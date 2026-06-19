@@ -1198,10 +1198,17 @@ def _server_console_enabled(state: Any) -> bool:
 
 class _StartupHeartbeat:
     def __init__(self, label: str, *, interval_s: float = 10.0) -> None:
+        # The heartbeat runs as a detached child so it can keep printing while
+        # the parent is busy loading the model. It must therefore stop on BOTH
+        # a clean SIGTERM (via set()) AND when the parent dies without sending
+        # one (kill -9, crash, closed terminal) — otherwise it is reparented to
+        # init and prints "<label>... Ns elapsed" forever. We detect the latter
+        # with an os.getppid() guard, mirroring the heartbeat in mtplx/ui/progress.py.
         script = (
-            "import signal,sys,time\n"
+            "import os,signal,sys,time\n"
             "label=sys.argv[1]\n"
             "interval=float(sys.argv[2])\n"
+            "parent=int(sys.argv[3])\n"
             "running=True\n"
             "def stop(_signum,_frame):\n"
             "    global running\n"
@@ -1212,11 +1219,13 @@ class _StartupHeartbeat:
             "    time.sleep(interval)\n"
             "    if not running:\n"
             "        break\n"
+            "    if os.getppid() != parent:\n"
+            "        break\n"
             "    elapsed += interval\n"
             "    print(f'      {label}... {elapsed:.0f}s elapsed', flush=True)\n"
         )
         self.proc = subprocess.Popen(
-            [sys.executable, "-c", script, label, str(float(interval_s))],
+            [sys.executable, "-c", script, label, str(float(interval_s)), str(os.getpid())],
             stdout=None,
             stderr=subprocess.DEVNULL,
             close_fds=True,
