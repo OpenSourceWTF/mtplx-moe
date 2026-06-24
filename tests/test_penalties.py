@@ -14,7 +14,7 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 
-from mtplx.fast_sampling import apply_penalties_mlx
+from mtplx.fast_sampling import apply_penalties_mlx, sparse_distribution_from_mlx_logits
 from mtplx.sampling import SamplerConfig, apply_penalties, distribution_from_logits
 
 
@@ -82,3 +82,15 @@ def test_apply_penalties_mlx_zero_is_exact_noop_identity():
     assert apply_penalties_mlx(logits, {0: 9}, 0.0, 0.0) is logits
     # no counts -> also a no-op
     assert apply_penalties_mlx(logits, None, 2.0, 2.0) is logits
+
+
+def test_sparse_distribution_from_mlx_logits_applies_penalty_before_filtering():
+    # The MLX sparse builder (the runtime hot path) must penalize raw logits
+    # before temperature/top-k/top-p. frequency 2.0 (clamp) * count 4 = 8 craters
+    # token 0 (5.0 -> -3.0) below token 1 (4.0), flipping the distribution argmax.
+    logits = mx.array([5.0, 4.0, 0.0, 0.0], dtype=mx.float32)
+    cfg = SamplerConfig(temperature=1.0, top_p=1.0, top_k=20, frequency_penalty=2.0)
+    base = sparse_distribution_from_mlx_logits(logits, cfg)
+    pen = sparse_distribution_from_mlx_logits(logits, cfg, token_counts={0: 4})
+    assert int(np.argmax(base.to_dense())) == 0
+    assert int(np.argmax(pen.to_dense())) == 1

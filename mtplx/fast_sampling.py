@@ -83,6 +83,8 @@ class BatchedSparseDistributions:
 def sparse_distribution_from_mlx_logits(
     logits: mx.array,
     config: SamplerConfig,
+    *,
+    token_counts: Mapping[int, int] | None = None,
 ) -> SparseDistribution | None:
     """Return an exact sparse distribution for top-p then top-k sampling.
 
@@ -90,12 +92,19 @@ def sparse_distribution_from_mlx_logits(
     larger than 20 tokens. We still compute the full-vocab logsumexp on MLX so
     top-p decisions use true full-distribution probability mass, then move only
     the small support to NumPy for deterministic speculative correction.
+
+    ``token_counts`` (completion tokens seen so far, scoped by the caller) applies
+    the additive presence/frequency penalty to the raw logits BEFORE the
+    temperature divide — a no-op (same array) when penalties are 0.
     """
 
     if config.temperature <= 0 or config.top_k <= 0:
         return None
 
-    flat = logits.reshape(-1).astype(mx.float32) / float(config.temperature)
+    row = apply_penalties_mlx(
+        logits.reshape(-1), token_counts, config.presence_penalty, config.frequency_penalty
+    )
+    flat = row.astype(mx.float32) / float(config.temperature)
     vocab_size = int(flat.shape[-1])
     k = min(int(config.top_k), vocab_size)
     if k <= 0:
