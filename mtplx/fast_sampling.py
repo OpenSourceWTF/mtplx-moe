@@ -2,10 +2,40 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import mlx.core as mx
 import numpy as np
 
-from .sampling import SamplerConfig, SparseDistribution
+from .sampling import PENALTY_MAX, PENALTY_MIN, SamplerConfig, SparseDistribution
+
+
+def apply_penalties_mlx(
+    logits: mx.array,
+    token_counts: Mapping[int, int] | None,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+) -> mx.array:
+    """On-device MLX twin of ``sampling.apply_penalties`` for one logit row.
+
+    Subtracts the additive OpenAI/vLLM penalty on the RAW logits — before any
+    temperature/top-k/top-p — via a sparse scatter over only the seen tokens
+    (``logits.at[ids].add(-deltas)``): O(unique_seen), no dense vocab-sized
+    allocation and no host round-trip beyond the small (ids, deltas) transfer.
+    Penalties clamp to [-2, 2]. Returns the same array unchanged (no-op) when
+    both penalties are 0 or there are no counts, preserving exactness.
+
+    Expects a 1-D logit row (``logits.shape == (vocab,)``); batched callers apply
+    it per row (the MTP draft block is a handful of positions, not a hot loop).
+    """
+    presence = min(max(float(presence_penalty), PENALTY_MIN), PENALTY_MAX)
+    frequency = min(max(float(frequency_penalty), PENALTY_MIN), PENALTY_MAX)
+    if (presence == 0.0 and frequency == 0.0) or not token_counts:
+        return logits
+    ids = np.fromiter(token_counts.keys(), dtype=np.int64, count=len(token_counts))
+    counts = np.fromiter(token_counts.values(), dtype=np.float64, count=len(token_counts))
+    deltas = (frequency * counts + presence * (counts > 0.0)).astype(np.float32)
+    return logits.at[mx.array(ids)].add(mx.array(-deltas))
 
 
 class BatchedSparseDistributions:

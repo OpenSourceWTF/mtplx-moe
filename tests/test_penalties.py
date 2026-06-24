@@ -11,9 +11,11 @@ yet accept `token_counts`.
 
 from __future__ import annotations
 
+import mlx.core as mx
 import numpy as np
 
-from mtplx.sampling import SamplerConfig, distribution_from_logits
+from mtplx.fast_sampling import apply_penalties_mlx
+from mtplx.sampling import SamplerConfig, apply_penalties, distribution_from_logits
 
 
 def test_presence_penalty_demotes_a_seen_token():
@@ -60,3 +62,23 @@ def test_penalties_clamped_to_openai_range():
     logits = np.array([5.0, 2.0])
     cfg = SamplerConfig(temperature=1.0, top_p=1.0, top_k=0, presence_penalty=100.0)
     assert int(np.argmax(distribution_from_logits(logits, cfg, token_counts={0: 1}))) == 0
+
+
+def test_apply_penalties_mlx_matches_numpy_reference():
+    # On-device MLX penalty must produce the same penalized logits as the NumPy
+    # reference, so the runtime hot path and the reference path stay in lockstep.
+    raw = [5.0, 4.0, 3.0, 1.0, 0.0]
+    counts = {0: 3, 2: 1}
+    ref = apply_penalties(np.array(raw), counts, presence_penalty=1.5, frequency_penalty=0.5)
+    mlx_out = apply_penalties_mlx(mx.array(raw, dtype=mx.float32), counts,
+                                  presence_penalty=1.5, frequency_penalty=0.5)
+    mx.eval(mlx_out)
+    assert np.allclose(np.asarray(mlx_out), ref, atol=1e-5)
+
+
+def test_apply_penalties_mlx_zero_is_exact_noop_identity():
+    logits = mx.array([5.0, 4.0, 0.0], dtype=mx.float32)
+    # both penalties 0 -> same object back (no scatter, no copy) => exactness
+    assert apply_penalties_mlx(logits, {0: 9}, 0.0, 0.0) is logits
+    # no counts -> also a no-op
+    assert apply_penalties_mlx(logits, None, 2.0, 2.0) is logits
