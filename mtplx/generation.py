@@ -3607,7 +3607,14 @@ def generate_ar(
         emit_trace()
 
     for step in range(max_tokens):
-        token, _ = _sample_from_logits(logits[0], sampler, rng)
+        token, _ = _sample_from_logits(
+            logits[0],
+            sampler,
+            rng,
+            token_counts=Counter(tokens)
+            if (sampler.presence_penalty or sampler.frequency_penalty)
+            else None,
+        )
         tokens.append(token)
         emit_token(token)
         events.append({"step": step, "token": token})

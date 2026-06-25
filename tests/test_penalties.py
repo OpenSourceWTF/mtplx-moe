@@ -15,9 +15,9 @@ import mlx.core as mx
 import numpy as np
 
 from mtplx.fast_sampling import apply_penalties_mlx, sparse_distribution_from_mlx_logits
-from mtplx.generation import generate_mtpk
+from mtplx.generation import generate_ar, generate_mtpk
 from mtplx.sampling import SamplerConfig, apply_penalties, distribution_from_logits
-from tests.test_generation_sustained import AcceptingTinyMTPModel, _runtime
+from tests.test_generation_sustained import AcceptingTinyMTPModel, TinyModel, _runtime
 
 
 def _mtpk(model, **kw):
@@ -126,3 +126,17 @@ def test_generate_mtpk_zero_penalty_is_unchanged():
         sampler=SamplerConfig(**cfg, presence_penalty=0.0, frequency_penalty=0.0),
     )
     assert withz.tokens == base.tokens
+
+
+def test_generate_mtpk_matches_generate_ar_with_penalty_per_position():
+    # SC7: native-MTP decode with per-position penalties is token-for-token
+    # identical to sequential AR decode with the same penalty + seed. This is the
+    # definition of "per-position / identical-to-sequential-decode" (vLLM-exact).
+    cfg = SamplerConfig(temperature=0.0, top_p=1.0, top_k=20, presence_penalty=1.5)
+    mtp = _mtpk(AcceptingTinyMTPModel(), max_tokens=6, sampler=cfg)
+    ar = generate_ar(
+        _runtime(TinyModel(), mtp_enabled=True), [0],
+        max_tokens=6, sampler=cfg, stop_token_ids=set(),
+    )
+    assert mtp.tokens == ar.tokens
+    assert len(mtp.tokens) == 6
