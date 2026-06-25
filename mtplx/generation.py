@@ -6,6 +6,8 @@ optimized runtime can tighten the same contracts after the MTP-1 gates pass.
 
 from __future__ import annotations
 
+from collections import Counter
+from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 import json
@@ -35,6 +37,7 @@ from .cache_state import (
 )
 from .fast_sampling import (
     BatchedSparseDistributions,
+    apply_penalties_mlx,
     batched_sparse_distributions_from_mlx_logits,
     sample_token_ids_from_mlx_logits,
     sparse_distribution_from_mlx_logits,
@@ -2733,11 +2736,15 @@ def _logits_to_numpy(logits: mx.array) -> np.ndarray:
 def _distribution_from_mlx_logits(
     logits: mx.array,
     config: SamplerConfig,
+    *,
+    token_counts: Mapping[int, int] | None = None,
 ) -> np.ndarray | SparseDistribution:
-    sparse = sparse_distribution_from_mlx_logits(logits, config)
+    sparse = sparse_distribution_from_mlx_logits(logits, config, token_counts=token_counts)
     if sparse is not None:
         return sparse
-    return dense_distribution_from_logits(_logits_to_numpy(logits), config)
+    return dense_distribution_from_logits(
+        _logits_to_numpy(logits), config, token_counts=token_counts
+    )
 
 
 def _distributions_from_mlx_logits(
@@ -2761,11 +2768,20 @@ def _sample_from_logits(
     logits: mx.array,
     config: SamplerConfig,
     rng: np.random.Generator,
+    *,
+    token_counts: Mapping[int, int] | None = None,
 ) -> tuple[int, np.ndarray | SparseDistribution | None]:
     if config.temperature <= 0:
+        if token_counts and (config.presence_penalty or config.frequency_penalty):
+            logits = apply_penalties_mlx(
+                logits.reshape(-1),
+                token_counts,
+                config.presence_penalty,
+                config.frequency_penalty,
+            )
         _eval(logits)
         return int(mx.argmax(logits, axis=-1).item()), None
-    probs = _distribution_from_mlx_logits(logits, config)
+    probs = _distribution_from_mlx_logits(logits, config, token_counts=token_counts)
     return sample_from_distribution(probs, rng), probs
 
 
@@ -4670,6 +4686,12 @@ def generate_mtpk(
     bonus_time = 0.0
     online_hidden_corrector_time = 0.0
     tokens: list[int] = []
+    # OpenAI-style presence/frequency penalties. When active, each token is
+    # penalized by the counts of the completion-so-far (prompt excluded), and
+    # every verified MTP position by its growing in-block prefix (per-position /
+    # vLLM-exact). Counts are rebuilt from `tokens` at each sample point — simple
+    # and drift-proof; an incremental counter is a documented perf follow-up.
+    _penalties_active = bool(sampler.presence_penalty) or bool(sampler.frequency_penalty)
     events: list[dict] = []
     record_events = not _env_truthy("MTPLX_DROP_EVENTS")
     append_event = events.append if record_events else (lambda _event: None)
@@ -5321,7 +5343,12 @@ def generate_mtpk(
             break
         primary_already_emitted = pending_primary is not None
         if pending_primary is None:
-            primary, _ = _sample_from_logits(logits[0], sampler, rng)
+            primary, _ = _sample_from_logits(
+                logits[0],
+                sampler,
+                rng,
+                token_counts=Counter(tokens) if _penalties_active else None,
+            )
             tokens.append(primary)
             emit_new_tokens()
         else:
@@ -6097,13 +6124,32 @@ def generate_mtpk(
         lazy_target_distribution_rows = 0
         lazy_target_distribution_time = 0.0
         lazy_target_distribution_window_counted = False
+        if _penalties_active:
+            # Force the lazy per-row verify path: the batched/prefix precomputes
+            # build one un-penalized distribution per block and cannot carry the
+            # per-row counts.
+            target_prefix_tokens = None
+            target_distribution_batch = None
         for depth_index, draft_token in enumerate(draft_tokens):
             target_logits_for_draft = verify_logits[:, depth_index, :]
+            if _penalties_active:
+                # Per-position (vLLM-exact) prefix counts: committed completion
+                # (incl. this step's primary, already in `tokens`) + the in-block
+                # draft tokens *before* this position. Rebuilt per position so it
+                # cannot drift; an incremental counter is a perf follow-up.
+                _working_counts: Counter[int] = Counter(tokens)
+                _working_counts.update(draft_tokens[:depth_index])
             target_p_for_cache = None
             if sampler.temperature <= 0:
-                target_token = int(
-                    mx.argmax(target_logits_for_draft[0], axis=-1).item()
-                )
+                _greedy_row = target_logits_for_draft[0]
+                if _penalties_active:
+                    _greedy_row = apply_penalties_mlx(
+                        _greedy_row,
+                        _working_counts,
+                        sampler.presence_penalty,
+                        sampler.frequency_penalty,
+                    )
+                target_token = int(mx.argmax(_greedy_row, axis=-1).item())
                 accepted_now = draft_token == target_token
                 accept_prob = 1.0 if accepted_now else 0.0
                 correction = target_token
@@ -6148,13 +6194,15 @@ def generate_mtpk(
             else:
                 target_p = (
                     target_distributions[depth_index]
-                    if target_distributions is not None
+                    if target_distributions is not None and not _penalties_active
                     else None
                 )
                 if target_p is None:
                     started_target_distribution = time.perf_counter()
                     target_p = _distribution_from_mlx_logits(
-                        target_logits_for_draft[0], sampler
+                        target_logits_for_draft[0],
+                        sampler,
+                        token_counts=_working_counts if _penalties_active else None,
                     )
                     elapsed_target_distribution = (
                         time.perf_counter() - started_target_distribution

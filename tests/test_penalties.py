@@ -15,7 +15,17 @@ import mlx.core as mx
 import numpy as np
 
 from mtplx.fast_sampling import apply_penalties_mlx, sparse_distribution_from_mlx_logits
+from mtplx.generation import generate_mtpk
 from mtplx.sampling import SamplerConfig, apply_penalties, distribution_from_logits
+from tests.test_generation_sustained import AcceptingTinyMTPModel, _runtime
+
+
+def _mtpk(model, **kw):
+    return generate_mtpk(
+        _runtime(model, mtp_enabled=True), [0],
+        speculative_depth=3, mtp_history_policy="committed",
+        verify_strategy="batched", stop_token_ids=set(), **kw,
+    )
 
 
 def test_presence_penalty_demotes_a_seen_token():
@@ -94,3 +104,25 @@ def test_sparse_distribution_from_mlx_logits_applies_penalty_before_filtering():
     pen = sparse_distribution_from_mlx_logits(logits, cfg, token_counts={0: 4})
     assert int(np.argmax(base.to_dense())) == 0
     assert int(np.argmax(pen.to_dense())) == 1
+
+
+def test_generate_mtpk_applies_presence_penalty_greedy_per_position():
+    # The fake target emits constant [0,1,0,0] -> unpenalized greedy output is all
+    # 1s (the existing suite asserts [1,1,1,1]). With presence_penalty=1.5 each
+    # newly-seen token is demoted, so the per-position argmax walks 1 -> 0 -> 2 -> 3.
+    out = _mtpk(
+        AcceptingTinyMTPModel(),
+        max_tokens=4,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=20, presence_penalty=1.5),
+    )
+    assert out.tokens == [1, 0, 2, 3]
+
+
+def test_generate_mtpk_zero_penalty_is_unchanged():
+    cfg = dict(temperature=0.6, top_p=0.95, top_k=20)
+    base = _mtpk(AcceptingTinyMTPModel(), max_tokens=5, sampler=SamplerConfig(**cfg))
+    withz = _mtpk(
+        AcceptingTinyMTPModel(), max_tokens=5,
+        sampler=SamplerConfig(**cfg, presence_penalty=0.0, frequency_penalty=0.0),
+    )
+    assert withz.tokens == base.tokens
