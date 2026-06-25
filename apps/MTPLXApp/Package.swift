@@ -38,16 +38,5 @@ let package = Package(
             dependencies: ["MTPLXAppCore"],
             path: "Tests/MTPLXAppCoreTests"
         ),
-        // TEMPORARY verification harness — added by one commit and reverted by
-        // the final commit of this PR, so the net diff is the fix alone. It lets
-        // a reviewer `git checkout` the harness commit and run
-        // `swift test --filter ComposerIMEIntegrationTests` to see the before
-        // (fails) / after (passes). Shippable coverage lives in
-        // MTPLXAppCoreTests/ComposerTextSyncTests.
-        .testTarget(
-            name: "MTPLXAppHostTests",
-            dependencies: ["MTPLXAppHost"],
-            path: "Tests/MTPLXAppHostTests"
-        ),
     ]
 )
