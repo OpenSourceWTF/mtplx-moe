@@ -23035,6 +23035,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument(
+        "--default-presence-penalty",
+        dest="default_presence_penalty",
+        type=float,
+        default=0.0,
+        help="Server-default OpenAI presence_penalty baked into every request.",
+    )
+    parser.add_argument(
+        "--default-frequency-penalty",
+        dest="default_frequency_penalty",
+        type=float,
+        default=0.0,
+        help="Server-default OpenAI frequency_penalty baked into every request.",
+    )
+    parser.add_argument(
         "--adaptive-policy",
         choices=["none", "streak", "expected_value"],
         default="none",
