@@ -6451,6 +6451,7 @@ def generate_mtpk(
                 elif (
                     target_distributions is not None
                     and not lazy_bonus_verify
+                    and not _penalties_active
                     and len(target_distributions) > len(draft_tokens)
                 ):
                     bonus = sample_from_distribution(
@@ -6459,7 +6460,14 @@ def generate_mtpk(
                     )
                 else:
                     started_bonus_distribution = time.perf_counter()
-                    bonus, _ = _sample_from_logits(logits[0], sampler, rng)
+                    # all-accept bonus: tokens already includes the committed block,
+                    # so Counter(tokens) is the correct prefix for this next token.
+                    bonus, _ = _sample_from_logits(
+                        logits[0],
+                        sampler,
+                        rng,
+                        token_counts=Counter(tokens) if _penalties_active else None,
+                    )
                     if sampler.temperature > 0:
                         bonus_target_distribution_time = (
                             time.perf_counter() - started_bonus_distribution
