@@ -6,9 +6,14 @@ runtime path can later swap equivalent MLX kernels behind the same semantics.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
+
+# OpenAI/vLLM valid range for presence_penalty / frequency_penalty.
+PENALTY_MIN = -2.0
+PENALTY_MAX = 2.0
 
 
 @dataclass(frozen=True)
@@ -16,6 +21,10 @@ class SamplerConfig:
     temperature: float = 0.6
     top_p: float = 0.95
     top_k: int = 20
+    # OpenAI-style additive penalties (default 0.0 == exact no-op). Applied to
+    # raw logits before temperature; counts cover completion tokens only.
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -125,7 +134,46 @@ def apply_top_k_top_p(probs: np.ndarray, top_k: int = 0, top_p: float = 1.0) -> 
     return apply_top_p_top_k(probs, top_p=top_p, top_k=top_k)
 
 
-def distribution_from_logits(logits: np.ndarray, config: SamplerConfig) -> np.ndarray:
+def apply_penalties(
+    logits: np.ndarray,
+    token_counts: Mapping[int, int] | None,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+) -> np.ndarray:
+    """Subtract OpenAI-style additive presence/frequency penalties on raw logits.
+
+        logit[j] -= frequency_penalty * count[j] + presence_penalty * (count[j] > 0)
+
+    Matches OpenAI's published formula and vLLM (``model_executor/layers/utils.py``):
+    a positive penalty lowers the logit of reused tokens. ``token_counts`` maps a
+    token id to how many times it has appeared **in the completion so far** (the
+    caller scopes this to output tokens; the prompt is excluded). Penalties are
+    clamped to ``[-2, 2]``.
+
+    Returns ``logits`` unchanged (same object, no copy) when both penalties are
+    0 or there are no counts — the exactness-preserving no-op path.
+    """
+    presence = float(np.clip(presence_penalty, PENALTY_MIN, PENALTY_MAX))
+    frequency = float(np.clip(frequency_penalty, PENALTY_MIN, PENALTY_MAX))
+    if (presence == 0.0 and frequency == 0.0) or not token_counts:
+        return logits
+    out = np.array(logits, dtype=np.float64, copy=True)
+    ids = np.fromiter(token_counts.keys(), dtype=np.int64, count=len(token_counts))
+    counts = np.fromiter(token_counts.values(), dtype=np.float64, count=len(token_counts))
+    # Sparse scatter-subtract over only the seen tokens: O(unique_seen), not O(vocab).
+    out[ids] -= frequency * counts + presence * (counts > 0)
+    return out
+
+
+def distribution_from_logits(
+    logits: np.ndarray,
+    config: SamplerConfig,
+    *,
+    token_counts: Mapping[int, int] | None = None,
+) -> np.ndarray:
+    logits = apply_penalties(
+        logits, token_counts, config.presence_penalty, config.frequency_penalty
+    )
     probs = softmax(logits, temperature=config.temperature)
     return apply_top_p_top_k(probs, top_p=config.top_p, top_k=config.top_k)
 

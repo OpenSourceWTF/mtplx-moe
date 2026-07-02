@@ -13612,6 +13612,8 @@ def _generation_params(
     temperature: float | None,
     top_p: float | None,
     top_k: int | None,
+    presence_penalty: float | None = None,
+    frequency_penalty: float | None = None,
 ) -> tuple[int, SamplerConfig, dict[str, Any]]:
     remaining_context = max(1, int(state.context_window) - int(prompt_token_count))
     request_max_tokens = None if max_tokens is None else int(max_tokens)
@@ -13642,10 +13644,25 @@ def _generation_params(
     )
     sampler_top_p = state.args.top_p if top_p is None else float(top_p)
     sampler_top_k = state.args.top_k if top_k is None else int(top_k)
+    # OpenAI-style penalties: per-request value wins; else the server default
+    # (--default-presence-penalty / --default-frequency-penalty, so a serve can
+    # bake them in for clients like pi that never send the field); else 0.0.
+    sampler_presence_penalty = (
+        float(getattr(state.args, "default_presence_penalty", 0.0) or 0.0)
+        if presence_penalty is None
+        else float(presence_penalty)
+    )
+    sampler_frequency_penalty = (
+        float(getattr(state.args, "default_frequency_penalty", 0.0) or 0.0)
+        if frequency_penalty is None
+        else float(frequency_penalty)
+    )
     sampler = SamplerConfig(
         temperature=sampler_temperature,
         top_p=sampler_top_p,
         top_k=sampler_top_k,
+        presence_penalty=sampler_presence_penalty,
+        frequency_penalty=sampler_frequency_penalty,
     )
     return (
         decode_lease_tokens,
@@ -14033,6 +14050,8 @@ def _run_generation_dispatched(
             temperature=kwargs.get("temperature"),
             top_p=kwargs.get("top_p"),
             top_k=kwargs.get("top_k"),
+            presence_penalty=kwargs.get("presence_penalty"),
+            frequency_penalty=kwargs.get("frequency_penalty"),
         )
         generation_seed, _seed_is_explicit = _resolve_seed(state, kwargs.get("seed"))
         request_observability = dict(kwargs.get("request_observability") or {})
@@ -23024,6 +23043,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--top-p", "--default-top-p", dest="top_p", type=float, default=0.95
     )
     parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument(
+        "--default-presence-penalty",
+        dest="default_presence_penalty",
+        type=float,
+        default=0.0,
+        help="Server-default OpenAI presence_penalty baked into every request.",
+    )
+    parser.add_argument(
+        "--default-frequency-penalty",
+        dest="default_frequency_penalty",
+        type=float,
+        default=0.0,
+        help="Server-default OpenAI frequency_penalty baked into every request.",
+    )
     parser.add_argument(
         "--adaptive-policy",
         choices=["none", "streak", "expected_value"],

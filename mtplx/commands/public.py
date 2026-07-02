@@ -8359,6 +8359,10 @@ def cmd_serve_public(args: Any) -> int:
         cmd.extend(["--top-p", str(args.top_p)])
     if getattr(args, "top_k", None) is not None:
         cmd.extend(["--top-k", str(args.top_k)])
+    if getattr(args, "default_presence_penalty", None):
+        cmd.extend(["--default-presence-penalty", str(args.default_presence_penalty)])
+    if getattr(args, "default_frequency_penalty", None):
+        cmd.extend(["--default-frequency-penalty", str(args.default_frequency_penalty)])
     if getattr(args, "reasoning", None) is not None:
         reasoning_mode = _reasoning_mode(args, default="auto")
         if reasoning_mode == "on":
