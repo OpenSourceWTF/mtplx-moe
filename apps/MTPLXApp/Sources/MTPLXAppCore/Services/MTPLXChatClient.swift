@@ -165,6 +165,7 @@ public struct ChatRequest: Encodable, Sendable {
     public var temperature: Double?
     public var topP: Double?
     public var topK: Int?
+    public var presencePenalty: Double?
     public var stream: Bool
     public var tools: [ChatRequestTool]?
     public var toolChoice: String?
@@ -179,6 +180,7 @@ public struct ChatRequest: Encodable, Sendable {
         temperature: Double? = nil,
         topP: Double? = nil,
         topK: Int? = nil,
+        presencePenalty: Double? = nil,
         stream: Bool = true,
         tools: [ChatRequestTool]? = nil,
         toolChoice: String? = nil,
@@ -192,6 +194,7 @@ public struct ChatRequest: Encodable, Sendable {
         self.temperature = temperature
         self.topP = topP
         self.topK = topK
+        self.presencePenalty = presencePenalty
         self.stream = stream
         self.tools = tools
         self.toolChoice = toolChoice
@@ -206,6 +209,7 @@ public struct ChatRequest: Encodable, Sendable {
         case temperature
         case topP = "top_p"
         case topK = "top_k"
+        case presencePenalty = "presence_penalty"
         case stream, tools
         case toolChoice = "tool_choice"
         case enableThinking = "enable_thinking"

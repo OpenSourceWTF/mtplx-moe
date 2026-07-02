@@ -56,6 +56,7 @@ struct InferenceParamsOverlay: View {
     @State private var temperature: Double = 0.6
     @State private var topP: Double = 0.95
     @State private var topK: Int = 20
+    @State private var presencePenalty: Double = 0
     @State private var depth: Int = 3
 
     // Reasoning draft — live-mutable. "auto" lets the daemon decide per
@@ -283,6 +284,21 @@ struct InferenceParamsOverlay: View {
                 hapticPattern: .alignment,
                 onCommit: { commitLiveSettings() }
             )
+            paramSlider(
+                title: "Presence Penalty",
+                value: Binding(get: { presencePenalty }, set: { presencePenalty = $0 }),
+                range: 0...Self.presencePenaltyMax,
+                step: 0.05,
+                valueText: { v in
+                    Text(v, format: .number.precision(.fractionLength(2)))
+                },
+                hapticPattern: .alignment,
+                onCommit: { commitLiveSettings() }
+            )
+            Text("Discourages reusing tokens the reply already contains. 0 is exact and best for coding; try 0.5–1.5 for creative or repetitive output.")
+                .font(.caption2)
+                .foregroundStyle(Brand.typeTertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -1090,6 +1106,7 @@ struct InferenceParamsOverlay: View {
         draft.temperature = temperature
         draft.topP = topP
         draft.topK = topK
+        draft.presencePenalty = presencePenalty
         if depthControlSupportsMtpOff {
             if depth <= 0 {
                 draft.generationMode = "ar"
@@ -1187,6 +1204,7 @@ struct InferenceParamsOverlay: View {
         temperature = clampTemperature(settings?.temperature ?? samplingDefaults?.temperature ?? 0.6)
         topP = clampTopP(settings?.topP ?? samplingDefaults?.topP ?? 0.95)
         topK = clampTopK(settings?.topK ?? samplingDefaults?.topK ?? 20)
+        presencePenalty = clampPresencePenalty(settings?.presencePenalty ?? 0)
         let liveDepth = compatibleStartupControls == nil ? nil : backend.health?.depth
         let tunedDraftValue = compatibleConfigurationTunedDraftValue
         let generationMode = normalizedGenerationMode(
@@ -1230,6 +1248,10 @@ struct InferenceParamsOverlay: View {
 
     private func clampTemperature(_ value: Double) -> Double {
         max(0, min(Self.temperatureMax, value))
+    }
+
+    private func clampPresencePenalty(_ value: Double) -> Double {
+        max(0, min(Self.presencePenaltyMax, value))
     }
 
     private static func kvQuantLabel(_ mode: String) -> String {
@@ -1370,6 +1392,12 @@ struct InferenceParamsOverlay: View {
     /// open so the thumb never pins off-screen with a stale value
     /// label.
     static let temperatureMax: Double = 1.0
+
+    /// OpenAI's documented presence_penalty range is [-2, 2]; the dial
+    /// exposes the useful positive half (0 = off/exact, up to 2 = max
+    /// anti-repetition). Negative values encourage repetition, which no
+    /// product flow wants from a slider.
+    static let presencePenaltyMax: Double = 2.0
 
     private static func reasoningHint(for mode: String) -> String {
         switch mode {

@@ -84,6 +84,10 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     public var temperature: Double?
     public var topP: Double?
     public var topK: Int?
+    /// OpenAI-style presence penalty (0 = exact no-op; Qwen recommends 0
+    /// for coding). Round-trips through the daemon's live settings like
+    /// temperature/topP/topK.
+    public var presencePenalty: Double?
     public var reasoning: String?
     public var reasoningEffort: String?
     /// Family that owns the persisted sampler/reasoning values above.
@@ -197,6 +201,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         temperature: Double? = nil,
         topP: Double? = nil,
         topK: Int? = nil,
+        presencePenalty: Double? = nil,
         reasoning: String? = nil,
         reasoningEffort: String? = nil,
         liveSettingsModelFamily: String? = nil,
@@ -256,6 +261,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         self.temperature = temperature
         self.topP = topP
         self.topK = topK
+        self.presencePenalty = presencePenalty
         self.reasoning = reasoning
         self.reasoningEffort = reasoningEffort
         self.liveSettingsModelFamily = liveSettingsModelFamily
@@ -437,6 +443,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         case temperature
         case topP = "top_p"
         case topK = "top_k"
+        case presencePenalty = "presence_penalty"
         case reasoning
         case reasoningEffort = "reasoning_effort"
         case liveSettingsModelFamily = "live_settings_model_family"
@@ -502,6 +509,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         temperature = try container.decodeIfPresent(Double.self, forKey: .temperature)
         topP = try container.decodeIfPresent(Double.self, forKey: .topP)
         topK = try container.decodeIfPresent(Int.self, forKey: .topK)
+        presencePenalty = try container.decodeIfPresent(Double.self, forKey: .presencePenalty)
         reasoning = try container.decodeIfPresent(String.self, forKey: .reasoning)
         reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
         liveSettingsModelFamily = try container.decodeIfPresent(String.self, forKey: .liveSettingsModelFamily)

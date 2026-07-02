@@ -1281,6 +1281,7 @@ public final class MTPLXBackendStore: ObservableObject {
             temperature: settings.temperature,
             topP: settings.topP,
             topK: settings.topK,
+            presencePenalty: settings.presencePenalty,
             maxResponseTokens: settings.maxResponseTokens,
             streamInterval: settings.streamInterval,
             enableThinking: settings.enableThinking,
@@ -1392,6 +1393,9 @@ public final class MTPLXBackendStore: ObservableObject {
         if let temperature = settings.temperature { next.temperature = temperature }
         if let topP = settings.topP { next.topP = topP }
         if let topK = settings.topK { next.topK = topK }
+        if let presencePenalty = settings.presencePenalty {
+            next.presencePenalty = presencePenalty
+        }
         if let reasoning = normalizedReasoning(settings.reasoning) {
             next.reasoning = reasoning
         }
@@ -1468,6 +1472,10 @@ public final class MTPLXBackendStore: ObservableObject {
         }
         if let topK = configuration.topK {
             persisted.topK = topK
+            hasValue = true
+        }
+        if let presencePenalty = configuration.presencePenalty {
+            persisted.presencePenalty = presencePenalty
             hasValue = true
         }
         if let reasoning = normalizedReasoning(configuration.reasoning) {
@@ -1629,6 +1637,9 @@ public final class MTPLXBackendStore: ObservableObject {
         if let temperature = patch.temperature { merged.temperature = temperature }
         if let topP = patch.topP { merged.topP = topP }
         if let topK = patch.topK { merged.topK = topK }
+        if let presencePenalty = patch.presencePenalty {
+            merged.presencePenalty = presencePenalty
+        }
         merged.maxResponseTokens = patch.maxResponseTokens
         if let streamInterval = patch.streamInterval { merged.streamInterval = streamInterval }
         if let enableThinking = patch.enableThinking { merged.enableThinking = enableThinking }
@@ -3013,6 +3024,7 @@ private extension MutableSettings {
             || temperature != nil
             || topP != nil
             || topK != nil
+            || presencePenalty != nil
             || maxResponseTokens != nil
             || streamInterval != nil
             || enableThinking != nil

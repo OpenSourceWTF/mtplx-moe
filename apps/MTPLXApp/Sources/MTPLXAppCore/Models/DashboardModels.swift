@@ -321,6 +321,10 @@ public struct MutableSettings: Codable, Equatable, Sendable {
     public var temperature: Double?
     public var topP: Double?
     public var topK: Int?
+    /// OpenAI-style presence penalty (0 = exact no-op). Live-mutable via
+    /// `/v1/mtplx/settings`; the daemon maps it onto its
+    /// `--default-presence-penalty` server default.
+    public var presencePenalty: Double?
     public var maxResponseTokens: Int?
     public var streamInterval: Int?
     public var enableThinking: Bool?
@@ -346,6 +350,7 @@ public struct MutableSettings: Codable, Equatable, Sendable {
         temperature: Double? = nil,
         topP: Double? = nil,
         topK: Int? = nil,
+        presencePenalty: Double? = nil,
         maxResponseTokens: Int? = nil,
         streamInterval: Int? = nil,
         enableThinking: Bool? = nil,
@@ -370,6 +375,7 @@ public struct MutableSettings: Codable, Equatable, Sendable {
         self.temperature = temperature
         self.topP = topP
         self.topK = topK
+        self.presencePenalty = presencePenalty
         self.maxResponseTokens = maxResponseTokens
         self.streamInterval = streamInterval
         self.enableThinking = enableThinking
@@ -396,6 +402,7 @@ public struct MutableSettings: Codable, Equatable, Sendable {
         case temperature
         case topP = "top_p"
         case topK = "top_k"
+        case presencePenalty = "presence_penalty"
         case maxResponseTokens = "max_response_tokens"
         case streamInterval = "stream_interval"
         case enableThinking = "enable_thinking"
