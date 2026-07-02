@@ -2641,6 +2641,7 @@ def restore_or_prefill_prompt_state(
             if len(prompt_ids) > 1:
                 history_token_ids = prompt_ids[1:]
                 history_hidden = prompt_hidden[:, :-1, :]
+                history_window_start = 1
                 if mtp_history_policy == "last_window":
                     keep = min(len(history_token_ids), mtp_history_window_tokens)
                     dropped = len(history_token_ids) - keep
@@ -2649,6 +2650,22 @@ def restore_or_prefill_prompt_state(
                     )
                     history_token_ids = history_token_ids[-keep:]
                     history_hidden = history_hidden[:, -keep:, :]
+                    history_window_start = 1 + dropped
+                history_embeddings = None
+                if vision_splice is not None:
+                    pad_id = vision_splice.image_pad_token_id
+                    rows_before = sum(
+                        1 for token in prompt_ids[:history_window_start] if token == pad_id
+                    )
+                    if any(token == pad_id for token in history_token_ids):
+                        from mtplx.vision.splice import spliced_embeddings_for_window
+
+                        history_embeddings = spliced_embeddings_for_window(
+                            rt.embed_tokens,
+                            mx.array([history_token_ids]),
+                            vision_splice,
+                            rows_before=rows_before,
+                        )
                 prompt_history_time = _append_mtp_history(
                     rt,
                     mtp_history_cache,
@@ -2660,6 +2677,7 @@ def restore_or_prefill_prompt_state(
                         if mtp_position_mode == "absolute" or mtp_history_policy == "last_window"
                         else None
                     ),
+                    input_embeddings=history_embeddings,
                 )
                 prompt_eval_time += prompt_history_time
     else:
@@ -3140,6 +3158,19 @@ def _prefill_committed_mtp_history_streaming(
 
     cursor = 0
     body_array = mx.array([body]) if body else None
+    prompt_array = None
+    pad_prefix_counts: list[int] | None = None
+    if vision_splice is not None:
+        # Prefix counts of image-pad tokens let the (one-token-shifted) MTP
+        # history windows read their vision rows at an explicit offset
+        # without disturbing the trunk's sequential splice cursor.
+        prompt_array = mx.array([prompt_ids])
+        pad_prefix_counts = [0]
+        pad_id = vision_splice.image_pad_token_id
+        for token in prompt_ids:
+            pad_prefix_counts.append(
+                pad_prefix_counts[-1] + (1 if token == pad_id else 0)
+            )
     for start, end in _iter_prefill_chunk_spans(len(body)):
         _check_postcommit_abort(abort_check)
         chunk_array = body_array[:, start:end]
@@ -3232,6 +3263,24 @@ def _prefill_committed_mtp_history_streaming(
                     slice_start : slice_start + len(sliced_token_ids),
                     :,
                 ]
+                history_embeddings = None
+                if vision_splice is not None and pad_prefix_counts is not None:
+                    window_start = token_start_index + slice_start
+                    window_end = window_start + len(sliced_token_ids)
+                    if (
+                        pad_prefix_counts[window_end]
+                        > pad_prefix_counts[window_start]
+                    ):
+                        from mtplx.vision.splice import (
+                            spliced_embeddings_for_window,
+                        )
+
+                        history_embeddings = spliced_embeddings_for_window(
+                            rt.embed_tokens,
+                            prompt_array[:, window_start:window_end],
+                            vision_splice,
+                            rows_before=pad_prefix_counts[window_start],
+                        )
                 prompt_history_time += _append_mtp_history(
                     rt,
                     mtp_history_cache,
@@ -3246,6 +3295,7 @@ def _prefill_committed_mtp_history_streaming(
                         else None
                     ),
                     force_eval=True,
+                    input_embeddings=history_embeddings,
                 )
                 _check_postcommit_abort(abort_check)
         cursor += chunk_len
@@ -3409,11 +3459,14 @@ def _append_mtp_history(
     mtp_hidden_variant: str,
     position_offset: int | None = None,
     force_eval: bool = False,
+    input_embeddings: mx.array | None = None,
 ) -> float:
     if not token_ids:
         return 0.0
     if hidden_states.shape[1] != len(token_ids):
         raise ValueError("hidden_states length must match token_ids length")
+    if input_embeddings is not None and input_embeddings.shape[1] != len(token_ids):
+        raise ValueError("input_embeddings length must match token_ids length")
     _runtime_count(rt, "mtp_history_append_calls")
     started = time.perf_counter()
     hidden = rt.update_mtp_cache(
@@ -3422,6 +3475,7 @@ def _append_mtp_history(
         mtp_cache=mtp_cache,
         mtp_hidden_variant=mtp_hidden_variant,
         position_offset=position_offset,
+        input_embeddings=input_embeddings,
     )
     if _env_truthy("MTPLX_LAZY_MTP_HISTORY_APPEND") and not force_eval:
         return time.perf_counter() - started

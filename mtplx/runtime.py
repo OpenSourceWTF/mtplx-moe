@@ -193,6 +193,7 @@ class MTPLXRuntime:
         concat_order: str | None = None,
         mtp_hidden_variant: str | None = None,
         position_offset: int | None = None,
+        input_embeddings=None,
     ):
         if not self.mtp_enabled:
             raise RuntimeError("MTP is not enabled for this runtime")
@@ -220,15 +221,28 @@ class MTPLXRuntime:
                 "concat_order": resolved_concat_order,
                 "mtp_hidden_variant": resolved_hidden_variant,
                 "position_offset": position_offset,
+                "input_embeddings": input_embeddings,
             }
             kwargs = {
                 key: value
                 for key, value in candidates.items()
                 if accepts_kwargs or key in params
             }
+            if input_embeddings is not None and "input_embeddings" not in kwargs:
+                # Silently dropping the spliced vision rows would rebuild the
+                # exact draft-history corruption this parameter fixes (#103).
+                raise RuntimeError(
+                    "this MTP backend does not accept input_embeddings; "
+                    "vision history append is unsupported for it"
+                )
             if "mtp_depth" in params:
                 kwargs["mtp_depth"] = None
             return update(hidden_states, next_token_ids, **kwargs)
+        if input_embeddings is not None:
+            raise RuntimeError(
+                "mtp_forward fallback does not accept input_embeddings; "
+                "vision history append is unsupported for it"
+            )
         _logits, hidden = self.model.mtp_forward(
             hidden_states,
             next_token_ids,

@@ -208,3 +208,97 @@ def test_vision_spec_populated(tmp_path):
     assert spec.patch_size == 16
     assert spec.temporal_patch_size == 2
     assert spec.out_hidden_size == 5120
+
+
+# --- splice window helpers (MTP history alignment, issue #103) --------------
+
+
+def _make_splice(pad_id: int, rows: int, hidden: int = 8):
+    from mtplx.vision.splice import VisionSplice
+
+    return VisionSplice(
+        image_pad_token_id=pad_id,
+        embeddings=mx.arange(rows * hidden, dtype=mx.float32).reshape(rows, hidden)
+        + 1000.0,
+    )
+
+
+class _IdentityEmbed:
+    """Fake embed_tokens: token id t -> row of value t (easy to assert on)."""
+
+    def __call__(self, ids):
+        base = ids.astype(mx.float32)
+        return mx.broadcast_to(base[..., None], (*ids.shape, 8)).astype(mx.float32)
+
+
+def test_spliced_embeddings_for_window_replaces_correct_rows():
+    from mtplx.vision.splice import spliced_embeddings_for_window
+
+    pad = 99
+    splice = _make_splice(pad, rows=4)
+    # Prompt: [t, PAD, PAD, t, PAD, t, PAD] — window covers tokens 3..7
+    # (one PAD before the window, so rows_before=2: pads at idx 1, 2).
+    window = mx.array([[5, pad, 7, pad]])
+    out = spliced_embeddings_for_window(
+        _IdentityEmbed(), window, splice, rows_before=2
+    )
+    assert out is not None
+    got = np.array(out)
+    # Non-pad positions keep the token embedding.
+    assert np.allclose(got[0, 0], 5.0)
+    assert np.allclose(got[0, 2], 7.0)
+    # Pad positions get vision rows 2 and 3 (rows_before=2 offset).
+    expected_row2 = np.array(splice.embeddings[2])
+    expected_row3 = np.array(splice.embeddings[3])
+    assert np.allclose(got[0, 1], expected_row2)
+    assert np.allclose(got[0, 3], expected_row3)
+    # Cursor untouched — the trunk owns the sequential cursor.
+    assert splice.cursor == 0
+
+
+def test_spliced_embeddings_for_window_none_without_pads():
+    from mtplx.vision.splice import spliced_embeddings_for_window
+
+    splice = _make_splice(99, rows=2)
+    out = spliced_embeddings_for_window(
+        _IdentityEmbed(), mx.array([[1, 2, 3]]), splice, rows_before=0
+    )
+    assert out is None
+
+
+def test_spliced_embeddings_for_window_overflow_raises():
+    from mtplx.vision.splice import spliced_embeddings_for_window
+
+    splice = _make_splice(99, rows=1)
+    with pytest.raises(ValueError, match="window overflow"):
+        spliced_embeddings_for_window(
+            _IdentityEmbed(), mx.array([[99, 99]]), splice, rows_before=0
+        )
+
+
+def test_trunk_and_history_windows_share_rows():
+    """The history window is the trunk chunk shifted one token right; the
+    vision rows each pad receives must agree between the two lanes."""
+    from mtplx.vision.splice import (
+        spliced_chunk_embeddings,
+        spliced_embeddings_for_window,
+    )
+
+    pad = 99
+    prompt = [1, pad, pad, 2, pad, 3]
+    splice = _make_splice(pad, rows=3)
+    embed = _IdentityEmbed()
+    prompt_arr = mx.array([prompt])
+
+    # Trunk consumes the body [1, pad, pad, 2, pad] sequentially.
+    trunk = spliced_chunk_embeddings(embed, prompt_arr[:, :5], splice)
+    assert splice.cursor == 3
+    # History window = prompt[1:6] = [pad, pad, 2, pad, 3], rows_before=0.
+    hist = spliced_embeddings_for_window(
+        embed, prompt_arr[:, 1:6], splice, rows_before=0
+    )
+    trunk_np, hist_np = np.array(trunk), np.array(hist)
+    # Same prompt position => same vision row in both lanes:
+    # prompt idx 1 is trunk col 1 and history col 0, etc.
+    for prompt_idx in (1, 2, 4):
+        assert np.allclose(trunk_np[0, prompt_idx], hist_np[0, prompt_idx - 1])

@@ -36,6 +36,21 @@ class VisionSplice:
         self.cursor = 0
 
 
+def _splice_rows_into_embedded(
+    embedded: Any,
+    mask: Any,
+    rows: Any,
+) -> Any:
+    flat_mask = mask.reshape(-1)
+    positions = mx.array(
+        [i for i, hit in enumerate(flat_mask.tolist()) if hit], dtype=mx.int32
+    )
+    batch, seq, hidden = embedded.shape
+    flat = embedded.reshape(batch * seq, hidden)
+    flat[positions] = rows.astype(embedded.dtype)
+    return flat.reshape(batch, seq, hidden)
+
+
 def spliced_chunk_embeddings(
     embed_tokens: Any,
     chunk_array: Any,
@@ -62,14 +77,38 @@ def spliced_chunk_embeddings(
         )
     embedded = embed_tokens(ids)
     rows = splice.embeddings[splice.cursor : splice.cursor + pad_count]
-    rows = rows.astype(embedded.dtype)
     splice.cursor += pad_count
+    return _splice_rows_into_embedded(embedded, mask, rows)
 
-    flat_mask = mask.reshape(-1)
-    positions = mx.array(
-        [i for i, hit in enumerate(flat_mask.tolist()) if hit], dtype=mx.int32
-    )
-    batch, seq, hidden = embedded.shape
-    flat = embedded.reshape(batch * seq, hidden)
-    flat[positions] = rows
-    return flat.reshape(batch, seq, hidden)
+
+def spliced_embeddings_for_window(
+    embed_tokens: Any,
+    window_array: Any,
+    splice: VisionSplice,
+    *,
+    rows_before: int,
+) -> Any | None:
+    """Cursor-free splice for an arbitrary prompt window.
+
+    The MTP committed-history stream pairs hidden state t with token t+1,
+    so its embedding window is shifted one token right of the trunk prefill
+    chunk that produced the hidden states. This variant reads vision rows
+    at an explicit offset (``rows_before`` = pad tokens before the window
+    start) without touching the sequential cursor the trunk consumes.
+
+    Returns None when the window holds no image pad tokens.
+    """
+
+    mask = window_array == splice.image_pad_token_id
+    pad_count = int(mask.sum().item())
+    if pad_count == 0:
+        return None
+    if rows_before + pad_count > splice.total_rows:
+        raise ValueError(
+            "vision splice window overflow: window needs rows "
+            f"[{rows_before}, {rows_before + pad_count}) but only "
+            f"{splice.total_rows} vision rows exist"
+        )
+    embedded = embed_tokens(window_array)
+    rows = splice.embeddings[rows_before : rows_before + pad_count]
+    return _splice_rows_into_embedded(embedded, mask, rows)

@@ -947,8 +947,16 @@ def inject_mtp_support(
             mtp_hidden_variant: str = "post_norm",
             position_offset: int | None = None,
             emit_logits: bool = True,
+            input_embeddings=None,
         ):
-            input_embeds = self.model.embed_tokens(next_token_ids)
+            # Vision prompts: the caller passes the same spliced embedding
+            # rows the trunk prefill consumed, so the MTP history sees the
+            # image content instead of raw image-pad embeddings (#103).
+            input_embeds = (
+                input_embeddings
+                if input_embeddings is not None
+                else self.model.embed_tokens(next_token_ids)
+            )
             e = self.mtp.pre_fc_norm_embedding(input_embeds)
             h = self.mtp.pre_fc_norm_hidden(hidden_states)
             order = concat_order or getattr(self, "_mtplx_concat_order", "embedding_hidden")
@@ -1020,6 +1028,7 @@ def inject_mtp_support(
             concat_order=None,
             mtp_hidden_variant: str | None = None,
             position_offset: int | None = None,
+            input_embeddings=None,
         ):
             _logits, hidden = self._mtp_core(
                 hidden_states,
@@ -1030,6 +1039,7 @@ def inject_mtp_support(
                 or getattr(self, "_mtplx_hidden_variant", "post_norm"),
                 position_offset=position_offset,
                 emit_logits=False,
+                input_embeddings=input_embeddings,
             )
             return hidden
 
