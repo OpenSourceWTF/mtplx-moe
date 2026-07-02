@@ -93,7 +93,14 @@ struct ComposerInputTextView: NSViewRepresentable {
         textView.onSubmit = onSubmit
         textView.onFileDrop = onFileDrop
         syncDocumentFrame(for: textView)
-        if textView.string != text {
+        // Never overwrite the text view while an IME composition is in flight:
+        // doing so tears down the marked-text session and drops the in-progress
+        // input (CJK, dead-key accents, etc.). Defer until the composition commits.
+        if ComposerTextSync.shouldApplyBindingToTextView(
+            hasMarkedText: textView.hasMarkedText(),
+            textViewString: textView.string,
+            binding: text
+        ) {
             context.coordinator.isApplyingProgrammaticText = true
             textView.string = text
             let cursor = text.utf16.count
@@ -171,6 +178,13 @@ struct ComposerInputTextView: NSViewRepresentable {
         func textDidChange(_ notification: Notification) {
             guard !isApplyingProgrammaticText else { return }
             guard let textView = notification.object as? NSTextView else { return }
+            // While marked text is active the string is provisional IME preedit.
+            // Keep the box auto-growing, but don't publish the preedit up into the
+            // binding — that round-trip races (and kills) the live composition.
+            guard ComposerTextSync.shouldPublishEdit(hasMarkedText: textView.hasMarkedText()) else {
+                parent.recalculateHeight(for: textView)
+                return
+            }
             parent.text = textView.string
             parent.recalculateHeight(for: textView)
         }
