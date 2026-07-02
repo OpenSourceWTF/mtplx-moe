@@ -203,143 +203,28 @@ def _read_json(path: Path) -> Mapping[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _artifact_role_model_id(role: str) -> str | None:
-    normalized = role.strip().lower().replace("_", "-")
-    if not normalized:
-        return None
-    if "quality" in normalized:
-        return QUALITY_PUBLIC_MODEL_ID
-    if "fp16" in normalized or "float16" in normalized:
-        return DEFAULT_FP16_PUBLIC_MODEL_ID
-    if "gdn8" in normalized or normalized in {"optimized", "legacy-optimized"}:
-        return LEGACY_OPTIMIZED_PUBLIC_MODEL_ID
-    if "speed" in normalized or "flat4" in normalized or "maximum-speed" in normalized:
-        return DEFAULT_PUBLIC_MODEL_ID
-    return None
-
-
-def _confirmed_default_speed_model_id(path: Path, *values: object) -> str | None:
-    candidates = [str(path)]
-    for value in values:
-        if isinstance(value, str):
-            candidates.append(value)
-    for candidate in candidates:
-        inferred = _public_model_id_from_name(candidate)
-        if inferred == DEFAULT_PUBLIC_MODEL_ID:
-            return DEFAULT_PUBLIC_MODEL_ID
-    return None
-
-
-def _metadata_or_name_looks_qwen36_35b(path: Path, metadata: Mapping[str, Any] | None = None) -> bool:
-    values = [str(path), path.name]
-    if isinstance(metadata, Mapping):
-        for key in (
-            "model",
-            "model_id",
-            "base_model",
-            "source_model",
-            "repo_id",
-            "public_model_id",
-            "served_model_id",
-            "artifact_role",
-        ):
-            value = metadata.get(key)
-            if isinstance(value, str):
-                values.append(value)
-        verified_on = metadata.get("verified_on")
-        if isinstance(verified_on, Mapping):
-            value = verified_on.get("model")
-            if isinstance(value, str):
-                values.append(value)
-    text = " ".join(values).replace("\\", "/").lower()
-    return "qwen3.6-35b-a3b" in text or "qwen36-35b-a3b" in text
-
-
-def _metadata_looks_qwen(path: Path, config: Mapping[str, Any]) -> bool:
-    values: list[str] = [path.name]
-    model_type = config.get("model_type")
-    if isinstance(model_type, str):
-        values.append(model_type)
-    architectures = config.get("architectures")
-    if isinstance(architectures, list):
-        values.extend(str(item) for item in architectures if isinstance(item, str))
-    return "qwen" in " ".join(values).lower()
-
-
 def _public_model_id_from_metadata(path: Path) -> str | None:
+    """Resolve identity from the artifact's explicit runtime contract only.
+
+    Canonical ``mtplx-*`` ids are a first-party claim, so they require a
+    true first-party match: an explicit ``public_model_id`` /
+    ``served_model_id`` / ``model_id`` written into ``mtplx_runtime.json``,
+    or an exact first-party name (handled by ``_public_model_id_from_name``
+    on the path). The old fuzzy lanes — ``artifact_role`` substring
+    matching, ``verified_on`` model-string inference, ``precision_variant``
+    coercion, family-name coercion, and quantization-layout inference —
+    all mislabeled third-party builds (nom666/samuelfaj Qwopus artifacts,
+    issue #57, PR #77) and were removed in July 2026. Third-party builds
+    made with MTPLX tooling carry the same metadata shapes, so nothing
+    short of an explicit id is proof of identity.
+    """
+
     runtime = _read_json(path / "mtplx_runtime.json")
     for key in ("public_model_id", "served_model_id", "model_id"):
         value = runtime.get(key)
         if isinstance(value, str) and value.strip():
             return _sanitize_public_model_id(value)
-    runtime_values = [str(path)]
-    role = runtime.get("artifact_role")
-    if isinstance(role, str):
-        runtime_values.append(role)
-    verified_on = runtime.get("verified_on")
-    if isinstance(verified_on, dict):
-        verified_model = verified_on.get("model")
-        if isinstance(verified_model, str):
-            runtime_values.append(verified_model)
-    explicit_name = _public_model_id_from_name(" ".join(runtime_values))
-    if explicit_name in {
-        QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
-        QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
-        QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
-        QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
-        QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID,
-        QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID,
-    }:
-        return explicit_name
-    if _metadata_or_name_looks_qwen36_35b(path, runtime):
-        return QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
-    precision = runtime.get("precision_variant")
-    if isinstance(precision, str) and precision.strip().lower() in {"fp16", "float16"}:
-        return DEFAULT_FP16_PUBLIC_MODEL_ID
-    role = runtime.get("artifact_role")
-    if isinstance(role, str):
-        inferred = _artifact_role_model_id(role)
-        if inferred:
-            if inferred != DEFAULT_PUBLIC_MODEL_ID:
-                return inferred
-            confirmed = _confirmed_default_speed_model_id(path)
-            if confirmed:
-                return confirmed
-    verified_on = runtime.get("verified_on")
-    if isinstance(verified_on, dict):
-        verified_model = verified_on.get("model")
-        if isinstance(verified_model, str):
-            inferred = _artifact_role_model_id(verified_model)
-            if inferred:
-                if inferred != DEFAULT_PUBLIC_MODEL_ID:
-                    return inferred
-                confirmed = _confirmed_default_speed_model_id(path, verified_model)
-                if confirmed:
-                    return confirmed
-
-    config = _read_json(path / "config.json")
-    if not _metadata_looks_qwen(path, config):
-        return None
-    name_inferred = _public_model_id_from_name(str(path))
-    if name_inferred is None:
-        return None
-    if name_inferred == QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID:
-        return name_inferred
-    quantization = config.get("quantization") or config.get("quantization_config")
-    if isinstance(quantization, dict):
-        bits = quantization.get("bits")
-        if bits == 4:
-            child_bits = [
-                value.get("bits")
-                for value in quantization.values()
-                if isinstance(value, dict) and "bits" in value
-            ]
-            if child_bits and all(bit == 8 for bit in child_bits):
-                return QUALITY_PUBLIC_MODEL_ID
-            return DEFAULT_PUBLIC_MODEL_ID
-        if bits == 8:
-            return QUALITY_PUBLIC_MODEL_ID
-    return None
+    return _public_model_id_from_name(str(path))
 
 
 def _sanitize_public_model_id(value: str) -> str:
@@ -351,6 +236,16 @@ def _sanitize_public_model_id(value: str) -> str:
 
 
 def _public_model_id_from_name(value: str) -> str | None:
+    """Map exact first-party names (public ids, HF repo ids, released
+    folder names) to their canonical public ids.
+
+    Every pattern here is a complete first-party artifact name. Loose
+    family matches (e.g. any "qwen3.6-35b-a3b" + "mtplx" string) claimed
+    third-party builds as first-party artifacts and were removed in July
+    2026 (issue #57 / PR #77 class): a name that merely resembles the
+    family now falls through to the sanitized artifact name.
+    """
+
     text = value.strip()
     if not text:
         return None
@@ -365,11 +260,10 @@ def _public_model_id_from_name(value: str) -> str | None:
         return QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
     if "qwen3.5-9b-mtplx-optimized-speed-fp16" in lowered:
         return QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID
-    if (
-        "qwen3.5-9b" in lowered
-        and "mtplx" in lowered
-        and ("optimized-speed" in lowered or "speed-6bit" in lowered)
-    ):
+    if "qwen3.5-9b-mtplx-optimized-speed" in lowered:
+        return QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
+    if "qwen3.5-9b-mtplx-speed-6bit" in lowered:
+        # Exact released artifact family: Qwen-Qwen3.5-9B-MTPLX-Speed-6bit-*.
         return QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
     if QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID in lowered:
         return QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID
@@ -379,11 +273,10 @@ def _public_model_id_from_name(value: str) -> str | None:
         return QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID
     if QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID.lower() in lowered:
         return QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID
-    if (
-        ("qwen3.6-35b-a3b" in lowered or "qwen36-35b-a3b" in lowered)
-        and "optimized-balance-fp16" in lowered
-    ):
+    if "qwen3.6-35b-a3b-mtplx-optimized-balance-fp16" in lowered:
         return QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID
+    if "qwen3.6-35b-a3b-mtplx-optimized-balance" in lowered:
+        return QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID
     if QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID in lowered:
         return QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID
     if QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID in lowered:
@@ -392,20 +285,13 @@ def _public_model_id_from_name(value: str) -> str | None:
         return QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID
     if QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID.lower() in lowered:
         return QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
-    if (
-        ("qwen3.6-35b-a3b" in lowered or "qwen36-35b-a3b" in lowered)
-        and "optimized-speed-fp16" in lowered
-    ):
+    if "qwen3.6-35b-a3b-mtplx-optimized-speed-fp16" in lowered:
         return QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID
-    if (
-        ("qwen3.6-35b-a3b" in lowered or "qwen36-35b-a3b" in lowered)
-        and "optimized-balance" in lowered
-    ):
-        return QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID
-    if (
-        ("qwen3.6-35b-a3b" in lowered or "qwen36-35b-a3b" in lowered)
-        and "mtplx" in lowered
-    ):
+    if "qwen3.6-35b-a3b-mtplx-optimized-speed" in lowered:
+        return QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
+    if "qwen3.6-35b-a3b-mtplx-official4-cyankiwimtp-cleanrecipe" in lowered:
+        # First-party local research build of the released 35B speed
+        # artifact (listed in _OPTIMIZED_35B_SPEED_LOCAL_CANDIDATES).
         return QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
     if "qwen3.6-27b-mtplx-optimized-quality" in lowered:
         return QUALITY_PUBLIC_MODEL_ID

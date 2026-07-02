@@ -235,26 +235,70 @@ def test_public_model_id_for_ref_maps_known_local_names(model_ref, expected):
     assert public_model_id_for_ref(model_ref) == expected
 
 
-def test_public_model_id_for_ref_uses_runtime_metadata_before_folder_name(tmp_path):
+def test_public_model_id_for_ref_uses_explicit_runtime_id_before_folder_name(tmp_path):
     model = tmp_path / "whatever-local-folder"
     model.mkdir()
     (model / "mtplx_runtime.json").write_text(
-        json.dumps({"artifact_role": "optimized-quality"}),
+        json.dumps({"public_model_id": QUALITY_PUBLIC_MODEL_ID}),
         encoding="utf-8",
     )
 
     assert public_model_id_for_ref(model) == QUALITY_PUBLIC_MODEL_ID
 
 
-def test_public_model_id_for_ref_maps_gdn8_metadata_to_legacy_optimized(tmp_path):
-    model = tmp_path / "whatever-local-folder"
+def test_public_model_id_for_ref_ignores_artifact_role_substrings(tmp_path):
+    """artifact_role is written by MTPLX tooling for third-party builds too,
+    so a "quality"/"speed"/"gdn8" substring is NOT proof of first-party
+    identity (the July 2026 contract-match-only fix, issue #57 class)."""
+    for role in ("optimized-quality", "gdn8-speed4", "maximum-speed"):
+        model = tmp_path / f"whatever-{role}-folder"
+        model.mkdir()
+        (model / "mtplx_runtime.json").write_text(
+            json.dumps({"artifact_role": role}),
+            encoding="utf-8",
+        )
+        assert public_model_id_for_ref(model) == f"whatever-{role}-folder"
+
+
+def test_public_model_id_for_ref_ignores_precision_variant_coercion(tmp_path):
+    model = tmp_path / "SomeFinetune-FP16"
     model.mkdir()
     (model / "mtplx_runtime.json").write_text(
-        json.dumps({"artifact_role": "gdn8-speed4"}),
+        json.dumps({"precision_variant": "fp16"}),
         encoding="utf-8",
     )
 
-    assert public_model_id_for_ref(model) == LEGACY_OPTIMIZED_PUBLIC_MODEL_ID
+    assert public_model_id_for_ref(model) == "somefinetune-fp16"
+
+
+def test_public_model_id_for_ref_ignores_verified_on_inference(tmp_path):
+    """The nom666 Qwopus repro: a forge-built third-party artifact whose
+    verified_on.model contains "Speed" must keep its own identity."""
+    model = tmp_path / "Qwopus3.6-27B-Coder-MTPLX-4bit-Speed"
+    model.mkdir()
+    (model / "mtplx_runtime.json").write_text(
+        json.dumps(
+            {
+                "artifact_role": "forge-local",
+                "verified_on": {"model": "Qwopus3.6-27B-Coder-MTPLX-4bit-Speed"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3NextForCausalLM"],
+                "model_type": "qwen3_next",
+                "quantization": {"bits": 4},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        public_model_id_for_ref(model) == "qwopus3.6-27b-coder-mtplx-4bit-speed"
+    )
 
 
 def test_public_model_id_for_ref_does_not_map_small_speed_role_to_27b(tmp_path):
@@ -283,42 +327,31 @@ def test_public_model_id_for_ref_does_not_map_small_speed_role_to_27b(tmp_path):
     assert public_model_id_for_ref(model) == "qwen3.5-4b-mtplx-optimized-speed"
 
 
-def test_public_model_id_for_ref_maps_mixed_q4_speed_metadata_to_speed(tmp_path):
-    model = tmp_path / "Qwen3.6-27B-MTPLX-Optimized"
-    model.mkdir()
-    (model / "config.json").write_text(
-        json.dumps(
-            {
-                "quantization": {
-                    "bits": 4,
-                    "language_model.model.layers.0.mlp.down_proj": {"bits": 4},
-                    "language_model.model.layers.0.linear_attn.in_proj_qkv": {"bits": 8},
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert public_model_id_for_ref(model) == DEFAULT_PUBLIC_MODEL_ID
-
-
-def test_public_model_id_for_ref_maps_flat8_metadata_to_quality(tmp_path):
-    model = tmp_path / "Qwen3.6-27B-MTPLX-Optimized"
-    model.mkdir()
-    (model / "config.json").write_text(
-        json.dumps(
-            {
-                "quantization": {
-                    "bits": 4,
-                    "language_model.model.layers.0.mlp.down_proj": {"bits": 8},
-                    "language_model.model.layers.0.linear_attn.in_proj_qkv": {"bits": 8},
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert public_model_id_for_ref(model) == QUALITY_PUBLIC_MODEL_ID
+def test_public_model_id_for_ref_no_quantization_upgrade_of_legacy_name(tmp_path):
+    """Issue #57: the user loaded Qwen3.6-27B-MTPLX-Optimized (the legacy
+    artifact) and the CLI reported mtplx-qwen36-27b-optimized-speed because
+    the quantization layout was "upgrading" the identity. The served id
+    must match the artifact the user actually selected, regardless of its
+    quantization layout."""
+    for layout in (
+        {  # Q4 layout — used to coerce to the speed id
+            "bits": 4,
+            "language_model.model.layers.0.mlp.down_proj": {"bits": 4},
+            "language_model.model.layers.0.linear_attn.in_proj_qkv": {"bits": 8},
+        },
+        {  # Flat8-style layout — used to coerce to the quality id
+            "bits": 4,
+            "language_model.model.layers.0.mlp.down_proj": {"bits": 8},
+            "language_model.model.layers.0.linear_attn.in_proj_qkv": {"bits": 8},
+        },
+    ):
+        model = tmp_path / f"case-{layout['language_model.model.layers.0.mlp.down_proj']['bits']}" / "Qwen3.6-27B-MTPLX-Optimized"
+        model.mkdir(parents=True)
+        (model / "config.json").write_text(
+            json.dumps({"quantization": layout}),
+            encoding="utf-8",
+        )
+        assert public_model_id_for_ref(model) == LEGACY_OPTIMIZED_PUBLIC_MODEL_ID
 
 
 def test_public_model_id_for_ref_keeps_qwen36_35b_identity(tmp_path):
@@ -423,6 +456,65 @@ def test_public_model_id_for_ref_does_not_map_step_quantization_to_qwen(tmp_path
     )
 
     assert public_model_id_for_ref(model) == "step-3.7-flash-mtplx-step3p5"
+
+
+@pytest.mark.parametrize(
+    ("ref", "expected"),
+    [
+        # nom666 Qwopus builds (real third-party HF repos observed
+        # mislabeled in the June 2026 triage).
+        (
+            "nom666/Qwopus3.6-27B-Coder-MTPLX-4bit-Speed",
+            "qwopus3.6-27b-coder-mtplx-4bit-speed",
+        ),
+        (
+            "nom666/Qwopus3.6-27B-Coder-MTPLX-8bit-Quality",
+            "qwopus3.6-27b-coder-mtplx-8bit-quality",
+        ),
+        # samuelfaj 35B case from PR #77.
+        (
+            "samuelfaj/Qwopus3.6-35B-A3B-v1-8bit-MTPLX-Optimized-Speed",
+            "qwopus3.6-35b-a3b-v1-8bit-mtplx-optimized-speed",
+        ),
+        # A third-party remix that merely mentions the 35B family + MTPLX
+        # must NOT be claimed as the first-party 35B artifact (the removed
+        # family-name coercion).
+        (
+            "someguy/Qwen3.6-35B-A3B-MTPLX-Remix",
+            "qwen3.6-35b-a3b-mtplx-remix",
+        ),
+    ],
+)
+def test_public_model_id_for_ref_keeps_third_party_identity(ref, expected):
+    assert public_model_id_for_ref(ref) == expected
+
+
+@pytest.mark.parametrize(
+    ("ref", "expected"),
+    [
+        ("Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed", DEFAULT_PUBLIC_MODEL_ID),
+        (
+            "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-FP16",
+            DEFAULT_FP16_PUBLIC_MODEL_ID,
+        ),
+        ("Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality", QUALITY_PUBLIC_MODEL_ID),
+        ("Youssofal/Qwen3.6-27B-MTPLX-Optimized", LEGACY_OPTIMIZED_PUBLIC_MODEL_ID),
+        (
+            "Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed",
+            QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        ),
+        (
+            "Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed",
+            QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        ),
+        (
+            "~/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
+            DEFAULT_PUBLIC_MODEL_ID,
+        ),
+    ],
+)
+def test_public_model_id_for_ref_first_party_matrix(ref, expected):
+    assert public_model_id_for_ref(ref) == expected
 
 
 def test_public_model_id_for_ref_maps_unknown_local_name_to_sanitized_id():
