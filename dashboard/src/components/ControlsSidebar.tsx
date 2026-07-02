@@ -114,6 +114,15 @@ function DefaultsCard() {
           onChange={(v) => setDraft({ ...draft, top_k: v })}
         />
         <NumberField
+          label="presence_penalty"
+          value={draft.presence_penalty ?? 0}
+          min={0}
+          max={2}
+          step={0.05}
+          onChange={(v) => setDraft({ ...draft, presence_penalty: v })}
+          description="0 is exact (best for coding); 0.5-1.5 discourages repetition."
+        />
+        <NumberField
           label="stream_interval"
           value={draft.stream_interval}
           min={1}
@@ -150,6 +159,7 @@ function NumberField({
   max,
   step = 1,
   onChange,
+  description,
 }: {
   label: string;
   value: number;
@@ -157,6 +167,7 @@ function NumberField({
   max: number;
   step?: number;
   onChange: (next: number) => void;
+  description?: string;
 }) {
   return (
     <label className="block">
@@ -173,6 +184,9 @@ function NumberField({
         onChange={(e) => onChange(Number(e.target.value))}
         className="w-full mt-1 accent-[var(--accent)]"
       />
+      {description ? (
+        <div className="mt-0.5 text-xs text-[var(--text-muted)]">{description}</div>
+      ) : null}
     </label>
   );
 }

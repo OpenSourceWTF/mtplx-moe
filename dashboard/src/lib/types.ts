@@ -208,6 +208,7 @@ export type MutableSettings = {
   temperature: number;
   top_p: number;
   top_k: number;
+  presence_penalty: number;
   max_response_tokens: number | null;
   stream_interval: number;
   enable_thinking: boolean;
