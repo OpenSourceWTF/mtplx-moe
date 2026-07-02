@@ -1167,24 +1167,57 @@ class MaxSession:
 class SmartFanController:
     """Request-scoped max-fan lease for Smart fan mode.
 
-    Smart is intentionally lighter than ``MaxSession``: it commands max before
-    visible generation starts, but it does not wait for actual RPM verification
-    because that would delay prefill. It reference-counts overlapping requests
-    and restores Apple auto only after the last visible request finishes.
+    Smart is intentionally lighter than ``MaxSession``: it commands max as
+    soon as a request arrives, without making the request wait for the fan
+    hardware. It reference-counts overlapping leases and restores Apple auto
+    only after the last lease has been idle for ``restore_delay_s``.
+
+    Contract (July 2026 overhaul, issue #127):
+    - ``begin_request``/``end_request`` never block and never run a
+      subprocess on the caller thread. All hardware commands execute on one
+      dedicated worker thread; the controller lock only guards state.
+      This is what allows the ramp to be issued at HTTP request arrival
+      (before prompt encoding and queueing) at zero request-path cost.
+    - After commanding max the worker verifies the daemon accepted the
+      target RPM (``fan_summary``) and retries the command once if not.
+      It then keeps polling until the physical ramp is visible. Ramp
+      latencies and verification state are surfaced via ``status()``
+      (and therefore ``/health``).
+    - The restore is debounced: back-to-back requests (agent tool loops,
+      generation -> idle-postcommit handoffs) reuse the ramp instead of
+      flapping the fans down and up again.
+    - ``detach()`` lets an external owner (Max mode) take over fan
+      hardware without a scheduled smart restore racing it back to auto.
     """
 
-    def __init__(self, *, log: Any = None, restore_delay_s: float = 0.2) -> None:
+    _ACTUAL_RAMP_TIMEOUT_S = 30.0
+    _ACTUAL_RAMP_POLL_INTERVAL_S = 1.0
+    _WAIT_FOR_RESTORE_TIMEOUT_S = 30.0
+
+    def __init__(self, *, log: Any = None, restore_delay_s: float = 2.0) -> None:
         self.log = log
         self.restore_delay_s = max(0.0, float(restore_delay_s))
         self._lock = threading.RLock()
+        self._cond = threading.Condition(self._lock)
         self._active_requests: set[str] = set()
         self._cleanup: Any | None = None
         self._generation = 0
         self._commanded_max = False
+        self._target_verified = False
+        self._actual_ramp_verified = False
+        self._ramp_requested_at: float | None = None
+        self._ramp_latency_s: float | None = None
+        self._actual_ramp_latency_s: float | None = None
+        self._ramp_attempts = 0
+        self._ramp_failed_generation: int | None = None
+        self._actual_poll_deadline: float | None = None
+        self._next_actual_probe_at: float | None = None
+        self._idle_since: float | None = None
         self._last_transition_at: float | None = None
         self._last_result: dict[str, Any] | None = None
         self._last_error: str | None = None
-        self._restore_thread: threading.Thread | None = None
+        self._worker: threading.Thread | None = None
+        self._shutdown = False
 
     def _emit(self, line: str) -> None:
         if self.log is not None:
@@ -1193,114 +1226,323 @@ class SmartFanController:
             except Exception:
                 pass
 
+    # -- public lease API (non-blocking) ---------------------------------
+
     def begin_request(self, request_id: str) -> dict[str, Any]:
         request_key = str(request_id or "request")
-        with self._lock:
+        with self._cond:
             if request_key in self._active_requests:
-                return self.status()
+                return self._status_locked()
             self._active_requests.add(request_key)
             self._generation += 1
-            if len(self._active_requests) > 1 and self._commanded_max:
-                return self.status()
-            try:
-                check_and_recover_stale_max()
-            except Exception as exc:
-                self._last_error = f"stale_recovery:{type(exc).__name__}: {exc}"
-            if self._cleanup is None:
-                self._cleanup = install_max_lifecycle_hooks()
-            try:
-                result = set_thermal_profile("performance")
-                self._last_result = result
-                self._last_transition_at = time.time()
-                self._commanded_max = bool(result.get("ok"))
-                if self._commanded_max:
-                    self._last_error = None
-                else:
-                    self._last_error = str(result.get("message") or "max command failed")
-                    self._emit(f"[smart-fan] max command failed: {self._last_error}")
-            except Exception as exc:
-                self._commanded_max = False
-                self._last_error = f"{type(exc).__name__}: {exc}"
-                self._last_result = {"ok": False, "error": self._last_error}
-                self._emit(f"[smart-fan] max command raised: {self._last_error}")
-            return self.status()
+            self._idle_since = None
+            if not self._commanded_max and self._ramp_requested_at is None:
+                self._ramp_requested_at = time.monotonic()
+            self._ensure_worker_locked()
+            self._cond.notify_all()
+            return self._status_locked()
 
     def end_request(self, request_id: str, *, wait_for_restore: bool = False) -> dict[str, Any]:
         request_key = str(request_id or "request")
-        with self._lock:
+        with self._cond:
             self._active_requests.discard(request_key)
             self._generation += 1
-            generation = self._generation
-            if self._active_requests:
-                return self.status()
+            became_idle = not self._active_requests
+            if became_idle:
+                self._idle_since = time.monotonic()
+                if wait_for_restore:
+                    # Skip the debounce for explicit synchronous restores
+                    # (bench lanes, shutdown paths).
+                    self._idle_since -= self.restore_delay_s
+            self._ensure_worker_locked()
+            self._cond.notify_all()
+            if not became_idle:
+                return self._status_locked()
             if not self._commanded_max and self._cleanup is None:
-                return self.status()
+                return self._status_locked()
         if wait_for_restore:
-            self._restore_if_still_idle(generation)
-        else:
-            self._schedule_restore(generation)
+            self._wait_until_restored()
         return self.status()
-
-    def _schedule_restore(self, generation: int) -> None:
-        with self._lock:
-            self._restore_thread = threading.Thread(
-                target=self._restore_if_still_idle,
-                args=(generation,),
-                name="mtplx-smart-fan-restore",
-                daemon=True,
-            )
-            self._restore_thread.start()
-
-    def _restore_if_still_idle(self, generation: int) -> None:
-        if self.restore_delay_s > 0:
-            time.sleep(self.restore_delay_s)
-        with self._lock:
-            if self._active_requests or generation != self._generation:
-                return
-            cleanup = self._cleanup
-            self._cleanup = None
-            try:
-                if cleanup is not None:
-                    result = cleanup()
-                else:
-                    result = restore_thermal_profile_verified(log=self._emit)
-                    if result.get("ok"):
-                        _clear_max_marker()
-                self._last_result = result
-                self._last_transition_at = time.time()
-                if result.get("ok"):
-                    self._commanded_max = False
-                    self._last_error = None
-                else:
-                    self._last_error = str(result.get("message") or "restore failed")
-                    self._emit(f"[smart-fan] restore warning: {self._last_error}")
-            except Exception as exc:
-                self._last_error = f"{type(exc).__name__}: {exc}"
-                self._last_result = {"ok": False, "error": self._last_error}
-                self._emit(f"[smart-fan] restore raised: {self._last_error}")
 
     def restore_now(self, *, wait: bool = True) -> dict[str, Any]:
-        with self._lock:
+        with self._cond:
             self._active_requests.clear()
             self._generation += 1
-            generation = self._generation
+            self._idle_since = time.monotonic() - self.restore_delay_s
+            self._ensure_worker_locked()
+            self._cond.notify_all()
         if wait:
-            self._restore_if_still_idle(generation)
-        else:
-            self._schedule_restore(generation)
+            self._wait_until_restored()
         return self.status()
+
+    def detach(self) -> dict[str, Any]:
+        """Drop all leases and pending fan work WITHOUT touching hardware.
+
+        Used when an external owner takes over fan control (switching the
+        server to Max mode): the old behavior scheduled a delayed smart
+        restore that could fire *after* the Max pin landed and silently
+        drop fans back to auto while the UI showed Max (issue #127).
+        """
+        with self._cond:
+            self._active_requests.clear()
+            self._generation += 1
+            self._commanded_max = False
+            self._target_verified = False
+            self._actual_ramp_verified = False
+            self._ramp_requested_at = None
+            self._actual_poll_deadline = None
+            self._next_actual_probe_at = None
+            self._idle_since = None
+            # Drop our reference so the worker does not schedule a restore;
+            # the atexit hook installed by install_max_lifecycle_hooks stays
+            # registered and still restores fans on process exit.
+            self._cleanup = None
+            self._cond.notify_all()
+            return self._status_locked()
+
+    def wait_for_ramp(self, timeout_s: float = 10.0) -> bool:
+        """Block until the worker has commanded max (True) or the ramp
+        attempt for the current lease generation failed / timed out (False).
+
+        The request path never calls this — it exists for bench lanes,
+        tests, and QA probes that need a synchronization point with the
+        async worker.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with self._cond:
+            while True:
+                if self._commanded_max:
+                    return True
+                if self._ramp_failed_generation == self._generation:
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return bool(self._commanded_max)
+                self._cond.wait(timeout=remaining)
 
     def status(self) -> dict[str, Any]:
         with self._lock:
-            return {
-                "active": bool(self._active_requests),
-                "active_count": len(self._active_requests),
-                "active_requests": sorted(self._active_requests),
-                "commanded_max": bool(self._commanded_max),
-                "last_transition_at": self._last_transition_at,
-                "last_error": self._last_error,
-                "last_result": self._last_result,
-            }
+            return self._status_locked()
+
+    def _status_locked(self) -> dict[str, Any]:
+        return {
+            "active": bool(self._active_requests),
+            "active_count": len(self._active_requests),
+            "active_requests": sorted(self._active_requests),
+            "commanded_max": bool(self._commanded_max),
+            "target_verified": bool(self._target_verified),
+            "actual_ramp_verified": bool(self._actual_ramp_verified),
+            "ramp_latency_s": self._ramp_latency_s,
+            "actual_ramp_latency_s": self._actual_ramp_latency_s,
+            "ramp_attempts": self._ramp_attempts,
+            "last_transition_at": self._last_transition_at,
+            "last_error": self._last_error,
+            "last_result": self._last_result,
+        }
+
+    # -- worker machinery -------------------------------------------------
+
+    def _ensure_worker_locked(self) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            return
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name="mtplx-smart-fan-worker",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def _wait_until_restored(self) -> None:
+        deadline = time.monotonic() + self._WAIT_FOR_RESTORE_TIMEOUT_S
+        with self._cond:
+            while self._commanded_max and not self._active_requests:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                self._cond.wait(timeout=remaining)
+
+    def _worker_loop(self) -> None:
+        while True:
+            action: str | None = None
+            with self._cond:
+                while action is None:
+                    if self._shutdown:
+                        return
+                    now = time.monotonic()
+                    desired_max = bool(self._active_requests)
+                    if desired_max and not self._commanded_max:
+                        if self._ramp_failed_generation == self._generation:
+                            # The last ramp (with its retry) failed for this
+                            # lease generation; don't hammer the daemon.
+                            # A new begin_request bumps the generation and
+                            # re-arms the attempt.
+                            self._cond.wait()
+                            continue
+                        action = "ramp"
+                    elif not desired_max and (self._commanded_max or self._cleanup is not None):
+                        if self._idle_since is None:
+                            self._idle_since = now
+                        remaining = self._idle_since + self.restore_delay_s - now
+                        if remaining <= 0:
+                            action = "restore"
+                        else:
+                            self._cond.wait(timeout=remaining)
+                    elif (
+                        desired_max
+                        and self._commanded_max
+                        and not self._actual_ramp_verified
+                        and self._actual_poll_deadline is not None
+                    ):
+                        if now >= (self._next_actual_probe_at or 0.0):
+                            action = "probe_actual"
+                        else:
+                            self._cond.wait(
+                                timeout=max(0.05, (self._next_actual_probe_at or now) - now)
+                            )
+                    else:
+                        self._cond.wait()
+            if action == "ramp":
+                self._do_ramp()
+            elif action == "restore":
+                self._do_restore()
+            elif action == "probe_actual":
+                self._do_probe_actual()
+
+    def _do_ramp(self) -> None:
+        with self._lock:
+            generation = self._generation
+            requested_at = self._ramp_requested_at or time.monotonic()
+        try:
+            check_and_recover_stale_max()
+        except Exception as exc:
+            with self._lock:
+                self._last_error = f"stale_recovery:{type(exc).__name__}: {exc}"
+        with self._lock:
+            needs_hooks = self._cleanup is None
+        if needs_hooks:
+            hooks = install_max_lifecycle_hooks()
+            with self._lock:
+                if self._cleanup is None:
+                    self._cleanup = hooks
+        result: dict[str, Any] | None = None
+        error: str | None = None
+        ok = False
+        attempts = 0
+        for _attempt in range(2):  # initial command + one bounded retry
+            attempts += 1
+            try:
+                result = set_thermal_profile("performance")
+            except Exception as exc:
+                result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            if not result.get("ok"):
+                error = str(result.get("message") or result.get("error") or "max command failed")
+                continue
+            try:
+                summary = fan_summary()
+            except Exception as exc:
+                summary = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            if _summary_indicates_max(summary):
+                ok = True
+                error = None
+                break
+            error = "daemon accepted the command but is not commanding max target RPM"
+        now = time.monotonic()
+        with self._cond:
+            self._ramp_attempts += attempts
+            self._last_result = result
+            self._last_transition_at = time.time()
+            self._commanded_max = ok
+            self._target_verified = ok
+            if ok:
+                self._last_error = None
+                self._ramp_latency_s = now - requested_at
+                self._actual_ramp_verified = False
+                self._actual_poll_deadline = now + self._ACTUAL_RAMP_TIMEOUT_S
+                self._next_actual_probe_at = now
+                self._emit(
+                    "[smart-fan] max commanded and target verified in "
+                    f"{self._ramp_latency_s:.2f}s (attempt {attempts})"
+                )
+            else:
+                self._last_error = error
+                self._ramp_failed_generation = generation
+                self._emit(
+                    f"[smart-fan] ramp FAILED after {attempts} attempt(s): {error} "
+                    "— run `mtplx max --status` to check ThermalForge"
+                )
+            self._cond.notify_all()
+
+    def _do_probe_actual(self) -> None:
+        try:
+            summary = fan_summary()
+        except Exception:
+            summary = {"ok": False}
+        ramped = _summary_indicates_actual_ramp(summary)
+        now = time.monotonic()
+        with self._cond:
+            self._next_actual_probe_at = now + self._ACTUAL_RAMP_POLL_INTERVAL_S
+            if not self._commanded_max or self._actual_poll_deadline is None:
+                return
+            if ramped:
+                self._actual_ramp_verified = True
+                self._actual_poll_deadline = None
+                if self._ramp_requested_at is not None:
+                    self._actual_ramp_latency_s = now - self._ramp_requested_at
+                    self._emit(
+                        "[smart-fan] actual fan RPM ramp verified in "
+                        f"{self._actual_ramp_latency_s:.1f}s"
+                    )
+            elif now >= self._actual_poll_deadline:
+                self._actual_poll_deadline = None
+                self._last_error = (
+                    "target accepted but actual fan RPM did not ramp within "
+                    f"{self._ACTUAL_RAMP_TIMEOUT_S:.0f}s"
+                )
+                self._emit(
+                    f"[smart-fan] WARNING: {self._last_error} "
+                    "— check `mtplx max --status`"
+                )
+            self._cond.notify_all()
+
+    def _do_restore(self) -> None:
+        with self._lock:
+            if self._active_requests:
+                return
+            cleanup = self._cleanup
+            self._cleanup = None
+        try:
+            if cleanup is not None:
+                result = cleanup()
+            else:
+                result = restore_thermal_profile_verified(log=self._emit)
+                if result.get("ok"):
+                    _clear_max_marker()
+        except Exception as exc:
+            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        with self._cond:
+            self._last_result = result
+            self._last_transition_at = time.time()
+            if result.get("ok"):
+                self._commanded_max = False
+                self._target_verified = False
+                self._actual_ramp_verified = False
+                self._ramp_requested_at = None
+                self._actual_poll_deadline = None
+                self._last_error = None
+            else:
+                self._last_error = str(
+                    result.get("message") or result.get("error") or "restore failed"
+                )
+                self._emit(f"[smart-fan] restore warning: {self._last_error}")
+                # Do not leave a half-restored latch: treat as restored so
+                # the next lease re-commands max from a clean slate, and
+                # keep the error surfaced in status()/health.
+                self._commanded_max = False
+                self._target_verified = False
+                self._actual_ramp_verified = False
+                self._ramp_requested_at = None
+                self._actual_poll_deadline = None
+            self._cond.notify_all()
 
 
 def set_thermal_profile(profile: str, *, dry_run: bool = False) -> dict[str, Any]:

@@ -13491,6 +13491,17 @@ def _schedule_idle_postcommit_snapshot(
             or _foreground_model_work_pending(state)
         )
 
+    # The postcommit re-prefills the conversation at full GPU load after the
+    # HTTP response has already finished. Hold a smart-fan lease from
+    # schedule time (while the request's own lease is still active, so the
+    # refcount never dips to zero in between) until the postcommit resolves,
+    # so fans stay ramped through the post-generation GPU phase instead of
+    # restoring to auto right as the re-prefill starts (issue #127).
+    fan_lease = _begin_smart_fan_request(
+        state,
+        request_id=f"postcommit-{uuid.uuid4().hex}",
+    )
+
     def async_postcommit() -> None:
         deadline = time.monotonic() + _IDLE_POSTCOMMIT_MAX_WAIT_S
         record = pending_record_holder.get("record")
@@ -13568,12 +13579,20 @@ def _schedule_idle_postcommit_snapshot(
                     "reason": f"async_postcommit_raised:{type(exc).__name__}",
                 }
             )
+        finally:
+            _end_smart_fan_request(state, fan_lease)
 
-    future = _submit_idle_postcommit_model_work(
-        state,
-        async_postcommit,
-        batch_key=f"postcommit:{session_id or 'stateless'}",
-    )
+    try:
+        future = _submit_idle_postcommit_model_work(
+            state,
+            async_postcommit,
+            batch_key=f"postcommit:{session_id or 'stateless'}",
+        )
+    except BaseException:
+        # Submission failed; the job will never run, so release the fan
+        # lease here or it would pin fans until process exit.
+        _end_smart_fan_request(state, fan_lease)
+        raise
     # Stash the future on the EngineSession so the next request in this
     # session can wait briefly for it before acquiring the session lock.
     # The wait is bounded and best-effort: if the postcommit raises or
@@ -14026,6 +14045,56 @@ def _end_smart_fan_request(
         controller.end_request(lease_id, wait_for_restore=wait_for_restore)
     except Exception as exc:
         LOGGER.warning("Smart fan restore failed: %s", exc)
+
+
+_SMART_FAN_ARRIVAL_PATHS = {
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/messages",
+}
+
+
+class _SmartFanArrivalMiddleware:
+    """Issue the Smart-mode fan ramp at HTTP request arrival.
+
+    The generation dispatch sites also hold leases, but they only begin
+    after routing, body parsing, transcript canonicalization, prompt
+    encoding, and queueing — on long prompts that is exactly the prefill
+    lead-in users hear happening on silent fans (#127 flakiness reports).
+    This ASGI middleware leases the fans the moment a generation POST
+    arrives and releases when the response (including the full stream
+    body) has been sent. ``SmartFanController.begin_request`` is
+    non-blocking, so this adds no request-path latency.
+
+    Small background tasks (Open WebUI title/tag probes, identified by
+    their ``x-openwebui-task`` header) are skipped, mirroring the
+    ``background_request`` gate at the dispatch sites.
+    """
+
+    def __init__(self, app: Any, state: Any) -> None:
+        self.app = app
+        self.state = state
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if (
+            scope.get("type") != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path") not in _SMART_FAN_ARRIVAL_PATHS
+            or any(
+                name == b"x-openwebui-task"
+                for name, _value in (scope.get("headers") or [])
+            )
+        ):
+            await self.app(scope, receive, send)
+            return
+        lease = _begin_smart_fan_request(
+            self.state,
+            request_id=f"http-arrival-{uuid.uuid4().hex}",
+        )
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _end_smart_fan_request(self.state, lease)
 
 
 def _run_generation_dispatched(
@@ -17285,6 +17354,10 @@ def create_app(state: ServerState) -> FastAPI:
 
     app = FastAPI(title="MTPLX OpenAI-compatible server", lifespan=lifespan)
     app.state.mtplx = state
+    # Registered before the auth middleware below so auth stays outermost
+    # (the most recently added Starlette middleware runs first): fans only
+    # ramp for requests that passed the API-key and rate-limit gates.
+    app.add_middleware(_SmartFanArrivalMiddleware, state=state)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -17467,6 +17540,14 @@ def create_app(state: ServerState) -> FastAPI:
             "smart_fan_active_count": int(smart_status.get("active_count") or 0),
             "smart_fan_last_transition_at": smart_status.get("last_transition_at"),
             "smart_fan_last_error": smart_status.get("last_error"),
+            "smart_fan_target_verified": bool(smart_status.get("target_verified")),
+            "smart_fan_actual_ramp_verified": bool(
+                smart_status.get("actual_ramp_verified")
+            ),
+            "smart_fan_ramp_latency_s": smart_status.get("ramp_latency_s"),
+            "smart_fan_actual_ramp_latency_s": smart_status.get(
+                "actual_ramp_latency_s"
+            ),
             "startup": _startup_health_payload(state),
             "thermal": _thermal_health_payload(
                 fan_mode=fan_mode,
@@ -17770,7 +17851,11 @@ def create_app(state: ServerState) -> FastAPI:
             mode = normalize_fan_mode(request.mode)
             if mode == FAN_MODE_MAX:
                 if getattr(state, "smart_fans", None) is not None:
-                    state.smart_fans.restore_now(wait=False)
+                    # detach(), NOT restore_now(): a scheduled smart restore
+                    # would fire AFTER the max pin below and silently drop
+                    # fans back to auto while the UI shows Max (#127's
+                    # "max released early" report).
+                    state.smart_fans.detach()
                 kwargs: dict[str, Any] = {
                     "require_actual_ramp": bool(request.require_actual_ramp)
                 }
@@ -17795,9 +17880,11 @@ def create_app(state: ServerState) -> FastAPI:
                     "smart": smart_status,
                 }
             else:
-                result = restore_thermal_profile_verified()
+                # Synchronously drain any smart lease/restore first so the
+                # verified restore below is the last word on fan state.
                 if getattr(state, "smart_fans", None) is not None:
-                    state.smart_fans.restore_now(wait=False)
+                    state.smart_fans.restore_now(wait=True)
+                result = restore_thermal_profile_verified()
                 if result.get("ok"):
                     state.fan_mode = FAN_MODE_DEFAULT
                     state.args.fan_mode = FAN_MODE_DEFAULT

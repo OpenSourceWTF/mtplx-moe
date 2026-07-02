@@ -53,3 +53,9 @@ mtplx max --status --json
 ```
 
 If no supported thermal tool is detected, install ThermalForge or TG Pro and ensure the CLI is on `PATH`. MTPLX will not enable hidden spin-loop or clock-anchor fallbacks.
+
+## Fans Stay On Briefly After a Response (Smart Mode)
+
+That is intentional, not a leak. After the response finishes streaming, MTPLX may run a short background "postcommit" pass that re-processes the conversation into the session cache so your *next* message starts from a warm prefix instead of a cold prefill. That pass uses the GPU at full tilt for a few seconds, so Smart fan mode deliberately holds the fan lease through it and only restores the Apple automatic curve once the GPU work is actually done (plus a ~2 s debounce so back-to-back agent tool calls don't flap the fans down and up).
+
+In Smart mode the ramp is issued the moment your request arrives — before prompt processing starts — and the server verifies the fan daemon accepted the target RPM (retrying once if it didn't). You can watch this in `GET /health`: `smart_fan_target_verified`, `smart_fan_actual_ramp_verified`, `smart_fan_ramp_latency_s`, and `smart_fan_last_error` tell you exactly what the fan controller last did. If `smart_fan_last_error` mentions sudo, run `mtplx max --grant-sudo` once.

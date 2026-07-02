@@ -32,8 +32,29 @@ def test_set_thermal_profile_without_tool_is_actionable(monkeypatch):
     thermal.detect_thermal_control.cache_clear()
 
 
-def test_smart_fan_controller_keeps_max_until_final_request(monkeypatch):
-    calls: list[str] = []
+_RAMPED_SUMMARY = {
+    "ok": True,
+    "fans": [
+        {
+            "mode": "manual",
+            "target_rpm": 7826,
+            "actual_rpm": 7800,
+            "max_capacity_rpm": 7826,
+        }
+    ],
+}
+
+
+def _patch_smart_fan_hardware(monkeypatch, calls, *, set_results=None):
+    """Stub every hardware touchpoint the SmartFanController worker uses."""
+
+    results = list(set_results or [])
+
+    def fake_set(profile):
+        calls.append(profile)
+        if results:
+            return results.pop(0)
+        return {"ok": True, "profile": profile}
 
     monkeypatch.setattr(thermal, "check_and_recover_stale_max", lambda: None)
     monkeypatch.setattr(
@@ -41,14 +62,19 @@ def test_smart_fan_controller_keeps_max_until_final_request(monkeypatch):
         "install_max_lifecycle_hooks",
         lambda: (lambda: calls.append("auto") or {"ok": True, "profile": "silent"}),
     )
-    monkeypatch.setattr(
-        thermal,
-        "set_thermal_profile",
-        lambda profile: calls.append(profile) or {"ok": True, "profile": profile},
-    )
+    monkeypatch.setattr(thermal, "set_thermal_profile", fake_set)
+    monkeypatch.setattr(thermal, "fan_summary", lambda: _RAMPED_SUMMARY)
+
+
+def test_smart_fan_controller_keeps_max_until_final_request(monkeypatch):
+    calls: list[str] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
 
     controller = thermal.SmartFanController(restore_delay_s=0)
     controller.begin_request("first")
+    # begin_request is non-blocking; synchronize with the worker before
+    # asserting on the hardware call log.
+    assert controller.wait_for_ramp(5.0) is True
     controller.begin_request("second")
 
     assert calls == ["performance"]
@@ -61,6 +87,110 @@ def test_smart_fan_controller_keeps_max_until_final_request(monkeypatch):
     assert status["active"] is False
     assert status["active_count"] == 0
     assert status["commanded_max"] is False
+
+
+def test_smart_fan_controller_begin_does_not_block_on_hardware(monkeypatch):
+    """The whole point of the worker-thread overhaul: a slow fan daemon
+    must not delay the request path. begin_request returns immediately
+    even while the (stubbed) hardware command is still running."""
+    import threading as _threading
+
+    release = _threading.Event()
+    calls: list[str] = []
+
+    def slow_set(profile):
+        release.wait(timeout=10.0)
+        calls.append(profile)
+        return {"ok": True, "profile": profile}
+
+    monkeypatch.setattr(thermal, "check_and_recover_stale_max", lambda: None)
+    monkeypatch.setattr(
+        thermal,
+        "install_max_lifecycle_hooks",
+        lambda: (lambda: {"ok": True, "profile": "silent"}),
+    )
+    monkeypatch.setattr(thermal, "set_thermal_profile", slow_set)
+    monkeypatch.setattr(thermal, "fan_summary", lambda: _RAMPED_SUMMARY)
+
+    controller = thermal.SmartFanController(restore_delay_s=0)
+    import time as _time
+
+    started = _time.monotonic()
+    status = controller.begin_request("req")
+    elapsed = _time.monotonic() - started
+
+    assert elapsed < 0.5, f"begin_request blocked for {elapsed:.2f}s"
+    assert status["active"] is True
+    release.set()
+    assert controller.wait_for_ramp(5.0) is True
+    controller.end_request("req", wait_for_restore=True)
+
+
+def test_smart_fan_controller_retries_failed_ramp_once(monkeypatch):
+    calls: list[str] = []
+    _patch_smart_fan_hardware(
+        monkeypatch,
+        calls,
+        set_results=[
+            {"ok": False, "message": "daemon busy"},
+            {"ok": True, "profile": "performance"},
+        ],
+    )
+
+    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller.begin_request("req")
+
+    assert controller.wait_for_ramp(5.0) is True
+    status = controller.status()
+    assert status["ramp_attempts"] == 2
+    assert status["target_verified"] is True
+    assert status["ramp_latency_s"] is not None
+    controller.end_request("req", wait_for_restore=True)
+
+
+def test_smart_fan_controller_reports_failure_without_hammering(monkeypatch):
+    calls: list[str] = []
+    _patch_smart_fan_hardware(
+        monkeypatch,
+        calls,
+        set_results=[
+            {"ok": False, "message": "no sudo"},
+            {"ok": False, "message": "no sudo"},
+        ],
+    )
+
+    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller.begin_request("req")
+
+    assert controller.wait_for_ramp(5.0) is False
+    status = controller.status()
+    assert status["commanded_max"] is False
+    assert "no sudo" in (status["last_error"] or "")
+    # Initial attempt + exactly one retry — no further hammering while the
+    # same lease generation stays active.
+    assert calls == ["performance", "performance"]
+    controller.end_request("req", wait_for_restore=True)
+
+
+def test_smart_fan_controller_detach_never_touches_hardware(monkeypatch):
+    calls: list[str] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+
+    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller.begin_request("req")
+    assert controller.wait_for_ramp(5.0) is True
+
+    status = controller.detach()
+
+    assert status["active"] is False
+    assert status["commanded_max"] is False
+    # detach() must NOT issue `thermalforge auto` — an external owner (Max
+    # mode) is taking over and a delayed smart restore would silently drop
+    # the new Max pin back to auto.
+    import time as _time
+
+    _time.sleep(0.2)
+    assert calls == ["performance"]
 
 
 def test_thermalforge_profile_candidates_match_real_cli():
