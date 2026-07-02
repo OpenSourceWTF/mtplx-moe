@@ -1931,6 +1931,8 @@ def build_parser() -> argparse.ArgumentParser:
     start_flow_p.add_argument("--temperature", type=float, default=0.6)
     start_flow_p.add_argument("--top-p", type=float, default=0.95)
     start_flow_p.add_argument("--top-k", type=int, default=20)
+    start_flow_p.add_argument("--default-presence-penalty", dest="default_presence_penalty", type=float, default=0.0)
+    start_flow_p.add_argument("--default-frequency-penalty", dest="default_frequency_penalty", type=float, default=0.0)
     start_flow_p.add_argument("--depth", type=int, default=3)
     _add_mtp_toggle_args(start_flow_p)
     start_flow_p.add_argument("--seed", type=int, default=0)

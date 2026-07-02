@@ -10915,6 +10915,8 @@ def _with_server_policy_args(target: Any, source: Any) -> Any:
     for attr, default in (
         ("api_key_file", None),
         ("api_key_source", "none"),
+        ("default_presence_penalty", 0.0),
+        ("default_frequency_penalty", 0.0),
         ("paged_kv_quantization", "off"),
         ("tool_prompt_mode", "hybrid"),
         ("chat_template_profile", "local_qwen36"),
