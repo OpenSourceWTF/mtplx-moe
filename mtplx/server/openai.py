@@ -680,6 +680,8 @@ class ChatCompletionRequest(BaseModel):
     top_k: int | None = Field(
         default=None, validation_alias=AliasChoices("top_k", "topK")
     )
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
     depth: int | None = None
     draft_block_size: int | None = None
     gemma_draft_block_size: int | None = None
@@ -913,6 +915,8 @@ class MTPLXSettingsUpdate(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
     max_response_tokens: int | None = None
     stream_interval: int | None = None
     enable_thinking: bool | None = None
@@ -944,6 +948,8 @@ class CompletionRequest(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
     depth: int | None = None
     draft_block_size: int | None = None
     gemma_draft_block_size: int | None = None
@@ -9720,6 +9726,10 @@ def _ignored_client_control_fields(request: BaseModel) -> list[str]:
         fields.append("top_p")
     if getattr(request, "top_k", None) is not None:
         fields.append("top_k")
+    if getattr(request, "presence_penalty", None) is not None:
+        fields.append("presence_penalty")
+    if getattr(request, "frequency_penalty", None) is not None:
+        fields.append("frequency_penalty")
     if getattr(request, "enable_thinking", None) is not None:
         fields.append("enable_thinking")
     if getattr(request, "reasoning_effort", None) is not None:
@@ -10472,6 +10482,8 @@ DASHBOARD_MUTABLE_SETTINGS_KEYS: tuple[str, ...] = (
     "temperature",
     "top_p",
     "top_k",
+    "presence_penalty",
+    "frequency_penalty",
     "max_response_tokens",
     "stream_interval",
     "enable_thinking",
@@ -10788,6 +10800,14 @@ def _coerce_setting(name: str, value: Any) -> Any:
         if name == "draft_temperature" and coerced < 0:
             raise ValueError("draft_temperature must be non-negative")
         return coerced
+    if name in {"presence_penalty", "frequency_penalty"}:
+        try:
+            coerced = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a number") from exc
+        if not -2.0 <= coerced <= 2.0:
+            raise ValueError(f"{name} must be between -2 and 2")
+        return coerced
     if name == "enable_thinking":
         if isinstance(value, bool):
             return value
@@ -10892,7 +10912,13 @@ def _mtplx_apply_settings_payload(
                     status_code=400,
                     detail="generation_mode 'mtp' requires a runtime loaded with MTP",
                 )
-            setattr(state.args, key, value)
+            if key in {"presence_penalty", "frequency_penalty"}:
+                # The live-settings surface uses the plain OpenAI field names;
+                # the server args store them as the CLI's --default-*-penalty
+                # attributes that _generation_params reads.
+                setattr(state.args, f"default_{key}", value)
+            else:
+                setattr(state.args, key, value)
             applied[key] = value
         implicit_draft_updates: dict[str, Any] = {}
         if getattr(state, "draft_sampler", None) is not None:
@@ -11040,6 +11066,12 @@ def _mtplx_current_settings(state: "ServerState") -> dict[str, Any]:
         "temperature": float(getattr(args, "temperature", 0.6) or 0.0),
         "top_p": float(getattr(args, "top_p", 0.95) or 0.0),
         "top_k": int(getattr(args, "top_k", 20) or 0),
+        "presence_penalty": float(
+            getattr(args, "default_presence_penalty", 0.0) or 0.0
+        ),
+        "frequency_penalty": float(
+            getattr(args, "default_frequency_penalty", 0.0) or 0.0
+        ),
         "max_response_tokens": getattr(args, "max_response_tokens", None),
         "stream_interval": int(getattr(args, "stream_interval", 1) or 1),
         "enable_thinking": bool(getattr(args, "enable_thinking", False)),
@@ -14141,6 +14173,8 @@ def _run_generation(
     temperature: float | None,
     top_p: float | None,
     top_k: int | None,
+    presence_penalty: float | None = None,
+    frequency_penalty: float | None = None,
     seed: int | None,
     draft_sampler: SamplerConfig | None = None,
     generation_mode: str | None = None,
@@ -14172,6 +14206,8 @@ def _run_generation(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
     )
     uncapped_repetition_stop = _uncapped_repetition_stop_enabled(generation_limits)
     generation_limits["uncapped_repetition_stop_enabled"] = bool(
@@ -16057,6 +16093,11 @@ def _chat_ui_html(
         <input id="ctl-top-k" type="range" min="0" max="100" step="1" value="20">
         <p class="help">0 disables top-k.</p>
       </div>
+      <div class="sb-row">
+        <label for="ctl-presence">Presence Penalty <span class="v" id="val-presence">0.00</span></label>
+        <input id="ctl-presence" type="range" min="0" max="2" step="0.05" value="0">
+        <p class="help">0 is exact (best for coding); 0.5&ndash;1.5 discourages repetition.</p>
+      </div>
     </div>
     <div class="sb-section">
       <p class="sb-title">Speculative</p>
@@ -16169,6 +16210,7 @@ def _chat_ui_html(
       temperature: {min: 0, max: 2},
       top_p: {min: 0, max: 1},
       top_k: {min: 0, max: 100},
+      presence_penalty: {min: 0, max: 2},
       depth: {min: 1, max: __DEPTH_MAX__},
       max_tokens: {min: 256, max: 32768}
     };
@@ -16235,6 +16277,7 @@ def _chat_ui_html(
       temperature: document.getElementById("ctl-temp"),
       top_p: document.getElementById("ctl-top-p"),
       top_k: document.getElementById("ctl-top-k"),
+      presence_penalty: document.getElementById("ctl-presence"),
       mtp_enabled: document.getElementById("ctl-mtp"),
       depth: document.getElementById("ctl-depth"),
       max_tokens: document.getElementById("ctl-max-tokens"),
@@ -16245,6 +16288,7 @@ def _chat_ui_html(
       temperature: document.getElementById("val-temp"),
       top_p: document.getElementById("val-top-p"),
       top_k: document.getElementById("val-top-k"),
+      presence_penalty: document.getElementById("val-presence"),
       mtp_enabled: document.getElementById("val-mtp"),
       depth: document.getElementById("val-depth"),
       max_tokens: document.getElementById("val-max-tokens")
@@ -16275,6 +16319,7 @@ def _chat_ui_html(
         temperature: payload.temperature,
         top_p: payload.top_p,
         top_k: payload.top_k,
+        presence_penalty: payload.presence_penalty == null ? DEFAULTS.presence_penalty : payload.presence_penalty,
         mtp_enabled: mode ? mode === "mtp" : DEFAULTS.mtp_enabled,
         depth: payload.depth,
         max_tokens: payload.max_response_tokens == null ? DEFAULTS.max_tokens : payload.max_response_tokens,
@@ -16288,6 +16333,7 @@ def _chat_ui_html(
         temperature: normalized.temperature,
         top_p: normalized.top_p,
         top_k: normalized.top_k,
+        presence_penalty: normalized.presence_penalty,
         generation_mode: normalized.mtp_enabled ? "mtp" : "ar",
         depth: normalized.depth,
         max_response_tokens: normalized.max_tokens,
@@ -16322,6 +16368,7 @@ def _chat_ui_html(
         temperature: clamp(s.temperature, RANGES.temperature.min, RANGES.temperature.max, DEFAULTS.temperature, false),
         top_p: clamp(s.top_p, RANGES.top_p.min, RANGES.top_p.max, DEFAULTS.top_p, false),
         top_k: clamp(s.top_k, RANGES.top_k.min, RANGES.top_k.max, DEFAULTS.top_k, true),
+        presence_penalty: clamp(s.presence_penalty, RANGES.presence_penalty.min, RANGES.presence_penalty.max, DEFAULTS.presence_penalty, false),
         mtp_enabled: s.mtp_enabled == null ? DEFAULTS.mtp_enabled !== false : s.mtp_enabled !== false,
         depth: clamp(s.depth, RANGES.depth.min, RANGES.depth.max, DEFAULTS.depth, true),
         max_tokens: clamp(s.max_tokens, RANGES.max_tokens.min, RANGES.max_tokens.max, DEFAULTS.max_tokens, true),
@@ -16334,6 +16381,7 @@ def _chat_ui_html(
       ctlEls.temperature.value = normalized.temperature;
       ctlEls.top_p.value = normalized.top_p;
       ctlEls.top_k.value = normalized.top_k;
+      ctlEls.presence_penalty.value = normalized.presence_penalty;
       ctlEls.mtp_enabled.checked = normalized.mtp_enabled;
       ctlEls.depth.value = normalized.depth;
       ctlEls.max_tokens.value = normalized.max_tokens;
@@ -16409,6 +16457,8 @@ def _chat_ui_html(
       valEls.top_p.textContent = Number(ctlEls.top_p.value).toFixed(2);
       const tk = parseInt(ctlEls.top_k.value, 10) || 0;
       valEls.top_k.textContent = tk === 0 ? "off" : String(tk);
+      const pp = Number(ctlEls.presence_penalty.value) || 0;
+      valEls.presence_penalty.textContent = pp === 0 ? "off" : pp.toFixed(2);
       const mtpOn = Boolean(ctlEls.mtp_enabled.checked);
       valEls.mtp_enabled.textContent = mtpOn ? "on" : "off";
       ctlEls.depth.disabled = !mtpOn;
@@ -16417,7 +16467,7 @@ def _chat_ui_html(
       valEls.max_tokens.textContent = mt >= 1000 ? (mt / 1000).toFixed(1).replace(/\\.0$/, "") + "k" : String(mt);
     }
     function refreshSliderFills() {
-      for (const key of ["temperature", "top_p", "top_k", "depth", "max_tokens"]) {
+      for (const key of ["temperature", "top_p", "top_k", "presence_penalty", "depth", "max_tokens"]) {
         const el = ctlEls[key];
         const range = RANGES[key];
         if (!el || !range) continue;
@@ -16436,6 +16486,7 @@ def _chat_ui_html(
         temperature: clamp(ctlEls.temperature.value, RANGES.temperature.min, RANGES.temperature.max, DEFAULTS.temperature, false),
         top_p: clamp(ctlEls.top_p.value, RANGES.top_p.min, RANGES.top_p.max, DEFAULTS.top_p, false),
         top_k: clamp(ctlEls.top_k.value, RANGES.top_k.min, RANGES.top_k.max, DEFAULTS.top_k, true),
+        presence_penalty: clamp(ctlEls.presence_penalty.value, RANGES.presence_penalty.min, RANGES.presence_penalty.max, DEFAULTS.presence_penalty, false),
         mtp_enabled: Boolean(ctlEls.mtp_enabled.checked),
         depth: clamp(ctlEls.depth.value, RANGES.depth.min, RANGES.depth.max, DEFAULTS.depth, true),
         max_tokens: clamp(ctlEls.max_tokens.value, RANGES.max_tokens.min, RANGES.max_tokens.max, DEFAULTS.max_tokens, true),
@@ -17315,6 +17366,9 @@ def create_app(state: ServerState) -> FastAPI:
                     "temperature": float(state.args.temperature),
                     "top_p": float(state.args.top_p),
                     "top_k": int(state.args.top_k),
+                    "presence_penalty": float(
+                        getattr(state.args, "default_presence_penalty", 0.0) or 0.0
+                    ),
                     "depth": int(state.args.depth),
                     "depth_max": int(_backend_descriptor(state).draft_semantics.maximum),
                     "mtp_enabled": str(getattr(state.args, "generation_mode", "mtp"))
@@ -19206,15 +19260,34 @@ def create_app(state: ServerState) -> FastAPI:
         sampler_temperature = request.temperature if client_controls_allowed else None
         sampler_top_p = request.top_p if client_controls_allowed else None
         sampler_top_k = request.top_k if client_controls_allowed else None
+        # Penalties follow the same control-ownership policy as the other
+        # sampler fields; None falls through to the server default inside
+        # _generation_params (request value > server default > 0.0).
+        sampler_presence_penalty = (
+            request.presence_penalty if client_controls_allowed else None
+        )
+        sampler_frequency_penalty = (
+            request.frequency_penalty if client_controls_allowed else None
+        )
         request_observability["request_temperature"] = request.temperature
         request_observability["request_top_p"] = request.top_p
         request_observability["request_top_k"] = request.top_k
+        if request.presence_penalty is not None:
+            request_observability["request_presence_penalty"] = (
+                request.presence_penalty
+            )
+        if request.frequency_penalty is not None:
+            request_observability["request_frequency_penalty"] = (
+                request.frequency_penalty
+            )
         ignored_sampler_fields = [
             name
             for name, value in (
                 ("temperature", request.temperature),
                 ("top_p", request.top_p),
                 ("top_k", request.top_k),
+                ("presence_penalty", request.presence_penalty),
+                ("frequency_penalty", request.frequency_penalty),
             )
             if value is not None and not client_controls_allowed
         ]
@@ -19260,6 +19333,16 @@ def create_app(state: ServerState) -> FastAPI:
         request_observability["effective_temperature"] = float(sampler_temperature)
         request_observability["effective_top_p"] = float(sampler_top_p)
         request_observability["effective_top_k"] = int(sampler_top_k)
+        request_observability["effective_presence_penalty"] = float(
+            sampler_presence_penalty
+            if sampler_presence_penalty is not None
+            else getattr(state.args, "default_presence_penalty", 0.0) or 0.0
+        )
+        request_observability["effective_frequency_penalty"] = float(
+            sampler_frequency_penalty
+            if sampler_frequency_penalty is not None
+            else getattr(state.args, "default_frequency_penalty", 0.0) or 0.0
+        )
         suppress_visible_reasoning = False
         stop_sequences = _normalize_stop_sequences(request.stop)
 
@@ -19363,6 +19446,8 @@ def create_app(state: ServerState) -> FastAPI:
                         temperature=sampler_temperature,
                         top_p=sampler_top_p,
                         top_k=sampler_top_k,
+                        presence_penalty=sampler_presence_penalty,
+                        frequency_penalty=sampler_frequency_penalty,
                         seed=request.seed,
                         draft_sampler=request_draft_sampler,
                         generation_mode=request_generation_mode,
@@ -19399,6 +19484,8 @@ def create_app(state: ServerState) -> FastAPI:
                     temperature=sampler_temperature,
                     top_p=sampler_top_p,
                     top_k=sampler_top_k,
+                    presence_penalty=sampler_presence_penalty,
+                    frequency_penalty=sampler_frequency_penalty,
                     seed=request.seed,
                     draft_sampler=request_draft_sampler,
                     generation_mode=request_generation_mode,
@@ -19738,6 +19825,8 @@ def create_app(state: ServerState) -> FastAPI:
                         temperature=sampler_temperature,
                         top_p=sampler_top_p,
                         top_k=sampler_top_k,
+                        presence_penalty=sampler_presence_penalty,
+                        frequency_penalty=sampler_frequency_penalty,
                         seed=None,
                         draft_sampler=request_draft_sampler,
                         generation_mode=request_generation_mode,
@@ -19857,6 +19946,8 @@ def create_app(state: ServerState) -> FastAPI:
                         temperature=sampler_temperature,
                         top_p=sampler_top_p,
                         top_k=sampler_top_k,
+                        presence_penalty=sampler_presence_penalty,
+                        frequency_penalty=sampler_frequency_penalty,
                         seed=None,
                         draft_sampler=request_draft_sampler,
                         generation_mode=request_generation_mode,
@@ -19995,6 +20086,8 @@ def create_app(state: ServerState) -> FastAPI:
                         temperature=sampler_temperature,
                         top_p=sampler_top_p,
                         top_k=sampler_top_k,
+                        presence_penalty=sampler_presence_penalty,
+                        frequency_penalty=sampler_frequency_penalty,
                         seed=None,
                         draft_sampler=request_draft_sampler,
                         generation_mode=request_generation_mode,
@@ -20165,6 +20258,8 @@ def create_app(state: ServerState) -> FastAPI:
                         temperature=sampler_temperature,
                         top_p=sampler_top_p,
                         top_k=sampler_top_k,
+                        presence_penalty=sampler_presence_penalty,
+                        frequency_penalty=sampler_frequency_penalty,
                         seed=None,
                         draft_sampler=request_draft_sampler,
                         generation_mode=request_generation_mode,
@@ -20320,6 +20415,8 @@ def create_app(state: ServerState) -> FastAPI:
                         temperature=sampler_temperature,
                         top_p=sampler_top_p,
                         top_k=sampler_top_k,
+                        presence_penalty=sampler_presence_penalty,
+                        frequency_penalty=sampler_frequency_penalty,
                         seed=None,
                         draft_sampler=request_draft_sampler,
                         generation_mode=request_generation_mode,
@@ -20397,6 +20494,8 @@ def create_app(state: ServerState) -> FastAPI:
                                 temperature=sampler_temperature,
                                 top_p=sampler_top_p,
                                 top_k=sampler_top_k,
+                                presence_penalty=sampler_presence_penalty,
+                                frequency_penalty=sampler_frequency_penalty,
                                 seed=request.seed,
                                 draft_sampler=request_draft_sampler,
                                 generation_mode=request_generation_mode,
@@ -20445,6 +20544,8 @@ def create_app(state: ServerState) -> FastAPI:
                                     temperature=sampler_temperature,
                                     top_p=sampler_top_p,
                                     top_k=sampler_top_k,
+                                    presence_penalty=sampler_presence_penalty,
+                                    frequency_penalty=sampler_frequency_penalty,
                                     seed=request.seed,
                                     draft_sampler=request_draft_sampler,
                                     generation_mode=request_generation_mode,
@@ -22261,6 +22362,12 @@ def create_app(state: ServerState) -> FastAPI:
         sampler_temperature = request.temperature if client_controls_allowed else None
         sampler_top_p = request.top_p if client_controls_allowed else None
         sampler_top_k = request.top_k if client_controls_allowed else None
+        sampler_presence_penalty = (
+            request.presence_penalty if client_controls_allowed else None
+        )
+        sampler_frequency_penalty = (
+            request.frequency_penalty if client_controls_allowed else None
+        )
         request_observability = {
             "request_client_hint": _request_client_hint_from_headers(headers, metadata),
             "request_client_label": _request_client_hint_from_headers(headers, metadata)
@@ -22283,7 +22390,14 @@ def create_app(state: ServerState) -> FastAPI:
                 request_observability["client_sampler_fields_ignored"] = [
                     field
                     for field in ignored_fields
-                    if field in {"temperature", "top_p", "top_k"}
+                    if field
+                    in {
+                        "temperature",
+                        "top_p",
+                        "top_k",
+                        "presence_penalty",
+                        "frequency_penalty",
+                    }
                 ]
         stop_sequences = _normalize_stop_sequences(request.stop)
         model = state.model_id
@@ -22321,6 +22435,8 @@ def create_app(state: ServerState) -> FastAPI:
                             temperature=sampler_temperature,
                             top_p=sampler_top_p,
                             top_k=sampler_top_k,
+                            presence_penalty=sampler_presence_penalty,
+                            frequency_penalty=sampler_frequency_penalty,
                             seed=request.seed,
                             generation_mode=request_generation_mode,
                             depth=request_depth,
@@ -22550,6 +22666,8 @@ def create_app(state: ServerState) -> FastAPI:
                     temperature=sampler_temperature,
                     top_p=sampler_top_p,
                     top_k=sampler_top_k,
+                    presence_penalty=sampler_presence_penalty,
+                    frequency_penalty=sampler_frequency_penalty,
                     seed=request.seed,
                     generation_mode=request_generation_mode,
                     depth=request_depth,
