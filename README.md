@@ -71,6 +71,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 Sessions survive: a warm-prefix session bank keeps multi-turn chats fast, and an optional SSD cache restores sessions near-instantly across restarts.
 
+Sampler controls cover `temperature`, `top_p`, `top_k`, and the OpenAI penalty pair `presence_penalty` / `frequency_penalty` — per request, as server defaults (`--default-presence-penalty` / `--default-frequency-penalty` on `start`/`serve`/`quickstart`), or live via `mtplx settings set` and the app's Presence Penalty dial. Penalties default to 0, which is an exact no-op that preserves MTP exactness. Qwen's guidance: leave them at 0 for coding and agent work; ~0.5–1.5 presence penalty helps creative writing or when a model loops on itself.
+
 ## CLI quick reference
 
 ```bash
