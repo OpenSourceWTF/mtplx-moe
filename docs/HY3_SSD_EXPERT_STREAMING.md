@@ -54,6 +54,14 @@ The persistent allocation is per layer, but the physical transient Metal
 scratch bank should be global and reused as layers execute sequentially. Eight
 top-k scratch records are needed in memory once, not once per layer.
 
+For the M1 correctness baseline, each layer must complete this lifetime:
+fill scratch under a fresh epoch, build and execute the routed MLP, materialize
+the complete layer output, then wait for the last scratch-reading Metal command
+before the next `pread`. A command-buffer/shared-event fence is the production
+mechanism; a full MLX/GPU synchronization is the conservative first proof. This
+hard-serializes layers, so it is a low-memory baseline rather than the final
+throughput path.
+
 Eight scratch records describe the first single-stream, one-token decode path.
 A prefill chunk, continuous decode batch, or MTP verify batch can have a much
 larger union of expert ids. It must group tokens by expert and execute misses in
