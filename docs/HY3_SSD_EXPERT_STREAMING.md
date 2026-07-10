@@ -54,6 +54,14 @@ The persistent allocation is per layer, but the physical transient Metal
 scratch bank should be global and reused as layers execute sequentially. Eight
 top-k scratch records are needed in memory once, not once per layer.
 
+Eight scratch records describe the first single-stream, one-token decode path.
+A prefill chunk, continuous decode batch, or MTP verify batch can have a much
+larger union of expert ids. It must group tokens by expert and execute misses in
+bounded waves, accumulating each token's weighted result; it must not require
+the whole union to be resident at once. Phase 0 trace events are deliberately
+one token at one layer, so a wider event is rejected instead of silently
+under-sizing the native scratch bank.
+
 Prefill and decode must not share one blind LRU policy. Prompt tokens touch a
 wide one-off expert set and can erase the decode hot set immediately before it
 becomes valuable.
@@ -149,6 +157,8 @@ Primary configuration references:
 1. Land or vendor a pinned Hy3 MLX model implementation; upstream mlx-lm Hy3
    work is not yet a released dependency.
 2. Wrap each Hy3 MoE router to record selected expert ids by phase and layer.
+   Decode traces must include batch/session identity so cross-request locality
+   is not mistaken for within-sequence locality.
 3. Export expert-major records. Each record contains gate/up/down packed Q4
    weights plus scales/biases, with fixed alignment and checksums.
 4. Export a dense checkpoint without routed expert payloads.
@@ -171,6 +181,8 @@ Add a nanobind MLX extension beside `native_extensions/verify_mlp`:
   stale expert after eviction.
 - Run Q4 gate/up/SwiGLU/down from slot buffers and return the weighted expert
   contribution as an MLX array.
+- For multi-token calls, group rows by expert and dispatch bounded expert waves;
+  preserve the original token/router-weight mapping during accumulation.
 - Export counters: hits, misses, bytes, read latency, per-layer occupancy,
   evictions, and time in router/I/O/Metal.
 
