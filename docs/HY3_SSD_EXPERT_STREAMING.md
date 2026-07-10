@@ -148,25 +148,42 @@ before assigning persistent expert slots.
 
 Primary configuration references:
 
-- <https://huggingface.co/tencent/Hy3/blob/main/config.json>
-- <https://huggingface.co/XavierLocalAI/Hy3-4bit/blob/main/config.json>
-- <https://huggingface.co/pipenetwork/Hy3-4bit/blob/main/config.json>
+- <https://huggingface.co/tencent/Hy3/blob/716aa7241bd6d95896be4ebfc761162a9c4d49ef/config.json>
+- <https://huggingface.co/XavierLocalAI/Hy3-4bit/blob/c4f3e2d53d0de330dd3750cc352fbe3a62fef956/config.json>
+- <https://huggingface.co/pipenetwork/Hy3-4bit/blob/160619d3f96c8470350b6dac0ef033a8381551e3/config.json>
 
-## Phase 1: route telemetry and sidecar format
+## Phase 1: route telemetry and expert layout
 
 1. Land or vendor a pinned Hy3 MLX model implementation; upstream mlx-lm Hy3
    work is not yet a released dependency.
 2. Wrap each Hy3 MoE router to record selected expert ids by phase and layer.
    Decode traces must include batch/session identity so cross-request locality
    is not mistaken for within-sequence locality.
-3. Export expert-major records. Each record contains gate/up/down packed Q4
-   weights plus scales/biases, with fixed alignment and checksums.
-4. Export a dense checkpoint without routed expert payloads.
-5. Validate that dense + one loaded expert record reproduces the resident
+3. Generate and hash a manifest of the original safetensors expert-slab file
+   offsets first. The expert dimension is contiguous, so this proves selective
+   loading without writing a second 150 GiB artifact.
+4. Benchmark those component reads against an optional expert-major sidecar.
+   The derived format combines gate/up/down packed Q4 weights plus
+   scales/biases into aligned records and is kept only if fewer, larger reads
+   justify its disk cost.
+5. Export a dense checkpoint without routed expert payloads.
+6. Validate that dense + one loaded expert record reproduces the resident
    module's output on deterministic vectors before optimizing I/O.
 
 The manifest must pin the source model revision, tensor names/shapes/dtypes,
 quantization mode and group size, byte offsets/lengths, alignment, and hashes.
+
+The closest public MLX implementation seam is SharpAI's MIT-licensed
+`mlx-swift`/`mlx-swift-lm` fork: it writes an expert slab from safetensors
+directly into an already-evaluated MLX array at a slot byte offset, then uses a
+stacked `gatherQuantizedMM`. This demonstrates that the buffer path is possible,
+but its current code relies on caller-side global GPU synchronization and lacks
+the manifest, expert-index, epoch, and source-integrity checks required here.
+Port the narrow mechanism with attribution; do not copy its lifetime assumptions
+unchanged.
+
+- <https://github.com/SharpAI/mlx-swift/blob/133864c733c8d4178547f8fe92897da6a788368f/Source/Cmlx/mlx-c/mlx/c/fast.cpp#L865-L1188>
+- <https://github.com/SharpAI/mlx-swift-lm/blob/b9bf50bdafef02fffd5b83598a61bbf7d47434f9/Libraries/MLXLMCommon/SwitchLayers.swift#L48-L421>
 
 ## Phase 2: native slot bank
 
