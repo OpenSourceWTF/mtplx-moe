@@ -100,7 +100,7 @@ python scripts/simulate_expert_cache.py routes.jsonl \
   --ssd-gib-per-second 5.5
 ```
 
-`expert-record-bytes` must come from the actual sidecar manifest. Do not infer
+`expert-record-bytes` must come from the validated layout manifest. Do not infer
 it from the repository's total byte size once dense/shared tensors have been
 split out.
 
@@ -140,6 +140,12 @@ though their config still declares one NextN predictor. They are AR-only in
 practice. Initial streaming work must prove AR first; MTP requires separately
 packaging and validating the official BF16 layer-80 weights (or a new Q4
 conversion) and adding its own expert bank.
+
+Routing is a discrete, precision-sensitive boundary. The parity baseline must
+retain the Q4 artifact's resident 8-bit gate and run router math/selection in
+FP32. A future conversion should A/B resident BF16 gate weights as well: all 79
+gates are only about 124 MiB in BF16, so improving routing fidelity costs about
+61 MiB over the inspected Q8 layout, negligible beside the expert bank.
 
 Context length materially changes the cache budget: BF16 KV for the 80 target
 layers is about 0.3125 MiB per token, or 10/20/40/80 GiB at roughly
