@@ -70,14 +70,35 @@ This is not enabled by default and has not yet earned a full-checkpoint performa
 DEBUG=0 uv pip install -e native_extensions/expert_io
 
 # Build and verify an exact manifest; an aligned sidecar is optional
-python scripts/build_expert_manifest.py /path/to/model --model hy3-q4
-python scripts/verify_expert_manifest.py /path/to/model /path/to/model/expert-manifest.json
+uv run python scripts/build_expert_manifest.py /path/to/model --model hy3-q4
+uv run python scripts/verify_expert_manifest.py /path/to/model /path/to/model/expert-manifest.json
 
 # The total threshold includes resident weights, KV reservation, slots, and reserve.
 mtplx serve --model /path/to/model \
   --expert-streaming \
   --expert-manifest /path/to/model/expert-manifest.json \
   --expert-memory-limit 96GiB \
+  --expert-max-live-kv-tokens 32768
+```
+
+For a 128 GB Mac, this is the conservative starting profile for the pinned
+GLM-5.2 affine-Q4 checkpoint. The 104 GiB ceiling leaves system headroom while
+reserving 16 GiB inside the runtime plan; MTP is disabled automatically because
+the checkpoint does not contain its declared MTP layer.
+
+```bash
+MODEL=/path/to/mlx-community/GLM-5.2-4bit
+
+uv run python scripts/build_expert_manifest.py "$MODEL" --model glm52-q4
+uv run python scripts/verify_expert_manifest.py \
+  "$MODEL" "$MODEL/expert-manifest.json" --records
+
+uv run mtplx serve --model "$MODEL" \
+  --expert-streaming \
+  --expert-model-key glm52-q4 \
+  --expert-manifest "$MODEL/expert-manifest.json" \
+  --expert-memory-limit 104GiB \
+  --expert-runtime-reserve 16GiB \
   --expert-max-live-kv-tokens 32768
 ```
 
