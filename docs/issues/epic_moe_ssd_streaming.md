@@ -1,8 +1,10 @@
 > **Repository scope:** Issues are repository-wide in `davidtai/MTPLX`.
 > **Target implementation branch:** `codex/moe-ssd-hy3-glm52`.
-> **Current state:** the branch has a pure-Python expert-cache policy scaffold and
-> simulator. It does **not** yet have a native SSD-to-MLX loader or a working
-> streamed model adapter.
+> **Current state:** the branch implements manifest/sidecar tooling, fixed
+> MLX/Metal slot banks, native positional I/O, resident-only Hy3/GLM adapters,
+> runtime/server integration, and benchmark gates. Tiny end-to-end fixtures and
+> full artifact metadata audits pass; full-checkpoint hardware validation is
+> still open before the epic can be closed.
 
 ## Goal
 

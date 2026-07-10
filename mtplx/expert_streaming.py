@@ -180,6 +180,27 @@ class LayerExpertSlotBank:
     def occupancy(self) -> int:
         return len(self._expert_to_slot)
 
+    def invalidate_expert(self, expert_id: int) -> int | None:
+        """Forget a failed/stale persistent mapping and return its slot."""
+
+        expert = _integer("expert id", expert_id, minimum=0)
+        if expert >= self.expert_count:
+            raise ValueError(
+                f"expert id {expert} is outside [0, {self.expert_count})"
+            )
+        slot = self._expert_to_slot.pop(expert, None)
+        if slot is not None:
+            self._slot_to_expert[slot] = None
+        return slot
+
+    def reset(self) -> None:
+        """Clear residency and decode history without changing capacity."""
+
+        self._decode_epoch = 0
+        self._slot_to_expert = [None] * self.persistent_slots
+        self._expert_to_slot.clear()
+        self._history = [_ExpertHistory() for _ in range(self.expert_count)]
+
     def _validate_experts(self, expert_ids: Iterable[int]) -> tuple[int, ...]:
         try:
             experts = tuple(

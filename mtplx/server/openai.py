@@ -1414,6 +1414,26 @@ def _apply_metal_memory_caps(
 class ServerState:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
+        from mtplx.expert_cli import expert_streaming_load_kwargs
+
+        self.expert_streaming_load_kwargs = expert_streaming_load_kwargs(
+            args, args.model
+        )
+        if self.expert_streaming_load_kwargs:
+            args.load_mtp = False
+            args.generation_mode = "ar"
+            stream_config = self.expert_streaming_load_kwargs[
+                "expert_streaming_config"
+            ]
+            from mtplx.expert_runtime import reconcile_mlx_memory_cap
+            from mtplx.expert_streaming_models import get_model_spec
+
+            stream_plan = stream_config.memory_plan(
+                get_model_spec(stream_config.model_key)
+            )
+            os.environ["MTPLX_MEMORY_LIMIT_BYTES"] = str(
+                reconcile_mlx_memory_cap(stream_plan)
+            )
         try:
             args.paged_kv_quantization = normalize_paged_kv_quantization(
                 getattr(args, "paged_kv_quantization", "off")
@@ -1498,11 +1518,13 @@ class ServerState:
         )
         _startup_line("      Model load in progress (this may take a minute).")
         load_heartbeat = _startup_heartbeat("Model still loading")
+        streaming_kwargs = dict(self.expert_streaming_load_kwargs)
+        runtime_mtp = bool(streaming_kwargs.pop("mtp", bool(args.load_mtp)))
         try:
             self.runtime = self.model_scheduler.submit_foreground(
                 load,
                 args.model,
-                mtp=bool(args.load_mtp),
+                mtp=runtime_mtp,
                 contract=MTPContract(
                     mtp_quant_bits=getattr(args, "mtp_quant_bits", None),
                     mtp_quant_group_size=getattr(args, "mtp_quant_group_size", 64),
@@ -1515,6 +1537,7 @@ class ServerState:
                     args,
                     startup_backend,
                 ),
+                **streaming_kwargs,
                 batch_key="startup.load",
             ).result()
         except BaseException as exc:
@@ -14513,6 +14536,11 @@ class _SmartFanArrivalMiddleware:
             _end_smart_fan_request(self.state, lease)
 
 
+def _runtime_kv_admission(runtime: Any, tokens: int):
+    admit = getattr(runtime, "admit_kv_tokens", None)
+    return admit(tokens) if callable(admit) else nullcontext()
+
+
 def _run_generation_dispatched(
     state: ServerState,
     prompt_ids: list[int],
@@ -14610,10 +14638,19 @@ def _run_generation_dispatched(
             request_observability=request_observability,
         )
         state.begin_foreground()
+        kv_admission = None
         try:
+            kv_admission = _runtime_kv_admission(
+                state.runtime,
+                len(prompt_ids) + response_max
+            )
             future = state.ar_batch_service.submit(job)
             generated = future.result()
         finally:
+            if kv_admission is not None:
+                release_kv = getattr(kv_admission, "release", None)
+                if callable(release_kv):
+                    release_kv()
             state.end_foreground()
             _end_smart_fan_request(state, smart_fan_lease)
         ar_stats = dict(generated.get("stats") or {})
@@ -14783,9 +14820,14 @@ def _run_generation(
             state.begin_foreground()
             state.lock.acquire()
         lock_wait_time_s += time.perf_counter() - lock_started
+        kv_admission = None
         try:
             if cancel_event is not None and cancel_event.is_set():
                 raise _StreamCancelled("request cancelled before generation")
+            kv_admission = _runtime_kv_admission(
+                state.runtime,
+                len(prompt_ids) + response_max
+            )
             dynamic_kv_reservation = _dynamic_paged_kv_reservation(
                 prompt_tokens=len(prompt_ids),
                 max_new_tokens=response_max,
@@ -14898,6 +14940,10 @@ def _run_generation(
             # disconnects already take during decode.
             raise _StreamCancelled("client disconnected during prefill")
         finally:
+            if kv_admission is not None:
+                release_kv = getattr(kv_admission, "release", None)
+                if callable(release_kv):
+                    release_kv()
             state.lock.release()
             if not background_request:
                 state.end_foreground()
@@ -18209,6 +18255,10 @@ def create_app(state: ServerState) -> FastAPI:
                 pass
             for task in bg_tasks:
                 task.cancel()
+            runtime = getattr(state, "runtime", None)
+            close_runtime = getattr(runtime, "close", None)
+            if callable(close_runtime):
+                close_runtime(timeout=5.0)
             scheduler = getattr(state, "model_scheduler", None)
             if scheduler is not None:
                 scheduler.shutdown(wait=False, cancel_futures=True)
@@ -18452,6 +18502,12 @@ def create_app(state: ServerState) -> FastAPI:
             ),
             "paged_kv_quantization": _effective_paged_kv_quantization(),
             "kernel_selfcheck": _kernel_selfcheck_health_payload(),
+            "expert_streaming": (
+                runtime.expert_streaming_snapshot()
+                if runtime is not None
+                and getattr(runtime, "expert_streaming", None) is not None
+                else None
+            ),
             "rate_limit_per_minute": int(state.args.rate_limit),
             "stream_interval": int(state.args.stream_interval),
             "warmup": state.warmup_status,
@@ -18901,6 +18957,9 @@ def create_app(state: ServerState) -> FastAPI:
             state.draft_head_identity = None
             state.template_hash = None
             state.aime_parent_runtime_released = True
+            close_runtime = getattr(runtime, "close", None)
+            if callable(close_runtime):
+                close_runtime(timeout=5.0)
             gc.collect()
             cleanup = _clear_mlx_cache_after_request(
                 state,
@@ -24041,6 +24100,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if postcommit_default not in {"inline", "async"}:
         postcommit_default = "async"
     parser.add_argument("--model", default=DEFAULT_HF_MODEL_ID)
+    from mtplx.expert_cli import add_expert_streaming_args
+
+    add_expert_streaming_args(parser)
     parser.add_argument("--model-id", default="mtplx-qwen36-27b-native-mtp")
     parser.add_argument("--backend-id", default="qwen3_next", help=argparse.SUPPRESS)
     parser.add_argument(

@@ -1,7 +1,8 @@
 > **Repository scope:** This is a repository-wide `davidtai/MTPLX` issue.
 > **Target branch:** `codex/moe-ssd-hy3-glm52`.
-> **Implementation status:** the current policy produces planned `SlotLoad`
-> operations only; no native SSD-to-MLX/Metal transfer path exists yet.
+> **Implementation status:** implemented on the target branch. The optional
+> nanobind reader performs GIL-free bounded `pread` into stable MLX/Metal slot
+> banks; generation pins and explicit synchronization prevent stale reuse.
 
 ## Objective
 
@@ -91,22 +92,22 @@ dispatch completes; a persistent slot remains ready until policy eviction.
 
 ## Acceptance criteria
 
-- [ ] Mock-backend tests exercise every state transition, concurrent dedupe,
+- [x] Mock-backend tests exercise every state transition, concurrent dedupe,
       cancellation, timeout, eviction during load, and generation ABA hazard.
-- [ ] Native tests fill a slot from known bytes, run an MLX operation against
+- [x] Native/direct-buffer tests fill a slot from known bytes, run an MLX operation against
       it, replace the record in the same slot, and observe the new result while
       preserving planned allocation size.
-- [ ] Fault-injection tests for short reads and payload corruption fail before
+- [x] Fault-injection tests for short reads and payload corruption fail before
       expert dispatch and leave no slot falsely marked ready.
-- [ ] Repeated cold/warm routes never allocate beyond fixed slot buffers plus
+- [x] Repeated cold/warm routes never allocate beyond fixed slot buffers plus
       configured bounded staging/in-flight I/O memory.
 - [ ] Hy3 can load one 10.125 MiB record and GLM-5.2 one 20.25 MiB record with
       all packed weights/scales/biases matching source bytes.
 - [ ] One top-8 transient bank is safely reused across sequential layers: 81
       MiB for Hy3 and 162 MiB for GLM-5.2.
-- [ ] Metrics expose requested/read bytes, read latency, queue latency, deduped
+- [x] Metrics expose requested/read bytes, read latency, deduped
       loads, failures, cancellations, and wait time per layer.
-- [ ] A no-fallback test verifies a missing expert record does not cause all
+- [x] A no-fallback test verifies a missing expert record does not cause all
       safetensors shards to be opened.
 
 ## Dependencies

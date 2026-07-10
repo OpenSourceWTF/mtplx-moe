@@ -1,7 +1,8 @@
 # Hy3 SSD expert streaming — fork design
 
-Status: Phase 0 cache policy and trace simulator implemented; native I/O and
-Metal execution are not implemented yet.
+Status: AR implementation complete on the experimental branch, including the
+resident Hy3 overlay, native positional I/O, and direct MLX/Metal slot-bank
+execution. Full-checkpoint parity and hardware benchmarks remain release gates.
 
 ## Goal
 

@@ -1,7 +1,8 @@
 > **Repository scope:** This is a repository-wide `davidtai/MTPLX` issue.
 > **Target branch:** `codex/moe-ssd-hy3-glm52`.
-> **Implementation status:** this proposes a new artifact contract; no trusted
-> expert manifest or aligned sidecar generator is implemented yet.
+> **Implementation status:** implemented on the target branch with strict JSON,
+> safetensors header/index cross-validation, path containment, record/shard
+> hashes, source reads, and resumable aligned sidecar generation/verification.
 
 ## Objective
 

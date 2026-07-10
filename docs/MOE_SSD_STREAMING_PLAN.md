@@ -1,8 +1,9 @@
 # SSD-streamed MoE plan: Hy3 Q4 and GLM-5.2 Q4
 
-Status: design, model descriptors, cache policy, and memory-planning scaffold.
-This branch does **not** yet selectively load checkpoint records into MLX arrays
-or execute streamed experts with native Metal kernels.
+Status: implementation complete on the experimental branch; tiny end-to-end
+Hy3/GLM fixtures, failure injection, and full pinned artifact metadata audits
+pass. Full 166/418 GB checkpoint parity and performance measurements remain a
+release gate, so this document makes no full-model speed claim.
 
 Target branch: `codex/moe-ssd-hy3-glm52`
 
@@ -318,9 +319,39 @@ cache was warm.
 
 ## What this branch proves today
 
-This branch establishes the reusable cache decision model, memory-threshold
-contract, layout facts, simulator, and testable boundaries for both models. It
-is deliberately not presented as an SSD inference implementation. Native
-manifest reads, fixed Metal slot buffers, router adapters, IndexShare support,
-and slot-backed Q4 kernels remain required before either checkpoint can run
-with its routed parameters absent from unified memory.
+The branch now implements the complete AR data path:
+
+- Strict revision-pinned manifests and optional resumable 16 KiB-aligned
+  expert-major sidecars, with shape/dtype/range/hash validation.
+- Resident-only startup loading that never constructs routed parameter trees.
+- Hy3 and GLM-5.2 MLX overlays, including GLM FP32 MoE routing and the exact
+  21-full-layer IndexShare schedule.
+- Decode-aware hot admission, transient-only prefill misses, fixed slot
+  generations/pins, bounded descriptors and in-flight I/O, cancellation, and
+  corruption/short-read failure handling.
+- Optional native GIL-free `pread`, directly into stable MLX/Metal slot-bank
+  buffers. Q4 component arrays are shared-buffer views; evaluated expert work
+  is synchronized before a slot generation can be replaced.
+- Runtime/CLI/server integration, aggregate live-KV admission, MLX allocator
+  cap reconciliation, and `/health` cache/I/O/memory telemetry.
+
+The full pinned checkpoint indexes were audited without downloading payloads:
+Hy3 has 2,323 resident keys and 711 routed leaves; GLM-5.2 has 2,806 resident
+keys and 675 routed leaves. Tiny artifacts execute complete model forwards
+through the streamed path. What is not yet proven is full-checkpoint numerical
+parity, high-water memory, thermals, and sustained SSD throughput on target
+hardware. Use these gates before publishing a result:
+
+```bash
+python scripts/audit_streamed_model_layout.py --model hy3-q4
+python scripts/benchmark_expert_io.py MODEL MANIFEST \
+  --operations 256 --queue-depth 8 --cache-state steady --ssd-label "internal NVMe"
+python scripts/verify_streamed_parity.py MODEL MANIFEST probes.jsonl \
+  --model-key hy3-q4 --memory-limit 96GiB --max-live-kv-tokens 32768
+python scripts/benchmark_streamed_generation.py MODEL MANIFEST \
+  --model-key hy3-q4 --memory-limit 96GiB --max-live-kv-tokens 32768
+```
+
+`--cache-state` is provenance, not cache manipulation: the I/O benchmark never
+claims to purge macOS's filesystem cache. Every output includes immutable model
+and manifest identity plus raw cache/I/O/MLX measurements.

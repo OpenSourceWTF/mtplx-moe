@@ -1,7 +1,9 @@
 > **Repository scope:** This is a repository-wide `davidtai/MTPLX` issue.
 > **Target branch:** `codex/moe-ssd-hy3-glm52`.
-> **Implementation status:** this defines release gates. It does not imply that
-> streamed execution, benchmark results, or MTP support currently exist.
+> **Implementation status:** AR streaming and reproducible I/O, generation, and
+> golden-logit harnesses now exist. Tiny parity/failure tests pass. Full artifact
+> results remain deliberately unpublished, and MTP remains disabled because the
+> pinned Q4 artifacts omit its weights.
 
 ## Objective
 

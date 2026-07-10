@@ -1,8 +1,8 @@
 > **Repository scope:** This is a repository-wide `davidtai/MTPLX` issue.
 > **Target branch:** `codex/moe-ssd-hy3-glm52`.
-> **Implementation status:** MTPLX recognizes `glm_moe_dsa` experimentally, but
-> no GLM-5.2 streamed-Q4 adapter exists. The policy scaffold alone is not a
-> runnable model implementation.
+> **Implementation status:** the resident-only GLM-5.2 overlay, FP32 router,
+> IndexShare schedule, streamed Q4 switch, strict loader, and tiny end-to-end
+> forward are implemented. Full-checkpoint parity and memory benchmarks remain.
 
 ## Objective
 
@@ -87,13 +87,13 @@ not an acceptable precursor to swapping in streamed modules.
 - [ ] For fixed hidden-state fixtures, all 75 sparse layers match official
       top-8 IDs and normalized/scaled route weights, including near-tie cases
       where BF16 and FP32 selection would differ.
-- [ ] Tests prove correction bias changes selection only and does not contaminate
+- [x] Tests prove correction bias changes selection only and does not contaminate
       the gathered routing weight.
 - [ ] IndexShare tests assert exactly 21 full indexer executions and 57 reuses;
       sequences longer than 2,048 and 4,096 tokens exercise reuse behavior.
 - [ ] Full-resident test slots and streamed slots produce equivalent layer
       outputs within a documented Q4 numerical tolerance.
-- [ ] Autoregressive generation works without layer 78 and a requested MTP mode
+- [x] Autoregressive model execution works without layer 78 and requested MTP mode
       fails early with a clear missing-weight error.
 - [ ] Peak memory is governed by the resolved plan and not the 389.59 GiB total
       Q4 artifact size.

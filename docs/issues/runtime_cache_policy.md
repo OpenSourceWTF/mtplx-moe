@@ -1,7 +1,8 @@
 > **Repository scope:** This is a repository-wide `davidtai/MTPLX` issue.
 > **Target branch:** `codex/moe-ssd-hy3-glm52`.
-> **Implementation status:** `LayerExpertSlotBank` and simulation counters exist
-> as a pure policy scaffold. They are not connected to MTPLX runtime execution.
+> **Implementation status:** connected to MTPLX runtime, CLI, one-shot, and
+> server execution. Decode admission, transient prefill, bounded waves,
+> rollback, KV limits, reset/close, and health telemetry are implemented.
 
 ## Objective
 

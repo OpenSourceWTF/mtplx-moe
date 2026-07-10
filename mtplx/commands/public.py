@@ -23,6 +23,7 @@ import importlib.metadata
 import importlib.util
 import re
 import webbrowser
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -654,6 +655,11 @@ def _generation_mode_from_args(args: Any) -> str:
         if bool(getattr(args, "no_mtp", False))
         else GENERATION_MODE_MTP
     )
+
+
+def _runtime_kv_admission(runtime: Any, tokens: int):
+    admit = getattr(runtime, "admit_kv_tokens", None)
+    return admit(tokens) if callable(admit) else nullcontext()
 
 
 def _fan_mode_from_args(args: Any) -> str:
@@ -7724,6 +7730,9 @@ def _resolve_runtime_options_on_args(
 
 
 def cmd_serve_public(args: Any) -> int:
+    from mtplx.expert_cli import expert_streaming_requested
+
+    streaming_requested = expert_streaming_requested(args)
     dry_run = bool(getattr(args, "dry_run", False))
     quiet_json = dry_run and bool(getattr(args, "json", False))
     runtime_options_error = _resolve_runtime_options_on_args(
@@ -7793,6 +7802,10 @@ def cmd_serve_public(args: Any) -> int:
     depth_error = _validate_public_depth(args, printer=_print_serve_start_line)
     if depth_error is not None:
         return depth_error
+    if streaming_requested:
+        args.no_mtp = True
+        args.load_mtp = False
+        args.generation_mode = GENERATION_MODE_AR
     generation_mode = _generation_mode_from_args(args)
     fan_mode = _fan_mode_from_args(args)
     if generation_mode == GENERATION_MODE_MTP and getattr(args, "load_mtp", True) is False:
@@ -8021,6 +8034,8 @@ def cmd_serve_public(args: Any) -> int:
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=bool(getattr(args, "yes", False)),
     )
+    if streaming_requested:
+        gate_exit = None
     if gate_exit is not None:
         _print_model_gate_error(inspection, printer=_print_serve_start_line)
         return gate_exit
@@ -8094,6 +8109,9 @@ def cmd_serve_public(args: Any) -> int:
         "--fan-mode",
         fan_mode,
     ]
+    from mtplx.expert_cli import append_expert_streaming_child_args
+
+    append_expert_streaming_child_args(cmd, args)
     for attr, flag in (
         ("max_active_requests", "--max-active-requests"),
         ("decode_batch_max", "--decode-batch-max"),
@@ -8643,17 +8661,26 @@ def _generate_one_shot_public(
     )
     if resolve_error is not None:
         return EXIT_TELEMETRY, resolve_error, []
+    from mtplx.expert_cli import expert_streaming_requested
+
+    streaming_requested = expert_streaming_requested(args)
     inspection, gate_exit = _model_gate(
         runtime_model,
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=bool(getattr(args, "yes", False)),
     )
+    if streaming_requested:
+        gate_exit = None
     if gate_exit is not None:
         return (
             gate_exit,
             {"error": "model failed MTP primary gate", "model": inspection},
             [],
         )
+    if streaming_requested:
+        args.no_mtp = True
+        args.load_mtp = False
+        args.generation_mode = GENERATION_MODE_AR
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     apply_profile_env(profile.name)
     generation_mode = _generation_mode_from_args(args)
@@ -8694,8 +8721,12 @@ def _generate_one_shot_public(
     from mtplx.runtime import load
     from mtplx.sampling import SamplerConfig
 
+    rt = None
     try:
-        rt = load(runtime_model, mtp=True)
+        from mtplx.expert_cli import expert_streaming_load_kwargs
+
+        load_kwargs = expert_streaming_load_kwargs(args, runtime_model)
+        rt = load(runtime_model, **(load_kwargs or {"mtp": True}))
         draft_report = None
         if (
             draft_lm_head is not None
@@ -8755,33 +8786,39 @@ def _generate_one_shot_public(
             smart_request_id = f"cli-{command}-{int(time.time() * 1000)}"
             smart_fans.begin_request(smart_request_id)
         try:
-            if generation_mode == GENERATION_MODE_AR:
-                out = generate_ar(
-                    rt,
-                    prompt_ids,
-                    max_tokens=max_tokens_value,
-                    sampler=sampler,
-                    seed=args.seed,
-                )
-            else:
-                out = generate_mtpk(
-                    rt,
-                    prompt_ids,
-                    max_tokens=max_tokens_value,
-                    sampler=sampler,
-                    draft_sampler=_draft_sampler_from_spec(draft_sampler),
-                    speculative_depth=args.depth,
-                    seed=args.seed,
-                    mtp_hidden_variant="post_norm",
-                    mtp_cache_policy="persistent",
-                    mtp_history_policy="committed",
-                    verify_strategy="capture_commit",
-                    verify_core="linear-gdn-from-conv-tape",
-                )
+            with _runtime_kv_admission(
+                rt, len(prompt_ids) + max_tokens_value
+            ):
+                if generation_mode == GENERATION_MODE_AR:
+                    out = generate_ar(
+                        rt,
+                        prompt_ids,
+                        max_tokens=max_tokens_value,
+                        sampler=sampler,
+                        seed=args.seed,
+                    )
+                else:
+                    out = generate_mtpk(
+                        rt,
+                        prompt_ids,
+                        max_tokens=max_tokens_value,
+                        sampler=sampler,
+                        draft_sampler=_draft_sampler_from_spec(draft_sampler),
+                        speculative_depth=args.depth,
+                        seed=args.seed,
+                        mtp_hidden_variant="post_norm",
+                        mtp_cache_policy="persistent",
+                        mtp_history_policy="committed",
+                        verify_strategy="capture_commit",
+                        verify_core="linear-gdn-from-conv-tape",
+                    )
         finally:
             if smart_fans is not None and smart_request_id is not None:
                 smart_fans.end_request(smart_request_id, wait_for_restore=True)
     finally:
+        close_runtime = getattr(rt, "close", None)
+        if callable(close_runtime):
+            close_runtime(timeout=5.0)
         if max_session is not None:
             max_session.stop()
             thermal = max_session.thermal
@@ -9541,31 +9578,32 @@ def _quickstart_generate(
             smart_fans = SmartFanController(log=_quickstart_line)
             smart_request_id = f"terminal-{turn_index}-{int(time.time() * 1000)}"
             smart_fans.begin_request(smart_request_id)
-        if generation_mode == GENERATION_MODE_AR:
-            out = generate_ar(
-                rt,
-                prompt_ids,
-                max_tokens=max_tokens_value,
-                sampler=sampler,
-                seed=seed,
-                token_callback=record_tokens,
-            )
-        else:
-            out = generate_mtpk(
-                rt,
-                prompt_ids,
-                max_tokens=max_tokens_value,
-                sampler=sampler,
-                draft_sampler=_draft_sampler_from_spec(draft_sampler),
-                speculative_depth=int(getattr(args, "depth", 3)),
-                seed=seed,
-                mtp_hidden_variant="post_norm",
-                mtp_cache_policy="persistent",
-                mtp_history_policy="committed",
-                verify_strategy="capture_commit",
-                verify_core="linear-gdn-from-conv-tape",
-                token_callback=record_tokens,
-            )
+        with _runtime_kv_admission(rt, len(prompt_ids) + max_tokens_value):
+            if generation_mode == GENERATION_MODE_AR:
+                out = generate_ar(
+                    rt,
+                    prompt_ids,
+                    max_tokens=max_tokens_value,
+                    sampler=sampler,
+                    seed=seed,
+                    token_callback=record_tokens,
+                )
+            else:
+                out = generate_mtpk(
+                    rt,
+                    prompt_ids,
+                    max_tokens=max_tokens_value,
+                    sampler=sampler,
+                    draft_sampler=_draft_sampler_from_spec(draft_sampler),
+                    speculative_depth=int(getattr(args, "depth", 3)),
+                    seed=seed,
+                    mtp_hidden_variant="post_norm",
+                    mtp_cache_policy="persistent",
+                    mtp_history_policy="committed",
+                    verify_strategy="capture_commit",
+                    verify_core="linear-gdn-from-conv-tape",
+                    token_callback=record_tokens,
+                )
     finally:
         if smart_fans is not None and smart_request_id is not None:
             smart_fans.end_request(smart_request_id, wait_for_restore=False)
@@ -11663,7 +11701,10 @@ def _quickstart_run_terminal_chat_body(
     quiet_progress = not sys.stdout.isatty()
     with ModelLoadProgress("Loading model", quiet=quiet_progress) as progress:
         progress.set_subtitle(f"profile {profile.name}")
-        rt = load(runtime_model, mtp=True)
+        from mtplx.expert_cli import expert_streaming_load_kwargs
+
+        load_kwargs = expert_streaming_load_kwargs(args, runtime_model)
+        rt = load(runtime_model, **(load_kwargs or {"mtp": True}))
         progress.set_subtitle("ready")
     _quickstart_line(f"Model ready in {time.perf_counter() - started:.1f}s")
     _quickstart_line(f"Generation mode: {_generation_mode_label(generation_mode)}")

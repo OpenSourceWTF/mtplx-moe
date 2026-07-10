@@ -1,7 +1,9 @@
 # GLM-5.2 Q4 SSD expert streaming
 
-Status: pinned layout and implementation design. Native selective loading and
-slot-backed MLX/Metal execution are not implemented in this branch.
+Status: AR implementation complete on the experimental branch, including FP32
+routing, IndexShare, resident-only loading, native positional I/O, and direct
+MLX/Metal slot-bank execution. Full-checkpoint parity and hardware benchmarks
+remain release gates.
 
 This document specializes the shared design in
 [`MOE_SSD_STREAMING_PLAN.md`](MOE_SSD_STREAMING_PLAN.md) for

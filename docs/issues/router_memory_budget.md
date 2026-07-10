@@ -1,7 +1,8 @@
 > **Repository scope:** This is a repository-wide `davidtai/MTPLX` issue.
 > **Target branch:** `codex/moe-ssd-hy3-glm52`.
-> **Implementation status:** only the pure cache-policy scaffold exists today;
-> the runtime and model execution path described below are proposed work.
+> **Implementation status:** implemented on the target branch: pinned model
+> descriptors, total-memory planning, MLX cap reconciliation, layer-local
+> router-first execution, and aggregate live-KV admission are connected.
 
 ## Objective
 

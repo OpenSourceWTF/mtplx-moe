@@ -614,6 +614,12 @@ def _add_mtp_toggle_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
+    from .expert_cli import add_expert_streaming_args
+
+    add_expert_streaming_args(parser)
+
+
 SCHEDULER_MODE_CHOICES = (
     "serial",
     "cooperative",
@@ -2451,6 +2457,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--top-k", type=int, default=20)
     run_p.add_argument("--depth", type=int, default=3)
     _add_mtp_toggle_args(run_p)
+    _add_expert_streaming_args(run_p)
     run_p.add_argument("--seed", type=int, default=0)
     _add_reasoning_arg(run_p)
     run_p.add_argument("--quiet", action="store_true", help="Hide the stats footer")
@@ -2480,6 +2487,7 @@ def build_parser() -> argparse.ArgumentParser:
     chat_p.add_argument("--top-k", type=int, default=20)
     chat_p.add_argument("--depth", type=int, default=3)
     _add_mtp_toggle_args(chat_p)
+    _add_expert_streaming_args(chat_p)
     chat_p.add_argument("--seed", type=int, default=0)
     _add_reasoning_arg(chat_p)
     chat_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
@@ -2514,6 +2522,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument("--port", type=int, default=8000)
     serve_p.add_argument("--depth", type=int, default=3)
     _add_mtp_toggle_args(serve_p)
+    _add_expert_streaming_args(serve_p)
     serve_p.add_argument(
         "--generation-mode",
         choices=["mtp", "ar", "auto"],
