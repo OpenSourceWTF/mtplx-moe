@@ -57,6 +57,15 @@ causes expert records to be loaded.
 - **Parity, benchmarks, and MTP gates:** prove routing/output correctness before
   reporting throughput; add MTP only from explicit, validated weights.
 
+## Tracked implementation issues
+
+- [ ] #4 — Router-first execution and user memory budgeting.
+- [ ] #1 — Versioned expert manifest and aligned sidecar generator.
+- [ ] #3 — Native SSD-to-MLX slot loader with generations and fences.
+- [ ] #2 — GLM-5.2 Q4 adapter with FP32 router and IndexShare.
+- [ ] #6 — Runtime cache policy, batching, configuration, and telemetry.
+- [ ] #5 — AR parity, benchmarks, and explicit MTP artifacts.
+
 ## Proposed top-level API
 
 ```python
