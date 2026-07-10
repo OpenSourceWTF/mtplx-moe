@@ -15,6 +15,7 @@ from mtplx.expert_manifest import (
     build_expert_sidecar,
     load_expert_manifest,
     read_expert_record,
+    resolve_artifact_member,
     save_expert_manifest,
     verify_expert_manifest,
 )
@@ -204,6 +205,50 @@ def test_manifest_roundtrip_digest_and_unknown_fields_fail_closed(
     escaped["records"][0]["segments"][0]["shard"] = "../escape"
     with pytest.raises(ExpertManifestError, match="unsafe"):
         ExpertManifest.from_dict(escaped, verify_digest=False)
+
+
+def test_hugging_face_snapshot_blob_symlink_is_allowed_but_other_escapes_fail(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "models--org--model"
+    blobs = repository / "blobs"
+    snapshot = repository / "snapshots" / ("a" * 40)
+    blobs.mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    blob = blobs / ("b" * 64)
+    blob.write_bytes(b"trusted content-addressed payload")
+    member = snapshot / "model-00001-of-00001.safetensors"
+    member.symlink_to(Path("..") / ".." / "blobs" / blob.name)
+
+    assert resolve_artifact_member(snapshot, member.name) == blob
+
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside")
+    escaped = snapshot / "escaped.bin"
+    escaped.symlink_to(outside)
+    with pytest.raises(ExpertManifestError, match="escapes root"):
+        resolve_artifact_member(snapshot, escaped.name)
+
+    # A blobs-looking symlink is not trusted outside the exact snapshots/
+    # sibling-blobs repository layout.
+    ordinary_root = tmp_path / "ordinary"
+    ordinary_root.mkdir()
+    ordinary = ordinary_root / "model.bin"
+    ordinary.symlink_to(blob)
+    with pytest.raises(ExpertManifestError, match="escapes root"):
+        resolve_artifact_member(ordinary_root, ordinary.name)
+
+
+def test_manifest_builder_rejects_external_index_symlink(tmp_path: Path) -> None:
+    root = tmp_path / "model"
+    spec, _expected = _make_checkpoint(root)
+    index = root / "model.safetensors.index.json"
+    external = tmp_path / "external-index.json"
+    index.replace(external)
+    index.symlink_to(external)
+
+    with pytest.raises(ExpertManifestError, match="escapes root"):
+        build_expert_manifest(root, spec)
 
 
 def test_aligned_sidecar_is_readable_and_verifiable(tmp_path: Path) -> None:

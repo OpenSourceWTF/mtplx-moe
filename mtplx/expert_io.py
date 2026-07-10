@@ -249,13 +249,23 @@ class PositionalExpertReader:
                     target = destination[read_total : read_total + count]
                     try:
                         if self._native_read_into is not None:
-                            read_now = int(
-                                self._native_read_into(
-                                    fd,
-                                    source_offset + read_total,
-                                    target,
+                            try:
+                                read_now = int(
+                                    self._native_read_into(
+                                        fd,
+                                        source_offset + read_total,
+                                        target,
+                                    )
                                 )
-                            )
+                            except Exception as exc:
+                                # nanobind maps ``std::system_error`` to a
+                                # RuntimeError rather than OSError.  Preserve
+                                # the reader's fail-closed public contract and
+                                # metrics regardless of backend exception type.
+                                self.metrics.update(io_errors=1)
+                                raise ExpertIOError(
+                                    f"native positional read failed: {exc}"
+                                ) from exc
                         else:
                             read_now = int(
                                 os.preadv(fd, [target], source_offset + read_total)

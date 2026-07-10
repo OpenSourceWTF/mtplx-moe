@@ -448,6 +448,40 @@ def test_resident_loader_runs_hy3_without_materializing_routed_parameters(
         runtime.close()
 
 
+def test_batched_single_token_decode_warms_persistent_expert_cache(
+    tmp_path: Path,
+) -> None:
+    root, config, spec, manifest_path = _integrated_hy3_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + spec.persistent_cache_bytes(1),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+    )
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=make_mlx_slot_buffer_allocator(
+            stream_config.memory_plan(spec), spec
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+    try:
+        resident = construct_resident_model(root, runtime, config=config)
+        logits = resident.model(mx.array([[1], [2]], dtype=mx.int32))
+        mx.eval(logits)
+
+        assert logits.shape == (2, 1, config["vocab_size"])
+        assert runtime._banks[1].occupancy == 1
+        assert runtime.snapshot(mx_module=mx)["cache"]["persistent_loads"] >= 1
+    finally:
+        runtime.close()
+
+
 def _integrated_glm_artifact(tmp_path: Path):
     args = _glm_args(layers=6, first_sparse=1)
     model = GlmModel(args)

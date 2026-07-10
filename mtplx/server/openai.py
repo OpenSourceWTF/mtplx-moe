@@ -1722,7 +1722,6 @@ def _session_bank_cold_tier_from_args(args: argparse.Namespace) -> Any | None:
         return None
     from mtplx.cache_bank import (
         DEFAULT_COLD_TIER_DIR,
-        DEFAULT_COLD_TIER_MAX_BYTES,
         DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS,
         SessionBankColdTier,
         parse_size_bytes,
@@ -11821,6 +11820,18 @@ def _session_keep_live_refs_for_request(
     )
 
 
+def _expert_streaming_allows_session_live_refs(runtime: Any) -> bool:
+    """Keep unmetered live KV references out of bounded expert runtimes.
+
+    Session-bank snapshots participate in byte-budget eviction, but live-ref
+    entries deliberately report zero bytes. Retaining those references after
+    a request releases aggregate KV admission would invalidate the
+    user-visible expert-streaming memory ceiling.
+    """
+
+    return getattr(runtime, "expert_streaming", None) is None
+
+
 def _commit_prompt_prefix_for_request(
     state: Any,
     *,
@@ -20290,6 +20301,12 @@ def create_app(state: ServerState) -> FastAPI:
                 request_observability["request_session_keep_live_ref_reason"] = (
                     "opencode_tool_snapshot_only"
                 )
+        if not _expert_streaming_allows_session_live_refs(state.runtime):
+            session_keep_live_ref = False
+            live_frontier_policy = "expert_streaming_snapshot_only"
+            request_observability["request_session_keep_live_ref_reason"] = (
+                "expert_streaming_memory_plan"
+            )
         request_observability["request_session_keep_live_ref"] = bool(
             session_keep_live_ref
         )

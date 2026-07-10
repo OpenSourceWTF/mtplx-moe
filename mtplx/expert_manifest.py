@@ -204,7 +204,30 @@ def _resolve_member(root: Path, name: str, *, must_exist: bool = True) -> Path:
             f"could not resolve artifact member {relative}: {exc}"
         ) from exc
     if resolved != base and base not in resolved.parents:
-        raise ExpertManifestError(f"artifact member escapes root: {relative}")
+        # Hugging Face's standard cache stores snapshots as symlinks of the
+        # form ``snapshots/<revision>/<file> -> ../../blobs/<digest>``.  Keep
+        # the general no-escape rule, but recognize that exact repository-local
+        # content-addressed layout so a pinned cache snapshot is directly
+        # usable without copying hundreds of gigabytes.  The blobs directory
+        # itself must be a real directory, and only an actual snapshot symlink
+        # may cross this boundary.
+        snapshots = base.parent
+        repository = snapshots.parent
+        blob_root = repository / "blobs"
+        try:
+            resolved_blob_root = blob_root.resolve(strict=True)
+        except OSError:
+            resolved_blob_root = None
+        hugging_face_blob = (
+            snapshots.name == "snapshots"
+            and candidate.is_symlink()
+            and blob_root.is_dir()
+            and not blob_root.is_symlink()
+            and resolved_blob_root is not None
+            and resolved_blob_root in resolved.parents
+        )
+        if not hugging_face_blob:
+            raise ExpertManifestError(f"artifact member escapes root: {relative}")
     if must_exist and not resolved.is_file():
         raise ExpertManifestError(f"artifact member is not a file: {relative}")
     return resolved
@@ -216,7 +239,7 @@ def resolve_artifact_member(
     *,
     must_exist: bool = True,
 ) -> Path:
-    """Resolve a manifest member without permitting path or symlink escape."""
+    """Resolve a member inside its root or a repository-local HF cache blob."""
 
     return _resolve_member(Path(root), name, must_exist=must_exist)
 
@@ -820,6 +843,7 @@ def _checkpoint_inventory(
     index_path = root / "model.safetensors.index.json"
     weight_map: dict[str, str] | None = None
     if index_path.is_file():
+        index_path = _resolve_member(root, index_path.name)
         index = _expect_object(_load_json_file(index_path), label="safetensors index")
         _expect_keys(
             index,

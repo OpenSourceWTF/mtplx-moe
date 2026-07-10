@@ -75,7 +75,9 @@ length, and checksum while retaining source provenance.
 
 - Pin source repository and immutable revision; record shard relative paths,
   exact file sizes, safetensors header hashes, and a whole-manifest digest.
-- Reject absolute paths, `..`, symlink escapes from the artifact root, overlap,
+- Reject absolute paths, `..`, arbitrary symlink escapes from the artifact root,
+  while allowing only the standard repository-local Hugging Face
+  `snapshots/<revision> -> blobs/<digest>` cache layout; reject overlap,
   out-of-file ranges, duplicate `(layer, expert)` keys, unsupported endianness,
   unexpected dtype/shape, and non-integer offsets.
 - Validate per-projection quantized weights, scales, and biases rather than

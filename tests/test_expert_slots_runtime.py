@@ -10,6 +10,7 @@ import pytest
 
 from mtplx.expert_io import (
     ExpertIOCancelled,
+    ExpertIOError,
     ExpertIOIntegrityError,
     ExpertIOShortRead,
     PositionalExpertReader,
@@ -181,6 +182,25 @@ def test_positional_reader_fills_and_hashes_source_record(tmp_path: Path) -> Non
     assert metrics["read_operations"] == 9
     assert metrics["read_bytes"] == len(destination)
     assert metrics["open_files_peak"] == 1
+
+
+def test_native_backend_failure_is_normalized_and_counted(tmp_path: Path) -> None:
+    root, _spec_value, manifest, _expected = _artifact(tmp_path)
+    destination = bytearray(manifest.records[0].logical_bytes)
+    reader = PositionalExpertReader(root, use_native=False)
+
+    def fail_native(_fd: int, _offset: int, _destination: memoryview) -> int:
+        raise RuntimeError("pread failed: injected EIO")
+
+    reader._native_read_into = fail_native
+    try:
+        with pytest.raises(ExpertIOError, match="native positional read failed"):
+            reader.read_record_into(manifest, manifest.records[0], destination)
+        metrics = reader.metrics.as_dict()
+        assert metrics["io_errors"] == 1
+        assert metrics["read_bytes"] == 0
+    finally:
+        reader.close()
 
 
 def test_reader_cancellation_integrity_and_short_read_fail_closed(

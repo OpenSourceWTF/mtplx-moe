@@ -213,7 +213,10 @@ class HotExpertSwitchGLU(nn.Module):
         top_k = int(indices.shape[-1])
         mx.eval(indices)
         expert_ids = tuple(int(value) for value in indices.reshape(-1).tolist())
-        phase = current_expert_routing_phase(token_count=int(tokens.shape[0]))
+        # Batch size is not a generation phase. A batched decode has shape
+        # ``[B, 1, H]`` and must still train/use the persistent decode hot set;
+        # only the sequence length distinguishes prefill from decode here.
+        phase = current_expert_routing_phase(token_count=int(x.shape[-2]))
 
         outputs: list[mx.array] = []
         output_positions: list[int] = []
