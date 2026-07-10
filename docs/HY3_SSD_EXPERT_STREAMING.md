@@ -101,10 +101,9 @@ Trace event format:
 Example simulation:
 
 ```bash
-python scripts/simulate_expert_cache.py routes.jsonl \
+python3 scripts/simulate_expert_cache.py routes.jsonl \
+  --model hy3-q4 \
   --persistent-slots-per-layer 64 \
-  --transient-slots 8 \
-  --expert-record-bytes 10000000 \
   --ssd-gib-per-second 5.5
 ```
 

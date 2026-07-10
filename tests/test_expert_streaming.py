@@ -66,6 +66,43 @@ def test_frequent_decode_expert_eventually_displaces_a_cold_resident() -> None:
     assert 3 in bank.resident_experts
 
 
+def test_singleton_decode_miss_does_not_win_only_because_resident_decayed() -> None:
+    bank = LayerExpertSlotBank(
+        expert_count=16,
+        persistent_slots=2,
+        transient_slots=1,
+    )
+    bank.plan([1], phase="decode")
+    bank.plan([2], phase="decode")
+    resident_before = bank.resident_experts
+
+    singleton = bank.plan([3], phase="decode")
+
+    assert bank.resident_experts == resident_before
+    assert all(not load.persistent for load in singleton.loads)
+    assert singleton.evictions == ()
+
+
+def test_prefill_does_not_age_decode_admission_history() -> None:
+    bank = LayerExpertSlotBank(
+        expert_count=32,
+        persistent_slots=2,
+        transient_slots=1,
+        frequency_decay=0.5,
+    )
+    bank.plan([1], phase="decode")
+    bank.plan([2], phase="decode")
+    resident_before = bank.resident_experts
+
+    for _ in range(32):
+        bank.plan([10], phase="prefill")
+    singleton = bank.plan([3], phase="decode")
+
+    assert bank.resident_experts == resident_before
+    assert all(not load.persistent for load in singleton.loads)
+    assert singleton.evictions == ()
+
+
 def test_active_hit_is_pinned_during_multi_expert_admission() -> None:
     bank = LayerExpertSlotBank(
         expert_count=16,
@@ -94,6 +131,35 @@ def test_duplicate_router_ids_share_one_load_and_slot() -> None:
     assert plan.slots[0] == plan.slots[1]
 
 
+def test_counters_preserve_router_assignment_multiplicity() -> None:
+    bank = LayerExpertSlotBank(
+        expert_count=8,
+        persistent_slots=0,
+        transient_slots=2,
+    )
+    counters = CacheCounters()
+
+    plan = bank.plan([4, 4, 6], phase="decode")
+    counters.observe(plan, expert_record_bytes=100)
+
+    assert counters.expert_requests == 3
+    assert counters.expert_misses == 3
+    assert counters.transient_loads == 2
+    assert counters.bytes_read == 200
+
+
+@pytest.mark.parametrize("invalid_id", [1.9, "1", True])
+def test_router_ids_must_be_exact_integers(invalid_id: object) -> None:
+    bank = LayerExpertSlotBank(
+        expert_count=8,
+        persistent_slots=0,
+        transient_slots=2,
+    )
+
+    with pytest.raises(TypeError, match="exact integers"):
+        bank.plan([invalid_id], phase="decode")
+
+
 def test_route_larger_than_transient_service_tier_is_rejected() -> None:
     bank = LayerExpertSlotBank(
         expert_count=16,
@@ -103,6 +169,15 @@ def test_route_larger_than_transient_service_tier_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="transient_slots"):
         bank.plan([1, 2, 3], phase="decode")
+
+
+def test_persistent_capacity_cannot_exceed_the_model_expert_count() -> None:
+    with pytest.raises(ValueError, match="cannot exceed"):
+        LayerExpertSlotBank(
+            expert_count=16,
+            persistent_slots=17,
+            transient_slots=8,
+        )
 
 
 def test_counters_charge_only_cache_misses_for_io() -> None:
@@ -144,3 +219,22 @@ def test_simulation_reports_io_time_and_layer_hotsets() -> None:
     assert summary["transient_scratch_bytes"] == 200
     assert summary["resident_experts_by_layer"]["0"] == [1, 2]
     assert summary["resident_experts_by_layer"]["1"] == []
+
+
+def test_simulation_reports_full_allocated_bank_for_a_partial_trace() -> None:
+    simulation = ExpertCacheSimulation(
+        expert_count=256,
+        persistent_slots=32,
+        transient_slots=8,
+        expert_record_bytes=21_233_664,
+        allocated_layer_count=75,
+    )
+    simulation.observe(layer_index=3, expert_ids=range(8), phase="decode")
+
+    summary = simulation.summary(effective_ssd_bytes_per_second=1)
+
+    assert summary["layers_observed"] == 1
+    assert summary["allocated_layer_count"] == 75
+    assert summary["persistent_cache_scope"] == "configured_model"
+    assert summary["persistent_cache_bytes"] == 75 * 32 * 21_233_664
+    assert summary["observed_layer_cache_bytes"] == 32 * 21_233_664

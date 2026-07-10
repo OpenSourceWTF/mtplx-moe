@@ -10,7 +10,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from math import isfinite
+from operator import index
 from typing import Iterable
+
+
+def _integer(name: str, value: object, *, minimum: int | None = None) -> int:
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be an integer, not bool")
+    try:
+        normalized = index(value)
+    except TypeError as exc:
+        raise TypeError(f"{name} must be an integer") from exc
+    if minimum is not None and normalized < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return normalized
 
 
 class RoutingPhase(str, Enum):
@@ -69,12 +83,15 @@ class CacheCounters:
     bytes_read: int = 0
 
     def observe(self, plan: RoutePlan, *, expert_record_bytes: int) -> None:
-        if expert_record_bytes < 0:
-            raise ValueError("expert_record_bytes must be non-negative")
+        expert_record_bytes = _integer(
+            "expert_record_bytes", expert_record_bytes, minimum=0
+        )
+        hit_experts = set(plan.hits)
+        assignment_hits = sum(expert in hit_experts for expert in plan.experts)
         self.route_calls += 1
-        self.expert_requests += len(plan.hits) + len(plan.misses)
-        self.expert_hits += len(plan.hits)
-        self.expert_misses += len(plan.misses)
+        self.expert_requests += len(plan.experts)
+        self.expert_hits += assignment_hits
+        self.expert_misses += len(plan.experts) - assignment_hits
         self.persistent_loads += sum(load.persistent for load in plan.loads)
         self.transient_loads += sum(not load.persistent for load in plan.loads)
         self.evictions += len(plan.evictions)
@@ -127,13 +144,18 @@ class LayerExpertSlotBank:
         transient_slots: int,
         frequency_decay: float = 0.995,
     ) -> None:
-        if expert_count <= 0:
-            raise ValueError("expert_count must be positive")
-        if persistent_slots < 0:
-            raise ValueError("persistent_slots must be non-negative")
-        if transient_slots <= 0:
-            raise ValueError("transient_slots must be positive")
-        if not 0.0 < frequency_decay <= 1.0:
+        expert_count = _integer("expert_count", expert_count, minimum=1)
+        persistent_slots = _integer("persistent_slots", persistent_slots, minimum=0)
+        transient_slots = _integer("transient_slots", transient_slots, minimum=1)
+        if persistent_slots > expert_count:
+            raise ValueError("persistent_slots cannot exceed expert_count")
+        if isinstance(frequency_decay, bool):
+            raise TypeError("frequency_decay must be a finite number")
+        try:
+            frequency_decay = float(frequency_decay)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("frequency_decay must be a finite number") from exc
+        if not isfinite(frequency_decay) or not 0.0 < frequency_decay <= 1.0:
             raise ValueError("frequency_decay must be in (0, 1]")
 
         self.expert_count = expert_count
@@ -142,7 +164,10 @@ class LayerExpertSlotBank:
         self.slot_count = persistent_slots + transient_slots
         self.frequency_decay = frequency_decay
 
-        self._epoch = 0
+        # Prefill traffic must neither age nor refresh decode admission state.
+        # A separate decode-only epoch keeps a long prompt from erasing the
+        # hot set immediately before generation starts.
+        self._decode_epoch = 0
         self._slot_to_expert: list[int | None] = [None] * self.persistent_slots
         self._expert_to_slot: dict[int, int] = {}
         self._history = [_ExpertHistory() for _ in range(expert_count)]
@@ -156,7 +181,12 @@ class LayerExpertSlotBank:
         return len(self._expert_to_slot)
 
     def _validate_experts(self, expert_ids: Iterable[int]) -> tuple[int, ...]:
-        experts = tuple(int(expert) for expert in expert_ids)
+        try:
+            experts = tuple(
+                _integer("expert id", expert, minimum=0) for expert in expert_ids
+            )
+        except TypeError as exc:
+            raise TypeError("expert ids must be exact integers") from exc
         if not experts:
             raise ValueError("a route must select at least one expert")
         for expert in experts:
@@ -173,7 +203,7 @@ class LayerExpertSlotBank:
 
     def _score(self, expert: int) -> float:
         history = self._history[expert]
-        age = self._epoch - history.score_epoch
+        age = self._decode_epoch - history.score_epoch
         if age <= 0 or history.score == 0.0:
             return history.score
         return history.score * (self.frequency_decay**age)
@@ -181,8 +211,8 @@ class LayerExpertSlotBank:
     def _touch_decode(self, expert: int) -> None:
         history = self._history[expert]
         history.score = self._score(expert) + 1.0
-        history.score_epoch = self._epoch
-        history.last_used = self._epoch
+        history.score_epoch = self._decode_epoch
+        history.last_used = self._decode_epoch
 
     def _empty_persistent_slot(self) -> int | None:
         for slot, expert in enumerate(self._slot_to_expert):
@@ -229,11 +259,11 @@ class LayerExpertSlotBank:
 
         experts = self._validate_experts(expert_ids)
         phase = RoutingPhase(phase)
-        self._epoch += 1
         unique_experts = tuple(dict.fromkeys(experts))
 
         if phase is RoutingPhase.DECODE:
-            for expert in unique_experts:
+            self._decode_epoch += 1
+            for expert in experts:
                 self._touch_decode(expert)
 
         hit_set = {
@@ -257,7 +287,11 @@ class LayerExpertSlotBank:
                     if victim_slot is not None:
                         victim = self._slot_to_expert[victim_slot]
                         assert victim is not None
-                        if self._score(expert) > self._score(victim):
+                        # Do not let a first-seen singleton evict a resident
+                        # merely because decay made the resident score < 1.
+                        # A second decode observation (or older history) must
+                        # first lift the candidate above this admission floor.
+                        if self._score(expert) > max(1.0, self._score(victim)):
                             persistent_slot = victim_slot
 
             if persistent_slot is None:
@@ -279,8 +313,9 @@ class LayerExpertSlotBank:
             resolved[expert] = slot
             loads.append(SlotLoad(expert=expert, slot=slot, persistent=False))
 
-        for expert in hit_set:
-            self._history[expert].last_used = self._epoch
+        if phase is RoutingPhase.DECODE:
+            for expert in hit_set:
+                self._history[expert].last_used = self._decode_epoch
 
         return RoutePlan(
             phase=phase,
@@ -301,14 +336,45 @@ class ExpertCacheSimulation:
     persistent_slots: int
     transient_slots: int
     expert_record_bytes: int
+    allocated_layer_count: int | None = None
     frequency_decay: float = 0.995
     counters: CacheCounters = field(default_factory=CacheCounters)
     _layers: dict[int, LayerExpertSlotBank] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.expert_count = _integer("expert_count", self.expert_count, minimum=1)
+        self.persistent_slots = _integer(
+            "persistent_slots", self.persistent_slots, minimum=0
+        )
+        self.transient_slots = _integer(
+            "transient_slots", self.transient_slots, minimum=1
+        )
+        self.expert_record_bytes = _integer(
+            "expert_record_bytes", self.expert_record_bytes, minimum=1
+        )
+        if self.persistent_slots > self.expert_count:
+            raise ValueError("persistent_slots cannot exceed expert_count")
+        if self.allocated_layer_count is not None:
+            self.allocated_layer_count = _integer(
+                "allocated_layer_count", self.allocated_layer_count, minimum=1
+            )
+        if isinstance(self.frequency_decay, bool):
+            raise TypeError("frequency_decay must be a finite number")
+        try:
+            self.frequency_decay = float(self.frequency_decay)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("frequency_decay must be a finite number") from exc
+        if not isfinite(self.frequency_decay) or not 0.0 < self.frequency_decay <= 1.0:
+            raise ValueError("frequency_decay must be in (0, 1]")
+
     def layer(self, layer_index: int) -> LayerExpertSlotBank:
-        if layer_index < 0:
-            raise ValueError("layer_index must be non-negative")
+        layer_index = _integer("layer_index", layer_index, minimum=0)
         if layer_index not in self._layers:
+            if (
+                self.allocated_layer_count is not None
+                and len(self._layers) >= self.allocated_layer_count
+            ):
+                raise ValueError("trace exceeds allocated_layer_count")
             self._layers[layer_index] = LayerExpertSlotBank(
                 expert_count=self.expert_count,
                 persistent_slots=self.persistent_slots,
@@ -329,15 +395,38 @@ class ExpertCacheSimulation:
         return plan
 
     def summary(self, *, effective_ssd_bytes_per_second: float) -> dict[str, object]:
-        if effective_ssd_bytes_per_second <= 0:
+        if isinstance(effective_ssd_bytes_per_second, bool):
+            raise TypeError("effective_ssd_bytes_per_second must be finite")
+        try:
+            effective_ssd_bytes_per_second = float(effective_ssd_bytes_per_second)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("effective_ssd_bytes_per_second must be finite") from exc
+        if (
+            not isfinite(effective_ssd_bytes_per_second)
+            or effective_ssd_bytes_per_second <= 0
+        ):
             raise ValueError("effective_ssd_bytes_per_second must be positive")
         counters = self.counters.as_dict()
+        layer_count = (
+            len(self._layers)
+            if self.allocated_layer_count is None
+            else self.allocated_layer_count
+        )
         return {
             **counters,
             "estimated_io_seconds": self.counters.bytes_read
             / effective_ssd_bytes_per_second,
             "layers_observed": len(self._layers),
-            "persistent_cache_bytes": len(self._layers)
+            "allocated_layer_count": layer_count,
+            "persistent_cache_scope": (
+                "observed_layers_only"
+                if self.allocated_layer_count is None
+                else "configured_model"
+            ),
+            "persistent_cache_bytes": layer_count
+            * self.persistent_slots
+            * self.expert_record_bytes,
+            "observed_layer_cache_bytes": len(self._layers)
             * self.persistent_slots
             * self.expert_record_bytes,
             # Native execution reuses one top-k scratch bank across sequential
