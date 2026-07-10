@@ -443,7 +443,60 @@ def test_resident_loader_runs_hy3_without_materializing_routed_parameters(
         snapshot = runtime.snapshot(mx_module=mx)
         assert snapshot["cache"]["expert_requests"] == 1
         assert snapshot["slots"]["pins"] == 0
-        assert snapshot["slots"]["buffer_backend"] == "mlx-metal-slot-bank"
+        assert snapshot["slots"]["buffer_backend"] == "mlx-metal-direct-slots"
+    finally:
+        runtime.close()
+
+
+def test_resident_loader_reads_extensionless_hugging_face_cache_blob(
+    tmp_path: Path,
+) -> None:
+    source_parent = tmp_path / "source"
+    source_parent.mkdir()
+    source, config, spec, source_manifest = _integrated_hy3_artifact(source_parent)
+    repository = tmp_path / "models--test--tiny-hy3"
+    blobs = repository / "blobs"
+    snapshot = repository / "snapshots" / ("a" * 40)
+    blobs.mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    blob = blobs / ("b" * 64)
+    blob.hardlink_to(source / "model.safetensors")
+    (snapshot / "model.safetensors").symlink_to(
+        Path("..") / ".." / "blobs" / blob.name
+    )
+    (snapshot / "config.json").write_text(
+        (source / "config.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    manifest_path = snapshot / "expert-manifest.json"
+    manifest_path.write_text(
+        source_manifest.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + spec.persistent_cache_bytes(1),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+    )
+    runtime = ExpertStreamingRuntime.open(
+        snapshot,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=make_mlx_slot_buffer_allocator(
+            stream_config.memory_plan(spec), spec
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+    try:
+        resident = construct_resident_model(snapshot, runtime, config=config)
+        logits = resident.model(mx.array([[1]], dtype=mx.int32))
+        mx.eval(logits)
+        assert logits.shape == (1, 1, config["vocab_size"])
     finally:
         runtime.close()
 

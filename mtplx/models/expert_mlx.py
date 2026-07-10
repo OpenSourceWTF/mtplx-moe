@@ -98,15 +98,17 @@ def make_mlx_slot_buffer_allocator(
     plan: ExpertMemoryPlan,
     spec: ExpertStreamingModelSpec,
 ) -> Callable[[int, str], mx.array]:
-    """Create banked stable slot views backed by a small number of MTLBuffers."""
+    """Create stable direct MLX/Metal buffers without materialized bank slices.
 
-    banks: dict[str, mx.array] = {}
-    backend = "mlx-metal-slot-bank"
+    MLX integer indexing does not expose a writable view: evaluating
+    ``bank[slot]`` allocates a second buffer.  Keeping both the bank and all
+    evaluated slices therefore doubled the expert-cache allocation.  Direct
+    fixed slots preserve positional-I/O and generation semantics while making
+    physical allocation match the memory plan.
+    """
 
-    def make_bank(count: int, size: int) -> mx.array:
-        bank = mx.zeros((count, size), dtype=mx.uint8)
-        mx.eval(bank)
-        return bank
+    slots: dict[str, mx.array] = {}
+    backend = "mlx-metal-direct-slots"
 
     def allocate(size: int, label: str) -> mx.array:
         if size != spec.expert_record_bytes:
@@ -115,26 +117,26 @@ def make_mlx_slot_buffer_allocator(
         if label.startswith("layer-") and "-persistent-" in label:
             layer = int(parts[1])
             slot = int(parts[-1])
-            key = f"layer-{layer}"
             count = plan.slots_per_layer
+            if layer not in spec.routed_layer_indices:
+                raise ValueError(f"persistent slot layer {layer} is not routed")
         elif label.startswith("global-transient-"):
             slot = int(parts[-1])
-            key = "transient"
             count = plan.transient_slots
         else:
             raise ValueError(f"unknown expert slot label {label!r}")
         if count <= 0:
-            raise ValueError(f"slot bank {key} has no planned capacity")
-        bank = banks.get(key)
-        if bank is None:
-            bank = make_bank(count, size)
-            banks[key] = bank
-        value = bank[slot]
-        mx.eval(value)
+            raise ValueError(f"slot {label} has no planned capacity")
+        if not 0 <= slot < count:
+            raise ValueError(f"slot {label} is outside planned capacity {count}")
+        if label in slots:
+            raise ValueError(f"slot {label} was allocated twice")
+        value = mlx_slot_buffer_allocator(size, label)
+        slots[label] = value
         return value
 
     setattr(allocate, "backend", backend)
-    setattr(allocate, "banks", banks)
+    setattr(allocate, "slots", slots)
     return allocate
 
 

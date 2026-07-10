@@ -141,7 +141,22 @@ def _install_split_attention_hook(attn: Any) -> bool:
         x: mx.array,
         mask: mx.array | None = None,
         cache: Any | None = None,
-    ) -> mx.array:
+        *extra_args: Any,
+        **extra_kwargs: Any,
+    ) -> Any:
+        # Custom attention families can carry additional state (GLM-5.2
+        # IndexShare passes ``prev_topk_indices``).  The Qwen-specific split
+        # implementation cannot reproduce those contracts, so preserve the
+        # original call byte-for-byte instead of intercepting or dropping them.
+        if extra_args or extra_kwargs:
+            return original_call(
+                self,
+                x,
+                mask,
+                cache,
+                *extra_args,
+                **extra_kwargs,
+            )
         if not getattr(self, "_mtplx_split_full_attention_enabled", False):
             return original_call(self, x, mask=mask, cache=cache)
         if not _attention_has_gated_q_proj(self):

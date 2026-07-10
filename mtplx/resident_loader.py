@@ -90,7 +90,11 @@ def load_resident_arrays(
     for shard_name, expected_tensors in sorted(by_shard.items()):
         shard_path = resolve_artifact_member(artifact_root, shard_name)
         try:
-            loaded = mx.load(str(shard_path))
+            # Hugging Face cache blobs are content-addressed and extensionless,
+            # so format inference fails after secure symlink resolution.  The
+            # manifest admits safetensors shards only; make that contract
+            # explicit to MLX.
+            loaded = mx.load(str(shard_path), format="safetensors")
         except Exception as exc:
             raise ResidentLoadError(
                 f"could not lazily load {shard_name}: {exc}"
