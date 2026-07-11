@@ -69,7 +69,10 @@ Run every optimization in these lanes:
    - exact 512- and 1,024-token MTPLX prompt builds;
    - 128 output tokens;
    - thinking off, temperature 0.6, top-p 0.95, top-k 20;
-   - AR only, because the pinned Hy3/GLM Q4 artifacts omit MTP weights;
+   - AR only; MTP is a separate acceleration claim with its own lane (the
+     Hy3 layer-80 head is now packaged and opt-in, see
+     HY3_SSD_EXPERT_STREAMING.md; the pinned GLM Q4 artifact still omits
+     MTP weights);
    - compare with the recorded Qwen3.6 27B AR result (about 24.6 tok/s).
 2. **Realistic single-stream lane**
    - the checked-in 313-token engineering prompt;
@@ -215,9 +218,11 @@ optimizations should no longer be credited for time spent in attention.
 
 - Add a native event-driven route/cache scheduler only after profiling proves
   Python control overhead is material once I/O and Metal are overlapped.
-- Add MTP or another speculative decoder only when a separately pinned and
-  validated draft artifact exists. MTP is a separate acceleration claim and
-  must not be mixed into the AR comparison lane.
+- Hy3 MTP now has a separately pinned and validated draft artifact (the
+  layer-80 NextN head; enable with `--enable-mtp --mtp-artifacts`, see
+  HY3_SSD_EXPERT_STREAMING.md). It remains a separate acceleration claim
+  and must not be mixed into the AR comparison lane. Any other speculative
+  decoder still requires its own pinned, validated artifact first.
 - Evaluate lower-bit experts only as a separate quality/performance artifact;
   never relabel a different quantization as the current affine-Q4 model.
 - Keep file-backed Metal buffers experimental until tests show that cold pages

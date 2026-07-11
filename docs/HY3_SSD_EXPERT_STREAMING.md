@@ -2,7 +2,9 @@
 
 Status: AR implementation complete on the experimental branch, including the
 resident Hy3 overlay, native positional I/O, and direct MLX/Metal slot-bank
-execution. Full-checkpoint parity and hardware benchmarks remain release gates.
+execution. MTP through the layer-80 NextN head is implemented behind an
+opt-in flag (see "MTP: the layer-80 NextN head"). Full-checkpoint parity and
+hardware benchmarks remain release gates for both paths.
 
 ## Goal
 
@@ -145,9 +147,9 @@ manifest.
 
 The examined final-model community Q4 indexes omit checkpoint layer 80 even
 though their config still declares one NextN predictor. They are AR-only in
-practice. Initial streaming work must prove AR first; MTP requires separately
-packaging and validating the official BF16 layer-80 weights (or a new Q4
-conversion) and adding its own expert bank.
+practice. The layer-80 head is therefore packaged separately from the
+official BF16 checkpoint and loaded as resident weights when MTP is
+requested; see "MTP: the layer-80 NextN head" below.
 
 Routing is a discrete, precision-sensitive boundary. The parity baseline must
 retain the Q4 artifact's resident 8-bit gate and run router math/selection in
@@ -222,13 +224,87 @@ Flash-MoE measurements report a large cold-`mmap` regression versus explicit
 reads. The fork should reproduce that comparison on this machine rather than
 assuming virtual memory is an expert cache.
 
-## MTP sequencing
+## MTP: the layer-80 NextN head
 
-Start with AR correctness and throughput. Hy3's MTP head has its own routed MoE
-layer and therefore needs a separate slot bank. A verify batch can request the
-union of experts for several speculative positions, increasing SSD traffic.
-MTP is promoted only if it beats AR while passing exactness and repetition
-gates under the same cache budget.
+Status: implemented behind an opt-in flag. AR stays the default; an
+unflagged run is byte-identical to the AR-only branch. The real-checkpoint
+parity run and the AR-vs-MTP benchmark are still release gates.
+
+### Packaging
+
+The pinned Q4 conversion omits layer 80, so the head is packaged from the
+official `tencent/Hy3` BF16 checkpoint (revision `716aa724...`) into three
+sibling artifacts:
+
+1. `scripts/extract_mtp_layer80.py` copies all 593 `model.layers.80.*`
+   tensors bit-exactly into `layer80-bf16.safetensors`.
+2. `scripts/quantize_mtp_layer80.py` emits `layer80-q4.safetensors`: the
+   576 routed expert projections in the pinned affine-Q4/gs64 expert
+   segment format (U32 packed + BF16 scales/biases, 10,616,832 bytes per
+   expert).
+3. `scripts/quantize_mtp_layer80_residents.py` emits
+   `layer80-residents-q.safetensors`: attention q/k/v/o and the shared
+   expert in affine Q4/gs64, the router gate in affine Q8/gs64, norms and
+   `eh_proj` in BF16, `expert_bias` in F32 — the same resident conventions
+   the pinned artifact uses for trunk layers 1-79.
+
+Loading is fail-closed: revision mismatches, missing/extra tensors, shape
+disagreements between experts, and wrong leaf dtypes abort MTP enablement.
+
+### Resident experts, not a second slot bank
+
+Earlier planning assumed the head would need its own streamed expert bank.
+It does not get one. Layer 80's 192 experts total about 1.94 GiB in Q4 and
+every draft routes through the head, so streaming them would put SSD reads
+directly on the speculative path it is supposed to shorten. At MTP-enable
+time the experts load as ordinary resident weights — one stacked quantized
+`SwitchGLU`, the same shape resident MLX MoE layers use — while trunk
+layers 1-79 keep the existing slot bank unchanged.
+
+The head is standard NextN: the shifted token's embedding and the trunk's
+hidden state pass through `enorm`/`hnorm`, are concatenated and projected
+by `eh_proj` [4096, 8192] into one transformer block (attention plus the
+head's own 192-expert top-8 MoE), then the head's checkpoint
+`final_layernorm` feeds the shared trunk `lm_head`. Speculation reuses the
+existing exact rejection-sampling draft/verify loop (`generate_mtp1`,
+depth 1): acceptance rate changes speed, never tokens.
+
+Verify batches reach the streamed trunk as short multi-token forwards. The
+wave scheduler already groups tokens by expert; with MTP enabled the
+runtime classifies forwards up to primary+draft width as decode routing so
+verify traffic keeps training the persistent decode hot set instead of
+seeding prefill-transient slots. With MTP off the classification is exactly
+the historical single-token rule.
+
+Budget note: the head adds one attention layer of KV (about 1.25% per
+token over the 80 trunk layers) and ~2.1 GiB of resident weights; both must
+come out of the same memory plan when sizing persistent slots for MTP runs.
+
+### Enabling it
+
+Python: `mtplx.runtime.load(root, mtp=True, mtp_artifacts=<dir>,
+expert_streaming_config=..., expert_manifest=...)` where `<dir>` holds
+`layer80-residents-q.safetensors` and `layer80-q4.safetensors`
+(`~/.cache/huggingface/hy3-mtp-layer80` on the reference machine).
+
+Benchmark harness (release gate; run only on an otherwise idle machine —
+never beside the production qwen server):
+
+```bash
+python3 scripts/benchmark_streamed_generation.py \
+  <model_root> <manifest.json> \
+  --model-key hy3-q4 \
+  --memory-limit 112GiB \
+  --max-live-kv-tokens 8192 \
+  --enable-mtp \
+  --mtp-artifacts ~/.cache/huggingface/hy3-mtp-layer80 \
+  --output-json outputs/hy3-mtp-run.json
+```
+
+Run the same command without `--enable-mtp`/`--mtp-artifacts` for the AR
+baseline; `generation_stats` in the MTP payload carries drafted, accepted,
+and rejected counts. MTP is promoted only if it beats AR while passing
+exactness and repetition gates under the same cache budget.
 
 ## Validation gates
 
