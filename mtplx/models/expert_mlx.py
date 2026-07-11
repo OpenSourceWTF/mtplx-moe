@@ -20,7 +20,7 @@ from mlx_lm.models.activations import swiglu
 
 from mtplx.expert_runtime import ExpertStreamingRuntime
 from mtplx.expert_manifest import ExpertManifest, ExpertRecord
-from mtplx.expert_slots import ExpertSlotBinding
+from mtplx.expert_slots import ExpertSlotBinding, ReadyRoute
 from mtplx.expert_streaming import RoutingPhase
 from mtplx.expert_streaming_models import ExpertMemoryPlan, ExpertStreamingModelSpec
 from mtplx.mmap_mlx import mmap_u32
@@ -710,9 +710,46 @@ class HotExpertSwitchGLU(nn.Module):
         output_positions: list[int] = []
         shared: mx.array | None = None
 
+        def fence_bindings(
+            ready: ReadyRoute,
+            bindings: tuple[ExpertSlotBinding, ...],
+            wave_outputs: list[mx.array],
+        ) -> None:
+            raw = os.environ.get("MTPLX_EXPERT_SLOT_FENCES", "1")
+            enabled = raw.strip().lower() not in {"0", "false", "no", "off"}
+            async_eval = getattr(mx, "async_eval", None)
+            if not enabled:
+                mx.eval(wave_outputs)
+                return
+            if not callable(async_eval):
+                ready.pool.metrics.update(completion_fence_fallbacks=1)
+                mx.eval(wave_outputs)
+                return
+            try:
+                async_eval(wave_outputs)
+            except Exception:
+                # Older/stripped MLX builds may expose the name without a
+                # usable asynchronous evaluator. Preserve the generation
+                # fence with the original synchronous barrier.
+                ready.pool.metrics.update(completion_fence_fallbacks=1)
+                mx.eval(wave_outputs)
+                return
+            roots = tuple(wave_outputs)
+            try:
+                ready.defer_bindings_until(
+                    bindings,
+                    lambda: mx.eval(roots),
+                )
+            except Exception:
+                # If the completion lane rejects or cannot represent this
+                # binding set, do not release the route on an async promise.
+                ready.pool.metrics.update(completion_fence_fallbacks=1)
+                mx.eval(roots)
+
         def evaluate_component_bindings(
             positions: tuple[int, ...] | list[int],
             bindings: tuple[ExpertSlotBinding, ...],
+            ready: ReadyRoute,
         ) -> None:
             if not positions:
                 return
@@ -739,13 +776,14 @@ class HotExpertSwitchGLU(nn.Module):
                     )
                 )
                 wave_positions.extend(grouped_positions)
-            mx.eval(wave_outputs)
+            fence_bindings(ready, bindings, wave_outputs)
             outputs.extend(wave_outputs)
             output_positions.extend(wave_positions)
 
         def evaluate_direct_bindings(
             positions: tuple[int, ...] | list[int],
             bindings: tuple[ExpertSlotBinding, ...],
+            ready: ReadyRoute,
         ) -> None:
             if not positions:
                 return
@@ -770,7 +808,7 @@ class HotExpertSwitchGLU(nn.Module):
                     )
                 )
                 wave_positions.extend(expert_positions)
-            mx.eval(wave_outputs)
+            fence_bindings(ready, bindings, wave_outputs)
             outputs.extend(wave_outputs)
             output_positions.extend(wave_positions)
 
@@ -850,6 +888,7 @@ class HotExpertSwitchGLU(nn.Module):
                     evaluate_bindings(
                         hit_positions,
                         pending.hit_ready.bindings,
+                        pending.hit_ready,
                     )
                     pending.release_hits()
                 # The resident shared branch depends only on ``x``.  Force it
@@ -878,6 +917,7 @@ class HotExpertSwitchGLU(nn.Module):
                     evaluate_bindings(
                         miss_positions,
                         miss_ready.bindings,
+                        miss_ready,
                     )
             finally:
                 pending.close()

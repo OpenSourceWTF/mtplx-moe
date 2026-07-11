@@ -311,6 +311,70 @@ def test_transient_slot_waits_for_pinned_generation_before_overwrite(
     pool.close()
 
 
+def test_completion_fence_holds_generation_until_consumer_finishes(
+    tmp_path: Path,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    plan = _plan(spec)
+    reader = PositionalExpertReader(root, use_native=False)
+    pool = ExpertSlotPool(spec, plan, manifest, reader)
+    transient_slot = plan.slots_per_layer
+    completed = threading.Event()
+    first = pool.ensure_route(1, _manual_plan(0, transient_slot))
+    first_generation = first.generations[0]
+
+    assert first.defer_bindings_until(first.bindings, completed.wait) is True
+    first.release(synchronize=False)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        replacement = executor.submit(
+            pool.ensure_route,
+            1,
+            _manual_plan(1, transient_slot),
+        )
+        time.sleep(0.05)
+        assert replacement.done() is False
+        slot = pool._physical(1, transient_slot)
+        with slot.condition:
+            assert slot.pins == 1
+        completed.set()
+        second = replacement.result(timeout=2)
+
+    assert second.bindings[0].expert == 1
+    assert second.generations[0] > first_generation
+    second.release(synchronize=False)
+    snapshot = pool.snapshot()
+    assert snapshot["pins"] == 0
+    assert snapshot["metrics"]["completion_fences"] == 1
+    assert snapshot["metrics"]["completion_fence_slots"] == 1
+    pool.close()
+
+
+def test_completion_fence_failure_releases_pin_and_fails_next_route(
+    tmp_path: Path,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    plan = _plan(spec)
+    reader = PositionalExpertReader(root, use_native=False)
+    pool = ExpertSlotPool(spec, plan, manifest, reader)
+    transient_slot = plan.slots_per_layer
+    first = pool.ensure_route(1, _manual_plan(0, transient_slot))
+
+    def fail_completion() -> None:
+        raise RuntimeError("injected Metal completion failure")
+
+    first.defer_bindings_until(first.bindings, fail_completion)
+    first.release(synchronize=False)
+    pool._drain_completion_fences()
+
+    slot = pool._physical(1, transient_slot)
+    with slot.condition:
+        assert slot.pins == 0
+    assert pool.metrics.as_dict()["completion_fence_failures"] == 1
+    with pytest.raises(ExpertSlotError, match="completion fence failed"):
+        pool.ensure_route(1, _manual_plan(1, transient_slot))
+    pool.close()
+
+
 def test_runtime_handles_kv_admission_routes_waves_and_reset(tmp_path: Path) -> None:
     root, spec, manifest, expected = _artifact(tmp_path)
     manifest_path = root / "expert-manifest.json"

@@ -43,6 +43,10 @@ class ExpertSlotMetrics:
     load_waits: int = 0
     active_routes: int = 0
     active_routes_peak: int = 0
+    completion_fences: int = 0
+    completion_fence_slots: int = 0
+    completion_fence_fallbacks: int = 0
+    completion_fence_failures: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def update(self, **values: int) -> None:
@@ -67,6 +71,10 @@ class ExpertSlotMetrics:
                     "load_waits",
                     "active_routes",
                     "active_routes_peak",
+                    "completion_fences",
+                    "completion_fence_slots",
+                    "completion_fence_fallbacks",
+                    "completion_fence_failures",
                 )
             }
 
@@ -126,6 +134,11 @@ class ReadyRoute:
         self.bindings = bindings
         self._pinned = pinned
         self._released = False
+        self._route_finished = False
+        self._release_lock = threading.Lock()
+        self._pending_slots = {id(slot): slot for slot in pinned}
+        self._scheduled_slots: set[int] = set()
+        self._completion_futures: list[Future[None]] = []
 
     @property
     def slots(self) -> tuple[int, ...]:
@@ -150,25 +163,104 @@ class ReadyRoute:
                         "ready route references a stale slot generation"
                     )
 
+    def defer_bindings_until(
+        self,
+        bindings: Iterable[ExpertSlotBinding],
+        completion_waiter: Callable[[], None],
+    ) -> bool:
+        """Hold selected slot generations until their Metal work completes.
+
+        The waiter runs on the pool's bounded completion lane. This lets the
+        generation thread proceed to miss I/O without making a slot reusable
+        before the asynchronous kernels that consume it have completed.
+        """
+
+        if not callable(completion_waiter):
+            raise TypeError("completion_waiter must be callable")
+        selected: dict[int, _PhysicalSlot] = {}
+        for binding in bindings:
+            slot = self.pool._physical(binding.layer, binding.logical_slot)
+            selected[id(slot)] = slot
+        if not selected:
+            return False
+        with self._release_lock:
+            if self._released:
+                raise ExpertSlotError("cannot fence a released ready route")
+            unknown = set(selected) - set(self._pending_slots)
+            if unknown:
+                raise ExpertSlotError("completion fence references an unpinned slot")
+            duplicate = set(selected) & self._scheduled_slots
+            if duplicate:
+                raise ExpertSlotError("slot already has a completion fence")
+            self._scheduled_slots.update(selected)
+        future = self.pool._submit_completion_fence(
+            completion_waiter,
+            lambda: self._finish_slots(tuple(selected.values())),
+            slot_count=len(selected),
+        )
+        if future is not None:
+            with self._release_lock:
+                self._completion_futures.append(future)
+        return True
+
     def _binding_slots(self) -> tuple[_PhysicalSlot, ...]:
         return tuple(
             self.pool._physical(binding.layer, binding.logical_slot)
             for binding in self.bindings
         )
 
-    def release(self, *, synchronize: bool = True) -> None:
-        if self._released:
-            return
-        if synchronize and self.pool.device_synchronize is not None:
-            self.pool.device_synchronize()
-        for slot in self._pinned:
+    def _finish_slots(self, slots: tuple[_PhysicalSlot, ...]) -> None:
+        for slot in slots:
             with slot.condition:
                 if slot.pins <= 0:
                     raise ExpertSlotError("slot pin accounting underflow")
                 slot.pins -= 1
                 slot.condition.notify_all()
-        self._released = True
-        self.pool._route_released()
+        finish_route = False
+        with self._release_lock:
+            for slot in slots:
+                slot_id = id(slot)
+                self._pending_slots.pop(slot_id, None)
+                self._scheduled_slots.discard(slot_id)
+            if self._released and not self._pending_slots and not self._route_finished:
+                self._route_finished = True
+                finish_route = True
+        if finish_route:
+            self.pool._route_released()
+
+    def release(self, *, synchronize: bool = True) -> None:
+        with self._release_lock:
+            first_release = not self._released
+            self._released = True
+            immediate = (
+                tuple(
+                    slot
+                    for slot_id, slot in self._pending_slots.items()
+                    if slot_id not in self._scheduled_slots
+                )
+                if first_release
+                else ()
+            )
+            futures = tuple(self._completion_futures)
+            finish_empty = (
+                first_release
+                and not self._pending_slots
+                and not self._route_finished
+            )
+            if finish_empty:
+                self._route_finished = True
+        if first_release and synchronize and self.pool.device_synchronize is not None:
+            self.pool.device_synchronize()
+        if immediate:
+            self._finish_slots(immediate)
+        elif finish_empty:
+            self.pool._route_released()
+        if synchronize:
+            for future in futures:
+                try:
+                    future.result()
+                except BaseException as exc:
+                    raise ExpertSlotError("expert completion fence failed") from exc
 
     def __enter__(self) -> ReadyRoute:
         return self
@@ -311,6 +403,61 @@ class ExpertSlotPool:
             max_workers=workers,
             thread_name_prefix="mtplx-expert-io",
         )
+        self._completion_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="mtplx-slot-fence",
+        )
+        self._completion_error_lock = threading.Lock()
+        self._completion_error: BaseException | None = None
+
+    def _submit_completion_fence(
+        self,
+        completion_waiter: Callable[[], None],
+        on_complete: Callable[[], None],
+        *,
+        slot_count: int,
+    ) -> Future[None] | None:
+        self.metrics.update(
+            completion_fences=1,
+            completion_fence_slots=slot_count,
+        )
+
+        def wait_and_release() -> None:
+            try:
+                completion_waiter()
+            except BaseException as exc:
+                self.metrics.update(completion_fence_failures=1)
+                with self._completion_error_lock:
+                    if self._completion_error is None:
+                        self._completion_error = exc
+                raise
+            finally:
+                on_complete()
+
+        try:
+            return self._completion_executor.submit(wait_and_release)
+        except RuntimeError:
+            # Shutdown races or stripped-down runtimes fail closed: wait on the
+            # caller before allowing any generation to be overwritten.
+            self.metrics.update(completion_fence_fallbacks=1)
+            wait_and_release()
+            return None
+
+    def _raise_completion_error(self) -> None:
+        with self._completion_error_lock:
+            error = self._completion_error
+            self._completion_error = None
+        if error is not None:
+            raise ExpertSlotError("an asynchronous expert completion fence failed") from error
+
+    def _drain_completion_fences(self) -> None:
+        """Wait for completion tasks queued before this diagnostic snapshot."""
+
+        try:
+            barrier = self._completion_executor.submit(lambda: None)
+        except RuntimeError:
+            return
+        barrier.result()
 
     def _allocate_buffer(self, label: str) -> Any:
         buffer = self._allocator(self.spec.expert_record_bytes, label)
@@ -560,6 +707,7 @@ class ExpertSlotPool:
     ) -> ReadyRoute:
         """Load all misses, validate mappings, and pin the route's slots."""
 
+        self._raise_completion_error()
         try:
             layer_lock = self._ensure_locks[layer]
         except KeyError as exc:
@@ -752,6 +900,7 @@ class ExpertSlotPool:
             return True
 
     def snapshot(self) -> dict[str, Any]:
+        self._drain_completion_fences()
         states: dict[str, int] = {state.value: 0 for state in ExpertSlotState}
         pins = 0
         for slot in (*self._persistent.values(), *self._transient):
@@ -774,6 +923,7 @@ class ExpertSlotPool:
         }
 
     def reset(self) -> None:
+        self._raise_completion_error()
         with self._lifecycle:
             if self.metrics.as_dict()["active_routes"]:
                 raise ExpertSlotError("cannot reset while expert routes are active")
@@ -802,6 +952,7 @@ class ExpertSlotPool:
                             "active expert routes did not release before close"
                         )
                     self._lifecycle.wait(remaining)
+        self._completion_executor.shutdown(wait=True, cancel_futures=False)
         self._executor.shutdown(wait=True, cancel_futures=True)
         for slot in (*self._persistent.values(), *self._transient):
             with slot.condition:
