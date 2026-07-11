@@ -23,14 +23,43 @@ stage must earn its place with a matched benchmark before the next stage.
   - 0.74–1.34 GB/s disk throughput.
   - cool package, indicating scheduler/I/O/Metal bubbles rather than thermal
     throttling.
+- Hy3 exact affine-Q4, 1,024-token prompt / 64-token decode, direct slots,
+  80 GiB expert cache, LRU, trusted previously verified sidecar, and
+  `F_NOCACHE`:
+  - 61.21 prompt tok/s and 5.13 steady decode tok/s (2.19 tok/s including
+    prompt ingestion).
+  - 91.996 GB peak MLX memory with no compression or swap growth.
+  - 46.67 GB read for 63 instrumented decode steps: 740.8 MB/token at an
+    effective 3.74 GB/s during decode.
+  - 88.96% decode assignment hit rate.
 - A Python grouped-weight experiment changed the same first-256 window from
   1.3225 to 1.3261 tok/s (+0.3%). It was removed because copying slot tensors
   cancels the launch savings.
 
-The immediate bottleneck is serialized expert fault handling and low SSD queue
-depth. The predicted next bottleneck is small-batch Metal occupancy and
-router-to-host synchronization. At long context, KV/attention bandwidth will
-eventually replace expert I/O as the limiting resource.
+The direct-slot `F_NOCACHE` path has changed the immediate bottleneck. It now
+reaches the measured SSD bandwidth floor during decode: 740.8 MB/token at
+3.74 GB/s predicts 5.05 tok/s before compute, matching the observed 5.13
+tok/s. The immediate exact-model problem is therefore reducing physical expert
+bytes per token, not merely adding I/O queue depth. Small-batch Metal occupancy
+and router-to-host synchronization remain predicted later bottlenecks. At long
+context, KV/attention bandwidth will eventually replace expert I/O as the
+limiting resource.
+
+Local route replay also bounds which research ideas can reach the target at
+the current 80 GiB allocation:
+
+- uniform 102-slot-per-layer LRU: 89.29% hits, about 718 MB/token in replay;
+- uniform Belady oracle: 93.43% hits, about 441 MB/token, or only about
+  8.5 tok/s at the measured 3.74 GB/s;
+- 10 tok/s requires at most about 374 MB/token at that bandwidth;
+- a simple prompt-trained cross-layer expert-ID predictor reached only 37.35%
+  top-8 recall (52.7% top-16, 67.9% top-32);
+- pinning every expert in the first four sparse layers made this Hy3 trace
+  worse at a fixed global capacity.
+
+Consequently, published predictor and shallow-pinning results are hypotheses,
+not portable defaults. Dynamic allocation of the global 80 GiB across layers
+must be tested before deeper prefetch work.
 
 ## Benchmark contract
 
@@ -78,6 +107,12 @@ token parity in deterministic mode, and stays inside the memory plan.
    that maximizes sustained reads without duplicating the 80 GB application
    cache in the macOS file cache.
 
+Status: direct-slot `F_NOCACHE`, 32 transient slots, 64 MiB read chunks, and
+the trusted-sidecar benchmark tier are implemented. The matched probe improved
+steady decode from 2.69 to 5.13 tok/s and prompt ingestion from 45.72 to 61.21
+tok/s. Offset-sorted/coalesced prefill remains open, but decode is already at
+its measured byte-bandwidth floor.
+
 **Expected next bottleneck:** Metal execution and host synchronization once the
 SSD reaches several GB/s. Do not claim a target in advance; use the disk trace
 to determine whether the internal SSD or expert execution becomes limiting.
@@ -98,6 +133,12 @@ to determine whether the internal SSD or expert execution becomes limiting.
 5. Persist only frequency metadata, never live MLX slot references, across
    sessions. Prewarm from the profile under the same byte admission gate.
 
+The dynamic-capacity experiment is now the first item in this stage. A uniform
+per-layer Belady oracle cannot reach 10 tok/s, while an overfit same-trace
+frequency allocation shows large layer skew. The deployable experiment must
+train on prior prompts and be evaluated on held-out routes; same-trace oracle
+results are only an upper bound.
+
 **Expected next bottleneck:** Q4 compute/dispatch on high-hit decode. Measure
 bytes/token after this stage; a cache-policy win must reduce physical reads, not
 only improve a logical counter.
@@ -114,6 +155,12 @@ only improve a logical counter.
    reuse remains fenced by the last consumer of that slot.
 6. Add cancellation, deadline, generation-number, and exception tests for every
    split-route transition.
+
+Prediction is a cache hint only: the original router remains authoritative and
+any missing selected expert is loaded before computation. Report both recall
+and byte amplification. In particular, a high recall obtained by prefetching
+roughly four times top-k can reduce latency only if the extra reads do not
+consume the SSD bandwidth needed by true misses.
 
 **Expected next bottleneck:** small Q4 kernels and the per-layer router-ID host
 round trip. This stage should raise SSD and Metal duty cycle without requiring
@@ -173,6 +220,12 @@ optimizations should no longer be credited for time spent in attention.
   must not be mixed into the AR comparison lane.
 - Evaluate lower-bit experts only as a separate quality/performance artifact;
   never relabel a different quantization as the current affine-Q4 model.
+- Keep file-backed Metal buffers experimental until tests show that cold pages
+  are prefetched before binding, active resources are released under pressure,
+  wired/file-backed memory is accounted against the same user limit, and an
+  MLX upgrade regression test catches accidental eager residency. Mapping a
+  whole layer and touching one word has already shown resource-granularity
+  page-in behavior on this host.
 
 ## Stop/go criteria
 
