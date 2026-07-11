@@ -294,3 +294,136 @@ def build_hy3_mtp_module(
         Path(artifact_dir).expanduser(),
     )
     return mtp
+
+
+def inject_hy3_streamed_mtp_support(
+    model: Any,
+    artifact_dir: Path | str | None,
+    config: dict[str, Any],
+    contract: Any | None = None,
+    *,
+    expected_revision: str = HY3_MTP_SOURCE_REVISION,
+) -> bool:
+    """Attach layer-80 NextN speculative support to a streamed Hy3 model.
+
+    The patched model exposes the same ``__call__`` / ``mtp_forward`` /
+    ``mtp_update_cache`` / ``make_mtp_cache`` surface as the other mtplx MTP
+    backends, so the existing exact rejection-sampling generate loops drive
+    it unchanged.  ``mtp_verify_width`` tells the streamed runtime how wide a
+    decode-side verify batch can be so expert routing keeps training the
+    persistent decode hot set.
+    """
+
+    import mlx.core as mx
+    from mlx_lm.models.cache import KVCache
+
+    if artifact_dir is None:
+        raise Hy3MTPLoadError("streamed Hy3 MTP requires an artifact directory")
+    if str(config.get("model_type") or "") != "hy_v3":
+        raise Hy3MTPLoadError("streamed MTP injection supports hy_v3 only")
+    args = getattr(model, "args", None)
+    if args is None:
+        raise Hy3MTPLoadError("streamed Hy3 model exposes no ModelArgs")
+    declared = int(getattr(args, "num_nextn_predict_layers", 0) or 0)
+    if declared < 1:
+        raise Hy3MTPLoadError(
+            "model config declares no NextN predictor layer; refusing to "
+            "attach a layer-80 head it never trained"
+        )
+
+    mtp = build_hy3_mtp_module(
+        artifact_dir,
+        args,
+        expected_revision=expected_revision,
+    )
+    original_outer_class = model.__class__
+
+    class _MTPLXStreamedHy3Model(original_outer_class):
+        # Primary token plus one drafted token per NextN layer.  Consumed by
+        # MTPLXRuntime to classify short verify batches as decode routing.
+        mtp_verify_width = 1 + len(mtp.layers)
+
+        def __call__(
+            self,
+            inputs,
+            cache=None,
+            return_hidden: bool = False,
+            hidden_variant: str | None = None,
+        ):
+            if hidden_variant not in {None, "post_norm"}:
+                raise ValueError(
+                    "streamed Hy3 MTP supports the post_norm hidden variant only"
+                )
+            hidden = self.model(inputs, cache)
+            head_input = hidden
+            if self.args.enable_lm_head_fp32:
+                head_input = head_input.astype(mx.float32)
+            logits = self.lm_head(head_input)
+            if not return_hidden:
+                return logits
+            return logits, hidden
+
+        def mtp_forward(
+            self,
+            hidden_states,
+            next_token_ids,
+            cache=None,
+            mtp_cache=None,
+            concat_order=None,
+            return_hidden: bool = False,
+            mtp_hidden_variant: str | None = "post_norm",
+            position_offset: int | None = None,
+            mtp_depth: int | None = None,
+        ):
+            if concat_order not in {None, "embedding_hidden"}:
+                raise ValueError(
+                    "streamed Hy3 MTP supports embedding_hidden concat order only"
+                )
+            depth = 0 if mtp_depth is None else max(int(mtp_depth) - 1, 0)
+            depth %= len(self.mtp.layers)
+            layer_cache = None
+            if mtp_cache is not None:
+                layer_cache = (
+                    mtp_cache[depth] if isinstance(mtp_cache, list) else mtp_cache
+                )
+            logits, hidden = self.mtp.layers[depth](
+                next_token_ids,
+                hidden_states,
+                embed_tokens=self.model.embed_tokens,
+                lm_head=self.lm_head,
+                cache=layer_cache,
+            )
+            if not return_hidden:
+                return logits
+            return logits, hidden
+
+        def mtp_update_cache(
+            self,
+            hidden_states,
+            next_token_ids,
+            mtp_cache=None,
+            concat_order=None,
+            position_offset: int | None = None,
+            mtp_depth: int | None = None,
+        ):
+            _logits, hidden = self.mtp_forward(
+                hidden_states,
+                next_token_ids,
+                mtp_cache=mtp_cache,
+                concat_order=concat_order,
+                return_hidden=True,
+                position_offset=position_offset,
+                mtp_depth=mtp_depth,
+            )
+            return hidden
+
+        def make_mtp_cache(self):
+            return [KVCache() for _layer in self.mtp.layers]
+
+    model.mtp = mtp
+    model.__class__ = _MTPLXStreamedHy3Model
+    logger.info(
+        "[Hy3 MTP inject] streamed NextN head attached (verify width %d)",
+        _MTPLXStreamedHy3Model.mtp_verify_width,
+    )
+    return True

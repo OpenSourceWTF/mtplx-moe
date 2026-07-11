@@ -43,3 +43,49 @@ def test_window_telemetry_can_be_disabled() -> None:
                               "--max-live-kv-tokens", "2048",
                               "--no-window-telemetry"])
     assert args.window_telemetry is False
+
+
+_BASE_ARGS = ["/model", "/manifest", "--memory-limit", "112GiB",
+              "--max-live-kv-tokens", "2048"]
+
+
+def test_mtp_defaults_off_so_ar_runs_are_unchanged() -> None:
+    parser = _load_module().build_parser()
+    args = parser.parse_args([*_BASE_ARGS, "--model-key", "hy3-q4"])
+    assert args.enable_mtp is False
+    assert args.mtp_artifacts is None
+
+
+def test_enable_mtp_parses_with_artifacts_for_hy3() -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args([*_BASE_ARGS, "--model-key", "hy3-q4",
+                              "--enable-mtp", "--mtp-artifacts", "/artifacts"])
+    module.validate_mtp_flags(parser, args)
+    assert args.enable_mtp is True
+    assert str(args.mtp_artifacts) == "/artifacts"
+
+
+def test_enable_mtp_requires_artifacts_and_hy3(capsys) -> None:
+    import pytest
+
+    module = _load_module()
+    parser = module.build_parser()
+
+    args = parser.parse_args([*_BASE_ARGS, "--model-key", "hy3-q4",
+                              "--enable-mtp"])
+    with pytest.raises(SystemExit):
+        module.validate_mtp_flags(parser, args)
+    assert "--mtp-artifacts" in capsys.readouterr().err
+
+    args = parser.parse_args([*_BASE_ARGS, "--model-key", "glm52-q4",
+                              "--enable-mtp", "--mtp-artifacts", "/artifacts"])
+    with pytest.raises(SystemExit):
+        module.validate_mtp_flags(parser, args)
+    assert "hy3-q4" in capsys.readouterr().err
+
+    args = parser.parse_args([*_BASE_ARGS, "--model-key", "hy3-q4",
+                              "--mtp-artifacts", "/artifacts"])
+    with pytest.raises(SystemExit):
+        module.validate_mtp_flags(parser, args)
+    assert "--enable-mtp" in capsys.readouterr().err

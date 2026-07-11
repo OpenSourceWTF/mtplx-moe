@@ -183,7 +183,35 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Save per-layer routed expert IDs for cache/prefetch simulation.",
     )
+    parser.add_argument(
+        "--enable-mtp",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Speculative decoding through the packaged layer-80 NextN head "
+            "(hy3-q4 only; requires --mtp-artifacts). Default off: the AR "
+            "path is unchanged unless this flag is passed."
+        ),
+    )
+    parser.add_argument(
+        "--mtp-artifacts",
+        type=Path,
+        help=(
+            "Directory holding layer80-residents-q.safetensors and "
+            "layer80-q4.safetensors for the Hy3 MTP head."
+        ),
+    )
     return parser
+
+
+def validate_mtp_flags(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.enable_mtp:
+        if args.model_key != "hy3-q4":
+            parser.error("--enable-mtp is packaged for --model-key hy3-q4 only")
+        if args.mtp_artifacts is None:
+            parser.error("--enable-mtp requires --mtp-artifacts")
+    elif args.mtp_artifacts is not None:
+        parser.error("--mtp-artifacts requires --enable-mtp")
 
 
 def main() -> int:
@@ -264,6 +292,7 @@ def main() -> int:
         parser.error("--run-label may contain only letters, digits, '-' and '_'")
     if args.verified_sidecar and args.trust_sidecar:
         parser.error("--verified-sidecar and --trust-sidecar are mutually exclusive")
+    validate_mtp_flags(parser, args)
     config = ExpertStreamingConfig(
         model_key=args.model_key,
         memory_limit_bytes=parse_memory_bytes(args.memory_limit),
@@ -288,13 +317,18 @@ def main() -> int:
     )
     runtime = load(
         root,
-        mtp=False,
+        mtp=args.enable_mtp,
         expert_streaming_config=config,
         expert_manifest=args.manifest,
+        mtp_artifacts=(
+            args.mtp_artifacts.expanduser().resolve()
+            if args.mtp_artifacts is not None
+            else None
+        ),
     )
     rows = []
     try:
-        from mtplx.generation import generate_ar
+        from mtplx.generation import generate_ar, generate_mtp1
         from mtplx.sampling import SamplerConfig
 
         prompt_text = (
@@ -366,14 +400,25 @@ def main() -> int:
 
             started = time.perf_counter()
             with runtime.admit_kv_tokens(len(prompt_ids) + max_tokens):
-                result = generate_ar(
-                    runtime,
-                    prompt_ids,
-                    max_tokens=max_tokens,
-                    sampler=sampler,
-                    seed=args.seed,
-                    token_callback=token_callback,
-                )
+                if args.enable_mtp:
+                    # generate_mtp1 exposes accept/reject telemetry through
+                    # generation_stats instead of a token callback.
+                    result = generate_mtp1(
+                        runtime,
+                        prompt_ids,
+                        max_tokens=max_tokens,
+                        sampler=sampler,
+                        seed=args.seed,
+                    )
+                else:
+                    result = generate_ar(
+                        runtime,
+                        prompt_ids,
+                        max_tokens=max_tokens,
+                        sampler=sampler,
+                        seed=args.seed,
+                        token_callback=token_callback,
+                    )
             finished = time.perf_counter()
             elapsed = finished - started
             after = runtime.expert_streaming_snapshot()
@@ -453,6 +498,14 @@ def main() -> int:
         "chat": args.chat,
         "enable_thinking": enable_thinking,
         "reasoning_effort": reasoning_effort,
+        "mtp": {
+            "enabled": args.enable_mtp,
+            "artifacts": (
+                str(args.mtp_artifacts.expanduser().resolve())
+                if args.mtp_artifacts is not None
+                else None
+            ),
+        },
         "generation_profile": args.generation_profile,
         "run_label": run_label,
         "generation": {

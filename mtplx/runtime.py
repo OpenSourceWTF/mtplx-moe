@@ -86,9 +86,19 @@ class MTPLXRuntime:
         from .expert_streaming import RoutingPhase
         from .models.expert_mlx import expert_routing_phase
 
+        decode_width = 1
+        if self.mtp_enabled:
+            # MTP verify batches are decode traffic: routing them as prefill
+            # would stop the persistent decode hot set from ever training
+            # once speculation is on.  With MTP off this stays exactly the
+            # historical single-token decode classification.
+            decode_width = max(
+                decode_width,
+                int(getattr(self.model, "mtp_verify_width", 1)),
+            )
         phase = (
             RoutingPhase.PREFILL
-            if self._sequence_len(input_ids) > 1
+            if self._sequence_len(input_ids) > decode_width
             else RoutingPhase.DECODE
         )
         return expert_routing_phase(phase)
@@ -322,6 +332,7 @@ def load(
     gemma4_target_distribution_mode: str | None = None,
     expert_streaming_config: Any | None = None,
     expert_manifest: Path | str | None = None,
+    mtp_artifacts: Path | str | None = None,
 ) -> MTPLXRuntime:
     """Load an MLX model and optionally inject native MTP support."""
     path = Path(model_path)
@@ -331,6 +342,11 @@ def load(
     if (expert_streaming_config is None) != (expert_manifest is None):
         raise ValueError(
             "expert_streaming_config and expert_manifest must be supplied together"
+        )
+    if mtp_artifacts is not None and not streaming_requested:
+        raise ValueError(
+            "mtp_artifacts applies to streamed checkpoints only; non-streamed "
+            "models carry their own MTP weights"
         )
     from .gemma4_pair import resolve_gemma4_pair_paths
 
@@ -408,13 +424,19 @@ def load(
             raise TypeError(
                 "expert_streaming_config must be an ExpertStreamingConfig"
             )
-        if mtp:
+        if mtp and mtp_artifacts is None:
             raise RuntimeError(
                 "the pinned Hy3-4bit and GLM-5.2-4bit artifacts omit MTP weights; "
-                "load streamed checkpoints with mtp=False"
+                "pass mtp_artifacts=<layer-80 artifact directory> to enable "
+                "streamed Hy3 MTP or load with mtp=False"
+            )
+        if mtp and expert_streaming_config.model_key != "hy3-q4":
+            raise RuntimeError(
+                "streamed MTP artifacts are packaged for hy3-q4 only; "
+                f"got {expert_streaming_config.model_key!r}"
             )
         if mtp_adapter is not None or merge_mtp_adapter:
-            raise RuntimeError("MTP adapters are unavailable for streamed AR loading")
+            raise RuntimeError("MTP adapters are unavailable for streamed loading")
         expert_runtime = ExpertStreamingRuntime.open(
             path,
             expert_manifest,
@@ -449,7 +471,19 @@ def load(
         .with_config_defaults(config)
     )
     mtp_enabled = False
-    if mtp:
+    if mtp and expert_runtime is not None:
+        from .hy3_mtp_patch import inject_hy3_streamed_mtp_support
+
+        try:
+            mtp_enabled = inject_hy3_streamed_mtp_support(
+                model, mtp_artifacts, config, contract
+            )
+            if not mtp_enabled or not validate_mtp_support(model):
+                raise RuntimeError(f"streamed Hy3 MTP injection failed for {path}")
+        except BaseException:
+            expert_runtime.close()
+            raise
+    elif mtp:
         from .deepseek_mtp_patch import inject_deepseek_mtp_support, is_deepseek_mtp_config
         from .glm_mtp_patch import inject_glm_mtp_support, is_glm_mtp_config
         from .mimo_mtp_patch import inject_mimo_mtp_support, is_mimo_mtp_config
