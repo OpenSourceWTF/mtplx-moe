@@ -89,8 +89,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--generation-profile",
         choices=["model-default", "deterministic", "qwen36-comparable"],
-        default="model-default",
-        help="Use artifact/vendor generation defaults or greedy deterministic sampling.",
+        default="deterministic",
+        help=(
+            "Sampling profile. Defaults to deterministic greedy so that "
+            "unflagged runs are reproducible and comparable; pass "
+            "model-default explicitly for vendor sampling."
+        ),
     )
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--top-p", type=float)
@@ -104,10 +108,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-tokens",
         type=_positive_int,
+        default=256,
         help=(
             "Maximum generated tokens; generation still stops naturally at EOS. "
-            "Model-default is 65,536 for both profiles; GLM-5.2's documented "
-            "hard output max is 131,072."
+            "Defaults to a bounded 256 so an unflagged run cannot decode for "
+            "hours; pass the documented model ceiling explicitly for "
+            "full-response lanes (65,536 for both profiles; GLM-5.2's hard "
+            "output max is 131,072)."
+        ),
+    )
+    parser.add_argument(
+        "--window-telemetry",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Capture a full streaming snapshot at each rolling window. "
+            "Disable for headline runs: the snapshot walks every slot "
+            "condition and contends with in-flight miss loads."
         ),
     )
     parser.add_argument("--repeats", type=_positive_int, default=2)
@@ -339,7 +356,11 @@ def main() -> int:
                         {
                             "completion_tokens": decoded_count,
                             "time": time.perf_counter(),
-                            "streaming": runtime.expert_streaming_snapshot(),
+                            "streaming": (
+                                runtime.expert_streaming_snapshot()
+                                if args.window_telemetry
+                                else None
+                            ),
                         }
                     )
 
@@ -353,17 +374,20 @@ def main() -> int:
                     seed=args.seed,
                     token_callback=token_callback,
                 )
-            elapsed = time.perf_counter() - started
+            finished = time.perf_counter()
+            elapsed = finished - started
             after = runtime.expert_streaming_snapshot()
             token_ids = [int(token) for token in result.tokens]
             if token_ids and (
                 not decode_points
                 or decode_points[-1]["completion_tokens"] != len(token_ids)
             ):
+                # Stamp the final window with the generation end time, not a
+                # timestamp taken after the full-slot snapshot walk above.
                 decode_points.append(
                     {
                         "completion_tokens": len(token_ids),
-                        "time": time.perf_counter(),
+                        "time": finished,
                         "streaming": after,
                     }
                 )
