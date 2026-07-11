@@ -12,12 +12,15 @@ from mlx.utils import tree_flatten
 from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 
 from mtplx.hy3_mtp_patch import (
+    HY3_MTP_BF16_FILE,
     HY3_MTP_EXPERTS_FILE,
     HY3_MTP_RESIDENTS_FILE,
     Hy3MTPLoadError,
     build_hy3_mtp_module,
+    expected_bf16_names,
     expected_expert_names,
     expected_resident_names,
+    load_hy3_mtp_bf16_weights,
     load_hy3_mtp_weights,
 )
 from mtplx.models.hy3_mlx import Hy3MTP, Hy3MTPLayer
@@ -130,6 +133,31 @@ def _write_tiny_artifacts(tmp_path: Path, *, revision: str = TEST_REVISION) -> P
     return tmp_path
 
 
+def _write_tiny_bf16_artifact(tmp_path: Path, *, revision: str = TEST_REVISION) -> Path:
+    """Author the layer-80 BF16 fixture, mirroring the Q4 artifact writer.
+
+    The BF16 artifact is a straight extraction of the source checkpoint:
+    every layer-80 tensor as one BF16 ``.weight`` leaf (per-expert, not
+    stacked), except the F32 router correction bias.
+    """
+
+    mx.random.seed(13)
+    args = _tiny_args()
+    prefix = f"model.layers.{args.num_hidden_layers}."
+    tensors = _tiny_source_residents(prefix)
+    for expert in range(args.num_experts):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            tensors[f"{prefix}mlp.experts.{expert}.{projection}.weight"] = (
+                mx.random.normal((64, 64)).astype(mx.bfloat16)
+            )
+    mx.eval(list(tensors.values()))
+    metadata = {"source_repo": "test/tiny-hy3", "source_revision": revision}
+    mx.save_safetensors(
+        str(tmp_path / HY3_MTP_BF16_FILE), tensors, metadata=metadata
+    )
+    return tmp_path
+
+
 def test_expected_name_tables_cover_the_packaged_artifacts(tmp_path: Path) -> None:
     args = _tiny_args()
     _write_tiny_artifacts(tmp_path)
@@ -138,9 +166,12 @@ def test_expected_name_tables_cover_the_packaged_artifacts(tmp_path: Path) -> No
 
 
 def test_build_hy3_mtp_module_loads_quantized_resident_head(tmp_path: Path) -> None:
+    # precision="q4" must keep today's quantized head behavior unchanged.
     args = _tiny_args()
     _write_tiny_artifacts(tmp_path)
-    mtp = build_hy3_mtp_module(tmp_path, args, expected_revision=TEST_REVISION)
+    mtp = build_hy3_mtp_module(
+        tmp_path, args, expected_revision=TEST_REVISION, precision="q4"
+    )
 
     assert isinstance(mtp, Hy3MTP)
     assert len(mtp.layers) == 1
@@ -178,7 +209,9 @@ def test_hy3_mtp_layer_forward_produces_finite_logits_and_hidden(
 ) -> None:
     args = _tiny_args()
     _write_tiny_artifacts(tmp_path)
-    mtp = build_hy3_mtp_module(tmp_path, args, expected_revision=TEST_REVISION)
+    mtp = build_hy3_mtp_module(
+        tmp_path, args, expected_revision=TEST_REVISION, precision="q4"
+    )
     trunk = Hy3Model(args)
 
     token_ids = mx.array([[3, 5]], dtype=mx.int32)
@@ -301,3 +334,199 @@ def test_stacked_expert_weights_match_artifact_order(tmp_path: Path) -> None:
         weights["layers.0.eh_proj.weight"],
         experts[prefix + "eh_proj.weight"],
     ).item()
+
+
+def _module_leaves(mtp) -> list[tuple[str, object]]:
+    leaves = []
+
+    def visit(prefix, module):
+        leaves.append((prefix, module))
+        for name, child in module.children().items():
+            if isinstance(child, list):
+                for index, item in enumerate(child):
+                    if isinstance(item, nn.Module):
+                        visit(f"{prefix}.{name}.{index}", item)
+            elif isinstance(child, nn.Module):
+                visit(f"{prefix}.{name}", child)
+
+    visit("mtp", mtp)
+    return leaves
+
+
+def test_expected_bf16_names_cover_the_full_head(tmp_path: Path) -> None:
+    args = _tiny_args()
+    _write_tiny_bf16_artifact(tmp_path)
+    names = expected_bf16_names(args)
+    # 8 dense projections + 8 BF16 norms/eh_proj + expert_bias, plus one
+    # .weight leaf per expert projection.
+    assert len(names) == 8 + 8 + 1 + args.num_experts * 3
+    written = set(mx.load(str(tmp_path / HY3_MTP_BF16_FILE)))
+    assert written == names
+
+
+def test_default_build_precision_is_bf16_with_no_quantized_modules(
+    tmp_path: Path,
+) -> None:
+    """Forge contract section 6: quantizing the MTP head collapses MoE
+    acceptance to 5-11% (vs 79-85% BF16), so bf16 is the default and only
+    the BF16 artifact is required."""
+
+    args = _tiny_args()
+    _write_tiny_bf16_artifact(tmp_path)  # no Q4 artifacts on disk at all
+    mtp = build_hy3_mtp_module(tmp_path, args, expected_revision=TEST_REVISION)
+
+    assert isinstance(mtp, Hy3MTP)
+    layer = mtp.layers[0]
+    assert isinstance(layer, Hy3MTPLayer)
+
+    # The whole head is plain BF16: no quantized module anywhere.
+    for path, module in _module_leaves(mtp):
+        assert not isinstance(
+            module, (nn.QuantizedLinear, QuantizedSwitchLinear)
+        ), path
+    switch = layer.mtp_block.mlp.switch_mlp
+    assert tuple(switch.gate_proj.weight.shape) == (2, 64, 64)
+    assert switch.gate_proj.weight.dtype == mx.bfloat16
+    attn = layer.mtp_block.self_attn
+    assert isinstance(attn.q_proj, nn.Linear)
+    assert attn.q_proj.weight.dtype == mx.bfloat16
+    router = layer.mtp_block.mlp.router
+    assert isinstance(router.gate, nn.Linear)
+    assert router.gate.weight.dtype == mx.bfloat16
+    assert router.expert_bias.dtype == mx.float32
+    assert layer.eh_proj.weight.dtype == mx.bfloat16
+
+    # 17 resident leaves + 3 stacked expert leaves, nothing else.
+    parameters = dict(tree_flatten(mtp.parameters()))
+    assert len(parameters) == 20
+    assert all(name.startswith("layers.0.") for name in parameters)
+
+
+def test_bf16_head_forward_produces_finite_logits_and_hidden(
+    tmp_path: Path,
+) -> None:
+    args = _tiny_args()
+    _write_tiny_bf16_artifact(tmp_path)
+    mtp = build_hy3_mtp_module(tmp_path, args, expected_revision=TEST_REVISION)
+    trunk = Hy3Model(args)
+
+    token_ids = mx.array([[3, 5]], dtype=mx.int32)
+    previous_hidden = mx.random.normal((1, 2, args.hidden_size)).astype(mx.bfloat16)
+    logits, hidden = mtp.layers[0](
+        token_ids,
+        previous_hidden,
+        embed_tokens=trunk.model.embed_tokens,
+        lm_head=trunk.lm_head,
+    )
+    mx.eval(logits, hidden)
+
+    assert logits.shape == (1, 2, args.vocab_size)
+    assert hidden.shape == (1, 2, args.hidden_size)
+    assert mx.all(mx.isfinite(logits.astype(mx.float32))).item()
+    assert mx.all(mx.isfinite(hidden.astype(mx.float32))).item()
+
+
+def test_bf16_stacked_expert_weights_match_artifact_order(tmp_path: Path) -> None:
+    args = _tiny_args()
+    prefix = f"model.layers.{args.num_hidden_layers}."
+    _write_tiny_bf16_artifact(tmp_path)
+    weights = load_hy3_mtp_bf16_weights(
+        tmp_path, args, expected_revision=TEST_REVISION
+    )
+    source = mx.load(str(tmp_path / HY3_MTP_BF16_FILE))
+    stacked = weights["layers.0.mtp_block.mlp.switch_mlp.gate_proj.weight"]
+    assert tuple(stacked.shape) == (2, 64, 64)
+    for expert in range(2):
+        original = source[f"{prefix}mlp.experts.{expert}.gate_proj.weight"]
+        assert mx.array_equal(stacked[expert], original).item()
+    # Residents map onto the same Hy3MTPLayer paths as the Q4 loader.
+    assert "layers.0.eh_proj.weight" in weights
+    assert "layers.0.mtp_block.mlp.router.expert_bias" in weights
+    assert "layers.0.mtp_block.self_attn.q_proj.weight" in weights
+
+
+def test_bf16_loader_fails_closed(tmp_path: Path) -> None:
+    args = _tiny_args()
+    prefix = f"model.layers.{args.num_hidden_layers}."
+
+    # Missing artifact file (only the Q4 artifacts on disk).
+    _write_tiny_artifacts(tmp_path)
+    with pytest.raises(Hy3MTPLoadError, match="missing Hy3 MTP artifact"):
+        load_hy3_mtp_bf16_weights(tmp_path, args, expected_revision=TEST_REVISION)
+
+    # Revision mismatch.
+    _write_tiny_bf16_artifact(tmp_path, revision="unexpected")
+    with pytest.raises(Hy3MTPLoadError, match="revision"):
+        load_hy3_mtp_bf16_weights(tmp_path, args, expected_revision=TEST_REVISION)
+
+    # Missing tensor.
+    _write_tiny_bf16_artifact(tmp_path)
+    tensors = dict(mx.load(str(tmp_path / HY3_MTP_BF16_FILE)))
+    del tensors[prefix + "mlp.experts.1.down_proj.weight"]
+    mx.save_safetensors(
+        str(tmp_path / HY3_MTP_BF16_FILE),
+        tensors,
+        metadata={"source_revision": TEST_REVISION},
+    )
+    with pytest.raises(Hy3MTPLoadError, match="missing tensors"):
+        load_hy3_mtp_bf16_weights(tmp_path, args, expected_revision=TEST_REVISION)
+
+    # Unexpected tensor.
+    _write_tiny_bf16_artifact(tmp_path)
+    tensors = dict(mx.load(str(tmp_path / HY3_MTP_BF16_FILE)))
+    tensors[prefix + "mlp.experts.7.gate_proj.weight"] = mx.zeros(
+        (64, 64), dtype=mx.bfloat16
+    )
+    mx.save_safetensors(
+        str(tmp_path / HY3_MTP_BF16_FILE),
+        tensors,
+        metadata={"source_revision": TEST_REVISION},
+    )
+    with pytest.raises(Hy3MTPLoadError, match="unexpected tensors"):
+        load_hy3_mtp_bf16_weights(tmp_path, args, expected_revision=TEST_REVISION)
+
+    # Wrong dtypes: BF16-only weights and the F32 correction bias.
+    _write_tiny_bf16_artifact(tmp_path)
+    tensors = dict(mx.load(str(tmp_path / HY3_MTP_BF16_FILE)))
+    tensors[prefix + "mlp.expert_bias"] = mx.zeros((2,), dtype=mx.bfloat16)
+    mx.save_safetensors(
+        str(tmp_path / HY3_MTP_BF16_FILE),
+        tensors,
+        metadata={"source_revision": TEST_REVISION},
+    )
+    with pytest.raises(Hy3MTPLoadError, match="must be float32"):
+        load_hy3_mtp_bf16_weights(tmp_path, args, expected_revision=TEST_REVISION)
+
+    _write_tiny_bf16_artifact(tmp_path)
+    tensors = dict(mx.load(str(tmp_path / HY3_MTP_BF16_FILE)))
+    tensors[prefix + "eh_proj.weight"] = mx.zeros((64, 128), dtype=mx.float32)
+    mx.save_safetensors(
+        str(tmp_path / HY3_MTP_BF16_FILE),
+        tensors,
+        metadata={"source_revision": TEST_REVISION},
+    )
+    with pytest.raises(Hy3MTPLoadError, match="must be"):
+        load_hy3_mtp_bf16_weights(tmp_path, args, expected_revision=TEST_REVISION)
+
+    # Inconsistent expert shapes.
+    _write_tiny_bf16_artifact(tmp_path)
+    tensors = dict(mx.load(str(tmp_path / HY3_MTP_BF16_FILE)))
+    tensors[prefix + "mlp.experts.1.up_proj.weight"] = mx.zeros(
+        (32, 64), dtype=mx.bfloat16
+    )
+    mx.save_safetensors(
+        str(tmp_path / HY3_MTP_BF16_FILE),
+        tensors,
+        metadata={"source_revision": TEST_REVISION},
+    )
+    with pytest.raises(Hy3MTPLoadError, match="differs from expert 0"):
+        load_hy3_mtp_bf16_weights(tmp_path, args, expected_revision=TEST_REVISION)
+
+
+def test_build_rejects_unknown_precision(tmp_path: Path) -> None:
+    args = _tiny_args()
+    _write_tiny_bf16_artifact(tmp_path)
+    with pytest.raises(Hy3MTPLoadError, match="precision"):
+        build_hy3_mtp_module(
+            tmp_path, args, expected_revision=TEST_REVISION, precision="fp8"
+        )

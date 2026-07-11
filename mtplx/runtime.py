@@ -344,9 +344,24 @@ def load(
     expert_streaming_config: Any | None = None,
     expert_manifest: Path | str | None = None,
     mtp_artifacts: Path | str | None = None,
+    mtp_precision: str = "bf16",
 ) -> MTPLXRuntime:
-    """Load an MLX model and optionally inject native MTP support."""
+    """Load an MLX model and optionally inject native MTP support.
+
+    ``mtp_precision`` selects the streamed Hy3 layer-80 head build: ``"bf16"``
+    (default, per docs/FORGE_BACKEND_CONTRACT.md section 6 — quantized MTP
+    heads collapse acceptance) loads the bit-exact BF16 artifact (~7.5 GB
+    resident; budget it against the expert cache), ``"q4"`` loads the pinned
+    quantized artifacts (~1.94 GiB expert bank).
+    """
+    from .hy3_mtp_patch import HY3_MTP_PRECISIONS
+
     path = Path(model_path)
+    if mtp_precision not in HY3_MTP_PRECISIONS:
+        raise ValueError(
+            f"mtp_precision must be one of {HY3_MTP_PRECISIONS}; "
+            f"got {mtp_precision!r}"
+        )
     streaming_requested = (
         expert_streaming_config is not None or expert_manifest is not None
     )
@@ -487,7 +502,7 @@ def load(
 
         try:
             mtp_enabled = inject_hy3_streamed_mtp_support(
-                model, mtp_artifacts, config, contract
+                model, mtp_artifacts, config, contract, mtp_precision=mtp_precision
             )
             if not mtp_enabled or not validate_mtp_support(model):
                 raise RuntimeError(f"streamed Hy3 MTP injection failed for {path}")

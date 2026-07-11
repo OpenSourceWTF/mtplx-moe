@@ -220,8 +220,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--mtp-artifacts",
         type=Path,
         help=(
-            "Directory holding layer80-residents-q.safetensors and "
-            "layer80-q4.safetensors for the Hy3 MTP head."
+            "Directory holding the layer-80 Hy3 MTP head artifacts "
+            "(layer80-bf16.safetensors for bf16; layer80-residents-q"
+            ".safetensors and layer80-q4.safetensors for q4)."
+        ),
+    )
+    parser.add_argument(
+        "--mtp-precision",
+        choices=("bf16", "q4"),
+        help=(
+            "Layer-80 NextN head precision (default bf16). bf16 loads the "
+            "bit-exact BF16 head (~7.5 GB resident; quantized MTP heads "
+            "collapse acceptance, docs/FORGE_BACKEND_CONTRACT.md section 6) "
+            "- budget it against --expert-cache-limit. q4 loads the pinned "
+            "quantized artifacts (~1.94 GiB expert bank). Requires "
+            "--enable-mtp."
         ),
     )
     return parser
@@ -238,8 +251,12 @@ def validate_mtp_flags(parser: argparse.ArgumentParser, args: argparse.Namespace
                 "--enable-mtp is single-stream; the batch runner is AR-only "
                 "and concurrent MTP requests would only queue"
             )
+        if args.mtp_precision is None:
+            args.mtp_precision = "bf16"
     elif args.mtp_artifacts is not None:
         parser.error("--mtp-artifacts requires --enable-mtp")
+    elif args.mtp_precision is not None:
+        parser.error("--mtp-precision requires --enable-mtp")
 
 
 def build_concurrent_requests(
@@ -486,6 +503,7 @@ def main() -> int:
             if args.mtp_artifacts is not None
             else None
         ),
+        mtp_precision=(args.mtp_precision or "bf16"),
     )
     rows = []
     try:
@@ -678,6 +696,7 @@ def main() -> int:
                 if args.mtp_artifacts is not None
                 else None
             ),
+            "precision": args.mtp_precision,
         },
         "generation_profile": args.generation_profile,
         "run_label": run_label,

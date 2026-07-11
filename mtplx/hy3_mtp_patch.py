@@ -3,6 +3,11 @@
 The pinned pipenetwork/Hy3-4bit artifact omits checkpoint layer 80, so the
 head is packaged separately from the official tencent/Hy3 BF16 weights:
 
+    layer80-bf16.safetensors         the whole head bit-exact from the source
+                                     checkpoint: every layer-80 tensor BF16
+                                     (expert_bias F32), one .weight leaf per
+                                     expert projection
+                                     (scripts/extract_mtp_layer80.py)
     layer80-residents-q.safetensors  attention/router/shared/norms/eh_proj in
                                      the pinned resident conventions
                                      (scripts/quantize_mtp_layer80_residents.py)
@@ -10,10 +15,17 @@ head is packaged separately from the official tencent/Hy3 BF16 weights:
                                      Q4/gs64 expert segment format
                                      (scripts/quantize_mtp_layer80.py)
 
+The default precision is ``bf16``: docs/FORGE_BACKEND_CONTRACT.md section 6
+documents that quantizing MTP weights collapses MoE acceptance to 5-11%
+(vs 79-85% with the BF16 head).  ``q4`` keeps the quantized artifacts
+selectable for memory-constrained A/B runs.  Memory: the BF16 head is
+~7.5 GB (7.0 GiB) resident vs ~1.94 GiB for the Q4 expert bank — callers
+must budget the difference in their expert-cache plans.
+
 Unlike trunk layers 1-79 the head's experts are fully resident: they are
-stacked into one quantized ``SwitchGLU`` at MTP-enable time.  Loading is
-fail-closed: unexpected, missing, or wrongly typed tensors and revision
-mismatches abort instead of degrading.
+stacked into one ``SwitchGLU`` at MTP-enable time (quantized only in q4
+mode).  Loading is fail-closed: unexpected, missing, or wrongly typed
+tensors and revision mismatches abort instead of degrading.
 """
 
 from __future__ import annotations
@@ -28,8 +40,13 @@ logger = logging.getLogger(__name__)
 
 HY3_MTP_SOURCE_REPO = "tencent/Hy3"
 HY3_MTP_SOURCE_REVISION = "716aa7241bd6d95896be4ebfc761162a9c4d49ef"
+HY3_MTP_BF16_FILE = "layer80-bf16.safetensors"
 HY3_MTP_RESIDENTS_FILE = "layer80-residents-q.safetensors"
 HY3_MTP_EXPERTS_FILE = "layer80-q4.safetensors"
+HY3_MTP_PRECISIONS = ("bf16", "q4")
+# Forge contract section 6: quantized MTP heads collapse acceptance, so the
+# bit-exact BF16 head is the default despite its larger resident footprint.
+HY3_MTP_DEFAULT_PRECISION = "bf16"
 
 _QUANTIZED_RESIDENT_BASES = (
     "self_attn.q_proj",
@@ -105,6 +122,27 @@ def expected_expert_names(args: Any) -> set[str]:
         for projection in _EXPERT_PROJECTIONS
         for leaf in _QUANT_LEAVES
     }
+
+
+def expected_bf16_names(args: Any) -> set[str]:
+    """The full layer-80 inventory of the bit-exact BF16 artifact.
+
+    Every tensor is a single ``.weight`` leaf (the projections that the Q4
+    artifacts store quantized are plain BF16 here), plus the F32
+    ``mlp.expert_bias`` and one BF16 ``.weight`` per routed expert
+    projection.
+    """
+
+    prefix = _layer_prefix(args)
+    names = {prefix + base + ".weight" for base in _QUANTIZED_RESIDENT_BASES}
+    names.update(prefix + suffix for suffix in _BF16_RESIDENT_SUFFIXES)
+    names.update(prefix + suffix for suffix in _F32_RESIDENT_SUFFIXES)
+    names.update(
+        f"{prefix}mlp.experts.{expert}.{projection}.weight"
+        for expert in range(int(args.num_experts))
+        for projection in _EXPERT_PROJECTIONS
+    )
+    return names
 
 
 def _resident_target(suffix: str) -> str:
@@ -221,6 +259,76 @@ def load_hy3_mtp_weights(
     return mapped
 
 
+def load_hy3_mtp_bf16_weights(
+    artifact_dir: Path | str,
+    args: Any,
+    *,
+    expected_revision: str = HY3_MTP_SOURCE_REVISION,
+    mx_module: Any | None = None,
+) -> dict[str, Any]:
+    """Read and validate the bit-exact BF16 layer-80 artifact.
+
+    Fail-closed like the Q4 loader: the file must carry exactly the expected
+    tensor inventory at the expected source revision, every tensor BF16
+    except the F32 router correction bias.  Expert projections are stacked
+    into non-quantized ``switch_mlp`` tensors of shape ``[num_experts, ...]``.
+    """
+
+    if mx_module is None:
+        import mlx.core as mx
+    else:
+        mx = mx_module
+    artifact_dir = Path(artifact_dir).expanduser().resolve()
+    path = artifact_dir / HY3_MTP_BF16_FILE
+    if not path.exists():
+        raise Hy3MTPLoadError(f"missing Hy3 MTP artifact {path}")
+    _require_revision(path, expected_revision)
+
+    prefix = _layer_prefix(args)
+    tensors = mx.load(str(path), format="safetensors")
+    expected = expected_bf16_names(args)
+    missing = expected - set(tensors)
+    extra = set(tensors) - expected
+    if missing:
+        raise Hy3MTPLoadError(
+            f"{path.name} is missing tensors: {sorted(missing)[:4]}"
+        )
+    if extra:
+        raise Hy3MTPLoadError(
+            f"{path.name} has unexpected tensors: {sorted(extra)[:4]}"
+        )
+
+    mapped: dict[str, Any] = {}
+    for name, value in tensors.items():
+        if name.endswith("mlp.expert_bias"):
+            if value.dtype != mx.float32:
+                raise Hy3MTPLoadError(f"{name} must be float32, found {value.dtype}")
+        elif value.dtype != mx.bfloat16:
+            raise Hy3MTPLoadError(f"{name} must be bfloat16, found {value.dtype}")
+        if ".mlp.experts." not in name:
+            mapped["layers.0." + _resident_target(name[len(prefix):])] = value
+
+    num_experts = int(args.num_experts)
+    for projection in _EXPERT_PROJECTIONS:
+        values = []
+        reference: tuple[int, ...] | None = None
+        for expert in range(num_experts):
+            name = f"{prefix}mlp.experts.{expert}.{projection}.weight"
+            value = tensors[name]
+            shape = tuple(int(dim) for dim in value.shape)
+            if reference is None:
+                reference = shape
+            elif shape != reference:
+                raise Hy3MTPLoadError(
+                    f"{name} shape {shape} differs from expert 0 {reference}"
+                )
+            values.append(value)
+        mapped[f"layers.0.mtp_block.mlp.switch_mlp.{projection}.weight"] = (
+            mx.stack(values)
+        )
+    return mapped
+
+
 def _quantization_spec_for(
     path: str,
     module: Any,
@@ -257,31 +365,53 @@ def build_hy3_mtp_module(
     *,
     expected_revision: str = HY3_MTP_SOURCE_REVISION,
     group_size: int = 64,
+    precision: str = HY3_MTP_DEFAULT_PRECISION,
 ) -> Any:
-    """Construct, quantize, strictly load, and evaluate the Hy3 NextN head."""
+    """Construct, strictly load, and evaluate the Hy3 NextN head.
+
+    ``precision="bf16"`` (default) builds the entire head plain BF16 from the
+    bit-exact ``layer80-bf16.safetensors`` artifact — no quantized modules
+    anywhere (~7.5 GB resident).  ``precision="q4"`` keeps the pinned
+    quantized artifacts and behavior (~1.94 GiB expert bank).
+    """
 
     import mlx.core as mx
     import mlx.nn as nn
 
     from .models.hy3_mlx import Hy3MTP
 
-    weights = load_hy3_mtp_weights(
-        artifact_dir,
-        args,
-        expected_revision=expected_revision,
-    )
-    mtp = Hy3MTP(args, num_mtp_layers=1)
+    if precision not in HY3_MTP_PRECISIONS:
+        raise Hy3MTPLoadError(
+            f"unsupported Hy3 MTP precision {precision!r}; "
+            f"choose one of {HY3_MTP_PRECISIONS}"
+        )
+    if precision == "bf16":
+        weights = load_hy3_mtp_bf16_weights(
+            artifact_dir,
+            args,
+            expected_revision=expected_revision,
+        )
+        mtp = Hy3MTP(args, num_mtp_layers=1)
+    else:
+        weights = load_hy3_mtp_weights(
+            artifact_dir,
+            args,
+            expected_revision=expected_revision,
+        )
+        mtp = Hy3MTP(args, num_mtp_layers=1)
 
-    def class_predicate(path: str, module: Any) -> bool | dict[str, Any]:
-        return _quantization_spec_for(path, module, weights, group_size=group_size)
+        def class_predicate(path: str, module: Any) -> bool | dict[str, Any]:
+            return _quantization_spec_for(
+                path, module, weights, group_size=group_size
+            )
 
-    nn.quantize(
-        mtp,
-        group_size=group_size,
-        bits=4,
-        mode="affine",
-        class_predicate=class_predicate,
-    )
+        nn.quantize(
+            mtp,
+            group_size=group_size,
+            bits=4,
+            mode="affine",
+            class_predicate=class_predicate,
+        )
     mtp.eval()
     try:
         mtp.load_weights(list(weights.items()), strict=True)
@@ -289,8 +419,9 @@ def build_hy3_mtp_module(
         raise Hy3MTPLoadError(f"Hy3 MTP weight validation failed: {exc}") from exc
     mx.eval(mtp.parameters())
     logger.info(
-        "[Hy3 MTP] loaded %d tensors from %s",
+        "[Hy3 MTP] loaded %d tensors (%s) from %s",
         len(weights),
+        precision,
         Path(artifact_dir).expanduser(),
     )
     return mtp
@@ -303,6 +434,7 @@ def inject_hy3_streamed_mtp_support(
     contract: Any | None = None,
     *,
     expected_revision: str = HY3_MTP_SOURCE_REVISION,
+    mtp_precision: str = HY3_MTP_DEFAULT_PRECISION,
 ) -> bool:
     """Attach layer-80 NextN speculative support to a streamed Hy3 model.
 
@@ -312,6 +444,10 @@ def inject_hy3_streamed_mtp_support(
     it unchanged.  ``mtp_verify_width`` tells the streamed runtime how wide a
     decode-side verify batch can be so expert routing keeps training the
     persistent decode hot set.
+
+    ``mtp_precision="bf16"`` (default) loads the bit-exact BF16 head
+    (~7.5 GB resident — budget it against the expert cache);
+    ``"q4"`` loads the pinned quantized artifacts (~1.94 GiB expert bank).
     """
 
     import mlx.core as mx
@@ -335,6 +471,7 @@ def inject_hy3_streamed_mtp_support(
         artifact_dir,
         args,
         expected_revision=expected_revision,
+        precision=mtp_precision,
     )
     original_outer_class = model.__class__
 
@@ -361,10 +498,11 @@ def inject_hy3_streamed_mtp_support(
             logits = self.lm_head(head_input)
             if not return_hidden:
                 return logits
-            # NextN reference semantics: the head's hnorm consumes the RAW
-            # last-layer hidden. post_norm is kept only for A/B probing of
-            # the acceptance regression measured at 20.8%.
-            hidden = post_norm if hidden_variant == "post_norm" else pre_norm
+            # Gate v1/v2 measured the head prefers the POST-norm trunk
+            # hidden (acceptance 0.208 post vs 0.148 pre), matching
+            # deepseek_mtp_patch.py and the mtp_patch.py contract default.
+            # pre_norm stays selectable for A/B probing.
+            hidden = pre_norm if hidden_variant == "pre_norm" else post_norm
             return logits, hidden
 
         def mtp_forward(

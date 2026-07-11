@@ -255,8 +255,9 @@ class Hy3MTPLayer(nn.Module):
     hidden state are normalized (enorm/hnorm), concatenated, and projected by
     ``eh_proj`` into one transformer block whose MoE routes over the head's
     own experts.  Unlike trunk layers 1-79, those experts are ordinary
-    resident weights (a stacked ``SwitchGLU``), not streamed slots: the whole
-    layer-80 Q4 bank is ~1.94 GiB and every draft touches it, so streaming
+    resident weights (a stacked ``SwitchGLU``), not streamed slots: every
+    draft touches the whole layer-80 bank (~7.5 GB in the default BF16
+    build, ~1.94 GiB in Q4 — callers budget accordingly), so streaming
     would only add SSD traffic to the speculative path.  The embedding table
     and ``lm_head`` are shared with the trunk and passed in at call time; the
     head applies its own checkpoint ``final_layernorm`` before the shared
