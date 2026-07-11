@@ -31,6 +31,18 @@ from mtplx.sampling import SamplerConfig
 TEST_REVISION = mtp_fixtures.TEST_REVISION
 
 
+def _write_mtp_fixtures(mtp_dir: Path) -> None:
+    """Write both the Q4 and BF16 layer-80 fixture artifacts.
+
+    Default injection loads the BF16 head (Forge contract section 6), so the
+    shared fixture dir carries both precisions; precision-specific tests pick
+    theirs via mtp_precision.
+    """
+
+    mtp_fixtures._write_tiny_artifacts(mtp_dir)
+    mtp_fixtures._write_tiny_bf16_artifact(mtp_dir)
+
+
 class TinyTokenizer:
     def decode(self, tokens, **_kwargs):
         return "".join(str(int(token)) for token in tokens)
@@ -188,7 +200,7 @@ def test_injection_preserves_ar_forward_exactly(tmp_path: Path) -> None:
     root, config, spec, manifest_path = _integrated_streamed_hy3(tmp_path)
     mtp_dir = tmp_path / "mtp"
     mtp_dir.mkdir()
-    mtp_fixtures._write_tiny_artifacts(mtp_dir)
+    _write_mtp_fixtures(mtp_dir)
     runtime = _open_streamed_runtime(root, spec, manifest_path)
     try:
         resident = construct_resident_model(root, runtime, config=config)
@@ -222,7 +234,7 @@ def test_mtp_enabled_runtime_classifies_verify_batches_as_decode(
     root, config, spec, manifest_path = _integrated_streamed_hy3(tmp_path)
     mtp_dir = tmp_path / "mtp"
     mtp_dir.mkdir()
-    mtp_fixtures._write_tiny_artifacts(mtp_dir)
+    _write_mtp_fixtures(mtp_dir)
     runtime = _open_streamed_runtime(root, spec, manifest_path)
     try:
         resident = construct_resident_model(root, runtime, config=config)
@@ -246,7 +258,7 @@ def _injected_runtime_pair(tmp_path: Path):
     root, config, spec, manifest_path = _integrated_streamed_hy3(tmp_path)
     mtp_dir = tmp_path / "mtp"
     mtp_dir.mkdir()
-    mtp_fixtures._write_tiny_artifacts(mtp_dir)
+    _write_mtp_fixtures(mtp_dir)
     runtime = _open_streamed_runtime(root, spec, manifest_path)
     resident = construct_resident_model(root, runtime, config=config)
     inject_hy3_streamed_mtp_support(
@@ -318,7 +330,7 @@ def test_injection_requires_declared_nextn_layer(tmp_path: Path) -> None:
     root, config, spec, manifest_path = _integrated_streamed_hy3(tmp_path)
     mtp_dir = tmp_path / "mtp"
     mtp_dir.mkdir()
-    mtp_fixtures._write_tiny_artifacts(mtp_dir)
+    _write_mtp_fixtures(mtp_dir)
     runtime = _open_streamed_runtime(root, spec, manifest_path)
     try:
         resident = construct_resident_model(root, runtime, config=config)
@@ -397,7 +409,7 @@ def test_return_hidden_defaults_to_post_norm_for_the_nextn_head(tmp_path: Path) 
     root, config, spec, manifest_path = _integrated_streamed_hy3(tmp_path)
     mtp_dir = tmp_path / "mtp"
     mtp_dir.mkdir()
-    mtp_fixtures._write_tiny_artifacts(mtp_dir)
+    _write_mtp_fixtures(mtp_dir)
     runtime = _open_streamed_runtime(root, spec, manifest_path)
     try:
         resident = construct_resident_model(root, runtime, config=config)
@@ -420,3 +432,135 @@ def test_return_hidden_defaults_to_post_norm_for_the_nextn_head(tmp_path: Path) 
         assert not mx.array_equal(pre_ref, post_ref).item()
     finally:
         runtime.close()
+
+
+def _quantized_module_paths(mtp) -> list[str]:
+    import mlx.nn as nn
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+
+    found: list[str] = []
+
+    def visit(prefix, module):
+        if isinstance(module, (nn.QuantizedLinear, QuantizedSwitchLinear)):
+            found.append(prefix)
+        for name, child in module.children().items():
+            if isinstance(child, list):
+                for index, item in enumerate(child):
+                    if isinstance(item, nn.Module):
+                        visit(f"{prefix}.{name}.{index}", item)
+            elif isinstance(child, nn.Module):
+                visit(f"{prefix}.{name}", child)
+
+    visit("mtp", mtp)
+    return found
+
+
+def test_inject_defaults_to_bf16_head_without_quantized_modules(
+    tmp_path: Path,
+) -> None:
+    """Forge contract section 6: a quantized MTP head collapses acceptance to
+    5-11% (vs 79-85% BF16), so injection defaults to the BF16 artifact."""
+
+    root, config, spec, manifest_path = _integrated_streamed_hy3(tmp_path)
+    mtp_dir = tmp_path / "mtp"
+    mtp_dir.mkdir()
+    _write_mtp_fixtures(mtp_dir)
+    runtime = _open_streamed_runtime(root, spec, manifest_path)
+    try:
+        resident = construct_resident_model(root, runtime, config=config)
+        injected = inject_hy3_streamed_mtp_support(
+            resident.model,
+            mtp_dir,
+            config,
+            MTPContract(),
+            expected_revision=TEST_REVISION,
+        )
+        assert injected is True
+        assert _quantized_module_paths(resident.model.mtp) == []
+        switch = resident.model.mtp.layers[0].mtp_block.mlp.switch_mlp
+        assert switch.gate_proj.weight.dtype == mx.bfloat16
+    finally:
+        runtime.close()
+
+
+def test_inject_q4_precision_keeps_the_quantized_head_unchanged(
+    tmp_path: Path,
+) -> None:
+    root, config, spec, manifest_path = _integrated_streamed_hy3(tmp_path)
+    mtp_dir = tmp_path / "mtp"
+    mtp_dir.mkdir()
+    _write_mtp_fixtures(mtp_dir)
+    runtime = _open_streamed_runtime(root, spec, manifest_path)
+    try:
+        resident = construct_resident_model(root, runtime, config=config)
+        injected = inject_hy3_streamed_mtp_support(
+            resident.model,
+            mtp_dir,
+            config,
+            MTPContract(),
+            expected_revision=TEST_REVISION,
+            mtp_precision="q4",
+        )
+        assert injected is True
+        quantized = _quantized_module_paths(resident.model.mtp)
+        assert any(path.endswith("switch_mlp.gate_proj") for path in quantized)
+        assert any(path.endswith("self_attn.q_proj") for path in quantized)
+    finally:
+        runtime.close()
+
+
+def test_inject_bf16_fails_closed_without_the_bf16_artifact(tmp_path: Path) -> None:
+    root, config, spec, manifest_path = _integrated_streamed_hy3(tmp_path)
+    mtp_dir = tmp_path / "mtp"
+    mtp_dir.mkdir()
+    mtp_fixtures._write_tiny_artifacts(mtp_dir)  # Q4 only, no BF16 file
+    runtime = _open_streamed_runtime(root, spec, manifest_path)
+    try:
+        resident = construct_resident_model(root, runtime, config=config)
+        with pytest.raises(Hy3MTPLoadError, match="missing Hy3 MTP artifact"):
+            inject_hy3_streamed_mtp_support(
+                resident.model,
+                mtp_dir,
+                config,
+                MTPContract(),
+                expected_revision=TEST_REVISION,
+            )
+    finally:
+        runtime.close()
+
+
+def test_load_defaults_mtp_precision_to_bf16_and_validates_it(
+    tmp_path: Path,
+) -> None:
+    import inspect
+
+    from mtplx.hy3_mtp_patch import build_hy3_mtp_module
+
+    assert inspect.signature(load).parameters["mtp_precision"].default == "bf16"
+    assert (
+        inspect.signature(inject_hy3_streamed_mtp_support)
+        .parameters["mtp_precision"]
+        .default
+        == "bf16"
+    )
+    assert (
+        inspect.signature(build_hy3_mtp_module).parameters["precision"].default
+        == "bf16"
+    )
+
+    root = _guard_config_dir(tmp_path)
+    config = ExpertStreamingConfig(
+        model_key="hy3-q4",
+        memory_limit_bytes=1,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+    )
+    with pytest.raises(ValueError, match="mtp_precision"):
+        load(
+            root,
+            mtp=True,
+            expert_streaming_config=config,
+            expert_manifest=root / "expert-manifest.json",
+            mtp_artifacts=tmp_path,
+            mtp_precision="fp8",
+        )

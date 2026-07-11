@@ -91,6 +91,41 @@ def test_enable_mtp_requires_artifacts_and_hy3(capsys) -> None:
     assert "--enable-mtp" in capsys.readouterr().err
 
 
+def test_mtp_precision_defaults_bf16_and_requires_enable_mtp(capsys) -> None:
+    import pytest
+
+    module = _load_module()
+    parser = module.build_parser()
+
+    # Default resolves to bf16 (Forge contract section 6: quantized MTP heads
+    # collapse acceptance).
+    args = parser.parse_args([*_BASE_ARGS, "--model-key", "hy3-q4",
+                              "--enable-mtp", "--mtp-artifacts", "/artifacts"])
+    module.validate_mtp_flags(parser, args)
+    assert args.mtp_precision == "bf16"
+
+    # q4 stays selectable.
+    args = parser.parse_args([*_BASE_ARGS, "--model-key", "hy3-q4",
+                              "--enable-mtp", "--mtp-artifacts", "/artifacts",
+                              "--mtp-precision", "q4"])
+    module.validate_mtp_flags(parser, args)
+    assert args.mtp_precision == "q4"
+
+    # Unknown precisions are rejected at parse time.
+    with pytest.raises(SystemExit):
+        parser.parse_args([*_BASE_ARGS, "--model-key", "hy3-q4",
+                           "--enable-mtp", "--mtp-artifacts", "/artifacts",
+                           "--mtp-precision", "fp8"])
+    capsys.readouterr()
+
+    # The flag is meaningless without MTP.
+    args = parser.parse_args([*_BASE_ARGS, "--model-key", "hy3-q4",
+                              "--mtp-precision", "q4"])
+    with pytest.raises(SystemExit):
+        module.validate_mtp_flags(parser, args)
+    assert "--enable-mtp" in capsys.readouterr().err
+
+
 def test_mtp_rejects_concurrency(capsys) -> None:
     import pytest
 
