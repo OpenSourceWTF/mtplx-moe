@@ -44,17 +44,203 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-live-kv-tokens", type=_positive_int, required=True)
     parser.add_argument("--runtime-reserve", default="16GiB")
     parser.add_argument("--expert-cache-limit")
-    parser.add_argument("--prompt", default="Explain why the sky is blue in one paragraph.")
-    parser.add_argument("--max-tokens", type=_positive_int, default=64)
+    parser.add_argument(
+        "--cache-policy",
+        choices=["frequency", "lru"],
+        default="frequency",
+    )
+    prompt = parser.add_mutually_exclusive_group()
+    prompt.add_argument(
+        "--prompt",
+    )
+    prompt.add_argument("--prompt-file", type=Path)
+    parser.add_argument(
+        "--context-tokens",
+        type=_positive_int,
+        help="Build an exact-size MTPLX prefill-ladder prompt for comparison runs.",
+    )
+    parser.add_argument(
+        "--prompt-style",
+        choices=["coding-agent", "legacy-repeat"],
+        default="coding-agent",
+    )
+    parser.add_argument(
+        "--chat",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Encode the prompt as a user turn with the artifact chat template.",
+    )
+    parser.add_argument(
+        "--system-prompt",
+        default="You are a precise senior software engineer. Give a complete, self-contained answer.",
+    )
+    parser.add_argument(
+        "--enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--reasoning-effort")
+    parser.add_argument(
+        "--generation-profile",
+        choices=["model-default", "deterministic", "qwen36-comparable"],
+        default="model-default",
+        help="Use artifact/vendor generation defaults or greedy deterministic sampling.",
+    )
+    parser.add_argument("--temperature", type=float)
+    parser.add_argument("--top-p", type=float)
+    parser.add_argument("--top-k", type=int)
+    parser.add_argument(
+        "--window-tokens",
+        type=_positive_int,
+        default=32,
+        help="Capture rolling decode/cache telemetry every N generated tokens.",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=_positive_int,
+        help=(
+            "Maximum generated tokens; generation still stops naturally at EOS. "
+            "Model-default is 65,536 for both profiles; GLM-5.2's documented "
+            "hard output max is 131,072."
+        ),
+    )
     parser.add_argument("--repeats", type=_positive_int, default=2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--reset-between", action="store_true")
+    parser.add_argument(
+        "--transient-slots",
+        type=_positive_int,
+        help="Global miss-service/I/O slots (default: model top-k).",
+    )
+    parser.add_argument(
+        "--read-chunk",
+        default="8MiB",
+        help="Maximum native positional-read chunk (default: 8MiB).",
+    )
+    parser.add_argument(
+        "--f-nocache",
+        action="store_true",
+        help="Use macOS F_NOCACHE reads directly into shared expert slots.",
+    )
+    parser.add_argument(
+        "--slot-layout",
+        choices=["direct-slots", "component-banks", "metal-mmap"],
+        default="direct-slots",
+    )
+    parser.add_argument(
+        "--verified-sidecar",
+        action="store_true",
+        help="Verify the full sidecar once at open, then skip repeated record hashes.",
+    )
+    parser.add_argument(
+        "--trust-sidecar",
+        action="store_true",
+        help=(
+            "Explicitly trust the manifest's sidecar digest and skip both "
+            "startup and per-record hashing. Intended for an unchanged local "
+            "sidecar that was fully verified earlier."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Save each generated response as Markdown in this directory.",
+    )
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        help="Also write the complete benchmark payload to this JSON path.",
+    )
+    parser.add_argument(
+        "--run-label",
+        help="Filesystem-safe label used in saved response filenames.",
+    )
+    parser.add_argument(
+        "--route-trace-json",
+        type=Path,
+        help="Save per-layer routed expert IDs for cache/prefetch simulation.",
+    )
     return parser
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
     root = args.model_root.expanduser().resolve()
+    model_defaults = {
+        "glm52-q4": {
+            "max_tokens": 65_536,
+            "max_output_tokens": 131_072,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 0,
+            "enable_thinking": True,
+            "reasoning_effort": "max",
+        },
+        "hy3-q4": {
+            "max_tokens": 65_536,
+            "max_output_tokens": 262_144,
+            "temperature": 0.9,
+            "top_p": 1.0,
+            "top_k": 0,
+            "enable_thinking": False,
+            "reasoning_effort": None,
+        },
+    }[args.model_key]
+    if args.generation_profile == "deterministic":
+        profile_defaults = {
+            **model_defaults,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 1,
+            "enable_thinking": False,
+            "reasoning_effort": None,
+        }
+    elif args.generation_profile == "qwen36-comparable":
+        profile_defaults = {
+            **model_defaults,
+            "max_tokens": 128,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "enable_thinking": False,
+            "reasoning_effort": None,
+        }
+    else:
+        profile_defaults = model_defaults
+    max_tokens = args.max_tokens or int(profile_defaults["max_tokens"])
+    benchmark_context_limit = 262_144
+    if args.max_live_kv_tokens > benchmark_context_limit:
+        parser.error(
+            f"--max-live-kv-tokens {args.max_live_kv_tokens} exceeds the current "
+            f"benchmark ceiling of {benchmark_context_limit}"
+        )
+    if max_tokens > int(model_defaults["max_output_tokens"]):
+        parser.error(
+            f"--max-tokens {max_tokens} exceeds {args.model_key}'s documented "
+            f"maximum output of {model_defaults['max_output_tokens']}"
+        )
+    temperature = (
+        args.temperature
+        if args.temperature is not None
+        else float(profile_defaults["temperature"])
+    )
+    top_p = args.top_p if args.top_p is not None else float(profile_defaults["top_p"])
+    top_k = args.top_k if args.top_k is not None else int(profile_defaults["top_k"])
+    enable_thinking = (
+        args.enable_thinking
+        if args.enable_thinking is not None
+        else bool(profile_defaults["enable_thinking"])
+    )
+    reasoning_effort = args.reasoning_effort or profile_defaults["reasoning_effort"]
+    run_label = args.run_label or args.manifest.stem
+    if not run_label or any(
+        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+        for character in run_label
+    ):
+        parser.error("--run-label may contain only letters, digits, '-' and '_'")
+    if args.verified_sidecar and args.trust_sidecar:
+        parser.error("--verified-sidecar and --trust-sidecar are mutually exclusive")
     config = ExpertStreamingConfig(
         model_key=args.model_key,
         memory_limit_bytes=parse_memory_bytes(args.memory_limit),
@@ -65,6 +251,16 @@ def main() -> int:
             if args.expert_cache_limit
             else None
         ),
+        cache_policy=args.cache_policy,
+        transient_slots=args.transient_slots,
+        max_read_chunk_bytes=parse_memory_bytes(args.read_chunk),
+        bypass_page_cache=args.f_nocache,
+        slot_layout=args.slot_layout,
+        verify_record_hashes=not (
+            args.trust_sidecar or args.slot_layout == "metal-mmap"
+        ),
+        verify_sidecar_hash_at_open=args.verified_sidecar,
+        trace_routes=args.route_trace_json is not None,
     )
     runtime = load(
         root,
@@ -77,24 +273,122 @@ def main() -> int:
         from mtplx.generation import generate_ar
         from mtplx.sampling import SamplerConfig
 
-        prompt_ids = runtime.tokenizer.encode(args.prompt)
-        sampler = SamplerConfig(temperature=0.0, top_p=1.0, top_k=1)
+        prompt_text = (
+            args.prompt_file.expanduser().read_text(encoding="utf-8")
+            if args.prompt_file is not None
+            else args.prompt
+        )
+        prompt_metadata = None
+        if args.context_tokens is not None:
+            from mtplx.prefill_bench import _prompt_build_for_context
+
+            prompt_build = _prompt_build_for_context(
+                runtime.tokenizer,
+                args.context_tokens,
+                prompt_style=args.prompt_style,
+                prompt_tail=prompt_text,
+                prompt_format="chat" if args.chat else "raw",
+                enable_thinking=enable_thinking,
+            )
+            prompt_ids = prompt_build.token_ids
+            prompt_metadata = prompt_build.metadata
+        elif args.chat:
+            from mtplx.chat_encoding import encode_chat_messages
+
+            prompt_ids = encode_chat_messages(
+                runtime.tokenizer,
+                [
+                    {"role": "system", "content": args.system_prompt},
+                    {
+                        "role": "user",
+                        "content": prompt_text
+                        or "Explain why the sky is blue in one paragraph.",
+                    },
+                ],
+                enable_thinking=enable_thinking,
+                reasoning_effort=reasoning_effort,
+            )
+        else:
+            prompt_ids = runtime.tokenizer.encode(
+                prompt_text or "Explain why the sky is blue in one paragraph."
+            )
+        sampler = SamplerConfig(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )
         for repeat in range(args.repeats):
             if args.reset_between and repeat:
                 runtime.expert_streaming.reset()
             before = runtime.expert_streaming_snapshot()
+            decode_points = []
+            decoded_count = 0
+
+            def token_callback(token_ids):
+                nonlocal decoded_count
+                decoded_count += len(token_ids)
+                if decoded_count == 1 or (decoded_count - 1) % args.window_tokens == 0:
+                    decode_points.append(
+                        {
+                            "completion_tokens": decoded_count,
+                            "time": time.perf_counter(),
+                            "streaming": runtime.expert_streaming_snapshot(),
+                        }
+                    )
+
             started = time.perf_counter()
-            with runtime.admit_kv_tokens(len(prompt_ids) + args.max_tokens):
+            with runtime.admit_kv_tokens(len(prompt_ids) + max_tokens):
                 result = generate_ar(
                     runtime,
                     prompt_ids,
-                    max_tokens=args.max_tokens,
+                    max_tokens=max_tokens,
                     sampler=sampler,
                     seed=args.seed,
+                    token_callback=token_callback,
                 )
             elapsed = time.perf_counter() - started
             after = runtime.expert_streaming_snapshot()
             token_ids = [int(token) for token in result.tokens]
+            if token_ids and (
+                not decode_points
+                or decode_points[-1]["completion_tokens"] != len(token_ids)
+            ):
+                decode_points.append(
+                    {
+                        "completion_tokens": len(token_ids),
+                        "time": time.perf_counter(),
+                        "streaming": after,
+                    }
+                )
+            rolling_decode = []
+            for left, right in zip(decode_points, decode_points[1:], strict=False):
+                window_elapsed = right["time"] - left["time"]
+                window_tokens = (
+                    right["completion_tokens"] - left["completion_tokens"]
+                )
+                rolling_decode.append(
+                    {
+                        "from_completion_token": left["completion_tokens"],
+                        "to_completion_token": right["completion_tokens"],
+                        "decode_tokens": window_tokens,
+                        "elapsed_seconds": window_elapsed,
+                        "decode_tokens_per_second": (
+                            window_tokens / window_elapsed
+                            if window_elapsed > 0.0
+                            else 0.0
+                        ),
+                        "streaming_before": left["streaming"],
+                        "streaming_after": right["streaming"],
+                    }
+                )
+            response_path = None
+            if args.output_dir is not None:
+                output_dir = args.output_dir.expanduser().resolve()
+                output_dir.mkdir(parents=True, exist_ok=True)
+                response_path = output_dir / (
+                    f"{args.model_key}-{run_label}-repeat-{repeat}.md"
+                )
+                response_path.write_text(result.text + "\n", encoding="utf-8")
             rows.append(
                 {
                     "repeat": repeat,
@@ -103,7 +397,12 @@ def main() -> int:
                     "completion_tokens": len(token_ids),
                     "completion_tokens_per_second": len(token_ids) / elapsed,
                     "token_ids": token_ids,
-                    "text": runtime.tokenizer.decode(token_ids),
+                    "text": result.text,
+                    "response_path": (
+                        str(response_path) if response_path is not None else None
+                    ),
+                    "finish_reason": result.finish_reason,
+                    "rolling_decode": rolling_decode,
                     "streaming_before": before,
                     "streaming_after": after,
                     "generation_stats": result.stats.to_dict(),
@@ -120,6 +419,27 @@ def main() -> int:
         "manifest": str(args.manifest.resolve()),
         "config": config.to_dict(),
         "seed": args.seed,
+        "chat": args.chat,
+        "enable_thinking": enable_thinking,
+        "reasoning_effort": reasoning_effort,
+        "generation_profile": args.generation_profile,
+        "run_label": run_label,
+        "generation": {
+            "max_tokens": max_tokens,
+            "documented_max_output_tokens": model_defaults["max_output_tokens"],
+            "benchmark_context_limit": benchmark_context_limit,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+        },
+        "prompt_file": (
+            str(args.prompt_file.expanduser().resolve())
+            if args.prompt_file is not None
+            else None
+        ),
+        "context_tokens": args.context_tokens,
+        "prompt_style": args.prompt_style if args.context_tokens is not None else None,
+        "prompt_metadata": prompt_metadata,
         "reset_between": args.reset_between,
         "host": {
             "platform": platform.platform(),
@@ -127,7 +447,26 @@ def main() -> int:
         },
         "runs": rows,
     }
-    print(json.dumps(payload, indent=2, sort_keys=True))
+    if args.route_trace_json is not None:
+        route_trace_json = args.route_trace_json.expanduser().resolve()
+        route_trace_json.parent.mkdir(parents=True, exist_ok=True)
+        route_trace_payload = {
+            "schema": "mtplx-expert-route-trace-v1",
+            "model_key": args.model_key,
+            "manifest_sha256": runtime.expert_streaming.manifest.manifest_sha256,
+            "entries": runtime.expert_streaming.route_trace(),
+        }
+        route_trace_json.write_text(
+            json.dumps(route_trace_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        payload["route_trace_json"] = str(route_trace_json)
+    rendered = json.dumps(payload, indent=2, sort_keys=True)
+    if args.output_json is not None:
+        output_json = args.output_json.expanduser().resolve()
+        output_json.parent.mkdir(parents=True, exist_ok=True)
+        output_json.write_text(rendered + "\n", encoding="utf-8")
+    print(rendered)
     return 0
 
 

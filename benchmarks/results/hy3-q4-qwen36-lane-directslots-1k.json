@@ -1,0 +1,1730 @@
+{
+  "chat": true,
+  "config": {
+    "execution_workspace_bytes": 0,
+    "expert_cache_limit_bytes": 78383153152,
+    "frequency_decay": 0.995,
+    "io_staging_bytes": 0,
+    "max_inflight_io_bytes": null,
+    "max_live_kv_tokens": 69632,
+    "max_open_files": 16,
+    "max_read_chunk_bytes": 67108864,
+    "memory_limit_bytes": 123480309760,
+    "model_key": "hy3-q4",
+    "prefer_sidecar": true,
+    "prefill_admission": false,
+    "runtime_reserve_bytes": 17179869184,
+    "transient_slots": 32,
+    "verify_artifact_headers": true,
+    "verify_record_hashes": true
+  },
+  "context_tokens": 1024,
+  "enable_thinking": false,
+  "generation": {
+    "benchmark_context_limit": 262144,
+    "documented_max_output_tokens": 262144,
+    "max_tokens": 128,
+    "temperature": 0.6,
+    "top_k": 20,
+    "top_p": 0.95
+  },
+  "generation_profile": "qwen36-comparable",
+  "git_commit": "ba1bbd2cc69b1ff28186bbb5d448e004611140e5",
+  "host": {
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "manifest": "/Users/davidtai/.cache/huggingface/hub/models--pipenetwork--Hy3-4bit/snapshots/160619d3f96c8470350b6dac0ef033a8381551e3/expert-manifest-sidecar.json",
+  "model_key": "hy3-q4",
+  "model_root": "/Users/davidtai/.cache/huggingface/hub/models--pipenetwork--Hy3-4bit/snapshots/160619d3f96c8470350b6dac0ef033a8381551e3",
+  "prompt_file": null,
+  "prompt_metadata": {
+    "prompt_actual_tokens": 1024,
+    "prompt_context_tokens": 1024,
+    "prompt_enable_thinking": false,
+    "prompt_filler_sha256": "69b2be3dbd45365504b6dd0f0caff283b04905e96e0b905fa670260e359f8dcc",
+    "prompt_filler_tokens": 705,
+    "prompt_format": "chat",
+    "prompt_head_trimmed_tokens": 0,
+    "prompt_policy": "coding_agent_tail_v2",
+    "prompt_release_valid": true,
+    "prompt_style": "coding-agent",
+    "prompt_tail_preserved": true,
+    "prompt_tail_sha256": "887573dd262ed624eccb39f8b833f5711dd36889d2ea16e68837e2985a1f71b1",
+    "prompt_tail_tokens": 319,
+    "prompt_tail_truncated": false
+  },
+  "prompt_style": "coding-agent",
+  "reasoning_effort": null,
+  "reset_between": false,
+  "run_label": "qwen36-lane-directslots-1k",
+  "runs": [
+    {
+      "completion_tokens": 128,
+      "completion_tokens_per_second": 1.0520376048739848,
+      "elapsed_seconds": 121.66865462507121,
+      "finish_reason": "length",
+      "generation_stats": {
+        "accept_probability_sum_by_depth": [],
+        "accept_time_s": 0.0,
+        "accepted_by_depth": [],
+        "accepted_drafts": 0,
+        "adapter_ensemble_q": {},
+        "ar_dense_fallback_calls": 0,
+        "ar_return_hidden": false,
+        "attention_dense_fallback_calls": 0,
+        "benchmark_mode": null,
+        "bonus_time_s": 0.0,
+        "bonus_tokens": 0,
+        "cache_miss_reason": null,
+        "cache_restore_time_s": 0.0,
+        "cache_source": "none",
+        "cached_tokens": 0,
+        "capture_commit_detach_arrays": 0,
+        "capture_commit_detach_bytes": 0,
+        "capture_commit_detach_components": [],
+        "capture_commit_detach_conv_every": 0,
+        "capture_commit_detach_events": 0,
+        "capture_commit_detach_gdn_every": 0,
+        "capture_commit_detach_mode": "selected_slice_contiguous_eval",
+        "capture_commit_detach_time_s": 0.0,
+        "capture_commit_time_s": 0.0,
+        "clear_cache_events": 0,
+        "clear_cache_every": 0,
+        "clear_cache_time_s": 0.0,
+        "commit_time_s": 0.0,
+        "correction_tokens": 0,
+        "decode_dense_fallback_calls": 0,
+        "decode_elapsed_s": 100.98136683413759,
+        "decode_large_q_split_sdpa_fallback_calls": 0,
+        "decode_partitioned_paged_calls": 0,
+        "decode_tok_s": 1.2675605808568688,
+        "decode_trace_path": null,
+        "decode_trace_run_id": null,
+        "deferred_correction_repairs": 0,
+        "dirty_detach_arrays": 0,
+        "dirty_detach_attn_every": 0,
+        "dirty_detach_bytes": 0,
+        "dirty_detach_components": [],
+        "dirty_detach_conv_every": 0,
+        "dirty_detach_events": 0,
+        "dirty_detach_gdn_every": 0,
+        "dirty_detach_mode": "selected_slice_contiguous_eval",
+        "dirty_detach_time_s": 0.0,
+        "draft_core": {},
+        "draft_head_installed": null,
+        "draft_time_s": 0.0,
+        "drafted_by_depth": [],
+        "drafted_tokens": 0,
+        "elapsed_s": 121.66229316708632,
+        "end_to_end_tok_s": 1.0520926136433226,
+        "events": [
+          {
+            "step": 0,
+            "token": 1438
+          },
+          {
+            "step": 1,
+            "token": 6515
+          },
+          {
+            "step": 2,
+            "token": 185
+          },
+          {
+            "step": 3,
+            "token": 4140
+          },
+          {
+            "step": 4,
+            "token": 4277
+          },
+          {
+            "step": 5,
+            "token": 58035
+          },
+          {
+            "step": 6,
+            "token": 667
+          },
+          {
+            "step": 7,
+            "token": 1661
+          },
+          {
+            "step": 8,
+            "token": 39839
+          },
+          {
+            "step": 9,
+            "token": 286
+          },
+          {
+            "step": 10,
+            "token": 1655
+          },
+          {
+            "step": 11,
+            "token": 55814
+          },
+          {
+            "step": 12,
+            "token": 185
+          },
+          {
+            "step": 13,
+            "token": 1655
+          },
+          {
+            "step": 14,
+            "token": 3107
+          },
+          {
+            "step": 15,
+            "token": 32588
+          },
+          {
+            "step": 16,
+            "token": 20076
+          },
+          {
+            "step": 17,
+            "token": 185
+          },
+          {
+            "step": 18,
+            "token": 1655
+          },
+          {
+            "step": 19,
+            "token": 11996
+          },
+          {
+            "step": 20,
+            "token": 8563
+          },
+          {
+            "step": 21,
+            "token": 185
+          },
+          {
+            "step": 22,
+            "token": 1655
+          },
+          {
+            "step": 23,
+            "token": 11535
+          },
+          {
+            "step": 24,
+            "token": 185
+          },
+          {
+            "step": 25,
+            "token": 1655
+          },
+          {
+            "step": 26,
+            "token": 6726
+          },
+          {
+            "step": 27,
+            "token": 185
+          },
+          {
+            "step": 28,
+            "token": 1655
+          },
+          {
+            "step": 29,
+            "token": 13153
+          },
+          {
+            "step": 30,
+            "token": 185
+          },
+          {
+            "step": 31,
+            "token": 1655
+          },
+          {
+            "step": 32,
+            "token": 12363
+          },
+          {
+            "step": 33,
+            "token": 4725
+          },
+          {
+            "step": 34,
+            "token": 185
+          },
+          {
+            "step": 35,
+            "token": 1655
+          },
+          {
+            "step": 36,
+            "token": 1127
+          },
+          {
+            "step": 37,
+            "token": 185
+          },
+          {
+            "step": 38,
+            "token": 4140
+          },
+          {
+            "step": 39,
+            "token": 3043
+          },
+          {
+            "step": 40,
+            "token": 8563
+          },
+          {
+            "step": 41,
+            "token": 1661
+          },
+          {
+            "step": 42,
+            "token": 15478
+          },
+          {
+            "step": 43,
+            "token": 185
+          },
+          {
+            "step": 44,
+            "token": 4140
+          },
+          {
+            "step": 45,
+            "token": 25274
+          },
+          {
+            "step": 46,
+            "token": 1661
+          },
+          {
+            "step": 47,
+            "token": 9849
+          },
+          {
+            "step": 48,
+            "token": 11
+          },
+          {
+            "step": 49,
+            "token": 62255
+          },
+          {
+            "step": 50,
+            "token": 11
+          },
+          {
+            "step": 51,
+            "token": 24708
+          },
+          {
+            "step": 52,
+            "token": 286
+          },
+          {
+            "step": 53,
+            "token": 2
+          },
+          {
+            "step": 54,
+            "token": 206
+          },
+          {
+            "step": 55,
+            "token": 16
+          },
+          {
+            "step": 56,
+            "token": 13
+          },
+          {
+            "step": 57,
+            "token": 12059
+          },
+          {
+            "step": 58,
+            "token": 19106
+          },
+          {
+            "step": 59,
+            "token": 3107
+          },
+          {
+            "step": 60,
+            "token": 32588
+          },
+          {
+            "step": 61,
+            "token": 20076
+          },
+          {
+            "step": 62,
+            "token": 289
+          },
+          {
+            "step": 63,
+            "token": 9355
+          },
+          {
+            "step": 64,
+            "token": 43
+          },
+          {
+            "step": 65,
+            "token": 42279
+          },
+          {
+            "step": 66,
+            "token": 286
+          },
+          {
+            "step": 67,
+            "token": 31
+          },
+          {
+            "step": 68,
+            "token": 21013
+          },
+          {
+            "step": 69,
+            "token": 32588
+          },
+          {
+            "step": 70,
+            "token": 20076
+          },
+          {
+            "step": 71,
+            "token": 27215
+          },
+          {
+            "step": 72,
+            "token": 103071
+          },
+          {
+            "step": 73,
+            "token": 185
+          },
+          {
+            "step": 74,
+            "token": 2732
+          },
+          {
+            "step": 75,
+            "token": 69669
+          },
+          {
+            "step": 76,
+            "token": 17500
+          },
+          {
+            "step": 77,
+            "token": 25
+          },
+          {
+            "step": 78,
+            "token": 185
+          },
+          {
+            "step": 79,
+            "token": 300
+          },
+          {
+            "step": 80,
+            "token": 12059
+          },
+          {
+            "step": 81,
+            "token": 3692
+          },
+          {
+            "step": 82,
+            "token": 25
+          },
+          {
+            "step": 83,
+            "token": 2002
+          },
+          {
+            "step": 84,
+            "token": 185
+          },
+          {
+            "step": 85,
+            "token": 300
+          },
+          {
+            "step": 86,
+            "token": 2602
+          },
+          {
+            "step": 87,
+            "token": 25
+          },
+          {
+            "step": 88,
+            "token": 2002
+          },
+          {
+            "step": 89,
+            "token": 185
+          },
+          {
+            "step": 90,
+            "token": 300
+          },
+          {
+            "step": 91,
+            "token": 3340
+          },
+          {
+            "step": 92,
+            "token": 91024
+          },
+          {
+            "step": 93,
+            "token": 25
+          },
+          {
+            "step": 94,
+            "token": 694
+          },
+          {
+            "step": 95,
+            "token": 185
+          },
+          {
+            "step": 96,
+            "token": 300
+          },
+          {
+            "step": 97,
+            "token": 18125
+          },
+          {
+            "step": 98,
+            "token": 25
+          },
+          {
+            "step": 99,
+            "token": 13520
+          },
+          {
+            "step": 100,
+            "token": 33831
+          },
+          {
+            "step": 101,
+            "token": 11
+          },
+          {
+            "step": 102,
+            "token": 9849
+          },
+          {
+            "step": 103,
+            "token": 60
+          },
+          {
+            "step": 104,
+            "token": 324
+          },
+          {
+            "step": 105,
+            "token": 3107
+          },
+          {
+            "step": 106,
+            "token": 32588
+          },
+          {
+            "step": 107,
+            "token": 20076
+          },
+          {
+            "step": 108,
+            "token": 49323
+          },
+          {
+            "step": 109,
+            "token": 59729
+          },
+          {
+            "step": 110,
+            "token": 72809
+          },
+          {
+            "step": 111,
+            "token": 28
+          },
+          {
+            "step": 112,
+            "token": 17010
+          },
+          {
+            "step": 113,
+            "token": 1362
+          },
+          {
+            "step": 114,
+            "token": 300
+          },
+          {
+            "step": 115,
+            "token": 1823
+          },
+          {
+            "step": 116,
+            "token": 71405
+          },
+          {
+            "step": 117,
+            "token": 185
+          },
+          {
+            "step": 118,
+            "token": 300
+          },
+          {
+            "step": 119,
+            "token": 1120
+          },
+          {
+            "step": 120,
+            "token": 562
+          },
+          {
+            "step": 121,
+            "token": 15406
+          },
+          {
+            "step": 122,
+            "token": 52942
+          },
+          {
+            "step": 123,
+            "token": 11
+          },
+          {
+            "step": 124,
+            "token": 278
+          },
+          {
+            "step": 125,
+            "token": 25
+          },
+          {
+            "step": 126,
+            "token": 13520
+          },
+          {
+            "step": 127,
+            "token": 33831
+          }
+        ],
+        "final_logits_tokens_emitted": 128,
+        "forward_ar_hidden_calls": 0,
+        "forward_ar_plain_calls": 129,
+        "full_logits_tokens_emitted": 1023,
+        "generated_tokens": 128,
+        "graphbank": {},
+        "large_q_split_sdpa_fallback_calls": 0,
+        "large_q_split_sdpa_fallback_calls_by_phase": {},
+        "lazy_bonus_commit_time_s": 0.0,
+        "lazy_bonus_verify_calls": 0,
+        "live_output_detach_arrays": 0,
+        "live_output_detach_bytes": 0,
+        "live_output_detach_enabled": false,
+        "live_output_detach_events": 0,
+        "live_output_detach_mode": "contiguous_eval",
+        "live_output_detach_time_s": 0.0,
+        "load_mtp": null,
+        "logits_tokens_emitted": 1151,
+        "long_context_mtp_depth_policy": {},
+        "loop_guard": {},
+        "make_mtp_cache_calls": 0,
+        "mean_accept_probability_by_depth": [],
+        "mode": "ar",
+        "mtp_forward_calls": 0,
+        "mtp_history_append_calls": 0,
+        "mtp_history_materialize_events": 0,
+        "mtp_history_materialize_every": 0,
+        "mtp_history_policy": "cycle",
+        "mtp_history_position_base": 0,
+        "mtp_history_window_tokens": 0,
+        "mtp_topk_reranker": {},
+        "new_prefill_tokens": 0,
+        "online_correction_cache": {},
+        "online_hidden_corrector_time_s": 0.0,
+        "owned_attn_kv": {},
+        "owned_recurrent_state": {},
+        "paged_active_array_calls": 0,
+        "paged_active_array_time_s": 0.0,
+        "paged_attention_bailouts_by_phase_reason": {},
+        "paged_attention_large_q_path": "",
+        "paged_gqa_sdpa_calls": 0,
+        "paged_gqa_sdpa_calls_by_phase": {},
+        "paged_gqa_sdpa_calls_by_route": {},
+        "paged_gqa_sdpa_last_route_miss": {},
+        "paged_gqa_sdpa_route_misses_by_phase_reason": {},
+        "paged_gqa_sdpa_route_misses_by_q_len": {},
+        "paged_kv_capacity_tokens": 0,
+        "paged_kv_num_blocks": 0,
+        "paged_kv_quant": false,
+        "paged_kv_quant_attention_calls": 0,
+        "paged_kv_quant_dequant_calls": 0,
+        "paged_kv_quant_dequant_time_s": 0.0,
+        "paged_kv_quant_dequant_tokens": 0,
+        "paged_kv_quant_mode": "",
+        "paged_turboquant": false,
+        "paged_turboquant_attention_calls": 0,
+        "paged_turboquant_k_quant": "",
+        "paged_turboquant_v_quant": "",
+        "partitioned_paged_calls": 0,
+        "partitioned_paged_calls_by_phase": {},
+        "peak_memory_bytes": 84447687968,
+        "postcommit_dense_fallback_calls": 0,
+        "prefill_chunk_cache_cleanup_enabled": false,
+        "prefill_chunk_cache_cleanup_events": 0,
+        "prefill_chunk_cache_cleanup_every": 1,
+        "prefill_chunk_size": 2048,
+        "prefill_chunks": 1,
+        "prefill_dense_fallback_calls": 0,
+        "prefill_external_cache_only_calls": 0,
+        "prefill_external_emit_logits_enabled": true,
+        "prefill_large_q_split_sdpa_fallback_calls": 0,
+        "prefill_omlx_external_calls": 0,
+        "prefill_omlx_external_enabled": false,
+        "prefill_partitioned_paged_calls": 0,
+        "prefill_route": "",
+        "prefill_stock_cache_only_calls": 0,
+        "prefill_stock_cache_only_enabled": false,
+        "prompt_eval_time_s": 20.68092633294873,
+        "prompt_mtp_history_time_s": 0.0,
+        "prompt_mtp_history_tok_s": 0.0,
+        "prompt_target_prefill_time_s": 20.68092633294873,
+        "prompt_target_prefill_tok_s": 49.5142230823853,
+        "prompt_tps": 49.5142230823853,
+        "reject_path_counts": {},
+        "rejected_drafts": 0,
+        "repair_time_by_reject_depth_s": {},
+        "repair_time_s": 0.0,
+        "repetition_stop_block_tokens": 0,
+        "repetition_stop_raw_tokens": 0,
+        "repetition_stop_reason": null,
+        "repetition_stop_repeats": 0,
+        "repetition_stop_triggered": false,
+        "repetition_stop_trimmed_tokens": 0,
+        "requested_speculative_depth": 0,
+        "rollback_time_s": 0.0,
+        "runtime_mtp_enabled": false,
+        "session_cache_hit": false,
+        "session_prompt_prefix_bank_commit": {},
+        "session_restore_mode": "cold",
+        "sessionbank_skipped_oversized_snapshot": false,
+        "sessionbank_snapshot_bytes": 0,
+        "skipped_drafts": 0,
+        "snapshot_time_s": 0.0,
+        "speculative_depth": 0,
+        "ssd_cache_hit": false,
+        "ssd_cached_tokens": 0,
+        "ssd_restore_s": 0.0,
+        "ssd_suffix_tokens": 0,
+        "state_rebase_events": 0,
+        "state_rebase_every": 0,
+        "state_rebase_time_s": 0.0,
+        "state_root_eval_arrays": 0,
+        "state_root_eval_enabled": false,
+        "state_root_eval_events": 0,
+        "state_root_eval_include_mtp": true,
+        "state_root_eval_time_s": 0.0,
+        "target_distribution_materialized_rows": 0,
+        "target_distribution_materialized_windows": 0,
+        "target_distribution_share": 0.0,
+        "target_forward_time_s": 121.45791786629707,
+        "tok_s": 1.2675605808568688,
+        "trace_accounting_time_s": 0.0,
+        "trunk_cache_materialize_events": 0,
+        "trunk_cache_materialize_every": 0,
+        "trunk_cache_materialize_time_s": 0.0,
+        "update_mtp_cache_calls": 0,
+        "verify_calls": 127,
+        "verify_eval_time_s": 0.24175112089142203,
+        "verify_eval_unattributed_time_s": 0.0,
+        "verify_forward_time_s": 100.53512966632843,
+        "verify_hidden_eval_time_s": 0.0,
+        "verify_hidden_mode": "default",
+        "verify_joint_eval_time_s": 0.24175112089142203,
+        "verify_logits_eval_time_s": 0.0,
+        "verify_target_distribution_time_s": 0.0,
+        "verify_time_s": 100.77699153334834
+      },
+      "prompt_tokens": 1024,
+      "repeat": 0,
+      "response_path": "/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/benchmarks/results/hy3-q4-qwen36-lane-directslots-1k-repeat-0.md",
+      "rolling_decode": [
+        {
+          "decode_tokens": 32,
+          "decode_tokens_per_second": 1.2255091627999093,
+          "elapsed_seconds": 26.111595874885097,
+          "from_completion_token": 1,
+          "streaming_after": {
+            "cache": {
+              "bytes_read": 221849321472,
+              "evictions": 2,
+              "expert_hits": 14796,
+              "expert_misses": 652596,
+              "expert_requests": 667392,
+              "hit_rate": 0.02216987917146145,
+              "persistent_loads": 6051,
+              "route_calls": 3081,
+              "transient_loads": 14845
+            },
+            "live_kv_tokens": 1152,
+            "live_kv_tokens_peak": 1152,
+            "manifest_sha256": "8263670ddb775ccfccb51cb266fe5ddc3ce706114fc9c26b40ec36df54c367b4",
+            "memory_cap": {
+              "applied": true,
+              "limit": 106300440576
+            },
+            "memory_plan": {
+              "allocated_bytes": 123290840320,
+              "fixed_bytes": 45288975616,
+              "persistent_cache_bytes": 78001864704,
+              "slots_per_layer": 93,
+              "total_limit_bytes": 123480309760,
+              "transient_slots": 32,
+              "unallocated_bytes": 189469440
+            },
+            "mlx_memory": {
+              "active_memory_bytes": 83715173640,
+              "cache_memory_bytes": 2094210474,
+              "peak_memory_bytes": 84447687968
+            },
+            "model_key": "hy3-q4",
+            "slots": {
+              "allocated_bytes": 78341603328,
+              "buffer_backend": "mlx-metal-direct-slots",
+              "io": {
+                "cancellations": 0,
+                "deadline_errors": 0,
+                "integrity_errors": 0,
+                "io_errors": 0,
+                "open_files_peak": 1,
+                "read_bytes": 221849321472,
+                "read_mib_per_second": 825.8660279060758,
+                "read_ns": 256181986970,
+                "read_operations": 20896,
+                "record_requests": 20896,
+                "requested_bytes": 221849321472,
+                "short_reads": 0,
+                "sidecar_record_requests": 20896,
+                "source_record_requests": 0
+              },
+              "max_inflight_io_bytes": 339738624,
+              "metrics": {
+                "active_routes": 0,
+                "active_routes_peak": 1,
+                "deduplicated_loads": 0,
+                "ensure_calls": 3081,
+                "generation_replacements": 14815,
+                "load_failures": 0,
+                "load_requests": 20896,
+                "load_waits": 0,
+                "owned_loads": 20896,
+                "pin_waits": 0,
+                "ready_hits": 0
+              },
+              "persistent_slot_count": 7347,
+              "pins": 0,
+              "states": {
+                "closed": 0,
+                "empty": 1298,
+                "failed": 0,
+                "loading": 0,
+                "ready": 6081
+              },
+              "transient_slot_count": 32
+            }
+          },
+          "streaming_before": {
+            "cache": {
+              "bytes_read": 164221157376,
+              "evictions": 0,
+              "expert_hits": 0,
+              "expert_misses": 647168,
+              "expert_requests": 647168,
+              "hit_rate": 0.0,
+              "persistent_loads": 632,
+              "route_calls": 553,
+              "transient_loads": 14836
+            },
+            "live_kv_tokens": 1152,
+            "live_kv_tokens_peak": 1152,
+            "manifest_sha256": "8263670ddb775ccfccb51cb266fe5ddc3ce706114fc9c26b40ec36df54c367b4",
+            "memory_cap": {
+              "applied": true,
+              "limit": 106300440576
+            },
+            "memory_plan": {
+              "allocated_bytes": 123290840320,
+              "fixed_bytes": 45288975616,
+              "persistent_cache_bytes": 78001864704,
+              "slots_per_layer": 93,
+              "total_limit_bytes": 123480309760,
+              "transient_slots": 32,
+              "unallocated_bytes": 189469440
+            },
+            "mlx_memory": {
+              "active_memory_bytes": 83631385864,
+              "cache_memory_bytes": 1763810730,
+              "peak_memory_bytes": 84447687968
+            },
+            "model_key": "hy3-q4",
+            "slots": {
+              "allocated_bytes": 78341603328,
+              "buffer_backend": "mlx-metal-direct-slots",
+              "io": {
+                "cancellations": 0,
+                "deadline_errors": 0,
+                "integrity_errors": 0,
+                "io_errors": 0,
+                "open_files_peak": 1,
+                "read_bytes": 164221157376,
+                "read_mib_per_second": 669.5681910676373,
+                "read_ns": 233902240413,
+                "read_operations": 15468,
+                "record_requests": 15468,
+                "requested_bytes": 164221157376,
+                "short_reads": 0,
+                "sidecar_record_requests": 15468,
+                "source_record_requests": 0
+              },
+              "max_inflight_io_bytes": 339738624,
+              "metrics": {
+                "active_routes": 0,
+                "active_routes_peak": 1,
+                "deduplicated_loads": 0,
+                "ensure_calls": 553,
+                "generation_replacements": 14804,
+                "load_failures": 0,
+                "load_requests": 15468,
+                "load_waits": 0,
+                "owned_loads": 15468,
+                "pin_waits": 0,
+                "ready_hits": 0
+              },
+              "persistent_slot_count": 7347,
+              "pins": 0,
+              "states": {
+                "closed": 0,
+                "empty": 6715,
+                "failed": 0,
+                "loading": 0,
+                "ready": 664
+              },
+              "transient_slot_count": 32
+            }
+          },
+          "to_completion_token": 33
+        },
+        {
+          "decode_tokens": 32,
+          "decode_tokens_per_second": 1.3983364934067322,
+          "elapsed_seconds": 22.88433445803821,
+          "from_completion_token": 33,
+          "streaming_after": {
+            "cache": {
+              "bytes_read": 255674548224,
+              "evictions": 570,
+              "expert_hits": 31834,
+              "expert_misses": 655782,
+              "expert_requests": 687616,
+              "hit_rate": 0.046296188570364855,
+              "persistent_loads": 7846,
+              "route_calls": 5609,
+              "transient_loads": 16236
+            },
+            "live_kv_tokens": 1152,
+            "live_kv_tokens_peak": 1152,
+            "manifest_sha256": "8263670ddb775ccfccb51cb266fe5ddc3ce706114fc9c26b40ec36df54c367b4",
+            "memory_cap": {
+              "applied": true,
+              "limit": 106300440576
+            },
+            "memory_plan": {
+              "allocated_bytes": 123290840320,
+              "fixed_bytes": 45288975616,
+              "persistent_cache_bytes": 78001864704,
+              "slots_per_layer": 93,
+              "total_limit_bytes": 123480309760,
+              "transient_slots": 32,
+              "unallocated_bytes": 189469440
+            },
+            "mlx_memory": {
+              "active_memory_bytes": 83715173640,
+              "cache_memory_bytes": 2094217642,
+              "peak_memory_bytes": 84447687968
+            },
+            "model_key": "hy3-q4",
+            "slots": {
+              "allocated_bytes": 78341603328,
+              "buffer_backend": "mlx-metal-direct-slots",
+              "io": {
+                "cancellations": 0,
+                "deadline_errors": 0,
+                "integrity_errors": 0,
+                "io_errors": 0,
+                "open_files_peak": 1,
+                "read_bytes": 255674548224,
+                "read_mib_per_second": 915.7886263333169,
+                "read_ns": 266251668768,
+                "read_operations": 24082,
+                "record_requests": 24082,
+                "requested_bytes": 255674548224,
+                "short_reads": 0,
+                "sidecar_record_requests": 24082,
+                "source_record_requests": 0
+              },
+              "max_inflight_io_bytes": 339738624,
+              "metrics": {
+                "active_routes": 0,
+                "active_routes_peak": 1,
+                "deduplicated_loads": 0,
+                "ensure_calls": 5609,
+                "generation_replacements": 16774,
+                "load_failures": 0,
+                "load_requests": 24082,
+                "load_waits": 0,
+                "owned_loads": 24082,
+                "pin_waits": 0,
+                "ready_hits": 0
+              },
+              "persistent_slot_count": 7347,
+              "pins": 0,
+              "states": {
+                "closed": 0,
+                "empty": 71,
+                "failed": 0,
+                "loading": 0,
+                "ready": 7308
+              },
+              "transient_slot_count": 32
+            }
+          },
+          "streaming_before": {
+            "cache": {
+              "bytes_read": 221849321472,
+              "evictions": 2,
+              "expert_hits": 14796,
+              "expert_misses": 652596,
+              "expert_requests": 667392,
+              "hit_rate": 0.02216987917146145,
+              "persistent_loads": 6051,
+              "route_calls": 3081,
+              "transient_loads": 14845
+            },
+            "live_kv_tokens": 1152,
+            "live_kv_tokens_peak": 1152,
+            "manifest_sha256": "8263670ddb775ccfccb51cb266fe5ddc3ce706114fc9c26b40ec36df54c367b4",
+            "memory_cap": {
+              "applied": true,
+              "limit": 106300440576
+            },
+            "memory_plan": {
+              "allocated_bytes": 123290840320,
+              "fixed_bytes": 45288975616,
+              "persistent_cache_bytes": 78001864704,
+              "slots_per_layer": 93,
+              "total_limit_bytes": 123480309760,
+              "transient_slots": 32,
+              "unallocated_bytes": 189469440
+            },
+            "mlx_memory": {
+              "active_memory_bytes": 83715173640,
+              "cache_memory_bytes": 2094210474,
+              "peak_memory_bytes": 84447687968
+            },
+            "model_key": "hy3-q4",
+            "slots": {
+              "allocated_bytes": 78341603328,
+              "buffer_backend": "mlx-metal-direct-slots",
+              "io": {
+                "cancellations": 0,
+                "deadline_errors": 0,
+                "integrity_errors": 0,
+                "io_errors": 0,
+                "open_files_peak": 1,
+                "read_bytes": 221849321472,
+                "read_mib_per_second": 825.8660279060758,
+                "read_ns": 256181986970,
+                "read_operations": 20896,
+                "record_requests": 20896,
+                "requested_bytes": 221849321472,
+                "short_reads": 0,
+                "sidecar_record_requests": 20896,
+                "source_record_requests": 0
+              },
+              "max_inflight_io_bytes": 339738624,
+              "metrics": {
+                "active_routes": 0,
+                "active_routes_peak": 1,
+                "deduplicated_loads": 0,
+                "ensure_calls": 3081,
+                "generation_replacements": 14815,
+                "load_failures": 0,
+                "load_requests": 20896,
+                "load_waits": 0,
+                "owned_loads": 20896,
+                "pin_waits": 0,
+                "ready_hits": 0
+              },
+              "persistent_slot_count": 7347,
+              "pins": 0,
+              "states": {
+                "closed": 0,
+                "empty": 1298,
+                "failed": 0,
+                "loading": 0,
+                "ready": 6081
+              },
+              "transient_slot_count": 32
+            }
+          },
+          "to_completion_token": 65
+        },
+        {
+          "decode_tokens": 32,
+          "decode_tokens_per_second": 1.2224998032637808,
+          "elapsed_seconds": 26.17587333312258,
+          "from_completion_token": 65,
+          "streaming_after": {
+            "cache": {
+              "bytes_read": 290094317568,
+              "evictions": 2140,
+              "expert_hits": 48816,
+              "expert_misses": 659024,
+              "expert_requests": 707840,
+              "hit_rate": 0.06896473779385172,
+              "persistent_loads": 9487,
+              "route_calls": 8137,
+              "transient_loads": 17837
+            },
+            "live_kv_tokens": 1152,
+            "live_kv_tokens_peak": 1152,
+            "manifest_sha256": "8263670ddb775ccfccb51cb266fe5ddc3ce706114fc9c26b40ec36df54c367b4",
+            "memory_cap": {
+              "applied": true,
+              "limit": 106300440576
+            },
+            "memory_plan": {
+              "allocated_bytes": 123290840320,
+              "fixed_bytes": 45288975616,
+              "persistent_cache_bytes": 78001864704,
+              "slots_per_layer": 93,
+              "total_limit_bytes": 123480309760,
+              "transient_slots": 32,
+              "unallocated_bytes": 189469440
+            },
+            "mlx_memory": {
+              "active_memory_bytes": 83715173640,
+              "cache_memory_bytes": 2094217642,
+              "peak_memory_bytes": 84447687968
+            },
+            "model_key": "hy3-q4",
+            "slots": {
+              "allocated_bytes": 78341603328,
+              "buffer_backend": "mlx-metal-direct-slots",
+              "io": {
+                "cancellations": 0,
+                "deadline_errors": 0,
+                "integrity_errors": 0,
+                "io_errors": 0,
+                "open_files_peak": 1,
+                "read_bytes": 290094317568,
+                "read_mib_per_second": 1003.992166289584,
+                "read_ns": 275555436874,
+                "read_operations": 27324,
+                "record_requests": 27324,
+                "requested_bytes": 290094317568,
+                "short_reads": 0,
+                "sidecar_record_requests": 27324,
+                "source_record_requests": 0
+              },
+              "max_inflight_io_bytes": 339738624,
+              "metrics": {
+                "active_routes": 0,
+                "active_routes_peak": 1,
+                "deduplicated_loads": 0,
+                "ensure_calls": 8137,
+                "generation_replacements": 19945,
+                "load_failures": 0,
+                "load_requests": 27324,
+                "load_waits": 0,
+                "owned_loads": 27324,
+                "pin_waits": 0,
+                "ready_hits": 0
+              },
+              "persistent_slot_count": 7347,
+              "pins": 0,
+              "states": {
+                "closed": 0,
+                "empty": 0,
+                "failed": 0,
+                "loading": 0,
+                "ready": 7379
+              },
+              "transient_slot_count": 32
+            }
+          },
+          "streaming_before": {
+            "cache": {
+              "bytes_read": 255674548224,
+              "evictions": 570,
+              "expert_hits": 31834,
+              "expert_misses": 655782,
+              "expert_requests": 687616,
+              "hit_rate": 0.046296188570364855,
+              "persistent_loads": 7846,
+              "route_calls": 5609,
+              "transient_loads": 16236
+            },
+            "live_kv_tokens": 1152,
+            "live_kv_tokens_peak": 1152,
+            "manifest_sha256": "8263670ddb775ccfccb51cb266fe5ddc3ce706114fc9c26b40ec36df54c367b4",
+            "memory_cap": {
+              "applied": true,
+              "limit": 106300440576
+            },
+            "memory_plan": {
+              "allocated_bytes": 123290840320,
+              "fixed_bytes": 45288975616,
+              "persistent_cache_bytes": 78001864704,
+              "slots_per_layer": 93,
+              "total_limit_bytes": 123480309760,
+              "transient_slots": 32,
+              "unallocated_bytes": 189469440
+            },
+            "mlx_memory": {
+              "active_memory_bytes": 83715173640,
+              "cache_memory_bytes": 2094217642,
+              "peak_memory_bytes": 84447687968
+            },
+            "model_key": "hy3-q4",
+            "slots": {
+              "allocated_bytes": 78341603328,
+              "buffer_backend": "mlx-metal-direct-slots",
+              "io": {
+                "cancellations": 0,
+                "deadline_errors": 0,
+                "integrity_errors": 0,
+                "io_errors": 0,
+                "open_files_peak": 1,
+                "read_bytes": 255674548224,
+                "read_mib_per_second": 915.7886263333169,
+                "read_ns": 266251668768,
+                "read_operations": 24082,
+                "record_requests": 24082,
+                "requested_bytes": 255674548224,
+                "short_reads": 0,
+                "sidecar_record_requests": 24082,
+                "source_record_requests": 0
+              },
+              "max_inflight_io_bytes": 339738624,
+              "metrics": {
+                "active_routes": 0,
+                "active_routes_peak": 1,
+                "deduplicated_loads": 0,
+                "ensure_calls": 5609,
+                "generation_replacements": 16774,
+                "load_failures": 0,
+                "load_requests": 24082,
+                "load_waits": 0,
+                "owned_loads": 24082,
+                "pin_waits": 0,
+                "ready_hits": 0
+              },
+              "persistent_slot_count": 7347,
+              "pins": 0,
+              "states": {
+                "closed": 0,
+                "empty": 71,
+                "failed": 0,
+                "loading": 0,
+                "ready": 7308
+              },
+              "transient_slot_count": 32
+            }
+          },
+          "to_completion_token": 97
+        },
+        {
+          "decode_tokens": 31,
+          "decode_tokens_per_second": 1.2044832829705236,
+          "elapsed_seconds": 25.73717745882459,
+          "from_completion_token": 97,
+          "streaming_after": {
+            "cache": {
+              "bytes_read": 323420553216,
+              "evictions": 3704,
+              "expert_hits": 65269,
+              "expert_misses": 662163,
+              "expert_requests": 727432,
+              "hit_rate": 0.08972522517568653,
+              "persistent_loads": 11051,
+              "route_calls": 10586,
+              "transient_loads": 19412
+            },
+            "live_kv_tokens": 0,
+            "live_kv_tokens_peak": 1152,
+            "manifest_sha256": "8263670ddb775ccfccb51cb266fe5ddc3ce706114fc9c26b40ec36df54c367b4",
+            "memory_cap": {
+              "applied": true,
+              "limit": 106300440576
+            },
+            "memory_plan": {
+              "allocated_bytes": 123290840320,
+              "fixed_bytes": 45288975616,
+              "persistent_cache_bytes": 78001864704,
+              "slots_per_layer": 93,
+              "total_limit_bytes": 123480309760,
+              "transient_slots": 32,
+              "unallocated_bytes": 189469440
+            },
+            "mlx_memory": {
+              "active_memory_bytes": 83295251720,
+              "cache_memory_bytes": 2514139562,
+              "peak_memory_bytes": 84447687968
+            },
+            "model_key": "hy3-q4",
+            "slots": {
+              "allocated_bytes": 78341603328,
+              "buffer_backend": "mlx-metal-direct-slots",
+              "io": {
+                "cancellations": 0,
+                "deadline_errors": 0,
+                "integrity_errors": 0,
+                "io_errors": 0,
+                "open_files_peak": 1,
+                "read_bytes": 323420553216,
+                "read_mib_per_second": 1083.3883215549415,
+                "read_ns": 284697433841,
+                "read_operations": 30463,
+                "record_requests": 30463,
+                "requested_bytes": 323420553216,
+                "short_reads": 0,
+                "sidecar_record_requests": 30463,
+                "source_record_requests": 0
+              },
+              "max_inflight_io_bytes": 339738624,
+              "metrics": {
+                "active_routes": 0,
+                "active_routes_peak": 1,
+                "deduplicated_loads": 0,
+                "ensure_calls": 10586,
+                "generation_replacements": 23084,
+                "load_failures": 0,
+                "load_requests": 30463,
+                "load_waits": 0,
+                "owned_loads": 30463,
+                "pin_waits": 0,
+                "ready_hits": 0
+              },
+              "persistent_slot_count": 7347,
+              "pins": 0,
+              "states": {
+                "closed": 0,
+                "empty": 0,
+                "failed": 0,
+                "loading": 0,
+                "ready": 7379
+              },
+              "transient_slot_count": 32
+            }
+          },
+          "streaming_before": {
+            "cache": {
+              "bytes_read": 290094317568,
+              "evictions": 2140,
+              "expert_hits": 48816,
+              "expert_misses": 659024,
+              "expert_requests": 707840,
+              "hit_rate": 0.06896473779385172,
+              "persistent_loads": 9487,
+              "route_calls": 8137,
+              "transient_loads": 17837
+            },
+            "live_kv_tokens": 1152,
+            "live_kv_tokens_peak": 1152,
+            "manifest_sha256": "8263670ddb775ccfccb51cb266fe5ddc3ce706114fc9c26b40ec36df54c367b4",
+            "memory_cap": {
+              "applied": true,
+              "limit": 106300440576
+            },
+            "memory_plan": {
+              "allocated_bytes": 123290840320,
+              "fixed_bytes": 45288975616,
+              "persistent_cache_bytes": 78001864704,
+              "slots_per_layer": 93,
+              "total_limit_bytes": 123480309760,
+              "transient_slots": 32,
+              "unallocated_bytes": 189469440
+            },
+            "mlx_memory": {
+              "active_memory_bytes": 83715173640,
+              "cache_memory_bytes": 2094217642,
+              "peak_memory_bytes": 84447687968
+            },
+            "model_key": "hy3-q4",
+            "slots": {
+              "allocated_bytes": 78341603328,
+              "buffer_backend": "mlx-metal-direct-slots",
+              "io": {
+                "cancellations": 0,
+                "deadline_errors": 0,
+                "integrity_errors": 0,
+                "io_errors": 0,
+                "open_files_peak": 1,
+                "read_bytes": 290094317568,
+                "read_mib_per_second": 1003.992166289584,
+                "read_ns": 275555436874,
+                "read_operations": 27324,
+                "record_requests": 27324,
+                "requested_bytes": 290094317568,
+                "short_reads": 0,
+                "sidecar_record_requests": 27324,
+                "source_record_requests": 0
+              },
+              "max_inflight_io_bytes": 339738624,
+              "metrics": {
+                "active_routes": 0,
+                "active_routes_peak": 1,
+                "deduplicated_loads": 0,
+                "ensure_calls": 8137,
+                "generation_replacements": 19945,
+                "load_failures": 0,
+                "load_requests": 27324,
+                "load_waits": 0,
+                "owned_loads": 27324,
+                "pin_waits": 0,
+                "ready_hits": 0
+              },
+              "persistent_slot_count": 7347,
+              "pins": 0,
+              "states": {
+                "closed": 0,
+                "empty": 0,
+                "failed": 0,
+                "loading": 0,
+                "ready": 7379
+              },
+              "transient_slot_count": 32
+            }
+          },
+          "to_completion_token": 128
+        }
+      ],
+      "streaming_after": {
+        "cache": {
+          "bytes_read": 323420553216,
+          "evictions": 3704,
+          "expert_hits": 65269,
+          "expert_misses": 662163,
+          "expert_requests": 727432,
+          "hit_rate": 0.08972522517568653,
+          "persistent_loads": 11051,
+          "route_calls": 10586,
+          "transient_loads": 19412
+        },
+        "live_kv_tokens": 0,
+        "live_kv_tokens_peak": 1152,
+        "manifest_sha256": "8263670ddb775ccfccb51cb266fe5ddc3ce706114fc9c26b40ec36df54c367b4",
+        "memory_cap": {
+          "applied": true,
+          "limit": 106300440576
+        },
+        "memory_plan": {
+          "allocated_bytes": 123290840320,
+          "fixed_bytes": 45288975616,
+          "persistent_cache_bytes": 78001864704,
+          "slots_per_layer": 93,
+          "total_limit_bytes": 123480309760,
+          "transient_slots": 32,
+          "unallocated_bytes": 189469440
+        },
+        "mlx_memory": {
+          "active_memory_bytes": 83295251720,
+          "cache_memory_bytes": 2514139562,
+          "peak_memory_bytes": 84447687968
+        },
+        "model_key": "hy3-q4",
+        "slots": {
+          "allocated_bytes": 78341603328,
+          "buffer_backend": "mlx-metal-direct-slots",
+          "io": {
+            "cancellations": 0,
+            "deadline_errors": 0,
+            "integrity_errors": 0,
+            "io_errors": 0,
+            "open_files_peak": 1,
+            "read_bytes": 323420553216,
+            "read_mib_per_second": 1083.3883215549415,
+            "read_ns": 284697433841,
+            "read_operations": 30463,
+            "record_requests": 30463,
+            "requested_bytes": 323420553216,
+            "short_reads": 0,
+            "sidecar_record_requests": 30463,
+            "source_record_requests": 0
+          },
+          "max_inflight_io_bytes": 339738624,
+          "metrics": {
+            "active_routes": 0,
+            "active_routes_peak": 1,
+            "deduplicated_loads": 0,
+            "ensure_calls": 10586,
+            "generation_replacements": 23084,
+            "load_failures": 0,
+            "load_requests": 30463,
+            "load_waits": 0,
+            "owned_loads": 30463,
+            "pin_waits": 0,
+            "ready_hits": 0
+          },
+          "persistent_slot_count": 7347,
+          "pins": 0,
+          "states": {
+            "closed": 0,
+            "empty": 0,
+            "failed": 0,
+            "loading": 0,
+            "ready": 7379
+          },
+          "transient_slot_count": 32
+        }
+      },
+      "streaming_before": {
+        "cache": {
+          "bytes_read": 0,
+          "evictions": 0,
+          "expert_hits": 0,
+          "expert_misses": 0,
+          "expert_requests": 0,
+          "hit_rate": 0.0,
+          "persistent_loads": 0,
+          "route_calls": 0,
+          "transient_loads": 0
+        },
+        "live_kv_tokens": 0,
+        "live_kv_tokens_peak": 0,
+        "manifest_sha256": "8263670ddb775ccfccb51cb266fe5ddc3ce706114fc9c26b40ec36df54c367b4",
+        "memory_cap": {
+          "applied": true,
+          "limit": 106300440576
+        },
+        "memory_plan": {
+          "allocated_bytes": 123290840320,
+          "fixed_bytes": 45288975616,
+          "persistent_cache_bytes": 78001864704,
+          "slots_per_layer": 93,
+          "total_limit_bytes": 123480309760,
+          "transient_slots": 32,
+          "unallocated_bytes": 189469440
+        },
+        "mlx_memory": {
+          "active_memory_bytes": 83295251720,
+          "cache_memory_bytes": 11890,
+          "peak_memory_bytes": 83295251720
+        },
+        "model_key": "hy3-q4",
+        "slots": {
+          "allocated_bytes": 78341603328,
+          "buffer_backend": "mlx-metal-direct-slots",
+          "io": {
+            "cancellations": 0,
+            "deadline_errors": 0,
+            "integrity_errors": 0,
+            "io_errors": 0,
+            "open_files_peak": 0,
+            "read_bytes": 0,
+            "read_mib_per_second": 0.0,
+            "read_ns": 0,
+            "read_operations": 0,
+            "record_requests": 0,
+            "requested_bytes": 0,
+            "short_reads": 0,
+            "sidecar_record_requests": 0,
+            "source_record_requests": 0
+          },
+          "max_inflight_io_bytes": 339738624,
+          "metrics": {
+            "active_routes": 0,
+            "active_routes_peak": 0,
+            "deduplicated_loads": 0,
+            "ensure_calls": 0,
+            "generation_replacements": 0,
+            "load_failures": 0,
+            "load_requests": 0,
+            "load_waits": 0,
+            "owned_loads": 0,
+            "pin_waits": 0,
+            "ready_hits": 0
+          },
+          "persistent_slot_count": 7347,
+          "pins": 0,
+          "states": {
+            "closed": 0,
+            "empty": 7379,
+            "failed": 0,
+            "loading": 0,
+            "ready": 0
+          },
+          "transient_slot_count": 32
+        }
+      },
+      "text": "```python\nfrom __future__ import annotations\n\nimport argparse\nimport dataclasses\nimport hashlib\nimport json\nimport os\nimport statistics\nimport tempfile\nimport time\nfrom pathlib import Path\nfrom typing import Any, Iterator, Optional\n\n# 1. prompt schema dataclasses and JSONL loader\n\n@dataclasses.dataclass\nclass PromptRecord:\n    prompt_id: str\n    text: str\n    max_tokens: int\n    metadata: dict[str, Any] = dataclasses.field(default_factory=dict)\n\n    @classmethod\n    def from_dict(cls, d: dict[str",
+      "token_ids": [
+        1438,
+        6515,
+        185,
+        4140,
+        4277,
+        58035,
+        667,
+        1661,
+        39839,
+        286,
+        1655,
+        55814,
+        185,
+        1655,
+        3107,
+        32588,
+        20076,
+        185,
+        1655,
+        11996,
+        8563,
+        185,
+        1655,
+        11535,
+        185,
+        1655,
+        6726,
+        185,
+        1655,
+        13153,
+        185,
+        1655,
+        12363,
+        4725,
+        185,
+        1655,
+        1127,
+        185,
+        4140,
+        3043,
+        8563,
+        1661,
+        15478,
+        185,
+        4140,
+        25274,
+        1661,
+        9849,
+        11,
+        62255,
+        11,
+        24708,
+        286,
+        2,
+        206,
+        16,
+        13,
+        12059,
+        19106,
+        3107,
+        32588,
+        20076,
+        289,
+        9355,
+        43,
+        42279,
+        286,
+        31,
+        21013,
+        32588,
+        20076,
+        27215,
+        103071,
+        185,
+        2732,
+        69669,
+        17500,
+        25,
+        185,
+        300,
+        12059,
+        3692,
+        25,
+        2002,
+        185,
+        300,
+        2602,
+        25,
+        2002,
+        185,
+        300,
+        3340,
+        91024,
+        25,
+        694,
+        185,
+        300,
+        18125,
+        25,
+        13520,
+        33831,
+        11,
+        9849,
+        60,
+        324,
+        3107,
+        32588,
+        20076,
+        49323,
+        59729,
+        72809,
+        28,
+        17010,
+        1362,
+        300,
+        1823,
+        71405,
+        185,
+        300,
+        1120,
+        562,
+        15406,
+        52942,
+        11,
+        278,
+        25,
+        13520,
+        33831
+      ]
+    }
+  ],
+  "schema": "mtplx-streamed-generation-benchmark-v1",
+  "seed": 0
+}
