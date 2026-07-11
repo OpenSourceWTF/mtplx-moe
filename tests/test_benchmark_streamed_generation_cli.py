@@ -89,3 +89,16 @@ def test_enable_mtp_requires_artifacts_and_hy3(capsys) -> None:
     with pytest.raises(SystemExit):
         module.validate_mtp_flags(parser, args)
     assert "--enable-mtp" in capsys.readouterr().err
+
+
+def test_mtp_rejects_concurrency(capsys) -> None:
+    import pytest
+
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args([*_BASE_ARGS, "--model-key", "hy3-q4",
+                              "--enable-mtp", "--mtp-artifacts", "/artifacts",
+                              "--concurrency", "4"])
+    with pytest.raises(SystemExit):
+        module.validate_mtp_flags(parser, args)
+    assert "single-stream" in capsys.readouterr().err

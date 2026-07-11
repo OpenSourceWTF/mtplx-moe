@@ -200,6 +200,24 @@ work even after launch overhead is removed.
 This is the most direct way to use more of the M5 Max without pretending that a
 single autoregressive sequence contains unlimited parallelism.
 
+Status: the streamed-AR continuous-batch runner is implemented
+(`mtplx/streamed_batch.py`) with continuous admission at decode step
+boundaries, per-stream KV reservations through `admit_kv_tokens` (fail-closed,
+released at stream end), bounded joining prefills next to active decoders, and
+one `[B, 1, H]` forward per decode step so each sparse layer routes the
+cross-stream expert union through the existing wave/split-route machinery.
+Fixture tests pin B=1 byte-identity with `generate_ar`, per-sequence
+output/KV isolation, single-load-per-step for a record selected by every
+stream, and prefill service that cannot evict decode-hot persistent experts.
+`scripts/benchmark_streamed_generation.py --concurrency N` implements the
+saturation lane and reports aggregate and per-stream tok/s. Batch size is part
+of the run configuration label: `B > 1` outputs legitimately differ from
+`B = 1` runs of the same prompt (batched kernels see different shapes), so
+results are compared only at equal batch sizes. The measured batch-1/2/4/8
+saturation runs on the pinned artifacts are still to be taken; joining-prefill
+work is bounded per step boundary but not yet chunked, and the runner is
+scoped to the Hy3-style pre-norm decoder layout (fails closed otherwise).
+
 ## Stage 6 — long-context KV and attention
 
 1. Validate paged attention for both streamed overlays.
