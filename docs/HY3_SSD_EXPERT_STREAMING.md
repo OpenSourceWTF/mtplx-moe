@@ -253,3 +253,24 @@ gates under the same cache budget.
 - AR tokens/s and MTP tokens/s with identical quality gates.
 - Memory pressure, thermals, and SSD writes. Expert streaming should be
   read-only; large write counts indicate a packaging/cache bug.
+
+## Concurrent streams (Stage 5 batching)
+
+`mtplx/streamed_batch.py` decodes several AR streams together: each decode
+step evaluates every live stream as one `[B, 1, H]` forward, so a sparse
+layer routes the union of the experts selected across streams and a record
+selected by several streams in the same step is planned, read, and hashed
+once. Streams keep structurally separate per-sequence KV caches (their own
+offsets, no left-padding); a joining stream prefills at a decode step
+boundary through the single-stream prefill path, which keeps its misses in
+transient slots and cannot evict a decode-hot persistent expert. Each stream
+reserves its full `prompt + max_tokens` KV budget through `admit_kv_tokens`
+before any forward runs and releases it the moment it finishes.
+
+Batch size is part of the run configuration label. With one live stream the
+runner is byte-identical to `generate_ar`; with two or more, the batched
+kernels see different shapes, so `B > 1` outputs legitimately differ from
+`B = 1` runs of the same prompt and results are only comparable at equal
+batch sizes. The benchmark harness exposes this lane as
+`scripts/benchmark_streamed_generation.py --concurrency N`, reporting both
+aggregate and per-stream tok/s.
