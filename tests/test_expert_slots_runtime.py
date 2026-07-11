@@ -449,3 +449,72 @@ def test_prefill_seeds_only_empty_persistent_slots_by_frequency() -> None:
     assert third.loads[0].persistent is False
     assert third.evictions == ()
     assert set(bank.resident_experts) == {2, 3}
+
+
+def test_reader_reports_unverified_digest_when_hashing_disabled(
+    tmp_path: Path,
+) -> None:
+    root, _spec_value, manifest, expected = _artifact(tmp_path)
+    destination = bytearray(manifest.records[0].logical_bytes)
+    with PositionalExpertReader(root, use_native=False) as reader:
+        digest = reader.read_record_into(
+            manifest,
+            manifest.records[0],
+            destination,
+            verify_hash=False,
+        )
+    assert digest == "unverified"
+    assert bytes(destination) == expected[manifest.records[0].expert]
+
+
+def test_config_rejects_unsafe_trust_combinations() -> None:
+    spec = _spec()
+    base = dict(
+        model_key=spec.key,
+        memory_limit_bytes=1 << 30,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+    )
+    with pytest.raises(ValueError, match="requires prefer_sidecar"):
+        ExpertStreamingConfig(
+            **base,
+            verify_sidecar_hash_at_open=True,
+            prefer_sidecar=False,
+        )
+    with pytest.raises(ValueError, match="requires verify_sidecar_hash_at_open"):
+        ExpertStreamingConfig(**base, slot_layout="metal-mmap")
+
+
+def test_begin_split_route_rolls_back_when_executor_rejects(
+    tmp_path: Path,
+) -> None:
+    root, spec, manifest, expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=plan.total_limit_bytes,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        verify_artifact_headers=False,
+    )
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        config,
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    try:
+        runtime._split_executor.shutdown(wait=True, cancel_futures=True)
+        with pytest.raises(RuntimeError):
+            runtime.begin_split_route(1, [0], phase="decode")
+        # Without rollback the bank would keep mapping expert 0 to a
+        # never-loaded slot, wedging every later route on this layer.
+        assert runtime._banks[1].occupancy == 0
+        ready = runtime.ensure_route(1, [0], phase="decode")
+        assert bytes(ready.bindings[0].buffer) == expected[0]
+        ready.release(synchronize=False)
+    finally:
+        runtime.close()
