@@ -16,6 +16,7 @@ from mlx_lm.models.base import (
 )
 from mlx_lm.models.cache import KVCache
 from mlx_lm.models.rope_utils import initialize_rope
+from mlx_lm.models.switch_layers import SwitchGLU
 
 from .expert_mlx import UnboundExpertSwitch
 
@@ -216,12 +217,19 @@ class SparseMLP(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, args: ModelArgs, layer_index: int):
+    def __init__(
+        self,
+        args: ModelArgs,
+        layer_index: int,
+        *,
+        mlp_type: str | None = None,
+    ):
         super().__init__()
         self.self_attn = Attention(args)
+        resolved_mlp_type = mlp_type or args.mlp_layer_types[layer_index]
         self.mlp = (
             SparseMLP(args, layer_index)
-            if args.mlp_layer_types[layer_index] == "sparse"
+            if resolved_mlp_type == "sparse"
             else MLP(args)
         )
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
@@ -238,6 +246,80 @@ class DecoderLayer(nn.Module):
     ) -> mx.array:
         hidden = x + self.self_attn(self.input_layernorm(x), mask, cache)
         return hidden + self.mlp(self.post_attention_layernorm(hidden))
+
+
+class Hy3MTPLayer(nn.Module):
+    """Hy3 layer-80 NextN head with a fully resident routed-expert bank.
+
+    Standard NextN structure: the shifted token's embedding and the trunk's
+    hidden state are normalized (enorm/hnorm), concatenated, and projected by
+    ``eh_proj`` into one transformer block whose MoE routes over the head's
+    own experts.  Unlike trunk layers 1-79, those experts are ordinary
+    resident weights (a stacked ``SwitchGLU``), not streamed slots: the whole
+    layer-80 Q4 bank is ~1.94 GiB and every draft touches it, so streaming
+    would only add SSD traffic to the speculative path.  The embedding table
+    and ``lm_head`` are shared with the trunk and passed in at call time; the
+    head applies its own checkpoint ``final_layernorm`` before the shared
+    head.
+    """
+
+    def __init__(self, args: ModelArgs, layer_index: int):
+        super().__init__()
+        self.enorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.hnorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.eh_proj = nn.Linear(
+            2 * args.hidden_size,
+            args.hidden_size,
+            bias=False,
+        )
+        self.mtp_block = DecoderLayer(args, layer_index, mlp_type="sparse")
+        self.mtp_block.mlp.switch_mlp = SwitchGLU(
+            args.hidden_size,
+            args.moe_intermediate_size,
+            args.num_experts,
+            bias=args.mlp_bias,
+        )
+        self.final_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self._lm_head_fp32 = bool(args.enable_lm_head_fp32)
+
+    def __call__(
+        self,
+        input_ids: mx.array,
+        previous_hidden_states: mx.array,
+        *,
+        embed_tokens: Any,
+        lm_head: Any,
+        cache: Optional[Any] = None,
+    ) -> tuple[mx.array, mx.array]:
+        inputs_embeds = embed_tokens(input_ids)
+        mixed = self.eh_proj(
+            mx.concatenate(
+                [self.enorm(inputs_embeds), self.hnorm(previous_hidden_states)],
+                axis=-1,
+            )
+        )
+        mask = create_attention_mask(mixed, cache, return_array=True)
+        hidden = self.mtp_block(mixed, mask, cache)
+        normalized = self.final_layernorm(hidden)
+        if self._lm_head_fp32:
+            normalized = normalized.astype(mx.float32)
+        return lm_head(normalized), hidden
+
+
+class Hy3MTP(nn.Module):
+    """Container for Hy3 NextN heads, mirroring other mtplx MTP modules."""
+
+    def __init__(self, args: ModelArgs, num_mtp_layers: int = 1):
+        super().__init__()
+        if num_mtp_layers < 1:
+            raise ValueError("Hy3 MTP requires at least one NextN layer")
+        start_layer = args.num_hidden_layers
+        self.layers = [
+            Hy3MTPLayer(args, start_layer + index)
+            for index in range(num_mtp_layers)
+        ]
+        self.start_layer = start_layer
+        self.num_mtp_layers = num_mtp_layers
 
 
 class Hy3Model(nn.Module):
