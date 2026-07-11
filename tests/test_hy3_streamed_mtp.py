@@ -385,9 +385,15 @@ def test_load_rejects_mtp_artifacts_without_streaming(tmp_path: Path) -> None:
         load(root, mtp=True, mtp_artifacts=tmp_path)
 
 
-def test_return_hidden_defaults_to_pre_norm_for_the_nextn_head(tmp_path: Path) -> None:
-    """Regression for the 20.8%-acceptance gate: the head's hnorm must consume
-    the trunk's RAW last-layer hidden, not the lm_head's final-norm output."""
+def test_return_hidden_defaults_to_post_norm_for_the_nextn_head(tmp_path: Path) -> None:
+    """The head's hnorm consumes the POST-norm trunk hidden by default.
+
+    Gate v1/v2 measured acceptance 0.208 with post_norm vs 0.148 with
+    pre_norm, so the default matches deepseek_mtp_patch.py (which hands the
+    NextN head the trunk's normed hidden) and the mtp_patch.py contract
+    default (hidden_variant="post_norm").  pre_norm stays selectable for
+    A/B probing.
+    """
     root, config, spec, manifest_path = _integrated_streamed_hy3(tmp_path)
     mtp_dir = tmp_path / "mtp"
     mtp_dir.mkdir()
@@ -408,7 +414,7 @@ def test_return_hidden_defaults_to_pre_norm_for_the_nextn_head(tmp_path: Path) -
         _logits3, hidden_post = model(prompt, return_hidden=True, hidden_variant="post_norm")
         mx.eval(post_ref, pre_ref, hidden_default, hidden_pre, hidden_post)
 
-        assert mx.array_equal(hidden_default, pre_ref).item()
+        assert mx.array_equal(hidden_default, post_ref).item()
         assert mx.array_equal(hidden_pre, pre_ref).item()
         assert mx.array_equal(hidden_post, post_ref).item()
         assert not mx.array_equal(pre_ref, post_ref).item()

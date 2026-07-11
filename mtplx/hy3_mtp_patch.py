@@ -361,10 +361,11 @@ def inject_hy3_streamed_mtp_support(
             logits = self.lm_head(head_input)
             if not return_hidden:
                 return logits
-            # NextN reference semantics: the head's hnorm consumes the RAW
-            # last-layer hidden. post_norm is kept only for A/B probing of
-            # the acceptance regression measured at 20.8%.
-            hidden = post_norm if hidden_variant == "post_norm" else pre_norm
+            # Gate v1/v2 measured the head prefers the POST-norm trunk
+            # hidden (acceptance 0.208 post vs 0.148 pre), matching
+            # deepseek_mtp_patch.py and the mtp_patch.py contract default.
+            # pre_norm stays selectable for A/B probing.
+            hidden = pre_norm if hidden_variant == "pre_norm" else post_norm
             return logits, hidden
 
         def mtp_forward(
