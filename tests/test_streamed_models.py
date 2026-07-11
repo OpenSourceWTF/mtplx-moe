@@ -12,11 +12,19 @@ from mlx.utils import tree_flatten
 from mlx_lm.models.activations import swiglu
 from mlx_lm.models.deepseek_v32 import group_expert_select
 
-from mtplx.expert_manifest import build_expert_manifest, save_expert_manifest
+from mtplx.expert_manifest import (
+    build_expert_manifest,
+    load_expert_manifest,
+    save_expert_manifest,
+)
 from mtplx.expert_runtime import ExpertStreamingConfig, ExpertStreamingRuntime
 from mtplx.expert_slots import ExpertSlotBinding
 from mtplx.expert_streaming_models import ExpertStreamingModelSpec
-from mtplx.models.expert_mlx import _run_q4_expert, make_mlx_slot_buffer_allocator
+from mtplx.models.expert_mlx import (
+    _run_q4_expert,
+    make_mlx_component_bank_allocator,
+    make_mlx_slot_buffer_allocator,
+)
 from mtplx.models.glm52_mlx import FP32MoEGate
 from mtplx.models.glm52_mlx import Model as GlmModel
 from mtplx.models.glm52_mlx import ModelArgs as GlmArgs
@@ -104,6 +112,60 @@ def test_hy3_router_uses_unbiased_scores_for_weights() -> None:
     assert indices.item() == 1
     # Correction bias selects expert 1 but is not part of its returned weight.
     assert weights.item() == pytest.approx(2.0)
+
+
+def test_hy3_non_fp32_combine_casts_routing_weights_to_activation_dtype() -> None:
+    model = Hy3Model(_hy3_args())
+    sparse_mlp = model.model.layers[1].mlp
+    routed_values = [
+        4.336133731530333,
+        -3.7478681657261284,
+        2.5238181218276177,
+        4.55797767056557,
+        -0.09106507450222434,
+        -4.222918128185795,
+        0.24504878855251455,
+        3.055661890955095,
+    ]
+    routing_weights = [
+        1.9165060684424067,
+        0.1014428979156421,
+        1.6294923886421544,
+        1.2853930759868095,
+        1.2728115717622752,
+        0.5407021513938952,
+        1.755765528776848,
+        1.2906728107893897,
+    ]
+
+    class StubRouter:
+        def __call__(self, _x):
+            return (
+                mx.zeros((1, 1, 8), dtype=mx.int32),
+                mx.array([[routing_weights]], dtype=mx.float32),
+            )
+
+    class StubSwitch:
+        def __call__(self, _x, _indices):
+            rows = [[value] + [0.0] * 63 for value in routed_values]
+            return mx.array([[rows]], dtype=mx.bfloat16)
+
+    class StubShared:
+        def __call__(self, x):
+            return mx.zeros_like(x)
+
+    sparse_mlp.router = StubRouter()
+    sparse_mlp.switch_mlp = StubSwitch()
+    sparse_mlp.shared_mlp = StubShared()
+    hidden = mx.zeros((1, 1, 64), dtype=mx.bfloat16)
+
+    output = sparse_mlp(hidden)
+    mx.eval(output)
+
+    # The pinned reference rounds routing weights to BF16 before the multiply.
+    # Leaving them in FP32 produces 19.875 for this fixture instead of 20.0.
+    assert output.dtype == mx.bfloat16
+    assert output[0, 0, 0].item() == 20.0
 
 
 def test_glm_router_fp32_projection_changes_a_near_tie_route() -> None:
@@ -342,7 +404,6 @@ def test_portable_q4_slot_execution_matches_direct_quantized_matmul() -> None:
     mx.eval(actual, reference)
     assert mx.allclose(actual, reference, atol=1e-5, rtol=1e-5).item()
 
-
 def _integrated_hy3_artifact(tmp_path: Path):
     args = _hy3_args()
     model = Hy3Model(args)
@@ -444,6 +505,46 @@ def test_resident_loader_runs_hy3_without_materializing_routed_parameters(
         assert snapshot["cache"]["expert_requests"] == 1
         assert snapshot["slots"]["pins"] == 0
         assert snapshot["slots"]["buffer_backend"] == "mlx-metal-direct-slots"
+    finally:
+        runtime.close()
+
+
+def test_component_bank_hy3_executes_without_record_or_stack_copies(
+    tmp_path: Path,
+) -> None:
+    root, config, spec, manifest_path = _integrated_hy3_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + spec.persistent_cache_bytes(1),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        slot_layout="component-banks",
+    )
+    plan = stream_config.memory_plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=make_mlx_component_bank_allocator(
+            plan,
+            spec,
+            load_expert_manifest(manifest_path),
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+    try:
+        resident = construct_resident_model(root, runtime, config=config)
+        logits = resident.model(mx.array([[1, 2]], dtype=mx.int32))
+        mx.eval(logits)
+        assert logits.shape == (1, 2, config["vocab_size"])
+        assert mx.all(mx.isfinite(logits)).item()
+        snapshot = runtime.snapshot(mx_module=mx)
+        assert snapshot["slots"]["buffer_backend"] == "mlx-metal-component-banks"
+        assert snapshot["slots"]["pins"] == 0
+        assert snapshot["slots"]["io"]["integrity_errors"] == 0
     finally:
         runtime.close()
 

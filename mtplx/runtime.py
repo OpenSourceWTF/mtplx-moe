@@ -380,16 +380,29 @@ def load(
     if streaming_requested:
         from .expert_runtime import ExpertStreamingConfig, ExpertStreamingRuntime
         from .expert_streaming_models import get_model_spec
-        from .models.expert_mlx import make_mlx_slot_buffer_allocator
+        from .models.expert_mlx import (
+            make_mlx_component_bank_allocator,
+            make_mlx_slot_buffer_allocator,
+        )
         from .resident_loader import construct_resident_model
 
         import mlx.core as mx
 
         streaming_spec = get_model_spec(expert_streaming_config.model_key)
         streaming_plan = expert_streaming_config.memory_plan(streaming_spec)
-        slot_allocator = make_mlx_slot_buffer_allocator(
-            streaming_plan, streaming_spec
-        )
+        if expert_streaming_config.slot_layout == "component-banks":
+            from .expert_manifest import load_expert_manifest
+
+            streaming_manifest = load_expert_manifest(expert_manifest)
+            slot_allocator = make_mlx_component_bank_allocator(
+                streaming_plan,
+                streaming_spec,
+                streaming_manifest,
+            )
+        else:
+            slot_allocator = make_mlx_slot_buffer_allocator(
+                streaming_plan, streaming_spec
+            )
 
         if not isinstance(expert_streaming_config, ExpertStreamingConfig):
             raise TypeError(

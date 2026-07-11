@@ -8,6 +8,7 @@ size a cache before allocating multi-gigabyte Metal buffers.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
 from math import isfinite
@@ -143,6 +144,7 @@ class LayerExpertSlotBank:
         persistent_slots: int,
         transient_slots: int,
         frequency_decay: float = 0.995,
+        cache_policy: str = "frequency",
     ) -> None:
         expert_count = _integer("expert_count", expert_count, minimum=1)
         persistent_slots = _integer("persistent_slots", persistent_slots, minimum=0)
@@ -163,6 +165,9 @@ class LayerExpertSlotBank:
         self.transient_slots = transient_slots
         self.slot_count = persistent_slots + transient_slots
         self.frequency_decay = frequency_decay
+        if cache_policy not in {"frequency", "lru"}:
+            raise ValueError("cache_policy must be 'frequency' or 'lru'")
+        self.cache_policy = cache_policy
 
         # Prefill traffic must neither age nor refresh decode admission state.
         # A separate decode-only epoch keeps a long prompt from erasing the
@@ -171,6 +176,7 @@ class LayerExpertSlotBank:
         self._slot_to_expert: list[int | None] = [None] * self.persistent_slots
         self._expert_to_slot: dict[int, int] = {}
         self._history = [_ExpertHistory() for _ in range(expert_count)]
+        self._prefill_seed_candidates: set[int] = set()
 
     @property
     def resident_experts(self) -> tuple[int, ...]:
@@ -200,6 +206,39 @@ class LayerExpertSlotBank:
         self._slot_to_expert = [None] * self.persistent_slots
         self._expert_to_slot.clear()
         self._history = [_ExpertHistory() for _ in range(self.expert_count)]
+        self._prefill_seed_candidates.clear()
+
+    def prepare_prefill_seed(self, expert_ids: Iterable[int]) -> tuple[int, ...]:
+        """Choose prompt-frequent experts for empty slots without eviction."""
+
+        empty = self.persistent_slots - self.occupancy
+        if empty <= 0:
+            self._prefill_seed_candidates.clear()
+            return ()
+        experts = self._validate_experts_for_seed(expert_ids)
+        counts = Counter(experts)
+        ranked = sorted(counts, key=lambda expert: (-counts[expert], expert))
+        chosen = tuple(
+            expert
+            for expert in ranked
+            if expert not in self._expert_to_slot
+        )[:empty]
+        self._prefill_seed_candidates = set(chosen)
+        return chosen
+
+    def _validate_experts_for_seed(self, expert_ids: Iterable[int]) -> tuple[int, ...]:
+        try:
+            experts = tuple(
+                _integer("expert id", expert, minimum=0) for expert in expert_ids
+            )
+        except TypeError as exc:
+            raise TypeError("expert ids must be exact integers") from exc
+        for expert in experts:
+            if expert >= self.expert_count:
+                raise ValueError(
+                    f"expert id {expert} is outside [0, {self.expert_count})"
+                )
+        return experts
 
     def _validate_experts(self, expert_ids: Iterable[int]) -> tuple[int, ...]:
         try:
@@ -247,7 +286,10 @@ class LayerExpertSlotBank:
             if expert is None or expert in pinned:
                 continue
             history = self._history[expert]
-            candidates.append((self._score(expert), history.last_used, slot))
+            if self.cache_policy == "lru":
+                candidates.append((float(history.last_used), 0, slot))
+            else:
+                candidates.append((self._score(expert), history.last_used, slot))
         return min(candidates)[2] if candidates else None
 
     def _assign_persistent(
@@ -301,7 +343,10 @@ class LayerExpertSlotBank:
 
         for expert in miss_order:
             persistent_slot: int | None = None
-            if phase is RoutingPhase.DECODE and self.persistent_slots:
+            if phase is RoutingPhase.PREFILL and expert in self._prefill_seed_candidates:
+                persistent_slot = self._empty_persistent_slot()
+                self._prefill_seed_candidates.discard(expert)
+            elif phase is RoutingPhase.DECODE and self.persistent_slots:
                 persistent_slot = self._empty_persistent_slot()
                 if persistent_slot is None:
                     victim_slot = self._victim_slot(pinned=pinned)
@@ -312,7 +357,9 @@ class LayerExpertSlotBank:
                         # merely because decay made the resident score < 1.
                         # A second decode observation (or older history) must
                         # first lift the candidate above this admission floor.
-                        if self._score(expert) > max(1.0, self._score(victim)):
+                        if self.cache_policy == "lru" or self._score(expert) > max(
+                            1.0, self._score(victim)
+                        ):
                             persistent_slot = victim_slot
 
             if persistent_slot is None:

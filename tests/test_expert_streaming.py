@@ -66,6 +66,25 @@ def test_frequent_decode_expert_eventually_displaces_a_cold_resident() -> None:
     assert 3 in bank.resident_experts
 
 
+def test_lru_admits_first_miss_and_evicts_least_recent_unpinned_expert() -> None:
+    bank = LayerExpertSlotBank(
+        expert_count=16,
+        persistent_slots=2,
+        transient_slots=1,
+        cache_policy="lru",
+    )
+    bank.plan([1], phase="decode")
+    bank.plan([2], phase="decode")
+    bank.plan([1], phase="decode")
+
+    miss = bank.plan([3], phase="decode")
+
+    assert len(miss.evictions) == 1
+    assert miss.evictions[0].previous_expert == 2
+    assert any(load.persistent for load in miss.loads)
+    assert set(bank.resident_experts) == {1, 3}
+
+
 def test_singleton_decode_miss_does_not_win_only_because_resident_decayed() -> None:
     bank = LayerExpertSlotBank(
         expert_count=16,

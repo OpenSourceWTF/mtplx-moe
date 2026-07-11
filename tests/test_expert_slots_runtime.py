@@ -417,3 +417,35 @@ def test_memory_cap_reconciliation_and_fake_mlx_application() -> None:
 def test_partition_route_waves_rejects_non_integral_ids() -> None:
     with pytest.raises(TypeError, match="exact integers"):
         partition_route_waves([0, 1.5], max_unique_experts=1)
+
+    ordered = partition_route_waves(
+        [3, 1, 2, 3, 0],
+        max_unique_experts=2,
+        sort_unique=True,
+    )
+    assert ordered[0].experts == (1, 0)
+    assert ordered[1].experts == (3, 2, 3)
+
+
+def test_prefill_seeds_only_empty_persistent_slots_by_frequency() -> None:
+    bank = LayerExpertSlotBank(
+        expert_count=6,
+        persistent_slots=2,
+        transient_slots=2,
+    )
+    assert bank.prepare_prefill_seed([3, 3, 2, 1, 3, 2]) == (3, 2)
+
+    first = bank.plan([3, 1], phase="prefill")
+    assert [(load.expert, load.persistent) for load in first.loads] == [
+        (3, True),
+        (1, False),
+    ]
+    second = bank.plan([2], phase="prefill")
+    assert second.loads[0].persistent is True
+    assert set(bank.resident_experts) == {2, 3}
+
+    assert bank.prepare_prefill_seed([4, 4, 4]) == ()
+    third = bank.plan([4], phase="prefill")
+    assert third.loads[0].persistent is False
+    assert third.evictions == ()
+    assert set(bank.resident_experts) == {2, 3}

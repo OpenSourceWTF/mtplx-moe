@@ -55,12 +55,27 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
     )
     group.add_argument("--expert-runtime-reserve", help="Runtime/OS headroom (default 16GiB).")
     group.add_argument("--expert-cache-limit", help="Optional persistent expert-cache cap.")
+    group.add_argument(
+        "--expert-cache-policy",
+        choices=["frequency", "lru"],
+        help="Decode expert-cache replacement policy.",
+    )
     group.add_argument("--expert-transient-slots", type=int)
     group.add_argument("--expert-io-staging", help="Host I/O staging reserve.")
     group.add_argument("--expert-execution-workspace", help="Execution workspace reserve.")
     group.add_argument("--expert-max-inflight-io", help="Bound concurrent expert-read bytes.")
     group.add_argument("--expert-max-open-files", type=int)
     group.add_argument("--expert-read-chunk", help="Maximum positional read chunk.")
+    group.add_argument(
+        "--expert-f-nocache",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Bypass the macOS page cache for expert reads.",
+    )
+    group.add_argument(
+        "--expert-slot-layout",
+        choices=["direct-slots", "component-banks", "metal-mmap"],
+    )
     group.add_argument("--expert-frequency-decay", type=float)
     group.add_argument(
         "--expert-prefer-sidecar",
@@ -74,6 +89,11 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
     )
     group.add_argument(
         "--expert-verify-headers",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    group.add_argument(
+        "--expert-verify-sidecar-at-open",
         action=argparse.BooleanOptionalAction,
         default=None,
     )
@@ -141,16 +161,22 @@ def expert_streaming_load_kwargs(
         "max_live_kv_tokens": getattr(args, "expert_max_live_kv_tokens", None),
         "runtime_reserve_bytes": getattr(args, "expert_runtime_reserve", None),
         "expert_cache_limit_bytes": getattr(args, "expert_cache_limit", None),
+        "cache_policy": getattr(args, "expert_cache_policy", None),
         "transient_slots": getattr(args, "expert_transient_slots", None),
         "io_staging_bytes": getattr(args, "expert_io_staging", None),
         "execution_workspace_bytes": getattr(args, "expert_execution_workspace", None),
         "max_inflight_io_bytes": getattr(args, "expert_max_inflight_io", None),
         "max_open_files": getattr(args, "expert_max_open_files", None),
         "max_read_chunk_bytes": getattr(args, "expert_read_chunk", None),
+        "bypass_page_cache": getattr(args, "expert_f_nocache", None),
+        "slot_layout": getattr(args, "expert_slot_layout", None),
         "frequency_decay": getattr(args, "expert_frequency_decay", None),
         "prefer_sidecar": getattr(args, "expert_prefer_sidecar", None),
         "verify_record_hashes": getattr(args, "expert_verify_record_hashes", None),
         "verify_artifact_headers": getattr(args, "expert_verify_headers", None),
+        "verify_sidecar_hash_at_open": getattr(
+            args, "expert_verify_sidecar_at_open", None
+        ),
     }
     values.update({key: value for key, value in overrides.items() if value is not None})
     if "model_key" not in values:
@@ -200,12 +226,14 @@ def append_expert_streaming_child_args(command: list[str], args: Any) -> None:
         ("expert_max_live_kv_tokens", "--expert-max-live-kv-tokens"),
         ("expert_runtime_reserve", "--expert-runtime-reserve"),
         ("expert_cache_limit", "--expert-cache-limit"),
+        ("expert_cache_policy", "--expert-cache-policy"),
         ("expert_transient_slots", "--expert-transient-slots"),
         ("expert_io_staging", "--expert-io-staging"),
         ("expert_execution_workspace", "--expert-execution-workspace"),
         ("expert_max_inflight_io", "--expert-max-inflight-io"),
         ("expert_max_open_files", "--expert-max-open-files"),
         ("expert_read_chunk", "--expert-read-chunk"),
+        ("expert_slot_layout", "--expert-slot-layout"),
         ("expert_frequency_decay", "--expert-frequency-decay"),
     )
     for attribute, flag in mappings:
@@ -222,6 +250,16 @@ def append_expert_streaming_child_args(command: list[str], args: Any) -> None:
             "--no-expert-verify-record-hashes",
         ),
         ("expert_verify_headers", "--expert-verify-headers", "--no-expert-verify-headers"),
+        (
+            "expert_verify_sidecar_at_open",
+            "--expert-verify-sidecar-at-open",
+            "--no-expert-verify-sidecar-at-open",
+        ),
+        (
+            "expert_f_nocache",
+            "--expert-f-nocache",
+            "--no-expert-f-nocache",
+        ),
     ):
         value = getattr(args, attribute, None)
         if value is not None:

@@ -95,6 +95,9 @@ class ExpertSlotBinding:
     buffer: Any
 
     def component_view(self, component: str) -> memoryview:
+        direct = getattr(self.buffer, "component_view", None)
+        if callable(direct):
+            return direct(component)
         view = memoryview(self.buffer)
         if view.readonly or not view.c_contiguous:
             raise ExpertSlotError("slot buffer is not a writable contiguous buffer")
@@ -282,6 +285,15 @@ class ExpertSlotPool:
 
     def _allocate_buffer(self, label: str) -> Any:
         buffer = self._allocator(self.spec.expert_record_bytes, label)
+        direct_nbytes = getattr(buffer, "nbytes", None)
+        record_views = getattr(buffer, "record_views", None)
+        if callable(record_views):
+            if int(direct_nbytes or -1) != self.spec.expert_record_bytes:
+                raise ExpertSlotError(
+                    f"allocator returned invalid composite buffer for {label}: "
+                    f"bytes={direct_nbytes}"
+                )
+            return buffer
         try:
             view = memoryview(buffer)
         except TypeError as exc:
@@ -406,6 +418,70 @@ class ExpertSlotPool:
             slot.error = None
             slot.condition.notify_all()
 
+    def _fill_batch(
+        self,
+        owned: tuple[tuple[_PhysicalSlot, int, ExpertRecord], ...],
+        *,
+        cancel_event: Any,
+        deadline_ns: int | None,
+    ) -> None:
+        try:
+            digests = self.reader.read_component_records_into(
+                self.manifest,
+                tuple((record, slot.buffer) for slot, _generation, record in owned),
+                verify_hash=self.verify_hashes,
+                cancel_event=cancel_event,
+                deadline_ns=deadline_ns,
+            )
+        except BaseException as exc:
+            for slot, generation, _record in owned:
+                with slot.condition:
+                    if (
+                        slot.generation == generation
+                        and slot.state is ExpertSlotState.LOADING
+                    ):
+                        slot.state = ExpertSlotState.FAILED
+                        slot.error = exc
+                        slot.condition.notify_all()
+            self.metrics.update(load_failures=len(owned))
+            raise
+        for (slot, generation, _record), digest in zip(owned, digests, strict=True):
+            with slot.condition:
+                if (
+                    slot.generation != generation
+                    or slot.state is not ExpertSlotState.LOADING
+                ):
+                    raise ExpertSlotError(
+                        "slot generation changed during a batched expert read"
+                    )
+                slot.digest = digest
+                slot.state = ExpertSlotState.READY
+                slot.error = None
+                slot.condition.notify_all()
+
+    def _can_batch_component_sidecar(
+        self,
+        plan: RoutePlan,
+        owned: list[tuple[_PhysicalSlot, int, ExpertRecord]],
+    ) -> bool:
+        if (
+            plan.phase.value != "prefill"
+            or not self.prefer_sidecar
+            or self.manifest.sidecar is None
+            or len(owned) < 2
+            or not all(callable(getattr(slot.buffer, "record_views", None)) for slot, _generation, _record in owned)
+        ):
+            return False
+        ordered = sorted(
+            (record for _slot, _generation, record in owned),
+            key=lambda record: int(record.sidecar_offset or 0),
+        )
+        return all(
+            int(left.sidecar_offset or 0) + int(left.sidecar_length or 0)
+            == int(right.sidecar_offset or 0)
+            for left, right in zip(ordered, ordered[1:], strict=False)
+        )
+
     def _wait_ready(
         self,
         slot: _PhysicalSlot,
@@ -475,6 +551,7 @@ class ExpertSlotPool:
         combined_cancel = _CombinedCancel(cancel_event, internal_cancel)
         prepared: dict[tuple[int, int], tuple[_PhysicalSlot, int]] = {}
         futures: list[Future[None]] = []
+        owned_loads: list[tuple[_PhysicalSlot, int, ExpertRecord]] = []
         try:
             for load in plan.loads:
                 try:
@@ -490,6 +567,18 @@ class ExpertSlotPool:
                 )
                 prepared[(load.expert, load.slot)] = (slot, generation)
                 if owner:
+                    owned_loads.append((slot, generation, record))
+            if self._can_batch_component_sidecar(plan, owned_loads):
+                futures.append(
+                    self._executor.submit(
+                        self._fill_batch,
+                        tuple(owned_loads),
+                        cancel_event=combined_cancel,
+                        deadline_ns=deadline_ns,
+                    )
+                )
+            else:
+                for slot, generation, record in owned_loads:
                     futures.append(
                         self._executor.submit(
                             self._fill,
@@ -602,6 +691,7 @@ class ExpertSlotPool:
                 pins += slot.pins
         return {
             "buffer_backend": self.buffer_backend,
+            "io_cache_mode": self.reader.cache_mode,
             "allocated_bytes": self.allocated_bytes,
             "max_inflight_io_bytes": self.max_inflight_io_bytes,
             "persistent_slot_count": len(self._persistent),
@@ -647,6 +737,9 @@ class ExpertSlotPool:
                 slot.state = ExpertSlotState.CLOSED
                 slot.condition.notify_all()
         self.reader.close()
+        allocator_close = getattr(self._allocator, "close", None)
+        if callable(allocator_close):
+            allocator_close()
 
     def __enter__(self) -> ExpertSlotPool:
         return self
