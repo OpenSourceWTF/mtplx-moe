@@ -786,7 +786,13 @@ class HotExpertSwitchGLU(nn.Module):
                 mx.eval(wave_outputs)
                 outputs.extend(wave_outputs)
                 output_positions.extend(wave_positions)
-            finally:
+            except BaseException:
+                # If ``mx.eval`` itself failed, kernels may still be in
+                # flight; synchronize before dropping pins so a later route
+                # cannot rewrite a slot a zombie kernel is reading.
+                ready.release(synchronize=True)
+                raise
+            else:
                 # ``mx.eval(result)`` is the completion fence for every Q4
                 # read in this wave.  A second device-wide synchronize here
                 # only inserts an idle bubble before the next route.

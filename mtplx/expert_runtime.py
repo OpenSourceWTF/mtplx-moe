@@ -162,6 +162,16 @@ class ExpertStreamingConfig:
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be bool")
+        if self.verify_sidecar_hash_at_open and not self.prefer_sidecar:
+            raise ValueError(
+                "verify_sidecar_hash_at_open requires prefer_sidecar: source-shard "
+                "reads are not covered by the sidecar digest"
+            )
+        if self.slot_layout == "metal-mmap" and not self.verify_sidecar_hash_at_open:
+            raise ValueError(
+                "metal-mmap executes mapped weights without per-record hashing; "
+                "it requires verify_sidecar_hash_at_open"
+            )
         if self.prefill_admission:
             raise ValueError(
                 "prefill admission is not implemented; prefill must use transient slots"
@@ -662,6 +672,8 @@ class ExpertStreamingRuntime:
         except KeyError as exc:
             raise ValueError(f"layer {layer} is not routed for {self.spec.key}") from exc
         lock.acquire()
+        plan = None
+        miss_future = None
         try:
             plan = bank.plan(expert_ids, phase=phase)
             hit_plan = self._subset_route_plan(plan, hits=True)
@@ -700,6 +712,17 @@ class ExpertStreamingRuntime:
                 miss_future,
             )
         except BaseException:
+            # Mirror the sync-path rollback: without it, a failed hit pin or
+            # submit leaves the bank mapping experts to never-loaded slots,
+            # wedging every later route on this layer until reset().
+            if miss_future is not None:
+                miss_future.cancel()
+                try:
+                    miss_future.result()
+                except BaseException:
+                    pass
+            if plan is not None:
+                self._rollback_route_loads(layer, plan)
             lock.release()
             raise
 

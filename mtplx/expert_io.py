@@ -458,7 +458,9 @@ class PositionalExpertReader:
                         hasher.update(component_view)
                 digest = hasher.hexdigest()
             else:
-                digest = record.sha256 or ""
+                # Do not report the manifest hash as if these bytes were
+                # verified; trust modes must be visible in telemetry.
+                digest = "unverified"
         finally:
             if component_views is not None:
                 for component_view in component_views:
@@ -552,7 +554,8 @@ class PositionalExpertReader:
                                 f"({record.layer}, {record.expert})"
                             )
                     else:
-                        digest = record.sha256 or ""
+                        # Same telemetry honesty as the single-record path.
+                        digest = "unverified"
                     digests[original_index] = digest
         finally:
             for _index, _record, views in prepared:
