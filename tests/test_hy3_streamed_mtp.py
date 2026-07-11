@@ -383,3 +383,34 @@ def test_load_rejects_mtp_artifacts_without_streaming(tmp_path: Path) -> None:
     root = _guard_config_dir(tmp_path)
     with pytest.raises(ValueError, match="streamed checkpoints only"):
         load(root, mtp=True, mtp_artifacts=tmp_path)
+
+
+def test_return_hidden_defaults_to_pre_norm_for_the_nextn_head(tmp_path: Path) -> None:
+    """Regression for the 20.8%-acceptance gate: the head's hnorm must consume
+    the trunk's RAW last-layer hidden, not the lm_head's final-norm output."""
+    root, config, spec, manifest_path = _integrated_streamed_hy3(tmp_path)
+    mtp_dir = tmp_path / "mtp"
+    mtp_dir.mkdir()
+    mtp_fixtures._write_tiny_artifacts(mtp_dir)
+    runtime = _open_streamed_runtime(root, spec, manifest_path)
+    try:
+        resident = construct_resident_model(root, runtime, config=config)
+        model = resident.model
+        injected = inject_hy3_streamed_mtp_support(
+            model, mtp_dir, config, MTPContract(), expected_revision=TEST_REVISION
+        )
+        assert injected is True
+        prompt = mx.array([[1, 2, 4]], dtype=mx.int32)
+
+        post_ref, pre_ref = model.model(prompt, return_pre_norm=True)
+        _logits, hidden_default = model(prompt, return_hidden=True)
+        _logits2, hidden_pre = model(prompt, return_hidden=True, hidden_variant="pre_norm")
+        _logits3, hidden_post = model(prompt, return_hidden=True, hidden_variant="post_norm")
+        mx.eval(post_ref, pre_ref, hidden_default, hidden_pre, hidden_post)
+
+        assert mx.array_equal(hidden_default, pre_ref).item()
+        assert mx.array_equal(hidden_pre, pre_ref).item()
+        assert mx.array_equal(hidden_post, post_ref).item()
+        assert not mx.array_equal(pre_ref, post_ref).item()
+    finally:
+        runtime.close()

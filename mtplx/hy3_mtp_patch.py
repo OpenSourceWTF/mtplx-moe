@@ -350,17 +350,21 @@ def inject_hy3_streamed_mtp_support(
             return_hidden: bool = False,
             hidden_variant: str | None = None,
         ):
-            if hidden_variant not in {None, "post_norm"}:
+            if hidden_variant not in {None, "pre_norm", "post_norm"}:
                 raise ValueError(
-                    "streamed Hy3 MTP supports the post_norm hidden variant only"
+                    "streamed Hy3 MTP supports pre_norm or post_norm hidden variants"
                 )
-            hidden = self.model(inputs, cache)
-            head_input = hidden
+            post_norm, pre_norm = self.model(inputs, cache, return_pre_norm=True)
+            head_input = post_norm
             if self.args.enable_lm_head_fp32:
                 head_input = head_input.astype(mx.float32)
             logits = self.lm_head(head_input)
             if not return_hidden:
                 return logits
+            # NextN reference semantics: the head's hnorm consumes the RAW
+            # last-layer hidden. post_norm is kept only for A/B probing of
+            # the acceptance regression measured at 20.8%.
+            hidden = post_norm if hidden_variant == "post_norm" else pre_norm
             return logits, hidden
 
         def mtp_forward(

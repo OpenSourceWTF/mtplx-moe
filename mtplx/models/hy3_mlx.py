@@ -332,13 +332,22 @@ class Hy3Model(nn.Module):
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-    def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+        return_pre_norm: bool = False,
+    ) -> Any:
         hidden = self.embed_tokens(inputs)
         if cache is None:
             cache = [None] * len(self.layers)
         mask = create_attention_mask(hidden, cache[0])
         for layer, layer_cache in zip(self.layers, cache, strict=True):
             hidden = layer(hidden, mask, layer_cache)
+        if return_pre_norm:
+            # NextN heads normalize the trunk hidden themselves (hnorm); hand
+            # them the raw last-layer output, not the lm_head's normed view.
+            return self.norm(hidden), hidden
         return self.norm(hidden)
 
 
