@@ -103,7 +103,7 @@ class Attention(nn.Module):
             base=args.rope_theta,
             traditional=False,
             max_position_embeddings=args.max_position_embeddings,
-            scaling_config=None,
+            scaling_config=args.rope_parameters,
         )
 
     def __call__(
@@ -170,12 +170,15 @@ class Router(nn.Module):
         self.expert_bias = mx.zeros((args.num_experts,), dtype=mx.float32)
 
     def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
-        logits = self.gate(x.astype(mx.float32)).astype(mx.float32)
+        # The pinned artifact uses an affine-Q8 router.  Run that projection in
+        # the activation dtype, then promote its logits for stable sigmoid and
+        # top-k selection, exactly as the Hy3 MLX reference does.
+        logits = self.gate(x).astype(mx.float32)
         scores = mx.sigmoid(logits)
         selection_scores = scores + self.expert_bias.astype(mx.float32)
         top_k = self.top_k
-        indices = mx.argpartition(-selection_scores, kth=top_k - 1, axis=-1)[
-            ..., :top_k
+        indices = mx.argpartition(selection_scores, kth=-top_k, axis=-1)[
+            ..., -top_k:
         ]
         weights = mx.take_along_axis(scores, indices, axis=-1)
         if self.route_norm:
@@ -196,6 +199,12 @@ class SparseMLP(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         indices, scores = self.router(x)
+        # Match the pinned Hy3 MLX reference: when FP32 MoE combining is
+        # disabled, both the routing multiply and its reduction happen in the
+        # activation dtype.  Keeping ``scores`` in FP32 here subtly changes
+        # target logits even though the selected experts are identical.
+        if not self.enable_moe_fp32_combine:
+            scores = scores.astype(x.dtype)
         routed = self.switch_mlp(x, indices)
         routed = (routed * scores[..., None]).sum(axis=-2)
         shared = self.shared_mlp(x)
