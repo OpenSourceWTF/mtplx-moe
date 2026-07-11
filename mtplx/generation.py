@@ -561,12 +561,17 @@ def _prefill_cache_only_forward(
             emit_logits=False,
             input_embeddings=input_embeddings,
         )
-    if input_embeddings is not None:
-        unused_logits = rt.model(
-            token_array, cache=cache, input_embeddings=input_embeddings
-        )
-    else:
-        unused_logits = rt.model(token_array, cache=cache)
+    # The legacy external-logits branch calls the model directly, bypassing
+    # forward_ar, so streamed experts would classify one-token tail chunks
+    # by shape as decode. Declare the phase like the other prefill call
+    # sites so the routing context resolves it as prefill traffic.
+    with attention_phase("prefill"), rt._expert_routing_context(token_array):
+        if input_embeddings is not None:
+            unused_logits = rt.model(
+                token_array, cache=cache, input_embeddings=input_embeddings
+            )
+        else:
+            unused_logits = rt.model(token_array, cache=cache)
     del unused_logits
     return None
 
