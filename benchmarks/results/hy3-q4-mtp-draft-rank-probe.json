@@ -1,0 +1,6081 @@
+{
+  "chat": true,
+  "config": {
+    "bypass_page_cache": true,
+    "cache_policy": "lru",
+    "cache_scope": "layer",
+    "execution_workspace_bytes": 0,
+    "expert_cache_limit_bytes": 83751862272,
+    "frequency_decay": 0.995,
+    "io_staging_bytes": 0,
+    "max_inflight_io_bytes": null,
+    "max_live_kv_tokens": 4096,
+    "max_open_files": 16,
+    "max_read_chunk_bytes": 67108864,
+    "memory_limit_bytes": 120259084288,
+    "model_key": "hy3-q4",
+    "prefer_sidecar": true,
+    "prefill_admission": false,
+    "runtime_reserve_bytes": 8589934592,
+    "slot_layout": "component-banks",
+    "trace_routes": false,
+    "transient_slots": 32,
+    "verify_artifact_headers": true,
+    "verify_record_hashes": false,
+    "verify_sidecar_hash_at_open": false
+  },
+  "draft_batch": 32,
+  "enable_thinking": false,
+  "first_position": 11,
+  "git_commit": "a3318e4433f697958b6710d85b29055bc183a5d9",
+  "host": {
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "last_position": 310,
+  "manifest": "/Users/davidtai/.cache/huggingface/hub/models--pipenetwork--Hy3-4bit/snapshots/160619d3f96c8470350b6dac0ef033a8381551e3/expert-manifest-sidecar.json",
+  "model_key": "hy3-q4",
+  "model_root": "/Users/davidtai/.cache/huggingface/hub/models--pipenetwork--Hy3-4bit/snapshots/160619d3f96c8470350b6dac0ef033a8381551e3",
+  "mtp": {
+    "artifacts": "/Users/davidtai/.cache/huggingface/hy3-mtp-layer80",
+    "enabled": true,
+    "precision": "bf16"
+  },
+  "prefill_chunk": 256,
+  "probe_positions": 300,
+  "probe_positions_capped": false,
+  "probe_positions_requested": 300,
+  "probe_seconds": 18.702068375001545,
+  "prompt_file": "/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees/bf16-mtp-head/benchmarks/prompts/moe_streaming_realistic.md",
+  "prompt_tokens": 313,
+  "reasoning_effort": null,
+  "schema": "mtplx-mtp-draft-rank-probe-v1",
+  "variants": {
+    "post_norm": {
+      "records": [
+        {
+          "argmax_prob": 0.07313782721757889,
+          "argmax_token": 1236,
+          "echo": false,
+          "input_token": 11,
+          "position": 11,
+          "rank": 6,
+          "true_prob": 0.01871836557984352,
+          "true_token": 1622
+        },
+        {
+          "argmax_prob": 0.7168886661529541,
+          "argmax_token": 81425,
+          "echo": false,
+          "input_token": 1622,
+          "position": 12,
+          "rank": 0,
+          "true_prob": 0.7168886661529541,
+          "true_token": 81425
+        },
+        {
+          "argmax_prob": 0.4096733629703522,
+          "argmax_token": 397,
+          "echo": false,
+          "input_token": 81425,
+          "position": 13,
+          "rank": 91,
+          "true_prob": 0.000550741096958518,
+          "true_token": 2308
+        },
+        {
+          "argmax_prob": 0.25965917110443115,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 2308,
+          "position": 14,
+          "rank": 2,
+          "true_prob": 0.06990978121757507,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.1481103152036667,
+          "argmax_token": 286,
+          "echo": false,
+          "input_token": 13,
+          "position": 15,
+          "rank": 72394,
+          "true_prob": 6.315441503090824e-10,
+          "true_token": 120044
+        },
+        {
+          "argmax_prob": 0.09076662361621857,
+          "argmax_token": 1527,
+          "echo": false,
+          "input_token": 120044,
+          "position": 16,
+          "rank": 192,
+          "true_prob": 0.000702453195117414,
+          "true_token": 70830
+        },
+        {
+          "argmax_prob": 0.1211232990026474,
+          "argmax_token": 25,
+          "echo": false,
+          "input_token": 70830,
+          "position": 17,
+          "rank": 3,
+          "true_prob": 0.021168958395719528,
+          "true_token": 277
+        },
+        {
+          "argmax_prob": 0.060843851417303085,
+          "argmax_token": 25,
+          "echo": false,
+          "input_token": 277,
+          "position": 18,
+          "rank": 489,
+          "true_prob": 0.00024228126858361065,
+          "true_token": 9002
+        },
+        {
+          "argmax_prob": 0.11978521943092346,
+          "argmax_token": 48532,
+          "echo": false,
+          "input_token": 9002,
+          "position": 19,
+          "rank": 71,
+          "true_prob": 0.0008979382691904902,
+          "true_token": 647
+        },
+        {
+          "argmax_prob": 0.017066868022084236,
+          "argmax_token": 3263,
+          "echo": false,
+          "input_token": 647,
+          "position": 20,
+          "rank": 453,
+          "true_prob": 0.00029246730264276266,
+          "true_token": 497
+        },
+        {
+          "argmax_prob": 0.030793815851211548,
+          "argmax_token": 25,
+          "echo": false,
+          "input_token": 497,
+          "position": 21,
+          "rank": 0,
+          "true_prob": 0.030793815851211548,
+          "true_token": 25
+        },
+        {
+          "argmax_prob": 0.12762801349163055,
+          "argmax_token": 206,
+          "echo": false,
+          "input_token": 25,
+          "position": 22,
+          "rank": 7594,
+          "true_prob": 9.724996743898373e-06,
+          "true_token": 5130
+        },
+        {
+          "argmax_prob": 0.05622461438179016,
+          "argmax_token": 639,
+          "echo": false,
+          "input_token": 5130,
+          "position": 23,
+          "rank": 16,
+          "true_prob": 0.007472510915249586,
+          "true_token": 25152
+        },
+        {
+          "argmax_prob": 0.468885600566864,
+          "argmax_token": 1326,
+          "echo": false,
+          "input_token": 25152,
+          "position": 24,
+          "rank": 0,
+          "true_prob": 0.468885600566864,
+          "true_token": 1326
+        },
+        {
+          "argmax_prob": 0.06133647635579109,
+          "argmax_token": 503,
+          "echo": false,
+          "input_token": 1326,
+          "position": 25,
+          "rank": 58141,
+          "true_prob": 5.032717353969929e-07,
+          "true_token": 120006
+        },
+        {
+          "argmax_prob": 0.6040212512016296,
+          "argmax_token": 120030,
+          "echo": false,
+          "input_token": 120006,
+          "position": 26,
+          "rank": 13153,
+          "true_prob": 3.890048901666887e-06,
+          "true_token": 2353
+        },
+        {
+          "argmax_prob": 0.11310030519962311,
+          "argmax_token": 431,
+          "echo": false,
+          "input_token": 2353,
+          "position": 27,
+          "rank": 0,
+          "true_prob": 0.11310030519962311,
+          "true_token": 431
+        },
+        {
+          "argmax_prob": 0.36751511693000793,
+          "argmax_token": 244,
+          "echo": false,
+          "input_token": 431,
+          "position": 28,
+          "rank": 28,
+          "true_prob": 0.0016621650429442525,
+          "true_token": 41451
+        },
+        {
+          "argmax_prob": 0.2444349080324173,
+          "argmax_token": 275,
+          "echo": false,
+          "input_token": 41451,
+          "position": 29,
+          "rank": 1,
+          "true_prob": 0.22484879195690155,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.26067429780960083,
+          "argmax_token": 9220,
+          "echo": false,
+          "input_token": 244,
+          "position": 30,
+          "rank": 106,
+          "true_prob": 0.0006283993134275079,
+          "true_token": 4382
+        },
+        {
+          "argmax_prob": 0.2296914905309677,
+          "argmax_token": 2816,
+          "echo": false,
+          "input_token": 4382,
+          "position": 31,
+          "rank": 44,
+          "true_prob": 0.001993393525481224,
+          "true_token": 2719
+        },
+        {
+          "argmax_prob": 0.21388785541057587,
+          "argmax_token": 2657,
+          "echo": false,
+          "input_token": 2719,
+          "position": 32,
+          "rank": 2,
+          "true_prob": 0.05185028538107872,
+          "true_token": 356
+        },
+        {
+          "argmax_prob": 0.4123232662677765,
+          "argmax_token": 244,
+          "echo": false,
+          "input_token": 356,
+          "position": 33,
+          "rank": 1759,
+          "true_prob": 7.279853889485821e-06,
+          "true_token": 17975
+        },
+        {
+          "argmax_prob": 0.18081799149513245,
+          "argmax_token": 244,
+          "echo": false,
+          "input_token": 17975,
+          "position": 34,
+          "rank": 0,
+          "true_prob": 0.18081799149513245,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.24384325742721558,
+          "argmax_token": 2921,
+          "echo": false,
+          "input_token": 244,
+          "position": 35,
+          "rank": 78,
+          "true_prob": 0.0010005275253206491,
+          "true_token": 2027
+        },
+        {
+          "argmax_prob": 0.7887487411499023,
+          "argmax_token": 2921,
+          "echo": false,
+          "input_token": 2027,
+          "position": 36,
+          "rank": 0,
+          "true_prob": 0.7887487411499023,
+          "true_token": 2921
+        },
+        {
+          "argmax_prob": 0.14425769448280334,
+          "argmax_token": 10164,
+          "echo": false,
+          "input_token": 2921,
+          "position": 37,
+          "rank": 413,
+          "true_prob": 0.00024934596149250865,
+          "true_token": 14965
+        },
+        {
+          "argmax_prob": 0.17926421761512756,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 14965,
+          "position": 38,
+          "rank": 35,
+          "true_prob": 0.0024343247059732676,
+          "true_token": 11367
+        },
+        {
+          "argmax_prob": 0.23985789716243744,
+          "argmax_token": 12,
+          "echo": false,
+          "input_token": 11367,
+          "position": 39,
+          "rank": 2,
+          "true_prob": 0.16874374449253082,
+          "true_token": 13239
+        },
+        {
+          "argmax_prob": 0.9986187219619751,
+          "argmax_token": 1726,
+          "echo": false,
+          "input_token": 13239,
+          "position": 40,
+          "rank": 0,
+          "true_prob": 0.9986187219619751,
+          "true_token": 1726
+        },
+        {
+          "argmax_prob": 0.924170196056366,
+          "argmax_token": 82,
+          "echo": false,
+          "input_token": 1726,
+          "position": 41,
+          "rank": 0,
+          "true_prob": 0.924170196056366,
+          "true_token": 82
+        },
+        {
+          "argmax_prob": 0.8705843687057495,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 82,
+          "position": 42,
+          "rank": 24,
+          "true_prob": 0.0002321059728274122,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.3250610828399658,
+          "argmax_token": 8868,
+          "echo": false,
+          "input_token": 185,
+          "position": 43,
+          "rank": 4,
+          "true_prob": 0.03647981584072113,
+          "true_token": 33667
+        },
+        {
+          "argmax_prob": 0.9668331742286682,
+          "argmax_token": 2438,
+          "echo": false,
+          "input_token": 33667,
+          "position": 44,
+          "rank": 0,
+          "true_prob": 0.9668331742286682,
+          "true_token": 2438
+        },
+        {
+          "argmax_prob": 0.1756749302148819,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 2438,
+          "position": 45,
+          "rank": 16,
+          "true_prob": 0.005436883307993412,
+          "true_token": 377
+        },
+        {
+          "argmax_prob": 0.4374241828918457,
+          "argmax_token": 244,
+          "echo": false,
+          "input_token": 377,
+          "position": 46,
+          "rank": 6,
+          "true_prob": 0.008638297207653522,
+          "true_token": 275
+        },
+        {
+          "argmax_prob": 0.18683764338493347,
+          "argmax_token": 565,
+          "echo": false,
+          "input_token": 275,
+          "position": 47,
+          "rank": 98,
+          "true_prob": 0.0010192394256591797,
+          "true_token": 19618
+        },
+        {
+          "argmax_prob": 0.5610254406929016,
+          "argmax_token": 69708,
+          "echo": false,
+          "input_token": 19618,
+          "position": 48,
+          "rank": 0,
+          "true_prob": 0.5610254406929016,
+          "true_token": 69708
+        },
+        {
+          "argmax_prob": 0.5970650911331177,
+          "argmax_token": 10313,
+          "echo": false,
+          "input_token": 69708,
+          "position": 49,
+          "rank": 239,
+          "true_prob": 0.00012794366921298206,
+          "true_token": 98905
+        },
+        {
+          "argmax_prob": 0.6260817646980286,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 98905,
+          "position": 50,
+          "rank": 5,
+          "true_prob": 0.02453281730413437,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.162317156791687,
+          "argmax_token": 286,
+          "echo": false,
+          "input_token": 13,
+          "position": 51,
+          "rank": 2,
+          "true_prob": 0.08510211110115051,
+          "true_token": 424
+        },
+        {
+          "argmax_prob": 0.07811569422483444,
+          "argmax_token": 355,
+          "echo": false,
+          "input_token": 424,
+          "position": 52,
+          "rank": 1689,
+          "true_prob": 2.416305142105557e-05,
+          "true_token": 21722
+        },
+        {
+          "argmax_prob": 0.16885249316692352,
+          "argmax_token": 2438,
+          "echo": false,
+          "input_token": 21722,
+          "position": 53,
+          "rank": 12,
+          "true_prob": 0.01208203099668026,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.2126464694738388,
+          "argmax_token": 7728,
+          "echo": false,
+          "input_token": 11,
+          "position": 54,
+          "rank": 129,
+          "true_prob": 0.0005172364762984216,
+          "true_token": 7086
+        },
+        {
+          "argmax_prob": 0.3867998719215393,
+          "argmax_token": 13604,
+          "echo": false,
+          "input_token": 7086,
+          "position": 55,
+          "rank": 15,
+          "true_prob": 0.00816773809492588,
+          "true_token": 11809
+        },
+        {
+          "argmax_prob": 0.7995780110359192,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 11809,
+          "position": 56,
+          "rank": 2,
+          "true_prob": 0.04130256175994873,
+          "true_token": 622
+        },
+        {
+          "argmax_prob": 0.43970930576324463,
+          "argmax_token": 476,
+          "echo": false,
+          "input_token": 622,
+          "position": 57,
+          "rank": 11,
+          "true_prob": 0.0024757913779467344,
+          "true_token": 31277
+        },
+        {
+          "argmax_prob": 0.3644340932369232,
+          "argmax_token": 67,
+          "echo": false,
+          "input_token": 31277,
+          "position": 58,
+          "rank": 2,
+          "true_prob": 0.0785965770483017,
+          "true_token": 38853
+        },
+        {
+          "argmax_prob": 0.48965969681739807,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 38853,
+          "position": 59,
+          "rank": 0,
+          "true_prob": 0.48965969681739807,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.9434781670570374,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 11,
+          "position": 60,
+          "rank": 58,
+          "true_prob": 8.117852848954499e-05,
+          "true_token": 44797
+        },
+        {
+          "argmax_prob": 0.41381049156188965,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 44797,
+          "position": 61,
+          "rank": 10,
+          "true_prob": 0.011826593428850174,
+          "true_token": 11809
+        },
+        {
+          "argmax_prob": 0.8227473497390747,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 11809,
+          "position": 62,
+          "rank": 0,
+          "true_prob": 0.8227473497390747,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.9788118004798889,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 11,
+          "position": 63,
+          "rank": 0,
+          "true_prob": 0.9788118004798889,
+          "true_token": 289
+        },
+        {
+          "argmax_prob": 0.21230967342853546,
+          "argmax_token": 9685,
+          "echo": false,
+          "input_token": 289,
+          "position": 64,
+          "rank": 0,
+          "true_prob": 0.21230967342853546,
+          "true_token": 9685
+        },
+        {
+          "argmax_prob": 0.2648049592971802,
+          "argmax_token": 14639,
+          "echo": false,
+          "input_token": 9685,
+          "position": 65,
+          "rank": 3,
+          "true_prob": 0.05643423646688461,
+          "true_token": 13604
+        },
+        {
+          "argmax_prob": 0.17798049747943878,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 13604,
+          "position": 66,
+          "rank": 3451,
+          "true_prob": 3.062182713620132e-06,
+          "true_token": 2597
+        },
+        {
+          "argmax_prob": 0.2894793450832367,
+          "argmax_token": 5629,
+          "echo": false,
+          "input_token": 2597,
+          "position": 67,
+          "rank": 1,
+          "true_prob": 0.17791225016117096,
+          "true_token": 280
+        },
+        {
+          "argmax_prob": 0.22134140133857727,
+          "argmax_token": 377,
+          "echo": false,
+          "input_token": 280,
+          "position": 68,
+          "rank": 614,
+          "true_prob": 4.2067200411111116e-05,
+          "true_token": 35454
+        },
+        {
+          "argmax_prob": 0.4057724177837372,
+          "argmax_token": 5033,
+          "echo": false,
+          "input_token": 35454,
+          "position": 69,
+          "rank": 0,
+          "true_prob": 0.4057724177837372,
+          "true_token": 5033
+        },
+        {
+          "argmax_prob": 0.9260485768318176,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 5033,
+          "position": 70,
+          "rank": 6,
+          "true_prob": 0.0037389532662928104,
+          "true_token": 359
+        },
+        {
+          "argmax_prob": 0.04931870847940445,
+          "argmax_token": 1499,
+          "echo": false,
+          "input_token": 359,
+          "position": 71,
+          "rank": 124,
+          "true_prob": 0.0008851347956806421,
+          "true_token": 49
+        },
+        {
+          "argmax_prob": 0.12698499858379364,
+          "argmax_token": 7235,
+          "echo": false,
+          "input_token": 49,
+          "position": 72,
+          "rank": 3,
+          "true_prob": 0.028991730883717537,
+          "true_token": 96417
+        },
+        {
+          "argmax_prob": 0.10707510262727737,
+          "argmax_token": 206,
+          "echo": false,
+          "input_token": 96417,
+          "position": 73,
+          "rank": 101,
+          "true_prob": 0.0008651168900541961,
+          "true_token": 7728
+        },
+        {
+          "argmax_prob": 0.5770496726036072,
+          "argmax_token": 13604,
+          "echo": false,
+          "input_token": 7728,
+          "position": 74,
+          "rank": 6,
+          "true_prob": 0.0124287698417902,
+          "true_token": 16268
+        },
+        {
+          "argmax_prob": 0.07943534851074219,
+          "argmax_token": 5265,
+          "echo": false,
+          "input_token": 16268,
+          "position": 75,
+          "rank": 9,
+          "true_prob": 0.020930852741003036,
+          "true_token": 431
+        },
+        {
+          "argmax_prob": 0.13738805055618286,
+          "argmax_token": 7512,
+          "echo": false,
+          "input_token": 431,
+          "position": 76,
+          "rank": 0,
+          "true_prob": 0.13738805055618286,
+          "true_token": 7512
+        },
+        {
+          "argmax_prob": 0.2201090306043625,
+          "argmax_token": 280,
+          "echo": false,
+          "input_token": 7512,
+          "position": 77,
+          "rank": 6,
+          "true_prob": 0.020252376794815063,
+          "true_token": 402
+        },
+        {
+          "argmax_prob": 0.26801252365112305,
+          "argmax_token": 1970,
+          "echo": false,
+          "input_token": 402,
+          "position": 78,
+          "rank": 1311,
+          "true_prob": 1.289254032599274e-05,
+          "true_token": 45455
+        },
+        {
+          "argmax_prob": 0.08205749839544296,
+          "argmax_token": 607,
+          "echo": false,
+          "input_token": 45455,
+          "position": 79,
+          "rank": 1,
+          "true_prob": 0.06208076328039169,
+          "true_token": 206
+        },
+        {
+          "argmax_prob": 0.09838738292455673,
+          "argmax_token": 17,
+          "echo": false,
+          "input_token": 206,
+          "position": 80,
+          "rank": 3,
+          "true_prob": 0.07416173070669174,
+          "true_token": 19
+        },
+        {
+          "argmax_prob": 0.41935595870018005,
+          "argmax_token": 87,
+          "echo": false,
+          "input_token": 19,
+          "position": 81,
+          "rank": 3,
+          "true_prob": 0.04434477910399437,
+          "true_token": 17471
+        },
+        {
+          "argmax_prob": 0.07194142043590546,
+          "argmax_token": 17471,
+          "echo": true,
+          "input_token": 17471,
+          "position": 82,
+          "rank": 457,
+          "true_prob": 0.00017050100723281503,
+          "true_token": 60202
+        },
+        {
+          "argmax_prob": 0.16176708042621613,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 60202,
+          "position": 83,
+          "rank": 77,
+          "true_prob": 0.0011449551675468683,
+          "true_token": 377
+        },
+        {
+          "argmax_prob": 0.33847498893737793,
+          "argmax_token": 14012,
+          "echo": false,
+          "input_token": 377,
+          "position": 84,
+          "rank": 2,
+          "true_prob": 0.13103021681308746,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.4984285235404968,
+          "argmax_token": 3489,
+          "echo": false,
+          "input_token": 244,
+          "position": 85,
+          "rank": 0,
+          "true_prob": 0.4984285235404968,
+          "true_token": 3489
+        },
+        {
+          "argmax_prob": 0.13385728001594543,
+          "argmax_token": 14012,
+          "echo": false,
+          "input_token": 3489,
+          "position": 86,
+          "rank": 2,
+          "true_prob": 0.11501644551753998,
+          "true_token": 55647
+        },
+        {
+          "argmax_prob": 0.943697988986969,
+          "argmax_token": 9042,
+          "echo": false,
+          "input_token": 55647,
+          "position": 87,
+          "rank": 0,
+          "true_prob": 0.943697988986969,
+          "true_token": 9042
+        },
+        {
+          "argmax_prob": 0.5907842516899109,
+          "argmax_token": 8264,
+          "echo": false,
+          "input_token": 9042,
+          "position": 88,
+          "rank": 5,
+          "true_prob": 0.002599449595436454,
+          "true_token": 62067
+        },
+        {
+          "argmax_prob": 0.48284703493118286,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 62067,
+          "position": 89,
+          "rank": 1,
+          "true_prob": 0.10847157984972,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.8768664002418518,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 13,
+          "position": 90,
+          "rank": 25,
+          "true_prob": 0.0002530438650865108,
+          "true_token": 3911
+        },
+        {
+          "argmax_prob": 0.7118680477142334,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 3911,
+          "position": 91,
+          "rank": 0,
+          "true_prob": 0.7118680477142334,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.15544036030769348,
+          "argmax_token": 245,
+          "echo": false,
+          "input_token": 185,
+          "position": 92,
+          "rank": 5,
+          "true_prob": 0.025895169004797935,
+          "true_token": 30244
+        },
+        {
+          "argmax_prob": 0.20571039617061615,
+          "argmax_token": 28615,
+          "echo": false,
+          "input_token": 30244,
+          "position": 93,
+          "rank": 682,
+          "true_prob": 5.6677799875615165e-05,
+          "true_token": 33820
+        },
+        {
+          "argmax_prob": 0.36724981665611267,
+          "argmax_token": 10266,
+          "echo": false,
+          "input_token": 33820,
+          "position": 94,
+          "rank": 1,
+          "true_prob": 0.2563210725784302,
+          "true_token": 6162
+        },
+        {
+          "argmax_prob": 0.652845025062561,
+          "argmax_token": 7971,
+          "echo": false,
+          "input_token": 6162,
+          "position": 95,
+          "rank": 35,
+          "true_prob": 0.0008843763498589396,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.4774945080280304,
+          "argmax_token": 252,
+          "echo": false,
+          "input_token": 11,
+          "position": 96,
+          "rank": 0,
+          "true_prob": 0.4774945080280304,
+          "true_token": 252
+        },
+        {
+          "argmax_prob": 0.22661687433719635,
+          "argmax_token": 13604,
+          "echo": false,
+          "input_token": 252,
+          "position": 97,
+          "rank": 6,
+          "true_prob": 0.014251027256250381,
+          "true_token": 21722
+        },
+        {
+          "argmax_prob": 0.1428428441286087,
+          "argmax_token": 27676,
+          "echo": false,
+          "input_token": 21722,
+          "position": 98,
+          "rank": 85,
+          "true_prob": 0.001621800009161234,
+          "true_token": 42273
+        },
+        {
+          "argmax_prob": 0.07994061708450317,
+          "argmax_token": 2752,
+          "echo": false,
+          "input_token": 42273,
+          "position": 99,
+          "rank": 1406,
+          "true_prob": 1.4569635823136196e-05,
+          "true_token": 10749
+        },
+        {
+          "argmax_prob": 0.42344218492507935,
+          "argmax_token": 13604,
+          "echo": false,
+          "input_token": 10749,
+          "position": 100,
+          "rank": 0,
+          "true_prob": 0.42344218492507935,
+          "true_token": 13604
+        },
+        {
+          "argmax_prob": 0.25496727228164673,
+          "argmax_token": 562,
+          "echo": false,
+          "input_token": 13604,
+          "position": 101,
+          "rank": 13,
+          "true_prob": 0.009443884715437889,
+          "true_token": 26
+        },
+        {
+          "argmax_prob": 0.3806270360946655,
+          "argmax_token": 904,
+          "echo": false,
+          "input_token": 26,
+          "position": 102,
+          "rank": 30,
+          "true_prob": 0.0034454306587576866,
+          "true_token": 7499
+        },
+        {
+          "argmax_prob": 0.35732796788215637,
+          "argmax_token": 16268,
+          "echo": false,
+          "input_token": 7499,
+          "position": 103,
+          "rank": 2,
+          "true_prob": 0.048495978116989136,
+          "true_token": 13604
+        },
+        {
+          "argmax_prob": 0.15433648228645325,
+          "argmax_token": 13604,
+          "echo": true,
+          "input_token": 13604,
+          "position": 104,
+          "rank": 3,
+          "true_prob": 0.09642999619245529,
+          "true_token": 431
+        },
+        {
+          "argmax_prob": 0.2992638349533081,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 431,
+          "position": 105,
+          "rank": 2,
+          "true_prob": 0.11919911205768585,
+          "true_token": 15489
+        },
+        {
+          "argmax_prob": 0.964735209941864,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 15489,
+          "position": 106,
+          "rank": 0,
+          "true_prob": 0.964735209941864,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.644832193851471,
+          "argmax_token": 28126,
+          "echo": false,
+          "input_token": 185,
+          "position": 107,
+          "rank": 0,
+          "true_prob": 0.644832193851471,
+          "true_token": 28126
+        },
+        {
+          "argmax_prob": 0.05537673085927963,
+          "argmax_token": 377,
+          "echo": false,
+          "input_token": 28126,
+          "position": 108,
+          "rank": 18,
+          "true_prob": 0.010959779843688011,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.7414425015449524,
+          "argmax_token": 35454,
+          "echo": false,
+          "input_token": 244,
+          "position": 109,
+          "rank": 30,
+          "true_prob": 0.0015090915840119123,
+          "true_token": 7413
+        },
+        {
+          "argmax_prob": 0.10187453031539917,
+          "argmax_token": 31685,
+          "echo": false,
+          "input_token": 7413,
+          "position": 110,
+          "rank": 61,
+          "true_prob": 0.002052271505817771,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.13544735312461853,
+          "argmax_token": 10450,
+          "echo": false,
+          "input_token": 11,
+          "position": 111,
+          "rank": 82,
+          "true_prob": 0.0012539704330265522,
+          "true_token": 2388
+        },
+        {
+          "argmax_prob": 0.3339926302433014,
+          "argmax_token": 2776,
+          "echo": false,
+          "input_token": 2388,
+          "position": 112,
+          "rank": 14,
+          "true_prob": 0.00773585494607687,
+          "true_token": 2084
+        },
+        {
+          "argmax_prob": 0.4007090628147125,
+          "argmax_token": 79,
+          "echo": false,
+          "input_token": 2084,
+          "position": 113,
+          "rank": 324,
+          "true_prob": 7.788823131704703e-05,
+          "true_token": 29936
+        },
+        {
+          "argmax_prob": 0.06774867326021194,
+          "argmax_token": 779,
+          "echo": false,
+          "input_token": 29936,
+          "position": 114,
+          "rank": 220,
+          "true_prob": 0.00046267008292488754,
+          "true_token": 5033
+        },
+        {
+          "argmax_prob": 0.30500978231430054,
+          "argmax_token": 10450,
+          "echo": false,
+          "input_token": 5033,
+          "position": 115,
+          "rank": 224,
+          "true_prob": 0.00015267023991327733,
+          "true_token": 7692
+        },
+        {
+          "argmax_prob": 0.16607904434204102,
+          "argmax_token": 4995,
+          "echo": false,
+          "input_token": 7692,
+          "position": 116,
+          "rank": 40,
+          "true_prob": 0.0015597027959302068,
+          "true_token": 377
+        },
+        {
+          "argmax_prob": 0.20518025755882263,
+          "argmax_token": 252,
+          "echo": false,
+          "input_token": 377,
+          "position": 117,
+          "rank": 1,
+          "true_prob": 0.19841249287128448,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.18286345899105072,
+          "argmax_token": 5123,
+          "echo": false,
+          "input_token": 244,
+          "position": 118,
+          "rank": 6403,
+          "true_prob": 1.5829257336008595e-06,
+          "true_token": 6125
+        },
+        {
+          "argmax_prob": 0.07827969640493393,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 6125,
+          "position": 119,
+          "rank": 59,
+          "true_prob": 0.002717697760090232,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.2161250114440918,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 13,
+          "position": 120,
+          "rank": 481,
+          "true_prob": 0.00011055148934246972,
+          "true_token": 119320
+        },
+        {
+          "argmax_prob": 0.06580674648284912,
+          "argmax_token": 355,
+          "echo": false,
+          "input_token": 119320,
+          "position": 121,
+          "rank": 96,
+          "true_prob": 0.0014998179394751787,
+          "true_token": 11002
+        },
+        {
+          "argmax_prob": 0.17473579943180084,
+          "argmax_token": 316,
+          "echo": false,
+          "input_token": 11002,
+          "position": 122,
+          "rank": 2120,
+          "true_prob": 7.874659786466509e-06,
+          "true_token": 46465
+        },
+        {
+          "argmax_prob": 0.1641659289598465,
+          "argmax_token": 252,
+          "echo": false,
+          "input_token": 46465,
+          "position": 123,
+          "rank": 1,
+          "true_prob": 0.08391303569078445,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.9314823746681213,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 244,
+          "position": 124,
+          "rank": 0,
+          "true_prob": 0.9314823746681213,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.16290242969989777,
+          "argmax_token": 206,
+          "echo": false,
+          "input_token": 185,
+          "position": 125,
+          "rank": 1293,
+          "true_prob": 2.4117285647662356e-05,
+          "true_token": 67680
+        },
+        {
+          "argmax_prob": 0.05024207383394241,
+          "argmax_token": 952,
+          "echo": false,
+          "input_token": 67680,
+          "position": 126,
+          "rank": 1102,
+          "true_prob": 7.446824020007625e-05,
+          "true_token": 59338
+        },
+        {
+          "argmax_prob": 0.5463733673095703,
+          "argmax_token": 395,
+          "echo": false,
+          "input_token": 59338,
+          "position": 127,
+          "rank": 3,
+          "true_prob": 0.010632540099322796,
+          "true_token": 113364
+        },
+        {
+          "argmax_prob": 0.01542841736227274,
+          "argmax_token": 1855,
+          "echo": false,
+          "input_token": 113364,
+          "position": 128,
+          "rank": 69,
+          "true_prob": 0.0016296332469210029,
+          "true_token": 7154
+        },
+        {
+          "argmax_prob": 0.12103164196014404,
+          "argmax_token": 12728,
+          "echo": false,
+          "input_token": 7154,
+          "position": 129,
+          "rank": 0,
+          "true_prob": 0.12103164196014404,
+          "true_token": 12728
+        },
+        {
+          "argmax_prob": 0.31968578696250916,
+          "argmax_token": 1703,
+          "echo": false,
+          "input_token": 12728,
+          "position": 130,
+          "rank": 8,
+          "true_prob": 0.012664563953876495,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.11312948912382126,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 11,
+          "position": 131,
+          "rank": 154,
+          "true_prob": 0.0005715326988138258,
+          "true_token": 2089
+        },
+        {
+          "argmax_prob": 0.10817723721265793,
+          "argmax_token": 244,
+          "echo": false,
+          "input_token": 2089,
+          "position": 132,
+          "rank": 64,
+          "true_prob": 0.0021445394959300756,
+          "true_token": 12059
+        },
+        {
+          "argmax_prob": 0.45565515756607056,
+          "argmax_token": 9448,
+          "echo": false,
+          "input_token": 12059,
+          "position": 133,
+          "rank": 0,
+          "true_prob": 0.45565515756607056,
+          "true_token": 9448
+        },
+        {
+          "argmax_prob": 0.44515615701675415,
+          "argmax_token": 7568,
+          "echo": false,
+          "input_token": 9448,
+          "position": 134,
+          "rank": 4,
+          "true_prob": 0.026029307395219803,
+          "true_token": 517
+        },
+        {
+          "argmax_prob": 0.3196044862270355,
+          "argmax_token": 1995,
+          "echo": false,
+          "input_token": 517,
+          "position": 135,
+          "rank": 753,
+          "true_prob": 8.965032611740753e-05,
+          "true_token": 3865
+        },
+        {
+          "argmax_prob": 0.4441109299659729,
+          "argmax_token": 11002,
+          "echo": false,
+          "input_token": 3865,
+          "position": 136,
+          "rank": 1150,
+          "true_prob": 2.9349244869081303e-05,
+          "true_token": 32761
+        },
+        {
+          "argmax_prob": 0.14553891122341156,
+          "argmax_token": 12094,
+          "echo": false,
+          "input_token": 32761,
+          "position": 137,
+          "rank": 1418,
+          "true_prob": 3.771732735913247e-05,
+          "true_token": 39249
+        },
+        {
+          "argmax_prob": 0.1615917831659317,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 39249,
+          "position": 138,
+          "rank": 171,
+          "true_prob": 0.00036647223168984056,
+          "true_token": 950
+        },
+        {
+          "argmax_prob": 0.6193798184394836,
+          "argmax_token": 369,
+          "echo": false,
+          "input_token": 950,
+          "position": 139,
+          "rank": 12,
+          "true_prob": 0.002718826523050666,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.8004908561706543,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 244,
+          "position": 140,
+          "rank": 12,
+          "true_prob": 0.003108620410785079,
+          "true_token": 3548
+        },
+        {
+          "argmax_prob": 0.9823992252349854,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 3548,
+          "position": 141,
+          "rank": 0,
+          "true_prob": 0.9823992252349854,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.2514738142490387,
+          "argmax_token": 9051,
+          "echo": false,
+          "input_token": 185,
+          "position": 142,
+          "rank": 2,
+          "true_prob": 0.07092441618442535,
+          "true_token": 28462
+        },
+        {
+          "argmax_prob": 0.18936477601528168,
+          "argmax_token": 12059,
+          "echo": false,
+          "input_token": 28462,
+          "position": 143,
+          "rank": 0,
+          "true_prob": 0.18936477601528168,
+          "true_token": 12059
+        },
+        {
+          "argmax_prob": 0.8326933979988098,
+          "argmax_token": 9448,
+          "echo": false,
+          "input_token": 12059,
+          "position": 144,
+          "rank": 79,
+          "true_prob": 0.00012740308011416346,
+          "true_token": 4231
+        },
+        {
+          "argmax_prob": 0.13380290567874908,
+          "argmax_token": 10141,
+          "echo": false,
+          "input_token": 4231,
+          "position": 145,
+          "rank": 1,
+          "true_prob": 0.09275577962398529,
+          "true_token": 989
+        },
+        {
+          "argmax_prob": 0.420047402381897,
+          "argmax_token": 119650,
+          "echo": false,
+          "input_token": 989,
+          "position": 146,
+          "rank": 1,
+          "true_prob": 0.21763692796230316,
+          "true_token": 1483
+        },
+        {
+          "argmax_prob": 0.07279181480407715,
+          "argmax_token": 989,
+          "echo": false,
+          "input_token": 1483,
+          "position": 147,
+          "rank": 3,
+          "true_prob": 0.03774899244308472,
+          "true_token": 252
+        },
+        {
+          "argmax_prob": 0.22640635073184967,
+          "argmax_token": 12728,
+          "echo": false,
+          "input_token": 252,
+          "position": 148,
+          "rank": 16,
+          "true_prob": 0.015388467349112034,
+          "true_token": 1802
+        },
+        {
+          "argmax_prob": 0.4235360622406006,
+          "argmax_token": 38739,
+          "echo": false,
+          "input_token": 1802,
+          "position": 149,
+          "rank": 12,
+          "true_prob": 0.008402889594435692,
+          "true_token": 47857
+        },
+        {
+          "argmax_prob": 0.8956639170646667,
+          "argmax_token": 12592,
+          "echo": false,
+          "input_token": 47857,
+          "position": 150,
+          "rank": 401,
+          "true_prob": 1.741396772558801e-05,
+          "true_token": 38739
+        },
+        {
+          "argmax_prob": 0.5645728707313538,
+          "argmax_token": 7154,
+          "echo": false,
+          "input_token": 38739,
+          "position": 151,
+          "rank": 2,
+          "true_prob": 0.013959020376205444,
+          "true_token": 3822
+        },
+        {
+          "argmax_prob": 0.7678176760673523,
+          "argmax_token": 1178,
+          "echo": false,
+          "input_token": 3822,
+          "position": 152,
+          "rank": 0,
+          "true_prob": 0.7678176760673523,
+          "true_token": 1178
+        },
+        {
+          "argmax_prob": 0.3363284468650818,
+          "argmax_token": 13,
+          "echo": false,
+          "input_token": 1178,
+          "position": 153,
+          "rank": 1,
+          "true_prob": 0.16127707064151764,
+          "true_token": 412
+        },
+        {
+          "argmax_prob": 0.12168993055820465,
+          "argmax_token": 13,
+          "echo": false,
+          "input_token": 412,
+          "position": 154,
+          "rank": 1274,
+          "true_prob": 5.906821752432734e-05,
+          "true_token": 6331
+        },
+        {
+          "argmax_prob": 0.5396645665168762,
+          "argmax_token": 244,
+          "echo": false,
+          "input_token": 6331,
+          "position": 155,
+          "rank": 0,
+          "true_prob": 0.5396645665168762,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.10771095752716064,
+          "argmax_token": 16391,
+          "echo": false,
+          "input_token": 244,
+          "position": 156,
+          "rank": 1,
+          "true_prob": 0.10530497878789902,
+          "true_token": 10923
+        },
+        {
+          "argmax_prob": 0.09889830648899078,
+          "argmax_token": 11551,
+          "echo": false,
+          "input_token": 10923,
+          "position": 157,
+          "rank": 1,
+          "true_prob": 0.05186891928315163,
+          "true_token": 12273
+        },
+        {
+          "argmax_prob": 0.3166550099849701,
+          "argmax_token": 20054,
+          "echo": false,
+          "input_token": 12273,
+          "position": 158,
+          "rank": 5,
+          "true_prob": 0.029862770810723305,
+          "true_token": 3779
+        },
+        {
+          "argmax_prob": 0.16430124640464783,
+          "argmax_token": 2719,
+          "echo": false,
+          "input_token": 3779,
+          "position": 159,
+          "rank": 1,
+          "true_prob": 0.12065073847770691,
+          "true_token": 279
+        },
+        {
+          "argmax_prob": 0.5336390137672424,
+          "argmax_token": 252,
+          "echo": false,
+          "input_token": 279,
+          "position": 160,
+          "rank": 21,
+          "true_prob": 0.0033966482151299715,
+          "true_token": 549
+        },
+        {
+          "argmax_prob": 0.9178066849708557,
+          "argmax_token": 2719,
+          "echo": false,
+          "input_token": 549,
+          "position": 161,
+          "rank": 0,
+          "true_prob": 0.9178066849708557,
+          "true_token": 2719
+        },
+        {
+          "argmax_prob": 0.31357064843177795,
+          "argmax_token": 20054,
+          "echo": false,
+          "input_token": 2719,
+          "position": 162,
+          "rank": 57,
+          "true_prob": 0.0013959178468212485,
+          "true_token": 356
+        },
+        {
+          "argmax_prob": 0.07086490094661713,
+          "argmax_token": 252,
+          "echo": false,
+          "input_token": 356,
+          "position": 163,
+          "rank": 7,
+          "true_prob": 0.03870166465640068,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.1595762073993683,
+          "argmax_token": 4382,
+          "echo": false,
+          "input_token": 244,
+          "position": 164,
+          "rank": 8,
+          "true_prob": 0.01475531142205,
+          "true_token": 4056
+        },
+        {
+          "argmax_prob": 0.07490384578704834,
+          "argmax_token": 377,
+          "echo": false,
+          "input_token": 4056,
+          "position": 165,
+          "rank": 3237,
+          "true_prob": 9.421342838322744e-06,
+          "true_token": 23386
+        },
+        {
+          "argmax_prob": 0.10317857563495636,
+          "argmax_token": 252,
+          "echo": false,
+          "input_token": 23386,
+          "position": 166,
+          "rank": 4,
+          "true_prob": 0.05396895855665207,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.43605899810791016,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 244,
+          "position": 167,
+          "rank": 180,
+          "true_prob": 0.00016256717208307236,
+          "true_token": 2701
+        },
+        {
+          "argmax_prob": 0.7664347887039185,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 2701,
+          "position": 168,
+          "rank": 0,
+          "true_prob": 0.7664347887039185,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.09646178781986237,
+          "argmax_token": 12,
+          "echo": false,
+          "input_token": 185,
+          "position": 169,
+          "rank": 203,
+          "true_prob": 0.00032439298229292035,
+          "true_token": 767
+        },
+        {
+          "argmax_prob": 0.32164543867111206,
+          "argmax_token": 12533,
+          "echo": false,
+          "input_token": 767,
+          "position": 170,
+          "rank": 0,
+          "true_prob": 0.32164543867111206,
+          "true_token": 12533
+        },
+        {
+          "argmax_prob": 0.09000930190086365,
+          "argmax_token": 1285,
+          "echo": false,
+          "input_token": 12533,
+          "position": 171,
+          "rank": 44,
+          "true_prob": 0.0020886838901787996,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.07841373980045319,
+          "argmax_token": 424,
+          "echo": false,
+          "input_token": 13,
+          "position": 172,
+          "rank": 4911,
+          "true_prob": 2.672953087312635e-06,
+          "true_token": 37336
+        },
+        {
+          "argmax_prob": 0.20092611014842987,
+          "argmax_token": 27921,
+          "echo": false,
+          "input_token": 37336,
+          "position": 173,
+          "rank": 29,
+          "true_prob": 0.003131994977593422,
+          "true_token": 252
+        },
+        {
+          "argmax_prob": 0.3053402602672577,
+          "argmax_token": 1873,
+          "echo": false,
+          "input_token": 252,
+          "position": 174,
+          "rank": 45,
+          "true_prob": 0.0021984551567584276,
+          "true_token": 13380
+        },
+        {
+          "argmax_prob": 0.691033661365509,
+          "argmax_token": 2438,
+          "echo": false,
+          "input_token": 13380,
+          "position": 175,
+          "rank": 17,
+          "true_prob": 0.0024797762744128704,
+          "true_token": 4325
+        },
+        {
+          "argmax_prob": 0.4725418984889984,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 4325,
+          "position": 176,
+          "rank": 0,
+          "true_prob": 0.4725418984889984,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.24903333187103271,
+          "argmax_token": 1684,
+          "echo": false,
+          "input_token": 11,
+          "position": 177,
+          "rank": 62,
+          "true_prob": 0.0019460971234366298,
+          "true_token": 92541
+        },
+        {
+          "argmax_prob": 0.10250969976186752,
+          "argmax_token": 29976,
+          "echo": false,
+          "input_token": 92541,
+          "position": 178,
+          "rank": 21,
+          "true_prob": 0.009274214506149292,
+          "true_token": 289
+        },
+        {
+          "argmax_prob": 0.25975632667541504,
+          "argmax_token": 2438,
+          "echo": false,
+          "input_token": 289,
+          "position": 179,
+          "rank": 651,
+          "true_prob": 3.668930730782449e-05,
+          "true_token": 24177
+        },
+        {
+          "argmax_prob": 0.14640893042087555,
+          "argmax_token": 21216,
+          "echo": false,
+          "input_token": 24177,
+          "position": 180,
+          "rank": 119,
+          "true_prob": 0.0008547616889700294,
+          "true_token": 12137
+        },
+        {
+          "argmax_prob": 0.43639370799064636,
+          "argmax_token": 4798,
+          "echo": false,
+          "input_token": 12137,
+          "position": 181,
+          "rank": 1,
+          "true_prob": 0.15642821788787842,
+          "true_token": 1510
+        },
+        {
+          "argmax_prob": 0.6102206707000732,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 1510,
+          "position": 182,
+          "rank": 0,
+          "true_prob": 0.6102206707000732,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.33114805817604065,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 11,
+          "position": 183,
+          "rank": 82,
+          "true_prob": 0.0003638555353973061,
+          "true_token": 5033
+        },
+        {
+          "argmax_prob": 0.7992316484451294,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 5033,
+          "position": 184,
+          "rank": 0,
+          "true_prob": 0.7992316484451294,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.13588693737983704,
+          "argmax_token": 6803,
+          "echo": false,
+          "input_token": 185,
+          "position": 185,
+          "rank": 63,
+          "true_prob": 0.0010892958380281925,
+          "true_token": 15941
+        },
+        {
+          "argmax_prob": 0.7099748253822327,
+          "argmax_token": 277,
+          "echo": false,
+          "input_token": 15941,
+          "position": 186,
+          "rank": 0,
+          "true_prob": 0.7099748253822327,
+          "true_token": 277
+        },
+        {
+          "argmax_prob": 0.5798429846763611,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 277,
+          "position": 187,
+          "rank": 0,
+          "true_prob": 0.5798429846763611,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.2449827492237091,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 11,
+          "position": 188,
+          "rank": 10526,
+          "true_prob": 5.04579304561048e-07,
+          "true_token": 74772
+        },
+        {
+          "argmax_prob": 0.07396984100341797,
+          "argmax_token": 3162,
+          "echo": false,
+          "input_token": 74772,
+          "position": 189,
+          "rank": 19,
+          "true_prob": 0.010070644319057465,
+          "true_token": 360
+        },
+        {
+          "argmax_prob": 0.48470285534858704,
+          "argmax_token": 21953,
+          "echo": false,
+          "input_token": 360,
+          "position": 190,
+          "rank": 0,
+          "true_prob": 0.48470285534858704,
+          "true_token": 21953
+        },
+        {
+          "argmax_prob": 0.13034072518348694,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 21953,
+          "position": 191,
+          "rank": 1,
+          "true_prob": 0.0673227310180664,
+          "true_token": 289
+        },
+        {
+          "argmax_prob": 0.13378483057022095,
+          "argmax_token": 2720,
+          "echo": false,
+          "input_token": 289,
+          "position": 192,
+          "rank": 2260,
+          "true_prob": 1.247407817572821e-05,
+          "true_token": 20781
+        },
+        {
+          "argmax_prob": 0.05817744880914688,
+          "argmax_token": 9655,
+          "echo": false,
+          "input_token": 20781,
+          "position": 193,
+          "rank": 0,
+          "true_prob": 0.05817744880914688,
+          "true_token": 9655
+        },
+        {
+          "argmax_prob": 0.9257651567459106,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 9655,
+          "position": 194,
+          "rank": 0,
+          "true_prob": 0.9257651567459106,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.2779904901981354,
+          "argmax_token": 28434,
+          "echo": false,
+          "input_token": 11,
+          "position": 195,
+          "rank": 245,
+          "true_prob": 0.0004110797599423677,
+          "true_token": 12728
+        },
+        {
+          "argmax_prob": 0.12671248614788055,
+          "argmax_token": 989,
+          "echo": false,
+          "input_token": 12728,
+          "position": 196,
+          "rank": 418,
+          "true_prob": 0.00016699917614459991,
+          "true_token": 31331
+        },
+        {
+          "argmax_prob": 0.19576603174209595,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 31331,
+          "position": 197,
+          "rank": 0,
+          "true_prob": 0.19576603174209595,
+          "true_token": 289
+        },
+        {
+          "argmax_prob": 0.5691050887107849,
+          "argmax_token": 6207,
+          "echo": false,
+          "input_token": 289,
+          "position": 198,
+          "rank": 5,
+          "true_prob": 0.005670934449881315,
+          "true_token": 989
+        },
+        {
+          "argmax_prob": 0.9664665460586548,
+          "argmax_token": 3769,
+          "echo": false,
+          "input_token": 989,
+          "position": 199,
+          "rank": 0,
+          "true_prob": 0.9664665460586548,
+          "true_token": 3769
+        },
+        {
+          "argmax_prob": 0.8234504461288452,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 3769,
+          "position": 200,
+          "rank": 3,
+          "true_prob": 0.00514246616512537,
+          "true_token": 622
+        },
+        {
+          "argmax_prob": 0.4221028983592987,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 622,
+          "position": 201,
+          "rank": 6958,
+          "true_prob": 5.647418674925575e-07,
+          "true_token": 100423
+        },
+        {
+          "argmax_prob": 0.07922477275133133,
+          "argmax_token": 476,
+          "echo": false,
+          "input_token": 100423,
+          "position": 202,
+          "rank": 33,
+          "true_prob": 0.0031811329536139965,
+          "true_token": 12593
+        },
+        {
+          "argmax_prob": 0.6221075057983398,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 12593,
+          "position": 203,
+          "rank": 1,
+          "true_prob": 0.21520878374576569,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.7657831907272339,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 11,
+          "position": 204,
+          "rank": 252,
+          "true_prob": 0.0001111535748350434,
+          "true_token": 3973
+        },
+        {
+          "argmax_prob": 0.9983887672424316,
+          "argmax_token": 2219,
+          "echo": false,
+          "input_token": 3973,
+          "position": 205,
+          "rank": 0,
+          "true_prob": 0.9983887672424316,
+          "true_token": 2219
+        },
+        {
+          "argmax_prob": 0.3243676424026489,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 2219,
+          "position": 206,
+          "rank": 1,
+          "true_prob": 0.09099836647510529,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.9718582630157471,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 11,
+          "position": 207,
+          "rank": 0,
+          "true_prob": 0.9718582630157471,
+          "true_token": 289
+        },
+        {
+          "argmax_prob": 0.4179828464984894,
+          "argmax_token": 43192,
+          "echo": false,
+          "input_token": 289,
+          "position": 208,
+          "rank": 13,
+          "true_prob": 0.007628498133271933,
+          "true_token": 50509
+        },
+        {
+          "argmax_prob": 0.1728973090648651,
+          "argmax_token": 7758,
+          "echo": false,
+          "input_token": 50509,
+          "position": 209,
+          "rank": 45,
+          "true_prob": 0.00200110231526196,
+          "true_token": 6678
+        },
+        {
+          "argmax_prob": 0.21546337008476257,
+          "argmax_token": 13,
+          "echo": false,
+          "input_token": 6678,
+          "position": 210,
+          "rank": 0,
+          "true_prob": 0.21546337008476257,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.2210036963224411,
+          "argmax_token": 286,
+          "echo": false,
+          "input_token": 13,
+          "position": 211,
+          "rank": 46,
+          "true_prob": 0.0021104072220623493,
+          "true_token": 26869
+        },
+        {
+          "argmax_prob": 0.06322000920772552,
+          "argmax_token": 33959,
+          "echo": false,
+          "input_token": 26869,
+          "position": 212,
+          "rank": 3,
+          "true_prob": 0.045946139842271805,
+          "true_token": 252
+        },
+        {
+          "argmax_prob": 0.45082616806030273,
+          "argmax_token": 7758,
+          "echo": false,
+          "input_token": 252,
+          "position": 213,
+          "rank": 182,
+          "true_prob": 0.00035971030592918396,
+          "true_token": 2470
+        },
+        {
+          "argmax_prob": 0.8479424118995667,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 2470,
+          "position": 214,
+          "rank": 0,
+          "true_prob": 0.8479424118995667,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.49445971846580505,
+          "argmax_token": 80133,
+          "echo": false,
+          "input_token": 185,
+          "position": 215,
+          "rank": 0,
+          "true_prob": 0.49445971846580505,
+          "true_token": 80133
+        },
+        {
+          "argmax_prob": 0.6893048882484436,
+          "argmax_token": 46896,
+          "echo": false,
+          "input_token": 80133,
+          "position": 216,
+          "rank": 0,
+          "true_prob": 0.6893048882484436,
+          "true_token": 46896
+        },
+        {
+          "argmax_prob": 0.41636285185813904,
+          "argmax_token": 69586,
+          "echo": false,
+          "input_token": 46896,
+          "position": 217,
+          "rank": 25,
+          "true_prob": 0.0017917572986334562,
+          "true_token": 1418
+        },
+        {
+          "argmax_prob": 0.35881659388542175,
+          "argmax_token": 252,
+          "echo": false,
+          "input_token": 1418,
+          "position": 218,
+          "rank": 7674,
+          "true_prob": 2.3235797925735824e-06,
+          "true_token": 6142
+        },
+        {
+          "argmax_prob": 0.13780587911605835,
+          "argmax_token": 41116,
+          "echo": false,
+          "input_token": 6142,
+          "position": 219,
+          "rank": 65,
+          "true_prob": 0.0017516049556434155,
+          "true_token": 5050
+        },
+        {
+          "argmax_prob": 0.8892562985420227,
+          "argmax_token": 562,
+          "echo": false,
+          "input_token": 5050,
+          "position": 220,
+          "rank": 0,
+          "true_prob": 0.8892562985420227,
+          "true_token": 562
+        },
+        {
+          "argmax_prob": 0.29353412985801697,
+          "argmax_token": 252,
+          "echo": false,
+          "input_token": 562,
+          "position": 221,
+          "rank": 1040,
+          "true_prob": 9.241988664143719e-06,
+          "true_token": 5049
+        },
+        {
+          "argmax_prob": 0.56648188829422,
+          "argmax_token": 8264,
+          "echo": false,
+          "input_token": 5049,
+          "position": 222,
+          "rank": 14424,
+          "true_prob": 1.3837242462955146e-08,
+          "true_token": 74740
+        },
+        {
+          "argmax_prob": 0.5444474816322327,
+          "argmax_token": 8264,
+          "echo": false,
+          "input_token": 74740,
+          "position": 223,
+          "rank": 64570,
+          "true_prob": 1.244072667105911e-08,
+          "true_token": 4184
+        },
+        {
+          "argmax_prob": 0.10858028382062912,
+          "argmax_token": 298,
+          "echo": false,
+          "input_token": 4184,
+          "position": 224,
+          "rank": 0,
+          "true_prob": 0.10858028382062912,
+          "true_token": 298
+        },
+        {
+          "argmax_prob": 0.8743611574172974,
+          "argmax_token": 41963,
+          "echo": false,
+          "input_token": 298,
+          "position": 225,
+          "rank": 1,
+          "true_prob": 0.12311545759439468,
+          "true_token": 7657
+        },
+        {
+          "argmax_prob": 0.7914810180664062,
+          "argmax_token": 41963,
+          "echo": false,
+          "input_token": 7657,
+          "position": 226,
+          "rank": 440,
+          "true_prob": 2.664214844116941e-05,
+          "true_token": 574
+        },
+        {
+          "argmax_prob": 0.9657671451568604,
+          "argmax_token": 3577,
+          "echo": false,
+          "input_token": 574,
+          "position": 227,
+          "rank": 0,
+          "true_prob": 0.9657671451568604,
+          "true_token": 3577
+        },
+        {
+          "argmax_prob": 0.10381011664867401,
+          "argmax_token": 26,
+          "echo": false,
+          "input_token": 3577,
+          "position": 228,
+          "rank": 1,
+          "true_prob": 0.08329770714044571,
+          "true_token": 289
+        },
+        {
+          "argmax_prob": 0.9187107086181641,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 289,
+          "position": 229,
+          "rank": 0,
+          "true_prob": 0.9187107086181641,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.1076870858669281,
+          "argmax_token": 4140,
+          "echo": false,
+          "input_token": 185,
+          "position": 230,
+          "rank": 2,
+          "true_prob": 0.09023784846067429,
+          "true_token": 6393
+        },
+        {
+          "argmax_prob": 0.06569721549749374,
+          "argmax_token": 8649,
+          "echo": false,
+          "input_token": 6393,
+          "position": 231,
+          "rank": 4,
+          "true_prob": 0.016156090423464775,
+          "true_token": 275
+        },
+        {
+          "argmax_prob": 0.10306296497583389,
+          "argmax_token": 11405,
+          "echo": false,
+          "input_token": 275,
+          "position": 232,
+          "rank": 173,
+          "true_prob": 0.0005631448584608734,
+          "true_token": 15645
+        },
+        {
+          "argmax_prob": 0.07438238710165024,
+          "argmax_token": 1035,
+          "echo": false,
+          "input_token": 15645,
+          "position": 233,
+          "rank": 12,
+          "true_prob": 0.013895723968744278,
+          "true_token": 7728
+        },
+        {
+          "argmax_prob": 0.07049793750047684,
+          "argmax_token": 13568,
+          "echo": false,
+          "input_token": 7728,
+          "position": 234,
+          "rank": 6272,
+          "true_prob": 2.5187496248690877e-06,
+          "true_token": 74740
+        },
+        {
+          "argmax_prob": 0.078734390437603,
+          "argmax_token": 48232,
+          "echo": false,
+          "input_token": 74740,
+          "position": 235,
+          "rank": 778,
+          "true_prob": 9.123673953581601e-05,
+          "true_token": 3336
+        },
+        {
+          "argmax_prob": 0.12127387523651123,
+          "argmax_token": 46235,
+          "echo": false,
+          "input_token": 3336,
+          "position": 236,
+          "rank": 69,
+          "true_prob": 0.0017149458872154355,
+          "true_token": 11178
+        },
+        {
+          "argmax_prob": 0.3611237108707428,
+          "argmax_token": 13568,
+          "echo": false,
+          "input_token": 11178,
+          "position": 237,
+          "rank": 38,
+          "true_prob": 0.0016314948443323374,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.14558890461921692,
+          "argmax_token": 13568,
+          "echo": false,
+          "input_token": 13,
+          "position": 238,
+          "rank": 4298,
+          "true_prob": 5.218308615440037e-06,
+          "true_token": 13776
+        },
+        {
+          "argmax_prob": 0.19155125319957733,
+          "argmax_token": 19366,
+          "echo": false,
+          "input_token": 13776,
+          "position": 239,
+          "rank": 350,
+          "true_prob": 0.000184573233127594,
+          "true_token": 552
+        },
+        {
+          "argmax_prob": 0.5702530741691589,
+          "argmax_token": 3606,
+          "echo": false,
+          "input_token": 552,
+          "position": 240,
+          "rank": 0,
+          "true_prob": 0.5702530741691589,
+          "true_token": 3606
+        },
+        {
+          "argmax_prob": 0.16838808357715607,
+          "argmax_token": 252,
+          "echo": false,
+          "input_token": 3606,
+          "position": 241,
+          "rank": 4,
+          "true_prob": 0.02443099021911621,
+          "true_token": 5308
+        },
+        {
+          "argmax_prob": 0.15052105486392975,
+          "argmax_token": 5164,
+          "echo": false,
+          "input_token": 5308,
+          "position": 242,
+          "rank": 5,
+          "true_prob": 0.023315412923693657,
+          "true_token": 14839
+        },
+        {
+          "argmax_prob": 0.14121146500110626,
+          "argmax_token": 11161,
+          "echo": false,
+          "input_token": 14839,
+          "position": 243,
+          "rank": 4,
+          "true_prob": 0.07106480002403259,
+          "true_token": 8338
+        },
+        {
+          "argmax_prob": 0.9788545370101929,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 8338,
+          "position": 244,
+          "rank": 0,
+          "true_prob": 0.9788545370101929,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.503847062587738,
+          "argmax_token": 261,
+          "echo": false,
+          "input_token": 185,
+          "position": 245,
+          "rank": 3,
+          "true_prob": 0.06207572668790817,
+          "true_token": 76
+        },
+        {
+          "argmax_prob": 0.9959080219268799,
+          "argmax_token": 4322,
+          "echo": false,
+          "input_token": 76,
+          "position": 246,
+          "rank": 0,
+          "true_prob": 0.9959080219268799,
+          "true_token": 4322
+        },
+        {
+          "argmax_prob": 0.03732139617204666,
+          "argmax_token": 6066,
+          "echo": false,
+          "input_token": 4322,
+          "position": 247,
+          "rank": 5,
+          "true_prob": 0.0172499418258667,
+          "true_token": 289
+        },
+        {
+          "argmax_prob": 0.18504129350185394,
+          "argmax_token": 369,
+          "echo": false,
+          "input_token": 289,
+          "position": 248,
+          "rank": 90,
+          "true_prob": 0.0009386858437210321,
+          "true_token": 3904
+        },
+        {
+          "argmax_prob": 0.11793611198663712,
+          "argmax_token": 859,
+          "echo": false,
+          "input_token": 3904,
+          "position": 249,
+          "rank": 6,
+          "true_prob": 0.04073408246040344,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.27151188254356384,
+          "argmax_token": 47210,
+          "echo": false,
+          "input_token": 244,
+          "position": 250,
+          "rank": 12,
+          "true_prob": 0.00795588456094265,
+          "true_token": 11107
+        },
+        {
+          "argmax_prob": 0.8065810799598694,
+          "argmax_token": 47210,
+          "echo": false,
+          "input_token": 11107,
+          "position": 251,
+          "rank": 0,
+          "true_prob": 0.8065810799598694,
+          "true_token": 47210
+        },
+        {
+          "argmax_prob": 0.10466551780700684,
+          "argmax_token": 8629,
+          "echo": false,
+          "input_token": 47210,
+          "position": 252,
+          "rank": 6,
+          "true_prob": 0.042205050587654114,
+          "true_token": 356
+        },
+        {
+          "argmax_prob": 0.6821890473365784,
+          "argmax_token": 1346,
+          "echo": false,
+          "input_token": 356,
+          "position": 253,
+          "rank": 0,
+          "true_prob": 0.6821890473365784,
+          "true_token": 1346
+        },
+        {
+          "argmax_prob": 0.3546677529811859,
+          "argmax_token": 926,
+          "echo": false,
+          "input_token": 1346,
+          "position": 254,
+          "rank": 1,
+          "true_prob": 0.20385004580020905,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.20405398309230804,
+          "argmax_token": 286,
+          "echo": false,
+          "input_token": 13,
+          "position": 255,
+          "rank": 718,
+          "true_prob": 3.92072724935133e-05,
+          "true_token": 10479
+        },
+        {
+          "argmax_prob": 0.10215216875076294,
+          "argmax_token": 434,
+          "echo": false,
+          "input_token": 10479,
+          "position": 256,
+          "rank": 17,
+          "true_prob": 0.009054613299667835,
+          "true_token": 413
+        },
+        {
+          "argmax_prob": 0.3765823245048523,
+          "argmax_token": 840,
+          "echo": false,
+          "input_token": 413,
+          "position": 257,
+          "rank": 2,
+          "true_prob": 0.15658575296401978,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.3516976535320282,
+          "argmax_token": 111616,
+          "echo": false,
+          "input_token": 244,
+          "position": 258,
+          "rank": 146,
+          "true_prob": 0.00022381474263966084,
+          "true_token": 72442
+        },
+        {
+          "argmax_prob": 0.4065325856208801,
+          "argmax_token": 30587,
+          "echo": false,
+          "input_token": 72442,
+          "position": 259,
+          "rank": 5,
+          "true_prob": 0.01681356504559517,
+          "true_token": 9523
+        },
+        {
+          "argmax_prob": 0.8580366373062134,
+          "argmax_token": 654,
+          "echo": false,
+          "input_token": 9523,
+          "position": 260,
+          "rank": 0,
+          "true_prob": 0.8580366373062134,
+          "true_token": 654
+        },
+        {
+          "argmax_prob": 0.8736379742622375,
+          "argmax_token": 3111,
+          "echo": false,
+          "input_token": 654,
+          "position": 261,
+          "rank": 0,
+          "true_prob": 0.8736379742622375,
+          "true_token": 3111
+        },
+        {
+          "argmax_prob": 0.9101717472076416,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 3111,
+          "position": 262,
+          "rank": 0,
+          "true_prob": 0.9101717472076416,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.5069208145141602,
+          "argmax_token": 4140,
+          "echo": false,
+          "input_token": 185,
+          "position": 263,
+          "rank": 1,
+          "true_prob": 0.1463310867547989,
+          "true_token": 476
+        },
+        {
+          "argmax_prob": 0.1323402374982834,
+          "argmax_token": 369,
+          "echo": false,
+          "input_token": 476,
+          "position": 264,
+          "rank": 3406,
+          "true_prob": 1.535086084913928e-05,
+          "true_token": 11405
+        },
+        {
+          "argmax_prob": 0.1290953904390335,
+          "argmax_token": 23349,
+          "echo": false,
+          "input_token": 11405,
+          "position": 265,
+          "rank": 17,
+          "true_prob": 0.008156551979482174,
+          "true_token": 964
+        },
+        {
+          "argmax_prob": 0.1510416716337204,
+          "argmax_token": 23349,
+          "echo": false,
+          "input_token": 964,
+          "position": 266,
+          "rank": 2,
+          "true_prob": 0.0710589811205864,
+          "true_token": 84785
+        },
+        {
+          "argmax_prob": 0.7668106555938721,
+          "argmax_token": 29280,
+          "echo": false,
+          "input_token": 84785,
+          "position": 267,
+          "rank": 0,
+          "true_prob": 0.7668106555938721,
+          "true_token": 29280
+        },
+        {
+          "argmax_prob": 0.2681369185447693,
+          "argmax_token": 3785,
+          "echo": false,
+          "input_token": 29280,
+          "position": 268,
+          "rank": 1,
+          "true_prob": 0.2527484595775604,
+          "true_token": 11443
+        },
+        {
+          "argmax_prob": 0.1406729817390442,
+          "argmax_token": 356,
+          "echo": false,
+          "input_token": 11443,
+          "position": 269,
+          "rank": 1,
+          "true_prob": 0.13872601091861725,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.578350841999054,
+          "argmax_token": 286,
+          "echo": false,
+          "input_token": 13,
+          "position": 270,
+          "rank": 9,
+          "true_prob": 0.006878515239804983,
+          "true_token": 6663
+        },
+        {
+          "argmax_prob": 0.08685530722141266,
+          "argmax_token": 4727,
+          "echo": false,
+          "input_token": 6663,
+          "position": 271,
+          "rank": 1105,
+          "true_prob": 5.2353421779116616e-05,
+          "true_token": 3727
+        },
+        {
+          "argmax_prob": 0.2436463087797165,
+          "argmax_token": 81988,
+          "echo": false,
+          "input_token": 3727,
+          "position": 272,
+          "rank": 6,
+          "true_prob": 0.041896428912878036,
+          "true_token": 12280
+        },
+        {
+          "argmax_prob": 0.3922724723815918,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 12280,
+          "position": 273,
+          "rank": 0,
+          "true_prob": 0.3922724723815918,
+          "true_token": 289
+        },
+        {
+          "argmax_prob": 0.11714133620262146,
+          "argmax_token": 1358,
+          "echo": false,
+          "input_token": 289,
+          "position": 274,
+          "rank": 275,
+          "true_prob": 0.00020013173343613744,
+          "true_token": 4290
+        },
+        {
+          "argmax_prob": 0.764980673789978,
+          "argmax_token": 11551,
+          "echo": false,
+          "input_token": 4290,
+          "position": 275,
+          "rank": 0,
+          "true_prob": 0.764980673789978,
+          "true_token": 11551
+        },
+        {
+          "argmax_prob": 0.4065883457660675,
+          "argmax_token": 11088,
+          "echo": false,
+          "input_token": 11551,
+          "position": 276,
+          "rank": 0,
+          "true_prob": 0.4065883457660675,
+          "true_token": 11088
+        },
+        {
+          "argmax_prob": 0.9016562104225159,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 11088,
+          "position": 277,
+          "rank": 0,
+          "true_prob": 0.9016562104225159,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.3440898656845093,
+          "argmax_token": 1764,
+          "echo": false,
+          "input_token": 185,
+          "position": 278,
+          "rank": 2,
+          "true_prob": 0.10576958954334259,
+          "true_token": 9747
+        },
+        {
+          "argmax_prob": 0.5229418873786926,
+          "argmax_token": 2676,
+          "echo": false,
+          "input_token": 9747,
+          "position": 279,
+          "rank": 168,
+          "true_prob": 0.0002470192557666451,
+          "true_token": 275
+        },
+        {
+          "argmax_prob": 0.6287278532981873,
+          "argmax_token": 5278,
+          "echo": false,
+          "input_token": 275,
+          "position": 280,
+          "rank": 4,
+          "true_prob": 0.02462475560605526,
+          "true_token": 20612
+        },
+        {
+          "argmax_prob": 0.24572591483592987,
+          "argmax_token": 377,
+          "echo": false,
+          "input_token": 20612,
+          "position": 281,
+          "rank": 41,
+          "true_prob": 0.0019157626666128635,
+          "true_token": 1774
+        },
+        {
+          "argmax_prob": 0.6562501192092896,
+          "argmax_token": 2499,
+          "echo": false,
+          "input_token": 1774,
+          "position": 282,
+          "rank": 108,
+          "true_prob": 0.00023087555018719286,
+          "true_token": 3537
+        },
+        {
+          "argmax_prob": 0.5458385944366455,
+          "argmax_token": 2499,
+          "echo": false,
+          "input_token": 3537,
+          "position": 283,
+          "rank": 3,
+          "true_prob": 0.0349995456635952,
+          "true_token": 252
+        },
+        {
+          "argmax_prob": 0.30307358503341675,
+          "argmax_token": 1287,
+          "echo": false,
+          "input_token": 252,
+          "position": 284,
+          "rank": 3,
+          "true_prob": 0.06793862581253052,
+          "true_token": 3779
+        },
+        {
+          "argmax_prob": 0.2939877510070801,
+          "argmax_token": 2602,
+          "echo": false,
+          "input_token": 3779,
+          "position": 285,
+          "rank": 4,
+          "true_prob": 0.04240436106920242,
+          "true_token": 1079
+        },
+        {
+          "argmax_prob": 0.3005870580673218,
+          "argmax_token": 5050,
+          "echo": false,
+          "input_token": 1079,
+          "position": 286,
+          "rank": 57,
+          "true_prob": 0.0004482483782339841,
+          "true_token": 5278
+        },
+        {
+          "argmax_prob": 0.9081347584724426,
+          "argmax_token": 8714,
+          "echo": false,
+          "input_token": 5278,
+          "position": 287,
+          "rank": 0,
+          "true_prob": 0.9081347584724426,
+          "true_token": 8714
+        },
+        {
+          "argmax_prob": 0.4879560172557831,
+          "argmax_token": 13,
+          "echo": false,
+          "input_token": 8714,
+          "position": 288,
+          "rank": 0,
+          "true_prob": 0.4879560172557831,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.36364564299583435,
+          "argmax_token": 286,
+          "echo": false,
+          "input_token": 13,
+          "position": 289,
+          "rank": 6335,
+          "true_prob": 2.5035722046595765e-06,
+          "true_token": 74128
+        },
+        {
+          "argmax_prob": 0.08347156643867493,
+          "argmax_token": 277,
+          "echo": false,
+          "input_token": 74128,
+          "position": 290,
+          "rank": 17,
+          "true_prob": 0.004206557292491198,
+          "true_token": 356
+        },
+        {
+          "argmax_prob": 0.25932666659355164,
+          "argmax_token": 244,
+          "echo": false,
+          "input_token": 356,
+          "position": 291,
+          "rank": 8,
+          "true_prob": 0.03190506994724274,
+          "true_token": 552
+        },
+        {
+          "argmax_prob": 0.7068654894828796,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 552,
+          "position": 292,
+          "rank": 0,
+          "true_prob": 0.7068654894828796,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.31725338101387024,
+          "argmax_token": 242,
+          "echo": false,
+          "input_token": 185,
+          "position": 293,
+          "rank": 8,
+          "true_prob": 0.010566052049398422,
+          "true_token": 81997
+        },
+        {
+          "argmax_prob": 0.06605161726474762,
+          "argmax_token": 206,
+          "echo": false,
+          "input_token": 81997,
+          "position": 294,
+          "rank": 0,
+          "true_prob": 0.06605161726474762,
+          "true_token": 206
+        },
+        {
+          "argmax_prob": 0.46192464232444763,
+          "argmax_token": 4102,
+          "echo": false,
+          "input_token": 206,
+          "position": 295,
+          "rank": 14,
+          "true_prob": 0.0038485685363411903,
+          "true_token": 16
+        },
+        {
+          "argmax_prob": 0.9932491779327393,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 16,
+          "position": 296,
+          "rank": 0,
+          "true_prob": 0.9932491779327393,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.4558456242084503,
+          "argmax_token": 979,
+          "echo": false,
+          "input_token": 11,
+          "position": 297,
+          "rank": 3,
+          "true_prob": 0.08040124922990799,
+          "true_token": 1545
+        },
+        {
+          "argmax_prob": 0.5011571645736694,
+          "argmax_token": 5976,
+          "echo": false,
+          "input_token": 1545,
+          "position": 298,
+          "rank": 14,
+          "true_prob": 0.003456361126154661,
+          "true_token": 4235
+        },
+        {
+          "argmax_prob": 0.11754636466503143,
+          "argmax_token": 287,
+          "echo": false,
+          "input_token": 4235,
+          "position": 299,
+          "rank": 9,
+          "true_prob": 0.02123120240867138,
+          "true_token": 26
+        },
+        {
+          "argmax_prob": 0.08931444585323334,
+          "argmax_token": 39763,
+          "echo": false,
+          "input_token": 26,
+          "position": 300,
+          "rank": 129,
+          "true_prob": 0.0006387370522134006,
+          "true_token": 739
+        },
+        {
+          "argmax_prob": 0.9940536618232727,
+          "argmax_token": 575,
+          "echo": false,
+          "input_token": 739,
+          "position": 301,
+          "rank": 0,
+          "true_prob": 0.9940536618232727,
+          "true_token": 575
+        },
+        {
+          "argmax_prob": 0.21833248436450958,
+          "argmax_token": 362,
+          "echo": false,
+          "input_token": 575,
+          "position": 302,
+          "rank": 52,
+          "true_prob": 0.0023518698289990425,
+          "true_token": 4800
+        },
+        {
+          "argmax_prob": 0.20755241811275482,
+          "argmax_token": 1358,
+          "echo": false,
+          "input_token": 4800,
+          "position": 303,
+          "rank": 39,
+          "true_prob": 0.003492239397019148,
+          "true_token": 1749
+        },
+        {
+          "argmax_prob": 0.24466004967689514,
+          "argmax_token": 6079,
+          "echo": false,
+          "input_token": 1749,
+          "position": 304,
+          "rank": 6,
+          "true_prob": 0.008806775324046612,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.48353439569473267,
+          "argmax_token": 3385,
+          "echo": false,
+          "input_token": 244,
+          "position": 305,
+          "rank": 3,
+          "true_prob": 0.03069944493472576,
+          "true_token": 3686
+        },
+        {
+          "argmax_prob": 0.4029737114906311,
+          "argmax_token": 12102,
+          "echo": false,
+          "input_token": 3686,
+          "position": 306,
+          "rank": 0,
+          "true_prob": 0.4029737114906311,
+          "true_token": 12102
+        },
+        {
+          "argmax_prob": 0.1739736795425415,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 12102,
+          "position": 307,
+          "rank": 16,
+          "true_prob": 0.009795960038900375,
+          "true_token": 359
+        },
+        {
+          "argmax_prob": 0.214305579662323,
+          "argmax_token": 13,
+          "echo": false,
+          "input_token": 359,
+          "position": 308,
+          "rank": 40219,
+          "true_prob": 1.2163334872639098e-07,
+          "true_token": 120007
+        },
+        {
+          "argmax_prob": 0.9999421834945679,
+          "argmax_token": 120029,
+          "echo": false,
+          "input_token": 120007,
+          "position": 309,
+          "rank": 0,
+          "true_prob": 0.9999421834945679,
+          "true_token": 120029
+        },
+        {
+          "argmax_prob": 0.6137991547584534,
+          "argmax_token": 120030,
+          "echo": false,
+          "input_token": 120029,
+          "position": 310,
+          "rank": 0,
+          "true_prob": 0.6137991547584534,
+          "true_token": 120030
+        }
+      ],
+      "summary": {
+        "acceptance_at_1": 0.25,
+        "echo_rate": 0.006666666666666667,
+        "mean_true_prob": 0.18326722899110728,
+        "median_rank": 6.0,
+        "positions": 300,
+        "top20_rate": 0.6233333333333333,
+        "top5_rate": 0.45666666666666667
+      }
+    },
+    "pre_norm": {
+      "records": [
+        {
+          "argmax_prob": 0.24127520620822906,
+          "argmax_token": 3822,
+          "echo": false,
+          "input_token": 11,
+          "position": 11,
+          "rank": 92,
+          "true_prob": 0.0015264579560607672,
+          "true_token": 1622
+        },
+        {
+          "argmax_prob": 0.1781434416770935,
+          "argmax_token": 13457,
+          "echo": false,
+          "input_token": 1622,
+          "position": 12,
+          "rank": 1,
+          "true_prob": 0.12567806243896484,
+          "true_token": 81425
+        },
+        {
+          "argmax_prob": 0.08175378292798996,
+          "argmax_token": 71998,
+          "echo": false,
+          "input_token": 81425,
+          "position": 13,
+          "rank": 2898,
+          "true_prob": 4.6120694605633616e-05,
+          "true_token": 2308
+        },
+        {
+          "argmax_prob": 0.16401785612106323,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 2308,
+          "position": 14,
+          "rank": 8,
+          "true_prob": 0.010571328923106194,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.09371692687273026,
+          "argmax_token": 12742,
+          "echo": false,
+          "input_token": 13,
+          "position": 15,
+          "rank": 63752,
+          "true_prob": 1.940523830512575e-08,
+          "true_token": 120044
+        },
+        {
+          "argmax_prob": 0.012071169912815094,
+          "argmax_token": 10968,
+          "echo": false,
+          "input_token": 120044,
+          "position": 16,
+          "rank": 234,
+          "true_prob": 0.00044948820141144097,
+          "true_token": 70830
+        },
+        {
+          "argmax_prob": 0.0494643934071064,
+          "argmax_token": 25,
+          "echo": false,
+          "input_token": 70830,
+          "position": 17,
+          "rank": 5,
+          "true_prob": 0.007661717478185892,
+          "true_token": 277
+        },
+        {
+          "argmax_prob": 0.037280257791280746,
+          "argmax_token": 287,
+          "echo": false,
+          "input_token": 277,
+          "position": 18,
+          "rank": 979,
+          "true_prob": 0.000146167105413042,
+          "true_token": 9002
+        },
+        {
+          "argmax_prob": 0.03259257972240448,
+          "argmax_token": 32263,
+          "echo": false,
+          "input_token": 9002,
+          "position": 19,
+          "rank": 367,
+          "true_prob": 0.00032589997863397,
+          "true_token": 647
+        },
+        {
+          "argmax_prob": 0.016879649832844734,
+          "argmax_token": 3255,
+          "echo": false,
+          "input_token": 647,
+          "position": 20,
+          "rank": 2107,
+          "true_prob": 7.256200478877872e-05,
+          "true_token": 497
+        },
+        {
+          "argmax_prob": 0.00967978872358799,
+          "argmax_token": 17880,
+          "echo": false,
+          "input_token": 497,
+          "position": 21,
+          "rank": 65,
+          "true_prob": 0.0014484783168882132,
+          "true_token": 25
+        },
+        {
+          "argmax_prob": 0.03493102639913559,
+          "argmax_token": 2088,
+          "echo": false,
+          "input_token": 25,
+          "position": 22,
+          "rank": 28912,
+          "true_prob": 1.9953163246100303e-06,
+          "true_token": 5130
+        },
+        {
+          "argmax_prob": 0.016655977815389633,
+          "argmax_token": 4754,
+          "echo": false,
+          "input_token": 5130,
+          "position": 23,
+          "rank": 2164,
+          "true_prob": 6.785639561712742e-05,
+          "true_token": 25152
+        },
+        {
+          "argmax_prob": 0.118001289665699,
+          "argmax_token": 1326,
+          "echo": false,
+          "input_token": 25152,
+          "position": 24,
+          "rank": 0,
+          "true_prob": 0.118001289665699,
+          "true_token": 1326
+        },
+        {
+          "argmax_prob": 0.010180958546698093,
+          "argmax_token": 2088,
+          "echo": false,
+          "input_token": 1326,
+          "position": 25,
+          "rank": 59285,
+          "true_prob": 6.36114464214188e-07,
+          "true_token": 120006
+        },
+        {
+          "argmax_prob": 0.14761997759342194,
+          "argmax_token": 120030,
+          "echo": false,
+          "input_token": 120006,
+          "position": 26,
+          "rank": 5012,
+          "true_prob": 2.6849989808397368e-05,
+          "true_token": 2353
+        },
+        {
+          "argmax_prob": 0.012684090062975883,
+          "argmax_token": 120025,
+          "echo": false,
+          "input_token": 2353,
+          "position": 27,
+          "rank": 18,
+          "true_prob": 0.002174947876483202,
+          "true_token": 431
+        },
+        {
+          "argmax_prob": 0.048947352916002274,
+          "argmax_token": 244,
+          "echo": false,
+          "input_token": 431,
+          "position": 28,
+          "rank": 2942,
+          "true_prob": 4.26429724029731e-05,
+          "true_token": 41451
+        },
+        {
+          "argmax_prob": 0.14875008165836334,
+          "argmax_token": 244,
+          "echo": false,
+          "input_token": 41451,
+          "position": 29,
+          "rank": 0,
+          "true_prob": 0.14875008165836334,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.48202988505363464,
+          "argmax_token": 9220,
+          "echo": false,
+          "input_token": 244,
+          "position": 30,
+          "rank": 251,
+          "true_prob": 0.00027969825896434486,
+          "true_token": 4382
+        },
+        {
+          "argmax_prob": 0.12326518446207047,
+          "argmax_token": 9220,
+          "echo": false,
+          "input_token": 4382,
+          "position": 31,
+          "rank": 51,
+          "true_prob": 0.0024577644653618336,
+          "true_token": 2719
+        },
+        {
+          "argmax_prob": 0.1279786080121994,
+          "argmax_token": 1285,
+          "echo": false,
+          "input_token": 2719,
+          "position": 32,
+          "rank": 14,
+          "true_prob": 0.009760192595422268,
+          "true_token": 356
+        },
+        {
+          "argmax_prob": 0.1709756851196289,
+          "argmax_token": 244,
+          "echo": false,
+          "input_token": 356,
+          "position": 33,
+          "rank": 3367,
+          "true_prob": 1.569827873026952e-05,
+          "true_token": 17975
+        },
+        {
+          "argmax_prob": 0.07464239746332169,
+          "argmax_token": 244,
+          "echo": false,
+          "input_token": 17975,
+          "position": 34,
+          "rank": 0,
+          "true_prob": 0.07464239746332169,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.11593654006719589,
+          "argmax_token": 4309,
+          "echo": false,
+          "input_token": 244,
+          "position": 35,
+          "rank": 291,
+          "true_prob": 0.00039672772982157767,
+          "true_token": 2027
+        },
+        {
+          "argmax_prob": 0.37312427163124084,
+          "argmax_token": 2921,
+          "echo": false,
+          "input_token": 2027,
+          "position": 36,
+          "rank": 0,
+          "true_prob": 0.37312427163124084,
+          "true_token": 2921
+        },
+        {
+          "argmax_prob": 0.023755308240652084,
+          "argmax_token": 7416,
+          "echo": false,
+          "input_token": 2921,
+          "position": 37,
+          "rank": 142,
+          "true_prob": 0.0010393185075372458,
+          "true_token": 14965
+        },
+        {
+          "argmax_prob": 0.23017476499080658,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 14965,
+          "position": 38,
+          "rank": 153,
+          "true_prob": 0.0005364070530049503,
+          "true_token": 11367
+        },
+        {
+          "argmax_prob": 0.07435791939496994,
+          "argmax_token": 11367,
+          "echo": true,
+          "input_token": 11367,
+          "position": 39,
+          "rank": 6,
+          "true_prob": 0.0188691895455122,
+          "true_token": 13239
+        },
+        {
+          "argmax_prob": 0.2620147168636322,
+          "argmax_token": 1726,
+          "echo": false,
+          "input_token": 13239,
+          "position": 40,
+          "rank": 0,
+          "true_prob": 0.2620147168636322,
+          "true_token": 1726
+        },
+        {
+          "argmax_prob": 0.6134390830993652,
+          "argmax_token": 82,
+          "echo": false,
+          "input_token": 1726,
+          "position": 41,
+          "rank": 0,
+          "true_prob": 0.6134390830993652,
+          "true_token": 82
+        },
+        {
+          "argmax_prob": 0.044750552624464035,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 82,
+          "position": 42,
+          "rank": 733,
+          "true_prob": 0.00017732697597239166,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.35326850414276123,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 185,
+          "position": 43,
+          "rank": 58,
+          "true_prob": 0.0011816639453172684,
+          "true_token": 33667
+        },
+        {
+          "argmax_prob": 0.34559255838394165,
+          "argmax_token": 2438,
+          "echo": false,
+          "input_token": 33667,
+          "position": 44,
+          "rank": 0,
+          "true_prob": 0.34559255838394165,
+          "true_token": 2438
+        },
+        {
+          "argmax_prob": 0.03480229526758194,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 2438,
+          "position": 45,
+          "rank": 56,
+          "true_prob": 0.0020856917835772038,
+          "true_token": 377
+        },
+        {
+          "argmax_prob": 0.3211980164051056,
+          "argmax_token": 244,
+          "echo": false,
+          "input_token": 377,
+          "position": 46,
+          "rank": 10,
+          "true_prob": 0.006523646414279938,
+          "true_token": 275
+        },
+        {
+          "argmax_prob": 0.07439837604761124,
+          "argmax_token": 7322,
+          "echo": false,
+          "input_token": 275,
+          "position": 47,
+          "rank": 500,
+          "true_prob": 0.00012690988660324365,
+          "true_token": 19618
+        },
+        {
+          "argmax_prob": 0.1423320323228836,
+          "argmax_token": 66252,
+          "echo": false,
+          "input_token": 19618,
+          "position": 48,
+          "rank": 1,
+          "true_prob": 0.11051685363054276,
+          "true_token": 69708
+        },
+        {
+          "argmax_prob": 0.2306063324213028,
+          "argmax_token": 10313,
+          "echo": false,
+          "input_token": 69708,
+          "position": 49,
+          "rank": 276,
+          "true_prob": 0.00023153414076659828,
+          "true_token": 98905
+        },
+        {
+          "argmax_prob": 0.7023490071296692,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 98905,
+          "position": 50,
+          "rank": 5,
+          "true_prob": 0.013952472247183323,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.15983916819095612,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 13,
+          "position": 51,
+          "rank": 6,
+          "true_prob": 0.03243689984083176,
+          "true_token": 424
+        },
+        {
+          "argmax_prob": 0.03678348287940025,
+          "argmax_token": 2207,
+          "echo": false,
+          "input_token": 424,
+          "position": 52,
+          "rank": 3939,
+          "true_prob": 1.7646781998337246e-05,
+          "true_token": 21722
+        },
+        {
+          "argmax_prob": 0.10677113384008408,
+          "argmax_token": 2438,
+          "echo": false,
+          "input_token": 21722,
+          "position": 53,
+          "rank": 2,
+          "true_prob": 0.03072616644203663,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.06322288513183594,
+          "argmax_token": 2481,
+          "echo": false,
+          "input_token": 11,
+          "position": 54,
+          "rank": 440,
+          "true_prob": 0.00018915112013928592,
+          "true_token": 7086
+        },
+        {
+          "argmax_prob": 0.09014321863651276,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 7086,
+          "position": 55,
+          "rank": 21,
+          "true_prob": 0.006989887449890375,
+          "true_token": 11809
+        },
+        {
+          "argmax_prob": 0.6221505999565125,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 11809,
+          "position": 56,
+          "rank": 1,
+          "true_prob": 0.1477111577987671,
+          "true_token": 622
+        },
+        {
+          "argmax_prob": 0.25860825181007385,
+          "argmax_token": 476,
+          "echo": false,
+          "input_token": 622,
+          "position": 57,
+          "rank": 56,
+          "true_prob": 0.0010829888051375747,
+          "true_token": 31277
+        },
+        {
+          "argmax_prob": 0.5299562811851501,
+          "argmax_token": 8891,
+          "echo": false,
+          "input_token": 31277,
+          "position": 58,
+          "rank": 3,
+          "true_prob": 0.020605778321623802,
+          "true_token": 38853
+        },
+        {
+          "argmax_prob": 0.22517818212509155,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 38853,
+          "position": 59,
+          "rank": 0,
+          "true_prob": 0.22517818212509155,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.7185890078544617,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 11,
+          "position": 60,
+          "rank": 401,
+          "true_prob": 8.322210487676784e-05,
+          "true_token": 44797
+        },
+        {
+          "argmax_prob": 0.5341456532478333,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 44797,
+          "position": 61,
+          "rank": 21,
+          "true_prob": 0.0020370071288198233,
+          "true_token": 11809
+        },
+        {
+          "argmax_prob": 0.35345327854156494,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 11809,
+          "position": 62,
+          "rank": 1,
+          "true_prob": 0.2426643818616867,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.7723601460456848,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 11,
+          "position": 63,
+          "rank": 0,
+          "true_prob": 0.7723601460456848,
+          "true_token": 289
+        },
+        {
+          "argmax_prob": 0.4149267077445984,
+          "argmax_token": 9685,
+          "echo": false,
+          "input_token": 289,
+          "position": 64,
+          "rank": 0,
+          "true_prob": 0.4149267077445984,
+          "true_token": 9685
+        },
+        {
+          "argmax_prob": 0.18972602486610413,
+          "argmax_token": 14639,
+          "echo": false,
+          "input_token": 9685,
+          "position": 65,
+          "rank": 7,
+          "true_prob": 0.017908737063407898,
+          "true_token": 13604
+        },
+        {
+          "argmax_prob": 0.3390381336212158,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 13604,
+          "position": 66,
+          "rank": 3281,
+          "true_prob": 2.509958221708075e-06,
+          "true_token": 2597
+        },
+        {
+          "argmax_prob": 0.0676901787519455,
+          "argmax_token": 2650,
+          "echo": false,
+          "input_token": 2597,
+          "position": 67,
+          "rank": 1,
+          "true_prob": 0.05495462566614151,
+          "true_token": 280
+        },
+        {
+          "argmax_prob": 0.16202358901500702,
+          "argmax_token": 377,
+          "echo": false,
+          "input_token": 280,
+          "position": 68,
+          "rank": 569,
+          "true_prob": 0.00010757535346783698,
+          "true_token": 35454
+        },
+        {
+          "argmax_prob": 0.4558942914009094,
+          "argmax_token": 5033,
+          "echo": false,
+          "input_token": 35454,
+          "position": 69,
+          "rank": 0,
+          "true_prob": 0.4558942914009094,
+          "true_token": 5033
+        },
+        {
+          "argmax_prob": 0.7289758920669556,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 5033,
+          "position": 70,
+          "rank": 12,
+          "true_prob": 0.003882091725245118,
+          "true_token": 359
+        },
+        {
+          "argmax_prob": 0.04922320693731308,
+          "argmax_token": 4394,
+          "echo": false,
+          "input_token": 359,
+          "position": 71,
+          "rank": 287,
+          "true_prob": 0.0004955395124852657,
+          "true_token": 49
+        },
+        {
+          "argmax_prob": 0.04986555129289627,
+          "argmax_token": 7235,
+          "echo": false,
+          "input_token": 49,
+          "position": 72,
+          "rank": 108,
+          "true_prob": 0.0010902583599090576,
+          "true_token": 96417
+        },
+        {
+          "argmax_prob": 0.06128215417265892,
+          "argmax_token": 206,
+          "echo": false,
+          "input_token": 96417,
+          "position": 73,
+          "rank": 135,
+          "true_prob": 0.000691001012455672,
+          "true_token": 7728
+        },
+        {
+          "argmax_prob": 0.071684829890728,
+          "argmax_token": 13604,
+          "echo": false,
+          "input_token": 7728,
+          "position": 74,
+          "rank": 36,
+          "true_prob": 0.004080147948116064,
+          "true_token": 16268
+        },
+        {
+          "argmax_prob": 0.13777388632297516,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 16268,
+          "position": 75,
+          "rank": 6,
+          "true_prob": 0.024595247581601143,
+          "true_token": 431
+        },
+        {
+          "argmax_prob": 0.0411817766726017,
+          "argmax_token": 2921,
+          "echo": false,
+          "input_token": 431,
+          "position": 76,
+          "rank": 3,
+          "true_prob": 0.02670600451529026,
+          "true_token": 7512
+        },
+        {
+          "argmax_prob": 0.20931844413280487,
+          "argmax_token": 280,
+          "echo": false,
+          "input_token": 7512,
+          "position": 77,
+          "rank": 17,
+          "true_prob": 0.00892199482768774,
+          "true_token": 402
+        },
+        {
+          "argmax_prob": 0.24977415800094604,
+          "argmax_token": 1970,
+          "echo": false,
+          "input_token": 402,
+          "position": 78,
+          "rank": 1117,
+          "true_prob": 3.9112288504838943e-05,
+          "true_token": 45455
+        },
+        {
+          "argmax_prob": 0.060425546020269394,
+          "argmax_token": 12155,
+          "echo": false,
+          "input_token": 45455,
+          "position": 79,
+          "rank": 4,
+          "true_prob": 0.027004964649677277,
+          "true_token": 206
+        },
+        {
+          "argmax_prob": 0.08164616674184799,
+          "argmax_token": 17,
+          "echo": false,
+          "input_token": 206,
+          "position": 80,
+          "rank": 2,
+          "true_prob": 0.06183941289782524,
+          "true_token": 19
+        },
+        {
+          "argmax_prob": 0.0380469411611557,
+          "argmax_token": 5003,
+          "echo": false,
+          "input_token": 19,
+          "position": 81,
+          "rank": 23,
+          "true_prob": 0.003989055287092924,
+          "true_token": 17471
+        },
+        {
+          "argmax_prob": 0.0716748833656311,
+          "argmax_token": 8778,
+          "echo": false,
+          "input_token": 17471,
+          "position": 82,
+          "rank": 1213,
+          "true_prob": 0.00010580386151559651,
+          "true_token": 60202
+        },
+        {
+          "argmax_prob": 0.34077751636505127,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 60202,
+          "position": 83,
+          "rank": 73,
+          "true_prob": 0.0010782468598335981,
+          "true_token": 377
+        },
+        {
+          "argmax_prob": 0.3394901156425476,
+          "argmax_token": 252,
+          "echo": false,
+          "input_token": 377,
+          "position": 84,
+          "rank": 1,
+          "true_prob": 0.15171965956687927,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.31529197096824646,
+          "argmax_token": 6910,
+          "echo": false,
+          "input_token": 244,
+          "position": 85,
+          "rank": 1,
+          "true_prob": 0.18061648309230804,
+          "true_token": 3489
+        },
+        {
+          "argmax_prob": 0.1027616560459137,
+          "argmax_token": 34073,
+          "echo": false,
+          "input_token": 3489,
+          "position": 86,
+          "rank": 13,
+          "true_prob": 0.01594589836895466,
+          "true_token": 55647
+        },
+        {
+          "argmax_prob": 0.0884503424167633,
+          "argmax_token": 6910,
+          "echo": false,
+          "input_token": 55647,
+          "position": 87,
+          "rank": 5,
+          "true_prob": 0.011944418773055077,
+          "true_token": 9042
+        },
+        {
+          "argmax_prob": 0.09669353067874908,
+          "argmax_token": 9042,
+          "echo": true,
+          "input_token": 9042,
+          "position": 88,
+          "rank": 244,
+          "true_prob": 0.0004400703473947942,
+          "true_token": 62067
+        },
+        {
+          "argmax_prob": 0.197586789727211,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 62067,
+          "position": 89,
+          "rank": 4,
+          "true_prob": 0.05726080760359764,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.5938842296600342,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 13,
+          "position": 90,
+          "rank": 64,
+          "true_prob": 0.00047455099411308765,
+          "true_token": 3911
+        },
+        {
+          "argmax_prob": 0.022471221163868904,
+          "argmax_token": 475,
+          "echo": false,
+          "input_token": 3911,
+          "position": 91,
+          "rank": 10,
+          "true_prob": 0.0058947415091097355,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.013210837729275227,
+          "argmax_token": 7445,
+          "echo": false,
+          "input_token": 185,
+          "position": 92,
+          "rank": 5,
+          "true_prob": 0.00781081710010767,
+          "true_token": 30244
+        },
+        {
+          "argmax_prob": 0.07942003011703491,
+          "argmax_token": 3718,
+          "echo": false,
+          "input_token": 30244,
+          "position": 93,
+          "rank": 4856,
+          "true_prob": 1.4055073734198231e-05,
+          "true_token": 33820
+        },
+        {
+          "argmax_prob": 0.3268224000930786,
+          "argmax_token": 10266,
+          "echo": false,
+          "input_token": 33820,
+          "position": 94,
+          "rank": 1,
+          "true_prob": 0.07242658734321594,
+          "true_token": 6162
+        },
+        {
+          "argmax_prob": 0.6876128911972046,
+          "argmax_token": 7971,
+          "echo": false,
+          "input_token": 6162,
+          "position": 95,
+          "rank": 19,
+          "true_prob": 0.0018774779746308923,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.2990800142288208,
+          "argmax_token": 252,
+          "echo": false,
+          "input_token": 11,
+          "position": 96,
+          "rank": 0,
+          "true_prob": 0.2990800142288208,
+          "true_token": 252
+        },
+        {
+          "argmax_prob": 0.07305394858121872,
+          "argmax_token": 14639,
+          "echo": false,
+          "input_token": 252,
+          "position": 97,
+          "rank": 6,
+          "true_prob": 0.02213968150317669,
+          "true_token": 21722
+        },
+        {
+          "argmax_prob": 0.04060506075620651,
+          "argmax_token": 7971,
+          "echo": false,
+          "input_token": 21722,
+          "position": 98,
+          "rank": 101,
+          "true_prob": 0.0015080064767971635,
+          "true_token": 42273
+        },
+        {
+          "argmax_prob": 0.06293836236000061,
+          "argmax_token": 8778,
+          "echo": false,
+          "input_token": 42273,
+          "position": 99,
+          "rank": 1979,
+          "true_prob": 3.08715425489936e-05,
+          "true_token": 10749
+        },
+        {
+          "argmax_prob": 0.0504719614982605,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 10749,
+          "position": 100,
+          "rank": 23,
+          "true_prob": 0.005711850244551897,
+          "true_token": 13604
+        },
+        {
+          "argmax_prob": 0.15002049505710602,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 13604,
+          "position": 101,
+          "rank": 115,
+          "true_prob": 0.0005257157608866692,
+          "true_token": 26
+        },
+        {
+          "argmax_prob": 0.14711235463619232,
+          "argmax_token": 904,
+          "echo": false,
+          "input_token": 26,
+          "position": 102,
+          "rank": 62,
+          "true_prob": 0.001338914968073368,
+          "true_token": 7499
+        },
+        {
+          "argmax_prob": 0.1262199431657791,
+          "argmax_token": 24505,
+          "echo": false,
+          "input_token": 7499,
+          "position": 103,
+          "rank": 5,
+          "true_prob": 0.0145343616604805,
+          "true_token": 13604
+        },
+        {
+          "argmax_prob": 0.03342410549521446,
+          "argmax_token": 475,
+          "echo": false,
+          "input_token": 13604,
+          "position": 104,
+          "rank": 3,
+          "true_prob": 0.020871199667453766,
+          "true_token": 431
+        },
+        {
+          "argmax_prob": 0.03195333480834961,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 431,
+          "position": 105,
+          "rank": 3,
+          "true_prob": 0.019841108471155167,
+          "true_token": 15489
+        },
+        {
+          "argmax_prob": 0.454692006111145,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 15489,
+          "position": 106,
+          "rank": 0,
+          "true_prob": 0.454692006111145,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.04062019661068916,
+          "argmax_token": 9207,
+          "echo": false,
+          "input_token": 185,
+          "position": 107,
+          "rank": 7,
+          "true_prob": 0.00881228968501091,
+          "true_token": 28126
+        },
+        {
+          "argmax_prob": 0.029015954583883286,
+          "argmax_token": 8543,
+          "echo": false,
+          "input_token": 28126,
+          "position": 108,
+          "rank": 2,
+          "true_prob": 0.011325961910188198,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.12051805108785629,
+          "argmax_token": 35454,
+          "echo": false,
+          "input_token": 244,
+          "position": 109,
+          "rank": 39,
+          "true_prob": 0.0026936146896332502,
+          "true_token": 7413
+        },
+        {
+          "argmax_prob": 0.10485462099313736,
+          "argmax_token": 31685,
+          "echo": false,
+          "input_token": 7413,
+          "position": 110,
+          "rank": 16,
+          "true_prob": 0.009090976789593697,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.09165547043085098,
+          "argmax_token": 10450,
+          "echo": false,
+          "input_token": 11,
+          "position": 111,
+          "rank": 700,
+          "true_prob": 0.00010440789628773928,
+          "true_token": 2388
+        },
+        {
+          "argmax_prob": 0.18543381989002228,
+          "argmax_token": 2776,
+          "echo": false,
+          "input_token": 2388,
+          "position": 112,
+          "rank": 5,
+          "true_prob": 0.022587211802601814,
+          "true_token": 2084
+        },
+        {
+          "argmax_prob": 0.12624512612819672,
+          "argmax_token": 79,
+          "echo": false,
+          "input_token": 2084,
+          "position": 113,
+          "rank": 282,
+          "true_prob": 0.00035524892155081034,
+          "true_token": 29936
+        },
+        {
+          "argmax_prob": 0.06556094437837601,
+          "argmax_token": 779,
+          "echo": false,
+          "input_token": 29936,
+          "position": 114,
+          "rank": 234,
+          "true_prob": 0.00045767126721329987,
+          "true_token": 5033
+        },
+        {
+          "argmax_prob": 0.40042081475257874,
+          "argmax_token": 10450,
+          "echo": false,
+          "input_token": 5033,
+          "position": 115,
+          "rank": 251,
+          "true_prob": 0.00016224751016125083,
+          "true_token": 7692
+        },
+        {
+          "argmax_prob": 0.08014117181301117,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 7692,
+          "position": 116,
+          "rank": 20,
+          "true_prob": 0.006261955015361309,
+          "true_token": 377
+        },
+        {
+          "argmax_prob": 0.132069393992424,
+          "argmax_token": 17123,
+          "echo": false,
+          "input_token": 377,
+          "position": 117,
+          "rank": 2,
+          "true_prob": 0.10170883685350418,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.11335231363773346,
+          "argmax_token": 35454,
+          "echo": false,
+          "input_token": 244,
+          "position": 118,
+          "rank": 8084,
+          "true_prob": 2.3240850168804172e-06,
+          "true_token": 6125
+        },
+        {
+          "argmax_prob": 0.0834408774971962,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 6125,
+          "position": 119,
+          "rank": 73,
+          "true_prob": 0.0021239975467324257,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.17239411175251007,
+          "argmax_token": 341,
+          "echo": false,
+          "input_token": 13,
+          "position": 120,
+          "rank": 1006,
+          "true_prob": 8.703789353603497e-05,
+          "true_token": 119320
+        },
+        {
+          "argmax_prob": 0.03177947923541069,
+          "argmax_token": 840,
+          "echo": false,
+          "input_token": 119320,
+          "position": 121,
+          "rank": 1,
+          "true_prob": 0.01767025701701641,
+          "true_token": 11002
+        },
+        {
+          "argmax_prob": 0.1534954160451889,
+          "argmax_token": 431,
+          "echo": false,
+          "input_token": 11002,
+          "position": 122,
+          "rank": 1929,
+          "true_prob": 2.3544935174868442e-05,
+          "true_token": 46465
+        },
+        {
+          "argmax_prob": 0.05631423369050026,
+          "argmax_token": 252,
+          "echo": false,
+          "input_token": 46465,
+          "position": 123,
+          "rank": 1,
+          "true_prob": 0.05572273209691048,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.718625545501709,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 244,
+          "position": 124,
+          "rank": 0,
+          "true_prob": 0.718625545501709,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.03175260126590729,
+          "argmax_token": 846,
+          "echo": false,
+          "input_token": 185,
+          "position": 125,
+          "rank": 12216,
+          "true_prob": 3.4835593396564946e-06,
+          "true_token": 67680
+        },
+        {
+          "argmax_prob": 0.044707417488098145,
+          "argmax_token": 10792,
+          "echo": false,
+          "input_token": 67680,
+          "position": 126,
+          "rank": 2394,
+          "true_prob": 4.243229705025442e-05,
+          "true_token": 59338
+        },
+        {
+          "argmax_prob": 0.037312302738428116,
+          "argmax_token": 6533,
+          "echo": false,
+          "input_token": 59338,
+          "position": 127,
+          "rank": 222,
+          "true_prob": 0.0005999061977490783,
+          "true_token": 113364
+        },
+        {
+          "argmax_prob": 0.022035665810108185,
+          "argmax_token": 29705,
+          "echo": false,
+          "input_token": 113364,
+          "position": 128,
+          "rank": 73,
+          "true_prob": 0.001710031763650477,
+          "true_token": 7154
+        },
+        {
+          "argmax_prob": 0.11234361678361893,
+          "argmax_token": 3822,
+          "echo": false,
+          "input_token": 7154,
+          "position": 129,
+          "rank": 1,
+          "true_prob": 0.10572564601898193,
+          "true_token": 12728
+        },
+        {
+          "argmax_prob": 0.08002191036939621,
+          "argmax_token": 65329,
+          "echo": false,
+          "input_token": 12728,
+          "position": 130,
+          "rank": 5,
+          "true_prob": 0.03777315095067024,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.08782829344272614,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 11,
+          "position": 131,
+          "rank": 151,
+          "true_prob": 0.0005594217218458652,
+          "true_token": 2089
+        },
+        {
+          "argmax_prob": 0.09150903671979904,
+          "argmax_token": 244,
+          "echo": false,
+          "input_token": 2089,
+          "position": 132,
+          "rank": 155,
+          "true_prob": 0.000868008763063699,
+          "true_token": 12059
+        },
+        {
+          "argmax_prob": 0.18040308356285095,
+          "argmax_token": 14665,
+          "echo": false,
+          "input_token": 12059,
+          "position": 133,
+          "rank": 3,
+          "true_prob": 0.045486465096473694,
+          "true_token": 9448
+        },
+        {
+          "argmax_prob": 0.45343875885009766,
+          "argmax_token": 7568,
+          "echo": false,
+          "input_token": 9448,
+          "position": 134,
+          "rank": 5,
+          "true_prob": 0.012862946838140488,
+          "true_token": 517
+        },
+        {
+          "argmax_prob": 0.027769971638917923,
+          "argmax_token": 1995,
+          "echo": false,
+          "input_token": 517,
+          "position": 135,
+          "rank": 9466,
+          "true_prob": 1.1532090866239741e-05,
+          "true_token": 3865
+        },
+        {
+          "argmax_prob": 0.20239396393299103,
+          "argmax_token": 11002,
+          "echo": false,
+          "input_token": 3865,
+          "position": 136,
+          "rank": 10610,
+          "true_prob": 2.0229610981914448e-06,
+          "true_token": 32761
+        },
+        {
+          "argmax_prob": 0.08991222828626633,
+          "argmax_token": 5046,
+          "echo": false,
+          "input_token": 32761,
+          "position": 137,
+          "rank": 3574,
+          "true_prob": 1.4884355550748296e-05,
+          "true_token": 39249
+        },
+        {
+          "argmax_prob": 0.20935533940792084,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 39249,
+          "position": 138,
+          "rank": 130,
+          "true_prob": 0.0005273345741443336,
+          "true_token": 950
+        },
+        {
+          "argmax_prob": 0.4773533046245575,
+          "argmax_token": 369,
+          "echo": false,
+          "input_token": 950,
+          "position": 139,
+          "rank": 8,
+          "true_prob": 0.005763374734669924,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.6422907114028931,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 244,
+          "position": 140,
+          "rank": 14,
+          "true_prob": 0.006410882342606783,
+          "true_token": 3548
+        },
+        {
+          "argmax_prob": 0.8204742074012756,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 3548,
+          "position": 141,
+          "rank": 0,
+          "true_prob": 0.8204742074012756,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.02798914909362793,
+          "argmax_token": 7154,
+          "echo": false,
+          "input_token": 185,
+          "position": 142,
+          "rank": 69,
+          "true_prob": 0.0014834527391940355,
+          "true_token": 28462
+        },
+        {
+          "argmax_prob": 0.02860211953520775,
+          "argmax_token": 12059,
+          "echo": false,
+          "input_token": 28462,
+          "position": 143,
+          "rank": 0,
+          "true_prob": 0.02860211953520775,
+          "true_token": 12059
+        },
+        {
+          "argmax_prob": 0.1741819828748703,
+          "argmax_token": 9448,
+          "echo": false,
+          "input_token": 12059,
+          "position": 144,
+          "rank": 1341,
+          "true_prob": 4.57646710856352e-05,
+          "true_token": 4231
+        },
+        {
+          "argmax_prob": 0.18411241471767426,
+          "argmax_token": 362,
+          "echo": false,
+          "input_token": 4231,
+          "position": 145,
+          "rank": 5,
+          "true_prob": 0.014345302246510983,
+          "true_token": 989
+        },
+        {
+          "argmax_prob": 0.20910947024822235,
+          "argmax_token": 1483,
+          "echo": false,
+          "input_token": 989,
+          "position": 146,
+          "rank": 0,
+          "true_prob": 0.20910947024822235,
+          "true_token": 1483
+        },
+        {
+          "argmax_prob": 0.00878705270588398,
+          "argmax_token": 261,
+          "echo": false,
+          "input_token": 1483,
+          "position": 147,
+          "rank": 460,
+          "true_prob": 0.00031010142993181944,
+          "true_token": 252
+        },
+        {
+          "argmax_prob": 0.1850113570690155,
+          "argmax_token": 12728,
+          "echo": false,
+          "input_token": 252,
+          "position": 148,
+          "rank": 53,
+          "true_prob": 0.0009772899793460965,
+          "true_token": 1802
+        },
+        {
+          "argmax_prob": 0.1341397762298584,
+          "argmax_token": 7154,
+          "echo": false,
+          "input_token": 1802,
+          "position": 149,
+          "rank": 16,
+          "true_prob": 0.00844638142734766,
+          "true_token": 47857
+        },
+        {
+          "argmax_prob": 0.09116572886705399,
+          "argmax_token": 7154,
+          "echo": false,
+          "input_token": 47857,
+          "position": 150,
+          "rank": 3208,
+          "true_prob": 2.291897908435203e-05,
+          "true_token": 38739
+        },
+        {
+          "argmax_prob": 0.7571756839752197,
+          "argmax_token": 7154,
+          "echo": false,
+          "input_token": 38739,
+          "position": 151,
+          "rank": 2,
+          "true_prob": 0.0280808936804533,
+          "true_token": 3822
+        },
+        {
+          "argmax_prob": 0.5171988010406494,
+          "argmax_token": 1178,
+          "echo": false,
+          "input_token": 3822,
+          "position": 152,
+          "rank": 0,
+          "true_prob": 0.5171988010406494,
+          "true_token": 1178
+        },
+        {
+          "argmax_prob": 0.018782952800393105,
+          "argmax_token": 15907,
+          "echo": false,
+          "input_token": 1178,
+          "position": 153,
+          "rank": 10,
+          "true_prob": 0.007937305606901646,
+          "true_token": 412
+        },
+        {
+          "argmax_prob": 0.014693809673190117,
+          "argmax_token": 2452,
+          "echo": false,
+          "input_token": 412,
+          "position": 154,
+          "rank": 340,
+          "true_prob": 0.0004175275971647352,
+          "true_token": 6331
+        },
+        {
+          "argmax_prob": 0.08309456706047058,
+          "argmax_token": 244,
+          "echo": false,
+          "input_token": 6331,
+          "position": 155,
+          "rank": 0,
+          "true_prob": 0.08309456706047058,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.1293305605649948,
+          "argmax_token": 12069,
+          "echo": false,
+          "input_token": 244,
+          "position": 156,
+          "rank": 3,
+          "true_prob": 0.04879504814743996,
+          "true_token": 10923
+        },
+        {
+          "argmax_prob": 0.020005302503705025,
+          "argmax_token": 4309,
+          "echo": false,
+          "input_token": 10923,
+          "position": 157,
+          "rank": 23,
+          "true_prob": 0.0066424463875591755,
+          "true_token": 12273
+        },
+        {
+          "argmax_prob": 0.1903546005487442,
+          "argmax_token": 2719,
+          "echo": false,
+          "input_token": 12273,
+          "position": 158,
+          "rank": 16,
+          "true_prob": 0.007517916616052389,
+          "true_token": 3779
+        },
+        {
+          "argmax_prob": 0.10334443300962448,
+          "argmax_token": 51508,
+          "echo": false,
+          "input_token": 3779,
+          "position": 159,
+          "rank": 6,
+          "true_prob": 0.02452095039188862,
+          "true_token": 279
+        },
+        {
+          "argmax_prob": 0.19067126512527466,
+          "argmax_token": 252,
+          "echo": false,
+          "input_token": 279,
+          "position": 160,
+          "rank": 63,
+          "true_prob": 0.0016800190787762403,
+          "true_token": 549
+        },
+        {
+          "argmax_prob": 0.2964043915271759,
+          "argmax_token": 2719,
+          "echo": false,
+          "input_token": 549,
+          "position": 161,
+          "rank": 0,
+          "true_prob": 0.2964043915271759,
+          "true_token": 2719
+        },
+        {
+          "argmax_prob": 0.05910225957632065,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 2719,
+          "position": 162,
+          "rank": 86,
+          "true_prob": 0.0013914520386606455,
+          "true_token": 356
+        },
+        {
+          "argmax_prob": 0.06667928397655487,
+          "argmax_token": 475,
+          "echo": false,
+          "input_token": 356,
+          "position": 163,
+          "rank": 2,
+          "true_prob": 0.05801168829202652,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.09712819755077362,
+          "argmax_token": 4382,
+          "echo": false,
+          "input_token": 244,
+          "position": 164,
+          "rank": 62,
+          "true_prob": 0.0024363293778151274,
+          "true_token": 4056
+        },
+        {
+          "argmax_prob": 0.07310787588357925,
+          "argmax_token": 279,
+          "echo": false,
+          "input_token": 4056,
+          "position": 165,
+          "rank": 1354,
+          "true_prob": 5.0956816266989335e-05,
+          "true_token": 23386
+        },
+        {
+          "argmax_prob": 0.09579949080944061,
+          "argmax_token": 252,
+          "echo": false,
+          "input_token": 23386,
+          "position": 166,
+          "rank": 3,
+          "true_prob": 0.06060800701379776,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.4374832808971405,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 244,
+          "position": 167,
+          "rank": 160,
+          "true_prob": 0.00024338896037079394,
+          "true_token": 2701
+        },
+        {
+          "argmax_prob": 0.8040000200271606,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 2701,
+          "position": 168,
+          "rank": 0,
+          "true_prob": 0.8040000200271606,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.04433402791619301,
+          "argmax_token": 2293,
+          "echo": false,
+          "input_token": 185,
+          "position": 169,
+          "rank": 75,
+          "true_prob": 0.0017314321594312787,
+          "true_token": 767
+        },
+        {
+          "argmax_prob": 0.06502911448478699,
+          "argmax_token": 5278,
+          "echo": false,
+          "input_token": 767,
+          "position": 170,
+          "rank": 23,
+          "true_prob": 0.004101587459445,
+          "true_token": 12533
+        },
+        {
+          "argmax_prob": 0.09129175543785095,
+          "argmax_token": 1285,
+          "echo": false,
+          "input_token": 12533,
+          "position": 171,
+          "rank": 27,
+          "true_prob": 0.004442126955837011,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.02015080116689205,
+          "argmax_token": 73265,
+          "echo": false,
+          "input_token": 13,
+          "position": 172,
+          "rank": 1758,
+          "true_prob": 4.8095931560965255e-05,
+          "true_token": 37336
+        },
+        {
+          "argmax_prob": 0.023226803168654442,
+          "argmax_token": 4309,
+          "echo": false,
+          "input_token": 37336,
+          "position": 173,
+          "rank": 79,
+          "true_prob": 0.001349846599623561,
+          "true_token": 252
+        },
+        {
+          "argmax_prob": 0.2659437358379364,
+          "argmax_token": 1873,
+          "echo": false,
+          "input_token": 252,
+          "position": 174,
+          "rank": 39,
+          "true_prob": 0.0033416771329939365,
+          "true_token": 13380
+        },
+        {
+          "argmax_prob": 0.16099956631660461,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 13380,
+          "position": 175,
+          "rank": 27,
+          "true_prob": 0.003562738886103034,
+          "true_token": 4325
+        },
+        {
+          "argmax_prob": 0.41563400626182556,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 4325,
+          "position": 176,
+          "rank": 0,
+          "true_prob": 0.41563400626182556,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.147610142827034,
+          "argmax_token": 1684,
+          "echo": false,
+          "input_token": 11,
+          "position": 177,
+          "rank": 74,
+          "true_prob": 0.0018071311060339212,
+          "true_token": 92541
+        },
+        {
+          "argmax_prob": 0.11168535053730011,
+          "argmax_token": 29976,
+          "echo": false,
+          "input_token": 92541,
+          "position": 178,
+          "rank": 12,
+          "true_prob": 0.017611732706427574,
+          "true_token": 289
+        },
+        {
+          "argmax_prob": 0.16774967312812805,
+          "argmax_token": 2746,
+          "echo": false,
+          "input_token": 289,
+          "position": 179,
+          "rank": 10502,
+          "true_prob": 1.3097824194119312e-06,
+          "true_token": 24177
+        },
+        {
+          "argmax_prob": 0.10357727855443954,
+          "argmax_token": 21216,
+          "echo": false,
+          "input_token": 24177,
+          "position": 180,
+          "rank": 60,
+          "true_prob": 0.00255153002217412,
+          "true_token": 12137
+        },
+        {
+          "argmax_prob": 0.20915737748146057,
+          "argmax_token": 4798,
+          "echo": false,
+          "input_token": 12137,
+          "position": 181,
+          "rank": 1,
+          "true_prob": 0.1363629549741745,
+          "true_token": 1510
+        },
+        {
+          "argmax_prob": 0.04278532788157463,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 1510,
+          "position": 182,
+          "rank": 0,
+          "true_prob": 0.04278532788157463,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.20842094719409943,
+          "argmax_token": 6656,
+          "echo": false,
+          "input_token": 11,
+          "position": 183,
+          "rank": 64,
+          "true_prob": 0.0011387342819944024,
+          "true_token": 5033
+        },
+        {
+          "argmax_prob": 0.5657849907875061,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 5033,
+          "position": 184,
+          "rank": 0,
+          "true_prob": 0.5657849907875061,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.045193951576948166,
+          "argmax_token": 476,
+          "echo": false,
+          "input_token": 185,
+          "position": 185,
+          "rank": 263,
+          "true_prob": 0.00046726991422474384,
+          "true_token": 15941
+        },
+        {
+          "argmax_prob": 0.12666478753089905,
+          "argmax_token": 277,
+          "echo": false,
+          "input_token": 15941,
+          "position": 186,
+          "rank": 0,
+          "true_prob": 0.12666478753089905,
+          "true_token": 277
+        },
+        {
+          "argmax_prob": 0.09239289909601212,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 277,
+          "position": 187,
+          "rank": 0,
+          "true_prob": 0.09239289909601212,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.19541588425636292,
+          "argmax_token": 7106,
+          "echo": false,
+          "input_token": 11,
+          "position": 188,
+          "rank": 8561,
+          "true_prob": 3.5410469081398332e-06,
+          "true_token": 74772
+        },
+        {
+          "argmax_prob": 0.10995157808065414,
+          "argmax_token": 3162,
+          "echo": false,
+          "input_token": 74772,
+          "position": 189,
+          "rank": 48,
+          "true_prob": 0.0028398768045008183,
+          "true_token": 360
+        },
+        {
+          "argmax_prob": 0.22136029601097107,
+          "argmax_token": 21953,
+          "echo": false,
+          "input_token": 360,
+          "position": 190,
+          "rank": 0,
+          "true_prob": 0.22136029601097107,
+          "true_token": 21953
+        },
+        {
+          "argmax_prob": 0.08180538564920425,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 21953,
+          "position": 191,
+          "rank": 3,
+          "true_prob": 0.03398756682872772,
+          "true_token": 289
+        },
+        {
+          "argmax_prob": 0.1157793179154396,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 289,
+          "position": 192,
+          "rank": 1024,
+          "true_prob": 8.705171785550192e-05,
+          "true_token": 20781
+        },
+        {
+          "argmax_prob": 0.18360184133052826,
+          "argmax_token": 9655,
+          "echo": false,
+          "input_token": 20781,
+          "position": 193,
+          "rank": 0,
+          "true_prob": 0.18360184133052826,
+          "true_token": 9655
+        },
+        {
+          "argmax_prob": 0.6721328496932983,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 9655,
+          "position": 194,
+          "rank": 0,
+          "true_prob": 0.6721328496932983,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.023193325847387314,
+          "argmax_token": 9207,
+          "echo": false,
+          "input_token": 11,
+          "position": 195,
+          "rank": 294,
+          "true_prob": 0.00048089592019096017,
+          "true_token": 12728
+        },
+        {
+          "argmax_prob": 0.10349556058645248,
+          "argmax_token": 26447,
+          "echo": false,
+          "input_token": 12728,
+          "position": 196,
+          "rank": 672,
+          "true_prob": 0.00012265412078704685,
+          "true_token": 31331
+        },
+        {
+          "argmax_prob": 0.1924920678138733,
+          "argmax_token": 10564,
+          "echo": false,
+          "input_token": 31331,
+          "position": 197,
+          "rank": 2,
+          "true_prob": 0.11862372606992722,
+          "true_token": 289
+        },
+        {
+          "argmax_prob": 0.32630178332328796,
+          "argmax_token": 6207,
+          "echo": false,
+          "input_token": 289,
+          "position": 198,
+          "rank": 59,
+          "true_prob": 0.0013099038042128086,
+          "true_token": 989
+        },
+        {
+          "argmax_prob": 0.8361057639122009,
+          "argmax_token": 3769,
+          "echo": false,
+          "input_token": 989,
+          "position": 199,
+          "rank": 0,
+          "true_prob": 0.8361057639122009,
+          "true_token": 3769
+        },
+        {
+          "argmax_prob": 0.019167404621839523,
+          "argmax_token": 85229,
+          "echo": false,
+          "input_token": 3769,
+          "position": 200,
+          "rank": 7,
+          "true_prob": 0.007802183739840984,
+          "true_token": 622
+        },
+        {
+          "argmax_prob": 0.05743904784321785,
+          "argmax_token": 10564,
+          "echo": false,
+          "input_token": 622,
+          "position": 201,
+          "rank": 4240,
+          "true_prob": 2.5600718799978495e-05,
+          "true_token": 100423
+        },
+        {
+          "argmax_prob": 0.04444120451807976,
+          "argmax_token": 476,
+          "echo": false,
+          "input_token": 100423,
+          "position": 202,
+          "rank": 10,
+          "true_prob": 0.00887617003172636,
+          "true_token": 12593
+        },
+        {
+          "argmax_prob": 0.5273972749710083,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 12593,
+          "position": 203,
+          "rank": 1,
+          "true_prob": 0.183656707406044,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.2844173014163971,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 11,
+          "position": 204,
+          "rank": 1893,
+          "true_prob": 4.36489972344134e-05,
+          "true_token": 3973
+        },
+        {
+          "argmax_prob": 0.9929280877113342,
+          "argmax_token": 2219,
+          "echo": false,
+          "input_token": 3973,
+          "position": 205,
+          "rank": 0,
+          "true_prob": 0.9929280877113342,
+          "true_token": 2219
+        },
+        {
+          "argmax_prob": 0.027626745402812958,
+          "argmax_token": 2088,
+          "echo": false,
+          "input_token": 2219,
+          "position": 206,
+          "rank": 5,
+          "true_prob": 0.007704363204538822,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.5075284242630005,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 11,
+          "position": 207,
+          "rank": 0,
+          "true_prob": 0.5075284242630005,
+          "true_token": 289
+        },
+        {
+          "argmax_prob": 0.04961928725242615,
+          "argmax_token": 43192,
+          "echo": false,
+          "input_token": 289,
+          "position": 208,
+          "rank": 11,
+          "true_prob": 0.012513648718595505,
+          "true_token": 50509
+        },
+        {
+          "argmax_prob": 0.1459137499332428,
+          "argmax_token": 3347,
+          "echo": false,
+          "input_token": 50509,
+          "position": 209,
+          "rank": 26,
+          "true_prob": 0.0036540646106004715,
+          "true_token": 6678
+        },
+        {
+          "argmax_prob": 0.40385308861732483,
+          "argmax_token": 3407,
+          "echo": false,
+          "input_token": 6678,
+          "position": 210,
+          "rank": 1,
+          "true_prob": 0.05132419243454933,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.039268799126148224,
+          "argmax_token": 7791,
+          "echo": false,
+          "input_token": 13,
+          "position": 211,
+          "rank": 303,
+          "true_prob": 0.00045706043601967394,
+          "true_token": 26869
+        },
+        {
+          "argmax_prob": 0.016656043007969856,
+          "argmax_token": 44626,
+          "echo": false,
+          "input_token": 26869,
+          "position": 212,
+          "rank": 7,
+          "true_prob": 0.008592278696596622,
+          "true_token": 252
+        },
+        {
+          "argmax_prob": 0.13971666991710663,
+          "argmax_token": 7758,
+          "echo": false,
+          "input_token": 252,
+          "position": 213,
+          "rank": 268,
+          "true_prob": 0.0004367933142930269,
+          "true_token": 2470
+        },
+        {
+          "argmax_prob": 0.8289182782173157,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 2470,
+          "position": 214,
+          "rank": 0,
+          "true_prob": 0.8289182782173157,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.02384577877819538,
+          "argmax_token": 7758,
+          "echo": false,
+          "input_token": 185,
+          "position": 215,
+          "rank": 3,
+          "true_prob": 0.007477705366909504,
+          "true_token": 80133
+        },
+        {
+          "argmax_prob": 0.15590393543243408,
+          "argmax_token": 46896,
+          "echo": false,
+          "input_token": 80133,
+          "position": 216,
+          "rank": 0,
+          "true_prob": 0.15590393543243408,
+          "true_token": 46896
+        },
+        {
+          "argmax_prob": 0.012989715673029423,
+          "argmax_token": 2293,
+          "echo": false,
+          "input_token": 46896,
+          "position": 217,
+          "rank": 9389,
+          "true_prob": 1.3533448509406298e-05,
+          "true_token": 1418
+        },
+        {
+          "argmax_prob": 0.1371048241853714,
+          "argmax_token": 252,
+          "echo": false,
+          "input_token": 1418,
+          "position": 218,
+          "rank": 6084,
+          "true_prob": 9.588215107214637e-06,
+          "true_token": 6142
+        },
+        {
+          "argmax_prob": 0.16041246056556702,
+          "argmax_token": 377,
+          "echo": false,
+          "input_token": 6142,
+          "position": 219,
+          "rank": 10,
+          "true_prob": 0.016691196709871292,
+          "true_token": 5050
+        },
+        {
+          "argmax_prob": 0.37308257818222046,
+          "argmax_token": 562,
+          "echo": false,
+          "input_token": 5050,
+          "position": 220,
+          "rank": 0,
+          "true_prob": 0.37308257818222046,
+          "true_token": 562
+        },
+        {
+          "argmax_prob": 0.11328218132257462,
+          "argmax_token": 252,
+          "echo": false,
+          "input_token": 562,
+          "position": 221,
+          "rank": 8339,
+          "true_prob": 4.97315204484039e-06,
+          "true_token": 5049
+        },
+        {
+          "argmax_prob": 0.03583987057209015,
+          "argmax_token": 2391,
+          "echo": false,
+          "input_token": 5049,
+          "position": 222,
+          "rank": 16764,
+          "true_prob": 2.6044733658636687e-06,
+          "true_token": 74740
+        },
+        {
+          "argmax_prob": 0.6204901337623596,
+          "argmax_token": 8264,
+          "echo": false,
+          "input_token": 74740,
+          "position": 223,
+          "rank": 54010,
+          "true_prob": 1.5330236635691108e-08,
+          "true_token": 4184
+        },
+        {
+          "argmax_prob": 0.06311386823654175,
+          "argmax_token": 274,
+          "echo": false,
+          "input_token": 4184,
+          "position": 224,
+          "rank": 38,
+          "true_prob": 0.0033126086927950382,
+          "true_token": 298
+        },
+        {
+          "argmax_prob": 0.7436736226081848,
+          "argmax_token": 41963,
+          "echo": false,
+          "input_token": 298,
+          "position": 225,
+          "rank": 1,
+          "true_prob": 0.24526046216487885,
+          "true_token": 7657
+        },
+        {
+          "argmax_prob": 0.011221733875572681,
+          "argmax_token": 2088,
+          "echo": false,
+          "input_token": 7657,
+          "position": 226,
+          "rank": 1029,
+          "true_prob": 0.000148822131450288,
+          "true_token": 574
+        },
+        {
+          "argmax_prob": 0.14351361989974976,
+          "argmax_token": 3577,
+          "echo": false,
+          "input_token": 574,
+          "position": 227,
+          "rank": 0,
+          "true_prob": 0.14351361989974976,
+          "true_token": 3577
+        },
+        {
+          "argmax_prob": 0.043527256697416306,
+          "argmax_token": 2088,
+          "echo": false,
+          "input_token": 3577,
+          "position": 228,
+          "rank": 6,
+          "true_prob": 0.007484684232622385,
+          "true_token": 289
+        },
+        {
+          "argmax_prob": 0.1443595290184021,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 289,
+          "position": 229,
+          "rank": 0,
+          "true_prob": 0.1443595290184021,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.040599364787340164,
+          "argmax_token": 1431,
+          "echo": false,
+          "input_token": 185,
+          "position": 230,
+          "rank": 1,
+          "true_prob": 0.035422373563051224,
+          "true_token": 6393
+        },
+        {
+          "argmax_prob": 0.05179666355252266,
+          "argmax_token": 244,
+          "echo": false,
+          "input_token": 6393,
+          "position": 231,
+          "rank": 11,
+          "true_prob": 0.0059609441086649895,
+          "true_token": 275
+        },
+        {
+          "argmax_prob": 0.27517959475517273,
+          "argmax_token": 11405,
+          "echo": false,
+          "input_token": 275,
+          "position": 232,
+          "rank": 207,
+          "true_prob": 0.00024243247753474861,
+          "true_token": 15645
+        },
+        {
+          "argmax_prob": 0.12560762465000153,
+          "argmax_token": 11405,
+          "echo": false,
+          "input_token": 15645,
+          "position": 233,
+          "rank": 57,
+          "true_prob": 0.0021433639340102673,
+          "true_token": 7728
+        },
+        {
+          "argmax_prob": 0.07544553279876709,
+          "argmax_token": 106748,
+          "echo": false,
+          "input_token": 7728,
+          "position": 234,
+          "rank": 6286,
+          "true_prob": 4.5693650463363156e-06,
+          "true_token": 74740
+        },
+        {
+          "argmax_prob": 0.05732082948088646,
+          "argmax_token": 13568,
+          "echo": false,
+          "input_token": 74740,
+          "position": 235,
+          "rank": 2232,
+          "true_prob": 3.420853681745939e-05,
+          "true_token": 3336
+        },
+        {
+          "argmax_prob": 0.03998427838087082,
+          "argmax_token": 9448,
+          "echo": false,
+          "input_token": 3336,
+          "position": 236,
+          "rank": 32,
+          "true_prob": 0.003927908837795258,
+          "true_token": 11178
+        },
+        {
+          "argmax_prob": 0.08179663121700287,
+          "argmax_token": 13568,
+          "echo": false,
+          "input_token": 11178,
+          "position": 237,
+          "rank": 209,
+          "true_prob": 0.0005379370413720608,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.0459907129406929,
+          "argmax_token": 1673,
+          "echo": false,
+          "input_token": 13,
+          "position": 238,
+          "rank": 7515,
+          "true_prob": 4.066398560098605e-06,
+          "true_token": 13776
+        },
+        {
+          "argmax_prob": 0.01828872412443161,
+          "argmax_token": 11405,
+          "echo": false,
+          "input_token": 13776,
+          "position": 239,
+          "rank": 1028,
+          "true_prob": 0.00014068973541725427,
+          "true_token": 552
+        },
+        {
+          "argmax_prob": 0.44718554615974426,
+          "argmax_token": 3606,
+          "echo": false,
+          "input_token": 552,
+          "position": 240,
+          "rank": 0,
+          "true_prob": 0.44718554615974426,
+          "true_token": 3606
+        },
+        {
+          "argmax_prob": 0.060083530843257904,
+          "argmax_token": 252,
+          "echo": false,
+          "input_token": 3606,
+          "position": 241,
+          "rank": 15,
+          "true_prob": 0.009395096451044083,
+          "true_token": 5308
+        },
+        {
+          "argmax_prob": 0.0240462776273489,
+          "argmax_token": 5003,
+          "echo": false,
+          "input_token": 5308,
+          "position": 242,
+          "rank": 215,
+          "true_prob": 0.0006635977188125253,
+          "true_token": 14839
+        },
+        {
+          "argmax_prob": 0.1662396937608719,
+          "argmax_token": 8338,
+          "echo": false,
+          "input_token": 14839,
+          "position": 243,
+          "rank": 0,
+          "true_prob": 0.1662396937608719,
+          "true_token": 8338
+        },
+        {
+          "argmax_prob": 0.8588814735412598,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 8338,
+          "position": 244,
+          "rank": 0,
+          "true_prob": 0.8588814735412598,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.06726845353841782,
+          "argmax_token": 3712,
+          "echo": false,
+          "input_token": 185,
+          "position": 245,
+          "rank": 1304,
+          "true_prob": 9.824940207181498e-05,
+          "true_token": 76
+        },
+        {
+          "argmax_prob": 0.33173689246177673,
+          "argmax_token": 4322,
+          "echo": false,
+          "input_token": 76,
+          "position": 246,
+          "rank": 0,
+          "true_prob": 0.33173689246177673,
+          "true_token": 4322
+        },
+        {
+          "argmax_prob": 0.025252565741539,
+          "argmax_token": 6066,
+          "echo": false,
+          "input_token": 4322,
+          "position": 247,
+          "rank": 4,
+          "true_prob": 0.020516488701105118,
+          "true_token": 289
+        },
+        {
+          "argmax_prob": 0.15547922253608704,
+          "argmax_token": 244,
+          "echo": false,
+          "input_token": 289,
+          "position": 248,
+          "rank": 267,
+          "true_prob": 0.00025580692454241216,
+          "true_token": 3904
+        },
+        {
+          "argmax_prob": 0.30650922656059265,
+          "argmax_token": 1244,
+          "echo": false,
+          "input_token": 3904,
+          "position": 249,
+          "rank": 1,
+          "true_prob": 0.0814085602760315,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.16436779499053955,
+          "argmax_token": 2391,
+          "echo": false,
+          "input_token": 244,
+          "position": 250,
+          "rank": 8,
+          "true_prob": 0.013131433166563511,
+          "true_token": 11107
+        },
+        {
+          "argmax_prob": 0.51811283826828,
+          "argmax_token": 47210,
+          "echo": false,
+          "input_token": 11107,
+          "position": 251,
+          "rank": 0,
+          "true_prob": 0.51811283826828,
+          "true_token": 47210
+        },
+        {
+          "argmax_prob": 0.09258127957582474,
+          "argmax_token": 47210,
+          "echo": true,
+          "input_token": 47210,
+          "position": 252,
+          "rank": 16,
+          "true_prob": 0.0100896917283535,
+          "true_token": 356
+        },
+        {
+          "argmax_prob": 0.6193196773529053,
+          "argmax_token": 1346,
+          "echo": false,
+          "input_token": 356,
+          "position": 253,
+          "rank": 0,
+          "true_prob": 0.6193196773529053,
+          "true_token": 1346
+        },
+        {
+          "argmax_prob": 0.045919034630060196,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 1346,
+          "position": 254,
+          "rank": 36,
+          "true_prob": 0.002816330874338746,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.019781500101089478,
+          "argmax_token": 10820,
+          "echo": false,
+          "input_token": 13,
+          "position": 255,
+          "rank": 5136,
+          "true_prob": 2.1307554561644793e-05,
+          "true_token": 10479
+        },
+        {
+          "argmax_prob": 0.028768310323357582,
+          "argmax_token": 2209,
+          "echo": false,
+          "input_token": 10479,
+          "position": 256,
+          "rank": 7602,
+          "true_prob": 1.7840562577475794e-05,
+          "true_token": 413
+        },
+        {
+          "argmax_prob": 0.428168386220932,
+          "argmax_token": 244,
+          "echo": false,
+          "input_token": 413,
+          "position": 257,
+          "rank": 0,
+          "true_prob": 0.428168386220932,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.19005067646503448,
+          "argmax_token": 964,
+          "echo": false,
+          "input_token": 244,
+          "position": 258,
+          "rank": 265,
+          "true_prob": 0.00018693241872824728,
+          "true_token": 72442
+        },
+        {
+          "argmax_prob": 0.48713353276252747,
+          "argmax_token": 964,
+          "echo": false,
+          "input_token": 72442,
+          "position": 259,
+          "rank": 9,
+          "true_prob": 0.009926158003509045,
+          "true_token": 9523
+        },
+        {
+          "argmax_prob": 0.09353514015674591,
+          "argmax_token": 289,
+          "echo": false,
+          "input_token": 9523,
+          "position": 260,
+          "rank": 2,
+          "true_prob": 0.06137274205684662,
+          "true_token": 654
+        },
+        {
+          "argmax_prob": 0.017395490780472755,
+          "argmax_token": 2088,
+          "echo": false,
+          "input_token": 654,
+          "position": 261,
+          "rank": 4,
+          "true_prob": 0.007766135036945343,
+          "true_token": 3111
+        },
+        {
+          "argmax_prob": 0.3043292760848999,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 3111,
+          "position": 262,
+          "rank": 0,
+          "true_prob": 0.3043292760848999,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.018949439749121666,
+          "argmax_token": 2293,
+          "echo": false,
+          "input_token": 185,
+          "position": 263,
+          "rank": 2,
+          "true_prob": 0.01352644618600607,
+          "true_token": 476
+        },
+        {
+          "argmax_prob": 0.07038053125143051,
+          "argmax_token": 369,
+          "echo": false,
+          "input_token": 476,
+          "position": 264,
+          "rank": 377,
+          "true_prob": 0.00029299347079358995,
+          "true_token": 11405
+        },
+        {
+          "argmax_prob": 0.08416441828012466,
+          "argmax_token": 23349,
+          "echo": false,
+          "input_token": 11405,
+          "position": 265,
+          "rank": 1,
+          "true_prob": 0.0660438984632492,
+          "true_token": 964
+        },
+        {
+          "argmax_prob": 0.048157863318920135,
+          "argmax_token": 287,
+          "echo": false,
+          "input_token": 964,
+          "position": 266,
+          "rank": 18,
+          "true_prob": 0.011525868438184261,
+          "true_token": 84785
+        },
+        {
+          "argmax_prob": 0.02122654765844345,
+          "argmax_token": 29280,
+          "echo": false,
+          "input_token": 84785,
+          "position": 267,
+          "rank": 0,
+          "true_prob": 0.02122654765844345,
+          "true_token": 29280
+        },
+        {
+          "argmax_prob": 0.019120853394269943,
+          "argmax_token": 110415,
+          "echo": false,
+          "input_token": 29280,
+          "position": 268,
+          "rank": 1909,
+          "true_prob": 7.333689427468926e-05,
+          "true_token": 11443
+        },
+        {
+          "argmax_prob": 0.1489204317331314,
+          "argmax_token": 356,
+          "echo": false,
+          "input_token": 11443,
+          "position": 269,
+          "rank": 11,
+          "true_prob": 0.016092810779809952,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.06036505475640297,
+          "argmax_token": 7791,
+          "echo": false,
+          "input_token": 13,
+          "position": 270,
+          "rank": 31,
+          "true_prob": 0.0029170610941946507,
+          "true_token": 6663
+        },
+        {
+          "argmax_prob": 0.013500966131687164,
+          "argmax_token": 71998,
+          "echo": false,
+          "input_token": 6663,
+          "position": 271,
+          "rank": 1886,
+          "true_prob": 7.572727190563455e-05,
+          "true_token": 3727
+        },
+        {
+          "argmax_prob": 0.15705975890159607,
+          "argmax_token": 2391,
+          "echo": false,
+          "input_token": 3727,
+          "position": 272,
+          "rank": 2,
+          "true_prob": 0.07432235032320023,
+          "true_token": 12280
+        },
+        {
+          "argmax_prob": 0.34508511424064636,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 12280,
+          "position": 273,
+          "rank": 1,
+          "true_prob": 0.16481399536132812,
+          "true_token": 289
+        },
+        {
+          "argmax_prob": 0.14675500988960266,
+          "argmax_token": 1181,
+          "echo": false,
+          "input_token": 289,
+          "position": 274,
+          "rank": 1803,
+          "true_prob": 4.1059051000047475e-05,
+          "true_token": 4290
+        },
+        {
+          "argmax_prob": 0.3126920461654663,
+          "argmax_token": 11551,
+          "echo": false,
+          "input_token": 4290,
+          "position": 275,
+          "rank": 0,
+          "true_prob": 0.3126920461654663,
+          "true_token": 11551
+        },
+        {
+          "argmax_prob": 0.18467657268047333,
+          "argmax_token": 11088,
+          "echo": false,
+          "input_token": 11551,
+          "position": 276,
+          "rank": 0,
+          "true_prob": 0.18467657268047333,
+          "true_token": 11088
+        },
+        {
+          "argmax_prob": 0.17863820493221283,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 11088,
+          "position": 277,
+          "rank": 0,
+          "true_prob": 0.17863820493221283,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.012608743272721767,
+          "argmax_token": 287,
+          "echo": false,
+          "input_token": 185,
+          "position": 278,
+          "rank": 53,
+          "true_prob": 0.0015483548631891608,
+          "true_token": 9747
+        },
+        {
+          "argmax_prob": 0.031267356127500534,
+          "argmax_token": 2391,
+          "echo": false,
+          "input_token": 9747,
+          "position": 279,
+          "rank": 634,
+          "true_prob": 0.00021912249212618917,
+          "true_token": 275
+        },
+        {
+          "argmax_prob": 0.2279069572687149,
+          "argmax_token": 5278,
+          "echo": false,
+          "input_token": 275,
+          "position": 280,
+          "rank": 36,
+          "true_prob": 0.0017989987973123789,
+          "true_token": 20612
+        },
+        {
+          "argmax_prob": 0.20316210389137268,
+          "argmax_token": 11901,
+          "echo": false,
+          "input_token": 20612,
+          "position": 281,
+          "rank": 26,
+          "true_prob": 0.0027398846577852964,
+          "true_token": 1774
+        },
+        {
+          "argmax_prob": 0.7117739319801331,
+          "argmax_token": 2499,
+          "echo": false,
+          "input_token": 1774,
+          "position": 282,
+          "rank": 172,
+          "true_prob": 0.00011538925900822505,
+          "true_token": 3537
+        },
+        {
+          "argmax_prob": 0.5046988129615784,
+          "argmax_token": 2499,
+          "echo": false,
+          "input_token": 3537,
+          "position": 283,
+          "rank": 5,
+          "true_prob": 0.021678926423192024,
+          "true_token": 252
+        },
+        {
+          "argmax_prob": 0.13288186490535736,
+          "argmax_token": 1287,
+          "echo": false,
+          "input_token": 252,
+          "position": 284,
+          "rank": 22,
+          "true_prob": 0.0074086575768888,
+          "true_token": 3779
+        },
+        {
+          "argmax_prob": 0.19636958837509155,
+          "argmax_token": 3952,
+          "echo": false,
+          "input_token": 3779,
+          "position": 285,
+          "rank": 6,
+          "true_prob": 0.019106073305010796,
+          "true_token": 1079
+        },
+        {
+          "argmax_prob": 0.15300299227237701,
+          "argmax_token": 2391,
+          "echo": false,
+          "input_token": 1079,
+          "position": 286,
+          "rank": 1070,
+          "true_prob": 6.275959458434954e-05,
+          "true_token": 5278
+        },
+        {
+          "argmax_prob": 0.8758429884910583,
+          "argmax_token": 8714,
+          "echo": false,
+          "input_token": 5278,
+          "position": 287,
+          "rank": 0,
+          "true_prob": 0.8758429884910583,
+          "true_token": 8714
+        },
+        {
+          "argmax_prob": 0.14845077693462372,
+          "argmax_token": 13,
+          "echo": false,
+          "input_token": 8714,
+          "position": 288,
+          "rank": 0,
+          "true_prob": 0.14845077693462372,
+          "true_token": 13
+        },
+        {
+          "argmax_prob": 0.027914440259337425,
+          "argmax_token": 2243,
+          "echo": false,
+          "input_token": 13,
+          "position": 289,
+          "rank": 44388,
+          "true_prob": 5.739064476983913e-07,
+          "true_token": 74128
+        },
+        {
+          "argmax_prob": 0.018738750368356705,
+          "argmax_token": 277,
+          "echo": false,
+          "input_token": 74128,
+          "position": 290,
+          "rank": 155,
+          "true_prob": 0.0006686839042231441,
+          "true_token": 356
+        },
+        {
+          "argmax_prob": 0.29095199704170227,
+          "argmax_token": 244,
+          "echo": false,
+          "input_token": 356,
+          "position": 291,
+          "rank": 12,
+          "true_prob": 0.006658478640019894,
+          "true_token": 552
+        },
+        {
+          "argmax_prob": 0.33718177676200867,
+          "argmax_token": 185,
+          "echo": false,
+          "input_token": 552,
+          "position": 292,
+          "rank": 0,
+          "true_prob": 0.33718177676200867,
+          "true_token": 185
+        },
+        {
+          "argmax_prob": 0.02060253731906414,
+          "argmax_token": 2293,
+          "echo": false,
+          "input_token": 185,
+          "position": 293,
+          "rank": 73,
+          "true_prob": 0.001060553709976375,
+          "true_token": 81997
+        },
+        {
+          "argmax_prob": 0.04978465661406517,
+          "argmax_token": 255,
+          "echo": false,
+          "input_token": 81997,
+          "position": 294,
+          "rank": 2,
+          "true_prob": 0.008615748025476933,
+          "true_token": 206
+        },
+        {
+          "argmax_prob": 0.3230670392513275,
+          "argmax_token": 6422,
+          "echo": false,
+          "input_token": 206,
+          "position": 295,
+          "rank": 16,
+          "true_prob": 0.005384823307394981,
+          "true_token": 16
+        },
+        {
+          "argmax_prob": 0.015834739431738853,
+          "argmax_token": 9207,
+          "echo": false,
+          "input_token": 16,
+          "position": 296,
+          "rank": 17,
+          "true_prob": 0.0036285491660237312,
+          "true_token": 11
+        },
+        {
+          "argmax_prob": 0.13934722542762756,
+          "argmax_token": 5976,
+          "echo": false,
+          "input_token": 11,
+          "position": 297,
+          "rank": 6,
+          "true_prob": 0.020980743691325188,
+          "true_token": 1545
+        },
+        {
+          "argmax_prob": 0.08088311553001404,
+          "argmax_token": 5976,
+          "echo": false,
+          "input_token": 1545,
+          "position": 298,
+          "rank": 7959,
+          "true_prob": 1.379829609504668e-05,
+          "true_token": 4235
+        },
+        {
+          "argmax_prob": 0.08236237615346909,
+          "argmax_token": 5413,
+          "echo": false,
+          "input_token": 4235,
+          "position": 299,
+          "rank": 187,
+          "true_prob": 0.0005824852851219475,
+          "true_token": 26
+        },
+        {
+          "argmax_prob": 0.011543470434844494,
+          "argmax_token": 3275,
+          "echo": false,
+          "input_token": 26,
+          "position": 300,
+          "rank": 508,
+          "true_prob": 0.0003013398963958025,
+          "true_token": 739
+        },
+        {
+          "argmax_prob": 0.8383178114891052,
+          "argmax_token": 575,
+          "echo": false,
+          "input_token": 739,
+          "position": 301,
+          "rank": 0,
+          "true_prob": 0.8383178114891052,
+          "true_token": 575
+        },
+        {
+          "argmax_prob": 0.055947937071323395,
+          "argmax_token": 362,
+          "echo": false,
+          "input_token": 575,
+          "position": 302,
+          "rank": 563,
+          "true_prob": 0.0002188950020354241,
+          "true_token": 4800
+        },
+        {
+          "argmax_prob": 0.08705606311559677,
+          "argmax_token": 1358,
+          "echo": false,
+          "input_token": 4800,
+          "position": 303,
+          "rank": 133,
+          "true_prob": 0.0009858876001089811,
+          "true_token": 1749
+        },
+        {
+          "argmax_prob": 0.25330600142478943,
+          "argmax_token": 6079,
+          "echo": false,
+          "input_token": 1749,
+          "position": 304,
+          "rank": 3,
+          "true_prob": 0.04418276622891426,
+          "true_token": 244
+        },
+        {
+          "argmax_prob": 0.28561365604400635,
+          "argmax_token": 3385,
+          "echo": false,
+          "input_token": 244,
+          "position": 305,
+          "rank": 5,
+          "true_prob": 0.027887651696801186,
+          "true_token": 3686
+        },
+        {
+          "argmax_prob": 0.09203175455331802,
+          "argmax_token": 12102,
+          "echo": false,
+          "input_token": 3686,
+          "position": 306,
+          "rank": 0,
+          "true_prob": 0.09203175455331802,
+          "true_token": 12102
+        },
+        {
+          "argmax_prob": 0.23757535219192505,
+          "argmax_token": 11,
+          "echo": false,
+          "input_token": 12102,
+          "position": 307,
+          "rank": 293,
+          "true_prob": 0.0002586852351669222,
+          "true_token": 359
+        },
+        {
+          "argmax_prob": 0.016237858682870865,
+          "argmax_token": 3275,
+          "echo": false,
+          "input_token": 359,
+          "position": 308,
+          "rank": 46954,
+          "true_prob": 1.1160838084833813e-06,
+          "true_token": 120007
+        },
+        {
+          "argmax_prob": 0.2828023135662079,
+          "argmax_token": 120029,
+          "echo": false,
+          "input_token": 120007,
+          "position": 309,
+          "rank": 0,
+          "true_prob": 0.2828023135662079,
+          "true_token": 120029
+        },
+        {
+          "argmax_prob": 0.4891245365142822,
+          "argmax_token": 120030,
+          "echo": false,
+          "input_token": 120029,
+          "position": 310,
+          "rank": 0,
+          "true_prob": 0.4891245365142822,
+          "true_token": 120030
+        }
+      ],
+      "summary": {
+        "acceptance_at_1": 0.18666666666666668,
+        "echo_rate": 0.01,
+        "mean_true_prob": 0.08610373350082756,
+        "median_rank": 17.5,
+        "positions": 300,
+        "top20_rate": 0.51,
+        "top5_rate": 0.3333333333333333
+      }
+    }
+  }
+}
