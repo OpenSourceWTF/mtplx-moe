@@ -711,6 +711,37 @@ class HotExpertSwitchGLU(nn.Module):
             outputs.extend(wave_outputs)
             output_positions.extend(wave_positions)
 
+        def evaluate_direct_bindings(
+            positions: tuple[int, ...] | list[int],
+            bindings: tuple[ExpertSlotBinding, ...],
+        ) -> None:
+            if not positions:
+                return
+            by_expert: dict[int, list[int]] = {}
+            binding_by_expert: dict[int, ExpertSlotBinding] = {}
+            for global_position, binding in zip(positions, bindings, strict=True):
+                by_expert.setdefault(binding.expert, []).append(global_position)
+                binding_by_expert.setdefault(binding.expert, binding)
+            wave_outputs: list[mx.array] = []
+            wave_positions: list[int] = []
+            for expert, expert_positions in by_expert.items():
+                token_positions = mx.array(
+                    [position // top_k for position in expert_positions],
+                    dtype=mx.int32,
+                )
+                selected = mx.take(tokens, token_positions, axis=0)
+                wave_outputs.append(
+                    _run_q4_expert(
+                        selected,
+                        binding_by_expert[expert],
+                        group_size=self.group_size,
+                    )
+                )
+                wave_positions.extend(expert_positions)
+            mx.eval(wave_outputs)
+            outputs.extend(wave_outputs)
+            output_positions.extend(wave_positions)
+
         for wave in self.runtime.route_waves(
             expert_ids,
             sort_unique=(
@@ -718,85 +749,48 @@ class HotExpertSwitchGLU(nn.Module):
                 and self.runtime.manifest.sidecar is not None
             ),
         ):
-            if self.runtime.config.slot_layout == "component-banks":
-                pending = self.runtime.begin_split_route(
-                    self.layer_index,
-                    wave.experts,
-                    phase=phase,
-                )
-                try:
-                    hit_set = set(pending.plan.hits)
-                    hit_positions = tuple(
-                        position
-                        for position, expert in zip(
-                            wave.positions, wave.experts, strict=True
-                        )
-                        if expert in hit_set
-                    )
-                    if pending.hit_ready is not None:
-                        evaluate_component_bindings(
-                            hit_positions,
-                            pending.hit_ready.bindings,
-                        )
-                        pending.release_hits()
-                    miss_ready = pending.finish_misses()
-                    if miss_ready is not None:
-                        miss_positions = tuple(
-                            position
-                            for position, expert in zip(
-                                wave.positions, wave.experts, strict=True
-                            )
-                            if expert not in hit_set
-                        )
-                        evaluate_component_bindings(
-                            miss_positions,
-                            miss_ready.bindings,
-                        )
-                finally:
-                    pending.close()
-                continue
-            ready = self.runtime.ensure_route(
+            # Both layouts pin hits and start miss reads first, then run the
+            # resident experts on the GPU while the misses stream from SSD.
+            evaluate_bindings = (
+                evaluate_component_bindings
+                if self.runtime.config.slot_layout == "component-banks"
+                else evaluate_direct_bindings
+            )
+            pending = self.runtime.begin_split_route(
                 self.layer_index,
                 wave.experts,
                 phase=phase,
             )
             try:
-                by_expert: dict[int, list[int]] = {}
-                binding_by_expert: dict[int, ExpertSlotBinding] = {}
-                for global_position, binding in zip(
-                    wave.positions, ready.bindings, strict=True
-                ):
-                    by_expert.setdefault(binding.expert, []).append(global_position)
-                    binding_by_expert.setdefault(binding.expert, binding)
-                wave_outputs: list[mx.array] = []
-                wave_positions: list[int] = []
-                for expert, positions in by_expert.items():
-                    token_positions = mx.array(
-                        [position // top_k for position in positions],
-                        dtype=mx.int32,
+                hit_set = set(pending.plan.hits)
+                hit_positions = tuple(
+                    position
+                    for position, expert in zip(
+                        wave.positions, wave.experts, strict=True
                     )
-                    selected = mx.take(tokens, token_positions, axis=0)
-                    result = _run_q4_expert(
-                        selected,
-                        binding_by_expert[expert],
-                        group_size=self.group_size,
+                    if expert in hit_set
+                )
+                if pending.hit_ready is not None:
+                    evaluate_bindings(
+                        hit_positions,
+                        pending.hit_ready.bindings,
                     )
-                    wave_outputs.append(result)
-                    wave_positions.extend(positions)
-                mx.eval(wave_outputs)
-                outputs.extend(wave_outputs)
-                output_positions.extend(wave_positions)
-            except BaseException:
-                # If ``mx.eval`` itself failed, kernels may still be in
-                # flight; synchronize before dropping pins so a later route
-                # cannot rewrite a slot a zombie kernel is reading.
-                ready.release(synchronize=True)
-                raise
-            else:
-                # ``mx.eval(result)`` is the completion fence for every Q4
-                # read in this wave.  A second device-wide synchronize here
-                # only inserts an idle bubble before the next route.
-                ready.release(synchronize=False)
+                    pending.release_hits()
+                miss_ready = pending.finish_misses()
+                if miss_ready is not None:
+                    miss_positions = tuple(
+                        position
+                        for position, expert in zip(
+                            wave.positions, wave.experts, strict=True
+                        )
+                        if expert not in hit_set
+                    )
+                    evaluate_bindings(
+                        miss_positions,
+                        miss_ready.bindings,
+                    )
+            finally:
+                pending.close()
 
         if not outputs:
             raise ValueError("router produced no expert assignments")
