@@ -923,7 +923,7 @@ class HotExpertSwitchGLU(nn.Module):
                     )
                     pending.release_hits()
                 # The resident shared branch depends only on ``x``.  Force it
-                # on Metal while the native reader owns the miss future, so
+                # on Metal while the native readers own miss futures, so
                 # all-miss layers have useful GPU work instead of an empty
                 # device.  Keep prefill unchanged: at 128K, eagerly retaining
                 # the full shared output across routed waves would violate the
@@ -936,20 +936,21 @@ class HotExpertSwitchGLU(nn.Module):
                 ):
                     shared = shared_work()
                     mx.eval(shared)
-                miss_ready = pending.finish_misses()
-                if miss_ready is not None:
+                for miss_ready in pending.iter_ready_misses():
+                    ready_experts = set(miss_ready.plan.experts)
                     miss_positions = tuple(
                         position
                         for position, expert in zip(
                             wave.positions, wave.experts, strict=True
                         )
-                        if expert not in hit_set
+                        if expert not in hit_set and expert in ready_experts
                     )
                     evaluate_bindings(
                         miss_positions,
                         miss_ready.bindings,
                         miss_ready,
                     )
+                    miss_ready.release(synchronize=False)
             finally:
                 pending.close()
 
