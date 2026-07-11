@@ -5,9 +5,57 @@ import pytest
 from mtplx.expert_streaming import (
     CacheCounters,
     ExpertCacheSimulation,
+    GlobalExpertSlotBank,
     LayerExpertSlotBank,
     RoutingPhase,
 )
+
+
+def test_global_cache_lends_fixed_slots_between_layers() -> None:
+    bank = GlobalExpertSlotBank(
+        layer_indices=(1, 2),
+        expert_count=4,
+        persistent_slots=2,
+        transient_slots=2,
+        prefill_slots_per_layer=1,
+        cache_policy="lru",
+    )
+    bank.prepare_prefill_seed(1, [0])
+    first = bank.plan(1, [0], phase="prefill")
+    bank.prepare_prefill_seed(2, [0])
+    second = bank.plan(2, [0], phase="prefill")
+
+    assert first.loads[0].persistent is True
+    assert second.loads[0].persistent is True
+    assert bank.occupancy_by_layer == {1: 1, 2: 1}
+
+    # Layer 1 can take layer 2's older slot during decode. The underlying
+    # physical slot count remains exactly two.
+    replacement = bank.plan(1, [1], phase="decode")
+    assert replacement.loads[0].persistent is True
+    assert replacement.evictions[0].previous_layer == 1
+    assert replacement.evictions[0].next_layer == 1
+    assert bank.occupancy == 2
+
+    layer_one_again = bank.plan(1, [0], phase="decode")
+    assert layer_one_again.evictions[0].previous_layer == 2
+    assert bank.occupancy_by_layer == {1: 2, 2: 0}
+
+
+def test_global_cache_uses_total_capacity_as_transient_slot_base() -> None:
+    bank = GlobalExpertSlotBank(
+        layer_indices=(1, 2),
+        expert_count=4,
+        persistent_slots=3,
+        transient_slots=2,
+        prefill_slots_per_layer=0,
+        cache_policy="frequency",
+    )
+
+    plan = bank.plan(2, [1, 3], phase="prefill")
+
+    assert plan.slots == (3, 4)
+    assert all(not load.persistent for load in plan.loads)
 
 
 def test_decode_fills_persistent_slots_and_then_hits() -> None:

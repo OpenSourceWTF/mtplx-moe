@@ -200,6 +200,8 @@ class ExpertMemoryPlan:
     transient_bytes: int
     expert_cache_limit_bytes: int | None
     persistent_budget_bytes: int
+    cache_scope: str
+    persistent_slots: int
     slots_per_layer: int
     persistent_cache_bytes: int
     unallocated_bytes: int
@@ -301,6 +303,7 @@ def plan_expert_memory(
     transient_slots: int | None = None,
     io_staging_bytes: int = 0,
     execution_workspace_bytes: int = 0,
+    cache_scope: str = "layer",
 ) -> ExpertMemoryPlan:
     """Fit uniform persistent expert slots under an explicit memory ceiling.
 
@@ -330,6 +333,8 @@ def plan_expert_memory(
         expert_cache_limit_bytes = _integer(
             "expert_cache_limit_bytes", expert_cache_limit_bytes, minimum=0
         )
+    if cache_scope not in {"layer", "global"}:
+        raise ValueError("cache_scope must be 'layer' or 'global'")
 
     service_slots = spec.top_k if transient_slots is None else transient_slots
     service_slots = _integer("transient_slots", service_slots, minimum=0)
@@ -352,10 +357,23 @@ def plan_expert_memory(
         persistent_budget_bytes = min(persistent_budget_bytes, expert_cache_limit_bytes)
 
     bytes_per_uniform_slot = spec.routed_layer_count * spec.expert_record_bytes
-    slots_per_layer = min(
-        spec.expert_count, persistent_budget_bytes // bytes_per_uniform_slot
-    )
-    persistent_cache_bytes = spec.persistent_cache_bytes(slots_per_layer)
+    if cache_scope == "global":
+        persistent_slots = min(
+            spec.routed_layer_count * spec.expert_count,
+            persistent_budget_bytes // spec.expert_record_bytes,
+        )
+        # This quota is used only to seed an empty global pool fairly during
+        # prefill. Decode can lend every slot across layer boundaries.
+        slots_per_layer = min(
+            spec.expert_count, persistent_slots // spec.routed_layer_count
+        )
+        persistent_cache_bytes = persistent_slots * spec.expert_record_bytes
+    else:
+        slots_per_layer = min(
+            spec.expert_count, persistent_budget_bytes // bytes_per_uniform_slot
+        )
+        persistent_slots = slots_per_layer * spec.routed_layer_count
+        persistent_cache_bytes = spec.persistent_cache_bytes(slots_per_layer)
     unallocated_bytes = total_limit_bytes - fixed_bytes - persistent_cache_bytes
 
     return ExpertMemoryPlan(
@@ -371,6 +389,8 @@ def plan_expert_memory(
         transient_bytes=transient_bytes,
         expert_cache_limit_bytes=expert_cache_limit_bytes,
         persistent_budget_bytes=persistent_budget_bytes,
+        cache_scope=cache_scope,
+        persistent_slots=persistent_slots,
         slots_per_layer=slots_per_layer,
         persistent_cache_bytes=persistent_cache_bytes,
         unallocated_bytes=unallocated_bytes,

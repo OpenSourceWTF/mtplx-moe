@@ -8,7 +8,7 @@ size a cache before allocating multi-gigabyte Metal buffers.
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
 from enum import Enum
 from math import isfinite
@@ -42,6 +42,7 @@ class SlotLoad:
     expert: int
     slot: int
     persistent: bool
+    generation: int | None = None
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,8 @@ class SlotEviction:
     slot: int
     previous_expert: int
     next_expert: int
+    previous_layer: int | None = None
+    next_layer: int | None = None
 
 
 @dataclass(frozen=True)
@@ -68,6 +71,7 @@ class RoutePlan:
     misses: tuple[int, ...]
     loads: tuple[SlotLoad, ...]
     evictions: tuple[SlotEviction, ...]
+    generations: tuple[int | None, ...] = ()
 
 
 @dataclass
@@ -122,6 +126,13 @@ class _ExpertHistory:
     score: float = 0.0
     score_epoch: int = 0
     last_used: int = -1
+
+
+@dataclass
+class _GlobalDirectoryEntry:
+    slot: int
+    generation: int
+    state: str
 
 
 class LayerExpertSlotBank:
@@ -394,6 +405,427 @@ class LayerExpertSlotBank:
             loads=tuple(loads),
             evictions=tuple(evictions),
         )
+
+
+class GlobalExpertSlotBank:
+    """One fixed expert-record cache shared by every routed model layer.
+
+    Keys include both layer and expert ID because equal expert IDs in different
+    layers name unrelated weights.  The physical buffers are allocated once;
+    this policy only changes the generation-safe indirection from a key to a
+    global slot.  Prefill initially admits at most the legacy uniform quota per
+    layer so early layers cannot consume the entire empty pool.  Decode then
+    allows the replacement policy to move capacity between layers.
+    """
+
+    def __init__(
+        self,
+        *,
+        layer_indices: Iterable[int],
+        expert_count: int,
+        persistent_slots: int,
+        transient_slots: int,
+        prefill_slots_per_layer: int,
+        frequency_decay: float = 0.995,
+        cache_policy: str = "lru",
+    ) -> None:
+        self.layer_indices = tuple(
+            _integer("layer index", layer, minimum=0) for layer in layer_indices
+        )
+        if not self.layer_indices or len(set(self.layer_indices)) != len(
+            self.layer_indices
+        ):
+            raise ValueError("layer_indices must contain unique routed layers")
+        self._layer_set = set(self.layer_indices)
+        self.expert_count = _integer("expert_count", expert_count, minimum=1)
+        self.persistent_slots = _integer(
+            "persistent_slots", persistent_slots, minimum=0
+        )
+        self.transient_slots = _integer(
+            "transient_slots", transient_slots, minimum=1
+        )
+        self.prefill_slots_per_layer = _integer(
+            "prefill_slots_per_layer", prefill_slots_per_layer, minimum=0
+        )
+        if self.prefill_slots_per_layer > self.expert_count:
+            raise ValueError("prefill_slots_per_layer cannot exceed expert_count")
+        maximum_keys = len(self.layer_indices) * self.expert_count
+        if self.persistent_slots > maximum_keys:
+            raise ValueError("persistent_slots cannot exceed routed expert count")
+        if isinstance(frequency_decay, bool):
+            raise TypeError("frequency_decay must be a finite number")
+        try:
+            self.frequency_decay = float(frequency_decay)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("frequency_decay must be a finite number") from exc
+        if not isfinite(self.frequency_decay) or not 0.0 < self.frequency_decay <= 1.0:
+            raise ValueError("frequency_decay must be in (0, 1]")
+        if cache_policy not in {"frequency", "lru"}:
+            raise ValueError("cache_policy must be 'frequency' or 'lru'")
+        self.cache_policy = cache_policy
+        self.slot_count = self.persistent_slots + self.transient_slots
+
+        self._decode_epoch = 0
+        self._slot_to_key: list[tuple[int, int] | None] = [
+            None
+        ] * self.persistent_slots
+        self._key_to_slot: dict[tuple[int, int], int] = {}
+        self._directory: dict[tuple[int, int], _GlobalDirectoryEntry] = {}
+        self._slot_generations: list[int] = [0] * self.persistent_slots
+        self._free_slots = deque(range(self.persistent_slots))
+        self._free_slot_set = set(range(self.persistent_slots))
+        self._lru: OrderedDict[tuple[int, int], int] = OrderedDict()
+        self._history: dict[tuple[int, int], _ExpertHistory] = {}
+        self._layer_occupancy: Counter[int] = Counter()
+        self._evictions = 0
+        self._cross_layer_evictions = 0
+        self._prefill_seed_candidates: dict[int, set[int]] = {
+            layer: set() for layer in self.layer_indices
+        }
+
+    @property
+    def occupancy(self) -> int:
+        return len(self._key_to_slot)
+
+    @property
+    def resident_experts_by_layer(self) -> dict[int, tuple[int, ...]]:
+        grouped: dict[int, list[int]] = {layer: [] for layer in self.layer_indices}
+        for key in self._slot_to_key:
+            if key is not None:
+                grouped[key[0]].append(key[1])
+        return {layer: tuple(experts) for layer, experts in grouped.items()}
+
+    @property
+    def occupancy_by_layer(self) -> dict[int, int]:
+        return {layer: int(self._layer_occupancy[layer]) for layer in self.layer_indices}
+
+    def _key(self, layer: int, expert: int) -> tuple[int, int]:
+        layer = _integer("layer index", layer, minimum=0)
+        expert = _integer("expert id", expert, minimum=0)
+        if layer not in self._layer_set:
+            raise ValueError(f"layer {layer} is not a routed model layer")
+        if expert >= self.expert_count:
+            raise ValueError(
+                f"expert id {expert} is outside [0, {self.expert_count})"
+            )
+        return layer, expert
+
+    def _validate_experts(
+        self, layer: int, expert_ids: Iterable[int]
+    ) -> tuple[int, tuple[int, ...]]:
+        layer = self._key(layer, 0)[0]
+        try:
+            experts = tuple(
+                _integer("expert id", expert, minimum=0) for expert in expert_ids
+            )
+        except TypeError as exc:
+            raise TypeError("expert ids must be exact integers") from exc
+        if not experts:
+            raise ValueError("a route must select at least one expert")
+        for expert in experts:
+            self._key(layer, expert)
+        if len(dict.fromkeys(experts)) > self.transient_slots:
+            raise ValueError(
+                "transient_slots must cover the maximum unique experts in one route"
+            )
+        return layer, experts
+
+    def _history_for(self, key: tuple[int, int]) -> _ExpertHistory:
+        history = self._history.get(key)
+        if history is None:
+            history = _ExpertHistory()
+            self._history[key] = history
+        return history
+
+    def _score(self, key: tuple[int, int]) -> float:
+        history = self._history_for(key)
+        age = self._decode_epoch - history.score_epoch
+        if age <= 0 or history.score == 0.0:
+            return history.score
+        return history.score * (self.frequency_decay**age)
+
+    def _touch_decode(self, key: tuple[int, int]) -> None:
+        history = self._history_for(key)
+        history.score = self._score(key) + 1.0
+        history.score_epoch = self._decode_epoch
+        history.last_used = self._decode_epoch
+
+    def _empty_slot(self) -> int | None:
+        if not self._free_slots:
+            return None
+        slot = self._free_slots.popleft()
+        self._free_slot_set.remove(slot)
+        return slot
+
+    def _victim_slot(self, *, pinned: set[tuple[int, int]]) -> int | None:
+        if self.cache_policy == "lru":
+            for key, slot in self._lru.items():
+                if key not in pinned:
+                    return slot
+            return None
+        candidates: list[tuple[float, int, int]] = []
+        for slot, key in enumerate(self._slot_to_key):
+            if key is None or key in pinned:
+                continue
+            history = self._history_for(key)
+            if self.cache_policy == "lru":
+                candidates.append((float(history.last_used), 0, slot))
+            else:
+                candidates.append((self._score(key), history.last_used, slot))
+        return min(candidates)[2] if candidates else None
+
+    def _assign(
+        self,
+        *,
+        slot: int,
+        key: tuple[int, int],
+        evictions: list[SlotEviction],
+    ) -> None:
+        previous = self._slot_to_key[slot]
+        if previous is not None:
+            del self._key_to_slot[previous]
+            self._directory.pop(previous, None)
+            self._lru.pop(previous, None)
+            self._layer_occupancy[previous[0]] -= 1
+            self._evictions += 1
+            if previous[0] != key[0]:
+                self._cross_layer_evictions += 1
+            evictions.append(
+                SlotEviction(
+                    slot=slot,
+                    previous_expert=previous[1],
+                    next_expert=key[1],
+                    previous_layer=previous[0],
+                    next_layer=key[0],
+                )
+            )
+        elif slot in self._free_slot_set:
+            # Defensive support for callers assigning a specifically chosen
+            # empty slot rather than consuming it via _empty_slot().
+            self._free_slot_set.remove(slot)
+            self._free_slots.remove(slot)
+        self._slot_generations[slot] += 1
+        self._slot_to_key[slot] = key
+        self._key_to_slot[key] = slot
+        self._directory[key] = _GlobalDirectoryEntry(
+            slot=slot,
+            generation=self._slot_generations[slot],
+            state="loading",
+        )
+        self._lru[key] = slot
+        self._lru.move_to_end(key)
+        self._layer_occupancy[key[0]] += 1
+
+    def prepare_prefill_seed(
+        self, layer: int, expert_ids: Iterable[int]
+    ) -> tuple[int, ...]:
+        layer, experts = self._validate_experts(layer, expert_ids)
+        remaining_layer = max(
+            0, self.prefill_slots_per_layer - self._layer_occupancy[layer]
+        )
+        empty = self.persistent_slots - self.occupancy
+        available = min(remaining_layer, empty)
+        if available <= 0:
+            self._prefill_seed_candidates[layer].clear()
+            return ()
+        counts = Counter(experts)
+        ranked = sorted(counts, key=lambda expert: (-counts[expert], expert))
+        chosen = tuple(
+            expert
+            for expert in ranked
+            if (layer, expert) not in self._key_to_slot
+        )[:available]
+        self._prefill_seed_candidates[layer] = set(chosen)
+        return chosen
+
+    def invalidate_expert(self, layer: int, expert_id: int) -> int | None:
+        key = self._key(layer, expert_id)
+        slot = self._key_to_slot.pop(key, None)
+        if slot is not None:
+            self._slot_to_key[slot] = None
+            self._directory.pop(key, None)
+            self._lru.pop(key, None)
+            self._layer_occupancy[layer] -= 1
+            if slot not in self._free_slot_set:
+                self._free_slots.append(slot)
+                self._free_slot_set.add(slot)
+        return slot
+
+    def publish_ready(self, layer: int, plan: RoutePlan) -> None:
+        """Publish successfully filled global generations as cache hits."""
+
+        for load in plan.loads:
+            if not load.persistent or load.generation is None:
+                continue
+            key = self._key(layer, load.expert)
+            entry = self._directory.get(key)
+            if (
+                entry is None
+                or entry.slot != load.slot
+                or entry.generation != load.generation
+                or entry.state != "loading"
+            ):
+                raise RuntimeError("global cache generation changed before publish")
+            entry.state = "ready"
+
+    def rollback(self, layer: int, plan: RoutePlan) -> tuple[tuple[int, int], ...]:
+        """Remove only loading directory entries reserved by this plan."""
+
+        removed: list[tuple[int, int]] = []
+        for load in plan.loads:
+            if not load.persistent or load.generation is None:
+                continue
+            key = self._key(layer, load.expert)
+            entry = self._directory.get(key)
+            if (
+                entry is None
+                or entry.slot != load.slot
+                or entry.generation != load.generation
+                or entry.state != "loading"
+            ):
+                continue
+            del self._directory[key]
+            self._key_to_slot.pop(key, None)
+            self._lru.pop(key, None)
+            if self._slot_to_key[load.slot] == key:
+                self._slot_to_key[load.slot] = None
+                self._layer_occupancy[layer] -= 1
+                if load.slot not in self._free_slot_set:
+                    self._free_slots.append(load.slot)
+                    self._free_slot_set.add(load.slot)
+            removed.append((load.slot, load.generation))
+        return tuple(removed)
+
+    def plan(
+        self,
+        layer: int,
+        expert_ids: Iterable[int],
+        *,
+        phase: RoutingPhase | str,
+    ) -> RoutePlan:
+        layer, experts = self._validate_experts(layer, expert_ids)
+        phase = RoutingPhase(phase)
+        unique_experts = tuple(dict.fromkeys(experts))
+        keys = tuple((layer, expert) for expert in unique_experts)
+
+        if phase is RoutingPhase.DECODE:
+            self._decode_epoch += 1
+            for expert in experts:
+                self._touch_decode((layer, expert))
+
+        hit_keys = {
+            key
+            for key in keys
+            if (entry := self._directory.get(key)) is not None
+            and entry.state == "ready"
+        }
+        if self.cache_policy == "lru":
+            for key in keys:
+                if key in hit_keys:
+                    self._lru.move_to_end(key)
+        hit_set = {expert for key_layer, expert in hit_keys if key_layer == layer}
+        miss_order = [expert for expert in unique_experts if expert not in hit_set]
+        resolved = {
+            expert: self._key_to_slot[(layer, expert)] for expert in hit_set
+        }
+        loads: list[SlotLoad] = []
+        evictions: list[SlotEviction] = []
+        pinned = set(hit_keys)
+        transient_experts: list[int] = []
+
+        for expert in miss_order:
+            key = (layer, expert)
+            persistent_slot: int | None = None
+            if (
+                phase is RoutingPhase.PREFILL
+                and expert in self._prefill_seed_candidates[layer]
+                and self._layer_occupancy[layer] < self.prefill_slots_per_layer
+            ):
+                persistent_slot = self._empty_slot()
+                self._prefill_seed_candidates[layer].discard(expert)
+            elif phase is RoutingPhase.DECODE and self.persistent_slots:
+                persistent_slot = self._empty_slot()
+                if persistent_slot is None:
+                    victim_slot = self._victim_slot(pinned=pinned)
+                    if victim_slot is not None:
+                        victim = self._slot_to_key[victim_slot]
+                        assert victim is not None
+                        if self.cache_policy == "lru" or self._score(key) > max(
+                            1.0, self._score(victim)
+                        ):
+                            persistent_slot = victim_slot
+
+            if persistent_slot is None:
+                transient_experts.append(expert)
+                continue
+            self._assign(slot=persistent_slot, key=key, evictions=evictions)
+            pinned.add(key)
+            resolved[expert] = persistent_slot
+            loads.append(
+                SlotLoad(
+                    expert=expert,
+                    slot=persistent_slot,
+                    persistent=True,
+                    generation=self._directory[key].generation,
+                )
+            )
+
+        transient_base = self.persistent_slots
+        for offset, expert in enumerate(transient_experts):
+            slot = transient_base + offset
+            resolved[expert] = slot
+            loads.append(SlotLoad(expert=expert, slot=slot, persistent=False))
+
+        if phase is RoutingPhase.DECODE:
+            for key in hit_keys:
+                self._history_for(key).last_used = self._decode_epoch
+
+        generations = tuple(
+            (
+                self._directory[(layer, expert)].generation
+                if resolved[expert] < self.persistent_slots
+                else None
+            )
+            for expert in experts
+        )
+        return RoutePlan(
+            phase=phase,
+            experts=experts,
+            slots=tuple(resolved[expert] for expert in experts),
+            hits=tuple(expert for expert in unique_experts if expert in hit_set),
+            misses=tuple(miss_order),
+            loads=tuple(loads),
+            evictions=tuple(evictions),
+            generations=generations,
+        )
+
+    def reset(self) -> None:
+        self._decode_epoch = 0
+        self._slot_to_key = [None] * self.persistent_slots
+        self._key_to_slot.clear()
+        self._directory.clear()
+        self._slot_generations = [0] * self.persistent_slots
+        self._free_slots = deque(range(self.persistent_slots))
+        self._free_slot_set = set(range(self.persistent_slots))
+        self._lru.clear()
+        self._history.clear()
+        self._layer_occupancy.clear()
+        self._evictions = 0
+        self._cross_layer_evictions = 0
+        for candidates in self._prefill_seed_candidates.values():
+            candidates.clear()
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "capacity": self.persistent_slots,
+            "occupancy": self.occupancy,
+            "occupancy_by_layer": self.occupancy_by_layer,
+            "evictions": self._evictions,
+            "cross_layer_evictions": self._cross_layer_evictions,
+            # Records are read directly into their final fixed slots. There is
+            # no live-weight compaction or relocation copy on this path.
+            "relocation_bytes": 0,
+        }
 
 
 @dataclass

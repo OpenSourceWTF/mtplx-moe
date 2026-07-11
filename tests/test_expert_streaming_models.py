@@ -153,6 +153,33 @@ def test_explicit_expert_cache_limit_caps_slots_below_available_memory() -> None
     assert plan.unallocated_bytes == spec.persistent_cache_bytes(28)
 
 
+def test_global_memory_plan_uses_record_granularity_not_uniform_layer_rounding() -> None:
+    spec = get_model_spec("hy3-q4")
+    expert_cache_limit = 80 * GIB
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+
+    layer_plan = plan_expert_memory(
+        spec,
+        total_limit_bytes=fixed + expert_cache_limit,
+        context_tokens=0,
+        expert_cache_limit_bytes=expert_cache_limit,
+        cache_scope="layer",
+    )
+    global_plan = plan_expert_memory(
+        spec,
+        total_limit_bytes=fixed + expert_cache_limit,
+        context_tokens=0,
+        expert_cache_limit_bytes=expert_cache_limit,
+        cache_scope="global",
+    )
+
+    assert layer_plan.persistent_slots == 79 * 102
+    assert global_plan.persistent_slots == expert_cache_limit // spec.expert_record_bytes
+    assert global_plan.persistent_slots == 8_090
+    assert global_plan.persistent_cache_bytes > layer_plan.persistent_cache_bytes
+    assert 0 <= global_plan.unallocated_bytes < spec.expert_record_bytes
+
+
 def test_memory_plan_reports_when_fixed_footprint_does_not_fit() -> None:
     spec = get_model_spec("hy3-q4")
     context_tokens = 65_536

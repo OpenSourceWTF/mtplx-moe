@@ -60,6 +60,11 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
         choices=["frequency", "lru"],
         help="Decode expert-cache replacement policy.",
     )
+    group.add_argument(
+        "--expert-cache-scope",
+        choices=["layer", "global"],
+        help="Use fixed per-layer banks or one global expert-record pool.",
+    )
     group.add_argument("--expert-transient-slots", type=int)
     group.add_argument("--expert-io-staging", help="Host I/O staging reserve.")
     group.add_argument("--expert-execution-workspace", help="Execution workspace reserve.")
@@ -162,6 +167,7 @@ def expert_streaming_load_kwargs(
         "runtime_reserve_bytes": getattr(args, "expert_runtime_reserve", None),
         "expert_cache_limit_bytes": getattr(args, "expert_cache_limit", None),
         "cache_policy": getattr(args, "expert_cache_policy", None),
+        "cache_scope": getattr(args, "expert_cache_scope", None),
         "transient_slots": getattr(args, "expert_transient_slots", None),
         "io_staging_bytes": getattr(args, "expert_io_staging", None),
         "execution_workspace_bytes": getattr(args, "expert_execution_workspace", None),
@@ -227,6 +233,7 @@ def append_expert_streaming_child_args(command: list[str], args: Any) -> None:
         ("expert_runtime_reserve", "--expert-runtime-reserve"),
         ("expert_cache_limit", "--expert-cache-limit"),
         ("expert_cache_policy", "--expert-cache-policy"),
+        ("expert_cache_scope", "--expert-cache-scope"),
         ("expert_transient_slots", "--expert-transient-slots"),
         ("expert_io_staging", "--expert-io-staging"),
         ("expert_execution_workspace", "--expert-execution-workspace"),

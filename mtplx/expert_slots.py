@@ -205,6 +205,7 @@ class ExpertSlotPool:
         prefer_sidecar: bool = True,
         verify_hashes: bool = True,
         device_synchronize: Callable[[], None] | None = None,
+        cache_scope: str = "layer",
     ) -> None:
         if plan.model_key != spec.key or manifest.model_key != spec.key:
             raise ValueError("spec, memory plan, and manifest model keys must match")
@@ -234,6 +235,19 @@ class ExpertSlotPool:
         self.prefer_sidecar = prefer_sidecar
         self.verify_hashes = verify_hashes
         self.device_synchronize = device_synchronize
+        if cache_scope not in {"layer", "global"}:
+            raise ValueError("cache_scope must be 'layer' or 'global'")
+        self.cache_scope = cache_scope
+        self.global_persistent_slots = (
+            plan.persistent_slots
+            if cache_scope == "global"
+            else 0
+        )
+        self._persistent_route_capacity = (
+            self.global_persistent_slots
+            if cache_scope == "global"
+            else plan.slots_per_layer
+        )
         self.metrics = ExpertSlotMetrics()
         self._allocator = buffer_allocator or (lambda size, _label: bytearray(size))
         self.buffer_backend = str(
@@ -252,12 +266,27 @@ class ExpertSlotPool:
 
         allocated = 0
         try:
-            for layer in spec.routed_layer_indices:
-                for slot_index in range(plan.slots_per_layer):
-                    label = f"layer-{layer}-persistent-{slot_index}"
-                    buffer = self._allocate_buffer(label)
-                    self._persistent[(layer, slot_index)] = _PhysicalSlot(label, buffer)
-                    allocated += spec.expert_record_bytes
+            persistent_layout = (
+                ((None, slot_index) for slot_index in range(self.global_persistent_slots))
+                if self.cache_scope == "global"
+                else (
+                    (layer, slot_index)
+                    for layer in spec.routed_layer_indices
+                    for slot_index in range(plan.slots_per_layer)
+                )
+            )
+            for layer, slot_index in persistent_layout:
+                label = (
+                    f"global-persistent-{slot_index}"
+                    if layer is None
+                    else f"layer-{layer}-persistent-{slot_index}"
+                )
+                buffer = self._allocate_buffer(label)
+                key_layer = -1 if layer is None else layer
+                self._persistent[(key_layer, slot_index)] = _PhysicalSlot(
+                    label, buffer
+                )
+                allocated += spec.expert_record_bytes
             transient: list[_PhysicalSlot] = []
             for slot_index in range(plan.transient_slots):
                 label = f"global-transient-{slot_index}"
@@ -314,14 +343,15 @@ class ExpertSlotPool:
     def _physical(self, layer: int, logical_slot: int) -> _PhysicalSlot:
         if layer not in self.spec.routed_layer_indices:
             raise ExpertSlotError(f"layer {layer} is not a routed model layer")
-        if logical_slot < self.plan.slots_per_layer:
+        if logical_slot < self._persistent_route_capacity:
             try:
-                return self._persistent[(layer, logical_slot)]
+                key_layer = -1 if self.cache_scope == "global" else layer
+                return self._persistent[(key_layer, logical_slot)]
             except KeyError as exc:
                 raise ExpertSlotError(
                     "persistent slot is outside the memory plan"
                 ) from exc
-        transient_index = logical_slot - self.plan.slots_per_layer
+        transient_index = logical_slot - self._persistent_route_capacity
         if not 0 <= transient_index < len(self._transient):
             raise ExpertSlotError("transient slot is outside the memory plan")
         return self._transient[transient_index]
@@ -351,6 +381,10 @@ class ExpertSlotPool:
                     slot.layer == layer
                     and slot.expert == load.expert
                     and slot.state in {ExpertSlotState.LOADING, ExpertSlotState.READY}
+                    and (
+                        load.generation is None
+                        or slot.generation == load.generation
+                    )
                 ):
                     if slot.state is ExpertSlotState.LOADING:
                         self.metrics.update(deduplicated_loads=1)
@@ -366,7 +400,14 @@ class ExpertSlotPool:
                     slot.condition.wait(self._remaining(deadline_ns))
                     continue
                 replacing = slot.state is ExpertSlotState.READY
-                slot.generation += 1
+                if load.generation is None:
+                    slot.generation += 1
+                else:
+                    if load.generation <= slot.generation:
+                        raise ExpertSlotError(
+                            "stale global cache generation requested for slot"
+                        )
+                    slot.generation = load.generation
                 slot.layer = layer
                 slot.expert = load.expert
                 slot.state = ExpertSlotState.LOADING
@@ -609,13 +650,29 @@ class ExpertSlotPool:
             bindings: list[ExpertSlotBinding] = []
             unique_pins: dict[int, _PhysicalSlot] = {}
             try:
-                for expert, logical_slot in zip(plan.experts, plan.slots, strict=True):
+                plan_generations = (
+                    plan.generations
+                    if plan.generations
+                    else (None,) * len(plan.experts)
+                )
+                if len(plan_generations) != len(plan.experts):
+                    raise ExpertSlotError(
+                        "route experts and generations differ in length"
+                    )
+                for expert, logical_slot, expected_generation in zip(
+                    plan.experts,
+                    plan.slots,
+                    plan_generations,
+                    strict=True,
+                ):
                     slot = self._physical(layer, logical_slot)
                     with slot.condition:
                         current_generation = slot.generation
                     generation = prepared.get(
                         (expert, logical_slot), (slot, current_generation)
                     )[1]
+                    if expected_generation is not None:
+                        generation = expected_generation
                     self._wait_ready(
                         slot,
                         layer=layer,
@@ -670,17 +727,29 @@ class ExpertSlotPool:
             self.metrics.update(active_routes=-1)
             self._lifecycle.notify_all()
 
-    def invalidate(self, layer: int, logical_slot: int) -> None:
+    def invalidate(
+        self,
+        layer: int,
+        logical_slot: int,
+        *,
+        expert: int | None = None,
+        generation: int | None = None,
+    ) -> bool:
         slot = self._physical(layer, logical_slot)
         with slot.condition:
             if slot.state is ExpertSlotState.LOADING or slot.pins:
                 raise ExpertSlotError("cannot invalidate an active expert slot")
+            if expert is not None and slot.expert != expert:
+                return False
+            if generation is not None and slot.generation != generation:
+                return False
             slot.state = ExpertSlotState.EMPTY
             slot.layer = None
             slot.expert = None
             slot.digest = None
             slot.error = None
             slot.condition.notify_all()
+            return True
 
     def snapshot(self) -> dict[str, Any]:
         states: dict[str, int] = {state.value: 0 for state in ExpertSlotState}
@@ -695,6 +764,8 @@ class ExpertSlotPool:
             "allocated_bytes": self.allocated_bytes,
             "max_inflight_io_bytes": self.max_inflight_io_bytes,
             "persistent_slot_count": len(self._persistent),
+            "cache_scope": self.cache_scope,
+            "persistent_route_capacity": self._persistent_route_capacity,
             "transient_slot_count": len(self._transient),
             "states": states,
             "pins": pins,

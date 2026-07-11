@@ -128,6 +128,9 @@ def make_mlx_slot_buffer_allocator(
             count = plan.slots_per_layer
             if layer not in spec.routed_layer_indices:
                 raise ValueError(f"persistent slot layer {layer} is not routed")
+        elif label.startswith("global-persistent-"):
+            slot = int(parts[-1])
+            count = plan.persistent_slots
         elif label.startswith("global-transient-"):
             slot = int(parts[-1])
             count = plan.transient_slots

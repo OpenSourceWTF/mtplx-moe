@@ -49,6 +49,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["frequency", "lru"],
         default="frequency",
     )
+    parser.add_argument(
+        "--cache-scope",
+        choices=["layer", "global"],
+        default="layer",
+        help="Partition persistent expert records by layer or share them globally.",
+    )
     prompt = parser.add_mutually_exclusive_group()
     prompt.add_argument(
         "--prompt",
@@ -252,6 +258,7 @@ def main() -> int:
             else None
         ),
         cache_policy=args.cache_policy,
+        cache_scope=args.cache_scope,
         transient_slots=args.transient_slots,
         max_read_chunk_bytes=parse_memory_bytes(args.read_chunk),
         bypass_page_cache=args.f_nocache,

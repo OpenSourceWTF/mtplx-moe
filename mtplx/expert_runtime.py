@@ -20,6 +20,7 @@ from .expert_manifest import (
 from .expert_slots import ExpertSlotError, ExpertSlotPool, ReadyRoute
 from .expert_streaming import (
     CacheCounters,
+    GlobalExpertSlotBank,
     LayerExpertSlotBank,
     RoutePlan,
     RoutingPhase,
@@ -107,6 +108,7 @@ class ExpertStreamingConfig:
     slot_layout: str = "direct-slots"
     trace_routes: bool = False
     cache_policy: str = "frequency"
+    cache_scope: str = "layer"
     bypass_page_cache: bool = False
 
     def __post_init__(self) -> None:
@@ -142,6 +144,8 @@ class ExpertStreamingConfig:
         object.__setattr__(self, "frequency_decay", decay)
         if self.cache_policy not in {"frequency", "lru"}:
             raise ValueError("cache_policy must be 'frequency' or 'lru'")
+        if self.cache_scope not in {"layer", "global"}:
+            raise ValueError("cache_scope must be 'layer' or 'global'")
         if self.slot_layout not in {
             "direct-slots",
             "component-banks",
@@ -172,6 +176,10 @@ class ExpertStreamingConfig:
                 "metal-mmap executes mapped weights without per-record hashing; "
                 "it requires verify_sidecar_hash_at_open"
             )
+        if self.cache_scope == "global" and self.slot_layout != "direct-slots":
+            raise ValueError(
+                "global expert caching currently requires direct-slots"
+            )
         if self.prefill_admission:
             raise ValueError(
                 "prefill admission is not implemented; prefill must use transient slots"
@@ -196,6 +204,7 @@ class ExpertStreamingConfig:
             transient_slots=transient_slots,
             io_staging_bytes=self.io_staging_bytes,
             execution_workspace_bytes=self.execution_workspace_bytes,
+            cache_scope=self.cache_scope,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -432,19 +441,49 @@ class ExpertStreamingRuntime:
         self.memory_cap_report = memory_cap_report
         self.integrity_report = integrity_report
         self.counters = CacheCounters()
-        self._banks = {
-            layer: LayerExpertSlotBank(
+        self._layer_counters = {
+            layer: CacheCounters() for layer in spec.routed_layer_indices
+        }
+        self._global_bank = (
+            GlobalExpertSlotBank(
+                layer_indices=spec.routed_layer_indices,
                 expert_count=spec.expert_count,
-                persistent_slots=plan.slots_per_layer,
+                persistent_slots=plan.persistent_slots,
                 transient_slots=plan.transient_slots,
+                prefill_slots_per_layer=plan.slots_per_layer,
                 frequency_decay=config.frequency_decay,
                 cache_policy=config.cache_policy,
             )
-            for layer in spec.routed_layer_indices
-        }
-        self._layer_locks = {
-            layer: threading.Lock() for layer in spec.routed_layer_indices
-        }
+            if config.cache_scope == "global"
+            else None
+        )
+        self._banks = (
+            {}
+            if self._global_bank is not None
+            else {
+                layer: LayerExpertSlotBank(
+                    expert_count=spec.expert_count,
+                    persistent_slots=plan.slots_per_layer,
+                    transient_slots=plan.transient_slots,
+                    frequency_decay=config.frequency_decay,
+                    cache_policy=config.cache_policy,
+                )
+                for layer in spec.routed_layer_indices
+            }
+        )
+        if self._global_bank is not None:
+            # A route holds this lock through hit execution and miss loading.
+            # Physical pinning remains the final overwrite fence, while this
+            # lock prevents another layer from selecting the same global
+            # victim before the current transaction publishes its mapping.
+            global_lock = threading.Lock()
+            self._layer_locks = {
+                layer: global_lock for layer in spec.routed_layer_indices
+            }
+        else:
+            self._layer_locks = {
+                layer: threading.Lock() for layer in spec.routed_layer_indices
+            }
         self._kv_lock = threading.Lock()
         self._live_kv_tokens = 0
         self._live_kv_peak = 0
@@ -518,6 +557,7 @@ class ExpertStreamingRuntime:
                     and not config.verify_sidecar_hash_at_open
                 ),
                 device_synchronize=device_synchronize,
+                cache_scope=config.cache_scope,
             )
         except Exception:
             reader.close()
@@ -589,14 +629,13 @@ class ExpertStreamingRuntime:
         if self._closed:
             raise ExpertSlotError("expert streaming runtime is closed")
         try:
-            bank = self._banks[layer]
             lock = self._layer_locks[layer]
         except KeyError as exc:
             raise ValueError(
                 f"layer {layer} is not routed for {self.spec.key}"
             ) from exc
         with lock:
-            route_plan = bank.plan(expert_ids, phase=phase)
+            route_plan = self._plan_route(layer, expert_ids, phase=phase)
             try:
                 ready = self.slots.ensure_route(
                     layer,
@@ -607,17 +646,40 @@ class ExpertStreamingRuntime:
             except BaseException:
                 for load in route_plan.loads:
                     if load.persistent:
-                        bank.invalidate_expert(load.expert)
+                        self._invalidate_policy_expert(layer, load.expert)
                     try:
                         self.slots.invalidate(layer, load.slot)
                     except ExpertSlotError:
                         pass
                 raise
-            self.counters.observe(
-                route_plan,
-                expert_record_bytes=self.spec.expert_record_bytes,
-            )
+            self._observe_plan(layer, route_plan)
             return ready
+
+    def _observe_plan(self, layer: int, plan: RoutePlan) -> None:
+        self.counters.observe(
+            plan,
+            expert_record_bytes=self.spec.expert_record_bytes,
+        )
+        self._layer_counters[layer].observe(
+            plan,
+            expert_record_bytes=self.spec.expert_record_bytes,
+        )
+
+    def _plan_route(
+        self,
+        layer: int,
+        expert_ids: Iterable[int],
+        *,
+        phase: RoutingPhase | str,
+    ) -> RoutePlan:
+        if self._global_bank is not None:
+            return self._global_bank.plan(layer, expert_ids, phase=phase)
+        return self._banks[layer].plan(expert_ids, phase=phase)
+
+    def _invalidate_policy_expert(self, layer: int, expert: int) -> int | None:
+        if self._global_bank is not None:
+            return self._global_bank.invalidate_expert(layer, expert)
+        return self._banks[layer].invalidate_expert(expert)
 
     @staticmethod
     def _subset_route_plan(
@@ -644,10 +706,9 @@ class ExpertStreamingRuntime:
         )
 
     def _rollback_route_loads(self, layer: int, plan: RoutePlan) -> None:
-        bank = self._banks[layer]
         for load in plan.loads:
             if load.persistent:
-                bank.invalidate_expert(load.expert)
+                self._invalidate_policy_expert(layer, load.expert)
             try:
                 self.slots.invalidate(layer, load.slot)
             except ExpertSlotError:
@@ -667,7 +728,6 @@ class ExpertStreamingRuntime:
         if self._closed:
             raise ExpertSlotError("expert streaming runtime is closed")
         try:
-            bank = self._banks[layer]
             lock = self._layer_locks[layer]
         except KeyError as exc:
             raise ValueError(f"layer {layer} is not routed for {self.spec.key}") from exc
@@ -675,7 +735,7 @@ class ExpertStreamingRuntime:
         plan = None
         miss_future = None
         try:
-            plan = bank.plan(expert_ids, phase=phase)
+            plan = self._plan_route(layer, expert_ids, phase=phase)
             hit_plan = self._subset_route_plan(plan, hits=True)
             miss_plan = self._subset_route_plan(plan, hits=False)
             hit_ready = (
@@ -699,10 +759,7 @@ class ExpertStreamingRuntime:
                 if miss_plan is not None
                 else None
             )
-            self.counters.observe(
-                plan,
-                expert_record_bytes=self.spec.expert_record_bytes,
-            )
+            self._observe_plan(layer, plan)
             return PendingSplitRoute(
                 self,
                 layer,
@@ -767,22 +824,31 @@ class ExpertStreamingRuntime:
         expert_ids: Iterable[int],
     ) -> tuple[int, ...]:
         try:
-            bank = self._banks[layer]
             lock = self._layer_locks[layer]
         except KeyError as exc:
             raise ValueError(f"layer {layer} is not routed for {self.spec.key}") from exc
         with lock:
-            return bank.prepare_prefill_seed(expert_ids)
+            if self._global_bank is not None:
+                return self._global_bank.prepare_prefill_seed(layer, expert_ids)
+            return self._banks[layer].prepare_prefill_seed(expert_ids)
 
     def reset(self) -> None:
-        for lock in self._layer_locks.values():
+        locks = tuple(dict.fromkeys(self._layer_locks.values()))
+        for lock in locks:
             lock.acquire()
         try:
             self.slots.reset()
-            for bank in self._banks.values():
-                bank.reset()
+            if self._global_bank is not None:
+                self._global_bank.reset()
+            else:
+                for bank in self._banks.values():
+                    bank.reset()
+            self.counters = CacheCounters()
+            self._layer_counters = {
+                layer: CacheCounters() for layer in self.spec.routed_layer_indices
+            }
         finally:
-            for lock in reversed(tuple(self._layer_locks.values())):
+            for lock in reversed(locks):
                 lock.release()
 
     def snapshot(self, *, mx_module: Any | None = None) -> dict[str, Any]:
@@ -797,6 +863,12 @@ class ExpertStreamingRuntime:
                 "fixed_bytes": self.plan.fixed_bytes,
                 "persistent_cache_bytes": self.plan.persistent_cache_bytes,
                 "slots_per_layer": self.plan.slots_per_layer,
+                "cache_scope": self.config.cache_scope,
+                "global_persistent_slots": (
+                    self.plan.persistent_slots
+                    if self.config.cache_scope == "global"
+                    else None
+                ),
                 "transient_slots": self.plan.transient_slots,
                 "allocated_bytes": self.plan.allocated_bytes,
                 "unallocated_bytes": self.plan.unallocated_bytes,
@@ -807,8 +879,20 @@ class ExpertStreamingRuntime:
             "live_kv_tokens": live_kv,
             "live_kv_tokens_peak": peak_kv,
             "cache": self.counters.as_dict(),
+            "cache_by_layer": {
+                str(layer): counters.as_dict()
+                for layer, counters in self._layer_counters.items()
+            },
             "slots": self.slots.snapshot(),
         }
+        if self._global_bank is not None:
+            snapshot["global_cache"] = {
+                **self._global_bank.snapshot(),
+                "resident_experts_by_layer": {
+                    str(layer): list(experts)
+                    for layer, experts in self._global_bank.resident_experts_by_layer.items()
+                },
+            }
         if self._mapped_expert_store is not None:
             snapshot["mapped_experts"] = self._mapped_expert_store.snapshot()
         return snapshot
