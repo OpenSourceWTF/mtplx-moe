@@ -198,6 +198,39 @@ def test_duplicate_router_ids_share_one_load_and_slot() -> None:
     assert plan.slots[0] == plan.slots[1]
 
 
+def test_all_hit_probe_preserves_duplicate_order_beyond_transient_capacity() -> None:
+    bank = LayerExpertSlotBank(
+        expert_count=8,
+        persistent_slots=3,
+        transient_slots=1,
+    )
+    for expert in (0, 1, 2):
+        bank.plan([expert], phase="decode")
+
+    route = bank.try_plan_all_hits([2, 0, 2, 1], phase="decode")
+
+    assert route is not None
+    assert route.experts == (2, 0, 2, 1)
+    assert route.slots[0] == route.slots[2]
+    assert route.hits == (2, 0, 1)
+    assert route.misses == ()
+    assert route.loads == ()
+
+
+def test_failed_all_hit_probe_leaves_normal_miss_planning_available() -> None:
+    bank = LayerExpertSlotBank(
+        expert_count=8,
+        persistent_slots=1,
+        transient_slots=1,
+    )
+    bank.plan([0], phase="decode")
+
+    assert bank.try_plan_all_hits([0, 1], phase="decode") is None
+    miss = bank.plan([1], phase="decode")
+
+    assert miss.misses == (1,)
+
+
 def test_counters_preserve_router_assignment_multiplicity() -> None:
     bank = LayerExpertSlotBank(
         expert_count=8,

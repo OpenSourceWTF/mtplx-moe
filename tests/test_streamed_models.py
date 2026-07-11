@@ -12,6 +12,7 @@ from mlx.utils import tree_flatten
 from mlx_lm.models.activations import swiglu
 from mlx_lm.models.deepseek_v32 import group_expert_select
 
+import mtplx.models.expert_mlx as expert_mlx
 from mtplx.expert_manifest import (
     build_expert_manifest,
     load_expert_manifest,
@@ -765,6 +766,83 @@ def test_component_bank_hy3_executes_without_record_or_stack_copies(
         assert snapshot["slots"]["buffer_backend"] == "mlx-metal-component-banks"
         assert snapshot["slots"]["pins"] == 0
         assert snapshot["slots"]["io"]["integrity_errors"] == 0
+    finally:
+        runtime.close()
+
+
+def test_component_bank_all_hit_decode_keeps_router_order_without_split_ops(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + spec.persistent_cache_bytes(4),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        slot_layout="component-banks",
+    )
+    plan = stream_config.memory_plan(spec)
+    assert plan.slots_per_layer == 4
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=make_mlx_component_bank_allocator(
+            plan,
+            spec,
+            load_expert_manifest(manifest_path),
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+
+    def assignment_marker(
+        selected: mx.array,
+        bindings: tuple[ExpertSlotBinding, ...],
+        *,
+        group_size: int,
+    ) -> mx.array:
+        assert group_size == spec.quant_group_size
+        expert_offsets = mx.array(
+            [binding.expert * 100 for binding in bindings],
+            dtype=selected.dtype,
+        ).reshape((-1, 1))
+        return selected + expert_offsets
+
+    monkeypatch.setattr(expert_mlx, "_run_component_bank_q4", assignment_marker)
+    switch = HotExpertSwitchGLU(runtime, 1)
+    tokens = mx.zeros((2, 1, spec.hidden_size), dtype=mx.float32)
+    tokens[:, 0, 0] = mx.array([1.0, 2.0])
+    indices = mx.array([[2, 0], [2, 1]], dtype=mx.int32)
+    try:
+        # The cold call exercises the existing split/group/reorder path and
+        # fills three persistent slots across two transient-capacity waves.
+        reference = switch(tokens, indices)
+        mx.eval(reference)
+        assert reference[:, :, 0].tolist() == [[201.0, 1.0], [202.0, 102.0]]
+
+        def unexpected(*_args, **_kwargs):
+            raise AssertionError("all-hit decode used the split/group/reorder path")
+
+        monkeypatch.setattr(runtime, "route_waves", unexpected)
+        monkeypatch.setattr(runtime, "begin_split_route", unexpected)
+        monkeypatch.setattr(runtime._split_executor, "submit", unexpected)
+        monkeypatch.setattr(expert_mlx.mx, "take", unexpected)
+        monkeypatch.setattr(expert_mlx.mx, "concatenate", unexpected)
+        monkeypatch.setattr(expert_mlx.mx, "argsort", unexpected)
+
+        actual = switch(tokens, indices)
+        mx.eval(actual)
+
+        assert mx.array_equal(actual, reference).item()
+        assert actual[:, :, 0].tolist() == [[201.0, 1.0], [202.0, 102.0]]
+        snapshot = runtime.snapshot(mx_module=mx)
+        assert snapshot["cache"]["route_calls"] == 3
+        assert snapshot["cache"]["expert_hits"] == 4
+        assert snapshot["slots"]["pins"] == 0
     finally:
         runtime.close()
 

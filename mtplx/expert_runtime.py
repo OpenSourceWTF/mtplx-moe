@@ -659,6 +659,47 @@ class ExpertStreamingRuntime:
             self._observe_plan(layer, route_plan)
             return ready
 
+    def try_all_hit_route(
+        self,
+        layer: int,
+        expert_ids: Iterable[int],
+        *,
+        phase: RoutingPhase | str,
+        cancel_event: threading.Event | None = None,
+        deadline_ns: int | None = None,
+    ) -> ReadyRoute | None:
+        """Pin one fully resident layer route without wave or split execution.
+
+        The layer-local policy probe is side-effect free when any assignment
+        misses, allowing the caller to use the regular split route unchanged.
+        Component-bank execution is currently layer-local, so global-cache
+        configurations deliberately retain their existing route path.
+        """
+
+        if self._closed:
+            raise ExpertSlotError("expert streaming runtime is closed")
+        if self._global_bank is not None:
+            return None
+        try:
+            lock = self._layer_locks[layer]
+            bank = self._banks[layer]
+        except KeyError as exc:
+            raise ValueError(
+                f"layer {layer} is not routed for {self.spec.key}"
+            ) from exc
+        with lock:
+            route_plan = bank.try_plan_all_hits(expert_ids, phase=phase)
+            if route_plan is None:
+                return None
+            ready = self.slots.ensure_route(
+                layer,
+                route_plan,
+                cancel_event=cancel_event,
+                deadline_ns=deadline_ns,
+            )
+            self._observe_plan(layer, route_plan)
+            return ready
+
     def _observe_plan(self, layer: int, plan: RoutePlan) -> None:
         self.counters.observe(
             plan,

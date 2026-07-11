@@ -406,6 +406,45 @@ class LayerExpertSlotBank:
             evictions=tuple(evictions),
         )
 
+    def try_plan_all_hits(
+        self,
+        expert_ids: Iterable[int],
+        *,
+        phase: RoutingPhase | str,
+    ) -> RoutePlan | None:
+        """Plan a fully resident route without transient-capacity splitting.
+
+        A failed probe is side-effect free so callers can fall back to the
+        normal bounded-wave planner.  A successful probe applies the same
+        decode frequency/recency updates as :meth:`plan` and preserves every
+        router assignment, including duplicate expert IDs, in ``slots``.
+        """
+
+        experts = self._validate_experts_for_seed(expert_ids)
+        if not experts:
+            raise ValueError("a route must select at least one expert")
+        phase = RoutingPhase(phase)
+        unique_experts = tuple(dict.fromkeys(experts))
+        if any(expert not in self._expert_to_slot for expert in unique_experts):
+            return None
+
+        if phase is RoutingPhase.DECODE:
+            self._decode_epoch += 1
+            for expert in experts:
+                self._touch_decode(expert)
+            for expert in unique_experts:
+                self._history[expert].last_used = self._decode_epoch
+
+        return RoutePlan(
+            phase=phase,
+            experts=experts,
+            slots=tuple(self._expert_to_slot[expert] for expert in experts),
+            hits=unique_experts,
+            misses=(),
+            loads=(),
+            evictions=(),
+        )
+
 
 class GlobalExpertSlotBank:
     """One fixed expert-record cache shared by every routed model layer.

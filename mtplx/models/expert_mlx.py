@@ -706,6 +706,38 @@ class HotExpertSwitchGLU(nn.Module):
         if phase is RoutingPhase.PREFILL:
             self.runtime.prepare_prefill_seed(self.layer_index, expert_ids)
 
+        # A decode route whose complete expert set is already resident does
+        # not need transient-capacity waves or the hit/miss executor.  The
+        # component bank accepts one slot index per flattened assignment, so
+        # retaining the router's flattened order here also retains duplicate
+        # expert selections without a Python group/concatenate/sort roundtrip.
+        if (
+            phase is RoutingPhase.DECODE
+            and self.runtime.config.slot_layout == "component-banks"
+        ):
+            ready = self.runtime.try_all_hit_route(
+                self.layer_index,
+                expert_ids,
+                phase=phase,
+            )
+            if ready is not None:
+                try:
+                    assignment_inputs = mx.broadcast_to(
+                        tokens[:, None, :],
+                        (int(tokens.shape[0]), top_k, hidden_size),
+                    ).reshape((-1, hidden_size))
+                    result = _run_component_bank_q4(
+                        assignment_inputs,
+                        ready.bindings,
+                        group_size=self.group_size,
+                    )
+                    # Slot pins may be released only after the lazy graph has
+                    # consumed the currently bound bank generations.
+                    mx.eval(result)
+                finally:
+                    ready.release(synchronize=False)
+                return result.reshape((*indices.shape, hidden_size))
+
         outputs: list[mx.array] = []
         output_positions: list[int] = []
         shared: mx.array | None = None
