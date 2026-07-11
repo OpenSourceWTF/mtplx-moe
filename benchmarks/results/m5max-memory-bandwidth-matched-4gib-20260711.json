@@ -1,0 +1,90 @@
+{
+  "achieved_fraction_of_peak": 0.9088232454091093,
+  "achieved_gpu_gb_per_second": 558.0174726811931,
+  "configuration": {
+    "devices": [
+      "gpu"
+    ],
+    "dtype": "float32",
+    "elements_per_array": 1073741824,
+    "kernels": [
+      "read",
+      "triad"
+    ],
+    "repeats": 10,
+    "working_set_gib": 4.0
+  },
+  "host": {
+    "chip": "Apple M5 Max",
+    "cpu_cores": 18,
+    "efficiency_cores": 12,
+    "gpu": {
+      "architecture": "applegpu_g17s",
+      "device_name": "Apple M5 Max",
+      "max_buffer_length": 86586540032,
+      "max_recommended_working_set_size": 107374182400,
+      "memory_size": 137438953472,
+      "mlx_version": "0.31.2",
+      "resource_limit": 499000
+    },
+    "hostname": "Davids-MacBook-Pro.local",
+    "machine": "arm64",
+    "memory_bytes": 137438953472,
+    "model": "Mac17,6",
+    "performance_cores": 6,
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "lanes": [
+    {
+      "bytes": 4294967296,
+      "bytes_per_element": 4,
+      "device": "gpu",
+      "elements": 1073741824,
+      "fraction_of_peak": 0.9088232454091093,
+      "gb_per_second": 558.0174726811931,
+      "gib_per_second": 519.6942693378712,
+      "kernel": "read",
+      "label": "gpu-read",
+      "note": "bandwidth uses the fastest repeat, the standard STREAM rule",
+      "published_peak_gb_per_second": 614.0,
+      "repeats": 10,
+      "seconds": 0.007696832995861769,
+      "seconds_max": 0.008698542005731724,
+      "seconds_mean": 0.00802638329914771,
+      "seconds_min": 0.007696832995861769,
+      "traffic_multiplier": 1
+    },
+    {
+      "bytes": 12884901888,
+      "bytes_per_element": 4,
+      "device": "gpu",
+      "elements": 1073741824,
+      "fraction_of_peak": 0.5248531694155841,
+      "gb_per_second": 322.25984602116864,
+      "gib_per_second": 300.12786949162245,
+      "kernel": "triad",
+      "label": "gpu-triad",
+      "note": "bandwidth uses the fastest repeat, the standard STREAM rule",
+      "published_peak_gb_per_second": 614.0,
+      "repeats": 10,
+      "seconds": 0.03998295799829066,
+      "seconds_max": 0.040330084011657164,
+      "seconds_mean": 0.04018435009784298,
+      "seconds_min": 0.03998295799829066,
+      "traffic_multiplier": 3
+    }
+  ],
+  "memory_guard": {
+    "available_bytes": 124025339904,
+    "budget_bytes": 99220271923,
+    "headroom_fraction": 0.8,
+    "override": false,
+    "physical_bytes": 137438953472,
+    "projected_bench_bytes": 12884901888,
+    "used_bytes": 13412106240,
+    "within_budget": true
+  },
+  "published_peak_gb_per_second": 614.0,
+  "schema": "mtplx-memory-bandwidth-v1"
+}
