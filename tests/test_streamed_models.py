@@ -17,10 +17,15 @@ from mtplx.expert_manifest import (
     load_expert_manifest,
     save_expert_manifest,
 )
-from mtplx.expert_runtime import ExpertStreamingConfig, ExpertStreamingRuntime
+from mtplx.expert_runtime import (
+    ExpertStreamingConfig,
+    ExpertStreamingRuntime,
+    RouteWave,
+)
 from mtplx.expert_slots import ExpertSlotBinding
 from mtplx.expert_streaming_models import ExpertStreamingModelSpec
 from mtplx.models.expert_mlx import (
+    HotExpertSwitchGLU,
     _run_q4_expert,
     make_mlx_component_bank_allocator,
     make_mlx_slot_buffer_allocator,
@@ -166,6 +171,220 @@ def test_hy3_non_fp32_combine_casts_routing_weights_to_activation_dtype() -> Non
     # Leaving them in FP32 produces 19.875 for this fixture instead of 20.0.
     assert output.dtype == mx.bfloat16
     assert output[0, 0, 0].item() == 20.0
+
+
+def test_hy3_shared_mlp_uses_streamed_overlap_hook() -> None:
+    model = Hy3Model(_hy3_args())
+    sparse_mlp = model.model.layers[1].mlp
+    events: list[str] = []
+
+    class StubRouter:
+        def __call__(self, x):
+            return (
+                mx.zeros((*x.shape[:-1], 1), dtype=mx.int32),
+                mx.ones((*x.shape[:-1], 1), dtype=mx.bfloat16),
+            )
+
+    class OverlapSwitch:
+        def __call__(self, _x, _indices):
+            raise AssertionError("overlap-capable switch used its fallback path")
+
+        def run_with_shared_overlap(self, x, indices, shared_work):
+            events.append("switch")
+            shared = shared_work()
+            return mx.full((*indices.shape, x.shape[-1]), 2, dtype=x.dtype), shared
+
+    class FallbackSwitch:
+        def __call__(self, x, indices):
+            return mx.full((*indices.shape, x.shape[-1]), 2, dtype=x.dtype)
+
+    class StubShared:
+        def __call__(self, x):
+            events.append("shared")
+            return mx.full(x.shape, 3, dtype=x.dtype)
+
+    sparse_mlp.router = StubRouter()
+    sparse_mlp.shared_mlp = StubShared()
+    sparse_mlp.switch_mlp = FallbackSwitch()
+    hidden = mx.zeros((1, 1, 64), dtype=mx.bfloat16)
+    baseline = sparse_mlp(hidden)
+    mx.eval(baseline)
+
+    events.clear()
+    sparse_mlp.switch_mlp = OverlapSwitch()
+    output = sparse_mlp(hidden)
+    mx.eval(output)
+
+    assert events == ["switch", "shared"]
+    assert mx.array_equal(output, baseline).item()
+    assert mx.all(output == 5).item()
+
+
+def test_glm_shared_mlp_uses_streamed_overlap_hook() -> None:
+    model = GlmModel(_glm_args())
+    streamed_moe = model.model.layers[1].mlp
+    events: list[str] = []
+
+    class StubGate:
+        def __call__(self, x):
+            return (
+                mx.zeros((*x.shape[:-1], 2), dtype=mx.int32),
+                mx.full((*x.shape[:-1], 2), 0.5, dtype=mx.bfloat16),
+            )
+
+    class OverlapSwitch:
+        def __call__(self, _x, _indices):
+            raise AssertionError("overlap-capable switch used its fallback path")
+
+        def run_with_shared_overlap(self, x, indices, shared_work):
+            events.append("switch")
+            shared = shared_work()
+            return mx.full((*indices.shape, x.shape[-1]), 2, dtype=x.dtype), shared
+
+    class StubShared:
+        def __call__(self, x):
+            events.append("shared")
+            return mx.full(x.shape, 3, dtype=x.dtype)
+
+    streamed_moe.gate = StubGate()
+    streamed_moe.switch_mlp = OverlapSwitch()
+    streamed_moe.shared_experts = StubShared()
+    output = streamed_moe(mx.zeros((1, 1, 64), dtype=mx.bfloat16))
+    mx.eval(output)
+
+    assert events == ["switch", "shared"]
+    assert mx.all(output == 5).item()
+
+
+class _OverlapPending:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        assignment_count: int,
+        misses_pending: bool = True,
+    ) -> None:
+        self.events = events
+        self.plan = SimpleNamespace(hits=(), misses=(0,))
+        self.hit_ready = None
+        self.misses_pending = misses_pending
+        binding = SimpleNamespace(expert=0)
+        self._miss_ready = SimpleNamespace(
+            bindings=(binding,) * assignment_count,
+        )
+
+    def release_hits(self) -> None:
+        raise AssertionError("all-miss fixture has no hit route")
+
+    def finish_misses(self):
+        self.events.append("finish-misses")
+        self.misses_pending = False
+        return self._miss_ready
+
+    def close(self) -> None:
+        self.events.append("close")
+
+
+class _OverlapRuntime:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.spec = SimpleNamespace(top_k=1, hidden_size=2, quant_group_size=64)
+        self.manifest = SimpleNamespace(sidecar=None)
+        self.config = SimpleNamespace(slot_layout="direct-slots")
+
+    def observe_route(self, *_args, **_kwargs) -> None:
+        return None
+
+    def prepare_prefill_seed(self, *_args, **_kwargs) -> tuple[int, ...]:
+        self.events.append("prefill-seed")
+        return ()
+
+    def route_waves(self, expert_ids, **_kwargs):
+        experts = tuple(expert_ids)
+        return (
+            RouteWave(
+                positions=tuple(range(len(experts))),
+                experts=experts,
+            ),
+        )
+
+    def begin_split_route(self, _layer, experts, **_kwargs):
+        self.events.append("begin-misses")
+        return _OverlapPending(
+            self.events,
+            assignment_count=len(tuple(experts)),
+        )
+
+
+def test_streamed_decode_evaluates_shared_work_before_waiting_for_misses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    runtime = _OverlapRuntime(events)
+    switch = HotExpertSwitchGLU(runtime, 1)
+
+    def fake_q4(selected, _binding, *, group_size):
+        assert group_size == 64
+        events.append("miss-q4")
+        return selected
+
+    monkeypatch.setattr("mtplx.models.expert_mlx._run_q4_expert", fake_q4)
+
+    def shared_work():
+        events.append("shared")
+        return mx.ones((1, 1, 2), dtype=mx.bfloat16)
+
+    routed, shared = switch.run_with_shared_overlap(
+        mx.zeros((1, 1, 2), dtype=mx.bfloat16),
+        mx.zeros((1, 1, 1), dtype=mx.int32),
+        shared_work,
+    )
+    mx.eval(routed, shared)
+
+    assert events == [
+        "begin-misses",
+        "shared",
+        "finish-misses",
+        "miss-q4",
+        "close",
+    ]
+
+
+def test_128k_prefill_preserves_bounded_routed_then_shared_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokens = 128 * 1024
+    events: list[str] = []
+    runtime = _OverlapRuntime(events)
+    switch = HotExpertSwitchGLU(runtime, 1)
+
+    def fake_q4(selected, _binding, *, group_size):
+        assert group_size == 64
+        events.append("routed-q4")
+        return selected
+
+    monkeypatch.setattr("mtplx.models.expert_mlx._run_q4_expert", fake_q4)
+
+    def shared_work():
+        events.append("shared")
+        return mx.zeros((1, tokens, 2), dtype=mx.bfloat16)
+
+    routed, shared = switch.run_with_shared_overlap(
+        mx.zeros((1, tokens, 2), dtype=mx.bfloat16),
+        mx.zeros((1, tokens, 1), dtype=mx.int32),
+        shared_work,
+    )
+    mx.eval(routed, shared)
+
+    assert routed.shape == (1, tokens, 1, 2)
+    assert events == [
+        "prefill-seed",
+        "begin-misses",
+        "finish-misses",
+        "routed-q4",
+        "close",
+        "shared",
+    ]
 
 
 def test_glm_router_fp32_projection_changes_a_near_tie_route() -> None:
@@ -404,6 +623,7 @@ def test_portable_q4_slot_execution_matches_direct_quantized_matmul() -> None:
     mx.eval(actual, reference)
     assert mx.allclose(actual, reference, atol=1e-5, rtol=1e-5).item()
 
+
 def _integrated_hy3_artifact(tmp_path: Path):
     args = _hy3_args()
     model = Hy3Model(args)
@@ -562,9 +782,7 @@ def test_resident_loader_reads_extensionless_hugging_face_cache_blob(
     snapshot.mkdir(parents=True)
     blob = blobs / ("b" * 64)
     blob.hardlink_to(source / "model.safetensors")
-    (snapshot / "model.safetensors").symlink_to(
-        Path("..") / ".." / "blobs" / blob.name
-    )
+    (snapshot / "model.safetensors").symlink_to(Path("..") / ".." / "blobs" / blob.name)
     (snapshot / "config.json").write_text(
         (source / "config.json").read_text(encoding="utf-8"),
         encoding="utf-8",

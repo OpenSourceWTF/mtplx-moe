@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -27,6 +27,7 @@ from mtplx.expert_runtime import (
     ExpertStreamingConfig,
     ExpertStreamingConfigurationError,
     ExpertStreamingRuntime,
+    PendingSplitRoute,
     apply_mlx_memory_cap,
     partition_route_waves,
     reconcile_mlx_memory_cap,
@@ -580,3 +581,32 @@ def test_begin_split_route_rolls_back_when_executor_rejects(
         ready.release(synchronize=False)
     finally:
         runtime.close()
+
+
+def test_pending_split_route_reports_only_unfinished_miss_io() -> None:
+    future: Future[None] = Future()
+    layer_lock = threading.Lock()
+    layer_lock.acquire()
+    pending = PendingSplitRoute(
+        runtime=object(),
+        layer=1,
+        plan=RoutePlan(
+            phase=RoutingPhase.DECODE,
+            experts=(0,),
+            slots=(0,),
+            hits=(),
+            misses=(0,),
+            loads=(),
+            evictions=(),
+        ),
+        layer_lock=layer_lock,
+        hit_ready=None,
+        miss_future=future,
+    )
+
+    assert pending.misses_pending is True
+    future.set_result(None)
+    assert pending.misses_pending is False
+    pending.close()
+    assert layer_lock.acquire(blocking=False) is True
+    layer_lock.release()

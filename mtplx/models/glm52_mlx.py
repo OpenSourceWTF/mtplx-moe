@@ -27,7 +27,7 @@ from mlx_lm.models.deepseek_v32 import (
     group_expert_select,
 )
 
-from .expert_mlx import UnboundExpertSwitch
+from .expert_mlx import UnboundExpertSwitch, run_switch_with_shared_overlap
 
 
 @dataclass
@@ -252,10 +252,19 @@ class StreamedMoE(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         indices, scores = self.gate(x)
-        output = self.switch_mlp(x, indices)
+        if self.config.n_shared_experts is None:
+            output = self.switch_mlp(x, indices)
+            shared = None
+        else:
+            output, shared = run_switch_with_shared_overlap(
+                self.switch_mlp,
+                x,
+                indices,
+                lambda: self.shared_experts(x),
+            )
         output = (output * scores[..., None]).sum(axis=-2).astype(output.dtype)
-        if self.config.n_shared_experts is not None:
-            output = output + self.shared_experts(x)
+        if shared is not None:
+            output = output + shared
         return output
 
 

@@ -18,7 +18,7 @@ from mlx_lm.models.cache import KVCache
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
 
-from .expert_mlx import UnboundExpertSwitch
+from .expert_mlx import UnboundExpertSwitch, run_switch_with_shared_overlap
 
 
 @dataclass
@@ -178,9 +178,7 @@ class Router(nn.Module):
         scores = mx.sigmoid(logits)
         selection_scores = scores + self.expert_bias.astype(mx.float32)
         top_k = self.top_k
-        indices = mx.argpartition(selection_scores, kth=-top_k, axis=-1)[
-            ..., -top_k:
-        ]
+        indices = mx.argpartition(selection_scores, kth=-top_k, axis=-1)[..., -top_k:]
         weights = mx.take_along_axis(scores, indices, axis=-1)
         if self.route_norm:
             weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
@@ -206,9 +204,13 @@ class SparseMLP(nn.Module):
         # target logits even though the selected experts are identical.
         if not self.enable_moe_fp32_combine:
             scores = scores.astype(x.dtype)
-        routed = self.switch_mlp(x, indices)
+        routed, shared = run_switch_with_shared_overlap(
+            self.switch_mlp,
+            x,
+            indices,
+            lambda: self.shared_mlp(x),
+        )
         routed = (routed * scores[..., None]).sum(axis=-2)
-        shared = self.shared_mlp(x)
         if self.enable_moe_fp32_combine:
             return (routed.astype(mx.float32) + shared.astype(mx.float32)).astype(
                 x.dtype
@@ -228,9 +230,7 @@ class DecoderLayer(nn.Module):
         self.self_attn = Attention(args)
         resolved_mlp_type = mlp_type or args.mlp_layer_types[layer_index]
         self.mlp = (
-            SparseMLP(args, layer_index)
-            if resolved_mlp_type == "sparse"
-            else MLP(args)
+            SparseMLP(args, layer_index) if resolved_mlp_type == "sparse" else MLP(args)
         )
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
@@ -316,8 +316,7 @@ class Hy3MTP(nn.Module):
             raise ValueError("Hy3 MTP requires at least one NextN layer")
         start_layer = args.num_hidden_layers
         self.layers = [
-            Hy3MTPLayer(args, start_layer + index)
-            for index in range(num_mtp_layers)
+            Hy3MTPLayer(args, start_layer + index) for index in range(num_mtp_layers)
         ]
         self.start_layer = start_layer
         self.num_mtp_layers = num_mtp_layers

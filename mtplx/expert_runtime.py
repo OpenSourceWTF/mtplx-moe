@@ -152,8 +152,7 @@ class ExpertStreamingConfig:
             "metal-mmap",
         }:
             raise ValueError(
-                "slot_layout must be 'direct-slots', 'component-banks', or "
-                "'metal-mmap'"
+                "slot_layout must be 'direct-slots', 'component-banks', or 'metal-mmap'"
             )
         for name in (
             "prefer_sidecar",
@@ -177,9 +176,7 @@ class ExpertStreamingConfig:
                 "it requires verify_sidecar_hash_at_open"
             )
         if self.cache_scope == "global" and self.slot_layout != "direct-slots":
-            raise ValueError(
-                "global expert caching currently requires direct-slots"
-            )
+            raise ValueError("global expert caching currently requires direct-slots")
         if self.prefill_admission:
             raise ValueError(
                 "prefill admission is not implemented; prefill must use transient slots"
@@ -296,6 +293,12 @@ class PendingSplitRoute:
         if self.hit_ready is not None:
             self.hit_ready.release(synchronize=False)
             self.hit_ready = None
+
+    @property
+    def misses_pending(self) -> bool:
+        """Whether miss I/O still offers useful work-overlap headroom."""
+
+        return self._miss_future is not None and not self._miss_future.done()
 
     def finish_misses(self) -> ReadyRoute | None:
         if self._miss_ready is not None:
@@ -735,7 +738,9 @@ class ExpertStreamingRuntime:
         try:
             lock = self._layer_locks[layer]
         except KeyError as exc:
-            raise ValueError(f"layer {layer} is not routed for {self.spec.key}") from exc
+            raise ValueError(
+                f"layer {layer} is not routed for {self.spec.key}"
+            ) from exc
         lock.acquire()
         plan = None
         miss_future = None
@@ -831,7 +836,9 @@ class ExpertStreamingRuntime:
         try:
             lock = self._layer_locks[layer]
         except KeyError as exc:
-            raise ValueError(f"layer {layer} is not routed for {self.spec.key}") from exc
+            raise ValueError(
+                f"layer {layer} is not routed for {self.spec.key}"
+            ) from exc
         with lock:
             if self._global_bank is not None:
                 return self._global_bank.prepare_prefill_seed(layer, expert_ids)
@@ -852,9 +859,7 @@ class ExpertStreamingRuntime:
             self._layer_counters = {
                 layer: CacheCounters() for layer in self.spec.routed_layer_indices
             }
-            self._phase_counters = {
-                phase: CacheCounters() for phase in RoutingPhase
-            }
+            self._phase_counters = {phase: CacheCounters() for phase in RoutingPhase}
         finally:
             for lock in reversed(locks):
                 lock.release()
