@@ -83,8 +83,19 @@ class MTPLXRuntime:
     def _expert_routing_context(self, input_ids: Any):
         if self.expert_streaming is None:
             return nullcontext()
+        from .attention_context import current_attention_phase
         from .expert_streaming import RoutingPhase
         from .models.expert_mlx import expert_routing_phase
+
+        attention = current_attention_phase()
+        if attention == "prefill":
+            # A one-token prefill tail chunk is still prefill traffic: the
+            # width heuristic below would classify it as decode and pollute
+            # the persistent decode hot set.
+            return expert_routing_phase(RoutingPhase.PREFILL)
+        if attention in {"ar_decode", "decode_verify", "postcommit"}:
+            # MTP verify batches are decode traffic regardless of width.
+            return expert_routing_phase(RoutingPhase.DECODE)
 
         decode_width = 1
         if self.mtp_enabled:

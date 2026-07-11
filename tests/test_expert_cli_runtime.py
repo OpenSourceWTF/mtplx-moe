@@ -12,6 +12,7 @@ from mtplx.expert_cli import (
     append_expert_streaming_child_args,
     expert_streaming_load_kwargs,
 )
+from mtplx.attention_context import attention_phase
 from mtplx.expert_streaming import RoutingPhase
 from mtplx.models.expert_mlx import current_expert_routing_phase
 from mtplx.mtp_patch import MTPContract
@@ -150,3 +151,40 @@ def test_mtplx_runtime_marks_prefill_decode_and_closes_streaming_runtime() -> No
     assert runtime.expert_streaming_snapshot() == {"ok": True}
     runtime.close()
     assert streaming.closed is True
+
+
+def test_attention_phase_context_overrides_routing_shape_heuristic() -> None:
+    model = _PhaseModel()
+    runtime = MTPLXRuntime(
+        model=model,
+        tokenizer=None,
+        model_path=Path("model"),
+        mtp_enabled=False,
+        contract=MTPContract(),
+        expert_streaming=_StreamingStub(),
+    )
+
+    # A one-token prefill tail chunk is still prefill traffic.
+    with attention_phase("prefill"):
+        runtime.forward_ar(SimpleNamespace(shape=(1, 1)))
+    # MTP verify batches are decode traffic despite their width.
+    with attention_phase("decode_verify"):
+        runtime.forward_ar(SimpleNamespace(shape=(1, 2)))
+    with attention_phase("ar_decode"):
+        runtime.forward_ar(SimpleNamespace(shape=(1, 1)))
+    with attention_phase("postcommit"):
+        runtime.forward_ar(SimpleNamespace(shape=(1, 2)))
+    # Unrecognized phases normalize to unknown and keep the heuristic.
+    with attention_phase("ar_batch_shared_prefill"):
+        runtime.forward_ar(SimpleNamespace(shape=(1, 3)))
+        runtime.forward_ar(SimpleNamespace(shape=(1, 1)))
+
+    assert model.phases == [
+        RoutingPhase.PREFILL,
+        RoutingPhase.DECODE,
+        RoutingPhase.DECODE,
+        RoutingPhase.DECODE,
+        RoutingPhase.PREFILL,
+        RoutingPhase.DECODE,
+    ]
+    runtime.close()
