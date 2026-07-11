@@ -444,6 +444,7 @@ class ExpertStreamingRuntime:
         self._layer_counters = {
             layer: CacheCounters() for layer in spec.routed_layer_indices
         }
+        self._phase_counters = {phase: CacheCounters() for phase in RoutingPhase}
         self._global_bank = (
             GlobalExpertSlotBank(
                 layer_indices=spec.routed_layer_indices,
@@ -664,6 +665,10 @@ class ExpertStreamingRuntime:
             plan,
             expert_record_bytes=self.spec.expert_record_bytes,
         )
+        self._phase_counters[plan.phase].observe(
+            plan,
+            expert_record_bytes=self.spec.expert_record_bytes,
+        )
 
     def _plan_route(
         self,
@@ -847,6 +852,9 @@ class ExpertStreamingRuntime:
             self._layer_counters = {
                 layer: CacheCounters() for layer in self.spec.routed_layer_indices
             }
+            self._phase_counters = {
+                phase: CacheCounters() for phase in RoutingPhase
+            }
         finally:
             for lock in reversed(locks):
                 lock.release()
@@ -882,6 +890,10 @@ class ExpertStreamingRuntime:
             "cache_by_layer": {
                 str(layer): counters.as_dict()
                 for layer, counters in self._layer_counters.items()
+            },
+            "cache_by_phase": {
+                phase.value: counters.as_dict()
+                for phase, counters in self._phase_counters.items()
             },
             "slots": self.slots.snapshot(),
         }

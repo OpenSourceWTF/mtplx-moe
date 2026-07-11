@@ -353,6 +353,68 @@ def test_runtime_handles_kv_admission_routes_waves_and_reset(tmp_path: Path) -> 
         runtime.close()
 
 
+def test_runtime_snapshot_splits_cache_counters_by_phase(tmp_path: Path) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=plan.total_limit_bytes,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        verify_artifact_headers=False,
+    )
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        config,
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    try:
+        first = runtime.ensure_route(1, [0], phase="decode")
+        first.release(synchronize=False)
+        second = runtime.ensure_route(1, [0], phase="decode")
+        second.release(synchronize=False)
+        third = runtime.ensure_route(1, [1], phase="prefill")
+        third.release(synchronize=False)
+
+        snapshot = runtime.snapshot(mx_module=object())
+        by_phase = snapshot["cache_by_phase"]
+        assert set(by_phase) == {"prefill", "decode"}
+        decode = by_phase["decode"]
+        prefill = by_phase["prefill"]
+        assert decode["route_calls"] == 2
+        assert decode["expert_hits"] == 1
+        assert decode["expert_misses"] == 1
+        assert prefill["route_calls"] == 1
+        assert prefill["expert_hits"] == 0
+        assert prefill["expert_misses"] == 1
+        aggregate = snapshot["cache"]
+        for key in aggregate:
+            if key == "hit_rate":
+                continue
+            assert aggregate[key] == decode[key] + prefill[key]
+
+        # The split-route observation path must feed the same phase buckets.
+        runtime.reset()
+        assert all(
+            counters["route_calls"] == 0
+            for counters in runtime.snapshot(mx_module=object())[
+                "cache_by_phase"
+            ].values()
+        )
+        with runtime.begin_split_route(1, [0], phase="decode") as pending:
+            pending.finish_misses()
+        split_snapshot = runtime.snapshot(mx_module=object())
+        assert split_snapshot["cache_by_phase"]["decode"]["route_calls"] == 1
+        assert split_snapshot["cache_by_phase"]["decode"]["expert_misses"] == 1
+        assert split_snapshot["cache_by_phase"]["prefill"]["route_calls"] == 0
+    finally:
+        runtime.close()
+
+
 def test_runtime_rolls_back_policy_mapping_after_integrity_failure(
     tmp_path: Path,
 ) -> None:
