@@ -3282,3 +3282,75 @@ def test_pending_split_close_releases_all_parts_after_first_release_error() -> N
     assert second.releases == 1
     assert layer_lock.acquire(blocking=False)
     layer_lock.release()
+
+
+def test_pending_split_abort_claims_future_completing_during_partition() -> None:
+    part = RoutePlan(
+        phase=RoutingPhase.DECODE,
+        experts=(0,),
+        slots=(0,),
+        hits=(),
+        misses=(0,),
+        loads=(),
+        evictions=(),
+    )
+
+    class ReleaseCounter:
+        def __init__(self) -> None:
+            self.releases = 0
+
+        def release(self, *, synchronize: bool = True) -> None:
+            assert synchronize is False
+            self.releases += 1
+
+    ready = ReleaseCounter()
+
+    class CompletingFuture(Future[ReadyRoute]):
+        def __init__(self) -> None:
+            super().__init__()
+            self.done_calls = 0
+            assert self.set_running_or_notify_cancel()
+
+        def done(self) -> bool:
+            self.done_calls += 1
+            return self.done_calls > 1 or super().done()
+
+        def add_done_callback(self, fn) -> None:
+            if not super().done():
+                self.set_result(ready)  # type: ignore[arg-type]
+            super().add_done_callback(fn)
+
+    future = CompletingFuture()
+    failures: list[BaseException] = []
+
+    class FakeRuntime:
+        def _handle_split_route_failure(
+            self,
+            _layer,
+            _plan,
+            _policy_txn,
+            error,
+            **_kwargs,
+        ) -> None:
+            failures.append(error)
+
+    layer_lock = threading.Lock()
+    layer_lock.acquire()
+    pending = PendingSplitRoute(
+        runtime=FakeRuntime(),
+        layer=1,
+        plan=part,
+        layer_lock=layer_lock,
+        hit_ready=None,
+        miss_futures={future: part},
+        miss_parts=(part,),
+    )
+    primary_error = RuntimeError("injected partition failure")
+
+    pending.abort(primary_error)
+    pending.close()
+
+    assert failures == [primary_error]
+    assert ready.releases == 1
+    assert layer_lock.acquire(blocking=False)
+    layer_lock.release()
