@@ -36,4 +36,7 @@ headline claims.
 
 ## Local worktrees
 
-Keep auxiliary worktrees beneath the primary checkout's ignored `.worktrees/` directory instead of sibling `mtplx-*` workspace-root directories. Never move a worktree while another process/agent owns it; active exceptions stay until released.
+Keep auxiliary worktrees beneath the ignored `.worktrees/` directory in your
+main clone instead of creating sibling worktree directories. Never move a
+worktree while another process or agent owns it; active exceptions stay in
+place until their owner releases them.

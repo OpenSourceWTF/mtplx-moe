@@ -4,11 +4,16 @@
 
 **Goal:** Move 36 inactive auxiliary MTPLX worktrees beneath the retained primary checkout's ignored `.worktrees/` directory without changing any branch, commit, dirty state, untracked artifact, Qwen process, or GPU lock.
 
-**Architecture:** The primary checkout remains `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd`. A shared exclude and committed repository rule hide and standardize `.worktrees/`. A one-shot locked migration snapshots every inactive worktree, moves each with `git worktree move`, and verifies its identity and porcelain-status hash immediately. The actively owned `/Users/davidtai/projects/OpenSourceWTF/.worktrees/29-cache-scheduling` worktree is excluded.
+**Architecture:** The primary checkout remains `$PRIMARY`. A shared exclude and committed repository rule hide and standardize `.worktrees/`. A one-shot locked migration snapshots every inactive worktree, moves each with `git worktree move`, and verifies its identity and porcelain-status hash immediately. The actively owned `$WORKSPACE/.worktrees/29-cache-scheduling` worktree is excluded.
 
 **Tech Stack:** Git worktrees, zsh, GitHub CLI, Markdown.
 
 **Assumptions:** Assumes the registry still contains 38 worktrees — abort if it changes. Assumes `29-cache-scheduling` remains actively owned — this plan will not move, inspect recursively, or remove it. Assumes no initialized submodules, locked worktrees, or prunable entries among the other 36 — abort rather than force if any appear. Assumes moved virtual-environment entry-point scripts may retain old shebangs — this plan does not rebuild historical environments.
+
+**Path variables:** Resolve the Git common directory from any registered
+worktree, set `$PRIMARY` to the main clone containing that common `.git`
+directory, and set `$WORKSPACE` to its parent. No committed document depends on
+a user-specific absolute path.
 
 ---
 
@@ -22,7 +27,7 @@
 - `/tmp/mtplx-relocate-worktrees.zsh`: one-shot local migration driver, not committed.
 - `/tmp/mtplx-worktree-relocation-<timestamp>.tsv`: generated rollback/evidence snapshot, not committed.
 
-### Task 1: Add the durable and local placement rules
+## Task 1: Add the durable and local placement rules
 
 **Files:**
 - Modify: `.gitignore`
@@ -36,8 +41,10 @@
 - [ ] **Step 1: Verify the rule is absent**
 
 ```bash
+COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+PRIMARY="${COMMON_DIR%/.git}"
 ! rg -n '^/\.worktrees/$' .gitignore
-! rg -n '^/\.worktrees/$' /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.git/info/exclude
+! rg -n '^/\.worktrees/$' $PRIMARY/.git/info/exclude
 ```
 
 Expected: neither repository nor local shared rule exists before the change.
@@ -67,7 +74,7 @@ exception stays in place until its owner releases it.
 - [ ] **Step 4: Add the shared local exclude**
 
 Use `apply_patch` to add this exact line to
-`/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.git/info/exclude`:
+`$PRIMARY/.git/info/exclude`:
 
 ```gitignore
 /.worktrees/
@@ -87,7 +94,7 @@ git push
 
 Expected: the committed rule and approved documents are pushed on `experiment/moe-pr13-pr14-stack`; the common exclude remains local and uncommitted.
 
-### Task 2: Preflight and snapshot all inactive worktrees
+## Task 2: Preflight and snapshot all inactive worktrees
 
 **Files:**
 - Create: `/tmp/mtplx-relocate-worktrees.zsh`
@@ -100,8 +107,10 @@ Expected: the committed rule and approved documents are pushed on `experiment/mo
 - [ ] **Step 1: Require a stable registry and no competing migration**
 
 ```bash
-PRIMARY=/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd
-ACTIVE=/Users/davidtai/projects/OpenSourceWTF/.worktrees/29-cache-scheduling
+COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+PRIMARY="${COMMON_DIR%/.git}"
+WORKSPACE="$(dirname "$PRIMARY")"
+ACTIVE=$WORKSPACE/.worktrees/29-cache-scheduling
 test "$(git -C "$PRIMARY" worktree list --porcelain | rg -c '^worktree ')" = 38
 test -d "$ACTIVE"
 test "$(git -C "$ACTIVE" rev-parse --show-toplevel)" = "$ACTIVE"
@@ -122,8 +131,9 @@ content:
 set -euo pipefail
 
 MODE="${1:---dry-run}"
-PRIMARY=/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd
-WORKSPACE=/Users/davidtai/projects/OpenSourceWTF
+COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+PRIMARY="${COMMON_DIR%/.git}"
+WORKSPACE="${PRIMARY:h}"
 ACTIVE=$WORKSPACE/.worktrees/29-cache-scheduling
 DEST_ROOT=$PRIMARY/.worktrees
 INTEGRATION_OLD=$WORKSPACE/mtplx-experimental-pr13-pr14-main
@@ -184,6 +194,10 @@ if git -C "$PRIMARY" worktree list --porcelain | grep -Eq '^(locked|prunable)'; 
   print -u2 "locked or prunable worktree found"
   exit 1
 fi
+
+printf 'path\thead\tbranch_state\n%s\t%s\t%s\n' \
+  "$ACTIVE" "$(git -C "$ACTIVE" rev-parse HEAD)" "$(branch_state "$ACTIVE")" \
+  > "$SNAPSHOT.active"
 
 process_snapshot="$(ps -axo pid=,command=)"
 for old in "${registry[@]}"; do
@@ -277,7 +291,7 @@ zsh /tmp/mtplx-relocate-worktrees.zsh --dry-run
 
 Expected: exit zero, 36 collision-free old-to-new mappings printed, snapshot written, no paths moved, and the registry unchanged.
 
-### Task 3: Move and immediately verify 36 worktrees
+## Task 3: Move and immediately verify 36 worktrees
 
 **Files:**
 - Move: 36 registered worktree directories
@@ -289,7 +303,9 @@ Expected: exit zero, 36 collision-free old-to-new mappings printed, snapshot wri
 - [ ] **Step 1: Revalidate the dry-run snapshot immediately before mutation**
 
 ```bash
-test "$(git -C /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd \
+COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+PRIMARY="${COMMON_DIR%/.git}"
+test "$(git -C "$PRIMARY" \
   worktree list --porcelain | rg -c '^worktree ')" = 38
 ! ps -axo command= | rg 'git .*worktree (move|remove|add)'
 ```
@@ -317,7 +333,9 @@ a mismatch.
 - [ ] **Step 4: Execute the migration**
 
 ```bash
-cd /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd
+COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+PRIMARY="${COMMON_DIR%/.git}"
+cd "$PRIMARY"
 zsh /tmp/mtplx-relocate-worktrees.zsh --execute
 ```
 
@@ -326,14 +344,17 @@ Expected: 36 moves and 36 immediate verification passes; primary and active exce
 - [ ] **Step 5: Remove only empty former grouping directories**
 
 ```bash
-rmdir /Users/davidtai/projects/OpenSourceWTF/mtplx-opt-prs 2>/dev/null || true
-rmdir /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-stack 2>/dev/null || true
-rmdir /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees 2>/dev/null || true
+COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+PRIMARY="${COMMON_DIR%/.git}"
+WORKSPACE="$(dirname "$PRIMARY")"
+rmdir "$WORKSPACE/mtplx-opt-prs" 2>/dev/null || true
+rmdir "$WORKSPACE/mtplx-hy3-stack" 2>/dev/null || true
+rmdir "$PRIMARY/.claude/worktrees" 2>/dev/null || true
 ```
 
-Expected: empty containers disappear; nonempty directories are preserved. Do not remove `/Users/davidtai/projects/OpenSourceWTF/.worktrees/`.
+Expected: empty containers disappear; nonempty directories are preserved. Do not remove `$WORKSPACE/.worktrees/`.
 
-### Task 4: Verify final local and remote state
+## Task 4: Verify final local and remote state
 
 **Files:**
 - Test: Git worktree registry, dirty-state snapshot, default branch, CI, Qwen/lock state
@@ -343,8 +364,10 @@ Expected: empty containers disappear; nonempty directories are preserved. Do not
 - [ ] **Step 1: Verify registry placement and identity**
 
 ```bash
-PRIMARY=/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd
-ACTIVE=/Users/davidtai/projects/OpenSourceWTF/.worktrees/29-cache-scheduling
+COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+PRIMARY="${COMMON_DIR%/.git}"
+WORKSPACE="$(dirname "$PRIMARY")"
+ACTIVE=$WORKSPACE/.worktrees/29-cache-scheduling
 test "$(git -C "$PRIMARY" worktree list --porcelain | rg -c '^worktree ')" = 38
 test "$(git -C "$PRIMARY" worktree list --porcelain |
   rg -c "^worktree $PRIMARY/\.worktrees/")" = 36
@@ -356,14 +379,43 @@ Expected: one primary, one active exception, and 36 canonical auxiliary worktree
 
 - [ ] **Step 2: Verify all snapshot identities and dirty-state hashes**
 
-For all 36 snapshot rows, recompute HEAD, branch/detached state, and porcelain
-status hash at the destination and require exact equality. Require every old
-path to be absent. Verify the active exception's registered path and HEAD are
-unchanged from preflight without traversing its contents.
+```zsh
+set -euo pipefail
+SNAPSHOT="$(ls -t /tmp/mtplx-worktree-relocation-*.tsv | head -1)"
+status_hash() {
+  git -C "$1" status --porcelain=v1 -z --untracked-files=all |
+    shasum -a 256 | awk '{print $1}'
+}
+branch_state() {
+  git -C "$1" symbolic-ref --quiet --short HEAD 2>/dev/null || print DETACHED
+}
+
+verified=0
+while IFS=$'\t' read -r old destination head branch hash disk_kib; do
+  [[ "$old" == old_path ]] && continue
+  [[ ! -e "$old" ]]
+  [[ "$(git -C "$destination" rev-parse HEAD)" == "$head" ]]
+  [[ "$(branch_state "$destination")" == "$branch" ]]
+  [[ "$(status_hash "$destination")" == "$hash" ]]
+  (( ++verified ))
+done < "$SNAPSHOT"
+(( verified == 36 ))
+
+IFS=$'\t' read -r active_path active_head active_branch \
+  < <(tail -n 1 "$SNAPSHOT.active")
+[[ "$(git -C "$active_path" rev-parse HEAD)" == "$active_head" ]]
+[[ "$(branch_state "$active_path")" == "$active_branch" ]]
+```
+
+Expected: all 36 destination identities and status hashes match, every old path
+is absent, and the active exception's path, HEAD, and branch are unchanged
+without traversing its contents.
 
 - [ ] **Step 3: Verify repository/default-branch state**
 
 ```bash
+COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+PRIMARY="${COMMON_DIR%/.git}"
 NEW_ACTIVE=$PRIMARY/.worktrees/mtplx-experimental-pr13-pr14-main
 test -z "$(git -C "$NEW_ACTIVE" status --porcelain)"
 test "$(gh repo view davidtai/MTPLX --json defaultBranchRef --jq '.defaultBranchRef.name')" = \
@@ -379,9 +431,13 @@ Expected: clean default work-off branch at the same pushed commit and unchanged 
 - [ ] **Step 4: Verify ignore, CI, and service invariants**
 
 ```bash
+set -e
+COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+PRIMARY="${COMMON_DIR%/.git}"
 git -C "$PRIMARY" check-ignore -v .worktrees/example/file
-test -z "$(gh pr checks 32 --repo davidtai/MTPLX --json state \
-  --jq '.[] | select(.state != "SUCCESS") | .name')"
+gh pr checks 32 --repo davidtai/MTPLX --json state > /tmp/mtplx-pr32-checks.json
+test -z "$(jq -r '.[] | select(.state != "SUCCESS") | .name' \
+  /tmp/mtplx-pr32-checks.json)"
 test ! -d /tmp/mtplx-gpu-exclusive
 curl -fsS --max-time 3 http://127.0.0.1:8080/v1/models |
   jq -e '.data[] | select(.id == "mtplx-qwen36-27b-optimized-speed")'

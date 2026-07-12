@@ -2,10 +2,10 @@
 
 ## Scope
 
-Keep the primary checkout at
-`/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd` and relocate every other
-registered worktree for its Git common directory beneath the primary checkout's
-ignored `.worktrees/` directory.
+`$PRIMARY` denotes the retained main clone, and `$WORKSPACE` denotes its parent
+directory. Keep `$PRIMARY` in place and relocate inactive auxiliary worktrees
+for its Git common directory beneath the main clone's ignored `.worktrees/`
+directory.
 
 The current inventory contains 38 registered worktrees: one retained primary
 checkout, one actively owned exception, and 36 auxiliary worktrees to relocate.
@@ -17,10 +17,10 @@ migration.
 The canonical root is:
 
 ```text
-/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/
+$PRIMARY/.worktrees/
 ```
 
-Paths currently rooted directly beneath `OpenSourceWTF` retain their relative
+Paths currently rooted directly beneath `$WORKSPACE` retain their relative
 grouping beneath the canonical root. Examples:
 
 ```text
@@ -30,14 +30,14 @@ mtplx-hy3-stack/29-cache-scheduling
 mtplx-runtime-gate-pr17
 ```
 
-Legacy worktrees under `mtplx-hy3-ssd/.claude/worktrees/` move to:
+Legacy worktrees under `$PRIMARY/.claude/worktrees/` move to:
 
 ```text
 .worktrees/claude/<existing-name>
 ```
 
 The actively owned
-`/Users/davidtai/projects/OpenSourceWTF/.worktrees/29-cache-scheduling` worktree
+`$WORKSPACE/.worktrees/29-cache-scheduling` worktree
 is an explicit temporary exception. Another agent is using it, so this migration
 must not inspect its contents recursively, change its path, or remove its parent
 directory. It moves to the canonical root only in a later operation after its
