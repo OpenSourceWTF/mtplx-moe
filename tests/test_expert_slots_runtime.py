@@ -4415,3 +4415,162 @@ def test_finish_misses_releases_internal_lease_after_later_failure(
             if not release_fails:
                 raise
             assert exc.__cause__ is cleanup_error
+
+
+@pytest.mark.parametrize("gate_position", ["before", "after"])
+def test_finish_misses_aggregation_handoff_survives_concurrent_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gate_position: str,
+) -> None:
+    root, base_spec, manifest, _expected = _artifact(tmp_path)
+    spec = replace(base_spec, top_k=2)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    parts = (_manual_plan(0, 0), _manual_plan(1, 1))
+    full_plan = RoutePlan(
+        phase=RoutingPhase.DECODE,
+        experts=(0, 1),
+        slots=(0, 1),
+        hits=(),
+        misses=(0, 1),
+        loads=parts[0].loads + parts[1].loads,
+        evictions=(),
+    )
+    readies = [runtime.slots.ensure_route(1, part) for part in parts]
+    futures: list[Future[ReadyRoute]] = []
+    for ready in readies:
+        future: Future[ReadyRoute] = Future()
+        future.set_result(ready)
+        futures.append(future)
+    release_counts = [0, 0]
+    for index, ready in enumerate(readies):
+        original_release = ready.release
+
+        def count_release(
+            *,
+            synchronize: bool = True,
+            index: int = index,
+            original_release=original_release,
+        ) -> None:
+            release_counts[index] += 1
+            original_release(synchronize=synchronize)
+
+        monkeypatch.setattr(ready, "release", count_release)
+
+    lifecycle = runtime.slots.retain_split_lifecycle()
+    layer_lock = runtime._layer_locks[1]
+    layer_lock.acquire()
+    pending = PendingSplitRoute(
+        runtime=runtime,
+        layer=1,
+        plan=full_plan,
+        layer_lock=layer_lock,
+        hit_ready=None,
+        miss_futures=dict(zip(futures, parts, strict=True)),
+        lifecycle_release=lifecycle.release,
+        miss_parts=parts,
+    )
+    transfer_gate = threading.Event()
+    continue_transfer = threading.Event()
+    original_prepare = pending._prepare_ready_group
+
+    def gate_transfer():
+        if gate_position == "before":
+            transfer_gate.set()
+            assert continue_transfer.wait(timeout=2)
+        group = original_prepare()
+        if gate_position == "after":
+            transfer_gate.set()
+            assert continue_transfer.wait(timeout=2)
+        return group
+
+    monkeypatch.setattr(pending, "_prepare_ready_group", gate_transfer)
+    finish_executor = ThreadPoolExecutor(max_workers=1)
+    finish_call = finish_executor.submit(pending.finish_misses)
+    finish_result = None
+    finish_error: BaseException | None = None
+    layer_released_early = False
+    try:
+        assert transfer_gate.wait(timeout=2)
+        with pending._state_lock:
+            leases_at_gate = set(pending._consumer_leases)
+            aggregate_at_gate = getattr(pending, "_aggregate_lease", None)
+            parts_at_gate = tuple(pending._miss_ready_parts)
+        pending.close()
+        releases_during_handoff = tuple(release_counts)
+        layer_released_early = layer_lock.acquire(blocking=False)
+        if layer_released_early:
+            layer_lock.release()
+
+        continue_transfer.set()
+        try:
+            finish_result = finish_call.result(timeout=2)
+        except BaseException as exc:
+            finish_error = exc
+        if finish_result is not None:
+            release_group = getattr(pending, "release_misses", None)
+            if callable(release_group):
+                release_group(finish_result)
+
+        pins = 0
+        loading = 0
+        for slot in (*runtime.slots._persistent.values(), *runtime.slots._transient):
+            with slot.condition:
+                pins += slot.pins
+                loading += int(slot.state.value == "loading")
+        active_routes = runtime.slots.metrics.as_dict()["active_routes"]
+        assert layer_lock.acquire(timeout=2)
+        layer_lock.release()
+
+        evidence = (
+            f"position={gate_position}, leases={leases_at_gate}, "
+            f"aggregate={aggregate_at_gate!r}, parts={parts_at_gate}, "
+            f"releases_during={releases_during_handoff}, "
+            f"layer_released_early={layer_released_early}, "
+            f"finish_result={finish_result!r}, finish_error={finish_error!r}, "
+            f"release_counts={release_counts}, pins={pins}, "
+            f"active={active_routes}, loading={loading}"
+        )
+        if gate_position == "before":
+            assert leases_at_gate == {0, 1}, evidence
+            assert aggregate_at_gate is None, evidence
+            assert finish_result is None, evidence
+            assert isinstance(finish_error, ExpertSlotError), evidence
+        else:
+            assert leases_at_gate == set(), evidence
+            assert aggregate_at_gate is finish_result, evidence
+            assert finish_error is None, evidence
+        assert parts_at_gate == (0, 1), evidence
+        assert releases_during_handoff == (0, 0), evidence
+        assert layer_released_early is False, evidence
+        assert release_counts == [1, 1], evidence
+        assert pins == 0, evidence
+        assert active_routes == 0, evidence
+        assert loading == 0, evidence
+    finally:
+        continue_transfer.set()
+        try:
+            finish_call.result(timeout=2)
+        except BaseException:
+            pass
+        for ready in readies:
+            if not ready._released:
+                ready.release(synchronize=False)
+        pending.close()
+        finish_executor.shutdown(wait=True, cancel_futures=True)
+        runtime.close(timeout=2)
