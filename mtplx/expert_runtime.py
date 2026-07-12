@@ -1333,6 +1333,14 @@ class ExpertStreamingRuntime:
                     previous_layer,
                     eviction.previous_expert,
                 )
+        if self._global_bank is not None:
+            for part in accepted_parts:
+                for load in part.loads:
+                    if load.persistent and load.generation is not None:
+                        self._global_bank.reconcile_slot_generation(
+                            load.slot,
+                            load.generation,
+                        )
 
     def begin_split_route(
         self,

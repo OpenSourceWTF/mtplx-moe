@@ -780,6 +780,18 @@ class GlobalExpertSlotBank:
                 self._free_slot_set.add(slot)
         return slot
 
+    def reconcile_slot_generation(self, slot: int, generation: int) -> None:
+        """Advance policy state to a generation already used physically."""
+
+        slot = _integer("slot", slot, minimum=0)
+        if slot >= self.persistent_slots:
+            raise ValueError("slot is outside the persistent global cache")
+        generation = _integer("generation", generation, minimum=0)
+        self._slot_generations[slot] = max(
+            self._slot_generations[slot],
+            generation,
+        )
+
     def publish_ready(self, layer: int, plan: RoutePlan) -> None:
         """Publish successfully filled global generations as cache hits."""
 
