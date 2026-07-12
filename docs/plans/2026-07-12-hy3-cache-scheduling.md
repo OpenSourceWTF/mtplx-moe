@@ -32,7 +32,7 @@ Observed baseline: both runs stopped naturally after the same 1,905 generated to
 **Security flag:** none
 **Does NOT cover:** Metal execution or all-hit bypass; it only makes the existing global slot transaction representable by component-major storage.
 
-- [ ] **Step 1: Write failing configuration and allocator tests**
+- [x] **Step 1: Write failing configuration and allocator tests**
 
 Add tests equivalent to:
 
@@ -49,7 +49,7 @@ def test_global_component_allocator_uses_one_persistent_bank(plan, spec, manifes
     assert left.bank.capacity == plan.persistent_slots
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run:
 
@@ -61,11 +61,11 @@ uv run --frozen --extra dev --extra server pytest -q \
 
 Expected: configuration rejects the combination or the allocator rejects `global-persistent-*`.
 
-- [ ] **Step 3: Implement the global persistent bank**
+- [x] **Step 3: Implement the global persistent bank**
 
 Remove only the `global + component-banks` rejection from `ExpertStreamingConfig`. In `make_mlx_component_bank_allocator`, accept `global-persistent-N`, create a bank keyed as `("global-persistent", -1)`, use `plan.persistent_slots`, and use an exemplar record only after proving every routed layer has the same `(component, dtype, shape, length)` signature.
 
-- [ ] **Step 4: Verify GREEN and memory accounting**
+- [x] **Step 4: Verify GREEN and memory accounting**
 
 Run the target tests plus:
 
@@ -77,7 +77,7 @@ uv run --frozen --extra dev --extra server pytest -q \
 
 Expected: pass; allocated bytes equal `plan.persistent_cache_bytes + plan.transient_bytes`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add mtplx/expert_runtime.py mtplx/models/expert_mlx.py \
