@@ -115,10 +115,18 @@ def _spec() -> ExpertStreamingModelSpec:
 
 def _artifact(
     tmp_path: Path,
+    *,
+    expert_count: int = 2,
 ) -> tuple[Path, ExpertStreamingModelSpec, ExpertManifest, dict[int, bytes]]:
     root = tmp_path / "artifact"
     root.mkdir()
     spec = _spec()
+    if expert_count != spec.expert_count:
+        spec = replace(
+            spec,
+            expert_count=expert_count,
+            total_tensor_bytes=expert_count * spec.expert_record_bytes + 1,
+        )
     raw = bytearray()
     records: list[ExpertRecord] = []
     expected: dict[int, bytes] = {}
@@ -2843,6 +2851,92 @@ def test_incremental_submit_failure_releases_pinned_hit(
         assert lock.acquire(blocking=False)
         lock.release()
     finally:
+        runtime.close(timeout=2)
+
+
+def test_incremental_second_submit_failure_drains_accepted_part_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, base_spec, manifest, _expected = _artifact(tmp_path, expert_count=3)
+    spec = replace(base_spec, top_k=3)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+            cache_policy="lru",
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    warm = runtime.ensure_route(1, [0], phase="decode")
+    warm.release(synchronize=False)
+    policy_before = _layer_policy_state(runtime, 1)
+    cache_before = runtime.counters.as_dict()
+    incremental_before = runtime.snapshot(mx_module=object())["incremental_misses"]
+    original_submit = runtime._split_executor.submit
+    submit_error = RuntimeError("injected second outer split submit rejection")
+    submit_count = 0
+
+    class SuccessfulPart:
+        def __init__(self) -> None:
+            self.releases = 0
+
+        def release(self, *, synchronize: bool = True) -> None:
+            assert synchronize is False
+            self.releases += 1
+
+    successful_part = SuccessfulPart()
+    accepted: Future[ReadyRoute] = Future()
+    accepted.set_result(successful_part)  # type: ignore[arg-type]
+
+    def reject_second_submit(*_args, **_kwargs):
+        nonlocal submit_count
+        submit_count += 1
+        if submit_count == 1:
+            return accepted
+        raise submit_error
+
+    monkeypatch.setattr(runtime._split_executor, "submit", reject_second_submit)
+    try:
+        with pytest.raises(RuntimeError, match="second outer split") as failed:
+            runtime.begin_split_route(1, [0, 1, 2], phase="decode")
+
+        assert failed.value is submit_error
+        assert submit_count == 2
+        assert successful_part.releases == 1
+        assert _layer_policy_state(runtime, 1) == policy_before
+        assert runtime.counters.as_dict() == cache_before
+        assert runtime.snapshot(mx_module=object())["incremental_misses"] == (
+            incremental_before
+        )
+        slots = (*runtime.slots._persistent.values(), *runtime.slots._transient)
+        for slot in slots:
+            with slot.condition:
+                assert slot.state.value != "loading"
+                assert slot.pins == 0
+                assert slot.expert in {None, 0}
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+        layer_lock = runtime._layer_locks[1]
+        assert layer_lock.acquire(blocking=False)
+        layer_lock.release()
+
+        monkeypatch.setattr(runtime._split_executor, "submit", original_submit)
+        with runtime.begin_split_route(1, [0, 1, 2], phase="decode") as retry:
+            ready = retry.finish_misses()
+            assert ready is not None
+            assert tuple(binding.expert for binding in ready.bindings) == (1, 2)
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+    finally:
+        monkeypatch.setattr(runtime._split_executor, "submit", original_submit)
         runtime.close(timeout=2)
 
 
