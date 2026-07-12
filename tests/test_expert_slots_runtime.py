@@ -3260,6 +3260,157 @@ def test_incremental_part_observes_sticky_completion_failure(
             pass
 
 
+def test_incremental_final_commit_is_atomic_with_completion_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    bank = runtime._banks[1]
+    policy_before = _layer_policy_state(runtime, 1)
+    counters_before = runtime.counters.as_dict()
+    incremental_before = (
+        runtime._incremental_miss_routes,
+        runtime._incremental_miss_parts,
+    )
+    pending = runtime.begin_split_route(1, [0], phase="decode")
+
+    fence_started = threading.Event()
+    fail_fence = threading.Event()
+    final_health_checked = threading.Event()
+    continue_after_fence = threading.Event()
+    fence_error = RuntimeError("injected final-commit completion fence failure")
+
+    def wait_then_fail() -> None:
+        fence_started.set()
+        assert fail_fence.wait(timeout=2)
+        raise fence_error
+
+    fence_future = runtime.slots._submit_completion_fence(
+        wait_then_fail,
+        lambda: None,
+        slot_count=1,
+    )
+    assert fence_future is not None
+    assert fence_started.wait(timeout=2)
+
+    original_health_check = runtime.slots.raise_if_unhealthy
+    health_checks = 0
+
+    def pause_after_final_health_check() -> None:
+        nonlocal health_checks
+        original_health_check()
+        health_checks += 1
+        if health_checks == 1:
+            final_health_checked.set()
+            assert continue_after_fence.wait(timeout=2)
+
+    monkeypatch.setattr(
+        runtime.slots,
+        "raise_if_unhealthy",
+        pause_after_final_health_check,
+    )
+    finish_executor = ThreadPoolExecutor(max_workers=1)
+    finish_call: Future[object] | None = None
+    finish_result: object | None = None
+    finish_error: BaseException | None = None
+    close_error: ExpertSlotError | None = None
+    try:
+        finish_call = finish_executor.submit(pending.finish_misses)
+        assert final_health_checked.wait(timeout=2)
+        fail_fence.set()
+        runtime.slots._drain_completion_fences()
+        with pytest.raises(RuntimeError, match="final-commit completion") as fence:
+            fence_future.result(timeout=2)
+        assert fence.value is fence_error
+        with runtime.slots._completion_error_lock:
+            assert runtime.slots._completion_error is fence_error
+
+        continue_after_fence.set()
+        try:
+            finish_result = finish_call.result(timeout=2)
+        except BaseException as exc:
+            finish_error = exc
+        pending.close()
+
+        policy_after = _layer_policy_state(runtime, 1)
+        counters_after = runtime.counters.as_dict()
+        incremental_after = (
+            runtime._incremental_miss_routes,
+            runtime._incremental_miss_parts,
+        )
+        pins_after_failure = 0
+        physical_states: list[str] = []
+        for slot in (*runtime.slots._persistent.values(), *runtime.slots._transient):
+            with slot.condition:
+                pins_after_failure += slot.pins
+                physical_states.append(slot.state.value)
+
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as retry:
+            runtime.ensure_route(1, [0], phase="decode")
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as admit:
+            runtime.begin_split_route(1, [0], phase="decode")
+        with pytest.raises(
+            ExpertSlotError, match="completion fence failed"
+        ) as snapshot:
+            runtime.snapshot(mx_module=object())
+        try:
+            runtime.close(timeout=2)
+        except ExpertSlotError as exc:
+            close_error = exc
+
+        sticky_errors = (retry.value, admit.value, snapshot.value, close_error)
+        assert close_error is not None
+        assert all(error.__cause__ is fence_error for error in sticky_errors)
+        evidence = (
+            f"finish_result={type(finish_result).__name__}, "
+            f"finish_error={finish_error!r}, "
+            f"policy_restored={policy_after == policy_before}, "
+            f"counter_delta={counters_after['route_calls'] - counters_before['route_calls']}, "
+            f"incremental_before={incremental_before}, "
+            f"incremental_after={incremental_after}, "
+            f"pins={pins_after_failure}, states={physical_states}, "
+            f"resident={bank.resident_experts}"
+        )
+        assert isinstance(finish_error, ExpertSlotError), evidence
+        assert finish_error.__cause__ is fence_error, evidence
+        assert finish_result is None, evidence
+        assert policy_after == policy_before, evidence
+        assert counters_after == counters_before, evidence
+        assert incremental_after == incremental_before, evidence
+        assert pins_after_failure == 0, evidence
+        assert all(state == "empty" for state in physical_states), evidence
+    finally:
+        fail_fence.set()
+        continue_after_fence.set()
+        if finish_call is not None:
+            try:
+                finish_call.result(timeout=2)
+            except BaseException:
+                pass
+        pending.close()
+        finish_executor.shutdown(wait=True, cancel_futures=True)
+        try:
+            runtime.close(timeout=2)
+        except ExpertSlotError:
+            pass
+
+
 def test_incremental_failure_keeps_lifecycle_until_deferred_rollback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
