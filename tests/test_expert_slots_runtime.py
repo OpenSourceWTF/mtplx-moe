@@ -33,7 +33,7 @@ from mtplx.expert_runtime import (
     partition_route_waves,
     reconcile_mlx_memory_cap,
 )
-from mtplx.expert_slots import ExpertSlotError, ExpertSlotPool
+from mtplx.expert_slots import ExpertSlotError, ExpertSlotPool, ReadyRoute
 from mtplx.expert_streaming import (
     LayerExpertSlotBank,
     RoutePlan,
@@ -312,6 +312,21 @@ def _global_policy_state(runtime: ExpertStreamingRuntime) -> dict[str, object]:
             (layer, frozenset(experts))
             for layer, experts in sorted(bank._prefill_seed_candidates.items())
         ),
+    }
+
+
+def _layer_policy_state(
+    runtime: ExpertStreamingRuntime, layer: int
+) -> dict[str, object]:
+    bank = runtime._banks[layer]
+    return {
+        "decode_epoch": bank._decode_epoch,
+        "slot_to_expert": tuple(bank._slot_to_expert),
+        "expert_to_slot": dict(bank._expert_to_slot),
+        "history": tuple(
+            (value.score, value.score_epoch, value.last_used) for value in bank._history
+        ),
+        "prefill_seed_candidates": frozenset(bank._prefill_seed_candidates),
     }
 
 
@@ -1812,6 +1827,71 @@ def test_runtime_close_timeout_does_not_wait_for_running_split_miss(
     assert runtime.reader._closed is True
 
 
+def test_runtime_finite_close_does_not_wait_for_preadmission_split_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    mapped = _CloseTrackingResource()
+    runtime._mapped_expert_store = mapped
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    original_ensure = runtime.slots.ensure_route
+
+    def block_before_admission(*args, **kwargs):
+        worker_started.set()
+        assert release_worker.wait(timeout=2)
+        return original_ensure(*args, **kwargs)
+
+    monkeypatch.setattr(runtime.slots, "ensure_route", block_before_admission)
+    pending = runtime.begin_split_route(1, [0], phase="decode")
+    assert worker_started.wait(timeout=2)
+    assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        started = time.monotonic()
+        closing = executor.submit(runtime.close, timeout=0.01)
+        try:
+            closing.result(timeout=0.2)
+            assert time.monotonic() - started < 0.2
+            assert runtime._closed is True
+            assert runtime._closing is False
+            assert runtime.slots._closed is True
+            assert runtime._split_executor._shutdown is True
+            assert mapped.closed is True
+            assert runtime._mapped_expert_store is None
+            assert runtime.reader._closed is True
+            assert all(
+                slot.state.value == "closed"
+                for slot in (
+                    *runtime.slots._persistent.values(),
+                    *runtime.slots._transient,
+                )
+            )
+        finally:
+            release_worker.set()
+            pending.close()
+            closing.result(timeout=2)
+
+    runtime.close(timeout=2)
+
+
 def test_runtime_handles_kv_admission_routes_waves_and_reset(tmp_path: Path) -> None:
     root, spec, manifest, expected = _artifact(tmp_path)
     manifest_path = root / "expert-manifest.json"
@@ -1996,6 +2076,191 @@ def test_runtime_generic_io_failure_does_not_restore_overwritten_victim(
         runtime.close()
 
 
+def test_layer_first_io_submit_rejection_restores_policy_exactly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+            cache_policy="lru",
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    first = runtime.ensure_route(1, [0], phase="decode")
+    first.release(synchronize=False)
+    slot = runtime.slots._physical(1, 0)
+    generation = slot.generation
+    policy_before = _layer_policy_state(runtime, 1)
+    read_bytes = runtime.reader.metrics.as_dict()["read_bytes"]
+
+    def reject_submit(*_args, **_kwargs):
+        raise ValueError("injected first expert I/O submit rejection")
+
+    monkeypatch.setattr(runtime.slots._executor, "submit", reject_submit)
+    try:
+        with pytest.raises(ValueError, match="first expert I/O submit rejection"):
+            runtime.ensure_route(1, [1], phase="decode")
+
+        assert _layer_policy_state(runtime, 1) == policy_before
+        with slot.condition:
+            assert slot.state.value == "ready"
+            assert slot.layer == 1
+            assert slot.expert == 0
+            assert slot.generation == generation
+            assert slot.pins == 0
+        assert runtime.reader.metrics.as_dict()["read_bytes"] == read_bytes
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+    finally:
+        runtime.close()
+
+
+def test_global_first_io_submit_rejection_restores_policy_exactly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, manifest, _expected = _global_artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _global_plan(spec, persistent_slots=1)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+            cache_policy="lru",
+            cache_scope="global",
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    first = runtime.ensure_route(1, [0], phase="decode")
+    first.release(synchronize=False)
+    slot = runtime.slots._physical(1, 0)
+    generation = slot.generation
+    policy_before = _global_policy_state(runtime)
+    read_bytes = runtime.reader.metrics.as_dict()["read_bytes"]
+
+    def reject_submit(*_args, **_kwargs):
+        raise ValueError("injected first global expert I/O submit rejection")
+
+    monkeypatch.setattr(runtime.slots._executor, "submit", reject_submit)
+    try:
+        with pytest.raises(
+            ValueError, match="first global expert I/O submit rejection"
+        ):
+            runtime.ensure_route(2, [1], phase="decode")
+
+        assert _global_policy_state(runtime) == policy_before
+        with slot.condition:
+            assert slot.state.value == "ready"
+            assert slot.layer == 1
+            assert slot.expert == 0
+            assert slot.generation == generation
+            assert slot.pins == 0
+        assert runtime.reader.metrics.as_dict()["read_bytes"] == read_bytes
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+    finally:
+        runtime.close()
+
+
+def test_partial_io_submit_rejection_cleans_every_prepared_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, base_spec, manifest, _expected = _artifact(tmp_path)
+    spec = replace(base_spec, top_k=2)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+            cache_policy="lru",
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    original_submit = runtime.slots._executor.submit
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_rejected = threading.Event()
+    submit_count = 0
+
+    def controlled_submit(fn, *args, **kwargs):
+        nonlocal submit_count
+        submit_count += 1
+        if submit_count == 1:
+
+            def gated_first():
+                first_started.set()
+                assert release_first.wait(timeout=2)
+                return fn(*args, **kwargs)
+
+            return original_submit(gated_first)
+        second_rejected.set()
+        raise ValueError("injected second expert I/O submit rejection")
+
+    monkeypatch.setattr(runtime.slots._executor, "submit", controlled_submit)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending = executor.submit(
+                runtime.ensure_route,
+                1,
+                [0, 1],
+                phase="decode",
+            )
+            assert first_started.wait(timeout=2)
+            assert second_rejected.wait(timeout=2)
+            try:
+                assert not pending.done(), "route returned before accepted I/O drained"
+            finally:
+                release_first.set()
+            with pytest.raises(ValueError, match="second expert I/O submit rejection"):
+                pending.result(timeout=2)
+
+        slots = (
+            runtime.slots._physical(1, 0),
+            runtime.slots._physical(1, plan.slots_per_layer),
+        )
+        for slot in slots:
+            with slot.condition:
+                assert slot.state.value == "empty"
+                assert slot.layer is None
+                assert slot.expert is None
+                assert slot.pins == 0
+        assert runtime._banks[1].resident_experts == ()
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+
+        monkeypatch.setattr(runtime.slots._executor, "submit", original_submit)
+        retry = runtime.ensure_route(1, [0, 1], phase="decode")
+        retry.release(synchronize=False)
+    finally:
+        release_first.set()
+        runtime.close(timeout=2)
+
+
 def test_memory_cap_reconciliation_and_fake_mlx_application() -> None:
     spec = _spec()
     plan = plan_expert_memory(
@@ -2128,6 +2393,71 @@ def test_begin_split_route_rolls_back_when_executor_rejects(
         ready.release(synchronize=False)
     finally:
         runtime.close()
+
+
+def test_begin_split_constructs_pending_before_accepting_miss_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+            cache_policy="lru",
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    first = runtime.ensure_route(1, [0], phase="decode")
+    first.release(synchronize=False)
+    slot = runtime.slots._physical(1, 0)
+    generation = slot.generation
+    policy_before = _layer_policy_state(runtime, 1)
+    read_bytes = runtime.reader.metrics.as_dict()["read_bytes"]
+    original_submit = runtime._split_executor.submit
+    submitted_ready: list[ReadyRoute] = []
+    submit_calls = 0
+
+    def complete_before_return(fn, *args, **kwargs):
+        nonlocal submit_calls
+        submit_calls += 1
+        future = original_submit(fn, *args, **kwargs)
+        submitted_ready.append(future.result(timeout=2))
+        return future
+
+    def reject_pending(*_args, **_kwargs):
+        raise RuntimeError("injected pending split construction failure")
+
+    monkeypatch.setattr(runtime._split_executor, "submit", complete_before_return)
+    monkeypatch.setattr("mtplx.expert_runtime.PendingSplitRoute", reject_pending)
+    try:
+        with pytest.raises(RuntimeError, match="pending split construction failure"):
+            runtime.begin_split_route(1, [1], phase="decode")
+
+        assert submit_calls == 0
+        assert submitted_ready == []
+        assert _layer_policy_state(runtime, 1) == policy_before
+        with slot.condition:
+            assert slot.state.value == "ready"
+            assert slot.layer == 1
+            assert slot.expert == 0
+            assert slot.generation == generation
+            assert slot.pins == 0
+        assert runtime.reader.metrics.as_dict()["read_bytes"] == read_bytes
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+    finally:
+        for ready in submitted_ready:
+            ready.release(synchronize=False)
+        runtime.close(timeout=2)
 
 
 def test_split_safe_fence_failure_rolls_back_policy_without_observation(

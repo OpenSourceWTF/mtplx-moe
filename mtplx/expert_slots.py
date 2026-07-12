@@ -30,6 +30,20 @@ class ExpertCompletionFenceError(ExpertSlotError):
         self.policy_rollback_safe = bool(policy_rollback_safe)
 
 
+@dataclass
+class RouteIOAdmission:
+    """Per-route record of executor work accepted past the rollback boundary."""
+
+    accepted_submissions: int = 0
+
+    @property
+    def any_accepted(self) -> bool:
+        return self.accepted_submissions > 0
+
+    def mark_accepted(self) -> None:
+        self.accepted_submissions += 1
+
+
 class ExpertSlotState(str, Enum):
     EMPTY = "empty"
     LOADING = "loading"
@@ -819,6 +833,7 @@ class ExpertSlotPool:
         *,
         cancel_event: threading.Event | None = None,
         deadline_ns: int | None = None,
+        io_admission: RouteIOAdmission | None = None,
     ) -> ReadyRoute:
         """Load all misses, validate mappings, and pin the route's slots."""
 
@@ -829,11 +844,19 @@ class ExpertSlotPool:
             raise ExpertSlotError(f"layer {layer} is not a routed model layer") from exc
         with layer_lock:
             self._raise_completion_error()
+            if io_admission is None:
+                return self._ensure_route_locked(
+                    layer,
+                    plan,
+                    cancel_event=cancel_event,
+                    deadline_ns=deadline_ns,
+                )
             return self._ensure_route_locked(
                 layer,
                 plan,
                 cancel_event=cancel_event,
                 deadline_ns=deadline_ns,
+                io_admission=io_admission,
             )
 
     def _ensure_route_locked(
@@ -843,6 +866,7 @@ class ExpertSlotPool:
         *,
         cancel_event: threading.Event | None,
         deadline_ns: int | None,
+        io_admission: RouteIOAdmission | None = None,
     ) -> ReadyRoute:
 
         if len(plan.experts) != len(plan.slots):
@@ -860,7 +884,8 @@ class ExpertSlotPool:
         prepared_states: list[_PreparedSlotState] = []
         futures: list[Future[None]] = []
         owned_loads: list[tuple[_PhysicalSlot, int, ExpertRecord]] = []
-        io_submitted = False
+        submitted_loads: set[tuple[int, int]] = set()
+        admission = io_admission if io_admission is not None else RouteIOAdmission()
         try:
             try:
                 for load in plan.loads:
@@ -895,8 +920,12 @@ class ExpertSlotPool:
                             cancel_event=combined_cancel,
                             deadline_ns=deadline_ns,
                         )
-                        io_submitted = True
+                        admission.mark_accepted()
                         futures.append(future)
+                        submitted_loads.update(
+                            (id(slot), generation)
+                            for slot, generation, _record in owned_loads
+                        )
                     else:
                         for slot, generation, record in owned_loads:
                             future = self._executor.submit(
@@ -907,11 +936,23 @@ class ExpertSlotPool:
                                 cancel_event=combined_cancel,
                                 deadline_ns=deadline_ns,
                             )
-                            io_submitted = True
+                            admission.mark_accepted()
                             futures.append(future)
+                            submitted_loads.add((id(slot), generation))
             except BaseException:
-                if not io_submitted:
-                    self._restore_prepared_slots(prepared_states)
+                self._restore_prepared_slots(
+                    previous
+                    for previous in prepared_states
+                    if (id(previous.slot), previous.owned_generation)
+                    not in submitted_loads
+                )
+                if futures:
+                    internal_cancel.set()
+                    for future in futures:
+                        try:
+                            future.result()
+                        except BaseException:
+                            pass
                 raise
             future_error: BaseException | None = None
             for future in futures:
@@ -970,7 +1011,7 @@ class ExpertSlotPool:
                             f"manifest has no expert record ({layer}, {expert})"
                         ) from exc
                     with slot.condition:
-                        if io_submitted:
+                        if admission.any_accepted:
                             self._raise_completion_error(policy_rollback_safe=False)
                         else:
                             self._raise_completion_error()
@@ -987,7 +1028,7 @@ class ExpertSlotPool:
                                 buffer=slot.buffer,
                             )
                         )
-                if io_submitted:
+                if admission.any_accepted:
                     self._raise_completion_error(policy_rollback_safe=False)
                 else:
                     self._raise_completion_error()

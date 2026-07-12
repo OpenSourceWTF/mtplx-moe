@@ -23,6 +23,7 @@ from .expert_slots import (
     ExpertSlotError,
     ExpertSlotPool,
     ReadyRoute,
+    RouteIOAdmission,
 )
 from .expert_streaming import (
     CacheCounters,
@@ -287,11 +288,13 @@ class PendingSplitRoute:
         hit_ready: ReadyRoute | None,
         miss_future: Future[ReadyRoute] | None,
         policy_txn: RoutePolicyTxn | None = None,
+        io_admission: RouteIOAdmission | None = None,
     ) -> None:
         self.runtime = runtime
         self.layer = layer
         self.plan = plan
         self._policy_txn = policy_txn or RoutePolicyTxn(rollback=lambda: None)
+        self._io_admission = io_admission
         self._policy_observed = False
         self.hit_ready = hit_ready
         self._miss_future = miss_future
@@ -328,6 +331,7 @@ class PendingSplitRoute:
                 self.plan,
                 self._policy_txn,
                 exc,
+                io_admission=self._io_admission,
             )
             raise
         finally:
@@ -340,6 +344,9 @@ class PendingSplitRoute:
         self._policy_txn.commit()
         self.runtime._observe_plan(self.layer, self.plan)
         self._policy_observed = True
+
+    def _attach_miss_future(self, miss_future: Future[ReadyRoute]) -> None:
+        self._miss_future = miss_future
 
     def close(self) -> None:
         if self._closed:
@@ -677,12 +684,14 @@ class ExpertStreamingRuntime:
                 phase=phase,
             )
             ready: ReadyRoute | None = None
+            io_admission = RouteIOAdmission()
             try:
                 ready = self.slots.ensure_route(
                     layer,
                     route_plan,
                     cancel_event=cancel_event,
                     deadline_ns=deadline_ns,
+                    io_admission=io_admission,
                 )
                 policy_txn.commit()
             except BaseException as exc:
@@ -693,6 +702,7 @@ class ExpertStreamingRuntime:
                     route_plan,
                     policy_txn,
                     exc,
+                    io_admission=io_admission,
                 )
                 raise
             self._observe_plan(layer, route_plan)
@@ -849,8 +859,12 @@ class ExpertStreamingRuntime:
         plan: RoutePlan,
         policy_txn: RoutePolicyTxn,
         error: BaseException,
+        *,
+        io_admission: RouteIOAdmission | None = None,
     ) -> None:
-        if isinstance(error, ExpertCompletionFenceError) and error.policy_rollback_safe:
+        if (
+            isinstance(error, ExpertCompletionFenceError) and error.policy_rollback_safe
+        ) or (io_admission is not None and not io_admission.any_accepted):
             policy_txn.rollback_completion()
             return
         self._rollback_route_loads(layer, plan)
@@ -881,6 +895,8 @@ class ExpertStreamingRuntime:
         policy_txn: RoutePolicyTxn | None = None
         hit_ready: ReadyRoute | None = None
         miss_future: Future[ReadyRoute] | None = None
+        pending: PendingSplitRoute | None = None
+        io_admission = RouteIOAdmission()
         try:
             self.slots.raise_if_unhealthy()
             plan, policy_txn = self._plan_route_transaction(
@@ -900,46 +916,51 @@ class ExpertStreamingRuntime:
                 if hit_plan is not None
                 else None
             )
-            miss_future = (
-                self._split_executor.submit(
-                    self.slots.ensure_route,
-                    layer,
-                    miss_plan,
-                    cancel_event=cancel_event,
-                    deadline_ns=deadline_ns,
-                )
-                if miss_plan is not None
-                else None
-            )
             pending = PendingSplitRoute(
                 runtime=self,
                 layer=layer,
                 plan=plan,
                 layer_lock=lock,
                 hit_ready=hit_ready,
-                miss_future=miss_future,
+                miss_future=None,
                 policy_txn=policy_txn,
+                io_admission=io_admission,
             )
-            if miss_future is None:
+            if miss_plan is not None:
+                miss_future = self._split_executor.submit(
+                    self.slots.ensure_route,
+                    layer,
+                    miss_plan,
+                    cancel_event=cancel_event,
+                    deadline_ns=deadline_ns,
+                    io_admission=io_admission,
+                )
+                pending._attach_miss_future(miss_future)
+            else:
                 pending._commit_policy()
             return pending
-        except BaseException:
+        except BaseException as setup_error:
             # Mirror the sync-path rollback: without it, a failed hit pin or
             # submit leaves the bank mapping experts to never-loaded slots,
             # wedging every later route on this layer until reset().
             if miss_future is not None:
                 miss_future.cancel()
                 try:
-                    miss_future.result()
+                    abandoned_ready = miss_future.result()
                 except BaseException:
                     pass
+                else:
+                    abandoned_ready.release(synchronize=False)
             if hit_ready is not None:
                 hit_ready.release(synchronize=False)
             if policy_txn is not None:
-                # No future was accepted when setup itself fails, so neither
-                # policy mappings nor victim generations may have crossed the
-                # destructive I/O boundary.
-                policy_txn.rollback_completion()
+                self._handle_route_failure(
+                    layer,
+                    plan,
+                    policy_txn,
+                    setup_error,
+                    io_admission=io_admission,
+                )
             lock.release()
             raise
 
@@ -1089,7 +1110,10 @@ class ExpertStreamingRuntime:
                 if not self.slots._closed:
                     raise
                 slots_error = exc
-            self._split_executor.shutdown(wait=True, cancel_futures=True)
+            self._split_executor.shutdown(
+                wait=deadline is None,
+                cancel_futures=True,
+            )
             if self._mapped_expert_store is not None:
                 self._mapped_expert_store.close()
                 self._mapped_expert_store = None
