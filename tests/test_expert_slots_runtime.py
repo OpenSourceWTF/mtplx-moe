@@ -28,6 +28,7 @@ from mtplx.expert_runtime import (
     ExpertStreamingConfig,
     ExpertStreamingConfigurationError,
     ExpertStreamingRuntime,
+    KVAdmission,
     PendingSplitRoute,
     apply_mlx_memory_cap,
     partition_route_waves,
@@ -4143,6 +4144,111 @@ def test_kv_admission_rejects_closing_and_closed_runtime_without_mutation(
         if close_call is not None:
             close_call.result(timeout=2)
         close_executor.shutdown(wait=True, cancel_futures=True)
+        runtime.close(timeout=2)
+
+
+def test_kv_admission_linearizes_before_concurrent_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=1,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    health_checked = threading.Event()
+    continue_admission = threading.Event()
+    close_finished = threading.Event()
+    original_health = runtime._raise_if_unhealthy
+    order_lock = threading.Lock()
+    completion_order: list[str] = []
+    lease_holder: list[KVAdmission] = []
+    admission_errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+    kv_at_close: list[tuple[int, int]] = []
+
+    def pause_after_health() -> None:
+        original_health()
+        health_checked.set()
+        assert continue_admission.wait(timeout=2)
+
+    def admit() -> None:
+        try:
+            lease_holder.append(runtime.admit_kv_tokens(1))
+        except BaseException as exc:
+            admission_errors.append(exc)
+        finally:
+            with order_lock:
+                completion_order.append("admission")
+
+    def close() -> None:
+        try:
+            runtime.close(timeout=2)
+        except BaseException as exc:
+            close_errors.append(exc)
+        finally:
+            kv_at_close.append((runtime._live_kv_tokens, runtime._live_kv_peak))
+            with order_lock:
+                completion_order.append("close")
+            close_finished.set()
+
+    monkeypatch.setattr(runtime, "_raise_if_unhealthy", pause_after_health)
+    executor = ThreadPoolExecutor(max_workers=2)
+    admission_call = executor.submit(admit)
+    close_call: Future[None] | None = None
+    try:
+        assert health_checked.wait(timeout=2)
+        admission_holds_lifecycle = runtime._close_lock.locked()
+        close_call = executor.submit(close)
+        if not admission_holds_lifecycle:
+            assert close_finished.wait(timeout=2)
+            assert runtime._closed is True
+
+        continue_admission.set()
+        admission_call.result(timeout=2)
+        close_call.result(timeout=2)
+        assert close_finished.is_set()
+        evidence = (
+            f"holds_lifecycle={admission_holds_lifecycle}, "
+            f"order={completion_order}, admission_errors={admission_errors!r}, "
+            f"close_errors={close_errors!r}, leases={len(lease_holder)}, "
+            f"kv_at_close={kv_at_close}, live={runtime._live_kv_tokens}, "
+            f"peak={runtime._live_kv_peak}, closed={runtime._closed}"
+        )
+        assert admission_holds_lifecycle is True, evidence
+        assert completion_order == ["admission", "close"], evidence
+        assert admission_errors == [], evidence
+        assert close_errors == [], evidence
+        assert len(lease_holder) == 1, evidence
+        assert kv_at_close == [(1, 1)], evidence
+        assert runtime._live_kv_tokens == 1, evidence
+        assert runtime._live_kv_peak == 1, evidence
+        assert runtime._closed is True, evidence
+
+        lease_holder[0].release()
+        assert runtime._live_kv_tokens == 0
+        assert runtime._live_kv_peak == 1
+    finally:
+        continue_admission.set()
+        admission_call.result(timeout=2)
+        if close_call is not None:
+            close_call.result(timeout=2)
+        for lease in lease_holder:
+            if not lease.released:
+                lease.release()
+        executor.shutdown(wait=True, cancel_futures=True)
         runtime.close(timeout=2)
 
 
