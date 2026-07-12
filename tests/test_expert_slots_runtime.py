@@ -2696,3 +2696,175 @@ def test_decode_split_route_yields_each_miss_in_completion_order(
 
     assert snapshot["incremental_misses"] == {"routes": 1, "parts": 2}
     assert runtime.slots.snapshot()["metrics"]["active_routes"] == 0
+
+
+def test_incremental_miss_failure_cancels_running_sibling_without_blocking_primary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, base_spec, manifest, _expected = _artifact(tmp_path)
+    spec = replace(base_spec, top_k=2)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    primary_error = RuntimeError("injected primary incremental miss failure")
+    primary: Future[ReadyRoute] = Future()
+    primary.set_exception(primary_error)
+    sibling: Future[ReadyRoute] = Future()
+    assert sibling.set_running_or_notify_cancel()
+    captured_cancels: list[object] = []
+    submitted = 0
+
+    def controlled_submit(_fn, *_args, **kwargs):
+        nonlocal submitted
+        captured_cancels.append(kwargs["cancel_event"])
+        submitted += 1
+        return primary if submitted == 1 else sibling
+
+    class ReleaseCounter:
+        def __init__(self) -> None:
+            self.releases = 0
+
+        def release(self, *, synchronize: bool = True) -> None:
+            assert synchronize is False
+            self.releases += 1
+
+    abandoned = ReleaseCounter()
+    caller_cancel = threading.Event()
+    monkeypatch.setattr(runtime._split_executor, "submit", controlled_submit)
+    pending = runtime.begin_split_route(
+        1,
+        [0, 1],
+        phase="decode",
+        cancel_event=caller_cancel,
+    )
+    observed: list[BaseException] = []
+    consume_started = threading.Event()
+
+    def consume_failure() -> None:
+        consume_started.set()
+        try:
+            next(pending.iter_ready_misses())
+        except BaseException as exc:
+            observed.append(exc)
+
+    worker = threading.Thread(target=consume_failure, daemon=True)
+    worker.start()
+    assert consume_started.wait(timeout=2)
+    worker.join(timeout=0.25)
+    try:
+        assert not worker.is_alive(), "primary failure waited for a running sibling"
+        assert observed == [primary_error]
+        assert len(captured_cancels) == 2
+        assert captured_cancels[0] is captured_cancels[1]
+        assert captured_cancels[0] is not caller_cancel
+        assert captured_cancels[0].is_set()
+    finally:
+        sibling.set_result(abandoned)  # type: ignore[arg-type]
+        worker.join(timeout=2)
+        pending.close()
+        runtime.close(timeout=2)
+    assert not worker.is_alive()
+    assert abandoned.releases == 1
+
+
+def test_incremental_submit_failure_releases_pinned_hit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, base_spec, manifest, _expected = _artifact(tmp_path)
+    spec = replace(base_spec, top_k=2)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+            cache_policy="lru",
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    warm = runtime.ensure_route(1, [0], phase="decode")
+    warm.release(synchronize=False)
+    policy_before = _layer_policy_state(runtime, 1)
+    counters_before = runtime.snapshot(mx_module=object())["incremental_misses"]
+
+    def reject_submit(*_args, **_kwargs):
+        raise RuntimeError("injected incremental route submit rejection")
+
+    monkeypatch.setattr(runtime._split_executor, "submit", reject_submit)
+    try:
+        with pytest.raises(RuntimeError, match="route submit rejection"):
+            runtime.begin_split_route(1, [0, 1], phase="decode")
+
+        assert _layer_policy_state(runtime, 1) == policy_before
+        assert runtime.snapshot(mx_module=object())["incremental_misses"] == counters_before
+        slot = runtime.slots._physical(1, 0)
+        with slot.condition:
+            assert slot.expert == 0
+            assert slot.pins == 0
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+        lock = runtime._layer_locks[1]
+        assert lock.acquire(blocking=False)
+        lock.release()
+    finally:
+        runtime.close(timeout=2)
+
+
+def test_incremental_part_observes_sticky_completion_failure(
+    tmp_path: Path,
+) -> None:
+    root, base_spec, manifest, _expected = _artifact(tmp_path)
+    spec = replace(base_spec, top_k=2)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    pending = runtime.begin_split_route(1, [0, 1], phase="decode")
+    parts = pending.iter_ready_misses()
+    first = next(parts)
+    assert first is not None
+    completion_error = RuntimeError("injected sticky completion failure between parts")
+    runtime.slots._record_completion_error(completion_error)
+    try:
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as failed:
+            next(parts)
+        assert failed.value.__cause__ is completion_error
+    finally:
+        pending.close()
+        try:
+            runtime.close(timeout=2)
+        except ExpertSlotError:
+            pass

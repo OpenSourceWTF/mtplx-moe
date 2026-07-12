@@ -272,6 +272,8 @@ class _OverlapPending:
         binding = SimpleNamespace(expert=0)
         self._miss_ready = SimpleNamespace(
             bindings=(binding,) * assignment_count,
+            plan=SimpleNamespace(experts=(0,)),
+            release=lambda **_kwargs: None,
         )
 
     def release_hits(self) -> None:
@@ -281,6 +283,11 @@ class _OverlapPending:
         self.events.append("finish-misses")
         self.misses_pending = False
         return self._miss_ready
+
+    def iter_ready_misses(self):
+        ready = self.finish_misses()
+        if ready is not None:
+            yield ready
 
     def close(self) -> None:
         self.events.append("close")
@@ -386,6 +393,91 @@ def test_128k_prefill_preserves_bounded_routed_then_shared_order(
         "close",
         "shared",
     ]
+
+
+class _OwnedMissPart:
+    def __init__(self) -> None:
+        self.plan = SimpleNamespace(experts=(0,))
+        self.bindings = (SimpleNamespace(expert=0),)
+        self.releases = 0
+
+    def release(self, *, synchronize: bool = True) -> None:
+        assert synchronize is False
+        self.releases += 1
+
+
+class _OwnedMissPending:
+    def __init__(self, part: _OwnedMissPart) -> None:
+        self.plan = SimpleNamespace(hits=(), misses=(0,))
+        self.hit_ready = None
+        self.misses_pending = False
+        self.part = part
+        self.owner_releases = 0
+        self.closed = False
+
+    def release_hits(self) -> None:
+        raise AssertionError("all-miss fixture has no hit route")
+
+    def iter_ready_misses(self):
+        yield self.part
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.owner_releases += 1
+        self.part.release(synchronize=False)
+
+
+class _OwnedMissRuntime(_OverlapRuntime):
+    def __init__(self, pending: _OwnedMissPending) -> None:
+        super().__init__([])
+        self.pending = pending
+
+    def begin_split_route(self, _layer, _experts, **_kwargs):
+        return self.pending
+
+
+def test_streamed_miss_parts_have_one_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    part = _OwnedMissPart()
+    pending = _OwnedMissPending(part)
+    switch = HotExpertSwitchGLU(_OwnedMissRuntime(pending), 1)
+    monkeypatch.setattr(
+        "mtplx.models.expert_mlx._run_q4_expert",
+        lambda selected, _binding, **_kwargs: selected,
+    )
+
+    output = switch(
+        mx.zeros((1, 1, 2), dtype=mx.bfloat16),
+        mx.zeros((1, 1, 1), dtype=mx.int32),
+    )
+    mx.eval(output)
+
+    assert pending.owner_releases == 1
+    assert part.releases == 1
+
+
+def test_streamed_miss_compute_failure_releases_current_part(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    part = _OwnedMissPart()
+    pending = _OwnedMissPending(part)
+    switch = HotExpertSwitchGLU(_OwnedMissRuntime(pending), 1)
+
+    def fail_compute(*_args, **_kwargs):
+        raise RuntimeError("injected streamed miss compute failure")
+
+    monkeypatch.setattr("mtplx.models.expert_mlx._run_q4_expert", fail_compute)
+    with pytest.raises(RuntimeError, match="streamed miss compute failure"):
+        switch(
+            mx.zeros((1, 1, 2), dtype=mx.bfloat16),
+            mx.zeros((1, 1, 1), dtype=mx.int32),
+        )
+
+    assert pending.owner_releases == 1
+    assert part.releases == 1
 
 
 def test_glm_router_fp32_projection_changes_a_near_tie_route() -> None:
