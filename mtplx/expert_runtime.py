@@ -426,9 +426,16 @@ class PendingSplitRoute:
                 self._miss_admissions[ordinal] = io_admission
 
     def _record_cleanup_error(self, error: BaseException) -> None:
+        promote = False
         with self._state_lock:
             if self._cleanup_error is None:
                 self._cleanup_error = error
+                promote = True
+        if promote:
+            # Never nest the runtime health lock under Pending state.
+            recorder = getattr(self.runtime, "_record_cleanup_error", None)
+            if callable(recorder):
+                recorder(error)
 
     def _release_lifecycle(self) -> None:
         with self._state_lock:
@@ -900,6 +907,8 @@ class ExpertStreamingRuntime:
         self._close_lock = threading.Lock()
         self._closing = False
         self._closed = False
+        self._cleanup_error_lock = threading.Lock()
+        self._cleanup_error: BaseException | None = None
         self._mapped_expert_store: Any | None = None
         self._route_trace_lock = threading.Lock()
         self._route_trace: list[dict[str, Any]] = []
@@ -1011,6 +1020,21 @@ class ExpertStreamingRuntime:
                 "manifest does not match pinned model descriptor: " + ", ".join(errors)
             )
 
+    def _record_cleanup_error(self, error: BaseException) -> None:
+        with self._cleanup_error_lock:
+            if self._cleanup_error is None:
+                self._cleanup_error = error
+
+    def _raise_cleanup_error(self) -> None:
+        with self._cleanup_error_lock:
+            error = self._cleanup_error
+        if error is not None:
+            raise ExpertSlotError("expert streaming runtime cleanup failed") from error
+
+    def _raise_if_unhealthy(self) -> None:
+        self.slots.raise_if_unhealthy()
+        self._raise_cleanup_error()
+
     def admit_kv_tokens(self, tokens: int) -> KVAdmission:
         count = _integer("tokens", tokens, minimum=1)
         with self._kv_lock:
@@ -1051,7 +1075,7 @@ class ExpertStreamingRuntime:
                 f"layer {layer} is not routed for {self.spec.key}"
             ) from exc
         with lock:
-            self.slots.raise_if_unhealthy()
+            self._raise_if_unhealthy()
             route_plan, policy_txn = self._plan_route_transaction(
                 layer,
                 expert_ids,
@@ -1114,7 +1138,7 @@ class ExpertStreamingRuntime:
                 f"layer {layer} is not routed for {self.spec.key}"
             ) from exc
         with lock:
-            self.slots.raise_if_unhealthy()
+            self._raise_if_unhealthy()
             planned = bank.try_plan_all_hits_transaction(expert_ids, phase=phase)
             if planned is None:
                 return None
@@ -1380,7 +1404,7 @@ class ExpertStreamingRuntime:
         miss_cancel_event = threading.Event()
         combined_cancel = _RouteCancel(cancel_event, miss_cancel_event)
         try:
-            self.slots.raise_if_unhealthy()
+            self._raise_if_unhealthy()
             plan, policy_txn = self._plan_route_transaction(
                 layer,
                 expert_ids,
@@ -1520,6 +1544,7 @@ class ExpertStreamingRuntime:
                 f"layer {layer} is not routed for {self.spec.key}"
             ) from exc
         with lock:
+            self._raise_if_unhealthy()
             if self._global_bank is not None:
                 return self._global_bank.prepare_prefill_seed(layer, expert_ids)
             return self._banks[layer].prepare_prefill_seed(expert_ids)
@@ -1529,6 +1554,7 @@ class ExpertStreamingRuntime:
         for lock in locks:
             lock.acquire()
         try:
+            self._raise_if_unhealthy()
             self.slots.reset()
             if self._global_bank is not None:
                 self._global_bank.reset()
@@ -1598,6 +1624,7 @@ class ExpertStreamingRuntime:
             }
         if self._mapped_expert_store is not None:
             snapshot["mapped_experts"] = self._mapped_expert_store.snapshot()
+        self._raise_if_unhealthy()
         return snapshot
 
     def close(self, *, timeout: float | None = None) -> None:
@@ -1615,7 +1642,14 @@ class ExpertStreamingRuntime:
                 None if deadline is None else max(0.0, deadline - time.monotonic())
             )
             if self._closed:
-                self.slots.close(timeout=remaining)
+                slots_error: BaseException | None = None
+                try:
+                    self.slots.close(timeout=remaining)
+                except BaseException as exc:
+                    slots_error = exc
+                if slots_error is not None:
+                    raise slots_error
+                self._raise_cleanup_error()
                 return
             self._closing = True
             slots_error: BaseException | None = None
@@ -1636,6 +1670,7 @@ class ExpertStreamingRuntime:
             self._closing = False
             if slots_error is not None:
                 raise slots_error
+            self._raise_cleanup_error()
         finally:
             self._close_lock.release()
 

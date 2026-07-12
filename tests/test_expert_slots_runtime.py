@@ -3889,6 +3889,7 @@ def test_deferred_split_cleanup_failure_becomes_sticky_runtime_health(
     ensure_error: ExpertSlotError | None = None
     admission_error: ExpertSlotError | None = None
     snapshot_error: ExpertSlotError | None = None
+    reset_error: ExpertSlotError | None = None
     close_error: ExpertSlotError | None = None
     try:
         with pytest.raises(RuntimeError, match="primary miss failure") as primary_seen:
@@ -3921,16 +3922,27 @@ def test_deferred_split_cleanup_failure_becomes_sticky_runtime_health(
         except ExpertSlotError as exc:
             snapshot_error = exc
         try:
+            runtime.reset()
+        except ExpertSlotError as exc:
+            reset_error = exc
+        try:
             runtime.close(timeout=2)
         except ExpertSlotError as exc:
             close_error = exc
 
-        errors = (ensure_error, admission_error, snapshot_error, close_error)
+        errors = (
+            ensure_error,
+            admission_error,
+            snapshot_error,
+            reset_error,
+            close_error,
+        )
         evidence = (
             f"kind={cleanup_kind}, "
             f"ensure_error={ensure_error!r}, "
             f"admission_error={admission_error!r}, "
             f"snapshot_succeeded={snapshot_result is not None}, "
+            f"reset_error={reset_error!r}, "
             f"close_error={close_error!r}, "
             f"runtime_closed={runtime._closed}, slots_closed={runtime.slots._closed}"
         )
