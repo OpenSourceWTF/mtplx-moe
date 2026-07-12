@@ -1999,7 +1999,9 @@ def test_runtime_snapshot_splits_cache_counters_by_phase(tmp_path: Path) -> None
             ].values()
         )
         with runtime.begin_split_route(1, [0], phase="decode") as pending:
-            pending.finish_misses()
+            ready = pending.finish_misses()
+            assert ready is not None
+            pending.release_misses(ready)
         split_snapshot = runtime.snapshot(mx_module=object())
         assert split_snapshot["cache_by_phase"]["decode"]["route_calls"] == 1
         assert split_snapshot["cache_by_phase"]["decode"]["expert_misses"] == 1
@@ -2594,6 +2596,7 @@ def test_split_success_commits_and_observes_exactly_once(tmp_path: Path) -> None
         assert (
             runtime._phase_counters[RoutingPhase.DECODE].as_dict()["route_calls"] == 1
         )
+        pending.release_misses(first)
         pending.close()
     finally:
         runtime.close()
@@ -2701,6 +2704,7 @@ def test_decode_split_route_yields_each_miss_in_completion_order(
             combined = pending.finish_misses()
             assert combined is not None
             assert tuple(binding.expert for binding in combined.bindings) == (0, 1)
+            pending.release_misses(combined)
     finally:
         release_slow.set()
         snapshot = runtime.snapshot(mx_module=object())
@@ -2970,6 +2974,7 @@ def test_incremental_second_submit_failure_drains_accepted_part_and_retries(
             ready = retry.finish_misses()
             assert ready is not None
             assert tuple(binding.expert for binding in ready.bindings) == (3, 4)
+            retry.release_misses(ready)
         assert runtime.slots.metrics.as_dict()["active_routes"] == 0
     finally:
         monkeypatch.setattr(runtime._split_executor, "submit", original_submit)
@@ -4510,7 +4515,7 @@ def test_finish_misses_aggregation_handoff_survives_concurrent_close(
         with pending._state_lock:
             leases_at_gate = set(pending._consumer_leases)
             aggregate_at_gate = getattr(pending, "_aggregate_lease", None)
-            parts_at_gate = tuple(pending._miss_ready_parts)
+            parts_at_gate = tuple(sorted(pending._miss_ready_parts))
         pending.close()
         releases_during_handoff = tuple(release_counts)
         layer_released_early = layer_lock.acquire(blocking=False)

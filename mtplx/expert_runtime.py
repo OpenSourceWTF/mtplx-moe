@@ -377,6 +377,8 @@ class PendingSplitRoute:
         self._consumer_leases: set[int] = set()
         self._releasing_consumer_leases: set[int] = set()
         self._miss_ready: _ReadyRouteGroup | None = None
+        self._aggregate_lease: _ReadyRouteGroup | None = None
+        self._aggregate_lease_ordinals: set[int] = set()
         self._miss_cancel_event = miss_cancel_event or threading.Event()
         self._lifecycle_release = lifecycle_release
         self._layer_lock = layer_lock
@@ -534,6 +536,7 @@ class PendingSplitRoute:
                 or self._claimed_miss_futures
                 or self._consumer_leases
                 or self._releasing_consumer_leases
+                or self._aggregate_lease is not None
                 or self._ready_cleanup_finalizing
                 or self._failure_finalizing
                 or self._failure_finalized
@@ -678,51 +681,65 @@ class PendingSplitRoute:
         self._validate_completed_misses()
         self._commit_policy(lease_ordinal=lease_ordinal)
 
-    def _prepare_ready_group(self) -> None:
-        if self._miss_ready is not None:
-            return
+    def _prepare_ready_group(self) -> _ReadyRouteGroup | None:
         miss_plan = self.runtime._subset_route_plan(self.plan, hits=False)
         if miss_plan is None:
-            return
+            return None
         with self._state_lock:
+            if self._miss_ready is not None:
+                return self._miss_ready
+            if self._failure is not None:
+                raise self._failure
+            if self._close_requested:
+                raise ExpertSlotError("split route closed before miss aggregation")
+            if self._completed_miss_ordinals != self._all_miss_ordinals:
+                raise ExpertSlotError(
+                    "incremental miss completion does not cover every route part"
+                )
+            expected_ordinals = set(self._all_miss_ordinals)
+            if set(self._miss_ready_parts) != expected_ordinals:
+                raise ExpertSlotError(
+                    "incremental miss parts do not cover the original route"
+                )
+            if self._consumer_leases != expected_ordinals:
+                raise ExpertSlotError(
+                    "incremental miss aggregation does not own every route part"
+                )
             parts = tuple(
-                self._miss_ready_parts[ordinal]
-                for ordinal in sorted(self._miss_ready_parts)
+                self._miss_ready_parts[ordinal] for ordinal in sorted(expected_ordinals)
             )
-        self._miss_ready = _ReadyRouteGroup(miss_plan, parts)
+            group = _ReadyRouteGroup(miss_plan, parts)
+            self._consumer_leases.clear()
+            self._aggregate_lease = group
+            self._aggregate_lease_ordinals = expected_ordinals
+            self._miss_ready = group
+            return group
 
     def finish_misses(self) -> _ReadyRouteGroup | None:
-        if self._miss_ready is not None:
-            return self._miss_ready
         with self._state_lock:
+            if self._miss_ready is not None:
+                return self._miss_ready
             empty = not self._miss_futures and not self._miss_ready_parts
         if empty:
             return None
-        internally_consumed: list[ReadyRoute] = []
         try:
-            for ready in self.iter_ready_misses():
-                internally_consumed.append(ready)
-        except BaseException:
-            for ready in internally_consumed:
+            for _ready in self.iter_ready_misses():
+                pass
+            return self._prepare_ready_group()
+        except BaseException as exc:
+            self.abort(exc)
+            with self._state_lock:
+                leased_readies = tuple(
+                    self._miss_ready_parts[ordinal]
+                    for ordinal in sorted(self._consumer_leases)
+                )
+            for ready in leased_readies:
                 try:
                     self.release_miss(ready)
                 except BaseException:
                     pass
             self._finish_failure_if_ready()
             raise
-        with self._state_lock:
-            failure = self._failure
-            close_requested = self._close_requested
-            self._consumer_leases.clear()
-        if failure is not None:
-            self._finish_failure_if_ready()
-            raise failure
-        if close_requested:
-            self._finish_success_close_if_ready()
-            self._finalize_if_ready()
-            raise ExpertSlotError("split route closed before miss aggregation")
-        self._prepare_ready_group()
-        return self._miss_ready
 
     def _commit_policy(self, *, lease_ordinal: int | None = None) -> None:
         committed = False
@@ -777,6 +794,33 @@ class PendingSplitRoute:
         if success_error is not None:
             raise success_error
 
+    def release_misses(self, ready: _ReadyRouteGroup) -> None:
+        """Return one aggregate consumer lease to Pending ownership."""
+
+        with self._state_lock:
+            if self._aggregate_lease is not ready:
+                raise ExpertSlotError("miss aggregate is not owned by this split route")
+            ordinals = tuple(sorted(self._aggregate_lease_ordinals))
+            routes = tuple(self._miss_ready_parts[ordinal] for ordinal in ordinals)
+            self._aggregate_lease = None
+            self._aggregate_lease_ordinals.clear()
+            self._miss_ready = None
+            self._releasing_consumer_leases.update(ordinals)
+            for ordinal in ordinals:
+                self._miss_ready_parts.pop(ordinal)
+        release_error = self._release_routes(routes)
+        if release_error is not None:
+            self._record_cleanup_error(release_error)
+        with self._state_lock:
+            self._releasing_consumer_leases.difference_update(ordinals)
+        success_error = self._finish_success_close_if_ready()
+        self._finish_failure_if_ready()
+        self._finalize_if_ready()
+        if release_error is not None:
+            raise release_error
+        if success_error is not None:
+            raise success_error
+
     def _finish_success_close_if_ready(self) -> BaseException | None:
         with self._state_lock:
             if (
@@ -785,6 +829,7 @@ class PendingSplitRoute:
                 or self._claimed_miss_futures
                 or self._consumer_leases
                 or self._releasing_consumer_leases
+                or self._aggregate_lease is not None
                 or self._ready_cleanup_finalizing
                 or self._ready_cleanup_complete
             ):
