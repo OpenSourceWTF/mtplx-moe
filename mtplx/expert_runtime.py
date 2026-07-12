@@ -494,6 +494,9 @@ class PendingSplitRoute:
             self._miss_futures.clear()
             self._miss_ordinals.clear()
             self._miss_ready = None
+            # Claim every future before failure becomes observable without the
+            # state lock. Completed paths and callbacks each consume one claim.
+            self._failure_callbacks = len(pending)
 
         for future in pending:
             future.cancel()
@@ -501,10 +504,8 @@ class PendingSplitRoute:
         running: list[Future[ReadyRoute]] = []
         for future in pending:
             (completed if future.done() else running).append(future)
-        with self._state_lock:
-            self._failure_callbacks = len(running)
         for future in completed:
-            self._store_completed_future(future, ordinals[future])
+            self._failure_callback(future, ordinals[future])
         for future in running:
             future.add_done_callback(
                 lambda done, ordinal=ordinals[future]: self._failure_callback(
