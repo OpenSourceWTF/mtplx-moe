@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1053,6 +1053,224 @@ def test_component_bank_hy3_executes_without_record_or_stack_copies(
         assert snapshot["slots"]["io"]["integrity_errors"] == 0
     finally:
         runtime.close()
+
+
+def test_global_component_bank_allocator_reuses_one_persistent_bank_and_accounts_exactly(
+    tmp_path: Path,
+) -> None:
+    root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + 3 * spec.expert_record_bytes,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        cache_scope="global",
+        slot_layout="component-banks",
+    )
+    plan = stream_config.memory_plan(spec)
+    allocator = make_mlx_component_bank_allocator(
+        plan,
+        spec,
+        load_expert_manifest(manifest_path),
+    )
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=allocator,
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+    try:
+        persistent_slots = tuple(runtime.slots._persistent.values())
+        persistent_banks = {physical.buffer.bank for physical in persistent_slots}
+        expected_slot_bytes = plan.persistent_cache_bytes + plan.transient_bytes
+        physical_bank_bytes = sum(
+            int(array.nbytes)
+            for bank in allocator.banks.values()
+            for array in bank.arrays.values()
+        )
+
+        assert plan.persistent_slots == 3
+        assert len(persistent_slots) == plan.persistent_slots
+        assert len(persistent_banks) == 1
+        assert allocator.banks[("global-persistent", -1)].capacity == 3
+        assert runtime.slots.allocated_bytes == expected_slot_bytes
+        assert physical_bank_bytes == expected_slot_bytes
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("difference", ["order", "dtype", "shape", "length"])
+def test_global_component_bank_allocator_rejects_non_exemplar_geometry(
+    tmp_path: Path,
+    difference: str,
+) -> None:
+    _root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
+    manifest = load_expert_manifest(manifest_path)
+    exemplar_index = next(
+        index
+        for index, record in enumerate(manifest.records)
+        if record.layer == spec.routed_layer_indices[1] and record.expert == 1
+    )
+    exemplar = manifest.records[exemplar_index]
+    segments = list(exemplar.segments)
+    if difference == "order":
+        segments[0], segments[1] = segments[1], segments[0]
+    else:
+        replacement = {
+            "dtype": {"dtype": "BF16"},
+            "shape": {"shape": (32, 16)},
+            "length": {"length": segments[0].length + 4},
+        }[difference]
+        segments[0] = replace(segments[0], **replacement)
+    records = list(manifest.records)
+    records[exemplar_index] = replace(exemplar, segments=tuple(segments))
+    heterogeneous = replace(manifest, records=tuple(records))
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    plan = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + 3 * spec.expert_record_bytes,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        cache_scope="global",
+        slot_layout="component-banks",
+    ).memory_plan(spec)
+
+    with pytest.raises(ValueError, match="routed-layer component geometry differs"):
+        make_mlx_component_bank_allocator(plan, spec, heterogeneous)
+
+
+def test_global_component_bank_allocator_rejects_uniform_wrong_descriptor_geometry(
+    tmp_path: Path,
+) -> None:
+    _root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
+    manifest = load_expert_manifest(manifest_path)
+    records = []
+    for record in manifest.records:
+        segments = list(record.segments)
+        segments[0] = replace(segments[0], shape=tuple(reversed(segments[0].shape)))
+        records.append(replace(record, segments=tuple(segments)))
+    uniformly_wrong = replace(manifest, records=tuple(records))
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    plan = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + 3 * spec.expert_record_bytes,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        cache_scope="global",
+        slot_layout="component-banks",
+    ).memory_plan(spec)
+
+    with pytest.raises(ValueError, match="model descriptor"):
+        make_mlx_component_bank_allocator(plan, spec, uniformly_wrong)
+
+
+def test_global_component_bank_allocator_requires_exact_routed_expert_keys(
+    tmp_path: Path,
+) -> None:
+    _root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
+    manifest = load_expert_manifest(manifest_path)
+    records = list(manifest.records)
+    record_index = next(
+        index
+        for index, record in enumerate(records)
+        if record.layer == spec.routed_layer_indices[-1]
+        and record.expert == spec.expert_count - 1
+    )
+    records[record_index] = replace(records[record_index], expert=spec.expert_count)
+    shifted = replace(manifest, records=tuple(records))
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    plan = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + 3 * spec.expert_record_bytes,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        cache_scope="global",
+        slot_layout="component-banks",
+    ).memory_plan(spec)
+
+    with pytest.raises(ValueError, match="routed expert keys differ"):
+        make_mlx_component_bank_allocator(plan, spec, shifted)
+
+
+@pytest.mark.parametrize(
+    "label_template",
+    [
+        "global-persistent-junk-0",
+        "global-persistent--1",
+        "global-transient-junk-0",
+        "global-transient--1",
+        "layer-{layer}-persistent-junk-0",
+        "layer-{layer}-persistent--0",
+    ],
+)
+def test_global_component_bank_allocator_rejects_malformed_label_alias(
+    tmp_path: Path,
+    label_template: str,
+) -> None:
+    _root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    plan = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=(fixed + spec.routed_layer_count * spec.expert_record_bytes),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        cache_scope="global",
+        slot_layout="component-banks",
+    ).memory_plan(spec)
+    allocator = make_mlx_component_bank_allocator(
+        plan,
+        spec,
+        load_expert_manifest(manifest_path),
+    )
+    label = label_template.format(layer=spec.routed_layer_indices[0])
+    try:
+        with pytest.raises(ValueError, match="unknown expert slot label"):
+            allocator(spec.expert_record_bytes, label)
+    finally:
+        allocator.close()
+
+
+@pytest.mark.parametrize(
+    ("cache_scope", "label_template"),
+    [
+        ("global", "layer-{layer}-persistent-0"),
+        ("layer", "global-persistent-0"),
+    ],
+)
+def test_global_component_bank_allocator_rejects_wrong_cache_scope_persistent_label(
+    tmp_path: Path,
+    cache_scope: str,
+    label_template: str,
+) -> None:
+    _root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    plan = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=(fixed + spec.routed_layer_count * spec.expert_record_bytes),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        cache_scope=cache_scope,
+        slot_layout="component-banks",
+    ).memory_plan(spec)
+    allocator = make_mlx_component_bank_allocator(
+        plan,
+        spec,
+        load_expert_manifest(manifest_path),
+    )
+    label = label_template.format(layer=spec.routed_layer_indices[0])
+    try:
+        assert allocator.banks == {}
+        assert allocator.slots == {}
+        with pytest.raises(ValueError, match="cache scope"):
+            allocator(spec.expert_record_bytes, label)
+        assert allocator.banks == {}
+        assert allocator.slots == {}
+    finally:
+        allocator.close()
 
 
 def test_component_bank_all_hit_decode_keeps_router_order_without_split_route_ops(

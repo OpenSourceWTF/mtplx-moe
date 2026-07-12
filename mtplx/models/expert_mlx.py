@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -30,6 +31,12 @@ _ROUTING_PHASE: ContextVar[RoutingPhase | None] = ContextVar(
     "mtplx_expert_routing_phase",
     default=None,
 )
+_SLOT_INDEX_PATTERN = r"(?:0|[1-9][0-9]*)"
+_LAYER_PERSISTENT_LABEL = re.compile(
+    rf"layer-({_SLOT_INDEX_PATTERN})-persistent-({_SLOT_INDEX_PATTERN})"
+)
+_GLOBAL_PERSISTENT_LABEL = re.compile(rf"global-persistent-({_SLOT_INDEX_PATTERN})")
+_GLOBAL_TRANSIENT_LABEL = re.compile(rf"global-transient-({_SLOT_INDEX_PATTERN})")
 
 
 @contextmanager
@@ -401,14 +408,106 @@ def make_mlx_component_bank_allocator(
     kernels. No persistent slice or stacked weight copy is materialized.
     """
 
+    record_by_key: dict[tuple[int, int], ExpertRecord] = {}
+    duplicate_keys: set[tuple[int, int]] = set()
     record_by_layer: dict[int, ExpertRecord] = {}
     for record in manifest.records:
+        key = (record.layer, record.expert)
+        if key in record_by_key:
+            duplicate_keys.add(key)
+        else:
+            record_by_key[key] = record
         record_by_layer.setdefault(record.layer, record)
     missing = set(spec.routed_layer_indices) - set(record_by_layer)
     if missing:
         raise ValueError(
             f"manifest has no exemplar records for layers {sorted(missing)}"
         )
+    if plan.cache_scope == "global":
+        expected_keys = {
+            (layer, expert)
+            for layer in spec.routed_layer_indices
+            for expert in range(spec.expert_count)
+        }
+        actual_keys = set(record_by_key)
+        missing_keys = sorted(expected_keys - actual_keys)
+        extra_keys = sorted(actual_keys - expected_keys)
+        if missing_keys or extra_keys or duplicate_keys:
+            raise ValueError(
+                "manifest routed expert keys differ from model descriptor: "
+                f"missing={missing_keys}, extra={extra_keys}, "
+                f"duplicates={sorted(duplicate_keys)}"
+            )
+
+    def component_signature(record: ExpertRecord) -> tuple[tuple[Any, ...], ...]:
+        return tuple(
+            (
+                segment.component,
+                segment.dtype,
+                tuple(segment.shape),
+                int(segment.length),
+            )
+            for segment in record.segments
+        )
+
+    expected_signature: list[tuple[str, str, tuple[int, ...], int]] = []
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        output_size = (
+            spec.expert_hidden_size
+            if projection in {"gate_proj", "up_proj"}
+            else spec.hidden_size
+        )
+        input_size = (
+            spec.hidden_size
+            if projection in {"gate_proj", "up_proj"}
+            else spec.expert_hidden_size
+        )
+        weight_shape = (output_size, input_size * spec.quant_bits // 32)
+        parameter_shape = (output_size, input_size // spec.quant_group_size)
+        expected_signature.extend(
+            (
+                (
+                    f"{projection}.weight",
+                    "U32",
+                    weight_shape,
+                    output_size * input_size * spec.quant_bits // 8,
+                ),
+                (
+                    f"{projection}.scales",
+                    "BF16",
+                    parameter_shape,
+                    output_size
+                    * (input_size // spec.quant_group_size)
+                    * spec.quant_parameter_bytes,
+                ),
+                (
+                    f"{projection}.biases",
+                    "BF16",
+                    parameter_shape,
+                    output_size
+                    * (input_size // spec.quant_group_size)
+                    * spec.quant_parameter_bytes,
+                ),
+            )
+        )
+
+    exemplar_layer = spec.routed_layer_indices[0]
+    exemplar_signature = component_signature(record_by_layer[exemplar_layer])
+    if exemplar_signature != tuple(expected_signature):
+        raise ValueError(
+            "manifest component geometry does not match the model descriptor"
+        )
+    routed_layers = set(spec.routed_layer_indices)
+    for record in manifest.records:
+        if (
+            record.layer in routed_layers
+            and component_signature(record) != exemplar_signature
+        ):
+            raise ValueError(
+                "routed-layer component geometry differs for "
+                f"expert ({record.layer}, {record.expert}) from canonical "
+                f"layer {exemplar_layer}"
+            )
 
     banks: dict[tuple[str, int], MlxComponentBank] = {}
     slots: dict[str, MlxComponentSlot] = {}
@@ -423,9 +522,13 @@ def make_mlx_component_bank_allocator(
             capacity = plan.slots_per_layer
             record = record_by_layer[layer]
             label = f"layer-{layer}-persistent-bank"
+        elif kind == "global-persistent":
+            capacity = plan.persistent_slots
+            record = record_by_layer[exemplar_layer]
+            label = "global-persistent-bank"
         else:
             capacity = plan.transient_slots
-            record = record_by_layer[spec.routed_layer_indices[0]]
+            record = record_by_layer[exemplar_layer]
             label = "global-transient-bank"
         bank = MlxComponentBank(capacity=capacity, record=record, label=label)
         banks[key] = bank
@@ -434,20 +537,41 @@ def make_mlx_component_bank_allocator(
     def allocate(size: int, label: str) -> MlxComponentSlot:
         if int(size) != spec.expert_record_bytes:
             raise ValueError("slot allocator size differs from model descriptor")
-        parts = label.split("-")
-        if label.startswith("layer-") and "-persistent-" in label:
-            layer = int(parts[1])
-            slot_index = int(parts[-1])
+        layer_persistent = _LAYER_PERSISTENT_LABEL.fullmatch(label)
+        global_persistent = _GLOBAL_PERSISTENT_LABEL.fullmatch(label)
+        global_transient = _GLOBAL_TRANSIENT_LABEL.fullmatch(label)
+        if layer_persistent is not None:
+            if plan.cache_scope != "layer":
+                raise ValueError(
+                    "layer-persistent slot label conflicts with global cache scope"
+                )
+            layer = int(layer_persistent.group(1))
+            slot_index = int(layer_persistent.group(2))
             if layer not in spec.routed_layer_indices:
                 raise ValueError(f"persistent slot layer {layer} is not routed")
             if not 0 <= slot_index < plan.slots_per_layer:
                 raise ValueError("persistent slot is outside planned capacity")
             bank = bank_for("persistent", layer)
-        elif label.startswith("global-transient-"):
-            slot_index = int(parts[-1])
+        elif label.startswith("layer-") and "-persistent-" in label:
+            raise ValueError(f"unknown expert slot label {label!r}")
+        elif global_persistent is not None:
+            if plan.cache_scope != "global":
+                raise ValueError(
+                    "global-persistent slot label conflicts with layer cache scope"
+                )
+            slot_index = int(global_persistent.group(1))
+            if not 0 <= slot_index < plan.persistent_slots:
+                raise ValueError("global persistent slot is outside planned capacity")
+            bank = bank_for("global-persistent", -1)
+        elif label.startswith("global-persistent-"):
+            raise ValueError(f"unknown expert slot label {label!r}")
+        elif global_transient is not None:
+            slot_index = int(global_transient.group(1))
             if not 0 <= slot_index < plan.transient_slots:
                 raise ValueError("transient slot is outside planned capacity")
             bank = bank_for("transient", -1)
+        elif label.startswith("global-transient-"):
+            raise ValueError(f"unknown expert slot label {label!r}")
         else:
             raise ValueError(f"unknown expert slot label {label!r}")
         if label in slots:

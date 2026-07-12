@@ -183,8 +183,10 @@ class ExpertStreamingConfig:
                 "metal-mmap executes mapped weights without per-record hashing; "
                 "it requires verify_sidecar_hash_at_open"
             )
-        if self.cache_scope == "global" and self.slot_layout != "direct-slots":
-            raise ValueError("global expert caching currently requires direct-slots")
+        if self.cache_scope == "global" and self.slot_layout == "metal-mmap":
+            raise ValueError(
+                "global expert caching requires direct-slots or component-banks"
+            )
         if self.prefill_admission:
             raise ValueError(
                 "prefill admission is not implemented; prefill must use transient slots"

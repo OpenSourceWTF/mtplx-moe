@@ -2571,6 +2571,22 @@ def test_config_rejects_unsafe_trust_combinations() -> None:
         ExpertStreamingConfig(**base, slot_layout="metal-mmap")
 
 
+def test_global_component_bank_config_is_admitted() -> None:
+    spec = _spec()
+
+    config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=1 << 30,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        cache_scope="global",
+        slot_layout="component-banks",
+    )
+
+    assert config.cache_scope == "global"
+    assert config.slot_layout == "component-banks"
+
+
 def test_begin_split_route_rolls_back_when_executor_rejects(
     tmp_path: Path,
 ) -> None:
