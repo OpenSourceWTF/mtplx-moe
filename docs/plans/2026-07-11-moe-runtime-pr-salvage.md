@@ -177,7 +177,7 @@ Run at least three alternating pairs against the pre-#15 tip plus one instrument
 
 **Does NOT cover:** TurboQuant memory savings or GLM Q8; both must fail closed rather than receive Hy3 Q8 credit.
 
-- [ ] **Step 1: Transplant source and add RED tests**
+- [x] **Step 1: Transplant source and add RED tests**
 
 ```bash
 git cherry-pick -x a8ef882
@@ -206,7 +206,7 @@ def test_q8_capacity_rounding_can_fail_the_fixed_footprint():
 
 Add tests that reject truthy `MTPLX_VLLM_METAL_PAGED_TURBOQUANT`, skipped/non-Q8 cache installs, wrong converted-layer counts, and a one-byte memory deficit before manifest or allocator access. Extend the benchmark CLI test so `--paged-kv-quantization q8` reaches both `ExpertStreamingConfig` and serialized results.
 
-- [ ] **Step 2: Prove RED and repair**
+- [x] **Step 2: Prove RED and repair**
 
 ```bash
 uv run pytest -q tests/test_expert_streaming_models.py tests/test_expert_cli_runtime.py tests/test_expert_slots_runtime.py tests/test_cache_state.py tests/test_generation_sustained.py tests/test_hy3_streamed_mtp.py tests/test_benchmark_streamed_generation_cli.py
@@ -214,9 +214,15 @@ uv run pytest -q tests/test_expert_streaming_models.py tests/test_expert_cli_run
 
 Compute `kv_capacity_tokens = 0 if logical == 0 else ceil((logical + 128) / 16) * 16`, charge physical capacity, and serialize the capacity, block size, and margin. Reject TurboQuant precedence. Fail before manifest/model allocation when `fits_fixed` is false. Add `attest_expert_streaming_kv_cache()` and require q8 mode, quantized caches, 80 entries, zero skips, and zero TurboQuant entries after cache construction; persist attestation in runner-visible diagnostics.
 
-- [ ] **Step 3: Verify, commit, and gate**
+- [x] **Step 3: Verify, commit, and gate**
 
 Run focused tests, full pytest, Ruff, and `git diff --check`. Compare a conservative 75-slot BF16-accounted base with repaired attested-Q8/100-slot candidate using the same cap and runner hooks. Require token parity, physical planned/realized byte equality, positive median+mean reduction in expert misses and physical expert bytes/token, and no material throughput/tail-latency/memory regression.
+
+**Result:** correctness and attestation passed at repaired tip `124f4ce`, but the
+100-slot candidate failed the measured gate: token-identical decode fell 78.97%,
+p95 latency rose 351.5%, and peak MLX rose 20.97 GB. Runner hooks showed lower
+SSD traffic but a serialized route/read/compute critical path. PR #12 was not
+promoted; the passed-only integration tip remains `fb4c1d5`.
 
 ### Task 3: Repair and gate PR #17 completion fences
 
