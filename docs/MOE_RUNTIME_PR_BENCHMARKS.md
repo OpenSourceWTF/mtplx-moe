@@ -2,25 +2,28 @@
 
 Date: 2026-07-12
 Remote base: `origin/codex/moe-ssd-hy3-glm52@4146f72`
-Current sequential tip: `992070df685020b33c46531f3b87ecbea19ce3bd`
+Default work-off branch: `experiment/moe-pr13-pr14-stack`
+Integration merge: `f25eb4df639ffb8dc39bb34f80285955a3d6ce3c`
+(first parent `main@43c8f96`, second parent tested candidate `cc659f93`)
+Tested candidate: `cc659f9`
 
 ## Result
 
-The original independent audit retained only PR #13. The approved sequential
-salvage is rebuilding and repairing each rejected candidate on the latest
-retained tip. Current count: **3 retained (#13, repaired #15, and repaired #17),
-1 repaired but rejected on measurement (#12), and 4 pending repair/re-gate**.
-This report will
-become the requested consolidated seven-PR report as each remaining gate
-completes; prior failure findings remain below so the repair delta stays
-auditable.
+The original independent audit retained only PR #13. The completed experimental
+integration retains PR #13 shared-MLP overlap, repaired PR #14 ready-miss
+streaming, repaired PR #15 all-hit decode, and repaired PR #17 completion-fence
+safety. The original PR #14 source attempt still appears below as a historical
+failed gate so its repair delta remains auditable. PRs #11, #12, #16, and #18
+remain rejected. Integration and default-branch work are complete for the
+experimental draft; the full-Xcode SwiftDataMacros release gate remains
+outstanding, so this result is not release-ready.
 
 | PR | Clean candidate | Correctness result | Performance result | Decision |
 | --- | --- | --- | --- | --- |
 | #11 | `3d7c158` | 50 focused passed; 1,980 passed / 4 skipped full suite; semantic hotset and request-lifecycle failures | Not run: correctness stopped the gate | Skip |
 | #12 | `a8ef882` -> repaired `124f4ce` | Exact 128K Q8 accounting and 80-cache attestation repaired; concurrency/env/close/server bypasses fail closed; 2,033 passed / 4 skipped; both reviews approved | Token-identical short lane: 4.7052 -> 0.9896 tok/s, **-78.97%**; reads -27.03% but peak MLX +20.97 GB. Runner hooks classify the candidate as serialized, not bandwidth-bound. | **Skip; do not promote the 100-slot plan** |
 | #13 | `939fe57` | 43 focused passed; 1,978 passed / 4 skipped full suite; independent reviews approved | 6.0523 -> 6.5033 decode tok/s mean, **+7.45%** over two matched pairs; token-identical | **Retain** |
-| #14 | `c424381` | 49 focused passed; 1,979 passed / 4 skipped full suite; miss failure can hang rollback and leak pins | Not run: correctness stopped the gate | Skip |
+| #14 | historical source attempt `c424381`; repaired implementation in `cc659f9` | Historical attempt: 49 focused passed; 1,979 passed / 4 skipped full suite, but miss failure could hang rollback and leak pins. The repaired ready-miss implementation is included in the tested final candidate. | Historical attempt: not run because correctness stopped its gate. Repaired implementation: validated as part of the final stack below; no standalone throughput attribution. | **Retain repaired #14 in integration merge `f25eb4d`**; historical source attempt remains rejected |
 | #15 | `a5be248` + repair `e0e93b0` | RED reproduced tuple/shared-work, route-wave, and pin-cleanup failures; GREEN 40 focused passed; 1,985 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.5446 -> 6.5549 tok/s, **+0.16%**; median +0.23%; 4/6 positive; token/counters identical | **Retain at `fb4c1d5`**; effect is small and order-sensitive |
 | #16 | `4106348` | Exact focused gate: 68 passed / 2 failed; additional device-fence and policy-accounting failures | Not run: correctness stopped the gate | Skip |
 | #17 | `43f5c953` + repairs `8a37f2a`, `72470de`, `992070d` | Sticky completion errors, transactional slot/policy rollback, retryable close, admission races, and split-route cleanup repaired; 108 focused passed; 2,018 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.3843 -> 6.1838 tok/s, **-3.14% safety cost**; median -3.27%; both order strata retain >=95%; exact token/counter parity | **Retain at `992070d` under the explicit <=5% lifecycle-safety budget** |
@@ -246,7 +249,9 @@ Raw artifacts:
 
 Each JSON had a companion generated response Markdown in its raw run output.
 Decision:
-**do not promote PR #12; keep the passed-only integration tip at `fb4c1d5`**.
+**do not promote PR #12**. At that historical sequential checkpoint, the
+passed-only integration tip stayed at `fb4c1d5`; PR #12 is absent from final
+tested candidate `cc659f9`.
 
 ## PR #17: completion fences
 
@@ -345,6 +350,34 @@ Decision: **retain repaired PR #17 at `992070d` under the explicit <=5%
 lifecycle-safety budget**. Its benefit is fail-closed slot reuse and lifecycle
 behavior; its measured cost is a 3.14% pooled decode slowdown.
 
+## Final integrated PR #13/#14 stack
+
+The final tested candidate `cc659f9` combines PR #13 shared-MLP overlap,
+repaired PR #14 ready-miss streaming, repaired PR #15 all-hit decode, and
+repaired PR #17 completion-fence safety. Integration merge
+`f25eb4df639ffb8dc39bb34f80285955a3d6ce3c` records that candidate as the
+second parent after `main@43c8f96`.
+
+Every value in this final-stack table is the raw fixed-lane
+`generation_stats.decode_tok_s` field. It is not end-to-end throughput,
+aggregate throughput, or user-observed throughput.
+
+| Comparison | Control raw decode tok/s | Candidate raw decode tok/s | Raw decode delta | Direction |
+| --- | ---: | ---: | ---: | --- |
+| Canary (`c12cfba` control vs `cc659f9`) | 6.26989944912 | 6.628692480060882 | **+5.7225%** | candidate positive |
+| Six order-balanced long pairs (`c12cfba` control vs `cc659f9`) | 6.2868045458 mean | 6.3647565480 mean | **+1.23993%** | 5/6 pairs positive |
+
+Token output, fixed-lane configuration, cache behavior, read bytes, and peak
+memory matched between control and candidate. A separate reverse-order
+diagnostic was manually interrupted before it produced any result artifact
+after observed SSD throughput of 337–474 MB/s; it is counted in neither
+direction and contributes no result to the table.
+
+The final stack is retained as an experimental draft on
+`experiment/moe-pr13-pr14-stack`. Integration/default-branch work is complete,
+but the full-Xcode SwiftDataMacros release gate remains outstanding; this is not
+a release-ready claim.
+
 ## Correctness-gated candidates
 
 ### PR #11: prompt-wide hotset
@@ -357,10 +390,14 @@ realistic chunk cardinality before wave partitioning.
 
 ### PR #14: ready-miss streaming
 
-Each miss part owns a separate cancellation signal. If one part fails while a
-sibling read is already running, `Future.cancel()` cannot stop the sibling and
-cleanup blocks before rollback. Mixed hit/miss submission failure also leaks a
-pinned hit, and streamed versus legacy completion APIs disagree on pin ownership.
+Historical source attempt `c424381` gave each miss part a separate cancellation
+signal. If one part failed while a sibling read was already running,
+`Future.cancel()` could not stop the sibling and cleanup blocked before
+rollback. Mixed hit/miss submission failure also leaked a pinned hit, and
+streamed versus legacy completion APIs disagreed on pin ownership. That source
+attempt failed its gate. The repaired ready-miss implementation is retained in
+tested candidate `cc659f9` and integration merge `f25eb4d`, with final-stack
+evidence reported above.
 
 ### PR #16: Metal-resident routing
 
@@ -426,16 +463,21 @@ device-memory ceiling.
 Raw artifact:
 `hy3-q4-gated-pr13-instrumented-cbank99-r1.json`.
 
-## Current branch verification
+## Historical sequential validation and final integration identity
 
 The retained PR #13 tip `939fe57` collected 1,982 tests and completed with
 1,978 passed / 4 expected skips. Repaired PR #15 completed with 1,985 passed / 4
-expected skips. At repaired PR #17 tip `992070d`, the full suite collected 2,022
+expected skips. At the repaired PR #17 checkpoint `992070d`, the full suite collected 2,022
 tests and completed with **2,018 passed / 4 expected skips**; 108 focused tests,
 Ruff check, Ruff format check, the stub scan, and `git diff --check` all pass.
 The contaminated PR #15 merge/fix commits remain absent from ancestry.
 
-## PR #19 dry merge
+The immutable final identities are tested candidate `cc659f93` and integration
+merge `f25eb4df639ffb8dc39bb34f80285955a3d6ce3c`, whose parents are
+`main@43c8f96` and that tested candidate. The default work-off branch is
+`experiment/moe-pr13-pr14-stack`.
+
+## Historical PR #19 dry merge
 
 The earlier dry merge combined runtime tip `939fe57` with
 `codex/hy3-q4-native-serialized@28af6c5` in the isolated
@@ -455,10 +497,9 @@ After temporary dry-merge-only cleanup:
 - Python compilation and `git diff --check` pass
 - full synthesized suite: **2,032 passed, 4 skipped** in 108.20 seconds
 
-Neither source branch was modified by this synthesis. The dry merge now also
-predates repaired PRs #15 and #17. When PR #19 is rebased, apply the
-duplicate-import/format cleanup there and refresh its throughput matrix against
-the final sequential runtime tip.
+Neither source branch was modified by this synthesis. This dry merge predates
+repaired PRs #15 and #17 and is retained only as historical evidence; it is not
+the final integrated-stack result above.
 
 The compact machine-readable decision companion is
 [`moe-runtime-gate-matrix.md`](../benchmarks/results/moe-runtime-gate-matrix.md).
