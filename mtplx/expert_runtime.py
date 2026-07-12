@@ -282,8 +282,14 @@ class _ReadyRouteGroup:
     """Several independently completed route parts in original route order."""
 
     def __init__(self, plan: RoutePlan, parts: tuple[ReadyRoute, ...]) -> None:
+        if not parts:
+            raise ExpertSlotError("incremental miss group must contain a route part")
+        pool = parts[0].pool
+        if any(part.pool is not pool for part in parts[1:]):
+            raise ExpertSlotError("incremental miss parts belong to different pools")
         self.plan = plan
         self.parts = parts
+        self.pool = pool
         bindings_by_slot: dict[tuple[int, int], list[Any]] = {}
         for part in parts:
             for binding in part.bindings:

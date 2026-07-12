@@ -1066,7 +1066,17 @@ class HotExpertSwitchGLU(nn.Module):
                 wave.experts,
                 phase=phase,
             )
+            component_bank_layout = self.runtime.config.slot_layout == "component-banks"
+            aggregate_misses = None
+            route_error: BaseException | None = None
             try:
+                # A component bank exposes every logical slot as a row of one
+                # shared MLX/Metal resource. External preadv writes are not MLX
+                # graph operations, so slot-level pins cannot order a QMM on
+                # one row against an outstanding write to a sibling row. Drain
+                # every miss before any component-bank kernel can be encoded.
+                if component_bank_layout:
+                    aggregate_misses = pending.finish_misses()
                 hit_set = set(pending.plan.hits)
                 hit_positions = tuple(
                     position
@@ -1100,7 +1110,12 @@ class HotExpertSwitchGLU(nn.Module):
                 ):
                     shared = shared_work()
                     mx.eval(shared)
-                for miss_ready in pending.iter_ready_misses():
+                miss_readies = (
+                    (() if aggregate_misses is None else (aggregate_misses,))
+                    if component_bank_layout
+                    else pending.iter_ready_misses()
+                )
+                for miss_ready in miss_readies:
                     part_error: BaseException | None = None
                     try:
                         ready_experts = set(miss_ready.plan.experts)
@@ -1121,16 +1136,36 @@ class HotExpertSwitchGLU(nn.Module):
                         part_error = exc
                         raise
                     finally:
-                        try:
-                            pending.release_miss(miss_ready)
-                        except BaseException:
-                            if part_error is None:
-                                raise
+                        if not component_bank_layout:
+                            try:
+                                pending.release_miss(miss_ready)
+                            except BaseException:
+                                if part_error is None:
+                                    raise
             except BaseException as exc:
+                route_error = exc
                 pending.abort(exc)
                 raise
             finally:
-                pending.close()
+                if not component_bank_layout:
+                    pending.close()
+                else:
+                    aggregate_release_error: BaseException | None = None
+                    if aggregate_misses is not None:
+                        try:
+                            pending.release_misses(aggregate_misses)
+                        except BaseException as exc:
+                            aggregate_release_error = exc
+                    close_error: BaseException | None = None
+                    try:
+                        pending.close()
+                    except BaseException as exc:
+                        close_error = exc
+                    if route_error is None:
+                        if aggregate_release_error is not None:
+                            raise aggregate_release_error
+                        if close_error is not None:
+                            raise close_error
 
         if not outputs:
             raise ValueError("router produced no expert assignments")

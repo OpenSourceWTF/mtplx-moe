@@ -361,6 +361,162 @@ def test_streamed_decode_evaluates_shared_work_before_waiting_for_misses(
     ]
 
 
+class _BankBarrierPending:
+    plan = SimpleNamespace(hits=(0,), misses=(1, 2))
+    misses_pending = True
+
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.finished = False
+        self.finish_calls = 0
+        self.aggregate_releases = 0
+        self.close_calls = 0
+        self.abort_errors: list[BaseException] = []
+        bank = object()
+
+        def binding(expert: int) -> SimpleNamespace:
+            return SimpleNamespace(
+                expert=expert,
+                buffer=SimpleNamespace(bank=bank),
+            )
+
+        self.hit_ready = SimpleNamespace(bindings=(binding(0),))
+        self.miss_parts = (
+            SimpleNamespace(
+                bindings=(binding(1),),
+                plan=SimpleNamespace(experts=(1,)),
+            ),
+            SimpleNamespace(
+                bindings=(binding(2),),
+                plan=SimpleNamespace(experts=(2,)),
+            ),
+        )
+        self.aggregate = SimpleNamespace(
+            bindings=tuple(part.bindings[0] for part in self.miss_parts),
+            plan=SimpleNamespace(experts=(1, 2)),
+        )
+
+    def finish_misses(self):
+        self.events.append("finish-misses")
+        self.finish_calls += 1
+        self.finished = True
+        self.misses_pending = False
+        return self.aggregate
+
+    def iter_ready_misses(self):
+        for part in self.miss_parts:
+            self.events.append(f"ready:{part.plan.experts}")
+            yield part
+
+    def release_hits(self) -> None:
+        self.events.append("release-hits")
+
+    def release_miss(self, part) -> None:
+        self.events.append(f"release-miss:{part.plan.experts}")
+
+    def release_misses(self, ready) -> None:
+        assert ready is self.aggregate
+        self.aggregate_releases += 1
+        self.events.append("release-misses")
+
+    def abort(self, error: BaseException) -> None:
+        self.abort_errors.append(error)
+        self.events.append("abort")
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.events.append("close")
+
+
+class _BankBarrierRuntime(_OverlapRuntime):
+    def __init__(self, events: list[str], pending: _BankBarrierPending) -> None:
+        super().__init__(events)
+        self.config.slot_layout = "component-banks"
+        self.pending = pending
+
+    def try_all_hit_route(self, *_args, **_kwargs):
+        return None
+
+    def begin_split_route(self, _layer, _experts, **_kwargs):
+        self.events.append("begin-misses")
+        return self.pending
+
+
+def _bank_barrier_inputs() -> tuple[mx.array, mx.array]:
+    return (
+        mx.zeros((3, 1, 2), dtype=mx.bfloat16),
+        mx.array([[[0]], [[1]], [[2]]], dtype=mx.int32),
+    )
+
+
+def test_component_bank_waits_for_all_miss_writes_before_any_q4(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    pending = _BankBarrierPending(events)
+
+    def guarded_q4(selected, bindings, *, group_size):
+        assert group_size == 64
+        assert pending.finished, "component-bank Q4 started before miss writes finished"
+        events.append(f"q4:{tuple(item.expert for item in bindings)}")
+        return selected
+
+    monkeypatch.setattr(expert_mlx, "_run_component_bank_q4", guarded_q4)
+    switch = HotExpertSwitchGLU(_BankBarrierRuntime(events, pending), 1)
+
+    output = switch(*_bank_barrier_inputs())
+    mx.eval(output)
+
+    assert events == [
+        "begin-misses",
+        "finish-misses",
+        "q4:(0,)",
+        "release-hits",
+        "q4:(1, 2)",
+        "release-misses",
+        "close",
+    ]
+
+
+def test_component_bank_q4_failure_releases_aggregate_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    pending = _BankBarrierPending(events)
+    q4_error = RuntimeError("injected post-barrier Q4 failure")
+
+    def fail_aggregate_q4(selected, bindings, *, group_size):
+        assert group_size == 64
+        assert pending.finished, "component-bank Q4 started before miss writes finished"
+        experts = tuple(item.expert for item in bindings)
+        events.append(f"q4:{experts}")
+        if experts == (1, 2):
+            raise q4_error
+        return selected
+
+    monkeypatch.setattr(expert_mlx, "_run_component_bank_q4", fail_aggregate_q4)
+    switch = HotExpertSwitchGLU(_BankBarrierRuntime(events, pending), 1)
+
+    with pytest.raises(RuntimeError, match="post-barrier Q4") as failed:
+        switch(*_bank_barrier_inputs())
+
+    assert failed.value is q4_error
+    assert pending.finish_calls == 1
+    assert pending.abort_errors == [q4_error]
+    assert pending.aggregate_releases == 1
+    assert pending.close_calls == 1
+    assert events == [
+        "begin-misses",
+        "finish-misses",
+        "q4:(0,)",
+        "release-hits",
+        "q4:(1, 2)",
+        "abort",
+        "release-misses",
+        "close",
+    ]
+
+
 def test_128k_prefill_preserves_bounded_routed_then_shared_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1050,6 +1206,7 @@ def test_component_bank_hy3_executes_without_record_or_stack_copies(
         snapshot = runtime.snapshot(mx_module=mx)
         assert snapshot["slots"]["buffer_backend"] == "mlx-metal-component-banks"
         assert snapshot["slots"]["pins"] == 0
+        assert snapshot["slots"]["metrics"]["completion_fences"] >= 1
         assert snapshot["slots"]["io"]["integrity_errors"] == 0
     finally:
         runtime.close()
