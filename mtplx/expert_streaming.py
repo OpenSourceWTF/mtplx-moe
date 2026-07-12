@@ -202,9 +202,7 @@ class LayerExpertSlotBank:
 
         expert = _integer("expert id", expert_id, minimum=0)
         if expert >= self.expert_count:
-            raise ValueError(
-                f"expert id {expert} is outside [0, {self.expert_count})"
-            )
+            raise ValueError(f"expert id {expert} is outside [0, {self.expert_count})")
         slot = self._expert_to_slot.pop(expert, None)
         if slot is not None:
             self._slot_to_expert[slot] = None
@@ -230,9 +228,7 @@ class LayerExpertSlotBank:
         counts = Counter(experts)
         ranked = sorted(counts, key=lambda expert: (-counts[expert], expert))
         chosen = tuple(
-            expert
-            for expert in ranked
-            if expert not in self._expert_to_slot
+            expert for expert in ranked if expert not in self._expert_to_slot
         )[:empty]
         self._prefill_seed_candidates = set(chosen)
         return chosen
@@ -354,7 +350,10 @@ class LayerExpertSlotBank:
 
         for expert in miss_order:
             persistent_slot: int | None = None
-            if phase is RoutingPhase.PREFILL and expert in self._prefill_seed_candidates:
+            if (
+                phase is RoutingPhase.PREFILL
+                and expert in self._prefill_seed_candidates
+            ):
                 persistent_slot = self._empty_persistent_slot()
                 self._prefill_seed_candidates.discard(expert)
             elif phase is RoutingPhase.DECODE and self.persistent_slots:
@@ -480,9 +479,7 @@ class GlobalExpertSlotBank:
         self.persistent_slots = _integer(
             "persistent_slots", persistent_slots, minimum=0
         )
-        self.transient_slots = _integer(
-            "transient_slots", transient_slots, minimum=1
-        )
+        self.transient_slots = _integer("transient_slots", transient_slots, minimum=1)
         self.prefill_slots_per_layer = _integer(
             "prefill_slots_per_layer", prefill_slots_per_layer, minimum=0
         )
@@ -505,9 +502,7 @@ class GlobalExpertSlotBank:
         self.slot_count = self.persistent_slots + self.transient_slots
 
         self._decode_epoch = 0
-        self._slot_to_key: list[tuple[int, int] | None] = [
-            None
-        ] * self.persistent_slots
+        self._slot_to_key: list[tuple[int, int] | None] = [None] * self.persistent_slots
         self._key_to_slot: dict[tuple[int, int], int] = {}
         self._directory: dict[tuple[int, int], _GlobalDirectoryEntry] = {}
         self._slot_generations: list[int] = [0] * self.persistent_slots
@@ -536,7 +531,9 @@ class GlobalExpertSlotBank:
 
     @property
     def occupancy_by_layer(self) -> dict[int, int]:
-        return {layer: int(self._layer_occupancy[layer]) for layer in self.layer_indices}
+        return {
+            layer: int(self._layer_occupancy[layer]) for layer in self.layer_indices
+        }
 
     def _key(self, layer: int, expert: int) -> tuple[int, int]:
         layer = _integer("layer index", layer, minimum=0)
@@ -544,9 +541,7 @@ class GlobalExpertSlotBank:
         if layer not in self._layer_set:
             raise ValueError(f"layer {layer} is not a routed model layer")
         if expert >= self.expert_count:
-            raise ValueError(
-                f"expert id {expert} is outside [0, {self.expert_count})"
-            )
+            raise ValueError(f"expert id {expert} is outside [0, {self.expert_count})")
         return layer, expert
 
     def _validate_experts(
@@ -670,9 +665,7 @@ class GlobalExpertSlotBank:
         counts = Counter(experts)
         ranked = sorted(counts, key=lambda expert: (-counts[expert], expert))
         chosen = tuple(
-            expert
-            for expert in ranked
-            if (layer, expert) not in self._key_to_slot
+            expert for expert in ranked if (layer, expert) not in self._key_to_slot
         )[:available]
         self._prefill_seed_candidates[layer] = set(chosen)
         return chosen
@@ -764,9 +757,7 @@ class GlobalExpertSlotBank:
                     self._lru.move_to_end(key)
         hit_set = {expert for key_layer, expert in hit_keys if key_layer == layer}
         miss_order = [expert for expert in unique_experts if expert not in hit_set]
-        resolved = {
-            expert: self._key_to_slot[(layer, expert)] for expert in hit_set
-        }
+        resolved = {expert: self._key_to_slot[(layer, expert)] for expert in hit_set}
         loads: list[SlotLoad] = []
         evictions: list[SlotEviction] = []
         pinned = set(hit_keys)

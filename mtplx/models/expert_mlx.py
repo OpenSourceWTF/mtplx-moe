@@ -706,38 +706,6 @@ class HotExpertSwitchGLU(nn.Module):
         if phase is RoutingPhase.PREFILL:
             self.runtime.prepare_prefill_seed(self.layer_index, expert_ids)
 
-        # A decode route whose complete expert set is already resident does
-        # not need transient-capacity waves or the hit/miss executor.  The
-        # component bank accepts one slot index per flattened assignment, so
-        # retaining the router's flattened order here also retains duplicate
-        # expert selections without a Python group/concatenate/sort roundtrip.
-        if (
-            phase is RoutingPhase.DECODE
-            and self.runtime.config.slot_layout == "component-banks"
-        ):
-            ready = self.runtime.try_all_hit_route(
-                self.layer_index,
-                expert_ids,
-                phase=phase,
-            )
-            if ready is not None:
-                try:
-                    assignment_inputs = mx.broadcast_to(
-                        tokens[:, None, :],
-                        (int(tokens.shape[0]), top_k, hidden_size),
-                    ).reshape((-1, hidden_size))
-                    result = _run_component_bank_q4(
-                        assignment_inputs,
-                        ready.bindings,
-                        group_size=self.group_size,
-                    )
-                    # Slot pins may be released only after the lazy graph has
-                    # consumed the currently bound bank generations.
-                    mx.eval(result)
-                finally:
-                    ready.release(synchronize=False)
-                return result.reshape((*indices.shape, hidden_size))
-
         outputs: list[mx.array] = []
         output_positions: list[int] = []
         shared: mx.array | None = None
@@ -813,6 +781,50 @@ class HotExpertSwitchGLU(nn.Module):
                 and self.runtime.manifest.sidecar is not None
             ),
         ):
+            # Keep the all-hit optimization inside the authoritative bounded
+            # route-wave loop.  A successful probe avoids split-route futures
+            # and per-expert grouping while retaining the normal policy epoch,
+            # counters, and assignment order for this wave.
+            if (
+                phase is RoutingPhase.DECODE
+                and self.runtime.config.slot_layout == "component-banks"
+            ):
+                ready = self.runtime.try_all_hit_route(
+                    self.layer_index,
+                    wave.experts,
+                    phase=phase,
+                )
+                if ready is not None:
+                    try:
+                        if wave.positions == tuple(range(len(expert_ids))):
+                            assignment_inputs = mx.broadcast_to(
+                                tokens[:, None, :],
+                                (int(tokens.shape[0]), top_k, hidden_size),
+                            ).reshape((-1, hidden_size))
+                        else:
+                            token_positions = mx.array(
+                                [position // top_k for position in wave.positions],
+                                dtype=mx.int32,
+                            )
+                            assignment_inputs = mx.take(
+                                tokens,
+                                token_positions,
+                                axis=0,
+                            )
+                        wave_output = _run_component_bank_q4(
+                            assignment_inputs,
+                            ready.bindings,
+                            group_size=self.group_size,
+                        )
+                        # Slot pins may be released only after the lazy graph
+                        # has consumed the currently bound bank generations.
+                        mx.eval(wave_output)
+                        outputs.append(wave_output)
+                        output_positions.extend(wave.positions)
+                    finally:
+                        ready.release(synchronize=False)
+                    continue
+
             # Both layouts pin hits and start miss reads first, then run the
             # resident experts on the GPU while the misses stream from SSD.
             evaluate_bindings = (
@@ -872,9 +884,12 @@ class HotExpertSwitchGLU(nn.Module):
 
         if not outputs:
             raise ValueError("router produced no expert assignments")
-        joined = mx.concatenate(outputs, axis=0)
-        order = mx.argsort(mx.array(output_positions, dtype=mx.int32))
-        joined = mx.take(joined, order, axis=0)
+        if len(outputs) == 1 and output_positions == list(range(len(expert_ids))):
+            joined = outputs[0]
+        else:
+            joined = mx.concatenate(outputs, axis=0)
+            order = mx.argsort(mx.array(output_positions, dtype=mx.int32))
+            joined = mx.take(joined, order, axis=0)
         output = joined.reshape((*indices.shape, hidden_size))
         if shared_work is not None and shared is None:
             # No physical wait remained to hide, or this was a bounded-memory

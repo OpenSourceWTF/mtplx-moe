@@ -231,6 +231,74 @@ def test_failed_all_hit_probe_leaves_normal_miss_planning_available() -> None:
     assert miss.misses == (1,)
 
 
+def test_all_hit_probe_matches_normal_wave_policy_and_next_lru_victims() -> None:
+    normal = LayerExpertSlotBank(
+        expert_count=8,
+        persistent_slots=4,
+        transient_slots=2,
+        cache_policy="lru",
+    )
+    fast = LayerExpertSlotBank(
+        expert_count=8,
+        persistent_slots=4,
+        transient_slots=2,
+        cache_policy="lru",
+    )
+    for expert in (0, 1, 2, 3):
+        normal.plan([expert], phase="decode")
+        fast.plan([expert], phase="decode")
+
+    for wave in ((2, 3), (0, 1)):
+        expected = normal.plan(wave, phase="decode")
+        actual = fast.try_plan_all_hits(wave, phase="decode")
+        assert actual == expected
+
+    assert (
+        fast.plan([4], phase="decode").evictions
+        == normal.plan([4], phase="decode").evictions
+    )
+    assert (
+        fast.plan([5], phase="decode").evictions
+        == normal.plan([5], phase="decode").evictions
+    )
+
+
+def test_failed_all_hit_probe_is_side_effect_free() -> None:
+    control = LayerExpertSlotBank(
+        expert_count=8,
+        persistent_slots=1,
+        transient_slots=1,
+    )
+    probe = LayerExpertSlotBank(
+        expert_count=8,
+        persistent_slots=1,
+        transient_slots=1,
+    )
+    control.plan([0], phase="decode")
+    probe.plan([0], phase="decode")
+    before = (
+        probe._decode_epoch,
+        probe.resident_experts,
+        tuple(
+            (history.score, history.score_epoch, history.last_used)
+            for history in probe._history
+        ),
+    )
+
+    assert probe.try_plan_all_hits([0, 1], phase="decode") is None
+
+    after = (
+        probe._decode_epoch,
+        probe.resident_experts,
+        tuple(
+            (history.score, history.score_epoch, history.last_used)
+            for history in probe._history
+        ),
+    )
+    assert after == before
+    assert probe.plan([1], phase="decode") == control.plan([1], phase="decode")
+
+
 def test_counters_preserve_router_assignment_multiplicity() -> None:
     bank = LayerExpertSlotBank(
         expert_count=8,

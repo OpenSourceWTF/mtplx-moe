@@ -770,18 +770,20 @@ def test_component_bank_hy3_executes_without_record_or_stack_copies(
         runtime.close()
 
 
-def test_component_bank_all_hit_decode_keeps_router_order_without_split_ops(
+def test_component_bank_all_hit_decode_keeps_router_order_without_split_route_ops(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
-    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    transient_slots = 4
+    fixed = spec.resident_bytes + transient_slots * spec.expert_record_bytes
     stream_config = ExpertStreamingConfig(
         model_key=spec.key,
         memory_limit_bytes=fixed + spec.persistent_cache_bytes(4),
         max_live_kv_tokens=0,
         runtime_reserve_bytes=0,
         slot_layout="component-banks",
+        transient_slots=transient_slots,
     )
     plan = stream_config.memory_plan(spec)
     assert plan.slots_per_layer == 4
@@ -819,7 +821,7 @@ def test_component_bank_all_hit_decode_keeps_router_order_without_split_ops(
     indices = mx.array([[2, 0], [2, 1]], dtype=mx.int32)
     try:
         # The cold call exercises the existing split/group/reorder path and
-        # fills three persistent slots across two transient-capacity waves.
+        # fills three persistent slots in one bounded route wave.
         reference = switch(tokens, indices)
         mx.eval(reference)
         assert reference[:, :, 0].tolist() == [[201.0, 1.0], [202.0, 102.0]]
@@ -827,7 +829,6 @@ def test_component_bank_all_hit_decode_keeps_router_order_without_split_ops(
         def unexpected(*_args, **_kwargs):
             raise AssertionError("all-hit decode used the split/group/reorder path")
 
-        monkeypatch.setattr(runtime, "route_waves", unexpected)
         monkeypatch.setattr(runtime, "begin_split_route", unexpected)
         monkeypatch.setattr(runtime._split_executor, "submit", unexpected)
         monkeypatch.setattr(expert_mlx.mx, "take", unexpected)
@@ -840,9 +841,168 @@ def test_component_bank_all_hit_decode_keeps_router_order_without_split_ops(
         assert mx.array_equal(actual, reference).item()
         assert actual[:, :, 0].tolist() == [[201.0, 1.0], [202.0, 102.0]]
         snapshot = runtime.snapshot(mx_module=mx)
-        assert snapshot["cache"]["route_calls"] == 3
+        assert snapshot["cache"]["route_calls"] == 2
         assert snapshot["cache"]["expert_hits"] == 4
         assert snapshot["slots"]["pins"] == 0
+    finally:
+        runtime.close()
+
+
+def test_component_bank_all_hit_decode_preserves_route_waves_counters_and_shared_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + spec.persistent_cache_bytes(3),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        transient_slots=2,
+        slot_layout="component-banks",
+        cache_policy="lru",
+    )
+    plan = stream_config.memory_plan(spec)
+    assert plan.slots_per_layer == 3
+    assert plan.transient_slots == 2
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=make_mlx_component_bank_allocator(
+            plan,
+            spec,
+            load_expert_manifest(manifest_path),
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+    events: list[str] = []
+
+    def assignment_marker(
+        selected: mx.array,
+        bindings: tuple[ExpertSlotBinding, ...],
+        *,
+        group_size: int,
+    ) -> mx.array:
+        assert group_size == spec.quant_group_size
+        experts = tuple(binding.expert for binding in bindings)
+        events.append(f"q4:{experts}")
+        expert_offsets = mx.array(
+            [expert * 100 for expert in experts],
+            dtype=selected.dtype,
+        ).reshape((-1, 1))
+        return selected + expert_offsets
+
+    monkeypatch.setattr(expert_mlx, "_run_component_bank_q4", assignment_marker)
+    switch = HotExpertSwitchGLU(runtime, 1)
+    tokens = mx.zeros((2, 1, spec.hidden_size), dtype=mx.float32)
+    tokens[:, 0, 0] = mx.array([1.0, 2.0])
+    indices = mx.array([[2, 0], [2, 1]], dtype=mx.int32)
+    try:
+        reference = switch(tokens, indices)
+        mx.eval(reference)
+        assert runtime._banks[1].resident_experts == (2, 0, 1)
+        before = runtime.snapshot(mx_module=mx)["cache"]
+        events.clear()
+        fast_waves: list[tuple[int, ...]] = []
+        original_try = runtime.try_all_hit_route
+
+        def record_fast_wave(layer, expert_ids, **kwargs):
+            experts = tuple(expert_ids)
+            fast_waves.append(experts)
+            return original_try(layer, experts, **kwargs)
+
+        def unexpected_split(*_args, **_kwargs):
+            raise AssertionError("all-hit wave used the split-route executor")
+
+        monkeypatch.setattr(runtime, "try_all_hit_route", record_fast_wave)
+        monkeypatch.setattr(runtime, "begin_split_route", unexpected_split)
+
+        def shared_work():
+            events.append("shared")
+            return mx.full(tokens.shape, 7, dtype=tokens.dtype)
+
+        actual, shared = switch.run_with_shared_overlap(
+            tokens,
+            indices,
+            shared_work,
+        )
+        mx.eval(actual, shared)
+
+        after = runtime.snapshot(mx_module=mx)
+        assert mx.array_equal(actual, reference).item()
+        assert mx.all(shared == 7).item()
+        assert fast_waves == [(2, 0, 2), (1,)]
+        assert events == ["q4:(2, 0, 2)", "q4:(1,)", "shared"]
+        assert after["cache"]["route_calls"] - before["route_calls"] == 2
+        assert after["cache"]["expert_requests"] - before["expert_requests"] == 4
+        assert after["cache"]["expert_hits"] - before["expert_hits"] == 4
+        assert after["slots"]["pins"] == 0
+    finally:
+        runtime.close()
+
+
+def test_component_bank_all_hit_decode_releases_pins_on_q4_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + spec.persistent_cache_bytes(3),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        transient_slots=2,
+        slot_layout="component-banks",
+        cache_policy="lru",
+    )
+    plan = stream_config.memory_plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=make_mlx_component_bank_allocator(
+            plan,
+            spec,
+            load_expert_manifest(manifest_path),
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+    switch = HotExpertSwitchGLU(runtime, 1)
+    tokens = mx.zeros((2, 1, spec.hidden_size), dtype=mx.float32)
+    indices = mx.array([[2, 0], [2, 1]], dtype=mx.int32)
+    try:
+        warm = switch(tokens, indices)
+        mx.eval(warm)
+        q4_calls = 0
+
+        def fail_second_wave(
+            selected: mx.array,
+            bindings: tuple[ExpertSlotBinding, ...],
+            *,
+            group_size: int,
+        ) -> mx.array:
+            nonlocal q4_calls
+            assert group_size == spec.quant_group_size
+            assert len(bindings) == int(selected.shape[0])
+            q4_calls += 1
+            if q4_calls == 2:
+                raise RuntimeError("injected Q4 failure")
+            return selected
+
+        monkeypatch.setattr(expert_mlx, "_run_component_bank_q4", fail_second_wave)
+
+        with pytest.raises(RuntimeError, match="injected Q4 failure"):
+            switch(tokens, indices)
+
+        assert q4_calls == 2
+        assert runtime.snapshot(mx_module=mx)["slots"]["pins"] == 0
     finally:
         runtime.close()
 
