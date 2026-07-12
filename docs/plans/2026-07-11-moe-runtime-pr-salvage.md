@@ -234,7 +234,7 @@ promoted; the passed-only integration tip remains `fb4c1d5`.
 
 **Does NOT cover:** cancellation of sibling read futures; Task 4 owns that behavior.
 
-- [ ] **Step 1: Transplant source and add RED tests**
+- [x] **Step 1: Transplant source and add RED tests**
 
 ```bash
 git cherry-pick -x d484a94
@@ -242,7 +242,7 @@ git cherry-pick -x d484a94
 
 Add controlled-event tests named `test_completion_fence_failure_stops_replacement_already_waiting_on_pin`, `test_completion_fence_failure_is_visible_to_snapshot_and_close`, and `test_runtime_close_timeout_is_retryable_after_route_release`. Assert failed fences never change expert/generation/read bytes, terminal cause remains observable by both snapshot and close, and a timed-out close succeeds after the held route is released.
 
-- [ ] **Step 2: Prove RED and repair**
+- [x] **Step 2: Prove RED and repair**
 
 ```bash
 uv run pytest -q tests/test_expert_slots_runtime.py -k 'completion_fence or close_timeout'
@@ -251,9 +251,23 @@ uv run pytest -q tests/test_streamed_models.py -k 'slot_fence or streamed_decode
 
 Make the completion error sticky and check it inside `_ensure_route_locked` immediately before reuse after any pin wait. Snapshot and close drain and re-raise without consuming it. Separate closing from finalized-closed state so timeout is retryable. Fence bindings in both hit and miss evaluators while retaining PR #13 shared-before-miss ordering.
 
-- [ ] **Step 3: Verify, commit, and gate**
+- [x] **Step 3: Verify, commit, and gate**
 
 Run full pytest/Ruff/diff checks. Gate with `MTPLX_EXPERT_SLOT_FENCES=1`; require token parity, `completion_fences > 0`, zero fence fallbacks/failures, intact overlap order, and no material throughput/tail/bytes/memory regression.
+
+**Result:** source transplant `43f5c953` plus repairs `8a37f2a`, `72470de`, and
+`992070d` passed 108 focused tests and the 2,018-passed / 4-skipped full suite,
+with both reviews approved. Six balanced hardware pairs against base `07d034a`
+measured a 3.1401% pooled mean decode cost and 3.2740% median cost; the
+base-first and candidate-first strata retained 95.3202% and 98.4341% of base.
+Rolling p95 increased 1.2829%, peak MLX increased 36,448 bytes, and token,
+stop, cache, I/O, and memory-plan parity were exact. Each candidate run
+exercised 176,423 fences over 717,256 slots with zero fallback/failure and a
+clean final runtime state. Runner hooks classified the workload as mixed: SSD
+mean/p95 was 4.988902/6.630601 GiB/s (40.0104% of the measured ceiling) and the
+routed-memory floor mean/p95 was 45.055829/54.971803 GB/s. Retain `992070d`
+under the explicit <=5% lifecycle-safety budget; this is a measured safety cost,
+not a speedup, and the base-first margin is narrow.
 
 ### Task 4: Repair and gate PR #14 ready-miss streaming
 

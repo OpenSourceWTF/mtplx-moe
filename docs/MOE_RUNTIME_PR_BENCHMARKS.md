@@ -1,15 +1,16 @@
 # MoE Runtime PR Benchmark Report
 
-Date: 2026-07-11
+Date: 2026-07-12
 Remote base: `origin/codex/moe-ssd-hy3-glm52@4146f72`
-Current sequential tip: `fb4c1d5f6bcdf7a96f7685d372e522d5f25f0846`
+Current sequential tip: `992070df685020b33c46531f3b87ecbea19ce3bd`
 
 ## Result
 
 The original independent audit retained only PR #13. The approved sequential
 salvage is rebuilding and repairing each rejected candidate on the latest
-retained tip. Current count: **2 retained (#13 and repaired #15), 1 repaired but
-rejected on measurement (#12), and 5 pending repair/re-gate**. This report will
+retained tip. Current count: **3 retained (#13, repaired #15, and repaired #17),
+1 repaired but rejected on measurement (#12), and 4 pending repair/re-gate**.
+This report will
 become the requested consolidated seven-PR report as each remaining gate
 completes; prior failure findings remain below so the repair delta stays
 auditable.
@@ -22,7 +23,7 @@ auditable.
 | #14 | `c424381` | 49 focused passed; 1,979 passed / 4 skipped full suite; miss failure can hang rollback and leak pins | Not run: correctness stopped the gate | Skip |
 | #15 | `a5be248` + repair `e0e93b0` | RED reproduced tuple/shared-work, route-wave, and pin-cleanup failures; GREEN 40 focused passed; 1,985 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.5446 -> 6.5549 tok/s, **+0.16%**; median +0.23%; 4/6 positive; token/counters identical | **Retain at `fb4c1d5`**; effect is small and order-sensitive |
 | #16 | `4106348` | Exact focused gate: 68 passed / 2 failed; additional device-fence and policy-accounting failures | Not run: correctness stopped the gate | Skip |
-| #17 | `faf1527` | 51 focused passed; 1,981 passed / 4 skipped full suite; asynchronous fence errors are not fail-closed | Not run: correctness stopped the gate | Skip |
+| #17 | `43f5c953` + repairs `8a37f2a`, `72470de`, `992070d` | Sticky completion errors, transactional slot/policy rollback, retryable close, admission races, and split-route cleanup repaired; 108 focused passed; 2,018 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.3843 -> 6.1838 tok/s, **-3.14% safety cost**; median -3.27%; both order strata retain >=95%; exact token/counter parity | **Retain at `992070d` under the explicit <=5% lifecycle-safety budget** |
 | #18 | `8743a93` | 36 focused passed; 1,985 passed / 4 skipped full suite; storage can close while partial Metal work remains pinned | Not run: correctness stopped the gate | Skip |
 
 "Not run" is a gate result, not an estimated zero. Hardware performance was
@@ -36,7 +37,10 @@ For this salvage series, the approved design in
 minimum. A throughput candidate is retainable when its repeated matched mean
 and median are positive, direction is not systematically reversed, deterministic
 token parity and the candidate contract pass, and resource counters do not
-materially regress.
+materially regress. Correctness/lifecycle candidates use a contract-specific
+safety gate. For repaired PR #17, the explicit budget required pooled mean,
+pooled median, and both arm-order strata to retain at least 95% of base, rolling
+p95 to remain within 110%, and peak MLX memory to remain within 1 GiB.
 
 The realistic Hy3 lane used:
 
@@ -234,6 +238,89 @@ Raw artifacts:
 The companion response Markdown is committed beside each JSON. Decision:
 **do not promote PR #12; keep the passed-only integration tip at `fb4c1d5`**.
 
+## PR #17: completion fences
+
+The reviewed completion-fence source was transplanted as `43f5c953`. Repairs
+`8a37f2a`, `72470de`, and `992070d` make asynchronous completion errors sticky,
+recheck them at every admission/reuse boundary, restore prepared slots and
+cache policy transactionally, keep split-route cleanup bounded, and make
+timed-out close operations retryable. The final repair also closes the last
+layer/global admission and partial-submit races without changing Task 4's
+separate sibling-read cancellation contract.
+
+Validation at exact candidate `992070df685020b33c46531f3b87ecbea19ce3bd`:
+
+- focused lifecycle/runtime suites: **108 passed**;
+- full suite: **2,018 passed, 4 skipped**;
+- Ruff check, Ruff format check, stub scan, and `git diff --check`: pass;
+- independent code-quality and final red-team reviews: approve.
+
+Because PR #17 is a lifecycle-safety change, its predeclared hardware gate
+allows at most a 5% decode-throughput cost in the pooled mean, pooled median,
+and each balanced arm-order stratum. It still requires exact deterministic
+workload parity, rolling p95 no more than 10% above base, peak MLX no more than
+1 GiB above base, exercised fences, and zero fence fallback or failure. Six
+process-isolated pairs compared base `07d034a` with candidate `992070d` under
+`MTPLX_EXPERT_SLOT_FENCES=1` in both arms:
+
+| Pair | Order | Base decode tok/s | Repaired #17 decode tok/s | Delta |
+| --- | --- | ---: | ---: | ---: |
+| 1 | base -> candidate | 6.4986995875 | 6.0922996217 | -6.2536% |
+| 2 | candidate -> base | 6.2916076748 | 6.2412220452 | -0.8008% |
+| 3 | base -> candidate | 6.4724413054 | 6.1998123159 | -4.2122% |
+| 4 | candidate -> base | 6.3911989654 | 6.2572961903 | -2.0951% |
+| 5 | base -> candidate | 6.3932264116 | 6.1660469818 | -3.5534% |
+| 6 | candidate -> base | 6.2583481241 | 6.1460302936 | -1.7947% |
+| Pooled mean | balanced | **6.3842536781** | **6.1837845748** | **-3.1401%** |
+| Pooled median | balanced | **6.3922126885** | **6.1829296489** | **-3.2740%** |
+
+The mean and median retain 96.8599% and 96.7260% of base, respectively. The
+base-first stratum retains **95.3202%** (-4.6798%) and the candidate-first
+stratum retains **98.4341%** (-1.5659%). All six individual pairs are negative,
+so this is a measured safety cost, not a speedup. The base-first result clears
+the 95% floor by only 0.3202 percentage points; that narrow margin is part of
+the decision and should not be generalized beyond this fixed lane.
+
+The pooled rolling p95 was 180.78896 ms/token base and 183.10833 ms/token
+candidate, a 1.2829% increase. Peak MLX memory was 89,145,807,988 bytes base
+and 89,145,844,436 bytes candidate, a 36,448-byte increase. Every arm produced
+1,905 tokens, natural `stop`, and token SHA-256
+`484e182a68604821f69d56d0b15488d26723e6123f6a57f8158f8b20a4c6ed1c`.
+Cache counters, 1,768,689,893,376 expert bytes, 165,678 reads, memory-plan
+fields, and final runtime state were identical. Every candidate arm exercised
+176,423 completion fences over 717,256 slots, with 378 pin waits, zero fence
+fallbacks/failures, and zero final pins, active routes, loading slots, or
+runtime errors.
+
+The separate runner-hook replay (excluded from headline timing) collected 653
+intervals and measured:
+
+- SSD: 4.988902 GiB/s mean, 4.885349 p50, 6.630601 p95, 9.304924 max;
+- 1,768,689,893,376 bytes read, or 928,933,767.53 bytes per decode token;
+- SSD utilization: 40.0104% of the measured 12.469 GiB/s ceiling;
+- routed-weight memory-traffic floor: 45.055829 GB/s mean and 54.971803 GB/s
+  p95, or 7.3381% of the 614 GB/s published ceiling;
+- 80.440126 evictions per decode token; classification: `mixed`;
+- authoritative run-summary peak MLX memory: 89,145,844,436 bytes.
+
+The memory-traffic value is an analytic lower bound, not a physical DRAM
+counter. Peak MLX above comes from the authoritative run summary rather than
+the instrumentation sampler's differently keyed peak field.
+
+Raw headline artifacts (JSON / generated response):
+
+- Pair 1 base: [`JSON`](../benchmarks/results/hy3-q4-gated-pr17-base-cbank99-r1.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr17-base-cbank99-r1-repeat-0.md); candidate: [`JSON`](../benchmarks/results/hy3-q4-gated-pr17-candidate-cbank99-r1.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr17-candidate-cbank99-r1-repeat-0.md)
+- Pair 2 base: [`JSON`](../benchmarks/results/hy3-q4-gated-pr17-base-cbank99-r2.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr17-base-cbank99-r2-repeat-0.md); candidate: [`JSON`](../benchmarks/results/hy3-q4-gated-pr17-candidate-cbank99-r2.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr17-candidate-cbank99-r2-repeat-0.md)
+- Pair 3 base: [`JSON`](../benchmarks/results/hy3-q4-gated-pr17-base-cbank99-r3.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr17-base-cbank99-r3-repeat-0.md); candidate: [`JSON`](../benchmarks/results/hy3-q4-gated-pr17-candidate-cbank99-r3.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr17-candidate-cbank99-r3-repeat-0.md)
+- Pair 4 base: [`JSON`](../benchmarks/results/hy3-q4-gated-pr17-base-cbank99-r4.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr17-base-cbank99-r4-repeat-0.md); candidate: [`JSON`](../benchmarks/results/hy3-q4-gated-pr17-candidate-cbank99-r4.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr17-candidate-cbank99-r4-repeat-0.md)
+- Pair 5 base: [`JSON`](../benchmarks/results/hy3-q4-gated-pr17-base-cbank99-r5.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr17-base-cbank99-r5-repeat-0.md); candidate: [`JSON`](../benchmarks/results/hy3-q4-gated-pr17-candidate-cbank99-r5.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr17-candidate-cbank99-r5-repeat-0.md)
+- Pair 6 base: [`JSON`](../benchmarks/results/hy3-q4-gated-pr17-base-cbank99-r6.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr17-base-cbank99-r6-repeat-0.md); candidate: [`JSON`](../benchmarks/results/hy3-q4-gated-pr17-candidate-cbank99-r6.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr17-candidate-cbank99-r6-repeat-0.md)
+- Runner-hook replay: [`JSON`](../benchmarks/results/hy3-q4-gated-pr17-instrumented-cbank99-r1.json) / [`response`](../benchmarks/results/hy3-q4-hy3-q4-gated-pr17-instrumented-cbank99-r1-repeat-0.md)
+
+Decision: **retain repaired PR #17 at `992070d` under the explicit <=5%
+lifecycle-safety budget**. Its benefit is fail-closed slot reuse and lifecycle
+behavior; its measured cost is a 3.14% pooled decode slowdown.
+
 ## Correctness-gated candidates
 
 ### PR #11: prompt-wide hotset
@@ -259,13 +346,6 @@ release the mapping lease before candidate Q4 work is fenced. The shortcut also
 bypasses `route_waves`: a four-expert/two-transient probe changed two host route
 calls into one and changed the next LRU evictions from `(2->4, 3->5)` to
 `(0->4, 1->5)`. Invalid router IDs also reach `mx.take` before host validation.
-
-### PR #17: completion fences
-
-A replacement can pass the asynchronous-error check, block on the old pin, and
-then proceed after that fence fails and releases the pin. Only a later route
-observes the failure. Terminal fence failures can also disappear through
-`snapshot()` or `close()` when no later route runs.
 
 ### PR #18: projection/read pipeline
 
@@ -325,9 +405,10 @@ Raw artifact:
 ## Current branch verification
 
 The retained PR #13 tip `939fe57` collected 1,982 tests and completed with
-1,978 passed / 4 expected skips. After repaired PR #15, the current sequential
-tip collected 1,989 tests and completed with **1,985 passed / 4 expected
-skips**; focused, Ruff check, Ruff format check, and `git diff --check` all pass.
+1,978 passed / 4 expected skips. Repaired PR #15 completed with 1,985 passed / 4
+expected skips. At repaired PR #17 tip `992070d`, the full suite collected 2,022
+tests and completed with **2,018 passed / 4 expected skips**; 108 focused tests,
+Ruff check, Ruff format check, the stub scan, and `git diff --check` all pass.
 The contaminated PR #15 merge/fix commits remain absent from ancestry.
 
 ## PR #19 dry merge
@@ -351,7 +432,7 @@ After temporary dry-merge-only cleanup:
 - full synthesized suite: **2,032 passed, 4 skipped** in 108.20 seconds
 
 Neither source branch was modified by this synthesis. The dry merge now also
-predates repaired PR #15. When PR #19 is rebased, apply the
+predates repaired PRs #15 and #17. When PR #19 is rebased, apply the
 duplicate-import/format cleanup there and refresh its throughput matrix against
 the final sequential runtime tip.
 
