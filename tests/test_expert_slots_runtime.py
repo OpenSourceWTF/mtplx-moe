@@ -3808,7 +3808,7 @@ def test_deferred_split_cleanup_failure_becomes_sticky_runtime_health(
         ExpertStreamingConfig(
             model_key=spec.key,
             memory_limit_bytes=plan.total_limit_bytes,
-            max_live_kv_tokens=0,
+            max_live_kv_tokens=1,
             runtime_reserve_bytes=0,
             verify_artifact_headers=False,
         ),
@@ -3817,6 +3817,7 @@ def test_deferred_split_cleanup_failure_becomes_sticky_runtime_health(
     )
     primary_error = RuntimeError(f"injected primary miss failure before {cleanup_kind}")
     cleanup_error = RuntimeError(f"injected deferred {cleanup_kind} cleanup failure")
+    existing_kv = runtime.admit_kv_tokens(1)
 
     class DeferredReady:
         def __init__(self, error: BaseException | None = None) -> None:
@@ -3890,6 +3891,7 @@ def test_deferred_split_cleanup_failure_becomes_sticky_runtime_health(
     admission_error: ExpertSlotError | None = None
     snapshot_error: ExpertSlotError | None = None
     reset_error: ExpertSlotError | None = None
+    kv_error: ExpertSlotError | None = None
     close_error: ExpertSlotError | None = None
     try:
         with pytest.raises(RuntimeError, match="primary miss failure") as primary_seen:
@@ -3904,6 +3906,17 @@ def test_deferred_split_cleanup_failure_becomes_sticky_runtime_health(
         assert lifecycle_releases == 1
         assert layer_lock.acquire(blocking=False)
         layer_lock.release()
+        existing_kv.release()
+        kv_before = (runtime._live_kv_tokens, runtime._live_kv_peak)
+
+        new_kv = None
+        try:
+            new_kv = runtime.admit_kv_tokens(1)
+        except ExpertSlotError as exc:
+            kv_error = exc
+        kv_after = (runtime._live_kv_tokens, runtime._live_kv_peak)
+        if new_kv is not None:
+            new_kv.release()
 
         try:
             ensured = runtime.ensure_route(1, [0], phase="decode")
@@ -3935,6 +3948,7 @@ def test_deferred_split_cleanup_failure_becomes_sticky_runtime_health(
             admission_error,
             snapshot_error,
             reset_error,
+            kv_error,
             close_error,
         )
         evidence = (
@@ -3943,12 +3957,14 @@ def test_deferred_split_cleanup_failure_becomes_sticky_runtime_health(
             f"admission_error={admission_error!r}, "
             f"snapshot_succeeded={snapshot_result is not None}, "
             f"reset_error={reset_error!r}, "
+            f"kv_error={kv_error!r}, kv_before={kv_before}, kv_after={kv_after}, "
             f"close_error={close_error!r}, "
             f"runtime_closed={runtime._closed}, slots_closed={runtime.slots._closed}"
         )
         assert all(isinstance(error, ExpertSlotError) for error in errors), evidence
         assert all(error.__cause__ is cleanup_error for error in errors), evidence
         assert snapshot_result is None, evidence
+        assert kv_after == kv_before, evidence
         assert runtime._closed is True, evidence
         assert runtime.slots._closed is True, evidence
         assert runtime.reader._closed is True, evidence
@@ -3960,3 +3976,75 @@ def test_deferred_split_cleanup_failure_becomes_sticky_runtime_health(
             runtime.close(timeout=2)
         except ExpertSlotError:
             pass
+
+
+@pytest.mark.parametrize("runtime_state", ["closing", "closed"])
+def test_kv_admission_rejects_closing_and_closed_runtime_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_state: str,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=1,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    original_close = runtime.slots.close
+    close_entered = threading.Event()
+    continue_close = threading.Event()
+
+    def gate_slot_close(*, timeout=None) -> None:
+        close_entered.set()
+        assert continue_close.wait(timeout=2)
+        original_close(timeout=timeout)
+
+    close_executor = ThreadPoolExecutor(max_workers=1)
+    close_call: Future[None] | None = None
+    admitted = None
+    admission_error: ExpertSlotError | None = None
+    try:
+        if runtime_state == "closing":
+            monkeypatch.setattr(runtime.slots, "close", gate_slot_close)
+            close_call = close_executor.submit(runtime.close, timeout=2)
+            assert close_entered.wait(timeout=2)
+            assert runtime._closing is True
+        else:
+            runtime.close(timeout=2)
+            assert runtime._closed is True
+
+        kv_before = (runtime._live_kv_tokens, runtime._live_kv_peak)
+        try:
+            admitted = runtime.admit_kv_tokens(1)
+        except ExpertSlotError as exc:
+            admission_error = exc
+        kv_after = (runtime._live_kv_tokens, runtime._live_kv_peak)
+        if admitted is not None:
+            admitted.release()
+
+        evidence = (
+            f"state={runtime_state}, error={admission_error!r}, "
+            f"kv_before={kv_before}, kv_after={kv_after}"
+        )
+        assert isinstance(admission_error, ExpertSlotError), evidence
+        assert str(admission_error) == (
+            f"expert streaming runtime is {runtime_state}"
+        ), evidence
+        assert kv_after == kv_before, evidence
+    finally:
+        continue_close.set()
+        if close_call is not None:
+            close_call.result(timeout=2)
+        close_executor.shutdown(wait=True, cancel_futures=True)
+        runtime.close(timeout=2)
