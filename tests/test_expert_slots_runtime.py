@@ -2858,11 +2858,17 @@ def test_incremental_second_submit_failure_drains_accepted_part_and_retries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    root, base_spec, manifest, _expected = _artifact(tmp_path, expert_count=3)
+    root, base_spec, manifest, _expected = _artifact(tmp_path, expert_count=5)
     spec = replace(base_spec, top_k=3)
     manifest_path = root / "expert-manifest.json"
     save_expert_manifest(manifest, manifest_path)
-    plan = _plan(spec)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    plan = plan_expert_memory(
+        spec,
+        total_limit_bytes=fixed + spec.persistent_cache_bytes(3),
+        context_tokens=0,
+        runtime_reserve_bytes=0,
+    )
     runtime = ExpertStreamingRuntime.open(
         root,
         manifest_path,
@@ -2877,43 +2883,50 @@ def test_incremental_second_submit_failure_drains_accepted_part_and_retries(
         spec=spec,
         apply_memory_cap=False,
     )
-    warm = runtime.ensure_route(1, [0], phase="decode")
+    warm = runtime.ensure_route(1, [0, 1, 2], phase="decode")
     warm.release(synchronize=False)
-    policy_before = _layer_policy_state(runtime, 1)
+    bank = runtime._banks[1]
+    assert tuple(bank._slot_to_expert) == (0, 1, 2)
     cache_before = runtime.counters.as_dict()
     incremental_before = runtime.snapshot(mx_module=object())["incremental_misses"]
     original_submit = runtime._split_executor.submit
+    original_ensure = runtime.slots.ensure_route_part
     submit_error = RuntimeError("injected second outer split submit rejection")
+    first_part_completed = threading.Event()
+    submitted_parts: list[tuple[int, int]] = []
+    successful_parts: list[ReadyRoute] = []
     submit_count = 0
 
-    class SuccessfulPart:
-        def __init__(self) -> None:
-            self.releases = 0
+    def observe_real_part(layer, part, **kwargs):
+        ready = original_ensure(layer, part, **kwargs)
+        successful_parts.append(ready)
+        first_part_completed.set()
+        return ready
 
-        def release(self, *, synchronize: bool = True) -> None:
-            assert synchronize is False
-            self.releases += 1
-
-    successful_part = SuccessfulPart()
-    accepted: Future[ReadyRoute] = Future()
-    accepted.set_result(successful_part)  # type: ignore[arg-type]
-
-    def reject_second_submit(*_args, **_kwargs):
+    def reject_second_submit(fn, layer, part, **kwargs):
         nonlocal submit_count
         submit_count += 1
+        submitted_parts.append((part.loads[0].expert, part.loads[0].slot))
         if submit_count == 1:
-            return accepted
+            future = original_submit(fn, layer, part, **kwargs)
+            assert first_part_completed.wait(timeout=2)
+            assert future.result(timeout=2) is successful_parts[0]
+            return future
         raise submit_error
 
+    monkeypatch.setattr(runtime.slots, "ensure_route_part", observe_real_part)
     monkeypatch.setattr(runtime._split_executor, "submit", reject_second_submit)
     try:
         with pytest.raises(RuntimeError, match="second outer split") as failed:
-            runtime.begin_split_route(1, [0, 1, 2], phase="decode")
+            runtime.begin_split_route(1, [0, 3, 4], phase="decode")
 
         assert failed.value is submit_error
         assert submit_count == 2
-        assert successful_part.releases == 1
-        assert _layer_policy_state(runtime, 1) == policy_before
+        assert submitted_parts == [(3, 1), (4, 2)]
+        assert len(successful_parts) == 1
+        assert successful_parts[0]._released is True
+        assert tuple(bank._slot_to_expert) == (0, None, 2)
+        assert bank._expert_to_slot == {0: 0, 2: 2}
         assert runtime.counters.as_dict() == cache_before
         assert runtime.snapshot(mx_module=object())["incremental_misses"] == (
             incremental_before
@@ -2923,20 +2936,29 @@ def test_incremental_second_submit_failure_drains_accepted_part_and_retries(
             with slot.condition:
                 assert slot.state.value != "loading"
                 assert slot.pins == 0
-                assert slot.expert in {None, 0}
+        restored = runtime.slots._physical(1, 2)
+        with restored.condition:
+            assert restored.state.value == "ready"
+            assert restored.expert == 2
         assert runtime.slots.metrics.as_dict()["active_routes"] == 0
         layer_lock = runtime._layer_locks[1]
         assert layer_lock.acquire(blocking=False)
         layer_lock.release()
 
         monkeypatch.setattr(runtime._split_executor, "submit", original_submit)
-        with runtime.begin_split_route(1, [0, 1, 2], phase="decode") as retry:
+        monkeypatch.setattr(runtime.slots, "ensure_route_part", original_ensure)
+        restored_hit = runtime.ensure_route(1, [2], phase="decode")
+        assert restored_hit.plan.hits == (2,)
+        assert restored_hit.plan.loads == ()
+        restored_hit.release(synchronize=False)
+        with runtime.begin_split_route(1, [0, 3, 4], phase="decode") as retry:
             ready = retry.finish_misses()
             assert ready is not None
-            assert tuple(binding.expert for binding in ready.bindings) == (1, 2)
+            assert tuple(binding.expert for binding in ready.bindings) == (3, 4)
         assert runtime.slots.metrics.as_dict()["active_routes"] == 0
     finally:
         monkeypatch.setattr(runtime._split_executor, "submit", original_submit)
+        monkeypatch.setattr(runtime.slots, "ensure_route_part", original_ensure)
         runtime.close(timeout=2)
 
 
