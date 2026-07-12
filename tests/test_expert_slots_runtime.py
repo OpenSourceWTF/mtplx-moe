@@ -1236,6 +1236,96 @@ def test_global_runtime_success_publishes_ready_generation(tmp_path: Path) -> No
         runtime.close()
 
 
+def test_global_runtime_reset_preserves_physical_generation_watermark(
+    tmp_path: Path,
+) -> None:
+    root, spec, manifest, _expected = _global_artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _global_plan(spec, persistent_slots=1)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+            cache_policy="lru",
+            cache_scope="global",
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    bank = runtime._global_bank
+    assert bank is not None
+    try:
+        first = runtime.ensure_route(1, [0], phase="decode")
+        first.release(synchronize=False)
+        evicted = runtime.ensure_route(1, [1], phase="decode")
+        evicted.release(synchronize=False)
+        physical = runtime.slots._physical(1, 0)
+        with physical.condition:
+            generation_before_reset = physical.generation
+            assert physical.state.value == "ready"
+            assert physical.expert == 1
+        assert generation_before_reset == 2
+        assert bank._slot_generations == [generation_before_reset]
+        assert bank.occupancy == 1
+        assert runtime.counters.as_dict()["route_calls"] == 2
+
+        runtime.reset()
+        with physical.condition:
+            physical_generation_after_reset = physical.generation
+            assert physical.state.value == "empty"
+            assert physical.layer is None
+            assert physical.expert is None
+            assert physical.pins == 0
+        assert physical_generation_after_reset == generation_before_reset
+        policy_generation_after_reset = bank._slot_generations[0]
+        assert bank.occupancy == 0
+        assert bank._slot_to_key == [None]
+        assert bank._key_to_slot == {}
+        assert bank._directory == {}
+        assert tuple(bank._free_slots) == (0,)
+        assert bank._free_slot_set == {0}
+        assert tuple(bank._lru.items()) == ()
+        assert bank._history == {}
+        assert dict(bank._layer_occupancy) == {}
+        assert bank._evictions == 0
+        assert bank._cross_layer_evictions == 0
+        assert runtime.counters.as_dict()["route_calls"] == 0
+        assert runtime.snapshot(mx_module=object())["incremental_misses"] == {
+            "routes": 0,
+            "parts": 0,
+        }
+
+        try:
+            reloaded = runtime.ensure_route(1, [0], phase="decode")
+        except ExpertSlotError as exc:
+            pytest.fail(
+                "global reset rewound policy below physical generation: "
+                f"policy={policy_generation_after_reset}, "
+                f"physical={physical_generation_after_reset}; reload failed: {exc}"
+            )
+        assert policy_generation_after_reset == physical_generation_after_reset
+        assert reloaded.generations == (generation_before_reset + 1,)
+        reloaded.release(synchronize=False)
+
+        runtime.reset()
+        with physical.condition:
+            second_reset_generation = physical.generation
+            assert physical.state.value == "empty"
+        assert second_reset_generation == generation_before_reset + 1
+        assert bank._slot_generations == [second_reset_generation]
+        second_reload = runtime.ensure_route(1, [1], phase="decode")
+        assert second_reload.generations == (second_reset_generation + 1,)
+        second_reload.release(synchronize=False)
+    finally:
+        runtime.close(timeout=2)
+
+
 def test_global_safe_fence_failure_restores_cross_layer_policy_exactly(
     tmp_path: Path,
 ) -> None:
