@@ -1014,7 +1014,8 @@ class GlobalExpertSlotBank:
         self._slot_to_key = [None] * self.persistent_slots
         self._key_to_slot.clear()
         self._directory.clear()
-        self._slot_generations = [0] * self.persistent_slots
+        # Physical reset empties slots without rewinding their generations.
+        # Preserve the matching policy watermarks for the next assignment.
         self._free_slots = deque(range(self.persistent_slots))
         self._free_slot_set = set(range(self.persistent_slots))
         self._lru.clear()
