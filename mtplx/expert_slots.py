@@ -567,6 +567,13 @@ class ExpertSlotPool:
 
         self._raise_completion_error()
 
+    def commit_if_healthy(self, callback: Callable[[], None]) -> None:
+        """Run one host-only policy commit atomically with the health check."""
+
+        with self._completion_error_lock:
+            self._raise_completion_error_locked(policy_rollback_safe=False)
+            callback()
+
     def _drain_completion_fences(self) -> None:
         """Wait for completion tasks queued before this diagnostic snapshot."""
 

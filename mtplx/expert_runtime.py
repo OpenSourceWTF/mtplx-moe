@@ -596,8 +596,9 @@ class PendingSplitRoute:
                 is_final_part = not self._miss_futures
             if is_final_part:
                 try:
-                    self._validate_completed_misses()
-                    self._commit_policy()
+                    self.runtime.slots.commit_if_healthy(
+                        self._validate_and_commit_policy
+                    )
                 except BaseException as exc:
                     self.abort(exc)
                     raise
@@ -605,8 +606,7 @@ class PendingSplitRoute:
         if not self._policy_observed:
             try:
                 self.runtime.slots.raise_if_unhealthy()
-                self._validate_completed_misses()
-                self._commit_policy()
+                self.runtime.slots.commit_if_healthy(self._validate_and_commit_policy)
             except BaseException as exc:
                 self.abort(exc)
                 raise
@@ -617,6 +617,12 @@ class PendingSplitRoute:
                 raise ExpertSlotError(
                     "incremental miss completion does not cover every route part"
                 )
+
+    def _validate_and_commit_policy(self) -> None:
+        """Validate and publish only host policy state and counters."""
+
+        self._validate_completed_misses()
+        self._commit_policy()
 
     def _prepare_ready_group(self) -> None:
         if self._miss_ready is not None:
