@@ -734,6 +734,8 @@ class HotExpertSwitchGLU(nn.Module):
             ready: ReadyRoute,
             bindings: tuple[ExpertSlotBinding, ...],
             wave_outputs: list[mx.array],
+            *,
+            force_sync: bool = False,
         ) -> None:
             raw = os.environ.get("MTPLX_EXPERT_SLOT_FENCES", "1")
             enabled = raw.strip().lower() not in {"0", "false", "no", "off"}
@@ -743,6 +745,14 @@ class HotExpertSwitchGLU(nn.Module):
                 return
             if not callable(async_eval):
                 update_fence_metrics(ready, completion_fence_fallbacks=1)
+                synchronous_fence(ready, wave_outputs)
+                return
+            if force_sync:
+                update_fence_metrics(
+                    ready,
+                    completion_fences=1,
+                    completion_fence_slots=len(bindings),
+                )
                 synchronous_fence(ready, wave_outputs)
                 return
             try:
@@ -781,6 +791,8 @@ class HotExpertSwitchGLU(nn.Module):
             positions: tuple[int, ...] | list[int],
             bindings: tuple[ExpertSlotBinding, ...],
             ready: ReadyRoute,
+            *,
+            force_sync: bool = False,
         ) -> None:
             if not positions:
                 return
@@ -807,7 +819,12 @@ class HotExpertSwitchGLU(nn.Module):
                     )
                 )
                 wave_positions.extend(grouped_positions)
-            fence_bindings(ready, bindings, wave_outputs)
+            fence_bindings(
+                ready,
+                bindings,
+                wave_outputs,
+                force_sync=force_sync,
+            )
             outputs.extend(wave_outputs)
             output_positions.extend(wave_positions)
 
@@ -815,6 +832,8 @@ class HotExpertSwitchGLU(nn.Module):
             positions: tuple[int, ...] | list[int],
             bindings: tuple[ExpertSlotBinding, ...],
             ready: ReadyRoute,
+            *,
+            force_sync: bool = False,
         ) -> None:
             if not positions:
                 return
@@ -839,7 +858,12 @@ class HotExpertSwitchGLU(nn.Module):
                     )
                 )
                 wave_positions.extend(expert_positions)
-            fence_bindings(ready, bindings, wave_outputs)
+            fence_bindings(
+                ready,
+                bindings,
+                wave_outputs,
+                force_sync=force_sync,
+            )
             outputs.extend(wave_outputs)
             output_positions.extend(wave_positions)
 
@@ -916,10 +940,14 @@ class HotExpertSwitchGLU(nn.Module):
                     if expert in hit_set
                 )
                 if pending.hit_ready is not None:
+                    # Split parts feed one shared lazy graph. Keep every MLX
+                    # eval on the generation thread; evaluating a fence on the
+                    # completion lane can race the next part's graph traversal.
                     evaluate_bindings(
                         hit_positions,
                         pending.hit_ready.bindings,
                         pending.hit_ready,
+                        force_sync=True,
                     )
                     pending.release_hits()
                 # The resident shared branch depends only on ``x``.  Force it
@@ -951,6 +979,7 @@ class HotExpertSwitchGLU(nn.Module):
                             miss_positions,
                             miss_ready.bindings,
                             miss_ready,
+                            force_sync=True,
                         )
                     except BaseException as exc:
                         part_error = exc
