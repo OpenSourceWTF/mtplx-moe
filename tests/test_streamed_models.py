@@ -838,6 +838,49 @@ def test_resident_loader_runs_hy3_without_materializing_routed_parameters(
         runtime.close()
 
 
+def test_split_route_keeps_mlx_evaluation_on_generation_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, spec, manifest_path = _integrated_hy3_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + spec.persistent_cache_bytes(1),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+    )
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=make_mlx_slot_buffer_allocator(
+            stream_config.memory_plan(spec), spec
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+    original_async_eval = mx.async_eval
+    async_calls = 0
+
+    def tracked_async_eval(*values) -> None:
+        nonlocal async_calls
+        async_calls += 1
+        original_async_eval(*values)
+
+    monkeypatch.setattr(expert_mlx.mx, "async_eval", tracked_async_eval)
+    try:
+        resident = construct_resident_model(root, runtime, config=config)
+        logits = resident.model(mx.array([[1]], dtype=mx.int32))
+        mx.eval(logits)
+
+        assert async_calls == 0
+        assert runtime.snapshot(mx_module=mx)["slots"]["pins"] == 0
+    finally:
+        runtime.close()
+
+
 def test_slot_fence_falls_back_to_synchronous_eval_without_async_mlx(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
