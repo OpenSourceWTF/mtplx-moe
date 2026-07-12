@@ -373,6 +373,9 @@ class PendingSplitRoute:
         self._miss_admissions: dict[int, RouteIOAdmission] = {}
         self._completed_miss_ordinals: set[int] = set()
         self._miss_ready_parts: dict[int, ReadyRoute] = {}
+        self._claimed_miss_futures: dict[Future[ReadyRoute], int] = {}
+        self._consumer_leases: set[int] = set()
+        self._releasing_consumer_leases: set[int] = set()
         self._miss_ready: _ReadyRouteGroup | None = None
         self._miss_cancel_event = miss_cancel_event or threading.Event()
         self._lifecycle_release = lifecycle_release
@@ -384,6 +387,7 @@ class PendingSplitRoute:
         self._failure_finalized = False
         self._cleanup_error: BaseException | None = None
         self._ready_cleanup_complete = False
+        self._ready_cleanup_finalizing = False
         self._hits_released = hit_ready is None
         self._close_requested = False
         self._finalized = False
@@ -527,6 +531,10 @@ class PendingSplitRoute:
             if (
                 self._failure is None
                 or self._failure_callbacks
+                or self._claimed_miss_futures
+                or self._consumer_leases
+                or self._releasing_consumer_leases
+                or self._ready_cleanup_finalizing
                 or self._failure_finalizing
                 or self._failure_finalized
             ):
@@ -542,6 +550,7 @@ class PendingSplitRoute:
                     for ordinal in sorted(self._miss_ready_parts)
                 )
                 self._miss_ready_parts.clear()
+                self._miss_ready = None
             release_error = self._release_routes(routes)
             if release_error is not None:
                 self._record_cleanup_error(release_error)
@@ -590,25 +599,63 @@ class PendingSplitRoute:
                     continue
                 self._miss_futures.pop(future)
                 ordinal = self._miss_ordinals.pop(future)
+                self._claimed_miss_futures[future] = ordinal
             try:
                 ready = future.result()
+            except BaseException as exc:
                 with self._state_lock:
-                    self._miss_ready_parts[ordinal] = ready
-                    self._completed_miss_ordinals.add(ordinal)
+                    self._claimed_miss_futures.pop(future, None)
+                    failure = self._failure
+                if failure is not None:
+                    self._finish_failure_if_ready()
+                    raise failure
+                self.abort(exc)
+                raise
+            with self._state_lock:
+                self._claimed_miss_futures.pop(future, None)
+                self._miss_ready_parts[ordinal] = ready
+                self._completed_miss_ordinals.add(ordinal)
+                failure = self._failure
+            if failure is not None:
+                self._finish_failure_if_ready()
+                raise failure
+            try:
                 self.runtime.slots.raise_if_unhealthy()
             except BaseException as exc:
                 self.abort(exc)
                 raise
             with self._state_lock:
-                is_final_part = not self._miss_futures
+                is_final_part = (
+                    not self._miss_futures and not self._claimed_miss_futures
+                )
             if is_final_part:
                 try:
                     self.runtime.slots.commit_if_healthy(
-                        self._validate_and_commit_policy
+                        lambda ordinal=ordinal: self._validate_and_commit_policy(
+                            lease_ordinal=ordinal
+                        )
                     )
                 except BaseException as exc:
                     self.abort(exc)
                     raise
+            else:
+                with self._state_lock:
+                    if self._failure is None and not self._close_requested:
+                        self._consumer_leases.add(ordinal)
+            with self._state_lock:
+                leased = ordinal in self._consumer_leases
+                failure = self._failure
+                if failure is not None and leased:
+                    self._consumer_leases.remove(ordinal)
+                    leased = False
+            if failure is not None:
+                self._finish_failure_if_ready()
+                raise failure
+            if not leased:
+                failure = ExpertSlotError("split route closed before miss yield")
+                self.abort(failure)
+                self._finish_failure_if_ready()
+                raise failure
             yield ready
         if not self._policy_observed:
             try:
@@ -625,11 +672,11 @@ class PendingSplitRoute:
                     "incremental miss completion does not cover every route part"
                 )
 
-    def _validate_and_commit_policy(self) -> None:
+    def _validate_and_commit_policy(self, *, lease_ordinal: int | None = None) -> None:
         """Validate and publish only host policy state and counters."""
 
         self._validate_completed_misses()
-        self._commit_policy()
+        self._commit_policy(lease_ordinal=lease_ordinal)
 
     def _prepare_ready_group(self) -> None:
         if self._miss_ready is not None:
@@ -653,21 +700,38 @@ class PendingSplitRoute:
             return None
         for _ready in self.iter_ready_misses():
             pass
+        with self._state_lock:
+            failure = self._failure
+            close_requested = self._close_requested
+            self._consumer_leases.clear()
+        if failure is not None:
+            self._finish_failure_if_ready()
+            raise failure
+        if close_requested:
+            self._finish_success_close_if_ready()
+            self._finalize_if_ready()
+            raise ExpertSlotError("split route closed before miss aggregation")
         self._prepare_ready_group()
         return self._miss_ready
 
-    def _commit_policy(self) -> None:
+    def _commit_policy(self, *, lease_ordinal: int | None = None) -> None:
+        committed = False
         with self._state_lock:
-            if self._policy_observed or self._failure is not None:
+            if self._failure is not None:
                 return
-            incremental_parts = len(self._completed_miss_ordinals)
-            self._policy_txn.commit()
-            self.runtime._observe_plan(self.layer, self.plan)
-            if self.plan.phase is RoutingPhase.DECODE and self.plan.misses:
-                self.runtime._incremental_miss_routes += 1
-                self.runtime._incremental_miss_parts += incremental_parts
-            self._policy_observed = True
-        self._release_lifecycle()
+            if not self._policy_observed:
+                incremental_parts = len(self._completed_miss_ordinals)
+                self._policy_txn.commit()
+                self.runtime._observe_plan(self.layer, self.plan)
+                if self.plan.phase is RoutingPhase.DECODE and self.plan.misses:
+                    self.runtime._incremental_miss_routes += 1
+                    self.runtime._incremental_miss_parts += incremental_parts
+                self._policy_observed = True
+                committed = True
+            if lease_ordinal is not None:
+                self._consumer_leases.add(lease_ordinal)
+        if committed:
+            self._release_lifecycle()
 
     def release_miss(self, ready: ReadyRoute) -> None:
         """Release one streamed part while retaining sole route ownership."""
@@ -680,13 +744,56 @@ class PendingSplitRoute:
             )
             if len(matches) != 1:
                 raise ExpertSlotError("miss part is not owned by this split route")
-            self._miss_ready_parts.pop(matches[0])
+            ordinal = matches[0]
+            if ordinal not in self._consumer_leases:
+                raise ExpertSlotError("miss part has no active consumer lease")
+            self._consumer_leases.remove(ordinal)
+            self._releasing_consumer_leases.add(ordinal)
+            self._miss_ready_parts.pop(ordinal)
             self._miss_ready = None
+        release_error: BaseException | None = None
         try:
             ready.release(synchronize=False)
         except BaseException as exc:
+            release_error = exc
             self._record_cleanup_error(exc)
-            raise
+        with self._state_lock:
+            self._releasing_consumer_leases.remove(ordinal)
+        success_error = self._finish_success_close_if_ready()
+        self._finish_failure_if_ready()
+        self._finalize_if_ready()
+        if release_error is not None:
+            raise release_error
+        if success_error is not None:
+            raise success_error
+
+    def _finish_success_close_if_ready(self) -> BaseException | None:
+        with self._state_lock:
+            if (
+                self._failure is not None
+                or not self._close_requested
+                or self._claimed_miss_futures
+                or self._consumer_leases
+                or self._releasing_consumer_leases
+                or self._ready_cleanup_finalizing
+                or self._ready_cleanup_complete
+            ):
+                return None
+            self._ready_cleanup_finalizing = True
+            routes = tuple(
+                self._miss_ready_parts[ordinal]
+                for ordinal in sorted(self._miss_ready_parts)
+            )
+            self._miss_ready_parts.clear()
+            self._miss_ready = None
+        release_error = self._release_routes(routes)
+        if release_error is not None:
+            self._record_cleanup_error(release_error)
+        with self._state_lock:
+            self._ready_cleanup_complete = True
+            self._ready_cleanup_finalizing = False
+        self._finalize_if_ready()
+        return release_error
 
     def close(self) -> None:
         if self._closed:
@@ -703,23 +810,10 @@ class PendingSplitRoute:
             first_error = exc
         with self._state_lock:
             failure = self._failure
-            if failure is None:
-                routes = tuple(
-                    self._miss_ready_parts[ordinal]
-                    for ordinal in sorted(self._miss_ready_parts)
-                )
-                self._miss_ready_parts.clear()
-            else:
-                routes = ()
-        release_error = self._release_routes(routes)
+            self._close_requested = True
+        release_error = self._finish_success_close_if_ready()
         if first_error is None:
             first_error = release_error
-        if release_error is not None:
-            self._record_cleanup_error(release_error)
-        with self._state_lock:
-            if failure is None:
-                self._ready_cleanup_complete = True
-            self._close_requested = True
         self._finish_failure_if_ready()
         self._finalize_if_ready()
         if failure is None and first_error is not None:

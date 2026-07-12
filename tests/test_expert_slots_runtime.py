@@ -3238,6 +3238,7 @@ def test_incremental_part_observes_sticky_completion_failure(
     parts = pending.iter_ready_misses()
     first = next(parts)
     assert first is not None
+    pending.release_miss(first)
     completion_error = RuntimeError("injected sticky completion failure between parts")
     runtime.slots._record_completion_error(completion_error)
     try:
