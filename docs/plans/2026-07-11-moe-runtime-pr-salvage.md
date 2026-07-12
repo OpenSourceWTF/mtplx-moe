@@ -162,7 +162,7 @@ git add mtplx tests
 git commit -m 'fix: preserve route semantics in all-hit decode'
 ```
 
-- [ ] **Step 6: Run the matched gate and record the decision**
+- [x] **Step 6: Run the matched gate and record the decision**
 
 Run at least three alternating pairs against the pre-#15 tip plus one instrumented candidate replay. Retain only if token/stop parity holds, route counters and expert bytes/operations are invariant, pins end at zero, and both matched median and mean decode tok/s are positive without systematic reversals. Expand the run if the historical `+0.78%` overlaps noise.
 

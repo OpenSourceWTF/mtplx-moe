@@ -6,16 +6,20 @@ Passed-only integration branch: `codex/moe-runtime-gated-integration`
 
 ## Gate contract
 
-`docs/MOE_SSD_STREAMING_OPTIMIZATION_ROADMAP.md` requires a retained performance
-optimization to improve its target lane by at least 5% in repeated runs, avoid a
-material regression in another lane, preserve deterministic token parity, and
-remain inside the memory plan. Raw results, the exact command/profile, and an
-immediate-predecessor baseline are required. Correctness-only changes use their
-contract-specific gate rather than a speedup requirement.
+The sequential salvage contract in
+`docs/specs/2026-07-11-moe-runtime-pr-salvage-design.md` supersedes the old 5%
+minimum. A throughput candidate may be retained when repeated matched evidence
+is positive in mean and median, the direction is not systematically reversed,
+and correctness, deterministic token parity, memory planning, and resource
+counters pass. Raw results, the exact command/profile, and the immediate
+predecessor are required. Correctness-only changes use their contract-specific
+gate and must remain materially non-regressed.
 
 ## Status
 
-Final count: **1 retained, 7 skipped, 0 untested**.
+Sequential salvage in progress: **2 retained (#13 and repaired #15), 6 pending
+repair/re-gate**. Rows other than #13/#15 preserve the prior clean-candidate
+failure evidence until their sequential repair task is complete.
 
 | PR | Source | Purpose | Correctness evidence | Measured result | Gate status | Integration status |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -23,7 +27,7 @@ Final count: **1 retained, 7 skipped, 0 untested**.
 | #12 | `a8ef882` -> `d06b483` | Q8 KV physical-memory accounting | Fresh: 141 focused passed, 1 skipped; full suite 1,984 passed, 4 skipped; Ruff check/format and diff check pass. Semantic review found the runtime does not attest Q8 realization and the planner omits allocator capacity rounding/margin (21,299,200 bytes at 131,072 tokens). | 36.7% expert-read reduction remains replay-estimated; no GPU run because the correctness contract failed first | **Failed: physical-byte plan is not fail-closed** | Not integrated; candidate preserved on `eval/gated-pr12` |
 | #13 | `1efb308` -> `939fe57` | Overlap resident shared MLP with pending decode miss I/O | Fresh: 43 focused passed; full suite 1,978 passed, 4 skipped; Ruff check/format and diff check pass; spec and quality reviews approved | Repeated fixed lane: 6.0523 -> 6.5033 decode tok/s mean, **+7.45%**; pair gains +6.84% and +8.07%; all tokens identical | **Passed** | **Retained at `939fe57`** |
 | #14 | `87ea0b7` -> `c424381` | Stream ready misses in physical completion order | Fresh: 49 focused passed; full suite 1,979 passed, 4 skipped; lint/format/diff checks pass. If one miss part fails, a running sibling has no shared cancellation and cleanup can block forever before rollback. A mixed hit/miss submit failure also leaks the pinned hit, and the streamed/legacy APIs disagree on pin ownership. | No GPU run because cancellation and pin-lifetime correctness failed first | **Failed: miss failure can hang rollback and leak pins** | Not integrated; candidate preserved on `eval/gated-pr14` |
-| #15 | `7652fa2` | All-hit decode fast path | Historical full/focused tests passed | 6.1224 -> 6.1701 decode tok/s, **+0.78%**; token-identical | **Failed: below 5%** | Intentionally absent; local merge `bbe0b0d` not inherited |
+| #15 | `7652fa2` -> `a5be248` + repair `e0e93b0` | All-hit decode fast path | RED reproduced the PR #13 tuple/shared-work break, flattened route-wave accounting, and second-wave pin-cleanup gap. GREEN: 40 focused passed; full suite 1,985 passed / 4 skipped; spec and quality reviews approved; Ruff/format/diff checks pass. | Six order-balanced process-isolated pairs: pooled decode mean 6.5446 -> 6.5549 tok/s, **+0.16%**; pooled median **+0.23%**; median pair gain **+0.36%**; 4/6 pairs positive; token/counter identical. Runner hooks: 5.369 GiB/s mean SSD, 6.998 p95, 48.49 GB/s routed-memory floor. | **Passed under salvage override; small and order-sensitive** | **Retained at `fb4c1d5`; `bbe0b0d` and `05f2f13` not inherited** |
 | #16 | `99f0c2b` -> `4106348` | Metal-resident expert routing | Exact clean candidate focused gate: 68 passed, 2 failed; env-off construction reads `runtime.spec` that PR13 test doubles do not expose. Semantic probes also show unfenced speculative Q4 work on probe exceptions, route-wave bypass changing LRU epochs/next evictions, and invalid router IDs reaching `mx.take` before host validation. | No GPU run because focused and semantic correctness failed first | **Failed: default path regresses and Metal shortcut changes policy semantics** | Not integrated; candidate preserved on `eval/gated-pr16-clean` |
 | #17 | `d484a94` -> `faf1527` | Metal completion fences for slot reuse | Fresh: 51 focused passed; full suite 1,981 passed, 4 skipped; lint/format/diff checks pass. A deterministic race shows the next replacement checks for a fence error before waiting on the pin, then proceeds after that fence fails/releases it; only a later route observes the error. Terminal fence errors can also escape `snapshot()`/`close()`. | No GPU run because the fail-closed correctness contract failed first | **Failed: asynchronous fence errors are not fail-closed** | Not integrated; candidate preserved on `eval/gated-pr17` |
 | #18 | `f37be96` -> `8743a93` | Gate/up compute overlapped with down-projection reads | Fresh: 36 focused passed; full suite 1,985 passed, 4 skipped; lint/format/diff checks pass. After an injected suffix failure, `active_routes=0` while a projection pin remains; `close()` tears down the component-bank storage with that pin live. If projection-release synchronization raises, rollback is skipped and the suffix error is masked. | No GPU run because partial-route lifetime correctness failed first | **Failed: storage can close while staged Metal work remains pinned** | Not integrated; candidate preserved on `eval/gated-pr18-clean` |

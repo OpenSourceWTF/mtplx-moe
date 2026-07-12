@@ -2,15 +2,16 @@
 
 Date: 2026-07-11
 Remote base: `origin/codex/moe-ssd-hy3-glm52@4146f72`
-Passed-only tip: `939fe57206eaceb6b6f2cf6a84ecc393a3a08cde`
+Current sequential tip: `fb4c1d5f6bcdf7a96f7685d372e522d5f25f0846`
 
 ## Result
 
-PRs #11 through #18 were rebuilt independently from the latest passed-only tip.
-The final count is **1 retained, 7 skipped, 0 untested**. PR #13 is the only
-candidate that cleared correctness and the repository's measured performance
-gate. PR #15 missed the performance bar. The other six candidates failed a
-correctness or fail-closed contract before GPU benchmarking.
+The original independent audit retained only PR #13. The approved sequential
+salvage is now rebuilding and repairing each rejected candidate on the latest
+retained tip. Current count: **2 retained (#13 and repaired #15), 6 pending
+repair/re-gate**. This report will become the requested consolidated seven-PR
+report as each remaining gate completes; prior failure findings remain below so
+the repair delta stays auditable.
 
 | PR | Clean candidate | Correctness result | Performance result | Decision |
 | --- | --- | --- | --- | --- |
@@ -18,7 +19,7 @@ correctness or fail-closed contract before GPU benchmarking.
 | #12 | `d06b483` | 141 focused passed / 1 skipped; 1,984 passed / 4 skipped full suite; physical Q8 allocation is not attested or fully budgeted | Not run: contract stopped the gate; 36.7% remains an estimate | Skip |
 | #13 | `939fe57` | 43 focused passed; 1,978 passed / 4 skipped full suite; independent reviews approved | 6.0523 -> 6.5033 decode tok/s mean, **+7.45%** over two matched pairs; token-identical | **Retain** |
 | #14 | `c424381` | 49 focused passed; 1,979 passed / 4 skipped full suite; miss failure can hang rollback and leak pins | Not run: correctness stopped the gate | Skip |
-| #15 | `7652fa2` | Historical focused/full validation passed | 6.1224 -> 6.1701 decode tok/s, **+0.78%**; token-identical | Skip: below 5% |
+| #15 | `a5be248` + repair `e0e93b0` | RED reproduced tuple/shared-work, route-wave, and pin-cleanup failures; GREEN 40 focused passed; 1,985 passed / 4 skipped full suite; both reviews approved | Six balanced pairs: decode mean 6.5446 -> 6.5549 tok/s, **+0.16%**; median +0.23%; 4/6 positive; token/counters identical | **Retain at `fb4c1d5`**; effect is small and order-sensitive |
 | #16 | `4106348` | Exact focused gate: 68 passed / 2 failed; additional device-fence and policy-accounting failures | Not run: correctness stopped the gate | Skip |
 | #17 | `faf1527` | 51 focused passed; 1,981 passed / 4 skipped full suite; asynchronous fence errors are not fail-closed | Not run: correctness stopped the gate | Skip |
 | #18 | `8743a93` | 36 focused passed; 1,985 passed / 4 skipped full suite; storage can close while partial Metal work remains pinned | Not run: correctness stopped the gate | Skip |
@@ -29,10 +30,12 @@ unsafe implementation is not promotable.
 
 ## Gate contract and fixed lane
 
-The authoritative retention rule in
-`docs/MOE_SSD_STREAMING_OPTIMIZATION_ROADMAP.md` requires at least 5% on the
-candidate's target lane in repeated runs, no material regression, deterministic
-token parity, and compliance with the memory plan.
+For this salvage series, the approved design in
+`docs/specs/2026-07-11-moe-runtime-pr-salvage-design.md` supersedes the old 5%
+minimum. A throughput candidate is retainable when its repeated matched mean
+and median are positive, direction is not systematically reversed, deterministic
+token parity and the candidate contract pass, and resource counters do not
+materially regress.
 
 The realistic Hy3 lane used:
 
@@ -47,9 +50,9 @@ The realistic Hy3 lane used:
   2,048-token ceiling
 - window telemetry disabled for the headline timing lane
 
-Before every hardware run, the fixed streamed/probe process check was empty.
-Qwen 3.6 was unloaded while tests and benchmarks ran; its gateway remained
-loaded.
+Before every salvage hardware run, the fixed streamed/probe process check was
+empty. The Qwen model launch agent was disabled and unloaded for the complete
+hardware lane; its gateway remained loaded.
 
 ## PR #13: shared-MLP / miss-I/O overlap
 
@@ -84,12 +87,69 @@ the retained evidence.
 
 ## PR #15: all-hit fast path
 
-The historical realistic-lane result was 6.1224 -> 6.1701 decode tok/s,
-approximately **+0.78%**, with exact token parity and effectively unchanged
-memory/I/O counters. This is below the repository's 5% bar, so PR #15 and its
-local merge commit `bbe0b0d` are intentionally absent. The raw artifact is
-`benchmarks/results/hy3-q4-pr15-ab-cbank99.json` in benchmark commit
-`ca5691c`; the commit message records the matched baseline and candidate values.
+The reviewed source `7652fa2` was transplanted as `a5be248`; contaminated merge
+`bbe0b0d` and follow-up `05f2f13` were not inherited. RED tests reproduced that
+the raw source returned a bare MLX array from PR #13's tuple-returning `_run`,
+collapsed policy route waves, and could skip the injected second-wave Q4 error.
+Repair `e0e93b0` keeps the probe inside authoritative route waves, preserves
+epochs/counters/shared-work ordering, releases each wave's pins on error, and
+skips reorder operations only for one complete ordered output.
+
+Validation:
+
+- focused PR #15 suites: **40 passed**;
+- full suite: **1,985 passed, 4 skipped**;
+- Ruff check, Ruff format check, and `git diff --check`: pass;
+- independent spec and code-quality reviews: approve.
+
+The historical `+0.78%` effect was too small for a one-pair decision. The
+repaired stack therefore ran six process-isolated pairs with balanced arm order:
+
+| Pair | Order | Base decode tok/s | Repaired #15 decode tok/s | Gain |
+| --- | --- | ---: | ---: | ---: |
+| 1 | base -> candidate | 6.5486 | 6.4844 | -0.98% |
+| 2 | base -> candidate | 6.5629 | 6.5867 | +0.36% |
+| 3 | base -> candidate | 6.5828 | 6.5467 | -0.55% |
+| 4 | candidate -> base | 6.5251 | 6.5490 | +0.37% |
+| 5 | candidate -> base | 6.5349 | 6.5651 | +0.46% |
+| 6 | candidate -> base | 6.5131 | 6.5976 | +1.30% |
+| Pooled mean | balanced | **6.5446** | **6.5549** | **+0.16%** |
+| Pooled median | balanced | **6.5417** | **6.5570** | **+0.23%** |
+
+The median pair gain is `+0.36%`; four of six pairs are positive. The arm-order
+strata are visibly different (`-0.39%` base-first versus `+0.71%`
+candidate-first), so the result must be described as small and order-sensitive,
+not as a precise universal speedup. Balancing the two strata yields a positive
+`+0.16%` treatment estimate, consistent in direction with the historical
+measurement and sufficient under the explicitly approved salvage override.
+
+All 12 headline arms produced 1,905 tokens, natural `stop`, and token SHA-256
+`484e182a68604821f69d56d0b15488d26723e6123f6a57f8158f8b20a4c6ed1c`.
+Cache counters, slot metrics, expert bytes, read operations, and MLX memory were
+machine-compared and identical. Every run ended with zero pins and zero short
+reads, I/O errors, or integrity errors.
+
+The separate runner-hook replay (excluded from headline timing) measured:
+
+- SSD: 5.369 GiB/s mean, 5.239 p50, 6.998 p95, 9.112 max;
+- 928,933,768 physical expert bytes per decode token and 43.06% of the measured
+  12.469 GiB/s SSD ceiling;
+- routed-weight memory-traffic floor: 48.49 GB/s mean, 59.78 GB/s p95;
+- 80.44 evictions per decode token; classification: `mixed: no single resource dominates`;
+- peak MLX memory: 89,145,807,988 bytes; final pins: 0.
+
+Raw headline JSONs:
+
+- [`hy3-q4-gated-pr15-base-cbank99-r1.json`](../benchmarks/results/hy3-q4-gated-pr15-base-cbank99-r1.json) and [`candidate r1`](../benchmarks/results/hy3-q4-gated-pr15-candidate-cbank99-r1.json)
+- [`hy3-q4-gated-pr15-base-cbank99-r2.json`](../benchmarks/results/hy3-q4-gated-pr15-base-cbank99-r2.json) and [`candidate r2`](../benchmarks/results/hy3-q4-gated-pr15-candidate-cbank99-r2.json)
+- [`hy3-q4-gated-pr15-base-cbank99-r3.json`](../benchmarks/results/hy3-q4-gated-pr15-base-cbank99-r3.json) and [`candidate r3`](../benchmarks/results/hy3-q4-gated-pr15-candidate-cbank99-r3.json)
+- [`hy3-q4-gated-pr15-base-cbank99-r4.json`](../benchmarks/results/hy3-q4-gated-pr15-base-cbank99-r4.json) and [`candidate r4`](../benchmarks/results/hy3-q4-gated-pr15-candidate-cbank99-r4.json)
+- [`hy3-q4-gated-pr15-base-cbank99-r5.json`](../benchmarks/results/hy3-q4-gated-pr15-base-cbank99-r5.json) and [`candidate r5`](../benchmarks/results/hy3-q4-gated-pr15-candidate-cbank99-r5.json)
+- [`hy3-q4-gated-pr15-base-cbank99-r6.json`](../benchmarks/results/hy3-q4-gated-pr15-base-cbank99-r6.json) and [`candidate r6`](../benchmarks/results/hy3-q4-gated-pr15-candidate-cbank99-r6.json)
+- [`hy3-q4-gated-pr15-instrumented-cbank99-r1.json`](../benchmarks/results/hy3-q4-gated-pr15-instrumented-cbank99-r1.json)
+
+The companion response Markdown for every JSON is committed beside it. Decision:
+**retain repaired PR #15 at `fb4c1d5`**.
 
 ## Correctness-gated candidates
 
@@ -188,16 +248,17 @@ device-memory ceiling.
 Raw artifact:
 [`hy3-q4-gated-pr13-instrumented-cbank99-r1.json`](../benchmarks/results/hy3-q4-gated-pr13-instrumented-cbank99-r1.json).
 
-## Final branch verification
+## Current branch verification
 
-On `939fe57`, the final suite collected 1,982 tests and completed with exit 0
-(1,978 passed, 4 expected skips). Ruff check, Ruff format check, and
-`git diff --check` pass on all six changed Python files. PR #15 and every other
-skipped candidate are absent from ancestry.
+The retained PR #13 tip `939fe57` collected 1,982 tests and completed with
+1,978 passed / 4 expected skips. After repaired PR #15, the current sequential
+tip collected 1,989 tests and completed with **1,985 passed / 4 expected
+skips**; focused, Ruff check, Ruff format check, and `git diff --check` all pass.
+The contaminated PR #15 merge/fix commits remain absent from ancestry.
 
 ## PR #19 dry merge
 
-The dry merge combined runtime tip `939fe57` with
+The earlier dry merge combined runtime tip `939fe57` with
 `codex/hy3-q4-native-serialized@28af6c5` in the isolated
 `eval/gated-pr19-drymerge` worktree.
 
@@ -215,10 +276,10 @@ After temporary dry-merge-only cleanup:
 - Python compilation and `git diff --check` pass
 - full synthesized suite: **2,032 passed, 4 skipped** in 108.20 seconds
 
-Neither source branch was modified by this synthesis. When PR #19 is rebased,
-apply the duplicate-import/format cleanup there and refresh its throughput
-matrix: its checked-in measurements predate PR #13 and do not represent the
-final runtime base.
+Neither source branch was modified by this synthesis. The dry merge now also
+predates repaired PR #15. When PR #19 is rebased, apply the
+duplicate-import/format cleanup there and refresh its throughput matrix against
+the final sequential runtime tip.
 
 The compact machine-readable decision companion is
 [`moe-runtime-gate-matrix.md`](../benchmarks/results/moe-runtime-gate-matrix.md).
