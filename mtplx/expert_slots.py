@@ -36,6 +36,7 @@ class RouteIOAdmission:
 
     accepted_submissions: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _parent: RouteIOAdmission | None = field(default=None, repr=False)
 
     @property
     def any_accepted(self) -> bool:
@@ -45,6 +46,13 @@ class RouteIOAdmission:
     def mark_accepted(self) -> None:
         with self._lock:
             self.accepted_submissions += 1
+        if self._parent is not None:
+            self._parent.mark_accepted()
+
+    def child(self) -> RouteIOAdmission:
+        """Create a part-local admission that also updates this route."""
+
+        return RouteIOAdmission(_parent=self)
 
 
 class ExpertSlotState(str, Enum):

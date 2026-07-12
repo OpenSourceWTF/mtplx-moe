@@ -2887,6 +2887,10 @@ def test_incremental_second_submit_failure_drains_accepted_part_and_retries(
     warm.release(synchronize=False)
     bank = runtime._banks[1]
     assert tuple(bank._slot_to_expert) == (0, 1, 2)
+    policy_before = _layer_policy_state(runtime, 1)
+    untouched_victim = runtime.slots._physical(1, 2)
+    with untouched_victim.condition:
+        untouched_generation = untouched_victim.generation
     cache_before = runtime.counters.as_dict()
     incremental_before = runtime.snapshot(mx_module=object())["incremental_misses"]
     original_submit = runtime._split_executor.submit
@@ -2927,6 +2931,13 @@ def test_incremental_second_submit_failure_drains_accepted_part_and_retries(
         assert successful_parts[0]._released is True
         assert tuple(bank._slot_to_expert) == (0, None, 2)
         assert bank._expert_to_slot == {0: 0, 2: 2}
+        policy_after = _layer_policy_state(runtime, 1)
+        assert policy_after["decode_epoch"] == policy_before["decode_epoch"]
+        assert policy_after["history"] == policy_before["history"]
+        assert (
+            policy_after["prefill_seed_candidates"]
+            == (policy_before["prefill_seed_candidates"])
+        )
         assert runtime.counters.as_dict() == cache_before
         assert runtime.snapshot(mx_module=object())["incremental_misses"] == (
             incremental_before
@@ -2940,6 +2951,7 @@ def test_incremental_second_submit_failure_drains_accepted_part_and_retries(
         with restored.condition:
             assert restored.state.value == "ready"
             assert restored.expert == 2
+            assert restored.generation == untouched_generation
         assert runtime.slots.metrics.as_dict()["active_routes"] == 0
         layer_lock = runtime._layer_locks[1]
         assert layer_lock.acquire(blocking=False)
@@ -2959,6 +2971,111 @@ def test_incremental_second_submit_failure_drains_accepted_part_and_retries(
     finally:
         monkeypatch.setattr(runtime._split_executor, "submit", original_submit)
         monkeypatch.setattr(runtime.slots, "ensure_route_part", original_ensure)
+        runtime.close(timeout=2)
+
+
+def test_incremental_partial_submit_defers_accepted_running_part_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, base_spec, manifest, _expected = _artifact(tmp_path, expert_count=5)
+    spec = replace(base_spec, top_k=3)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    plan = plan_expert_memory(
+        spec,
+        total_limit_bytes=fixed + spec.persistent_cache_bytes(3),
+        context_tokens=0,
+        runtime_reserve_bytes=0,
+    )
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+            cache_policy="lru",
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    warm = runtime.ensure_route(1, [0, 1, 2], phase="decode")
+    warm.release(synchronize=False)
+    cache_before = runtime.counters.as_dict()
+    original_submit = runtime._split_executor.submit
+    original_read = runtime.reader.read_record_into
+    read_started = threading.Event()
+    accepted = threading.Event()
+    release_read = threading.Event()
+    submit_error = RuntimeError("injected running-part outer submit rejection")
+    first_future: Future[ReadyRoute] | None = None
+    submit_count = 0
+
+    def blocking_read(manifest, record, destination, **kwargs):
+        if record.expert == 3:
+            read_started.set()
+            assert release_read.wait(timeout=2)
+        return original_read(manifest, record, destination, **kwargs)
+
+    def reject_after_running_accept(fn, layer, part, **kwargs):
+        nonlocal first_future, submit_count
+        submit_count += 1
+        if submit_count == 1:
+            admission = kwargs["io_admission"]
+            original_mark = admission.mark_accepted
+
+            def observe_acceptance() -> None:
+                original_mark()
+                accepted.set()
+
+            admission.mark_accepted = observe_acceptance
+            first_future = original_submit(fn, layer, part, **kwargs)
+            assert read_started.wait(timeout=2)
+            assert accepted.wait(timeout=2)
+            assert not first_future.done()
+            return first_future
+        assert accepted.is_set()
+        assert first_future is not None and not first_future.done()
+        raise submit_error
+
+    monkeypatch.setattr(runtime.reader, "read_record_into", blocking_read)
+    monkeypatch.setattr(runtime._split_executor, "submit", reject_after_running_accept)
+    try:
+        with pytest.raises(RuntimeError, match="running-part outer") as failed:
+            runtime.begin_split_route(1, [0, 3, 4], phase="decode")
+
+        assert failed.value is submit_error
+        assert first_future is not None and not first_future.done()
+        assert tuple(runtime._banks[1]._slot_to_expert) == (0, 3, 4)
+
+        release_read.set()
+        with pytest.raises(ExpertSlotError):
+            first_future.result(timeout=2)
+        layer_lock = runtime._layer_locks[1]
+        assert layer_lock.acquire(timeout=2)
+        layer_lock.release()
+
+        bank = runtime._banks[1]
+        assert tuple(bank._slot_to_expert) == (0, None, 2)
+        assert bank._expert_to_slot == {0: 0, 2: 2}
+        assert runtime.counters.as_dict() == cache_before
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+        for slot in (*runtime.slots._persistent.values(), *runtime.slots._transient):
+            with slot.condition:
+                assert slot.state.value != "loading"
+                assert slot.pins == 0
+
+        monkeypatch.setattr(runtime._split_executor, "submit", original_submit)
+        restored = runtime.ensure_route(1, [2], phase="decode")
+        assert restored.plan.hits == (2,)
+        restored.release(synchronize=False)
+    finally:
+        release_read.set()
+        monkeypatch.setattr(runtime._split_executor, "submit", original_submit)
         runtime.close(timeout=2)
 
 

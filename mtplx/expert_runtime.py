@@ -348,6 +348,7 @@ class PendingSplitRoute:
         io_admission: RouteIOAdmission | None = None,
         miss_cancel_event: threading.Event | None = None,
         lifecycle_release: Callable[[], None] | None = None,
+        miss_parts: tuple[RoutePlan, ...] | None = None,
     ) -> None:
         self.runtime = runtime
         self.layer = layer
@@ -361,6 +362,15 @@ class PendingSplitRoute:
             future: ordinal for ordinal, future in enumerate(self._miss_futures)
         }
         self._all_miss_ordinals = set(self._miss_ordinals.values())
+        initial_parts = tuple(self._miss_futures.values())
+        self._all_miss_parts = {
+            ordinal: part
+            for ordinal, part in enumerate(
+                initial_parts if miss_parts is None else miss_parts
+            )
+        }
+        self._submitted_miss_ordinals = set(self._miss_ordinals.values())
+        self._miss_admissions: dict[int, RouteIOAdmission] = {}
         self._completed_miss_ordinals: set[int] = set()
         self._miss_ready_parts: dict[int, ReadyRoute] = {}
         self._miss_ready: _ReadyRouteGroup | None = None
@@ -404,11 +414,16 @@ class PendingSplitRoute:
         plan: RoutePlan,
         *,
         ordinal: int,
+        io_admission: RouteIOAdmission | None = None,
     ) -> None:
         with self._state_lock:
             self._miss_futures[future] = plan
             self._miss_ordinals[future] = ordinal
             self._all_miss_ordinals.add(ordinal)
+            self._all_miss_parts[ordinal] = plan
+            self._submitted_miss_ordinals.add(ordinal)
+            if io_admission is not None:
+                self._miss_admissions[ordinal] = io_admission
 
     def _record_cleanup_error(self, error: BaseException) -> None:
         with self._state_lock:
@@ -522,11 +537,26 @@ class PendingSplitRoute:
                 self._record_cleanup_error(release_error)
             if not policy_observed:
                 try:
-                    self.runtime._handle_route_failure(
+                    accepted_ordinals = {
+                        ordinal
+                        for ordinal, admission in self._miss_admissions.items()
+                        if admission.any_accepted
+                    }
+                    if not self._miss_admissions and (
+                        self._io_admission is not None
+                        and self._io_admission.any_accepted
+                    ):
+                        accepted_ordinals = set(self._submitted_miss_ordinals)
+                    accepted_parts = tuple(
+                        self._all_miss_parts[ordinal]
+                        for ordinal in sorted(accepted_ordinals)
+                    )
+                    self.runtime._handle_split_route_failure(
                         self.layer,
                         self.plan,
                         self._policy_txn,
                         failure,
+                        accepted_parts=accepted_parts,
                         io_admission=self._io_admission,
                     )
                 except BaseException as exc:
@@ -1258,6 +1288,50 @@ class ExpertStreamingRuntime:
             return
         self._rollback_route_loads(layer, plan)
 
+    def _handle_split_route_failure(
+        self,
+        layer: int,
+        plan: RoutePlan,
+        policy_txn: RoutePolicyTxn,
+        error: BaseException,
+        *,
+        accepted_parts: tuple[RoutePlan, ...],
+        io_admission: RouteIOAdmission | None,
+    ) -> None:
+        """Restore untouched victims while quarantining accepted split loads."""
+
+        if io_admission is None or not io_admission.any_accepted:
+            policy_txn.rollback_completion()
+            return
+        if not accepted_parts:
+            self._handle_route_failure(
+                layer,
+                plan,
+                policy_txn,
+                error,
+                io_admission=io_admission,
+            )
+            return
+
+        # Every submitted future has settled before this runs. Remove only the
+        # physical records that crossed their part-local admission boundary,
+        # then restore the full policy snapshot. Accepted evictions cannot be
+        # restored physically, so quarantine those victims again afterward.
+        for part in accepted_parts:
+            self._rollback_route_loads(layer, part)
+        policy_txn.rollback_completion()
+        for part in accepted_parts:
+            for eviction in part.evictions:
+                previous_layer = (
+                    layer
+                    if eviction.previous_layer is None
+                    else eviction.previous_layer
+                )
+                self._invalidate_policy_expert(
+                    previous_layer,
+                    eviction.previous_expert,
+                )
+
     def begin_split_route(
         self,
         layer: int,
@@ -1325,6 +1399,7 @@ class ExpertStreamingRuntime:
                 io_admission=io_admission,
                 miss_cancel_event=miss_cancel_event,
                 lifecycle_release=lifecycle_release,
+                miss_parts=miss_parts,
             )
             if miss_plan is not None:
                 ensure = (
@@ -1333,18 +1408,20 @@ class ExpertStreamingRuntime:
                     else self.slots.ensure_route
                 )
                 for ordinal, miss_part in enumerate(miss_parts):
+                    part_admission = io_admission.child()
                     future = self._split_executor.submit(
                         ensure,
                         layer,
                         miss_part,
                         cancel_event=combined_cancel,
                         deadline_ns=deadline_ns,
-                        io_admission=io_admission,
+                        io_admission=part_admission,
                     )
                     pending._attach_miss_future(
                         future,
                         miss_part,
                         ordinal=ordinal,
+                        io_admission=part_admission,
                     )
             else:
                 pending._commit_policy()
