@@ -1994,6 +1994,113 @@ def test_runtime_finite_close_does_not_wait_for_preadmission_split_worker(
     runtime.close(timeout=2)
 
 
+def test_single_part_failure_holds_slot_lifecycle_through_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    part_completed = threading.Event()
+    rollback_entered = threading.Event()
+    continue_rollback = threading.Event()
+    close_finished = threading.Event()
+    original_ensure = runtime.slots.ensure_route_part
+    original_failure = runtime._handle_split_route_failure
+    state_before_rollback: list[str] = []
+    state_after_rollback: list[str] = []
+
+    def observe_part(*args, **kwargs):
+        ready = original_ensure(*args, **kwargs)
+        part_completed.set()
+        return ready
+
+    def gate_rollback(*args, **kwargs) -> None:
+        rollback_entered.set()
+        assert continue_rollback.wait(timeout=2)
+        physical = runtime.slots._physical(1, 0)
+        with physical.condition:
+            state_before_rollback.append(physical.state.value)
+        original_failure(*args, **kwargs)
+        with physical.condition:
+            state_after_rollback.append(physical.state.value)
+
+    def close_runtime() -> None:
+        try:
+            runtime.close(timeout=2)
+        finally:
+            close_finished.set()
+
+    monkeypatch.setattr(runtime.slots, "ensure_route_part", observe_part)
+    monkeypatch.setattr(runtime, "_handle_split_route_failure", gate_rollback)
+    pending = runtime.begin_split_route(1, [0], phase="decode")
+    assert part_completed.wait(timeout=2)
+    primary_error = RuntimeError("injected one-part split failure")
+    executor = ThreadPoolExecutor(max_workers=2)
+    abort_call = executor.submit(pending.abort, primary_error)
+    close_call: Future[None] | None = None
+    try:
+        assert rollback_entered.wait(timeout=2)
+        active_during_rollback = runtime.slots.metrics.as_dict()["active_routes"]
+        close_call = executor.submit(close_runtime)
+        if active_during_rollback == 0:
+            assert close_finished.wait(timeout=2)
+        close_finished_before_rollback = close_finished.is_set()
+
+        continue_rollback.set()
+        abort_call.result(timeout=2)
+        pending.close()
+        close_call.result(timeout=2)
+        physical = runtime.slots._physical(1, 0)
+        with physical.condition:
+            final_state = physical.state.value
+            final_pins = physical.pins
+        final_active = runtime.slots.metrics.as_dict()["active_routes"]
+        layer_lock = runtime._layer_locks[1]
+        assert layer_lock.acquire(timeout=2)
+        layer_lock.release()
+
+        evidence = (
+            f"active_during_rollback={active_during_rollback}, "
+            f"close_finished_early={close_finished_before_rollback}, "
+            f"before={state_before_rollback}, after={state_after_rollback}, "
+            f"final={final_state}, pins={final_pins}, active={final_active}, "
+            f"closed={runtime._closed}, slots_closed={runtime.slots._closed}"
+        )
+        assert pending._failure is primary_error, evidence
+        assert active_during_rollback == 1, evidence
+        assert close_finished_before_rollback is False, evidence
+        assert state_before_rollback == ["ready"], evidence
+        assert state_after_rollback == ["empty"], evidence
+        assert final_state == "closed", evidence
+        assert final_pins == 0, evidence
+        assert final_active == 0, evidence
+        assert runtime._closed is True, evidence
+        assert runtime.slots._closed is True, evidence
+    finally:
+        continue_rollback.set()
+        abort_call.result(timeout=2)
+        pending.close()
+        if close_call is not None:
+            close_call.result(timeout=2)
+        executor.shutdown(wait=True, cancel_futures=True)
+        runtime.close(timeout=2)
+
+
 def test_runtime_handles_kv_admission_routes_waves_and_reset(tmp_path: Path) -> None:
     root, spec, manifest, expected = _artifact(tmp_path)
     manifest_path = root / "expert-manifest.json"
