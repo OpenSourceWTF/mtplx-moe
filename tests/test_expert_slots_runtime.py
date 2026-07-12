@@ -198,6 +198,8 @@ def _artifact(
 
 def _global_artifact(
     tmp_path: Path,
+    *,
+    expert_count: int = 2,
 ) -> tuple[
     Path,
     ExpertStreamingModelSpec,
@@ -211,9 +213,10 @@ def _global_artifact(
         _spec(),
         key="tiny-global-q4",
         display_name="Tiny Global Q4",
-        total_tensor_bytes=4 * record_bytes + 1,
+        total_tensor_bytes=2 * expert_count * record_bytes + 1,
         total_layers=3,
         routed_layer_count=2,
+        expert_count=expert_count,
         mtp_layer_index=3,
     )
     raw = bytearray()
@@ -2968,6 +2971,119 @@ def test_incremental_second_submit_failure_drains_accepted_part_and_retries(
             assert ready is not None
             assert tuple(binding.expert for binding in ready.bindings) == (3, 4)
         assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+    finally:
+        monkeypatch.setattr(runtime._split_executor, "submit", original_submit)
+        monkeypatch.setattr(runtime.slots, "ensure_route_part", original_ensure)
+        runtime.close(timeout=2)
+
+
+@pytest.mark.parametrize("warm_victims", [False, True], ids=["empty", "evicted"])
+def test_global_partial_submit_failure_preserves_physical_generation_for_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    warm_victims: bool,
+) -> None:
+    root, base_spec, manifest, _expected = _global_artifact(
+        tmp_path,
+        expert_count=5,
+    )
+    spec = replace(base_spec, top_k=2)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _global_plan(spec, persistent_slots=2)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+            cache_policy="lru",
+            cache_scope="global",
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    if warm_victims:
+        warm = runtime.ensure_route(1, [0, 1], phase="decode")
+        warm.release(synchronize=False)
+
+    bank = runtime._global_bank
+    assert bank is not None
+    accepted_slot = 0
+    accepted_physical = runtime.slots._physical(1, accepted_slot)
+    with accepted_physical.condition:
+        physical_generation_before = accepted_physical.generation
+    policy_generation_before = bank._slot_generations[accepted_slot]
+    assert policy_generation_before == physical_generation_before
+
+    original_submit = runtime._split_executor.submit
+    original_ensure = runtime.slots.ensure_route_part
+    submit_error = RuntimeError("injected second global outer submit rejection")
+    first_part_completed = threading.Event()
+    successful_parts: list[ReadyRoute] = []
+    submit_count = 0
+
+    def observe_real_part(layer, part, **kwargs):
+        ready = original_ensure(layer, part, **kwargs)
+        successful_parts.append(ready)
+        first_part_completed.set()
+        return ready
+
+    def reject_second_submit(fn, layer, part, **kwargs):
+        nonlocal submit_count
+        submit_count += 1
+        if submit_count == 1:
+            future = original_submit(fn, layer, part, **kwargs)
+            assert first_part_completed.wait(timeout=2)
+            assert future.result(timeout=2) is successful_parts[0]
+            return future
+        raise submit_error
+
+    monkeypatch.setattr(runtime.slots, "ensure_route_part", observe_real_part)
+    monkeypatch.setattr(runtime._split_executor, "submit", reject_second_submit)
+    try:
+        with pytest.raises(RuntimeError, match="second global outer") as failed:
+            runtime.begin_split_route(1, [2, 3], phase="decode")
+
+        assert failed.value is submit_error
+        assert submit_count == 2
+        assert len(successful_parts) == 1
+        assert successful_parts[0]._released is True
+        accepted_load = successful_parts[0].plan.loads[0]
+        assert accepted_load.slot == accepted_slot
+        assert accepted_load.generation == physical_generation_before + 1
+        with accepted_physical.condition:
+            physical_generation_after = accepted_physical.generation
+            assert accepted_physical.state.value == "empty"
+            assert accepted_physical.layer is None
+            assert accepted_physical.expert is None
+        assert physical_generation_after == accepted_load.generation
+        policy_generation_after = bank._slot_generations[accepted_slot]
+
+        if warm_victims:
+            assert bank._slot_to_key == [None, (1, 1)]
+            untouched = runtime.slots._physical(1, 1)
+            with untouched.condition:
+                assert untouched.state.value == "ready"
+                assert untouched.layer == 1
+                assert untouched.expert == 1
+
+        monkeypatch.setattr(runtime._split_executor, "submit", original_submit)
+        monkeypatch.setattr(runtime.slots, "ensure_route_part", original_ensure)
+        try:
+            retry = runtime.ensure_route(1, [4], phase="decode")
+        except ExpertSlotError as exc:
+            pytest.fail(
+                "global slot generation rewound below physical generation: "
+                f"policy={policy_generation_after}, "
+                f"physical={physical_generation_after}; retry failed: {exc}"
+            )
+        assert policy_generation_after == physical_generation_after
+        assert retry.plan.loads[0].generation == physical_generation_after + 1
+        retry.release(synchronize=False)
     finally:
         monkeypatch.setattr(runtime._split_executor, "submit", original_submit)
         monkeypatch.setattr(runtime.slots, "ensure_route_part", original_ensure)
