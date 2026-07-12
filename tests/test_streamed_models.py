@@ -23,7 +23,7 @@ from mtplx.expert_runtime import (
     ExpertStreamingRuntime,
     RouteWave,
 )
-from mtplx.expert_slots import ExpertSlotBinding
+from mtplx.expert_slots import ExpertSlotBinding, ExpertSlotError
 from mtplx.expert_streaming_models import ExpertStreamingModelSpec
 from mtplx.models.expert_mlx import (
     HotExpertSwitchGLU,
@@ -768,6 +768,103 @@ def test_slot_fence_falls_back_to_synchronous_eval_without_async_mlx(
         runtime.close()
 
 
+def test_slot_fence_synchronous_fallback_failure_blocks_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _config, spec, manifest_path = _integrated_hy3_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + spec.persistent_cache_bytes(1),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        cache_policy="lru",
+    )
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=make_mlx_slot_buffer_allocator(
+            stream_config.memory_plan(spec), spec
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+    switch = HotExpertSwitchGLU(runtime, 1)
+    tokens = mx.zeros((1, 1, spec.hidden_size), dtype=mx.bfloat16)
+    indices = mx.array([[0]], dtype=mx.int32)
+    eval_error = RuntimeError("injected synchronous fallback eval failure")
+    replacement_ready = None
+    original_eval = expert_mlx.mx.eval
+    monkeypatch.setattr(
+        expert_mlx, "_run_q4_expert", lambda selected, *_a, **_k: selected
+    )
+    monkeypatch.setattr(expert_mlx.mx, "async_eval", None)
+
+    try:
+        warm = switch(tokens, indices)
+        original_eval(warm)
+        runtime.snapshot(mx_module=mx)
+        slot = next(
+            slot
+            for slot in (*runtime.slots._persistent.values(), *runtime.slots._transient)
+            if slot.expert == 0
+        )
+        with slot.condition:
+            generation = slot.generation
+        read_bytes = runtime.reader.metrics.as_dict()["read_bytes"]
+
+        eval_calls = 0
+
+        def fail_fence_eval(*values) -> None:
+            nonlocal eval_calls
+            eval_calls += 1
+            if len(values) == 1 and values[0] is indices:
+                original_eval(*values)
+                return
+            assert len(values) == 1
+            assert isinstance(values[0], list)
+            assert tuple(values[0][0].shape) == (1, spec.hidden_size)
+            raise eval_error
+
+        monkeypatch.setattr(expert_mlx.mx, "eval", fail_fence_eval)
+        with pytest.raises(RuntimeError, match="fallback eval failure") as failed:
+            switch(tokens, indices)
+        monkeypatch.setattr(expert_mlx.mx, "eval", original_eval)
+        assert failed.value is eval_error
+        assert eval_calls == 2
+
+        with slot.condition:
+            assert slot.pins == 0
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as blocked:
+            replacement_ready = runtime.ensure_route(1, [1], phase="decode")
+        assert blocked.value.__cause__ is eval_error
+        with slot.condition:
+            assert slot.expert == 0
+            assert slot.generation == generation
+        assert runtime.reader.metrics.as_dict()["read_bytes"] == read_bytes
+
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as visible:
+            runtime.snapshot(mx_module=mx)
+        assert visible.value.__cause__ is eval_error
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as closed:
+            runtime.close(timeout=2)
+        assert closed.value.__cause__ is eval_error
+        assert runtime.reader._closed is True
+    finally:
+        monkeypatch.setattr(expert_mlx.mx, "eval", original_eval)
+        if replacement_ready is not None:
+            replacement_ready.release(synchronize=False)
+        try:
+            runtime.close(timeout=2)
+        except ExpertSlotError:
+            pass
+
+
 def test_component_bank_hy3_executes_without_record_or_stack_copies(
     tmp_path: Path,
 ) -> None:
@@ -1043,6 +1140,106 @@ def test_component_bank_all_hit_decode_releases_pins_on_q4_error(
         assert runtime.snapshot(mx_module=mx)["slots"]["pins"] == 0
     finally:
         runtime.close()
+
+
+def test_slot_fence_all_hit_synchronous_eval_failure_blocks_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + spec.persistent_cache_bytes(3),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        transient_slots=2,
+        slot_layout="component-banks",
+        cache_policy="lru",
+    )
+    plan = stream_config.memory_plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=make_mlx_component_bank_allocator(
+            plan,
+            spec,
+            load_expert_manifest(manifest_path),
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+    switch = HotExpertSwitchGLU(runtime, 1)
+    tokens = mx.zeros((2, 1, spec.hidden_size), dtype=mx.float32)
+    indices = mx.array([[2, 0], [2, 1]], dtype=mx.int32)
+    eval_error = RuntimeError("injected all-hit synchronous eval failure")
+    replacement_ready = None
+    original_eval = expert_mlx.mx.eval
+    monkeypatch.setattr(
+        expert_mlx,
+        "_run_component_bank_q4",
+        lambda selected, *_a, **_k: selected,
+    )
+
+    try:
+        warm = switch(tokens, indices)
+        original_eval(warm)
+        runtime.snapshot(mx_module=mx)
+        slots = (*runtime.slots._persistent.values(), *runtime.slots._transient)
+        before = tuple(
+            (slot.state, slot.layer, slot.expert, slot.generation) for slot in slots
+        )
+        read_bytes = runtime.reader.metrics.as_dict()["read_bytes"]
+
+        eval_calls = 0
+
+        def fail_all_hit_fence(*values) -> None:
+            nonlocal eval_calls
+            eval_calls += 1
+            if len(values) == 1 and values[0] is indices:
+                original_eval(*values)
+                return
+            assert len(values) == 1
+            assert tuple(values[0].shape) == (3, spec.hidden_size)
+            raise eval_error
+
+        monkeypatch.setattr(expert_mlx.mx, "eval", fail_all_hit_fence)
+        with pytest.raises(RuntimeError, match="all-hit synchronous eval") as failed:
+            switch(tokens, indices)
+        monkeypatch.setattr(expert_mlx.mx, "eval", original_eval)
+        assert failed.value is eval_error
+        assert eval_calls == 2
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+        assert sum(slot.pins for slot in slots) == 0
+        assert (
+            tuple(
+                (slot.state, slot.layer, slot.expert, slot.generation) for slot in slots
+            )
+            == before
+        )
+
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as blocked:
+            replacement_ready = runtime.ensure_route(1, [3, 0], phase="decode")
+        assert blocked.value.__cause__ is eval_error
+        assert runtime.reader.metrics.as_dict()["read_bytes"] == read_bytes
+
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as visible:
+            runtime.snapshot(mx_module=mx)
+        assert visible.value.__cause__ is eval_error
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as closed:
+            runtime.close(timeout=2)
+        assert closed.value.__cause__ is eval_error
+        assert runtime.reader._closed is True
+    finally:
+        monkeypatch.setattr(expert_mlx.mx, "eval", original_eval)
+        if replacement_ready is not None:
+            replacement_ready.release(synchronize=False)
+        try:
+            runtime.close(timeout=2)
+        except ExpertSlotError:
+            pass
 
 
 def test_resident_loader_reads_extensionless_hugging_face_cache_blob(

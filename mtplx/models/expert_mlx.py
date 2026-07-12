@@ -710,6 +710,26 @@ class HotExpertSwitchGLU(nn.Module):
         output_positions: list[int] = []
         shared: mx.array | None = None
 
+        def update_fence_metrics(ready: ReadyRoute, **values: int) -> None:
+            metrics = getattr(getattr(ready, "pool", None), "metrics", None)
+            update = getattr(metrics, "update", None)
+            if callable(update):
+                update(**values)
+
+        def synchronous_fence(ready: ReadyRoute, values: Any) -> None:
+            try:
+                mx.eval(values)
+            except BaseException as exc:
+                update_fence_metrics(ready, completion_fence_failures=1)
+                record = getattr(
+                    getattr(ready, "pool", None),
+                    "_record_completion_error",
+                    None,
+                )
+                if callable(record):
+                    record(exc)
+                raise
+
         def fence_bindings(
             ready: ReadyRoute,
             bindings: tuple[ExpertSlotBinding, ...],
@@ -719,11 +739,11 @@ class HotExpertSwitchGLU(nn.Module):
             enabled = raw.strip().lower() not in {"0", "false", "no", "off"}
             async_eval = getattr(mx, "async_eval", None)
             if not enabled:
-                mx.eval(wave_outputs)
+                synchronous_fence(ready, wave_outputs)
                 return
             if not callable(async_eval):
-                ready.pool.metrics.update(completion_fence_fallbacks=1)
-                mx.eval(wave_outputs)
+                update_fence_metrics(ready, completion_fence_fallbacks=1)
+                synchronous_fence(ready, wave_outputs)
                 return
             try:
                 async_eval(wave_outputs)
@@ -731,20 +751,31 @@ class HotExpertSwitchGLU(nn.Module):
                 # Older/stripped MLX builds may expose the name without a
                 # usable asynchronous evaluator. Preserve the generation
                 # fence with the original synchronous barrier.
-                ready.pool.metrics.update(completion_fence_fallbacks=1)
-                mx.eval(wave_outputs)
+                update_fence_metrics(ready, completion_fence_fallbacks=1)
+                synchronous_fence(ready, wave_outputs)
                 return
             roots = tuple(wave_outputs)
+            defer = getattr(ready, "defer_bindings_until", None)
+            if not callable(defer):
+                synchronous_fence(ready, roots)
+                return
             try:
-                ready.defer_bindings_until(
+                defer(
                     bindings,
                     lambda: mx.eval(roots),
                 )
             except Exception:
                 # If the completion lane rejects or cannot represent this
                 # binding set, do not release the route on an async promise.
-                ready.pool.metrics.update(completion_fence_fallbacks=1)
-                mx.eval(roots)
+                update_fence_metrics(ready, completion_fence_fallbacks=1)
+                synchronous_fence(ready, roots)
+                raise_completion_error = getattr(
+                    getattr(ready, "pool", None),
+                    "_raise_completion_error",
+                    None,
+                )
+                if callable(raise_completion_error):
+                    raise_completion_error()
 
         def evaluate_component_bindings(
             positions: tuple[int, ...] | list[int],
@@ -856,7 +887,7 @@ class HotExpertSwitchGLU(nn.Module):
                         )
                         # Slot pins may be released only after the lazy graph
                         # has consumed the currently bound bank generations.
-                        mx.eval(wave_output)
+                        synchronous_fence(ready, wave_output)
                         outputs.append(wave_output)
                         output_positions.extend(wave.positions)
                     finally:

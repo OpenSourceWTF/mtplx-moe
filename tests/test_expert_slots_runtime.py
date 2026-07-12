@@ -4,6 +4,7 @@ import hashlib
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -372,7 +373,428 @@ def test_completion_fence_failure_releases_pin_and_fails_next_route(
     assert pool.metrics.as_dict()["completion_fence_failures"] == 1
     with pytest.raises(ExpertSlotError, match="completion fence failed"):
         pool.ensure_route(1, _manual_plan(1, transient_slot))
-    pool.close()
+    with pytest.raises(ExpertSlotError, match="completion fence failed"):
+        pool.close()
+
+
+def test_completion_fence_failure_stops_replacement_already_waiting_on_pin(
+    tmp_path: Path,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    plan = _plan(spec)
+    reader = PositionalExpertReader(root, use_native=False)
+    pool = ExpertSlotPool(spec, plan, manifest, reader)
+    transient_slot = plan.slots_per_layer
+    first = pool.ensure_route(1, _manual_plan(0, transient_slot))
+    slot = pool._physical(1, transient_slot)
+    first_generation = first.generations[0]
+    read_bytes = reader.metrics.as_dict()["read_bytes"]
+    completion_started = threading.Event()
+    fail_completion = threading.Event()
+    fence_error = RuntimeError("injected Metal completion failure after pin wait")
+    replacement_ready = None
+
+    def wait_then_fail() -> None:
+        completion_started.set()
+        assert fail_completion.wait(timeout=2)
+        raise fence_error
+
+    try:
+        first.defer_bindings_until(first.bindings, wait_then_fail)
+        first.release(synchronize=False)
+        assert completion_started.wait(timeout=2)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            replacement = executor.submit(
+                pool.ensure_route,
+                1,
+                _manual_plan(1, transient_slot),
+            )
+            deadline = time.monotonic() + 2
+            while pool.metrics.as_dict()["pin_waits"] == 0:
+                assert time.monotonic() < deadline, "replacement did not wait on pin"
+                time.sleep(0.001)
+            fail_completion.set()
+            with pytest.raises(ExpertSlotError, match="completion fence failed") as exc:
+                replacement_ready = replacement.result(timeout=2)
+
+        assert exc.value.__cause__ is fence_error
+        with slot.condition:
+            assert slot.state.value == "ready"
+            assert slot.expert == 0
+            assert slot.generation == first_generation
+        assert reader.metrics.as_dict()["read_bytes"] == read_bytes
+    finally:
+        fail_completion.set()
+        if replacement_ready is not None:
+            replacement_ready.release(synchronize=False)
+        try:
+            pool.close(timeout=2)
+        except ExpertSlotError:
+            pass
+
+
+def test_runtime_completion_fence_failure_preserves_waiting_victim(
+    tmp_path: Path,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+            cache_policy="lru",
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    first = runtime.ensure_route(1, [0], phase="decode")
+    slot = runtime.slots._physical(1, 0)
+    generation = first.generations[0]
+    read_bytes = runtime.reader.metrics.as_dict()["read_bytes"]
+    completion_started = threading.Event()
+    fail_completion = threading.Event()
+    fence_error = RuntimeError("runtime victim fence failure")
+    replacement_ready = None
+
+    def wait_then_fail() -> None:
+        completion_started.set()
+        assert fail_completion.wait(timeout=2)
+        raise fence_error
+
+    try:
+        first.defer_bindings_until(first.bindings, wait_then_fail)
+        first.release(synchronize=False)
+        assert completion_started.wait(timeout=2)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            replacement = executor.submit(
+                runtime.ensure_route,
+                1,
+                [1],
+                phase="decode",
+            )
+            deadline = time.monotonic() + 2
+            while runtime.slots.metrics.as_dict()["pin_waits"] == 0:
+                assert time.monotonic() < deadline, "replacement did not wait on pin"
+                time.sleep(0.001)
+            fail_completion.set()
+            with pytest.raises(ExpertSlotError, match="completion fence failed") as exc:
+                replacement_ready = replacement.result(timeout=2)
+
+        assert exc.value.__cause__ is fence_error
+        with slot.condition:
+            assert slot.state.value == "ready"
+            assert slot.expert == 0
+            assert slot.generation == generation
+            assert slot.pins == 0
+        assert runtime.reader.metrics.as_dict()["read_bytes"] == read_bytes
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+    finally:
+        fail_completion.set()
+        if replacement_ready is not None:
+            replacement_ready.release(synchronize=False)
+        try:
+            runtime.close(timeout=2)
+        except ExpertSlotError:
+            pass
+
+
+def test_completion_fence_multi_load_prepare_failure_restores_earlier_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, base_spec, manifest, _expected = _artifact(tmp_path)
+    spec = replace(base_spec, top_k=2)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    first = runtime.slots.ensure_route(1, _manual_plan(0, 0))
+    first.release(synchronize=False)
+    held = runtime.slots.ensure_route(1, _manual_plan(1, 1))
+    first_slot = runtime.slots._physical(1, 0)
+    held_slot = runtime.slots._physical(1, 1)
+    before = (
+        (first_slot.state, first_slot.expert, first_slot.generation),
+        (held_slot.state, held_slot.expert, held_slot.generation),
+    )
+    read_bytes = runtime.reader.metrics.as_dict()["read_bytes"]
+    completion_started = threading.Event()
+    fail_completion = threading.Event()
+    fence_error = RuntimeError("multi-load preparation fence failure")
+
+    def wait_then_fail() -> None:
+        completion_started.set()
+        assert fail_completion.wait(timeout=2)
+        raise fence_error
+
+    route = RoutePlan(
+        phase=RoutingPhase.DECODE,
+        experts=(1, 0),
+        slots=(0, 1),
+        hits=(),
+        misses=(1, 0),
+        loads=(
+            SlotLoad(expert=1, slot=0, persistent=True),
+            SlotLoad(expert=0, slot=1, persistent=False),
+        ),
+        evictions=(),
+    )
+    monkeypatch.setattr(runtime, "_plan_route", lambda *_args, **_kwargs: route)
+
+    try:
+        held.defer_bindings_until(held.bindings, wait_then_fail)
+        held.release(synchronize=False)
+        assert completion_started.wait(timeout=2)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending = executor.submit(
+                runtime.ensure_route,
+                1,
+                [1, 0],
+                phase="decode",
+            )
+            deadline = time.monotonic() + 2
+            while runtime.slots.metrics.as_dict()["pin_waits"] == 0:
+                assert time.monotonic() < deadline, "second load did not wait on pin"
+                time.sleep(0.001)
+            fail_completion.set()
+            with pytest.raises(ExpertSlotError, match="completion fence failed") as exc:
+                pending.result(timeout=2)
+
+        assert exc.value.__cause__ is fence_error
+        with first_slot.condition, held_slot.condition:
+            after = (
+                (first_slot.state, first_slot.expert, first_slot.generation),
+                (held_slot.state, held_slot.expert, held_slot.generation),
+            )
+            assert after == before
+            assert first_slot.pins == 0
+            assert held_slot.pins == 0
+        assert runtime.reader.metrics.as_dict()["read_bytes"] == read_bytes
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+    finally:
+        fail_completion.set()
+        try:
+            runtime.close(timeout=2)
+        except ExpertSlotError:
+            pass
+
+
+def test_completion_fence_failure_is_visible_to_snapshot_and_close(
+    tmp_path: Path,
+) -> None:
+    class CloseTrackingAllocator:
+        backend = "test-close-tracking"
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __call__(self, size: int, _label: str) -> bytearray:
+            return bytearray(size)
+
+        def close(self) -> None:
+            self.closed = True
+
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    plan = _plan(spec)
+    reader = PositionalExpertReader(root, use_native=False)
+    allocator = CloseTrackingAllocator()
+    pool = ExpertSlotPool(
+        spec,
+        plan,
+        manifest,
+        reader,
+        buffer_allocator=allocator,
+    )
+    transient_slot = plan.slots_per_layer
+    first = pool.ensure_route(1, _manual_plan(0, transient_slot))
+    fence_error = RuntimeError("sticky Metal completion failure")
+
+    def fail_completion() -> None:
+        raise fence_error
+
+    try:
+        first.defer_bindings_until(first.bindings, fail_completion)
+        first.release(synchronize=False)
+
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as one:
+            pool.snapshot()
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as two:
+            pool.snapshot()
+        assert one.value.__cause__ is fence_error
+        assert two.value.__cause__ is fence_error
+
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as closed:
+            pool.close(timeout=2)
+        assert closed.value.__cause__ is fence_error
+        assert reader._closed is True
+        assert allocator.closed is True
+        assert pool._closed is True
+        assert pool._closing is False
+        assert all(
+            slot.state.value == "closed"
+            for slot in (*pool._persistent.values(), *pool._transient)
+        )
+    finally:
+        try:
+            pool.close(timeout=2)
+        except ExpertSlotError:
+            pass
+
+
+def test_completion_fence_synchronous_failure_releases_route_and_blocks_replacement(
+    tmp_path: Path,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    plan = _plan(spec)
+    reader = PositionalExpertReader(root, use_native=False)
+    fence_error = RuntimeError("injected synchronous Metal fence failure")
+
+    def fail_synchronize() -> None:
+        raise fence_error
+
+    pool = ExpertSlotPool(
+        spec,
+        plan,
+        manifest,
+        reader,
+        device_synchronize=fail_synchronize,
+    )
+    transient_slot = plan.slots_per_layer
+    ready = pool.ensure_route(1, _manual_plan(0, transient_slot))
+    slot = pool._physical(1, transient_slot)
+    generation = ready.generations[0]
+    read_bytes = reader.metrics.as_dict()["read_bytes"]
+
+    try:
+        with pytest.raises(RuntimeError, match="synchronous Metal fence") as released:
+            ready.release()
+        assert released.value is fence_error
+        with slot.condition:
+            assert slot.pins == 0
+            assert slot.expert == 0
+            assert slot.generation == generation
+        assert pool.metrics.as_dict()["active_routes"] == 0
+
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as blocked:
+            pool.ensure_route(1, _manual_plan(1, transient_slot))
+        assert blocked.value.__cause__ is fence_error
+        with slot.condition:
+            assert slot.expert == 0
+            assert slot.generation == generation
+        assert reader.metrics.as_dict()["read_bytes"] == read_bytes
+
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as closed:
+            pool.close(timeout=2)
+        assert closed.value.__cause__ is fence_error
+        assert reader._closed is True
+    finally:
+        with slot.condition:
+            leaked_pin = slot.pins > 0
+        if leaked_pin:
+            ready._finish_slots((slot,))
+        try:
+            pool.close(timeout=2)
+        except ExpertSlotError:
+            pass
+
+
+def test_slot_pool_close_timeout_blocks_admission_and_can_be_retried(
+    tmp_path: Path,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    plan = _plan(spec)
+    reader = PositionalExpertReader(root, use_native=False)
+    pool = ExpertSlotPool(spec, plan, manifest, reader)
+    transient_slot = plan.slots_per_layer
+    active = pool.ensure_route(1, _manual_plan(0, transient_slot))
+
+    try:
+        with pytest.raises(TimeoutError, match="active expert routes"):
+            pool.close(timeout=0)
+        assert pool._closed is False
+        assert pool._closing is True
+        with pytest.raises(ExpertSlotError, match="closing"):
+            pool.ensure_route(1, _manual_plan(1, transient_slot))
+
+        active.release(synchronize=False)
+        pool.close(timeout=2)
+        assert pool._closed is True
+        assert pool._closing is False
+        assert reader._closed is True
+    finally:
+        active.release(synchronize=False)
+        try:
+            pool.close(timeout=2)
+        except ExpertSlotError:
+            pass
+
+
+def test_runtime_close_timeout_is_retryable_after_route_release(
+    tmp_path: Path,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=plan.total_limit_bytes,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        verify_artifact_headers=False,
+    )
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        config,
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    active = runtime.ensure_route(1, [0], phase="decode")
+
+    try:
+        with pytest.raises(TimeoutError, match="active expert routes"):
+            runtime.close(timeout=0)
+        assert runtime._closed is False
+        assert runtime._closing is True
+        with pytest.raises(ExpertSlotError, match="closing"):
+            runtime.ensure_route(1, [1], phase="decode")
+
+        active.release(synchronize=False)
+        runtime.close(timeout=2)
+        assert runtime._closed is True
+        assert runtime._closing is False
+        assert runtime.reader._closed is True
+        assert all(
+            slot.state.value == "closed"
+            for slot in (*runtime.slots._persistent.values(), *runtime.slots._transient)
+        )
+    finally:
+        active.release(synchronize=False)
+        try:
+            runtime.close(timeout=2)
+        finally:
+            if not runtime.reader._closed:
+                runtime.slots.close(timeout=2)
 
 
 def test_runtime_handles_kv_admission_routes_waves_and_reset(tmp_path: Path) -> None:

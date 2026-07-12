@@ -491,6 +491,8 @@ class ExpertStreamingRuntime:
         self._kv_lock = threading.Lock()
         self._live_kv_tokens = 0
         self._live_kv_peak = 0
+        self._close_lock = threading.Lock()
+        self._closing = False
         self._closed = False
         self._mapped_expert_store: Any | None = None
         self._route_trace_lock = threading.Lock()
@@ -632,6 +634,8 @@ class ExpertStreamingRuntime:
     ) -> ReadyRoute:
         if self._closed:
             raise ExpertSlotError("expert streaming runtime is closed")
+        if self._closing:
+            raise ExpertSlotError("expert streaming runtime is closing")
         try:
             lock = self._layer_locks[layer]
         except KeyError as exc:
@@ -652,7 +656,12 @@ class ExpertStreamingRuntime:
                     if load.persistent:
                         self._invalidate_policy_expert(layer, load.expert)
                     try:
-                        self.slots.invalidate(layer, load.slot)
+                        self.slots.invalidate(
+                            layer,
+                            load.slot,
+                            expert=load.expert,
+                            generation=load.generation,
+                        )
                     except ExpertSlotError:
                         pass
                 raise
@@ -678,6 +687,8 @@ class ExpertStreamingRuntime:
 
         if self._closed:
             raise ExpertSlotError("expert streaming runtime is closed")
+        if self._closing:
+            raise ExpertSlotError("expert streaming runtime is closing")
         if self._global_bank is not None:
             return None
         try:
@@ -759,7 +770,12 @@ class ExpertStreamingRuntime:
             if load.persistent:
                 self._invalidate_policy_expert(layer, load.expert)
             try:
-                self.slots.invalidate(layer, load.slot)
+                self.slots.invalidate(
+                    layer,
+                    load.slot,
+                    expert=load.expert,
+                    generation=load.generation,
+                )
             except ExpertSlotError:
                 pass
 
@@ -776,6 +792,8 @@ class ExpertStreamingRuntime:
 
         if self._closed:
             raise ExpertSlotError("expert streaming runtime is closed")
+        if self._closing:
+            raise ExpertSlotError("expert streaming runtime is closing")
         try:
             lock = self._layer_locks[layer]
         except KeyError as exc:
@@ -956,14 +974,24 @@ class ExpertStreamingRuntime:
         return snapshot
 
     def close(self, *, timeout: float | None = None) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._split_executor.shutdown(wait=True, cancel_futures=True)
-        if self._mapped_expert_store is not None:
-            self._mapped_expert_store.close()
-            self._mapped_expert_store = None
-        self.slots.close(timeout=timeout)
+        with self._close_lock:
+            if self._closed:
+                self.slots.close(timeout=timeout)
+                return
+            self._closing = True
+            try:
+                self._split_executor.shutdown(wait=True, cancel_futures=True)
+                if self._mapped_expert_store is not None:
+                    self._mapped_expert_store.close()
+                    self._mapped_expert_store = None
+                self.slots.close(timeout=timeout)
+            except BaseException:
+                if self.slots._closed:
+                    self._closed = True
+                    self._closing = False
+                raise
+            self._closed = True
+            self._closing = False
 
     def __enter__(self) -> ExpertStreamingRuntime:
         return self
