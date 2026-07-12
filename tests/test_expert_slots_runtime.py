@@ -4280,3 +4280,121 @@ def test_yielded_miss_lease_survives_abort_and_close_until_owner_release(
             ready.release(synchronize=False)
         pending.close()
         runtime.close(timeout=2)
+
+
+def test_finish_misses_releases_internal_lease_after_later_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, base_spec, manifest, _expected = _artifact(tmp_path)
+    spec = replace(base_spec, top_k=2)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    first_part = _manual_plan(0, 0)
+    second_part = _manual_plan(1, 1)
+    full_plan = RoutePlan(
+        phase=RoutingPhase.DECODE,
+        experts=(0, 1),
+        slots=(0, 1),
+        hits=(),
+        misses=(0, 1),
+        loads=first_part.loads + second_part.loads,
+        evictions=(),
+    )
+    first_ready = runtime.slots.ensure_route(1, first_part)
+    first_result_seen = threading.Event()
+
+    class ObservedFuture(Future[ReadyRoute]):
+        def result(self, timeout=None):
+            first_result_seen.set()
+            return super().result(timeout=timeout)
+
+    first: Future[ReadyRoute] = ObservedFuture()
+    first.set_result(first_ready)
+    second: Future[ReadyRoute] = Future()
+    assert second.set_running_or_notify_cancel()
+    release_count = 0
+    original_release = first_ready.release
+
+    def count_release(*, synchronize: bool = True) -> None:
+        nonlocal release_count
+        release_count += 1
+        original_release(synchronize=synchronize)
+
+    monkeypatch.setattr(first_ready, "release", count_release)
+    lifecycle = runtime.slots.retain_split_lifecycle()
+    layer_lock = runtime._layer_locks[1]
+    layer_lock.acquire()
+    pending = PendingSplitRoute(
+        runtime=runtime,
+        layer=1,
+        plan=full_plan,
+        layer_lock=layer_lock,
+        hit_ready=None,
+        miss_futures={first: first_part, second: second_part},
+        lifecycle_release=lifecycle.release,
+        miss_parts=(first_part, second_part),
+    )
+    primary_error = RuntimeError("injected later finish_misses failure")
+    finish_executor = ThreadPoolExecutor(max_workers=1)
+    finish_call = finish_executor.submit(pending.finish_misses)
+    layer_released = False
+    try:
+        assert first_result_seen.wait(timeout=2)
+        second.set_exception(primary_error)
+        with pytest.raises(RuntimeError, match="later finish_misses") as failed:
+            finish_call.result(timeout=2)
+        assert failed.value is primary_error
+        pending.close()
+
+        with pending._state_lock:
+            leases = set(pending._consumer_leases)
+            owned_parts = tuple(pending._miss_ready_parts)
+            failure_finalized = pending._failure_finalized
+        physical = runtime.slots._physical(1, 0)
+        with physical.condition:
+            pins = physical.pins
+            loading = physical.state.value == "loading"
+        active_routes = runtime.slots.metrics.as_dict()["active_routes"]
+        layer_released = layer_lock.acquire(blocking=False)
+        if layer_released:
+            layer_lock.release()
+
+        evidence = (
+            f"release_count={release_count}, leases={leases}, owned={owned_parts}, "
+            f"failure_finalized={failure_finalized}, active={active_routes}, "
+            f"pins={pins}, loading={loading}, layer_released={layer_released}"
+        )
+        assert release_count == 1, evidence
+        assert leases == set(), evidence
+        assert owned_parts == (), evidence
+        assert failure_finalized is True, evidence
+        assert active_routes == 0, evidence
+        assert pins == 0, evidence
+        assert loading is False, evidence
+        assert layer_released is True, evidence
+    finally:
+        if not second.done():
+            second.set_exception(RuntimeError("test cleanup"))
+        if not first_ready._released:
+            try:
+                pending.release_miss(first_ready)
+            except ExpertSlotError:
+                first_ready.release(synchronize=False)
+        pending.close()
+        finish_executor.shutdown(wait=True, cancel_futures=True)
+        runtime.close(timeout=2)
