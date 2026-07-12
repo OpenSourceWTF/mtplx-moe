@@ -3787,3 +3787,164 @@ def test_pending_split_abort_preclaims_callbacks_before_concurrent_close(
         pending.close()
         abort_executor.shutdown(wait=True, cancel_futures=True)
         runtime.close(timeout=2)
+
+
+@pytest.mark.parametrize(
+    "cleanup_kind",
+    ["release", "rollback", "lifecycle"],
+)
+def test_deferred_split_cleanup_failure_becomes_sticky_runtime_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_kind: str,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    primary_error = RuntimeError(f"injected primary miss failure before {cleanup_kind}")
+    cleanup_error = RuntimeError(f"injected deferred {cleanup_kind} cleanup failure")
+
+    class DeferredReady:
+        def __init__(self, error: BaseException | None = None) -> None:
+            self.error = error
+            self.releases = 0
+
+        def release(self, *, synchronize: bool = True) -> None:
+            assert synchronize is False
+            self.releases += 1
+            if self.error is not None:
+                raise self.error
+
+    full_plan = RoutePlan(
+        phase=RoutingPhase.DECODE,
+        experts=(0, 1),
+        slots=(0, 1),
+        hits=(),
+        misses=(0, 1),
+        loads=(),
+        evictions=(),
+    )
+    parts = tuple(
+        RoutePlan(
+            phase=RoutingPhase.DECODE,
+            experts=(expert,),
+            slots=(expert,),
+            hits=(),
+            misses=(expert,),
+            loads=(),
+            evictions=(),
+        )
+        for expert in (0, 1)
+    )
+    primary: Future[ReadyRoute] = Future()
+    primary.set_exception(primary_error)
+    sibling: Future[ReadyRoute] = Future()
+    assert sibling.set_running_or_notify_cancel()
+    ready = DeferredReady(cleanup_error if cleanup_kind == "release" else None)
+    lifecycle_releases = 0
+
+    def release_lifecycle() -> None:
+        nonlocal lifecycle_releases
+        lifecycle_releases += 1
+        if cleanup_kind == "lifecycle":
+            raise cleanup_error
+
+    if cleanup_kind == "rollback":
+
+        def fail_rollback(*_args, **_kwargs) -> None:
+            raise cleanup_error
+
+        monkeypatch.setattr(runtime, "_handle_split_route_failure", fail_rollback)
+
+    layer_lock = runtime._layer_locks[1]
+    layer_lock.acquire()
+    pending = PendingSplitRoute(
+        runtime=runtime,
+        layer=1,
+        plan=full_plan,
+        layer_lock=layer_lock,
+        hit_ready=None,
+        miss_futures={primary: parts[0], sibling: parts[1]},
+        lifecycle_release=release_lifecycle,
+        miss_parts=parts,
+    )
+    routes = pending.iter_ready_misses()
+    ensured = None
+    admitted = None
+    snapshot_result = None
+    ensure_error: ExpertSlotError | None = None
+    admission_error: ExpertSlotError | None = None
+    snapshot_error: ExpertSlotError | None = None
+    close_error: ExpertSlotError | None = None
+    try:
+        with pytest.raises(RuntimeError, match="primary miss failure") as primary_seen:
+            next(routes)
+        assert primary_seen.value is primary_error
+        assert sibling.done() is False
+        pending.close()
+
+        sibling.set_result(ready)  # type: ignore[arg-type]
+        assert ready.releases == 1
+        assert pending._cleanup_error is cleanup_error
+        assert lifecycle_releases == 1
+        assert layer_lock.acquire(blocking=False)
+        layer_lock.release()
+
+        try:
+            ensured = runtime.ensure_route(1, [0], phase="decode")
+        except ExpertSlotError as exc:
+            ensure_error = exc
+        if ensured is not None:
+            ensured.release(synchronize=False)
+        try:
+            admitted = runtime.begin_split_route(1, [0], phase="decode")
+        except ExpertSlotError as exc:
+            admission_error = exc
+        if admitted is not None:
+            admitted.close()
+        try:
+            snapshot_result = runtime.snapshot(mx_module=object())
+        except ExpertSlotError as exc:
+            snapshot_error = exc
+        try:
+            runtime.close(timeout=2)
+        except ExpertSlotError as exc:
+            close_error = exc
+
+        errors = (ensure_error, admission_error, snapshot_error, close_error)
+        evidence = (
+            f"kind={cleanup_kind}, "
+            f"ensure_error={ensure_error!r}, "
+            f"admission_error={admission_error!r}, "
+            f"snapshot_succeeded={snapshot_result is not None}, "
+            f"close_error={close_error!r}, "
+            f"runtime_closed={runtime._closed}, slots_closed={runtime.slots._closed}"
+        )
+        assert all(isinstance(error, ExpertSlotError) for error in errors), evidence
+        assert all(error.__cause__ is cleanup_error for error in errors), evidence
+        assert snapshot_result is None, evidence
+        assert runtime._closed is True, evidence
+        assert runtime.slots._closed is True, evidence
+        assert runtime.reader._closed is True, evidence
+    finally:
+        if not sibling.done():
+            sibling.set_exception(RuntimeError("test cleanup"))
+        pending.close()
+        try:
+            runtime.close(timeout=2)
+        except ExpertSlotError:
+            pass
