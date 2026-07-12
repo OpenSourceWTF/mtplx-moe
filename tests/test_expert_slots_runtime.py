@@ -2765,6 +2765,7 @@ def test_incremental_miss_failure_cancels_running_sibling_without_blocking_prima
     worker.start()
     assert consume_started.wait(timeout=2)
     worker.join(timeout=0.25)
+    pending_closed = False
     try:
         assert not worker.is_alive(), "primary failure waited for a running sibling"
         assert observed == [primary_error]
@@ -2772,13 +2773,23 @@ def test_incremental_miss_failure_cancels_running_sibling_without_blocking_prima
         assert captured_cancels[0] is captured_cancels[1]
         assert captured_cancels[0] is not caller_cancel
         assert captured_cancels[0].is_set()
+        pending.close()
+        pending_closed = True
+        layer_lock = runtime._layer_locks[1]
+        assert not layer_lock.acquire(blocking=False), (
+            "failed split released its lifecycle before sibling cleanup"
+        )
     finally:
         sibling.set_result(abandoned)  # type: ignore[arg-type]
         worker.join(timeout=2)
-        pending.close()
+        if not pending_closed:
+            pending.close()
         runtime.close(timeout=2)
     assert not worker.is_alive()
     assert abandoned.releases == 1
+    layer_lock = runtime._layer_locks[1]
+    assert layer_lock.acquire(blocking=False)
+    layer_lock.release()
 
 
 def test_incremental_submit_failure_releases_pinned_hit(
