@@ -937,20 +937,33 @@ class HotExpertSwitchGLU(nn.Module):
                     shared = shared_work()
                     mx.eval(shared)
                 for miss_ready in pending.iter_ready_misses():
-                    ready_experts = set(miss_ready.plan.experts)
-                    miss_positions = tuple(
-                        position
-                        for position, expert in zip(
-                            wave.positions, wave.experts, strict=True
+                    part_error: BaseException | None = None
+                    try:
+                        ready_experts = set(miss_ready.plan.experts)
+                        miss_positions = tuple(
+                            position
+                            for position, expert in zip(
+                                wave.positions, wave.experts, strict=True
+                            )
+                            if expert not in hit_set and expert in ready_experts
                         )
-                        if expert not in hit_set and expert in ready_experts
-                    )
-                    evaluate_bindings(
-                        miss_positions,
-                        miss_ready.bindings,
-                        miss_ready,
-                    )
-                    miss_ready.release(synchronize=False)
+                        evaluate_bindings(
+                            miss_positions,
+                            miss_ready.bindings,
+                            miss_ready,
+                        )
+                    except BaseException as exc:
+                        part_error = exc
+                        raise
+                    finally:
+                        try:
+                            pending.release_miss(miss_ready)
+                        except BaseException:
+                            if part_error is None:
+                                raise
+            except BaseException as exc:
+                pending.abort(exc)
+                raise
             finally:
                 pending.close()
 

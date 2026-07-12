@@ -1852,14 +1852,14 @@ def test_runtime_finite_close_does_not_wait_for_preadmission_split_worker(
     runtime._mapped_expert_store = mapped
     worker_started = threading.Event()
     release_worker = threading.Event()
-    original_ensure = runtime.slots.ensure_route
+    original_ensure = runtime.slots.ensure_route_part
 
     def block_before_admission(*args, **kwargs):
         worker_started.set()
         assert release_worker.wait(timeout=2)
         return original_ensure(*args, **kwargs)
 
-    monkeypatch.setattr(runtime.slots, "ensure_route", block_before_admission)
+    monkeypatch.setattr(runtime.slots, "ensure_route_part", block_before_admission)
     pending = runtime.begin_split_route(1, [0], phase="decode")
     assert worker_started.wait(timeout=2)
     assert runtime.slots.metrics.as_dict()["active_routes"] == 0
@@ -2647,9 +2647,7 @@ def test_decode_split_route_yields_each_miss_in_completion_order(
     save_expert_manifest(manifest, manifest_path)
     config = ExpertStreamingConfig(
         model_key=spec.key,
-        memory_limit_bytes=(
-            spec.resident_bytes + 2 * spec.expert_record_bytes
-        ),
+        memory_limit_bytes=(spec.resident_bytes + 2 * spec.expert_record_bytes),
         max_live_kv_tokens=0,
         runtime_reserve_bytes=0,
         expert_cache_limit_bytes=0,
@@ -2679,12 +2677,15 @@ def test_decode_split_route_yields_each_miss_in_completion_order(
             ready_iter = pending.iter_ready_misses()
             first = next(ready_iter)
             assert tuple(binding.expert for binding in first.bindings) == (1,)
-            first.release(synchronize=False)
 
             release_slow.set()
             second = next(ready_iter)
             assert tuple(binding.expert for binding in second.bindings) == (0,)
-            second.release(synchronize=False)
+            assert runtime.counters.as_dict()["route_calls"] == 1
+            assert runtime.snapshot(mx_module=object())["incremental_misses"] == {
+                "routes": 1,
+                "parts": 2,
+            }
 
             combined = pending.finish_misses()
             assert combined is not None
@@ -2829,7 +2830,10 @@ def test_incremental_submit_failure_releases_pinned_hit(
             runtime.begin_split_route(1, [0, 1], phase="decode")
 
         assert _layer_policy_state(runtime, 1) == policy_before
-        assert runtime.snapshot(mx_module=object())["incremental_misses"] == counters_before
+        assert (
+            runtime.snapshot(mx_module=object())["incremental_misses"]
+            == counters_before
+        )
         slot = runtime.slots._physical(1, 0)
         with slot.condition:
             assert slot.expert == 0
@@ -2844,6 +2848,7 @@ def test_incremental_submit_failure_releases_pinned_hit(
 
 def test_incremental_part_observes_sticky_completion_failure(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, base_spec, manifest, _expected = _artifact(tmp_path)
     spec = replace(base_spec, top_k=2)
@@ -2863,7 +2868,24 @@ def test_incremental_part_observes_sticky_completion_failure(
         spec=spec,
         apply_memory_cap=False,
     )
+    original_ensure = runtime.slots.ensure_route_part
+    completion_lock = threading.Lock()
+    both_parts_completed = threading.Event()
+    completion_count = 0
+
+    def track_completion(*args, **kwargs):
+        nonlocal completion_count
+        ready = original_ensure(*args, **kwargs)
+        with completion_lock:
+            completion_count += 1
+            if completion_count == 2:
+                both_parts_completed.set()
+        return ready
+
+    monkeypatch.setattr(runtime.slots, "ensure_route_part", track_completion)
     pending = runtime.begin_split_route(1, [0, 1], phase="decode")
+    assert both_parts_completed.wait(timeout=2)
+    assert all(future.done() for future in pending._miss_futures)
     parts = pending.iter_ready_misses()
     first = next(parts)
     assert first is not None
@@ -2873,9 +2895,157 @@ def test_incremental_part_observes_sticky_completion_failure(
         with pytest.raises(ExpertSlotError, match="completion fence failed") as failed:
             next(parts)
         assert failed.value.__cause__ is completion_error
+        assert pending._io_admission is not None
+        assert pending._io_admission.any_accepted
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+        slots = (*runtime.slots._persistent.values(), *runtime.slots._transient)
+        for slot in slots:
+            with slot.condition:
+                assert slot.pins == 0
+                assert slot.state.value == "empty"
     finally:
         pending.close()
         try:
             runtime.close(timeout=2)
         except ExpertSlotError:
             pass
+
+
+def test_incremental_failure_keeps_lifecycle_until_deferred_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, base_spec, manifest, _expected = _artifact(tmp_path)
+    spec = replace(base_spec, top_k=2)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    sibling_started = threading.Event()
+    release_sibling = threading.Event()
+    original_ensure = runtime.slots.ensure_route_part
+
+    def gate_second_part(layer, part, **kwargs):
+        if part.misses == (1,):
+            sibling_started.set()
+            assert release_sibling.wait(timeout=2)
+        return original_ensure(layer, part, **kwargs)
+
+    monkeypatch.setattr(runtime.slots, "ensure_route_part", gate_second_part)
+    pending = runtime.begin_split_route(1, [0, 1], phase="decode")
+    parts = pending.iter_ready_misses()
+    try:
+        assert sibling_started.wait(timeout=2)
+        first = next(parts)
+        assert tuple(binding.expert for binding in first.bindings) == (0,)
+        pending.release_miss(first)
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 1
+
+        with pytest.raises(TimeoutError, match="active expert routes"):
+            runtime.close(timeout=0.01)
+        assert runtime._closed is False
+        assert runtime.slots._closed is False
+        assert all(
+            slot.state.value != "closed"
+            for slot in (*runtime.slots._persistent.values(), *runtime.slots._transient)
+        )
+
+        release_sibling.set()
+        with pytest.raises(ExpertSlotError, match="closing"):
+            next(parts)
+        pending.close()
+        runtime.close(timeout=2)
+        assert runtime.slots._closed is True
+    finally:
+        release_sibling.set()
+        pending.close()
+        try:
+            runtime.close(timeout=2)
+        except ExpertSlotError:
+            pass
+
+
+def test_incremental_miss_parts_preserve_first_use_and_duplicate_order() -> None:
+    plan = RoutePlan(
+        phase=RoutingPhase.DECODE,
+        experts=(2, 0, 2, 1),
+        slots=(5, 3, 5, 4),
+        hits=(),
+        misses=(2, 0, 1),
+        loads=(
+            SlotLoad(expert=2, slot=5, persistent=False, generation=7),
+            SlotLoad(expert=0, slot=3, persistent=False, generation=8),
+            SlotLoad(expert=1, slot=4, persistent=False, generation=9),
+        ),
+        evictions=(),
+        generations=(7, 8, 7, 9),
+    )
+
+    parts = ExpertStreamingRuntime._miss_route_parts(plan)
+
+    assert tuple(part.misses for part in parts) == ((2,), (0,), (1,))
+    assert tuple(part.experts for part in parts) == ((2, 2), (0,), (1,))
+    assert tuple(part.slots for part in parts) == ((5, 5), (3,), (4,))
+    assert tuple(part.generations for part in parts) == ((7, 7), (8,), (9,))
+
+
+def test_pending_split_close_releases_all_parts_after_first_release_error() -> None:
+    first_error = RuntimeError("injected first part release failure")
+
+    class FailingPart:
+        def __init__(self, error: BaseException | None = None) -> None:
+            self.error = error
+            self.releases = 0
+
+        def release(self, *, synchronize: bool = True) -> None:
+            assert synchronize is False
+            self.releases += 1
+            if self.error is not None:
+                raise self.error
+
+    first = FailingPart(first_error)
+    second = FailingPart()
+    layer_lock = threading.Lock()
+    layer_lock.acquire()
+    pending = PendingSplitRoute(
+        runtime=object(),
+        layer=1,
+        plan=RoutePlan(
+            phase=RoutingPhase.DECODE,
+            experts=(0, 1),
+            slots=(0, 1),
+            hits=(),
+            misses=(0, 1),
+            loads=(),
+            evictions=(),
+        ),
+        layer_lock=layer_lock,
+        hit_ready=None,
+        miss_futures={},
+    )
+    pending._policy_observed = True
+    pending._miss_ready_parts = {  # type: ignore[assignment]
+        0: first,
+        1: second,
+    }
+
+    with pytest.raises(RuntimeError, match="first part release failure") as failed:
+        pending.close()
+
+    assert failed.value is first_error
+    assert first.releases == 1
+    assert second.releases == 1
+    assert layer_lock.acquire(blocking=False)
+    layer_lock.release()

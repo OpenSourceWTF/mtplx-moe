@@ -289,6 +289,9 @@ class _OverlapPending:
         if ready is not None:
             yield ready
 
+    def release_miss(self, ready) -> None:
+        ready.release(synchronize=False)
+
     def close(self) -> None:
         self.events.append("close")
 
@@ -414,6 +417,8 @@ class _OwnedMissPending:
         self.part = part
         self.owner_releases = 0
         self.closed = False
+        self.failure: BaseException | None = None
+        self.owns_part = True
 
     def release_hits(self) -> None:
         raise AssertionError("all-miss fixture has no hit route")
@@ -421,12 +426,22 @@ class _OwnedMissPending:
     def iter_ready_misses(self):
         yield self.part
 
+    def abort(self, error: BaseException) -> None:
+        self.failure = error
+
+    def release_miss(self, part: _OwnedMissPart) -> None:
+        assert self.owns_part
+        assert part is self.part
+        self.owns_part = False
+        self.owner_releases += 1
+        part.release(synchronize=False)
+
     def close(self) -> None:
         if self.closed:
             return
         self.closed = True
-        self.owner_releases += 1
-        self.part.release(synchronize=False)
+        if self.owns_part:
+            self.release_miss(self.part)
 
 
 class _OwnedMissRuntime(_OverlapRuntime):

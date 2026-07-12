@@ -35,13 +35,16 @@ class RouteIOAdmission:
     """Per-route record of executor work accepted past the rollback boundary."""
 
     accepted_submissions: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
     def any_accepted(self) -> bool:
-        return self.accepted_submissions > 0
+        with self._lock:
+            return self.accepted_submissions > 0
 
     def mark_accepted(self) -> None:
-        self.accepted_submissions += 1
+        with self._lock:
+            self.accepted_submissions += 1
 
 
 class ExpertSlotState(str, Enum):
@@ -333,6 +336,22 @@ class ReadyRoute:
 
     def __exit__(self, *_exc: object) -> None:
         self.release()
+
+
+class _RouteLifecycle:
+    """One extra active-route hold spanning a multi-part transaction."""
+
+    def __init__(self, pool: ExpertSlotPool) -> None:
+        self.pool = pool
+        self._released = False
+        self._lock = threading.Lock()
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self.pool._route_released()
 
 
 class _CombinedCancel:
@@ -859,6 +878,18 @@ class ExpertSlotPool:
                 io_admission=io_admission,
             )
 
+    def retain_split_lifecycle(self) -> _RouteLifecycle:
+        """Keep close from finalizing slots during multi-part commit/rollback."""
+
+        self._raise_completion_error()
+        with self._lifecycle:
+            if self._closed:
+                raise ExpertSlotError("expert slot pool is closed")
+            if self._closing:
+                raise ExpertSlotError("expert slot pool is closing")
+            self.metrics.update(active_routes=1)
+        return _RouteLifecycle(self)
+
     def ensure_route_part(
         self,
         layer: int,
@@ -876,6 +907,9 @@ class ExpertSlotPool:
         completed records to wait behind the slowest read in the layer.
         """
 
+        self._raise_completion_error()
+        if layer not in self._ensure_locks:
+            raise ExpertSlotError(f"layer {layer} is not a routed model layer")
         return self._ensure_route_locked(
             layer,
             plan,
@@ -894,6 +928,7 @@ class ExpertSlotPool:
         io_admission: RouteIOAdmission | None = None,
     ) -> ReadyRoute:
 
+        self._raise_completion_error()
         if len(plan.experts) != len(plan.slots):
             raise ExpertSlotError("route experts and slots differ in length")
         with self._lifecycle:
