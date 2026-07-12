@@ -22,6 +22,14 @@ class ExpertSlotError(RuntimeError):
     pass
 
 
+class ExpertCompletionFenceError(ExpertSlotError):
+    """Sticky completion failure annotated with policy rollback safety."""
+
+    def __init__(self, message: str, *, policy_rollback_safe: bool) -> None:
+        super().__init__(message)
+        self.policy_rollback_safe = bool(policy_rollback_safe)
+
+
 class ExpertSlotState(str, Enum):
     EMPTY = "empty"
     LOADING = "loading"
@@ -148,9 +156,11 @@ class ReadyRoute:
         self._released = False
         self._route_finished = False
         self._release_lock = threading.Lock()
+        self._release_condition = threading.Condition(self._release_lock)
         self._pending_slots = {id(slot): slot for slot in pinned}
         self._scheduled_slots: set[int] = set()
         self._completion_futures: list[Future[None]] = []
+        self._registrations_in_progress = 0
 
     @property
     def slots(self) -> tuple[int, ...]:
@@ -195,7 +205,7 @@ class ReadyRoute:
             selected[id(slot)] = slot
         if not selected:
             return False
-        with self._release_lock:
+        with self._release_condition:
             if self._released:
                 raise ExpertSlotError("cannot fence a released ready route")
             unknown = set(selected) - set(self._pending_slots)
@@ -205,14 +215,24 @@ class ReadyRoute:
             if duplicate:
                 raise ExpertSlotError("slot already has a completion fence")
             self._scheduled_slots.update(selected)
-        future = self.pool._submit_completion_fence(
-            completion_waiter,
-            lambda: self._finish_slots(tuple(selected.values())),
-            slot_count=len(selected),
-        )
-        if future is not None:
-            with self._release_lock:
+            self._registrations_in_progress += 1
+        try:
+            future = self.pool._submit_completion_fence(
+                completion_waiter,
+                lambda: self._finish_slots(tuple(selected.values())),
+                slot_count=len(selected),
+            )
+        except BaseException:
+            with self._release_condition:
+                self._scheduled_slots.difference_update(selected)
+                self._registrations_in_progress -= 1
+                self._release_condition.notify_all()
+            raise
+        with self._release_condition:
+            if future is not None:
                 self._completion_futures.append(future)
+            self._registrations_in_progress -= 1
+            self._release_condition.notify_all()
         return True
 
     def _binding_slots(self) -> tuple[_PhysicalSlot, ...]:
@@ -241,9 +261,11 @@ class ReadyRoute:
             self.pool._route_released()
 
     def release(self, *, synchronize: bool = True) -> None:
-        with self._release_lock:
+        with self._release_condition:
             first_release = not self._released
             self._released = True
+            while self._registrations_in_progress:
+                self._release_condition.wait()
             immediate = (
                 tuple(
                     slot
@@ -289,6 +311,8 @@ class ReadyRoute:
             raise cleanup_error
         if future_error is not None:
             raise ExpertSlotError("expert completion fence failed") from future_error
+        if synchronize:
+            self.pool._raise_completion_error()
 
     def __enter__(self) -> ReadyRoute:
         return self
@@ -475,13 +499,32 @@ class ExpertSlotPool:
             if self._completion_error is None:
                 self._completion_error = error
 
-    def _raise_completion_error(self) -> None:
-        with self._completion_error_lock:
-            error = self._completion_error
+    def _raise_completion_error_locked(
+        self,
+        *,
+        policy_rollback_safe: bool,
+    ) -> None:
+        error = self._completion_error
         if error is not None:
-            raise ExpertSlotError(
-                "an asynchronous expert completion fence failed"
+            raise ExpertCompletionFenceError(
+                "an asynchronous expert completion fence failed",
+                policy_rollback_safe=policy_rollback_safe,
             ) from error
+
+    def _raise_completion_error(
+        self,
+        *,
+        policy_rollback_safe: bool = True,
+    ) -> None:
+        with self._completion_error_lock:
+            self._raise_completion_error_locked(
+                policy_rollback_safe=policy_rollback_safe
+            )
+
+    def raise_if_unhealthy(self) -> None:
+        """Reject new policy or slot work after a terminal fence failure."""
+
+        self._raise_completion_error()
 
     def _drain_completion_fences(self) -> None:
         """Wait for completion tasks queued before this diagnostic snapshot."""
@@ -559,6 +602,7 @@ class ExpertSlotPool:
                     raise ExpertSlotError("expert slot pool is closed")
                 if self._closing:
                     raise ExpertSlotError("expert slot pool is closing")
+                self._raise_completion_error()
                 if (
                     slot.layer == layer
                     and slot.expert == load.expert
@@ -579,6 +623,7 @@ class ExpertSlotPool:
                     slot.condition.wait(self._remaining(deadline_ns))
                     self._raise_completion_error()
                     continue
+                self._raise_completion_error()
                 previous_state = slot.state
                 previous_layer = slot.layer
                 previous_expert = slot.expert
@@ -783,6 +828,7 @@ class ExpertSlotPool:
         except KeyError as exc:
             raise ExpertSlotError(f"layer {layer} is not a routed model layer") from exc
         with layer_lock:
+            self._raise_completion_error()
             return self._ensure_route_locked(
                 layer,
                 plan,
@@ -814,6 +860,7 @@ class ExpertSlotPool:
         prepared_states: list[_PreparedSlotState] = []
         futures: list[Future[None]] = []
         owned_loads: list[tuple[_PhysicalSlot, int, ExpertRecord]] = []
+        io_submitted = False
         try:
             try:
                 for load in plan.loads:
@@ -833,30 +880,39 @@ class ExpertSlotPool:
                         owned_loads.append((slot, generation, record))
                         assert previous is not None
                         prepared_states.append(previous)
-            except BaseException:
-                self._restore_prepared_slots(prepared_states)
-                raise
-            if self._can_batch_component_sidecar(plan, owned_loads):
-                futures.append(
-                    self._executor.submit(
-                        self._fill_batch,
-                        tuple(owned_loads),
-                        cancel_event=combined_cancel,
-                        deadline_ns=deadline_ns,
-                    )
-                )
-            else:
-                for slot, generation, record in owned_loads:
-                    futures.append(
-                        self._executor.submit(
-                            self._fill,
-                            slot,
-                            generation,
-                            record,
+                use_batch = self._can_batch_component_sidecar(plan, owned_loads)
+                # Completion failure recording uses this same lock.  Keeping
+                # it through every submission makes the rollback boundary
+                # exact: either no read was accepted, or policy restoration is
+                # conservatively unsafe because at least one read may replace
+                # a victim generation.
+                with self._completion_error_lock:
+                    self._raise_completion_error_locked(policy_rollback_safe=True)
+                    if use_batch:
+                        future = self._executor.submit(
+                            self._fill_batch,
+                            tuple(owned_loads),
                             cancel_event=combined_cancel,
                             deadline_ns=deadline_ns,
                         )
-                    )
+                        io_submitted = True
+                        futures.append(future)
+                    else:
+                        for slot, generation, record in owned_loads:
+                            future = self._executor.submit(
+                                self._fill,
+                                slot,
+                                generation,
+                                record,
+                                cancel_event=combined_cancel,
+                                deadline_ns=deadline_ns,
+                            )
+                            io_submitted = True
+                            futures.append(future)
+            except BaseException:
+                if not io_submitted:
+                    self._restore_prepared_slots(prepared_states)
+                raise
             future_error: BaseException | None = None
             for future in futures:
                 try:
@@ -914,6 +970,10 @@ class ExpertSlotPool:
                             f"manifest has no expert record ({layer}, {expert})"
                         ) from exc
                     with slot.condition:
+                        if io_submitted:
+                            self._raise_completion_error(policy_rollback_safe=False)
+                        else:
+                            self._raise_completion_error()
                         if id(slot) not in unique_pins:
                             slot.pins += 1
                             unique_pins[id(slot)] = slot
@@ -927,6 +987,10 @@ class ExpertSlotPool:
                                 buffer=slot.buffer,
                             )
                         )
+                if io_submitted:
+                    self._raise_completion_error(policy_rollback_safe=False)
+                else:
+                    self._raise_completion_error()
             except BaseException:
                 for slot in unique_pins.values():
                     with slot.condition:
@@ -1022,7 +1086,13 @@ class ExpertSlotPool:
 
     def close(self, *, timeout: float | None = None) -> None:
         deadline = None if timeout is None else time.monotonic() + timeout
-        with self._close_lock:
+        if deadline is None:
+            self._close_lock.acquire()
+        else:
+            remaining = max(0.0, deadline - time.monotonic())
+            if not self._close_lock.acquire(timeout=remaining):
+                raise TimeoutError("expert slot close already in progress at deadline")
+        try:
             with self._lifecycle:
                 if not self._closed:
                     self._closing = True
@@ -1053,6 +1123,8 @@ class ExpertSlotPool:
                     self._closing = False
                     self._lifecycle.notify_all()
             self._raise_completion_error()
+        finally:
+            self._close_lock.release()
 
     def __enter__(self) -> ExpertSlotPool:
         return self

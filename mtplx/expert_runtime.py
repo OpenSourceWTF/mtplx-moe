@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,12 +18,18 @@ from .expert_manifest import (
     load_expert_manifest,
     verify_expert_manifest,
 )
-from .expert_slots import ExpertSlotError, ExpertSlotPool, ReadyRoute
+from .expert_slots import (
+    ExpertCompletionFenceError,
+    ExpertSlotError,
+    ExpertSlotPool,
+    ReadyRoute,
+)
 from .expert_streaming import (
     CacheCounters,
     GlobalExpertSlotBank,
     LayerExpertSlotBank,
     RoutePlan,
+    RoutePolicyTxn,
     RoutingPhase,
 )
 from .expert_streaming_models import (
@@ -279,10 +286,13 @@ class PendingSplitRoute:
         layer_lock: threading.Lock,
         hit_ready: ReadyRoute | None,
         miss_future: Future[ReadyRoute] | None,
+        policy_txn: RoutePolicyTxn | None = None,
     ) -> None:
         self.runtime = runtime
         self.layer = layer
         self.plan = plan
+        self._policy_txn = policy_txn or RoutePolicyTxn(rollback=lambda: None)
+        self._policy_observed = False
         self.hit_ready = hit_ready
         self._miss_future = miss_future
         self._miss_ready: ReadyRoute | None = None
@@ -305,14 +315,31 @@ class PendingSplitRoute:
             return self._miss_ready
         if self._miss_future is None:
             return None
+        miss_ready: ReadyRoute | None = None
         try:
-            self._miss_ready = self._miss_future.result()
-        except BaseException:
-            self.runtime._rollback_route_loads(self.layer, self.plan)
+            miss_ready = self._miss_future.result()
+            self._commit_policy()
+            self._miss_ready = miss_ready
+        except BaseException as exc:
+            if miss_ready is not None:
+                miss_ready.release(synchronize=False)
+            self.runtime._handle_route_failure(
+                self.layer,
+                self.plan,
+                self._policy_txn,
+                exc,
+            )
             raise
         finally:
             self._miss_future = None
         return self._miss_ready
+
+    def _commit_policy(self) -> None:
+        if self._policy_observed:
+            return
+        self._policy_txn.commit()
+        self.runtime._observe_plan(self.layer, self.plan)
+        self._policy_observed = True
 
     def close(self) -> None:
         if self._closed:
@@ -643,7 +670,13 @@ class ExpertStreamingRuntime:
                 f"layer {layer} is not routed for {self.spec.key}"
             ) from exc
         with lock:
-            route_plan = self._plan_route(layer, expert_ids, phase=phase)
+            self.slots.raise_if_unhealthy()
+            route_plan, policy_txn = self._plan_route_transaction(
+                layer,
+                expert_ids,
+                phase=phase,
+            )
+            ready: ReadyRoute | None = None
             try:
                 ready = self.slots.ensure_route(
                     layer,
@@ -651,21 +684,19 @@ class ExpertStreamingRuntime:
                     cancel_event=cancel_event,
                     deadline_ns=deadline_ns,
                 )
-            except BaseException:
-                for load in route_plan.loads:
-                    if load.persistent:
-                        self._invalidate_policy_expert(layer, load.expert)
-                    try:
-                        self.slots.invalidate(
-                            layer,
-                            load.slot,
-                            expert=load.expert,
-                            generation=load.generation,
-                        )
-                    except ExpertSlotError:
-                        pass
+                policy_txn.commit()
+            except BaseException as exc:
+                if ready is not None:
+                    ready.release(synchronize=False)
+                self._handle_route_failure(
+                    layer,
+                    route_plan,
+                    policy_txn,
+                    exc,
+                )
                 raise
             self._observe_plan(layer, route_plan)
+            assert ready is not None
             return ready
 
     def try_all_hit_route(
@@ -699,15 +730,25 @@ class ExpertStreamingRuntime:
                 f"layer {layer} is not routed for {self.spec.key}"
             ) from exc
         with lock:
-            route_plan = bank.try_plan_all_hits(expert_ids, phase=phase)
-            if route_plan is None:
+            self.slots.raise_if_unhealthy()
+            planned = bank.try_plan_all_hits_transaction(expert_ids, phase=phase)
+            if planned is None:
                 return None
-            ready = self.slots.ensure_route(
-                layer,
-                route_plan,
-                cancel_event=cancel_event,
-                deadline_ns=deadline_ns,
-            )
+            route_plan, policy_txn = planned
+            try:
+                ready = self.slots.ensure_route(
+                    layer,
+                    route_plan,
+                    cancel_event=cancel_event,
+                    deadline_ns=deadline_ns,
+                )
+            except BaseException:
+                # A successful all-hit probe has no loads and therefore can
+                # never cross the destructive I/O boundary.  Any pin-path
+                # failure must restore its decode history and epoch exactly.
+                policy_txn.rollback_completion()
+                raise
+            policy_txn.commit()
             self._observe_plan(layer, route_plan)
             return ready
 
@@ -736,6 +777,21 @@ class ExpertStreamingRuntime:
             return self._global_bank.plan(layer, expert_ids, phase=phase)
         return self._banks[layer].plan(expert_ids, phase=phase)
 
+    def _plan_route_transaction(
+        self,
+        layer: int,
+        expert_ids: Iterable[int],
+        *,
+        phase: RoutingPhase | str,
+    ) -> tuple[RoutePlan, RoutePolicyTxn]:
+        if self._global_bank is not None:
+            return self._global_bank.plan_transaction(
+                layer,
+                expert_ids,
+                phase=phase,
+            )
+        return self._banks[layer].plan_transaction(expert_ids, phase=phase)
+
     def _invalidate_policy_expert(self, layer: int, expert: int) -> int | None:
         if self._global_bank is not None:
             return self._global_bank.invalidate_expert(layer, expert)
@@ -748,11 +804,14 @@ class ExpertStreamingRuntime:
         hits: bool,
     ) -> RoutePlan | None:
         hit_set = set(plan.hits)
-        selected = [
-            (expert, slot)
-            for expert, slot in zip(plan.experts, plan.slots, strict=True)
+        selected_indices = [
+            index
+            for index, expert in enumerate(plan.experts)
             if (expert in hit_set) is hits
         ]
+        selected = tuple(
+            (plan.experts[index], plan.slots[index]) for index in selected_indices
+        )
         if not selected:
             return None
         return RoutePlan(
@@ -763,6 +822,11 @@ class ExpertStreamingRuntime:
             misses=() if hits else plan.misses,
             loads=() if hits else plan.loads,
             evictions=() if hits else plan.evictions,
+            generations=(
+                tuple(plan.generations[index] for index in selected_indices)
+                if plan.generations
+                else ()
+            ),
         )
 
     def _rollback_route_loads(self, layer: int, plan: RoutePlan) -> None:
@@ -778,6 +842,18 @@ class ExpertStreamingRuntime:
                 )
             except ExpertSlotError:
                 pass
+
+    def _handle_route_failure(
+        self,
+        layer: int,
+        plan: RoutePlan,
+        policy_txn: RoutePolicyTxn,
+        error: BaseException,
+    ) -> None:
+        if isinstance(error, ExpertCompletionFenceError) and error.policy_rollback_safe:
+            policy_txn.rollback_completion()
+            return
+        self._rollback_route_loads(layer, plan)
 
     def begin_split_route(
         self,
@@ -801,10 +877,17 @@ class ExpertStreamingRuntime:
                 f"layer {layer} is not routed for {self.spec.key}"
             ) from exc
         lock.acquire()
-        plan = None
-        miss_future = None
+        plan: RoutePlan | None = None
+        policy_txn: RoutePolicyTxn | None = None
+        hit_ready: ReadyRoute | None = None
+        miss_future: Future[ReadyRoute] | None = None
         try:
-            plan = self._plan_route(layer, expert_ids, phase=phase)
+            self.slots.raise_if_unhealthy()
+            plan, policy_txn = self._plan_route_transaction(
+                layer,
+                expert_ids,
+                phase=phase,
+            )
             hit_plan = self._subset_route_plan(plan, hits=True)
             miss_plan = self._subset_route_plan(plan, hits=False)
             hit_ready = (
@@ -828,15 +911,18 @@ class ExpertStreamingRuntime:
                 if miss_plan is not None
                 else None
             )
-            self._observe_plan(layer, plan)
-            return PendingSplitRoute(
-                self,
-                layer,
-                plan,
-                lock,
-                hit_ready,
-                miss_future,
+            pending = PendingSplitRoute(
+                runtime=self,
+                layer=layer,
+                plan=plan,
+                layer_lock=lock,
+                hit_ready=hit_ready,
+                miss_future=miss_future,
+                policy_txn=policy_txn,
             )
+            if miss_future is None:
+                pending._commit_policy()
+            return pending
         except BaseException:
             # Mirror the sync-path rollback: without it, a failed hit pin or
             # submit leaves the bank mapping experts to never-loaded slots,
@@ -847,8 +933,13 @@ class ExpertStreamingRuntime:
                     miss_future.result()
                 except BaseException:
                     pass
-            if plan is not None:
-                self._rollback_route_loads(layer, plan)
+            if hit_ready is not None:
+                hit_ready.release(synchronize=False)
+            if policy_txn is not None:
+                # No future was accepted when setup itself fails, so neither
+                # policy mappings nor victim generations may have crossed the
+                # destructive I/O boundary.
+                policy_txn.rollback_completion()
             lock.release()
             raise
 
@@ -974,24 +1065,40 @@ class ExpertStreamingRuntime:
         return snapshot
 
     def close(self, *, timeout: float | None = None) -> None:
-        with self._close_lock:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        if deadline is None:
+            self._close_lock.acquire()
+        else:
+            remaining = max(0.0, deadline - time.monotonic())
+            if not self._close_lock.acquire(timeout=remaining):
+                raise TimeoutError(
+                    "expert streaming runtime close already in progress at deadline"
+                )
+        try:
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
             if self._closed:
-                self.slots.close(timeout=timeout)
+                self.slots.close(timeout=remaining)
                 return
             self._closing = True
+            slots_error: BaseException | None = None
             try:
-                self._split_executor.shutdown(wait=True, cancel_futures=True)
-                if self._mapped_expert_store is not None:
-                    self._mapped_expert_store.close()
-                    self._mapped_expert_store = None
-                self.slots.close(timeout=timeout)
-            except BaseException:
-                if self.slots._closed:
-                    self._closed = True
-                    self._closing = False
-                raise
+                self.slots.close(timeout=remaining)
+            except BaseException as exc:
+                if not self.slots._closed:
+                    raise
+                slots_error = exc
+            self._split_executor.shutdown(wait=True, cancel_futures=True)
+            if self._mapped_expert_store is not None:
+                self._mapped_expert_store.close()
+                self._mapped_expert_store = None
             self._closed = True
             self._closing = False
+            if slots_error is not None:
+                raise slots_error
+        finally:
+            self._close_lock.release()
 
     def __enter__(self) -> ExpertStreamingRuntime:
         return self

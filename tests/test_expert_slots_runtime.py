@@ -56,6 +56,34 @@ COMPONENTS = (
 )
 
 
+class _CloseTrackingResource:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _ObservedLock:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.acquire_attempted = threading.Event()
+
+    def acquire(self, *args, **kwargs) -> bool:
+        self.acquire_attempted.set()
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.release()
+
+
 def _spec() -> ExpertStreamingModelSpec:
     record_bytes = sum(item[1] for item in COMPONENTS)
     return ExpertStreamingModelSpec(
@@ -160,6 +188,133 @@ def _artifact(
     return root, spec, manifest, expected
 
 
+def _global_artifact(
+    tmp_path: Path,
+) -> tuple[
+    Path,
+    ExpertStreamingModelSpec,
+    ExpertManifest,
+    dict[tuple[int, int], bytes],
+]:
+    root = tmp_path / "global-artifact"
+    root.mkdir()
+    record_bytes = sum(item[1] for item in COMPONENTS)
+    spec = replace(
+        _spec(),
+        key="tiny-global-q4",
+        display_name="Tiny Global Q4",
+        total_tensor_bytes=4 * record_bytes + 1,
+        total_layers=3,
+        routed_layer_count=2,
+        mtp_layer_index=3,
+    )
+    raw = bytearray()
+    records: list[ExpertRecord] = []
+    expected: dict[tuple[int, int], bytes] = {}
+    for layer in spec.routed_layer_indices:
+        for expert in range(spec.expert_count):
+            segments: list[TensorSegment] = []
+            record_payload = bytearray()
+            for component_index, (component, length, dtype, shape) in enumerate(
+                COMPONENTS
+            ):
+                payload = (
+                    bytes([layer * 64 + expert * 16 + component_index + 1]) * length
+                )
+                offset = len(raw)
+                raw.extend(payload)
+                record_payload.extend(payload)
+                segments.append(
+                    TensorSegment(
+                        component=component,
+                        tensor=(f"model.layers.{layer}.mlp.switch_mlp.{component}"),
+                        shard="source.bin",
+                        offset=offset,
+                        length=length,
+                        dtype=dtype,
+                        shape=shape,
+                    )
+                )
+            expected[(layer, expert)] = bytes(record_payload)
+            records.append(
+                ExpertRecord(
+                    layer=layer,
+                    expert=expert,
+                    logical_bytes=len(record_payload),
+                    segments=tuple(segments),
+                    sha256=hashlib.sha256(record_payload).hexdigest(),
+                )
+            )
+    resident_offset = len(raw)
+    raw.append(123)
+    (root / "source.bin").write_bytes(raw)
+    manifest = ExpertManifest(
+        model_key=spec.key,
+        source_repo=spec.quant_model,
+        source_revision=spec.quant_revision,
+        quant_bits=4,
+        quant_group_size=64,
+        quant_mode="affine",
+        artifact_tensor_bytes=spec.total_tensor_bytes,
+        resident_tensor_bytes=1,
+        routed_expert_bytes=spec.routed_expert_bytes,
+        shards=(
+            ShardInfo(
+                name="source.bin",
+                size=len(raw),
+                header_bytes=1,
+                header_sha256="fixture-header",
+            ),
+        ),
+        resident_tensors=(
+            ResidentTensor(
+                tensor="model.norm.flag",
+                shard="source.bin",
+                offset=resident_offset,
+                length=1,
+                dtype="U8",
+                shape=(1,),
+            ),
+        ),
+        records=tuple(records),
+    ).with_digest()
+    manifest.validate_structure()
+    return root, spec, manifest, expected
+
+
+def _global_policy_state(runtime: ExpertStreamingRuntime) -> dict[str, object]:
+    bank = runtime._global_bank
+    assert bank is not None
+    return {
+        "decode_epoch": bank._decode_epoch,
+        "slot_to_key": tuple(bank._slot_to_key),
+        "key_to_slot": dict(bank._key_to_slot),
+        "directory": tuple(
+            sorted(
+                (key, entry.slot, entry.generation, entry.state)
+                for key, entry in bank._directory.items()
+            )
+        ),
+        "slot_generations": tuple(bank._slot_generations),
+        "free_slots": tuple(bank._free_slots),
+        "free_slot_set": set(bank._free_slot_set),
+        "lru": tuple(bank._lru.items()),
+        "history": tuple(
+            sorted(
+                (key, value.score, value.score_epoch, value.last_used)
+                for key, value in bank._history.items()
+            )
+        ),
+        "layer_occupancy": dict(bank._layer_occupancy),
+        "evictions": bank._evictions,
+        "cross_layer_evictions": bank._cross_layer_evictions,
+        "prefill_seed_candidates": tuple(
+            (layer, frozenset(experts))
+            for layer, experts in sorted(bank._prefill_seed_candidates.items())
+        ),
+    }
+
+
 def _plan(spec: ExpertStreamingModelSpec):
     fixed = spec.resident_bytes + spec.transient_scratch_bytes
     return plan_expert_memory(
@@ -167,6 +322,17 @@ def _plan(spec: ExpertStreamingModelSpec):
         total_limit_bytes=fixed + spec.persistent_cache_bytes(1),
         context_tokens=0,
         runtime_reserve_bytes=0,
+    )
+
+
+def _global_plan(spec: ExpertStreamingModelSpec, *, persistent_slots: int = 2):
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    return plan_expert_memory(
+        spec,
+        total_limit_bytes=fixed + persistent_slots * spec.expert_record_bytes,
+        context_tokens=0,
+        runtime_reserve_bytes=0,
+        cache_scope="global",
     )
 
 
@@ -350,6 +516,101 @@ def test_completion_fence_holds_generation_until_consumer_finishes(
     pool.close()
 
 
+def test_completion_fence_registration_rolls_back_non_runtime_submit_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    plan = _plan(spec)
+    reader = PositionalExpertReader(root, use_native=False)
+    pool = ExpertSlotPool(spec, plan, manifest, reader)
+    ready = pool.ensure_route(1, _manual_plan(0, plan.slots_per_layer))
+
+    def reject_submit(*_args, **_kwargs):
+        raise ValueError("injected non-runtime completion submit rejection")
+
+    monkeypatch.setattr(pool._completion_executor, "submit", reject_submit)
+    try:
+        with pytest.raises(ValueError, match="non-runtime completion submit"):
+            ready.defer_bindings_until(ready.bindings, lambda: None)
+        assert ready._scheduled_slots == set()
+
+        ready.release(synchronize=False)
+        slot = pool._physical(1, plan.slots_per_layer)
+        with slot.condition:
+            assert slot.pins == 0
+        assert pool.metrics.as_dict()["active_routes"] == 0
+    finally:
+        with ready._release_lock:
+            ready._scheduled_slots.clear()
+        ready.release(synchronize=False)
+        pool.close(timeout=2)
+
+
+def test_completion_fence_release_waits_for_concurrent_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    plan = _plan(spec)
+    reader = PositionalExpertReader(root, use_native=False)
+    pool = ExpertSlotPool(spec, plan, manifest, reader)
+    ready = pool.ensure_route(1, _manual_plan(0, plan.slots_per_layer))
+    registration_submitted = threading.Event()
+    finish_registration = threading.Event()
+    fail_completion = threading.Event()
+    fence_error = RuntimeError("concurrent registration fence failure")
+    original_submit = pool._submit_completion_fence
+
+    def wait_then_fail() -> None:
+        assert fail_completion.wait(timeout=2)
+        raise fence_error
+
+    def pause_after_submit(*args, **kwargs):
+        future = original_submit(*args, **kwargs)
+        registration_submitted.set()
+        assert finish_registration.wait(timeout=2)
+        return future
+
+    monkeypatch.setattr(pool, "_submit_completion_fence", pause_after_submit)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        registration = executor.submit(
+            ready.defer_bindings_until,
+            ready.bindings,
+            wait_then_fail,
+        )
+        assert registration_submitted.wait(timeout=2)
+        release = executor.submit(ready.release)
+        try:
+            with pytest.raises(TimeoutError):
+                release.result(timeout=0.05)
+            finish_registration.set()
+            assert registration.result(timeout=2) is True
+            fail_completion.set()
+            with pytest.raises(ExpertSlotError, match="completion fence failed") as exc:
+                release.result(timeout=2)
+            assert exc.value.__cause__ is fence_error
+        finally:
+            finish_registration.set()
+            fail_completion.set()
+            try:
+                registration.result(timeout=2)
+            except BaseException:
+                pass
+            try:
+                release.result(timeout=2)
+            except BaseException:
+                pass
+
+    slot = pool._physical(1, plan.slots_per_layer)
+    with slot.condition:
+        assert slot.pins == 0
+    assert ready._scheduled_slots == set()
+    assert pool.metrics.as_dict()["active_routes"] == 0
+    with pytest.raises(ExpertSlotError, match="completion fence failed"):
+        pool.close(timeout=2)
+
+
 def test_completion_fence_failure_releases_pin_and_fails_next_route(
     tmp_path: Path,
 ) -> None:
@@ -455,6 +716,15 @@ def test_runtime_completion_fence_failure_preserves_waiting_victim(
         apply_memory_cap=False,
     )
     first = runtime.ensure_route(1, [0], phase="decode")
+    bank = runtime._banks[1]
+    policy_before = (
+        bank.resident_experts,
+        bank._decode_epoch,
+        tuple(
+            (history.score, history.score_epoch, history.last_used)
+            for history in bank._history
+        ),
+    )
     slot = runtime.slots._physical(1, 0)
     generation = first.generations[0]
     read_bytes = runtime.reader.metrics.as_dict()["read_bytes"]
@@ -490,6 +760,529 @@ def test_runtime_completion_fence_failure_preserves_waiting_victim(
         assert exc.value.__cause__ is fence_error
         with slot.condition:
             assert slot.state.value == "ready"
+            assert slot.expert == 0
+            assert slot.generation == generation
+            assert slot.pins == 0
+        assert runtime.reader.metrics.as_dict()["read_bytes"] == read_bytes
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+        assert (
+            bank.resident_experts,
+            bank._decode_epoch,
+            tuple(
+                (history.score, history.score_epoch, history.last_used)
+                for history in bank._history
+            ),
+        ) == policy_before
+    finally:
+        fail_completion.set()
+        if replacement_ready is not None:
+            replacement_ready.release(synchronize=False)
+        try:
+            runtime.close(timeout=2)
+        except ExpertSlotError:
+            pass
+
+
+def test_completion_fence_failure_while_waiting_runtime_lock_skips_policy_plan(
+    tmp_path: Path,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+            cache_policy="lru",
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    first = runtime.ensure_route(1, [0], phase="decode")
+    bank = runtime._banks[1]
+    policy_before = (
+        bank.resident_experts,
+        bank._decode_epoch,
+        tuple(
+            (history.score, history.score_epoch, history.last_used)
+            for history in bank._history
+        ),
+    )
+    slot = runtime.slots._physical(1, 0)
+    generation = first.generations[0]
+    read_bytes = runtime.reader.metrics.as_dict()["read_bytes"]
+    completion_started = threading.Event()
+    fail_completion = threading.Event()
+    fence_error = RuntimeError("fence failure while waiting on runtime layer lock")
+    observed_lock = _ObservedLock()
+    observed_lock._lock.acquire()
+    runtime._layer_locks[1] = observed_lock
+    replacement_ready = None
+    lock_held = True
+
+    def wait_then_fail() -> None:
+        completion_started.set()
+        assert fail_completion.wait(timeout=2)
+        raise fence_error
+
+    try:
+        first.defer_bindings_until(first.bindings, wait_then_fail)
+        first.release(synchronize=False)
+        assert completion_started.wait(timeout=2)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending = executor.submit(
+                runtime.ensure_route,
+                1,
+                [1],
+                phase="decode",
+            )
+            assert observed_lock.acquire_attempted.wait(timeout=2)
+            fail_completion.set()
+            runtime.slots._drain_completion_fences()
+            observed_lock._lock.release()
+            lock_held = False
+            with pytest.raises(ExpertSlotError, match="completion fence failed") as exc:
+                replacement_ready = pending.result(timeout=2)
+
+        assert exc.value.__cause__ is fence_error
+        assert (
+            bank.resident_experts,
+            bank._decode_epoch,
+            tuple(
+                (history.score, history.score_epoch, history.last_used)
+                for history in bank._history
+            ),
+        ) == policy_before
+        with slot.condition:
+            assert slot.state.value == "ready"
+            assert slot.expert == 0
+            assert slot.generation == generation
+            assert slot.pins == 0
+        assert runtime.reader.metrics.as_dict()["read_bytes"] == read_bytes
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+    finally:
+        fail_completion.set()
+        if lock_held:
+            observed_lock._lock.release()
+        if replacement_ready is not None:
+            replacement_ready.release(synchronize=False)
+        try:
+            runtime.close(timeout=2)
+        except ExpertSlotError:
+            pass
+
+
+def test_completion_fence_failure_after_layer_lock_precheck_blocks_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+            cache_policy="lru",
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    first = runtime.ensure_route(1, [0], phase="decode")
+    bank = runtime._banks[1]
+    policy_before = (
+        bank.resident_experts,
+        bank._decode_epoch,
+        tuple(
+            (history.score, history.score_epoch, history.last_used)
+            for history in bank._history
+        ),
+    )
+    slot = runtime.slots._physical(1, 0)
+    generation = first.generations[0]
+    read_bytes = runtime.reader.metrics.as_dict()["read_bytes"]
+    completion_started = threading.Event()
+    fail_completion = threading.Event()
+    precheck_complete = threading.Event()
+    fence_error = RuntimeError("fence failure while replacement waits on layer lock")
+    replacement_ready = None
+    layer_lock = runtime.slots._ensure_locks[1]
+    lock_held = False
+
+    def wait_then_fail() -> None:
+        completion_started.set()
+        assert fail_completion.wait(timeout=2)
+        raise fence_error
+
+    original_raise = runtime.slots._raise_completion_error
+
+    def observe_precheck() -> None:
+        precheck_complete.set()
+        original_raise()
+
+    monkeypatch.setattr(runtime.slots, "_raise_completion_error", observe_precheck)
+
+    try:
+        first.defer_bindings_until(first.bindings, wait_then_fail)
+        first.release(synchronize=False)
+        assert completion_started.wait(timeout=2)
+        layer_lock.acquire()
+        lock_held = True
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            replacement = executor.submit(
+                runtime.ensure_route,
+                1,
+                [1],
+                phase="decode",
+            )
+            assert precheck_complete.wait(timeout=2)
+            fail_completion.set()
+            runtime.slots._drain_completion_fences()
+            with slot.condition:
+                assert slot.pins == 0
+            layer_lock.release()
+            lock_held = False
+            with pytest.raises(ExpertSlotError, match="completion fence failed") as exc:
+                replacement_ready = replacement.result(timeout=2)
+
+        assert exc.value.__cause__ is fence_error
+        with slot.condition:
+            assert slot.state.value == "ready"
+            assert slot.expert == 0
+            assert slot.generation == generation
+            assert slot.pins == 0
+        assert runtime.reader.metrics.as_dict()["read_bytes"] == read_bytes
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+        assert (
+            bank.resident_experts,
+            bank._decode_epoch,
+            tuple(
+                (history.score, history.score_epoch, history.last_used)
+                for history in bank._history
+            ),
+        ) == policy_before
+
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as visible:
+            runtime.snapshot(mx_module=object())
+        assert visible.value.__cause__ is fence_error
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as closed:
+            runtime.close(timeout=2)
+        assert closed.value.__cause__ is fence_error
+        assert runtime.reader._closed is True
+    finally:
+        fail_completion.set()
+        if lock_held:
+            layer_lock.release()
+        if replacement_ready is not None:
+            replacement_ready.release(synchronize=False)
+        try:
+            runtime.close(timeout=2)
+        except ExpertSlotError:
+            pass
+
+
+def test_completion_fence_failure_after_post_lock_check_blocks_all_hit_pin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+            cache_policy="lru",
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    first = runtime.ensure_route(1, [0], phase="decode")
+    bank = runtime._banks[1]
+    policy_before = (
+        bank.resident_experts,
+        bank._decode_epoch,
+        tuple(
+            (history.score, history.score_epoch, history.last_used)
+            for history in bank._history
+        ),
+    )
+    slot = runtime.slots._physical(1, 0)
+    generation = first.generations[0]
+    read_bytes = runtime.reader.metrics.as_dict()["read_bytes"]
+    completion_started = threading.Event()
+    fail_completion = threading.Event()
+    entered_locked_route = threading.Event()
+    continue_locked_route = threading.Event()
+    fence_error = RuntimeError("fence failure after all-hit post-lock check")
+    all_hit_ready = None
+
+    def wait_then_fail() -> None:
+        completion_started.set()
+        assert fail_completion.wait(timeout=2)
+        raise fence_error
+
+    original_ensure_locked = runtime.slots._ensure_route_locked
+
+    def block_after_post_lock_check(
+        layer: int,
+        route: RoutePlan,
+        *,
+        cancel_event: threading.Event | None,
+        deadline_ns: int | None,
+    ):
+        entered_locked_route.set()
+        assert continue_locked_route.wait(timeout=2)
+        return original_ensure_locked(
+            layer,
+            route,
+            cancel_event=cancel_event,
+            deadline_ns=deadline_ns,
+        )
+
+    monkeypatch.setattr(
+        runtime.slots, "_ensure_route_locked", block_after_post_lock_check
+    )
+
+    try:
+        first.defer_bindings_until(first.bindings, wait_then_fail)
+        first.release(synchronize=False)
+        assert completion_started.wait(timeout=2)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending = executor.submit(
+                runtime.try_all_hit_route,
+                1,
+                [0],
+                phase="decode",
+            )
+            assert entered_locked_route.wait(timeout=2)
+            fail_completion.set()
+            runtime.slots._drain_completion_fences()
+            with slot.condition:
+                assert slot.pins == 0
+            continue_locked_route.set()
+            with pytest.raises(ExpertSlotError, match="completion fence failed") as exc:
+                all_hit_ready = pending.result(timeout=2)
+
+        assert exc.value.__cause__ is fence_error
+        with slot.condition:
+            assert slot.state.value == "ready"
+            assert slot.expert == 0
+            assert slot.generation == generation
+            assert slot.pins == 0
+        assert runtime.reader.metrics.as_dict()["read_bytes"] == read_bytes
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+        assert (
+            bank.resident_experts,
+            bank._decode_epoch,
+            tuple(
+                (history.score, history.score_epoch, history.last_used)
+                for history in bank._history
+            ),
+        ) == policy_before
+
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as visible:
+            runtime.snapshot(mx_module=object())
+        assert visible.value.__cause__ is fence_error
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as closed:
+            runtime.close(timeout=2)
+        assert closed.value.__cause__ is fence_error
+        assert runtime.reader._closed is True
+    finally:
+        fail_completion.set()
+        continue_locked_route.set()
+        if all_hit_ready is not None:
+            all_hit_ready.release(synchronize=False)
+        try:
+            runtime.close(timeout=2)
+        except ExpertSlotError:
+            pass
+
+
+def test_all_hit_generic_pin_failure_rolls_back_policy_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    first = runtime.ensure_route(1, [0], phase="decode")
+    first.release(synchronize=False)
+    bank = runtime._banks[1]
+    policy_before = (
+        bank._decode_epoch,
+        tuple(
+            (history.score, history.score_epoch, history.last_used)
+            for history in bank._history
+        ),
+    )
+
+    def reject_pin(*_args, **_kwargs):
+        raise ValueError("injected all-hit pin rejection")
+
+    monkeypatch.setattr(runtime.slots, "ensure_route", reject_pin)
+    try:
+        with pytest.raises(ValueError, match="all-hit pin rejection"):
+            runtime.try_all_hit_route(1, [0], phase="decode")
+        assert (
+            bank._decode_epoch,
+            tuple(
+                (history.score, history.score_epoch, history.last_used)
+                for history in bank._history
+            ),
+        ) == policy_before
+        assert runtime.slots.metrics.as_dict()["active_routes"] == 0
+    finally:
+        runtime.close()
+
+
+def test_global_runtime_success_publishes_ready_generation(tmp_path: Path) -> None:
+    root, spec, manifest, expected = _global_artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _global_plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+            cache_policy="lru",
+            cache_scope="global",
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    try:
+        first = runtime.ensure_route(1, [0], phase="decode")
+        assert bytes(first.bindings[0].buffer) == expected[(1, 0)]
+        bank = runtime._global_bank
+        assert bank is not None
+        entry = bank._directory[(1, 0)]
+        assert entry.state == "ready"
+        generation = entry.generation
+        first.release(synchronize=False)
+
+        second = runtime.ensure_route(1, [0], phase="decode")
+        assert second.plan.hits == (0,)
+        assert second.plan.loads == ()
+        assert bank._directory[(1, 0)].generation == generation
+        assert bank._directory[(1, 0)].state == "ready"
+        second.release(synchronize=False)
+        assert runtime.counters.as_dict()["route_calls"] == 2
+        assert runtime.counters.as_dict()["expert_hits"] == 1
+    finally:
+        runtime.close()
+
+
+def test_global_safe_fence_failure_restores_cross_layer_policy_exactly(
+    tmp_path: Path,
+) -> None:
+    root, spec, manifest, _expected = _global_artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _global_plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+            cache_policy="lru",
+            cache_scope="global",
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    held = runtime.ensure_route(1, [0], phase="decode")
+    other = runtime.ensure_route(2, [0], phase="decode")
+    other.release(synchronize=False)
+    slot = runtime.slots._physical(1, held.slots[0])
+    generation = held.generations[0]
+    policy_before = _global_policy_state(runtime)
+    counters_before = (
+        runtime.counters.as_dict(),
+        runtime._layer_counters[2].as_dict(),
+        runtime._phase_counters[RoutingPhase.DECODE].as_dict(),
+    )
+    read_bytes = runtime.reader.metrics.as_dict()["read_bytes"]
+    completion_started = threading.Event()
+    fail_completion = threading.Event()
+    fence_error = RuntimeError("global cross-layer victim fence failure")
+    replacement_ready = None
+
+    def wait_then_fail() -> None:
+        completion_started.set()
+        assert fail_completion.wait(timeout=2)
+        raise fence_error
+
+    try:
+        held.defer_bindings_until(held.bindings, wait_then_fail)
+        held.release(synchronize=False)
+        assert completion_started.wait(timeout=2)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            replacement = executor.submit(
+                runtime.ensure_route,
+                2,
+                [1],
+                phase="decode",
+            )
+            deadline = time.monotonic() + 2
+            while runtime.slots.metrics.as_dict()["pin_waits"] == 0:
+                assert time.monotonic() < deadline, "global victim did not wait on pin"
+                time.sleep(0.001)
+            fail_completion.set()
+            with pytest.raises(ExpertSlotError, match="completion fence failed") as exc:
+                replacement_ready = replacement.result(timeout=2)
+
+        assert exc.value.__cause__ is fence_error
+        assert _global_policy_state(runtime) == policy_before
+        assert (
+            runtime.counters.as_dict(),
+            runtime._layer_counters[2].as_dict(),
+            runtime._phase_counters[RoutingPhase.DECODE].as_dict(),
+        ) == counters_before
+        with slot.condition:
+            assert slot.state.value == "ready"
+            assert slot.layer == 1
             assert slot.expert == 0
             assert slot.generation == generation
             assert slot.pins == 0
@@ -594,6 +1387,75 @@ def test_completion_fence_multi_load_prepare_failure_restores_earlier_slot(
         fail_completion.set()
         try:
             runtime.close(timeout=2)
+        except ExpertSlotError:
+            pass
+
+
+def test_completion_fence_failure_after_prepare_stops_io_submit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    plan = _plan(spec)
+    reader = PositionalExpertReader(root, use_native=False)
+    pool = ExpertSlotPool(spec, plan, manifest, reader)
+    first = pool.ensure_route(1, _manual_plan(0, 0))
+    target_slot = pool._physical(1, plan.slots_per_layer)
+    read_bytes = reader.metrics.as_dict()["read_bytes"]
+    completion_started = threading.Event()
+    fail_completion = threading.Event()
+    prepare_complete = threading.Event()
+    continue_after_prepare = threading.Event()
+    fence_error = RuntimeError("fence failure after slot preparation")
+
+    def wait_then_fail() -> None:
+        completion_started.set()
+        assert fail_completion.wait(timeout=2)
+        raise fence_error
+
+    original_can_batch = pool._can_batch_component_sidecar
+
+    def block_after_prepare(*args, **kwargs) -> bool:
+        prepare_complete.set()
+        assert continue_after_prepare.wait(timeout=2)
+        return original_can_batch(*args, **kwargs)
+
+    monkeypatch.setattr(pool, "_can_batch_component_sidecar", block_after_prepare)
+
+    try:
+        first.defer_bindings_until(first.bindings, wait_then_fail)
+        first.release(synchronize=False)
+        assert completion_started.wait(timeout=2)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending = executor.submit(
+                pool.ensure_route,
+                1,
+                _manual_plan(1, plan.slots_per_layer),
+            )
+            assert prepare_complete.wait(timeout=2)
+            with target_slot.condition:
+                assert target_slot.state.value == "loading"
+                assert target_slot.expert == 1
+            fail_completion.set()
+            pool._drain_completion_fences()
+            continue_after_prepare.set()
+            with pytest.raises(ExpertSlotError, match="completion fence failed") as exc:
+                pending.result(timeout=2)
+
+        assert exc.value.__cause__ is fence_error
+        with target_slot.condition:
+            assert target_slot.state.value == "empty"
+            assert target_slot.layer is None
+            assert target_slot.expert is None
+            assert target_slot.generation == 0
+            assert target_slot.pins == 0
+        assert reader.metrics.as_dict()["read_bytes"] == read_bytes
+        assert pool.metrics.as_dict()["active_routes"] == 0
+    finally:
+        fail_completion.set()
+        continue_after_prepare.set()
+        try:
+            pool.close(timeout=2)
         except ExpertSlotError:
             pass
 
@@ -748,6 +1610,40 @@ def test_slot_pool_close_timeout_blocks_admission_and_can_be_retried(
             pass
 
 
+def test_slot_pool_concurrent_close_lock_honors_timeout(tmp_path: Path) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    plan = _plan(spec)
+    reader = PositionalExpertReader(root, use_native=False)
+    pool = ExpertSlotPool(spec, plan, manifest, reader)
+    active = pool.ensure_route(1, _manual_plan(0, plan.slots_per_layer))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_close = executor.submit(pool.close)
+        deadline = time.monotonic() + 2
+        while not pool._closing:
+            assert time.monotonic() < deadline, (
+                "first close did not enter draining state"
+            )
+            time.sleep(0.001)
+        started = time.monotonic()
+        second_close = executor.submit(pool.close, timeout=0.01)
+        try:
+            with pytest.raises(TimeoutError, match="close.*progress|deadline"):
+                second_close.result(timeout=0.2)
+            assert time.monotonic() - started < 0.2
+        finally:
+            active.release(synchronize=False)
+            first_close.result(timeout=2)
+            try:
+                second_close.result(timeout=2)
+            except TimeoutError:
+                pass
+
+    pool.close(timeout=2)
+    assert pool._closed is True
+    assert reader._closed is True
+
+
 def test_runtime_close_timeout_is_retryable_after_route_release(
     tmp_path: Path,
 ) -> None:
@@ -770,12 +1666,17 @@ def test_runtime_close_timeout_is_retryable_after_route_release(
         apply_memory_cap=False,
     )
     active = runtime.ensure_route(1, [0], phase="decode")
+    mapped = _CloseTrackingResource()
+    runtime._mapped_expert_store = mapped
 
     try:
         with pytest.raises(TimeoutError, match="active expert routes"):
             runtime.close(timeout=0)
         assert runtime._closed is False
         assert runtime._closing is True
+        assert runtime._split_executor._shutdown is False
+        assert mapped.closed is False
+        assert runtime._mapped_expert_store is mapped
         with pytest.raises(ExpertSlotError, match="closing"):
             runtime.ensure_route(1, [1], phase="decode")
 
@@ -783,6 +1684,9 @@ def test_runtime_close_timeout_is_retryable_after_route_release(
         runtime.close(timeout=2)
         assert runtime._closed is True
         assert runtime._closing is False
+        assert runtime._split_executor._shutdown is True
+        assert mapped.closed is True
+        assert runtime._mapped_expert_store is None
         assert runtime.reader._closed is True
         assert all(
             slot.state.value == "closed"
@@ -795,6 +1699,117 @@ def test_runtime_close_timeout_is_retryable_after_route_release(
         finally:
             if not runtime.reader._closed:
                 runtime.slots.close(timeout=2)
+
+
+def test_runtime_concurrent_close_lock_honors_timeout(tmp_path: Path) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    active = runtime.ensure_route(1, [0], phase="decode")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_close = executor.submit(runtime.close)
+        deadline = time.monotonic() + 2
+        while not runtime._closing:
+            assert time.monotonic() < deadline, (
+                "first close did not enter draining state"
+            )
+            time.sleep(0.001)
+        started = time.monotonic()
+        second_close = executor.submit(runtime.close, timeout=0.01)
+        try:
+            with pytest.raises(TimeoutError, match="close.*progress|deadline"):
+                second_close.result(timeout=0.2)
+            assert time.monotonic() - started < 0.2
+        finally:
+            active.release(synchronize=False)
+            first_close.result(timeout=2)
+            try:
+                second_close.result(timeout=2)
+            except TimeoutError:
+                pass
+
+    runtime.close(timeout=2)
+    assert runtime._closed is True
+    assert runtime.reader._closed is True
+
+
+def test_runtime_close_timeout_does_not_wait_for_running_split_miss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    mapped = _CloseTrackingResource()
+    runtime._mapped_expert_store = mapped
+    read_started = threading.Event()
+    finish_read = threading.Event()
+    original_read = runtime.reader.read_record_into
+
+    def blocking_read(*args, **kwargs):
+        read_started.set()
+        assert finish_read.wait(timeout=2)
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(runtime.reader, "read_record_into", blocking_read)
+    pending = runtime.begin_split_route(1, [0], phase="decode")
+    assert read_started.wait(timeout=2)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        started = time.monotonic()
+        closing = executor.submit(runtime.close, timeout=0.01)
+        try:
+            with pytest.raises(TimeoutError, match="active expert routes"):
+                closing.result(timeout=0.2)
+            assert time.monotonic() - started < 0.2
+            assert runtime._closed is False
+            assert runtime._closing is True
+            assert runtime._split_executor._shutdown is False
+            assert mapped.closed is False
+            assert runtime._mapped_expert_store is mapped
+        finally:
+            finish_read.set()
+            pending.close()
+            try:
+                closing.result(timeout=2)
+            except TimeoutError:
+                pass
+
+    runtime.close(timeout=2)
+    assert runtime._closed is True
+    assert runtime._split_executor._shutdown is True
+    assert mapped.closed is True
+    assert runtime._mapped_expert_store is None
+    assert runtime.reader._closed is True
 
 
 def test_runtime_handles_kv_admission_routes_waves_and_reset(tmp_path: Path) -> None:
@@ -935,6 +1950,52 @@ def test_runtime_rolls_back_policy_mapping_after_integrity_failure(
         runtime.close()
 
 
+def test_runtime_generic_io_failure_does_not_restore_overwritten_victim(
+    tmp_path: Path,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+            cache_policy="lru",
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    first = runtime.ensure_route(1, [0], phase="decode")
+    first_generation = first.generations[0]
+    first.release(synchronize=False)
+    corrupt_offset = manifest.records[1].segments[0].offset
+    payload = bytearray((root / "source.bin").read_bytes())
+    payload[corrupt_offset] ^= 0xFF
+    (root / "source.bin").write_bytes(payload)
+
+    try:
+        with pytest.raises(ExpertSlotError, match="hash mismatch"):
+            runtime.ensure_route(1, [1], phase="decode")
+
+        bank = runtime._banks[1]
+        slot = runtime.slots._physical(1, 0)
+        assert bank.resident_experts == ()
+        with slot.condition:
+            assert slot.state.value == "empty"
+            assert slot.layer is None
+            assert slot.expert is None
+            assert slot.generation > first_generation
+            assert slot.pins == 0
+    finally:
+        runtime.close()
+
+
 def test_memory_cap_reconciliation_and_fake_mlx_application() -> None:
     spec = _spec()
     plan = plan_expert_memory(
@@ -1067,6 +2128,155 @@ def test_begin_split_route_rolls_back_when_executor_rejects(
         ready.release(synchronize=False)
     finally:
         runtime.close()
+
+
+def test_split_safe_fence_failure_rolls_back_policy_without_observation(
+    tmp_path: Path,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+            cache_policy="lru",
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    held = runtime.ensure_route(1, [0], phase="decode")
+    bank = runtime._banks[1]
+    policy_before = (
+        bank.resident_experts,
+        bank._decode_epoch,
+        tuple(
+            (history.score, history.score_epoch, history.last_used)
+            for history in bank._history
+        ),
+    )
+    counters_before = (
+        runtime.counters.as_dict(),
+        runtime._layer_counters[1].as_dict(),
+        runtime._phase_counters[RoutingPhase.DECODE].as_dict(),
+    )
+    slot = runtime.slots._physical(1, 0)
+    generation = held.generations[0]
+    read_bytes = runtime.reader.metrics.as_dict()["read_bytes"]
+    completion_started = threading.Event()
+    fail_completion = threading.Event()
+    fence_error = RuntimeError("split miss victim fence failure")
+    pending: PendingSplitRoute | None = None
+
+    def wait_then_fail() -> None:
+        completion_started.set()
+        assert fail_completion.wait(timeout=2)
+        raise fence_error
+
+    try:
+        held.defer_bindings_until(held.bindings, wait_then_fail)
+        held.release(synchronize=False)
+        assert completion_started.wait(timeout=2)
+        pending = runtime.begin_split_route(1, [1], phase="decode")
+        deadline = time.monotonic() + 2
+        while runtime.slots.metrics.as_dict()["pin_waits"] == 0:
+            assert time.monotonic() < deadline, "split miss did not wait on pin"
+            time.sleep(0.001)
+        fail_completion.set()
+        with pytest.raises(ExpertSlotError, match="completion fence failed") as exc:
+            pending.finish_misses()
+
+        assert exc.value.__cause__ is fence_error
+        assert (
+            bank.resident_experts,
+            bank._decode_epoch,
+            tuple(
+                (history.score, history.score_epoch, history.last_used)
+                for history in bank._history
+            ),
+        ) == policy_before
+        assert (
+            runtime.counters.as_dict(),
+            runtime._layer_counters[1].as_dict(),
+            runtime._phase_counters[RoutingPhase.DECODE].as_dict(),
+        ) == counters_before
+        with slot.condition:
+            assert slot.state.value == "ready"
+            assert slot.expert == 0
+            assert slot.generation == generation
+            assert slot.pins == 0
+        assert runtime.reader.metrics.as_dict()["read_bytes"] == read_bytes
+    finally:
+        fail_completion.set()
+        if pending is not None:
+            pending.close()
+        try:
+            runtime.close(timeout=2)
+        except ExpertSlotError:
+            pass
+
+
+def test_split_success_commits_and_observes_exactly_once(tmp_path: Path) -> None:
+    root, spec, manifest, expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    try:
+        pending = runtime.begin_split_route(1, [0], phase="decode")
+        first = pending.finish_misses()
+        second = pending.finish_misses()
+        assert first is not None
+        assert second is first
+        assert bytes(first.bindings[0].buffer) == expected[0]
+        assert runtime._banks[1].resident_experts == (0,)
+        assert runtime.counters.as_dict()["route_calls"] == 1
+        assert runtime._layer_counters[1].as_dict()["route_calls"] == 1
+        assert (
+            runtime._phase_counters[RoutingPhase.DECODE].as_dict()["route_calls"] == 1
+        )
+        pending.close()
+    finally:
+        runtime.close()
+
+
+def test_split_route_subsets_preserve_global_generations() -> None:
+    plan = RoutePlan(
+        phase=RoutingPhase.DECODE,
+        experts=(0, 1),
+        slots=(3, 4),
+        hits=(0,),
+        misses=(1,),
+        loads=(SlotLoad(expert=1, slot=4, persistent=True, generation=12),),
+        evictions=(),
+        generations=(7, 12),
+    )
+
+    hit_plan = ExpertStreamingRuntime._subset_route_plan(plan, hits=True)
+    miss_plan = ExpertStreamingRuntime._subset_route_plan(plan, hits=False)
+
+    assert hit_plan is not None
+    assert miss_plan is not None
+    assert hit_plan.generations == (7,)
+    assert miss_plan.generations == (12,)
 
 
 def test_pending_split_route_reports_only_unfinished_miss_io() -> None:

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from math import isfinite
 from operator import index
-from typing import Iterable
+from typing import Callable, Iterable
 
 
 def _integer(name: str, value: object, *, minimum: int | None = None) -> int:
@@ -72,6 +72,33 @@ class RoutePlan:
     loads: tuple[SlotLoad, ...]
     evictions: tuple[SlotEviction, ...]
     generations: tuple[int | None, ...] = ()
+
+
+class RoutePolicyTxn:
+    """Idempotent policy publication or completion-failure rollback."""
+
+    def __init__(
+        self,
+        *,
+        commit: Callable[[], None] | None = None,
+        rollback: Callable[[], None],
+    ) -> None:
+        self._commit = commit
+        self._rollback = rollback
+        self._finished = False
+
+    def commit(self) -> None:
+        if self._finished:
+            return
+        if self._commit is not None:
+            self._commit()
+        self._finished = True
+
+    def rollback_completion(self) -> None:
+        if self._finished:
+            return
+        self._rollback()
+        self._finished = True
 
 
 @dataclass
@@ -405,6 +432,47 @@ class LayerExpertSlotBank:
             evictions=tuple(evictions),
         )
 
+    def plan_transaction(
+        self,
+        expert_ids: Iterable[int],
+        *,
+        phase: RoutingPhase | str,
+    ) -> tuple[RoutePlan, RoutePolicyTxn]:
+        experts = self._validate_experts(expert_ids)
+        unique_experts = tuple(dict.fromkeys(experts))
+        decode_epoch = self._decode_epoch
+        histories = {
+            expert: (
+                self._history[expert].score,
+                self._history[expert].score_epoch,
+                self._history[expert].last_used,
+            )
+            for expert in unique_experts
+        }
+        seed_candidates = set(self._prefill_seed_candidates)
+        plan = self.plan(experts, phase=phase)
+
+        def rollback() -> None:
+            evictions = {eviction.slot: eviction for eviction in plan.evictions}
+            for load in reversed(plan.loads):
+                if not load.persistent:
+                    continue
+                if self._expert_to_slot.get(load.expert) == load.slot:
+                    self._expert_to_slot.pop(load.expert, None)
+                eviction = evictions.get(load.slot)
+                if eviction is None:
+                    self._slot_to_expert[load.slot] = None
+                else:
+                    self._slot_to_expert[load.slot] = eviction.previous_expert
+                    self._expert_to_slot[eviction.previous_expert] = load.slot
+            self._decode_epoch = decode_epoch
+            for expert, values in histories.items():
+                history = self._history[expert]
+                history.score, history.score_epoch, history.last_used = values
+            self._prefill_seed_candidates = set(seed_candidates)
+
+        return plan, RoutePolicyTxn(rollback=rollback)
+
     def try_plan_all_hits(
         self,
         expert_ids: Iterable[int],
@@ -443,6 +511,35 @@ class LayerExpertSlotBank:
             loads=(),
             evictions=(),
         )
+
+    def try_plan_all_hits_transaction(
+        self,
+        expert_ids: Iterable[int],
+        *,
+        phase: RoutingPhase | str,
+    ) -> tuple[RoutePlan, RoutePolicyTxn] | None:
+        experts = self._validate_experts_for_seed(expert_ids)
+        unique_experts = tuple(dict.fromkeys(experts))
+        decode_epoch = self._decode_epoch
+        histories = {
+            expert: (
+                self._history[expert].score,
+                self._history[expert].score_epoch,
+                self._history[expert].last_used,
+            )
+            for expert in unique_experts
+        }
+        plan = self.try_plan_all_hits(experts, phase=phase)
+        if plan is None:
+            return None
+
+        def rollback() -> None:
+            self._decode_epoch = decode_epoch
+            for expert, values in histories.items():
+                history = self._history[expert]
+                history.score, history.score_epoch, history.last_used = values
+
+        return plan, RoutePolicyTxn(rollback=rollback)
 
 
 class GlobalExpertSlotBank:
@@ -828,6 +925,77 @@ class GlobalExpertSlotBank:
             evictions=tuple(evictions),
             generations=generations,
         )
+
+    def plan_transaction(
+        self,
+        layer: int,
+        expert_ids: Iterable[int],
+        *,
+        phase: RoutingPhase | str,
+    ) -> tuple[RoutePlan, RoutePolicyTxn]:
+        layer, experts = self._validate_experts(layer, expert_ids)
+        route_keys = {(layer, expert) for expert in experts}
+        resident_keys = {key for key in self._slot_to_key if key is not None}
+        history_keys = route_keys | resident_keys
+        missing = object()
+        histories: dict[tuple[int, int], object] = {}
+        for key in history_keys:
+            history = self._history.get(key)
+            histories[key] = (
+                missing
+                if history is None
+                else (history.score, history.score_epoch, history.last_used)
+            )
+        decode_epoch = self._decode_epoch
+        slot_to_key = tuple(self._slot_to_key)
+        key_to_slot = dict(self._key_to_slot)
+        directory = {
+            key: _GlobalDirectoryEntry(entry.slot, entry.generation, entry.state)
+            for key, entry in self._directory.items()
+        }
+        slot_generations = tuple(self._slot_generations)
+        free_slots = tuple(self._free_slots)
+        free_slot_set = set(self._free_slot_set)
+        lru = tuple(self._lru.items())
+        layer_occupancy = Counter(self._layer_occupancy)
+        evictions = self._evictions
+        cross_layer_evictions = self._cross_layer_evictions
+        seed_candidates = set(self._prefill_seed_candidates[layer])
+        plan = self.plan(layer, experts, phase=phase)
+
+        def commit() -> None:
+            self.publish_ready(layer, plan)
+
+        def rollback() -> None:
+            self._decode_epoch = decode_epoch
+            self._slot_to_key = list(slot_to_key)
+            self._key_to_slot = dict(key_to_slot)
+            self._directory = {
+                key: _GlobalDirectoryEntry(entry.slot, entry.generation, entry.state)
+                for key, entry in directory.items()
+            }
+            self._slot_generations = list(slot_generations)
+            self._free_slots = deque(free_slots)
+            self._free_slot_set = set(free_slot_set)
+            self._lru = OrderedDict(lru)
+            self._layer_occupancy = Counter(layer_occupancy)
+            self._evictions = evictions
+            self._cross_layer_evictions = cross_layer_evictions
+            self._prefill_seed_candidates[layer] = set(seed_candidates)
+            for key, values in histories.items():
+                if values is missing:
+                    self._history.pop(key, None)
+                    continue
+                score, score_epoch, last_used = values
+                history = self._history.get(key)
+                if history is None:
+                    history = _ExpertHistory()
+                    self._history[key] = history
+                history.score = score
+                history.score_epoch = score_epoch
+                history.last_used = last_used
+
+        return plan, RoutePolicyTxn(commit=commit, rollback=rollback)
 
     def reset(self) -> None:
         self._decode_epoch = 0
