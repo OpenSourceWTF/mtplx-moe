@@ -77,9 +77,11 @@ directory containing any unregistered file.
 ## Verification
 
 - Exactly 38 worktrees remain registered.
-- The primary path and active `29-cache-scheduling` exception are unchanged; the
-  other 36 paths are beneath the primary checkout's `.worktrees/` directory.
-- Every pre-migration HEAD, branch/detached state, and status hash matches.
+- The primary path and active `29-cache-scheduling` exception path and branch
+  are unchanged; its owner may advance its HEAD. The other 36 paths are beneath
+  the primary checkout's `.worktrees/` directory.
+- Every relocated worktree's pre-migration HEAD, branch/detached state, and
+  status hash matches.
 - The default work-off branch, GitHub default branch, and `origin/HEAD` remain
   `experiment/moe-pr13-pr14-stack` at the same commit.
 - The primary checkout no longer reports `.worktrees/` as untracked.

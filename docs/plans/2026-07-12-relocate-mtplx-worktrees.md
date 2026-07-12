@@ -38,7 +38,7 @@ a user-specific absolute path.
 
 **Security flag:** `none`
 
-- [ ] **Step 1: Verify the rule is absent**
+- [x] **Step 1: Verify the rule is absent**
 
 ```bash
 COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
@@ -49,7 +49,7 @@ PRIMARY="${COMMON_DIR%/.git}"
 
 Expected: neither repository nor local shared rule exists before the change.
 
-- [ ] **Step 2: Add the repository ignore rule**
+- [x] **Step 2: Add the repository ignore rule**
 
 Add this block beneath generated artifacts in `.gitignore`:
 
@@ -58,7 +58,7 @@ Add this block beneath generated artifacts in `.gitignore`:
 /.worktrees/
 ```
 
-- [ ] **Step 3: Add the contributor rule**
+- [x] **Step 3: Add the contributor rule**
 
 Append this section to `CONTRIBUTING.md`:
 
@@ -71,7 +71,7 @@ root. Never move a worktree while another process or agent owns it; an active
 exception stays in place until its owner releases it.
 ```
 
-- [ ] **Step 4: Add the shared local exclude**
+- [x] **Step 4: Add the shared local exclude**
 
 Use `apply_patch` to add this exact line to
 `$PRIMARY/.git/info/exclude`:
@@ -80,7 +80,7 @@ Use `apply_patch` to add this exact line to
 /.worktrees/
 ```
 
-- [ ] **Step 5: Verify, commit, and push the rule before moving paths**
+- [x] **Step 5: Verify, commit, and push the rule before moving paths**
 
 ```bash
 git check-ignore -v .worktrees/example/file
@@ -104,7 +104,7 @@ Expected: the committed rule and approved documents are pushed on `experiment/mo
 
 **Does NOT cover:** The active `29-cache-scheduling` exception and the retained primary checkout are recorded but never moved.
 
-- [ ] **Step 1: Require a stable registry and no competing migration**
+- [x] **Step 1: Require a stable registry and no competing migration**
 
 ```bash
 COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
@@ -119,9 +119,9 @@ test "$(git -C "$ACTIVE" rev-parse --show-toplevel)" = "$ACTIVE"
 test ! -e /tmp/mtplx-worktree-relocation.lock
 ```
 
-Expected: 38 stable registrations, active exception present, no locks/prunable entries or competing worktree mutation, and the migration lock available.
+Expected: 38 stable registrations, active exception present, no locks/prunable entries or competing worktree mutation, and the migration lock available. The active owner may advance its HEAD without invalidating this migration.
 
-- [ ] **Step 2: Create the one-shot driver with `apply_patch`**
+- [x] **Step 2: Create the one-shot driver with `apply_patch`**
 
 Create `/tmp/mtplx-relocate-worktrees.zsh` with `apply_patch` using this complete
 content:
@@ -149,7 +149,12 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   print -u2 "migration lock is held: $LOCK"
   exit 1
 fi
-trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
+cleanup() {
+  rmdir "$LOCK" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 status_hash() {
   git -C "$1" status --porcelain=v1 -z --untracked-files=all |
@@ -206,7 +211,11 @@ for old in "${registry[@]}"; do
     print -u2 "active process references worktree: $old"
     exit 1
   fi
-  if [[ -n "$(git -C "$old" submodule status 2>/dev/null)" ]]; then
+  if ! submodule_state="$(git -C "$old" submodule status 2>&1)"; then
+    print -u2 "could not inspect submodules for $old: $submodule_state"
+    exit 1
+  fi
+  if [[ -n "$submodule_state" ]]; then
     print -u2 "initialized submodule found: $old"
     exit 1
   fi
@@ -272,7 +281,7 @@ done
 print "execute verified 36 moves"
 ```
 
-- [ ] **Step 3: Validate the driver contract**
+- [x] **Step 3: Validate the driver contract**
 
 ```bash
 zsh -n /tmp/mtplx-relocate-worktrees.zsh
@@ -283,13 +292,13 @@ rg -n '!= 38|!= 36|old_paths|status_hash|submodule status|worktree move|INTEGRAT
 Expected: syntax passes and the driver contains the registry, count, status,
 submodule, move, and move-integration-last guards.
 
-- [ ] **Step 4: Dry-run the mapping**
+- [x] **Step 4: Dry-run the mapping**
 
 ```bash
 zsh /tmp/mtplx-relocate-worktrees.zsh --dry-run
 ```
 
-Expected: exit zero, 36 collision-free old-to-new mappings printed, snapshot written, no paths moved, and the registry unchanged.
+Expected: exit zero, 36 collision-free old-to-new mappings printed, snapshot written, no paths moved, and the registry unchanged. The active exception sidecar is observational; its owner may advance HEAD later.
 
 ## Task 3: Move and immediately verify 36 worktrees
 
@@ -300,7 +309,7 @@ Expected: exit zero, 36 collision-free old-to-new mappings printed, snapshot wri
 
 **Does NOT cover:** The primary checkout and active `29-cache-scheduling` exception remain at their original paths.
 
-- [ ] **Step 1: Revalidate the dry-run snapshot immediately before mutation**
+- [x] **Step 1: Revalidate the dry-run snapshot immediately before mutation**
 
 ```bash
 COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
@@ -312,7 +321,7 @@ test "$(git -C "$PRIMARY" \
 
 Expected: registry and process admission still match the dry run.
 
-- [ ] **Step 2: Execute each move from the retained primary checkout**
+- [x] **Step 2: Execute each move from the retained primary checkout**
 
 For each snapshot row, the driver must run:
 
@@ -323,14 +332,14 @@ git -C "$PRIMARY" worktree move "$old_path" "$destination"
 
 Move `mtplx-experimental-pr13-pr14-main` last. Never use `--force`.
 
-- [ ] **Step 3: Verify immediately after every move**
+- [x] **Step 3: Verify immediately after every move**
 
 Require the destination's HEAD, branch/detached state, and status hash to equal
 the snapshot and require the old path to be absent. If any check fails and the
 old path is free, move that single worktree back and stop. Do not continue after
 a mismatch.
 
-- [ ] **Step 4: Execute the migration**
+- [x] **Step 4: Execute the migration**
 
 ```bash
 COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
@@ -339,9 +348,9 @@ cd "$PRIMARY"
 zsh /tmp/mtplx-relocate-worktrees.zsh --execute
 ```
 
-Expected: 36 moves and 36 immediate verification passes; primary and active exception untouched.
+Expected: 36 moves and 36 immediate verification passes; primary and active exception paths untouched. The active owner may continue committing.
 
-- [ ] **Step 5: Remove only empty former grouping directories**
+- [x] **Step 5: Remove only empty former grouping directories**
 
 ```bash
 COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
@@ -361,7 +370,7 @@ Expected: empty containers disappear; nonempty directories are preserved. Do not
 
 **Security flag:** `none`
 
-- [ ] **Step 1: Verify registry placement and identity**
+- [x] **Step 1: Verify registry placement and identity**
 
 ```bash
 COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
@@ -377,7 +386,7 @@ test "$(git -C "$PRIMARY" worktree list --porcelain |
 
 Expected: one primary, one active exception, and 36 canonical auxiliary worktrees.
 
-- [ ] **Step 2: Verify all snapshot identities and dirty-state hashes**
+- [x] **Step 2: Verify all snapshot identities and dirty-state hashes**
 
 ```zsh
 set -euo pipefail
@@ -401,17 +410,19 @@ while IFS=$'\t' read -r old destination head branch hash disk_kib; do
 done < "$SNAPSHOT"
 (( verified == 36 ))
 
-IFS=$'\t' read -r active_path active_head active_branch \
+IFS=$'\t' read -r active_path active_head_before active_branch \
   < <(tail -n 1 "$SNAPSHOT.active")
-[[ "$(git -C "$active_path" rev-parse HEAD)" == "$active_head" ]]
 [[ "$(branch_state "$active_path")" == "$active_branch" ]]
+active_head_after="$(git -C "$active_path" rev-parse HEAD)"
+printf 'active exception HEAD before=%s after=%s (owner may advance)\n' \
+  "$active_head_before" "$active_head_after"
 ```
 
 Expected: all 36 destination identities and status hashes match, every old path
-is absent, and the active exception's path, HEAD, and branch are unchanged
-without traversing its contents.
+is absent, and the active exception's registered path and branch are unchanged
+without traversing its contents. Its HEAD may advance under its owner.
 
-- [ ] **Step 3: Verify repository/default-branch state**
+- [x] **Step 3: Verify repository/default-branch state**
 
 ```bash
 COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
@@ -428,7 +439,7 @@ test "$(git -C "$NEW_ACTIVE" rev-parse HEAD)" = \
 
 Expected: clean default work-off branch at the same pushed commit and unchanged GitHub/local default branch.
 
-- [ ] **Step 4: Verify ignore, CI, and service invariants**
+- [x] **Step 4: Verify ignore, CI, and service invariants**
 
 ```bash
 set -e
@@ -445,7 +456,7 @@ curl -fsS --max-time 3 http://127.0.0.1:8080/v1/models |
 
 Expected: local ignore active, PR checks green, GPU lock absent, and Qwen unchanged/ready.
 
-- [ ] **Step 5: Mark the plan complete and publish the evidence-only update**
+- [x] **Step 5: Mark the plan complete and publish the evidence-only update**
 
 From `$NEW_ACTIVE`, mark all plan checkboxes complete, run `git diff --check`,
 commit only the plan update as `docs: record worktree relocation completion`,
