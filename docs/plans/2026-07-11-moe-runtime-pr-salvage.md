@@ -93,7 +93,7 @@ Do not use the instrumented replay for headline timing. Run at least three alter
 
 **Does NOT cover:** global-cache layouts, mapped experts, or miss-route acceleration; they continue through the PR #13 path.
 
-- [ ] **Step 1: Transplant only the reviewed source**
+- [x] **Step 1: Transplant only the reviewed source**
 
 ```bash
 git cherry-pick -x 7652fa2
@@ -101,7 +101,7 @@ git cherry-pick -x 7652fa2
 
 Resolve the `_run(..., shared_work=...)` conflict by retaining PR #13's tuple-returning method and inserting the source fast-path logic without importing later merge/fix commits.
 
-- [ ] **Step 2: Write failing policy and execution tests**
+- [x] **Step 2: Write failing policy and execution tests**
 
 ```python
 def test_all_hit_probe_matches_normal_wave_policy_and_next_lru_victims():
@@ -138,7 +138,7 @@ def test_failed_all_hit_probe_is_side_effect_free():
 
 Add `test_component_bank_all_hit_decode_preserves_route_waves_counters_and_shared_order` and `test_component_bank_all_hit_decode_releases_pins_on_q4_error` in `tests/test_streamed_models.py`. The warmed three-unique/two-capacity route must still produce two waves/two route calls, all fast Q4 events must precede `shared`, and both success and injected Q4 failure must end with `pins == 0`.
 
-- [ ] **Step 3: Prove RED**
+- [x] **Step 3: Prove RED**
 
 ```bash
 uv run pytest -q tests/test_expert_streaming.py tests/test_streamed_models.py
@@ -146,11 +146,11 @@ uv run pytest -q tests/test_expert_streaming.py tests/test_streamed_models.py
 
 Expected: the raw source collapses the warmed route into one policy epoch/route call and mishandles PR #13's shared-work return contract.
 
-- [ ] **Step 4: Implement the repair**
+- [x] **Step 4: Implement the repair**
 
 Keep `try_plan_all_hits()` side-effect-free until all unique IDs are resident. Invoke it inside the existing `for wave in runtime.route_waves(...)` loop, never on the flattened route. On a hit wave, run assignment-aligned component-bank Q4 in `wave.positions` order, `mx.eval()` before releasing the route, append output/positions, and continue. On `None`, execute the unchanged PR #13 split path. Do not early-return from `_run`; call `shared_work()` exactly once after routed work when no miss overlap exists. Skip concatenate/argsort/take only when one output already spans `range(total_assignments)`.
 
-- [ ] **Step 5: Verify and commit repair**
+- [x] **Step 5: Verify and commit repair**
 
 ```bash
 uv run pytest -q tests/test_expert_streaming.py tests/test_streamed_models.py
