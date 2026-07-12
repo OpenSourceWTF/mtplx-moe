@@ -431,6 +431,17 @@ class PendingSplitRoute:
             if io_admission is not None:
                 self._miss_admissions[ordinal] = io_admission
 
+    def _retain_lifecycle_after_admission(self) -> None:
+        with self._state_lock:
+            if (
+                self._lifecycle_release is not None
+                or self._failure_finalized
+                or self._policy_observed
+            ):
+                return
+            lifecycle = self.runtime.slots.retain_admitted_split_lifecycle()
+            self._lifecycle_release = lifecycle.release
+
     def _record_cleanup_error(self, error: BaseException) -> None:
         promote = False
         with self._state_lock:
@@ -1556,7 +1567,6 @@ class ExpertStreamingRuntime:
         policy_txn: RoutePolicyTxn | None = None
         hit_ready: ReadyRoute | None = None
         pending: PendingSplitRoute | None = None
-        lifecycle_release: Callable[[], None] | None = None
         io_admission = RouteIOAdmission()
         miss_cancel_event = threading.Event()
         combined_cancel = _RouteCancel(cancel_event, miss_cancel_event)
@@ -1584,8 +1594,6 @@ class ExpertStreamingRuntime:
                 if hit_plan is not None
                 else None
             )
-            if len(miss_parts) > 1:
-                lifecycle_release = self.slots.retain_split_lifecycle().release
             pending = PendingSplitRoute(
                 runtime=self,
                 layer=layer,
@@ -1596,7 +1604,6 @@ class ExpertStreamingRuntime:
                 policy_txn=policy_txn,
                 io_admission=io_admission,
                 miss_cancel_event=miss_cancel_event,
-                lifecycle_release=lifecycle_release,
                 miss_parts=miss_parts,
             )
             if miss_plan is not None:
@@ -1614,6 +1621,7 @@ class ExpertStreamingRuntime:
                         cancel_event=combined_cancel,
                         deadline_ns=deadline_ns,
                         io_admission=part_admission,
+                        route_admitted=pending._retain_lifecycle_after_admission,
                     )
                     pending._attach_miss_future(
                         future,
@@ -1633,8 +1641,6 @@ class ExpertStreamingRuntime:
                 pending.abort(setup_error)
                 pending.close()
             else:
-                if lifecycle_release is not None:
-                    lifecycle_release()
                 if hit_ready is not None:
                     try:
                         hit_ready.release(synchronize=False)

@@ -868,6 +868,7 @@ class ExpertSlotPool:
         cancel_event: threading.Event | None = None,
         deadline_ns: int | None = None,
         io_admission: RouteIOAdmission | None = None,
+        route_admitted: Callable[[], None] | None = None,
     ) -> ReadyRoute:
         """Load all misses, validate mappings, and pin the route's slots."""
 
@@ -879,11 +880,27 @@ class ExpertSlotPool:
         with layer_lock:
             self._raise_completion_error()
             if io_admission is None:
+                if route_admitted is None:
+                    return self._ensure_route_locked(
+                        layer,
+                        plan,
+                        cancel_event=cancel_event,
+                        deadline_ns=deadline_ns,
+                    )
                 return self._ensure_route_locked(
                     layer,
                     plan,
                     cancel_event=cancel_event,
                     deadline_ns=deadline_ns,
+                    route_admitted=route_admitted,
+                )
+            if route_admitted is None:
+                return self._ensure_route_locked(
+                    layer,
+                    plan,
+                    cancel_event=cancel_event,
+                    deadline_ns=deadline_ns,
+                    io_admission=io_admission,
                 )
             return self._ensure_route_locked(
                 layer,
@@ -891,6 +908,7 @@ class ExpertSlotPool:
                 cancel_event=cancel_event,
                 deadline_ns=deadline_ns,
                 io_admission=io_admission,
+                route_admitted=route_admitted,
             )
 
     def retain_split_lifecycle(self) -> _RouteLifecycle:
@@ -905,6 +923,15 @@ class ExpertSlotPool:
             self.metrics.update(active_routes=1)
         return _RouteLifecycle(self)
 
+    def retain_admitted_split_lifecycle(self) -> _RouteLifecycle:
+        """Retain rollback lifetime after this worker owns an active route."""
+
+        with self._lifecycle:
+            if self._closed:
+                raise ExpertSlotError("expert slot pool is closed")
+            self.metrics.update(active_routes=1)
+        return _RouteLifecycle(self)
+
     def ensure_route_part(
         self,
         layer: int,
@@ -913,6 +940,7 @@ class ExpertSlotPool:
         cancel_event: threading.Event | None = None,
         deadline_ns: int | None = None,
         io_admission: RouteIOAdmission | None = None,
+        route_admitted: Callable[[], None] | None = None,
     ) -> ReadyRoute:
         """Load one disjoint part of a runtime-locked route transaction.
 
@@ -925,12 +953,21 @@ class ExpertSlotPool:
         self._raise_completion_error()
         if layer not in self._ensure_locks:
             raise ExpertSlotError(f"layer {layer} is not a routed model layer")
+        if route_admitted is None:
+            return self._ensure_route_locked(
+                layer,
+                plan,
+                cancel_event=cancel_event,
+                deadline_ns=deadline_ns,
+                io_admission=io_admission,
+            )
         return self._ensure_route_locked(
             layer,
             plan,
             cancel_event=cancel_event,
             deadline_ns=deadline_ns,
             io_admission=io_admission,
+            route_admitted=route_admitted,
         )
 
     def _ensure_route_locked(
@@ -941,6 +978,7 @@ class ExpertSlotPool:
         cancel_event: threading.Event | None,
         deadline_ns: int | None,
         io_admission: RouteIOAdmission | None = None,
+        route_admitted: Callable[[], None] | None = None,
     ) -> ReadyRoute:
 
         self._raise_completion_error()
@@ -952,6 +990,12 @@ class ExpertSlotPool:
             if self._closing:
                 raise ExpertSlotError("expert slot pool is closing")
             self.metrics.update(active_routes=1)
+        try:
+            if route_admitted is not None:
+                route_admitted()
+        except BaseException:
+            self._route_released()
+            raise
         self.metrics.update(ensure_calls=1, load_requests=len(plan.loads))
         internal_cancel = threading.Event()
         combined_cancel = _CombinedCancel(cancel_event, internal_cancel)
