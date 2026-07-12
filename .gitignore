@@ -37,6 +37,9 @@ benchmark_outputs/
 *.jsonl
 !mtplx/benchmarks/prompts/*.jsonl
 
+# Local auxiliary Git worktrees
+/.worktrees/
+
 # Local secrets
 .env
 .env.*

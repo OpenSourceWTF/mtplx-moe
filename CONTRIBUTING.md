@@ -33,3 +33,7 @@ two-digit repeat number together for later repeats.
 Benchmark summaries must include the complete reproducibility metadata listed
 in `benchmarks/results/README.md`. Do not use fan-controlled runs for product
 headline claims.
+
+## Local worktrees
+
+Keep auxiliary worktrees beneath the primary checkout's ignored `.worktrees/` directory instead of sibling `mtplx-*` workspace-root directories. Never move a worktree while another process/agent owns it; active exceptions stay until released.

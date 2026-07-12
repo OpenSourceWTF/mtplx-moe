@@ -1,0 +1,396 @@
+# Relocate MTPLX Worktrees Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers-optimized:subagent-driven-development (recommended) or superpowers-optimized:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Move 36 inactive auxiliary MTPLX worktrees beneath the retained primary checkout's ignored `.worktrees/` directory without changing any branch, commit, dirty state, untracked artifact, Qwen process, or GPU lock.
+
+**Architecture:** The primary checkout remains `/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd`. A shared exclude and committed repository rule hide and standardize `.worktrees/`. A one-shot locked migration snapshots every inactive worktree, moves each with `git worktree move`, and verifies its identity and porcelain-status hash immediately. The actively owned `/Users/davidtai/projects/OpenSourceWTF/.worktrees/29-cache-scheduling` worktree is excluded.
+
+**Tech Stack:** Git worktrees, zsh, GitHub CLI, Markdown.
+
+**Assumptions:** Assumes the registry still contains 38 worktrees — abort if it changes. Assumes `29-cache-scheduling` remains actively owned — this plan will not move, inspect recursively, or remove it. Assumes no initialized submodules, locked worktrees, or prunable entries among the other 36 — abort rather than force if any appear. Assumes moved virtual-environment entry-point scripts may retain old shebangs — this plan does not rebuild historical environments.
+
+---
+
+## File Structure
+
+- `.gitignore`: permanently ignores `/.worktrees/` on branches containing the rule.
+- `CONTRIBUTING.md`: defines the repository-level auxiliary-worktree placement and ownership rule.
+- `.git/info/exclude`: applies `/.worktrees/` immediately to the retained primary checkout without changing its older branch.
+- `docs/specs/2026-07-12-worktree-layout-design.md`: approved migration contract.
+- `docs/plans/2026-07-12-relocate-mtplx-worktrees.md`: executable migration and verification record.
+- `/tmp/mtplx-relocate-worktrees.zsh`: one-shot local migration driver, not committed.
+- `/tmp/mtplx-worktree-relocation-<timestamp>.tsv`: generated rollback/evidence snapshot, not committed.
+
+### Task 1: Add the durable and local placement rules
+
+**Files:**
+- Modify: `.gitignore`
+- Modify: `CONTRIBUTING.md`
+- Modify: `.git/info/exclude`
+- Stage: `docs/specs/2026-07-12-worktree-layout-design.md`
+- Stage: `docs/plans/2026-07-12-relocate-mtplx-worktrees.md`
+
+**Security flag:** `none`
+
+- [ ] **Step 1: Verify the rule is absent**
+
+```bash
+! rg -n '^/\.worktrees/$' .gitignore
+! rg -n '^/\.worktrees/$' /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.git/info/exclude
+```
+
+Expected: neither repository nor local shared rule exists before the change.
+
+- [ ] **Step 2: Add the repository ignore rule**
+
+Add this block beneath generated artifacts in `.gitignore`:
+
+```gitignore
+# Local auxiliary Git worktrees
+/.worktrees/
+```
+
+- [ ] **Step 3: Add the contributor rule**
+
+Append this section to `CONTRIBUTING.md`:
+
+```markdown
+## Local worktrees
+
+Keep auxiliary worktrees beneath the primary checkout's ignored `.worktrees/`
+directory instead of creating sibling `mtplx-*` directories in the workspace
+root. Never move a worktree while another process or agent owns it; an active
+exception stays in place until its owner releases it.
+```
+
+- [ ] **Step 4: Add the shared local exclude**
+
+Use `apply_patch` to add this exact line to
+`/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.git/info/exclude`:
+
+```gitignore
+/.worktrees/
+```
+
+- [ ] **Step 5: Verify, commit, and push the rule before moving paths**
+
+```bash
+git check-ignore -v .worktrees/example/file
+git diff --check
+git add .gitignore CONTRIBUTING.md \
+  docs/specs/2026-07-12-worktree-layout-design.md \
+  docs/plans/2026-07-12-relocate-mtplx-worktrees.md
+git commit -m "chore: standardize local worktree layout"
+git push
+```
+
+Expected: the committed rule and approved documents are pushed on `experiment/moe-pr13-pr14-stack`; the common exclude remains local and uncommitted.
+
+### Task 2: Preflight and snapshot all inactive worktrees
+
+**Files:**
+- Create: `/tmp/mtplx-relocate-worktrees.zsh`
+- Generate: `/tmp/mtplx-worktree-relocation-<timestamp>.tsv`
+
+**Security flag:** `none`
+
+**Does NOT cover:** The active `29-cache-scheduling` exception and the retained primary checkout are recorded but never moved.
+
+- [ ] **Step 1: Require a stable registry and no competing migration**
+
+```bash
+PRIMARY=/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd
+ACTIVE=/Users/davidtai/projects/OpenSourceWTF/.worktrees/29-cache-scheduling
+test "$(git -C "$PRIMARY" worktree list --porcelain | rg -c '^worktree ')" = 38
+test -d "$ACTIVE"
+test "$(git -C "$ACTIVE" rev-parse --show-toplevel)" = "$ACTIVE"
+! git -C "$PRIMARY" worktree list --porcelain | rg '^(locked|prunable)'
+! ps -axo command= | rg 'git .*worktree (move|remove|add)'
+test ! -e /tmp/mtplx-worktree-relocation.lock
+```
+
+Expected: 38 stable registrations, active exception present, no locks/prunable entries or competing worktree mutation, and the migration lock available.
+
+- [ ] **Step 2: Create the one-shot driver with `apply_patch`**
+
+Create `/tmp/mtplx-relocate-worktrees.zsh` with `apply_patch` using this complete
+content:
+
+```zsh
+#!/bin/zsh
+set -euo pipefail
+
+MODE="${1:---dry-run}"
+PRIMARY=/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd
+WORKSPACE=/Users/davidtai/projects/OpenSourceWTF
+ACTIVE=$WORKSPACE/.worktrees/29-cache-scheduling
+DEST_ROOT=$PRIMARY/.worktrees
+INTEGRATION_OLD=$WORKSPACE/mtplx-experimental-pr13-pr14-main
+LOCK=/tmp/mtplx-worktree-relocation.lock
+SNAPSHOT=/tmp/mtplx-worktree-relocation-$(date -u +%Y%m%dT%H%M%SZ).tsv
+
+if [[ "$MODE" != "--dry-run" && "$MODE" != "--execute" ]]; then
+  print -u2 "usage: $0 --dry-run|--execute"
+  exit 2
+fi
+
+if ! mkdir "$LOCK" 2>/dev/null; then
+  print -u2 "migration lock is held: $LOCK"
+  exit 1
+fi
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
+
+status_hash() {
+  git -C "$1" status --porcelain=v1 -z --untracked-files=all |
+    shasum -a 256 | awk '{print $1}'
+}
+
+branch_state() {
+  git -C "$1" symbolic-ref --quiet --short HEAD 2>/dev/null || print DETACHED
+}
+
+destination_for() {
+  local old="$1" rel
+  case "$old" in
+    "$PRIMARY/.claude/worktrees/"*)
+      rel="claude/${old#$PRIMARY/.claude/worktrees/}"
+      ;;
+    "$WORKSPACE/"*)
+      rel="${old#$WORKSPACE/}"
+      ;;
+    *)
+      print -u2 "unmapped worktree: $old"
+      return 1
+      ;;
+  esac
+  print "$DEST_ROOT/$rel"
+}
+
+typeset -a registry old_paths destinations heads branches hashes sizes order
+typeset -A seen_destinations
+registry=("${(@f)$(git -C "$PRIMARY" worktree list --porcelain |
+  awk '/^worktree /{print substr($0,10)}')}")
+
+if (( ${#registry[@]} != 38 )); then
+  print -u2 "registry changed: expected 38, found ${#registry[@]}"
+  exit 1
+fi
+if [[ "${registry[(Ie)$PRIMARY]}" -eq 0 || "${registry[(Ie)$ACTIVE]}" -eq 0 ]]; then
+  print -u2 "primary or active exception is not registered"
+  exit 1
+fi
+if git -C "$PRIMARY" worktree list --porcelain | grep -Eq '^(locked|prunable)'; then
+  print -u2 "locked or prunable worktree found"
+  exit 1
+fi
+
+process_snapshot="$(ps -axo pid=,command=)"
+for old in "${registry[@]}"; do
+  [[ "$old" == "$PRIMARY" || "$old" == "$ACTIVE" ]] && continue
+  if print -r -- "$process_snapshot" | grep -F -- "$old" >/dev/null; then
+    print -u2 "active process references worktree: $old"
+    exit 1
+  fi
+  if [[ -n "$(git -C "$old" submodule status 2>/dev/null)" ]]; then
+    print -u2 "initialized submodule found: $old"
+    exit 1
+  fi
+  destination="$(destination_for "$old")"
+  if [[ -e "$destination" || -n "${seen_destinations[$destination]-}" ]]; then
+    print -u2 "occupied or duplicate destination: $destination"
+    exit 1
+  fi
+  seen_destinations[$destination]=1
+  old_paths+=("$old")
+  destinations+=("$destination")
+  heads+=("$(git -C "$old" rev-parse HEAD)")
+  branches+=("$(branch_state "$old")")
+  hashes+=("$(status_hash "$old")")
+  sizes+=("$(du -sk "$old" | awk '{print $1}')")
+done
+
+if (( ${#old_paths[@]} != 36 || ${#seen_destinations[@]} != 36 )); then
+  print -u2 "move-set mismatch: paths=${#old_paths[@]} destinations=${#seen_destinations[@]}"
+  exit 1
+fi
+
+printf 'old_path\tdestination\thead\tbranch_state\tstatus_sha256\tdisk_kib\n' > "$SNAPSHOT"
+for (( i=1; i<=${#old_paths[@]}; i++ )); do
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "${old_paths[$i]}" "${destinations[$i]}" "${heads[$i]}" \
+    "${branches[$i]}" "${hashes[$i]}" "${sizes[$i]}" >> "$SNAPSHOT"
+  printf '%s -> %s\n' "${old_paths[$i]}" "${destinations[$i]}"
+done
+print "snapshot=$SNAPSHOT"
+
+if [[ "$MODE" == "--dry-run" ]]; then
+  print "dry-run verified 36 moves; no paths changed"
+  exit 0
+fi
+
+for (( i=1; i<=${#old_paths[@]}; i++ )); do
+  [[ "${old_paths[$i]}" == "$INTEGRATION_OLD" ]] || order+=("$i")
+done
+for (( i=1; i<=${#old_paths[@]}; i++ )); do
+  [[ "${old_paths[$i]}" == "$INTEGRATION_OLD" ]] && order+=("$i")
+done
+
+for i in "${order[@]}"; do
+  old="${old_paths[$i]}"
+  destination="${destinations[$i]}"
+  mkdir -p "$(dirname "$destination")"
+  git -C "$PRIMARY" worktree move "$old" "$destination"
+  if [[ -e "$old" ]] ||
+     [[ "$(git -C "$destination" rev-parse HEAD)" != "${heads[$i]}" ]] ||
+     [[ "$(branch_state "$destination")" != "${branches[$i]}" ]] ||
+     [[ "$(status_hash "$destination")" != "${hashes[$i]}" ]]; then
+    print -u2 "verification failed after move: $old -> $destination"
+    if [[ ! -e "$old" ]]; then
+      mkdir -p "$(dirname "$old")"
+      git -C "$PRIMARY" worktree move "$destination" "$old" || true
+    fi
+    exit 1
+  fi
+  printf 'verified\t%s\t%s\n' "$old" "$destination" >> "$SNAPSHOT.moved"
+done
+
+print "execute verified 36 moves"
+```
+
+- [ ] **Step 3: Validate the driver contract**
+
+```bash
+zsh -n /tmp/mtplx-relocate-worktrees.zsh
+rg -n '!= 38|!= 36|old_paths|status_hash|submodule status|worktree move|INTEGRATION_OLD' \
+  /tmp/mtplx-relocate-worktrees.zsh
+```
+
+Expected: syntax passes and the driver contains the registry, count, status,
+submodule, move, and move-integration-last guards.
+
+- [ ] **Step 4: Dry-run the mapping**
+
+```bash
+zsh /tmp/mtplx-relocate-worktrees.zsh --dry-run
+```
+
+Expected: exit zero, 36 collision-free old-to-new mappings printed, snapshot written, no paths moved, and the registry unchanged.
+
+### Task 3: Move and immediately verify 36 worktrees
+
+**Files:**
+- Move: 36 registered worktree directories
+
+**Security flag:** `none`
+
+**Does NOT cover:** The primary checkout and active `29-cache-scheduling` exception remain at their original paths.
+
+- [ ] **Step 1: Revalidate the dry-run snapshot immediately before mutation**
+
+```bash
+test "$(git -C /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd \
+  worktree list --porcelain | rg -c '^worktree ')" = 38
+! ps -axo command= | rg 'git .*worktree (move|remove|add)'
+```
+
+Expected: registry and process admission still match the dry run.
+
+- [ ] **Step 2: Execute each move from the retained primary checkout**
+
+For each snapshot row, the driver must run:
+
+```bash
+mkdir -p "$(dirname "$destination")"
+git -C "$PRIMARY" worktree move "$old_path" "$destination"
+```
+
+Move `mtplx-experimental-pr13-pr14-main` last. Never use `--force`.
+
+- [ ] **Step 3: Verify immediately after every move**
+
+Require the destination's HEAD, branch/detached state, and status hash to equal
+the snapshot and require the old path to be absent. If any check fails and the
+old path is free, move that single worktree back and stop. Do not continue after
+a mismatch.
+
+- [ ] **Step 4: Execute the migration**
+
+```bash
+cd /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd
+zsh /tmp/mtplx-relocate-worktrees.zsh --execute
+```
+
+Expected: 36 moves and 36 immediate verification passes; primary and active exception untouched.
+
+- [ ] **Step 5: Remove only empty former grouping directories**
+
+```bash
+rmdir /Users/davidtai/projects/OpenSourceWTF/mtplx-opt-prs 2>/dev/null || true
+rmdir /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-stack 2>/dev/null || true
+rmdir /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.claude/worktrees 2>/dev/null || true
+```
+
+Expected: empty containers disappear; nonempty directories are preserved. Do not remove `/Users/davidtai/projects/OpenSourceWTF/.worktrees/`.
+
+### Task 4: Verify final local and remote state
+
+**Files:**
+- Test: Git worktree registry, dirty-state snapshot, default branch, CI, Qwen/lock state
+
+**Security flag:** `none`
+
+- [ ] **Step 1: Verify registry placement and identity**
+
+```bash
+PRIMARY=/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd
+ACTIVE=/Users/davidtai/projects/OpenSourceWTF/.worktrees/29-cache-scheduling
+test "$(git -C "$PRIMARY" worktree list --porcelain | rg -c '^worktree ')" = 38
+test "$(git -C "$PRIMARY" worktree list --porcelain |
+  rg -c "^worktree $PRIMARY/\.worktrees/")" = 36
+test "$(git -C "$PRIMARY" worktree list --porcelain |
+  rg -c "^worktree $ACTIVE$")" = 1
+```
+
+Expected: one primary, one active exception, and 36 canonical auxiliary worktrees.
+
+- [ ] **Step 2: Verify all snapshot identities and dirty-state hashes**
+
+For all 36 snapshot rows, recompute HEAD, branch/detached state, and porcelain
+status hash at the destination and require exact equality. Require every old
+path to be absent. Verify the active exception's registered path and HEAD are
+unchanged from preflight without traversing its contents.
+
+- [ ] **Step 3: Verify repository/default-branch state**
+
+```bash
+NEW_ACTIVE=$PRIMARY/.worktrees/mtplx-experimental-pr13-pr14-main
+test -z "$(git -C "$NEW_ACTIVE" status --porcelain)"
+test "$(gh repo view davidtai/MTPLX --json defaultBranchRef --jq '.defaultBranchRef.name')" = \
+  experiment/moe-pr13-pr14-stack
+test "$(git -C "$NEW_ACTIVE" symbolic-ref --short refs/remotes/origin/HEAD)" = \
+  origin/experiment/moe-pr13-pr14-stack
+test "$(git -C "$NEW_ACTIVE" rev-parse HEAD)" = \
+  "$(git -C "$NEW_ACTIVE" rev-parse origin/experiment/moe-pr13-pr14-stack)"
+```
+
+Expected: clean default work-off branch at the same pushed commit and unchanged GitHub/local default branch.
+
+- [ ] **Step 4: Verify ignore, CI, and service invariants**
+
+```bash
+git -C "$PRIMARY" check-ignore -v .worktrees/example/file
+test -z "$(gh pr checks 32 --repo davidtai/MTPLX --json state \
+  --jq '.[] | select(.state != "SUCCESS") | .name')"
+test ! -d /tmp/mtplx-gpu-exclusive
+curl -fsS --max-time 3 http://127.0.0.1:8080/v1/models |
+  jq -e '.data[] | select(.id == "mtplx-qwen36-27b-optimized-speed")'
+```
+
+Expected: local ignore active, PR checks green, GPU lock absent, and Qwen unchanged/ready.
+
+- [ ] **Step 5: Mark the plan complete and publish the evidence-only update**
+
+From `$NEW_ACTIVE`, mark all plan checkboxes complete, run `git diff --check`,
+commit only the plan update as `docs: record worktree relocation completion`,
+push, and wait for all PR #32 checks to pass again.
