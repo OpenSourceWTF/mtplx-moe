@@ -27,25 +27,54 @@ from .constants import (
 )
 from .profiles import (
     DEFAULT_FP16_HF_MODEL_ID,
+    DEFAULT_FP16_PUBLIC_MODEL_ID,
     DEFAULT_HF_MODEL_ID,
+    DEFAULT_PUBLIC_MODEL_ID,
     LEGACY_OPTIMIZED_HF_MODEL_ID,
+    LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
+    QUALITY_FP16_HF_MODEL_ID,
+    QUALITY_FP16_PUBLIC_MODEL_ID,
     QUALITY_HF_MODEL_ID,
+    QUALITY_PUBLIC_MODEL_ID,
     QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+    QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
     QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
+    QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID,
     QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID,
     QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
     QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
 )
 
 MTP_KEY_PREFIXES = ("mtp.", "language_model.mtp.")
 _KNOWN_PUBLIC_MODEL_ALIASES = {
+    # Served public ids (the exact strings /v1/models advertises) resolve to
+    # their first-party repos. Explicit ids only — consistent with the July
+    # 2026 contract-match-only identity stance (#57): pasting the id the
+    # server displayed into `mtplx serve/run/pull --model` must work.
+    DEFAULT_PUBLIC_MODEL_ID: DEFAULT_HF_MODEL_ID,
+    DEFAULT_FP16_PUBLIC_MODEL_ID: DEFAULT_FP16_HF_MODEL_ID,
+    QUALITY_PUBLIC_MODEL_ID: QUALITY_HF_MODEL_ID,
+    QUALITY_FP16_PUBLIC_MODEL_ID: QUALITY_FP16_HF_MODEL_ID,
+    LEGACY_OPTIMIZED_PUBLIC_MODEL_ID: LEGACY_OPTIMIZED_HF_MODEL_ID,
+    QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID: QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
+    QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID: QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID: QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID: QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID: QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID: QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
+    # Artifact-basename aliases (folder-name style).
     "qwen3.5-9b-mtplx-optimized-speed": QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
     "qwen3.5-9b-mtplx-optimized-speed-fp16": QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
     "qwen3.6-27b-mtplx-optimized-speed": DEFAULT_HF_MODEL_ID,
     "qwen3.6-27b-mtplx-optimized": LEGACY_OPTIMIZED_HF_MODEL_ID,
     "qwen3.6-27b-mtplx-optimized-speed-fp16": DEFAULT_FP16_HF_MODEL_ID,
     "qwen3.6-27b-mtplx-optimized-quality": QUALITY_HF_MODEL_ID,
+    "qwen3.6-27b-mtplx-optimized-quality-fp16": QUALITY_FP16_HF_MODEL_ID,
     "qwen3.6-35b-a3b-mtplx-optimized-speed": QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
     "qwen3.6-35b-a3b-mtplx-optimized-speed-fp16": QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
     "qwen3.6-35b-a3b-mtplx-optimized-balance": QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
@@ -782,7 +811,6 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
             config = dict(target_config)
             config["assistant_pair_bundle"] = pair_manifest
             config["mtplx_pair.json"] = True
-            config_path = target_path
             config_error = None
     if config is None:
         raise RuntimeError(

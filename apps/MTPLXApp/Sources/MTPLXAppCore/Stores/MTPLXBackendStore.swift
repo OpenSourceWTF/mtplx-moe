@@ -509,6 +509,25 @@ public final class MTPLXBackendStore: ObservableObject {
         target: LaunchTarget?,
         attemptedPortRemediation: Bool
     ) async {
+        // `mtplx serve` refuses non-loopback binds without an API key
+        // (validate_server_security_args) — the process exits at argparse
+        // and the app used to surface only a generic "Degraded" (issue
+        // #109). Fail the launch here with the actionable sentence instead.
+        let bindHost = configuration.host
+        if !MTPLXServerURLs.isLoopbackBind(bindHost),
+           (configuration.apiKey ?? "").isEmpty {
+            let message =
+                "Serving on \(bindHost) exposes MTPLX beyond this Mac, so an "
+                + "API key is required. Set one under Settings → API key, or "
+                + "change the host back to 127.0.0.1."
+            daemonState = .degraded(message)
+            startupPhase = .failed(message)
+            await supervisor.logs.append(
+                "launch blocked: host \(bindHost) requires an API key",
+                stream: .system
+            )
+            return
+        }
         let target = target ?? defaultLaunchTarget(for: configuration)
         if let target {
             var next = configuration
@@ -712,11 +731,18 @@ public final class MTPLXBackendStore: ObservableObject {
                 return
             }
             occupantDescription = "an MTPLX server started outside the app"
+        case .unauthorized:
+            occupantDescription = "a server requiring a different API key"
         case .foreign:
             occupantDescription = "another app"
         }
         let occupiedPort = configuration.port
-        guard let freePort = PortPreflight.nextFreePort(after: occupiedPort) else {
+        guard
+            let freePort = PortPreflight.nextFreePort(
+                after: occupiedPort,
+                bindHost: configuration.host
+            )
+        else {
             // No port available; let supervisor.start surface the failure.
             return
         }
@@ -759,11 +785,16 @@ public final class MTPLXBackendStore: ObservableObject {
             apiKey: configuration.apiKey
         )
         switch occupant {
-        case .mtplxServer, .foreign:
+        case .mtplxServer, .unauthorized, .foreign:
             await preflightConfiguredPort(target: target, launchID: launchID)
             return true
         case .free:
-            guard let freePort = PortPreflight.nextFreePort(after: occupiedPort) else {
+            guard
+                let freePort = PortPreflight.nextFreePort(
+                    after: occupiedPort,
+                    bindHost: configuration.host
+                )
+            else {
                 return false
             }
             var next = configuration
@@ -1206,6 +1237,10 @@ public final class MTPLXBackendStore: ObservableObject {
             await refreshPrefillHistory()
             await refreshModels()
             await refreshLogs()
+        } catch is DecodingError {
+            // The daemon answered; only the app-side schema mapping failed.
+            // Never treat a decode bug as a dead daemon (2026-07-06 reap).
+            throw MTPLXAPIClientError.invalidResponse
         } catch {
             markDaemonUnreachableIfNeeded(
                 reason: "MTPLX lost contact with the model server. Start it again."
@@ -1217,6 +1252,8 @@ public final class MTPLXBackendStore: ObservableObject {
     public func refreshSnapshot() async throws {
         do {
             apply(snapshot: try await apiClient.snapshot())
+        } catch is DecodingError {
+            throw MTPLXAPIClientError.invalidResponse
         } catch {
             markDaemonUnreachableIfNeeded(
                 reason: "MTPLX lost contact with live metrics. Start it again."
@@ -1713,6 +1750,7 @@ public final class MTPLXBackendStore: ObservableObject {
         healthWatchTask = Task { @MainActor [weak self] in
             defer { probeClient.session.finishTasksAndInvalidate() }
             var consecutiveMisses = 0
+            var loggedUndecodable = false
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
                 guard let self, !Task.isCancelled else { return }
@@ -1720,13 +1758,48 @@ public final class MTPLXBackendStore: ObservableObject {
                     consecutiveMisses = 0
                     continue
                 }
-                if let health = await probeClient.healthWithinDeadline(
+                switch await probeClient.livenessWithinDeadline(
                     seconds: Self.watchdogProbeDeadlineSeconds
-                ), health.ok {
+                ) {
+                case .healthy(let health) where health.ok:
                     consecutiveMisses = 0
                     self.health = health
                     self.currentFanMode = self.verifiedFanMode(from: health)
                     continue
+                case .healthy:
+                    // Answered but self-reported not-ok: treat as a miss so a
+                    // daemon stuck unhealthy still gets reaped eventually.
+                    break
+                case .aliveUndecodable(let detail):
+                    // The daemon answered 2xx — it is alive. A payload the
+                    // app cannot decode is an app-schema bug, never grounds
+                    // to kill a serving process (2026-07-06: the watchdog
+                    // reaped a healthy daemon 95 s after an OpenCode run
+                    // because one /health field stopped matching Codable).
+                    consecutiveMisses = 0
+                    if !loggedUndecodable {
+                        loggedUndecodable = true
+                        let excerpt = String(detail.prefix(300))
+                        await self.supervisor.logs.append(
+                            "health payload undecodable; daemon is alive, watchdog standing down on schema (\(excerpt))",
+                            stream: .system
+                        )
+                    }
+                    continue
+                case .aliveUnauthorized:
+                    // 401/403 proves a live daemon; an API-key mismatch is a
+                    // configuration problem, never grounds to reap.
+                    consecutiveMisses = 0
+                    if !loggedUndecodable {
+                        loggedUndecodable = true
+                        await self.supervisor.logs.append(
+                            "health probe rejected with 401/403; daemon is alive, check the API key in Settings",
+                            stream: .system
+                        )
+                    }
+                    continue
+                case .unreachable:
+                    break
                 }
                 consecutiveMisses += 1
                 guard consecutiveMisses >= 2 else { continue }
@@ -2525,9 +2598,17 @@ public final class MTPLXBackendStore: ObservableObject {
         MTPLXAPIClient(baseURL: baseURL, apiKey: configuration.apiKey)
     }
 
-    /// Daemon base URL (`http://<host>:<port>`).
+    /// Connectable daemon base URL. The configured host is a BIND address;
+    /// wildcard binds (0.0.0.0 / ::) resolve to 127.0.0.1 for the app's own
+    /// connections — probing http://0.0.0.0 made the port preflight, the
+    /// startup health wait, and the watchdog all fail against a healthy LAN
+    /// daemon (issue #109). The verbatim bind host still flows to `--host`
+    /// via MTPLXCommandBuilder.
     public var baseURL: URL {
-        URL(string: "http://\(configuration.host):\(configuration.port)")!
+        MTPLXServerURLs.baseURL(
+            bindHost: configuration.host,
+            port: configuration.port
+        )
     }
 
     private func scheduleLateHealthRecovery(launchID: String, target: LaunchTarget?) {

@@ -110,7 +110,20 @@ public final class ChatViewModel: ObservableObject {
         guard let handoffAssistantMessageID else { return true }
         return !visibleMessages.contains { $0.id == handoffAssistantMessageID }
     }
+    /// Every tool trace of the CURRENT turn, oldest first — accumulates
+    /// across tool rounds so the live activity strip lists the whole
+    /// turn's searches, not just the round in flight.
     @Published public private(set) var pendingToolTraces: [PendingToolTrace] = []
+    /// Deduped sources gathered so far in the CURRENT turn. Drives the
+    /// live sources footer under the streaming answer bubble; frozen
+    /// into `sourcesJSON` on the final persist.
+    @Published public private(set) var liveTurnSources: [SourceRecord] = []
+    /// Identity shared by every assistant/tool message this turn's
+    /// tool loop persists. Published so the transcript can EXCLUDE the
+    /// in-flight turn's persisted rounds while the live surface is
+    /// their one representation; the grouped transcript re-unites the
+    /// rounds under this id once the turn settles.
+    @Published public private(set) var currentTurnGroupID: UUID?
     @Published public private(set) var chatDecodeReading: HeadlineDecodeReading = .absent
     @Published public var pendingAttachments: [ChatAttachment] = []
     @Published public var lastError: ChatError?
@@ -158,6 +171,18 @@ public final class ChatViewModel: ObservableObject {
     private var roundStats: ChatStreamStats?
     private var turnStartedAt: Date?
     private var reasoningStartedAt: Date?
+    /// Raw (un-deduped) sources gathered across the turn's tool calls;
+    /// deduped into `liveTurnSources` after every tool completes and
+    /// frozen into `sourcesJSON` on the final persist.
+    private var turnSourceAccumulator: [SourceRecord] = []
+    /// Sum of completed think spans in earlier rounds of this turn.
+    /// The live span (reasoningStartedAt → now/first-answer-token) is
+    /// added on top when the turn finishes.
+    private var completedThinkingMs: Int = 0
+    /// Character offset into the accumulated live reasoning document
+    /// where the CURRENT round's reasoning begins. The document only
+    /// ever appends, so a count-based offset stays valid.
+    private var roundReasoningStartOffset: Int = 0
     private var streamingReasoningBuffer = ""
     private var streamingContentBuffer = ""
     private var streamFlushTask: Task<Void, Never>?
@@ -166,6 +191,9 @@ public final class ChatViewModel: ObservableObject {
     // text, so this can feel token-by-token without invoking markdown/layout
     // work for every raw network event.
     private static let streamFlushInterval: Duration = .milliseconds(16)
+    /// Hard bound on how far a coalescing buffer may run ahead of its
+    /// document if the flush task ever stalls (freeze backstop).
+    private static let streamBufferFlushBackstop = 1_024
     private static let liveDecodeUpdateInterval: TimeInterval = 0.20
     private static let requestContextCharacterBudget = 64_000
     private static let requestRecentVerbatimMessageCount = 8
@@ -405,10 +433,14 @@ public final class ChatViewModel: ObservableObject {
         hasStreamingContent = false
         handoffAssistantMessageID = nil
         pendingToolTraces = []
+        liveTurnSources = []
         chatDecodeReading = .absent
         roundToolCalls = [:]
         turnStartedAt = Date()
         reasoningStartedAt = nil
+        currentTurnGroupID = UUID()
+        turnSourceAccumulator = []
+        completedThinkingMs = 0
         currentRequestId = nil
         lastError = nil
         streamingReasoningBuffer = ""
@@ -517,25 +549,39 @@ public final class ChatViewModel: ObservableObject {
             let finalStats = roundStats
 
             if finishReason == "tool_calls", round <= maxToolRounds {
+                // Close this round's think span before persisting so
+                // the final "Thought · Ns" chip sums every round.
+                closeThinkingSpan()
                 // Persist the assistant turn that requested the tool
                 // calls, then dispatch each call and append role:"tool"
-                // responses, then continue the loop.
+                // responses, then continue the loop. The message stores
+                // only THIS round's reasoning (the live document now
+                // accumulates across rounds for the single-card UI);
+                // traces are persisted with real args/results in the
+                // dispatch loop below — passing pendingToolTraces here
+                // re-persisted the PREVIOUS round's traces as arg-less
+                // duplicates on the next message (the query-less
+                // "Web Search" chips in pre-2026-07-02 transcripts).
                 let assistantMessage = persistAssistantTurn(
                     conversation: conversation,
                     finishReason: finishReason,
                     usage: finalUsage,
                     stats: finalStats,
                     toolCalls: Array(accumulatedToolCalls.values),
-                    traces: pendingToolTraces
+                    traces: [],
+                    reasoningOverride: currentRoundReasoning
                 )
                 messages.append(
                     Self.assistantRequestMessage(from: assistantMessage)
                 )
-                pendingToolTraces.removeAll()
 
                 for call in accumulatedToolCalls.values {
                     if Task.isCancelled { break }
-                    let traceId = call.id
+                    // pendingToolTraces accumulates across rounds (the
+                    // live strip shows the whole turn), so the UI trace
+                    // id is round-prefixed — engine call ids can repeat
+                    // between rounds and must not collide.
+                    let traceId = "r\(round)-\(call.id)"
                     pendingToolTraces.append(
                         PendingToolTrace(
                             id: traceId,
@@ -555,6 +601,11 @@ public final class ChatViewModel: ObservableObject {
                         trace.status = .success
                         trace.detail = Self.shortResultDetail(for: call.name, json: result)
                     }
+                    accumulateTurnSources(
+                        toolName: call.name,
+                        argumentsJSON: call.arguments,
+                        resultJSON: result
+                    )
                     persistToolTrace(
                         on: assistantMessage,
                         id: call.id,
@@ -575,6 +626,7 @@ public final class ChatViewModel: ObservableObject {
                         role: .tool,
                         visibleContent: result,
                         toolCallId: call.id,
+                        turnGroupID: currentTurnGroupID,
                         createdAt: Date(),
                         conversation: conversation
                     )
@@ -584,11 +636,30 @@ public final class ChatViewModel: ObservableObject {
                 saveContext()
                 refreshVisibleMessages()
 
+                // Single-card continuity: the thinking document is NOT
+                // reset between rounds. Any visible narration the model
+                // emitted before calling tools ("Let me search for…")
+                // is process talk, not the answer — fold it into the
+                // thinking stream so it never pops up as a stray
+                // half-answer bubble, then mark the round boundary.
+                let narration = streamingContent
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !narration.isEmpty {
+                    appendThinkingRoundSeparatorIfNeeded()
+                    streamingReasoningDocument.append(narration)
+                    hasStreamingReasoning = true
+                }
+                appendThinkingRoundSeparatorIfNeeded()
+                roundReasoningStartOffset = streamingReasoning.count
+
                 streamingContentDocument.reset()
-                streamingReasoningDocument.reset()
+                streamingContentBuffer = ""
                 hasStreamingContent = false
-                hasStreamingReasoning = false
-                streamingPhase = .answering
+                streamingPhase = .thinking
+                // Start the next round from a fully flushed document so
+                // the live thought viewport can never sit on a stale
+                // pre-boundary state while round-2 tokens buffer.
+                flushStreamingBuffers()
                 if round == maxToolRounds {
                     // Final pass: stop the model from issuing more tool
                     // calls so the user always gets a concrete answer.
@@ -598,14 +669,18 @@ public final class ChatViewModel: ObservableObject {
             }
 
             // Plain finish (stop / length / unknown). Persist and stop.
+            closeThinkingSpan()
             let assistantMessage = persistAssistantTurn(
                 conversation: conversation,
                 finishReason: finishReason,
                 usage: finalUsage,
                 stats: finalStats,
                 toolCalls: Array(accumulatedToolCalls.values),
-                traces: pendingToolTraces,
-                publishImmediately: false
+                traces: [],
+                publishImmediately: false,
+                reasoningOverride: currentRoundReasoning,
+                sourcesJSON: SourceRecord.encodeJSON(liveTurnSources),
+                thinkingTimeMs: completedThinkingMs > 0 ? completedThinkingMs : nil
             )
             updateChatDecodeReading(from: finalStats)
             publishVisibleMessages(for: conversation, ensuring: assistantMessage)
@@ -664,6 +739,11 @@ public final class ChatViewModel: ObservableObject {
         if wasEmpty {
             hasStreamingReasoning = true
             flushStreamingBuffers()
+        } else if streamingReasoningBuffer.count > Self.streamBufferFlushBackstop {
+            // Backstop: the 16 ms flush loop is the cadence; this bound
+            // guarantees the live viewport can never lag more than ~1KB
+            // behind the stream even if that task stalls.
+            flushStreamingBuffers()
         }
         if streamingContent.isEmpty, streamingPhase != .thinking {
             streamingPhase = .thinking
@@ -674,8 +754,15 @@ public final class ChatViewModel: ObservableObject {
         guard !fragment.isEmpty else { return }
         let wasEmpty = streamingContent.isEmpty
         streamingContentBuffer.append(fragment)
+        if !wasEmpty, streamingContentBuffer.count > Self.streamBufferFlushBackstop {
+            flushStreamingBuffers()
+        }
         if wasEmpty {
             hasStreamingContent = true
+            // The think span ends the moment answer tokens start; a
+            // later reasoningDelta (interleaved thinking) opens a new
+            // span, so multi-burst turns sum every burst.
+            closeThinkingSpan()
         }
         if streamingPhase != .answering {
             streamingPhase = .answering
@@ -749,6 +836,52 @@ public final class ChatViewModel: ObservableObject {
         pendingToolTraces[index] = trace
     }
 
+    // MARK: - Turn aggregation (single-card thinking + sources footer)
+
+    /// The slice of the live reasoning document that belongs to the
+    /// round currently streaming. Earlier rounds' reasoning stays in
+    /// the document (one continuously-growing card) but is already
+    /// persisted on earlier messages. The slice is stored VERBATIM —
+    /// trimming is only used to decide emptiness, so a single-round
+    /// turn persists byte-for-byte what the model emitted.
+    private var currentRoundReasoning: String? {
+        let full = streamingReasoning
+        guard roundReasoningStartOffset < full.count else { return nil }
+        let slice = String(full.dropFirst(roundReasoningStartOffset))
+        let isBlank = slice
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+        return isBlank ? nil : slice
+    }
+
+    private func appendThinkingRoundSeparatorIfNeeded() {
+        let text = streamingReasoningDocument.rawText
+        guard !text.isEmpty, !text.hasSuffix("\n\n") else { return }
+        streamingReasoningDocument.append(text.hasSuffix("\n") ? "\n" : "\n\n")
+    }
+
+    /// Fold the live think span (if one is open) into the turn total.
+    private func closeThinkingSpan(at end: Date = Date()) {
+        guard let start = reasoningStartedAt else { return }
+        completedThinkingMs += max(0, Int(end.timeIntervalSince(start) * 1000))
+        reasoningStartedAt = nil
+    }
+
+    private func accumulateTurnSources(
+        toolName: String,
+        argumentsJSON: String?,
+        resultJSON: String?
+    ) {
+        let extracted = SourceRecord.extract(
+            toolName: toolName,
+            argumentsJSON: argumentsJSON,
+            resultJSON: resultJSON
+        )
+        guard !extracted.isEmpty else { return }
+        turnSourceAccumulator.append(contentsOf: extracted)
+        liveTurnSources = SourceRecord.dedupe(turnSourceAccumulator)
+    }
+
     // MARK: - Stream UI coalescing
 
     private func startStreamFlushLoop(generation: Int) {
@@ -804,7 +937,10 @@ public final class ChatViewModel: ObservableObject {
         stats: ChatStreamStats?,
         toolCalls: [AccumulatingToolCall],
         traces: [PendingToolTrace],
-        publishImmediately: Bool = true
+        publishImmediately: Bool = true,
+        reasoningOverride: String?,
+        sourcesJSON: String? = nil,
+        thinkingTimeMs: Int? = nil
     ) -> ChatMessage {
         let toolCallRecords = toolCalls.map { call in
             ToolCallRecord(id: call.id, name: call.name, arguments: call.arguments)
@@ -829,7 +965,8 @@ public final class ChatViewModel: ObservableObject {
             acceptedByDepth: stats?.acceptedByDepth,
             draftedByDepth: stats?.draftedByDepth,
             verifyCalls: stats?.verifyCalls,
-            verifyTimeS: stats?.verifyTimeS
+            verifyTimeS: stats?.verifyTimeS,
+            thinkingTimeMs: thinkingTimeMs
         )
         let statsJSON: String? = {
             guard let data = try? JSONEncoder().encode(chatStats),
@@ -838,13 +975,20 @@ public final class ChatViewModel: ObservableObject {
             return str
         }()
 
+        // The live reasoning document accumulates across tool rounds
+        // (single-card UI); each persisted message stores only its own
+        // round's slice via `reasoningOverride` so replays and the
+        // grouped transcript never double-count a round.
+        let reasoning = reasoningOverride
         let message = ChatMessage(
             role: .assistant,
             visibleContent: streamingContent,
-            reasoningContent: streamingReasoning.isEmpty ? nil : streamingReasoning,
+            reasoningContent: reasoning,
             toolCallsJSON: toolCallsJSON,
             statsJSON: statsJSON,
             finishReason: finishReason,
+            turnGroupID: currentTurnGroupID,
+            sourcesJSON: sourcesJSON,
             createdAt: Date(),
             conversation: conversation
         )
@@ -899,6 +1043,11 @@ public final class ChatViewModel: ObservableObject {
         currentRequestId = nil
         turnStartedAt = nil
         reasoningStartedAt = nil
+        currentTurnGroupID = nil
+        turnSourceAccumulator = []
+        liveTurnSources = []
+        completedThinkingMs = 0
+        roundReasoningStartOffset = 0
         lastLiveDecodeUpdateAt = .distantPast
         pendingToolTraces = []
         streamingContentDocument.reset()
@@ -914,13 +1063,20 @@ public final class ChatViewModel: ObservableObject {
         guard isStreaming, let conversation = current else { return }
         flushLeakedThinkingSplitter()
         flushStreamingBuffers()
+        closeThinkingSpan()
         var partialMessage: ChatMessage?
-        if !streamingContent.isEmpty || !streamingReasoning.isEmpty {
+        if !streamingContent.isEmpty || currentRoundReasoning != nil {
+            // Store only the interrupted ROUND's reasoning — earlier
+            // rounds of this turn were already persisted on their own
+            // messages, and the shared turnGroupID re-unites them in
+            // the transcript.
             let message = ChatMessage(
                 role: .assistant,
                 visibleContent: streamingContent,
-                reasoningContent: streamingReasoning.isEmpty ? nil : streamingReasoning,
+                reasoningContent: currentRoundReasoning,
                 finishReason: reason,
+                turnGroupID: currentTurnGroupID,
+                sourcesJSON: SourceRecord.encodeJSON(liveTurnSources),
                 createdAt: Date(),
                 conversation: conversation
             )
@@ -972,6 +1128,11 @@ public final class ChatViewModel: ObservableObject {
         streamingContentBuffer = ""
         leakedThinkingSplitter.reset()
         pendingToolTraces = []
+        liveTurnSources = []
+        turnSourceAccumulator = []
+        currentTurnGroupID = nil
+        completedThinkingMs = 0
+        roundReasoningStartOffset = 0
         currentRequestId = nil
         chatDecodeReading = .absent
         lastError = nil

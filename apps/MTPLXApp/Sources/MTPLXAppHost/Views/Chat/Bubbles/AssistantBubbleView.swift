@@ -4,69 +4,112 @@ import MTPLXAppCore
 
 // MARK: - AssistantBubbleView
 //
-// Left-anchored bubble for persisted `role == .assistant` turns.
-// Composes (top to bottom): optional `ThinkingCard` collapsed, then
-// markdown content via `AssistantMarkdownView`, then any persisted
-// `ToolTraceRecord`s as compact `AssistantTraceSurface`s.
+// Left-anchored surface for one persisted assistant TURN — which may
+// span several stored messages when web search ran (think → search →
+// think → answer). Composes (top to bottom): ONE `TurnActivityStrip`
+// (equal-width Thought / Searched chips whose detail wells expand on
+// tap), the answer markdown, then a compact `SourcesFooterView`
+// capsule. The strip has the exact same geometry as the streaming
+// surface's, so the live→settled handoff doesn't jump (2026-07-03
+// chat-UX redesign).
 //
 // Container: 576pt max width, `Brand.cardSurface` fill, `Brand.separator`
 // border, mirrored asymmetric corners (small 4pt on bottom-leading —
 // the tail side; large 14pt elsewhere).
 
 struct AssistantBubbleView: View {
-    let message: ChatMessage
+    let group: AssistantTurnGroup
+    private let message: ChatMessage
+    private let combinedReasoning: String
+    private let sources: [SourceRecord]
+    private let searchQueries: [String]
+    private let fetchedPageCount: Int
+    private let thinkingTimeMs: Int?
     private let metricItems: [MetricItem]
     private let replyCopyText: String
     private let isInterruptedReply: Bool
     private let longReplyPreviewText: String?
     @State private var isHovered: Bool = false
     @State private var expandedLongReply: Bool = false
+    @State private var expandedDetail: TurnActivityModel.Detail = .none
 
-    init(message: ChatMessage) {
-        self.message = message
-        self.metricItems = Self.formattedMetrics(from: message.statsJSON)
-        self.replyCopyText = message.visibleContent.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.isInterruptedReply = Self.isInterruptedFinishReason(message.finishReason)
+    init(group: AssistantTurnGroup) {
+        self.group = group
+        let finalMessage = group.finalMessage
+        self.message = finalMessage
+        self.combinedReasoning = group.combinedReasoning
+        self.sources = group.sources
+        self.searchQueries = group.searchQueries
+        self.fetchedPageCount = group.fetchedPageCount
+        self.thinkingTimeMs = group.thinkingTimeMs
+        self.metricItems = Self.formattedMetrics(from: finalMessage.statsJSON)
+        self.replyCopyText = finalMessage.visibleContent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        self.isInterruptedReply = Self.isInterruptedFinishReason(finalMessage.finishReason)
         self.longReplyPreviewText = Self.longReplyPreview(for: self.replyCopyText)
     }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            // Reasoning lives OUTSIDE the bubble as a small compact
-            // chip the user can expand on demand. Matches the live
-            // streaming layout, so a turn looks identical before and
-            // after completion.
-            if let reasoning = message.reasoningContent, !reasoning.isEmpty {
-                ThinkingCard(
-                    content: reasoning,
-                    isStreaming: false,
-                    isCompact: true
+    init(message: ChatMessage) {
+        self.init(group: AssistantTurnGroup(id: message.id, members: [message]))
+    }
+
+    private var activityModel: TurnActivityModel {
+        TurnActivityModel.settled(
+            hasThought: !combinedReasoning.isEmpty,
+            thinkingTimeMs: thinkingTimeMs,
+            searchCount: searchQueries.count,
+            fetchedPageCount: fetchedPageCount,
+            hasOtherToolActivity: !group.traces.isEmpty
+        )
+    }
+
+    /// Search-well receipt rows: one per query, plus a page-read
+    /// summary line when the turn fetched pages.
+    private var settledActivityRows: [ThinkingActivityRow] {
+        var rows = searchQueries.enumerated().map { index, query in
+            ThinkingActivityRow(
+                id: "query-\(index)",
+                systemName: "magnifyingglass",
+                text: query,
+                detail: "",
+                isLive: false
+            )
+        }
+        if fetchedPageCount > 0 {
+            rows.append(
+                ThinkingActivityRow(
+                    id: "fetched-pages",
+                    systemName: "doc.text",
+                    text: fetchedPageCount == 1
+                        ? "Read 1 page"
+                        : "Read \(fetchedPageCount) pages",
+                    detail: "",
+                    isLive: false
                 )
-                .frame(maxWidth: 576, alignment: .leading)
-            }
-            // Tool traces ALSO live OUTSIDE the bubble — they are
-            // process metadata, not the assistant's spoken reply.
-            // Rendered as standalone compact chips above the text
-            // bubble, identical to the streaming layout.
-            if !message.toolTraces.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(message.toolTraces, id: \.id) { trace in
-                        AssistantTraceSurface(
-                            title: Self.traceTitle(for: trace.name),
-                            subtitle: Self.traceSubtitle(for: trace),
-                            detail: Self.traceDetail(for: trace),
-                            systemName: Self.traceIcon(for: trace.name),
-                            isCompact: true,
-                            isLive: false,
-                            defaultExpanded: false
-                        )
-                    }
+            )
+        }
+        return rows
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // The turn's whole activity record — reasoning and tool
+            // work — as ONE strip of tap-to-expand chips above the
+            // answer, matching the streaming surface exactly.
+            TurnActivityStrip(
+                model: activityModel,
+                expandedDetail: $expandedDetail,
+                thoughtWell: {
+                    SettledThoughtWell(content: combinedReasoning)
+                },
+                searchWell: {
+                    SearchActivityWell(rows: settledActivityRows)
                 }
-                .frame(maxWidth: 576, alignment: .leading)
-            }
+            )
+            .frame(maxWidth: 576, alignment: .leading)
             let hasVisibleAnswer = !message.visibleContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            let hasReasoning = message.reasoningContent?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            let hasTrace = !message.toolTraces.isEmpty
+            let hasReasoning = !combinedReasoning.isEmpty
+            let hasTrace = !group.traces.isEmpty
             let hasToolCalls = message.toolCallsJSON?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
             if hasVisibleAnswer {
                 HStack(alignment: .top, spacing: 0) {
@@ -139,6 +182,10 @@ struct AssistantBubbleView: View {
                     Spacer(minLength: 60)
                 }
             }
+            // Where the turn's web sources live — one quiet pill row,
+            // not a card per fetched page.
+            SourcesFooterView(sources: sources)
+                .frame(maxWidth: 576, alignment: .leading)
             // Hover-revealed metrics footer (web-dashboard parity).
             // Renders in a fixed-height slot so the layout below
             // doesn't shift when it appears.
@@ -385,62 +432,4 @@ struct AssistantBubbleView: View {
         return String(format: "%.1fs", value)
     }
 
-    // MARK: - Trace presentation helpers
-
-    private static func traceTitle(for toolName: String) -> String {
-        switch toolName {
-        case "web_search": return "Web Search"
-        case "fetch_url": return "Fetched Page"
-        default: return toolName.replacingOccurrences(of: "_", with: " ").capitalized
-        }
-    }
-
-    private static func traceIcon(for toolName: String) -> String {
-        switch toolName {
-        case "web_search": return "globe"
-        case "fetch_url": return "link"
-        default: return "wrench.and.screwdriver"
-        }
-    }
-
-    private static func traceSubtitle(for trace: ToolTraceRecord) -> String {
-        guard let json = trace.argumentsJSON,
-            let data = json.data(using: .utf8),
-            let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return "" }
-        switch trace.name {
-        case "web_search":
-            return (dict["query"] as? String).map { "Searched: \($0)" } ?? ""
-        case "fetch_url":
-            return (dict["url"] as? String) ?? ""
-        default:
-            return ""
-        }
-    }
-
-    private static func traceDetail(for trace: ToolTraceRecord) -> String {
-        switch trace.status {
-        case .pending: return "Running…"
-        case .failed: return "Failed"
-        case .success:
-            guard let json = trace.resultJSON,
-                let data = json.data(using: .utf8),
-                let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { return "Completed" }
-            if let error = dict["error"] as? String {
-                return "Error: \(error)"
-            }
-            switch trace.name {
-            case "web_search":
-                if let results = dict["results"] as? [[String: Any]] {
-                    return "\(results.count) result\(results.count == 1 ? "" : "s")"
-                }
-                return "Completed"
-            case "fetch_url":
-                return (dict["title"] as? String).map { "Read: \($0)" } ?? "Completed"
-            default:
-                return "Completed"
-            }
-        }
-    }
 }

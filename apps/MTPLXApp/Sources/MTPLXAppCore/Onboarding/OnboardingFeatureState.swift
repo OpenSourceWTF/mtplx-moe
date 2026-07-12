@@ -187,7 +187,9 @@ public struct OnboardingFeatureState: Equatable, Sendable {
             let id = useFP16 ? "qwen36-35b-a3b-optimized-balance-fp16" : "qwen36-35b-a3b-optimized-balance"
             return catalog.first { $0.id == id }
         case .curatedQuality:
-            return catalog.first { $0.id == "optimized-quality" }
+            let useFP16 = hardware?.tier == .legacyApple
+            let id = useFP16 ? "optimized-quality-fp16" : "optimized-quality"
+            return catalog.first { $0.id == id }
         case .curatedGemmaSpeed:
             return catalog.first { $0.id == "gemma4-optimized-speed" }
         case .curatedStepFlash:

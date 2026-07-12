@@ -1636,9 +1636,13 @@ def gdn_forward_with_capture(
         "yes",
         "on",
     }:
+        from .kernel_selfcheck import lane_disabled
         from .kernels.fused_norm import fused_gdn_norm_gate
 
-        out = fused_gdn_norm_gate(out, z, gdn.norm.weight, gdn.norm.eps)
+        if lane_disabled("fused_gdn_norm_gate"):
+            out = gdn.norm(out, z)
+        else:
+            out = fused_gdn_norm_gate(out, z, gdn.norm.weight, gdn.norm.eps)
     else:
         out = gdn.norm(out, z)
     if not tail_projected:
@@ -1739,15 +1743,20 @@ def forward_with_gdn_capture(
             "yes",
             "on",
         }:
+            from .kernel_selfcheck import lane_disabled
             from .kernels.fused_norm import fused_add_rmsnorm
 
-            h, mlp_input = fused_add_rmsnorm(
-                hidden_states,
-                r,
-                layer.post_attention_layernorm.weight,
-                layer.post_attention_layernorm.eps,
-                threadgroup_size=512,
-            )
+            if lane_disabled("fused_add_rmsnorm"):
+                h = hidden_states + r
+                mlp_input = layer.post_attention_layernorm(h)
+            else:
+                h, mlp_input = fused_add_rmsnorm(
+                    hidden_states,
+                    r,
+                    layer.post_attention_layernorm.weight,
+                    layer.post_attention_layernorm.eps,
+                    threadgroup_size=512,
+                )
         else:
             h = hidden_states + r
             mlp_input = layer.post_attention_layernorm(h)

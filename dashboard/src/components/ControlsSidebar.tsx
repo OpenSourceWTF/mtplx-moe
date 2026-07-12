@@ -6,6 +6,18 @@ import type { MutableSettings } from "../lib/types";
 import { Card } from "./Card";
 import { useDashboardStore } from "../state/store";
 
+const MUTABLE_SETTINGS_KEYS: (keyof MutableSettings)[] = [
+  "depth",
+  "temperature",
+  "top_p",
+  "top_k",
+  "presence_penalty",
+  "max_response_tokens",
+  "stream_interval",
+  "enable_thinking",
+  "reasoning_parser",
+];
+
 const DEBOUNCE_MS = 250;
 
 export function ControlsSidebar() {
@@ -43,9 +55,14 @@ function DefaultsCard() {
   useEffect(() => {
     if (!draft || !settings) return;
     const diff: Partial<MutableSettings> = {};
-    (Object.keys(draft) as (keyof MutableSettings)[]).forEach((key) => {
+    // Diff ONLY the mutable keys. `draft` is seeded from the full settings
+    // GET payload at runtime, so Object.keys(draft) also yields the
+    // informational keys (object-valued ones differ by reference after every
+    // snapshot refresh) and the echo-back used to trip the server's
+    // all-or-nothing unknown_settings 400 — the 2026-07-02
+    // presence-penalty-persistence bug.
+    MUTABLE_SETTINGS_KEYS.forEach((key) => {
       if (draft[key] !== settings[key]) {
-        // The mutable surface is intentionally narrow, see backend constant.
         (diff as Record<string, unknown>)[key] = draft[key];
       }
     });

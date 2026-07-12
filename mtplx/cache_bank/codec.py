@@ -56,6 +56,9 @@ class DecodedPayload:
     logits: Any
     hidden: Any | None
     mtp_history_snapshot: CacheSnapshot | None
+    # v3: (token_count, recurrent-only CacheSnapshot, hidden_last|None)
+    gdn_boundaries: tuple = ()
+    has_recurrent: bool = False
 
 
 class TreeCodec:
@@ -189,6 +192,8 @@ def encode_payload(
     logits: Any,
     hidden: Any | None,
     mtp_history_snapshot: CacheSnapshot | None,
+    gdn_boundaries: tuple | list | None = None,
+    has_recurrent: bool | None = None,
     block_size: int = 256,
 ) -> EncodedPayload:
     codec = TreeCodec(block_size=block_size)
@@ -207,6 +212,24 @@ def encode_payload(
                 "meta_states": codec.encode(mtp_history_snapshot.meta_states),
             }
         ),
+        # v3: interior recurrent boundaries make persisted entries usable for
+        # sub-prefix (partial) restores on hybrid models after a restart.
+        "gdn_boundaries": [
+            {
+                "tokens": int(record[0]),
+                "states": codec.encode(record[1].states),
+                "meta_states": codec.encode(record[1].meta_states),
+                "hidden_last": codec.encode(
+                    record[2] if len(record) > 2 else None
+                ),
+            }
+            for record in (gdn_boundaries or [])
+        ],
+        "has_recurrent": bool(
+            has_recurrent
+            if has_recurrent is not None
+            else bool(gdn_boundaries)
+        ),
     }
     return EncodedPayload(
         spec=spec,
@@ -215,7 +238,12 @@ def encode_payload(
     )
 
 
-def decode_payload(spec: dict[str, Any], read_tensor: Callable[[str], bytes]) -> DecodedPayload:
+def decode_payload(
+    spec: dict[str, Any],
+    read_tensor: Callable[[str], bytes],
+    *,
+    include_gdn_boundaries: bool = True,
+) -> DecodedPayload:
     cache_spec = spec["cache_snapshot"]
     cache_snapshot = CacheSnapshot(
         states=tuple(decode_tree(cache_spec["states"], read_tensor)),
@@ -228,12 +256,84 @@ def decode_payload(spec: dict[str, Any], read_tensor: Callable[[str], bytes]) ->
             states=tuple(decode_tree(mtp_spec["states"], read_tensor)),
             meta_states=tuple(decode_tree(mtp_spec["meta_states"], read_tensor)),
         )
-    return DecodedPayload(
+    gdn_boundaries = (
+        decode_gdn_boundaries(spec, read_tensor)
+        if include_gdn_boundaries
+        else ()
+    )
+    decoded = DecodedPayload(
         cache_snapshot=cache_snapshot,
         logits=decode_tree(spec["logits"], read_tensor),
         hidden=decode_tree(spec["hidden"], read_tensor),
         mtp_history_snapshot=mtp_history_snapshot,
+        gdn_boundaries=gdn_boundaries,
+        has_recurrent=bool(spec.get("has_recurrent", False)),
     )
+    _eval_decoded_arrays(decoded)
+    return decoded
+
+
+def _eval_decoded_arrays(decoded: DecodedPayload) -> None:
+    """Single batched evaluation of every decoded array (vs per-tensor eval)."""
+    arrays: list[Any] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, mx.array):
+            arrays.append(value)
+        elif isinstance(value, CacheSnapshot):
+            collect(value.states)
+            collect(value.meta_states)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+
+    collect(decoded.cache_snapshot)
+    collect(decoded.logits)
+    collect(decoded.hidden)
+    collect(decoded.mtp_history_snapshot)
+    collect(decoded.gdn_boundaries)
+    if arrays:
+        mx.eval(*arrays)
+
+
+def decode_gdn_boundaries(
+    spec: dict[str, Any], read_tensor: Callable[[str], bytes]
+) -> tuple:
+    """Decode only the interior recurrent boundaries from a payload spec.
+
+    Used lazily by SSD-restored entries: exact restores skip the MB-scale
+    boundary payloads entirely, and partial restores load them on demand
+    through this helper (batched single eval)."""
+    boundaries = tuple(
+        (
+            int(record["tokens"]),
+            CacheSnapshot(
+                states=tuple(decode_tree(record["states"], read_tensor)),
+                meta_states=tuple(decode_tree(record["meta_states"], read_tensor)),
+            ),
+            decode_tree(record.get("hidden_last") or {"kind": "none"}, read_tensor),
+        )
+        for record in (spec.get("gdn_boundaries") or [])
+    )
+    arrays: list[Any] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, mx.array):
+            arrays.append(value)
+        elif isinstance(value, CacheSnapshot):
+            collect(value.states)
+            collect(value.meta_states)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item)
+
+    collect(boundaries)
+    if arrays:
+        mx.eval(*arrays)
+    return boundaries
 
 
 def _decode_tensor(spec: dict[str, Any], read_tensor: Callable[[str], bytes]) -> Any:
@@ -250,7 +350,6 @@ def _decode_tensor(spec: dict[str, Any], read_tensor: Callable[[str], bytes]) ->
         arr = mx.array(np.frombuffer(raw, dtype=np_dtype), dtype=mlx_dtype)
     if shape:
         arr = arr.reshape(shape)
-    mx.eval(arr)
     return arr
 
 
@@ -264,7 +363,6 @@ def _decode_tensor_blocks(spec: dict[str, Any], read_tensor: Callable[[str], byt
     shape = tuple(int(dim) for dim in spec.get("shape") or [])
     if shape:
         arr = arr.reshape(shape)
-    mx.eval(arr)
     return arr
 
 

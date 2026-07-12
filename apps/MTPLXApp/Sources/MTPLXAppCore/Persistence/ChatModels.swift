@@ -88,6 +88,20 @@ public final class ChatMessage {
     /// finish reason (`stop`, `length`, etc.); interrupted local turns use
     /// app reasons such as `cancelled` or `error`.
     public var finishReason: String?
+    /// Groups every assistant/tool message persisted by ONE user turn's
+    /// tool loop (think → search → think → answer) so the transcript can
+    /// render the whole turn as a single surface: one thinking card, one
+    /// activity chip, one answer, one sources footer. Nil on messages
+    /// persisted before this field existed (and on user messages) — the
+    /// renderer treats those as singleton groups, so old conversations
+    /// keep their historical layout. Optional => SwiftData lightweight
+    /// migration, no store version bump.
+    public var turnGroupID: UUID?
+    /// JSON-encoded `[SourceRecord]` — the deduped web sources gathered
+    /// across ALL tool rounds of this turn. Persisted only on the FINAL
+    /// assistant message of a group so completed turns re-render their
+    /// sources footer without re-parsing tool-trace JSON.
+    public var sourcesJSON: String?
     public var createdAt: Date
     /// Denormalized conversation identity for resilient transcript fetches.
     /// SwiftData relationship queries can lag after rapid inserts/reloads;
@@ -116,6 +130,8 @@ public final class ChatMessage {
         toolCallsJSON: String? = nil,
         statsJSON: String? = nil,
         finishReason: String? = nil,
+        turnGroupID: UUID? = nil,
+        sourcesJSON: String? = nil,
         createdAt: Date = Date(),
         conversation: ChatConversation? = nil,
         attachments: [ChatAttachment] = [],
@@ -129,6 +145,8 @@ public final class ChatMessage {
         self.toolCallsJSON = toolCallsJSON
         self.statsJSON = statsJSON
         self.finishReason = finishReason
+        self.turnGroupID = turnGroupID
+        self.sourcesJSON = sourcesJSON
         self.createdAt = createdAt
         self.conversationID = conversation?.id
         self.conversation = conversation
@@ -262,6 +280,11 @@ public struct ChatTurnStats: Codable, Hashable, Sendable {
     public var draftedByDepth: [Int]?
     public var verifyCalls: Int?
     public var verifyTimeS: Double?
+    /// Total wall time the turn spent in reasoning across ALL tool
+    /// rounds (think → search → think → answer sums every think span).
+    /// Drives the collapsed "Thought · 12.4s" chip. Optional so stats
+    /// persisted before this field decode unchanged.
+    public var thinkingTimeMs: Int?
 
     public init(
         rawDecodeTokS: Double? = nil,
@@ -272,7 +295,8 @@ public struct ChatTurnStats: Codable, Hashable, Sendable {
         acceptedByDepth: [Int]? = nil,
         draftedByDepth: [Int]? = nil,
         verifyCalls: Int? = nil,
-        verifyTimeS: Double? = nil
+        verifyTimeS: Double? = nil,
+        thinkingTimeMs: Int? = nil
     ) {
         self.rawDecodeTokS = rawDecodeTokS
         self.displayDecodeTokS = displayDecodeTokS
@@ -283,5 +307,139 @@ public struct ChatTurnStats: Codable, Hashable, Sendable {
         self.draftedByDepth = draftedByDepth
         self.verifyCalls = verifyCalls
         self.verifyTimeS = verifyTimeS
+        self.thinkingTimeMs = thinkingTimeMs
+    }
+}
+
+// MARK: - SourceRecord
+//
+// One web source the assistant consulted during a turn (a web_search
+// result it was shown, or a page it fetched). The chat renders these as
+// a single compact "Sources" footer under the final answer instead of
+// spraying per-tool result cards through the transcript.
+
+public struct SourceRecord: Codable, Hashable, Sendable, Identifiable {
+    public var url: String
+    public var title: String
+    /// Registrable host for the pill label ("anthropic.com"). Computed
+    /// once at extraction so rendering never re-parses URLs.
+    public var domain: String
+
+    public var id: String { url }
+
+    public init(url: String, title: String, domain: String) {
+        self.url = url
+        self.title = title
+        self.domain = domain
+    }
+
+    public init?(url: String, title: String?) {
+        let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let parsed = URL(string: trimmed), parsed.host != nil else {
+            return nil
+        }
+        self.url = trimmed
+        self.title = (title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        self.domain = Self.displayDomain(for: parsed)
+    }
+
+    private static func displayDomain(for url: URL) -> String {
+        guard var host = url.host?.lowercased() else { return url.absoluteString }
+        if host.hasPrefix("www.") {
+            host = String(host.dropFirst(4))
+        }
+        return host
+    }
+
+    /// Pull sources out of one completed tool call. Tolerant of missing
+    /// fields — tool result shapes drift and a sources footer that
+    /// silently shows fewer pills beats a decode crash.
+    public static func extract(
+        toolName: String,
+        argumentsJSON: String?,
+        resultJSON: String?
+    ) -> [SourceRecord] {
+        switch toolName {
+        case "web_search":
+            guard let json = resultJSON,
+                let data = json.data(using: .utf8),
+                let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let results = dict["results"] as? [[String: Any]]
+            else { return [] }
+            return results.compactMap { entry in
+                guard let url = entry["url"] as? String else { return nil }
+                return SourceRecord(url: url, title: entry["title"] as? String)
+            }
+        case "fetch_url":
+            var url: String?
+            if let json = argumentsJSON,
+                let data = json.data(using: .utf8),
+                let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            {
+                url = dict["url"] as? String
+            }
+            var title: String?
+            if let json = resultJSON,
+                let data = json.data(using: .utf8),
+                let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            {
+                title = dict["title"] as? String
+                if url == nil { url = dict["url"] as? String }
+            }
+            guard let url, let record = SourceRecord(url: url, title: title) else { return [] }
+            return [record]
+        default:
+            return []
+        }
+    }
+
+    /// Order-preserving dedupe by normalized URL (scheme/case/trailing
+    /// slash insensitive), keeping the first-seen title unless a later
+    /// duplicate has one and the kept record does not.
+    public static func dedupe(_ records: [SourceRecord]) -> [SourceRecord] {
+        var seenIndex: [String: Int] = [:]
+        var output: [SourceRecord] = []
+        for record in records {
+            let key = normalizedKey(record.url)
+            if let existing = seenIndex[key] {
+                if output[existing].title.isEmpty, !record.title.isEmpty {
+                    output[existing].title = record.title
+                }
+                continue
+            }
+            seenIndex[key] = output.count
+            output.append(record)
+        }
+        return output
+    }
+
+    private static func normalizedKey(_ url: String) -> String {
+        var key = url.lowercased()
+        for prefix in ["https://", "http://"] where key.hasPrefix(prefix) {
+            key = String(key.dropFirst(prefix.count))
+        }
+        if key.hasPrefix("www.") {
+            key = String(key.dropFirst(4))
+        }
+        while key.hasSuffix("/") {
+            key = String(key.dropLast())
+        }
+        return key
+    }
+
+    public static func encodeJSON(_ records: [SourceRecord]) -> String? {
+        guard !records.isEmpty,
+            let data = try? JSONEncoder().encode(records),
+            let json = String(data: data, encoding: .utf8)
+        else { return nil }
+        return json
+    }
+
+    public static func decodeJSON(_ json: String?) -> [SourceRecord] {
+        guard let json,
+            let data = json.data(using: .utf8),
+            let records = try? JSONDecoder().decode([SourceRecord].self, from: data)
+        else { return [] }
+        return records
     }
 }

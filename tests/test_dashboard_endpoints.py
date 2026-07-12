@@ -34,6 +34,7 @@ from mtplx.server.dashboard_state import (
 )
 from mtplx.server.openai import (
     DASHBOARD_MUTABLE_SETTINGS_KEYS,
+    DASHBOARD_READ_ONLY_SETTINGS_KEYS,
     DASHBOARD_RESTART_REQUIRED_KEYS,
     DASHBOARD_SNAPSHOT_INTERVAL_DEFAULT_MS,
     DASHBOARD_SNAPSHOT_INTERVAL_MAX_MS,
@@ -429,6 +430,58 @@ def test_settings_restart_keys_cover_protected_runtime_surface():
     assert "prefill_chunk_tokens" not in DASHBOARD_RESTART_REQUIRED_KEYS
     assert "generation_mode" in DASHBOARD_MUTABLE_SETTINGS_KEYS
     assert "generation_mode" not in DASHBOARD_RESTART_REQUIRED_KEYS
+
+
+def test_settings_get_payload_keys_are_all_classified():
+    """Every key the settings GET returns must be classified as mutable,
+    read-only, or restart-required.
+
+    The dashboard Settings page diffs its draft against the GET payload and
+    POSTs the diff back. Object-valued keys always differ by reference after
+    a store refresh, so ANY unclassified GET key eventually rides a POST and
+    the all-or-nothing unknown_settings 400 silently kills the whole write
+    (the 2026-07-02 presence-penalty-persistence flag). This test pins the
+    contract so a new GET field cannot reintroduce the bug.
+    """
+    client = TestClient(create_app(_fake_state()))
+    payload = client.get("/v1/mtplx/settings").json()
+    classified = (
+        set(DASHBOARD_MUTABLE_SETTINGS_KEYS)
+        | set(DASHBOARD_READ_ONLY_SETTINGS_KEYS)
+        | set(DASHBOARD_RESTART_REQUIRED_KEYS)
+    )
+    unclassified = sorted(set(payload.keys()) - classified)
+    assert unclassified == [], (
+        f"settings GET returns unclassified keys {unclassified}; add them to "
+        "one of the DASHBOARD_*_SETTINGS_KEYS tuples (read-only for "
+        "informational echo-back keys) or the dashboard settings POST 400s"
+    )
+
+
+def test_settings_post_tolerates_dashboard_echo_back_diff():
+    """The dashboard-shaped write: one changed primitive + every
+    object/array-valued GET key echoed back unchanged (reference-diff
+    artifact). Must apply the primitive and drop the echoes — this is the
+    exact payload that used to 400 and made presence_penalty (and every
+    other dashboard settings write) silently non-persistent.
+    """
+    state = _fake_state()
+    client = TestClient(create_app(state))
+    snapshot = client.get("/v1/mtplx/settings").json()
+    echo = {
+        key: value
+        for key, value in snapshot.items()
+        if isinstance(value, (dict, list))
+    }
+    assert echo, "expected object/array-valued keys in the settings GET"
+    response = client.post(
+        "/v1/mtplx/settings", json={**echo, "presence_penalty": 0.5}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json().get("applied") == {"presence_penalty": 0.5}
+    # presence/frequency penalties apply as server-side request DEFAULTS
+    # (default_-prefixed on args), mirroring the completion-request override.
+    assert state.args.default_presence_penalty == 0.5
 
 
 def test_settings_post_rejects_invalid_depth_prefill_chunk_and_generation_mode():

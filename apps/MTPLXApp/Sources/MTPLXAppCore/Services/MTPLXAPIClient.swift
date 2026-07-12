@@ -30,7 +30,27 @@ public struct MTPLXAPIClient: Sendable {
         try await get("/health")
     }
 
-    /// `/health`, or `nil` once `seconds` pass without an answer.
+    /// Liveness truth for the daemon watchdog.
+    ///
+    /// `healthy` carries the decoded payload. `aliveUndecodable` means the
+    /// daemon answered 2xx but the payload failed the app's Codable schema —
+    /// the process is provably alive, so the watchdog must NOT count it as
+    /// a miss (2026-07-06 incident: an idle-postcommit grew `/health` by one
+    /// bank entry, the decode threw, two `try?`-swallowed probes counted as
+    /// misses, and the app reaped a daemon that was answering 200 in 14 ms).
+    /// `unreachable` is a transport failure, non-2xx, or deadline timeout —
+    /// the only states that may count toward reaping.
+    public enum LivenessProbeResult: Sendable {
+        case healthy(HealthPayload)
+        case aliveUndecodable(String)
+        /// The daemon answered 401/403 — provably alive, credentials wrong.
+        /// An API-key mismatch is an app configuration bug and never
+        /// grounds to reap a serving process (liveness = transport truth).
+        case aliveUnauthorized
+        case unreachable
+    }
+
+    /// Probe `/health` against a hard deadline.
     ///
     /// A wedged daemon can hold an accepted connection open without
     /// ever answering, which surfaces as a request that neither
@@ -38,17 +58,40 @@ public struct MTPLXAPIClient: Sendable {
     /// (QA-114's stale-green hole). Racing the probe against a hard
     /// deadline turns "no answer in time" into a definite miss; the
     /// losing side is cancelled.
-    public func healthWithinDeadline(seconds: TimeInterval) async -> HealthPayload? {
-        await withTaskGroup(of: HealthPayload?.self) { group in
-            group.addTask { try? await self.health() }
+    public func livenessWithinDeadline(seconds: TimeInterval) async -> LivenessProbeResult {
+        await withTaskGroup(of: LivenessProbeResult?.self) { group in
+            group.addTask {
+                do {
+                    return .healthy(try await self.health())
+                } catch let error as DecodingError {
+                    // 2xx arrived and the body was read; only the schema
+                    // mapping failed. The daemon is alive.
+                    return .aliveUndecodable(String(describing: error))
+                } catch MTPLXAPIClientError.httpStatus(401, _),
+                        MTPLXAPIClientError.httpStatus(403, _) {
+                    // An auth rejection is a live daemon speaking HTTP.
+                    return .aliveUnauthorized
+                } catch {
+                    // Transport failures, timeouts, other non-2xx, non-HTTP.
+                    return .unreachable
+                }
+            }
             group.addTask {
                 try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
                 return nil
             }
             let winner = await group.next() ?? nil
             group.cancelAll()
-            return winner
+            return winner ?? .unreachable
         }
+    }
+
+    /// Back-compat shim for callers that only need the payload.
+    public func healthWithinDeadline(seconds: TimeInterval) async -> HealthPayload? {
+        if case .healthy(let payload) = await livenessWithinDeadline(seconds: seconds) {
+            return payload
+        }
+        return nil
     }
 
     /// Client for the daemon watchdog's liveness probes.

@@ -291,11 +291,7 @@ public struct MTPLXRuntimeBootstrapper: Sendable {
             withIntermediateDirectories: true
         )
         let python = try resolvePythonExecutable()
-        _ = try run(
-            executable: python,
-            arguments: ["-m", "venv", runtimeDir.path],
-            displayCommand: "python -m venv \(runtimeDir.path)"
-        )
+        try createRuntimeVenv(python: python, runtimeDir: runtimeDir)
         let venvPython = runtimeDir.appendingPathComponent("bin").appendingPathComponent("python")
         // Best effort: the venv's ensurepip pip is already new enough
         // to install the bundled wheel, so a PyPI hiccup or blocked
@@ -341,6 +337,53 @@ public struct MTPLXRuntimeBootstrapper: Sendable {
         }
         Self.recordWheelFingerprint(for: wheel, runtimeDir: runtimeDir)
         return executable
+    }
+
+    /// Create (or repair) the app-owned runtime venv.
+    ///
+    /// The venv's `bin/python3` is a symlink chain into the interpreter
+    /// it was built from — usually the one shipped inside the app
+    /// bundle. After an app update replaces the bundle, that chain can
+    /// dangle, and a plain `python -m venv` over the corpse exits 1
+    /// with "[Errno 2] No such file or directory: …/bin/python3"
+    /// (issue #139). Reinstalling the app cannot fix it because the
+    /// venv lives in Application Support, outside the bundle. So:
+    /// rebuild with `--clear` when the existing venv python is broken,
+    /// and retry once with `--clear` on any other creation failure.
+    /// A healthy venv keeps the plain no-clear path so same-venv
+    /// updates reuse installed dependencies (fast and offline-safe).
+    func createRuntimeVenv(python: URL, runtimeDir: URL) throws {
+        let fileManager = FileManager.default
+        // Probe bin/python — the executable the install steps below
+        // actually invoke. isExecutableFile resolves symlinks, so a
+        // dangling chain reads as not-executable — exactly the broken
+        // state.
+        let venvPython = runtimeDir
+            .appendingPathComponent("bin")
+            .appendingPathComponent("python")
+        let venvBroken = fileManager.fileExists(atPath: runtimeDir.path)
+            && !fileManager.isExecutableFile(atPath: venvPython.path)
+        if venvBroken {
+            _ = try run(
+                executable: python,
+                arguments: ["-m", "venv", "--clear", runtimeDir.path],
+                displayCommand: "python -m venv --clear \(runtimeDir.path)"
+            )
+            return
+        }
+        do {
+            _ = try run(
+                executable: python,
+                arguments: ["-m", "venv", runtimeDir.path],
+                displayCommand: "python -m venv \(runtimeDir.path)"
+            )
+        } catch {
+            _ = try run(
+                executable: python,
+                arguments: ["-m", "venv", "--clear", runtimeDir.path],
+                displayCommand: "python -m venv --clear \(runtimeDir.path)"
+            )
+        }
     }
 
     private func resolvedInstalledRuntime(

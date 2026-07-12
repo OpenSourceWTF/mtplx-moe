@@ -87,8 +87,6 @@ from mtplx.sampling import SamplerConfig
 from mtplx.profiles import (
     DEFAULT_HF_MODEL_ID,
     DEFAULT_PROFILE_NAME,
-    NATIVE_MTP_60_MLX_FORK_COMMIT,
-    NATIVE_MTP_60_MLX_FORK_FRAGMENT,
     PROFILE_CHOICES,
     apply_profile_env,
     get_profile,
@@ -246,8 +244,6 @@ FAST_PATH_ENV = {
     "MTPLX_SKIP_VERIFY_SNAPSHOT": "1",
 }
 VERIFY_SNAPSHOT_REQUIRED_STRATEGIES = {"trim_commit", "target_prefix"}
-EXPECTED_MLX_QMV_FORK_COMMIT = NATIVE_MTP_60_MLX_FORK_COMMIT
-EXPECTED_MLX_QMV_FORK_FRAGMENT = NATIVE_MTP_60_MLX_FORK_FRAGMENT
 STATS_FOOTER_MARKER = "\n---\n⚡ **MTPLX TPS:**"
 THINK_OPEN = "<think>"
 THINK_CLOSE = "</think>"
@@ -567,7 +563,16 @@ def _draft_head_identity(runtime: Any) -> str | None:
     return h.hexdigest()[:16]
 
 
-def _mlx_fork_status() -> dict[str, Any]:
+def _mlx_runtime_status() -> dict[str, Any]:
+    """Report which MLX runtime the daemon imported.
+
+    MTPLX runs on stock PyPI MLX. There is no required MLX fork and no
+    patched qmm/qmv build; the speed stack (NAX verify kernels, packed-GQA
+    SDPA, compiled verify) ships inside the mtplx package itself. This is
+    a plain diagnostic so support logs show exactly which wheel served a
+    session.
+    """
+
     try:
         import mlx.core as mx
 
@@ -575,44 +580,13 @@ def _mlx_fork_status() -> dict[str, Any]:
         version = getattr(mx, "__version__", None)
     except Exception as exc:
         return {"ok": False, "error": repr(exc)}
-    commit = None
-    for parent in [path.parent, *path.parents]:
-        if (
-            EXPECTED_MLX_QMV_FORK_FRAGMENT in parent.name
-            or EXPECTED_MLX_QMV_FORK_FRAGMENT in str(parent)
-        ):
-            try:
-                # Bounded timeout: if git is slow or hung (lock
-                # contention, zombie pickaxe process holding pack
-                # files, slow disk), do not let the daemon block on
-                # startup forever. The hash is diagnostic; failing
-                # closed with `commit = None` is safe and matches the
-                # `prefill_bench.py` pattern.
-                commit = subprocess.check_output(
-                    ["git", "-C", str(parent), "rev-parse", "--short", "HEAD"],
-                    text=True,
-                    stderr=subprocess.DEVNULL,
-                    timeout=2.0,
-                ).strip()
-            except (
-                subprocess.SubprocessError,
-                FileNotFoundError,
-                OSError,
-            ):
-                commit = None
-            break
-    path_active = EXPECTED_MLX_QMV_FORK_FRAGMENT in str(path)
-    commit_matches = commit in {None, EXPECTED_MLX_QMV_FORK_COMMIT}
-    ok = path_active and commit_matches
+    path_text = str(path)
+    stock_layout = "site-packages" in path_text or "dist-packages" in path_text
     return {
-        "ok": ok,
-        "path_active": path_active,
-        "commit_matches": commit_matches,
-        "path": str(path),
+        "ok": True,
+        "path": path_text,
         "version": version,
-        "expected_path_fragment": EXPECTED_MLX_QMV_FORK_FRAGMENT,
-        "expected_commit": EXPECTED_MLX_QMV_FORK_COMMIT,
-        "observed_commit": commit,
+        "stock_pypi_layout": stock_layout,
     }
 
 
@@ -1100,6 +1074,16 @@ def _health_runtime_mode_label(
     return mode
 
 
+def _kernel_selfcheck_health_payload() -> dict[str, Any]:
+    """Per-lane turbo kernel selfcheck verdicts (JSON primitives only)."""
+    try:
+        from mtplx.kernel_selfcheck import report_for_health
+
+        return report_for_health()
+    except Exception:
+        return {"ran": False}
+
+
 def _backend_descriptor(state: "ServerState") -> BackendDescriptor:
     descriptor = getattr(state, "backend_descriptor", None)
     if descriptor is not None:
@@ -1296,7 +1280,7 @@ def _detect_total_ram_bytes_for_metal_caps() -> tuple[int | None, str]:
     if sys.platform == "darwin":
         try:
             output = subprocess.check_output(
-                ["sysctl", "-n", "hw.memsize"],
+                ["/usr/sbin/sysctl", "-n", "hw.memsize"],
                 text=True,
                 stderr=subprocess.DEVNULL,
             )
@@ -1430,6 +1414,26 @@ def _apply_metal_memory_caps(
 class ServerState:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
+        from mtplx.expert_cli import expert_streaming_load_kwargs
+
+        self.expert_streaming_load_kwargs = expert_streaming_load_kwargs(
+            args, args.model
+        )
+        if self.expert_streaming_load_kwargs:
+            args.load_mtp = False
+            args.generation_mode = "ar"
+            stream_config = self.expert_streaming_load_kwargs[
+                "expert_streaming_config"
+            ]
+            from mtplx.expert_runtime import reconcile_mlx_memory_cap
+            from mtplx.expert_streaming_models import get_model_spec
+
+            stream_plan = stream_config.memory_plan(
+                get_model_spec(stream_config.model_key)
+            )
+            os.environ["MTPLX_MEMORY_LIMIT_BYTES"] = str(
+                reconcile_mlx_memory_cap(stream_plan)
+            )
         try:
             args.paged_kv_quantization = normalize_paged_kv_quantization(
                 getattr(args, "paged_kv_quantization", "off")
@@ -1504,17 +1508,7 @@ class ServerState:
             self.fast_path_env_status = _fast_path_env_status()
         _startup_line("[4/6] Checking local acceleration runtime")
         _startup_line("      This may take a few seconds.")
-        self.mlx_fork_status = _mlx_fork_status()
-        if (
-            args.strict_mlx_fork_assert
-            and startup_backend.requires_native_mlx_fork
-            and self.profile.required_mlx_fork_commit
-            and not self.mlx_fork_status.get("ok")
-        ):
-            raise RuntimeError(
-                "Patched MLX qmv fork is not active: "
-                + json.dumps(self.mlx_fork_status, sort_keys=True)
-            )
+        self.mlx_runtime_status = _mlx_runtime_status()
         self.mlx_cache_limit_status = _configure_mlx_cache_limit(args)
         _startup_line("[4/6] Runtime checks complete")
         started = time.perf_counter()
@@ -1524,11 +1518,13 @@ class ServerState:
         )
         _startup_line("      Model load in progress (this may take a minute).")
         load_heartbeat = _startup_heartbeat("Model still loading")
+        streaming_kwargs = dict(self.expert_streaming_load_kwargs)
+        runtime_mtp = bool(streaming_kwargs.pop("mtp", bool(args.load_mtp)))
         try:
             self.runtime = self.model_scheduler.submit_foreground(
                 load,
                 args.model,
-                mtp=bool(args.load_mtp),
+                mtp=runtime_mtp,
                 contract=MTPContract(
                     mtp_quant_bits=getattr(args, "mtp_quant_bits", None),
                     mtp_quant_group_size=getattr(args, "mtp_quant_group_size", 64),
@@ -1541,6 +1537,7 @@ class ServerState:
                     args,
                     startup_backend,
                 ),
+                **streaming_kwargs,
                 batch_key="startup.load",
             ).result()
         except BaseException as exc:
@@ -1621,6 +1618,13 @@ class ServerState:
             if self.runtime is not None
             else None
         )
+        # Scoped reasoning-history capability is a property of the loaded
+        # template (probed once after the profile is applied, cached here).
+        self.reasoning_history_scoped_capable = (
+            _template_supports_scoped_reasoning(self.runtime.tokenizer)
+            if self.runtime is not None
+            else False
+        )
         self.draft_sampler = (
             SamplerConfig(
                 temperature=float(args.draft_temperature),
@@ -1642,7 +1646,14 @@ class ServerState:
         )
         _startup_line(f"[5/6] Context window: {self.context_window} tokens")
         self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
-        self.sessions = EngineSessionManager(cold_tier=self.session_bank_cold_tier)
+        from mtplx.engine_session import model_weights_bytes as _model_weights_bytes
+
+        self.sessions = EngineSessionManager(
+            cold_tier=self.session_bank_cold_tier,
+            model_weights_bytes=_model_weights_bytes(
+                getattr(self.runtime, "model_path", None)
+            ),
+        )
         self.last_metrics: list[dict[str, Any]] = []
         self.tool_parse_counters = {key: 0 for key in _TOOL_PARSE_COUNTER_KEYS}
         # Activity timestamps used by the parent-process thermal watchdog to
@@ -1711,7 +1722,6 @@ def _session_bank_cold_tier_from_args(args: argparse.Namespace) -> Any | None:
         return None
     from mtplx.cache_bank import (
         DEFAULT_COLD_TIER_DIR,
-        DEFAULT_COLD_TIER_MAX_BYTES,
         DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS,
         SessionBankColdTier,
         parse_size_bytes,
@@ -1720,9 +1730,11 @@ def _session_bank_cold_tier_from_args(args: argparse.Namespace) -> Any | None:
     cache_dir = Path(
         str(getattr(args, "ssd_session_cache_dir", "") or DEFAULT_COLD_TIER_DIR)
     ).expanduser()
+    from mtplx.cache_bank.cold_tier import default_cold_tier_max_bytes
+
     max_bytes = parse_size_bytes(
         getattr(args, "ssd_session_cache_max_size", None),
-        DEFAULT_COLD_TIER_MAX_BYTES,
+        default_cold_tier_max_bytes(),
     )
     min_prefix_tokens = int(
         getattr(
@@ -1764,12 +1776,14 @@ class _BatchedARJob:
         session_template_hash: str | None = None,
         session_draft_head_identity: str | None = None,
         session_policy_fingerprint: str | None = None,
+        seed_is_explicit: bool = False,
     ) -> None:
         self.request_id = request_id
         self.prompt_ids = [int(token) for token in prompt_ids]
         self.max_tokens = max(1, int(max_tokens))
         self.sampler = sampler
         self.seed = int(seed)
+        self.seed_is_explicit = bool(seed_is_explicit)
         self.stop_token_ids = {int(token) for token in stop_token_ids}
         self.token_callback = token_callback
         self.prefill_callback = prefill_callback
@@ -1878,6 +1892,22 @@ class _BatchedARGenerationService:
 
         if float(job.sampler.temperature) <= 0:
             return lambda logprobs: mx.argmax(logprobs, axis=-1)
+        if not job.seed_is_explicit and not (
+            float(getattr(job.sampler, "presence_penalty", 0.0) or 0.0)
+            or float(getattr(job.sampler, "frequency_penalty", 0.0) or 0.0)
+        ):
+            # Fast path: mlx-lm's fused GPU sampler. The numpy fallback below
+            # synchronizes the full logits row to the CPU for every decode
+            # step of every active sequence, which serializes the whole batch
+            # pump on host round-trips under concurrency. Explicitly seeded
+            # requests keep the numpy path for per-request reproducibility.
+            from mlx_lm.sample_utils import make_sampler
+
+            return make_sampler(
+                temp=float(job.sampler.temperature),
+                top_p=float(getattr(job.sampler, "top_p", 0.0) or 0.0),
+                top_k=int(getattr(job.sampler, "top_k", 0) or 0),
+            )
         rng = np.random.default_rng(job.seed)
 
         def sample_one(logprobs: Any) -> Any:
@@ -2389,6 +2419,11 @@ class _BatchedARGenerationService:
             max_tokens=max(1, generator_max_tokens),
             stop_tokens=self._stop_sequences(),
             completion_batch_size=max(1, int(config_dict["decode_batch_max"])),
+            # Prefill concurrency stays capped at 2 regardless of the decode
+            # batch. Measured 2026-07-05 on 8x 2k-token cold prompts (M5 Max):
+            # cap 2 = 266 pp tok/s aggregate at 22 GB peak; cap 8 = 178 pp
+            # tok/s at 74.5 GB peak — wide concurrent prefill thrashes
+            # working-set memory and is slower end to end.
             prefill_batch_size=max(1, min(2, int(config_dict["decode_batch_max"]))),
             prefill_step_size=max(1, int(config_dict["prefill_chunk_tokens"])),
         )
@@ -3644,6 +3679,7 @@ _NAMESPACED_TOOL_CALL_START_RE = re.compile(
 )
 _MTPLX_TOOL_CONTRACT_SENTINEL = "MTPLX tool contract:"
 _MTPLX_NO_TOOL_CONTRACT_SENTINEL = "MTPLX direct reply turn:"
+_MTPLX_POST_TOOL_ANSWER_SENTINEL = "MTPLX post-tool answer turn:"
 _MTPLX_SIMPLE_CHAT_SYSTEM_PROMPT = (
     "You are MTPLX. Answer the latest user message directly and naturally."
 )
@@ -3680,9 +3716,10 @@ _OPENAI_BRIDGE_POLICY_VERSION = (
     "omlx_style:preserve_history:parse_at_completion:tool_digest:v4"
 )
 _MTPLX_TOOL_CONTRACT_POLICY_VERSION = (
-    "soft_schema_contract:native_xml:targeted_reads:post_tool_continue:agent_tail:v11"
+    "soft_schema_contract:native_xml:targeted_reads:post_tool_continue:agent_tail:dated:v12"
 )
 _MTPLX_NO_TOOL_CONTRACT_POLICY_VERSION = "no_tool_direct_reply:v1"
+_MTPLX_POST_TOOL_ANSWER_POLICY_VERSION = "post_tool_full_answer:dated:v2"
 _MTPLX_OPENCODE_AGENT_CONTRACT_PROFILE = "opencode_agent"
 _MTPLX_READ_ONLY_FORCE_ANSWER_POLICY_VERSION = "read_only_force_answer:v1"
 _MTPLX_PI_CONVERGENCE_POLICY_VERSION = "pi_convergence:v1"
@@ -3781,9 +3818,12 @@ def _tool_prompt_policy_version_for_request(
     no_tools_contract_active: bool,
     read_only_force_answer_contract_active: bool = False,
     pi_convergence_contract_active: bool = False,
+    post_tool_answer_contract_active: bool = False,
 ) -> str:
     if read_only_force_answer_contract_active and not tools_active:
         return _MTPLX_READ_ONLY_FORCE_ANSWER_POLICY_VERSION
+    if post_tool_answer_contract_active and not tools_active:
+        return _MTPLX_POST_TOOL_ANSWER_POLICY_VERSION
     if no_tools_contract_active and not tools_active:
         return _MTPLX_NO_TOOL_CONTRACT_POLICY_VERSION
     if not tools_active:
@@ -4447,6 +4487,17 @@ def _forced_tool_contract_clause(tool_choice: Any) -> str:
     return ""
 
 
+def _current_date_line() -> str:
+    # Local wall-clock date, day granularity. Injected into the tool
+    # and post-tool contracts so the model stops anchoring "latest
+    # version" reasoning (and search queries) to its training cutoff —
+    # without it, queries came out as "latest X 2024 2025" and final
+    # answers dismissed fresher tool results (2026-07-03 founder
+    # report). Day granularity keeps prompt bytes stable within a day,
+    # so warm-prefix session reuse is unaffected until midnight.
+    return f"Today's date is {time.strftime('%B %d, %Y')}."
+
+
 def _mtplx_tool_contract_text(
     tools: list[dict[str, Any]],
     *,
@@ -4459,7 +4510,10 @@ def _mtplx_tool_contract_text(
         allowed = allowed[:1197].rstrip() + "..."
     forced_clause = _forced_tool_contract_clause(tool_choice)
     return (
-        f"{_MTPLX_TOOL_CONTRACT_SENTINEL} declared tools and schemas: {allowed}. "
+        f"{_MTPLX_TOOL_CONTRACT_SENTINEL} {_current_date_line()} Your "
+        "training data ends before today; treat tool results as more "
+        "current than your own knowledge. "
+        f"Declared tools and schemas: {allowed}. "
         "Call only these exact tool names and exact argument keys/case. "
         "Include every required key shown in the signature. "
         "For large files, search first and use the smallest read range/limit/offset "
@@ -4497,6 +4551,54 @@ def _with_mtplx_no_tool_contract(
     if str(first.role).lower() == "system":
         content = str(first.content or "")
         if _MTPLX_NO_TOOL_CONTRACT_SENTINEL not in content:
+            updated[0] = _copy_chat_message(
+                first,
+                content=(f"{content.rstrip()}\n\n{contract}" if content else contract),
+            )
+        return updated
+    return [ChatMessage(role="system", content=contract), *updated]
+
+
+def _mtplx_post_tool_answer_contract_text() -> str:
+    # The direct-reply contract above was tuned to stop protocol-tag
+    # leakage on plain turns, and its anti-verbosity clauses ("one short
+    # friendly sentence", "no markdown lists, analysis, examples")
+    # actively clip the FINAL ANSWER of a searched turn — the client
+    # closes the loop with tool_choice="none" precisely when the model
+    # is supposed to synthesize everything it just gathered. This
+    # variant keeps the protocol prohibitions and drops every length or
+    # format restriction (2026-07-03 founder report: detailed questions
+    # kept getting ~30-word answers, only when search ran).
+    return (
+        f"{_MTPLX_POST_TOOL_ANSWER_SENTINEL} {_current_date_line()} The "
+        "tool phase of this turn is closed and its results are in the "
+        "conversation above. Those results are more current than your "
+        "training data — when they conflict, trust the tool results "
+        "instead of claiming something does not exist or falling back to "
+        "what was latest as of your training. Start with the final "
+        "user-facing answer to the latest user message, using those "
+        "results as evidence. Do not emit tool calls, tool names, or "
+        "protocol tags such as <tool_call>, <toolExec>, <invoke>, "
+        "<function>, or <parameter>, and do not say 'let me search' or "
+        "request more tools. If a detail is genuinely unresolved by the "
+        "results, say so briefly and still give the best supported answer. "
+        "Match the depth the user asked for: detailed questions deserve "
+        "thorough, well-structured answers, and markdown structure is "
+        "welcome when it helps the answer."
+    )
+
+
+def _with_mtplx_post_tool_answer_contract(
+    messages: list[ChatMessage],
+) -> list[ChatMessage]:
+    contract = _mtplx_post_tool_answer_contract_text()
+    if not messages:
+        return [ChatMessage(role="system", content=contract)]
+    updated = list(messages)
+    first = updated[0]
+    if str(first.role).lower() == "system":
+        content = str(first.content or "")
+        if _MTPLX_POST_TOOL_ANSWER_SENTINEL not in content:
             updated[0] = _copy_chat_message(
                 first,
                 content=(f"{content.rstrip()}\n\n{contract}" if content else contract),
@@ -4610,29 +4712,26 @@ def _mtplx_pi_convergence_user_instruction_text() -> str:
 def _with_mtplx_pi_convergence_contract(
     messages: list[ChatMessage],
 ) -> list[ChatMessage]:
+    # PREFIX STABILITY (2026-07-04): this contract used to be appended to the
+    # SYSTEM message. It activates MID-SESSION (>= 14 tool results), so the
+    # first bytes of the transcript changed under the session bank and the
+    # transition round re-prefilled the entire session cold — the same defect
+    # class as the read-only force-answer template flip fixed the same night.
+    # The contract now travels as a pure suffix: one appended user message
+    # carrying both the convergence contract and the turn instruction, which
+    # is also positionally stronger (closest to generation).
     contract = _mtplx_pi_convergence_contract_text()
     user_instruction = _mtplx_pi_convergence_user_instruction_text()
+    final_instruction = f"{contract}\n\n{user_instruction}"
     if not messages:
-        return [
-            ChatMessage(role="system", content=contract),
-            ChatMessage(role="user", content=user_instruction),
-        ]
+        return [ChatMessage(role="user", content=final_instruction)]
     updated = list(messages)
-    first = updated[0]
-    if str(first.role).lower() == "system":
-        content = str(first.content or "")
-        if _MTPLX_PI_CONVERGENCE_SENTINEL not in content:
-            updated[0] = _copy_chat_message(
-                first,
-                content=(f"{content.rstrip()}\n\n{contract}" if content else contract),
-            )
-    else:
-        updated = [ChatMessage(role="system", content=contract), *updated]
     if not any(
         _MTPLX_PI_CONVERGENCE_USER_SENTINEL in str(message.content or "")
+        or _MTPLX_PI_CONVERGENCE_SENTINEL in str(message.content or "")
         for message in updated
     ):
-        updated.append(ChatMessage(role="user", content=user_instruction))
+        updated.append(ChatMessage(role="user", content=final_instruction))
     return updated
 
 
@@ -5081,10 +5180,39 @@ _NO_FILE_MUTATION_RE = re.compile(
     r"\b(?:do\s+not|don['’]?t|dont|without)\s+"
     r"(?:edit|modify|change|write|create|patch|touch)\b.{0,48}"
     r"\b(?:files?|source|project|repo|repository|workspace|code)\b"
-    r"|\bno\s+(?:file\s+)?(?:edits?|changes?|modifications?|writes?)\b"
-    r"|\b(?:read[- ]only|inspect[- ]only)\b",
+    r"|\bno\s+(?:file\s+)?(?:edits?|changes?|modifications?|writes?)\b",
     re.IGNORECASE | re.DOTALL,
 )
+_READ_ONLY_PHASE_RE = re.compile(
+    r"\b(?:read|inspect)[- ]only\b",
+    re.IGNORECASE,
+)
+# "no longer in read-only mode", "not read-only", "exited read-only" are
+# PERMISSION GRANTS, not read-only instructions. OpenCode's build-mode
+# system-reminder says exactly "You are no longer in read-only mode" — the
+# unanchored read-only match hid write/edit on the execute-the-plan turn and
+# the model spiralled re-planning files it could not create (2026-07-04).
+_READ_ONLY_NEGATION_TAIL_RE = re.compile(
+    r"(?:\bno\s+longer(?:\s+(?:in|the))?|\bnot(?:\s+(?:in|the))?|"
+    r"\bisn['’]?t(?:\s+(?:in|the))?|\bexit(?:ed|ing)?(?:\s+the)?|"
+    r"\bleav(?:e|ing)(?:\s+the)?|\bleft(?:\s+the)?|\bend(?:ed|ing)?(?:\s+the)?|"
+    r"\bdisabled?)\s*$",
+    re.IGNORECASE,
+)
+_FILE_MUTATION_GRANT_RE = re.compile(
+    r"\b(?:permitted|allowed|free|encouraged)\s+to\s+"
+    r"(?:(?:make|apply)\s+)?(?:file\s+)?"
+    r"(?:changes?|edits?|modifications?|write|modify|create)\b",
+    re.IGNORECASE,
+)
+
+
+def _mentions_active_read_only_phase(text: str) -> bool:
+    for match in _READ_ONLY_PHASE_RE.finditer(text):
+        prefix = text[max(0, match.start() - 32) : match.start()]
+        if not _READ_ONLY_NEGATION_TAIL_RE.search(prefix):
+            return True
+    return False
 _NO_TOOL_USE_RE = re.compile(
     r"\b(?:do\s+not|don['’]?t|dont|never)\s+"
     r"(?:use|call|invoke)\s+(?:any\s+)?tools?\b"
@@ -5127,7 +5255,16 @@ def _request_disallows_file_mutation(messages: list[ChatMessage]) -> bool:
     for message in reversed(messages):
         if str(message.role).lower() != "user":
             continue
-        return bool(_NO_FILE_MUTATION_RE.search(_content_to_text(message.content)))
+        text = _content_to_text(message.content)
+        if _FILE_MUTATION_GRANT_RE.search(text):
+            # An explicit grant ("you are permitted to make file changes")
+            # outranks read-only phrasing elsewhere in the same message —
+            # mode-switch reminders describe the phase they LEFT.
+            return False
+        return bool(
+            _NO_FILE_MUTATION_RE.search(text)
+            or _mentions_active_read_only_phase(text)
+        )
     return False
 
 
@@ -5170,6 +5307,20 @@ def _read_only_inspection_force_answer_after_tools() -> int:
 
 def _tool_result_message_count(messages: list[ChatMessage]) -> int:
     return sum(1 for message in messages if str(message.role).lower() == "tool")
+
+
+def _turn_tail_contains_tool_results(messages: list[ChatMessage]) -> bool:
+    """True when the CURRENT user turn already ran tools — i.e. tool
+    results sit after the last user message. This is the shape a tool
+    loop's final round has when the client disables tools to force the
+    synthesized answer."""
+    for message in reversed(messages):
+        role = str(message.role).lower()
+        if role == "user":
+            return False
+        if role == "tool":
+            return True
+    return False
 
 
 def _request_explicit_single_tool_then_answer(messages: list[ChatMessage]) -> bool:
@@ -5240,6 +5391,7 @@ def _filter_tool_specs_for_request(
     messages: list[ChatMessage],
     *,
     tool_choice: Any = None,
+    client_manages_tools: bool = False,
 ) -> list[dict[str, Any]]:
     if not tools:
         return tools
@@ -5247,6 +5399,17 @@ def _filter_tool_specs_for_request(
         return tools
     if _request_disallows_tools(messages):
         return []
+    if client_manages_tools:
+        # Coding-agent clients (OpenCode) curate the toolset per agent mode
+        # and enforce permissions client-side; they also inject mode
+        # reminders whose wording trips the content heuristics below
+        # (plan-mode text kept write/edit hidden AFTER the user switched to
+        # build — the model re-planned files it could not create until it
+        # looped, 2026-07-04). Content-conditional hiding also rewrites the
+        # rendered tool digest between rounds, which breaks banked-prefix
+        # reuse at the digest bytes. The client's toolset is authoritative:
+        # pass it through byte-stable.
+        return tools
     hidden_tools: set[str] = set()
     if _request_disallows_subagents(messages):
         hidden_tools.update(_SUBAGENT_TOOL_NAMES)
@@ -7182,6 +7345,60 @@ _ACTIVE_READ_INSPECTION_MULTI_FILE_LINE_MAX_CHARS = 150
 _ACTIVE_TOOL_RESULT_COMPACT_THRESHOLD_CHARS = 4_000
 _ACTIVE_TOOL_RESULT_COMPACT_HEAD_LINES = 8
 _ACTIVE_TOOL_RESULT_COMPACT_TAIL_LINES = 4
+def _historical_read_budget() -> tuple[int, int]:
+    """Fixed prefix-stable budget for HISTORICAL inspection-segment reads.
+
+    Historical renders must be a pure function of the transcript prefix, so
+    the count-scaled budget from `_inspection_read_budget_for_count` (which
+    shrinks as the session accumulates reads, rewriting already-banked
+    history bytes) is replaced by the multi-file floor tier — the state every
+    long inspection transcript converges to anyway.
+    """
+
+    return (
+        max(
+            8,
+            _env_int(
+                "MTPLX_ACTIVE_READ_INSPECTION_MIN_LINES_PER_FILE",
+                _ACTIVE_READ_INSPECTION_MIN_LINES_PER_FILE,
+            ),
+        ),
+        max(
+            120,
+            _env_int(
+                "MTPLX_ACTIVE_READ_INSPECTION_MULTI_FILE_LINE_MAX_CHARS",
+                _ACTIVE_READ_INSPECTION_MULTI_FILE_LINE_MAX_CHARS,
+            ),
+        ),
+    )
+
+
+def _looks_like_embedded_tool_response_user_text(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith("<tool_response>") or stripped.startswith(
+        "<tool_result>"
+    )
+
+
+def _segment_inspection_flags(messages: list[ChatMessage]) -> list[bool]:
+    """Per-message inspection classification anchored to each message's OWN round.
+
+    Historical rendering must never depend on the LATEST user text (it changes
+    every turn and re-classifies the whole transcript, rewriting banked
+    history bytes). Instead, each message inherits the classification of the
+    real user request that opened its segment — a pure function of the
+    transcript prefix.
+    """
+
+    flags: list[bool] = []
+    current = False
+    for message in messages:
+        if str(message.role).lower() == "user":
+            text = _content_to_text(message.content)
+            if text.strip() and not _looks_like_embedded_tool_response_user_text(text):
+                current = _is_read_only_inspection_request(text)
+        flags.append(current)
+    return flags
 _ACTIVE_TOOL_RESULT_COMPACT_MAX_LINES = 48
 _ACTIVE_TOOL_RESULT_LINE_MAX_CHARS = 280
 _LINE_NUMBERED_CONTENT_RE = re.compile(r"^\s*(\d+):\s?(.*)$")
@@ -8030,6 +8247,23 @@ def _inspection_read_budget_for_count(candidate_count: int) -> tuple[int | None,
     return max_lines, line_max_chars
 
 
+def _inspection_read_budget_for_ordinal(
+    ordinal: int | None,
+) -> tuple[int | None, int | None]:
+    """Prefix-stable per-read budget: a pure function of the read's own
+    1-based ordinal among qualifying reads seen SO FAR in the transcript.
+
+    The old transcript-wide count re-rendered EARLIER reads whenever a new
+    read arrived, mutating prompt-prefix bytes mid tool-loop and breaking
+    SessionBank prefix reuse. Ordinal budgets keep every emitted byte
+    immutable while still tapering context growth: read #1 keeps the
+    single-read render, read #k gets total//k lines (floored).
+    """
+    if ordinal is None or ordinal <= 1:
+        return None, None
+    return _inspection_read_budget_for_count(ordinal)
+
+
 def _compact_repeated_inspection_read_tool_result_text(
     text: str,
     *,
@@ -8458,41 +8692,39 @@ def _canonicalize_agent_transcript(
                 signature = _tool_call_loop_key(tool_call)
                 if call_id and signature is not None:
                     tool_calls_by_id[call_id] = signature
-        inspection_read_candidate_count = 0
-        if inspection_request:
-            for message in source_messages:
-                if str(message.role).lower() != "tool":
-                    continue
-                text = _content_to_text(message.content)
-                tool_call_id = str(
-                    message.tool_call_id
-                    or _message_extra(message, "tool_call_id")
-                    or ""
-                ).strip()
-                signature = tool_calls_by_id.get(tool_call_id)
-                read_text = text
-                if signature is not None:
-                    tool_name, _key_payload, command = signature
-                    if tool_name.strip().lower() == "read":
-                        tagged = _tag_plain_read_tool_result_text(text, path=command)
-                        if tagged is not None:
-                            read_text = tagged
-                read_meta = _read_tool_content_meta(read_text)
-                if read_meta is not None and len(read_meta.line_numbers) >= 20:
-                    inspection_read_candidate_count += 1
-        inspection_max_lines, inspection_line_max_chars = (
-            _inspection_read_budget_for_count(inspection_read_candidate_count)
-        )
-        if inspection_max_lines is not None:
-            stats.inspection_read_budget_candidate_messages = (
-                inspection_read_candidate_count
-            )
-            stats.inspection_read_budget_max_lines_per_file = inspection_max_lines
+        # FORWARD-ONLY READ BUDGETS (2026-07-04 prefix-stability fix): the old
+        # budget divided a fixed line total by the TRANSCRIPT-WIDE count of
+        # big reads, so every new read in the tool loop retroactively
+        # re-rendered all earlier read results (72//n lines each) — the bytes
+        # of the prompt PREFIX changed mid-turn, SessionBank prefix reuse
+        # broke, and every later round re-prefilled from the first read.
+        # Budgets are now a pure function of each read's own 1-based ordinal
+        # among qualifying reads seen SO FAR: read #1 keeps the single-read
+        # render forever, later reads render tighter. Bytes, once emitted,
+        # never change within a turn.
+        inspection_read_ordinal = 0
         timeout_counts_by_key: dict[str, int] = {}
         inspection_read_lines_by_path: dict[str, set[int]] = {}
+        # PREFIX STABILITY CONTRACT (2026-07-03 OpenCode cache-divergence fix):
+        # any message strictly behind the latest assistant step is "historical"
+        # and must render as a pure function of the transcript prefix up to
+        # that message. Renders used to be gated on `inspection_request`
+        # (derived from the LATEST user text, which changes every turn) and on
+        # transcript-wide read budgets, so history bytes were rewritten
+        # between turns — the banked KV prefix diverged mid-transcript and
+        # every later turn foreground-re-prefilled from that point (measured:
+        # TTFT growing 3s -> 16.4s across one real OpenCode session).
+        # Historical messages now classify by their OWN segment's user request
+        # and use fixed budgets; only the active zone (>= latest assistant
+        # step) may use the per-request classification and count-scaled
+        # budgets, because it re-prefills anyway.
+        segment_inspection = _segment_inspection_flags(source_messages)
         canonical = []
         for index, message in enumerate(source_messages):
             role = str(message.role).lower()
+            historical = (
+                latest_assistant_cutoff is not None and index < latest_assistant_cutoff
+            ) or (plain_answer_cutoff is not None and index < plain_answer_cutoff)
             if role == "assistant":
                 content = _content_to_text(message.content)
                 if _message_declares_aborted_assistant_turn(message):
@@ -8504,7 +8736,11 @@ def _canonicalize_agent_transcript(
                 if (
                     message.tool_calls
                     and content.strip()
-                    and (inspection_request or strip_tool_call_preamble_text)
+                    and (
+                        (segment_inspection[index] or strip_tool_call_preamble_text)
+                        if historical
+                        else (inspection_request or strip_tool_call_preamble_text)
+                    )
                 ):
                     stats.stripped_tool_preamble_messages += 1
                     stats.stripped_tool_preamble_chars += len(content)
@@ -8549,18 +8785,35 @@ def _canonicalize_agent_transcript(
                         )
                         stats.compacted_repeated_timeout_tool_messages += 1
                         continue
-                if inspection_request:
-                    read_text = text
-                    if signature is not None:
-                        tool_name, _key_payload, command = signature
-                        if tool_name.strip().lower() == "read":
-                            tagged = _tag_plain_read_tool_result_text(
-                                text,
-                                path=command,
-                            )
-                            if tagged is not None:
-                                read_text = tagged
-                    read_meta = _read_tool_content_meta(read_text)
+                # Forward-only read accounting: read_text/read_meta and the
+                # qualifying ordinal are pure functions of the transcript
+                # PREFIX (source text order), never of later messages, so a
+                # message's render can never be rewritten by a read that
+                # arrives after it.
+                read_text = text
+                if signature is not None:
+                    tool_name, _key_payload, command = signature
+                    if tool_name.strip().lower() == "read":
+                        tagged = _tag_plain_read_tool_result_text(
+                            text,
+                            path=command,
+                        )
+                        if tagged is not None:
+                            read_text = tagged
+                read_meta = _read_tool_content_meta(read_text)
+                message_read_ordinal: int | None = None
+                if read_meta is not None and len(read_meta.line_numbers) >= 20:
+                    inspection_read_ordinal += 1
+                    message_read_ordinal = inspection_read_ordinal
+                if historical and segment_inspection[index]:
+                    # Prefix-stable inspection-segment historical render:
+                    # classification comes from this message's own segment,
+                    # budgets are the fixed multi-file floor tier, and dedupe
+                    # state accumulates strictly forward. A tool result flips
+                    # render exactly ONCE — when it ages behind a new
+                    # assistant step — and the retokenized postcommit produces
+                    # the identical bytes the next request will build, so
+                    # SessionBank prefix reuse survives the whole session.
                     if read_meta is not None:
                         prior_lines = inspection_read_lines_by_path.setdefault(
                             read_meta.path,
@@ -8591,6 +8844,75 @@ def _canonicalize_agent_transcript(
                             stats.compacted_repeated_read_inspection_chars += saved_chars
                             continue
                         prior_lines.update(read_meta.line_numbers)
+                    historical_max_lines, historical_line_chars = (
+                        _historical_read_budget()
+                    )
+                    compacted = _compact_active_read_tool_result_text(
+                        read_text,
+                        inspection_request=True,
+                        inspection_max_lines=historical_max_lines,
+                        inspection_line_max_chars=historical_line_chars,
+                    )
+                    if compacted is not None:
+                        canonical.append(_copy_chat_message(message, content=compacted))
+                        stats.compacted_active_read_messages += 1
+                        stats.compacted_active_read_chars += max(
+                            0, len(text) - len(compacted)
+                        )
+                        stats.compacted_active_read_inspection_messages += 1
+                        stats.compacted_active_read_inspection_chars += max(
+                            0, len(text) - len(compacted)
+                        )
+                        continue
+                    compacted = _compact_tool_result_text(text)
+                    if compacted is not None:
+                        canonical.append(_copy_chat_message(message, content=compacted))
+                        stats.compacted_tool_result_messages += 1
+                        stats.compacted_tool_result_chars += len(text) - len(compacted)
+                        continue
+                    canonical.append(message)
+                    continue
+                if not historical and inspection_request:
+                    if read_meta is not None:
+                        prior_lines = inspection_read_lines_by_path.setdefault(
+                            read_meta.path,
+                            set(),
+                        )
+                        new_lines = set(read_meta.line_numbers) - prior_lines
+                        duplicate_threshold = max(
+                            3,
+                            int(len(read_meta.line_numbers) * 0.08),
+                        )
+                        if prior_lines and len(new_lines) <= duplicate_threshold:
+                            compacted = _compact_repeated_inspection_read_tool_result_text(
+                                read_text,
+                                meta=read_meta,
+                                prior_covered_lines=len(prior_lines),
+                                new_lines=len(new_lines),
+                            )
+                            prior_lines.update(read_meta.line_numbers)
+                            canonical.append(
+                                _copy_chat_message(message, content=compacted)
+                            )
+                            saved_chars = max(0, len(text) - len(compacted))
+                            stats.compacted_active_read_messages += 1
+                            stats.compacted_active_read_chars += saved_chars
+                            stats.compacted_active_read_inspection_messages += 1
+                            stats.compacted_active_read_inspection_chars += saved_chars
+                            stats.compacted_repeated_read_inspection_messages += 1
+                            stats.compacted_repeated_read_inspection_chars += saved_chars
+                            continue
+                        prior_lines.update(read_meta.line_numbers)
+                    inspection_max_lines, inspection_line_max_chars = (
+                        _inspection_read_budget_for_ordinal(message_read_ordinal)
+                    )
+                    if inspection_max_lines is not None:
+                        stats.inspection_read_budget_candidate_messages = (
+                            inspection_read_ordinal
+                        )
+                        stats.inspection_read_budget_max_lines_per_file = (
+                            inspection_max_lines
+                        )
                     compacted = _compact_active_read_tool_result_text(
                         read_text,
                         inspection_request=True,
@@ -8608,23 +8930,27 @@ def _canonicalize_agent_transcript(
                             0, len(text) - len(compacted)
                         )
                         continue
-                if (
-                    plain_answer_cutoff is not None
-                    and index < plain_answer_cutoff
-                    or latest_assistant_cutoff is not None
-                    and index < latest_assistant_cutoff
-                ):
+                if historical:
+                    # Non-inspection-segment historical result: the classic
+                    # deterministic older-tool digest (pure function of text).
                     compacted = _compact_tool_result_text(text)
                     if compacted is not None:
                         canonical.append(_copy_chat_message(message, content=compacted))
                         stats.compacted_tool_result_messages += 1
                         stats.compacted_tool_result_chars += len(text) - len(compacted)
                         continue
+                fallthrough_max_lines, fallthrough_line_max_chars = (
+                    (None, None)
+                    if historical
+                    else _inspection_read_budget_for_ordinal(message_read_ordinal)
+                )
                 compacted = _compact_active_read_tool_result_text(
                     text,
-                    inspection_request=inspection_request,
-                    inspection_max_lines=inspection_max_lines,
-                    inspection_line_max_chars=inspection_line_max_chars,
+                    # Historical fall-through renders must not vary with the
+                    # per-request classification/budgets (prefix stability).
+                    inspection_request=False if historical else inspection_request,
+                    inspection_max_lines=fallthrough_max_lines,
+                    inspection_line_max_chars=fallthrough_line_max_chars,
                 )
                 if compacted is not None:
                     canonical.append(_copy_chat_message(message, content=compacted))
@@ -8632,7 +8958,7 @@ def _canonicalize_agent_transcript(
                     stats.compacted_active_read_chars += max(
                         0, len(text) - len(compacted)
                     )
-                    if inspection_request:
+                    if not historical and inspection_request:
                         stats.compacted_active_read_inspection_messages += 1
                         stats.compacted_active_read_inspection_chars += max(
                             0, len(text) - len(compacted)
@@ -8660,6 +8986,7 @@ def _message_to_template_dict(
     message: ChatMessage,
     *,
     strip_assistant_reasoning_history: bool,
+    include_reasoning_content: bool = False,
 ) -> dict[str, Any] | None:
     if not message.role:
         return None
@@ -8673,6 +9000,18 @@ def _message_to_template_dict(
             ).strip()
         )
     item: dict[str, Any] = {"role": message.role, "content": content}
+    if include_reasoning_content and message.role == "assistant":
+        # Scoped reasoning history carries the client's structured reasoning
+        # fields through to the chat template so its rolling checkpoint can
+        # keep them inside the active agent round (interleaved-thinking
+        # continuity) and drop them for completed turns. The legacy
+        # preserve/strip modes keep their historical behavior: the field is
+        # dropped here, so `on` stays byte-identical as the rollback path.
+        for key in ("reasoning_content", "reasoning"):
+            reasoning = _message_extra(message, key)
+            if reasoning:
+                item["reasoning_content"] = str(reasoning)
+                break
     if message.name:
         item["name"] = message.name
     if message.tool_call_id:
@@ -8983,17 +9322,26 @@ def _encode_messages(
     enable_thinking: bool,
     reasoning_effort: str | None = None,
     strip_assistant_reasoning_history: bool = False,
+    scoped_reasoning_history: bool = False,
     add_generation_prompt: bool = True,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
     tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
     template_observability: dict[str, Any] | None = None,
 ) -> list[int]:
+    # Scoped mode keeps reasoning_content on the normalized messages and
+    # passes preserve_thinking=False so the template's own rolling checkpoint
+    # governs: think blocks survive inside the active agent round (after the
+    # last real user query) and are dropped for completed turns.
+    template_preserve_thinking = (
+        not strip_assistant_reasoning_history and not scoped_reasoning_history
+    )
     prepared_messages: list[dict[str, Any]] = []
     for message in messages:
         item = _message_to_template_dict(
             message,
             strip_assistant_reasoning_history=strip_assistant_reasoning_history,
+            include_reasoning_content=scoped_reasoning_history,
         )
         if item is not None:
             prepared_messages.append(item)
@@ -9034,6 +9382,9 @@ def _encode_messages(
             if effective_tool_prompt_mode == _TOOL_PROMPT_MODE_NATIVE and tools
             else None
         )
+        # The Gemma4 encoder has no rolling checkpoint; it keeps its binary
+        # preserve/strip contract (the scoped capability probe returns False
+        # for it, so scoped never resolves here in practice).
         return encode_chat_messages(
             tokenizer,
             normalized,
@@ -9053,7 +9404,7 @@ def _encode_messages(
         add_generation_prompt=add_generation_prompt,
         enable_thinking=enable_thinking,
         reasoning_effort=reasoning_effort,
-        preserve_thinking=not strip_assistant_reasoning_history,
+        preserve_thinking=template_preserve_thinking,
         tools=template_tools,
         template_observability=template_observability,
     )
@@ -9066,7 +9417,7 @@ def _encode_messages(
             add_generation_prompt=add_generation_prompt,
             enable_thinking=enable_thinking,
             reasoning_effort=reasoning_effort,
-            preserve_thinking=not strip_assistant_reasoning_history,
+            preserve_thinking=template_preserve_thinking,
             tools=template_tools,
             template_observability=template_observability,
         )
@@ -9076,7 +9427,7 @@ def _encode_messages(
         "tokenize": True,
         "add_generation_prompt": add_generation_prompt,
         "enable_thinking": enable_thinking,
-        "preserve_thinking": not strip_assistant_reasoning_history,
+        "preserve_thinking": template_preserve_thinking,
     }
     if reasoning_effort:
         template_kwargs["reasoning_effort"] = reasoning_effort
@@ -9241,6 +9592,7 @@ def _postcommit_next_turn_prefix_ids(
     enable_thinking: bool,
     reasoning_effort: str | None = None,
     strip_assistant_reasoning_history: bool,
+    scoped_reasoning_history: bool = False,
     tools: list[dict[str, Any]] | None,
     assistant_tool_calls: list[dict[str, Any]] | None,
     tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
@@ -9262,6 +9614,7 @@ def _postcommit_next_turn_prefix_ids(
         item = _message_to_template_dict(
             message,
             strip_assistant_reasoning_history=strip_assistant_reasoning_history,
+            include_reasoning_content=scoped_reasoning_history,
         )
         if item is not None:
             normalized.append(item)
@@ -9269,18 +9622,26 @@ def _postcommit_next_turn_prefix_ids(
     item = _message_to_template_dict(
         sentinel_message,
         strip_assistant_reasoning_history=strip_assistant_reasoning_history,
+        include_reasoning_content=scoped_reasoning_history,
     )
     if item is not None:
         normalized.append(item)
     if not normalized:
         return None
 
+    # Under scoped reasoning history the sentinel's role drives the template's
+    # rolling checkpoint exactly like the real next turn will: a user sentinel
+    # becomes the last query, so every completed round's think block is
+    # scoped out of the predicted prefix; a tool sentinel is not a query, so
+    # the active round's reasoning stays in - matching in-round continuation.
     rendered = _render_messages_for_postcommit(
         tokenizer,
         normalized,
         enable_thinking=enable_thinking,
         reasoning_effort=reasoning_effort,
-        preserve_thinking=not strip_assistant_reasoning_history,
+        preserve_thinking=(
+            not strip_assistant_reasoning_history and not scoped_reasoning_history
+        ),
         tools=tools,
         tool_prompt_mode=tool_prompt_mode,
     )
@@ -10059,6 +10420,7 @@ def _metrics_envelope(
         "repetition_stop_raw_tokens": int(
             stats.get("repetition_stop_raw_tokens") or 0
         ),
+        "loop_guard": dict(stats.get("loop_guard") or {}),
         "lock_wait_time_s": lock_wait_time_s,
         "session_id": session_id,
         **generation_limits,
@@ -10119,7 +10481,7 @@ def _machine_info() -> dict[str, Any]:
     mem_bytes: int | None = None
     try:
         chip = subprocess.run(
-            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"],
             check=True,
             text=True,
             capture_output=True,
@@ -10129,7 +10491,7 @@ def _machine_info() -> dict[str, Any]:
         pass
     try:
         model = subprocess.run(
-            ["sysctl", "-n", "hw.model"],
+            ["/usr/sbin/sysctl", "-n", "hw.model"],
             check=True,
             text=True,
             capture_output=True,
@@ -10139,7 +10501,7 @@ def _machine_info() -> dict[str, Any]:
         pass
     try:
         result = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"],
+            ["/usr/sbin/sysctl", "-n", "hw.memsize"],
             check=True,
             text=True,
             capture_output=True,
@@ -10243,6 +10605,11 @@ def _dashboard_record_completion(
 
     dashboard = getattr(state, "dashboard", None)
     if dashboard is None:
+        return
+    if bool(envelope.get("warmup")) or bool(stats.get("warmup")):
+        # Warmup generations (startup pass and the silent background
+        # ladder) are not user requests: they must not tick the rolling
+        # TPS gauge, prefill history, or live bus while the user is idle.
         return
     try:
         request_id = envelope.get("request_id") or stats.get("request_id")
@@ -10495,18 +10862,37 @@ DASHBOARD_MUTABLE_SETTINGS_KEYS: tuple[str, ...] = (
     "draft_top_k",
 )
 DASHBOARD_READ_ONLY_SETTINGS_KEYS: tuple[str, ...] = (
+    # Every informational key the settings GET echoes must be listed here so
+    # a dashboard echo-back POST drops it instead of tripping the
+    # all-or-nothing unknown_settings 400. The Settings page diffs its draft
+    # against the GET payload by identity, so object/array-valued keys ALWAYS
+    # ride the POST after a snapshot refresh (2026-07-02 presence-penalty
+    # flag). test_settings_get_payload_keys_are_all_classified pins this.
+    "api_key_required",
+    "api_key_source",
     "architecture_id",
     "backend_id",
+    "chat_template_hash",
+    "chat_template_profile",
     "context_window",
     "context_window_policy",
     "depth_max",
     "draft_control",
     "kv_quant_policy",
+    "metal_memory_caps",
     "model_controls",
     "model_family",
+    "ok",
+    "preserve_thinking",
+    "preserve_thinking_effective",
+    "reasoning_history_mode",
     "reasoning_policy",
+    "restart_required_settings",
     "sampling_defaults",
     "support_level",
+    "tool_contract_active",
+    "tool_contract_policy_version",
+    "tool_prompt_mode",
     "tune_policy",
 )
 DASHBOARD_RESTART_REQUIRED_KEYS: tuple[str, ...] = (
@@ -11434,6 +11820,18 @@ def _session_keep_live_refs_for_request(
     )
 
 
+def _expert_streaming_allows_session_live_refs(runtime: Any) -> bool:
+    """Keep unmetered live KV references out of bounded expert runtimes.
+
+    Session-bank snapshots participate in byte-budget eviction, but live-ref
+    entries deliberately report zero bytes. Retaining those references after
+    a request releases aggregate KV admission would invalidate the
+    user-visible expert-streaming memory ceiling.
+    """
+
+    return getattr(runtime, "expert_streaming", None) is None
+
+
 def _commit_prompt_prefix_for_request(
     state: Any,
     *,
@@ -11624,6 +12022,7 @@ def _clear_mlx_cache_after_request(
     state: Any,
     *,
     reason: str,
+    lock_wait_s: float = 0.0,
 ) -> dict[str, Any]:
     raw = (os.environ.get("MTPLX_CLEAR_CACHE_AFTER_REQUEST") or "auto").strip().lower()
     if raw in {"0", "false", "no", "off", "never"}:
@@ -11631,7 +12030,13 @@ def _clear_mlx_cache_after_request(
     lock = getattr(state, "lock", None)
     acquired = False
     if lock is not None and hasattr(lock, "acquire"):
-        acquired = bool(lock.acquire(blocking=False))
+        # Request-path callers must never stall (lock_wait_s=0 keeps the old
+        # non-blocking probe); admin/benchmark-boundary callers pass a bounded
+        # wait so a just-finishing request cannot skip the cleanup.
+        if lock_wait_s > 0:
+            acquired = bool(lock.acquire(timeout=float(lock_wait_s)))
+        else:
+            acquired = bool(lock.acquire(blocking=False))
         if not acquired:
             return {"cleared": False, "reason": "model_lock_busy", "trigger": reason}
     try:
@@ -12470,6 +12875,7 @@ def _policy_fingerprint(
     no_tools_contract_active: bool = False,
     read_only_force_answer_contract_active: bool = False,
     pi_convergence_contract_active: bool = False,
+    post_tool_answer_contract_active: bool = False,
     simple_chat_contract_active: bool = False,
     opencode_prompt_contract_profile: str | None = None,
     cache_scope: str | None = None,
@@ -12493,7 +12899,7 @@ def _policy_fingerprint(
     parts = [
         f"template={state.template_hash}",
         f"thinking={int(bool(thinking_enabled))}",
-        f"strip_reasoning={int(bool(state.args.strip_assistant_reasoning_history))}",
+        _reasoning_history_fingerprint_component(state),
         f"openai_bridge={_OPENAI_BRIDGE_POLICY_VERSION}",
         f"tool_prompt_mode={effective_tool_prompt_mode}",
         "tool_contract="
@@ -12503,9 +12909,11 @@ def _policy_fingerprint(
             no_tools_contract_active=no_tools_contract_active,
             read_only_force_answer_contract_active=read_only_force_answer_contract_active,
             pi_convergence_contract_active=pi_convergence_contract_active,
+            post_tool_answer_contract_active=post_tool_answer_contract_active,
         ),
         f"tool_choice={_tool_choice_policy_signature(tool_choice)}",
         f"no_tools_contract={int(bool(no_tools_contract_active))}",
+        f"post_tool_answer_contract={int(bool(post_tool_answer_contract_active))}",
         "read_only_force_answer_contract="
         f"{int(bool(read_only_force_answer_contract_active))}",
         f"pi_convergence_contract={int(bool(pi_convergence_contract_active))}",
@@ -12719,6 +13127,7 @@ def _bridge_policy_observability(
     no_tools_contract_active: bool = False,
     read_only_force_answer_contract_active: bool = False,
     pi_convergence_contract_active: bool = False,
+    post_tool_answer_contract_active: bool = False,
 ) -> dict[str, Any]:
     effective_tool_prompt_mode = _normalize_tool_prompt_mode(tool_prompt_mode)
     return {
@@ -12730,12 +13139,14 @@ def _bridge_policy_observability(
             no_tools_contract_active=no_tools_contract_active,
             read_only_force_answer_contract_active=read_only_force_answer_contract_active,
             pi_convergence_contract_active=pi_convergence_contract_active,
+            post_tool_answer_contract_active=post_tool_answer_contract_active,
         ),
         "tool_contract_active": _tool_contract_active_for_mode(
             tools_active=tools_active,
             tool_prompt_mode=effective_tool_prompt_mode,
         ),
         "no_tools_contract_active": bool(no_tools_contract_active),
+        "post_tool_answer_contract_active": bool(post_tool_answer_contract_active),
         "read_only_force_answer_contract_active": bool(
             read_only_force_answer_contract_active
         ),
@@ -13025,6 +13436,9 @@ def _store_retokenized_history_snapshot(
                 mtp_history_policy="committed",
                 draft_head_identity=state.draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
+                gdn_boundaries=list(
+                    getattr(prompt_state, "gdn_boundaries", None) or []
+                ),
                 mtp_history_snapshot=mtp_snapshot,
                 snapshot_epoch=len(history_ids),
                 mtp_snapshot_epoch=len(history_ids)
@@ -13166,6 +13580,7 @@ def _history_ids_for_postcommit(
         enable_thinking=thinking_enabled,
         reasoning_effort=reasoning_effort,
         strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
+        scoped_reasoning_history=_reasoning_history_scoped_active(state),
         tools=tool_specs,
         assistant_tool_calls=assistant_tool_calls,
         tool_prompt_mode=effective_tool_prompt_mode,
@@ -13178,6 +13593,7 @@ def _history_ids_for_postcommit(
         enable_thinking=thinking_enabled,
         reasoning_effort=reasoning_effort,
         strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
+        scoped_reasoning_history=_reasoning_history_scoped_active(state),
         add_generation_prompt=False,
         tools=tool_specs,
         tool_prompt_mode=effective_tool_prompt_mode,
@@ -13279,6 +13695,12 @@ def _generation_final_postcommit_compatibility(
     reason = "retokenized_history_mismatch"
     if bool(state.args.strip_assistant_reasoning_history) and thinking_enabled:
         reason = "reasoning_history_stripping_mismatch"
+    elif _reasoning_history_scoped_active(state) and thinking_enabled:
+        # Expected under scoped mode when a turn completes with a plain
+        # answer: the next user turn scopes this round's think block out, so
+        # the generation boundary is not a prefix of the next-turn prompt.
+        # In-round tool continuations (tool sentinel) still prefix-match.
+        reason = "reasoning_history_scoping_mismatch"
     elif str(generated.get("finish_reason") or "") == "stop":
         reason = "stop_token_boundary_mismatch"
     return {
@@ -13525,6 +13947,12 @@ def _schedule_idle_postcommit_snapshot(
                     )
                     return
                 if abort_event.is_set() or _foreground_model_work_pending(state):
+                    # Yield to queued foreground: return to free the single
+                    # model worker (a sleep+retry here would starve the
+                    # foreground request behind us — regression caught by
+                    # test_running_idle_postcommit_yields_to_queued_foreground,
+                    # 2026-07-02). Warming the next agent turn is handled by
+                    # store-on-prefill instead, which needs no idle gap.
                     _log(
                         {
                             "stored": False,
@@ -13758,6 +14186,20 @@ def _uncapped_repetition_stop_enabled(generation_limits: dict[str, Any]) -> bool
     return raw not in _UNCAPPED_RESPONSE_LEASE_DISABLED_VALUES
 
 
+def _loop_guard_enabled() -> bool:
+    """Loop Guard product default for the serve path: OFF (opt-in).
+
+    Founder ruling 2026-07-08: no synthetic steering touches sampling by
+    default. The guard's detector-gated DRY steering remains available for
+    users running repetition-damaged third-party quants via
+    ``MTPLX_LOOP_GUARD=1``, but the product answer to the quantized-model
+    loop marathons is the artifact lane (delta-net-sensitive quantization),
+    not a sampler intervention. Config knobs live in mtplx/loop_guard.py.
+    """
+    raw = os.environ.get("MTPLX_LOOP_GUARD", "0").strip().lower()
+    return raw not in _UNCAPPED_RESPONSE_LEASE_DISABLED_VALUES
+
+
 def _fresh_seed() -> int:
     # Keep within signed 31-bit range for downstream RNG compatibility.
     return secrets.randbelow(2**31 - 1)
@@ -13838,23 +14280,31 @@ def _ar_batch_history_bypass_reason(
 ) -> str | None:
     """Return why a request must stay out of the live AR batch lane.
 
-    The live AR batch lane is an agent fairness feature, not a generic OpenAI
-    API compatibility mode. Anonymous benchmark/API calls should keep the solo
-    MTP path so concurrent `mtplx serve` users do not see hidden AR fallback.
+    When the operator opts into ``--scheduler-mode ar_batch``, every client —
+    including anonymous OpenAI API calls — rides the same concurrency-adaptive
+    policy: a lone request keeps the solo MTP oracle
+    (``_ar_batch_mtp_fallback_reason`` only diverts when another request is
+    actually in flight) and genuine concurrency shares the batched AR lane.
+    Until 2026-07-05 generic clients were force-pinned to solo MTP even under
+    ar_batch mode, which made the flag a no-op for plain API servers. The lane
+    is not hidden: ``mtplx_stats`` carries ``mtp_disabled_reason`` and
+    ``scheduler_lane`` per request.
+
+    Shape guidance (measured 2026-07-05, M5 Max, 27B q4): serialized solo-MTP
+    wins prefill-heavy concurrent loads end to end (2k-token cold prompts,
+    128-token gens: serial 18-20 tok/s aggregate vs 13-14 batched) because MTP
+    decode is ~4x faster per stream; the batched lane wins decode-heavy loads
+    (short prompts, 256-token gens at batch 8: 79 vs ~48 aggregate). That is
+    why serial remains the server default and ar_batch is the opt-in.
 
     Tool/history turns are still plain prompt tokens when no restored cache is
     handed to mlx-lm's ``BatchGenerator``. The unsafe object is the restored
     non-mergeable paged KV history cache, not the existence of assistant/tool
     roles in the prompt. Keep this hook for future explicit bypass reasons, but
-    do not serialize OpenCode follow-up turns by role alone.
+    do not serialize follow-up turns by role or client identity alone.
     """
 
-    request_observability = request_observability or {}
-    client_hint = str(request_observability.get("request_client_hint") or "").lower()
-    client_label = str(request_observability.get("request_client_label") or "").lower()
-    client = client_hint or client_label
-    if client in {"", "openai"}:
-        return "generic_openai_solo_mtp"
+    del request_observability
     return None
 
 
@@ -14097,6 +14547,11 @@ class _SmartFanArrivalMiddleware:
             _end_smart_fan_request(self.state, lease)
 
 
+def _runtime_kv_admission(runtime: Any, tokens: int):
+    admit = getattr(runtime, "admit_kv_tokens", None)
+    return admit(tokens) if callable(admit) else nullcontext()
+
+
 def _run_generation_dispatched(
     state: ServerState,
     prompt_ids: list[int],
@@ -14154,7 +14609,7 @@ def _run_generation_dispatched(
             presence_penalty=kwargs.get("presence_penalty"),
             frequency_penalty=kwargs.get("frequency_penalty"),
         )
-        generation_seed, _seed_is_explicit = _resolve_seed(state, kwargs.get("seed"))
+        generation_seed, seed_is_explicit = _resolve_seed(state, kwargs.get("seed"))
         request_observability = dict(kwargs.get("request_observability") or {})
         request_observability["scheduler_lane"] = "ar_batch"
         if kwargs.get("cache_miss_reason") is not None:
@@ -14185,6 +14640,7 @@ def _run_generation_dispatched(
             session_template_hash=kwargs.get("session_template_hash"),
             session_draft_head_identity=kwargs.get("session_draft_head_identity"),
             session_policy_fingerprint=kwargs.get("session_policy_fingerprint"),
+            seed_is_explicit=seed_is_explicit,
         )
         ar_request_id = response_id or job.request_id
         smart_fan_lease = _begin_smart_fan_request(
@@ -14193,10 +14649,19 @@ def _run_generation_dispatched(
             request_observability=request_observability,
         )
         state.begin_foreground()
+        kv_admission = None
         try:
+            kv_admission = _runtime_kv_admission(
+                state.runtime,
+                len(prompt_ids) + response_max
+            )
             future = state.ar_batch_service.submit(job)
             generated = future.result()
         finally:
+            if kv_admission is not None:
+                release_kv = getattr(kv_admission, "release", None)
+                if callable(release_kv):
+                    release_kv()
             state.end_foreground()
             _end_smart_fan_request(state, smart_fan_lease)
         ar_stats = dict(generated.get("stats") or {})
@@ -14366,9 +14831,14 @@ def _run_generation(
             state.begin_foreground()
             state.lock.acquire()
         lock_wait_time_s += time.perf_counter() - lock_started
+        kv_admission = None
         try:
             if cancel_event is not None and cancel_event.is_set():
                 raise _StreamCancelled("request cancelled before generation")
+            kv_admission = _runtime_kv_admission(
+                state.runtime,
+                len(prompt_ids) + response_max
+            )
             dynamic_kv_reservation = _dynamic_paged_kv_reservation(
                 prompt_tokens=len(prompt_ids),
                 max_new_tokens=response_max,
@@ -14390,6 +14860,7 @@ def _run_generation(
                         trace_metadata=trace_metadata,
                         prefill_callback=prefill_callback,
                         repetition_stop=uncapped_repetition_stop,
+                        loop_guard=_loop_guard_enabled(),
                     )
                 else:
                     adaptive_policy = _make_adaptive_policy(
@@ -14403,6 +14874,11 @@ def _run_generation(
                         state.runtime,
                         prompt_ids,
                         vision_splice=vision_splice,
+                        abort_check=(
+                            (lambda: bool(cancel_event.is_set()))
+                            if cancel_event is not None
+                            else None
+                        ),
                         max_tokens=response_max,
                         sampler=sampler,
                         draft_sampler=effective_draft_sampler,
@@ -14437,6 +14913,7 @@ def _run_generation(
                         prefill_callback=prefill_callback,
                         adaptive_policy=adaptive_policy,
                         repetition_stop=uncapped_repetition_stop,
+                        loop_guard=_loop_guard_enabled(),
                         online_correction_cache=bool(
                             state.args.online_correction_cache
                         ),
@@ -14468,7 +14945,16 @@ def _run_generation(
                             state.args.online_hidden_corrector_key
                         ),
                     )
+        except PostcommitAbort:
+            # abort_check tripped inside the prefill: the client disconnected
+            # mid-prompt-processing. Reuse the exact cancellation path client
+            # disconnects already take during decode.
+            raise _StreamCancelled("client disconnected during prefill")
         finally:
+            if kv_admission is not None:
+                release_kv = getattr(kv_admission, "release", None)
+                if callable(release_kv):
+                    release_kv()
             state.lock.release()
             if not background_request:
                 state.end_foreground()
@@ -14731,6 +15217,312 @@ def _run_generation(
     return last
 
 
+def _extended_warmup_enabled() -> bool:
+    """Lane E (speed-war, 2026-07-06): default-on extended kernel warmup.
+
+    The first ~6 requests of a fresh daemon measured 51 vs 61 tok/s warm
+    (JIT band: prefill chunk shape classes, verify shapes at real context,
+    packed-GQA pipelines). One tiny generation does not cross those shape
+    classes; the extended pass runs a ~2.5k-token prefill + short decode
+    and pre-builds the packed-GQA pipelines so the first user request (and
+    benchmark row) lands in the warm band. Env kill-switch for A/B.
+    """
+    raw = (os.environ.get("MTPLX_WARMUP_EXTENDED") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _background_warmup_enabled() -> bool:
+    """Lane E2 (speed-war, 2026-07-06): silent background warming.
+
+    When on (default), the extended warmup runs on the model scheduler's
+    idle lane AFTER the 16-token proof-of-life warmup instead of blocking
+    startup (~5 s on the 27B): the server reports ready immediately and
+    the extended coverage (packed-GQA pipelines + a small context ladder)
+    warms silently while the daemon is idle. Real requests always win —
+    the idle lane only runs when no foreground work is queued, and every
+    warming generation carries a foreground-yield abort (the postcommit
+    prefill mechanism) so a request arriving mid-step cancels the step at
+    the next prefill chunk / verify cycle and the step retries later.
+    ``MTPLX_WARMUP_BACKGROUND=0`` restores the legacy blocking pass.
+    """
+    raw = (os.environ.get("MTPLX_WARMUP_BACKGROUND") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _warmup_ladder_contexts(state: Any) -> list[int]:
+    """Prompt-token classes the background ladder warms, smallest first.
+
+    Default 512 + 2560: 512 covers the short-prompt decode-verify shape
+    classes (compiled traces, masks, attention pipelines at shallow KV);
+    2560 crosses the 2048-token prefill chunk class + tail and runs a
+    short decode at real depth (the original Lane E extended pass).
+    Deeper classes are not worth their idle GPU time by default (first
+    touch at 8k measured only ~2 tok/s of tax) but the ladder is
+    env-tunable for machines/models where they are.
+    """
+    raw = os.environ.get("MTPLX_WARMUP_LADDER")
+    if raw is None:
+        raw = "512,2560"
+    raw = raw.strip()
+    contexts: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError:
+            continue
+        if value > 0 and value not in contexts:
+            contexts.append(value)
+    window = int(getattr(state, "context_window", 0) or 0)
+    if window > 0:
+        contexts = [ctx for ctx in contexts if ctx + 64 <= window]
+    return sorted(contexts)
+
+
+class _ForegroundYield:
+    """Duck-typed cancel event that trips when foreground work is queued.
+
+    ``_run_generation`` only calls ``.is_set()`` on its ``cancel_event``,
+    so this shim plugs warming generations into the existing
+    cancellation/abort plumbing without threads or polling. It checks the
+    scheduler queues (not ``state.has_foreground()``, which the warming
+    request itself sets while running).
+    """
+
+    def __init__(self, state: Any) -> None:
+        self._state = state
+
+    def is_set(self) -> bool:
+        try:
+            return _foreground_model_work_pending(self._state)
+        except BaseException:
+            return False
+
+
+class _BackgroundWarmup:
+    """Silent post-ready warming plan executed on the idle model lane.
+
+    Each step is its own idle submission, so foreground work drains
+    between steps by scheduler priority; a step preempted mid-flight
+    (``_StreamCancelled`` from the foreground-yield shim) is resubmitted
+    to the idle lane tail and retried when the daemon is quiet again.
+    Status lives under ``warmup_status["background"]``: the key is
+    created before the server starts accepting requests and its value is
+    only ever replaced whole (never mutated in place), so concurrent
+    ``/health`` serialization stays safe. Warming generations pass no
+    session bank (nothing is stored) and are flagged ``warmup`` so smart
+    fans and the dashboard gauge ignore them.
+    """
+
+    MAX_RESUBMITS = 8
+
+    def __init__(
+        self,
+        state: Any,
+        status_host: dict[str, Any],
+        prompt_ids: list[int],
+    ) -> None:
+        self.state = state
+        self._status_host = status_host
+        self.prompt_ids = [int(token) for token in prompt_ids] or [0]
+        self.steps: list[dict[str, Any]] = [
+            {
+                "kind": "gqa_packed_pipelines",
+                "state": "pending",
+                "elapsed_s": 0.0,
+                "yields": 0,
+            }
+        ]
+        for ctx in _warmup_ladder_contexts(state):
+            self.steps.append(
+                {
+                    "kind": "ladder",
+                    "context": int(ctx),
+                    "state": "pending",
+                    "elapsed_s": 0.0,
+                    "yields": 0,
+                }
+            )
+        self.state_label = "pending"
+        self.resubmits = 0
+        self.started_at_s: float | None = None
+        self.finished_at_s: float | None = None
+        self._publish()
+
+    def snapshot(self) -> dict[str, Any]:
+        elapsed_s = 0.0
+        if self.started_at_s is not None:
+            end = self.finished_at_s if self.finished_at_s is not None else time.time()
+            elapsed_s = round(max(0.0, end - self.started_at_s), 3)
+        return {
+            "mode": "background",
+            "state": self.state_label,
+            "steps": [dict(step) for step in self.steps],
+            "started_at_s": self.started_at_s,
+            "finished_at_s": self.finished_at_s,
+            "elapsed_s": elapsed_s,
+            "resubmits": int(self.resubmits),
+        }
+
+    def _publish(self) -> None:
+        try:
+            self._status_host["background"] = self.snapshot()
+        except BaseException:
+            pass
+
+    def submit(self, index: int = 0) -> None:
+        try:
+            _submit_idle_postcommit_model_work(
+                self.state,
+                self._run_step,
+                index,
+                batch_key=f"warmup.background:{index}",
+            )
+        except BaseException:
+            self.state_label = "failed"
+            self._publish()
+
+    def _run_step(self, index: int) -> None:
+        try:
+            self._run_step_inner(index)
+        except BaseException:
+            # Warming must never take the daemon down; a step that raises
+            # outside the per-step handler (e.g. interpreter teardown)
+            # simply ends the plan.
+            self.state_label = "failed"
+            self._publish()
+
+    def _run_step_inner(self, index: int) -> None:
+        if index >= len(self.steps):
+            self._finish()
+            return
+        if self.started_at_s is None:
+            self.started_at_s = time.time()
+        self.state_label = "running"
+        step = self.steps[index]
+        step["state"] = "running"
+        self._publish()
+        started = time.perf_counter()
+        yielded = False
+        try:
+            if step["kind"] == "gqa_packed_pipelines":
+                step["state"] = (
+                    "ok" if _prewarm_gqa_packed_pipelines() else "skipped"
+                )
+            else:
+                generated = self._ladder_generation(int(step["context"]))
+                tok_s = generated.get("tok_s")
+                if isinstance(tok_s, (int, float)):
+                    step["tok_s"] = round(float(tok_s), 2)
+                step["state"] = "ok"
+        except _StreamCancelled:
+            yielded = True
+        except BaseException as exc:
+            step["state"] = "failed"
+            step["error"] = f"{type(exc).__name__}: {exc}"
+        step["elapsed_s"] = round(
+            float(step.get("elapsed_s") or 0.0) + time.perf_counter() - started, 3
+        )
+        if yielded:
+            step["yields"] = int(step.get("yields") or 0) + 1
+            self.resubmits += 1
+            if self.resubmits <= self.MAX_RESUBMITS:
+                step["state"] = "yielded"
+                self._publish()
+                self.submit(index)
+                return
+            # A daemon under continuous load does not need warming; stop
+            # churning re-prefills against real traffic.
+            step["state"] = "abandoned"
+            self._finish(abandoned=True)
+            return
+        self._publish()
+        if index + 1 < len(self.steps):
+            self.submit(index + 1)
+        else:
+            self._finish()
+
+    def _ladder_generation(self, context_tokens: int) -> dict[str, Any]:
+        repeats = context_tokens // max(1, len(self.prompt_ids)) + 1
+        prompt_ids = (list(self.prompt_ids) * repeats)[:context_tokens]
+        return _run_generation(
+            self.state,
+            prompt_ids,
+            max_tokens=8,
+            temperature=self.state.args.temperature,
+            top_p=self.state.args.top_p,
+            top_k=self.state.args.top_k,
+            seed=0,
+            request_observability={"warmup": True, "warmup_background": True},
+            cancel_event=_ForegroundYield(self.state),
+        )
+
+    def _finish(self, abandoned: bool = False) -> None:
+        if abandoned:
+            for step in self.steps:
+                if step.get("state") in ("pending", "yielded", "running"):
+                    step["state"] = "abandoned"
+        self.finished_at_s = time.time()
+        self.state_label = "abandoned_busy" if abandoned else "done"
+        self._publish()
+        snapshot = self.snapshot()
+        try:
+            _safe_stdout_print(
+                "[mtplx] background warmup "
+                + json.dumps(
+                    {
+                        "state": snapshot["state"],
+                        "elapsed_s": snapshot["elapsed_s"],
+                        "resubmits": snapshot["resubmits"],
+                        "steps": [
+                            {
+                                key: step.get(key)
+                                for key in ("kind", "context", "state", "elapsed_s", "tok_s")
+                                if key in step
+                            }
+                            for step in snapshot["steps"]
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        except BaseException:
+            pass
+
+
+def _prewarm_gqa_packed_pipelines() -> bool:
+    """Compile the packed-GQA verify kernel pipelines (QL=2..4) off the
+    request path. Shapes are runtime args; one call per template compiles
+    the Metal pipeline for every capacity. ~0.2 s, ~70 MB transient."""
+    try:
+        import mlx.core as mx
+
+        from mtplx.attention_split import _env_enabled as _split_env_enabled
+        from mtplx.kernels.sdpa_gqa_packed import sdpa_gqa_packed_tail
+
+        if not _split_env_enabled("MTPLX_GQA_PACKED_SDPA"):
+            return False
+        capacity = 8192
+        keys = mx.zeros((1, 4, capacity, 256), dtype=mx.bfloat16)
+        values = mx.zeros((1, 4, capacity, 256), dtype=mx.bfloat16)
+        for q_len in (2, 3, 4):
+            queries = mx.zeros((1, 24, q_len, 256), dtype=mx.bfloat16)
+            out = sdpa_gqa_packed_tail(
+                queries=queries,
+                keys=keys,
+                values=values,
+                offset=capacity - 8,
+                scale=0.0625,
+            )
+            if out is not None:
+                mx.eval(out)
+        return True
+    except Exception:
+        return False
+
+
 def _run_startup_warmup(state: ServerState) -> dict[str, Any]:
     warmup_tokens = int(getattr(state.args, "warmup_tokens", 0) or 0)
     status: dict[str, Any] = {
@@ -14786,6 +15578,66 @@ def _run_startup_warmup(state: ServerState) -> dict[str, Any]:
             "tok_s": generated.get("tok_s"),
         }
     )
+    if _extended_warmup_enabled():
+        if _background_warmup_enabled():
+            # Lane E2: run the extended pass on the idle model lane instead
+            # of blocking startup. The status key is created here — before
+            # the server accepts requests — so /health readers never race a
+            # dict insert; steps replace the value atomically as they run.
+            try:
+                warming = _BackgroundWarmup(state, status, prompt_ids)
+                status["extended"] = {
+                    "mode": "background",
+                    "steps_planned": len(warming.steps),
+                }
+                warming.submit(0)
+                _startup_line(
+                    "[6/6] Extended warmup continues silently in the background"
+                )
+            except BaseException as exc:  # pragma: no cover - never blocks startup
+                status["extended"] = {
+                    "mode": "background",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+        else:
+            extended_started = time.perf_counter()
+            extended: dict[str, Any] = {"ran": False}
+            extended_heartbeat = _startup_heartbeat(
+                "extended warmup still running", interval_s=5.0
+            )
+            try:
+                # Cross the chunked-prefill shape classes (2048-token chunks +
+                # tail) and run a short decode at real depth so verify/mask/NAX
+                # shape classes beyond the tiny prompt are compiled at startup,
+                # not on the first user request. No session bank is passed, so
+                # nothing is stored.
+                repeats = max(1, (2560 // max(1, len(prompt_ids))) + 1)
+                long_ids = (list(prompt_ids) * repeats)[:2560]
+                gen = _submit_foreground_model_work(
+                    state,
+                    lambda: _run_generation(
+                        state,
+                        long_ids,
+                        max_tokens=8,
+                        temperature=state.args.temperature,
+                        top_p=state.args.top_p,
+                        top_k=state.args.top_k,
+                        seed=0,
+                        request_observability={"warmup": True},
+                    ),
+                    batch_key="startup.warmup_extended",
+                ).result()
+                extended["prefill_tokens"] = len(long_ids)
+                extended["tok_s"] = gen.get("tok_s")
+                extended["gqa_packed_pipelines"] = _prewarm_gqa_packed_pipelines()
+                extended["ran"] = True
+            except BaseException as exc:  # pragma: no cover - never blocks startup
+                extended["error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                extended_heartbeat.set()
+            extended["elapsed_s"] = round(time.perf_counter() - extended_started, 3)
+            status["extended"] = extended
+        status["elapsed_s"] = time.perf_counter() - started
     tok_s = status.get("tok_s")
     tok_s_text = "unknown tok/s" if tok_s is None else f"{float(tok_s):.2f} tok/s"
     _startup_line(f"[6/6] Warmup complete in {status['elapsed_s']:.1f}s ({tok_s_text})")
@@ -17178,15 +18030,85 @@ def _normalize_reasoning_mode(value: Any, *, default: str = "auto") -> str:
 
 def _normalize_preserve_thinking_policy(value: Any, *, default: str = "auto") -> str:
     mode = str(value or default).strip().lower()
-    if mode not in {"auto", "on", "off"}:
-        raise ValueError("preserve_thinking must be one of: auto, on, off")
+    if mode not in {"auto", "on", "off", "scoped"}:
+        raise ValueError("preserve_thinking must be one of: auto, on, off, scoped")
     return mode
 
 
 def _preserve_thinking_effective(args: argparse.Namespace) -> bool:
+    # "Effective" means reasoning history is NOT fully stripped. Scoped keeps
+    # the active round's reasoning, so it counts as preserving. This boolean
+    # feeds args.strip_assistant_reasoning_history and the app's Codable
+    # settings contract (must stay a bool - the 196e5fc lesson).
     return _normalize_preserve_thinking_policy(
         getattr(args, "preserve_thinking", "auto")
-    ) in {"auto", "on"}
+    ) in {"auto", "on", "scoped"}
+
+
+# Resolved reasoning-history modes. The user-facing policy is
+# {auto, on, off, scoped}; the resolved mode is one of these three.
+_REASONING_HISTORY_PRESERVE = "preserve"
+_REASONING_HISTORY_SCOPED = "scoped"
+_REASONING_HISTORY_STRIP = "strip"
+
+
+def _template_supports_scoped_reasoning(tokenizer: Any) -> bool:
+    """Startup capability probe for the scoped reasoning-history mode.
+
+    Qwen3.6/3.5 chat templates carry a "rolling checkpoint": they keep
+    ``<think>`` blocks only for assistant messages after the last real user
+    query (``ns.last_query_index``), which is exactly Qwen's trained
+    "no thinking content in completed-turn history" contract. Scoped mode
+    works by letting that checkpoint govern instead of overriding it with
+    ``preserve_thinking=True``, so it is only meaningful when the loaded
+    template actually implements the checkpoint. Templates without it (the
+    Gemma4 encoder, the froggeric profile, generic templates) fall back to
+    today's preserve-all behavior.
+    """
+    if is_gemma4_tokenizer(tokenizer):
+        return False
+    template = getattr(tokenizer, "chat_template", None)
+    return isinstance(template, str) and "last_query_index" in template
+
+
+def _reasoning_history_mode(state: "ServerState") -> str:
+    """Resolve the effective reasoning-history mode for the loaded template.
+
+    - ``on``  -> preserve-all (today's exact behavior, legacy fingerprint)
+    - ``off`` -> full strip (today's exact behavior, legacy fingerprint)
+    - ``auto``/``scoped`` -> scoped when the template carries the rolling
+      checkpoint, else preserve-all.
+    """
+    if bool(getattr(state.args, "strip_assistant_reasoning_history", False)):
+        return _REASONING_HISTORY_STRIP
+    policy = _normalize_preserve_thinking_policy(
+        getattr(state.args, "preserve_thinking", "auto")
+    )
+    if policy == "off":
+        return _REASONING_HISTORY_STRIP
+    if policy == "on":
+        return _REASONING_HISTORY_PRESERVE
+    if getattr(state, "reasoning_history_scoped_capable", False):
+        return _REASONING_HISTORY_SCOPED
+    return _REASONING_HISTORY_PRESERVE
+
+
+def _reasoning_history_scoped_active(state: "ServerState") -> bool:
+    return _reasoning_history_mode(state) == _REASONING_HISTORY_SCOPED
+
+
+def _reasoning_history_fingerprint_component(state: "ServerState") -> str:
+    """Session-cache identity component for the reasoning-history policy.
+
+    Explicit preserve/strip emit the exact legacy ``strip_reasoning={0|1}``
+    strings so existing users' warm session banks survive this release.
+    Only scoped mints a new component - honest, because its rendered prompt
+    bytes genuinely differ from both legacy modes.
+    """
+    mode = _reasoning_history_mode(state)
+    if mode == _REASONING_HISTORY_SCOPED:
+        return "reasoning_history=scoped"
+    return f"strip_reasoning={int(mode == _REASONING_HISTORY_STRIP)}"
 
 
 def _set_server_reasoning_mode(state: ServerState, mode: str) -> None:
@@ -17210,6 +18132,9 @@ def _server_settings_payload(state: ServerState) -> dict[str, Any]:
         "enable_thinking": bool(getattr(state.args, "enable_thinking", True)),
         "preserve_thinking": getattr(state.args, "preserve_thinking", "auto"),
         "preserve_thinking_effective": _preserve_thinking_effective(state.args),
+        # Additive string field (never replaces the boolean above - Swift
+        # Codable safety): the resolved reasoning-history mode.
+        "reasoning_history_mode": _reasoning_history_mode(state),
         "reasoning_parser": state.args.reasoning_parser,
         "generation_mode": state.args.generation_mode,
         "depth": state.args.depth,
@@ -17341,6 +18266,10 @@ def create_app(state: ServerState) -> FastAPI:
                 pass
             for task in bg_tasks:
                 task.cancel()
+            runtime = getattr(state, "runtime", None)
+            close_runtime = getattr(runtime, "close", None)
+            if callable(close_runtime):
+                close_runtime(timeout=5.0)
             scheduler = getattr(state, "model_scheduler", None)
             if scheduler is not None:
                 scheduler.shutdown(wait=False, cancel_futures=True)
@@ -17572,6 +18501,7 @@ def create_app(state: ServerState) -> FastAPI:
             "enable_thinking": state.args.enable_thinking,
             "preserve_thinking": getattr(state.args, "preserve_thinking", "auto"),
             "preserve_thinking_effective": _preserve_thinking_effective(state.args),
+            "reasoning_history_mode": _reasoning_history_mode(state),
             "strip_assistant_reasoning_history": bool(
                 state.args.strip_assistant_reasoning_history
             ),
@@ -17582,6 +18512,13 @@ def create_app(state: ServerState) -> FastAPI:
                 getattr(state.args, "api_key_source", "none") or "none"
             ),
             "paged_kv_quantization": _effective_paged_kv_quantization(),
+            "kernel_selfcheck": _kernel_selfcheck_health_payload(),
+            "expert_streaming": (
+                runtime.expert_streaming_snapshot()
+                if runtime is not None
+                and getattr(runtime, "expert_streaming", None) is not None
+                else None
+            ),
             "rate_limit_per_minute": int(state.args.rate_limit),
             "stream_interval": int(state.args.stream_interval),
             "warmup": state.warmup_status,
@@ -17773,7 +18710,7 @@ def create_app(state: ServerState) -> FastAPI:
                 {"applied": False, "reason": "unavailable"},
             ),
             "mlx_cache_limit": state.mlx_cache_limit_status,
-            "mlx_fork": state.mlx_fork_status,
+            "mlx_runtime": state.mlx_runtime_status,
             # Hardware fields surfaced for the dashboard's HardwareBanner
             # and MemoryStackedBar. Cached after the first lookup.
             **_machine_info(),
@@ -18031,6 +18968,9 @@ def create_app(state: ServerState) -> FastAPI:
             state.draft_head_identity = None
             state.template_hash = None
             state.aime_parent_runtime_released = True
+            close_runtime = getattr(runtime, "close", None)
+            if callable(close_runtime):
+                close_runtime(timeout=5.0)
             gc.collect()
             cleanup = _clear_mlx_cache_after_request(
                 state,
@@ -18631,20 +19571,42 @@ def create_app(state: ServerState) -> FastAPI:
 
     @app.post("/admin/cache/clear")
     def admin_clear_cache() -> dict[str, Any]:
+        # Quiesce BEFORE dropping state: abort per-session idle postcommits
+        # and drain the SSD deferred-encode queue so no background work from
+        # earlier traffic keeps running (and pinning snapshots in memory)
+        # after the operator asked for a clean slate.
+        quiesce = getattr(state.sessions, "quiesce", None)
+        quiesced: dict[str, Any] | None = None
+        if callable(quiesce):
+            try:
+                quiesced = quiesce(reason="admin_cache_clear")
+            except Exception as exc:
+                quiesced = {"error": repr(exc)}
         cleared = state.sessions.clear_all()
-        if isinstance(cleared, dict):
-            cleared["mlx_cache_cleanup"] = _clear_mlx_cache_after_request(
-                state,
-                reason="admin_cache_clear",
-            )
-            return cleared
-        return {
-            "cleared": cleared,
-            "mlx_cache_cleanup": _clear_mlx_cache_after_request(
-                state,
-                reason="admin_cache_clear",
-            ),
-        }
+        if not isinstance(cleared, dict):
+            cleared = {"cleared": cleared}
+        if quiesced is not None:
+            cleared["quiesced"] = quiesced
+        cleared["mlx_cache_cleanup"] = _clear_mlx_cache_after_request(
+            state,
+            reason="admin_cache_clear",
+            lock_wait_s=5.0,
+        )
+        # The MLX peak-memory counter is process-monotonic. After the bank and
+        # the MLX buffer cache are dropped, the old high-water mark describes
+        # freed allocations, so per-request ``peak_memory_bytes`` would keep
+        # reporting the largest phase the process ever ran (benchmark
+        # harnesses that clear between context sizes then chart a ratchet
+        # instead of per-run peaks). Reset it so the next requests report
+        # their own true peaks. RSS and bank telemetry still expose leaks.
+        try:
+            import mlx.core as mx
+
+            mx.reset_peak_memory()
+            cleared["peak_memory_reset"] = True
+        except Exception:
+            cleared["peak_memory_reset"] = False
+        return cleared
 
     @app.get("/admin/cache/ssd")
     def admin_ssd_cache() -> dict[str, Any]:
@@ -18718,6 +19680,7 @@ def create_app(state: ServerState) -> FastAPI:
             requested_tool_specs,
             request.messages,
             tool_choice=request.tool_choice,
+            client_manages_tools=opencode_client,
         )
         tools_active = _tools_active_for_request(tool_specs, request.tool_choice)
         raw_tool_result_history_present = any(
@@ -18746,19 +19709,17 @@ def create_app(state: ServerState) -> FastAPI:
                 tool_specs = []
                 tools_active = False
             else:
-                # Read-budget force answer: keep the read-only inspection
-                # toolset so cited evidence stays greppable, instead of
-                # returning zero tools.
-                tool_specs = [
-                    tool
-                    for tool in requested_tool_specs
-                    if (_tool_spec_name(tool) or "").strip().lower()
-                    in _READ_ONLY_FORCE_ANSWER_TOOL_NAMES
-                ]
-                tools_active = _tools_active_for_request(
-                    tool_specs, request.tool_choice
-                )
-        no_tools_contract_active = bool(
+                # Read-budget force answer: keep the REQUESTED toolset
+                # byte-identical to every prior round of this loop. Filtering
+                # to a read-only subset rewrote the rendered tool contract in
+                # the system prompt, so the largest prompt of the session (the
+                # forced final answer) diverged from every banked prefix at
+                # token ~3 and re-prefilled fully cold (measured 2026-07-04:
+                # 13.2k tokens, TTFT 21s). The appended force-answer user
+                # message carries the "answer now, no more tools" conditioning;
+                # prefix stability owns the toolset bytes.
+                pass
+        no_tools_contract_applies = bool(
             not read_only_force_answer_contract_active
             and _should_add_no_tool_contract(
                 requested_tools=requested_tool_specs,
@@ -18766,10 +19727,22 @@ def create_app(state: ServerState) -> FastAPI:
                 messages=request.messages,
             )
         )
+        # A tool loop's FINAL round (tool results already in this turn,
+        # tools now disabled) must synthesize a full answer — it gets
+        # the post-tool contract instead of the terse direct-reply one,
+        # whose no-lists/no-analysis clauses clip searched answers.
+        post_tool_answer_contract_active = bool(
+            no_tools_contract_applies
+            and _turn_tail_contains_tool_results(request.messages)
+        )
+        no_tools_contract_active = bool(
+            no_tools_contract_applies and not post_tool_answer_contract_active
+        )
         client_controls_allowed = _client_controls_allowed(headers, metadata)
         pi_convergence_contract_active = bool(
             not read_only_force_answer_contract_active
             and not no_tools_contract_active
+            and not post_tool_answer_contract_active
             and _request_should_add_pi_convergence_contract(
                 request.messages,
                 headers=headers,
@@ -18802,6 +19775,10 @@ def create_app(state: ServerState) -> FastAPI:
             messages_for_generation = _with_mtplx_read_only_force_answer_contract(
                 messages_for_generation
             )
+        elif post_tool_answer_contract_active:
+            messages_for_generation = _with_mtplx_post_tool_answer_contract(
+                messages_for_generation
+            )
         elif no_tools_contract_active:
             messages_for_generation = _with_mtplx_no_tool_contract(
                 messages_for_generation
@@ -18823,6 +19800,7 @@ def create_app(state: ServerState) -> FastAPI:
                 list(messages_for_generation)
                 if (
                     no_tools_contract_active
+                    or post_tool_answer_contract_active
                     or pi_convergence_contract_active
                     or opencode_prompt_contract_profile is not None
                     or backend_chat_policy_active
@@ -18891,16 +19869,17 @@ def create_app(state: ServerState) -> FastAPI:
         )
         template_tool_prompt_mode = tool_prompt_mode
         if read_only_force_answer_contract_active and tools_active:
-            # Read-budget force-answer turns keep the read-only toolset with
-            # real schemas in the template; the compact schema-free contract
-            # would strip them and defeat the evidence-citing final turn.
-            # Only the template/observability lane switches to hybrid — the
-            # policy fingerprints keep the resolved launch/client mode so
-            # SessionBank restore still matches postcommit.
-            template_tool_prompt_mode = _TOOL_PROMPT_MODE_HYBRID
+            # Read-budget force-answer turns keep the SAME template mode as
+            # every prior round. The earlier hybrid switch re-rendered the
+            # system prompt with full "# Tools" schemas, so the forced final
+            # turn's prompt diverged from all banked prefixes at token ~3 and
+            # re-prefilled fully cold — the fingerprint compatibility shim
+            # could not help because the BYTES differed (2026-07-04 fix).
+            # The appended contract user message is a pure suffix and owns
+            # the force-answer conditioning.
             tool_prompt_mode_resolution = {
                 **tool_prompt_mode_resolution,
-                "tool_prompt_mode_source": "read_only_force_answer",
+                "tool_prompt_mode_source": "read_only_force_answer_prefix_stable",
             }
         postcommit_tool_prompt_mode = tool_prompt_mode
         if postcommit_tool_specs and not tools_active:
@@ -18949,6 +19928,7 @@ def create_app(state: ServerState) -> FastAPI:
             enable_thinking=thinking_enabled,
             reasoning_effort=reasoning_effort,
             strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
+            scoped_reasoning_history=_reasoning_history_scoped_active(state),
             tools=tool_specs if tools_active else None,
             tool_choice=request.tool_choice,
             tool_prompt_mode=template_tool_prompt_mode,
@@ -19015,19 +19995,38 @@ def create_app(state: ServerState) -> FastAPI:
             no_tools_contract_active=no_tools_contract_active,
             read_only_force_answer_contract_active=read_only_force_answer_contract_active,
             pi_convergence_contract_active=pi_convergence_contract_active,
+            post_tool_answer_contract_active=post_tool_answer_contract_active,
             simple_chat_contract_active=opencode_simple_chat_contract_active,
             opencode_prompt_contract_profile=opencode_prompt_contract_profile,
             cache_scope=session_cache_scope,
         )
+        # Transient suffix-only contracts (force-answer, pi-convergence) never
+        # rewrite earlier prompt bytes, so entries banked WITHOUT the contract
+        # remain byte-compatible prefixes of the contract-bearing request.
+        # Restore + postcommit must therefore use the contract-free
+        # fingerprint, or the flag flip alone would hard-miss the bank at the
+        # exact turn that most needs the warm prefix (measured on OpenCode
+        # 2026-07-04; Pi shares the mechanism via its >=14-tools contract).
+        transient_suffix_contract_active = bool(
+            read_only_force_answer_contract_active or pi_convergence_contract_active
+        )
         postcommit_policy_fingerprint = policy_fingerprint
-        if read_only_force_answer_contract_active:
+        if transient_suffix_contract_active:
             postcommit_policy_fingerprint = _policy_fingerprint(
                 state,
                 thinking_enabled=thinking_enabled,
                 generation_mode=request_generation_mode,
                 depth=effective_request_depth,
-                tools_active=bool(postcommit_tool_specs),
-                tool_prompt_mode=postcommit_tool_prompt_mode,
+                tools_active=(
+                    bool(postcommit_tool_specs)
+                    if read_only_force_answer_contract_active
+                    else tools_active
+                ),
+                tool_prompt_mode=(
+                    postcommit_tool_prompt_mode
+                    if read_only_force_answer_contract_active
+                    else tool_prompt_mode
+                ),
                 tool_choice=request.tool_choice,
                 no_tools_contract_active=False,
                 read_only_force_answer_contract_active=False,
@@ -19038,7 +20037,7 @@ def create_app(state: ServerState) -> FastAPI:
             )
         session_restore_policy_fingerprint = (
             postcommit_policy_fingerprint
-            if read_only_force_answer_contract_active
+            if transient_suffix_contract_active
             else policy_fingerprint
         )
         request_observability = _request_observability(
@@ -19052,9 +20051,11 @@ def create_app(state: ServerState) -> FastAPI:
         if vision_splice is not None:
             request_observability["request_vision_images"] = len(vision_images)
             request_observability["request_vision_rows"] = vision_splice.total_rows
-        if read_only_force_answer_contract_active:
+        if transient_suffix_contract_active:
             request_observability["request_session_restore_policy"] = (
                 "stable_without_transient_force_answer"
+                if read_only_force_answer_contract_active
+                else "stable_without_transient_pi_convergence"
             )
             request_observability[
                 "request_session_restore_policy_matches_postcommit"
@@ -19203,6 +20204,9 @@ def create_app(state: ServerState) -> FastAPI:
         request_observability["preserve_thinking_effective"] = (
             _preserve_thinking_effective(state.args)
         )
+        request_observability["reasoning_history_mode"] = _reasoning_history_mode(
+            state
+        )
         request_observability["strip_assistant_reasoning_history"] = bool(
             state.args.strip_assistant_reasoning_history
         )
@@ -19216,6 +20220,7 @@ def create_app(state: ServerState) -> FastAPI:
                 no_tools_contract_active=no_tools_contract_active,
                 read_only_force_answer_contract_active=read_only_force_answer_contract_active,
                 pi_convergence_contract_active=pi_convergence_contract_active,
+                post_tool_answer_contract_active=post_tool_answer_contract_active,
             )
         )
         request_observability.update(tool_prompt_mode_resolution)
@@ -19296,6 +20301,12 @@ def create_app(state: ServerState) -> FastAPI:
                 request_observability["request_session_keep_live_ref_reason"] = (
                     "opencode_tool_snapshot_only"
                 )
+        if not _expert_streaming_allows_session_live_refs(state.runtime):
+            session_keep_live_ref = False
+            live_frontier_policy = "expert_streaming_snapshot_only"
+            request_observability["request_session_keep_live_ref_reason"] = (
+                "expert_streaming_memory_plan"
+            )
         request_observability["request_session_keep_live_ref"] = bool(
             session_keep_live_ref
         )
@@ -20003,6 +21014,9 @@ def create_app(state: ServerState) -> FastAPI:
                         enable_thinking=thinking_enabled,
                         reasoning_effort=reasoning_effort,
                         strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
+                        scoped_reasoning_history=_reasoning_history_scoped_active(
+                            state
+                        ),
                         tools=tool_specs,
                         tool_prompt_mode=tool_prompt_mode,
                         template_observability=repair_observability,
@@ -20315,6 +21329,9 @@ def create_app(state: ServerState) -> FastAPI:
                         enable_thinking=thinking_enabled,
                         reasoning_effort=reasoning_effort,
                         strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
+                        scoped_reasoning_history=_reasoning_history_scoped_active(
+                            state
+                        ),
                         tools=tool_specs,
                         tool_prompt_mode=tool_prompt_mode,
                         template_observability=repair_observability,
@@ -20470,6 +21487,9 @@ def create_app(state: ServerState) -> FastAPI:
                         enable_thinking=thinking_enabled,
                         reasoning_effort=reasoning_effort,
                         strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
+                        scoped_reasoning_history=_reasoning_history_scoped_active(
+                            state
+                        ),
                         tools=None,
                         tool_prompt_mode=tool_prompt_mode,
                         template_observability=repair_observability,
@@ -22416,6 +23436,7 @@ def create_app(state: ServerState) -> FastAPI:
             enable_thinking=thinking_enabled,
             reasoning_effort=reasoning_effort,
             strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
+            scoped_reasoning_history=_reasoning_history_scoped_active(state),
             tools=requested_tool_specs if tools_active else None,
             tool_choice=chat_request.tool_choice,
             tool_prompt_mode=tool_prompt_mode,
@@ -23051,6 +24072,19 @@ def _apply_backend_server_defaults(
         "draft-block-size",
         "gemma-draft-block-size",
     ):
+        # Gemma4 default draft schedule: live long-form acceptance collapses
+        # by depth ([68.5, 45, 31, 21, 16]% at 2.5k tok, thinking on, measured
+        # 2026-07-03), so the deep bundled/semantics default is EV-negative —
+        # most of every round is drafted, rejected, and rolled back across 50
+        # rotating layers. Fixed depth 2 measured +26% decode (16.8 -> 21.2
+        # tok/s) with a flatter within-response slope. Explicit flags win;
+        # remove once the adaptive EV controller governs the assistant round.
+        try:
+            gemma_cap = int(os.environ.get("MTPLX_GEMMA4_DEFAULT_DEPTH", "2"))
+        except (TypeError, ValueError):
+            gemma_cap = 2
+        if gemma_cap > 0:
+            draft_block_size = min(int(draft_block_size), gemma_cap)
         set_draft_control_arg(args, backend, int(draft_block_size))
     else:
         sync_backend_arg_aliases(args)
@@ -23083,6 +24117,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if postcommit_default not in {"inline", "async"}:
         postcommit_default = "async"
     parser.add_argument("--model", default=DEFAULT_HF_MODEL_ID)
+    from mtplx.expert_cli import add_expert_streaming_args
+
+    add_expert_streaming_args(parser)
     parser.add_argument("--model-id", default="mtplx-qwen36-27b-native-mtp")
     parser.add_argument("--backend-id", default="qwen3_next", help=argparse.SUPPRESS)
     parser.add_argument(
@@ -23138,9 +24175,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=SCHEDULER_MODE_CHOICES,
         default=os.environ.get("MTPLX_SCHEDULER_MODE", "serial"),
         help=(
-            "Generation scheduler mode. The live default remains serial so "
-            "single-request MTP stays the oracle while batching modes are "
-            "brought online behind explicit flags."
+            "Generation scheduler mode. Default serial keeps every request "
+            "on the solo MTP oracle (measured 2026-07-05: serialized MTP "
+            "beats the batched-AR lane end to end on prefill-heavy "
+            "concurrent loads); ar_batch opts concurrency into the batched "
+            "AR decode lane, which wins on decode-heavy many-client loads."
         ),
     )
     parser.add_argument(
@@ -23161,8 +24200,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--ssd-session-cache",
         choices=["off", "on", "write-only"],
-        default=os.environ.get("MTPLX_SSD_SESSION_CACHE", "off"),
-        help="Persistent SessionBank cold tier. Default off for raw serve.",
+        default=os.environ.get("MTPLX_SSD_SESSION_CACHE", "on"),
+        help=(
+            "Persistent SessionBank cold tier (default on; kvcache-v2). "
+            "Budgeted by min(configured cap, free_disk/4), disabled below "
+            "10 GiB free."
+        ),
     )
     parser.add_argument(
         "--ssd-session-cache-dir",
@@ -23353,11 +24396,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--preserve-thinking",
-        choices=["auto", "on", "off"],
+        choices=["auto", "on", "off", "scoped"],
         default="auto",
         help=(
-            "Preserve prior assistant <think>/reasoning blocks in chat-template "
-            "history. Default auto preserves them for Qwen reasoning templates."
+            "Reasoning-history policy for chat-template rendering. scoped "
+            "keeps <think>/reasoning blocks only inside the active agent "
+            "round (the template's rolling checkpoint - Qwen's trained "
+            "contract); on preserves all history reasoning; off strips it. "
+            "Default auto resolves to scoped for checkpoint-capable "
+            "templates, else preserve-all."
         ),
     )
     parser.add_argument(
@@ -23489,7 +24536,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--strict-mlx-fork-assert",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Refuse startup unless the selected profile's required MLX fork is active.",
+        help=(
+            "Deprecated, no effect: MTPLX runs on stock PyPI MLX and no "
+            "profile requires an MLX fork. Accepted for launcher "
+            "compatibility only."
+        ),
     )
     parser.add_argument(
         "--open-browser",
@@ -23631,20 +24682,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     validate_server_security_args(args)
     _start_aime_parent_watchdog_from_env()
-    try:
-        state = ServerState(args)
-    except RuntimeError as exc:
-        if str(exc).startswith("Patched MLX qmv fork is not active:"):
-            _startup_line("error: fast MLX fork is not active")
-            _startup_line(str(exc))
-            _startup_line("try: mtplx start --profile sustained")
-            _startup_line("try: mtplx start --profile stable")
-            _startup_line("try: mtplx start --profile performance-cold --max")
-            _startup_line(
-                "     (public start disables the strict fork assert when the fork is missing)"
-            )
-            raise SystemExit(2) from None
-        raise
+    state = ServerState(args)
     app = create_app(state)
     import uvicorn
 
@@ -23661,7 +24699,11 @@ def main(argv: list[str] | None = None) -> None:
     _startup_line("Model: " + str(args.model_id))
     _startup_line(
         "Reasoning history: "
-        + ("preserve" if _preserve_thinking_effective(args) else "strip")
+        + {
+            _REASONING_HISTORY_PRESERVE: "preserve",
+            _REASONING_HISTORY_SCOPED: "scoped (active round only)",
+            _REASONING_HISTORY_STRIP: "strip",
+        }[_reasoning_history_mode(state)]
         + f" (policy {getattr(args, 'preserve_thinking', 'auto')})"
     )
     if getattr(args, "api_key", None):
@@ -23704,8 +24746,18 @@ def main(argv: list[str] | None = None) -> None:
             _startup_line(
                 "warning: --launch-hermes was set but no Hermes command was provided."
             )
+    # Graceful-with-deadline shutdown (#124): a browser tab holding an
+    # infinite SSE stream (chat, dashboard, /metrics) otherwise makes
+    # uvicorn wait forever on Ctrl-C. The deadline lets in-flight requests
+    # finish, then cancels lingering streams and exits normally — atexit
+    # cleanup (thermal restore) still runs, unlike a hard os._exit.
     uvicorn.run(
-        app, host=args.host, port=args.port, log_level="warning", access_log=False
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="warning",
+        access_log=False,
+        timeout_graceful_shutdown=5,
     )
 
 

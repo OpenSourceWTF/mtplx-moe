@@ -2311,6 +2311,11 @@ class TensorOffsetVllmMetalPagedKVCache:
         self.rollback_state = [None, None, None]
         self.block_size = int(block_size)
         self.num_blocks = int(num_blocks)
+        # Per-instance static attention ceiling for the dynamic-offset paged
+        # kernel.  When set it wins over MTPLX_GRAPHBANK_PAGED_STATIC_MAX_OFFSET
+        # so a compiled-verify bucket can pin the kernel's static block count
+        # without mutating process-global env state.
+        self.static_max_offset: int | None = None
         self.update_calls = 0
         self.paged_attention_calls = 0
         self.cache_write_time_s = 0.0
@@ -2448,6 +2453,8 @@ class TensorOffsetVllmMetalPagedKVCache:
         return out
 
     def _static_attention_max_offset(self) -> int | None:
+        if self.static_max_offset is not None:
+            return int(self.static_max_offset)
         raw = os.environ.get("MTPLX_GRAPHBANK_PAGED_STATIC_MAX_OFFSET")
         if raw is None or not raw.strip():
             return None
@@ -2525,6 +2532,51 @@ class TensorOffsetVllmMetalPagedKVCache:
 
     def empty(self) -> bool:
         return self.key_cache is None or self.value_cache is None
+
+    @property
+    def meta_state(self) -> tuple[str, ...]:
+        return (
+            str(self.block_size),
+            str(self.num_blocks),
+            str(int(self.size())),
+        )
+
+    @meta_state.setter
+    def meta_state(self, value) -> None:
+        if not value:
+            return
+        self.block_size = int(value[0])
+        self.num_blocks = int(value[1])
+        self.offset = int(value[2])
+
+    def to_paged_cache(self) -> "VllmMetalPagedKVCache":
+        """Restore a stock ``VllmMetalPagedKVCache`` from this adapter.
+
+        The stock container receives the adapter's current physical page
+        buffers (no copy, no densify) and the materialized integer offset.
+        Shape/dtype metadata is rebuilt so the next ``update_without_fetch``
+        appends in place instead of re-allocating.
+        """
+        paged = VllmMetalPagedKVCache(
+            block_size=int(self.block_size),
+            num_blocks=int(self.num_blocks),
+        )
+        if self.cache[0] is None or self.cache[1] is None:
+            return paged
+        paged.key_cache = self.cache[0]
+        paged.value_cache = self.cache[1]
+        paged.offset = int(self.size())
+        paged._shape = (
+            int(self.cache[0].shape[2]),
+            int(self.cache[0].shape[3]),
+            int(self.cache[1].shape[3]),
+        )
+        paged._dtypes = (self.cache[0].dtype, self.cache[1].dtype)
+        return paged
+
+    def demote(self) -> "VllmMetalPagedKVCache":
+        """Alias for :meth:`to_paged_cache` (bank-facing demotion API)."""
+        return self.to_paged_cache()
 
     @property
     def nbytes(self) -> int:
@@ -3307,6 +3359,49 @@ def snapshot_cache(cache: list[Any]) -> CacheSnapshot:
     )
 
 
+def _lazy_state_view(value: Any) -> Any:
+    """Zero-copy retention of a cache leaf.
+
+    A fresh slice expression references the array's current *value*, so later
+    container writes — whether rebind-style (`self.cache[0] = mx.slice_update`)
+    or setitem-style (`self.keys[..., a:b, :] = tail`) — can never mutate it:
+    MLX only donates a buffer when it holds the sole reference
+    (tests/test_lazy_snapshot_cow.py pins this). No GPU work happens here.
+    """
+    import mlx.core as mx
+
+    if isinstance(value, mx.array):
+        return value[...]
+    if isinstance(value, tuple):
+        return tuple(_lazy_state_view(v) for v in value)
+    if isinstance(value, list):
+        return [_lazy_state_view(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _lazy_state_view(v) for k, v in value.items()}
+    return value
+
+
+def snapshot_cache_lazy_hybrid(cache: list[Any]) -> CacheSnapshot:
+    """Snapshot with zero-copy views for trimmable KV, clones for the rest.
+
+    Trimmable attention KV carries the GB-scale bytes; retaining lazy views
+    makes commit O(1) and defers the single divergence copy to MLX's COW at
+    the next container write. Recurrent/owned containers mutate their buffers
+    in place (`OwnedRecurrentStateCache._own_value` setitem path), so their
+    small states are still eagerly cloned.
+    """
+    states = []
+    meta_states = []
+    for entry in cache:
+        state = getattr(entry, "state", None)
+        if _is_trimmable(entry):
+            states.append(_lazy_state_view(state))
+        else:
+            states.append(_clone_tree(state))
+        meta_states.append(_clone_tree(getattr(entry, "meta_state", None)))
+    return CacheSnapshot(states=tuple(states), meta_states=tuple(meta_states))
+
+
 def snapshot_untrimmable_cache(cache: list[Any]) -> CacheSnapshot:
     """Snapshot only recurrent/non-trimmable cache state.
 
@@ -3330,16 +3425,23 @@ def restore_cache(
     snapshot: CacheSnapshot,
     *,
     restore_meta_state: bool = True,
+    clone_states: bool = True,
 ) -> None:
     for entry, state, meta_state in zip(cache, snapshot.states, snapshot.meta_states):
         if state is not None:
-            _restore_state_preserving_container(entry, state)
+            install_as_is = not clone_states and _is_trimmable(entry)
+            _restore_state_preserving_container(entry, state, clone=not install_as_is)
         if restore_meta_state and meta_state is not None:
             entry.meta_state = _clone_tree(meta_state)
 
 
-def _restore_state_preserving_container(entry: Any, state: Any) -> None:
-    cloned = _clone_tree(state)
+def _restore_state_preserving_container(entry: Any, state: Any, *, clone: bool = True) -> None:
+    # Lazy (view-based) snapshots install their states as-is into trimmable KV
+    # containers: those containers only rebind or setitem (both COW-safe with
+    # a retained reference), so the snapshot cannot be mutated through them.
+    # Containers with replace_state (owned recurrent) copy into owned buffers
+    # and must always receive a clone-or-view they are free to consume.
+    cloned = _clone_tree(state) if clone else state
     if hasattr(entry, "replace_state"):
         entry.replace_state(cloned)
         return

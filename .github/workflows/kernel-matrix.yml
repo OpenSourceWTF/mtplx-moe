@@ -1,0 +1,140 @@
+name: kernel-matrix
+
+# Real-hardware validation for the turbo Metal kernels. macos-14 runners are
+# Apple Silicon M1 (7 GB RAM) — the exact GPU family the 2.0.1 turbo-default
+# promotion must not break. Two jobs:
+#
+# 1. kernel-exactness: every turbo kernel lane x {bf16, fp16} x {4, 6, 8}-bit
+#    synthetic shapes vs stock MLX, plus the load-time selfcheck suite.
+#    No model download needed.
+# 2. small-model-smoke: download the 4B q4 artifact (~3.3 GB, fits 7 GB RAM),
+#    boot `--profile turbo`, assert the selfcheck reports every engaged lane
+#    ok in /health, and run a short generation through the OpenAI API.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "mtplx/kernels/**"
+      - "mtplx/nax_verify.py"
+      - "mtplx/verify_kernels.py"
+      - "mtplx/kernel_selfcheck.py"
+      - ".github/workflows/kernel-matrix.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  kernel-exactness:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -U pip
+      - run: python -m pip install -e ".[dev]"
+      - name: Kernel + selfcheck unit suites
+        run: |
+          python -m pytest -p no:warnings \
+            tests/test_nax_verify.py \
+            tests/test_kernel_selfcheck.py \
+            tests/test_attention_split.py
+      - name: Selfcheck matrix (bf16/fp16 x 4/6/8-bit) on this GPU family
+        run: |
+          python - <<'EOF'
+          import json
+          import mlx.core as mx
+          import os
+          os.environ["MTPLX_NAX_VERIFY"] = "1"
+          os.environ["MTPLX_GQA_PACKED_SDPA"] = "1"
+          from mtplx.kernel_selfcheck import run_kernel_selfcheck
+          failures = []
+          for bits in (4, 6, 8):
+              for dtype in (mx.bfloat16, mx.float16):
+                  report = run_kernel_selfcheck(dtype, bits, 64)
+                  bad = {
+                      lane: status
+                      for lane, status in report["lanes"].items()
+                      if status == "fallback"
+                  }
+                  tag = report["dtype"]
+                  print(json.dumps({"bits": bits, "dtype": tag, **report["lanes"]}))
+                  if bad:
+                      failures.append((bits, tag, bad, report["dmax"]))
+          if failures:
+              raise SystemExit(f"kernel selfcheck failures on this hardware: {failures}")
+          print("all engaged lanes exact on", mx.device_info().get("architecture"))
+          EOF
+
+  small-model-smoke:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -U pip
+      - run: python -m pip install -e ".[dev,server]"
+      - name: Download the 4B q4 artifact
+        run: python -m mtplx.cli pull Youssofal/Qwen3.5-4B-MTPLX-Optimized-Speed
+      - name: Boot turbo, verify selfcheck + generate
+        run: |
+          python -m mtplx.cli serve \
+            --model Youssofal/Qwen3.5-4B-MTPLX-Optimized-Speed \
+            --port 18901 --profile turbo --yes > serve.log 2>&1 &
+          SERVER_PID=$!
+          for i in $(seq 1 120); do
+            sleep 5
+            if curl -s -m 2 http://127.0.0.1:18901/health > /dev/null; then break; fi
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "server died during startup"; cat serve.log; exit 1
+            fi
+          done
+          python - <<'EOF'
+          import json
+          import urllib.request
+
+          health = json.loads(
+              urllib.request.urlopen("http://127.0.0.1:18901/health", timeout=30).read()
+          )
+          selfcheck = health.get("kernel_selfcheck") or {}
+          assert selfcheck.get("ran") is True, f"selfcheck did not run: {selfcheck}"
+          fallbacks = {k: v for k, v in selfcheck.items() if v == "fallback"}
+          assert not fallbacks, f"kernel lanes fell back on this hardware: {fallbacks}"
+          print("selfcheck:", json.dumps(selfcheck))
+
+          body = json.dumps({
+              "model": "default",
+              "messages": [{"role": "user", "content": "Write a haiku about unit tests."}],
+              "max_tokens": 64,
+              "temperature": 0.6,
+          }).encode()
+          request = urllib.request.Request(
+              "http://127.0.0.1:18901/v1/chat/completions",
+              data=body,
+              headers={"Content-Type": "application/json"},
+          )
+          response = json.loads(urllib.request.urlopen(request, timeout=300).read())
+          message = response["choices"][0]["message"]
+          text = (message.get("content") or "") + (message.get("reasoning_content") or "")
+          assert len(text.strip()) > 10, f"incoherent/empty generation: {text!r}"
+          print("generation ok:", text[:120].replace("\n", " "))
+
+          snapshot = json.loads(
+              urllib.request.urlopen(
+                  "http://127.0.0.1:18901/v1/mtplx/snapshot", timeout=30
+              ).read()
+          )
+          latest = snapshot.get("latest") or {}
+          assert latest.get("generation_mode") == "mtp", latest
+          assert int(latest.get("verify_calls") or 0) > 0, latest
+          print("mtp engaged, verify_calls =", latest.get("verify_calls"))
+          EOF
+          kill $SERVER_PID || true
+      - name: Show server log on failure
+        if: failure()
+        run: cat serve.log || true

@@ -32,15 +32,15 @@
   <line x1="0" y1="0" x2="1200" y2="0" stroke="rgba(255,255,255,0.18)" stroke-width="1"/>
 
   <text x="60" y="56" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="12" fill="#80807a" letter-spacing="6">MLX RUNTIME LAYER  ·  WHAT MTPLX OWNS</text>
-  <text x="60" y="100" font-family="Inter, sans-serif" font-weight="700" font-size="32" fill="url(#chrome)" letter-spacing="-1">Patched MLX fork plus four custom kernels.</text>
+  <text x="60" y="100" font-family="Inter, sans-serif" font-weight="700" font-size="32" fill="url(#chrome)" letter-spacing="-1">Stock PyPI MLX plus custom in-package kernels.</text>
 
-  <!-- Layer 1: MLX source fork -->
+  <!-- Layer 1: Stock MLX runtime -->
   <g transform="translate(60, 152)">
     <rect x="0" y="0" width="1080" height="120" rx="14" fill="url(#cardOwn)" stroke="rgba(255,255,255,0.18)" stroke-width="1"/>
     <rect x="0" y="0" width="1080" height="32" rx="14" fill="url(#cardBevel)"/>
-    <text x="22" y="38" font-family="ui-monospace, monospace" font-size="11" fill="#cdcdc6" letter-spacing="4">01 — MLX SOURCE FORK</text>
-    <text x="22" y="76" font-family="Inter, sans-serif" font-weight="600" font-size="22" fill="url(#chrome)" letter-spacing="-0.5">mlx-mtplx-0.31.2-qmm</text>
-    <text x="22" y="104" font-family="Inter, sans-serif" font-size="14" fill="#a0a098">Small-M <tspan font-family="ui-monospace, monospace" fill="#cdcdc6">qmv</tspan> retuned for verify shapes M = 3..6 ·  <tspan font-family="ui-monospace, monospace" fill="#cdcdc6">BN16</tspan>  ·  4-simdgroup  ·  <tspan font-family="ui-monospace, monospace" fill="#cdcdc6">unroll_count(4)</tspan></text>
+    <text x="22" y="38" font-family="ui-monospace, monospace" font-size="11" fill="#cdcdc6" letter-spacing="4">01 — STOCK MLX RUNTIME</text>
+    <text x="22" y="76" font-family="Inter, sans-serif" font-weight="600" font-size="22" fill="url(#chrome)" letter-spacing="-0.5">mlx (PyPI) — no fork, no patched build</text>
+    <text x="22" y="104" font-family="Inter, sans-serif" font-size="14" fill="#a0a098">Verify-shape speed comes from MTPLX kernels below (<tspan font-family="ui-monospace, monospace" fill="#cdcdc6">NAX vk_k / vk-q8</tspan> · packed-GQA SDPA · compiled verify), shipped inside the package</text>
   </g>
   <g transform="translate(591, 282)"><circle cx="9" cy="9" r="11" fill="url(#chip)" stroke="#0a0a0c" stroke-width="3"/><path d="M 4 5 L 9 12 L 14 5" fill="none" stroke="#0a0a0c" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></g>
 

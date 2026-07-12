@@ -16,6 +16,7 @@ import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from threading import Event, Lock
 from typing import Any, Iterator, Mapping
 
@@ -37,6 +38,13 @@ logger = logging.getLogger(__name__)
 _HIGH_MEMORY_SESSION_BANK_THRESHOLD_BYTES = 96 * 1024**3
 _HIGH_MEMORY_PER_SESSION_MAX_BYTES = 24 * 1024**3
 _HIGH_MEMORY_MAX_ENTRIES = 16
+# Model-aware auto budget (v2, founder ruling 2026-07-05): the RAM cache
+# defaults to half of the RAM that remains after the model weights, so a
+# 128 GB Mac gets a big warm cache while a 32 GB Mac is not handed the old
+# flat 24 GiB cap that could push the whole process past physical RAM.
+_AUTO_BUDGET_SURPLUS_FRACTION = 0.5
+_AUTO_BUDGET_FLOOR_BYTES = 1 * 1024**3
+_AUTO_BUDGET_CAP_BYTES = 48 * 1024**3
 
 
 def _bank_bytes_from_env(name: str, default: int) -> int:
@@ -100,8 +108,12 @@ def _detect_total_ram_bytes_for_session_bank() -> int | None:
     if sys.platform != "darwin":
         return None
     try:
+        # Absolute path: the app-owned daemon runs with a sanitized PATH that
+        # does not include /usr/sbin, so a bare "sysctl" raises
+        # FileNotFoundError and RAM-aware budgets silently fell back to the
+        # legacy flat defaults (caught by v2 app QA, 2026-07-05).
         output = subprocess.check_output(
-            ["sysctl", "-n", "hw.memsize"],
+            ["/usr/sbin/sysctl", "-n", "hw.memsize"],
             text=True,
             stderr=subprocess.DEVNULL,
             timeout=2.0,
@@ -138,6 +150,99 @@ def _default_per_session_max_bytes() -> int:
     ):
         return _HIGH_MEMORY_PER_SESSION_MAX_BYTES
     return DEFAULT_PER_SESSION_MAX_BYTES
+
+
+def model_weights_bytes(model_path: Any) -> int | None:
+    """Total bytes of the model's safetensors shards (weights actually wired
+    into memory), following symlink wrappers. None when unknown."""
+    try:
+        root = Path(str(model_path))
+        if not root.is_dir():
+            return None
+        total = 0
+        for shard in root.glob("*.safetensors"):
+            try:
+                total += shard.stat().st_size
+            except OSError:
+                continue
+        return total if total > 0 else None
+    except Exception:
+        return None
+
+
+def _auto_session_bank_max_bytes(model_bytes: int | None) -> int | None:
+    """Half of the RAM surplus left after the model weights, clamped.
+
+    Founder ruling 2026-07-05 after the in-flight memory climb to 55 GB on a
+    128 GB Mac: fine there, lethal on a 32 GB M1. The RAM cache budget scales
+    with what the machine actually has left once the model is resident:
+    ``0.5 * (total_ram - model_weights)``, floored at 1 GiB (below that the
+    bank is pure churn) and capped at 48 GiB. Returns None when either input
+    is unknown so callers fall back to the legacy tiered defaults.
+    """
+    if model_bytes is None or model_bytes <= 0:
+        return None
+    total_ram = _detect_total_ram_bytes_for_session_bank()
+    if total_ram is None:
+        return None
+    surplus = total_ram - int(model_bytes)
+    if surplus <= 0:
+        return _AUTO_BUDGET_FLOOR_BYTES
+    budget = int(surplus * _AUTO_BUDGET_SURPLUS_FRACTION)
+    return max(_AUTO_BUDGET_FLOOR_BYTES, min(_AUTO_BUDGET_CAP_BYTES, budget))
+
+
+def _is_auto_bytes_setting(raw: str | None) -> bool:
+    return raw is not None and raw.strip().lower() in {"auto", "default"}
+
+
+def resolve_session_bank_max_bytes(
+    model_bytes: int | None = None,
+) -> tuple[int, bool]:
+    """MTPLX_SESSION_BANK_MAX_BYTES resolution with model-aware auto sizing.
+
+    Returns ``(max_bytes, auto_active)``. Explicit byte values keep today's
+    semantics (auto_active False). Unset or ``auto`` computes half the
+    post-model RAM surplus when the model size is known; when it cannot be
+    computed the legacy flat default applies (auto_active False) so every
+    legacy behavior stays byte-identical.
+    """
+    raw = os.environ.get("MTPLX_SESSION_BANK_MAX_BYTES")
+    if raw is not None and raw.strip() and not _is_auto_bytes_setting(raw):
+        return (
+            _bank_bytes_from_env(
+                "MTPLX_SESSION_BANK_MAX_BYTES", DEFAULT_MAX_BYTES
+            ),
+            False,
+        )
+    auto = _auto_session_bank_max_bytes(model_bytes)
+    if auto is not None:
+        return auto, True
+    return DEFAULT_MAX_BYTES, False
+
+
+def resolve_session_bank_per_session_bytes(
+    max_bytes: int,
+    *,
+    auto_active: bool = True,
+) -> int:
+    """Per-session cap resolution.
+
+    Explicit env wins (clamped to the bank budget when the budget was
+    auto-computed). In auto mode the default is 2/3 of the budget so one
+    conversation cannot monopolize the whole cache; in legacy mode the
+    RAM-tiered defaults are preserved exactly.
+    """
+    raw = os.environ.get("MTPLX_SESSION_BANK_PER_SESSION_BYTES")
+    if raw is not None and raw.strip() and not _is_auto_bytes_setting(raw):
+        parsed = _bank_bytes_from_env(
+            "MTPLX_SESSION_BANK_PER_SESSION_BYTES",
+            _default_per_session_max_bytes(),
+        )
+        return min(parsed, int(max_bytes)) if auto_active else parsed
+    if auto_active:
+        return max(_AUTO_BUDGET_FLOOR_BYTES, int(max_bytes) * 2 // 3)
+    return _default_per_session_max_bytes()
 
 
 def _session_bank_per_session_max_bytes() -> int:
@@ -906,26 +1011,44 @@ class EngineSessionManager:
         bank: SessionBank | None = None,
         idle_ttl_s: float = DEFAULT_IDLE_TTL_S,
         cold_tier: Any | None = None,
+        model_weights_bytes: int | None = None,
     ) -> None:
-        # Bank caps mostly default to the constants in session_bank.py. On
-        # 96GB+ Apple Silicon machines, the per-session default rises to the
-        # global 24GiB bank cap so exact 100k-token prefixes and retokenized
-        # follow-up histories can stay hot in RAM together without increasing
-        # the total RAM-cache budget. Operators can still override byte caps via
-        # MTPLX_SESSION_BANK_PER_SESSION_BYTES (e.g. "16G") or
-        # MTPLX_SESSION_BANK_MAX_BYTES. The entry-count cap is also overridable
-        # via MTPLX_SESSION_BANK_MAX_ENTRIES (plain integer) for workloads
-        # where ~2 GB-per-entry contexts make the default of 8 the binding
-        # constraint well before the byte caps.
-        self.bank = bank or SessionBank(
-            max_entries=_session_bank_max_entries(),
-            max_bytes=_bank_bytes_from_env(
-                "MTPLX_SESSION_BANK_MAX_BYTES", DEFAULT_MAX_BYTES
-            ),
-            per_session_max_bytes=_session_bank_per_session_max_bytes(),
-            idle_ttl_s=idle_ttl_s,
-            cold_tier=cold_tier,
-        )
+        # Byte caps resolve model-aware by default (v2): unset or "auto" env
+        # gives the bank half of the RAM surplus left after the model weights
+        # (floored 1 GiB, capped 48 GiB), so a 32 GB Mac never inherits the
+        # old flat 24 GiB budget while a 128 GB Mac keeps a big warm cache.
+        # Explicit byte values (MTPLX_SESSION_BANK_MAX_BYTES /
+        # MTPLX_SESSION_BANK_PER_SESSION_BYTES, e.g. "16G") keep their exact
+        # semantics; per-session is additionally clamped to the bank budget.
+        # The entry-count cap stays overridable via
+        # MTPLX_SESSION_BANK_MAX_ENTRIES (plain integer).
+        if bank is None:
+            resolved_max_bytes, auto_active = resolve_session_bank_max_bytes(
+                model_weights_bytes
+            )
+            bank = SessionBank(
+                max_entries=_session_bank_max_entries(),
+                max_bytes=resolved_max_bytes,
+                per_session_max_bytes=resolve_session_bank_per_session_bytes(
+                    resolved_max_bytes,
+                    auto_active=auto_active,
+                ),
+                idle_ttl_s=idle_ttl_s,
+                cold_tier=cold_tier,
+            )
+            logger.info(
+                "[session-bank] budget max_bytes=%.1fG per_session=%.1fG "
+                "entries=%d (model_weights=%s)",
+                bank.max_bytes / 1024**3,
+                bank.per_session_max_bytes / 1024**3,
+                bank.max_entries,
+                (
+                    f"{model_weights_bytes / 1024**3:.1f}G"
+                    if model_weights_bytes
+                    else "unknown"
+                ),
+            )
+        self.bank = bank
         self.idle_ttl_s = float(idle_ttl_s)
         self._sessions: dict[str, EngineSession] = {}
         self._lock = Lock()
@@ -1181,6 +1304,61 @@ class EngineSessionManager:
             self._sessions.clear()
         bank_entries = self.bank.clear()
         return {"sessions_cleared": sessions, "bank_entries_cleared": bank_entries}
+
+    def quiesce(self, *, reason: str = "admin_cache_clear") -> dict[str, Any]:
+        """Abort pending idle maintenance so a clear leaves nothing running.
+
+        Dropping sessions/entries alone leaves two kinds of background work
+        alive: per-session idle postcommits (retokenize + snapshot on the
+        model thread) and the SSD cold-tier writer's deferred-encode queue,
+        whose PendingWrite items pin full cache snapshots in memory until
+        encoded. A benchmark-boundary or operator "clear cache" call means
+        "clean slate": without this, work queued by earlier traffic keeps
+        stealing GPU/memory bandwidth from the rows measured after the clear
+        (observed 2026-07-05: 8k cold prefill 790 tok/s on a fresh daemon vs
+        ~650 mid-sweep, and 90-107 GB active-memory peaks during
+        post-128k-row batch phases from queued 128k snapshot encodes).
+        """
+
+        aborted = 0
+        for session in self._sessions_snapshot():
+            record = getattr(session, "_pending_postcommit", None)
+            if record is None:
+                continue
+            future = getattr(record, "future", None)
+            done = getattr(future, "done", None)
+            if callable(done):
+                try:
+                    if done():
+                        continue
+                except BaseException:
+                    pass
+            abort = getattr(record, "abort", None)
+            if callable(abort):
+                try:
+                    abort(reason)
+                    aborted += 1
+                except BaseException:
+                    pass
+        # Cancel (not flush) queued SSD writes: after a clear they describe
+        # discarded state, and deferred-encode backlogs from long-context
+        # rows pin snapshots for minutes while starving foreground decode.
+        cancelled = 0
+        cold_tier = getattr(self.bank, "cold_tier", None)
+        cancel_pending = getattr(cold_tier, "cancel_pending", None)
+        if callable(cancel_pending):
+            try:
+                cancelled = int(cancel_pending())
+            except BaseException:
+                cancelled = 0
+        # Bounded wait for the (at most one) in-flight encode to finish so
+        # the response reflects a genuinely idle writer.
+        flushed = self.flush_cold_tier(timeout_s=10.0)
+        return {
+            "postcommits_aborted": aborted,
+            "ssd_writes_cancelled": cancelled,
+            "cold_tier_flushed": bool(flushed),
+        }
 
     def archive_cold_tier(self) -> dict[str, Any]:
         archive = getattr(self.bank, "archive_cold_tier", None)

@@ -542,9 +542,10 @@ def test_opencode_memory_defaults_scale_on_high_memory_darwin(monkeypatch):
 
     public._apply_opencode_memory_env_defaults(env)
 
-    assert env["MTPLX_SESSION_BANK_MAX_ENTRIES"] == "16"
-    assert env["MTPLX_SESSION_BANK_MAX_BYTES"] == "24G"
-    assert env["MTPLX_SESSION_BANK_PER_SESSION_BYTES"] == "16G"
+    assert env["MTPLX_SESSION_BANK_MAX_ENTRIES"] == "32"
+    # "auto": the engine budgets half the post-model RAM surplus at startup.
+    assert env["MTPLX_SESSION_BANK_MAX_BYTES"] == "auto"
+    assert env["MTPLX_SESSION_BANK_PER_SESSION_BYTES"] == "auto"
     assert env["MTPLX_LAZY_TARGET_DISTRIBUTIONS"] == "1"
     assert env["MTPLX_LAZY_BONUS_VERIFY"] == "1"
     assert env["MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER"] == "1"
@@ -567,9 +568,9 @@ def test_opencode_memory_defaults_stay_conservative_below_high_memory(monkeypatc
 
     public._apply_opencode_memory_env_defaults(env)
 
-    assert env["MTPLX_SESSION_BANK_MAX_ENTRIES"] == "4"
-    assert env["MTPLX_SESSION_BANK_MAX_BYTES"] == "8G"
-    assert env["MTPLX_SESSION_BANK_PER_SESSION_BYTES"] == "4G"
+    assert env["MTPLX_SESSION_BANK_MAX_ENTRIES"] == "6"
+    assert env["MTPLX_SESSION_BANK_MAX_BYTES"] == "auto"
+    assert env["MTPLX_SESSION_BANK_PER_SESSION_BYTES"] == "auto"
     assert env["MTPLX_LAZY_TARGET_DISTRIBUTIONS"] == "1"
     assert env["MTPLX_LAZY_BONUS_VERIFY"] == "1"
     assert env["MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER"] == "1"
@@ -834,6 +835,43 @@ def test_start_opencode_dry_run_json_writes_no_hidden_cap(
     assert "options" not in model
 
 
+def test_start_opencode_dry_run_emits_explicit_ssd_off(
+    monkeypatch, tmp_path, capsys
+):
+    """Issue #140 class: a generated server_command must carry an explicit
+    --ssd-session-cache off. The CLIs that re-parse these commands default
+    the flag to "on" (kvcache-v2), so omitting "off" silently re-enables
+    the cache the user disabled."""
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+    monkeypatch.setenv("MTPLX_OPENCODE_CONFIG", str(tmp_path / "opencode.json"))
+    monkeypatch.setenv(
+        "MTPLX_OPENCODE_DESKTOP_SETTINGS_STORE", str(tmp_path / "default.dat")
+    )
+
+    code = main(
+        [
+            "start",
+            "opencode",
+            "--dry-run",
+            "--json",
+            "--model",
+            "models/example",
+            "--api-key",
+            "1234",
+            "--ssd-session-cache",
+            "off",
+            "--yes",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    command = payload["opencode"]["server_command"]
+    assert "--ssd-session-cache off" in command
+    assert "--ssd-session-cache-max-size" not in command
+    assert "--ssd-session-cache-min-prefix-tokens" not in command
+
+
 def test_start_opencode_dry_run_uses_qwen36_contract_draft_sampler(
     monkeypatch, tmp_path, capsys
 ):
@@ -954,11 +992,6 @@ def test_serve_dry_run_prefers_contract_draft_sampler_over_internal_defaults(
             None,
         ),
     )
-    monkeypatch.setattr(
-        public,
-        "_active_mlx_fork_status",
-        lambda **_kwargs: {"ok": True},
-    )
 
     args = build_parser().parse_args(
         [
@@ -981,6 +1014,111 @@ def test_serve_dry_run_prefers_contract_draft_sampler_over_internal_defaults(
     assert "--draft-temperature 0.7" in payload["server_command"]
     assert "--draft-top-p 0.95" in payload["server_command"]
     assert "--draft-top-k 20" in payload["server_command"]
+    # --profile sustained was explicitly typed: the per-model turbo default
+    # must not override a user decision.
+    assert payload["profile"] == "sustained"
+
+
+def _serve_dry_run_payload_for_model(monkeypatch, capsys, model_dir, extra_args=()):
+    """Drive `mtplx serve --dry-run --json` against a stubbed local model."""
+
+    runtime_contract = {
+        "arch_id": "qwen3-next-mtp",
+        "mtp_depth_max": 3,
+        "recommended_profile": "sustained",
+    }
+    inspection = {
+        "model_dir": str(model_dir),
+        "recommended_backend": "qwen3_next",
+        "runtime_compatibility": "native-contract-gated",
+        "compatibility": {
+            "can_run": True,
+            "exit_code": 0,
+            "runtime_contract": runtime_contract,
+        },
+    }
+    monkeypatch.setattr(public, "_serve_should_onboard", lambda _args: False)
+    monkeypatch.setattr(public, "_port_is_busy", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        public,
+        "_resolve_runtime_model_path",
+        lambda model, cache_dir=None: (str(model_dir), None),
+    )
+    monkeypatch.setattr(
+        public,
+        "_model_gate",
+        lambda runtime_model, *, unsafe_force_unverified, yes: (inspection, None),
+    )
+    args = build_parser().parse_args(
+        ["serve", "--model", str(model_dir), "--yes", *extra_args]
+    )
+    args.dry_run = True
+    args.json = True
+    code = public.cmd_serve_public(args)
+    assert code == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_serve_defaults_quantized_27b_flagships_to_turbo(
+    monkeypatch, tmp_path, capsys
+):
+    """Bare `mtplx serve` on the quantized 27B flagships resolves turbo.
+
+    This is the same launch rule the macOS app applies (Speed/Quality ->
+    turbo). Before 2026-07-05 the bare CLI stayed on sustained, so every
+    OpenAI-API consumer measured the slow path while the app ran the NAX +
+    compiled-verify fast path.
+    """
+
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+    for dir_name in (
+        "Qwen3.6-27B-MTPLX-Optimized-Speed",
+        "Qwen3.6-27B-MTPLX-Optimized-Quality",
+        "Qwen3.6-27B-MTPLX-Optimized",
+        # 27B Speed-FP16 (M1/M2 routing target) promoted 2026-07-07:
+        # turbo measured 1.98-2.08x over true AR on the artifact itself
+        # (INT4/g64 weights, fp16 activations) vs 1.34x on sustained.
+        "Qwen3.6-27B-MTPLX-Optimized-Speed-FP16",
+        # 27B Quality-FP16 (M1/M2 quality pick, built 2026-07-07):
+        # turbo measured 2.5x over true AR on the artifact itself
+        # (q8/g64 weights, fp16 activations; 43.8/42.1 vs 17.4 tok/s).
+        "Qwen3.6-27B-MTPLX-Optimized-Quality-FP16",
+        # 9B (6-bit) promoted 2026-07-07 with the 6-bit hexpack split-K
+        # kernels: live ABBA MTP D3 110/102 vs sustained 90/69 tok/s.
+        "Qwen3.5-9B-MTPLX-Optimized-Speed",
+        "Qwen3.5-9B-MTPLX-Optimized-Speed-FP16",
+    ):
+        model_dir = tmp_path / dir_name
+        model_dir.mkdir()
+        payload = _serve_dry_run_payload_for_model(monkeypatch, capsys, model_dir)
+        assert payload["profile"] == "turbo", dir_name
+        assert "--profile turbo" in payload["server_command"], dir_name
+
+
+def test_serve_default_profile_untouched_off_the_turbo_allowlist(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+    for dir_name in (
+        # 35B MoE: experts bypass the NAX patch; stays sustained.
+        "Qwen3.6-35B-A3B-MTPLX-Optimized-Balance",
+        # Unrecognized third-party artifact.
+        "example-model",
+    ):
+        model_dir = tmp_path / dir_name
+        model_dir.mkdir()
+        payload = _serve_dry_run_payload_for_model(monkeypatch, capsys, model_dir)
+        assert payload["profile"] == "sustained", dir_name
+
+
+def test_serve_explicit_profile_beats_turbo_default(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+    model_dir = tmp_path / "Qwen3.6-27B-MTPLX-Optimized-Speed"
+    model_dir.mkdir()
+    payload = _serve_dry_run_payload_for_model(
+        monkeypatch, capsys, model_dir, extra_args=("--profile", "sustained")
+    )
+    assert payload["profile"] == "sustained"
 
 
 def test_start_opencode_dry_run_uses_step_descriptor_defaults(
@@ -1471,11 +1609,6 @@ def test_serve_require_max_fans_fails_closed_before_child_launch(monkeypatch, ca
     )
     monkeypatch.setattr(public, "_model_draft_lm_head_spec", lambda *_args: None)
     monkeypatch.setattr(public, "_model_draft_sampler_spec", lambda *_args: None)
-    monkeypatch.setattr(
-        public,
-        "_active_mlx_fork_status",
-        lambda **_kwargs: {"ok": True},
-    )
     monkeypatch.setattr(public, "os", public.os)
 
     args = build_parser().parse_args(
@@ -2970,9 +3103,9 @@ def test_tune_retune_starts_max_fans_before_slow_diagnostics(
     monkeypatch.setattr(
         public,
         "_mlx_backend_context",
-        lambda _profile: (
+        lambda: (
             assert_after_max("backend")
-            or {"optional_fast_mlx_fork_active": False, "stock_mlx_likely": True}
+            or {"stock_mlx_likely": True}
         ),
     )
     monkeypatch.setenv("MTPLX_TUNE_STATE", str(tmp_path / "tune-state.json"))
@@ -5071,6 +5204,9 @@ def test_serve_dispatches_packaged_openai_server(monkeypatch, capsys):
     assert calls["cmd"][calls["cmd"].index("--api-key") + 1] == "test-key"
     assert calls["cmd"][calls["cmd"].index("--rate-limit") + 1] == "120"
     assert calls["cmd"][calls["cmd"].index("--stream-interval") + 1] == "4"
+    # Serial stays the default: measured 2026-07-05, serialized solo-MTP
+    # beats the batched-AR lane end to end on concurrent loads because MTP
+    # decode is ~4x faster per stream (see MEASUREMENTS).
     assert calls["cmd"][calls["cmd"].index("--scheduler-mode") + 1] == "serial"
     assert calls["cmd"][calls["cmd"].index("--batching-preset") + 1] == "latency"
     assert calls["cmd"][calls["cmd"].index("--max-response-tokens") + 1] == "512"
@@ -5397,11 +5533,6 @@ def test_quickstart_dry_run_json_previews_server_without_side_effects(
             None,
         ),
     )
-    monkeypatch.setattr(
-        public,
-        "_active_mlx_fork_status",
-        lambda **_kwargs: {"ok": True},
-    )
 
     def fail_execvpe(*_args):
         raise AssertionError("dry-run should not exec the server")
@@ -5483,11 +5614,6 @@ def test_serve_threads_api_key_file_and_kv_quant_to_daemon(monkeypatch, tmp_path
             {"compatibility": {"tier": "verified", "can_run": True, "exit_code": 0}},
             None,
         ),
-    )
-    monkeypatch.setattr(
-        public,
-        "_active_mlx_fork_status",
-        lambda **_kwargs: {"ok": True},
     )
 
     def fake_execvpe(_executable, cmd, env):
@@ -6259,7 +6385,11 @@ def test_serve_skips_onboarding_with_explicit_model(monkeypatch):
     assert calls["cmd"][calls["cmd"].index("--model") + 1] == "models/explicit"
 
 
-def test_serve_relaxes_missing_fast_mlx_fork_for_product_start(monkeypatch, capsys):
+def test_serve_never_gates_on_an_mlx_fork(monkeypatch, capsys):
+    # MTPLX runs on stock PyPI MLX. The old fork gate (relax flag,
+    # strict-fast-path failure, PYTHONPATH source-build autodiscovery)
+    # was vestigial research residue and must never resurface in the
+    # product serve path (issue #129).
     calls = {}
 
     monkeypatch.setattr(
@@ -6276,18 +6406,10 @@ def test_serve_relaxes_missing_fast_mlx_fork_for_product_start(monkeypatch, caps
         ),
     )
     monkeypatch.setattr(public, "_port_is_busy", lambda host, port: False)
-    monkeypatch.setattr(
-        public,
-        "_active_mlx_fork_status",
-        lambda **_kwargs: {
-            "ok": False,
-            "path": "/venv/site-packages/mlx/core.cpython-313-darwin.so",
-            "version": "0.31.2",
-        },
-    )
 
     def fake_execvpe(executable, cmd, env):
         calls["cmd"] = cmd
+        calls["env"] = env
         raise SystemExit(0)
 
     monkeypatch.setattr(public.os, "execvpe", fake_execvpe)
@@ -6320,19 +6442,16 @@ def test_serve_relaxes_missing_fast_mlx_fork_for_product_start(monkeypatch, caps
         assert exc.code == 0
 
     captured = capsys.readouterr().out
-    assert "Fast MLX fork not active" not in captured
-    assert "stock-MLX compatibility" not in captured
-    assert "--no-strict-mlx-fork-assert" in calls["cmd"]
+    assert "MLX fork" not in captured
+    assert "--no-strict-mlx-fork-assert" not in calls["cmd"]
+    assert "MTPLX_FAST_MLX_SOURCE_PATH_ACTIVE" not in calls["env"]
 
 
-def test_serve_autodiscovers_fast_mlx_source_for_child_env(monkeypatch, tmp_path):
+def test_serve_strict_fast_path_flag_is_an_inert_no_op(monkeypatch, capsys):
+    # --strict-fast-path used to fail startup when the optional fork was
+    # missing. No profile requires a fork anymore, so the flag stays
+    # accepted for script compatibility but must never block a launch.
     calls = {}
-
-    source = tmp_path / "mlx-mtplx-0.31.2-qmm-build" / "python"
-    (source / "mlx").mkdir(parents=True)
-    (source / "mlx" / "core.cpython-313-darwin.so").write_bytes(b"")
-    monkeypatch.setenv("MTPLX_FAST_MLX_SOURCE_PATH", str(source.parent))
-    monkeypatch.delenv("MTPLX_DISABLE_FAST_MLX_AUTODISCOVERY", raising=False)
 
     monkeypatch.setattr(
         public,
@@ -6348,73 +6467,12 @@ def test_serve_autodiscovers_fast_mlx_source_for_child_env(monkeypatch, tmp_path
         ),
     )
     monkeypatch.setattr(public, "_port_is_busy", lambda host, port: False)
-    monkeypatch.setattr(
-        public,
-        "_active_mlx_fork_status",
-        lambda **_kwargs: {"ok": False, "path_active": False},
-    )
 
     def fake_execvpe(executable, cmd, env):
         calls["cmd"] = cmd
-        calls["env"] = env
         raise SystemExit(0)
 
     monkeypatch.setattr(public.os, "execvpe", fake_execvpe)
-    args = SimpleNamespace(
-        model="models/example",
-        cache_dir=None,
-        profile="sustained",
-        unsafe_force_unverified=False,
-        yes=True,
-        host="127.0.0.1",
-        port=8000,
-        depth=3,
-        api_key=None,
-        rate_limit=0,
-        stream_interval=1,
-        max_response_tokens=None,
-        temperature=0.6,
-        top_p=0.95,
-        reasoning_parser="qwen3",
-        stats_footer=False,
-        warmup_tokens=0,
-        strict_warmup=False,
-        strict_fast_path=False,
-        max=False,
-    )
-
-    try:
-        public.cmd_serve_public(args)
-    except SystemExit as exc:
-        assert exc.code == 0
-
-    pythonpath = calls["env"]["PYTHONPATH"].split(os.pathsep)
-    assert pythonpath[0] == str(source.resolve())
-    assert calls["env"]["MTPLX_FAST_MLX_SOURCE_PATH_ACTIVE"] == str(source.resolve())
-    assert "--no-strict-mlx-fork-assert" in calls["cmd"]
-
-
-def test_serve_strict_fast_path_fails_cleanly_without_traceback(monkeypatch, capsys):
-    monkeypatch.setattr(
-        public,
-        "_resolve_runtime_model_path",
-        lambda model, cache_dir=None: (model, None),
-    )
-    monkeypatch.setattr(
-        public,
-        "_model_gate",
-        lambda model, unsafe_force_unverified=False, yes=False: (
-            {"compatibility": {"tier": "verified", "can_run": True, "exit_code": 0}},
-            None,
-        ),
-    )
-    monkeypatch.setattr(public, "_port_is_busy", lambda host, port: False)
-    monkeypatch.setattr(
-        public,
-        "_active_mlx_fork_status",
-        lambda **_kwargs: {"ok": False, "error": "mlx.core is not installed"},
-    )
-
     args = SimpleNamespace(
         model="models/example",
         cache_dir=None,
@@ -6438,10 +6496,14 @@ def test_serve_strict_fast_path_fails_cleanly_without_traceback(monkeypatch, cap
         max=False,
     )
 
-    assert public.cmd_serve_public(args) == 2
+    try:
+        public.cmd_serve_public(args)
+    except SystemExit as exc:
+        assert exc.code == 0
+
+    assert "cmd" in calls
     captured = capsys.readouterr().out
-    assert "Fast MLX fork is required but not active" in captured
-    assert "Traceback" not in captured
+    assert "Fast MLX fork is required but not active" not in captured
 
 
 def test_serve_reports_busy_port_before_model_resolution(monkeypatch, capsys):
@@ -6692,6 +6754,7 @@ def test_profiles_command_lists_default_without_mlx(capsys):
         "stable",
         "performance-cold",
         "sustained",
+        "turbo",
         "exact",
         "max-diagnostic",
     ]
@@ -6886,3 +6949,142 @@ def test_model_gate_error_lines_render_for_every_tier():
         lines = _model_gate_error_lines(inspection)
         assert lines, tier
         assert any("try:" in line for line in lines), (tier, lines)
+
+
+# Issue #131: the Hermes profile config was regenerated from the template on
+# every sync, silently dropping user-added sections (memory/providers/…) and
+# child keys (model.max_tokens). Mirrors the Swift-side tests — SYNC PAIR
+# with HermesIntegration.mergedConfigYAML.
+
+
+def test_hermes_merged_config_owns_template_shaped_sections():
+    template = (
+        "model:\n"
+        '  default: "m"\n'
+        "  provider: custom\n"
+        '  base_url: "http://127.0.0.1:9001/v1"\n'
+        "toolsets:\n"
+        "  - terminal\n"
+        "  - file\n"
+        "display:\n"
+        "  streaming: true\n"
+    )
+    existing = (
+        "# user preamble comment\n"
+        "model:\n"
+        '  default: "old"\n'
+        "  provider: custom\n"
+        '  base_url: "http://127.0.0.1:8123/v1"\n'
+        "  max_tokens: 32768\n"
+        '  reasoning_effort: "high"\n'
+        "toolsets:\n"
+        "  - terminal\n"
+        "  - custom-extra\n"
+        "# external memory\n"
+        "memory:\n"
+        "  provider: honcho\n"
+    )
+
+    merged = public._hermes_merged_config_yaml(existing, template)
+
+    assert merged.startswith("# user preamble comment\n")
+    assert 'base_url: "http://127.0.0.1:9001/v1"' in merged
+    assert "8123" not in merged
+    assert "  max_tokens: 32768" in merged
+    # Conditionally app-owned (the app writes it while an effort is set):
+    # a stale line must not be resurrected as user content.
+    assert "reasoning_effort" not in merged
+    # Sequence-shaped owned sections are rewritten wholly.
+    assert "custom-extra" not in merged
+    # Unknown sections survive verbatim, with their comments.
+    assert "# external memory\nmemory:\n  provider: honcho" in merged
+    # Idempotent: merging the merge result changes nothing.
+    assert public._hermes_merged_config_yaml(merged, template) == merged
+
+
+def test_hermes_merged_config_without_existing_is_template():
+    template = 'model:\n  default: "m"\n'
+    assert public._hermes_merged_config_yaml(None, template) == template
+    assert public._hermes_merged_config_yaml("  \n", template) == template
+
+
+def test_sync_hermes_profile_preserves_user_sections(monkeypatch, tmp_path):
+    monkeypatch.setattr(public, "_hermes_home", lambda: tmp_path / ".hermes")
+
+    first = public._sync_hermes_profile(
+        model_id="mtplx-qwen36-27b-optimized-speed",
+        base_url="http://127.0.0.1:8123/v1",
+        api_key="local",
+        workspace_path=str(tmp_path / "ws"),
+    )
+    config_path = Path(first["config_path"])
+
+    # The user adds non-template config — the issue #131 repro.
+    text = config_path.read_text(encoding="utf-8")
+    text = text.replace(
+        "  api_mode: chat_completions\n",
+        "  api_mode: chat_completions\n  max_tokens: 32768\n",
+    )
+    text += "# external memory (issue #131 repro)\nmemory:\n  provider: honcho\n"
+    config_path.write_text(text, encoding="utf-8")
+
+    # The next sync must preserve all of it.
+    public._sync_hermes_profile(
+        model_id="mtplx-qwen36-27b-optimized-speed",
+        base_url="http://127.0.0.1:8123/v1",
+        api_key="local",
+        workspace_path=str(tmp_path / "ws"),
+    )
+    preserved = config_path.read_text(encoding="utf-8")
+    assert "# external memory (issue #131 repro)\nmemory:\n  provider: honcho" in preserved
+    assert "  max_tokens: 32768" in preserved
+
+    # A repeat sync with unchanged inputs must not rewrite the file.
+    repeated = public._sync_hermes_profile(
+        model_id="mtplx-qwen36-27b-optimized-speed",
+        base_url="http://127.0.0.1:8123/v1",
+        api_key="local",
+        workspace_path=str(tmp_path / "ws"),
+    )
+    assert repeated["did_change"] is False
+
+    # Owned keys update in place while user content survives.
+    public._sync_hermes_profile(
+        model_id="mtplx-qwen36-27b-optimized-speed",
+        base_url="http://127.0.0.1:9001/v1",
+        api_key="local",
+        workspace_path=str(tmp_path / "ws"),
+    )
+    final = config_path.read_text(encoding="utf-8")
+    assert "9001/v1" in final
+    assert "8123/v1" not in final
+    assert "memory:\n  provider: honcho" in final
+    assert "  max_tokens: 32768" in final
+
+
+def test_ui_pretty_path_is_importable():
+    # Regression: ``mtplx.ui`` must export ``pretty_path``. The dashboard
+    # handoff does ``from mtplx.ui import pretty_path``, but the symbol lived
+    # in ``onboarding`` as ``_pretty_path`` and was never re-exported, so the
+    # import raised ImportError.
+    from mtplx import ui
+    from mtplx.ui import pretty_path
+
+    assert "pretty_path" in ui.__all__
+    assert pretty_path is ui.onboarding._pretty_path
+    # Behaves like the underlying helper: collapse $HOME, pass HF refs through.
+    assert pretty_path("Youssofal/Qwen3.6-27B") == "Youssofal/Qwen3.6-27B"
+    assert pretty_path(str(Path.home() / "models" / "x")) == "~/models/x"
+
+
+def test_quickstart_dashboard_handoff_does_not_crash(capsys):
+    # Regression: ``mtplx start`` reached the dashboard handoff and crashed on
+    # ``from mtplx.ui import pretty_path``. Drive the handoff directly and
+    # assert it prints the loading line with the model path instead of raising.
+    args = SimpleNamespace(host="127.0.0.1", port=8000)
+    public._quickstart_print_dashboard_handoff(
+        args, runtime_model=str(Path.home() / ".mtplx" / "models" / "demo")
+    )
+    out = capsys.readouterr().out
+    assert "Loading model: ~/.mtplx/models/demo" in out
+    assert "Dashboard URL:" in out

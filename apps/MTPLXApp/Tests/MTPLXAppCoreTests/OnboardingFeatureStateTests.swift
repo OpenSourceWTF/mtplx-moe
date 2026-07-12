@@ -190,13 +190,27 @@ final class OnboardingFeatureStateTests: XCTestCase {
         XCTAssertEqual(s.resolvedModel?.id, "optimized-speed")
     }
 
-    func testResolvedModelForQualityNeverSwaps() {
+    func testResolvedModelForQualityRoutesToFP16OnLegacyApple() {
+        // Until 2026-07-07 quality never swapped because no Quality-FP16
+        // artifact existed. It exists now (2.0.1) and is measured (2.5x
+        // over true AR under turbo), so the M1/M2 quality pick resolves
+        // the FP16 sibling exactly like the speed lane.
         let m1 = DetectedHardware(
             chipName: "Apple M1",
             appleSiliconGeneration: "m1",
             unifiedMemoryBytes: 8 * 1_073_741_824
         )
         let s = OnboardingFeatureState(hardware: m1, pick: .curatedQuality)
+        XCTAssertEqual(s.resolvedModel?.id, "optimized-quality-fp16")
+    }
+
+    func testResolvedModelForQualityKeepsBF16OnModernApple() {
+        let m5 = DetectedHardware(
+            chipName: "Apple M5 Max",
+            appleSiliconGeneration: "m5",
+            unifiedMemoryBytes: 64 * 1_073_741_824
+        )
+        let s = OnboardingFeatureState(hardware: m5, pick: .curatedQuality)
         XCTAssertEqual(s.resolvedModel?.id, "optimized-quality")
     }
 

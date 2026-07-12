@@ -35,12 +35,12 @@ from mtplx.profiles import (
 )
 
 
-def test_catalog_has_eleven_unique_entries():
+def test_catalog_has_twelve_unique_entries():
     ids = [model.id for model in OFFICIAL_CATALOG]
-    assert len(ids) == 11
-    assert len(set(ids)) == 11
+    assert len(ids) == 12
+    assert len(set(ids)) == 12
     hf_ids = [model.hf_model_id for model in OFFICIAL_CATALOG]
-    assert len(set(hf_ids)) == 11
+    assert len(set(hf_ids)) == 12
 
 
 def test_catalog_matches_swift_official_catalog():
@@ -104,11 +104,21 @@ def test_recommended_ids_mirror_app_ram_tiers():
     ]
     assert recommended_catalog_ids(memory_gib=64, chip_tier=LEGACY_TIER) == [
         "optimized-speed-fp16",
-        "optimized-quality",
+        # Quality on legacy silicon resolves the FP16 sibling (2.0.1,
+        # 2026-07-07) so an M1/M2 quality pick gets the fp16-activation
+        # artifact the turbo vk q8 kernels were measured on.
+        "optimized-quality-fp16",
         "qwen36-35b-a3b-optimized-speed-fp16",
         "qwen36-35b-a3b-optimized-balance-fp16",
         "gemma4-optimized-speed",
         "qwen35-9b-optimized-speed-fp16",
+    ]
+    assert recommended_catalog_ids(memory_gib=36, chip_tier=LEGACY_TIER) == [
+        "qwen35-9b-optimized-speed-fp16",
+        "optimized-speed-fp16",
+        "gemma4-optimized-speed",
+        "qwen36-35b-a3b-optimized-speed-fp16",
+        "optimized-quality-fp16",
     ]
     assert recommended_catalog_ids(memory_gib=64, chip_tier=INTEL_TIER) == []
     assert recommended_catalog_ids(

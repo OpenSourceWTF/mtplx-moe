@@ -152,6 +152,62 @@ def test_manager_byte_caps_alone_still_work(monkeypatch):
     assert mgr.bank.per_session_max_bytes == 8 * 1024**3
 
 
+def test_manager_quiesce_aborts_pending_postcommits_and_flushes_cold_tier(
+    monkeypatch,
+):
+    """`/admin/cache/clear` quiesce: pending idle postcommits are aborted and
+    the SSD deferred-encode queue is drained before state is dropped."""
+
+    monkeypatch.delenv("MTPLX_SESSION_BANK_MAX_ENTRIES", raising=False)
+    monkeypatch.delenv("MTPLX_SESSION_BANK_MAX_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_SESSION_BANK_PER_SESSION_BYTES", raising=False)
+    es = _reload_engine_session()
+    mgr = es.EngineSessionManager()
+
+    class FakeFuture:
+        def __init__(self):
+            self.cancelled = False
+
+        def done(self):
+            return False
+
+        def cancel(self):
+            self.cancelled = True
+            return True
+
+    session = mgr.get_or_create("quiesce-test")
+    session.set_pending_postcommit(FakeFuture(), reason="test", token_count=4)
+    record = session._pending_postcommit
+    assert record is not None
+
+    flushes: list[float] = []
+    monkeypatch.setattr(
+        mgr, "flush_cold_tier", lambda *, timeout_s: flushes.append(timeout_s) or True
+    )
+
+    class FakeColdTier:
+        def __init__(self):
+            self.cancelled = 0
+
+        def cancel_pending(self):
+            self.cancelled += 3
+            return 3
+
+    fake_tier = FakeColdTier()
+    monkeypatch.setattr(mgr.bank, "cold_tier", fake_tier, raising=False)
+
+    outcome = mgr.quiesce(reason="admin_cache_clear")
+
+    assert outcome["postcommits_aborted"] == 1
+    assert outcome["ssd_writes_cancelled"] == 3
+    assert outcome["cold_tier_flushed"] is True
+    assert record.abort_event.is_set()
+    assert record.last_abort_reason == "admin_cache_clear"
+    assert record.future.cancelled is True
+    assert flushes == [10.0]
+    assert fake_tier.cancelled == 3
+
+
 def test_manager_uses_24g_per_session_default_on_high_memory_darwin(
     monkeypatch,
 ):

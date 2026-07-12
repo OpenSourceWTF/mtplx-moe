@@ -210,6 +210,22 @@ def test_optimized_quality_prefers_complete_local_env_model(tmp_path, monkeypatc
     assert optimized_quality_model_ref() == str(local_quality)
 
 
+def test_optimized_quality_routes_fp16_sibling_on_legacy_silicon(monkeypatch):
+    """A quality pick on M1/M2 resolves the Quality-FP16 sibling (2.0.1),
+    mirroring the speed lane's precision routing."""
+    from mtplx.profiles import QUALITY_FP16_HF_MODEL_ID, QUALITY_HF_MODEL_ID
+
+    monkeypatch.delenv(QUALITY_MODEL_ENV, raising=False)
+    legacy = {"chip": "Apple M1 Pro", "apple_silicon_generation": "m1"}
+    modern = {"chip": "Apple M5 Max", "apple_silicon_generation": "m5"}
+
+    legacy_ref = optimized_quality_model_ref(hardware=legacy)
+    assert "Quality-FP16" in legacy_ref or legacy_ref == QUALITY_FP16_HF_MODEL_ID
+
+    modern_ref = optimized_quality_model_ref(hardware=modern)
+    assert "FP16" not in modern_ref or modern_ref == QUALITY_HF_MODEL_ID
+
+
 @pytest.mark.parametrize(
     ("model_ref", "expected"),
     [
@@ -224,6 +240,10 @@ def test_optimized_quality_prefers_complete_local_env_model(tmp_path, monkeypatc
         (
             "/Users/example/models/Qwen3.6-27B-MTPLX-Optimized-Quality",
             QUALITY_PUBLIC_MODEL_ID,
+        ),
+        (
+            "/Users/example/models/Qwen3.6-27B-MTPLX-Optimized-Quality-FP16",
+            "mtplx-qwen36-27b-optimized-quality-fp16",
         ),
         (
             "/Users/example/models/Qwen3.6-27B-MTPLX-Optimized",

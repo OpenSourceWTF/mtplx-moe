@@ -23,6 +23,7 @@ import importlib.metadata
 import importlib.util
 import re
 import webbrowser
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -83,6 +84,8 @@ from mtplx.profiles import (
     DEFAULT_PUBLIC_MODEL_ID,
     LEGACY_OPTIMIZED_HF_MODEL_ID,
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
+    QUALITY_FP16_HF_MODEL_ID,
+    QUALITY_FP16_PUBLIC_MODEL_ID,
     QUALITY_HF_MODEL_ID,
     QUALITY_PUBLIC_MODEL_ID,
     QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
@@ -252,16 +255,23 @@ HERMES_LATENCY_DEFAULTS: dict[str, Any] = {
 _OPENCODE_HIGH_MEMORY_THRESHOLD_BYTES = 96 * 1024**3
 _OPENCODE_HIGH_MEMORY_MAX_BYTES = "24G"
 _OPENCODE_HIGH_MEMORY_PER_SESSION_BYTES = "16G"
-_OPENCODE_DEFAULT_MAX_ENTRIES = "4"
-_OPENCODE_HIGH_MEMORY_MAX_ENTRIES = "16"
+_OPENCODE_DEFAULT_MAX_ENTRIES = "6"
+# 2026-07-04 multitask finding: one busy OpenCode conversation banked 13
+# entries (20.6 GB) before prefix-supersede landed; 16 slots left nothing for
+# a second or third project. With supersede a conversation settles around
+# 2-4 live entries, so 32 slots hold several projects warm while the 24G
+# byte budget remains the real guard.
+_OPENCODE_HIGH_MEMORY_MAX_ENTRIES = "32"
 
 
 def _detect_total_ram_bytes_for_opencode_defaults() -> int | None:
     if sys.platform != "darwin":
         return None
     try:
+        # Absolute path: app-owned daemons run with a sanitized PATH that
+        # lacks /usr/sbin (see engine_session RAM detection).
         output = subprocess.check_output(
-            ["sysctl", "-n", "hw.memsize"],
+            ["/usr/sbin/sysctl", "-n", "hw.memsize"],
             text=True,
             stderr=subprocess.DEVNULL,
             timeout=2.0,
@@ -278,10 +288,6 @@ def _opencode_memory_env_defaults() -> dict[str, str]:
         total_ram is not None
         and total_ram >= _OPENCODE_HIGH_MEMORY_THRESHOLD_BYTES
     )
-    max_bytes = _OPENCODE_HIGH_MEMORY_MAX_BYTES if high_memory else "8G"
-    per_session_bytes = (
-        _OPENCODE_HIGH_MEMORY_PER_SESSION_BYTES if high_memory else "4G"
-    )
     max_entries = (
         _OPENCODE_HIGH_MEMORY_MAX_ENTRIES
         if high_memory
@@ -290,8 +296,12 @@ def _opencode_memory_env_defaults() -> dict[str, str]:
     return {
         "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
         "MTPLX_SESSION_BANK_MAX_ENTRIES": max_entries,
-        "MTPLX_SESSION_BANK_MAX_BYTES": max_bytes,
-        "MTPLX_SESSION_BANK_PER_SESSION_BYTES": per_session_bytes,
+        # "auto" = the engine budgets half the RAM surplus left after the
+        # model weights (floor 1 GiB, cap 48 GiB). Replaces the flat
+        # 24G/8G tier that ignored the loaded model's size (founder memory
+        # ruling 2026-07-05: 55 GB total was fine on 128 GB, lethal on 32).
+        "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+        "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
         "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
         "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
         "MTPLX_LAZY_TARGET_DISTRIBUTIONS": "1",
@@ -647,6 +657,11 @@ def _generation_mode_from_args(args: Any) -> str:
     )
 
 
+def _runtime_kv_admission(runtime: Any, tokens: int):
+    admit = getattr(runtime, "admit_kv_tokens", None)
+    return admit(tokens) if callable(admit) else nullcontext()
+
+
 def _fan_mode_from_args(args: Any) -> str:
     mode = fan_mode_from_args(args)
     setattr(args, "fan_mode", mode)
@@ -812,6 +827,69 @@ def _apply_model_contract_depth_default(
         profile=profile,
         fallback=int(getattr(args, "depth", 3)),
     )
+
+
+# Quantized 27B flagships whose measured default profile is turbo. This is
+# the same launch rule the macOS app applies in MTPLXCommandBuilder
+# (Speed/Quality/Speed-FP16 -> turbo): NAX verify kernels +22-40% chat decode
+# on q8 (ULP-exact) and vk_k on q4, plus compiled verify behind its per-model
+# quant-bits gate. Before 2026-07-05 the bare CLI (`mtplx serve` / quickstart
+# / start) silently stayed on sustained, so every OpenAI-API consumer —
+# including third-party benchmark harnesses — measured the slow path while
+# the app ran turbo. Keep this list measured-win only: 6-bit small models
+# (vk covers 4/8-bit affine only), 35B MoE (experts bypass the NAX patch),
+# Gemma, and third-party artifacts keep the sustained default.
+_TURBO_DEFAULT_PUBLIC_MODEL_IDS = frozenset(
+    {
+        DEFAULT_PUBLIC_MODEL_ID,  # 27B Optimized-Speed (flat 4-bit)
+        QUALITY_PUBLIC_MODEL_ID,  # 27B Optimized-Quality (8-bit)
+        LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,  # 27B Optimized (gdn8 hybrid, 8/4-bit)
+        # 27B Speed-FP16 (INT4/g64 weights, fp16 activations — the M1/M2
+        # routing target). Promoted 2026-07-07 after the first-ever e2e
+        # measurement: turbo 1.98-2.08x over true AR on M5 Max (55-60 tok/s
+        # D3 vs 27-29 AR), acceptance [86/66/51]%, peak 18.6 GB, vs only
+        # 1.34x on sustained (fp16 verify_hidden_eval tax ~8s/384-tok run).
+        # The 9B FP16 (6-bit) and 35B FP16 (MoE) siblings are NOT promoted.
+        DEFAULT_FP16_PUBLIC_MODEL_ID,
+        # 27B Quality-FP16 (q8/g64 weights, fp16 activations — the M1/M2
+        # quality pick, built 2026-07-07). Measured on its own artifact:
+        # turbo MTP D3 43.8/42.1 tok/s vs true AR 17.4 (2.5x), selfcheck
+        # all vk q8 lanes ok, parent logit-diff argmax 16/16.
+        QUALITY_FP16_PUBLIC_MODEL_ID,
+        # 9B (6-bit/g64) promoted 2026-07-07 after the 6-bit hexpack
+        # split-K kernels landed: live ABBA on the 9B measured turbo MTP
+        # D3 110/102 tok/s vs sustained 90/69 (+34%), true AR 62-65 flat
+        # both profiles -> multiplier 1.25x -> 1.68x. Exactness: 54
+        # synthetic {bf16,fp16}x{gs32,64,128} cases dmax <= 0.027 vs
+        # stock. The FP16 sibling shares the 6-bit packs and fp16 lanes
+        # are exactness-proven, so both promote together.
+        QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
+    }
+)
+
+
+def _apply_model_default_profile(args: Any, model_id: str) -> bool:
+    """Give the quantized 27B flagships the app's turbo default on the CLI.
+
+    Returns True when the profile default was rewritten (caller must
+    re-resolve its ``profile`` object). An explicit ``--profile`` flag or an
+    interactive wizard choice always wins — both are recorded in
+    ``args._cli_flags``.
+    """
+
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if "profile" in cli_flags:
+        return False
+    if model_id not in _TURBO_DEFAULT_PUBLIC_MODEL_IDS:
+        return False
+    current = str(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
+    if current != DEFAULT_PROFILE_NAME:
+        # A non-default profile that arrived without a CLI flag came from a
+        # programmatic caller (app command builder, tests); respect it.
+        return False
+    args.profile = "turbo"
+    return True
 
 
 def _apply_qwen36_35b_optimized_speed_defaults(args: Any, model_id: str) -> None:
@@ -1113,7 +1191,7 @@ def _preserve_thinking_policy(args: Any) -> str:
         return "off"
     raw = getattr(args, "preserve_thinking", None)
     mode = str(raw or "auto").strip().lower()
-    return mode if mode in {"auto", "on", "off"} else "auto"
+    return mode if mode in {"auto", "on", "off", "scoped"} else "auto"
 
 
 def _pi_preserve_thinking_policy(args: Any) -> str:
@@ -1918,7 +1996,6 @@ def cmd_stop_public(args: Any) -> int:
     """Stop a running MTPLX server via its health-reported pid."""
 
     from mtplx.daemon_client import (
-        DAEMON_PROBE_PORTS,
         probe_running_daemons,
         stop_daemon,
     )
@@ -2687,7 +2764,6 @@ def _cmd_tune(
     )
     model_source_notes = _tune_model_source_notes(args, runtime_model=runtime_model)
 
-    profile = get_profile("performance-cold")
     hardware: dict[str, Any] | None = None
     software: dict[str, Any] | None = None
     backend: dict[str, Any] | None = None
@@ -2711,7 +2787,7 @@ def _cmd_tune(
         ):
             hardware = _apple_hardware_context()
             software = _software_context()
-            backend = _mlx_backend_context(profile)
+            backend = _mlx_backend_context()
             state_key, key_material = _tune_state_key(
                 runtime_model,
                 settings=settings,
@@ -3223,9 +3299,6 @@ def _tune_state_key(
         },
         "backend": {
             "mlx_core_path": backend.get("mlx_core_path"),
-            "optional_fast_mlx_fork_active": backend.get(
-                "optional_fast_mlx_fork_active"
-            ),
             "stock_mlx_likely": backend.get("stock_mlx_likely"),
         },
         "settings": settings,
@@ -7189,150 +7262,6 @@ def _port_is_busy(host: str, port: int) -> bool:
         return False
 
 
-def _active_mlx_fork_status(
-    *, expected_fragment: str, expected_commit: str | None
-) -> dict[str, Any]:
-    try:
-        spec = importlib.util.find_spec("mlx.core")
-    except Exception as exc:
-        return {
-            "ok": False,
-            "error": repr(exc),
-            "expected_path_fragment": expected_fragment,
-            "expected_commit": expected_commit,
-        }
-    if spec is None or not spec.origin:
-        return {
-            "ok": False,
-            "error": "mlx.core is not installed",
-            "expected_path_fragment": expected_fragment,
-            "expected_commit": expected_commit,
-        }
-    path = Path(spec.origin).resolve()
-    try:
-        version = importlib.metadata.version("mlx")
-    except Exception:
-        version = None
-    commit = None
-    if expected_fragment in str(path):
-        for parent in [path.parent, *path.parents]:
-            if expected_fragment in parent.name or expected_fragment in str(parent):
-                try:
-                    # Bounded timeout: hung git (lock contention,
-                    # zombie pickaxe process, slow disk) must not
-                    # block daemon startup forever. Matches
-                    # `prefill_bench.py`. Hash is diagnostic only.
-                    commit = subprocess.check_output(
-                        ["git", "-C", str(parent), "rev-parse", "--short", "HEAD"],
-                        text=True,
-                        stderr=subprocess.DEVNULL,
-                        timeout=2.0,
-                    ).strip()
-                except (
-                    subprocess.SubprocessError,
-                    FileNotFoundError,
-                    OSError,
-                ):
-                    commit = None
-                break
-    path_active = expected_fragment in str(path)
-    commit_matches = expected_commit is None or commit in {None, expected_commit}
-    ok = path_active and (
-        expected_commit is None or commit in {None, expected_commit}
-    )
-    return {
-        "ok": ok,
-        "path_active": path_active,
-        "commit_matches": commit_matches,
-        "path": str(path),
-        "version": version,
-        "expected_path_fragment": expected_fragment,
-        "expected_commit": expected_commit,
-        "observed_commit": commit,
-    }
-
-
-def _env_truthy(value: str | None) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _normalize_fast_mlx_source_path(candidate: Path) -> Path | None:
-    expanded = candidate.expanduser()
-    if (expanded / "mlx").is_dir():
-        python_dir = expanded
-    elif (expanded / "python" / "mlx").is_dir():
-        python_dir = expanded / "python"
-    else:
-        return None
-    if any((python_dir / "mlx").glob("core*.so")):
-        return python_dir.resolve()
-    return None
-
-
-def _fast_mlx_source_candidates(expected_fragment: str) -> list[Path]:
-    candidates: list[Path] = []
-    explicit = os.environ.get("MTPLX_FAST_MLX_SOURCE_PATH")
-    if explicit:
-        candidates.append(Path(explicit))
-    home = Path.home()
-    for root in (
-        repo_root(),
-        home / "Documents" / "MTPLX",
-    ):
-        candidates.extend(
-            [
-                root
-                / "outputs"
-                / "mlx-source-worktrees"
-                / f"{expected_fragment}-build"
-                / "python",
-                root / "REFERENCES:TOOLS" / expected_fragment / "python",
-            ]
-        )
-    return candidates
-
-
-def _discover_fast_mlx_source_path(profile: Any) -> Path | None:
-    if _env_truthy(os.environ.get("MTPLX_DISABLE_FAST_MLX_AUTODISCOVERY")):
-        return None
-    expected_fragment = getattr(profile, "required_mlx_fork_fragment", None)
-    if not expected_fragment:
-        return None
-    expected_commit = getattr(profile, "required_mlx_fork_commit", None)
-    active = _active_mlx_fork_status(
-        expected_fragment=expected_fragment,
-        expected_commit=expected_commit,
-    )
-    if active.get("path_active"):
-        return None
-    seen: set[str] = set()
-    for candidate in _fast_mlx_source_candidates(str(expected_fragment)):
-        normalized = _normalize_fast_mlx_source_path(candidate)
-        if normalized is None:
-            continue
-        normalized_text = str(normalized)
-        if normalized_text in seen:
-            continue
-        seen.add(normalized_text)
-        if (
-            os.environ.get("MTPLX_FAST_MLX_SOURCE_PATH")
-            or str(expected_fragment) in normalized_text
-        ):
-            return normalized
-    return None
-
-
-def _prepend_pythonpath(env: dict[str, str], path: Path) -> None:
-    path_text = str(path)
-    existing = env.get("PYTHONPATH", "")
-    parts = [part for part in existing.split(os.pathsep) if part]
-    if path_text in parts:
-        return
-    env["PYTHONPATH"] = (
-        path_text if not existing else path_text + os.pathsep + existing
-    )
-
-
 def _apple_hardware_context() -> dict[str, Any]:
     mem_bytes = _sysctl_int("hw.memsize")
     chip = _sysctl_text("machdep.cpu.brand_string")
@@ -7368,19 +7297,15 @@ def _software_context() -> dict[str, Any]:
     }
 
 
-def _mlx_backend_context(profile: Any) -> dict[str, Any]:
+def _mlx_backend_context() -> dict[str, Any]:
+    # MTPLX runs on stock PyPI MLX; no profile requires an MLX fork or a
+    # patched qmm build. Report the imported runtime as a plain diagnostic.
     path = None
     try:
         spec = importlib.util.find_spec("mlx.core")
         path = str(Path(spec.origin).resolve()) if spec and spec.origin else None
     except Exception as exc:  # pragma: no cover - host dependent
         path = f"ERROR: {exc}"
-    fork_status = None
-    if getattr(profile, "required_mlx_fork_fragment", None):
-        fork_status = _active_mlx_fork_status(
-            expected_fragment=profile.required_mlx_fork_fragment,
-            expected_commit=profile.required_mlx_fork_commit,
-        )
     custom_env = {
         key: os.environ.get(key)
         for key in (
@@ -7392,14 +7317,14 @@ def _mlx_backend_context(profile: Any) -> dict[str, Any]:
         )
         if os.environ.get(key)
     }
-    fork_active = bool(fork_status and fork_status.get("ok"))
+    stock_layout = bool(
+        path and ("site-packages" in path or "dist-packages" in path)
+    )
     return {
         "mlx_core_path": path,
         "mlx_version": _package_version("mlx"),
         "mlx_lm_version": _package_version("mlx-lm"),
-        "optional_fast_mlx_fork_active": fork_active,
-        "optional_fast_mlx_fork": fork_status,
-        "stock_mlx_likely": not fork_active,
+        "stock_mlx_likely": stock_layout,
         "custom_qmv_or_qmm_env": custom_env,
     }
 
@@ -7457,7 +7382,9 @@ def _command_text(args: list[str]) -> str | None:
 
 
 def _sysctl_text(name: str) -> str | None:
-    return _command_text(["sysctl", "-n", name])
+    # Absolute path: app-owned daemons run with a sanitized PATH that lacks
+    # /usr/sbin, which silently broke every sysctl-derived hardware detection.
+    return _command_text(["/usr/sbin/sysctl", "-n", name])
 
 
 def _sysctl_int(name: str) -> int | None:
@@ -7729,6 +7656,9 @@ def _model_ref_from_public_model_id(model_id: str | None) -> str | None:
         QUALITY_PUBLIC_MODEL_ID.lower(): QUALITY_HF_MODEL_ID,
         QUALITY_HF_MODEL_ID.lower(): QUALITY_HF_MODEL_ID,
         Path(QUALITY_HF_MODEL_ID).name.lower(): QUALITY_HF_MODEL_ID,
+        QUALITY_FP16_PUBLIC_MODEL_ID.lower(): QUALITY_FP16_HF_MODEL_ID,
+        QUALITY_FP16_HF_MODEL_ID.lower(): QUALITY_FP16_HF_MODEL_ID,
+        Path(QUALITY_FP16_HF_MODEL_ID).name.lower(): QUALITY_FP16_HF_MODEL_ID,
         QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID.lower(): QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
         QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID.lower(): QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
         Path(QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID).name.lower(): QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
@@ -7799,6 +7729,9 @@ def _resolve_runtime_options_on_args(
 
 
 def cmd_serve_public(args: Any) -> int:
+    from mtplx.expert_cli import expert_streaming_requested
+
+    streaming_requested = expert_streaming_requested(args)
     dry_run = bool(getattr(args, "dry_run", False))
     quiet_json = dry_run and bool(getattr(args, "json", False))
     runtime_options_error = _resolve_runtime_options_on_args(
@@ -7857,6 +7790,10 @@ def cmd_serve_public(args: Any) -> int:
         chosen_profile = choice.get("profile")
         if chosen_profile:
             args.profile = chosen_profile
+            # A wizard pick is a user decision: record it so per-model
+            # default-profile resolution never overrides it.
+            args._cli_flags = set(getattr(args, "_cli_flags", set()) or set())
+            args._cli_flags.add("profile")
         args.max = bool(choice.get("max"))
         args.fan_mode = FAN_MODE_MAX if args.max else "default"
         args.open_browser = bool(choice.get("open_browser"))
@@ -7864,6 +7801,10 @@ def cmd_serve_public(args: Any) -> int:
     depth_error = _validate_public_depth(args, printer=_print_serve_start_line)
     if depth_error is not None:
         return depth_error
+    if streaming_requested:
+        args.no_mtp = True
+        args.load_mtp = False
+        args.generation_mode = GENERATION_MODE_AR
     generation_mode = _generation_mode_from_args(args)
     fan_mode = _fan_mode_from_args(args)
     if generation_mode == GENERATION_MODE_MTP and getattr(args, "load_mtp", True) is False:
@@ -8092,13 +8033,17 @@ def cmd_serve_public(args: Any) -> int:
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=bool(getattr(args, "yes", False)),
     )
+    if streaming_requested:
+        gate_exit = None
     if gate_exit is not None:
         _print_model_gate_error(inspection, printer=_print_serve_start_line)
         return gate_exit
-    _apply_model_contract_depth_default(args, inspection, profile)
-    _apply_backend_serve_defaults(args, inspection)
     model_id = _public_model_id_for_args(args, str(runtime_model))
     args.model_id = model_id
+    if _apply_model_default_profile(args, model_id):
+        profile = get_profile(args.profile)
+    _apply_model_contract_depth_default(args, inspection, profile)
+    _apply_backend_serve_defaults(args, inspection)
     _apply_qwen36_35b_optimized_speed_defaults(args, model_id)
     backend_descriptor = descriptor_from_inspection(inspection)
     draft_lm_head = _model_draft_lm_head_spec(inspection, profile) or {
@@ -8110,45 +8055,6 @@ def cmd_serve_public(args: Any) -> int:
     draft_sampler_override = _explicit_draft_sampler_override(args, draft_sampler)
     if draft_sampler_override is not None:
         draft_sampler = draft_sampler_override
-    strict_fast_path = bool(getattr(args, "strict_fast_path", False))
-    relax_mlx_fork_assert = False
-    if profile.required_mlx_fork_fragment and not _inspection_is_gemma4_assistant(
-        inspection
-    ):
-        fork_status = _active_mlx_fork_status(
-            expected_fragment=profile.required_mlx_fork_fragment,
-            expected_commit=profile.required_mlx_fork_commit,
-        )
-        if not fork_status.get("ok"):
-            if strict_fast_path:
-                _print_serve_start_line(
-                    "[3/6] Fast MLX fork is required but not active"
-                )
-                _print_serve_start_line(
-                    f"      Expected: {profile.required_mlx_fork_fragment}"
-                    + (
-                        f" @ {profile.required_mlx_fork_commit}"
-                        if profile.required_mlx_fork_commit
-                        else ""
-                    )
-                )
-                observed = (
-                    fork_status.get("path") or fork_status.get("error") or "unknown"
-                )
-                _print_serve_start_line(f"      Found: {observed}")
-                server_command = _server_command_name(args)
-                _print_serve_start_line(
-                    f"try: mtplx {server_command} --profile sustained"
-                )
-                _print_serve_start_line(f"try: mtplx {server_command} --profile stable")
-                _print_serve_start_line(
-                    f"try: mtplx {server_command} --profile performance-cold --max"
-                )
-                _print_serve_start_line(
-                    "     (without --strict-fast-path, MTPLX starts in stock-MLX compatibility)"
-                )
-                return 2
-            relax_mlx_fork_assert = True
     if not quiet_json:
         _print_serve_handoff(args, runtime_model, profile.name)
     cmd = [
@@ -8202,6 +8108,9 @@ def cmd_serve_public(args: Any) -> int:
         "--fan-mode",
         fan_mode,
     ]
+    from mtplx.expert_cli import append_expert_streaming_child_args
+
+    append_expert_streaming_child_args(cmd, args)
     for attr, flag in (
         ("max_active_requests", "--max-active-requests"),
         ("decode_batch_max", "--decode-batch-max"),
@@ -8236,7 +8145,7 @@ def cmd_serve_public(args: Any) -> int:
         )
     if bool(getattr(args, "experimental_mtp_cohorts", False)):
         cmd.append("--experimental-mtp-cohorts")
-    ssd_session_cache = str(getattr(args, "ssd_session_cache", "off") or "off")
+    ssd_session_cache = str(getattr(args, "ssd_session_cache", "on") or "on")
     cmd.extend(["--ssd-session-cache", ssd_session_cache])
     ssd_dir = getattr(args, "ssd_session_cache_dir", None)
     if ssd_dir:
@@ -8343,8 +8252,6 @@ def cmd_serve_public(args: Any) -> int:
         cmd.append("--stock-ar")
     elif getattr(args, "load_mtp", True) is False:
         cmd.append("--no-load-mtp")
-    if relax_mlx_fork_assert:
-        cmd.append("--no-strict-mlx-fork-assert")
     api_key_source = str(getattr(args, "api_key_source", "none") or "none")
     api_key_file = getattr(args, "api_key_file", None)
     if api_key and api_key_source == "flag":
@@ -8396,10 +8303,6 @@ def cmd_serve_public(args: Any) -> int:
         child_env_base["MTPLX_FAN_MODE"] = fan_mode
     if fan_mode == FAN_MODE_MAX:
         child_env_base["MTPLX_MAX_REQUESTED"] = "1"
-    fast_mlx_source = _discover_fast_mlx_source_path(profile)
-    if fast_mlx_source is not None:
-        _prepend_pythonpath(child_env_base, fast_mlx_source)
-        child_env_base["MTPLX_FAST_MLX_SOURCE_PATH_ACTIVE"] = str(fast_mlx_source)
     if dry_run:
         payload = _serve_dry_run_payload(
             args,
@@ -8757,17 +8660,26 @@ def _generate_one_shot_public(
     )
     if resolve_error is not None:
         return EXIT_TELEMETRY, resolve_error, []
+    from mtplx.expert_cli import expert_streaming_requested
+
+    streaming_requested = expert_streaming_requested(args)
     inspection, gate_exit = _model_gate(
         runtime_model,
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=bool(getattr(args, "yes", False)),
     )
+    if streaming_requested:
+        gate_exit = None
     if gate_exit is not None:
         return (
             gate_exit,
             {"error": "model failed MTP primary gate", "model": inspection},
             [],
         )
+    if streaming_requested:
+        args.no_mtp = True
+        args.load_mtp = False
+        args.generation_mode = GENERATION_MODE_AR
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     apply_profile_env(profile.name)
     generation_mode = _generation_mode_from_args(args)
@@ -8808,8 +8720,12 @@ def _generate_one_shot_public(
     from mtplx.runtime import load
     from mtplx.sampling import SamplerConfig
 
+    rt = None
     try:
-        rt = load(runtime_model, mtp=True)
+        from mtplx.expert_cli import expert_streaming_load_kwargs
+
+        load_kwargs = expert_streaming_load_kwargs(args, runtime_model)
+        rt = load(runtime_model, **(load_kwargs or {"mtp": True}))
         draft_report = None
         if (
             draft_lm_head is not None
@@ -8869,33 +8785,39 @@ def _generate_one_shot_public(
             smart_request_id = f"cli-{command}-{int(time.time() * 1000)}"
             smart_fans.begin_request(smart_request_id)
         try:
-            if generation_mode == GENERATION_MODE_AR:
-                out = generate_ar(
-                    rt,
-                    prompt_ids,
-                    max_tokens=max_tokens_value,
-                    sampler=sampler,
-                    seed=args.seed,
-                )
-            else:
-                out = generate_mtpk(
-                    rt,
-                    prompt_ids,
-                    max_tokens=max_tokens_value,
-                    sampler=sampler,
-                    draft_sampler=_draft_sampler_from_spec(draft_sampler),
-                    speculative_depth=args.depth,
-                    seed=args.seed,
-                    mtp_hidden_variant="post_norm",
-                    mtp_cache_policy="persistent",
-                    mtp_history_policy="committed",
-                    verify_strategy="capture_commit",
-                    verify_core="linear-gdn-from-conv-tape",
-                )
+            with _runtime_kv_admission(
+                rt, len(prompt_ids) + max_tokens_value
+            ):
+                if generation_mode == GENERATION_MODE_AR:
+                    out = generate_ar(
+                        rt,
+                        prompt_ids,
+                        max_tokens=max_tokens_value,
+                        sampler=sampler,
+                        seed=args.seed,
+                    )
+                else:
+                    out = generate_mtpk(
+                        rt,
+                        prompt_ids,
+                        max_tokens=max_tokens_value,
+                        sampler=sampler,
+                        draft_sampler=_draft_sampler_from_spec(draft_sampler),
+                        speculative_depth=args.depth,
+                        seed=args.seed,
+                        mtp_hidden_variant="post_norm",
+                        mtp_cache_policy="persistent",
+                        mtp_history_policy="committed",
+                        verify_strategy="capture_commit",
+                        verify_core="linear-gdn-from-conv-tape",
+                    )
         finally:
             if smart_fans is not None and smart_request_id is not None:
                 smart_fans.end_request(smart_request_id, wait_for_restore=True)
     finally:
+        close_runtime = getattr(rt, "close", None)
+        if callable(close_runtime):
+            close_runtime(timeout=5.0)
         if max_session is not None:
             max_session.stop()
             thermal = max_session.thermal
@@ -9655,31 +9577,32 @@ def _quickstart_generate(
             smart_fans = SmartFanController(log=_quickstart_line)
             smart_request_id = f"terminal-{turn_index}-{int(time.time() * 1000)}"
             smart_fans.begin_request(smart_request_id)
-        if generation_mode == GENERATION_MODE_AR:
-            out = generate_ar(
-                rt,
-                prompt_ids,
-                max_tokens=max_tokens_value,
-                sampler=sampler,
-                seed=seed,
-                token_callback=record_tokens,
-            )
-        else:
-            out = generate_mtpk(
-                rt,
-                prompt_ids,
-                max_tokens=max_tokens_value,
-                sampler=sampler,
-                draft_sampler=_draft_sampler_from_spec(draft_sampler),
-                speculative_depth=int(getattr(args, "depth", 3)),
-                seed=seed,
-                mtp_hidden_variant="post_norm",
-                mtp_cache_policy="persistent",
-                mtp_history_policy="committed",
-                verify_strategy="capture_commit",
-                verify_core="linear-gdn-from-conv-tape",
-                token_callback=record_tokens,
-            )
+        with _runtime_kv_admission(rt, len(prompt_ids) + max_tokens_value):
+            if generation_mode == GENERATION_MODE_AR:
+                out = generate_ar(
+                    rt,
+                    prompt_ids,
+                    max_tokens=max_tokens_value,
+                    sampler=sampler,
+                    seed=seed,
+                    token_callback=record_tokens,
+                )
+            else:
+                out = generate_mtpk(
+                    rt,
+                    prompt_ids,
+                    max_tokens=max_tokens_value,
+                    sampler=sampler,
+                    draft_sampler=_draft_sampler_from_spec(draft_sampler),
+                    speculative_depth=int(getattr(args, "depth", 3)),
+                    seed=seed,
+                    mtp_hidden_variant="post_norm",
+                    mtp_cache_policy="persistent",
+                    mtp_history_policy="committed",
+                    verify_strategy="capture_commit",
+                    verify_core="linear-gdn-from-conv-tape",
+                    token_callback=record_tokens,
+                )
     finally:
         if smart_fans is not None and smart_request_id is not None:
             smart_fans.end_request(smart_request_id, wait_for_restore=False)
@@ -9809,9 +9732,13 @@ def _batching_command_suffix(args: Any) -> str:
             parts.extend([flag, shlex.quote(str(value))])
     if bool(getattr(args, "experimental_mtp_cohorts", False)):
         parts.append("--experimental-mtp-cohorts")
-    ssd_session_cache = str(getattr(args, "ssd_session_cache", "off") or "off")
+    ssd_session_cache = str(getattr(args, "ssd_session_cache", "on") or "on")
+    # Emit the mode unconditionally, "off" included: these generated
+    # commands are re-parsed by CLIs whose own default is "on"
+    # (kvcache-v2), so omitting an explicit "off" silently re-enables
+    # the cache (issue #140 class).
+    parts.extend(["--ssd-session-cache", shlex.quote(ssd_session_cache)])
     if ssd_session_cache != "off":
-        parts.extend(["--ssd-session-cache", shlex.quote(ssd_session_cache)])
         ssd_dir = getattr(args, "ssd_session_cache_dir", None)
         if ssd_dir:
             parts.extend(["--ssd-session-cache-dir", shlex.quote(str(ssd_dir))])
@@ -9985,6 +9912,144 @@ def _hermes_dotenv(
     )
 
 
+# Issue #131: the Hermes profile config is user-editable. Regenerating it
+# from the template alone silently wiped every top-level section the app/CLI
+# does not own (memory/providers/delegation/…) and user-added child keys such
+# as model.max_tokens. The template is merged over the existing file instead:
+# app-owned keys are rewritten, everything else is preserved byte-for-byte.
+# SYNC PAIR: HermesIntegration.mergedConfigYAML in
+# apps/MTPLXApp/Sources/MTPLXAppCore/Services/HermesIntegration.swift — the
+# app and the CLI write the same file and must share merge semantics.
+
+# Children owned under a template section even when the current template does
+# not emit them — conditional lines must be able to disappear instead of
+# being resurrected as user content. The app writes model.reasoning_effort
+# only while an effort is configured, and both writers share this file.
+_HERMES_CONDITIONALLY_OWNED_CHILD_KEYS: dict[str, frozenset[str]] = {
+    "model": frozenset({"reasoning_effort"}),
+}
+
+
+def _hermes_top_level_key(line: str) -> str | None:
+    if not line or line[0] in (" ", "\t", "#", "-", "%"):
+        return None
+    head, colon, _tail = line.partition(":")
+    if not colon:
+        return None
+    key = head.strip().strip("\"'")
+    return key or None
+
+
+def _hermes_direct_child_key(line: str) -> str | None:
+    if not line.startswith("  ") or line.startswith("   "):
+        return None
+    rest = line[2:]
+    if not rest or rest[0] in (" ", "\t", "#", "-"):
+        return None
+    head, colon, _tail = rest.partition(":")
+    if not colon:
+        return None
+    key = head.strip().strip("\"'")
+    return key or None
+
+
+def _hermes_parse_top_level_blocks(
+    text: str,
+) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+    """Split YAML text into (preamble, top-level blocks, trailing lines).
+
+    Each block is {"leading": [...], "key": str, "lines": [...]} with the key
+    line and everything under it kept verbatim; comment/blank lines directly
+    above a block travel with it.
+    """
+    preamble: list[str] = []
+    blocks: list[dict[str, Any]] = []
+    pending: list[str] = []
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    for line in lines:
+        key = _hermes_top_level_key(line)
+        if key is not None:
+            blocks.append({"leading": pending, "key": key, "lines": [line]})
+            pending = []
+        elif not line or line.startswith("#"):
+            # Could belong to the current block or introduce the next one;
+            # decided when the following line arrives (or at EOF).
+            if blocks:
+                pending.append(line)
+            else:
+                preamble.append(line)
+        elif blocks:
+            # Indented content or a column-zero continuation (sequence
+            # items, flow scalars): body of the current block, together with
+            # any buffered comment/blank lines above it.
+            blocks[-1]["lines"].extend(pending)
+            pending = []
+            blocks[-1]["lines"].append(line)
+        else:
+            preamble.extend(pending)
+            pending = []
+            preamble.append(line)
+    return preamble, blocks, pending
+
+
+def _hermes_direct_child_blocks(
+    block: dict[str, Any],
+) -> list[tuple[str, list[str]]]:
+    children: list[tuple[str, list[str]]] = []
+    for line in block["lines"][1:]:
+        key = _hermes_direct_child_key(line)
+        if key is not None:
+            children.append((key, [line]))
+        elif children:
+            children[-1][1].append(line)
+    return children
+
+
+def _hermes_merged_config_yaml(existing: str | None, template: str) -> str:
+    """Merge the generated template over the existing profile config.
+
+    Template sections and their child keys are rewritten every sync; unknown
+    top-level sections, unknown child keys under owned sections, comments,
+    and blank lines are preserved byte-for-byte. Sequence-shaped owned
+    sections (toolsets) are rewritten wholly. Idempotent, so an unchanged
+    configuration produces an unchanged file and the write is skipped.
+    """
+    if existing is None or not existing.strip():
+        return template
+    _t_preamble, t_blocks, _t_trailing = _hermes_parse_top_level_blocks(template)
+    e_preamble, e_blocks, e_trailing = _hermes_parse_top_level_blocks(existing)
+    if not e_blocks:
+        return template
+    template_keys = {block["key"] for block in t_blocks}
+    out: list[str] = list(e_preamble)
+    for t_block in t_blocks:
+        e_block = next(
+            (block for block in e_blocks if block["key"] == t_block["key"]), None
+        )
+        if e_block is not None:
+            out.extend(e_block["leading"])
+        out.extend(t_block["lines"])
+        if e_block is None:
+            continue
+        owned = {key for key, _lines in _hermes_direct_child_blocks(t_block)}
+        owned |= _HERMES_CONDITIONALLY_OWNED_CHILD_KEYS.get(t_block["key"], frozenset())
+        # A template section without mapping children is sequence- or
+        # scalar-shaped; its full body is owned.
+        if not owned:
+            continue
+        for key, child_lines in _hermes_direct_child_blocks(e_block):
+            if key not in owned:
+                out.extend(child_lines)
+    for e_block in e_blocks:
+        if e_block["key"] not in template_keys:
+            out.extend(e_block["leading"])
+            out.extend(e_block["lines"])
+    out.extend(e_trailing)
+    return "\n".join(out) + "\n"
+
+
 def _write_if_changed(path: Path, text: str, *, mode: int = 0o600) -> bool:
     existing = None
     if path.exists():
@@ -10014,13 +10079,22 @@ def _sync_hermes_profile(
     config_path = profile_dir / "config.yaml"
     env_path = profile_dir / ".env"
     profile_dir.mkdir(parents=True, exist_ok=True)
+    existing_config: str | None = None
+    if config_path.exists():
+        try:
+            existing_config = config_path.read_text(encoding="utf-8")
+        except OSError:
+            existing_config = None
     config_changed = _write_if_changed(
         config_path,
-        _hermes_config_yaml(
-            model_id=model_id,
-            base_url=base_url,
-            api_key=api_key,
-            workspace_path=workspace_path,
+        _hermes_merged_config_yaml(
+            existing_config,
+            _hermes_config_yaml(
+                model_id=model_id,
+                base_url=base_url,
+                api_key=api_key,
+                workspace_path=workspace_path,
+            ),
         ),
     )
     env_changed = _write_if_changed(
@@ -10900,9 +10974,9 @@ def _with_batching_args(target: Any, source: Any) -> Any:
         ("batch_wait_ms", None),
         ("prefill_chunk_tokens", None),
         ("experimental_mtp_cohorts", False),
-        ("ssd_session_cache", "off"),
+        ("ssd_session_cache", "on"),
         ("ssd_session_cache_dir", None),
-        ("ssd_session_cache_max_size", "100GB"),
+        ("ssd_session_cache_max_size", None),
         ("ssd_session_cache_min_prefix_tokens", 512),
     ):
         setattr(target, attr, getattr(source, attr, default))
@@ -10990,14 +11064,9 @@ def _apply_hermes_memory_env_defaults(env: dict[str, str]) -> None:
         "MTPLX_SESSION_BANK_MAX_ENTRIES",
         _OPENCODE_HIGH_MEMORY_MAX_ENTRIES if high_memory else _OPENCODE_DEFAULT_MAX_ENTRIES,
     )
-    env.setdefault(
-        "MTPLX_SESSION_BANK_MAX_BYTES",
-        _OPENCODE_HIGH_MEMORY_MAX_BYTES if high_memory else "8G",
-    )
-    env.setdefault(
-        "MTPLX_SESSION_BANK_PER_SESSION_BYTES",
-        _OPENCODE_HIGH_MEMORY_PER_SESSION_BYTES if high_memory else "4G",
-    )
+    # Model-aware auto budget (see _opencode_memory_env_defaults).
+    env.setdefault("MTPLX_SESSION_BANK_MAX_BYTES", "auto")
+    env.setdefault("MTPLX_SESSION_BANK_PER_SESSION_BYTES", "auto")
     env.setdefault("MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S", "30.0")
     env.setdefault("MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS", "4096")
     env.setdefault("MTPLX_LAZY_BONUS_VERIFY", "1")
@@ -11046,7 +11115,6 @@ def _quickstart_run_openwebui(
         reasoning_effort=getattr(args, "reasoning_effort", None),
         stats_footer=False,
         strict_warmup=bool(getattr(args, "strict_warmup", False)),
-        strict_fast_path=bool(getattr(args, "strict_fast_path", False)),
         quickstart_openwebui=True,
         open_browser=True,
         open_dashboard=open_dashboard,
@@ -11099,7 +11167,6 @@ def _quickstart_run_pi(
         reasoning_effort=getattr(args, "reasoning_effort", None),
         stats_footer=False,
         strict_warmup=bool(getattr(args, "strict_warmup", False)),
-        strict_fast_path=bool(getattr(args, "strict_fast_path", False)),
         quickstart_openwebui=False,
         quickstart_pi=True,
         open_browser=False,
@@ -11175,7 +11242,6 @@ def _quickstart_run_opencode(
         chat_template_path=getattr(args, "chat_template_path", None),
         stats_footer=False,
         strict_warmup=bool(getattr(args, "strict_warmup", False)),
-        strict_fast_path=bool(getattr(args, "strict_fast_path", False)),
         quickstart_openwebui=False,
         quickstart_pi=False,
         quickstart_opencode=True,
@@ -11227,7 +11293,6 @@ def _quickstart_run_swival(
         reasoning_effort=getattr(args, "reasoning_effort", None),
         stats_footer=False,
         strict_warmup=bool(getattr(args, "strict_warmup", False)),
-        strict_fast_path=bool(getattr(args, "strict_fast_path", False)),
         quickstart_openwebui=False,
         quickstart_pi=False,
         quickstart_opencode=False,
@@ -11293,7 +11358,6 @@ def _quickstart_run_hermes(
         chat_template_path=getattr(args, "chat_template_path", None),
         stats_footer=False,
         strict_warmup=bool(getattr(args, "strict_warmup", False)),
-        strict_fast_path=bool(getattr(args, "strict_fast_path", False)),
         quickstart_openwebui=False,
         quickstart_pi=False,
         quickstart_opencode=False,
@@ -11359,7 +11423,6 @@ def _quickstart_run_dashboard(
         reasoning_effort=getattr(args, "reasoning_effort", None),
         stats_footer=False,
         strict_warmup=bool(getattr(args, "strict_warmup", False)),
-        strict_fast_path=bool(getattr(args, "strict_fast_path", False)),
         # Bypass the busy-port openwebui short-circuit; the dashboard target
         # always wants a fresh server in the foreground so the user sees
         # logs while driving load from another terminal.
@@ -11589,6 +11652,9 @@ def _quickstart_run_terminal_chat(
 def _quickstart_run_terminal_chat_body(
     args: Any, *, runtime_model: str, inspection: dict[str, Any]
 ) -> int:
+    _apply_model_default_profile(
+        args, _public_model_id_for_args(args, str(runtime_model))
+    )
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     apply_profile_env(profile.name)
     generation_mode = _generation_mode_from_args(args)
@@ -11634,7 +11700,10 @@ def _quickstart_run_terminal_chat_body(
     quiet_progress = not sys.stdout.isatty()
     with ModelLoadProgress("Loading model", quiet=quiet_progress) as progress:
         progress.set_subtitle(f"profile {profile.name}")
-        rt = load(runtime_model, mtp=True)
+        from mtplx.expert_cli import expert_streaming_load_kwargs
+
+        load_kwargs = expert_streaming_load_kwargs(args, runtime_model)
+        rt = load(runtime_model, **(load_kwargs or {"mtp": True}))
         progress.set_subtitle("ready")
     _quickstart_line(f"Model ready in {time.perf_counter() - started:.1f}s")
     _quickstart_line(f"Generation mode: {_generation_mode_label(generation_mode)}")
@@ -11808,10 +11877,9 @@ def _quickstart_apply_tuned_depth(
         "seed": TUNE_DEFAULT_SEED,
         "thinking": "disabled",
     }
-    profile = get_profile("performance-cold")
     hardware = _apple_hardware_context()
     software = _software_context()
-    backend = _mlx_backend_context(profile)
+    backend = _mlx_backend_context()
     state_key, _key_material = _tune_state_key(
         runtime_model,
         settings=settings,
@@ -11958,6 +12026,8 @@ def cmd_quickstart_public(args: Any) -> int:
             fresh=fresh,
             configured_model=configured_model,
             open_dashboard_override=explicit_open_dashboard,
+            host=str(getattr(args, "host", "127.0.0.1")),
+            port=int(getattr(args, "port", 8000)),
         )
         if choice is None:
             _quickstart_line("aborted")
@@ -11983,6 +12053,10 @@ def cmd_quickstart_public(args: Any) -> int:
         chosen_profile = choice.get("profile")
         if chosen_profile:
             args.profile = chosen_profile
+            # A wizard pick is a user decision: record it so per-model
+            # default-profile resolution never overrides it.
+            args._cli_flags = set(getattr(args, "_cli_flags", set()) or set())
+            args._cli_flags.add("profile")
         if choice.get("max"):
             args.max = True
             args.fan_mode = FAN_MODE_MAX

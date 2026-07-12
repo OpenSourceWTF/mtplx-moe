@@ -42,8 +42,6 @@ class Qwen3NextMTPBackend(MTPBackend):
             "arch_id": self.arch_id,
             "runtime_path": "mtplx.runtime + mtplx.generation",
             "performance_cold_requirements": {
-                "mlx_fork_commit": profile.required_mlx_fork_commit,
-                "mlx_fork_fragment": profile.required_mlx_fork_fragment,
                 "env": profile.env_dict(),
                 "draft_lm_head": (
                     None

@@ -1,0 +1,411 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+from mtplx.expert_streaming_models import (
+    MODEL_SPECS,
+    get_model_spec,
+    plan_expert_memory,
+)
+
+
+GIB = 1 << 30
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_hy3_q4_exact_expert_layout() -> None:
+    spec = get_model_spec("hy3-q4")
+
+    assert MODEL_SPECS["hy3-q4"] is spec
+    assert spec.total_layers == 80
+    assert spec.total_tensor_bytes == 165_988_461_824
+    assert spec.routed_layer_indices == tuple(range(1, 80))
+    assert spec.expert_count == 192
+    assert spec.top_k == 8
+    assert spec.hidden_size == 4096
+    assert spec.expert_hidden_size == 1536
+    assert spec.quant_bits == 4
+    assert spec.quant_group_size == 64
+    assert spec.quant_parameter_bytes == 2
+    assert spec.expert_record_bytes == 10_616_832
+    assert spec.routed_expert_bytes == 161_036_107_776
+    assert spec.cold_expert_bytes_per_token == 6_709_837_824
+    assert spec.transient_scratch_bytes == 84_934_656
+    assert spec.persistent_cache_bytes(0) == 0
+    assert spec.persistent_cache_bytes(8) == 6_709_837_824
+    assert spec.persistent_cache_bytes(32) == 26_839_351_296
+    assert spec.resident_bytes == 4_952_354_048
+    assert spec.routed_expert_bytes + spec.resident_bytes == spec.total_tensor_bytes
+    assert spec.router_bytes == 66_071_808
+    assert spec.router_storage == "affine-q8 with fp32 correction bias"
+    assert spec.router_matmul_dtype == "float32"
+    assert spec.source_revision == "716aa7241bd6d95896be4ebfc761162a9c4d49ef"
+    assert spec.quant_revision == "160619d3f96c8470350b6dac0ef033a8381551e3"
+    assert spec.kv_bytes_per_token == 327_680
+    assert spec.mtp_layer_index == 80
+    assert spec.mtp_included is False
+    assert spec.full_indexer_layers == ()
+
+
+def test_glm52_q4_exact_expert_and_indexshare_layout() -> None:
+    spec = get_model_spec("glm52-q4")
+
+    assert MODEL_SPECS["glm52-q4"] is spec
+    assert spec.total_layers == 78
+    assert spec.total_tensor_bytes == 418_320_895_488
+    assert spec.routed_layer_indices == tuple(range(3, 78))
+    assert spec.expert_count == 256
+    assert spec.top_k == 8
+    assert spec.hidden_size == 6144
+    assert spec.expert_hidden_size == 2048
+    assert spec.quant_bits == 4
+    assert spec.quant_group_size == 64
+    assert spec.quant_parameter_bytes == 2
+    assert spec.expert_record_bytes == 21_233_664
+    assert spec.routed_expert_bytes == 407_686_348_800
+    assert spec.cold_expert_bytes_per_token == 12_740_198_400
+    assert spec.transient_scratch_bytes == 169_869_312
+    assert spec.persistent_cache_bytes(0) == 0
+    assert spec.persistent_cache_bytes(8) == 12_740_198_400
+    assert spec.persistent_cache_bytes(32) == 50_960_793_600
+    assert spec.persistent_cache_bytes(64) == 101_921_587_200
+    assert spec.resident_bytes == 10_634_546_688
+    assert spec.routed_expert_bytes + spec.resident_bytes == spec.total_tensor_bytes
+    assert spec.router_bytes == 236_006_400
+    assert spec.router_storage == "bfloat16 with fp32 correction bias"
+    assert spec.router_matmul_dtype == "float32"
+    assert spec.source_revision == "b4734de4facf877f85769a911abafc5283eab3d9"
+    assert spec.quant_revision == "6b347a6472d46bf55de65ee34032136a3929d778"
+    assert spec.kv_bytes_per_token == 95_232
+    assert spec.mtp_layer_index == 78
+    assert spec.mtp_included is False
+    assert spec.full_indexer_layers == (0, 1, 2, *range(6, 75, 4))
+    assert len(spec.full_indexer_layers) == 21
+
+
+def test_model_registry_contains_both_q4_targets() -> None:
+    assert {"hy3-q4", "glm52-q4"} <= MODEL_SPECS.keys()
+    with pytest.raises(ValueError, match="unknown model"):
+        get_model_spec("unknown-model")
+
+
+@pytest.mark.parametrize("model_key", ["hy3-q4", "glm52-q4"])
+def test_memory_plan_turns_a_total_limit_into_whole_per_layer_slots(
+    model_key: str,
+) -> None:
+    spec = get_model_spec(model_key)
+    context_tokens = 32_768
+    runtime_reserve = 2 * GIB
+    fixed_bytes = (
+        spec.resident_bytes
+        + context_tokens * spec.kv_bytes_per_token
+        + spec.transient_scratch_bytes
+        + runtime_reserve
+    )
+    total_limit = fixed_bytes + spec.persistent_cache_bytes(20) + 12_345
+
+    plan = plan_expert_memory(
+        spec,
+        total_limit_bytes=total_limit,
+        context_tokens=context_tokens,
+        runtime_reserve_bytes=runtime_reserve,
+    )
+
+    assert plan.fits_fixed is True
+    assert plan.total_limit_bytes == total_limit
+    assert plan.context_tokens == context_tokens
+    assert plan.runtime_reserve_bytes == runtime_reserve
+    assert plan.resident_bytes == spec.resident_bytes
+    assert plan.kv_bytes == context_tokens * spec.kv_bytes_per_token
+    assert plan.transient_bytes == spec.transient_scratch_bytes
+    assert plan.persistent_budget_bytes == spec.persistent_cache_bytes(20) + 12_345
+    assert plan.slots_per_layer == 20
+    assert plan.persistent_cache_bytes == spec.persistent_cache_bytes(20)
+    assert plan.unallocated_bytes == 12_345
+    assert plan.allocated_bytes <= plan.total_limit_bytes
+
+
+def test_explicit_expert_cache_limit_caps_slots_below_available_memory() -> None:
+    spec = get_model_spec("glm52-q4")
+    per_layer_bank_slot = spec.persistent_cache_bytes(1)
+    fixed_bytes = spec.resident_bytes + spec.transient_scratch_bytes
+    total_limit = fixed_bytes + spec.persistent_cache_bytes(40)
+    expert_cache_limit = spec.persistent_cache_bytes(12) + per_layer_bank_slot - 1
+
+    plan = plan_expert_memory(
+        spec,
+        total_limit_bytes=total_limit,
+        context_tokens=0,
+        expert_cache_limit_bytes=expert_cache_limit,
+    )
+
+    assert plan.fits_fixed is True
+    assert plan.persistent_budget_bytes == expert_cache_limit
+    assert plan.slots_per_layer == 12
+    assert plan.persistent_cache_bytes == spec.persistent_cache_bytes(12)
+    assert plan.unallocated_bytes == spec.persistent_cache_bytes(28)
+
+
+def test_global_memory_plan_uses_record_granularity_not_uniform_layer_rounding() -> None:
+    spec = get_model_spec("hy3-q4")
+    expert_cache_limit = 80 * GIB
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+
+    layer_plan = plan_expert_memory(
+        spec,
+        total_limit_bytes=fixed + expert_cache_limit,
+        context_tokens=0,
+        expert_cache_limit_bytes=expert_cache_limit,
+        cache_scope="layer",
+    )
+    global_plan = plan_expert_memory(
+        spec,
+        total_limit_bytes=fixed + expert_cache_limit,
+        context_tokens=0,
+        expert_cache_limit_bytes=expert_cache_limit,
+        cache_scope="global",
+    )
+
+    assert layer_plan.persistent_slots == 79 * 102
+    assert global_plan.persistent_slots == expert_cache_limit // spec.expert_record_bytes
+    assert global_plan.persistent_slots == 8_090
+    assert global_plan.persistent_cache_bytes > layer_plan.persistent_cache_bytes
+    assert 0 <= global_plan.unallocated_bytes < spec.expert_record_bytes
+
+
+def test_memory_plan_reports_when_fixed_footprint_does_not_fit() -> None:
+    spec = get_model_spec("hy3-q4")
+    context_tokens = 65_536
+    runtime_reserve = 4 * GIB
+    fixed_bytes = (
+        spec.resident_bytes
+        + context_tokens * spec.kv_bytes_per_token
+        + spec.transient_scratch_bytes
+        + runtime_reserve
+    )
+
+    plan = plan_expert_memory(
+        spec,
+        total_limit_bytes=fixed_bytes - 1,
+        context_tokens=context_tokens,
+        runtime_reserve_bytes=runtime_reserve,
+    )
+
+    assert plan.fits_fixed is False
+    assert plan.persistent_budget_bytes == 0
+    assert plan.slots_per_layer == 0
+    assert plan.persistent_cache_bytes == 0
+    assert plan.unallocated_bytes == -1
+
+
+@pytest.mark.parametrize("model_key", ["hy3-q4", "glm52-q4"])
+def test_memory_plan_exact_fixed_one_slot_and_full_residency(model_key: str) -> None:
+    spec = get_model_spec(model_key)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+
+    fixed_only = plan_expert_memory(
+        spec,
+        total_limit_bytes=fixed,
+        context_tokens=0,
+    )
+    one_slot = plan_expert_memory(
+        spec,
+        total_limit_bytes=fixed + spec.persistent_cache_bytes(1),
+        context_tokens=0,
+    )
+    full = plan_expert_memory(
+        spec,
+        total_limit_bytes=fixed + spec.routed_expert_bytes + GIB,
+        context_tokens=0,
+    )
+
+    assert fixed_only.fits_fixed is True
+    assert fixed_only.slots_per_layer == 0
+    assert fixed_only.unallocated_bytes == 0
+    assert one_slot.slots_per_layer == 1
+    assert one_slot.unallocated_bytes == 0
+    assert full.slots_per_layer == spec.expert_count
+    assert full.persistent_budget_bytes == spec.routed_expert_bytes
+    assert full.persistent_cache_bytes == spec.routed_expert_bytes
+    assert full.unallocated_bytes == GIB
+    assert all(
+        plan.allocated_bytes <= plan.total_limit_bytes
+        for plan in (fixed_only, one_slot, full)
+    )
+
+
+def test_zero_cache_cap_and_explicit_fixed_workspaces_are_accounted() -> None:
+    spec = get_model_spec("glm52-q4")
+    transient_slots = 12
+    io_staging = 512 * 2**20
+    execution_workspace = 256 * 2**20
+    fixed = (
+        spec.resident_bytes
+        + transient_slots * spec.expert_record_bytes
+        + io_staging
+        + execution_workspace
+    )
+
+    plan = plan_expert_memory(
+        spec,
+        total_limit_bytes=fixed + 10 * GIB,
+        context_tokens=0,
+        transient_slots=transient_slots,
+        io_staging_bytes=io_staging,
+        execution_workspace_bytes=execution_workspace,
+        expert_cache_limit_bytes=0,
+    )
+
+    assert plan.transient_slots == transient_slots
+    assert plan.transient_bytes == transient_slots * spec.expert_record_bytes
+    assert plan.io_staging_bytes == io_staging
+    assert plan.execution_workspace_bytes == execution_workspace
+    assert plan.fixed_bytes == fixed
+    assert plan.persistent_budget_bytes == 0
+    assert plan.slots_per_layer == 0
+    assert plan.unallocated_bytes == 10 * GIB
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        ({"total_limit_bytes": 100.5}, TypeError),
+        ({"context_tokens": 1.5}, TypeError),
+        ({"transient_slots": 8.5}, TypeError),
+        ({"expert_cache_limit_bytes": True}, TypeError),
+        ({"transient_slots": 7}, ValueError),
+    ],
+)
+def test_memory_plan_rejects_lossy_or_undersized_inputs(
+    kwargs: dict[str, object], error: type[Exception]
+) -> None:
+    spec = get_model_spec("hy3-q4")
+    arguments: dict[str, object] = {
+        "total_limit_bytes": 128 * GIB,
+        "context_tokens": 0,
+    }
+    arguments.update(kwargs)
+
+    with pytest.raises(error):
+        plan_expert_memory(spec, **arguments)  # type: ignore[arg-type]
+
+
+def test_model_spec_rejects_float_dimensions_and_misaligned_projections() -> None:
+    spec = get_model_spec("hy3-q4")
+
+    with pytest.raises(TypeError, match="total_layers must be an integer"):
+        replace(spec, total_layers=80.0)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="projection input"):
+        replace(spec, expert_hidden_size=1537)
+
+
+def test_glm_model_key_drives_trace_simulator_geometry(tmp_path: Path) -> None:
+    trace = tmp_path / "glm-routes.jsonl"
+    trace.write_text(
+        json.dumps(
+            {
+                "phase": "decode",
+                "layer": 3,
+                "experts": list(range(8)),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "simulate_expert_cache.py"),
+            str(trace),
+            "--model",
+            "glm52-q4",
+            "--persistent-slots-per-layer",
+            "0",
+        ],
+        cwd=ROOT,
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["model_key"] == "glm52-q4"
+    assert payload["expert_misses"] == 8
+    assert payload["bytes_read"] == 8 * 21_233_664
+    assert payload["transient_scratch_bytes"] == 8 * 21_233_664
+    assert payload["allocated_layer_count"] == 75
+    assert payload["persistent_cache_scope"] == "configured_model"
+
+
+def test_memory_planner_cli_runs_from_a_clean_checkout_environment() -> None:
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "plan_expert_memory.py"),
+            "--model",
+            "glm52-q4",
+            "--memory-limit-gib",
+            "128",
+            "--context-tokens",
+            "131072",
+            "--runtime-reserve-gib",
+            "16",
+        ],
+        cwd=ROOT,
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["model"]["key"] == "glm52-q4"
+    assert payload["plan"]["persistent_slots_per_layer"] == 60
+    assert payload["plan"]["fits_fixed"] is True
+    assert payload["plan"]["context_tokens"] == 131072
+    assert payload["plan"]["transient_slots"] == 8
+    assert payload["plan"]["expert_cache_limit_bytes"] is None
+    assert payload["plan"]["fixed_bytes"] < payload["plan"]["accounted_bytes"]
+    assert payload["plan"]["accounted_bytes"] <= payload["plan"]["memory_limit_bytes"]
+
+
+def test_memory_planner_cli_returns_json_and_exit_two_for_fixed_deficit() -> None:
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "plan_expert_memory.py"),
+            "--model",
+            "glm52-q4",
+            "--memory-limit-gib",
+            "1",
+            "--context-tokens",
+            "0",
+            "--runtime-reserve-gib",
+            "0",
+        ],
+        cwd=ROOT,
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert proc.returncode == 2, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["plan"]["fits_fixed"] is False
+    assert payload["plan"]["persistent_slots_per_layer"] == 0
+    assert payload["plan"]["unallocated_bytes"] < 0

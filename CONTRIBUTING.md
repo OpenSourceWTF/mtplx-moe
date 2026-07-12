@@ -11,4 +11,25 @@ python -m build
 scripts/fresh_venv_smoke.sh
 ```
 
-Benchmarks must include hardware, model, quantization, sampler, token count, profile, fan mode, date, and commit. Do not use fan-controlled runs for product headline claims.
+## Benchmark artifacts
+
+Store raw machine-generated artifacts under
+`benchmarks/raw/<benchmark>/<run-id>/`. This tree is ignored by Git; never
+force-add files from it. Store only curated, human-readable summaries under
+`benchmarks/results/`.
+
+Run IDs must use this grammar:
+
+```text
+<benchmark>-<variant>-<YYYYMMDDTHHMMSSZ>-<short-sha>
+```
+
+Use lowercase ASCII letters, digits, and hyphens for `<benchmark>` and
+`<variant>`. The timestamp must be UTC, and `<short-sha>` must contain 7-12
+lowercase hexadecimal characters. Name repeated raw artifacts
+`base-r01.json`, `candidate-r01.json`, and `response-r01.md`, incrementing the
+two-digit repeat number together for later repeats.
+
+Benchmark summaries must include the complete reproducibility metadata listed
+in `benchmarks/results/README.md`. Do not use fan-controlled runs for product
+headline claims.

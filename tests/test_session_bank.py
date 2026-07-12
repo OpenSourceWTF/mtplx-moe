@@ -21,6 +21,12 @@ class TrimmableLiveCache:
     def state(self):
         raise RuntimeError("Paged KV cache attempted to materialize active K/V arrays")
 
+    def is_trimmable(self) -> bool:
+        # Models a real attention KV container; without this the bank's
+        # conservative recurrent detection treats it as untrimmable state and
+        # boundary-true restores fail closed.
+        return True
+
     def trim(self, n: int) -> int:
         self.trimmed.append(int(n))
         self.offset -= int(n)
@@ -183,10 +189,14 @@ def test_session_bank_live_reference_can_restore_block_prefix_boundary():
     )
 
     assert restored is not None
-    restored_cache, restored_mtp_cache, restore_mode = restored
+    restored_cache, restored_mtp_cache, restore_mode, restore_point, boundary_hidden = (
+        restored
+    )
     assert restored_cache is cache
     assert restored_mtp_cache is mtp_cache
     assert restore_mode == "reference_lease"
+    assert restore_point == 1024
+    assert boundary_hidden is None
     assert cache[0].offset == 1023
     assert mtp_cache[0].offset == 1023
     assert entry.cache_ref is None
@@ -316,9 +326,13 @@ def test_session_bank_contained_long_prompt_uses_block_prefix_not_answer_tail():
         allow_block_prefix=True,
     )
 
-    assert candidates == [(entry, 1024)]
+    # kvcache-v2: matches are token-exact (no block quantization) for entries
+    # that can restore at any offset. A contained prompt restores at its own
+    # full length; the trim + seed-forward make that state cold-identical, so
+    # the pre-v2 "back off to the last block edge" conservatism is obsolete.
+    assert candidates == [(entry, 1197)]
     assert bank.last_prefix_diagnostic is not None
-    assert bank.last_prefix_diagnostic["restore_kind"] == "block_prefix"
+    assert bank.last_prefix_diagnostic["restore_kind"] == "near_boundary"
 
 
 def test_session_bank_block_prefix_candidates_restore_large_agent_overlap():
@@ -345,7 +359,128 @@ def test_session_bank_block_prefix_candidates_restore_large_agent_overlap():
         allow_block_prefix=True,
     )
 
-    assert candidates == [(entry, 1024)]
+    # kvcache-v2 token-granularity: the agent follow-up diverges at 1050, so
+    # the candidate matches exactly there instead of backing off to 1024.
+    assert candidates == [(entry, 1050)]
     assert bank.last_prefix_diagnostic is not None
     assert bank.last_prefix_diagnostic["restore_kind"] == "block_prefix"
-    assert bank.last_prefix_diagnostic["new_prefill_tokens"] == len(followup) - 1024
+    assert bank.last_prefix_diagnostic["new_prefill_tokens"] == len(followup) - 1050
+
+
+# --- prefix-supersede (2026-07-04 multitask capacity fix) --------------------
+# One busy OpenCode conversation banked 13/16 RAM entries (20.6 of 24 GB),
+# a third of them strict prefixes of a newer entry; multitasking across
+# projects then churned every other project out of RAM. A newer entry that
+# extends an older one dominates it for every restore shape, so the bank
+# drops the contained entry at put() time.
+
+
+def test_session_bank_put_supersedes_contained_prefixes():
+    bank = SessionBank(max_entries=8, max_bytes=4096, per_session_max_bytes=2048)
+    runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+
+    short = bank.put(
+        runtime=runtime,
+        token_ids=[1, 2, 3, 4],
+        cache=[],
+        logits=None,
+        hidden=None,
+        session_id="round-1",
+        nbytes_override=64,
+    )
+    assert short is not None
+
+    longer = bank.put(
+        runtime=runtime,
+        token_ids=[1, 2, 3, 4, 5, 6],
+        cache=[],
+        logits=None,
+        hidden=None,
+        session_id="round-2",
+        nbytes_override=64,
+    )
+    assert longer is not None
+
+    assert len(bank) == 1
+    assert bank.longest_prefix([1, 2, 3, 4, 5, 6, 7]) is longer
+    assert bank.eviction_log[-1]["reason"] == "superseded_by_longer_prefix"
+    assert bank.eviction_log[-1]["prefix_len"] == 4
+
+
+def test_session_bank_put_keeps_divergent_and_policy_mismatched_entries():
+    bank = SessionBank(max_entries=8, max_bytes=4096, per_session_max_bytes=2048)
+    runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+
+    divergent = bank.put(
+        runtime=runtime,
+        token_ids=[1, 2, 9, 9],
+        cache=[],
+        logits=None,
+        hidden=None,
+        session_id="other-project",
+        nbytes_override=64,
+    )
+    policy_mismatch = bank.put(
+        runtime=runtime,
+        token_ids=[1, 2, 3],
+        cache=[],
+        logits=None,
+        hidden=None,
+        session_id="old-policy",
+        policy_fingerprint="policy-A",
+        nbytes_override=64,
+    )
+    container = bank.put(
+        runtime=runtime,
+        token_ids=[1, 2, 3, 4, 5],
+        cache=[],
+        logits=None,
+        hidden=None,
+        session_id="round-2",
+        policy_fingerprint="policy-B",
+        nbytes_override=64,
+    )
+
+    assert divergent is not None
+    assert policy_mismatch is not None
+    assert container is not None
+    # The divergent prefix is not contained; the contained entry carries a
+    # different policy fingerprint and can serve requests the container
+    # cannot. Both must survive.
+    assert len(bank) == 3
+
+
+def test_session_bank_recurrent_container_without_boundaries_does_not_supersede():
+    bank = SessionBank(max_entries=8, max_bytes=4096, per_session_max_bytes=2048)
+    runtime = RuntimeWithCaches()
+
+    class RecurrentCache:
+        state = None
+
+        def is_trimmable(self) -> bool:
+            return False
+
+    short = bank.put(
+        runtime=runtime,
+        token_ids=[1, 2, 3, 4],
+        cache=[RecurrentCache()],
+        logits=None,
+        hidden=None,
+        session_id="round-1",
+        nbytes_override=64,
+    )
+    longer = bank.put(
+        runtime=runtime,
+        token_ids=[1, 2, 3, 4, 5, 6],
+        cache=[RecurrentCache()],
+        logits=None,
+        hidden=None,
+        session_id="round-2",
+        nbytes_override=64,
+    )
+
+    assert short is not None
+    assert longer is not None
+    # A recurrent container with no interior boundaries fails closed on
+    # sub-prefix restores, so the shorter exact frontier still adds coverage.
+    assert len(bank) == 2

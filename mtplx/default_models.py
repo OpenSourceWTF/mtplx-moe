@@ -18,6 +18,8 @@ from mtplx.profiles import (
     DEFAULT_MODEL_ID,
     DEFAULT_PUBLIC_MODEL_ID,
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
+    QUALITY_FP16_HF_MODEL_ID,
+    QUALITY_FP16_PUBLIC_MODEL_ID,
     QUALITY_HF_MODEL_ID,
     QUALITY_PUBLIC_MODEL_ID,
     QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
@@ -59,6 +61,10 @@ _OPTIMIZED_SPEED_LOCAL_CANDIDATES = (
 _OPTIMIZED_QUALITY_LOCAL_CANDIDATES = (
     "~/Documents/MTPLX/hf-staging/Qwen3.6-27B-MTPLX-Optimized-Quality",
     "~/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Quality",
+)
+_OPTIMIZED_QUALITY_FP16_LOCAL_CANDIDATES = (
+    "~/Documents/MTPLX/hf-staging/Qwen3.6-27B-MTPLX-Optimized-Quality-FP16",
+    "~/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Quality-FP16",
 )
 _OPTIMIZED_35B_SPEED_LOCAL_CANDIDATES = (
     "~/Documents/MTPLX/models/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed",
@@ -171,16 +177,29 @@ def optimized_speed_model_ref() -> str:
     return local or DEFAULT_HF_MODEL_ID
 
 
-def optimized_quality_model_ref() -> str:
+def optimized_quality_model_ref(
+    *,
+    hardware: Mapping[str, Any] | None = None,
+) -> str:
     env_ref = str(os.environ.get(QUALITY_MODEL_ENV) or "").strip()
-    if env_ref:
-        if _env_ref_disabled(env_ref):
-            candidates = ()
-        else:
-            candidates = (env_ref, *_OPTIMIZED_QUALITY_LOCAL_CANDIDATES)
-    else:
-        candidates = _OPTIMIZED_QUALITY_LOCAL_CANDIDATES
-    local = _complete_local_model_ref(candidates)
+    env_disabled = _env_ref_disabled(env_ref) if env_ref else False
+    if env_ref and not env_disabled:
+        local = _complete_local_model_ref((env_ref,))
+        if local:
+            return local
+    # A quality pick on legacy (M1/M2) silicon resolves the FP16 sibling,
+    # mirroring the speed lane's precision routing (2.0.1, 2026-07-07).
+    hardware_info = dict(detect_apple_silicon() if hardware is None else hardware)
+    generation = _hardware_generation(hardware_info)
+    if generation in _LEGACY_APPLE_FP16_GENERATIONS:
+        if not env_disabled:
+            local = _complete_local_model_ref(_OPTIMIZED_QUALITY_FP16_LOCAL_CANDIDATES)
+            if local:
+                return local
+        return QUALITY_FP16_HF_MODEL_ID
+    if env_disabled:
+        return QUALITY_HF_MODEL_ID
+    local = _complete_local_model_ref(_OPTIMIZED_QUALITY_LOCAL_CANDIDATES)
     return local or QUALITY_HF_MODEL_ID
 
 
@@ -293,6 +312,8 @@ def _public_model_id_from_name(value: str) -> str | None:
         # First-party local research build of the released 35B speed
         # artifact (listed in _OPTIMIZED_35B_SPEED_LOCAL_CANDIDATES).
         return QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
+    if "qwen3.6-27b-mtplx-optimized-quality-fp16" in lowered:
+        return QUALITY_FP16_PUBLIC_MODEL_ID
     if "qwen3.6-27b-mtplx-optimized-quality" in lowered:
         return QUALITY_PUBLIC_MODEL_ID
     if "qwen3.6-27b-mtplx-optimized-speed-fp16" in lowered:

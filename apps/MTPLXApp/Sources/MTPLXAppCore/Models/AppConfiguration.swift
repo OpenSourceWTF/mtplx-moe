@@ -84,6 +84,15 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     public var temperature: Double?
     public var topP: Double?
     public var topK: Int?
+    /// One-shot guard for the 2026-07-02 legacy-sampler migration: once
+    /// true, sanitize never touches the sampler again, so a deliberate
+    /// 1.0/0.95/20 (or anything else) persists. Fresh configs start
+    /// migrated-false, run the check once, and flip it.
+    public var samplerLegacyTripleMigrated: Bool
+    /// One-shot guards for the 2026-07-03 turbo-release migrations
+    /// (legacy default profile -> "auto"; 250 ms stream cadence -> 100).
+    public var profileLegacyDefaultMigrated: Bool
+    public var streamCadenceMigrated: Bool
     /// OpenAI-style presence penalty (0 = exact no-op; Qwen recommends 0
     /// for coding). Round-trips through the daemon's live settings like
     /// temperature/topP/topK.
@@ -173,7 +182,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     public init(
         executablePath: String? = nil,
         model: String = MTPLXAppConfiguration.defaultLocalModelPath(),
-        profile: String = "sustained",
+        profile: String = "auto",
         host: String = "127.0.0.1",
         port: Int = 8000,
         generationMode: String = "mtp",
@@ -188,26 +197,29 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         experimentalMTPCohorts: Bool = false,
         ramSessionCachePolicy: String = "target-default",
         ramSessionBlockPrefixRestore: Bool = true,
-        ramSessionCacheMaxEntries: Int = 4,
-        ramSessionCacheMaxSize: String = "8G",
-        ramSessionCachePerSessionMaxSize: String = "4G",
+        ramSessionCacheMaxEntries: Int = 8,
+        ramSessionCacheMaxSize: String = "auto",
+        ramSessionCachePerSessionMaxSize: String = "auto",
         pagedKVQuantization: String = "off",
         ssdSessionCache: String = "target-default",
         ssdSessionCacheDir: String? = nil,
-        ssdSessionCacheMaxSize: String = "100GB",
+        ssdSessionCacheMaxSize: String = "auto",
         ssdSessionCacheMinPrefixTokens: Int = 512,
         contextWindow: Int? = nil,
         contextWindowModelFamily: String? = nil,
         temperature: Double? = nil,
         topP: Double? = nil,
         topK: Int? = nil,
+        samplerLegacyTripleMigrated: Bool = false,
+        profileLegacyDefaultMigrated: Bool = false,
+        streamCadenceMigrated: Bool = false,
         presencePenalty: Double? = nil,
         reasoning: String? = nil,
         reasoningEffort: String? = nil,
         liveSettingsModelFamily: String? = nil,
         apiKey: String? = nil,
         enableThermalPolling: Bool = false,
-        streamSnapshotIntervalMs: Int = 250,
+        streamSnapshotIntervalMs: Int = 100,
         performanceLock: Bool = false,
         launchDaemonOnOpen: Bool = false,
         hermesAutoApprove: Bool = true,
@@ -261,6 +273,9 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         self.temperature = temperature
         self.topP = topP
         self.topK = topK
+        self.samplerLegacyTripleMigrated = samplerLegacyTripleMigrated
+        self.profileLegacyDefaultMigrated = profileLegacyDefaultMigrated
+        self.streamCadenceMigrated = streamCadenceMigrated
         self.presencePenalty = presencePenalty
         self.reasoning = reasoning
         self.reasoningEffort = reasoningEffort
@@ -443,6 +458,9 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         case temperature
         case topP = "top_p"
         case topK = "top_k"
+        case samplerLegacyTripleMigrated = "sampler_legacy_triple_migrated"
+        case profileLegacyDefaultMigrated = "profile_legacy_default_migrated"
+        case streamCadenceMigrated = "stream_cadence_migrated"
         case presencePenalty = "presence_penalty"
         case reasoning
         case reasoningEffort = "reasoning_effort"
@@ -509,6 +527,15 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         temperature = try container.decodeIfPresent(Double.self, forKey: .temperature)
         topP = try container.decodeIfPresent(Double.self, forKey: .topP)
         topK = try container.decodeIfPresent(Int.self, forKey: .topK)
+        samplerLegacyTripleMigrated = try container.decodeIfPresent(
+            Bool.self, forKey: .samplerLegacyTripleMigrated
+        ) ?? false
+        profileLegacyDefaultMigrated = try container.decodeIfPresent(
+            Bool.self, forKey: .profileLegacyDefaultMigrated
+        ) ?? false
+        streamCadenceMigrated = try container.decodeIfPresent(
+            Bool.self, forKey: .streamCadenceMigrated
+        ) ?? false
         presencePenalty = try container.decodeIfPresent(Double.self, forKey: .presencePenalty)
         reasoning = try container.decodeIfPresent(String.self, forKey: .reasoning)
         reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
@@ -558,8 +585,14 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     /// as a daemon that is degraded on every start, so any persisted
     /// config must decode back to something launchable.
     static let engineProfiles: Set<String> = [
-        "stable", "performance-cold", "sustained", "exact", "max-diagnostic",
+        "stable", "performance-cold", "sustained", "turbo", "exact",
+        "max-diagnostic",
     ]
+
+    /// "auto" is persistable but never launchable: it means "use the
+    /// recommended profile for the selected model" and is resolved to a
+    /// concrete engine profile by the command builder before argv.
+    static let persistedProfiles: Set<String> = engineProfiles.union(["auto"])
     static let engineGenerationModes: Set<String> = ["mtp", "ar"]
 
     public static func launchableProfile(_ raw: String) -> String {
@@ -608,8 +641,49 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
             fanMode = MTPLXFanMode.max.rawValue
             pinFansAtMaxOnStart = true
         }
-        profile = Self.launchableProfile(profile)
+        // "auto" persists as-is (per-model resolution happens at launch);
+        // everything else must be engine-launchable.
+        profile = Self.persistedProfiles.contains(profileValue)
+            ? profileValue
+            : Self.launchableProfile(profile)
         generationMode = Self.launchableGenerationMode(generationMode)
+        // One-shot migration (2026-07-03, turbo release): a persisted
+        // "sustained" predating the Auto option was never a choice — it
+        // was the field's default. Migrate it to "auto" once so the
+        // recommended per-model profile (turbo for the 27Bs) applies;
+        // any profile picked after this keeps winning forever.
+        if !profileLegacyDefaultMigrated {
+            if profile == "sustained" {
+                profile = "auto"
+            }
+            profileLegacyDefaultMigrated = true
+        }
+        // One-shot migration (2026-07-03): 250 ms stream snapshots alias
+        // against 8-bit verify steps (200-300 ms late in generation) —
+        // the founder's freeze-then-vomit stutter. 100 ms is the new
+        // default; a cadence chosen after this migration sticks.
+        if !streamCadenceMigrated {
+            if streamSnapshotIntervalMs == 250 {
+                streamSnapshotIntervalMs = 100
+            }
+            streamCadenceMigrated = true
+        }
+        // Legacy sampler migration (2026-07-02): before the 27B launch
+        // family existed, its sampler fell through to the CLI default
+        // (1.0/0.95/20) and the app persisted that effective triple back
+        // to settings, which then overrode any later per-model preset.
+        // The exact untouched triple is a fingerprint of "never chosen",
+        // so it yields back to preset authority (Qwen3.6 thinking spec
+        // is 0.6/0.95/20 — founder-confirmed). Any other combination is
+        // treated as a deliberate user choice and preserved.
+        if !samplerLegacyTripleMigrated {
+            if temperature == 1.0, topP == 0.95, topK == 20 {
+                temperature = nil
+                topP = nil
+                topK = nil
+            }
+            samplerLegacyTripleMigrated = true
+        }
     }
 
     public mutating func applySchedulingPreset(_ raw: String) {

@@ -139,6 +139,7 @@ def apply_penalties(
     token_counts: Mapping[int, int] | None,
     presence_penalty: float = 0.0,
     frequency_penalty: float = 0.0,
+    penalty_overlay: Mapping[int, float] | None = None,
 ) -> np.ndarray:
     """Subtract OpenAI-style additive presence/frequency penalties on raw logits.
 
@@ -150,18 +151,33 @@ def apply_penalties(
     caller scopes this to output tokens; the prompt is excluded). Penalties are
     clamped to ``[-2, 2]``.
 
+    ``penalty_overlay`` is an additional sparse token->positive-subtraction map
+    (the Loop Guard's DRY-style steering); unlike the count penalties it is not
+    clamped — the caller caps it.
+
     Returns ``logits`` unchanged (same object, no copy) when both penalties are
-    0 or there are no counts — the exactness-preserving no-op path.
+    0/no counts and there is no overlay — the exactness-preserving no-op path.
     """
     presence = float(np.clip(presence_penalty, PENALTY_MIN, PENALTY_MAX))
     frequency = float(np.clip(frequency_penalty, PENALTY_MIN, PENALTY_MAX))
-    if (presence == 0.0 and frequency == 0.0) or not token_counts:
+    counts_active = bool(token_counts) and (presence != 0.0 or frequency != 0.0)
+    overlay_active = bool(penalty_overlay)
+    if not counts_active and not overlay_active:
         return logits
     out = np.array(logits, dtype=np.float64, copy=True)
-    ids = np.fromiter(token_counts.keys(), dtype=np.int64, count=len(token_counts))
-    counts = np.fromiter(token_counts.values(), dtype=np.float64, count=len(token_counts))
-    # Sparse scatter-subtract over only the seen tokens: O(unique_seen), not O(vocab).
-    out[ids] -= frequency * counts + presence * (counts > 0)
+    if counts_active:
+        ids = np.fromiter(token_counts.keys(), dtype=np.int64, count=len(token_counts))
+        counts = np.fromiter(token_counts.values(), dtype=np.float64, count=len(token_counts))
+        # Sparse scatter-subtract over only the seen tokens: O(unique_seen), not O(vocab).
+        out[ids] -= frequency * counts + presence * (counts > 0)
+    if overlay_active:
+        overlay_ids = np.fromiter(
+            penalty_overlay.keys(), dtype=np.int64, count=len(penalty_overlay)
+        )
+        overlay_vals = np.fromiter(
+            penalty_overlay.values(), dtype=np.float64, count=len(penalty_overlay)
+        )
+        out[overlay_ids] -= overlay_vals
     return out
 
 
@@ -170,9 +186,14 @@ def distribution_from_logits(
     config: SamplerConfig,
     *,
     token_counts: Mapping[int, int] | None = None,
+    penalty_overlay: Mapping[int, float] | None = None,
 ) -> np.ndarray:
     logits = apply_penalties(
-        logits, token_counts, config.presence_penalty, config.frequency_penalty
+        logits,
+        token_counts,
+        config.presence_penalty,
+        config.frequency_penalty,
+        penalty_overlay=penalty_overlay,
     )
     probs = softmax(logits, temperature=config.temperature)
     return apply_top_p_top_k(probs, top_p=config.top_p, top_k=config.top_k)

@@ -18,8 +18,43 @@ from typing import Any, Callable
 import mlx.core as mx
 import numpy as np
 
-from .cache_state import CacheSnapshot, _clone_tree, restore_cache, snapshot_cache
+from .cache_state import (
+    CacheSnapshot,
+    _clone_tree,
+    _is_trimmable,
+    restore_cache,
+    snapshot_cache,
+    snapshot_cache_lazy_hybrid,
+)
 from .runtime import MTPLXRuntime
+
+
+def _lazy_snapshot_enabled() -> bool:
+    """Zero-copy KV snapshots at commit (kvcache-v2). Off-switch only."""
+    raw = str(os.environ.get("MTPLX_SESSION_LAZY_SNAPSHOT", "1")).strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _near_prefix_tiny_gap_limit() -> int:
+    """Token gap treated as tokenizer-boundary drift (long-shipped tolerance)."""
+    raw = os.environ.get("MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP")
+    try:
+        return max(0, int(str(raw).strip())) if raw is not None else 8
+    except (TypeError, ValueError):
+        return 8
+
+
+def _boundary_true_restore_enabled() -> bool:
+    """Fail-closed recurrent-boundary restores (kvcache-v2). Off-switch only.
+
+    When ON, a sub-prefix restore of an entry whose model carries recurrent
+    (non-trimmable) state requires a stored recurrent boundary at or below the
+    match point; without one the entry is skipped instead of silently reusing
+    recurrent state from a later boundary (the pre-v2 behavior that Desktop QA
+    observed "degrading the visible answer").
+    """
+    raw = str(os.environ.get("MTPLX_SESSION_BOUNDARY_TRUE_RESTORE", "1")).strip().lower()
+    return raw not in {"0", "false", "off", "no"}
 
 GIB = 1024**3
 DEFAULT_MAX_ENTRIES = 8
@@ -138,10 +173,54 @@ class SessionBankEntry:
     mtp_snapshot_epoch: int | None = None
     eviction_reason: str | None = None
     extra_state: dict[str, Any] | None = None
+    # kvcache-v2: KV states held as zero-copy lazy views (recurrent still
+    # cloned). Restores install views as-is instead of re-cloning.
+    lazy_kv: bool = False
+    # kvcache-v2: whether the source cache carried non-trimmable (recurrent)
+    # entries — recorded at put() time from the live cache, because only the
+    # producer knows the container classes.
+    has_recurrent: bool = False
+    # kvcache-v2: (token_count, recurrent-only CacheSnapshot, hidden_last)
+    # captured at interior prefill boundaries, sorted ascending. Enables exact
+    # sub-prefix restores on hybrid (GDN/conv) models: trim KV to boundary
+    # b <= match, install recurrent state at b, re-prefill (b, prompt_end].
+    # hidden_last (base hidden of token b-1, may be None) lets committed MTP
+    # history resume at b without a seed re-forward — re-running token b-1
+    # would advance recurrent state twice and break exactness.
+    gdn_boundaries: list[tuple[int, CacheSnapshot, Any]] = field(default_factory=list)
+    # kvcache-v2: SSD-restored entries defer boundary decode (exact restores
+    # never need them); the loader fills gdn_boundaries on first partial use.
+    gdn_boundary_loader: Any = None
 
     @property
     def prefix_len(self) -> int:
         return len(self.token_ids)
+
+    def _ensure_boundaries_loaded(self) -> None:
+        if self.gdn_boundaries or self.gdn_boundary_loader is None:
+            return
+        loader, self.gdn_boundary_loader = self.gdn_boundary_loader, None
+        try:
+            self.gdn_boundaries = [
+                (int(r[0]), r[1], r[2] if len(r) > 2 else None) for r in loader() or ()
+            ]
+        except Exception:
+            # Fail closed: a missing/corrupt boundary payload just means the
+            # partial-restore path declines, exactly as if none were stored.
+            self.gdn_boundaries = []
+
+    def recurrent_boundary_at_or_below(
+        self, matched: int
+    ) -> tuple[int, CacheSnapshot, Any] | None:
+        """Newest stored recurrent boundary b <= matched, if any."""
+        self._ensure_boundaries_loaded()
+        best: tuple[int, CacheSnapshot, Any] | None = None
+        for record in self.gdn_boundaries:
+            boundary, snapshot = int(record[0]), record[1]
+            hidden = record[2] if len(record) > 2 else None
+            if boundary <= int(matched) and (best is None or boundary > best[0]):
+                best = (boundary, snapshot, hidden)
+        return best
 
 
 def _empty_cache_snapshot(cache: list[Any] | None) -> CacheSnapshot:
@@ -153,6 +232,31 @@ def _trim_cache_ref_to_prefix(cache: list[Any] | None, prefix_len: int) -> bool:
     if cache is None:
         return False
     target_offset = max(0, int(prefix_len) - 1)
+    for entry in cache:
+        current = int(getattr(entry, "offset", target_offset) or 0)
+        if current < target_offset:
+            return False
+        delta = current - target_offset
+        if delta <= 0:
+            continue
+        trim = getattr(entry, "trim", None)
+        if not callable(trim):
+            return False
+        if int(trim(delta)) != delta:
+            return False
+    return True
+
+
+def _trim_cache_ref_to_tokens(cache: list[Any] | None, tokens: int) -> bool:
+    """Trim offset-bearing entries to exactly `tokens` consumed tokens.
+
+    Unlike `_trim_cache_ref_to_prefix` (which leaves one slot for a seed
+    re-forward of the final prefix token), this lands the cache at the full
+    boundary — used by boundary-true restores where no seed forward runs.
+    """
+    if cache is None:
+        return False
+    target_offset = max(0, int(tokens))
     for entry in cache:
         current = int(getattr(entry, "offset", target_offset) or 0)
         if current < target_offset:
@@ -263,6 +367,7 @@ class SessionBank:
         mtp_snapshot_epoch: int | None = None,
         nbytes_override: int | None = None,
         extra_state: dict[str, Any] | None = None,
+        gdn_boundaries: list[tuple[int, CacheSnapshot]] | None = None,
     ) -> SessionBankEntry | None:
         tokens = tuple(int(token) for token in token_ids)
         if not tokens:
@@ -271,6 +376,29 @@ class SessionBank:
             raise ValueError("trunk and MTP snapshots must share the same commit boundary")
         self.last_put_nbytes = 0
         self.last_put_skipped_oversized_snapshot = False
+        cache_has_recurrent = any(not _is_trimmable(entry) for entry in (cache or []))
+        normalized_boundaries = sorted(
+            (
+                (int(r[0]), r[1], r[2] if len(r) > 2 else None)
+                for r in (gdn_boundaries or [])
+                if int(r[0]) > 0
+            ),
+            key=lambda item: item[0],
+        )
+        if not normalized_boundaries:
+            # Same-key replacement must not lose interior boundaries: the idle
+            # postcommit re-put of a prompt-boundary entry (which restores
+            # instead of re-prefilling, so it captures none) would otherwise
+            # strip the store-on-prefill entry's boundaries and push the next
+            # RAG-shape turn to a fail-closed cold prefill (found 2026-07-03).
+            # Boundaries describe the token prefix, so an identical key keeps
+            # them valid.
+            prior = self._entries.get(tokens)
+            if prior is not None and prior.gdn_boundaries:
+                normalized_boundaries = list(prior.gdn_boundaries)
+            inherited_loader = (
+                getattr(prior, "gdn_boundary_loader", None) if prior is not None else None
+            )
         def live_ref_entry(reason: str, nbytes: int) -> SessionBankEntry | None:
             if not keep_live_ref or not cache:
                 return None
@@ -304,6 +432,8 @@ class SessionBank:
                     )
                 ),
                 extra_state=_clone_tree(extra_state),
+                has_recurrent=cache_has_recurrent,
+                gdn_boundaries=list(normalized_boundaries),
             )
             self.eviction_log.append(
                 {
@@ -317,6 +447,7 @@ class SessionBank:
                 }
             )
             self._entries[tokens] = entry
+            self._supersede_contained_prefixes(tokens)
             self._evict_if_needed(protected_tokens=tokens)
             return entry
 
@@ -340,8 +471,11 @@ class SessionBank:
                 }
             )
             return None
+        lazy_kv = _lazy_snapshot_enabled()
         try:
-            snapshot = snapshot_cache(cache)
+            snapshot = (
+                snapshot_cache_lazy_hybrid(cache) if lazy_kv else snapshot_cache(cache)
+            )
         except RuntimeError as exc:
             if "materialize active K/V arrays" not in str(exc):
                 raise
@@ -369,6 +503,10 @@ class SessionBank:
             + _tree_nbytes(logits)
             + _tree_nbytes(hidden)
             + _tree_nbytes(mtp_history_snapshot)
+            + sum(
+                _snapshot_nbytes(r[1]) + _tree_nbytes(r[2])
+                for r in normalized_boundaries
+            )
         )
         entry_nbytes = int(nbytes_override if nbytes_override is not None else computed_nbytes)
         self.last_put_nbytes = int(entry_nbytes)
@@ -416,9 +554,16 @@ class SessionBank:
                 else (int(snapshot_epoch) if mtp_history_snapshot is not None else None)
             ),
             extra_state=_clone_tree(extra_state),
+            lazy_kv=lazy_kv,
+            has_recurrent=cache_has_recurrent,
+            gdn_boundaries=list(normalized_boundaries),
+            gdn_boundary_loader=(
+                inherited_loader if not normalized_boundaries else None
+            ),
         )
         self._enqueue_cold_entry(entry)
         self._entries[tokens] = entry
+        self._supersede_contained_prefixes(tokens)
         self._evict_if_needed(protected_tokens=tokens)
         return entry
 
@@ -501,6 +646,7 @@ class SessionBank:
         )
         self._enqueue_cold_entry(entry)
         self._entries[tokens] = entry
+        self._supersede_contained_prefixes(tokens)
         self._evict_if_needed(protected_tokens=tokens)
         return entry
 
@@ -597,13 +743,24 @@ class SessionBank:
 
             if not allow_block_prefix:
                 continue
-            if safe_block < block_min_match:
+            # kvcache-v2 token-granularity: entries that can restore exactly at
+            # any offset (pure-attention models) or that carry interior
+            # recurrent boundaries no longer quantize the match to block edges
+            # — KV trims to any token and the boundary-true restore picks the
+            # actual recurrent-safe point. Legacy hybrid entries without
+            # boundaries keep the block-aligned value (restore fails closed on
+            # them when boundary-true is on).
+            exact_capable = (not entry.has_recurrent) or bool(
+                entry.gdn_boundaries or getattr(entry, "gdn_boundary_loader", None)
+            )
+            candidate_len = matched if exact_capable else safe_block
+            if candidate_len < block_min_match:
                 continue
-            if safe_block < 2:
+            if candidate_len < 2:
                 continue
-            if safe_block > matched:
+            if candidate_len > matched:
                 continue
-            matches.append((entry, safe_block))
+            matches.append((entry, candidate_len))
 
         cold_match = self._cold_near_prefix_candidate(
             tokens,
@@ -709,6 +866,12 @@ class SessionBank:
         entry = SessionBankEntry(
             token_ids=tuple(int(token) for token in record.token_ids),
             token_hash=metadata.get("token_hash") or token_prefix_hash(record.token_ids),
+            has_recurrent=bool(
+                getattr(record, "has_recurrent", False)
+                or metadata.get("has_recurrent", False)
+            ),
+            gdn_boundaries=list(getattr(record, "gdn_boundaries", None) or []),
+            gdn_boundary_loader=getattr(record, "gdn_boundary_loader", None),
             model_path=str(metadata.get("model_path") or model_path),
             mtp_enabled=bool(metadata.get("mtp_enabled", mtp_enabled)),
             hidden_variant=metadata.get("hidden_variant"),
@@ -827,6 +990,7 @@ class SessionBank:
                 cache,
                 entry.cache_snapshot,
                 restore_meta_state=cache_factory is None,
+                clone_states=not entry.lazy_kv,
             )
         mtp_history_cache = None
         if mode == "reference" and entry.mtp_history_cache_ref is not None:
@@ -901,12 +1065,54 @@ class SessionBank:
         if matched < 1 or matched > int(entry.prefix_len):
             return None
 
+        # kvcache-v2 boundary-true restore: on hybrid models a sub-prefix
+        # restore must land on a token where the recurrent state is *known*,
+        # not merely where the KV can trim. Restoring KV to `matched` while
+        # recurrent state stays at the stored end silently degrades answers
+        # (Desktop QA, pre-v2). Tiny gaps (<= near-prefix gap limit) keep the
+        # long-shipped tokenizer-drift tolerance; anything larger requires a
+        # stored boundary <= matched and restores there instead, with the
+        # caller re-prefilling (boundary, prompt_end].
+        restore_point = matched
+        boundary_snapshot: CacheSnapshot | None = None
+        boundary_hidden: Any | None = None
+        gap_from_entry = int(entry.prefix_len) - matched
+        needs_boundary = (
+            bool(entry.has_recurrent)
+            and gap_from_entry > _near_prefix_tiny_gap_limit()
+        )
+        if needs_boundary:
+            boundary = entry.recurrent_boundary_at_or_below(matched)
+            if boundary is None:
+                if _boundary_true_restore_enabled():
+                    self.last_miss_reason = (
+                        CacheMissReason.NO_SNAPSHOT_COVERAGE.value
+                    )
+                    return None
+                # Legacy escape hatch (env off-switch): pre-v2 behavior.
+            else:
+                restore_point, boundary_snapshot, boundary_hidden = boundary
+                if restore_point < 1:
+                    self.last_miss_reason = (
+                        CacheMissReason.NO_SNAPSHOT_COVERAGE.value
+                    )
+                    return None
+
         actual_restore_mode = "clone"
-        mtp_history_trim_tokens = max(0, int(entry.prefix_len) - matched)
+        mtp_history_trim_tokens = max(0, int(entry.prefix_len) - restore_point)
+        # Boundary restores land the KV at the full boundary (no seed forward
+        # will run — it would advance recurrent state past the captured
+        # boundary a second time). Non-boundary restores keep the seed-forward
+        # slot semantics.
+        trim_to_target = (
+            (lambda c: _trim_cache_ref_to_tokens(c, restore_point))
+            if boundary_snapshot is not None
+            else (lambda c: _trim_cache_ref_to_prefix(c, restore_point))
+        )
         if mode == "reference" and entry.cache_ref is not None:
             cache = entry.cache_ref
             entry.cache_ref = None
-            if not _trim_cache_ref_to_prefix(cache, matched):
+            if not trim_to_target(cache):
                 self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
                 return None
             actual_restore_mode = "reference_lease"
@@ -919,10 +1125,15 @@ class SessionBank:
                 cache,
                 entry.cache_snapshot,
                 restore_meta_state=cache_factory is None,
+                clone_states=not entry.lazy_kv,
             )
-            if not _trim_cache_ref_to_prefix(cache, matched):
+            if not trim_to_target(cache):
                 self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
                 return None
+        if boundary_snapshot is not None:
+            # Overwrite recurrent (non-trimmable) states with the interior
+            # boundary capture; trimmable entries are None in these snapshots.
+            restore_cache(cache, boundary_snapshot, restore_meta_state=False)
 
         mtp_history_cache = None
         if mode == "reference" and entry.mtp_history_cache_ref is not None:
@@ -951,7 +1162,13 @@ class SessionBank:
             self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
             return None
 
-        return cache, mtp_history_cache, actual_restore_mode
+        return (
+            cache,
+            mtp_history_cache,
+            actual_restore_mode,
+            restore_point,
+            boundary_hidden if boundary_snapshot is not None else None,
+        )
 
     def clear(self, *, session_id: str | None = None) -> int:
         if session_id is None:
@@ -1021,6 +1238,12 @@ class SessionBank:
                     "live_ref_only": bool(entry.live_ref_only),
                     "snapshot_epoch": entry.snapshot_epoch,
                     "mtp_snapshot_epoch": entry.mtp_snapshot_epoch,
+                    "lazy_kv": bool(getattr(entry, "lazy_kv", False)),
+                    "has_recurrent": bool(getattr(entry, "has_recurrent", False)),
+                    "gdn_boundaries": [
+                        int(record[0])
+                        for record in (getattr(entry, "gdn_boundaries", None) or [])
+                    ],
                 }
                 for entry in sorted(self._entries.values(), key=lambda item: item.prefix_len)
             ],
@@ -1103,6 +1326,12 @@ class SessionBank:
         entry = SessionBankEntry(
             token_ids=tuple(int(token) for token in record.token_ids),
             token_hash=metadata.get("token_hash") or token_prefix_hash(record.token_ids),
+            has_recurrent=bool(
+                getattr(record, "has_recurrent", False)
+                or metadata.get("has_recurrent", False)
+            ),
+            gdn_boundaries=list(getattr(record, "gdn_boundaries", None) or []),
+            gdn_boundary_loader=getattr(record, "gdn_boundary_loader", None),
             model_path=str(metadata.get("model_path") or runtime.model_path),
             mtp_enabled=bool(metadata.get("mtp_enabled", runtime.mtp_enabled)),
             hidden_variant=metadata.get("hidden_variant"),
@@ -1189,6 +1418,53 @@ class SessionBank:
             for entry in self._entries.values()
             if entry.session_id == session_id
         )
+
+    def _supersede_contained_prefixes(self, tokens: tuple[int, ...]) -> None:
+        """Evict RAM entries that are strict token-prefixes of a new entry.
+
+        Agent sessions bank one entry per round, and each round's canonical
+        transcript strictly extends the last — measured 2026-07-04: a single
+        OpenCode conversation held 13/16 RAM slots (20.6 of 24 GB), a third of
+        them strict prefixes of a newer entry. Multitasking across projects
+        then churned every other project out of RAM ("sometimes I see a long
+        prefill"). A container entry dominates its contained prefixes for
+        every restore shape (exact hits trim; boundary-true restores pick a
+        boundary <= the matched point), so the contained entries are pure
+        redundancy — but only when the restore-compat identity (model,
+        template, policy fingerprint, MTP policy, draft head, hidden variant)
+        matches; a differing fingerprint can serve requests the container
+        cannot. The SSD cold tier is untouched: superseded prefixes remain
+        restorable from disk.
+        """
+        container = self._entries.get(tokens)
+        if container is None:
+            return
+        if container.live_ref_only:
+            # A live-reference lease is consumed by its first restore; it
+            # cannot stand in for durable snapshot entries.
+            return
+        if container.has_recurrent and not (
+            container.gdn_boundaries or container.gdn_boundary_loader is not None
+        ):
+            # Without recurrent boundaries the container cannot serve
+            # sub-prefix restores, so contained entries still add coverage.
+            return
+        victims = [
+            entry
+            for key, entry in self._entries.items()
+            if key != tokens
+            and entry.prefix_len < len(tokens)
+            and tokens[: entry.prefix_len] == entry.token_ids
+            and entry.cache_ref is None
+            and entry.model_path == container.model_path
+            and entry.template_hash == container.template_hash
+            and entry.policy_fingerprint == container.policy_fingerprint
+            and entry.mtp_history_policy == container.mtp_history_policy
+            and entry.draft_head_identity == container.draft_head_identity
+            and entry.hidden_variant == container.hidden_variant
+        ]
+        for entry in victims:
+            self._evict_entry(entry, reason="superseded_by_longer_prefix")
 
     def _evict_if_needed(self, *, protected_tokens: tuple[int, ...] | None = None) -> None:
         while True:

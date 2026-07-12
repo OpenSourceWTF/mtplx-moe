@@ -19,6 +19,7 @@ dist/
 
 # Model weights and generated artifacts
 /models/
+/benchmarks/raw/
 outputs/
 qa_runs/
 runs/

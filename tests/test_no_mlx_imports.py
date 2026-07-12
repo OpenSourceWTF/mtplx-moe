@@ -299,6 +299,7 @@ def test_profiles_without_mlx(tmp_path: Path) -> None:
         "stable",
         "performance-cold",
         "sustained",
+        "turbo",
         "exact",
         "max-diagnostic",
     ]

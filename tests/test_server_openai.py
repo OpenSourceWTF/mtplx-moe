@@ -237,8 +237,11 @@ def test_server_parser_applies_gemma4_pair_defaults(tmp_path):
     assert args.top_k == 64
     assert args.draft_top_p == 0.95
     assert args.draft_top_k == 64
-    assert args.depth == 6
-    assert args.draft_block_size == 6
+    # kvcache-v2 2026-07-03: Gemma4 default draft depth capped at 2 —
+    # long-form acceptance collapses by depth, making 5-6 EV-negative
+    # (+26%/+8% decode in A/Bs; MTPLX_GEMMA4_DEFAULT_DEPTH overrides).
+    assert args.depth == 2
+    assert args.draft_block_size == 2
     assert args.reasoning_parser == "gemma4"
     assert args.chat_template_profile == "tokenizer"
     assert args.reasoning == "auto"
@@ -523,15 +526,25 @@ def test_ar_batch_keeps_tool_history_turns_in_fair_lane():
     )
 
 
-def test_ar_batch_keeps_generic_openai_on_solo_mtp():
-    assert openai._ar_batch_history_bypass_reason(
-        {
-            "request_message_count": 2,
-            "request_message_roles": ["system", "user"],
-            "request_tool_count": 0,
-            "request_client_label": "openai",
-        }
-    ) == "generic_openai_solo_mtp"
+def test_ar_batch_admits_generic_openai_clients():
+    """Generic API clients ride the concurrency-adaptive lane.
+
+    A lone request still keeps solo MTP (the in-flight check in
+    ``_ar_batch_mtp_fallback_reason`` only diverts under real concurrency),
+    but anonymous clients are no longer force-serialized behind the queue.
+    """
+
+    assert (
+        openai._ar_batch_history_bypass_reason(
+            {
+                "request_message_count": 2,
+                "request_message_roles": ["system", "user"],
+                "request_tool_count": 0,
+                "request_client_label": "openai",
+            }
+        )
+        is None
+    )
 
 
 def test_ar_batch_strips_nonmergeable_history_caches():
@@ -682,6 +695,14 @@ def test_implicit_session_live_refs_have_diagnostic_override(monkeypatch):
         )
         is True
     )
+
+
+def test_expert_streaming_disables_unmetered_session_live_refs():
+    regular = SimpleNamespace(expert_streaming=None)
+    streamed = SimpleNamespace(expert_streaming=object())
+
+    assert openai._expert_streaming_allows_session_live_refs(regular) is True
+    assert openai._expert_streaming_allows_session_live_refs(streamed) is False
 
 
 def test_opencode_tool_history_live_frontier_is_app_opt_in(monkeypatch):
@@ -986,7 +1007,7 @@ def _fake_state(*, api_key: str | None = None, rate_limit: int = 0):
         profile_env_status={},
         mlx_cache_limit_status={"configured": False},
         metal_memory_caps={"applied": False, "reason": "test"},
-        mlx_fork_status={"ok": False},
+        mlx_runtime_status={"ok": True, "stock_pypi_layout": True},
         warmup_status={"enabled": False, "ran": False, "tokens": 0},
         last_metrics=[{"tok_s": 12.5, "accept_rate": 0.75}],
         rate_limiter=_RateLimiter(rate_limit),
@@ -1508,7 +1529,7 @@ def test_openai_server_health_metrics_and_models_fake_state():
     assert (
         health.json()["startup"]["tool_contract_policy_version"]
         == "soft_schema_contract:native_xml:targeted_reads:"
-        "post_tool_continue:agent_tail:v11"
+        "post_tool_continue:agent_tail:dated:v12"
     )
     assert health.json()["thermal"]["max_requested"] is False
     assert health.json()["foreground_active"] == 0
@@ -3397,6 +3418,57 @@ def test_chat_tools_report_filtered_task_names_for_direct_project_work(monkeypat
 
 
 def test_chat_tools_report_no_edit_mutating_tools_hidden(monkeypatch):
+    """Generic clients (no coding-agent hint) keep the content-heuristic
+    lockdown. OpenCode clients are exempt — see the pass-through test below:
+    they curate the toolset per agent mode themselves, and bridge-side hiding
+    both broke banked-prefix bytes and starved build mode of write/edit
+    (2026-07-04)."""
+    seen: dict[str, object] = {}
+    state = _fake_state()
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = True
+    client = TestClient(create_app(state))
+
+    def fake_run_generation(*_args, **kwargs):
+        seen["request_observability"] = dict(kwargs["request_observability"])
+        return _fake_generation("ok")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Do not edit files. Run pwd, then read package.json and "
+                        "answer with the scripts."
+                    ),
+                }
+            ],
+            "tools": [
+                _bash_tool_schema(),
+                _write_tool_schema(),
+                _named_tool_schema("read"),
+                _named_tool_schema("edit"),
+                _todowrite_tool_schema(),
+            ],
+            "tool_choice": "auto",
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 200
+    stats = seen["request_observability"]
+    assert stats["request_tool_names"] == ["bash", "write", "read", "edit", "todowrite"]
+    assert stats["request_filtered_tool_names"] == ["bash", "read"]
+    assert stats["request_hidden_tool_names"] == ["write", "edit", "todowrite"]
+    assert stats["request_tools_hidden_by_bridge"] is True
+
+
+def test_chat_tools_opencode_client_toolset_passes_through(monkeypatch):
     seen: dict[str, object] = {}
     state = _fake_state()
     state.runtime.tokenizer = CaptureTokenizer()
@@ -3435,13 +3507,16 @@ def test_chat_tools_report_no_edit_mutating_tools_hidden(monkeypatch):
     )
 
     assert response.status_code == 200
-    _messages, kwargs = state.runtime.tokenizer.calls[0]
-    assert "tools" not in kwargs
     stats = seen["request_observability"]
-    assert stats["request_tool_names"] == ["bash", "write", "read", "edit", "todowrite"]
-    assert stats["request_filtered_tool_names"] == ["bash", "read"]
-    assert stats["request_hidden_tool_names"] == ["write", "edit", "todowrite"]
-    assert stats["request_tools_hidden_by_bridge"] is True
+    assert stats["request_filtered_tool_names"] == [
+        "bash",
+        "write",
+        "read",
+        "edit",
+        "todowrite",
+    ]
+    assert stats["request_hidden_tool_names"] == []
+    assert stats["request_tools_hidden_by_bridge"] is False
     assert stats["tool_prompt_mode"] == "compact"
 
 
@@ -6641,6 +6716,100 @@ def test_read_only_force_answer_contract_allows_requested_lists():
     assert "The only valid next assistant turn is the final" in user_instruction
 
 
+def test_filter_tool_specs_passes_through_when_client_manages_tools():
+    """OpenCode curates its toolset per agent mode (plan/build) and enforces
+    permissions client-side; the bridge must not content-filter it. Hiding
+    write/edit on the build turn (triggered by plan-mode reminder wording in
+    history) made the model re-plan files it could not create until it looped,
+    and every filter flip rewrote the tool digest bytes and broke banked-prefix
+    reuse (2026-07-04 chess-project repro)."""
+    tools = [
+        _bash_tool_schema(),
+        _write_tool_schema(),
+        _named_tool_schema("edit"),
+        _named_tool_schema("read"),
+        _named_tool_schema("glob"),
+        _named_tool_schema("grep"),
+        _task_tool_schema(),
+        _todowrite_tool_schema(),
+    ]
+    plan_reminder = (
+        "1. no\n2. yes\n"
+        "<system-reminder>\n# Plan Mode - System Reminder\n\n"
+        "CRITICAL: Plan mode ACTIVE - you are in READ-ONLY phase. STRICTLY "
+        "FORBIDDEN: ANY file edits, modifications, or system changes. You "
+        "MUST NOT make any edits.\n</system-reminder>"
+    )
+
+    filtered = openai._filter_tool_specs_for_request(
+        tools,
+        [openai.ChatMessage(role="user", content=plan_reminder)],
+        client_manages_tools=True,
+    )
+
+    assert filtered == tools
+
+
+def test_filter_tool_specs_client_managed_still_honors_explicit_no_tools():
+    tools = [_bash_tool_schema(), _named_tool_schema("read")]
+
+    filtered = openai._filter_tool_specs_for_request(
+        tools,
+        [
+            openai.ChatMessage(
+                role="user",
+                content="Do not use any tools. Answer from memory only.",
+            )
+        ],
+        client_manages_tools=True,
+    )
+
+    assert filtered == []
+
+
+def test_build_mode_reminder_is_not_read_only_for_generic_clients():
+    """OpenCode's build-mode switch reminder says 'no longer in read-only
+    mode... permitted to make file changes'. The unanchored read-only match
+    treated that grant as a read-only instruction and kept write/edit hidden
+    exactly on the execute-the-plan turn."""
+    build_reminder = (
+        "execute plan with care and precision in line with my goals.\n"
+        "<system-reminder>\nYour operational mode has changed from plan to build.\n"
+        "You are no longer in read-only mode.\n"
+        "You are permitted to make file changes, run shell commands, and "
+        "utilize your arsenal of tools as needed.\n</system-reminder>"
+    )
+    messages = [openai.ChatMessage(role="user", content=build_reminder)]
+
+    assert openai._request_disallows_file_mutation(messages) is False
+
+    tools = [
+        _bash_tool_schema(),
+        _write_tool_schema(),
+        _named_tool_schema("edit"),
+        _named_tool_schema("read"),
+    ]
+    filtered = openai._filter_tool_specs_for_request(tools, messages)
+    names = [
+        tool["function"]["name"]
+        for tool in filtered
+        if isinstance(tool.get("function"), dict)
+    ]
+    assert "write" in names
+    assert "edit" in names
+
+
+def test_active_read_only_phase_still_hides_mutating_tools_for_generic_clients():
+    messages = [
+        openai.ChatMessage(
+            role="user",
+            content="Plan mode ACTIVE - you are in READ-ONLY phase. Do NOT edit files.",
+        )
+    ]
+
+    assert openai._request_disallows_file_mutation(messages) is True
+
+
 def test_filter_tool_specs_keeps_upgrade_recommendations_read_only():
     tools = [
         _bash_tool_schema(),
@@ -6885,7 +7054,13 @@ def test_opencode_agent_tool_client_uses_compact_prompt_mode(monkeypatch):
     rendered = "\n".join(str(message.get("content") or "") for message in messages)
     stats = seen["request_observability"]
     assert "tools" not in kwargs
-    assert stats["request_filtered_tool_names"] == ["read", "session_status"]
+    # OpenCode toolsets pass through unfiltered (client curates per agent
+    # mode); the compact prompt-mode repair is what this test pins.
+    assert stats["request_filtered_tool_names"] == [
+        "bash",
+        "read",
+        "session_status",
+    ]
     assert "MTPLX tool contract:" in rendered
     assert "read()" in rendered
     assert stats["tool_prompt_mode"] == "compact"
@@ -7075,6 +7250,95 @@ def test_chat_tools_add_no_tool_contract_when_non_chitchat_disables_tools(monkey
     assert stats["tool_contract_policy_version"] == "no_tool_direct_reply:v1"
 
 
+def test_final_round_after_tools_gets_post_tool_answer_contract(monkeypatch):
+    """A tool loop's closing round (tool results in the current turn,
+    tool_choice=none) must NOT get the terse direct-reply contract —
+    its no-lists/no-analysis clauses clipped searched chat answers to a
+    few sentences (2026-07-03). It gets the post-tool full-answer
+    contract instead."""
+    seen: dict[str, object] = {}
+    state = _fake_state()
+    foreground = ForegroundState()
+    state.lock = foreground.lock
+    state.has_foreground = foreground.has_foreground
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+
+    def fake_run_generation(*_args, **kwargs):
+        seen["request_observability"] = dict(kwargs["request_observability"])
+        return _fake_generation("Here is the detailed comparison...")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "What is better, X or Y? Explain in detail.",
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": "{\"query\": \"X vs Y\"}",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "{\"results\": [{\"title\": \"X vs Y\"}]}",
+                },
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": "Search the web",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                            "required": ["query"],
+                        },
+                    },
+                }
+            ],
+            "tool_choice": "none",
+            "max_tokens": 32,
+        },
+    )
+
+    assert response.status_code == 200
+    messages, kwargs = state.runtime.tokenizer.calls[0]
+    rendered = "\n".join(str(message.get("content") or "") for message in messages)
+    stats = seen["request_observability"]
+    assert "tools" not in kwargs
+    assert "MTPLX post-tool answer turn:" in rendered
+    assert "Match the depth the user asked for" in rendered
+    # The model must be anchored to today and told fresher tool results
+    # outrank its training data.
+    assert "Today's date is" in rendered
+    assert "trust the tool results" in rendered
+    # The clipping clauses must be gone from this round.
+    assert "MTPLX direct reply turn:" not in rendered
+    assert "one short friendly sentence" not in rendered
+    assert "No markdown lists" not in rendered
+    assert stats["post_tool_answer_contract_active"] is True
+    assert stats["no_tools_contract_active"] is False
+    assert stats["tool_contract_policy_version"] == "post_tool_full_answer:dated:v2"
+
+
 def test_chat_tools_add_no_tool_contract_for_explicit_no_tools_text(monkeypatch):
     seen: dict[str, object] = {}
     state = _fake_state()
@@ -7170,12 +7434,14 @@ def test_chat_tools_add_read_only_force_answer_contract_after_read_budget(monkey
     messages, kwargs = state.runtime.tokenizer.calls[0]
     rendered = "\n".join(str(message.get("content") or "") for message in messages)
     stats = seen["request_observability"]
-    assert [tool["function"]["name"] for tool in kwargs["tools"]] == [
-        "bash",
-        "read",
-        "glob",
-        "grep",
-    ]
+    # PREFIX STABILITY (2026-07-04): the force-answer turn must render the
+    # SAME toolset through the SAME template mode as every prior round of the
+    # loop — the old hybrid/schema switch rewrote the system prompt and forced
+    # a fully cold re-prefill of the largest prompt in the session. The
+    # conditioning lives in the appended user contract message only.
+    assert "tools" not in kwargs or kwargs["tools"] is None or [
+        tool["function"]["name"] for tool in kwargs["tools"]
+    ] == ["bash", "read", "glob", "grep"]
     assert "MTPLX read-only answer turn:" in rendered
     assert "MTPLX read-only final answer instruction:" in rendered
     assert "MTPLX direct reply turn:" not in rendered
@@ -7198,7 +7464,10 @@ def test_chat_tools_add_read_only_force_answer_contract_after_read_budget(monkey
         == "stable_without_transient_force_answer"
     )
     assert stats["request_session_restore_policy_matches_postcommit"] is True
-    assert stats["tool_contract_policy_version"].startswith("soft_schema_contract:")
+    # Byte-identity guard: the force-answer request must NOT switch the tool
+    # contract lane (compact for opencode) — a different contract version
+    # means different system prompt bytes and a broken KV prefix.
+    assert stats["tool_contract_policy_version"].startswith("compact_tool_contract:")
 
 
 def test_explicit_single_tool_then_answer_forces_final_after_tool_result(monkeypatch):
@@ -7389,10 +7658,24 @@ def test_pi_tool_history_adds_convergence_contract_after_budget(monkeypatch):
     assert "A single targeted read" in rendered
     assert "only one narrow line-range refresh" in rendered
     assert messages[-1]["role"] == "user"
+    # PREFIX STABILITY (2026-07-04): the convergence contract activates
+    # MID-SESSION (tool-count budget), so it must never rewrite earlier
+    # transcript bytes — the system message stays untouched and the whole
+    # contract travels in the appended user message. The old system-append
+    # invalidated every banked KV prefix at the transition round.
+    assert messages[0]["role"] == "system"
+    assert "MTPLX Pi convergence turn:" not in str(messages[0]["content"])
+    assert "MTPLX Pi convergence turn:" in str(messages[-1]["content"])
+    assert "MTPLX Pi convergence instruction:" in str(messages[-1]["content"])
     assert stats["request_pi_convergence_contract"] is True
     assert stats["request_pi_convergence_tool_result_count"] == 2
     assert stats["request_pi_convergence_after_tools"] == 2
     assert stats["pi_convergence_contract_active"] is True
+    assert (
+        stats["request_session_restore_policy"]
+        == "stable_without_transient_pi_convergence"
+    )
+    assert stats["request_session_restore_policy_matches_postcommit"] is True
     assert stats["request_filtered_tool_names"] == [
         "bash",
         "read",
@@ -8470,11 +8753,16 @@ def test_postcommit_read_only_final_matches_next_turn_history_boundary():
         tools=tools,
     )
 
-    assert next_stats.compacted_tool_result_messages == 1
+    # Prefix-stability fix (2026-07-03): the historical read now classifies by
+    # its OWN segment's user request (inspection) instead of the latest user
+    # text, so both the postcommit and the next turn render it as the same
+    # inspection digest — the alignment invariant below is what matters.
+    assert next_stats.compacted_tool_result_messages == 0
+    assert next_stats.compacted_active_read_inspection_messages >= 1
     assert next_turn_prompt[: len(postcommit_prefix)] == postcommit_prefix
     rendered_prefix = tokenizer.decode(postcommit_prefix)
     assert "MTPLX read-only final answer instruction" not in rendered_prefix
-    assert "<mtplx_compacted_tool_output" in rendered_prefix
+    assert "<mtplx_read_inspection_digest" in rendered_prefix
     assert "<mtplx_compacted_active_read_output" not in rendered_prefix
 
 
@@ -9724,7 +10012,7 @@ def test_server_state_emits_startup_progress(monkeypatch, capsys):
     monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
     monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
-    monkeypatch.setattr(openai, "_mlx_fork_status", lambda: {"ok": True})
+    monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
     )
@@ -9773,7 +10061,7 @@ def test_server_state_applies_clear_cache_every_after_profile(monkeypatch):
     monkeypatch.setattr(openai, "apply_profile_env", capture_apply_profile_env)
     monkeypatch.setattr(openai, "profile_env_status", capture_profile_env_status)
     monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
-    monkeypatch.setattr(openai, "_mlx_fork_status", lambda: {"ok": True})
+    monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai,
         "_configure_mlx_cache_limit",
@@ -9823,7 +10111,7 @@ def test_server_state_reports_model_load_failure(monkeypatch, capsys):
     monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
     monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
-    monkeypatch.setattr(openai, "_mlx_fork_status", lambda: {"ok": True})
+    monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
     )
@@ -9850,7 +10138,7 @@ def test_server_state_passes_step_adapter_quant_contract_to_load(monkeypatch):
     monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
     monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
-    monkeypatch.setattr(openai, "_mlx_fork_status", lambda: {"ok": True})
+    monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai,
         "_configure_mlx_cache_limit",

@@ -19,6 +19,7 @@ PROFILE_CHOICES = (
     "stable",
     "performance-cold",
     "sustained",
+    "turbo",
     "exact",
     "max-diagnostic",
 )
@@ -31,12 +32,27 @@ PROFILE_ENV_USER_OVERRIDE_KEYS = frozenset(
         "MTPLX_VLLM_METAL_PAGED_TURBOQUANT",
         "MTPLX_VLLM_METAL_PAGED_TURBOQUANT_K_QUANT",
         "MTPLX_VLLM_METAL_PAGED_TURBOQUANT_V_QUANT",
+        # Prefill chunk sizing is a tuning knob users/operators legitimately
+        # sweep; an explicit env must beat the profile default like the
+        # depth/history knobs above (before 2026-07-05 the profile applier
+        # silently stomped it back to the profile value).
+        "MTPLX_PREFILL_CHUNK_SIZE",
+        "MTPLX_PREFILL_CHUNK_SIZE_DENSE",
+        "MTPLX_PREFILL_CHUNK_SIZE_REPAGE",
+        # Packed-GQA verify attention (speed-war Lane A): operators must be
+        # able to force it off/on per launch for A/B work.
+        "MTPLX_GQA_PACKED_SDPA",
+        "MTPLX_GQA_PACKED_SDPA_THRESHOLD",
+        # Compiled-verify commit-first donation (speed-war Lane A2): same
+        # A/B requirement — an explicit env must beat the profile default.
+        "MTPLX_COMPILED_VERIFY_DONATION",
     }
 )
 
 DEFAULT_HF_MODEL_ID = "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
 DEFAULT_FP16_HF_MODEL_ID = "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-FP16"
 QUALITY_HF_MODEL_ID = "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality"
+QUALITY_FP16_HF_MODEL_ID = "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality-FP16"
 LEGACY_OPTIMIZED_HF_MODEL_ID = "Youssofal/Qwen3.6-27B-MTPLX-Optimized"
 QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID = (
     "Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed"
@@ -79,11 +95,8 @@ DEFAULT_MODEL_ID = DEFAULT_HF_MODEL_ID
 DEFAULT_PUBLIC_MODEL_ID = "mtplx-qwen36-27b-optimized-speed"
 DEFAULT_FP16_PUBLIC_MODEL_ID = "mtplx-qwen36-27b-optimized-speed-fp16"
 QUALITY_PUBLIC_MODEL_ID = "mtplx-qwen36-27b-optimized-quality"
+QUALITY_FP16_PUBLIC_MODEL_ID = "mtplx-qwen36-27b-optimized-quality-fp16"
 LEGACY_OPTIMIZED_PUBLIC_MODEL_ID = "mtplx-qwen36-27b-optimized"
-# The historical 60 tok/s fork landed at 2377a99f, but the launch runtime uses
-# the reconstructed colon-free source-build mirror imported by the app daemon.
-NATIVE_MTP_60_MLX_FORK_COMMIT = "68cf2fdd"
-NATIVE_MTP_60_MLX_FORK_FRAGMENT = "mlx-mtplx-0.31.2-qmm"
 
 
 NATIVE_MTP_60_FAST_PATH_ENV = {
@@ -105,6 +118,8 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         "MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD",
         "MTPLX_LONG_CONTEXT_MTP_DEPTH",
         "MTPLX_CLEAR_CACHE_EVERY",
+        "MTPLX_COMPILED_VERIFY",
+        "MTPLX_COMPILED_VERIFY_MAX_LEN",
     }
 )
 
@@ -312,8 +327,6 @@ class RuntimeProfile:
     model_id: str = DEFAULT_MODEL_ID
     benchmark_ids: tuple[str, ...] = ()
     caveats: tuple[str, ...] = ()
-    required_mlx_fork_commit: str | None = None
-    required_mlx_fork_fragment: str | None = None
     draft_lm_head: DraftLMHeadRequirement | None = None
     draft_sampler: SamplerDefaults | None = None
     qa_only: bool = False
@@ -338,8 +351,6 @@ class RuntimeProfile:
             "model_id": self.model_id,
             "benchmark_ids": list(self.benchmark_ids),
             "caveats": list(self.caveats),
-            "required_mlx_fork_commit": self.required_mlx_fork_commit,
-            "required_mlx_fork_fragment": self.required_mlx_fork_fragment,
             "draft_lm_head": (
                 None
                 if self.draft_lm_head is None
@@ -407,10 +418,8 @@ PERFORMANCE_COLD_PROFILE = RuntimeProfile(
     ),
     caveats=(
         "Best fan-backed burst throughput; not recommended for long context.",
-        "Requires the MLX-MTPLX fork for the native QMV/QMM fast path.",
+        "Runs on stock PyPI MLX; no custom MLX fork or build is required.",
     ),
-    required_mlx_fork_commit=NATIVE_MTP_60_MLX_FORK_COMMIT,
-    required_mlx_fork_fragment=NATIVE_MTP_60_MLX_FORK_FRAGMENT,
     draft_lm_head=DraftLMHeadRequirement(bits=4, group_size=64, mode="affine"),
 )
 
@@ -426,10 +435,69 @@ SUSTAINED_PROFILE = RuntimeProfile(
         "Default product path for long-context coding and agent use.",
         "Targets long-context memory safety while preserving most Burst TPS.",
         "Does not include v0.2 decode-state eval scheduling flags.",
+        "Runs on stock PyPI MLX; no custom MLX fork or build is required.",
     ),
-    required_mlx_fork_commit=NATIVE_MTP_60_MLX_FORK_COMMIT,
-    required_mlx_fork_fragment=NATIVE_MTP_60_MLX_FORK_FRAGMENT,
     draft_lm_head=DraftLMHeadRequirement(bits=4, group_size=64, mode="affine"),
+)
+
+TURBO_PROFILE = RuntimeProfile(
+    name="turbo",
+    runtime_profile="native_mtp_turbo",
+    summary=(
+        "Sustained Mode plus verify-specialized quantized-matmul kernels "
+        "(MTPLX_NAX_VERIFY) and the compiled verify step for 4-bit models "
+        "(MTPLX_COMPILED_VERIFY, context-routed). Fastest decode profile."
+    ),
+    env=_merge_env(
+        SUSTAINED_PREFILL_ENV,
+        {
+            "MTPLX_NAX_VERIFY": "1",
+            "MTPLX_NAX_M4_IMPL": "vk_k",
+            # Compiled verify (W2) promotion, 2026-07-04: default-on for the
+            # turbo profile. Measured wins with the growth-demote +
+            # shared-traces bank: Speed-4bit +8% bare / +12% @7k / +22% @12k;
+            # Quality-q8 +10% bare / flat-to-+6% at 7k contexts (the 07-02
+            # sprint's q8 -15/-18% was the since-removed per-request trace
+            # tax). parity2 zero divergences on both trunks. The engine
+            # self-gates per model (unmeasured quantizations such as the
+            # 6-bit 9B stay eager) and contexts above the router fall back
+            # per call.
+            "MTPLX_COMPILED_VERIFY": "1",
+            "MTPLX_COMPILED_VERIFY_MAX_CONTEXT": "12288",
+            # Packed-GQA verify attention (speed-war Lane A, 2026-07-05):
+            # one KV stream per simdgroup with all q=2..4 verify rows in
+            # registers + a single float4 shuffle butterfly. Isolated
+            # kernel: 207 vs 160 GB/s useful at 128k (+27%). Live gates:
+            # 8-arm ABBA @64k warm decode +5.8% mean / verify -3.9ms
+            # (fwd -4pt spread), paired 128k cold pair verify 192->152
+            # ms/call, decode 14.4->18.6; acceptance-by-depth bands and
+            # peak memory byte-identical. Engages only >= threshold and
+            # only on dense-cache decode windows; bails to fused SDPA on
+            # any contract miss.
+            "MTPLX_GQA_PACKED_SDPA": "1",
+            "MTPLX_GQA_PACKED_SDPA_THRESHOLD": "8192",
+        },
+    ),
+    caveats=(
+        "Speculative-verify matmuls use the MTPLX verify_kernels family. "
+        "4-bit (vk_k): argmax- and sampler-distribution-validated, not "
+        "bit-exact vs stock. 8-bit (vk q8): ULP-exact vs stock.",
+        "Prefill and non-speculative decode remain bit-identical to stock.",
+        "4-bit and 8-bit affine models; 6-bit models silently run the "
+        "stock path.",
+        "Compiled verify engages on 4-bit and 8-bit affine trunks at "
+        "contexts <= 12288 (parity2-validated on both); other "
+        "quantizations/contexts run the eager verify path unchanged.",
+        "Measured 2026-07-02/03 on M5 Max chat lane (app-launch flags, "
+        "thinking on): 27B Optimized-Speed 44.7 -> 58-60 tok/s (vk_k "
+        "within ~2% of the retired dflash-port kernel both directions); "
+        "27B Optimized-Quality 31-36 -> 43-44 tok/s (+22-40%, q8 verify "
+        "61-64 ms/call vs stock 81-93).",
+        "Runs on stock PyPI MLX; the MTPLX verify kernels are shipped "
+        "in-package Metal kernels, not an MLX fork or patched qmm build.",
+    ),
+    draft_lm_head=DraftLMHeadRequirement(bits=4, group_size=64, mode="affine"),
+    product_claim_eligible=False,
 )
 
 EXACT_PROFILE = RuntimeProfile(
@@ -461,6 +529,7 @@ PROFILES: dict[ProfileName, RuntimeProfile] = {
     STABLE_PROFILE.name: STABLE_PROFILE,
     PERFORMANCE_COLD_PROFILE.name: PERFORMANCE_COLD_PROFILE,
     SUSTAINED_PROFILE.name: SUSTAINED_PROFILE,
+    TURBO_PROFILE.name: TURBO_PROFILE,
     EXACT_PROFILE.name: EXACT_PROFILE,
     MAX_DIAGNOSTIC_PROFILE.name: MAX_DIAGNOSTIC_PROFILE,
 }

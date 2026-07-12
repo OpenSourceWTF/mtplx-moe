@@ -406,13 +406,22 @@ public struct HermesIntegration: Sendable {
 
         try ensureProfileDirectory(profileURL)
 
-        let configText = Self.configYAML(
-            modelID: modelID,
-            baseURL: baseURL,
-            apiKey: apiKey,
-            workspacePath: workspacePath,
-            showReasoning: reasoning != "off",
-            reasoningEffort: reasoningEffort
+        // Issue #131: the profile config is user-editable. Regenerating it
+        // from the template alone silently wiped every section the app does
+        // not own (memory/providers/delegation/…), so the template is merged
+        // over the existing file instead: app-owned keys are rewritten, all
+        // other content is preserved byte-for-byte.
+        let existingConfigText = try? String(contentsOf: configURL, encoding: .utf8)
+        let configText = Self.mergedConfigYAML(
+            existing: existingConfigText,
+            template: Self.configYAML(
+                modelID: modelID,
+                baseURL: baseURL,
+                apiKey: apiKey,
+                workspacePath: workspacePath,
+                showReasoning: reasoning != "off",
+                reasoningEffort: reasoningEffort
+            )
         )
         let envText = Self.dotenv(
             modelID: modelID,
@@ -720,6 +729,164 @@ public struct HermesIntegration: Sendable {
           show_reasoning: \(showReasoningText)
           tool_progress: all
         """ + "\n"
+    }
+
+    // MARK: - Profile config merge (issue #131)
+
+    /// One top-level block of a YAML document, kept as raw text: the key
+    /// line plus every line that belongs under it, and the comment/blank
+    /// lines that directly precede it.
+    struct YAMLTopLevelBlock {
+        var leadingLines: [String]
+        var keyName: String
+        var lines: [String]
+    }
+
+    struct YAMLTopLevelDocument {
+        var preamble: [String]
+        var blocks: [YAMLTopLevelBlock]
+        var trailing: [String]
+    }
+
+    /// Children the app owns under a template section even when the current
+    /// template does not emit them — conditional lines must be able to
+    /// disappear instead of being resurrected as "user content". Today that
+    /// is only `model.reasoning_effort` (emitted only while an effort is
+    /// configured).
+    static let conditionallyOwnedChildKeys: [String: Set<String>] = [
+        "model": ["reasoning_effort"]
+    ]
+
+    /// Merge the generated template over the existing profile config.
+    ///
+    /// The app owns the template's top-level sections and their child keys;
+    /// those are rewritten every sync. Everything else — unknown top-level
+    /// sections (`memory:`, `providers:`, …), unknown child keys under owned
+    /// sections (`model.max_tokens`), comments, blank lines — is preserved
+    /// byte-for-byte. Sequence-shaped owned sections (`toolsets:`) are
+    /// rewritten wholly. The merge is idempotent, so an unchanged
+    /// configuration produces an unchanged file and `writeIfChanged` skips
+    /// the rewrite (and its backup) entirely.
+    ///
+    /// The child-key scan assumes the template's own two-space indentation,
+    /// which is what the app has always written; user files started from our
+    /// template keep that shape.
+    static func mergedConfigYAML(existing: String?, template: String) -> String {
+        guard
+            let existing,
+            !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return template
+        }
+        let templateDoc = parseTopLevelBlocks(template)
+        let existingDoc = parseTopLevelBlocks(existing)
+        // Nothing recognizable to preserve: the template wins (the caller's
+        // writeIfChanged still snapshots a backup of the old file).
+        guard !existingDoc.blocks.isEmpty else { return template }
+
+        let templateKeys = Set(templateDoc.blocks.map(\.keyName))
+        var out: [String] = existingDoc.preamble
+        for templateBlock in templateDoc.blocks {
+            let existingBlock = existingDoc.blocks.first {
+                $0.keyName == templateBlock.keyName
+            }
+            out += existingBlock?.leadingLines ?? []
+            out += templateBlock.lines
+            guard let existingBlock else { continue }
+            let ownedChildKeys = Set(directChildBlocks(of: templateBlock).map(\.key))
+                .union(Self.conditionallyOwnedChildKeys[templateBlock.keyName] ?? [])
+            // A template section without mapping children is sequence- or
+            // scalar-shaped; the app owns its full body.
+            guard !ownedChildKeys.isEmpty else { continue }
+            for child in directChildBlocks(of: existingBlock)
+            where !ownedChildKeys.contains(child.key) {
+                out += child.lines
+            }
+        }
+        for existingBlock in existingDoc.blocks
+        where !templateKeys.contains(existingBlock.keyName) {
+            out += existingBlock.leadingLines
+            out += existingBlock.lines
+        }
+        out += existingDoc.trailing
+        return out.joined(separator: "\n") + "\n"
+    }
+
+    static func parseTopLevelBlocks(_ text: String) -> YAMLTopLevelDocument {
+        var preamble: [String] = []
+        var blocks: [YAMLTopLevelBlock] = []
+        var pending: [String] = []
+        var lines = text.components(separatedBy: "\n")
+        if lines.last == "" { lines.removeLast() }
+        for line in lines {
+            if let key = topLevelKeyName(of: line) {
+                blocks.append(
+                    YAMLTopLevelBlock(leadingLines: pending, keyName: key, lines: [line])
+                )
+                pending = []
+            } else if line.isEmpty || line.hasPrefix("#") {
+                // Could belong to the current block or introduce the next
+                // one; decided when the following line arrives (or at EOF).
+                if blocks.isEmpty { preamble.append(line) } else { pending.append(line) }
+            } else if var last = blocks.popLast() {
+                // Indented content or a column-zero continuation (sequence
+                // items, flow scalars): body of the current block, together
+                // with any buffered comment/blank lines above it.
+                last.lines += pending
+                pending = []
+                last.lines.append(line)
+                blocks.append(last)
+            } else {
+                preamble += pending
+                pending = []
+                preamble.append(line)
+            }
+        }
+        return YAMLTopLevelDocument(preamble: preamble, blocks: blocks, trailing: pending)
+    }
+
+    static func topLevelKeyName(of line: String) -> String? {
+        guard
+            let first = line.first,
+            first != " ", first != "\t", first != "#", first != "-", first != "%"
+        else {
+            return nil
+        }
+        guard let colon = line.firstIndex(of: ":") else { return nil }
+        let key = String(line[line.startIndex..<colon])
+            .trimmingCharacters(in: .whitespaces)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+        return key.isEmpty ? nil : key
+    }
+
+    static func directChildBlocks(
+        of block: YAMLTopLevelBlock
+    ) -> [(key: String, lines: [String])] {
+        var children: [(key: String, lines: [String])] = []
+        for line in block.lines.dropFirst() {
+            if let key = directChildKeyName(of: line) {
+                children.append((key, [line]))
+            } else if !children.isEmpty {
+                children[children.count - 1].lines.append(line)
+            }
+        }
+        return children
+    }
+
+    static func directChildKeyName(of line: String) -> String? {
+        guard line.hasPrefix("  "), !line.hasPrefix("   ") else { return nil }
+        let rest = String(line.dropFirst(2))
+        guard
+            let first = rest.first,
+            first != " ", first != "\t", first != "#", first != "-"
+        else {
+            return nil
+        }
+        guard let colon = rest.firstIndex(of: ":") else { return nil }
+        let key = String(rest[rest.startIndex..<colon])
+            .trimmingCharacters(in: .whitespaces)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+        return key.isEmpty ? nil : key
     }
 
     private static func dotenv(

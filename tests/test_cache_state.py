@@ -1368,3 +1368,183 @@ def test_tensor_offset_vllm_metal_paged_cache_updates_offset_inside_compile():
     mx.eval(keys, values)
     assert keys[0, 0, :4, 0].tolist() == [1.0, 1.0, 3.0, 3.0]
     assert values[0, 0, :4, 0].tolist() == [2.0, 2.0, 4.0, 4.0]
+
+
+def _paged_cache_with_data(*, block_size: int = 4, num_blocks: int = 4):
+    paged = VllmMetalPagedKVCache(block_size=block_size, num_blocks=num_blocks)
+    keys = mx.arange(6, dtype=mx.float32).reshape(1, 1, 6, 1)
+    values = 10 + mx.arange(6, dtype=mx.float32).reshape(1, 1, 6, 1)
+    paged.update_without_fetch(keys, values)
+    return paged
+
+
+def test_promote_preserve_paged_param_keeps_paged_storage(monkeypatch):
+    from mtplx.graphbank import promote_kv_cache_offsets
+
+    monkeypatch.delenv("MTPLX_GRAPHBANK_PRESERVE_PAGED_KV", raising=False)
+    cache = [_paged_cache_with_data()]
+
+    promoted, failures = promote_kv_cache_offsets(
+        cache, reserve_tokens=4, preserve_paged=True
+    )
+
+    assert promoted == 1
+    assert failures == {}
+    assert isinstance(cache[0], TensorOffsetVllmMetalPagedKVCache)
+    assert cache[0].size() == 6
+    # Physical pages carried over by reference — no densify, no copy.
+    assert cache[0].cache[0].shape == (4, 4, 1, 1)
+
+
+def test_promote_default_still_follows_env_for_paged_entries(monkeypatch):
+    from mtplx.graphbank import TensorOffsetKVCache, promote_kv_cache_offsets
+
+    monkeypatch.delenv("MTPLX_GRAPHBANK_PRESERVE_PAGED_KV", raising=False)
+    cache = [_paged_cache_with_data()]
+    promoted, failures = promote_kv_cache_offsets(cache, reserve_tokens=4)
+    # Historical trap: without preserve_paged the paged entry falls through the
+    # dense path and its `.keys` property densifies the paged storage.
+    assert promoted == 1
+    assert failures == {}
+    assert isinstance(cache[0], TensorOffsetKVCache)
+
+    monkeypatch.setenv("MTPLX_GRAPHBANK_PRESERVE_PAGED_KV", "1")
+    cache = [_paged_cache_with_data()]
+    promoted, failures = promote_kv_cache_offsets(cache, reserve_tokens=4)
+    assert promoted == 1
+    assert failures == {}
+    assert isinstance(cache[0], TensorOffsetVllmMetalPagedKVCache)
+
+
+def test_promote_preserve_paged_refuses_quantized_paged_entries(monkeypatch):
+    from mtplx.graphbank import promote_kv_cache_offsets
+
+    monkeypatch.delenv("MTPLX_GRAPHBANK_PRESERVE_PAGED_KV", raising=False)
+    quantized = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=4,
+        kv_quant_config=PagedKVQuantConfig("q8"),
+    )
+    quantized.update_without_fetch(
+        mx.random.normal((1, 2, 5, 16), dtype=mx.float16),
+        mx.random.normal((1, 2, 5, 16), dtype=mx.float16),
+    )
+    cache = [quantized]
+
+    promoted, failures = promote_kv_cache_offsets(
+        cache, reserve_tokens=4, preserve_paged=True
+    )
+
+    assert promoted == 0
+    assert failures == {"quantized_paged_kv_cache": 1}
+    assert cache[0] is quantized
+
+
+def test_tensor_offset_paged_static_max_offset_attr_beats_env(monkeypatch):
+    monkeypatch.setenv("MTPLX_GRAPHBANK_PAGED_STATIC_MAX_OFFSET", "32")
+    adapter = TensorOffsetVllmMetalPagedKVCache.from_paged_cache(
+        _paged_cache_with_data()
+    )
+
+    assert adapter._static_attention_max_offset() == 32
+    assert adapter.paged_stats()["static_max_offset"] == 32
+
+    adapter.static_max_offset = 64
+    assert adapter._static_attention_max_offset() == 64
+    assert adapter.paged_stats()["static_max_offset"] == 64
+
+    monkeypatch.delenv("MTPLX_GRAPHBANK_PAGED_STATIC_MAX_OFFSET", raising=False)
+    assert adapter._static_attention_max_offset() == 64
+    adapter.static_max_offset = None
+    assert adapter._static_attention_max_offset() is None
+
+
+def test_tensor_offset_paged_demote_round_trips_offset_and_buffers():
+    paged = _paged_cache_with_data()
+    adapter = TensorOffsetVllmMetalPagedKVCache.from_paged_cache(paged)
+    adapter.update_without_fetch(
+        100 + mx.arange(2, dtype=mx.float32).reshape(1, 1, 2, 1),
+        200 + mx.arange(2, dtype=mx.float32).reshape(1, 1, 2, 1),
+    )
+
+    restored = adapter.to_paged_cache()
+
+    assert isinstance(restored, VllmMetalPagedKVCache)
+    assert type(restored) is VllmMetalPagedKVCache
+    assert isinstance(restored.offset, int)
+    assert restored.offset == 8
+    # Original buffers by reference — bit-exact, no copy.
+    assert restored.key_cache is adapter.cache[0]
+    assert restored.value_cache is adapter.cache[1]
+    assert restored.block_size == 4
+    assert restored.num_blocks == 4
+
+    keys, values = restored.state
+    mx.eval(keys, values)
+    assert keys[0, 0, :, 0].tolist() == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 100.0, 101.0]
+    assert values[0, 0, :, 0].tolist() == [
+        10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 200.0, 201.0,
+    ]
+
+    # Shape metadata restored: the next write appends without re-allocating.
+    restored.update_without_fetch(
+        mx.array([[[[300.0]]]]), mx.array([[[[400.0]]]])
+    )
+    assert restored.size() == 9
+    keys, _ = restored.state
+    mx.eval(keys)
+    assert keys[0, 0, 8, 0].item() == 300.0
+
+    # demote() is the bank-facing alias.
+    assert isinstance(adapter.demote(), VllmMetalPagedKVCache)
+
+
+def test_tensor_offset_paged_meta_state_round_trip():
+    adapter = TensorOffsetVllmMetalPagedKVCache.from_paged_cache(
+        _paged_cache_with_data()
+    )
+
+    assert adapter.meta_state == ("4", "4", "6")
+
+    adapter.meta_state = ("4", "8", "3")
+    assert adapter.num_blocks == 8
+    assert adapter.size() == 3
+    assert isinstance(adapter.cache[2], mx.array)
+
+
+def test_tensor_offset_kv_cache_demote_restores_stock_container():
+    from mlx_lm.models.cache import KVCache
+
+    from mtplx.graphbank import TensorOffsetKVCache, promote_kv_cache_offsets
+
+    stock = KVCache()
+    stock.update_and_fetch(
+        mx.arange(3, dtype=mx.float32).reshape(1, 1, 3, 1),
+        10 + mx.arange(3, dtype=mx.float32).reshape(1, 1, 3, 1),
+    )
+    cache = [stock]
+    promoted, failures = promote_kv_cache_offsets(cache, reserve_tokens=4)
+    assert promoted == 1 and failures == {}
+    adapter = cache[0]
+    assert isinstance(adapter, TensorOffsetKVCache)
+    adapter.update_and_fetch(
+        mx.array([[[[7.0], [8.0]]]]), mx.array([[[[9.0], [11.0]]]])
+    )
+
+    restored = adapter.demote()
+
+    assert type(restored) is KVCache
+    assert isinstance(restored.offset, int)
+    assert restored.offset == 5
+    assert restored.keys is adapter.cache[0]
+    assert restored.values is adapter.cache[1]
+    keys, values = restored.state
+    mx.eval(keys, values)
+    assert keys[0, 0, :, 0].tolist() == [0.0, 1.0, 2.0, 7.0, 8.0]
+    assert values[0, 0, :, 0].tolist() == [10.0, 11.0, 12.0, 9.0, 11.0]
+
+    # Stock trim/update behavior intact after demotion.
+    restored.trim(2)
+    assert restored.offset == 3
+    restored.update_and_fetch(mx.array([[[[42.0]]]]), mx.array([[[[43.0]]]]))
+    assert restored.offset == 4

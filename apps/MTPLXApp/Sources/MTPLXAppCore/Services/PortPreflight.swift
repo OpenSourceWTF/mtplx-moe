@@ -17,12 +17,21 @@ public enum PortOccupantKind: Equatable, Sendable {
     /// A healthy MTPLX daemon answered `/health`. The supervisor decides
     /// separately whether it is adoptable (app-owned, same model).
     case mtplxServer(HealthPayload)
+    /// A live listener rejected the probe with 401/403 — an auth-protected
+    /// server (often an MTPLX daemon with a different API key). Provably
+    /// alive, never adoptable with the current credentials.
+    case unauthorized
     /// Something is listening but does not speak MTPLX health.
     case foreign
 }
 
 public enum PortPreflight {
     /// Classify the occupant of `baseURL`'s port with a short timeout.
+    ///
+    /// `baseURL` must be a CONNECT address (see MTPLXServerURLs): probing a
+    /// wildcard bind address like http://0.0.0.0 times out on a free port
+    /// and misclassified it as `.foreign` (issue #109's bogus "Port 8000
+    /// was in use by another app").
     public static func classify(
         baseURL: URL,
         apiKey: String?,
@@ -46,6 +55,12 @@ public enum PortPreflight {
                 // something we cannot use".
                 return .foreign
             }
+        } catch MTPLXAPIClientError.httpStatus(401, _),
+                MTPLXAPIClientError.httpStatus(403, _) {
+            // The daemon's own /health requires the API key; a wrong or
+            // missing key must read as "auth-protected listener", not as a
+            // foreign app.
+            return .unauthorized
         } catch {
             // Decode failures / non-2xx statuses: a listener that is not an
             // MTPLX daemon.
@@ -53,20 +68,32 @@ public enum PortPreflight {
         }
     }
 
-    /// First bindable loopback port strictly after `port`.
+    /// First port strictly after `port` that the daemon's own bind address
+    /// can take. `bindHost` must be the CONFIGURED bind host: a wildcard
+    /// daemon needs INADDR_ANY free, which a loopback-only check misses
+    /// (and vice versa a busy loopback port may be irrelevant to a
+    /// specific-interface bind).
     public static func nextFreePort(
         after port: Int,
+        bindHost: String = "127.0.0.1",
         attempts: Int = 50
     ) -> Int? {
         guard port < 65_535 else { return nil }
         let upperBound = min(port + max(1, attempts), 65_535)
-        for candidate in (port + 1)...upperBound where portIsBindable(candidate) {
+        for candidate in (port + 1)...upperBound
+        where portIsBindable(candidate, bindHost: bindHost) {
             return candidate
         }
         return nil
     }
 
-    static func portIsBindable(_ port: Int) -> Bool {
+    static func portIsBindable(_ port: Int, bindHost: String = "127.0.0.1") -> Bool {
+        let raw = MTPLXServerURLs.isWildcardBind(bindHost)
+            ? nil
+            : bindHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let raw, raw.contains(":") {
+            return ipv6PortIsBindable(port, host: raw)
+        }
         let descriptor = socket(AF_INET, SOCK_STREAM, 0)
         guard descriptor >= 0 else { return false }
         defer { close(descriptor) }
@@ -81,10 +108,44 @@ public enum PortPreflight {
         var address = sockaddr_in()
         address.sin_family = sa_family_t(AF_INET)
         address.sin_port = in_port_t(UInt16(port).bigEndian)
-        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        if let raw {
+            let parsed = inet_addr(raw.isEmpty ? "127.0.0.1" : raw)
+            guard parsed != INADDR_NONE else { return false }
+            address.sin_addr.s_addr = parsed
+        } else {
+            // Wildcard daemon bind: test the address family it will use.
+            address.sin_addr.s_addr = INADDR_ANY
+        }
         let result = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { rebound in
                 bind(descriptor, rebound, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        return result == 0
+    }
+
+    private static func ipv6PortIsBindable(_ port: Int, host: String) -> Bool {
+        let descriptor = socket(AF_INET6, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { return false }
+        defer { close(descriptor) }
+        var reuse: Int32 = 1
+        setsockopt(
+            descriptor,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            &reuse,
+            socklen_t(MemoryLayout<Int32>.size)
+        )
+        var address = sockaddr_in6()
+        address.sin6_family = sa_family_t(AF_INET6)
+        address.sin6_port = in_port_t(UInt16(port).bigEndian)
+        let bare = host.hasPrefix("[") && host.hasSuffix("]")
+            ? String(host.dropFirst().dropLast())
+            : host
+        guard inet_pton(AF_INET6, bare, &address.sin6_addr) == 1 else { return false }
+        let result = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { rebound in
+                bind(descriptor, rebound, socklen_t(MemoryLayout<sockaddr_in6>.size))
             }
         }
         return result == 0

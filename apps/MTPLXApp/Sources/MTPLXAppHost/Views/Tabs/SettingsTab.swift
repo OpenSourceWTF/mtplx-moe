@@ -417,7 +417,7 @@ struct SettingsTab: View {
             VStack(alignment: .leading, spacing: 6) {
                 FormRow(
                     label: "Allocation policy",
-                    caption: "Target default keeps launch presets; bounded uses the limits below."
+                    caption: "Target default budgets half the RAM left after the model loads; bounded uses the limits below."
                 ) {
                     Picker("Allocation policy", selection: $draftConfig.ramSessionCachePolicy) {
                         Text("Target default").tag("target-default")
@@ -456,7 +456,7 @@ struct SettingsTab: View {
                         ) {
                             Stepper(
                                 value: $draftConfig.ramSessionCacheMaxEntries,
-                                in: 1...16
+                                in: 1...64
                             ) {
                                 Text("\(draftConfig.ramSessionCacheMaxEntries)")
                                     .font(.system(.body, design: .rounded).weight(.semibold))
@@ -468,22 +468,22 @@ struct SettingsTab: View {
                         Divider().overlay(Brand.separator)
                         FormRow(
                             label: "Total RAM cap",
-                            caption: "Global SessionBank memory budget."
+                            caption: "Auto budgets half the RAM left after the model loads. Old prompts are evicted past the cap."
                         ) {
                             cacheSizePicker(
                                 selection: $draftConfig.ramSessionCacheMaxSize,
-                                values: ["1G", "2G", "4G", "8G", "16G", "24G", "32G"]
+                                values: ["auto", "1G", "2G", "4G", "8G", "16G", "24G", "32G", "48G"]
                             )
                         }
 
                         Divider().overlay(Brand.separator)
                         FormRow(
                             label: "Per-session cap",
-                            caption: "Maximum RAM cache held by one conversation."
+                            caption: "Maximum RAM cache held by one conversation. Auto keeps it at 2/3 of the total cap."
                         ) {
                             cacheSizePicker(
                                 selection: $draftConfig.ramSessionCachePerSessionMaxSize,
-                                values: ["1G", "2G", "4G", "8G", "16G", "24G"]
+                                values: ["auto", "1G", "2G", "4G", "8G", "16G", "24G", "32G"]
                             )
                         }
                     }
@@ -562,12 +562,27 @@ struct SettingsTab: View {
     private func cacheSizePicker(selection: Binding<String>, values: [String]) -> some View {
         Picker("Cache size", selection: selection) {
             ForEach(values, id: \.self) { value in
-                Text(value.replacingOccurrences(of: "G", with: " GB")).tag(value)
+                Text(Self.cacheSizeDisplayLabel(value)).tag(value)
             }
         }
         .pickerStyle(.menu)
         .labelsHidden()
-        .frame(maxWidth: 120, alignment: .leading)
+        .frame(maxWidth: 140, alignment: .leading)
+    }
+
+    static func cacheSizeDisplayLabel(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespaces)
+        if trimmed.lowercased() == "auto" {
+            return "Auto"
+        }
+        for (suffix, unit) in [("GB", "GB"), ("TB", "TB"), ("G", "GB"), ("T", "TB")] {
+            if trimmed.uppercased().hasSuffix(suffix) {
+                let number = trimmed.dropLast(suffix.count)
+                    .trimmingCharacters(in: .whitespaces)
+                return "\(number) \(unit)"
+            }
+        }
+        return trimmed
     }
 
     @ViewBuilder
@@ -678,9 +693,10 @@ struct SettingsTab: View {
                     Divider().overlay(Brand.separator)
                     FormRow(
                         label: "Max size",
-                        caption: "Old entries are evicted to stay under the cap; oversized writes are skipped."
+                        caption: "Auto scales with your Mac's RAM tier (16 GB to 100 GB). Old entries are evicted to stay under the cap."
                     ) {
                         Picker("Max size", selection: $draftConfig.ssdSessionCacheMaxSize) {
+                            Text("Auto").tag("auto")
                             Text("10 GB").tag("10GB")
                             Text("50 GB").tag("50GB")
                             Text("100 GB").tag("100GB")
@@ -880,12 +896,19 @@ struct SettingsTab: View {
                         .font(.system(.callout, design: .monospaced))
                 }
 
-                FormRow(label: "Profile") {
-                    // Only engine-launchable profiles may appear here; a
-                    // stray tag value persists into config and kills serve
-                    // at argparse. Max fans is the Fan mode row, not a
-                    // profile.
+                FormRow(
+                    label: "Profile",
+                    caption: "Auto picks the recommended profile for the "
+                        + "selected model — Turbo for the 27B models."
+                ) {
+                    // Only persistable profiles may appear here; a stray
+                    // tag value persists into config and kills serve at
+                    // argparse ("auto" is resolved to a concrete engine
+                    // profile before launch). Max fans is the Fan mode
+                    // row, not a profile.
                     Picker("Profile", selection: $draftConfig.profile) {
+                        Text("Auto (recommended)").tag("auto")
+                        Text("Turbo").tag("turbo")
                         Text("Sustained").tag("sustained")
                         Text("Performance Cold (Burst)").tag("performance-cold")
                     }
@@ -910,19 +933,34 @@ struct SettingsTab: View {
                 }
 
                 FormRow(label: "Host / Port") {
-                    HStack(spacing: 6) {
-                        TextField("127.0.0.1", text: $draftConfig.host)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            TextField("127.0.0.1", text: $draftConfig.host)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(maxWidth: 160)
+                            Text(":")
+                                .foregroundStyle(Brand.typeTertiary)
+                            TextField(
+                                "8000",
+                                value: $draftConfig.port,
+                                format: .number.grouping(.never)
+                            )
                             .textFieldStyle(.roundedBorder)
-                            .frame(maxWidth: 160)
-                        Text(":")
-                            .foregroundStyle(Brand.typeTertiary)
-                        TextField(
-                            "8000",
-                            value: $draftConfig.port,
-                            format: .number.grouping(.never)
-                        )
-                        .textFieldStyle(.roundedBorder)
-                        .frame(maxWidth: 80)
+                            .frame(maxWidth: 80)
+                        }
+                        if !MTPLXServerURLs.isLoopbackBind(draftConfig.host) {
+                            Text(
+                                MTPLXServerURLs.isWildcardBind(draftConfig.host)
+                                    ? "Serves on every interface (LAN). An API key is required."
+                                    : "Non-localhost host: an API key is required."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(
+                                (draftConfig.apiKey ?? "").isEmpty
+                                    ? Brand.warning
+                                    : Brand.typeTertiary
+                            )
+                        }
                     }
                 }
 

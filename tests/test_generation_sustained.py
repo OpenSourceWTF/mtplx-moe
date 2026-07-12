@@ -7,12 +7,14 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
+from mtplx.expert_streaming import RoutingPhase
 from mtplx.generation import (
     _clear_cache_every,
     _defer_verify_hidden_eval_enabled,
     _make_target_prefill_cache,
     _maybe_repage_target_prefill_cache,
     _prefill,
+    _prefill_cache_only_forward,
     _prefill_chunk_cache_cleanup_every,
     _prefill_chunk_size,
     _prefill_committed_mtp_history_streaming,
@@ -21,6 +23,7 @@ from mtplx.generation import (
     generate_mtpk,
     restore_or_prefill_prompt_state,
 )
+from mtplx.models.expert_mlx import current_expert_routing_phase
 from mtplx.mtp_patch import MTPContract
 from mtplx.runtime import MTPLXRuntime
 from mtplx.sampling import SamplerConfig
@@ -343,14 +346,17 @@ def test_auto_sustained_prefill_policy_keeps_dense_decode_through_128k(monkeypat
     monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", "65536")
     assert _sustained_prefill_layout() == "contiguous_dense_decode"
     assert _prefill_chunk_size() == 2048
-    assert _prefill_chunk_cache_cleanup_every() == 1
+    # Dense-layout cleanup cadence: every 4 chunks (2026-07-05 A/B — the
+    # per-chunk synchronize+clear_cache cost 5-21% prefill throughput with
+    # byte-identical peak memory; receipts in MEASUREMENTS).
+    assert _prefill_chunk_cache_cleanup_every() == 4
     assert _defer_verify_hidden_eval_enabled() is True
     assert _clear_cache_every() == 256
 
     monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", "131072")
     assert _sustained_prefill_layout() == "contiguous_dense_decode"
     assert _prefill_chunk_size() == 2048
-    assert _prefill_chunk_cache_cleanup_every() == 1
+    assert _prefill_chunk_cache_cleanup_every() == 4
     assert _defer_verify_hidden_eval_enabled() is True
     assert _clear_cache_every() == 256
 
@@ -662,6 +668,9 @@ def test_sustained_prefill_chunks_without_full_prompt_logits(monkeypatch):
 
 
 def test_warm_restored_suffix_prefill_is_chunked_and_typed_for_abort(monkeypatch):
+    # kvcache-v2: suffixes <= MTPLX_SMALL_SUFFIX_FUSED_MAX fuse into one
+    # forward; this test guards the chunked lane used above that threshold.
+    monkeypatch.setenv("MTPLX_SMALL_SUFFIX_FUSED_MAX", "0")
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
@@ -763,7 +772,11 @@ def test_restore_prefers_larger_near_gap_over_shorter_exact_prefix(monkeypatch):
             return exact_entry
 
         def near_prefix_candidates(self, _prompt_ids, **kwargs):
-            assert kwargs["allow_block_prefix"] is False
+            # kvcache-v2: with boundary-true restore on (default), the
+            # block-prefix lane is env-decided (default on) for every
+            # client, not just OpenCode-compact — restores fail closed at
+            # the entry layer instead (issue #138).
+            assert kwargs["allow_block_prefix"] is True
             return [(near_entry, 7)]
 
         def restore_entry_prefix_cache(
@@ -826,9 +839,11 @@ def test_restore_prefers_larger_near_gap_over_shorter_exact_prefix(monkeypatch):
     assert bank.prefix_restore_calls == [(7, "clone")]
     assert near_entry.hits == 1
     chunk_events = [event for event in prefill_events if event["phase"] == "chunk"]
-    assert [event["tokens_done"] for event in chunk_events] == [7, 8, 9]
-    assert [event["cached_tokens"] for event in chunk_events] == [7, 7, 7]
-    assert [event["new_prefill_tokens"] for event in chunk_events] == [2, 2, 2]
+    # kvcache-v2 fused small-suffix prefill emits one progress event for the
+    # whole (tiny) suffix instead of per-chunk events.
+    assert [event["tokens_done"] for event in chunk_events] == [7, 9]
+    assert [event["cached_tokens"] for event in chunk_events] == [7, 7]
+    assert [event["new_prefill_tokens"] for event in chunk_events] == [2, 2]
 
 
 def test_opencode_compact_restore_prefers_block_prefix_over_short_exact(monkeypatch):
@@ -939,7 +954,194 @@ def test_opencode_compact_restore_prefers_block_prefix_over_short_exact(monkeypa
     assert bank.near_allow_block == [True]
     assert bank.prefix_restore_calls == [(8, "clone")]
     assert block_entry.hits == 1
-    assert appended == [[8], [9, 10], [11]]
+    # kvcache-v2 fused small-suffix prefill appends the post-first-token
+    # history rows in one call instead of body/final chunks — same rows, same
+    # hidden positions, one eval barrier.
+    assert appended == [[8], [9, 10, 11]]
+
+
+def _make_frozen_prefix_bank_fixture(rt, *, policy_fingerprint=None):
+    """Bank shape from issue #138: a stale short exact-prefix entry plus a
+    much longer entry sharing a bigger prompt prefix (gap > tiny-gap limit).
+    Before the fix, non-OpenCode clients could only take the tiny-gap lane,
+    so every restore froze on the short exact entry."""
+    exact_entry = SimpleNamespace(prefix_len=3)
+    block_entry = SimpleNamespace(
+        prefix_len=20,
+        token_ids=tuple(range(20)),
+        session_id="agent-session",
+        model_path=str(rt.model_path),
+        hidden_variant="post_norm",
+        template_hash=None,
+        mtp_history_policy="committed",
+        draft_head_identity=None,
+        policy_fingerprint=policy_fingerprint,
+        snapshot_epoch=20,
+        mtp_snapshot_epoch=20,
+        mtp_history_snapshot=object(),
+        mtp_history_cache_ref=None,
+        hits=0,
+        last_access_s=0.0,
+    )
+
+    class Bank:
+        last_miss_reason = None
+
+        def __init__(self):
+            self.restore_calls = 0
+            self.prefix_restore_calls: list[tuple[int, str]] = []
+            self.near_allow_block: list[bool] = []
+
+        def longest_prefix(self, _prompt_ids):
+            return exact_entry
+
+        def near_prefix_candidates(self, _prompt_ids, **kwargs):
+            self.near_allow_block.append(bool(kwargs["allow_block_prefix"]))
+            if not kwargs["allow_block_prefix"]:
+                return []
+            return [(block_entry, 8)]
+
+        def restore_entry_prefix_cache(
+            self,
+            _rt,
+            _entry,
+            prefix_len,
+            *,
+            mode,
+            cache_factory=None,
+        ):
+            assert cache_factory is None or callable(cache_factory)
+            self.prefix_restore_calls.append((int(prefix_len), str(mode)))
+            return [], [], "clone"
+
+        def restore(self, *_args, **_kwargs):
+            self.restore_calls += 1
+            return SimpleNamespace(
+                entry=SimpleNamespace(prefix_len=exact_entry.prefix_len),
+                cache=[],
+                logits=mx.zeros((1, 4), dtype=mx.float32),
+                hidden=mx.zeros((1, 1, 2), dtype=mx.float32),
+                mtp_history_cache=[],
+                restore_mode="clone",
+            )
+
+    return Bank(), exact_entry, block_entry
+
+
+def _install_history_stub(monkeypatch):
+    def append_history(
+        _rt,
+        _mtp_cache,
+        hidden_states,
+        token_ids,
+        *,
+        mtp_hidden_variant,
+        position_offset=None,
+        force_eval=False,
+        input_embeddings=None,
+    ):
+        assert hidden_states.shape[1] == len(token_ids)
+        return 0.0
+
+    monkeypatch.setattr("mtplx.generation._append_mtp_history", append_history)
+
+
+def test_generic_client_escapes_stale_short_exact_prefix_via_block_restore(
+    monkeypatch,
+):
+    """Issue #138: Pi/little-coder style clients (no OpenCode-compact
+    fingerprint) froze on the oldest short exact prefix while longer banked
+    prefixes went unused, re-prefilling a growing suffix every turn. With
+    boundary-true restore on (the v2 default), the block-prefix lane is safe
+    and must engage for every client."""
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
+    monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
+    model = TinyModel()
+    rt = _runtime(model, mtp_enabled=True)
+    _install_history_stub(monkeypatch)
+    fingerprint = "tool_prompt_mode=hybrid;client=pi"
+    bank, _exact_entry, block_entry = _make_frozen_prefix_bank_fixture(
+        rt, policy_fingerprint=fingerprint
+    )
+
+    prompt_state = restore_or_prefill_prompt_state(
+        rt,
+        list(range(12)),
+        mtp_history_policy="committed",
+        session_bank=bank,
+        policy_fingerprint=fingerprint,
+    )
+
+    assert prompt_state.cache_hit is True
+    assert prompt_state.cached_tokens == 8
+    assert prompt_state.restore_mode == "block_prefix_clone"
+    assert bank.restore_calls == 0
+    assert bank.near_allow_block == [True]
+    assert bank.prefix_restore_calls == [(8, "clone")]
+    assert block_entry.hits == 1
+
+
+def test_generic_client_block_restore_respects_boundary_true_off_switch(
+    monkeypatch,
+):
+    """With MTPLX_SESSION_BOUNDARY_TRUE_RESTORE=0 the pre-v2 caution comes
+    back for non-OpenCode clients: tiny-gap only, exact restore wins."""
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
+    monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
+    monkeypatch.setenv("MTPLX_SESSION_BOUNDARY_TRUE_RESTORE", "0")
+    model = TinyModel()
+    rt = _runtime(model, mtp_enabled=True)
+    _install_history_stub(monkeypatch)
+    fingerprint = "tool_prompt_mode=hybrid;client=pi"
+    bank, exact_entry, block_entry = _make_frozen_prefix_bank_fixture(
+        rt, policy_fingerprint=fingerprint
+    )
+
+    prompt_state = restore_or_prefill_prompt_state(
+        rt,
+        list(range(12)),
+        mtp_history_policy="committed",
+        session_bank=bank,
+        policy_fingerprint=fingerprint,
+    )
+
+    assert prompt_state.cached_tokens == exact_entry.prefix_len
+    assert bank.restore_calls == 1
+    assert bank.near_allow_block[0] is False
+    assert block_entry.hits == 0
+
+
+def test_generic_client_block_restore_respects_block_prefix_kill_switch(
+    monkeypatch,
+):
+    """MTPLX_SESSION_BLOCK_PREFIX_RESTORE=0 must still disable the block
+    lane for generic clients even with boundary-true restore on."""
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
+    monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
+    monkeypatch.setenv("MTPLX_SESSION_BLOCK_PREFIX_RESTORE", "0")
+    model = TinyModel()
+    rt = _runtime(model, mtp_enabled=True)
+    _install_history_stub(monkeypatch)
+    fingerprint = "tool_prompt_mode=hybrid;client=pi"
+    bank, exact_entry, block_entry = _make_frozen_prefix_bank_fixture(
+        rt, policy_fingerprint=fingerprint
+    )
+
+    prompt_state = restore_or_prefill_prompt_state(
+        rt,
+        list(range(12)),
+        mtp_history_policy="committed",
+        session_bank=bank,
+        policy_fingerprint=fingerprint,
+    )
+
+    assert prompt_state.cached_tokens == exact_entry.prefix_len
+    assert bank.restore_calls == 1
+    assert bank.near_allow_block[0] is False
+    assert block_entry.hits == 0
 
 
 def test_ssd_near_prefix_restore_time_is_cache_time_not_decode_time(monkeypatch):
@@ -1134,6 +1336,46 @@ def test_sustained_prefill_omlx_external_is_safe_profile_path(monkeypatch):
     assert rt.diagnostic_counters["prefill_external_cache_only_calls"] == 2
     assert rt.diagnostic_counters["prefill_omlx_external_calls"] == 2
     assert rt.diagnostic_counters.get("prefill_stock_cache_only_calls", 0) == 0
+
+
+def test_legacy_external_prefill_routes_streamed_experts_as_prefill(monkeypatch):
+    monkeypatch.setenv("MTPLX_PREFILL_OMLX_EXTERNAL", "1")
+
+    class PhaseRecordingModel(TinyModel):
+        def __init__(self):
+            super().__init__()
+            self.phases: list[RoutingPhase] = []
+
+        def __call__(self, input_ids, *, cache=None, **kwargs):
+            # token_count=1 would classify as decode without an explicit
+            # routing context, so a PREFILL observation proves the wrap.
+            self.phases.append(current_expert_routing_phase(token_count=1))
+            kwargs.pop("input_embeddings", None)
+            return super().__call__(input_ids, cache=cache, **kwargs)
+
+    model = PhaseRecordingModel()
+    rt = MTPLXRuntime(
+        model=model,
+        tokenizer=TinyTokenizer(),
+        model_path=Path("tiny"),
+        mtp_enabled=False,
+        contract=MTPContract(),
+        expert_streaming=SimpleNamespace(),
+    )
+
+    assert _prefill_cache_only_forward(rt, mx.array([[7]]), cache=[]) is None
+    assert (
+        _prefill_cache_only_forward(
+            rt,
+            mx.array([[7]]),
+            cache=[],
+            input_embeddings=object(),
+        )
+        is None
+    )
+
+    assert rt.diagnostic_counters["prefill_omlx_external_calls"] == 2
+    assert model.phases == [RoutingPhase.PREFILL, RoutingPhase.PREFILL]
 
 
 def test_sustained_prefill_forwards_logits_controls_through_patched_kwargs_wrapper(

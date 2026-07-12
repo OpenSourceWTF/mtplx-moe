@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect as py_inspect
 import json
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,8 @@ class MTPLXRuntime:
     mtp_adapter_path: Path | None = None
     mtp_adapter_metadata: dict[str, Any] | None = None
     mtp_adapter_merge_report: dict[str, Any] | None = None
+    expert_streaming: Any | None = None
+    resident_load_report: dict[str, Any] | None = None
     diagnostic_counters: dict[str, int] = field(default_factory=dict)
     _forward_ar_supports_emit_logits: bool | None = field(default=None, init=False, repr=False)
     _forward_ar_supports_logits_keep: bool | None = field(default=None, init=False, repr=False)
@@ -77,6 +80,40 @@ class MTPLXRuntime:
         text_model = getattr(self.model, "language_model", self.model)
         return text_model.model.embed_tokens(input_ids)
 
+    def _expert_routing_context(self, input_ids: Any):
+        if self.expert_streaming is None:
+            return nullcontext()
+        from .attention_context import current_attention_phase
+        from .expert_streaming import RoutingPhase
+        from .models.expert_mlx import expert_routing_phase
+
+        attention = current_attention_phase()
+        if attention == "prefill":
+            # A one-token prefill tail chunk is still prefill traffic: the
+            # width heuristic below would classify it as decode and pollute
+            # the persistent decode hot set.
+            return expert_routing_phase(RoutingPhase.PREFILL)
+        if attention in {"ar_decode", "decode_verify", "postcommit"}:
+            # MTP verify batches are decode traffic regardless of width.
+            return expert_routing_phase(RoutingPhase.DECODE)
+
+        decode_width = 1
+        if self.mtp_enabled:
+            # MTP verify batches are decode traffic: routing them as prefill
+            # would stop the persistent decode hot set from ever training
+            # once speculation is on.  With MTP off this stays exactly the
+            # historical single-token decode classification.
+            decode_width = max(
+                decode_width,
+                int(getattr(self.model, "mtp_verify_width", 1)),
+            )
+        phase = (
+            RoutingPhase.PREFILL
+            if self._sequence_len(input_ids) > decode_width
+            else RoutingPhase.DECODE
+        )
+        return expert_routing_phase(phase)
+
     def forward_ar(
         self,
         input_ids,
@@ -119,14 +156,15 @@ class MTPLXRuntime:
                 self._count("final_logits_tokens_emitted", 1)
             else:
                 self._count("full_logits_tokens_emitted", emitted)
-        if not return_hidden and hidden_variant is None and not kwargs:
-            return self.model(input_ids, cache=cache)
-        return self.model(
-            input_ids,
-            cache=cache,
-            return_hidden=return_hidden,
-            **kwargs,
-        )
+        with self._expert_routing_context(input_ids):
+            if not return_hidden and hidden_variant is None and not kwargs:
+                return self.model(input_ids, cache=cache)
+            return self.model(
+                input_ids,
+                cache=cache,
+                return_hidden=return_hidden,
+                **kwargs,
+            )
 
     def forward_ar_capture(
         self,
@@ -138,14 +176,15 @@ class MTPLXRuntime:
     ):
         from .gdn_capture import forward_with_gdn_capture
 
-        return forward_with_gdn_capture(
-            self.model,
-            input_ids,
-            cache=cache,
-            return_hidden=return_hidden,
-            hidden_variant=hidden_variant,
-            capture_backend=capture_backend,
-        )
+        with self._expert_routing_context(input_ids):
+            return forward_with_gdn_capture(
+                self.model,
+                input_ids,
+                cache=cache,
+                return_hidden=return_hidden,
+                hidden_variant=hidden_variant,
+                capture_backend=capture_backend,
+            )
 
     def draft_mtp(
         self,
@@ -276,6 +315,22 @@ class MTPLXRuntime:
         configure_mtp_attention_kv_cache(cache)
         return cache
 
+    def admit_kv_tokens(self, tokens: int):
+        """Reserve request KV capacity under the streamed memory plan."""
+
+        if self.expert_streaming is None:
+            return nullcontext()
+        return self.expert_streaming.admit_kv_tokens(tokens)
+
+    def expert_streaming_snapshot(self) -> dict[str, Any] | None:
+        if self.expert_streaming is None:
+            return None
+        return self.expert_streaming.snapshot()
+
+    def close(self, *, timeout: float | None = None) -> None:
+        if self.expert_streaming is not None:
+            self.expert_streaming.close(timeout=timeout)
+
 
 def load(
     model_path: Path | str,
@@ -286,13 +341,45 @@ def load(
     merge_mtp_adapter: bool = False,
     gemma4_draft_block_size: int | None = None,
     gemma4_target_distribution_mode: str | None = None,
+    expert_streaming_config: Any | None = None,
+    expert_manifest: Path | str | None = None,
+    mtp_artifacts: Path | str | None = None,
+    mtp_precision: str = "bf16",
 ) -> MTPLXRuntime:
-    """Load an MLX model and optionally inject native MTP support."""
+    """Load an MLX model and optionally inject native MTP support.
+
+    ``mtp_precision`` selects the streamed Hy3 layer-80 head build: ``"bf16"``
+    (default, per docs/FORGE_BACKEND_CONTRACT.md section 6 — quantized MTP
+    heads collapse acceptance) loads the bit-exact BF16 artifact (~7.5 GB
+    resident; budget it against the expert cache), ``"q4"`` loads the pinned
+    quantized artifacts (~1.94 GiB expert bank).
+    """
+    from .hy3_mtp_patch import HY3_MTP_PRECISIONS
+
     path = Path(model_path)
+    if mtp_precision not in HY3_MTP_PRECISIONS:
+        raise ValueError(
+            f"mtp_precision must be one of {HY3_MTP_PRECISIONS}; "
+            f"got {mtp_precision!r}"
+        )
+    streaming_requested = (
+        expert_streaming_config is not None or expert_manifest is not None
+    )
+    if (expert_streaming_config is None) != (expert_manifest is None):
+        raise ValueError(
+            "expert_streaming_config and expert_manifest must be supplied together"
+        )
+    if mtp_artifacts is not None and not streaming_requested:
+        raise ValueError(
+            "mtp_artifacts applies to streamed checkpoints only; non-streamed "
+            "models carry their own MTP weights"
+        )
     from .gemma4_pair import resolve_gemma4_pair_paths
 
     gemma4_pair = resolve_gemma4_pair_paths(path)
     if gemma4_pair is not None:
+        if streaming_requested:
+            raise ValueError("expert streaming does not support Gemma assistant pairs")
         if mtp:
             from .backends.gemma4_assistant import (
                 DEFAULT_DRAFT_BLOCK_SIZE,
@@ -330,7 +417,71 @@ def load(
     config = load_config(path)
     from .step3p5_mtp_patch import is_step3p5_mtp_config
 
-    if is_step3p5_mtp_config(config):
+    expert_runtime = None
+    resident_load_report = None
+    if streaming_requested:
+        from .expert_runtime import ExpertStreamingConfig, ExpertStreamingRuntime
+        from .expert_streaming_models import get_model_spec
+        from .models.expert_mlx import (
+            make_mlx_component_bank_allocator,
+            make_mlx_slot_buffer_allocator,
+        )
+        from .resident_loader import construct_resident_model
+
+        import mlx.core as mx
+
+        streaming_spec = get_model_spec(expert_streaming_config.model_key)
+        streaming_plan = expert_streaming_config.memory_plan(streaming_spec)
+        if expert_streaming_config.slot_layout == "component-banks":
+            from .expert_manifest import load_expert_manifest
+
+            streaming_manifest = load_expert_manifest(expert_manifest)
+            slot_allocator = make_mlx_component_bank_allocator(
+                streaming_plan,
+                streaming_spec,
+                streaming_manifest,
+            )
+        else:
+            slot_allocator = make_mlx_slot_buffer_allocator(
+                streaming_plan, streaming_spec
+            )
+
+        if not isinstance(expert_streaming_config, ExpertStreamingConfig):
+            raise TypeError(
+                "expert_streaming_config must be an ExpertStreamingConfig"
+            )
+        if mtp and mtp_artifacts is None:
+            raise RuntimeError(
+                "the pinned Hy3-4bit and GLM-5.2-4bit artifacts omit MTP weights; "
+                "pass mtp_artifacts=<layer-80 artifact directory> to enable "
+                "streamed Hy3 MTP or load with mtp=False"
+            )
+        if mtp and expert_streaming_config.model_key != "hy3-q4":
+            raise RuntimeError(
+                "streamed MTP artifacts are packaged for hy3-q4 only; "
+                f"got {expert_streaming_config.model_key!r}"
+            )
+        if mtp_adapter is not None or merge_mtp_adapter:
+            raise RuntimeError("MTP adapters are unavailable for streamed loading")
+        expert_runtime = ExpertStreamingRuntime.open(
+            path,
+            expert_manifest,
+            expert_streaming_config,
+            spec=streaming_spec,
+            buffer_allocator=slot_allocator,
+            device_synchronize=mx.synchronize,
+            apply_memory_cap=True,
+            mx_module=mx,
+        )
+        try:
+            resident = construct_resident_model(path, expert_runtime, config=config)
+            model = resident.model
+            resident_load_report = resident.report.as_dict()
+            tokenizer = _load_tokenizer_resilient(path, config)
+        except BaseException:
+            expert_runtime.close()
+            raise
+    elif is_step3p5_mtp_config(config):
         from mlx_lm.utils import load_model
 
         tokenizer = _load_tokenizer_resilient(path, config)
@@ -346,7 +497,19 @@ def load(
         .with_config_defaults(config)
     )
     mtp_enabled = False
-    if mtp:
+    if mtp and expert_runtime is not None:
+        from .hy3_mtp_patch import inject_hy3_streamed_mtp_support
+
+        try:
+            mtp_enabled = inject_hy3_streamed_mtp_support(
+                model, mtp_artifacts, config, contract, mtp_precision=mtp_precision
+            )
+            if not mtp_enabled or not validate_mtp_support(model):
+                raise RuntimeError(f"streamed Hy3 MTP injection failed for {path}")
+        except BaseException:
+            expert_runtime.close()
+            raise
+    elif mtp:
         from .deepseek_mtp_patch import inject_deepseek_mtp_support, is_deepseek_mtp_config
         from .glm_mtp_patch import inject_glm_mtp_support, is_glm_mtp_config
         from .mimo_mtp_patch import inject_mimo_mtp_support, is_mimo_mtp_config
@@ -372,6 +535,17 @@ def load(
 
     configure_split_full_attention(model)
     configure_native_mlp(model)
+    from .nax_verify import install_nax_qlinear_patch, nax_env_enabled
+
+    if nax_env_enabled():
+        nax_report = install_nax_qlinear_patch()
+        logger.info("[nax-verify] %s", nax_report)
+    from .kernel_selfcheck import maybe_run_model_selfcheck
+
+    # Turbo lanes validate themselves once per load on the model's actual
+    # dtype/quant format; a mismatching lane disables itself and serving
+    # continues on the stock path (surfaced in /health kernel_selfcheck).
+    maybe_run_model_selfcheck(model)
     adapter_path = Path(mtp_adapter) if mtp_adapter is not None else None
     adapter_metadata = None
     adapter_merge_report = None
@@ -392,6 +566,8 @@ def load(
         mtp_adapter_path=adapter_path,
         mtp_adapter_metadata=adapter_metadata,
         mtp_adapter_merge_report=adapter_merge_report,
+        expert_streaming=expert_runtime,
+        resident_load_report=resident_load_report,
     )
 
 

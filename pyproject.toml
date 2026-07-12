@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mtplx"
-version = "1.0.4"
+version = "2.0.2"
 description = "Native MTP speculative decoding for Qwen3-Next on Apple Silicon."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,6 +16,12 @@ dependencies = [
   "huggingface-hub>=0.36",
   "mlx>=0.31,<0.32; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "mlx-lm>=0.31,<0.32; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  # transformers 5.13.0 changed AutoTokenizer.register to require a config
+  # class as the key; mlx-lm 0.31.x still registers by name
+  # ("NewlineTokenizer") and crashes at import, killing every fresh install
+  # at model load (#136, #135; PR #137 by @davidtai). Drop the cap once
+  # mlx-lm registers the 5.13-compatible way (mlx-lm PR #1465).
+  "transformers<5.13; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "nanobind>=2; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "numpy>=2",
   "pydantic>=2",
@@ -68,6 +74,7 @@ include = ["mtplx*", "vllm_metal*"]
 
 [tool.setuptools.package-data]
 "mtplx.benchmarks" = ["prompts/*.jsonl"]
+"mtplx" = ["native/*.cpp"]
 "mtplx.dashboard" = ["_static/**/*"]
 "vllm_metal.metal" = [
   "README.md",

@@ -5,9 +5,11 @@ import MTPLXAppCore
 
 // MARK: - AssistantMarkdownView
 //
-// Markdown renderer for settled assistant bubbles. The live streaming path
-// paints one plain text surface from token-sized deltas; full markdown/code
-// rendering happens after generation.
+// Markdown renderer for assistant bubbles. Settled bubbles render fully;
+// the live streaming path promotes frozen fence-safe blocks to the same
+// settled pipeline (rendered once, cached by Equatable text) while the
+// growing tail stays plain text — markdown during streaming with no
+// per-token parsing cost.
 
 struct AssistantMarkdownView: View {
     let content: String
@@ -470,11 +472,23 @@ struct StreamingAssistantMarkdownView: View {
             if document.blocks.isEmpty {
                 StreamingPlainTextView(text: fallbackText)
             } else {
+                // Frozen fence-safe blocks render as full markdown ONCE
+                // (Equatable on text, so they never repaint as later
+                // tokens arrive); only the growing tail block — and any
+                // open-fence interior — stays a plain Text. Per-token
+                // cost is one linear safety pass plus the tail repaint,
+                // so streaming TPS is untouched (2026-07-03).
+                let blocks = document.blocks
+                let safety = StreamingMarkdownBlockSafety.classify(blocks.map(\.text))
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(document.blocks) { block in
-                        StreamingPlainBlockView(block: block)
-                            .equatable()
-                            .id(block.id)
+                    ForEach(Array(blocks.enumerated()), id: \.element.id) { index, block in
+                        if index < safety.count, safety[index] {
+                            StreamingSettledBlockView(text: block.text)
+                                .equatable()
+                        } else {
+                            StreamingPlainBlockView(block: block)
+                                .equatable()
+                        }
                     }
                 }
             }
@@ -483,6 +497,22 @@ struct StreamingAssistantMarkdownView: View {
         .transaction { tx in
             tx.animation = nil
         }
+    }
+}
+
+/// A frozen streaming block promoted to the settled markdown pipeline.
+/// Equatable on its text: SwiftUI evaluates the body once when the
+/// block freezes and never again during the rest of the stream.
+private struct StreamingSettledBlockView: View, Equatable {
+    let text: String
+
+    nonisolated static func == (lhs: StreamingSettledBlockView, rhs: StreamingSettledBlockView) -> Bool {
+        lhs.text == rhs.text
+    }
+
+    var body: some View {
+        SettledAssistantMarkdownView(content: text)
+            .padding(.bottom, 6)
     }
 }
 

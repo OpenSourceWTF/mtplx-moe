@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import os
 import time
+import weakref
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import mlx.core as mx
 
+from .attention_context import attention_phase
 from .gdn_capture import resolve_gdn_capture_backend
 
 
@@ -388,6 +390,13 @@ class TensorOffsetKVCache:
         self.cache = [keys, values, offset_array]
         self.rollback_state = [None, None, None]
         self.step = step
+        # Growth-budget tracking (2026-07-03): the first promotion grants
+        # headroom (`initial_reserve_tokens`); any capacity expansion AFTER
+        # that grant means the compiled verify graph would retrace, so the
+        # bank demotes the request to eager. Flag-based so the hot path never
+        # adds extra offset evals.
+        self._granted = False
+        self.growth_after_grant = False
 
     @classmethod
     def from_kv_cache(cls, entry: Any, *, reserve_tokens: int) -> "TensorOffsetKVCache":
@@ -445,7 +454,10 @@ class TensorOffsetKVCache:
             return
         capacity = int(self.keys.shape[2])
         if needed <= capacity:
+            self._granted = True
             return
+        if self._granted:
+            self.growth_after_grant = True
         new_capacity = ((needed + self.step - 1) // self.step) * self.step
         extra = new_capacity - capacity
         k_shape = (*self.keys.shape[:2], extra, self.keys.shape[3])
@@ -458,6 +470,7 @@ class TensorOffsetKVCache:
             [self.values, mx.zeros(v_shape, dtype=self.values.dtype)],
             axis=2,
         )
+        self._granted = True
 
     def update_and_fetch(self, keys, values):
         steps = int(keys.shape[2])
@@ -546,24 +559,56 @@ class TensorOffsetKVCache:
             return 0
         return self.keys.nbytes + self.values.nbytes + self.cache[2].nbytes
 
+    def demote(self):
+        """Restore a stock ``KVCache`` from this adapter.
+
+        The stock container receives the adapter's current key/value buffers
+        (no copy) and the materialized integer offset, so downstream consumers
+        that expect python-int offsets (postcommit, session bank snapshots)
+        never see a tensor-offset adapter.
+        """
+        from mlx_lm.models.cache import KVCache
+
+        entry = KVCache()
+        entry.step = self.step
+        entry.keys = self.cache[0]
+        entry.values = self.cache[1]
+        entry.offset = int(self.size()) if self.cache[0] is not None else 0
+        return entry
+
 
 def promote_kv_cache_offsets(
     cache: Any,
     *,
     reserve_tokens: int,
+    preserve_paged: bool | None = None,
+    initial_reserve_tokens: int | None = None,
 ) -> tuple[int, dict[str, int]]:
-    """Replace stock full-attention KV caches with tensor-offset adapters."""
+    """Replace stock full-attention KV caches with tensor-offset adapters.
+
+    ``preserve_paged`` controls what happens to ``VllmMetalPagedKVCache``
+    entries.  When true they are promoted in place to
+    ``TensorOffsetVllmMetalPagedKVCache`` (keeping the physical page buffers).
+    When false the paged entry falls through to the dense promotion path,
+    which reads ``entry.keys`` / ``entry.values`` — the ``.keys`` property on
+    the paged cache densifies the whole cache, so paged storage is silently
+    lost.  The default (``None``) preserves the historical behavior of the
+    ``MTPLX_GRAPHBANK_PRESERVE_PAGED_KV`` env switch; callers that must never
+    densify paged KV (e.g. ``CompiledVerifyBank``) pass ``True`` explicitly.
+    """
     promoted = 0
     failures: dict[str, int] = {}
     if cache is None:
         return promoted, failures
+    if preserve_paged is None:
+        preserve_paged = _env_enabled("MTPLX_GRAPHBANK_PRESERVE_PAGED_KV")
     for idx, entry in enumerate(cache):
         if entry is None:
             continue
         if isinstance(entry, TensorOffsetKVCache):
             entry.ensure_capacity(entry.size() + reserve_tokens)
             continue
-        if _env_enabled("MTPLX_GRAPHBANK_PRESERVE_PAGED_KV"):
+        if preserve_paged:
             try:
                 from .cache_state import (
                     TensorOffsetVllmMetalPagedKVCache,
@@ -579,6 +624,13 @@ def promote_kv_cache_offsets(
                 if entry.key_cache is None or entry.value_cache is None:
                     failures["empty_paged_kv_cache"] = (
                         failures.get("empty_paged_kv_cache", 0) + 1
+                    )
+                    continue
+                if getattr(entry, "turboquant", False) or getattr(entry, "kv_quant", False):
+                    # The tensor-offset adapter only understands plain bf16/fp16
+                    # pages; promoting quantized pages would corrupt them.
+                    failures["quantized_paged_kv_cache"] = (
+                        failures.get("quantized_paged_kv_cache", 0) + 1
                     )
                     continue
                 cache[idx] = TensorOffsetVllmMetalPagedKVCache.from_paged_cache(entry)
@@ -605,16 +657,24 @@ def promote_kv_cache_offsets(
             continue
         cache[idx] = TensorOffsetKVCache.from_kv_cache(
             entry,
-            reserve_tokens=reserve_tokens,
+            # First promotion may grant extra growth headroom so the compiled
+            # verify graph keeps a stable leaf shape for the whole span of a
+            # typical agent round; steady-state re-promotion calls above only
+            # top up by `reserve_tokens` (the verify length).
+            reserve_tokens=(
+                initial_reserve_tokens
+                if initial_reserve_tokens is not None
+                else reserve_tokens
+            ),
         )
         promoted += 1
     return promoted, failures
 
 
-def _env_enabled(name: str) -> bool:
+def _env_enabled(name: str, *, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
-        return False
+        return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -639,3 +699,1506 @@ def cache_array_tree(cache: Any) -> list[Any]:
             leaves.append(entry.state)
         tree.append(leaves)
     return tree
+
+
+# ---------------------------------------------------------------------------
+# W2 compiled verify: pure-function verify step over a shadow cache.
+#
+# The June-12 poisoning failure compiled the side-effecting forward directly:
+# tracer arrays were assigned into the *real* ArraysCache/paged cache lists and
+# python offsets were baked into the trace as constants, so the next trace died
+# with "eval an array without a primitive".  The firewall here is a persistent
+# shadow cache owned by the bank: the compiled function re-seeds every shadow
+# leaf from its explicit inputs BEFORE any read, runs the existing runtime
+# forward against the shadow containers, and returns every leaf as an explicit
+# output.  Tracers therefore never escape into the real cache; the dispatch
+# wrapper mirror-commits materialized outputs into the real entries.
+# ---------------------------------------------------------------------------
+
+VERIFY_SPEC_KIND_FULL_ATTN = "fa"
+VERIFY_SPEC_KIND_GDN = "gdn"
+
+TAPE_CAPTURE_KEYS = ("conv_states", "conv_out", "g", "state_in", "tape")
+STANDARD_CAPTURE_KEYS = ("conv_states", "states")
+_UNSUPPORTED_CAPTURE_BACKENDS = {
+    "linear_gdn_final",  # emits {"final_only": True}; nothing to flatten
+    "linear_gdn_from_conv_stream_skip0",  # capture_start-shifted layout
+}
+
+
+# One ladder walk per process: the shader cache it primes is process-global
+# (and OS-persistent), so re-walking on every per-generation bank instance
+# would be pure waste.
+_PREWARM_DONE = False
+
+# Process-global compiled verify callables, keyed by
+# (runtime id, capture backend, state spec, verify length, hidden variant,
+# bucket). The bank is per-generation; without sharing, every request pays a
+# fresh trace. Values are (compiled_fn, trace_host) where trace_host["bank"]
+# is re-pointed to the live bank before each dispatch so internal retraces
+# (mx.compile re-traces on leaf-shape changes) always use live scratch
+# containers. See CompiledVerifyBank._shared_or_new_verify_step.
+_SHARED_VERIFY_STEPS: dict[tuple, tuple[Any, dict[str, Any]]] = {}
+
+
+def _prewarm_enabled() -> bool:
+    raw = str(os.environ.get("MTPLX_COMPILED_VERIFY_PREWARM", "1")).strip().lower()
+    return raw not in {"0", "false", "off", ""}
+
+
+def compiled_verify_mode() -> str:
+    """Resolve MTPLX_COMPILED_VERIFY into 'off' | 'on' | 'parity' | 'parity2'.
+
+    ``parity``  — double-run with the eager leg authoritative; abort on the
+                  first mismatch (Gate A: per-call bit-exactness).
+    ``parity2`` — double-run with the COMPILED leg authoritative and an eager
+                  clone tracking it; log mismatches, never abort (Gate B:
+                  does compiled-committed state evolution diverge?).
+    """
+    raw = (os.environ.get("MTPLX_COMPILED_VERIFY") or "").strip().lower()
+    if raw in {"", "0", "false", "no", "off"}:
+        return "off"
+    if raw in {"parity", "parity2"}:
+        return raw
+    return "on"
+
+
+def _next_pow2(value: int) -> int:
+    value = max(1, int(value))
+    return 1 << (value - 1).bit_length()
+
+
+def _owned_state_env_active(name: str) -> bool:
+    """True when an owned-state wrapper env is set to any enabling value.
+
+    These envs carry mode names (e.g. ``persistent_eval``) rather than plain
+    booleans, so anything other than empty/off counts as active.
+    """
+    raw = (os.environ.get(name) or "").strip().lower()
+    return raw not in {"", "0", "false", "no", "off"}
+
+
+def build_verify_state_spec(cache: Any) -> tuple[list[tuple[int, str, int]] | None, str | None]:
+    """Ordered (layer_idx, kind, n_leaves) spec over the cache list.
+
+    Full-attention tensor-offset entries contribute their three ``cache[0..2]``
+    leaves; GDN ``ArraysCache`` entries contribute their two slots.  ``None``
+    entries contribute nothing.  Any other container makes the cache
+    non-compilable and returns ``(None, reason)``.
+    """
+    try:
+        from mlx_lm.models.cache import ArraysCache
+    except Exception:  # pragma: no cover - mlx_lm always present in product envs
+        ArraysCache = None
+    try:
+        from .cache_state import TensorOffsetVllmMetalPagedKVCache
+    except Exception:  # pragma: no cover - import guard for minimal test envs
+        TensorOffsetVllmMetalPagedKVCache = None
+
+    spec: list[tuple[int, str, int]] = []
+    for idx, entry in enumerate(cache or []):
+        if entry is None:
+            continue
+        if isinstance(entry, TensorOffsetKVCache) or (
+            TensorOffsetVllmMetalPagedKVCache is not None
+            and isinstance(entry, TensorOffsetVllmMetalPagedKVCache)
+        ):
+            spec.append((idx, VERIFY_SPEC_KIND_FULL_ATTN, 3))
+            continue
+        if ArraysCache is not None and isinstance(entry, ArraysCache):
+            if len(entry.cache) != 2:
+                return None, f"unsupported_container:ArraysCache[{len(entry.cache)}]"
+            spec.append((idx, VERIFY_SPEC_KIND_GDN, 2))
+            continue
+        return None, f"unsupported_container:{type(entry).__name__}"
+    return spec, None
+
+
+def _paged_kernel_bucket_eligible(entry: Any, length: int, bucket: int) -> bool:
+    """Best-effort eager mirror of sdpa_2pass_paged_tail_dynamic_offset gates.
+
+    A miss here is a performance decision, not a correctness one: inside the
+    compiled function the kernel declining simply routes to the pure dense
+    ``cache.state`` math, which stays trace-safe.
+    """
+    key_cache = entry.cache[0]
+    value_cache = entry.cache[1]
+    if key_cache is None or value_cache is None:
+        return False
+    if not mx.metal.is_available():
+        return False
+    if key_cache.dtype not in (mx.bfloat16, mx.float16):
+        return False
+    if key_cache.dtype != value_cache.dtype:
+        return False
+    if int(entry.block_size) != int(key_cache.shape[1]):
+        return False
+    head_dim = int(key_cache.shape[3])
+    if head_dim != int(value_cache.shape[3]) or head_dim not in {64, 96, 128, 256}:
+        return False
+    max_q = int(os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q", "16") or "16")
+    if length > max_q:
+        return False
+    from .kernels.sdpa_2pass import _compute_blocks
+
+    blocks = _compute_blocks(max(1, int(length)), int(bucket))
+    return blocks > 0 and blocks % 32 == 0
+
+
+def _as_numpy(value: Any):
+    import numpy as np
+
+    try:
+        import mlx.core as mx
+
+        if isinstance(value, mx.array) and value.dtype == mx.bfloat16:
+            # numpy has no bf16 buffer support; widening to float32 is exact
+            # (every bf16 maps to a unique float32), so bit-equality on the
+            # widened arrays is bit-equality on the originals.
+            return np.asarray(value.astype(mx.float32))
+    except Exception:
+        pass
+    return np.asarray(value)
+
+
+def _copy_state_leaf(leaf: Any) -> Any:
+    """Materialized copy of a cache state leaf.
+
+    ``mx.array(existing)`` allocates a fresh buffer (dtype-preserving, immune
+    to donation of the source), which is what lets the parity2 eager clone
+    replay a verify step without sharing a single buffer with the live
+    compiled-authoritative stream.
+    """
+    if isinstance(leaf, mx.array):
+        return mx.array(leaf)
+    return leaf
+
+
+def _artifact_kind(name: str) -> str:
+    """Map a compare_verify_outputs leaf name to its artifact family."""
+    if name == "logits":
+        return "logits"
+    if name == "hidden":
+        return "hidden"
+    if name.startswith("capture["):
+        return "capture"
+    if name.startswith("state["):
+        return "state"
+    return "other"
+
+
+def _leaf_max_abs_diff(reference: Any, candidate: Any) -> float | None:
+    """Max-abs difference between two leaves, or None when incomparable."""
+    import numpy as np
+
+    if reference is None or candidate is None:
+        return None
+    if not hasattr(reference, "shape") or not hasattr(candidate, "shape"):
+        return None
+    ref_np = _as_numpy(reference)
+    cand_np = _as_numpy(candidate)
+    if ref_np.shape != cand_np.shape:
+        return None
+    try:
+        diff = np.asarray(ref_np, dtype=np.float64) - np.asarray(
+            cand_np, dtype=np.float64
+        )
+    except (TypeError, ValueError):
+        return None
+    if not diff.size:
+        return 0.0
+    with np.errstate(invalid="ignore"):
+        return float(np.nanmax(np.abs(diff)))
+
+
+def _compiled_verify_max_context() -> int:
+    """Context ceiling for the compiled verify step (tokens). Beyond it the
+    bank falls back to eager for that call. Default 6144 = the highest
+    context Gate A has proven bit-exact AND the ABBA showed +4.8%; past it
+    the 2026-07-02 long-form pair measured -28% with a seed-0 trajectory
+    fork (boundary materialization scales with context; bucket-crossing
+    numerics untested). 0 disables the ceiling (experiments only)."""
+    import os
+
+    raw = str(os.environ.get("MTPLX_COMPILED_VERIFY_MAX_CONTEXT", "6144")).strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 6144
+    return max(0, value)
+
+
+def _compiled_verify_boundary() -> str:
+    import os
+
+    raw = str(os.environ.get("MTPLX_COMPILED_VERIFY_BOUNDARY", "both")).strip().lower()
+    return raw if raw in ("both", "pre", "post", "none") else "both"
+
+
+def _compiled_verify_donation_enabled() -> bool:
+    """A2.1 commit-first ownership handoff (speed-war Lane A2, 2026-07-06).
+
+    Donation of a KV buffer into its in-graph ``slice_update`` requires the
+    graph to hold the ONLY reference when the graph is scheduled.  The
+    historical dispatch order (async_eval outputs -> mirror-commit) kept the
+    real cache entries and the ``state_in`` list alive at schedule time, so
+    every compiled verify call materialized a full copy of every full-attn
+    K and V buffer: measured 16.5 ms at 64k / ~33 ms at 128k per call
+    (compiled_copy_tax_probe.py arms A vs G, 2026-07-06).  Committing the
+    output leaves into the real cache FIRST and dropping the dispatcher
+    reference before ``async_eval`` unblocks donation with byte-identical
+    results (chained-pending + snapshot-COW proof:
+    compiled_copy_tax_correctness.py).  Default ON; env kill-switch for
+    A/B and emergency revert.
+    """
+    import os
+
+    raw = str(os.environ.get("MTPLX_COMPILED_VERIFY_DONATION", "1")).strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _compiled_verify_growth_reserve() -> int:
+    """Dense-leaf growth headroom granted at first promotion (tokens).
+
+    Sized so a typical agent tool round (40-500 generated tokens) completes
+    inside one stable leaf shape: one trace per (length, capacity) class,
+    zero mid-round retraces. Long generations exceed the grant and demote to
+    eager for the request remainder, which measured flat vs eager-only.
+    """
+
+    raw = str(os.environ.get("MTPLX_COMPILED_VERIFY_GROWTH_RESERVE", "512")).strip()
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 512
+
+
+def _runtime_trunk_quant_bits(runtime: Any) -> int | None:
+    """Bits of the first quantized trunk projection, or None if unquantized.
+
+    Used by the turbo-profile per-model gate. 4-bit (Optimized-Speed) and
+    8-bit (Optimized-Quality) trunks are measured wins with the growth-demote
+    + shared-traces bank (2026-07-04 re-measure: q8 +10% bare / flat @7k /
+    +6% rules-context, parity2 zero divergences — the 07-02 sprint's q8
+    -15/-18% verdict was the per-request trace tax, since removed). Other
+    quantizations (6-bit 9B) stay eager until measured.
+    """
+
+    try:
+        model = getattr(runtime, "model", None)
+        text_model = getattr(model, "language_model", model)
+        inner = getattr(text_model, "model", text_model)
+        for layer in getattr(inner, "layers", []) or []:
+            for attr_path in (
+                ("self_attn", "q_proj"),
+                ("mlp", "gate_proj"),
+                ("linear_attn", "in_proj_qkvz"),
+            ):
+                node = layer
+                for name in attr_path:
+                    node = getattr(node, name, None)
+                    if node is None:
+                        break
+                bits = getattr(node, "bits", None)
+                if bits is not None:
+                    return int(bits)
+        return None
+    except Exception:
+        return None
+
+
+def _compiled_verify_bits_gate_ok(runtime: Any) -> bool:
+    if _env_enabled("MTPLX_COMPILED_VERIFY_FORCE"):
+        return True
+    bits = _runtime_trunk_quant_bits(runtime)
+    # Measured-win allowlist: 4-bit and 8-bit affine trunks engage;
+    # unquantized (None) passes for test rigs and bf16 research models.
+    # Unmeasured quantizations (e.g. the 6-bit 9B) stay eager.
+    return bits is None or bits in (4, 8)
+
+
+def compare_verify_outputs(
+    reference: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    max_report_lines: int = 24,
+) -> list[str]:
+    """Exact-equality diff between two named verify output trees.
+
+    Both arguments are flat mappings ``name -> leaf`` where leaves are arrays
+    (mx or numpy) or plain python values.  Returns human-readable mismatch
+    lines; an empty list means bit-exact agreement.
+    """
+    import numpy as np
+
+    lines: list[str] = []
+
+    def add(line: str) -> None:
+        if len(lines) < max_report_lines:
+            lines.append(line)
+        elif len(lines) == max_report_lines:
+            lines.append("... report truncated ...")
+
+    for name in sorted(set(reference) | set(candidate)):
+        if name not in reference:
+            add(f"{name}: missing from reference output")
+            continue
+        if name not in candidate:
+            add(f"{name}: missing from candidate output")
+            continue
+        ref = reference[name]
+        cand = candidate[name]
+        if ref is None or cand is None:
+            if ref is not cand:
+                add(f"{name}: one side is None ({type(ref).__name__} vs {type(cand).__name__})")
+            continue
+        if not hasattr(ref, "shape") and not hasattr(cand, "shape"):
+            if ref != cand:
+                add(f"{name}: value mismatch ({ref!r} vs {cand!r})")
+            continue
+        ref_np = _as_numpy(ref)
+        cand_np = _as_numpy(cand)
+        if ref_np.shape != cand_np.shape:
+            add(f"{name}: shape mismatch ({ref_np.shape} vs {cand_np.shape})")
+            continue
+        if ref_np.dtype != cand_np.dtype:
+            add(f"{name}: dtype mismatch ({ref_np.dtype} vs {cand_np.dtype})")
+            continue
+        if not np.array_equal(ref_np, cand_np):
+            both = np.asarray(ref_np, dtype=np.float64) - np.asarray(cand_np, dtype=np.float64)
+            with np.errstate(invalid="ignore"):
+                max_abs = float(np.nanmax(np.abs(both))) if both.size else 0.0
+            mismatched = int(np.sum(ref_np != cand_np))
+            add(
+                f"{name}: value mismatch (elements={mismatched}/{ref_np.size}, "
+                f"max_abs_diff={max_abs:.3e})"
+            )
+    return lines
+
+
+class CompiledVerifyParityError(RuntimeError):
+    """Raised in parity mode when compiled and eager verify outputs diverge."""
+
+    def __init__(self, report: list[str]) -> None:
+        self.report = list(report)
+        super().__init__(
+            "compiled verify parity mismatch:\n" + "\n".join(self.report)
+        )
+
+
+class CompiledVerifyBank:
+    """Compiled speculative-verify dispatcher with a shadow-cache firewall.
+
+    ``verify_step(input_ids, *state_in) -> (logits, hidden, *captures_flat,
+    *state_out)`` is a pure function: every piece of cache state enters as an
+    explicit input leaf and leaves as an explicit output leaf.  The dispatch
+    wrapper reads the leaves from the real (promoted) cache entries, calls the
+    compiled function, and mirror-commits the outputs back into the real
+    entries with ``rollback_state`` cleared so the untouched accept
+    (``commit_captured_prefix``) and reject (``rollback_after_verify`` ->
+    offset-only ``trim``) paths keep working unchanged.
+    """
+
+    def __init__(
+        self,
+        runtime: Any,
+        *,
+        max_verify_len: int | None = None,
+        capture_backend: str | None = None,
+        parity: bool = False,
+        parity2: bool = False,
+    ) -> None:
+        self.runtime = runtime
+        if max_verify_len is None:
+            raw = os.environ.get("MTPLX_COMPILED_VERIFY_MAX_LEN", "").strip()
+            max_verify_len = int(raw) if raw else 6
+        self.max_verify_len = int(max_verify_len)
+        self.capture_backend = resolve_gdn_capture_backend(capture_backend)
+        self.parity = bool(parity)
+        self.parity2 = bool(parity2)
+        if self.parity and self.parity2:
+            raise ValueError(
+                "CompiledVerifyBank: parity and parity2 are mutually exclusive"
+            )
+        self.permanent_eager = False
+        if not parity and not parity2 and not _compiled_verify_bits_gate_ok(runtime):
+            # Per-model promotion gate: only 4-bit affine trunks measured a
+            # win; q8 (Optimized-Quality) measured -15/-18% and stays eager.
+            self.permanent_eager = True
+        self._capture_accepts_backend = _accepts_capture_backend(runtime)
+        self._compiled: dict[tuple[int, str, int], Any] = {}
+        self._spec: list[tuple[int, str, int]] | None = None
+        self._shadow: list[Any] | None = None
+        self._shadow_signature: tuple[Any, ...] | None = None
+        self._gdn_meta_cache: dict[int, dict[str, int] | None] = {}
+        self._exception_failures = 0
+        self._held_state_refs: list = []
+        # Growth-budget demotion (2026-07-03): dense leaves that outgrow the
+        # capacity granted at first promotion would retrace the compiled graph
+        # on every 256-token step (measured: 5 retraces per 1.3k-token answer,
+        # one 9.5s first-compile stall mid-generation at 7k). Once the request
+        # exhausts its growth budget the bank stays eager for the rest of the
+        # generation: agent-length rounds (<= ~500 tokens) run fully compiled,
+        # long chat generations pay zero retraces and zero padded-mask tax.
+        self._growth_demoted = False
+        self._dense_capacity_grant: dict[int, int] | None = None
+        self.stats: dict[str, Any] = {
+            "calls": 0,
+            "compiled_calls": 0,
+            "fallback_calls": 0,
+            "fallback_reasons": {},
+            "buckets": {},
+            "promoted": 0,
+            "demotions": 0,
+            "traces": 0,
+            "parity_checks": 0,
+            "parity_failures": 0,
+            "parity2_calls": 0,
+            "parity2_divergent_calls": 0,
+            "parity2_first_divergence": None,
+        }
+
+    # -- public API ---------------------------------------------------------
+
+    def forward_ar_capture(
+        self,
+        input_ids,
+        *,
+        cache=None,
+        return_hidden: bool = True,
+        hidden_variant: str | None = None,
+    ):
+        global _PREWARM_DONE
+        if (
+            not _PREWARM_DONE
+            and not self.parity
+            and not self.parity2
+            and _prewarm_enabled()
+        ):
+            # First compiled dispatch of the process (normally the startup
+            # warmup generation): walk the PAGED bucket ladder once so those
+            # graphs (and their Metal pipelines) exist before any user-facing
+            # generation — paged bucket crossings were the bulk of the −28%
+            # unrouted long-form cost (MEASUREMENTS 2026-07-02). On the dense
+            # path this is a deliberate no-op ("no_paged_entries"): dense KV
+            # retraces every 256 tokens of growth (5 traces per 1.3k-token
+            # chat answer, measured 2026-07-02 21:25) and pre-walking ~24
+            # shape classes to 6k is startup-prohibitive — the designed fix
+            # there is pow2-bucketized dense leaves, not a longer prewarm.
+            _PREWARM_DONE = True
+            report = self.prewarm_ladder(
+                cache, input_ids, hidden_variant=hidden_variant
+            )
+            self.stats["prewarm"] = report
+            try:
+                import json as _json
+
+                print(
+                    "[mtplx] compiled-verify prewarm " + _json.dumps(report),
+                    flush=True,
+                )
+            except Exception:
+                pass
+        self.stats["calls"] += 1
+        reason = self._fallback_reason(input_ids, cache, return_hidden)
+        if reason is not None:
+            return self._fallback(
+                input_ids,
+                cache=cache,
+                return_hidden=return_hidden,
+                hidden_variant=hidden_variant,
+                reason=reason,
+            )
+        length = _decode_length(input_ids)
+        try:
+            bucket = self._resolve_bucket(cache, length)
+            if bucket is None:
+                return self._fallback(
+                    input_ids,
+                    cache=cache,
+                    return_hidden=return_hidden,
+                    hidden_variant=hidden_variant,
+                    reason="capacity_overflow",
+                )
+            max_ctx = _compiled_verify_max_context()
+            if max_ctx and getattr(self, "_last_context_estimate", 0) > max_ctx:
+                # Context-scaled router: compiled verify is proven bit-exact
+                # and +4.8% only up to ~6k ctx; beyond, eager wins and the
+                # exactness corpus has no coverage. Fall back per call.
+                return self._fallback(
+                    input_ids,
+                    cache=cache,
+                    return_hidden=return_hidden,
+                    hidden_variant=hidden_variant,
+                    reason="context_above_threshold",
+                )
+            ineligible = self._paged_ineligibility(cache, length, bucket)
+            if ineligible is not None:
+                return self._fallback(
+                    input_ids,
+                    cache=cache,
+                    return_hidden=return_hidden,
+                    hidden_variant=hidden_variant,
+                    reason=ineligible,
+                )
+            self._ensure_shadow(cache)
+            self._apply_bucket(cache, bucket)
+            # Boundary policy (experiment knob, 2026-07-02 sprint):
+            #   pre  — materialize pending input state with the eager kernels
+            #          before entering the compiled function. Exactness
+            #          boundary: a lazy upstream graph absorbed into compiled
+            #          execution computes with fused-kernel numerics (~1e-6),
+            #          breaking bit-parity with the eager reference.
+            #   post — schedule evaluation of outputs while the input leaves
+            #          are still referenced by the real cache. Buffer-safety
+            #          boundary: without it, mirror-commit drops the last
+            #          input references while the compiled graph is pending
+            #          and the allocator reuses their buffers.
+            # MTPLX_COMPILED_VERIFY_BOUNDARY = both (default) | pre | post |
+            # none. When 'post' is dropped, buffer safety is preserved by
+            # holding the input references until the NEXT dispatch instead
+            # (self._held_state_refs) — no numerics cost, no forced batch.
+            boundary = _compiled_verify_boundary()
+            donate = (
+                _compiled_verify_donation_enabled()
+                and not self.parity
+                and not self.parity2
+                and boundary in ("both", "post")
+            )
+            if donate:
+                # A2.1: the shadow twins hold promotion-time leaf refs that
+                # (a) pin one full stale KV buffer set for the generation and
+                # (b) alias the first call's input buffers, blocking their
+                # donation. The traced body re-seeds every slot from the
+                # explicit inputs before any read, so the held refs are dead.
+                self._clear_shadow_leaf_refs()
+            key = (length, str(hidden_variant or ""), int(bucket))
+            fn = self._compiled.get(key)
+            if fn is None:
+                fn = self._shared_or_new_verify_step(key, length, hidden_variant)
+                self._compiled[key] = fn
+            state_in = self._read_state_leaves(cache)
+            if state_in is None:
+                return self._fallback(
+                    input_ids,
+                    cache=cache,
+                    return_hidden=return_hidden,
+                    hidden_variant=hidden_variant,
+                    reason="empty_state_leaf",
+                )
+            if boundary in ("both", "pre"):
+                mx.async_eval(*state_in)
+            outputs = fn(input_ids, *state_in)
+            logits, hidden, captures_flat, state_out = self._unpack_outputs(outputs)
+            if donate:
+                # A2.1 commit-first ownership handoff — commit + schedule
+                # happen AFTER this fallback-safe block (see below): once the
+                # real cache is rebound to the outputs, an eager fallback
+                # would double-apply the verify window.
+                pass
+            elif boundary in ("both", "post"):
+                mx.async_eval(*outputs)
+                self._held_state_refs.clear()
+            else:
+                # Keep inputs alive across a 3-generation window: with the
+                # deferred serve path, call N-1's graph may still be pending
+                # when call N dispatches, so a single-slot hold can release
+                # buffers the allocator then reuses. Three generations covers
+                # the deepest deferred chain the serve path produces
+                # (experiment probe; production would release on evidence).
+                self._held_state_refs.append(state_in)
+                if len(self._held_state_refs) > 3:
+                    self._held_state_refs.pop(0)
+        except Exception as exc:
+            self._exception_failures += 1
+            if self._exception_failures >= 3:
+                self.permanent_eager = True
+            return self._fallback(
+                input_ids,
+                cache=cache,
+                return_hidden=return_hidden,
+                hidden_variant=hidden_variant,
+                reason=f"exception:{type(exc).__name__}",
+            )
+        self._exception_failures = 0
+        self.stats["compiled_calls"] += 1
+        bucket_key = str(int(bucket))
+        self.stats["buckets"][bucket_key] = self.stats["buckets"].get(bucket_key, 0) + 1
+        captures = self._rebuild_captures(captures_flat)
+        if self.parity:
+            return self._parity_check(
+                input_ids,
+                cache=cache,
+                hidden_variant=hidden_variant,
+                state_in=state_in,
+                compiled_logits=logits,
+                compiled_hidden=hidden,
+                compiled_captures=captures,
+                compiled_state_out=state_out,
+            )
+        if self.parity2:
+            return self._parity2_check(
+                input_ids,
+                cache=cache,
+                hidden_variant=hidden_variant,
+                bucket=int(bucket),
+                compiled_logits=logits,
+                compiled_hidden=hidden,
+                compiled_captures=captures,
+                compiled_state_out=state_out,
+            )
+        self._mirror_commit(cache, state_out)
+        if donate:
+            # A2.1 commit-first ownership handoff: the real cache is already
+            # rebound to the output leaves, so dropping the dispatcher's
+            # ``state_in`` list makes the pending graph the ONLY holder of
+            # each input KV buffer at schedule time.  MLX then donates the
+            # buffer into the in-graph ``slice_update`` instead of
+            # materializing a full copy of every full-attn K/V buffer per
+            # verify call (measured 16.5 ms @64k, ~33 ms @128k — probe arms
+            # A vs G, outputs/ivanbench-20260705/compiled_copy_tax_probe.py).
+            # Byte-exactness across chained pending calls and snapshot-COW
+            # pinning proven in compiled_copy_tax_correctness.py; buffers
+            # shared with a bank entry (restore/postcommit views) simply COW
+            # once, exactly as before.  (A freshly built shadow still holds
+            # the promotion-time leaves, so the first call of a generation
+            # pays one copy; calls 2+ donate because the shadow's stale refs
+            # never alias the current inputs.)
+            state_in = None
+            self._held_state_refs.clear()
+            mx.async_eval(*outputs)
+        return logits, hidden, captures
+
+    def prewarm_ladder(
+        self,
+        cache: Any,
+        input_ids,
+        *,
+        hidden_variant: str | None = None,
+        max_context: int | None = None,
+    ) -> dict[str, Any]:
+        """Compile-and-execute the verify step once per pow2 bucket up to
+        the router boundary, priming the Metal shader cache.
+
+        Outputs are discarded and state is never committed (`verify_step`
+        is a pure function of its state leaves), so the caller's cache is
+        untouched apart from the static bucket ceiling, which is restored
+        to its natural value before returning. Failures are recorded per
+        bucket and never flip ``permanent_eager`` — a bucket that cannot
+        prewarm simply pays its organic compile later.
+        """
+        report: dict[str, Any] = {"buckets": [], "skipped": [], "elapsed_s": 0.0}
+        started = time.perf_counter()
+
+        def _finish() -> dict[str, Any]:
+            report["elapsed_s"] = round(time.perf_counter() - started, 3)
+            return report
+
+        if self.permanent_eager:
+            report["skipped"].append("permanent_eager")
+            return _finish()
+        reason = self._fallback_reason(input_ids, cache, True)
+        if reason is not None:
+            report["skipped"].append(reason)
+            return _finish()
+        length = _decode_length(input_ids)
+        try:
+            natural = self._resolve_bucket(cache, length)
+        except Exception as exc:
+            report["skipped"].append(f"resolve:{type(exc).__name__}")
+            return _finish()
+        if not natural:
+            report["skipped"].append(
+                "capacity_overflow" if natural is None else "no_paged_entries"
+            )
+            return _finish()
+        boundary = (
+            int(max_context)
+            if max_context is not None
+            else _compiled_verify_max_context()
+        )
+        if boundary <= 0:
+            # Router disabled: only the natural bucket is reachable cheaply;
+            # deeper buckets appear at unbounded context growth and warming
+            # them all is unbounded work.
+            boundary = int(natural)
+        min_capacity: int | None = None
+        for idx, kind, _n in self._spec or []:
+            if kind != VERIFY_SPEC_KIND_FULL_ATTN:
+                continue
+            entry = cache[idx]
+            if hasattr(entry, "capacity"):
+                cap = int(entry.capacity)
+                min_capacity = cap if min_capacity is None else min(min_capacity, cap)
+        ceiling = _next_pow2(boundary + length + 512)
+        ladder: list[int] = []
+        bucket = int(natural)
+        while True:
+            if min_capacity is not None:
+                bucket = min(bucket, min_capacity)
+            if bucket not in ladder:
+                ladder.append(bucket)
+            if min_capacity is not None and bucket >= min_capacity:
+                break
+            if bucket >= ceiling:
+                break
+            bucket *= 2
+        self._ensure_shadow(cache)
+        state_in = self._read_state_leaves(cache)
+        if state_in is None:
+            report["skipped"].append("empty_state_leaf")
+            return _finish()
+        for bucket in ladder:
+            if self._paged_ineligibility(cache, length, bucket) is not None:
+                report["skipped"].append(f"b{bucket}:paged_kernel_ineligible")
+                continue
+            try:
+                self._apply_bucket(cache, bucket)
+                key = (length, str(hidden_variant or ""), int(bucket))
+                fn = self._compiled.get(key)
+                if fn is None:
+                    fn = mx.compile(self._make_verify_step(length, hidden_variant))
+                    self._compiled[key] = fn
+                bucket_started = time.perf_counter()
+                outputs = fn(input_ids, *state_in)
+                # Synchronous eval: the compile cost is paid HERE, and no
+                # graph is left pending, so no held-reference bookkeeping
+                # is needed. Outputs are dropped, never committed.
+                mx.eval(*outputs)
+                report["buckets"].append(
+                    {
+                        "bucket": int(bucket),
+                        "s": round(time.perf_counter() - bucket_started, 3),
+                    }
+                )
+            except Exception as exc:
+                report["skipped"].append(f"b{bucket}:{type(exc).__name__}")
+        try:
+            restored = self._resolve_bucket(cache, length)
+            if restored:
+                self._apply_bucket(cache, restored)
+        except Exception:
+            pass
+        return _finish()
+
+    def demote(self, cache: Any) -> int:
+        """Restore stock containers for every tensor-offset adapter in place.
+
+        Mandatory before postcommit / final-state capture: downstream cache
+        consumers must never see promoted adapters.
+        """
+        try:
+            from .cache_state import TensorOffsetVllmMetalPagedKVCache
+        except Exception:  # pragma: no cover - import guard for minimal test envs
+            TensorOffsetVllmMetalPagedKVCache = None
+        count = 0
+        for idx, entry in enumerate(cache or []):
+            if isinstance(entry, TensorOffsetKVCache):
+                cache[idx] = entry.demote()
+                count += 1
+            elif TensorOffsetVllmMetalPagedKVCache is not None and isinstance(
+                entry, TensorOffsetVllmMetalPagedKVCache
+            ):
+                cache[idx] = entry.demote()
+                count += 1
+        if count:
+            self.stats["demotions"] += count
+            # Container identity changed; compiled closures bound the old
+            # shadow, which no longer mirrors the cache list.
+            self._shadow = None
+            self._shadow_signature = None
+            self._spec = None
+            self._compiled.clear()
+        return count
+
+    def to_dict(self) -> dict[str, Any]:
+        data = dict(self.stats)
+        data["fallback_reasons"] = dict(self.stats["fallback_reasons"])
+        data["buckets"] = dict(self.stats["buckets"])
+        first_divergence = self.stats.get("parity2_first_divergence")
+        data["parity2_first_divergence"] = (
+            dict(first_divergence) if isinstance(first_divergence, dict) else None
+        )
+        if self.parity2:
+            data["mode"] = "parity2"
+        else:
+            data["mode"] = "parity" if self.parity else "on"
+        data["max_verify_len"] = self.max_verify_len
+        data["capture_backend"] = self.capture_backend
+        data["permanent_eager"] = self.permanent_eager
+        data["compiled_entry_count"] = len(self._compiled)
+        data["compiled_keys"] = [
+            f"m{length}:{variant or 'default'}:b{bucket}"
+            for length, variant, bucket in sorted(self._compiled)
+        ]
+        return data
+
+    # -- dispatch preconditions ----------------------------------------------
+
+    def _fallback_reason(self, input_ids, cache, return_hidden: bool) -> str | None:
+        if self.permanent_eager:
+            return "permanent_eager"
+        if not return_hidden:
+            return "hidden_not_requested"
+        shape = getattr(input_ids, "shape", None)
+        if shape is None or len(shape) != 2:
+            return "invalid_input_shape"
+        if int(shape[0]) != 1:
+            return "batch_size"
+        length = int(shape[1])
+        if length < 1:
+            return "invalid_length"
+        if length > self.max_verify_len:
+            return "length_outside_bank"
+        if self.capture_backend in _UNSUPPORTED_CAPTURE_BACKENDS:
+            return "unsupported_capture_backend"
+        if _owned_state_env_active("MTPLX_OWNED_ATTN_KV"):
+            return "owned_attn_kv_env"
+        if _owned_state_env_active("MTPLX_OWNED_RECURRENT_STATE"):
+            return "owned_recurrent_state_env"
+        if cache is None:
+            return "no_cache"
+        if self._growth_demoted:
+            # Cache was demoted back to stock entries when the growth budget
+            # tripped; the plain eager path owns the rest of this request.
+            return "growth_budget_exhausted"
+        promoted, failures = promote_kv_cache_offsets(
+            cache,
+            reserve_tokens=length,
+            preserve_paged=True,
+            initial_reserve_tokens=max(length, _compiled_verify_growth_reserve()),
+        )
+        self.stats["promoted"] += promoted
+        for entry in cache:
+            if isinstance(entry, TensorOffsetKVCache) and entry.growth_after_grant:
+                # A dense leaf outgrew its first-promotion grant: every
+                # further growth step would retrace the compiled graph, and
+                # eager-on-adapter pays capacity-wide masks + non-donatable
+                # slice updates (measured -15% vs clean eager at 7k). Demote
+                # to stock entries NOW and stay eager for the rest of this
+                # request (the bank is per-request, so the next round
+                # re-grants fresh headroom).
+                self._growth_demoted = True
+                self.stats["growth_demotions"] = (
+                    int(self.stats.get("growth_demotions", 0)) + 1
+                )
+                self.demote(cache)
+                return "growth_budget_exhausted"
+        if failures:
+            if "quantized_paged_kv_cache" in failures:
+                return "quantized_paged_kv"
+            return "promotion_failure:" + ",".join(sorted(failures))
+        if cache_has_python_offsets(cache):
+            return "python_cache_offsets"
+        spec, spec_reason = build_verify_state_spec(cache)
+        if spec is None:
+            return spec_reason or "unsupported_container"
+        self._spec = spec
+        if self.capture_backend == "linear_gdn_from_conv_tape":
+            for idx, kind, _n in spec:
+                if kind == VERIFY_SPEC_KIND_GDN and self._gdn_meta(idx) is None:
+                    return "gdn_meta_unavailable"
+        return None
+
+    def _resolve_bucket(self, cache: Any, length: int) -> int | None:
+        """Static paged-attention ceiling for this call, or None on overflow."""
+        max_needed = 0
+        min_capacity: int | None = None
+        for idx, kind, _n in self._spec or []:
+            if kind != VERIFY_SPEC_KIND_FULL_ATTN:
+                continue
+            entry = cache[idx]
+            if not hasattr(entry, "capacity"):
+                continue  # dense adapter: grows via ensure_capacity instead
+            offset = int(entry.size())
+            capacity = int(entry.capacity)
+            max_needed = max(max_needed, offset + length)
+            min_capacity = capacity if min_capacity is None else min(min_capacity, capacity)
+        self._last_context_estimate = max_needed
+        if min_capacity is None:
+            return 0  # no paged entries; bucket unused
+        if max_needed > min_capacity:
+            return None
+        bucket = min(min_capacity, _next_pow2(max_needed + 512))
+        if max_needed > bucket:  # hard precondition: offset+M <= bucket
+            bucket = min_capacity
+        return bucket
+
+    def _paged_ineligibility(self, cache: Any, length: int, bucket: int) -> str | None:
+        for idx, kind, _n in self._spec or []:
+            if kind != VERIFY_SPEC_KIND_FULL_ATTN:
+                continue
+            entry = cache[idx]
+            if not hasattr(entry, "capacity"):
+                continue
+            if not _paged_kernel_bucket_eligible(entry, length, bucket):
+                return "paged_kernel_ineligible"
+        return None
+
+    def _apply_bucket(self, cache: Any, bucket: int) -> None:
+        """Pin the per-instance static ceiling on shadow and real paged entries.
+
+        The two-pass paged kernel's reduction topology depends on the static
+        ceiling, so the real entries get the same bucket: eager fallback calls
+        and parity's authoritative eager run then use the identical kernel
+        shape, which is what makes bit-exact comparison meaningful.
+        """
+        if not bucket:
+            return
+        for idx, kind, _n in self._spec or []:
+            if kind != VERIFY_SPEC_KIND_FULL_ATTN:
+                continue
+            entry = cache[idx]
+            if hasattr(entry, "static_max_offset"):
+                entry.static_max_offset = int(bucket)
+            shadow_entry = self._shadow[idx] if self._shadow else None
+            if shadow_entry is not None and hasattr(shadow_entry, "static_max_offset"):
+                shadow_entry.static_max_offset = int(bucket)
+
+    # -- shadow cache ---------------------------------------------------------
+
+    def _container_signature(self, cache: Any) -> tuple[Any, ...]:
+        signature: list[Any] = []
+        for entry in cache or []:
+            if entry is None:
+                signature.append(None)
+                continue
+            meta = (
+                (int(entry.block_size), int(entry.num_blocks))
+                if hasattr(entry, "num_blocks")
+                else ()
+            )
+            signature.append((id(entry), type(entry).__name__, meta))
+        return tuple(signature)
+
+    def _ensure_shadow(self, cache: Any) -> None:
+        signature = self._container_signature(cache)
+        if self._shadow is not None and signature == self._shadow_signature:
+            return
+        from .cache_state import TensorOffsetVllmMetalPagedKVCache
+
+        shadow: list[Any] = [None] * len(cache)
+        for idx, kind, _n in self._spec or []:
+            entry = cache[idx]
+            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                if isinstance(entry, TensorOffsetKVCache):
+                    twin = TensorOffsetKVCache(
+                        entry.cache[0],
+                        entry.cache[1],
+                        entry.cache[2],
+                        step=entry.step,
+                    )
+                else:
+                    twin = TensorOffsetVllmMetalPagedKVCache(
+                        key_cache=entry.cache[0],
+                        value_cache=entry.cache[1],
+                        offset=entry.cache[2],
+                        block_size=entry.block_size,
+                        num_blocks=entry.num_blocks,
+                    )
+            else:
+                twin = type(entry)(len(entry.cache))
+                for slot, leaf in enumerate(entry.cache):
+                    twin[slot] = leaf
+            shadow[idx] = twin
+        self._shadow = shadow
+        self._shadow_signature = signature
+        # New shadow objects invalidate closures compiled over the old ones.
+        self._compiled.clear()
+
+    # -- compiled function ------------------------------------------------------
+
+    def _shared_or_new_verify_step(self, key, length: int, hidden_variant: str | None):
+        """Reuse one compiled verify callable per process for a logical key.
+
+        The bank is constructed per generation, so a per-instance compile dict
+        pays a fresh trace (~1s wall at 7k leaves, measured 2026-07-03 as the
+        whole compiled-vs-eager gap on long generations) for every request.
+        The traced graph depends only on the runtime, capture layout, state
+        spec, verify length, and hidden variant — mx.compile re-traces
+        internally when leaf shapes change and caches per shape signature —
+        so callables are shared process-wide. The closure's shadow containers
+        are trace-time scratch: the re-seed firewall assigns every leaf from
+        the explicit inputs before any read, so a retrace under a different
+        bank/request is safe. `_TRACE_HOSTS` keeps each callable's shadow and
+        stats sink pointed at the LIVE bank so retraces never touch a dead
+        request's containers.
+        """
+
+        if not _env_enabled("MTPLX_COMPILED_VERIFY_SHARED_TRACES", default=True):
+            return mx.compile(self._make_verify_step(length, hidden_variant))
+        spec_sig = tuple(self._spec or [])
+        global_key = (
+            id(self.runtime),
+            self.capture_backend,
+            spec_sig,
+            int(length),
+            str(hidden_variant or ""),
+            int(key[2]),
+        )
+        entry = _SHARED_VERIFY_STEPS.get(global_key)
+        if entry is not None:
+            fn, host, runtime_ref = entry
+            # id() can be recycled after a model swap frees the old runtime;
+            # a stale callable would replay graphs bound to freed weights.
+            if runtime_ref() is self.runtime:
+                host["bank"] = self
+                return fn
+            _SHARED_VERIFY_STEPS.pop(global_key, None)
+        host = {"bank": self}
+        fn = mx.compile(
+            self._make_verify_step(length, hidden_variant, trace_host=host)
+        )
+        _SHARED_VERIFY_STEPS[global_key] = (fn, host, weakref.ref(self.runtime))
+        return fn
+
+    def _make_verify_step(
+        self,
+        length: int,
+        hidden_variant: str | None,
+        trace_host: dict[str, Any] | None = None,
+    ):
+        spec = list(self._spec or [])
+        layout = self._capture_layout()
+        bank = self
+        static_host = {"bank": self}
+        host = trace_host if trace_host is not None else static_host
+
+        del bank
+
+        def verify_step(input_ids, *state_in):
+            # Python body executes at trace time only; replays skip it.
+            live = host["bank"]
+            shadow = live._shadow
+            live.stats["traces"] += 1
+            if _decode_length(input_ids) != length:
+                raise ValueError("compiled verify length mismatch")
+            # (1) Re-seed firewall: every shadow leaf is assigned from the
+            # explicit inputs BEFORE any read, so nothing stale and no tracer
+            # from a previous trace can leak into this graph.
+            pos = 0
+            for idx, kind, n_leaves in spec:
+                entry = shadow[idx]
+                if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                    entry.cache[0] = state_in[pos]
+                    entry.cache[1] = state_in[pos + 1]
+                    entry.cache[2] = state_in[pos + 2]
+                    entry.rollback_state[0] = None
+                    entry.rollback_state[1] = None
+                    entry.rollback_state[2] = None
+                else:
+                    entry.cache[0] = state_in[pos]
+                    entry.cache[1] = state_in[pos + 1]
+                pos += n_leaves
+            # (2) The existing runtime forward, on shadow containers only.
+            with attention_phase("decode_verify"):
+                result = live._runtime_forward(
+                    input_ids,
+                    cache=shadow,
+                    return_hidden=True,
+                    hidden_variant=hidden_variant,
+                )
+            logits, hidden, captures = result
+            # (3) Read every leaf back out and return it explicitly.
+            captures_flat: list[Any] = []
+            for idx, kind, _n in spec:
+                if kind != VERIFY_SPEC_KIND_GDN:
+                    continue
+                layer_capture = captures[idx]
+                for key_name in layout:
+                    captures_flat.append(layer_capture[key_name])
+            state_out: list[Any] = []
+            for idx, kind, _n in spec:
+                entry = shadow[idx]
+                if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                    state_out.extend((entry.cache[0], entry.cache[1], entry.cache[2]))
+                else:
+                    state_out.extend((entry.cache[0], entry.cache[1]))
+            return (logits, hidden, *captures_flat, *state_out)
+
+        return verify_step
+
+    def _capture_layout(self) -> tuple[str, ...]:
+        if self.capture_backend == "linear_gdn_from_conv_tape":
+            return TAPE_CAPTURE_KEYS
+        return STANDARD_CAPTURE_KEYS
+
+    def _unpack_outputs(self, outputs):
+        spec = self._spec or []
+        layout = self._capture_layout()
+        n_captures = sum(
+            len(layout) for _idx, kind, _n in spec if kind == VERIFY_SPEC_KIND_GDN
+        )
+        n_state = sum(n for _idx, _kind, n in spec)
+        expected = 2 + n_captures + n_state
+        if len(outputs) != expected:
+            raise ValueError(
+                f"compiled verify returned {len(outputs)} leaves, expected {expected}"
+            )
+        logits = outputs[0]
+        hidden = outputs[1]
+        captures_flat = list(outputs[2 : 2 + n_captures])
+        state_out = list(outputs[2 + n_captures :])
+        return logits, hidden, captures_flat, state_out
+
+    def _rebuild_captures(self, captures_flat: list[Any]) -> dict[int, dict[str, Any]]:
+        layout = self._capture_layout()
+        captures: dict[int, dict[str, Any]] = {}
+        pos = 0
+        for idx, kind, _n in self._spec or []:
+            if kind != VERIFY_SPEC_KIND_GDN:
+                continue
+            layer_capture = {
+                key_name: captures_flat[pos + key_pos]
+                for key_pos, key_name in enumerate(layout)
+            }
+            pos += len(layout)
+            if self.capture_backend == "linear_gdn_from_conv_tape":
+                layer_capture["gdn_meta"] = self._gdn_meta(idx)
+            captures[idx] = layer_capture
+        return captures
+
+    def _gdn_meta(self, layer_idx: int) -> dict[str, int] | None:
+        if layer_idx in self._gdn_meta_cache:
+            return self._gdn_meta_cache[layer_idx]
+        meta: dict[str, int] | None = None
+        try:
+            from .gdn_capture import _gdn_tape_meta
+
+            model = getattr(self.runtime, "model", None)
+            text_model = getattr(model, "language_model", model)
+            inner = getattr(text_model, "model", None)
+            layer = inner.layers[layer_idx]
+            meta = _gdn_tape_meta(layer.linear_attn)
+        except Exception:
+            meta = None
+        self._gdn_meta_cache[layer_idx] = meta
+        return meta
+
+    # -- state movement -----------------------------------------------------------
+
+    def _read_state_leaves(self, cache: Any) -> list[Any] | None:
+        leaves: list[Any] = []
+        for idx, kind, _n in self._spec or []:
+            entry = cache[idx]
+            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                layer_leaves = (entry.cache[0], entry.cache[1], entry.cache[2])
+            else:
+                layer_leaves = (entry.cache[0], entry.cache[1])
+            if any(leaf is None for leaf in layer_leaves):
+                return None
+            leaves.extend(layer_leaves)
+        return leaves
+
+    def _mirror_commit(self, cache: Any, state_out: list[Any]) -> None:
+        pos = 0
+        for idx, kind, n_leaves in self._spec or []:
+            entry = cache[idx]
+            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                entry.cache[0] = state_out[pos]
+                entry.cache[1] = state_out[pos + 1]
+                entry.cache[2] = state_out[pos + 2]
+                # Cleared rollback forces trim() onto the offset-only branch,
+                # which is the correct reject semantics for a batched verify.
+                entry.rollback_state[0] = None
+                entry.rollback_state[1] = None
+                entry.rollback_state[2] = None
+            else:
+                entry.cache[0] = state_out[pos]
+                entry.cache[1] = state_out[pos + 1]
+            pos += n_leaves
+
+    def _clear_shadow_leaf_refs(self) -> None:
+        """Drop leaf references held by the shadow twins (A2.1 donation).
+
+        The traced verify body re-seeds every shadow slot from the explicit
+        inputs before any read, so whatever the twins hold between calls —
+        promotion-time leaves right after ``_ensure_shadow``, stale tracers
+        after a trace — is dead weight.  Promotion-time refs additionally
+        alias the first call's input buffers, which would block their
+        donation and pin one full stale KV/GDN buffer set for the whole
+        generation.
+        """
+        for entry in self._shadow or []:
+            if entry is None:
+                continue
+            cache_list = getattr(entry, "cache", None)
+            if isinstance(cache_list, list):
+                for slot in range(len(cache_list)):
+                    cache_list[slot] = None
+            rollback = getattr(entry, "rollback_state", None)
+            if isinstance(rollback, list):
+                for slot in range(len(rollback)):
+                    rollback[slot] = None
+
+    # -- eager paths ---------------------------------------------------------------
+
+    def _runtime_forward(
+        self,
+        input_ids,
+        *,
+        cache,
+        return_hidden: bool,
+        hidden_variant: str | None,
+    ):
+        if self._capture_accepts_backend:
+            return self.runtime.forward_ar_capture(
+                input_ids,
+                cache=cache,
+                return_hidden=return_hidden,
+                hidden_variant=hidden_variant,
+                capture_backend=self.capture_backend,
+            )
+        return self.runtime.forward_ar_capture(
+            input_ids,
+            cache=cache,
+            return_hidden=return_hidden,
+            hidden_variant=hidden_variant,
+        )
+
+    def _fallback(
+        self,
+        input_ids,
+        *,
+        cache,
+        return_hidden: bool,
+        hidden_variant: str | None,
+        reason: str,
+    ):
+        self.stats["fallback_calls"] += 1
+        self.stats["fallback_reasons"][reason] = (
+            self.stats["fallback_reasons"].get(reason, 0) + 1
+        )
+        return self._runtime_forward(
+            input_ids,
+            cache=cache,
+            return_hidden=return_hidden,
+            hidden_variant=hidden_variant,
+        )
+
+    def _parity_check(
+        self,
+        input_ids,
+        *,
+        cache,
+        hidden_variant: str | None,
+        state_in: list[Any],
+        compiled_logits,
+        compiled_hidden,
+        compiled_captures,
+        compiled_state_out,
+    ):
+        """Double-run: compiled pure step already ran; eager is authoritative."""
+        self.stats["parity_checks"] += 1
+        with attention_phase("decode_verify"):
+            eager_logits, eager_hidden, eager_captures = self._runtime_forward(
+                input_ids,
+                cache=cache,
+                return_hidden=True,
+                hidden_variant=hidden_variant,
+            )
+        eager_state = []
+        for idx, kind, _n in self._spec or []:
+            entry = cache[idx]
+            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                eager_state.extend((entry.cache[0], entry.cache[1], entry.cache[2]))
+            else:
+                eager_state.extend((entry.cache[0], entry.cache[1]))
+        reference = self._named_outputs(eager_logits, eager_hidden, eager_captures, eager_state)
+        candidate = self._named_outputs(
+            compiled_logits, compiled_hidden, compiled_captures, compiled_state_out
+        )
+        report = compare_verify_outputs(reference, candidate)
+        if report:
+            self.stats["parity_failures"] += 1
+            raise CompiledVerifyParityError(report)
+        return eager_logits, eager_hidden, eager_captures
+
+    def _parity2_check(
+        self,
+        input_ids,
+        *,
+        cache,
+        hidden_variant: str | None,
+        bucket: int,
+        compiled_logits,
+        compiled_hidden,
+        compiled_captures,
+        compiled_state_out,
+    ):
+        """Inverted parity: COMPILED is authoritative; an eager CLONE tracks it.
+
+        Parity mode #1 proved per-call bit-exactness at fixed contexts, but its
+        eager leg re-commits the real cache on every call, so compiled-committed
+        state never compounds across steps — exactly the multi-step evolution
+        the live-stream fork hypothesis points at.  Here the real stream keeps
+        running on the compiled mirror-commit, and the eager reference replays
+        the same single step on a fresh leaf-copy clone of the pre-step cache.
+        The clone is rebuilt from the real entries every call, so accept-path
+        commits/trims on the real cache between calls can never drift the clone
+        structurally: each comparison is one verify step given identical
+        (compiled-committed) inputs.  A mismatch is logged and counted — never
+        raised — so streaming continues compiled-authoritative.
+        """
+        self.stats["parity2_calls"] += 1
+        # Seed the clone BEFORE mirror-commit: the real entries still hold the
+        # pre-step leaves here (the compiled step ran purely on the shadow).
+        clone = self._parity2_clone_cache(cache, bucket)
+        with attention_phase("decode_verify"):
+            eager_logits, eager_hidden, eager_captures = self._runtime_forward(
+                input_ids,
+                cache=clone,
+                return_hidden=True,
+                hidden_variant=hidden_variant,
+            )
+        # Compiled is authoritative: the live stream advances on compiled state.
+        self._mirror_commit(cache, compiled_state_out)
+        clone_state: list[Any] = []
+        for idx, kind, _n in self._spec or []:
+            entry = clone[idx]
+            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                clone_state.extend((entry.cache[0], entry.cache[1], entry.cache[2]))
+            else:
+                clone_state.extend((entry.cache[0], entry.cache[1]))
+        reference = self._named_outputs(
+            eager_logits, eager_hidden, eager_captures, clone_state
+        )
+        candidate = self._named_outputs(
+            compiled_logits, compiled_hidden, compiled_captures, compiled_state_out
+        )
+        # Uncapped compare so mismatched_leaves is a true count, not a preview.
+        report = compare_verify_outputs(
+            reference,
+            candidate,
+            max_report_lines=len(reference) + len(candidate) + 8,
+        )
+        if report:
+            self._record_parity2_divergence(report, reference, candidate, cache)
+        return compiled_logits, compiled_hidden, compiled_captures
+
+    def _parity2_clone_cache(self, cache: Any, bucket: int) -> list[Any]:
+        """Fresh eager-leg clone: real container classes over leaf COPIES.
+
+        Mirrors ``_ensure_shadow``'s twin construction but with materialized
+        ``mx.array`` copies instead of shared refs, so the eager forward's
+        writes (functional slice_updates and slot reassignments) can never
+        interact with the buffers the compiled-authoritative stream holds.
+        """
+        from .cache_state import TensorOffsetVllmMetalPagedKVCache
+
+        clone: list[Any] = [None] * len(cache)
+        for idx, kind, _n in self._spec or []:
+            entry = cache[idx]
+            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                if isinstance(entry, TensorOffsetKVCache):
+                    twin = TensorOffsetKVCache(
+                        _copy_state_leaf(entry.cache[0]),
+                        _copy_state_leaf(entry.cache[1]),
+                        _copy_state_leaf(entry.cache[2]),
+                        step=entry.step,
+                    )
+                else:
+                    twin = TensorOffsetVllmMetalPagedKVCache(
+                        key_cache=_copy_state_leaf(entry.cache[0]),
+                        value_cache=_copy_state_leaf(entry.cache[1]),
+                        offset=_copy_state_leaf(entry.cache[2]),
+                        block_size=entry.block_size,
+                        num_blocks=entry.num_blocks,
+                    )
+                if bucket and hasattr(twin, "static_max_offset"):
+                    # Same static ceiling as the real/shadow entries so the
+                    # eager paged kernel runs the identical reduction topology
+                    # (what makes bit-exact comparison meaningful).
+                    twin.static_max_offset = int(bucket)
+            else:
+                twin = type(entry)(len(entry.cache))
+                for slot, leaf in enumerate(entry.cache):
+                    twin[slot] = _copy_state_leaf(leaf)
+            clone[idx] = twin
+        return clone
+
+    def _record_parity2_divergence(
+        self,
+        report: list[str],
+        reference: dict[str, Any],
+        candidate: dict[str, Any],
+        cache: Any,
+    ) -> None:
+        self.stats["parity2_divergent_calls"] += 1
+        ordinal = int(self.stats["calls"])
+        context = self._parity2_context_estimate(cache)
+        # Split on ": " (not ":"): state leaf names embed a colon, e.g.
+        # "state[1:fa].2: value mismatch (...)".
+        first_name = report[0].split(": ", 1)[0]
+        artifact = _artifact_kind(first_name)
+        max_abs = _leaf_max_abs_diff(
+            reference.get(first_name), candidate.get(first_name)
+        )
+        mismatched = sum(1 for line in report if not line.startswith("... "))
+        record = {
+            "call": ordinal,
+            "context": context,
+            "artifact": artifact,
+            "leaf": first_name,
+            "max_abs_diff": max_abs,
+            "mismatched_leaves": mismatched,
+        }
+        if self.stats["parity2_first_divergence"] is None:
+            self.stats["parity2_first_divergence"] = record
+        count = int(self.stats["parity2_divergent_calls"])
+        if count <= 10:
+            max_abs_text = "n/a" if max_abs is None else f"{max_abs:.3e}"
+            print(
+                f"[parity2] divergence call={ordinal} context={context} "
+                f"artifact={artifact} leaf={first_name} "
+                f"max_abs_diff={max_abs_text} mismatched_leaves={mismatched}",
+                flush=True,
+            )
+            if count == 10:
+                print(
+                    "[parity2] divergence log cap reached (10); further "
+                    "divergent calls are counted in stats only "
+                    "(parity2_divergent_calls)",
+                    flush=True,
+                )
+
+    def _parity2_context_estimate(self, cache: Any) -> int:
+        """Context/offset estimate for divergence reports (tokens).
+
+        Paged entries already produced offset+M in ``_resolve_bucket``; dense
+        adapters (no ``capacity``) fall through to the post-commit offset.
+        Best-effort diagnostics only — never load-bearing.
+        """
+        estimate = int(getattr(self, "_last_context_estimate", 0) or 0)
+        if estimate:
+            return estimate
+        best = 0
+        for idx, kind, _n in self._spec or []:
+            if kind != VERIFY_SPEC_KIND_FULL_ATTN:
+                continue
+            entry = cache[idx]
+            try:
+                best = max(best, int(entry.size()))
+            except Exception:
+                continue
+        return best
+
+    def _named_outputs(
+        self,
+        logits,
+        hidden,
+        captures: dict[int, dict[str, Any]],
+        state_leaves: list[Any],
+    ) -> dict[str, Any]:
+        named: dict[str, Any] = {"logits": logits, "hidden": hidden}
+        layout = self._capture_layout()
+        for layer_idx in sorted(k for k in captures if isinstance(k, int)):
+            layer_capture = captures[layer_idx]
+            for key_name in layout:
+                named[f"capture[{layer_idx}].{key_name}"] = layer_capture.get(key_name)
+        pos = 0
+        for idx, kind, n_leaves in self._spec or []:
+            for leaf_idx in range(n_leaves):
+                named[f"state[{idx}:{kind}].{leaf_idx}"] = state_leaves[pos + leaf_idx]
+            pos += n_leaves
+        return named

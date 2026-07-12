@@ -780,3 +780,102 @@ def test_session_bank_cold_tier_archives_legacy_manifest_on_start(tmp_path):
         assert base_dir.exists()
     finally:
         cold.close()
+
+
+def test_cold_tier_v3_roundtrips_gdn_boundaries_and_boundary_restores(tmp_path, monkeypatch):
+    """kvcache-v2 format v3: interior recurrent boundaries survive the SSD
+    roundtrip, and a partial restore from an SSD-restored hybrid entry lands on
+    the persisted boundary instead of failing closed."""
+    import mlx.core as mx
+
+    monkeypatch.setenv("MTPLX_SESSION_BLOCK_PREFIX_RESTORE", "1")
+    cold = SessionBankColdTier(
+        base_dir=tmp_path / "session-bank",
+        mode="on",
+        min_prefix_tokens=2,
+    )
+    try:
+        runtime = FakeRuntime()
+        bank = SessionBank(
+            max_entries=1,
+            max_bytes=1 << 30,
+            per_session_max_bytes=1 << 30,
+            cold_tier=cold,
+        )
+
+        class RecurrentStub:
+            def __init__(self):
+                self.state = [mx.ones((2, 2)), None]
+                self.meta_state = ("owned_recurrent_state", "persistent_eval")
+
+            def is_trimmable(self):
+                return False
+
+            def replace_state(self, value):
+                self.state = list(value)
+
+        boundary_state = CacheSnapshot(
+            states=(mx.full((2, 2), 7.0),),
+            meta_states=(None,),
+        )
+        hidden_last = mx.full((1, 1, 4), 3.0)
+        entry = bank.put(
+            runtime=runtime,
+            token_ids=list(range(1200)),
+            cache=[RecurrentStub()],
+            logits=mx.zeros((1, 4)),
+            hidden=None,
+            session_id="hybrid-session",
+            template_hash="template-a",
+            policy_fingerprint="policy-a",
+            snapshot_epoch=1200,
+            gdn_boundaries=[(1024, boundary_state, hidden_last)],
+        )
+        assert entry is not None
+        assert entry.has_recurrent is True
+        assert cold.flush(timeout_s=10.0) is True
+        bank.clear()
+
+        candidates = bank.near_prefix_candidates(
+            list(range(1050)) + [99_001, 99_002, 99_003],
+            block_size=256,
+            block_min_matched_tokens=512,
+            allow_block_prefix=True,
+            model_path=str(runtime.model_path),
+            mtp_enabled=runtime.mtp_enabled,
+            template_hash="template-a",
+            policy_fingerprint="policy-a",
+        )
+        assert candidates
+        ssd_entry, matched = candidates[0]
+        assert getattr(ssd_entry, "cache_source") == "ssd"
+        assert ssd_entry.has_recurrent is True
+        assert [b for b, _, _ in ssd_entry.gdn_boundaries] == [1024]
+        restored_hidden = ssd_entry.gdn_boundaries[0][2]
+        assert restored_hidden is not None
+        assert float(mx.max(mx.abs(restored_hidden - hidden_last)).item()) == 0.0
+
+        restored = bank.restore_entry_prefix_cache(
+            runtime,
+            ssd_entry,
+            int(matched),
+            mode="clone",
+            cache_factory=lambda: [RecurrentStub()],
+        )
+        assert restored is not None
+        cache, _mtp, mode, restore_point, boundary_hidden = restored
+        assert restore_point == 1024
+        assert boundary_hidden is not None
+        recurrent = cache[0]
+        assert float(mx.max(mx.abs(recurrent.state[0] - mx.full((2, 2), 7.0))).item()) == 0.0
+    finally:
+        cold.close()
+
+
+def test_parse_size_bytes_auto_falls_back_to_default():
+    from mtplx.cache_bank import parse_size_bytes
+
+    # The app's SSD "Auto" picker sends the literal string; it must resolve
+    # to the RAM-tiered default instead of crashing daemon startup.
+    assert parse_size_bytes("auto", 16 * 1024**3) == 16 * 1024**3
+    assert parse_size_bytes("garbage", 7) == 7

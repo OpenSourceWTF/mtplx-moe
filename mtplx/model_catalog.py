@@ -93,7 +93,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.5 9B Optimized Speed FP16",
         detail="FP16-friendly 9B speed artifact for M1 and M2 Macs.",
         hf_model_id="Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed-FP16",
-        size_bytes=7_783_300_114,
+        size_bytes=7_783_301_179,
         peak_memory_gib=10.5,
         recommended_tiers=frozenset({LEGACY_TIER}),
         aliases=(
@@ -121,7 +121,9 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.6 27B Optimized Speed FP16",
         detail="FP16 speed artifact recommended for M1 and M2 Macs.",
         hf_model_id="Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-FP16",
-        size_bytes=17_179_869_184,
+        # Exact sum of the published HF repo files (2026-07-03 audit); the
+        # previous 16-GiB figure was a pre-publish estimate ~0.7 GiB high.
+        size_bytes=16_419_644_370,
         peak_memory_gib=17.5,
         recommended_tiers=frozenset({LEGACY_TIER}),
         aliases=(
@@ -152,7 +154,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.6 35B-A3B Optimized Speed FP16",
         detail="FP16-friendly 35B speed artifact for M1 and M2 Macs.",
         hf_model_id="Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16",
-        size_bytes=21_016_117_499,
+        size_bytes=21_016_116_512,
         peak_memory_gib=28.5,
         recommended_tiers=frozenset({LEGACY_TIER}),
         aliases=(
@@ -180,7 +182,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.6 35B-A3B Optimized Balance FP16",
         detail="FP16-friendly 35B balance artifact for M1 and M2 Macs.",
         hf_model_id="Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance-FP16",
-        size_bytes=29_672_250_227,
+        size_bytes=29_672_249_552,
         peak_memory_gib=32.5,
         recommended_tiers=frozenset({LEGACY_TIER}),
         aliases=(
@@ -218,6 +220,22 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
             "mtplx-qwen36-27b-optimized-quality",
             "Qwen3.6 27B Optimized Quality",
             "Optimized Quality",
+        ),
+    ),
+    CatalogModel(
+        id="optimized-quality-fp16",
+        display_name="Qwen 3.6 27B Optimized Quality FP16",
+        detail="FP16 quality artifact recommended for M1 and M2 Macs.",
+        hf_model_id="Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality-FP16",
+        # Exact byte sum of the published HF repo files (2026-07-07 upload,
+        # verified via the tree API).
+        size_bytes=30_017_528_922,
+        peak_memory_gib=28.12,
+        recommended_tiers=frozenset({LEGACY_TIER}),
+        aliases=(
+            "mtplx-qwen36-27b-optimized-quality-fp16",
+            "Qwen3.6 27B Optimized Quality FP16",
+            "Optimized Quality FP16",
         ),
     ),
 )
@@ -294,11 +312,13 @@ def recommended_catalog_ids(
         speed27 = "optimized-speed-fp16"
         speed35 = "qwen36-35b-a3b-optimized-speed-fp16"
         balance35 = "qwen36-35b-a3b-optimized-balance-fp16"
+        quality27 = "optimized-quality-fp16"
     else:
         small = "qwen35-9b-optimized-speed"
         speed27 = "optimized-speed"
         speed35 = "qwen36-35b-a3b-optimized-speed"
         balance35 = "qwen36-35b-a3b-optimized-balance"
+        quality27 = "optimized-quality"
     if memory_gib is None or memory_gib <= 0:
         return list(_MODERN_TOP_RECOMMENDATION_IDS)
     if memory_gib < 32:
@@ -309,11 +329,11 @@ def recommended_catalog_ids(
             speed27,
             "gemma4-optimized-speed",
             speed35,
-            "optimized-quality",
+            quality27,
         ]
     return [
         speed27,
-        "optimized-quality",
+        quality27,
         speed35,
         balance35,
         "gemma4-optimized-speed",

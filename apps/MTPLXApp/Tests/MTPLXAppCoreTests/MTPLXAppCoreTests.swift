@@ -374,6 +374,10 @@ final class MTPLXAppCoreTests: XCTestCase {
         fi
         if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
           venv="$3"
+          if [ "$venv" = "--clear" ]; then
+            venv="$4"
+            rm -rf "$venv"
+          fi
           mkdir -p "$venv/bin"
           cat > "$venv/bin/python" <<'PYTHON'
         #!/bin/sh
@@ -535,6 +539,10 @@ final class MTPLXAppCoreTests: XCTestCase {
         fi
         if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
           venv="$3"
+          if [ "$venv" = "--clear" ]; then
+            venv="$4"
+            rm -rf "$venv"
+          fi
           mkdir -p "$venv/bin"
           cat > "$venv/bin/python" <<'PYTHON'
         #!/bin/sh
@@ -587,6 +595,101 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(installLog.contains("mtplx-1.0.0-py3-none-any.whl[server]"), installLog)
     }
 
+    // Issue #139: after an app update, the runtime venv's bin/python3
+    // symlink chain can dangle (it pointed into the replaced bundle),
+    // and a plain `python -m venv` over the corpse exits 1 with
+    // "[Errno 2] No such file or directory: …/bin/python3". The venv
+    // lives in Application Support, so DMG reinstalls never fix it —
+    // the bootstrapper must rebuild with --clear itself.
+    private func makeVenvFakePython(
+        home: URL,
+        log: URL,
+        failPlainVenv: Bool = false
+    ) throws -> URL {
+        try FileManager.default.createDirectory(
+            at: home, withIntermediateDirectories: true
+        )
+        let fakePython = home.appendingPathComponent("fake-python")
+        let plainVenvExit = failPlainVenv ? 1 : 0
+        try """
+        #!/bin/sh
+        echo "$*" >> "\(log.path)"
+        if [ "$1" = "--version" ]; then
+          echo "Python 3.13.0"
+          exit 0
+        fi
+        if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
+          if [ "$3" = "--clear" ]; then
+            exit 0
+          fi
+          exit \(plainVenvExit)
+        fi
+        exit 0
+        """.data(using: .utf8)!.write(to: fakePython)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: fakePython.path
+        )
+        return fakePython
+    }
+
+    func testRuntimeBootstrapperRebuildsBrokenVenvWithClear() throws {
+        let home = temporaryDirectory()
+        let log = home.appendingPathComponent("venv.log")
+        let fakePython = try makeVenvFakePython(home: home, log: log)
+        let runtimeDir = home.appendingPathComponent("runtime-venv")
+        let bin = runtimeDir.appendingPathComponent("bin")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        // Dangling symlink: the interpreter the venv was built from is gone.
+        try FileManager.default.createSymbolicLink(
+            at: bin.appendingPathComponent("python3"),
+            withDestinationURL: home.appendingPathComponent("gone/python3.14")
+        )
+
+        let bootstrapper = MTPLXRuntimeBootstrapper(environment: ["HOME": home.path])
+        try bootstrapper.createRuntimeVenv(python: fakePython, runtimeDir: runtimeDir)
+
+        let calls = try String(contentsOf: log, encoding: .utf8)
+        XCTAssertTrue(calls.contains("-m venv --clear \(runtimeDir.path)"), calls)
+    }
+
+    func testRuntimeBootstrapperRetriesVenvCreationWithClearOnFailure() throws {
+        let home = temporaryDirectory()
+        let log = home.appendingPathComponent("venv.log")
+        let fakePython = try makeVenvFakePython(home: home, log: log, failPlainVenv: true)
+        let runtimeDir = home.appendingPathComponent("runtime-venv")
+
+        let bootstrapper = MTPLXRuntimeBootstrapper(environment: ["HOME": home.path])
+        try bootstrapper.createRuntimeVenv(python: fakePython, runtimeDir: runtimeDir)
+
+        let calls = try String(contentsOf: log, encoding: .utf8)
+            .split(separator: "\n").map(String.init)
+        XCTAssertEqual(calls, [
+            "-m venv \(runtimeDir.path)",
+            "-m venv --clear \(runtimeDir.path)",
+        ])
+    }
+
+    func testRuntimeBootstrapperKeepsPlainVenvPathWhenHealthy() throws {
+        let home = temporaryDirectory()
+        let log = home.appendingPathComponent("venv.log")
+        let fakePython = try makeVenvFakePython(home: home, log: log)
+        let runtimeDir = home.appendingPathComponent("runtime-venv")
+        let bin = runtimeDir.appendingPathComponent("bin")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let venvPython = bin.appendingPathComponent("python")
+        try "#!/bin/sh\nexit 0\n".data(using: .utf8)!.write(to: venvPython)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: venvPython.path
+        )
+
+        let bootstrapper = MTPLXRuntimeBootstrapper(environment: ["HOME": home.path])
+        try bootstrapper.createRuntimeVenv(python: fakePython, runtimeDir: runtimeDir)
+
+        let calls = try String(contentsOf: log, encoding: .utf8)
+        XCTAssertTrue(calls.contains("-m venv \(runtimeDir.path)"), calls)
+        XCTAssertFalse(calls.contains("--clear"), calls)
+    }
+
     func testCommandBuilderPrefersInstalledRuntimeOverSourceWrapper() throws {
         let fake = try makeExecutable(named: "mtplx")
         let builder = MTPLXCommandBuilder(environment: [
@@ -637,20 +740,34 @@ final class MTPLXAppCoreTests: XCTestCase {
     }
 
     func testPersistedLegacyProfileStringsDecodeLaunchable() throws {
+        // "auto" is a first-class persisted value since the 2026-07-03
+        // turbo release (resolved per-model before argv).
         let auto = try decodeConfiguration(json: #"{"profile": "auto"}"#)
-        XCTAssertEqual(auto.profile, "sustained")
+        XCTAssertEqual(auto.profile, "auto")
 
+        // Junk coerces to sustained, which the one-shot legacy migration
+        // then lifts to auto — either way the launch resolution produces
+        // an engine-launchable profile.
         let unknown = try decodeConfiguration(
             json: #"{"profile": "banana", "generation_mode": "auto"}"#
         )
-        XCTAssertEqual(unknown.profile, "sustained")
+        XCTAssertEqual(unknown.profile, "auto")
         XCTAssertEqual(unknown.generationMode, "mtp")
+
+        // A post-migration explicit sustained is preserved verbatim.
+        let chosen = try decodeConfiguration(
+            json: #"{"profile": "sustained", "profile_legacy_default_migrated": true}"#
+        )
+        XCTAssertEqual(chosen.profile, "sustained")
     }
 
     func testPersistedSustainedMaxMigratesToSustainedPlusMaxFans() throws {
         let config = try decodeConfiguration(json: #"{"profile": "sustained-max"}"#)
 
-        XCTAssertEqual(config.profile, "sustained")
+        // sustained-max meant "fastest + pinned fans"; the profile half
+        // now lands on auto (recommended per model — turbo for the
+        // 27Bs), and the fan intent survives as before.
+        XCTAssertEqual(config.profile, "auto")
         XCTAssertEqual(config.fanMode, MTPLXFanMode.max.rawValue)
         XCTAssertTrue(config.pinFansAtMaxOnStart)
     }
@@ -889,6 +1006,7 @@ final class MTPLXAppCoreTests: XCTestCase {
                 "--profile", "sustained",
                 "--scheduler-mode", "serial",
                 "--batching-preset", "latency",
+                "--ssd-session-cache", "off",
                 "--api-key", "secret",
                 "--enable-thermal-poll",
                 "--fan-mode", "smart",
@@ -943,6 +1061,214 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(command.arguments.containsInOrder(["--draft-top-p", "0.95"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--draft-top-k", "20"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--chat-template-profile", "local_qwen36"]))
+    }
+
+    func testCommandBuilderResolvesAutoProfileToTurboForQwen27BOptimizedSpeed() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/Users/youssof/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
+                profile: "auto"
+            )
+        )
+
+        // Auto = the recommended per-model profile: turbo for the 4-bit
+        // Optimized-Speed (chat lane 44.7 -> 58-60 tok/s, 2026-07-02).
+        XCTAssertTrue(command.arguments.containsInOrder(["--profile", "turbo"]))
+        // Qwen3.6 thinking-mode spec sampler (0.6/0.95/20), same as the
+        // 35B and Step presets — the 27B fell through to 1.0 until the
+        // launch family existed (founder-confirmed 2026-07-02).
+        XCTAssertTrue(command.arguments.containsInOrder(["--temperature", "0.6"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--draft-temperature", "0.6"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--top-k", "20"]))
+    }
+
+    func testCommandBuilderResolvesAutoProfileToTurboForQwen27BSpeedFP16Sibling() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/Users/youssof/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed-FP16",
+                profile: "auto"
+            )
+        )
+
+        // The FP16 sibling (M1/M2 routing target) earned turbo on
+        // 2026-07-07 after its first e2e measurement: same INT4/g64
+        // weight packs the vk kernels cover, 1.98-2.08x over true AR
+        // under turbo vs 1.34x on sustained. Promotion is per-artifact,
+        // the same way Quality q8 earned turbo.
+        XCTAssertTrue(command.arguments.containsInOrder(["--profile", "turbo"]))
+        // It still gets the Qwen3.6 thinking-mode sampler preset.
+        XCTAssertTrue(command.arguments.containsInOrder(["--temperature", "0.6"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--draft-temperature", "0.6"]))
+    }
+
+    func testCommandBuilderResolvesAutoProfileToTurboForQwen27BOptimizedQuality() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/Users/youssof/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Quality",
+                profile: "auto"
+            )
+        )
+
+        // 8-bit Quality is promoted to turbo too: the q8 verify_kernels
+        // branch is ULP-exact and measured +22-40% on the chat lane
+        // (2026-07-03). The old sustained ruling was about compiled
+        // verify, which turbo does not use.
+        XCTAssertTrue(command.arguments.containsInOrder(["--profile", "turbo"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--temperature", "0.6"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--draft-temperature", "0.6"]))
+    }
+
+    func testCommandBuilderResolvesAutoProfileToTurboForQwen27BQualityFP16Sibling() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/Users/youssof/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Quality-FP16",
+                profile: "auto"
+            )
+        )
+
+        // The Quality-FP16 sibling (M1/M2 quality pick, built 2026-07-07)
+        // shares the q8/g64 packs the ULP-exact vk kernels cover and
+        // measured 2.5x over true AR under turbo on its own artifact
+        // (43.8/42.1 vs 17.4 tok/s D3).
+        XCTAssertTrue(command.arguments.containsInOrder(["--profile", "turbo"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--temperature", "0.6"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--draft-temperature", "0.6"]))
+    }
+
+    func testCommandBuilderResolvesAutoProfileToTurboForQwen359BOptimizedSpeed() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        for model in [
+            "/Users/youssof/.mtplx/models/Youssofal--Qwen3.5-9B-MTPLX-Optimized-Speed",
+            "/Users/youssof/.mtplx/models/Youssofal--Qwen3.5-9B-MTPLX-Optimized-Speed-FP16",
+        ] {
+            let command = try builder.buildServeCommand(
+                configuration: MTPLXAppConfiguration(
+                    executablePath: fake.path,
+                    model: model,
+                    profile: "auto"
+                )
+            )
+            // The 6-bit 9B earned turbo on 2026-07-07 with the 6-bit
+            // hexpack split-K kernels: live ABBA MTP D3 110/102 tok/s
+            // under turbo vs 90/69 sustained (AR flat both profiles).
+            XCTAssertTrue(
+                command.arguments.containsInOrder(["--profile", "turbo"]),
+                model
+            )
+            XCTAssertTrue(command.arguments.containsInOrder(["--temperature", "0.6"]), model)
+        }
+    }
+
+    func testCommandBuilderHonorsExplicitProfileOverPreset() throws {
+        // The Settings picker must never lie: an explicit user choice
+        // beats the per-model preset (2026-07-03 turbo release).
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/Users/youssof/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
+                profile: "sustained",
+                profileLegacyDefaultMigrated: true
+            )
+        )
+        XCTAssertTrue(command.arguments.containsInOrder(["--profile", "sustained"]))
+    }
+
+    func testSanitizeMigratesLegacyProfileToAutoOnce() throws {
+        var legacy = MTPLXAppConfiguration()
+        legacy.profile = "sustained"
+        legacy.profileLegacyDefaultMigrated = false
+        legacy.sanitizeLaunchCriticalFields()
+        XCTAssertEqual(legacy.profile, "auto")
+        XCTAssertTrue(legacy.profileLegacyDefaultMigrated)
+
+        // A deliberate post-migration Sustained pick sticks.
+        legacy.profile = "sustained"
+        legacy.sanitizeLaunchCriticalFields()
+        XCTAssertEqual(legacy.profile, "sustained")
+
+        // "auto" itself survives sanitize (persistable, not launchable).
+        var auto = MTPLXAppConfiguration()
+        auto.sanitizeLaunchCriticalFields()
+        XCTAssertEqual(auto.profile, "auto")
+    }
+
+    func testSanitizeMigratesStreamCadenceOnce() throws {
+        var legacy = MTPLXAppConfiguration()
+        legacy.streamSnapshotIntervalMs = 250
+        legacy.streamCadenceMigrated = false
+        legacy.sanitizeLaunchCriticalFields()
+        XCTAssertEqual(legacy.streamSnapshotIntervalMs, 100)
+        XCTAssertTrue(legacy.streamCadenceMigrated)
+
+        // A deliberate post-migration 250 sticks.
+        legacy.streamSnapshotIntervalMs = 250
+        legacy.sanitizeLaunchCriticalFields()
+        XCTAssertEqual(legacy.streamSnapshotIntervalMs, 250)
+
+        // A pre-migration non-default cadence is a choice and survives.
+        var chosen = MTPLXAppConfiguration()
+        chosen.streamSnapshotIntervalMs = 500
+        chosen.streamCadenceMigrated = false
+        chosen.sanitizeLaunchCriticalFields()
+        XCTAssertEqual(chosen.streamSnapshotIntervalMs, 500)
+    }
+
+    func testSanitizeMigratesLegacyDefaultSamplerTripleOnce() throws {
+        // The exact legacy triple (1.0/0.95/20) is the fingerprint of the
+        // persisted override that clobbered the engine's 0.6 default. It
+        // yields to preset authority exactly ONCE per config.
+        var legacy = MTPLXAppConfiguration()
+        legacy.temperature = 1.0
+        legacy.topP = 0.95
+        legacy.topK = 20
+        legacy.sanitizeLaunchCriticalFields()
+        XCTAssertNil(legacy.temperature)
+        XCTAssertNil(legacy.topP)
+        XCTAssertNil(legacy.topK)
+        XCTAssertTrue(legacy.samplerLegacyTripleMigrated)
+
+        // After migration the user can deliberately choose exactly 1.0
+        // (founder requirement 2026-07-02): it must stick.
+        legacy.temperature = 1.0
+        legacy.topP = 0.95
+        legacy.topK = 20
+        legacy.sanitizeLaunchCriticalFields()
+        XCTAssertEqual(legacy.temperature, 1.0)
+        XCTAssertEqual(legacy.topP, 0.95)
+        XCTAssertEqual(legacy.topK, 20)
+
+        // Any other combination is a deliberate choice and survives even
+        // the first pass (and still flips the one-shot flag).
+        var chosen = MTPLXAppConfiguration()
+        chosen.temperature = 0.8
+        chosen.topP = 0.95
+        chosen.topK = 20
+        chosen.sanitizeLaunchCriticalFields()
+        XCTAssertEqual(chosen.temperature, 0.8)
+        XCTAssertTrue(chosen.samplerLegacyTripleMigrated)
+
+        var partial = MTPLXAppConfiguration()
+        partial.temperature = 1.0
+        partial.topP = 0.9
+        partial.topK = 20
+        partial.sanitizeLaunchCriticalFields()
+        XCTAssertEqual(partial.temperature, 1.0)
+        XCTAssertEqual(partial.topP, 0.9)
     }
 
     func testCommandBuilderEmitsLaunchOwnershipAndStrictFanArgs() throws {
@@ -1046,7 +1372,7 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertFalse(command.arguments.contains("--decode-batch-max"))
         XCTAssertFalse(command.arguments.contains("--batch-wait-ms"))
         XCTAssertTrue(command.arguments.containsInOrder(["--ssd-session-cache", "on"]))
-        XCTAssertTrue(command.arguments.containsInOrder(["--ssd-session-cache-max-size", "100GB"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--ssd-session-cache-max-size", "auto"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--ssd-session-cache-min-prefix-tokens", "512"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--reasoning", "off"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--depth", "3"]))
@@ -1199,7 +1525,7 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertFalse(command.arguments.contains("--batch-wait-ms"))
         XCTAssertTrue(command.arguments.containsInOrder(["--prefill-chunk-tokens", "2048"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--ssd-session-cache", "on"]))
-        XCTAssertTrue(command.arguments.containsInOrder(["--ssd-session-cache-max-size", "100GB"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--ssd-session-cache-max-size", "auto"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--ssd-session-cache-min-prefix-tokens", "512"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--reasoning", "auto"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--temperature", "0.6"]))
@@ -1218,7 +1544,7 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(command.arguments.containsInOrder(["--app-launch-id", "hermes-launch"]))
         XCTAssertEqual(command.environment["MTPLX_CLIENT"], "hermes")
         XCTAssertEqual(command.environment["MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE"], "async_per_head")
-        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_ENTRIES"], "16")
+        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_ENTRIES"], "32")
     }
 
     func testCommandBuilderBenchmarkPresetStartsSoloBenchmarkDaemon() throws {
@@ -1317,7 +1643,9 @@ final class MTPLXAppCoreTests: XCTestCase {
         )
 
         XCTAssertTrue(command.arguments.containsInOrder(["--profile", "sustained"]))
-        XCTAssertTrue(command.arguments.containsInOrder(["--depth", "6"]))
+        // Depth 2: assistant-pair acceptance collapse makes deeper blocks
+        // EV-negative (2026-07-03 in-app measurement, 23.2 vs ~31 tok/s).
+        XCTAssertTrue(command.arguments.containsInOrder(["--depth", "2"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--chat-template-profile", "tokenizer"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--reasoning-parser", "gemma4"]))
     }
@@ -1341,7 +1669,8 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(MTPLXCommandBuilder.defaultReasoningMode(for: .chat), "auto")
         XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "serial"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--batching-preset", "solo"]))
-        XCTAssertTrue(command.arguments.containsInOrder(["--depth", "6"]))
+        // Depth 2: see the Gemma preset comment in MTPLXCommandBuilder.
+        XCTAssertTrue(command.arguments.containsInOrder(["--depth", "2"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--temperature", "1.0"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--top-p", "0.95"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--top-k", "64"]))
@@ -1367,7 +1696,10 @@ final class MTPLXAppCoreTests: XCTestCase {
             launchID: "opencode-ssd-off"
         )
 
-        XCTAssertFalse(command.arguments.contains("--ssd-session-cache"))
+        // "off" must be passed explicitly: the serve CLI default became
+        // "on" in 2.0.0, so omitting the flag would silently re-enable
+        // the cache the user disabled (issue #140).
+        XCTAssertTrue(command.arguments.containsInOrder(["--ssd-session-cache", "off"]))
         XCTAssertFalse(command.arguments.contains("--ssd-session-cache-max-size"))
         XCTAssertFalse(command.arguments.contains("--ssd-session-cache-min-prefix-tokens"))
         XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "serial"]))
@@ -1378,6 +1710,30 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(command.arguments.containsInOrder(["--reasoning", "auto"]))
         XCTAssertFalse(command.arguments.contains("--adaptive-policy"))
         XCTAssertFalse(command.arguments.contains("--adaptive-ev-base-depth"))
+    }
+
+    // Issue #140: Settings "Persistent Cache (SSD) = Off" + Play ->
+    // "Other, Custom client" launched the daemon with the SSD cache ON,
+    // because the .other preset says "on" and, before the fix, an
+    // explicit user "off" was expressed by omitting the flag — which the
+    // 2.0.0 serve CLI (default "on") reads as on with default limits.
+    func testCommandBuilderOtherTargetHonorsExplicitSSDOff() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/models/qwen",
+                profile: "sustained",
+                ssdSessionCache: "off"
+            ),
+            target: .other,
+            launchID: "other-ssd-off"
+        )
+
+        XCTAssertTrue(command.arguments.containsInOrder(["--ssd-session-cache", "off"]))
+        XCTAssertFalse(command.arguments.contains("--ssd-session-cache-max-size"))
+        XCTAssertFalse(command.arguments.contains("--ssd-session-cache-min-prefix-tokens"))
     }
 
     func testCommandBuilderHonorsExplicitLatencySchedulingPresetForCodingAgents() throws {
@@ -1443,7 +1799,7 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(command.arguments.containsInOrder(["--preserve-thinking", "auto"]))
         XCTAssertEqual(command.environment["MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE"], "async_per_head")
         XCTAssertEqual(command.environment["MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_CONTEXT"], "32768")
-        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_ENTRIES"], "16")
+        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_ENTRIES"], "32")
         XCTAssertNil(command.environment["MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY"])
         XCTAssertNil(command.environment["MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD"])
         XCTAssertNil(command.environment["MTPLX_LONG_CONTEXT_MTP_DEPTH"])
@@ -1481,7 +1837,9 @@ final class MTPLXAppCoreTests: XCTestCase {
             launchID: "pi-gemma-launch"
         )
 
-        XCTAssertTrue(command.arguments.containsInOrder(["--depth", "6"]))
+        // Depth 2 is the Gemma launch default (see MTPLXCommandBuilder);
+        // the incompatible Qwen tune (3) above must NOT leak through.
+        XCTAssertTrue(command.arguments.containsInOrder(["--depth", "2"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--temperature", "1.0"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--top-p", "0.95"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--top-k", "64"]))
@@ -1514,7 +1872,8 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "serial"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--batching-preset", "latency"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--ssd-session-cache", "on"]))
-        XCTAssertTrue(command.arguments.containsInOrder(["--depth", "6"]))
+        // Depth 2: Gemma launch default, see MTPLXCommandBuilder preset.
+        XCTAssertTrue(command.arguments.containsInOrder(["--depth", "2"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--temperature", "1.0"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--top-p", "0.95"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--top-k", "64"]))
@@ -1713,9 +2072,10 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(command.environment["MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_Q"], "3")
         XCTAssertEqual(command.environment["MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MAX_Q"], "5")
         XCTAssertEqual(command.environment["MTPLX_SESSION_BLOCK_PREFIX_RESTORE"], "1")
-        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_ENTRIES"], "16")
-        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_BYTES"], "24G")
-        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_PER_SESSION_BYTES"], "16G")
+        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_ENTRIES"], "32")
+        // "auto": the engine budgets half the post-model RAM surplus.
+        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_BYTES"], "auto")
+        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_PER_SESSION_BYTES"], "auto")
         XCTAssertEqual(command.environment["MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S"], "30.0")
         XCTAssertEqual(command.environment["MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS"], "4096")
         XCTAssertEqual(command.environment["MTPLX_LAZY_BONUS_VERIFY"], "1")
@@ -1748,9 +2108,9 @@ final class MTPLXAppCoreTests: XCTestCase {
             launchID: "opencode-launch"
         )
 
-        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_ENTRIES"], "4")
-        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_BYTES"], "8G")
-        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_PER_SESSION_BYTES"], "4G")
+        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_ENTRIES"], "6")
+        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_BYTES"], "auto")
+        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_PER_SESSION_BYTES"], "auto")
         XCTAssertEqual(command.environment["MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE"], "async_per_head")
     }
 
@@ -1803,6 +2163,46 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_PER_SESSION_BYTES"], "1G")
     }
 
+    func testCommandBuilderBoundedPolicyPassesAutoCacheSizesThrough() throws {
+        // The default bounded selections are "auto": the engine budgets half
+        // of the RAM left after the model weights. Explicit sizes still pass
+        // through verbatim (previous test); auto must too, not be rewritten.
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/models/qwen",
+                profile: "sustained",
+                ramSessionCachePolicy: "bounded",
+                ramSessionCacheMaxEntries: 8,
+                ramSessionCacheMaxSize: "auto",
+                ramSessionCachePerSessionMaxSize: "auto"
+            ),
+            target: .openCode,
+            launchID: "opencode-launch"
+        )
+
+        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_BYTES"], "auto")
+        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_PER_SESSION_BYTES"], "auto")
+        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_ENTRIES"], "8")
+    }
+
+    func testConfigurationDefaultsUseAutoCacheBudgets() throws {
+        let defaults = MTPLXAppConfiguration()
+        XCTAssertEqual(defaults.ramSessionCacheMaxSize, "auto")
+        XCTAssertEqual(defaults.ramSessionCachePerSessionMaxSize, "auto")
+        XCTAssertEqual(defaults.ssdSessionCacheMaxSize, "auto")
+
+        // Persisted configs from older builds decode their explicit values.
+        let legacy = try decodeConfiguration(json: """
+        {"model": "/models/qwen", "ram_session_cache_max_size": "8G",
+         "ssd_session_cache_max_size": "100GB"}
+        """)
+        XCTAssertEqual(legacy.ramSessionCacheMaxSize, "8G")
+        XCTAssertEqual(legacy.ssdSessionCacheMaxSize, "100GB")
+    }
+
     func testCommandBuilderChatPresetMirrorsWebUISoloServing() throws {
         let fake = try makeExecutable(named: "mtplx")
         let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
@@ -1821,7 +2221,9 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertFalse(command.arguments.contains("--decode-batch-max"))
         XCTAssertFalse(command.arguments.contains("--batch-wait-ms"))
         XCTAssertFalse(command.arguments.contains("--prefill-chunk-tokens"))
-        XCTAssertFalse(command.arguments.contains("--ssd-session-cache"))
+        // The chat preset is SSD-off by design; that must reach argv
+        // explicitly now that the serve CLI defaults to "on".
+        XCTAssertTrue(command.arguments.containsInOrder(["--ssd-session-cache", "off"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--reasoning", "auto"]))
         XCTAssertFalse(command.arguments.contains("--top-k"))
         XCTAssertFalse(command.arguments.contains("--draft-temperature"))
@@ -2154,6 +2556,145 @@ final class MTPLXAppCoreTests: XCTestCase {
         )
         XCTAssertTrue(channelDirectoryText.contains("launch-room"))
         XCTAssertEqual(integration.discoverProfiles().map(\.name), ["default", "mtplx", "research"])
+    }
+
+    // Issue #131: the app regenerated the Hermes profile config from its
+    // template on every launch, silently dropping every top-level section
+    // it does not own (memory/providers/delegation/…) and user-added child
+    // keys such as model.max_tokens. These tests drive the reporter's exact
+    // repro through the real sync() path.
+
+    func testHermesSyncPreservesUserConfigSectionsAcrossLaunches() throws {
+        let root = temporaryDirectory()
+        let hermesHome = root.appendingPathComponent(".hermes", isDirectory: true)
+        let workspace = root.appendingPathComponent("ws", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        let integration = HermesIntegration(
+            hermesHome: hermesHome,
+            environment: ["HOME": root.path, "PATH": "/usr/bin:/bin"],
+            terminalCommandURL: root.appendingPathComponent(".mtplx").appendingPathComponent("open-hermes.command")
+        )
+        let configuration = MTPLXAppConfiguration(
+            model: "/models/Qwen3.6-27B-MTPLX-Optimized-Speed",
+            host: "127.0.0.1",
+            port: 8123,
+            apiKey: "",
+            hermesWorkspacePath: workspace.path
+        )
+
+        // First launch writes the template.
+        let first = try integration.sync(configuration: configuration)
+        let configURL = URL(fileURLWithPath: first.configPath)
+
+        // The user adds non-template sections and a model override —
+        // the issue #131 repro.
+        var text = try String(contentsOf: configURL, encoding: .utf8)
+        text = text.replacingOccurrences(
+            of: "  api_mode: chat_completions\n",
+            with: "  api_mode: chat_completions\n  max_tokens: 32768\n"
+        )
+        text += """
+        # external memory (issue #131 repro)
+        memory:
+          provider: honcho
+          workspace: mtplx
+        providers:
+          openrouter:
+            api_key: sk-fake
+        """ + "\n"
+        try text.write(to: configURL, atomically: true, encoding: .utf8)
+
+        // Next launch must preserve all of it.
+        _ = try integration.sync(configuration: configuration)
+        let preserved = try String(contentsOf: configURL, encoding: .utf8)
+        XCTAssertTrue(preserved.contains("# external memory (issue #131 repro)"))
+        XCTAssertTrue(preserved.contains("memory:\n  provider: honcho\n  workspace: mtplx"))
+        XCTAssertTrue(preserved.contains("providers:\n  openrouter:\n    api_key: sk-fake"))
+        XCTAssertTrue(preserved.contains("  max_tokens: 32768"))
+
+        // A repeat launch with an unchanged configuration must not rewrite
+        // the file at all (no rewrite loop, no backup spam).
+        let repeated = try integration.sync(configuration: configuration)
+        XCTAssertFalse(repeated.didChange)
+        XCTAssertNil(repeated.configBackupPath)
+
+        // App-owned keys still update in place while user content survives.
+        let moved = MTPLXAppConfiguration(
+            model: "/models/Qwen3.6-27B-MTPLX-Optimized-Speed",
+            host: "127.0.0.1",
+            port: 9001,
+            apiKey: "",
+            hermesWorkspacePath: workspace.path
+        )
+        let rewritten = try integration.sync(configuration: moved)
+        XCTAssertTrue(rewritten.didChange)
+        let final = try String(contentsOf: configURL, encoding: .utf8)
+        XCTAssertTrue(final.contains("9001/v1"))
+        XCTAssertFalse(final.contains("8123/v1"))
+        XCTAssertTrue(final.contains("memory:\n  provider: honcho\n  workspace: mtplx"))
+        XCTAssertTrue(final.contains("  max_tokens: 32768"))
+    }
+
+    func testHermesMergedConfigOwnsTemplateShapedSections() {
+        let template = """
+        model:
+          default: "m"
+          provider: custom
+          base_url: "http://127.0.0.1:9001/v1"
+        toolsets:
+          - terminal
+          - file
+        display:
+          streaming: true
+        """ + "\n"
+        let existing = """
+        # user preamble comment
+        model:
+          default: "old"
+          provider: custom
+          base_url: "http://127.0.0.1:8123/v1"
+          max_tokens: 32768
+          reasoning_effort: "high"
+        toolsets:
+          - terminal
+          - custom-extra
+        memory:
+          provider: honcho
+        """ + "\n"
+
+        let merged = HermesIntegration.mergedConfigYAML(existing: existing, template: template)
+
+        // Preamble comment survives at the top.
+        XCTAssertTrue(merged.hasPrefix("# user preamble comment\n"))
+        // App-owned model keys come from the template; the user's unknown
+        // child key is kept.
+        XCTAssertTrue(merged.contains("base_url: \"http://127.0.0.1:9001/v1\""))
+        XCTAssertFalse(merged.contains("8123"))
+        XCTAssertTrue(merged.contains("  max_tokens: 32768"))
+        // reasoning_effort is conditionally app-owned: the template omits
+        // it, so a stale line must not be resurrected as user content.
+        XCTAssertFalse(merged.contains("reasoning_effort"))
+        // Sequence-shaped owned sections are rewritten wholly.
+        XCTAssertFalse(merged.contains("custom-extra"))
+        // Unknown sections survive verbatim.
+        XCTAssertTrue(merged.contains("memory:\n  provider: honcho"))
+        // The merge is idempotent.
+        XCTAssertEqual(
+            HermesIntegration.mergedConfigYAML(existing: merged, template: template),
+            merged
+        )
+    }
+
+    func testHermesMergedConfigWithoutExistingFileIsTemplate() {
+        let template = "model:\n  default: \"m\"\n"
+        XCTAssertEqual(
+            HermesIntegration.mergedConfigYAML(existing: nil, template: template),
+            template
+        )
+        XCTAssertEqual(
+            HermesIntegration.mergedConfigYAML(existing: "  \n", template: template),
+            template
+        )
     }
 
     func testHermesIntegrationSurfacesInvalidMessagingEnvWarning() throws {
@@ -2656,6 +3197,43 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertFalse(ids.contains { $0.contains("step") })
     }
 
+    func testFreshLegacyLargeMemoryCatalogRoutesQualityToFP16Sibling() throws {
+        // The M1/M2 quality pick resolves the Quality-FP16 sibling
+        // (2.0.1, 2026-07-07) — same policy as the speed lane.
+        let m2 = DetectedHardware(
+            chipName: "Apple M2 Ultra",
+            appleSiliconGeneration: "m2",
+            unifiedMemoryBytes: 64 * 1_073_741_824
+        )
+
+        let ids = MTPLXModelOption.hardwareAwareOfficialCatalog(
+            hardware: m2,
+            includeInstalledOverrides: false
+        ).map(\.id)
+
+        XCTAssertEqual(ids, [
+            "optimized-speed-fp16",
+            "optimized-quality-fp16",
+            "qwen36-35b-a3b-optimized-speed-fp16",
+            "qwen36-35b-a3b-optimized-balance-fp16",
+            "gemma4-optimized-speed",
+            "qwen35-9b-optimized-speed-fp16",
+        ])
+        XCTAssertFalse(ids.contains("optimized-quality"))
+    }
+
+    func testOfficialModelCatalogIncludesOptimizedQualityFP16() throws {
+        let quality = try XCTUnwrap(
+            MTPLXModelOption.option(matching: "mtplx-qwen36-27b-optimized-quality-fp16")
+        )
+        XCTAssertEqual(quality.id, "optimized-quality-fp16")
+        XCTAssertEqual(
+            quality.hfModelID,
+            "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality-FP16"
+        )
+        XCTAssertTrue(quality.recommendedFor.contains(.legacyApple))
+    }
+
     func testFreshModernSmallMemoryCatalogUses9BAsMinimum() throws {
         let m5 = DetectedHardware(
             chipName: "Apple M5",
@@ -2959,7 +3537,11 @@ final class MTPLXAppCoreTests: XCTestCase {
         )
 
         try store.save(configuration)
-        XCTAssertEqual(try store.load(), configuration)
+        // Decode runs sanitize (one-shot migrations consume their
+        // flags); the loaded config is the sanitized form.
+        var expected = configuration
+        expected.sanitizeLaunchCriticalFields()
+        XCTAssertEqual(try store.load(), expected)
     }
 
     func testSettingsStoreSupportsEnvironmentOverride() throws {
@@ -4044,7 +4626,12 @@ final class MTPLXAppCoreTests: XCTestCase {
 
         try await backend.applyConfiguration(configuration, restartIfRunning: true)
 
-        XCTAssertEqual(try settingsStore.load(), configuration)
+        // Loading decodes through sanitize (one-shot migrations consume
+        // their flags); the backend's live copy holds the configuration
+        // exactly as applied. Both are correct for their surface.
+        var loadedExpected = configuration
+        loadedExpected.sanitizeLaunchCriticalFields()
+        XCTAssertEqual(try settingsStore.load(), loadedExpected)
         let observed = await backend.configuration
         XCTAssertEqual(observed, configuration)
     }

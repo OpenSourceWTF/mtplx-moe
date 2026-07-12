@@ -111,7 +111,7 @@ def _parse_version(value: str) -> tuple[int, ...]:
 
 
 def _sysctl(name: str) -> str | None:
-    result = _run(["sysctl", "-n", name])
+    result = _run(["/usr/sbin/sysctl", "-n", name])
     if result.get("ok"):
         return str(result.get("stdout") or "").strip() or None
     return None

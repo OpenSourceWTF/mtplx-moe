@@ -1996,7 +1996,7 @@ def test_policy_fingerprint_separates_tool_contract_cache_identity():
     assert "tool_prompt_mode=hybrid" in tools
     assert (
         "tool_contract=soft_schema_contract:native_xml:targeted_reads:"
-        "post_tool_continue:agent_tail:v11"
+        "post_tool_continue:agent_tail:dated:v12"
     ) in tools
     native = _policy_fingerprint(
         state,

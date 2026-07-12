@@ -18,12 +18,49 @@ from typing import Any
 
 from mtplx.cache_state import CacheSnapshot
 
-from .codec import decode_payload, encode_payload
+from .codec import decode_gdn_boundaries, decode_payload, encode_payload
 
 
 logger = logging.getLogger(__name__)
 
-COLD_TIER_FORMAT_VERSION = 2
+
+def _eval_payload_trees(*trees: Any) -> None:
+    """Force-evaluate every MLX array reachable from the given trees."""
+    import mlx.core as mx
+
+    arrays: list[Any] = []
+    seen: set[int] = set()
+
+    def collect(value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, mx.array):
+            if id(value) not in seen:
+                seen.add(id(value))
+                arrays.append(value)
+            return
+        if isinstance(value, CacheSnapshot):
+            collect(value.states)
+            collect(value.meta_states)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item)
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+
+    for tree in trees:
+        collect(tree)
+    if arrays:
+        mx.eval(*arrays)
+
+# v3 (kvcache-v2, 2026-07-03): payload carries interior recurrent boundaries
+# (token_count, recurrent-only snapshot, hidden_last) plus a has_recurrent
+# identity flag, and encode moved off the caller thread (deferred writer-side
+# encode). v2 stores go through the existing legacy-archive migration.
+COLD_TIER_FORMAT_VERSION = 3
 DEFAULT_COLD_TIER_DIR = Path("~/.mtplx/session-bank").expanduser()
 DEFAULT_COLD_TIER_MAX_BYTES = 100 * 1024**3
 DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS = 512
@@ -32,13 +69,36 @@ DISK_USAGE_CACHE_TTL_S = 30.0
 _COMMITTED_CACHE_POLICIES = frozenset({"committed", "last_window"})
 
 
+def _deferred_encode_enabled() -> bool:
+    """Writer-thread payload encode (kvcache-v2). Off-switch only.
+
+    The foreground evaluates payload arrays (ms-scale GPU slice kernels) so
+    the writer thread never evaluates foreign lazy graphs — it only reads
+    settled buffers into bytes (the GB-scale memcpy that used to run on the
+    request thread)."""
+    raw = str(os.environ.get("MTPLX_SSD_DEFERRED_ENCODE", "1")).strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+@dataclass(frozen=True)
+class DeferredPayload:
+    cache_snapshot: CacheSnapshot
+    logits: Any
+    hidden: Any | None
+    mtp_history_snapshot: CacheSnapshot | None
+    gdn_boundaries: tuple[tuple[int, CacheSnapshot, Any], ...]
+    has_recurrent: bool
+    block_size: int
+
+
 @dataclass(frozen=True)
 class PendingWrite:
     entry_id: str
     token_ids: tuple[int, ...]
     metadata: dict[str, Any]
-    payload_spec: dict[str, Any]
+    payload_spec: dict[str, Any] | None
     tensors: dict[str, bytes]
+    deferred: DeferredPayload | None = None
     created_at_s: float = field(default_factory=time.time)
 
 
@@ -53,6 +113,10 @@ class ColdRestoreRecord:
     metadata: dict[str, Any]
     nbytes: int
     restore_s: float
+    gdn_boundaries: tuple[tuple[int, CacheSnapshot, Any], ...] = ()
+    has_recurrent: bool = False
+    # Lazy loader for boundaries skipped at exact-restore time (callable -> tuple).
+    gdn_boundary_loader: Any = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +124,49 @@ class ColdPrefixRestoreRecord:
     record: ColdRestoreRecord
     matched_tokens: int
     restore_kind: str
+
+
+GIB = 1024**3
+LOW_DISK_FLOOR_BYTES = 10 * GIB
+
+
+def detect_total_ram_bytes() -> int | None:
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            # Absolute path: app-owned daemons run with a sanitized PATH
+            # that lacks /usr/sbin (see engine_session RAM detection).
+            ["/usr/sbin/sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=2
+        )
+        value = int(out.stdout.strip())
+        return value if value > 0 else None
+    except Exception:
+        try:
+            import os as _os
+
+            return int(_os.sysconf("SC_PAGE_SIZE")) * int(_os.sysconf("SC_PHYS_PAGES"))
+        except Exception:
+            return None
+
+
+def default_cold_tier_max_bytes() -> int:
+    """RAM-tier-scaled default SSD cap (kvcache-v2 P2.3).
+
+    A 16 GB Mac should not default to a 100 GB session store. Bands: <=16 GB
+    RAM -> 16 GB cap, <=32 -> 24 GB, <=64 -> 32 GB, else 100 GB (the legacy
+    flat default for big-RAM machines that also tend to have big disks).
+    """
+    ram = detect_total_ram_bytes()
+    if ram is None:
+        return DEFAULT_COLD_TIER_MAX_BYTES
+    if ram <= 16 * GIB:
+        return 16 * GIB
+    if ram <= 32 * GIB:
+        return 24 * GIB
+    if ram <= 64 * GIB:
+        return 32 * GIB
+    return DEFAULT_COLD_TIER_MAX_BYTES
 
 
 def parse_size_bytes(value: str | int | None, default: int) -> int:
@@ -81,11 +188,18 @@ def parse_size_bytes(value: str | int | None, default: int) -> int:
         "TB": 1024**4,
         "T": 1024**4,
     }
-    for suffix, multiplier in sorted(suffixes.items(), key=lambda item: len(item[0]), reverse=True):
-        if normalized.endswith(suffix):
-            number = normalized[: -len(suffix)].strip()
-            return max(1, int(float(number) * multiplier))
-    return max(1, int(float(normalized)))
+    try:
+        for suffix, multiplier in sorted(
+            suffixes.items(), key=lambda item: len(item[0]), reverse=True
+        ):
+            if normalized.endswith(suffix):
+                number = normalized[: -len(suffix)].strip()
+                return max(1, int(float(number) * multiplier))
+        return max(1, int(float(normalized)))
+    except (TypeError, ValueError):
+        # "auto"/garbage falls back to the caller's default (which is already
+        # RAM-tiered for the cold tier) instead of failing daemon startup.
+        return int(default)
 
 
 def token_hash(token_ids: tuple[int, ...]) -> str:
@@ -222,30 +336,79 @@ class SessionBankColdTier:
         if len(token_ids) < self.min_prefix_tokens:
             self._inc("skipped_too_short")
             return False
-        try:
-            encoded = encode_payload(
-                cache_snapshot=getattr(entry, "cache_snapshot"),
-                logits=getattr(entry, "logits"),
-                hidden=getattr(entry, "hidden"),
-                mtp_history_snapshot=getattr(entry, "mtp_history_snapshot", None),
-                block_size=self.block_size,
+        boundaries = tuple(
+            (int(r[0]), r[1], r[2] if len(r) > 2 else None)
+            for r in (getattr(entry, "gdn_boundaries", None) or [])
+        )
+        if _deferred_encode_enabled():
+            try:
+                deferred = DeferredPayload(
+                    cache_snapshot=getattr(entry, "cache_snapshot"),
+                    logits=getattr(entry, "logits"),
+                    hidden=getattr(entry, "hidden"),
+                    mtp_history_snapshot=getattr(entry, "mtp_history_snapshot", None),
+                    gdn_boundaries=boundaries,
+                    has_recurrent=bool(getattr(entry, "has_recurrent", False)),
+                    block_size=self.block_size,
+                )
+                # Settle every payload array on the request thread so the
+                # writer only reads buffers (MLX thread discipline: never
+                # evaluate another thread's lazy graph).
+                _eval_payload_trees(
+                    deferred.cache_snapshot,
+                    deferred.logits,
+                    deferred.hidden,
+                    deferred.mtp_history_snapshot,
+                    deferred.gdn_boundaries,
+                )
+            except Exception as exc:
+                self._inc("skipped_serialize_error")
+                logger.warning(
+                    "SessionBank SSD payload prep skipped: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                return False
+            metadata = self._metadata_for_entry(
+                entry,
+                capabilities=capabilities or (),
+                payload_nbytes=0,
             )
-        except Exception as exc:
-            self._inc("skipped_serialize_error")
-            logger.warning("SessionBank SSD serialize skipped: %s: %s", type(exc).__name__, exc)
-            return False
-        metadata = self._metadata_for_entry(
-            entry,
-            capabilities=capabilities or (),
-            payload_nbytes=encoded.nbytes,
-        )
-        pending = PendingWrite(
-            entry_id=str(metadata["entry_id"]),
-            token_ids=token_ids,
-            metadata=metadata,
-            payload_spec=encoded.spec,
-            tensors=encoded.tensors,
-        )
+            pending = PendingWrite(
+                entry_id=str(metadata["entry_id"]),
+                token_ids=token_ids,
+                metadata=metadata,
+                payload_spec=None,
+                tensors={},
+                deferred=deferred,
+            )
+        else:
+            try:
+                encoded = encode_payload(
+                    cache_snapshot=getattr(entry, "cache_snapshot"),
+                    logits=getattr(entry, "logits"),
+                    hidden=getattr(entry, "hidden"),
+                    mtp_history_snapshot=getattr(entry, "mtp_history_snapshot", None),
+                    gdn_boundaries=boundaries,
+                    has_recurrent=bool(getattr(entry, "has_recurrent", False)),
+                    block_size=self.block_size,
+                )
+            except Exception as exc:
+                self._inc("skipped_serialize_error")
+                logger.warning("SessionBank SSD serialize skipped: %s: %s", type(exc).__name__, exc)
+                return False
+            metadata = self._metadata_for_entry(
+                entry,
+                capabilities=capabilities or (),
+                payload_nbytes=encoded.nbytes,
+            )
+            pending = PendingWrite(
+                entry_id=str(metadata["entry_id"]),
+                token_ids=token_ids,
+                metadata=metadata,
+                payload_spec=encoded.spec,
+                tensors=encoded.tensors,
+            )
         try:
             self._queue.put_nowait(pending)
         except queue.Full:
@@ -392,6 +555,7 @@ class SessionBankColdTier:
                 tokens,
                 started_s=started,
                 require_exact_prefix=False,
+                include_gdn_boundaries=True,
             )
             if record is None:
                 return None
@@ -475,6 +639,41 @@ class SessionBankColdTier:
                 return True
             time.sleep(0.05)
         return self._queue.empty()
+
+    def cancel_pending(self) -> int:
+        """Drop queued writes without encoding them.
+
+        Used by the admin cache-clear quiesce: once the RAM bank has been
+        cleared, queued PendingWrite items describe state the operator just
+        asked to discard, and deferred-encode payloads pin multi-GB cache
+        snapshots until the writer thread gets to them (a 128k-token entry
+        encodes for minutes and starves foreground decode bandwidth — the
+        post-long-row slowdown measured 2026-07-05: 20 tok/s with the
+        backlog live vs 75 tok/s after dropping it). An in-flight encode, if
+        any, finishes on its own; everything behind it is discarded.
+        """
+
+        dropped = 0
+        while True:
+            try:
+                pending = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if pending is None:
+                # Preserve shutdown sentinels for the writer thread.
+                try:
+                    self._queue.put_nowait(None)
+                except queue.Full:
+                    pass
+                break
+            dropped += 1
+            self._queue.task_done()
+        if dropped:
+            with self._stats_lock:
+                self._stats["writes_cancelled"] = (
+                    int(self._stats.get("writes_cancelled") or 0) + dropped
+                )
+        return dropped
 
     def archive(self) -> dict[str, Any]:
         self.flush(timeout_s=10.0)
@@ -564,6 +763,8 @@ class SessionBankColdTier:
                 else None
             ),
             "capabilities": sorted({str(item) for item in capabilities}),
+            "has_recurrent": bool(getattr(entry, "has_recurrent", False)),
+            "gdn_boundary_count": len(getattr(entry, "gdn_boundaries", None) or []),
             "nbytes": nbytes,
             "block_size": self.block_size,
             "block_hashes": block_hashes,
@@ -603,6 +804,34 @@ class SessionBankColdTier:
                 self._queue.task_done()
 
     def _write_pending(self, pending: PendingWrite) -> bool:
+        if pending.deferred is not None:
+            # Writer-side encode (kvcache-v2): arrays were settled by the
+            # request thread; this is pure buffer->bytes work off the
+            # foreground. Failures count as write failures, not serialize
+            # skips, so the stats distinguish the two eras.
+            encoded = encode_payload(
+                cache_snapshot=pending.deferred.cache_snapshot,
+                logits=pending.deferred.logits,
+                hidden=pending.deferred.hidden,
+                mtp_history_snapshot=pending.deferred.mtp_history_snapshot,
+                gdn_boundaries=pending.deferred.gdn_boundaries,
+                has_recurrent=pending.deferred.has_recurrent,
+                block_size=pending.deferred.block_size,
+            )
+            metadata = dict(pending.metadata)
+            metadata["nbytes"] = int(
+                max(int(metadata.get("nbytes", 0) or 0), int(encoded.nbytes))
+            )
+            metadata["logical_nbytes"] = int(encoded.nbytes)
+            metadata["physical_nbytes"] = int(encoded.nbytes)
+            pending = PendingWrite(
+                entry_id=pending.entry_id,
+                token_ids=pending.token_ids,
+                metadata=metadata,
+                payload_spec=encoded.spec,
+                tensors=encoded.tensors,
+                created_at_s=pending.created_at_s,
+            )
         with self._base_lock:
             self._ensure_store()
             entry_hash_prefix = pending.entry_id[:2]
@@ -612,6 +841,20 @@ class SessionBankColdTier:
                     self._touch_entry(pending.entry_id)
                     return True
                 self._archive_orphan_entry_dir(final_dir, pending.entry_id)
+            effective_cap, budget_block = self._effective_write_budget()
+            if budget_block is not None:
+                self._inc("skipped_low_disk")
+                with self._stats_lock:
+                    self._stats["low_disk_writes_disabled"] = True
+                logger.warning(
+                    "SessionBank SSD writes disabled (%s): free disk below %d GiB",
+                    budget_block,
+                    LOW_DISK_FLOOR_BYTES // GIB,
+                )
+                return False
+            with self._stats_lock:
+                self._stats["low_disk_writes_disabled"] = False
+                self._stats["effective_max_bytes"] = int(effective_cap)
             tensor_blobs, missing_blob_bytes = self._plan_tensor_blobs(pending.tensors)
             payload = {
                 "format_version": COLD_TIER_FORMAT_VERSION,
@@ -625,7 +868,7 @@ class SessionBankColdTier:
             )
             logical_bytes = sum(int(item["nbytes"]) for item in tensor_blobs.values())
             pending_bytes = int(missing_blob_bytes + payload_bytes)
-            if pending_bytes > self.max_bytes:
+            if pending_bytes > effective_cap:
                 self._inc("skipped_size_cap")
                 logger.warning(
                     "SessionBank SSD size cap skipped entry_id=%s prefix_len=%d pending=%d max=%d",
@@ -635,7 +878,7 @@ class SessionBankColdTier:
                     self.max_bytes,
                 )
                 return False
-            if not self._evict_until_room(pending_bytes):
+            if not self._evict_until_room(pending_bytes, cap_bytes=effective_cap):
                 self._inc("skipped_size_cap")
                 return False
             temp_parent = self.base_dir / "entries" / entry_hash_prefix
@@ -693,10 +936,11 @@ class SessionBankColdTier:
             return False
         return True
 
-    def _evict_until_room(self, required_bytes: int) -> bool:
+    def _evict_until_room(self, required_bytes: int, *, cap_bytes: int | None = None) -> bool:
         required = max(0, int(required_bytes))
+        cap = int(self.max_bytes if cap_bytes is None else cap_bytes)
         current = self._current_bytes_for_cap(required)
-        if current + required <= self.max_bytes:
+        if current + required <= cap:
             return True
         with self._connect() as conn:
             rows = list(
@@ -709,9 +953,22 @@ class SessionBankColdTier:
             self._delete_entry_row(row)
             current -= int(row["physical_nbytes"] or row["nbytes"] or 0)
             self._inc("entries_evicted")
-            if current + required <= self.max_bytes:
+            if current + required <= cap:
                 return True
-        return current + required <= self.max_bytes
+        return current + required <= cap
+
+    def _effective_write_budget(self) -> tuple[int, str | None]:
+        """min(configured cap, free_disk/4), writes disabled under 10 GiB free.
+
+        Re-checked on every write (cheap statvfs); guards strangers' Macs where
+        a flat configured cap could fill the disk (kvcache-v2 P2.3)."""
+        try:
+            free = shutil.disk_usage(self.base_dir).free
+        except Exception:
+            return self.max_bytes, None
+        if free < LOW_DISK_FLOOR_BYTES:
+            return 0, "low_disk"
+        return min(int(self.max_bytes), int(free // 4)), None
 
     def _current_bytes_for_cap(self, required_bytes: int = 0) -> int:
         required = max(0, int(required_bytes))
@@ -1017,6 +1274,7 @@ class SessionBankColdTier:
         *,
         started_s: float,
         require_exact_prefix: bool = True,
+        include_gdn_boundaries: bool = False,
     ) -> ColdRestoreRecord | None:
         metadata = dict(row)
         token_ids = tuple(int(token) for token in json.loads(str(metadata["token_ids_json"])))
@@ -1050,7 +1308,14 @@ class SessionBankColdTier:
                 raise FileNotFoundError(str(path))
             return path.read_bytes()
 
-        decoded = decode_payload(payload["payload_spec"], read_tensor)
+        # Exact-prefix restores never rewind below the stored boundary, so the
+        # (MB-scale x boundary-count) interior snapshots are decoded only for
+        # partial restores — keeps exact restart-warm on the fast path.
+        decoded = decode_payload(
+            payload["payload_spec"],
+            read_tensor,
+            include_gdn_boundaries=include_gdn_boundaries,
+        )
         restore_s = time.perf_counter() - started_s
         self._inc("restore_hits")
         with self._stats_lock:
@@ -1065,6 +1330,12 @@ class SessionBankColdTier:
         )
         metadata["capabilities"] = json.loads(str(metadata.get("capabilities_json") or "[]"))
         metadata["block_hashes"] = json.loads(str(metadata.get("block_hashes_json") or "[]"))
+        payload_spec = payload["payload_spec"]
+        boundary_loader = (
+            None
+            if include_gdn_boundaries
+            else (lambda: decode_gdn_boundaries(payload_spec, read_tensor))
+        )
         return ColdRestoreRecord(
             entry_id=str(metadata["entry_id"]),
             token_ids=token_ids,
@@ -1075,6 +1346,9 @@ class SessionBankColdTier:
             metadata=metadata,
             nbytes=int(metadata["nbytes"]),
             restore_s=restore_s,
+            gdn_boundaries=tuple(decoded.gdn_boundaries or ()),
+            has_recurrent=bool(decoded.has_recurrent),
+            gdn_boundary_loader=boundary_loader,
         )
 
     def _candidate_rows(

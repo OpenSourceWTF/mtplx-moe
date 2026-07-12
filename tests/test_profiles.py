@@ -5,7 +5,6 @@ import pytest
 from mtplx.profiles import (
     DEFAULT_PROFILE_NAME,
     NATIVE_MTP_60_FAST_PATH_ENV,
-    NATIVE_MTP_60_MLX_FORK_COMMIT,
     SUSTAINED_PREFILL_ENV,
     apply_profile_env,
     get_profile,
@@ -32,10 +31,27 @@ def test_performance_cold_is_explicit_fast_path() -> None:
     profile = get_profile("performance-cold")
 
     assert profile.runtime_profile == "native_mtp_60_cold"
-    assert profile.required_mlx_fork_commit == NATIVE_MTP_60_MLX_FORK_COMMIT
     assert profile.draft_lm_head is not None
     assert profile.env_dict() == NATIVE_MTP_60_FAST_PATH_ENV
     assert "MTPLX_SUSTAINED_PREFILL_LAYOUT" not in profile.env_dict()
+
+
+def test_no_profile_requires_or_mentions_an_mlx_fork() -> None:
+    # MTPLX runs on stock PyPI MLX. The old required_mlx_fork_commit /
+    # required_mlx_fork_fragment metadata was vestigial research residue
+    # that kept resurfacing in user bug reports as "MTPLX needs a custom
+    # tuned qmm fork" (issue #129). It must never come back: no profile
+    # attribute, no payload key, and no caveat may claim a fork is
+    # required.
+    for payload in list_profiles():
+        assert "required_mlx_fork_commit" not in payload
+        assert "required_mlx_fork_fragment" not in payload
+        for caveat in payload["caveats"]:
+            assert "Requires the MLX-MTPLX fork" not in caveat
+    for name in ("performance-cold", "sustained", "turbo"):
+        profile = get_profile(name)
+        assert not hasattr(profile, "required_mlx_fork_commit")
+        assert not hasattr(profile, "required_mlx_fork_fragment")
 
 
 def test_legacy_native_mtp_60_alias_resolves_to_performance_cold() -> None:
@@ -162,7 +178,7 @@ def test_apply_profile_env_preserves_long_context_depth_overrides() -> None:
 def test_list_profiles_includes_all_public_modes() -> None:
     names = [profile["name"] for profile in list_profiles()]
 
-    assert names == ["stable", "performance-cold", "sustained", "exact", "max-diagnostic"]
+    assert names == ["stable", "performance-cold", "sustained", "turbo", "exact", "max-diagnostic"]
 
 
 def test_sustained_profile_is_native_mtp_long_context_path() -> None:

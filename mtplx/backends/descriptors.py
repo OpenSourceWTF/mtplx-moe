@@ -253,7 +253,6 @@ class BackendDescriptor:
     draft_semantics: DraftSemantics
     uses_external_assistant: bool = False
     uses_draft_lm_head: bool = True
-    requires_native_mlx_fork: bool = True
     hidden_variant: str = "post_norm"
     mtp_history_policy: str = "committed"
     target_distribution_modes: tuple[str, ...] = ("backend_default",)
@@ -303,7 +302,6 @@ class BackendDescriptor:
             "draft_semantics": self.draft_semantics.to_dict(),
             "uses_external_assistant": bool(self.uses_external_assistant),
             "uses_draft_lm_head": bool(self.uses_draft_lm_head),
-            "requires_native_mlx_fork": bool(self.requires_native_mlx_fork),
             "hidden_variant": self.hidden_variant,
             "mtp_history_policy": self.mtp_history_policy,
             "target_distribution_modes": list(self.target_distribution_modes),
@@ -590,7 +588,6 @@ GEMMA4_ASSISTANT_DESCRIPTOR = BackendDescriptor(
     ),
     uses_external_assistant=True,
     uses_draft_lm_head=False,
-    requires_native_mlx_fork=False,
     hidden_variant="gemma4_pre_norm",
     mtp_history_policy="assistant_shared_kv",
     target_distribution_policy=GEMMA4_TARGET_DISTRIBUTION_POLICY,
@@ -961,9 +958,6 @@ def profile_payload_for_descriptor(
     ]
     if not descriptor.uses_draft_lm_head:
         payload["draft_lm_head"] = None
-    if not descriptor.requires_native_mlx_fork:
-        payload["required_mlx_fork_commit"] = None
-        payload["required_mlx_fork_fragment"] = None
     payload["draft_control"] = descriptor.draft_semantics.request_field
     payload["draft_unit"] = descriptor.draft_semantics.unit
     payload["draft_default"] = (

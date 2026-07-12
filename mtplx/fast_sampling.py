@@ -15,6 +15,7 @@ def apply_penalties_mlx(
     token_counts: Mapping[int, int] | None,
     presence_penalty: float = 0.0,
     frequency_penalty: float = 0.0,
+    penalty_overlay: Mapping[int, float] | None = None,
 ) -> mx.array:
     """On-device MLX twin of ``sampling.apply_penalties`` for one logit row.
 
@@ -22,20 +23,33 @@ def apply_penalties_mlx(
     temperature/top-k/top-p — via a sparse scatter over only the seen tokens
     (``logits.at[ids].add(-deltas)``): O(unique_seen), no dense vocab-sized
     allocation and no host round-trip beyond the small (ids, deltas) transfer.
-    Penalties clamp to [-2, 2]. Returns the same array unchanged (no-op) when
-    both penalties are 0 or there are no counts, preserving exactness.
+    Penalties clamp to [-2, 2]. ``penalty_overlay`` is the Loop Guard's sparse
+    token->subtraction map (not clamped; the guard caps it). Returns the same
+    array unchanged (no-op) when nothing is active, preserving exactness.
 
     Expects a 1-D logit row (``logits.shape == (vocab,)``); batched callers apply
     it per row (the MTP draft block is a handful of positions, not a hot loop).
     """
     presence = min(max(float(presence_penalty), PENALTY_MIN), PENALTY_MAX)
     frequency = min(max(float(frequency_penalty), PENALTY_MIN), PENALTY_MAX)
-    if (presence == 0.0 and frequency == 0.0) or not token_counts:
+    counts_active = bool(token_counts) and (presence != 0.0 or frequency != 0.0)
+    overlay_active = bool(penalty_overlay)
+    if not counts_active and not overlay_active:
         return logits
-    ids = np.fromiter(token_counts.keys(), dtype=np.int64, count=len(token_counts))
-    counts = np.fromiter(token_counts.values(), dtype=np.float64, count=len(token_counts))
-    deltas = (frequency * counts + presence * (counts > 0.0)).astype(np.float32)
-    return logits.at[mx.array(ids)].add(mx.array(-deltas))
+    if counts_active:
+        ids = np.fromiter(token_counts.keys(), dtype=np.int64, count=len(token_counts))
+        counts = np.fromiter(token_counts.values(), dtype=np.float64, count=len(token_counts))
+        deltas = (frequency * counts + presence * (counts > 0.0)).astype(np.float32)
+        logits = logits.at[mx.array(ids)].add(mx.array(-deltas))
+    if overlay_active:
+        overlay_ids = np.fromiter(
+            penalty_overlay.keys(), dtype=np.int64, count=len(penalty_overlay)
+        )
+        overlay_vals = np.fromiter(
+            penalty_overlay.values(), dtype=np.float64, count=len(penalty_overlay)
+        ).astype(np.float32)
+        logits = logits.at[mx.array(overlay_ids)].add(mx.array(-overlay_vals))
+    return logits
 
 
 class BatchedSparseDistributions:
@@ -85,6 +99,7 @@ def sparse_distribution_from_mlx_logits(
     config: SamplerConfig,
     *,
     token_counts: Mapping[int, int] | None = None,
+    penalty_overlay: Mapping[int, float] | None = None,
 ) -> SparseDistribution | None:
     """Return an exact sparse distribution for top-p then top-k sampling.
 
@@ -96,13 +111,19 @@ def sparse_distribution_from_mlx_logits(
     ``token_counts`` (completion tokens seen so far, scoped by the caller) applies
     the additive presence/frequency penalty to the raw logits BEFORE the
     temperature divide — a no-op (same array) when penalties are 0.
+    ``penalty_overlay`` is the Loop Guard's sparse steering map, applied at the
+    same raw-logit stage.
     """
 
     if config.temperature <= 0 or config.top_k <= 0:
         return None
 
     row = apply_penalties_mlx(
-        logits.reshape(-1), token_counts, config.presence_penalty, config.frequency_penalty
+        logits.reshape(-1),
+        token_counts,
+        config.presence_penalty,
+        config.frequency_penalty,
+        penalty_overlay=penalty_overlay,
     )
     flat = row.astype(mx.float32) / float(config.temperature)
     vocab_size = int(flat.shape[-1])

@@ -26,7 +26,8 @@ struct ChatConversationView: View {
     @State private var showFullHeavyTranscript = false
     @State private var renderPlan = ChatConversationRenderPlan(
         messages: [],
-        showFullHeavyTranscript: false
+        showFullHeavyTranscript: false,
+        excludedTurnGroupID: nil
     )
 
     var body: some View {
@@ -40,20 +41,18 @@ struct ChatConversationView: View {
                     )
                     .id("hidden-heavy-transcript-summary")
                 }
-                ForEach(plan.renderedMessages, id: \.id) { message in
-                    switch message.role {
-                    case .user:
+                ForEach(plan.transcriptItems) { item in
+                    switch item {
+                    case .user(let message):
                         UserBubbleView(message: message)
-                            .id(message.id)
-                    case .assistant:
-                        AssistantBubbleView(message: message)
-                            .id(message.id)
-                    case .tool:
-                        EmptyView()
-                            .id(message.id)
-                    case .system:
-                        EmptyView()
-                            .id(message.id)
+                            .id(item.id)
+                    case .assistantTurn(let group):
+                        // One surface per TURN: a searched answer renders
+                        // a single thinking chip + activity chip + bubble
+                        // + sources footer, however many think/search
+                        // rounds the tool loop persisted.
+                        AssistantBubbleView(group: group)
+                            .id(item.id)
                     }
                 }
                 if viewModel.shouldRenderStreamingAssistant {
@@ -256,23 +255,35 @@ struct ChatConversationView: View {
         activeRenderPlan.usesHeavyTranscriptScrollGuard
     }
 
+    /// While the tool loop streams, the in-flight turn's already-
+    /// persisted rounds are excluded from the settled transcript — the
+    /// live surface at the bottom is the turn's ONE representation.
+    /// Lifts automatically the moment streaming ends (including error
+    /// and cancel paths, which publish and stop streaming).
+    private var liveExcludedTurnGroupID: UUID? {
+        viewModel.shouldRenderStreamingAssistant ? viewModel.currentTurnGroupID : nil
+    }
+
     private var activeRenderPlan: ChatConversationRenderPlan {
         if renderPlan.matches(
             messages: viewModel.visibleMessages,
-            showFullHeavyTranscript: showFullHeavyTranscript
+            showFullHeavyTranscript: showFullHeavyTranscript,
+            excludedTurnGroupID: liveExcludedTurnGroupID
         ) {
             return renderPlan
         }
         return ChatConversationRenderPlan(
             messages: viewModel.visibleMessages,
-            showFullHeavyTranscript: showFullHeavyTranscript
+            showFullHeavyTranscript: showFullHeavyTranscript,
+            excludedTurnGroupID: liveExcludedTurnGroupID
         )
     }
 
     private func updateRenderPlan(showFullHeavyTranscript override: Bool? = nil) {
         renderPlan = ChatConversationRenderPlan(
             messages: viewModel.visibleMessages,
-            showFullHeavyTranscript: override ?? showFullHeavyTranscript
+            showFullHeavyTranscript: override ?? showFullHeavyTranscript,
+            excludedTurnGroupID: liveExcludedTurnGroupID
         )
     }
 
@@ -424,10 +435,14 @@ private struct HiddenTranscriptSummary: Equatable {
 private struct ChatConversationRenderPlan {
     private static let heavyMessageCharacterThreshold = 3_000
     private static let heavyTranscriptCharacterThreshold = 18_000
-    private static let heavyTranscriptTailMessageCount = 4
+    private static let heavyTranscriptTailItemCount = 4
 
     let renderableMessages: [ChatMessage]
-    let renderedMessages: [ChatMessage]
+    /// Grouped transcript rows: one item per user message and one per
+    /// assistant TURN (a searched turn's several stored messages fold
+    /// into a single item, so heavy-tail slicing can never cut a turn
+    /// in half).
+    let transcriptItems: [ChatTranscriptItem]
     let hiddenTranscriptSummary: HiddenTranscriptSummary?
     let usesHeavyTranscriptScrollGuard: Bool
 
@@ -435,12 +450,18 @@ private struct ChatConversationRenderPlan {
     private let firstSourceMessageID: UUID?
     private let lastSourceMessageID: UUID?
     private let showFullHeavyTranscript: Bool
+    private let excludedTurnGroupID: UUID?
 
-    init(messages: [ChatMessage], showFullHeavyTranscript: Bool) {
+    init(
+        messages: [ChatMessage],
+        showFullHeavyTranscript: Bool,
+        excludedTurnGroupID: UUID? = nil
+    ) {
         self.sourceMessageCount = messages.count
         self.firstSourceMessageID = messages.first?.id
         self.lastSourceMessageID = messages.last?.id
         self.showFullHeavyTranscript = showFullHeavyTranscript
+        self.excludedTurnGroupID = excludedTurnGroupID
 
         var totalCharacters = 0
         var heavy = false
@@ -468,31 +489,54 @@ private struct ChatConversationRenderPlan {
         self.renderableMessages = renderable
         self.usesHeavyTranscriptScrollGuard = heavy
 
+        let allItems = ChatTranscriptGrouping.items(
+            from: renderable,
+            excludingTurnGroupID: excludedTurnGroupID
+        )
+
         guard !showFullHeavyTranscript,
               heavy,
-              renderable.count > Self.heavyTranscriptTailMessageCount
+              allItems.count > Self.heavyTranscriptTailItemCount
         else {
-            self.renderedMessages = renderable
+            self.transcriptItems = allItems
             self.hiddenTranscriptSummary = nil
             return
         }
 
-        let hidden = renderable.dropLast(Self.heavyTranscriptTailMessageCount)
-        let hiddenCharacters = hidden.reduce(0) { total, message in
-            total + message.visibleContent.count + (message.reasoningContent?.count ?? 0)
+        let hiddenItems = allItems.dropLast(Self.heavyTranscriptTailItemCount)
+        var hiddenMessageCount = 0
+        var hiddenCharacters = 0
+        for item in hiddenItems {
+            switch item {
+            case .user(let message):
+                hiddenMessageCount += 1
+                hiddenCharacters += message.visibleContent.count
+                    + (message.reasoningContent?.count ?? 0)
+            case .assistantTurn(let group):
+                hiddenMessageCount += group.members.count
+                for member in group.members {
+                    hiddenCharacters += member.visibleContent.count
+                        + (member.reasoningContent?.count ?? 0)
+                }
+            }
         }
-        self.renderedMessages = Array(renderable.suffix(Self.heavyTranscriptTailMessageCount))
+        self.transcriptItems = Array(allItems.suffix(Self.heavyTranscriptTailItemCount))
         self.hiddenTranscriptSummary = HiddenTranscriptSummary(
-            messageCount: hidden.count,
+            messageCount: hiddenMessageCount,
             characterCount: hiddenCharacters
         )
     }
 
-    func matches(messages: [ChatMessage], showFullHeavyTranscript: Bool) -> Bool {
+    func matches(
+        messages: [ChatMessage],
+        showFullHeavyTranscript: Bool,
+        excludedTurnGroupID: UUID?
+    ) -> Bool {
         sourceMessageCount == messages.count
             && firstSourceMessageID == messages.first?.id
             && lastSourceMessageID == messages.last?.id
             && self.showFullHeavyTranscript == showFullHeavyTranscript
+            && self.excludedTurnGroupID == excludedTurnGroupID
     }
 
     private static func isRenderableMessage(_ message: ChatMessage) -> Bool {

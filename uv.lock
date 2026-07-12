@@ -678,7 +678,7 @@ wheels = [
 
 [[package]]
 name = "mtplx"
-version = "1.0.4"
+version = "2.0.2"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
@@ -690,6 +690,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "rich" },
     { name = "safetensors" },
+    { name = "transformers", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "uvicorn" },
 ]
 
@@ -726,6 +727,7 @@ requires-dist = [
     { name = "rich", specifier = ">=14" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8" },
     { name = "safetensors", specifier = ">=0.6" },
+    { name = "transformers", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = "<5.13" },
     { name = "twine", marker = "extra == 'dev'", specifier = ">=5" },
     { name = "uvicorn", specifier = ">=0.46" },
     { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.46" },

@@ -2,7 +2,8 @@
 
 | Profile | Purpose |
 |---|---|
-| `sustained` | Default `mtplx start` mode: native-MTP long-context path with chunked prefill, final-token logits, request-sized paged KV, and the normal Apple fan controller. |
+| `turbo` | Default for the quantized 27B flagships (Optimized-Speed, Optimized-Quality, legacy Optimized): Sustained plus the NAX verify kernels and context-routed compiled verify. Fastest decode profile; matches the macOS app's launch presets. |
+| `sustained` | Default `mtplx start` mode for every other model: native-MTP long-context path with chunked prefill, final-token logits, request-sized paged KV, and the normal Apple fan controller. |
 | `sustained` + `--max` | Sustained Max: the same long-context path with ThermalForge/TG Pro fans pinned while MTPLX runs. |
 | `performance-cold` + `--max` | Burst: old max-fan headline lane, not recommended beyond 8K context. |
 | `performance-cold` | Legacy burst path without fan boost. Kept for explicit flags and compatibility; not shown in first-run onboarding. |

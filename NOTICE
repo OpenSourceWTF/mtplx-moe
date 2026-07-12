@@ -16,3 +16,7 @@ This distribution includes a vendored standalone subset of vllm-metal's
 Apache-2.0 licensed Metal paged-attention kernels under vllm_metal/metal.
 The vendored subset is used only for local MLX/Metal kernel dispatch and does
 not include or depend on the vLLM serving stack.
+
+This product includes Metal kernel code adapted from dflash-mlx
+(https://github.com/bstnxbt/dflash-mlx), Copyright dflash-mlx contributors,
+licensed under the Apache License 2.0. See mtplx/nax_verify.py for details.

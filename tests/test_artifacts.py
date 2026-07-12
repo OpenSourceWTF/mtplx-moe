@@ -2022,3 +2022,32 @@ def test_pull_refreshes_when_remote_index_changed(monkeypatch, tmp_path):
 
     monkeypatch.setattr("huggingface_hub.hf_hub_download", broken_download)
     assert hf_loader._local_matches_remote_index(local, "org/repo", None) is True
+
+
+def test_served_public_ids_resolve_to_first_party_repos():
+    """The exact ids /v1/models advertises must resolve for serve/run/pull.
+
+    Explicit first-party ids only (contract-match-only stance, #57):
+    anything that is not a known public id or two-part repo stays None.
+    """
+    from mtplx.artifacts import _hf_repo_id_from_ref
+    from mtplx.profiles import (
+        DEFAULT_HF_MODEL_ID,
+        QUALITY_HF_MODEL_ID,
+        QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
+        QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
+    )
+
+    assert _hf_repo_id_from_ref("mtplx-qwen36-27b-optimized-speed") == DEFAULT_HF_MODEL_ID
+    assert _hf_repo_id_from_ref("MTPLX-Qwen36-27B-Optimized-Speed") == DEFAULT_HF_MODEL_ID
+    assert _hf_repo_id_from_ref("mtplx-qwen36-27b-optimized-quality") == QUALITY_HF_MODEL_ID
+    assert (
+        _hf_repo_id_from_ref("mtplx-qwen35-9b-optimized-speed")
+        == QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID
+    )
+    assert (
+        _hf_repo_id_from_ref("mtplx-qwen36-35b-a3b-optimized-speed")
+        == QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID
+    )
+    assert _hf_repo_id_from_ref("mtplx-qwopus-madeup-id") is None
+    assert _hf_repo_id_from_ref("some-random-model-name") is None
