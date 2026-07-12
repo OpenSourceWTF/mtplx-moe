@@ -86,6 +86,7 @@ class RoutePolicyTxn:
         self._commit = commit
         self._rollback = rollback
         self._finished = False
+        self._rolled_back = False
 
     def commit(self) -> None:
         if self._finished:
@@ -99,6 +100,16 @@ class RoutePolicyTxn:
             return
         self._rollback()
         self._finished = True
+        self._rolled_back = True
+
+    def rollback_publication(self) -> None:
+        """Undo a publication that committed before a later host-side failure."""
+
+        if self._rolled_back:
+            return
+        self._rollback()
+        self._finished = True
+        self._rolled_back = True
 
 
 @dataclass
@@ -644,6 +655,16 @@ class GlobalExpertSlotBank:
     def _validate_experts(
         self, layer: int, expert_ids: Iterable[int]
     ) -> tuple[int, tuple[int, ...]]:
+        layer, experts = self._validate_experts_for_all_hits(layer, expert_ids)
+        if len(dict.fromkeys(experts)) > self.transient_slots:
+            raise ValueError(
+                "transient_slots must cover the maximum unique experts in one route"
+            )
+        return layer, experts
+
+    def _validate_experts_for_all_hits(
+        self, layer: int, expert_ids: Iterable[int]
+    ) -> tuple[int, tuple[int, ...]]:
         layer = self._key(layer, 0)[0]
         try:
             experts = tuple(
@@ -655,10 +676,6 @@ class GlobalExpertSlotBank:
             raise ValueError("a route must select at least one expert")
         for expert in experts:
             self._key(layer, expert)
-        if len(dict.fromkeys(experts)) > self.transient_slots:
-            raise ValueError(
-                "transient_slots must cover the maximum unique experts in one route"
-            )
         return layer, experts
 
     def _history_for(self, key: tuple[int, int]) -> _ExpertHistory:
@@ -994,6 +1011,85 @@ class GlobalExpertSlotBank:
             self._evictions = evictions
             self._cross_layer_evictions = cross_layer_evictions
             self._prefill_seed_candidates[layer] = set(seed_candidates)
+            for key, values in histories.items():
+                if values is missing:
+                    self._history.pop(key, None)
+                    continue
+                score, score_epoch, last_used = values
+                history = self._history.get(key)
+                if history is None:
+                    history = _ExpertHistory()
+                    self._history[key] = history
+                history.score = score
+                history.score_epoch = score_epoch
+                history.last_used = last_used
+
+        return plan, RoutePolicyTxn(commit=commit, rollback=rollback)
+
+    def try_plan_all_hits_transaction(
+        self,
+        layer: int,
+        expert_ids: Iterable[int],
+        *,
+        phase: RoutingPhase | str,
+    ) -> tuple[RoutePlan, RoutePolicyTxn] | None:
+        """Plan a ready global route and defer policy updates until commit."""
+
+        layer, experts = self._validate_experts_for_all_hits(layer, expert_ids)
+        phase = RoutingPhase(phase)
+        unique_experts = tuple(dict.fromkeys(experts))
+        keys = tuple((layer, expert) for expert in unique_experts)
+        entries = tuple(self._directory.get(key) for key in keys)
+        if any(entry is None or entry.state != "ready" for entry in entries):
+            return None
+
+        missing = object()
+        histories: dict[tuple[int, int], object] = {}
+        for key in keys:
+            history = self._history.get(key)
+            histories[key] = (
+                missing
+                if history is None
+                else (history.score, history.score_epoch, history.last_used)
+            )
+        decode_epoch = self._decode_epoch
+        lru = tuple(self._lru.items())
+
+        resolved = {
+            expert: entry.slot
+            for expert, entry in zip(unique_experts, entries, strict=True)
+            if entry is not None
+        }
+        generations = {
+            expert: entry.generation
+            for expert, entry in zip(unique_experts, entries, strict=True)
+            if entry is not None
+        }
+        plan = RoutePlan(
+            phase=phase,
+            experts=experts,
+            slots=tuple(resolved[expert] for expert in experts),
+            hits=unique_experts,
+            misses=(),
+            loads=(),
+            evictions=(),
+            generations=tuple(generations[expert] for expert in experts),
+        )
+
+        def commit() -> None:
+            if phase is RoutingPhase.DECODE:
+                self._decode_epoch += 1
+                for expert in experts:
+                    self._touch_decode((layer, expert))
+                for key in keys:
+                    self._history_for(key).last_used = self._decode_epoch
+            if self.cache_policy == "lru":
+                for key in keys:
+                    self._lru.move_to_end(key)
+
+        def rollback() -> None:
+            self._decode_epoch = decode_epoch
+            self._lru = OrderedDict(lru)
             for key, values in histories.items():
                 if values is missing:
                     self._history.pop(key, None)

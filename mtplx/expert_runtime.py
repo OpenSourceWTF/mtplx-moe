@@ -465,6 +465,9 @@ class PendingSplitRoute:
         try:
             release()
         except BaseException as exc:
+            with self._state_lock:
+                if self._lifecycle_release is None:
+                    self._lifecycle_release = release
             self._record_cleanup_error(exc)
 
     @staticmethod
@@ -761,11 +764,12 @@ class PendingSplitRoute:
                 return
             if not self._policy_observed:
                 incremental_parts = len(self._completed_miss_ordinals)
-                self._policy_txn.commit()
-                self.runtime._observe_plan(self.layer, self.plan)
-                if self.plan.phase is RoutingPhase.DECODE and self.plan.misses:
-                    self.runtime._incremental_miss_routes += 1
-                    self.runtime._incremental_miss_parts += incremental_parts
+                self.runtime._publish_route_transaction(
+                    self.layer,
+                    self.plan,
+                    self._policy_txn,
+                    incremental_parts=incremental_parts,
+                )
                 self._policy_observed = True
                 committed = True
             if lease_ordinal is not None:
@@ -1023,6 +1027,7 @@ class ExpertStreamingRuntime:
             layer: CacheCounters() for layer in spec.routed_layer_indices
         }
         self._phase_counters = {phase: CacheCounters() for phase in RoutingPhase}
+        self._counter_lock = threading.Lock()
         self._global_bank = (
             GlobalExpertSlotBank(
                 layer_indices=spec.routed_layer_indices,
@@ -1286,33 +1291,44 @@ class ExpertStreamingRuntime:
         cancel_event: threading.Event | None = None,
         deadline_ns: int | None = None,
     ) -> ReadyRoute | None:
-        """Pin one fully resident layer route without wave or split execution.
+        """Pin one fully resident route without wave or split execution.
 
-        The layer-local policy probe is side-effect free when any assignment
-        misses, allowing the caller to use the regular split route unchanged.
-        Component-bank execution is currently layer-local, so global-cache
-        configurations deliberately retain their existing route path.
+        The policy probe is side-effect free when any assignment misses,
+        allowing the caller to use the regular split route unchanged.
         """
 
         if self._closed:
             raise ExpertSlotError("expert streaming runtime is closed")
         if self._closing:
             raise ExpertSlotError("expert streaming runtime is closing")
-        if self._global_bank is not None:
-            return None
         try:
             lock = self._layer_locks[layer]
-            bank = self._banks[layer]
         except KeyError as exc:
             raise ValueError(
                 f"layer {layer} is not routed for {self.spec.key}"
             ) from exc
         with lock:
             self._raise_if_unhealthy()
-            planned = bank.try_plan_all_hits_transaction(expert_ids, phase=phase)
+            planned = (
+                self._global_bank.try_plan_all_hits_transaction(
+                    layer,
+                    expert_ids,
+                    phase=phase,
+                )
+                if self._global_bank is not None
+                else self._banks[layer].try_plan_all_hits_transaction(
+                    expert_ids,
+                    phase=phase,
+                )
+            )
             if planned is None:
                 return None
             route_plan, policy_txn = planned
+            ready: ReadyRoute | None = None
+
+            def publish_route() -> None:
+                self._publish_route_transaction(layer, route_plan, policy_txn)
+
             try:
                 ready = self.slots.ensure_route(
                     layer,
@@ -1320,17 +1336,33 @@ class ExpertStreamingRuntime:
                     cancel_event=cancel_event,
                     deadline_ns=deadline_ns,
                 )
+                self.slots.commit_if_healthy(publish_route)
             except BaseException:
                 # A successful all-hit probe has no loads and therefore can
                 # never cross the destructive I/O boundary.  Any pin-path
                 # failure must restore its decode history and epoch exactly.
-                policy_txn.rollback_completion()
+                if ready is not None:
+                    try:
+                        ready.release(synchronize=False)
+                    except BaseException as cleanup_error:
+                        self._record_cleanup_error(cleanup_error)
+                        try:
+                            ready.release(synchronize=False)
+                        except BaseException as retry_error:
+                            self._record_cleanup_error(retry_error)
+                try:
+                    policy_txn.rollback_publication()
+                except BaseException as rollback_error:
+                    self._record_cleanup_error(rollback_error)
                 raise
-            policy_txn.commit()
-            self._observe_plan(layer, route_plan)
+            assert ready is not None
             return ready
 
     def _observe_plan(self, layer: int, plan: RoutePlan) -> None:
+        with self._counter_lock:
+            self._observe_plan_unlocked(layer, plan)
+
+    def _observe_plan_unlocked(self, layer: int, plan: RoutePlan) -> None:
         self.counters.observe(
             plan,
             expert_record_bytes=self.spec.expert_record_bytes,
@@ -1343,6 +1375,51 @@ class ExpertStreamingRuntime:
             plan,
             expert_record_bytes=self.spec.expert_record_bytes,
         )
+
+    def _observe_incremental_unlocked(self, *, routes: int, parts: int) -> None:
+        self._incremental_miss_routes += routes
+        self._incremental_miss_parts += parts
+
+    def _publish_route_transaction(
+        self,
+        layer: int,
+        plan: RoutePlan,
+        policy_txn: RoutePolicyTxn,
+        *,
+        incremental_parts: int = 0,
+    ) -> None:
+        counters = (
+            self.counters,
+            self._layer_counters[layer],
+            self._phase_counters[plan.phase],
+        )
+        with self._counter_lock:
+            counter_snapshots = tuple(counter.__dict__.copy() for counter in counters)
+            incremental_snapshot = (
+                self._incremental_miss_routes,
+                self._incremental_miss_parts,
+            )
+            try:
+                policy_txn.commit()
+                self._observe_plan_unlocked(layer, plan)
+                if plan.phase is RoutingPhase.DECODE and plan.misses:
+                    self._observe_incremental_unlocked(
+                        routes=1,
+                        parts=incremental_parts,
+                    )
+            except BaseException:
+                for counter, snapshot in zip(counters, counter_snapshots, strict=True):
+                    counter.__dict__.clear()
+                    counter.__dict__.update(snapshot)
+                (
+                    self._incremental_miss_routes,
+                    self._incremental_miss_parts,
+                ) = incremental_snapshot
+                try:
+                    policy_txn.rollback_publication()
+                except BaseException as rollback_error:
+                    self._record_cleanup_error(rollback_error)
+                raise
 
     def _plan_route(
         self,
@@ -1726,13 +1803,16 @@ class ExpertStreamingRuntime:
             else:
                 for bank in self._banks.values():
                     bank.reset()
-            self.counters = CacheCounters()
-            self._layer_counters = {
-                layer: CacheCounters() for layer in self.spec.routed_layer_indices
-            }
-            self._phase_counters = {phase: CacheCounters() for phase in RoutingPhase}
-            self._incremental_miss_routes = 0
-            self._incremental_miss_parts = 0
+            with self._counter_lock:
+                self.counters = CacheCounters()
+                self._layer_counters = {
+                    layer: CacheCounters() for layer in self.spec.routed_layer_indices
+                }
+                self._phase_counters = {
+                    phase: CacheCounters() for phase in RoutingPhase
+                }
+                self._incremental_miss_routes = 0
+                self._incremental_miss_parts = 0
         finally:
             for lock in reversed(locks):
                 lock.release()
@@ -1741,6 +1821,22 @@ class ExpertStreamingRuntime:
         with self._kv_lock:
             live_kv = self._live_kv_tokens
             peak_kv = self._live_kv_peak
+        with self._counter_lock:
+            cache = self.counters.as_dict()
+            cache_by_layer = {
+                str(layer): counters.as_dict()
+                for layer, counters in self._layer_counters.items()
+            }
+            cache_by_phase = {
+                phase.value: counters.as_dict()
+                for phase, counters in self._phase_counters.items()
+            }
+            incremental_misses = {
+                "routes": self._incremental_miss_routes,
+                "parts": self._incremental_miss_parts,
+            }
+        # Never hold the counter lock across slot health/fence inspection.
+        slots = self.slots.snapshot()
         snapshot = {
             "model_key": self.spec.key,
             "manifest_sha256": self.manifest.manifest_sha256,
@@ -1764,20 +1860,11 @@ class ExpertStreamingRuntime:
             "mlx_memory": mlx_memory_telemetry(mx_module),
             "live_kv_tokens": live_kv,
             "live_kv_tokens_peak": peak_kv,
-            "cache": self.counters.as_dict(),
-            "cache_by_layer": {
-                str(layer): counters.as_dict()
-                for layer, counters in self._layer_counters.items()
-            },
-            "cache_by_phase": {
-                phase.value: counters.as_dict()
-                for phase, counters in self._phase_counters.items()
-            },
-            "incremental_misses": {
-                "routes": self._incremental_miss_routes,
-                "parts": self._incremental_miss_parts,
-            },
-            "slots": self.slots.snapshot(),
+            "cache": cache,
+            "cache_by_layer": cache_by_layer,
+            "cache_by_phase": cache_by_phase,
+            "incremental_misses": incremental_misses,
+            "slots": slots,
         }
         if self._global_bank is not None:
             snapshot["global_cache"] = {

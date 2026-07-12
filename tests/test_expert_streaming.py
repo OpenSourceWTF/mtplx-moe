@@ -58,6 +58,92 @@ def test_global_cache_uses_total_capacity_as_transient_slot_base() -> None:
     assert all(not load.persistent for load in plan.loads)
 
 
+def _global_all_hit_bank(*, transient_slots: int = 1) -> GlobalExpertSlotBank:
+    bank = GlobalExpertSlotBank(
+        layer_indices=(1, 2),
+        expert_count=4,
+        persistent_slots=3,
+        transient_slots=transient_slots,
+        prefill_slots_per_layer=0,
+        cache_policy="lru",
+    )
+    for expert in (0, 1, 2):
+        plan, transaction = bank.plan_transaction(1, [expert], phase="decode")
+        transaction.commit()
+        assert plan.loads
+    return bank
+
+
+def _global_all_hit_state(bank: GlobalExpertSlotBank) -> tuple[object, ...]:
+    return (
+        bank._decode_epoch,
+        tuple(bank._slot_to_key),
+        dict(bank._key_to_slot),
+        tuple(
+            sorted(
+                (key, entry.slot, entry.generation, entry.state)
+                for key, entry in bank._directory.items()
+            )
+        ),
+        tuple(bank._slot_generations),
+        tuple(bank._free_slots),
+        frozenset(bank._free_slot_set),
+        tuple(bank._lru.items()),
+        tuple(
+            sorted(
+                (key, history.score, history.score_epoch, history.last_used)
+                for key, history in bank._history.items()
+            )
+        ),
+        tuple(sorted(bank._layer_occupancy.items())),
+        bank._evictions,
+        bank._cross_layer_evictions,
+    )
+
+
+def test_global_all_hit_transaction_defers_state_and_rolls_back_exactly() -> None:
+    bank = _global_all_hit_bank()
+    before = _global_all_hit_state(bank)
+
+    planned = bank.try_plan_all_hits_transaction(1, [2, 0, 2, 1], phase="decode")
+
+    assert planned is not None
+    route, transaction = planned
+    assert route.experts == (2, 0, 2, 1)
+    assert route.slots[0] == route.slots[2]
+    assert route.hits == (2, 0, 1)
+    assert route.misses == ()
+    assert route.loads == ()
+    assert all(generation is not None for generation in route.generations)
+    assert _global_all_hit_state(bank) == before
+
+    transaction.rollback_completion()
+    assert _global_all_hit_state(bank) == before
+
+
+def test_global_all_hit_transaction_commit_matches_normal_hit_policy() -> None:
+    bank = _global_all_hit_bank()
+    control = _global_all_hit_bank(transient_slots=3)
+    expected = control.plan(1, [2, 0, 2, 1], phase="decode")
+
+    planned = bank.try_plan_all_hits_transaction(1, [2, 0, 2, 1], phase="decode")
+
+    assert planned is not None
+    route, transaction = planned
+    transaction.commit()
+    assert route == expected
+    assert _global_all_hit_state(bank) == _global_all_hit_state(control)
+
+
+def test_global_all_hit_miss_is_side_effect_free() -> None:
+    bank = _global_all_hit_bank()
+    before = _global_all_hit_state(bank)
+
+    assert bank.try_plan_all_hits_transaction(2, [0], phase="decode") is None
+
+    assert _global_all_hit_state(bank) == before
+
+
 def test_decode_fills_persistent_slots_and_then_hits() -> None:
     bank = LayerExpertSlotBank(
         expert_count=16,

@@ -63,6 +63,16 @@ class ExpertSlotState(str, Enum):
     CLOSED = "closed"
 
 
+@dataclass(eq=False)
+class _RouteReleaseClaim:
+    released: bool = False
+
+
+@dataclass(eq=False)
+class _SlotPinClaim:
+    active: bool = True
+
+
 @dataclass
 class ExpertSlotMetrics:
     ensure_calls: int = 0
@@ -81,12 +91,54 @@ class ExpertSlotMetrics:
     completion_fence_fallbacks: int = 0
     completion_fence_failures: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _route_claims: list[_RouteReleaseClaim] = field(default_factory=list, repr=False)
+    _admission_test_hook: Callable[[str], None] | None = field(default=None, repr=False)
 
     def update(self, **values: int) -> None:
         with self._lock:
             for name, value in values.items():
                 setattr(self, name, int(getattr(self, name)) + int(value))
             self.active_routes_peak = max(self.active_routes_peak, self.active_routes)
+
+    def admit_route(self, claim: _RouteReleaseClaim) -> None:
+        with self._lock:
+            previous_claims = self._route_claims
+            previous_active = self.active_routes
+            previous_peak = self.active_routes_peak
+            hook = self._admission_test_hook
+            try:
+                if hook is not None:
+                    hook("before_filter")
+                filtered = [item for item in previous_claims if not item.released]
+                if hook is not None:
+                    hook("after_filter")
+                next_claims = [*filtered, claim]
+                if hook is not None:
+                    hook("after_append")
+                next_active = sum(not item.released for item in next_claims)
+                if hook is not None:
+                    hook("after_active_count")
+                next_peak = max(previous_peak, next_active)
+
+                self._route_claims = next_claims
+                self.active_routes = next_active
+                if hook is not None:
+                    hook("after_publish")
+                self.active_routes_peak = next_peak
+                if hook is not None:
+                    hook("after_peak")
+            except BaseException:
+                self._route_claims = previous_claims
+                self.active_routes = previous_active
+                self.active_routes_peak = previous_peak
+                raise
+
+    def release_route(self, claim: _RouteReleaseClaim) -> None:
+        """Consume one token and reconcile aggregate accounting idempotently."""
+
+        with self._lock:
+            claim.released = True
+            self.active_routes = sum(not item.released for item in self._route_claims)
 
     def as_dict(self) -> dict[str, int]:
         with self._lock:
@@ -121,6 +173,7 @@ class _PhysicalSlot:
     expert: int | None = None
     generation: int = 0
     pins: int = 0
+    pin_claims: list[_SlotPinClaim] = field(default_factory=list, repr=False)
     digest: str | None = None
     error: BaseException | None = None
     condition: threading.Condition = field(default_factory=threading.Condition)
@@ -172,17 +225,22 @@ class ReadyRoute:
         pool: ExpertSlotPool,
         plan: RoutePlan,
         bindings: tuple[ExpertSlotBinding, ...],
-        pinned: tuple[_PhysicalSlot, ...],
+        pinned: tuple[tuple[_PhysicalSlot, _SlotPinClaim], ...],
+        lifecycle_claim: _RouteReleaseClaim,
     ) -> None:
         self.pool = pool
         self.plan = plan
         self.bindings = bindings
-        self._pinned = pinned
+        self._pinned = tuple(slot for slot, _claim in pinned)
         self._released = False
         self._route_finished = False
+        self._route_finishing = False
+        self._lifecycle_claim = lifecycle_claim
+        self._pin_claims = {id(slot): claim for slot, claim in pinned}
+        self._release_in_progress = False
         self._release_lock = threading.Lock()
         self._release_condition = threading.Condition(self._release_lock)
-        self._pending_slots = {id(slot): slot for slot in pinned}
+        self._pending_slots = {id(slot): slot for slot, _claim in pinned}
         self._scheduled_slots: set[int] = set()
         self._completion_futures: list[Future[None]] = []
         self._registrations_in_progress = 0
@@ -244,7 +302,7 @@ class ReadyRoute:
         try:
             future = self.pool._submit_completion_fence(
                 completion_waiter,
-                lambda: self._finish_slots(tuple(selected.values())),
+                lambda: self._run_claimed_slot_cleanup(tuple(selected.values())),
                 slot_count=len(selected),
             )
         except BaseException:
@@ -268,44 +326,115 @@ class ReadyRoute:
 
     def _finish_slots(self, slots: tuple[_PhysicalSlot, ...]) -> None:
         for slot in slots:
-            with slot.condition:
-                if slot.pins <= 0:
-                    raise ExpertSlotError("slot pin accounting underflow")
-                slot.pins -= 1
-                slot.condition.notify_all()
+            self._finish_slot_claim(slot)
         finish_route = False
-        with self._release_lock:
-            for slot in slots:
-                slot_id = id(slot)
-                self._pending_slots.pop(slot_id, None)
-                self._scheduled_slots.discard(slot_id)
-            if self._released and not self._pending_slots and not self._route_finished:
-                self._route_finished = True
+        with self._release_condition:
+            if (
+                self._released
+                and not self._pending_slots
+                and not self._route_finished
+                and not self._route_finishing
+            ):
+                self._route_finishing = True
                 finish_route = True
         if finish_route:
-            self.pool._route_released()
+            self._finish_route_lifecycle()
+
+    def _finish_slot_claim(self, slot: _PhysicalSlot) -> None:
+        slot_id = id(slot)
+        with self._release_condition:
+            if slot_id not in self._pending_slots:
+                self._scheduled_slots.discard(slot_id)
+                return
+            claim = self._pin_claims[slot_id]
+            self._release_physical_claim(slot, claim)
+            self._complete_slot_claim(slot_id)
+            self._release_condition.notify_all()
+
+    @staticmethod
+    def _release_physical_claim(slot: _PhysicalSlot, claim: _SlotPinClaim) -> None:
+        with slot.condition:
+            claim.active = False
+            slot.pins = sum(item.active for item in slot.pin_claims)
+            slot.condition.notify_all()
+
+    def _complete_slot_claim(self, slot_id: int) -> None:
+        slot = self._pending_slots.get(slot_id)
+        claim = self._pin_claims.get(slot_id)
+        if slot is not None and claim is not None and claim in slot.pin_claims:
+            slot.pin_claims.remove(claim)
+        self._pending_slots.pop(slot_id, None)
+        self._pin_claims.pop(slot_id, None)
+        self._scheduled_slots.discard(slot_id)
+
+    def _mark_slot_cleanup_failure(
+        self,
+        slots: tuple[_PhysicalSlot, ...],
+        error: BaseException,
+    ) -> None:
+        with self._release_condition:
+            for slot in slots:
+                slot_id = id(slot)
+                if slot_id in self._pending_slots:
+                    self._scheduled_slots.discard(slot_id)
+            self._release_condition.notify_all()
+        self.pool._record_cleanup_error(error)
+
+    def _run_claimed_slot_cleanup(self, slots: tuple[_PhysicalSlot, ...]) -> None:
+        try:
+            self._finish_slots(slots)
+        except BaseException as exc:
+            self._mark_slot_cleanup_failure(slots, exc)
+            raise
+
+    def _finish_route_lifecycle(self) -> None:
+        try:
+            self.pool._route_released(self._lifecycle_claim)
+        except BaseException as exc:
+            with self._release_condition:
+                self._route_finishing = False
+                self._release_condition.notify_all()
+            self.pool._record_cleanup_error(exc)
+            raise
+        with self._release_condition:
+            self._route_finishing = False
+            self._route_finished = True
+            self._release_condition.notify_all()
 
     def release(self, *, synchronize: bool = True) -> None:
+        with self._release_condition:
+            while self._release_in_progress:
+                if not synchronize:
+                    return
+                self._release_condition.wait()
+            self._release_in_progress = True
+        try:
+            self._release_owned(synchronize=synchronize)
+        finally:
+            with self._release_condition:
+                self._release_in_progress = False
+                self._release_condition.notify_all()
+
+    def _release_owned(self, *, synchronize: bool) -> None:
         with self._release_condition:
             first_release = not self._released
             self._released = True
             while self._registrations_in_progress:
                 self._release_condition.wait()
-            immediate = (
-                tuple(
-                    slot
-                    for slot_id, slot in self._pending_slots.items()
-                    if slot_id not in self._scheduled_slots
-                )
-                if first_release
-                else ()
+            immediate = tuple(
+                slot
+                for slot_id, slot in self._pending_slots.items()
+                if slot_id not in self._scheduled_slots
             )
+            self._scheduled_slots.update(id(slot) for slot in immediate)
             futures = tuple(self._completion_futures)
             finish_empty = (
-                first_release and not self._pending_slots and not self._route_finished
+                not self._pending_slots
+                and not self._route_finished
+                and not self._route_finishing
             )
             if finish_empty:
-                self._route_finished = True
+                self._route_finishing = True
         synchronize_error: BaseException | None = None
         cleanup_error: BaseException | None = None
         future_error: BaseException | None = None
@@ -318,9 +447,9 @@ class ReadyRoute:
                 synchronize_error = exc
         try:
             if immediate:
-                self._finish_slots(immediate)
+                self._run_claimed_slot_cleanup(immediate)
             elif finish_empty:
-                self.pool._route_released()
+                self._finish_route_lifecycle()
         except BaseException as exc:
             cleanup_error = exc
         if synchronize:
@@ -332,10 +461,10 @@ class ReadyRoute:
                         future_error = exc
         if synchronize_error is not None:
             raise synchronize_error
-        if cleanup_error is not None:
-            raise cleanup_error
         if future_error is not None:
             raise ExpertSlotError("expert completion fence failed") from future_error
+        if cleanup_error is not None:
+            raise cleanup_error
         if synchronize:
             self.pool._raise_completion_error()
 
@@ -349,17 +478,57 @@ class ReadyRoute:
 class _RouteLifecycle:
     """One extra active-route hold spanning a multi-part transaction."""
 
-    def __init__(self, pool: ExpertSlotPool) -> None:
+    def __init__(self, pool: ExpertSlotPool, claim: _RouteReleaseClaim) -> None:
         self.pool = pool
-        self._released = False
-        self._lock = threading.Lock()
+        self._claim = claim
 
     def release(self) -> None:
-        with self._lock:
-            if self._released:
-                return
-            self._released = True
-        self.pool._route_released()
+        try:
+            self.pool._route_released(self._claim)
+        except BaseException as exc:
+            self.pool._record_cleanup_error(exc)
+            raise
+
+
+class _FailedRouteSetupOwner:
+    """Retryable owner for pins and lifecycle from failed route construction."""
+
+    def __init__(
+        self,
+        pool: ExpertSlotPool,
+        lifecycle: _RouteLifecycle,
+        pins: dict[int, tuple[_PhysicalSlot, _SlotPinClaim]],
+    ) -> None:
+        self.pool = pool
+        self.lifecycle = lifecycle
+        self.pins = pins
+
+    @property
+    def terminal(self) -> bool:
+        return not self.pins and self.lifecycle._claim.released
+
+    def release(self) -> None:
+        hook = self.pool._failed_setup_cleanup_test_hook
+        for slot_id, (slot, claim) in tuple(self.pins.items()):
+            if hook is not None:
+                hook("before_pin", slot_id)
+            with slot.condition:
+                claim.active = False
+                slot.pins = sum(item.active for item in slot.pin_claims)
+                slot.condition.notify_all()
+            if hook is not None:
+                hook("after_pin_reconcile", slot_id)
+            with slot.condition:
+                if claim in slot.pin_claims:
+                    slot.pin_claims.remove(claim)
+            if hook is not None:
+                hook("after_pin_list", slot_id)
+            self.pins.pop(slot_id, None)
+        if hook is not None:
+            hook("before_lifecycle", -1)
+        self.lifecycle.release()
+        if hook is not None:
+            hook("after_lifecycle", -1)
 
 
 class _CombinedCancel:
@@ -448,6 +617,10 @@ class ExpertSlotPool:
         self._close_lock = threading.Lock()
         self._closing = False
         self._closed = False
+        self._route_setup_test_hook: Callable[[str], None] | None = None
+        self._failed_setup_cleanup_test_hook: Callable[[str, int], None] | None = None
+        self._cleanup_owner_lock = threading.Lock()
+        self._cleanup_owners: list[_FailedRouteSetupOwner] = []
 
         allocated = 0
         try:
@@ -503,6 +676,7 @@ class ExpertSlotPool:
         )
         self._completion_error_lock = threading.Lock()
         self._completion_error: BaseException | None = None
+        self._cleanup_error: BaseException | None = None
 
     def _submit_completion_fence(
         self,
@@ -517,14 +691,24 @@ class ExpertSlotPool:
         )
 
         def wait_and_release() -> None:
+            waiter_error: BaseException | None = None
+            cleanup_error: BaseException | None = None
             try:
                 completion_waiter()
             except BaseException as exc:
                 self.metrics.update(completion_fence_failures=1)
                 self._record_completion_error(exc)
-                raise
-            finally:
+                waiter_error = exc
+            try:
                 on_complete()
+            except BaseException as exc:
+                self.metrics.update(completion_fence_failures=1)
+                self._record_cleanup_error(exc)
+                cleanup_error = exc
+            if waiter_error is not None:
+                raise waiter_error
+            if cleanup_error is not None:
+                raise cleanup_error
 
         try:
             return self._completion_executor.submit(wait_and_release)
@@ -540,6 +724,11 @@ class ExpertSlotPool:
             if self._completion_error is None:
                 self._completion_error = error
 
+    def _record_cleanup_error(self, error: BaseException) -> None:
+        with self._completion_error_lock:
+            if self._cleanup_error is None:
+                self._cleanup_error = error
+
     def _raise_completion_error_locked(
         self,
         *,
@@ -551,6 +740,8 @@ class ExpertSlotPool:
                 "an asynchronous expert completion fence failed",
                 policy_rollback_safe=policy_rollback_safe,
             ) from error
+        if self._cleanup_error is not None:
+            raise ExpertSlotError("expert slot cleanup failed") from self._cleanup_error
 
     def _raise_completion_error(
         self,
@@ -565,6 +756,7 @@ class ExpertSlotPool:
     def raise_if_unhealthy(self) -> None:
         """Reject new policy or slot work after a terminal fence failure."""
 
+        self._retry_cleanup_owners()
         self._raise_completion_error()
 
     def commit_if_healthy(self, callback: Callable[[], None]) -> None:
@@ -915,22 +1107,26 @@ class ExpertSlotPool:
         """Keep close from finalizing slots during multi-part commit/rollback."""
 
         self._raise_completion_error()
+        claim = _RouteReleaseClaim()
+        lifecycle = _RouteLifecycle(self, claim)
         with self._lifecycle:
             if self._closed:
                 raise ExpertSlotError("expert slot pool is closed")
             if self._closing:
                 raise ExpertSlotError("expert slot pool is closing")
-            self.metrics.update(active_routes=1)
-        return _RouteLifecycle(self)
+            self.metrics.admit_route(claim)
+        return lifecycle
 
     def retain_admitted_split_lifecycle(self) -> _RouteLifecycle:
         """Retain rollback lifetime after this worker owns an active route."""
 
+        claim = _RouteReleaseClaim()
+        lifecycle = _RouteLifecycle(self, claim)
         with self._lifecycle:
             if self._closed:
                 raise ExpertSlotError("expert slot pool is closed")
-            self.metrics.update(active_routes=1)
-        return _RouteLifecycle(self)
+            self.metrics.admit_route(claim)
+        return lifecycle
 
     def ensure_route_part(
         self,
@@ -980,31 +1176,110 @@ class ExpertSlotPool:
         io_admission: RouteIOAdmission | None = None,
         route_admitted: Callable[[], None] | None = None,
     ) -> ReadyRoute:
-
         self._raise_completion_error()
         if len(plan.experts) != len(plan.slots):
             raise ExpertSlotError("route experts and slots differ in length")
+        lifecycle_claim = _RouteReleaseClaim()
+        lifecycle_owner = _RouteLifecycle(self, lifecycle_claim)
+        setup_pins: dict[int, tuple[_PhysicalSlot, _SlotPinClaim]] = {}
+        setup_owner = _FailedRouteSetupOwner(self, lifecycle_owner, setup_pins)
         with self._lifecycle:
             if self._closed:
                 raise ExpertSlotError("expert slot pool is closed")
             if self._closing:
                 raise ExpertSlotError("expert slot pool is closing")
-            self.metrics.update(active_routes=1)
+            self.metrics.admit_route(lifecycle_claim)
         try:
-            if route_admitted is not None:
-                route_admitted()
+            return self._ensure_route_owned(
+                layer,
+                plan,
+                cancel_event=cancel_event,
+                deadline_ns=deadline_ns,
+                io_admission=io_admission,
+                route_admitted=route_admitted,
+                lifecycle_claim=lifecycle_claim,
+                setup_pins=setup_pins,
+            )
         except BaseException:
-            self._route_released()
+            self._cleanup_failed_route_setup(setup_owner)
             raise
+
+    def _cleanup_failed_route_setup(
+        self,
+        setup_owner: _FailedRouteSetupOwner,
+    ) -> None:
+        for _attempt in range(2):
+            try:
+                setup_owner.release()
+            except BaseException as exc:
+                self._record_cleanup_error(exc)
+                if setup_owner.terminal:
+                    return
+            else:
+                return
+        with self._lifecycle:
+            with self._cleanup_owner_lock:
+                if setup_owner not in self._cleanup_owners:
+                    self._cleanup_owners.append(setup_owner)
+            self._lifecycle.notify_all()
+
+    def _retry_cleanup_owners(self) -> None:
+        with self._cleanup_owner_lock:
+            owners = tuple(self._cleanup_owners)
+        for owner in owners:
+            remove = False
+            try:
+                owner.release()
+            except BaseException as exc:
+                self._record_cleanup_error(exc)
+                remove = owner.terminal
+            else:
+                remove = True
+            if remove:
+                with self._cleanup_owner_lock:
+                    if owner in self._cleanup_owners:
+                        self._cleanup_owners.remove(owner)
+
+    def _has_cleanup_owners(self) -> bool:
+        with self._cleanup_owner_lock:
+            return bool(self._cleanup_owners)
+
+    def _ensure_route_owned(
+        self,
+        layer: int,
+        plan: RoutePlan,
+        *,
+        cancel_event: threading.Event | None,
+        deadline_ns: int | None,
+        io_admission: RouteIOAdmission | None = None,
+        route_admitted: Callable[[], None] | None = None,
+        lifecycle_claim: _RouteReleaseClaim,
+        setup_pins: dict[int, tuple[_PhysicalSlot, _SlotPinClaim]],
+    ) -> ReadyRoute:
+        setup_hook = self._route_setup_test_hook
+        if route_admitted is not None:
+            route_admitted()
+        if setup_hook is not None:
+            setup_hook("after_callback")
         self.metrics.update(ensure_calls=1, load_requests=len(plan.loads))
+        if setup_hook is not None:
+            setup_hook("after_metrics")
         internal_cancel = threading.Event()
+        if setup_hook is not None:
+            setup_hook("after_cancel_event")
         combined_cancel = _CombinedCancel(cancel_event, internal_cancel)
+        if setup_hook is not None:
+            setup_hook("after_combined_cancel")
         prepared: dict[tuple[int, int], tuple[_PhysicalSlot, int]] = {}
         prepared_states: list[_PreparedSlotState] = []
         futures: list[Future[None]] = []
         owned_loads: list[tuple[_PhysicalSlot, int, ExpertRecord]] = []
         submitted_loads: set[tuple[int, int]] = set()
+        if setup_hook is not None:
+            setup_hook("after_containers")
         admission = io_admission if io_admission is not None else RouteIOAdmission()
+        if setup_hook is not None:
+            setup_hook("after_io_admission")
         try:
             try:
                 for load in plan.loads:
@@ -1091,7 +1366,7 @@ class ExpertSlotPool:
                 raise future_error
 
             bindings: list[ExpertSlotBinding] = []
-            unique_pins: dict[int, _PhysicalSlot] = {}
+            unique_pins = setup_pins
             try:
                 plan_generations = (
                     plan.generations
@@ -1135,8 +1410,10 @@ class ExpertSlotPool:
                         else:
                             self._raise_completion_error()
                         if id(slot) not in unique_pins:
-                            slot.pins += 1
-                            unique_pins[id(slot)] = slot
+                            claim = _SlotPinClaim()
+                            unique_pins[id(slot)] = (slot, claim)
+                            slot.pin_claims.append(claim)
+                            slot.pins = sum(item.active for item in slot.pin_claims)
                         bindings.append(
                             ExpertSlotBinding(
                                 layer=layer,
@@ -1151,31 +1428,44 @@ class ExpertSlotPool:
                     self._raise_completion_error(policy_rollback_safe=False)
                 else:
                     self._raise_completion_error()
+                if setup_hook is not None:
+                    setup_hook("after_pin_materialization")
             except BaseException:
-                for slot in unique_pins.values():
+                for slot, claim in unique_pins.values():
                     with slot.condition:
-                        slot.pins -= 1
+                        claim.active = False
+                        slot.pins = sum(item.active for item in slot.pin_claims)
+                        if claim in slot.pin_claims:
+                            slot.pin_claims.remove(claim)
                         slot.condition.notify_all()
                 raise
         except (ExpertManifestError, ExpertIOError) as exc:
             internal_cancel.set()
-            self._route_released()
             raise ExpertSlotError(str(exc)) from exc
         except BaseException:
             internal_cancel.set()
-            self._route_released()
             raise
 
-        return ReadyRoute(
+        binding_tuple = tuple(bindings)
+        if setup_hook is not None:
+            setup_hook("after_bindings_tuple")
+        pin_tuple = tuple(unique_pins.values())
+        if setup_hook is not None:
+            setup_hook("after_pins_tuple")
+        ready = ReadyRoute(
             self,
             plan,
-            tuple(bindings),
-            tuple(unique_pins.values()),
+            binding_tuple,
+            pin_tuple,
+            lifecycle_claim,
         )
+        if setup_hook is not None:
+            setup_hook("before_ownership_transfer")
+        return ready
 
-    def _route_released(self) -> None:
+    def _route_released(self, claim: _RouteReleaseClaim) -> None:
         with self._lifecycle:
-            self.metrics.update(active_routes=-1)
+            self.metrics.release_route(claim)
             self._lifecycle.notify_all()
 
     def invalidate(
@@ -1229,6 +1519,7 @@ class ExpertSlotPool:
         }
 
     def reset(self) -> None:
+        self._retry_cleanup_owners()
         self._raise_completion_error()
         with self._lifecycle:
             if self.metrics.as_dict()["active_routes"]:
@@ -1253,20 +1544,31 @@ class ExpertSlotPool:
             if not self._close_lock.acquire(timeout=remaining):
                 raise TimeoutError("expert slot close already in progress at deadline")
         try:
-            with self._lifecycle:
-                if not self._closed:
+            while True:
+                self._retry_cleanup_owners()
+                if self._has_cleanup_owners():
+                    self._raise_completion_error()
+                with self._lifecycle:
+                    if self._closed:
+                        finalized = True
+                        break
                     self._closing = True
-                    while self.metrics.as_dict()["active_routes"]:
-                        if deadline is None:
-                            self._lifecycle.wait()
-                        else:
-                            remaining = deadline - time.monotonic()
-                            if remaining <= 0:
-                                raise TimeoutError(
-                                    "active expert routes did not release before close"
-                                )
-                            self._lifecycle.wait(remaining)
-                finalized = self._closed
+                    if not self.metrics.as_dict()["active_routes"]:
+                        finalized = False
+                        break
+                    # Registration holds this condition while publishing an
+                    # owner, so checking here closes the scan-to-wait race.
+                    if self._has_cleanup_owners():
+                        continue
+                    if deadline is None:
+                        self._lifecycle.wait()
+                    else:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(
+                                "active expert routes did not release before close"
+                            )
+                        self._lifecycle.wait(remaining)
             if not finalized:
                 self._completion_executor.shutdown(wait=True, cancel_futures=False)
                 self._executor.shutdown(wait=True, cancel_futures=True)

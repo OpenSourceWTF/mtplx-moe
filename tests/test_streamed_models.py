@@ -1351,6 +1351,85 @@ def test_component_bank_all_hit_decode_keeps_router_order_without_split_route_op
         runtime.close()
 
 
+def test_global_component_bank_all_hit_decode_binds_without_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
+    transient_slots = 4
+    fixed = spec.resident_bytes + transient_slots * spec.expert_record_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + 4 * spec.expert_record_bytes,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        cache_scope="global",
+        slot_layout="component-banks",
+        transient_slots=transient_slots,
+    )
+    plan = stream_config.memory_plan(spec)
+    assert plan.persistent_slots == 4
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=make_mlx_component_bank_allocator(
+            plan,
+            spec,
+            load_expert_manifest(manifest_path),
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+    switch = HotExpertSwitchGLU(runtime, 1)
+    tokens = mx.zeros((2, 1, spec.hidden_size), dtype=mx.float32)
+    indices = mx.array([[2, 0], [2, 1]], dtype=mx.int32)
+    observed: list[tuple[tuple[int, int, int], ...]] = []
+    original_run = expert_mlx._run_component_bank_q4
+    try:
+        cold = switch(tokens, indices)
+        mx.eval(cold)
+        reads_before = runtime.reader.metrics.as_dict()["read_bytes"]
+
+        def observe_component_bindings(
+            selected: mx.array,
+            bindings: tuple[ExpertSlotBinding, ...],
+            *,
+            group_size: int,
+        ) -> mx.array:
+            observed.append(
+                tuple(
+                    (binding.expert, binding.logical_slot, binding.generation)
+                    for binding in bindings
+                )
+            )
+            assert len({id(binding.buffer.bank) for binding in bindings}) == 1
+            assert all(
+                binding.buffer.bank_index == binding.logical_slot
+                for binding in bindings
+            )
+            return original_run(selected, bindings, group_size=group_size)
+
+        def unexpected_split(*_args, **_kwargs):
+            raise AssertionError("global all-hit decode used the split route")
+
+        monkeypatch.setattr(
+            expert_mlx, "_run_component_bank_q4", observe_component_bindings
+        )
+        monkeypatch.setattr(runtime, "begin_split_route", unexpected_split)
+
+        hot = switch(tokens, indices)
+        mx.eval(hot)
+
+        assert mx.array_equal(hot, cold).item()
+        assert tuple(expert for expert, _, _ in observed[0]) == (2, 0, 2, 1)
+        assert runtime.reader.metrics.as_dict()["read_bytes"] == reads_before
+        assert runtime.snapshot(mx_module=mx)["slots"]["pins"] == 0
+    finally:
+        runtime.close()
+
+
 def test_component_bank_all_hit_decode_preserves_route_waves_counters_and_shared_order(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
