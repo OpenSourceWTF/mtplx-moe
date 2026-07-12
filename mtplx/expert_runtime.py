@@ -1036,6 +1036,11 @@ class ExpertStreamingRuntime:
         self._raise_cleanup_error()
 
     def admit_kv_tokens(self, tokens: int) -> KVAdmission:
+        if self._closed:
+            raise ExpertSlotError("expert streaming runtime is closed")
+        if self._closing:
+            raise ExpertSlotError("expert streaming runtime is closing")
+        self._raise_if_unhealthy()
         count = _integer("tokens", tokens, minimum=1)
         with self._kv_lock:
             requested = self._live_kv_tokens + count
