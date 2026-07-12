@@ -497,8 +497,10 @@ class PendingSplitRoute:
 
         for future in pending:
             future.cancel()
-        completed = tuple(future for future in pending if future.done())
-        running = tuple(future for future in pending if not future.done())
+        completed: list[Future[ReadyRoute]] = []
+        running: list[Future[ReadyRoute]] = []
+        for future in pending:
+            (completed if future.done() else running).append(future)
         with self._state_lock:
             self._failure_callbacks = len(running)
         for future in completed:
