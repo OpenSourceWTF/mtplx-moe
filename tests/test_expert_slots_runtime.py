@@ -4107,8 +4107,9 @@ def test_kv_admission_rejects_closing_and_closed_runtime_without_mutation(
         assert continue_close.wait(timeout=2)
         original_close(timeout=timeout)
 
-    close_executor = ThreadPoolExecutor(max_workers=1)
+    close_executor = ThreadPoolExecutor(max_workers=2)
     close_call: Future[None] | None = None
+    admission_call: Future[KVAdmission] | None = None
     admitted = None
     admission_error: ExpertSlotError | None = None
     try:
@@ -4117,13 +4118,20 @@ def test_kv_admission_rejects_closing_and_closed_runtime_without_mutation(
             close_call = close_executor.submit(runtime.close, timeout=2)
             assert close_entered.wait(timeout=2)
             assert runtime._closing is True
+            admission_call = close_executor.submit(runtime.admit_kv_tokens, 1)
+            continue_close.set()
+            close_call.result(timeout=2)
         else:
             runtime.close(timeout=2)
             assert runtime._closed is True
 
         kv_before = (runtime._live_kv_tokens, runtime._live_kv_peak)
         try:
-            admitted = runtime.admit_kv_tokens(1)
+            admitted = (
+                admission_call.result(timeout=2)
+                if admission_call is not None
+                else runtime.admit_kv_tokens(1)
+            )
         except ExpertSlotError as exc:
             admission_error = exc
         kv_after = (runtime._live_kv_tokens, runtime._live_kv_peak)
@@ -4135,9 +4143,7 @@ def test_kv_admission_rejects_closing_and_closed_runtime_without_mutation(
             f"kv_before={kv_before}, kv_after={kv_after}"
         )
         assert isinstance(admission_error, ExpertSlotError), evidence
-        assert str(admission_error) == (
-            f"expert streaming runtime is {runtime_state}"
-        ), evidence
+        assert str(admission_error) == "expert streaming runtime is closed", evidence
         assert kv_after == kv_before, evidence
     finally:
         continue_close.set()

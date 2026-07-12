@@ -1185,22 +1185,25 @@ class ExpertStreamingRuntime:
         self._raise_cleanup_error()
 
     def admit_kv_tokens(self, tokens: int) -> KVAdmission:
-        if self._closed:
-            raise ExpertSlotError("expert streaming runtime is closed")
-        if self._closing:
-            raise ExpertSlotError("expert streaming runtime is closing")
-        self._raise_if_unhealthy()
-        count = _integer("tokens", tokens, minimum=1)
-        with self._kv_lock:
-            requested = self._live_kv_tokens + count
-            if requested > self.config.max_live_kv_tokens:
-                raise ExpertStreamingConfigurationError(
-                    f"live KV admission {requested} exceeds planned "
-                    f"{self.config.max_live_kv_tokens} tokens"
-                )
-            self._live_kv_tokens = requested
-            self._live_kv_peak = max(self._live_kv_peak, requested)
-        return KVAdmission(self, count)
+        # Lifecycle order is close -> slot/runtime health -> KV accounting.
+        # Release takes only the KV lock so an existing lease can always drain.
+        with self._close_lock:
+            if self._closed:
+                raise ExpertSlotError("expert streaming runtime is closed")
+            if self._closing:
+                raise ExpertSlotError("expert streaming runtime is closing")
+            self._raise_if_unhealthy()
+            count = _integer("tokens", tokens, minimum=1)
+            with self._kv_lock:
+                requested = self._live_kv_tokens + count
+                if requested > self.config.max_live_kv_tokens:
+                    raise ExpertStreamingConfigurationError(
+                        f"live KV admission {requested} exceeds planned "
+                        f"{self.config.max_live_kv_tokens} tokens"
+                    )
+                self._live_kv_tokens = requested
+                self._live_kv_peak = max(self._live_kv_peak, requested)
+            return KVAdmission(self, count)
 
     def release_kv_tokens(self, tokens: int) -> None:
         count = _integer("tokens", tokens, minimum=1)
