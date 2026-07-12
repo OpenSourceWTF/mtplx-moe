@@ -698,8 +698,18 @@ class PendingSplitRoute:
             empty = not self._miss_futures and not self._miss_ready_parts
         if empty:
             return None
-        for _ready in self.iter_ready_misses():
-            pass
+        internally_consumed: list[ReadyRoute] = []
+        try:
+            for ready in self.iter_ready_misses():
+                internally_consumed.append(ready)
+        except BaseException:
+            for ready in internally_consumed:
+                try:
+                    self.release_miss(ready)
+                except BaseException:
+                    pass
+            self._finish_failure_if_ready()
+            raise
         with self._state_lock:
             failure = self._failure
             close_requested = self._close_requested

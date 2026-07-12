@@ -4282,9 +4282,11 @@ def test_yielded_miss_lease_survives_abort_and_close_until_owner_release(
         runtime.close(timeout=2)
 
 
+@pytest.mark.parametrize("release_fails", [False, True])
 def test_finish_misses_releases_internal_lease_after_later_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    release_fails: bool,
 ) -> None:
     root, base_spec, manifest, _expected = _artifact(tmp_path)
     spec = replace(base_spec, top_k=2)
@@ -4329,11 +4331,14 @@ def test_finish_misses_releases_internal_lease_after_later_failure(
     assert second.set_running_or_notify_cancel()
     release_count = 0
     original_release = first_ready.release
+    cleanup_error = RuntimeError("injected internal finish release failure")
 
     def count_release(*, synchronize: bool = True) -> None:
         nonlocal release_count
         release_count += 1
         original_release(synchronize=synchronize)
+        if release_fails:
+            raise cleanup_error
 
     monkeypatch.setattr(first_ready, "release", count_release)
     lifecycle = runtime.slots.retain_split_lifecycle()
@@ -4387,6 +4392,13 @@ def test_finish_misses_releases_internal_lease_after_later_failure(
         assert pins == 0, evidence
         assert loading is False, evidence
         assert layer_released is True, evidence
+        if release_fails:
+            assert pending._cleanup_error is cleanup_error
+            with pytest.raises(ExpertSlotError) as sticky:
+                runtime.snapshot(mx_module=object())
+            assert sticky.value.__cause__ is cleanup_error
+        else:
+            assert pending._cleanup_error is None
     finally:
         if not second.done():
             second.set_exception(RuntimeError("test cleanup"))
@@ -4397,4 +4409,9 @@ def test_finish_misses_releases_internal_lease_after_later_failure(
                 first_ready.release(synchronize=False)
         pending.close()
         finish_executor.shutdown(wait=True, cancel_futures=True)
-        runtime.close(timeout=2)
+        try:
+            runtime.close(timeout=2)
+        except ExpertSlotError as exc:
+            if not release_fails:
+                raise
+            assert exc.__cause__ is cleanup_error
