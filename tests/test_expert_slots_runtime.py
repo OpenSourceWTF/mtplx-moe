@@ -4048,3 +4048,234 @@ def test_kv_admission_rejects_closing_and_closed_runtime_without_mutation(
             close_call.result(timeout=2)
         close_executor.shutdown(wait=True, cancel_futures=True)
         runtime.close(timeout=2)
+
+
+def test_claimed_ready_future_cannot_yield_after_concurrent_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    part = _manual_plan(0, 0)
+    ready = runtime.slots.ensure_route(1, part)
+    result_entered = threading.Event()
+    continue_result = threading.Event()
+
+    class GatedDoneFuture(Future[ReadyRoute]):
+        def result(self, timeout=None):
+            result_entered.set()
+            assert continue_result.wait(timeout=2)
+            return super().result(timeout=timeout)
+
+    future = GatedDoneFuture()
+    future.set_result(ready)
+    release_count = 0
+    original_release = ready.release
+
+    def count_release(*, synchronize: bool = True) -> None:
+        nonlocal release_count
+        release_count += 1
+        original_release(synchronize=synchronize)
+
+    monkeypatch.setattr(ready, "release", count_release)
+    lifecycle_releases = 0
+
+    def release_lifecycle() -> None:
+        nonlocal lifecycle_releases
+        lifecycle_releases += 1
+
+    layer_lock = runtime._layer_locks[1]
+    layer_lock.acquire()
+    pending = PendingSplitRoute(
+        runtime=runtime,
+        layer=1,
+        plan=part,
+        layer_lock=layer_lock,
+        hit_ready=None,
+        miss_futures={future: part},
+        lifecycle_release=release_lifecycle,
+        miss_parts=(part,),
+    )
+    yielded: list[ReadyRoute] = []
+    consumer_errors: list[BaseException] = []
+
+    def consume() -> None:
+        try:
+            yielded.append(next(pending.iter_ready_misses()))
+        except BaseException as exc:
+            consumer_errors.append(exc)
+
+    consumer = threading.Thread(target=consume, daemon=True)
+    consumer.start()
+    layer_released_early = False
+    try:
+        assert result_entered.wait(timeout=2)
+        with pending._state_lock:
+            assert pending._miss_futures == {}
+        pending.close()
+        with pending._state_lock:
+            finalized_before_result = pending._failure_finalized
+        lifecycle_before_result = lifecycle_releases
+        layer_released_early = layer_lock.acquire(blocking=False)
+        if layer_released_early:
+            layer_lock.release()
+
+        continue_result.set()
+        consumer.join(timeout=2)
+        assert not consumer.is_alive()
+        with pending._state_lock:
+            owned_parts = tuple(pending._miss_ready_parts)
+        pins = 0
+        loading = 0
+        for slot in (*runtime.slots._persistent.values(), *runtime.slots._transient):
+            with slot.condition:
+                pins += slot.pins
+                loading += int(slot.state.value == "loading")
+        active_routes = runtime.slots.metrics.as_dict()["active_routes"]
+        assert layer_lock.acquire(timeout=2)
+        layer_lock.release()
+
+        evidence = (
+            f"yielded={len(yielded)}, errors={consumer_errors!r}, "
+            f"release_count={release_count}, owned={owned_parts}, pins={pins}, "
+            f"routes={active_routes}, loading={loading}, "
+            f"finalized_before_result={finalized_before_result}, "
+            f"lifecycle_before_result={lifecycle_before_result}, "
+            f"layer_released_early={layer_released_early}"
+        )
+        assert yielded == [], evidence
+        assert len(consumer_errors) == 1, evidence
+        assert release_count == 1, evidence
+        assert owned_parts == (), evidence
+        assert pins == 0, evidence
+        assert active_routes == 0, evidence
+        assert loading == 0, evidence
+        assert finalized_before_result is False, evidence
+        assert lifecycle_before_result == 0, evidence
+        assert lifecycle_releases == 1, evidence
+        assert layer_released_early is False, evidence
+    finally:
+        continue_result.set()
+        consumer.join(timeout=2)
+        if not ready._released:
+            ready.release(synchronize=False)
+        pending.close()
+        runtime.close(timeout=2)
+
+
+def test_yielded_miss_lease_survives_abort_and_close_until_owner_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    part = _manual_plan(0, 0)
+    ready = runtime.slots.ensure_route(1, part)
+    future: Future[ReadyRoute] = Future()
+    future.set_result(ready)
+    release_count = 0
+    original_release = ready.release
+
+    def count_release(*, synchronize: bool = True) -> None:
+        nonlocal release_count
+        release_count += 1
+        original_release(synchronize=synchronize)
+
+    monkeypatch.setattr(ready, "release", count_release)
+    layer_lock = runtime._layer_locks[1]
+    layer_lock.acquire()
+    pending = PendingSplitRoute(
+        runtime=runtime,
+        layer=1,
+        plan=part,
+        layer_lock=layer_lock,
+        hit_ready=None,
+        miss_futures={future: part},
+        miss_parts=(part,),
+    )
+    primary_error = RuntimeError("injected failure while consumer owns miss")
+    layer_released_early = False
+    owner_release_error: BaseException | None = None
+    try:
+        yielded = next(pending.iter_ready_misses())
+        assert yielded is ready
+        physical = runtime.slots._physical(1, 0)
+        with physical.condition:
+            assert physical.pins == 1
+
+        pending.abort(primary_error)
+        pending.close()
+        with physical.condition:
+            pins_during_compute = physical.pins
+        release_count_during_compute = release_count
+        layer_released_early = layer_lock.acquire(blocking=False)
+        if layer_released_early:
+            layer_lock.release()
+
+        try:
+            pending.release_miss(ready)
+        except BaseException as exc:
+            owner_release_error = exc
+        with physical.condition:
+            pins_after_release = physical.pins
+            loading_after_release = physical.state.value == "loading"
+        active_routes = runtime.slots.metrics.as_dict()["active_routes"]
+        with pending._state_lock:
+            owned_parts = tuple(pending._miss_ready_parts)
+        assert layer_lock.acquire(timeout=2)
+        layer_lock.release()
+
+        evidence = (
+            f"release_during_compute={release_count_during_compute}, "
+            f"pins_during_compute={pins_during_compute}, "
+            f"layer_released_early={layer_released_early}, "
+            f"owner_release_error={owner_release_error!r}, "
+            f"release_count={release_count}, pins_after={pins_after_release}, "
+            f"routes={active_routes}, loading={loading_after_release}, "
+            f"owned={owned_parts}"
+        )
+        assert pending._failure is primary_error, evidence
+        assert release_count_during_compute == 0, evidence
+        assert pins_during_compute == 1, evidence
+        assert layer_released_early is False, evidence
+        assert owner_release_error is None, evidence
+        assert release_count == 1, evidence
+        assert pins_after_release == 0, evidence
+        assert active_routes == 0, evidence
+        assert loading_after_release is False, evidence
+        assert owned_parts == (), evidence
+    finally:
+        if not ready._released:
+            ready.release(synchronize=False)
+        pending.close()
+        runtime.close(timeout=2)
