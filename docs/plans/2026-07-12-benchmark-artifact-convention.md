@@ -218,7 +218,7 @@ Expected: lock absent and Qwen serving the expected model.
 
 **Security flag:** `none`
 
-- [ ] **Step 1: Stage and inspect final scope**
+- [x] **Step 1: Stage and inspect final scope**
 
 ```bash
 git add .gitignore CONTRIBUTING.md benchmarks/results/README.md \
@@ -234,7 +234,7 @@ git diff --cached --check
 
 Expected: no raw artifacts, unresolved files, or unintended convention changes.
 
-- [ ] **Step 2: Create and verify the merge commit**
+- [x] **Step 2: Create and verify the merge commit**
 
 ```bash
 git commit -m "merge: establish stacked MoE runtime experiment"
@@ -245,7 +245,7 @@ test "$(git rev-parse HEAD^2)" = cc659f93eea2c0f4ed5e5b0eff3aca126e4ecf28
 
 Expected: one merge commit with `origin/main` first and tested candidate second.
 
-- [ ] **Step 3: Push and open a draft PR**
+- [x] **Step 3: Push and open a draft PR**
 
 ```bash
 git push -u origin experiment/moe-pr13-pr14-stack
@@ -261,7 +261,7 @@ conflicting paths, final validation, raw decode canary
 `6.2868045458 -> 6.3647565480 tok/s (+1.23993%, 5/6 positive)`, and exclusions
 `0bde6ac`, `e1fca36`, global lock changes, and raw artifacts.
 
-- [ ] **Step 4: Verify remote state**
+- [x] **Step 4: Verify remote state**
 
 ```bash
 git ls-remote origin refs/heads/experiment/moe-pr13-pr14-stack
@@ -271,7 +271,7 @@ gh pr view --repo davidtai/MTPLX experiment/moe-pr13-pr14-stack \
 
 Expected: remote branch points to the merge commit and an open draft PR targets `main`.
 
-- [ ] **Step 5: Set and verify the repository default branch**
+- [x] **Step 5: Set and verify the repository default branch**
 
 ```bash
 gh repo edit davidtai/MTPLX --default-branch experiment/moe-pr13-pr14-stack
@@ -284,7 +284,7 @@ test "$(git symbolic-ref --short refs/remotes/origin/HEAD)" = \
 
 Expected: GitHub and this checkout's `origin/HEAD` both identify the experimental integration branch as the default.
 
-- [ ] **Step 6: Remove the final superseded source worktree**
+- [x] **Step 6: Remove the final superseded source worktree**
 
 ```bash
 git -C /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-q4-native \
