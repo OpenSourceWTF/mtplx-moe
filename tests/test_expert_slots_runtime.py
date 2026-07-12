@@ -3470,3 +3470,169 @@ def test_pending_split_abort_claims_future_completing_during_partition() -> None
     assert ready.releases == 1
     assert layer_lock.acquire(blocking=False)
     layer_lock.release()
+
+
+def test_pending_split_abort_preclaims_callbacks_before_concurrent_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, base_spec, manifest, _expected = _artifact(tmp_path)
+    spec = replace(base_spec, top_k=2)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            verify_artifact_headers=False,
+        ),
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    original_read = runtime.reader.read_record_into
+    original_failure = runtime._handle_split_route_failure
+    reads_started = threading.Event()
+    release_reads = threading.Event()
+    read_lock = threading.Lock()
+    started_experts: set[int] = set()
+    failure_calls: list[BaseException] = []
+
+    def block_accepted_reads(manifest, record, destination, **kwargs):
+        with read_lock:
+            started_experts.add(record.expert)
+            if started_experts == {0, 1}:
+                reads_started.set()
+        assert release_reads.wait(timeout=2)
+        kwargs["cancel_event"] = None
+        return original_read(manifest, record, destination, **kwargs)
+
+    def observe_failure(
+        layer,
+        route_plan,
+        policy_txn,
+        error,
+        **kwargs,
+    ):
+        failure_calls.append(error)
+        return original_failure(
+            layer,
+            route_plan,
+            policy_txn,
+            error,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(runtime.reader, "read_record_into", block_accepted_reads)
+    monkeypatch.setattr(runtime, "_handle_split_route_failure", observe_failure)
+    pending = runtime.begin_split_route(1, [0, 1], phase="decode")
+    layer_lock = runtime._layer_locks[1]
+    assert reads_started.wait(timeout=2)
+    with pending._state_lock:
+        futures = tuple(
+            sorted(
+                pending._miss_futures,
+                key=lambda future: pending._miss_ordinals[future],
+            )
+        )
+    assert len(futures) == 2
+
+    abort_claimed_futures = threading.Event()
+    continue_abort_setup = threading.Event()
+    original_cancel = futures[0].cancel
+
+    def pause_first_cancel() -> bool:
+        abort_claimed_futures.set()
+        assert continue_abort_setup.wait(timeout=2)
+        return original_cancel()
+
+    monkeypatch.setattr(futures[0], "cancel", pause_first_cancel)
+    primary_error = RuntimeError("injected concurrent abort failure")
+    abort_executor = ThreadPoolExecutor(max_workers=1)
+    abort_call: Future[None] | None = None
+    late_readies: list[ReadyRoute] = []
+    layer_was_released = False
+    try:
+        abort_call = abort_executor.submit(pending.abort, primary_error)
+        assert abort_claimed_futures.wait(timeout=2)
+        with pending._state_lock:
+            assert pending._failure is primary_error
+            assert pending._miss_futures == {}
+            callbacks_preclaimed = pending._failure_callbacks
+
+        pending.close()
+        with pending._state_lock:
+            prematurely_finalized = pending._failure_finalized
+            lifecycle_retained = pending._lifecycle_release is not None
+        rollback_deferred = failure_calls == []
+        active_routes_after_close = runtime.slots.metrics.as_dict()["active_routes"]
+        layer_was_released = layer_lock.acquire(blocking=False)
+        if layer_was_released:
+            layer_lock.release()
+
+        continue_abort_setup.set()
+        abort_call.result(timeout=2)
+
+        callbacks_completed = threading.Event()
+        callback_lock = threading.Lock()
+        completed_callbacks = 0
+
+        def observe_callback(_future: Future[ReadyRoute]) -> None:
+            nonlocal completed_callbacks
+            with callback_lock:
+                completed_callbacks += 1
+                if completed_callbacks == len(futures):
+                    callbacks_completed.set()
+
+        for future in futures:
+            future.add_done_callback(observe_callback)
+        release_reads.set()
+        assert callbacks_completed.wait(timeout=2)
+        late_readies = [future.result(timeout=2) for future in futures]
+        late_routes_released = tuple(ready._released for ready in late_readies)
+        pins_after_callbacks = 0
+        physical_states: list[str] = []
+        for slot in (*runtime.slots._persistent.values(), *runtime.slots._transient):
+            with slot.condition:
+                pins_after_callbacks += slot.pins
+                physical_states.append(slot.state.value)
+        assert layer_lock.acquire(timeout=2)
+        layer_lock.release()
+
+        assert failure_calls == [primary_error]
+        evidence = (
+            f"callbacks={callbacks_preclaimed}, "
+            f"premature_finalized={prematurely_finalized}, "
+            f"lifecycle_retained={lifecycle_retained}, "
+            f"rollback_deferred={rollback_deferred}, "
+            f"active_routes={active_routes_after_close}, "
+            f"layer_released={layer_was_released}, "
+            f"late_released={late_routes_released}, "
+            f"pins={pins_after_callbacks}, states={physical_states}"
+        )
+        assert callbacks_preclaimed == len(futures), evidence
+        assert prematurely_finalized is False, evidence
+        assert lifecycle_retained is True, evidence
+        assert rollback_deferred is True, evidence
+        assert active_routes_after_close == 3, evidence
+        assert layer_was_released is False, evidence
+        assert late_routes_released == (True, True), evidence
+        assert pins_after_callbacks == 0, evidence
+    finally:
+        continue_abort_setup.set()
+        release_reads.set()
+        if abort_call is not None:
+            try:
+                abort_call.result(timeout=2)
+            except BaseException:
+                pass
+        for ready in late_readies:
+            if not ready._released:
+                ready.release(synchronize=False)
+        pending.close()
+        abort_executor.shutdown(wait=True, cancel_futures=True)
+        runtime.close(timeout=2)
