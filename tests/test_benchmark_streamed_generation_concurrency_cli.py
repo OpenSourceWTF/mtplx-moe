@@ -79,6 +79,11 @@ def test_run_concurrent_repeats_reports_aggregate_and_per_stream_rates(
             seed=0,
             output_dir=None,
             model_key="hy3-q4",
+            resource_telemetry=True,
+            resource_sample_interval=0.01,
+            resource_max_samples=128,
+            ssd_ceiling_gib_s=12.5,
+            powermetrics=False,
         )
         rows = module._run_concurrent_repeats(
             args,
@@ -104,6 +109,9 @@ def test_run_concurrent_repeats_reports_aggregate_and_per_stream_rates(
             assert len(stream["token_times_s"]) == 4
             assert len(stream["token_ids"]) == 4
         assert row["streaming_after"]["live_kv_tokens"] == 0
+        assert row["diagnostic_run"] is True
+        assert row["resource_telemetry"]["schema"] == "mtplx-resource-telemetry-v1"
+        assert row["resource_telemetry"]["sample_count"] >= 2
     finally:
         rt.close()
 
@@ -127,3 +135,32 @@ def test_concurrent_requests_are_identical_prompts_with_distinct_streams() -> No
         module.build_concurrent_requests(
             [1], concurrency=0, max_tokens=1, sampler=sampler, seed=0
         )
+
+
+def test_concurrent_token_counter_never_drops_finished_streams() -> None:
+    from types import SimpleNamespace
+
+    counter = _load_module()._ConcurrentTokenCounter()
+    counter.observe(
+        SimpleNamespace(
+            live=(
+                SimpleNamespace(request_id="a", generated_tokens=2),
+                SimpleNamespace(request_id="b", generated_tokens=3),
+            )
+        )
+    )
+    counter.observe(
+        SimpleNamespace(
+            live=(SimpleNamespace(request_id="b", generated_tokens=4),)
+        )
+    )
+
+    assert counter.count() == 6
+
+    counter.finish(
+        [
+            SimpleNamespace(request_id="a", tokens=(1, 2, 3)),
+            SimpleNamespace(request_id="b", tokens=(1, 2, 3, 4, 5)),
+        ]
+    )
+    assert counter.count() == 8

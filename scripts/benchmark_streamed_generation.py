@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -16,11 +18,23 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from mtplx.expert_runtime import ExpertStreamingConfig, parse_memory_bytes  # noqa: E402
+from mtplx.benchmarks.resource_telemetry import (  # noqa: E402
+    PowermetricsCollector,
+    ResourceRun,
+    ResourceTelemetrySampler,
+)
 from mtplx.runtime import load  # noqa: E402
 
 
 def _positive_int(value: str) -> int:
     parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be positive")
     return parsed
@@ -125,6 +139,42 @@ def build_parser() -> argparse.ArgumentParser:
             "Capture a full streaming snapshot at each rolling window. "
             "Disable for headline runs: the snapshot walks every slot "
             "condition and contends with in-flight miss loads."
+        ),
+    )
+    parser.add_argument(
+        "--resource-telemetry",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Capture diagnostic resource throughput, queue occupancy, and "
+            "I/O/Metal overlap. Off by default; enabled runs are diagnostic, "
+            "not headline timing lanes."
+        ),
+    )
+    parser.add_argument(
+        "--resource-sample-interval",
+        type=_positive_float,
+        default=0.25,
+        help="Seconds between cheap resource snapshots (default: 0.25).",
+    )
+    parser.add_argument(
+        "--resource-max-samples",
+        type=_positive_int,
+        default=4096,
+        help="Bounded resource timeline length (default: 4096 samples).",
+    )
+    parser.add_argument(
+        "--ssd-ceiling-gib-s",
+        type=_positive_float,
+        help="Measured SSD ceiling used only for saturation evidence.",
+    )
+    parser.add_argument(
+        "--powermetrics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Add non-interactive per-process CPU/GPU/wait/I/O samples. "
+            "Requires --resource-telemetry and passwordless sudo authorization."
         ),
     )
     parser.add_argument("--repeats", type=_positive_int, default=2)
@@ -259,6 +309,82 @@ def validate_mtp_flags(parser: argparse.ArgumentParser, args: argparse.Namespace
         parser.error("--mtp-precision requires --enable-mtp")
 
 
+def validate_resource_flags(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> None:
+    if args.resource_max_samples < 2:
+        parser.error("--resource-max-samples must be at least 2")
+    if args.powermetrics and not args.resource_telemetry:
+        parser.error("--powermetrics requires --resource-telemetry")
+    if args.ssd_ceiling_gib_s is not None and not args.resource_telemetry:
+        parser.error("--ssd-ceiling-gib-s requires --resource-telemetry")
+
+
+class _ConcurrentTokenCounter:
+    def __init__(self) -> None:
+        self._counts: dict[str, int] = {}
+
+    def observe(self, state) -> None:
+        for stream in state.live:
+            request_id = str(stream.request_id)
+            self._counts[request_id] = max(
+                self._counts.get(request_id, 0),
+                int(stream.generated_tokens),
+            )
+
+    def finish(self, results) -> None:
+        for result in results:
+            request_id = str(result.request_id)
+            self._counts[request_id] = max(
+                self._counts.get(request_id, 0),
+                len(result.tokens),
+            )
+
+    def count(self) -> int:
+        return sum(self._counts.values())
+
+
+@contextmanager
+def _resource_telemetry(args, runtime, token_count):
+    if not args.resource_telemetry:
+        yield None
+        return
+    sampler = ResourceTelemetrySampler(
+        runtime.expert_resource_telemetry_snapshot,
+        token_count=token_count,
+        interval_s=args.resource_sample_interval,
+        max_samples=args.resource_max_samples,
+    )
+    power = PowermetricsCollector(
+        enabled=args.powermetrics,
+        pid=os.getpid(),
+        interval_ms=max(100, int(args.resource_sample_interval * 1000)),
+    )
+    with power, sampler:
+        yield ResourceRun(sampler=sampler, powermetrics=power)
+
+
+def _attach_resource_report(
+    row: dict,
+    resource_run: ResourceRun | None,
+    *,
+    ssd_ceiling_gib_s: float | None,
+    generation_thread_cpu_ns: int,
+    generation_elapsed_ns: int,
+    final_completion_tokens: int,
+) -> None:
+    if resource_run is None:
+        return
+    row["diagnostic_run"] = True
+    row["resource_telemetry"] = resource_run.report(
+        ssd_ceiling_gib_s=ssd_ceiling_gib_s,
+        generation_thread_cpu_ns=generation_thread_cpu_ns,
+        generation_elapsed_ns=generation_elapsed_ns,
+        final_completion_tokens=final_completion_tokens,
+    )
+
+
 def build_concurrent_requests(
     prompt_ids,
     *,
@@ -315,16 +441,26 @@ def _run_concurrent_repeats(
             seed=args.seed,
         )
         before = runtime.expert_streaming_snapshot()
+        token_counter = _ConcurrentTokenCounter()
         runner = StreamedBatchRunner(
             runtime,
             max_concurrency=args.concurrency,
             max_prefills_per_step=args.max_prefills_per_step,
+            on_step=token_counter.observe,
         )
         for request in requests:
             runner.submit(request)
-        started = time.perf_counter()
-        results = runner.run()
-        finished = time.perf_counter()
+        with _resource_telemetry(
+            args,
+            runtime,
+            token_counter.count,
+        ) as resource_run:
+            started = time.perf_counter()
+            thread_cpu_started = time.thread_time_ns()
+            results = runner.run()
+            token_counter.finish(results)
+            thread_cpu_finished = time.thread_time_ns()
+            finished = time.perf_counter()
         elapsed = finished - started
         after = runtime.expert_streaming_snapshot()
         streams = []
@@ -373,28 +509,36 @@ def _run_concurrent_repeats(
                 }
             )
         aggregate_tokens = sum(stream["completion_tokens"] for stream in streams)
-        rows.append(
-            {
-                "repeat": repeat,
-                "elapsed_seconds": elapsed,
-                "prompt_tokens": len(prompt_ids),
-                "concurrency": args.concurrency,
-                "aggregate_completion_tokens": aggregate_tokens,
-                "aggregate_completion_tokens_per_second": (
-                    aggregate_tokens / elapsed if elapsed > 0.0 else 0.0
-                ),
-                "scheduler": runner.stats(),
-                "streams": streams,
-                "streaming_before": before,
-                "streaming_after": after,
-            }
+        row = {
+            "repeat": repeat,
+            "elapsed_seconds": elapsed,
+            "prompt_tokens": len(prompt_ids),
+            "concurrency": args.concurrency,
+            "aggregate_completion_tokens": aggregate_tokens,
+            "aggregate_completion_tokens_per_second": (
+                aggregate_tokens / elapsed if elapsed > 0.0 else 0.0
+            ),
+            "scheduler": runner.stats(),
+            "streams": streams,
+            "streaming_before": before,
+            "streaming_after": after,
+        }
+        _attach_resource_report(
+            row,
+            resource_run,
+            ssd_ceiling_gib_s=args.ssd_ceiling_gib_s,
+            generation_thread_cpu_ns=thread_cpu_finished - thread_cpu_started,
+            generation_elapsed_ns=int(elapsed * 1e9),
+            final_completion_tokens=aggregate_tokens,
         )
+        rows.append(row)
     return rows
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    validate_resource_flags(parser, args)
     root = args.model_root.expanduser().resolve()
     model_defaults = {
         "glm52-q4": {
@@ -589,28 +733,36 @@ def main() -> int:
                         }
                     )
 
-            started = time.perf_counter()
-            with runtime.admit_kv_tokens(len(prompt_ids) + max_tokens):
-                if args.enable_mtp:
-                    # generate_mtp1 exposes accept/reject telemetry through
-                    # generation_stats instead of a token callback.
-                    result = generate_mtp1(
-                        runtime,
-                        prompt_ids,
-                        max_tokens=max_tokens,
-                        sampler=sampler,
-                        seed=args.seed,
-                    )
-                else:
-                    result = generate_ar(
-                        runtime,
-                        prompt_ids,
-                        max_tokens=max_tokens,
-                        sampler=sampler,
-                        seed=args.seed,
-                        token_callback=token_callback,
-                    )
-            finished = time.perf_counter()
+            with _resource_telemetry(
+                args,
+                runtime,
+                lambda: decoded_count,
+            ) as resource_run:
+                started = time.perf_counter()
+                thread_cpu_started = time.thread_time_ns()
+                with runtime.admit_kv_tokens(len(prompt_ids) + max_tokens):
+                    if args.enable_mtp:
+                        # generate_mtp1 exposes accept/reject telemetry through
+                        # generation_stats instead of a token callback.
+                        result = generate_mtp1(
+                            runtime,
+                            prompt_ids,
+                            max_tokens=max_tokens,
+                            sampler=sampler,
+                            seed=args.seed,
+                        )
+                    else:
+                        result = generate_ar(
+                            runtime,
+                            prompt_ids,
+                            max_tokens=max_tokens,
+                            sampler=sampler,
+                            seed=args.seed,
+                            token_callback=token_callback,
+                        )
+                decoded_count = len(result.tokens)
+                thread_cpu_finished = time.thread_time_ns()
+                finished = time.perf_counter()
             elapsed = finished - started
             after = runtime.expert_streaming_snapshot()
             token_ids = [int(token) for token in result.tokens]
@@ -656,25 +808,32 @@ def main() -> int:
                     f"{args.model_key}-{run_label}-repeat-{repeat}.md"
                 )
                 response_path.write_text(result.text + "\n", encoding="utf-8")
-            rows.append(
-                {
-                    "repeat": repeat,
-                    "elapsed_seconds": elapsed,
-                    "prompt_tokens": len(prompt_ids),
-                    "completion_tokens": len(token_ids),
-                    "completion_tokens_per_second": len(token_ids) / elapsed,
-                    "token_ids": token_ids,
-                    "text": result.text,
-                    "response_path": (
-                        str(response_path) if response_path is not None else None
-                    ),
-                    "finish_reason": result.finish_reason,
-                    "rolling_decode": rolling_decode,
-                    "streaming_before": before,
-                    "streaming_after": after,
-                    "generation_stats": result.stats.to_dict(),
-                }
+            row = {
+                "repeat": repeat,
+                "elapsed_seconds": elapsed,
+                "prompt_tokens": len(prompt_ids),
+                "completion_tokens": len(token_ids),
+                "completion_tokens_per_second": len(token_ids) / elapsed,
+                "token_ids": token_ids,
+                "text": result.text,
+                "response_path": (
+                    str(response_path) if response_path is not None else None
+                ),
+                "finish_reason": result.finish_reason,
+                "rolling_decode": rolling_decode,
+                "streaming_before": before,
+                "streaming_after": after,
+                "generation_stats": result.stats.to_dict(),
+            }
+            _attach_resource_report(
+                row,
+                resource_run,
+                ssd_ceiling_gib_s=args.ssd_ceiling_gib_s,
+                generation_thread_cpu_ns=thread_cpu_finished - thread_cpu_started,
+                generation_elapsed_ns=int(elapsed * 1e9),
+                final_completion_tokens=len(token_ids),
             )
+            rows.append(row)
     finally:
         runtime.close(timeout=10.0)
 
