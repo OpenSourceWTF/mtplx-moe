@@ -137,11 +137,11 @@ git commit -m "perf(hy3): fast-path global all-hit routes"
 **Security flag:** none
 **Does NOT cover:** automatically changing a production cache allocation from the same trace being evaluated.
 
-- [ ] **Step 1: Write failing analyzer and CLI tests**
+- [x] **Step 1: Write failing analyzer and CLI tests**
 
 Require the analyzer payload to include `recommended_capacity` with per-layer quotas, total slots, total bytes, training gain, and held-out delta. Require benchmark configuration labels to encode cache scope, slot layout, and concurrency.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 ```bash
 uv run --frozen --extra dev --extra server pytest -q \
@@ -150,15 +150,15 @@ uv run --frozen --extra dev --extra server pytest -q \
   tests/test_benchmark_streamed_generation_concurrency_cli.py
 ```
 
-- [ ] **Step 3: Implement export and labels**
+- [x] **Step 3: Implement export and labels**
 
 Promote the already computed train-only quota data into a stable JSON object. Do not recompute it from evaluation rows. Add explicit `cache_scope`, `slot_layout`, and `concurrency` fields to benchmark labels and summaries.
 
-- [ ] **Step 4: Verify GREEN**
+- [x] **Step 4: Verify GREEN**
 
 Run the same tests and deterministic JSON snapshot assertions.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add scripts/analyze_expert_route_trace.py scripts/benchmark_streamed_generation.py \
@@ -173,12 +173,14 @@ git commit -m "bench(hy3): export held-out cache and batch evidence"
 **Security flag:** none
 **Does NOT cover:** kernel, serialization, MTP, KV-precision, or lower-bit claims.
 
-- [ ] Run full pytest: `uv run --frozen --extra dev --extra server pytest -q`.
-- [ ] Run Ruff on changed Python files only.
-- [ ] Stop the Qwen MLX server only for the benchmark window and record its exact restart command.
-- [ ] Run two or more exclusive long AR baselines for layer/component and global/component arms with identical cache bytes.
-- [ ] Run B=1/2/4/8 using `scripts/benchmark_streamed_generation.py --concurrency N`.
-- [ ] Reject global component banks if repeated results miss the 5% target or materially regress single-stream latency.
-- [ ] Save raw JSON, a concise Markdown comparison, and the exact commands.
-- [ ] Restart Qwen and verify `/v1/models` returns the expected model.
+- [x] Run full pytest: `uv run --frozen --extra dev --extra server pytest -q`.
+- [x] Run Ruff on changed Python files only.
+- [x] Stop the Qwen MLX server only for the benchmark window and record its exact restart command.
+- [x] Run two or more exclusive long AR baselines for layer/component and global/component arms with identical cache bytes.
+- [x] Run B=1/2/4/8 using `scripts/benchmark_streamed_generation.py --concurrency N`.
+- [x] Reject global component banks if repeated results miss the 5% target or materially regress single-stream latency.
+- [x] Save raw JSON, a concise Markdown comparison, and the exact commands.
+- [x] Restart Qwen and verify `/v1/models` returns the expected model.
 - [ ] Push `experiment/hy3-cache-scheduling` and open a draft PR against `experiment/moe-pr13-pr14-stack`, linking #29.
+
+Observed outcome: the bounded transaction journal repaired a severe global-cache host-bookkeeping regression and passed exact state-machine fuzzing. The allocation experiment is nevertheless a no-go: repeated long B1 improves by 4.858% on average, while static B2/B4/B8 improve by 2.017%/3.063%/2.864% and mixed-join B4 improves by 1.261%. See `benchmarks/results/hy3-cache-scheduling-issue29-20260713.{md,json}`.
