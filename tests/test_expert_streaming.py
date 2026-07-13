@@ -42,6 +42,19 @@ def test_global_cache_lends_fixed_slots_between_layers() -> None:
     assert bank.occupancy_by_layer == {1: 2, 2: 0}
 
 
+def test_global_prefill_seed_accepts_chunk_wider_than_route_capacity() -> None:
+    bank = GlobalExpertSlotBank(
+        layer_indices=(1,),
+        expert_count=4,
+        persistent_slots=2,
+        transient_slots=1,
+        prefill_slots_per_layer=2,
+        cache_policy="lru",
+    )
+
+    assert bank.prepare_prefill_seed(1, [0, 1, 0]) == (0, 1)
+
+
 def test_global_cache_uses_total_capacity_as_transient_slot_base() -> None:
     bank = GlobalExpertSlotBank(
         layer_indices=(1, 2),

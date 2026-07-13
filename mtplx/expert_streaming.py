@@ -655,14 +655,14 @@ class GlobalExpertSlotBank:
     def _validate_experts(
         self, layer: int, expert_ids: Iterable[int]
     ) -> tuple[int, tuple[int, ...]]:
-        layer, experts = self._validate_experts_for_all_hits(layer, expert_ids)
+        layer, experts = self._validate_experts_without_capacity(layer, expert_ids)
         if len(dict.fromkeys(experts)) > self.transient_slots:
             raise ValueError(
                 "transient_slots must cover the maximum unique experts in one route"
             )
         return layer, experts
 
-    def _validate_experts_for_all_hits(
+    def _validate_experts_without_capacity(
         self, layer: int, expert_ids: Iterable[int]
     ) -> tuple[int, tuple[int, ...]]:
         layer = self._key(layer, 0)[0]
@@ -767,7 +767,7 @@ class GlobalExpertSlotBank:
     def prepare_prefill_seed(
         self, layer: int, expert_ids: Iterable[int]
     ) -> tuple[int, ...]:
-        layer, experts = self._validate_experts(layer, expert_ids)
+        layer, experts = self._validate_experts_without_capacity(layer, expert_ids)
         remaining_layer = max(
             0, self.prefill_slots_per_layer - self._layer_occupancy[layer]
         )
@@ -1035,7 +1035,7 @@ class GlobalExpertSlotBank:
     ) -> tuple[RoutePlan, RoutePolicyTxn] | None:
         """Plan a ready global route and defer policy updates until commit."""
 
-        layer, experts = self._validate_experts_for_all_hits(layer, expert_ids)
+        layer, experts = self._validate_experts_without_capacity(layer, expert_ids)
         phase = RoutingPhase(phase)
         unique_experts = tuple(dict.fromkeys(experts))
         keys = tuple((layer, expert) for expert in unique_experts)
