@@ -134,10 +134,11 @@ def _interval(previous: ResourceTick, current: ResourceTick) -> dict[str, Any] |
     fence_pending = fences["mean_active_work"] > 0.0
     result: dict[str, Any] = {
         "interval_seconds": span_s,
-        "physical_read_bytes": read_bytes,
-        "physical_read_operations": read_operations,
-        "ssd_gib_per_second": read_bytes / 1024**3 / span_s,
-        "physical_iops": read_operations / span_s,
+        "io_cache_mode": str(after.get("io_cache_mode") or "unknown"),
+        "reader_read_bytes": read_bytes,
+        "reader_read_operations": read_operations,
+        "reader_gib_per_second": read_bytes / 1024**3 / span_s,
+        "reader_iops": read_operations / span_s,
         "bytes_per_read_operation": (
             read_bytes / read_operations if read_operations else 0.0
         ),
@@ -238,7 +239,8 @@ class ResourceTelemetrySampler:
         self._token_count = token_count
         self._interval_s = float(interval_s)
         self._clock_ns = clock_ns
-        self._ticks: deque[ResourceTick] = deque(maxlen=max_samples)
+        self._first_tick: ResourceTick | None = None
+        self._recent_ticks: deque[ResourceTick] = deque(maxlen=max_samples - 1)
         self._capture_count = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -254,7 +256,10 @@ class ResourceTelemetrySampler:
             snapshot=dict(snapshot),
         )
         with self._lock:
-            self._ticks.append(tick)
+            if self._first_tick is None:
+                self._first_tick = tick
+            else:
+                self._recent_ticks.append(tick)
             self._capture_count += 1
         return tick
 
@@ -281,7 +286,9 @@ class ResourceTelemetrySampler:
     @property
     def ticks(self) -> tuple[ResourceTick, ...]:
         with self._lock:
-            return tuple(self._ticks)
+            if self._first_tick is None:
+                return ()
+            return (self._first_tick, *self._recent_ticks)
 
     def report(
         self,
@@ -316,11 +323,23 @@ class ResourceTelemetrySampler:
             powermetrics=powermetrics,
             generation_thread_core_fraction=thread_fraction,
         )
+        samples_dropped = max(0, self._capture_count - len(ticks))
+        if samples_dropped:
+            summary["coverage"]["timeline"] = "retained_start_and_recent_tail"
+            candidates = list(summary["attribution"]["candidates"])
+            if "increase_resource_max_samples" not in candidates:
+                candidates.append("increase_resource_max_samples")
+            summary["attribution"] = {
+                "status": "incomplete",
+                "candidates": candidates,
+            }
+        else:
+            summary["coverage"]["timeline"] = "complete"
         payload: dict[str, Any] = {
             "schema": "mtplx-resource-telemetry-v1",
             "sample_interval_seconds": self._interval_s,
             "sample_count": len(ticks),
-            "samples_dropped": max(0, self._capture_count - len(ticks)),
+            "samples_dropped": samples_dropped,
             **summary,
             "timeline": intervals,
         }
@@ -385,10 +404,14 @@ def summarize_intervals(
     rows = list(intervals)
     elapsed = sum(_number(item.get("interval_seconds")) for item in rows)
     count = len(rows)
-    read_bytes = sum(_integer(item.get("physical_read_bytes")) for item in rows)
+    read_bytes = sum(_integer(item.get("reader_read_bytes")) for item in rows)
     read_operations = sum(
-        _integer(item.get("physical_read_operations")) for item in rows
+        _integer(item.get("reader_read_operations")) for item in rows
     )
+    io_cache_modes = sorted(
+        {str(item.get("io_cache_mode") or "unknown") for item in rows}
+    )
+    uncached_reader = bool(rows) and io_cache_modes == ["f-nocache"]
     requests = sum(_integer(item.get("expert_requests")) for item in rows)
     misses = sum(_integer(item.get("expert_misses")) for item in rows)
     completion_tokens = sum(
@@ -469,7 +492,10 @@ def summarize_intervals(
         rows, "completion_fences", "mean_active_units", elapsed
     )
 
-    if ssd_ceiling_gib_s is None or ssd_ceiling_gib_s <= 0:
+    if not uncached_reader:
+        ssd_utilization = None
+        ssd_status = "unavailable"
+    elif ssd_ceiling_gib_s is None or ssd_ceiling_gib_s <= 0:
         ssd_utilization = None
         ssd_status = "unavailable"
     else:
@@ -539,7 +565,11 @@ def summarize_intervals(
 
     coverage: dict[str, Any] = {
         "runtime_occupancy": "measured",
-        "physical_reads": "measured",
+        "storage_reads": (
+            "uncached_reader_bytes"
+            if uncached_reader
+            else "logical_reader_bytes"
+        ),
         "ssd_ceiling": "supplied" if ssd_utilization is not None else "unavailable",
         "gpu": gpu_coverage,
         "dram_bandwidth": "unavailable",
@@ -563,8 +593,9 @@ def summarize_intervals(
             "q4_assignments_per_second": requests / elapsed if elapsed > 0 else 0.0,
         },
         "storage": {
-            "physical_read_bytes": read_bytes,
-            "physical_read_operations": read_operations,
+            "io_cache_modes": io_cache_modes,
+            "reader_read_bytes": read_bytes,
+            "reader_read_operations": read_operations,
             "mean_gib_per_second": ssd_gib_s,
             "iops": read_operations / elapsed if elapsed > 0 else 0.0,
             "bytes_per_read_operation": (

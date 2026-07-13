@@ -73,6 +73,7 @@ def test_resource_telemetry_flags_parse_without_enabling_window_walks() -> None:
             "1024",
             "--ssd-ceiling-gib-s",
             "12.5",
+            "--f-nocache",
             "--powermetrics",
             "--no-window-telemetry",
         ]
@@ -97,6 +98,26 @@ def test_powermetrics_requires_resource_telemetry(capsys) -> None:
         module.validate_resource_flags(parser, args)
 
     assert "--resource-telemetry" in capsys.readouterr().err
+
+
+def test_ssd_ceiling_requires_uncached_reader_lane(capsys) -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [
+            *_BASE_ARGS,
+            "--model-key",
+            "hy3-q4",
+            "--resource-telemetry",
+            "--ssd-ceiling-gib-s",
+            "12.5",
+        ]
+    )
+
+    with pytest.raises(SystemExit):
+        module.validate_resource_flags(parser, args)
+
+    assert "--f-nocache" in capsys.readouterr().err
 
 
 def test_resource_report_fields_are_absent_when_disabled() -> None:

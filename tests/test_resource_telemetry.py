@@ -21,7 +21,8 @@ def _synthetic_intervals(
     io_active_fraction: float | None = None,
     fence_active_fraction: float = 0.0,
     both_fraction: float = 0.0,
-) -> list[dict[str, float | int | bool]]:
+    io_cache_mode: str = "f-nocache",
+) -> list[dict[str, float | int | bool | str]]:
     interval_count = 10
     queued_count = round(interval_count * queued_fraction)
     io_count = round(
@@ -39,8 +40,9 @@ def _synthetic_intervals(
         intervals.append(
             {
                 "interval_seconds": 1.0,
-                "physical_read_bytes": int(ssd_gib_s * 1024**3),
-                "physical_read_operations": 1024,
+                "reader_read_bytes": int(ssd_gib_s * 1024**3),
+                "reader_read_operations": 1024,
+                "io_cache_mode": io_cache_mode,
                 "ssd_gib_per_second": ssd_gib_s,
                 "expert_requests": 80,
                 "expert_misses": expert_misses,
@@ -91,6 +93,25 @@ def test_storage_evidence_requires_ceiling_queue_and_worker_pressure() -> None:
         "status": "conclusive",
         "candidates": ["storage_throughput"],
     }
+
+
+def test_cached_reader_bytes_cannot_establish_ssd_saturation() -> None:
+    report = summarize_intervals(
+        _synthetic_intervals(
+            ssd_gib_s=11.8,
+            queued_fraction=0.8,
+            active_workers=3.8,
+            worker_capacity=4,
+            io_cache_mode="buffered",
+        ),
+        ssd_ceiling_gib_s=12.5,
+        powermetrics=None,
+    )
+
+    assert report["coverage"]["storage_reads"] == "logical_reader_bytes"
+    assert report["evidence"]["ssd_saturation"]["status"] == "unavailable"
+    assert report["storage"]["utilization_of_ceiling"] is None
+    assert report["attribution"]["status"] == "incomplete"
 
 
 def test_missing_powermetrics_is_coverage_not_zero_gpu_usage() -> None:
@@ -272,11 +293,44 @@ def test_sampler_differences_counters_and_occupancy_on_one_clock() -> None:
     report = sampler.report(ssd_ceiling_gib_s=12.5)
 
     interval = report["timeline"][0]
-    assert interval["ssd_gib_per_second"] == 2.0
-    assert interval["physical_read_operations"] == 200
+    assert interval["reader_gib_per_second"] == 2.0
+    assert interval["reader_read_operations"] == 200
     assert interval["mean_queued_reads"] == 0.5
     assert interval["mean_active_readers"] == 2.0
     assert interval["q4_assignments_per_second"] == 80.0
+
+
+def test_bounded_sampler_preserves_run_start_for_cumulative_summary() -> None:
+    clock_values = iter((1_000_000_000, 2_000_000_000, 3_000_000_000, 4_000_000_000))
+    snapshots = iter(
+        _snapshot(
+            read_bytes=index * 1024**3,
+            read_ops=index * 100,
+            requests=index * 80,
+            queue_ns=0,
+            active_ns=index * 1_000_000_000,
+        )
+        for index in range(4)
+    )
+    sampler = ResourceTelemetrySampler(
+        lambda: next(snapshots),
+        token_count=lambda: 0,
+        interval_s=1.0,
+        max_samples=3,
+        clock_ns=lambda: next(clock_values),
+    )
+
+    for _index in range(4):
+        sampler.capture()
+    report = sampler.report(ssd_ceiling_gib_s=12.5)
+
+    assert report["sample_count"] == 3
+    assert report["samples_dropped"] == 1
+    assert report["elapsed_seconds"] == 3.0
+    assert report["storage"]["reader_read_bytes"] == 3 * 1024**3
+    assert report["coverage"]["timeline"] == "retained_start_and_recent_tail"
+    assert report["attribution"]["status"] == "incomplete"
+    assert "increase_resource_max_samples" in report["attribution"]["candidates"]
 
 
 def _snapshot(
@@ -311,6 +365,7 @@ def _snapshot(
         "model_key": "hy3-q4",
         "quant_bits": 4,
         "expert_record_bytes": 100,
+        "io_cache_mode": "f-nocache",
         "cache": {
             "route_calls": requests // 8,
             "expert_requests": requests,

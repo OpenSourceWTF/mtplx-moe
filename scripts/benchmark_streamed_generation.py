@@ -319,6 +319,8 @@ def validate_resource_flags(
         parser.error("--powermetrics requires --resource-telemetry")
     if args.ssd_ceiling_gib_s is not None and not args.resource_telemetry:
         parser.error("--ssd-ceiling-gib-s requires --resource-telemetry")
+    if args.ssd_ceiling_gib_s is not None and not args.f_nocache:
+        parser.error("--ssd-ceiling-gib-s requires --f-nocache")
 
 
 class _ConcurrentTokenCounter:

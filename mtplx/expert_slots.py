@@ -1336,6 +1336,7 @@ class ExpertSlotPool:
             raise ExpertSlotError("resource telemetry is disabled")
         assert self._completion_fence_telemetry is not None
         return {
+            "io_cache_mode": self.reader.cache_mode,
             "metrics": self.metrics.as_dict(),
             "io": self.reader.metrics.as_dict(),
             "reader_pool": self._reader_pool_telemetry.snapshot(),
