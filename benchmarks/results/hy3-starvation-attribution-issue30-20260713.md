@@ -29,11 +29,11 @@ unavailable. Sampler telemetry averaged **3.291 of 32 active readers**, a
 did not approach 32, so raising the cap alone is unsupported for this workload;
 the sampler's lifetime peak of 32 still shows that short bursts can fill it.
 
-The next narrow performance experiment should test 2/4/8-way exact-demand
-range striping within a required record while preserving authoritative routing,
-deterministic parity, and the existing no-extra-barrier rule. Phase 1 itself
-does not authorize that implementation, speculation, cache-policy changes,
-MLX scheduling changes, or a kernel change.
+The next narrow performance experiment should compare the existing 1-way
+control with 2/4/8-way exact-demand range striping within a required record
+while preserving authoritative routing, deterministic parity, and the existing
+no-extra-barrier rule. Phase 1 itself does not authorize that implementation,
+speculation, cache-policy changes, MLX scheduling changes, or a kernel change.
 
 ## Campaign validity
 
@@ -165,7 +165,7 @@ different identities.
 - The full repository `pytest -q` gate reached 100% with exit code 0 after the
   curated evidence was added; four expected skips and existing dependency
   deprecation warnings remained.
-- The issue-specific campaign-runner suite passed all 16 cases.
+- The issue-specific campaign-runner suite passed all 20 cases.
 - Ruff check passed, and all 14 changed Python files were already formatted.
 - The curated JSON parsed successfully and an automated cross-check matched its
   campaign status, physical order, Qwen tuple, parity, paired decode TPS, and

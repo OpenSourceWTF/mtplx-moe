@@ -91,6 +91,73 @@ def _json_fingerprint(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _require_fields(
+    value: Mapping[str, object],
+    fields: Sequence[str],
+    *,
+    context: str,
+) -> None:
+    missing = [field for field in fields if field not in value]
+    if missing:
+        raise RuntimeError(
+            f"{context} is missing required field(s): {', '.join(missing)}"
+        )
+
+
+def _require_mapping_field(
+    value: Mapping[str, object],
+    field: str,
+    *,
+    context: str,
+) -> Mapping[str, object]:
+    item = value.get(field)
+    if not isinstance(item, Mapping):
+        raise RuntimeError(f"{context}.{field} must be an object")
+    return item
+
+
+def _require_exact_int(
+    value: object,
+    *,
+    context: str,
+    minimum: int = 0,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise RuntimeError(f"{context} must be an integer >= {minimum}")
+    return value
+
+
+def _require_finite_number(value: object, *, context: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(f"{context} must be a finite number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise RuntimeError(f"{context} must be a finite number")
+    return result
+
+
+def _require_nonempty_string(value: object, *, context: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise RuntimeError(f"{context} must be a nonempty string")
+    return value
+
+
+def _require_bool(value: object, *, context: str) -> bool:
+    if not isinstance(value, bool):
+        raise RuntimeError(f"{context} must be bool")
+    return value
+
+
+def _require_sha256(value: object, *, context: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise RuntimeError(f"{context} must be 64 lowercase hexadecimal digits")
+    return value
+
+
 def normalized_config_fingerprint(config: Mapping[str, object]) -> str:
     """Hash runtime settings after removing only the telemetry-local toggle."""
 
@@ -104,13 +171,242 @@ def normalized_configuration_fingerprint(
 ) -> str:
     """Hash the full resolved identity after removing only telemetry enablement."""
 
+    _require_fields(
+        summary,
+        (
+            "cache_scope",
+            "slot_layout",
+            "requested_concurrency",
+            "execution_lane",
+            "performance_settings",
+        ),
+        context="configuration summary",
+    )
+    _require_nonempty_string(
+        summary["cache_scope"], context="configuration summary.cache_scope"
+    )
+    _require_nonempty_string(
+        summary["slot_layout"], context="configuration summary.slot_layout"
+    )
+    _require_exact_int(
+        summary["requested_concurrency"],
+        context="configuration summary.requested_concurrency",
+        minimum=1,
+    )
+    _require_nonempty_string(
+        summary["execution_lane"], context="configuration summary.execution_lane"
+    )
     settings_value = summary.get("performance_settings")
     if not isinstance(settings_value, Mapping):
         raise RuntimeError("configuration summary has no performance settings")
+    required_settings = (
+        "runtime_config",
+        "prompt_identity",
+        "generation",
+        "model_artifact",
+        "mtp",
+        "prompt_options",
+        "sampler",
+        "scheduler",
+        "seed",
+    )
+    _require_fields(
+        settings_value,
+        required_settings,
+        context="configuration summary.performance_settings",
+    )
     settings = dict(settings_value)
     runtime_value = settings.get("runtime_config")
     if not isinstance(runtime_value, Mapping):
         raise RuntimeError("performance settings have no runtime config")
+    _require_fields(
+        runtime_value,
+        ("model_key", "resource_telemetry"),
+        context="configuration summary.performance_settings.runtime_config",
+    )
+    _require_nonempty_string(
+        runtime_value["model_key"],
+        context="configuration summary.performance_settings.runtime_config.model_key",
+    )
+    _require_bool(
+        runtime_value["resource_telemetry"],
+        context=(
+            "configuration summary.performance_settings.runtime_config."
+            "resource_telemetry"
+        ),
+    )
+
+    prompt_identity = _require_mapping_field(
+        settings_value,
+        "prompt_identity",
+        context="configuration summary.performance_settings",
+    )
+    _require_fields(
+        prompt_identity,
+        ("content_bytes", "content_sha256", "token_count", "token_sha256"),
+        context="configuration summary.performance_settings.prompt_identity",
+    )
+    _require_exact_int(
+        prompt_identity["content_bytes"],
+        context="configuration summary.performance_settings.prompt_identity.content_bytes",
+    )
+    _require_sha256(
+        prompt_identity["content_sha256"],
+        context="configuration summary.performance_settings.prompt_identity.content_sha256",
+    )
+    _require_exact_int(
+        prompt_identity["token_count"],
+        context="configuration summary.performance_settings.prompt_identity.token_count",
+    )
+    _require_sha256(
+        prompt_identity["token_sha256"],
+        context="configuration summary.performance_settings.prompt_identity.token_sha256",
+    )
+
+    generation = _require_mapping_field(
+        settings_value,
+        "generation",
+        context="configuration summary.performance_settings",
+    )
+    _require_fields(
+        generation,
+        ("generation_profile", "max_tokens"),
+        context="configuration summary.performance_settings.generation",
+    )
+    _require_nonempty_string(
+        generation["generation_profile"],
+        context=(
+            "configuration summary.performance_settings.generation.generation_profile"
+        ),
+    )
+    _require_exact_int(
+        generation["max_tokens"],
+        context="configuration summary.performance_settings.generation.max_tokens",
+        minimum=1,
+    )
+
+    model_artifact = _require_mapping_field(
+        settings_value,
+        "model_artifact",
+        context="configuration summary.performance_settings",
+    )
+    _require_fields(
+        model_artifact,
+        ("method", "expert_payload", "manifest", "harness_source"),
+        context="configuration summary.performance_settings.model_artifact",
+    )
+    _require_nonempty_string(
+        model_artifact["method"],
+        context="configuration summary.performance_settings.model_artifact.method",
+    )
+    expert_payload = _require_mapping_field(
+        model_artifact,
+        "expert_payload",
+        context="configuration summary.performance_settings.model_artifact",
+    )
+    _require_fields(
+        expert_payload,
+        ("sha256", "size"),
+        context=(
+            "configuration summary.performance_settings.model_artifact.expert_payload"
+        ),
+    )
+    _require_sha256(
+        expert_payload["sha256"],
+        context=(
+            "configuration summary.performance_settings.model_artifact."
+            "expert_payload.sha256"
+        ),
+    )
+    _require_exact_int(
+        expert_payload["size"],
+        context=(
+            "configuration summary.performance_settings.model_artifact."
+            "expert_payload.size"
+        ),
+        minimum=1,
+    )
+    manifest = _require_mapping_field(
+        model_artifact,
+        "manifest",
+        context="configuration summary.performance_settings.model_artifact",
+    )
+    _require_fields(
+        manifest,
+        (
+            "content_sha256",
+            "declared_manifest_sha256",
+            "model_key",
+            "source_repo",
+            "source_revision",
+        ),
+        context="configuration summary.performance_settings.model_artifact.manifest",
+    )
+    for field in ("content_sha256", "declared_manifest_sha256"):
+        _require_sha256(
+            manifest[field],
+            context=(
+                "configuration summary.performance_settings.model_artifact."
+                f"manifest.{field}"
+            ),
+        )
+    for field in ("model_key", "source_repo", "source_revision"):
+        _require_nonempty_string(
+            manifest[field],
+            context=(
+                "configuration summary.performance_settings.model_artifact."
+                f"manifest.{field}"
+            ),
+        )
+    harness_source = _require_mapping_field(
+        model_artifact,
+        "harness_source",
+        context="configuration summary.performance_settings.model_artifact",
+    )
+    _require_fields(
+        harness_source,
+        ("dirty", "git_head", "source_sha256"),
+        context=(
+            "configuration summary.performance_settings.model_artifact.harness_source"
+        ),
+    )
+    _require_bool(
+        harness_source["dirty"],
+        context=(
+            "configuration summary.performance_settings.model_artifact."
+            "harness_source.dirty"
+        ),
+    )
+    _require_nonempty_string(
+        harness_source["git_head"],
+        context=(
+            "configuration summary.performance_settings.model_artifact."
+            "harness_source.git_head"
+        ),
+    )
+    _require_sha256(
+        harness_source["source_sha256"],
+        context=(
+            "configuration summary.performance_settings.model_artifact."
+            "harness_source.source_sha256"
+        ),
+    )
+
+    for field in ("mtp", "prompt_options", "sampler", "scheduler"):
+        mapping = _require_mapping_field(
+            settings_value,
+            field,
+            context="configuration summary.performance_settings",
+        )
+        if not mapping:
+            raise RuntimeError(
+                f"configuration summary.performance_settings.{field} must not be empty"
+            )
+    _require_exact_int(
+        settings_value["seed"],
+        context="configuration summary.performance_settings.seed",
+    )
+
     runtime_config = dict(runtime_value)
     runtime_config.pop("resource_telemetry", None)
     settings["runtime_config"] = runtime_config
@@ -587,20 +883,43 @@ def _stream_signature(payload: Mapping[str, Any]) -> str:
     streams = runs[0].get("streams")
     if not isinstance(streams, list) or len(streams) != 1:
         raise RuntimeError("benchmark result stream list must contain exactly one row")
-    stable = [
-        {
-            "seed": stream.get("seed"),
-            "prompt_tokens": stream.get("prompt_tokens"),
-            "completion_tokens": stream.get("completion_tokens"),
-            "finish_reason": stream.get("finish_reason"),
-            "token_ids": stream.get("token_ids"),
-            "text": stream.get("text"),
-        }
-        for stream in streams
-        if isinstance(stream, dict)
-    ]
-    if len(stable) != len(streams):
-        raise RuntimeError("benchmark stream payload contains a non-object row")
+    required = (
+        "seed",
+        "prompt_tokens",
+        "completion_tokens",
+        "finish_reason",
+        "token_ids",
+        "text",
+    )
+    stable: list[dict[str, object]] = []
+    for index, stream in enumerate(streams):
+        if not isinstance(stream, Mapping):
+            raise RuntimeError("benchmark stream payload contains a non-object row")
+        context = f"benchmark stream row {index}"
+        _require_fields(stream, required, context=context)
+        _require_exact_int(stream["seed"], context=f"{context}.seed")
+        _require_exact_int(stream["prompt_tokens"], context=f"{context}.prompt_tokens")
+        completion_tokens = _require_exact_int(
+            stream["completion_tokens"], context=f"{context}.completion_tokens"
+        )
+        _require_nonempty_string(
+            stream["finish_reason"], context=f"{context}.finish_reason"
+        )
+        token_ids = stream["token_ids"]
+        if not isinstance(token_ids, list):
+            raise RuntimeError(f"{context}.token_ids must be a list")
+        for token_index, token_id in enumerate(token_ids):
+            _require_exact_int(
+                token_id,
+                context=f"{context}.token_ids[{token_index}]",
+            )
+        if len(token_ids) != completion_tokens:
+            raise RuntimeError(
+                f"{context}.token_ids length must equal completion_tokens"
+            )
+        if not isinstance(stream["text"], str):
+            raise RuntimeError(f"{context}.text must be a string")
+        stable.append({field: stream[field] for field in required})
     return _json_fingerprint(stable)
 
 
@@ -642,6 +961,75 @@ def _cache_signature(payload: Mapping[str, Any]) -> str:
         "deadline_errors",
         "io_errors",
     )
+    cache_counter_fields = (
+        "bytes_read",
+        "evictions",
+        "expert_hits",
+        "expert_misses",
+        "expert_requests",
+        "persistent_loads",
+        "route_calls",
+        "shared_expert_assignments",
+        "transient_loads",
+        "unique_expert_requests",
+    )
+    _require_fields(cache, cache_counter_fields, context="benchmark aggregate cache")
+    for field in cache_counter_fields:
+        _require_exact_int(cache[field], context=f"benchmark aggregate cache.{field}")
+    _require_finite_number(
+        cache.get("hit_rate"), context="benchmark aggregate cache.hit_rate"
+    )
+    _require_fields(
+        cache_by_phase,
+        ("prefill", "decode"),
+        context="benchmark cache_by_phase",
+    )
+    for phase in ("prefill", "decode"):
+        phase_cache = _require_mapping_field(
+            cache_by_phase,
+            phase,
+            context="benchmark cache_by_phase",
+        )
+        _require_fields(
+            phase_cache,
+            cache_counter_fields,
+            context=f"benchmark cache_by_phase.{phase}",
+        )
+        for field in cache_counter_fields:
+            _require_exact_int(
+                phase_cache[field],
+                context=f"benchmark cache_by_phase.{phase}.{field}",
+            )
+        _require_finite_number(
+            phase_cache.get("hit_rate"),
+            context=f"benchmark cache_by_phase.{phase}.hit_rate",
+        )
+    _require_fields(
+        incremental_misses,
+        ("routes", "parts"),
+        context="benchmark incremental_misses",
+    )
+    for field in ("routes", "parts"):
+        _require_exact_int(
+            incremental_misses[field],
+            context=f"benchmark incremental_misses.{field}",
+        )
+    _require_fields(
+        io_value,
+        deterministic_io_fields,
+        context="benchmark slot I/O metrics",
+    )
+    for field in deterministic_io_fields:
+        _require_exact_int(
+            io_value[field], context=f"benchmark slot I/O metrics.{field}"
+        )
+    _require_fields(
+        metrics,
+        ("load_failures", "completion_fence_failures"),
+        context="benchmark slot metrics",
+    )
+    for field in ("load_failures", "completion_fence_failures"):
+        _require_exact_int(metrics[field], context=f"benchmark slot metrics.{field}")
     return _json_fingerprint(
         {
             "cache": cache,
@@ -690,6 +1078,31 @@ def _route_evidence(route_trace: Mapping[str, object]) -> tuple[str, str]:
         or any(character not in "0123456789abcdef" for character in manifest_sha256)
     ):
         raise RuntimeError("route manifest SHA must be 64 lowercase hexadecimal digits")
+    required = ("expert_ids", "layer", "phase", "token_count", "trace_epoch")
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, Mapping):
+            raise RuntimeError(f"route entry {index} must be an object")
+        context = f"route entry {index}"
+        _require_fields(entry, required, context=context)
+        expert_ids = entry["expert_ids"]
+        if not isinstance(expert_ids, list) or not expert_ids:
+            raise RuntimeError(f"{context}.expert_ids must be a nonempty list")
+        for expert_index, expert_id in enumerate(expert_ids):
+            _require_exact_int(
+                expert_id,
+                context=f"{context}.expert_ids[{expert_index}]",
+            )
+        _require_exact_int(entry["layer"], context=f"{context}.layer")
+        phase = entry["phase"]
+        if phase not in {"prefill", "decode"}:
+            raise RuntimeError(f"{context}.phase must be prefill or decode")
+        _require_exact_int(
+            entry["token_count"], context=f"{context}.token_count", minimum=1
+        )
+        _require_exact_int(entry["trace_epoch"], context=f"{context}.trace_epoch")
+        if phase == "decode":
+            _require_fields(entry, ("decode_step",), context=context)
+            _require_exact_int(entry["decode_step"], context=f"{context}.decode_step")
     return _json_fingerprint(entries), manifest_sha256
 
 

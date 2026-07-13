@@ -23,6 +23,112 @@ def _load_module():
     return module
 
 
+def _valid_configuration_summary(*, telemetry: bool = False) -> dict[str, object]:
+    return {
+        "cache_scope": "global",
+        "slot_layout": "component-banks",
+        "requested_concurrency": 1,
+        "execution_lane": "continuous-batch-ar",
+        "performance_settings": {
+            "runtime_config": {
+                "model_key": "hy3-q4",
+                "resource_telemetry": telemetry,
+            },
+            "prompt_identity": {
+                "content_bytes": 10,
+                "content_sha256": "a" * 64,
+                "token_count": 3,
+                "token_sha256": "b" * 64,
+            },
+            "generation": {"generation_profile": "deterministic", "max_tokens": 256},
+            "model_artifact": {
+                "method": "manifest_plus_executable_resident_content_v1",
+                "expert_payload": {"sha256": "c" * 64, "size": 123},
+                "manifest": {
+                    "content_sha256": "d" * 64,
+                    "declared_manifest_sha256": "e" * 64,
+                    "model_key": "hy3-q4",
+                    "source_repo": "pipenetwork/Hy3-4bit",
+                    "source_revision": "f" * 40,
+                },
+                "harness_source": {
+                    "dirty": False,
+                    "git_head": "1" * 40,
+                    "source_sha256": "2" * 64,
+                },
+            },
+            "mtp": {"enabled": False, "precision": "bf16"},
+            "prompt_options": {"chat": True, "enable_thinking": False},
+            "sampler": {"temperature": 0.0, "top_k": 1, "top_p": 1.0},
+            "scheduler": {
+                "execution_lane": "continuous-batch-ar",
+                "requested_concurrency": 1,
+                "workload_shape": "static",
+            },
+            "seed": 0,
+        },
+    }
+
+
+def _valid_cache_payload(*, read_ns: int = 10, read_bytes: int = 123):
+    cache = {
+        "bytes_read": read_bytes,
+        "evictions": 1,
+        "expert_hits": 10,
+        "expert_misses": 2,
+        "expert_requests": 12,
+        "hit_rate": 10 / 12,
+        "persistent_loads": 2,
+        "route_calls": 2,
+        "shared_expert_assignments": 0,
+        "transient_loads": 0,
+        "unique_expert_requests": 12,
+    }
+    io = {
+        "record_requests": 8,
+        "source_record_requests": 0,
+        "sidecar_record_requests": 8,
+        "read_operations": 8,
+        "python_preadv_invocations": 8,
+        "preadv_bytes_returned": read_bytes,
+        "native_positional_calls": 0,
+        "native_bytes_returned": 0,
+        "requested_bytes": read_bytes,
+        "read_bytes": read_bytes,
+        "read_ns": read_ns,
+        "read_mib_per_second": read_bytes / max(1, read_ns),
+        "short_reads": 0,
+        "integrity_errors": 0,
+        "cancellations": 0,
+        "deadline_errors": 0,
+        "io_errors": 0,
+    }
+    return {
+        "runs": [
+            {
+                "streaming_after": {
+                    "cache": cache,
+                    "cache_by_phase": {
+                        "prefill": dict(cache),
+                        "decode": dict(cache),
+                    },
+                    "incremental_misses": {"routes": 2, "parts": 4},
+                    "slots": {
+                        "io": io,
+                        "metrics": {
+                            "load_failures": 0,
+                            "completion_fence_failures": 0,
+                            "active_routes": 0,
+                        },
+                        "states": {"loading": 0, "failed": 0},
+                        "pins": 0,
+                    },
+                }
+            }
+        ]
+    }
+
+
 def test_issue30_campaign_pins_balanced_physical_order_and_exact_flags(
     tmp_path: Path,
 ) -> None:
@@ -86,32 +192,28 @@ def test_normalized_config_fingerprint_removes_only_telemetry_toggle() -> None:
 
 def test_normalized_configuration_covers_prompt_model_and_generation() -> None:
     module = _load_module()
-
-    def summary(*, telemetry: bool, prompt_sha: str = "prompt-a"):
-        return {
-            "cache_scope": "global",
-            "slot_layout": "component-banks",
-            "requested_concurrency": 1,
-            "execution_lane": "continuous-batch-ar",
-            "performance_settings": {
-                "runtime_config": {
-                    "model_key": "hy3-q4",
-                    "resource_telemetry": telemetry,
-                },
-                "prompt_identity": {"sha256": prompt_sha},
-                "generation": {"max_tokens": 256},
-                "model_artifact": {"sha256": "model-a"},
-            },
-        }
-
-    assert module.normalized_configuration_fingerprint(
-        summary(telemetry=False)
-    ) == module.normalized_configuration_fingerprint(summary(telemetry=True))
-    assert module.normalized_configuration_fingerprint(
-        summary(telemetry=False)
-    ) != module.normalized_configuration_fingerprint(
-        summary(telemetry=False, prompt_sha="prompt-b")
+    disabled = _valid_configuration_summary(telemetry=False)
+    enabled = _valid_configuration_summary(telemetry=True)
+    changed_prompt = _valid_configuration_summary(telemetry=False)
+    changed_prompt["performance_settings"]["prompt_identity"]["content_sha256"] = (
+        "9" * 64
     )
+
+    assert module.normalized_configuration_fingerprint(
+        disabled
+    ) == module.normalized_configuration_fingerprint(enabled)
+    assert module.normalized_configuration_fingerprint(
+        disabled
+    ) != module.normalized_configuration_fingerprint(changed_prompt)
+
+
+def test_normalized_configuration_rejects_missing_required_identity() -> None:
+    module = _load_module()
+    summary = _valid_configuration_summary()
+    del summary["performance_settings"]["prompt_identity"]
+
+    with pytest.raises(RuntimeError, match="prompt_identity"):
+        module.normalized_configuration_fingerprint(summary)
 
 
 def test_exclusive_window_restores_qwen_and_releases_lane_after_failure() -> None:
@@ -396,42 +498,23 @@ def test_run_record_persists_argv_and_start_before_launch(
 def test_cache_signature_ignores_io_timing_but_not_deterministic_counters() -> None:
     module = _load_module()
 
-    def payload(*, read_ns: int, read_bytes: int = 123) -> dict[str, object]:
-        return {
-            "runs": [
-                {
-                    "streaming_after": {
-                        "cache": {"hits": 10, "misses": 2},
-                        "cache_by_phase": {"decode": {"hits": 10, "misses": 2}},
-                        "incremental_misses": {"routes": 2, "parts": 4},
-                        "slots": {
-                            "io": {
-                                "read_bytes": read_bytes,
-                                "read_operations": 8,
-                                "read_ns": read_ns,
-                                "read_mib_per_second": read_bytes / max(1, read_ns),
-                                "short_reads": 0,
-                                "integrity_errors": 0,
-                            },
-                            "metrics": {
-                                "load_failures": 0,
-                                "completion_fence_failures": 0,
-                                "active_routes": 0,
-                            },
-                            "states": {"loading": 0, "failed": 0},
-                            "pins": 0,
-                        },
-                    }
-                }
-            ]
-        }
+    assert module._cache_signature(
+        _valid_cache_payload(read_ns=10)
+    ) == module._cache_signature(_valid_cache_payload(read_ns=20))
+    assert module._cache_signature(
+        _valid_cache_payload(read_ns=10)
+    ) != module._cache_signature(_valid_cache_payload(read_ns=10, read_bytes=124))
 
-    assert module._cache_signature(payload(read_ns=10)) == module._cache_signature(
-        payload(read_ns=20)
-    )
-    assert module._cache_signature(payload(read_ns=10)) != module._cache_signature(
-        payload(read_ns=10, read_bytes=124)
-    )
+
+def test_cache_signature_rejects_missing_deterministic_counter() -> None:
+    module = _load_module()
+    payload = _valid_cache_payload()
+    del payload["runs"][0]["streaming_after"]["slots"]["io"][
+        "python_preadv_invocations"
+    ]
+
+    with pytest.raises(RuntimeError, match="python_preadv_invocations"):
+        module._cache_signature(payload)
 
 
 def test_parity_requires_one_distinct_raw_fingerprint_per_arm() -> None:
@@ -476,16 +559,67 @@ def test_parity_requires_one_distinct_raw_fingerprint_per_arm() -> None:
 def test_route_and_stream_evidence_fail_closed_when_missing() -> None:
     module = _load_module()
     manifest = "a" * 64
+    route = {
+        "expert_ids": [2],
+        "layer": 1,
+        "phase": "decode",
+        "token_count": 1,
+        "trace_epoch": 0,
+        "decode_step": 0,
+    }
     assert module._route_evidence(
-        {"entries": [{"layer": 1, "experts": [2]}], "manifest_sha256": manifest}
-    ) == (module._json_fingerprint([{"layer": 1, "experts": [2]}]), manifest)
+        {"entries": [route], "manifest_sha256": manifest}
+    ) == (module._json_fingerprint([route]), manifest)
 
     with pytest.raises(RuntimeError, match="route entries"):
         module._route_evidence({"entries": [], "manifest_sha256": manifest})
     with pytest.raises(RuntimeError, match="manifest SHA"):
-        module._route_evidence({"entries": [{"layer": 1}], "manifest_sha256": None})
+        module._route_evidence({"entries": [route], "manifest_sha256": None})
     with pytest.raises(RuntimeError, match="stream list"):
         module._stream_signature({"runs": [{"streams": []}]})
+
+
+def test_route_evidence_rejects_malformed_nonempty_entry() -> None:
+    module = _load_module()
+
+    with pytest.raises(RuntimeError, match="expert_ids"):
+        module._route_evidence(
+            {
+                "entries": [
+                    {
+                        "layer": 1,
+                        "phase": "decode",
+                        "token_count": 1,
+                        "trace_epoch": 0,
+                        "decode_step": 0,
+                    }
+                ],
+                "manifest_sha256": "a" * 64,
+            }
+        )
+
+
+def test_stream_signature_rejects_malformed_nonempty_row() -> None:
+    module = _load_module()
+
+    with pytest.raises(RuntimeError, match="token_ids"):
+        module._stream_signature(
+            {
+                "runs": [
+                    {
+                        "streams": [
+                            {
+                                "seed": 0,
+                                "prompt_tokens": 3,
+                                "completion_tokens": 1,
+                                "finish_reason": "length",
+                                "text": "answer",
+                            }
+                        ]
+                    }
+                ]
+            }
+        )
 
 
 def test_hardware_profile_drops_stable_machine_identifiers() -> None:

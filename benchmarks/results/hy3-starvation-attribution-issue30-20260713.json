@@ -8,7 +8,7 @@
     "status": "retain_phase1_attribution_infrastructure",
     "runtime_optimization_promoted": false,
     "finding": "In this concurrency-1 covered-decode lane, the potentially blocking next-miss upper-bound span is predominantly co-located with host-known current-route read activity and rarely with ledger submitted-queued or eligible-unsubmitted states; awaited-future identity and outer split-executor occupancy remain unavailable.",
-    "next_narrow_experiment": "Matched 2/4/8-way exact-demand range striping within one required record, preserving authoritative routing and adding no synchronization barrier.",
+    "next_narrow_experiment": "Matched existing 1-way control versus 2/4/8-way exact-demand range striping within one required record, preserving authoritative routing and adding no synchronization barrier.",
     "not_authorized": [
       "scheduler change",
       "speculative prefetch",
@@ -304,13 +304,13 @@
       "expected_skips": 4
     },
     "campaign_runner_tests": {
-      "tests": 16,
+      "tests": 20,
       "exit_code": 0
     },
     "ruff_check": "passed",
-    "ruff_format_check": "14 changed Python files already formatted",
+    "ruff_format_check": "changed Python files already formatted",
     "json_parse": "passed",
     "raw_to_curated_crosscheck": "passed",
-    "independent_review": "no Critical or Important findings after wording correction"
+    "independent_review": "no Critical or Important findings after strict retained-artifact validation"
   }
 }
