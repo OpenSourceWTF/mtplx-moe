@@ -1,5 +1,5 @@
 # Project Map
-_Generated: 2026-07-13 06:06 CDT | Git: fb9268a_
+_Generated: 2026-07-13 06:59 CDT | Git: c56b2b6_
 
 ## Directory Structure
 .github/ — CI, build, hygiene, release, ownership, and issue/PR automation.
@@ -36,11 +36,13 @@ mtplx/models/expert_mlx.py — MLX Q4 expert dispatch, hit/miss overlap, evaluat
 mtplx/models/hy3_mlx.py — Resident Hy3 model overlay and streamed sparse-layer integration.
 mtplx/streamed_batch.py — Continuously admitted streamed-AR batch execution.
 scripts/benchmark_streamed_generation.py — Canonical streamed-generation benchmark harness and result schema.
+mtplx/benchmarks/resource_telemetry.py — Bounded same-clock resource sampler, evidence matrix, and optional non-interactive powermetrics adapter.
 scripts/benchmark_expert_io.py — Expert read-path throughput and concurrency benchmark.
 scripts/build_expert_manifest.py — Validated expert-layout manifest builder.
 scripts/verify_streamed_parity.py — Deterministic streamed-versus-resident parity gate.
 docs/MOE_SSD_STREAMING_OPTIMIZATION_ROADMAP.md — Measured bottlenecks, staged optimization contract, and stop/go rules.
 docs/MOE_RUNTIME_PR_BENCHMARKS.md — Curated per-PR runtime correctness and performance evidence.
+docs/RESOURCE_TELEMETRY.md — Agent-facing rules for interpreting throughput, occupancy, overlap, coverage gaps, and defensible bottleneck claims.
 CONTRIBUTING.md — Required verification, benchmark provenance, and workspace-level worktree rules.
 
 ## Critical Constraints
@@ -52,6 +54,7 @@ CONTRIBUTING.md — Required verification, benchmark provenance, and workspace-l
 - Memory planning is fail-closed: reserve resident weights, KV, runtime headroom, persistent slots, and transient slots under one explicit limit.
 - A slot cannot be overwritten until its generation's last Metal consumer is complete; preserve pins, generations, and completion-fence ownership.
 - Performance changes require deterministic parity, matched repeated evidence against the immediate predecessor, exact commands, and resource counters.
+- Bottleneck attribution requires same-clock throughput plus occupancy evidence; missing GPU/DRAM counters are unavailable, and low SSD use or elapsed time alone never proves serialization.
 - Raw benchmark output belongs only under ignored `benchmarks/raw/<benchmark>/<run-id>/`; commit curated summaries with full provenance.
 - Auxiliary worktrees are flat direct children of the workspace-level `.worktrees/` directory and must not be created inside the clone.
 - Do not silently fall back for unsupported models, layouts, quantization, missing artifacts, integrity failures, or memory-plan breaches.
