@@ -37,7 +37,7 @@ benchmark_outputs/
 *.jsonl
 !mtplx/benchmarks/prompts/*.jsonl
 
-# Local auxiliary Git worktrees
+# Prevent accidental in-clone worktree containers; use ../.worktrees instead
 /.worktrees/
 
 # Local secrets

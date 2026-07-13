@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers-optimized:subagent-driven-development (recommended) or superpowers-optimized:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Move 36 inactive auxiliary MTPLX worktrees beneath the retained primary checkout's ignored `.worktrees/` directory without changing any branch, commit, dirty state, untracked artifact, Qwen process, or GPU lock.
+**Goal:** Keep the primary clone in place and place all auxiliary MTPLX worktrees as flat direct children of the workspace-level `.worktrees/` directory without changing any branch, commit, dirty state, untracked artifact, Qwen process, or GPU lock.
 
-**Architecture:** The primary checkout remains `$PRIMARY`. A shared exclude and committed repository rule hide and standardize `.worktrees/`. A one-shot locked migration snapshots every inactive worktree, moves each with `git worktree move`, and verifies its identity and porcelain-status hash immediately. The actively owned `$WORKSPACE/.worktrees/29-cache-scheduling` worktree is excluded.
+**Architecture:** The primary checkout remains `$PRIMARY`; the canonical auxiliary root is `$WORKSPACE/.worktrees/`, one level above it. A one-shot locked migration snapshots every inactive worktree, moves each with `git worktree move`, and verifies its identity and porcelain-status hash immediately. The actively owned `$WORKSPACE/.worktrees/29-cache-scheduling` worktree is already canonical and excluded.
 
 **Tech Stack:** Git worktrees, zsh, GitHub CLI, Markdown.
 
@@ -65,10 +65,11 @@ Append this section to `CONTRIBUTING.md`:
 ```markdown
 ## Local worktrees
 
-Keep auxiliary worktrees beneath the primary checkout's ignored `.worktrees/`
-directory instead of creating sibling `mtplx-*` directories in the workspace
-root. Never move a worktree while another process or agent owns it; an active
-exception stays in place until its owner releases it.
+Keep auxiliary worktrees as direct children of the workspace-level
+`.worktrees/` directory beside your main clone. Do not create worktree
+directories inside the clone or scatter them across the workspace root. Never
+move a worktree while another process or agent owns it; active worktrees stay in
+place until their owner releases them.
 ```
 
 - [x] **Step 4: Add the shared local exclude**
@@ -135,8 +136,8 @@ COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
 PRIMARY="${COMMON_DIR%/.git}"
 WORKSPACE="${PRIMARY:h}"
 ACTIVE=$WORKSPACE/.worktrees/29-cache-scheduling
-DEST_ROOT=$PRIMARY/.worktrees
-INTEGRATION_OLD=$WORKSPACE/mtplx-experimental-pr13-pr14-main
+DEST_ROOT=$WORKSPACE/.worktrees
+INTEGRATION_OLD=$PRIMARY/.worktrees/mtplx-experimental-pr13-pr14-main
 LOCK=/tmp/mtplx-worktree-relocation.lock
 SNAPSHOT=/tmp/mtplx-worktree-relocation-$(date -u +%Y%m%dT%H%M%SZ).tsv
 
@@ -168,11 +169,8 @@ branch_state() {
 destination_for() {
   local old="$1" rel
   case "$old" in
-    "$PRIMARY/.claude/worktrees/"*)
-      rel="claude/${old#$PRIMARY/.claude/worktrees/}"
-      ;;
-    "$WORKSPACE/"*)
-      rel="${old#$WORKSPACE/}"
+    "$PRIMARY/.worktrees/"*)
+      rel="$(basename "$old")"
       ;;
     *)
       print -u2 "unmapped worktree: $old"
@@ -350,18 +348,16 @@ zsh /tmp/mtplx-relocate-worktrees.zsh --execute
 
 Expected: 36 moves and 36 immediate verification passes; primary and active exception paths untouched. The active owner may continue committing.
 
-- [x] **Step 5: Remove only empty former grouping directories**
+- [x] **Step 5: Remove the empty in-clone worktree root**
 
 ```bash
 COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
 PRIMARY="${COMMON_DIR%/.git}"
-WORKSPACE="$(dirname "$PRIMARY")"
-rmdir "$WORKSPACE/mtplx-opt-prs" 2>/dev/null || true
-rmdir "$WORKSPACE/mtplx-hy3-stack" 2>/dev/null || true
-rmdir "$PRIMARY/.claude/worktrees" 2>/dev/null || true
+find "$PRIMARY/.worktrees" -depth -type d -empty -exec rmdir {} \;
+test ! -e "$PRIMARY/.worktrees"
 ```
 
-Expected: empty containers disappear; nonempty directories are preserved. Do not remove `$WORKSPACE/.worktrees/`.
+Expected: the now-empty in-clone container disappears. Do not remove `$WORKSPACE/.worktrees/`.
 
 ## Task 4: Verify final local and remote state
 
@@ -379,12 +375,12 @@ WORKSPACE="$(dirname "$PRIMARY")"
 ACTIVE=$WORKSPACE/.worktrees/29-cache-scheduling
 test "$(git -C "$PRIMARY" worktree list --porcelain | rg -c '^worktree ')" = 38
 test "$(git -C "$PRIMARY" worktree list --porcelain |
-  rg -c "^worktree $PRIMARY/\.worktrees/")" = 36
+  rg -c "^worktree $WORKSPACE/\.worktrees/[^/]+$")" = 37
 test "$(git -C "$PRIMARY" worktree list --porcelain |
-  rg -c "^worktree $ACTIVE$")" = 1
+  rg -c "^worktree $PRIMARY/\.worktrees/")" = 0
 ```
 
-Expected: one primary, one active exception, and 36 canonical auxiliary worktrees.
+Expected: one primary and 37 flat canonical auxiliary worktrees, including the active worktree.
 
 - [x] **Step 2: Verify all snapshot identities and dirty-state hashes**
 
@@ -427,7 +423,8 @@ without traversing its contents. Its HEAD may advance under its owner.
 ```bash
 COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
 PRIMARY="${COMMON_DIR%/.git}"
-NEW_ACTIVE=$PRIMARY/.worktrees/mtplx-experimental-pr13-pr14-main
+WORKSPACE="$(dirname "$PRIMARY")"
+NEW_ACTIVE=$WORKSPACE/.worktrees/mtplx-experimental-pr13-pr14-main
 test -z "$(git -C "$NEW_ACTIVE" status --porcelain)"
 test "$(gh repo view davidtai/MTPLX --json defaultBranchRef --jq '.defaultBranchRef.name')" = \
   experiment/moe-pr13-pr14-stack
@@ -458,8 +455,7 @@ Expected: local ignore active, PR checks green, GPU lock absent, and Qwen unchan
 
 - [x] **Step 5: Mark the plan complete and publish the evidence-only update**
 
-From `$NEW_ACTIVE`, mark all plan checkboxes complete, include the approved
-active-exception clarification in the design spec, run `git diff --check`,
-commit those two documentation updates as
-`docs: record worktree relocation completion`, push, and wait for all PR #32
-checks to pass again.
+From `$NEW_ACTIVE`, mark all plan checkboxes complete and stage the corrected
+`.gitignore`, `CONTRIBUTING.md`, layout spec, and plan. Run `git diff --check`,
+commit those four files as `docs: correct workspace-level worktree layout`,
+push, and wait for all PR #32 checks to pass again.

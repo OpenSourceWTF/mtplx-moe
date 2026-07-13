@@ -36,7 +36,8 @@ headline claims.
 
 ## Local worktrees
 
-Keep auxiliary worktrees beneath the ignored `.worktrees/` directory in your
-main clone instead of creating sibling worktree directories. Never move a
-worktree while another process or agent owns it; active exceptions stay in
+Keep auxiliary worktrees as direct children of the workspace-level
+`.worktrees/` directory beside your main clone. Do not create worktree
+directories inside the clone or scatter them across the workspace root. Never
+move a worktree while another process or agent owns it; active worktrees stay in
 place until their owner releases them.
