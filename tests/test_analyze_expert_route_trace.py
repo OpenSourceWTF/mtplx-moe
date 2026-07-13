@@ -154,10 +154,10 @@ def test_atomic_global_replay_matches_global_bank_with_route_waves(
     )
     for layer in layers:
         prompt_ids = tuple(expert for row in prompt[layer] for expert in row)
+        bank.prepare_prefill_seed(layer, prompt_ids)
         for wave in partition_route_waves(
             prompt_ids, max_unique_experts=transient_slots
         ):
-            bank.prepare_prefill_seed(layer, wave.experts)
             plan = bank.plan(layer, wave.experts, phase="prefill")
             bank.publish_ready(layer, plan)
     counters = CacheCounters()
@@ -191,6 +191,20 @@ def test_atomic_global_replay_matches_global_bank_with_route_waves(
         str(layer): list(experts)
         for layer, experts in bank.resident_experts_by_layer.items()
     }
+
+
+def test_atomic_global_replay_ranks_seed_over_the_whole_prompt() -> None:
+    metric = route._simulate_atomic_global_lru_metric(
+        [1],
+        {1: [(0,), (1,), (1,)]},
+        {1: []},
+        1,
+        2,
+        1,
+        prefill_slots_per_layer=1,
+    )
+
+    assert metric["final_resident_experts_by_layer"] == {"1": [1]}
 
 
 def test_global_sequence_keys_records_by_layer_in_runtime_order() -> None:

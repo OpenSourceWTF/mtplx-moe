@@ -169,10 +169,10 @@ def _simulate_atomic_global_lru_metric(
         prompt_experts = tuple(expert for row in prompt[layer] for expert in row)
         if not prompt_experts:
             continue
+        bank.prepare_prefill_seed(layer, prompt_experts)
         for wave in partition_route_waves(
             prompt_experts, max_unique_experts=transient_slots
         ):
-            bank.prepare_prefill_seed(layer, wave.experts)
             plan = bank.plan(layer, wave.experts, phase="prefill")
             bank.publish_ready(layer, plan)
     counters = CacheCounters()
