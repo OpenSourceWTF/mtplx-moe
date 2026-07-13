@@ -9,8 +9,12 @@ Resource telemetry answers a different question from the headline benchmark:
 Telemetry-enabled runs are diagnostic. Do not use their token rate as a
 promotion headline until the result is reproduced with telemetry disabled
 under the same model, prompt, cache, seed, concurrency, and generation flags.
-The disabled runtime keeps the original executor submission path: it does not
-allocate telemetry occupancy trackers or add telemetry locks and wrappers.
+The enabled runtime allocates a phase-scoped `ExpertPipelineLedger`. Its short
+local lock orders diagnostic state changes, but is never held across I/O,
+hashing, MLX work, future waits, slot conditions, policy transactions, or
+executor submission. The disabled runtime keeps the original executor
+submission path: it allocates no pipeline ledger and enters no ledger clock,
+lock, histogram, or callback.
 
 ## Run a diagnostic lane
 
@@ -45,15 +49,25 @@ For the matched headline lane, remove `--resource-telemetry`,
    If `coverage.timeline` is `retained_start_and_recent_tail`, cumulative
    throughput still spans the run, but interval attribution is deliberately
    incomplete; increase `--resource-max-samples` and repeat.
-2. Read `storage` and `reader_pool` together. SSD throughput alone cannot
+2. Read `expert_pipeline.coverage`, then confirm its summary `schema`,
+   `source_schema`, and `scope`. Decode and backend coverage are independent;
+   interpret decode fractions only against `decode_observation_ns`, and read
+   backend-call deltas against their own all-phase status.
+3. Read `expert_pipeline.orthogonal_overlap` before
+   `primary_state_fraction`. The overlaps retain independent facts; the primary
+   states provide one precedence partition for orientation.
+4. Compare logical records, accepted executor calls, accepted records, reader
+   tasks, decode ranges, and backend calls without treating them as one kind of
+   operation.
+5. Read `storage` and `reader_pool` together. SSD throughput alone cannot
    distinguish device saturation from an underfed device.
-3. Read `completion_fences` and `overlap` to see whether reads and outstanding
+6. Read `completion_fences` and `overlap` to see whether reads and outstanding
    Metal-consumer work appear in the same sampling intervals. This is coarse
    coactivity evidence, not a simultaneous-overlap measurement.
-4. Read `host.generation_thread_core_fraction` and measured GPU evidence.
-5. Use `cache_by_layer` to find whether aggregate demand is concentrated in a
+7. Read `host.generation_thread_core_fraction` and measured GPU evidence.
+8. Use `cache_by_layer` to find whether aggregate demand is concentrated in a
    subset of routed layers.
-6. Treat `attribution.candidates` as the supported next investigations. This
+9. Treat `attribution.candidates` as the supported next investigations. This
    sampler does not perform a causal intervention, so its attribution remains
    `incomplete` even when a pressure screen is positive.
 
@@ -83,6 +97,138 @@ before it is called a bottleneck:
 - Submission/dependency starvation requires cache misses, less than 10% queued
   intervals, and less than 40% of the supplied SSD ceiling.
 
+No expert-pipeline state fraction is itself a promotion gate or causal cutoff,
+and the ledger embeds no target reader depth such as eight. A candidate still
+requires a matched intervention and repeated measurement.
+
+## Expert-pipeline attribution in schema v2
+
+The resource report has schema `mtplx-resource-telemetry-v2`. Its
+`expert_pipeline` block is a decode summary with schema
+`mtplx-expert-pipeline-summary-v1`; `source_schema` identifies the raw runtime
+ledger as `mtplx-expert-pipeline-attribution-v1`. These names are deliberately
+different: the runtime object is cumulative source telemetry, while the report
+is a sampler-window summary.
+
+### Keep operation identities separate
+
+| Field | Exact meaning |
+| --- | --- |
+| `logical_record_jobs` / `logical_record_bytes` | Unique authoritative miss records from `RoutePlan.loads` and their manifest logical bytes; not router assignments or futures. |
+| `accepted_executor_submissions` | Calls for which `executor.submit` returned a `Future`; worker start does not imply acceptance. |
+| `submission_accepted_record_jobs` / `submission_accepted_record_bytes` | Records and logical bytes covered by accepted executor submissions. One task may cover a different number of records. |
+| `reader_tasks_started`, `reader_tasks_completed`, `reader_tasks_failed` | Executor-task lifecycle counts. They are not record or range counts. |
+| `decode_logical_ranges_started` | Logical contiguous range readers started in the decode ledger phase. |
+| `sampler_window_backend.logical_range_reader_invocations` | Backward-compatible `ExpertIOMetrics.read_operations`: calls that pass the reader's initial cancellation/deadline checks and enter one logical contiguous range reader. Later failures count; exits at either initial check do not. These are not completed decode ranges, kernel calls, or device operations. |
+| `sampler_window_backend.python_preadv_invocations` | Python `os.preadv` attempts, including interrupted attempts. This does not prove kernel entry. |
+| `sampler_window_backend.preadv_bytes_returned` | Positive bytes returned by Python `os.preadv`. |
+| `sampler_window_backend.native_positional_calls` / `native_bytes_returned` | Native positional-reader attempts and returned bytes. Native calls provide no Python `preadv` coverage. |
+
+The summary-level record, task, and decode-range fields have `scope="decode"`.
+`sampler_window_backend.scope` is `sampler_window_all_phases`: those reader
+deltas cover the full sampler window and must not be presented as decode-only.
+Its coverage is `measured_all_phases`, `unavailable`, `incomplete_reset`, or
+`incomplete`. Missing backend counters are `null`, never measured zeroes.
+
+### Decode observation and primary precedence
+
+`decode_observation_ns` is the measured decode time during which the ledger had
+an open route, active logical range, open hit/shared-work span, or potentially
+blocking next-miss step. It excludes inactive prefill, setup, and teardown.
+Durations appear in `primary_state_ns`; `primary_state_fraction` divides each
+duration by the summed `decode_observation_ns`. When that denominator is zero,
+fractions and `potentially_blocking_next_miss_fraction` are `null`, not zero.
+
+The primary state is selected at every event boundary in this precedence:
+
+1. `potentially_blocking_next_miss_step` — the generation thread is inside
+   `next(as_completed(...))` after a prior scan saw no done future.
+2. `logical_range_active` — a logical range reader is executing.
+3. `reader_completion_active` — a reader task is active outside a logical
+   range, such as hashing, validation, or READY publication.
+4. `submitted_queued` — provisional or accepted work awaits reader service.
+5. `eligible_unsubmitted` — authoritative current-route work is not submitted.
+6. `host_runnable_work` — hit, shared, or completed-miss work is known runnable
+   but has not been host-dispatched.
+7. `route_publication_pending` — a ready record, including one from an existing
+   READY generation, is not yet part of a constructed route.
+8. `no_known_useful_work` — none of the preceding states applies inside the
+   covered decode window.
+
+This precedence produces one orientation state at a time. It does not erase the
+independent state integrals in `decode_integrals_ns`. The eight exact
+`primary_state_ns` values must sum to `decode_observation_ns`; a mismatch keeps
+the raw values but marks `coverage.attribution` and `coverage.decode_phase`
+incomplete.
+
+The first state is an upper bound on blocked time, not an exact wait
+measurement. The readiness scan and iterator step are not atomic, so a future
+may complete after the scan but before `next(as_completed(...))` blocks. After
+the iterator returns, the end hook can also wait to acquire the telemetry
+ledger lock. Exact generation-thread expert-input blocked time therefore
+remains unavailable.
+
+### Orthogonal overlap is independent evidence
+
+`orthogonal_overlap.duration_ns` retains five independent intersections with
+the potentially blocking next-miss upper-bound span:
+`next_miss_step_storage_active`, `next_miss_step_reader_task_active`,
+`next_miss_step_submitted_queued`, `next_miss_step_eligible_unsubmitted`, and
+`next_miss_step_runnable`. They may overlap each other and must not be added
+together.
+`orthogonal_overlap.denominator` is `decode_observation_ns`, and
+`fraction_of_decode_observation` uses that denominator. A
+next-miss-step/runnable overlap is host evidence to investigate; it is not
+automatically an invariant failure and is never relabeled GPU wait.
+
+### Histograms are bounded, not interpolated
+
+`latency_histograms` reports logical-range and complete-record latency. The
+canonical finite bounds `(1_000, 10_000, 100_000, 1_000_000, 10_000_000,
+100_000_000, 1_000_000_000)` nanoseconds are required, followed by an overflow
+bucket; matching but noncanonical bounds are invalid and mark decode coverage
+incomplete. `p50_upper_bound_ns` and `p95_upper_bound_ns` are bucket upper
+bounds, not interpolated percentiles. Their status is `bounded`,
+`censored_overflow`, or `unavailable`. If a percentile lands in overflow, only
+that percentile is `null` and censored above the largest bound; exact counters,
+state integrals, and other bounded percentiles remain valid. A missing required
+logical-range or complete-record histogram marks decode coverage incomplete.
+
+### Coverage and unavailable claims
+
+`block_reasons.pin_held` and `block_reasons.slot_loading` contain count and
+duration. They cover elapsed `Condition.wait` time, published only after the
+slot condition is released. Their status is `measured` only while aggregate
+pipeline coverage is complete; after any invariant or hook failure it becomes
+`incomplete` while retaining the observed raw values. Operation credit, byte
+credit, authoritative reserve, and distinct slot-capacity admission do not
+exist in the frozen #29 runtime and remain `unavailable`, not measured zeroes.
+
+The report also leaves physical device operations, physical device bytes,
+physical device queue depth, `gpu_expert_wait`, and `gpu_idle_time` unavailable.
+It reports `coverage.generation_expert_input_wait="unavailable"` and
+`coverage.potentially_blocking_next_miss_step="measured_upper_bound"` when the
+ledger is complete, or `"incomplete"` when pipeline attribution is incomplete.
+Its coverage also marks the outer split-executor queue, independently
+admitted/scheduled ranges, `future_layer_eligibility`,
+`speculative_record_accounting`, and `python_preadv_when_native_reader`
+unavailable; eligible-unsubmitted cause remains unattributed.
+The reporter requires both aggregate and decode-phase source coverage to remain
+measured. An unscoped invariant therefore makes the decode summary incomplete
+instead of allowing a phase-local measured label to hide it. Pipeline hooks are
+implemented only by slot-backed layouts; `metal-mmap` reports expert-pipeline
+attribution unavailable rather than publishing measured zeroes.
+`F_NOCACHE` supports the term
+"uncached reader traffic," never physical NAND traffic. Submission rejection,
+counter reset, histogram-contract change, hook failure, or ledger invariant
+failure makes attribution incomplete; a valid histogram overflow alone does
+not.
+
+`coverage.decode_phase` and `coverage.sampler_window_backend` are independent.
+`coverage.attribution` is the aggregate: it becomes incomplete when either
+scope is incomplete, while retaining the exact scope-specific status and raw
+values.
+
 ## What each field actually means
 
 `storage.mean_gib_per_second`
@@ -91,6 +237,11 @@ before it is called a bottleneck:
   otherwise `coverage.storage_reads` is `logical_reader_bytes` and storage
   saturation is unavailable. `slots.io.read_mib_per_second` instead uses summed
   reader service time and can overstate sustained device throughput.
+
+`storage.iops` and `storage.reader_read_operations`
+: Compatibility names derived from logical range-reader invocations. They are
+  neither Python/native backend-call rates nor physical device IOPS; use
+  `expert_pipeline.sampler_window_backend` for the separated backend counts.
 
 `reader_pool.mean_queued_reads`
 : Occupancy integrated at executor state changes. A sustained value above zero
@@ -151,6 +302,10 @@ before it is called a bottleneck:
 - System-wide GPU activity is not per-process GPU activity.
 - A peak without occupancy or throughput context does not establish sustained
   pressure.
+- Exact generation-thread expert-input blocked time is unavailable; the
+  potentially blocking next-miss step is only an upper bound and is not GPU
+  wait.
+- Python or native positional calls are not physical device operations.
 
 The schema therefore does not emit `bound_by`. It reports evidence, coverage,
 and attribution status so an optimizing agent can choose the next operation to

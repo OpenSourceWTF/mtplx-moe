@@ -290,7 +290,7 @@ def test_run_concurrent_repeats_reports_aggregate_and_per_stream_rates(
         assert row["timing_summary"]["completion_latency_seconds"]["p99"] > 0.0
         assert row["streaming_after"]["live_kv_tokens"] == 0
         assert row["diagnostic_run"] is True
-        assert row["resource_telemetry"]["schema"] == "mtplx-resource-telemetry-v1"
+        assert row["resource_telemetry"]["schema"] == "mtplx-resource-telemetry-v2"
         assert row["resource_telemetry"]["sample_count"] >= 2
     finally:
         rt.close()

@@ -55,6 +55,43 @@ def current_expert_routing_phase(*, token_count: int) -> RoutingPhase:
     return RoutingPhase.PREFILL if token_count > 1 else RoutingPhase.DECODE
 
 
+def _mark_pipeline_incomplete(ledger: Any, phase: RoutingPhase) -> None:
+    try:
+        ledger.mark_incomplete(phase=phase)
+    except Exception:
+        pass
+
+
+def _begin_pipeline_work(
+    ledger: Any,
+    method: str,
+    *args: Any,
+    phase: RoutingPhase,
+) -> Any | None:
+    """Open optional diagnostics without changing model execution outcomes."""
+
+    try:
+        return getattr(ledger, method)(*args, phase=phase)
+    except Exception:
+        _mark_pipeline_incomplete(ledger, phase)
+        return None
+
+
+def _pipeline_work_call(
+    ledger: Any,
+    target: Any,
+    method: str,
+    *args: Any,
+    phase: RoutingPhase,
+) -> None:
+    """Publish one optional work transition while preserving data-path errors."""
+
+    try:
+        getattr(target, method)(*args)
+    except Exception:
+        _mark_pipeline_incomplete(ledger, phase)
+
+
 class UnboundExpertSwitch(nn.Module):
     """Parameter-free placeholder installed before resident-only loading."""
 
@@ -1009,149 +1046,278 @@ class HotExpertSwitchGLU(nn.Module):
             outputs.extend(wave_outputs)
             output_positions.extend(wave_positions)
 
-        for wave in self.runtime.route_waves(
-            expert_ids,
-            sort_unique=(
-                phase is RoutingPhase.PREFILL
-                and self.runtime.manifest.sidecar is not None
-            ),
+        pipeline_ledger = getattr(self.runtime, "_pipeline_ledger", None)
+        shared_pipeline_work = None
+        if (
+            pipeline_ledger is not None
+            and shared_work is not None
+            and phase is RoutingPhase.DECODE
         ):
-            # Keep the all-hit optimization inside the authoritative bounded
-            # route-wave loop.  A successful probe avoids split-route futures
-            # and per-expert grouping while retaining the normal policy epoch,
-            # counters, and assignment order for this wave.
-            if (
-                phase is RoutingPhase.DECODE
-                and self.runtime.config.slot_layout == "component-banks"
+            shared_pipeline_work = _begin_pipeline_work(
+                pipeline_ledger,
+                "begin_shared_work",
+                phase=phase,
+            )
+
+        try:
+            for wave in self.runtime.route_waves(
+                expert_ids,
+                sort_unique=(
+                    phase is RoutingPhase.PREFILL
+                    and self.runtime.manifest.sidecar is not None
+                ),
             ):
-                ready = self.runtime.try_all_hit_route(
+                # Keep the all-hit optimization inside the authoritative bounded
+                # route-wave loop.  A successful probe avoids split-route futures
+                # and per-expert grouping while retaining the normal policy epoch,
+                # counters, and assignment order for this wave.
+                if (
+                    phase is RoutingPhase.DECODE
+                    and self.runtime.config.slot_layout == "component-banks"
+                ):
+                    ready = self.runtime.try_all_hit_route(
+                        self.layer_index,
+                        wave.experts,
+                        phase=phase,
+                    )
+                    if ready is not None:
+                        hit_pipeline_work = None
+                        if pipeline_ledger is not None:
+                            hit_pipeline_work = _begin_pipeline_work(
+                                pipeline_ledger,
+                                "begin_hit_work",
+                                ready.plan.hits,
+                                phase=phase,
+                            )
+                        try:
+                            if wave.positions == tuple(range(len(expert_ids))):
+                                assignment_inputs = mx.broadcast_to(
+                                    tokens[:, None, :],
+                                    (int(tokens.shape[0]), top_k, hidden_size),
+                                ).reshape((-1, hidden_size))
+                            else:
+                                token_positions = mx.array(
+                                    [position // top_k for position in wave.positions],
+                                    dtype=mx.int32,
+                                )
+                                assignment_inputs = mx.take(
+                                    tokens,
+                                    token_positions,
+                                    axis=0,
+                                )
+                            if (
+                                pipeline_ledger is not None
+                                and hit_pipeline_work is not None
+                            ):
+                                _pipeline_work_call(
+                                    pipeline_ledger,
+                                    hit_pipeline_work,
+                                    "claim",
+                                    phase=phase,
+                                )
+                            wave_output = _run_component_bank_q4(
+                                assignment_inputs,
+                                ready.bindings,
+                                group_size=self.group_size,
+                            )
+                            # Slot pins may be released only after the lazy graph
+                            # has consumed the currently bound bank generations.
+                            synchronous_fence(ready, wave_output)
+                            outputs.append(wave_output)
+                            output_positions.extend(wave.positions)
+                        finally:
+                            if (
+                                pipeline_ledger is not None
+                                and hit_pipeline_work is not None
+                            ):
+                                _pipeline_work_call(
+                                    pipeline_ledger,
+                                    hit_pipeline_work,
+                                    "close",
+                                    phase=phase,
+                                )
+                            ready.release(synchronize=False)
+                        continue
+
+                # Both layouts pin hits and start miss reads first, then run the
+                # resident experts on the GPU while the misses stream from SSD.
+                evaluate_bindings = (
+                    evaluate_component_bindings
+                    if self.runtime.config.slot_layout == "component-banks"
+                    else evaluate_direct_bindings
+                )
+                pending = self.runtime.begin_split_route(
                     self.layer_index,
                     wave.experts,
                     phase=phase,
                 )
-                if ready is not None:
-                    try:
-                        if wave.positions == tuple(range(len(expert_ids))):
-                            assignment_inputs = mx.broadcast_to(
-                                tokens[:, None, :],
-                                (int(tokens.shape[0]), top_k, hidden_size),
-                            ).reshape((-1, hidden_size))
-                        else:
-                            token_positions = mx.array(
-                                [position // top_k for position in wave.positions],
-                                dtype=mx.int32,
-                            )
-                            assignment_inputs = mx.take(
-                                tokens,
-                                token_positions,
-                                axis=0,
-                            )
-                        wave_output = _run_component_bank_q4(
-                            assignment_inputs,
-                            ready.bindings,
-                            group_size=self.group_size,
+                try:
+                    hit_pipeline_work = None
+                    if pipeline_ledger is not None and pending.hit_ready is not None:
+                        hit_pipeline_work = _begin_pipeline_work(
+                            pipeline_ledger,
+                            "begin_hit_work",
+                            pending.plan.hits,
+                            phase=phase,
                         )
-                        # Slot pins may be released only after the lazy graph
-                        # has consumed the currently bound bank generations.
-                        synchronous_fence(ready, wave_output)
-                        outputs.append(wave_output)
-                        output_positions.extend(wave.positions)
-                    finally:
-                        ready.release(synchronize=False)
-                    continue
-
-            # Both layouts pin hits and start miss reads first, then run the
-            # resident experts on the GPU while the misses stream from SSD.
-            evaluate_bindings = (
-                evaluate_component_bindings
-                if self.runtime.config.slot_layout == "component-banks"
-                else evaluate_direct_bindings
-            )
-            pending = self.runtime.begin_split_route(
-                self.layer_index,
-                wave.experts,
-                phase=phase,
-            )
-            try:
-                hit_set = set(pending.plan.hits)
-                hit_positions = tuple(
-                    position
-                    for position, expert in zip(
-                        wave.positions, wave.experts, strict=True
-                    )
-                    if expert in hit_set
-                )
-                if pending.hit_ready is not None:
-                    # Split parts feed one shared lazy graph. Keep every MLX
-                    # eval on the generation thread; evaluating a fence on the
-                    # completion lane can race the next part's graph traversal.
-                    evaluate_bindings(
-                        hit_positions,
-                        pending.hit_ready.bindings,
-                        pending.hit_ready,
-                        force_sync=True,
-                    )
-                    pending.release_hits()
-                # The resident shared branch depends only on ``x``.  Force it
-                # on Metal while the native readers own miss futures, so
-                # all-miss layers have useful GPU work instead of an empty
-                # device.  Keep prefill unchanged: at 128K, eagerly retaining
-                # the full shared output across routed waves would violate the
-                # bounded-memory execution contract.
-                if (
-                    shared_work is not None
-                    and shared is None
-                    and phase is RoutingPhase.DECODE
-                    and pending.misses_pending
-                ):
-                    shared = shared_work()
-                    mx.eval(shared)
-                for miss_ready in pending.iter_ready_misses():
-                    part_error: BaseException | None = None
                     try:
-                        ready_experts = set(miss_ready.plan.experts)
-                        miss_positions = tuple(
+                        hit_set = set(pending.plan.hits)
+                        hit_positions = tuple(
                             position
                             for position, expert in zip(
                                 wave.positions, wave.experts, strict=True
                             )
-                            if expert not in hit_set and expert in ready_experts
+                            if expert in hit_set
                         )
-                        evaluate_bindings(
-                            miss_positions,
-                            miss_ready.bindings,
-                            miss_ready,
-                            force_sync=True,
-                        )
-                    except BaseException as exc:
-                        part_error = exc
-                        raise
+                        if pending.hit_ready is not None:
+                            # Split parts feed one shared lazy graph. Keep every MLX
+                            # eval on the generation thread; evaluating a fence on the
+                            # completion lane can race the next part's graph traversal.
+                            if (
+                                pipeline_ledger is not None
+                                and hit_pipeline_work is not None
+                            ):
+                                _pipeline_work_call(
+                                    pipeline_ledger,
+                                    hit_pipeline_work,
+                                    "claim",
+                                    phase=phase,
+                                )
+                            evaluate_bindings(
+                                hit_positions,
+                                pending.hit_ready.bindings,
+                                pending.hit_ready,
+                                force_sync=True,
+                            )
                     finally:
+                        if (
+                            pipeline_ledger is not None
+                            and hit_pipeline_work is not None
+                        ):
+                            _pipeline_work_call(
+                                pipeline_ledger,
+                                hit_pipeline_work,
+                                "close",
+                                phase=phase,
+                            )
+                    if pending.hit_ready is not None:
+                        pending.release_hits()
+                    # The resident shared branch depends only on ``x``.  Force it
+                    # on Metal while the native readers own miss futures, so
+                    # all-miss layers have useful GPU work instead of an empty
+                    # device.  Keep prefill unchanged: at 128K, eagerly retaining
+                    # the full shared output across routed waves would violate the
+                    # bounded-memory execution contract.
+                    if (
+                        shared_work is not None
+                        and shared is None
+                        and phase is RoutingPhase.DECODE
+                        and pending.misses_pending
+                    ):
+                        if (
+                            pipeline_ledger is not None
+                            and shared_pipeline_work is not None
+                        ):
+                            _pipeline_work_call(
+                                pipeline_ledger,
+                                shared_pipeline_work,
+                                "claim",
+                                phase=phase,
+                            )
                         try:
-                            pending.release_miss(miss_ready)
-                        except BaseException:
-                            if part_error is None:
-                                raise
-            except BaseException as exc:
-                pending.abort(exc)
-                raise
-            finally:
-                pending.close()
+                            shared = shared_work()
+                            mx.eval(shared)
+                        finally:
+                            if (
+                                pipeline_ledger is not None
+                                and shared_pipeline_work is not None
+                            ):
+                                _pipeline_work_call(
+                                    pipeline_ledger,
+                                    shared_pipeline_work,
+                                    "close",
+                                    phase=phase,
+                                )
+                                shared_pipeline_work = None
+                    for miss_ready in pending.iter_ready_misses():
+                        part_error: BaseException | None = None
+                        try:
+                            ready_experts = set(miss_ready.plan.experts)
+                            miss_positions = tuple(
+                                position
+                                for position, expert in zip(
+                                    wave.positions, wave.experts, strict=True
+                                )
+                                if expert not in hit_set and expert in ready_experts
+                            )
+                            if pipeline_ledger is not None:
+                                _pipeline_work_call(
+                                    pipeline_ledger,
+                                    pending,
+                                    "claim_misses",
+                                    miss_ready,
+                                    phase=phase,
+                                )
+                            evaluate_bindings(
+                                miss_positions,
+                                miss_ready.bindings,
+                                miss_ready,
+                                force_sync=True,
+                            )
+                        except BaseException as exc:
+                            part_error = exc
+                            raise
+                        finally:
+                            try:
+                                pending.release_miss(miss_ready)
+                            except BaseException:
+                                if part_error is None:
+                                    raise
+                except BaseException as exc:
+                    pending.abort(exc)
+                    raise
+                finally:
+                    pending.close()
 
-        if not outputs:
-            raise ValueError("router produced no expert assignments")
-        if len(outputs) == 1 and output_positions == list(range(len(expert_ids))):
-            joined = outputs[0]
-        else:
-            joined = mx.concatenate(outputs, axis=0)
-            order = mx.argsort(mx.array(output_positions, dtype=mx.int32))
-            joined = mx.take(joined, order, axis=0)
-        output = joined.reshape((*indices.shape, hidden_size))
-        if shared_work is not None and shared is None:
-            # No physical wait remained to hide, or this was a bounded-memory
-            # prefill. Preserve the original routed-then-shared ordering.
-            shared = shared_work()
-        return output, shared
+            if not outputs:
+                raise ValueError("router produced no expert assignments")
+            if len(outputs) == 1 and output_positions == list(range(len(expert_ids))):
+                joined = outputs[0]
+            else:
+                joined = mx.concatenate(outputs, axis=0)
+                order = mx.argsort(mx.array(output_positions, dtype=mx.int32))
+                joined = mx.take(joined, order, axis=0)
+            output = joined.reshape((*indices.shape, hidden_size))
+            if shared_work is not None and shared is None:
+                # No physical wait remained to hide, or this was a bounded-memory
+                # prefill. Preserve the original routed-then-shared ordering.
+                if pipeline_ledger is not None and shared_pipeline_work is not None:
+                    _pipeline_work_call(
+                        pipeline_ledger,
+                        shared_pipeline_work,
+                        "claim",
+                        phase=phase,
+                    )
+                try:
+                    shared = shared_work()
+                finally:
+                    if pipeline_ledger is not None and shared_pipeline_work is not None:
+                        _pipeline_work_call(
+                            pipeline_ledger,
+                            shared_pipeline_work,
+                            "close",
+                            phase=phase,
+                        )
+                        shared_pipeline_work = None
+            return output, shared
+        finally:
+            if pipeline_ledger is not None and shared_pipeline_work is not None:
+                _pipeline_work_call(
+                    pipeline_ledger,
+                    shared_pipeline_work,
+                    "close",
+                    phase=phase,
+                )
 
 
 def run_switch_with_shared_overlap(
