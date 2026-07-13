@@ -352,6 +352,27 @@ def _plan(spec: ExpertStreamingModelSpec):
     )
 
 
+def _open_tiny_runtime(tmp_path: Path) -> ExpertStreamingRuntime:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=plan.total_limit_bytes,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        verify_artifact_headers=False,
+    )
+    return ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        config,
+        spec=spec,
+        apply_memory_cap=False,
+    )
+
+
 def _global_plan(spec: ExpertStreamingModelSpec, *, persistent_slots: int = 2):
     fixed = spec.resident_bytes + spec.transient_scratch_bytes
     return plan_expert_memory(
@@ -2204,6 +2225,25 @@ def test_runtime_snapshot_splits_cache_counters_by_phase(tmp_path: Path) -> None
         assert split_snapshot["cache_by_phase"]["decode"]["route_calls"] == 1
         assert split_snapshot["cache_by_phase"]["decode"]["expert_misses"] == 1
         assert split_snapshot["cache_by_phase"]["prefill"]["route_calls"] == 0
+    finally:
+        runtime.close()
+
+
+def test_resource_snapshot_does_not_call_full_slot_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path)
+
+    def fail_full_snapshot() -> None:
+        raise AssertionError("resource telemetry must not take a full slot snapshot")
+
+    monkeypatch.setattr(runtime.slots, "snapshot", fail_full_snapshot)
+    try:
+        snapshot = runtime.resource_telemetry_snapshot(mx_module=object())
+        assert snapshot["reader_pool"]["worker_capacity"] >= 1
+        assert "io" in snapshot
+        assert "cache_by_layer" in snapshot
     finally:
         runtime.close()
 

@@ -327,6 +327,11 @@ class MTPLXRuntime:
             return None
         return self.expert_streaming.snapshot()
 
+    def expert_resource_telemetry_snapshot(self) -> dict[str, Any] | None:
+        if self.expert_streaming is None:
+            return None
+        return self.expert_streaming.resource_telemetry_snapshot()
+
     def close(self, *, timeout: float | None = None) -> None:
         if self.expert_streaming is not None:
             self.expert_streaming.close(timeout=timeout)

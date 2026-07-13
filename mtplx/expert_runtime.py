@@ -1790,6 +1790,35 @@ class ExpertStreamingRuntime:
         self._raise_if_unhealthy()
         return snapshot
 
+    def resource_telemetry_snapshot(
+        self,
+        *,
+        mx_module: Any | None = None,
+    ) -> dict[str, Any]:
+        """Return cheap cumulative counters for the benchmark sampler."""
+
+        slots = self.slots.resource_telemetry_snapshot()
+        return {
+            "model_key": self.spec.key,
+            "quant_bits": self.spec.quant_bits,
+            "expert_record_bytes": self.spec.expert_record_bytes,
+            "mlx_memory": mlx_memory_telemetry(mx_module),
+            "cache": self.counters.as_dict(),
+            "cache_by_layer": {
+                str(layer): counters.as_dict()
+                for layer, counters in self._layer_counters.items()
+            },
+            "cache_by_phase": {
+                phase.value: counters.as_dict()
+                for phase, counters in self._phase_counters.items()
+            },
+            "incremental_misses": {
+                "routes": self._incremental_miss_routes,
+                "parts": self._incremental_miss_parts,
+            },
+            **slots,
+        }
+
     def close(self, *, timeout: float | None = None) -> None:
         deadline = None if timeout is None else time.monotonic() + timeout
         if deadline is None:

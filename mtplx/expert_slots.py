@@ -11,6 +11,7 @@ from typing import Any, Callable, Iterable
 
 from .expert_io import ExpertIOError, PositionalExpertReader
 from .expert_manifest import ExpertManifest, ExpertManifestError, ExpertRecord
+from .resource_metrics import PoolOccupancy
 from .expert_streaming import RoutePlan, SlotLoad
 from .expert_streaming_models import (
     ExpertMemoryPlan,
@@ -493,6 +494,8 @@ class ExpertSlotPool:
         workers = max(1, max_inflight_io_bytes // spec.expert_record_bytes)
         workers = min(workers, plan.transient_slots)
         self.max_inflight_io_bytes = workers * spec.expert_record_bytes
+        self._reader_pool_telemetry = PoolOccupancy(worker_capacity=workers)
+        self._completion_fence_telemetry = PoolOccupancy(worker_capacity=1)
         self._executor = ThreadPoolExecutor(
             max_workers=workers,
             thread_name_prefix="mtplx-expert-io",
@@ -503,6 +506,43 @@ class ExpertSlotPool:
         )
         self._completion_error_lock = threading.Lock()
         self._completion_error: BaseException | None = None
+
+    @staticmethod
+    def _run_tracked(
+        telemetry: PoolOccupancy,
+        units: int,
+        callback: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        telemetry.started(units)
+        try:
+            return callback(*args, **kwargs)
+        finally:
+            telemetry.completed(units)
+
+    def _submit_tracked(
+        self,
+        executor: ThreadPoolExecutor,
+        telemetry: PoolOccupancy,
+        units: int,
+        callback: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Future[Any]:
+        telemetry.submitted(units)
+        try:
+            return executor.submit(
+                self._run_tracked,
+                telemetry,
+                units,
+                callback,
+                *args,
+                **kwargs,
+            )
+        except BaseException:
+            telemetry.rejected(units)
+            raise
 
     def _submit_completion_fence(
         self,
@@ -527,12 +567,22 @@ class ExpertSlotPool:
                 on_complete()
 
         try:
-            return self._completion_executor.submit(wait_and_release)
+            return self._submit_tracked(
+                self._completion_executor,
+                self._completion_fence_telemetry,
+                slot_count,
+                wait_and_release,
+            )
         except RuntimeError:
             # Shutdown races or stripped-down runtimes fail closed: wait on the
             # caller before allowing any generation to be overwritten.
             self.metrics.update(completion_fence_fallbacks=1)
-            wait_and_release()
+            self._completion_fence_telemetry.submitted(slot_count)
+            self._run_tracked(
+                self._completion_fence_telemetry,
+                slot_count,
+                wait_and_release,
+            )
             return None
 
     def _record_completion_error(self, error: BaseException) -> None:
@@ -1033,7 +1083,10 @@ class ExpertSlotPool:
                 with self._completion_error_lock:
                     self._raise_completion_error_locked(policy_rollback_safe=True)
                     if use_batch:
-                        future = self._executor.submit(
+                        future = self._submit_tracked(
+                            self._executor,
+                            self._reader_pool_telemetry,
+                            sum(record.logical_bytes for _, _, record in owned_loads),
                             self._fill_batch,
                             tuple(owned_loads),
                             cancel_event=combined_cancel,
@@ -1047,7 +1100,10 @@ class ExpertSlotPool:
                         )
                     else:
                         for slot, generation, record in owned_loads:
-                            future = self._executor.submit(
+                            future = self._submit_tracked(
+                                self._executor,
+                                self._reader_pool_telemetry,
+                                record.logical_bytes,
                                 self._fill,
                                 slot,
                                 generation,
@@ -1226,6 +1282,18 @@ class ExpertSlotPool:
             "pins": pins,
             "metrics": self.metrics.as_dict(),
             "io": self.reader.metrics.as_dict(),
+            "reader_pool": self._reader_pool_telemetry.snapshot(),
+            "completion_fences": self._completion_fence_telemetry.snapshot(),
+        }
+
+    def resource_telemetry_snapshot(self) -> dict[str, Any]:
+        """Return cumulative resource counters without draining or walking slots."""
+
+        return {
+            "metrics": self.metrics.as_dict(),
+            "io": self.reader.metrics.as_dict(),
+            "reader_pool": self._reader_pool_telemetry.snapshot(),
+            "completion_fences": self._completion_fence_telemetry.snapshot(),
         }
 
     def reset(self) -> None:
