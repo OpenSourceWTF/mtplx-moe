@@ -181,6 +181,6 @@ git commit -m "bench(hy3): export held-out cache and batch evidence"
 - [x] Reject global component banks if repeated results miss the 5% target or materially regress single-stream latency.
 - [x] Save raw JSON, a concise Markdown comparison, and the exact commands.
 - [x] Restart Qwen and verify `/v1/models` returns the expected model.
-- [ ] Push `experiment/hy3-cache-scheduling` and open a draft PR against `experiment/moe-pr13-pr14-stack`, linking #29.
+- [x] Push `experiment/hy3-cache-scheduling` and open draft PR #35 against `experiment/moe-pr13-pr14-stack`, linking #29.
 
 Observed outcome: the bounded transaction journal repaired a severe global-cache host-bookkeeping regression and passed exact state-machine fuzzing. The allocation experiment is nevertheless a no-go: repeated long B1 improves by 4.858% on average, while static B2/B4/B8 improve by 2.017%/3.063%/2.864% and mixed-join B4 improves by 1.261%. See `benchmarks/results/hy3-cache-scheduling-issue29-20260713.{md,json}`.
