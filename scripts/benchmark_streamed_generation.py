@@ -1141,6 +1141,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--workload-shape",
+        choices=["static", "mixed-join"],
+        default="static",
+        help=(
+            "Submit every stream before decode (static), or start one decoder "
+            "and submit the remaining streams at --join-after-step so their "
+            "bounded prefills run beside live decode (mixed-join)."
+        ),
+    )
+    parser.add_argument(
+        "--join-after-step",
+        type=int,
+        default=2,
+        help="Decode step boundary that submits mixed-join requests (default: 2).",
+    )
+    parser.add_argument(
         "--reference-ar",
         action="store_true",
         help=(
@@ -1278,6 +1294,17 @@ def validate_reference_ar_flags(
         parser.error("--reference-ar cannot be combined with --enable-mtp")
 
 
+def validate_workload_flags(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    if args.join_after_step < 0:
+        parser.error("--join-after-step must be non-negative")
+    if args.workload_shape == "mixed-join" and args.concurrency < 2:
+        parser.error("mixed-join requires --concurrency at least 2")
+    if args.workload_shape == "mixed-join" and (args.reference_ar or args.enable_mtp):
+        parser.error("mixed-join requires the continuous-batch AR lane")
+
+
 def resolve_execution_lane(args: argparse.Namespace) -> str:
     """Return the explicit execution path used by this benchmark arm."""
 
@@ -1413,15 +1440,38 @@ def _run_concurrent_repeats(
             seed=args.seed,
         )
         before = runtime.expert_streaming_snapshot()
+        workload_shape = getattr(args, "workload_shape", "static")
+        join_after_step = int(getattr(args, "join_after_step", 2))
+        runner_box: list[StreamedBatchRunner] = []
+        join_submission_step: int | None = None
+
+        def submit_joiners(state) -> None:
+            nonlocal join_submission_step
+            if (
+                workload_shape == "mixed-join"
+                and join_submission_step is None
+                and state.step == join_after_step
+            ):
+                for request in requests[1:]:
+                    runner_box[0].submit(request)
+                join_submission_step = state.step
+
         runner = StreamedBatchRunner(
             runtime,
             max_concurrency=args.concurrency,
             max_prefills_per_step=args.max_prefills_per_step,
+            on_step=submit_joiners if workload_shape == "mixed-join" else None,
         )
-        for request in requests:
+        runner_box.append(runner)
+        initial_requests = requests[:1] if workload_shape == "mixed-join" else requests
+        for request in initial_requests:
             runner.submit(request)
         started = time.perf_counter()
         results = runner.run()
+        if workload_shape == "mixed-join" and join_submission_step is None:
+            raise RuntimeError(
+                "initial stream finished before the mixed-join submission step"
+            )
         finished = time.perf_counter()
         elapsed = finished - started
         after = runtime.expert_streaming_snapshot()
@@ -1505,6 +1555,8 @@ def _run_concurrent_repeats(
                 "cache_scope": args.cache_scope,
                 "slot_layout": args.slot_layout,
                 "execution_lane": "continuous-batch-ar",
+                "workload_shape": workload_shape,
+                "join_submission_step": join_submission_step,
                 "aggregate_completion_tokens": aggregate_tokens,
                 "aggregate_completion_tokens_per_second": (
                     aggregate_tokens / elapsed if elapsed > 0.0 else 0.0
@@ -1605,6 +1657,7 @@ def _main() -> int:
     run_label = base_run_label
     validate_mtp_flags(parser, args)
     validate_reference_ar_flags(parser, args)
+    validate_workload_flags(parser, args)
     execution_lane = resolve_execution_lane(args)
     evidence_reservations = reserve_json_evidence_targets(
         args.output_json, args.route_trace_json
@@ -1759,6 +1812,12 @@ def _main() -> int:
                 "requested_concurrency": args.concurrency,
                 "max_prefills_per_step": args.max_prefills_per_step,
                 "execution_lane": execution_lane,
+                "workload_shape": args.workload_shape,
+                "join_after_step": (
+                    args.join_after_step
+                    if args.workload_shape == "mixed-join"
+                    else None
+                ),
             },
             mtp={
                 "enabled": args.enable_mtp,
@@ -1954,6 +2013,10 @@ def _main() -> int:
         "cache_scope": args.cache_scope,
         "slot_layout": args.slot_layout,
         "execution_lane": execution_lane,
+        "workload_shape": args.workload_shape,
+        "join_after_step": (
+            args.join_after_step if args.workload_shape == "mixed-join" else None
+        ),
         "concurrency": args.concurrency,
         "requested_concurrency": args.concurrency,
         "achieved_peak_concurrency": evidence_summary["achieved_peak_concurrency"],

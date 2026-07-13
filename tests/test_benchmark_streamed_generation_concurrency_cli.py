@@ -107,6 +107,39 @@ def test_saturation_lane_flags_parse() -> None:
     assert args.max_prefills_per_step == 2
 
 
+def test_mixed_join_workload_flags_parse_and_validate() -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [
+            *_BASE_ARGS,
+            "--concurrency",
+            "4",
+            "--workload-shape",
+            "mixed-join",
+            "--join-after-step",
+            "3",
+        ]
+    )
+
+    module.validate_workload_flags(parser, args)
+
+    assert args.workload_shape == "mixed-join"
+    assert args.join_after_step == 3
+
+
+def test_mixed_join_requires_room_for_a_live_decoder_and_joiner(capsys) -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [*_BASE_ARGS, "--workload-shape", "mixed-join", "--concurrency", "1"]
+    )
+
+    with pytest.raises(SystemExit):
+        module.validate_workload_flags(parser, args)
+    assert "mixed-join requires --concurrency at least 2" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("cache_scope", ["layer", "global"])
 @pytest.mark.parametrize("concurrency", [1, 2, 4, 8])
 def test_run_label_distinguishes_cache_arm_and_saturation_lane(
@@ -229,6 +262,51 @@ def test_run_concurrent_repeats_reports_aggregate_and_per_stream_rates(
         assert row["timing_summary"]["ttft_seconds"]["p50"] > 0.0
         assert row["timing_summary"]["completion_latency_seconds"]["p99"] > 0.0
         assert row["streaming_after"]["live_kv_tokens"] == 0
+    finally:
+        rt.close()
+
+
+def test_mixed_join_lane_submits_prefill_while_first_stream_decodes(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from test_streamed_batch import _open_fixture_runtime
+
+    module = _load_module()
+    rt, _streaming = _open_fixture_runtime(tmp_path, max_live_kv_tokens=64)
+    try:
+        args = SimpleNamespace(
+            repeats=1,
+            reset_between=False,
+            concurrency=2,
+            max_prefills_per_step=1,
+            workload_shape="mixed-join",
+            join_after_step=1,
+            seed=0,
+            output_dir=None,
+            model_key="hy3-q4",
+            cache_scope="global",
+            slot_layout="component-banks",
+        )
+        row = module._run_concurrent_repeats(
+            args,
+            rt,
+            prompt_ids=[1, 2, 3],
+            sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=1),
+            max_tokens=5,
+            run_label="fixture",
+            configuration_label="mixed-B2",
+        )[0]
+
+        streams = {stream["request_id"]: stream for stream in row["streams"]}
+        assert row["workload_shape"] == "mixed-join"
+        assert row["join_submission_step"] == 1
+        assert streams["stream-00"]["admitted_step"] == 0
+        assert streams["stream-01"]["admitted_step"] == 2
+        assert row["scheduler"]["live_stream_counts"][0:2] == [1, 1]
+        assert 2 in row["scheduler"]["live_stream_counts"]
+        assert row["achieved_peak_concurrency"] == 2
     finally:
         rt.close()
 
