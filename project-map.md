@@ -1,5 +1,5 @@
 # Project Map
-_Generated: 2026-07-13 12:30 CDT | Git: c3aca92_
+_Generated: 2026-07-13 14:15 CDT | Git: 59bc40c_
 
 ## Directory Structure
 .github/ — CI, build, hygiene, release, ownership, and issue/PR automation.
@@ -44,6 +44,8 @@ scripts/build_expert_manifest.py — Validated expert-layout manifest builder.
 scripts/verify_streamed_parity.py — Deterministic streamed-versus-resident parity gate.
 docs/MOE_SSD_STREAMING_OPTIMIZATION_ROADMAP.md — Measured bottlenecks, staged optimization contract, and stop/go rules.
 docs/MOE_RUNTIME_PR_BENCHMARKS.md — Curated per-PR runtime correctness and performance evidence.
+benchmarks/results/hy3-starvation-attribution-issue30-20260713.md — Phase 1 paired hardware evidence, starvation-wall interpretation, and claim boundaries.
+benchmarks/results/hy3-starvation-attribution-issue30-20260713.json — Machine-readable issue #30 campaign, parity, throughput, attribution, and coverage summary.
 docs/specs/2026-07-13-hy3-starvation-attribution-design.md — Issue #30 Phase 1 ontology, hook boundaries, coverage limits, and evidence gate.
 docs/RESOURCE_TELEMETRY.md — Interpretation contract for resource schema v2 and expert-pipeline attribution.
 CONTRIBUTING.md — Required verification, benchmark provenance, and workspace-level worktree rules.
