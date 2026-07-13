@@ -26,7 +26,7 @@ from mtplx.expert_manifest import (
     TensorSegment,
     save_expert_manifest,
 )
-from mtplx.resource_metrics import ExpertPipelineRoute
+from mtplx.resource_metrics import ExpertPipelineLedger, ExpertPipelineRoute
 from mtplx.expert_runtime import (
     ExpertStreamingConfig,
     ExpertStreamingConfigurationError,
@@ -380,6 +380,114 @@ def _open_tiny_runtime(
         spec=spec,
         apply_memory_cap=False,
     )
+
+
+class _PipelineWaitClock:
+    def __init__(self) -> None:
+        self.now_ns = 0
+
+    def __call__(self) -> int:
+        return self.now_ns
+
+    def advance(self, elapsed_ns: int) -> None:
+        self.now_ns += elapsed_ns
+
+
+class _PipelineWaitReady:
+    def __init__(self, plan: RoutePlan) -> None:
+        self.plan = plan
+        self.released = False
+
+    def release(self, *, synchronize: bool = True) -> None:
+        assert synchronize is False
+        assert self.released is False
+        self.released = True
+
+
+class _PipelineWaitSlots:
+    @staticmethod
+    def raise_if_unhealthy() -> None:
+        return None
+
+    @staticmethod
+    def commit_if_healthy(commit) -> None:
+        commit()
+
+
+class _PipelineWaitRuntime:
+    def __init__(self, ledger: ExpertPipelineLedger | None) -> None:
+        self._pipeline_ledger = ledger
+        self.slots = _PipelineWaitSlots()
+        self.failures: list[BaseException] = []
+
+    @staticmethod
+    def _publish_route_transaction(*_args, **_kwargs) -> None:
+        return None
+
+    def _handle_split_route_failure(
+        self,
+        _layer,
+        _plan,
+        _policy_txn,
+        error,
+        **_kwargs,
+    ) -> None:
+        self.failures.append(error)
+
+
+def _controlled_wait_pending(
+    clock: _PipelineWaitClock,
+    *,
+    future_count: int,
+    telemetry: bool = True,
+) -> tuple[
+    ExpertPipelineLedger | None,
+    PendingSplitRoute,
+    tuple[Future[ReadyRoute], ...],
+    tuple[_PipelineWaitReady, ...],
+]:
+    ledger = ExpertPipelineLedger(strict=True, clock_ns=clock) if telemetry else None
+    runtime = _PipelineWaitRuntime(ledger)
+    parts = tuple(_manual_plan(expert, expert) for expert in range(future_count))
+    full_plan = RoutePlan(
+        phase=RoutingPhase.DECODE,
+        experts=tuple(range(future_count)),
+        slots=tuple(range(future_count)),
+        hits=(),
+        misses=tuple(range(future_count)),
+        loads=tuple(load for part in parts for load in part.loads),
+        evictions=(),
+    )
+    futures = tuple(Future() for _ in parts)
+    readies = tuple(_PipelineWaitReady(part) for part in parts)
+    layer_lock = threading.Lock()
+    layer_lock.acquire()
+    pipeline_route = (
+        ledger.begin_route(
+            layer=1,
+            phase="decode",
+            load_experts=(),
+            load_logical_bytes=(),
+        )
+        if ledger is not None
+        else None
+    )
+    pending = PendingSplitRoute(
+        runtime=runtime,  # type: ignore[arg-type]
+        layer=1,
+        plan=full_plan,
+        layer_lock=layer_lock,
+        hit_ready=None,
+        miss_futures=dict(zip(futures, parts, strict=True)),
+        miss_parts=parts,
+        pipeline_route=pipeline_route,
+    )
+    return ledger, pending, futures, readies
+
+
+def _drain_controlled_wait_pending(pending: PendingSplitRoute) -> None:
+    for ready in pending.iter_ready_misses():
+        pending.release_miss(ready)
 
 
 def _global_plan(spec: ExpertStreamingModelSpec, *, persistent_slots: int = 2):
@@ -4463,6 +4571,221 @@ def test_pipeline_telemetry_off_omits_ledger_and_snapshot(
         }
     finally:
         runtime.close()
+
+
+def test_expert_input_wait_already_completed_future_records_zero_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _PipelineWaitClock()
+    ledger, pending, futures, readies = _controlled_wait_pending(
+        clock,
+        future_count=1,
+    )
+    assert ledger is not None
+    futures[0].set_result(readies[0])  # type: ignore[arg-type]
+
+    def controlled_as_completed(snapshot):
+        assert tuple(snapshot) == futures
+        return iter(futures)
+
+    monkeypatch.setattr(expert_runtime_module, "as_completed", controlled_as_completed)
+    try:
+        _drain_controlled_wait_pending(pending)
+    finally:
+        pending.close()
+
+    pipeline = ledger.snapshot()
+    assert pipeline["counters"]["generation_expert_input_wait_events"] == 0
+    assert pipeline["integrals_ns"]["generation_expert_input_wait_ns"] == 0
+    assert all(value == 0 for value in pipeline["gauges"].values())
+
+
+def test_expert_input_wait_records_one_exact_blocking_next_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _PipelineWaitClock()
+    ledger, pending, futures, readies = _controlled_wait_pending(
+        clock,
+        future_count=1,
+    )
+    assert ledger is not None
+
+    def controlled_as_completed(snapshot):
+        assert tuple(snapshot) == futures
+
+        def completions():
+            clock.advance(7)
+            futures[0].set_result(readies[0])  # type: ignore[arg-type]
+            yield futures[0]
+
+        return completions()
+
+    monkeypatch.setattr(expert_runtime_module, "as_completed", controlled_as_completed)
+    try:
+        _drain_controlled_wait_pending(pending)
+    finally:
+        if not futures[0].done():
+            futures[0].set_exception(RuntimeError("test cleanup"))
+        pending.close()
+
+    pipeline = ledger.snapshot()
+    assert pipeline["counters"]["generation_expert_input_wait_events"] == 1
+    assert pipeline["integrals_ns"]["generation_expert_input_wait_ns"] == 7
+    assert (
+        pipeline["by_phase"]["decode"]["integrals_ns"][
+            "generation_expert_input_wait_ns"
+        ]
+        == 7
+    )
+    assert all(value == 0 for value in pipeline["gauges"].values())
+
+
+def test_expert_input_wait_records_two_sequential_blocking_next_intervals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _PipelineWaitClock()
+    ledger, pending, futures, readies = _controlled_wait_pending(
+        clock,
+        future_count=2,
+    )
+    assert ledger is not None
+
+    def controlled_as_completed(snapshot):
+        assert tuple(snapshot) == futures
+
+        def completions():
+            clock.advance(3)
+            futures[0].set_result(readies[0])  # type: ignore[arg-type]
+            yield futures[0]
+            clock.advance(5)
+            futures[1].set_result(readies[1])  # type: ignore[arg-type]
+            yield futures[1]
+
+        return completions()
+
+    monkeypatch.setattr(expert_runtime_module, "as_completed", controlled_as_completed)
+    try:
+        _drain_controlled_wait_pending(pending)
+    finally:
+        for future in futures:
+            if not future.done():
+                future.set_exception(RuntimeError("test cleanup"))
+        pending.close()
+
+    pipeline = ledger.snapshot()
+    assert pipeline["counters"]["generation_expert_input_wait_events"] == 2
+    assert pipeline["integrals_ns"]["generation_expert_input_wait_ns"] == 8
+    assert all(value == 0 for value in pipeline["gauges"].values())
+
+
+def test_expert_input_wait_removes_buffered_future_before_next_readiness_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _PipelineWaitClock()
+    ledger, pending, futures, readies = _controlled_wait_pending(
+        clock,
+        future_count=2,
+    )
+    assert ledger is not None
+    futures[0].set_result(readies[0])  # type: ignore[arg-type]
+
+    def controlled_as_completed(snapshot):
+        assert tuple(snapshot) == futures
+
+        def completions():
+            yield futures[0]
+            clock.advance(11)
+            futures[1].set_result(readies[1])  # type: ignore[arg-type]
+            yield futures[1]
+
+        return completions()
+
+    monkeypatch.setattr(expert_runtime_module, "as_completed", controlled_as_completed)
+    try:
+        _drain_controlled_wait_pending(pending)
+    finally:
+        if not futures[1].done():
+            futures[1].set_exception(RuntimeError("test cleanup"))
+        pending.close()
+
+    pipeline = ledger.snapshot()
+    assert pipeline["counters"]["generation_expert_input_wait_events"] == 1
+    assert pipeline["integrals_ns"]["generation_expert_input_wait_ns"] == 11
+    assert all(value == 0 for value in pipeline["gauges"].values())
+
+
+def test_expert_input_wait_future_failure_ends_wait_and_preserves_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _PipelineWaitClock()
+    ledger, pending, futures, _readies = _controlled_wait_pending(
+        clock,
+        future_count=1,
+    )
+    assert ledger is not None
+    read_error = RuntimeError("injected controlled completion failure")
+
+    def controlled_as_completed(snapshot):
+        assert tuple(snapshot) == futures
+
+        def completions():
+            clock.advance(13)
+            futures[0].set_exception(read_error)
+            yield futures[0]
+
+        return completions()
+
+    monkeypatch.setattr(expert_runtime_module, "as_completed", controlled_as_completed)
+    try:
+        with pytest.raises(RuntimeError, match="controlled completion") as failed:
+            _drain_controlled_wait_pending(pending)
+        assert failed.value is read_error
+        pipeline = ledger.snapshot()
+        assert pipeline["gauges"]["generation_wait_active"] == 0
+        assert pipeline["counters"]["generation_expert_input_wait_events"] == 1
+        assert pipeline["integrals_ns"]["generation_expert_input_wait_ns"] == 13
+    finally:
+        pending.close()
+
+    assert all(value == 0 for value in ledger.snapshot()["gauges"].values())
+
+
+def test_expert_input_wait_telemetry_off_uses_original_completion_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NoDiagnosticDoneFuture(Future[ReadyRoute]):
+        def done(self) -> bool:
+            raise AssertionError("telemetry-off readiness scan entered")
+
+    clock = _PipelineWaitClock()
+    _ledger, pending, original_futures, readies = _controlled_wait_pending(
+        clock,
+        future_count=1,
+        telemetry=False,
+    )
+    future: Future[ReadyRoute] = NoDiagnosticDoneFuture()
+    future.set_result(readies[0])  # type: ignore[arg-type]
+    part = pending._miss_futures.pop(original_futures[0])
+    pending._miss_ordinals.pop(original_futures[0])
+    pending._miss_futures[future] = part
+    pending._miss_ordinals[future] = 0
+
+    def fail_diagnostic(*_args, **_kwargs):
+        raise AssertionError("telemetry-off wait diagnostic entered")
+
+    def controlled_as_completed(snapshot):
+        assert tuple(snapshot) == (future,)
+        return iter((future,))
+
+    monkeypatch.setattr(expert_runtime_module, "_pipeline_call", fail_diagnostic)
+    monkeypatch.setattr(expert_runtime_module.time, "monotonic_ns", fail_diagnostic)
+    monkeypatch.setattr(expert_runtime_module, "as_completed", controlled_as_completed)
+    try:
+        _drain_controlled_wait_pending(pending)
+    finally:
+        pending.close()
+
+    assert readies[0].released is True
 
 
 def test_resource_telemetry_config_requires_bool() -> None:

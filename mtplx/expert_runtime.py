@@ -652,12 +652,56 @@ class PendingSplitRoute:
                 self._failure_finalizing = False
             self._finalize_if_ready()
 
+    def _iter_pipeline_miss_completions(
+        self,
+        snapshot: tuple[Future[ReadyRoute], ...],
+    ) -> Iterable[Future[ReadyRoute]]:
+        """Attribute only a blocking step of the existing completion iterator."""
+
+        route = self._pipeline_route
+        assert route is not None
+        completions = iter(as_completed(snapshot))
+        remaining = set(snapshot)
+        while remaining:
+            try:
+                blocks_for_next = not any(future.done() for future in remaining)
+            except Exception:
+                blocks_for_next = False
+                ledger = self.runtime._pipeline_ledger
+                if ledger is not None:
+                    try:
+                        ledger.mark_incomplete(phase=route.phase)
+                    except Exception:
+                        pass
+            if blocks_for_next:
+                _pipeline_call(
+                    self.runtime._pipeline_ledger,
+                    route,
+                    "begin_generation_wait",
+                )
+            try:
+                future = next(completions)
+            finally:
+                if blocks_for_next:
+                    _pipeline_call(
+                        self.runtime._pipeline_ledger,
+                        route,
+                        "end_generation_wait",
+                    )
+            remaining.discard(future)
+            yield future
+
     def iter_ready_misses(self) -> Iterable[ReadyRoute]:
         """Yield authoritative miss bindings in physical completion order."""
 
         with self._state_lock:
             snapshot = tuple(self._miss_futures)
-        for future in as_completed(snapshot):
+        completion_order = (
+            as_completed(snapshot)
+            if self._pipeline_route is None
+            else self._iter_pipeline_miss_completions(snapshot)
+        )
+        for future in completion_order:
             with self._state_lock:
                 if future not in self._miss_futures:
                     continue

@@ -25,6 +25,7 @@ from mtplx.expert_runtime import (
 )
 from mtplx.expert_slots import ExpertSlotBinding, ExpertSlotError
 from mtplx.expert_streaming_models import ExpertStreamingModelSpec
+from mtplx.resource_metrics import ExpertPipelineLedger
 from mtplx.models.expert_mlx import (
     HotExpertSwitchGLU,
     _run_q4_expert,
@@ -305,6 +306,7 @@ class _OverlapRuntime:
             slot_layout="direct-slots",
             resource_telemetry=False,
         )
+        self._pipeline_ledger = None
 
     def observe_route(self, *_args, **_kwargs) -> None:
         return None
@@ -404,6 +406,9 @@ class _BankOverlapPending:
     def release_miss(self, part) -> None:
         self.events.append(f"release-miss:{part.plan.experts}")
 
+    def claim_misses(self, part) -> None:
+        self.events.append(f"claim-miss:{part.plan.experts}")
+
     def abort(self, error: BaseException) -> None:
         self.events.append(f"abort:{type(error).__name__}")
 
@@ -412,9 +417,17 @@ class _BankOverlapPending:
 
 
 class _BankOverlapRuntime(_OverlapRuntime):
-    def __init__(self, events: list[str], pending: _BankOverlapPending) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        pending: _BankOverlapPending,
+        *,
+        pipeline_ledger=None,
+    ) -> None:
         super().__init__(events)
         self.config.slot_layout = "component-banks"
+        self.config.resource_telemetry = pipeline_ledger is not None
+        self._pipeline_ledger = pipeline_ledger
         self.pending = pending
 
     def try_all_hit_route(self, *_args, **_kwargs):
@@ -430,6 +443,68 @@ def _bank_overlap_inputs() -> tuple[mx.array, mx.array]:
         mx.zeros((3, 1, 2), dtype=mx.bfloat16),
         mx.array([[[0]], [[1]], [[2]]], dtype=mx.int32),
     )
+
+
+class _RecordingPipelineSpan:
+    def __init__(
+        self,
+        events: list[str],
+        kind: str,
+        *,
+        fail_claim: bool = False,
+        fail_close: bool = False,
+    ) -> None:
+        self.events = events
+        self.kind = kind
+        self.fail_claim = fail_claim
+        self.fail_close = fail_close
+
+    def claim(self) -> None:
+        self.events.append(f"claim-{self.kind}")
+        if self.fail_claim:
+            raise RuntimeError(f"injected {self.kind} claim failure")
+
+    def close(self) -> None:
+        self.events.append(f"close-{self.kind}")
+        if self.fail_close:
+            raise RuntimeError(f"injected {self.kind} close failure")
+
+
+class _RecordingPipelineLedger:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        fail_hit_claim: bool = False,
+        fail_shared_close: bool = False,
+    ) -> None:
+        self.events = events
+        self.fail_hit_claim = fail_hit_claim
+        self.fail_shared_close = fail_shared_close
+
+    @staticmethod
+    def _phase_name(phase) -> str:
+        return str(getattr(phase, "value", phase))
+
+    def begin_hit_work(self, experts, *, phase):
+        values = tuple(experts)
+        self.events.append(f"begin-hit:{values}")
+        return _RecordingPipelineSpan(
+            self.events,
+            "hit",
+            fail_claim=self.fail_hit_claim,
+        )
+
+    def begin_shared_work(self, *, phase):
+        self.events.append("begin-shared")
+        return _RecordingPipelineSpan(
+            self.events,
+            "shared",
+            fail_close=self.fail_shared_close,
+        )
+
+    def mark_incomplete(self, *, phase) -> None:
+        self.events.append(f"incomplete:{self._phase_name(phase)}")
 
 
 def test_component_bank_overlaps_hit_and_shared_work_with_incremental_misses(
@@ -467,6 +542,229 @@ def test_component_bank_overlaps_hit_and_shared_work_with_incremental_misses(
         "ready:(2,)",
         "q4:(2,)",
         "release-miss:(2,)",
+        "close",
+    ]
+
+
+def test_component_bank_claims_runnable_work_immediately_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    pending = _BankOverlapPending(events)
+    ledger = _RecordingPipelineLedger(events)
+    runtime = _BankOverlapRuntime(
+        events,
+        pending,
+        pipeline_ledger=ledger,
+    )
+
+    def fake_q4(selected, bindings, *, group_size):
+        assert group_size == 64
+        events.append(f"q4:{tuple(item.expert for item in bindings)}")
+        return selected
+
+    monkeypatch.setattr(expert_mlx, "_run_component_bank_q4", fake_q4)
+    switch = HotExpertSwitchGLU(runtime, 1)
+
+    def shared_work():
+        events.append("shared")
+        return mx.ones((3, 1, 2), dtype=mx.bfloat16)
+
+    routed, shared = switch.run_with_shared_overlap(
+        *_bank_overlap_inputs(),
+        shared_work,
+    )
+    mx.eval(routed, shared)
+
+    assert events == [
+        "begin-shared",
+        "begin-misses",
+        "begin-hit:(0,)",
+        "claim-hit",
+        "q4:(0,)",
+        "close-hit",
+        "release-hits",
+        "claim-shared",
+        "shared",
+        "close-shared",
+        "ready:(1,)",
+        "claim-miss:(1,)",
+        "q4:(1,)",
+        "release-miss:(1,)",
+        "ready:(2,)",
+        "claim-miss:(2,)",
+        "q4:(2,)",
+        "release-miss:(2,)",
+        "close",
+    ]
+
+
+def test_streamed_decode_telemetry_off_calls_no_pipeline_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    pending = _BankOverlapPending(events)
+    runtime = _BankOverlapRuntime(events, pending)
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("telemetry-off path called a pipeline helper")
+
+    pending.claim_misses = unexpected
+    monkeypatch.setattr(
+        expert_mlx,
+        "_begin_pipeline_work",
+        unexpected,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        expert_mlx,
+        "_pipeline_work_call",
+        unexpected,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        expert_mlx,
+        "_run_component_bank_q4",
+        lambda selected, _bindings, **_kwargs: selected,
+    )
+
+    output = HotExpertSwitchGLU(runtime, 1)(*_bank_overlap_inputs())
+    mx.eval(output)
+
+    assert events == [
+        "begin-misses",
+        "release-hits",
+        "ready:(1,)",
+        "release-miss:(1,)",
+        "ready:(2,)",
+        "release-miss:(2,)",
+        "close",
+    ]
+
+
+def test_shared_callback_failure_preserves_error_and_closes_pipeline_spans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    pending = _BankOverlapPending(events)
+    ledger = ExpertPipelineLedger(strict=True)
+    runtime = _BankOverlapRuntime(
+        events,
+        pending,
+        pipeline_ledger=ledger,
+    )
+    shared_error = RuntimeError("injected shared callback failure")
+
+    monkeypatch.setattr(
+        expert_mlx,
+        "_run_component_bank_q4",
+        lambda selected, _bindings, **_kwargs: selected,
+    )
+
+    def fail_shared():
+        events.append("shared")
+        raise shared_error
+
+    with pytest.raises(RuntimeError, match="shared callback failure") as failed:
+        HotExpertSwitchGLU(runtime, 1).run_with_shared_overlap(
+            *_bank_overlap_inputs(),
+            fail_shared,
+        )
+
+    assert failed.value is shared_error
+    assert events == [
+        "begin-misses",
+        "release-hits",
+        "shared",
+        "abort:RuntimeError",
+        "close",
+    ]
+    pipeline = ledger.snapshot()["by_phase"]["decode"]
+    assert pipeline["counters"]["claimed_hit_work"] == 1
+    assert pipeline["counters"]["claimed_shared_work"] == 1
+    assert pipeline["gauges"]["open_hit_work_spans"] == 0
+    assert pipeline["gauges"]["open_shared_work_spans"] == 0
+    assert pipeline["gauges"]["runnable_hit_work"] == 0
+    assert pipeline["gauges"]["runnable_shared_work"] == 0
+
+
+def test_pipeline_hook_failure_does_not_mask_q4_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    pending = _BankOverlapPending(events)
+    ledger = _RecordingPipelineLedger(events, fail_hit_claim=True)
+    runtime = _BankOverlapRuntime(
+        events,
+        pending,
+        pipeline_ledger=ledger,
+    )
+    q4_error = RuntimeError("injected authoritative Q4 failure")
+
+    def fail_q4(*_args, **_kwargs):
+        events.append("q4")
+        raise q4_error
+
+    monkeypatch.setattr(expert_mlx, "_run_component_bank_q4", fail_q4)
+
+    with pytest.raises(RuntimeError, match="authoritative Q4 failure") as failed:
+        HotExpertSwitchGLU(runtime, 1)(*_bank_overlap_inputs())
+
+    assert failed.value is q4_error
+    assert events == [
+        "begin-misses",
+        "begin-hit:(0,)",
+        "claim-hit",
+        "incomplete:decode",
+        "q4",
+        "close-hit",
+        "abort:RuntimeError",
+        "close",
+    ]
+
+
+def test_pipeline_close_failure_does_not_mask_shared_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    pending = _BankOverlapPending(events)
+    ledger = _RecordingPipelineLedger(events, fail_shared_close=True)
+    runtime = _BankOverlapRuntime(
+        events,
+        pending,
+        pipeline_ledger=ledger,
+    )
+    shared_error = RuntimeError("injected authoritative shared failure")
+
+    monkeypatch.setattr(
+        expert_mlx,
+        "_run_component_bank_q4",
+        lambda selected, _bindings, **_kwargs: selected,
+    )
+
+    def fail_shared():
+        events.append("shared")
+        raise shared_error
+
+    with pytest.raises(RuntimeError, match="authoritative shared failure") as failed:
+        HotExpertSwitchGLU(runtime, 1).run_with_shared_overlap(
+            *_bank_overlap_inputs(),
+            fail_shared,
+        )
+
+    assert failed.value is shared_error
+    assert events == [
+        "begin-shared",
+        "begin-misses",
+        "begin-hit:(0,)",
+        "claim-hit",
+        "close-hit",
+        "release-hits",
+        "claim-shared",
+        "shared",
+        "close-shared",
+        "incomplete:decode",
+        "abort:RuntimeError",
         "close",
     ]
 
@@ -1604,6 +1902,7 @@ def test_component_bank_all_hit_decode_preserves_route_waves_counters_and_shared
         transient_slots=2,
         slot_layout="component-banks",
         cache_policy="lru",
+        resource_telemetry=True,
     )
     plan = stream_config.memory_plan(spec)
     assert plan.slots_per_layer == 3
@@ -1647,7 +1946,9 @@ def test_component_bank_all_hit_decode_preserves_route_waves_counters_and_shared
         reference = switch(tokens, indices)
         mx.eval(reference)
         assert runtime._banks[1].resident_experts == (2, 0, 1)
-        before = runtime.snapshot(mx_module=mx)["cache"]
+        before_snapshot = runtime.snapshot(mx_module=mx)
+        before = before_snapshot["cache"]
+        pipeline_before = before_snapshot["expert_pipeline"]["by_phase"]["decode"]
         events.clear()
         fast_waves: list[tuple[int, ...]] = []
         original_try = runtime.try_all_hit_route
@@ -1683,6 +1984,31 @@ def test_component_bank_all_hit_decode_preserves_route_waves_counters_and_shared
         assert after["cache"]["expert_requests"] - before["expert_requests"] == 4
         assert after["cache"]["expert_hits"] - before["expert_hits"] == 4
         assert after["slots"]["pins"] == 0
+        pipeline_after = after["expert_pipeline"]["by_phase"]["decode"]
+        assert (
+            pipeline_after["counters"]["claimed_hit_work"]
+            - pipeline_before["counters"]["claimed_hit_work"]
+            == 3
+        )
+        assert (
+            pipeline_after["counters"]["claimed_shared_work"]
+            - pipeline_before["counters"]["claimed_shared_work"]
+            == 1
+        )
+        assert (
+            pipeline_after["counters"]["generation_expert_input_wait_events"]
+            - pipeline_before["counters"]["generation_expert_input_wait_events"]
+            == 0
+        )
+        assert (
+            pipeline_after["integrals_ns"]["generation_expert_input_wait_ns"]
+            - pipeline_before["integrals_ns"]["generation_expert_input_wait_ns"]
+            == 0
+        )
+        assert pipeline_after["gauges"]["open_hit_work_spans"] == 0
+        assert pipeline_after["gauges"]["open_shared_work_spans"] == 0
+        assert pipeline_after["gauges"]["runnable_hit_work"] == 0
+        assert pipeline_after["gauges"]["runnable_shared_work"] == 0
     finally:
         runtime.close()
 
@@ -1701,6 +2027,7 @@ def test_component_bank_all_hit_decode_releases_pins_on_q4_error(
         transient_slots=2,
         slot_layout="component-banks",
         cache_policy="lru",
+        resource_telemetry=True,
     )
     plan = stream_config.memory_plan(spec)
     runtime = ExpertStreamingRuntime.open(
@@ -1722,9 +2049,14 @@ def test_component_bank_all_hit_decode_releases_pins_on_q4_error(
     try:
         warm = switch(tokens, indices)
         mx.eval(warm)
+        pipeline_before = runtime.snapshot(mx_module=mx)["expert_pipeline"]["by_phase"][
+            "decode"
+        ]
         q4_calls = 0
 
-        def fail_second_wave(
+        q4_error = RuntimeError("injected Q4 failure")
+
+        def fail_second_wave_with_identity(
             selected: mx.array,
             bindings: tuple[ExpertSlotBinding, ...],
             *,
@@ -1735,16 +2067,30 @@ def test_component_bank_all_hit_decode_releases_pins_on_q4_error(
             assert len(bindings) == int(selected.shape[0])
             q4_calls += 1
             if q4_calls == 2:
-                raise RuntimeError("injected Q4 failure")
+                raise q4_error
             return selected
 
-        monkeypatch.setattr(expert_mlx, "_run_component_bank_q4", fail_second_wave)
+        monkeypatch.setattr(
+            expert_mlx,
+            "_run_component_bank_q4",
+            fail_second_wave_with_identity,
+        )
 
-        with pytest.raises(RuntimeError, match="injected Q4 failure"):
+        with pytest.raises(RuntimeError, match="injected Q4 failure") as failed:
             switch(tokens, indices)
 
+        assert failed.value is q4_error
         assert q4_calls == 2
-        assert runtime.snapshot(mx_module=mx)["slots"]["pins"] == 0
+        failed_snapshot = runtime.snapshot(mx_module=mx)
+        assert failed_snapshot["slots"]["pins"] == 0
+        pipeline_after = failed_snapshot["expert_pipeline"]["by_phase"]["decode"]
+        assert (
+            pipeline_after["counters"]["claimed_hit_work"]
+            - pipeline_before["counters"]["claimed_hit_work"]
+            == 3
+        )
+        assert pipeline_after["gauges"]["open_hit_work_spans"] == 0
+        assert pipeline_after["gauges"]["runnable_hit_work"] == 0
     finally:
         runtime.close()
 
