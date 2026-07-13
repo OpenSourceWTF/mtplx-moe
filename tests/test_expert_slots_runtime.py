@@ -469,6 +469,12 @@ def test_slot_pool_loads_hits_replaces_and_preserves_component_views(
         assert snapshot["allocated_bytes"] == 2 * spec.expert_record_bytes
         assert snapshot["metrics"]["generation_replacements"] == 1
         assert snapshot["io"]["record_requests"] == 3
+        layer_reads = snapshot["physical_read_latency_by_layer"]["1"]
+        assert layer_reads["operations"] == 3
+        assert layer_reads["records"] == 3
+        assert layer_reads["elapsed_ns"] > 0
+        assert layer_reads["mean_operation_ms"] > 0.0
+        assert layer_reads["mean_record_ms"] > 0.0
     finally:
         pool.close()
 

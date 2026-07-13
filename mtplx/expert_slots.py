@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -94,6 +95,9 @@ class ExpertSlotMetrics:
     completion_fence_slots: int = 0
     completion_fence_fallbacks: int = 0
     completion_fence_failures: int = 0
+    _physical_reads_by_layer: dict[int, dict[str, int]] = field(
+        default_factory=dict, repr=False
+    )
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _route_claims: list[_RouteReleaseClaim] = field(default_factory=list, repr=False)
     _admission_test_hook: Callable[[str], None] | None = field(default=None, repr=False)
@@ -143,6 +147,44 @@ class ExpertSlotMetrics:
         with self._lock:
             claim.released = True
             self.active_routes = sum(not item.released for item in self._route_claims)
+
+    def observe_physical_read(
+        self,
+        layer: int,
+        *,
+        records: int,
+        elapsed_ns: int,
+    ) -> None:
+        with self._lock:
+            row = self._physical_reads_by_layer.setdefault(
+                int(layer), {"operations": 0, "records": 0, "elapsed_ns": 0}
+            )
+            row["operations"] += 1
+            row["records"] += int(records)
+            row["elapsed_ns"] += int(elapsed_ns)
+
+    def physical_read_latency_by_layer(self) -> dict[str, dict[str, int | float]]:
+        with self._lock:
+            rows = {
+                layer: dict(values)
+                for layer, values in self._physical_reads_by_layer.items()
+            }
+        return {
+            str(layer): {
+                **values,
+                "mean_operation_ms": (
+                    values["elapsed_ns"] / values["operations"] / 1e6
+                    if values["operations"]
+                    else 0.0
+                ),
+                "mean_record_ms": (
+                    values["elapsed_ns"] / values["records"] / 1e6
+                    if values["records"]
+                    else 0.0
+                ),
+            }
+            for layer, values in sorted(rows.items())
+        }
 
     def as_dict(self) -> dict[str, int]:
         with self._lock:
@@ -931,6 +973,7 @@ class ExpertSlotPool:
         deadline_ns: int | None,
     ) -> None:
         try:
+            read_started = time.monotonic_ns()
             digest = self.reader.read_record_into(
                 self.manifest,
                 record,
@@ -939,6 +982,11 @@ class ExpertSlotPool:
                 verify_hash=self.verify_hashes,
                 cancel_event=cancel_event,
                 deadline_ns=deadline_ns,
+            )
+            self.metrics.observe_physical_read(
+                record.layer,
+                records=1,
+                elapsed_ns=time.monotonic_ns() - read_started,
             )
         except BaseException as exc:
             with slot.condition:
@@ -970,6 +1018,7 @@ class ExpertSlotPool:
         deadline_ns: int | None,
     ) -> None:
         try:
+            read_started = time.monotonic_ns()
             digests = self.reader.read_component_records_into(
                 self.manifest,
                 tuple((record, slot.buffer) for slot, _generation, record in owned),
@@ -977,6 +1026,24 @@ class ExpertSlotPool:
                 cancel_event=cancel_event,
                 deadline_ns=deadline_ns,
             )
+            elapsed_ns = time.monotonic_ns() - read_started
+            records_by_layer = Counter(
+                record.layer for _slot, _generation, record in owned
+            )
+            total_records = len(owned)
+            distributed_ns = 0
+            for index, (layer, records) in enumerate(sorted(records_by_layer.items())):
+                layer_ns = (
+                    elapsed_ns - distributed_ns
+                    if index == len(records_by_layer) - 1
+                    else elapsed_ns * records // total_records
+                )
+                distributed_ns += layer_ns
+                self.metrics.observe_physical_read(
+                    layer,
+                    records=records,
+                    elapsed_ns=layer_ns,
+                )
         except BaseException as exc:
             for slot, generation, _record in owned:
                 with slot.condition:
@@ -1519,6 +1586,9 @@ class ExpertSlotPool:
             "states": states,
             "pins": pins,
             "metrics": self.metrics.as_dict(),
+            "physical_read_latency_by_layer": (
+                self.metrics.physical_read_latency_by_layer()
+            ),
             "io": self.reader.metrics.as_dict(),
         }
 
