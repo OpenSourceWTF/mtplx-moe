@@ -142,7 +142,12 @@ def _batched_hy3_artifact(tmp_path: Path):
     return root, config, spec, manifest_path
 
 
-def _open_fixture_runtime(tmp_path: Path, *, max_live_kv_tokens: int):
+def _open_fixture_runtime(
+    tmp_path: Path,
+    *,
+    max_live_kv_tokens: int,
+    resource_telemetry: bool = False,
+):
     root, config, spec, manifest_path = _batched_hy3_artifact(tmp_path)
     fixed = spec.resident_bytes + spec.transient_scratch_bytes
     stream_config = ExpertStreamingConfig(
@@ -150,6 +155,7 @@ def _open_fixture_runtime(tmp_path: Path, *, max_live_kv_tokens: int):
         memory_limit_bytes=fixed + spec.persistent_cache_bytes(1),
         max_live_kv_tokens=max_live_kv_tokens,
         runtime_reserve_bytes=0,
+        resource_telemetry=resource_telemetry,
     )
     streaming = ExpertStreamingRuntime.open(
         root,

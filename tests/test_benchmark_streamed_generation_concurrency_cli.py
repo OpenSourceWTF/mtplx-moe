@@ -69,7 +69,11 @@ def test_run_concurrent_repeats_reports_aggregate_and_per_stream_rates(
     from test_streamed_batch import _open_fixture_runtime
 
     module = _load_module()
-    rt, _streaming = _open_fixture_runtime(tmp_path, max_live_kv_tokens=64)
+    rt, _streaming = _open_fixture_runtime(
+        tmp_path,
+        max_live_kv_tokens=64,
+        resource_telemetry=True,
+    )
     try:
         args = SimpleNamespace(
             repeats=1,

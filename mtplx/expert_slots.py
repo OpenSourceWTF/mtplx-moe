@@ -81,6 +81,8 @@ class ExpertSlotMetrics:
     completion_fence_slots: int = 0
     completion_fence_fallbacks: int = 0
     completion_fence_failures: int = 0
+    synchronous_fences: int = 0
+    synchronous_fence_slots: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def update(self, **values: int) -> None:
@@ -109,6 +111,8 @@ class ExpertSlotMetrics:
                     "completion_fence_slots",
                     "completion_fence_fallbacks",
                     "completion_fence_failures",
+                    "synchronous_fences",
+                    "synchronous_fence_slots",
                 )
             }
 
@@ -392,6 +396,7 @@ class ExpertSlotPool:
         verify_hashes: bool = True,
         device_synchronize: Callable[[], None] | None = None,
         cache_scope: str = "layer",
+        resource_telemetry: bool = False,
     ) -> None:
         if plan.model_key != spec.key or manifest.model_key != spec.key:
             raise ValueError("spec, memory plan, and manifest model keys must match")
@@ -421,6 +426,9 @@ class ExpertSlotPool:
         self.prefer_sidecar = prefer_sidecar
         self.verify_hashes = verify_hashes
         self.device_synchronize = device_synchronize
+        if not isinstance(resource_telemetry, bool):
+            raise TypeError("resource_telemetry must be bool")
+        self.resource_telemetry_enabled = resource_telemetry
         if cache_scope not in {"layer", "global"}:
             raise ValueError("cache_scope must be 'layer' or 'global'")
         self.cache_scope = cache_scope
@@ -494,8 +502,12 @@ class ExpertSlotPool:
         workers = max(1, max_inflight_io_bytes // spec.expert_record_bytes)
         workers = min(workers, plan.transient_slots)
         self.max_inflight_io_bytes = workers * spec.expert_record_bytes
-        self._reader_pool_telemetry = PoolOccupancy(worker_capacity=workers)
-        self._completion_fence_telemetry = PoolOccupancy(worker_capacity=1)
+        self._reader_pool_telemetry = (
+            PoolOccupancy(worker_capacity=workers) if resource_telemetry else None
+        )
+        self._completion_fence_telemetry = (
+            PoolOccupancy(worker_capacity=1) if resource_telemetry else None
+        )
         self._executor = ThreadPoolExecutor(
             max_workers=workers,
             thread_name_prefix="mtplx-expert-io",
@@ -567,6 +579,8 @@ class ExpertSlotPool:
                 on_complete()
 
         try:
+            if self._completion_fence_telemetry is None:
+                return self._completion_executor.submit(wait_and_release)
             return self._submit_tracked(
                 self._completion_executor,
                 self._completion_fence_telemetry,
@@ -577,12 +591,15 @@ class ExpertSlotPool:
             # Shutdown races or stripped-down runtimes fail closed: wait on the
             # caller before allowing any generation to be overwritten.
             self.metrics.update(completion_fence_fallbacks=1)
-            self._completion_fence_telemetry.submitted(slot_count)
-            self._run_tracked(
-                self._completion_fence_telemetry,
-                slot_count,
-                wait_and_release,
-            )
+            if self._completion_fence_telemetry is None:
+                wait_and_release()
+            else:
+                self._completion_fence_telemetry.submitted(slot_count)
+                self._run_tracked(
+                    self._completion_fence_telemetry,
+                    slot_count,
+                    wait_and_release,
+                )
             return None
 
     def _record_completion_error(self, error: BaseException) -> None:
@@ -1083,15 +1100,26 @@ class ExpertSlotPool:
                 with self._completion_error_lock:
                     self._raise_completion_error_locked(policy_rollback_safe=True)
                     if use_batch:
-                        future = self._submit_tracked(
-                            self._executor,
-                            self._reader_pool_telemetry,
-                            sum(record.logical_bytes for _, _, record in owned_loads),
-                            self._fill_batch,
-                            tuple(owned_loads),
-                            cancel_event=combined_cancel,
-                            deadline_ns=deadline_ns,
-                        )
+                        if self._reader_pool_telemetry is None:
+                            future = self._executor.submit(
+                                self._fill_batch,
+                                tuple(owned_loads),
+                                cancel_event=combined_cancel,
+                                deadline_ns=deadline_ns,
+                            )
+                        else:
+                            future = self._submit_tracked(
+                                self._executor,
+                                self._reader_pool_telemetry,
+                                sum(
+                                    record.logical_bytes
+                                    for _, _, record in owned_loads
+                                ),
+                                self._fill_batch,
+                                tuple(owned_loads),
+                                cancel_event=combined_cancel,
+                                deadline_ns=deadline_ns,
+                            )
                         admission.mark_accepted()
                         futures.append(future)
                         submitted_loads.update(
@@ -1100,17 +1128,27 @@ class ExpertSlotPool:
                         )
                     else:
                         for slot, generation, record in owned_loads:
-                            future = self._submit_tracked(
-                                self._executor,
-                                self._reader_pool_telemetry,
-                                record.logical_bytes,
-                                self._fill,
-                                slot,
-                                generation,
-                                record,
-                                cancel_event=combined_cancel,
-                                deadline_ns=deadline_ns,
-                            )
+                            if self._reader_pool_telemetry is None:
+                                future = self._executor.submit(
+                                    self._fill,
+                                    slot,
+                                    generation,
+                                    record,
+                                    cancel_event=combined_cancel,
+                                    deadline_ns=deadline_ns,
+                                )
+                            else:
+                                future = self._submit_tracked(
+                                    self._executor,
+                                    self._reader_pool_telemetry,
+                                    record.logical_bytes,
+                                    self._fill,
+                                    slot,
+                                    generation,
+                                    record,
+                                    cancel_event=combined_cancel,
+                                    deadline_ns=deadline_ns,
+                                )
                             admission.mark_accepted()
                             futures.append(future)
                             submitted_loads.add((id(slot), generation))
@@ -1269,7 +1307,7 @@ class ExpertSlotPool:
             with slot.condition:
                 states[slot.state.value] += 1
                 pins += slot.pins
-        return {
+        snapshot = {
             "buffer_backend": self.buffer_backend,
             "io_cache_mode": self.reader.cache_mode,
             "allocated_bytes": self.allocated_bytes,
@@ -1282,13 +1320,21 @@ class ExpertSlotPool:
             "pins": pins,
             "metrics": self.metrics.as_dict(),
             "io": self.reader.metrics.as_dict(),
-            "reader_pool": self._reader_pool_telemetry.snapshot(),
-            "completion_fences": self._completion_fence_telemetry.snapshot(),
         }
+        if self._reader_pool_telemetry is not None:
+            assert self._completion_fence_telemetry is not None
+            snapshot["reader_pool"] = self._reader_pool_telemetry.snapshot()
+            snapshot["completion_fences"] = (
+                self._completion_fence_telemetry.snapshot()
+            )
+        return snapshot
 
     def resource_telemetry_snapshot(self) -> dict[str, Any]:
         """Return cumulative resource counters without draining or walking slots."""
 
+        if self._reader_pool_telemetry is None:
+            raise ExpertSlotError("resource telemetry is disabled")
+        assert self._completion_fence_telemetry is not None
         return {
             "metrics": self.metrics.as_dict(),
             "io": self.reader.metrics.as_dict(),

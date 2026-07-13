@@ -636,6 +636,7 @@ def main() -> int:
         ),
         verify_sidecar_hash_at_open=args.verified_sidecar,
         trace_routes=args.route_trace_json is not None,
+        resource_telemetry=args.resource_telemetry,
     )
     runtime = load(
         root,

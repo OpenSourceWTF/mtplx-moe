@@ -129,6 +129,10 @@ def test_low_overlap_is_reported_as_evidence_not_a_bound_label() -> None:
 def test_completion_backlog_summary_keeps_work_and_slot_occupancy() -> None:
     intervals = _synthetic_intervals(ssd_gib_s=1.0)
     for interval in intervals:
+        interval["completion_tokens"] = 8
+        interval["synchronous_fences"] = 10
+        interval["synchronous_fence_slots"] = 80
+        interval["completion_fence_registrations"] = 2
         interval["completion_fences"] = {
             "mean_queued_work": 0.25,
             "mean_active_work": 0.75,
@@ -152,6 +156,10 @@ def test_completion_backlog_summary_keeps_work_and_slot_occupancy() -> None:
     assert report["completion_fences"]["mean_queued_slots"] == 2.0
     assert report["completion_fences"]["mean_active_slots"] == 6.0
     assert report["completion_fences"]["lifetime_queued_slots_peak"] == 16
+    assert report["completion_fences"]["synchronous_fences"] == 100
+    assert report["completion_fences"]["synchronous_fence_slots"] == 800
+    assert report["completion_fences"]["synchronous_fences_per_token"] == 1.25
+    assert "synchronous_fence_or_evaluation" in report["attribution"]["candidates"]
 
 
 def test_powermetrics_auth_timeout_degrades_without_prompting(

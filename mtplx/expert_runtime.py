@@ -118,6 +118,7 @@ class ExpertStreamingConfig:
     cache_policy: str = "frequency"
     cache_scope: str = "layer"
     bypass_page_cache: bool = False
+    resource_telemetry: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -170,6 +171,7 @@ class ExpertStreamingConfig:
             "prefill_admission",
             "trace_routes",
             "bypass_page_cache",
+            "resource_telemetry",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be bool")
@@ -1141,6 +1143,7 @@ class ExpertStreamingRuntime:
                 ),
                 device_synchronize=device_synchronize,
                 cache_scope=config.cache_scope,
+                resource_telemetry=config.resource_telemetry,
             )
         except Exception:
             reader.close()

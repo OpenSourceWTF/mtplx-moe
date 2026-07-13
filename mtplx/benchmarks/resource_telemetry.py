@@ -102,6 +102,8 @@ def _interval(previous: ResourceTick, current: ResourceTick) -> dict[str, Any] |
     after_io = _mapping(after.get("io"))
     before_cache = _mapping(before.get("cache"))
     after_cache = _mapping(after.get("cache"))
+    before_metrics = _mapping(before.get("metrics"))
+    after_metrics = _mapping(after.get("metrics"))
     reader = _pool_interval(
         _mapping(before.get("reader_pool")),
         _mapping(after.get("reader_pool")),
@@ -156,6 +158,30 @@ def _interval(previous: ResourceTick, current: ResourceTick) -> dict[str, Any] |
         "io_active": io_active,
         "completion_fence_pending": fence_pending,
         "io_and_completion_fence_active": io_active and fence_pending,
+        "completion_fence_registrations": _counter_delta(
+            before_metrics.get("completion_fences"),
+            after_metrics.get("completion_fences"),
+        ),
+        "completion_fence_slots": _counter_delta(
+            before_metrics.get("completion_fence_slots"),
+            after_metrics.get("completion_fence_slots"),
+        ),
+        "completion_fence_fallbacks": _counter_delta(
+            before_metrics.get("completion_fence_fallbacks"),
+            after_metrics.get("completion_fence_fallbacks"),
+        ),
+        "completion_fence_failures": _counter_delta(
+            before_metrics.get("completion_fence_failures"),
+            after_metrics.get("completion_fence_failures"),
+        ),
+        "synchronous_fences": _counter_delta(
+            before_metrics.get("synchronous_fences"),
+            after_metrics.get("synchronous_fences"),
+        ),
+        "synchronous_fence_slots": _counter_delta(
+            before_metrics.get("synchronous_fence_slots"),
+            after_metrics.get("synchronous_fence_slots"),
+        ),
     }
     if _integer(after.get("quant_bits")) == 4:
         result["q4_assignments_per_second"] = expert_requests / span_s
@@ -368,6 +394,24 @@ def summarize_intervals(
     completion_tokens = sum(
         _integer(item.get("completion_tokens")) for item in rows
     )
+    completion_fence_registrations = sum(
+        _integer(item.get("completion_fence_registrations")) for item in rows
+    )
+    completion_fence_slots = sum(
+        _integer(item.get("completion_fence_slots")) for item in rows
+    )
+    completion_fence_fallbacks = sum(
+        _integer(item.get("completion_fence_fallbacks")) for item in rows
+    )
+    completion_fence_failures = sum(
+        _integer(item.get("completion_fence_failures")) for item in rows
+    )
+    synchronous_fences = sum(
+        _integer(item.get("synchronous_fences")) for item in rows
+    )
+    synchronous_fence_slots = sum(
+        _integer(item.get("synchronous_fence_slots")) for item in rows
+    )
     ssd_gib_s = read_bytes / 1024**3 / elapsed if elapsed > 0 else 0.0
     queue_fraction = (
         sum(bool(item.get("reader_queue_nonempty")) for item in rows) / count
@@ -474,6 +518,8 @@ def summarize_intervals(
         and both_fraction < 0.10
     ):
         candidates.append("synchronization_or_insufficient_overlap")
+    if synchronous_fences > 0 and fence_fraction < 0.10:
+        candidates.append("synchronous_fence_or_evaluation")
 
     if ssd_status == "supported":
         attribution = {
@@ -549,6 +595,20 @@ def summarize_intervals(
             ),
         },
         "completion_fences": {
+            "registrations": completion_fence_registrations,
+            "registered_slots": completion_fence_slots,
+            "fallbacks": completion_fence_fallbacks,
+            "failures": completion_fence_failures,
+            "synchronous_fences": synchronous_fences,
+            "synchronous_fence_slots": synchronous_fence_slots,
+            "synchronous_fences_per_second": (
+                synchronous_fences / elapsed if elapsed > 0 else 0.0
+            ),
+            "synchronous_fences_per_token": (
+                synchronous_fences / completion_tokens
+                if completion_tokens
+                else None
+            ),
             "mean_queued_fences": queued_fences,
             "mean_active_fences": active_fences,
             "mean_queued_slots": queued_fence_slots,

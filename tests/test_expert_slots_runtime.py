@@ -352,7 +352,11 @@ def _plan(spec: ExpertStreamingModelSpec):
     )
 
 
-def _open_tiny_runtime(tmp_path: Path) -> ExpertStreamingRuntime:
+def _open_tiny_runtime(
+    tmp_path: Path,
+    *,
+    resource_telemetry: bool = False,
+) -> ExpertStreamingRuntime:
     root, spec, manifest, _expected = _artifact(tmp_path)
     manifest_path = root / "expert-manifest.json"
     save_expert_manifest(manifest, manifest_path)
@@ -363,6 +367,7 @@ def _open_tiny_runtime(tmp_path: Path) -> ExpertStreamingRuntime:
         max_live_kv_tokens=0,
         runtime_reserve_bytes=0,
         verify_artifact_headers=False,
+        resource_telemetry=resource_telemetry,
     )
     return ExpertStreamingRuntime.open(
         root,
@@ -2233,7 +2238,7 @@ def test_resource_snapshot_does_not_call_full_slot_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtime = _open_tiny_runtime(tmp_path)
+    runtime = _open_tiny_runtime(tmp_path, resource_telemetry=True)
 
     def fail_full_snapshot() -> None:
         raise AssertionError("resource telemetry must not take a full slot snapshot")
@@ -2246,6 +2251,35 @@ def test_resource_snapshot_does_not_call_full_slot_snapshot(
         assert "cache_by_layer" in snapshot
     finally:
         runtime.close()
+
+
+def test_resource_telemetry_is_off_the_runtime_hot_path_by_default(
+    tmp_path: Path,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path)
+    try:
+        assert runtime.config.resource_telemetry is False
+        assert runtime.slots._reader_pool_telemetry is None
+        assert runtime.slots._completion_fence_telemetry is None
+        snapshot = runtime.snapshot(mx_module=object())
+        assert "reader_pool" not in snapshot["slots"]
+        assert "completion_fences" not in snapshot["slots"]
+        with pytest.raises(ExpertSlotError, match="resource telemetry is disabled"):
+            runtime.resource_telemetry_snapshot(mx_module=object())
+    finally:
+        runtime.close()
+
+
+def test_resource_telemetry_config_requires_bool() -> None:
+    plan = _plan(_spec())
+    with pytest.raises(TypeError, match="resource_telemetry must be bool"):
+        ExpertStreamingConfig(
+            model_key="tiny-q4",
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            resource_telemetry="yes",
+        )
 
 
 def test_runtime_rolls_back_policy_mapping_after_integrity_failure(

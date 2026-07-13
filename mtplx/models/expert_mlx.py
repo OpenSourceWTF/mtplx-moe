@@ -717,6 +717,12 @@ class HotExpertSwitchGLU(nn.Module):
                 update(**values)
 
         def synchronous_fence(ready: ReadyRoute, values: Any) -> None:
+            if self.runtime.config.resource_telemetry:
+                update_fence_metrics(
+                    ready,
+                    synchronous_fences=1,
+                    synchronous_fence_slots=len(ready.bindings),
+                )
             try:
                 mx.eval(values)
             except BaseException as exc:
