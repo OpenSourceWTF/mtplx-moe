@@ -118,6 +118,7 @@ class ExpertStreamingConfig:
     cache_policy: str = "frequency"
     cache_scope: str = "layer"
     bypass_page_cache: bool = False
+    resource_telemetry: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -170,6 +171,7 @@ class ExpertStreamingConfig:
             "prefill_admission",
             "trace_routes",
             "bypass_page_cache",
+            "resource_telemetry",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be bool")
@@ -1157,6 +1159,7 @@ class ExpertStreamingRuntime:
                 ),
                 device_synchronize=device_synchronize,
                 cache_scope=config.cache_scope,
+                resource_telemetry=config.resource_telemetry,
             )
         except Exception:
             reader.close()
@@ -1921,6 +1924,42 @@ class ExpertStreamingRuntime:
             snapshot["mapped_experts"] = self._mapped_expert_store.snapshot()
         self._raise_if_unhealthy()
         return snapshot
+
+    def resource_telemetry_snapshot(
+        self,
+        *,
+        mx_module: Any | None = None,
+    ) -> dict[str, Any]:
+        """Return cheap cumulative counters for the benchmark sampler."""
+
+        with self._counter_lock:
+            cache = self.counters.as_dict()
+            cache_by_layer = {
+                str(layer): counters.as_dict()
+                for layer, counters in self._layer_counters.items()
+            }
+            cache_by_phase = {
+                phase.value: counters.as_dict()
+                for phase, counters in self._phase_counters.items()
+            }
+            incremental_misses = {
+                "routes": self._incremental_miss_routes,
+                "parts": self._incremental_miss_parts,
+            }
+        # Pool occupancy has independent locks; do not hold the counter lock
+        # across that snapshot.
+        slots = self.slots.resource_telemetry_snapshot()
+        return {
+            "model_key": self.spec.key,
+            "quant_bits": self.spec.quant_bits,
+            "expert_record_bytes": self.spec.expert_record_bytes,
+            "mlx_memory": mlx_memory_telemetry(mx_module),
+            "cache": cache,
+            "cache_by_layer": cache_by_layer,
+            "cache_by_phase": cache_by_phase,
+            "incremental_misses": incremental_misses,
+            **slots,
+        }
 
     def close(self, *, timeout: float | None = None) -> None:
         deadline = None if timeout is None else time.monotonic() + timeout

@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import importlib.metadata
 import importlib.util
+from contextlib import contextmanager
 import json
 import os
 import platform
@@ -28,11 +29,23 @@ from mtplx.expert_manifest import (  # noqa: E402
     resolve_artifact_member,
 )
 from mtplx.expert_runtime import ExpertStreamingConfig, parse_memory_bytes  # noqa: E402
+from mtplx.benchmarks.resource_telemetry import (  # noqa: E402
+    PowermetricsCollector,
+    ResourceRun,
+    ResourceTelemetrySampler,
+)
 from mtplx.runtime import load  # noqa: E402
 
 
 def _positive_int(value: str) -> int:
     parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be positive")
     return parsed
@@ -1114,6 +1127,42 @@ def build_parser() -> argparse.ArgumentParser:
             "condition and contends with in-flight miss loads."
         ),
     )
+    parser.add_argument(
+        "--resource-telemetry",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Capture diagnostic resource throughput, queue occupancy, and "
+            "I/O/Metal overlap. Off by default; enabled runs are diagnostic, "
+            "not headline timing lanes."
+        ),
+    )
+    parser.add_argument(
+        "--resource-sample-interval",
+        type=_positive_float,
+        default=0.25,
+        help="Seconds between cheap resource snapshots (default: 0.25).",
+    )
+    parser.add_argument(
+        "--resource-max-samples",
+        type=_positive_int,
+        default=4096,
+        help="Bounded resource timeline length (default: 4096 samples).",
+    )
+    parser.add_argument(
+        "--ssd-ceiling-gib-s",
+        type=_positive_float,
+        help="Measured SSD ceiling used only for saturation evidence.",
+    )
+    parser.add_argument(
+        "--powermetrics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Add non-interactive per-process CPU/GPU/wait/I/O samples. "
+            "Requires --resource-telemetry and passwordless sudo authorization."
+        ),
+    )
     parser.add_argument("--repeats", type=_positive_int, default=2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--reset-between", action="store_true")
@@ -1336,6 +1385,84 @@ def should_verify_source_records(args: argparse.Namespace, manifest) -> bool:
     return not (args.trust_sidecar and manifest.sidecar is not None)
 
 
+def validate_resource_flags(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> None:
+    if args.resource_max_samples < 2:
+        parser.error("--resource-max-samples must be at least 2")
+    if args.powermetrics and not args.resource_telemetry:
+        parser.error("--powermetrics requires --resource-telemetry")
+    if args.ssd_ceiling_gib_s is not None and not args.resource_telemetry:
+        parser.error("--ssd-ceiling-gib-s requires --resource-telemetry")
+    if args.ssd_ceiling_gib_s is not None and not args.f_nocache:
+        parser.error("--ssd-ceiling-gib-s requires --f-nocache")
+
+
+class _ConcurrentTokenCounter:
+    def __init__(self) -> None:
+        self._counts: dict[str, int] = {}
+
+    def observe(self, state) -> None:
+        for stream in state.live:
+            request_id = str(stream.request_id)
+            self._counts[request_id] = max(
+                self._counts.get(request_id, 0),
+                int(stream.generated_tokens),
+            )
+
+    def finish(self, results) -> None:
+        for result in results:
+            request_id = str(result.request_id)
+            self._counts[request_id] = max(
+                self._counts.get(request_id, 0),
+                len(result.tokens),
+            )
+
+    def count(self) -> int:
+        return sum(self._counts.values())
+
+
+@contextmanager
+def _resource_telemetry(args, runtime, token_count):
+    if not args.resource_telemetry:
+        yield None
+        return
+    sampler = ResourceTelemetrySampler(
+        runtime.expert_resource_telemetry_snapshot,
+        token_count=token_count,
+        interval_s=args.resource_sample_interval,
+        max_samples=args.resource_max_samples,
+    )
+    power = PowermetricsCollector(
+        enabled=args.powermetrics,
+        pid=os.getpid(),
+        interval_ms=max(100, int(args.resource_sample_interval * 1000)),
+    )
+    with power, sampler:
+        yield ResourceRun(sampler=sampler, powermetrics=power)
+
+
+def _attach_resource_report(
+    row: dict,
+    resource_run: ResourceRun | None,
+    *,
+    ssd_ceiling_gib_s: float | None,
+    generation_thread_cpu_ns: int,
+    generation_elapsed_ns: int,
+    final_completion_tokens: int,
+) -> None:
+    if resource_run is None:
+        return
+    row["diagnostic_run"] = True
+    row["resource_telemetry"] = resource_run.report(
+        ssd_ceiling_gib_s=ssd_ceiling_gib_s,
+        generation_thread_cpu_ns=generation_thread_cpu_ns,
+        generation_elapsed_ns=generation_elapsed_ns,
+        final_completion_tokens=final_completion_tokens,
+    )
+
+
 def build_concurrent_requests(
     prompt_ids,
     *,
@@ -1444,6 +1571,7 @@ def _run_concurrent_repeats(
         join_after_step = int(getattr(args, "join_after_step", 2))
         runner_box: list[StreamedBatchRunner] = []
         join_submission_step: int | None = None
+        token_counter = _ConcurrentTokenCounter()
 
         def submit_joiners(state) -> None:
             nonlocal join_submission_step
@@ -1456,23 +1584,35 @@ def _run_concurrent_repeats(
                     runner_box[0].submit(request)
                 join_submission_step = state.step
 
+        def observe_step(state) -> None:
+            token_counter.observe(state)
+            submit_joiners(state)
+
         runner = StreamedBatchRunner(
             runtime,
             max_concurrency=args.concurrency,
             max_prefills_per_step=args.max_prefills_per_step,
-            on_step=submit_joiners if workload_shape == "mixed-join" else None,
+            on_step=observe_step,
         )
         runner_box.append(runner)
         initial_requests = requests[:1] if workload_shape == "mixed-join" else requests
         for request in initial_requests:
             runner.submit(request)
-        started = time.perf_counter()
-        results = runner.run()
+        with _resource_telemetry(
+            args,
+            runtime,
+            token_counter.count,
+        ) as resource_run:
+            started = time.perf_counter()
+            thread_cpu_started = time.thread_time_ns()
+            results = runner.run()
+            token_counter.finish(results)
+            thread_cpu_finished = time.thread_time_ns()
+            finished = time.perf_counter()
         if workload_shape == "mixed-join" and join_submission_step is None:
             raise RuntimeError(
                 "initial stream finished before the mixed-join submission step"
             )
-        finished = time.perf_counter()
         elapsed = finished - started
         after = runtime.expert_streaming_snapshot()
         streams = []
@@ -1539,35 +1679,42 @@ def _run_concurrent_repeats(
             f"{configuration_label}-achieved-B{achieved_peak_concurrency}"
             f"{'-undersubscribed' if undersubscribed else ''}"
         )
-        rows.append(
-            {
-                "repeat": repeat,
-                "elapsed_seconds": elapsed,
-                "prompt_tokens": len(prompt_ids),
-                "run_label": run_label,
-                "configuration_label": configuration_label,
-                "concurrency": args.concurrency,
-                "requested_concurrency": args.concurrency,
-                "achieved_peak_concurrency": achieved_peak_concurrency,
-                "saturation_valid": not undersubscribed,
-                "undersubscribed": undersubscribed,
-                "evidence_label": evidence_label,
-                "cache_scope": args.cache_scope,
-                "slot_layout": args.slot_layout,
-                "execution_lane": "continuous-batch-ar",
-                "workload_shape": workload_shape,
-                "join_submission_step": join_submission_step,
-                "aggregate_completion_tokens": aggregate_tokens,
-                "aggregate_completion_tokens_per_second": (
-                    aggregate_tokens / elapsed if elapsed > 0.0 else 0.0
-                ),
-                "scheduler": scheduler,
-                "timing_summary": timing_summary,
-                "streams": streams,
-                "streaming_before": before,
-                "streaming_after": after,
-            }
+        row = {
+            "repeat": repeat,
+            "elapsed_seconds": elapsed,
+            "prompt_tokens": len(prompt_ids),
+            "run_label": run_label,
+            "configuration_label": configuration_label,
+            "concurrency": args.concurrency,
+            "requested_concurrency": args.concurrency,
+            "achieved_peak_concurrency": achieved_peak_concurrency,
+            "saturation_valid": not undersubscribed,
+            "undersubscribed": undersubscribed,
+            "evidence_label": evidence_label,
+            "cache_scope": args.cache_scope,
+            "slot_layout": args.slot_layout,
+            "execution_lane": "continuous-batch-ar",
+            "workload_shape": workload_shape,
+            "join_submission_step": join_submission_step,
+            "aggregate_completion_tokens": aggregate_tokens,
+            "aggregate_completion_tokens_per_second": (
+                aggregate_tokens / elapsed if elapsed > 0.0 else 0.0
+            ),
+            "scheduler": scheduler,
+            "timing_summary": timing_summary,
+            "streams": streams,
+            "streaming_before": before,
+            "streaming_after": after,
+        }
+        _attach_resource_report(
+            row,
+            resource_run,
+            ssd_ceiling_gib_s=args.ssd_ceiling_gib_s,
+            generation_thread_cpu_ns=thread_cpu_finished - thread_cpu_started,
+            generation_elapsed_ns=int(elapsed * 1e9),
+            final_completion_tokens=aggregate_tokens,
         )
+        rows.append(row)
     return rows
 
 
@@ -1578,6 +1725,7 @@ def _main() -> int:
     global _active_evidence_reservations
     parser = build_parser()
     args = parser.parse_args()
+    validate_resource_flags(parser, args)
     root = args.model_root.expanduser().resolve()
     model_defaults = {
         "glm52-q4": {
@@ -1689,6 +1837,7 @@ def _main() -> int:
         verify_record_hashes=should_verify_source_records(args, validated_manifest),
         verify_sidecar_hash_at_open=args.verified_sidecar,
         trace_routes=args.route_trace_json is not None,
+        resource_telemetry=args.resource_telemetry,
     )
     verification_receipt_dir = args.verification_receipt_dir.expanduser().resolve()
     model_artifact_identity = build_model_artifact_identity(
@@ -1879,28 +2028,36 @@ def _main() -> int:
                         }
                     )
 
-            started = time.perf_counter()
-            with runtime.admit_kv_tokens(len(prompt_ids) + max_tokens):
-                if args.enable_mtp:
-                    # generate_mtp1 exposes accept/reject telemetry through
-                    # generation_stats instead of a token callback.
-                    result = generate_mtp1(
-                        runtime,
-                        prompt_ids,
-                        max_tokens=max_tokens,
-                        sampler=sampler,
-                        seed=args.seed,
-                    )
-                else:
-                    result = generate_ar(
-                        runtime,
-                        prompt_ids,
-                        max_tokens=max_tokens,
-                        sampler=sampler,
-                        seed=args.seed,
-                        token_callback=token_callback,
-                    )
-            finished = time.perf_counter()
+            with _resource_telemetry(
+                args,
+                runtime,
+                lambda: decoded_count,
+            ) as resource_run:
+                started = time.perf_counter()
+                thread_cpu_started = time.thread_time_ns()
+                with runtime.admit_kv_tokens(len(prompt_ids) + max_tokens):
+                    if args.enable_mtp:
+                        # generate_mtp1 exposes accept/reject telemetry through
+                        # generation_stats instead of a token callback.
+                        result = generate_mtp1(
+                            runtime,
+                            prompt_ids,
+                            max_tokens=max_tokens,
+                            sampler=sampler,
+                            seed=args.seed,
+                        )
+                    else:
+                        result = generate_ar(
+                            runtime,
+                            prompt_ids,
+                            max_tokens=max_tokens,
+                            sampler=sampler,
+                            seed=args.seed,
+                            token_callback=token_callback,
+                        )
+                decoded_count = len(result.tokens)
+                thread_cpu_finished = time.thread_time_ns()
+                finished = time.perf_counter()
             elapsed = finished - started
             after = runtime.expert_streaming_snapshot()
             token_ids = [int(token) for token in result.tokens]
@@ -1946,36 +2103,43 @@ def _main() -> int:
                     repeat=repeat,
                     configuration_fingerprint=configuration_fingerprint,
                 )
-            rows.append(
-                {
-                    "repeat": repeat,
-                    "elapsed_seconds": elapsed,
-                    "prompt_tokens": len(prompt_ids),
-                    "run_label": run_label,
-                    "configuration_label": configuration_label,
-                    "concurrency": args.concurrency,
-                    "requested_concurrency": args.concurrency,
-                    "achieved_peak_concurrency": 1,
-                    "saturation_valid": args.concurrency == 1,
-                    "undersubscribed": args.concurrency > 1,
-                    "evidence_label": f"{configuration_label}-achieved-B1",
-                    "cache_scope": args.cache_scope,
-                    "slot_layout": args.slot_layout,
-                    "execution_lane": execution_lane,
-                    "completion_tokens": len(token_ids),
-                    "completion_tokens_per_second": len(token_ids) / elapsed,
-                    "token_ids": token_ids,
-                    "text": result.text,
-                    "response_path": (
-                        str(response_path) if response_path is not None else None
-                    ),
-                    "finish_reason": result.finish_reason,
-                    "rolling_decode": rolling_decode,
-                    "streaming_before": before,
-                    "streaming_after": after,
-                    "generation_stats": result.stats.to_dict(),
-                }
+            row = {
+                "repeat": repeat,
+                "elapsed_seconds": elapsed,
+                "prompt_tokens": len(prompt_ids),
+                "run_label": run_label,
+                "configuration_label": configuration_label,
+                "concurrency": args.concurrency,
+                "requested_concurrency": args.concurrency,
+                "achieved_peak_concurrency": 1,
+                "saturation_valid": args.concurrency == 1,
+                "undersubscribed": args.concurrency > 1,
+                "evidence_label": f"{configuration_label}-achieved-B1",
+                "cache_scope": args.cache_scope,
+                "slot_layout": args.slot_layout,
+                "execution_lane": execution_lane,
+                "completion_tokens": len(token_ids),
+                "completion_tokens_per_second": len(token_ids) / elapsed,
+                "token_ids": token_ids,
+                "text": result.text,
+                "response_path": (
+                    str(response_path) if response_path is not None else None
+                ),
+                "finish_reason": result.finish_reason,
+                "rolling_decode": rolling_decode,
+                "streaming_before": before,
+                "streaming_after": after,
+                "generation_stats": result.stats.to_dict(),
+            }
+            _attach_resource_report(
+                row,
+                resource_run,
+                ssd_ceiling_gib_s=args.ssd_ceiling_gib_s,
+                generation_thread_cpu_ns=thread_cpu_finished - thread_cpu_started,
+                generation_elapsed_ns=int(elapsed * 1e9),
+                final_completion_tokens=len(token_ids),
             )
+            rows.append(row)
     except BaseException:
         evidence_reservations.cleanup()
         raise

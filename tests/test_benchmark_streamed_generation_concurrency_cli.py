@@ -206,7 +206,11 @@ def test_run_concurrent_repeats_reports_aggregate_and_per_stream_rates(
     from test_streamed_batch import _open_fixture_runtime
 
     module = _load_module()
-    rt, _streaming = _open_fixture_runtime(tmp_path, max_live_kv_tokens=64)
+    rt, _streaming = _open_fixture_runtime(
+        tmp_path,
+        max_live_kv_tokens=64,
+        resource_telemetry=True,
+    )
     try:
         args = SimpleNamespace(
             repeats=1,
@@ -218,6 +222,11 @@ def test_run_concurrent_repeats_reports_aggregate_and_per_stream_rates(
             model_key="hy3-q4",
             cache_scope="global",
             slot_layout="component-banks",
+            resource_telemetry=True,
+            resource_sample_interval=0.01,
+            resource_max_samples=128,
+            ssd_ceiling_gib_s=12.5,
+            powermetrics=False,
         )
         configuration_label = "cache-global-layout-component-banks-B2-cfg-fixture"
         rows = module._run_concurrent_repeats(
@@ -262,6 +271,9 @@ def test_run_concurrent_repeats_reports_aggregate_and_per_stream_rates(
         assert row["timing_summary"]["ttft_seconds"]["p50"] > 0.0
         assert row["timing_summary"]["completion_latency_seconds"]["p99"] > 0.0
         assert row["streaming_after"]["live_kv_tokens"] == 0
+        assert row["diagnostic_run"] is True
+        assert row["resource_telemetry"]["schema"] == "mtplx-resource-telemetry-v1"
+        assert row["resource_telemetry"]["sample_count"] >= 2
     finally:
         rt.close()
 
@@ -274,7 +286,11 @@ def test_mixed_join_lane_submits_prefill_while_first_stream_decodes(
     from test_streamed_batch import _open_fixture_runtime
 
     module = _load_module()
-    rt, _streaming = _open_fixture_runtime(tmp_path, max_live_kv_tokens=64)
+    rt, _streaming = _open_fixture_runtime(
+        tmp_path,
+        max_live_kv_tokens=64,
+        resource_telemetry=True,
+    )
     try:
         args = SimpleNamespace(
             repeats=1,
@@ -288,6 +304,11 @@ def test_mixed_join_lane_submits_prefill_while_first_stream_decodes(
             model_key="hy3-q4",
             cache_scope="global",
             slot_layout="component-banks",
+            resource_telemetry=True,
+            resource_sample_interval=0.01,
+            resource_max_samples=128,
+            ssd_ceiling_gib_s=None,
+            powermetrics=False,
         )
         row = module._run_concurrent_repeats(
             args,
@@ -307,6 +328,10 @@ def test_mixed_join_lane_submits_prefill_while_first_stream_decodes(
         assert row["scheduler"]["live_stream_counts"][0:2] == [1, 1]
         assert 2 in row["scheduler"]["live_stream_counts"]
         assert row["achieved_peak_concurrency"] == 2
+        assert row["diagnostic_run"] is True
+        assert row["resource_telemetry"]["throughput"][
+            "final_completion_tokens"
+        ] == sum(stream["completion_tokens"] for stream in row["streams"])
     finally:
         rt.close()
 
@@ -333,6 +358,8 @@ def test_requested_saturation_lanes_report_achieved_peak(
             model_key="hy3-q4",
             cache_scope="global",
             slot_layout="component-banks",
+            resource_telemetry=False,
+            ssd_ceiling_gib_s=None,
         )
         row = module._run_concurrent_repeats(
             args,
@@ -370,6 +397,8 @@ def test_kv_constrained_lane_is_marked_undersubscribed(tmp_path: Path) -> None:
             model_key="hy3-q4",
             cache_scope="global",
             slot_layout="component-banks",
+            resource_telemetry=False,
+            ssd_ceiling_gib_s=None,
         )
         row = module._run_concurrent_repeats(
             args,
@@ -495,3 +524,30 @@ def test_evidence_timing_summary_preserves_any_repeat_undersubscription() -> Non
     assert summary["undersubscribed"] is True
     assert summary["timing_summary"]["undersubscribed"] is True
     assert summary["timing_summary"]["saturation_valid"] is False
+
+
+def test_concurrent_token_counter_never_drops_finished_streams() -> None:
+    from types import SimpleNamespace
+
+    counter = _load_module()._ConcurrentTokenCounter()
+    counter.observe(
+        SimpleNamespace(
+            live=(
+                SimpleNamespace(request_id="a", generated_tokens=2),
+                SimpleNamespace(request_id="b", generated_tokens=3),
+            )
+        )
+    )
+    counter.observe(
+        SimpleNamespace(live=(SimpleNamespace(request_id="b", generated_tokens=4),))
+    )
+
+    assert counter.count() == 6
+
+    counter.finish(
+        [
+            SimpleNamespace(request_id="a", tokens=(1, 2, 3)),
+            SimpleNamespace(request_id="b", tokens=(1, 2, 3, 4, 5)),
+        ]
+    )
+    assert counter.count() == 8

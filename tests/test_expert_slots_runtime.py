@@ -353,6 +353,32 @@ def _plan(spec: ExpertStreamingModelSpec):
     )
 
 
+def _open_tiny_runtime(
+    tmp_path: Path,
+    *,
+    resource_telemetry: bool = False,
+) -> ExpertStreamingRuntime:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=plan.total_limit_bytes,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        verify_artifact_headers=False,
+        resource_telemetry=resource_telemetry,
+    )
+    return ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        config,
+        spec=spec,
+        apply_memory_cap=False,
+    )
+
+
 def _global_plan(spec: ExpertStreamingModelSpec, *, persistent_slots: int = 2):
     fixed = spec.resident_bytes + spec.transient_scratch_bytes
     return plan_expert_memory(
@@ -3692,6 +3718,75 @@ def test_route_trace_producer_assigns_one_monotonic_step_across_routed_layers(
         assert [entry["decode_step"] for entry in reset_trace[-2:]] == [0, 0]
     finally:
         runtime.close()
+
+
+def test_resource_snapshot_does_not_call_full_slot_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path, resource_telemetry=True)
+
+    def fail_full_snapshot() -> None:
+        raise AssertionError("resource telemetry must not take a full slot snapshot")
+
+    monkeypatch.setattr(runtime.slots, "snapshot", fail_full_snapshot)
+    try:
+        snapshot = runtime.resource_telemetry_snapshot(mx_module=object())
+        assert snapshot["reader_pool"]["worker_capacity"] >= 1
+        assert "io" in snapshot
+        assert "cache_by_layer" in snapshot
+    finally:
+        runtime.close()
+
+
+def test_resource_snapshot_holds_counter_lock_while_copying(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path, resource_telemetry=True)
+    original_as_dict = runtime.counters.as_dict
+
+    def assert_counter_lock_held() -> dict[str, int | float]:
+        acquired = runtime._counter_lock.acquire(blocking=False)
+        if acquired:
+            runtime._counter_lock.release()
+        assert acquired is False
+        return original_as_dict()
+
+    monkeypatch.setattr(runtime.counters, "as_dict", assert_counter_lock_held)
+    try:
+        runtime.resource_telemetry_snapshot(mx_module=object())
+    finally:
+        runtime.close()
+
+
+def test_resource_telemetry_is_off_the_runtime_hot_path_by_default(
+    tmp_path: Path,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path)
+    try:
+        assert runtime.config.resource_telemetry is False
+        assert runtime.slots._reader_pool_telemetry is None
+        assert runtime.slots._completion_fence_telemetry is None
+        snapshot = runtime.snapshot(mx_module=object())
+        assert "reader_pool" not in snapshot["slots"]
+        assert "completion_fences" not in snapshot["slots"]
+        with pytest.raises(ExpertSlotError, match="resource telemetry is disabled"):
+            runtime.resource_telemetry_snapshot(mx_module=object())
+    finally:
+        runtime.close()
+
+
+def test_resource_telemetry_config_requires_bool() -> None:
+    plan = _plan(_spec())
+    with pytest.raises(TypeError, match="resource_telemetry must be bool"):
+        ExpertStreamingConfig(
+            model_key="tiny-q4",
+            memory_limit_bytes=plan.total_limit_bytes,
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            resource_telemetry="yes",
+        )
 
 
 def test_runtime_rolls_back_policy_mapping_after_integrity_failure(

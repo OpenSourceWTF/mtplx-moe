@@ -301,7 +301,10 @@ class _OverlapRuntime:
         self.events = events
         self.spec = SimpleNamespace(top_k=1, hidden_size=2, quant_group_size=64)
         self.manifest = SimpleNamespace(sidecar=None)
-        self.config = SimpleNamespace(slot_layout="direct-slots")
+        self.config = SimpleNamespace(
+            slot_layout="direct-slots",
+            resource_telemetry=False,
+        )
 
     def observe_route(self, *_args, **_kwargs) -> None:
         return None
