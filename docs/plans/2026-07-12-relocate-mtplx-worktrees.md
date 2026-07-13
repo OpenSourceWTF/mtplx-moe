@@ -458,6 +458,8 @@ Expected: local ignore active, PR checks green, GPU lock absent, and Qwen unchan
 
 - [x] **Step 5: Mark the plan complete and publish the evidence-only update**
 
-From `$NEW_ACTIVE`, mark all plan checkboxes complete, run `git diff --check`,
-commit only the plan update as `docs: record worktree relocation completion`,
-push, and wait for all PR #32 checks to pass again.
+From `$NEW_ACTIVE`, mark all plan checkboxes complete, include the approved
+active-exception clarification in the design spec, run `git diff --check`,
+commit those two documentation updates as
+`docs: record worktree relocation completion`, push, and wait for all PR #32
+checks to pass again.
