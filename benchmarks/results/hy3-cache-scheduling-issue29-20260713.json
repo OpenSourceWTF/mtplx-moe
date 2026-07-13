@@ -1,15 +1,18 @@
 {
-  "schema": "mtplx.hy3-cache-scheduling.issue29.v2",
+  "schema": "mtplx.hy3-cache-scheduling.issue29.v3",
   "issue": 29,
-  "measured_commit": "aef62bc0e4ff0c716933dd16a2acd0154f112a93",
+  "measured_commit": "bf34a0ad917495db386edb90e27fd1de42da8929",
+  "baseline_commit": "e7669d43a8033e4c0cf4d4aea93563967481be75",
+  "historical_cache_scope_commit": "aef62bc0e4ff0c716933dd16a2acd0154f112a93",
   "serialized_control_commit": "058b40b28de97ddce23184e2c62ed1f41cb6ba2d",
   "base_branch": "experiment/moe-pr13-pr14-stack",
   "decision": {
     "candidate": "global component-bank cache",
-    "promotion_gate_percent": 5.0,
-    "repeated_b1_mean_gain_percent": 4.85811087,
-    "status": "no-go",
-    "reason": "The repeated B1 mean and second paired run missed the 5% throughput gate."
+    "fixed_percentage_gate": "retired as arbitrary and unsupported by a noise model",
+    "rule": "Require identical output, positive paired direction, repeatability small relative to the observed effect, and no material correctness or concurrency regression; collect more pairs when those checks disagree.",
+    "current_repeated_b1_mean_gain_percent": 4.199829813108202,
+    "status": "retain",
+    "reason": "Both current pairs and both historical same-commit cache-scope pairs are positive, current run spread is small relative to the effect, and deterministic output is identical."
   },
   "environment": {
     "machine": "MacBook Pro Mac17,6",
@@ -39,6 +42,80 @@
       "top_k": 1
     },
     "mtp_enabled": false
+  },
+  "current_remeasurement": {
+    "headline_telemetry_enabled": false,
+    "natural_completion_tokens": 1905,
+    "token_ids_sha256": "484e182a68604821f69d56d0b15488d26723e6123f6a57f8158f8b20a4c6ed1c",
+    "pair_order": [
+      "base",
+      "candidate",
+      "candidate",
+      "base"
+    ],
+    "pairs": [
+      {
+        "pair": 1,
+        "base_tokens_per_second": 6.153428987071347,
+        "candidate_tokens_per_second": 6.415852100113637,
+        "gain_percent": 4.264664686854314,
+        "base_elapsed_seconds": 309.58348654099973,
+        "candidate_elapsed_seconds": 296.9208096250004,
+        "base_run": "issue29-headline-base-layer-B1-p01-20260713T132429Z-e7669d43a803",
+        "candidate_run": "issue29-headline-opt-global-B1-p01-20260713T132947Z-bf34a0ad9174"
+      },
+      {
+        "pair": 2,
+        "base_tokens_per_second": 6.1840427367336765,
+        "candidate_tokens_per_second": 6.439772439331545,
+        "gain_percent": 4.1353159006941365,
+        "base_elapsed_seconds": 308.05091120799625,
+        "candidate_elapsed_seconds": 295.8179062920026,
+        "base_run": "issue29-headline-base-layer-B1-p02-20260713T133955Z-e7669d43a803",
+        "candidate_run": "issue29-headline-opt-global-B1-p02-20260713T133452Z-bf34a0ad9174"
+      }
+    ],
+    "mean": {
+      "base_tokens_per_second": 6.168735861902512,
+      "candidate_tokens_per_second": 6.42781226972259,
+      "gain_percent": 4.199829813108202,
+      "base_run_spread_percent": 0.49750715782452826,
+      "candidate_run_spread_percent": 0.37283183659244656
+    }
+  },
+  "resource_diagnostic": {
+    "diagnostic_only": true,
+    "run": "issue29-diag-global-B1-20260713T132054Z-bf34a0ad9174",
+    "generated_tokens": 256,
+    "tokens_per_second": 4.817051628948769,
+    "ssd_ceiling_gib_per_second": 12.47,
+    "reader_gib_per_second": 6.065121035004007,
+    "ssd_ceiling_fraction": 0.48637698757048975,
+    "reader_read_bytes": 346098106368,
+    "reader_bytes_per_token": 1351945728,
+    "logical_reader_operations": 31684,
+    "logical_reader_operations_per_token": 123.765625,
+    "reader_worker_capacity": 32,
+    "mean_active_readers": 3.7320675371608085,
+    "active_capacity_fraction": 0.11662711053627527,
+    "mean_queued_reads": 0.37697449033261016,
+    "queue_nonempty_fraction": 0.9951690821256038,
+    "synchronous_fences": 39910,
+    "synchronous_fences_per_token": 155.8984375,
+    "mean_active_asynchronous_fences": 0.0,
+    "coverage": {
+      "timeline": "complete",
+      "sampling_failures": 0,
+      "gpu": "unavailable",
+      "dram_bandwidth": "unavailable",
+      "simultaneous_io_metal_overlap": "not measured"
+    },
+    "attribution": {
+      "status": "incomplete",
+      "candidates": [
+        "synchronous_fence_or_evaluation"
+      ]
+    }
   },
   "repeated_b1": {
     "max_tokens": 2048,
@@ -240,7 +317,9 @@
     "scope": "Python transaction bookkeeping only; not an end-to-end model throughput claim"
   },
   "verification": {
-    "full_pytest": "passed at 100% on serialized-control commit 058b40b with existing skips and deprecation warnings",
+    "full_pytest": "passed at 100% on bf34a0a with existing skips and deprecation warnings",
+    "independent_reviews": "two post-fix reviews passed; telemetry-disabled static, mixed-join, and reference lanes retain their predecessor timing operations",
+    "diagnostic_sampling": "208 samples, zero drops, zero sampling failures, complete timeline",
     "focused_exact_rollback_cases": 5000,
     "focused_partial_admission_cases": 3000,
     "randomized_state_transitions": 144000,

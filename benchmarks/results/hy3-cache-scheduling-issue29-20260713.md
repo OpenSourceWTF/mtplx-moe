@@ -1,12 +1,40 @@
 # Hy3 cache scheduling experiment (#29)
 
-The cache-policy comparison was measured at `aef62bc0e4ff0c716933dd16a2acd0154f112a93` on an Apple M5 Max with 128 GB unified memory. A conservative serialized control was later measured at `058b40b28de97ddce23184e2c62ed1f41cb6ba2d` and rejected because its resource-wide exclusion premise was not established. All runs use the same Hy3 Q4 artifact, deterministic AR generation, component-bank layout, LRU policy, 7,821 persistent slots, 32 transient slots, and an exact 83,034,243,072-byte expert-cache ceiling.
+The current immediate-predecessor comparison measures default `e7669d43a8033e4c0cf4d4aea93563967481be75` against #29 head `bf34a0ad917495db386edb90e27fd1de42da8929` on an Apple M5 Max with 128 GB unified memory. Earlier same-commit cache-scope measurements at `aef62bc0e4ff0c716933dd16a2acd0154f112a93` remain useful isolation evidence. A conservative serialized control at `058b40b28de97ddce23184e2c62ed1f41cb6ba2d` was rejected because its resource-wide exclusion premise was not established. All comparable headline runs use the same Hy3 Q4 artifact, deterministic AR generation, component-bank layout, LRU policy, 7,821 persistent slots, 32 transient slots, and an exact 83,034,243,072-byte expert-cache ceiling.
 
 ## Decision
 
-**No-go for promoting the global component-bank cache on performance.** The repeated B1 mean gain is 4.858%, below the issue's 5% gate, and the second paired run reaches only 4.674%. Static B2/B4/B8 gains are 2.02%, 3.06%, and 2.86%; the mixed prefill/decode B4 gain is 1.26%.
+**Retain #29.** The fixed 5% promotion gate is retired: it had no empirical noise model or causal basis. The replacement rule requires identical output, positive paired direction, repeatability small relative to the observed effect, and no material correctness or concurrency regression. If those checks disagree, collect more pairs rather than deciding from a fixed percentage.
 
-The bounded transaction-journal refactor remains useful independently. It removes an accidental O(cache capacity) Python snapshot from every global route while preserving exact rollback behavior. The global allocation also cuts physical expert reads, but the saved I/O does not produce enough end-to-end throughput to cross the promotion threshold.
+The current telemetry-off pairs are +4.265% and +4.135%, with a +4.200% mean. Base run spread is 0.498% and #29 spread is 0.373%, while all four runs stop at 1,905 tokens with the same SHA-256 `484e182a68604821f69d56d0b15488d26723e6123f6a57f8158f8b20a4c6ed1c`. The earlier same-commit cache-scope pairs were also positive (+5.043% and +4.674%). This is repeatable positive evidence, not a universal throughput guarantee.
+
+The bounded transaction-journal refactor remains useful independently. It removes an accidental O(cache capacity) Python snapshot from every global route while preserving exact rollback behavior. The global allocation also cuts physical expert reads; the end-to-end effect is modest but repeatable under the matched protocol.
+
+## Current immediate-predecessor headline
+
+Resource telemetry, rolling slot snapshots, and Qwen were disabled during the timed lanes. The pair order was base/global/global/base to expose drift.
+
+| Pair | Default layer tok/s | #29 global tok/s | Gain | Default elapsed | #29 elapsed |
+|---|---:|---:|---:|---:|---:|
+| 1 | 6.1534 | 6.4159 | +4.265% | 309.583 s | 296.921 s |
+| 2, reverse order | 6.1840 | 6.4398 | +4.135% | 308.051 s | 295.818 s |
+| Mean | **6.1687** | **6.4278** | **+4.200%** | - | - |
+
+## New resource diagnostic
+
+A separate 256-token diagnostic at `bf34a0a` used the same #29 global-cache configuration with `--resource-telemetry --ssd-ceiling-gib-s 12.47`. Its 4.817 tok/s is not headline timing evidence.
+
+| Signal | Measurement | Interpretation boundary |
+|---|---:|---|
+| Uncached reader throughput | 6.065 GiB/s (48.64% of supplied ceiling) | Device ceiling was not reached |
+| Mean active readers | 3.732 / 32 (11.66%) | Reader pool had substantial unused capacity |
+| Mean queued reads | 0.377 | Queue was shallow |
+| Queue-nonempty intervals | 99.52% | Work was usually present despite shallow depth |
+| Logical reader operations | 31,684 (123.77/token) | Reader jobs, not kernel syscall count |
+| Synchronous fences | 39,910 (155.90/token) | Operation count; it does not prove fence wall-time dominance |
+| Asynchronous fence occupancy | 0.0 mean active fences | The diagnostic could not measure simultaneous I/O/Metal overlap |
+
+GPU and DRAM-bandwidth coverage were unavailable. Attribution therefore remains `incomplete`; the report routes follow-up toward fence/evaluation placement and increasing useful read concurrency without asserting either as the bottleneck.
 
 ## Rejected serialized-control premise
 
@@ -24,7 +52,7 @@ The corrected layer-scope B1 control retained exact output parity: both repeats 
 
 The serialized-control mean is 51.587% below the original layer mean of 6.1027 tok/s while reading the same 1,768,689,893,376 expert bytes in repeat 1. It documents the cost of draining all misses before compute, but it does not establish that the original schedule was unsafe. The remaining serialized global and paired arms were stopped because the control itself was not viable. A prior 458-token launch omitted `--chat`; it is retained locally as harness-debugging evidence and excluded from every comparison.
 
-## Repeated long B1 headline
+## Historical same-commit cache-scope headline
 
 Each run stopped naturally after the same 1,905 generated tokens. All four outputs have SHA-256 `484e182a68604821f69d56d0b15488d26723e6123f6a57f8158f8b20a4c6ed1c`.
 
@@ -34,7 +62,7 @@ Each run stopped naturally after the same 1,905 generated tokens. All four outpu
 | 2, reverse order | 6.1121 | 6.3978 | 4.674% | 14.786 s | 14.854 s |
 | Mean | 6.1027 | 6.3991 | **4.858%** | - | - |
 
-Run spread is 0.311% for layer scope and 0.042% for global scope. This is stable enough to make the missed gate meaningful rather than treating it as run noise.
+Run spread is 0.311% for layer scope and 0.042% for global scope. Both paired directions are positive; the former fixed 5% cutoff is no longer used to discard that evidence.
 
 Pair 1 cache economics:
 
@@ -120,8 +148,10 @@ For mixed traffic, change `--workload-shape static` to `--workload-shape mixed-j
 
 ## Verification and limits
 
-- Full `pytest -q` reached 100% at serialized-control commit `058b40b`; only pre-existing skips and deprecation warnings remained.
+- Full `pytest -q` reached 100% at current head `bf34a0a`; only pre-existing skips and deprecation warnings remained.
+- Two independent post-fix reviews passed. They specifically verified that telemetry-disabled static, mixed-join, AR-reference, and MTP-reference timed regions retain their predecessor operations.
 - Ruff passed on every changed Python file.
 - Qwen was stopped only for the exclusive MLX window, then restored with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tea.qwen.plist`. `launchctl print gui/$(id -u)/com.tea.qwen` reported the service running and `/v1/models` returned `mtplx-qwen36-27b-optimized-speed`.
-- `sudo` was unavailable for `powermetrics`. Process samples during the optimized global run averaged roughly 55-57% CPU and 82.7 GiB RSS; instantaneous `ioreg` samples showed 0% GPU during the sampled I/O-heavy intervals. These are not full-run GPU-utilization claims.
+- The new diagnostic retained 208 samples with zero drops and zero sampler failures. GPU and DRAM bandwidth remained unavailable; neither is treated as zero.
+- Historical process samples averaged roughly 55-57% CPU and 82.7 GiB RSS; instantaneous `ioreg` samples showed 0% GPU during sampled I/O-heavy intervals. These are not full-run GPU-utilization claims.
 - This issue is AR-only. MTP, kernels, serialization changes, KV precision, sidecars beyond the existing verified artifact, and lower-bit tiers are out of scope.
