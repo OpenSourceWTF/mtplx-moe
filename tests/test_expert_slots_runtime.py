@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from mtplx import expert_runtime as expert_runtime_module
+from mtplx import expert_slots as expert_slots_module
 from mtplx.expert_io import (
     ExpertIOCancelled,
     ExpertIOError,
@@ -24,6 +26,7 @@ from mtplx.expert_manifest import (
     TensorSegment,
     save_expert_manifest,
 )
+from mtplx.resource_metrics import ExpertPipelineRoute
 from mtplx.expert_runtime import (
     ExpertStreamingConfig,
     ExpertStreamingConfigurationError,
@@ -3773,6 +3776,691 @@ def test_resource_telemetry_is_off_the_runtime_hot_path_by_default(
         assert "completion_fences" not in snapshot["slots"]
         with pytest.raises(ExpertSlotError, match="resource telemetry is disabled"):
             runtime.resource_telemetry_snapshot(mx_module=object())
+    finally:
+        runtime.close()
+
+
+def test_pipeline_telemetry_off_preserves_constructor_keyword_shapes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, manifest, _expected = _artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=plan.total_limit_bytes,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        verify_artifact_headers=False,
+    )
+    constructor_kwargs: dict[str, dict[str, object]] = {}
+    original_reader = expert_runtime_module.PositionalExpertReader
+    original_pool = expert_runtime_module.ExpertSlotPool
+
+    def recording_reader(*args, **kwargs):
+        constructor_kwargs["reader"] = dict(kwargs)
+        return original_reader(*args, **kwargs)
+
+    def recording_pool(*args, **kwargs):
+        constructor_kwargs["pool"] = dict(kwargs)
+        return original_pool(*args, **kwargs)
+
+    class RecordingRuntime(ExpertStreamingRuntime):
+        def __init__(self, *args, **kwargs) -> None:
+            constructor_kwargs["runtime"] = dict(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(
+        expert_runtime_module,
+        "PositionalExpertReader",
+        recording_reader,
+    )
+    monkeypatch.setattr(expert_runtime_module, "ExpertSlotPool", recording_pool)
+    runtime = RecordingRuntime.open(
+        root,
+        manifest_path,
+        config,
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    try:
+        assert set(constructor_kwargs) == {"reader", "pool", "runtime"}
+        assert all(
+            "pipeline_ledger" not in kwargs for kwargs in constructor_kwargs.values()
+        )
+    finally:
+        runtime.close()
+
+
+def test_pipeline_split_route_counts_unique_loads_exact_bytes_and_phase(
+    tmp_path: Path,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path, resource_telemetry=True)
+    record = runtime.manifest.record(1, 0)
+    try:
+        with runtime.begin_split_route(1, [0, 0], phase="decode") as pending:
+            ready = pending.finish_misses()
+            assert ready is not None
+            try:
+                pending.claim_misses(ready)
+            finally:
+                pending.release_misses(ready)
+
+        pipeline = runtime.resource_telemetry_snapshot(mx_module=object())[
+            "expert_pipeline"
+        ]
+        assert pipeline["counters"]["logical_record_jobs"] == 1
+        assert pipeline["counters"]["logical_record_bytes"] == record.logical_bytes
+        assert pipeline["counters"]["accepted_record_jobs"] == 1
+        assert pipeline["counters"]["claimed_record_jobs"] == 1
+        decode = pipeline["by_phase"]["decode"]
+        assert decode["counters"]["logical_record_jobs"] == 1
+        assert decode["counters"]["started_logical_range_bytes"] == record.logical_bytes
+        assert (
+            pipeline["by_phase"]["unscoped"]["counters"]["started_logical_ranges"] == 0
+        )
+    finally:
+        runtime.close()
+
+
+def test_pipeline_reader_can_finish_before_submit_returns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path, resource_telemetry=True)
+    original_submit = runtime.slots._executor.submit
+    original_attempted = ExpertPipelineRoute.submission_attempted
+    original_started = ExpertPipelineRoute.reader_started
+    original_completed = ExpertPipelineRoute.reader_completed
+    original_accepted = ExpertPipelineRoute.submission_accepted
+    events: list[str] = []
+
+    def attempted(self, experts) -> None:
+        events.append("attempted")
+        original_attempted(self, experts)
+
+    def started(self, experts) -> None:
+        events.append("started")
+        original_started(self, experts)
+
+    def completed(self, experts, *, thread_cpu_ns) -> None:
+        events.append("completed")
+        original_completed(self, experts, thread_cpu_ns=thread_cpu_ns)
+
+    def accepted(self, experts) -> None:
+        events.append("accepted")
+        original_accepted(self, experts)
+
+    def finish_before_return(fn, *args, **kwargs):
+        future = original_submit(fn, *args, **kwargs)
+        future.result(timeout=2)
+        return future
+
+    monkeypatch.setattr(runtime.slots._executor, "submit", finish_before_return)
+    monkeypatch.setattr(ExpertPipelineRoute, "submission_attempted", attempted)
+    monkeypatch.setattr(ExpertPipelineRoute, "reader_started", started)
+    monkeypatch.setattr(ExpertPipelineRoute, "reader_completed", completed)
+    monkeypatch.setattr(ExpertPipelineRoute, "submission_accepted", accepted)
+    try:
+        with runtime.begin_split_route(1, [0], phase="decode") as pending:
+            ready = pending.finish_misses()
+            assert ready is not None
+            try:
+                pending.claim_misses(ready)
+            finally:
+                pending.release_misses(ready)
+
+        pipeline = runtime.resource_telemetry_snapshot(mx_module=object())[
+            "expert_pipeline"
+        ]
+        assert pipeline["counters"]["accepted_submissions"] == 1
+        assert pipeline["counters"]["started_reader_tasks"] == 1
+        assert pipeline["counters"]["completed_reader_tasks"] == 1
+        assert pipeline["counters"]["verified_record_jobs"] == 1
+        assert pipeline["invariant_failures"] == 0
+        assert all(value == 0 for value in pipeline["gauges"].values())
+        assert events == ["attempted", "started", "completed", "accepted"]
+    finally:
+        runtime.close()
+
+
+def test_pipeline_reader_submit_rejection_restores_provisional_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path, resource_telemetry=True)
+    submit_error = ValueError("injected pipeline reader submit rejection")
+
+    def reject_submit(*_args, **_kwargs):
+        raise submit_error
+
+    monkeypatch.setattr(runtime.slots._executor, "submit", reject_submit)
+    pending = runtime.begin_split_route(1, [0], phase="decode")
+    try:
+        with pytest.raises(ValueError, match="pipeline reader submit") as failed:
+            pending.finish_misses()
+        assert failed.value is submit_error
+    finally:
+        pending.close()
+    try:
+        pipeline = runtime.resource_telemetry_snapshot(mx_module=object())[
+            "expert_pipeline"
+        ]
+        assert pipeline["counters"]["submission_attempts"] == 1
+        assert pipeline["counters"]["accepted_submissions"] == 0
+        assert pipeline["counters"]["submission_rejections"] == 1
+        assert pipeline["counters"]["abandoned_record_jobs"] == 1
+        assert pipeline["coverage"]["attribution"] == "incomplete"
+        assert all(value == 0 for value in pipeline["gauges"].values())
+    finally:
+        runtime.close()
+
+
+def test_pipeline_reader_failure_clears_active_state_and_preserves_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path, resource_telemetry=True)
+    read_error = RuntimeError("injected pipeline reader failure")
+
+    def fail_read(*_args, **_kwargs):
+        raise read_error
+
+    monkeypatch.setattr(runtime.reader, "read_record_into", fail_read)
+    pending = runtime.begin_split_route(1, [0], phase="decode")
+    try:
+        with pytest.raises(RuntimeError, match="pipeline reader failure") as failed:
+            pending.finish_misses()
+        assert failed.value is read_error
+    finally:
+        pending.close()
+    try:
+        pipeline = runtime.resource_telemetry_snapshot(mx_module=object())[
+            "expert_pipeline"
+        ]
+        assert pipeline["counters"]["failed_reader_tasks"] == 1
+        assert pipeline["counters"]["failed_record_jobs"] == 1
+        assert pipeline["counters"]["verified_record_jobs"] == 0
+        assert pipeline["counters"]["runnable_record_jobs"] == 0
+        assert pipeline["counters"]["claimed_record_jobs"] == 0
+        assert pipeline["counters"]["abandoned_record_jobs"] == 1
+        assert all(value == 0 for value in pipeline["gauges"].values())
+    finally:
+        runtime.close()
+
+
+def test_pipeline_thread_cpu_clock_failure_does_not_change_successful_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path, resource_telemetry=True)
+
+    def fail_clock() -> int:
+        raise RuntimeError("injected thread CPU clock failure")
+
+    monkeypatch.setattr(expert_slots_module.time, "thread_time_ns", fail_clock)
+    try:
+        with runtime.begin_split_route(1, [0], phase="decode") as pending:
+            ready = pending.finish_misses()
+            assert ready is not None
+            try:
+                pending.claim_misses(ready)
+            finally:
+                pending.release_misses(ready)
+        pipeline = runtime.resource_telemetry_snapshot(mx_module=object())[
+            "expert_pipeline"
+        ]
+        assert pipeline["coverage"]["attribution"] == "incomplete"
+        assert pipeline["counters"]["diagnostic_hook_failures"] >= 1
+    finally:
+        runtime.close()
+
+
+def test_pipeline_terminal_cpu_clock_failure_does_not_mask_reader_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path, resource_telemetry=True)
+    read_error = RuntimeError("original reader error after clock start")
+    clock_calls = 0
+
+    def fail_terminal_clock() -> int:
+        nonlocal clock_calls
+        clock_calls += 1
+        if clock_calls == 1:
+            return 10
+        raise RuntimeError("injected terminal CPU clock failure")
+
+    def fail_read(*_args, **_kwargs):
+        raise read_error
+
+    monkeypatch.setattr(
+        expert_slots_module.time,
+        "thread_time_ns",
+        fail_terminal_clock,
+    )
+    monkeypatch.setattr(runtime.reader, "read_record_into", fail_read)
+    pending = runtime.begin_split_route(1, [0], phase="decode")
+    try:
+        with pytest.raises(RuntimeError, match="original reader error") as failed:
+            pending.finish_misses()
+        assert failed.value is read_error
+    finally:
+        pending.close()
+    try:
+        pipeline = runtime.resource_telemetry_snapshot(mx_module=object())[
+            "expert_pipeline"
+        ]
+        assert pipeline["coverage"]["attribution"] == "incomplete"
+        assert pipeline["counters"]["diagnostic_hook_failures"] >= 1
+    finally:
+        runtime.close()
+
+
+def test_pipeline_verified_record_waits_for_ready_route_construction(
+    tmp_path: Path,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path, resource_telemetry=True)
+    construction_paused = threading.Event()
+    continue_construction = threading.Event()
+
+    def pause_before_ready(stage: str) -> None:
+        if stage == "after_pins_tuple":
+            construction_paused.set()
+            assert continue_construction.wait(timeout=2)
+
+    runtime.slots._route_setup_test_hook = pause_before_ready
+    pending = runtime.begin_split_route(1, [0], phase="decode")
+    try:
+        assert construction_paused.wait(timeout=2)
+        paused = runtime.resource_telemetry_snapshot(mx_module=object())[
+            "expert_pipeline"
+        ]
+        assert paused["counters"]["verified_record_jobs"] == 1
+        assert paused["gauges"]["verified_not_runnable_records"] == 1
+        assert paused["gauges"]["runnable_miss_records"] == 0
+        assert paused["gauges"]["active_reader_tasks"] == 0
+
+        continue_construction.set()
+        ready = pending.finish_misses()
+        assert ready is not None
+        runnable = runtime.resource_telemetry_snapshot(mx_module=object())[
+            "expert_pipeline"
+        ]
+        assert runnable["gauges"]["verified_not_runnable_records"] == 0
+        assert runnable["gauges"]["runnable_miss_records"] == 1
+        try:
+            pending.claim_misses(ready)
+        finally:
+            pending.release_misses(ready)
+    finally:
+        continue_construction.set()
+        pending.close()
+        runtime.close()
+
+
+def test_pipeline_deduplicated_load_is_satisfied_only_after_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path, resource_telemetry=True)
+    ledger = getattr(runtime, "_pipeline_ledger", None)
+    if ledger is None:
+        runtime.close()
+    assert ledger is not None
+    record = runtime.manifest.record(1, 0)
+    plan = _manual_plan(0, runtime.plan.slots_per_layer)
+    first_route = ledger.begin_route(
+        layer=1,
+        phase="decode",
+        load_experts=(0,),
+        load_logical_bytes=(record.logical_bytes,),
+    )
+    second_route = ledger.begin_route(
+        layer=1,
+        phase="decode",
+        load_experts=(0,),
+        load_logical_bytes=(record.logical_bytes,),
+    )
+    transient_slot = runtime.plan.slots_per_layer
+    slot = runtime.slots._physical(1, transient_slot)
+    slot.condition = threading.Condition(threading.Lock())
+    original_observe = second_route.observe_block
+    observed_outside: list[bool] = []
+
+    def observe_outside(expert, reason, *, elapsed_ns):
+        acquired = slot.condition.acquire(blocking=False)
+        observed_outside.append(acquired)
+        if acquired:
+            slot.condition.release()
+        original_observe(expert, reason, elapsed_ns=elapsed_ns)
+
+    second_route.observe_block = observe_outside  # type: ignore[method-assign]
+    read_started = threading.Event()
+    continue_read = threading.Event()
+    original_read = runtime.reader.read_record_into
+
+    def block_read(*args, **kwargs):
+        read_started.set()
+        assert continue_read.wait(timeout=2)
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(runtime.reader, "read_record_into", block_read)
+    first_ready = None
+    second_ready = None
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            runtime.slots.ensure_route_part,
+            1,
+            plan,
+            pipeline_route=first_route,
+        )
+        assert read_started.wait(timeout=2)
+        second = executor.submit(
+            runtime.slots.ensure_route_part,
+            1,
+            plan,
+            pipeline_route=second_route,
+        )
+        deadline = time.monotonic() + 2
+        while runtime.slots.metrics.as_dict()["load_waits"] < 1:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        before_ready = ledger.snapshot()
+        assert before_ready["counters"]["satisfied_without_submit_record_jobs"] == 0
+        continue_read.set()
+        first_ready = first.result(timeout=2)
+        second_ready = second.result(timeout=2)
+    try:
+        snapshot = ledger.snapshot()
+        assert snapshot["counters"]["accepted_record_jobs"] == 1
+        assert snapshot["counters"]["satisfied_without_submit_record_jobs"] == 1
+        assert snapshot["counters"]["runnable_record_jobs"] == 2
+        assert snapshot["block_counts"]["slot_loading"] >= 1
+        assert snapshot["block_ns"]["slot_loading"] > 0
+        assert snapshot["block_counts"]["pin_held"] == 0
+        assert snapshot["block_ns"]["pin_held"] == 0
+        assert observed_outside and all(observed_outside)
+        first_route.claim_misses((0,))
+        second_route.claim_misses((0,))
+    finally:
+        continue_read.set()
+        if first_ready is not None:
+            first_ready.release(synchronize=False)
+        if second_ready is not None:
+            second_ready.release(synchronize=False)
+        first_route.close()
+        second_route.close()
+        runtime.close()
+
+
+def test_pipeline_pin_wait_is_published_outside_slot_condition(
+    tmp_path: Path,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path, resource_telemetry=True)
+    ledger = getattr(runtime, "_pipeline_ledger", None)
+    if ledger is None:
+        runtime.close()
+    assert ledger is not None
+    transient_slot = runtime.plan.slots_per_layer
+    slot = runtime.slots._physical(1, transient_slot)
+    slot.condition = threading.Condition(threading.Lock())
+    held = runtime.slots.ensure_route_part(1, _manual_plan(0, transient_slot))
+    record = runtime.manifest.record(1, 1)
+    route = ledger.begin_route(
+        layer=1,
+        phase="decode",
+        load_experts=(1,),
+        load_logical_bytes=(record.logical_bytes,),
+    )
+    original_observe = route.observe_block
+    observed_outside: list[bool] = []
+
+    def observe_outside(expert, reason, *, elapsed_ns):
+        acquired = slot.condition.acquire(blocking=False)
+        observed_outside.append(acquired)
+        if acquired:
+            slot.condition.release()
+        original_observe(expert, reason, elapsed_ns=elapsed_ns)
+
+    route.observe_block = observe_outside  # type: ignore[method-assign]
+    replacement = None
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(
+            runtime.slots.ensure_route_part,
+            1,
+            _manual_plan(1, transient_slot),
+            pipeline_route=route,
+        )
+        deadline = time.monotonic() + 2
+        while runtime.slots.metrics.as_dict()["pin_waits"] < 1:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        held.release(synchronize=False)
+        replacement = pending.result(timeout=2)
+    try:
+        snapshot = ledger.snapshot()
+        assert snapshot["block_counts"]["pin_held"] >= 1
+        assert snapshot["block_ns"]["pin_held"] > 0
+        assert snapshot["block_counts"]["slot_loading"] == 0
+        assert snapshot["block_ns"]["slot_loading"] == 0
+        assert observed_outside and all(observed_outside)
+        route.claim_misses((1,))
+    finally:
+        if replacement is not None:
+            replacement.release(synchronize=False)
+        route.close()
+        runtime.close()
+
+
+def test_pipeline_block_clock_failure_does_not_skip_pin_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path, resource_telemetry=True)
+    ledger = runtime._pipeline_ledger
+    assert ledger is not None
+    transient_slot = runtime.plan.slots_per_layer
+    held = runtime.slots.ensure_route_part(1, _manual_plan(0, transient_slot))
+    record = runtime.manifest.record(1, 1)
+    route = ledger.begin_route(
+        layer=1,
+        phase="decode",
+        load_experts=(1,),
+        load_logical_bytes=(record.logical_bytes,),
+    )
+    original_clock = expert_slots_module.time.monotonic_ns
+    clock_calls = 0
+
+    def fail_first_clock() -> int:
+        nonlocal clock_calls
+        clock_calls += 1
+        if clock_calls == 1:
+            raise RuntimeError("injected block timing clock failure")
+        return original_clock()
+
+    monkeypatch.setattr(
+        expert_slots_module.time,
+        "monotonic_ns",
+        fail_first_clock,
+    )
+    replacement = None
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                runtime.slots.ensure_route_part,
+                1,
+                _manual_plan(1, transient_slot),
+                pipeline_route=route,
+            )
+            deadline = time.monotonic() + 2
+            while runtime.slots.metrics.as_dict()["pin_waits"] < 1:
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            try:
+                assert future.done() is False
+            finally:
+                held.release(synchronize=False)
+            replacement = future.result(timeout=2)
+        route.claim_misses((1,))
+        snapshot = ledger.snapshot()
+        assert snapshot["coverage"]["attribution"] == "incomplete"
+        assert snapshot["counters"]["diagnostic_hook_failures"] >= 1
+    finally:
+        if replacement is not None:
+            replacement.release(synchronize=False)
+        route.close()
+        runtime.close()
+
+
+def test_pipeline_route_stays_open_until_running_split_future_settles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path, resource_telemetry=True)
+    future: Future[ReadyRoute] = Future()
+    assert future.set_running_or_notify_cancel()
+    monkeypatch.setattr(runtime._split_executor, "submit", lambda *_a, **_k: future)
+
+    pending = runtime.begin_split_route(1, [0], phase="decode")
+    try:
+        pending.close()
+        before_settle = runtime.resource_telemetry_snapshot(mx_module=object())[
+            "expert_pipeline"
+        ]
+        assert before_settle["gauges"]["open_routes"] == 1
+        assert before_settle["gauges"]["eligible_unsubmitted_records"] == 1
+        assert before_settle["counters"]["abandoned_record_jobs"] == 0
+        layer_lock = runtime._layer_locks[1]
+        assert layer_lock.acquire(blocking=False) is False
+
+        future.set_exception(RuntimeError("injected running outer future failure"))
+        after_settle = runtime.resource_telemetry_snapshot(mx_module=object())[
+            "expert_pipeline"
+        ]
+        assert after_settle["counters"]["abandoned_record_jobs"] == 1
+        assert all(value == 0 for value in after_settle["gauges"].values())
+        assert layer_lock.acquire(timeout=2)
+        layer_lock.release()
+    finally:
+        if not future.done():
+            future.set_exception(RuntimeError("test cleanup"))
+        pending.close()
+        runtime.close()
+
+
+def test_pipeline_hook_failure_does_not_change_successful_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path, resource_telemetry=True)
+    expected = runtime.manifest.record(1, 0).sha256
+
+    def fail_runnable(_self, _expert):
+        raise RuntimeError("injected record-runnable diagnostic failure")
+
+    monkeypatch.setattr(ExpertPipelineRoute, "record_runnable", fail_runnable)
+    try:
+        with runtime.begin_split_route(1, [0], phase="decode") as pending:
+            ready = pending.finish_misses()
+            assert ready is not None
+            assert ready.bindings[0].record.sha256 == expected
+            try:
+                pending.claim_misses(ready)
+            finally:
+                pending.release_misses(ready)
+        pipeline = runtime.resource_telemetry_snapshot(mx_module=object())[
+            "expert_pipeline"
+        ]
+        assert pipeline["coverage"]["attribution"] == "incomplete"
+        assert pipeline["counters"]["diagnostic_hook_failures"] >= 1
+    finally:
+        runtime.close()
+
+
+def test_pipeline_hook_failure_does_not_mask_original_reader_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path, resource_telemetry=True)
+    read_error = RuntimeError("original reader failure")
+
+    def fail_read(*_args, **_kwargs):
+        raise read_error
+
+    def fail_reader_diagnostic(self, experts, *, thread_cpu_ns=0):
+        raise RuntimeError("secondary reader diagnostic failure")
+
+    monkeypatch.setattr(runtime.reader, "read_record_into", fail_read)
+    monkeypatch.setattr(ExpertPipelineRoute, "reader_failed", fail_reader_diagnostic)
+    pending = runtime.begin_split_route(1, [0], phase="decode")
+    try:
+        with pytest.raises(RuntimeError, match="original reader failure") as failed:
+            pending.finish_misses()
+        assert failed.value is read_error
+    finally:
+        pending.close()
+    try:
+        pipeline = runtime.resource_telemetry_snapshot(mx_module=object())[
+            "expert_pipeline"
+        ]
+        assert pipeline["coverage"]["attribution"] == "incomplete"
+        assert pipeline["counters"]["diagnostic_hook_failures"] >= 1
+        assert all(value == 0 for value in pipeline["gauges"].values())
+    finally:
+        runtime.close()
+
+
+def test_pipeline_telemetry_off_omits_ledger_and_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _open_tiny_runtime(tmp_path)
+    original_read = runtime.reader.read_record_into
+    reader_kwargs: list[dict[str, object]] = []
+
+    def capture_read(*args, **kwargs):
+        reader_kwargs.append(dict(kwargs))
+        return original_read(*args, **kwargs)
+
+    def fail_pipeline_entry(*_args, **_kwargs):
+        raise AssertionError("telemetry-off pipeline helper entered")
+
+    monkeypatch.setattr(runtime.reader, "read_record_into", capture_read)
+    monkeypatch.setattr(runtime.reader, "_start_pipeline_range", fail_pipeline_entry)
+    monkeypatch.setattr(runtime.reader, "_finish_pipeline_range", fail_pipeline_entry)
+    monkeypatch.setattr(runtime.slots, "_pipeline_call", fail_pipeline_entry)
+    monkeypatch.setattr(runtime.slots, "_submit_pipeline_reader", fail_pipeline_entry)
+    monkeypatch.setattr(
+        runtime.slots,
+        "_diagnostic_monotonic_ns",
+        fail_pipeline_entry,
+    )
+    monkeypatch.setattr(
+        runtime.slots,
+        "_diagnostic_thread_time_ns",
+        fail_pipeline_entry,
+    )
+    try:
+        assert runtime._pipeline_ledger is None
+        assert runtime.reader.pipeline_ledger is None
+        assert runtime.slots._pipeline_ledger is None
+        with runtime.begin_split_route(1, [0], phase="decode") as pending:
+            ready = pending.finish_misses()
+            assert ready is not None
+            pending.release_misses(ready)
+        snapshot = runtime.snapshot(mx_module=object())
+        assert "expert_pipeline" not in snapshot
+        assert "expert_pipeline" not in snapshot["slots"]
+        assert len(reader_kwargs) == 1
+        assert set(reader_kwargs[0]) == {
+            "prefer_sidecar",
+            "verify_hash",
+            "cancel_event",
+            "deadline_ns",
+        }
     finally:
         runtime.close()
 

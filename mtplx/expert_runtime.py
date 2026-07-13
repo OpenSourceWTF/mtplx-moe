@@ -39,6 +39,7 @@ from .expert_streaming_models import (
     get_model_spec,
     plan_expert_memory,
 )
+from .resource_metrics import ExpertPipelineLedger, ExpertPipelineRoute
 
 
 _MEMORY_RE = re.compile(r"^([0-9]+)([kmgt]i?b?|b)?$", re.IGNORECASE)
@@ -46,6 +47,25 @@ _MEMORY_RE = re.compile(r"^([0-9]+)([kmgt]i?b?|b)?$", re.IGNORECASE)
 
 class ExpertStreamingConfigurationError(ValueError):
     pass
+
+
+def _pipeline_call(
+    ledger: ExpertPipelineLedger | None,
+    route: ExpertPipelineRoute,
+    method: str,
+    *args: Any,
+    **kwargs: Any,
+) -> None:
+    """Publish optional diagnostics without changing runtime outcomes."""
+
+    try:
+        getattr(route, method)(*args, **kwargs)
+    except Exception:
+        if ledger is not None:
+            try:
+                ledger.mark_incomplete(phase=route.phase)
+            except Exception:
+                pass
 
 
 def _integer(name: str, value: object, *, minimum: int = 0) -> int:
@@ -359,6 +379,7 @@ class PendingSplitRoute:
         miss_cancel_event: threading.Event | None = None,
         lifecycle_release: Callable[[], None] | None = None,
         miss_parts: tuple[RoutePlan, ...] | None = None,
+        pipeline_route: ExpertPipelineRoute | None = None,
     ) -> None:
         self.runtime = runtime
         self.layer = layer
@@ -391,6 +412,7 @@ class PendingSplitRoute:
         self._aggregate_lease_ordinals: set[int] = set()
         self._miss_cancel_event = miss_cancel_event or threading.Event()
         self._lifecycle_release = lifecycle_release
+        self._pipeline_route = pipeline_route
         self._layer_lock = layer_lock
         self._state_lock = threading.Lock()
         self._failure: BaseException | None = None
@@ -423,6 +445,21 @@ class PendingSplitRoute:
 
         with self._state_lock:
             return any(not future.done() for future in self._miss_futures)
+
+    def claim_misses(self, ready: ReadyRoute | _ReadyRouteGroup) -> None:
+        """Record the point at which runnable miss bindings are consumed."""
+
+        route = self._pipeline_route
+        if route is None:
+            return
+        experts = tuple(dict.fromkeys(load.expert for load in ready.plan.loads))
+        if experts:
+            _pipeline_call(
+                self.runtime._pipeline_ledger,
+                route,
+                "claim_misses",
+                experts,
+            )
 
     def _attach_miss_future(
         self,
@@ -909,7 +946,17 @@ class PendingSplitRoute:
             ):
                 return
             self._finalized = True
-        self._layer_lock.release()
+            pipeline_route = self._pipeline_route
+            self._pipeline_route = None
+        try:
+            if pipeline_route is not None:
+                _pipeline_call(
+                    self.runtime._pipeline_ledger,
+                    pipeline_route,
+                    "close",
+                )
+        finally:
+            self._layer_lock.release()
 
     def __enter__(self) -> "PendingSplitRoute":
         return self
@@ -1020,6 +1067,7 @@ class ExpertStreamingRuntime:
         *,
         memory_cap_report: dict[str, Any] | None = None,
         integrity_report: dict[str, Any] | None = None,
+        pipeline_ledger: ExpertPipelineLedger | None = None,
     ) -> None:
         self.root = root
         self.spec = spec
@@ -1030,6 +1078,7 @@ class ExpertStreamingRuntime:
         self.slots = slots
         self.memory_cap_report = memory_cap_report
         self.integrity_report = integrity_report
+        self._pipeline_ledger = pipeline_ledger
         self.counters = CacheCounters()
         self._layer_counters = {
             layer: CacheCounters() for layer in spec.routed_layer_indices
@@ -1138,11 +1187,18 @@ class ExpertStreamingRuntime:
             if apply_memory_cap
             else None
         )
+        pipeline_ledger = (
+            ExpertPipelineLedger(strict=False) if config.resource_telemetry else None
+        )
+        pipeline_kwargs = (
+            {} if pipeline_ledger is None else {"pipeline_ledger": pipeline_ledger}
+        )
         reader = PositionalExpertReader(
             artifact_root,
             max_open_files=config.max_open_files,
             max_read_chunk_bytes=config.max_read_chunk_bytes,
             bypass_page_cache=config.bypass_page_cache,
+            **pipeline_kwargs,
         )
         try:
             slots = ExpertSlotPool(
@@ -1160,6 +1216,7 @@ class ExpertStreamingRuntime:
                 device_synchronize=device_synchronize,
                 cache_scope=config.cache_scope,
                 resource_telemetry=config.resource_telemetry,
+                **pipeline_kwargs,
             )
         except Exception:
             reader.close()
@@ -1174,6 +1231,7 @@ class ExpertStreamingRuntime:
             slots,
             memory_cap_report=cap_report,
             integrity_report=integrity_report,
+            **pipeline_kwargs,
         )
 
     @staticmethod
@@ -1663,6 +1721,7 @@ class ExpertStreamingRuntime:
         policy_txn: RoutePolicyTxn | None = None
         hit_ready: ReadyRoute | None = None
         pending: PendingSplitRoute | None = None
+        pipeline_route: ExpertPipelineRoute | None = None
         io_admission = RouteIOAdmission()
         miss_cancel_event = threading.Event()
         combined_cancel = _RouteCancel(cancel_event, miss_cancel_event)
@@ -1680,6 +1739,30 @@ class ExpertStreamingRuntime:
                 if miss_plan is not None and plan.phase is RoutingPhase.DECODE
                 else ((miss_plan,) if miss_plan is not None else ())
             )
+            pipeline_ledger = self._pipeline_ledger
+            if pipeline_ledger is not None:
+                try:
+                    load_experts = tuple(
+                        dict.fromkeys(
+                            load.expert
+                            for load in (() if miss_plan is None else miss_plan.loads)
+                        )
+                    )
+                    pipeline_route = pipeline_ledger.begin_route(
+                        layer=layer,
+                        phase=plan.phase,
+                        load_experts=load_experts,
+                        load_logical_bytes=tuple(
+                            self.manifest.record(layer, expert).logical_bytes
+                            for expert in load_experts
+                        ),
+                    )
+                except Exception:
+                    pipeline_route = None
+                    try:
+                        pipeline_ledger.mark_incomplete(phase=plan.phase)
+                    except Exception:
+                        pass
             hit_ready = (
                 self.slots.ensure_route(
                     layer,
@@ -1701,6 +1784,7 @@ class ExpertStreamingRuntime:
                 io_admission=io_admission,
                 miss_cancel_event=miss_cancel_event,
                 miss_parts=miss_parts,
+                pipeline_route=pipeline_route,
             )
             if miss_plan is not None:
                 ensure = (
@@ -1710,15 +1794,27 @@ class ExpertStreamingRuntime:
                 )
                 for ordinal, miss_part in enumerate(miss_parts):
                     part_admission = io_admission.child()
-                    future = self._split_executor.submit(
-                        ensure,
-                        layer,
-                        miss_part,
-                        cancel_event=combined_cancel,
-                        deadline_ns=deadline_ns,
-                        io_admission=part_admission,
-                        route_admitted=pending._retain_lifecycle_after_admission,
-                    )
+                    if pipeline_route is None:
+                        future = self._split_executor.submit(
+                            ensure,
+                            layer,
+                            miss_part,
+                            cancel_event=combined_cancel,
+                            deadline_ns=deadline_ns,
+                            io_admission=part_admission,
+                            route_admitted=pending._retain_lifecycle_after_admission,
+                        )
+                    else:
+                        future = self._split_executor.submit(
+                            ensure,
+                            layer,
+                            miss_part,
+                            cancel_event=combined_cancel,
+                            deadline_ns=deadline_ns,
+                            io_admission=part_admission,
+                            route_admitted=pending._retain_lifecycle_after_admission,
+                            pipeline_route=pipeline_route,
+                        )
                     pending._attach_miss_future(
                         future,
                         miss_part,
@@ -1737,6 +1833,12 @@ class ExpertStreamingRuntime:
                 pending.abort(setup_error)
                 pending.close()
             else:
+                if pipeline_route is not None:
+                    _pipeline_call(
+                        self._pipeline_ledger,
+                        pipeline_route,
+                        "close",
+                    )
                 if hit_ready is not None:
                     try:
                         hit_ready.release(synchronize=False)
@@ -1922,6 +2024,8 @@ class ExpertStreamingRuntime:
             }
         if self._mapped_expert_store is not None:
             snapshot["mapped_experts"] = self._mapped_expert_store.snapshot()
+        if self._pipeline_ledger is not None:
+            snapshot["expert_pipeline"] = self._pipeline_ledger.snapshot()
         self._raise_if_unhealthy()
         return snapshot
 
@@ -1949,7 +2053,7 @@ class ExpertStreamingRuntime:
         # Pool occupancy has independent locks; do not hold the counter lock
         # across that snapshot.
         slots = self.slots.resource_telemetry_snapshot()
-        return {
+        snapshot = {
             "model_key": self.spec.key,
             "quant_bits": self.spec.quant_bits,
             "expert_record_bytes": self.spec.expert_record_bytes,
@@ -1960,6 +2064,9 @@ class ExpertStreamingRuntime:
             "incremental_misses": incremental_misses,
             **slots,
         }
+        if self._pipeline_ledger is not None:
+            snapshot["expert_pipeline"] = self._pipeline_ledger.snapshot()
+        return snapshot
 
     def close(self, *, timeout: float | None = None) -> None:
         deadline = None if timeout is None else time.monotonic() + timeout

@@ -173,6 +173,8 @@ def test_pipeline_ledger_preserves_block_reason_identity(selected: str) -> None:
         "pin_held": "measured",
         "slot_loading": "measured",
     }
+    assert snapshot["coverage"]["outer_split_executor_queue"] == "unavailable"
+    assert snapshot["coverage"]["eligible_unsubmitted_cause"] == "unattributed"
 
 
 def test_pipeline_route_close_abandons_all_nonterminal_records() -> None:

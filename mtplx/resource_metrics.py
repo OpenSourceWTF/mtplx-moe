@@ -877,6 +877,8 @@ class ExpertPipelineLedger:
                     "logical_range_accounting": "measured",
                     "host_runnable_work": "measured",
                     "generation_expert_input_wait": "measured",
+                    "outer_split_executor_queue": "unavailable",
+                    "eligible_unsubmitted_cause": "unattributed",
                     "admitted_read_ranges": "unavailable",
                     "scheduled_read_ranges": "unavailable",
                     "physical_device_operations": "unavailable",

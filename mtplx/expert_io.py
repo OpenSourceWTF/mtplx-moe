@@ -254,19 +254,47 @@ class PositionalExpertReader:
         except TypeError as exc:
             raise TypeError("destination must be byte-addressable") from exc
 
-    def _start_pipeline_range(self, logical_bytes: int) -> tuple[Any | None, Any]:
+    def _start_pipeline_range(
+        self,
+        pipeline_ledger: Any,
+        logical_bytes: int,
+        pipeline_phase: str | None,
+    ) -> tuple[Any | None, Any]:
         """Begin optional diagnostics without changing the read outcome."""
 
-        pipeline_ledger = self.pipeline_ledger
-        if pipeline_ledger is None:
-            return None, None
         try:
-            return pipeline_ledger, pipeline_ledger.range_started(logical_bytes)
+            if pipeline_phase is None:
+                token = pipeline_ledger.range_started(logical_bytes)
+            else:
+                token = pipeline_ledger.range_started(
+                    logical_bytes,
+                    phase=pipeline_phase,
+                )
+            return pipeline_ledger, token
         except Exception:
+            self._mark_pipeline_incomplete(pipeline_ledger, pipeline_phase)
             return None, None
 
     @staticmethod
-    def _finish_pipeline_range(pipeline_ledger: Any | None, token: Any) -> None:
+    def _mark_pipeline_incomplete(
+        pipeline_ledger: Any,
+        pipeline_phase: str | None,
+    ) -> None:
+        try:
+            if pipeline_phase is None:
+                pipeline_ledger.mark_incomplete()
+            else:
+                pipeline_ledger.mark_incomplete(phase=pipeline_phase)
+        except Exception:
+            pass
+
+    @classmethod
+    def _finish_pipeline_range(
+        cls,
+        pipeline_ledger: Any | None,
+        token: Any,
+        pipeline_phase: str | None,
+    ) -> None:
         """Finish optional diagnostics without masking data-path outcomes."""
 
         if pipeline_ledger is None:
@@ -274,7 +302,7 @@ class PositionalExpertReader:
         try:
             pipeline_ledger.range_completed(token)
         except Exception:
-            pass
+            cls._mark_pipeline_incomplete(pipeline_ledger, pipeline_phase)
 
     def _read_range_into(
         self,
@@ -284,6 +312,7 @@ class PositionalExpertReader:
         *,
         cancel_event: threading.Event | None,
         deadline_ns: int | None,
+        pipeline_phase: str | None = None,
     ) -> None:
         self._check_cancelled(cancel_event, deadline_ns)
         requested = len(destination)
@@ -293,7 +322,14 @@ class PositionalExpertReader:
         preadv_bytes_returned = 0
         native_positional_calls = 0
         native_bytes_returned = 0
-        pipeline_ledger, range_token = self._start_pipeline_range(requested)
+        pipeline_ledger = self.pipeline_ledger
+        range_token = None
+        if pipeline_ledger is not None:
+            pipeline_ledger, range_token = self._start_pipeline_range(
+                pipeline_ledger,
+                requested,
+                pipeline_phase,
+            )
         try:
             with self._lease(relative_name) as fd:
                 while read_total < requested:
@@ -352,7 +388,12 @@ class PositionalExpertReader:
             raise ExpertIOError(f"positional read failed: {exc}") from exc
         finally:
             read_elapsed_ns = time.monotonic_ns() - started
-            self._finish_pipeline_range(pipeline_ledger, range_token)
+            if pipeline_ledger is not None:
+                self._finish_pipeline_range(
+                    pipeline_ledger,
+                    range_token,
+                    pipeline_phase,
+                )
             self.metrics.update(
                 read_operations=1,
                 python_preadv_invocations=python_preadv_invocations,
@@ -372,6 +413,7 @@ class PositionalExpertReader:
         *,
         cancel_event: threading.Event | None,
         deadline_ns: int | None,
+        pipeline_phase: str | None = None,
     ) -> None:
         """Scatter one contiguous file range into component-bank rows."""
 
@@ -381,7 +423,14 @@ class PositionalExpertReader:
         read_total = 0
         python_preadv_invocations = 0
         preadv_bytes_returned = 0
-        pipeline_ledger, range_token = self._start_pipeline_range(requested)
+        pipeline_ledger = self.pipeline_ledger
+        range_token = None
+        if pipeline_ledger is not None:
+            pipeline_ledger, range_token = self._start_pipeline_range(
+                pipeline_ledger,
+                requested,
+                pipeline_phase,
+            )
         pending = [destination for destination in destinations if len(destination)]
         try:
             with self._lease(relative_name) as fd:
@@ -427,7 +476,12 @@ class PositionalExpertReader:
             raise ExpertIOError(f"positional scatter read failed: {exc}") from exc
         finally:
             read_elapsed_ns = time.monotonic_ns() - started
-            self._finish_pipeline_range(pipeline_ledger, range_token)
+            if pipeline_ledger is not None:
+                self._finish_pipeline_range(
+                    pipeline_ledger,
+                    range_token,
+                    pipeline_phase,
+                )
             self.metrics.update(
                 read_operations=1,
                 python_preadv_invocations=python_preadv_invocations,
@@ -447,6 +501,7 @@ class PositionalExpertReader:
         verify_hash: bool = True,
         cancel_event: threading.Event | None = None,
         deadline_ns: int | None = None,
+        pipeline_phase: str | None = None,
     ) -> str:
         """Fill a fixed record buffer and return its SHA-256 digest."""
 
@@ -479,6 +534,7 @@ class PositionalExpertReader:
                         view,
                         cancel_event=cancel_event,
                         deadline_ns=deadline_ns,
+                        pipeline_phase=pipeline_phase,
                     )
                 else:
                     self._readv_range_into(
@@ -487,6 +543,7 @@ class PositionalExpertReader:
                         component_views,
                         cancel_event=cancel_event,
                         deadline_ns=deadline_ns,
+                        pipeline_phase=pipeline_phase,
                     )
             else:
                 self.metrics.update(source_record_requests=1)
@@ -504,6 +561,7 @@ class PositionalExpertReader:
                         target,
                         cancel_event=cancel_event,
                         deadline_ns=deadline_ns,
+                        pipeline_phase=pipeline_phase,
                     )
                     cursor = end
                 if cursor != record.logical_bytes:
@@ -549,6 +607,7 @@ class PositionalExpertReader:
         verify_hash: bool = True,
         cancel_event: threading.Event | None = None,
         deadline_ns: int | None = None,
+        pipeline_phase: str | None = None,
     ) -> tuple[str, ...]:
         """Read offset-ordered adjacent sidecar records with scatter preadv."""
 
@@ -597,6 +656,7 @@ class PositionalExpertReader:
                     flat_views,
                     cancel_event=cancel_event,
                     deadline_ns=deadline_ns,
+                    pipeline_phase=pipeline_phase,
                 )
                 for original_index, record, views in group:
                     if verify_hash:

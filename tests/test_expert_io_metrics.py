@@ -15,6 +15,35 @@ def _write_source(tmp_path: Path, payload: bytes = b"abcdefgh") -> tuple[str, by
     return relative_name, payload
 
 
+class _RecordingRangeLedger:
+    def __init__(self) -> None:
+        self.started: list[tuple[int, str | None]] = []
+        self.completed: list[int] = []
+
+    def range_started(
+        self,
+        logical_bytes: int,
+        *,
+        phase: str | None = None,
+    ) -> int:
+        self.started.append((logical_bytes, phase))
+        return len(self.started)
+
+    def range_completed(self, token: int) -> None:
+        self.completed.append(token)
+
+
+class _ComponentDestination:
+    def __init__(self, lengths: tuple[int, ...]) -> None:
+        self.buffers = tuple(bytearray(length) for length in lengths)
+
+    def record_views(self, _record: object) -> tuple[memoryview, ...]:
+        return tuple(memoryview(buffer) for buffer in self.buffers)
+
+    def payload(self) -> bytes:
+        return b"".join(self.buffers)
+
+
 def test_partial_preadv_separates_logical_range_reader_invocations_and_bytes(
     tmp_path: Path,
     monkeypatch,
@@ -130,13 +159,19 @@ def test_source_record_counts_each_segment_as_one_logical_range_reader_invocatio
     )
     destination = bytearray(len(payload))
 
-    with PositionalExpertReader(tmp_path, use_native=False) as reader:
+    ledger = _RecordingRangeLedger()
+    with PositionalExpertReader(
+        tmp_path,
+        use_native=False,
+        pipeline_ledger=ledger,
+    ) as reader:
         digest = reader.read_record_into(
             manifest,
             record,
             destination,
             prefer_sidecar=False,
             verify_hash=False,
+            pipeline_phase="decode",
         )
         metrics = reader.metrics.as_dict()
 
@@ -146,6 +181,99 @@ def test_source_record_counts_each_segment_as_one_logical_range_reader_invocatio
     assert metrics["read_operations"] == len(lengths)
     assert metrics["python_preadv_invocations"] == len(lengths)
     assert metrics["preadv_bytes_returned"] == len(payload)
+    assert ledger.started == [(length, "decode") for length in lengths]
+    assert ledger.completed == [1, 2, 3]
+
+
+def test_public_sidecar_single_and_component_paths_propagate_phase(
+    tmp_path: Path,
+) -> None:
+    relative_name, payload = _write_source(tmp_path)
+    record = SimpleNamespace(
+        layer=1,
+        expert=2,
+        logical_bytes=len(payload),
+        segments=(SimpleNamespace(length=3), SimpleNamespace(length=5)),
+        sidecar_offset=0,
+        sidecar_length=len(payload),
+        sha256=None,
+    )
+    manifest = SimpleNamespace(sidecar=SimpleNamespace(file=relative_name))
+    ledger = _RecordingRangeLedger()
+    contiguous = bytearray(len(payload))
+    component = _ComponentDestination((3, 5))
+
+    with PositionalExpertReader(
+        tmp_path,
+        use_native=False,
+        pipeline_ledger=ledger,
+    ) as reader:
+        reader.read_record_into(
+            manifest,
+            record,
+            contiguous,
+            verify_hash=False,
+            pipeline_phase="decode",
+        )
+        reader.read_record_into(
+            manifest,
+            record,
+            component,
+            verify_hash=False,
+            pipeline_phase="prefill",
+        )
+
+    assert contiguous == payload
+    assert component.payload() == payload
+    assert ledger.started == [
+        (len(payload), "decode"),
+        (len(payload), "prefill"),
+    ]
+    assert ledger.completed == [1, 2]
+
+
+def test_public_grouped_component_scatter_propagates_phase(tmp_path: Path) -> None:
+    relative_name, payload = _write_source(tmp_path)
+    first = SimpleNamespace(
+        layer=1,
+        expert=1,
+        logical_bytes=4,
+        segments=(SimpleNamespace(length=2), SimpleNamespace(length=2)),
+        sidecar_offset=0,
+        sidecar_length=4,
+        sha256=None,
+    )
+    second = SimpleNamespace(
+        layer=1,
+        expert=2,
+        logical_bytes=4,
+        segments=(SimpleNamespace(length=1), SimpleNamespace(length=3)),
+        sidecar_offset=4,
+        sidecar_length=4,
+        sha256=None,
+    )
+    first_destination = _ComponentDestination((2, 2))
+    second_destination = _ComponentDestination((1, 3))
+    manifest = SimpleNamespace(sidecar=SimpleNamespace(file=relative_name))
+    ledger = _RecordingRangeLedger()
+
+    with PositionalExpertReader(
+        tmp_path,
+        use_native=False,
+        pipeline_ledger=ledger,
+    ) as reader:
+        digests = reader.read_component_records_into(
+            manifest,
+            ((first, first_destination), (second, second_destination)),
+            verify_hash=False,
+            pipeline_phase="decode",
+        )
+
+    assert digests == ("unverified", "unverified")
+    assert first_destination.payload() == payload[:4]
+    assert second_destination.payload() == payload[4:]
+    assert ledger.started == [(len(payload), "decode")]
+    assert ledger.completed == [1]
 
 
 def test_partial_scatter_preadv_counts_each_python_invocation(
@@ -229,8 +357,10 @@ def test_pipeline_ledger_completion_error_does_not_mask_read_failure(
             self.started = 0
             self.completed = 0
             self.token = object()
+            self.incomplete_phases: list[str] = []
 
-        def range_started(self, _logical_bytes: int) -> object:
+        def range_started(self, _logical_bytes: int, *, phase: str) -> object:
+            assert phase == "decode"
             self.started += 1
             return self.token
 
@@ -238,6 +368,9 @@ def test_pipeline_ledger_completion_error_does_not_mask_read_failure(
             assert token is self.token
             self.completed += 1
             raise RuntimeError("injected ledger failure")
+
+        def mark_incomplete(self, *, phase: str) -> None:
+            self.incomplete_phases.append(phase)
 
     monkeypatch.setattr(expert_io.os, "preadv", lambda *_args: 0)
     ledger = FailingLedger()
@@ -254,6 +387,7 @@ def test_pipeline_ledger_completion_error_does_not_mask_read_failure(
                 memoryview(bytearray(len(payload))),
                 cancel_event=None,
                 deadline_ns=None,
+                pipeline_phase="decode",
             )
         metrics = reader.metrics.as_dict()
     finally:
@@ -264,6 +398,7 @@ def test_pipeline_ledger_completion_error_does_not_mask_read_failure(
     assert metrics["preadv_bytes_returned"] == 0
     assert ledger.started == 1
     assert ledger.completed == 1
+    assert ledger.incomplete_phases == ["decode"]
 
 
 def test_pipeline_ledger_completion_error_does_not_change_successful_read(
@@ -274,13 +409,18 @@ def test_pipeline_ledger_completion_error_does_not_change_successful_read(
     class FailingLedger:
         def __init__(self) -> None:
             self.completed = 0
+            self.incomplete_phases: list[str] = []
 
-        def range_started(self, _logical_bytes: int) -> object:
+        def range_started(self, _logical_bytes: int, *, phase: str) -> object:
+            assert phase == "prefill"
             return object()
 
         def range_completed(self, _token: object) -> None:
             self.completed += 1
             raise RuntimeError("injected ledger failure")
+
+        def mark_incomplete(self, *, phase: str) -> None:
+            self.incomplete_phases.append(phase)
 
     ledger = FailingLedger()
     destination = bytearray(len(payload))
@@ -295,10 +435,12 @@ def test_pipeline_ledger_completion_error_does_not_change_successful_read(
             memoryview(destination),
             cancel_event=None,
             deadline_ns=None,
+            pipeline_phase="prefill",
         )
 
     assert destination == payload
     assert ledger.completed == 1
+    assert ledger.incomplete_phases == ["prefill"]
 
 
 def test_pipeline_ledger_start_error_does_not_change_successful_read(
@@ -309,12 +451,17 @@ def test_pipeline_ledger_start_error_does_not_change_successful_read(
     class FailingLedger:
         def __init__(self) -> None:
             self.completed = 0
+            self.incomplete_phases: list[str] = []
 
-        def range_started(self, _logical_bytes: int) -> object:
+        def range_started(self, _logical_bytes: int, *, phase: str) -> object:
+            assert phase == "decode"
             raise RuntimeError("injected ledger start failure")
 
         def range_completed(self, _token: object) -> None:
             self.completed += 1
+
+        def mark_incomplete(self, *, phase: str) -> None:
+            self.incomplete_phases.append(phase)
 
     ledger = FailingLedger()
     destination = bytearray(len(payload))
@@ -329,6 +476,7 @@ def test_pipeline_ledger_start_error_does_not_change_successful_read(
             memoryview(destination),
             cancel_event=None,
             deadline_ns=None,
+            pipeline_phase="decode",
         )
         metrics = reader.metrics.as_dict()
 
@@ -337,3 +485,79 @@ def test_pipeline_ledger_start_error_does_not_change_successful_read(
     assert metrics["python_preadv_invocations"] == 1
     assert metrics["preadv_bytes_returned"] == len(payload)
     assert ledger.completed == 0
+    assert ledger.incomplete_phases == ["decode"]
+
+
+def test_telemetry_off_does_not_enter_pipeline_range_helpers(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    relative_name, payload = _write_source(tmp_path)
+    destination = bytearray(len(payload))
+
+    with PositionalExpertReader(tmp_path, use_native=False) as reader:
+        monkeypatch.setattr(
+            reader,
+            "_start_pipeline_range",
+            lambda *_args: (_ for _ in ()).throw(
+                AssertionError("telemetry-off start helper entered")
+            ),
+        )
+        monkeypatch.setattr(
+            reader,
+            "_finish_pipeline_range",
+            lambda *_args: (_ for _ in ()).throw(
+                AssertionError("telemetry-off finish helper entered")
+            ),
+        )
+        reader._read_range_into(
+            relative_name,
+            0,
+            memoryview(destination),
+            cancel_event=None,
+            deadline_ns=None,
+        )
+        reader._readv_range_into(
+            relative_name,
+            0,
+            (memoryview(bytearray(3)), memoryview(bytearray(5))),
+            cancel_event=None,
+            deadline_ns=None,
+        )
+
+    assert destination == payload
+
+
+def test_per_call_phase_scopes_single_and_scatter_ranges(
+    tmp_path: Path,
+) -> None:
+    relative_name, payload = _write_source(tmp_path)
+
+    ledger = _RecordingRangeLedger()
+    with PositionalExpertReader(
+        tmp_path,
+        use_native=False,
+        pipeline_ledger=ledger,
+    ) as reader:
+        reader._read_range_into(
+            relative_name,
+            0,
+            memoryview(bytearray(len(payload))),
+            cancel_event=None,
+            deadline_ns=None,
+            pipeline_phase="decode",
+        )
+        reader._readv_range_into(
+            relative_name,
+            0,
+            (memoryview(bytearray(3)), memoryview(bytearray(5))),
+            cancel_event=None,
+            deadline_ns=None,
+            pipeline_phase="prefill",
+        )
+
+    assert ledger.started == [
+        (len(payload), "decode"),
+        (len(payload), "prefill"),
+    ]
+    assert ledger.completed == [1, 2]
