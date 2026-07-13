@@ -361,17 +361,12 @@ def test_streamed_decode_evaluates_shared_work_before_waiting_for_misses(
     ]
 
 
-class _BankBarrierPending:
+class _BankOverlapPending:
     plan = SimpleNamespace(hits=(0,), misses=(1, 2))
     misses_pending = True
 
     def __init__(self, events: list[str]) -> None:
         self.events = events
-        self.finished = False
-        self.finish_calls = 0
-        self.aggregate_releases = 0
-        self.close_calls = 0
-        self.abort_errors: list[BaseException] = []
         bank = object()
 
         def binding(expert: int) -> SimpleNamespace:
@@ -391,17 +386,9 @@ class _BankBarrierPending:
                 plan=SimpleNamespace(experts=(2,)),
             ),
         )
-        self.aggregate = SimpleNamespace(
-            bindings=tuple(part.bindings[0] for part in self.miss_parts),
-            plan=SimpleNamespace(experts=(1, 2)),
-        )
 
     def finish_misses(self):
-        self.events.append("finish-misses")
-        self.finish_calls += 1
-        self.finished = True
-        self.misses_pending = False
-        return self.aggregate
+        raise AssertionError("component-bank overlap must not aggregate all misses")
 
     def iter_ready_misses(self):
         for part in self.miss_parts:
@@ -414,22 +401,15 @@ class _BankBarrierPending:
     def release_miss(self, part) -> None:
         self.events.append(f"release-miss:{part.plan.experts}")
 
-    def release_misses(self, ready) -> None:
-        assert ready is self.aggregate
-        self.aggregate_releases += 1
-        self.events.append("release-misses")
-
     def abort(self, error: BaseException) -> None:
-        self.abort_errors.append(error)
-        self.events.append("abort")
+        self.events.append(f"abort:{type(error).__name__}")
 
     def close(self) -> None:
-        self.close_calls += 1
         self.events.append("close")
 
 
-class _BankBarrierRuntime(_OverlapRuntime):
-    def __init__(self, events: list[str], pending: _BankBarrierPending) -> None:
+class _BankOverlapRuntime(_OverlapRuntime):
+    def __init__(self, events: list[str], pending: _BankOverlapPending) -> None:
         super().__init__(events)
         self.config.slot_layout = "component-banks"
         self.pending = pending
@@ -442,77 +422,48 @@ class _BankBarrierRuntime(_OverlapRuntime):
         return self.pending
 
 
-def _bank_barrier_inputs() -> tuple[mx.array, mx.array]:
+def _bank_overlap_inputs() -> tuple[mx.array, mx.array]:
     return (
         mx.zeros((3, 1, 2), dtype=mx.bfloat16),
         mx.array([[[0]], [[1]], [[2]]], dtype=mx.int32),
     )
 
 
-def test_component_bank_waits_for_all_miss_writes_before_any_q4(
+def test_component_bank_overlaps_hit_and_shared_work_with_incremental_misses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
-    pending = _BankBarrierPending(events)
+    pending = _BankOverlapPending(events)
 
-    def guarded_q4(selected, bindings, *, group_size):
+    def fake_q4(selected, bindings, *, group_size):
         assert group_size == 64
-        assert pending.finished, "component-bank Q4 started before miss writes finished"
         events.append(f"q4:{tuple(item.expert for item in bindings)}")
         return selected
 
-    monkeypatch.setattr(expert_mlx, "_run_component_bank_q4", guarded_q4)
-    switch = HotExpertSwitchGLU(_BankBarrierRuntime(events, pending), 1)
+    monkeypatch.setattr(expert_mlx, "_run_component_bank_q4", fake_q4)
+    switch = HotExpertSwitchGLU(_BankOverlapRuntime(events, pending), 1)
 
-    output = switch(*_bank_barrier_inputs())
-    mx.eval(output)
+    def shared_work():
+        events.append("shared")
+        return mx.ones((3, 1, 2), dtype=mx.bfloat16)
+
+    routed, shared = switch.run_with_shared_overlap(
+        *_bank_overlap_inputs(),
+        shared_work,
+    )
+    mx.eval(routed, shared)
 
     assert events == [
         "begin-misses",
-        "finish-misses",
         "q4:(0,)",
         "release-hits",
-        "q4:(1, 2)",
-        "release-misses",
-        "close",
-    ]
-
-
-def test_component_bank_q4_failure_releases_aggregate_once(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events: list[str] = []
-    pending = _BankBarrierPending(events)
-    q4_error = RuntimeError("injected post-barrier Q4 failure")
-
-    def fail_aggregate_q4(selected, bindings, *, group_size):
-        assert group_size == 64
-        assert pending.finished, "component-bank Q4 started before miss writes finished"
-        experts = tuple(item.expert for item in bindings)
-        events.append(f"q4:{experts}")
-        if experts == (1, 2):
-            raise q4_error
-        return selected
-
-    monkeypatch.setattr(expert_mlx, "_run_component_bank_q4", fail_aggregate_q4)
-    switch = HotExpertSwitchGLU(_BankBarrierRuntime(events, pending), 1)
-
-    with pytest.raises(RuntimeError, match="post-barrier Q4") as failed:
-        switch(*_bank_barrier_inputs())
-
-    assert failed.value is q4_error
-    assert pending.finish_calls == 1
-    assert pending.abort_errors == [q4_error]
-    assert pending.aggregate_releases == 1
-    assert pending.close_calls == 1
-    assert events == [
-        "begin-misses",
-        "finish-misses",
-        "q4:(0,)",
-        "release-hits",
-        "q4:(1, 2)",
-        "abort",
-        "release-misses",
+        "shared",
+        "ready:(1,)",
+        "q4:(1,)",
+        "release-miss:(1,)",
+        "ready:(2,)",
+        "q4:(2,)",
+        "release-miss:(2,)",
         "close",
     ]
 

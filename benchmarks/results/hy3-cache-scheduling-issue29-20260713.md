@@ -1,18 +1,18 @@
 # Hy3 cache scheduling experiment (#29)
 
-The original cache-policy comparison was measured at `aef62bc0e4ff0c716933dd16a2acd0154f112a93` on an Apple M5 Max with 128 GB unified memory. A corrected safety control was then measured at `058b40b28de97ddce23184e2c62ed1f41cb6ba2d`. All runs use the same Hy3 Q4 artifact, deterministic AR generation, component-bank layout, LRU policy, 7,821 persistent slots, 32 transient slots, and an exact 83,034,243,072-byte expert-cache ceiling.
+The cache-policy comparison was measured at `aef62bc0e4ff0c716933dd16a2acd0154f112a93` on an Apple M5 Max with 128 GB unified memory. A conservative serialized control was later measured at `058b40b28de97ddce23184e2c62ed1f41cb6ba2d` and rejected because its resource-wide exclusion premise was not established. All runs use the same Hy3 Q4 artifact, deterministic AR generation, component-bank layout, LRU policy, 7,821 persistent slots, 32 transient slots, and an exact 83,034,243,072-byte expert-cache ceiling.
 
 ## Decision
 
-**No-go for promoting the global component-bank cache.** In the original comparison it improves repeated B1 mean throughput by 4.858%, below the issue's 5% gate, and the second paired run reaches only 4.674%. Static B2/B4/B8 gains are 2.02%, 3.06%, and 2.86%; the mixed prefill/decode B4 gain is 1.26%.
+**No-go for promoting the global component-bank cache on performance.** The repeated B1 mean gain is 4.858%, below the issue's 5% gate, and the second paired run reaches only 4.674%. Static B2/B4/B8 gains are 2.02%, 3.06%, and 2.86%; the mixed prefill/decode B4 gain is 1.26%.
 
 The bounded transaction-journal refactor remains useful independently. It removes an accidental O(cache capacity) Python snapshot from every global route while preserving exact rollback behavior. The global allocation also cuts physical expert reads, but the saved I/O does not produce enough end-to-end throughput to cross the promotion threshold.
 
-## Safety correction and superseding control
+## Rejected serialized-control premise
 
-The original schedule did not exclude external component-bank writes from Metal reads of sibling rows in the same MLX allocation. Per-slot pins do not establish that resource-level ordering because `preadv` writes are outside MLX's dependency graph. Commit `058b40b` therefore finishes every component-bank miss before dispatching any Q4 read from that bank and aggregates route release exactly once.
+Commit `058b40b` tested a conservative schedule that drained every component-bank miss before any Q4 dispatch. It was motivated by a hypothesis that CPU writes to one logical row required exclusion from Metal reads of disjoint sibling rows in the same MLX allocation.
 
-This makes the original throughput payloads **diagnostic only, not promotion evidence**. They still describe the cache economics and transaction-bookkeeping change, but they were collected under a schedule that is not safe to ship.
+The measured overlapped runs retained exact token parity and reported no output-integrity failure; no attributable crash was documented. The serialized control itself excluded the disputed overlap and therefore could not validate the hypothesis. The existing per-slot path already prevents same-slot replacement until its Metal consumer completes, so the resource-wide exclusion premise remains unproven. The barrier is removed rather than promoted, and the original exact-parity benchmark payload remains the promotion evidence for this cache-policy experiment.
 
 The corrected layer-scope B1 control retained exact output parity: both repeats stopped naturally at 1,905 tokens and produced SHA-256 `484e182a68604821f69d56d0b15488d26723e6123f6a57f8158f8b20a4c6ed1c`.
 
@@ -22,7 +22,7 @@ The corrected layer-scope B1 control retained exact output parity: both repeats 
 | 2 | 2.9757 | 640.181 s | 10.239 s |
 | Mean | **2.9545** | - | - |
 
-The corrected mean is 51.587% below the original layer mean of 6.1027 tok/s while reading the same 1,768,689,893,376 expert bytes in repeat 1. That single control is already a decisive no-go for this serialized safety schedule, so the remaining global and paired arms were stopped instead of spending another exclusive benchmark window on a configuration that cannot be promoted. A prior 458-token launch omitted `--chat`; it is retained locally as harness-debugging evidence and excluded from every comparison.
+The serialized-control mean is 51.587% below the original layer mean of 6.1027 tok/s while reading the same 1,768,689,893,376 expert bytes in repeat 1. It documents the cost of draining all misses before compute, but it does not establish that the original schedule was unsafe. The remaining serialized global and paired arms were stopped because the control itself was not viable. A prior 458-token launch omitted `--chat`; it is retained locally as harness-debugging evidence and excluded from every comparison.
 
 ## Repeated long B1 headline
 
@@ -120,7 +120,7 @@ For mixed traffic, change `--workload-shape static` to `--workload-shape mixed-j
 
 ## Verification and limits
 
-- Full `pytest -q` reached 100% at safety commit `058b40b`; only pre-existing skips and deprecation warnings remained.
+- Full `pytest -q` reached 100% at serialized-control commit `058b40b`; only pre-existing skips and deprecation warnings remained.
 - Ruff passed on every changed Python file.
 - Qwen was stopped only for the exclusive MLX window, then restored with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tea.qwen.plist`. `launchctl print gui/$(id -u)/com.tea.qwen` reported the service running and `/v1/models` returned `mtplx-qwen36-27b-optimized-speed`.
 - `sudo` was unavailable for `powermetrics`. Process samples during the optimized global run averaged roughly 55-57% CPU and 82.7 GiB RSS; instantaneous `ioreg` samples showed 0% GPU during the sampled I/O-heavy intervals. These are not full-run GPU-utilization claims.
