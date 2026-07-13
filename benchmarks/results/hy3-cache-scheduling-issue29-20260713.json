@@ -1,14 +1,15 @@
 {
-  "schema": "mtplx.hy3-cache-scheduling.issue29.v1",
+  "schema": "mtplx.hy3-cache-scheduling.issue29.v2",
   "issue": 29,
   "measured_commit": "aef62bc0e4ff0c716933dd16a2acd0154f112a93",
+  "safety_commit": "058b40b28de97ddce23184e2c62ed1f41cb6ba2d",
   "base_branch": "experiment/moe-pr13-pr14-stack",
   "decision": {
     "candidate": "global component-bank cache",
     "promotion_gate_percent": 5.0,
     "repeated_b1_mean_gain_percent": 4.85811087,
     "status": "no-go",
-    "reason": "The repeated B1 mean and the second paired run missed the 5% throughput gate."
+    "reason": "The original repeated B1 mean and second paired run missed the 5% throughput gate; the corrected resource-safe layer control is also 51.587% slower than the original layer mean."
   },
   "environment": {
     "machine": "MacBook Pro Mac17,6",
@@ -102,6 +103,40 @@
         "evictions_percent": -8.474908265,
         "read_operations_percent": -7.8344741
       }
+    }
+  },
+  "safety_correction": {
+    "hazard": "External component-bank writes were not excluded from Metal reads of sibling rows in the same MLX allocation.",
+    "schedule": "Finish every component-bank miss before any Q4 dispatch from the bank and aggregate route release exactly once.",
+    "original_payload_status": "diagnostic-only; not safe promotion evidence",
+    "corrected_control": {
+      "scope": "layer",
+      "run": "issue29-fenced-layer-B1-p01-20260713T073735Z-058b40b28de9",
+      "chat": true,
+      "max_tokens": 2048,
+      "natural_completion_tokens": 1905,
+      "token_ids_sha256": "484e182a68604821f69d56d0b15488d26723e6123f6a57f8158f8b20a4c6ed1c",
+      "repeats": [
+        {
+          "tokens_per_second": 2.933186210425617,
+          "elapsed_seconds": 649.4643924170014,
+          "ttft_seconds": 16.338481125001636,
+          "bytes_read": 1768689893376
+        },
+        {
+          "tokens_per_second": 2.975719562340102,
+          "elapsed_seconds": 640.181294,
+          "ttft_seconds": 10.239435749999757,
+          "bytes_read_cumulative": 3462520504320
+        }
+      ],
+      "mean_tokens_per_second": 2.9544528863828594,
+      "change_from_original_layer_mean_percent": -51.587469360692495
+    },
+    "remaining_arms": "stopped after the corrected layer control established a decisive no-go",
+    "excluded_harness_run": {
+      "run": "issue29-fenced-layer-B1-p01-20260713T072759Z-058b40b28de9",
+      "reason": "omitted --chat and stopped after 458 tokens; not comparable"
     }
   },
   "static_saturation": [
@@ -203,7 +238,7 @@
     "scope": "Python transaction bookkeeping only; not an end-to-end model throughput claim"
   },
   "verification": {
-    "full_pytest": "passed at 100% with existing skips and deprecation warnings",
+    "full_pytest": "passed at 100% on safety commit 058b40b with existing skips and deprecation warnings",
     "focused_exact_rollback_cases": 5000,
     "focused_partial_admission_cases": 3000,
     "randomized_state_transitions": 144000,

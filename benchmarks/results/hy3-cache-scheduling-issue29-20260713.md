@@ -1,12 +1,28 @@
 # Hy3 cache scheduling experiment (#29)
 
-Measured at `aef62bc0e4ff0c716933dd16a2acd0154f112a93` on an Apple M5 Max with 128 GB unified memory. Both arms use the same Hy3 Q4 artifact, deterministic AR generation, component-bank layout, LRU policy, 7,821 persistent slots, 32 transient slots, and an exact 83,034,243,072-byte expert-cache ceiling.
+The original cache-policy comparison was measured at `aef62bc0e4ff0c716933dd16a2acd0154f112a93` on an Apple M5 Max with 128 GB unified memory. A corrected safety control was then measured at `058b40b28de97ddce23184e2c62ed1f41cb6ba2d`. All runs use the same Hy3 Q4 artifact, deterministic AR generation, component-bank layout, LRU policy, 7,821 persistent slots, 32 transient slots, and an exact 83,034,243,072-byte expert-cache ceiling.
 
 ## Decision
 
-**No-go for promoting the global component-bank cache.** It improves repeated B1 mean throughput by 4.858%, below the issue's 5% gate, and the second paired run reaches only 4.674%. Static B2/B4/B8 gains are 2.02%, 3.06%, and 2.86%; the mixed prefill/decode B4 gain is 1.26%.
+**No-go for promoting the global component-bank cache.** In the original comparison it improves repeated B1 mean throughput by 4.858%, below the issue's 5% gate, and the second paired run reaches only 4.674%. Static B2/B4/B8 gains are 2.02%, 3.06%, and 2.86%; the mixed prefill/decode B4 gain is 1.26%.
 
 The bounded transaction-journal refactor remains useful independently. It removes an accidental O(cache capacity) Python snapshot from every global route while preserving exact rollback behavior. The global allocation also cuts physical expert reads, but the saved I/O does not produce enough end-to-end throughput to cross the promotion threshold.
+
+## Safety correction and superseding control
+
+The original schedule did not exclude external component-bank writes from Metal reads of sibling rows in the same MLX allocation. Per-slot pins do not establish that resource-level ordering because `preadv` writes are outside MLX's dependency graph. Commit `058b40b` therefore finishes every component-bank miss before dispatching any Q4 read from that bank and aggregates route release exactly once.
+
+This makes the original throughput payloads **diagnostic only, not promotion evidence**. They still describe the cache economics and transaction-bookkeeping change, but they were collected under a schedule that is not safe to ship.
+
+The corrected layer-scope B1 control retained exact output parity: both repeats stopped naturally at 1,905 tokens and produced SHA-256 `484e182a68604821f69d56d0b15488d26723e6123f6a57f8158f8b20a4c6ed1c`.
+
+| Repeat | Corrected layer tok/s | Elapsed | TTFT |
+|---|---:|---:|---:|
+| 1 | 2.9332 | 649.464 s | 16.338 s |
+| 2 | 2.9757 | 640.181 s | 10.239 s |
+| Mean | **2.9545** | - | - |
+
+The corrected mean is 51.587% below the original layer mean of 6.1027 tok/s while reading the same 1,768,689,893,376 expert bytes in repeat 1. That single control is already a decisive no-go for this serialized safety schedule, so the remaining global and paired arms were stopped instead of spending another exclusive benchmark window on a configuration that cannot be promoted. A prior 458-token launch omitted `--chat`; it is retained locally as harness-debugging evidence and excluded from every comparison.
 
 ## Repeated long B1 headline
 
@@ -87,6 +103,7 @@ uv run --frozen --extra dev --extra server python \
   --f-nocache \
   --trust-sidecar \
   --no-enable-mtp \
+  --chat \
   --prompt-file benchmarks/prompts/moe_streaming_realistic.md \
   --generation-profile deterministic \
   --max-tokens "$TOKENS" \
@@ -103,9 +120,8 @@ For mixed traffic, change `--workload-shape static` to `--workload-shape mixed-j
 
 ## Verification and limits
 
-- Full `pytest -q` reached 100% at the measured commit; only pre-existing skips and deprecation warnings remained.
+- Full `pytest -q` reached 100% at safety commit `058b40b`; only pre-existing skips and deprecation warnings remained.
 - Ruff passed on every changed Python file.
 - Qwen was stopped only for the exclusive MLX window, then restored with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tea.qwen.plist`. `launchctl print gui/$(id -u)/com.tea.qwen` reported the service running and `/v1/models` returned `mtplx-qwen36-27b-optimized-speed`.
 - `sudo` was unavailable for `powermetrics`. Process samples during the optimized global run averaged roughly 55-57% CPU and 82.7 GiB RSS; instantaneous `ioreg` samples showed 0% GPU during the sampled I/O-heavy intervals. These are not full-run GPU-utilization claims.
 - This issue is AR-only. MTP, kernels, serialization changes, KV precision, sidecars beyond the existing verified artifact, and lower-bit tiers are out of scope.
-
