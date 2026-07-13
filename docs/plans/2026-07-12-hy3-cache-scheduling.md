@@ -90,7 +90,7 @@ git commit -m "perf(hy3): enable global component-bank cache"
 **Security flag:** none
 **Does NOT cover:** miss handling or concurrent global route mutation; misses retain the existing split-route transaction.
 
-- [ ] **Step 1: Write failing policy and runtime tests**
+- [x] **Step 1: Write failing policy and runtime tests**
 
 Test that a fully resident global route returns bindings without loads, preserves duplicate assignment order, updates LRU history only on commit, and restores state if pinning fails.
 
@@ -104,7 +104,7 @@ txn.rollback_completion()
 assert bank.snapshot() == before
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run:
 
@@ -116,15 +116,15 @@ uv run --frozen --extra dev --extra server pytest -q \
 
 Expected: `GlobalExpertSlotBank` has no safe all-hit transaction.
 
-- [ ] **Step 3: Implement the transaction**
+- [x] **Step 3: Implement the transaction**
 
 Add `GlobalExpertSlotBank.try_plan_all_hits_transaction(layer, expert_ids, phase)` using the same snapshot/commit/rollback contract as `LayerExpertSlotBank`. Update `ExpertStreamingRuntime.try_all_hit_route` to select the global or layer-local transaction instead of returning `None` for global cache scope.
 
-- [ ] **Step 4: Verify GREEN and fault paths**
+- [x] **Step 4: Verify GREEN and fault paths**
 
 Run target tests and the slot-generation/fence tests in `tests/test_expert_slots_runtime.py`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add mtplx/expert_streaming.py mtplx/expert_runtime.py \
