@@ -303,7 +303,7 @@ def _global_policy_state(runtime: ExpertStreamingRuntime) -> dict[str, object]:
         "key_to_slot": dict(bank._key_to_slot),
         "directory": tuple(
             sorted(
-                (key, entry.slot, entry.generation, entry.state)
+                (key, entry.slot, entry.generation, entry.state, entry.lru_rank)
                 for key, entry in bank._directory.items()
             )
         ),
@@ -311,6 +311,7 @@ def _global_policy_state(runtime: ExpertStreamingRuntime) -> dict[str, object]:
         "free_slots": tuple(bank._free_slots),
         "free_slot_set": set(bank._free_slot_set),
         "lru": tuple(bank._lru.items()),
+        "lru_clock": bank._lru_clock,
         "history": tuple(
             sorted(
                 (key, value.score, value.score_epoch, value.last_used)

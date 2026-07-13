@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import pytest
 
 from mtplx.expert_streaming import (
@@ -125,7 +127,7 @@ def _global_all_hit_state(bank: GlobalExpertSlotBank) -> tuple[object, ...]:
         dict(bank._key_to_slot),
         tuple(
             sorted(
-                (key, entry.slot, entry.generation, entry.state)
+                (key, entry.slot, entry.generation, entry.state, entry.lru_rank)
                 for key, entry in bank._directory.items()
             )
         ),
@@ -133,6 +135,7 @@ def _global_all_hit_state(bank: GlobalExpertSlotBank) -> tuple[object, ...]:
         tuple(bank._free_slots),
         frozenset(bank._free_slot_set),
         tuple(bank._lru.items()),
+        bank._lru_clock,
         tuple(
             sorted(
                 (key, history.score, history.score_epoch, history.last_used)
@@ -179,11 +182,99 @@ def test_global_all_hit_transaction_commit_matches_normal_hit_policy() -> None:
     assert _global_all_hit_state(bank) == _global_all_hit_state(control)
 
 
+def test_global_all_hit_publication_rollback_restores_lru_exactly() -> None:
+    bank = _global_all_hit_bank()
+    before = _global_all_hit_state(bank)
+
+    planned = bank.try_plan_all_hits_transaction(1, [2, 0, 2, 1], phase="decode")
+
+    assert planned is not None
+    _route, transaction = planned
+    transaction.commit()
+    transaction.rollback_publication()
+    assert _global_all_hit_state(bank) == before
+
+
+def test_global_all_hit_transaction_does_not_scan_the_whole_lru() -> None:
+    bank = _global_all_hit_bank()
+
+    class NoFullScanOrderedDict(OrderedDict):
+        def items(self):
+            raise AssertionError("all-hit transaction scanned the whole global LRU")
+
+    bank._lru = NoFullScanOrderedDict(bank._lru)
+
+    planned = bank.try_plan_all_hits_transaction(1, [2, 0, 2, 1], phase="decode")
+
+    assert planned is not None
+    _route, transaction = planned
+    transaction.commit()
+    assert tuple(bank._lru) == ((1, 2), (1, 0), (1, 1))
+
+
 def test_global_all_hit_miss_is_side_effect_free() -> None:
     bank = _global_all_hit_bank()
     before = _global_all_hit_state(bank)
 
     assert bank.try_plan_all_hits_transaction(2, [0], phase="decode") is None
+
+    assert _global_all_hit_state(bank) == before
+
+
+def test_global_miss_transaction_does_not_scan_whole_cache_state() -> None:
+    bank = _global_all_hit_bank()
+
+    class NoFullScanList(list):
+        def __iter__(self):
+            raise AssertionError("miss transaction scanned every global slot")
+
+    class NoFullScanDirectory(dict):
+        def items(self):
+            raise AssertionError("miss transaction copied the global directory")
+
+    bank._slot_to_key = NoFullScanList(bank._slot_to_key)
+    bank._directory = NoFullScanDirectory(bank._directory)
+
+    plan, transaction = bank.plan_transaction(2, [0], phase="decode")
+    transaction.commit()
+
+    assert plan.misses == (0,)
+    assert len(plan.evictions) == 1
+    assert bank._key_to_slot[(2, 0)] == plan.slots[0]
+
+
+def test_global_mixed_hit_miss_publication_rollback_restores_state_exactly() -> None:
+    bank = _global_all_hit_bank(transient_slots=3)
+    before = _global_all_hit_state(bank)
+
+    plan, transaction = bank.plan_transaction(1, [2, 3, 1], phase="decode")
+
+    assert plan.hits == (2, 1)
+    assert plan.misses == (3,)
+    assert plan.evictions[0].previous_expert == 0
+    transaction.commit()
+    transaction.rollback_publication()
+    assert _global_all_hit_state(bank) == before
+
+
+def test_global_transient_rollback_preserves_zero_occupancy_entries() -> None:
+    bank = GlobalExpertSlotBank(
+        layer_indices=(1, 2),
+        expert_count=2,
+        persistent_slots=1,
+        transient_slots=1,
+        prefill_slots_per_layer=0,
+        cache_policy="lru",
+    )
+    loaded, loaded_transaction = bank.plan_transaction(1, [0], phase="decode")
+    loaded_transaction.commit()
+    assert bank.invalidate_expert(1, 0) == loaded.slots[0]
+    assert bank._layer_occupancy == {1: 0}
+    before = _global_all_hit_state(bank)
+
+    _transient, transaction = bank.plan_transaction(2, [0], phase="prefill")
+    transaction.commit()
+    transaction.rollback_publication()
 
     assert _global_all_hit_state(bank) == before
 

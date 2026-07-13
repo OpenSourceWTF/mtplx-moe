@@ -1403,13 +1403,18 @@ class ExpertStreamingRuntime:
                 self._incremental_miss_parts,
             )
             try:
-                policy_txn.commit()
                 self._observe_plan_unlocked(layer, plan)
                 if plan.phase is RoutingPhase.DECODE and plan.misses:
                     self._observe_incremental_unlocked(
                         routes=1,
                         parts=incremental_parts,
                     )
+                # Publish policy last.  Counter observation is reversible and
+                # cannot expose a partial snapshot while this lock is held.
+                # Deferring the commit also means an all-hit global route does
+                # not need to copy the entire LRU merely to undo a later
+                # counter failure.
+                policy_txn.commit()
             except BaseException:
                 for counter, snapshot in zip(counters, counter_snapshots, strict=True):
                     counter.__dict__.clear()
