@@ -754,6 +754,7 @@ def build_configuration_summary(
     cache_scope: str,
     slot_layout: str,
     concurrency: int,
+    execution_lane: str,
     performance_settings: Mapping[str, object],
 ) -> dict[str, object]:
     """Return legacy run identity plus bounded requested-config identity."""
@@ -767,6 +768,7 @@ def build_configuration_summary(
         "cache_scope": cache_scope,
         "slot_layout": slot_layout,
         "requested_concurrency": concurrency,
+        "execution_lane": execution_lane,
         "performance_settings": canonical_settings,
     }
     fingerprint = hashlib.sha256(
@@ -777,7 +779,8 @@ def build_configuration_summary(
         ).encode("utf-8")
     ).hexdigest()[:16]
     configuration_label = (
-        f"cache-{cache_scope}-layout-{slot_layout}-B{concurrency}-cfg-{fingerprint}"
+        f"cache-{cache_scope}-layout-{slot_layout}-B{concurrency}"
+        f"-lane-{execution_lane}-cfg-{fingerprint}"
     )
     return {
         "run_label": base_run_label,
@@ -787,6 +790,7 @@ def build_configuration_summary(
         "slot_layout": slot_layout,
         "concurrency": concurrency,
         "requested_concurrency": concurrency,
+        "execution_lane": execution_lane,
         "performance_settings": canonical_settings,
     }
 
@@ -996,6 +1000,17 @@ def build_evidence_summary(
         f"{configuration_label}-achieved-B{achieved_peak_concurrency}"
         f"{'-undersubscribed' if undersubscribed else ''}"
     )
+    streams = [stream for row in rows for stream in row.get("streams", [])]
+    timing_summary = (
+        summarize_stream_timings(
+            streams,
+            requested_concurrency=requested_concurrency,
+            achieved_peak_concurrency=achieved_peak_concurrency,
+            undersubscribed=undersubscribed,
+        )
+        if streams
+        else None
+    )
     return {
         "configuration_label": configuration_label,
         "evidence_label": evidence_label,
@@ -1003,6 +1018,7 @@ def build_evidence_summary(
         "achieved_peak_concurrency": achieved_peak_concurrency,
         "saturation_valid": bool(rows) and not undersubscribed,
         "undersubscribed": undersubscribed,
+        "timing_summary": timing_summary,
     }
 
 
@@ -1108,7 +1124,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Saturation-lane stream count: decode N identical prompts through "
             "the streamed continuous-batch runner and report aggregate and "
-            "per-stream tok/s. 1 keeps the reference single-stream path. "
+            "per-stream tok/s. B=1 uses the same runner as B=2/4/8. "
             "Streams whose combined prompt+max-tokens KV exceeds "
             "--max-live-kv-tokens are serialized at step boundaries. "
             "Outputs at different concurrencies are not token-comparable: "
@@ -1122,6 +1138,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Joining prefills allowed per decode step boundary while other "
             "streams are actively decoding (concurrency > 1 only)."
+        ),
+    )
+    parser.add_argument(
+        "--reference-ar",
+        action="store_true",
+        help=(
+            "Opt into the legacy single-stream generate_ar reference path. "
+            "Unflagged AR runs, including B=1, use the continuous-batch runner "
+            "so B=1/2/4/8 saturation evidence shares one execution path."
         ),
     )
     parser.add_argument(
@@ -1244,6 +1269,25 @@ def validate_mtp_flags(
         parser.error("--mtp-precision requires --enable-mtp")
 
 
+def validate_reference_ar_flags(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    if args.reference_ar and args.concurrency != 1:
+        parser.error("--reference-ar requires --concurrency 1")
+    if args.reference_ar and args.enable_mtp:
+        parser.error("--reference-ar cannot be combined with --enable-mtp")
+
+
+def resolve_execution_lane(args: argparse.Namespace) -> str:
+    """Return the explicit execution path used by this benchmark arm."""
+
+    if args.enable_mtp:
+        return "reference-mtp1"
+    if args.reference_ar:
+        return "reference-ar"
+    return "continuous-batch-ar"
+
+
 def validate_sidecar_flags(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
@@ -1296,6 +1340,52 @@ def build_concurrent_requests(
     ]
 
 
+def _r7_percentile(values: list[float], percentile: int) -> float:
+    """Return the deterministic R7 linearly interpolated percentile."""
+
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        raise ValueError("percentiles require at least one value")
+    position = (len(ordered) - 1) * percentile / 100.0
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def summarize_stream_timings(
+    streams: list[dict],
+    *,
+    requested_concurrency: int,
+    achieved_peak_concurrency: int,
+    undersubscribed: bool | None = None,
+) -> dict[str, object]:
+    """Summarize comparable stream timings and saturation state."""
+
+    ttft = [float(stream["ttft_seconds"]) for stream in streams]
+    completion = [float(stream["completion_latency_seconds"]) for stream in streams]
+
+    def percentiles(values: list[float]) -> dict[str, float]:
+        return {
+            "p50": _r7_percentile(values, 50),
+            "p95": _r7_percentile(values, 95),
+            "p99": _r7_percentile(values, 99),
+        }
+
+    if undersubscribed is None:
+        undersubscribed = achieved_peak_concurrency < requested_concurrency
+    return {
+        "stream_count": len(streams),
+        "percentile_method": "linear_interpolation_r7",
+        "requested_concurrency": requested_concurrency,
+        "achieved_peak_concurrency": achieved_peak_concurrency,
+        "saturation_valid": not undersubscribed,
+        "undersubscribed": undersubscribed,
+        "ttft_seconds": percentiles(ttft),
+        "completion_latency_seconds": percentiles(completion),
+    }
+
+
 def _run_concurrent_repeats(
     args,
     runtime,
@@ -1340,6 +1430,7 @@ def _run_concurrent_repeats(
             completion_tokens = len(result.tokens)
             stream_elapsed = result.last_token_s - result.admitted_s
             decode_elapsed = result.last_token_s - result.first_token_s
+            ttft_seconds = result.first_token_s - result.admitted_s
             response_path = None
             if args.output_dir is not None:
                 response_path = write_response_file(
@@ -1372,6 +1463,8 @@ def _run_concurrent_repeats(
                     "finished_step": result.finished_step,
                     "decode_steps": result.decode_steps,
                     "prefill_seconds": result.prefill_seconds,
+                    "ttft_seconds": ttft_seconds,
+                    "completion_latency_seconds": stream_elapsed,
                     "token_times_s": [
                         token_time - started for token_time in result.token_times_s
                     ],
@@ -1386,6 +1479,12 @@ def _run_concurrent_repeats(
         scheduler = runner.stats()
         achieved_peak_concurrency = max(scheduler["live_stream_counts"], default=0)
         undersubscribed = achieved_peak_concurrency < args.concurrency
+        timing_summary = summarize_stream_timings(
+            streams,
+            requested_concurrency=args.concurrency,
+            achieved_peak_concurrency=achieved_peak_concurrency,
+            undersubscribed=undersubscribed,
+        )
         evidence_label = (
             f"{configuration_label}-achieved-B{achieved_peak_concurrency}"
             f"{'-undersubscribed' if undersubscribed else ''}"
@@ -1405,11 +1504,13 @@ def _run_concurrent_repeats(
                 "evidence_label": evidence_label,
                 "cache_scope": args.cache_scope,
                 "slot_layout": args.slot_layout,
+                "execution_lane": "continuous-batch-ar",
                 "aggregate_completion_tokens": aggregate_tokens,
                 "aggregate_completion_tokens_per_second": (
                     aggregate_tokens / elapsed if elapsed > 0.0 else 0.0
                 ),
                 "scheduler": scheduler,
+                "timing_summary": timing_summary,
                 "streams": streams,
                 "streaming_before": before,
                 "streaming_after": after,
@@ -1503,6 +1604,8 @@ def _main() -> int:
         parser.error("--run-label may contain only letters, digits, '-' and '_'")
     run_label = base_run_label
     validate_mtp_flags(parser, args)
+    validate_reference_ar_flags(parser, args)
+    execution_lane = resolve_execution_lane(args)
     evidence_reservations = reserve_json_evidence_targets(
         args.output_json, args.route_trace_json
     )
@@ -1655,6 +1758,7 @@ def _main() -> int:
             scheduler={
                 "requested_concurrency": args.concurrency,
                 "max_prefills_per_step": args.max_prefills_per_step,
+                "execution_lane": execution_lane,
             },
             mtp={
                 "enabled": args.enable_mtp,
@@ -1670,13 +1774,14 @@ def _main() -> int:
             cache_scope=args.cache_scope,
             slot_layout=args.slot_layout,
             concurrency=args.concurrency,
+            execution_lane=execution_lane,
             performance_settings=performance_settings,
         )
         configuration_label = str(configuration_summary["configuration_label"])
         configuration_fingerprint = str(
             configuration_summary["configuration_fingerprint"]
         )
-        if args.concurrency > 1:
+        if execution_lane == "continuous-batch-ar":
             rows.extend(
                 _run_concurrent_repeats(
                     args,
@@ -1689,8 +1794,10 @@ def _main() -> int:
                     configuration_fingerprint=configuration_fingerprint,
                 )
             )
-        # The single-stream reference lane runs only at concurrency 1.
-        for repeat in range(args.repeats if args.concurrency == 1 else 0):
+        # Legacy AR and MTP generation remain explicitly labelled references.
+        for repeat in range(
+            args.repeats if execution_lane != "continuous-batch-ar" else 0
+        ):
             if args.reset_between and repeat:
                 runtime.expert_streaming.reset()
             before = runtime.expert_streaming_snapshot()
@@ -1795,6 +1902,7 @@ def _main() -> int:
                     "evidence_label": f"{configuration_label}-achieved-B1",
                     "cache_scope": args.cache_scope,
                     "slot_layout": args.slot_layout,
+                    "execution_lane": execution_lane,
                     "completion_tokens": len(token_ids),
                     "completion_tokens_per_second": len(token_ids) / elapsed,
                     "token_ids": token_ids,
@@ -1845,6 +1953,7 @@ def _main() -> int:
         "configuration_label": configuration_label,
         "cache_scope": args.cache_scope,
         "slot_layout": args.slot_layout,
+        "execution_lane": execution_lane,
         "concurrency": args.concurrency,
         "requested_concurrency": args.concurrency,
         "achieved_peak_concurrency": evidence_summary["achieved_peak_concurrency"],

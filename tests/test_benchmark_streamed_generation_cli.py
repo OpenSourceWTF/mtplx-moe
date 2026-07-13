@@ -84,18 +84,20 @@ def test_configuration_summary_exports_explicit_cache_and_batch_identity() -> No
         cache_scope="global",
         slot_layout="component-banks",
         concurrency=4,
+        execution_lane="continuous-batch-ar",
         performance_settings=settings,
     )
 
     assert summary["run_label"] == "fixture"
     assert summary["configuration_label"].startswith(
-        "cache-global-layout-component-banks-B4-cfg-"
+        "cache-global-layout-component-banks-B4-lane-continuous-batch-ar-cfg-"
     )
     assert len(summary["configuration_fingerprint"]) == 16
     assert summary["cache_scope"] == "global"
     assert summary["slot_layout"] == "component-banks"
     assert summary["concurrency"] == 4
     assert summary["requested_concurrency"] == 4
+    assert summary["execution_lane"] == "continuous-batch-ar"
     assert summary["performance_settings"] == settings
 
 
@@ -139,6 +141,7 @@ def test_configuration_identity_is_deterministic_and_covers_performance_arms() -
             cache_scope="global",
             slot_layout="component-banks",
             concurrency=4,
+            execution_lane="continuous-batch-ar",
             performance_settings=settings,
         )["configuration_fingerprint"]
 
@@ -191,6 +194,7 @@ def test_configuration_identity_is_deterministic_and_covers_performance_arms() -
             cache_scope=cache_scope,
             slot_layout=slot_layout,
             concurrency=concurrency,
+            execution_lane="continuous-batch-ar",
             performance_settings=base,
         )["configuration_fingerprint"]
         assert changed_identity != identity(base)

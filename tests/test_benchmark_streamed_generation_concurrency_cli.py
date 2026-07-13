@@ -36,13 +36,66 @@ def _load_module():
     return module
 
 
-def test_unflagged_runs_stay_on_the_single_stream_reference_lane() -> None:
+def test_unflagged_runs_use_the_comparable_continuous_batch_lane() -> None:
     parser = _load_module().build_parser()
     args = parser.parse_args(_BASE_ARGS)
-    # Concurrency changes the run configuration label: an unflagged run must
-    # stay comparable to every previous single-stream result.
     assert args.concurrency == 1
     assert args.max_prefills_per_step == 1
+    assert args.reference_ar is False
+    assert _load_module().resolve_execution_lane(args) == "continuous-batch-ar"
+
+
+def test_legacy_single_stream_ar_requires_an_explicit_reference_flag() -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args([*_BASE_ARGS, "--reference-ar"])
+
+    module.validate_reference_ar_flags(parser, args)
+
+    assert args.reference_ar is True
+    assert module.resolve_execution_lane(args) == "reference-ar"
+
+
+def test_reference_ar_rejects_concurrent_saturation_lanes(capsys) -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args([*_BASE_ARGS, "--reference-ar", "--concurrency", "2"])
+
+    with pytest.raises(SystemExit):
+        module.validate_reference_ar_flags(parser, args)
+    assert "--reference-ar requires --concurrency 1" in capsys.readouterr().err
+
+
+def test_mtp_stays_on_a_distinct_reference_lane() -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [*_BASE_ARGS, "--enable-mtp", "--mtp-artifacts", "/artifacts"]
+    )
+
+    module.validate_mtp_flags(parser, args)
+    module.validate_reference_ar_flags(parser, args)
+
+    assert module.resolve_execution_lane(args) == "reference-mtp1"
+
+
+def test_reference_ar_cannot_be_combined_with_mtp(capsys) -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [
+            *_BASE_ARGS,
+            "--reference-ar",
+            "--enable-mtp",
+            "--mtp-artifacts",
+            "/artifacts",
+        ]
+    )
+    module.validate_mtp_flags(parser, args)
+
+    with pytest.raises(SystemExit):
+        module.validate_reference_ar_flags(parser, args)
+    assert "cannot be combined with --enable-mtp" in capsys.readouterr().err
 
 
 def test_saturation_lane_flags_parse() -> None:
@@ -67,16 +120,42 @@ def test_run_label_distinguishes_cache_arm_and_saturation_lane(
         cache_scope=cache_scope,
         slot_layout="component-banks",
         concurrency=concurrency,
+        execution_lane="continuous-batch-ar",
         performance_settings={"cache_policy": "frequency"},
     )
 
     assert summary["run_label"] == "fixture"
     assert summary["configuration_label"].startswith(
-        f"cache-{cache_scope}-layout-component-banks-B{concurrency}-cfg-"
+        f"cache-{cache_scope}-layout-component-banks-B{concurrency}"
+        "-lane-continuous-batch-ar-cfg-"
     )
     assert summary["cache_scope"] == cache_scope
     assert summary["slot_layout"] == "component-banks"
     assert summary["concurrency"] == concurrency
+    assert summary["execution_lane"] == "continuous-batch-ar"
+
+
+def test_reference_ar_has_a_distinct_configuration_identity() -> None:
+    module = _load_module()
+    common = {
+        "cache_scope": "global",
+        "slot_layout": "component-banks",
+        "concurrency": 1,
+        "performance_settings": {"cache_policy": "lru"},
+    }
+
+    continuous = module.build_configuration_summary(
+        "fixture", execution_lane="continuous-batch-ar", **common
+    )
+    reference = module.build_configuration_summary(
+        "fixture", execution_lane="reference-ar", **common
+    )
+
+    assert (
+        continuous["configuration_fingerprint"]
+        != (reference["configuration_fingerprint"])
+    )
+    assert "-lane-reference-ar-cfg-" in reference["configuration_label"]
 
 
 @pytest.mark.parametrize("value", ["0", "-1"])
@@ -129,6 +208,7 @@ def test_run_concurrent_repeats_reports_aggregate_and_per_stream_rates(
         assert row["undersubscribed"] is False
         assert row["cache_scope"] == "global"
         assert row["slot_layout"] == "component-banks"
+        assert row["execution_lane"] == "continuous-batch-ar"
         assert len(row["streams"]) == 2
         assert row["aggregate_completion_tokens"] == 8
         assert row["aggregate_completion_tokens_per_second"] > 0.0
@@ -138,8 +218,16 @@ def test_run_concurrent_repeats_reports_aggregate_and_per_stream_rates(
             assert stream["finish_reason"] == "length"
             assert stream["completion_tokens_per_second"] > 0.0
             assert stream["decode_tokens_per_second"] > 0.0
+            assert stream["ttft_seconds"] > 0.0
+            assert stream["completion_latency_seconds"] >= stream["ttft_seconds"]
             assert len(stream["token_times_s"]) == 4
             assert len(stream["token_ids"]) == 4
+        assert row["timing_summary"]["stream_count"] == 2
+        assert row["timing_summary"]["requested_concurrency"] == 2
+        assert row["timing_summary"]["achieved_peak_concurrency"] == 2
+        assert row["timing_summary"]["undersubscribed"] is False
+        assert row["timing_summary"]["ttft_seconds"]["p50"] > 0.0
+        assert row["timing_summary"]["completion_latency_seconds"]["p99"] > 0.0
         assert row["streaming_after"]["live_kv_tokens"] == 0
     finally:
         rt.close()
@@ -231,6 +319,7 @@ def test_kv_constrained_lane_is_marked_undersubscribed(tmp_path: Path) -> None:
             "achieved_peak_concurrency": 1,
             "saturation_valid": False,
             "undersubscribed": True,
+            "timing_summary": row["timing_summary"],
         }
     finally:
         rt.close()
@@ -255,3 +344,76 @@ def test_concurrent_requests_are_identical_prompts_with_distinct_streams() -> No
         module.build_concurrent_requests(
             [1], concurrency=0, max_tokens=1, sampler=sampler, seed=0
         )
+
+
+def test_stream_timing_summary_uses_deterministic_r7_percentiles() -> None:
+    module = _load_module()
+    streams = [
+        {"ttft_seconds": ttft, "completion_latency_seconds": completion}
+        for ttft, completion in (
+            (0.1, 1.0),
+            (0.2, 2.0),
+            (0.3, 3.0),
+            (0.4, 4.0),
+        )
+    ]
+
+    summary = module.summarize_stream_timings(
+        streams,
+        requested_concurrency=4,
+        achieved_peak_concurrency=4,
+    )
+
+    assert summary["stream_count"] == 4
+    assert summary["percentile_method"] == "linear_interpolation_r7"
+    assert summary["requested_concurrency"] == 4
+    assert summary["achieved_peak_concurrency"] == 4
+    assert summary["saturation_valid"] is True
+    assert summary["undersubscribed"] is False
+    assert summary["ttft_seconds"] == pytest.approx(
+        {"p50": 0.25, "p95": 0.385, "p99": 0.397}
+    )
+    assert summary["completion_latency_seconds"] == pytest.approx(
+        {"p50": 2.5, "p95": 3.85, "p99": 3.97}
+    )
+
+
+def test_stream_timing_summary_marks_undersubscribed_requests() -> None:
+    module = _load_module()
+
+    summary = module.summarize_stream_timings(
+        [{"ttft_seconds": 0.1, "completion_latency_seconds": 1.0}],
+        requested_concurrency=2,
+        achieved_peak_concurrency=1,
+    )
+
+    assert summary["saturation_valid"] is False
+    assert summary["undersubscribed"] is True
+
+
+def test_evidence_timing_summary_preserves_any_repeat_undersubscription() -> None:
+    module = _load_module()
+    stream = {"ttft_seconds": 0.1, "completion_latency_seconds": 1.0}
+    rows = [
+        {
+            "achieved_peak_concurrency": 4,
+            "undersubscribed": False,
+            "streams": [stream],
+        },
+        {
+            "achieved_peak_concurrency": 2,
+            "undersubscribed": True,
+            "streams": [stream],
+        },
+    ]
+
+    summary = module.build_evidence_summary(
+        rows,
+        configuration_label="requested-B4",
+        requested_concurrency=4,
+    )
+
+    assert summary["achieved_peak_concurrency"] == 4
+    assert summary["undersubscribed"] is True
+    assert summary["timing_summary"]["undersubscribed"] is True
+    assert summary["timing_summary"]["saturation_valid"] is False
