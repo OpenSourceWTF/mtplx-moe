@@ -6,6 +6,7 @@ import importlib.util
 import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -707,6 +708,13 @@ def test_resource_telemetry_is_opt_in_and_bounded() -> None:
     assert args.powermetrics is False
 
 
+def test_resource_telemetry_help_does_not_claim_simultaneous_overlap() -> None:
+    help_text = _load_module().build_parser().format_help()
+
+    assert "same-interval I/O/Metal coactivity" in help_text
+    assert "I/O/Metal overlap" not in help_text
+
+
 def test_resource_telemetry_flags_parse_without_enabling_window_walks() -> None:
     parser = _load_module().build_parser()
     args = parser.parse_args(
@@ -781,6 +789,42 @@ def test_resource_report_fields_are_absent_when_disabled() -> None:
 
     assert "diagnostic_run" not in row
     assert "resource_telemetry" not in row
+
+
+def test_telemetry_disabled_reference_generation_skips_thread_cpu_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module()
+    clock = iter((10.0, 20.0))
+    monkeypatch.setattr(module.time, "perf_counter", lambda: next(clock))
+    monkeypatch.setattr(
+        module.time,
+        "thread_time_ns",
+        lambda: pytest.fail("disabled telemetry sampled thread CPU time"),
+    )
+    runtime = SimpleNamespace(admit_kv_tokens=lambda _tokens: nullcontext())
+
+    result, started, finished, cpu_started, cpu_finished = (
+        module._run_reference_generation(
+            SimpleNamespace(enable_mtp=False, seed=0),
+            runtime,
+            prompt_ids=[1, 2],
+            max_tokens=3,
+            sampler=object(),
+            token_callback=lambda _tokens: None,
+            resource_run=None,
+            generate_ar_fn=(
+                lambda *_args, **_kwargs: SimpleNamespace(tokens=(1, 2, 3))
+            ),
+            generate_mtp1_fn=lambda *_args, **_kwargs: pytest.fail(
+                "AR reference called MTP generation"
+            ),
+        )
+    )
+
+    assert result.tokens == (1, 2, 3)
+    assert (started, finished) == (10.0, 20.0)
+    assert (cpu_started, cpu_finished) == (0, 0)
 
 
 def test_mtp_defaults_off_so_ar_runs_are_unchanged() -> None:

@@ -154,7 +154,7 @@ def _interval(previous: ResourceTick, current: ResourceTick) -> dict[str, Any] |
         "completion_fences": fences,
         "io_active": io_active,
         "completion_fence_pending": fence_pending,
-        "io_and_completion_fence_active": io_active and fence_pending,
+        "io_and_completion_fence_seen_in_interval": io_active and fence_pending,
         "completion_fence_registrations": _counter_delta(
             before_metrics.get("completion_fences"),
             after_metrics.get("completion_fences"),
@@ -238,6 +238,7 @@ class ResourceTelemetrySampler:
         self._first_tick: ResourceTick | None = None
         self._recent_ticks: deque[ResourceTick] = deque(maxlen=max_samples - 1)
         self._capture_count = 0
+        self._sampling_failure: str | None = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -261,7 +262,17 @@ class ResourceTelemetrySampler:
 
     def _loop(self) -> None:
         while not self._stop.wait(self._interval_s):
-            self.capture()
+            try:
+                self.capture()
+            except BaseException as exc:
+                self._record_sampling_failure(exc)
+                self._stop.set()
+                return
+
+    def _record_sampling_failure(self, exc: BaseException) -> None:
+        with self._lock:
+            if self._sampling_failure is None:
+                self._sampling_failure = f"{type(exc).__name__}: {exc}"
 
     def __enter__(self) -> ResourceTelemetrySampler:
         self.capture()
@@ -277,7 +288,10 @@ class ResourceTelemetrySampler:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=max(1.0, self._interval_s * 4))
-        self.capture()
+        try:
+            self.capture()
+        except BaseException as exc:
+            self._record_sampling_failure(exc)
 
     @property
     def ticks(self) -> tuple[ResourceTick, ...]:
@@ -318,6 +332,8 @@ class ResourceTelemetrySampler:
             generation_thread_core_fraction=thread_fraction,
         )
         samples_dropped = max(0, self._capture_count - len(ticks))
+        with self._lock:
+            sampling_failure = self._sampling_failure
         if samples_dropped:
             summary["coverage"]["timeline"] = "retained_start_and_recent_tail"
             candidates = list(summary["attribution"]["candidates"])
@@ -329,11 +345,22 @@ class ResourceTelemetrySampler:
             }
         else:
             summary["coverage"]["timeline"] = "complete"
+        if sampling_failure is not None:
+            summary["coverage"]["timeline"] = "incomplete_sampler_failure"
+            candidates = list(summary["attribution"]["candidates"])
+            if "resource_sampler_failure" not in candidates:
+                candidates.append("resource_sampler_failure")
+            summary["attribution"] = {
+                "status": "incomplete",
+                "candidates": candidates,
+            }
         payload: dict[str, Any] = {
             "schema": "mtplx-resource-telemetry-v1",
             "sample_interval_seconds": self._interval_s,
             "sample_count": len(ticks),
             "samples_dropped": samples_dropped,
+            "sampling_failures": int(sampling_failure is not None),
+            "sampling_failure": sampling_failure,
             **summary,
             "timeline": intervals,
         }
@@ -443,7 +470,7 @@ def summarize_intervals(
         if count
         else 0.0
     )
-    both_fraction = (
+    same_interval_activity_fraction = (
         sum(
             bool(item.get("io_active")) and bool(item.get("completion_fence_pending"))
             for item in rows
@@ -452,7 +479,7 @@ def summarize_intervals(
         if count
         else 0.0
     )
-    neither_fraction = (
+    neither_activity_interval_fraction = (
         sum(
             not bool(item.get("io_active"))
             and not bool(item.get("completion_fence_pending"))
@@ -529,26 +556,23 @@ def summarize_intervals(
         and gpu_status in {"not_supported", "unavailable"}
     ):
         candidates.append("host_orchestration")
-    if io_fraction >= 0.25 and fence_fraction >= 0.25 and both_fraction < 0.10:
-        candidates.append("synchronization_or_insufficient_overlap")
+    if (
+        io_fraction >= 0.25
+        and fence_fraction >= 0.25
+        and same_interval_activity_fraction < 0.10
+    ):
+        candidates.append("coarse_io_fence_separation")
     if synchronous_fences > 0 and fence_fraction < 0.10:
         candidates.append("synchronous_fence_or_evaluation")
 
     if ssd_status == "supported":
-        attribution = {
-            "status": "conclusive",
-            "candidates": ["storage_throughput"],
-        }
-    elif gpu_status == "supported" and queue_fraction < 0.10:
-        attribution = {
-            "status": "conclusive",
-            "candidates": ["gpu_compute"],
-        }
-    else:
-        attribution = {
-            "status": "incomplete",
-            "candidates": candidates or ["unidentified"],
-        }
+        candidates.append("storage_throughput")
+    if gpu_status == "supported" and queue_fraction < 0.10:
+        candidates.append("gpu_compute")
+    attribution = {
+        "status": "incomplete",
+        "candidates": list(dict.fromkeys(candidates)) or ["unidentified"],
+    }
 
     coverage: dict[str, Any] = {
         "runtime_occupancy": "measured",
@@ -641,10 +665,12 @@ def summarize_intervals(
             ),
         },
         "overlap": {
-            "io_active_fraction": io_fraction,
-            "completion_fence_pending_fraction": fence_fraction,
-            "both_fraction": both_fraction,
-            "neither_fraction": neither_fraction,
+            "measurement": "same_interval_coactivity",
+            "simultaneous_overlap_measured": False,
+            "io_activity_interval_fraction": io_fraction,
+            "fence_activity_interval_fraction": fence_fraction,
+            "same_interval_activity_fraction": same_interval_activity_fraction,
+            "neither_activity_interval_fraction": (neither_activity_interval_fraction),
         },
         "host": {
             "generation_thread_core_fraction": generation_thread_core_fraction,

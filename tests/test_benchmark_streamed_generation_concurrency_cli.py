@@ -36,6 +36,24 @@ def _load_module():
     return module
 
 
+def _static_runner_args():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        repeats=1,
+        reset_between=False,
+        concurrency=1,
+        max_prefills_per_step=1,
+        seed=0,
+        output_dir=None,
+        model_key="hy3-q4",
+        cache_scope="global",
+        slot_layout="component-banks",
+        resource_telemetry=False,
+        ssd_ceiling_gib_s=None,
+    )
+
+
 def test_unflagged_runs_use_the_comparable_continuous_batch_lane() -> None:
     parser = _load_module().build_parser()
     args = parser.parse_args(_BASE_ARGS)
@@ -336,6 +354,104 @@ def test_mixed_join_lane_submits_prefill_while_first_stream_decodes(
         rt.close()
 
 
+def test_telemetry_disabled_static_lane_installs_no_step_callback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mtplx.streamed_batch as streamed_batch
+    from test_streamed_batch import _open_fixture_runtime
+
+    module = _load_module()
+    callbacks = []
+    real_runner = streamed_batch.StreamedBatchRunner
+
+    class CapturingRunner(real_runner):
+        def __init__(self, *args, on_step=None, **kwargs):
+            callbacks.append(on_step)
+            super().__init__(*args, on_step=on_step, **kwargs)
+
+    monkeypatch.setattr(streamed_batch, "StreamedBatchRunner", CapturingRunner)
+    runtime, _streaming = _open_fixture_runtime(tmp_path, max_live_kv_tokens=64)
+    try:
+        module._run_concurrent_repeats(
+            _static_runner_args(),
+            runtime,
+            prompt_ids=[1, 2, 3],
+            sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=1),
+            max_tokens=2,
+            run_label="fixture",
+            configuration_label="static-B1",
+        )
+        assert callbacks == [None]
+    finally:
+        runtime.close()
+
+
+def test_telemetry_disabled_static_lane_skips_thread_cpu_clock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from test_streamed_batch import _open_fixture_runtime
+
+    module = _load_module()
+    monkeypatch.setattr(
+        module.time,
+        "thread_time_ns",
+        lambda: pytest.fail("disabled telemetry sampled thread CPU time"),
+    )
+    runtime, _streaming = _open_fixture_runtime(tmp_path, max_live_kv_tokens=64)
+    try:
+        module._run_concurrent_repeats(
+            _static_runner_args(),
+            runtime,
+            prompt_ids=[1, 2, 3],
+            sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=1),
+            max_tokens=2,
+            run_label="fixture",
+            configuration_label="static-B1",
+        )
+    finally:
+        runtime.close()
+
+
+def test_telemetry_disabled_mixed_join_uses_only_join_callback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mtplx.streamed_batch as streamed_batch
+    from test_streamed_batch import _open_fixture_runtime
+
+    module = _load_module()
+    callbacks = []
+    real_runner = streamed_batch.StreamedBatchRunner
+
+    class CapturingRunner(real_runner):
+        def __init__(self, *args, on_step=None, **kwargs):
+            callbacks.append(on_step)
+            super().__init__(*args, on_step=on_step, **kwargs)
+
+    monkeypatch.setattr(streamed_batch, "StreamedBatchRunner", CapturingRunner)
+    args = _static_runner_args()
+    args.concurrency = 2
+    args.workload_shape = "mixed-join"
+    args.join_after_step = 1
+    runtime, _streaming = _open_fixture_runtime(tmp_path, max_live_kv_tokens=64)
+    try:
+        module._run_concurrent_repeats(
+            args,
+            runtime,
+            prompt_ids=[1, 2, 3],
+            sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=1),
+            max_tokens=4,
+            run_label="fixture",
+            configuration_label="mixed-B2",
+        )
+        assert len(callbacks) == 1
+        assert callbacks[0].__name__ == "submit_joiners"
+    finally:
+        runtime.close()
+
+
 @pytest.mark.parametrize("concurrency", [1, 2, 4, 8])
 def test_requested_saturation_lanes_report_achieved_peak(
     tmp_path: Path,
@@ -535,11 +651,15 @@ def test_concurrent_token_counter_never_drops_finished_streams() -> None:
             live=(
                 SimpleNamespace(request_id="a", generated_tokens=2),
                 SimpleNamespace(request_id="b", generated_tokens=3),
-            )
-        )
+            ),
+        ),
+        completed_tokens=0,
     )
     counter.observe(
-        SimpleNamespace(live=(SimpleNamespace(request_id="b", generated_tokens=4),))
+        SimpleNamespace(
+            live=(SimpleNamespace(request_id="b", generated_tokens=4),),
+        ),
+        completed_tokens=2,
     )
 
     assert counter.count() == 6
@@ -551,3 +671,17 @@ def test_concurrent_token_counter_never_drops_finished_streams() -> None:
         ]
     )
     assert counter.count() == 8
+
+
+def test_concurrent_token_counter_charges_finished_streams_before_run_end() -> None:
+    from types import SimpleNamespace
+
+    counter = _load_module()._ConcurrentTokenCounter()
+    counter.observe(
+        SimpleNamespace(
+            live=(SimpleNamespace(request_id="long", generated_tokens=10),),
+        ),
+        completed_tokens=2,
+    )
+
+    assert counter.count() == 12

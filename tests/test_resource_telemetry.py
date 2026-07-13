@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 import subprocess
 
 import mtplx.benchmarks.resource_telemetry as telemetry_module
@@ -76,7 +78,9 @@ def test_backed_up_readers_below_ssd_ceiling_are_not_called_storage_bound() -> N
     assert "bound_by" not in report
 
 
-def test_storage_evidence_requires_ceiling_queue_and_worker_pressure() -> None:
+def test_storage_pressure_screen_routes_a_candidate_without_claiming_causality() -> (
+    None
+):
     report = summarize_intervals(
         _synthetic_intervals(
             ssd_gib_s=11.8,
@@ -90,9 +94,24 @@ def test_storage_evidence_requires_ceiling_queue_and_worker_pressure() -> None:
 
     assert report["evidence"]["ssd_saturation"]["status"] == "supported"
     assert report["attribution"] == {
-        "status": "conclusive",
+        "status": "incomplete",
         "candidates": ["storage_throughput"],
     }
+
+
+def test_gpu_activity_screen_routes_a_candidate_without_claiming_causality() -> None:
+    report = summarize_intervals(
+        _synthetic_intervals(ssd_gib_s=2.0),
+        ssd_ceiling_gib_s=12.5,
+        powermetrics={
+            "available": True,
+            "process_gpu_busy_fraction": 0.9,
+        },
+    )
+
+    assert report["evidence"]["gpu_activity"]["status"] == "supported"
+    assert report["attribution"]["status"] == "incomplete"
+    assert "gpu_compute" in report["attribution"]["candidates"]
 
 
 def test_cached_reader_bytes_cannot_establish_ssd_saturation() -> None:
@@ -127,7 +146,7 @@ def test_missing_powermetrics_is_coverage_not_zero_gpu_usage() -> None:
     assert report["coverage"]["gpu_reason"] == "sudo requires a password"
 
 
-def test_low_overlap_is_reported_as_evidence_not_a_bound_label() -> None:
+def test_io_fence_coactivity_is_labeled_coarse_not_simultaneous() -> None:
     report = summarize_intervals(
         _synthetic_intervals(
             ssd_gib_s=3.0,
@@ -139,12 +158,13 @@ def test_low_overlap_is_reported_as_evidence_not_a_bound_label() -> None:
         powermetrics=None,
     )
 
-    assert report["overlap"]["io_active_fraction"] == 0.5
-    assert report["overlap"]["completion_fence_pending_fraction"] == 0.5
-    assert report["overlap"]["both_fraction"] == 0.0
-    assert (
-        "synchronization_or_insufficient_overlap" in report["attribution"]["candidates"]
-    )
+    assert report["overlap"]["measurement"] == "same_interval_coactivity"
+    assert report["overlap"]["simultaneous_overlap_measured"] is False
+    assert report["overlap"]["io_activity_interval_fraction"] == 0.5
+    assert report["overlap"]["fence_activity_interval_fraction"] == 0.5
+    assert report["overlap"]["same_interval_activity_fraction"] == 0.0
+    assert "both_fraction" not in report["overlap"]
+    assert "coarse_io_fence_separation" in report["attribution"]["candidates"]
 
 
 def test_completion_backlog_summary_keeps_work_and_slot_occupancy() -> None:
@@ -299,6 +319,8 @@ def test_sampler_differences_counters_and_occupancy_on_one_clock() -> None:
     assert interval["mean_queued_reads"] == 0.5
     assert interval["mean_active_readers"] == 2.0
     assert interval["q4_assignments_per_second"] == 80.0
+    assert interval["io_and_completion_fence_seen_in_interval"] is True
+    assert "io_and_completion_fence_active" not in interval
 
 
 def test_bounded_sampler_preserves_run_start_for_cumulative_summary() -> None:
@@ -332,6 +354,40 @@ def test_bounded_sampler_preserves_run_start_for_cumulative_summary() -> None:
     assert report["coverage"]["timeline"] == "retained_start_and_recent_tail"
     assert report["attribution"]["status"] == "incomplete"
     assert "increase_resource_max_samples" in report["attribution"]["candidates"]
+
+
+def test_persistent_periodic_sampler_failure_marks_evidence_incomplete() -> None:
+    calls = 0
+    failed = threading.Event()
+
+    def snapshot() -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            failed.set()
+            raise RuntimeError("injected persistent snapshot failure")
+        return _snapshot(
+            read_bytes=0,
+            read_ops=0,
+            requests=0,
+            queue_ns=0,
+            active_ns=0,
+        )
+
+    sampler = ResourceTelemetrySampler(
+        snapshot,
+        token_count=lambda: 0,
+        interval_s=0.001,
+        max_samples=8,
+    )
+    with sampler:
+        assert failed.wait(timeout=1.0)
+
+    report = sampler.report(ssd_ceiling_gib_s=12.5)
+    assert report["sampling_failures"] == 1
+    assert report["coverage"]["timeline"] == "incomplete_sampler_failure"
+    assert report["attribution"]["status"] == "incomplete"
+    assert "resource_sampler_failure" in report["attribution"]["candidates"]
 
 
 def _snapshot(

@@ -48,27 +48,32 @@ For the matched headline lane, remove `--resource-telemetry`,
 2. Read `storage` and `reader_pool` together. SSD throughput alone cannot
    distinguish device saturation from an underfed device.
 3. Read `completion_fences` and `overlap` to see whether reads and outstanding
-   Metal-consumer work coexist or alternate.
+   Metal-consumer work appear in the same sampling intervals. This is coarse
+   coactivity evidence, not a simultaneous-overlap measurement.
 4. Read `host.generation_thread_core_fraction` and measured GPU evidence.
 5. Use `cache_by_layer` to find whether aggregate demand is concentrated in a
    subset of routed layers.
-6. Treat `attribution.candidates` as the supported next investigations. Only a
-   `conclusive` status establishes a directly measured saturated resource.
+6. Treat `attribution.candidates` as the supported next investigations. This
+   sampler does not perform a causal intervention, so its attribution remains
+   `incomplete` even when a pressure screen is positive.
 
 ## Evidence matrix
 
 | Observed evidence | Defensible conclusion | Operations to investigate |
 | --- | --- | --- |
-| Read queue nonempty, readers near capacity, uncached reader throughput near the supplied SSD ceiling | Storage throughput is limiting | Reader bytes per token, cache hit rate, eviction policy, record layout |
+| Read queue nonempty, readers near capacity, uncached reader throughput near the supplied SSD ceiling | The storage-pressure screen is positive; storage throughput is a candidate | Reader bytes per token, cache hit rate, eviction policy, record layout; vary read shape or demand and measure the paired throughput response |
 | Read queue nonempty and readers near capacity, but SSD below its ceiling | Backpressure exists before the device ceiling | Reader count, request size, batching, positional-read shape, completion processing |
 | Cache misses occur while the read queue is empty and SSD use is low | The device is being starved | Route submission, dependency ordering, prefetch distance, producer serialization |
 | Generation thread is near one full core while measured SSD and GPU activity are low | Host orchestration is a candidate | Python routing, wave construction, dispatch preparation, per-token bookkeeping |
 | Measured process GPU activity is high while the read queue is empty | GPU compute is a candidate | Kernel shape, quantized matmul, gather/scatter, batch geometry |
-| I/O-active and completion-fence-active intervals are common individually but rarely overlap | Synchronization or insufficient overlap is a candidate | Fence placement, work submission order, miss/compute pipelining |
+| I/O-active and completion-fence-active intervals are common individually but rarely occur in the same sampling interval | Coarse I/O/fence separation is a candidate | Fence placement, work submission order, miss/compute pipelining; add a narrower probe before claiming serialization |
 | Synchronous fences are frequent while asynchronous completion-fence occupancy is absent | Explicit evaluation or fence placement is a candidate | `mx.eval` sites, forced-sync route waves, graph boundaries, slot-release ordering |
 | All measured resources remain below their ceilings, or GPU/DRAM coverage is absent | Attribution is incomplete | Obtain missing counters or add a narrower probe; do not name a bottleneck |
 
-The current evidence thresholds are intentionally conservative:
+The current evidence thresholds are screening heuristics, not promotion gates
+or causal cutoffs. Reports retain the continuous measurements, and a candidate
+must be tested with a matched intervention and repeated uncertainty estimate
+before it is called a bottleneck:
 
 - SSD saturation requires at least 75% of the supplied SSD ceiling, at least
   75% mean reader-capacity use, and a nonempty read queue in at least 50% of
@@ -113,10 +118,12 @@ The current evidence thresholds are intentionally conservative:
   operation counts with both synchronous fences and measured occupancy; a
   registration count alone says nothing about how long a barrier waited.
 
-`overlap.both_fraction`
-: Fraction of sampled intervals with reader work and an active completion fence
-  at the same time. Compare with the individual active fractions before
-  concluding that overlap is missing.
+`overlap.same_interval_activity_fraction`
+: Fraction of sampling intervals in which both reader work and an active
+  completion fence were observed. Independent state-change integrals feed this
+  sampled signal, so work may have occurred sequentially inside one interval.
+  `simultaneous_overlap_measured` is therefore always false. Use this field to
+  choose a narrower probe, not to claim simultaneous overlap or serialization.
 
 `throughput.q4_assignments_per_second`
 : Routed Q4 expert assignments observed by the cache policy per wall second.

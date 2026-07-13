@@ -1133,8 +1133,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "Capture diagnostic resource throughput, queue occupancy, and "
-            "I/O/Metal overlap. Off by default; enabled runs are diagnostic, "
-            "not headline timing lanes."
+            "same-interval I/O/Metal coactivity. Off by default; enabled runs "
+            "are diagnostic, not headline timing lanes."
         ),
     )
     parser.add_argument(
@@ -1401,26 +1401,19 @@ def validate_resource_flags(
 
 class _ConcurrentTokenCounter:
     def __init__(self) -> None:
-        self._counts: dict[str, int] = {}
+        self._count = 0
 
-    def observe(self, state) -> None:
-        for stream in state.live:
-            request_id = str(stream.request_id)
-            self._counts[request_id] = max(
-                self._counts.get(request_id, 0),
-                int(stream.generated_tokens),
-            )
+    def observe(self, state, *, completed_tokens: int) -> None:
+        observed = int(completed_tokens) + sum(
+            int(stream.generated_tokens) for stream in state.live
+        )
+        self._count = max(self._count, observed)
 
     def finish(self, results) -> None:
-        for result in results:
-            request_id = str(result.request_id)
-            self._counts[request_id] = max(
-                self._counts.get(request_id, 0),
-                len(result.tokens),
-            )
+        self._count = max(self._count, sum(len(result.tokens) for result in results))
 
     def count(self) -> int:
-        return sum(self._counts.values())
+        return self._count
 
 
 @contextmanager
@@ -1461,6 +1454,43 @@ def _attach_resource_report(
         generation_elapsed_ns=generation_elapsed_ns,
         final_completion_tokens=final_completion_tokens,
     )
+
+
+def _run_reference_generation(
+    args,
+    runtime,
+    *,
+    prompt_ids,
+    max_tokens: int,
+    sampler,
+    token_callback,
+    resource_run: ResourceRun | None,
+    generate_ar_fn,
+    generate_mtp1_fn,
+):
+    thread_cpu_started = time.thread_time_ns() if resource_run is not None else 0
+    started = time.perf_counter()
+    with runtime.admit_kv_tokens(len(prompt_ids) + max_tokens):
+        if args.enable_mtp:
+            result = generate_mtp1_fn(
+                runtime,
+                prompt_ids,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                seed=args.seed,
+            )
+        else:
+            result = generate_ar_fn(
+                runtime,
+                prompt_ids,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                seed=args.seed,
+                token_callback=token_callback,
+            )
+    finished = time.perf_counter()
+    thread_cpu_finished = time.thread_time_ns() if resource_run is not None else 0
+    return result, started, finished, thread_cpu_started, thread_cpu_finished
 
 
 def build_concurrent_requests(
@@ -1569,9 +1599,10 @@ def _run_concurrent_repeats(
         before = runtime.expert_streaming_snapshot()
         workload_shape = getattr(args, "workload_shape", "static")
         join_after_step = int(getattr(args, "join_after_step", 2))
+        telemetry_enabled = bool(args.resource_telemetry)
         runner_box: list[StreamedBatchRunner] = []
         join_submission_step: int | None = None
-        token_counter = _ConcurrentTokenCounter()
+        token_counter = _ConcurrentTokenCounter() if telemetry_enabled else None
 
         def submit_joiners(state) -> None:
             nonlocal join_submission_step
@@ -1585,14 +1616,24 @@ def _run_concurrent_repeats(
                 join_submission_step = state.step
 
         def observe_step(state) -> None:
-            token_counter.observe(state)
+            assert token_counter is not None
+            completed_tokens = sum(
+                len(result.tokens) for result in runner_box[0]._results.values()
+            )
+            token_counter.observe(state, completed_tokens=completed_tokens)
             submit_joiners(state)
 
+        if telemetry_enabled:
+            step_callback = observe_step
+        elif workload_shape == "mixed-join":
+            step_callback = submit_joiners
+        else:
+            step_callback = None
         runner = StreamedBatchRunner(
             runtime,
             max_concurrency=args.concurrency,
             max_prefills_per_step=args.max_prefills_per_step,
-            on_step=observe_step,
+            on_step=step_callback,
         )
         runner_box.append(runner)
         initial_requests = requests[:1] if workload_shape == "mixed-join" else requests
@@ -1601,18 +1642,30 @@ def _run_concurrent_repeats(
         with _resource_telemetry(
             args,
             runtime,
-            token_counter.count,
+            token_counter.count if token_counter is not None else None,
         ) as resource_run:
-            started = time.perf_counter()
-            thread_cpu_started = time.thread_time_ns()
-            results = runner.run()
-            token_counter.finish(results)
-            thread_cpu_finished = time.thread_time_ns()
-            finished = time.perf_counter()
-        if workload_shape == "mixed-join" and join_submission_step is None:
-            raise RuntimeError(
-                "initial stream finished before the mixed-join submission step"
-            )
+            if resource_run is None:
+                thread_cpu_started = 0
+                started = time.perf_counter()
+                results = runner.run()
+                if workload_shape == "mixed-join" and join_submission_step is None:
+                    raise RuntimeError(
+                        "initial stream finished before the mixed-join submission step"
+                    )
+                finished = time.perf_counter()
+                thread_cpu_finished = 0
+            else:
+                thread_cpu_started = time.thread_time_ns()
+                started = time.perf_counter()
+                results = runner.run()
+                if workload_shape == "mixed-join" and join_submission_step is None:
+                    raise RuntimeError(
+                        "initial stream finished before the mixed-join submission step"
+                    )
+                finished = time.perf_counter()
+                thread_cpu_finished = time.thread_time_ns()
+                assert token_counter is not None
+                token_counter.finish(results)
         elapsed = finished - started
         after = runtime.expert_streaming_snapshot()
         streams = []
@@ -2033,31 +2086,24 @@ def _main() -> int:
                 runtime,
                 lambda: decoded_count,
             ) as resource_run:
-                started = time.perf_counter()
-                thread_cpu_started = time.thread_time_ns()
-                with runtime.admit_kv_tokens(len(prompt_ids) + max_tokens):
-                    if args.enable_mtp:
-                        # generate_mtp1 exposes accept/reject telemetry through
-                        # generation_stats instead of a token callback.
-                        result = generate_mtp1(
-                            runtime,
-                            prompt_ids,
-                            max_tokens=max_tokens,
-                            sampler=sampler,
-                            seed=args.seed,
-                        )
-                    else:
-                        result = generate_ar(
-                            runtime,
-                            prompt_ids,
-                            max_tokens=max_tokens,
-                            sampler=sampler,
-                            seed=args.seed,
-                            token_callback=token_callback,
-                        )
+                (
+                    result,
+                    started,
+                    finished,
+                    thread_cpu_started,
+                    thread_cpu_finished,
+                ) = _run_reference_generation(
+                    args,
+                    runtime,
+                    prompt_ids=prompt_ids,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    token_callback=token_callback,
+                    resource_run=resource_run,
+                    generate_ar_fn=generate_ar,
+                    generate_mtp1_fn=generate_mtp1,
+                )
                 decoded_count = len(result.tokens)
-                thread_cpu_finished = time.thread_time_ns()
-                finished = time.perf_counter()
             elapsed = finished - started
             after = runtime.expert_streaming_snapshot()
             token_ids = [int(token) for token in result.tokens]
