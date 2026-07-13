@@ -55,6 +55,37 @@ def test_global_prefill_seed_accepts_chunk_wider_than_route_capacity() -> None:
     assert bank.prepare_prefill_seed(1, [0, 1, 0]) == (0, 1)
 
 
+def test_global_joining_prefill_cannot_evict_decode_hot_set() -> None:
+    bank = GlobalExpertSlotBank(
+        layer_indices=(1, 2),
+        expert_count=4,
+        persistent_slots=2,
+        transient_slots=2,
+        prefill_slots_per_layer=1,
+        cache_policy="lru",
+    )
+    for layer in (1, 2):
+        plan, transaction = bank.plan_transaction(layer, [0], phase="decode")
+        transaction.commit()
+        assert plan.loads[0].persistent is True
+
+    resident_before = bank.resident_experts_by_layer
+    snapshot_before = bank.snapshot()
+
+    # A joining prompt wants two cold experts while the fixed global cache is
+    # full.  Prefill may use the service slots, but it cannot repurpose either
+    # layer's established decode-hot slot.
+    assert bank.prepare_prefill_seed(1, [1, 2, 1]) == ()
+    joining_prefill = bank.plan(1, [1, 2], phase="prefill")
+
+    assert joining_prefill.slots == (2, 3)
+    assert all(not load.persistent for load in joining_prefill.loads)
+    assert joining_prefill.evictions == ()
+    assert bank.resident_experts_by_layer == resident_before
+    assert bank.occupancy == bank.persistent_slots == 2
+    assert bank.snapshot() == snapshot_before
+
+
 def test_global_cache_uses_total_capacity_as_transient_slot_base() -> None:
     bank = GlobalExpertSlotBank(
         layer_indices=(1, 2),
