@@ -118,6 +118,8 @@ class CacheCounters:
 
     route_calls: int = 0
     expert_requests: int = 0
+    unique_expert_requests: int = 0
+    shared_expert_assignments: int = 0
     expert_hits: int = 0
     expert_misses: int = 0
     persistent_loads: int = 0
@@ -130,9 +132,12 @@ class CacheCounters:
             "expert_record_bytes", expert_record_bytes, minimum=0
         )
         hit_experts = set(plan.hits)
+        unique_request_count = len(set(plan.experts))
         assignment_hits = sum(expert in hit_experts for expert in plan.experts)
         self.route_calls += 1
         self.expert_requests += len(plan.experts)
+        self.unique_expert_requests += unique_request_count
+        self.shared_expert_assignments += len(plan.experts) - unique_request_count
         self.expert_hits += assignment_hits
         self.expert_misses += len(plan.experts) - assignment_hits
         self.persistent_loads += sum(load.persistent for load in plan.loads)
@@ -149,6 +154,8 @@ class CacheCounters:
         return {
             "route_calls": self.route_calls,
             "expert_requests": self.expert_requests,
+            "unique_expert_requests": self.unique_expert_requests,
+            "shared_expert_assignments": self.shared_expert_assignments,
             "expert_hits": self.expert_hits,
             "expert_misses": self.expert_misses,
             "hit_rate": self.hit_rate,

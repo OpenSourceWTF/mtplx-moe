@@ -410,6 +410,8 @@ def test_counters_preserve_router_assignment_multiplicity() -> None:
     counters.observe(plan, expert_record_bytes=100)
 
     assert counters.expert_requests == 3
+    assert counters.unique_expert_requests == 2
+    assert counters.shared_expert_assignments == 1
     assert counters.expert_misses == 3
     assert counters.transient_loads == 2
     assert counters.bytes_read == 200
