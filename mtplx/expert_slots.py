@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -11,7 +12,11 @@ from typing import Any, Callable, Iterable
 
 from .expert_io import ExpertIOError, PositionalExpertReader
 from .expert_manifest import ExpertManifest, ExpertManifestError, ExpertRecord
-from .resource_metrics import PoolOccupancy
+from .resource_metrics import (
+    ExpertPipelineLedger,
+    ExpertPipelineRoute,
+    PoolOccupancy,
+)
 from .expert_streaming import RoutePlan, SlotLoad
 from .expert_streaming_models import (
     ExpertMemoryPlan,
@@ -29,6 +34,10 @@ class ExpertCompletionFenceError(ExpertSlotError):
     def __init__(self, message: str, *, policy_rollback_safe: bool) -> None:
         super().__init__(message)
         self.policy_rollback_safe = bool(policy_rollback_safe)
+
+
+def _closed_allocator(_size: int, _label: str) -> Any:
+    raise ExpertSlotError("expert slot pool is closed; its allocator was released")
 
 
 @dataclass
@@ -64,6 +73,16 @@ class ExpertSlotState(str, Enum):
     CLOSED = "closed"
 
 
+@dataclass(eq=False)
+class _RouteReleaseClaim:
+    released: bool = False
+
+
+@dataclass(eq=False)
+class _SlotPinClaim:
+    active: bool = True
+
+
 @dataclass
 class ExpertSlotMetrics:
     ensure_calls: int = 0
@@ -81,15 +100,98 @@ class ExpertSlotMetrics:
     completion_fence_slots: int = 0
     completion_fence_fallbacks: int = 0
     completion_fence_failures: int = 0
+    _physical_reads_by_layer: dict[int, dict[str, int]] = field(
+        default_factory=dict, repr=False
+    )
     synchronous_fences: int = 0
     synchronous_fence_slots: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _route_claims: list[_RouteReleaseClaim] = field(default_factory=list, repr=False)
+    _admission_test_hook: Callable[[str], None] | None = field(default=None, repr=False)
 
     def update(self, **values: int) -> None:
         with self._lock:
             for name, value in values.items():
                 setattr(self, name, int(getattr(self, name)) + int(value))
             self.active_routes_peak = max(self.active_routes_peak, self.active_routes)
+
+    def admit_route(self, claim: _RouteReleaseClaim) -> None:
+        with self._lock:
+            previous_claims = self._route_claims
+            previous_active = self.active_routes
+            previous_peak = self.active_routes_peak
+            hook = self._admission_test_hook
+            try:
+                if hook is not None:
+                    hook("before_filter")
+                filtered = [item for item in previous_claims if not item.released]
+                if hook is not None:
+                    hook("after_filter")
+                next_claims = [*filtered, claim]
+                if hook is not None:
+                    hook("after_append")
+                next_active = sum(not item.released for item in next_claims)
+                if hook is not None:
+                    hook("after_active_count")
+                next_peak = max(previous_peak, next_active)
+
+                self._route_claims = next_claims
+                self.active_routes = next_active
+                if hook is not None:
+                    hook("after_publish")
+                self.active_routes_peak = next_peak
+                if hook is not None:
+                    hook("after_peak")
+            except BaseException:
+                self._route_claims = previous_claims
+                self.active_routes = previous_active
+                self.active_routes_peak = previous_peak
+                raise
+
+    def release_route(self, claim: _RouteReleaseClaim) -> None:
+        """Consume one token and reconcile aggregate accounting idempotently."""
+
+        with self._lock:
+            claim.released = True
+            self.active_routes = sum(not item.released for item in self._route_claims)
+
+    def observe_physical_read(
+        self,
+        layer: int,
+        *,
+        records: int,
+        elapsed_ns: int,
+    ) -> None:
+        with self._lock:
+            row = self._physical_reads_by_layer.setdefault(
+                int(layer), {"operations": 0, "records": 0, "elapsed_ns": 0}
+            )
+            row["operations"] += 1
+            row["records"] += int(records)
+            row["elapsed_ns"] += int(elapsed_ns)
+
+    def physical_read_latency_by_layer(self) -> dict[str, dict[str, int | float]]:
+        with self._lock:
+            rows = {
+                layer: dict(values)
+                for layer, values in self._physical_reads_by_layer.items()
+            }
+        return {
+            str(layer): {
+                **values,
+                "mean_operation_ms": (
+                    values["elapsed_ns"] / values["operations"] / 1e6
+                    if values["operations"]
+                    else 0.0
+                ),
+                "mean_record_ms": (
+                    values["elapsed_ns"] / values["records"] / 1e6
+                    if values["records"]
+                    else 0.0
+                ),
+            }
+            for layer, values in sorted(rows.items())
+        }
 
     def as_dict(self) -> dict[str, int]:
         with self._lock:
@@ -126,6 +228,7 @@ class _PhysicalSlot:
     expert: int | None = None
     generation: int = 0
     pins: int = 0
+    pin_claims: list[_SlotPinClaim] = field(default_factory=list, repr=False)
     digest: str | None = None
     error: BaseException | None = None
     condition: threading.Condition = field(default_factory=threading.Condition)
@@ -177,17 +280,22 @@ class ReadyRoute:
         pool: ExpertSlotPool,
         plan: RoutePlan,
         bindings: tuple[ExpertSlotBinding, ...],
-        pinned: tuple[_PhysicalSlot, ...],
+        pinned: tuple[tuple[_PhysicalSlot, _SlotPinClaim], ...],
+        lifecycle_claim: _RouteReleaseClaim,
     ) -> None:
         self.pool = pool
         self.plan = plan
         self.bindings = bindings
-        self._pinned = pinned
+        self._pinned = tuple(slot for slot, _claim in pinned)
         self._released = False
         self._route_finished = False
+        self._route_finishing = False
+        self._lifecycle_claim = lifecycle_claim
+        self._pin_claims = {id(slot): claim for slot, claim in pinned}
+        self._release_in_progress = False
         self._release_lock = threading.Lock()
         self._release_condition = threading.Condition(self._release_lock)
-        self._pending_slots = {id(slot): slot for slot in pinned}
+        self._pending_slots = {id(slot): slot for slot, _claim in pinned}
         self._scheduled_slots: set[int] = set()
         self._completion_futures: list[Future[None]] = []
         self._registrations_in_progress = 0
@@ -249,7 +357,7 @@ class ReadyRoute:
         try:
             future = self.pool._submit_completion_fence(
                 completion_waiter,
-                lambda: self._finish_slots(tuple(selected.values())),
+                lambda: self._run_claimed_slot_cleanup(tuple(selected.values())),
                 slot_count=len(selected),
             )
         except BaseException:
@@ -273,44 +381,115 @@ class ReadyRoute:
 
     def _finish_slots(self, slots: tuple[_PhysicalSlot, ...]) -> None:
         for slot in slots:
-            with slot.condition:
-                if slot.pins <= 0:
-                    raise ExpertSlotError("slot pin accounting underflow")
-                slot.pins -= 1
-                slot.condition.notify_all()
+            self._finish_slot_claim(slot)
         finish_route = False
-        with self._release_lock:
-            for slot in slots:
-                slot_id = id(slot)
-                self._pending_slots.pop(slot_id, None)
-                self._scheduled_slots.discard(slot_id)
-            if self._released and not self._pending_slots and not self._route_finished:
-                self._route_finished = True
+        with self._release_condition:
+            if (
+                self._released
+                and not self._pending_slots
+                and not self._route_finished
+                and not self._route_finishing
+            ):
+                self._route_finishing = True
                 finish_route = True
         if finish_route:
-            self.pool._route_released()
+            self._finish_route_lifecycle()
+
+    def _finish_slot_claim(self, slot: _PhysicalSlot) -> None:
+        slot_id = id(slot)
+        with self._release_condition:
+            if slot_id not in self._pending_slots:
+                self._scheduled_slots.discard(slot_id)
+                return
+            claim = self._pin_claims[slot_id]
+            self._release_physical_claim(slot, claim)
+            self._complete_slot_claim(slot_id)
+            self._release_condition.notify_all()
+
+    @staticmethod
+    def _release_physical_claim(slot: _PhysicalSlot, claim: _SlotPinClaim) -> None:
+        with slot.condition:
+            claim.active = False
+            slot.pins = sum(item.active for item in slot.pin_claims)
+            slot.condition.notify_all()
+
+    def _complete_slot_claim(self, slot_id: int) -> None:
+        slot = self._pending_slots.get(slot_id)
+        claim = self._pin_claims.get(slot_id)
+        if slot is not None and claim is not None and claim in slot.pin_claims:
+            slot.pin_claims.remove(claim)
+        self._pending_slots.pop(slot_id, None)
+        self._pin_claims.pop(slot_id, None)
+        self._scheduled_slots.discard(slot_id)
+
+    def _mark_slot_cleanup_failure(
+        self,
+        slots: tuple[_PhysicalSlot, ...],
+        error: BaseException,
+    ) -> None:
+        with self._release_condition:
+            for slot in slots:
+                slot_id = id(slot)
+                if slot_id in self._pending_slots:
+                    self._scheduled_slots.discard(slot_id)
+            self._release_condition.notify_all()
+        self.pool._record_cleanup_error(error)
+
+    def _run_claimed_slot_cleanup(self, slots: tuple[_PhysicalSlot, ...]) -> None:
+        try:
+            self._finish_slots(slots)
+        except BaseException as exc:
+            self._mark_slot_cleanup_failure(slots, exc)
+            raise
+
+    def _finish_route_lifecycle(self) -> None:
+        try:
+            self.pool._route_released(self._lifecycle_claim)
+        except BaseException as exc:
+            with self._release_condition:
+                self._route_finishing = False
+                self._release_condition.notify_all()
+            self.pool._record_cleanup_error(exc)
+            raise
+        with self._release_condition:
+            self._route_finishing = False
+            self._route_finished = True
+            self._release_condition.notify_all()
 
     def release(self, *, synchronize: bool = True) -> None:
+        with self._release_condition:
+            while self._release_in_progress:
+                if not synchronize:
+                    return
+                self._release_condition.wait()
+            self._release_in_progress = True
+        try:
+            self._release_owned(synchronize=synchronize)
+        finally:
+            with self._release_condition:
+                self._release_in_progress = False
+                self._release_condition.notify_all()
+
+    def _release_owned(self, *, synchronize: bool) -> None:
         with self._release_condition:
             first_release = not self._released
             self._released = True
             while self._registrations_in_progress:
                 self._release_condition.wait()
-            immediate = (
-                tuple(
-                    slot
-                    for slot_id, slot in self._pending_slots.items()
-                    if slot_id not in self._scheduled_slots
-                )
-                if first_release
-                else ()
+            immediate = tuple(
+                slot
+                for slot_id, slot in self._pending_slots.items()
+                if slot_id not in self._scheduled_slots
             )
+            self._scheduled_slots.update(id(slot) for slot in immediate)
             futures = tuple(self._completion_futures)
             finish_empty = (
-                first_release and not self._pending_slots and not self._route_finished
+                not self._pending_slots
+                and not self._route_finished
+                and not self._route_finishing
             )
             if finish_empty:
-                self._route_finished = True
+                self._route_finishing = True
         synchronize_error: BaseException | None = None
         cleanup_error: BaseException | None = None
         future_error: BaseException | None = None
@@ -323,9 +502,9 @@ class ReadyRoute:
                 synchronize_error = exc
         try:
             if immediate:
-                self._finish_slots(immediate)
+                self._run_claimed_slot_cleanup(immediate)
             elif finish_empty:
-                self.pool._route_released()
+                self._finish_route_lifecycle()
         except BaseException as exc:
             cleanup_error = exc
         if synchronize:
@@ -337,10 +516,10 @@ class ReadyRoute:
                         future_error = exc
         if synchronize_error is not None:
             raise synchronize_error
-        if cleanup_error is not None:
-            raise cleanup_error
         if future_error is not None:
             raise ExpertSlotError("expert completion fence failed") from future_error
+        if cleanup_error is not None:
+            raise cleanup_error
         if synchronize:
             self.pool._raise_completion_error()
 
@@ -354,17 +533,57 @@ class ReadyRoute:
 class _RouteLifecycle:
     """One extra active-route hold spanning a multi-part transaction."""
 
-    def __init__(self, pool: ExpertSlotPool) -> None:
+    def __init__(self, pool: ExpertSlotPool, claim: _RouteReleaseClaim) -> None:
         self.pool = pool
-        self._released = False
-        self._lock = threading.Lock()
+        self._claim = claim
 
     def release(self) -> None:
-        with self._lock:
-            if self._released:
-                return
-            self._released = True
-        self.pool._route_released()
+        try:
+            self.pool._route_released(self._claim)
+        except BaseException as exc:
+            self.pool._record_cleanup_error(exc)
+            raise
+
+
+class _FailedRouteSetupOwner:
+    """Retryable owner for pins and lifecycle from failed route construction."""
+
+    def __init__(
+        self,
+        pool: ExpertSlotPool,
+        lifecycle: _RouteLifecycle,
+        pins: dict[int, tuple[_PhysicalSlot, _SlotPinClaim]],
+    ) -> None:
+        self.pool = pool
+        self.lifecycle = lifecycle
+        self.pins = pins
+
+    @property
+    def terminal(self) -> bool:
+        return not self.pins and self.lifecycle._claim.released
+
+    def release(self) -> None:
+        hook = self.pool._failed_setup_cleanup_test_hook
+        for slot_id, (slot, claim) in tuple(self.pins.items()):
+            if hook is not None:
+                hook("before_pin", slot_id)
+            with slot.condition:
+                claim.active = False
+                slot.pins = sum(item.active for item in slot.pin_claims)
+                slot.condition.notify_all()
+            if hook is not None:
+                hook("after_pin_reconcile", slot_id)
+            with slot.condition:
+                if claim in slot.pin_claims:
+                    slot.pin_claims.remove(claim)
+            if hook is not None:
+                hook("after_pin_list", slot_id)
+            self.pins.pop(slot_id, None)
+        if hook is not None:
+            hook("before_lifecycle", -1)
+        self.lifecycle.release()
+        if hook is not None:
+            hook("after_lifecycle", -1)
 
 
 class _CombinedCancel:
@@ -397,6 +616,7 @@ class ExpertSlotPool:
         device_synchronize: Callable[[], None] | None = None,
         cache_scope: str = "layer",
         resource_telemetry: bool = False,
+        pipeline_ledger: ExpertPipelineLedger | None = None,
     ) -> None:
         if plan.model_key != spec.key or manifest.model_key != spec.key:
             raise ValueError("spec, memory plan, and manifest model keys must match")
@@ -429,6 +649,7 @@ class ExpertSlotPool:
         if not isinstance(resource_telemetry, bool):
             raise TypeError("resource_telemetry must be bool")
         self.resource_telemetry_enabled = resource_telemetry
+        self._pipeline_ledger = pipeline_ledger
         if cache_scope not in {"layer", "global"}:
             raise ValueError("cache_scope must be 'layer' or 'global'")
         self.cache_scope = cache_scope
@@ -457,6 +678,10 @@ class ExpertSlotPool:
         self._close_lock = threading.Lock()
         self._closing = False
         self._closed = False
+        self._route_setup_test_hook: Callable[[str], None] | None = None
+        self._failed_setup_cleanup_test_hook: Callable[[str, int], None] | None = None
+        self._cleanup_owner_lock = threading.Lock()
+        self._cleanup_owners: list[_FailedRouteSetupOwner] = []
 
         allocated = 0
         try:
@@ -518,6 +743,7 @@ class ExpertSlotPool:
         )
         self._completion_error_lock = threading.Lock()
         self._completion_error: BaseException | None = None
+        self._cleanup_error: BaseException | None = None
 
     @staticmethod
     def _run_tracked(
@@ -556,6 +782,141 @@ class ExpertSlotPool:
             telemetry.rejected(units)
             raise
 
+    def _pipeline_call(
+        self,
+        route: ExpertPipelineRoute,
+        method: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Publish optional diagnostics without changing slot outcomes."""
+
+        try:
+            getattr(route, method)(*args, **kwargs)
+        except Exception:
+            self._mark_pipeline_incomplete(route)
+
+    def _mark_pipeline_incomplete(self, route: ExpertPipelineRoute) -> None:
+        ledger = self._pipeline_ledger
+        if ledger is not None:
+            try:
+                ledger.mark_incomplete(phase=route.phase)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _diagnostic_monotonic_ns() -> int | None:
+        try:
+            value = time.monotonic_ns()
+        except Exception:
+            return None
+        return (
+            value
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            else None
+        )
+
+    @staticmethod
+    def _diagnostic_thread_time_ns() -> int | None:
+        try:
+            value = time.thread_time_ns()
+        except Exception:
+            return None
+        return (
+            value
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            else None
+        )
+
+    def _pipeline_thread_cpu_elapsed(
+        self,
+        route: ExpertPipelineRoute,
+        started_ns: int | None,
+    ) -> int:
+        if started_ns is None:
+            return 0
+        completed_ns = self._diagnostic_thread_time_ns()
+        if completed_ns is None or completed_ns < started_ns:
+            self._mark_pipeline_incomplete(route)
+            return 0
+        return completed_ns - started_ns
+
+    def _run_pipeline_reader(
+        self,
+        telemetry: PoolOccupancy | None,
+        units: int,
+        route: ExpertPipelineRoute,
+        experts: tuple[int, ...],
+        callback: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if telemetry is not None:
+            telemetry.started(units)
+        self._pipeline_call(route, "reader_started", experts)
+        cpu_started_ns = self._diagnostic_thread_time_ns()
+        if cpu_started_ns is None:
+            self._mark_pipeline_incomplete(route)
+        try:
+            result = callback(*args, **kwargs)
+        except BaseException:
+            self._pipeline_call(
+                route,
+                "reader_failed",
+                experts,
+                thread_cpu_ns=self._pipeline_thread_cpu_elapsed(
+                    route,
+                    cpu_started_ns,
+                ),
+            )
+            raise
+        else:
+            self._pipeline_call(
+                route,
+                "reader_completed",
+                experts,
+                thread_cpu_ns=self._pipeline_thread_cpu_elapsed(
+                    route,
+                    cpu_started_ns,
+                ),
+            )
+            return result
+        finally:
+            if telemetry is not None:
+                telemetry.completed(units)
+
+    def _submit_pipeline_reader(
+        self,
+        route: ExpertPipelineRoute,
+        experts: tuple[int, ...],
+        units: int,
+        callback: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Future[Any]:
+        telemetry = self._reader_pool_telemetry
+        if telemetry is not None:
+            telemetry.submitted(units)
+        self._pipeline_call(route, "submission_attempted", experts)
+        try:
+            future = self._executor.submit(
+                self._run_pipeline_reader,
+                telemetry,
+                units,
+                route,
+                experts,
+                callback,
+                *args,
+                **kwargs,
+            )
+        except BaseException:
+            if telemetry is not None:
+                telemetry.rejected(units)
+            self._pipeline_call(route, "submission_rejected", experts)
+            raise
+        self._pipeline_call(route, "submission_accepted", experts)
+        return future
+
     def _submit_completion_fence(
         self,
         completion_waiter: Callable[[], None],
@@ -569,14 +930,24 @@ class ExpertSlotPool:
         )
 
         def wait_and_release() -> None:
+            waiter_error: BaseException | None = None
+            cleanup_error: BaseException | None = None
             try:
                 completion_waiter()
             except BaseException as exc:
                 self.metrics.update(completion_fence_failures=1)
                 self._record_completion_error(exc)
-                raise
-            finally:
+                waiter_error = exc
+            try:
                 on_complete()
+            except BaseException as exc:
+                self.metrics.update(completion_fence_failures=1)
+                self._record_cleanup_error(exc)
+                cleanup_error = exc
+            if waiter_error is not None:
+                raise waiter_error
+            if cleanup_error is not None:
+                raise cleanup_error
 
         try:
             if self._completion_fence_telemetry is None:
@@ -607,6 +978,11 @@ class ExpertSlotPool:
             if self._completion_error is None:
                 self._completion_error = error
 
+    def _record_cleanup_error(self, error: BaseException) -> None:
+        with self._completion_error_lock:
+            if self._cleanup_error is None:
+                self._cleanup_error = error
+
     def _raise_completion_error_locked(
         self,
         *,
@@ -618,6 +994,8 @@ class ExpertSlotPool:
                 "an asynchronous expert completion fence failed",
                 policy_rollback_safe=policy_rollback_safe,
             ) from error
+        if self._cleanup_error is not None:
+            raise ExpertSlotError("expert slot cleanup failed") from self._cleanup_error
 
     def _raise_completion_error(
         self,
@@ -632,6 +1010,7 @@ class ExpertSlotPool:
     def raise_if_unhealthy(self) -> None:
         """Reject new policy or slot work after a terminal fence failure."""
 
+        self._retry_cleanup_owners()
         self._raise_completion_error()
 
     def commit_if_healthy(self, callback: Callable[[], None]) -> None:
@@ -709,70 +1088,134 @@ class ExpertSlotPool:
         load: SlotLoad,
         *,
         deadline_ns: int | None,
+        pipeline_route: ExpertPipelineRoute | None = None,
     ) -> tuple[_PhysicalSlot, int, bool, _PreparedSlotState | None]:
         slot = self._physical(layer, load.slot)
-        with slot.condition:
-            while True:
-                if self._closed or slot.state is ExpertSlotState.CLOSED:
-                    raise ExpertSlotError("expert slot pool is closed")
-                if self._closing:
-                    raise ExpertSlotError("expert slot pool is closing")
-                self._raise_completion_error()
-                if (
-                    slot.layer == layer
-                    and slot.expert == load.expert
-                    and slot.state in {ExpertSlotState.LOADING, ExpertSlotState.READY}
-                    and (load.generation is None or slot.generation == load.generation)
-                ):
-                    if slot.state is ExpertSlotState.LOADING:
-                        self.metrics.update(deduplicated_loads=1)
-                    else:
-                        self.metrics.update(ready_hits=1)
-                    return slot, slot.generation, False, None
-                if slot.state is ExpertSlotState.LOADING:
-                    self.metrics.update(load_waits=1)
-                    slot.condition.wait(self._remaining(deadline_ns))
-                    continue
-                if slot.pins:
-                    self.metrics.update(pin_waits=1)
-                    slot.condition.wait(self._remaining(deadline_ns))
+        block_observations: list[tuple[str, int]] | None = (
+            [] if pipeline_route is not None else None
+        )
+        block_clock_failed = False
+        try:
+            with slot.condition:
+                while True:
+                    if self._closed or slot.state is ExpertSlotState.CLOSED:
+                        raise ExpertSlotError("expert slot pool is closed")
+                    if self._closing:
+                        raise ExpertSlotError("expert slot pool is closing")
                     self._raise_completion_error()
-                    continue
-                self._raise_completion_error()
-                previous_state = slot.state
-                previous_layer = slot.layer
-                previous_expert = slot.expert
-                previous_generation = slot.generation
-                previous_digest = slot.digest
-                previous_error = slot.error
-                replacing = slot.state is ExpertSlotState.READY
-                if load.generation is None:
-                    slot.generation += 1
-                else:
-                    if load.generation <= slot.generation:
-                        raise ExpertSlotError(
-                            "stale global cache generation requested for slot"
+                    if (
+                        slot.layer == layer
+                        and slot.expert == load.expert
+                        and slot.state
+                        in {ExpertSlotState.LOADING, ExpertSlotState.READY}
+                        and (
+                            load.generation is None
+                            or slot.generation == load.generation
                         )
-                    slot.generation = load.generation
-                previous = _PreparedSlotState(
-                    slot=slot,
-                    owned_generation=slot.generation,
-                    state=previous_state,
-                    layer=previous_layer,
-                    expert=previous_expert,
-                    generation=previous_generation,
-                    digest=previous_digest,
-                    error=previous_error,
-                )
-                slot.layer = layer
-                slot.expert = load.expert
-                slot.state = ExpertSlotState.LOADING
-                slot.digest = None
-                slot.error = None
-                if replacing:
-                    self.metrics.update(generation_replacements=1)
-                self.metrics.update(owned_loads=1)
-                return slot, slot.generation, True, previous
+                    ):
+                        if slot.state is ExpertSlotState.LOADING:
+                            self.metrics.update(deduplicated_loads=1)
+                        else:
+                            self.metrics.update(ready_hits=1)
+                        return slot, slot.generation, False, None
+                    if slot.state is ExpertSlotState.LOADING:
+                        self.metrics.update(load_waits=1)
+                        wait_started_ns = (
+                            self._diagnostic_monotonic_ns()
+                            if block_observations is not None
+                            else None
+                        )
+                        if block_observations is not None and wait_started_ns is None:
+                            block_clock_failed = True
+                        slot.condition.wait(self._remaining(deadline_ns))
+                        if block_observations is not None:
+                            wait_completed_ns = self._diagnostic_monotonic_ns()
+                            if (
+                                wait_started_ns is None
+                                or wait_completed_ns is None
+                                or wait_completed_ns < wait_started_ns
+                            ):
+                                block_clock_failed = True
+                            else:
+                                block_observations.append(
+                                    (
+                                        "slot_loading",
+                                        wait_completed_ns - wait_started_ns,
+                                    )
+                                )
+                        continue
+                    if slot.pins:
+                        self.metrics.update(pin_waits=1)
+                        wait_started_ns = (
+                            self._diagnostic_monotonic_ns()
+                            if block_observations is not None
+                            else None
+                        )
+                        if block_observations is not None and wait_started_ns is None:
+                            block_clock_failed = True
+                        slot.condition.wait(self._remaining(deadline_ns))
+                        if block_observations is not None:
+                            wait_completed_ns = self._diagnostic_monotonic_ns()
+                            if (
+                                wait_started_ns is None
+                                or wait_completed_ns is None
+                                or wait_completed_ns < wait_started_ns
+                            ):
+                                block_clock_failed = True
+                            else:
+                                block_observations.append(
+                                    ("pin_held", wait_completed_ns - wait_started_ns)
+                                )
+                        self._raise_completion_error()
+                        continue
+                    self._raise_completion_error()
+                    previous_state = slot.state
+                    previous_layer = slot.layer
+                    previous_expert = slot.expert
+                    previous_generation = slot.generation
+                    previous_digest = slot.digest
+                    previous_error = slot.error
+                    replacing = slot.state is ExpertSlotState.READY
+                    if load.generation is None:
+                        slot.generation += 1
+                    else:
+                        if load.generation <= slot.generation:
+                            raise ExpertSlotError(
+                                "stale global cache generation requested for slot"
+                            )
+                        slot.generation = load.generation
+                    previous = _PreparedSlotState(
+                        slot=slot,
+                        owned_generation=slot.generation,
+                        state=previous_state,
+                        layer=previous_layer,
+                        expert=previous_expert,
+                        generation=previous_generation,
+                        digest=previous_digest,
+                        error=previous_error,
+                    )
+                    slot.layer = layer
+                    slot.expert = load.expert
+                    slot.state = ExpertSlotState.LOADING
+                    slot.digest = None
+                    slot.error = None
+                    if replacing:
+                        self.metrics.update(generation_replacements=1)
+                    self.metrics.update(owned_loads=1)
+                    return slot, slot.generation, True, previous
+        finally:
+            if pipeline_route is not None:
+                if block_clock_failed:
+                    self._mark_pipeline_incomplete(pipeline_route)
+                if block_observations:
+                    for reason, elapsed_ns in block_observations:
+                        self._pipeline_call(
+                            pipeline_route,
+                            "observe_block",
+                            load.expert,
+                            reason,
+                            elapsed_ns=elapsed_ns,
+                        )
 
     @staticmethod
     def _restore_prepared_slots(prepared: Iterable[_PreparedSlotState]) -> None:
@@ -800,16 +1243,35 @@ class ExpertSlotPool:
         *,
         cancel_event: Any,
         deadline_ns: int | None,
+        pipeline_route: ExpertPipelineRoute | None = None,
     ) -> None:
         try:
-            digest = self.reader.read_record_into(
-                self.manifest,
-                record,
-                slot.buffer,
-                prefer_sidecar=self.prefer_sidecar,
-                verify_hash=self.verify_hashes,
-                cancel_event=cancel_event,
-                deadline_ns=deadline_ns,
+            read_started = time.monotonic_ns()
+            if pipeline_route is None:
+                digest = self.reader.read_record_into(
+                    self.manifest,
+                    record,
+                    slot.buffer,
+                    prefer_sidecar=self.prefer_sidecar,
+                    verify_hash=self.verify_hashes,
+                    cancel_event=cancel_event,
+                    deadline_ns=deadline_ns,
+                )
+            else:
+                digest = self.reader.read_record_into(
+                    self.manifest,
+                    record,
+                    slot.buffer,
+                    prefer_sidecar=self.prefer_sidecar,
+                    verify_hash=self.verify_hashes,
+                    cancel_event=cancel_event,
+                    deadline_ns=deadline_ns,
+                    pipeline_phase=pipeline_route.phase,
+                )
+            self.metrics.observe_physical_read(
+                record.layer,
+                records=1,
+                elapsed_ns=time.monotonic_ns() - read_started,
             )
         except BaseException as exc:
             with slot.condition:
@@ -832,6 +1294,8 @@ class ExpertSlotPool:
             slot.state = ExpertSlotState.READY
             slot.error = None
             slot.condition.notify_all()
+        if pipeline_route is not None:
+            self._pipeline_call(pipeline_route, "record_ready", record.expert)
 
     def _fill_batch(
         self,
@@ -839,15 +1303,46 @@ class ExpertSlotPool:
         *,
         cancel_event: Any,
         deadline_ns: int | None,
+        pipeline_route: ExpertPipelineRoute | None = None,
     ) -> None:
         try:
-            digests = self.reader.read_component_records_into(
-                self.manifest,
-                tuple((record, slot.buffer) for slot, _generation, record in owned),
-                verify_hash=self.verify_hashes,
-                cancel_event=cancel_event,
-                deadline_ns=deadline_ns,
+            read_started = time.monotonic_ns()
+            items = tuple((record, slot.buffer) for slot, _generation, record in owned)
+            if pipeline_route is None:
+                digests = self.reader.read_component_records_into(
+                    self.manifest,
+                    items,
+                    verify_hash=self.verify_hashes,
+                    cancel_event=cancel_event,
+                    deadline_ns=deadline_ns,
+                )
+            else:
+                digests = self.reader.read_component_records_into(
+                    self.manifest,
+                    items,
+                    verify_hash=self.verify_hashes,
+                    cancel_event=cancel_event,
+                    deadline_ns=deadline_ns,
+                    pipeline_phase=pipeline_route.phase,
+                )
+            elapsed_ns = time.monotonic_ns() - read_started
+            records_by_layer = Counter(
+                record.layer for _slot, _generation, record in owned
             )
+            total_records = len(owned)
+            distributed_ns = 0
+            for index, (layer, records) in enumerate(sorted(records_by_layer.items())):
+                layer_ns = (
+                    elapsed_ns - distributed_ns
+                    if index == len(records_by_layer) - 1
+                    else elapsed_ns * records // total_records
+                )
+                distributed_ns += layer_ns
+                self.metrics.observe_physical_read(
+                    layer,
+                    records=records,
+                    elapsed_ns=layer_ns,
+                )
         except BaseException as exc:
             for slot, generation, _record in owned:
                 with slot.condition:
@@ -860,7 +1355,7 @@ class ExpertSlotPool:
                         slot.condition.notify_all()
             self.metrics.update(load_failures=len(owned))
             raise
-        for (slot, generation, _record), digest in zip(owned, digests, strict=True):
+        for (slot, generation, record), digest in zip(owned, digests, strict=True):
             with slot.condition:
                 if (
                     slot.generation != generation
@@ -873,6 +1368,12 @@ class ExpertSlotPool:
                 slot.state = ExpertSlotState.READY
                 slot.error = None
                 slot.condition.notify_all()
+            if pipeline_route is not None:
+                self._pipeline_call(
+                    pipeline_route,
+                    "record_ready",
+                    record.expert,
+                )
 
     def _can_batch_component_sidecar(
         self,
@@ -908,24 +1409,62 @@ class ExpertSlotPool:
         expert: int,
         generation: int,
         deadline_ns: int | None,
+        pipeline_route: ExpertPipelineRoute | None = None,
     ) -> None:
-        with slot.condition:
-            while slot.state is ExpertSlotState.LOADING:
-                self.metrics.update(load_waits=1)
-                slot.condition.wait(self._remaining(deadline_ns))
-            if (
-                slot.state is not ExpertSlotState.READY
-                or slot.layer != layer
-                or slot.expert != expert
-                or slot.generation != generation
-            ):
-                if slot.error is not None:
+        block_observations: list[int] | None = (
+            [] if pipeline_route is not None else None
+        )
+        block_clock_failed = False
+        try:
+            with slot.condition:
+                while slot.state is ExpertSlotState.LOADING:
+                    self.metrics.update(load_waits=1)
+                    wait_started_ns = (
+                        self._diagnostic_monotonic_ns()
+                        if block_observations is not None
+                        else None
+                    )
+                    if block_observations is not None and wait_started_ns is None:
+                        block_clock_failed = True
+                    slot.condition.wait(self._remaining(deadline_ns))
+                    if block_observations is not None:
+                        wait_completed_ns = self._diagnostic_monotonic_ns()
+                        if (
+                            wait_started_ns is None
+                            or wait_completed_ns is None
+                            or wait_completed_ns < wait_started_ns
+                        ):
+                            block_clock_failed = True
+                        else:
+                            block_observations.append(
+                                wait_completed_ns - wait_started_ns
+                            )
+                if (
+                    slot.state is not ExpertSlotState.READY
+                    or slot.layer != layer
+                    or slot.expert != expert
+                    or slot.generation != generation
+                ):
+                    if slot.error is not None:
+                        raise ExpertSlotError(
+                            f"expert load failed for ({layer}, {expert}): {slot.error}"
+                        ) from slot.error
                     raise ExpertSlotError(
-                        f"expert load failed for ({layer}, {expert}): {slot.error}"
-                    ) from slot.error
-                raise ExpertSlotError(
-                    "expert slot did not reach the requested generation"
-                )
+                        "expert slot did not reach the requested generation"
+                    )
+        finally:
+            if pipeline_route is not None:
+                if block_clock_failed:
+                    self._mark_pipeline_incomplete(pipeline_route)
+                if block_observations:
+                    for elapsed_ns in block_observations:
+                        self._pipeline_call(
+                            pipeline_route,
+                            "observe_block",
+                            expert,
+                            "slot_loading",
+                            elapsed_ns=elapsed_ns,
+                        )
 
     def ensure_route(
         self,
@@ -936,6 +1475,7 @@ class ExpertSlotPool:
         deadline_ns: int | None = None,
         io_admission: RouteIOAdmission | None = None,
         route_admitted: Callable[[], None] | None = None,
+        pipeline_route: ExpertPipelineRoute | None = None,
     ) -> ReadyRoute:
         """Load all misses, validate mappings, and pin the route's slots."""
 
@@ -946,6 +1486,38 @@ class ExpertSlotPool:
             raise ExpertSlotError(f"layer {layer} is not a routed model layer") from exc
         with layer_lock:
             self._raise_completion_error()
+            if pipeline_route is None:
+                if io_admission is None:
+                    if route_admitted is None:
+                        return self._ensure_route_locked(
+                            layer,
+                            plan,
+                            cancel_event=cancel_event,
+                            deadline_ns=deadline_ns,
+                        )
+                    return self._ensure_route_locked(
+                        layer,
+                        plan,
+                        cancel_event=cancel_event,
+                        deadline_ns=deadline_ns,
+                        route_admitted=route_admitted,
+                    )
+                if route_admitted is None:
+                    return self._ensure_route_locked(
+                        layer,
+                        plan,
+                        cancel_event=cancel_event,
+                        deadline_ns=deadline_ns,
+                        io_admission=io_admission,
+                    )
+                return self._ensure_route_locked(
+                    layer,
+                    plan,
+                    cancel_event=cancel_event,
+                    deadline_ns=deadline_ns,
+                    io_admission=io_admission,
+                    route_admitted=route_admitted,
+                )
             if io_admission is None:
                 if route_admitted is None:
                     return self._ensure_route_locked(
@@ -953,6 +1525,7 @@ class ExpertSlotPool:
                         plan,
                         cancel_event=cancel_event,
                         deadline_ns=deadline_ns,
+                        pipeline_route=pipeline_route,
                     )
                 return self._ensure_route_locked(
                     layer,
@@ -960,7 +1533,75 @@ class ExpertSlotPool:
                     cancel_event=cancel_event,
                     deadline_ns=deadline_ns,
                     route_admitted=route_admitted,
+                    pipeline_route=pipeline_route,
                 )
+            if route_admitted is None:
+                return self._ensure_route_locked(
+                    layer,
+                    plan,
+                    cancel_event=cancel_event,
+                    deadline_ns=deadline_ns,
+                    io_admission=io_admission,
+                    pipeline_route=pipeline_route,
+                )
+            return self._ensure_route_locked(
+                layer,
+                plan,
+                cancel_event=cancel_event,
+                deadline_ns=deadline_ns,
+                io_admission=io_admission,
+                route_admitted=route_admitted,
+                pipeline_route=pipeline_route,
+            )
+
+    def retain_split_lifecycle(self) -> _RouteLifecycle:
+        """Keep close from finalizing slots during multi-part commit/rollback."""
+
+        self._raise_completion_error()
+        claim = _RouteReleaseClaim()
+        lifecycle = _RouteLifecycle(self, claim)
+        with self._lifecycle:
+            if self._closed:
+                raise ExpertSlotError("expert slot pool is closed")
+            if self._closing:
+                raise ExpertSlotError("expert slot pool is closing")
+            self.metrics.admit_route(claim)
+        return lifecycle
+
+    def retain_admitted_split_lifecycle(self) -> _RouteLifecycle:
+        """Retain rollback lifetime after this worker owns an active route."""
+
+        claim = _RouteReleaseClaim()
+        lifecycle = _RouteLifecycle(self, claim)
+        with self._lifecycle:
+            if self._closed:
+                raise ExpertSlotError("expert slot pool is closed")
+            self.metrics.admit_route(claim)
+        return lifecycle
+
+    def ensure_route_part(
+        self,
+        layer: int,
+        plan: RoutePlan,
+        *,
+        cancel_event: threading.Event | None = None,
+        deadline_ns: int | None = None,
+        io_admission: RouteIOAdmission | None = None,
+        route_admitted: Callable[[], None] | None = None,
+        pipeline_route: ExpertPipelineRoute | None = None,
+    ) -> ReadyRoute:
+        """Load one disjoint part of a runtime-locked route transaction.
+
+        ``ExpertStreamingRuntime`` holds its layer transaction lock while all
+        parts are active. Each part owns distinct logical slots, so individual
+        slot conditions provide the remaining synchronization without forcing
+        completed records to wait behind the slowest read in the layer.
+        """
+
+        self._raise_completion_error()
+        if layer not in self._ensure_locks:
+            raise ExpertSlotError(f"layer {layer} is not a routed model layer")
+        if pipeline_route is None:
             if route_admitted is None:
                 return self._ensure_route_locked(
                     layer,
@@ -977,49 +1618,6 @@ class ExpertSlotPool:
                 io_admission=io_admission,
                 route_admitted=route_admitted,
             )
-
-    def retain_split_lifecycle(self) -> _RouteLifecycle:
-        """Keep close from finalizing slots during multi-part commit/rollback."""
-
-        self._raise_completion_error()
-        with self._lifecycle:
-            if self._closed:
-                raise ExpertSlotError("expert slot pool is closed")
-            if self._closing:
-                raise ExpertSlotError("expert slot pool is closing")
-            self.metrics.update(active_routes=1)
-        return _RouteLifecycle(self)
-
-    def retain_admitted_split_lifecycle(self) -> _RouteLifecycle:
-        """Retain rollback lifetime after this worker owns an active route."""
-
-        with self._lifecycle:
-            if self._closed:
-                raise ExpertSlotError("expert slot pool is closed")
-            self.metrics.update(active_routes=1)
-        return _RouteLifecycle(self)
-
-    def ensure_route_part(
-        self,
-        layer: int,
-        plan: RoutePlan,
-        *,
-        cancel_event: threading.Event | None = None,
-        deadline_ns: int | None = None,
-        io_admission: RouteIOAdmission | None = None,
-        route_admitted: Callable[[], None] | None = None,
-    ) -> ReadyRoute:
-        """Load one disjoint part of a runtime-locked route transaction.
-
-        ``ExpertStreamingRuntime`` holds its layer transaction lock while all
-        parts are active. Each part owns distinct logical slots, so individual
-        slot conditions provide the remaining synchronization without forcing
-        completed records to wait behind the slowest read in the layer.
-        """
-
-        self._raise_completion_error()
-        if layer not in self._ensure_locks:
-            raise ExpertSlotError(f"layer {layer} is not a routed model layer")
         if route_admitted is None:
             return self._ensure_route_locked(
                 layer,
@@ -1027,6 +1625,7 @@ class ExpertSlotPool:
                 cancel_event=cancel_event,
                 deadline_ns=deadline_ns,
                 io_admission=io_admission,
+                pipeline_route=pipeline_route,
             )
         return self._ensure_route_locked(
             layer,
@@ -1035,6 +1634,7 @@ class ExpertSlotPool:
             deadline_ns=deadline_ns,
             io_admission=io_admission,
             route_admitted=route_admitted,
+            pipeline_route=pipeline_route,
         )
 
     def _ensure_route_locked(
@@ -1046,32 +1646,128 @@ class ExpertSlotPool:
         deadline_ns: int | None,
         io_admission: RouteIOAdmission | None = None,
         route_admitted: Callable[[], None] | None = None,
+        pipeline_route: ExpertPipelineRoute | None = None,
     ) -> ReadyRoute:
-
         self._raise_completion_error()
         if len(plan.experts) != len(plan.slots):
             raise ExpertSlotError("route experts and slots differ in length")
+        lifecycle_claim = _RouteReleaseClaim()
+        lifecycle_owner = _RouteLifecycle(self, lifecycle_claim)
+        setup_pins: dict[int, tuple[_PhysicalSlot, _SlotPinClaim]] = {}
+        setup_owner = _FailedRouteSetupOwner(self, lifecycle_owner, setup_pins)
         with self._lifecycle:
             if self._closed:
                 raise ExpertSlotError("expert slot pool is closed")
             if self._closing:
                 raise ExpertSlotError("expert slot pool is closing")
-            self.metrics.update(active_routes=1)
+            self.metrics.admit_route(lifecycle_claim)
         try:
-            if route_admitted is not None:
-                route_admitted()
+            if pipeline_route is None:
+                return self._ensure_route_owned(
+                    layer,
+                    plan,
+                    cancel_event=cancel_event,
+                    deadline_ns=deadline_ns,
+                    io_admission=io_admission,
+                    route_admitted=route_admitted,
+                    lifecycle_claim=lifecycle_claim,
+                    setup_pins=setup_pins,
+                )
+            return self._ensure_route_owned(
+                layer,
+                plan,
+                cancel_event=cancel_event,
+                deadline_ns=deadline_ns,
+                io_admission=io_admission,
+                route_admitted=route_admitted,
+                pipeline_route=pipeline_route,
+                lifecycle_claim=lifecycle_claim,
+                setup_pins=setup_pins,
+            )
         except BaseException:
-            self._route_released()
+            self._cleanup_failed_route_setup(setup_owner)
             raise
+
+    def _cleanup_failed_route_setup(
+        self,
+        setup_owner: _FailedRouteSetupOwner,
+    ) -> None:
+        for _attempt in range(2):
+            try:
+                setup_owner.release()
+            except BaseException as exc:
+                self._record_cleanup_error(exc)
+                if setup_owner.terminal:
+                    return
+            else:
+                return
+        with self._lifecycle:
+            with self._cleanup_owner_lock:
+                if setup_owner not in self._cleanup_owners:
+                    self._cleanup_owners.append(setup_owner)
+            self._lifecycle.notify_all()
+
+    def _retry_cleanup_owners(self) -> None:
+        with self._cleanup_owner_lock:
+            owners = tuple(self._cleanup_owners)
+        for owner in owners:
+            remove = False
+            try:
+                owner.release()
+            except BaseException as exc:
+                self._record_cleanup_error(exc)
+                remove = owner.terminal
+            else:
+                remove = True
+            if remove:
+                with self._cleanup_owner_lock:
+                    if owner in self._cleanup_owners:
+                        self._cleanup_owners.remove(owner)
+
+    def _has_cleanup_owners(self) -> bool:
+        with self._cleanup_owner_lock:
+            return bool(self._cleanup_owners)
+
+    def _ensure_route_owned(
+        self,
+        layer: int,
+        plan: RoutePlan,
+        *,
+        cancel_event: threading.Event | None,
+        deadline_ns: int | None,
+        io_admission: RouteIOAdmission | None = None,
+        route_admitted: Callable[[], None] | None = None,
+        pipeline_route: ExpertPipelineRoute | None = None,
+        lifecycle_claim: _RouteReleaseClaim,
+        setup_pins: dict[int, tuple[_PhysicalSlot, _SlotPinClaim]],
+    ) -> ReadyRoute:
+        setup_hook = self._route_setup_test_hook
+        if route_admitted is not None:
+            route_admitted()
+        if setup_hook is not None:
+            setup_hook("after_callback")
         self.metrics.update(ensure_calls=1, load_requests=len(plan.loads))
+        if setup_hook is not None:
+            setup_hook("after_metrics")
         internal_cancel = threading.Event()
+        if setup_hook is not None:
+            setup_hook("after_cancel_event")
         combined_cancel = _CombinedCancel(cancel_event, internal_cancel)
+        if setup_hook is not None:
+            setup_hook("after_combined_cancel")
         prepared: dict[tuple[int, int], tuple[_PhysicalSlot, int]] = {}
         prepared_states: list[_PreparedSlotState] = []
         futures: list[Future[None]] = []
         owned_loads: list[tuple[_PhysicalSlot, int, ExpertRecord]] = []
         submitted_loads: set[tuple[int, int]] = set()
+        nonowned_loads: set[tuple[int, int]] | None = (
+            set() if pipeline_route is not None else None
+        )
+        if setup_hook is not None:
+            setup_hook("after_containers")
         admission = io_admission if io_admission is not None else RouteIOAdmission()
+        if setup_hook is not None:
+            setup_hook("after_io_admission")
         try:
             try:
                 for load in plan.loads:
@@ -1081,16 +1777,26 @@ class ExpertSlotPool:
                         raise ExpertSlotError(
                             f"manifest has no expert record ({layer}, {load.expert})"
                         ) from exc
-                    slot, generation, owner, previous = self._prepare_load(
-                        layer,
-                        load,
-                        deadline_ns=deadline_ns,
-                    )
+                    if pipeline_route is None:
+                        slot, generation, owner, previous = self._prepare_load(
+                            layer,
+                            load,
+                            deadline_ns=deadline_ns,
+                        )
+                    else:
+                        slot, generation, owner, previous = self._prepare_load(
+                            layer,
+                            load,
+                            deadline_ns=deadline_ns,
+                            pipeline_route=pipeline_route,
+                        )
                     prepared[(load.expert, load.slot)] = (slot, generation)
                     if owner:
                         owned_loads.append((slot, generation, record))
                         assert previous is not None
                         prepared_states.append(previous)
+                    elif nonowned_loads is not None:
+                        nonowned_loads.add((load.expert, load.slot))
                 use_batch = self._can_batch_component_sidecar(plan, owned_loads)
                 # Completion failure recording uses this same lock.  Keeping
                 # it through every submission makes the rollback boundary
@@ -1100,7 +1806,24 @@ class ExpertSlotPool:
                 with self._completion_error_lock:
                     self._raise_completion_error_locked(policy_rollback_safe=True)
                     if use_batch:
-                        if self._reader_pool_telemetry is None:
+                        if pipeline_route is not None:
+                            experts = tuple(
+                                record.expert
+                                for _slot, _generation, record in owned_loads
+                            )
+                            future = self._submit_pipeline_reader(
+                                pipeline_route,
+                                experts,
+                                sum(
+                                    record.logical_bytes for _, _, record in owned_loads
+                                ),
+                                self._fill_batch,
+                                tuple(owned_loads),
+                                cancel_event=combined_cancel,
+                                deadline_ns=deadline_ns,
+                                pipeline_route=pipeline_route,
+                            )
+                        elif self._reader_pool_telemetry is None:
                             future = self._executor.submit(
                                 self._fill_batch,
                                 tuple(owned_loads),
@@ -1112,8 +1835,7 @@ class ExpertSlotPool:
                                 self._executor,
                                 self._reader_pool_telemetry,
                                 sum(
-                                    record.logical_bytes
-                                    for _, _, record in owned_loads
+                                    record.logical_bytes for _, _, record in owned_loads
                                 ),
                                 self._fill_batch,
                                 tuple(owned_loads),
@@ -1128,7 +1850,20 @@ class ExpertSlotPool:
                         )
                     else:
                         for slot, generation, record in owned_loads:
-                            if self._reader_pool_telemetry is None:
+                            if pipeline_route is not None:
+                                future = self._submit_pipeline_reader(
+                                    pipeline_route,
+                                    (record.expert,),
+                                    record.logical_bytes,
+                                    self._fill,
+                                    slot,
+                                    generation,
+                                    record,
+                                    cancel_event=combined_cancel,
+                                    deadline_ns=deadline_ns,
+                                    pipeline_route=pipeline_route,
+                                )
+                            elif self._reader_pool_telemetry is None:
                                 future = self._executor.submit(
                                     self._fill,
                                     slot,
@@ -1185,7 +1920,10 @@ class ExpertSlotPool:
                 raise future_error
 
             bindings: list[ExpertSlotBinding] = []
-            unique_pins: dict[int, _PhysicalSlot] = {}
+            unique_pins = setup_pins
+            satisfied_experts: set[int] | None = (
+                set() if pipeline_route is not None else None
+            )
             try:
                 plan_generations = (
                     plan.generations
@@ -1210,13 +1948,36 @@ class ExpertSlotPool:
                     )[1]
                     if expected_generation is not None:
                         generation = expected_generation
-                    self._wait_ready(
-                        slot,
-                        layer=layer,
-                        expert=expert,
-                        generation=generation,
-                        deadline_ns=deadline_ns,
-                    )
+                    if pipeline_route is None:
+                        self._wait_ready(
+                            slot,
+                            layer=layer,
+                            expert=expert,
+                            generation=generation,
+                            deadline_ns=deadline_ns,
+                        )
+                    else:
+                        self._wait_ready(
+                            slot,
+                            layer=layer,
+                            expert=expert,
+                            generation=generation,
+                            deadline_ns=deadline_ns,
+                            pipeline_route=pipeline_route,
+                        )
+                    if (
+                        pipeline_route is not None
+                        and nonowned_loads is not None
+                        and satisfied_experts is not None
+                        and (expert, logical_slot) in nonowned_loads
+                        and expert not in satisfied_experts
+                    ):
+                        self._pipeline_call(
+                            pipeline_route,
+                            "satisfied_without_submit",
+                            (expert,),
+                        )
+                        satisfied_experts.add(expert)
                     try:
                         record = self._record_map[(layer, expert)]
                     except KeyError as exc:
@@ -1229,8 +1990,10 @@ class ExpertSlotPool:
                         else:
                             self._raise_completion_error()
                         if id(slot) not in unique_pins:
-                            slot.pins += 1
-                            unique_pins[id(slot)] = slot
+                            claim = _SlotPinClaim()
+                            unique_pins[id(slot)] = (slot, claim)
+                            slot.pin_claims.append(claim)
+                            slot.pins = sum(item.active for item in slot.pin_claims)
                         bindings.append(
                             ExpertSlotBinding(
                                 layer=layer,
@@ -1245,31 +2008,47 @@ class ExpertSlotPool:
                     self._raise_completion_error(policy_rollback_safe=False)
                 else:
                     self._raise_completion_error()
+                if setup_hook is not None:
+                    setup_hook("after_pin_materialization")
             except BaseException:
-                for slot in unique_pins.values():
+                for slot, claim in unique_pins.values():
                     with slot.condition:
-                        slot.pins -= 1
+                        claim.active = False
+                        slot.pins = sum(item.active for item in slot.pin_claims)
+                        if claim in slot.pin_claims:
+                            slot.pin_claims.remove(claim)
                         slot.condition.notify_all()
                 raise
         except (ExpertManifestError, ExpertIOError) as exc:
             internal_cancel.set()
-            self._route_released()
             raise ExpertSlotError(str(exc)) from exc
         except BaseException:
             internal_cancel.set()
-            self._route_released()
             raise
 
-        return ReadyRoute(
+        binding_tuple = tuple(bindings)
+        if setup_hook is not None:
+            setup_hook("after_bindings_tuple")
+        pin_tuple = tuple(unique_pins.values())
+        if setup_hook is not None:
+            setup_hook("after_pins_tuple")
+        ready = ReadyRoute(
             self,
             plan,
-            tuple(bindings),
-            tuple(unique_pins.values()),
+            binding_tuple,
+            pin_tuple,
+            lifecycle_claim,
         )
+        if pipeline_route is not None:
+            for expert in dict.fromkeys(load.expert for load in plan.loads):
+                self._pipeline_call(pipeline_route, "record_runnable", expert)
+        if setup_hook is not None:
+            setup_hook("before_ownership_transfer")
+        return ready
 
-    def _route_released(self) -> None:
+    def _route_released(self, claim: _RouteReleaseClaim) -> None:
         with self._lifecycle:
-            self.metrics.update(active_routes=-1)
+            self.metrics.release_route(claim)
             self._lifecycle.notify_all()
 
     def invalidate(
@@ -1319,14 +2098,15 @@ class ExpertSlotPool:
             "states": states,
             "pins": pins,
             "metrics": self.metrics.as_dict(),
+            "physical_read_latency_by_layer": (
+                self.metrics.physical_read_latency_by_layer()
+            ),
             "io": self.reader.metrics.as_dict(),
         }
         if self._reader_pool_telemetry is not None:
             assert self._completion_fence_telemetry is not None
             snapshot["reader_pool"] = self._reader_pool_telemetry.snapshot()
-            snapshot["completion_fences"] = (
-                self._completion_fence_telemetry.snapshot()
-            )
+            snapshot["completion_fences"] = self._completion_fence_telemetry.snapshot()
         return snapshot
 
     def resource_telemetry_snapshot(self) -> dict[str, Any]:
@@ -1344,6 +2124,7 @@ class ExpertSlotPool:
         }
 
     def reset(self) -> None:
+        self._retry_cleanup_owners()
         self._raise_completion_error()
         with self._lifecycle:
             if self.metrics.as_dict()["active_routes"]:
@@ -1368,20 +2149,31 @@ class ExpertSlotPool:
             if not self._close_lock.acquire(timeout=remaining):
                 raise TimeoutError("expert slot close already in progress at deadline")
         try:
-            with self._lifecycle:
-                if not self._closed:
+            while True:
+                self._retry_cleanup_owners()
+                if self._has_cleanup_owners():
+                    self._raise_completion_error()
+                with self._lifecycle:
+                    if self._closed:
+                        finalized = True
+                        break
                     self._closing = True
-                    while self.metrics.as_dict()["active_routes"]:
-                        if deadline is None:
-                            self._lifecycle.wait()
-                        else:
-                            remaining = deadline - time.monotonic()
-                            if remaining <= 0:
-                                raise TimeoutError(
-                                    "active expert routes did not release before close"
-                                )
-                            self._lifecycle.wait(remaining)
-                finalized = self._closed
+                    if not self.metrics.as_dict()["active_routes"]:
+                        finalized = False
+                        break
+                    # Registration holds this condition while publishing an
+                    # owner, so checking here closes the scan-to-wait race.
+                    if self._has_cleanup_owners():
+                        continue
+                    if deadline is None:
+                        self._lifecycle.wait()
+                    else:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(
+                                "active expert routes did not release before close"
+                            )
+                        self._lifecycle.wait(remaining)
             if not finalized:
                 self._completion_executor.shutdown(wait=True, cancel_futures=False)
                 self._executor.shutdown(wait=True, cancel_futures=True)
@@ -1393,6 +2185,9 @@ class ExpertSlotPool:
                 allocator_close = getattr(self._allocator, "close", None)
                 if callable(allocator_close):
                     allocator_close()
+                for slot in (*self._persistent.values(), *self._transient):
+                    slot.buffer = None
+                self._allocator = _closed_allocator
                 with self._lifecycle:
                     self._closed = True
                     self._closing = False

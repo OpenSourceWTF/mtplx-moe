@@ -34,11 +34,17 @@ class MTPLXRuntime:
     expert_streaming: Any | None = None
     resident_load_report: dict[str, Any] | None = None
     diagnostic_counters: dict[str, int] = field(default_factory=dict)
-    _forward_ar_supports_emit_logits: bool | None = field(default=None, init=False, repr=False)
-    _forward_ar_supports_logits_keep: bool | None = field(default=None, init=False, repr=False)
+    _forward_ar_supports_emit_logits: bool | None = field(
+        default=None, init=False, repr=False
+    )
+    _forward_ar_supports_logits_keep: bool | None = field(
+        default=None, init=False, repr=False
+    )
 
     def _count(self, key: str, amount: int = 1) -> None:
-        self.diagnostic_counters[key] = int(self.diagnostic_counters.get(key, 0)) + int(amount)
+        self.diagnostic_counters[key] = int(self.diagnostic_counters.get(key, 0)) + int(
+            amount
+        )
 
     @staticmethod
     def _sequence_len(input_ids: Any) -> int:
@@ -124,7 +130,9 @@ class MTPLXRuntime:
         logits_keep: int | None = None,
         input_embeddings=None,
     ):
-        self._count("forward_ar_hidden_calls" if return_hidden else "forward_ar_plain_calls")
+        self._count(
+            "forward_ar_hidden_calls" if return_hidden else "forward_ar_plain_calls"
+        )
         if not self.mtp_enabled and return_hidden:
             raise RuntimeError("return_hidden requires an MTP-patched runtime")
         if input_embeddings is not None and not self.mtp_enabled:
@@ -206,7 +214,9 @@ class MTPLXRuntime:
             else str(mtp_hidden_variant)
         )
         resolved_concat_order = (
-            self.contract.concat_order if concat_order in {None, "auto", "contract"} else concat_order
+            self.contract.concat_order
+            if concat_order in {None, "auto", "contract"}
+            else concat_order
         )
         with mtp_adapter_depth(self.model, mtp_depth):
             kwargs = {
@@ -243,7 +253,9 @@ class MTPLXRuntime:
             else str(mtp_hidden_variant)
         )
         resolved_concat_order = (
-            self.contract.concat_order if concat_order in {None, "auto", "contract"} else concat_order
+            self.contract.concat_order
+            if concat_order in {None, "auto", "contract"}
+            else concat_order
         )
         update = getattr(self.model, "mtp_update_cache", None)
         if update is not None:
@@ -364,8 +376,7 @@ def load(
     path = Path(model_path)
     if mtp_precision not in HY3_MTP_PRECISIONS:
         raise ValueError(
-            f"mtp_precision must be one of {HY3_MTP_PRECISIONS}; "
-            f"got {mtp_precision!r}"
+            f"mtp_precision must be one of {HY3_MTP_PRECISIONS}; got {mtp_precision!r}"
         )
     streaming_requested = (
         expert_streaming_config is not None or expert_manifest is not None
@@ -393,9 +404,7 @@ def load(
             )
 
             metadata = gemma4_pair["metadata"]
-            benchmark = (
-                metadata.get("benchmark") if isinstance(metadata, dict) else {}
-            )
+            benchmark = metadata.get("benchmark") if isinstance(metadata, dict) else {}
             draft_block_size = DEFAULT_DRAFT_BLOCK_SIZE
             if isinstance(benchmark, dict):
                 try:
@@ -452,9 +461,7 @@ def load(
             )
 
         if not isinstance(expert_streaming_config, ExpertStreamingConfig):
-            raise TypeError(
-                "expert_streaming_config must be an ExpertStreamingConfig"
-            )
+            raise TypeError("expert_streaming_config must be an ExpertStreamingConfig")
         if mtp and mtp_artifacts is None:
             raise RuntimeError(
                 "the pinned Hy3-4bit and GLM-5.2-4bit artifacts omit MTP weights; "
@@ -515,10 +522,16 @@ def load(
             expert_runtime.close()
             raise
     elif mtp:
-        from .deepseek_mtp_patch import inject_deepseek_mtp_support, is_deepseek_mtp_config
+        from .deepseek_mtp_patch import (
+            inject_deepseek_mtp_support,
+            is_deepseek_mtp_config,
+        )
         from .glm_mtp_patch import inject_glm_mtp_support, is_glm_mtp_config
         from .mimo_mtp_patch import inject_mimo_mtp_support, is_mimo_mtp_config
-        from .nemotron_h_mtp_patch import inject_nemotron_h_mtp_support, is_nemotron_h_mtp_config
+        from .nemotron_h_mtp_patch import (
+            inject_nemotron_h_mtp_support,
+            is_nemotron_h_mtp_config,
+        )
         from .step3p5_mtp_patch import inject_step3p5_mtp_support
 
         if is_nemotron_h_mtp_config(config):
@@ -595,10 +608,18 @@ def _load_tokenizer_resilient(model_path: Path, config: dict[str, Any]) -> Any:
     from transformers import PreTrainedTokenizerFast
 
     tcfg_path = model_path / "tokenizer_config.json"
-    tcfg = json.loads(tcfg_path.read_text(encoding="utf-8")) if tcfg_path.exists() else {}
+    tcfg = (
+        json.loads(tcfg_path.read_text(encoding="utf-8")) if tcfg_path.exists() else {}
+    )
     passthrough = {
         key: tcfg[key]
-        for key in ("bos_token", "eos_token", "pad_token", "unk_token", "additional_special_tokens")
+        for key in (
+            "bos_token",
+            "eos_token",
+            "pad_token",
+            "unk_token",
+            "additional_special_tokens",
+        )
         if key in tcfg
     }
     hf_tokenizer = PreTrainedTokenizerFast(

@@ -86,6 +86,7 @@ class RoutePolicyTxn:
         self._commit = commit
         self._rollback = rollback
         self._finished = False
+        self._rolled_back = False
 
     def commit(self) -> None:
         if self._finished:
@@ -99,6 +100,16 @@ class RoutePolicyTxn:
             return
         self._rollback()
         self._finished = True
+        self._rolled_back = True
+
+    def rollback_publication(self) -> None:
+        """Undo a publication that committed before a later host-side failure."""
+
+        if self._rolled_back:
+            return
+        self._rollback()
+        self._finished = True
+        self._rolled_back = True
 
 
 @dataclass
@@ -107,6 +118,8 @@ class CacheCounters:
 
     route_calls: int = 0
     expert_requests: int = 0
+    unique_expert_requests: int = 0
+    shared_expert_assignments: int = 0
     expert_hits: int = 0
     expert_misses: int = 0
     persistent_loads: int = 0
@@ -119,9 +132,12 @@ class CacheCounters:
             "expert_record_bytes", expert_record_bytes, minimum=0
         )
         hit_experts = set(plan.hits)
+        unique_request_count = len(set(plan.experts))
         assignment_hits = sum(expert in hit_experts for expert in plan.experts)
         self.route_calls += 1
         self.expert_requests += len(plan.experts)
+        self.unique_expert_requests += unique_request_count
+        self.shared_expert_assignments += len(plan.experts) - unique_request_count
         self.expert_hits += assignment_hits
         self.expert_misses += len(plan.experts) - assignment_hits
         self.persistent_loads += sum(load.persistent for load in plan.loads)
@@ -138,6 +154,8 @@ class CacheCounters:
         return {
             "route_calls": self.route_calls,
             "expert_requests": self.expert_requests,
+            "unique_expert_requests": self.unique_expert_requests,
+            "shared_expert_assignments": self.shared_expert_assignments,
             "expert_hits": self.expert_hits,
             "expert_misses": self.expert_misses,
             "hit_rate": self.hit_rate,
@@ -160,6 +178,7 @@ class _GlobalDirectoryEntry:
     slot: int
     generation: int
     state: str
+    lru_rank: int
 
 
 class LayerExpertSlotBank:
@@ -606,6 +625,7 @@ class GlobalExpertSlotBank:
         self._free_slots = deque(range(self.persistent_slots))
         self._free_slot_set = set(range(self.persistent_slots))
         self._lru: OrderedDict[tuple[int, int], int] = OrderedDict()
+        self._lru_clock = 0
         self._history: dict[tuple[int, int], _ExpertHistory] = {}
         self._layer_occupancy: Counter[int] = Counter()
         self._evictions = 0
@@ -644,6 +664,16 @@ class GlobalExpertSlotBank:
     def _validate_experts(
         self, layer: int, expert_ids: Iterable[int]
     ) -> tuple[int, tuple[int, ...]]:
+        layer, experts = self._validate_experts_without_capacity(layer, expert_ids)
+        if len(dict.fromkeys(experts)) > self.transient_slots:
+            raise ValueError(
+                "transient_slots must cover the maximum unique experts in one route"
+            )
+        return layer, experts
+
+    def _validate_experts_without_capacity(
+        self, layer: int, expert_ids: Iterable[int]
+    ) -> tuple[int, tuple[int, ...]]:
         layer = self._key(layer, 0)[0]
         try:
             experts = tuple(
@@ -655,10 +685,6 @@ class GlobalExpertSlotBank:
             raise ValueError("a route must select at least one expert")
         for expert in experts:
             self._key(layer, expert)
-        if len(dict.fromkeys(experts)) > self.transient_slots:
-            raise ValueError(
-                "transient_slots must cover the maximum unique experts in one route"
-            )
         return layer, experts
 
     def _history_for(self, key: tuple[int, int]) -> _ExpertHistory:
@@ -688,6 +714,24 @@ class GlobalExpertSlotBank:
         self._free_slot_set.remove(slot)
         return slot
 
+    def _touch_lru(self, key: tuple[int, int]) -> None:
+        entry = self._directory[key]
+        self._lru_clock += 1
+        entry.lru_rank = self._lru_clock
+        self._lru[key] = entry.slot
+        self._lru.move_to_end(key)
+
+    def _discard_lru(self, key: tuple[int, int]) -> None:
+        self._lru.pop(key, None)
+
+    def _rebuild_lru(self) -> None:
+        self._lru = OrderedDict(
+            (key, entry.slot)
+            for key, entry in sorted(
+                self._directory.items(), key=lambda item: item[1].lru_rank
+            )
+        )
+
     def _victim_slot(self, *, pinned: set[tuple[int, int]]) -> int | None:
         if self.cache_policy == "lru":
             for key, slot in self._lru.items():
@@ -711,12 +755,38 @@ class GlobalExpertSlotBank:
         slot: int,
         key: tuple[int, int],
         evictions: list[SlotEviction],
+        evicted_entries: dict[int, tuple[tuple[int, int], _GlobalDirectoryEntry]]
+        | None = None,
+        occupancy_before: dict[int, tuple[bool, int]] | None = None,
     ) -> None:
         previous = self._slot_to_key[slot]
         if previous is not None:
+            previous_entry = self._directory.get(previous)
+            if previous_entry is None:
+                raise RuntimeError(
+                    "global resident slot is missing its directory entry"
+                )
+            if evicted_entries is not None:
+                evicted_entries[slot] = (
+                    previous,
+                    _GlobalDirectoryEntry(
+                        previous_entry.slot,
+                        previous_entry.generation,
+                        previous_entry.state,
+                        previous_entry.lru_rank,
+                    ),
+                )
+            if occupancy_before is not None:
+                occupancy_before.setdefault(
+                    previous[0],
+                    (
+                        previous[0] in self._layer_occupancy,
+                        self._layer_occupancy[previous[0]],
+                    ),
+                )
             del self._key_to_slot[previous]
             self._directory.pop(previous, None)
-            self._lru.pop(previous, None)
+            self._discard_lru(previous)
             self._layer_occupancy[previous[0]] -= 1
             self._evictions += 1
             if previous[0] != key[0]:
@@ -736,21 +806,26 @@ class GlobalExpertSlotBank:
             self._free_slot_set.remove(slot)
             self._free_slots.remove(slot)
         self._slot_generations[slot] += 1
+        if occupancy_before is not None:
+            occupancy_before.setdefault(
+                key[0],
+                (key[0] in self._layer_occupancy, self._layer_occupancy[key[0]]),
+            )
         self._slot_to_key[slot] = key
         self._key_to_slot[key] = slot
         self._directory[key] = _GlobalDirectoryEntry(
             slot=slot,
             generation=self._slot_generations[slot],
             state="loading",
+            lru_rank=0,
         )
-        self._lru[key] = slot
-        self._lru.move_to_end(key)
+        self._touch_lru(key)
         self._layer_occupancy[key[0]] += 1
 
     def prepare_prefill_seed(
         self, layer: int, expert_ids: Iterable[int]
     ) -> tuple[int, ...]:
-        layer, experts = self._validate_experts(layer, expert_ids)
+        layer, experts = self._validate_experts_without_capacity(layer, expert_ids)
         remaining_layer = max(
             0, self.prefill_slots_per_layer - self._layer_occupancy[layer]
         )
@@ -773,7 +848,7 @@ class GlobalExpertSlotBank:
         if slot is not None:
             self._slot_to_key[slot] = None
             self._directory.pop(key, None)
-            self._lru.pop(key, None)
+            self._discard_lru(key)
             self._layer_occupancy[layer] -= 1
             if slot not in self._free_slot_set:
                 self._free_slots.append(slot)
@@ -827,7 +902,7 @@ class GlobalExpertSlotBank:
                 continue
             del self._directory[key]
             self._key_to_slot.pop(key, None)
-            self._lru.pop(key, None)
+            self._discard_lru(key)
             if self._slot_to_key[load.slot] == key:
                 self._slot_to_key[load.slot] = None
                 self._layer_occupancy[layer] -= 1
@@ -843,6 +918,9 @@ class GlobalExpertSlotBank:
         expert_ids: Iterable[int],
         *,
         phase: RoutingPhase | str,
+        _evicted_entries: dict[int, tuple[tuple[int, int], _GlobalDirectoryEntry]]
+        | None = None,
+        _occupancy_before: dict[int, tuple[bool, int]] | None = None,
     ) -> RoutePlan:
         layer, experts = self._validate_experts(layer, expert_ids)
         phase = RoutingPhase(phase)
@@ -863,7 +941,7 @@ class GlobalExpertSlotBank:
         if self.cache_policy == "lru":
             for key in keys:
                 if key in hit_keys:
-                    self._lru.move_to_end(key)
+                    self._touch_lru(key)
         hit_set = {expert for key_layer, expert in hit_keys if key_layer == layer}
         miss_order = [expert for expert in unique_experts if expert not in hit_set]
         resolved = {expert: self._key_to_slot[(layer, expert)] for expert in hit_set}
@@ -897,7 +975,13 @@ class GlobalExpertSlotBank:
             if persistent_slot is None:
                 transient_experts.append(expert)
                 continue
-            self._assign(slot=persistent_slot, key=key, evictions=evictions)
+            self._assign(
+                slot=persistent_slot,
+                key=key,
+                evictions=evictions,
+                evicted_entries=_evicted_entries,
+                occupancy_before=_occupancy_before,
+            )
             pinned.add(key)
             resolved[expert] = persistent_slot
             loads.append(
@@ -947,8 +1031,12 @@ class GlobalExpertSlotBank:
     ) -> tuple[RoutePlan, RoutePolicyTxn]:
         layer, experts = self._validate_experts(layer, expert_ids)
         route_keys = {(layer, expert) for expert in experts}
-        resident_keys = {key for key in self._slot_to_key if key is not None}
-        history_keys = route_keys | resident_keys
+        history_keys = set(route_keys)
+        if self.cache_policy == "frequency":
+            # Frequency victim selection inherently scans every resident and
+            # may lazily create history for one. Preserve that policy's exact
+            # rollback semantics without charging the LRU hot path for it.
+            history_keys.update(key for key in self._slot_to_key if key is not None)
         missing = object()
         histories: dict[tuple[int, int], object] = {}
         for key in history_keys:
@@ -959,41 +1047,164 @@ class GlobalExpertSlotBank:
                 else (history.score, history.score_epoch, history.last_used)
             )
         decode_epoch = self._decode_epoch
-        slot_to_key = tuple(self._slot_to_key)
-        key_to_slot = dict(self._key_to_slot)
-        directory = {
-            key: _GlobalDirectoryEntry(entry.slot, entry.generation, entry.state)
-            for key, entry in self._directory.items()
+        lru_clock = self._lru_clock
+        route_lru_ranks = {
+            key: entry.lru_rank
+            for key in route_keys
+            if (entry := self._directory.get(key)) is not None
         }
-        slot_generations = tuple(self._slot_generations)
-        free_slots = tuple(self._free_slots)
-        free_slot_set = set(self._free_slot_set)
-        lru = tuple(self._lru.items())
-        layer_occupancy = Counter(self._layer_occupancy)
         evictions = self._evictions
         cross_layer_evictions = self._cross_layer_evictions
         seed_candidates = set(self._prefill_seed_candidates[layer])
-        plan = self.plan(layer, experts, phase=phase)
+        evicted_entries: dict[int, tuple[tuple[int, int], _GlobalDirectoryEntry]] = {}
+        occupancy_before: dict[int, tuple[bool, int]] = {}
+        plan = self.plan(
+            layer,
+            experts,
+            phase=phase,
+            _evicted_entries=evicted_entries,
+            _occupancy_before=occupancy_before,
+        )
 
         def commit() -> None:
             self.publish_ready(layer, plan)
 
         def rollback() -> None:
             self._decode_epoch = decode_epoch
-            self._slot_to_key = list(slot_to_key)
-            self._key_to_slot = dict(key_to_slot)
-            self._directory = {
-                key: _GlobalDirectoryEntry(entry.slot, entry.generation, entry.state)
-                for key, entry in directory.items()
-            }
-            self._slot_generations = list(slot_generations)
-            self._free_slots = deque(free_slots)
-            self._free_slot_set = set(free_slot_set)
-            self._lru = OrderedDict(lru)
-            self._layer_occupancy = Counter(layer_occupancy)
+            empty_slots = [
+                load.slot
+                for load in plan.loads
+                if load.persistent and load.slot not in evicted_entries
+            ]
+            for load in reversed(plan.loads):
+                if not load.persistent or load.generation is None:
+                    continue
+                key = (layer, load.expert)
+                if self._key_to_slot.get(key) == load.slot:
+                    self._key_to_slot.pop(key, None)
+                self._directory.pop(key, None)
+                evicted = evicted_entries.get(load.slot)
+                if evicted is None:
+                    self._slot_to_key[load.slot] = None
+                    self._free_slot_set.add(load.slot)
+                else:
+                    previous_key, previous_entry = evicted
+                    self._slot_to_key[load.slot] = previous_key
+                    self._key_to_slot[previous_key] = load.slot
+                    self._directory[previous_key] = _GlobalDirectoryEntry(
+                        previous_entry.slot,
+                        previous_entry.generation,
+                        previous_entry.state,
+                        previous_entry.lru_rank,
+                    )
+                self._slot_generations[load.slot] = load.generation - 1
+            # Restore empty slots at the exact front positions consumed by
+            # _empty_slot(). An accepted partial load may already have
+            # appended one of them during physical quarantine.
+            for slot in empty_slots:
+                try:
+                    self._free_slots.remove(slot)
+                except ValueError:
+                    pass
+            for slot in reversed(empty_slots):
+                self._free_slots.appendleft(slot)
+            for key, rank in route_lru_ranks.items():
+                entry = self._directory.get(key)
+                if entry is not None:
+                    entry.lru_rank = rank
+            self._lru_clock = lru_clock
+            self._rebuild_lru()
+            for affected_layer, (was_present, value) in occupancy_before.items():
+                if was_present:
+                    self._layer_occupancy[affected_layer] = value
+                else:
+                    self._layer_occupancy.pop(affected_layer, None)
             self._evictions = evictions
             self._cross_layer_evictions = cross_layer_evictions
             self._prefill_seed_candidates[layer] = set(seed_candidates)
+            for key, values in histories.items():
+                if values is missing:
+                    self._history.pop(key, None)
+                    continue
+                score, score_epoch, last_used = values
+                history = self._history.get(key)
+                if history is None:
+                    history = _ExpertHistory()
+                    self._history[key] = history
+                history.score = score
+                history.score_epoch = score_epoch
+                history.last_used = last_used
+
+        return plan, RoutePolicyTxn(commit=commit, rollback=rollback)
+
+    def try_plan_all_hits_transaction(
+        self,
+        layer: int,
+        expert_ids: Iterable[int],
+        *,
+        phase: RoutingPhase | str,
+    ) -> tuple[RoutePlan, RoutePolicyTxn] | None:
+        """Plan a ready global route and defer policy updates until commit."""
+
+        layer, experts = self._validate_experts_without_capacity(layer, expert_ids)
+        phase = RoutingPhase(phase)
+        unique_experts = tuple(dict.fromkeys(experts))
+        keys = tuple((layer, expert) for expert in unique_experts)
+        entries = tuple(self._directory.get(key) for key in keys)
+        if any(entry is None or entry.state != "ready" for entry in entries):
+            return None
+
+        missing = object()
+        histories: dict[tuple[int, int], object] = {}
+        for key in keys:
+            history = self._history.get(key)
+            histories[key] = (
+                missing
+                if history is None
+                else (history.score, history.score_epoch, history.last_used)
+            )
+        decode_epoch = self._decode_epoch
+        lru_clock = self._lru_clock
+        lru_ranks = {key: self._directory[key].lru_rank for key in keys}
+
+        resolved = {
+            expert: entry.slot
+            for expert, entry in zip(unique_experts, entries, strict=True)
+            if entry is not None
+        }
+        generations = {
+            expert: entry.generation
+            for expert, entry in zip(unique_experts, entries, strict=True)
+            if entry is not None
+        }
+        plan = RoutePlan(
+            phase=phase,
+            experts=experts,
+            slots=tuple(resolved[expert] for expert in experts),
+            hits=unique_experts,
+            misses=(),
+            loads=(),
+            evictions=(),
+            generations=tuple(generations[expert] for expert in experts),
+        )
+
+        def commit() -> None:
+            if phase is RoutingPhase.DECODE:
+                self._decode_epoch += 1
+                for expert in experts:
+                    self._touch_decode((layer, expert))
+                for key in keys:
+                    self._history_for(key).last_used = self._decode_epoch
+            if self.cache_policy == "lru":
+                for key in keys:
+                    self._touch_lru(key)
+
+        def rollback() -> None:
+            self._decode_epoch = decode_epoch
+            for key, rank in lru_ranks.items():
+                self._directory[key].lru_rank = rank
+            self._lru_clock = lru_clock
+            self._rebuild_lru()
             for key, values in histories.items():
                 if values is missing:
                     self._history.pop(key, None)
@@ -1019,6 +1230,7 @@ class GlobalExpertSlotBank:
         self._free_slots = deque(range(self.persistent_slots))
         self._free_slot_set = set(range(self.persistent_slots))
         self._lru.clear()
+        self._lru_clock = 0
         self._history.clear()
         self._layer_occupancy.clear()
         self._evictions = 0

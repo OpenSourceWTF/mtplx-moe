@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers-optimized:subagent-driven-development (recommended) or superpowers-optimized:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add opt-in, low-contention benchmark telemetry that distinguishes storage saturation, reader backpressure, submission starvation, host pressure, and missing I/O/Metal overlap without inventing unavailable GPU or RAM measurements.
+**Goal:** Add opt-in, low-contention benchmark telemetry that distinguishes storage saturation, reader backpressure, submission starvation, host pressure, and coarse same-interval I/O/Metal coactivity without inventing unavailable GPU or RAM measurements.
 
 **Architecture:** Runtime hot paths publish cumulative queue, worker, byte, and completion-fence occupancy through state-change counters. A benchmark-only sampler reads a cheap snapshot, differences cumulative counters on one clock, and emits raw intervals plus an evidence matrix. An optional non-interactive `powermetrics` collector adds process/GPU evidence when privilege and hardware support exist; absent measurements remain explicitly unavailable. The benchmark harness marks telemetry-enabled runs as diagnostic and keeps the default timing lane unchanged.
 
@@ -301,7 +301,7 @@ def test_backed_up_readers_below_ssd_ceiling_are_not_called_storage_bound():
     assert "bound_by" not in report
 
 
-def test_storage_evidence_requires_ceiling_queue_and_worker_pressure():
+def test_storage_pressure_screen_routes_a_candidate_without_claiming_causality():
     report = summarize_intervals(
         synthetic_intervals(
             ssd_gib_s=11.8,
@@ -314,7 +314,7 @@ def test_storage_evidence_requires_ceiling_queue_and_worker_pressure():
     )
     assert report["evidence"]["ssd_saturation"]["status"] == "supported"
     assert report["attribution"] == {
-        "status": "conclusive",
+        "status": "incomplete",
         "candidates": ["storage_throughput"],
     }
 
@@ -419,7 +419,7 @@ Evidence rules are deterministic and named in output:
 - Submission/dependency starvation is only a candidate when uncached reader throughput is below 0.40 of the SSD ceiling, queued-read interval fraction is below 0.10, and cache misses occurred.
 - GPU evidence is `unavailable` unless the collector returns measured process GPU time or an explicitly labeled system GPU residency sample.
 - RAM bandwidth remains `unavailable`; routed expert bytes are reported as demand, not utilization.
-- Attribution is `conclusive` only for directly supported storage or GPU saturation. Otherwise it is `incomplete` with evidence-backed candidates and coverage gaps.
+- Fixed thresholds are screening heuristics, not promotion gates or causal cutoffs. Attribution remains `incomplete` with evidence-backed candidates until a matched intervention produces a repeatable throughput response with uncertainty.
 
 Implement `PowermetricsCollector` with `sudo -n`, `--format plist`, `--samplers tasks,disk,cpu_power,gpu_power`, `--show-process-gpu`, `--show-process-samp-norm`, `--show-process-wait-times`, and `--show-process-io`. It writes to a temporary binary stream, stops cleanly, splits NUL-separated plist documents, extracts only the requested PID, and returns `{available: false, reason: ...}` on privilege, parser, or hardware failure. It never prompts.
 
@@ -518,14 +518,18 @@ if run is not None:
     )
 ```
 
-For the concurrent lane, pass an `on_step` callback to `StreamedBatchRunner`
-that retains the greatest `generated_tokens` count seen for every request and
-publishes their sum to the sampler. A stream disappearing from the live set
-therefore cannot reduce the cumulative token count. The report schema is
-additive when enabled; disabled rows contain no `diagnostic_run` or
-`resource_telemetry` key. Existing defaults, deterministic token output, and
-timing fields remain unchanged. Reject `--powermetrics` unless
-`--resource-telemetry` is enabled.
+For a telemetry-enabled concurrent lane, pass an `on_step` callback to
+`StreamedBatchRunner` that publishes the token count in already-finalized
+results plus the generated tokens of its current live streams. This accounting
+is computed by the diagnostic callback rather than the runner's production
+finalization path, so a finished stream transfers its final count without a
+temporal drop or disabled-lane work. Do not allocate the counter, install the
+diagnostic callback, or sample caller-thread CPU in the telemetry-disabled
+static lane; mixed-join keeps only its required join-submission callback. The
+report schema is additive when enabled; disabled rows contain no
+`diagnostic_run` or `resource_telemetry` key. Existing defaults, deterministic
+token output, and timing fields remain unchanged. Reject `--powermetrics`
+unless `--resource-telemetry` is enabled.
 
 - [ ] **Step 4: Run harness tests**
 
@@ -560,7 +564,9 @@ Document:
 
 Treat tokens/s as the outcome, not the bottleneck diagnosis. Start with
 `coverage`; an unavailable counter is unknown, never zero. Then read physical
-throughput, queue/worker occupancy, and overlap on the same intervals.
+throughput, queue/worker occupancy, and coarse coactivity on the same intervals.
+The sampled I/O/fence signal does not establish simultaneous overlap within an
+interval.
 
 | Observed evidence | Defensible conclusion |
 | --- | --- |
@@ -569,7 +575,7 @@ throughput, queue/worker occupancy, and overlap on the same intervals.
 | Misses occur, queue empty, SSD low | Submission, routing, prefetch, or dependency starvation |
 | Caller thread near one core, SSD/GPU low | Host orchestration candidate |
 | Measured GPU activity high, I/O queue empty | GPU compute candidate |
-| I/O and completion-fence work alternate with little overlap | Synchronization or insufficient overlap |
+| I/O and completion-fence work rarely appear in the same sampling interval | Coarse I/O/fence separation; add a narrower probe before claiming serialization |
 
 `completion_fences.active_work` means Metal consumer work is outstanding; it is
 not GPU utilization. `cache.expert_requests * expert_record_bytes` is routed

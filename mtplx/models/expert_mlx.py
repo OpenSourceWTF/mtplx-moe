@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -30,6 +31,12 @@ _ROUTING_PHASE: ContextVar[RoutingPhase | None] = ContextVar(
     "mtplx_expert_routing_phase",
     default=None,
 )
+_SLOT_INDEX_PATTERN = r"(?:0|[1-9][0-9]*)"
+_LAYER_PERSISTENT_LABEL = re.compile(
+    rf"layer-({_SLOT_INDEX_PATTERN})-persistent-({_SLOT_INDEX_PATTERN})"
+)
+_GLOBAL_PERSISTENT_LABEL = re.compile(rf"global-persistent-({_SLOT_INDEX_PATTERN})")
+_GLOBAL_TRANSIENT_LABEL = re.compile(rf"global-transient-({_SLOT_INDEX_PATTERN})")
 
 
 @contextmanager
@@ -46,6 +53,43 @@ def current_expert_routing_phase(*, token_count: int) -> RoutingPhase:
     if explicit is not None:
         return explicit
     return RoutingPhase.PREFILL if token_count > 1 else RoutingPhase.DECODE
+
+
+def _mark_pipeline_incomplete(ledger: Any, phase: RoutingPhase) -> None:
+    try:
+        ledger.mark_incomplete(phase=phase)
+    except Exception:
+        pass
+
+
+def _begin_pipeline_work(
+    ledger: Any,
+    method: str,
+    *args: Any,
+    phase: RoutingPhase,
+) -> Any | None:
+    """Open optional diagnostics without changing model execution outcomes."""
+
+    try:
+        return getattr(ledger, method)(*args, phase=phase)
+    except Exception:
+        _mark_pipeline_incomplete(ledger, phase)
+        return None
+
+
+def _pipeline_work_call(
+    ledger: Any,
+    target: Any,
+    method: str,
+    *args: Any,
+    phase: RoutingPhase,
+) -> None:
+    """Publish one optional work transition while preserving data-path errors."""
+
+    try:
+        getattr(target, method)(*args)
+    except Exception:
+        _mark_pipeline_incomplete(ledger, phase)
 
 
 class UnboundExpertSwitch(nn.Module):
@@ -219,6 +263,8 @@ class MlxComponentBank:
             except Exception:
                 pass
         self._views.clear()
+        self.arrays.clear()
+        self._segment_bytes.clear()
 
 
 class MlxComponentSlot:
@@ -401,14 +447,106 @@ def make_mlx_component_bank_allocator(
     kernels. No persistent slice or stacked weight copy is materialized.
     """
 
+    record_by_key: dict[tuple[int, int], ExpertRecord] = {}
+    duplicate_keys: set[tuple[int, int]] = set()
     record_by_layer: dict[int, ExpertRecord] = {}
     for record in manifest.records:
+        key = (record.layer, record.expert)
+        if key in record_by_key:
+            duplicate_keys.add(key)
+        else:
+            record_by_key[key] = record
         record_by_layer.setdefault(record.layer, record)
     missing = set(spec.routed_layer_indices) - set(record_by_layer)
     if missing:
         raise ValueError(
             f"manifest has no exemplar records for layers {sorted(missing)}"
         )
+    if plan.cache_scope == "global":
+        expected_keys = {
+            (layer, expert)
+            for layer in spec.routed_layer_indices
+            for expert in range(spec.expert_count)
+        }
+        actual_keys = set(record_by_key)
+        missing_keys = sorted(expected_keys - actual_keys)
+        extra_keys = sorted(actual_keys - expected_keys)
+        if missing_keys or extra_keys or duplicate_keys:
+            raise ValueError(
+                "manifest routed expert keys differ from model descriptor: "
+                f"missing={missing_keys}, extra={extra_keys}, "
+                f"duplicates={sorted(duplicate_keys)}"
+            )
+
+    def component_signature(record: ExpertRecord) -> tuple[tuple[Any, ...], ...]:
+        return tuple(
+            (
+                segment.component,
+                segment.dtype,
+                tuple(segment.shape),
+                int(segment.length),
+            )
+            for segment in record.segments
+        )
+
+    expected_signature: list[tuple[str, str, tuple[int, ...], int]] = []
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        output_size = (
+            spec.expert_hidden_size
+            if projection in {"gate_proj", "up_proj"}
+            else spec.hidden_size
+        )
+        input_size = (
+            spec.hidden_size
+            if projection in {"gate_proj", "up_proj"}
+            else spec.expert_hidden_size
+        )
+        weight_shape = (output_size, input_size * spec.quant_bits // 32)
+        parameter_shape = (output_size, input_size // spec.quant_group_size)
+        expected_signature.extend(
+            (
+                (
+                    f"{projection}.weight",
+                    "U32",
+                    weight_shape,
+                    output_size * input_size * spec.quant_bits // 8,
+                ),
+                (
+                    f"{projection}.scales",
+                    "BF16",
+                    parameter_shape,
+                    output_size
+                    * (input_size // spec.quant_group_size)
+                    * spec.quant_parameter_bytes,
+                ),
+                (
+                    f"{projection}.biases",
+                    "BF16",
+                    parameter_shape,
+                    output_size
+                    * (input_size // spec.quant_group_size)
+                    * spec.quant_parameter_bytes,
+                ),
+            )
+        )
+
+    exemplar_layer = spec.routed_layer_indices[0]
+    exemplar_signature = component_signature(record_by_layer[exemplar_layer])
+    if exemplar_signature != tuple(expected_signature):
+        raise ValueError(
+            "manifest component geometry does not match the model descriptor"
+        )
+    routed_layers = set(spec.routed_layer_indices)
+    for record in manifest.records:
+        if (
+            record.layer in routed_layers
+            and component_signature(record) != exemplar_signature
+        ):
+            raise ValueError(
+                "routed-layer component geometry differs for "
+                f"expert ({record.layer}, {record.expert}) from canonical "
+                f"layer {exemplar_layer}"
+            )
 
     banks: dict[tuple[str, int], MlxComponentBank] = {}
     slots: dict[str, MlxComponentSlot] = {}
@@ -423,9 +561,13 @@ def make_mlx_component_bank_allocator(
             capacity = plan.slots_per_layer
             record = record_by_layer[layer]
             label = f"layer-{layer}-persistent-bank"
+        elif kind == "global-persistent":
+            capacity = plan.persistent_slots
+            record = record_by_layer[exemplar_layer]
+            label = "global-persistent-bank"
         else:
             capacity = plan.transient_slots
-            record = record_by_layer[spec.routed_layer_indices[0]]
+            record = record_by_layer[exemplar_layer]
             label = "global-transient-bank"
         bank = MlxComponentBank(capacity=capacity, record=record, label=label)
         banks[key] = bank
@@ -434,20 +576,41 @@ def make_mlx_component_bank_allocator(
     def allocate(size: int, label: str) -> MlxComponentSlot:
         if int(size) != spec.expert_record_bytes:
             raise ValueError("slot allocator size differs from model descriptor")
-        parts = label.split("-")
-        if label.startswith("layer-") and "-persistent-" in label:
-            layer = int(parts[1])
-            slot_index = int(parts[-1])
+        layer_persistent = _LAYER_PERSISTENT_LABEL.fullmatch(label)
+        global_persistent = _GLOBAL_PERSISTENT_LABEL.fullmatch(label)
+        global_transient = _GLOBAL_TRANSIENT_LABEL.fullmatch(label)
+        if layer_persistent is not None:
+            if plan.cache_scope != "layer":
+                raise ValueError(
+                    "layer-persistent slot label conflicts with global cache scope"
+                )
+            layer = int(layer_persistent.group(1))
+            slot_index = int(layer_persistent.group(2))
             if layer not in spec.routed_layer_indices:
                 raise ValueError(f"persistent slot layer {layer} is not routed")
             if not 0 <= slot_index < plan.slots_per_layer:
                 raise ValueError("persistent slot is outside planned capacity")
             bank = bank_for("persistent", layer)
-        elif label.startswith("global-transient-"):
-            slot_index = int(parts[-1])
+        elif label.startswith("layer-") and "-persistent-" in label:
+            raise ValueError(f"unknown expert slot label {label!r}")
+        elif global_persistent is not None:
+            if plan.cache_scope != "global":
+                raise ValueError(
+                    "global-persistent slot label conflicts with layer cache scope"
+                )
+            slot_index = int(global_persistent.group(1))
+            if not 0 <= slot_index < plan.persistent_slots:
+                raise ValueError("global persistent slot is outside planned capacity")
+            bank = bank_for("global-persistent", -1)
+        elif label.startswith("global-persistent-"):
+            raise ValueError(f"unknown expert slot label {label!r}")
+        elif global_transient is not None:
+            slot_index = int(global_transient.group(1))
             if not 0 <= slot_index < plan.transient_slots:
                 raise ValueError("transient slot is outside planned capacity")
             bank = bank_for("transient", -1)
+        elif label.startswith("global-transient-"):
+            raise ValueError(f"unknown expert slot label {label!r}")
         else:
             raise ValueError(f"unknown expert slot label {label!r}")
         if label in slots:
@@ -456,15 +619,25 @@ def make_mlx_component_bank_allocator(
         slots[label] = slot
         return slot
 
+    def close_banks() -> None:
+        for bank in tuple(banks.values()):
+            bank.close()
+        banks.clear()
+        slots.clear()
+        _release_mlx_cache()
+
     setattr(allocate, "backend", backend)
     setattr(allocate, "slots", slots)
     setattr(allocate, "banks", banks)
-    setattr(
-        allocate,
-        "close",
-        lambda: [bank.close() for bank in tuple(banks.values())],
-    )
+    setattr(allocate, "close", close_banks)
     return allocate
+
+
+def _release_mlx_cache() -> None:
+    try:
+        mx.clear_cache()
+    except Exception:  # pragma: no cover - compatibility with older MLX
+        pass
 
 
 def _run_q4_expert(
@@ -873,149 +1046,278 @@ class HotExpertSwitchGLU(nn.Module):
             outputs.extend(wave_outputs)
             output_positions.extend(wave_positions)
 
-        for wave in self.runtime.route_waves(
-            expert_ids,
-            sort_unique=(
-                phase is RoutingPhase.PREFILL
-                and self.runtime.manifest.sidecar is not None
-            ),
+        pipeline_ledger = getattr(self.runtime, "_pipeline_ledger", None)
+        shared_pipeline_work = None
+        if (
+            pipeline_ledger is not None
+            and shared_work is not None
+            and phase is RoutingPhase.DECODE
         ):
-            # Keep the all-hit optimization inside the authoritative bounded
-            # route-wave loop.  A successful probe avoids split-route futures
-            # and per-expert grouping while retaining the normal policy epoch,
-            # counters, and assignment order for this wave.
-            if (
-                phase is RoutingPhase.DECODE
-                and self.runtime.config.slot_layout == "component-banks"
+            shared_pipeline_work = _begin_pipeline_work(
+                pipeline_ledger,
+                "begin_shared_work",
+                phase=phase,
+            )
+
+        try:
+            for wave in self.runtime.route_waves(
+                expert_ids,
+                sort_unique=(
+                    phase is RoutingPhase.PREFILL
+                    and self.runtime.manifest.sidecar is not None
+                ),
             ):
-                ready = self.runtime.try_all_hit_route(
+                # Keep the all-hit optimization inside the authoritative bounded
+                # route-wave loop.  A successful probe avoids split-route futures
+                # and per-expert grouping while retaining the normal policy epoch,
+                # counters, and assignment order for this wave.
+                if (
+                    phase is RoutingPhase.DECODE
+                    and self.runtime.config.slot_layout == "component-banks"
+                ):
+                    ready = self.runtime.try_all_hit_route(
+                        self.layer_index,
+                        wave.experts,
+                        phase=phase,
+                    )
+                    if ready is not None:
+                        hit_pipeline_work = None
+                        if pipeline_ledger is not None:
+                            hit_pipeline_work = _begin_pipeline_work(
+                                pipeline_ledger,
+                                "begin_hit_work",
+                                ready.plan.hits,
+                                phase=phase,
+                            )
+                        try:
+                            if wave.positions == tuple(range(len(expert_ids))):
+                                assignment_inputs = mx.broadcast_to(
+                                    tokens[:, None, :],
+                                    (int(tokens.shape[0]), top_k, hidden_size),
+                                ).reshape((-1, hidden_size))
+                            else:
+                                token_positions = mx.array(
+                                    [position // top_k for position in wave.positions],
+                                    dtype=mx.int32,
+                                )
+                                assignment_inputs = mx.take(
+                                    tokens,
+                                    token_positions,
+                                    axis=0,
+                                )
+                            if (
+                                pipeline_ledger is not None
+                                and hit_pipeline_work is not None
+                            ):
+                                _pipeline_work_call(
+                                    pipeline_ledger,
+                                    hit_pipeline_work,
+                                    "claim",
+                                    phase=phase,
+                                )
+                            wave_output = _run_component_bank_q4(
+                                assignment_inputs,
+                                ready.bindings,
+                                group_size=self.group_size,
+                            )
+                            # Slot pins may be released only after the lazy graph
+                            # has consumed the currently bound bank generations.
+                            synchronous_fence(ready, wave_output)
+                            outputs.append(wave_output)
+                            output_positions.extend(wave.positions)
+                        finally:
+                            if (
+                                pipeline_ledger is not None
+                                and hit_pipeline_work is not None
+                            ):
+                                _pipeline_work_call(
+                                    pipeline_ledger,
+                                    hit_pipeline_work,
+                                    "close",
+                                    phase=phase,
+                                )
+                            ready.release(synchronize=False)
+                        continue
+
+                # Both layouts pin hits and start miss reads first, then run the
+                # resident experts on the GPU while the misses stream from SSD.
+                evaluate_bindings = (
+                    evaluate_component_bindings
+                    if self.runtime.config.slot_layout == "component-banks"
+                    else evaluate_direct_bindings
+                )
+                pending = self.runtime.begin_split_route(
                     self.layer_index,
                     wave.experts,
                     phase=phase,
                 )
-                if ready is not None:
-                    try:
-                        if wave.positions == tuple(range(len(expert_ids))):
-                            assignment_inputs = mx.broadcast_to(
-                                tokens[:, None, :],
-                                (int(tokens.shape[0]), top_k, hidden_size),
-                            ).reshape((-1, hidden_size))
-                        else:
-                            token_positions = mx.array(
-                                [position // top_k for position in wave.positions],
-                                dtype=mx.int32,
-                            )
-                            assignment_inputs = mx.take(
-                                tokens,
-                                token_positions,
-                                axis=0,
-                            )
-                        wave_output = _run_component_bank_q4(
-                            assignment_inputs,
-                            ready.bindings,
-                            group_size=self.group_size,
+                try:
+                    hit_pipeline_work = None
+                    if pipeline_ledger is not None and pending.hit_ready is not None:
+                        hit_pipeline_work = _begin_pipeline_work(
+                            pipeline_ledger,
+                            "begin_hit_work",
+                            pending.plan.hits,
+                            phase=phase,
                         )
-                        # Slot pins may be released only after the lazy graph
-                        # has consumed the currently bound bank generations.
-                        synchronous_fence(ready, wave_output)
-                        outputs.append(wave_output)
-                        output_positions.extend(wave.positions)
-                    finally:
-                        ready.release(synchronize=False)
-                    continue
-
-            # Both layouts pin hits and start miss reads first, then run the
-            # resident experts on the GPU while the misses stream from SSD.
-            evaluate_bindings = (
-                evaluate_component_bindings
-                if self.runtime.config.slot_layout == "component-banks"
-                else evaluate_direct_bindings
-            )
-            pending = self.runtime.begin_split_route(
-                self.layer_index,
-                wave.experts,
-                phase=phase,
-            )
-            try:
-                hit_set = set(pending.plan.hits)
-                hit_positions = tuple(
-                    position
-                    for position, expert in zip(
-                        wave.positions, wave.experts, strict=True
-                    )
-                    if expert in hit_set
-                )
-                if pending.hit_ready is not None:
-                    # Split parts feed one shared lazy graph. Keep every MLX
-                    # eval on the generation thread; evaluating a fence on the
-                    # completion lane can race the next part's graph traversal.
-                    evaluate_bindings(
-                        hit_positions,
-                        pending.hit_ready.bindings,
-                        pending.hit_ready,
-                        force_sync=True,
-                    )
-                    pending.release_hits()
-                # The resident shared branch depends only on ``x``.  Force it
-                # on Metal while the native readers own miss futures, so
-                # all-miss layers have useful GPU work instead of an empty
-                # device.  Keep prefill unchanged: at 128K, eagerly retaining
-                # the full shared output across routed waves would violate the
-                # bounded-memory execution contract.
-                if (
-                    shared_work is not None
-                    and shared is None
-                    and phase is RoutingPhase.DECODE
-                    and pending.misses_pending
-                ):
-                    shared = shared_work()
-                    mx.eval(shared)
-                for miss_ready in pending.iter_ready_misses():
-                    part_error: BaseException | None = None
                     try:
-                        ready_experts = set(miss_ready.plan.experts)
-                        miss_positions = tuple(
+                        hit_set = set(pending.plan.hits)
+                        hit_positions = tuple(
                             position
                             for position, expert in zip(
                                 wave.positions, wave.experts, strict=True
                             )
-                            if expert not in hit_set and expert in ready_experts
+                            if expert in hit_set
                         )
-                        evaluate_bindings(
-                            miss_positions,
-                            miss_ready.bindings,
-                            miss_ready,
-                            force_sync=True,
-                        )
-                    except BaseException as exc:
-                        part_error = exc
-                        raise
+                        if pending.hit_ready is not None:
+                            # Split parts feed one shared lazy graph. Keep every MLX
+                            # eval on the generation thread; evaluating a fence on the
+                            # completion lane can race the next part's graph traversal.
+                            if (
+                                pipeline_ledger is not None
+                                and hit_pipeline_work is not None
+                            ):
+                                _pipeline_work_call(
+                                    pipeline_ledger,
+                                    hit_pipeline_work,
+                                    "claim",
+                                    phase=phase,
+                                )
+                            evaluate_bindings(
+                                hit_positions,
+                                pending.hit_ready.bindings,
+                                pending.hit_ready,
+                                force_sync=True,
+                            )
                     finally:
+                        if (
+                            pipeline_ledger is not None
+                            and hit_pipeline_work is not None
+                        ):
+                            _pipeline_work_call(
+                                pipeline_ledger,
+                                hit_pipeline_work,
+                                "close",
+                                phase=phase,
+                            )
+                    if pending.hit_ready is not None:
+                        pending.release_hits()
+                    # The resident shared branch depends only on ``x``.  Force it
+                    # on Metal while the native readers own miss futures, so
+                    # all-miss layers have useful GPU work instead of an empty
+                    # device.  Keep prefill unchanged: at 128K, eagerly retaining
+                    # the full shared output across routed waves would violate the
+                    # bounded-memory execution contract.
+                    if (
+                        shared_work is not None
+                        and shared is None
+                        and phase is RoutingPhase.DECODE
+                        and pending.misses_pending
+                    ):
+                        if (
+                            pipeline_ledger is not None
+                            and shared_pipeline_work is not None
+                        ):
+                            _pipeline_work_call(
+                                pipeline_ledger,
+                                shared_pipeline_work,
+                                "claim",
+                                phase=phase,
+                            )
                         try:
-                            pending.release_miss(miss_ready)
-                        except BaseException:
-                            if part_error is None:
-                                raise
-            except BaseException as exc:
-                pending.abort(exc)
-                raise
-            finally:
-                pending.close()
+                            shared = shared_work()
+                            mx.eval(shared)
+                        finally:
+                            if (
+                                pipeline_ledger is not None
+                                and shared_pipeline_work is not None
+                            ):
+                                _pipeline_work_call(
+                                    pipeline_ledger,
+                                    shared_pipeline_work,
+                                    "close",
+                                    phase=phase,
+                                )
+                                shared_pipeline_work = None
+                    for miss_ready in pending.iter_ready_misses():
+                        part_error: BaseException | None = None
+                        try:
+                            ready_experts = set(miss_ready.plan.experts)
+                            miss_positions = tuple(
+                                position
+                                for position, expert in zip(
+                                    wave.positions, wave.experts, strict=True
+                                )
+                                if expert not in hit_set and expert in ready_experts
+                            )
+                            if pipeline_ledger is not None:
+                                _pipeline_work_call(
+                                    pipeline_ledger,
+                                    pending,
+                                    "claim_misses",
+                                    miss_ready,
+                                    phase=phase,
+                                )
+                            evaluate_bindings(
+                                miss_positions,
+                                miss_ready.bindings,
+                                miss_ready,
+                                force_sync=True,
+                            )
+                        except BaseException as exc:
+                            part_error = exc
+                            raise
+                        finally:
+                            try:
+                                pending.release_miss(miss_ready)
+                            except BaseException:
+                                if part_error is None:
+                                    raise
+                except BaseException as exc:
+                    pending.abort(exc)
+                    raise
+                finally:
+                    pending.close()
 
-        if not outputs:
-            raise ValueError("router produced no expert assignments")
-        if len(outputs) == 1 and output_positions == list(range(len(expert_ids))):
-            joined = outputs[0]
-        else:
-            joined = mx.concatenate(outputs, axis=0)
-            order = mx.argsort(mx.array(output_positions, dtype=mx.int32))
-            joined = mx.take(joined, order, axis=0)
-        output = joined.reshape((*indices.shape, hidden_size))
-        if shared_work is not None and shared is None:
-            # No physical wait remained to hide, or this was a bounded-memory
-            # prefill. Preserve the original routed-then-shared ordering.
-            shared = shared_work()
-        return output, shared
+            if not outputs:
+                raise ValueError("router produced no expert assignments")
+            if len(outputs) == 1 and output_positions == list(range(len(expert_ids))):
+                joined = outputs[0]
+            else:
+                joined = mx.concatenate(outputs, axis=0)
+                order = mx.argsort(mx.array(output_positions, dtype=mx.int32))
+                joined = mx.take(joined, order, axis=0)
+            output = joined.reshape((*indices.shape, hidden_size))
+            if shared_work is not None and shared is None:
+                # No physical wait remained to hide, or this was a bounded-memory
+                # prefill. Preserve the original routed-then-shared ordering.
+                if pipeline_ledger is not None and shared_pipeline_work is not None:
+                    _pipeline_work_call(
+                        pipeline_ledger,
+                        shared_pipeline_work,
+                        "claim",
+                        phase=phase,
+                    )
+                try:
+                    shared = shared_work()
+                finally:
+                    if pipeline_ledger is not None and shared_pipeline_work is not None:
+                        _pipeline_work_call(
+                            pipeline_ledger,
+                            shared_pipeline_work,
+                            "close",
+                            phase=phase,
+                        )
+                        shared_pipeline_work = None
+            return output, shared
+        finally:
+            if pipeline_ledger is not None and shared_pipeline_work is not None:
+                _pipeline_work_call(
+                    pipeline_ledger,
+                    shared_pipeline_work,
+                    "close",
+                    phase=phase,
+                )
 
 
 def run_switch_with_shared_overlap(

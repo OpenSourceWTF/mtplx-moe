@@ -1,0 +1,379 @@
+{
+  "schema": "mtplx.hy3-cache-scheduling.issue29.v3",
+  "issue": 29,
+  "measured_commit": "bf34a0ad917495db386edb90e27fd1de42da8929",
+  "baseline_commit": "e7669d43a8033e4c0cf4d4aea93563967481be75",
+  "historical_cache_scope_commit": "aef62bc0e4ff0c716933dd16a2acd0154f112a93",
+  "serialized_control_commit": "058b40b28de97ddce23184e2c62ed1f41cb6ba2d",
+  "base_branch": "experiment/moe-pr13-pr14-stack",
+  "decision": {
+    "candidate": "global component-bank cache",
+    "fixed_percentage_gate": "retired as arbitrary and unsupported by a noise model",
+    "rule": {
+      "hard_gates": "Identical token hashes, requested concurrency, passing tests, and preserved documented behavior.",
+      "minimum_pairs": 4,
+      "order": "Equal base-first and candidate-first pairs.",
+      "positive": "Retain as directionally positive only when every valid paired TPS delta is positive.",
+      "negative": "Reject as directionally negative only when every valid paired TPS delta is negative.",
+      "mixed": "Mark the batch inconclusive when paired deltas have mixed signs; more pairs may characterize uncertainty but cannot make the cumulative batch unanimous.",
+      "magnitude": "Report the median and full paired range; no universal minimum effect-size gate."
+    },
+    "status": "retain_directionally_positive",
+    "magnitude_status": "uncertain",
+    "current_median_paired_gain_percent": 4.199990293774225,
+    "current_paired_gain_range_percent": [
+      1.0842457199193856,
+      5.035338950194146
+    ],
+    "reason": "All four balanced-order current pairs and both historical same-commit cache-scope pairs are positive, while the wide current range prevents a precise magnitude claim."
+  },
+  "environment": {
+    "machine": "MacBook Pro Mac17,6",
+    "chip": "Apple M5 Max",
+    "memory_bytes": 137438953472,
+    "os": "macOS 26.5.2 arm64",
+    "python": "3.12.13",
+    "mlx": "0.31.2",
+    "qwen_restored_model": "mtplx-qwen36-27b-optimized-speed"
+  },
+  "common_configuration": {
+    "model": "pipenetwork/Hy3-4bit snapshot 160619d3f96c8470350b6dac0ef033a8381551e3",
+    "model_key": "hy3-q4",
+    "slot_layout": "component-banks",
+    "cache_policy": "lru",
+    "expert_cache_limit_bytes": 83034243072,
+    "persistent_slots": 7821,
+    "transient_slots": 32,
+    "memory_limit_bytes": 120259084288,
+    "runtime_reserve_bytes": 8589934592,
+    "max_live_kv_tokens": 18888,
+    "max_read_chunk_bytes": 67108864,
+    "f_nocache": true,
+    "generation": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": 1
+    },
+    "mtp_enabled": false
+  },
+  "current_remeasurement": {
+    "headline_telemetry_enabled": false,
+    "measured_python_source_commit": "bf34a0ad917495db386edb90e27fd1de42da8929",
+    "docs_only_descendant_commit": "a387fcec3f6fd6565eaac3830a57233b9f7b15bc",
+    "candidate_harness_source_sha256": "ca1b011662dc6fa8c7745051ddf1fd571a3e67f76355fe5f12e6dfd0ab351005",
+    "natural_completion_tokens": 1905,
+    "token_ids_sha256": "484e182a68604821f69d56d0b15488d26723e6123f6a57f8158f8b20a4c6ed1c",
+    "pair_order": [
+      "base",
+      "candidate",
+      "candidate",
+      "base",
+      "base",
+      "candidate",
+      "candidate",
+      "base"
+    ],
+    "pairs": [
+      {
+        "pair": 1,
+        "base_tokens_per_second": 6.153428987071347,
+        "candidate_tokens_per_second": 6.415852100113637,
+        "gain_percent": 4.264664686854314,
+        "base_elapsed_seconds": 309.58348654099973,
+        "candidate_elapsed_seconds": 296.9208096250004,
+        "base_run": "issue29-headline-base-layer-B1-p01-20260713T132429Z-e7669d43a803",
+        "candidate_run": "issue29-headline-opt-global-B1-p01-20260713T132947Z-bf34a0ad9174"
+      },
+      {
+        "pair": 2,
+        "base_tokens_per_second": 6.1840427367336765,
+        "candidate_tokens_per_second": 6.439772439331545,
+        "gain_percent": 4.1353159006941365,
+        "base_elapsed_seconds": 308.05091120799625,
+        "candidate_elapsed_seconds": 295.8179062920026,
+        "base_run": "issue29-headline-base-layer-B1-p02-20260713T133955Z-e7669d43a803",
+        "candidate_run": "issue29-headline-opt-global-B1-p02-20260713T133452Z-bf34a0ad9174"
+      },
+      {
+        "pair": 3,
+        "base_tokens_per_second": 6.1691624849504505,
+        "candidate_tokens_per_second": 6.2360513651483975,
+        "gain_percent": 1.0842457199193856,
+        "base_elapsed_seconds": 308.793941584001,
+        "candidate_elapsed_seconds": 305.48176858300576,
+        "base_run": "issue29-headline-base-layer-B1-p03-20260713T135008Z-e7669d43a803",
+        "candidate_run": "issue29-headline-opt-global-B1-p03-20260713T135523Z-a387fcec3f6f"
+      },
+      {
+        "pair": 4,
+        "base_tokens_per_second": 5.919963698196334,
+        "candidate_tokens_per_second": 6.2180539361289675,
+        "gain_percent": 5.035338950194146,
+        "base_elapsed_seconds": 321.79251379200286,
+        "candidate_elapsed_seconds": 306.36594979199435,
+        "base_run": "issue29-headline-base-layer-B1-p04-20260713T140755Z-e7669d43a803",
+        "candidate_run": "issue29-headline-opt-global-B1-p04-20260713T140240Z-a387fcec3f6f"
+      }
+    ],
+    "mean": {
+      "base_tokens_per_second": 6.106649476737952,
+      "candidate_tokens_per_second": 6.327432460180637,
+      "ratio_of_means_gain_percent": 3.6154520459003248,
+      "mean_paired_gain_percent": 3.629891314415495
+    },
+    "paired_gain": {
+      "median_percent": 4.199990293774225,
+      "minimum_percent": 1.0842457199193856,
+      "maximum_percent": 5.035338950194146,
+      "all_positive": true
+    },
+    "arm_variability": {
+      "base_max_min_range_percent": 4.46082192392161,
+      "candidate_max_min_range_percent": 3.5657217753342296,
+      "magnitude_interpretation": "uncertain; report the full paired range"
+    }
+  },
+  "resource_diagnostic": {
+    "diagnostic_only": true,
+    "run": "issue29-diag-global-B1-20260713T132054Z-bf34a0ad9174",
+    "generated_tokens": 256,
+    "tokens_per_second": 4.817051628948769,
+    "ssd_ceiling_gib_per_second": 12.47,
+    "reader_gib_per_second": 6.065121035004007,
+    "ssd_ceiling_fraction": 0.48637698757048975,
+    "reader_read_bytes": 346098106368,
+    "reader_bytes_per_token": 1351945728,
+    "logical_reader_operations": 31684,
+    "logical_reader_operations_per_token": 123.765625,
+    "reader_worker_capacity": 32,
+    "mean_active_readers": 3.7320675371608085,
+    "active_capacity_fraction": 0.11662711053627527,
+    "mean_queued_reads": 0.37697449033261016,
+    "queue_nonempty_fraction": 0.9951690821256038,
+    "synchronous_fences": 39910,
+    "synchronous_fences_per_token": 155.8984375,
+    "mean_active_asynchronous_fences": 0.0,
+    "coverage": {
+      "timeline": "complete",
+      "sampling_failures": 0,
+      "gpu": "unavailable",
+      "dram_bandwidth": "unavailable",
+      "simultaneous_io_metal_overlap": "not measured"
+    },
+    "attribution": {
+      "status": "incomplete",
+      "candidates": [
+        "synchronous_fence_or_evaluation"
+      ]
+    }
+  },
+  "repeated_b1": {
+    "max_tokens": 2048,
+    "natural_completion_tokens": 1905,
+    "token_ids_sha256": "484e182a68604821f69d56d0b15488d26723e6123f6a57f8158f8b20a4c6ed1c",
+    "pairs": [
+      {
+        "pair": 1,
+        "layer_tokens_per_second": 6.093200550507134,
+        "global_tokens_per_second": 6.40046621109308,
+        "gain_percent": 5.042762962,
+        "layer_ttft_seconds": 14.689838041,
+        "global_ttft_seconds": 14.756240833,
+        "layer_elapsed_seconds": 312.643574458,
+        "global_elapsed_seconds": 297.634568666,
+        "layer_run": "issue29-headline-layer-B1-opt-p01-20260713T064202Z-aef62bc0e4ff",
+        "global_run": "issue29-headline-global-B1-opt-p01-20260713T063614Z-aef62bc0e4ff"
+      },
+      {
+        "pair": 2,
+        "layer_tokens_per_second": 6.112122523366164,
+        "global_tokens_per_second": 6.3978049898064215,
+        "gain_percent": 4.674030426,
+        "layer_ttft_seconds": 14.78574,
+        "global_ttft_seconds": 14.854436375,
+        "layer_elapsed_seconds": 311.675689209,
+        "global_elapsed_seconds": 297.758372291,
+        "layer_run": "issue29-headline-layer-B1-opt-p02-20260713T064753Z-aef62bc0e4ff",
+        "global_run": "issue29-headline-global-B1-opt-p02-20260713T065333Z-aef62bc0e4ff"
+      }
+    ],
+    "mean": {
+      "layer_tokens_per_second": 6.102661536937,
+      "global_tokens_per_second": 6.39913560045,
+      "gain_percent": 4.85811087,
+      "layer_run_spread_percent": 0.310542,
+      "global_run_spread_percent": 0.041596
+    },
+    "pair_1_cache_economics": {
+      "layer": {
+        "bytes_read": 1768689893376,
+        "decode_hit_rate": 0.8727213195404744,
+        "persistent_loads": 160979,
+        "evictions": 153158,
+        "read_operations": 165678,
+        "read_mib_per_second": 3639.589817,
+        "peak_mlx_memory_bytes": 89145312888
+      },
+      "global": {
+        "bytes_read": 1630883414016,
+        "decode_hit_rate": 0.8835080709498989,
+        "persistent_loads": 147999,
+        "evictions": 140178,
+        "read_operations": 152698,
+        "read_mib_per_second": 3835.687873,
+        "peak_mlx_memory_bytes": 89145312888
+      },
+      "global_minus_layer": {
+        "bytes_read_percent": -7.791443818,
+        "decode_hit_rate_percentage_points": 1.078675141,
+        "persistent_loads_percent": -8.063163518,
+        "evictions_percent": -8.474908265,
+        "read_operations_percent": -7.8344741
+      }
+    }
+  },
+  "serialized_control": {
+    "premise": "CPU writes to one component-bank row require exclusion from Metal reads of disjoint sibling rows in the same MLX allocation.",
+    "premise_status": "unproven; measured overlapped runs retained exact output parity with no observed output-integrity failure, and no attributable crash was documented",
+    "schedule": "Finish every component-bank miss before any Q4 dispatch from the bank.",
+    "original_payload_status": "primary promotion evidence with exact deterministic output parity and no observed integrity failure",
+    "control": {
+      "scope": "layer",
+      "run": "issue29-fenced-layer-B1-p01-20260713T073735Z-058b40b28de9",
+      "chat": true,
+      "max_tokens": 2048,
+      "natural_completion_tokens": 1905,
+      "token_ids_sha256": "484e182a68604821f69d56d0b15488d26723e6123f6a57f8158f8b20a4c6ed1c",
+      "repeats": [
+        {
+          "tokens_per_second": 2.933186210425617,
+          "elapsed_seconds": 649.4643924170014,
+          "ttft_seconds": 16.338481125001636,
+          "bytes_read": 1768689893376
+        },
+        {
+          "tokens_per_second": 2.975719562340102,
+          "elapsed_seconds": 640.181294,
+          "ttft_seconds": 10.239435749999757,
+          "bytes_read_cumulative": 3462520504320
+        }
+      ],
+      "mean_tokens_per_second": 2.9544528863828594,
+      "change_from_original_layer_mean_percent": -51.587469360692495
+    },
+    "remaining_arms": "stopped after the serialized layer control proved nonviable",
+    "excluded_harness_run": {
+      "run": "issue29-fenced-layer-B1-p01-20260713T072759Z-058b40b28de9",
+      "reason": "omitted --chat and stopped after 458 tokens; not comparable"
+    },
+    "decision": "reject the serialized barrier; it measures cost but does not prove the original schedule unsafe"
+  },
+  "static_saturation": [
+    {
+      "batch": 2,
+      "max_tokens_per_stream": 64,
+      "layer_tokens_per_second": 3.9477918459,
+      "global_tokens_per_second": 4.0274220877,
+      "gain_percent": 2.017083091,
+      "layer_ttft_p50_seconds": 10.58697,
+      "global_ttft_p50_seconds": 10.44615,
+      "layer_completion_p95_seconds": 31.69212,
+      "global_completion_p95_seconds": 31.05446,
+      "achieved_peak_concurrency": 2,
+      "saturation_valid": true,
+      "undersubscribed": false,
+      "layer_run": "issue29-static-layer-B2-20260713T065932Z-aef62bc0e4ff",
+      "global_run": "issue29-static-global-B2-20260713T070028Z-aef62bc0e4ff"
+    },
+    {
+      "batch": 4,
+      "max_tokens_per_stream": 64,
+      "layer_tokens_per_second": 5.40901922266,
+      "global_tokens_per_second": 5.57467097287,
+      "gain_percent": 3.062509919,
+      "layer_ttft_p50_seconds": 6.6753277,
+      "global_ttft_p50_seconds": 6.34618825,
+      "layer_completion_p95_seconds": 45.112487,
+      "global_completion_p95_seconds": 43.736603,
+      "achieved_peak_concurrency": 4,
+      "saturation_valid": true,
+      "undersubscribed": false,
+      "layer_run": "issue29-static-layer-B4-20260713T070129Z-aef62bc0e4ff",
+      "global_run": "issue29-static-global-B4-20260713T070301Z-aef62bc0e4ff"
+    },
+    {
+      "batch": 8,
+      "max_tokens_per_stream": 64,
+      "layer_tokens_per_second": 6.70951542601,
+      "global_tokens_per_second": 6.90170875818,
+      "gain_percent": 2.864489012,
+      "layer_ttft_p50_seconds": 6.5915901,
+      "global_ttft_p50_seconds": 6.3509662,
+      "layer_completion_p95_seconds": 71.161736,
+      "global_completion_p95_seconds": 69.093858,
+      "achieved_peak_concurrency": 8,
+      "saturation_valid": true,
+      "undersubscribed": false,
+      "layer_run": "issue29-static-layer-B8-20260713T070429Z-aef62bc0e4ff",
+      "global_run": "issue29-static-global-B8-20260713T070608Z-aef62bc0e4ff"
+    }
+  ],
+  "mixed_prefill_decode": {
+    "batch": 4,
+    "max_tokens_per_stream": 64,
+    "join_after_step": 2,
+    "max_prefills_per_step": 1,
+    "layer_tokens_per_second": 5.37579874626,
+    "global_tokens_per_second": 5.44357440016,
+    "gain_percent": 1.260755045,
+    "layer_ttft_p50_seconds": 6.606729187,
+    "global_ttft_p50_seconds": 6.450274687,
+    "layer_completion_p95_seconds": 44.869691,
+    "global_completion_p95_seconds": 44.303312,
+    "achieved_peak_concurrency": 4,
+    "mean_live_streams": 3.70588235,
+    "saturation_valid": true,
+    "undersubscribed": false,
+    "layer_run": "issue29-mixed-layer-B4-20260713T070751Z-aef62bc0e4ff",
+    "global_run": "issue29-mixed-global-B4-20260713T070915Z-aef62bc0e4ff"
+  },
+  "held_out_route_analysis": {
+    "trace_run": "issue29-route-trace128-B1-20260713T054701Z-8e94afce7c21",
+    "decode_steps": 254,
+    "assignment_requests": 160528,
+    "unique_assignment_requests": 160528,
+    "shared_assignment_requests": 0,
+    "batch_union_size": 8,
+    "recommended_total_slots": 7821,
+    "recommended_total_bytes": 83034243072,
+    "training_hit_gain": 286,
+    "held_out_hit_delta": 22,
+    "held_out_miss_delta": -22,
+    "held_out_hit_rate_delta": 0.0002719541139240506,
+    "decision": "diagnostic-only; gain is 0.0272 percentage points and does not justify promotion"
+  },
+  "transaction_hot_path_microbenchmark": {
+    "entries": 7821,
+    "before_commit": "05a2b07",
+    "after_commit": "aef62bc",
+    "all_hit_microseconds_per_route": {
+      "before": 297.828,
+      "after": 8.192
+    },
+    "forced_miss_microseconds_per_route": {
+      "before": 2453.428,
+      "after": 6.128
+    },
+    "scope": "Python transaction bookkeeping only; not an end-to-end model throughput claim"
+  },
+  "verification": {
+    "full_pytest": "passed at 100% on bf34a0a with existing skips and deprecation warnings",
+    "independent_reviews": "two post-fix reviews passed; telemetry-disabled static, mixed-join, and reference lanes retain their predecessor timing operations",
+    "diagnostic_sampling": "208 samples, zero drops, zero sampling failures, complete timeline",
+    "focused_exact_rollback_cases": 5000,
+    "focused_partial_admission_cases": 3000,
+    "randomized_state_transitions": 144000,
+    "ruff": "passed on changed Python files",
+    "qwen_restore": "launchctl service com.tea.qwen running and /v1/models returned the expected model"
+  }
+}

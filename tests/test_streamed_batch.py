@@ -250,9 +250,7 @@ def test_two_streams_keep_outputs_and_kv_isolated_per_sequence(
         states: list = []
 
         def run_batch(first: str) -> dict[str, tuple[int, ...]]:
-            runner = StreamedBatchRunner(
-                rt, max_concurrency=2, on_step=states.append
-            )
+            runner = StreamedBatchRunner(rt, max_concurrency=2, on_step=states.append)
             requests = {
                 "a": _request("a", prompt_a, max_tokens=5),
                 "b": _request("b", prompt_b, max_tokens=5),
@@ -260,9 +258,7 @@ def test_two_streams_keep_outputs_and_kv_isolated_per_sequence(
             second = "b" if first == "a" else "a"
             runner.submit(requests[first])
             runner.submit(requests[second])
-            return {
-                result.request_id: result.tokens for result in runner.run()
-            }
+            return {result.request_id: result.tokens for result in runner.run()}
 
         first_order = run_batch("a")
         second_order = run_batch("b")
@@ -342,8 +338,7 @@ def test_continuous_admission_joins_at_a_later_step_boundary(
         overlapped = [
             state
             for state in states
-            if {"r2", "r3"}
-            <= {view.request_id for view in state.live}
+            if {"r2", "r3"} <= {view.request_id for view in state.live}
         ]
         assert overlapped, "r3 never decoded next to a still-live stream"
         assert all(len(result.tokens) > 0 for result in results.values())
@@ -386,9 +381,7 @@ def test_per_request_stop_tokens_finish_with_stop_reason(tmp_path: Path) -> None
         def run_pair(stop_b: frozenset[int]):
             runner = StreamedBatchRunner(rt, max_concurrency=2)
             runner.submit(_request("a", prompt_a, max_tokens=6))
-            runner.submit(
-                _request("b", prompt_b, max_tokens=6, stop_token_ids=stop_b)
-            )
+            runner.submit(_request("b", prompt_b, max_tokens=6, stop_token_ids=stop_b))
             return {result.request_id: result for result in runner.run()}
 
         # Learn stream b's deterministic second token, then re-run with it as

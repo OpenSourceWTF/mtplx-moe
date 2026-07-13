@@ -2,8 +2,9 @@
 """Analyze Hy3 route traces for cache, global-pool, and cluster headroom.
 
 The legacy whole-decode metrics remain in ``policies``.  The issue #9 offline
-gate lives in ``held_out`` and uses a chronological train/evaluation split so
-that deployable quota and cluster metadata never sees evaluation routes.
+gate lives in ``held_out`` and uses a per-reset-epoch chronological
+train/evaluation split so deployable quota and cluster metadata never sees
+evaluation routes and every simulated cache starts cold after a runtime reset.
 """
 
 from __future__ import annotations
@@ -11,9 +12,21 @@ from __future__ import annotations
 import argparse
 import heapq
 import json
+import sys
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 from typing import Hashable, Iterable, Sequence, TypeVar
+
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from mtplx.expert_runtime import partition_route_waves  # noqa: E402
+from mtplx.expert_streaming import (  # noqa: E402
+    CacheCounters,
+    GlobalExpertSlotBank,
+    LayerExpertSlotBank,
+)
 
 
 CacheKey = TypeVar("CacheKey", bound=Hashable)
@@ -68,6 +81,151 @@ def _simulate_lru(
                         cache.pop(next(iter(cache)))
                     cache[expert] = None
     return hits, misses
+
+
+def _simulate_atomic_layer_lru(
+    prompt_rows: Sequence[tuple[int, ...]],
+    decode_steps: Sequence[Sequence[tuple[int, ...]]],
+    capacity: int,
+    expert_count: int,
+    *,
+    evaluate_from: int = 0,
+) -> tuple[int, int]:
+    """Replay each B*top-k selection through the production policy atomically."""
+    metric = _simulate_atomic_layer_lru_metric(
+        prompt_rows,
+        decode_steps,
+        capacity,
+        expert_count,
+        evaluate_from=evaluate_from,
+    )
+    return int(metric["hits"]), int(metric["misses"])
+
+
+def _simulate_atomic_layer_lru_metric(
+    prompt_rows: Sequence[tuple[int, ...]],
+    decode_steps: Sequence[Sequence[tuple[int, ...]]],
+    capacity: int,
+    expert_count: int,
+    *,
+    evaluate_from: int = 0,
+    transient_slots: int | None = None,
+) -> dict[str, float | int]:
+    """Return assignment and unique-load evidence from production-policy replay."""
+
+    atomic_routes = [
+        tuple(expert for row in step for expert in row) for step in decode_steps
+    ]
+    prompt_experts = tuple(expert for row in prompt_rows for expert in row)
+    maximum_unique = transient_slots or max(
+        [len(set(route)) for route in atomic_routes if route]
+        + ([len(set(prompt_experts))] if prompt_experts else [1])
+    )
+    bank = LayerExpertSlotBank(
+        expert_count=expert_count,
+        persistent_slots=capacity,
+        transient_slots=maximum_unique,
+        cache_policy="lru",
+    )
+    if prompt_experts:
+        bank.prepare_prefill_seed(prompt_experts)
+        for wave in partition_route_waves(
+            prompt_experts, max_unique_experts=maximum_unique
+        ):
+            bank.plan(wave.experts, phase="prefill")
+    counters = CacheCounters()
+    for index, atomic_route in enumerate(atomic_routes):
+        for wave in partition_route_waves(
+            atomic_route, max_unique_experts=maximum_unique
+        ):
+            plan = bank.plan(wave.experts, phase="decode")
+            if index >= evaluate_from:
+                counters.observe(plan, expert_record_bytes=0)
+    metric = _metric(counters.expert_hits, counters.expert_misses)
+    metric["physical_records_read"] = (
+        counters.persistent_loads + counters.transient_loads
+    )
+    metric["final_resident_experts"] = list(bank.resident_experts)
+    return metric
+
+
+def _simulate_atomic_global_lru_metric(
+    layers: Sequence[int],
+    prompt: dict[int, Sequence[tuple[int, ...]]],
+    decode_steps: dict[int, Sequence[Sequence[tuple[int, ...]]]],
+    capacity: int,
+    expert_count: int,
+    transient_slots: int,
+    *,
+    prefill_slots_per_layer: int,
+    evaluate_from: int = 0,
+) -> dict[str, object]:
+    """Replay runtime-ordered layer routes through the production global bank."""
+
+    bank = GlobalExpertSlotBank(
+        layer_indices=layers,
+        expert_count=expert_count,
+        persistent_slots=capacity,
+        transient_slots=transient_slots,
+        prefill_slots_per_layer=prefill_slots_per_layer,
+        cache_policy="lru",
+    )
+    for layer in layers:
+        prompt_experts = tuple(expert for row in prompt[layer] for expert in row)
+        if not prompt_experts:
+            continue
+        bank.prepare_prefill_seed(layer, prompt_experts)
+        for wave in partition_route_waves(
+            prompt_experts, max_unique_experts=transient_slots
+        ):
+            plan = bank.plan(layer, wave.experts, phase="prefill")
+            bank.publish_ready(layer, plan)
+    counters = CacheCounters()
+    step_count = len(decode_steps[layers[0]])
+    for step in range(step_count):
+        for layer in layers:
+            atomic_route = tuple(
+                expert for row in decode_steps[layer][step] for expert in row
+            )
+            for wave in partition_route_waves(
+                atomic_route, max_unique_experts=transient_slots
+            ):
+                plan = bank.plan(layer, wave.experts, phase="decode")
+                bank.publish_ready(layer, plan)
+                if step >= evaluate_from:
+                    counters.observe(plan, expert_record_bytes=0)
+    metric: dict[str, object] = _metric(counters.expert_hits, counters.expert_misses)
+    metric["physical_records_read"] = (
+        counters.persistent_loads + counters.transient_loads
+    )
+    metric["final_resident_experts_by_layer"] = {
+        str(layer): list(experts)
+        for layer, experts in bank.resident_experts_by_layer.items()
+    }
+    return metric
+
+
+def _atomic_lru_training_hit_curves_epochs(
+    epochs: Sequence[int],
+    layers: Sequence[int],
+    prompt: dict[int, dict[int, list[tuple[int, ...]]]],
+    train_steps: dict[int, dict[int, list[list[tuple[int, ...]]]]],
+    expert_count: int,
+    transient_slots: int,
+) -> dict[int, list[int]]:
+    curves = {layer: [0] * (expert_count + 1) for layer in layers}
+    for epoch in epochs:
+        for layer in layers:
+            for capacity in range(expert_count + 1):
+                metric = _simulate_atomic_layer_lru_metric(
+                    prompt[epoch][layer],
+                    train_steps[epoch][layer],
+                    capacity,
+                    expert_count,
+                    transient_slots=transient_slots,
+                )
+                curves[layer][capacity] += int(metric["hits"])
+    return curves
 
 
 def _simulate_belady(
@@ -207,6 +365,67 @@ def _global_sequence(
     ]
 
 
+def _global_batched_sequence(
+    layers: Sequence[int],
+    routes: dict[int, list[list[tuple[int, ...]]]],
+) -> list[ExpertKey]:
+    """Flatten route steps in runtime order: step, layer, row, router rank."""
+
+    if not layers:
+        return []
+    steps = len(routes[layers[0]])
+    if any(len(routes[layer]) != steps for layer in layers):
+        raise ValueError("all layers must have the same route-step count")
+    return [
+        (layer, expert)
+        for step in range(steps)
+        for layer in layers
+        for row in routes[layer][step]
+        for expert in row
+    ]
+
+
+def _batch_union_summary(
+    layers: Sequence[int],
+    routes: dict[int, list[list[tuple[int, ...]]]],
+) -> dict[str, object]:
+    """Summarize assignment reuse within each atomic layer/step route."""
+
+    union_size_by_layer: dict[str, list[int]] = {}
+    assignment_requests = 0
+    unique_records_demanded = 0
+    for layer in layers:
+        layer_sizes = []
+        for step in routes[layer]:
+            assignments = [expert for row in step for expert in row]
+            union_size = len(set(assignments))
+            assignment_requests += len(assignments)
+            unique_records_demanded += union_size
+            layer_sizes.append(union_size)
+        union_size_by_layer[str(layer)] = layer_sizes
+    sizes = [
+        size for layer_sizes in union_size_by_layer.values() for size in layer_sizes
+    ]
+    shared_assignments = assignment_requests - unique_records_demanded
+    return {
+        "assignment_requests": assignment_requests,
+        "unique_records_demanded": unique_records_demanded,
+        "shared_expert_assignments": shared_assignments,
+        "assignment_reuse_ratio": (
+            assignment_requests / unique_records_demanded
+            if unique_records_demanded
+            else 0.0
+        ),
+        "union_size": {
+            "min": min(sizes, default=0),
+            "mean": sum(sizes) / len(sizes) if sizes else 0.0,
+            "max": max(sizes, default=0),
+            "samples": len(sizes),
+        },
+        "union_size_by_layer": union_size_by_layer,
+    }
+
+
 def _metric(hits: int, misses: int) -> dict[str, float | int]:
     requests = hits + misses
     return {
@@ -234,6 +453,43 @@ def _sum_policy(
     return _metric(hits, misses)
 
 
+def _aggregate_metrics(
+    metrics: Iterable[dict[str, float | int]],
+) -> dict[str, float | int]:
+    metrics = list(metrics)
+    hits = sum(int(metric["hits"]) for metric in metrics)
+    misses = sum(int(metric["misses"]) for metric in metrics)
+    aggregate = _metric(hits, misses)
+    if any("physical_records_read" in metric for metric in metrics):
+        aggregate["physical_records_read"] = sum(
+            int(metric.get("physical_records_read", metric["misses"]))
+            for metric in metrics
+        )
+    if any("final_resident_experts" in metric for metric in metrics):
+        aggregate["final_residency_by_run"] = [
+            metric.get("final_resident_experts") for metric in metrics
+        ]
+    if any("final_resident_experts_by_layer" in metric for metric in metrics):
+        aggregate["final_residency_by_epoch"] = [
+            metric.get("final_resident_experts_by_layer") for metric in metrics
+        ]
+    return aggregate
+
+
+def _sum_policy_epochs(
+    epochs: Sequence[int],
+    layers: Sequence[int],
+    decode: dict[int, dict[int, list[tuple[int, ...]]]],
+    ranks: dict[int, dict[int, list[int]]],
+    capacities: dict[int, int],
+    simulator,
+) -> dict[str, float | int]:
+    return _aggregate_metrics(
+        _sum_policy(layers, decode[epoch], ranks[epoch], capacities, simulator)
+        for epoch in epochs
+    )
+
+
 def _decorate_io_metric(
     metric: dict[str, float | int | None],
     token_count: int,
@@ -246,7 +502,11 @@ def _decorate_io_metric(
 
     if token_count <= 0:
         raise ValueError("token_count must be positive")
-    records = int(metric["misses"]) if physical_records is None else physical_records
+    records = (
+        int(metric.get("physical_records_read", metric["misses"]))
+        if physical_records is None
+        else physical_records
+    )
     bytes_read = records * record_bytes
     bytes_per_token = bytes_read / token_count
     metric.update(
@@ -351,6 +611,24 @@ def _lru_training_hit_curves(
     return curves
 
 
+def _lru_training_hit_curves_epochs(
+    epochs: Sequence[int],
+    layers: Sequence[int],
+    train: dict[int, dict[int, list[tuple[int, ...]]]],
+    ranks: dict[int, dict[int, list[int]]],
+    expert_count: int,
+) -> dict[int, list[int]]:
+    curves = {layer: [0] * (expert_count + 1) for layer in layers}
+    for epoch in epochs:
+        epoch_curves = _lru_training_hit_curves(
+            layers, train[epoch], ranks[epoch], expert_count
+        )
+        for layer in layers:
+            for capacity, hits in enumerate(epoch_curves[layer]):
+                curves[layer][capacity] += hits
+    return curves
+
+
 def _rebalance_trained_quotas(
     hit_curves: dict[int, list[int]],
     initial_capacities: dict[int, int],
@@ -412,6 +690,67 @@ def _rebalance_trained_quotas(
         "training_hits_after": after,
         "training_hit_gain": after - before,
         "hysteresis_hits": hysteresis_hits,
+    }
+
+
+def _recommended_capacity_summary(
+    layers: Sequence[int],
+    trained_capacities: dict[int, int],
+    quota_training: dict[str, int],
+    held_out_policies: dict[str, dict[str, float | int | None]],
+    *,
+    record_bytes: int,
+) -> dict[str, object]:
+    """Export one train-derived allocation and its held-out evaluation.
+
+    ``trained_capacities`` and ``quota_training`` are computed exclusively from
+    the chronological training prefix.  Held-out rows contribute only to the
+    reported delta against the uniform LRU baseline; they never change quotas.
+    """
+
+    ordered_layers = sorted(layers)
+    if set(ordered_layers) != set(trained_capacities):
+        raise ValueError("trained capacities do not match analyzed layers")
+    total_slots = sum(trained_capacities[layer] for layer in ordered_layers)
+    baseline = held_out_policies["uniform_per_layer_lru"]
+    candidate = held_out_policies["trained_dynamic_quota_lru"]
+    baseline_hits = int(baseline["hits"])
+    baseline_misses = int(baseline["misses"])
+    candidate_hits = int(candidate["hits"])
+    candidate_misses = int(candidate["misses"])
+    baseline_requests = baseline_hits + baseline_misses
+    candidate_requests = candidate_hits + candidate_misses
+    if baseline_requests != candidate_requests:
+        raise ValueError("held-out policies evaluated different request counts")
+    hit_delta = candidate_hits - baseline_hits
+
+    return {
+        "per_layer_quotas": [
+            {"layer": layer, "slots": trained_capacities[layer]}
+            for layer in ordered_layers
+        ],
+        "total_slots": total_slots,
+        "record_bytes_per_slot": record_bytes,
+        "total_bytes": total_slots * record_bytes,
+        "training_gain": {
+            "source": "prefill_rank_plus_chronological_decode_train_prefix",
+            "reallocation_moves": quota_training["reallocation_moves"],
+            "hits_before": quota_training["training_hits_before"],
+            "hits_after": quota_training["training_hits_after"],
+            "hit_delta": quota_training["training_hit_gain"],
+            "hysteresis_hits": quota_training["hysteresis_hits"],
+        },
+        "held_out_delta": {
+            "source": "chronological_decode_held_out_suffix_after_train_warmup",
+            "baseline": "uniform_per_layer_lru",
+            "candidate": "trained_dynamic_quota_lru",
+            "direction": "candidate_minus_baseline",
+            "hit_delta": hit_delta,
+            "miss_delta": candidate_misses - baseline_misses,
+            "hit_rate_delta": (
+                hit_delta / baseline_requests if baseline_requests else 0.0
+            ),
+        },
     }
 
 
@@ -670,6 +1009,34 @@ def _run_cluster_lru_sequence(
     }
 
 
+def _aggregate_cluster_runs(metrics: Sequence[dict[str, object]]) -> dict[str, object]:
+    count_keys = (
+        "hits",
+        "misses",
+        "cluster_reads",
+        "physical_records_read",
+        "demanded_records_read",
+        "speculative_records_read",
+        "redundant_records_read",
+        "speculative_records_admitted",
+        "speculative_records_used_before_eviction",
+        "speculative_records_unused_at_eviction",
+        "speculative_records_still_resident",
+    )
+    result = {key: sum(int(metric[key]) for metric in metrics) for key in count_keys}
+    result.update(_metric(int(result["hits"]), int(result["misses"])))
+    speculative = int(result["speculative_records_read"])
+    admitted = int(result["speculative_records_admitted"])
+    used = int(result["speculative_records_used_before_eviction"])
+    demanded = int(result["demanded_records_read"])
+    result["useful_prefetch_ratio"] = used / speculative if speculative else None
+    result["admitted_useful_prefetch_ratio"] = used / admitted if admitted else None
+    result["read_amplification_vs_demanded"] = (
+        int(result["physical_records_read"]) / demanded if demanded else 0.0
+    )
+    return result
+
+
 def _conditional_prefetch(
     layers: list[int],
     prompt: dict[int, list[tuple[int, ...]]],
@@ -752,6 +1119,11 @@ def main() -> int:
     parser.add_argument("--capacity-per-layer", type=int, default=102)
     parser.add_argument("--expert-count", type=int, default=192)
     parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument(
+        "--transient-slots",
+        type=int,
+        help="Runtime transient route-wave capacity (defaults to trace metadata).",
+    )
     parser.add_argument("--record-bytes", type=int, default=10_616_832)
     parser.add_argument(
         "--measured-ssd-gb-per-second",
@@ -769,7 +1141,10 @@ def main() -> int:
     parser.add_argument(
         "--train-steps",
         type=int,
-        help="Exact decode-prefix length; overrides --train-fraction.",
+        help=(
+            "Exact decode-prefix length within every trace epoch; overrides "
+            "--train-fraction."
+        ),
     )
     parser.add_argument(
         "--quota-hysteresis-hits",
@@ -794,60 +1169,303 @@ def main() -> int:
         raise ValueError("capacity-per-layer cannot exceed expert-count")
     if args.top_k <= 0 or args.top_k > args.expert_count:
         raise ValueError("top-k must be in [1, expert-count]")
-    if args.record_bytes <= 0:
-        raise ValueError("record-bytes must be positive")
+    if args.record_bytes <= 0 or args.record_bytes > 2**63 - 1:
+        raise ValueError("record-bytes must be a positive signed 64-bit integer")
     if args.measured_ssd_gb_per_second <= 0:
         raise ValueError("measured-ssd-gb-per-second must be positive")
     if args.quota_hysteresis_hits < 0:
         raise ValueError("quota-hysteresis-hits must be non-negative")
+    if (
+        args.output_json is not None
+        and args.trace.expanduser().resolve() == args.output_json.expanduser().resolve()
+    ):
+        raise ValueError("trace input and output-json must be different")
 
     payload = json.loads(args.trace.read_text(encoding="utf-8"))
+    payload_transient_slots = payload.get("transient_slots")
+    if (
+        args.transient_slots is not None
+        and payload_transient_slots is not None
+        and args.transient_slots != int(payload_transient_slots)
+    ):
+        raise ValueError("transient-slots override differs from trace metadata")
+    if args.transient_slots is not None:
+        transient_slots = args.transient_slots
+    elif payload_transient_slots is not None:
+        transient_slots = int(payload_transient_slots)
+    elif payload.get("schema") == "mtplx-expert-route-trace-v2":
+        raise ValueError("v2 trace is missing configured transient_slots")
+    else:
+        transient_slots = args.top_k
+    if transient_slots <= 0:
+        raise ValueError("transient-slots must be positive")
     entries = payload["entries"]
     by_phase: dict[str, dict[int, list[list[int]]]] = defaultdict(
         lambda: defaultdict(list)
     )
+    decode_entries: dict[int, list[dict[str, object]]] = defaultdict(list)
+    prefill_entries: dict[int, list[dict[str, object]]] = defaultdict(list)
+    reset_entries: list[dict[str, object]] = []
+    current_epoch = 0
+    epoch_has_routes = False
+    decode_started = False
     for entry in entries:
-        by_phase[entry["phase"]][int(entry["layer"])].append(
-            [int(value) for value in entry["expert_ids"]]
-        )
-    layers = sorted(by_phase["decode"])
-    if not layers:
+        phase = str(entry["phase"])
+        if phase == "reset":
+            previous = int(entry.get("previous_trace_epoch", -1))
+            current = int(entry.get("trace_epoch", -1))
+            if (
+                not epoch_has_routes
+                or previous != current_epoch
+                or current != current_epoch + 1
+            ):
+                raise ValueError("malformed or out-of-order trace reset marker")
+            reset_entries.append(entry)
+            current_epoch = current
+            epoch_has_routes = False
+            decode_started = False
+            continue
+        entry_epoch = int(entry.get("trace_epoch", 0))
+        if entry_epoch != current_epoch:
+            raise ValueError("trace route crosses an unmarked epoch boundary")
+        if phase == "prefill" and decode_started:
+            raise ValueError("prefill route appears after decode in the same epoch")
+        if phase == "decode":
+            decode_started = True
+        epoch_has_routes = True
+        layer = int(entry["layer"])
+        by_phase[phase][layer].append([int(value) for value in entry["expert_ids"]])
+        if phase == "decode":
+            decode_entries[layer].append(entry)
+        elif phase == "prefill":
+            prefill_entries[layer].append(entry)
+    if reset_entries and not epoch_has_routes:
+        raise ValueError("trace ends with a reset marker and no following epoch routes")
+    decode_layers = set(by_phase["decode"])
+    if not decode_layers:
         raise ValueError("trace contains no decode routes")
-    missing_prefill = [layer for layer in layers if not by_phase["prefill"][layer]]
-    if missing_prefill:
-        raise ValueError(f"trace has no prefill routes for layers {missing_prefill}")
-    prompt = {
+    layers = sorted(decode_layers | set(by_phase["prefill"]))
+    decode_counts = {layer: len(by_phase["decode"][layer]) for layer in layers}
+    if len(set(decode_counts.values())) != 1:
+        rendered_counts = ", ".join(
+            f"{layer}: {decode_counts[layer]}" for layer in layers
+        )
+        raise ValueError(f"decode row counts differ by layer: {rendered_counts}")
+    if any(
+        entry.get("decode_step") is None or entry.get("trace_epoch") is None
+        for layer in layers
+        for entry in decode_entries[layer]
+    ):
+        raise ValueError(
+            "trace_epoch and decode_step are required for every decode route; "
+            "regenerate the trace"
+        )
+    route_coordinates = {
         layer: [
-            row
-            for values in by_phase["prefill"][layer]
-            for row in _sets(values, args.top_k)
+            (int(entry["trace_epoch"]), int(entry["decode_step"]))
+            for entry in decode_entries[layer]
         ]
         for layer in layers
     }
-    decode = {
-        layer: [_sets(values, args.top_k)[0] for values in by_phase["decode"][layer]]
+    reference_coordinates = route_coordinates[layers[0]]
+    if any(route_coordinates[layer] != reference_coordinates for layer in layers[1:]):
+        raise ValueError(
+            "trace_epoch/decode_step sequence alignment differs across layers"
+        )
+    epochs = sorted({epoch for epoch, _step in reference_coordinates})
+    if epochs != list(range(len(epochs))):
+        raise ValueError("trace_epoch sequence must start at zero and be contiguous")
+    expected_resets = [
+        {
+            "phase": "reset",
+            "previous_trace_epoch": previous,
+            "trace_epoch": current,
+        }
+        for previous, current in zip(epochs, epochs[1:], strict=False)
+    ]
+    if reset_entries != expected_resets:
+        raise ValueError("trace reset boundaries do not match trace_epoch transitions")
+    expected_coordinates = [
+        (epoch, step)
+        for epoch in epochs
+        for step in range(
+            sum(1 for candidate, _step in reference_coordinates if candidate == epoch)
+        )
+    ]
+    if reference_coordinates != expected_coordinates:
+        raise ValueError(
+            "trace_epoch/decode_step sequence must be unique, monotonic, and "
+            "contiguous within every epoch"
+        )
+    token_counts = {
+        layer: [int(entry.get("token_count", 0)) for entry in decode_entries[layer]]
         for layer in layers
     }
-    decode_steps = min(len(decode[layer]) for layer in layers)
+    reference_widths = token_counts[layers[0]]
+    if any(width <= 0 for width in reference_widths):
+        raise ValueError("decode token_count must be positive for every route")
+    if any(token_counts[layer] != reference_widths for layer in layers[1:]):
+        raise ValueError("decode token_count sequence differs across layers")
+    missing_prefill = [layer for layer in layers if not by_phase["prefill"][layer]]
+    if missing_prefill:
+        raise ValueError(f"trace has no prefill routes for layers {missing_prefill}")
+    prompt_by_epoch = {
+        epoch: {
+            layer: [
+                row
+                for entry in prefill_entries[layer]
+                if int(entry.get("trace_epoch", 0)) == epoch
+                for row in _sets(
+                    [int(value) for value in entry["expert_ids"]], args.top_k
+                )
+            ]
+            for layer in layers
+        }
+        for epoch in epochs
+    }
+    for epoch in epochs:
+        for layer in layers:
+            if not prompt_by_epoch[epoch][layer]:
+                raise ValueError(
+                    f"trace epoch {epoch} has no causal prefill route for layer {layer}"
+                )
+    prompt = {
+        layer: [row for epoch in epochs for row in prompt_by_epoch[epoch][layer]]
+        for layer in layers
+    }
+    decode_steps = decode_counts[layers[0]]
     if decode_steps < 2:
         raise ValueError("trace needs at least two complete decode steps")
-    decode = {layer: rows[:decode_steps] for layer, rows in decode.items()}
-    train_steps = (
-        args.train_steps
-        if args.train_steps is not None
-        else max(1, min(decode_steps - 1, int(decode_steps * args.train_fraction)))
-    )
-    if not 0 < train_steps < decode_steps:
-        raise ValueError("train-steps must leave at least one train and held-out step")
+    decode_by_step: dict[int, list[list[tuple[int, ...]]]] = {}
+    for layer in layers:
+        layer_steps = []
+        for entry, token_count in zip(
+            decode_entries[layer], token_counts[layer], strict=True
+        ):
+            values = [int(value) for value in entry["expert_ids"]]
+            expected_values = token_count * args.top_k
+            if len(values) != expected_values:
+                raise ValueError(
+                    f"decode layer {layer} step {entry['decode_step']} has "
+                    f"{len(values)} expert_ids; expected token_count*top_k="
+                    f"{expected_values}"
+                )
+            layer_steps.append(_sets(values, args.top_k))
+        decode_by_step[layer] = layer_steps
+    epoch_indices = {
+        epoch: [
+            index
+            for index, coordinate in enumerate(reference_coordinates)
+            if coordinate[0] == epoch
+        ]
+        for epoch in epochs
+    }
+    train_steps_by_epoch = {}
+    for epoch in epochs:
+        epoch_steps = len(epoch_indices[epoch])
+        trained = (
+            args.train_steps
+            if args.train_steps is not None
+            else max(1, min(epoch_steps - 1, int(epoch_steps * args.train_fraction)))
+        )
+        if not 0 < trained < epoch_steps:
+            raise ValueError(
+                "train-steps must leave at least one train and held-out step in "
+                f"trace epoch {epoch}"
+            )
+        train_steps_by_epoch[epoch] = trained
+    train_steps = sum(train_steps_by_epoch.values())
     evaluation_steps = decode_steps - train_steps
-    train = {layer: rows[:train_steps] for layer, rows in decode.items()}
-    evaluation = {layer: rows[train_steps:] for layer, rows in decode.items()}
-    ranks = {layer: _prompt_rank(prompt[layer]) for layer in layers}
+    decode_tokens = sum(reference_widths)
+    train_indices = {
+        index
+        for epoch in epochs
+        for index in epoch_indices[epoch][: train_steps_by_epoch[epoch]]
+    }
+    train_tokens = sum(
+        width for index, width in enumerate(reference_widths) if index in train_indices
+    )
+    evaluation_tokens = decode_tokens - train_tokens
+    decode = {
+        layer: [row for step in decode_by_step[layer] for row in step]
+        for layer in layers
+    }
+    decode_epochs = {
+        epoch: {
+            layer: [
+                row
+                for index in epoch_indices[epoch]
+                for row in decode_by_step[layer][index]
+            ]
+            for layer in layers
+        }
+        for epoch in epochs
+    }
+    decode_step_epochs = {
+        epoch: {
+            layer: [decode_by_step[layer][index] for index in epoch_indices[epoch]]
+            for layer in layers
+        }
+        for epoch in epochs
+    }
+    train_step_epochs = {
+        epoch: {
+            layer: [
+                decode_by_step[layer][index]
+                for index in epoch_indices[epoch][: train_steps_by_epoch[epoch]]
+            ]
+            for layer in layers
+        }
+        for epoch in epochs
+    }
+    evaluation_step_epochs = {
+        epoch: {
+            layer: [
+                decode_by_step[layer][index]
+                for index in epoch_indices[epoch][train_steps_by_epoch[epoch] :]
+            ]
+            for layer in layers
+        }
+        for epoch in epochs
+    }
+    train_epochs = {
+        epoch: {
+            layer: [
+                row
+                for index in epoch_indices[epoch][: train_steps_by_epoch[epoch]]
+                for row in decode_by_step[layer][index]
+            ]
+            for layer in layers
+        }
+        for epoch in epochs
+    }
+    evaluation_epochs = {
+        epoch: {
+            layer: [
+                row
+                for index in epoch_indices[epoch][train_steps_by_epoch[epoch] :]
+                for row in decode_by_step[layer][index]
+            ]
+            for layer in layers
+        }
+        for epoch in epochs
+    }
+    train = {
+        layer: [row for epoch in epochs for row in train_epochs[epoch][layer]]
+        for layer in layers
+    }
+    ranks_epochs = {
+        epoch: {layer: _prompt_rank(prompt_by_epoch[epoch][layer]) for layer in layers}
+        for epoch in epochs
+    }
     uniform = {layer: args.capacity_per_layer for layer in layers}
     total_slots = args.capacity_per_layer * len(layers)
-    global_rank = _global_prompt_rank(layers, prompt, args.expert_count)
-    global_initial = _initial_lru_order(global_rank, total_slots)
-    full_global_sequence = _global_sequence(layers, decode)
+    if total_slots > (2**63 - 1) // args.record_bytes:
+        raise ValueError("total cache byte projection exceeds signed 64-bit range")
+    global_ranks_epochs = {
+        epoch: _global_prompt_rank(layers, prompt_by_epoch[epoch], args.expert_count)
+        for epoch in epochs
+    }
 
     shallow = {}
     shallow_set = set(layers[: args.shallow_layers])
@@ -869,41 +1487,67 @@ def main() -> int:
         total_slots,
         args.expert_count,
     )
+    oracle_ranks = {
+        layer: [
+            expert
+            for expert, _count in Counter(
+                expert for row in decode[layer] for expert in row
+            ).most_common()
+        ]
+        for layer in layers
+    }
+    global_epoch_sequences = {
+        epoch: _global_batched_sequence(layers, decode_step_epochs[epoch])
+        for epoch in epochs
+    }
     policies = {
-        "prompt_static_uniform": _sum_policy(
-            layers, decode, ranks, uniform, _simulate_static
+        "prompt_static_uniform": _sum_policy_epochs(
+            epochs, layers, decode_epochs, ranks_epochs, uniform, _simulate_static
         ),
-        "lru_uniform": _sum_policy(layers, decode, ranks, uniform, _simulate_lru),
-        "belady_uniform": _sum_policy(layers, decode, ranks, uniform, _simulate_belady),
-        "global_pool_lru": _metric(
-            *_run_lru_sequence(
-                full_global_sequence,
-                global_initial,
-                total_slots,
-            )[:2]
-        ),
-        "global_pool_belady": _metric(
-            *_run_belady_sequence(
-                full_global_sequence,
-                global_initial,
-                total_slots,
+        "lru_uniform": _aggregate_metrics(
+            _simulate_atomic_layer_lru_metric(
+                prompt_by_epoch[epoch][layer],
+                decode_step_epochs[epoch][layer],
+                uniform[layer],
+                args.expert_count,
+                transient_slots=transient_slots,
             )
+            for epoch in epochs
+            for layer in layers
         ),
-        "prompt_static_shallow_pinned": _sum_policy(
-            layers, decode, ranks, shallow, _simulate_static
+        "belady_uniform": _sum_policy_epochs(
+            epochs, layers, decode_epochs, ranks_epochs, uniform, _simulate_belady
         ),
-        "oracle_decode_frequency_allocation": _sum_policy(
+        "global_pool_lru": _aggregate_metrics(
+            _simulate_atomic_global_lru_metric(
+                layers,
+                prompt_by_epoch[epoch],
+                decode_step_epochs[epoch],
+                total_slots,
+                args.expert_count,
+                transient_slots,
+                prefill_slots_per_layer=args.capacity_per_layer,
+            )
+            for epoch in epochs
+        ),
+        "global_pool_belady": _aggregate_metrics(
+            _metric(
+                *_run_belady_sequence(
+                    global_epoch_sequences[epoch],
+                    _initial_lru_order(global_ranks_epochs[epoch], total_slots),
+                    total_slots,
+                )
+            )
+            for epoch in epochs
+        ),
+        "prompt_static_shallow_pinned": _sum_policy_epochs(
+            epochs, layers, decode_epochs, ranks_epochs, shallow, _simulate_static
+        ),
+        "oracle_decode_frequency_allocation": _sum_policy_epochs(
+            epochs,
             layers,
-            decode,
-            {
-                layer: [
-                    expert
-                    for expert, _count in Counter(
-                        expert for row in decode[layer] for expert in row
-                    ).most_common()
-                ]
-                for layer in layers
-            },
+            decode_epochs,
+            {epoch: oracle_ranks for epoch in epochs},
             oracle_capacities,
             _simulate_static,
         ),
@@ -911,62 +1555,114 @@ def main() -> int:
     for metric in policies.values():
         _decorate_io_metric(
             metric,
-            decode_steps,
+            decode_tokens,
             args.record_bytes,
             measured_ssd_bytes_per_second=args.measured_ssd_gb_per_second * 1e9,
         )
 
     # Held-out uniform partitions start from the exact same causal LRU warm
     # state.  Belady sees only evaluation-future positions, never train routes.
-    uniform_warm = _warm_partitioned_lru(layers, train, ranks, uniform)
     held_out_policies: dict[str, dict[str, float | int | None]] = {
-        "uniform_per_layer_lru": _evaluate_partitioned_lru(
-            layers, evaluation, uniform_warm, uniform
+        "uniform_per_layer_lru": _aggregate_metrics(
+            _simulate_atomic_layer_lru_metric(
+                prompt_by_epoch[epoch][layer],
+                decode_step_epochs[epoch][layer],
+                uniform[layer],
+                args.expert_count,
+                evaluate_from=train_steps_by_epoch[epoch],
+                transient_slots=transient_slots,
+            )
+            for epoch in epochs
+            for layer in layers
         ),
-        "uniform_per_layer_belady": _evaluate_partitioned_belady(
-            layers, evaluation, uniform_warm, uniform
+        "uniform_per_layer_belady": _aggregate_metrics(
+            _evaluate_partitioned_belady(
+                layers,
+                evaluation_epochs[epoch],
+                _warm_partitioned_lru(
+                    layers, train_epochs[epoch], ranks_epochs[epoch], uniform
+                ),
+                uniform,
+            )
+            for epoch in epochs
         ),
     }
 
-    train_global_sequence = _global_sequence(layers, train)
-    evaluation_global_sequence = _global_sequence(layers, evaluation)
-    _train_hits, _train_misses, global_warm = _run_lru_sequence(
-        train_global_sequence,
-        global_initial,
-        total_slots,
+    train_global_sequences = {
+        epoch: _global_batched_sequence(layers, train_step_epochs[epoch])
+        for epoch in epochs
+    }
+    evaluation_global_sequences = {
+        epoch: _global_batched_sequence(layers, evaluation_step_epochs[epoch])
+        for epoch in epochs
+    }
+    held_out_policies["global_pool_lru"] = _aggregate_metrics(
+        _simulate_atomic_global_lru_metric(
+            layers,
+            prompt_by_epoch[epoch],
+            decode_step_epochs[epoch],
+            total_slots,
+            args.expert_count,
+            transient_slots,
+            prefill_slots_per_layer=args.capacity_per_layer,
+            evaluate_from=train_steps_by_epoch[epoch],
+        )
+        for epoch in epochs
     )
-    global_lru_hits, global_lru_misses, _global_final = _run_lru_sequence(
-        evaluation_global_sequence,
-        global_warm,
-        total_slots,
-    )
-    held_out_policies["global_pool_lru"] = _metric(global_lru_hits, global_lru_misses)
-    global_belady_hits, global_belady_misses = _run_belady_sequence(
-        evaluation_global_sequence,
-        global_warm,
-        total_slots,
-    )
-    held_out_policies["global_pool_belady"] = _metric(
-        global_belady_hits, global_belady_misses
+    # Belady remains an explicitly clairvoyant lower bound. Its initial state
+    # is the production global LRU warm residency, not a sequential surrogate.
+    held_out_policies["global_pool_belady"] = _aggregate_metrics(
+        _metric(
+            *_run_belady_sequence(
+                evaluation_global_sequences[epoch],
+                [
+                    (int(layer), int(expert))
+                    for layer, experts in _simulate_atomic_global_lru_metric(
+                        layers,
+                        prompt_by_epoch[epoch],
+                        train_step_epochs[epoch],
+                        total_slots,
+                        args.expert_count,
+                        transient_slots,
+                        prefill_slots_per_layer=args.capacity_per_layer,
+                    )["final_resident_experts_by_layer"].items()
+                    for expert in experts
+                ],
+                total_slots,
+            )
+        )
+        for epoch in epochs
     )
 
-    hit_curves = _lru_training_hit_curves(layers, train, ranks, args.expert_count)
+    hit_curves = _atomic_lru_training_hit_curves_epochs(
+        epochs,
+        layers,
+        prompt_by_epoch,
+        train_step_epochs,
+        args.expert_count,
+        transient_slots,
+    )
     trained_capacities, quota_training = _rebalance_trained_quotas(
         hit_curves,
         uniform,
         args.quota_hysteresis_hits,
     )
-    trained_warm = _warm_partitioned_lru(layers, train, ranks, trained_capacities)
-    held_out_policies["trained_dynamic_quota_lru"] = _evaluate_partitioned_lru(
-        layers,
-        evaluation,
-        trained_warm,
-        trained_capacities,
+    held_out_policies["trained_dynamic_quota_lru"] = _aggregate_metrics(
+        _simulate_atomic_layer_lru_metric(
+            prompt_by_epoch[epoch][layer],
+            decode_step_epochs[epoch][layer],
+            trained_capacities[layer],
+            args.expert_count,
+            evaluate_from=train_steps_by_epoch[epoch],
+            transient_slots=transient_slots,
+        )
+        for epoch in epochs
+        for layer in layers
     )
     for metric in held_out_policies.values():
         _decorate_io_metric(
             metric,
-            evaluation_steps,
+            evaluation_tokens,
             args.record_bytes,
             measured_ssd_bytes_per_second=args.measured_ssd_gb_per_second * 1e9,
         )
@@ -982,19 +1678,43 @@ def main() -> int:
             args.expert_count,
             cluster_size,
         )
-        warm_cluster = _run_cluster_lru_sequence(
-            train_global_sequence,
-            global_initial,
-            total_slots,
-            cluster_map,
-        )
-        evaluation_cluster = _run_cluster_lru_sequence(
-            evaluation_global_sequence,
-            warm_cluster["final_lru_order"],
-            total_slots,
-            cluster_map,
-        )
-        evaluation_cluster.pop("final_lru_order")
+        epoch_cluster_metrics = []
+        for epoch in epochs:
+            warm_cluster = _run_cluster_lru_sequence(
+                train_global_sequences[epoch],
+                _initial_lru_order(global_ranks_epochs[epoch], total_slots),
+                total_slots,
+                cluster_map,
+            )
+            epoch_cluster_metrics.append(
+                _run_cluster_lru_sequence(
+                    evaluation_global_sequences[epoch],
+                    warm_cluster["final_lru_order"],
+                    total_slots,
+                    cluster_map,
+                )
+            )
+        evaluation_cluster = _aggregate_cluster_runs(epoch_cluster_metrics)
+        if cluster_size == 1:
+            global_lru = held_out_policies["global_pool_lru"]
+            records = int(global_lru["physical_records_read"])
+            evaluation_cluster.update(
+                {
+                    **_metric(int(global_lru["hits"]), int(global_lru["misses"])),
+                    "cluster_reads": records,
+                    "physical_records_read": records,
+                    "demanded_records_read": records,
+                    "speculative_records_read": 0,
+                    "redundant_records_read": 0,
+                    "speculative_records_admitted": 0,
+                    "speculative_records_used_before_eviction": 0,
+                    "speculative_records_unused_at_eviction": 0,
+                    "speculative_records_still_resident": 0,
+                    "useful_prefetch_ratio": None,
+                    "admitted_useful_prefetch_ratio": None,
+                    "read_amplification_vs_demanded": 1.0 if records else 0.0,
+                }
+            )
         evaluation_cluster["cluster_size"] = cluster_size
         evaluation_cluster.update(
             _coactivation_cluster_training_stats(
@@ -1005,7 +1725,7 @@ def main() -> int:
         )
         _decorate_io_metric(
             evaluation_cluster,
-            evaluation_steps,
+            evaluation_tokens,
             args.record_bytes,
             physical_records=int(evaluation_cluster["physical_records_read"]),
             measured_ssd_bytes_per_second=args.measured_ssd_gb_per_second * 1e9,
@@ -1020,10 +1740,10 @@ def main() -> int:
             int(evaluation_cluster["redundant_records_read"]) * args.record_bytes
         )
         evaluation_cluster["demanded_bytes_per_token"] = (
-            int(evaluation_cluster["demanded_bytes_read"]) / evaluation_steps
+            int(evaluation_cluster["demanded_bytes_read"]) / evaluation_tokens
         )
         evaluation_cluster["speculative_bytes_per_token"] = (
-            int(evaluation_cluster["speculative_bytes_read"]) / evaluation_steps
+            int(evaluation_cluster["speculative_bytes_read"]) / evaluation_tokens
         )
         cluster_results[str(cluster_size)] = evaluation_cluster
 
@@ -1034,7 +1754,11 @@ def main() -> int:
             or cluster_one["misses"] != held_out_policies["global_pool_lru"]["misses"]
         ):
             raise AssertionError(
-                "cluster size 1 must equal record-granularity global LRU"
+                "cluster size 1 must equal record-granularity global LRU: "
+                f"cluster=({cluster_one['hits']}, {cluster_one['misses']}), "
+                "global=("
+                f"{held_out_policies['global_pool_lru']['hits']}, "
+                f"{held_out_policies['global_pool_lru']['misses']})"
             )
         baseline_records = int(cluster_one["physical_records_read"])
         baseline_bytes = int(cluster_one["bytes_read"])
@@ -1053,12 +1777,16 @@ def main() -> int:
         "schema": "mtplx-expert-route-analysis-v2",
         "source_trace": str(args.trace.resolve()),
         "layers": layers,
+        "trace_epochs": epochs,
         "decode_steps": decode_steps,
+        "decode_tokens": decode_tokens,
         "top_k": args.top_k,
+        "transient_slots": transient_slots,
         "expert_count": args.expert_count,
         "record_bytes": args.record_bytes,
         "measured_ssd_gb_per_second": args.measured_ssd_gb_per_second,
         "total_persistent_slots": total_slots,
+        "batch_union": _batch_union_summary(layers, decode_by_step),
         "policies": policies,
         "capacities": {
             "uniform": uniform,
@@ -1066,11 +1794,24 @@ def main() -> int:
             "oracle_decode_frequency": oracle_capacities,
             "trained_dynamic_quota": trained_capacities,
         },
+        "recommended_capacity": _recommended_capacity_summary(
+            layers,
+            trained_capacities,
+            quota_training,
+            held_out_policies,
+            record_bytes=args.record_bytes,
+        ),
         "held_out": {
             "split": {
                 "strategy": "chronological_decode_prefix",
+                "scope": "per_epoch_chronological_prefix",
                 "train_steps": train_steps,
                 "evaluation_steps": evaluation_steps,
+                "train_steps_by_epoch": {
+                    str(epoch): train_steps_by_epoch[epoch] for epoch in epochs
+                },
+                "train_tokens": train_tokens,
+                "evaluation_tokens": evaluation_tokens,
                 "train_fraction": train_steps / decode_steps,
                 "cluster_training_source": "prefill_plus_decode_train_prefix",
                 "limitation": (
@@ -1084,7 +1825,17 @@ def main() -> int:
             "clusters": cluster_results,
         },
         "prefetch": {
-            "temporal_previous_token": _temporal_prefetch(layers, decode),
+            "temporal_previous_token": (
+                _temporal_prefetch(layers, decode)
+                if max(reference_widths) == 1
+                else {
+                    "supported": False,
+                    "hits": None,
+                    "requests": None,
+                    "recall": None,
+                    "reason": ("batched traces do not carry stable request identities"),
+                }
+            ),
             "prompt_trained_cross_layer_top8": _conditional_prefetch(
                 layers, prompt, decode, args.expert_count, args.top_k
             ),
@@ -1098,8 +1849,15 @@ def main() -> int:
     }
     rendered = json.dumps(result, indent=2, sort_keys=True)
     if args.output_json is not None:
-        args.output_json.parent.mkdir(parents=True, exist_ok=True)
-        args.output_json.write_text(rendered + "\n", encoding="utf-8")
+        from scripts.benchmark_streamed_generation import (
+            reserve_json_evidence_targets,
+        )
+
+        reservation = reserve_json_evidence_targets(args.output_json, None)
+        try:
+            reservation.commit(args.output_json, rendered + "\n")
+        finally:
+            reservation.cleanup()
     print(rendered)
     return 0
 
