@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 _SCRIPT = (
     Path(__file__).resolve().parent.parent
     / "scripts"
@@ -43,6 +45,96 @@ def test_window_telemetry_can_be_disabled() -> None:
                               "--max-live-kv-tokens", "2048",
                               "--no-window-telemetry"])
     assert args.window_telemetry is False
+
+
+def test_resource_telemetry_is_opt_in_and_bounded() -> None:
+    parser = _load_module().build_parser()
+    args = parser.parse_args(
+        [*_BASE_ARGS, "--model-key", "hy3-q4"]
+    )
+
+    assert args.resource_telemetry is False
+    assert args.resource_sample_interval == 0.25
+    assert args.resource_max_samples == 4096
+    assert args.powermetrics is False
+
+
+def test_resource_telemetry_flags_parse_without_enabling_window_walks() -> None:
+    parser = _load_module().build_parser()
+    args = parser.parse_args(
+        [
+            *_BASE_ARGS,
+            "--model-key",
+            "hy3-q4",
+            "--resource-telemetry",
+            "--resource-sample-interval",
+            "0.5",
+            "--resource-max-samples",
+            "1024",
+            "--ssd-ceiling-gib-s",
+            "12.5",
+            "--f-nocache",
+            "--powermetrics",
+            "--no-window-telemetry",
+        ]
+    )
+
+    assert args.resource_telemetry is True
+    assert args.window_telemetry is False
+    assert args.resource_sample_interval == 0.5
+    assert args.resource_max_samples == 1024
+    assert args.ssd_ceiling_gib_s == 12.5
+    assert args.powermetrics is True
+
+
+def test_powermetrics_requires_resource_telemetry(capsys) -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [*_BASE_ARGS, "--model-key", "hy3-q4", "--powermetrics"]
+    )
+
+    with pytest.raises(SystemExit):
+        module.validate_resource_flags(parser, args)
+
+    assert "--resource-telemetry" in capsys.readouterr().err
+
+
+def test_ssd_ceiling_requires_uncached_reader_lane(capsys) -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [
+            *_BASE_ARGS,
+            "--model-key",
+            "hy3-q4",
+            "--resource-telemetry",
+            "--ssd-ceiling-gib-s",
+            "12.5",
+        ]
+    )
+
+    with pytest.raises(SystemExit):
+        module.validate_resource_flags(parser, args)
+
+    assert "--f-nocache" in capsys.readouterr().err
+
+
+def test_resource_report_fields_are_absent_when_disabled() -> None:
+    module = _load_module()
+    row = {"completion_tokens": 4}
+
+    module._attach_resource_report(
+        row,
+        None,
+        ssd_ceiling_gib_s=None,
+        generation_thread_cpu_ns=1,
+        generation_elapsed_ns=2,
+        final_completion_tokens=4,
+    )
+
+    assert "diagnostic_run" not in row
+    assert "resource_telemetry" not in row
 
 
 _BASE_ARGS = ["/model", "/manifest", "--memory-limit", "112GiB",
