@@ -25,6 +25,63 @@ _POOL_INTEGRALS = (
     "active_unit_ns",
 )
 
+_PIPELINE_SOURCE_SCHEMA = "mtplx-expert-pipeline-attribution-v1"
+_PIPELINE_SUMMARY_SCHEMA = "mtplx-expert-pipeline-summary-v1"
+_PIPELINE_PRIMARY_STATES = (
+    "generation_thread_expert_input_wait",
+    "logical_range_active",
+    "reader_completion_active",
+    "submitted_queued",
+    "eligible_unsubmitted",
+    "host_runnable_work",
+    "route_publication_pending",
+    "no_known_useful_work",
+)
+_PIPELINE_OVERLAPS = {
+    "generation_wait_storage_active": "generation_wait_storage_active_ns",
+    "generation_wait_reader_task_active": ("generation_wait_reader_task_active_ns"),
+    "generation_wait_submitted_queued": ("generation_wait_submitted_queued_ns"),
+    "generation_wait_eligible_unsubmitted": ("generation_wait_eligible_unsubmitted_ns"),
+    "generation_wait_runnable": "generation_wait_runnable_ns",
+}
+_PIPELINE_BLOCK_REASONS = (
+    "operation_credit",
+    "byte_credit",
+    "authoritative_reserve",
+    "slot_unavailable",
+    "pin_held",
+    "slot_loading",
+)
+_PIPELINE_BACKEND_COUNTERS = {
+    "logical_range_reader_invocations": "read_operations",
+    "python_preadv_invocations": "python_preadv_invocations",
+    "preadv_bytes_returned": "preadv_bytes_returned",
+    "native_positional_calls": "native_positional_calls",
+    "native_bytes_returned": "native_bytes_returned",
+}
+_PIPELINE_HISTOGRAMS = (
+    "logical_range_latency_ns",
+    "complete_record_latency_ns",
+)
+_PIPELINE_COVERAGE_LIMITATIONS = {
+    "operation_credit": "unavailable",
+    "byte_credit": "unavailable",
+    "authoritative_reserve": "unavailable",
+    "slot_capacity_admission": "unavailable",
+    "outer_split_executor_queue": "unavailable",
+    "eligible_unsubmitted_cause": "unattributed",
+    "admitted_read_ranges": "unavailable",
+    "scheduled_read_ranges": "unavailable",
+    "physical_device_operations": "unavailable",
+    "physical_device_bytes": "unavailable",
+    "physical_device_queue_depth": "unavailable",
+    "gpu_expert_wait": "unavailable",
+    "gpu_idle_time": "unavailable",
+    "future_layer_eligibility": "unavailable",
+    "speculative_record_accounting": "unavailable",
+    "python_preadv_when_native_reader": "unavailable",
+}
+
 
 def _mapping(value: object) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
@@ -44,6 +101,223 @@ def _integer(value: object, default: int = 0) -> int:
 
 def _counter_delta(before: object, after: object) -> int:
     return max(0, _integer(after) - _integer(before))
+
+
+def _monotonic_delta(before: object, after: object) -> tuple[int, bool]:
+    left = _integer(before)
+    right = _integer(after)
+    if right < left:
+        return 0, True
+    return right - left, False
+
+
+def _mapping_deltas(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+) -> tuple[dict[str, int], bool]:
+    result: dict[str, int] = {}
+    reset = False
+    for name in sorted(set(before) | set(after)):
+        result[name], changed = _monotonic_delta(before.get(name), after.get(name))
+        reset = reset or changed
+    return result, reset
+
+
+def _histogram_delta(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    before_bounds = tuple(_integer(value) for value in before.get("bounds_ns", ()))
+    after_bounds = tuple(_integer(value) for value in after.get("bounds_ns", ()))
+    before_counts = tuple(_integer(value) for value in before.get("bucket_counts", ()))
+    after_counts = tuple(_integer(value) for value in after.get("bucket_counts", ()))
+    valid_shape = (
+        bool(after_bounds)
+        and before_bounds == after_bounds
+        and len(before_counts) == len(after_counts) == len(after_bounds) + 1
+    )
+    if not valid_shape:
+        return {
+            "bounds_ns": after_bounds,
+            "bucket_counts": tuple(0 for _value in after_counts),
+            "sample_count": 0,
+            "overflow_count": 0,
+        }, True
+
+    valid_totals = (
+        _integer(before.get("sample_count")) == sum(before_counts)
+        and _integer(after.get("sample_count")) == sum(after_counts)
+        and _integer(before.get("overflow_count")) == before_counts[-1]
+        and _integer(after.get("overflow_count")) == after_counts[-1]
+    )
+    bucket_counts: list[int] = []
+    reset = not valid_totals
+    for left, right in zip(before_counts, after_counts, strict=True):
+        delta, changed = _monotonic_delta(left, right)
+        bucket_counts.append(delta)
+        reset = reset or changed
+    sample_count, sample_reset = _monotonic_delta(
+        before.get("sample_count"), after.get("sample_count")
+    )
+    overflow_count, overflow_reset = _monotonic_delta(
+        before.get("overflow_count"), after.get("overflow_count")
+    )
+    reset = reset or sample_reset or overflow_reset
+    if sample_count != sum(bucket_counts) or overflow_count != bucket_counts[-1]:
+        reset = True
+    return {
+        "bounds_ns": after_bounds,
+        "bucket_counts": tuple(bucket_counts),
+        "sample_count": sample_count,
+        "overflow_count": overflow_count,
+    }, reset
+
+
+def _pipeline_interval(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    span_ns: int,
+) -> dict[str, Any]:
+    """Difference one decode-phase pipeline snapshot on the sampler clock."""
+    before_pipeline = _mapping(before.get("expert_pipeline"))
+    after_pipeline = _mapping(after.get("expert_pipeline"))
+    source_schema = str(after_pipeline.get("schema") or "unavailable")
+    schema_mismatch = (
+        before_pipeline.get("schema") != _PIPELINE_SOURCE_SCHEMA
+        or after_pipeline.get("schema") != _PIPELINE_SOURCE_SCHEMA
+    )
+    before_decode = _mapping(_mapping(before_pipeline.get("by_phase")).get("decode"))
+    after_decode = _mapping(_mapping(after_pipeline.get("by_phase")).get("decode"))
+    required_decode_keys = (
+        "observation_ns",
+        "counters",
+        "integrals_ns",
+        "primary_integrals_ns",
+        "block_counts",
+        "block_ns",
+        "block_coverage",
+        "histograms",
+        "coverage",
+    )
+    source_components_present = all(
+        name in snapshot
+        for snapshot in (before_decode, after_decode)
+        for name in required_decode_keys
+    )
+    primary_components_present = all(
+        name in _mapping(snapshot.get("primary_integrals_ns"))
+        for snapshot in (before_decode, after_decode)
+        for name in _PIPELINE_PRIMARY_STATES
+    )
+
+    observation_ns, observation_reset = _monotonic_delta(
+        before_decode.get("observation_ns"), after_decode.get("observation_ns")
+    )
+    counters, counters_reset = _mapping_deltas(
+        _mapping(before_decode.get("counters")),
+        _mapping(after_decode.get("counters")),
+    )
+    integrals_ns, integrals_reset = _mapping_deltas(
+        _mapping(before_decode.get("integrals_ns")),
+        _mapping(after_decode.get("integrals_ns")),
+    )
+    primary_integrals_ns, primary_reset = _mapping_deltas(
+        _mapping(before_decode.get("primary_integrals_ns")),
+        _mapping(after_decode.get("primary_integrals_ns")),
+    )
+    block_counts, block_count_reset = _mapping_deltas(
+        _mapping(before_decode.get("block_counts")),
+        _mapping(after_decode.get("block_counts")),
+    )
+    block_ns, block_ns_reset = _mapping_deltas(
+        _mapping(before_decode.get("block_ns")),
+        _mapping(after_decode.get("block_ns")),
+    )
+
+    before_histograms = _mapping(before_decode.get("histograms"))
+    after_histograms = _mapping(after_decode.get("histograms"))
+    required_histograms_present = all(
+        name in histograms
+        for histograms in (before_histograms, after_histograms)
+        for name in _PIPELINE_HISTOGRAMS
+    )
+    histograms: dict[str, dict[str, Any]] = {}
+    histogram_reset = False
+    for name in sorted(set(before_histograms) | set(after_histograms)):
+        histogram, changed = _histogram_delta(
+            _mapping(before_histograms.get(name)),
+            _mapping(after_histograms.get(name)),
+        )
+        histograms[name] = histogram
+        histogram_reset = histogram_reset or changed
+
+    before_io = _mapping(before.get("io"))
+    after_io = _mapping(after.get("io"))
+    backend_available = all(
+        source_name in snapshot
+        for snapshot in (before_io, after_io)
+        for source_name in _PIPELINE_BACKEND_COUNTERS.values()
+    )
+    backend: dict[str, int] = {}
+    backend_reset = False
+    for report_name, source_name in _PIPELINE_BACKEND_COUNTERS.items():
+        backend[report_name], changed = _monotonic_delta(
+            before_io.get(source_name), after_io.get(source_name)
+        )
+        backend_reset = backend_reset or changed
+
+    source_incomplete = (
+        _mapping(after_decode.get("coverage")).get("attribution") != "measured"
+    )
+    decode_reset = any(
+        (
+            observation_reset,
+            counters_reset,
+            integrals_reset,
+            primary_reset,
+            block_count_reset,
+            block_ns_reset,
+            histogram_reset,
+        )
+    )
+    primary_identity_valid = sum(primary_integrals_ns.values()) == observation_ns
+    decode_incomplete = (
+        schema_mismatch
+        or source_incomplete
+        or not source_components_present
+        or not primary_components_present
+        or not required_histograms_present
+        or not primary_identity_valid
+        or decode_reset
+    )
+    if not backend_available:
+        backend_coverage = "unavailable"
+    elif backend_reset:
+        backend_coverage = "incomplete_reset"
+    else:
+        backend_coverage = "measured_all_phases"
+    reset_detected = decode_reset or backend_reset
+    incomplete = decode_incomplete or backend_coverage != "measured_all_phases"
+    return {
+        "source_schema": source_schema,
+        "scope": "decode",
+        "sampler_span_ns": max(0, int(span_ns)),
+        "decode_observation_ns": observation_ns,
+        "counters": counters,
+        "integrals_ns": integrals_ns,
+        "primary_integrals_ns": primary_integrals_ns,
+        "block_counts": block_counts,
+        "block_ns": block_ns,
+        "block_coverage": dict(_mapping(after_decode.get("block_coverage"))),
+        "histograms": histograms,
+        "sampler_window_backend": backend,
+        "coverage": {
+            "attribution": "incomplete" if incomplete else "measured",
+            "decode_phase": "incomplete" if decode_incomplete else "measured",
+            "sampler_window_backend": backend_coverage,
+            "reset_detected": reset_detected,
+        },
+    }
 
 
 def _pool_interval(
@@ -180,6 +454,11 @@ def _interval(previous: ResourceTick, current: ResourceTick) -> dict[str, Any] |
             after_metrics.get("synchronous_fence_slots"),
         ),
     }
+    if (
+        before.get("expert_pipeline") is not None
+        or after.get("expert_pipeline") is not None
+    ):
+        result["expert_pipeline"] = _pipeline_interval(before, after, span_ns)
     if _integer(after.get("quant_bits")) == 4:
         result["q4_assignments_per_second"] = expert_requests / span_s
     return result
@@ -355,7 +634,7 @@ class ResourceTelemetrySampler:
                 "candidates": candidates,
             }
         payload: dict[str, Any] = {
-            "schema": "mtplx-resource-telemetry-v1",
+            "schema": "mtplx-resource-telemetry-v2",
             "sample_interval_seconds": self._interval_s,
             "sample_count": len(ticks),
             "samples_dropped": samples_dropped,
@@ -419,6 +698,270 @@ def _nested_max(
         (_integer(_mapping(item.get(group)).get(name)) for item in intervals),
         default=0,
     )
+
+
+def _sum_nested_mappings(
+    rows: list[Mapping[str, Any]],
+    name: str,
+) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for row in rows:
+        for key, value in _mapping(row.get(name)).items():
+            result[str(key)] = result.get(str(key), 0) + _integer(value)
+    return result
+
+
+def _merge_pipeline_histogram(
+    rows: list[Mapping[str, Any]],
+    name: str,
+) -> tuple[dict[str, Any], bool]:
+    bounds: tuple[int, ...] | None = None
+    bucket_counts: list[int] | None = None
+    incomplete = False
+    for row in rows:
+        histogram = _mapping(_mapping(row.get("histograms")).get(name))
+        current_bounds = tuple(
+            _integer(value) for value in histogram.get("bounds_ns", ())
+        )
+        current_counts = tuple(
+            _integer(value) for value in histogram.get("bucket_counts", ())
+        )
+        if not current_bounds or len(current_counts) != len(current_bounds) + 1:
+            incomplete = True
+            continue
+        if bounds is None:
+            bounds = current_bounds
+            bucket_counts = [0] * len(current_counts)
+        if current_bounds != bounds or bucket_counts is None:
+            incomplete = True
+            continue
+        for index, value in enumerate(current_counts):
+            bucket_counts[index] += value
+
+    if bounds is None or bucket_counts is None:
+        return {
+            "bounds_ns": (),
+            "bucket_counts": (),
+            "sample_count": 0,
+            "overflow_count": 0,
+        }, True
+    sample_count = sum(bucket_counts)
+    return {
+        "bounds_ns": bounds,
+        "bucket_counts": tuple(bucket_counts),
+        "sample_count": sample_count,
+        "overflow_count": bucket_counts[-1],
+    }, incomplete
+
+
+def _histogram_percentile(
+    histogram: Mapping[str, Any],
+    percentile: int,
+) -> tuple[int | None, str]:
+    counts = tuple(_integer(value) for value in histogram.get("bucket_counts", ()))
+    bounds = tuple(_integer(value) for value in histogram.get("bounds_ns", ()))
+    sample_count = _integer(histogram.get("sample_count"))
+    if sample_count <= 0 or len(counts) != len(bounds) + 1:
+        return None, "unavailable"
+    rank = (sample_count * percentile + 99) // 100
+    cumulative = 0
+    for bucket, count in enumerate(counts):
+        cumulative += count
+        if cumulative >= rank:
+            if bucket == len(bounds):
+                return None, "censored_overflow"
+            return bounds[bucket], "bounded"
+    return None, "unavailable"
+
+
+def _histogram_report(histogram: Mapping[str, Any]) -> dict[str, Any]:
+    p50, p50_status = _histogram_percentile(histogram, 50)
+    p95, p95_status = _histogram_percentile(histogram, 95)
+    return {
+        "bounds_ns": tuple(histogram.get("bounds_ns", ())),
+        "bucket_counts": tuple(histogram.get("bucket_counts", ())),
+        "sample_count": _integer(histogram.get("sample_count")),
+        "overflow_count": _integer(histogram.get("overflow_count")),
+        "p50_upper_bound_ns": p50,
+        "p50_status": p50_status,
+        "p95_upper_bound_ns": p95,
+        "p95_status": p95_status,
+    }
+
+
+def _unavailable_pipeline_summary() -> dict[str, Any]:
+    return {
+        "schema": _PIPELINE_SUMMARY_SCHEMA,
+        "source_schema": "unavailable",
+        "scope": "decode",
+        "decode_observation_ns": 0,
+        "generation_expert_input_wait_fraction": None,
+        "coverage": {
+            "attribution": "unavailable",
+            "decode_phase": "unavailable",
+            "sampler_window_backend": "unavailable",
+            **_PIPELINE_COVERAGE_LIMITATIONS,
+        },
+        "physical_device_queue_depth": {"status": "unavailable"},
+        "gpu_expert_wait": {"status": "unavailable"},
+    }
+
+
+def _summarize_pipeline(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    pipeline_rows = [
+        _mapping(row.get("expert_pipeline"))
+        for row in rows
+        if isinstance(row.get("expert_pipeline"), Mapping)
+    ]
+    if not pipeline_rows:
+        return _unavailable_pipeline_summary()
+
+    counters = _sum_nested_mappings(pipeline_rows, "counters")
+    integrals_ns = _sum_nested_mappings(pipeline_rows, "integrals_ns")
+    primary_state_ns = _sum_nested_mappings(pipeline_rows, "primary_integrals_ns")
+    block_counts = _sum_nested_mappings(pipeline_rows, "block_counts")
+    block_ns = _sum_nested_mappings(pipeline_rows, "block_ns")
+    backend = _sum_nested_mappings(pipeline_rows, "sampler_window_backend")
+    decode_observation_ns = sum(
+        _integer(row.get("decode_observation_ns")) for row in pipeline_rows
+    )
+    source_schemas = {str(row.get("source_schema")) for row in pipeline_rows}
+    interval_incomplete = any(
+        _mapping(row.get("coverage")).get("attribution") != "measured"
+        for row in pipeline_rows
+    )
+    decode_statuses = {
+        str(_mapping(row.get("coverage")).get("decode_phase") or "incomplete")
+        for row in pipeline_rows
+    }
+    decode_incomplete = decode_statuses != {"measured"} or source_schemas != {
+        _PIPELINE_SOURCE_SCHEMA
+    }
+    backend_statuses = {
+        str(
+            _mapping(row.get("coverage")).get("sampler_window_backend") or "unavailable"
+        )
+        for row in pipeline_rows
+    }
+    if backend_statuses == {"measured_all_phases"}:
+        backend_coverage = "measured_all_phases"
+    elif "incomplete_reset" in backend_statuses:
+        backend_coverage = "incomplete_reset"
+    elif backend_statuses == {"unavailable"}:
+        backend_coverage = "unavailable"
+    else:
+        backend_coverage = "incomplete"
+
+    histogram_names = set()
+    for row in pipeline_rows:
+        histogram_names.update(_mapping(row.get("histograms")))
+    histogram_reports: dict[str, Any] = {}
+    for name in sorted(histogram_names):
+        histogram, histogram_incomplete = _merge_pipeline_histogram(
+            pipeline_rows, str(name)
+        )
+        decode_incomplete = decode_incomplete or histogram_incomplete
+        histogram_reports[str(name)] = _histogram_report(histogram)
+
+    primary_state_ns = {
+        name: primary_state_ns.get(name, 0) for name in _PIPELINE_PRIMARY_STATES
+    }
+    decode_incomplete = (
+        decode_incomplete or sum(primary_state_ns.values()) != decode_observation_ns
+    )
+    incomplete = (
+        interval_incomplete
+        or decode_incomplete
+        or backend_coverage != "measured_all_phases"
+    )
+    primary_state_fraction = {
+        name: (value / decode_observation_ns if decode_observation_ns > 0 else None)
+        for name, value in primary_state_ns.items()
+    }
+    overlap_ns = {
+        report_name: integrals_ns.get(source_name, 0)
+        for report_name, source_name in _PIPELINE_OVERLAPS.items()
+    }
+    overlap_fraction = {
+        name: (value / decode_observation_ns if decode_observation_ns > 0 else None)
+        for name, value in overlap_ns.items()
+    }
+
+    block_coverage: dict[str, str] = {}
+    for reason in _PIPELINE_BLOCK_REASONS:
+        statuses = {
+            str(_mapping(row.get("block_coverage")).get(reason) or "unavailable")
+            for row in pipeline_rows
+        }
+        block_coverage[reason] = (
+            "measured" if statuses == {"measured"} else "unavailable"
+        )
+    block_reasons = {
+        reason: (
+            {
+                "status": "measured",
+                "count": block_counts.get(reason, 0),
+                "duration_ns": block_ns.get(reason, 0),
+            }
+            if block_coverage[reason] == "measured"
+            else {"status": "unavailable"}
+        )
+        for reason in _PIPELINE_BLOCK_REASONS
+    }
+
+    return {
+        "schema": _PIPELINE_SUMMARY_SCHEMA,
+        "source_schema": (
+            _PIPELINE_SOURCE_SCHEMA
+            if source_schemas == {_PIPELINE_SOURCE_SCHEMA}
+            else "mixed_or_unavailable"
+        ),
+        "scope": "decode",
+        "logical_record_jobs": counters.get("logical_record_jobs", 0),
+        "logical_record_bytes": counters.get("logical_record_bytes", 0),
+        "accepted_executor_submissions": counters.get("accepted_submissions", 0),
+        "submission_accepted_record_jobs": counters.get("accepted_record_jobs", 0),
+        "submission_accepted_record_bytes": counters.get("accepted_record_bytes", 0),
+        "reader_tasks_started": counters.get("started_reader_tasks", 0),
+        "reader_tasks_completed": counters.get("completed_reader_tasks", 0),
+        "reader_tasks_failed": counters.get("failed_reader_tasks", 0),
+        "decode_logical_ranges_started": counters.get("started_logical_ranges", 0),
+        "decode_observation_ns": decode_observation_ns,
+        "decode_counters": counters,
+        "decode_integrals_ns": integrals_ns,
+        "primary_state_ns": primary_state_ns,
+        "generation_expert_input_wait_fraction": (
+            integrals_ns.get("generation_expert_input_wait_ns", 0)
+            / decode_observation_ns
+            if decode_observation_ns > 0
+            else None
+        ),
+        "orthogonal_overlap": {
+            "denominator": "decode_observation_ns",
+            "duration_ns": overlap_ns,
+            "fraction_of_decode_observation": overlap_fraction,
+        },
+        "primary_state_fraction": primary_state_fraction,
+        "block_reasons": block_reasons,
+        "latency_histograms": histogram_reports,
+        "sampler_window_backend": {
+            "scope": "sampler_window_all_phases",
+            **{
+                name: (
+                    None if backend_coverage == "unavailable" else backend.get(name, 0)
+                )
+                for name in _PIPELINE_BACKEND_COUNTERS
+            },
+        },
+        "physical_device_queue_depth": {"status": "unavailable"},
+        "gpu_expert_wait": {"status": "unavailable"},
+        "coverage": {
+            "attribution": "incomplete" if incomplete else "measured",
+            "decode_phase": "incomplete" if decode_incomplete else "measured",
+            "sampler_window_backend": backend_coverage,
+            **_PIPELINE_COVERAGE_LIMITATIONS,
+        },
+    }
 
 
 def summarize_intervals(
@@ -511,6 +1054,7 @@ def summarize_intervals(
     active_fence_slots = _weighted_nested_mean(
         rows, "completion_fences", "mean_active_units", elapsed
     )
+    pipeline_summary = _summarize_pipeline(rows)
 
     if not uncached_reader:
         ssd_utilization = None
@@ -675,6 +1219,7 @@ def summarize_intervals(
         "host": {
             "generation_thread_core_fraction": generation_thread_core_fraction,
         },
+        "expert_pipeline": pipeline_summary,
         "powermetrics": power,
         "coverage": coverage,
         "evidence": {

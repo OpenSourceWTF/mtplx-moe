@@ -1,5 +1,5 @@
 # Project Map
-_Generated: 2026-07-13 07:08 CDT | Git: 020005c_
+_Generated: 2026-07-13 12:30 CDT | Git: c3aca92_
 
 ## Directory Structure
 .github/ — CI, build, hygiene, release, ownership, and issue/PR automation.
@@ -28,21 +28,23 @@ mtplx/generation.py — Core autoregressive and multi-token generation loops and
 mtplx/runtime.py — Runtime construction and model execution coordination.
 mtplx/engine_session.py — Session lifecycle, commits, concurrency, and state ownership.
 mtplx/server/openai.py — OpenAI/Anthropic API server, request scheduling, streaming, and metrics exposure.
-mtplx/expert_runtime.py — Streamed-MoE memory planning, route admission, cache policy, and runtime snapshots.
-mtplx/expert_slots.py — Fixed slot-bank ownership, generations, pins, completion fences, and I/O lifecycle.
-mtplx/expert_io.py — Positional expert reads, descriptor caching, integrity checks, and I/O counters.
+mtplx/resource_metrics.py — Telemetry-only, phase-scoped expert-pipeline ledger, state integrals, primary precedence, overlaps, and bounded histograms.
+mtplx/expert_runtime.py — Streamed-MoE planning plus authoritative miss lifecycle, blocking next-miss timing, route publication, and pipeline snapshots.
+mtplx/expert_slots.py — Fixed slot ownership plus reader-task/record lifecycle, pin/loading wait observations, and asynchronous cleanup.
+mtplx/expert_io.py — Positional reads with separate logical-range, Python `preadv`, native-call, and returned-byte counters.
 mtplx/expert_streaming.py — Hardware-independent expert-cache planning and route telemetry.
-mtplx/models/expert_mlx.py — MLX Q4 expert dispatch, hit/miss overlap, evaluation, and slot-release ordering.
+mtplx/models/expert_mlx.py — MLX Q4 expert dispatch with telemetry claims immediately before unchanged hit/shared/miss evaluation.
 mtplx/models/hy3_mlx.py — Resident Hy3 model overlay and streamed sparse-layer integration.
 mtplx/streamed_batch.py — Continuously admitted streamed-AR batch execution.
 scripts/benchmark_streamed_generation.py — Canonical streamed-generation benchmark harness and result schema.
-mtplx/benchmarks/resource_telemetry.py — Bounded same-clock resource sampler, evidence matrix, and optional non-interactive powermetrics adapter.
+mtplx/benchmarks/resource_telemetry.py — Resource schema v2 differencing and duration-weighted decode primary/orthogonal attribution.
 scripts/benchmark_expert_io.py — Expert read-path throughput and concurrency benchmark.
 scripts/build_expert_manifest.py — Validated expert-layout manifest builder.
 scripts/verify_streamed_parity.py — Deterministic streamed-versus-resident parity gate.
 docs/MOE_SSD_STREAMING_OPTIMIZATION_ROADMAP.md — Measured bottlenecks, staged optimization contract, and stop/go rules.
 docs/MOE_RUNTIME_PR_BENCHMARKS.md — Curated per-PR runtime correctness and performance evidence.
-docs/RESOURCE_TELEMETRY.md — Agent-facing rules for interpreting throughput, occupancy, overlap, coverage gaps, and defensible bottleneck claims.
+docs/specs/2026-07-13-hy3-starvation-attribution-design.md — Issue #30 Phase 1 ontology, hook boundaries, coverage limits, and evidence gate.
+docs/RESOURCE_TELEMETRY.md — Interpretation contract for resource schema v2 and expert-pipeline attribution.
 CONTRIBUTING.md — Required verification, benchmark provenance, and workspace-level worktree rules.
 
 ## Critical Constraints
@@ -54,7 +56,10 @@ CONTRIBUTING.md — Required verification, benchmark provenance, and workspace-l
 - Memory planning is fail-closed: reserve resident weights, KV, runtime headroom, persistent slots, and transient slots under one explicit limit.
 - A slot cannot be overwritten until its generation's last Metal consumer is complete; preserve pins, generations, and completion-fence ownership.
 - Performance changes require deterministic parity, matched repeated evidence against the immediate predecessor, exact commands, and resource counters.
-- Bottleneck attribution requires same-clock throughput plus occupancy evidence; missing GPU/DRAM counters are unavailable, and low SSD use or elapsed time alone never proves serialization.
+- Expert-pipeline attribution is telemetry-only; its local lock is never held across runtime work, and telemetry-off enters no ledger instrumentation.
+- Records, reader tasks, logical ranges, Python/native calls, and device operations are distinct identities; physical device QD, GPU expert-wait, and GPU idle time remain unavailable.
+- Decode primary fractions use covered `decode_observation_ns`; orthogonal overlaps are independent evidence, and neither form is itself a bottleneck claim.
+- Bottleneck attribution requires same-clock throughput plus occupancy evidence and matched telemetry-off reproduction; no fixed worker target or state percentage is causal.
 - Raw benchmark output belongs only under ignored `benchmarks/raw/<benchmark>/<run-id>/`; commit curated summaries with full provenance.
 - Auxiliary worktrees are flat direct children of the workspace-level `.worktrees/` directory and must not be created inside the clone.
 - Do not silently fall back for unsupported models, layouts, quantization, missing artifacts, integrity failures, or memory-plan breaches.
