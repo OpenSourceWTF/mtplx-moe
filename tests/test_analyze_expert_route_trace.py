@@ -740,6 +740,20 @@ def test_cli_processes_every_batched_routed_row(
     assert payload["held_out"]["policies"]["uniform_per_layer_lru"]["requests"] == (
         2 * batch_width * 2
     )
+    union = payload["batch_union"]
+    assert union["assignment_requests"] == 4 * 2 * batch_width
+    expected_unique_per_layer_step = min(batch_width, 3)
+    assert union["unique_records_demanded"] == (4 * 2 * expected_unique_per_layer_step)
+    assert union["shared_expert_assignments"] == (
+        union["assignment_requests"] - union["unique_records_demanded"]
+    )
+    assert union["union_size_by_layer"] == {
+        "1": [expected_unique_per_layer_step] * 4,
+        "2": [expected_unique_per_layer_step] * 4,
+    }
+    assert union["union_size"]["min"] == expected_unique_per_layer_step
+    assert union["union_size"]["mean"] == expected_unique_per_layer_step
+    assert union["union_size"]["max"] == expected_unique_per_layer_step
     temporal = payload["prefetch"]["temporal_previous_token"]
     assert temporal == {
         "supported": False,

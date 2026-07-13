@@ -380,6 +380,47 @@ def _global_batched_sequence(
     ]
 
 
+def _batch_union_summary(
+    layers: Sequence[int],
+    routes: dict[int, list[list[tuple[int, ...]]]],
+) -> dict[str, object]:
+    """Summarize assignment reuse within each atomic layer/step route."""
+
+    union_size_by_layer: dict[str, list[int]] = {}
+    assignment_requests = 0
+    unique_records_demanded = 0
+    for layer in layers:
+        layer_sizes = []
+        for step in routes[layer]:
+            assignments = [expert for row in step for expert in row]
+            union_size = len(set(assignments))
+            assignment_requests += len(assignments)
+            unique_records_demanded += union_size
+            layer_sizes.append(union_size)
+        union_size_by_layer[str(layer)] = layer_sizes
+    sizes = [
+        size for layer_sizes in union_size_by_layer.values() for size in layer_sizes
+    ]
+    shared_assignments = assignment_requests - unique_records_demanded
+    return {
+        "assignment_requests": assignment_requests,
+        "unique_records_demanded": unique_records_demanded,
+        "shared_expert_assignments": shared_assignments,
+        "assignment_reuse_ratio": (
+            assignment_requests / unique_records_demanded
+            if unique_records_demanded
+            else 0.0
+        ),
+        "union_size": {
+            "min": min(sizes, default=0),
+            "mean": sum(sizes) / len(sizes) if sizes else 0.0,
+            "max": max(sizes, default=0),
+            "samples": len(sizes),
+        },
+        "union_size_by_layer": union_size_by_layer,
+    }
+
+
 def _metric(hits: int, misses: int) -> dict[str, float | int]:
     requests = hits + misses
     return {
@@ -1740,6 +1781,7 @@ def main() -> int:
         "record_bytes": args.record_bytes,
         "measured_ssd_gb_per_second": args.measured_ssd_gb_per_second,
         "total_persistent_slots": total_slots,
+        "batch_union": _batch_union_summary(layers, decode_by_step),
         "policies": policies,
         "capacities": {
             "uniform": uniform,
