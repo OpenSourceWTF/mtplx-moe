@@ -1079,6 +1079,9 @@ class ExpertStreamingRuntime:
         self._mapped_expert_store: Any | None = None
         self._route_trace_lock = threading.Lock()
         self._route_trace: list[dict[str, Any]] = []
+        self._route_trace_epoch = 0
+        self._route_trace_decode_step = 0
+        self._route_trace_decode_layers_seen: set[int] = set()
         self._incremental_miss_routes = 0
         self._incremental_miss_parts = 0
         self._split_executor = ThreadPoolExecutor(
@@ -1761,13 +1764,29 @@ class ExpertStreamingRuntime:
     ) -> None:
         if not self.config.trace_routes:
             return
-        entry = {
-            "layer": int(layer),
-            "phase": RoutingPhase(phase).value,
-            "token_count": int(token_count),
-            "expert_ids": [int(expert) for expert in expert_ids],
-        }
+        normalized_phase = RoutingPhase(phase)
+        routed_experts = [int(expert) for expert in expert_ids]
         with self._route_trace_lock:
+            entry = {
+                "layer": int(layer),
+                "phase": normalized_phase.value,
+                "trace_epoch": self._route_trace_epoch,
+                "token_count": int(token_count),
+                "expert_ids": routed_experts,
+            }
+            if normalized_phase is RoutingPhase.DECODE:
+                routed_layers = set(self.spec.routed_layer_indices)
+                if layer in self._route_trace_decode_layers_seen:
+                    # Preserve evidence rather than silently assigning a
+                    # duplicate layer to the current step. The analyzer will
+                    # reject the resulting incomplete step sequences.
+                    self._route_trace_decode_step += 1
+                    self._route_trace_decode_layers_seen.clear()
+                entry["decode_step"] = self._route_trace_decode_step
+                self._route_trace_decode_layers_seen.add(int(layer))
+                if self._route_trace_decode_layers_seen == routed_layers:
+                    self._route_trace_decode_step += 1
+                    self._route_trace_decode_layers_seen.clear()
             self._route_trace.append(entry)
 
     def route_trace(self) -> list[dict[str, Any]]:
@@ -1813,6 +1832,19 @@ class ExpertStreamingRuntime:
                 }
                 self._incremental_miss_routes = 0
                 self._incremental_miss_parts = 0
+            if self.config.trace_routes:
+                with self._route_trace_lock:
+                    previous_epoch = self._route_trace_epoch
+                    self._route_trace_epoch += 1
+                    self._route_trace_decode_step = 0
+                    self._route_trace_decode_layers_seen.clear()
+                    self._route_trace.append(
+                        {
+                            "phase": "reset",
+                            "previous_trace_epoch": previous_epoch,
+                            "trace_epoch": self._route_trace_epoch,
+                        }
+                    )
         finally:
             for lock in reversed(locks):
                 lock.release()

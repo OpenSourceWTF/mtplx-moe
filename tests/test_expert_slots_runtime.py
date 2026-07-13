@@ -3639,6 +3639,54 @@ def test_runtime_snapshot_splits_cache_counters_by_phase(tmp_path: Path) -> None
         runtime.close()
 
 
+def test_route_trace_producer_assigns_one_monotonic_step_across_routed_layers(
+    tmp_path: Path,
+) -> None:
+    root, spec, manifest, _expected = _global_artifact(tmp_path)
+    manifest_path = root / "expert-manifest.json"
+    save_expert_manifest(manifest, manifest_path)
+    plan = _plan(spec)
+    config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=plan.total_limit_bytes,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        verify_artifact_headers=False,
+        trace_routes=True,
+    )
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        config,
+        spec=spec,
+        apply_memory_cap=False,
+    )
+    try:
+        for _step in range(2):
+            runtime.observe_route(1, "decode", [0, 1], token_count=2)
+            runtime.observe_route(2, "decode", [1, 0], token_count=2)
+
+        trace = runtime.route_trace()
+        assert [entry["decode_step"] for entry in trace] == [0, 0, 1, 1]
+        assert [entry["trace_epoch"] for entry in trace] == [0, 0, 0, 0]
+        assert [entry["layer"] for entry in trace] == [1, 2, 1, 2]
+        assert all(entry["token_count"] == 2 for entry in trace)
+
+        runtime.reset()
+        runtime.observe_route(1, "decode", [0, 1], token_count=2)
+        runtime.observe_route(2, "decode", [1, 0], token_count=2)
+        reset_trace = runtime.route_trace()
+        assert reset_trace[-3] == {
+            "phase": "reset",
+            "previous_trace_epoch": 0,
+            "trace_epoch": 1,
+        }
+        assert [entry["trace_epoch"] for entry in reset_trace[-2:]] == [1, 1]
+        assert [entry["decode_step"] for entry in reset_trace[-2:]] == [0, 0]
+    finally:
+        runtime.close()
+
+
 def test_runtime_rolls_back_policy_mapping_after_integrity_failure(
     tmp_path: Path,
 ) -> None:

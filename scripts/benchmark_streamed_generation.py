@@ -4,17 +4,29 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
+import importlib.metadata
+import importlib.util
 import json
+import os
 import platform
+import secrets
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Mapping
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from mtplx.expert_manifest import (  # noqa: E402
+    ExpertManifestError,
+    load_expert_manifest,
+    resolve_artifact_member,
+)
 from mtplx.expert_runtime import ExpertStreamingConfig, parse_memory_bytes  # noqa: E402
 from mtplx.runtime import load  # noqa: E402
 
@@ -33,6 +45,965 @@ def _git_commit() -> str | None:
         ).strip()
     except Exception:
         return None
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 * 1024**2):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _file_stat_identity(path: Path) -> dict[str, int]:
+    stat = path.stat()
+    return {
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "ctime_ns": stat.st_ctime_ns,
+    }
+
+
+def _receipt_path(receipt_dir: Path, path: Path, *, suffix: str = "full") -> Path:
+    key = _sha256_bytes(f"{path.resolve()}:{suffix}".encode("utf-8"))
+    return receipt_dir.expanduser().resolve() / f"{key}.json"
+
+
+def _verified_file_digest(
+    path: Path,
+    *,
+    require_nocache: bool = False,
+    receipt_path: Path | None = None,
+) -> dict[str, object]:
+    """Stream actual bytes, bypassing the page cache where the host supports it."""
+
+    before = _file_stat_identity(path)
+    if receipt_path is not None and receipt_path.is_file():
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            receipt = None
+        if (
+            isinstance(receipt, dict)
+            and receipt.get("schema") == "mtplx-verification-receipt-v1"
+            and receipt.get("stat") == before
+            and receipt.get("scope") == "full_file"
+        ):
+            return {
+                "sha256": str(receipt["sha256"]),
+                "size": before["size"],
+                "verification_method": "versioned_prior_nocache_receipt",
+                "page_cache_bypassed": True,
+                "verification_elapsed_seconds": 0.0,
+                "receipt_reused": True,
+                "receipt": str(receipt_path),
+            }
+    digest = hashlib.sha256()
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    nocache = False
+    started = time.perf_counter()
+    try:
+        command = getattr(fcntl, "F_NOCACHE", None)
+        if command is not None:
+            try:
+                fcntl.fcntl(descriptor, command, 1)
+                nocache = True
+            except OSError:
+                pass
+        if require_nocache and not nocache:
+            raise RuntimeError(
+                f"non-caching verification is unavailable for retained evidence: {path}"
+            )
+        size = 0
+        while True:
+            chunk = os.read(descriptor, 8 * 1024**2)
+            if not chunk:
+                break
+            size += len(chunk)
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    elapsed = time.perf_counter() - started
+    after = _file_stat_identity(path)
+    if after != before:
+        raise RuntimeError(f"artifact changed during verification: {path}")
+    result = {
+        "sha256": digest.hexdigest(),
+        "size": size,
+        "verification_method": "streamed_full_file_sha256",
+        "page_cache_bypassed": nocache,
+        "verification_elapsed_seconds": elapsed,
+        "receipt_reused": False,
+    }
+    if receipt_path is not None and nocache:
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = receipt_path.with_name(
+            f".{receipt_path.name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+        )
+        try:
+            with temporary.open("x", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "schema": "mtplx-verification-receipt-v1",
+                        "scope": "full_file",
+                        "stat": after,
+                        "sha256": result["sha256"],
+                    },
+                    handle,
+                    sort_keys=True,
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, receipt_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        result["receipt"] = str(receipt_path)
+    return result
+
+
+def _verified_range_digest(
+    path: Path,
+    offset: int,
+    length: int,
+    *,
+    require_nocache: bool = False,
+    receipt_path: Path | None = None,
+) -> dict[str, object]:
+    before = _file_stat_identity(path)
+    if receipt_path is not None and receipt_path.is_file():
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            receipt = None
+        if (
+            isinstance(receipt, dict)
+            and receipt.get("schema") == "mtplx-verification-receipt-v1"
+            and receipt.get("stat") == before
+            and receipt.get("scope") == "byte_range"
+            and receipt.get("offset") == offset
+            and receipt.get("length") == length
+        ):
+            return {
+                "sha256": str(receipt["sha256"]),
+                "verification_method": "versioned_prior_nocache_receipt",
+                "page_cache_bypassed": True,
+                "verification_elapsed_seconds": 0.0,
+                "receipt_reused": True,
+                "receipt": str(receipt_path),
+            }
+    digest = hashlib.sha256()
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    nocache = False
+    started = time.perf_counter()
+    try:
+        command = getattr(fcntl, "F_NOCACHE", None)
+        if command is not None:
+            try:
+                fcntl.fcntl(descriptor, command, 1)
+                nocache = True
+            except OSError:
+                pass
+        if require_nocache and not nocache:
+            raise RuntimeError(
+                f"non-caching verification is unavailable for retained evidence: {path}"
+            )
+        remaining = length
+        position = offset
+        while remaining:
+            chunk = os.pread(descriptor, min(8 * 1024**2, remaining), position)
+            if not chunk:
+                raise ValueError(f"resident range in {path.name} is truncated")
+            digest.update(chunk)
+            position += len(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(descriptor)
+    result = {
+        "sha256": digest.hexdigest(),
+        "verification_method": "streamed_resident_range_sha256",
+        "page_cache_bypassed": nocache,
+        "verification_elapsed_seconds": time.perf_counter() - started,
+        "receipt_reused": False,
+    }
+    after = _file_stat_identity(path)
+    if after != before:
+        raise RuntimeError(f"artifact changed during verification: {path}")
+    if receipt_path is not None and nocache:
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = receipt_path.with_name(
+            f".{receipt_path.name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+        )
+        try:
+            with temporary.open("x", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "schema": "mtplx-verification-receipt-v1",
+                        "scope": "byte_range",
+                        "stat": after,
+                        "offset": offset,
+                        "length": length,
+                        "sha256": result["sha256"],
+                    },
+                    handle,
+                    sort_keys=True,
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, receipt_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        result["receipt"] = str(receipt_path)
+    return result
+
+
+def _verification_identity_fields(
+    result: dict[str, object], *, report_timing: bool
+) -> dict[str, object]:
+    if report_timing:
+        return result
+    return {
+        key: value
+        for key, value in result.items()
+        if key not in {"verification_elapsed_seconds", "receipt"}
+    }
+
+
+def build_expert_manifest_identity(path: Path) -> dict[str, object]:
+    """Hash the small expert manifest and retain its pinned artifact metadata."""
+
+    raw = path.expanduser().read_bytes()
+    payload = json.loads(raw)
+    return {
+        "content_sha256": _sha256_bytes(raw),
+        "declared_manifest_sha256": payload.get("manifest_sha256"),
+        "model_key": payload.get("model_key"),
+        "source_revision": payload.get("source_revision"),
+        "source_repo": payload.get("source_repo"),
+    }
+
+
+def build_model_artifact_identity(
+    model_root: Path,
+    manifest_path: Path,
+    *,
+    require_nocache: bool = False,
+    receipt_dir: Path | None = None,
+    report_timing: bool = False,
+) -> dict[str, object]:
+    """Validate the manifest and identify the exact executable artifact bytes."""
+
+    root = model_root.expanduser().resolve()
+    raw_manifest = manifest_path.expanduser().read_bytes()
+    manifest = load_expert_manifest(manifest_path, verify_digest=True)
+    small_names = {
+        "config.json",
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "model.safetensors.index.json",
+        "tokenizer.model",
+        "vocab.json",
+        "merges.txt",
+    }
+    small_names.update(path.name for path in root.glob("chat_template*.jinja"))
+    small_files = []
+    for name in sorted(small_names):
+        path = resolve_artifact_member(root, name, must_exist=False)
+        if path.is_file():
+            verified = _verified_file_digest(
+                path,
+                require_nocache=require_nocache,
+                receipt_path=(
+                    _receipt_path(receipt_dir, path)
+                    if receipt_dir is not None
+                    else None
+                ),
+            )
+            small_files.append(
+                {
+                    "name": name,
+                    **_verification_identity_fields(
+                        verified, report_timing=report_timing
+                    ),
+                }
+            )
+
+    if manifest.sidecar is not None:
+        sidecar_path = resolve_artifact_member(root, manifest.sidecar.file)
+        expert_payload = _verified_file_digest(
+            sidecar_path,
+            require_nocache=require_nocache,
+            receipt_path=(
+                _receipt_path(receipt_dir, sidecar_path)
+                if receipt_dir is not None
+                else None
+            ),
+        )
+        if expert_payload["size"] != manifest.sidecar.size:
+            raise ExpertManifestError("sidecar size differs from validated manifest")
+        if expert_payload["sha256"] != manifest.sidecar.sha256:
+            raise ExpertManifestError("sidecar digest differs from validated manifest")
+        expert_payload.update(
+            {
+                "method": "verified_sidecar_sha256",
+                "verification_level": "actual_full_file_digest_matches_manifest",
+            }
+        )
+        expert_payload = _verification_identity_fields(
+            expert_payload, report_timing=report_timing
+        )
+    else:
+        expert_payload = {
+            "method": "manifest_record_sha256_inventory",
+            "verification_level": "per_record_declared_digest",
+            "manifest_content_sha256": _sha256_bytes(raw_manifest),
+        }
+
+    resident_tensors = []
+    seen_ranges: dict[str, list[tuple[int, int]]] = {}
+    for tensor in manifest.resident_tensors:
+        shard_path = resolve_artifact_member(root, tensor.shard)
+        end = tensor.offset + tensor.length
+        if end > shard_path.stat().st_size:
+            raise ExpertManifestError(f"resident tensor {tensor.tensor} exceeds shard")
+        shard_key = str(shard_path)
+        ranges = seen_ranges.setdefault(shard_key, [])
+        if any(
+            tensor.offset < previous_end and previous_start < end
+            for previous_start, previous_end in ranges
+        ):
+            raise ExpertManifestError("resident byte ranges overlap or repeat")
+        ranges.append((tensor.offset, end))
+        resident_tensors.append(
+            {
+                "tensor": tensor.tensor,
+                "shard": tensor.shard,
+                "offset": tensor.offset,
+                "length": tensor.length,
+                **_verification_identity_fields(
+                    _verified_range_digest(
+                        shard_path,
+                        tensor.offset,
+                        tensor.length,
+                        require_nocache=require_nocache,
+                        receipt_path=(
+                            _receipt_path(
+                                receipt_dir,
+                                shard_path,
+                                suffix=f"range-{tensor.offset}-{tensor.length}",
+                            )
+                            if receipt_dir is not None
+                            else None
+                        ),
+                    ),
+                    report_timing=report_timing,
+                ),
+            }
+        )
+
+    return {
+        "method": "manifest_plus_executable_resident_content_v1",
+        "verification_level": "full_small_files_and_authenticated_resident_content",
+        "manifest": build_expert_manifest_identity(manifest_path),
+        "expert_payload": expert_payload,
+        "small_files": small_files,
+        "resident_tensors": resident_tensors,
+    }
+
+
+def build_prompt_identity(prompt_text: str | None, prompt_ids) -> dict[str, object]:
+    """Identify exact source content and the exact encoded token sequence."""
+
+    content = (prompt_text or "").encode("utf-8")
+    tokens = [int(token) for token in prompt_ids]
+    token_bytes = json.dumps(tokens, separators=(",", ":")).encode("utf-8")
+    return {
+        "content_sha256": _sha256_bytes(content),
+        "content_bytes": len(content),
+        "token_sha256": _sha256_bytes(token_bytes),
+        "token_count": len(tokens),
+    }
+
+
+def _safetensors_header_identity(path: Path) -> dict[str, object]:
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        header_size_raw = handle.read(8)
+        if len(header_size_raw) != 8:
+            raise ValueError(f"{path.name} has no safetensors header length")
+        header_size = int.from_bytes(header_size_raw, "little")
+        if header_size <= 0 or header_size > 64 * 1024**2:
+            raise ValueError(f"{path.name} has an invalid safetensors header length")
+        header = handle.read(header_size)
+    if len(header) != header_size:
+        raise ValueError(f"{path.name} has a truncated safetensors header")
+    return {
+        "name": path.name,
+        "size": size,
+        "header_sha256": _sha256_bytes(header),
+    }
+
+
+def build_mtp_artifact_identity(
+    artifact_root: Path,
+    *,
+    precision: str,
+    require_nocache: bool = False,
+    receipt_dir: Path | None = None,
+    report_timing: bool = False,
+) -> dict[str, object]:
+    """Identify MTP artifacts from filenames, sizes, and small tensor headers."""
+
+    filenames = (
+        ("layer80-bf16.safetensors",)
+        if precision == "bf16"
+        else ("layer80-residents-q.safetensors", "layer80-q4.safetensors")
+    )
+    digest_manifest_path = artifact_root.expanduser() / "artifact-digests.json"
+    declared_files = None
+    if digest_manifest_path.is_file():
+        digest_manifest = json.loads(digest_manifest_path.read_text(encoding="utf-8"))
+        if digest_manifest.get("format") != "mtplx-artifact-digests-v1":
+            raise ValueError("unsupported MTP artifact digest manifest format")
+        declared_manifest_sha256 = digest_manifest.get("manifest_sha256")
+        unsigned_manifest = {
+            key: value
+            for key, value in digest_manifest.items()
+            if key != "manifest_sha256"
+        }
+        computed_manifest_sha256 = _sha256_bytes(
+            json.dumps(unsigned_manifest, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
+        if declared_manifest_sha256 != computed_manifest_sha256:
+            raise ValueError("MTP artifact digest manifest authentication failed")
+        declared_files = digest_manifest.get("files")
+    files = []
+    for filename in filenames:
+        path = artifact_root.expanduser() / filename
+        header_identity = _safetensors_header_identity(path)
+        declared = declared_files.get(filename) if declared_files else None
+        verified = _verified_file_digest(
+            path,
+            require_nocache=require_nocache,
+            receipt_path=(
+                _receipt_path(receipt_dir, path) if receipt_dir is not None else None
+            ),
+        )
+        if declared is not None:
+            if int(declared["size"]) != verified["size"]:
+                raise ValueError(f"declared MTP size differs for {filename}")
+            if str(declared["sha256"]) != verified["sha256"]:
+                raise ValueError(f"declared MTP digest differs for {filename}")
+            verification_level = "actual_full_file_digest_matches_manifest"
+        else:
+            verification_level = "full_file_verified_at_benchmark_start"
+        files.append(
+            {
+                **header_identity,
+                "full_sha256": verified["sha256"],
+                "identity_method": verified["verification_method"],
+                "page_cache_bypassed": verified["page_cache_bypassed"],
+                "verification_level": verification_level,
+                **(
+                    {
+                        "verification_elapsed_seconds": verified[
+                            "verification_elapsed_seconds"
+                        ],
+                        "receipt_reused": verified["receipt_reused"],
+                        "receipt": verified.get("receipt"),
+                    }
+                    if report_timing
+                    else {}
+                ),
+            }
+        )
+    return {
+        "precision": precision,
+        "files": files,
+    }
+
+
+def build_harness_source_identity(root: Path = _ROOT) -> dict[str, object]:
+    """Hash behavior-affecting local source independently of checkout path."""
+
+    root = root.expanduser().resolve()
+    candidates = set()
+    for source_root in (
+        root / "mtplx",
+        root / "native_extensions",
+        root / "vllm_metal",
+    ):
+        if not source_root.exists():
+            continue
+        for pattern in (
+            "*.py",
+            "*.metal",
+            "*.c",
+            "*.cc",
+            "*.cpp",
+            "*.h",
+            "*.mm",
+            "*.so",
+            "*.dylib",
+            "*.metallib",
+            "CMakeLists.txt",
+            "pyproject.toml",
+        ):
+            candidates.update(source_root.rglob(pattern))
+    for relative in (
+        "scripts/benchmark_streamed_generation.py",
+        "scripts/analyze_expert_route_trace.py",
+        "pyproject.toml",
+        "uv.lock",
+        "CMakeLists.txt",
+    ):
+        path = root / relative
+        if path.is_file():
+            candidates.add(path)
+    inventory = [
+        {
+            "path": path.relative_to(root).as_posix(),
+            "sha256": _sha256_file(path),
+        }
+        for path in sorted(candidates)
+    ]
+    native_binaries = []
+    extension_modules = {
+        "mtplx_native_expert_io._ext",
+        "mtplx_native_mlp._ext",
+        "mlx.core",
+    }
+    extension_modules.update(
+        name
+        for name, module in sys.modules.items()
+        if name.startswith(("mtplx", "mlx", "mtplx_native"))
+        and getattr(module, "__file__", "")
+        and Path(str(module.__file__)).suffix in {".so", ".dylib", ".metallib"}
+    )
+    seen_native_paths: set[Path] = set()
+    for module_name in sorted(extension_modules):
+        try:
+            spec = importlib.util.find_spec(module_name)
+        except (ImportError, AttributeError, ValueError):
+            spec = None
+        origin = (
+            Path(spec.origin).resolve() if spec is not None and spec.origin else None
+        )
+        related = []
+        if origin is not None and origin.is_file():
+            related = [origin, *origin.parent.glob("*.dylib")]
+            related.extend(origin.parent.rglob("*.metallib"))
+        for binary in related:
+            binary = binary.resolve()
+            if binary in seen_native_paths or binary.suffix not in {
+                ".so",
+                ".dylib",
+                ".metallib",
+            }:
+                continue
+            seen_native_paths.add(binary)
+            native_binaries.append(
+                {
+                    "module": module_name,
+                    "name": binary.name,
+                    "sha256": _sha256_file(binary),
+                    "size": binary.stat().st_size,
+                }
+            )
+    dependency_versions = {}
+    for distribution in ("mlx", "mlx-lm", "numpy", "safetensors"):
+        try:
+            dependency_versions[distribution] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            dependency_versions[distribution] = None
+    source_sha256 = _sha256_bytes(
+        json.dumps(
+            {
+                "sources": inventory,
+                "native_binaries": native_binaries,
+                "dependency_versions": dependency_versions,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    try:
+        git_head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True, timeout=2
+        ).strip()
+        dirty = bool(
+            subprocess.check_output(
+                [
+                    "git",
+                    "status",
+                    "--porcelain",
+                    "--",
+                    *[item["path"] for item in inventory],
+                ],
+                cwd=root,
+                text=True,
+                timeout=5,
+            ).strip()
+        )
+    except Exception:
+        git_head = None
+        dirty = None
+    return {
+        "method": "path_relative_source_inventory_sha256_v1",
+        "source_sha256": source_sha256,
+        "file_count": len(inventory),
+        "native_binaries": native_binaries,
+        "dependency_versions": dependency_versions,
+        "git_head": git_head,
+        "dirty": dirty,
+    }
+
+
+def settle_after_artifact_verification(
+    identities: object,
+    seconds: float,
+    *,
+    sleeper=time.sleep,
+) -> bool:
+    """Cooldown only after a fresh full/range verification, never receipt reuse."""
+
+    if seconds < 0:
+        raise ValueError("verification settle seconds must be non-negative")
+
+    def fresh(value: object) -> bool:
+        if isinstance(value, dict):
+            if (value.get("verification_method") or value.get("identity_method")) in {
+                "streamed_full_file_sha256",
+                "streamed_resident_range_sha256",
+            } and not value.get("receipt_reused", False):
+                return True
+            return any(fresh(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(fresh(item) for item in value)
+        return False
+
+    required = fresh(identities)
+    if required and seconds:
+        sleeper(seconds)
+    return required
+
+
+def stable_artifact_content_identity(value: object) -> object:
+    """Remove run-local verification telemetry from performance fingerprints."""
+
+    operational = {
+        "verification_elapsed_seconds",
+        "verification_method",
+        "identity_method",
+        "verification_level",
+        "page_cache_bypassed",
+        "receipt_reused",
+        "receipt",
+    }
+    if isinstance(value, dict):
+        return {
+            key: stable_artifact_content_identity(item)
+            for key, item in value.items()
+            if key not in operational
+        }
+    if isinstance(value, list):
+        return [stable_artifact_content_identity(item) for item in value]
+    return value
+
+
+def build_stable_performance_settings(
+    *,
+    runtime_config: Mapping[str, object],
+    sampler: Mapping[str, object],
+    seed: int,
+    prompt_identity: Mapping[str, object],
+    prompt_options: Mapping[str, object],
+    generation: Mapping[str, object],
+    scheduler: Mapping[str, object],
+    mtp: Mapping[str, object],
+    model_artifact: Mapping[str, object],
+) -> dict[str, object]:
+    """Collect resolved, path-independent inputs used by config fingerprinting."""
+
+    return {
+        "runtime_config": dict(runtime_config),
+        "sampler": dict(sampler),
+        "seed": int(seed),
+        "prompt_identity": dict(prompt_identity),
+        "prompt_options": dict(prompt_options),
+        "generation": dict(generation),
+        "scheduler": dict(scheduler),
+        "mtp": dict(mtp),
+        "model_artifact": dict(model_artifact),
+    }
+
+
+def build_configuration_summary(
+    base_run_label: str,
+    *,
+    cache_scope: str,
+    slot_layout: str,
+    concurrency: int,
+    performance_settings: Mapping[str, object],
+) -> dict[str, object]:
+    """Return legacy run identity plus bounded requested-config identity."""
+
+    if concurrency < 1:
+        raise ValueError("concurrency must be at least 1")
+    canonical_settings = {
+        key: performance_settings[key] for key in sorted(performance_settings)
+    }
+    fingerprint_payload = {
+        "cache_scope": cache_scope,
+        "slot_layout": slot_layout,
+        "requested_concurrency": concurrency,
+        "performance_settings": canonical_settings,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    configuration_label = (
+        f"cache-{cache_scope}-layout-{slot_layout}-B{concurrency}-cfg-{fingerprint}"
+    )
+    return {
+        "run_label": base_run_label,
+        "configuration_label": configuration_label,
+        "configuration_fingerprint": fingerprint,
+        "cache_scope": cache_scope,
+        "slot_layout": slot_layout,
+        "concurrency": concurrency,
+        "requested_concurrency": concurrency,
+        "performance_settings": canonical_settings,
+    }
+
+
+def build_response_filename(
+    model_key: str,
+    run_label: str,
+    repeat: int,
+    *,
+    request_id: str | None = None,
+    configuration_fingerprint: str | None = None,
+) -> str:
+    """Preserve the legacy filename, bounding only oversized path components."""
+
+    request_suffix = f"-{request_id}" if request_id is not None else ""
+    config_suffix = (
+        f"-cfg-{configuration_fingerprint}"
+        if configuration_fingerprint is not None
+        else ""
+    )
+    tail = f"-repeat-{repeat}{request_suffix}{config_suffix}.md"
+    candidate = f"{model_key}-{run_label}{tail}"
+    if len(candidate.encode("utf-8")) <= 255:
+        return candidate
+    digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()[:16]
+    prefix = f"{model_key}-"
+    hash_suffix = f"-h{digest}"
+    available = 255 - len((prefix + hash_suffix + tail).encode("utf-8"))
+    bounded_label = run_label.encode("utf-8")[:available].decode(
+        "utf-8", errors="ignore"
+    )
+    return f"{prefix}{bounded_label}{hash_suffix}{tail}"
+
+
+def write_response_file(
+    output_dir: Path,
+    text: str,
+    *,
+    model_key: str,
+    run_label: str,
+    repeat: int,
+    configuration_fingerprint: str,
+    request_id: str | None = None,
+) -> Path:
+    """Write once, falling back to config identity without overwriting evidence."""
+
+    output_dir = output_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    candidates = (
+        build_response_filename(
+            model_key,
+            run_label,
+            repeat,
+            request_id=request_id,
+        ),
+        build_response_filename(
+            model_key,
+            run_label,
+            repeat,
+            request_id=request_id,
+            configuration_fingerprint=configuration_fingerprint,
+        ),
+    )
+    for filename in candidates:
+        path = output_dir / filename
+        try:
+            reservation = reserve_json_evidence_targets(path, None)
+        except FileExistsError:
+            continue
+        try:
+            reservation.commit(path, text)
+        finally:
+            reservation.cleanup()
+        return path
+    raise FileExistsError(
+        f"response evidence already exists for run {run_label!r}, repeat {repeat}, "
+        f"configuration {configuration_fingerprint}"
+    )
+
+
+class JsonEvidenceReservations:
+    """Own sibling locks while publishing immutable JSON with no replacement."""
+
+    def __init__(
+        self,
+        paths: tuple[Path, ...],
+        locks: Mapping[Path, tuple[Path, str, int]],
+    ) -> None:
+        self.paths = paths
+        self._locks = dict(locks)
+        self._committed: set[Path] = set()
+
+    def _assert_lock_owned(self, path: Path) -> None:
+        lock_path, token, inode = self._locks[path]
+        try:
+            stat = lock_path.stat()
+            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"JSON evidence reservation was lost: {path}") from exc
+        if stat.st_ino != inode or payload.get("owner_token") != token:
+            raise RuntimeError(f"JSON evidence reservation ownership changed: {path}")
+
+    def commit(self, path: Path, text: str) -> None:
+        resolved = path.expanduser().resolve()
+        if resolved not in self.paths:
+            raise ValueError("JSON evidence path was not reserved")
+        if resolved in self._committed:
+            raise FileExistsError(f"JSON evidence was already committed: {resolved}")
+        self._assert_lock_owned(resolved)
+        token = self._locks[resolved][1]
+        temporary = resolved.with_name(f".{resolved.name}.tmp-{token}")
+        try:
+            with temporary.open("x", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self._assert_lock_owned(resolved)
+            try:
+                os.link(temporary, resolved)
+            except FileExistsError as exc:
+                raise FileExistsError(
+                    f"JSON evidence target appeared before publication: {resolved}"
+                ) from exc
+            directory_fd = os.open(resolved.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            self._committed.add(resolved)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def cleanup(self) -> None:
+        for path in self.paths:
+            lock_path, token, inode = self._locks[path]
+            try:
+                stat = lock_path.stat()
+                payload = json.loads(lock_path.read_text(encoding="utf-8"))
+                if stat.st_ino == inode and payload.get("owner_token") == token:
+                    lock_path.unlink()
+            except (FileNotFoundError, json.JSONDecodeError):
+                pass
+
+
+def reserve_json_evidence_targets(
+    output_json: Path | None,
+    route_trace_json: Path | None,
+) -> JsonEvidenceReservations:
+    """Exclusively reserve explicit JSON evidence paths before model loading."""
+
+    paths = tuple(
+        path.expanduser().resolve()
+        for path in (output_json, route_trace_json)
+        if path is not None
+    )
+    if len(paths) != len(set(paths)):
+        raise ValueError("--output-json and --route-trace-json must be different")
+    locks: dict[Path, tuple[Path, str, int]] = {}
+    try:
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists():
+                raise FileExistsError(path)
+            lock_path = path.with_name(f".{path.name}.lock")
+            token = secrets.token_hex(16)
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                payload = json.dumps(
+                    {"owner_token": token, "pid": os.getpid(), "target": path.name}
+                ).encode("utf-8")
+                os.write(descriptor, payload)
+                os.fsync(descriptor)
+                inode = os.fstat(descriptor).st_ino
+            finally:
+                os.close(descriptor)
+            locks[path] = (lock_path, token, inode)
+    except FileExistsError as exc:
+        for lock_path, _token, _inode in locks.values():
+            lock_path.unlink(missing_ok=True)
+        raise FileExistsError(
+            "JSON evidence target or ownership lock already exists; abandoned "
+            f"locks require explicit operator removal: {exc.filename or exc}"
+        ) from exc
+    return JsonEvidenceReservations(paths, locks)
+
+
+def resolve_run_label(args: argparse.Namespace) -> str:
+    """Return the unchanged legacy user label or manifest-stem default."""
+
+    return args.run_label or args.manifest.stem
+
+
+def build_evidence_summary(
+    rows: list[dict],
+    *,
+    configuration_label: str,
+    requested_concurrency: int,
+) -> dict[str, object]:
+    """Summarize achieved concurrency without relabeling requested config."""
+
+    achieved_peak_concurrency = max(
+        (int(row["achieved_peak_concurrency"]) for row in rows),
+        default=0,
+    )
+    undersubscribed = any(bool(row["undersubscribed"]) for row in rows)
+    evidence_label = (
+        f"{configuration_label}-achieved-B{achieved_peak_concurrency}"
+        f"{'-undersubscribed' if undersubscribed else ''}"
+    )
+    return {
+        "configuration_label": configuration_label,
+        "evidence_label": evidence_label,
+        "requested_concurrency": requested_concurrency,
+        "achieved_peak_concurrency": achieved_peak_concurrency,
+        "saturation_valid": bool(rows) and not undersubscribed,
+        "undersubscribed": undersubscribed,
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -169,6 +1140,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use macOS F_NOCACHE reads directly into shared expert slots.",
     )
     parser.add_argument(
+        "--verification-receipt-dir",
+        type=Path,
+        default=Path("~/.cache/mtplx/verification-receipts"),
+        help="Versioned stat-bound receipts for prior full non-caching reads.",
+    )
+    parser.add_argument(
+        "--verification-settle-seconds",
+        type=float,
+        default=5.0,
+        help="Cooldown after fresh artifact digest reads and before timed generation.",
+    )
+    parser.add_argument(
         "--slot-layout",
         choices=["direct-slots", "component-banks", "metal-mmap"],
         default="direct-slots",
@@ -240,7 +1223,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def validate_mtp_flags(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+def validate_mtp_flags(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
     if args.enable_mtp:
         if args.model_key != "hy3-q4":
             parser.error("--enable-mtp is packaged for --model-key hy3-q4 only")
@@ -257,6 +1242,27 @@ def validate_mtp_flags(parser: argparse.ArgumentParser, args: argparse.Namespace
         parser.error("--mtp-artifacts requires --enable-mtp")
     elif args.mtp_precision is not None:
         parser.error("--mtp-precision requires --enable-mtp")
+
+
+def validate_sidecar_flags(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    manifest,
+) -> None:
+    """Fail closed when a sidecar trust mode has no validated sidecar target."""
+
+    if args.verified_sidecar and args.trust_sidecar:
+        parser.error("--verified-sidecar and --trust-sidecar are mutually exclusive")
+    if (args.trust_sidecar or args.verified_sidecar) and manifest.sidecar is None:
+        parser.error("sidecar trust/verification requires a validated manifest sidecar")
+
+
+def should_verify_source_records(args: argparse.Namespace, manifest) -> bool:
+    """Never let a no-sidecar trust flag disable source-record verification."""
+
+    if args.slot_layout == "metal-mmap":
+        return False
+    return not (args.trust_sidecar and manifest.sidecar is not None)
 
 
 def build_concurrent_requests(
@@ -298,6 +1304,8 @@ def _run_concurrent_repeats(
     sampler,
     max_tokens: int,
     run_label: str,
+    configuration_label: str,
+    configuration_fingerprint: str = "unfingerprinted",
 ) -> list[dict]:
     """Saturation lane: N identical prompts, aggregate and per-stream tok/s."""
 
@@ -334,13 +1342,15 @@ def _run_concurrent_repeats(
             decode_elapsed = result.last_token_s - result.first_token_s
             response_path = None
             if args.output_dir is not None:
-                output_dir = args.output_dir.expanduser().resolve()
-                output_dir.mkdir(parents=True, exist_ok=True)
-                response_path = output_dir / (
-                    f"{args.model_key}-{run_label}-repeat-{repeat}"
-                    f"-{result.request_id}.md"
+                response_path = write_response_file(
+                    args.output_dir,
+                    result.text + "\n",
+                    model_key=args.model_key,
+                    run_label=run_label,
+                    repeat=repeat,
+                    configuration_fingerprint=configuration_fingerprint,
+                    request_id=result.request_id,
                 )
-                response_path.write_text(result.text + "\n", encoding="utf-8")
             streams.append(
                 {
                     "request_id": result.request_id,
@@ -373,17 +1383,33 @@ def _run_concurrent_repeats(
                 }
             )
         aggregate_tokens = sum(stream["completion_tokens"] for stream in streams)
+        scheduler = runner.stats()
+        achieved_peak_concurrency = max(scheduler["live_stream_counts"], default=0)
+        undersubscribed = achieved_peak_concurrency < args.concurrency
+        evidence_label = (
+            f"{configuration_label}-achieved-B{achieved_peak_concurrency}"
+            f"{'-undersubscribed' if undersubscribed else ''}"
+        )
         rows.append(
             {
                 "repeat": repeat,
                 "elapsed_seconds": elapsed,
                 "prompt_tokens": len(prompt_ids),
+                "run_label": run_label,
+                "configuration_label": configuration_label,
                 "concurrency": args.concurrency,
+                "requested_concurrency": args.concurrency,
+                "achieved_peak_concurrency": achieved_peak_concurrency,
+                "saturation_valid": not undersubscribed,
+                "undersubscribed": undersubscribed,
+                "evidence_label": evidence_label,
+                "cache_scope": args.cache_scope,
+                "slot_layout": args.slot_layout,
                 "aggregate_completion_tokens": aggregate_tokens,
                 "aggregate_completion_tokens_per_second": (
                     aggregate_tokens / elapsed if elapsed > 0.0 else 0.0
                 ),
-                "scheduler": runner.stats(),
+                "scheduler": scheduler,
                 "streams": streams,
                 "streaming_before": before,
                 "streaming_after": after,
@@ -392,7 +1418,11 @@ def _run_concurrent_repeats(
     return rows
 
 
-def main() -> int:
+_active_evidence_reservations: JsonEvidenceReservations | None = None
+
+
+def _main() -> int:
+    global _active_evidence_reservations
     parser = build_parser()
     args = parser.parse_args()
     root = args.model_root.expanduser().resolve()
@@ -449,6 +1479,8 @@ def main() -> int:
             f"--max-tokens {max_tokens} exceeds {args.model_key}'s documented "
             f"maximum output of {model_defaults['max_output_tokens']}"
         )
+    if args.verification_settle_seconds < 0:
+        parser.error("--verification-settle-seconds must be non-negative")
     temperature = (
         args.temperature
         if args.temperature is not None
@@ -462,15 +1494,26 @@ def main() -> int:
         else bool(profile_defaults["enable_thinking"])
     )
     reasoning_effort = args.reasoning_effort or profile_defaults["reasoning_effort"]
-    run_label = args.run_label or args.manifest.stem
-    if not run_label or any(
-        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
-        for character in run_label
+    base_run_label = resolve_run_label(args)
+    if not base_run_label or any(
+        character
+        not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+        for character in base_run_label
     ):
         parser.error("--run-label may contain only letters, digits, '-' and '_'")
-    if args.verified_sidecar and args.trust_sidecar:
-        parser.error("--verified-sidecar and --trust-sidecar are mutually exclusive")
+    run_label = base_run_label
     validate_mtp_flags(parser, args)
+    evidence_reservations = reserve_json_evidence_targets(
+        args.output_json, args.route_trace_json
+    )
+    _active_evidence_reservations = evidence_reservations
+    validated_manifest = (
+        load_expert_manifest(args.manifest, verify_digest=True)
+        if args.trust_sidecar or args.verified_sidecar
+        else None
+    )
+    if validated_manifest is not None:
+        validate_sidecar_flags(parser, args, validated_manifest)
     config = ExpertStreamingConfig(
         model_key=args.model_key,
         memory_limit_bytes=parse_memory_bytes(args.memory_limit),
@@ -487,24 +1530,50 @@ def main() -> int:
         max_read_chunk_bytes=parse_memory_bytes(args.read_chunk),
         bypass_page_cache=args.f_nocache,
         slot_layout=args.slot_layout,
-        verify_record_hashes=not (
-            args.trust_sidecar or args.slot_layout == "metal-mmap"
-        ),
+        verify_record_hashes=should_verify_source_records(args, validated_manifest),
         verify_sidecar_hash_at_open=args.verified_sidecar,
         trace_routes=args.route_trace_json is not None,
     )
-    runtime = load(
+    verification_receipt_dir = args.verification_receipt_dir.expanduser().resolve()
+    model_artifact_identity = build_model_artifact_identity(
         root,
-        mtp=args.enable_mtp,
-        expert_streaming_config=config,
-        expert_manifest=args.manifest,
-        mtp_artifacts=(
-            args.mtp_artifacts.expanduser().resolve()
-            if args.mtp_artifacts is not None
-            else None
-        ),
-        mtp_precision=(args.mtp_precision or "bf16"),
+        args.manifest,
+        require_nocache=True,
+        receipt_dir=verification_receipt_dir,
+        report_timing=True,
     )
+    model_artifact_identity["harness_source"] = build_harness_source_identity()
+    mtp_artifact_identity = (
+        build_mtp_artifact_identity(
+            args.mtp_artifacts,
+            precision=(args.mtp_precision or "bf16"),
+            require_nocache=True,
+            receipt_dir=verification_receipt_dir,
+            report_timing=True,
+        )
+        if args.enable_mtp and args.mtp_artifacts is not None
+        else None
+    )
+    verification_settle_applied = settle_after_artifact_verification(
+        (model_artifact_identity, mtp_artifact_identity),
+        args.verification_settle_seconds,
+    )
+    try:
+        runtime = load(
+            root,
+            mtp=args.enable_mtp,
+            expert_streaming_config=config,
+            expert_manifest=args.manifest,
+            mtp_artifacts=(
+                args.mtp_artifacts.expanduser().resolve()
+                if args.mtp_artifacts is not None
+                else None
+            ),
+            mtp_precision=(args.mtp_precision or "bf16"),
+        )
+    except BaseException:
+        evidence_reservations.cleanup()
+        raise
     rows = []
     try:
         from mtplx.generation import generate_ar, generate_mtp1
@@ -514,6 +1583,12 @@ def main() -> int:
             args.prompt_file.expanduser().read_text(encoding="utf-8")
             if args.prompt_file is not None
             else args.prompt
+        )
+        default_prompt = "Explain why the sky is blue in one paragraph."
+        effective_prompt_text = (
+            prompt_text
+            if args.context_tokens is not None
+            else (prompt_text or default_prompt)
         )
         prompt_metadata = None
         if args.context_tokens is not None:
@@ -538,21 +1613,68 @@ def main() -> int:
                     {"role": "system", "content": args.system_prompt},
                     {
                         "role": "user",
-                        "content": prompt_text
-                        or "Explain why the sky is blue in one paragraph.",
+                        "content": effective_prompt_text,
                     },
                 ],
                 enable_thinking=enable_thinking,
                 reasoning_effort=reasoning_effort,
             )
         else:
-            prompt_ids = runtime.tokenizer.encode(
-                prompt_text or "Explain why the sky is blue in one paragraph."
-            )
+            prompt_ids = runtime.tokenizer.encode(effective_prompt_text)
         sampler = SamplerConfig(
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
+        )
+        performance_settings = build_stable_performance_settings(
+            runtime_config=config.to_dict(),
+            sampler={
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+            },
+            seed=args.seed,
+            prompt_identity=build_prompt_identity(effective_prompt_text, prompt_ids),
+            prompt_options={
+                "chat": args.chat,
+                "system_prompt": args.system_prompt,
+                "prompt_style": args.prompt_style,
+                "enable_thinking": enable_thinking,
+                "reasoning_effort": reasoning_effort,
+                "prompt_metadata": prompt_metadata,
+            },
+            generation={
+                "generation_profile": args.generation_profile,
+                "max_tokens": max_tokens,
+                "context_tokens": args.context_tokens,
+                "window_tokens": args.window_tokens,
+                "window_telemetry": args.window_telemetry,
+                "repeats": args.repeats,
+                "reset_between": args.reset_between,
+            },
+            scheduler={
+                "requested_concurrency": args.concurrency,
+                "max_prefills_per_step": args.max_prefills_per_step,
+            },
+            mtp={
+                "enabled": args.enable_mtp,
+                "precision": args.mtp_precision or "bf16",
+                "artifact_identity": stable_artifact_content_identity(
+                    mtp_artifact_identity
+                ),
+            },
+            model_artifact=stable_artifact_content_identity(model_artifact_identity),
+        )
+        configuration_summary = build_configuration_summary(
+            base_run_label,
+            cache_scope=args.cache_scope,
+            slot_layout=args.slot_layout,
+            concurrency=args.concurrency,
+            performance_settings=performance_settings,
+        )
+        configuration_label = str(configuration_summary["configuration_label"])
+        configuration_fingerprint = str(
+            configuration_summary["configuration_fingerprint"]
         )
         if args.concurrency > 1:
             rows.extend(
@@ -563,6 +1685,8 @@ def main() -> int:
                     sampler=sampler,
                     max_tokens=max_tokens,
                     run_label=run_label,
+                    configuration_label=configuration_label,
+                    configuration_fingerprint=configuration_fingerprint,
                 )
             )
         # The single-stream reference lane runs only at concurrency 1.
@@ -630,9 +1754,7 @@ def main() -> int:
             rolling_decode = []
             for left, right in zip(decode_points, decode_points[1:], strict=False):
                 window_elapsed = right["time"] - left["time"]
-                window_tokens = (
-                    right["completion_tokens"] - left["completion_tokens"]
-                )
+                window_tokens = right["completion_tokens"] - left["completion_tokens"]
                 rolling_decode.append(
                     {
                         "from_completion_token": left["completion_tokens"],
@@ -650,17 +1772,29 @@ def main() -> int:
                 )
             response_path = None
             if args.output_dir is not None:
-                output_dir = args.output_dir.expanduser().resolve()
-                output_dir.mkdir(parents=True, exist_ok=True)
-                response_path = output_dir / (
-                    f"{args.model_key}-{run_label}-repeat-{repeat}.md"
+                response_path = write_response_file(
+                    args.output_dir,
+                    result.text + "\n",
+                    model_key=args.model_key,
+                    run_label=run_label,
+                    repeat=repeat,
+                    configuration_fingerprint=configuration_fingerprint,
                 )
-                response_path.write_text(result.text + "\n", encoding="utf-8")
             rows.append(
                 {
                     "repeat": repeat,
                     "elapsed_seconds": elapsed,
                     "prompt_tokens": len(prompt_ids),
+                    "run_label": run_label,
+                    "configuration_label": configuration_label,
+                    "concurrency": args.concurrency,
+                    "requested_concurrency": args.concurrency,
+                    "achieved_peak_concurrency": 1,
+                    "saturation_valid": args.concurrency == 1,
+                    "undersubscribed": args.concurrency > 1,
+                    "evidence_label": f"{configuration_label}-achieved-B1",
+                    "cache_scope": args.cache_scope,
+                    "slot_layout": args.slot_layout,
                     "completion_tokens": len(token_ids),
                     "completion_tokens_per_second": len(token_ids) / elapsed,
                     "token_ids": token_ids,
@@ -675,9 +1809,17 @@ def main() -> int:
                     "generation_stats": result.stats.to_dict(),
                 }
             )
+    except BaseException:
+        evidence_reservations.cleanup()
+        raise
     finally:
         runtime.close(timeout=10.0)
 
+    evidence_summary = build_evidence_summary(
+        rows,
+        configuration_label=configuration_label,
+        requested_concurrency=args.concurrency,
+    )
     payload = {
         "schema": "mtplx-streamed-generation-benchmark-v1",
         "git_commit": _git_commit(),
@@ -700,7 +1842,24 @@ def main() -> int:
         },
         "generation_profile": args.generation_profile,
         "run_label": run_label,
+        "configuration_label": configuration_label,
+        "cache_scope": args.cache_scope,
+        "slot_layout": args.slot_layout,
         "concurrency": args.concurrency,
+        "requested_concurrency": args.concurrency,
+        "achieved_peak_concurrency": evidence_summary["achieved_peak_concurrency"],
+        "saturation_valid": evidence_summary["saturation_valid"],
+        "undersubscribed": evidence_summary["undersubscribed"],
+        "configuration_summary": configuration_summary,
+        "artifact_verification": {
+            "model": model_artifact_identity,
+            "mtp": mtp_artifact_identity,
+            "receipt_dir": str(verification_receipt_dir),
+            "settle_seconds": args.verification_settle_seconds,
+            "settle_applied": verification_settle_applied,
+            "timing_scope": "outside_timed_generation",
+        },
+        "evidence_summary": evidence_summary,
         "max_prefills_per_step": args.max_prefills_per_step,
         "generation": {
             "max_tokens": max_tokens,
@@ -729,23 +1888,40 @@ def main() -> int:
         route_trace_json = args.route_trace_json.expanduser().resolve()
         route_trace_json.parent.mkdir(parents=True, exist_ok=True)
         route_trace_payload = {
-            "schema": "mtplx-expert-route-trace-v1",
+            "schema": "mtplx-expert-route-trace-v2",
             "model_key": args.model_key,
             "manifest_sha256": runtime.expert_streaming.manifest.manifest_sha256,
+            "reset_behavior": (
+                "trace_epoch increments and decode_step restarts at zero after reset"
+            ),
+            "repeats": args.repeats,
+            "reset_between": args.reset_between,
+            "transient_slots": runtime.expert_streaming.plan.transient_slots,
             "entries": runtime.expert_streaming.route_trace(),
         }
-        route_trace_json.write_text(
+        evidence_reservations.commit(
+            route_trace_json,
             json.dumps(route_trace_payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
         )
         payload["route_trace_json"] = str(route_trace_json)
     rendered = json.dumps(payload, indent=2, sort_keys=True)
     if args.output_json is not None:
         output_json = args.output_json.expanduser().resolve()
-        output_json.parent.mkdir(parents=True, exist_ok=True)
-        output_json.write_text(rendered + "\n", encoding="utf-8")
+        evidence_reservations.commit(output_json, rendered + "\n")
     print(rendered)
     return 0
+
+
+def main() -> int:
+    """Run the CLI with explicit cleanup spanning every post-reservation phase."""
+
+    global _active_evidence_reservations
+    try:
+        return _main()
+    finally:
+        if _active_evidence_reservations is not None:
+            _active_evidence_reservations.cleanup()
+            _active_evidence_reservations = None
 
 
 if __name__ == "__main__":
