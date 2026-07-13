@@ -9,10 +9,23 @@
   "decision": {
     "candidate": "global component-bank cache",
     "fixed_percentage_gate": "retired as arbitrary and unsupported by a noise model",
-    "rule": "Require identical output, positive paired direction, repeatability small relative to the observed effect, and no material correctness or concurrency regression; collect more pairs when those checks disagree.",
-    "current_repeated_b1_mean_gain_percent": 4.199829813108202,
-    "status": "retain",
-    "reason": "Both current pairs and both historical same-commit cache-scope pairs are positive, current run spread is small relative to the effect, and deterministic output is identical."
+    "rule": {
+      "hard_gates": "Identical token hashes, requested concurrency, passing tests, and preserved documented behavior.",
+      "minimum_pairs": 4,
+      "order": "Equal base-first and candidate-first pairs.",
+      "positive": "Retain as directionally positive only when every valid paired TPS delta is positive.",
+      "negative": "Reject as directionally negative only when every valid paired TPS delta is negative.",
+      "mixed": "Mark the batch inconclusive when paired deltas have mixed signs; more pairs may characterize uncertainty but cannot make the cumulative batch unanimous.",
+      "magnitude": "Report the median and full paired range; no universal minimum effect-size gate."
+    },
+    "status": "retain_directionally_positive",
+    "magnitude_status": "uncertain",
+    "current_median_paired_gain_percent": 4.199990293774225,
+    "current_paired_gain_range_percent": [
+      1.0842457199193856,
+      5.035338950194146
+    ],
+    "reason": "All four balanced-order current pairs and both historical same-commit cache-scope pairs are positive, while the wide current range prevents a precise magnitude claim."
   },
   "environment": {
     "machine": "MacBook Pro Mac17,6",
@@ -20,7 +33,7 @@
     "memory_bytes": 137438953472,
     "os": "macOS 26.5.2 arm64",
     "python": "3.12.13",
-    "mlx": "0.31",
+    "mlx": "0.31.2",
     "qwen_restored_model": "mtplx-qwen36-27b-optimized-speed"
   },
   "common_configuration": {
@@ -45,9 +58,16 @@
   },
   "current_remeasurement": {
     "headline_telemetry_enabled": false,
+    "measured_python_source_commit": "bf34a0ad917495db386edb90e27fd1de42da8929",
+    "docs_only_descendant_commit": "a387fcec3f6fd6565eaac3830a57233b9f7b15bc",
+    "candidate_harness_source_sha256": "ca1b011662dc6fa8c7745051ddf1fd571a3e67f76355fe5f12e6dfd0ab351005",
     "natural_completion_tokens": 1905,
     "token_ids_sha256": "484e182a68604821f69d56d0b15488d26723e6123f6a57f8158f8b20a4c6ed1c",
     "pair_order": [
+      "base",
+      "candidate",
+      "candidate",
+      "base",
       "base",
       "candidate",
       "candidate",
@@ -73,14 +93,44 @@
         "candidate_elapsed_seconds": 295.8179062920026,
         "base_run": "issue29-headline-base-layer-B1-p02-20260713T133955Z-e7669d43a803",
         "candidate_run": "issue29-headline-opt-global-B1-p02-20260713T133452Z-bf34a0ad9174"
+      },
+      {
+        "pair": 3,
+        "base_tokens_per_second": 6.1691624849504505,
+        "candidate_tokens_per_second": 6.2360513651483975,
+        "gain_percent": 1.0842457199193856,
+        "base_elapsed_seconds": 308.793941584001,
+        "candidate_elapsed_seconds": 305.48176858300576,
+        "base_run": "issue29-headline-base-layer-B1-p03-20260713T135008Z-e7669d43a803",
+        "candidate_run": "issue29-headline-opt-global-B1-p03-20260713T135523Z-a387fcec3f6f"
+      },
+      {
+        "pair": 4,
+        "base_tokens_per_second": 5.919963698196334,
+        "candidate_tokens_per_second": 6.2180539361289675,
+        "gain_percent": 5.035338950194146,
+        "base_elapsed_seconds": 321.79251379200286,
+        "candidate_elapsed_seconds": 306.36594979199435,
+        "base_run": "issue29-headline-base-layer-B1-p04-20260713T140755Z-e7669d43a803",
+        "candidate_run": "issue29-headline-opt-global-B1-p04-20260713T140240Z-a387fcec3f6f"
       }
     ],
     "mean": {
-      "base_tokens_per_second": 6.168735861902512,
-      "candidate_tokens_per_second": 6.42781226972259,
-      "gain_percent": 4.199829813108202,
-      "base_run_spread_percent": 0.49750715782452826,
-      "candidate_run_spread_percent": 0.37283183659244656
+      "base_tokens_per_second": 6.106649476737952,
+      "candidate_tokens_per_second": 6.327432460180637,
+      "ratio_of_means_gain_percent": 3.6154520459003248,
+      "mean_paired_gain_percent": 3.629891314415495
+    },
+    "paired_gain": {
+      "median_percent": 4.199990293774225,
+      "minimum_percent": 1.0842457199193856,
+      "maximum_percent": 5.035338950194146,
+      "all_positive": true
+    },
+    "arm_variability": {
+      "base_max_min_range_percent": 4.46082192392161,
+      "candidate_max_min_range_percent": 3.5657217753342296,
+      "magnitude_interpretation": "uncertain; report the full paired range"
     }
   },
   "resource_diagnostic": {

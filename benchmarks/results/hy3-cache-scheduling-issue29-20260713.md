@@ -1,24 +1,33 @@
 # Hy3 cache scheduling experiment (#29)
 
-The current immediate-predecessor comparison measures default `e7669d43a8033e4c0cf4d4aea93563967481be75` against #29 head `bf34a0ad917495db386edb90e27fd1de42da8929` on an Apple M5 Max with 128 GB unified memory. Earlier same-commit cache-scope measurements at `aef62bc0e4ff0c716933dd16a2acd0154f112a93` remain useful isolation evidence. A conservative serialized control at `058b40b28de97ddce23184e2c62ed1f41cb6ba2d` was rejected because its resource-wide exclusion premise was not established. All comparable headline runs use the same Hy3 Q4 artifact, deterministic AR generation, component-bank layout, LRU policy, 7,821 persistent slots, 32 transient slots, and an exact 83,034,243,072-byte expert-cache ceiling.
+The current immediate-predecessor comparison measures default `e7669d43a8033e4c0cf4d4aea93563967481be75` against #29's measured Python source at `bf34a0ad917495db386edb90e27fd1de42da8929` on an Apple M5 Max with 128 GB unified memory. Pairs 3-4 use docs-only descendant `a387fcec3f6fd6565eaac3830a57233b9f7b15bc`, whose harness source hash is identical. Earlier same-commit cache-scope measurements at `aef62bc0e4ff0c716933dd16a2acd0154f112a93` remain useful isolation evidence. A conservative serialized control at `058b40b28de97ddce23184e2c62ed1f41cb6ba2d` was rejected because its resource-wide exclusion premise was not established. All comparable headline runs use the same Hy3 Q4 artifact, deterministic AR generation, component-bank layout, LRU policy, 7,821 persistent slots, 32 transient slots, and an exact 83,034,243,072-byte expert-cache ceiling.
 
 ## Decision
 
-**Retain #29.** The fixed 5% promotion gate is retired: it had no empirical noise model or causal basis. The replacement rule requires identical output, positive paired direction, repeatability small relative to the observed effect, and no material correctness or concurrency regression. If those checks disagree, collect more pairs rather than deciding from a fixed percentage.
+**Retain #29 as directionally positive; its gain magnitude is uncertain.** The fixed 5% promotion gate is retired because it had no empirical noise model or causal basis. The replacement rule is deterministic:
 
-The current telemetry-off pairs are +4.265% and +4.135%, with a +4.200% mean. Base run spread is 0.498% and #29 spread is 0.373%, while all four runs stop at 1,905 tokens with the same SHA-256 `484e182a68604821f69d56d0b15488d26723e6123f6a57f8158f8b20a4c6ed1c`. The earlier same-commit cache-scope pairs were also positive (+5.043% and +4.674%). This is repeatable positive evidence, not a universal throughput guarantee.
+1. Token hashes, requested concurrency, tests, and documented behavior are hard gates; any regression blocks retention.
+2. Measure at least four telemetry-off pairs with equal base-first and candidate-first order.
+3. If every paired TPS delta is positive, retain as directionally positive. If every delta is negative, reject. Mixed signs are inconclusive for that batch; more pairs may characterize uncertainty but cannot make the cumulative batch unanimous.
+4. Report the median and full paired range; do not substitute a universal minimum effect size or promote a single mean as the gain.
 
-The bounded transaction-journal refactor remains useful independently. It removes an accidental O(cache capacity) Python snapshot from every global route while preserving exact rollback behavior. The global allocation also cuts physical expert reads; the end-to-end effect is modest but repeatable under the matched protocol.
+The four current gains are +4.265%, +4.135%, +1.084%, and +5.035% (median +4.200%, full range +1.084% to +5.035%). All eight runs stop at 1,905 tokens with the same SHA-256 `484e182a68604821f69d56d0b15488d26723e6123f6a57f8158f8b20a4c6ed1c`. The earlier same-commit cache-scope pairs were also positive (+5.043% and +4.674%). This supports direction, while the wide current range prevents a precise magnitude claim.
+
+The bounded transaction-journal refactor remains useful independently. It removes an accidental O(cache capacity) Python snapshot from every global route while preserving exact rollback behavior. The global allocation also cuts uncached reader bytes and logical reader operations; the realized wall-time gain varies with the rest of the system.
 
 ## Current immediate-predecessor headline
 
-Resource telemetry, rolling slot snapshots, and Qwen were disabled during the timed lanes. The pair order was base/global/global/base to expose drift.
+Resource telemetry, rolling slot snapshots, and Qwen were disabled during the timed lanes. Pair order was balanced: base-first for pairs 1 and 3, candidate-first for pairs 2 and 4.
 
 | Pair | Default layer tok/s | #29 global tok/s | Gain | Default elapsed | #29 elapsed |
 |---|---:|---:|---:|---:|---:|
 | 1 | 6.1534 | 6.4159 | +4.265% | 309.583 s | 296.921 s |
 | 2, reverse order | 6.1840 | 6.4398 | +4.135% | 308.051 s | 295.818 s |
-| Mean | **6.1687** | **6.4278** | **+4.200%** | - | - |
+| 3 | 6.1692 | 6.2361 | +1.084% | 308.794 s | 305.482 s |
+| 4, reverse order | 5.9200 | 6.2181 | +5.035% | 321.793 s | 306.366 s |
+| Arm mean | **6.1066** | **6.3274** | +3.615% ratio of means | - | - |
+
+The late base slowdown and candidate shift make the arm-wide ranges large (4.461% base, 3.566% candidate). Balanced pairing keeps every directional comparison positive, but the full paired range is the honest magnitude statement.
 
 ## New resource diagnostic
 
@@ -26,7 +35,7 @@ A separate 256-token diagnostic at `bf34a0a` used the same #29 global-cache conf
 
 | Signal | Measurement | Interpretation boundary |
 |---|---:|---|
-| Uncached reader throughput | 6.065 GiB/s (48.64% of supplied ceiling) | Device ceiling was not reached |
+| Uncached reader throughput | 6.065 GiB/s (48.64% of supplied ceiling) | Mean reader throughput was below the supplied ceiling; instantaneous saturation was not measured |
 | Mean active readers | 3.732 / 32 (11.66%) | Reader pool had substantial unused capacity |
 | Mean queued reads | 0.377 | Queue was shallow |
 | Queue-nonempty intervals | 99.52% | Work was usually present despite shallow depth |
@@ -71,7 +80,7 @@ Pair 1 cache economics:
 | Expert bytes read | 1,768,689,893,376 | 1,630,883,414,016 | -7.79% |
 | Persistent loads | 160,979 | 147,999 | -8.06% |
 | Evictions | 153,158 | 140,178 | -8.47% |
-| Physical read operations | 165,678 | 152,698 | -7.83% |
+| Logical reader operations | 165,678 | 152,698 | -7.83% |
 | Decode hit rate | 87.272% | 88.351% | +1.079 pp |
 | Peak MLX memory | 89,145,312,888 B | 89,145,312,888 B | unchanged |
 
@@ -144,11 +153,11 @@ uv run --frozen --extra dev --extra server python \
   --output-json "$OUT/result.json"
 ```
 
-For mixed traffic, change `--workload-shape static` to `--workload-shape mixed-join --join-after-step 2`. The paired long runs were launched in alternating order. The complete local payloads are retained under `benchmarks/raw/moe-runtime/` with the run labels recorded in the adjacent JSON summary.
+For mixed traffic, change `--workload-shape static` to `--workload-shape mixed-join --join-after-step 2`. Default `e7669d4` predates that flag; omit `--workload-shape static` for the baseline, whose implicit workload is static. The paired long runs were launched in balanced alternating order. The complete local payloads are retained under `benchmarks/raw/moe-runtime/` with the run labels recorded in the adjacent JSON summary.
 
 ## Verification and limits
 
-- Full `pytest -q` reached 100% at current head `bf34a0a`; only pre-existing skips and deprecation warnings remained.
+- Full `pytest -q` reached 100% at measured code commit `bf34a0a`; only pre-existing skips and deprecation warnings remained.
 - Two independent post-fix reviews passed. They specifically verified that telemetry-disabled static, mixed-join, AR-reference, and MTP-reference timed regions retain their predecessor operations.
 - Ruff passed on every changed Python file.
 - Qwen was stopped only for the exclusive MLX window, then restored with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tea.qwen.plist`. `launchctl print gui/$(id -u)/com.tea.qwen` reported the service running and `/v1/models` returned `mtplx-qwen36-27b-optimized-speed`.
