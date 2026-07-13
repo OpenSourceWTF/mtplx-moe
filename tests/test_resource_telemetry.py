@@ -12,6 +12,7 @@ from mtplx.benchmarks.resource_telemetry import (
     parse_powermetrics_documents,
     summarize_intervals,
 )
+from mtplx.resource_metrics import ExpertPipelineLedger
 
 
 def _synthetic_intervals(
@@ -61,7 +62,7 @@ def _synthetic_intervals(
 
 
 _PRIMARY_STATES = (
-    "generation_thread_expert_input_wait",
+    "potentially_blocking_next_miss_step",
     "logical_range_active",
     "reader_completion_active",
     "submitted_queued",
@@ -69,6 +70,15 @@ _PRIMARY_STATES = (
     "host_runnable_work",
     "route_publication_pending",
     "no_known_useful_work",
+)
+_HISTOGRAM_BOUNDS_NS = (
+    1_000,
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
 )
 
 
@@ -86,8 +96,8 @@ def _pipeline_snapshot(
     attribution: str = "measured",
 ) -> dict[str, object]:
     histogram = {
-        "bounds_ns": (10, 20, 30),
-        "bucket_counts": (0, 0, 0, 0),
+        "bounds_ns": _HISTOGRAM_BOUNDS_NS,
+        "bucket_counts": (0,) * (len(_HISTOGRAM_BOUNDS_NS) + 1),
         "sample_count": 0,
         "overflow_count": 0,
     }
@@ -102,6 +112,7 @@ def _pipeline_snapshot(
         },
         "expert_pipeline": {
             "schema": "mtplx-expert-pipeline-attribution-v1",
+            "coverage": {"attribution": "measured"},
             "by_phase": {
                 "decode": {
                     "observation_ns": observation_ns,
@@ -136,19 +147,23 @@ def _pipeline_snapshot(
 def _pipeline_row(
     *,
     seconds: int,
-    wait_seconds: int = 0,
+    next_miss_step_seconds: int = 0,
     integrals_ns: dict[str, int] | None = None,
 ) -> dict[str, object]:
     span_ns = seconds * 1_000_000_000
     after = _pipeline_snapshot(
         observation_ns=span_ns,
         integrals_ns={
-            "generation_expert_input_wait_ns": wait_seconds * 1_000_000_000,
+            "potentially_blocking_next_miss_ns": (
+                next_miss_step_seconds * 1_000_000_000
+            ),
             **dict(integrals_ns or {}),
         },
         primary_integrals_ns={
-            "generation_thread_expert_input_wait": wait_seconds * 1_000_000_000,
-            "no_known_useful_work": (seconds - wait_seconds) * 1_000_000_000,
+            "potentially_blocking_next_miss_step": (
+                next_miss_step_seconds * 1_000_000_000
+            ),
+            "no_known_useful_work": (seconds - next_miss_step_seconds) * 1_000_000_000,
         },
     )
     return {
@@ -160,8 +175,8 @@ def _pipeline_row(
 def test_pipeline_summary_weights_duration_not_sample_count() -> None:
     report = summarize_intervals(
         [
-            _pipeline_row(seconds=1, wait_seconds=1),
-            _pipeline_row(seconds=9, wait_seconds=0),
+            _pipeline_row(seconds=1, next_miss_step_seconds=1),
+            _pipeline_row(seconds=9, next_miss_step_seconds=0),
         ],
         ssd_ceiling_gib_s=12.47,
         powermetrics=None,
@@ -171,13 +186,14 @@ def test_pipeline_summary_weights_duration_not_sample_count() -> None:
     assert pipeline["schema"] == "mtplx-expert-pipeline-summary-v1"
     assert pipeline["source_schema"] == "mtplx-expert-pipeline-attribution-v1"
     assert pipeline["decode_observation_ns"] == 10_000_000_000
-    assert pipeline["generation_expert_input_wait_fraction"] == 0.1
+    assert pipeline["potentially_blocking_next_miss_fraction"] == 0.1
+    assert "generation_expert_input_wait_fraction" not in pipeline
     assert (
-        pipeline["primary_state_ns"]["generation_thread_expert_input_wait"]
+        pipeline["primary_state_ns"]["potentially_blocking_next_miss_step"]
         == 1_000_000_000
     )
     assert pipeline["primary_state_fraction"] == {
-        "generation_thread_expert_input_wait": 0.1,
+        "potentially_blocking_next_miss_step": 0.1,
         "logical_range_active": 0.0,
         "reader_completion_active": 0.0,
         "submitted_queued": 0.0,
@@ -188,18 +204,18 @@ def test_pipeline_summary_weights_duration_not_sample_count() -> None:
     }
 
 
-def test_pipeline_summary_preserves_distinct_wait_overlap_durations() -> None:
+def test_pipeline_summary_preserves_distinct_next_miss_step_overlaps() -> None:
     report = summarize_intervals(
         [
             _pipeline_row(
                 seconds=10,
-                wait_seconds=5,
+                next_miss_step_seconds=5,
                 integrals_ns={
-                    "generation_wait_storage_active_ns": 1_000_000_000,
-                    "generation_wait_reader_task_active_ns": 2_000_000_000,
-                    "generation_wait_submitted_queued_ns": 3_000_000_000,
-                    "generation_wait_eligible_unsubmitted_ns": 4_000_000_000,
-                    "generation_wait_runnable_ns": 500_000_000,
+                    "next_miss_step_storage_active_ns": 1_000_000_000,
+                    "next_miss_step_reader_task_active_ns": 2_000_000_000,
+                    "next_miss_step_submitted_queued_ns": 3_000_000_000,
+                    "next_miss_step_eligible_unsubmitted_ns": 4_000_000_000,
+                    "next_miss_step_runnable_ns": 500_000_000,
                 },
             )
         ],
@@ -210,22 +226,22 @@ def test_pipeline_summary_preserves_distinct_wait_overlap_durations() -> None:
     overlap = report["expert_pipeline"]["orthogonal_overlap"]
     assert overlap["denominator"] == "decode_observation_ns"
     assert overlap["duration_ns"] == {
-        "generation_wait_storage_active": 1_000_000_000,
-        "generation_wait_reader_task_active": 2_000_000_000,
-        "generation_wait_submitted_queued": 3_000_000_000,
-        "generation_wait_eligible_unsubmitted": 4_000_000_000,
-        "generation_wait_runnable": 500_000_000,
+        "next_miss_step_storage_active": 1_000_000_000,
+        "next_miss_step_reader_task_active": 2_000_000_000,
+        "next_miss_step_submitted_queued": 3_000_000_000,
+        "next_miss_step_eligible_unsubmitted": 4_000_000_000,
+        "next_miss_step_runnable": 500_000_000,
     }
     assert overlap["fraction_of_decode_observation"] == {
-        "generation_wait_storage_active": 0.1,
-        "generation_wait_reader_task_active": 0.2,
-        "generation_wait_submitted_queued": 0.3,
-        "generation_wait_eligible_unsubmitted": 0.4,
-        "generation_wait_runnable": 0.05,
+        "next_miss_step_storage_active": 0.1,
+        "next_miss_step_reader_task_active": 0.2,
+        "next_miss_step_submitted_queued": 0.3,
+        "next_miss_step_eligible_unsubmitted": 0.4,
+        "next_miss_step_runnable": 0.05,
     }
     assert (
         report["expert_pipeline"]["decode_integrals_ns"][
-            "generation_wait_submitted_queued_ns"
+            "next_miss_step_submitted_queued_ns"
         ]
         == 3_000_000_000
     )
@@ -311,18 +327,23 @@ def test_pipeline_summary_marks_unobservable_device_and_admission_facts_unavaila
     assert report["coverage"]["eligible_unsubmitted_cause"] == "unattributed"
     assert report["coverage"]["admitted_read_ranges"] == "unavailable"
     assert report["coverage"]["scheduled_read_ranges"] == "unavailable"
+    assert report["coverage"]["generation_expert_input_wait"] == "unavailable"
+    assert (
+        report["coverage"]["potentially_blocking_next_miss_step"]
+        == "measured_upper_bound"
+    )
 
 
 def test_pipeline_histogram_deltas_report_percentile_bucket_upper_bounds() -> None:
     before_histogram = {
-        "bounds_ns": (10, 20, 30),
-        "bucket_counts": (2, 3, 4, 0),
+        "bounds_ns": _HISTOGRAM_BOUNDS_NS,
+        "bucket_counts": (2, 3, 4, 0, 0, 0, 0, 0),
         "sample_count": 9,
         "overflow_count": 0,
     }
     after_histogram = {
-        "bounds_ns": (10, 20, 30),
-        "bucket_counts": (12, 11, 5, 1),
+        "bounds_ns": _HISTOGRAM_BOUNDS_NS,
+        "bucket_counts": (12, 11, 5, 0, 0, 0, 0, 1),
         "sample_count": 29,
         "overflow_count": 1,
     }
@@ -347,14 +368,14 @@ def test_pipeline_histogram_deltas_report_percentile_bucket_upper_bounds() -> No
     for histogram in report["latency_histograms"].values():
         assert histogram["sample_count"] == 20
         assert histogram["overflow_count"] == 1
-        assert histogram["p50_upper_bound_ns"] == 10
-        assert histogram["p95_upper_bound_ns"] == 30
+        assert histogram["p50_upper_bound_ns"] == 1_000
+        assert histogram["p95_upper_bound_ns"] == 100_000
 
 
 def test_pipeline_histogram_overflow_censors_only_percentile_in_overflow() -> None:
     histogram = {
-        "bounds_ns": (10, 20, 30),
-        "bucket_counts": (10, 0, 0, 10),
+        "bounds_ns": _HISTOGRAM_BOUNDS_NS,
+        "bucket_counts": (10, 0, 0, 0, 0, 0, 0, 10),
         "sample_count": 20,
         "overflow_count": 10,
     }
@@ -376,7 +397,7 @@ def test_pipeline_histogram_overflow_censors_only_percentile_in_overflow() -> No
     assert report["coverage"]["attribution"] == "measured"
     for result in report["latency_histograms"].values():
         assert result["sample_count"] == 20
-        assert result["p50_upper_bound_ns"] == 10
+        assert result["p50_upper_bound_ns"] == 1_000
         assert result["p50_status"] == "bounded"
         assert result["p95_upper_bound_ns"] is None
         assert result["p95_status"] == "censored_overflow"
@@ -384,14 +405,14 @@ def test_pipeline_histogram_overflow_censors_only_percentile_in_overflow() -> No
 
 def test_pipeline_histogram_contract_change_marks_interval_incomplete() -> None:
     before_histogram = {
-        "bounds_ns": (10, 20),
-        "bucket_counts": (1, 0, 0),
+        "bounds_ns": _HISTOGRAM_BOUNDS_NS,
+        "bucket_counts": (1, 0, 0, 0, 0, 0, 0, 0),
         "sample_count": 1,
         "overflow_count": 0,
     }
     after_histogram = {
-        "bounds_ns": (10, 30),
-        "bucket_counts": (2, 0, 0),
+        "bounds_ns": (*_HISTOGRAM_BOUNDS_NS[:-1], 2_000_000_000),
+        "bucket_counts": (2, 0, 0, 0, 0, 0, 0, 0),
         "sample_count": 2,
         "overflow_count": 0,
     }
@@ -412,16 +433,78 @@ def test_pipeline_histogram_contract_change_marks_interval_incomplete() -> None:
     assert interval["coverage"]["attribution"] == "incomplete"
 
 
-def test_pipeline_histogram_rejects_matching_but_invalid_source_totals() -> None:
+def test_pipeline_histogram_rejects_stable_noncanonical_bounds() -> None:
     before_histogram = {
         "bounds_ns": (10, 20, 30),
         "bucket_counts": (1, 0, 0, 0),
-        "sample_count": 2,
+        "sample_count": 1,
         "overflow_count": 0,
     }
     after_histogram = {
         "bounds_ns": (10, 20, 30),
         "bucket_counts": (2, 0, 0, 0),
+        "sample_count": 2,
+        "overflow_count": 0,
+    }
+
+    interval = _pipeline_interval(
+        _pipeline_snapshot(
+            range_histogram=before_histogram,
+            record_histogram=before_histogram,
+        ),
+        _pipeline_snapshot(
+            observation_ns=1_000,
+            range_histogram=after_histogram,
+            record_histogram=after_histogram,
+        ),
+        1_000,
+    )
+
+    assert interval["coverage"]["attribution"] == "incomplete"
+    assert interval["coverage"]["decode_phase"] == "incomplete"
+
+
+def test_pipeline_histogram_rejects_negative_source_counts() -> None:
+    before_histogram = {
+        "bounds_ns": _HISTOGRAM_BOUNDS_NS,
+        "bucket_counts": (-1, 1, 0, 0, 0, 0, 0, 0),
+        "sample_count": 0,
+        "overflow_count": 0,
+    }
+    after_histogram = {
+        "bounds_ns": _HISTOGRAM_BOUNDS_NS,
+        "bucket_counts": (0, 1, 0, 0, 0, 0, 0, 0),
+        "sample_count": 1,
+        "overflow_count": 0,
+    }
+
+    interval = _pipeline_interval(
+        _pipeline_snapshot(
+            range_histogram=before_histogram,
+            record_histogram=before_histogram,
+        ),
+        _pipeline_snapshot(
+            observation_ns=1_000,
+            range_histogram=after_histogram,
+            record_histogram=after_histogram,
+        ),
+        1_000,
+    )
+
+    assert interval["coverage"]["attribution"] == "incomplete"
+    assert interval["coverage"]["decode_phase"] == "incomplete"
+
+
+def test_pipeline_histogram_rejects_matching_but_invalid_source_totals() -> None:
+    before_histogram = {
+        "bounds_ns": _HISTOGRAM_BOUNDS_NS,
+        "bucket_counts": (1, 0, 0, 0, 0, 0, 0, 0),
+        "sample_count": 2,
+        "overflow_count": 0,
+    }
+    after_histogram = {
+        "bounds_ns": _HISTOGRAM_BOUNDS_NS,
+        "bucket_counts": (2, 0, 0, 0, 0, 0, 0, 0),
         "sample_count": 3,
         "overflow_count": 0,
     }
@@ -458,6 +541,79 @@ def test_pipeline_source_phase_incomplete_propagates_to_summary() -> None:
     assert interval["coverage"]["attribution"] == "incomplete"
     assert report["coverage"]["attribution"] == "incomplete"
     assert report["coverage"]["decode_phase"] == "incomplete"
+
+
+def test_pipeline_global_incomplete_propagates_when_decode_phase_is_measured() -> None:
+    ledger = ExpertPipelineLedger(strict=False, clock_ns=lambda: 0)
+    route = ledger.begin_route(
+        layer=0,
+        phase="decode",
+        load_experts=(1,),
+        load_logical_bytes=(64,),
+    )
+    before = _pipeline_snapshot()
+    before["expert_pipeline"] = ledger.snapshot()
+
+    ledger.range_completed(999)
+    after = _pipeline_snapshot()
+    after["expert_pipeline"] = ledger.snapshot()
+
+    assert after["expert_pipeline"]["coverage"]["attribution"] == "incomplete"
+    assert (
+        after["expert_pipeline"]["by_phase"]["decode"]["coverage"]["attribution"]
+        == "measured"
+    )
+
+    interval = _pipeline_interval(before, after, 1_000)
+    report = summarize_intervals(
+        [{"interval_seconds": 1e-6, "expert_pipeline": interval}],
+        ssd_ceiling_gib_s=None,
+        powermetrics=None,
+    )["expert_pipeline"]
+
+    assert interval["coverage"]["attribution"] == "incomplete"
+    assert interval["coverage"]["decode_phase"] == "incomplete"
+    assert report["coverage"]["attribution"] == "incomplete"
+    assert report["coverage"]["decode_phase"] == "incomplete"
+    assert report["coverage"]["potentially_blocking_next_miss_step"] == "incomplete"
+    route.close()
+
+
+def test_pipeline_incomplete_source_does_not_claim_block_reasons_measured() -> None:
+    ledger = ExpertPipelineLedger(strict=False, clock_ns=lambda: 0)
+    route = ledger.begin_route(
+        layer=0,
+        phase="decode",
+        load_experts=(1,),
+        load_logical_bytes=(64,),
+    )
+    before = _pipeline_snapshot()
+    before["expert_pipeline"] = ledger.snapshot()
+
+    route.observe_block(1, "pin_held", elapsed_ns=10)
+    ledger.mark_incomplete(phase="decode")
+    after = _pipeline_snapshot()
+    after["expert_pipeline"] = ledger.snapshot()
+
+    interval = _pipeline_interval(before, after, 1_000)
+    report = summarize_intervals(
+        [{"interval_seconds": 1e-6, "expert_pipeline": interval}],
+        ssd_ceiling_gib_s=None,
+        powermetrics=None,
+    )["expert_pipeline"]
+
+    assert interval["block_coverage"]["pin_held"] == "incomplete"
+    assert report["block_reasons"]["pin_held"] == {
+        "status": "incomplete",
+        "count": 1,
+        "duration_ns": 10,
+    }
+    assert report["block_reasons"]["slot_loading"] == {
+        "status": "incomplete",
+        "count": 0,
+        "duration_ns": 0,
+    }
+    route.close()
 
 
 def test_pipeline_primary_integral_mismatch_marks_summary_incomplete() -> None:
@@ -574,6 +730,8 @@ def test_unavailable_pipeline_summary_preserves_full_coverage_contract() -> None
         "attribution": "unavailable",
         "decode_phase": "unavailable",
         "sampler_window_backend": "unavailable",
+        "potentially_blocking_next_miss_step": "unavailable",
+        "generation_expert_input_wait": "unavailable",
         "operation_credit": "unavailable",
         "byte_credit": "unavailable",
         "authoritative_reserve": "unavailable",
@@ -591,6 +749,8 @@ def test_unavailable_pipeline_summary_preserves_full_coverage_contract() -> None
         "speculative_record_accounting": "unavailable",
         "python_preadv_when_native_reader": "unavailable",
     }
+    assert report["potentially_blocking_next_miss_fraction"] is None
+    assert "generation_expert_input_wait_fraction" not in report
 
 
 def test_pipeline_counter_reset_marks_interval_incomplete_without_negative_delta() -> (
@@ -618,8 +778,11 @@ def test_pipeline_counter_reset_marks_interval_incomplete_without_negative_delta
         ssd_ceiling_gib_s=None,
         powermetrics=None,
     )["expert_pipeline"]
-    assert report["generation_expert_input_wait_fraction"] is None
+    assert report["potentially_blocking_next_miss_fraction"] is None
+    assert "generation_expert_input_wait_fraction" not in report
     assert report["coverage"]["attribution"] == "incomplete"
+    assert report["coverage"]["generation_expert_input_wait"] == "unavailable"
+    assert report["coverage"]["potentially_blocking_next_miss_step"] == "incomplete"
 
 
 def test_backed_up_readers_below_ssd_ceiling_are_not_called_storage_bound() -> None:

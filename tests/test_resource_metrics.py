@@ -98,14 +98,14 @@ def test_pipeline_ledger_integrates_record_lifecycle_and_overlap() -> None:
     route.reader_started((5,))
     hit_work.claim()
     hit_work.close()
-    route.begin_generation_wait()
+    route.begin_potentially_blocking_next_miss_step()
     range_token = ledger.range_started(logical_bytes=100, phase="decode")
     clock.advance(10)
     ledger.range_completed(range_token)
-    route.record_verified(5)
+    route.record_ready(5)
     route.reader_completed((5,), thread_cpu_ns=4)
     route.record_runnable(5)
-    route.end_generation_wait()
+    route.end_potentially_blocking_next_miss_step()
     clock.advance(5)
     route.claim_misses((5,))
     route.close()
@@ -118,19 +118,19 @@ def test_pipeline_ledger_integrates_record_lifecycle_and_overlap() -> None:
     assert snapshot["counters"]["submission_attempted_record_bytes"] == 100
     assert snapshot["counters"]["accepted_record_jobs"] == 1
     assert snapshot["counters"]["accepted_record_bytes"] == 100
-    assert snapshot["counters"]["verified_record_jobs"] == 1
+    assert snapshot["counters"]["ready_record_jobs"] == 1
     assert snapshot["counters"]["runnable_record_jobs"] == 1
     assert snapshot["counters"]["claimed_record_jobs"] == 1
     assert snapshot["counters"]["reader_thread_cpu_ns"] == 4
     assert snapshot["integrals_ns"]["eligible_unsubmitted_record_ns"] == 10
     assert snapshot["block_ns"]["pin_held"] == 5
-    assert snapshot["integrals_ns"]["generation_expert_input_wait_ns"] == 10
-    assert snapshot["integrals_ns"]["generation_wait_storage_active_ns"] == 10
-    assert snapshot["primary_integrals_ns"]["generation_thread_expert_input_wait"] == 10
+    assert snapshot["integrals_ns"]["potentially_blocking_next_miss_ns"] == 10
+    assert snapshot["integrals_ns"]["next_miss_step_storage_active_ns"] == 10
+    assert snapshot["primary_integrals_ns"]["potentially_blocking_next_miss_step"] == 10
     assert snapshot["primary_integrals_ns"]["host_runnable_work"] == 5
     assert (
         snapshot["by_phase"]["decode"]["integrals_ns"][
-            "generation_wait_storage_active_ns"
+            "next_miss_step_storage_active_ns"
         ]
         == 10
     )
@@ -177,6 +177,23 @@ def test_pipeline_ledger_preserves_block_reason_identity(selected: str) -> None:
     assert snapshot["coverage"]["eligible_unsubmitted_cause"] == "unattributed"
 
 
+def test_pipeline_hook_failure_marks_granular_coverage_incomplete() -> None:
+    ledger = ExpertPipelineLedger(strict=False)
+
+    ledger.mark_incomplete(phase="decode")
+
+    coverage = ledger.snapshot()["coverage"]
+    for name in (
+        "logical_record_lifecycle",
+        "reader_task_accounting",
+        "logical_range_accounting",
+        "host_runnable_work",
+        "potentially_blocking_next_miss_step",
+    ):
+        assert coverage[name] == "incomplete"
+    assert coverage["generation_expert_input_wait"] == "unavailable"
+
+
 def test_pipeline_route_close_abandons_all_nonterminal_records() -> None:
     ledger = ExpertPipelineLedger(strict=True, clock_ns=FakeClock())
     route = ledger.begin_route(
@@ -191,7 +208,7 @@ def test_pipeline_route_close_abandons_all_nonterminal_records() -> None:
     route.submission_attempted((4,))
     route.submission_accepted((4,))
     route.reader_started((4,))
-    route.record_verified(4)
+    route.record_ready(4)
     route.reader_completed((4,), thread_cpu_ns=0)
     route.record_runnable(4)
     route.satisfied_without_submit((5,))
@@ -254,7 +271,7 @@ def test_pipeline_latency_histograms_are_bounded_and_complete() -> None:
     span = ledger.range_started(logical_bytes=100, phase="decode")
     clock.advance(10**9 + 1)
     ledger.range_completed(span)
-    route.record_verified(5)
+    route.record_ready(5)
     route.reader_completed((5,), thread_cpu_ns=0)
     route.record_runnable(5)
     route.claim_misses((5,))
@@ -281,7 +298,7 @@ def test_pipeline_latency_histograms_are_bounded_and_complete() -> None:
     assert snapshot["coverage"]["attribution"] == "measured"
 
 
-def test_pipeline_verified_record_is_not_runnable_until_explicit_publish() -> None:
+def test_pipeline_ready_record_is_not_runnable_until_explicit_publish() -> None:
     clock = FakeClock()
     ledger = ExpertPipelineLedger(strict=True, clock_ns=clock)
     route = ledger.begin_route(
@@ -294,9 +311,9 @@ def test_pipeline_verified_record_is_not_runnable_until_explicit_publish() -> No
     route.submission_accepted((5,))
     route.reader_started((5,))
     clock.advance(4)
-    route.record_verified(5)
-    verified = ledger.snapshot()
-    assert verified["gauges"]["runnable_miss_records"] == 0
+    route.record_ready(5)
+    ready = ledger.snapshot()
+    assert ready["gauges"]["runnable_miss_records"] == 0
 
     clock.advance(3)
     route.reader_completed((5,), thread_cpu_ns=0)
@@ -329,7 +346,7 @@ def test_pipeline_ledger_rejects_duplicate_and_out_of_order_transitions() -> Non
         load_logical_bytes=(100,),
     )
     with pytest.raises(RuntimeError, match="eligible"):
-        route.record_verified(5)
+        route.record_ready(5)
     with pytest.raises(RuntimeError, match="unavailable"):
         route.observe_block(5, "operation_credit", elapsed_ns=1)
     with pytest.raises(RuntimeError, match="unknown active range"):
@@ -462,7 +479,7 @@ def test_pipeline_worker_may_start_before_submit_returns() -> None:
     route.submission_attempted((5,))
     route.reader_started((5,))
     route.submission_accepted((5,))
-    route.record_verified(5)
+    route.record_ready(5)
     route.reader_completed((5,), thread_cpu_ns=0)
     route.record_runnable(5)
     route.claim_misses((5,))
@@ -520,26 +537,26 @@ def test_pipeline_primary_projection_has_honest_reader_service_state() -> None:
     clock.advance(4)  # storage takes precedence over reader service
     ledger.range_completed(token)
     clock.advance(2)  # post-range hash/validation remains reader service
-    route.record_verified(5)
+    route.record_ready(5)
     route.reader_completed((5,), thread_cpu_ns=0)
     route.record_runnable(5)
     route.claim_misses((5,))
     route.close()
     clock.advance(6)
-    wait_route = ledger.begin_route(
+    next_miss_route = ledger.begin_route(
         layer=1,
         phase="decode",
         load_experts=(),
         load_logical_bytes=(),
     )
-    wait_route.begin_generation_wait()
+    next_miss_route.begin_potentially_blocking_next_miss_step()
     clock.advance(5)
-    wait_route.end_generation_wait()
-    wait_route.close()
+    next_miss_route.end_potentially_blocking_next_miss_step()
+    next_miss_route.close()
 
     primary = ledger.snapshot()["primary_integrals_ns"]
     assert primary == {
-        "generation_thread_expert_input_wait": 5,
+        "potentially_blocking_next_miss_step": 5,
         "logical_range_active": 4,
         "reader_completion_active": 5,
         "submitted_queued": 3,
@@ -624,7 +641,7 @@ def test_reader_failure_clears_records_tasks_bytes_and_keeps_cpu() -> None:
     route.submission_attempted((1, 2))
     route.submission_accepted((1, 2))
     route.reader_started((1, 2))
-    route.record_verified(1)
+    route.record_ready(1)
 
     route.reader_failed((1, 2), thread_cpu_ns=7)
     route.close()
@@ -648,7 +665,7 @@ def test_worker_may_complete_before_submission_acceptance_returns() -> None:
     )
     route.submission_attempted((5,))
     route.reader_started((5,))
-    route.record_verified(5)
+    route.record_ready(5)
     route.reader_completed((5,), thread_cpu_ns=3)
 
     route.submission_accepted((5,))
@@ -663,7 +680,9 @@ def test_worker_may_complete_before_submission_acceptance_returns() -> None:
     assert all(value == 0 for value in snapshot["gauges"].values())
 
 
-def test_generation_wait_with_runnable_work_is_raw_overlap_only() -> None:
+def test_potentially_blocking_next_miss_step_with_runnable_work_is_raw_overlap_only() -> (
+    None
+):
     clock = FakeClock()
     ledger = ExpertPipelineLedger(strict=True, clock_ns=clock)
     route = ledger.begin_route(
@@ -673,22 +692,20 @@ def test_generation_wait_with_runnable_work_is_raw_overlap_only() -> None:
         load_logical_bytes=(),
     )
     hit_work = ledger.begin_hit_work((2,))
-    route.begin_generation_wait()
+    route.begin_potentially_blocking_next_miss_step()
     clock.advance(3)
 
     snapshot = ledger.snapshot()
-    assert snapshot["primary_integrals_ns"]["generation_thread_expert_input_wait"] == 3
-    assert snapshot["integrals_ns"]["generation_wait_runnable_ns"] == 3
+    assert snapshot["primary_integrals_ns"]["potentially_blocking_next_miss_step"] == 3
+    assert snapshot["integrals_ns"]["next_miss_step_runnable_ns"] == 3
     assert snapshot["invariant_failures"] == 0
     assert snapshot["coverage"]["attribution"] == "measured"
-    route.end_generation_wait()
+    route.end_potentially_blocking_next_miss_step()
     hit_work.close()
     route.close()
 
 
-def test_mixed_eligible_and_submitted_prefers_submitted_and_tracks_wait_overlap() -> (
-    None
-):
+def test_mixed_eligible_and_submitted_tracks_next_miss_step_overlap() -> None:
     clock = FakeClock()
     ledger = ExpertPipelineLedger(strict=True, clock_ns=clock)
     route = ledger.begin_route(
@@ -700,21 +717,21 @@ def test_mixed_eligible_and_submitted_prefers_submitted_and_tracks_wait_overlap(
     route.submission_attempted((1,))
     route.submission_accepted((1,))
     clock.advance(2)
-    route.begin_generation_wait()
+    route.begin_potentially_blocking_next_miss_step()
     clock.advance(3)
 
     snapshot = ledger.snapshot()
     assert snapshot["primary_integrals_ns"]["submitted_queued"] == 2
     assert snapshot["primary_integrals_ns"]["eligible_unsubmitted"] == 0
-    assert snapshot["integrals_ns"]["generation_wait_submitted_queued_ns"] == 3
-    assert snapshot["integrals_ns"]["generation_wait_eligible_unsubmitted_ns"] == 3
+    assert snapshot["integrals_ns"]["next_miss_step_submitted_queued_ns"] == 3
+    assert snapshot["integrals_ns"]["next_miss_step_eligible_unsubmitted_ns"] == 3
     assert (
         snapshot["by_phase"]["decode"]["integrals_ns"][
-            "generation_wait_submitted_queued_ns"
+            "next_miss_step_submitted_queued_ns"
         ]
         == 3
     )
-    route.end_generation_wait()
+    route.end_potentially_blocking_next_miss_step()
     route.close()
 
 
@@ -728,7 +745,7 @@ def test_non_strict_violation_does_not_raise_or_mutate_valid_state() -> None:
     )
     before = ledger.snapshot()["gauges"]
 
-    route.record_verified(5)
+    route.record_ready(5)
     ledger.range_completed(999)
 
     snapshot = ledger.snapshot()

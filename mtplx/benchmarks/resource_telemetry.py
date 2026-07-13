@@ -28,7 +28,7 @@ _POOL_INTEGRALS = (
 _PIPELINE_SOURCE_SCHEMA = "mtplx-expert-pipeline-attribution-v1"
 _PIPELINE_SUMMARY_SCHEMA = "mtplx-expert-pipeline-summary-v1"
 _PIPELINE_PRIMARY_STATES = (
-    "generation_thread_expert_input_wait",
+    "potentially_blocking_next_miss_step",
     "logical_range_active",
     "reader_completion_active",
     "submitted_queued",
@@ -38,11 +38,11 @@ _PIPELINE_PRIMARY_STATES = (
     "no_known_useful_work",
 )
 _PIPELINE_OVERLAPS = {
-    "generation_wait_storage_active": "generation_wait_storage_active_ns",
-    "generation_wait_reader_task_active": ("generation_wait_reader_task_active_ns"),
-    "generation_wait_submitted_queued": ("generation_wait_submitted_queued_ns"),
-    "generation_wait_eligible_unsubmitted": ("generation_wait_eligible_unsubmitted_ns"),
-    "generation_wait_runnable": "generation_wait_runnable_ns",
+    "next_miss_step_storage_active": "next_miss_step_storage_active_ns",
+    "next_miss_step_reader_task_active": "next_miss_step_reader_task_active_ns",
+    "next_miss_step_submitted_queued": "next_miss_step_submitted_queued_ns",
+    "next_miss_step_eligible_unsubmitted": ("next_miss_step_eligible_unsubmitted_ns"),
+    "next_miss_step_runnable": "next_miss_step_runnable_ns",
 }
 _PIPELINE_BLOCK_REASONS = (
     "operation_credit",
@@ -63,7 +63,17 @@ _PIPELINE_HISTOGRAMS = (
     "logical_range_latency_ns",
     "complete_record_latency_ns",
 )
+_PIPELINE_HISTOGRAM_BOUNDS_NS = (
+    1_000,
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
+)
 _PIPELINE_COVERAGE_LIMITATIONS = {
+    "generation_expert_input_wait": "unavailable",
     "operation_credit": "unavailable",
     "byte_credit": "unavailable",
     "authoritative_reserve": "unavailable",
@@ -123,18 +133,41 @@ def _mapping_deltas(
     return result, reset
 
 
+def _valid_histogram_values(values: tuple[object, ...], expected: int) -> bool:
+    return len(values) == expected and all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in values
+    )
+
+
 def _histogram_delta(
     before: Mapping[str, Any],
     after: Mapping[str, Any],
 ) -> tuple[dict[str, Any], bool]:
-    before_bounds = tuple(_integer(value) for value in before.get("bounds_ns", ()))
-    after_bounds = tuple(_integer(value) for value in after.get("bounds_ns", ()))
-    before_counts = tuple(_integer(value) for value in before.get("bucket_counts", ()))
-    after_counts = tuple(_integer(value) for value in after.get("bucket_counts", ()))
+    before_bounds_raw = tuple(before.get("bounds_ns", ()))
+    after_bounds_raw = tuple(after.get("bounds_ns", ()))
+    before_counts_raw = tuple(before.get("bucket_counts", ()))
+    after_counts_raw = tuple(after.get("bucket_counts", ()))
+    after_bounds = tuple(_integer(value) for value in after_bounds_raw)
+    before_counts = tuple(_integer(value) for value in before_counts_raw)
+    after_counts = tuple(_integer(value) for value in after_counts_raw)
+    expected_counts = len(_PIPELINE_HISTOGRAM_BOUNDS_NS) + 1
     valid_shape = (
-        bool(after_bounds)
-        and before_bounds == after_bounds
-        and len(before_counts) == len(after_counts) == len(after_bounds) + 1
+        before_bounds_raw == after_bounds_raw == _PIPELINE_HISTOGRAM_BOUNDS_NS
+        and _valid_histogram_values(
+            before_bounds_raw, len(_PIPELINE_HISTOGRAM_BOUNDS_NS)
+        )
+        and _valid_histogram_values(
+            after_bounds_raw, len(_PIPELINE_HISTOGRAM_BOUNDS_NS)
+        )
+        and _valid_histogram_values(before_counts_raw, expected_counts)
+        and _valid_histogram_values(after_counts_raw, expected_counts)
+        and _valid_histogram_values(
+            (before.get("sample_count"), before.get("overflow_count")), 2
+        )
+        and _valid_histogram_values(
+            (after.get("sample_count"), after.get("overflow_count")), 2
+        )
     )
     if not valid_shape:
         return {
@@ -266,8 +299,14 @@ def _pipeline_interval(
         )
         backend_reset = backend_reset or changed
 
-    source_incomplete = (
-        _mapping(after_decode.get("coverage")).get("attribution") != "measured"
+    source_incomplete = any(
+        _mapping(snapshot.get("coverage")).get("attribution") != "measured"
+        for snapshot in (
+            before_pipeline,
+            after_pipeline,
+            before_decode,
+            after_decode,
+        )
     )
     decode_reset = any(
         (
@@ -720,13 +759,19 @@ def _merge_pipeline_histogram(
     incomplete = False
     for row in rows:
         histogram = _mapping(_mapping(row.get("histograms")).get(name))
-        current_bounds = tuple(
-            _integer(value) for value in histogram.get("bounds_ns", ())
-        )
-        current_counts = tuple(
-            _integer(value) for value in histogram.get("bucket_counts", ())
-        )
-        if not current_bounds or len(current_counts) != len(current_bounds) + 1:
+        current_bounds_raw = tuple(histogram.get("bounds_ns", ()))
+        current_counts_raw = tuple(histogram.get("bucket_counts", ()))
+        current_bounds = tuple(_integer(value) for value in current_bounds_raw)
+        current_counts = tuple(_integer(value) for value in current_counts_raw)
+        if (
+            current_bounds_raw != _PIPELINE_HISTOGRAM_BOUNDS_NS
+            or not _valid_histogram_values(
+                current_bounds_raw, len(_PIPELINE_HISTOGRAM_BOUNDS_NS)
+            )
+            or not _valid_histogram_values(
+                current_counts_raw, len(_PIPELINE_HISTOGRAM_BOUNDS_NS) + 1
+            )
+        ):
             incomplete = True
             continue
         if bounds is None:
@@ -795,11 +840,12 @@ def _unavailable_pipeline_summary() -> dict[str, Any]:
         "source_schema": "unavailable",
         "scope": "decode",
         "decode_observation_ns": 0,
-        "generation_expert_input_wait_fraction": None,
+        "potentially_blocking_next_miss_fraction": None,
         "coverage": {
             "attribution": "unavailable",
             "decode_phase": "unavailable",
             "sampler_window_backend": "unavailable",
+            "potentially_blocking_next_miss_step": "unavailable",
             **_PIPELINE_COVERAGE_LIMITATIONS,
         },
         "physical_device_queue_depth": {"status": "unavailable"},
@@ -893,17 +939,20 @@ def _summarize_pipeline(rows: list[dict[str, Any]]) -> dict[str, Any]:
             str(_mapping(row.get("block_coverage")).get(reason) or "unavailable")
             for row in pipeline_rows
         }
-        block_coverage[reason] = (
-            "measured" if statuses == {"measured"} else "unavailable"
-        )
+        if statuses == {"measured"}:
+            block_coverage[reason] = "measured"
+        elif "incomplete" in statuses:
+            block_coverage[reason] = "incomplete"
+        else:
+            block_coverage[reason] = "unavailable"
     block_reasons = {
         reason: (
             {
-                "status": "measured",
+                "status": block_coverage[reason],
                 "count": block_counts.get(reason, 0),
                 "duration_ns": block_ns.get(reason, 0),
             }
-            if block_coverage[reason] == "measured"
+            if block_coverage[reason] in {"measured", "incomplete"}
             else {"status": "unavailable"}
         )
         for reason in _PIPELINE_BLOCK_REASONS
@@ -930,8 +979,8 @@ def _summarize_pipeline(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "decode_counters": counters,
         "decode_integrals_ns": integrals_ns,
         "primary_state_ns": primary_state_ns,
-        "generation_expert_input_wait_fraction": (
-            integrals_ns.get("generation_expert_input_wait_ns", 0)
+        "potentially_blocking_next_miss_fraction": (
+            integrals_ns.get("potentially_blocking_next_miss_ns", 0)
             / decode_observation_ns
             if decode_observation_ns > 0
             else None
@@ -959,6 +1008,9 @@ def _summarize_pipeline(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "attribution": "incomplete" if incomplete else "measured",
             "decode_phase": "incomplete" if decode_incomplete else "measured",
             "sampler_window_backend": backend_coverage,
+            "potentially_blocking_next_miss_step": (
+                "incomplete" if decode_incomplete else "measured_upper_bound"
+            ),
             **_PIPELINE_COVERAGE_LIMITATIONS,
         },
     }

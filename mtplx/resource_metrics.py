@@ -188,8 +188,8 @@ _PIPELINE_COUNTER_NAMES = (
     "active_reader_record_bytes",
     "completed_reader_tasks",
     "failed_reader_tasks",
-    "verified_record_jobs",
-    "verified_record_bytes",
+    "ready_record_jobs",
+    "ready_record_bytes",
     "satisfied_without_submit_record_jobs",
     "satisfied_without_submit_record_bytes",
     "runnable_record_jobs",
@@ -204,7 +204,7 @@ _PIPELINE_COUNTER_NAMES = (
     "claimed_shared_work",
     "abandoned_hit_work",
     "abandoned_shared_work",
-    "generation_expert_input_wait_events",
+    "potentially_blocking_next_miss_events",
     "started_logical_ranges",
     "started_logical_range_bytes",
     "completed_logical_ranges",
@@ -222,8 +222,8 @@ _PIPELINE_GAUGE_NAMES = (
     "accepted_unstarted_record_bytes",
     "reader_active_records",
     "reader_active_record_bytes",
-    "verified_not_runnable_records",
-    "verified_not_runnable_record_bytes",
+    "ready_not_runnable_records",
+    "ready_not_runnable_record_bytes",
     "satisfied_not_runnable_records",
     "satisfied_not_runnable_record_bytes",
     "runnable_miss_records",
@@ -238,7 +238,7 @@ _PIPELINE_GAUGE_NAMES = (
     "open_shared_work_spans",
     "runnable_hit_work",
     "runnable_shared_work",
-    "generation_wait_active",
+    "potentially_blocking_next_miss_active",
     "active_logical_ranges",
     "active_logical_range_bytes",
 )
@@ -251,8 +251,8 @@ _PIPELINE_GAUGE_INTEGRALS = {
     "accepted_unstarted_record_bytes": "accepted_unstarted_record_byte_ns",
     "reader_active_records": "reader_active_record_ns",
     "reader_active_record_bytes": "reader_active_record_byte_ns",
-    "verified_not_runnable_records": "verified_not_runnable_record_ns",
-    "verified_not_runnable_record_bytes": "verified_not_runnable_record_byte_ns",
+    "ready_not_runnable_records": "ready_not_runnable_record_ns",
+    "ready_not_runnable_record_bytes": "ready_not_runnable_record_byte_ns",
     "satisfied_not_runnable_records": "satisfied_not_runnable_record_ns",
     "satisfied_not_runnable_record_bytes": "satisfied_not_runnable_record_byte_ns",
     "runnable_miss_records": "runnable_miss_unclaimed_record_ns",
@@ -265,12 +265,12 @@ _PIPELINE_GAUGE_INTEGRALS = {
     "active_reader_task_bytes": "active_reader_task_byte_ns",
     "runnable_hit_work": "runnable_hit_work_ns",
     "runnable_shared_work": "runnable_shared_work_ns",
-    "generation_wait_active": "generation_expert_input_wait_ns",
+    "potentially_blocking_next_miss_active": "potentially_blocking_next_miss_ns",
     "active_logical_ranges": "active_logical_range_ns",
     "active_logical_range_bytes": "active_logical_range_byte_ns",
 }
 _PIPELINE_PRIMARY_NAMES = (
-    "generation_thread_expert_input_wait",
+    "potentially_blocking_next_miss_step",
     "logical_range_active",
     "reader_completion_active",
     "submitted_queued",
@@ -434,7 +434,7 @@ class ExpertPipelineLedger:
         self._next_range_id = 1
         self._routes: dict[int, ExpertPipelineRoute] = {}
         self._active_ranges: dict[int, tuple[int, int, str]] = {}
-        self._generation_wait_route: int | None = None
+        self._next_miss_step_route: int | None = None
         self._invariant_failures = 0
         self._phase_invariant_failures = dict.fromkeys(_PIPELINE_PHASES, 0)
         self._explicitly_incomplete = False
@@ -442,11 +442,11 @@ class ExpertPipelineLedger:
         self._counters = _zeroes(_PIPELINE_COUNTER_NAMES)
         self._gauges = _zeroes(_PIPELINE_GAUGE_NAMES)
         integral_names = tuple(_PIPELINE_GAUGE_INTEGRALS.values()) + (
-            "generation_wait_storage_active_ns",
-            "generation_wait_reader_task_active_ns",
-            "generation_wait_submitted_queued_ns",
-            "generation_wait_eligible_unsubmitted_ns",
-            "generation_wait_runnable_ns",
+            "next_miss_step_storage_active_ns",
+            "next_miss_step_reader_task_active_ns",
+            "next_miss_step_submitted_queued_ns",
+            "next_miss_step_eligible_unsubmitted_ns",
+            "next_miss_step_runnable_ns",
         )
         self._integrals_ns = _zeroes(integral_names)
         self._primary_integrals_ns = _zeroes(_PIPELINE_PRIMARY_NAMES)
@@ -526,8 +526,8 @@ class ExpertPipelineLedger:
 
     @staticmethod
     def _primary_state(gauges: dict[str, int]) -> str:
-        if gauges["generation_wait_active"]:
-            return "generation_thread_expert_input_wait"
+        if gauges["potentially_blocking_next_miss_active"]:
+            return "potentially_blocking_next_miss_step"
         if gauges["active_logical_ranges"]:
             return "logical_range_active"
         if gauges["active_reader_tasks"] or gauges["reader_active_records"]:
@@ -543,7 +543,7 @@ class ExpertPipelineLedger:
         ):
             return "host_runnable_work"
         if (
-            gauges["verified_not_runnable_records"]
+            gauges["ready_not_runnable_records"]
             or gauges["satisfied_not_runnable_records"]
         ):
             return "route_publication_pending"
@@ -556,7 +556,7 @@ class ExpertPipelineLedger:
             or gauges["active_logical_ranges"]
             or gauges["open_hit_work_spans"]
             or gauges["open_shared_work_spans"]
-            or gauges["generation_wait_active"]
+            or gauges["potentially_blocking_next_miss_active"]
         )
 
     def _accrue_metric_set_locked(
@@ -600,26 +600,26 @@ class ExpertPipelineLedger:
                 self._phase_observation_ns[phase] += span
             phase_gauges = self._phase_gauges[phase]
             phase_integrals = self._phase_integrals[phase]
-            phase_waiting = phase_gauges["generation_wait_active"] > 0
-            if phase_waiting and phase_gauges["active_logical_ranges"] > 0:
-                phase_integrals["generation_wait_storage_active_ns"] += span
-            if phase_waiting and phase_gauges["active_reader_tasks"] > 0:
-                phase_integrals["generation_wait_reader_task_active_ns"] += span
-            if phase_waiting and (
+            next_miss_step = phase_gauges["potentially_blocking_next_miss_active"] > 0
+            if next_miss_step and phase_gauges["active_logical_ranges"] > 0:
+                phase_integrals["next_miss_step_storage_active_ns"] += span
+            if next_miss_step and phase_gauges["active_reader_tasks"] > 0:
+                phase_integrals["next_miss_step_reader_task_active_ns"] += span
+            if next_miss_step and (
                 phase_gauges["provisional_reader_tasks"] > 0
                 or phase_gauges["queued_reader_tasks"] > 0
             ):
-                phase_integrals["generation_wait_submitted_queued_ns"] += span
-            if phase_waiting and phase_gauges["eligible_unsubmitted_records"] > 0:
-                phase_integrals["generation_wait_eligible_unsubmitted_ns"] += span
+                phase_integrals["next_miss_step_submitted_queued_ns"] += span
+            if next_miss_step and phase_gauges["eligible_unsubmitted_records"] > 0:
+                phase_integrals["next_miss_step_eligible_unsubmitted_ns"] += span
             phase_runnable = (
                 phase_gauges["runnable_miss_records"]
                 + phase_gauges["runnable_hit_work"]
                 + phase_gauges["runnable_shared_work"]
             ) > 0
-            if phase_waiting and phase_runnable:
-                phase_integrals["generation_wait_runnable_ns"] += span
-        waiting = self._gauges["generation_wait_active"] > 0
+            if next_miss_step and phase_runnable:
+                phase_integrals["next_miss_step_runnable_ns"] += span
+        next_miss_step = self._gauges["potentially_blocking_next_miss_active"] > 0
         storage = self._gauges["active_logical_ranges"] > 0
         reader_active = self._gauges["active_reader_tasks"] > 0
         runnable = (
@@ -627,19 +627,19 @@ class ExpertPipelineLedger:
             + self._gauges["runnable_hit_work"]
             + self._gauges["runnable_shared_work"]
         ) > 0
-        if waiting and storage:
-            self._integrals_ns["generation_wait_storage_active_ns"] += span
-        if waiting and reader_active:
-            self._integrals_ns["generation_wait_reader_task_active_ns"] += span
-        if waiting and (
+        if next_miss_step and storage:
+            self._integrals_ns["next_miss_step_storage_active_ns"] += span
+        if next_miss_step and reader_active:
+            self._integrals_ns["next_miss_step_reader_task_active_ns"] += span
+        if next_miss_step and (
             self._gauges["provisional_reader_tasks"] > 0
             or self._gauges["queued_reader_tasks"] > 0
         ):
-            self._integrals_ns["generation_wait_submitted_queued_ns"] += span
-        if waiting and self._gauges["eligible_unsubmitted_records"] > 0:
-            self._integrals_ns["generation_wait_eligible_unsubmitted_ns"] += span
-        if waiting and runnable:
-            self._integrals_ns["generation_wait_runnable_ns"] += span
+            self._integrals_ns["next_miss_step_submitted_queued_ns"] += span
+        if next_miss_step and self._gauges["eligible_unsubmitted_records"] > 0:
+            self._integrals_ns["next_miss_step_eligible_unsubmitted_ns"] += span
+        if next_miss_step and runnable:
+            self._integrals_ns["next_miss_step_runnable_ns"] += span
         self._last_ns = now_ns
 
     def begin_route(
@@ -810,9 +810,10 @@ class ExpertPipelineLedger:
                 or self._counters["submission_rejections"] > 0
                 or self._explicitly_incomplete
             )
+            measured_coverage = "incomplete" if incomplete else "measured"
             block_coverage = {
                 reason: (
-                    "measured"
+                    measured_coverage
                     if reason in _PIPELINE_MEASURED_BLOCK_REASONS
                     else "unavailable"
                 )
@@ -872,11 +873,14 @@ class ExpertPipelineLedger:
                 "invariant_failures": self._invariant_failures,
                 "coverage": {
                     "attribution": "incomplete" if incomplete else "measured",
-                    "logical_record_lifecycle": "measured",
-                    "reader_task_accounting": "measured",
-                    "logical_range_accounting": "measured",
-                    "host_runnable_work": "measured",
-                    "generation_expert_input_wait": "measured",
+                    "logical_record_lifecycle": measured_coverage,
+                    "reader_task_accounting": measured_coverage,
+                    "logical_range_accounting": measured_coverage,
+                    "host_runnable_work": measured_coverage,
+                    "generation_expert_input_wait": "unavailable",
+                    "potentially_blocking_next_miss_step": (
+                        "incomplete" if incomplete else "measured_upper_bound"
+                    ),
                     "outer_split_executor_queue": "unavailable",
                     "eligible_unsubmitted_cause": "unattributed",
                     "admitted_read_ranges": "unavailable",
@@ -906,9 +910,9 @@ class ExpertPipelineRoute:
             "accepted_unstarted_record_bytes",
         ),
         "reader-active": ("reader_active_records", "reader_active_record_bytes"),
-        "verified": (
-            "verified_not_runnable_records",
-            "verified_not_runnable_record_bytes",
+        "ready": (
+            "ready_not_runnable_records",
+            "ready_not_runnable_record_bytes",
         ),
         "satisfied": (
             "satisfied_not_runnable_records",
@@ -1213,7 +1217,7 @@ class ExpertPipelineRoute:
             ):
                 ledger._add_counter_locked(name, amount, self.phase)
 
-    def record_verified(self, expert: int) -> None:
+    def record_ready(self, expert: int) -> None:
         ledger = self._ledger
         with ledger._lock:
             now_ns = ledger._now_locked()
@@ -1227,11 +1231,11 @@ class ExpertPipelineRoute:
             if started_ns is None:
                 self._violation_locked(f"record {expert} has no reader start time")
                 return
-            if not self._move_records_locked(values, "verified"):
+            if not self._move_records_locked(values, "ready"):
                 return
             byte_count = self._record_bytes[expert]
-            ledger._add_counter_locked("verified_record_jobs", 1, self.phase)
-            ledger._add_counter_locked("verified_record_bytes", byte_count, self.phase)
+            ledger._add_counter_locked("ready_record_jobs", 1, self.phase)
+            ledger._add_counter_locked("ready_record_bytes", byte_count, self.phase)
             ledger._record_latency.observe(now_ns - started_ns)
             ledger._phase_record_latency[self.phase].observe(now_ns - started_ns)
             self._record_started_ns.pop(expert)
@@ -1253,7 +1257,7 @@ class ExpertPipelineRoute:
             if task is None or task.status != "active":
                 self._violation_locked("reader completion has no active task")
                 return
-            if self._select_locked(values, expected="verified") is None:
+            if self._select_locked(values, expected="ready") is None:
                 return
             if not ledger._change_gauges_locked(
                 {
@@ -1287,10 +1291,7 @@ class ExpertPipelineRoute:
             if task is None or task.status != "active":
                 self._violation_locked("reader failure has no active task")
                 return
-            if (
-                self._select_locked(values, expected={"reader-active", "verified"})
-                is None
-            ):
+            if self._select_locked(values, expected={"reader-active", "ready"}) is None:
                 return
             if not self._move_records_locked(
                 values,
@@ -1325,10 +1326,10 @@ class ExpertPipelineRoute:
             ledger._accrue_locked(ledger._now_locked())
             if not self._ensure_open_locked():
                 return
-            values = self._select_locked((expert,), expected={"verified", "satisfied"})
+            values = self._select_locked((expert,), expected={"ready", "satisfied"})
             if values is None:
                 return
-            if self._states[expert] == "verified" and any(
+            if self._states[expert] == "ready" and any(
                 task.status == "active" and expert in task.experts
                 for task in self._tasks.values()
             ):
@@ -1353,36 +1354,42 @@ class ExpertPipelineRoute:
             ledger._add_counter_locked("claimed_record_jobs", len(values), self.phase)
             ledger._add_counter_locked("claimed_record_bytes", byte_count, self.phase)
 
-    def begin_generation_wait(self) -> None:
+    def begin_potentially_blocking_next_miss_step(self) -> None:
         ledger = self._ledger
         with ledger._lock:
             ledger._accrue_locked(ledger._now_locked())
             if not self._ensure_open_locked():
                 return
-            if ledger._generation_wait_route is not None:
-                self._violation_locked("generation expert-input wait is already active")
-                return
-            if not ledger._change_gauge_locked("generation_wait_active", 1, self.phase):
-                return
-            ledger._generation_wait_route = self._route_id
-            ledger._add_counter_locked(
-                "generation_expert_input_wait_events", 1, self.phase
-            )
-
-    def end_generation_wait(self) -> None:
-        ledger = self._ledger
-        with ledger._lock:
-            ledger._accrue_locked(ledger._now_locked())
-            if not self._ensure_open_locked():
-                return
-            if ledger._generation_wait_route != self._route_id:
-                self._violation_locked("generation expert-input wait is not active")
+            if ledger._next_miss_step_route is not None:
+                self._violation_locked(
+                    "potentially blocking next-miss step is already active"
+                )
                 return
             if not ledger._change_gauge_locked(
-                "generation_wait_active", -1, self.phase
+                "potentially_blocking_next_miss_active", 1, self.phase
             ):
                 return
-            ledger._generation_wait_route = None
+            ledger._next_miss_step_route = self._route_id
+            ledger._add_counter_locked(
+                "potentially_blocking_next_miss_events", 1, self.phase
+            )
+
+    def end_potentially_blocking_next_miss_step(self) -> None:
+        ledger = self._ledger
+        with ledger._lock:
+            ledger._accrue_locked(ledger._now_locked())
+            if not self._ensure_open_locked():
+                return
+            if ledger._next_miss_step_route != self._route_id:
+                self._violation_locked(
+                    "potentially blocking next-miss step is not active"
+                )
+                return
+            if not ledger._change_gauge_locked(
+                "potentially_blocking_next_miss_active", -1, self.phase
+            ):
+                return
+            ledger._next_miss_step_route = None
 
     def close(self) -> None:
         ledger = self._ledger
@@ -1392,8 +1399,8 @@ class ExpertPipelineRoute:
                 return
             ledger._accrue_locked(ledger._now_locked())
             deltas: dict[str, int] = {"open_routes": -1}
-            if ledger._generation_wait_route == self._route_id:
-                deltas["generation_wait_active"] = -1
+            if ledger._next_miss_step_route == self._route_id:
+                deltas["potentially_blocking_next_miss_active"] = -1
             for task in self._tasks.values():
                 task_gauges = {
                     "provisional": (
@@ -1434,8 +1441,8 @@ class ExpertPipelineRoute:
             for expert in abandoned:
                 self._states[expert] = "abandoned"
                 self._record_started_ns.pop(expert, None)
-            if ledger._generation_wait_route == self._route_id:
-                ledger._generation_wait_route = None
+            if ledger._next_miss_step_route == self._route_id:
+                ledger._next_miss_step_route = None
             self._tasks.clear()
             ledger._routes.pop(self._route_id, None)
             self._closed = True

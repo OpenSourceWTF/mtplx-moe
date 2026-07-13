@@ -1295,7 +1295,7 @@ class ExpertSlotPool:
             slot.error = None
             slot.condition.notify_all()
         if pipeline_route is not None:
-            self._pipeline_call(pipeline_route, "record_verified", record.expert)
+            self._pipeline_call(pipeline_route, "record_ready", record.expert)
 
     def _fill_batch(
         self,
@@ -1371,7 +1371,7 @@ class ExpertSlotPool:
             if pipeline_route is not None:
                 self._pipeline_call(
                     pipeline_route,
-                    "record_verified",
+                    "record_ready",
                     record.expert,
                 )
 

@@ -10,8 +10,9 @@ The measured problem is real: the B1 diagnostic averaged 3.732 active readers
 out of 32 and 6.065 GiB/s of reader-returned data while the checked-in host
 concurrency-8 control reached 12.469 GiB/s. Those measurements prove underfill,
 but they do not distinguish dependency-limited demand, unissued eligible work,
-reader service, or generation-thread expert-input wait. Phase 1 exists to make
-that distinction before any scheduling behavior changes.
+reader service, or time inside a potentially blocking next-miss iterator step.
+Phase 1 exists to make that distinction before any scheduling behavior changes;
+it does not measure exact generation-thread expert-input blocked time.
 
 ## Scope
 
@@ -23,11 +24,11 @@ Phase 1 adds opt-in, event-time attribution for:
 - active logical read ranges;
 - logical range jobs, actual Python `preadv` calls, and returned bytes;
 - slot-loading and pin-held wait duration;
-- verified record readiness and host dispatch for execution;
+- ready-record completion and host dispatch for execution;
 - host-known runnable hit, shared, and completed-miss work;
-- generation-thread time blocked waiting for the next miss future;
+- an upper bound around a potentially blocking next-miss iterator step;
 - orthogonal overlap between storage activity, runnable work, dependency
-  underfill, and generation-thread expert-input wait;
+  underfill, and that upper-bound step;
 - bounded latency histograms for logical ranges and complete records.
 
 The default telemetry-off path retains the exact #29 submission and execution
@@ -54,7 +55,7 @@ The report keeps these identities separate:
 | `submission_accepted_*` | Records and bytes covered by calls for which `executor.submit` returned a `Future`. Acceptance is never inferred from worker start. |
 | `submission_rejected_*` | Provisional work rolled back because `executor.submit` raised. Any rejection marks the attribution interval incomplete. |
 | `started_reader_tasks` / `completed_reader_tasks` / `failed_reader_tasks` | Explicit executor-job lifecycle counts. A task may contain one record today and may contain a batch elsewhere. |
-| `logical_range_reader_invocations` | Calls into one logical contiguous range reader. This is the backward-compatible `ExpertIOMetrics.read_operations`; it is not a queued or physical operation count. |
+| `logical_range_reader_invocations` | Calls that pass the reader's initial cancellation/deadline checks and enter one logical contiguous range reader. Later failures count; exits at either initial check do not. This is the backward-compatible `ExpertIOMetrics.read_operations`; it is not a queued or physical operation count. |
 | `python_preadv_invocations` | Python `os.preadv` invocation attempts, including interrupted attempts. It does not prove kernel entry. |
 | `preadv_bytes_returned` | Positive bytes returned by Python `os.preadv`. |
 | `native_positional_calls` | Native-reader invocations; these do not claim Python `preadv` coverage. |
@@ -94,7 +95,7 @@ ledger spans and are never owned by the load route. The route tracks unique
 load experts through these transitions:
 
 ```text
-eligible -> submission-provisional -> accepted/reader-active -> verified
+eligible -> submission-provisional -> accepted/reader-active -> ready
                                                         -> route-part-runnable
                                                         -> claimed-for-execution
         \-> satisfied-without-new-submit -> route-part-runnable -> claimed
@@ -125,12 +126,14 @@ the GPU has physically consumed the record.
   existing generation is marked `satisfied_without_new_submit` only after
   `_wait_ready` confirms READY; it remains nonterminal until route-part
   publication and host claim.
-- `_submit_tracked` publishes a provisional attempt before `executor.submit`,
+- `_submit_pipeline_reader` publishes a provisional attempt before
+  `executor.submit`,
   records acceptance only after a `Future` returns, and rolls provisional state
-  back on rejection. `_run_tracked` may legally start between those events.
-- `_run_tracked`, `_fill`, and `_fill_batch` record reader-task activity,
-  verified complete-record readiness, failures, latency, and reader-thread CPU.
-  Verified slot readiness ends record service time but does not yet make a miss
+  back on rejection. `_run_pipeline_reader` may legally start between those
+  events.
+- `_run_pipeline_reader`, `_fill`, and `_fill_batch` record reader-task activity,
+  complete-record readiness, failures, latency, and reader-thread CPU. A ready
+  slot ends record service time but does not yet make a miss
   runnable. The route part becomes host-runnable only after `_ensure_route_owned`
   has completed waits, pins, bindings, and `ReadyRoute` construction.
 - `PositionalExpertReader` records range start/finish against the route's phase
@@ -146,12 +149,14 @@ the GPU has physically consumed the record.
   Q4 or `shared_work()` callback is dispatched.
 - The streamed MLX decode path marks hit/shared/completed-miss work claimed
   immediately before host dispatch to its existing evaluation function.
-- `PendingSplitRoute.iter_ready_misses` measures only a blocking `next()` on
-  the completion iterator. It maintains an explicit remaining-future set and
-  removes every yielded future before deciding whether the next step can block;
-  otherwise the first completed future would suppress timing of later waits.
-  It does not include hit work, shared work, Q4 evaluation, policy publication,
-  release, or cleanup.
+- `PendingSplitRoute.iter_ready_misses` brackets `next(as_completed(...))` only
+  when a prior scan of the remaining futures saw no done future. It maintains an
+  explicit remaining-future set and removes every yielded future before the
+  next scan. The scan and iterator step are not atomic, so a future may complete
+  between them; the end hook may also wait for the telemetry ledger lock after
+  `next()` returns. The resulting `potentially_blocking_next_miss_ns` is an
+  upper bound, not exact blocked time. It does not include hit work, shared
+  work, Q4 evaluation, policy publication, release, or cleanup.
 - Every runtime hook is fail-open for data-path behavior: instrumentation
   invariant failures mark coverage incomplete but cannot change a successful
   route result or mask its original exception. Strict transition failures are
@@ -167,30 +172,33 @@ record and byte nanoseconds for independent facts:
 - eligible-but-unsubmitted records;
 - queued and active reader tasks;
 - active logical ranges;
-- verified/satisfied records awaiting route publication and runnable misses
+- ready/satisfied records awaiting route publication and runnable misses
   awaiting host claim;
 - runnable hit, shared, and completed-miss work;
-- generation-thread expert-input wait;
-- pairwise overlap between expert-input wait and logical-range activity,
+- the potentially blocking next-miss upper-bound span;
+- pairwise overlap between that span and logical-range activity,
   reader completion outside a range, runnable work, eligible unsubmitted work,
   or queued submitted work.
 
 No fixed target such as eight is embedded in the ledger. Eight was a host
 concurrency label, not a causal threshold. The report exposes exact available
-useful work as eligible, provisional/queued, reader-active, verified, and
+useful work as eligible, provisional/queued, reader-active, ready, and
 runnable states. A later optimization gate may compare service depth with
 `min(configured_reader_capacity, currently_available_useful_records)`, but it
 must not call low depth starvation when fewer useful records exist.
 
-The orthogonal durations are authoritative. Primary time accrues only while the
-phase has an open route, active logical range, runnable hit/shared span, or
-generation wait; inactive prefill/setup/teardown time cannot inflate decode's
-fallback. The report publishes this covered observation duration explicitly.
+The orthogonal durations retain the ledger's observed states; intersections
+with the next-miss step inherit its upper-bound semantics. Primary time accrues
+only while the phase has an open route, active logical range, runnable
+hit/shared span, or potentially blocking next-miss span. Inactive
+prefill/setup/teardown time cannot inflate decode's fallback. The report
+publishes this covered observation duration explicitly.
 Within that window it derives one deterministic decode-only primary state with
 this precedence at every event boundary:
 
-1. `generation_thread_expert_input_wait` when the generation thread is inside
-   the blocking next-miss span;
+1. `potentially_blocking_next_miss_step` when the generation thread is inside
+   the bracketed `next(as_completed(...))` step after the preceding readiness
+   scan saw no done future;
 2. `logical_range_active` when a logical range reader is executing;
 3. `reader_completion_active` when a reader task is active outside a logical
    range (for example hashing, validation, or READY publication);
@@ -199,14 +207,14 @@ this precedence at every event boundary:
 5. `eligible_unsubmitted` when authoritative work remains unsubmitted;
 6. `host_runnable_work` when a hit, shared callback, or completed miss is known
    runnable but has not yet been host-dispatched;
-7. `route_publication_pending` when a verified or existing READY record is not
-   yet part of a constructed route;
+7. `route_publication_pending` when a ready record, including one from an
+   existing READY generation, is not yet part of a constructed route;
 8. `no_known_useful_work` otherwise within the covered phase window.
 
-If generation wait overlaps host-known runnable work, the time remains in the
-first primary state and is also retained in the orthogonal overlap counter. It
-is evidence to interpret, not automatically an instrumentation failure. The
-report never relabels this host state as GPU wait.
+If the upper-bound next-miss step overlaps host-known runnable work, the time
+remains in the first primary state and is also retained in the orthogonal
+overlap counter. It is evidence to interpret, not automatically an
+instrumentation failure. The report never relabels this host state as GPU wait.
 
 ## Coverage contract
 
@@ -223,6 +231,7 @@ The Phase 1 report must say `unavailable`, not zero, for:
   waits are measured separately, but #29 has no distinct slot admission stage);
 - independently queued logical ranges in the frozen whole-record executor;
 - physical device operations, bytes, and queue depth;
+- exact generation-thread expert-input blocked time;
 - exact `gpu_idle_time` and `gpu_expert_wait`;
 - future-layer or speculative eligibility;
 - useful, late, cancelled, or unused speculative records;
@@ -230,6 +239,14 @@ The Phase 1 report must say `unavailable`, not zero, for:
 
 Pin-held and slot-loading waits are measured. There is no distinct slot-capacity
 admission mechanism in #29, so it is not invented as a counter.
+If any ledger invariant or hook fails, their status becomes `incomplete` while
+retaining observed raw values; they are not published as measured zeroes.
+`coverage.generation_expert_input_wait` is therefore `unavailable`.
+`coverage.potentially_blocking_next_miss_step` is `measured_upper_bound` when
+pipeline attribution is complete and `incomplete` otherwise.
+The Phase 1 pipeline hooks cover slot-backed layouts. The separate `metal-mmap`
+execution path does not emit these events, so it omits the pipeline ledger and
+reports attribution unavailable rather than measured zeroes.
 
 ## Report and schema
 
@@ -241,8 +258,13 @@ v1 field meanings remain stable. Its `expert_pipeline` report block is a
 derived summary with schema `mtplx-expert-pipeline-summary-v1`, identifies the
 runtime schema in `source_schema`, and declares `scope="decode"`.
 
-The summary exposes exact `primary_state_ns`, `decode_integrals_ns`, block
-durations, and orthogonal-overlap durations. Fractions use the summed
+The summary exposes `primary_state_ns`, `decode_integrals_ns`, block durations,
+and orthogonal-overlap durations. Its public upper-bound fraction is
+`potentially_blocking_next_miss_fraction`; the corresponding primary key is
+`potentially_blocking_next_miss_step`. The overlap keys are
+`next_miss_step_storage_active`, `next_miss_step_reader_task_active`,
+`next_miss_step_submitted_queued`, `next_miss_step_eligible_unsubmitted`, and
+`next_miss_step_runnable`. Fractions use the summed
 `decode_observation_ns` denominator and are `null` when that denominator is
 zero. `orthogonal_overlap.denominator` names that denominator explicitly, and
 its independent durations and fractions must not be summed. The eight primary
@@ -257,8 +279,10 @@ coverage and is `measured_all_phases`, `unavailable`, `incomplete_reset`, or
 attribution becomes incomplete if either scope is incomplete.
 
 Histogram percentiles are reported as bucket upper-bound estimates with sample
-and overflow counts. The finite bounds are 1 us, 10 us, 100 us, 1 ms, 10 ms,
-100 ms, and 1 s. Each percentile status is `bounded`, `censored_overflow`, or
+and overflow counts. The canonical finite bounds `(1_000, 10_000, 100_000,
+1_000_000, 10_000_000, 100_000_000, 1_000_000_000)` nanoseconds are required;
+matching but noncanonical bounds are invalid. Each percentile status is
+`bounded`, `censored_overflow`, or
 `unavailable`. Overflow censors only the affected percentile above the largest
 bound; it does not invalidate exact counters or state integrals. A route
 instrumentation invariant violation, invalid histogram contract, or missing
@@ -276,9 +300,9 @@ incomplete.
   from reader tasks, pin/loading waits remain distinct, failed work never
   becomes ready, and telemetry-off avoids the ledger entirely.
 - Controlled futures prove completed records become runnable before host claim,
-  two distinct future waits produce two distinct blocking spans, buffered
-  futures do not add wait, and only blocking completion waits add expert-input
-  wait.
+  separate no-done scans produce separate potentially blocking steps, and a
+  future already done at the scan does not add a step. A completion race proves
+  the duration remains labeled as an upper bound rather than exact wait.
 - Sampler tests use unequal interval widths so state fractions are duration
   weighted, preserve orthogonal overlaps, and retain explicit unavailable
   coverage.
@@ -289,7 +313,9 @@ incomplete.
 
 Phase 1 is diagnostic and does not itself authorize a runtime optimization.
 Hardware evidence uses a clean commit, the frozen #29 model/configuration, and
-balanced repeated telemetry-off/telemetry-on pairs. Qwen is unloaded only for
+four balanced telemetry-off/telemetry-on pairs run physically in this order:
+`off-p01`, `on-p01`, `on-p02`, `off-p02`, `off-p03`, `on-p03`, `on-p04`,
+`off-p04`. Qwen is unloaded only for
 the exclusive measurement window and restored and API-verified in a cleanup
 trap. Raw artifacts use the repository run-id grammar under `benchmarks/raw/`;
 the checked-in result under `benchmarks/results/` records exact commands,
@@ -300,14 +326,16 @@ logical record bytes, and model/config hashes, then publish:
 
 - accepted executor-call, logical record, reader-task, decode-range, Python and
   native backend-call, and returned-byte counts with their declared scopes;
-- time-weighted eligible, queued, active, ready, runnable, and wait states;
+- time-weighted eligible, queued, active, ready, runnable, and potentially
+  blocking next-miss states;
 - block reasons and unavailable coverage;
 - range and complete-record latency distributions;
 - reader-thread and generation-thread CPU time.
 
 Phase 2 or Phase 3 may proceed only if the report finds measurable unissued
-eligible work or material generation-thread expert-input wait that a separately
-measured feed can cover.
+eligible work or material potentially blocking next-miss time that a separately
+measured feed can cover. Because that time is an upper bound, a narrower probe
+or matched intervention is required before attributing it to actual blocking.
 
 ## Failure-mode check
 

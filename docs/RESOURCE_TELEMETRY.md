@@ -119,7 +119,7 @@ is a sampler-window summary.
 | `submission_accepted_record_jobs` / `submission_accepted_record_bytes` | Records and logical bytes covered by accepted executor submissions. One task may cover a different number of records. |
 | `reader_tasks_started`, `reader_tasks_completed`, `reader_tasks_failed` | Executor-task lifecycle counts. They are not record or range counts. |
 | `decode_logical_ranges_started` | Logical contiguous range readers started in the decode ledger phase. |
-| `sampler_window_backend.logical_range_reader_invocations` | Backward-compatible `ExpertIOMetrics.read_operations`: entries into a logical contiguous range reader, including failing calls; not completed decode ranges, kernel calls, or device operations. |
+| `sampler_window_backend.logical_range_reader_invocations` | Backward-compatible `ExpertIOMetrics.read_operations`: calls that pass the reader's initial cancellation/deadline checks and enter one logical contiguous range reader. Later failures count; exits at either initial check do not. These are not completed decode ranges, kernel calls, or device operations. |
 | `sampler_window_backend.python_preadv_invocations` | Python `os.preadv` attempts, including interrupted attempts. This does not prove kernel entry. |
 | `sampler_window_backend.preadv_bytes_returned` | Positive bytes returned by Python `os.preadv`. |
 | `sampler_window_backend.native_positional_calls` / `native_bytes_returned` | Native positional-reader attempts and returned bytes. Native calls provide no Python `preadv` coverage. |
@@ -133,16 +133,16 @@ Its coverage is `measured_all_phases`, `unavailable`, `incomplete_reset`, or
 ### Decode observation and primary precedence
 
 `decode_observation_ns` is the measured decode time during which the ledger had
-an open route, active logical range, open hit/shared-work span, or generation
-wait. It excludes inactive prefill, setup, and teardown. Exact durations appear
-in `primary_state_ns`; `primary_state_fraction` divides each duration by the
-summed `decode_observation_ns`. When that denominator is zero, fractions and
-`generation_expert_input_wait_fraction` are `null`, not zero.
+an open route, active logical range, open hit/shared-work span, or potentially
+blocking next-miss step. It excludes inactive prefill, setup, and teardown.
+Durations appear in `primary_state_ns`; `primary_state_fraction` divides each
+duration by the summed `decode_observation_ns`. When that denominator is zero,
+fractions and `potentially_blocking_next_miss_fraction` are `null`, not zero.
 
 The primary state is selected at every event boundary in this precedence:
 
-1. `generation_thread_expert_input_wait` — the generation thread is blocked on
-   the next miss completion.
+1. `potentially_blocking_next_miss_step` — the generation thread is inside
+   `next(as_completed(...))` after a prior scan saw no done future.
 2. `logical_range_active` — a logical range reader is executing.
 3. `reader_completion_active` — a reader task is active outside a logical
    range, such as hashing, validation, or READY publication.
@@ -150,8 +150,8 @@ The primary state is selected at every event boundary in this precedence:
 5. `eligible_unsubmitted` — authoritative current-route work is not submitted.
 6. `host_runnable_work` — hit, shared, or completed-miss work is known runnable
    but has not been host-dispatched.
-7. `route_publication_pending` — a verified or existing READY record is not yet
-   part of a constructed route.
+7. `route_publication_pending` — a ready record, including one from an existing
+   READY generation, is not yet part of a constructed route.
 8. `no_known_useful_work` — none of the preceding states applies inside the
    covered decode window.
 
@@ -161,22 +161,33 @@ independent state integrals in `decode_integrals_ns`. The eight exact
 the raw values but marks `coverage.attribution` and `coverage.decode_phase`
 incomplete.
 
+The first state is an upper bound on blocked time, not an exact wait
+measurement. The readiness scan and iterator step are not atomic, so a future
+may complete after the scan but before `next(as_completed(...))` blocks. After
+the iterator returns, the end hook can also wait to acquire the telemetry
+ledger lock. Exact generation-thread expert-input blocked time therefore
+remains unavailable.
+
 ### Orthogonal overlap is independent evidence
 
 `orthogonal_overlap.duration_ns` retains five independent intersections with
-generation-thread expert-input wait: logical-range activity, any reader-task
-activity, submitted-queued work, eligible-unsubmitted work, and host-runnable
-work. They may overlap each other and must not be added together.
+the potentially blocking next-miss upper-bound span:
+`next_miss_step_storage_active`, `next_miss_step_reader_task_active`,
+`next_miss_step_submitted_queued`, `next_miss_step_eligible_unsubmitted`, and
+`next_miss_step_runnable`. They may overlap each other and must not be added
+together.
 `orthogonal_overlap.denominator` is `decode_observation_ns`, and
-`fraction_of_decode_observation` uses that denominator. A wait/runnable overlap
-is host evidence to investigate; it is not automatically an invariant failure
-and is never relabeled GPU wait.
+`fraction_of_decode_observation` uses that denominator. A
+next-miss-step/runnable overlap is host evidence to investigate; it is not
+automatically an invariant failure and is never relabeled GPU wait.
 
 ### Histograms are bounded, not interpolated
 
-`latency_histograms` reports logical-range and complete-record latency using
-fixed upper bounds of 1 us, 10 us, 100 us, 1 ms, 10 ms, 100 ms, and 1 s, plus an
-overflow bucket. `p50_upper_bound_ns` and `p95_upper_bound_ns` are bucket upper
+`latency_histograms` reports logical-range and complete-record latency. The
+canonical finite bounds `(1_000, 10_000, 100_000, 1_000_000, 10_000_000,
+100_000_000, 1_000_000_000)` nanoseconds are required, followed by an overflow
+bucket; matching but noncanonical bounds are invalid and mark decode coverage
+incomplete. `p50_upper_bound_ns` and `p95_upper_bound_ns` are bucket upper
 bounds, not interpolated percentiles. Their status is `bounded`,
 `censored_overflow`, or `unavailable`. If a percentile lands in overflow, only
 that percentile is `null` and censored above the largest bound; exact counters,
@@ -185,18 +196,28 @@ logical-range or complete-record histogram marks decode coverage incomplete.
 
 ### Coverage and unavailable claims
 
-`block_reasons.pin_held` and `block_reasons.slot_loading` contain measured count
-and duration. They cover elapsed `Condition.wait` time, published only after the
-slot condition is released. Operation credit, byte credit, authoritative
-reserve, and distinct slot-capacity admission do not exist in the frozen #29
-runtime and remain `unavailable`, not measured zeroes.
+`block_reasons.pin_held` and `block_reasons.slot_loading` contain count and
+duration. They cover elapsed `Condition.wait` time, published only after the
+slot condition is released. Their status is `measured` only while aggregate
+pipeline coverage is complete; after any invariant or hook failure it becomes
+`incomplete` while retaining the observed raw values. Operation credit, byte
+credit, authoritative reserve, and distinct slot-capacity admission do not
+exist in the frozen #29 runtime and remain `unavailable`, not measured zeroes.
 
 The report also leaves physical device operations, physical device bytes,
 physical device queue depth, `gpu_expert_wait`, and `gpu_idle_time` unavailable.
+It reports `coverage.generation_expert_input_wait="unavailable"` and
+`coverage.potentially_blocking_next_miss_step="measured_upper_bound"` when the
+ledger is complete, or `"incomplete"` when pipeline attribution is incomplete.
 Its coverage also marks the outer split-executor queue, independently
 admitted/scheduled ranges, `future_layer_eligibility`,
 `speculative_record_accounting`, and `python_preadv_when_native_reader`
 unavailable; eligible-unsubmitted cause remains unattributed.
+The reporter requires both aggregate and decode-phase source coverage to remain
+measured. An unscoped invariant therefore makes the decode summary incomplete
+instead of allowing a phase-local measured label to hide it. Pipeline hooks are
+implemented only by slot-backed layouts; `metal-mmap` reports expert-pipeline
+attribution unavailable rather than publishing measured zeroes.
 `F_NOCACHE` supports the term
 "uncached reader traffic," never physical NAND traffic. Submission rejection,
 counter reset, histogram-contract change, hook failure, or ledger invariant
@@ -281,7 +302,9 @@ values.
 - System-wide GPU activity is not per-process GPU activity.
 - A peak without occupancy or throughput context does not establish sustained
   pressure.
-- Host expert-input wait is not GPU wait.
+- Exact generation-thread expert-input blocked time is unavailable; the
+  potentially blocking next-miss step is only an upper bound and is not GPU
+  wait.
 - Python or native positional calls are not physical device operations.
 
 The schema therefore does not emit `bound_by`. It reports evidence, coverage,

@@ -240,6 +240,16 @@ class ExpertStreamingConfig:
         return {name: getattr(self, name) for name in self.__dataclass_fields__}
 
 
+def _pipeline_ledger_for_config(
+    config: ExpertStreamingConfig,
+) -> ExpertPipelineLedger | None:
+    """Enable pipeline attribution only on the instrumented slot-backed path."""
+
+    if not config.resource_telemetry or config.slot_layout == "metal-mmap":
+        return None
+    return ExpertPipelineLedger(strict=False)
+
+
 @dataclass(frozen=True)
 class RouteWave:
     positions: tuple[int, ...]
@@ -656,7 +666,12 @@ class PendingSplitRoute:
         self,
         snapshot: tuple[Future[ReadyRoute], ...],
     ) -> Iterable[Future[ReadyRoute]]:
-        """Attribute only a blocking step of the existing completion iterator."""
+        """Bound a completion step that may block on the existing iterator.
+
+        The readiness scan and ``next(as_completed(...))`` cannot be atomic through
+        the public Future API. The measured span is therefore an upper bound that
+        can include completion races, iterator work, and telemetry-lock delay.
+        """
 
         route = self._pipeline_route
         assert route is not None
@@ -664,29 +679,29 @@ class PendingSplitRoute:
         remaining = set(snapshot)
         while remaining:
             try:
-                blocks_for_next = not any(future.done() for future in remaining)
+                may_block_for_next = not any(future.done() for future in remaining)
             except Exception:
-                blocks_for_next = False
+                may_block_for_next = False
                 ledger = self.runtime._pipeline_ledger
                 if ledger is not None:
                     try:
                         ledger.mark_incomplete(phase=route.phase)
                     except Exception:
                         pass
-            if blocks_for_next:
+            if may_block_for_next:
                 _pipeline_call(
                     self.runtime._pipeline_ledger,
                     route,
-                    "begin_generation_wait",
+                    "begin_potentially_blocking_next_miss_step",
                 )
             try:
                 future = next(completions)
             finally:
-                if blocks_for_next:
+                if may_block_for_next:
                     _pipeline_call(
                         self.runtime._pipeline_ledger,
                         route,
-                        "end_generation_wait",
+                        "end_potentially_blocking_next_miss_step",
                     )
             remaining.discard(future)
             yield future
@@ -1231,9 +1246,7 @@ class ExpertStreamingRuntime:
             if apply_memory_cap
             else None
         )
-        pipeline_ledger = (
-            ExpertPipelineLedger(strict=False) if config.resource_telemetry else None
-        )
+        pipeline_ledger = _pipeline_ledger_for_config(config)
         pipeline_kwargs = (
             {} if pipeline_ledger is None else {"pipeline_ledger": pipeline_ledger}
         )

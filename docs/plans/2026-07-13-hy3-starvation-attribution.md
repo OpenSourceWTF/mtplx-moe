@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers-optimized:subagent-driven-development (recommended) or superpowers-optimized:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add behavior-neutral, telemetry-only Phase 1 evidence that distinguishes dependency underfill, unissued authoritative work, reader service, and generation-thread expert-input wait.
+**Goal:** Add behavior-neutral, telemetry-only Phase 1 evidence that distinguishes dependency underfill, unissued authoritative work, reader service, and time inside a potentially blocking next-miss iterator step without claiming exact blocked time.
 
-**Architecture:** A diagnostic-only `ExpertPipelineLedger` integrates record, reader-task, logical-range, runnable-work, and generation-wait state changes on one monotonic clock. Split routes own bounded record lifecycle handles so cancellation cannot leak occupancy. The existing resource sampler differences cumulative integrals and publishes a versioned, honestly labeled report; scheduling, cache, MLX ownership, and telemetry-off execution remain unchanged.
+**Architecture:** A diagnostic-only `ExpertPipelineLedger` integrates record, reader-task, logical-range, runnable-work, and potentially-blocking-next-miss state changes on one monotonic clock. Split routes own bounded record lifecycle handles so cancellation cannot leak occupancy. The existing resource sampler differences cumulative integrals and publishes a versioned, honestly labeled report; scheduling, cache, MLX ownership, and telemetry-off execution remain unchanged.
 
 **Tech Stack:** Python 3.11+, `threading`, `time.monotonic_ns`, `time.thread_time_ns`, `concurrent.futures`, pytest, Ruff, existing MTPLX resource telemetry.
 
@@ -22,7 +22,7 @@
 - `mtplx/resource_metrics.py` — pipeline ledger, route handle, state integrals, bounded latency histograms, and snapshots.
 - `mtplx/expert_io.py` — logical-range lifecycle plus exact Python/native call and returned-byte metrics.
 - `mtplx/expert_slots.py` — record blocking, accepted submission, reader-task, ready/failure lifecycle hooks.
-- `mtplx/expert_runtime.py` — create the ledger, begin/close split-route attribution, and measure blocking next-miss waits.
+- `mtplx/expert_runtime.py` — create the ledger, begin/close split-route attribution, and measure potentially blocking next-miss upper-bound spans.
 - `mtplx/models/expert_mlx.py` — host-dispatch markers for hit, shared, and completed-miss work.
 - `mtplx/benchmarks/resource_telemetry.py` — same-clock differencing, duration-weighted summaries, coverage, and schema v2.
 - `tests/test_resource_metrics.py` — deterministic fake-clock ledger tests.
@@ -66,14 +66,14 @@ def test_pipeline_ledger_integrates_record_lifecycle_and_overlap() -> None:
     route.submission_accepted((5,))
     route.reader_started((5,))
     hit_work.claim()
-    route.begin_generation_wait()
+    route.begin_potentially_blocking_next_miss_step()
     range_token = ledger.range_started(logical_bytes=100, phase="decode")
     clock.advance(10)
     ledger.range_completed(range_token)
-    route.record_verified(5)
+    route.record_ready(5)
     route.reader_completed((5,), thread_cpu_ns=4)
     route.record_runnable(5)
-    route.end_generation_wait()
+    route.end_potentially_blocking_next_miss_step()
     clock.advance(5)
     route.claim_misses((5,))
     route.close()
@@ -83,13 +83,13 @@ def test_pipeline_ledger_integrates_record_lifecycle_and_overlap() -> None:
     assert snapshot["counters"]["logical_record_bytes"] == 100
     assert snapshot["counters"]["accepted_record_jobs"] == 1
     assert snapshot["counters"]["accepted_record_bytes"] == 100
-    assert snapshot["counters"]["verified_record_jobs"] == 1
+    assert snapshot["counters"]["ready_record_jobs"] == 1
     assert snapshot["counters"]["runnable_record_jobs"] == 1
     assert snapshot["counters"]["claimed_record_jobs"] == 1
     assert snapshot["integrals_ns"]["eligible_unsubmitted_record_ns"] == 10
     assert snapshot["block_ns"]["pin_held"] == 5
-    assert snapshot["integrals_ns"]["generation_expert_input_wait_ns"] == 10
-    assert snapshot["integrals_ns"]["generation_wait_storage_active_ns"] == 10
+    assert snapshot["integrals_ns"]["potentially_blocking_next_miss_ns"] == 10
+    assert snapshot["integrals_ns"]["next_miss_step_storage_active_ns"] == 10
     assert snapshot["integrals_ns"]["runnable_miss_unclaimed_record_ns"] == 5
 ```
 
@@ -103,7 +103,7 @@ corresponding slot condition is released. Add separate tests for exact
 record/byte counters, worker-start-before-submit-return, rejection rollback and
 incomplete coverage, satisfied-without-new-submit continuing through runnable
 and claimed, route close abandoning every nonterminal record, active range
-bytes and phase isolation, six-state primary precedence, bounded histograms,
+bytes and phase isolation, eight-state primary precedence, bounded histograms,
 decode/prefill/unscoped snapshots, and fail-open non-strict transitions. Strict
 unit-test mode raises on duplicate/out-of-order transitions; runtime mode never
 changes a data-path outcome.
@@ -124,17 +124,18 @@ The start method returns an opaque integer span token so concurrent equal-sized
 ranges cannot be confused. `ExpertPipelineRoute`
 exposes elapsed block observation, satisfied-without-new-submit, provisional
 submission attempt plus acceptance/rejection, reader start/complete/failure,
-generation-wait begin/end, separate verified and route-part-runnable record
-transitions, miss claim, and idempotent close. Exact bytes are registered with
+potentially-blocking-next-miss begin/end, separate ready and
+route-part-runnable record transitions, miss claim, and idempotent close. Exact bytes are registered with
 each load expert and derived for every later transition. Hit/shared spans are
 ledger-level and never owned by the route. Every valid state mutation calls
 `_accrue(now_ns)` under one ledger-local diagnostic lock.
 
-Use fixed nanosecond histogram buckets ending in an overflow bucket. Export
-only cumulative bucket counts, operation/byte counters, gauges, integrals,
-six-state primary integrals, block counts/time, invariant failures, coverage,
-and global plus phase-scoped snapshots; do not retain a raw event list or a
-fixed target-depth rule.
+Use the required canonical finite histogram bounds `(1_000, 10_000, 100_000,
+1_000_000, 10_000_000, 100_000_000, 1_000_000_000)` nanoseconds followed by
+an overflow bucket. Export only cumulative bucket counts, operation/byte
+counters, gauges, integrals, eight-state primary integrals, block counts/time,
+invariant failures, coverage, and global plus phase-scoped snapshots; do not
+retain a raw event list or a fixed target-depth rule.
 
 - [x] **Step 4: Run focused tests and verify GREEN**
 
@@ -202,7 +203,9 @@ native_positional_calls: int = 0
 native_bytes_returned: int = 0
 ```
 
-In `_read_range_into` and `_readv_range_into`, increment local attempt counters
+In `_read_range_into` and `_readv_range_into`, count a logical range only after
+the initial cancellation and deadline checks pass; exits at either initial
+guard do not count, while later failures do. Increment local attempt counters
 immediately before each backend invocation and local returned bytes only after a
 positive return. Publish all values in the existing final metrics update so no
 new metrics lock is taken per partial read. If a ledger is present, bracket the
@@ -259,7 +262,7 @@ def test_split_route_counts_unique_loads_not_assignment_duplicates(tmp_path) -> 
 ```
 
 Add a controlled-submit test whose worker fully finishes before `submit`
-returns; acceptance must remain legal after verified/completed publication.
+returns; acceptance must remain legal after ready/completed publication.
 The pin/loading test must hold a pinned ready victim and a separately loading
 generation long enough for each waiter to enter its condition, then assert both
 durations are positive and neither count aliases the other. The failure test
@@ -299,7 +302,7 @@ roll the provisional state back on rejection. Preserve the existing
 `RouteIOAdmission` rollback meaning unchanged. A reader-specific wrapper calls
 reader-start before `_fill`/`_fill_batch`, captures thread CPU, calls
 reader-complete on success or reader-failed before bare-raising the original
-exception, and supports completion before late submit acceptance. Mark verified
+exception, and supports completion before late submit acceptance. Mark
 complete-record readiness only after digest validation and READY publication,
 outside the slot condition. Mark a miss host-runnable separately after waits,
 pins, bindings, task completion, and `ReadyRoute` construction. Mark a
@@ -328,7 +331,7 @@ git add mtplx/expert_io.py mtplx/expert_slots.py mtplx/expert_runtime.py tests/t
 git commit -m "feat(bench): trace authoritative expert record lifecycle"
 ```
 
-### Task 4: Measure runnable work and only the blocking next-miss wait
+### Task 4: Measure runnable work and a potentially blocking next-miss upper bound
 
 **Files:**
 - Modify: `mtplx/expert_runtime.py`
@@ -338,39 +341,50 @@ git commit -m "feat(bench): trace authoritative expert record lifecycle"
 
 **Security flag:** `none`
 
-**Does NOT cover:** `mx.eval`, Q4 compute, policy publication, and release time are not expert-input wait; host-known runnable work is not a GPU-runnable claim.
+**Does NOT cover:** Exact generation-thread expert-input blocked time remains
+unavailable. `mx.eval`, Q4 compute, policy publication, and release time are
+outside the bracketed iterator step; host-known runnable work is not a
+GPU-runnable claim.
 
 - [x] **Step 1: Write failing ordered-work tests**
 
 Use controlled futures and the existing fake-MLX ordered-overlap fixture. The
-blocking case releases a miss future only after the iterator has entered its
-wait and asserts positive expert-input wait. The already-completed case resolves
-the future before iteration and asserts zero wait. A two-future case completes
-futures after two distinct blocking spans and asserts both waits are measured;
-a buffered-first/late-second case asserts only the second span is measured. The
+controlled-block case releases a miss future only after the iterator has entered
+its step and asserts a positive potentially-blocking-next-miss duration. The
+already-completed case resolves the future before the readiness scan and asserts
+zero such duration. A two-future case makes two scans see no done future and
+asserts both upper-bound spans are measured; a buffered-first/late-second case
+asserts only the second span is measured. A completion-during-scan case proves
+the metric remains an upper bound even when `next()` does not block. The
 ordered model case
 records callbacks and asserts `claim_hits`, `claim_shared`, and `claim_misses`
 occur immediately before their corresponding evaluation callbacks. Open one
 ledger-level shared span after decode phase is known so the all-hit fast path
 and split path use the same shared-work lifecycle. The all-hit case asserts its
-hit is claimed, its deferred shared callback is claimed, and wait events and
-nanoseconds remain zero. Advance the fake clock
+hit is claimed, its deferred shared callback is claimed, and next-miss-step
+events and nanoseconds remain zero. Advance the fake clock
 during hit Q4, shared evaluation, miss Q4, policy commit, and release, and
-assert none of those advances appears in the expert-input-wait counter.
+assert none of those advances appears in the next-miss-step counter.
 
 - [x] **Step 2: Run tests and verify RED**
 
-Run: `uv run --frozen --extra dev python -m pytest -q tests/test_streamed_models.py tests/test_expert_slots_runtime.py -k 'expert_input_wait or runnable or already_completed'`
+Run: `uv run --frozen --extra dev python -m pytest -q tests/test_streamed_models.py tests/test_expert_slots_runtime.py -k 'potentially_blocking_next_miss or runnable or already_completed'`
 
-Expected: FAIL because runnable claims and the blocking iterator boundary are not instrumented.
+Expected: FAIL because runnable claims and the potentially blocking iterator boundary are not instrumented.
 
-- [x] **Step 3: Add host-dispatch and wait boundaries**
+- [x] **Step 3: Add host-dispatch and upper-bound boundaries**
 
 Replace the implicit `for future in as_completed(snapshot)` wait with an
 explicit iterator step and an explicit `remaining` future set. Remove every
-yielded future before the next readiness check. Call `begin_generation_wait()`
-only when no future in `remaining` is already done; bracket only
-`next(completions)` and always end the span in `finally`. Mark hits, shared
+yielded future before the next readiness check. Call
+`begin_potentially_blocking_next_miss_step()` only when a prior scan sees no
+done future in `remaining`; bracket only `next(completions)` and always end the
+span in `finally`. The scan and iterator step are not atomic, and the end hook
+may wait for the telemetry ledger lock after `next()` returns, so publish this
+duration only as an upper bound. Set
+`coverage.generation_expert_input_wait="unavailable"` and report
+`coverage.potentially_blocking_next_miss_step` as `measured_upper_bound` or
+`incomplete`. Mark hits, shared
 work, and a completed miss claimed immediately before their existing
 evaluation dispatch calls. Do not move or add any MLX operation, future,
 condition, or release.
@@ -385,7 +399,7 @@ Expected: PASS with existing ordered overlap behavior unchanged.
 
 ```bash
 git add mtplx/expert_runtime.py mtplx/models/expert_mlx.py tests/test_streamed_models.py tests/test_expert_slots_runtime.py
-git commit -m "feat(bench): measure expert input wait boundaries"
+git commit -m "feat(bench): measure potentially blocking next-miss steps"
 ```
 
 ### Task 5: Publish honest same-clock attribution in resource telemetry v2
@@ -401,24 +415,27 @@ git commit -m "feat(bench): measure expert input wait boundaries"
 
 **Security flag:** `none`
 
-**Does NOT cover:** The report cannot promote an optimization, infer physical device QD, or call host expert-input wait GPU wait.
+**Does NOT cover:** The report cannot promote an optimization, infer physical
+device QD, claim exact generation-thread expert-input blocked time, or call the
+upper-bound step GPU wait.
 
 - [x] **Step 1: Write failing interval and report-contract tests**
 
 ```python
 def test_pipeline_summary_weights_duration_not_sample_count():
-    intervals = [pipeline_interval(seconds=1, wait_seconds=1),
-                 pipeline_interval(seconds=9, wait_seconds=0)]
+    intervals = [pipeline_interval(seconds=1, next_miss_seconds=1),
+                 pipeline_interval(seconds=9, next_miss_seconds=0)]
     report = summarize_intervals(intervals, ssd_ceiling_gib_s=12.47,
                                  powermetrics=None)
-    assert report["expert_pipeline"]["generation_expert_input_wait_fraction"] == 0.1
+    assert report["expert_pipeline"]["potentially_blocking_next_miss_fraction"] == 0.1
 
 ```
 
-Add exact report tests that preserve separate wait/storage, wait/reader-task,
-wait/submitted, wait/eligible, and wait/runnable durations and fractions against
-the named decode-observation denominator. Assert unequal values survive for
-accepted executor calls, accepted record jobs/bytes, started/completed/failed
+Add exact report tests that preserve separate next-miss-step/storage,
+next-miss-step/reader-task, next-miss-step/submitted,
+next-miss-step/eligible, and next-miss-step/runnable durations and fractions
+against the named decode-observation denominator. Assert unequal values survive
+for accepted executor calls, accepted record jobs/bytes, started/completed/failed
 reader tasks, decode ranges, and all-phase sampler-window Python/native backend
 calls and returned bytes. Assert credit, reserve, slot-admission, device-QD, and
 GPU-wait/idle coverage all equal `"unavailable"`. Prove missing backend counters
@@ -464,14 +481,20 @@ integral, block, and histogram deltas. Duration-weight all fractions. Emit:
         "decode_counters": dict[str, int],
         "decode_integrals_ns": dict[str, int],
         "primary_state_ns": dict[str, int],
-        "generation_expert_input_wait_fraction": float | None,
+        "potentially_blocking_next_miss_fraction": float | None,
         "orthogonal_overlap": {
             "denominator": "decode_observation_ns",
-            "duration_ns": dict[str, int],
+            "duration_ns": {
+                "next_miss_step_storage_active": int,
+                "next_miss_step_reader_task_active": int,
+                "next_miss_step_submitted_queued": int,
+                "next_miss_step_eligible_unsubmitted": int,
+                "next_miss_step_runnable": int,
+            },
             "fraction_of_decode_observation": dict[str, float | None],
         },
         "primary_state_fraction": {
-            "generation_thread_expert_input_wait": float | None,
+            "potentially_blocking_next_miss_step": float | None,
             "logical_range_active": float | None,
             "reader_completion_active": float | None,
             "submitted_queued": float | None,
@@ -506,6 +529,10 @@ integral, block, and histogram deltas. Duration-weight all fractions. Emit:
             "sampler_window_backend": (
                 "measured_all_phases | unavailable | incomplete_reset | incomplete"
             ),
+            "generation_expert_input_wait": "unavailable",
+            "potentially_blocking_next_miss_step": (
+                "measured_upper_bound | incomplete"
+            ),
             "operation_credit": "unavailable",
             "byte_credit": "unavailable",
             "authoritative_reserve": "unavailable",
@@ -528,9 +555,12 @@ integral, block, and histogram deltas. Duration-weight all fractions. Emit:
 ```
 
 Keep v1 fields unchanged. The summary is decode-scoped, but its nested backend
-deltas are explicitly all-phase over the sampler window. Preserve exact
-nanosecond durations alongside fractions, emit `null` rather than zero when the
-decode denominator is absent, and document identities, the telemetry-only lock,
+deltas are explicitly all-phase over the sampler window. Preserve nanosecond
+durations alongside fractions, while labeling the potentially blocking
+next-miss duration as an upper bound rather than exact blocked time. Emit `null`
+rather than zero when the decode denominator is absent. Require the canonical
+histogram bounds `(1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000,
+1_000_000_000)` nanoseconds, and document identities, the telemetry-only lock,
 histogram bounds, and unavailable claims in `docs/RESOURCE_TELEMETRY.md`. Point
 `project-map.md` to the new Phase 1 evidence.
 
@@ -561,56 +591,40 @@ conditions. Create a run ID using the `CONTRIBUTING.md` grammar and store raw
 machine output under `benchmarks/raw/<benchmark>/<run-id>/`; write only the
 curated reproducibility summary under `benchmarks/results/`.
 
-Run at least four balanced telemetry-off/telemetry-on pairs in alternating
-AB/BA order. Record every exact command and interval, and require parity for
-generated tokens, router decisions, model/config hashes, logical record bytes,
-cache counters, and failures. Estimate instrumentation overhead from the paired
-telemetry-off lane; never use telemetry-on TPS as a promotion headline.
+Run four balanced telemetry-off/telemetry-on pairs physically in this AB/BA
+order: `off-p01`, `on-p01`, `on-p02`, `off-p02`, `off-p03`, `on-p03`,
+`on-p04`, `off-p04`. Record every exact command and interval, and require parity
+for generated tokens, router decisions, model/artifact identities, logical
+record bytes, cache counters, and failures. Raw configuration fingerprints must
+form one stable value per arm and differ because `resource_telemetry` is part of
+the runtime config. The normalized full configuration identity removes only
+that nested telemetry toggle and must match across all eight runs; it still
+covers prompt, generation, scheduler, MTP, and model-artifact settings. Estimate
+instrumentation overhead from the paired telemetry-off lane; never use
+telemetry-on TPS as a promotion headline.
 
-Each repeat uses this frozen command shape; `TELEMETRY_ARGS` is exactly
-`(--no-resource-telemetry)` for control and
-`(--resource-telemetry --resource-sample-interval 0.25
---resource-max-samples 4096 --ssd-ceiling-gib-s 12.47 --no-powermetrics)` for
-attribution:
+Use the tested issue-specific campaign runner. `--plan-only` prints the frozen
+physical order and both exact argv templates without changing Qwen or acquiring
+the lane:
 
 ```bash
-MODEL="$HOME/.cache/huggingface/hub/models--pipenetwork--Hy3-4bit/snapshots/160619d3f96c8470350b6dac0ef033a8381551e3"
-LABEL="issue30-${VARIANT}-$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short=12 HEAD)"
-OUT="benchmarks/raw/moe-runtime/$LABEL"
+uv run --frozen --extra dev --extra server python \
+  scripts/run_issue30_starvation_attribution.py --plan-only
 
 uv run --frozen --extra dev --extra server python \
-  scripts/benchmark_streamed_generation.py \
-  "$MODEL" "$MODEL/expert-manifest-sidecar.json" \
-  --model-key hy3-q4 \
-  --memory-limit 120259084288 \
-  --runtime-reserve 8589934592 \
-  --expert-cache-limit 83034243072 \
-  --max-live-kv-tokens 18888 \
-  --cache-policy lru \
-  --cache-scope global \
-  --slot-layout component-banks \
-  --transient-slots 32 \
-  --read-chunk 67108864 \
-  --f-nocache \
-  --trust-sidecar \
-  --no-enable-mtp \
-  --chat \
-  --prompt-file benchmarks/prompts/moe_streaming_realistic.md \
-  --generation-profile deterministic \
-  --max-tokens 256 \
-  --concurrency 1 \
-  --max-prefills-per-step 1 \
-  --workload-shape static \
-  --no-window-telemetry \
-  "${TELEMETRY_ARGS[@]}" \
-  --run-label "$LABEL" \
-  --output-dir "$OUT" \
-  --output-json "$OUT/result.json"
+  scripts/run_issue30_starvation_attribution.py
 ```
 
-Before the exclusive window, capture whether Qwen is running. Stop it only for
-the measurements, and install a shell cleanup trap that restores the captured
-state on success, failure, or interruption. After restoration, verify the Qwen
-API and loaded-model response before publishing the Phase 1 report to issue
-#30. No striping or scheduler implementation begins until this evidence is
-reviewed.
+The runner asserts one clean full SHA before every invocation, atomically
+acquires `/tmp/mtplx-gpu-exclusive`, waits for an already-running benchmark,
+and fails closed on an ambiguous stale lane. It captures the exact launchd/API
+Qwen state, uses conditional `launchctl bootout`, and blocks termination signals
+while restoring that exact state and releasing the lane. Each benchmark runs in
+its own process group so interruption terminates and reaps descendants before
+Qwen restoration. The atomic campaign manifest records the physical order,
+argv, UTC start/end, sanitized chip/RAM/OS data, thermal status, unavailable fan
+coverage, source SHA, parity signatures, throughput, and initial/final Qwen
+state. This exclusivity proof covers launchers that honor the shared lane; it
+does not claim control over an unrelated process that deliberately bypasses the
+repository convention. No striping or scheduler implementation begins until
+the Phase 1 evidence is reviewed.

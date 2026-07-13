@@ -1996,13 +1996,13 @@ def test_component_bank_all_hit_decode_preserves_route_waves_counters_and_shared
             == 1
         )
         assert (
-            pipeline_after["counters"]["generation_expert_input_wait_events"]
-            - pipeline_before["counters"]["generation_expert_input_wait_events"]
+            pipeline_after["counters"]["potentially_blocking_next_miss_events"]
+            - pipeline_before["counters"]["potentially_blocking_next_miss_events"]
             == 0
         )
         assert (
-            pipeline_after["integrals_ns"]["generation_expert_input_wait_ns"]
-            - pipeline_before["integrals_ns"]["generation_expert_input_wait_ns"]
+            pipeline_after["integrals_ns"]["potentially_blocking_next_miss_ns"]
+            - pipeline_before["integrals_ns"]["potentially_blocking_next_miss_ns"]
             == 0
         )
         assert pipeline_after["gauges"]["open_hit_work_spans"] == 0
