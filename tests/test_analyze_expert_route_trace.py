@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import random
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -462,6 +465,64 @@ def test_cli_exports_train_derived_recommendation_in_json(
         == payload["held_out"]["dynamic_quota_training"]["training_hit_gain"]
     )
     assert isinstance(payload["prefetch"]["temporal_previous_token"]["hits"], int)
+
+
+def test_direct_script_output_json_works_without_repo_on_pythonpath(
+    tmp_path: Path,
+) -> None:
+    trace_path = tmp_path / "route-trace.json"
+    output_path = tmp_path / "analysis.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {"phase": "prefill", "layer": 1, "expert_ids": [0]},
+                    *(
+                        {
+                            "phase": "decode",
+                            "layer": 1,
+                            "trace_epoch": 0,
+                            "decode_step": step,
+                            "token_count": 1,
+                            "expert_ids": [step],
+                        }
+                        for step in (0, 1)
+                    ),
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(route.__file__).resolve()),
+            str(trace_path),
+            "--capacity-per-layer",
+            "1",
+            "--expert-count",
+            "2",
+            "--top-k",
+            "1",
+            "--train-steps",
+            "1",
+            "--cluster-sizes",
+            "1",
+            "--output-json",
+            str(output_path),
+        ],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(output_path.read_text(encoding="utf-8"))["decode_steps"] == 2
 
 
 def _run_trace_analysis(

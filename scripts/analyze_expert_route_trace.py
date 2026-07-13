@@ -12,12 +12,17 @@ from __future__ import annotations
 import argparse
 import heapq
 import json
+import sys
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 from typing import Hashable, Iterable, Sequence, TypeVar
 
-from mtplx.expert_runtime import partition_route_waves
-from mtplx.expert_streaming import (
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from mtplx.expert_runtime import partition_route_waves  # noqa: E402
+from mtplx.expert_streaming import (  # noqa: E402
     CacheCounters,
     GlobalExpertSlotBank,
     LayerExpertSlotBank,
