@@ -226,6 +226,8 @@ class MlxComponentBank:
             except Exception:
                 pass
         self._views.clear()
+        self.arrays.clear()
+        self._segment_bytes.clear()
 
 
 class MlxComponentSlot:
@@ -580,15 +582,25 @@ def make_mlx_component_bank_allocator(
         slots[label] = slot
         return slot
 
+    def close_banks() -> None:
+        for bank in tuple(banks.values()):
+            bank.close()
+        banks.clear()
+        slots.clear()
+        _release_mlx_cache()
+
     setattr(allocate, "backend", backend)
     setattr(allocate, "slots", slots)
     setattr(allocate, "banks", banks)
-    setattr(
-        allocate,
-        "close",
-        lambda: [bank.close() for bank in tuple(banks.values())],
-    )
+    setattr(allocate, "close", close_banks)
     return allocate
+
+
+def _release_mlx_cache() -> None:
+    try:
+        mx.clear_cache()
+    except Exception:  # pragma: no cover - compatibility with older MLX
+        pass
 
 
 def _run_q4_expert(

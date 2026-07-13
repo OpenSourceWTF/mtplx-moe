@@ -30,6 +30,10 @@ class ExpertCompletionFenceError(ExpertSlotError):
         self.policy_rollback_safe = bool(policy_rollback_safe)
 
 
+def _closed_allocator(_size: int, _label: str) -> Any:
+    raise ExpertSlotError("expert slot pool is closed; its allocator was released")
+
+
 @dataclass
 class RouteIOAdmission:
     """Per-route record of executor work accepted past the rollback boundary."""
@@ -1580,6 +1584,9 @@ class ExpertSlotPool:
                 allocator_close = getattr(self._allocator, "close", None)
                 if callable(allocator_close):
                     allocator_close()
+                for slot in (*self._persistent.values(), *self._transient):
+                    slot.buffer = None
+                self._allocator = _closed_allocator
                 with self._lifecycle:
                     self._closed = True
                     self._closing = False

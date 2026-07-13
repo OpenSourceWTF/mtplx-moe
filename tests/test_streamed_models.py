@@ -1103,6 +1103,55 @@ def test_global_component_bank_allocator_reuses_one_persistent_bank_and_accounts
         runtime.close()
 
 
+def test_global_component_bank_runtime_close_releases_all_storage_owners(
+    tmp_path: Path,
+) -> None:
+    root, _config, spec, manifest_path = _integrated_glm_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=fixed + 3 * spec.expert_record_bytes,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        cache_scope="global",
+        slot_layout="component-banks",
+    )
+    allocator = make_mlx_component_bank_allocator(
+        stream_config.memory_plan(spec),
+        spec,
+        load_expert_manifest(manifest_path),
+    )
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=allocator,
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+    pool = runtime.slots
+    physical_slots = (*pool._persistent.values(), *pool._transient)
+    banks = tuple(allocator.banks.values())
+    assert banks
+    assert allocator.slots
+    assert all(bank.arrays for bank in banks)
+    assert all(bank._views for bank in banks)
+    assert all(bank._segment_bytes for bank in banks)
+    assert all(slot.buffer is not None for slot in physical_slots)
+
+    assert runtime.close() is None
+
+    assert all(not bank.arrays for bank in banks)
+    assert all(not bank._views for bank in banks)
+    assert all(not bank._segment_bytes for bank in banks)
+    assert allocator.banks == {}
+    assert allocator.slots == {}
+    assert all(slot.buffer is None for slot in physical_slots)
+    assert pool._allocator is not allocator
+    assert runtime.close() is None
+
+
 @pytest.mark.parametrize("difference", ["order", "dtype", "shape", "length"])
 def test_global_component_bank_allocator_rejects_non_exemplar_geometry(
     tmp_path: Path,
