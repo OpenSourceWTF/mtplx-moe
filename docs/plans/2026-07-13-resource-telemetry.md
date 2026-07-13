@@ -269,8 +269,8 @@ def synthetic_intervals(
     return [
         {
             "interval_seconds": 1.0,
-            "physical_read_bytes": int(ssd_gib_s * 1024**3),
-            "physical_read_operations": 1024,
+            "reader_read_bytes": int(ssd_gib_s * 1024**3),
+            "reader_read_operations": 1024,
             "ssd_gib_per_second": ssd_gib_s,
             "expert_misses": expert_misses,
             "reader_queue_nonempty": index < queued_count,
@@ -381,7 +381,8 @@ class ResourceTelemetrySampler:
         self._snapshot = snapshot
         self._token_count = token_count
         self._interval_s = float(interval_s)
-        self._ticks = deque(maxlen=int(max_samples))
+        self._first_tick = None
+        self._recent_ticks = deque(maxlen=int(max_samples) - 1)
 
     def _tick(self) -> ResourceTick:
         return ResourceTick(
@@ -404,7 +405,7 @@ class ResourceRun:
         )
 ```
 
-Difference `read_bytes`, `read_operations`, cache requests/misses, and every occupancy integral over the same monotonic interval. Emit wall-rate GiB/s, IOPS, bytes/read, expert requests/s, completion tokens/s, mean queue depth, mean active readers, mean queued/active bytes, completion-fence occupancy, and interval booleans for I/O active, fence pending, both, and neither. Keep a bounded raw timeline and summarize occupancy and overlap fractions.
+Difference `read_bytes`, `read_operations`, cache requests/misses, and every occupancy integral over the same monotonic interval. Emit wall-rate GiB/s, IOPS, bytes/read, expert requests/s, completion tokens/s, mean queue depth, mean active readers, mean queued/active bytes, completion-fence occupancy, and interval booleans for I/O active, fence pending, both, and neither. Keep the first tick plus a bounded recent tail so cumulative summaries cover the whole run. If samples are dropped, mark interval attribution incomplete until the run is repeated with a larger bound.
 
 Expose `q4_assignments_per_second` as the physical Q4 routed-assignment rate,
 derived from `cache.expert_requests` only for the Q4 model keys supported by
@@ -413,9 +414,9 @@ not hidden by the aggregate.
 
 Evidence rules are deterministic and named in output:
 
-- SSD saturation is `supported` only when supplied-ceiling utilization is at least 0.75, reader active-capacity fraction is at least 0.75, and queued-read interval fraction is at least 0.50.
+- SSD saturation is `supported` only when `F_NOCACHE` is active, supplied-ceiling utilization is at least 0.75, reader active-capacity fraction is at least 0.75, and queued-read interval fraction is at least 0.50.
 - Reader backpressure is `present` when reader active-capacity fraction is at least 0.75 and queued-read interval fraction is at least 0.50.
-- Submission/dependency starvation is only a candidate when physical SSD utilization is below 0.40, queued-read interval fraction is below 0.10, and cache misses occurred.
+- Submission/dependency starvation is only a candidate when uncached reader throughput is below 0.40 of the SSD ceiling, queued-read interval fraction is below 0.10, and cache misses occurred.
 - GPU evidence is `unavailable` unless the collector returns measured process GPU time or an explicitly labeled system GPU residency sample.
 - RAM bandwidth remains `unavailable`; routed expert bytes are reported as demand, not utilization.
 - Attribution is `conclusive` only for directly supported storage or GPU saturation. Otherwise it is `incomplete` with evidence-backed candidates and coverage gaps.

@@ -23,6 +23,7 @@ python3 scripts/benchmark_streamed_generation.py MODEL_ROOT MANIFEST \
   --resource-telemetry \
   --resource-sample-interval 0.25 \
   --resource-max-samples 4096 \
+  --f-nocache \
   --ssd-ceiling-gib-s 12.47 \
   --powermetrics \
   --no-window-telemetry \
@@ -41,6 +42,9 @@ For the matched headline lane, remove `--resource-telemetry`,
 ## Read the report in this order
 
 1. Read `coverage`. An unavailable counter is unknown, never zero.
+   If `coverage.timeline` is `retained_start_and_recent_tail`, cumulative
+   throughput still spans the run, but interval attribution is deliberately
+   incomplete; increase `--resource-max-samples` and repeat.
 2. Read `storage` and `reader_pool` together. SSD throughput alone cannot
    distinguish device saturation from an underfed device.
 3. Read `completion_fences` and `overlap` to see whether reads and outstanding
@@ -55,7 +59,7 @@ For the matched headline lane, remove `--resource-telemetry`,
 
 | Observed evidence | Defensible conclusion | Operations to investigate |
 | --- | --- | --- |
-| Read queue nonempty, readers near capacity, SSD near the supplied ceiling | Storage throughput is limiting | Physical bytes per token, cache hit rate, eviction policy, record layout |
+| Read queue nonempty, readers near capacity, uncached reader throughput near the supplied SSD ceiling | Storage throughput is limiting | Reader bytes per token, cache hit rate, eviction policy, record layout |
 | Read queue nonempty and readers near capacity, but SSD below its ceiling | Backpressure exists before the device ceiling | Reader count, request size, batching, positional-read shape, completion processing |
 | Cache misses occur while the read queue is empty and SSD use is low | The device is being starved | Route submission, dependency ordering, prefetch distance, producer serialization |
 | Generation thread is near one full core while measured SSD and GPU activity are low | Host orchestration is a candidate | Python routing, wave construction, dispatch preparation, per-token bookkeeping |
@@ -77,9 +81,11 @@ The current evidence thresholds are intentionally conservative:
 ## What each field actually means
 
 `storage.mean_gib_per_second`
-: Physical bytes reported by the positional reader divided by benchmark wall
-  time. Use this for device demand. `slots.io.read_mib_per_second` instead uses
-  summed reader service time and can overstate sustained device throughput.
+: Bytes returned by the positional reader divided by benchmark wall time. The
+  harness compares this with an SSD ceiling only when `--f-nocache` is active;
+  otherwise `coverage.storage_reads` is `logical_reader_bytes` and storage
+  saturation is unavailable. `slots.io.read_mib_per_second` instead uses summed
+  reader service time and can overstate sustained device throughput.
 
 `reader_pool.mean_queued_reads`
 : Occupancy integrated at executor state changes. A sustained value above zero
