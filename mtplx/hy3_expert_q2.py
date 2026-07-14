@@ -60,6 +60,7 @@ _SOURCE_DIRECTORY_NAME = "hy3-expert-only-mlx-q4"
 _TARGET_DIRECTORY_NAME = "hy3-expert-only-mlx-q2"
 _WORK_DIRECTORY_NAME = ".hy3-expert-only-mlx-q2.incomplete"
 _JOURNAL_FILE = "conversion-journal.jsonl"
+_RETAINED_JOURNAL_PREFIX = ".mtplx-hy3-q2-journal-"
 _SIDECAR_FILE = "experts.bin"
 _EXPERT_MANIFEST_FILE = "expert-manifest.json"
 _CONVERSION_MANIFEST_FILE = "conversion-manifest.json"
@@ -3688,73 +3689,129 @@ def _open_named_directory(parent_fd: int, name: str, *, label: str) -> int:
         raise
 
 
-def _rollback_published_directory(
+def _named_entry_exists(directory_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _quarantine_named_entry(directory_fd: int, name: str, *, reason: str) -> str:
+    quarantine = f"{_WORK_DIRECTORY_NAME}.{reason}-{secrets.token_hex(16)}"
+    _exclusive_name_rename(
+        directory_fd,
+        name,
+        directory_fd,
+        quarantine,
+    )
+    return quarantine
+
+
+def _find_directory_name_by_identity(parent_fd: int, directory_fd: int) -> str:
+    descriptor = os.fstat(directory_fd)
+    matches: list[str] = []
+    for name in os.listdir(parent_fd):
+        try:
+            entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(entry.st_mode) and (
+            entry.st_dev,
+            entry.st_ino,
+        ) == (descriptor.st_dev, descriptor.st_ino):
+            matches.append(name)
+    if len(matches) != 1:
+        raise ValueError(
+            "held conversion work directory does not have one recoverable parent name"
+        )
+    return matches[0]
+
+
+def _recover_verified_work_to_canonical(parent_fd: int, work_fd: int) -> None:
+    """Recover the held work inode by identity without overwriting any entry."""
+
+    for _attempt in range(8):
+        source_name = _find_directory_name_by_identity(parent_fd, work_fd)
+        if source_name == _WORK_DIRECTORY_NAME:
+            _assert_work_root_identity(parent_fd, work_fd)
+            os.fsync(parent_fd)
+            return
+        if _named_entry_exists(parent_fd, _WORK_DIRECTORY_NAME):
+            _quarantine_named_entry(
+                parent_fd,
+                _WORK_DIRECTORY_NAME,
+                reason="rejected",
+            )
+        source_name = _find_directory_name_by_identity(parent_fd, work_fd)
+        if source_name == _WORK_DIRECTORY_NAME:
+            continue
+        try:
+            _exclusive_directory_rename(
+                parent_fd,
+                source_name,
+                parent_fd,
+                _WORK_DIRECTORY_NAME,
+            )
+        except FileExistsError:
+            continue
+        try:
+            _assert_work_root_identity(parent_fd, work_fd)
+        except ValueError:
+            if _named_entry_exists(parent_fd, _WORK_DIRECTORY_NAME):
+                _quarantine_named_entry(
+                    parent_fd,
+                    _WORK_DIRECTORY_NAME,
+                    reason="rejected",
+                )
+            continue
+        os.fsync(parent_fd)
+        return
+    raise ValueError("held conversion work directory could not be recovered")
+
+
+def _stage_private_publication_source(parent_fd: int, work_fd: int) -> str:
+    private_name = f"{_WORK_DIRECTORY_NAME}.publish-{secrets.token_hex(16)}"
+    try:
+        _exclusive_directory_rename(
+            parent_fd,
+            _WORK_DIRECTORY_NAME,
+            parent_fd,
+            private_name,
+        )
+    except BaseException:
+        _recover_verified_work_to_canonical(parent_fd, work_fd)
+        raise
+    try:
+        _assert_named_directory_identity(
+            parent_fd,
+            private_name,
+            work_fd,
+            label="private publication source",
+        )
+    except BaseException:
+        _recover_verified_work_to_canonical(parent_fd, work_fd)
+        raise ValueError("private publication source identity changed")
+    return private_name
+
+
+def _recover_after_publication_failure(
     parent_fd: int,
     published_name: str,
-    preferred_name: str,
-    published_fd: int,
-) -> str:
-    """Remove a rejected publication from its public name without deletion."""
-
-    _assert_named_directory_identity(
+    private_name: str,
+    work_fd: int,
+) -> None:
+    exact_name = _find_directory_name_by_identity(parent_fd, work_fd)
+    if exact_name not in {private_name, published_name} and _named_entry_exists(
         parent_fd,
         published_name,
-        published_fd,
-        label="rejected published directory",
-    )
-    rollback_name = preferred_name
-    try:
-        _exclusive_directory_rename(
+    ):
+        _quarantine_named_entry(
             parent_fd,
             published_name,
-            parent_fd,
-            rollback_name,
+            reason="rejected-publication",
         )
-    except FileExistsError:
-        rollback_name = f"{_WORK_DIRECTORY_NAME}.rejected-{secrets.token_hex(16)}"
-        _exclusive_directory_rename(
-            parent_fd,
-            published_name,
-            parent_fd,
-            rollback_name,
-        )
-    _assert_named_directory_identity(
-        parent_fd,
-        rollback_name,
-        published_fd,
-        label="rolled-back published directory",
-    )
-    os.fsync(parent_fd)
-    return rollback_name
-
-
-def _rollback_verified_publication_if_present(
-    parent_fd: int,
-    published_name: str,
-    work_fd: int,
-) -> bool:
-    try:
-        published_fd = _open_named_directory(
-            parent_fd,
-            published_name,
-            label="interrupted published output root",
-        )
-    except ValueError:
-        return False
-    try:
-        published = os.fstat(published_fd)
-        work = os.fstat(work_fd)
-        if (published.st_dev, published.st_ino) != (work.st_dev, work.st_ino):
-            return False
-        _rollback_published_directory(
-            parent_fd,
-            published_name,
-            _WORK_DIRECTORY_NAME,
-            published_fd,
-        )
-        return True
-    finally:
-        os.close(published_fd)
+    _recover_verified_work_to_canonical(parent_fd, work_fd)
 
 
 def _publish_verified_work(
@@ -3777,86 +3834,153 @@ def _publish_verified_work(
         raise ValueError("final output root appeared before atomic publish")
     verified.assert_unchanged(work_fd)
     _assert_work_root_identity(parent_fd, work_fd)
+    private_name = _stage_private_publication_source(parent_fd, work_fd)
     try:
         _exclusive_directory_rename(
             parent_fd,
-            _WORK_DIRECTORY_NAME,
+            private_name,
             parent_fd,
             config.output_root.name,
         )
     except BaseException:
-        _rollback_verified_publication_if_present(
+        _recover_after_publication_failure(
             parent_fd,
             config.output_root.name,
+            private_name,
             work_fd,
         )
         raise
-    published_fd = _open_named_directory(
-        parent_fd,
-        config.output_root.name,
-        label="published output root",
-    )
+    published_fd: int | None = None
     try:
+        published_fd = _open_named_directory(
+            parent_fd,
+            config.output_root.name,
+            label="published output root",
+        )
         published = os.fstat(published_fd)
         verified_work = os.fstat(work_fd)
         if (published.st_dev, published.st_ino) != (
             verified_work.st_dev,
             verified_work.st_ino,
         ):
-            _rollback_published_directory(
-                parent_fd,
-                config.output_root.name,
-                _WORK_DIRECTORY_NAME,
-                published_fd,
-            )
             raise ValueError("published output root path identity changed")
-        try:
-            os.fsync(parent_fd)
-            _assert_named_directory_identity(
-                parent_fd,
-                config.output_root.name,
-                work_fd,
-                label="published output root",
-            )
-        except BaseException:
-            _rollback_published_directory(
-                parent_fd,
-                config.output_root.name,
-                _WORK_DIRECTORY_NAME,
-                published_fd,
-            )
-            raise
+        os.fsync(parent_fd)
+        _assert_named_directory_identity(
+            parent_fd,
+            config.output_root.name,
+            work_fd,
+            label="published output root",
+        )
+    except BaseException:
+        _recover_after_publication_failure(
+            parent_fd,
+            config.output_root.name,
+            private_name,
+            work_fd,
+        )
+        raise
     finally:
-        os.close(published_fd)
+        if published_fd is not None:
+            os.close(published_fd)
     return config.output_root
 
 
-def _unlink_verified_member(
-    work_fd: int,
+def _assert_named_file_identity(
+    directory_fd: int,
     name: str,
     member_fd: int,
-    verified: _VerifiedDirectory,
+    *,
+    label: str,
 ) -> None:
-    """Unlink only the inode held by ``member_fd`` from a randomized name."""
-
-    _assert_conversion_file_identity(work_fd, name, member_fd)
-    tombstone = f".{name}.delete-{secrets.token_hex(16)}"
-    _exclusive_name_rename(work_fd, name, work_fd, tombstone)
     try:
-        _assert_conversion_file_identity(work_fd, tombstone, member_fd)
-    except BaseException:
+        entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(f"{label} identity is unavailable: {exc}") from exc
+    descriptor = os.fstat(member_fd)
+    if (
+        not stat.S_ISREG(entry.st_mode)
+        or entry.st_nlink != 1
+        or (entry.st_dev, entry.st_ino) != (descriptor.st_dev, descriptor.st_ino)
+    ):
+        raise ValueError(f"{label} identity changed")
+
+
+def _retain_verified_journal(
+    work_fd: int,
+    parent_fd: int,
+    member_fd: int,
+    verified: _VerifiedDirectory,
+    journal_sha256: str,
+) -> str:
+    """Move the exact journal outside publish inventory and retain it."""
+
+    _assert_conversion_file_identity(work_fd, _JOURNAL_FILE, member_fd)
+    retained_name = (
+        f"{_RETAINED_JOURNAL_PREFIX}{journal_sha256[:16]}-{secrets.token_hex(16)}"
+    )
+    _exclusive_name_rename(
+        work_fd,
+        _JOURNAL_FILE,
+        parent_fd,
+        retained_name,
+    )
+    _assert_named_file_identity(
+        parent_fd,
+        retained_name,
+        member_fd,
+        label="retained conversion journal",
+    )
+    verified.remove(_JOURNAL_FILE)
+    _assert_named_file_identity(
+        parent_fd,
+        retained_name,
+        member_fd,
+        label="retained conversion journal",
+    )
+    os.fsync(work_fd)
+    os.fsync(parent_fd)
+    return retained_name
+
+
+def _verify_retained_journal_receipt(
+    parent_fd: int,
+    receipt: dict[str, Any],
+) -> str:
+    expected_sha256 = receipt.get("sha256")
+    expected_bytes = receipt.get("bytes")
+    for name in os.listdir(parent_fd):
+        if not name.startswith(_RETAINED_JOURNAL_PREFIX):
+            continue
         try:
-            _exclusive_name_rename(work_fd, tombstone, work_fd, name)
-        except BaseException as rollback_error:
-            raise ValueError(
-                "verified member substitution rollback failed"
-            ) from rollback_error
-        raise ValueError(f"conversion file {name} identity changed before deletion")
-    verified.remove(name)
-    _assert_conversion_file_identity(work_fd, tombstone, member_fd)
-    os.unlink(tombstone, dir_fd=work_fd)
-    if os.fstat(member_fd).st_nlink != 0:
-        raise ValueError(f"conversion file {name} was not the inode deleted")
+            entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or entry.st_nlink != 1
+            or entry.st_size != expected_bytes
+        ):
+            continue
+        fd = os.open(name, _read_flags(), dir_fd=parent_fd)
+        try:
+            descriptor = os.fstat(fd)
+            if (entry.st_dev, entry.st_ino) != (
+                descriptor.st_dev,
+                descriptor.st_ino,
+            ) or _hash_fd(
+                fd, length=descriptor.st_size, chunk_bytes=8 * 1024**2
+            ) != expected_sha256:
+                continue
+            _assert_named_file_identity(
+                parent_fd,
+                name,
+                fd,
+                label="retained conversion journal receipt",
+            )
+            return name
+        finally:
+            os.close(fd)
+    raise ValueError("retained conversion journal receipt is unavailable")
 
 
 def _validate_pilot_report(
@@ -4044,6 +4168,10 @@ def finalize_hy3_expert_q2(config: ConversionConfig) -> Path:
                 != context.report["pilot_report_sha256"]
             ):
                 raise ValueError("verified work build or pilot receipt mismatch")
+            journal_receipt = conversion.get("journal")
+            if not isinstance(journal_receipt, dict):
+                raise ValueError("verified work journal receipt is missing")
+            _verify_retained_journal_receipt(parent_fd, journal_receipt)
             manifest_value, _manifest_digest, _manifest_bytes = _read_json_member(
                 work_fd,
                 _EXPERT_MANIFEST_FILE,
@@ -4126,13 +4254,13 @@ def finalize_hy3_expert_q2(config: ConversionConfig) -> Path:
             allow_journal=True,
         )
         _assert_conversion_file_identity(work_fd, _JOURNAL_FILE, journal_fd)
-        _unlink_verified_member(
+        _retain_verified_journal(
             work_fd,
-            _JOURNAL_FILE,
+            parent_fd,
             journal_fd,
             verified,
+            journal_sha256,
         )
-        os.fsync(work_fd)
         verified.assert_unchanged(work_fd)
         return _publish_verified_work(config, context, work_fd, verified)
     finally:

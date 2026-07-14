@@ -2199,7 +2199,7 @@ def test_finalize_publishes_authoritative_output_atomically_and_records_journal(
             target_directory_fd,
             target,
         )
-        if source == env["work_root"].name and target == env["output_root"].name:
+        if target == env["output_root"].name:
             events.append("directory_replace")
         return result
 
@@ -2236,6 +2236,12 @@ def test_finalize_publishes_authoritative_output_atomically_and_records_journal(
     conversion = json.loads((published / "conversion-manifest.json").read_text())
     assert conversion["journal"]["record_count"] == 3
     assert len(conversion["journal"]["sha256"]) == 64
+    retained_journals = list(tmp_path.glob(f"{q2_module._RETAINED_JOURNAL_PREFIX}*"))
+    assert len(retained_journals) == 1
+    assert (
+        hashlib.sha256(retained_journals[0].read_bytes()).hexdigest()
+        == conversion["journal"]["sha256"]
+    )
     assert conversion["target"]["expert_manifest_sha256"] == manifest.manifest_sha256
     assert verify_hy3_expert_q2(published, deep=True)["passed"] is True
 
@@ -2299,6 +2305,7 @@ def test_finalize_interruption_after_journal_removal_is_safely_retryable(
     assert env["work_root"].is_dir()
     assert not (env["work_root"] / "conversion-journal.jsonl").exists()
     assert not env["output_root"].exists()
+    assert len(list(tmp_path.glob(f"{q2_module._RETAINED_JOURNAL_PREFIX}*"))) == 1
 
     assert finalize_hy3_expert_q2(config) == env["output_root"]
     assert verify_hy3_expert_q2(env["output_root"], deep=True)["passed"] is True
@@ -2467,6 +2474,7 @@ def test_publish_rolls_back_source_name_substituted_at_rename_boundary(
     env = _conversion_test_environment(tmp_path, monkeypatch)
     config = _complete_staged_conversion(env)
     held_work = env["work_root"].with_name(f"{env['work_root'].name}-held")
+    verified_inode = env["work_root"].stat().st_ino
     original_rename = q2_module._exclusive_directory_rename
     substituted = False
 
@@ -2477,7 +2485,7 @@ def test_publish_rolls_back_source_name_substituted_at_rename_boundary(
         target,
     ):
         nonlocal substituted
-        if source == env["work_root"].name and target == env["output_root"].name:
+        if source == env["work_root"].name and ".publish-" in target:
             env["work_root"].rename(held_work)
             env["work_root"].mkdir()
             (env["work_root"] / "attacker-owned").write_bytes(b"preserve me")
@@ -2495,13 +2503,84 @@ def test_publish_rolls_back_source_name_substituted_at_rename_boundary(
         substitute_source_then_rename,
     )
 
-    with pytest.raises(ValueError, match="published output root.*identity"):
+    with pytest.raises(ValueError, match="private publication source.*identity"):
         finalize_hy3_expert_q2(config)
 
     assert substituted is True
     assert not env["output_root"].exists()
-    assert (env["work_root"] / "attacker-owned").read_bytes() == b"preserve me"
-    assert held_work.is_dir()
+    assert env["work_root"].stat().st_ino == verified_inode
+    assert not held_work.exists()
+    assert any(
+        path.is_dir() and (path / "attacker-owned").read_bytes() == b"preserve me"
+        for path in tmp_path.iterdir()
+        if (path / "attacker-owned").is_file()
+    )
+
+
+def test_private_publish_recovers_canonical_work_after_swap_and_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    config = _complete_staged_conversion(env)
+    verified_inode = env["work_root"].stat().st_ino
+    hidden_verified = env["work_root"].with_name(
+        f"{env['work_root'].name}-attacker-hidden"
+    )
+    original_rename = q2_module._exclusive_directory_rename
+    interrupted = False
+
+    def swap_then_rename_and_interrupt(
+        source_directory_fd,
+        source,
+        target_directory_fd,
+        target,
+    ):
+        nonlocal interrupted
+        if source == env["work_root"].name and not interrupted:
+            env["work_root"].rename(hidden_verified)
+            env["work_root"].mkdir()
+            (env["work_root"] / "attacker-owned").write_bytes(b"preserve me")
+            original_rename(
+                source_directory_fd,
+                source,
+                target_directory_fd,
+                target,
+            )
+            interrupted = True
+            raise KeyboardInterrupt("injected swapped-source interruption")
+        return original_rename(
+            source_directory_fd,
+            source,
+            target_directory_fd,
+            target,
+        )
+
+    monkeypatch.setattr(
+        q2_module,
+        "_exclusive_directory_rename",
+        swap_then_rename_and_interrupt,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="swapped-source interruption"):
+        finalize_hy3_expert_q2(config)
+
+    assert interrupted is True
+    assert not env["output_root"].exists()
+    assert env["work_root"].is_dir()
+    assert env["work_root"].stat().st_ino == verified_inode
+    assert any(
+        path.is_dir() and (path / "attacker-owned").read_bytes() == b"preserve me"
+        for path in tmp_path.iterdir()
+        if (path / "attacker-owned").is_file()
+    )
+
+    monkeypatch.setattr(
+        q2_module,
+        "_exclusive_directory_rename",
+        original_rename,
+    )
+    assert finalize_hy3_expert_q2(config) == env["output_root"]
 
 
 def test_finalize_does_not_unlink_a_substituted_journal(
@@ -2522,7 +2601,9 @@ def test_finalize_does_not_unlink_a_substituted_journal(
         target,
     ):
         nonlocal substituted
-        if source == journal.name and target.startswith(f".{journal.name}.delete-"):
+        if source == journal.name and target.startswith(
+            q2_module._RETAINED_JOURNAL_PREFIX
+        ):
             journal.rename(held_journal)
             journal.write_bytes(b"attacker-owned replacement\n")
             substituted = True
@@ -2539,12 +2620,14 @@ def test_finalize_does_not_unlink_a_substituted_journal(
         substitute_at_delete_rename,
     )
 
-    with pytest.raises(ValueError, match="journal.*identity|inventory.*changed"):
+    with pytest.raises(ValueError, match="retained conversion journal.*identity"):
         finalize_hy3_expert_q2(config)
 
     assert substituted is True
-    assert journal.read_bytes() == b"attacker-owned replacement\n"
     assert held_journal.is_file()
+    retained = list(tmp_path.glob(f"{q2_module._RETAINED_JOURNAL_PREFIX}*"))
+    assert len(retained) == 1
+    assert retained[0].read_bytes() == b"attacker-owned replacement\n"
     assert not env["output_root"].exists()
 
 
@@ -2554,7 +2637,7 @@ def test_finalize_does_not_unlink_tombstone_substituted_after_lease_drop(
 ) -> None:
     env = _conversion_test_environment(tmp_path, monkeypatch)
     config = _complete_staged_conversion(env)
-    held_journal = env["work_root"] / "conversion-journal.held"
+    held_journal = tmp_path / ".conversion-journal.held"
     original_remove = q2_module._VerifiedDirectory.remove
     replacement: Path | None = None
 
@@ -2562,9 +2645,7 @@ def test_finalize_does_not_unlink_tombstone_substituted_after_lease_drop(
         nonlocal replacement
         original_remove(verified, name)
         if name == "conversion-journal.jsonl":
-            tombstones = list(
-                env["work_root"].glob(".conversion-journal.jsonl.delete-*")
-            )
+            tombstones = list(tmp_path.glob(f"{q2_module._RETAINED_JOURNAL_PREFIX}*"))
             assert len(tombstones) == 1
             replacement = tombstones[0]
             replacement.rename(held_journal)
@@ -2576,13 +2657,66 @@ def test_finalize_does_not_unlink_tombstone_substituted_after_lease_drop(
         substitute_after_lease_drop,
     )
 
-    with pytest.raises(ValueError, match="journal.*identity|conversion file"):
+    with pytest.raises(ValueError, match="retained conversion journal.*identity"):
         finalize_hy3_expert_q2(config)
 
     assert replacement is not None
     assert replacement.read_bytes() == b"attacker-owned replacement\n"
     assert held_journal.is_file()
     assert not env["output_root"].exists()
+
+
+def test_finalize_never_deletes_a_finally_substituted_journal_tombstone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    config = _complete_staged_conversion(env)
+    held_journal = tmp_path / ".conversion-journal.final-held"
+    original_assert = q2_module._assert_named_file_identity
+    replacement: Path | None = None
+    retained_checks = 0
+
+    def substitute_after_final_retained_check(
+        directory_fd,
+        name,
+        member_fd,
+        *,
+        label,
+    ):
+        nonlocal replacement, retained_checks
+        result = original_assert(
+            directory_fd,
+            name,
+            member_fd,
+            label=label,
+        )
+        if name.startswith(q2_module._RETAINED_JOURNAL_PREFIX):
+            retained_checks += 1
+            if retained_checks == 2:
+                replacement = tmp_path / name
+                os.rename(
+                    name,
+                    held_journal.name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                )
+                replacement.write_bytes(b"attacker-owned replacement\n")
+        return result
+
+    monkeypatch.setattr(
+        q2_module,
+        "_assert_named_file_identity",
+        substitute_after_final_retained_check,
+    )
+
+    published = finalize_hy3_expert_q2(config)
+
+    assert retained_checks == 2
+    assert replacement is not None
+    assert replacement.read_bytes() == b"attacker-owned replacement\n"
+    assert held_journal.is_file()
+    assert verify_hy3_expert_q2(published, deep=True)["passed"] is True
 
 
 def test_finalize_rolls_back_when_parent_fsync_fails_after_directory_rename(
@@ -2643,7 +2777,7 @@ def test_finalize_rolls_back_when_publish_rename_returns_an_interruption(
             target_directory_fd,
             target,
         )
-        if source == env["work_root"].name and target == env["output_root"].name:
+        if target == env["output_root"].name:
             interrupted = True
             raise KeyboardInterrupt("injected post-rename interruption")
         return result
