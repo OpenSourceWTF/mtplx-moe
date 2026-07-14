@@ -5,6 +5,7 @@ import math
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -2139,6 +2140,8 @@ def test_pilot_is_read_only_and_reports_requested_real_records(
         (1, 2),
     ]
     assert all(len(item["diagnostics"]) == 3 for item in report["records"])
+    assert report["producer"] == {"git_commit": "a" * 40, "dirty": False}
+    assert report["mlx_version"] == "0.31.test"
     assert not env["work_root"].exists()
     assert not env["output_root"].exists()
 
@@ -2185,12 +2188,17 @@ def test_finalize_publishes_authoritative_output_atomically_and_records_journal(
     env = _conversion_test_environment(tmp_path, monkeypatch)
     config = _complete_staged_conversion(env)
     parent_inode = tmp_path.stat().st_ino
-    original_replace = q2_module.os.replace
+    original_rename = q2_module._exclusive_directory_rename
     original_fsync = q2_module.os.fsync
     events: list[str] = []
 
-    def record_replace(source, target, *args, **kwargs):
-        result = original_replace(source, target, *args, **kwargs)
+    def record_rename(source_directory_fd, source, target_directory_fd, target):
+        result = original_rename(
+            source_directory_fd,
+            source,
+            target_directory_fd,
+            target,
+        )
         if source == env["work_root"].name and target == env["output_root"].name:
             events.append("directory_replace")
         return result
@@ -2202,7 +2210,7 @@ def test_finalize_publishes_authoritative_output_atomically_and_records_journal(
             if stat.S_ISDIR(metadata.st_mode) and metadata.st_ino == parent_inode:
                 events.append("parent_fsync")
 
-    monkeypatch.setattr(q2_module.os, "replace", record_replace)
+    monkeypatch.setattr(q2_module, "_exclusive_directory_rename", record_rename)
     monkeypatch.setattr(q2_module.os, "fsync", record_fsync)
 
     published = finalize_hy3_expert_q2(config)
@@ -2242,7 +2250,7 @@ def test_failed_deep_verify_prevents_atomic_publish_and_preserves_journal(
     def reject(*_args, **_kwargs):
         raise ValueError("injected deep verification failure")
 
-    monkeypatch.setattr(q2_module, "_verify_hy3_root", reject)
+    monkeypatch.setattr(q2_module, "_verify_hy3_fd", reject)
 
     with pytest.raises(ValueError, match="deep verification failure"):
         finalize_hy3_expert_q2(config)
@@ -2258,19 +2266,29 @@ def test_finalize_interruption_after_journal_removal_is_safely_retryable(
 ) -> None:
     env = _conversion_test_environment(tmp_path, monkeypatch)
     config = _complete_staged_conversion(env)
-    original_replace = q2_module.os.replace
+    original_rename = q2_module._exclusive_directory_rename
     interrupted = False
 
-    def interrupt_first_directory_publish(source, target, *args, **kwargs):
+    def interrupt_first_directory_publish(
+        source_directory_fd,
+        source,
+        target_directory_fd,
+        target,
+    ):
         nonlocal interrupted
         if source == env["work_root"].name and not interrupted:
             interrupted = True
             raise OSError("injected publish interruption")
-        return original_replace(source, target, *args, **kwargs)
+        return original_rename(
+            source_directory_fd,
+            source,
+            target_directory_fd,
+            target,
+        )
 
     monkeypatch.setattr(
-        q2_module.os,
-        "replace",
+        q2_module,
+        "_exclusive_directory_rename",
         interrupt_first_directory_publish,
     )
 
@@ -2284,6 +2302,162 @@ def test_finalize_interruption_after_journal_removal_is_safely_retryable(
 
     assert finalize_hy3_expert_q2(config) == env["output_root"]
     assert verify_hy3_expert_q2(env["output_root"], deep=True)["passed"] is True
+
+
+def test_finalize_verifies_the_held_directory_that_is_later_published(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    config = _complete_staged_conversion(env)
+    work_root = env["work_root"]
+    moved_work = work_root.with_name(f"{work_root.name}-held-original")
+    original_read_json = q2_module._read_json_member
+    substituted = False
+
+    def substitute_valid_clone_after_manifest_reads(*args, **kwargs):
+        nonlocal substituted
+        result = original_read_json(*args, **kwargs)
+        if args[1] == "conversion-manifest.json" and not substituted:
+            work_root.rename(moved_work)
+            shutil.copytree(moved_work, work_root)
+            sidecar = moved_work / "experts.bin"
+            payload = bytearray(sidecar.read_bytes())
+            payload[-1] ^= 0xFF
+            sidecar.write_bytes(payload)
+            substituted = True
+        return result
+
+    monkeypatch.setattr(
+        q2_module,
+        "_read_json_member",
+        substitute_valid_clone_after_manifest_reads,
+    )
+
+    try:
+        with pytest.raises(ValueError, match="sidecar|record|hash|changed|identity"):
+            finalize_hy3_expert_q2(config)
+    finally:
+        if moved_work.exists():
+            if work_root.exists():
+                shutil.rmtree(work_root)
+            moved_work.rename(work_root)
+
+    assert substituted is True
+    assert not env["output_root"].exists()
+    assert work_root.is_dir()
+
+
+def test_atomic_publish_never_overwrites_target_created_after_absence_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    config = _complete_staged_conversion(env)
+    original_stat = q2_module.os.stat
+    raced_target_inode: int | None = None
+
+    def create_target_after_absence_check(path, *args, **kwargs):
+        nonlocal raced_target_inode
+        try:
+            return original_stat(path, *args, **kwargs)
+        except FileNotFoundError:
+            directory_fd = kwargs.get("dir_fd")
+            if (
+                path == env["output_root"].name
+                and directory_fd is not None
+                and raced_target_inode is None
+            ):
+                work_fd: int | None = None
+                try:
+                    work_fd = os.open(
+                        env["work_root"].name,
+                        q2_module._directory_flags(),
+                        dir_fd=directory_fd,
+                    )
+                    original_stat(
+                        "conversion-manifest.json",
+                        dir_fd=work_fd,
+                        follow_symlinks=False,
+                    )
+                    try:
+                        original_stat(
+                            "conversion-journal.jsonl",
+                            dir_fd=work_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        os.mkdir(path, dir_fd=directory_fd)
+                        raced_target_inode = original_stat(
+                            path,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        ).st_ino
+                except (FileNotFoundError, NotADirectoryError):
+                    pass
+                finally:
+                    if work_fd is not None:
+                        os.close(work_fd)
+            raise
+
+    monkeypatch.setattr(q2_module.os, "stat", create_target_after_absence_check)
+
+    with pytest.raises(OSError, match="exist|exclusive|publish"):
+        finalize_hy3_expert_q2(config)
+
+    assert raced_target_inode is not None
+    assert env["output_root"].is_dir()
+    assert env["output_root"].stat().st_ino == raced_target_inode
+    assert env["work_root"].is_dir()
+
+
+def test_finalize_rejects_pilot_output_not_bound_to_journal_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    config = _complete_staged_conversion(env)
+    pilot = json.loads(config.pilot_report.read_text())
+    pilot["records"][0]["output_sha256"] = "0" * 64
+    config.pilot_report.write_text(
+        json.dumps(pilot, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="pilot.*journal|pilot.*output|record receipt"):
+        finalize_hy3_expert_q2(config)
+
+    assert not env["output_root"].exists()
+    assert (env["work_root"] / "conversion-journal.jsonl").is_file()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("producer", {"git_commit": "b" * 40, "dirty": False}),
+        ("mlx_version", "0.31.other"),
+    ],
+)
+def test_finalize_binds_pilot_to_producer_and_mlx_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    config = _complete_staged_conversion(env)
+    pilot = json.loads(config.pilot_report.read_text())
+    pilot[field] = value
+    config.pilot_report.write_text(
+        json.dumps(pilot, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="pilot.*provenance"):
+        finalize_hy3_expert_q2(config)
+
+    assert not env["output_root"].exists()
+    assert (env["work_root"] / "conversion-journal.jsonl").is_file()
 
 
 @pytest.mark.parametrize(

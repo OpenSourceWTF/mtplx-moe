@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+import ctypes
+import errno
 import json
 import math
 import os
@@ -11,6 +13,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 from dataclasses import dataclass, fields
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
@@ -26,7 +29,6 @@ from .expert_manifest import (
     TensorSegment,
     make_sidecar_authoritative,
     validate_expert_manifest_spec,
-    verify_expert_manifest,
 )
 from .expert_streaming_models import ExpertStreamingModelSpec, get_model_spec
 
@@ -3326,6 +3328,8 @@ def pilot_hy3_expert_q2(
         return {
             "schema": "mtplx-hy3-expert-q2-pilot-v1",
             "passed": True,
+            "producer": context.report["producer"],
+            "mlx_version": context.report["mlx_version"],
             "source_fingerprint_sha256": context.report["source"]["fingerprint_sha256"],
             "target_descriptor": context.report["target_descriptor"],
             "records": results,
@@ -3573,14 +3577,72 @@ def _build_authoritative_manifest(
     return make_sidecar_authoritative(candidate, spec)
 
 
+def _exclusive_directory_rename(
+    source_directory_fd: int,
+    source_name: str,
+    target_directory_fd: int,
+    target_name: str,
+) -> None:
+    """Atomically rename without ever replacing an existing destination."""
+
+    source_name = _require_flat_target_name(source_name)
+    target_name = _require_flat_target_name(target_name)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        rename = libc.renameatx_np
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        result = rename(
+            source_directory_fd,
+            os.fsencode(source_name),
+            target_directory_fd,
+            os.fsencode(target_name),
+            0x00000004,  # RENAME_EXCL from Darwin sys/stdio.h.
+        )
+    elif hasattr(libc, "renameat2"):
+        rename = libc.renameat2
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        result = rename(
+            source_directory_fd,
+            os.fsencode(source_name),
+            target_directory_fd,
+            os.fsencode(target_name),
+            0x00000001,  # RENAME_NOREPLACE from Linux fs.h.
+        )
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            "exclusive atomic directory rename is unavailable",
+            target_name,
+        )
+    if result != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), target_name)
+        raise OSError(error, os.strerror(error), target_name)
+
+
 def _publish_verified_work(
     config: ConversionConfig,
     context: _PreflightContext,
     work_fd: int,
+    verified: _VerifiedDirectory,
 ) -> Path:
     parent_fd = context.pinned.output_parent_fd
     _assert_pinned_preflight_identities(context.pinned)
-    _assert_work_root_identity(parent_fd, work_fd)
     try:
         os.stat(
             config.output_root.name,
@@ -3591,11 +3653,13 @@ def _publish_verified_work(
         pass
     else:
         raise ValueError("final output root appeared before atomic publish")
-    os.replace(
+    verified.assert_unchanged(work_fd)
+    _assert_work_root_identity(parent_fd, work_fd)
+    _exclusive_directory_rename(
+        parent_fd,
         _WORK_DIRECTORY_NAME,
+        parent_fd,
         config.output_root.name,
-        src_dir_fd=parent_fd,
-        dst_dir_fd=parent_fd,
     )
     os.fsync(parent_fd)
     _assert_directory_path_identity(
@@ -3609,7 +3673,7 @@ def _publish_verified_work(
 def _validate_pilot_report(
     config: ConversionConfig,
     context: _PreflightContext,
-) -> None:
+) -> dict[str, Any]:
     if config.pilot_report is None:
         raise ValueError("finalization requires a pilot report")
     report, digest, _size = _read_json_path(
@@ -3622,6 +3686,8 @@ def _validate_pilot_report(
     expected_keys = {
         "schema",
         "passed",
+        "producer",
+        "mlx_version",
         "source_fingerprint_sha256",
         "target_descriptor",
         "records",
@@ -3631,6 +3697,8 @@ def _validate_pilot_report(
         or set(report) != expected_keys
         or report.get("schema") != "mtplx-hy3-expert-q2-pilot-v1"
         or report.get("passed") is not True
+        or report.get("producer") != context.report["producer"]
+        or report.get("mlx_version") != context.report["mlx_version"]
         or report.get("source_fingerprint_sha256")
         != context.report["source"]["fingerprint_sha256"]
         or report.get("target_descriptor") != context.report["target_descriptor"]
@@ -3696,6 +3764,40 @@ def _validate_pilot_report(
                 raise ValueError("Hy3 Q2 pilot diagnostics are invalid")
     if len(coordinates) != len(set(coordinates)):
         raise ValueError("Hy3 Q2 pilot records are duplicated")
+    return report
+
+
+def _bind_pilot_to_built_records(
+    pilot: dict[str, Any],
+    records: tuple[ExpertRecord, ...],
+    parsed_journal: list[tuple[dict[str, Any], int, int]] | None,
+) -> None:
+    by_coordinate = {
+        (record.layer, record.expert): (ordinal, record)
+        for ordinal, record in enumerate(records)
+    }
+    for item in pilot["records"]:
+        coordinate = (item["layer"], item["expert"])
+        built = by_coordinate.get(coordinate)
+        if built is None:
+            raise ValueError("pilot record identity is absent from the built artifact")
+        ordinal, record = built
+        if (
+            record.sha256 != item["output_sha256"]
+            or record.logical_bytes != item["output_bytes"]
+        ):
+            raise ValueError("pilot output is not bound to the built record")
+        if parsed_journal is not None:
+            journal_record = parsed_journal[ordinal + 1][0]
+            output = journal_record.get("output")
+            if (
+                journal_record.get("layer") != item["layer"]
+                or journal_record.get("expert") != item["expert"]
+                or not isinstance(output, dict)
+                or output.get("sha256") != item["output_sha256"]
+                or output.get("length") != item["output_bytes"]
+            ):
+                raise ValueError("pilot output is not bound to its journal record")
 
 
 def finalize_hy3_expert_q2(config: ConversionConfig) -> Path:
@@ -3707,8 +3809,9 @@ def finalize_hy3_expert_q2(config: ConversionConfig) -> Path:
     work_fd: int | None = None
     journal_fd: int | None = None
     output_fd: int | None = None
+    verified: _VerifiedDirectory | None = None
     try:
-        _validate_pilot_report(config, context)
+        pilot = _validate_pilot_report(config, context)
         parent_fd = context.pinned.output_parent_fd
         work_fd = _open_existing_work_root(config, parent_fd)
         work_root = _work_root(config)
@@ -3728,7 +3831,11 @@ def finalize_hy3_expert_q2(config: ConversionConfig) -> Path:
             journal_fd = os.open(_JOURNAL_FILE, _read_flags(), dir_fd=work_fd)
         except FileNotFoundError:
             _assert_conversion_file_identity(work_fd, _SIDECAR_FILE, output_fd)
-            _verify_hy3_root(work_root, deep=True, allow_journal=False)
+            _report, verified = _verify_hy3_fd(
+                work_fd,
+                deep=True,
+                allow_journal=False,
+            )
             conversion, _digest, _size = _read_json_member(
                 work_fd,
                 _CONVERSION_MANIFEST_FILE,
@@ -3748,7 +3855,15 @@ def finalize_hy3_expert_q2(config: ConversionConfig) -> Path:
                 != context.report["pilot_report_sha256"]
             ):
                 raise ValueError("verified work build or pilot receipt mismatch")
-            return _publish_verified_work(config, context, work_fd)
+            manifest_value, _manifest_digest, _manifest_bytes = _read_json_member(
+                work_fd,
+                _EXPERT_MANIFEST_FILE,
+                max_bytes=_MAX_MANIFEST_BYTES,
+                label="target expert manifest",
+            )
+            manifest = ExpertManifest.from_dict(manifest_value)
+            _bind_pilot_to_built_records(pilot, manifest.records, None)
+            return _publish_verified_work(config, context, work_fd, verified)
         except OSError as exc:
             raise ValueError(f"conversion journal is unavailable: {exc}") from exc
         _assert_conversion_file_identity(work_fd, _SIDECAR_FILE, output_fd)
@@ -3772,6 +3887,7 @@ def finalize_hy3_expert_q2(config: ConversionConfig) -> Path:
             )
             for ordinal, (line, _start, _end) in enumerate(parsed[1:])
         )
+        _bind_pilot_to_built_records(pilot, records, parsed)
         sidecar_sha256 = _hash_fd(
             output_fd,
             length=context.expectations.target_sidecar_bytes,
@@ -3815,12 +3931,17 @@ def finalize_hy3_expert_q2(config: ConversionConfig) -> Path:
             _CONVERSION_MANIFEST_FILE,
             conversion,
         )
-        _verify_hy3_root(work_root, deep=True, allow_journal=True)
+        _report, verified = _verify_hy3_fd(
+            work_fd,
+            deep=True,
+            allow_journal=True,
+        )
         _assert_conversion_file_identity(work_fd, _JOURNAL_FILE, journal_fd)
+        verified.remove(_JOURNAL_FILE)
         os.unlink(_JOURNAL_FILE, dir_fd=work_fd)
         os.fsync(work_fd)
-        _verify_hy3_root(work_root, deep=False, allow_journal=False)
-        return _publish_verified_work(config, context, work_fd)
+        verified.assert_unchanged(work_fd)
+        return _publish_verified_work(config, context, work_fd, verified)
     finally:
         if journal_fd is not None:
             os.close(journal_fd)
@@ -3828,21 +3949,250 @@ def finalize_hy3_expert_q2(config: ConversionConfig) -> Path:
             os.close(output_fd)
         if work_fd is not None:
             os.close(work_fd)
+        if verified is not None:
+            verified.close()
         _close_preflight_context(context)
 
 
-def _verify_hy3_root(
-    root: Path,
+@dataclass(frozen=True)
+class _VerifiedMember:
+    name: str
+    fd: int
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+@dataclass
+class _VerifiedDirectory:
+    members: dict[str, _VerifiedMember]
+    closed: bool = False
+
+    @classmethod
+    def open(cls, directory_fd: int) -> _VerifiedDirectory:
+        members: dict[str, _VerifiedMember] = {}
+        try:
+            for name in os.listdir(directory_fd):
+                _require_flat_target_name(name)
+                entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+                    if "mtp" in name.lower():
+                        raise ValueError(
+                            f"MTP content is forbidden in authoritative output: {name}"
+                        )
+                    raise ValueError(
+                        f"authoritative output entry is not independent: {name}"
+                    )
+                fd = os.open(name, _read_flags(), dir_fd=directory_fd)
+                try:
+                    descriptor = os.fstat(fd)
+                    if (
+                        not stat.S_ISREG(descriptor.st_mode)
+                        or descriptor.st_nlink != 1
+                        or (entry.st_dev, entry.st_ino)
+                        != (descriptor.st_dev, descriptor.st_ino)
+                    ):
+                        raise ValueError(
+                            f"authoritative output entry changed while opening: {name}"
+                        )
+                    members[name] = _VerifiedMember(
+                        name=name,
+                        fd=fd,
+                        device=descriptor.st_dev,
+                        inode=descriptor.st_ino,
+                        size=descriptor.st_size,
+                        mtime_ns=descriptor.st_mtime_ns,
+                        ctime_ns=descriptor.st_ctime_ns,
+                    )
+                    fd = -1
+                finally:
+                    if fd >= 0:
+                        os.close(fd)
+            return cls(members=members)
+        except BaseException:
+            for member in members.values():
+                os.close(member.fd)
+            raise
+
+    def member(self, name: str) -> _VerifiedMember:
+        if self.closed:
+            raise ValueError("verified directory lease is closed")
+        try:
+            return self.members[name]
+        except KeyError as exc:
+            raise ValueError(f"verified artifact member is missing: {name}") from exc
+
+    def remove(self, name: str) -> None:
+        member = self.member(name)
+        os.close(member.fd)
+        del self.members[name]
+
+    def assert_unchanged(
+        self,
+        directory_fd: int,
+        *,
+        expected_names: set[str] | None = None,
+    ) -> None:
+        if self.closed:
+            raise ValueError("verified directory lease is closed")
+        names = set(self.members) if expected_names is None else expected_names
+        if set(self.members) != names or set(os.listdir(directory_fd)) != names:
+            raise ValueError("verified artifact inventory changed before publication")
+        for name, member in self.members.items():
+            try:
+                entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                descriptor = os.fstat(member.fd)
+            except OSError as exc:
+                raise ValueError(
+                    f"verified artifact identity is unavailable: {name}: {exc}"
+                ) from exc
+            expected = (
+                member.device,
+                member.inode,
+                member.size,
+                member.mtime_ns,
+                member.ctime_ns,
+            )
+            if (
+                not stat.S_ISREG(entry.st_mode)
+                or entry.st_nlink != 1
+                or (
+                    entry.st_dev,
+                    entry.st_ino,
+                    entry.st_size,
+                    entry.st_mtime_ns,
+                    entry.st_ctime_ns,
+                )
+                != expected
+                or (
+                    descriptor.st_dev,
+                    descriptor.st_ino,
+                    descriptor.st_size,
+                    descriptor.st_mtime_ns,
+                    descriptor.st_ctime_ns,
+                )
+                != expected
+            ):
+                raise ValueError(f"verified artifact bytes or identity changed: {name}")
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        for member in self.members.values():
+            os.close(member.fd)
+        self.members.clear()
+
+
+def _hash_verified_member(
+    verified: _VerifiedDirectory,
+    name: str,
+) -> tuple[str, int]:
+    member = verified.member(name)
+    return (
+        _hash_fd(member.fd, length=member.size, chunk_bytes=8 * 1024**2),
+        member.size,
+    )
+
+
+def _verify_held_expert_payloads(
+    verified: _VerifiedDirectory,
+    manifest: ExpertManifest,
+    *,
+    deep: bool,
+) -> dict[str, int | bool]:
+    index_member = verified.member(_INDEX_FILE)
+    weight_map, declared_total_size = _parse_index_fd(index_member.fd)
+    expected_residents = {tensor.tensor: tensor for tensor in manifest.resident_tensors}
+    if set(weight_map) != set(expected_residents):
+        raise ValueError("authoritative resident index tensor inventory mismatch")
+    resident_shards = {
+        shard.name: shard for shard in manifest.shards if shard.kind == "safetensors"
+    }
+    parsed_tensors: dict[str, ResidentTensor] = {}
+    for name, expected_shard in resident_shards.items():
+        member = verified.member(name)
+        actual_sha256 = (
+            _hash_fd(member.fd, length=member.size, chunk_bytes=8 * 1024**2)
+            if deep
+            else expected_shard.sha256
+        )
+        if actual_sha256 is None:
+            raise ValueError(f"resident shard hash is missing: {name}")
+        parsed_shard, tensors = _parse_safetensors_fd(
+            member.fd,
+            name=name,
+            sha256=actual_sha256,
+        )
+        if (
+            parsed_shard.size != expected_shard.size
+            or parsed_shard.header_bytes != expected_shard.header_bytes
+            or parsed_shard.header_sha256 != expected_shard.header_sha256
+            or parsed_shard.sha256 != expected_shard.sha256
+        ):
+            raise ValueError(f"resident shard header or hash mismatch: {name}")
+        for tensor_name, tensor in tensors.items():
+            if tensor_name in parsed_tensors or weight_map.get(tensor_name) != name:
+                raise ValueError(
+                    f"resident index/header mapping mismatch: {tensor_name}"
+                )
+            parsed_tensors[tensor_name] = tensor
+    if parsed_tensors != expected_residents:
+        raise ValueError("authoritative resident header inventory mismatch")
+    if declared_total_size is not None and declared_total_size != sum(
+        tensor.length for tensor in manifest.resident_tensors
+    ):
+        raise ValueError("authoritative resident index total_size mismatch")
+
+    if manifest.sidecar is None:
+        raise ValueError("authoritative target sidecar metadata is missing")
+    sidecar = verified.member(manifest.sidecar.file)
+    if sidecar.size != manifest.sidecar.size:
+        raise ValueError("authoritative target sidecar size mismatch")
+    checked_records = 0
+    if deep:
+        for record in manifest.records:
+            if (
+                record.sha256 is None
+                or record.sidecar_offset is None
+                or record.sidecar_length is None
+            ):
+                raise ValueError("authoritative record provenance is incomplete")
+            payload = _pread_exact(
+                sidecar.fd,
+                record.sidecar_offset,
+                record.sidecar_length,
+                label=f"target record ({record.layer}, {record.expert})",
+            )
+            if hashlib.sha256(payload).hexdigest() != record.sha256:
+                raise ValueError(
+                    f"target record hash mismatch: ({record.layer}, {record.expert})"
+                )
+            checked_records += 1
+        if (
+            _hash_fd(sidecar.fd, length=sidecar.size, chunk_bytes=8 * 1024**2)
+            != manifest.sidecar.sha256
+        ):
+            raise ValueError("target sidecar hash mismatch")
+    return {
+        "checked_records": checked_records,
+        "checked_shards": len(manifest.shards),
+        "sidecar_verified": deep,
+    }
+
+
+def _verify_hy3_fd(
+    root_fd: int,
     *,
     deep: bool,
     allow_journal: bool,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], _VerifiedDirectory]:
     if not isinstance(deep, bool) or not isinstance(allow_journal, bool):
         raise TypeError("verification flags must be bool")
-    root = _require_real_directory(Path(root), label="Hy3 Q2 artifact root")
-    root_fd = os.open(root, _directory_flags())
+    verified = _VerifiedDirectory.open(root_fd)
     try:
-        _assert_directory_path_identity(root, root_fd, label="Hy3 Q2 artifact root")
         manifest_value, manifest_file_sha256, manifest_file_bytes = _read_json_member(
             root_fd,
             _EXPERT_MANIFEST_FILE,
@@ -4016,34 +4366,27 @@ def _verify_hy3_root(
         ):
             raise ValueError("target conversion provenance journal receipt mismatch")
         if allow_journal:
-            try:
-                journal_fd = os.open(_JOURNAL_FILE, _read_flags(), dir_fd=root_fd)
-            except OSError as exc:
-                raise ValueError(
-                    f"staged journal receipt is unavailable: {exc}"
-                ) from exc
-            try:
-                parsed_journal, journal_end, journal_tail = _parse_journal(journal_fd)
-                journal_size = os.fstat(journal_fd).st_size
-                if (
-                    journal_tail
-                    or journal_end != journal_size
-                    or journal_size != journal["bytes"]
-                    or len(parsed_journal) - 1 != journal["record_count"]
-                    or parsed_journal[0][0].get("header_sha256")
-                    != journal["header_sha256"]
-                    or parsed_journal[-1][0].get("entry_sha256")
-                    != journal["last_entry_sha256"]
-                    or _hash_fd(
-                        journal_fd,
-                        length=journal_size,
-                        chunk_bytes=8 * 1024**2,
-                    )
-                    != journal["sha256"]
-                ):
-                    raise ValueError("staged journal receipt does not match its file")
-            finally:
-                os.close(journal_fd)
+            journal_member = verified.member(_JOURNAL_FILE)
+            parsed_journal, journal_end, journal_tail = _parse_journal(
+                journal_member.fd
+            )
+            journal_size = journal_member.size
+            if (
+                journal_tail
+                or journal_end != journal_size
+                or journal_size != journal["bytes"]
+                or len(parsed_journal) - 1 != journal["record_count"]
+                or parsed_journal[0][0].get("header_sha256") != journal["header_sha256"]
+                or parsed_journal[-1][0].get("entry_sha256")
+                != journal["last_entry_sha256"]
+                or _hash_fd(
+                    journal_member.fd,
+                    length=journal_size,
+                    chunk_bytes=8 * 1024**2,
+                )
+                != journal["sha256"]
+            ):
+                raise ValueError("staged journal receipt does not match its file")
 
         resident_receipts = source.get("resident_files")
         ancillary_receipts = source.get("ancillary_files")
@@ -4081,7 +4424,7 @@ def _verify_hy3_root(
         ):
             raise ValueError("ancillary provenance inventory mismatch")
         for name, receipt in ancillary_by_name.items():
-            digest, size = _sha256_path(root / name)
+            digest, size = _hash_verified_member(verified, name)
             if receipt.get("size") != size or receipt.get("sha256") != digest:
                 raise ValueError(f"ancillary hash mismatch: {name}")
 
@@ -4151,7 +4494,7 @@ def _verify_hy3_root(
         }
         if allow_journal:
             expected_inventory.add(_JOURNAL_FILE)
-        actual_inventory = set(os.listdir(root_fd))
+        actual_inventory = set(verified.members)
         if "mtp" in actual_inventory or any(
             "mtp" in name.lower() for name in actual_inventory
         ):
@@ -4162,22 +4505,13 @@ def _verify_hy3_root(
                 f"extra={sorted(actual_inventory - expected_inventory)[:4]}, "
                 f"missing={sorted(expected_inventory - actual_inventory)[:4]}"
             )
-        for name in actual_inventory:
-            entry = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
-            if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
-                raise ValueError(
-                    f"authoritative output entry is not independent: {name}"
-                )
-
-        report = verify_expert_manifest(
+        report = _verify_held_expert_payloads(
+            verified,
             manifest,
-            root,
-            verify_records=deep,
-            verify_shard_hashes=deep,
-            verify_sidecar_hash=deep,
+            deep=deep,
         )
-        _assert_directory_path_identity(root, root_fd, label="Hy3 Q2 artifact root")
-        return {
+        verified.assert_unchanged(root_fd, expected_names=expected_inventory)
+        result = {
             "schema": "mtplx-hy3-expert-q2-verification-v1",
             "passed": True,
             "deep": deep,
@@ -4192,7 +4526,33 @@ def _verify_hy3_root(
             "checked_shards": report["checked_shards"],
             "sidecar_verified": report["sidecar_verified"],
         }
+        return result, verified
+    except BaseException:
+        verified.close()
+        raise
+
+
+def _verify_hy3_root(
+    root: Path,
+    *,
+    deep: bool,
+    allow_journal: bool,
+) -> dict[str, Any]:
+    root = _require_real_directory(Path(root), label="Hy3 Q2 artifact root")
+    root_fd = os.open(root, _directory_flags())
+    verified: _VerifiedDirectory | None = None
+    try:
+        _assert_directory_path_identity(root, root_fd, label="Hy3 Q2 artifact root")
+        report, verified = _verify_hy3_fd(
+            root_fd,
+            deep=deep,
+            allow_journal=allow_journal,
+        )
+        _assert_directory_path_identity(root, root_fd, label="Hy3 Q2 artifact root")
+        return report
     finally:
+        if verified is not None:
+            verified.close()
         os.close(root_fd)
 
 
