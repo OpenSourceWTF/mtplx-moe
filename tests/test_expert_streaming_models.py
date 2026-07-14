@@ -65,6 +65,8 @@ def test_hy3_expert_only_q4_control_exact_layout() -> None:
     assert q4.routed_expert_bytes == 161_036_107_776
     assert q4.resident_bytes == 17_494_289_664
     assert q4.total_tensor_bytes == 178_530_397_440
+    assert q4.router_storage == "source bfloat16 with fp32 correction bias"
+    assert q4.router_bytes == 124_316_928
 
     cache = 83_034_243_072
     assert cache // q4.expert_record_bytes == 7_821
@@ -83,6 +85,8 @@ def test_hy3_expert_q2_exact_layout() -> None:
     assert q2.resident_bytes == 17_494_289_664
     assert q2.total_tensor_bytes == 106_958_793_984
     assert q2.mtp_included is False
+    assert q2.router_storage == "source bfloat16 with fp32 correction bias"
+    assert q2.router_bytes == 124_316_928
 
     cache = 83_034_243_072
     assert cache // q2.expert_record_bytes == 14_077
@@ -224,7 +228,9 @@ def test_explicit_expert_cache_limit_caps_slots_below_available_memory() -> None
     assert plan.unallocated_bytes == spec.persistent_cache_bytes(28)
 
 
-def test_global_memory_plan_uses_record_granularity_not_uniform_layer_rounding() -> None:
+def test_global_memory_plan_uses_record_granularity_not_uniform_layer_rounding() -> (
+    None
+):
     spec = get_model_spec("hy3-q4")
     expert_cache_limit = 80 * GIB
     fixed = spec.resident_bytes + spec.transient_scratch_bytes
@@ -245,7 +251,9 @@ def test_global_memory_plan_uses_record_granularity_not_uniform_layer_rounding()
     )
 
     assert layer_plan.persistent_slots == 79 * 102
-    assert global_plan.persistent_slots == expert_cache_limit // spec.expert_record_bytes
+    assert (
+        global_plan.persistent_slots == expert_cache_limit // spec.expert_record_bytes
+    )
     assert global_plan.persistent_slots == 8_090
     assert global_plan.persistent_cache_bytes > layer_plan.persistent_cache_bytes
     assert 0 <= global_plan.unallocated_bytes < spec.expert_record_bytes
