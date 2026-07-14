@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import gc
 import hashlib
 import json
@@ -365,25 +366,109 @@ def _flat_artifact_name(value: object, *, label: str) -> str:
     return value
 
 
-def _resident_file_size(root: Path, name: str) -> tuple[Path, int]:
-    resolved_root = _absolute_lexical_path(root)
-    root_fd = _open_anchored_directory(resolved_root, label="model root")
+def _revalidate_root_binding(
+    path: Path,
+    descriptor: int,
+    expected: tuple[int, ...],
+    *,
+    label: str,
+) -> None:
+    held = os.fstat(descriptor)
+    current = os.stat(path, follow_symlinks=False)
+    if _stable_identity(held) != expected or _object_identity(
+        current
+    ) != _object_identity(held):
+        raise ValueError(f"{label} changed while being inspected")
+
+
+def _revalidate_member_binding(
+    parent_fd: int,
+    name: str,
+    descriptor: int,
+    expected: tuple[int, ...],
+    *,
+    label: str,
+) -> None:
+    held = os.fstat(descriptor)
+    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if _stable_identity(held) != expected or _stable_identity(
+        current
+    ) != _stable_identity(held):
+        raise ValueError(f"{label} changed while being hashed")
+
+
+def _hash_bound_regular_file(
+    root_fd: int,
+    path: Path,
+    name: str,
+    expected_size: int,
+    *,
+    label: str,
+    bypass_page_cache: bool,
+) -> dict[str, Any]:
+    descriptor = _open_bound_regular_file(root_fd, name, label=label)
     try:
-        descriptor = _open_bound_regular_file(
+        opened = os.fstat(descriptor)
+        expected_identity = _stable_identity(opened)
+        if opened.st_size != expected_size:
+            raise ValueError(f"{label} size does not match provenance")
+        page_cache_bypassed = False
+        if bypass_page_cache:
+            command = getattr(fcntl, "F_NOCACHE", None)
+            if command is None:
+                raise RuntimeError("secure resident hashing requires F_NOCACHE")
+            try:
+                fcntl.fcntl(descriptor, command, 1)
+            except OSError as exc:
+                raise RuntimeError(f"could not enable F_NOCACHE for {label}") from exc
+            page_cache_bypassed = True
+        digest = hashlib.sha256()
+        remaining = expected_size
+        while remaining:
+            payload = os.read(descriptor, min(remaining, 8 * 1024 * 1024))
+            if not payload:
+                raise ValueError(f"{label} ended before its declared size")
+            digest.update(payload)
+            remaining -= len(payload)
+        _revalidate_member_binding(
             root_fd,
             name,
-            label=f"resident shard {name}",
+            descriptor,
+            expected_identity,
+            label=label,
         )
-        try:
-            first = os.fstat(descriptor)
-            second = os.fstat(descriptor)
-            if _stable_identity(first) != _stable_identity(second):
-                raise ValueError(f"resident shard {name} changed while being inspected")
-            return resolved_root / name, first.st_size
-        finally:
-            os.close(descriptor)
+        return {
+            "name": name,
+            "path": str(path),
+            "bytes": expected_size,
+            "sha256": digest.hexdigest(),
+            "page_cache_bypassed": page_cache_bypassed,
+        }
     finally:
-        os.close(root_fd)
+        os.close(descriptor)
+
+
+def _read_bound_regular_file(
+    root_fd: int,
+    path: Path,
+    name: str,
+    *,
+    label: str,
+) -> bytes:
+    descriptor = _open_bound_regular_file(root_fd, name, label=label)
+    try:
+        expected_identity = _stable_identity(os.fstat(descriptor))
+        payload = _read_stable_descriptor(descriptor, label=label, path=path)
+        _revalidate_member_binding(
+            root_fd,
+            name,
+            descriptor,
+            expected_identity,
+            label=label,
+        )
+        return payload
+    finally:
+        os.close(descriptor)
 
 
 def _artifact_receipt(
@@ -391,8 +476,9 @@ def _artifact_receipt(
     manifest_path: Path,
     *,
     expected_model_key: str,
+    bypass_page_cache: bool = False,
 ) -> dict[str, Any]:
-    """Bind a lane to its physical index and manifest-proven resident shards."""
+    """Hash and bind a lane's physical index and resident shards."""
 
     manifest_resolved, manifest_payload = _stable_file_bytes(
         manifest_path,
@@ -433,49 +519,67 @@ def _artifact_receipt(
             raise ValueError(f"expert manifest repeats shard {name!r}")
         shard_by_name[name] = item
 
+    resolved_root = _absolute_lexical_path(root)
+    root_fd = _open_anchored_directory(resolved_root, label="model root")
+    root_identity = _stable_identity(os.fstat(root_fd))
     resident_files = []
     resident_digest = hashlib.sha256()
-    for name in sorted(resident_names):
-        shard = shard_by_name.get(name)
-        if shard is None or shard.get("kind", "safetensors") != "safetensors":
-            raise ValueError(f"resident shard provenance is incomplete: {name}")
-        size = shard.get("size")
-        declared_sha256 = shard.get("sha256")
-        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
-            raise ValueError(f"resident shard has invalid size: {name}")
-        if (
-            not isinstance(declared_sha256, str)
-            or re.fullmatch(r"[0-9a-f]{64}", declared_sha256) is None
-        ):
-            raise ValueError(f"resident shard has invalid SHA-256 provenance: {name}")
-        resolved, physical_size = _resident_file_size(root, name)
-        if physical_size != size:
-            raise ValueError(f"resident shard size does not match provenance: {name}")
-        encoded_name = name.encode("utf-8")
-        resident_digest.update(len(encoded_name).to_bytes(4, "big"))
-        resident_digest.update(encoded_name)
-        resident_digest.update(size.to_bytes(8, "big"))
-        resident_digest.update(bytes.fromhex(declared_sha256))
-        resident_files.append(
-            {
-                "name": name,
-                "path": str(resolved),
-                "bytes": size,
-                "declared_sha256": declared_sha256,
-            }
-        )
+    try:
+        for name in sorted(resident_names):
+            shard = shard_by_name.get(name)
+            if shard is None or shard.get("kind", "safetensors") != "safetensors":
+                raise ValueError(f"resident shard provenance is incomplete: {name}")
+            size = shard.get("size")
+            declared_sha256 = shard.get("sha256")
+            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                raise ValueError(f"resident shard has invalid size: {name}")
+            if (
+                not isinstance(declared_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", declared_sha256) is None
+            ):
+                raise ValueError(
+                    f"resident shard has invalid SHA-256 provenance: {name}"
+                )
+            receipt = _hash_bound_regular_file(
+                root_fd,
+                resolved_root / name,
+                name,
+                size,
+                label=f"resident shard {name}",
+                bypass_page_cache=bypass_page_cache,
+            )
+            if receipt["sha256"] != declared_sha256:
+                raise ValueError(
+                    f"resident shard hash does not match provenance: {name}"
+                )
+            encoded_name = name.encode("utf-8")
+            resident_digest.update(len(encoded_name).to_bytes(4, "big"))
+            resident_digest.update(encoded_name)
+            resident_digest.update(size.to_bytes(8, "big"))
+            resident_digest.update(bytes.fromhex(receipt["sha256"]))
+            receipt["declared_sha256"] = declared_sha256
+            resident_files.append(receipt)
 
-    index_path = Path(root) / "model.safetensors.index.json"
-    index_resolved, index_payload = _stable_file_bytes(
-        index_path,
-        label="resident index",
-    )
+        index_name = "model.safetensors.index.json"
+        index_path = resolved_root / index_name
+        index_payload = _read_bound_regular_file(
+            root_fd,
+            index_path,
+            index_name,
+            label="resident index",
+        )
+        _revalidate_root_binding(
+            resolved_root,
+            root_fd,
+            root_identity,
+            label="model root",
+        )
+    finally:
+        os.close(root_fd)
     try:
         index = json.loads(index_payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            f"resident index is malformed: {index_resolved}: {exc}"
-        ) from exc
+        raise ValueError(f"resident index is malformed: {index_path}: {exc}") from exc
     weight_map = index.get("weight_map") if isinstance(index, dict) else None
     if not isinstance(weight_map, dict) or not weight_map:
         raise ValueError("resident index has no weight map")
@@ -488,12 +592,12 @@ def _artifact_receipt(
     return {
         "manifest_file_sha256": _sha256(manifest_payload),
         "index": {
-            "path": str(index_resolved),
+            "path": str(index_path),
             "bytes": len(index_payload),
             "sha256": _sha256(index_payload),
         },
         "residents": {
-            "algorithm": "sha256-name-size-and-declared-file-digest-v1",
+            "algorithm": "sha256-name-size-and-verified-file-digest-v1",
             "sha256": resident_digest.hexdigest(),
             "files": resident_files,
         },
@@ -1298,6 +1402,7 @@ def _evaluate_lane(
             config.model_root,
             config.manifest_path,
             expected_model_key=config.model_key,
+            bypass_page_cache=config.f_nocache,
         )
         if artifact["manifest_file_sha256"] != result["manifest"]["file_sha256"]:
             raise ValueError("expert manifest changed between artifact receipts")
@@ -1579,12 +1684,65 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _bind_regular_file_size(
+    root: Path,
+    name: str,
+    expected_size: int,
+    *,
+    label: str,
+) -> None:
+    resolved_root = _absolute_lexical_path(root)
+    root_fd = _open_anchored_directory(resolved_root, label="model root")
+    root_identity = _stable_identity(os.fstat(root_fd))
+    try:
+        descriptor = _open_bound_regular_file(root_fd, name, label=label)
+        try:
+            opened = os.fstat(descriptor)
+            if opened.st_size != expected_size:
+                raise ValueError(f"{label} size does not match the manifest")
+            current = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            if _stable_identity(opened) != _stable_identity(current):
+                raise ValueError(f"{label} changed while being inspected")
+        finally:
+            os.close(descriptor)
+        _revalidate_root_binding(
+            resolved_root,
+            root_fd,
+            root_identity,
+            label="model root",
+        )
+    finally:
+        os.close(root_fd)
+
+
+def _validate_trusted_sidecar(config: LaneConfig) -> None:
+    from mtplx.expert_manifest import load_expert_manifest
+
+    manifest = load_expert_manifest(config.manifest_path, verify_digest=True)
+    if manifest.model_key != config.model_key:
+        raise ValueError("trusted sidecar manifest model key differs from the lane")
+    sidecar = manifest.sidecar
+    if sidecar is None:
+        raise ValueError("--trust-sidecar requires a validated manifest sidecar")
+    sidecar_name = _flat_artifact_name(sidecar.file, label="trusted sidecar")
+    _bind_regular_file_size(
+        config.model_root,
+        sidecar_name,
+        sidecar.size,
+        label=f"trusted sidecar {sidecar_name}",
+    )
+
+
 def _load_lane_runtime(config: LaneConfig) -> Any:
     if config.memory_limit is None or config.expert_cache_limit is None:
         raise ValueError("runtime lane memory limits are required")
     from mtplx.expert_runtime import ExpertStreamingConfig, parse_memory_bytes
     from mtplx.runtime import load
 
+    verify_record_hashes = True
+    if config.trust_sidecar:
+        _validate_trusted_sidecar(config)
+        verify_record_hashes = False
     streaming = ExpertStreamingConfig(
         model_key=config.model_key,
         memory_limit_bytes=parse_memory_bytes(config.memory_limit),
@@ -1597,7 +1755,7 @@ def _load_lane_runtime(config: LaneConfig) -> Any:
         transient_slots=config.transient_slots,
         max_read_chunk_bytes=parse_memory_bytes(config.read_chunk),
         bypass_page_cache=config.f_nocache,
-        verify_record_hashes=not config.trust_sidecar,
+        verify_record_hashes=verify_record_hashes,
     )
     return load(
         config.model_root,

@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import shutil
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -601,6 +602,15 @@ def test_compare_quality_records_receipts_and_never_co_resides_lanes(
         result["lanes"]["q4"]["artifact"]["residents"]["sha256"]
         == result["lanes"]["q2"]["artifact"]["residents"]["sha256"]
     )
+    expected_resident_sha256 = hashlib.sha256(b"resident fixture\n").hexdigest()
+    assert (
+        result["lanes"]["q4"]["artifact"]["residents"]["files"][0]["sha256"]
+        == expected_resident_sha256
+    )
+    assert (
+        result["lanes"]["q2"]["artifact"]["residents"]["files"][0]["sha256"]
+        == expected_resident_sha256
+    )
     assert result["relative_perplexity_regression"] == pytest.approx(0.0)
     assert result["quality_passed"] is True
     assert result["passed"] is True
@@ -740,11 +750,111 @@ def test_hy3_rejects_a_lane_key_that_differs_from_its_manifest(tmp_path: Path) -
         )
 
 
-def test_hy3_runtime_configuration_forces_ar_and_carries_streaming_settings(
+def test_hy3_resident_receipt_rejects_same_size_content_corruption(
+    tmp_path: Path,
+) -> None:
+    original = b"resident fixture\n"
+    root, manifest = _write_lane_files(
+        tmp_path / "hy3-q2",
+        "b" * 64,
+        model_key="hy3-expert-q2",
+        resident_payload=original,
+    )
+    resident = root / "model-00001-of-00001.safetensors"
+    resident.write_bytes(b"X" * len(original))
+
+    with pytest.raises(ValueError, match="resident shard hash"):
+        quality._artifact_receipt(
+            root,
+            manifest,
+            expected_model_key="hy3-expert-q2",
+        )
+
+
+def test_hy3_resident_receipt_rejects_member_replacement_during_hash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured: dict[str, object] = {}
+    root, manifest = _write_lane_files(
+        tmp_path / "hy3-q2",
+        "b" * 64,
+        model_key="hy3-expert-q2",
+    )
+    resident = root / "model-00001-of-00001.safetensors"
+    resident_inode = resident.stat().st_ino
+    replacement = tmp_path / "replacement.safetensors"
+    replacement.write_bytes(b"X" * resident.stat().st_size)
+    real_read = quality.os.read
+    swapped = False
+
+    def racing_read(descriptor, size):
+        nonlocal swapped
+        payload = real_read(descriptor, size)
+        if not swapped and quality.os.fstat(descriptor).st_ino == resident_inode:
+            swapped = True
+            resident.rename(root / "original.safetensors")
+            replacement.rename(resident)
+        return payload
+
+    monkeypatch.setattr(quality.os, "read", racing_read)
+
+    with pytest.raises(ValueError, match="changed while being hashed"):
+        quality._artifact_receipt(
+            root,
+            manifest,
+            expected_model_key="hy3-expert-q2",
+        )
+
+    assert swapped is True
+
+
+def test_hy3_resident_receipt_rejects_root_replacement_during_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, manifest = _write_lane_files(
+        tmp_path / "hy3-q2",
+        "b" * 64,
+        model_key="hy3-expert-q2",
+    )
+    resident = root / "model-00001-of-00001.safetensors"
+    resident_inode = resident.stat().st_ino
+    replacement = tmp_path / "replacement-root"
+    shutil.copytree(root, replacement)
+    replacement_resident = replacement / resident.name
+    replacement_resident.write_bytes(b"X" * replacement_resident.stat().st_size)
+    original_root = tmp_path / "original-root"
+    real_read = quality.os.read
+    swapped = False
+
+    def racing_read(descriptor, size):
+        nonlocal swapped
+        payload = real_read(descriptor, size)
+        if not swapped and quality.os.fstat(descriptor).st_ino == resident_inode:
+            swapped = True
+            root.rename(original_root)
+            replacement.rename(root)
+        return payload
+
+    monkeypatch.setattr(quality.os, "read", racing_read)
+
+    with pytest.raises(ValueError, match="model root changed"):
+        quality._artifact_receipt(
+            root,
+            manifest,
+            expected_model_key="hy3-expert-q2",
+        )
+
+    assert swapped is True
+
+
+def _install_fake_lane_modules(
+    monkeypatch: pytest.MonkeyPatch,
+    captured: dict[str, object],
+    *,
+    manifest_value: object,
+) -> type:
+    expert_manifest = ModuleType("mtplx.expert_manifest")
     expert_runtime = ModuleType("mtplx.expert_runtime")
     runtime_module = ModuleType("mtplx.runtime")
 
@@ -752,19 +862,144 @@ def test_hy3_runtime_configuration_forces_ar_and_carries_streaming_settings(
         def __init__(self, **kwargs) -> None:
             captured["streaming"] = kwargs
 
-    expert_runtime.ExpertStreamingConfig = FakeStreamingConfig
-    expert_runtime.parse_memory_bytes = lambda value: int(value)
+    def fake_load_manifest(path, *, verify_digest=True):
+        captured["loaded_manifest"] = (path, verify_digest)
+        return manifest_value
 
     def fake_load(root, **kwargs):
         captured["root"] = root
         captured["load"] = kwargs
         return object()
 
+    expert_manifest.load_expert_manifest = fake_load_manifest
+    expert_runtime.ExpertStreamingConfig = FakeStreamingConfig
+
+    def fake_parse_memory_bytes(value):
+        if value == "16GiB":
+            return 16 * 1024**3
+        if value == "8MiB":
+            return 8 * 1024**2
+        return int(value)
+
+    expert_runtime.parse_memory_bytes = fake_parse_memory_bytes
     runtime_module.load = fake_load
+    monkeypatch.setitem(sys.modules, "mtplx.expert_manifest", expert_manifest)
     monkeypatch.setitem(sys.modules, "mtplx.expert_runtime", expert_runtime)
     monkeypatch.setitem(sys.modules, "mtplx.runtime", runtime_module)
+    return FakeStreamingConfig
+
+
+def test_hy3_trusted_sidecar_mode_rejects_a_manifest_without_a_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    _install_fake_lane_modules(
+        monkeypatch,
+        captured,
+        manifest_value=SimpleNamespace(model_key="hy3-expert-q2", sidecar=None),
+    )
+    root = tmp_path / "hy3"
+    root.mkdir()
+    manifest = root / "expert-manifest.json"
+    config = quality.LaneConfig(
+        "q2",
+        root,
+        manifest,
+        "hy3-expert-q2",
+        memory_limit="120259084288",
+        expert_cache_limit="83034243072",
+        trust_sidecar=True,
+    )
+
+    with pytest.raises(ValueError, match="validated manifest sidecar"):
+        quality._load_lane_runtime(config)
+
+    assert "streaming" not in captured
+    assert "load" not in captured
+
+
+def test_hy3_trusted_sidecar_mode_rejects_a_missing_sidecar_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    _install_fake_lane_modules(
+        monkeypatch,
+        captured,
+        manifest_value=SimpleNamespace(
+            model_key="hy3-expert-q2",
+            sidecar=SimpleNamespace(file="experts.bin", size=4096),
+        ),
+    )
+    root = tmp_path / "hy3"
+    root.mkdir()
+    manifest = root / "expert-manifest.json"
+    config = quality.LaneConfig(
+        "q2",
+        root,
+        manifest,
+        "hy3-expert-q2",
+        memory_limit="120259084288",
+        expert_cache_limit="83034243072",
+        trust_sidecar=True,
+    )
+
+    with pytest.raises((OSError, ValueError), match="experts.bin|sidecar"):
+        quality._load_lane_runtime(config)
+
+    assert "streaming" not in captured
+    assert "load" not in captured
+
+
+def test_hy3_source_segment_fallback_keeps_record_hashing_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    _install_fake_lane_modules(
+        monkeypatch,
+        captured,
+        manifest_value=SimpleNamespace(model_key="hy3-expert-q2", sidecar=None),
+    )
     root = tmp_path / "hy3"
     manifest = root / "expert-manifest.json"
+    config = quality.LaneConfig(
+        "q2",
+        root,
+        manifest,
+        "hy3-expert-q2",
+        memory_limit="120259084288",
+        expert_cache_limit="83034243072",
+        trust_sidecar=False,
+    )
+
+    quality._load_lane_runtime(config)
+
+    streaming = captured["streaming"]
+    assert isinstance(streaming, dict)
+    assert streaming["verify_record_hashes"] is True
+    assert "loaded_manifest" not in captured
+
+
+def test_hy3_runtime_configuration_forces_ar_and_carries_streaming_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    root = tmp_path / "hy3"
+    root.mkdir()
+    sidecar_payload = b"trusted sidecar fixture\n"
+    (root / "experts.bin").write_bytes(sidecar_payload)
+    manifest = root / "expert-manifest.json"
+    FakeStreamingConfig = _install_fake_lane_modules(
+        monkeypatch,
+        captured,
+        manifest_value=SimpleNamespace(
+            model_key="hy3-expert-q2",
+            sidecar=SimpleNamespace(file="experts.bin", size=len(sidecar_payload)),
+        ),
+    )
     config = quality.LaneConfig(
         "q2",
         root,
@@ -786,6 +1021,7 @@ def test_hy3_runtime_configuration_forces_ar_and_carries_streaming_settings(
     quality._load_lane_runtime(config)
 
     assert captured["root"] == root
+    assert captured["loaded_manifest"] == (manifest, True)
     load_kwargs = captured["load"]
     assert isinstance(load_kwargs, dict)
     assert load_kwargs["mtp"] is False
