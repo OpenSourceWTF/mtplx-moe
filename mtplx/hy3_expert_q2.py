@@ -11,7 +11,7 @@ import re
 import shutil
 import stat
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
@@ -159,6 +159,44 @@ class _HfBlobLayout:
     blobs_fd: int | None = None
 
 
+@dataclass
+class _PinnedPreflightInputs:
+    source_root: Path
+    source_fd: int
+    hf_blob_layout: _HfBlobLayout | None
+    output_parent: Path
+    output_parent_fd: int
+    artifacts: dict[str, _SourceArtifact]
+    closed: bool = False
+
+    def open_artifact(self, name: str) -> _SourceArtifact:
+        if self.closed:
+            raise ValueError("pinned preflight inputs are closed")
+        existing = self.artifacts.get(name)
+        if existing is not None:
+            return existing
+        artifact, self.hf_blob_layout = _open_source_artifact(
+            self.source_root,
+            self.source_fd,
+            name,
+            self.hf_blob_layout,
+        )
+        self.artifacts[name] = artifact
+        return artifact
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        for artifact in self.artifacts.values():
+            os.close(artifact.fd)
+        self.artifacts.clear()
+        os.close(self.source_fd)
+        if self.hf_blob_layout is not None:
+            _close_hf_blob_layout(self.hf_blob_layout)
+        os.close(self.output_parent_fd)
+
+
 @dataclass(frozen=True)
 class ConversionConfig:
     source_root: Path
@@ -230,6 +268,7 @@ class _PreflightContext:
     source_descriptor: ExpertStreamingModelSpec
     target_descriptor: ExpertStreamingModelSpec
     expectations: _ConversionExpectations
+    pinned: _PinnedPreflightInputs
 
 
 def _read_flags() -> int:
@@ -324,25 +363,10 @@ def _mlx_version() -> str:
 
 
 def _target_descriptor_state(spec: ExpertStreamingModelSpec) -> dict[str, Any]:
-    return {
-        "key": spec.key,
-        "source_model": spec.source_model,
-        "source_revision": spec.source_revision,
-        "quant_model": spec.quant_model,
-        "quant_revision": spec.quant_revision,
-        "total_tensor_bytes": spec.total_tensor_bytes,
-        "total_layers": spec.total_layers,
-        "routed_layer_start": spec.routed_layer_start,
-        "routed_layer_count": spec.routed_layer_count,
-        "expert_count": spec.expert_count,
-        "hidden_size": spec.hidden_size,
-        "expert_hidden_size": spec.expert_hidden_size,
-        "quant_bits": spec.quant_bits,
-        "quant_group_size": spec.quant_group_size,
-        "quant_parameter_bytes": spec.quant_parameter_bytes,
-        "mtp_layer_index": spec.mtp_layer_index,
-        "mtp_included": spec.mtp_included,
-    }
+    if not isinstance(spec, ExpertStreamingModelSpec):
+        raise TypeError("target descriptor must be an ExpertStreamingModelSpec")
+    state = {field.name: getattr(spec, field.name) for field in fields(spec)}
+    return json.loads(_canonical_json_bytes(state))
 
 
 def _minimum_conversion_manifest(
@@ -1927,6 +1951,210 @@ def _read_json_path(path: Path, *, max_bytes: int, label: str) -> tuple[Any, str
     return value, hashlib.sha256(payload).hexdigest(), len(payload)
 
 
+def _open_pinned_preflight_inputs(config: ConversionConfig) -> _PinnedPreflightInputs:
+    source_root = _require_real_directory(config.source_root, label="source root")
+    output_parent = _require_real_directory(
+        config.output_root.parent,
+        label="output parent",
+    )
+    output_parent_fd: int | None = None
+    source_fd: int | None = None
+    try:
+        output_parent_fd = os.open(output_parent, _directory_flags())
+        _assert_directory_path_identity(
+            output_parent,
+            output_parent_fd,
+            label="output parent",
+        )
+        source_entry = os.stat(
+            source_root.name,
+            dir_fd=output_parent_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(source_entry.st_mode):
+            raise ValueError("source root must be a real directory")
+        source_fd = os.open(
+            source_root.name,
+            _directory_flags(),
+            dir_fd=output_parent_fd,
+        )
+        source_descriptor = os.fstat(source_fd)
+        source_repeated = os.stat(
+            source_root.name,
+            dir_fd=output_parent_fd,
+            follow_symlinks=False,
+        )
+        source_identity = (source_descriptor.st_dev, source_descriptor.st_ino)
+        if (
+            not stat.S_ISDIR(source_descriptor.st_mode)
+            or (source_entry.st_dev, source_entry.st_ino) != source_identity
+            or (source_repeated.st_dev, source_repeated.st_ino) != source_identity
+        ):
+            raise ValueError("source root identity changed while opening")
+        _assert_directory_path_identity(source_root, source_fd, label="source root")
+
+        try:
+            final_entry = os.stat(
+                config.output_root.name,
+                dir_fd=output_parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            final_entry = None
+        if final_entry is not None:
+            raise ValueError("final output root already exists")
+        try:
+            work_entry = os.stat(
+                _WORK_DIRECTORY_NAME,
+                dir_fd=output_parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            work_entry = None
+        if work_entry is not None and not stat.S_ISDIR(work_entry.st_mode):
+            raise ValueError("conversion work root must be a real directory")
+
+        result = _PinnedPreflightInputs(
+            source_root=source_root,
+            source_fd=source_fd,
+            hf_blob_layout=None,
+            output_parent=output_parent,
+            output_parent_fd=output_parent_fd,
+            artifacts={},
+        )
+        source_fd = None
+        output_parent_fd = None
+        return result
+    except OSError as exc:
+        raise ValueError(f"could not pin conversion directories: {exc}") from exc
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
+        if output_parent_fd is not None:
+            os.close(output_parent_fd)
+
+
+def _assert_source_artifact_identity(
+    pinned: _PinnedPreflightInputs,
+    artifact: _SourceArtifact,
+) -> None:
+    try:
+        descriptor = os.fstat(artifact.fd)
+        entry = os.stat(
+            artifact.entry_name,
+            dir_fd=artifact.entry_directory_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise ValueError(
+            f"source artifact {artifact.name} identity is unavailable: {exc}"
+        ) from exc
+    identity = (artifact.device, artifact.inode)
+    if (
+        not stat.S_ISREG(descriptor.st_mode)
+        or not stat.S_ISREG(entry.st_mode)
+        or descriptor.st_size != artifact.size
+        or (descriptor.st_dev, descriptor.st_ino) != identity
+        or (entry.st_dev, entry.st_ino) != identity
+        or (artifact.entry_device, artifact.entry_inode) != identity
+    ):
+        raise ValueError(f"source artifact {artifact.name} identity changed")
+    if artifact.link_target is not None:
+        try:
+            link = os.stat(
+                artifact.name,
+                dir_fd=pinned.source_fd,
+                follow_symlinks=False,
+            )
+            link_target = os.readlink(artifact.name, dir_fd=pinned.source_fd)
+        except OSError as exc:
+            raise ValueError(
+                f"source HF link {artifact.name} is unavailable: {exc}"
+            ) from exc
+        if (
+            not stat.S_ISLNK(link.st_mode)
+            or (link.st_dev, link.st_ino) != (artifact.link_device, artifact.link_inode)
+            or link_target != artifact.link_target
+        ):
+            raise ValueError(f"source HF link {artifact.name} identity changed")
+
+
+def _assert_pinned_preflight_identities(pinned: _PinnedPreflightInputs) -> None:
+    if pinned.closed:
+        raise ValueError("pinned preflight inputs are closed")
+    _assert_directory_path_identity(
+        pinned.output_parent,
+        pinned.output_parent_fd,
+        label="output parent",
+    )
+    _assert_directory_path_identity(
+        pinned.source_root,
+        pinned.source_fd,
+        label="source root",
+    )
+    try:
+        source_entry = os.stat(
+            pinned.source_root.name,
+            dir_fd=pinned.output_parent_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise ValueError(f"source root identity is unavailable: {exc}") from exc
+    source_descriptor = os.fstat(pinned.source_fd)
+    if not stat.S_ISDIR(source_entry.st_mode) or (
+        source_entry.st_dev,
+        source_entry.st_ino,
+    ) != (source_descriptor.st_dev, source_descriptor.st_ino):
+        raise ValueError("source root identity changed under output parent")
+    if pinned.hf_blob_layout is not None:
+        _assert_hf_layout_identity(pinned.source_fd, pinned.hf_blob_layout)
+    for artifact in pinned.artifacts.values():
+        _assert_source_artifact_identity(pinned, artifact)
+
+
+def _hash_pinned_source_artifact(
+    pinned: _PinnedPreflightInputs,
+    name: str,
+    *,
+    expected_size: int | None = None,
+) -> tuple[str, int]:
+    artifact = pinned.open_artifact(name)
+    if expected_size is not None and artifact.size != expected_size:
+        raise ValueError(
+            f"source file size mismatch for {name}: {artifact.size} != {expected_size}"
+        )
+    digest = _hash_fd(
+        artifact.fd,
+        length=artifact.size,
+        chunk_bytes=8 * 1024**2,
+    )
+    _assert_source_artifact_identity(pinned, artifact)
+    return digest, artifact.size
+
+
+def _read_pinned_json_artifact(
+    pinned: _PinnedPreflightInputs,
+    name: str,
+    *,
+    max_bytes: int,
+    label: str,
+) -> tuple[Any, str, int]:
+    artifact = pinned.open_artifact(name)
+    if artifact.size > max_bytes:
+        raise ValueError(f"{label} must be a bounded regular file")
+    payload = _pread_exact(artifact.fd, 0, artifact.size, label=label)
+    _assert_source_artifact_identity(pinned, artifact)
+    try:
+        value = json.loads(payload, object_pairs_hook=_strict_json_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid {label} JSON: {exc}") from exc
+    return value, hashlib.sha256(payload).hexdigest(), len(payload)
+
+
+def _close_preflight_context(context: _PreflightContext) -> None:
+    context.pinned.close()
+
+
 def _work_root(config: ConversionConfig) -> Path:
     work_root = config.output_root.with_name(_WORK_DIRECTORY_NAME)
     if work_root.parent != config.output_root.parent:
@@ -1985,10 +2213,11 @@ def _validate_upstream_provenance(
         raise ValueError("source provenance Q4 oracle identity mismatch")
 
 
-def _preflight_context(
+def _validate_preflight_context(
     config: ConversionConfig,
     *,
     deep_source_hash: bool,
+    pinned: _PinnedPreflightInputs,
 ) -> _PreflightContext:
     if not isinstance(config, ConversionConfig):
         raise TypeError("config must be a ConversionConfig")
@@ -2011,23 +2240,15 @@ def _preflight_context(
         != expectations.target_tensor_bytes
     ):
         raise ValueError("target routed and resident bytes do not equal tensor bytes")
-    source_root = _require_real_directory(config.source_root, label="source root")
-    output_parent = _require_real_directory(
-        config.output_root.parent,
-        label="output parent",
-    )
-    if config.output_root.exists() or config.output_root.is_symlink():
-        raise ValueError("final output root already exists")
-    work_root = _work_root(config)
-    if work_root.is_symlink():
-        raise ValueError("conversion work root must not be a symlink")
-    if work_root.exists():
-        _require_real_directory(work_root, label="conversion work root")
+    source_root = pinned.source_root
 
-    manifest_value, manifest_file_sha256, manifest_file_bytes = _read_json_path(
-        config.source_manifest,
-        max_bytes=_MAX_MANIFEST_BYTES,
-        label="source expert manifest",
+    manifest_value, manifest_file_sha256, manifest_file_bytes = (
+        _read_pinned_json_artifact(
+            pinned,
+            config.source_manifest.name,
+            max_bytes=_MAX_MANIFEST_BYTES,
+            label="source expert manifest",
+        )
     )
     if manifest_file_sha256 != expectations.manifest_file_sha256:
         raise ValueError("source manifest file hash mismatch")
@@ -2093,8 +2314,9 @@ def _preflight_context(
     ):
         raise ValueError("source sidecar metadata mismatch")
 
-    provenance, provenance_sha256, provenance_bytes = _read_json_path(
-        config.source_provenance,
+    provenance, provenance_sha256, provenance_bytes = _read_pinned_json_artifact(
+        pinned,
+        config.source_provenance.name,
         max_bytes=_MAX_PROVENANCE_BYTES,
         label="source conversion provenance",
     )
@@ -2102,22 +2324,22 @@ def _preflight_context(
         raise ValueError("source conversion provenance hash mismatch")
     _validate_upstream_provenance(provenance, expectations)
 
-    index_sha256, index_bytes = _sha256_path(source_root / _INDEX_FILE)
-    config_sha256, config_bytes = _sha256_path(source_root / "config.json")
+    index_sha256, index_bytes = _hash_pinned_source_artifact(pinned, _INDEX_FILE)
+    config_sha256, config_bytes = _hash_pinned_source_artifact(
+        pinned,
+        "config.json",
+    )
     if index_sha256 != expectations.index_sha256:
         raise ValueError("source resident index hash mismatch")
     if config_sha256 != expectations.config_sha256:
         raise ValueError("source config hash mismatch")
-    sidecar_path = source_root / _SIDECAR_FILE
-    sidecar_status = os.stat(sidecar_path, follow_symlinks=False)
-    if (
-        not stat.S_ISREG(sidecar_status.st_mode)
-        or sidecar_status.st_size != expectations.source_sidecar_bytes
-    ):
+    sidecar_artifact = pinned.open_artifact(_SIDECAR_FILE)
+    if sidecar_artifact.size != expectations.source_sidecar_bytes:
         raise ValueError("source sidecar size mismatch")
     if deep_source_hash:
-        actual_sidecar_sha256, _size = _sha256_path(
-            sidecar_path,
+        actual_sidecar_sha256, _size = _hash_pinned_source_artifact(
+            pinned,
+            _SIDECAR_FILE,
             expected_size=expectations.source_sidecar_bytes,
         )
         if actual_sidecar_sha256 != expectations.sidecar_sha256:
@@ -2135,15 +2357,13 @@ def _preflight_context(
         shard = manifest_shards.get(name)
         if shard is None or shard.kind != "safetensors" or shard.sha256 is None:
             raise ValueError(f"resident shard provenance is incomplete: {name}")
-        try:
-            metadata = os.stat(source_root / name, follow_symlinks=False)
-        except OSError as exc:
-            raise ValueError(f"resident shard is unavailable: {name}: {exc}") from exc
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != shard.size:
+        resident_artifact = pinned.open_artifact(name)
+        if resident_artifact.size != shard.size:
             raise ValueError(f"resident shard size mismatch: {name}")
         if deep_source_hash:
-            actual_sha256, _size = _sha256_path(
-                source_root / name,
+            actual_sha256, _size = _hash_pinned_source_artifact(
+                pinned,
+                name,
                 expected_size=shard.size,
             )
             if actual_sha256 != shard.sha256:
@@ -2161,7 +2381,7 @@ def _preflight_context(
     for name in _ANCILLARY_FILES:
         if name == "config.json":
             continue
-        digest, size = _sha256_path(source_root / name)
+        digest, size = _hash_pinned_source_artifact(pinned, name)
         ancillary_files.append({"file": name, "size": size, "sha256": digest})
         ancillary_physical_bytes += size
 
@@ -2228,7 +2448,7 @@ def _preflight_context(
     )
     required_bytes = (base_bytes * 105 + 99) // 100 + _PROJECTION_WORKING_RESERVE
     try:
-        free_bytes = shutil.disk_usage(output_parent).free
+        free_bytes = shutil.disk_usage(pinned.output_parent_fd).free
     except OSError as exc:
         raise ValueError(f"could not determine output free space: {exc}") from exc
     report["space"] = {
@@ -2246,13 +2466,36 @@ def _preflight_context(
         raise ValueError(
             f"insufficient free space: {free_bytes} available; {required_bytes} required"
         )
+    _assert_pinned_preflight_identities(pinned)
     return _PreflightContext(
         manifest=manifest,
         report=report,
         source_descriptor=source_descriptor,
         target_descriptor=target_descriptor,
         expectations=expectations,
+        pinned=pinned,
     )
+
+
+def _preflight_context(
+    config: ConversionConfig,
+    *,
+    deep_source_hash: bool,
+) -> _PreflightContext:
+    if not isinstance(config, ConversionConfig):
+        raise TypeError("config must be a ConversionConfig")
+    if not isinstance(deep_source_hash, bool):
+        raise TypeError("deep_source_hash must be a bool")
+    pinned = _open_pinned_preflight_inputs(config)
+    try:
+        return _validate_preflight_context(
+            config,
+            deep_source_hash=deep_source_hash,
+            pinned=pinned,
+        )
+    except BaseException:
+        pinned.close()
+        raise
 
 
 def preflight_hy3_expert_q2(
@@ -2262,10 +2505,14 @@ def preflight_hy3_expert_q2(
 ) -> dict[str, Any]:
     """Fail closed on every pinned source, producer, target, and space gate."""
 
-    return _preflight_context(
+    context = _preflight_context(
         config,
         deep_source_hash=deep_source_hash,
-    ).report
+    )
+    try:
+        return context.report
+    finally:
+        _close_preflight_context(context)
 
 
 def _journal_header(
@@ -2777,8 +3024,7 @@ def _assert_conversion_file_identity(
         raise ValueError(f"conversion file {name} identity changed")
 
 
-def _open_or_create_work_root(config: ConversionConfig) -> tuple[int, int]:
-    parent_fd = os.open(config.output_root.parent, _directory_flags())
+def _open_or_create_work_root(config: ConversionConfig, parent_fd: int) -> int:
     work_fd: int | None = None
     try:
         _assert_directory_path_identity(
@@ -2786,6 +3032,16 @@ def _open_or_create_work_root(config: ConversionConfig) -> tuple[int, int]:
             parent_fd,
             label="output parent",
         )
+        try:
+            os.stat(
+                config.output_root.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("final output root already exists")
         try:
             entry = os.stat(
                 _WORK_DIRECTORY_NAME,
@@ -2818,15 +3074,12 @@ def _open_or_create_work_root(config: ConversionConfig) -> tuple[int, int]:
             repeated.st_ino,
         ) != (descriptor.st_dev, descriptor.st_ino):
             raise ValueError("conversion work root changed while opening")
-        result = (parent_fd, work_fd)
-        parent_fd = None
+        result = work_fd
         work_fd = None
         return result
     finally:
         if work_fd is not None:
             os.close(work_fd)
-        if parent_fd is not None:
-            os.close(parent_fd)
 
 
 def _assert_work_root_identity(parent_fd: int, work_fd: int) -> None:
@@ -2912,16 +3165,17 @@ def convert_expert_records(
 
     if not isinstance(resume, bool):
         raise TypeError("resume must be a bool")
-    context = _preflight_context(config, deep_source_hash=False)
-    work_root = _work_root(config)
-    header = _journal_header(config, context)
+    context: _PreflightContext | None = None
     output_fd: int | None = None
     journal_fd: int | None = None
-    source_fd: int | None = None
     work_fd: int | None = None
-    parent_fd: int | None = None
     try:
-        parent_fd, work_fd = _open_or_create_work_root(config)
+        context = _preflight_context(config, deep_source_hash=True)
+        work_root = _work_root(config)
+        header = _journal_header(config, context)
+        _assert_pinned_preflight_identities(context.pinned)
+        parent_fd = context.pinned.output_parent_fd
+        work_fd = _open_or_create_work_root(config, parent_fd)
         output_fd, journal_fd, created = _open_conversion_files(
             work_fd,
             header,
@@ -2929,8 +3183,7 @@ def convert_expert_records(
         )
         _assert_conversion_file_identity(work_fd, _SIDECAR_FILE, output_fd)
         _assert_conversion_file_identity(work_fd, _JOURNAL_FILE, journal_fd)
-        source_path = config.source_root / _SIDECAR_FILE
-        source_fd = os.open(source_path, _read_flags())
+        source_fd = context.pinned.artifacts[_SIDECAR_FILE].fd
         source_status = os.fstat(source_fd)
         if (
             not stat.S_ISREG(source_status.st_mode)
@@ -2997,19 +3250,18 @@ def convert_expert_records(
             raise ValueError("conversion output sidecar size mismatch")
         _assert_conversion_file_identity(work_fd, _SIDECAR_FILE, output_fd)
         _assert_conversion_file_identity(work_fd, _JOURNAL_FILE, journal_fd)
+        _assert_pinned_preflight_identities(context.pinned)
         _assert_work_root_identity(parent_fd, work_fd)
         _assert_directory_path_identity(
             work_root, work_fd, label="conversion work root"
         )
         return tuple(output_records)
     finally:
-        if source_fd is not None:
-            os.close(source_fd)
         if journal_fd is not None:
             os.close(journal_fd)
         if output_fd is not None:
             os.close(output_fd)
         if work_fd is not None:
             os.close(work_fd)
-        if parent_fd is not None:
-            os.close(parent_fd)
+        if context is not None:
+            _close_preflight_context(context)

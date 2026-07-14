@@ -1591,6 +1591,7 @@ def _conversion_test_environment(
         "source_record_bytes": source_record_bytes,
         "manifest": manifest.with_digest(),
         "source_spec": source_spec,
+        "target_spec": target_spec,
     }
 
 
@@ -1780,6 +1781,111 @@ def test_convert_checks_free_space_before_creating_workdir(
     assert not env["work_root"].exists()
 
 
+def test_convert_deep_hashes_entire_sidecar_before_creating_workdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    sidecar = env["source_root"] / "experts.bin"
+    payload = bytearray(sidecar.read_bytes())
+    payload[-1] ^= 0xFF
+    sidecar.write_bytes(payload)
+
+    with pytest.raises(ValueError, match="sidecar hash"):
+        convert_expert_records(env["config"], resume=True)
+
+    assert env["conversions"] == []
+    assert not env["work_root"].exists()
+
+
+def test_resume_deep_hashes_resident_shards_before_touching_durable_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    convert_expert_records(env["config"], resume=True)
+    output = env["work_root"] / "experts.bin"
+    journal = env["work_root"] / "conversion-journal.jsonl"
+    durable_state = (output.read_bytes(), journal.read_bytes())
+    resident = env["source_root"] / env["manifest"].resident_tensors[0].shard
+    payload = bytearray(resident.read_bytes())
+    payload[-1] ^= 0xFF
+    resident.write_bytes(payload)
+    env["conversions"].clear()
+
+    with pytest.raises(ValueError, match="resident shard hash"):
+        convert_expert_records(env["config"], resume=True)
+
+    assert env["conversions"] == []
+    assert (output.read_bytes(), journal.read_bytes()) == durable_state
+
+
+def test_convert_rejects_source_root_replacement_after_deep_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    source_root = env["source_root"]
+    moved_source = source_root.with_name(f"{source_root.name}-moved")
+    original_disk_usage = q2_module.shutil.disk_usage
+    replaced = False
+
+    def replace_source_after_validation(path):
+        nonlocal replaced
+        usage = original_disk_usage(path)
+        source_root.rename(moved_source)
+        source_root.mkdir()
+        (source_root / "experts.bin").write_bytes(
+            (moved_source / "experts.bin").read_bytes()
+        )
+        replaced = True
+        return usage
+
+    monkeypatch.setattr(q2_module.shutil, "disk_usage", replace_source_after_validation)
+
+    with pytest.raises(ValueError, match="source root.*identity|identity.*source root"):
+        convert_expert_records(env["config"], resume=True)
+
+    assert replaced is True
+    assert env["conversions"] == []
+    assert not env["work_root"].exists()
+
+
+def test_convert_rejects_output_parent_replacement_before_workdir_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    moved_parent = tmp_path.with_name(f"{tmp_path.name}-moved")
+    replacement_work = env["work_root"]
+    held_work = moved_parent / replacement_work.name
+    original_disk_usage = q2_module.shutil.disk_usage
+    replaced = False
+
+    def replace_output_parent_after_validation(path):
+        nonlocal replaced
+        usage = original_disk_usage(path)
+        tmp_path.rename(moved_parent)
+        tmp_path.mkdir()
+        replaced = True
+        return usage
+
+    monkeypatch.setattr(
+        q2_module.shutil,
+        "disk_usage",
+        replace_output_parent_after_validation,
+    )
+
+    with pytest.raises(
+        ValueError, match="output parent.*identity|identity.*output parent"
+    ):
+        convert_expert_records(env["config"], resume=True)
+
+    assert replaced is True
+    assert not replacement_work.exists()
+    assert not held_work.exists()
+
+
 def test_conversion_config_rejects_unpinned_paths_and_alignment(tmp_path: Path) -> None:
     source_root = tmp_path / "wrong-source"
     output_root = tmp_path / "hy3-expert-only-mlx-q2"
@@ -1930,6 +2036,33 @@ def test_resume_refuses_changed_build_fingerprint(
         env["target_state_box"][0] = {"key": "changed-target"}
 
     with pytest.raises(ValueError, match="fingerprint|header|resume"):
+        convert_expert_records(env["config"], resume=True)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("display_name", "changed display"),
+        ("top_k", 2),
+        ("router_storage", "changed storage"),
+        ("router_matmul_dtype", "changed dtype"),
+        ("router_bytes", 1),
+        ("kv_bytes_per_token", 1),
+        ("full_indexer_layers", (0,)),
+    ],
+)
+def test_resume_binds_every_target_descriptor_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    convert_expert_records(env["config"], resume=True)
+    changed = replace(env["target_spec"], **{field: value})
+    env["target_state_box"][0] = q2_module._target_descriptor_state(changed)
+
+    with pytest.raises(ValueError, match="header|resume"):
         convert_expert_records(env["config"], resume=True)
 
 
