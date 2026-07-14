@@ -10,6 +10,8 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from typing import Any
 
+from mtplx.expert_streaming_models import get_model_spec
+
 
 GIB = 1024**3
 RESOURCE_ORDER = ("q4", "q2", "q2", "q4")
@@ -27,7 +29,46 @@ EXPECTED_RUNTIME = {
     "max_read_chunk_bytes": 8 * 1024**2,
     "bypass_page_cache": True,
     "verify_record_hashes": True,
+    "transient_slots": None,
+    "io_staging_bytes": 0,
+    "execution_workspace_bytes": 0,
 }
+EXPECTED_GLOBAL_COVERAGE = frozenset(
+    {
+        "runtime_occupancy",
+        "storage_reads",
+        "ssd_ceiling",
+        "gpu",
+        "dram_bandwidth",
+        "generation_thread_cpu",
+        "timeline",
+    }
+)
+EXPECTED_PIPELINE_COVERAGE = frozenset(
+    {
+        "attribution",
+        "decode_phase",
+        "sampler_window_backend",
+        "potentially_blocking_next_miss_step",
+        "generation_expert_input_wait",
+        "operation_credit",
+        "byte_credit",
+        "authoritative_reserve",
+        "slot_capacity_admission",
+        "outer_split_executor_queue",
+        "eligible_unsubmitted_cause",
+        "admitted_read_ranges",
+        "scheduled_read_ranges",
+        "physical_device_operations",
+        "physical_device_bytes",
+        "physical_device_queue_depth",
+        "gpu_expert_wait",
+        "gpu_idle_time",
+        "future_layer_eligibility",
+        "speculative_record_accounting",
+        "python_preadv_when_native_reader",
+    }
+)
 
 
 def _mapping(value: object) -> Mapping[str, Any]:
@@ -45,6 +86,24 @@ def _finite_number(value: object) -> float | None:
         return None
     result = float(value)
     return result if math.isfinite(result) else None
+
+
+def _nonfinite_numeric_paths(value: object, *, path: str) -> list[str]:
+    if isinstance(value, bool):
+        return []
+    if isinstance(value, float):
+        return [] if math.isfinite(value) else [path]
+    if isinstance(value, Mapping):
+        paths: list[str] = []
+        for key, item in value.items():
+            paths.extend(_nonfinite_numeric_paths(item, path=f"{path}.{key}"))
+        return paths
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        paths = []
+        for index, item in enumerate(value):
+            paths.extend(_nonfinite_numeric_paths(item, path=f"{path}[{index}]"))
+        return paths
+    return []
 
 
 def _canonical(value: object) -> str:
@@ -225,16 +284,24 @@ def _output_divergence(
 def _coverage_gaps(telemetry: Mapping[str, Any]) -> list[str]:
     gaps: list[str] = []
     sections = (
-        ("coverage", _mapping(telemetry.get("coverage"))),
+        (
+            "coverage",
+            _mapping(telemetry.get("coverage")),
+            EXPECTED_GLOBAL_COVERAGE,
+        ),
         (
             "expert_pipeline.coverage",
             _mapping(_mapping(telemetry.get("expert_pipeline")).get("coverage")),
+            EXPECTED_PIPELINE_COVERAGE,
         ),
     )
-    for prefix, coverage in sections:
+    for prefix, coverage, expected_keys in sections:
+        for key in sorted(expected_keys - set(coverage)):
+            gaps.append(f"{prefix}.{key}=missing")
         for key, value in coverage.items():
             status = str(value)
             if status.startswith("measured") or status in {
+                "complete",
                 "supplied",
                 "uncached_reader_bytes",
             }:
@@ -300,14 +367,46 @@ def _validate_payloads(
             continue
         if run.get("run_label") != expected_label:
             errors.append(f"{label} nested run label does not match declared order")
+        configuration_label = _mapping(payload.get("configuration_summary")).get(
+            "configuration_label"
+        )
+        if (
+            not isinstance(configuration_label, str)
+            or payload.get("configuration_label") != configuration_label
+            or run.get("configuration_label") != configuration_label
+        ):
+            errors.append(
+                f"{label} configuration_label differs across payload, summary, and run"
+            )
         _append_expected_error(
             errors,
             f"{label} run execution_lane",
             run.get("execution_lane"),
             "reference-ar",
         )
+        for field, expected in (
+            ("cache_scope", "layer"),
+            ("slot_layout", "component-banks"),
+            ("concurrency", 1),
+            ("requested_concurrency", 1),
+            ("achieved_peak_concurrency", 1),
+            ("saturation_valid", True),
+            ("undersubscribed", False),
+        ):
+            _append_expected_error(
+                errors,
+                f"{label} run {field}",
+                run.get(field),
+                expected,
+            )
         if payload.get("error") or run.get("error"):
             errors.append(f"{label} reports an operational error")
+        finish_reason = run.get("finish_reason")
+        if not isinstance(finish_reason, str) or any(
+            marker in finish_reason.lower()
+            for marker in ("error", "crash", "exception", "failed")
+        ):
+            errors.append(f"{label} has invalid finish_reason {finish_reason!r}")
         tps = _finite_number(run.get("completion_tokens_per_second"))
         if tps is None or tps <= 0:
             errors.append(f"{label} has invalid completion_tokens_per_second")
@@ -316,8 +415,20 @@ def _validate_payloads(
             isinstance(token, bool) or not isinstance(token, int) for token in token_ids
         ):
             errors.append(f"{label} token_ids must be a list of integers")
-        if not isinstance(run.get("text"), str):
+        completion_tokens = run.get("completion_tokens")
+        if (
+            isinstance(completion_tokens, bool)
+            or not isinstance(completion_tokens, int)
+            or completion_tokens <= 0
+            or not isinstance(token_ids, list)
+            or completion_tokens != len(token_ids)
+        ):
+            errors.append(f"{label} completion_tokens does not match token_ids")
+        text = run.get("text")
+        if not isinstance(text, str):
             errors.append(f"{label} text must be present for divergence reporting")
+        elif completion_tokens and not text:
+            errors.append(f"{label} text evidence is empty for a non-empty completion")
 
         telemetry = run.get("resource_telemetry")
         if kind == "resource":
@@ -347,6 +458,9 @@ def _validate_configuration(
         generation = _mapping(settings.get("generation"))
         sampler = _mapping(settings.get("sampler"))
         scheduler = _mapping(settings.get("scheduler"))
+        prompt_options = _mapping(settings.get("prompt_options"))
+        mtp = _mapping(settings.get("mtp"))
+        payload_mtp = _mapping(payload.get("mtp"))
         model_artifact = _mapping(settings.get("model_artifact"))
         top_generation = _mapping(payload.get("generation"))
         if not summary or not settings:
@@ -393,6 +507,72 @@ def _validate_configuration(
             f"{label} scheduler execution_lane",
             scheduler.get("execution_lane"),
             "reference-ar",
+        )
+        for field, expected in (
+            ("cache_scope", "layer"),
+            ("slot_layout", "component-banks"),
+            ("concurrency", 1),
+            ("requested_concurrency", 1),
+        ):
+            _append_expected_error(
+                errors,
+                f"{label} configuration {field}",
+                summary.get(field),
+                expected,
+            )
+        _append_expected_error(
+            errors,
+            f"{label} scheduler requested_concurrency",
+            scheduler.get("requested_concurrency"),
+            1,
+        )
+        _append_expected_error(
+            errors,
+            f"{label} scheduler max_prefills_per_step",
+            scheduler.get("max_prefills_per_step"),
+            1,
+        )
+        _append_expected_error(
+            errors,
+            f"{label} scheduler workload_shape",
+            scheduler.get("workload_shape"),
+            "static",
+        )
+        _append_expected_error(
+            errors,
+            f"{label} MTP enabled",
+            mtp.get("enabled"),
+            False,
+        )
+        _append_expected_error(
+            errors,
+            f"{label} payload MTP enabled",
+            payload_mtp.get("enabled"),
+            False,
+        )
+        _append_expected_error(
+            errors,
+            f"{label} thinking enabled",
+            prompt_options.get("enable_thinking"),
+            False,
+        )
+        _append_expected_error(
+            errors,
+            f"{label} payload thinking enabled",
+            payload.get("enable_thinking"),
+            False,
+        )
+        _append_expected_error(
+            errors,
+            f"{label} prompt chat",
+            prompt_options.get("chat"),
+            False,
+        )
+        _append_expected_error(
+            errors,
+            f"{label} payload chat",
+            payload.get("chat"),
+            False,
         )
         for key, expected in EXPECTED_RUNTIME.items():
             _append_expected_error(
@@ -466,6 +646,19 @@ def _validate_configuration(
             payload.get("slot_layout"),
             "component-banks",
         )
+        for field, expected in (
+            ("concurrency", 1),
+            ("requested_concurrency", 1),
+            ("achieved_peak_concurrency", 1),
+            ("saturation_valid", True),
+            ("undersubscribed", False),
+        ):
+            _append_expected_error(
+                errors,
+                f"{label} payload {field}",
+                payload.get(field),
+                expected,
+            )
 
 
 def _validate_run_gate(
@@ -476,6 +669,7 @@ def _validate_run_gate(
     slots: dict[str, set[int]] = {"q4": set(), "q2": set()}
     for index, (lane, _payload, run) in enumerate(entries):
         label = f"run[{index + 1}]"
+        spec = get_model_spec(MODEL_KEYS[lane])
         after = _mapping(run.get("streaming_after"))
         plan = _mapping(after.get("memory_plan"))
         integrity = _mapping(after.get("integrity"))
@@ -491,10 +685,59 @@ def _validate_run_gate(
         )
         _append_expected_error(
             errors,
-            f"{label} memory_plan.total_limit_bytes",
+            f"{label} memory plan total_limit_bytes",
             plan.get("total_limit_bytes"),
             EXPECTED_RUNTIME["memory_limit_bytes"],
         )
+        _append_expected_error(
+            errors,
+            f"{label} memory plan cache_scope",
+            plan.get("cache_scope"),
+            "layer",
+        )
+        _append_expected_error(
+            errors,
+            f"{label} memory plan transient_slots",
+            plan.get("transient_slots"),
+            spec.top_k,
+        )
+        expected_fixed = (
+            spec.resident_bytes
+            + EXPECTED_RUNTIME["max_live_kv_tokens"] * spec.kv_bytes_per_token
+            + spec.transient_scratch_bytes
+            + EXPECTED_RUNTIME["runtime_reserve_bytes"]
+        )
+        expected_persistent = spec.persistent_cache_bytes(EXPECTED_SLOTS[lane])
+        expected_allocated = expected_fixed + expected_persistent
+        expected_unallocated = (
+            EXPECTED_RUNTIME["memory_limit_bytes"] - expected_allocated
+        )
+        _append_expected_error(
+            errors,
+            f"{label} memory plan fixed_bytes",
+            plan.get("fixed_bytes"),
+            expected_fixed,
+        )
+        _append_expected_error(
+            errors,
+            f"{label} memory plan persistent_cache_bytes",
+            plan.get("persistent_cache_bytes"),
+            expected_persistent,
+        )
+        _append_expected_error(
+            errors,
+            f"{label} memory plan allocated_bytes",
+            plan.get("allocated_bytes"),
+            expected_allocated,
+        )
+        _append_expected_error(
+            errors,
+            f"{label} memory plan unallocated_bytes",
+            plan.get("unallocated_bytes"),
+            expected_unallocated,
+        )
+        fixed = plan.get("fixed_bytes")
+        persistent = plan.get("persistent_cache_bytes")
         allocated = plan.get("allocated_bytes")
         unallocated = plan.get("unallocated_bytes")
         if (
@@ -510,6 +753,27 @@ def _validate_run_gate(
             or unallocated < 0
         ):
             errors.append(f"{label} has an invalid fixed memory plan remainder")
+        if (
+            all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in (fixed, persistent, allocated)
+            )
+            and fixed + persistent != allocated
+        ):
+            errors.append(
+                f"{label} memory plan violates fixed + persistent == allocated"
+            )
+        total = plan.get("total_limit_bytes")
+        if (
+            all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in (allocated, unallocated, total)
+            )
+            and allocated + unallocated != total
+        ):
+            errors.append(
+                f"{label} memory plan violates allocated + unallocated == total"
+            )
         if (
             integrity.get("valid") is not True
             or integrity.get("model_key") != MODEL_KEYS[lane]
@@ -549,6 +813,38 @@ def _resource_summary(
             telemetry.get("schema"),
             "mtplx-resource-telemetry-v2",
         )
+        nonfinite_paths = _nonfinite_numeric_paths(telemetry, path="resource_telemetry")
+        if nonfinite_paths:
+            errors.append(
+                f"{label} has non-finite resource telemetry at "
+                + ", ".join(nonfinite_paths)
+            )
+        interval_count = telemetry.get("interval_count")
+        sample_count = telemetry.get("sample_count")
+        elapsed = _finite_number(telemetry.get("elapsed_seconds"))
+        if (
+            isinstance(interval_count, bool)
+            or not isinstance(interval_count, int)
+            or interval_count <= 0
+        ):
+            errors.append(f"{label} interval_count must be a positive integer")
+        if elapsed is None or elapsed <= 0:
+            errors.append(f"{label} elapsed_seconds must be positive and finite")
+        if (
+            isinstance(sample_count, bool)
+            or not isinstance(sample_count, int)
+            or sample_count < 2
+        ):
+            errors.append(f"{label} sample_count must be at least two")
+        elif interval_count != sample_count - 1:
+            errors.append(f"{label} interval_count must equal sample_count minus one")
+        if telemetry.get("samples_dropped") != 0:
+            errors.append(f"{label} samples_dropped must be zero")
+        if (
+            telemetry.get("sampling_failures") != 0
+            or telemetry.get("sampling_failure") is not None
+        ):
+            errors.append(f"{label} resource sampling failure was reported")
         throughput = _mapping(telemetry.get("throughput"))
         storage = _mapping(telemetry.get("storage"))
         pipeline = _mapping(telemetry.get("expert_pipeline"))
@@ -558,6 +854,24 @@ def _resource_summary(
             errors.append(
                 f"{label} is missing required telemetry coverage declarations"
             )
+        missing_global = EXPECTED_GLOBAL_COVERAGE - set(coverage)
+        missing_pipeline = EXPECTED_PIPELINE_COVERAGE - set(pipeline_coverage)
+        if missing_global or missing_pipeline:
+            errors.append(
+                f"{label} missing coverage keys: "
+                f"global={sorted(missing_global)}, "
+                f"expert_pipeline={sorted(missing_pipeline)}"
+            )
+        if coverage.get("timeline") != "complete":
+            errors.append(f"{label} telemetry timeline coverage is not complete")
+
+        run_completion = run.get("completion_tokens")
+        for field in ("completion_tokens", "final_completion_tokens"):
+            if throughput.get(field) != run_completion:
+                errors.append(
+                    f"{label} telemetry completion token count {field} "
+                    "does not match the run"
+                )
 
         diagnostic_tps = _finite_number(throughput.get("completion_tokens_per_second"))
         read_bytes = _finite_number(storage.get("reader_read_bytes"))
@@ -577,6 +891,8 @@ def _resource_summary(
             errors.append(f"{label} miss-wait fraction exceeds one")
         if coverage.get("storage_reads") != "uncached_reader_bytes":
             errors.append(f"{label} does not prove uncached physical reader bytes")
+        if storage.get("io_cache_modes") != ["f-nocache"]:
+            errors.append(f"{label} io_cache_modes must be exactly ['f-nocache']")
         if (
             pipeline_coverage.get("potentially_blocking_next_miss_step")
             != "measured_upper_bound"
@@ -630,7 +946,17 @@ def _resource_summary(
     else:
         result["pairs"] = {"samples": 0, "percent_changes": []}
         result["order_splits"] = {}
+    gaps.add("swap_pressure=unavailable")
     result["coverage_gaps"] = sorted(gaps)
+    result["swap_pressure"] = {
+        "status": "unavailable",
+        "gate_passed": False,
+        "reason": "current benchmark payload does not measure swap pressure",
+    }
+    errors.append(
+        "resource campaign swap-pressure evidence unavailable; "
+        "the current benchmark payload cannot prove a pressure-free run"
+    )
     return result
 
 
@@ -686,30 +1012,35 @@ def summarize_glm52_q2_campaign(
 ) -> dict[str, Any]:
     """Validate one fixed campaign and summarize diagnostic/headline evidence."""
 
-    errors: list[str] = []
+    comparability_errors: list[str] = []
+    resource_errors: list[str] = []
     resource_entries = _validate_payloads(
         resource_payloads,
         kind="resource",
         order=RESOURCE_ORDER,
-        errors=errors,
+        errors=comparability_errors,
     )
     headline_entries = _validate_payloads(
         headline_payloads,
         kind="headline",
         order=HEADLINE_ORDER,
-        errors=errors,
+        errors=comparability_errors,
     )
     all_entries = [*resource_entries, *headline_entries]
-    _validate_configuration(all_entries, errors=errors)
-    slots = _validate_run_gate(all_entries, errors=errors)
-    resource = _resource_summary(resource_entries, errors=errors)
+    _validate_configuration(all_entries, errors=comparability_errors)
+    slots = _validate_run_gate(all_entries, errors=resource_errors)
+    resource = _resource_summary(resource_entries, errors=resource_errors)
     headline = _headline_summary(headline_entries)
 
     slot_summary = {
         lane: next(iter(values)) if len(values) == 1 else None
         for lane, values in slots.items()
     }
-    unique_errors = list(dict.fromkeys(errors))
+    unique_comparability_errors = list(dict.fromkeys(comparability_errors))
+    unique_resource_errors = list(dict.fromkeys(resource_errors))
+    unique_errors = list(
+        dict.fromkeys([*unique_comparability_errors, *unique_resource_errors])
+    )
     valid = not unique_errors
     return {
         "schema": "mtplx-glm52-expert-q2-campaign-summary-v1",
@@ -720,7 +1051,8 @@ def summarize_glm52_q2_campaign(
             "headline": list(HEADLINE_ORDER),
         },
         "comparability": {
-            "passed": valid,
+            "passed": not unique_comparability_errors,
+            "errors": unique_comparability_errors,
             "normalization": [
                 "run_and_derived_labels",
                 "model_key",
@@ -729,10 +1061,12 @@ def summarize_glm52_q2_campaign(
             ],
         },
         "resource_gate": {
-            "passed": valid,
+            "passed": not unique_comparability_errors and not unique_resource_errors,
+            "errors": unique_resource_errors,
             "requires_uncached_reader_bytes": True,
             "requires_full_record_integrity": True,
             "requires_fixed_memory_plan": True,
+            "requires_swap_pressure_evidence": True,
         },
         "cache_slots_per_layer": slot_summary,
         "resource": resource,

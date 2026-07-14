@@ -65,49 +65,212 @@ def _load_payloads(paths: Sequence[Path]) -> list[dict]:
     return payloads
 
 
-def _write_json_exclusive(path: Path, payload: dict) -> None:
+class _OutputBinding:
+    __slots__ = ("path", "parent_path", "final_name", "parent_fd", "parent_identity")
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        parent_path: Path,
+        final_name: str,
+        parent_fd: int,
+        parent_identity: tuple[int, int],
+    ) -> None:
+        self.path = path
+        self.parent_path = parent_path
+        self.final_name = final_name
+        self.parent_fd = parent_fd
+        self.parent_identity = parent_identity
+
+
+def _bind_output_parent(path: Path) -> _OutputBinding:
+    parent_path = path.expanduser().parent.resolve(strict=True)
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    parent_fd = os.open(parent_path, directory_flags)
+    try:
+        parent_identity = _inode_identity(os.fstat(parent_fd))
+        if _inode_identity(os.stat(parent_path, follow_symlinks=False)) != (
+            parent_identity
+        ):
+            raise RuntimeError("output parent was substituted while binding")
+        try:
+            os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(f"refusing to overwrite campaign evidence: {path}")
+        return _OutputBinding(
+            path=path,
+            parent_path=parent_path,
+            final_name=path.name,
+            parent_fd=parent_fd,
+            parent_identity=parent_identity,
+        )
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
+def _write_json_exclusive(
+    path: Path,
+    payload: dict,
+    *,
+    binding: _OutputBinding | None = None,
+) -> None:
     encoded = (
         json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
     ).encode("utf-8")
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(8)}")
-    descriptor = os.open(
-        temporary,
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
-    )
+    owned_binding = binding is None
+    bound = binding or _bind_output_parent(path)
+    parent_path = bound.parent_path
+    final_name = bound.final_name
+    temporary_name = f".{final_name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+    parent_fd = bound.parent_fd
+    parent_identity = bound.parent_identity
+    temporary_fd = -1
+    final_fd = -1
+    temporary_identity: tuple[int, int] | None = None
+    linked = False
+    succeeded = False
     try:
-        with os.fdopen(descriptor, "wb", closefd=True) as handle:
-            descriptor = -1
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.link(temporary, path, follow_symlinks=False)
-        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
         try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+            os.stat(final_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(f"refusing to overwrite campaign evidence: {path}")
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        temporary_identity = _inode_identity(os.fstat(temporary_fd))
+        view = memoryview(encoded)
+        while view:
+            written = os.write(temporary_fd, view)
+            if written <= 0:
+                raise OSError("short write while recording campaign evidence")
+            view = view[written:]
+        os.fsync(temporary_fd)
+        if _inode_identity(os.fstat(temporary_fd)) != temporary_identity:
+            raise RuntimeError("output temporary inode was substituted while open")
+        os.link(
+            temporary_name,
+            final_name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        linked = True
+        final_fd = os.open(
+            final_name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        final_stat = os.fstat(final_fd)
+        if _inode_identity(
+            final_stat
+        ) != temporary_identity or final_stat.st_size != len(encoded):
+            raise RuntimeError("output final inode was substituted before validation")
+        _revalidate_advertised_output(
+            parent_path,
+            final_name,
+            parent_identity=parent_identity,
+            final_identity=temporary_identity,
+        )
+        _unlink_if_identity(parent_fd, temporary_name, temporary_identity)
+        os.fsync(parent_fd)
+        _revalidate_advertised_output(
+            parent_path,
+            final_name,
+            parent_identity=parent_identity,
+            final_identity=temporary_identity,
+        )
+        succeeded = True
     finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        temporary.unlink(missing_ok=True)
+        if final_fd >= 0:
+            os.close(final_fd)
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        if temporary_identity is not None:
+            if linked and not succeeded:
+                _unlink_if_identity(parent_fd, final_name, temporary_identity)
+            _unlink_if_identity(parent_fd, temporary_name, temporary_identity)
+        if not succeeded:
+            os.fsync(parent_fd)
+        if owned_binding:
+            os.close(parent_fd)
+
+
+def _inode_identity(value: os.stat_result) -> tuple[int, int]:
+    return value.st_dev, value.st_ino
+
+
+def _unlink_if_identity(
+    parent_fd: int,
+    name: str,
+    expected: tuple[int, int],
+) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if _inode_identity(current) == expected:
+        os.unlink(name, dir_fd=parent_fd)
+
+
+def _revalidate_advertised_output(
+    parent_path: Path,
+    final_name: str,
+    *,
+    parent_identity: tuple[int, int],
+    final_identity: tuple[int, int],
+) -> None:
+    try:
+        current_parent = _inode_identity(os.stat(parent_path, follow_symlinks=False))
+    except FileNotFoundError as exc:
+        raise RuntimeError("output parent was substituted or removed") from exc
+    if current_parent != parent_identity:
+        raise RuntimeError("output parent was substituted after validation")
+    try:
+        current_final = _inode_identity(
+            os.stat(parent_path / final_name, follow_symlinks=False)
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "advertised output final was substituted or removed"
+        ) from exc
+    if current_final != final_identity:
+        raise RuntimeError("advertised output final inode was substituted")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    binding: _OutputBinding | None = None
     try:
         output = validate_external_output_path(args.output_json)
+        binding = _bind_output_parent(output)
         resource = _load_payloads(args.resource)
         headline = _load_payloads(args.headline)
         summary = summarize_glm52_q2_campaign(resource, headline)
-        _write_json_exclusive(output, summary)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        _write_json_exclusive(output, summary, binding=binding)
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
         print(f"campaign summary failed: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if binding is not None:
+            os.close(binding.parent_fd)
     return 0 if summary["valid"] else 2
 
 
