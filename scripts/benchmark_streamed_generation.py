@@ -1327,30 +1327,29 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Speculative decoding through the packaged layer-80 NextN head "
-            "(hy3-q4 only; requires --mtp-artifacts). Default off: the AR "
-            "path is unchanged unless this flag is passed."
+            "Speculative decoding through a packaged external NextN head "
+            "(hy3-q4 or glm52-q4; requires --mtp-artifacts). Default off: "
+            "the AR path is unchanged unless this flag is passed."
         ),
     )
     parser.add_argument(
         "--mtp-artifacts",
         type=Path,
         help=(
-            "Directory holding the layer-80 Hy3 MTP head artifacts "
-            "(layer80-bf16.safetensors for bf16; layer80-residents-q"
-            ".safetensors and layer80-q4.safetensors for q4)."
+            "Directory holding the external MTP head artifacts (Hy3 layer 80 "
+            "or GLM-5.2 layer 78). GLM-5.2 requires the verified BF16 artifact."
         ),
     )
     parser.add_argument(
         "--mtp-precision",
         choices=("bf16", "q4"),
         help=(
-            "Layer-80 NextN head precision (default bf16). bf16 loads the "
+            "External NextN head precision (default bf16). bf16 loads the "
             "bit-exact BF16 head (~7.5 GB resident; quantized MTP heads "
             "collapse acceptance, docs/FORGE_BACKEND_CONTRACT.md section 6) "
             "- budget it against --expert-cache-limit. q4 loads the pinned "
-            "quantized artifacts (~1.94 GiB expert bank). Requires "
-            "--enable-mtp."
+            "Hy3 quantized artifacts (~1.94 GiB expert bank); GLM-5.2 supports "
+            "BF16 only. Requires --enable-mtp."
         ),
     )
     return parser
@@ -1360,8 +1359,10 @@ def validate_mtp_flags(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
     if args.enable_mtp:
-        if args.model_key != "hy3-q4":
-            parser.error("--enable-mtp is packaged for --model-key hy3-q4 only")
+        if args.model_key not in {"hy3-q4", "glm52-q4"}:
+            parser.error(
+                "--enable-mtp is packaged for --model-key hy3-q4 or glm52-q4 only"
+            )
         if args.mtp_artifacts is None:
             parser.error("--enable-mtp requires --mtp-artifacts")
         if getattr(args, "concurrency", 1) > 1:
@@ -1371,6 +1372,8 @@ def validate_mtp_flags(
             )
         if args.mtp_precision is None:
             args.mtp_precision = "bf16"
+        if args.model_key == "glm52-q4" and args.mtp_precision != "bf16":
+            parser.error("--model-key glm52-q4 requires the validated BF16 MTP head")
     elif args.mtp_artifacts is not None:
         parser.error("--mtp-artifacts requires --enable-mtp")
     elif args.mtp_precision is not None:
