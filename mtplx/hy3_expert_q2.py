@@ -111,12 +111,12 @@ class _SourceArtifact:
     link_target: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class _HfBlobLayout:
     source_name: str
     snapshots_fd: int
     repository_fd: int
-    blobs_fd: int
+    blobs_fd: int | None = None
 
 
 def _read_flags() -> int:
@@ -245,75 +245,187 @@ def _require_flat_target_name(name: str) -> str:
 
 
 def _close_hf_blob_layout(layout: _HfBlobLayout) -> None:
-    os.close(layout.blobs_fd)
-    os.close(layout.repository_fd)
+    if layout.blobs_fd is not None:
+        os.close(layout.blobs_fd)
     os.close(layout.snapshots_fd)
+    os.close(layout.repository_fd)
 
 
-def _open_hf_blob_directory(source_root: Path, source_fd: int) -> _HfBlobLayout:
+def _open_source_directory(
+    source_root: Path,
+) -> tuple[int, _HfBlobLayout | None]:
     if source_root.parent.name != "snapshots":
-        raise ValueError("source artifact symlink is outside an HF snapshot layout")
+        return os.open(source_root, _directory_flags()), None
+
     snapshot_name = _require_flat_target_name(source_root.name)
-    snapshots_fd = os.open("..", _directory_flags(), dir_fd=source_fd)
-    repository_fd: int | None = None
-    blob_fd: int | None = None
+    repository_root = _require_real_directory(
+        source_root.parent.parent,
+        label="HF repository root",
+    )
+    repository_fd: int | None = os.open(repository_root, _directory_flags())
+    snapshots_fd: int | None = None
+    source_fd: int | None = None
     try:
-        source_entry = os.stat(
-            snapshot_name,
-            dir_fd=snapshots_fd,
-            follow_symlinks=False,
+        _assert_directory_path_identity(
+            repository_root,
+            repository_fd,
+            label="HF repository root",
         )
-        source_status = os.fstat(source_fd)
-        if not stat.S_ISDIR(source_entry.st_mode) or (
-            source_entry.st_dev,
-            source_entry.st_ino,
-        ) != (source_status.st_dev, source_status.st_ino):
-            raise ValueError("source root is not pinned inside its HF snapshot")
-        repository_fd = os.open("..", _directory_flags(), dir_fd=snapshots_fd)
-        snapshots_entry = os.stat(
+        snapshots_before = os.stat(
             "snapshots",
             dir_fd=repository_fd,
             follow_symlinks=False,
         )
+        if not stat.S_ISDIR(snapshots_before.st_mode):
+            raise ValueError("HF snapshots entry must be a real directory")
+        snapshots_fd = os.open(
+            "snapshots",
+            _directory_flags(),
+            dir_fd=repository_fd,
+        )
         snapshots_status = os.fstat(snapshots_fd)
-        if not stat.S_ISDIR(snapshots_entry.st_mode) or (
-            snapshots_entry.st_dev,
-            snapshots_entry.st_ino,
-        ) != (snapshots_status.st_dev, snapshots_status.st_ino):
-            raise ValueError("HF snapshots directory identity changed")
-        blob_entry = os.stat(
-            "blobs",
+        snapshots_after = os.stat(
+            "snapshots",
             dir_fd=repository_fd,
             follow_symlinks=False,
         )
-        if not stat.S_ISDIR(blob_entry.st_mode):
-            raise ValueError("HF blobs entry must be a real directory")
-        blob_fd = os.open("blobs", _directory_flags(), dir_fd=repository_fd)
-        blob_status = os.fstat(blob_fd)
-        if (blob_entry.st_dev, blob_entry.st_ino) != (
-            blob_status.st_dev,
-            blob_status.st_ino,
+        if (
+            not stat.S_ISDIR(snapshots_status.st_mode)
+            or not stat.S_ISDIR(snapshots_after.st_mode)
+            or (snapshots_before.st_dev, snapshots_before.st_ino)
+            != (snapshots_status.st_dev, snapshots_status.st_ino)
+            or (snapshots_after.st_dev, snapshots_after.st_ino)
+            != (snapshots_status.st_dev, snapshots_status.st_ino)
         ):
-            raise ValueError("HF blobs directory changed while opening")
+            raise ValueError("HF snapshots directory changed while opening")
+        source_before = os.stat(
+            snapshot_name,
+            dir_fd=snapshots_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(source_before.st_mode):
+            raise ValueError("HF snapshot revision must be a real directory")
+        source_fd = os.open(
+            snapshot_name,
+            _directory_flags(),
+            dir_fd=snapshots_fd,
+        )
+        source_status = os.fstat(source_fd)
+        source_after = os.stat(
+            snapshot_name,
+            dir_fd=snapshots_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(source_status.st_mode)
+            or not stat.S_ISDIR(source_after.st_mode)
+            or (source_before.st_dev, source_before.st_ino)
+            != (source_status.st_dev, source_status.st_ino)
+            or (source_after.st_dev, source_after.st_ino)
+            != (source_status.st_dev, source_status.st_ino)
+        ):
+            raise ValueError("HF snapshot revision changed while opening")
+        _assert_directory_path_identity(source_root, source_fd, label="source root")
+        _assert_directory_path_identity(
+            repository_root,
+            repository_fd,
+            label="HF repository root",
+        )
         result = _HfBlobLayout(
             source_name=snapshot_name,
             snapshots_fd=snapshots_fd,
             repository_fd=repository_fd,
-            blobs_fd=blob_fd,
         )
         snapshots_fd = None
         repository_fd = None
+        opened_source_fd = source_fd
+        source_fd = None
+        return opened_source_fd, result
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
+        if snapshots_fd is not None:
+            os.close(snapshots_fd)
+        if repository_fd is not None:
+            os.close(repository_fd)
+
+
+def _open_hf_blob_directory(layout: _HfBlobLayout) -> int:
+    if layout.blobs_fd is not None:
+        return layout.blobs_fd
+    blob_before = os.stat(
+        "blobs",
+        dir_fd=layout.repository_fd,
+        follow_symlinks=False,
+    )
+    if not stat.S_ISDIR(blob_before.st_mode):
+        raise ValueError("HF blobs entry must be a real directory")
+    blob_fd: int | None = os.open(
+        "blobs",
+        _directory_flags(),
+        dir_fd=layout.repository_fd,
+    )
+    try:
+        blob_status = os.fstat(blob_fd)
+        blob_after = os.stat(
+            "blobs",
+            dir_fd=layout.repository_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(blob_status.st_mode)
+            or not stat.S_ISDIR(blob_after.st_mode)
+            or (blob_before.st_dev, blob_before.st_ino)
+            != (blob_status.st_dev, blob_status.st_ino)
+            or (blob_after.st_dev, blob_after.st_ino)
+            != (blob_status.st_dev, blob_status.st_ino)
+        ):
+            raise ValueError("HF blobs directory changed while opening")
+        layout.blobs_fd = blob_fd
         blob_fd = None
-        return result
-    except OSError as exc:
-        raise ValueError(f"HF blob directory is unavailable: {exc}") from exc
+        return layout.blobs_fd
     finally:
         if blob_fd is not None:
             os.close(blob_fd)
-        if repository_fd is not None:
-            os.close(repository_fd)
-        if snapshots_fd is not None:
-            os.close(snapshots_fd)
+
+
+def _assert_hf_layout_identity(source_fd: int, layout: _HfBlobLayout) -> None:
+    try:
+        source_entry = os.stat(
+            layout.source_name,
+            dir_fd=layout.snapshots_fd,
+            follow_symlinks=False,
+        )
+        snapshots_entry = os.stat(
+            "snapshots",
+            dir_fd=layout.repository_fd,
+            follow_symlinks=False,
+        )
+        source_status = os.fstat(source_fd)
+        snapshots_status = os.fstat(layout.snapshots_fd)
+        if (
+            not stat.S_ISDIR(source_entry.st_mode)
+            or (source_entry.st_dev, source_entry.st_ino)
+            != (source_status.st_dev, source_status.st_ino)
+            or not stat.S_ISDIR(snapshots_entry.st_mode)
+            or (snapshots_entry.st_dev, snapshots_entry.st_ino)
+            != (snapshots_status.st_dev, snapshots_status.st_ino)
+        ):
+            raise ValueError("HF snapshot topology identity changed during staging")
+        if layout.blobs_fd is not None:
+            blobs_entry = os.stat(
+                "blobs",
+                dir_fd=layout.repository_fd,
+                follow_symlinks=False,
+            )
+            blobs_status = os.fstat(layout.blobs_fd)
+            if not stat.S_ISDIR(blobs_entry.st_mode) or (
+                blobs_entry.st_dev,
+                blobs_entry.st_ino,
+            ) != (blobs_status.st_dev, blobs_status.st_ino):
+                raise ValueError("HF blob directory identity changed during staging")
+    except OSError as exc:
+        raise ValueError(f"HF snapshot topology is unavailable: {exc}") from exc
 
 
 def _open_source_artifact(
@@ -330,7 +442,6 @@ def _open_source_artifact(
             f"required source artifact {name} is unavailable: {exc}"
         ) from exc
     artifact_fd: int | None = None
-    opened_blob_fd = False
     try:
         if stat.S_ISREG(initial_entry.st_mode):
             artifact_fd = os.open(name, _read_flags(), dir_fd=source_fd)
@@ -362,11 +473,14 @@ def _open_source_artifact(
             ) != (initial_entry.st_dev, initial_entry.st_ino):
                 raise ValueError(f"source artifact {name} changed while resolving")
             if hf_blob_layout is None:
-                hf_blob_layout = _open_hf_blob_directory(source_root, source_fd)
-                opened_blob_fd = True
+                raise ValueError(
+                    "source artifact symlink is outside a pinned HF snapshot layout: "
+                    f"{source_root / name}"
+                )
+            blob_directory_fd = _open_hf_blob_directory(hf_blob_layout)
             blob_entry = os.stat(
                 blob_name,
-                dir_fd=hf_blob_layout.blobs_fd,
+                dir_fd=blob_directory_fd,
                 follow_symlinks=False,
             )
             if not stat.S_ISREG(blob_entry.st_mode):
@@ -374,9 +488,9 @@ def _open_source_artifact(
             artifact_fd = os.open(
                 blob_name,
                 _read_flags(),
-                dir_fd=hf_blob_layout.blobs_fd,
+                dir_fd=blob_directory_fd,
             )
-            entry_directory_fd = hf_blob_layout.blobs_fd
+            entry_directory_fd = blob_directory_fd
             entry_name = blob_name
             initial_entry = blob_entry
             link_device = repeated_link.st_dev
@@ -415,13 +529,7 @@ def _open_source_artifact(
         artifact_fd = None
         return artifact, hf_blob_layout
     except OSError as exc:
-        if opened_blob_fd and hf_blob_layout is not None:
-            _close_hf_blob_layout(hf_blob_layout)
         raise ValueError(f"could not open source artifact {name}: {exc}") from exc
-    except BaseException:
-        if opened_blob_fd and hf_blob_layout is not None:
-            _close_hf_blob_layout(hf_blob_layout)
-        raise
     finally:
         if artifact_fd is not None:
             os.close(artifact_fd)
@@ -436,36 +544,7 @@ def _recheck_source_artifacts(
     chunk_bytes: int,
 ) -> None:
     if hf_blob_layout is not None:
-        source_entry = os.stat(
-            hf_blob_layout.source_name,
-            dir_fd=hf_blob_layout.snapshots_fd,
-            follow_symlinks=False,
-        )
-        snapshots_entry = os.stat(
-            "snapshots",
-            dir_fd=hf_blob_layout.repository_fd,
-            follow_symlinks=False,
-        )
-        blobs_entry = os.stat(
-            "blobs",
-            dir_fd=hf_blob_layout.repository_fd,
-            follow_symlinks=False,
-        )
-        source_status = os.fstat(source_fd)
-        snapshots_status = os.fstat(hf_blob_layout.snapshots_fd)
-        blobs_status = os.fstat(hf_blob_layout.blobs_fd)
-        if (
-            not stat.S_ISDIR(source_entry.st_mode)
-            or (source_entry.st_dev, source_entry.st_ino)
-            != (source_status.st_dev, source_status.st_ino)
-            or not stat.S_ISDIR(snapshots_entry.st_mode)
-            or (snapshots_entry.st_dev, snapshots_entry.st_ino)
-            != (snapshots_status.st_dev, snapshots_status.st_ino)
-            or not stat.S_ISDIR(blobs_entry.st_mode)
-            or (blobs_entry.st_dev, blobs_entry.st_ino)
-            != (blobs_status.st_dev, blobs_status.st_ino)
-        ):
-            raise ValueError("HF blob directory identity changed during staging")
+        _assert_hf_layout_identity(source_fd, hf_blob_layout)
     for name, artifact in artifacts.items():
         receipt = receipts[name]
         descriptor_status = os.fstat(artifact.fd)
@@ -944,14 +1023,15 @@ def stage_exact_residents(
         or work_root in source_root.parents
     ):
         raise ValueError("source root and target work root must not contain each other")
-    source_fd = os.open(source_root, _directory_flags())
+    source_fd, hf_blob_layout = _open_source_directory(source_root)
     try:
         work_fd = os.open(work_root, _directory_flags())
     except BaseException:
+        if hf_blob_layout is not None:
+            _close_hf_blob_layout(hf_blob_layout)
         os.close(source_fd)
         raise
     source_artifacts: dict[str, _SourceArtifact] = {}
-    hf_blob_layout: _HfBlobLayout | None = None
     try:
         _assert_directory_path_identity(source_root, source_fd, label="source root")
         _assert_directory_path_identity(work_root, work_fd, label="target work root")

@@ -994,6 +994,22 @@ def test_resident_staging_accepts_only_pinned_hf_blob_symlinks(
         assert (work_root / name).read_bytes() == payload
 
 
+def test_resident_staging_preserves_regular_source_inside_snapshots_directory(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "repository" / "snapshots" / ("a" * 40)
+    source_root.parent.mkdir(parents=True)
+    manifest, expected = _resident_source(source_root)
+    work_root = tmp_path / "work"
+    work_root.mkdir()
+
+    result = stage_exact_residents(source_root, manifest, work_root)
+
+    assert result.tensors == manifest.resident_tensors
+    for name, payload in expected.items():
+        assert (work_root / name).read_bytes() == payload
+
+
 def test_resident_staging_rejects_hf_looking_link_outside_snapshot_layout(
     tmp_path: Path,
 ) -> None:
@@ -1038,6 +1054,68 @@ def test_resident_staging_rejects_persistent_hf_blob_directory_swap(
         stage_exact_residents(source_root, manifest, work_root)
 
     assert list(work_root.iterdir()) == []
+
+
+def test_resident_staging_never_discovers_hf_parents_from_reparented_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root, genuine_blobs, manifest, expected = _resident_hf_source(tmp_path)
+    attacker_repository = tmp_path / "attacker-repository"
+    attacker_snapshots = attacker_repository / "snapshots"
+    attacker_blobs = attacker_repository / "blobs"
+    attacker_snapshots.mkdir(parents=True)
+    attacker_blobs.mkdir()
+    for blob in genuine_blobs.iterdir():
+        (attacker_blobs / blob.name).write_bytes(blob.read_bytes())
+    config_blob = hashlib.sha256(expected["config.json"]).hexdigest()
+    (attacker_blobs / config_blob).write_bytes(b"attacker-config")
+    attacker_revision = attacker_snapshots / source_root.name
+    work_root = tmp_path / "work"
+    work_root.mkdir()
+    original_open_source = q2_module._open_source_artifact
+    original_copy = q2_module._copy_independent_file
+    original_recheck = q2_module._recheck_source_artifacts
+    reparented = False
+
+    def reparent_before_first_member(*args, **kwargs):
+        nonlocal reparented
+        if args[2] == "model.safetensors.index.json" and not reparented:
+            source_root.rename(attacker_revision)
+            reparented = True
+        return original_open_source(*args, **kwargs)
+
+    def restore_after_last_copy(*args, **kwargs):
+        receipt = original_copy(*args, **kwargs)
+        if args[2] == "chat_template.jinja":
+            attacker_revision.rename(source_root)
+        return receipt
+
+    def satisfy_separated_parent_recheck(*args, **kwargs):
+        source_root.rename(attacker_revision)
+        try:
+            return original_recheck(*args, **kwargs)
+        finally:
+            attacker_revision.rename(source_root)
+
+    monkeypatch.setattr(
+        q2_module,
+        "_open_source_artifact",
+        reparent_before_first_member,
+    )
+    monkeypatch.setattr(q2_module, "_copy_independent_file", restore_after_last_copy)
+    monkeypatch.setattr(
+        q2_module,
+        "_recheck_source_artifacts",
+        satisfy_separated_parent_recheck,
+    )
+
+    try:
+        stage_exact_residents(source_root, manifest, work_root)
+    except ValueError:
+        assert list(work_root.iterdir()) == []
+    else:
+        assert (work_root / "config.json").read_bytes() == expected["config.json"]
 
 
 @pytest.mark.parametrize("symlinked_root", ["source", "work"])
