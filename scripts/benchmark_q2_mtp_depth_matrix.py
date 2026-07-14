@@ -60,6 +60,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "transient_slots": 8,
     "read_chunk": "8MiB",
     "bypass_page_cache": True,
+    "resource_telemetry": False,
 }
 
 
@@ -84,6 +85,9 @@ class RunnerAPIs:
         sampler_factory,
         generate_ar,
         generate_mtpk,
+        reset_peak_memory,
+        get_peak_memory,
+        synchronize,
     ) -> None:
         self.load = load
         self.config_factory = config_factory
@@ -92,11 +96,16 @@ class RunnerAPIs:
         self.sampler_factory = sampler_factory
         self.generate_ar = generate_ar
         self.generate_mtpk = generate_mtpk
+        self.reset_peak_memory = reset_peak_memory
+        self.get_peak_memory = get_peak_memory
+        self.synchronize = synchronize
 
 
 def _default_apis() -> RunnerAPIs:
     # Keep all MLX-bearing imports behind execution so importing the CLI is cheap
     # and fake-runtime tests cannot allocate a model accidentally.
+    import mlx.core as mx
+
     from mtplx.expert_runtime import ExpertStreamingConfig, parse_memory_bytes
     from mtplx.generation import generate_ar, generate_mtpk
     from mtplx.prefill_bench import _prompt_build_for_context
@@ -111,6 +120,9 @@ def _default_apis() -> RunnerAPIs:
         sampler_factory=SamplerConfig,
         generate_ar=generate_ar,
         generate_mtpk=generate_mtpk,
+        reset_peak_memory=mx.reset_peak_memory,
+        get_peak_memory=mx.get_peak_memory,
+        synchronize=mx.synchronize,
     )
 
 
@@ -223,6 +235,15 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--resource-telemetry",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable instrumented per-row resource snapshots. This changes hot-path "
+            "cost, so these rows are diagnostic rather than headline throughput."
+        ),
+    )
     parser.add_argument("--output-json", type=Path)
     return parser
 
@@ -275,6 +296,7 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "transient_slots": args.transient_slots,
         "read_chunk": args.read_chunk,
         "bypass_page_cache": args.bypass_page_cache,
+        "resource_telemetry": args.resource_telemetry,
     }
 
 
@@ -553,6 +575,24 @@ def _resource_telemetry(runtime: Any) -> dict[str, Any] | None:
     return _jsonable(snapshot) if isinstance(snapshot, Mapping) else None
 
 
+def _numeric_delta(before: Any, after: Any) -> Any:
+    if isinstance(before, Mapping) and isinstance(after, Mapping):
+        result = {}
+        for key in before.keys() & after.keys():
+            delta = _numeric_delta(before[key], after[key])
+            if delta is not None:
+                result[str(key)] = delta
+        return result
+    if (
+        isinstance(before, (int, float))
+        and not isinstance(before, bool)
+        and isinstance(after, (int, float))
+        and not isinstance(after, bool)
+    ):
+        return after - before
+    return None
+
+
 def _result_tokens(result: Any) -> list[int]:
     value = _field(result, "tokens")
     if not isinstance(value, (list, tuple)):
@@ -572,10 +612,16 @@ def _run_observation(
     depth: int,
     position: int,
     max_tokens: int,
+    resource_telemetry_enabled: bool,
     ar_tokens: Sequence[int] | None,
     ar_finish_reason: str | None,
 ) -> tuple[dict[str, Any], list[int], str | None]:
     _reset_expert_streaming(runtime)
+    resource_before = (
+        _resource_telemetry(runtime) if resource_telemetry_enabled else None
+    )
+    apis.synchronize()
+    apis.reset_peak_memory()
     prompt_copy = list(prompt_ids)
     admission_fn = getattr(runtime, "admit_kv_tokens", None)
     admission = (
@@ -603,6 +649,10 @@ def _run_observation(
                 mtp_history_policy="committed",
                 **common,
             )
+    apis.synchronize()
+    resource_after = (
+        _resource_telemetry(runtime) if resource_telemetry_enabled else None
+    )
 
     if tuple(int(token) for token in prompt_copy) != prompt_ids:
         raise BenchmarkGateError("generation mutated the exact benchmark prompt")
@@ -663,7 +713,15 @@ def _run_observation(
         "token_ids": tokens,
         **_metrics(stats, completion_tokens=len(tokens), depth=depth),
         "expert_streaming_counters": _streaming_counters(runtime),
-        "expert_resource_telemetry": _resource_telemetry(runtime),
+        "expert_resource_telemetry": (
+            {
+                "before": resource_before,
+                "after": resource_after,
+                "numeric_delta": _numeric_delta(resource_before, resource_after),
+            }
+            if resource_telemetry_enabled
+            else None
+        ),
         "gates": {
             "prompt_length_exact": len(prompt_ids) == context_tokens,
             "new_prefill_tokens_exact": _field(stats, "new_prefill_tokens")
@@ -704,6 +762,7 @@ def _runtime_config(
         transient_slots=int(options["transient_slots"]),
         max_read_chunk_bytes=apis.parse_memory_bytes(options["read_chunk"]),
         bypass_page_cache=bool(options["bypass_page_cache"]),
+        resource_telemetry=bool(options["resource_telemetry"]),
     )
 
 
@@ -792,6 +851,15 @@ def run_depth_matrix(
                 raise BenchmarkGateError(
                     f"{request['model']} runtime did not load its BF16 MTP head"
                 )
+            apis.synchronize()
+            load_peak_memory_bytes = apis.get_peak_memory()
+            if (
+                isinstance(load_peak_memory_bytes, bool)
+                or not isinstance(load_peak_memory_bytes, int)
+                or load_peak_memory_bytes < 0
+            ):
+                raise BenchmarkGateError("MLX load peak must be a non-negative integer")
+            hard_peak_memory_bytes = int(load_peak_memory_bytes)
             observations = []
             prompts = []
             discarded_warmup_count = 0
@@ -837,8 +905,13 @@ def run_depth_matrix(
                     depth=0,
                     position=1,
                     max_tokens=WARMUP_TOKENS,
+                    resource_telemetry_enabled=bool(options["resource_telemetry"]),
                     ar_tokens=None,
                     ar_finish_reason=None,
+                )
+                hard_peak_memory_bytes = max(
+                    hard_peak_memory_bytes,
+                    int(_warmup_ar_row["peak_memory_bytes"]),
                 )
                 discarded_warmup_count += 1
                 ar_row, ar_tokens, ar_finish = _run_observation(
@@ -852,8 +925,13 @@ def run_depth_matrix(
                     depth=0,
                     position=1,
                     max_tokens=OUTPUT_TOKENS,
+                    resource_telemetry_enabled=bool(options["resource_telemetry"]),
                     ar_tokens=None,
                     ar_finish_reason=None,
+                )
+                hard_peak_memory_bytes = max(
+                    hard_peak_memory_bytes,
+                    int(ar_row["peak_memory_bytes"]),
                 )
                 pair_id = f"{request['model']}-c{context_tokens}-ar"
                 ar_row["pair_id"] = pair_id
@@ -870,8 +948,13 @@ def run_depth_matrix(
                         depth=depth,
                         position=position,
                         max_tokens=WARMUP_TOKENS,
+                        resource_telemetry_enabled=bool(options["resource_telemetry"]),
                         ar_tokens=warmup_ar_tokens,
                         ar_finish_reason=warmup_ar_finish,
+                    )
+                    hard_peak_memory_bytes = max(
+                        hard_peak_memory_bytes,
+                        int(_warmup_row["peak_memory_bytes"]),
                     )
                     discarded_warmup_count += 1
                     row, _tokens, _finish = _run_observation(
@@ -885,8 +968,13 @@ def run_depth_matrix(
                         depth=depth,
                         position=position,
                         max_tokens=OUTPUT_TOKENS,
+                        resource_telemetry_enabled=bool(options["resource_telemetry"]),
                         ar_tokens=ar_tokens,
                         ar_finish_reason=ar_finish,
+                    )
+                    hard_peak_memory_bytes = max(
+                        hard_peak_memory_bytes,
+                        int(row["peak_memory_bytes"]),
                     )
                     row["pair_id"] = pair_id
                     observations.append(row)
@@ -900,6 +988,13 @@ def run_depth_matrix(
                     "mtp_precision": "bf16",
                     "depths": list(request["depths"]),
                     "load_count": 1,
+                    "measurement_lane": (
+                        "diagnostic-resource-instrumented"
+                        if options["resource_telemetry"]
+                        else "headline-uninstrumented"
+                    ),
+                    "load_peak_memory_bytes": load_peak_memory_bytes,
+                    "hard_peak_memory_bytes": hard_peak_memory_bytes,
                     "discarded_warmup_count": discarded_warmup_count,
                     "warmup_output_tokens": WARMUP_TOKENS,
                     "runtime_config": _jsonable(config),
@@ -917,6 +1012,11 @@ def run_depth_matrix(
         "schema": SCHEMA,
         "passed": True,
         "configuration": {
+            "measurement_lane": (
+                "diagnostic-resource-instrumented"
+                if options["resource_telemetry"]
+                else "headline-uninstrumented"
+            ),
             "contexts": list(context_values),
             "output_tokens": OUTPUT_TOKENS,
             "warmup_output_tokens": WARMUP_TOKENS,

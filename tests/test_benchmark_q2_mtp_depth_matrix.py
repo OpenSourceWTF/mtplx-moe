@@ -43,6 +43,7 @@ class _FakeRuntime:
         self.expert_streaming = _FakeStreaming()
         self.admissions: list[int] = []
         self.closed = False
+        self.telemetry_reads = 0
 
     @contextlib.contextmanager
     def admit_kv_tokens(self, tokens: int):
@@ -59,11 +60,17 @@ class _FakeRuntime:
         }
 
     def expert_resource_telemetry_snapshot(self):
+        self.telemetry_reads += 1
         return {
-            "cache": {"expert_bytes_read": 4096, "read_operations": 2},
-            "cache_by_phase": {"decode": {"expert_bytes_read": 4096}},
+            "cache": {
+                "expert_bytes_read": 4096 * self.telemetry_reads,
+                "read_operations": 2 * self.telemetry_reads,
+            },
+            "cache_by_phase": {
+                "decode": {"expert_bytes_read": 4096 * self.telemetry_reads}
+            },
             "reader": {"active_reads": 0, "peak_active_reads": 2},
-            "expert_pipeline": {"completion_fences": 3},
+            "expert_pipeline": {"completion_fences": 3 * self.telemetry_reads},
             "mlx_memory": {"active_memory_bytes": 1024},
         }
 
@@ -118,6 +125,8 @@ def _fake_apis(module, *, output_tokens: int = 128, mismatch_depth: int | None =
         ar=[],
         mtpk=[],
         runtimes=[],
+        peak_resets=0,
+        synchronizations=0,
     )
 
     def parse_memory(value):
@@ -178,6 +187,15 @@ def _fake_apis(module, *, output_tokens: int = 128, mismatch_depth: int | None =
             ),
         )
 
+    def reset_peak_memory():
+        calls.peak_resets += 1
+
+    def synchronize():
+        calls.synchronizations += 1
+
+    def get_peak_memory():
+        return 5 * 1024**3
+
     return (
         module.RunnerAPIs(
             load=load,
@@ -187,6 +205,9 @@ def _fake_apis(module, *, output_tokens: int = 128, mismatch_depth: int | None =
             sampler_factory=sampler_factory,
             generate_ar=generate_ar,
             generate_mtpk=generate_mtpk,
+            reset_peak_memory=reset_peak_memory,
+            get_peak_memory=get_peak_memory,
+            synchronize=synchronize,
         ),
         calls,
     )
@@ -223,6 +244,7 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
     assert args.runtime_reserve == "12GiB"
     assert args.expert_cache_limit == "64GiB"
     assert args.max_live_kv_tokens == 4096
+    assert args.resource_telemetry is False
 
 
 def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
@@ -239,11 +261,14 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
         "hy3-expert-q2",
         "glm52-expert-q2",
     ]
+    assert all(config["resource_telemetry"] is False for config in calls.configs)
     assert len(calls.loads) == 2
     assert all(kwargs["mtp"] is True for _root, kwargs in calls.loads)
     assert all(kwargs["mtp_precision"] == "bf16" for _root, kwargs in calls.loads)
     assert len(calls.ar) == 8
     assert len(calls.mtpk) == 36
+    assert calls.peak_resets == 44
+    assert calls.synchronizations >= 44
     assert [len(model["observations"]) for model in payload["models"]] == [10, 12]
     assert [model["discarded_warmup_count"] for model in payload["models"]] == [
         10,
@@ -251,6 +276,11 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
     ]
     assert all(
         row["generated_tokens"] == 128
+        for model in payload["models"]
+        for row in model["observations"]
+    )
+    assert all(
+        row["expert_resource_telemetry"] is None
         for model in payload["models"]
         for row in model["observations"]
     )
@@ -299,10 +329,13 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
 
 def test_rows_recompute_ingestion_decode_and_acceptance_metrics(tmp_path: Path) -> None:
     module = _load_module()
-    apis, _calls = _fake_apis(module)
+    apis, calls = _fake_apis(module)
 
     payload = module.run_depth_matrix(
-        [_requests(tmp_path)[0]], contexts=(1024,), apis=apis
+        [_requests(tmp_path)[0]],
+        contexts=(1024,),
+        runtime_options={"resource_telemetry": True},
+        apis=apis,
     )
     depth_two = next(
         row for row in payload["models"][0]["observations"] if row["cell"] == "d2"
@@ -315,13 +348,24 @@ def test_rows_recompute_ingestion_decode_and_acceptance_metrics(tmp_path: Path) 
     assert depth_two["prompt_target_prefill_tok_s"] == 256.0
     assert depth_two["decode_tok_s"] == 16.0
     assert depth_two["peak_memory_bytes"] == 3 * 1024**3
-    assert depth_two["expert_resource_telemetry"] == {
+    assert payload["models"][0]["hard_peak_memory_bytes"] == 5 * 1024**3
+    assert calls.configs[0]["resource_telemetry"] is True
+    assert (
+        payload["configuration"]["measurement_lane"]
+        == "diagnostic-resource-instrumented"
+    )
+    telemetry = depth_two["expert_resource_telemetry"]
+    assert telemetry["numeric_delta"] == {
         "cache": {"expert_bytes_read": 4096, "read_operations": 2},
         "cache_by_phase": {"decode": {"expert_bytes_read": 4096}},
-        "reader": {"active_reads": 0, "peak_active_reads": 2},
+        "reader": {"active_reads": 0, "peak_active_reads": 0},
         "expert_pipeline": {"completion_fences": 3},
-        "mlx_memory": {"active_memory_bytes": 1024},
+        "mlx_memory": {"active_memory_bytes": 0},
     }
+    assert (
+        telemetry["after"]["cache"]["expert_bytes_read"]
+        > telemetry["before"]["cache"]["expert_bytes_read"]
+    )
     assert depth_two["accepted_drafts"] == 9
     assert depth_two["evaluated_drafts"] == 11
     assert depth_two["drafted_tokens"] == 12
