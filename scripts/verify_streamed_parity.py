@@ -36,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
             "glm52-q4",
             "hy3-expert-only-q4",
             "hy3-expert-q2",
+            "glm52-expert-q2",
         ],
         required=True,
     )

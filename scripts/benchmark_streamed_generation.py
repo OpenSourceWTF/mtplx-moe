@@ -57,6 +57,7 @@ _HY3_AR_DEFAULTS = {
 }
 _MODEL_DEFAULTS = {
     "glm52-q4": _GLM52_AR_DEFAULTS,
+    "glm52-expert-q2": _GLM52_AR_DEFAULTS,
     "hy3-q4": _HY3_AR_DEFAULTS,
     "hy3-expert-only-q4": _HY3_AR_DEFAULTS,
     "hy3-expert-q2": _HY3_AR_DEFAULTS,
@@ -1078,6 +1079,7 @@ def build_parser() -> argparse.ArgumentParser:
             "glm52-q4",
             "hy3-expert-only-q4",
             "hy3-expert-q2",
+            "glm52-expert-q2",
         ],
         required=True,
     )

@@ -106,8 +106,11 @@ def test_hy3_default_and_glm_default_stay_on_production_q4(
     assert kwargs["expert_streaming_config"].model_key == expected_model_key
 
 
-@pytest.mark.parametrize("model_key", ["hy3-expert-only-q4", "hy3-expert-q2"])
-def test_expert_cli_accepts_explicit_hy3_expert_q2_and_expert_only_q4(
+@pytest.mark.parametrize(
+    "model_key",
+    ["hy3-expert-only-q4", "hy3-expert-q2", "glm52-expert-q2"],
+)
+def test_expert_cli_accepts_explicit_expert_only_model_keys(
     model_key: str,
 ) -> None:
     args = _parser().parse_args(["--expert-model-key", model_key])

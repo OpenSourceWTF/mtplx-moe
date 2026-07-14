@@ -10,8 +10,11 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 from mlx_lm.models.activations import swiglu
+from mlx_lm.models.cache import CacheList, KVCache
 from mlx_lm.models.deepseek_v32 import group_expert_select
+from mlx_lm.models.switch_layers import SwitchGLU
 
+import mtplx.models.glm52_mlx as glm52_mlx
 import mtplx.models.expert_mlx as expert_mlx
 from mtplx.expert_manifest import (
     build_expert_manifest,
@@ -28,6 +31,7 @@ from mtplx.expert_streaming_models import ExpertStreamingModelSpec
 from mtplx.resource_metrics import ExpertPipelineLedger
 from mtplx.models.expert_mlx import (
     HotExpertSwitchGLU,
+    UnboundExpertSwitch,
     _run_q4_expert,
     make_mlx_component_bank_allocator,
     make_mlx_slot_buffer_allocator,
@@ -1061,6 +1065,281 @@ def test_glm_indexshare_schedule_and_asymmetric_caches_execute() -> None:
     mx.eval(logits)
     assert logits.shape == (1, 4, args.vocab_size)
     assert mx.all(mx.isfinite(logits)).item()
+
+
+def test_glm52_indexshare_defaults_compute_full_and_reuse_on_shared() -> None:
+    args = _glm_args(first_sparse=6)
+    full = glm52_mlx.GlmMoeDsaAttention(args, 0)
+    shared = glm52_mlx.GlmMoeDsaAttention(args, 1)
+    computed = mx.array([[[[0]]]], dtype=mx.int32)
+    previous = mx.array([[[[0]]]], dtype=mx.int32)
+    indexer_calls: list[tuple[object, object]] = []
+
+    class RecordingIndexer:
+        def __call__(self, _x, _qr, mask, cache=None):
+            indexer_calls.append((mask, cache))
+            return computed
+
+    full.indexer = RecordingIndexer()
+    hidden = mx.zeros((1, 1, args.hidden_size), dtype=mx.float32)
+
+    _full_output, full_topk = full(hidden, prev_topk_indices=previous)
+    _shared_output, shared_topk = shared(hidden, prev_topk_indices=full_topk)
+    mx.eval(_full_output, _shared_output, full_topk, shared_topk)
+
+    assert len(indexer_calls) == 1
+    assert mx.array_equal(full_topk, computed).item()
+    assert mx.array_equal(shared_topk, computed).item()
+
+
+def test_glm52_resident_layer78_has_full_indexer_and_bf16_experts() -> None:
+    args = replace(
+        _glm_args(),
+        num_hidden_layers=78,
+        indexer_types=["shared"] * 78,
+        n_routed_experts=256,
+        num_experts_per_tok=8,
+    )
+
+    layer = glm52_mlx.GlmMoeDsaDecoderLayer(
+        args,
+        78,
+        expert_mode="resident",
+        indexer_type="full",
+    )
+
+    assert layer.self_attn.indexer is not None
+    assert isinstance(layer.mlp, glm52_mlx.GlmMoeDsaResidentMoE)
+    assert isinstance(layer.mlp.switch_mlp, SwitchGLU)
+    assert not isinstance(layer.mlp.switch_mlp, UnboundExpertSwitch)
+    for projection in (
+        layer.mlp.switch_mlp.gate_proj,
+        layer.mlp.switch_mlp.up_proj,
+        layer.mlp.switch_mlp.down_proj,
+    ):
+        assert projection.weight.shape[0] == 256
+        assert projection.weight.dtype == mx.bfloat16
+
+
+def test_glm52_resident_and_streamed_router_match_near_tie_in_fp32() -> None:
+    args = replace(
+        _glm_args(),
+        hidden_size=16,
+        moe_intermediate_size=8,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+    )
+    streamed = glm52_mlx.StreamedMoE(args, 1)
+    resident = glm52_mlx.GlmMoeDsaResidentMoE(args)
+    weight = mx.array(
+        [
+            [0.5] * 16,
+            [0.5] * 15 + [0.5078125],
+            [-0.5] * 16,
+            [0.0] * 16,
+        ],
+        dtype=mx.bfloat16,
+    )
+    correction = mx.array([0.0, 0.0, -0.25, -0.25], dtype=mx.float32)
+    for gate in (streamed.gate, resident.gate):
+        gate.weight = weight
+        gate.e_score_correction_bias = correction
+    hidden = mx.full((1, 1, 16), 0.1, dtype=mx.bfloat16)
+
+    streamed_indices, streamed_scores = streamed.gate(hidden)
+    resident_indices, resident_scores = resident.gate(hidden)
+    mx.eval(
+        streamed_indices,
+        streamed_scores,
+        resident_indices,
+        resident_scores,
+    )
+
+    assert streamed_scores.dtype == mx.float32
+    assert resident_scores.dtype == mx.float32
+    assert mx.array_equal(resident_indices, streamed_indices).item()
+    assert mx.array_equal(resident_scores, streamed_scores).item()
+    assert abs(float(streamed_scores[0, 0, 0] - streamed_scores[0, 0, 1])) < 0.001
+
+
+def _glm52_attention_cache(args: GlmArgs, offset: int) -> CacheList:
+    main = KVCache()
+    indexer = KVCache()
+    main.update_and_fetch(
+        mx.zeros((1, 1, offset, args.kv_lora_rank), dtype=mx.bfloat16),
+        mx.zeros((1, 1, offset, args.qk_rope_head_dim), dtype=mx.bfloat16),
+    )
+    indexer.update_and_fetch(
+        mx.zeros((1, 1, offset, args.index_head_dim), dtype=mx.bfloat16),
+        mx.zeros((1, 1, offset, 0), dtype=mx.bfloat16),
+    )
+    return CacheList(main, indexer)
+
+
+def test_glm52_recurrent_compute_topk_false_never_advances_indexer() -> None:
+    args = _glm_args(first_sparse=6)
+    attention = glm52_mlx.GlmMoeDsaAttention(args, 0)
+    cache = _glm52_attention_cache(args, offset=2)
+
+    class ForbiddenIndexer:
+        def __call__(self, *_args, **_kwargs):
+            raise AssertionError("recurrent depth must reuse D1 top-k")
+
+    attention.indexer = ForbiddenIndexer()
+    output, topk = attention(
+        mx.zeros((1, 1, args.hidden_size), dtype=mx.bfloat16),
+        cache=cache,
+        prev_topk_indices=None,
+        compute_topk=False,
+    )
+    mx.eval(output)
+
+    assert topk is None
+    assert cache[0].offset == 3
+    assert cache[1].offset == 2
+
+
+@pytest.mark.parametrize("sparse", [False, True], ids=["dense", "sparse"])
+def test_glm52_recurrent_read_boundary_caps_every_attention_read(
+    monkeypatch: pytest.MonkeyPatch,
+    sparse: bool,
+) -> None:
+    args = _glm_args(first_sparse=6)
+    attention = glm52_mlx.GlmMoeDsaAttention(args, 0)
+    boundary = 2
+    cache = _glm52_attention_cache(args, offset=boundary)
+    source_lengths: list[int] = []
+    observed: dict[str, int] = {}
+    original_take = glm52_mlx.mx.take_along_axis
+
+    class ForbiddenIndexer:
+        def __call__(self, *_args, **_kwargs):
+            raise AssertionError("recurrent depth must reuse D1 top-k")
+
+    def recording_take(array, indices, axis):
+        source_lengths.append(int(array.shape[axis]))
+        return original_take(array, indices, axis)
+
+    def recording_attention(queries, keys, values, *, cache, scale, mask):
+        del cache, scale
+        observed["keys"] = int(keys.shape[2])
+        observed["values"] = int(values.shape[2])
+        observed["mask"] = int(mask.shape[-1])
+        return mx.zeros_like(queries)
+
+    attention.indexer = ForbiddenIndexer()
+    monkeypatch.setattr(glm52_mlx.mx, "take_along_axis", recording_take)
+    monkeypatch.setattr(
+        glm52_mlx,
+        "scaled_dot_product_attention",
+        recording_attention,
+    )
+    topk = mx.array([[[[1]]]], dtype=mx.int32) if sparse else None
+    output, returned_topk = attention(
+        mx.zeros((1, 1, args.hidden_size), dtype=mx.bfloat16),
+        mask=mx.ones((1, 1, 1, boundary + 1), dtype=mx.bool_),
+        cache=cache,
+        prev_topk_indices=topk,
+        compute_topk=False,
+        kv_read_boundary=boundary,
+    )
+    mx.eval(output)
+
+    assert cache[0].offset == boundary + 1
+    assert cache[1].offset == boundary
+    if sparse:
+        assert mx.array_equal(returned_topk, topk).item()
+        assert source_lengths == [boundary, boundary, boundary]
+        assert observed == {"keys": 1, "values": 1, "mask": 1}
+    else:
+        assert returned_topk is None
+        assert source_lengths == []
+        assert observed == {
+            "keys": boundary,
+            "values": boundary,
+            "mask": boundary,
+        }
+
+
+def test_glm52_resident_mtp_uses_call_time_shared_embedding_and_lm_head() -> None:
+    args = _glm_args(first_sparse=1)
+    mtp = glm52_mlx.Glm52MTP(args)
+    layer = mtp.layers[0]
+    parameter_names = {name for name, _value in tree_flatten(mtp.parameters())}
+    events: list[str] = []
+    head_inputs: list[mx.array] = []
+    topk = mx.array([[[[0]]]], dtype=mx.int32)
+
+    class Identity:
+        def __call__(self, value):
+            return value
+
+    class ProjectHidden:
+        def __call__(self, value):
+            return value[..., : args.hidden_size]
+
+    class OffsetSharedHeadNorm:
+        def __call__(self, value):
+            return value + mx.array(2, dtype=value.dtype)
+
+    class RecordingBlock:
+        def __call__(
+            self,
+            hidden,
+            mask=None,
+            cache=None,
+            prev_topk_indices=None,
+            *,
+            compute_topk=None,
+            kv_read_boundary=None,
+        ):
+            assert mask is None
+            assert cache is None
+            assert compute_topk is False
+            assert kv_read_boundary == 7
+            assert mx.array_equal(prev_topk_indices, topk).item()
+            events.append("block")
+            return hidden, prev_topk_indices
+
+    class RecordingEmbedding:
+        def __call__(self, input_ids):
+            events.append("embed")
+            return mx.ones((*input_ids.shape, args.hidden_size), dtype=mx.bfloat16)
+
+    class RecordingHead:
+        def __call__(self, hidden):
+            events.append("head")
+            head_inputs.append(hidden)
+            return mx.ones((*hidden.shape[:-1], args.vocab_size), dtype=hidden.dtype)
+
+    layer.enorm = Identity()
+    layer.hnorm = Identity()
+    layer.eh_proj = ProjectHidden()
+    layer.mtp_block = RecordingBlock()
+    layer.shared_head_norm = OffsetSharedHeadNorm()
+    logits, hidden, returned_topk = layer(
+        mx.array([[3]], dtype=mx.int32),
+        mx.zeros((1, 1, args.hidden_size), dtype=mx.bfloat16),
+        embed_tokens=RecordingEmbedding(),
+        lm_head=RecordingHead(),
+        prev_topk_indices=topk,
+        compute_topk=False,
+        kv_read_boundary=7,
+    )
+    mx.eval(logits, hidden, returned_topk)
+
+    assert mtp.start_layer == args.num_hidden_layers
+    assert len(mtp.layers) == 1
+    assert events == ["embed", "block", "head"]
+    assert logits.shape == (1, 1, args.vocab_size)
+    expected_recycle = mx.full(hidden.shape, 3, dtype=mx.bfloat16)
+    assert mx.array_equal(hidden, expected_recycle).item()
+    assert mx.array_equal(head_inputs[0], hidden).item()
+    assert mx.array_equal(returned_topk, topk).item()
+    assert "layers.0.shared_head_norm.weight" in parameter_names
+    assert not any(
+        "embed_tokens" in name or "lm_head" in name for name in parameter_names
+    )
 
 
 def _raw_array(value: mx.array, dtype: str) -> bytes:

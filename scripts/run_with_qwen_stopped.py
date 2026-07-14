@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one explicit command while Qwen is stopped, then restore Qwen exactly."""
+"""Run one command in a serialized MLX window, then restore Qwen exactly."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Any
 
-from mtplx.qwen_guard import qwen_stopped_for_mlx
+from mtplx.qwen_guard import DEFAULT_MLX_LOCK_PATH, exclusive_mlx_window
 
 
 GuardFactory = Callable[..., Any]
@@ -38,6 +38,12 @@ def _parser() -> argparse.ArgumentParser:
         default="http://127.0.0.1:8080/v1/models",
     )
     parser.add_argument("--timeout-seconds", type=_positive_float, default=180.0)
+    parser.add_argument("--lock-path", type=Path, default=DEFAULT_MLX_LOCK_PATH)
+    parser.add_argument(
+        "--lock-timeout-seconds",
+        type=_positive_float,
+        default=None,
+    )
     return parser
 
 
@@ -179,6 +185,8 @@ def _run_guarded(
             plist=args.plist,
             api_url=args.api_url,
             timeout_seconds=args.timeout_seconds,
+            lock_path=args.lock_path,
+            lock_timeout_seconds=args.lock_timeout_seconds,
         ):
             child_exit = relay.run_child(args.command, popen=popen)
         if relay.received is not None:
@@ -189,7 +197,7 @@ def _run_guarded(
 def main(
     argv: Sequence[str] | None = None,
     *,
-    _guard_factory: GuardFactory = qwen_stopped_for_mlx,
+    _guard_factory: GuardFactory = exclusive_mlx_window,
     _popen: PopenFactory = subprocess.Popen,
 ) -> int:
     args = parse_cli_args(argv)

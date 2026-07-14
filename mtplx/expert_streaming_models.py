@@ -34,7 +34,7 @@ def _integer(name: str, value: object, *, minimum: int | None = None) -> int:
 
 @dataclass(frozen=True)
 class ExpertStreamingModelSpec:
-    """Revision-pinned geometry needed to size a streamed Q4 expert bank."""
+    """Revision-pinned geometry needed to size a streamed quantized expert bank."""
 
     key: str
     display_name: str
@@ -151,7 +151,7 @@ class ExpertStreamingModelSpec:
 
     @property
     def expert_record_bytes(self) -> int:
-        """Packed Q4 weights plus affine scale and bias leaves for one expert."""
+        """Packed quantized weights plus affine scale and bias leaves per expert."""
 
         return self.packed_weight_bytes + self.scale_bias_bytes
 
@@ -332,8 +332,43 @@ GLM52_Q4 = ExpertStreamingModelSpec(
 )
 
 
+GLM52_EXPERT_Q2 = ExpertStreamingModelSpec(
+    key="glm52-expert-q2",
+    display_name="GLM-5.2 expert-only affine Q2",
+    source_model="zai-org/GLM-5.2",
+    source_revision="b4734de4facf877f85769a911abafc5283eab3d9",
+    quant_model="mlx-community/GLM-5.2-4bit",
+    quant_revision="6b347a6472d46bf55de65ee34032136a3929d778",
+    total_tensor_bytes=237_126_962_688,
+    total_layers=78,
+    routed_layer_start=3,
+    routed_layer_count=75,
+    expert_count=256,
+    top_k=8,
+    hidden_size=6144,
+    expert_hidden_size=2048,
+    quant_bits=2,
+    quant_group_size=64,
+    quant_parameter_bytes=2,
+    router_storage="bfloat16 with fp32 correction bias",
+    router_matmul_dtype="float32",
+    router_bytes=236_006_400,
+    kv_bytes_per_token=95_232,
+    mtp_layer_index=78,
+    mtp_included=False,
+    full_indexer_layers=(0, 1, 2, *range(6, 75, 4)),
+)
+
+
 MODEL_SPECS: dict[str, ExpertStreamingModelSpec] = {
-    spec.key: spec for spec in (HY3_Q4, HY3_EXPERT_ONLY_Q4, HY3_EXPERT_Q2, GLM52_Q4)
+    spec.key: spec
+    for spec in (
+        HY3_Q4,
+        HY3_EXPERT_ONLY_Q4,
+        HY3_EXPERT_Q2,
+        GLM52_Q4,
+        GLM52_EXPERT_Q2,
+    )
 }
 
 
@@ -357,6 +392,7 @@ def plan_expert_memory(
     transient_slots: int | None = None,
     io_staging_bytes: int = 0,
     execution_workspace_bytes: int = 0,
+    additional_resident_bytes: int = 0,
     cache_scope: str = "layer",
 ) -> ExpertMemoryPlan:
     """Fit uniform persistent expert slots under an explicit memory ceiling.
@@ -383,6 +419,9 @@ def plan_expert_memory(
     execution_workspace_bytes = _integer(
         "execution_workspace_bytes", execution_workspace_bytes, minimum=0
     )
+    additional_resident_bytes = _integer(
+        "additional_resident_bytes", additional_resident_bytes, minimum=0
+    )
     if expert_cache_limit_bytes is not None:
         expert_cache_limit_bytes = _integer(
             "expert_cache_limit_bytes", expert_cache_limit_bytes, minimum=0
@@ -397,8 +436,9 @@ def plan_expert_memory(
 
     kv_bytes = context_tokens * spec.kv_bytes_per_token
     transient_bytes = service_slots * spec.expert_record_bytes
+    resident_bytes = spec.resident_bytes + additional_resident_bytes
     fixed_bytes = (
-        spec.resident_bytes
+        resident_bytes
         + kv_bytes
         + runtime_reserve_bytes
         + transient_bytes
@@ -437,7 +477,7 @@ def plan_expert_memory(
         io_staging_bytes=io_staging_bytes,
         execution_workspace_bytes=execution_workspace_bytes,
         context_tokens=context_tokens,
-        resident_bytes=spec.resident_bytes,
+        resident_bytes=resident_bytes,
         kv_bytes=kv_bytes,
         transient_slots=service_slots,
         transient_bytes=transient_bytes,

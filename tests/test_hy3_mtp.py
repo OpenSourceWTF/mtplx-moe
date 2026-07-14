@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
+import struct
 from pathlib import Path
 
 import mlx.core as mx
@@ -11,10 +14,12 @@ import pytest
 from mlx.utils import tree_flatten
 from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 
+import mtplx.hy3_mtp_patch as hy3_mtp_patch
 from mtplx.hy3_mtp_patch import (
     HY3_MTP_BF16_FILE,
     HY3_MTP_EXPERTS_FILE,
     HY3_MTP_RESIDENTS_FILE,
+    HY3_MTP_SOURCE_REPO,
     Hy3MTPLoadError,
     build_hy3_mtp_module,
     expected_bf16_names,
@@ -33,6 +38,10 @@ _RESIDENTS_SCRIPT = (
     / "quantize_mtp_layer80_residents.py"
 )
 TEST_REVISION = "test-revision"
+TEST_METADATA = {
+    "source_repo": HY3_MTP_SOURCE_REPO,
+    "source_revision": TEST_REVISION,
+}
 
 
 def _load_residents_script():
@@ -98,7 +107,7 @@ def _write_tiny_artifacts(tmp_path: Path, *, revision: str = TEST_REVISION) -> P
     mx.random.seed(11)
     args = _tiny_args()
     prefix = f"model.layers.{args.num_hidden_layers}."
-    metadata = {"source_repo": "test/tiny-hy3", "source_revision": revision}
+    metadata = {"source_repo": HY3_MTP_SOURCE_REPO, "source_revision": revision}
     residents_mod = _load_residents_script()
     residents = residents_mod.quantize_resident_tensors(
         _tiny_source_residents(prefix), layer_prefix=prefix
@@ -151,10 +160,8 @@ def _write_tiny_bf16_artifact(tmp_path: Path, *, revision: str = TEST_REVISION) 
                 mx.random.normal((64, 64)).astype(mx.bfloat16)
             )
     mx.eval(list(tensors.values()))
-    metadata = {"source_repo": "test/tiny-hy3", "source_revision": revision}
-    mx.save_safetensors(
-        str(tmp_path / HY3_MTP_BF16_FILE), tensors, metadata=metadata
-    )
+    metadata = {"source_repo": HY3_MTP_SOURCE_REPO, "source_revision": revision}
+    mx.save_safetensors(str(tmp_path / HY3_MTP_BF16_FILE), tensors, metadata=metadata)
     return tmp_path
 
 
@@ -255,7 +262,7 @@ def test_loader_rejects_missing_and_unexpected_tensors(tmp_path: Path) -> None:
     mx.save_safetensors(
         str(tmp_path / HY3_MTP_RESIDENTS_FILE),
         residents,
-        metadata={"source_revision": TEST_REVISION},
+        metadata=TEST_METADATA,
     )
     with pytest.raises(Hy3MTPLoadError, match="missing tensors"):
         load_hy3_mtp_weights(tmp_path, args, expected_revision=TEST_REVISION)
@@ -266,7 +273,7 @@ def test_loader_rejects_missing_and_unexpected_tensors(tmp_path: Path) -> None:
     mx.save_safetensors(
         str(tmp_path / HY3_MTP_EXPERTS_FILE),
         experts,
-        metadata={"source_revision": TEST_REVISION},
+        metadata=TEST_METADATA,
     )
     with pytest.raises(Hy3MTPLoadError, match="missing expert tensors"):
         load_hy3_mtp_weights(tmp_path, args, expected_revision=TEST_REVISION)
@@ -279,7 +286,7 @@ def test_loader_rejects_missing_and_unexpected_tensors(tmp_path: Path) -> None:
     mx.save_safetensors(
         str(tmp_path / HY3_MTP_EXPERTS_FILE),
         experts,
-        metadata={"source_revision": TEST_REVISION},
+        metadata=TEST_METADATA,
     )
     with pytest.raises(Hy3MTPLoadError, match="unexpected expert tensors"):
         load_hy3_mtp_weights(tmp_path, args, expected_revision=TEST_REVISION)
@@ -294,7 +301,7 @@ def test_loader_rejects_wrong_leaf_dtypes(tmp_path: Path) -> None:
     mx.save_safetensors(
         str(tmp_path / HY3_MTP_RESIDENTS_FILE),
         residents,
-        metadata={"source_revision": TEST_REVISION},
+        metadata=TEST_METADATA,
     )
     with pytest.raises(Hy3MTPLoadError, match="must be float32"):
         load_hy3_mtp_weights(tmp_path, args, expected_revision=TEST_REVISION)
@@ -311,7 +318,7 @@ def test_loader_rejects_inconsistent_expert_shapes(tmp_path: Path) -> None:
     mx.save_safetensors(
         str(tmp_path / HY3_MTP_EXPERTS_FILE),
         experts,
-        metadata={"source_revision": TEST_REVISION},
+        metadata=TEST_METADATA,
     )
     with pytest.raises(Hy3MTPLoadError, match="differs from expert 0"):
         load_hy3_mtp_weights(tmp_path, args, expected_revision=TEST_REVISION)
@@ -381,9 +388,7 @@ def test_default_build_precision_is_bf16_with_no_quantized_modules(
 
     # The whole head is plain BF16: no quantized module anywhere.
     for path, module in _module_leaves(mtp):
-        assert not isinstance(
-            module, (nn.QuantizedLinear, QuantizedSwitchLinear)
-        ), path
+        assert not isinstance(module, (nn.QuantizedLinear, QuantizedSwitchLinear)), path
     switch = layer.mtp_block.mlp.switch_mlp
     assert tuple(switch.gate_proj.weight.shape) == (2, 64, 64)
     assert switch.gate_proj.weight.dtype == mx.bfloat16
@@ -430,9 +435,7 @@ def test_bf16_stacked_expert_weights_match_artifact_order(tmp_path: Path) -> Non
     args = _tiny_args()
     prefix = f"model.layers.{args.num_hidden_layers}."
     _write_tiny_bf16_artifact(tmp_path)
-    weights = load_hy3_mtp_bf16_weights(
-        tmp_path, args, expected_revision=TEST_REVISION
-    )
+    weights = load_hy3_mtp_bf16_weights(tmp_path, args, expected_revision=TEST_REVISION)
     source = mx.load(str(tmp_path / HY3_MTP_BF16_FILE))
     stacked = weights["layers.0.mtp_block.mlp.switch_mlp.gate_proj.weight"]
     assert tuple(stacked.shape) == (2, 64, 64)
@@ -466,7 +469,7 @@ def test_bf16_loader_fails_closed(tmp_path: Path) -> None:
     mx.save_safetensors(
         str(tmp_path / HY3_MTP_BF16_FILE),
         tensors,
-        metadata={"source_revision": TEST_REVISION},
+        metadata=TEST_METADATA,
     )
     with pytest.raises(Hy3MTPLoadError, match="missing tensors"):
         load_hy3_mtp_bf16_weights(tmp_path, args, expected_revision=TEST_REVISION)
@@ -480,7 +483,7 @@ def test_bf16_loader_fails_closed(tmp_path: Path) -> None:
     mx.save_safetensors(
         str(tmp_path / HY3_MTP_BF16_FILE),
         tensors,
-        metadata={"source_revision": TEST_REVISION},
+        metadata=TEST_METADATA,
     )
     with pytest.raises(Hy3MTPLoadError, match="unexpected tensors"):
         load_hy3_mtp_bf16_weights(tmp_path, args, expected_revision=TEST_REVISION)
@@ -492,7 +495,7 @@ def test_bf16_loader_fails_closed(tmp_path: Path) -> None:
     mx.save_safetensors(
         str(tmp_path / HY3_MTP_BF16_FILE),
         tensors,
-        metadata={"source_revision": TEST_REVISION},
+        metadata=TEST_METADATA,
     )
     with pytest.raises(Hy3MTPLoadError, match="must be float32"):
         load_hy3_mtp_bf16_weights(tmp_path, args, expected_revision=TEST_REVISION)
@@ -503,7 +506,7 @@ def test_bf16_loader_fails_closed(tmp_path: Path) -> None:
     mx.save_safetensors(
         str(tmp_path / HY3_MTP_BF16_FILE),
         tensors,
-        metadata={"source_revision": TEST_REVISION},
+        metadata=TEST_METADATA,
     )
     with pytest.raises(Hy3MTPLoadError, match="must be"):
         load_hy3_mtp_bf16_weights(tmp_path, args, expected_revision=TEST_REVISION)
@@ -517,7 +520,7 @@ def test_bf16_loader_fails_closed(tmp_path: Path) -> None:
     mx.save_safetensors(
         str(tmp_path / HY3_MTP_BF16_FILE),
         tensors,
-        metadata={"source_revision": TEST_REVISION},
+        metadata=TEST_METADATA,
     )
     with pytest.raises(Hy3MTPLoadError, match="differs from expert 0"):
         load_hy3_mtp_bf16_weights(tmp_path, args, expected_revision=TEST_REVISION)
@@ -530,3 +533,445 @@ def test_build_rejects_unknown_precision(tmp_path: Path) -> None:
         build_hy3_mtp_module(
             tmp_path, args, expected_revision=TEST_REVISION, precision="fp8"
         )
+
+
+def _write_preflight_safetensors(
+    path: Path,
+    *,
+    revision: object = TEST_REVISION,
+    source_repo: object = HY3_MTP_SOURCE_REPO,
+    tensors: tuple[tuple[str, str, list[int], bytes], ...] = (
+        ("weight", "BF16", [3], b"\0" * 6),
+    ),
+) -> int:
+    header: dict[str, object] = {
+        "__metadata__": {
+            "source_repo": source_repo,
+            "source_revision": revision,
+        }
+    }
+    payload = bytearray()
+    for name, dtype, shape, data in tensors:
+        start = len(payload)
+        payload.extend(data)
+        header[name] = {
+            "dtype": dtype,
+            "shape": shape,
+            "data_offsets": [start, len(payload)],
+        }
+    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    encoded += b" " * (-len(encoded) % 8)
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
+    return len(payload)
+
+
+def test_preflight_bf16_returns_exact_payload_without_loading_mlx(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = _write_preflight_safetensors(tmp_path / HY3_MTP_BF16_FILE)
+    monkeypatch.setattr(
+        mx,
+        "load",
+        lambda *_args, **_kwargs: pytest.fail("preflight must not call MLX"),
+    )
+
+    assert (
+        hy3_mtp_patch.preflight_hy3_mtp_artifacts(
+            tmp_path,
+            precision="bf16",
+            expected_revision=TEST_REVISION,
+        )
+        == expected
+    )
+
+
+def test_preflight_q4_charges_both_complete_tensor_payloads(tmp_path: Path) -> None:
+    resident_bytes = _write_preflight_safetensors(
+        tmp_path / HY3_MTP_RESIDENTS_FILE,
+        tensors=(
+            ("resident", "BF16", [2], b"r" * 4),
+            ("router", "F32", [1], b"g" * 4),
+        ),
+    )
+    expert_bytes = _write_preflight_safetensors(
+        tmp_path / HY3_MTP_EXPERTS_FILE,
+        tensors=(
+            ("expert", "U32", [3], b"e" * 12),
+            # The real expert file carries resident pass-through tensors too;
+            # charge the entire payload conservatively, even if loading skips one.
+            ("resident_passthrough", "BF16", [2], b"p" * 4),
+        ),
+    )
+    (tmp_path / HY3_MTP_BF16_FILE).write_bytes(b"not selected")
+
+    assert (
+        hy3_mtp_patch.preflight_hy3_mtp_artifacts(
+            tmp_path,
+            precision="q4",
+            expected_revision=TEST_REVISION,
+        )
+        == resident_bytes + expert_bytes
+    )
+
+
+def test_preflight_reads_only_the_selected_precision_files(tmp_path: Path) -> None:
+    expected = _write_preflight_safetensors(tmp_path / HY3_MTP_BF16_FILE)
+    (tmp_path / HY3_MTP_RESIDENTS_FILE).write_bytes(b"malformed but unselected")
+    (tmp_path / HY3_MTP_EXPERTS_FILE).mkdir()
+
+    assert (
+        hy3_mtp_patch.preflight_hy3_mtp_artifacts(
+            tmp_path,
+            precision="bf16",
+            expected_revision=TEST_REVISION,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("precision", ["", "fp8", "BF16"])
+def test_preflight_rejects_unknown_precision(tmp_path: Path, precision: str) -> None:
+    with pytest.raises(Hy3MTPLoadError, match="precision"):
+        hy3_mtp_patch.preflight_hy3_mtp_artifacts(tmp_path, precision=precision)
+
+
+def test_preflight_rejects_missing_nonregular_and_symlink_files(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(Hy3MTPLoadError, match="missing"):
+        hy3_mtp_patch.preflight_hy3_mtp_artifacts(
+            tmp_path,
+            precision="bf16",
+            expected_revision=TEST_REVISION,
+        )
+
+    (tmp_path / HY3_MTP_BF16_FILE).mkdir()
+    with pytest.raises(Hy3MTPLoadError, match="regular file"):
+        hy3_mtp_patch.preflight_hy3_mtp_artifacts(
+            tmp_path,
+            precision="bf16",
+            expected_revision=TEST_REVISION,
+        )
+
+    (tmp_path / HY3_MTP_BF16_FILE).rmdir()
+    target = tmp_path / "target.safetensors"
+    _write_preflight_safetensors(target)
+    (tmp_path / HY3_MTP_BF16_FILE).symlink_to(target)
+    with pytest.raises(Hy3MTPLoadError, match="regular file"):
+        hy3_mtp_patch.preflight_hy3_mtp_artifacts(
+            tmp_path,
+            precision="bf16",
+            expected_revision=TEST_REVISION,
+        )
+
+
+@pytest.mark.parametrize("revision", [None, 7, "other-revision"])
+def test_preflight_rejects_missing_malformed_or_wrong_revision(
+    tmp_path: Path, revision: object
+) -> None:
+    _write_preflight_safetensors(
+        tmp_path / HY3_MTP_BF16_FILE,
+        revision=revision,
+    )
+    with pytest.raises(Hy3MTPLoadError, match="source_revision|revision"):
+        hy3_mtp_patch.preflight_hy3_mtp_artifacts(
+            tmp_path,
+            precision="bf16",
+            expected_revision=TEST_REVISION,
+        )
+
+
+def test_preflight_rejects_wrong_source_repository(tmp_path: Path) -> None:
+    _write_preflight_safetensors(
+        tmp_path / HY3_MTP_BF16_FILE,
+        source_repo="attacker/repacked",
+    )
+    with pytest.raises(Hy3MTPLoadError, match="source_repo|repository"):
+        hy3_mtp_patch.preflight_hy3_mtp_artifacts(
+            tmp_path,
+            precision="bf16",
+            expected_revision=TEST_REVISION,
+        )
+
+
+def test_preflight_rejects_oversized_or_truncated_headers(tmp_path: Path) -> None:
+    path = tmp_path / HY3_MTP_BF16_FILE
+    path.write_bytes(struct.pack("<Q", 64 * 1024 * 1024 + 1))
+    with pytest.raises(Hy3MTPLoadError, match="bounded"):
+        hy3_mtp_patch.preflight_hy3_mtp_artifacts(
+            tmp_path,
+            precision="bf16",
+            expected_revision=TEST_REVISION,
+        )
+
+    path.write_bytes(struct.pack("<Q", 128) + b"{}")
+    with pytest.raises(Hy3MTPLoadError, match="truncated"):
+        hy3_mtp_patch.preflight_hy3_mtp_artifacts(
+            tmp_path,
+            precision="bf16",
+            expected_revision=TEST_REVISION,
+        )
+
+
+@pytest.mark.parametrize(
+    ("header", "payload", "message"),
+    [
+        (
+            {
+                "__metadata__": TEST_METADATA,
+                "weight": {
+                    "dtype": "BF16",
+                    "shape": [2],
+                    "data_offsets": [0, 2],
+                },
+            },
+            b"xx",
+            "byte-count",
+        ),
+        (
+            {
+                "__metadata__": TEST_METADATA,
+                "first": {
+                    "dtype": "BF16",
+                    "shape": [1],
+                    "data_offsets": [0, 2],
+                },
+                "second": {
+                    "dtype": "BF16",
+                    "shape": [1],
+                    "data_offsets": [3, 5],
+                },
+            },
+            b"12345",
+            "contiguous",
+        ),
+        (
+            {
+                "__metadata__": TEST_METADATA,
+                "weight": {
+                    "dtype": "BF16",
+                    "shape": [1],
+                    "data_offsets": [0, 2],
+                },
+            },
+            b"xxtrailing",
+            "trailing",
+        ),
+        (
+            {
+                "__metadata__": TEST_METADATA,
+                "weight": {
+                    "dtype": "BF16",
+                    "shape": [True],
+                    "data_offsets": [0, 2],
+                },
+            },
+            b"xx",
+            "shape",
+        ),
+    ],
+)
+def test_preflight_rejects_malformed_tensor_ranges(
+    tmp_path: Path,
+    header: dict[str, object],
+    payload: bytes,
+    message: str,
+) -> None:
+    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    encoded += b" " * (-len(encoded) % 8)
+    (tmp_path / HY3_MTP_BF16_FILE).write_bytes(
+        struct.pack("<Q", len(encoded)) + encoded + payload
+    )
+
+    with pytest.raises(Hy3MTPLoadError, match=message):
+        hy3_mtp_patch.preflight_hy3_mtp_artifacts(
+            tmp_path,
+            precision="bf16",
+            expected_revision=TEST_REVISION,
+        )
+
+
+def test_verified_bf16_handle_survives_atomic_path_replacement(
+    tmp_path: Path,
+) -> None:
+    args = _tiny_args()
+    prefix = f"model.layers.{args.num_hidden_layers}."
+    artifact_path = _write_tiny_bf16_artifact(tmp_path) / HY3_MTP_BF16_FILE
+    original = mx.load(str(artifact_path))[prefix + "eh_proj.weight"]
+    mx.eval(original)
+
+    replacement_dir = tmp_path / "replacement"
+    replacement_dir.mkdir()
+    replacement_path = _write_tiny_bf16_artifact(replacement_dir) / HY3_MTP_BF16_FILE
+    replacement = dict(mx.load(str(replacement_path)))
+    replacement[prefix + "eh_proj.weight"] = mx.zeros_like(
+        replacement[prefix + "eh_proj.weight"]
+    )
+    mx.save_safetensors(
+        str(replacement_path),
+        replacement,
+        metadata=TEST_METADATA,
+    )
+
+    with hy3_mtp_patch.open_verified_hy3_mtp_artifacts(
+        tmp_path,
+        precision="bf16",
+        expected_revision=TEST_REVISION,
+    ) as verified:
+        assert verified.root == tmp_path.resolve()
+        assert verified.precision == "bf16"
+        assert set(verified.files) == {HY3_MTP_BF16_FILE}
+        assert verified.payload_bytes > 0
+
+        os.replace(replacement_path, artifact_path)
+        weights = load_hy3_mtp_bf16_weights(
+            tmp_path,
+            args,
+            expected_revision=TEST_REVISION,
+            verified_artifacts=verified,
+        )
+        loaded = weights["layers.0.eh_proj.weight"]
+        mx.eval(loaded)
+        assert mx.array_equal(loaded, original).item()
+        assert not mx.array_equal(
+            loaded,
+            mx.load(str(artifact_path))[prefix + "eh_proj.weight"],
+        ).item()
+
+
+def test_verified_handle_allows_path_replacement_during_header_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_path = tmp_path / HY3_MTP_BF16_FILE
+    expected = _write_preflight_safetensors(artifact_path)
+    replacement_path = tmp_path / "replacement.safetensors"
+    _write_preflight_safetensors(
+        replacement_path,
+        tensors=(("replacement", "BF16", [2], b"r" * 4),),
+    )
+    real_pread_exact = hy3_mtp_patch._pread_exact
+    replaced = False
+
+    def replace_after_read(fd, size, offset, *, label):
+        nonlocal replaced
+        data = real_pread_exact(fd, size, offset, label=label)
+        if offset == 8 and not replaced:
+            os.replace(replacement_path, artifact_path)
+            replaced = True
+        return data
+
+    monkeypatch.setattr(hy3_mtp_patch, "_pread_exact", replace_after_read)
+    with hy3_mtp_patch.open_verified_hy3_mtp_artifacts(
+        tmp_path,
+        precision="bf16",
+        expected_revision=TEST_REVISION,
+    ) as verified:
+        assert verified.payload_bytes == expected
+        assert replaced
+
+
+def test_verified_handle_rejects_in_place_mutation_before_context_exit(
+    tmp_path: Path,
+) -> None:
+    artifact_path = _write_tiny_bf16_artifact(tmp_path) / HY3_MTP_BF16_FILE
+
+    with pytest.raises(Hy3MTPLoadError, match="changed while in use"):
+        with hy3_mtp_patch.open_verified_hy3_mtp_artifacts(
+            tmp_path,
+            precision="bf16",
+            expected_revision=TEST_REVISION,
+        ):
+            with artifact_path.open("ab") as artifact:
+                artifact.write(b"mutation")
+                artifact.flush()
+                os.fsync(artifact.fileno())
+
+
+def test_verified_handle_rejects_mutation_with_restored_mtime(tmp_path: Path) -> None:
+    artifact_path = _write_tiny_bf16_artifact(tmp_path) / HY3_MTP_BF16_FILE
+    before = artifact_path.stat()
+
+    with pytest.raises(Hy3MTPLoadError, match="changed while in use"):
+        with hy3_mtp_patch.open_verified_hy3_mtp_artifacts(
+            tmp_path,
+            precision="bf16",
+            expected_revision=TEST_REVISION,
+        ):
+            with artifact_path.open("r+b") as artifact:
+                artifact.seek(-1, os.SEEK_END)
+                byte = artifact.read(1)
+                artifact.seek(-1, os.SEEK_END)
+                artifact.write(bytes([byte[0] ^ 0xFF]))
+                artifact.flush()
+                os.fsync(artifact.fileno())
+            os.utime(
+                artifact_path,
+                ns=(before.st_atime_ns, before.st_mtime_ns),
+            )
+
+
+def test_verified_handle_checks_mutation_when_consumer_raises(tmp_path: Path) -> None:
+    artifact_path = _write_tiny_bf16_artifact(tmp_path) / HY3_MTP_BF16_FILE
+
+    with pytest.raises(Hy3MTPLoadError, match="changed while in use"):
+        with hy3_mtp_patch.open_verified_hy3_mtp_artifacts(
+            tmp_path,
+            precision="bf16",
+            expected_revision=TEST_REVISION,
+        ):
+            with artifact_path.open("ab") as artifact:
+                artifact.write(b"mutation")
+                artifact.flush()
+                os.fsync(artifact.fileno())
+            raise ValueError("consumer failed")
+
+
+def test_bf16_loader_passes_held_file_object_to_mlx(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = _tiny_args()
+    _write_tiny_bf16_artifact(tmp_path)
+    real_load = mx.load
+    observed = []
+
+    def record_load(source, *args, **kwargs):
+        observed.append(source)
+        assert hasattr(source, "read") and not isinstance(source, (str, Path))
+        return real_load(source, *args, **kwargs)
+
+    monkeypatch.setattr(mx, "load", record_load)
+    weights = load_hy3_mtp_bf16_weights(
+        tmp_path,
+        args,
+        expected_revision=TEST_REVISION,
+        mx_module=mx,
+    )
+    mx.eval(weights)
+    assert len(observed) == 1
+
+
+def test_build_accepts_borrowed_q4_handles(tmp_path: Path) -> None:
+    args = _tiny_args()
+    _write_tiny_artifacts(tmp_path)
+
+    with hy3_mtp_patch.open_verified_hy3_mtp_artifacts(
+        tmp_path,
+        precision="q4",
+        expected_revision=TEST_REVISION,
+    ) as verified:
+        assert set(verified.files) == {
+            HY3_MTP_RESIDENTS_FILE,
+            HY3_MTP_EXPERTS_FILE,
+        }
+        mtp = build_hy3_mtp_module(
+            tmp_path,
+            args,
+            expected_revision=TEST_REVISION,
+            precision="q4",
+            verified_artifacts=verified,
+        )
+
+    assert isinstance(mtp, Hy3MTP)
+    assert all(handle.closed for handle in verified.files.values())

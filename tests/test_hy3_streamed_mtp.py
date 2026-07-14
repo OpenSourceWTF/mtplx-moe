@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
@@ -228,6 +229,61 @@ def test_injection_preserves_ar_forward_exactly(tmp_path: Path) -> None:
         runtime.close()
 
 
+def test_injected_prefill_honors_logit_suppression_and_tail_keep(
+    tmp_path: Path,
+) -> None:
+    root, config, spec, manifest_path = _integrated_streamed_hy3(tmp_path)
+    mtp_dir = tmp_path / "mtp"
+    mtp_dir.mkdir()
+    _write_mtp_fixtures(mtp_dir)
+    runtime = _open_streamed_runtime(root, spec, manifest_path)
+    try:
+        resident = construct_resident_model(root, runtime, config=config)
+        model = resident.model
+        inject_hy3_streamed_mtp_support(
+            model, mtp_dir, config, MTPContract(), expected_revision=TEST_REVISION
+        )
+        prompt = mx.array([[1, 2, 4]], dtype=mx.int32)
+
+        logits, hidden = model(prompt, return_hidden=True, emit_logits=False)
+        tail_logits, tail_hidden = model(
+            prompt,
+            return_hidden=True,
+            emit_logits=True,
+            logits_keep=1,
+        )
+        mx.eval(hidden, tail_logits, tail_hidden)
+
+        assert logits is None
+        assert hidden.shape == (1, 3, spec.hidden_size)
+        assert tail_logits.shape == (1, 1, _streamed_args().vocab_size)
+        assert tail_hidden.shape == hidden.shape
+    finally:
+        runtime.close()
+
+
+def test_injection_uses_prebuilt_head_without_reloading_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "mtplx.hy3_mtp_patch.build_hy3_mtp_module",
+        lambda *_args, **_kwargs: pytest.fail("prebuilt head reloaded artifact"),
+    )
+    model = Hy3Model(_streamed_args())
+    prebuilt = SimpleNamespace(layers=[object()])
+
+    assert inject_hy3_streamed_mtp_support(
+        model,
+        tmp_path,
+        {"model_type": "hy_v3"},
+        MTPContract(),
+        expected_revision=TEST_REVISION,
+        mtp_module=prebuilt,
+    )
+    assert model.mtp is prebuilt
+
+
 def test_mtp_enabled_runtime_classifies_verify_batches_as_decode(
     tmp_path: Path,
 ) -> None:
@@ -371,7 +427,7 @@ def test_load_requires_artifacts_for_streamed_mtp(tmp_path: Path) -> None:
         )
 
 
-def test_load_rejects_streamed_mtp_for_non_hy3_models(tmp_path: Path) -> None:
+def test_load_rejects_streamed_mtp_for_unsupported_glm_q4(tmp_path: Path) -> None:
     root = _guard_config_dir(tmp_path)
     config = ExpertStreamingConfig(
         model_key="glm52-q4",
@@ -379,7 +435,7 @@ def test_load_rejects_streamed_mtp_for_non_hy3_models(tmp_path: Path) -> None:
         max_live_kv_tokens=0,
         runtime_reserve_bytes=0,
     )
-    with pytest.raises(RuntimeError, match="hy3-q4 only"):
+    with pytest.raises(RuntimeError, match="not supported"):
         load(
             root,
             mtp=True,
@@ -389,8 +445,8 @@ def test_load_rejects_streamed_mtp_for_non_hy3_models(tmp_path: Path) -> None:
         )
 
 
-@pytest.mark.parametrize("model_key", ["hy3-expert-only-q4", "hy3-expert-q2"])
-def test_load_rejects_mtp_for_hy3_expert_q2_and_expert_only_q4_before_model_load(
+@pytest.mark.parametrize("model_key", ["hy3-expert-only-q4"])
+def test_load_rejects_mtp_for_unvalidated_hy3_lanes_before_model_load(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     model_key: str,
@@ -411,13 +467,29 @@ def test_load_rejects_mtp_for_hy3_expert_q2_and_expert_only_q4_before_model_load
         unexpected_model_load,
     )
 
-    with pytest.raises(RuntimeError, match="hy3-q4 only"):
+    with pytest.raises(RuntimeError, match="not supported"):
         load(
             root,
             mtp=True,
             expert_streaming_config=config,
             expert_manifest=root / "expert-manifest.json",
         )
+
+
+def test_streamed_mtp_dispatch_and_precision_matrix() -> None:
+    from mtplx.runtime import _streamed_mtp_backend
+
+    assert _streamed_mtp_backend("hy3-q4", "bf16") == "hy3"
+    assert _streamed_mtp_backend("hy3-q4", "q4") == "hy3"
+    assert _streamed_mtp_backend("hy3-expert-q2", "bf16") == "hy3"
+    assert _streamed_mtp_backend("glm52-expert-q2", "bf16") == "glm52"
+
+    with pytest.raises(RuntimeError, match="BF16"):
+        _streamed_mtp_backend("hy3-expert-q2", "q4")
+    with pytest.raises(RuntimeError, match="BF16"):
+        _streamed_mtp_backend("glm52-expert-q2", "q4")
+    with pytest.raises(RuntimeError, match="not supported"):
+        _streamed_mtp_backend("glm52-q4", "bf16")
 
 
 def test_load_rejects_mtp_artifacts_without_streaming(tmp_path: Path) -> None:

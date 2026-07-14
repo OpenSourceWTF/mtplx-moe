@@ -30,11 +30,16 @@ tensors and revision mismatches abort instead of degrading.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
+import stat
 import struct
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, BinaryIO, Iterator, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -72,10 +77,395 @@ _F32_RESIDENT_SUFFIXES = ("mlp.expert_bias",)
 _HEAD_LOCAL_MODULES = ("enorm", "hnorm", "eh_proj", "final_layernorm")
 _EXPERT_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 _QUANT_LEAVES = ("weight", "scales", "biases")
+_MAX_SAFETENSORS_HEADER_BYTES = 64 * 1024 * 1024
+_MAX_SAFETENSORS_TENSORS = 4096
+_SAFETENSORS_DTYPE_BYTES = {
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "F8_E4M3": 1,
+    "F8_E4M3FN": 1,
+    "F8_E5M2": 1,
+    "I16": 2,
+    "U16": 2,
+    "F16": 2,
+    "BF16": 2,
+    "I32": 4,
+    "U32": 4,
+    "F32": 4,
+    "I64": 8,
+    "U64": 8,
+    "F64": 8,
+}
 
 
 class Hy3MTPLoadError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class VerifiedHy3MTPArtifacts:
+    """Structurally verified artifacts held open for an exact runtime load."""
+
+    root: Path
+    precision: str
+    payload_bytes: int
+    source_revision: str
+    files: Mapping[str, BinaryIO]
+
+
+def _json_object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+def _pread_exact(fd: int, size: int, offset: int, *, label: str) -> bytes:
+    chunks: list[bytes] = []
+    received = 0
+    while received < size:
+        chunk = os.pread(fd, size - received, offset + received)
+        if not chunk:
+            raise Hy3MTPLoadError(f"{label} is truncated")
+        chunks.append(chunk)
+        received += len(chunk)
+    return b"".join(chunks)
+
+
+def _tensor_payload_bytes(
+    dtype: Any,
+    shape: Any,
+    *,
+    path: Path,
+    name: str,
+) -> int:
+    if not isinstance(dtype, str) or dtype not in _SAFETENSORS_DTYPE_BYTES:
+        raise Hy3MTPLoadError(f"{path.name} tensor {name!r} has invalid dtype")
+    if not isinstance(shape, list) or any(
+        isinstance(dim, bool) or not isinstance(dim, int) or dim < 0 for dim in shape
+    ):
+        raise Hy3MTPLoadError(f"{path.name} tensor {name!r} has invalid shape")
+    elements = 1
+    for dim in shape:
+        elements *= dim
+    return elements * _SAFETENSORS_DTYPE_BYTES[dtype]
+
+
+def _preflight_safetensors_payload_held(
+    path: Path,
+    fd: int,
+    opened_info: os.stat_result,
+    expected_revision: str,
+) -> int:
+    try:
+        current_info = os.fstat(fd)
+        if not stat.S_ISREG(current_info.st_mode) or not _unchanged_while_held(
+            opened_info, current_info
+        ):
+            raise Hy3MTPLoadError(f"Hy3 MTP artifact changed before preflight: {path}")
+        size = opened_info.st_size
+        if size < 8:
+            raise Hy3MTPLoadError(f"{path.name} is too short to be safetensors")
+
+        header_size = struct.unpack(
+            "<Q", _pread_exact(fd, 8, 0, label=f"{path.name} header length")
+        )[0]
+        if not 2 <= header_size <= _MAX_SAFETENSORS_HEADER_BYTES:
+            raise Hy3MTPLoadError(
+                f"{path.name} header size {header_size} is outside the bounded range"
+            )
+        data_start = 8 + header_size
+        if data_start > size:
+            raise Hy3MTPLoadError(f"{path.name} has a truncated header")
+        header_bytes = _pread_exact(
+            fd,
+            header_size,
+            8,
+            label=f"{path.name} header",
+        )
+        try:
+            header = json.loads(
+                header_bytes,
+                object_pairs_hook=_json_object_without_duplicates,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError(f"invalid JSON constant {value}")
+                ),
+            )
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+            RecursionError,
+        ) as exc:
+            raise Hy3MTPLoadError(
+                f"{path.name} has an invalid safetensors header: {exc}"
+            ) from exc
+        if not isinstance(header, dict):
+            raise Hy3MTPLoadError(f"{path.name} safetensors header must be an object")
+        if len(header) > _MAX_SAFETENSORS_TENSORS + 1:
+            raise Hy3MTPLoadError(f"{path.name} has too many tensor entries")
+
+        metadata = header.get("__metadata__")
+        if not isinstance(metadata, dict):
+            raise Hy3MTPLoadError(f"{path.name} has a malformed __metadata__ block")
+        revision = metadata.get("source_revision")
+        if not isinstance(revision, str):
+            raise Hy3MTPLoadError(
+                f"{path.name} source_revision metadata must be a string"
+            )
+        if any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in metadata.items()
+        ):
+            raise Hy3MTPLoadError(f"{path.name} has a malformed __metadata__ block")
+        source_repo = metadata.get("source_repo")
+        if source_repo != HY3_MTP_SOURCE_REPO:
+            raise Hy3MTPLoadError(
+                f"{path.name} source_repo is {source_repo!r}; "
+                f"expected {HY3_MTP_SOURCE_REPO!r}"
+            )
+        if revision != expected_revision:
+            raise Hy3MTPLoadError(
+                f"{path.name} was packaged from revision {revision!r}; "
+                f"expected {expected_revision!r}"
+            )
+
+        ranges: list[tuple[int, int, str]] = []
+        for name, tensor in header.items():
+            if name == "__metadata__":
+                continue
+            if not isinstance(name, str) or not name:
+                raise Hy3MTPLoadError(f"{path.name} has an invalid tensor name")
+            if not isinstance(tensor, dict) or set(tensor) != {
+                "dtype",
+                "shape",
+                "data_offsets",
+            }:
+                raise Hy3MTPLoadError(
+                    f"{path.name} tensor {name!r} has invalid metadata keys"
+                )
+            offsets = tensor["data_offsets"]
+            if (
+                not isinstance(offsets, list)
+                or len(offsets) != 2
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    for value in offsets
+                )
+            ):
+                raise Hy3MTPLoadError(
+                    f"{path.name} tensor {name!r} has invalid data offsets"
+                )
+            start, end = offsets
+            if start < 0 or end < start:
+                raise Hy3MTPLoadError(
+                    f"{path.name} tensor {name!r} has an invalid data range"
+                )
+            expected_bytes = _tensor_payload_bytes(
+                tensor["dtype"], tensor["shape"], path=path, name=name
+            )
+            if end - start != expected_bytes:
+                raise Hy3MTPLoadError(
+                    f"{path.name} tensor {name!r} has a dtype/shape byte-count "
+                    f"mismatch: range={end - start}, expected={expected_bytes}"
+                )
+            ranges.append((start, end, name))
+
+        if not ranges:
+            raise Hy3MTPLoadError(f"{path.name} contains no tensors")
+        payload_bytes = size - data_start
+        cursor = 0
+        for start, end, name in sorted(ranges):
+            if start < cursor:
+                raise Hy3MTPLoadError(
+                    f"{path.name} has overlapping tensor data at {name!r}"
+                )
+            if start != cursor:
+                raise Hy3MTPLoadError(
+                    f"{path.name} tensor data is not contiguous at {name!r}"
+                )
+            if end > payload_bytes:
+                raise Hy3MTPLoadError(
+                    f"{path.name} tensor {name!r} extends beyond the file"
+                )
+            cursor = end
+        if cursor != payload_bytes:
+            raise Hy3MTPLoadError(
+                f"{path.name} has trailing data after the final tensor"
+            )
+
+        final_info = os.fstat(fd)
+        if not _unchanged_while_held(opened_info, final_info):
+            raise Hy3MTPLoadError(f"Hy3 MTP artifact changed during preflight: {path}")
+        return payload_bytes
+    except OSError as exc:
+        raise Hy3MTPLoadError(f"cannot read Hy3 MTP artifact {path}: {exc}") from exc
+
+
+def _same_file_contents(before: os.stat_result, after: os.stat_result) -> bool:
+    return (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) == (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+
+
+def _unchanged_while_held(before: os.stat_result, after: os.stat_result) -> bool:
+    if _same_file_contents(before, after):
+        return True
+    # Replacing the pathname unlinks the still-open old inode on filesystems
+    # such as APFS, which changes only ctime/nlink. The descriptor continues to
+    # identify the exact bytes that were preflighted and intentionally remains
+    # the load source.
+    return (
+        (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        == (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        )
+        and before.st_nlink > 0
+        and after.st_nlink == 0
+    )
+
+
+def _selected_artifact_filenames(precision: str) -> tuple[str, ...]:
+    return (
+        (HY3_MTP_BF16_FILE,)
+        if precision == "bf16"
+        else (HY3_MTP_RESIDENTS_FILE, HY3_MTP_EXPERTS_FILE)
+    )
+
+
+def _validate_artifact_selection(precision: str, expected_revision: str) -> None:
+    if precision not in HY3_MTP_PRECISIONS:
+        raise Hy3MTPLoadError(
+            f"unsupported Hy3 MTP precision {precision!r}; "
+            f"choose one of {HY3_MTP_PRECISIONS}"
+        )
+    if not isinstance(expected_revision, str) or not expected_revision:
+        raise Hy3MTPLoadError("expected Hy3 MTP source revision must be non-empty")
+
+
+@contextlib.contextmanager
+def open_verified_hy3_mtp_artifacts(
+    artifact_dir: Path | str,
+    *,
+    precision: str = HY3_MTP_DEFAULT_PRECISION,
+    expected_revision: str = HY3_MTP_SOURCE_REVISION,
+) -> Iterator[VerifiedHy3MTPArtifacts]:
+    """Open, structurally verify, and retain the exact selected artifact inodes.
+
+    Verification is bounded to safetensors headers and revision metadata; it is
+    not cryptographic payload authentication. Consumers must pass the yielded
+    file objects directly to ``mx.load`` and materialize arrays before exit.
+    """
+
+    _validate_artifact_selection(precision, expected_revision)
+    root = Path(artifact_dir).expanduser().resolve()
+    opened: dict[str, tuple[BinaryIO, os.stat_result]] = {}
+    payload_bytes = 0
+    with contextlib.ExitStack() as stack:
+        for filename in _selected_artifact_filenames(precision):
+            path = root / filename
+            try:
+                path_info = os.lstat(path)
+            except FileNotFoundError as exc:
+                raise Hy3MTPLoadError(f"missing Hy3 MTP artifact {path}") from exc
+            except OSError as exc:
+                raise Hy3MTPLoadError(
+                    f"cannot inspect Hy3 MTP artifact {path}: {exc}"
+                ) from exc
+            if not stat.S_ISREG(path_info.st_mode):
+                raise Hy3MTPLoadError(
+                    f"Hy3 MTP artifact must be a regular file: {path}"
+                )
+
+            flags = (
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                fd = os.open(path, flags)
+            except OSError as exc:
+                raise Hy3MTPLoadError(
+                    f"Hy3 MTP artifact must be a regular file: {path}: {exc}"
+                ) from exc
+            try:
+                opened_info = os.fstat(fd)
+                if not stat.S_ISREG(opened_info.st_mode) or (
+                    opened_info.st_dev,
+                    opened_info.st_ino,
+                ) != (path_info.st_dev, path_info.st_ino):
+                    raise Hy3MTPLoadError(
+                        "Hy3 MTP artifact was replaced or is not a regular file: "
+                        f"{path}"
+                    )
+                file = os.fdopen(fd, "rb")
+            except Exception:
+                os.close(fd)
+                raise
+            stack.enter_context(file)
+            payload_bytes += _preflight_safetensors_payload_held(
+                path, file.fileno(), opened_info, expected_revision
+            )
+            file.seek(0)
+            opened[filename] = (file, opened_info)
+
+        verified = VerifiedHy3MTPArtifacts(
+            root=root,
+            precision=precision,
+            payload_bytes=payload_bytes,
+            source_revision=expected_revision,
+            files=MappingProxyType(
+                {filename: file for filename, (file, _info) in opened.items()}
+            ),
+        )
+        try:
+            yield verified
+        finally:
+            for filename, (file, opened_info) in opened.items():
+                if not _unchanged_while_held(opened_info, os.fstat(file.fileno())):
+                    raise Hy3MTPLoadError(
+                        f"Hy3 MTP artifact changed while in use: {root / filename}"
+                    )
+
+
+def preflight_hy3_mtp_artifacts(
+    artifact_dir: Path | str,
+    *,
+    precision: str = HY3_MTP_DEFAULT_PRECISION,
+    expected_revision: str = HY3_MTP_SOURCE_REVISION,
+) -> int:
+    """Validate selected artifacts and return their resident tensor bytes.
+
+    This performs bounded header-only reads and never imports or allocates MLX
+    arrays.  Q4 conservatively charges the complete residents and experts file
+    payloads, including pass-through tensors that the weight loader ignores.
+    """
+
+    with open_verified_hy3_mtp_artifacts(
+        artifact_dir,
+        precision=precision,
+        expected_revision=expected_revision,
+    ) as verified:
+        return verified.payload_bytes
 
 
 def read_safetensors_metadata(path: Path) -> dict[str, str]:
@@ -166,12 +556,44 @@ def _validate_leaf_dtype(name: str, value: Any, mx: Any) -> None:
             raise Hy3MTPLoadError(f"{name} must be float32, found {value.dtype}")
     elif name.endswith(".weight"):
         base = name.rsplit(".", 1)[0]
-        quantized = any(
-            base.endswith(candidate) for candidate in _QUANTIZED_RESIDENT_BASES
-        ) or ".mlp.experts." in name
+        quantized = (
+            any(base.endswith(candidate) for candidate in _QUANTIZED_RESIDENT_BASES)
+            or ".mlp.experts." in name
+        )
         wanted = mx.uint32 if quantized else mx.bfloat16
         if value.dtype != wanted:
             raise Hy3MTPLoadError(f"{name} must be {wanted}, found {value.dtype}")
+
+
+def _require_verified_artifacts(
+    verified: VerifiedHy3MTPArtifacts,
+    artifact_dir: Path,
+    *,
+    precision: str,
+    expected_revision: str,
+) -> Mapping[str, BinaryIO]:
+    if not isinstance(verified, VerifiedHy3MTPArtifacts):
+        raise Hy3MTPLoadError("invalid borrowed Hy3 MTP artifact handle")
+    if verified.root != artifact_dir:
+        raise Hy3MTPLoadError(
+            "borrowed Hy3 MTP artifact root does not match artifact_dir"
+        )
+    if verified.precision != precision:
+        raise Hy3MTPLoadError(
+            f"borrowed Hy3 MTP precision is {verified.precision!r}; "
+            f"expected {precision!r}"
+        )
+    if verified.source_revision != expected_revision:
+        raise Hy3MTPLoadError(
+            f"borrowed Hy3 MTP revision is {verified.source_revision!r}; "
+            f"expected {expected_revision!r}"
+        )
+    expected_files = set(_selected_artifact_filenames(precision))
+    if set(verified.files) != expected_files:
+        raise Hy3MTPLoadError("borrowed Hy3 MTP artifact file set is invalid")
+    if any(file.closed for file in verified.files.values()):
+        raise Hy3MTPLoadError("borrowed Hy3 MTP artifact handle is closed")
+    return verified.files
 
 
 def load_hy3_mtp_weights(
@@ -180,6 +602,7 @@ def load_hy3_mtp_weights(
     *,
     expected_revision: str = HY3_MTP_SOURCE_REVISION,
     mx_module: Any | None = None,
+    verified_artifacts: VerifiedHy3MTPArtifacts | None = None,
 ) -> dict[str, Any]:
     """Read and validate both layer-80 artifacts into module-path weights.
 
@@ -194,17 +617,34 @@ def load_hy3_mtp_weights(
     else:
         mx = mx_module
     artifact_dir = Path(artifact_dir).expanduser().resolve()
+    if verified_artifacts is None:
+        with open_verified_hy3_mtp_artifacts(
+            artifact_dir,
+            precision="q4",
+            expected_revision=expected_revision,
+        ) as verified:
+            return load_hy3_mtp_weights(
+                artifact_dir,
+                args,
+                expected_revision=expected_revision,
+                mx_module=mx,
+                verified_artifacts=verified,
+            )
+    files = _require_verified_artifacts(
+        verified_artifacts,
+        artifact_dir,
+        precision="q4",
+        expected_revision=expected_revision,
+    )
     residents_path = artifact_dir / HY3_MTP_RESIDENTS_FILE
     experts_path = artifact_dir / HY3_MTP_EXPERTS_FILE
-    for path in (residents_path, experts_path):
-        if not path.exists():
-            raise Hy3MTPLoadError(f"missing Hy3 MTP artifact {path}")
-        _require_revision(path, expected_revision)
 
     prefix = _layer_prefix(args)
     mapped: dict[str, Any] = {}
 
-    residents = mx.load(str(residents_path), format="safetensors")
+    residents_file = files[HY3_MTP_RESIDENTS_FILE]
+    residents_file.seek(0)
+    residents = mx.load(residents_file, format="safetensors")
     expected_residents = expected_resident_names(args)
     missing = expected_residents - set(residents)
     extra = set(residents) - expected_residents
@@ -218,9 +658,11 @@ def load_hy3_mtp_weights(
         )
     for name, value in residents.items():
         _validate_leaf_dtype(name, value, mx)
-        mapped["layers.0." + _resident_target(name[len(prefix):])] = value
+        mapped["layers.0." + _resident_target(name[len(prefix) :])] = value
 
-    experts = mx.load(str(experts_path), format="safetensors")
+    experts_file = files[HY3_MTP_EXPERTS_FILE]
+    experts_file.seek(0)
+    experts = mx.load(experts_file, format="safetensors")
     expected_experts = expected_expert_names(args)
     missing = expected_experts - set(experts)
     if missing:
@@ -228,9 +670,7 @@ def load_hy3_mtp_weights(
             f"{experts_path.name} is missing expert tensors: {sorted(missing)[:4]}"
         )
     unexpected = {
-        name
-        for name in set(experts) - expected_experts
-        if ".mlp.experts." in name
+        name for name in set(experts) - expected_experts if ".mlp.experts." in name
     }
     if unexpected:
         raise Hy3MTPLoadError(
@@ -253,9 +693,10 @@ def load_hy3_mtp_weights(
                         f"{name} shape {shape} differs from expert 0 {reference}"
                     )
                 values.append(value)
-            mapped[f"layers.0.mtp_block.mlp.switch_mlp.{projection}.{leaf}"] = (
-                mx.stack(values)
+            mapped[f"layers.0.mtp_block.mlp.switch_mlp.{projection}.{leaf}"] = mx.stack(
+                values
             )
+    mx.eval(mapped)
     return mapped
 
 
@@ -265,6 +706,7 @@ def load_hy3_mtp_bf16_weights(
     *,
     expected_revision: str = HY3_MTP_SOURCE_REVISION,
     mx_module: Any | None = None,
+    verified_artifacts: VerifiedHy3MTPArtifacts | None = None,
 ) -> dict[str, Any]:
     """Read and validate the bit-exact BF16 layer-80 artifact.
 
@@ -279,20 +721,36 @@ def load_hy3_mtp_bf16_weights(
     else:
         mx = mx_module
     artifact_dir = Path(artifact_dir).expanduser().resolve()
+    if verified_artifacts is None:
+        with open_verified_hy3_mtp_artifacts(
+            artifact_dir,
+            precision="bf16",
+            expected_revision=expected_revision,
+        ) as verified:
+            return load_hy3_mtp_bf16_weights(
+                artifact_dir,
+                args,
+                expected_revision=expected_revision,
+                mx_module=mx,
+                verified_artifacts=verified,
+            )
+    files = _require_verified_artifacts(
+        verified_artifacts,
+        artifact_dir,
+        precision="bf16",
+        expected_revision=expected_revision,
+    )
     path = artifact_dir / HY3_MTP_BF16_FILE
-    if not path.exists():
-        raise Hy3MTPLoadError(f"missing Hy3 MTP artifact {path}")
-    _require_revision(path, expected_revision)
 
     prefix = _layer_prefix(args)
-    tensors = mx.load(str(path), format="safetensors")
+    artifact_file = files[HY3_MTP_BF16_FILE]
+    artifact_file.seek(0)
+    tensors = mx.load(artifact_file, format="safetensors")
     expected = expected_bf16_names(args)
     missing = expected - set(tensors)
     extra = set(tensors) - expected
     if missing:
-        raise Hy3MTPLoadError(
-            f"{path.name} is missing tensors: {sorted(missing)[:4]}"
-        )
+        raise Hy3MTPLoadError(f"{path.name} is missing tensors: {sorted(missing)[:4]}")
     if extra:
         raise Hy3MTPLoadError(
             f"{path.name} has unexpected tensors: {sorted(extra)[:4]}"
@@ -306,7 +764,7 @@ def load_hy3_mtp_bf16_weights(
         elif value.dtype != mx.bfloat16:
             raise Hy3MTPLoadError(f"{name} must be bfloat16, found {value.dtype}")
         if ".mlp.experts." not in name:
-            mapped["layers.0." + _resident_target(name[len(prefix):])] = value
+            mapped["layers.0." + _resident_target(name[len(prefix) :])] = value
 
     num_experts = int(args.num_experts)
     for projection in _EXPERT_PROJECTIONS:
@@ -323,9 +781,10 @@ def load_hy3_mtp_bf16_weights(
                     f"{name} shape {shape} differs from expert 0 {reference}"
                 )
             values.append(value)
-        mapped[f"layers.0.mtp_block.mlp.switch_mlp.{projection}.weight"] = (
-            mx.stack(values)
+        mapped[f"layers.0.mtp_block.mlp.switch_mlp.{projection}.weight"] = mx.stack(
+            values
         )
+    mx.eval(mapped)
     return mapped
 
 
@@ -353,8 +812,7 @@ def _quantization_spec_for(
     derived_group, remainder = divmod(logical_in, int(scales.shape[-1]))
     if remainder or derived_group != group_size:
         raise Hy3MTPLoadError(
-            f"{path}.scales implies group size {derived_group}; "
-            f"expected {group_size}"
+            f"{path}.scales implies group size {derived_group}; expected {group_size}"
         )
     return {"bits": bits, "group_size": group_size, "mode": "affine"}
 
@@ -366,6 +824,7 @@ def build_hy3_mtp_module(
     expected_revision: str = HY3_MTP_SOURCE_REVISION,
     group_size: int = 64,
     precision: str = HY3_MTP_DEFAULT_PRECISION,
+    verified_artifacts: VerifiedHy3MTPArtifacts | None = None,
 ) -> Any:
     """Construct, strictly load, and evaluate the Hy3 NextN head.
 
@@ -385,11 +844,33 @@ def build_hy3_mtp_module(
             f"unsupported Hy3 MTP precision {precision!r}; "
             f"choose one of {HY3_MTP_PRECISIONS}"
         )
+    artifact_dir = Path(artifact_dir).expanduser().resolve()
+    if verified_artifacts is None:
+        with open_verified_hy3_mtp_artifacts(
+            artifact_dir,
+            precision=precision,
+            expected_revision=expected_revision,
+        ) as verified:
+            return build_hy3_mtp_module(
+                artifact_dir,
+                args,
+                expected_revision=expected_revision,
+                group_size=group_size,
+                precision=precision,
+                verified_artifacts=verified,
+            )
+    _require_verified_artifacts(
+        verified_artifacts,
+        artifact_dir,
+        precision=precision,
+        expected_revision=expected_revision,
+    )
     if precision == "bf16":
         weights = load_hy3_mtp_bf16_weights(
             artifact_dir,
             args,
             expected_revision=expected_revision,
+            verified_artifacts=verified_artifacts,
         )
         mtp = Hy3MTP(args, num_mtp_layers=1)
     else:
@@ -397,13 +878,12 @@ def build_hy3_mtp_module(
             artifact_dir,
             args,
             expected_revision=expected_revision,
+            verified_artifacts=verified_artifacts,
         )
         mtp = Hy3MTP(args, num_mtp_layers=1)
 
         def class_predicate(path: str, module: Any) -> bool | dict[str, Any]:
-            return _quantization_spec_for(
-                path, module, weights, group_size=group_size
-            )
+            return _quantization_spec_for(path, module, weights, group_size=group_size)
 
         nn.quantize(
             mtp,
@@ -435,6 +915,7 @@ def inject_hy3_streamed_mtp_support(
     *,
     expected_revision: str = HY3_MTP_SOURCE_REVISION,
     mtp_precision: str = HY3_MTP_DEFAULT_PRECISION,
+    mtp_module: Any | None = None,
 ) -> bool:
     """Attach layer-80 NextN speculative support to a streamed Hy3 model.
 
@@ -467,12 +948,14 @@ def inject_hy3_streamed_mtp_support(
             "attach a layer-80 head it never trained"
         )
 
-    mtp = build_hy3_mtp_module(
-        artifact_dir,
-        args,
-        expected_revision=expected_revision,
-        precision=mtp_precision,
-    )
+    mtp = mtp_module
+    if mtp is None:
+        mtp = build_hy3_mtp_module(
+            artifact_dir,
+            args,
+            expected_revision=expected_revision,
+            precision=mtp_precision,
+        )
     original_outer_class = model.__class__
 
     class _MTPLXStreamedHy3Model(original_outer_class):
@@ -486,16 +969,25 @@ def inject_hy3_streamed_mtp_support(
             cache=None,
             return_hidden: bool = False,
             hidden_variant: str | None = None,
+            emit_logits: bool = True,
+            logits_keep: int | None = None,
         ):
             if hidden_variant not in {None, "pre_norm", "post_norm"}:
                 raise ValueError(
                     "streamed Hy3 MTP supports pre_norm or post_norm hidden variants"
                 )
             post_norm, pre_norm = self.model(inputs, cache, return_pre_norm=True)
-            head_input = post_norm
-            if self.args.enable_lm_head_fp32:
-                head_input = head_input.astype(mx.float32)
-            logits = self.lm_head(head_input)
+            logits = None
+            if emit_logits:
+                head_input = post_norm
+                if logits_keep is not None:
+                    keep = int(logits_keep)
+                    if keep < 1:
+                        raise ValueError("logits_keep must be positive when supplied")
+                    head_input = head_input[:, -keep:, :]
+                if self.args.enable_lm_head_fp32:
+                    head_input = head_input.astype(mx.float32)
+                logits = self.lm_head(head_input)
             if not return_hidden:
                 return logits
             # Gate v1/v2 measured the head prefers the POST-norm trunk

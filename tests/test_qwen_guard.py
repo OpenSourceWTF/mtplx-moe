@@ -18,9 +18,12 @@ import pytest
 
 import mtplx.qwen_guard as qwen_guard_module
 from mtplx.qwen_guard import (
+    DEFAULT_MLX_LOCK_PATH,
     EXPECTED_QWEN_MODELS,
     CommandResult,
+    MlxWindowReceipt,
     QwenState,
+    exclusive_mlx_window,
     qwen_stopped_for_mlx,
 )
 
@@ -148,6 +151,283 @@ def _guard(plist: Path, fake: FakeQwen, *, timeout: float = 2.0):
         _sleep=fake.sleep,
         _getuid=lambda: UID,
     )
+
+
+def _probe_lock_from_subprocess(lock_path: Path) -> bool:
+    """Return whether a separate process can acquire ``lock_path`` now."""
+
+    program = """
+import fcntl
+import os
+import sys
+
+fd = os.open(sys.argv[1], os.O_RDWR)
+try:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(75)
+    fcntl.flock(fd, fcntl.LOCK_UN)
+finally:
+    os.close(fd)
+"""
+    result = subprocess.run(
+        (sys.executable, "-c", program, str(lock_path)),
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=5.0,
+    )
+    assert result.returncode in {0, 75}, result.stderr.decode(errors="replace")
+    return result.returncode == 0
+
+
+def _wait_for_path(path: Path) -> None:
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"subprocess did not create marker: {path}")
+
+
+def _start_lock_holder(
+    lock_path: Path,
+    acquired_path: Path,
+    release_path: Path,
+) -> subprocess.Popen[bytes]:
+    program = """
+import sys
+import time
+from pathlib import Path
+
+from mtplx.qwen_guard import _exclusive_mlx_lock
+
+lock_path, acquired_path, release_path = map(Path, sys.argv[1:])
+with _exclusive_mlx_lock(lock_path=lock_path, timeout_seconds=5.0):
+    acquired_path.write_text("acquired", encoding="utf-8")
+    while not release_path.exists():
+        time.sleep(0.01)
+"""
+    process = subprocess.Popen(
+        (
+            sys.executable,
+            "-c",
+            program,
+            str(lock_path),
+            str(acquired_path),
+            str(release_path),
+        ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_for_path(acquired_path)
+    except BaseException:
+        process.kill()
+        stdout, stderr = process.communicate(timeout=5.0)
+        raise AssertionError(
+            f"lock holder failed: stdout={stdout!r}, stderr={stderr!r}"
+        )
+    return process
+
+
+def _release_lock_holder(
+    process: subprocess.Popen[bytes],
+    release_path: Path,
+) -> None:
+    release_path.write_text("release", encoding="utf-8")
+    stdout, stderr = process.communicate(timeout=5.0)
+    assert process.returncode == 0, f"stdout={stdout!r}, stderr={stderr!r}"
+
+
+def test_exclusive_window_locks_before_qwen_and_unlocks_after_restore(
+    tmp_path: Path,
+) -> None:
+    plist = tmp_path / "unused-by-fake-guard.plist"
+    lock_path = tmp_path / "mlx.lock"
+    state = QwenState(loaded=True, models=EXPECTED_QWEN_MODELS)
+    events: list[str] = []
+
+    @contextmanager
+    def fake_qwen_guard(**_kwargs):
+        assert _probe_lock_from_subprocess(lock_path) is False
+        events.append("qwen-stopped")
+        try:
+            yield state
+        finally:
+            assert _probe_lock_from_subprocess(lock_path) is False
+            events.append("qwen-restored")
+
+    with exclusive_mlx_window(
+        plist=plist,
+        lock_path=lock_path,
+        _qwen_guard=fake_qwen_guard,
+    ) as receipt:
+        assert receipt == MlxWindowReceipt(lock_path=lock_path, qwen_state=state)
+        assert _probe_lock_from_subprocess(lock_path) is False
+        events.append("body")
+
+    assert events == ["qwen-stopped", "body", "qwen-restored"]
+    assert _probe_lock_from_subprocess(lock_path) is True
+
+
+def test_exclusive_lock_serializes_separate_processes(tmp_path: Path) -> None:
+    lock_path = tmp_path / "mlx.lock"
+    first_acquired = tmp_path / "first-acquired"
+    release_first = tmp_path / "release-first"
+    second_acquired = tmp_path / "second-acquired"
+    first = _start_lock_holder(lock_path, first_acquired, release_first)
+    program = """
+import sys
+from pathlib import Path
+
+from mtplx.qwen_guard import _exclusive_mlx_lock
+
+lock_path, acquired_path = map(Path, sys.argv[1:])
+with _exclusive_mlx_lock(lock_path=lock_path, timeout_seconds=5.0):
+    acquired_path.write_text("acquired", encoding="utf-8")
+"""
+    second = subprocess.Popen(
+        (sys.executable, "-c", program, str(lock_path), str(second_acquired)),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        time.sleep(0.15)
+        assert not second_acquired.exists()
+        assert second.poll() is None
+        _release_lock_holder(first, release_first)
+        stdout, stderr = second.communicate(timeout=5.0)
+        assert second.returncode == 0, f"stdout={stdout!r}, stderr={stderr!r}"
+        assert second_acquired.read_text(encoding="utf-8") == "acquired"
+    finally:
+        for process in (first, second):
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=5.0)
+
+
+def test_exclusive_window_lock_timeout_never_enters_qwen_guard(
+    tmp_path: Path,
+) -> None:
+    lock_path = tmp_path / "mlx.lock"
+    acquired_path = tmp_path / "acquired"
+    release_path = tmp_path / "release"
+    holder = _start_lock_holder(lock_path, acquired_path, release_path)
+    guard_entered = False
+
+    @contextmanager
+    def fake_qwen_guard(**_kwargs):
+        nonlocal guard_entered
+        guard_entered = True
+        yield QwenState(loaded=False, models=())
+
+    try:
+        with pytest.raises(TimeoutError, match="exclusive MLX lock"):
+            with exclusive_mlx_window(
+                plist=tmp_path / "unused.plist",
+                lock_path=lock_path,
+                lock_timeout_seconds=0.05,
+                _qwen_guard=fake_qwen_guard,
+            ):
+                pass
+        assert guard_entered is False
+    finally:
+        _release_lock_holder(holder, release_path)
+
+
+@pytest.mark.parametrize("failure_phase", ("stop", "body", "restore"))
+def test_exclusive_window_releases_lock_on_every_failure_phase(
+    tmp_path: Path,
+    failure_phase: str,
+) -> None:
+    lock_path = tmp_path / "mlx.lock"
+
+    @contextmanager
+    def fake_qwen_guard(**_kwargs):
+        if failure_phase == "stop":
+            raise RuntimeError("stop failed")
+        try:
+            yield QwenState(loaded=True, models=EXPECTED_QWEN_MODELS)
+        finally:
+            if failure_phase == "restore":
+                raise RuntimeError("restore failed")
+
+    with pytest.raises(RuntimeError, match=failure_phase):
+        with exclusive_mlx_window(
+            plist=tmp_path / "unused.plist",
+            lock_path=lock_path,
+            _qwen_guard=fake_qwen_guard,
+        ):
+            if failure_phase == "body":
+                raise RuntimeError("body failed")
+
+    assert _probe_lock_from_subprocess(lock_path) is True
+
+
+def test_exclusive_window_rejects_same_thread_reentrancy(tmp_path: Path) -> None:
+    lock_path = tmp_path / "mlx.lock"
+    entries = 0
+
+    @contextmanager
+    def fake_qwen_guard(**_kwargs):
+        nonlocal entries
+        entries += 1
+        yield QwenState(loaded=False, models=())
+
+    with exclusive_mlx_window(
+        plist=tmp_path / "unused.plist",
+        lock_path=lock_path,
+        _qwen_guard=fake_qwen_guard,
+    ):
+        with pytest.raises(RuntimeError, match="reentrant"):
+            with exclusive_mlx_window(
+                plist=tmp_path / "unused.plist",
+                lock_path=lock_path,
+                lock_timeout_seconds=0.05,
+                _qwen_guard=fake_qwen_guard,
+            ):
+                pass
+
+    assert entries == 1
+    assert _probe_lock_from_subprocess(lock_path) is True
+
+
+@pytest.mark.parametrize("unsafe_kind", ("symlink", "hardlink", "writable"))
+def test_exclusive_window_rejects_unsafe_lock_files(
+    tmp_path: Path,
+    unsafe_kind: str,
+) -> None:
+    lock_path = tmp_path / "mlx.lock"
+    source = tmp_path / "source"
+    source.write_text("", encoding="utf-8")
+    source.chmod(0o600)
+    if unsafe_kind == "symlink":
+        lock_path.symlink_to(source)
+    elif unsafe_kind == "hardlink":
+        os.link(source, lock_path)
+    else:
+        source.rename(lock_path)
+        lock_path.chmod(0o620)
+
+    @contextmanager
+    def fake_qwen_guard(**_kwargs):
+        raise AssertionError("unsafe lock must fail before Qwen inspection")
+        yield
+
+    with pytest.raises(ValueError, match="lock file"):
+        with exclusive_mlx_window(
+            plist=tmp_path / "unused.plist",
+            lock_path=lock_path,
+            _qwen_guard=fake_qwen_guard,
+        ):
+            pass
+
+
+def test_default_exclusive_lock_path_is_stable_and_absolute() -> None:
+    assert DEFAULT_MLX_LOCK_PATH == Path("/tmp/mtplx-gpu-exclusive.lock")
+    assert DEFAULT_MLX_LOCK_PATH.is_absolute()
 
 
 def test_loaded_qwen_is_stopped_and_exactly_restored(tmp_path: Path) -> None:
@@ -775,6 +1055,30 @@ def test_cli_requires_child_command_after_explicit_delimiter(tmp_path: Path) -> 
     assert error.value.code == 2
 
 
+def test_cli_accepts_configurable_exclusive_lock(tmp_path: Path) -> None:
+    module = _load_cli_module()
+    plist = _write_plist(tmp_path)
+    lock_path = tmp_path / "matrix.lock"
+
+    args = module.parse_cli_args(
+        [
+            "--plist",
+            str(plist),
+            "--lock-path",
+            str(lock_path),
+            "--lock-timeout-seconds",
+            "12.5",
+            "--",
+            "python",
+            "job.py",
+        ]
+    )
+
+    assert args.lock_path == lock_path
+    assert args.lock_timeout_seconds == 12.5
+    assert args.command == ("python", "job.py")
+
+
 @pytest.mark.parametrize("child_exit", (0, 7))
 def test_cli_returns_child_exit_only_after_restoration(
     tmp_path: Path,
@@ -804,6 +1108,8 @@ def test_cli_returns_child_exit_only_after_restoration(
                 "plist": plist,
                 "api_url": "http://127.0.0.1:8080/v1/models",
                 "timeout_seconds": 180.0,
+                "lock_path": DEFAULT_MLX_LOCK_PATH,
+                "lock_timeout_seconds": None,
             },
         ),
         ("popen", ("python", "job.py", "--flag")),

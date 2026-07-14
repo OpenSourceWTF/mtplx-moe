@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import hashlib
 import json
 import math
@@ -11,9 +13,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,6 +24,7 @@ from pathlib import Path
 QWEN_LABEL = "com.tea.qwen"
 QWEN_PROCESS_PATTERN = "mtplx.server.openai.*Qwen3.6"
 EXPECTED_QWEN_MODELS = ("mtplx-qwen36-27b-optimized-speed",)
+DEFAULT_MLX_LOCK_PATH = Path("/tmp/mtplx-gpu-exclusive.lock")
 _MAX_PLIST_BYTES = 1024 * 1024
 _MAX_API_BYTES = 1024 * 1024
 _POLL_SECONDS = 0.1
@@ -46,6 +50,14 @@ class CommandResult:
     returncode: int
     stdout: str
     stderr: str
+
+
+@dataclass(frozen=True)
+class MlxWindowReceipt:
+    """Identity of the lock and Qwen state captured for one MLX window."""
+
+    lock_path: Path
+    qwen_state: QwenState
 
 
 @dataclass(frozen=True)
@@ -81,8 +93,22 @@ class _PlistSnapshot:
     wrapper_payload: bytes | None
 
 
+@dataclass(frozen=True)
+class _OpenedMlxLock:
+    path: Path
+    fd: int
+    parent_fd: int
+    name: str
+    identity: tuple[int, int]
+
+
 CommandRunner = Callable[[tuple[str, ...], float], CommandResult]
 ModelFetcher = Callable[[str, float], tuple[str, ...] | None]
+QwenGuard = Callable[..., AbstractContextManager[QwenState]]
+
+
+_PROCESS_LOCK_CONDITION = threading.Condition()
+_PROCESS_LOCK_OWNERS: dict[tuple[int, int], int] = {}
 
 
 def _run_command(command: tuple[str, ...], timeout: float) -> CommandResult:
@@ -179,6 +205,240 @@ def _open_without_symlink_ancestors(path: Path, flags: int) -> int:
         ) from exc
     finally:
         os.close(directory_fd)
+
+
+def _validate_positive_timeout(
+    value: float | None,
+    *,
+    name: str,
+    allow_none: bool,
+) -> float | None:
+    if value is None and allow_none:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or value <= 0
+    ):
+        suffix = " or None" if allow_none else ""
+        raise ValueError(f"{name} must be a positive finite number{suffix}")
+    return float(value)
+
+
+def _validate_uid(uid: int) -> int:
+    if isinstance(uid, bool) or not isinstance(uid, int) or uid < 0:
+        raise ValueError("current user ID is invalid")
+    return uid
+
+
+def _open_lock_parent(path: Path) -> int:
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"exclusive MLX lock file parent is invalid: {exc}") from exc
+    if resolved == Path("/"):
+        return os.open("/", _directory_flags())
+    try:
+        return _open_without_symlink_ancestors(resolved, _directory_flags())
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"exclusive MLX lock file parent must be a no-follow directory: {exc}"
+        ) from exc
+
+
+def _validate_opened_mlx_lock(lock: _OpenedMlxLock, *, uid: int) -> None:
+    try:
+        status = os.fstat(lock.fd)
+        named = os.stat(lock.name, dir_fd=lock.parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(
+            f"exclusive MLX lock file could not be verified: {exc}"
+        ) from exc
+    identity = (status.st_dev, status.st_ino)
+    named_identity = (named.st_dev, named.st_ino)
+    if identity != lock.identity or named_identity != lock.identity:
+        raise ValueError("exclusive MLX lock file identity changed")
+    if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
+        raise ValueError("exclusive MLX lock file must be a single-link regular file")
+    if status.st_uid != uid:
+        raise ValueError("exclusive MLX lock file must be owned by the current user")
+    if stat.S_IMODE(status.st_mode) != 0o600:
+        raise ValueError("exclusive MLX lock file mode must be exactly 0600")
+
+
+def _open_mlx_lock_file(path: Path, *, uid: int) -> _OpenedMlxLock:
+    lock_path = path.expanduser()
+    if (
+        not lock_path.is_absolute()
+        or lock_path == Path("/")
+        or lock_path.name in {"", ".", ".."}
+        or any(component in {"", ".", ".."} for component in lock_path.parts)
+    ):
+        raise ValueError(
+            "exclusive MLX lock file path must be an absolute non-root path"
+        )
+    parent_fd = _open_lock_parent(lock_path.parent)
+    fd: int | None = None
+    flags = (
+        os.O_RDWR
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        try:
+            fd = os.open(
+                lock_path.name,
+                flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            os.fchmod(fd, 0o600)
+        except FileExistsError:
+            fd = os.open(lock_path.name, flags, dir_fd=parent_fd)
+        status = os.fstat(fd)
+        lock = _OpenedMlxLock(
+            path=lock_path,
+            fd=fd,
+            parent_fd=parent_fd,
+            name=lock_path.name,
+            identity=(status.st_dev, status.st_ino),
+        )
+        _validate_opened_mlx_lock(lock, uid=uid)
+        return lock
+    except (OSError, ValueError) as exc:
+        if fd is not None:
+            os.close(fd)
+        os.close(parent_fd)
+        if isinstance(exc, ValueError):
+            raise
+        raise ValueError(f"exclusive MLX lock file is unsafe: {exc}") from exc
+
+
+def _lock_wait_remaining(
+    deadline: float | None,
+    monotonic: Callable[[], float],
+) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise TimeoutError("timed out waiting for the exclusive MLX lock")
+    return remaining
+
+
+def _reserve_process_lock(
+    identity: tuple[int, int],
+    *,
+    deadline: float | None,
+    monotonic: Callable[[], float],
+) -> None:
+    owner = threading.get_ident()
+    with _PROCESS_LOCK_CONDITION:
+        while identity in _PROCESS_LOCK_OWNERS:
+            if _PROCESS_LOCK_OWNERS[identity] == owner:
+                raise RuntimeError(
+                    "reentrant exclusive MLX lock acquisition is not supported"
+                )
+            remaining = _lock_wait_remaining(deadline, monotonic)
+            _PROCESS_LOCK_CONDITION.wait(
+                _POLL_SECONDS if remaining is None else min(_POLL_SECONDS, remaining)
+            )
+        _PROCESS_LOCK_OWNERS[identity] = owner
+
+
+def _release_process_lock(identity: tuple[int, int]) -> None:
+    owner = threading.get_ident()
+    with _PROCESS_LOCK_CONDITION:
+        if _PROCESS_LOCK_OWNERS.get(identity) == owner:
+            del _PROCESS_LOCK_OWNERS[identity]
+            _PROCESS_LOCK_CONDITION.notify_all()
+
+
+def _raise_lock_errors(
+    primary: BaseException | None,
+    cleanup_errors: list[BaseException],
+) -> None:
+    if primary is not None and cleanup_errors:
+        raise BaseExceptionGroup(
+            "exclusive MLX lock body and cleanup both failed",
+            [primary, *cleanup_errors],
+        )
+    if primary is not None:
+        raise primary.with_traceback(primary.__traceback__)
+    if len(cleanup_errors) == 1:
+        raise cleanup_errors[0]
+    if cleanup_errors:
+        raise BaseExceptionGroup("exclusive MLX lock cleanup failed", cleanup_errors)
+
+
+@contextmanager
+def _exclusive_mlx_lock(
+    *,
+    lock_path: Path = DEFAULT_MLX_LOCK_PATH,
+    timeout_seconds: float | None = None,
+    _monotonic: Callable[[], float] = time.monotonic,
+    _sleep: Callable[[float], None] = time.sleep,
+    _getuid: Callable[[], int] = os.getuid,
+) -> Iterator[Path]:
+    """Hold the process-shared advisory lock for one exclusive MLX window."""
+
+    timeout = _validate_positive_timeout(
+        timeout_seconds,
+        name="lock timeout_seconds",
+        allow_none=True,
+    )
+    uid = _validate_uid(_getuid())
+    deadline = None if timeout is None else _monotonic() + timeout
+    lock = _open_mlx_lock_file(Path(lock_path), uid=uid)
+    reserved = False
+    acquired = False
+    primary: BaseException | None = None
+    cleanup_errors: list[BaseException] = []
+    try:
+        _reserve_process_lock(
+            lock.identity,
+            deadline=deadline,
+            monotonic=_monotonic,
+        )
+        reserved = True
+        while True:
+            try:
+                fcntl.flock(lock.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                    raise
+            remaining = _lock_wait_remaining(deadline, _monotonic)
+            _sleep(
+                _POLL_SECONDS if remaining is None else min(_POLL_SECONDS, remaining)
+            )
+        _validate_opened_mlx_lock(lock, uid=uid)
+        try:
+            yield lock.path
+        except BaseException as exc:
+            primary = exc
+    except BaseException as exc:
+        primary = exc
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(lock.fd, fcntl.LOCK_UN)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        try:
+            os.close(lock.fd)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        try:
+            os.close(lock.parent_fd)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        if reserved:
+            _release_process_lock(lock.identity)
+    _raise_lock_errors(primary, cleanup_errors)
 
 
 def _read_owned_file(
@@ -948,3 +1208,27 @@ def qwen_stopped_for_mlx(
                         monotonic=_monotonic,
                         sleep=_sleep,
                     )
+
+
+@contextmanager
+def exclusive_mlx_window(
+    *,
+    plist: Path,
+    api_url: str = "http://127.0.0.1:8080/v1/models",
+    timeout_seconds: float = 180.0,
+    lock_path: Path = DEFAULT_MLX_LOCK_PATH,
+    lock_timeout_seconds: float | None = None,
+    _qwen_guard: QwenGuard = qwen_stopped_for_mlx,
+) -> Iterator[MlxWindowReceipt]:
+    """Serialize one MLX benchmark and restore Qwen before releasing the lock."""
+
+    with _exclusive_mlx_lock(
+        lock_path=Path(lock_path),
+        timeout_seconds=lock_timeout_seconds,
+    ) as acquired_path:
+        with _qwen_guard(
+            plist=Path(plist),
+            api_url=api_url,
+            timeout_seconds=timeout_seconds,
+        ) as state:
+            yield MlxWindowReceipt(lock_path=acquired_path, qwen_state=state)

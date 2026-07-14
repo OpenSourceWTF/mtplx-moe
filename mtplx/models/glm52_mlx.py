@@ -8,7 +8,7 @@ aligned with the official Transformers GLM-5.2 implementation.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -26,6 +26,7 @@ from mlx_lm.models.deepseek_v32 import (
     MoEGate,
     group_expert_select,
 )
+from mlx_lm.models.switch_layers import SwitchGLU
 
 from .expert_mlx import UnboundExpertSwitch, run_switch_with_shared_overlap
 
@@ -130,9 +131,20 @@ class FP32MoEGate(nn.Module):
 
 
 class GlmMoeDsaAttention(DeepseekV32Attention):
-    def __init__(self, config: ModelArgs, layer_index: int):
+    def __init__(
+        self,
+        config: ModelArgs,
+        layer_index: int,
+        *,
+        indexer_type: Literal["full", "shared"] | None = None,
+    ):
         super().__init__(config)
-        self.skip_topk = config.indexer_types[layer_index] == "shared"
+        resolved_indexer_type = (
+            config.indexer_types[layer_index] if indexer_type is None else indexer_type
+        )
+        if resolved_indexer_type not in {"full", "shared"}:
+            raise ValueError("indexer_type must be 'full' or 'shared'")
+        self.skip_topk = resolved_indexer_type == "shared"
         if self.skip_topk:
             self.indexer = None
 
@@ -142,6 +154,9 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         prev_topk_indices: Optional[mx.array] = None,
+        *,
+        compute_topk: bool | None = None,
+        kv_read_boundary: int | None = None,
     ) -> tuple[mx.array, mx.array | None]:
         batch, length, _ = x.shape
         qr = self.q_a_layernorm(self.q_a_proj(x))
@@ -170,11 +185,20 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             kv_latent, k_pe = cache[0].update_and_fetch(kv_latent, k_pe)
         else:
             cache = [None] * 2
-        topk_indices = (
-            self.indexer(x, qr, mask, cache=cache[1])
-            if self.indexer is not None
-            else prev_topk_indices
-        )
+        should_compute_topk = self.indexer is not None and compute_topk is not False
+        if should_compute_topk:
+            topk_indices = self.indexer(x, qr, mask, cache=cache[1])
+        else:
+            topk_indices = prev_topk_indices
+        if kv_read_boundary is not None:
+            read_boundary = min(
+                max(int(kv_read_boundary), 0),
+                int(kv_latent.shape[2]),
+            )
+            kv_latent = kv_latent[..., :read_boundary, :]
+            k_pe = k_pe[..., :read_boundary, :]
+            if mask is not None:
+                mask = mask[..., :read_boundary]
         if topk_indices is not None:
             if length == 1:
                 index = topk_indices[:, :, 0, :, None]
@@ -203,7 +227,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 if mask is not None:
                     sparse_mask = sparse_mask & mask
                 mask = sparse_mask
-        if self.indexer is not None and cache is not None and cache[0] is not None:
+        if should_compute_topk and cache[0] is not None:
             cache[0].keys = mx.depends(
                 cache[0].keys,
                 (cache[1].keys, cache[1].values),
@@ -268,19 +292,66 @@ class StreamedMoE(nn.Module):
         return output
 
 
-class GlmMoeDsaDecoderLayer(nn.Module):
-    def __init__(self, config: ModelArgs, layer_index: int):
+class GlmMoeDsaResidentMoE(nn.Module):
+    """GLM routed MoE with one resident, stacked BF16 expert bank."""
+
+    def __init__(self, config: ModelArgs):
         super().__init__()
-        self.self_attn = GlmMoeDsaAttention(config, layer_index)
-        self.mlp = (
-            StreamedMoE(config, layer_index)
-            if (
-                config.n_routed_experts is not None
-                and layer_index >= config.first_k_dense_replace
-                and layer_index % config.moe_layer_freq == 0
-            )
-            else DeepseekV32MLP(config)
+        self.config = config
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.switch_mlp = SwitchGLU(
+            config.hidden_size,
+            config.moe_intermediate_size,
+            config.n_routed_experts,
         )
+        self.switch_mlp.set_dtype(mx.bfloat16)
+        self.gate = FP32MoEGate(MoEGate(config))
+        if config.n_shared_experts is not None:
+            self.shared_experts = DeepseekV32MLP(
+                config=config,
+                intermediate_size=(
+                    config.moe_intermediate_size * config.n_shared_experts
+                ),
+            )
+        self.sharding_group = None
+
+    def __call__(self, x: mx.array) -> mx.array:
+        indices, scores = self.gate(x)
+        output = self.switch_mlp(x, indices)
+        output = (output * scores[..., None]).sum(axis=-2).astype(output.dtype)
+        if self.config.n_shared_experts is not None:
+            output = output + self.shared_experts(x)
+        return output
+
+
+class GlmMoeDsaDecoderLayer(nn.Module):
+    def __init__(
+        self,
+        config: ModelArgs,
+        layer_index: int,
+        *,
+        expert_mode: Literal["streamed", "resident"] = "streamed",
+        indexer_type: Literal["full", "shared"] | None = None,
+    ):
+        super().__init__()
+        if expert_mode not in {"streamed", "resident"}:
+            raise ValueError("expert_mode must be 'streamed' or 'resident'")
+        self.self_attn = GlmMoeDsaAttention(
+            config,
+            layer_index,
+            indexer_type=indexer_type,
+        )
+        is_sparse = (
+            config.n_routed_experts is not None
+            and layer_index >= config.first_k_dense_replace
+            and layer_index % config.moe_layer_freq == 0
+        )
+        if is_sparse and expert_mode == "resident":
+            self.mlp = GlmMoeDsaResidentMoE(config)
+        elif is_sparse:
+            self.mlp = StreamedMoE(config, layer_index)
+        else:
+            self.mlp = DeepseekV32MLP(config)
         self.input_layernorm = nn.RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
@@ -296,16 +367,93 @@ class GlmMoeDsaDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         prev_topk_indices: Optional[mx.array] = None,
+        *,
+        compute_topk: bool | None = None,
+        kv_read_boundary: int | None = None,
     ) -> tuple[mx.array, mx.array | None]:
         residual, topk_indices = self.self_attn(
             self.input_layernorm(x),
             mask,
             cache,
             prev_topk_indices,
+            compute_topk=compute_topk,
+            kv_read_boundary=kv_read_boundary,
         )
         hidden = x + residual
         residual = self.mlp(self.post_attention_layernorm(hidden))
         return hidden + residual, topk_indices
+
+
+class Glm52MTPLayer(nn.Module):
+    """GLM-5.2 NextN layer with resident experts and call-time shared heads."""
+
+    def __init__(self, args: ModelArgs, layer_index: int):
+        super().__init__()
+        self.enorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.hnorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.eh_proj = nn.Linear(
+            2 * args.hidden_size,
+            args.hidden_size,
+            bias=False,
+        )
+        self.mtp_block = GlmMoeDsaDecoderLayer(
+            args,
+            layer_index,
+            expert_mode="resident",
+            indexer_type="full",
+        )
+        self.shared_head_norm = nn.RMSNorm(
+            args.hidden_size,
+            eps=args.rms_norm_eps,
+        )
+
+    def __call__(
+        self,
+        input_ids: mx.array,
+        previous_hidden_states: mx.array,
+        *,
+        embed_tokens: Any,
+        lm_head: Any,
+        cache: Optional[Any] = None,
+        prev_topk_indices: Optional[mx.array] = None,
+        compute_topk: bool | None = None,
+        kv_read_boundary: int | None = None,
+    ) -> tuple[mx.array, mx.array, mx.array | None]:
+        inputs_embeds = embed_tokens(input_ids)
+        mixed = self.eh_proj(
+            mx.concatenate(
+                [self.enorm(inputs_embeds), self.hnorm(previous_hidden_states)],
+                axis=-1,
+            )
+        )
+        main_cache = cache[0] if cache is not None else None
+        mask = create_attention_mask(mixed, main_cache, return_array=True)
+        hidden, topk_indices = self.mtp_block(
+            mixed,
+            mask,
+            cache,
+            prev_topk_indices,
+            compute_topk=compute_topk,
+            kv_read_boundary=kv_read_boundary,
+        )
+        recycle_hidden = self.shared_head_norm(hidden)
+        logits = lm_head(recycle_hidden)
+        return logits, recycle_hidden, topk_indices
+
+
+class Glm52MTP(nn.Module):
+    """Container for GLM-5.2 NextN layers."""
+
+    def __init__(self, args: ModelArgs, num_mtp_layers: int = 1):
+        super().__init__()
+        if num_mtp_layers < 1:
+            raise ValueError("GLM-5.2 MTP requires at least one NextN layer")
+        self.start_layer = args.num_hidden_layers
+        self.layers = [
+            Glm52MTPLayer(args, self.start_layer + index)
+            for index in range(num_mtp_layers)
+        ]
+        self.num_mtp_layers = num_mtp_layers
 
 
 class GlmMoeDsaModel(nn.Module):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -10,6 +11,9 @@ from pathlib import Path
 import pytest
 
 from mtplx.expert_streaming_models import (
+    GLM52_Q4,
+    HY3_EXPERT_ONLY_Q4,
+    HY3_EXPERT_Q2,
     HY3_Q4,
     MODEL_SPECS,
     get_model_spec,
@@ -165,8 +169,75 @@ def test_glm52_q4_exact_expert_and_indexshare_layout() -> None:
     assert len(spec.full_indexer_layers) == 21
 
 
-def test_model_registry_contains_both_q4_targets() -> None:
-    assert {"hy3-q4", "glm52-q4"} <= MODEL_SPECS.keys()
+def test_glm52_expert_q2_exact_expert_and_indexshare_layout() -> None:
+    spec = get_model_spec("glm52-expert-q2")
+
+    assert MODEL_SPECS["glm52-expert-q2"] is spec
+    assert spec.display_name == "GLM-5.2 expert-only affine Q2"
+    assert spec.source_model == "zai-org/GLM-5.2"
+    assert spec.source_revision == "b4734de4facf877f85769a911abafc5283eab3d9"
+    assert spec.quant_model == "mlx-community/GLM-5.2-4bit"
+    assert spec.quant_revision == "6b347a6472d46bf55de65ee34032136a3929d778"
+    assert spec.total_layers == 78
+    assert spec.total_tensor_bytes == 237_126_962_688
+    assert spec.routed_layer_indices == tuple(range(3, 78))
+    assert spec.expert_count == 256
+    assert spec.top_k == 8
+    assert spec.hidden_size == 6144
+    assert spec.expert_hidden_size == 2048
+    assert spec.quant_bits == 2
+    assert spec.quant_group_size == 64
+    assert spec.quant_parameter_bytes == 2
+    assert spec.packed_weight_bytes == 9_437_184
+    assert spec.scale_bias_bytes == 2_359_296
+    assert spec.expert_record_bytes == 11_796_480
+    assert spec.routed_layer_count * spec.expert_count == 19_200
+    assert spec.routed_expert_bytes == 226_492_416_000
+    assert spec.resident_bytes == 10_634_546_688
+    assert spec.routed_expert_bytes + spec.resident_bytes == spec.total_tensor_bytes
+    assert spec.router_bytes == 236_006_400
+    assert spec.router_storage == "bfloat16 with fp32 correction bias"
+    assert spec.router_matmul_dtype == "float32"
+    assert spec.kv_bytes_per_token == 95_232
+    assert spec.mtp_layer_index == 78
+    assert spec.mtp_included is False
+    assert spec.full_indexer_layers == (0, 1, 2, *range(6, 75, 4))
+    assert len(spec.full_indexer_layers) == 21
+
+
+def test_existing_descriptors_are_unchanged_by_glm52_expert_q2_registry_expansion() -> (
+    None
+):
+    expected_digests = {
+        "hy3-q4": "533a0ef2255a5db82374d8c7731c95ae5ddda5251c290de3b667c2954954fb87",
+        "hy3-expert-only-q4": "22f6af1e3dd702ab968af86ce31ba50308ebae62e7ee638587d79ddd75187373",
+        "hy3-expert-q2": "dfc46bf9641b64bc8119361032a1cc1d0f11a60f751887494a37f9c041ab32ed",
+        "glm52-q4": "09813b5e03a43226212adbee85ac3cc7df92fa4ca693c4f46505ca3f4c278a5d",
+    }
+    existing = (HY3_Q4, HY3_EXPERT_ONLY_Q4, HY3_EXPERT_Q2, GLM52_Q4)
+
+    actual_digests = {
+        spec.key: hashlib.sha256(
+            json.dumps(
+                asdict(spec),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        for spec in existing
+    }
+
+    assert actual_digests == expected_digests
+
+
+def test_model_registry_contains_all_streaming_targets() -> None:
+    assert {
+        "hy3-q4",
+        "hy3-expert-only-q4",
+        "hy3-expert-q2",
+        "glm52-q4",
+        "glm52-expert-q2",
+    } <= MODEL_SPECS.keys()
     with pytest.raises(ValueError, match="unknown model"):
         get_model_spec("unknown-model")
 
@@ -205,6 +276,33 @@ def test_memory_plan_turns_a_total_limit_into_whole_per_layer_slots(
     assert plan.persistent_cache_bytes == spec.persistent_cache_bytes(20)
     assert plan.unallocated_bytes == 12_345
     assert plan.allocated_bytes <= plan.total_limit_bytes
+
+
+def test_memory_plan_charges_external_mtp_head_as_resident_mlx_bytes() -> None:
+    spec = get_model_spec("glm52-expert-q2")
+    mtp_head_bytes = 19_905_841_664
+    arguments = {
+        "total_limit_bytes": 112 * GIB,
+        "context_tokens": 4096,
+        "runtime_reserve_bytes": 12 * GIB,
+        "expert_cache_limit_bytes": 64 * GIB,
+        "transient_slots": 8,
+    }
+    base = plan_expert_memory(spec, **arguments)
+    with_mtp = plan_expert_memory(
+        spec,
+        **arguments,
+        additional_resident_bytes=mtp_head_bytes,
+    )
+
+    assert with_mtp.resident_bytes == base.resident_bytes + mtp_head_bytes
+    assert with_mtp.fixed_bytes == base.fixed_bytes + mtp_head_bytes
+    assert with_mtp.persistent_budget_bytes == min(
+        64 * GIB,
+        max(0, with_mtp.total_limit_bytes - with_mtp.fixed_bytes),
+    )
+    assert with_mtp.unallocated_bytes == base.unallocated_bytes - mtp_head_bytes
+    assert with_mtp.allocated_bytes <= with_mtp.total_limit_bytes
 
 
 def test_explicit_expert_cache_limit_caps_slots_below_available_memory() -> None:

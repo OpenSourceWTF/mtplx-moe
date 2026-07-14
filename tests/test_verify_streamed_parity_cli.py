@@ -20,8 +20,11 @@ def _load_module():
     return module
 
 
-@pytest.mark.parametrize("model_key", ["hy3-expert-only-q4", "hy3-expert-q2"])
-def test_parity_cli_accepts_explicit_hy3_expert_q2_and_expert_only_q4(
+@pytest.mark.parametrize(
+    "model_key",
+    ["hy3-expert-only-q4", "hy3-expert-q2", "glm52-expert-q2"],
+)
+def test_parity_cli_accepts_explicit_expert_only_model_keys(
     model_key: str,
 ) -> None:
     args = (

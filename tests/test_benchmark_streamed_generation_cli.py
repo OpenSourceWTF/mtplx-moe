@@ -85,6 +85,36 @@ def test_benchmark_accepts_explicit_hy3_expert_lanes_with_hy3_defaults(
     }
 
 
+def test_glm52_expert_q2_benchmark_uses_glm52_q4_defaults() -> None:
+    module = _load_module()
+    args = module.build_parser().parse_args(
+        [
+            "/model",
+            "/manifest",
+            "--model-key",
+            "glm52-expert-q2",
+            "--memory-limit",
+            "112GiB",
+            "--max-live-kv-tokens",
+            "2048",
+        ]
+    )
+
+    assert args.model_key == "glm52-expert-q2"
+    assert module.model_defaults_for_key("glm52-expert-q2") == (
+        module.model_defaults_for_key("glm52-q4")
+    )
+    assert module.model_defaults_for_key("glm52-expert-q2") == {
+        "max_tokens": 65_536,
+        "max_output_tokens": 131_072,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 0,
+        "enable_thinking": True,
+        "reasoning_effort": "max",
+    }
+
+
 def test_window_telemetry_can_be_disabled() -> None:
     parser = _load_module().build_parser()
     args = parser.parse_args(
