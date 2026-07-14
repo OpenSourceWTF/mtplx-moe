@@ -4002,6 +4002,7 @@ def test_public_bench_run_dry_run_records_external_kernel_env(monkeypatch, capsy
     monkeypatch.setenv("MTPLX_EXPORT_VERIFY_DOT_DIR", "outputs/dot-probe")
     monkeypatch.setenv("MTPLX_EXPORT_VERIFY_DOT_CYCLES", "1,128")
     monkeypatch.setenv("MTPLX_EVAL_STATE_ROOTS_INCLUDE_LIVE", "0")
+    monkeypatch.setenv("MTPLX_FUSE_HY3_SHARED_GATE_UP_PROJECTIONS", "1")
 
     code = main(
         [
@@ -4027,6 +4028,9 @@ def test_public_bench_run_dry_run_records_external_kernel_env(monkeypatch, capsy
     assert payload["runtime_env"]["MTPLX_EXPORT_VERIFY_DOT_DIR"] == "outputs/dot-probe"
     assert payload["runtime_env"]["MTPLX_EXPORT_VERIFY_DOT_CYCLES"] == "1,128"
     assert payload["runtime_env"]["MTPLX_EVAL_STATE_ROOTS_INCLUDE_LIVE"] == "0"
+    assert (
+        payload["runtime_env"]["MTPLX_FUSE_HY3_SHARED_GATE_UP_PROJECTIONS"] == "1"
+    )
 
 
 def test_public_bench_cold_run_defaults_to_sustained_mode(capsys):
