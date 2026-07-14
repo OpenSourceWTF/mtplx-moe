@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare sequential Q4/Q2 GLM streamed quality with deterministic gates."""
+"""Compare sequential Q4/Q2 streamed quality with deterministic gates."""
 
 from __future__ import annotations
 
@@ -51,6 +51,13 @@ class LaneConfig:
     expert_cache_limit: str | None = None
     runtime_reserve: str = "16GiB"
     max_live_kv_tokens: int = 8192
+    cache_policy: str = "frequency"
+    cache_scope: str = "layer"
+    slot_layout: str = "direct-slots"
+    transient_slots: int | None = None
+    read_chunk: str = "8MiB"
+    f_nocache: bool = False
+    trust_sidecar: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "model_root", Path(self.model_root))
@@ -59,6 +66,25 @@ class LaneConfig:
             raise ValueError("lane label must be 'q4' or 'q2'")
         if not self.model_key:
             raise ValueError("lane model_key must be non-empty")
+        if self.cache_policy not in {"frequency", "lru"}:
+            raise ValueError("cache_policy must be 'frequency' or 'lru'")
+        if self.cache_scope not in {"layer", "global"}:
+            raise ValueError("cache_scope must be 'layer' or 'global'")
+        if self.slot_layout not in {
+            "direct-slots",
+            "component-banks",
+            "metal-mmap",
+        }:
+            raise ValueError("unsupported slot_layout")
+        if self.transient_slots is not None and (
+            isinstance(self.transient_slots, bool)
+            or not isinstance(self.transient_slots, int)
+            or self.transient_slots <= 0
+        ):
+            raise ValueError("transient_slots must be a positive integer")
+        for name in ("f_nocache", "trust_sidecar"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be bool")
 
 
 @dataclass(frozen=True)
@@ -328,6 +354,149 @@ def _manifest_receipt(path: Path) -> dict[str, Any]:
         "path": str(resolved),
         "file_sha256": _sha256(payload),
         "declared_sha256": declared,
+    }
+
+
+def _flat_artifact_name(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or not value or Path(value).name != value:
+        raise ValueError(f"{label} must be a flat artifact name")
+    if value in {".", ".."} or "\x00" in value:
+        raise ValueError(f"{label} must be a flat artifact name")
+    return value
+
+
+def _resident_file_size(root: Path, name: str) -> tuple[Path, int]:
+    resolved_root = _absolute_lexical_path(root)
+    root_fd = _open_anchored_directory(resolved_root, label="model root")
+    try:
+        descriptor = _open_bound_regular_file(
+            root_fd,
+            name,
+            label=f"resident shard {name}",
+        )
+        try:
+            first = os.fstat(descriptor)
+            second = os.fstat(descriptor)
+            if _stable_identity(first) != _stable_identity(second):
+                raise ValueError(f"resident shard {name} changed while being inspected")
+            return resolved_root / name, first.st_size
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(root_fd)
+
+
+def _artifact_receipt(
+    root: Path,
+    manifest_path: Path,
+    *,
+    expected_model_key: str,
+) -> dict[str, Any]:
+    """Bind a lane to its physical index and manifest-proven resident shards."""
+
+    manifest_resolved, manifest_payload = _stable_file_bytes(
+        manifest_path,
+        label="expert manifest",
+    )
+    try:
+        manifest = json.loads(manifest_payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"expert manifest is malformed: {manifest_resolved}: {exc}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise ValueError(f"expert manifest must be an object: {manifest_resolved}")
+    if manifest.get("model_key") != expected_model_key:
+        raise ValueError(
+            "lane model key does not exactly match the expert manifest: "
+            f"{expected_model_key!r}"
+        )
+    raw_residents = manifest.get("resident_tensors")
+    raw_shards = manifest.get("shards")
+    if not isinstance(raw_residents, list) or not isinstance(raw_shards, list):
+        raise ValueError("expert manifest has no resident shard provenance")
+    resident_names: set[str] = set()
+    for item in raw_residents:
+        if not isinstance(item, dict):
+            raise ValueError("expert manifest resident tensor must be an object")
+        resident_names.add(
+            _flat_artifact_name(item.get("shard"), label="resident shard")
+        )
+    if not resident_names:
+        raise ValueError("expert manifest has no resident tensors")
+    shard_by_name: dict[str, dict[str, Any]] = {}
+    for item in raw_shards:
+        if not isinstance(item, dict):
+            raise ValueError("expert manifest shard must be an object")
+        name = _flat_artifact_name(item.get("name"), label="manifest shard")
+        if name in shard_by_name:
+            raise ValueError(f"expert manifest repeats shard {name!r}")
+        shard_by_name[name] = item
+
+    resident_files = []
+    resident_digest = hashlib.sha256()
+    for name in sorted(resident_names):
+        shard = shard_by_name.get(name)
+        if shard is None or shard.get("kind", "safetensors") != "safetensors":
+            raise ValueError(f"resident shard provenance is incomplete: {name}")
+        size = shard.get("size")
+        declared_sha256 = shard.get("sha256")
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            raise ValueError(f"resident shard has invalid size: {name}")
+        if (
+            not isinstance(declared_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", declared_sha256) is None
+        ):
+            raise ValueError(f"resident shard has invalid SHA-256 provenance: {name}")
+        resolved, physical_size = _resident_file_size(root, name)
+        if physical_size != size:
+            raise ValueError(f"resident shard size does not match provenance: {name}")
+        encoded_name = name.encode("utf-8")
+        resident_digest.update(len(encoded_name).to_bytes(4, "big"))
+        resident_digest.update(encoded_name)
+        resident_digest.update(size.to_bytes(8, "big"))
+        resident_digest.update(bytes.fromhex(declared_sha256))
+        resident_files.append(
+            {
+                "name": name,
+                "path": str(resolved),
+                "bytes": size,
+                "declared_sha256": declared_sha256,
+            }
+        )
+
+    index_path = Path(root) / "model.safetensors.index.json"
+    index_resolved, index_payload = _stable_file_bytes(
+        index_path,
+        label="resident index",
+    )
+    try:
+        index = json.loads(index_payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"resident index is malformed: {index_resolved}: {exc}"
+        ) from exc
+    weight_map = index.get("weight_map") if isinstance(index, dict) else None
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError("resident index has no weight map")
+    index_shards = {
+        _flat_artifact_name(value, label="resident index shard")
+        for value in weight_map.values()
+    }
+    if index_shards != resident_names:
+        raise ValueError("resident index and manifest shard inventories differ")
+    return {
+        "manifest_file_sha256": _sha256(manifest_payload),
+        "index": {
+            "path": str(index_resolved),
+            "bytes": len(index_payload),
+            "sha256": _sha256(index_payload),
+        },
+        "residents": {
+            "algorithm": "sha256-name-size-and-declared-file-digest-v1",
+            "sha256": resident_digest.hexdigest(),
+            "files": resident_files,
+        },
     }
 
 
@@ -1125,6 +1294,14 @@ def _evaluate_lane(
     try:
         result["manifest"] = _manifest_receipt(config.manifest_path)
         result["tokenizer"] = _tokenizer_receipt(config.model_root)
+        artifact = _artifact_receipt(
+            config.model_root,
+            config.manifest_path,
+            expected_model_key=config.model_key,
+        )
+        if artifact["manifest_file_sha256"] != result["manifest"]["file_sha256"]:
+            raise ValueError("expert manifest changed between artifact receipts")
+        result["artifact"] = artifact
         load_attempted = True
         runtime = lane.load_runtime()
         token_ids, per_file_token_counts = _tokenize_corpus(
@@ -1245,6 +1422,25 @@ def compare_quality(
                     "message": "Q4 and Q2 tokenizer artifact hashes differ",
                 }
             )
+    q4_artifact = q4_result.get("artifact")
+    q2_artifact = q2_result.get("artifact")
+    if isinstance(q4_artifact, dict) and isinstance(q2_artifact, dict):
+        if q4_artifact["index"]["sha256"] != q2_artifact["index"]["sha256"]:
+            errors.append(
+                {
+                    "stage": "resident_index_identity",
+                    "type": "ArtifactMismatch",
+                    "message": "Q4 and Q2 resident index hashes differ",
+                }
+            )
+        if q4_artifact["residents"]["sha256"] != q2_artifact["residents"]["sha256"]:
+            errors.append(
+                {
+                    "stage": "resident_identity",
+                    "type": "ArtifactMismatch",
+                    "message": "Q4 and Q2 resident shard hashes differ",
+                }
+            )
 
     greedy = None
     if "greedy_outputs" in q4_result and "greedy_outputs" in q2_result:
@@ -1351,6 +1547,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-reserve", default="16GiB")
     parser.add_argument("--max-live-kv-tokens", type=_positive_int, required=True)
     parser.add_argument(
+        "--cache-policy", choices=("frequency", "lru"), default="frequency"
+    )
+    parser.add_argument("--cache-scope", choices=("layer", "global"), default="layer")
+    parser.add_argument(
+        "--slot-layout",
+        choices=("direct-slots", "component-banks", "metal-mmap"),
+        default="direct-slots",
+    )
+    parser.add_argument("--transient-slots", type=_positive_int)
+    parser.add_argument("--read-chunk", default="8MiB")
+    parser.add_argument("--f-nocache", action="store_true")
+    parser.add_argument(
+        "--trust-sidecar",
+        action="store_true",
+        help="Use a separately deep-verified sidecar without per-record hashes.",
+    )
+    parser.add_argument(
         "--corpus-file", type=Path, action="append", required=True, dest="corpus_files"
     )
     parser.add_argument("--evaluation-tokens", type=_positive_int, required=True)
@@ -1378,6 +1591,13 @@ def _load_lane_runtime(config: LaneConfig) -> Any:
         expert_cache_limit_bytes=parse_memory_bytes(config.expert_cache_limit),
         runtime_reserve_bytes=parse_memory_bytes(config.runtime_reserve),
         max_live_kv_tokens=config.max_live_kv_tokens,
+        cache_policy=config.cache_policy,
+        cache_scope=config.cache_scope,
+        slot_layout=config.slot_layout,
+        transient_slots=config.transient_slots,
+        max_read_chunk_bytes=parse_memory_bytes(config.read_chunk),
+        bypass_page_cache=config.f_nocache,
+        verify_record_hashes=not config.trust_sidecar,
     )
     return load(
         config.model_root,
@@ -1440,6 +1660,13 @@ def main(
         expert_cache_limit=args.expert_cache_limit,
         runtime_reserve=args.runtime_reserve,
         max_live_kv_tokens=args.max_live_kv_tokens,
+        cache_policy=args.cache_policy,
+        cache_scope=args.cache_scope,
+        slot_layout=args.slot_layout,
+        transient_slots=args.transient_slots,
+        read_chunk=args.read_chunk,
+        f_nocache=args.f_nocache,
+        trust_sidecar=args.trust_sidecar,
     )
     q2_config = LaneConfig(
         "q2",
@@ -1450,6 +1677,13 @@ def main(
         expert_cache_limit=args.expert_cache_limit,
         runtime_reserve=args.runtime_reserve,
         max_live_kv_tokens=args.max_live_kv_tokens,
+        cache_policy=args.cache_policy,
+        cache_scope=args.cache_scope,
+        slot_layout=args.slot_layout,
+        transient_slots=args.transient_slots,
+        read_chunk=args.read_chunk,
+        f_nocache=args.f_nocache,
+        trust_sidecar=args.trust_sidecar,
     )
     try:
         payload = _compare_quality(

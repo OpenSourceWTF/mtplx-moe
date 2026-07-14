@@ -9,7 +9,7 @@ import math
 import sys
 from contextlib import nullcontext
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -19,6 +19,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = _ROOT / "scripts" / "compare_streamed_quality.py"
 _QUALITY_PROMPTS = _ROOT / "benchmarks/fixtures/glm52-q2-quality-prompts.jsonl"
 _BENCHMARK_PROMPT = _ROOT / "benchmarks/fixtures/glm52-q2-benchmark-prompt.txt"
+_HY3_QUALITY_PROMPTS = _ROOT / "benchmarks/fixtures/hy3-q2-quality-prompts.jsonl"
+_HY3_BENCHMARK_PROMPT = _ROOT / "benchmarks/fixtures/hy3-q2-benchmark-prompt.txt"
 
 
 def _load_module():
@@ -452,15 +454,53 @@ def test_greedy_diagnostics_report_agreement_and_first_divergence() -> None:
     }
 
 
-def _write_lane_files(root: Path, manifest_hash: str) -> tuple[Path, Path]:
+def _write_lane_files(
+    root: Path,
+    manifest_hash: str,
+    *,
+    model_key: str = "glm52-q4",
+    resident_payload: bytes = b"resident fixture\n",
+    tokenizer_payload: str = '{"fixture":"same"}\n',
+    index_indent: int | None = None,
+) -> tuple[Path, Path]:
     root.mkdir()
-    (root / "tokenizer.json").write_text('{"fixture":"same"}\n', encoding="utf-8")
+    (root / "tokenizer.json").write_text(tokenizer_payload, encoding="utf-8")
     (root / "tokenizer_config.json").write_text(
         '{"add_bos_token":false}\n', encoding="utf-8"
     )
+    resident_name = "model-00001-of-00001.safetensors"
+    (root / resident_name).write_bytes(resident_payload)
+    index = {
+        "metadata": {"total_size": len(resident_payload)},
+        "weight_map": {"model.embed_tokens.weight": resident_name},
+    }
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps(index, indent=index_indent, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     manifest = root / "expert-manifest.json"
     manifest.write_text(
-        json.dumps({"manifest_sha256": manifest_hash}, sort_keys=True) + "\n",
+        json.dumps(
+            {
+                "manifest_sha256": manifest_hash,
+                "model_key": model_key,
+                "shards": [
+                    {
+                        "name": resident_name,
+                        "size": len(resident_payload),
+                        "sha256": hashlib.sha256(resident_payload).hexdigest(),
+                    }
+                ],
+                "resident_tensors": [
+                    {
+                        "tensor": "model.embed_tokens.weight",
+                        "shard": resident_name,
+                    }
+                ],
+            },
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
     return root, manifest
@@ -478,7 +518,9 @@ def test_compare_quality_records_receipts_and_never_co_resides_lanes(
     tmp_path: Path,
 ) -> None:
     q4_root, q4_manifest = _write_lane_files(tmp_path / "q4", "a" * 64)
-    q2_root, q2_manifest = _write_lane_files(tmp_path / "q2", "b" * 64)
+    q2_root, q2_manifest = _write_lane_files(
+        tmp_path / "q2", "b" * 64, model_key="glm52-expert-q2"
+    )
     first = tmp_path / "first.txt"
     second = tmp_path / "second.txt"
     first.write_bytes(b"abc")
@@ -551,6 +593,14 @@ def test_compare_quality_records_receipts_and_never_co_resides_lanes(
         result["lanes"]["q4"]["tokenizer"]["sha256"]
         == result["lanes"]["q2"]["tokenizer"]["sha256"]
     )
+    assert (
+        result["lanes"]["q4"]["artifact"]["index"]["sha256"]
+        == result["lanes"]["q2"]["artifact"]["index"]["sha256"]
+    )
+    assert (
+        result["lanes"]["q4"]["artifact"]["residents"]["sha256"]
+        == result["lanes"]["q2"]["artifact"]["residents"]["sha256"]
+    )
     assert result["relative_perplexity_regression"] == pytest.approx(0.0)
     assert result["quality_passed"] is True
     assert result["passed"] is True
@@ -559,7 +609,9 @@ def test_compare_quality_records_receipts_and_never_co_resides_lanes(
 
 def test_q4_load_failure_clears_cache_and_does_not_start_q2(tmp_path: Path) -> None:
     q4_root, q4_manifest = _write_lane_files(tmp_path / "failed-q4", "a" * 64)
-    q2_root, q2_manifest = _write_lane_files(tmp_path / "unused-q2", "b" * 64)
+    q2_root, q2_manifest = _write_lane_files(
+        tmp_path / "unused-q2", "b" * 64, model_key="glm52-expert-q2"
+    )
     corpus = tmp_path / "corpus.txt"
     corpus.write_text("abc", encoding="utf-8")
     prompt_file = tmp_path / "prompts.jsonl"
@@ -602,6 +654,157 @@ def test_q4_load_failure_clears_cache_and_does_not_start_q2(tmp_path: Path) -> N
     assert result["passed"] is False
     assert result["lanes"]["q2"]["skipped"] == "q4 lane did not complete safely"
     assert result["errors"][0]["stage"] == "lane_evaluation"
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "expected_stage"),
+    (
+        ("resident", "resident_identity"),
+        ("index", "resident_index_identity"),
+        ("tokenizer", "tokenizer_identity"),
+    ),
+)
+def test_hy3_rejects_nonidentical_lane_artifact_receipts(
+    tmp_path: Path,
+    mismatch: str,
+    expected_stage: str,
+) -> None:
+    q4_root, q4_manifest = _write_lane_files(
+        tmp_path / "hy3-q4",
+        "a" * 64,
+        model_key="hy3-expert-only-q4",
+    )
+    q2_root, q2_manifest = _write_lane_files(
+        tmp_path / "hy3-q2",
+        "b" * 64,
+        model_key="hy3-expert-q2",
+        resident_payload=(
+            b"different resident fixture\n"
+            if mismatch == "resident"
+            else b"resident fixture\n"
+        ),
+        tokenizer_payload=(
+            '{"fixture":"different"}\n'
+            if mismatch == "tokenizer"
+            else '{"fixture":"same"}\n'
+        ),
+        index_indent=2 if mismatch == "index" else None,
+    )
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("abc", encoding="utf-8")
+    prompt_file = tmp_path / "prompts.jsonl"
+    prompt_file.write_text(
+        '{"name":"p","category":"coding","prompt":"seed"}\n',
+        encoding="utf-8",
+    )
+    tokenizer = FakeTokenizer({"abc": [0, 1, 2], "seed": [0]})
+    q4_runtime = FakeRuntime(tokenizer=tokenizer, label="q4")
+    q2_runtime = FakeRuntime(tokenizer=tokenizer, label="q2")
+    q4_lane = quality.QualityLane(
+        config=quality.LaneConfig("q4", q4_root, q4_manifest, "hy3-expert-only-q4"),
+        load_runtime=lambda: q4_runtime,
+        clear_cache=lambda: None,
+    )
+    q2_lane = quality.QualityLane(
+        config=quality.LaneConfig("q2", q2_root, q2_manifest, "hy3-expert-q2"),
+        load_runtime=lambda: q2_runtime,
+        clear_cache=lambda: None,
+    )
+
+    result = quality.compare_quality(
+        q4_lane,
+        q2_lane,
+        corpus_files=[corpus],
+        prompt_file=prompt_file,
+        evaluation_tokens=3,
+        chunk_tokens=2,
+        greedy_max_tokens=2,
+    )
+
+    assert result["passed"] is False
+    assert any(error["stage"] == expected_stage for error in result["errors"])
+
+
+def test_hy3_rejects_a_lane_key_that_differs_from_its_manifest(tmp_path: Path) -> None:
+    root, manifest = _write_lane_files(
+        tmp_path / "hy3-q2",
+        "b" * 64,
+        model_key="hy3-expert-q2",
+    )
+
+    with pytest.raises(ValueError, match="exactly match"):
+        quality._artifact_receipt(
+            root,
+            manifest,
+            expected_model_key="hy3-expert-only-q4",
+        )
+
+
+def test_hy3_runtime_configuration_forces_ar_and_carries_streaming_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    expert_runtime = ModuleType("mtplx.expert_runtime")
+    runtime_module = ModuleType("mtplx.runtime")
+
+    class FakeStreamingConfig:
+        def __init__(self, **kwargs) -> None:
+            captured["streaming"] = kwargs
+
+    expert_runtime.ExpertStreamingConfig = FakeStreamingConfig
+    expert_runtime.parse_memory_bytes = lambda value: int(value)
+
+    def fake_load(root, **kwargs):
+        captured["root"] = root
+        captured["load"] = kwargs
+        return object()
+
+    runtime_module.load = fake_load
+    monkeypatch.setitem(sys.modules, "mtplx.expert_runtime", expert_runtime)
+    monkeypatch.setitem(sys.modules, "mtplx.runtime", runtime_module)
+    root = tmp_path / "hy3"
+    manifest = root / "expert-manifest.json"
+    config = quality.LaneConfig(
+        "q2",
+        root,
+        manifest,
+        "hy3-expert-q2",
+        memory_limit="120259084288",
+        expert_cache_limit="83034243072",
+        runtime_reserve="8589934592",
+        max_live_kv_tokens=18888,
+        cache_policy="lru",
+        cache_scope="global",
+        slot_layout="component-banks",
+        transient_slots=32,
+        read_chunk="67108864",
+        f_nocache=True,
+        trust_sidecar=True,
+    )
+
+    quality._load_lane_runtime(config)
+
+    assert captured["root"] == root
+    load_kwargs = captured["load"]
+    assert isinstance(load_kwargs, dict)
+    assert load_kwargs["mtp"] is False
+    assert load_kwargs["expert_manifest"] == manifest
+    assert isinstance(load_kwargs["expert_streaming_config"], FakeStreamingConfig)
+    assert captured["streaming"] == {
+        "model_key": "hy3-expert-q2",
+        "memory_limit_bytes": 120259084288,
+        "expert_cache_limit_bytes": 83034243072,
+        "runtime_reserve_bytes": 8589934592,
+        "max_live_kv_tokens": 18888,
+        "cache_policy": "lru",
+        "cache_scope": "global",
+        "slot_layout": "component-banks",
+        "transient_slots": 32,
+        "max_read_chunk_bytes": 67108864,
+        "bypass_page_cache": True,
+        "verify_record_hashes": False,
+    }
 
 
 @pytest.mark.parametrize(
@@ -680,7 +883,9 @@ def test_quality_gate_records_nonfinite_perplexity_as_json_safe_error() -> None:
 
 def _cli_args(tmp_path: Path, output: Path) -> list[str]:
     q4_root, q4_manifest = _write_lane_files(tmp_path / "cli-q4", "c" * 64)
-    q2_root, q2_manifest = _write_lane_files(tmp_path / "cli-q2", "d" * 64)
+    q2_root, q2_manifest = _write_lane_files(
+        tmp_path / "cli-q2", "d" * 64, model_key="glm52-expert-q2"
+    )
     corpus = tmp_path / "corpus.txt"
     corpus.write_text("corpus", encoding="utf-8")
     prompts = tmp_path / "prompts.jsonl"
@@ -724,6 +929,39 @@ def _cli_args(tmp_path: Path, output: Path) -> list[str]:
         "--output-json",
         str(output),
     ]
+
+
+def test_hy3_cli_accepts_the_planned_streaming_configuration(tmp_path: Path) -> None:
+    args = _cli_args(tmp_path, tmp_path / "hy3.json")
+    args[args.index("--q4-model-key") + 1] = "hy3-expert-only-q4"
+    args[args.index("--q2-model-key") + 1] = "hy3-expert-q2"
+    output_index = args.index("--output-json")
+    args[output_index:output_index] = [
+        "--cache-policy",
+        "lru",
+        "--cache-scope",
+        "global",
+        "--slot-layout",
+        "component-banks",
+        "--transient-slots",
+        "32",
+        "--read-chunk",
+        "67108864",
+        "--f-nocache",
+        "--trust-sidecar",
+    ]
+
+    parsed = quality.build_parser().parse_args(args)
+
+    assert parsed.q4_model_key == "hy3-expert-only-q4"
+    assert parsed.q2_model_key == "hy3-expert-q2"
+    assert parsed.cache_policy == "lru"
+    assert parsed.cache_scope == "global"
+    assert parsed.slot_layout == "component-banks"
+    assert parsed.transient_slots == 32
+    assert parsed.read_chunk == "67108864"
+    assert parsed.f_nocache is True
+    assert parsed.trust_sidecar is True
 
 
 def test_cli_writes_complete_json_before_quality_exit_two(tmp_path: Path) -> None:
@@ -792,6 +1030,26 @@ def test_reviewed_prompt_fixtures_cover_required_categories() -> None:
     }
     assert all(item["name"] and item["prompt"].strip() for item in prompts)
     benchmark_prompt = _BENCHMARK_PROMPT.read_bytes()
+    assert benchmark_prompt.endswith(b"\n")
+    assert b"repository" in benchmark_prompt.lower()
+    assert b"tests" in benchmark_prompt.lower()
+
+
+def test_hy3_reviewed_prompt_fixtures_cover_required_categories() -> None:
+    prompts = [
+        json.loads(line)
+        for line in _HY3_QUALITY_PROMPTS.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert {item["category"] for item in prompts} >= {
+        "coding",
+        "mathematical_reasoning",
+        "structured_extraction",
+        "long_form_explanation",
+    }
+    assert all(item["name"] and item["prompt"].strip() for item in prompts)
+    benchmark_prompt = _HY3_BENCHMARK_PROMPT.read_bytes()
     assert benchmark_prompt.endswith(b"\n")
     assert b"repository" in benchmark_prompt.lower()
     assert b"tests" in benchmark_prompt.lower()
