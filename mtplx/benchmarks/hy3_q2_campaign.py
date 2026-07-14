@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import statistics
@@ -559,6 +560,16 @@ def _valid_sha256(value: object) -> bool:
     )
 
 
+def _valid_flat_name(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value not in {"", ".", ".."}
+        and "/" not in value
+        and "\\" not in value
+        and "\x00" not in value
+    )
+
+
 def _resident_range_map(
     values: object,
     *,
@@ -618,28 +629,64 @@ def _validate_artifact_binding(
         residents = _mapping(quality_artifact.get("residents"))
         _append_expected(
             errors,
+            f"quality {lane} resident file algorithm",
+            residents.get("algorithm"),
+            "sha256-name-size-and-verified-file-digest-v1",
+        )
+        _append_expected(
+            errors,
             f"quality {lane} resident range algorithm",
             residents.get("range_algorithm"),
             "sha256-tensor-shard-offset-length-and-content-v1",
         )
         file_names: set[str] = set()
+        file_receipts: list[tuple[str, int, str]] = []
         files = _sequence(residents.get("files"))
         if not files:
             errors.append(f"quality {lane} has no authenticated resident files")
         for index, raw in enumerate(files):
             item = _mapping(raw)
             name = item.get("name")
+            size = item.get("bytes")
             actual = item.get("sha256")
             declared = item.get("declared_sha256")
             label = f"quality {lane} resident file[{index + 1}]"
-            if not isinstance(name, str) or not name or name in file_names:
+            if not _valid_flat_name(name) or name in file_names:
                 errors.append(f"{label} has an invalid or repeated name")
                 continue
             file_names.add(name)
+            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                errors.append(f"{label} has invalid bytes")
+            if item.get("page_cache_bypassed") is not True:
+                errors.append(f"{label} did not prove F_NOCACHE hashing")
             if not _valid_sha256(actual) or not _valid_sha256(declared):
                 errors.append(f"{label} has an invalid actual or declared SHA-256")
             elif actual != declared:
                 errors.append(f"{label} actual SHA-256 does not match declared SHA-256")
+            if (
+                isinstance(size, int)
+                and not isinstance(size, bool)
+                and size > 0
+                and _valid_sha256(actual)
+            ):
+                file_receipts.append((name, size, actual))
+        composite = hashlib.sha256()
+        for name, size, actual in sorted(file_receipts):
+            encoded_name = name.encode("utf-8")
+            composite.update(len(encoded_name).to_bytes(4, "big"))
+            composite.update(encoded_name)
+            composite.update(size.to_bytes(8, "big"))
+            composite.update(bytes.fromhex(actual))
+        declared_composite = residents.get("sha256")
+        if not _valid_sha256(declared_composite):
+            errors.append(f"quality {lane} resident composite has an invalid SHA-256")
+        elif (
+            len(file_receipts) != len(files)
+            or composite.hexdigest() != declared_composite
+        ):
+            errors.append(
+                f"quality {lane} resident composite does not match file receipts"
+            )
         quality_shards[lane] = file_names
         quality_range_maps[lane] = _resident_range_map(
             residents.get("ranges"),

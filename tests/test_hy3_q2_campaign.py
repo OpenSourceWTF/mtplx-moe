@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 from copy import deepcopy
@@ -367,6 +368,15 @@ def _quality() -> dict:
     lanes = {}
     for lane in ("q4", "q2"):
         artifact = _artifact_identity(lane)
+        resident_name = "model-00001-of-00018.safetensors"
+        resident_bytes = 16_384
+        resident_sha256 = "5" * 64
+        resident_digest = hashlib.sha256()
+        encoded_name = resident_name.encode("utf-8")
+        resident_digest.update(len(encoded_name).to_bytes(4, "big"))
+        resident_digest.update(encoded_name)
+        resident_digest.update(resident_bytes.to_bytes(8, "big"))
+        resident_digest.update(bytes.fromhex(resident_sha256))
         lanes[lane] = {
             "model_key": _MODEL_KEYS[lane],
             "manifest": {
@@ -384,15 +394,18 @@ def _quality() -> dict:
                 "manifest_file_sha256": artifact["manifest"]["content_sha256"],
                 "index": {"sha256": "2" * 64},
                 "residents": {
-                    "sha256": "0" * 64,
+                    "algorithm": "sha256-name-size-and-verified-file-digest-v1",
+                    "sha256": resident_digest.hexdigest(),
                     "range_algorithm": (
                         "sha256-tensor-shard-offset-length-and-content-v1"
                     ),
                     "files": [
                         {
-                            "name": "model-00001-of-00018.safetensors",
-                            "sha256": "5" * 64,
-                            "declared_sha256": "5" * 64,
+                            "name": resident_name,
+                            "bytes": resident_bytes,
+                            "sha256": resident_sha256,
+                            "declared_sha256": resident_sha256,
+                            "page_cache_bypassed": True,
                         }
                     ],
                     "ranges": [
@@ -597,6 +610,7 @@ def test_requires_exact_global_cache_capacity(lane: str, capacity: int) -> None:
         "expert_payload",
         "harness",
         "quality_resident_hash",
+        "quality_resident_whole_file_hash",
         "benchmark_resident_range_hash",
     ),
 )
@@ -622,6 +636,10 @@ def test_quality_receipt_must_bind_every_benchmark_artifact(location: str) -> No
         model["harness_source"]["source_sha256"] = "f" * 64
     elif location == "quality_resident_hash":
         quality["lanes"]["q2"]["artifact"]["residents"]["files"][0]["sha256"] = "f" * 64
+    elif location == "quality_resident_whole_file_hash":
+        receipt = quality["lanes"]["q2"]["artifact"]["residents"]["files"][0]
+        receipt["sha256"] = "f" * 64
+        receipt["declared_sha256"] = "f" * 64
     else:
         for candidate in [*resource, *headline]:
             full = candidate["artifact_verification"]["model"]
