@@ -110,6 +110,7 @@ def _write_hf_snapshot_member(
     revision: str = "a" * 40,
     member_name: str = "tokenizer.json",
     payload: bytes = b'{"fixture":"hf-snapshot"}\n',
+    blob_name: str | None = None,
     target: str | None = None,
 ) -> tuple[Path, Path, Path]:
     repository = tmp_path / "models--example--glm"
@@ -117,12 +118,17 @@ def _write_hf_snapshot_member(
     snapshot = repository / "snapshots" / revision
     blobs.mkdir(parents=True)
     snapshot.mkdir(parents=True)
-    blob_name = hashlib.sha256(payload).hexdigest()
-    blob = blobs / blob_name
+    selected_blob_name = blob_name or hashlib.sha256(payload).hexdigest()
+    blob = blobs / selected_blob_name
     blob.write_bytes(payload)
     member = snapshot / member_name
-    member.symlink_to(target or f"../../blobs/{blob_name}")
+    member.symlink_to(target or f"../../blobs/{selected_blob_name}")
     return repository, snapshot, blob
+
+
+def _git_blob_sha1(payload: bytes) -> str:
+    header = b"blob " + str(len(payload)).encode("ascii") + b"\0"
+    return hashlib.sha1(header + payload).hexdigest()
 
 
 def test_tokenizer_receipt_accepts_identity_bound_hf_snapshot_symlink(
@@ -140,6 +146,149 @@ def test_tokenizer_receipt_accepts_identity_bound_hf_snapshot_symlink(
             "sha256": hashlib.sha256(blob.read_bytes()).hexdigest(),
         }
     ]
+
+
+def test_hf_snapshot_accepts_git_blob_sha1_content_address(tmp_path: Path) -> None:
+    payload = b'{"fixture":"git-blob"}\n'
+    _repository, snapshot, blob = _write_hf_snapshot_member(
+        tmp_path,
+        payload=payload,
+        blob_name=_git_blob_sha1(payload),
+    )
+
+    receipt = quality._tokenizer_receipt(snapshot)
+
+    assert receipt["files"][0]["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert receipt["files"][0]["bytes"] == blob.stat().st_size
+
+
+def test_hf_snapshot_rejects_invalid_git_blob_content_address(tmp_path: Path) -> None:
+    _repository, snapshot, _blob = _write_hf_snapshot_member(
+        tmp_path,
+        blob_name="b" * 40,
+    )
+
+    with pytest.raises(ValueError, match="content address"):
+        quality._tokenizer_receipt(snapshot)
+
+
+def test_hf_snapshot_rejects_blobs_swap_before_first_stat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, snapshot, blob = _write_hf_snapshot_member(tmp_path)
+    replacement = repository / "replacement-blobs"
+    replacement.mkdir()
+    (replacement / blob.name).write_bytes(b"attacker bytes under the same name\n")
+    real_stat = quality.os.stat
+    swapped = False
+
+    def racing_stat(path, *args, **kwargs):
+        nonlocal swapped
+        if path == "blobs" and kwargs.get("dir_fd") is not None and not swapped:
+            swapped = True
+            (repository / "blobs").rename(repository / "original-blobs")
+            replacement.rename(repository / "blobs")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(quality.os, "stat", racing_stat)
+
+    with pytest.raises(ValueError, match="content address"):
+        quality._tokenizer_receipt(snapshot)
+
+
+def test_hf_tokenizer_receipt_rejects_revision_swap_between_members(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, snapshot, _blob = _write_hf_snapshot_member(tmp_path)
+    config_payload = b'{"fixture":"original-config"}\n'
+    config_blob_name = hashlib.sha256(config_payload).hexdigest()
+    (repository / "blobs" / config_blob_name).write_bytes(config_payload)
+    (snapshot / "tokenizer_config.json").symlink_to(f"../../blobs/{config_blob_name}")
+    replacement = repository / "replacement-snapshots"
+    replacement_revision = replacement / snapshot.name
+    replacement_revision.mkdir(parents=True)
+    attacker_payload = b'{"fixture":"replacement-config"}\n'
+    attacker_blob_name = hashlib.sha256(attacker_payload).hexdigest()
+    (repository / "blobs" / attacker_blob_name).write_bytes(attacker_payload)
+    (replacement_revision / "tokenizer_config.json").symlink_to(
+        f"../../blobs/{attacker_blob_name}"
+    )
+    real_read = quality.os.read
+    swapped = False
+
+    def racing_read(descriptor, size):
+        nonlocal swapped
+        payload = real_read(descriptor, size)
+        if not swapped:
+            swapped = True
+            (repository / "snapshots").rename(repository / "original-snapshots")
+            replacement.rename(repository / "snapshots")
+        return payload
+
+    monkeypatch.setattr(quality.os, "read", racing_read)
+
+    with pytest.raises(ValueError, match="changed during tokenizer receipt"):
+        quality._tokenizer_receipt(snapshot)
+
+
+def test_regular_tokenizer_receipt_rejects_root_swap_between_members(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "q2-root"
+    root.mkdir()
+    (root / "tokenizer.json").write_text('{"fixture":"original"}\n')
+    (root / "tokenizer_config.json").write_text('{"fixture":"original"}\n')
+    replacement = tmp_path / "replacement-root"
+    replacement.mkdir()
+    (replacement / "tokenizer_config.json").write_text('{"fixture":"replacement"}\n')
+    real_read = quality.os.read
+    swapped = False
+
+    def racing_read(descriptor, size):
+        nonlocal swapped
+        payload = real_read(descriptor, size)
+        if not swapped:
+            swapped = True
+            root.rename(tmp_path / "original-root")
+            replacement.rename(root)
+        return payload
+
+    monkeypatch.setattr(quality.os, "read", racing_read)
+
+    with pytest.raises(ValueError, match="changed during tokenizer receipt"):
+        quality._tokenizer_receipt(root)
+
+
+def test_regular_tokenizer_receipt_rejects_member_swap_after_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "q2-root"
+    root.mkdir()
+    member = root / "tokenizer.json"
+    member.write_text('{"fixture":"original"}\n')
+    (root / "tokenizer_config.json").write_text('{"fixture":"config"}\n')
+    replacement = tmp_path / "replacement-tokenizer.json"
+    replacement.write_text('{"fixture":"replacement"}\n')
+    real_read = quality._read_stable_descriptor
+    swapped = False
+
+    def racing_read(descriptor, *, label, path):
+        nonlocal swapped
+        payload = real_read(descriptor, label=label, path=path)
+        if not swapped:
+            swapped = True
+            member.rename(root / "original-tokenizer.json")
+            replacement.rename(member)
+        return payload
+
+    monkeypatch.setattr(quality, "_read_stable_descriptor", racing_read)
+
+    with pytest.raises(ValueError, match="changed during tokenizer receipt"):
+        quality._tokenizer_receipt(root)
 
 
 def test_hf_snapshot_symlink_requires_a_pinned_revision(tmp_path: Path) -> None:

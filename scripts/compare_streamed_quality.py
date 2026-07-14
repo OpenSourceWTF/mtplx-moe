@@ -166,6 +166,23 @@ def _read_stable_descriptor(descriptor: int, *, label: str, path: Path) -> bytes
     return b"".join(chunks)
 
 
+def _validate_hf_blob_content_address(
+    blob_name: str,
+    payload: bytes,
+    *,
+    label: str,
+) -> None:
+    if len(blob_name) == 64:
+        computed = hashlib.sha256(payload).hexdigest()
+    elif len(blob_name) == 40:
+        header = b"blob " + str(len(payload)).encode("ascii") + b"\0"
+        computed = hashlib.sha1(header + payload, usedforsecurity=False).hexdigest()
+    else:
+        raise ValueError(f"{label} has an unsupported blob content address")
+    if computed != blob_name:
+        raise ValueError(f"{label} blob content address does not match its bytes")
+
+
 def _open_bound_regular_file(parent_fd: int, name: str, *, label: str) -> int:
     before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     if not stat.S_ISREG(before.st_mode):
@@ -257,6 +274,7 @@ def _stable_hf_snapshot_symlink(
         if _stable_identity(link_before) != _stable_identity(link_after):
             raise ValueError(f"{label} snapshot member changed while being opened")
         payload = _read_stable_descriptor(blob_fd, label=label, path=source)
+        _validate_hf_blob_content_address(blob_name, payload, label=label)
         link_final = os.stat(
             source.name,
             dir_fd=revision_fd,
@@ -313,19 +331,273 @@ def _manifest_receipt(path: Path) -> dict[str, Any]:
     }
 
 
-def _tokenizer_receipt(root: Path) -> dict[str, Any]:
-    root = _absolute_lexical_path(root)
-    entries = []
-    digest = hashlib.sha256()
-    for name in _TOKENIZER_FILES:
-        candidate = root / name
-        try:
-            resolved, payload = _stable_file_bytes(
-                candidate,
+def _tokenizer_receipt_changed(detail: str) -> ValueError:
+    return ValueError(f"{detail} changed during tokenizer receipt")
+
+
+def _revalidate_directory_binding(
+    parent_fd: int,
+    name: str,
+    descriptor: int,
+    expected: tuple[int, ...],
+    *,
+    label: str,
+) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        held = os.fstat(descriptor)
+    except OSError as exc:
+        raise _tokenizer_receipt_changed(label) from exc
+    if (
+        _object_identity(current) != _object_identity(held)
+        or _stable_identity(held) != expected
+    ):
+        raise _tokenizer_receipt_changed(label)
+
+
+def _optional_member_stat(parent_fd: int, name: str) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def _revalidate_missing_members(parent_fd: int, names: Sequence[str]) -> None:
+    for name in names:
+        if _optional_member_stat(parent_fd, name) is not None:
+            raise _tokenizer_receipt_changed(f"tokenizer {name}")
+
+
+def _hf_snapshot_layout(root: Path) -> tuple[Path, Path, Path] | None:
+    revision_dir = root
+    snapshots_dir = revision_dir.parent
+    repository = snapshots_dir.parent
+    if snapshots_dir.name != "snapshots" or not repository.name.startswith("models--"):
+        return None
+    if _HF_REVISION_RE.fullmatch(revision_dir.name) is None:
+        raise ValueError("tokenizer snapshot requires a pinned revision")
+    return repository, snapshots_dir, revision_dir
+
+
+def _read_regular_tokenizer_set(root: Path) -> list[tuple[str, Path, bytes]]:
+    descriptors: list[int] = []
+    bindings: list[tuple[int, str, int, tuple[int, ...], str]] = []
+    members: list[tuple[str, int, tuple[int, ...]]] = []
+    missing: list[str] = []
+    items: list[tuple[str, Path, bytes]] = []
+    try:
+        parent_fd = _open_anchored_directory(
+            root.parent,
+            label="tokenizer root parent",
+        )
+        descriptors.append(parent_fd)
+        root_fd = _open_child_directory(parent_fd, root.name, label="tokenizer root")
+        descriptors.append(root_fd)
+        bindings.append(
+            (
+                parent_fd,
+                root.name,
+                root_fd,
+                _stable_identity(os.fstat(root_fd)),
+                "tokenizer root",
+            )
+        )
+        for name in _TOKENIZER_FILES:
+            initial = _optional_member_stat(root_fd, name)
+            if initial is None:
+                missing.append(name)
+                continue
+            if not stat.S_ISREG(initial.st_mode):
+                raise ValueError(f"tokenizer {name} must be a regular file")
+            descriptor = _open_bound_regular_file(
+                root_fd,
+                name,
                 label=f"tokenizer {name}",
             )
-        except FileNotFoundError:
-            continue
+            descriptors.append(descriptor)
+            expected = _stable_identity(os.fstat(descriptor))
+            payload = _read_stable_descriptor(
+                descriptor,
+                label=f"tokenizer {name}",
+                path=root / name,
+            )
+            members.append((name, descriptor, expected))
+            items.append((name, root / name, payload))
+
+        for name, descriptor, expected in members:
+            try:
+                current = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                held = os.fstat(descriptor)
+            except OSError as exc:
+                raise _tokenizer_receipt_changed(f"tokenizer {name}") from exc
+            if not (
+                _object_identity(current) == _object_identity(held)
+                and _stable_identity(held) == expected
+            ):
+                raise _tokenizer_receipt_changed(f"tokenizer {name}")
+        _revalidate_missing_members(root_fd, missing)
+        for binding in reversed(bindings):
+            _revalidate_directory_binding(*binding[:4], label=binding[4])
+        return items
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _read_hf_tokenizer_set(
+    root: Path,
+    layout: tuple[Path, Path, Path],
+) -> list[tuple[str, Path, bytes]]:
+    repository, _snapshots_dir, revision_dir = layout
+    descriptors: list[int] = []
+    bindings: list[tuple[int, str, int, tuple[int, ...], str]] = []
+    members: list[tuple[str, tuple[int, ...], str, int, tuple[int, ...]]] = []
+    missing: list[str] = []
+    items: list[tuple[str, Path, bytes]] = []
+    try:
+        repository_parent_fd = _open_anchored_directory(
+            repository.parent,
+            label="Hugging Face repository parent",
+        )
+        descriptors.append(repository_parent_fd)
+        repository_fd = _open_child_directory(
+            repository_parent_fd,
+            repository.name,
+            label="Hugging Face repository",
+        )
+        descriptors.append(repository_fd)
+        bindings.append(
+            (
+                repository_parent_fd,
+                repository.name,
+                repository_fd,
+                _stable_identity(os.fstat(repository_fd)),
+                "Hugging Face repository",
+            )
+        )
+        snapshots_fd = _open_child_directory(
+            repository_fd,
+            "snapshots",
+            label="Hugging Face snapshots",
+        )
+        descriptors.append(snapshots_fd)
+        bindings.append(
+            (
+                repository_fd,
+                "snapshots",
+                snapshots_fd,
+                _stable_identity(os.fstat(snapshots_fd)),
+                "Hugging Face snapshots",
+            )
+        )
+        revision_fd = _open_child_directory(
+            snapshots_fd,
+            revision_dir.name,
+            label="Hugging Face pinned revision",
+        )
+        descriptors.append(revision_fd)
+        bindings.append(
+            (
+                snapshots_fd,
+                revision_dir.name,
+                revision_fd,
+                _stable_identity(os.fstat(revision_fd)),
+                "Hugging Face pinned revision",
+            )
+        )
+        blobs_fd = _open_child_directory(
+            repository_fd,
+            "blobs",
+            label="Hugging Face blobs",
+        )
+        descriptors.append(blobs_fd)
+        bindings.append(
+            (
+                repository_fd,
+                "blobs",
+                blobs_fd,
+                _stable_identity(os.fstat(blobs_fd)),
+                "Hugging Face blobs",
+            )
+        )
+
+        for name in _TOKENIZER_FILES:
+            link = _optional_member_stat(revision_fd, name)
+            if link is None:
+                missing.append(name)
+                continue
+            if not stat.S_ISLNK(link.st_mode):
+                raise ValueError(f"tokenizer {name} must be a snapshot symlink")
+            target = os.readlink(name, dir_fd=revision_fd)
+            match = _HF_BLOB_TARGET_RE.fullmatch(target)
+            if match is None:
+                raise ValueError(
+                    f"tokenizer {name} symlink target must be exact "
+                    "../../blobs/<flat-name>"
+                )
+            blob_name = match.group(1)
+            descriptor = _open_bound_regular_file(
+                blobs_fd,
+                blob_name,
+                label=f"tokenizer {name}",
+            )
+            descriptors.append(descriptor)
+            expected_blob = _stable_identity(os.fstat(descriptor))
+            payload = _read_stable_descriptor(
+                descriptor,
+                label=f"tokenizer {name}",
+                path=root / name,
+            )
+            _validate_hf_blob_content_address(
+                blob_name,
+                payload,
+                label=f"tokenizer {name}",
+            )
+            members.append(
+                (name, _stable_identity(link), blob_name, descriptor, expected_blob)
+            )
+            items.append((name, root / name, payload))
+
+        for name, expected_link, blob_name, descriptor, expected_blob in members:
+            try:
+                current_link = os.stat(
+                    name,
+                    dir_fd=revision_fd,
+                    follow_symlinks=False,
+                )
+                current_blob = os.stat(
+                    blob_name,
+                    dir_fd=blobs_fd,
+                    follow_symlinks=False,
+                )
+                held_blob = os.fstat(descriptor)
+            except OSError as exc:
+                raise _tokenizer_receipt_changed(f"tokenizer {name}") from exc
+            if not (
+                _stable_identity(current_link) == expected_link
+                and _object_identity(current_blob) == _object_identity(held_blob)
+                and _stable_identity(held_blob) == expected_blob
+            ):
+                raise _tokenizer_receipt_changed(f"tokenizer {name}")
+        _revalidate_missing_members(revision_fd, missing)
+        for binding in reversed(bindings):
+            _revalidate_directory_binding(*binding[:4], label=binding[4])
+        return items
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _tokenizer_receipt(root: Path) -> dict[str, Any]:
+    root = _absolute_lexical_path(root)
+    layout = _hf_snapshot_layout(root)
+    if layout is None:
+        items = _read_regular_tokenizer_set(root)
+    else:
+        items = _read_hf_tokenizer_set(root, layout)
+    entries = []
+    digest = hashlib.sha256()
+    for name, resolved, payload in items:
         encoded_name = name.encode("utf-8")
         digest.update(len(encoded_name).to_bytes(4, "big"))
         digest.update(encoded_name)
