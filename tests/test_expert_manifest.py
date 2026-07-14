@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import filecmp
 import hashlib
 import json
 import os
@@ -29,7 +30,7 @@ from mtplx.expert_manifest import (
     validate_expert_manifest_spec,
     verify_expert_manifest,
 )
-from mtplx.expert_streaming_models import ExpertStreamingModelSpec
+from mtplx.expert_streaming_models import ExpertStreamingModelSpec, get_model_spec
 
 
 COMPONENTS = (
@@ -42,6 +43,16 @@ COMPONENTS = (
     "down_proj.weight",
     "down_proj.scales",
     "down_proj.biases",
+)
+
+PINNED_HY3_EXPERT_ONLY_Q4_ROOT = Path(
+    "/Users/davidtai/.cache/huggingface/hy3-expert-only-mlx-q4"
+)
+PINNED_HY3_EXPERT_ONLY_Q4_FILE_SHA256 = (
+    "e7fcfd6c69486456af4261d908d95f8a84a391d6a273ff1cff02a15f73fac92d"
+)
+PINNED_HY3_EXPERT_ONLY_Q4_CANONICAL_SHA256 = (
+    "507ca09cebb9ef5180c46401db7b61d8a9759ffd04ffbc97c5dbba0e9ef89f43"
 )
 
 
@@ -436,6 +447,50 @@ def test_legacy_q4_shard_kind_omission_and_digest_are_frozen(tmp_path: Path) -> 
     assert manifest.quant_group_size == 64
     assert manifest.records[0].logical_bytes == 6_912
     assert all("kind" not in item for item in manifest.to_dict()["shards"])
+
+
+def test_pinned_current_hy3_q4_manifest_identity_and_reserialization(
+    tmp_path: Path,
+) -> None:
+    root = PINNED_HY3_EXPERT_ONLY_Q4_ROOT
+    manifest_path = root / "expert-manifest.json"
+    if not manifest_path.is_file():
+        pytest.skip(f"pinned Hy3 Q4 artifact is unavailable at {root}")
+
+    with manifest_path.open("rb") as handle:
+        file_sha256 = hashlib.file_digest(handle, "sha256").hexdigest()
+    assert file_sha256 == PINNED_HY3_EXPERT_ONLY_Q4_FILE_SHA256
+
+    manifest = load_expert_manifest(manifest_path)
+
+    assert manifest.manifest_sha256 == PINNED_HY3_EXPERT_ONLY_Q4_CANONICAL_SHA256
+    assert manifest.model_key == "hy3-expert-only-q4"
+    assert manifest.quant_bits == 4
+    assert manifest.quant_group_size == 64
+    assert len(manifest.records) == 15_168
+    assert len(manifest.shards) == 52
+    assert len(manifest.resident_tensors) == 1_041
+    assert all(record.logical_bytes == 10_616_832 for record in manifest.records)
+    assert all(shard.kind == "safetensors" for shard in manifest.shards)
+    assert all("kind" not in shard for shard in manifest.to_dict()["shards"])
+
+    validate_expert_manifest_spec(
+        manifest,
+        get_model_spec("hy3-expert-only-q4"),
+    )
+    report = verify_expert_manifest(manifest, root)
+    assert report["valid"] is True
+    assert report["checked_shards"] == 52
+
+    reserialized_path = tmp_path / "expert-manifest.json"
+    saved = save_expert_manifest(manifest, reserialized_path)
+    assert saved == manifest
+    assert filecmp.cmp(manifest_path, reserialized_path, shallow=False)
+    with reserialized_path.open("rb") as handle:
+        assert (
+            hashlib.file_digest(handle, "sha256").hexdigest()
+            == PINNED_HY3_EXPERT_ONLY_Q4_FILE_SHA256
+        )
 
 
 def test_affine_q2_descriptor_geometry_roundtrips_and_validates(tmp_path: Path) -> None:
