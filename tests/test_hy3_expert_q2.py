@@ -2460,6 +2460,215 @@ def test_finalize_binds_pilot_to_producer_and_mlx_version(
     assert (env["work_root"] / "conversion-journal.jsonl").is_file()
 
 
+def test_publish_rolls_back_source_name_substituted_at_rename_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    config = _complete_staged_conversion(env)
+    held_work = env["work_root"].with_name(f"{env['work_root'].name}-held")
+    original_rename = q2_module._exclusive_directory_rename
+    substituted = False
+
+    def substitute_source_then_rename(
+        source_directory_fd,
+        source,
+        target_directory_fd,
+        target,
+    ):
+        nonlocal substituted
+        if source == env["work_root"].name and target == env["output_root"].name:
+            env["work_root"].rename(held_work)
+            env["work_root"].mkdir()
+            (env["work_root"] / "attacker-owned").write_bytes(b"preserve me")
+            substituted = True
+        return original_rename(
+            source_directory_fd,
+            source,
+            target_directory_fd,
+            target,
+        )
+
+    monkeypatch.setattr(
+        q2_module,
+        "_exclusive_directory_rename",
+        substitute_source_then_rename,
+    )
+
+    with pytest.raises(ValueError, match="published output root.*identity"):
+        finalize_hy3_expert_q2(config)
+
+    assert substituted is True
+    assert not env["output_root"].exists()
+    assert (env["work_root"] / "attacker-owned").read_bytes() == b"preserve me"
+    assert held_work.is_dir()
+
+
+def test_finalize_does_not_unlink_a_substituted_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    config = _complete_staged_conversion(env)
+    journal = env["work_root"] / "conversion-journal.jsonl"
+    held_journal = env["work_root"] / "conversion-journal.held"
+    original_rename = q2_module._exclusive_name_rename
+    substituted = False
+
+    def substitute_at_delete_rename(
+        source_directory_fd,
+        source,
+        target_directory_fd,
+        target,
+    ):
+        nonlocal substituted
+        if source == journal.name and target.startswith(f".{journal.name}.delete-"):
+            journal.rename(held_journal)
+            journal.write_bytes(b"attacker-owned replacement\n")
+            substituted = True
+        return original_rename(
+            source_directory_fd,
+            source,
+            target_directory_fd,
+            target,
+        )
+
+    monkeypatch.setattr(
+        q2_module,
+        "_exclusive_name_rename",
+        substitute_at_delete_rename,
+    )
+
+    with pytest.raises(ValueError, match="journal.*identity|inventory.*changed"):
+        finalize_hy3_expert_q2(config)
+
+    assert substituted is True
+    assert journal.read_bytes() == b"attacker-owned replacement\n"
+    assert held_journal.is_file()
+    assert not env["output_root"].exists()
+
+
+def test_finalize_does_not_unlink_tombstone_substituted_after_lease_drop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    config = _complete_staged_conversion(env)
+    held_journal = env["work_root"] / "conversion-journal.held"
+    original_remove = q2_module._VerifiedDirectory.remove
+    replacement: Path | None = None
+
+    def substitute_after_lease_drop(verified, name):
+        nonlocal replacement
+        original_remove(verified, name)
+        if name == "conversion-journal.jsonl":
+            tombstones = list(
+                env["work_root"].glob(".conversion-journal.jsonl.delete-*")
+            )
+            assert len(tombstones) == 1
+            replacement = tombstones[0]
+            replacement.rename(held_journal)
+            replacement.write_bytes(b"attacker-owned replacement\n")
+
+    monkeypatch.setattr(
+        q2_module._VerifiedDirectory,
+        "remove",
+        substitute_after_lease_drop,
+    )
+
+    with pytest.raises(ValueError, match="journal.*identity|conversion file"):
+        finalize_hy3_expert_q2(config)
+
+    assert replacement is not None
+    assert replacement.read_bytes() == b"attacker-owned replacement\n"
+    assert held_journal.is_file()
+    assert not env["output_root"].exists()
+
+
+def test_finalize_rolls_back_when_parent_fsync_fails_after_directory_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    config = _complete_staged_conversion(env)
+    original_fsync = q2_module.os.fsync
+    parent_inode = tmp_path.stat().st_ino
+    interrupted = False
+
+    def fail_once_after_directory_rename(fd: int) -> None:
+        nonlocal interrupted
+        descriptor = os.fstat(fd)
+        if (
+            not interrupted
+            and stat.S_ISDIR(descriptor.st_mode)
+            and descriptor.st_ino == parent_inode
+            and env["output_root"].is_dir()
+            and not env["work_root"].exists()
+        ):
+            interrupted = True
+            raise OSError("injected parent fsync interruption")
+        original_fsync(fd)
+
+    monkeypatch.setattr(q2_module.os, "fsync", fail_once_after_directory_rename)
+
+    with pytest.raises(OSError, match="parent fsync interruption"):
+        finalize_hy3_expert_q2(config)
+
+    assert interrupted is True
+    assert not env["output_root"].exists()
+    assert env["work_root"].is_dir()
+    assert finalize_hy3_expert_q2(config) == env["output_root"]
+    assert verify_hy3_expert_q2(env["output_root"], deep=True)["passed"] is True
+
+
+def test_finalize_rolls_back_when_publish_rename_returns_an_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    config = _complete_staged_conversion(env)
+    original_rename = q2_module._exclusive_directory_rename
+    interrupted = False
+
+    def rename_then_interrupt(
+        source_directory_fd,
+        source,
+        target_directory_fd,
+        target,
+    ):
+        nonlocal interrupted
+        result = original_rename(
+            source_directory_fd,
+            source,
+            target_directory_fd,
+            target,
+        )
+        if source == env["work_root"].name and target == env["output_root"].name:
+            interrupted = True
+            raise KeyboardInterrupt("injected post-rename interruption")
+        return result
+
+    monkeypatch.setattr(
+        q2_module,
+        "_exclusive_directory_rename",
+        rename_then_interrupt,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="post-rename interruption"):
+        finalize_hy3_expert_q2(config)
+
+    assert interrupted is True
+    assert not env["output_root"].exists()
+    assert env["work_root"].is_dir()
+
+    monkeypatch.setattr(
+        q2_module,
+        "_exclusive_directory_rename",
+        original_rename,
+    )
+    assert finalize_hy3_expert_q2(config) == env["output_root"]
+
+
 @pytest.mark.parametrize(
     "corruption",
     ["sidecar", "resident", "ancillary", "provenance", "mtp", "extra_q4"],

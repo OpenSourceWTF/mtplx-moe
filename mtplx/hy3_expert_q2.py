@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -3577,7 +3578,7 @@ def _build_authoritative_manifest(
     return make_sidecar_authoritative(candidate, spec)
 
 
-def _exclusive_directory_rename(
+def _exclusive_name_rename(
     source_directory_fd: int,
     source_name: str,
     target_directory_fd: int,
@@ -3635,6 +3636,127 @@ def _exclusive_directory_rename(
         raise OSError(error, os.strerror(error), target_name)
 
 
+def _exclusive_directory_rename(
+    source_directory_fd: int,
+    source_name: str,
+    target_directory_fd: int,
+    target_name: str,
+) -> None:
+    _exclusive_name_rename(
+        source_directory_fd,
+        source_name,
+        target_directory_fd,
+        target_name,
+    )
+
+
+def _assert_named_directory_identity(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+    *,
+    label: str,
+) -> None:
+    try:
+        entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(f"{label} identity is unavailable: {exc}") from exc
+    descriptor = os.fstat(directory_fd)
+    if not stat.S_ISDIR(entry.st_mode) or (
+        entry.st_dev,
+        entry.st_ino,
+    ) != (descriptor.st_dev, descriptor.st_ino):
+        raise ValueError(f"{label} identity changed")
+
+
+def _open_named_directory(parent_fd: int, name: str, *, label: str) -> int:
+    try:
+        entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        directory_fd = os.open(name, _directory_flags(), dir_fd=parent_fd)
+    except OSError as exc:
+        raise ValueError(f"{label} identity is unavailable: {exc}") from exc
+    try:
+        descriptor = os.fstat(directory_fd)
+        if not stat.S_ISDIR(entry.st_mode) or (
+            entry.st_dev,
+            entry.st_ino,
+        ) != (descriptor.st_dev, descriptor.st_ino):
+            raise ValueError(f"{label} identity changed while opening")
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def _rollback_published_directory(
+    parent_fd: int,
+    published_name: str,
+    preferred_name: str,
+    published_fd: int,
+) -> str:
+    """Remove a rejected publication from its public name without deletion."""
+
+    _assert_named_directory_identity(
+        parent_fd,
+        published_name,
+        published_fd,
+        label="rejected published directory",
+    )
+    rollback_name = preferred_name
+    try:
+        _exclusive_directory_rename(
+            parent_fd,
+            published_name,
+            parent_fd,
+            rollback_name,
+        )
+    except FileExistsError:
+        rollback_name = f"{_WORK_DIRECTORY_NAME}.rejected-{secrets.token_hex(16)}"
+        _exclusive_directory_rename(
+            parent_fd,
+            published_name,
+            parent_fd,
+            rollback_name,
+        )
+    _assert_named_directory_identity(
+        parent_fd,
+        rollback_name,
+        published_fd,
+        label="rolled-back published directory",
+    )
+    os.fsync(parent_fd)
+    return rollback_name
+
+
+def _rollback_verified_publication_if_present(
+    parent_fd: int,
+    published_name: str,
+    work_fd: int,
+) -> bool:
+    try:
+        published_fd = _open_named_directory(
+            parent_fd,
+            published_name,
+            label="interrupted published output root",
+        )
+    except ValueError:
+        return False
+    try:
+        published = os.fstat(published_fd)
+        work = os.fstat(work_fd)
+        if (published.st_dev, published.st_ino) != (work.st_dev, work.st_ino):
+            return False
+        _rollback_published_directory(
+            parent_fd,
+            published_name,
+            _WORK_DIRECTORY_NAME,
+            published_fd,
+        )
+        return True
+    finally:
+        os.close(published_fd)
+
+
 def _publish_verified_work(
     config: ConversionConfig,
     context: _PreflightContext,
@@ -3655,19 +3777,86 @@ def _publish_verified_work(
         raise ValueError("final output root appeared before atomic publish")
     verified.assert_unchanged(work_fd)
     _assert_work_root_identity(parent_fd, work_fd)
-    _exclusive_directory_rename(
-        parent_fd,
-        _WORK_DIRECTORY_NAME,
+    try:
+        _exclusive_directory_rename(
+            parent_fd,
+            _WORK_DIRECTORY_NAME,
+            parent_fd,
+            config.output_root.name,
+        )
+    except BaseException:
+        _rollback_verified_publication_if_present(
+            parent_fd,
+            config.output_root.name,
+            work_fd,
+        )
+        raise
+    published_fd = _open_named_directory(
         parent_fd,
         config.output_root.name,
-    )
-    os.fsync(parent_fd)
-    _assert_directory_path_identity(
-        config.output_root,
-        work_fd,
         label="published output root",
     )
+    try:
+        published = os.fstat(published_fd)
+        verified_work = os.fstat(work_fd)
+        if (published.st_dev, published.st_ino) != (
+            verified_work.st_dev,
+            verified_work.st_ino,
+        ):
+            _rollback_published_directory(
+                parent_fd,
+                config.output_root.name,
+                _WORK_DIRECTORY_NAME,
+                published_fd,
+            )
+            raise ValueError("published output root path identity changed")
+        try:
+            os.fsync(parent_fd)
+            _assert_named_directory_identity(
+                parent_fd,
+                config.output_root.name,
+                work_fd,
+                label="published output root",
+            )
+        except BaseException:
+            _rollback_published_directory(
+                parent_fd,
+                config.output_root.name,
+                _WORK_DIRECTORY_NAME,
+                published_fd,
+            )
+            raise
+    finally:
+        os.close(published_fd)
     return config.output_root
+
+
+def _unlink_verified_member(
+    work_fd: int,
+    name: str,
+    member_fd: int,
+    verified: _VerifiedDirectory,
+) -> None:
+    """Unlink only the inode held by ``member_fd`` from a randomized name."""
+
+    _assert_conversion_file_identity(work_fd, name, member_fd)
+    tombstone = f".{name}.delete-{secrets.token_hex(16)}"
+    _exclusive_name_rename(work_fd, name, work_fd, tombstone)
+    try:
+        _assert_conversion_file_identity(work_fd, tombstone, member_fd)
+    except BaseException:
+        try:
+            _exclusive_name_rename(work_fd, tombstone, work_fd, name)
+        except BaseException as rollback_error:
+            raise ValueError(
+                "verified member substitution rollback failed"
+            ) from rollback_error
+        raise ValueError(f"conversion file {name} identity changed before deletion")
+    verified.remove(name)
+    _assert_conversion_file_identity(work_fd, tombstone, member_fd)
+    os.unlink(tombstone, dir_fd=work_fd)
+    if os.fstat(member_fd).st_nlink != 0:
+        raise ValueError(f"conversion file {name} was not the inode deleted")
 
 
 def _validate_pilot_report(
@@ -3937,8 +4126,12 @@ def finalize_hy3_expert_q2(config: ConversionConfig) -> Path:
             allow_journal=True,
         )
         _assert_conversion_file_identity(work_fd, _JOURNAL_FILE, journal_fd)
-        verified.remove(_JOURNAL_FILE)
-        os.unlink(_JOURNAL_FILE, dir_fd=work_fd)
+        _unlink_verified_member(
+            work_fd,
+            _JOURNAL_FILE,
+            journal_fd,
+            verified,
+        )
         os.fsync(work_fd)
         verified.assert_unchanged(work_fd)
         return _publish_verified_work(config, context, work_fd, verified)
