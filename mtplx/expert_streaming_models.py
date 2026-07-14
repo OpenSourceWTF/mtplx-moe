@@ -250,6 +250,60 @@ HY3_Q4 = ExpertStreamingModelSpec(
 )
 
 
+HY3_EXPERT_ONLY_Q4 = ExpertStreamingModelSpec(
+    key="hy3-expert-only-q4",
+    display_name="Local Tencent Hy3 expert-only affine Q4 control",
+    source_model="tencent/Hy3",
+    source_revision="716aa7241bd6d95896be4ebfc761162a9c4d49ef",
+    quant_model="local/hy3-expert-only-mlx-q4",
+    quant_revision="716aa7241bd6d95896be4ebfc761162a9c4d49ef",
+    total_tensor_bytes=178_530_397_440,
+    total_layers=80,
+    routed_layer_start=1,
+    routed_layer_count=79,
+    expert_count=192,
+    top_k=8,
+    hidden_size=4096,
+    expert_hidden_size=1536,
+    quant_bits=4,
+    quant_group_size=64,
+    quant_parameter_bytes=2,
+    router_storage="affine-q8 with fp32 correction bias",
+    router_matmul_dtype="float32",
+    router_bytes=66_071_808,
+    kv_bytes_per_token=327_680,
+    mtp_layer_index=80,
+    mtp_included=False,
+)
+
+
+HY3_EXPERT_Q2 = ExpertStreamingModelSpec(
+    key="hy3-expert-q2",
+    display_name="Experimental Tencent Hy3 expert-only affine Q2",
+    source_model="tencent/Hy3",
+    source_revision="716aa7241bd6d95896be4ebfc761162a9c4d49ef",
+    quant_model="local/hy3-expert-only-mlx-q4",
+    quant_revision="716aa7241bd6d95896be4ebfc761162a9c4d49ef",
+    total_tensor_bytes=106_958_793_984,
+    total_layers=80,
+    routed_layer_start=1,
+    routed_layer_count=79,
+    expert_count=192,
+    top_k=8,
+    hidden_size=4096,
+    expert_hidden_size=1536,
+    quant_bits=2,
+    quant_group_size=64,
+    quant_parameter_bytes=2,
+    router_storage="affine-q8 with fp32 correction bias",
+    router_matmul_dtype="float32",
+    router_bytes=66_071_808,
+    kv_bytes_per_token=327_680,
+    mtp_layer_index=80,
+    mtp_included=False,
+)
+
+
 GLM52_Q4 = ExpertStreamingModelSpec(
     key="glm52-q4",
     display_name="GLM-5.2 affine Q4",
@@ -279,7 +333,7 @@ GLM52_Q4 = ExpertStreamingModelSpec(
 
 
 MODEL_SPECS: dict[str, ExpertStreamingModelSpec] = {
-    spec.key: spec for spec in (HY3_Q4, GLM52_Q4)
+    spec.key: spec for spec in (HY3_Q4, HY3_EXPERT_ONLY_Q4, HY3_EXPERT_Q2, GLM52_Q4)
 }
 
 

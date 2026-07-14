@@ -4,12 +4,13 @@ import json
 import os
 import subprocess
 import sys
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
 
 from mtplx.expert_streaming_models import (
+    HY3_Q4,
     MODEL_SPECS,
     get_model_spec,
     plan_expert_memory,
@@ -52,6 +53,76 @@ def test_hy3_q4_exact_expert_layout() -> None:
     assert spec.mtp_layer_index == 80
     assert spec.mtp_included is False
     assert spec.full_indexer_layers == ()
+
+
+def test_hy3_expert_only_q4_control_exact_layout() -> None:
+    q4 = get_model_spec("hy3-expert-only-q4")
+
+    assert q4.quant_model == "local/hy3-expert-only-mlx-q4"
+    assert q4.quant_revision == "716aa7241bd6d95896be4ebfc761162a9c4d49ef"
+    assert q4.quant_bits == 4
+    assert q4.expert_record_bytes == 10_616_832
+    assert q4.routed_expert_bytes == 161_036_107_776
+    assert q4.resident_bytes == 17_494_289_664
+    assert q4.total_tensor_bytes == 178_530_397_440
+
+    cache = 83_034_243_072
+    assert cache // q4.expert_record_bytes == 7_821
+
+
+def test_hy3_expert_q2_exact_layout() -> None:
+    q2 = get_model_spec("hy3-expert-q2")
+
+    assert q2.source_model == "tencent/Hy3"
+    assert q2.source_revision == "716aa7241bd6d95896be4ebfc761162a9c4d49ef"
+    assert q2.quant_model == "local/hy3-expert-only-mlx-q4"
+    assert q2.quant_revision == "716aa7241bd6d95896be4ebfc761162a9c4d49ef"
+    assert q2.quant_bits == 2
+    assert q2.expert_record_bytes == 5_898_240
+    assert q2.routed_expert_bytes == 89_464_504_320
+    assert q2.resident_bytes == 17_494_289_664
+    assert q2.total_tensor_bytes == 106_958_793_984
+    assert q2.mtp_included is False
+
+    cache = 83_034_243_072
+    assert cache // q2.expert_record_bytes == 14_077
+
+
+def test_hy3_q4_is_unchanged_by_hy3_expert_q2_registry_expansion() -> None:
+    expected = {
+        "key": "hy3-q4",
+        "display_name": "Tencent Hy3 affine Q4",
+        "source_model": "tencent/Hy3",
+        "source_revision": "716aa7241bd6d95896be4ebfc761162a9c4d49ef",
+        "quant_model": "pipenetwork/Hy3-4bit",
+        "quant_revision": "160619d3f96c8470350b6dac0ef033a8381551e3",
+        "total_tensor_bytes": 165_988_461_824,
+        "total_layers": 80,
+        "routed_layer_start": 1,
+        "routed_layer_count": 79,
+        "expert_count": 192,
+        "top_k": 8,
+        "hidden_size": 4096,
+        "expert_hidden_size": 1536,
+        "quant_bits": 4,
+        "quant_group_size": 64,
+        "quant_parameter_bytes": 2,
+        "router_storage": "affine-q8 with fp32 correction bias",
+        "router_matmul_dtype": "float32",
+        "router_bytes": 66_071_808,
+        "kv_bytes_per_token": 327_680,
+        "mtp_layer_index": 80,
+        "mtp_included": False,
+        "full_indexer_layers": (),
+    }
+    before = asdict(HY3_Q4)
+
+    get_model_spec("hy3-expert-only-q4")
+    get_model_spec("hy3-expert-q2")
+
+    assert before == expected
+    assert asdict(HY3_Q4) == expected
+    assert MODEL_SPECS["hy3-q4"] is HY3_Q4
 
 
 def test_glm52_q4_exact_expert_and_indexshare_layout() -> None:
