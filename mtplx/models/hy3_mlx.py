@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -19,6 +20,80 @@ from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
 
 from .expert_mlx import UnboundExpertSwitch, run_switch_with_shared_overlap
+
+
+FUSE_SHARED_GATE_UP_ENV = "MTPLX_FUSE_HY3_SHARED_GATE_UP_PROJECTIONS"
+_PACKABLE_LINEAR_SUFFIXES = ("weight", "scales", "biases", "bias")
+
+
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _projection_pack_plan(
+    weights: dict[str, mx.array],
+    *,
+    target: str,
+    sources: tuple[str, ...],
+    equal_output_widths: bool = False,
+) -> tuple[str, tuple[str, ...], tuple[str, ...]] | None:
+    """Validate one construction-time linear pack without allocating arrays."""
+
+    target_suffixes = {
+        suffix
+        for suffix in _PACKABLE_LINEAR_SUFFIXES
+        if f"{target}.{suffix}" in weights
+    }
+    source_suffixes = [
+        {
+            suffix
+            for suffix in _PACKABLE_LINEAR_SUFFIXES
+            if f"{source}.{suffix}" in weights
+        }
+        for source in sources
+    ]
+    has_sources = any(source_suffixes)
+    if target_suffixes and has_sources:
+        raise ValueError(f"packed projection target conflicts with sources: {target}")
+    if target_suffixes:
+        if "weight" not in target_suffixes:
+            raise ValueError(f"packed projection target has no weight: {target}")
+        return None
+    if not has_sources:
+        return None
+    if any(suffixes != source_suffixes[0] for suffixes in source_suffixes[1:]):
+        raise ValueError(f"incomplete packed projection source for {target}")
+    suffixes = source_suffixes[0]
+    if "weight" not in suffixes:
+        raise ValueError(f"incomplete packed projection source for {target}")
+    if ("scales" in suffixes) != ("biases" in suffixes):
+        raise ValueError(f"incomplete affine quantization source for {target}")
+    for suffix in suffixes:
+        arrays = [weights[f"{source}.{suffix}"] for source in sources]
+        tail_shapes = {tuple(array.shape[1:]) for array in arrays}
+        if len(tail_shapes) != 1:
+            raise ValueError(f"incompatible {suffix} shapes for {target}")
+        if equal_output_widths and len({int(array.shape[0]) for array in arrays}) != 1:
+            raise ValueError(f"incompatible output widths for {target}")
+    ordered_suffixes = tuple(
+        suffix for suffix in _PACKABLE_LINEAR_SUFFIXES if suffix in suffixes
+    )
+    return target, sources, ordered_suffixes
+
+
+def _pack_linear_projection(
+    weights: dict[str, mx.array],
+    plan: tuple[str, tuple[str, ...], tuple[str, ...]],
+) -> None:
+    """Materialize one packed linear and release each set of source arrays."""
+
+    target, sources, suffixes = plan
+    for suffix in suffixes:
+        arrays = [weights.pop(f"{source}.{suffix}") for source in sources]
+        packed = mx.concatenate(arrays, axis=0)
+        mx.eval(packed)
+        weights[f"{target}.{suffix}"] = packed
+        del arrays
 
 
 @dataclass
@@ -160,6 +235,28 @@ class MLP(nn.Module):
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
+class FusedSharedMLP(nn.Module):
+    """Sparse-layer shared MLP with one packed gate/up projection."""
+
+    def __init__(self, args: ModelArgs, *, intermediate_size: int):
+        super().__init__()
+        self._split_at = intermediate_size
+        self.gate_up_proj = nn.Linear(
+            args.hidden_size,
+            2 * intermediate_size,
+            bias=args.mlp_bias,
+        )
+        self.down_proj = nn.Linear(
+            intermediate_size,
+            args.hidden_size,
+            bias=args.mlp_bias,
+        )
+
+    def __call__(self, x: mx.array) -> mx.array:
+        gate, up = mx.split(self.gate_up_proj(x), [self._split_at], axis=-1)
+        return self.down_proj(swiglu(gate, up))
+
+
 def _router_storage_module(module: nn.Module) -> nn.Module:
     """Find the stored linear beneath instrumentation or adapter wrappers."""
 
@@ -212,13 +309,21 @@ class Router(nn.Module):
 
 
 class SparseMLP(nn.Module):
-    def __init__(self, args: ModelArgs, layer_index: int):
+    def __init__(
+        self,
+        args: ModelArgs,
+        layer_index: int,
+        *,
+        fuse_shared_gate_up: bool = False,
+    ):
         super().__init__()
         self.router = Router(args)
         self.switch_mlp = UnboundExpertSwitch(layer_index)
-        self.shared_mlp = MLP(
+        shared_width = args.moe_intermediate_size * args.num_shared_experts
+        shared_cls = FusedSharedMLP if fuse_shared_gate_up else MLP
+        self.shared_mlp = shared_cls(
             args,
-            intermediate_size=args.moe_intermediate_size * args.num_shared_experts,
+            intermediate_size=shared_width,
         )
         self.enable_moe_fp32_combine = args.enable_moe_fp32_combine
 
@@ -251,12 +356,19 @@ class DecoderLayer(nn.Module):
         layer_index: int,
         *,
         mlp_type: str | None = None,
+        fuse_shared_gate_up: bool = False,
     ):
         super().__init__()
         self.self_attn = Attention(args)
         resolved_mlp_type = mlp_type or args.mlp_layer_types[layer_index]
         self.mlp = (
-            SparseMLP(args, layer_index) if resolved_mlp_type == "sparse" else MLP(args)
+            SparseMLP(
+                args,
+                layer_index,
+                fuse_shared_gate_up=fuse_shared_gate_up,
+            )
+            if resolved_mlp_type == "sparse"
+            else MLP(args)
         )
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
@@ -350,11 +462,20 @@ class Hy3MTP(nn.Module):
 
 
 class Hy3Model(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(
+        self,
+        args: ModelArgs,
+        *,
+        fuse_shared_gate_up: bool = False,
+    ):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            DecoderLayer(args, layer_index)
+            DecoderLayer(
+                args,
+                layer_index,
+                fuse_shared_gate_up=fuse_shared_gate_up,
+            )
             for layer_index in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
@@ -383,7 +504,11 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = Hy3Model(args)
+        self._fuse_shared_gate_up = _env_enabled(FUSE_SHARED_GATE_UP_ENV)
+        self.model = Hy3Model(
+            args,
+            fuse_shared_gate_up=self._fuse_shared_gate_up,
+        )
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
@@ -405,6 +530,27 @@ class Model(nn.Module):
                 except ValueError:
                     pass
             result[key] = value
+        plans: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
+        if self._fuse_shared_gate_up:
+            for layer_index, mlp_type in enumerate(self.args.mlp_layer_types):
+                if mlp_type != "sparse":
+                    continue
+                base = f"model.layers.{layer_index}.mlp.shared_mlp"
+                plan = _projection_pack_plan(
+                    result,
+                    target=f"{base}.gate_up_proj",
+                    sources=(f"{base}.gate_proj", f"{base}.up_proj"),
+                    equal_output_widths=True,
+                )
+                if plan is not None:
+                    plans.append(plan)
+        if plans:
+            # The caller replaces its source mapping with this return value.
+            # Clearing it first lets each evaluated packed layer release its
+            # original arrays instead of retaining a second model-sized copy.
+            weights.clear()
+            for plan in plans:
+                _pack_linear_projection(result, plan)
         return result
 
     @property
