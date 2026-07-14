@@ -4,7 +4,6 @@ import hashlib
 import importlib.util
 import json
 from copy import deepcopy
-from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -38,6 +37,7 @@ def _load_script():
 
 def _artifact_identity(lane: str) -> dict:
     model_key = _MODEL_KEYS[lane]
+    model_spec = get_model_spec(model_key)
     manifest_sha256 = ("a" if lane == "q4" else "b") * 64
     sidecar_sha256 = ("c" if lane == "q4" else "d") * 64
     sidecar_bytes = 161_036_107_776 if lane == "q4" else 89_464_504_320
@@ -49,7 +49,7 @@ def _artifact_identity(lane: str) -> dict:
             "declared_manifest_sha256": ("e" if lane == "q4" else "f") * 64,
             "model_key": model_key,
             "source_revision": "716aa7241bd6d95896be4ebfc761162a9c4d49ef",
-            "source_repo": "tencent/Hy3",
+            "source_repo": model_spec.quant_model,
         },
         "expert_payload": {
             "method": "verified_sidecar_sha256",
@@ -128,10 +128,17 @@ def _memory_plan(lane: str) -> dict:
         cache_scope="global",
     )
     assert plan.persistent_slots == _CAPACITIES[lane]
-    payload = asdict(plan)
-    payload["fixed_bytes"] = plan.fixed_bytes
-    payload["allocated_bytes"] = plan.allocated_bytes
-    return payload
+    return {
+        "allocated_bytes": plan.allocated_bytes,
+        "cache_scope": plan.cache_scope,
+        "fixed_bytes": plan.fixed_bytes,
+        "global_persistent_slots": plan.persistent_slots,
+        "persistent_cache_bytes": plan.persistent_cache_bytes,
+        "slots_per_layer": plan.slots_per_layer,
+        "total_limit_bytes": plan.total_limit_bytes,
+        "transient_slots": plan.transient_slots,
+        "unallocated_bytes": plan.unallocated_bytes,
+    }
 
 
 def _telemetry(lane: str, position: int) -> dict:
@@ -319,8 +326,8 @@ def _payload(kind: str, position: int, lane: str, *, tps: float) -> dict:
             "integrity": {
                 "valid": True,
                 "model_key": model_key,
-                "checked_shards": 19,
-                "checked_records": 15_168,
+                "checked_shards": 52 if lane == "q4" else 19,
+                "checked_records": 0,
                 "sidecar_verified": False,
             },
             "memory_cap": {
@@ -485,6 +492,26 @@ def test_complete_campaign_is_comparable_but_resource_ineligible() -> None:
     assert summary["completion_tokens"] == {"expected": 512, "observed_runs": 12}
 
 
+def test_accepts_current_benchmark_memory_and_integrity_export_shape() -> None:
+    resource, headline, quality = _campaigns()
+
+    summary = summarize_hy3_q2_campaign(
+        resource,
+        headline,
+        quality_payload=quality,
+    )
+
+    schema_errors = [
+        error
+        for error in summary["errors"]
+        if "memory plan" in error
+        or "manifest integrity" in error
+        or "artifact source repository" in error
+    ]
+    assert schema_errors == []
+    assert summary["integrity_gate"]["passed"] is True
+
+
 @pytest.mark.parametrize(
     ("section", "field", "replacement"),
     (
@@ -592,12 +619,14 @@ def test_requires_exact_payload_counts_runs_and_orders(mutation: str) -> None:
 def test_requires_exact_global_cache_capacity(lane: str, capacity: int) -> None:
     resource, headline, quality = _campaigns()
     payload = next(item for item in resource if item["model_key"] == _MODEL_KEYS[lane])
-    payload["runs"][0]["streaming_after"]["memory_plan"]["persistent_slots"] = capacity
+    payload["runs"][0]["streaming_after"]["memory_plan"]["global_persistent_slots"] = (
+        capacity
+    )
 
     summary = summarize_hy3_q2_campaign(resource, headline, quality_payload=quality)
 
     assert summary["integrity_gate"]["passed"] is False
-    assert any("persistent_slots" in error for error in summary["errors"])
+    assert any("global_persistent_slots" in error for error in summary["errors"])
     assert summary["artifact_binding"]["passed"] is True
 
 

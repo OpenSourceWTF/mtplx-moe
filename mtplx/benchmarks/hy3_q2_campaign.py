@@ -8,7 +8,6 @@ import math
 import statistics
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import asdict
 from typing import Any
 
 from mtplx.expert_streaming_models import get_model_spec, plan_expert_memory
@@ -19,6 +18,7 @@ RESOURCE_ORDER = ("q4", "q2", "q2", "q4")
 HEADLINE_ORDER = ("q4", "q2", "q2", "q4", "q4", "q2", "q2", "q4")
 MODEL_KEYS = {"q4": "hy3-expert-only-q4", "q2": "hy3-expert-q2"}
 EXPECTED_CAPACITIES = {"q4": 7_821, "q2": 14_077}
+EXPECTED_CHECKED_SHARDS = {"q4": 52, "q2": 19}
 EXPECTED_RUNTIME = {
     "memory_limit_bytes": 112 * GIB,
     "max_live_kv_tokens": 18_888,
@@ -482,10 +482,17 @@ def _expected_plan(lane: str) -> dict[str, Any]:
         execution_workspace_bytes=EXPECTED_RUNTIME["execution_workspace_bytes"],
         cache_scope="global",
     )
-    payload = asdict(plan)
-    payload["fixed_bytes"] = plan.fixed_bytes
-    payload["allocated_bytes"] = plan.allocated_bytes
-    return payload
+    return {
+        "allocated_bytes": plan.allocated_bytes,
+        "cache_scope": plan.cache_scope,
+        "fixed_bytes": plan.fixed_bytes,
+        "global_persistent_slots": plan.persistent_slots,
+        "persistent_cache_bytes": plan.persistent_cache_bytes,
+        "slots_per_layer": plan.slots_per_layer,
+        "total_limit_bytes": plan.total_limit_bytes,
+        "transient_slots": plan.transient_slots,
+        "unallocated_bytes": plan.unallocated_bytes,
+    }
 
 
 def _validate_run_integrity(
@@ -498,22 +505,19 @@ def _validate_run_integrity(
         after = _mapping(run.get("streaming_after"))
         plan = _mapping(after.get("memory_plan"))
         expected = _expected_plan(lane)
+        if set(plan) != set(expected):
+            errors.append(f"{label} memory plan schema mismatch")
         for field, value in expected.items():
             _append_expected(
                 errors, f"{label} memory plan {field}", plan.get(field), value
             )
-        _append_expected(
-            errors,
-            f"{label} persistent_slots",
-            plan.get("persistent_slots"),
-            EXPECTED_CAPACITIES[lane],
-        )
         integrity = _mapping(after.get("integrity"))
         for field, value in (
             ("valid", True),
             ("model_key", MODEL_KEYS[lane]),
-            ("checked_shards", 19),
-            ("checked_records", 15_168),
+            ("checked_shards", EXPECTED_CHECKED_SHARDS[lane]),
+            ("checked_records", 0),
+            ("sidecar_verified", False),
         ):
             _append_expected(
                 errors,
@@ -788,7 +792,7 @@ def _validate_artifact_binding(
             errors,
             f"{label} artifact source repository",
             manifest.get("source_repo"),
-            spec.source_model,
+            spec.quant_model,
         )
         _append_expected(
             errors,
