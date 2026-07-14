@@ -54,6 +54,8 @@ def _load_bound_child(
     base_dir: Path,
     seen_paths: set[Path],
     expected_arm: str,
+    depths: Sequence[int],
+    resource_telemetry: bool = False,
 ) -> tuple[Path, dict[CampaignCell, dict[str, float]]]:
     raw_path = entry.get("path")
     if not isinstance(raw_path, str) or not raw_path:
@@ -81,7 +83,39 @@ def _load_bound_child(
         payload = json.load(handle)
     if not isinstance(payload, dict):
         raise ValueError(f"artifact payload is not an object: {raw_path}")
-    return path, validate_a1_child(payload, arm=expected_arm)
+    configuration = _mapping(
+        payload.get("configuration"), context="child configuration"
+    )
+    expected_lane = (
+        "diagnostic-resource-instrumented"
+        if resource_telemetry
+        else "headline-uninstrumented"
+    )
+    if configuration.get("measurement_lane") != expected_lane:
+        raise ValueError(f"artifact measurement lane disagrees for {raw_path}")
+    return path, validate_a1_child(payload, arm=expected_arm, depths=depths)
+
+
+def _within_candidate_statistics(
+    metrics_rows: Sequence[Mapping[CampaignCell, Mapping[str, float]]],
+    *,
+    context_tokens: int,
+    depth: int,
+    metric: str,
+) -> dict[str, Any]:
+    paired_rows = []
+    for metrics in metrics_rows:
+        control = metrics[CampaignCell(context_tokens, 0)][metric]
+        candidate = metrics[CampaignCell(context_tokens, depth)][metric]
+        paired_rows.append(
+            {
+                "control_decode_tok_s": control,
+                "candidate_decode_tok_s": candidate,
+                "control_end_to_end_tok_s": control,
+                "candidate_end_to_end_tok_s": candidate,
+            }
+        )
+    return paired_decode_statistics(paired_rows)
 
 
 def _scheduled_run(value: Mapping[str, Any], *, context: str) -> ScheduledRun:
@@ -110,13 +144,23 @@ def summarize_a1_index(index: Mapping[str, Any], *, base_dir: Path) -> dict[str,
     configuration = _mapping(campaign.get("configuration"), context="configuration")
     if configuration.get("contexts") != [1024, 2048]:
         raise ValueError("campaign contexts must be exactly [1024, 2048]")
-    if configuration.get("depths") != [1, 2]:
-        raise ValueError("campaign depths must be exactly [1, 2]")
+    raw_depths = configuration.get("depths")
+    if raw_depths not in ([1], [2]):
+        raise ValueError("campaign must run exactly one depth: [1] or [2]")
+    depths = tuple(raw_depths)
+    depth = depths[0]
     if configuration.get("output_tokens") != 128:
         raise ValueError("campaign output token count must be exactly 128")
     retained_pairs = configuration.get("retained_pairs")
     if isinstance(retained_pairs, bool) or not isinstance(retained_pairs, int):
         raise ValueError("campaign retained_pairs must be an integer")
+    diagnostic_repeats = configuration.get("diagnostic_repeats")
+    if (
+        isinstance(diagnostic_repeats, bool)
+        or not isinstance(diagnostic_repeats, int)
+        or diagnostic_repeats < 2
+    ):
+        raise ValueError("campaign diagnostic_repeats must be at least two")
 
     seen_paths: set[Path] = set()
     qualifications = _sequence(campaign.get("qualifications"), context="qualifications")
@@ -130,10 +174,12 @@ def summarize_a1_index(index: Mapping[str, Any], *, base_dir: Path) -> dict[str,
             base_dir=root,
             seen_paths=seen_paths,
             expected_arm=arm,
+            depths=depths,
         )
         qualified.append(arm)
 
     comparisons_summary = []
+    compiled_metrics_rows: list[dict[CampaignCell, dict[str, float]]] = []
     comparisons = _sequence(campaign.get("comparisons"), context="comparisons")
     if not comparisons:
         raise ValueError("A1 campaign has no performance comparisons")
@@ -188,11 +234,18 @@ def summarize_a1_index(index: Mapping[str, Any], *, base_dir: Path) -> dict[str,
                 base_dir=root,
                 seen_paths=seen_paths,
                 expected_arm=row.arm,
+                depths=depths,
             )
             metrics_by_index[row.index] = metrics
+            if row.arm == "capture-compiled":
+                compiled_metrics_rows.append(metrics)
 
         cell_summaries = []
-        cells = sorted(next(iter(metrics_by_index.values())))
+        cells = [
+            cell
+            for cell in sorted(next(iter(metrics_by_index.values())))
+            if cell.depth == depth
+        ]
         for cell in cells:
             paired_rows = []
             for control_row, candidate_row in pairs:
@@ -236,10 +289,80 @@ def summarize_a1_index(index: Mapping[str, Any], *, base_dir: Path) -> dict[str,
                 },
             }
         )
+    if len(compiled_metrics_rows) < retained_pairs:
+        raise ValueError("A1 campaign lacks repeated capture-compiled rows")
+
+    diagnostics = _sequence(campaign.get("diagnostics"), context="diagnostics")
+    if len(diagnostics) != diagnostic_repeats:
+        raise ValueError("A1 diagnostics do not match diagnostic_repeats")
+    diagnostic_metrics_rows = []
+    for index, raw_entry in enumerate(diagnostics):
+        entry = _mapping(raw_entry, context=f"diagnostic {index}")
+        _path, metrics = _load_bound_child(
+            entry,
+            base_dir=root,
+            seen_paths=seen_paths,
+            expected_arm="capture-compiled",
+            depths=depths,
+            resource_telemetry=True,
+        )
+        diagnostic_metrics_rows.append(metrics)
+
+    next_k_contexts = []
+    for context_tokens in (1024, 2048):
+        speed_stats = _within_candidate_statistics(
+            compiled_metrics_rows,
+            context_tokens=context_tokens,
+            depth=depth,
+            metric="decode_tok_s",
+        )
+        utilization_stats = _within_candidate_statistics(
+            diagnostic_metrics_rows,
+            context_tokens=context_tokens,
+            depth=depth,
+            metric="mean_active_readers",
+        )
+        next_k_contexts.append(
+            {
+                "context_tokens": context_tokens,
+                "depth": depth,
+                "speed": {
+                    "statistics": speed_stats,
+                    "decision": decide_performance(speed_stats, default_threshold=0.0),
+                },
+                "utilization": {
+                    "statistics": utilization_stats,
+                    "decision": decide_performance(
+                        utilization_stats, default_threshold=0.0
+                    ),
+                },
+            }
+        )
+    advance_to_k2 = depth == 1 and all(
+        row["speed"]["decision"]["promote"]
+        and row["utilization"]["decision"]["promote"]
+        for row in next_k_contexts
+    )
+    next_k_gate = {
+        "tested_depth": depth,
+        "max_depth": 2,
+        "contexts": next_k_contexts,
+        "advance_to_k2": advance_to_k2,
+        "reason": (
+            "K=1 speed and utilization intervals are positive at both contexts"
+            if advance_to_k2
+            else (
+                "K=2 is the maximum authorized depth"
+                if depth == 2
+                else "K=1 failed speed or utilization at one or more contexts"
+            )
+        ),
+    }
     return {
-        "schema": "mtplx-issue51-a1-summary-v1",
+        "schema": "mtplx-issue51-a1-summary-v2",
         "qualification": {"passed": True, "candidates": qualified},
         "comparisons": comparisons_summary,
+        "next_k_gate": next_k_gate,
     }
 
 
@@ -247,7 +370,7 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
     lines = [
         "## A1 correctness",
         "",
-        "Passed: all four process-isolated candidates qualified on 1024/2048 x D1/D2 with 128 output tokens.",
+        "Passed: all four process-isolated candidates qualified on 1024/2048 with 128 output tokens.",
         "",
         "Candidates: " + ", ".join(summary["qualification"]["candidates"]),
         "",
@@ -271,6 +394,15 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
                 f"(95% CI {interval[0] * 100:.2f}% to {interval[1] * 100:.2f}%); "
                 f"end-to-end CI {end_to_end[0] * 100:.2f}% to {end_to_end[1] * 100:.2f}%"
             )
+    gate = summary["next_k_gate"]
+    lines.extend(
+        [
+            "",
+            "## Next-K advancement",
+            "",
+            f"K=2 gate: {'GO' if gate['advance_to_k2'] else 'NO-GO'} — {gate['reason']}",
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 

@@ -87,6 +87,7 @@ class _FakeRuntime:
 
     def expert_resource_telemetry_snapshot(self):
         self.telemetry_reads += 1
+        observation_ns = 1_000_000_000 * self.telemetry_reads
         return {
             "cache": {
                 "expert_bytes_read": 4096 * self.telemetry_reads,
@@ -95,7 +96,14 @@ class _FakeRuntime:
             "cache_by_phase": {
                 "decode": {"expert_bytes_read": 4096 * self.telemetry_reads}
             },
-            "reader": {"active_reads": 0, "peak_active_reads": 2},
+            "reader_pool": {
+                "worker_capacity": 32,
+                "observation_ns": observation_ns,
+                "active_work_ns": 4 * observation_ns,
+                "queued_work_ns": observation_ns // 2,
+                "active_work_peak": 8,
+                "queued_work_peak": 2,
+            },
             "expert_pipeline": {"completion_fences": 3 * self.telemetry_reads},
             "mlx_memory": {"active_memory_bytes": 1024},
         }
@@ -265,6 +273,9 @@ def _fake_apis(
 
     def generate_ar(runtime, prompt_ids, **kwargs):
         calls.ar.append((runtime, tuple(prompt_ids), kwargs))
+        prefill_callback = kwargs.get("prefill_callback")
+        if prefill_callback is not None:
+            prefill_callback({"phase": "completed"})
         count = output_tokens if kwargs["max_tokens"] == 128 else kwargs["max_tokens"]
         tokens = [index % 97 for index in range(count)]
         return SimpleNamespace(
@@ -275,6 +286,9 @@ def _fake_apis(
 
     def generate_mtpk(runtime, prompt_ids, **kwargs):
         calls.mtpk.append((runtime, tuple(prompt_ids), kwargs))
+        prefill_callback = kwargs.get("prefill_callback")
+        if prefill_callback is not None:
+            prefill_callback({"phase": "completed"})
         depth = kwargs["speculative_depth"]
         count = output_tokens if kwargs["max_tokens"] == 128 else kwargs["max_tokens"]
         tokens = [index % 97 for index in range(count)]
@@ -1404,16 +1418,31 @@ def test_rows_recompute_ingestion_decode_and_acceptance_metrics(tmp_path: Path) 
     )
     telemetry = depth_two["expert_resource_telemetry"]
     assert telemetry["numeric_delta"] == {
-        "cache": {"expert_bytes_read": 4096, "read_operations": 2},
-        "cache_by_phase": {"decode": {"expert_bytes_read": 4096}},
-        "reader": {"active_reads": 0, "peak_active_reads": 0},
-        "expert_pipeline": {"completion_fences": 3},
+        "cache": {"expert_bytes_read": 8192, "read_operations": 4},
+        "cache_by_phase": {"decode": {"expert_bytes_read": 8192}},
+        "reader_pool": {
+            "worker_capacity": 0,
+            "observation_ns": 2_000_000_000,
+            "active_work_ns": 8_000_000_000,
+            "queued_work_ns": 1_000_000_000,
+            "active_work_peak": 0,
+            "queued_work_peak": 0,
+        },
+        "expert_pipeline": {"completion_fences": 6},
         "mlx_memory": {"active_memory_bytes": 0},
     }
     assert (
         telemetry["after"]["cache"]["expert_bytes_read"]
         > telemetry["before"]["cache"]["expert_bytes_read"]
     )
+    assert telemetry["decode"]["reader_pool"] == {
+        "worker_capacity": 32,
+        "elapsed_seconds": 1.0,
+        "mean_active_readers": 4.0,
+        "active_capacity_fraction": 0.125,
+        "mean_queued_reads": 0.5,
+    }
+    assert all("prefill_callback" in kwargs for *_rest, kwargs in calls.ar + calls.mtpk)
     assert depth_two["accepted_drafts"] == 85
     assert depth_two["evaluated_drafts"] == 85
     assert depth_two["drafted_tokens"] == 85

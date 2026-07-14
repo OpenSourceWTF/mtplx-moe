@@ -27,14 +27,7 @@ A1_PROCESS_CONFIG = {
     "capture-compiled-parity": ("parity", "capture_commit"),
     "capture-compiled": ("on", "capture_commit"),
 }
-EXPECTED_A1_CELLS = frozenset(
-    {
-        (1024, 1),
-        (1024, 2),
-        (2048, 1),
-        (2048, 2),
-    }
-)
+A1_ALLOWED_DEPTHS = frozenset({1, 2})
 REQUIRED_A1_GATES = frozenset(
     {
         "prompt_length_exact",
@@ -177,13 +170,91 @@ def _validate_compiled_evidence(row: Mapping[str, Any], *, arm: str) -> None:
         raise ValueError("compiled verifier evidence mode disagrees with candidate")
 
 
+def _mean_active_readers(
+    row: Mapping[str, Any], *, observation_index: int
+) -> float | None:
+    resource = row.get("expert_resource_telemetry")
+    if resource is None:
+        return None
+    reader_pool = _mapping(
+        _mapping(
+            _mapping(resource, context="resource telemetry").get("decode"),
+            context="decode resource telemetry",
+        ).get("reader_pool"),
+        context="decode reader_pool telemetry",
+    )
+    _exact_int(
+        reader_pool.get("worker_capacity"),
+        expected=32,
+        context=f"observation {observation_index} reader worker capacity",
+    )
+    return _finite_positive(
+        reader_pool.get("mean_active_readers"),
+        context=f"observation {observation_index} mean active readers",
+    )
+
+
+def _validate_terminal_mtp_cache_contract(
+    contract: Mapping[str, Any], *, context_tokens: int, observation_index: int
+) -> None:
+    if contract.get("safe_to_commit") is not True:
+        raise ValueError(
+            f"observation {observation_index} final-state contract is unsafe"
+        )
+    if contract.get("generated_token_ids_match") is not True:
+        raise ValueError(
+            f"observation {observation_index} generated token IDs do not match"
+        )
+    if contract.get("finish_reason_match") is not True:
+        raise ValueError(
+            f"observation {observation_index} finish reason does not match"
+        )
+    _exact_int(
+        contract.get("prompt_mtp_history_tokens"),
+        expected=context_tokens - 1,
+        context=f"observation {observation_index} prompt MTP history",
+    )
+    _exact_int(
+        contract.get("mtp_history_position_base"),
+        expected=0,
+        context=f"observation {observation_index} MTP history position base",
+    )
+
+    def exact_offsets(field: str, *, expected: int, label: str) -> None:
+        offsets = _sequence(
+            contract.get(field), context=f"observation {observation_index} {label}"
+        )
+        if not offsets:
+            raise ValueError(f"observation {observation_index} {label} is empty")
+        for offset in offsets:
+            _exact_int(
+                offset,
+                expected=expected,
+                context=f"observation {observation_index} {label}",
+            )
+
+    exact_offsets(
+        "target_cache_offsets",
+        expected=context_tokens + 128,
+        label="target cache offsets",
+    )
+    exact_offsets(
+        "committed_mtp_cache_offsets",
+        expected=context_tokens + 127,
+        label="committed MTP cache offsets",
+    )
+
+
 def validate_a1_child(
-    payload: Mapping[str, Any], *, arm: str
+    payload: Mapping[str, Any], *, arm: str, depths: Sequence[int] = (1,)
 ) -> dict[CampaignCell, dict[str, float]]:
     """Validate one process-isolated A1 artifact and return its fixed-cell metrics."""
 
     if arm not in A1_PROCESS_CONFIG:
         raise ValueError(f"unsupported A1 candidate arm: {arm!r}")
+    expected_depths = tuple(depths)
+    if len(expected_depths) != 1 or expected_depths[0] not in A1_ALLOWED_DEPTHS:
+        raise ValueError("A1 validation requires exactly one depth, K=1 or K=2")
     root = _mapping(payload, context="A1 child payload")
     if root.get("schema") != "mtplx-q2-bf16-mtp-depth-matrix-v3":
         raise ValueError("A1 child has the wrong depth-matrix schema")
@@ -213,8 +284,8 @@ def validate_a1_child(
     model = _mapping(models[0], context="Hy3 model")
     if model.get("model") != "hy3-q2" or model.get("model_key") != "hy3-expert-q2":
         raise ValueError("A1 child must contain only hy3-expert-q2")
-    if model.get("depths") != [1, 2]:
-        raise ValueError("A1 child depths must be exactly [1, 2]")
+    if model.get("depths") != list(expected_depths):
+        raise ValueError(f"A1 child depths must be exactly {list(expected_depths)}")
     if model.get("passed") is not True:
         raise ValueError("A1 Hy3 model must be passed")
 
@@ -223,7 +294,7 @@ def validate_a1_child(
     for index, value in enumerate(observations):
         row = _mapping(value, context=f"observation {index}")
         depth = row.get("requested_depth")
-        if depth not in {1, 2}:
+        if depth not in {0, *expected_depths}:
             continue
         context_tokens = row.get("context_tokens")
         if isinstance(context_tokens, bool) or not isinstance(context_tokens, int):
@@ -237,6 +308,22 @@ def validate_a1_child(
             context=f"observation {index} output token count",
         )
         gates = _mapping(row.get("gates"), context=f"observation {index} gates")
+        if depth == 0:
+            if gates.get("output_tokens_exact") is not True:
+                raise ValueError(f"observation {index} AR output gate failed")
+            cells[cell] = {
+                "decode_tok_s": _finite_positive(
+                    row.get("decode_tok_s"), context=f"observation {index} decode TPS"
+                ),
+                "end_to_end_tok_s": _finite_positive(
+                    row.get("end_to_end_tok_s"),
+                    context=f"observation {index} end-to-end TPS",
+                ),
+            }
+            mean_active_readers = _mean_active_readers(row, observation_index=index)
+            if mean_active_readers is not None:
+                cells[cell]["mean_active_readers"] = mean_active_readers
+            continue
         missing = sorted(REQUIRED_A1_GATES.difference(gates))
         if missing:
             raise ValueError(
@@ -253,8 +340,11 @@ def validate_a1_child(
             row.get("final_state_contract"),
             context=f"observation {index} final-state contract",
         )
-        if final_state.get("safe_to_commit") is not True:
-            raise ValueError(f"observation {index} final-state contract is unsafe")
+        _validate_terminal_mtp_cache_contract(
+            final_state,
+            context_tokens=context_tokens,
+            observation_index=index,
+        )
         _validate_compiled_evidence(row, arm=arm)
         cells[cell] = {
             "decode_tok_s": _finite_positive(
@@ -265,10 +355,17 @@ def validate_a1_child(
                 context=f"observation {index} end-to-end TPS",
             ),
         }
+        mean_active_readers = _mean_active_readers(row, observation_index=index)
+        if mean_active_readers is not None:
+            cells[cell]["mean_active_readers"] = mean_active_readers
     observed = {(cell.context_tokens, cell.depth) for cell in cells}
-    if observed != EXPECTED_A1_CELLS:
+    expected_cells = {
+        (context, depth) for context in (1024, 2048) for depth in (0, *expected_depths)
+    }
+    if observed != expected_cells:
         raise ValueError(
-            "A1 child retained matrix must contain exactly 1024/2048 x D1/D2"
+            "A1 child retained matrix must contain exactly 1024/2048 x "
+            f"K=0/K={expected_depths[0]}"
         )
     return cells
 

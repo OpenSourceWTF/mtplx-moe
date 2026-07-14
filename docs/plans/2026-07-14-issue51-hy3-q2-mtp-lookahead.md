@@ -7,19 +7,19 @@
 > decision, and `superpowers-optimized:verification-before-completion` before
 > any completion claim. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Determine, in priority order, whether compiled whole-window
-verification, MTP-derived hint-only expert prediction, and Q2 NAX/grouped
-expert execution can improve correctness-qualified Hy3 expert-Q2 decoding at
-1,024/2,048 input tokens and exactly 128 output tokens.
+**Goal:** Build and gate three related but independently attributable tracks:
+Next-K speculative execution, the persistent MTP cache/commit lifecycle, and
+Q2 inner-product/NAX execution for Hy3 at 1,024/2,048 input tokens and exactly
+128 output tokens.
 
 **Architecture:** Extend the corrected Q2 depth-matrix runner with an explicit,
-fail-closed candidate contract while preserving its current defaults. Run the
-compiled verifier first. Then add diagnostic-only draft-hidden and target-route
-evidence for an offline predictor study. Finally, reuse those target traces to
-measure G1/G2/G3 grouping and real Q2 operator headroom; NAX remains the third
-priority and receives no production kernel unless the measured model-wide
-lower bound clears the existing five-percent gate. Every candidate is measured
-separately before combinations.
+fail-closed candidate contract while preserving its current defaults. Run K=1
+against K=0 first in separate headline-speed and diagnostic-utilization lanes;
+K=2 requires a passing K=1 summary, and K>=3 is rejected. Every row verifies
+the persistent MTP cache, committed history, capture/rollback/commit, terminal
+offsets, and safe resume state. Reuse retained traces for predictive-cache and
+Q2 operator evidence; NAX remains third priority and receives no production
+kernel unless measured headroom clears the gate.
 
 **Tech Stack:** Python 3.12, MLX 0.31.x, mlx-lm, pytest, Ruff, JSON/JSONL,
 existing `CompiledVerifyBank`, existing streamed Hy3 component-bank experts,
@@ -37,9 +37,9 @@ existing Qwen exclusive-window guard, and authenticated `gh` for Issue #51.
 - The target remains `hy3-expert-q2` with affine Q2 group-size 64 streamed
   experts and a resident BF16 layer-80 MTP head — this plan will NOT
   re-quantize the target trunk or MTP head.
-- The fixed matrix is 1,024/2,048 input, exactly 128 output, greedy sampling,
-  and D1/D2; K=0 is added only as the NAX single-row control — no deeper MTP
-  result is a promotion gate.
+- The fixed contexts are 1,024/2,048 input and exactly 128 output with greedy
+  sampling. K=0 is the one-row control, K=1 is measured first, K=2 is
+  conditional, and K>=3 is out of scope.
 - Qwen remains loaded during code/test preparation and is unloaded only by
   `scripts/run_with_qwen_stopped.py` around an exclusive hardware campaign —
   unit tests will NOT import or allocate the real model.
@@ -53,9 +53,9 @@ existing Qwen exclusive-window guard, and authenticated `gh` for Issue #51.
 
 | Priority | Test | Entry gate | Terminal outcomes |
 |---:|---|---|---|
-| 1 | Compiled whole-window verifier | v3 prerequisite integrated | promote experimental arm, or retain no-go evidence |
-| 2 | MTP hint-only predictive loading | compiled verifier has its own decision | offline no-go, or guarded runtime pilot |
-| 3 | Q2 NAX and G1/G2/G3 grouping | predictor has its own decision | premise no-go, or guarded Q2 kernel prototype |
+| 1 | K=1 compiled Next-K plus MTP cache lifecycle | v3 prerequisite integrated | authorize K=2, or retain no-go evidence |
+| 2 | MTP cache/predictive loading | K=1 has its own decision | offline no-go, or guarded runtime pilot |
+| 3 | Q2 inner-product/NAX and grouping | cache track has its own decision | premise no-go, or guarded Q2 kernel prototype |
 
 The next priority may begin after the prior test has a recorded decision; it
 does not require the prior candidate to win.
@@ -405,7 +405,7 @@ git commit -m "feat(bench): orchestrate issue 51 verifier campaign"
 
 ---
 
-### Task 4: Run A1 qualification and performance on the exclusive lane
+### Task 4: Run K=1 qualification, speed, and utilization on the exclusive lane
 
 **Files:**
 
@@ -436,10 +436,11 @@ curl -fsS http://127.0.0.1:8080/v1/models
   -- \
   .venv/bin/python scripts/run_issue51_hy3_q2.py a1 \
   --contexts 1024,2048 \
-  --depths 1,2 \
+  --depths 1 \
   --output-tokens 128 \
   --retained-pairs 8 \
-  --output-dir benchmarks/raw/issue51/2026-07-14-a1
+  --diagnostic-repeats 4 \
+  --output-dir benchmarks/raw/issue51/2026-07-14-k1
 ```
 
 Expected: the wrapper restores the exact captured Qwen model on every exit;
@@ -451,14 +452,32 @@ stops that candidate.
 ```bash
 curl -fsS http://127.0.0.1:8080/v1/models
 .venv/bin/python scripts/summarize_issue51_hy3_q2.py \
-  --input benchmarks/raw/issue51/2026-07-14-a1/index.json \
-  --output-json benchmarks/raw/issue51/2026-07-14-a1/summary.json
+  --input benchmarks/raw/issue51/2026-07-14-k1/index.json \
+  --output-json benchmarks/raw/issue51/2026-07-14-k1/summary.json
 ```
 
-- [ ] **Step 4: record the A1 decision before starting priority 2**
+- [ ] **Step 4: record the K=1 decision**
 
 Post the exact candidate, commit, matrix, fallback/parity result, paired decode
-interval, and go/no-go to Issue #51. A1 is complete even when rejected.
+interval, active-reader interval, and go/no-go to Issue #51. K=1 is complete
+even when rejected.
+
+- [ ] **Step 5: run K=2 only when the K=1 summary authorizes it**
+
+```bash
+.venv/bin/python scripts/run_with_qwen_stopped.py \
+  --plist "$HOME/Library/LaunchAgents/com.tea.qwen.plist" \
+  --lock-timeout-seconds 1800 \
+  -- \
+  .venv/bin/python scripts/run_issue51_hy3_q2.py a1 \
+  --contexts 1024,2048 --depths 2 --output-tokens 128 \
+  --retained-pairs 8 --diagnostic-repeats 4 \
+  --k1-summary benchmarks/raw/issue51/2026-07-14-k1/summary.json \
+  --output-dir benchmarks/raw/issue51/2026-07-14-k2
+```
+
+Expected: the runner refuses K=2 when the K=1 summary is missing, malformed,
+or reports a non-positive speed/utilization gate. No K=3 command exists.
 
 ---
 
@@ -806,8 +825,9 @@ a separate user instruction.
 ## Plan self-review checklist
 
 - [ ] The corrected priority is compiled verifier, predictor, then Q2 NAX.
-- [ ] The required 1,024/2,048 by 128-output D1/D2 matrix is explicit.
-- [ ] K=0 appears only as the NAX single-row control.
+- [ ] K=1 is measured against K=0 at 1,024/2,048 by 128 output before K=2.
+- [ ] K=2 requires a passing K=1 speed and utilization summary; K>=3 is rejected.
+- [ ] Persistent MTP cache/history/rollback/commit and terminal offsets gate every row.
 - [ ] Every behavior change begins with a failing test and observed RED.
 - [ ] Every optimization is measured independently before combinations.
 - [ ] Qwen unload/restore and exclusive-lane ownership wrap hardware only.

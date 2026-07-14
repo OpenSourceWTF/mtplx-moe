@@ -7,7 +7,8 @@ Approved in conversation on 2026-07-14 with these constraints:
 - target the existing Hy3 expert-only affine-Q2 artifact and its BF16 MTP
   layer;
 - verify 1,024- and 2,048-token inputs with exactly 128 generated tokens;
-- test fixed MTP depths D1 and D2;
+- test D1 first and test D2 only if D1 improves both speed and utilization;
+- treat K=0 AR as the one-row Next-K control and exclude K=3 or deeper;
 - evaluate MTPLX's Qwen-style compiled whole-window verifier;
 - evaluate predictive expert loading only after the verifier work has its own
   decision;
@@ -85,13 +86,20 @@ The target is `hy3-expert-q2`:
 - repetition stop and loop guard: disabled;
 - output length: exactly 128 tokens with an empty stop-token set.
 
-The matrix is:
+The gated sequence is:
 
 - contexts: 1,024 and 2,048 input tokens;
-- controls: AR and stock batched MTP verification;
-- speculative depths: D1 and D2;
-- D1 target-verify width: 2 rows;
-- D2 target-verify width: 3 rows.
+- K=0 AR control: one target row;
+- D1/K=1: two-row target verification, measured first;
+- D2/K=2: three-row target verification, measured only after D1 has positive
+  paired speed and active-reader intervals at both contexts;
+- K=3 and deeper: non-goal because the streamed Q2 expert path is already
+  bandwidth-sensitive.
+
+Headline speed rows run without resource telemetry. A separate diagnostic lane
+measures decode mean-active readers out of the 32-worker pool from the
+prefill-complete boundary to generation completion. Instrumented TPS is not a
+headline value.
 
 All arms use identical prompt IDs, artifacts, runtime capacity, expert-cache
 policy, slot state, sampler, and generated-token limit.
@@ -132,7 +140,7 @@ cannot be isolated without excessive complexity.
 
 ### A1 correctness gate
 
-For every D1/D2 cell:
+For every authorized D1 or D2 cell:
 
 - every speculative event reconstructs the emitted tokens;
 - accepted drafts, corrections, bonuses, verify calls, and per-depth counters
@@ -154,6 +162,9 @@ The complete verifier block must have a positive paired speed interval, and
 sustained decode TPS must improve without material regression in prefill,
 memory, p95, expert-cache hit rate, or I/O. Reduced dispatch count or compiled
 micro-time alone is not sufficient.
+
+D1 additionally requires a positive paired decode active-reader interval at
+both contexts before D2 is authorized. D2 is the maximum tested depth.
 
 ## Subproject A2: Q2 NAX evaluation (execution priority 3)
 
@@ -343,15 +354,14 @@ repository test behavior.
    immutable reserve, and zero-tolerance reserve telemetry.
 4. **Minor: A1 and A2 wins do not compose.** This is acceptable; keep the
    independently passing arm and reject the combination.
-5. **Minor: benefits appear only at one context or depth.** Report the scoped
-   win and keep other cells on stock; do not generalize beyond the measured
-   matrix.
+5. **Minor: benefits appear only at one context.** Do not authorize D2 unless
+   D1 improves both fixed contexts; retain the scoped D1 evidence as a no-go.
 
 ## Deliverables
 
 - Qwen-to-Hy3 compiled-verifier compatibility map;
-- D1/D2 stock, capture-eager, and compiled results at 1,024/2,048 input and
-  128 output tokens;
+- D1 stock, capture-eager, and compiled speed/utilization results at
+  1,024/2,048 input and 128 output tokens, followed by D2 only if authorized;
 - Q2 NAX premise profile and, only if gated, prototype and end-to-end results;
 - predictive-loading oracle and cheap-baseline comparison;
 - runtime predictive-loading pilot only if the offline gate passes;

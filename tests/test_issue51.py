@@ -51,6 +51,8 @@ def _child_payload(
     *,
     decode_tok_s: float = 16.0,
     end_to_end_tok_s: float = 8.0,
+    depths: tuple[int, ...] = (1,),
+    resource_telemetry: bool = False,
 ) -> dict[str, object]:
     mode, strategy = A1_PROCESS_CONFIG[arm]
     observations = []
@@ -62,10 +64,22 @@ def _child_payload(
                 "generated_tokens": 128,
                 "decode_tok_s": 15.0,
                 "end_to_end_tok_s": 7.0,
+                "expert_resource_telemetry": (
+                    {
+                        "decode": {
+                            "reader_pool": {
+                                "worker_capacity": 32,
+                                "mean_active_readers": 3.0,
+                            }
+                        }
+                    }
+                    if resource_telemetry
+                    else None
+                ),
                 "gates": {"output_tokens_exact": True},
             }
         )
-        for depth in (1, 2):
+        for depth in depths:
             observations.append(
                 {
                     "context_tokens": context,
@@ -73,8 +87,28 @@ def _child_payload(
                     "generated_tokens": 128,
                     "decode_tok_s": decode_tok_s + depth + context / 2048,
                     "end_to_end_tok_s": end_to_end_tok_s + depth + context / 4096,
+                    "expert_resource_telemetry": (
+                        {
+                            "decode": {
+                                "reader_pool": {
+                                    "worker_capacity": 32,
+                                    "mean_active_readers": 4.0,
+                                }
+                            }
+                        }
+                        if resource_telemetry
+                        else None
+                    ),
                     "compiled_verify": _compiled_evidence(arm),
-                    "final_state_contract": {"safe_to_commit": True},
+                    "final_state_contract": {
+                        "safe_to_commit": True,
+                        "generated_token_ids_match": True,
+                        "finish_reason_match": True,
+                        "prompt_mtp_history_tokens": context - 1,
+                        "mtp_history_position_base": 0,
+                        "target_cache_offsets": [context + 128],
+                        "committed_mtp_cache_offsets": [context + 127],
+                    },
                     "gates": {
                         "prompt_length_exact": True,
                         "new_prefill_tokens_exact": True,
@@ -104,12 +138,17 @@ def _child_payload(
                 "compiled_verify_mode": mode,
                 "trace_routes": False,
             },
+            "measurement_lane": (
+                "diagnostic-resource-instrumented"
+                if resource_telemetry
+                else "headline-uninstrumented"
+            ),
         },
         "models": [
             {
                 "model": "hy3-q2",
                 "model_key": "hy3-expert-q2",
-                "depths": [1, 2],
+                "depths": list(depths),
                 "passed": True,
                 "observations": observations,
             }
@@ -117,9 +156,22 @@ def _child_payload(
     }
 
 
-def _write_child(path: Path, arm: str, *, speed: float) -> str:
+def _write_child(
+    path: Path,
+    arm: str,
+    *,
+    speed: float,
+    resource_telemetry: bool = False,
+) -> str:
     path.write_text(
-        json.dumps(_child_payload(arm, decode_tok_s=speed), allow_nan=False),
+        json.dumps(
+            _child_payload(
+                arm,
+                decode_tok_s=speed,
+                resource_telemetry=resource_telemetry,
+            ),
+            allow_nan=False,
+        ),
         encoding="utf-8",
     )
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -167,15 +219,31 @@ def _valid_index(tmp_path: Path) -> dict[str, object]:
             speed=16.0 if row.arm == "capture-eager" else 18.0,
         )
         artifacts.append(_artifact_entry(path, row.arm, row.index, digest))
+    diagnostics = []
+    for index in range(4):
+        path = tmp_path / f"diagnostic-{index:02d}-capture-compiled.json"
+        diagnostics.append(
+            {
+                "path": path.name,
+                "sha256": _write_child(
+                    path,
+                    "capture-compiled",
+                    speed=18.0,
+                    resource_telemetry=True,
+                ),
+                "arm": "capture-compiled",
+            }
+        )
     return {
         "schema": "mtplx-issue51-a1-campaign-v1",
         "stage": "a1",
         "status": "passed",
         "configuration": {
             "contexts": [1024, 2048],
-            "depths": [1, 2],
+            "depths": [1],
             "output_tokens": 128,
             "retained_pairs": 2,
+            "diagnostic_repeats": 4,
         },
         "qualifications": qualification,
         "comparisons": [
@@ -195,6 +263,7 @@ def _valid_index(tmp_path: Path) -> dict[str, object]:
                 "artifacts": artifacts,
             }
         ],
+        "diagnostics": diagnostics,
     }
 
 
@@ -258,16 +327,18 @@ def test_pairing_rejects_incomplete_or_mutated_abba_blocks() -> None:
         pair_abba_rows(schedule)
 
 
-def test_child_validation_returns_exact_four_cell_metrics() -> None:
+def test_child_validation_returns_k0_and_k1_metrics() -> None:
     cells = validate_a1_child(
-        _child_payload("capture-compiled"), arm="capture-compiled"
+        _child_payload("capture-compiled"),
+        arm="capture-compiled",
+        depths=(1,),
     )
 
     assert set(cells) == {
+        CampaignCell(1024, 0),
         CampaignCell(1024, 1),
-        CampaignCell(1024, 2),
+        CampaignCell(2048, 0),
         CampaignCell(2048, 1),
-        CampaignCell(2048, 2),
     }
     assert cells[CampaignCell(1024, 1)]["decode_tok_s"] == 17.5
 
@@ -285,7 +356,7 @@ def test_child_validation_returns_exact_four_cell_metrics() -> None:
             lambda payload: payload["configuration"].update(output_tokens=127),
             "128",
         ),
-        (lambda payload: payload["models"][0].update(depths=[1]), "depths"),
+        (lambda payload: payload["models"][0].update(depths=[2]), "depths"),
         (
             lambda payload: payload["models"][0]["observations"][1]["gates"].pop(
                 "final_state_contract"
@@ -305,17 +376,63 @@ def test_child_validation_fails_closed(mutation, message: str) -> None:
     mutation(payload)
 
     with pytest.raises(ValueError, match=message):
-        validate_a1_child(payload, arm="capture-compiled")
+        validate_a1_child(payload, arm="capture-compiled", depths=(1,))
 
 
 def test_child_validation_rejects_candidate_mismatch_and_compiled_fallback() -> None:
     with pytest.raises(ValueError, match="candidate"):
-        validate_a1_child(_child_payload("capture-eager"), arm="capture-compiled")
+        validate_a1_child(
+            _child_payload("capture-eager"),
+            arm="capture-compiled",
+            depths=(1,),
+        )
 
     payload = _child_payload("capture-compiled")
     payload["models"][0]["observations"][1]["compiled_verify"]["fallback_calls"] = 1
     with pytest.raises(ValueError, match="fallback"):
-        validate_a1_child(payload, arm="capture-compiled")
+        validate_a1_child(payload, arm="capture-compiled", depths=(1,))
+
+
+def test_child_validation_requires_the_fixed_32_reader_utilization_metric() -> None:
+    payload = _child_payload("capture-compiled", resource_telemetry=True)
+    payload["models"][0]["observations"][0]["expert_resource_telemetry"]["decode"][
+        "reader_pool"
+    ]["worker_capacity"] = 31
+
+    with pytest.raises(ValueError, match="32"):
+        validate_a1_child(payload, arm="capture-compiled", depths=(1,))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("target_cache_offsets", [1151], "target cache"),
+        ("committed_mtp_cache_offsets", [1150], "MTP cache"),
+        ("prompt_mtp_history_tokens", 1022, "prompt MTP history"),
+        ("mtp_history_position_base", 1, "position base"),
+        ("generated_token_ids_match", False, "generated token"),
+        ("finish_reason_match", False, "finish reason"),
+    ],
+)
+def test_child_validation_recomputes_terminal_mtp_cache_contract(
+    field: str, value: object, message: str
+) -> None:
+    payload = _child_payload("capture-compiled")
+    contract = payload["models"][0]["observations"][1]["final_state_contract"]
+    contract.update(
+        {
+            "target_cache_offsets": [1152],
+            "committed_mtp_cache_offsets": [1151],
+            "prompt_mtp_history_tokens": 1023,
+            "mtp_history_position_base": 0,
+            "generated_token_ids_match": True,
+            "finish_reason_match": True,
+        }
+    )
+    contract[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        validate_a1_child(payload, arm="capture-compiled", depths=(1,))
 
 
 def test_paired_statistics_are_deterministic_and_performance_is_fail_closed() -> None:
@@ -376,7 +493,7 @@ def test_runner_builds_exact_one_candidate_child_command(tmp_path: Path) -> None
     command, environment = runner.build_a1_child_invocation(
         arm="capture-compiled-parity",
         contexts=(1024, 2048),
-        depths=(1, 2),
+        depths=(1,),
         output_tokens=128,
         output_path=output,
         python_executable="python",
@@ -386,7 +503,7 @@ def test_runner_builds_exact_one_candidate_child_command(tmp_path: Path) -> None
     assert command.count("--model") == 1
     assert command[command.index("--model") + 1] == "hy3-q2"
     assert command[command.index("--contexts") + 1] == "1024,2048"
-    assert command[command.index("--hy3-depths") + 1] == "1,2"
+    assert command[command.index("--hy3-depths") + 1] == "1"
     assert command[command.index("--verify-strategy") + 1] == "capture_commit"
     assert command[command.index("--compiled-verify-mode") + 1] == "parity"
     assert command[command.index("--output-json") + 1] == str(output)
@@ -402,14 +519,14 @@ def test_runner_forces_only_q2_compiled_candidates(tmp_path: Path, monkeypatch) 
     _command, stock_environment = runner.build_a1_child_invocation(
         arm="batched-stock",
         contexts=(1024, 2048),
-        depths=(1, 2),
+        depths=(1,),
         output_tokens=128,
         output_path=tmp_path / "stock.json",
     )
     _command, compiled_environment = runner.build_a1_child_invocation(
         arm="capture-compiled",
         contexts=(1024, 2048),
-        depths=(1, 2),
+        depths=(1,),
         output_tokens=128,
         output_path=tmp_path / "compiled.json",
     )
@@ -427,7 +544,7 @@ def test_runner_refuses_to_replace_existing_child_artifact(tmp_path: Path) -> No
         runner.run_a1_child(
             arm="batched-stock",
             contexts=(1024, 2048),
-            depths=(1, 2),
+            depths=(1,),
             output_tokens=128,
             output_path=path,
             run_process=lambda *_args, **_kwargs: None,
@@ -445,9 +562,53 @@ def test_summarizer_validates_digests_schedule_and_renders_decisions(
 
     assert summary["qualification"]["passed"] is True
     assert summary["comparisons"][0]["cells"]
+    assert summary["next_k_gate"]["advance_to_k2"] is True
     assert "A1 correctness" in markdown
     assert "A1 performance" in markdown
     assert "capture-compiled" in markdown
+    assert "K=2 gate: GO" in markdown
+
+
+def test_runner_rejects_combined_k1_k2_campaign(tmp_path: Path) -> None:
+    runner = _load_script(_RUNNER, "run_issue51_combined")
+
+    with pytest.raises(ValueError, match="one depth at a time"):
+        runner.build_a1_child_invocation(
+            arm="batched-stock",
+            contexts=(1024, 2048),
+            depths=(1, 2),
+            output_tokens=128,
+            output_path=tmp_path / "combined.json",
+        )
+
+
+def test_k2_requires_a_passing_k1_speed_and_utilization_summary() -> None:
+    runner = _load_script(_RUNNER, "run_issue51_k2_gate")
+
+    with pytest.raises(ValueError, match="passing K=1 summary"):
+        runner.validate_depth_authorization((2,), None)
+
+    failed = {
+        "schema": "mtplx-issue51-a1-summary-v2",
+        "next_k_gate": {
+            "tested_depth": 1,
+            "max_depth": 2,
+            "advance_to_k2": False,
+        },
+    }
+    with pytest.raises(ValueError, match="does not authorize"):
+        runner.validate_depth_authorization((2,), failed)
+
+    passed = deepcopy(failed)
+    passed["next_k_gate"]["advance_to_k2"] = True
+    assert runner.validate_depth_authorization((2,), passed) == {
+        "tested_depth": 1,
+        "max_depth": 2,
+        "advance_to_k2": True,
+    }
+
+    with pytest.raises(ValueError, match="K=1 or K=2"):
+        runner.validate_depth_authorization((3,), passed)
 
 
 def test_summarizer_rejects_duplicate_paths_digest_drift_and_schedule_drift(

@@ -34,6 +34,35 @@ A1_COMPARISONS = (
 )
 
 
+def validate_depth_authorization(
+    depths: Sequence[int], k1_summary: Mapping[str, Any] | None
+) -> dict[str, Any] | None:
+    requested = tuple(depths)
+    if len(requested) != 1 or requested[0] not in {1, 2}:
+        raise ValueError("Issue #51 requires exactly one depth, K=1 or K=2")
+    if requested == (1,):
+        return None
+    if k1_summary is None:
+        raise ValueError("K=2 requires a passing K=1 summary")
+    if k1_summary.get("schema") != "mtplx-issue51-a1-summary-v2":
+        raise ValueError("K=2 requires a passing K=1 summary with the v2 schema")
+    gate = k1_summary.get("next_k_gate")
+    if not isinstance(gate, Mapping):
+        raise ValueError("K=1 summary is missing the Next-K gate")
+    authorization = {
+        "tested_depth": gate.get("tested_depth"),
+        "max_depth": gate.get("max_depth"),
+        "advance_to_k2": gate.get("advance_to_k2"),
+    }
+    if authorization != {
+        "tested_depth": 1,
+        "max_depth": 2,
+        "advance_to_k2": True,
+    }:
+        raise ValueError("K=1 summary does not authorize K=2")
+    return authorization
+
+
 def _integer_csv(value: str) -> tuple[int, ...]:
     try:
         parsed = tuple(
@@ -90,6 +119,7 @@ def build_a1_child_invocation(
     depths: Sequence[int],
     output_tokens: int,
     output_path: Path,
+    resource_telemetry: bool = False,
     python_executable: str | Path = sys.executable,
 ) -> tuple[list[str], dict[str, str]]:
     """Build one immutable candidate process and its exact verifier environment."""
@@ -98,8 +128,10 @@ def build_a1_child_invocation(
         raise ValueError(f"unsupported A1 candidate arm: {arm!r}")
     if tuple(contexts) != (1024, 2048):
         raise ValueError("A1 contexts must be exactly 1024,2048")
-    if tuple(depths) != (1, 2):
-        raise ValueError("A1 depths must be exactly 1,2")
+    if len(tuple(depths)) != 1:
+        raise ValueError("A1 runs one depth at a time")
+    if tuple(depths)[0] not in {1, 2}:
+        raise ValueError("A1 depth must be K=1 or K=2")
     if output_tokens != 128:
         raise ValueError("A1 output_tokens must be exactly 128")
     mode, strategy = A1_PROCESS_CONFIG[arm]
@@ -117,6 +149,7 @@ def build_a1_child_invocation(
         "--compiled-verify-mode",
         mode,
         "--no-trace-routes",
+        "--resource-telemetry" if resource_telemetry else "--no-resource-telemetry",
         "--output-json",
         str(output_path),
     ]
@@ -150,6 +183,7 @@ def run_a1_child(
     depths: Sequence[int],
     output_tokens: int,
     output_path: Path,
+    resource_telemetry: bool = False,
     python_executable: str | Path = sys.executable,
     run_process: Callable[..., Any] = subprocess.run,
 ) -> dict[str, Any]:
@@ -168,6 +202,7 @@ def run_a1_child(
         depths=depths,
         output_tokens=output_tokens,
         output_path=output_path,
+        resource_telemetry=resource_telemetry,
         python_executable=python_executable,
     )
     result = run_process(
@@ -190,7 +225,7 @@ def run_a1_child(
     if not output_path.is_file() or output_path.is_symlink():
         raise RuntimeError(f"A1 child did not create a regular artifact: {output_path}")
     payload = _load_json_object(output_path)
-    validate_a1_child(payload, arm=arm)
+    validate_a1_child(payload, arm=arm, depths=depths)
     return payload
 
 
@@ -208,13 +243,16 @@ def run_a1_campaign(
     depths: Sequence[int],
     output_tokens: int,
     retained_pairs: int,
+    diagnostic_repeats: int,
     output_dir: Path,
+    k1_summary: Mapping[str, Any] | None = None,
     python_executable: str | Path = sys.executable,
     child_runner: Callable[..., dict[str, Any]] = run_a1_child,
 ) -> dict[str, Any]:
     """Run qualification and both A1 ABBA comparisons with per-child checkpoints."""
 
     # Validate all fixed campaign inputs before claiming the output directory.
+    depth_authorization = validate_depth_authorization(depths, k1_summary)
     build_a1_child_invocation(
         arm=A1_CANDIDATES[0],
         contexts=contexts,
@@ -224,6 +262,8 @@ def run_a1_campaign(
         python_executable=python_executable,
     )
     build_abba_schedule(control="a", candidate="b", retained_pairs=retained_pairs)
+    if diagnostic_repeats < 2:
+        raise ValueError("diagnostic_repeats must be at least two")
     root = output_dir.expanduser().resolve()
     root.mkdir(parents=True, exist_ok=False)
     index_path = root / "index.json"
@@ -237,6 +277,8 @@ def run_a1_campaign(
             "depths": list(depths),
             "output_tokens": output_tokens,
             "retained_pairs": retained_pairs,
+            "diagnostic_repeats": diagnostic_repeats,
+            "depth_authorization": depth_authorization,
         },
         "qualifications": [],
         "comparisons": [],
@@ -300,6 +342,25 @@ def run_a1_campaign(
                 )
                 comparison["artifacts"].append(entry)
                 _write_json_checkpoint(index_path, index)
+        diagnostic_dir = root / "diagnostics"
+        diagnostic_dir.mkdir()
+        diagnostics = []
+        index["diagnostics"] = diagnostics
+        _write_json_checkpoint(index_path, index)
+        for position in range(diagnostic_repeats):
+            arm = "capture-compiled"
+            path = diagnostic_dir / f"{position:02d}-{arm}.json"
+            child_runner(
+                arm=arm,
+                contexts=contexts,
+                depths=depths,
+                output_tokens=output_tokens,
+                output_path=path,
+                resource_telemetry=True,
+                python_executable=python_executable,
+            )
+            diagnostics.append(_artifact_entry(path, root=root, arm=arm))
+            _write_json_checkpoint(index_path, index)
     except BaseException as exc:
         index["status"] = "failed"
         index["failure"] = {"error": str(exc), "error_type": type(exc).__name__}
@@ -315,9 +376,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="stage", required=True)
     a1 = subparsers.add_parser("a1", help="Run compiled-verifier A1 campaign")
     a1.add_argument("--contexts", type=_integer_csv, default=(1024, 2048))
-    a1.add_argument("--depths", type=_integer_csv, default=(1, 2))
+    a1.add_argument("--depths", type=_integer_csv, default=(1,))
     a1.add_argument("--output-tokens", type=_positive_int, default=128)
     a1.add_argument("--retained-pairs", type=_positive_int, default=8)
+    a1.add_argument("--diagnostic-repeats", type=_positive_int, default=4)
+    a1.add_argument("--k1-summary", type=Path)
     a1.add_argument("--output-dir", type=Path, required=True)
     return parser
 
@@ -326,12 +389,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.stage != "a1":
         raise AssertionError(f"unsupported stage: {args.stage}")
+    k1_summary = (
+        _load_json_object(args.k1_summary.expanduser().resolve())
+        if args.k1_summary is not None
+        else None
+    )
     payload = run_a1_campaign(
         contexts=args.contexts,
         depths=args.depths,
         output_tokens=args.output_tokens,
         retained_pairs=args.retained_pairs,
+        diagnostic_repeats=args.diagnostic_repeats,
         output_dir=args.output_dir,
+        k1_summary=k1_summary,
     )
     print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
     return 0

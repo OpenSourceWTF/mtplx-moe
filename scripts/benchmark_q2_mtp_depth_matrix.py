@@ -1201,6 +1201,51 @@ def _numeric_delta(before: Any, after: Any) -> Any:
     return None
 
 
+def _reader_pool_interval(
+    before: Mapping[str, Any], after: Mapping[str, Any]
+) -> dict[str, float | int]:
+    before_pool = before.get("reader_pool")
+    after_pool = after.get("reader_pool")
+    if not isinstance(before_pool, Mapping) or not isinstance(after_pool, Mapping):
+        raise BenchmarkGateError("resource telemetry is missing reader_pool counters")
+    capacity = after_pool.get("worker_capacity")
+    if (
+        isinstance(capacity, bool)
+        or not isinstance(capacity, int)
+        or capacity <= 0
+        or before_pool.get("worker_capacity") != capacity
+    ):
+        raise BenchmarkGateError("reader_pool worker capacity is invalid or changed")
+
+    def interval(name: str) -> int:
+        start = before_pool.get(name)
+        end = after_pool.get(name)
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+            or end < start
+        ):
+            raise BenchmarkGateError(f"reader_pool {name} interval is invalid")
+        return end - start
+
+    elapsed_ns = interval("observation_ns")
+    if elapsed_ns <= 0:
+        raise BenchmarkGateError("reader_pool decode interval is empty")
+    active_work_ns = interval("active_work_ns")
+    queued_work_ns = interval("queued_work_ns")
+    mean_active = active_work_ns / elapsed_ns
+    mean_queued = queued_work_ns / elapsed_ns
+    return {
+        "worker_capacity": capacity,
+        "elapsed_seconds": elapsed_ns / 1_000_000_000,
+        "mean_active_readers": mean_active,
+        "active_capacity_fraction": mean_active / capacity,
+        "mean_queued_reads": mean_queued,
+    }
+
+
 def _result_tokens(result: Any) -> list[int]:
     value = _field(result, "tokens")
     if not isinstance(value, (list, tuple)):
@@ -1231,6 +1276,13 @@ def _run_observation(
     resource_before = (
         _resource_telemetry(runtime) if resource_telemetry_enabled else None
     )
+    resource_prefill_complete = None
+
+    def capture_prefill_boundary(event: Mapping[str, Any]) -> None:
+        nonlocal resource_prefill_complete
+        if resource_prefill_complete is None and event.get("phase") == "completed":
+            resource_prefill_complete = _resource_telemetry(runtime)
+
     apis.synchronize()
     apis.reset_peak_memory()
     prompt_copy = list(prompt_ids)
@@ -1248,6 +1300,8 @@ def _run_observation(
         "repetition_stop": False,
         "loop_guard": False,
     }
+    if resource_telemetry_enabled:
+        common["prefill_callback"] = capture_prefill_boundary
     with admission:
         if depth == 0:
             result = apis.generate_ar(runtime, prompt_copy, **common)
@@ -1271,6 +1325,29 @@ def _run_observation(
     resource_after = (
         _resource_telemetry(runtime) if resource_telemetry_enabled else None
     )
+    if resource_telemetry_enabled and resource_prefill_complete is None:
+        raise BenchmarkGateError(
+            "resource telemetry did not observe the prefill-complete boundary"
+        )
+    resource_evidence = None
+    if resource_telemetry_enabled:
+        assert resource_before is not None
+        assert resource_prefill_complete is not None
+        assert resource_after is not None
+        resource_evidence = {
+            "before": resource_before,
+            "prefill_complete": resource_prefill_complete,
+            "after": resource_after,
+            "numeric_delta": _numeric_delta(resource_before, resource_after),
+            "decode": {
+                "numeric_delta": _numeric_delta(
+                    resource_prefill_complete, resource_after
+                ),
+                "reader_pool": _reader_pool_interval(
+                    resource_prefill_complete, resource_after
+                ),
+            },
+        }
 
     if tuple(int(token) for token in prompt_copy) != prompt_ids:
         raise BenchmarkGateError("generation mutated the exact benchmark prompt")
@@ -1291,13 +1368,7 @@ def _run_observation(
         "expert_streaming_counters": streaming_counters,
         "expert_streaming_counters_by_phase": streaming_counters_by_phase,
         "expert_resource_telemetry": (
-            {
-                "before": resource_before,
-                "after": resource_after,
-                "numeric_delta": _numeric_delta(resource_before, resource_after),
-            }
-            if resource_telemetry_enabled
-            else None
+            resource_evidence if resource_telemetry_enabled else None
         ),
     }
     try:
@@ -1424,13 +1495,7 @@ def _run_observation(
         "expert_streaming_counters_by_phase": streaming_counters_by_phase,
         "decode_expert_cache_hit_rate": decode_cache_hit_rate,
         "expert_resource_telemetry": (
-            {
-                "before": resource_before,
-                "after": resource_after,
-                "numeric_delta": _numeric_delta(resource_before, resource_after),
-            }
-            if resource_telemetry_enabled
-            else None
+            resource_evidence if resource_telemetry_enabled else None
         ),
         "gates": {
             "prompt_length_exact": len(prompt_ids) == context_tokens,
