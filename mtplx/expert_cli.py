@@ -27,7 +27,7 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
         "--expert-streaming",
         action="store_true",
         help=(
-            "Load only resident weights and stream routed Q4 experts from SSD. "
+            "Load only resident weights and stream routed quantized experts from SSD. "
             "This selects target-only AR for the pinned Hy3/GLM artifacts."
         ),
     )
@@ -41,7 +41,12 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
     )
     group.add_argument(
         "--expert-model-key",
-        choices=["hy3-q4", "glm52-q4"],
+        choices=[
+            "hy3-q4",
+            "glm52-q4",
+            "hy3-expert-only-q4",
+            "hy3-expert-q2",
+        ],
         help="Pinned streamed model descriptor; inferred from config.json by default.",
     )
     group.add_argument(
@@ -53,8 +58,12 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         help="Aggregate live KV-token admission ceiling reserved in the memory plan.",
     )
-    group.add_argument("--expert-runtime-reserve", help="Runtime/OS headroom (default 16GiB).")
-    group.add_argument("--expert-cache-limit", help="Optional persistent expert-cache cap.")
+    group.add_argument(
+        "--expert-runtime-reserve", help="Runtime/OS headroom (default 16GiB)."
+    )
+    group.add_argument(
+        "--expert-cache-limit", help="Optional persistent expert-cache cap."
+    )
     group.add_argument(
         "--expert-cache-policy",
         choices=["frequency", "lru"],
@@ -67,8 +76,12 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
     )
     group.add_argument("--expert-transient-slots", type=int)
     group.add_argument("--expert-io-staging", help="Host I/O staging reserve.")
-    group.add_argument("--expert-execution-workspace", help="Execution workspace reserve.")
-    group.add_argument("--expert-max-inflight-io", help="Bound concurrent expert-read bytes.")
+    group.add_argument(
+        "--expert-execution-workspace", help="Execution workspace reserve."
+    )
+    group.add_argument(
+        "--expert-max-inflight-io", help="Bound concurrent expert-read bytes."
+    )
     group.add_argument("--expert-max-open-files", type=int)
     group.add_argument("--expert-read-chunk", help="Maximum positional read chunk.")
     group.add_argument(
@@ -135,7 +148,9 @@ def _load_config_object(path: str | None) -> dict[str, Any]:
     try:
         value = json.loads(Path(path).read_text(encoding="utf-8"))
     except Exception as exc:
-        raise ValueError(f"could not read expert streaming config {path}: {exc}") from exc
+        raise ValueError(
+            f"could not read expert streaming config {path}: {exc}"
+        ) from exc
     if not isinstance(value, dict):
         raise ValueError("expert streaming config must contain one JSON object")
     return dict(value)
@@ -250,13 +265,21 @@ def append_expert_streaming_child_args(command: list[str], args: Any) -> None:
                 value = Path(value).expanduser().resolve()
             command.extend([flag, str(value)])
     for attribute, positive, negative in (
-        ("expert_prefer_sidecar", "--expert-prefer-sidecar", "--no-expert-prefer-sidecar"),
+        (
+            "expert_prefer_sidecar",
+            "--expert-prefer-sidecar",
+            "--no-expert-prefer-sidecar",
+        ),
         (
             "expert_verify_record_hashes",
             "--expert-verify-record-hashes",
             "--no-expert-verify-record-hashes",
         ),
-        ("expert_verify_headers", "--expert-verify-headers", "--no-expert-verify-headers"),
+        (
+            "expert_verify_headers",
+            "--expert-verify-headers",
+            "--no-expert-verify-headers",
+        ),
         (
             "expert_verify_sidecar_at_open",
             "--expert-verify-sidecar-at-open",

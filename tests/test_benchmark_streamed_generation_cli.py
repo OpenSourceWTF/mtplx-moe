@@ -52,6 +52,39 @@ def test_unflagged_runs_are_reproducible_and_bounded() -> None:
     assert args.seed == 0
 
 
+@pytest.mark.parametrize("model_key", ["hy3-expert-only-q4", "hy3-expert-q2"])
+def test_benchmark_accepts_explicit_hy3_expert_lanes_with_hy3_defaults(
+    model_key: str,
+) -> None:
+    module = _load_module()
+    args = module.build_parser().parse_args(
+        [
+            "/model",
+            "/manifest",
+            "--model-key",
+            model_key,
+            "--memory-limit",
+            "112GiB",
+            "--max-live-kv-tokens",
+            "2048",
+        ]
+    )
+
+    assert args.model_key == model_key
+    assert module.model_defaults_for_key(model_key) == (
+        module.model_defaults_for_key("hy3-q4")
+    )
+    assert module.model_defaults_for_key(model_key) == {
+        "max_tokens": 65_536,
+        "max_output_tokens": 262_144,
+        "temperature": 0.9,
+        "top_p": 1.0,
+        "top_k": 0,
+        "enable_thinking": False,
+        "reasoning_effort": None,
+    }
+
+
 def test_window_telemetry_can_be_disabled() -> None:
     parser = _load_module().build_parser()
     args = parser.parse_args(
@@ -883,6 +916,30 @@ def test_enable_mtp_requires_artifacts_and_hy3(capsys) -> None:
     with pytest.raises(SystemExit):
         module.validate_mtp_flags(parser, args)
     assert "--enable-mtp" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("model_key", ["hy3-expert-only-q4", "hy3-expert-q2"])
+def test_benchmark_rejects_mtp_for_explicit_hy3_expert_lanes_before_load(
+    model_key: str,
+    capsys,
+) -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [
+            *_BASE_ARGS,
+            "--model-key",
+            model_key,
+            "--enable-mtp",
+            "--mtp-artifacts",
+            "/artifacts",
+        ]
+    )
+
+    with pytest.raises(SystemExit):
+        module.validate_mtp_flags(parser, args)
+
+    assert "hy3-q4 only" in capsys.readouterr().err
 
 
 def test_sidecar_trust_requires_validated_sidecar_and_preserves_source_hashes(

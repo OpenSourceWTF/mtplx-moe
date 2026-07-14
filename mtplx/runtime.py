@@ -462,16 +462,16 @@ def load(
 
         if not isinstance(expert_streaming_config, ExpertStreamingConfig):
             raise TypeError("expert_streaming_config must be an ExpertStreamingConfig")
+        if mtp and expert_streaming_config.model_key != "hy3-q4":
+            raise RuntimeError(
+                "streamed MTP artifacts are packaged for hy3-q4 only; "
+                f"got {expert_streaming_config.model_key!r}"
+            )
         if mtp and mtp_artifacts is None:
             raise RuntimeError(
                 "the pinned Hy3-4bit and GLM-5.2-4bit artifacts omit MTP weights; "
                 "pass mtp_artifacts=<layer-80 artifact directory> to enable "
                 "streamed Hy3 MTP or load with mtp=False"
-            )
-        if mtp and expert_streaming_config.model_key != "hy3-q4":
-            raise RuntimeError(
-                "streamed MTP artifacts are packaged for hy3-q4 only; "
-                f"got {expert_streaming_config.model_key!r}"
             )
         if mtp_adapter is not None or merge_mtp_adapter:
             raise RuntimeError("MTP adapters are unavailable for streamed loading")

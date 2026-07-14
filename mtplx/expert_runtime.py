@@ -16,6 +16,7 @@ from .expert_manifest import (
     ExpertManifest,
     ExpertManifestError,
     load_expert_manifest,
+    validate_expert_manifest_spec,
     verify_expert_manifest,
 )
 from .expert_slots import (
@@ -1296,23 +1297,12 @@ class ExpertStreamingRuntime:
         manifest: ExpertManifest,
         spec: ExpertStreamingModelSpec,
     ) -> None:
-        errors: list[str] = []
-        if manifest.model_key != spec.key:
-            errors.append("model key")
-        if manifest.source_repo != spec.quant_model:
-            errors.append("source repository")
-        if manifest.source_revision != spec.quant_revision:
-            errors.append("source revision")
-        if manifest.quant_bits != spec.quant_bits:
-            errors.append("quantization bits")
-        if manifest.quant_group_size != spec.quant_group_size:
-            errors.append("quantization group size")
-        if manifest.artifact_tensor_bytes != spec.total_tensor_bytes:
-            errors.append("artifact tensor bytes")
-        if errors:
+        try:
+            validate_expert_manifest_spec(manifest, spec)
+        except ExpertManifestError as exc:
             raise ExpertStreamingConfigurationError(
-                "manifest does not match pinned model descriptor: " + ", ".join(errors)
-            )
+                "manifest does not match pinned model descriptor: " + str(exc)
+            ) from exc
 
     def _record_cleanup_error(self, error: BaseException) -> None:
         with self._cleanup_error_lock:

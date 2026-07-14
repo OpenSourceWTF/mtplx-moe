@@ -29,7 +29,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("model_root", type=Path)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("probes", type=Path)
-    parser.add_argument("--model-key", choices=["hy3-q4", "glm52-q4"], required=True)
+    parser.add_argument(
+        "--model-key",
+        choices=[
+            "hy3-q4",
+            "glm52-q4",
+            "hy3-expert-only-q4",
+            "hy3-expert-q2",
+        ],
+        required=True,
+    )
     parser.add_argument("--memory-limit", required=True)
     parser.add_argument("--max-live-kv-tokens", type=_positive_int, required=True)
     parser.add_argument("--runtime-reserve", default="16GiB")
@@ -40,7 +49,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _load_probes(path: Path) -> list[dict]:
     probes = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), 1
+    ):
         if not line.strip():
             continue
         try:
@@ -110,7 +121,9 @@ def main() -> int:
             actual_logits = [float(value) for value in actual.tolist()]
             ids_match = actual_ids == expected_ids
             logits_match = all(
-                math.isclose(actual_value, expected_value, rel_tol=args.rtol, abs_tol=args.atol)
+                math.isclose(
+                    actual_value, expected_value, rel_tol=args.rtol, abs_tol=args.atol
+                )
                 for actual_value, expected_value in zip(
                     actual_logits, expected_logits, strict=True
                 )

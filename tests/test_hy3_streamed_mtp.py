@@ -299,9 +299,7 @@ def test_rejected_drafts_fall_back_to_target_tokens_exactly(tmp_path: Path) -> N
         ar = generate_ar(rt_ar, prompt, max_tokens=8, sampler=sampler, seed=0)
         model = rt_mtp.model
         vocab = 128
-        wrong = next(
-            token for token in range(vocab) if token not in set(ar.tokens)
-        )
+        wrong = next(token for token in range(vocab) if token not in set(ar.tokens))
         one_hot = (mx.arange(vocab) == wrong).astype(mx.float32)
         original_forward = model.mtp_forward
 
@@ -391,6 +389,37 @@ def test_load_rejects_streamed_mtp_for_non_hy3_models(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.parametrize("model_key", ["hy3-expert-only-q4", "hy3-expert-q2"])
+def test_load_rejects_mtp_for_hy3_expert_q2_and_expert_only_q4_before_model_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model_key: str,
+) -> None:
+    root = _guard_config_dir(tmp_path)
+    config = ExpertStreamingConfig(
+        model_key=model_key,
+        memory_limit_bytes=1,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+    )
+
+    def unexpected_model_load(*_args, **_kwargs):
+        raise AssertionError("explicit local MTP rejection happened after model load")
+
+    monkeypatch.setattr(
+        "mtplx.resident_loader.construct_resident_model",
+        unexpected_model_load,
+    )
+
+    with pytest.raises(RuntimeError, match="hy3-q4 only"):
+        load(
+            root,
+            mtp=True,
+            expert_streaming_config=config,
+            expert_manifest=root / "expert-manifest.json",
+        )
+
+
 def test_load_rejects_mtp_artifacts_without_streaming(tmp_path: Path) -> None:
     root = _guard_config_dir(tmp_path)
     with pytest.raises(ValueError, match="streamed checkpoints only"):
@@ -422,8 +451,12 @@ def test_return_hidden_defaults_to_post_norm_for_the_nextn_head(tmp_path: Path) 
 
         post_ref, pre_ref = model.model(prompt, return_pre_norm=True)
         _logits, hidden_default = model(prompt, return_hidden=True)
-        _logits2, hidden_pre = model(prompt, return_hidden=True, hidden_variant="pre_norm")
-        _logits3, hidden_post = model(prompt, return_hidden=True, hidden_variant="post_norm")
+        _logits2, hidden_pre = model(
+            prompt, return_hidden=True, hidden_variant="pre_norm"
+        )
+        _logits3, hidden_post = model(
+            prompt, return_hidden=True, hidden_variant="post_norm"
+        )
         mx.eval(post_ref, pre_ref, hidden_default, hidden_pre, hidden_post)
 
         assert mx.array_equal(hidden_default, post_ref).item()

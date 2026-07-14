@@ -37,6 +37,38 @@ from mtplx.benchmarks.resource_telemetry import (  # noqa: E402
 from mtplx.runtime import load  # noqa: E402
 
 
+_GLM52_AR_DEFAULTS = {
+    "max_tokens": 65_536,
+    "max_output_tokens": 131_072,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 0,
+    "enable_thinking": True,
+    "reasoning_effort": "max",
+}
+_HY3_AR_DEFAULTS = {
+    "max_tokens": 65_536,
+    "max_output_tokens": 262_144,
+    "temperature": 0.9,
+    "top_p": 1.0,
+    "top_k": 0,
+    "enable_thinking": False,
+    "reasoning_effort": None,
+}
+_MODEL_DEFAULTS = {
+    "glm52-q4": _GLM52_AR_DEFAULTS,
+    "hy3-q4": _HY3_AR_DEFAULTS,
+    "hy3-expert-only-q4": _HY3_AR_DEFAULTS,
+    "hy3-expert-q2": _HY3_AR_DEFAULTS,
+}
+
+
+def model_defaults_for_key(model_key: str) -> dict[str, object]:
+    """Return benchmark defaults without making local lanes auto-selectable."""
+
+    return dict(_MODEL_DEFAULTS[model_key])
+
+
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -1039,7 +1071,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model_root", type=Path)
     parser.add_argument("manifest", type=Path)
-    parser.add_argument("--model-key", choices=["hy3-q4", "glm52-q4"], required=True)
+    parser.add_argument(
+        "--model-key",
+        choices=[
+            "hy3-q4",
+            "glm52-q4",
+            "hy3-expert-only-q4",
+            "hy3-expert-q2",
+        ],
+        required=True,
+    )
     parser.add_argument("--memory-limit", required=True)
     parser.add_argument("--max-live-kv-tokens", type=_positive_int, required=True)
     parser.add_argument("--runtime-reserve", default="16GiB")
@@ -1780,26 +1821,7 @@ def _main() -> int:
     args = parser.parse_args()
     validate_resource_flags(parser, args)
     root = args.model_root.expanduser().resolve()
-    model_defaults = {
-        "glm52-q4": {
-            "max_tokens": 65_536,
-            "max_output_tokens": 131_072,
-            "temperature": 1.0,
-            "top_p": 0.95,
-            "top_k": 0,
-            "enable_thinking": True,
-            "reasoning_effort": "max",
-        },
-        "hy3-q4": {
-            "max_tokens": 65_536,
-            "max_output_tokens": 262_144,
-            "temperature": 0.9,
-            "top_p": 1.0,
-            "top_k": 0,
-            "enable_thinking": False,
-            "reasoning_effort": None,
-        },
-    }[args.model_key]
+    model_defaults = model_defaults_for_key(args.model_key)
     if args.generation_profile == "deterministic":
         profile_defaults = {
             **model_defaults,
