@@ -1,0 +1,95 @@
+{
+  "schema": "mtplx-issue31-c2-shared-gate-up-decode-v1",
+  "date_local": "2026-07-13",
+  "source_campaign_commit": "1154041f4767146b240a5f463c96c0a511ab3750",
+  "decision": "advance C2 shared gate/up only; paired interval is above parity",
+  "contract": {
+    "model": "pipenetwork/Hy3-4bit@160619d3f96c8470350b6dac0ef033a8381551e3",
+    "prompt_tokens": 313,
+    "completion_tokens": 256,
+    "decode_steps": 255,
+    "batch": 1,
+    "repeats_per_layout": 8,
+    "retained_runs": 16,
+    "source_campaign_total_runs": 32,
+    "cache_policy": "lru",
+    "cache_scope": "global",
+    "slot_layout": "component-banks",
+    "mtp": false,
+    "thinking": false,
+    "window_telemetry": false,
+    "resource_telemetry": false,
+    "bootstrap_resamples": 20000
+  },
+  "layouts": {
+    "control": {
+      "packed_shared_mlp_layers": 0
+    },
+    "c2": {
+      "packed_shared_mlp_layers": 79
+    }
+  },
+  "decode": {
+    "control": {
+      "samples_tps": [
+        6.334427772372103,
+        5.9610550132149145,
+        5.847809893197981,
+        6.248626374265122,
+        6.048637730455287,
+        5.794716673890436,
+        6.218017027430618,
+        6.2502100637396945
+      ],
+      "mean_tps": 6.087937568570769,
+      "median_tps": 6.133327378942953
+    },
+    "c2": {
+      "samples_tps": [
+        6.308387046859546,
+        6.362405485844326,
+        6.179717864253815,
+        6.121189047094705,
+        6.279637967297732,
+        6.117695910592548,
+        6.294161112170614,
+        6.3675377697818645
+      ],
+      "mean_tps": 6.253841525486894,
+      "median_tps": 6.286899539734173,
+      "paired_ratios": [
+        0.995889016901237,
+        1.0673287650826353,
+        1.0567576540820693,
+        0.979605545357094,
+        1.0381904566179163,
+        1.0557368470070982,
+        1.0122457182738624,
+        1.0187718020427572
+      ],
+      "paired_ratio_mean": 1.0280657256705836,
+      "paired_ratio_median": 1.0284811293303369,
+      "paired_gain_percent": 2.806572567058363,
+      "paired_ratio_mean_95_ci": [
+        1.007289291030079,
+        1.0479610966589512
+      ]
+    }
+  },
+  "parity": {
+    "successful_runs": 16,
+    "expected_runs": 16,
+    "tokens": true,
+    "routes": true,
+    "cache_and_io": true,
+    "configuration": true,
+    "loaded_layouts": true,
+    "final_slot_health": true
+  },
+  "lifecycle": {
+    "qwen_restore_verified": true,
+    "restored_model": "mtplx-qwen36-27b-optimized-speed",
+    "exclusive_lane_released": true
+  },
+  "raw_campaign": "benchmarks/raw/moe-runtime/moe-runtime-issue31-packed-p96097-20260714T021357Z-1154041f4767/campaign.json"
+}
