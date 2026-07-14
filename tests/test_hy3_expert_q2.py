@@ -9,6 +9,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
@@ -17,18 +18,24 @@ import pytest
 import mtplx.hy3_expert_q2 as q2_module
 from mtplx import expert_manifest as expert_manifest_module
 from mtplx.expert_manifest import (
+    EMPTY_SHA256,
     ExpertManifest,
     ExpertRecord,
     ResidentTensor,
+    SidecarInfo,
     ShardInfo,
     TensorSegment,
 )
+from mtplx.expert_streaming_models import ExpertStreamingModelSpec
 from mtplx.hy3_expert_q2 import (
+    ConversionConfig,
     ProjectionDiagnostics,
     ResidentReuse,
     SOURCE_MANIFEST_SHA256,
     SOURCE_MODEL_KEY,
     TARGET_MODEL_KEY,
+    convert_expert_records,
+    preflight_hy3_expert_q2,
     requantize_expert_record_q4_to_q2,
     requantize_projection_q4_to_q2,
     stage_exact_residents,
@@ -1288,3 +1295,679 @@ def test_resident_copy_chunk_bound_is_strict(
         )
 
     assert list(work_root.iterdir()) == []
+
+
+def _test_component_metadata(
+    spec: ExpertStreamingModelSpec,
+) -> tuple[tuple[str, str, tuple[int, int], int], ...]:
+    result = []
+    for projection in _PROJECTIONS:
+        input_size = (
+            spec.hidden_size if projection != "down_proj" else spec.expert_hidden_size
+        )
+        output_size = (
+            spec.expert_hidden_size if projection != "down_proj" else spec.hidden_size
+        )
+        shapes = (
+            (output_size, input_size * spec.quant_bits // 32),
+            (output_size, input_size // spec.quant_group_size),
+            (output_size, input_size // spec.quant_group_size),
+        )
+        for leaf, dtype, shape in zip(_LEAVES, _DTYPES, shapes, strict=True):
+            item_size = 4 if dtype == "U32" else 2
+            result.append(
+                (
+                    f"{projection}.{leaf}",
+                    dtype,
+                    shape,
+                    shape[0] * shape[1] * item_size,
+                )
+            )
+    return tuple(result)
+
+
+def _test_conversion_spec(
+    *, bits: int, resident_bytes: int
+) -> ExpertStreamingModelSpec:
+    hidden_size = 64
+    expert_hidden_size = 128
+    component_bytes = sum(
+        item[3]
+        for item in _test_component_metadata(
+            SimpleNamespace(
+                hidden_size=hidden_size,
+                expert_hidden_size=expert_hidden_size,
+                quant_bits=bits,
+                quant_group_size=64,
+            )
+        )
+    )
+    key = "hy3-expert-only-q4" if bits == 4 else "hy3-expert-q2"
+    return ExpertStreamingModelSpec(
+        key=key,
+        display_name=f"Test Hy3 Q{bits}",
+        source_model="test/tencent-hy3",
+        source_revision="resident-revision",
+        quant_model="test/hy3-q4",
+        quant_revision="oracle-revision",
+        total_tensor_bytes=resident_bytes + 3 * component_bytes,
+        total_layers=2,
+        routed_layer_start=1,
+        routed_layer_count=1,
+        expert_count=3,
+        top_k=1,
+        hidden_size=hidden_size,
+        expert_hidden_size=expert_hidden_size,
+        quant_bits=bits,
+        quant_group_size=64,
+        quant_parameter_bytes=2,
+        router_storage="source bfloat16",
+        router_matmul_dtype="float32",
+        router_bytes=0,
+        kv_bytes_per_token=0,
+        mtp_layer_index=2,
+        mtp_included=False,
+    )
+
+
+def _write_test_manifest(path: Path, manifest: ExpertManifest) -> tuple[str, str]:
+    finalized = manifest.with_digest()
+    payload = (json.dumps(finalized.to_dict(), indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    path.write_bytes(payload)
+    assert finalized.manifest_sha256 is not None
+    return hashlib.sha256(payload).hexdigest(), finalized.manifest_sha256
+
+
+def _conversion_test_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, object]:
+    source_root = tmp_path / "hy3-expert-only-mlx-q4"
+    resident_manifest, _resident_payloads = _resident_source(source_root)
+    source_spec = _test_conversion_spec(bits=4, resident_bytes=16)
+    target_spec = _test_conversion_spec(bits=2, resident_bytes=16)
+    source_components = _test_component_metadata(source_spec)
+    source_record_bytes = sum(item[3] for item in source_components)
+    target_record_bytes = target_spec.expert_record_bytes
+    one_record = b"".join(
+        bytes([index + 1]) * length
+        for index, (_component, _dtype, _shape, length) in enumerate(source_components)
+    )
+    records = []
+    for expert in range(source_spec.expert_count):
+        record_offset = expert * source_record_bytes
+        cursor = record_offset
+        segments = []
+        for component, dtype, shape, length in source_components:
+            segments.append(
+                TensorSegment(
+                    component=component,
+                    tensor=(
+                        f"model.layers.1.mlp.switch_mlp.experts.{expert}.{component}"
+                    ),
+                    shard="experts.bin",
+                    offset=cursor,
+                    length=length,
+                    dtype=dtype,
+                    shape=shape,
+                )
+            )
+            cursor += length
+        records.append(
+            ExpertRecord(
+                layer=1,
+                expert=expert,
+                logical_bytes=source_record_bytes,
+                segments=tuple(segments),
+                sha256=hashlib.sha256(one_record).hexdigest(),
+                sidecar_offset=record_offset,
+                sidecar_length=source_record_bytes,
+            )
+        )
+    source_sidecar = one_record * source_spec.expert_count
+    (source_root / "experts.bin").write_bytes(source_sidecar)
+    sidecar_sha256 = hashlib.sha256(source_sidecar).hexdigest()
+    sidecar = SidecarInfo(
+        file="experts.bin",
+        alignment=256,
+        size=len(source_sidecar),
+        sha256=sidecar_sha256,
+    )
+    sidecar_shard = ShardInfo(
+        name="experts.bin",
+        size=len(source_sidecar),
+        header_bytes=0,
+        header_sha256=EMPTY_SHA256,
+        sha256=sidecar_sha256,
+        kind="sidecar",
+    )
+    manifest = replace(
+        resident_manifest,
+        model_key=source_spec.key,
+        source_repo=source_spec.quant_model,
+        source_revision=source_spec.quant_revision,
+        quant_bits=4,
+        quant_group_size=64,
+        quant_mode="affine",
+        artifact_tensor_bytes=16 + len(source_sidecar),
+        resident_tensor_bytes=16,
+        routed_expert_bytes=len(source_sidecar),
+        shards=(*resident_manifest.shards, sidecar_shard),
+        records=tuple(records),
+        sidecar=sidecar,
+        manifest_sha256=None,
+    )
+    manifest_path = source_root / "expert-manifest.json"
+    manifest_file_sha256, manifest_sha256 = _write_test_manifest(
+        manifest_path,
+        manifest,
+    )
+    provenance = {
+        "format": "mtplx-hy3-expert-only-q4-provenance-v1",
+        "source": {
+            "repo": source_spec.source_model,
+            "revision": source_spec.source_revision,
+        },
+        "oracle": {
+            "repo": source_spec.quant_model,
+            "revision": source_spec.quant_revision,
+        },
+    }
+    provenance_path = source_root / "conversion-provenance.json"
+    provenance_path.write_text(
+        json.dumps(provenance, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    def file_sha256(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    expectations = q2_module._ConversionExpectations(
+        source_root=source_root,
+        manifest_file_sha256=manifest_file_sha256,
+        manifest_sha256=manifest_sha256,
+        provenance_sha256=file_sha256(provenance_path),
+        index_sha256=file_sha256(source_root / "model.safetensors.index.json"),
+        config_sha256=file_sha256(source_root / "config.json"),
+        sidecar_sha256=sidecar_sha256,
+        source_sidecar_bytes=len(source_sidecar),
+        record_count=source_spec.expert_count,
+        source_record_bytes=source_record_bytes,
+        target_record_bytes=target_record_bytes,
+        target_sidecar_bytes=target_record_bytes * target_spec.expert_count,
+        resident_tensor_bytes=16,
+        target_tensor_bytes=16 + target_record_bytes * target_spec.expert_count,
+        resident_shard_count=len(resident_manifest.shards),
+        alignment=256,
+        resident_source_repo=source_spec.source_model,
+        resident_source_revision=source_spec.source_revision,
+        oracle_repo=source_spec.quant_model,
+        oracle_revision=source_spec.quant_revision,
+    )
+    expectation_box = [expectations]
+    producer_box = [{"git_commit": "a" * 40, "dirty": False}]
+    mlx_box = ["0.31.test"]
+    target_state_box: list[dict[str, object] | None] = [None]
+    free_box = [10**15]
+    monkeypatch.setattr(
+        q2_module,
+        "_conversion_expectations",
+        lambda: expectation_box[0],
+    )
+    monkeypatch.setattr(q2_module, "_source_descriptor", lambda: source_spec)
+    monkeypatch.setattr(q2_module, "_target_descriptor", lambda: target_spec)
+    monkeypatch.setattr(q2_module, "_producer_state", lambda: producer_box[0])
+    monkeypatch.setattr(q2_module, "_mlx_version", lambda: mlx_box[0])
+    original_target_state = q2_module._target_descriptor_state
+    monkeypatch.setattr(
+        q2_module,
+        "_target_descriptor_state",
+        lambda spec: target_state_box[0] or original_target_state(spec),
+    )
+    monkeypatch.setattr(
+        q2_module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=10**15, used=0, free=free_box[0]),
+    )
+    conversions: list[tuple[int, int]] = []
+
+    def fake_requantize(
+        record: ExpertRecord,
+        read_component,
+        write_component,
+        **_kwargs,
+    ):
+        conversions.append((record.layer, record.expert))
+        for source_segment, target in zip(
+            record.segments,
+            _test_component_metadata(target_spec),
+            strict=True,
+        ):
+            component, _dtype, _shape, length = target
+            seed = hashlib.sha256(
+                read_component(source_segment) + component.encode("utf-8")
+            ).digest()
+            payload = (seed * ((length + len(seed) - 1) // len(seed)))[:length]
+            write_component(component, payload)
+        return tuple(
+            ProjectionDiagnostics(
+                component=projection,
+                cosine_q4_q2=0.99,
+                normalized_error_q4_q2=0.01,
+                finite=True,
+            )
+            for projection in _PROJECTIONS
+        )
+
+    monkeypatch.setattr(
+        q2_module,
+        "requantize_expert_record_q4_to_q2",
+        fake_requantize,
+    )
+    output_root = tmp_path / "hy3-expert-only-mlx-q2"
+    config = ConversionConfig(
+        source_root=source_root,
+        source_manifest=manifest_path,
+        source_provenance=provenance_path,
+        output_root=output_root,
+        alignment=256,
+    )
+    return {
+        "config": config,
+        "source_root": source_root,
+        "output_root": output_root,
+        "work_root": output_root.with_name(f".{output_root.name}.incomplete"),
+        "manifest_path": manifest_path,
+        "provenance_path": provenance_path,
+        "expectation_box": expectation_box,
+        "producer_box": producer_box,
+        "mlx_box": mlx_box,
+        "target_state_box": target_state_box,
+        "free_box": free_box,
+        "conversions": conversions,
+        "target_record_bytes": target_record_bytes,
+        "source_record_bytes": source_record_bytes,
+        "manifest": manifest.with_digest(),
+        "source_spec": source_spec,
+    }
+
+
+def _rewrite_conversion_test_manifest(
+    env: dict[str, object],
+    manifest: ExpertManifest,
+) -> ExpertManifest:
+    finalized = manifest.with_digest()
+    file_sha256, manifest_sha256 = _write_test_manifest(
+        env["manifest_path"],
+        finalized,
+    )
+    env["expectation_box"][0] = replace(
+        env["expectation_box"][0],
+        manifest_file_sha256=file_sha256,
+        manifest_sha256=manifest_sha256,
+    )
+    env["manifest"] = finalized
+    return finalized
+
+
+def test_provenance_contract_uses_exact_hy3_counts_bytes_and_derivation() -> None:
+    expectations = q2_module._conversion_expectations()
+    manifest = q2_module._minimum_conversion_manifest(expectations)
+
+    assert manifest["schema"] == "mtplx-hy3-expert-q2-conversion-v1"
+    assert manifest["derivation"] == {
+        "kind": "q4_to_q2",
+        "source_bits": 4,
+        "target_bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "external_q2_artifact_used": False,
+    }
+    assert manifest["target"] == {
+        "model_key": "hy3-expert-q2",
+        "record_count": 15_168,
+        "record_bytes": 5_898_240,
+        "sidecar_bytes": 89_464_504_320,
+        "resident_tensor_bytes": 17_494_289_664,
+        "tensor_bytes": 106_958_793_984,
+        "mtp_included": False,
+    }
+
+
+def test_preflight_checks_exact_source_and_space_before_workdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    config = env["config"]
+
+    report = preflight_hy3_expert_q2(config, deep_source_hash=True)
+
+    assert not env["work_root"].exists()
+    assert report["source"]["model_key"] == "hy3-expert-only-q4"
+    assert report["source"]["record_count"] == 3
+    assert report["target"]["record_bytes"] == env["target_record_bytes"]
+    assert report["space"]["required_bytes"] == (
+        (report["space"]["base_bytes"] * 105 + 99) // 100 + 64 * 1024**2
+    )
+    assert report["space"]["free_bytes"] == 10**15
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "manifest_file",
+        "index",
+        "config",
+        "provenance",
+        "sidecar_size",
+        "sidecar_hash",
+        "resident_size",
+        "dirty",
+        "free_space",
+    ],
+)
+def test_preflight_rejects_source_or_producer_fault_before_workdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    source_root = env["source_root"]
+    if fault == "manifest_file":
+        env["manifest_path"].write_bytes(env["manifest_path"].read_bytes() + b" ")
+    elif fault in {"index", "config", "provenance"}:
+        name = {
+            "index": "model.safetensors.index.json",
+            "config": "config.json",
+            "provenance": "conversion-provenance.json",
+        }[fault]
+        (source_root / name).write_bytes((source_root / name).read_bytes() + b" ")
+    elif fault == "sidecar_size":
+        sidecar = source_root / "experts.bin"
+        sidecar.write_bytes(sidecar.read_bytes()[:-1])
+    elif fault == "sidecar_hash":
+        sidecar = source_root / "experts.bin"
+        payload = bytearray(sidecar.read_bytes())
+        payload[-1] ^= 0xFF
+        sidecar.write_bytes(payload)
+    elif fault == "resident_size":
+        shard = source_root / "model-00001-of-00003.safetensors"
+        shard.write_bytes(shard.read_bytes()[:-1])
+    elif fault == "dirty":
+        env["producer_box"][0] = {"git_commit": "a" * 40, "dirty": True}
+    else:
+        env["free_box"][0] = 0
+
+    with pytest.raises(ValueError, match="hash|size|dirty|space|provenance"):
+        preflight_hy3_expert_q2(env["config"], deep_source_hash=True)
+
+    assert not env["work_root"].exists()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["model_key", "q4_metadata", "record_product", "resident_bytes", "upstream"],
+)
+def test_preflight_rejects_structural_source_fault_before_workdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    manifest = env["manifest"]
+    if fault == "model_key":
+        _rewrite_conversion_test_manifest(
+            env,
+            replace(manifest, model_key="wrong-source-key", manifest_sha256=None),
+        )
+    elif fault == "q4_metadata":
+        _rewrite_conversion_test_manifest(
+            env,
+            replace(manifest, quant_bits=2, manifest_sha256=None),
+        )
+    elif fault == "record_product":
+        records = manifest.records[:-1]
+        routed_bytes = sum(record.logical_bytes for record in records)
+        _rewrite_conversion_test_manifest(
+            env,
+            replace(
+                manifest,
+                records=records,
+                routed_expert_bytes=routed_bytes,
+                artifact_tensor_bytes=manifest.resident_tensor_bytes + routed_bytes,
+                manifest_sha256=None,
+            ),
+        )
+    elif fault == "resident_bytes":
+        _rewrite_conversion_test_manifest(
+            env,
+            replace(
+                manifest,
+                resident_tensor_bytes=manifest.resident_tensor_bytes + 1,
+                artifact_tensor_bytes=manifest.artifact_tensor_bytes + 1,
+                manifest_sha256=None,
+            ),
+        )
+    else:
+        provenance_path = env["provenance_path"]
+        provenance = json.loads(provenance_path.read_text())
+        provenance["source"]["repo"] = "attacker/repo"
+        provenance_path.write_text(json.dumps(provenance) + "\n")
+        env["expectation_box"][0] = replace(
+            env["expectation_box"][0],
+            provenance_sha256=hashlib.sha256(provenance_path.read_bytes()).hexdigest(),
+        )
+
+    with pytest.raises(ValueError, match="model|manifest|record|resident|provenance"):
+        preflight_hy3_expert_q2(env["config"], deep_source_hash=False)
+
+    assert not env["work_root"].exists()
+
+
+def test_convert_checks_free_space_before_creating_workdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    env["free_box"][0] = 0
+
+    with pytest.raises(ValueError, match="free space"):
+        convert_expert_records(env["config"], resume=True)
+
+    assert not env["work_root"].exists()
+
+
+def test_conversion_config_rejects_unpinned_paths_and_alignment(tmp_path: Path) -> None:
+    source_root = tmp_path / "wrong-source"
+    output_root = tmp_path / "hy3-expert-only-mlx-q2"
+
+    with pytest.raises(ValueError, match="source_root"):
+        ConversionConfig(
+            source_root=source_root,
+            source_manifest=source_root / "expert-manifest.json",
+            source_provenance=source_root / "conversion-provenance.json",
+            output_root=output_root,
+        )
+    source_root = tmp_path / "hy3-expert-only-mlx-q4"
+    with pytest.raises(ValueError, match="alignment"):
+        ConversionConfig(
+            source_root=source_root,
+            source_manifest=source_root / "expert-manifest.json",
+            source_provenance=source_root / "conversion-provenance.json",
+            output_root=output_root,
+            alignment=3,
+        )
+
+
+def test_journal_fsyncs_output_before_record_and_binds_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    original_fsync = q2_module.os.fsync
+    fsync_inodes: list[int] = []
+
+    def record_fsync(fd: int) -> None:
+        fsync_inodes.append(os.fstat(fd).st_ino)
+        original_fsync(fd)
+
+    monkeypatch.setattr(q2_module.os, "fsync", record_fsync)
+    records = convert_expert_records(env["config"], resume=True)
+    output_path = env["work_root"] / "experts.bin"
+    journal_path = env["work_root"] / "conversion-journal.jsonl"
+    output_inode = output_path.stat().st_ino
+    journal_inode = journal_path.stat().st_ino
+    relevant = [
+        inode for inode in fsync_inodes if inode in {output_inode, journal_inode}
+    ]
+
+    assert len(records) == 3
+    assert relevant == [
+        journal_inode,
+        output_inode,
+        journal_inode,
+        output_inode,
+        journal_inode,
+        output_inode,
+        journal_inode,
+    ]
+    lines = [json.loads(line) for line in journal_path.read_text().splitlines()]
+    assert lines[0]["source"]["fingerprint_sha256"]
+    assert lines[0]["producer"] == {"git_commit": "a" * 40, "dirty": False}
+    assert lines[0]["mlx_version"] == "0.31.test"
+    assert lines[0]["derivation"]["external_q2_artifact_used"] is False
+    assert all(len(line["source"]["components"]) == 9 for line in lines[1:])
+    assert all(len(line["output"]["components"]) == 9 for line in lines[1:])
+
+
+def test_journal_never_records_a_record_when_output_fsync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    original_fsync = q2_module.os.fsync
+    failed = False
+
+    def fail_first_output_fsync(fd: int) -> None:
+        nonlocal failed
+        output = env["work_root"] / "experts.bin"
+        if (
+            not failed
+            and output.exists()
+            and os.fstat(fd).st_ino == output.stat().st_ino
+            and os.fstat(fd).st_size > 0
+        ):
+            failed = True
+            raise OSError("injected output fsync failure")
+        original_fsync(fd)
+
+    monkeypatch.setattr(q2_module.os, "fsync", fail_first_output_fsync)
+
+    with pytest.raises(OSError, match="injected output fsync failure"):
+        convert_expert_records(env["config"], resume=True)
+
+    journal = env["work_root"] / "conversion-journal.jsonl"
+    assert failed is True
+    assert len(journal.read_text().splitlines()) == 1
+
+
+def test_resume_refuses_noncontiguous_journal_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    convert_expert_records(env["config"], resume=True)
+    journal = env["work_root"] / "conversion-journal.jsonl"
+    lines = journal.read_bytes().splitlines(keepends=True)
+    journal.write_bytes(b"".join((lines[0], lines[1], lines[3])))
+
+    with pytest.raises(ValueError, match="contiguous|journal|chain"):
+        convert_expert_records(env["config"], resume=True)
+
+
+def test_resume_accepts_only_durable_contiguous_prefix_and_discards_extra_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    convert_expert_records(env["config"], resume=True)
+    journal = env["work_root"] / "conversion-journal.jsonl"
+    lines = journal.read_bytes().splitlines(keepends=True)
+    journal.write_bytes(b"".join(lines[:-1]))
+    env["conversions"].clear()
+
+    records = convert_expert_records(env["config"], resume=True)
+
+    assert len(records) == 3
+    assert env["conversions"] == [(1, 2)]
+    assert (env["work_root"] / "experts.bin").stat().st_size == (
+        3 * env["target_record_bytes"]
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["commit", "mlx", "source_fingerprint", "target_descriptor"],
+)
+def test_resume_refuses_changed_build_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    convert_expert_records(env["config"], resume=True)
+    if change == "commit":
+        env["producer_box"][0] = {"git_commit": "b" * 40, "dirty": False}
+    elif change == "mlx":
+        env["mlx_box"][0] = "0.32.test"
+    elif change == "source_fingerprint":
+        tokenizer = env["source_root"] / "tokenizer.json"
+        tokenizer.write_bytes(tokenizer.read_bytes() + b" ")
+    else:
+        env["target_state_box"][0] = {"key": "changed-target"}
+
+    with pytest.raises(ValueError, match="fingerprint|header|resume"):
+        convert_expert_records(env["config"], resume=True)
+
+
+def test_resume_source_mismatch_is_fatal_without_truncation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    convert_expert_records(env["config"], resume=True)
+    output = env["work_root"] / "experts.bin"
+    journal = env["work_root"] / "conversion-journal.jsonl"
+    original_sizes = (output.stat().st_size, journal.stat().st_size)
+    source = env["source_root"] / "experts.bin"
+    payload = bytearray(source.read_bytes())
+    payload[env["source_record_bytes"] + 1] ^= 0xFF
+    source.write_bytes(payload)
+
+    with pytest.raises(ValueError, match="source.*hash|source.*mismatch"):
+        convert_expert_records(env["config"], resume=True)
+
+    assert (output.stat().st_size, journal.stat().st_size) == original_sizes
+
+
+def test_resume_output_corruption_truncates_to_prefix_and_recomputes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    convert_expert_records(env["config"], resume=True)
+    output = env["work_root"] / "experts.bin"
+    expected_output = output.read_bytes()
+    env["conversions"].clear()
+    payload = bytearray(expected_output)
+    payload[env["target_record_bytes"] + 1] ^= 0xFF
+    output.write_bytes(payload)
+
+    records = convert_expert_records(env["config"], resume=True)
+
+    assert len(records) == 3
+    assert env["conversions"] == [(1, 1), (1, 2)]
+    assert output.read_bytes() == expected_output

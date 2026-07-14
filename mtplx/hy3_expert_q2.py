@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
 import re
+import shutil
 import stat
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
@@ -20,7 +23,9 @@ from .expert_manifest import (
     ResidentTensor,
     ShardInfo,
     TensorSegment,
+    validate_expert_manifest_spec,
 )
+from .expert_streaming_models import ExpertStreamingModelSpec, get_model_spec
 
 
 SOURCE_MODEL_KEY = "hy3-expert-only-q4"
@@ -28,6 +33,41 @@ TARGET_MODEL_KEY = "hy3-expert-q2"
 SOURCE_MANIFEST_SHA256 = (
     "507ca09cebb9ef5180c46401db7b61d8a9759ffd04ffbc97c5dbba0e9ef89f43"
 )
+_SOURCE_MANIFEST_FILE_SHA256 = (
+    "e7fcfd6c69486456af4261d908d95f8a84a391d6a273ff1cff02a15f73fac92d"
+)
+_SOURCE_PROVENANCE_SHA256 = (
+    "e832743f84f09f5a548a8734b2ab6d75043e32723223e90b1c05da074b42e7f2"
+)
+_SOURCE_INDEX_SHA256 = (
+    "b901cc98a86131b519d69294d65a20023b5ac4d5706c96bd4bf128ef7e41ef5e"
+)
+_SOURCE_CONFIG_SHA256 = (
+    "cf58dd3aaf61b1d59495622c209680abf718d2ee8fd952b56187e57f355923b7"
+)
+_SOURCE_SIDECAR_SHA256 = (
+    "5ba698b9b2c51bca66254e5d8d35101325e37dfe40744294d4aa233c980472ae"
+)
+_CONVERSION_SCHEMA = "mtplx-hy3-expert-q2-conversion-v1"
+_JOURNAL_SCHEMA = "mtplx-hy3-expert-q2-journal-v1"
+_SOURCE_DIRECTORY_NAME = "hy3-expert-only-mlx-q4"
+_TARGET_DIRECTORY_NAME = "hy3-expert-only-mlx-q2"
+_WORK_DIRECTORY_NAME = ".hy3-expert-only-mlx-q2.incomplete"
+_JOURNAL_FILE = "conversion-journal.jsonl"
+_SIDECAR_FILE = "experts.bin"
+_DEFAULT_ALIGNMENT = 16 * 1024
+_SOURCE_RECORD_BYTES = 10_616_832
+_TARGET_RECORD_BYTES = 5_898_240
+_RECORD_COUNT = 15_168
+_SOURCE_SIDECAR_BYTES = 161_036_107_776
+_TARGET_SIDECAR_BYTES = 89_464_504_320
+_RESIDENT_TENSOR_BYTES = 17_494_289_664
+_TARGET_TENSOR_BYTES = 106_958_793_984
+_RESIDENT_SHARD_COUNT = 18
+_PROJECTION_WORKING_RESERVE = 64 * 1024**2
+_MAX_MANIFEST_BYTES = 256 * 1024**2
+_MAX_PROVENANCE_BYTES = 16 * 1024**2
+_MAX_JOURNAL_BYTES = 1024 * 1024**2
 
 _PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 _LEAVES = ("weight", "scales", "biases")
@@ -119,6 +159,79 @@ class _HfBlobLayout:
     blobs_fd: int | None = None
 
 
+@dataclass(frozen=True)
+class ConversionConfig:
+    source_root: Path
+    source_manifest: Path
+    source_provenance: Path
+    output_root: Path
+    alignment: int = _DEFAULT_ALIGNMENT
+    pilot_report: Path | None = None
+
+    def __post_init__(self) -> None:
+        paths = {
+            "source_root": self.source_root,
+            "source_manifest": self.source_manifest,
+            "source_provenance": self.source_provenance,
+            "output_root": self.output_root,
+        }
+        if self.pilot_report is not None:
+            paths["pilot_report"] = self.pilot_report
+        for label, path in paths.items():
+            if not isinstance(path, Path) or not path.is_absolute():
+                raise ValueError(f"{label} must be an absolute pathlib.Path")
+        if self.source_root.name != _SOURCE_DIRECTORY_NAME:
+            raise ValueError("source_root must name the pinned Hy3 Q4 artifact")
+        if self.output_root.name != _TARGET_DIRECTORY_NAME:
+            raise ValueError("output_root must name the explicit Hy3 Q2 artifact")
+        if self.source_root.parent != self.output_root.parent:
+            raise ValueError("source and output roots must be siblings")
+        if self.source_manifest != self.source_root / "expert-manifest.json":
+            raise ValueError("source_manifest must be the source root manifest")
+        if self.source_provenance != self.source_root / "conversion-provenance.json":
+            raise ValueError("source_provenance must be the source root provenance")
+        if (
+            isinstance(self.alignment, bool)
+            or not isinstance(self.alignment, int)
+            or self.alignment <= 0
+            or self.alignment & (self.alignment - 1)
+        ):
+            raise ValueError("alignment must be a positive power of two")
+
+
+@dataclass(frozen=True)
+class _ConversionExpectations:
+    source_root: Path
+    manifest_file_sha256: str
+    manifest_sha256: str
+    provenance_sha256: str
+    index_sha256: str
+    config_sha256: str
+    sidecar_sha256: str
+    source_sidecar_bytes: int
+    record_count: int
+    source_record_bytes: int
+    target_record_bytes: int
+    target_sidecar_bytes: int
+    resident_tensor_bytes: int
+    target_tensor_bytes: int
+    resident_shard_count: int
+    alignment: int
+    resident_source_repo: str
+    resident_source_revision: str
+    oracle_repo: str
+    oracle_revision: str
+
+
+@dataclass(frozen=True)
+class _PreflightContext:
+    manifest: ExpertManifest
+    report: dict[str, Any]
+    source_descriptor: ExpertStreamingModelSpec
+    target_descriptor: ExpertStreamingModelSpec
+    expectations: _ConversionExpectations
+
+
 def _read_flags() -> int:
     return os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 
@@ -133,6 +246,10 @@ def _write_flags() -> int:
     )
 
 
+def _read_write_flags() -> int:
+    return os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
 def _directory_flags() -> int:
     return (
         os.O_RDONLY
@@ -140,6 +257,124 @@ def _directory_flags() -> int:
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
+
+
+def _conversion_expectations() -> _ConversionExpectations:
+    return _ConversionExpectations(
+        source_root=Path("/Users/davidtai/.cache/huggingface/hy3-expert-only-mlx-q4"),
+        manifest_file_sha256=_SOURCE_MANIFEST_FILE_SHA256,
+        manifest_sha256=SOURCE_MANIFEST_SHA256,
+        provenance_sha256=_SOURCE_PROVENANCE_SHA256,
+        index_sha256=_SOURCE_INDEX_SHA256,
+        config_sha256=_SOURCE_CONFIG_SHA256,
+        sidecar_sha256=_SOURCE_SIDECAR_SHA256,
+        source_sidecar_bytes=_SOURCE_SIDECAR_BYTES,
+        record_count=_RECORD_COUNT,
+        source_record_bytes=_SOURCE_RECORD_BYTES,
+        target_record_bytes=_TARGET_RECORD_BYTES,
+        target_sidecar_bytes=_TARGET_SIDECAR_BYTES,
+        resident_tensor_bytes=_RESIDENT_TENSOR_BYTES,
+        target_tensor_bytes=_TARGET_TENSOR_BYTES,
+        resident_shard_count=_RESIDENT_SHARD_COUNT,
+        alignment=_DEFAULT_ALIGNMENT,
+        resident_source_repo="tencent/Hy3",
+        resident_source_revision="716aa7241bd6d95896be4ebfc761162a9c4d49ef",
+        oracle_repo="pipenetwork/Hy3-4bit",
+        oracle_revision="160619d3f96c8470350b6dac0ef033a8381551e3",
+    )
+
+
+def _source_descriptor() -> ExpertStreamingModelSpec:
+    return get_model_spec(SOURCE_MODEL_KEY)
+
+
+def _target_descriptor() -> ExpertStreamingModelSpec:
+    return get_model_spec(TARGET_MODEL_KEY)
+
+
+def _producer_state() -> dict[str, Any]:
+    repository = Path(__file__).resolve().parents[1]
+
+    def run(*arguments: str) -> str:
+        completed = subprocess.run(
+            ("git", *arguments),
+            cwd=repository,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            raise ValueError(
+                f"could not establish producer Git state: {completed.stderr.strip()}"
+            )
+        return completed.stdout.strip()
+
+    commit = run("rev-parse", "HEAD")
+    if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        raise ValueError("producer Git commit is not a full SHA-1")
+    dirty = bool(run("status", "--porcelain", "--untracked-files=all"))
+    return {"git_commit": commit, "dirty": dirty}
+
+
+def _mlx_version() -> str:
+    try:
+        return importlib.metadata.version("mlx")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise ValueError("MLX package version is unavailable") from exc
+
+
+def _target_descriptor_state(spec: ExpertStreamingModelSpec) -> dict[str, Any]:
+    return {
+        "key": spec.key,
+        "source_model": spec.source_model,
+        "source_revision": spec.source_revision,
+        "quant_model": spec.quant_model,
+        "quant_revision": spec.quant_revision,
+        "total_tensor_bytes": spec.total_tensor_bytes,
+        "total_layers": spec.total_layers,
+        "routed_layer_start": spec.routed_layer_start,
+        "routed_layer_count": spec.routed_layer_count,
+        "expert_count": spec.expert_count,
+        "hidden_size": spec.hidden_size,
+        "expert_hidden_size": spec.expert_hidden_size,
+        "quant_bits": spec.quant_bits,
+        "quant_group_size": spec.quant_group_size,
+        "quant_parameter_bytes": spec.quant_parameter_bytes,
+        "mtp_layer_index": spec.mtp_layer_index,
+        "mtp_included": spec.mtp_included,
+    }
+
+
+def _minimum_conversion_manifest(
+    expectations: _ConversionExpectations,
+) -> dict[str, Any]:
+    return {
+        "schema": _CONVERSION_SCHEMA,
+        "source": {
+            "model_key": SOURCE_MODEL_KEY,
+            "manifest_file_sha256": expectations.manifest_file_sha256,
+            "manifest_sha256": expectations.manifest_sha256,
+            "conversion_provenance_sha256": expectations.provenance_sha256,
+            "sidecar_sha256": expectations.sidecar_sha256,
+        },
+        "derivation": {
+            "kind": "q4_to_q2",
+            "source_bits": 4,
+            "target_bits": 2,
+            "group_size": 64,
+            "mode": "affine",
+            "external_q2_artifact_used": False,
+        },
+        "target": {
+            "model_key": TARGET_MODEL_KEY,
+            "record_count": expectations.record_count,
+            "record_bytes": expectations.target_record_bytes,
+            "sidecar_bytes": expectations.target_sidecar_bytes,
+            "resident_tensor_bytes": expectations.resident_tensor_bytes,
+            "tensor_bytes": expectations.target_tensor_bytes,
+            "mtp_included": False,
+        },
+    }
 
 
 def _pread_chunk(fd: int, length: int, offset: int) -> bytes:
@@ -1604,3 +1839,1177 @@ def requantize_expert_record_q4_to_q2(
     for component, payload in staged_outputs:
         write_component(component, payload)
     return tuple(diagnostics)
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"value is not canonical JSON: {exc}") from exc
+
+
+def _sha256_path(path: Path, *, expected_size: int | None = None) -> tuple[str, int]:
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"source file is not regular: {path}")
+        if expected_size is not None and metadata.st_size != expected_size:
+            raise ValueError(
+                f"source file size mismatch for {path.name}: "
+                f"{metadata.st_size} != {expected_size}"
+            )
+        fd = os.open(path, _read_flags())
+    except OSError as exc:
+        raise ValueError(f"source file is unavailable: {path}: {exc}") from exc
+    try:
+        descriptor = os.fstat(fd)
+        repeated = os.stat(path, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(descriptor.st_mode)
+            or (descriptor.st_dev, descriptor.st_ino)
+            != (metadata.st_dev, metadata.st_ino)
+            or (repeated.st_dev, repeated.st_ino)
+            != (descriptor.st_dev, descriptor.st_ino)
+        ):
+            raise ValueError(f"source file changed while opening: {path}")
+        digest = _hash_fd(
+            fd,
+            length=descriptor.st_size,
+            chunk_bytes=8 * 1024**2,
+        )
+        final = os.fstat(fd)
+        if (final.st_dev, final.st_ino, final.st_size) != (
+            descriptor.st_dev,
+            descriptor.st_ino,
+            descriptor.st_size,
+        ):
+            raise ValueError(f"source file changed while hashing: {path}")
+        return digest, descriptor.st_size
+    finally:
+        os.close(fd)
+
+
+def _read_json_path(path: Path, *, max_bytes: int, label: str) -> tuple[Any, str, int]:
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_bytes:
+            raise ValueError(f"{label} must be a bounded regular file")
+        fd = os.open(path, _read_flags())
+    except OSError as exc:
+        raise ValueError(f"{label} is unavailable: {exc}") from exc
+    try:
+        descriptor = os.fstat(fd)
+        if (descriptor.st_dev, descriptor.st_ino) != (
+            metadata.st_dev,
+            metadata.st_ino,
+        ):
+            raise ValueError(f"{label} changed while opening")
+        payload = _pread_exact(fd, 0, descriptor.st_size, label=label)
+        repeated = os.fstat(fd)
+        if (repeated.st_dev, repeated.st_ino, repeated.st_size) != (
+            descriptor.st_dev,
+            descriptor.st_ino,
+            descriptor.st_size,
+        ):
+            raise ValueError(f"{label} changed while reading")
+    finally:
+        os.close(fd)
+    try:
+        value = json.loads(payload, object_pairs_hook=_strict_json_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid {label} JSON: {exc}") from exc
+    return value, hashlib.sha256(payload).hexdigest(), len(payload)
+
+
+def _work_root(config: ConversionConfig) -> Path:
+    work_root = config.output_root.with_name(_WORK_DIRECTORY_NAME)
+    if work_root.parent != config.output_root.parent:
+        raise ValueError("work root is not the stable output sibling")
+    return work_root
+
+
+def _descriptor_component_metadata(
+    spec: ExpertStreamingModelSpec,
+) -> tuple[tuple[str, str, tuple[int, int], int], ...]:
+    result: list[tuple[str, str, tuple[int, int], int]] = []
+    for projection in _PROJECTIONS:
+        input_size = (
+            spec.hidden_size if projection != "down_proj" else spec.expert_hidden_size
+        )
+        output_size = (
+            spec.expert_hidden_size if projection != "down_proj" else spec.hidden_size
+        )
+        shapes = (
+            (output_size, input_size * spec.quant_bits // 32),
+            (output_size, input_size // spec.quant_group_size),
+            (output_size, input_size // spec.quant_group_size),
+        )
+        for leaf, dtype, shape in zip(_LEAVES, _DTYPES, shapes, strict=True):
+            item_size = 4 if dtype == "U32" else 2
+            result.append(
+                (
+                    f"{projection}.{leaf}",
+                    dtype,
+                    shape,
+                    shape[0] * shape[1] * item_size,
+                )
+            )
+    return tuple(result)
+
+
+def _validate_upstream_provenance(
+    value: Any,
+    expectations: _ConversionExpectations,
+) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("source provenance must be an object")
+    source = value.get("source")
+    oracle = value.get("oracle")
+    if not isinstance(source, dict) or not isinstance(oracle, dict):
+        raise ValueError("source provenance lacks source or oracle identity")
+    if (
+        source.get("repo") != expectations.resident_source_repo
+        or source.get("revision") != expectations.resident_source_revision
+    ):
+        raise ValueError("source provenance resident identity mismatch")
+    if (
+        oracle.get("repo") != expectations.oracle_repo
+        or oracle.get("revision") != expectations.oracle_revision
+    ):
+        raise ValueError("source provenance Q4 oracle identity mismatch")
+
+
+def _preflight_context(
+    config: ConversionConfig,
+    *,
+    deep_source_hash: bool,
+) -> _PreflightContext:
+    if not isinstance(config, ConversionConfig):
+        raise TypeError("config must be a ConversionConfig")
+    if not isinstance(deep_source_hash, bool):
+        raise TypeError("deep_source_hash must be a bool")
+    expectations = _conversion_expectations()
+    if config.source_root != expectations.source_root:
+        raise ValueError("source path does not match the pinned Hy3 Q4 artifact")
+    if config.alignment != expectations.alignment:
+        raise ValueError("conversion alignment does not match the pinned descriptor")
+    if expectations.target_record_bytes % config.alignment:
+        raise ValueError("target record bytes are not exactly alignment-divisible")
+    if (
+        expectations.record_count * expectations.target_record_bytes
+        != expectations.target_sidecar_bytes
+    ):
+        raise ValueError("target record count and bytes do not equal sidecar bytes")
+    if (
+        expectations.target_sidecar_bytes + expectations.resident_tensor_bytes
+        != expectations.target_tensor_bytes
+    ):
+        raise ValueError("target routed and resident bytes do not equal tensor bytes")
+    source_root = _require_real_directory(config.source_root, label="source root")
+    output_parent = _require_real_directory(
+        config.output_root.parent,
+        label="output parent",
+    )
+    if config.output_root.exists() or config.output_root.is_symlink():
+        raise ValueError("final output root already exists")
+    work_root = _work_root(config)
+    if work_root.is_symlink():
+        raise ValueError("conversion work root must not be a symlink")
+    if work_root.exists():
+        _require_real_directory(work_root, label="conversion work root")
+
+    manifest_value, manifest_file_sha256, manifest_file_bytes = _read_json_path(
+        config.source_manifest,
+        max_bytes=_MAX_MANIFEST_BYTES,
+        label="source expert manifest",
+    )
+    if manifest_file_sha256 != expectations.manifest_file_sha256:
+        raise ValueError("source manifest file hash mismatch")
+    try:
+        manifest = ExpertManifest.from_dict(manifest_value)
+    except ValueError as exc:
+        raise ValueError(f"source manifest is invalid: {exc}") from exc
+    if manifest.manifest_sha256 != expectations.manifest_sha256:
+        raise ValueError("source canonical manifest hash mismatch")
+    source_descriptor = _source_descriptor()
+    target_descriptor = _target_descriptor()
+    validate_expert_manifest_spec(manifest, source_descriptor)
+    if (
+        manifest.model_key != SOURCE_MODEL_KEY
+        or manifest.quant_bits != 4
+        or manifest.quant_group_size != 64
+        or manifest.quant_mode != "affine"
+    ):
+        raise ValueError("source manifest is not the pinned affine Q4 model")
+    if (
+        target_descriptor.key != TARGET_MODEL_KEY
+        or target_descriptor.quant_bits != 2
+        or target_descriptor.quant_group_size != 64
+        or target_descriptor.mtp_included
+    ):
+        raise ValueError(
+            "target descriptor is not the explicit AR-only affine Q2 model"
+        )
+    if source_descriptor.expert_record_bytes != expectations.source_record_bytes:
+        raise ValueError("source descriptor record bytes mismatch")
+    if target_descriptor.expert_record_bytes != expectations.target_record_bytes:
+        raise ValueError("target descriptor record bytes mismatch")
+    if len(manifest.records) != expectations.record_count:
+        raise ValueError("source record count mismatch")
+    expected_keys = tuple(
+        (layer, expert)
+        for layer in source_descriptor.routed_layer_indices
+        for expert in range(source_descriptor.expert_count)
+    )
+    if (
+        tuple((record.layer, record.expert) for record in manifest.records)
+        != expected_keys
+    ):
+        raise ValueError("source record Cartesian product mismatch")
+    for ordinal, record in enumerate(manifest.records):
+        if (
+            record.logical_bytes != expectations.source_record_bytes
+            or record.sidecar_offset != ordinal * expectations.source_record_bytes
+            or record.sidecar_length != expectations.source_record_bytes
+            or record.sha256 is None
+        ):
+            raise ValueError("source record metadata is not canonical Q4")
+    if (
+        manifest.resident_tensor_bytes != expectations.resident_tensor_bytes
+        or target_descriptor.total_tensor_bytes != expectations.target_tensor_bytes
+    ):
+        raise ValueError("resident or target tensor byte accounting mismatch")
+    if manifest.sidecar is None or (
+        manifest.sidecar.file != _SIDECAR_FILE
+        or manifest.sidecar.alignment != expectations.alignment
+        or manifest.sidecar.size != expectations.source_sidecar_bytes
+        or manifest.sidecar.sha256 != expectations.sidecar_sha256
+    ):
+        raise ValueError("source sidecar metadata mismatch")
+
+    provenance, provenance_sha256, provenance_bytes = _read_json_path(
+        config.source_provenance,
+        max_bytes=_MAX_PROVENANCE_BYTES,
+        label="source conversion provenance",
+    )
+    if provenance_sha256 != expectations.provenance_sha256:
+        raise ValueError("source conversion provenance hash mismatch")
+    _validate_upstream_provenance(provenance, expectations)
+
+    index_sha256, index_bytes = _sha256_path(source_root / _INDEX_FILE)
+    config_sha256, config_bytes = _sha256_path(source_root / "config.json")
+    if index_sha256 != expectations.index_sha256:
+        raise ValueError("source resident index hash mismatch")
+    if config_sha256 != expectations.config_sha256:
+        raise ValueError("source config hash mismatch")
+    sidecar_path = source_root / _SIDECAR_FILE
+    sidecar_status = os.stat(sidecar_path, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(sidecar_status.st_mode)
+        or sidecar_status.st_size != expectations.source_sidecar_bytes
+    ):
+        raise ValueError("source sidecar size mismatch")
+    if deep_source_hash:
+        actual_sidecar_sha256, _size = _sha256_path(
+            sidecar_path,
+            expected_size=expectations.source_sidecar_bytes,
+        )
+        if actual_sidecar_sha256 != expectations.sidecar_sha256:
+            raise ValueError("source sidecar hash mismatch")
+
+    manifest_shards = {shard.name: shard for shard in manifest.shards}
+    resident_shard_names = sorted(
+        {tensor.shard for tensor in manifest.resident_tensors}
+    )
+    if len(resident_shard_names) != expectations.resident_shard_count:
+        raise ValueError("resident shard count mismatch")
+    resident_files: list[dict[str, Any]] = []
+    resident_physical_bytes = 0
+    for name in resident_shard_names:
+        shard = manifest_shards.get(name)
+        if shard is None or shard.kind != "safetensors" or shard.sha256 is None:
+            raise ValueError(f"resident shard provenance is incomplete: {name}")
+        try:
+            metadata = os.stat(source_root / name, follow_symlinks=False)
+        except OSError as exc:
+            raise ValueError(f"resident shard is unavailable: {name}: {exc}") from exc
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != shard.size:
+            raise ValueError(f"resident shard size mismatch: {name}")
+        if deep_source_hash:
+            actual_sha256, _size = _sha256_path(
+                source_root / name,
+                expected_size=shard.size,
+            )
+            if actual_sha256 != shard.sha256:
+                raise ValueError(f"resident shard hash mismatch: {name}")
+        resident_physical_bytes += shard.size
+        resident_files.append(
+            {"file": name, "size": shard.size, "sha256": shard.sha256}
+        )
+
+    ancillary_files: list[dict[str, Any]] = [
+        {"file": _INDEX_FILE, "size": index_bytes, "sha256": index_sha256},
+        {"file": "config.json", "size": config_bytes, "sha256": config_sha256},
+    ]
+    ancillary_physical_bytes = index_bytes + config_bytes
+    for name in _ANCILLARY_FILES:
+        if name == "config.json":
+            continue
+        digest, size = _sha256_path(source_root / name)
+        ancillary_files.append({"file": name, "size": size, "sha256": digest})
+        ancillary_physical_bytes += size
+
+    producer = _producer_state()
+    if producer.get("dirty") is not False:
+        raise ValueError("producer Git state is dirty")
+    commit = producer.get("git_commit")
+    if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        raise ValueError("producer Git commit is invalid")
+    mlx_version = _mlx_version()
+    if not isinstance(mlx_version, str) or not mlx_version:
+        raise ValueError("MLX version is invalid")
+    pilot_sha256 = None
+    pilot_bytes = 0
+    if config.pilot_report is not None:
+        pilot_sha256, pilot_bytes = _sha256_path(config.pilot_report)
+
+    source_fingerprint_value = {
+        "source_root": os.fspath(source_root),
+        "manifest_file_sha256": manifest_file_sha256,
+        "manifest_sha256": manifest.manifest_sha256,
+        "provenance_sha256": provenance_sha256,
+        "index_sha256": index_sha256,
+        "config_sha256": config_sha256,
+        "sidecar_sha256": expectations.sidecar_sha256,
+        "sidecar_bytes": expectations.source_sidecar_bytes,
+        "resident_files": resident_files,
+        "ancillary_files": ancillary_files,
+    }
+    source_fingerprint_sha256 = hashlib.sha256(
+        _canonical_json_bytes(source_fingerprint_value)
+    ).hexdigest()
+    report = _minimum_conversion_manifest(expectations)
+    report["source"].update(
+        {
+            "path": os.fspath(source_root),
+            "record_count": len(manifest.records),
+            "record_bytes": expectations.source_record_bytes,
+            "sidecar_bytes": expectations.source_sidecar_bytes,
+            "index_sha256": index_sha256,
+            "config_sha256": config_sha256,
+            "fingerprint_sha256": source_fingerprint_sha256,
+            "resident_files": resident_files,
+            "ancillary_files": ancillary_files,
+        }
+    )
+    report["producer"] = dict(producer)
+    report["mlx_version"] = mlx_version
+    report["target_descriptor"] = _target_descriptor_state(target_descriptor)
+    report["alignment"] = config.alignment
+    report["resident_copy_policy"] = "exact-independent-whole-file"
+    report["pilot_report_sha256"] = pilot_sha256
+    manifest_header_overhead = (
+        manifest_file_bytes
+        + provenance_bytes
+        + pilot_bytes
+        + expectations.record_count * expectations.alignment
+    )
+    base_bytes = (
+        expectations.target_sidecar_bytes
+        + resident_physical_bytes
+        + ancillary_physical_bytes
+        + manifest_header_overhead
+    )
+    required_bytes = (base_bytes * 105 + 99) // 100 + _PROJECTION_WORKING_RESERVE
+    try:
+        free_bytes = shutil.disk_usage(output_parent).free
+    except OSError as exc:
+        raise ValueError(f"could not determine output free space: {exc}") from exc
+    report["space"] = {
+        "target_sidecar_bytes": expectations.target_sidecar_bytes,
+        "resident_file_bytes": resident_physical_bytes,
+        "ancillary_file_bytes": ancillary_physical_bytes,
+        "manifest_header_overhead_bytes": manifest_header_overhead,
+        "base_bytes": base_bytes,
+        "safety_margin_percent": 5,
+        "projection_working_reserve_bytes": _PROJECTION_WORKING_RESERVE,
+        "required_bytes": required_bytes,
+        "free_bytes": free_bytes,
+    }
+    if free_bytes < required_bytes:
+        raise ValueError(
+            f"insufficient free space: {free_bytes} available; {required_bytes} required"
+        )
+    return _PreflightContext(
+        manifest=manifest,
+        report=report,
+        source_descriptor=source_descriptor,
+        target_descriptor=target_descriptor,
+        expectations=expectations,
+    )
+
+
+def preflight_hy3_expert_q2(
+    config: ConversionConfig,
+    *,
+    deep_source_hash: bool,
+) -> dict[str, Any]:
+    """Fail closed on every pinned source, producer, target, and space gate."""
+
+    return _preflight_context(
+        config,
+        deep_source_hash=deep_source_hash,
+    ).report
+
+
+def _journal_header(
+    config: ConversionConfig,
+    context: _PreflightContext,
+) -> dict[str, Any]:
+    report = context.report
+    body = {
+        "kind": "header",
+        "schema": _JOURNAL_SCHEMA,
+        "conversion_schema": _CONVERSION_SCHEMA,
+        "source": report["source"],
+        "derivation": report["derivation"],
+        "target": report["target"],
+        "producer": report["producer"],
+        "mlx_version": report["mlx_version"],
+        "target_descriptor": report["target_descriptor"],
+        "alignment": config.alignment,
+        "resident_copy_policy": report["resident_copy_policy"],
+        "pilot_report_sha256": report["pilot_report_sha256"],
+    }
+    return {
+        **body,
+        "header_sha256": hashlib.sha256(_canonical_json_bytes(body)).hexdigest(),
+    }
+
+
+def _source_record_state(
+    sidecar_fd: int,
+    record: ExpertRecord,
+) -> tuple[bytes, dict[str, Any]]:
+    if (
+        record.sidecar_offset is None
+        or record.sidecar_length is None
+        or record.sha256 is None
+    ):
+        raise ValueError(
+            f"source record ({record.layer}, {record.expert}) lacks sidecar provenance"
+        )
+    payload = _pread_exact(
+        sidecar_fd,
+        record.sidecar_offset,
+        record.sidecar_length,
+        label=f"source record ({record.layer}, {record.expert})",
+    )
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != record.sha256:
+        raise ValueError(
+            f"source record hash mismatch: ({record.layer}, {record.expert})"
+        )
+    components = []
+    for segment in record.segments:
+        relative = segment.offset - record.sidecar_offset
+        if relative < 0 or relative + segment.length > len(payload):
+            raise ValueError("source component escapes its sidecar record")
+        component_payload = payload[relative : relative + segment.length]
+        components.append(
+            {
+                "component": segment.component,
+                "tensor": segment.tensor,
+                "offset": segment.offset,
+                "length": segment.length,
+                "dtype": segment.dtype,
+                "shape": list(segment.shape),
+                "sha256": hashlib.sha256(component_payload).hexdigest(),
+            }
+        )
+    return payload, {
+        "offset": record.sidecar_offset,
+        "length": record.sidecar_length,
+        "sha256": digest,
+        "components": components,
+    }
+
+
+def _output_record_metadata(
+    source_record: ExpertRecord,
+    target_descriptor: ExpertStreamingModelSpec,
+    *,
+    output_offset: int,
+) -> tuple[tuple[TensorSegment, ...], int]:
+    metadata = _descriptor_component_metadata(target_descriptor)
+    if len(source_record.segments) != len(metadata):
+        raise ValueError("source record does not have nine target components")
+    cursor = output_offset
+    segments = []
+    for source_segment, (component, dtype, shape, length) in zip(
+        source_record.segments,
+        metadata,
+        strict=True,
+    ):
+        if source_segment.component != component:
+            raise ValueError("source and target component order differ")
+        segments.append(
+            TensorSegment(
+                component=component,
+                tensor=source_segment.tensor,
+                shard=_SIDECAR_FILE,
+                offset=cursor,
+                length=length,
+                dtype=dtype,
+                shape=shape,
+            )
+        )
+        cursor += length
+    return tuple(segments), cursor - output_offset
+
+
+def _diagnostics_json(
+    diagnostics: tuple[ProjectionDiagnostics, ...],
+) -> list[dict[str, Any]]:
+    if tuple(item.component for item in diagnostics) != _PROJECTIONS:
+        raise ValueError("conversion diagnostics are not projection-complete")
+    result = []
+    for item in diagnostics:
+        if (
+            not item.finite
+            or not math.isfinite(item.cosine_q4_q2)
+            or not math.isfinite(item.normalized_error_q4_q2)
+        ):
+            raise ValueError("conversion diagnostics are non-finite")
+        result.append(
+            {
+                "component": item.component,
+                "cosine_q4_q2": item.cosine_q4_q2,
+                "normalized_error_q4_q2": item.normalized_error_q4_q2,
+                "finite": True,
+            }
+        )
+    return result
+
+
+def _convert_one_record(
+    source_record: ExpertRecord,
+    source_payload: bytes,
+    target_descriptor: ExpertStreamingModelSpec,
+    *,
+    output_offset: int,
+) -> tuple[ExpertRecord, bytes, dict[str, Any], list[dict[str, Any]]]:
+    target_segments, target_length = _output_record_metadata(
+        source_record,
+        target_descriptor,
+        output_offset=output_offset,
+    )
+    source_by_component = {
+        segment.component: segment for segment in source_record.segments
+    }
+    outputs: dict[str, bytes] = {}
+
+    def read_component(segment: TensorSegment) -> bytes:
+        expected = source_by_component.get(segment.component)
+        if expected != segment or source_record.sidecar_offset is None:
+            raise ValueError("converter requested an unexpected source component")
+        relative = segment.offset - source_record.sidecar_offset
+        return source_payload[relative : relative + segment.length]
+
+    def write_component(component: str, payload: bytes) -> None:
+        if component in outputs:
+            raise ValueError(f"converter emitted duplicate component {component}")
+        outputs[component] = bytes(payload)
+
+    diagnostics = requantize_expert_record_q4_to_q2(
+        source_record,
+        read_component,
+        write_component,
+        hidden_size=target_descriptor.hidden_size,
+        expert_hidden_size=target_descriptor.expert_hidden_size,
+        group_size=target_descriptor.quant_group_size,
+    )
+    if tuple(outputs) != tuple(segment.component for segment in target_segments):
+        raise ValueError("converter output component order is not canonical")
+    component_states = []
+    chunks = []
+    for segment in target_segments:
+        payload = outputs[segment.component]
+        if len(payload) != segment.length:
+            raise ValueError(
+                f"converter output length mismatch for {segment.component}"
+            )
+        chunks.append(payload)
+        component_states.append(
+            {
+                "component": segment.component,
+                "tensor": segment.tensor,
+                "offset": segment.offset,
+                "length": segment.length,
+                "dtype": segment.dtype,
+                "shape": list(segment.shape),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+    output_payload = b"".join(chunks)
+    if len(output_payload) != target_length:
+        raise ValueError("converted record output bytes are inconsistent")
+    output_sha256 = hashlib.sha256(output_payload).hexdigest()
+    output_record = ExpertRecord(
+        layer=source_record.layer,
+        expert=source_record.expert,
+        logical_bytes=target_length,
+        segments=target_segments,
+        sha256=output_sha256,
+        sidecar_offset=output_offset,
+        sidecar_length=target_length,
+    )
+    output_state = {
+        "offset": output_offset,
+        "length": target_length,
+        "sha256": output_sha256,
+        "components": component_states,
+    }
+    return output_record, output_payload, output_state, _diagnostics_json(diagnostics)
+
+
+def _journal_entry(
+    *,
+    ordinal: int,
+    source_record: ExpertRecord,
+    source_state: dict[str, Any],
+    output_state: dict[str, Any],
+    diagnostics: list[dict[str, Any]],
+    previous_sha256: str,
+) -> dict[str, Any]:
+    body = {
+        "kind": "record",
+        "ordinal": ordinal,
+        "layer": source_record.layer,
+        "expert": source_record.expert,
+        "source": source_state,
+        "output": output_state,
+        "diagnostics": diagnostics,
+        "previous_sha256": previous_sha256,
+    }
+    return {
+        **body,
+        "entry_sha256": hashlib.sha256(_canonical_json_bytes(body)).hexdigest(),
+    }
+
+
+def _parse_journal(
+    journal_fd: int,
+) -> tuple[list[tuple[dict[str, Any], int, int]], int, bool]:
+    metadata = os.fstat(journal_fd)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _MAX_JOURNAL_BYTES:
+        raise ValueError("conversion journal is not a bounded regular file")
+    payload = _pread_exact(
+        journal_fd,
+        0,
+        metadata.st_size,
+        label="conversion journal",
+    )
+    last_newline = payload.rfind(b"\n")
+    if last_newline < 0:
+        raise ValueError("conversion journal has no durable header")
+    complete_end = last_newline + 1
+    partial_tail = complete_end != len(payload)
+    parsed: list[tuple[dict[str, Any], int, int]] = []
+    cursor = 0
+    for raw_line in payload[:complete_end].splitlines(keepends=True):
+        end = cursor + len(raw_line)
+        line_payload = raw_line[:-1]
+        if not line_payload:
+            raise ValueError("conversion journal contains an empty line")
+        try:
+            value = json.loads(
+                line_payload,
+                object_pairs_hook=_strict_json_pairs,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"conversion journal JSON is invalid: {exc}") from exc
+        if not isinstance(value, dict):
+            raise ValueError("conversion journal line must be an object")
+        parsed.append((value, cursor, end))
+        cursor = end
+    return parsed, complete_end, partial_tail
+
+
+def _validate_journal_chain(
+    parsed: list[tuple[dict[str, Any], int, int]],
+    expected_header: dict[str, Any],
+    source_records: tuple[ExpertRecord, ...],
+) -> None:
+    if not parsed or parsed[0][0] != expected_header:
+        raise ValueError("resume journal header fingerprint mismatch")
+    previous_sha256 = expected_header["header_sha256"]
+    expected_keys = {
+        "kind",
+        "ordinal",
+        "layer",
+        "expert",
+        "source",
+        "output",
+        "diagnostics",
+        "previous_sha256",
+        "entry_sha256",
+    }
+    if len(parsed) - 1 > len(source_records):
+        raise ValueError("conversion journal contains excess records")
+    for ordinal, (line, _start, _end) in enumerate(parsed[1:]):
+        if set(line) != expected_keys or line.get("kind") != "record":
+            raise ValueError("conversion journal record schema mismatch")
+        source_record = source_records[ordinal]
+        if line.get("ordinal") != ordinal or (
+            line.get("layer"),
+            line.get("expert"),
+        ) != (source_record.layer, source_record.expert):
+            raise ValueError("conversion journal is not a contiguous record prefix")
+        if line.get("previous_sha256") != previous_sha256:
+            raise ValueError("conversion journal hash chain mismatch")
+        body = {key: value for key, value in line.items() if key != "entry_sha256"}
+        entry_sha256 = hashlib.sha256(_canonical_json_bytes(body)).hexdigest()
+        if line.get("entry_sha256") != entry_sha256:
+            raise ValueError("conversion journal entry hash mismatch")
+        diagnostics = line.get("diagnostics")
+        if not isinstance(diagnostics, list) or len(diagnostics) != len(_PROJECTIONS):
+            raise ValueError("conversion journal diagnostics are incomplete")
+        for projection, item in zip(_PROJECTIONS, diagnostics, strict=True):
+            if (
+                not isinstance(item, dict)
+                or set(item)
+                != {
+                    "component",
+                    "cosine_q4_q2",
+                    "normalized_error_q4_q2",
+                    "finite",
+                }
+                or item.get("component") != projection
+                or item.get("finite") is not True
+                or not isinstance(item.get("cosine_q4_q2"), (int, float))
+                or not isinstance(item.get("normalized_error_q4_q2"), (int, float))
+                or not math.isfinite(item["cosine_q4_q2"])
+                or not math.isfinite(item["normalized_error_q4_q2"])
+            ):
+                raise ValueError("conversion journal diagnostics are invalid")
+        previous_sha256 = entry_sha256
+
+
+def _record_from_output_state(
+    source_record: ExpertRecord,
+    target_descriptor: ExpertStreamingModelSpec,
+    output_state: Any,
+    *,
+    ordinal: int,
+    target_record_bytes: int,
+) -> ExpertRecord:
+    output_offset = ordinal * target_record_bytes
+    segments, expected_length = _output_record_metadata(
+        source_record,
+        target_descriptor,
+        output_offset=output_offset,
+    )
+    if not isinstance(output_state, dict) or set(output_state) != {
+        "offset",
+        "length",
+        "sha256",
+        "components",
+    }:
+        raise ValueError("journal output state schema mismatch")
+    if (
+        output_state["offset"] != output_offset
+        or output_state["length"] != expected_length
+        or not isinstance(output_state["sha256"], str)
+        or not isinstance(output_state["components"], list)
+        or len(output_state["components"]) != len(segments)
+    ):
+        raise ValueError("journal output record metadata mismatch")
+    for state, segment in zip(output_state["components"], segments, strict=True):
+        expected = {
+            "component": segment.component,
+            "tensor": segment.tensor,
+            "offset": segment.offset,
+            "length": segment.length,
+            "dtype": segment.dtype,
+            "shape": list(segment.shape),
+        }
+        if (
+            not isinstance(state, dict)
+            or {key: state.get(key) for key in expected} != expected
+            or set(state) != {*expected, "sha256"}
+            or not isinstance(state.get("sha256"), str)
+        ):
+            raise ValueError("journal output component metadata mismatch")
+    return ExpertRecord(
+        layer=source_record.layer,
+        expert=source_record.expert,
+        logical_bytes=expected_length,
+        segments=segments,
+        sha256=output_state["sha256"],
+        sidecar_offset=output_offset,
+        sidecar_length=expected_length,
+    )
+
+
+def _output_state_matches(
+    output_fd: int,
+    output_state: dict[str, Any],
+) -> bool:
+    output_offset = output_state["offset"]
+    output_length = output_state["length"]
+    metadata = os.fstat(output_fd)
+    if metadata.st_size < output_offset + output_length:
+        return False
+    payload = _pread_exact(
+        output_fd,
+        output_offset,
+        output_length,
+        label="resumed output record",
+    )
+    if hashlib.sha256(payload).hexdigest() != output_state["sha256"]:
+        return False
+    for component in output_state["components"]:
+        relative = component["offset"] - output_offset
+        component_payload = payload[relative : relative + component["length"]]
+        if (
+            len(component_payload) != component["length"]
+            or hashlib.sha256(component_payload).hexdigest() != component["sha256"]
+        ):
+            return False
+    return True
+
+
+def _open_conversion_files(
+    work_fd: int,
+    header: dict[str, Any],
+    *,
+    resume: bool,
+) -> tuple[int, int, bool]:
+    def entry_exists(name: str) -> bool:
+        try:
+            os.stat(name, dir_fd=work_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return True
+
+    output_exists = entry_exists(_SIDECAR_FILE)
+    journal_exists = entry_exists(_JOURNAL_FILE)
+    if not resume and (output_exists or journal_exists):
+        raise ValueError("conversion output exists and resume is disabled")
+    if output_exists != journal_exists:
+        raise ValueError("resume requires both output sidecar and journal")
+    if output_exists:
+        output_fd: int | None = None
+        try:
+            output_fd = os.open(
+                _SIDECAR_FILE,
+                _read_write_flags(),
+                dir_fd=work_fd,
+            )
+            journal_fd = os.open(
+                _JOURNAL_FILE,
+                _read_write_flags(),
+                dir_fd=work_fd,
+            )
+            result = (output_fd, journal_fd, False)
+            output_fd = None
+            return result
+        except OSError as exc:
+            raise ValueError(f"could not open conversion resume files: {exc}") from exc
+        finally:
+            if output_fd is not None:
+                os.close(output_fd)
+
+    output_fd: int | None = None
+    journal_fd: int | None = None
+    try:
+        output_fd = os.open(
+            _SIDECAR_FILE,
+            _write_flags(),
+            0o644,
+            dir_fd=work_fd,
+        )
+        journal_fd = os.open(
+            _JOURNAL_FILE,
+            _write_flags(),
+            0o644,
+            dir_fd=work_fd,
+        )
+        header_payload = _canonical_json_bytes(header) + b"\n"
+        _pwrite_all(journal_fd, header_payload, 0)
+        os.fsync(journal_fd)
+        os.fsync(work_fd)
+        result = (output_fd, journal_fd, True)
+        output_fd = None
+        journal_fd = None
+        return result
+    except BaseException:
+        if journal_fd is not None:
+            os.close(journal_fd)
+        if output_fd is not None:
+            os.close(output_fd)
+        raise
+
+
+def _assert_conversion_file_identity(
+    work_fd: int,
+    name: str,
+    fd: int,
+) -> None:
+    try:
+        entry = os.stat(name, dir_fd=work_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(f"conversion file {name} is unavailable: {exc}") from exc
+    descriptor = os.fstat(fd)
+    if (
+        not stat.S_ISREG(entry.st_mode)
+        or not stat.S_ISREG(descriptor.st_mode)
+        or entry.st_nlink != 1
+        or (entry.st_dev, entry.st_ino) != (descriptor.st_dev, descriptor.st_ino)
+    ):
+        raise ValueError(f"conversion file {name} identity changed")
+
+
+def _open_or_create_work_root(config: ConversionConfig) -> tuple[int, int]:
+    parent_fd = os.open(config.output_root.parent, _directory_flags())
+    work_fd: int | None = None
+    try:
+        _assert_directory_path_identity(
+            config.output_root.parent,
+            parent_fd,
+            label="output parent",
+        )
+        try:
+            entry = os.stat(
+                _WORK_DIRECTORY_NAME,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            os.mkdir(_WORK_DIRECTORY_NAME, 0o755, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            entry = os.stat(
+                _WORK_DIRECTORY_NAME,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        if not stat.S_ISDIR(entry.st_mode):
+            raise ValueError("conversion work root must be a real directory")
+        work_fd = os.open(
+            _WORK_DIRECTORY_NAME,
+            _directory_flags(),
+            dir_fd=parent_fd,
+        )
+        descriptor = os.fstat(work_fd)
+        repeated = os.stat(
+            _WORK_DIRECTORY_NAME,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (entry.st_dev, entry.st_ino) != (descriptor.st_dev, descriptor.st_ino) or (
+            repeated.st_dev,
+            repeated.st_ino,
+        ) != (descriptor.st_dev, descriptor.st_ino):
+            raise ValueError("conversion work root changed while opening")
+        result = (parent_fd, work_fd)
+        parent_fd = None
+        work_fd = None
+        return result
+    finally:
+        if work_fd is not None:
+            os.close(work_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
+def _assert_work_root_identity(parent_fd: int, work_fd: int) -> None:
+    try:
+        entry = os.stat(
+            _WORK_DIRECTORY_NAME,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise ValueError(f"conversion work root is unavailable: {exc}") from exc
+    descriptor = os.fstat(work_fd)
+    if not stat.S_ISDIR(entry.st_mode) or (entry.st_dev, entry.st_ino) != (
+        descriptor.st_dev,
+        descriptor.st_ino,
+    ):
+        raise ValueError("conversion work root identity changed")
+
+
+def _prepare_resume_prefix(
+    output_fd: int,
+    journal_fd: int,
+    source_fd: int,
+    context: _PreflightContext,
+    header: dict[str, Any],
+) -> tuple[list[ExpertRecord], int]:
+    parsed, complete_end, partial_tail = _parse_journal(journal_fd)
+    source_records = context.manifest.records
+    _validate_journal_chain(parsed, header, source_records)
+
+    for ordinal, (line, _start, _end) in enumerate(parsed[1:]):
+        _payload, current_source = _source_record_state(
+            source_fd,
+            source_records[ordinal],
+        )
+        if line.get("source") != current_source:
+            raise ValueError("resume source record metadata or hash mismatch")
+
+    prefix: list[ExpertRecord] = []
+    invalid_ordinal: int | None = None
+    for ordinal, (line, _start, _end) in enumerate(parsed[1:]):
+        record = _record_from_output_state(
+            source_records[ordinal],
+            context.target_descriptor,
+            line.get("output"),
+            ordinal=ordinal,
+            target_record_bytes=context.expectations.target_record_bytes,
+        )
+        if not _output_state_matches(output_fd, line["output"]):
+            invalid_ordinal = ordinal
+            break
+        prefix.append(record)
+
+    target_size = len(prefix) * context.expectations.target_record_bytes
+    journal_size = (
+        parsed[len(prefix) + 1][1] if invalid_ordinal is not None else complete_end
+    )
+    output_size = os.fstat(output_fd).st_size
+    journal_actual_size = os.fstat(journal_fd).st_size
+    needs_truncation = (
+        invalid_ordinal is not None
+        or partial_tail
+        or output_size != target_size
+        or journal_actual_size != journal_size
+    )
+    if needs_truncation:
+        os.ftruncate(output_fd, target_size)
+        os.fsync(output_fd)
+        os.ftruncate(journal_fd, journal_size)
+        os.fsync(journal_fd)
+    previous_sha256 = (prefix and parsed[len(prefix)][0]["entry_sha256"]) or header[
+        "header_sha256"
+    ]
+    return prefix, previous_sha256
+
+
+def convert_expert_records(
+    config: ConversionConfig,
+    *,
+    resume: bool = True,
+) -> tuple[ExpertRecord, ...]:
+    """Convert and durably journal the exact sorted source record bank."""
+
+    if not isinstance(resume, bool):
+        raise TypeError("resume must be a bool")
+    context = _preflight_context(config, deep_source_hash=False)
+    work_root = _work_root(config)
+    header = _journal_header(config, context)
+    output_fd: int | None = None
+    journal_fd: int | None = None
+    source_fd: int | None = None
+    work_fd: int | None = None
+    parent_fd: int | None = None
+    try:
+        parent_fd, work_fd = _open_or_create_work_root(config)
+        output_fd, journal_fd, created = _open_conversion_files(
+            work_fd,
+            header,
+            resume=resume,
+        )
+        _assert_conversion_file_identity(work_fd, _SIDECAR_FILE, output_fd)
+        _assert_conversion_file_identity(work_fd, _JOURNAL_FILE, journal_fd)
+        source_path = config.source_root / _SIDECAR_FILE
+        source_fd = os.open(source_path, _read_flags())
+        source_status = os.fstat(source_fd)
+        if (
+            not stat.S_ISREG(source_status.st_mode)
+            or source_status.st_size != context.expectations.source_sidecar_bytes
+        ):
+            raise ValueError("source sidecar identity or size changed")
+        if created:
+            output_records: list[ExpertRecord] = []
+            previous_sha256 = header["header_sha256"]
+        else:
+            output_records, previous_sha256 = _prepare_resume_prefix(
+                output_fd,
+                journal_fd,
+                source_fd,
+                context,
+                header,
+            )
+        journal_offset = os.fstat(journal_fd).st_size
+        for ordinal in range(len(output_records), len(context.manifest.records)):
+            source_record = context.manifest.records[ordinal]
+            source_payload, source_state = _source_record_state(
+                source_fd,
+                source_record,
+            )
+            output_offset = ordinal * context.expectations.target_record_bytes
+            output_record, output_payload, output_state, diagnostics = (
+                _convert_one_record(
+                    source_record,
+                    source_payload,
+                    context.target_descriptor,
+                    output_offset=output_offset,
+                )
+            )
+            if output_record.logical_bytes != context.expectations.target_record_bytes:
+                raise ValueError(
+                    "converted record bytes do not match target descriptor"
+                )
+            _pwrite_all(output_fd, output_payload, output_offset)
+            os.ftruncate(
+                output_fd,
+                output_offset + context.expectations.target_record_bytes,
+            )
+            os.fsync(output_fd)
+            _assert_conversion_file_identity(work_fd, _SIDECAR_FILE, output_fd)
+            entry = _journal_entry(
+                ordinal=ordinal,
+                source_record=source_record,
+                source_state=source_state,
+                output_state=output_state,
+                diagnostics=diagnostics,
+                previous_sha256=previous_sha256,
+            )
+            entry_payload = _canonical_json_bytes(entry) + b"\n"
+            _pwrite_all(journal_fd, entry_payload, journal_offset)
+            journal_offset += len(entry_payload)
+            os.ftruncate(journal_fd, journal_offset)
+            os.fsync(journal_fd)
+            _assert_conversion_file_identity(work_fd, _JOURNAL_FILE, journal_fd)
+            output_records.append(output_record)
+            previous_sha256 = entry["entry_sha256"]
+        if len(output_records) != context.expectations.record_count:
+            raise ValueError("conversion did not produce the exact record count")
+        if os.fstat(output_fd).st_size != context.expectations.target_sidecar_bytes:
+            raise ValueError("conversion output sidecar size mismatch")
+        _assert_conversion_file_identity(work_fd, _SIDECAR_FILE, output_fd)
+        _assert_conversion_file_identity(work_fd, _JOURNAL_FILE, journal_fd)
+        _assert_work_root_identity(parent_fd, work_fd)
+        _assert_directory_path_identity(
+            work_root, work_fd, label="conversion work root"
+        )
+        return tuple(output_records)
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
+        if journal_fd is not None:
+            os.close(journal_fd)
+        if output_fd is not None:
+            os.close(output_fd)
+        if work_fd is not None:
+            os.close(work_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
