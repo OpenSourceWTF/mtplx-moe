@@ -1,29 +1,169 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import json
 import subprocess
 import sys
 from dataclasses import replace
+from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
 import pytest
 
 import mtplx.hy3_expert_q2 as q2_module
-from mtplx.expert_manifest import ExpertRecord, TensorSegment
+from mtplx.expert_manifest import (
+    ExpertManifest,
+    ExpertRecord,
+    ResidentTensor,
+    ShardInfo,
+    TensorSegment,
+)
 from mtplx.hy3_expert_q2 import (
     ProjectionDiagnostics,
+    ResidentReuse,
     SOURCE_MANIFEST_SHA256,
     SOURCE_MODEL_KEY,
     TARGET_MODEL_KEY,
     requantize_expert_record_q4_to_q2,
     requantize_projection_q4_to_q2,
+    stage_exact_residents,
 )
 
 
 _PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 _LEAVES = ("weight", "scales", "biases")
 _DTYPES = ("U32", "BF16", "BF16")
+_ANCILLARY_PAYLOADS = {
+    "config.json": b'{"model_type":"hy_v3","quantization":{"bits":4}}\n',
+    "generation_config.json": b'{"temperature":0.9}\n',
+    "tokenizer.json": b'{"version":"1.0"}\n',
+    "tokenizer_config.json": b'{"chat_template":"source"}\n',
+    "special_tokens_map.json": b'{"eos_token":"<eos>"}\n',
+    "chat_template.jinja": b"{{ messages }}\n",
+}
+
+
+def _write_resident_safetensors(
+    path: Path,
+    tensors: dict[str, tuple[str, tuple[int, ...], bytes]],
+) -> tuple[ShardInfo, tuple[ResidentTensor, ...]]:
+    header: dict[str, object] = {}
+    payload = bytearray()
+    ranges: dict[str, tuple[int, int]] = {}
+    for name in sorted(tensors):
+        dtype, shape, tensor_payload = tensors[name]
+        start = len(payload)
+        payload.extend(tensor_payload)
+        ranges[name] = (start, len(payload))
+        header[name] = {
+            "dtype": dtype,
+            "shape": list(shape),
+            "data_offsets": list(ranges[name]),
+        }
+    header_raw = json.dumps(
+        header,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    header_raw += b" " * (-len(header_raw) % 8)
+    length_raw = len(header_raw).to_bytes(8, "little")
+    contents = length_raw + header_raw + payload
+    path.write_bytes(contents)
+    data_start = len(length_raw) + len(header_raw)
+    residents = tuple(
+        ResidentTensor(
+            tensor=name,
+            shard=path.name,
+            offset=data_start + ranges[name][0],
+            length=len(tensor_payload),
+            dtype=dtype,
+            shape=shape,
+        )
+        for name, (dtype, shape, tensor_payload) in sorted(tensors.items())
+    )
+    return (
+        ShardInfo(
+            name=path.name,
+            size=len(contents),
+            header_bytes=data_start,
+            header_sha256=hashlib.sha256(length_raw + header_raw).hexdigest(),
+            sha256=hashlib.sha256(contents).hexdigest(),
+        ),
+        residents,
+    )
+
+
+def _resident_source(
+    root: Path,
+    *,
+    resident_names: tuple[str, str] = (
+        "model.embed_tokens.weight",
+        "model.layers.1.self_attn.q_proj.weight",
+    ),
+) -> tuple[ExpertManifest, dict[str, bytes]]:
+    root.mkdir()
+    resident_specs = (
+        (resident_names[0], "BF16", (4,), bytes(range(8))),
+        (resident_names[1], "F32", (2,), bytes(range(8, 16))),
+    )
+    shards = []
+    residents = []
+    copied_payloads: dict[str, bytes] = {}
+    weight_map: dict[str, str] = {}
+    for index, (name, dtype, shape, payload) in enumerate(resident_specs, start=1):
+        shard_name = f"model-{index:05d}-of-00003.safetensors"
+        shard, shard_residents = _write_resident_safetensors(
+            root / shard_name,
+            {name: (dtype, shape, payload)},
+        )
+        shards.append(shard)
+        residents.extend(shard_residents)
+        weight_map[name] = shard_name
+        copied_payloads[shard_name] = (root / shard_name).read_bytes()
+
+    _unreferenced, _routed = _write_resident_safetensors(
+        root / "model-00003-of-00003.safetensors",
+        {
+            "model.layers.1.mlp.switch_mlp.gate_proj.weight": (
+                "U32",
+                (1,),
+                b"q4!!",
+            )
+        },
+    )
+    index_payload = (
+        json.dumps(
+            {"metadata": {"total_size": 16}, "weight_map": weight_map},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    (root / "model.safetensors.index.json").write_bytes(index_payload)
+    copied_payloads["model.safetensors.index.json"] = index_payload
+    for name, payload in _ANCILLARY_PAYLOADS.items():
+        (root / name).write_bytes(payload)
+        copied_payloads[name] = payload
+    mtp_root = root / "mtp"
+    mtp_root.mkdir()
+    (mtp_root / "model.safetensors").write_bytes(b"do-not-copy-mtp")
+    manifest = ExpertManifest(
+        model_key="hy3-expert-only-q4",
+        source_repo="local/hy3-expert-only-mlx-q4",
+        source_revision="716aa7241bd6d95896be4ebfc761162a9c4d49ef",
+        quant_bits=4,
+        quant_group_size=64,
+        quant_mode="affine",
+        artifact_tensor_bytes=16,
+        resident_tensor_bytes=16,
+        routed_expert_bytes=0,
+        shards=tuple(shards),
+        resident_tensors=tuple(sorted(residents, key=lambda item: item.tensor)),
+        records=(),
+    ).with_digest()
+    return manifest, copied_payloads
 
 
 def _bf16_matrix(rows: int, columns: int, *, offset: float) -> mx.array:
@@ -510,3 +650,214 @@ def test_nonfinite_projection_q4_parameters_are_rejected(leaf_index: int) -> Non
             input_size=64,
             output_size=64,
         )
+
+
+def test_resident_reuse_copies_exact_index_allowlist_and_excludes_q4_and_mtp(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    work_root = tmp_path / "work"
+    manifest, expected_payloads = _resident_source(source_root)
+    work_root.mkdir()
+
+    result = stage_exact_residents(
+        source_root,
+        manifest,
+        work_root,
+        copy_chunk_bytes=3,
+    )
+
+    assert isinstance(result, ResidentReuse)
+    assert result.shards == manifest.shards
+    assert result.tensors == manifest.resident_tensors
+    assert set(result.copied_files) == set(expected_payloads)
+    assert {path.name for path in work_root.iterdir()} == set(expected_payloads)
+    for name, expected in expected_payloads.items():
+        source_path = source_root / name
+        target_path = work_root / name
+        assert target_path.read_bytes() == expected
+        assert result.copied_files[name] == hashlib.sha256(expected).hexdigest()
+        source_status = source_path.stat()
+        target_status = target_path.stat()
+        assert (target_status.st_dev, target_status.st_ino) != (
+            source_status.st_dev,
+            source_status.st_ino,
+        )
+        assert target_status.st_nlink == 1
+    assert (work_root / "config.json").read_bytes() == _ANCILLARY_PAYLOADS[
+        "config.json"
+    ]
+    assert not (work_root / "model-00003-of-00003.safetensors").exists()
+    assert not (work_root / "mtp").exists()
+
+
+@pytest.mark.parametrize("fault", ["missing", "extra"])
+def test_resident_index_must_equal_manifest_allowlist(
+    tmp_path: Path,
+    fault: str,
+) -> None:
+    source_root = tmp_path / "source"
+    work_root = tmp_path / "work"
+    manifest, _payloads = _resident_source(source_root)
+    work_root.mkdir()
+    index_path = source_root / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    if fault == "missing":
+        removed = sorted(index["weight_map"])[0]
+        del index["weight_map"][removed]
+        index["metadata"]["total_size"] = 8
+    else:
+        index["weight_map"]["model.layers.1.mlp.switch_mlp.gate_proj.weight"] = (
+            "model-00003-of-00003.safetensors"
+        )
+        index["metadata"]["total_size"] = 20
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="resident index|routed expert"):
+        stage_exact_residents(source_root, manifest, work_root)
+
+    assert list(work_root.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "resident_name",
+    [
+        "model.layers.1.mlp.switch_mlp.gate_proj.weight",
+        "model.layers.80.self_attn.q_proj.weight",
+    ],
+    ids=["routed", "mtp"],
+)
+def test_resident_staging_rejects_routed_or_mtp_tensor_contamination(
+    tmp_path: Path,
+    resident_name: str,
+) -> None:
+    source_root = tmp_path / "source"
+    work_root = tmp_path / "work"
+    manifest, _payloads = _resident_source(
+        source_root,
+        resident_names=(resident_name, "model.norm.weight"),
+    )
+    work_root.mkdir()
+
+    with pytest.raises(ValueError, match="routed expert|MTP"):
+        stage_exact_residents(source_root, manifest, work_root)
+
+    assert list(work_root.iterdir()) == []
+
+
+@pytest.mark.parametrize("fault", ["dtype", "shape"])
+def test_resident_metadata_must_match_index_headers(
+    tmp_path: Path,
+    fault: str,
+) -> None:
+    source_root = tmp_path / "source"
+    work_root = tmp_path / "work"
+    manifest, _payloads = _resident_source(source_root)
+    work_root.mkdir()
+    residents = list(manifest.resident_tensors)
+    if fault == "dtype":
+        residents[0] = replace(residents[0], dtype="I16")
+    else:
+        residents[0] = replace(residents[0], shape=(2, 2))
+    changed = replace(manifest, resident_tensors=tuple(residents)).with_digest()
+
+    with pytest.raises(ValueError, match="resident metadata"):
+        stage_exact_residents(source_root, changed, work_root)
+
+    assert list(work_root.iterdir()) == []
+
+
+def test_resident_source_full_hash_must_match_manifest_provenance(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    work_root = tmp_path / "work"
+    manifest, _payloads = _resident_source(source_root)
+    work_root.mkdir()
+    shard_path = source_root / manifest.shards[0].name
+    contents = bytearray(shard_path.read_bytes())
+    contents[-1] ^= 0xFF
+    shard_path.write_bytes(contents)
+
+    with pytest.raises(ValueError, match="hash|provenance"):
+        stage_exact_residents(source_root, manifest, work_root)
+
+    assert list(work_root.iterdir()) == []
+
+
+def test_ancillary_allowlist_is_required_and_copied_without_rewriting(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    work_root = tmp_path / "work"
+    manifest, _payloads = _resident_source(source_root)
+    work_root.mkdir()
+    (source_root / "special_tokens_map.json").unlink()
+
+    with pytest.raises(ValueError, match="ancillary|special_tokens_map"):
+        stage_exact_residents(source_root, manifest, work_root)
+
+    assert list(work_root.iterdir()) == []
+
+
+def test_resident_index_path_escape_is_rejected_before_target_mutation(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    work_root = tmp_path / "work"
+    manifest, _payloads = _resident_source(source_root)
+    work_root.mkdir()
+    index_path = source_root / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["weight_map"][sorted(index["weight_map"])[0]] = "../outside.safetensors"
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsafe|escape|path"):
+        stage_exact_residents(source_root, manifest, work_root)
+
+    assert list(work_root.iterdir()) == []
+
+
+@pytest.mark.parametrize("target_kind", ["root_symlink", "member_symlink"])
+def test_resident_staging_refuses_target_symlinks(
+    tmp_path: Path,
+    target_kind: str,
+) -> None:
+    source_root = tmp_path / "source"
+    manifest, _payloads = _resident_source(source_root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"unchanged")
+    work_root = tmp_path / "work"
+    if target_kind == "root_symlink":
+        work_root.symlink_to(outside, target_is_directory=True)
+    else:
+        work_root.mkdir()
+        (work_root / "config.json").symlink_to(sentinel)
+
+    with pytest.raises(ValueError, match="target|work root|empty|symlink"):
+        stage_exact_residents(source_root, manifest, work_root)
+
+    assert sentinel.read_bytes() == b"unchanged"
+
+
+@pytest.mark.parametrize("chunk_bytes", [0, 64 * 1024**2 + 1])
+def test_resident_copy_chunk_bound_is_strict(
+    tmp_path: Path,
+    chunk_bytes: int,
+) -> None:
+    source_root = tmp_path / "source"
+    work_root = tmp_path / "work"
+    manifest, _payloads = _resident_source(source_root)
+    work_root.mkdir()
+
+    with pytest.raises(ValueError, match="copy_chunk_bytes"):
+        stage_exact_residents(
+            source_root,
+            manifest,
+            work_root,
+            copy_chunk_bytes=chunk_bytes,
+        )
+
+    assert list(work_root.iterdir()) == []
