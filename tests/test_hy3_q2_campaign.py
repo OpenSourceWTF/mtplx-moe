@@ -513,6 +513,59 @@ def test_accepts_current_benchmark_memory_and_integrity_export_shape() -> None:
 
 
 @pytest.mark.parametrize(
+    "field",
+    (
+        "allocated_bytes",
+        "global_persistent_slots",
+        "slots_per_layer",
+        "transient_slots",
+    ),
+)
+def test_rejects_equal_cross_type_memory_plan_values(field: str) -> None:
+    resource, headline, quality = _campaigns()
+    plan = resource[0]["runs"][0]["streaming_after"]["memory_plan"]
+    plan[field] = float(plan[field])
+
+    summary = summarize_hy3_q2_campaign(resource, headline, quality_payload=quality)
+
+    assert summary["integrity_gate"]["passed"] is False
+    assert any(field in error for error in summary["errors"])
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("valid", 1),
+        ("checked_records", False),
+        ("sidecar_verified", 0),
+    ),
+)
+def test_rejects_equal_cross_type_runtime_integrity_values(
+    field: str,
+    replacement: object,
+) -> None:
+    resource, headline, quality = _campaigns()
+    integrity = resource[0]["runs"][0]["streaming_after"]["integrity"]
+    integrity[field] = replacement
+
+    summary = summarize_hy3_q2_campaign(resource, headline, quality_payload=quality)
+
+    assert summary["integrity_gate"]["passed"] is False
+    assert any(field in error for error in summary["errors"])
+
+
+def test_rejects_extra_runtime_integrity_fields() -> None:
+    resource, headline, quality = _campaigns()
+    integrity = resource[0]["runs"][0]["streaming_after"]["integrity"]
+    integrity["extra"] = 1
+
+    summary = summarize_hy3_q2_campaign(resource, headline, quality_payload=quality)
+
+    assert summary["integrity_gate"]["passed"] is False
+    assert any("integrity schema" in error for error in summary["errors"])
+
+
+@pytest.mark.parametrize(
     ("section", "field", "replacement"),
     (
         ("prompt_identity", "content_sha256", "f" * 64),

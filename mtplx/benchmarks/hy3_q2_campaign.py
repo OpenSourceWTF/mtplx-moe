@@ -134,7 +134,7 @@ def _nonfinite_paths(value: object, path: str) -> list[str]:
 def _append_expected(
     errors: list[str], label: str, actual: object, expected: object
 ) -> None:
-    if actual != expected:
+    if type(actual) is not type(expected) or actual != expected:
         errors.append(f"{label}: expected {expected!r}, got {actual!r}")
 
 
@@ -512,13 +512,16 @@ def _validate_run_integrity(
                 errors, f"{label} memory plan {field}", plan.get(field), value
             )
         integrity = _mapping(after.get("integrity"))
-        for field, value in (
-            ("valid", True),
-            ("model_key", MODEL_KEYS[lane]),
-            ("checked_shards", EXPECTED_CHECKED_SHARDS[lane]),
-            ("checked_records", 0),
-            ("sidecar_verified", False),
-        ):
+        expected_integrity = {
+            "valid": True,
+            "model_key": MODEL_KEYS[lane],
+            "checked_shards": EXPECTED_CHECKED_SHARDS[lane],
+            "checked_records": 0,
+            "sidecar_verified": False,
+        }
+        if set(integrity) != set(expected_integrity):
+            errors.append(f"{label} manifest integrity schema mismatch")
+        for field, value in expected_integrity.items():
             _append_expected(
                 errors,
                 f"{label} manifest integrity {field}",
