@@ -104,6 +104,103 @@ def _float32_nll(row: list[float], target: int) -> float:
     return float(np.float32(logsumexp - values[target]))
 
 
+def _write_hf_snapshot_member(
+    tmp_path: Path,
+    *,
+    revision: str = "a" * 40,
+    member_name: str = "tokenizer.json",
+    payload: bytes = b'{"fixture":"hf-snapshot"}\n',
+    target: str | None = None,
+) -> tuple[Path, Path, Path]:
+    repository = tmp_path / "models--example--glm"
+    blobs = repository / "blobs"
+    snapshot = repository / "snapshots" / revision
+    blobs.mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    blob_name = hashlib.sha256(payload).hexdigest()
+    blob = blobs / blob_name
+    blob.write_bytes(payload)
+    member = snapshot / member_name
+    member.symlink_to(target or f"../../blobs/{blob_name}")
+    return repository, snapshot, blob
+
+
+def test_tokenizer_receipt_accepts_identity_bound_hf_snapshot_symlink(
+    tmp_path: Path,
+) -> None:
+    _repository, snapshot, blob = _write_hf_snapshot_member(tmp_path)
+
+    receipt = quality._tokenizer_receipt(snapshot)
+
+    assert receipt["files"] == [
+        {
+            "name": "tokenizer.json",
+            "path": str(snapshot / "tokenizer.json"),
+            "bytes": blob.stat().st_size,
+            "sha256": hashlib.sha256(blob.read_bytes()).hexdigest(),
+        }
+    ]
+
+
+def test_hf_snapshot_symlink_requires_a_pinned_revision(tmp_path: Path) -> None:
+    _repository, snapshot, _blob = _write_hf_snapshot_member(
+        tmp_path,
+        revision="main",
+    )
+
+    with pytest.raises(ValueError, match="pinned revision"):
+        quality._stable_file_bytes(snapshot / "tokenizer.json", label="tokenizer")
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        "../../../outside",
+        "../../blobs/../outside",
+        "/tmp/outside",
+        "../../blobs/nested/member",
+    ),
+)
+def test_hf_snapshot_symlink_rejects_noncanonical_targets(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    _repository, snapshot, _blob = _write_hf_snapshot_member(
+        tmp_path,
+        target=target,
+    )
+
+    with pytest.raises(ValueError, match="exact ../../blobs/<flat-name>"):
+        quality._stable_file_bytes(snapshot / "tokenizer.json", label="tokenizer")
+
+
+def test_hf_snapshot_symlink_rejects_snapshots_ancestor_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, snapshot, _blob = _write_hf_snapshot_member(tmp_path)
+    revision = snapshot.name
+    replacement = repository / "replacement-snapshots"
+    replacement_member = replacement / revision / "tokenizer.json"
+    replacement_member.parent.mkdir(parents=True)
+    replacement_member.symlink_to(snapshot.joinpath("tokenizer.json").readlink())
+    real_open = quality.os.open
+    swapped = False
+
+    def racing_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if path == "snapshots" and kwargs.get("dir_fd") is not None and not swapped:
+            swapped = True
+            (repository / "snapshots").rename(repository / "original-snapshots")
+            replacement.rename(repository / "snapshots")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(quality.os, "open", racing_open)
+
+    with pytest.raises(ValueError, match="changed while being opened"):
+        quality._stable_file_bytes(snapshot / "tokenizer.json", label="tokenizer")
+
+
 def test_teacher_forced_loss_aligns_next_tokens_and_reuses_chunk_cache() -> None:
     table = {
         0: [0.0, 2.0, -1.0],
@@ -129,6 +226,52 @@ def test_teacher_forced_loss_aligns_next_tokens_and_reuses_chunk_cache() -> None
     assert result["nan_count"] == 0
     assert [call[1] for call in runtime.forward_calls] == [(0, 1), (2,)]
     assert len({call[0] for call in runtime.forward_calls}) == 1
+
+
+def test_nonfinite_loss_is_json_safe_and_remains_a_quality_rejection(
+    tmp_path: Path,
+) -> None:
+    runtime = FakeRuntime(
+        tokenizer=FakeTokenizer(),
+        logits_by_token={0: [0.0, math.nan], 1: [0.0, 1.0]},
+    )
+
+    loss = quality.teacher_forced_loss(runtime, [0, 1], chunk_tokens=1)
+
+    assert loss["finite"] is False
+    assert loss["nll_sum"] is None
+    assert loss["mean_nll"] is None
+    assert loss["perplexity"] is None
+    assert loss["error"]["type"] == "NonFiniteQualityEvidence"
+    payload = {
+        "schema": "mtplx-streamed-quality-v1",
+        "passed": False,
+        "quality_passed": False,
+        "relative_perplexity_regression": None,
+        "lanes": {"q4": {"loss": loss}},
+        "errors": [],
+    }
+    output = tmp_path / "nonfinite.json"
+
+    exit_code = quality.main(
+        _cli_args(tmp_path, output),
+        _compare_quality=lambda *_args, **_kwargs: payload,
+    )
+
+    assert exit_code == 2
+    raw = output.read_text(encoding="utf-8")
+    assert "NaN" not in raw
+    assert "Infinity" not in raw
+    assert json.loads(raw)["lanes"]["q4"]["loss"]["perplexity"] is None
+
+
+def test_json_writer_rejects_unhandled_nonfinite_values(tmp_path: Path) -> None:
+    output = tmp_path / "invalid.json"
+
+    with pytest.raises(ValueError, match="Out of range float values"):
+        quality._write_json_once(output, {"unhandled": math.nan})
+
+    assert not output.exists()
 
 
 def test_greedy_diagnostics_report_agreement_and_first_divergence() -> None:
@@ -316,6 +459,7 @@ def test_q4_load_failure_clears_cache_and_does_not_start_q2(tmp_path: Path) -> N
     ("q4_perplexity", "q2_perplexity", "finite", "regression", "passed"),
     (
         (10.0, 10.4, True, 0.04, True),
+        (10.0, 10.5, True, 0.05, True),
         (10.0, 10.6, True, 0.06, False),
         (10.0, 10.0, False, 0.0, False),
     ),
@@ -336,6 +480,53 @@ def test_quality_gate_is_finite_and_at_most_five_percent(
 
     assert result["relative_perplexity_regression"] == pytest.approx(regression)
     assert result["quality_passed"] is passed
+
+
+def test_quality_gate_rejects_a_threshold_above_five_percent() -> None:
+    with pytest.raises(ValueError, match="must not exceed 0.05"):
+        quality.quality_gate(
+            10.0,
+            10.5,
+            finite=True,
+            max_relative_perplexity_regression=0.0500001,
+        )
+
+
+def test_quality_gate_rejects_the_next_threshold_float_above_five_percent() -> None:
+    with pytest.raises(ValueError, match="must not exceed 0.05"):
+        quality.quality_gate(
+            10.0,
+            10.5,
+            finite=True,
+            max_relative_perplexity_regression=math.nextafter(0.05, math.inf),
+        )
+
+
+def test_quality_gate_rejects_the_next_float_above_five_percent() -> None:
+    q2_perplexity = math.nextafter(10.5, math.inf)
+
+    result = quality.quality_gate(
+        10.0,
+        q2_perplexity,
+        finite=True,
+        max_relative_perplexity_regression=0.05,
+    )
+
+    assert result["relative_perplexity_regression"] > 0.05
+    assert result["quality_passed"] is False
+
+
+def test_quality_gate_records_nonfinite_perplexity_as_json_safe_error() -> None:
+    result = quality.quality_gate(
+        None,
+        10.0,
+        finite=False,
+        max_relative_perplexity_regression=0.05,
+    )
+
+    assert result["relative_perplexity_regression"] is None
+    assert result["quality_passed"] is False
+    assert result["error"]["type"] == "NonFiniteQualityEvidence"
 
 
 def _cli_args(tmp_path: Path, output: Path) -> list[str]:
@@ -405,6 +596,17 @@ def test_cli_writes_complete_json_before_quality_exit_two(tmp_path: Path) -> Non
     assert payload["schema"] == "mtplx-streamed-quality-v1"
     assert payload["passed"] is False
     assert payload["relative_perplexity_regression"] == pytest.approx(0.06)
+
+
+def test_cli_rejects_a_quality_ceiling_above_five_percent(tmp_path: Path) -> None:
+    args = _cli_args(tmp_path, tmp_path / "must-not-write.json")
+    threshold_index = args.index("--max-relative-perplexity-regression") + 1
+    args[threshold_index] = "0.0500001"
+
+    with pytest.raises(SystemExit) as exc_info:
+        quality.build_parser().parse_args(args)
+
+    assert exc_info.value.code == 2
 
 
 def test_cli_operational_failure_returns_one_and_writes_error_json(

@@ -9,11 +9,13 @@ import hashlib
 import json
 import math
 import os
+import re
 import stat
 import sys
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,9 @@ _TOKENIZER_FILES = (
     "chat_template.jinja",
 )
 _MAX_EVIDENCE_FILE_BYTES = 512 * 1024 * 1024
+_MAX_QUALITY_CEILING_DECIMAL = Decimal("0.05")
+_HF_REVISION_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+_HF_BLOB_TARGET_RE = re.compile(r"\.\./\.\./blobs/([0-9a-f]{40}(?:[0-9a-f]{24})?)")
 
 
 @dataclass(frozen=True)
@@ -69,50 +74,225 @@ def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _stable_file_bytes(path: Path, *, label: str) -> tuple[Path, bytes]:
-    source = Path(path).expanduser()
-    if source.is_symlink():
-        raise ValueError(f"{label} must not be a symlink: {source}")
-    try:
-        resolved = source.resolve(strict=True)
-    except OSError as exc:
-        raise ValueError(f"{label} is unavailable: {source}: {exc}") from exc
+def _object_identity(value: os.stat_result) -> tuple[int, int, int]:
+    return value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode)
+
+
+def _stable_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _open_flags(*, directory: bool = False) -> int:
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("secure evidence reads require O_NOFOLLOW")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+    if directory:
+        if not hasattr(os, "O_DIRECTORY"):
+            raise RuntimeError("secure evidence reads require O_DIRECTORY")
+        flags |= os.O_DIRECTORY
+    return flags
+
+
+def _absolute_lexical_path(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+
+
+def _open_child_directory(parent_fd: int, name: str, *, label: str) -> int:
+    if not name or name in {".", ".."} or "/" in name:
+        raise ValueError(f"invalid {label} directory member {name!r}")
+    before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(before.st_mode):
+        raise ValueError(f"{label} must be a directory")
     descriptor = os.open(
-        resolved,
-        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        name,
+        _open_flags(directory=True),
+        dir_fd=parent_fd,
     )
     try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError(f"{label} must be a regular file: {resolved}")
-        if before.st_size > _MAX_EVIDENCE_FILE_BYTES:
-            raise ValueError(f"{label} exceeds its size bound: {resolved}")
-        chunks: list[bytes] = []
-        remaining = before.st_size
-        while remaining:
-            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
-            if not chunk:
-                raise ValueError(f"{label} ended before its declared size: {resolved}")
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        after = os.fstat(descriptor)
-    finally:
+        opened = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not (
+            _object_identity(before)
+            == _object_identity(opened)
+            == _object_identity(current)
+        ):
+            raise ValueError(f"{label} changed while being opened")
+    except BaseException:
         os.close(descriptor)
-    if (
-        before.st_dev,
-        before.st_ino,
-        before.st_size,
-        before.st_mtime_ns,
-        before.st_ctime_ns,
-    ) != (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
-        after.st_ctime_ns,
-    ):
-        raise ValueError(f"{label} changed while being read: {resolved}")
-    return resolved, b"".join(chunks)
+        raise
+    return descriptor
+
+
+def _open_anchored_directory(path: Path, *, label: str) -> int:
+    absolute = _absolute_lexical_path(path)
+    if not absolute.is_absolute() or not absolute.anchor:
+        raise ValueError(f"{label} must be an absolute directory")
+    descriptor = os.open(absolute.anchor, _open_flags(directory=True))
+    try:
+        for component in absolute.parts[1:]:
+            child = _open_child_directory(descriptor, component, label=label)
+            os.close(descriptor)
+            descriptor = child
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _read_stable_descriptor(descriptor: int, *, label: str, path: Path) -> bytes:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError(f"{label} must be a regular file: {path}")
+    if before.st_size > _MAX_EVIDENCE_FILE_BYTES:
+        raise ValueError(f"{label} exceeds its size bound: {path}")
+    chunks: list[bytes] = []
+    remaining = before.st_size
+    while remaining:
+        chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+        if not chunk:
+            raise ValueError(f"{label} ended before its declared size: {path}")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    after = os.fstat(descriptor)
+    if _stable_identity(before) != _stable_identity(after):
+        raise ValueError(f"{label} changed while being read: {path}")
+    return b"".join(chunks)
+
+
+def _open_bound_regular_file(parent_fd: int, name: str, *, label: str) -> int:
+    before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError(f"{label} must be a regular file")
+    descriptor = os.open(name, _open_flags(), dir_fd=parent_fd)
+    try:
+        opened = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not (
+            _object_identity(before)
+            == _object_identity(opened)
+            == _object_identity(current)
+        ):
+            raise ValueError(f"{label} changed while being opened")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _stable_hf_snapshot_symlink(
+    source: Path,
+    *,
+    label: str,
+    expected_revision_fd: int,
+    expected_member: os.stat_result,
+) -> tuple[Path, bytes]:
+    revision_dir = source.parent
+    snapshots_dir = revision_dir.parent
+    repository = snapshots_dir.parent
+    if snapshots_dir.name != "snapshots" or not repository.name.startswith("models--"):
+        raise ValueError(f"{label} symlink is not under a Hugging Face model snapshot")
+    if _HF_REVISION_RE.fullmatch(revision_dir.name) is None:
+        raise ValueError(f"{label} symlink requires a pinned revision")
+
+    descriptors: list[int] = []
+    try:
+        repository_fd = _open_anchored_directory(
+            repository,
+            label="Hugging Face repository",
+        )
+        descriptors.append(repository_fd)
+        snapshots_fd = _open_child_directory(
+            repository_fd,
+            "snapshots",
+            label="Hugging Face snapshots",
+        )
+        descriptors.append(snapshots_fd)
+        revision_fd = _open_child_directory(
+            snapshots_fd,
+            revision_dir.name,
+            label="Hugging Face pinned revision",
+        )
+        descriptors.append(revision_fd)
+        if _object_identity(os.fstat(expected_revision_fd)) != _object_identity(
+            os.fstat(revision_fd)
+        ):
+            raise ValueError(f"{label} snapshot ancestor changed while being opened")
+        blobs_fd = _open_child_directory(
+            repository_fd,
+            "blobs",
+            label="Hugging Face blobs",
+        )
+        descriptors.append(blobs_fd)
+
+        link_before = os.stat(
+            source.name,
+            dir_fd=revision_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISLNK(link_before.st_mode):
+            raise ValueError(f"{label} snapshot member stopped being a symlink")
+        if _stable_identity(expected_member) != _stable_identity(link_before):
+            raise ValueError(f"{label} snapshot member changed while being opened")
+        target = os.readlink(source.name, dir_fd=revision_fd)
+        match = _HF_BLOB_TARGET_RE.fullmatch(target)
+        if match is None:
+            raise ValueError(
+                f"{label} symlink target must be exact ../../blobs/<flat-name>"
+            )
+        blob_name = match.group(1)
+        blob_fd = _open_bound_regular_file(blobs_fd, blob_name, label=label)
+        descriptors.append(blob_fd)
+        link_after = os.stat(
+            source.name,
+            dir_fd=revision_fd,
+            follow_symlinks=False,
+        )
+        if _stable_identity(link_before) != _stable_identity(link_after):
+            raise ValueError(f"{label} snapshot member changed while being opened")
+        payload = _read_stable_descriptor(blob_fd, label=label, path=source)
+        link_final = os.stat(
+            source.name,
+            dir_fd=revision_fd,
+            follow_symlinks=False,
+        )
+        if _stable_identity(link_before) != _stable_identity(link_final):
+            raise ValueError(f"{label} snapshot member changed while being read")
+        return source, payload
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _stable_file_bytes(path: Path, *, label: str) -> tuple[Path, bytes]:
+    source = _absolute_lexical_path(path)
+    parent_fd = _open_anchored_directory(source.parent, label=f"{label} parent")
+    try:
+        member = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
+        if stat.S_ISLNK(member.st_mode):
+            return _stable_hf_snapshot_symlink(
+                source,
+                label=label,
+                expected_revision_fd=parent_fd,
+                expected_member=member,
+            )
+        descriptor = _open_bound_regular_file(parent_fd, source.name, label=label)
+        try:
+            return source, _read_stable_descriptor(
+                descriptor,
+                label=label,
+                path=source,
+            )
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_fd)
 
 
 def _manifest_receipt(path: Path) -> dict[str, Any]:
@@ -134,14 +314,18 @@ def _manifest_receipt(path: Path) -> dict[str, Any]:
 
 
 def _tokenizer_receipt(root: Path) -> dict[str, Any]:
-    root = Path(root).expanduser().resolve(strict=True)
+    root = _absolute_lexical_path(root)
     entries = []
     digest = hashlib.sha256()
     for name in _TOKENIZER_FILES:
         candidate = root / name
-        if not candidate.exists():
+        try:
+            resolved, payload = _stable_file_bytes(
+                candidate,
+                label=f"tokenizer {name}",
+            )
+        except FileNotFoundError:
             continue
-        resolved, payload = _stable_file_bytes(candidate, label=f"tokenizer {name}")
         encoded_name = name.encode("utf-8")
         digest.update(len(encoded_name).to_bytes(4, "big"))
         digest.update(encoded_name)
@@ -349,6 +533,7 @@ def teacher_forced_loss(
     nll_sum = 0.0
     nan_count = 0
     nonfinite_count = 0
+    nll_valid = True
     chunks = 0
     _reset_streaming(runtime)
     with _admission(runtime, len(tokens)), _attention_phase("prefill"):
@@ -363,8 +548,14 @@ def teacher_forced_loss(
             rows = _logits_array(logits, expected_tokens=len(input_chunk))
             if np.any(target_chunk >= rows.shape[1]):
                 raise ValueError("teacher-forced target token exceeds vocabulary")
-            nan_count += int(np.isnan(rows).sum())
-            nonfinite_count += int((~np.isfinite(rows)).sum())
+            row_nan_count = int(np.isnan(rows).sum())
+            row_nonfinite_count = int((~np.isfinite(rows)).sum())
+            nan_count += row_nan_count
+            nonfinite_count += row_nonfinite_count
+            if row_nonfinite_count:
+                nll_valid = False
+                chunks += 1
+                continue
             maximum = np.max(rows, axis=-1).astype(np.float32, copy=False)
             shifted = (rows - maximum[:, None]).astype(np.float32, copy=False)
             exponentials = np.exp(shifted).astype(np.float32, copy=False)
@@ -372,34 +563,56 @@ def teacher_forced_loss(
             logsumexp = (maximum + np.log(totals)).astype(np.float32, copy=False)
             selected = rows[np.arange(len(target_chunk)), target_chunk]
             losses = (logsumexp - selected).astype(np.float32, copy=False)
-            nan_count += int(np.isnan(losses).sum())
-            nonfinite_count += int((~np.isfinite(losses)).sum())
-            nll_sum += float(np.sum(losses, dtype=np.float64))
+            loss_nan_count = int(np.isnan(losses).sum())
+            loss_nonfinite_count = int((~np.isfinite(losses)).sum())
+            nan_count += loss_nan_count
+            nonfinite_count += loss_nonfinite_count
+            if loss_nonfinite_count:
+                nll_valid = False
+            else:
+                nll_sum += float(np.sum(losses, dtype=np.float64))
             chunks += 1
     token_count = len(targets)
-    mean_nll = nll_sum / token_count
-    try:
-        perplexity = math.exp(mean_nll)
-    except OverflowError:
-        perplexity = math.inf
+    mean_nll = nll_sum / token_count if nll_valid else None
+    perplexity = None
+    if mean_nll is not None and math.isfinite(mean_nll):
+        try:
+            candidate_perplexity = math.exp(mean_nll)
+        except OverflowError:
+            candidate_perplexity = math.inf
+        if math.isfinite(candidate_perplexity):
+            perplexity = candidate_perplexity
+        else:
+            nll_valid = False
+            nonfinite_count += 1
     finite = bool(
-        nan_count == 0
+        nll_valid
+        and nan_count == 0
         and nonfinite_count == 0
         and math.isfinite(nll_sum)
+        and mean_nll is not None
         and math.isfinite(mean_nll)
+        and perplexity is not None
         and math.isfinite(perplexity)
     )
+    error = None
+    if not finite:
+        error = {
+            "type": "NonFiniteQualityEvidence",
+            "message": "teacher-forced loss produced nonfinite numeric evidence",
+        }
     return {
         "input_token_count": len(tokens),
         "token_count": token_count,
         "chunk_tokens": chunk_tokens,
         "chunk_count": chunks,
-        "nll_sum": nll_sum,
-        "mean_nll": mean_nll,
-        "perplexity": perplexity,
+        "nll_sum": nll_sum if finite else None,
+        "mean_nll": mean_nll if finite else None,
+        "perplexity": perplexity if finite else None,
         "finite": finite,
         "nan_count": nan_count,
         "nonfinite_count": nonfinite_count,
+        "error": error,
     }
 
 
@@ -548,30 +761,59 @@ def greedy_diagnostics(
 
 
 def quality_gate(
-    q4_perplexity: float,
-    q2_perplexity: float,
+    q4_perplexity: float | None,
+    q2_perplexity: float | None,
     *,
     finite: bool,
     max_relative_perplexity_regression: float,
 ) -> dict[str, Any]:
+    threshold, threshold_decimal = _bounded_quality_ceiling(
+        max_relative_perplexity_regression
+    )
+    relative_decimal = None
+    relative = None
+    error = None
+    try:
+        q4_value = float(q4_perplexity) if q4_perplexity is not None else math.nan
+        q2_value = float(q2_perplexity) if q2_perplexity is not None else math.nan
+    except (TypeError, ValueError):
+        q4_value = math.nan
+        q2_value = math.nan
     if (
-        math.isfinite(q4_perplexity)
-        and q4_perplexity > 0.0
-        and math.isfinite(q2_perplexity)
+        math.isfinite(q4_value)
+        and q4_value > 0.0
+        and math.isfinite(q2_value)
+        and q2_value > 0.0
     ):
-        relative = q2_perplexity / q4_perplexity - 1.0
+        relative_decimal = Decimal(str(q2_value)) / Decimal(str(q4_value)) - Decimal(1)
+        try:
+            candidate_relative = float(relative_decimal)
+        except (OverflowError, ValueError):
+            candidate_relative = math.inf
+        if math.isfinite(candidate_relative):
+            relative = candidate_relative
+        else:
+            error = {
+                "type": "NonFiniteQualityEvidence",
+                "message": "relative perplexity regression is not JSON-safe",
+            }
     else:
-        relative = None
+        error = {
+            "type": "NonFiniteQualityEvidence",
+            "message": "perplexity inputs must be finite and positive",
+        }
     quality_passed = bool(
         finite
+        and relative_decimal is not None
+        and relative_decimal.is_finite()
         and relative is not None
-        and math.isfinite(relative)
-        and relative <= max_relative_perplexity_regression
+        and relative_decimal <= threshold_decimal
     )
     return {
         "relative_perplexity_regression": relative,
-        "max_relative_perplexity_regression": max_relative_perplexity_regression,
+        "max_relative_perplexity_regression": threshold,
         "quality_passed": quality_passed,
+        "error": error,
     }
 
 
@@ -675,13 +917,9 @@ def compare_quality(
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
-    if (
-        not math.isfinite(max_relative_perplexity_regression)
-        or max_relative_perplexity_regression < 0.0
-    ):
-        raise ValueError(
-            "max_relative_perplexity_regression must be finite and non-negative"
-        )
+    max_relative_perplexity_regression, _threshold_decimal = _bounded_quality_ceiling(
+        max_relative_perplexity_regression
+    )
     corpus, corpus_texts = _corpus_receipt(corpus_files)
     prompt_receipt, prompts = _load_prompts(prompt_file)
     errors: list[dict[str, str]] = []
@@ -769,8 +1007,8 @@ def compare_quality(
             for row in lane.get("greedy_outputs", [])
         )
     )
-    q4_perplexity = float(q4_result.get("loss", {}).get("perplexity", math.nan))
-    q2_perplexity = float(q2_result.get("loss", {}).get("perplexity", math.nan))
+    q4_perplexity = q4_result.get("loss", {}).get("perplexity")
+    q2_perplexity = q2_result.get("loss", {}).get("perplexity")
     gate = quality_gate(
         q4_perplexity,
         q2_perplexity,
@@ -789,6 +1027,7 @@ def compare_quality(
         ],
         "nan_count": nan_count,
         "nonfinite_count": nonfinite_count,
+        "gate_error": gate["error"],
         "corpus": corpus,
         "prompt_file": prompt_receipt,
         "lanes": {"q4": q4_result, "q2": q2_result},
@@ -804,10 +1043,26 @@ def _positive_int(value: str) -> int:
     return result
 
 
-def _nonnegative_float(value: str) -> float:
-    result = float(value)
-    if not math.isfinite(result) or result < 0.0:
-        raise argparse.ArgumentTypeError("value must be finite and non-negative")
+def _bounded_quality_ceiling(value: object) -> tuple[float, Decimal]:
+    if isinstance(value, bool):
+        raise ValueError("quality ceiling must be numeric")
+    try:
+        decimal_value = Decimal(str(value))
+        result = float(decimal_value)
+    except (InvalidOperation, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("quality ceiling must be numeric") from exc
+    if not decimal_value.is_finite() or not math.isfinite(result) or result < 0.0:
+        raise ValueError("quality ceiling must be finite and non-negative")
+    if decimal_value > _MAX_QUALITY_CEILING_DECIMAL:
+        raise ValueError("quality ceiling must not exceed 0.05")
+    return result, decimal_value
+
+
+def _quality_ceiling_argument(value: str) -> float:
+    try:
+        result, _decimal = _bounded_quality_ceiling(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
     return result
 
 
@@ -832,7 +1087,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--greedy-max-tokens", type=_positive_int, required=True)
     parser.add_argument(
         "--max-relative-perplexity-regression",
-        type=_nonnegative_float,
+        type=_quality_ceiling_argument,
         default=0.05,
     )
     parser.add_argument("--output-json", type=Path, required=True)
@@ -878,7 +1133,9 @@ def _lane(config: LaneConfig) -> QualityLane:
 def _write_json_once(path: Path, payload: dict[str, Any]) -> None:
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
-    encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    encoded = (
+        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
     descriptor = os.open(
         target,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
