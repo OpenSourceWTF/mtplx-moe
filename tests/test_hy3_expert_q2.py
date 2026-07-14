@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 import hashlib
 import json
+import os
+import stat
 import subprocess
 import sys
 from dataclasses import replace
@@ -13,6 +15,7 @@ import numpy as np
 import pytest
 
 import mtplx.hy3_expert_q2 as q2_module
+from mtplx import expert_manifest as expert_manifest_module
 from mtplx.expert_manifest import (
     ExpertManifest,
     ExpertRecord,
@@ -840,6 +843,242 @@ def test_resident_staging_refuses_target_symlinks(
         stage_exact_residents(source_root, manifest, work_root)
 
     assert sentinel.read_bytes() == b"unchanged"
+
+
+@pytest.mark.parametrize("mutation", ["config_bytes", "extra_mtp", "config_symlink"])
+def test_resident_final_state_rejects_post_copy_mutation_and_cleans_created_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    source_root = tmp_path / "source"
+    work_root = tmp_path / "work"
+    manifest, expected_payloads = _resident_source(source_root)
+    work_root.mkdir()
+    original_copy = q2_module._copy_independent_file
+
+    def mutate_after_last_copy(*args, **kwargs):
+        digest = original_copy(*args, **kwargs)
+        if args[2] == "chat_template.jinja":
+            target_config = work_root / "config.json"
+            if mutation == "config_bytes":
+                target_config.write_bytes(b"mutated-after-copy")
+            elif mutation == "extra_mtp":
+                (work_root / "mtp").mkdir()
+            else:
+                target_config.unlink()
+                target_config.symlink_to(source_root / "config.json")
+        return digest
+
+    monkeypatch.setattr(q2_module, "_copy_independent_file", mutate_after_last_copy)
+
+    with pytest.raises(ValueError, match="final|inventory|hash|regular|symlink|swap"):
+        stage_exact_residents(source_root, manifest, work_root)
+
+    remaining = {path.name for path in work_root.iterdir()}
+    if mutation == "extra_mtp":
+        assert remaining == {"mtp"}
+    elif mutation == "config_symlink":
+        assert remaining == {"config.json"}
+        assert (work_root / "config.json").is_symlink()
+    else:
+        assert remaining == set()
+    assert (source_root / "config.json").read_bytes() == expected_payloads[
+        "config.json"
+    ]
+
+
+def test_resident_final_identity_detects_swap_during_descriptor_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    work_root = tmp_path / "work"
+    manifest, expected_payloads = _resident_source(source_root)
+    work_root.mkdir()
+    original_copy = q2_module._copy_independent_file
+    original_hash_fd = q2_module._hash_fd
+    target_config_inode: int | None = None
+    copies_finished = False
+    swapped = False
+
+    def observe_last_copy(*args, **kwargs):
+        nonlocal target_config_inode, copies_finished
+        digest = original_copy(*args, **kwargs)
+        if args[2] == "config.json":
+            target_config_inode = (work_root / "config.json").stat().st_ino
+        if args[2] == "chat_template.jinja":
+            copies_finished = True
+        return digest
+
+    def swap_after_final_hash(fd: int, *, length: int, chunk_bytes: int) -> str:
+        nonlocal swapped
+        digest = original_hash_fd(fd, length=length, chunk_bytes=chunk_bytes)
+        if (
+            copies_finished
+            and not swapped
+            and target_config_inode is not None
+            and os.fstat(fd).st_ino == target_config_inode
+        ):
+            swapped = True
+            target = work_root / "config.json"
+            target.unlink()
+            target.symlink_to(source_root / "config.json")
+        return digest
+
+    monkeypatch.setattr(q2_module, "_copy_independent_file", observe_last_copy)
+    monkeypatch.setattr(q2_module, "_hash_fd", swap_after_final_hash)
+
+    with pytest.raises(ValueError, match="swap|identity|symlink|regular"):
+        stage_exact_residents(source_root, manifest, work_root)
+
+    assert swapped is True
+    assert {path.name for path in work_root.iterdir()} == {"config.json"}
+    assert (work_root / "config.json").is_symlink()
+    assert (source_root / "config.json").read_bytes() == expected_payloads[
+        "config.json"
+    ]
+
+
+def test_resident_final_index_and_headers_are_parsed_from_held_descriptors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    work_root = tmp_path / "work"
+    manifest, _payloads = _resident_source(source_root)
+    work_root.mkdir()
+    original_inventory = expert_manifest_module._checkpoint_inventory
+
+    def reject_path_following_target_inventory(root: Path, *, hash_shards: bool):
+        if Path(root).resolve() == work_root.resolve():
+            raise AssertionError("final inventory followed target paths")
+        return original_inventory(root, hash_shards=hash_shards)
+
+    monkeypatch.setattr(
+        expert_manifest_module,
+        "_checkpoint_inventory",
+        reject_path_following_target_inventory,
+    )
+
+    result = stage_exact_residents(source_root, manifest, work_root)
+
+    assert result.tensors == manifest.resident_tensors
+
+
+@pytest.mark.parametrize("symlinked_root", ["source", "work"])
+def test_resident_staging_rejects_symlinked_directory_ancestors(
+    tmp_path: Path,
+    symlinked_root: str,
+) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    source_real = real_parent / "source"
+    manifest, _payloads = _resident_source(source_real)
+    work_real = real_parent / "work"
+    work_real.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+    source_root = alias / "source" if symlinked_root == "source" else source_real
+    work_root = alias / "work" if symlinked_root == "work" else work_real
+
+    with pytest.raises(ValueError, match="ancestor|symlink"):
+        stage_exact_residents(source_root, manifest, work_root)
+
+    assert list(work_real.iterdir()) == []
+
+
+def test_resident_final_directory_identity_rejects_path_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    work_root = tmp_path / "work"
+    moved_root = tmp_path / "work-moved"
+    manifest, _payloads = _resident_source(source_root)
+    work_root.mkdir()
+    original_copy = q2_module._copy_independent_file
+
+    def swap_work_path_after_last_copy(*args, **kwargs):
+        receipt = original_copy(*args, **kwargs)
+        if args[2] == "chat_template.jinja":
+            work_root.rename(moved_root)
+            work_root.symlink_to(moved_root, target_is_directory=True)
+        return receipt
+
+    monkeypatch.setattr(
+        q2_module,
+        "_copy_independent_file",
+        swap_work_path_after_last_copy,
+    )
+
+    with pytest.raises(ValueError, match="identity|symlink|path|swap"):
+        stage_exact_residents(source_root, manifest, work_root)
+
+    assert list(moved_root.iterdir()) == []
+
+
+def test_resident_final_source_identity_rejects_path_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    moved_source = tmp_path / "source-moved"
+    work_root = tmp_path / "work"
+    manifest, _payloads = _resident_source(source_root)
+    work_root.mkdir()
+    original_copy = q2_module._copy_independent_file
+
+    def swap_source_path_after_last_copy(*args, **kwargs):
+        receipt = original_copy(*args, **kwargs)
+        if args[2] == "chat_template.jinja":
+            source_root.rename(moved_source)
+            source_root.symlink_to(moved_source, target_is_directory=True)
+        return receipt
+
+    monkeypatch.setattr(
+        q2_module,
+        "_copy_independent_file",
+        swap_source_path_after_last_copy,
+    )
+
+    with pytest.raises(ValueError, match="identity|symlink|path|swap"):
+        stage_exact_residents(source_root, manifest, work_root)
+
+    assert list(work_root.iterdir()) == []
+
+
+def test_resident_final_directory_fsync_failure_cleans_and_allows_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    work_root = tmp_path / "work"
+    manifest, _payloads = _resident_source(source_root)
+    work_root.mkdir()
+    original_fsync = q2_module.os.fsync
+    directory_fsyncs = 0
+    injected = False
+
+    def fail_final_directory_fsync(fd: int) -> None:
+        nonlocal directory_fsyncs, injected
+        metadata = os.fstat(fd)
+        if stat.S_ISDIR(metadata.st_mode):
+            directory_fsyncs += 1
+            if directory_fsyncs == 10 and not injected:
+                injected = True
+                raise OSError("injected final directory fsync failure")
+        original_fsync(fd)
+
+    monkeypatch.setattr(q2_module.os, "fsync", fail_final_directory_fsync)
+
+    with pytest.raises(OSError, match="injected final directory fsync failure"):
+        stage_exact_residents(source_root, manifest, work_root)
+
+    assert injected is True
+    assert list(work_root.iterdir()) == []
+    result = stage_exact_residents(source_root, manifest, work_root)
+    assert result.tensors == manifest.resident_tensors
 
 
 @pytest.mark.parametrize("chunk_bytes", [0, 64 * 1024**2 + 1])

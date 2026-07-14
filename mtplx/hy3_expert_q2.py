@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 
@@ -45,6 +46,24 @@ _ANCILLARY_FILES = (
     "chat_template.jinja",
 )
 _MAX_COPY_CHUNK_BYTES = 64 * 1024**2
+_MAX_INDEX_BYTES = 128 * 1024**2
+_MAX_SAFETENSORS_HEADER_BYTES = 128 * 1024**2
+_MAX_RESIDENT_TENSORS = 1_000_000
+_SAFETENSORS_DTYPE_BYTES = {
+    "BOOL": 1,
+    "I8": 1,
+    "U8": 1,
+    "I16": 2,
+    "U16": 2,
+    "F16": 2,
+    "BF16": 2,
+    "I32": 4,
+    "U32": 4,
+    "F32": 4,
+    "I64": 8,
+    "U64": 8,
+    "F64": 8,
+}
 _ROUTED_EXPERT_RE = re.compile(
     r"(?:^|\.)layers\.\d+\.mlp\.(?:switch_mlp|experts)(?:\.|$)"
 )
@@ -67,6 +86,16 @@ class ResidentReuse:
     shards: tuple[ShardInfo, ...]
     tensors: tuple[ResidentTensor, ...]
     copied_files: dict[str, str]
+
+
+@dataclass(frozen=True)
+class _CopyReceipt:
+    sha256: str
+    size: int
+    source_device: int
+    source_inode: int
+    target_device: int
+    target_inode: int
 
 
 def _read_flags() -> int:
@@ -100,6 +129,20 @@ def _pread_chunk(fd: int, length: int, offset: int) -> bytes:
             continue
 
 
+def _pread_exact(fd: int, offset: int, length: int, *, label: str) -> bytes:
+    chunks: list[bytes] = []
+    consumed = 0
+    while consumed < length:
+        chunk = _pread_chunk(fd, length - consumed, offset + consumed)
+        if not chunk:
+            raise ValueError(
+                f"short read for {label}: got {consumed} bytes; expected {length}"
+            )
+        chunks.append(chunk)
+        consumed += len(chunk)
+    return b"".join(chunks)
+
+
 def _pwrite_all(fd: int, payload: bytes, offset: int) -> None:
     view = memoryview(payload)
     written = 0
@@ -127,14 +170,44 @@ def _hash_fd(fd: int, *, length: int, chunk_bytes: int) -> str:
     return digest.hexdigest()
 
 
+def _absolute_without_symlink_ancestors(path: Path, *, label: str) -> Path:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        try:
+            metadata = os.lstat(current)
+        except OSError as exc:
+            raise ValueError(f"{label} ancestor is unavailable: {exc}") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"{label} has a symlinked ancestor: {current}")
+    return absolute
+
+
 def _require_real_directory(path: Path, *, label: str) -> Path:
+    path = _absolute_without_symlink_ancestors(path, label=label)
     try:
         metadata = os.lstat(path)
     except OSError as exc:
         raise ValueError(f"{label} is unavailable: {exc}") from exc
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise ValueError(f"{label} must be a real directory, not a symlink")
-    return path.resolve()
+    return path
+
+
+def _assert_directory_path_identity(path: Path, fd: int, *, label: str) -> None:
+    try:
+        path_status = os.lstat(path)
+    except OSError as exc:
+        raise ValueError(f"{label} path identity is unavailable: {exc}") from exc
+    descriptor_status = os.fstat(fd)
+    if (
+        stat.S_ISLNK(path_status.st_mode)
+        or not stat.S_ISDIR(path_status.st_mode)
+        or (path_status.st_dev, path_status.st_ino)
+        != (descriptor_status.st_dev, descriptor_status.st_ino)
+    ):
+        raise ValueError(f"{label} path identity changed during resident staging")
 
 
 def _require_flat_target_name(name: str) -> str:
@@ -157,7 +230,7 @@ def _copy_independent_file(
     *,
     chunk_bytes: int,
     expected_sha256: str | None,
-) -> str:
+) -> _CopyReceipt:
     source_fd = os.open(source, _read_flags())
     target_fd: int | None = None
     try:
@@ -213,15 +286,33 @@ def _copy_independent_file(
             raise ValueError(
                 f"resident shard hash does not match manifest provenance: {target_name}"
             )
-        return target_sha256
+        return _CopyReceipt(
+            sha256=target_sha256,
+            size=target_status.st_size,
+            source_device=source_after.st_dev,
+            source_inode=source_after.st_ino,
+            target_device=target_status.st_dev,
+            target_inode=target_status.st_ino,
+        )
     except BaseException:
         if target_fd is not None:
-            os.close(target_fd)
-            target_fd = None
             try:
-                os.unlink(target_name, dir_fd=directory_fd)
+                descriptor_status = os.fstat(target_fd)
+                entry_status = os.stat(
+                    target_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISREG(entry_status.st_mode) and (
+                    entry_status.st_dev,
+                    entry_status.st_ino,
+                ) == (descriptor_status.st_dev, descriptor_status.st_ino):
+                    os.unlink(target_name, dir_fd=directory_fd)
             except FileNotFoundError:
                 pass
+            finally:
+                os.close(target_fd)
+                target_fd = None
         raise
     finally:
         os.close(source_fd)
@@ -241,6 +332,308 @@ def _reject_resident_contamination(
     for name in sorted(shard_names):
         if any(part.lower() == "mtp" for part in PurePosixPath(name).parts):
             raise ValueError(f"resident index contains MTP shard {name!r}")
+
+
+def _strict_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+def _json_from_fd(fd: int, *, name: str, max_bytes: int) -> Any:
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_bytes:
+        raise ValueError(f"final {name} is not a bounded regular JSON file")
+    payload = _pread_exact(fd, 0, metadata.st_size, label=name)
+    try:
+        return json.loads(payload, object_pairs_hook=_strict_json_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid final JSON in {name}: {exc}") from exc
+
+
+def _exact_integer(value: Any, *, label: str, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{label} must be an integer of at least {minimum}")
+    return value
+
+
+def _parse_index_fd(fd: int) -> tuple[dict[str, str], int | None]:
+    value = _json_from_fd(fd, name=_INDEX_FILE, max_bytes=_MAX_INDEX_BYTES)
+    if not isinstance(value, dict) or "weight_map" not in value:
+        raise ValueError("final resident index must contain a weight_map object")
+    if set(value) - {"weight_map", "metadata"}:
+        raise ValueError("final resident index contains unknown top-level keys")
+    raw_map = value["weight_map"]
+    if not isinstance(raw_map, dict) or len(raw_map) > _MAX_RESIDENT_TENSORS:
+        raise ValueError("final resident index weight_map is invalid or too large")
+    weight_map: dict[str, str] = {}
+    for tensor, shard in raw_map.items():
+        if not isinstance(tensor, str) or not tensor:
+            raise ValueError("final resident index has an invalid tensor name")
+        if not isinstance(shard, str):
+            raise ValueError(f"final resident index shard for {tensor!r} is invalid")
+        weight_map[tensor] = _require_flat_target_name(shard)
+    total_size = None
+    if "metadata" in value:
+        metadata = value["metadata"]
+        if not isinstance(metadata, dict):
+            raise ValueError("final resident index metadata must be an object")
+        if "total_size" in metadata:
+            total_size = _exact_integer(
+                metadata["total_size"],
+                label="final resident index total_size",
+            )
+    return weight_map, total_size
+
+
+def _parse_safetensors_fd(
+    fd: int,
+    *,
+    name: str,
+    sha256: str,
+) -> tuple[ShardInfo, dict[str, ResidentTensor]]:
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"final resident shard {name} is not regular")
+    length_raw = _pread_exact(fd, 0, 8, label=f"{name} header length")
+    header_length = int.from_bytes(length_raw, "little")
+    if not 1 <= header_length <= _MAX_SAFETENSORS_HEADER_BYTES:
+        raise ValueError(f"final resident shard {name} has an invalid header length")
+    header_raw = _pread_exact(fd, 8, header_length, label=f"{name} header")
+    try:
+        header = json.loads(header_raw, object_pairs_hook=_strict_json_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid final safetensors header in {name}: {exc}") from exc
+    if not isinstance(header, dict) or len(header) > _MAX_RESIDENT_TENSORS:
+        raise ValueError(f"final resident shard {name} has an invalid tensor header")
+    data_start = 8 + header_length
+    tensors: dict[str, ResidentTensor] = {}
+    ranges: list[tuple[int, int, str]] = []
+    for tensor_name, raw_info in header.items():
+        if tensor_name == "__metadata__":
+            continue
+        if not isinstance(tensor_name, str) or not tensor_name:
+            raise ValueError(f"final resident shard {name} has an invalid tensor name")
+        if not isinstance(raw_info, dict) or set(raw_info) != {
+            "dtype",
+            "shape",
+            "data_offsets",
+        }:
+            raise ValueError(f"final tensor {tensor_name} has invalid metadata keys")
+        dtype = raw_info["dtype"]
+        if not isinstance(dtype, str) or dtype not in _SAFETENSORS_DTYPE_BYTES:
+            raise ValueError(f"final tensor {tensor_name} has unsupported dtype")
+        raw_shape = raw_info["shape"]
+        if not isinstance(raw_shape, list):
+            raise ValueError(f"final tensor {tensor_name} has an invalid shape")
+        shape = tuple(
+            _exact_integer(item, label=f"final tensor {tensor_name} shape", minimum=1)
+            for item in raw_shape
+        )
+        offsets = raw_info["data_offsets"]
+        if not isinstance(offsets, list) or len(offsets) != 2:
+            raise ValueError(f"final tensor {tensor_name} has invalid offsets")
+        start = _exact_integer(offsets[0], label=f"final tensor {tensor_name} start")
+        end = _exact_integer(offsets[1], label=f"final tensor {tensor_name} end")
+        if end <= start:
+            raise ValueError(f"final tensor {tensor_name} has an empty range")
+        length = end - start
+        expected_length = _SAFETENSORS_DTYPE_BYTES[dtype]
+        for dimension in shape:
+            expected_length *= dimension
+        if length != expected_length:
+            raise ValueError(f"final tensor {tensor_name} dtype/shape bytes mismatch")
+        absolute_start = data_start + start
+        absolute_end = data_start + end
+        if absolute_end > metadata.st_size:
+            raise ValueError(f"final tensor {tensor_name} exceeds shard {name}")
+        tensors[tensor_name] = ResidentTensor(
+            tensor=tensor_name,
+            shard=name,
+            offset=absolute_start,
+            length=length,
+            dtype=dtype,
+            shape=shape,
+        )
+        ranges.append((absolute_start, absolute_end, tensor_name))
+    if not tensors:
+        raise ValueError(f"final resident shard {name} contains no tensors")
+    ranges.sort()
+    for previous, current in zip(ranges, ranges[1:]):
+        if previous[1] > current[0]:
+            raise ValueError(
+                f"final resident shard {name} has overlapping tensor ranges"
+            )
+    if max(end for _start, end, _tensor in ranges) != metadata.st_size:
+        raise ValueError(f"final resident shard {name} has trailing payload bytes")
+    return (
+        ShardInfo(
+            name=name,
+            size=metadata.st_size,
+            header_bytes=data_start,
+            header_sha256=hashlib.sha256(length_raw + header_raw).hexdigest(),
+            sha256=sha256,
+        ),
+        tensors,
+    )
+
+
+def _open_final_files(
+    directory_fd: int,
+    receipts: dict[str, _CopyReceipt],
+    *,
+    chunk_bytes: int,
+) -> dict[str, int]:
+    expected_names = set(receipts)
+    actual_names = set(os.listdir(directory_fd))
+    if actual_names != expected_names:
+        missing = sorted(expected_names - actual_names)
+        extra = sorted(actual_names - expected_names)
+        raise ValueError(
+            "final resident directory inventory mismatch; "
+            f"missing={missing[:4]}, extra={extra[:4]}"
+        )
+    opened: dict[str, int] = {}
+    try:
+        for name in sorted(expected_names):
+            receipt = receipts[name]
+            entry_status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISREG(entry_status.st_mode) or entry_status.st_nlink != 1:
+                raise ValueError(
+                    f"final resident entry {name} is not a single-link regular file"
+                )
+            if (
+                entry_status.st_size != receipt.size
+                or (entry_status.st_dev, entry_status.st_ino)
+                != (receipt.target_device, receipt.target_inode)
+                or (entry_status.st_dev, entry_status.st_ino)
+                == (receipt.source_device, receipt.source_inode)
+            ):
+                raise ValueError(
+                    f"final resident entry {name} identity or size changed"
+                )
+            fd = os.open(name, _read_flags(), dir_fd=directory_fd)
+            opened[name] = fd
+            descriptor_status = os.fstat(fd)
+            if (descriptor_status.st_dev, descriptor_status.st_ino) != (
+                entry_status.st_dev,
+                entry_status.st_ino,
+            ):
+                raise ValueError(f"final resident entry {name} swapped while opening")
+            if (
+                _hash_fd(fd, length=descriptor_status.st_size, chunk_bytes=chunk_bytes)
+                != receipt.sha256
+            ):
+                raise ValueError(f"final resident entry {name} hash changed")
+            final_entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISREG(final_entry.st_mode) or (
+                final_entry.st_dev,
+                final_entry.st_ino,
+            ) != (descriptor_status.st_dev, descriptor_status.st_ino):
+                raise ValueError(
+                    f"final resident entry {name} swapped during validation"
+                )
+        return opened
+    except BaseException:
+        for fd in opened.values():
+            os.close(fd)
+        raise
+
+
+def _validate_final_index_and_shards(
+    final_fds: dict[str, int],
+    receipts: dict[str, _CopyReceipt],
+    expected_shards: tuple[ShardInfo, ...],
+    expected_tensors: tuple[ResidentTensor, ...],
+) -> None:
+    weight_map, declared_total_size = _parse_index_fd(final_fds[_INDEX_FILE])
+    tensors_by_name = {tensor.tensor: tensor for tensor in expected_tensors}
+    if set(weight_map) != set(tensors_by_name):
+        raise ValueError("final resident index tensor set changed during staging")
+    expected_shards_by_name = {shard.name: shard for shard in expected_shards}
+    if set(weight_map.values()) != set(expected_shards_by_name):
+        raise ValueError("final resident index shard set changed during staging")
+    parsed_tensors: dict[str, ResidentTensor] = {}
+    for name in sorted(expected_shards_by_name):
+        parsed_shard, shard_tensors = _parse_safetensors_fd(
+            final_fds[name],
+            name=name,
+            sha256=receipts[name].sha256,
+        )
+        if parsed_shard != expected_shards_by_name[name]:
+            raise ValueError(f"final resident shard metadata changed: {name}")
+        for tensor_name, tensor in shard_tensors.items():
+            if tensor_name in parsed_tensors:
+                raise ValueError(f"final resident tensor is duplicated: {tensor_name}")
+            if weight_map.get(tensor_name) != name:
+                raise ValueError(f"final resident index maps {tensor_name} incorrectly")
+            parsed_tensors[tensor_name] = tensor
+    if parsed_tensors != tensors_by_name:
+        raise ValueError("final resident tensor metadata changed during staging")
+    expected_total = sum(tensor.length for tensor in expected_tensors)
+    if declared_total_size is not None and declared_total_size != expected_total:
+        raise ValueError("final resident index total_size changed during staging")
+
+
+def _final_recheck(
+    directory_fd: int,
+    final_fds: dict[str, int],
+    receipts: dict[str, _CopyReceipt],
+    *,
+    chunk_bytes: int,
+) -> None:
+    if set(os.listdir(directory_fd)) != set(receipts):
+        raise ValueError("final resident directory inventory changed before return")
+    for name, fd in final_fds.items():
+        receipt = receipts[name]
+        descriptor_status = os.fstat(fd)
+        entry_status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(entry_status.st_mode)
+            or entry_status.st_nlink != 1
+            or (entry_status.st_dev, entry_status.st_ino)
+            != (descriptor_status.st_dev, descriptor_status.st_ino)
+            or (descriptor_status.st_dev, descriptor_status.st_ino)
+            != (receipt.target_device, receipt.target_inode)
+        ):
+            raise ValueError(
+                f"final resident entry {name} identity changed before return"
+            )
+        if (
+            _hash_fd(fd, length=descriptor_status.st_size, chunk_bytes=chunk_bytes)
+            != receipt.sha256
+        ):
+            raise ValueError(f"final resident entry {name} hash changed before return")
+    if set(os.listdir(directory_fd)) != set(receipts):
+        raise ValueError("final resident directory inventory changed during validation")
+    for name, fd in final_fds.items():
+        descriptor_status = os.fstat(fd)
+        entry_status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not stat.S_ISREG(entry_status.st_mode) or (
+            entry_status.st_dev,
+            entry_status.st_ino,
+        ) != (descriptor_status.st_dev, descriptor_status.st_ino):
+            raise ValueError(f"final resident entry {name} swapped before return")
+
+
+def _cleanup_created_entries(
+    directory_fd: int,
+    receipts: dict[str, _CopyReceipt],
+) -> None:
+    for name, receipt in reversed(tuple(receipts.items())):
+        try:
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISREG(metadata.st_mode) and (
+            metadata.st_dev,
+            metadata.st_ino,
+        ) == (receipt.target_device, receipt.target_inode):
+            os.unlink(name, dir_fd=directory_fd)
+    os.fsync(directory_fd)
 
 
 def stage_exact_residents(
@@ -268,8 +661,15 @@ def stage_exact_residents(
         or work_root in source_root.parents
     ):
         raise ValueError("source root and target work root must not contain each other")
-    work_fd = os.open(work_root, _directory_flags())
+    source_fd = os.open(source_root, _directory_flags())
     try:
+        work_fd = os.open(work_root, _directory_flags())
+    except BaseException:
+        os.close(source_fd)
+        raise
+    try:
+        _assert_directory_path_identity(source_root, source_fd, label="source root")
+        _assert_directory_path_identity(work_root, work_fd, label="target work root")
         if os.listdir(work_fd):
             raise ValueError("target work root must be empty before resident staging")
 
@@ -362,51 +762,76 @@ def stage_exact_residents(
         if len(target_names) != len(set(target_names)):
             raise ValueError("resident staging target names are not unique")
 
-        copied_files: dict[str, str] = {}
-        created: list[str] = []
+        receipts: dict[str, _CopyReceipt] = {}
+        final_fds: dict[str, int] = {}
         try:
             for name, source, expected_sha256 in source_members:
-                copied_files[name] = _copy_independent_file(
+                receipts[name] = _copy_independent_file(
                     source,
                     work_fd,
                     name,
                     chunk_bytes=copy_chunk_bytes,
                     expected_sha256=expected_sha256,
                 )
-                created.append(name)
                 os.fsync(work_fd)
-            target_shards, target_tensors = (
-                expert_manifest_module._checkpoint_inventory(
-                    work_root,
-                    hash_shards=True,
-                )
+            final_fds = _open_final_files(
+                work_fd,
+                receipts,
+                chunk_bytes=copy_chunk_bytes,
             )
-            if target_shards != source_shards:
-                raise ValueError(
-                    "copied resident shard inventory changed during staging"
-                )
-            for name, tensor in target_tensors.items():
-                source_tensor = source_tensors.get(name)
-                if source_tensor is None or tensor != source_tensor:
-                    raise ValueError(
-                        f"copied resident tensor metadata changed during staging: {name}"
-                    )
-        except BaseException:
-            for name in reversed(created):
-                try:
-                    os.unlink(name, dir_fd=work_fd)
-                except FileNotFoundError:
-                    pass
+            _validate_final_index_and_shards(
+                final_fds,
+                receipts,
+                tuple(selected_shards),
+                source_manifest.resident_tensors,
+            )
+            result = ResidentReuse(
+                shards=tuple(selected_shards),
+                tensors=source_manifest.resident_tensors,
+                copied_files={
+                    name: receipt.sha256 for name, receipt in receipts.items()
+                },
+            )
+            _assert_directory_path_identity(
+                source_root,
+                source_fd,
+                label="source root",
+            )
+            _assert_directory_path_identity(
+                work_root,
+                work_fd,
+                label="target work root",
+            )
             os.fsync(work_fd)
+            _final_recheck(
+                work_fd,
+                final_fds,
+                receipts,
+                chunk_bytes=copy_chunk_bytes,
+            )
+            _assert_directory_path_identity(
+                source_root,
+                source_fd,
+                label="source root",
+            )
+            _assert_directory_path_identity(
+                work_root,
+                work_fd,
+                label="target work root",
+            )
+            return result
+        except BaseException:
+            for fd in final_fds.values():
+                os.close(fd)
+            final_fds.clear()
+            _cleanup_created_entries(work_fd, receipts)
             raise
-        os.fsync(work_fd)
-        return ResidentReuse(
-            shards=tuple(selected_shards),
-            tensors=source_manifest.resident_tensors,
-            copied_files=copied_files,
-        )
+        finally:
+            for fd in final_fds.values():
+                os.close(fd)
     finally:
         os.close(work_fd)
+        os.close(source_fd)
 
 
 def _byte_view(
