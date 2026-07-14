@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
 import os
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,14 @@ class BenchmarkConfigurationError(ValueError):
 
 class BenchmarkGateError(RuntimeError):
     """Raised as soon as a correctness or metric gate fails."""
+
+
+Checkpoint = Callable[[Mapping[str, Any]], None]
+
+
+def _emit_checkpoint(payload: Mapping[str, Any], checkpoint: Checkpoint | None) -> None:
+    if checkpoint is not None:
+        checkpoint(copy.deepcopy(dict(payload)))
 
 
 class RunnerAPIs:
@@ -244,6 +253,14 @@ def build_parser() -> argparse.ArgumentParser:
             "cost, so these rows are diagnostic rather than headline throughput."
         ),
     )
+    parser.add_argument(
+        "--mtp-disabled-baseline",
+        action="store_true",
+        help=(
+            "Load the streamed Q2 target without an MTP artifact and run only "
+            "the AR warmup/retained baseline rows."
+        ),
+    )
     parser.add_argument("--output-json", type=Path)
     return parser
 
@@ -271,16 +288,16 @@ def _requests_from_args(args: argparse.Namespace) -> list[dict[str, Any]]:
             prompt_tail = args.glm52_q2_prompt_tail
             depths = args.glm52_depths
         model_root = _expand(model_root)
-        requests.append(
-            {
-                "model": model,
-                "model_root": model_root,
-                "manifest": _expand(manifest or model_root / "expert-manifest.json"),
-                "mtp_artifacts": _expand(mtp_artifacts),
-                "prompt_tail": _expand(prompt_tail),
-                "depths": tuple(depths),
-            }
-        )
+        request = {
+            "model": model,
+            "model_root": model_root,
+            "manifest": _expand(manifest or model_root / "expert-manifest.json"),
+            "prompt_tail": _expand(prompt_tail),
+            "depths": tuple(depths),
+        }
+        if not args.mtp_disabled_baseline:
+            request["mtp_artifacts"] = _expand(mtp_artifacts)
+        requests.append(request)
     return requests
 
 
@@ -766,20 +783,33 @@ def _runtime_config(
     )
 
 
-def _normalized_request(request: Mapping[str, Any]) -> dict[str, Any]:
+def _normalized_request(
+    request: Mapping[str, Any],
+    *,
+    mtp_disabled_baseline: bool,
+) -> dict[str, Any]:
     model = request.get("model")
     if model not in MODEL_SPECS:
         raise BenchmarkConfigurationError(f"unsupported model {model!r}")
     spec = MODEL_SPECS[model]
-    depths = tuple(int(value) for value in request.get("depths", spec["depths"]))
-    if not depths or len(set(depths)) != len(depths):
-        raise BenchmarkConfigurationError(f"{model} depths must be unique and nonempty")
-    permitted = set(spec["depths"])
-    if any(depth not in permitted for depth in depths):
-        raise BenchmarkConfigurationError(
-            f"{model} depths must be selected from {tuple(spec['depths'])}"
-        )
-    required_paths = ("model_root", "manifest", "mtp_artifacts")
+    if mtp_disabled_baseline:
+        depths: tuple[int, ...] = ()
+    else:
+        depths = tuple(int(value) for value in request.get("depths", spec["depths"]))
+        if not depths or len(set(depths)) != len(depths):
+            raise BenchmarkConfigurationError(
+                f"{model} depths must be unique and nonempty"
+            )
+        permitted = set(spec["depths"])
+        if any(depth not in permitted for depth in depths):
+            raise BenchmarkConfigurationError(
+                f"{model} depths must be selected from {tuple(spec['depths'])}"
+            )
+    required_paths = (
+        ("model_root", "manifest")
+        if mtp_disabled_baseline
+        else ("model_root", "manifest", "mtp_artifacts")
+    )
     missing = [name for name in required_paths if request.get(name) is None]
     if missing:
         raise BenchmarkConfigurationError(
@@ -793,15 +823,53 @@ def _normalized_request(request: Mapping[str, Any]) -> dict[str, Any]:
         prompt_tail_text = _expand(prompt_tail_path).read_text(encoding="utf-8")
     if not prompt_tail_text:
         raise BenchmarkConfigurationError(f"{model} prompt tail must not be empty")
-    return {
+    normalized = {
         "model": model,
         "model_key": spec["model_key"],
         "depths": depths,
         "model_root": _expand(request["model_root"]),
         "manifest": _expand(request["manifest"]),
-        "mtp_artifacts": _expand(request["mtp_artifacts"]),
         "prompt_tail": _expand(prompt_tail_path) if prompt_tail_path else None,
         "prompt_tail_text": prompt_tail_text,
+    }
+    if not mtp_disabled_baseline:
+        normalized["mtp_artifacts"] = _expand(request["mtp_artifacts"])
+    return normalized
+
+
+def _checkpoint_skeleton(
+    *,
+    contexts: Sequence[int],
+    runtime_options: Mapping[str, Any] | None,
+    mtp_disabled_baseline: bool,
+) -> dict[str, Any]:
+    """Return a uniform payload for failures before validated setup exists."""
+
+    baseline = (
+        mtp_disabled_baseline if isinstance(mtp_disabled_baseline, bool) else None
+    )
+    lane = (
+        "mtp-disabled-ar-baseline"
+        if baseline is True
+        else "mtp-resident-depth-matrix"
+        if baseline is False
+        else "invalid-configuration"
+    )
+    return {
+        "schema": SCHEMA,
+        "status": "running",
+        "passed": False,
+        "active_cell": {"phase": "configuration"},
+        "failure": None,
+        "lane": lane,
+        "mtp_resident": None if baseline is None else not baseline,
+        "configuration": {
+            "lane": lane,
+            "mtp_resident": None if baseline is None else not baseline,
+            "requested_contexts": _jsonable(list(contexts)),
+            "requested_runtime": _jsonable(dict(runtime_options or {})),
+        },
+        "models": [],
     }
 
 
@@ -810,13 +878,66 @@ def run_depth_matrix(
     *,
     contexts: Sequence[int] = DEFAULT_CONTEXTS,
     runtime_options: Mapping[str, Any] | None = None,
+    mtp_disabled_baseline: bool = False,
+    checkpoint: Checkpoint | None = None,
     apis: RunnerAPIs | None = None,
 ) -> dict[str, Any]:
-    """Run one AR/depth matrix per model, loading each selected model once."""
+    """Run one AR/depth matrix or true MTP-disabled AR baseline per model."""
+
+    live_payload = {
+        "payload": _checkpoint_skeleton(
+            contexts=contexts,
+            runtime_options=runtime_options,
+            mtp_disabled_baseline=mtp_disabled_baseline,
+        )
+    }
+    try:
+        return _run_depth_matrix_impl(
+            model_requests,
+            contexts=contexts,
+            runtime_options=runtime_options,
+            mtp_disabled_baseline=mtp_disabled_baseline,
+            checkpoint=checkpoint,
+            apis=apis,
+            _live_payload=live_payload,
+        )
+    except Exception as exc:
+        failed = live_payload["payload"]
+        active_cell = copy.deepcopy(failed.get("active_cell"))
+        failed["status"] = "failed"
+        failed["passed"] = False
+        failed["failure"] = {
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "active_cell": active_cell,
+        }
+        _emit_checkpoint(failed, checkpoint)
+        raise
+
+
+def _run_depth_matrix_impl(
+    model_requests: Sequence[Mapping[str, Any]],
+    *,
+    contexts: Sequence[int] = DEFAULT_CONTEXTS,
+    runtime_options: Mapping[str, Any] | None = None,
+    mtp_disabled_baseline: bool = False,
+    checkpoint: Checkpoint | None = None,
+    apis: RunnerAPIs | None = None,
+    _live_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Validated implementation; ``run_depth_matrix`` owns terminal failure state."""
 
     if not model_requests:
         raise BenchmarkConfigurationError("at least one model must be selected")
-    normalized = [_normalized_request(request) for request in model_requests]
+    if not isinstance(mtp_disabled_baseline, bool):
+        raise BenchmarkConfigurationError("mtp_disabled_baseline must be bool")
+    normalized = [
+        _normalized_request(
+            request,
+            mtp_disabled_baseline=mtp_disabled_baseline,
+        )
+        for request in model_requests
+    ]
     names = [request["model"] for request in normalized]
     if len(set(names)) != len(names):
         raise BenchmarkConfigurationError("models must not repeat")
@@ -834,20 +955,125 @@ def run_depth_matrix(
         )
     apis = apis or _default_apis()
     sampler = apis.sampler_factory(temperature=0.0, top_p=1.0, top_k=1)
+    lane = (
+        "mtp-disabled-ar-baseline"
+        if mtp_disabled_baseline
+        else "mtp-resident-depth-matrix"
+    )
 
-    models = []
+    models: list[dict[str, Any]] = []
+    payload: dict[str, Any] = {
+        "schema": SCHEMA,
+        "status": "running",
+        "passed": False,
+        "active_cell": {"phase": "setup"},
+        "failure": None,
+        "lane": lane,
+        "mtp_resident": not mtp_disabled_baseline,
+        "configuration": {
+            "lane": lane,
+            "mtp_resident": not mtp_disabled_baseline,
+            "measurement_lane": (
+                "diagnostic-resource-instrumented"
+                if options["resource_telemetry"]
+                else "headline-uninstrumented"
+            ),
+            "contexts": list(context_values),
+            "output_tokens": OUTPUT_TOKENS,
+            "warmup_output_tokens": WARMUP_TOKENS,
+            "retained_replicates": 1,
+            "sampler": {
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "top_k": 1,
+                "seed": SEED,
+            },
+            "generation": {
+                "ar_api": "generate_ar",
+                "mtp_api": None if mtp_disabled_baseline else "generate_mtpk",
+                "stop_token_ids": [],
+                "repetition_stop": False,
+                "loop_guard": False,
+                "mtp_cache_policy": (None if mtp_disabled_baseline else "persistent"),
+                "mtp_history_policy": (None if mtp_disabled_baseline else "committed"),
+            },
+            "runtime": _jsonable(options),
+        },
+        "models": models,
+    }
+    _live_payload["payload"] = payload
+    _emit_checkpoint(payload, checkpoint)
     for request in normalized:
+        payload["active_cell"] = {
+            "model": request["model"],
+            "context_tokens": None,
+            "depth": None,
+            "cell": None,
+            "phase": "configuration",
+        }
         config = _runtime_config(apis, request["model_key"], options)
-        runtime = apis.load(
-            request["model_root"],
-            mtp=True,
-            expert_streaming_config=config,
-            expert_manifest=request["manifest"],
-            mtp_artifacts=request["mtp_artifacts"],
-            mtp_precision="bf16",
-        )
+        observations: list[dict[str, Any]] = []
+        prompts: list[dict[str, Any]] = []
+        model_payload: dict[str, Any] = {
+            "model": request["model"],
+            "model_key": request["model_key"],
+            "model_root": str(request["model_root"]),
+            "manifest": str(request["manifest"]),
+            "lane": lane,
+            "mtp_resident": not mtp_disabled_baseline,
+            "depths": list(request["depths"]),
+            "load_count": 0,
+            "measurement_lane": (
+                "diagnostic-resource-instrumented"
+                if options["resource_telemetry"]
+                else "headline-uninstrumented"
+            ),
+            "load_peak_memory_bytes": None,
+            "hard_peak_memory_bytes": None,
+            "discarded_warmup_count": 0,
+            "warmup_output_tokens": WARMUP_TOKENS,
+            "runtime_config": _jsonable(config),
+            "prompts": prompts,
+            "observations": observations,
+            "passed": False,
+        }
+        if not mtp_disabled_baseline:
+            model_payload.update(
+                {
+                    "mtp_artifacts": str(request["mtp_artifacts"]),
+                    "mtp_precision": "bf16",
+                }
+            )
+        models.append(model_payload)
+        payload["active_cell"] = {
+            "model": request["model"],
+            "context_tokens": None,
+            "depth": None,
+            "cell": None,
+            "phase": "load",
+        }
+        load_kwargs = {
+            "mtp": not mtp_disabled_baseline,
+            "expert_streaming_config": config,
+            "expert_manifest": request["manifest"],
+        }
+        if not mtp_disabled_baseline:
+            load_kwargs.update(
+                {
+                    "mtp_artifacts": request["mtp_artifacts"],
+                    "mtp_precision": "bf16",
+                }
+            )
+        runtime = apis.load(request["model_root"], **load_kwargs)
+        model_payload["load_count"] = 1
         try:
-            if getattr(runtime, "mtp_enabled", False) is not True:
+            runtime_mtp_enabled = getattr(runtime, "mtp_enabled", None)
+            if mtp_disabled_baseline:
+                if runtime_mtp_enabled is not False:
+                    raise BenchmarkGateError(
+                        f"{request['model']} baseline runtime unexpectedly enabled MTP"
+                    )
+            elif runtime_mtp_enabled is not True:
                 raise BenchmarkGateError(
                     f"{request['model']} runtime did not load its BF16 MTP head"
                 )
@@ -860,10 +1086,17 @@ def run_depth_matrix(
             ):
                 raise BenchmarkGateError("MLX load peak must be a non-negative integer")
             hard_peak_memory_bytes = int(load_peak_memory_bytes)
-            observations = []
-            prompts = []
+            model_payload["load_peak_memory_bytes"] = load_peak_memory_bytes
+            model_payload["hard_peak_memory_bytes"] = hard_peak_memory_bytes
             discarded_warmup_count = 0
             for context_tokens in context_values:
+                payload["active_cell"] = {
+                    "model": request["model"],
+                    "context_tokens": context_tokens,
+                    "depth": None,
+                    "cell": None,
+                    "phase": "prompt",
+                }
                 prompt = apis.prompt_builder(
                     runtime.tokenizer,
                     context_tokens,
@@ -894,6 +1127,13 @@ def run_depth_matrix(
                         "builder_metadata": metadata,
                     }
                 )
+                payload["active_cell"] = {
+                    "model": request["model"],
+                    "context_tokens": context_tokens,
+                    "depth": 0,
+                    "cell": "ar",
+                    "phase": "warmup",
+                }
                 _warmup_ar_row, warmup_ar_tokens, warmup_ar_finish = _run_observation(
                     apis=apis,
                     runtime=runtime,
@@ -914,6 +1154,15 @@ def run_depth_matrix(
                     int(_warmup_ar_row["peak_memory_bytes"]),
                 )
                 discarded_warmup_count += 1
+                model_payload["discarded_warmup_count"] = discarded_warmup_count
+                model_payload["hard_peak_memory_bytes"] = hard_peak_memory_bytes
+                payload["active_cell"] = {
+                    "model": request["model"],
+                    "context_tokens": context_tokens,
+                    "depth": 0,
+                    "cell": "ar",
+                    "phase": "retained",
+                }
                 ar_row, ar_tokens, ar_finish = _run_observation(
                     apis=apis,
                     runtime=runtime,
@@ -936,7 +1185,16 @@ def run_depth_matrix(
                 pair_id = f"{request['model']}-c{context_tokens}-ar"
                 ar_row["pair_id"] = pair_id
                 observations.append(ar_row)
+                model_payload["hard_peak_memory_bytes"] = hard_peak_memory_bytes
+                _emit_checkpoint(payload, checkpoint)
                 for position, depth in enumerate(request["depths"], start=2):
+                    payload["active_cell"] = {
+                        "model": request["model"],
+                        "context_tokens": context_tokens,
+                        "depth": depth,
+                        "cell": f"d{depth}",
+                        "phase": "warmup",
+                    }
                     _warmup_row, _warmup_tokens, _warmup_finish = _run_observation(
                         apis=apis,
                         runtime=runtime,
@@ -957,6 +1215,15 @@ def run_depth_matrix(
                         int(_warmup_row["peak_memory_bytes"]),
                     )
                     discarded_warmup_count += 1
+                    model_payload["discarded_warmup_count"] = discarded_warmup_count
+                    model_payload["hard_peak_memory_bytes"] = hard_peak_memory_bytes
+                    payload["active_cell"] = {
+                        "model": request["model"],
+                        "context_tokens": context_tokens,
+                        "depth": depth,
+                        "cell": f"d{depth}",
+                        "phase": "retained",
+                    }
                     row, _tokens, _finish = _run_observation(
                         apis=apis,
                         runtime=runtime,
@@ -978,68 +1245,49 @@ def run_depth_matrix(
                     )
                     row["pair_id"] = pair_id
                     observations.append(row)
-            models.append(
-                {
-                    "model": request["model"],
-                    "model_key": request["model_key"],
-                    "model_root": str(request["model_root"]),
-                    "manifest": str(request["manifest"]),
-                    "mtp_artifacts": str(request["mtp_artifacts"]),
-                    "mtp_precision": "bf16",
-                    "depths": list(request["depths"]),
-                    "load_count": 1,
-                    "measurement_lane": (
-                        "diagnostic-resource-instrumented"
-                        if options["resource_telemetry"]
-                        else "headline-uninstrumented"
-                    ),
-                    "load_peak_memory_bytes": load_peak_memory_bytes,
-                    "hard_peak_memory_bytes": hard_peak_memory_bytes,
-                    "discarded_warmup_count": discarded_warmup_count,
-                    "warmup_output_tokens": WARMUP_TOKENS,
-                    "runtime_config": _jsonable(config),
-                    "prompts": prompts,
-                    "observations": observations,
-                    "passed": True,
-                }
-            )
+                    model_payload["hard_peak_memory_bytes"] = hard_peak_memory_bytes
+                    _emit_checkpoint(payload, checkpoint)
+            model_payload["discarded_warmup_count"] = discarded_warmup_count
+            model_payload["hard_peak_memory_bytes"] = hard_peak_memory_bytes
+            model_payload["passed"] = True
+            payload["active_cell"] = {
+                "model": request["model"],
+                "context_tokens": None,
+                "depth": None,
+                "cell": None,
+                "phase": "model_complete",
+            }
+            _emit_checkpoint(payload, checkpoint)
         finally:
             close = getattr(runtime, "close", None)
             if callable(close):
-                close()
+                primary_error = sys.exc_info()[1]
+                if primary_error is None:
+                    payload["active_cell"] = {
+                        "model": request["model"],
+                        "context_tokens": None,
+                        "depth": None,
+                        "cell": None,
+                        "phase": "close",
+                    }
+                try:
+                    close()
+                except Exception as close_error:
+                    if primary_error is None:
+                        raise
+                    payload.setdefault("cleanup_errors", []).append(
+                        {
+                            "error": str(close_error),
+                            "error_type": type(close_error).__name__,
+                            "model": request["model"],
+                        }
+                    )
 
-    return {
-        "schema": SCHEMA,
-        "passed": True,
-        "configuration": {
-            "measurement_lane": (
-                "diagnostic-resource-instrumented"
-                if options["resource_telemetry"]
-                else "headline-uninstrumented"
-            ),
-            "contexts": list(context_values),
-            "output_tokens": OUTPUT_TOKENS,
-            "warmup_output_tokens": WARMUP_TOKENS,
-            "retained_replicates": 1,
-            "sampler": {
-                "temperature": 0.0,
-                "top_p": 1.0,
-                "top_k": 1,
-                "seed": SEED,
-            },
-            "generation": {
-                "ar_api": "generate_ar",
-                "mtp_api": "generate_mtpk",
-                "stop_token_ids": [],
-                "repetition_stop": False,
-                "loop_guard": False,
-                "mtp_cache_policy": "persistent",
-                "mtp_history_policy": "committed",
-            },
-            "runtime": _jsonable(options),
-        },
-        "models": models,
-    }
+    payload["status"] = "passed"
+    payload["passed"] = True
+    payload["active_cell"] = None
+    _emit_checkpoint(payload, checkpoint)
+    return payload
 
 
 def _write_json_atomic(path: Path, rendered: str) -> None:
@@ -1060,28 +1308,59 @@ def _write_json_atomic(path: Path, rendered: str) -> None:
 def main(argv: Sequence[str] | None = None, *, apis: RunnerAPIs | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    latest_checkpoint: dict[str, Any] | None = None
+
+    def persist_checkpoint(snapshot: Mapping[str, Any]) -> None:
+        nonlocal latest_checkpoint
+        latest_checkpoint = copy.deepcopy(dict(snapshot))
+        if args.output_json is not None:
+            rendered_checkpoint = json.dumps(
+                latest_checkpoint,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            _write_json_atomic(args.output_json, rendered_checkpoint)
+
     try:
         payload = run_depth_matrix(
             _requests_from_args(args),
             contexts=args.contexts,
             runtime_options=_runtime_options_from_args(args),
+            mtp_disabled_baseline=args.mtp_disabled_baseline,
+            checkpoint=persist_checkpoint,
             apis=apis,
         )
     except Exception as exc:
-        print(
-            json.dumps(
-                {
-                    "schema": SCHEMA,
-                    "passed": False,
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
-                },
-                sort_keys=True,
-            )
+        if latest_checkpoint is None:
+            failed = {
+                "schema": SCHEMA,
+                "passed": False,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            }
+        else:
+            failed = latest_checkpoint
+            active_cell = copy.deepcopy(failed.get("active_cell"))
+            failed["status"] = "failed"
+            failed["passed"] = False
+            failed["failure"] = {
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "active_cell": active_cell,
+            }
+        rendered_failure = json.dumps(
+            failed,
+            indent=2 if latest_checkpoint is not None else None,
+            sort_keys=True,
+            allow_nan=False,
         )
+        if args.output_json is not None:
+            _write_json_atomic(args.output_json, rendered_failure)
+        print(rendered_failure)
         return 1
     rendered = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
-    if args.output_json is not None:
+    if args.output_json is not None and latest_checkpoint is None:
         _write_json_atomic(args.output_json, rendered)
     print(rendered)
     return 0
