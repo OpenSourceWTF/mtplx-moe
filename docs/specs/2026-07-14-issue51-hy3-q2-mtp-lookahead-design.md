@@ -9,9 +9,10 @@ Approved in conversation on 2026-07-14 with these constraints:
 - verify 1,024- and 2,048-token inputs with exactly 128 generated tokens;
 - test fixed MTP depths D1 and D2;
 - evaluate MTPLX's Qwen-style compiled whole-window verifier;
-- evaluate NAX as a separate, measurement-gated Q2 candidate;
-- keep predictive expert loading isolated until the verifier work has its own
-  decision.
+- evaluate predictive expert loading only after the verifier work has its own
+  decision;
+- evaluate NAX as a separate, measurement-gated Q2 candidate at the lowest
+  priority of the three tests.
 
 The work remains experimental and off by default. Each candidate must pass on
 its own before combinations are measured.
@@ -40,9 +41,13 @@ kernel work and must earn its existence from the actual Q2 profile.
 The proportional order is therefore:
 
 1. reuse and test the existing compiled whole-window verifier;
-2. profile the Q2 expert operator and route-reuse geometry;
-3. prototype a Q2 NAX operator only if the profile shows addressable headroom;
-4. run predictive loading offline, then pilot it only if its own gate passes.
+2. run predictive loading offline, then pilot it only if its own gate passes;
+3. profile the Q2 expert operator and G1/G2/G3 route-reuse geometry;
+4. prototype a Q2 NAX operator only if the profile shows addressable headroom.
+
+Q2 NAX and multi-row grouping must not delay either higher-priority test.
+K=0 is its single-row control; K=1 and K=2 measure the additional value of
+multi-row reuse.
 
 Not doing the work leaves D1 3.9% below AR at 1,024 and 18.1% below AR at
 2,048. Building a new Q2 Metal kernel without a positive operator premise would
@@ -150,7 +155,10 @@ sustained decode TPS must improve without material regression in prefill,
 memory, p95, expert-cache hit rate, or I/O. Reduced dispatch count or compiled
 micro-time alone is not sufficient.
 
-## Subproject A2: Q2 NAX evaluation
+## Subproject A2: Q2 NAX evaluation (execution priority 3)
+
+Despite the historical A2 label, execute this only after Subproject B has its
+own offline/runtime decision. Q2 NAX and grouping are the lowest-priority test.
 
 ### Compatibility map
 
@@ -227,7 +235,7 @@ pass. If both pass, measure `capture-compiled + q2-nax` against each winning
 individual arm, not only against stock. Retain the combination only if it adds
 a positive paired interval and preserves every individual correctness gate.
 
-## Subproject B: hint-only predictive expert loading
+## Subproject B: hint-only predictive expert loading (execution priority 2)
 
 ### Offline gate
 
