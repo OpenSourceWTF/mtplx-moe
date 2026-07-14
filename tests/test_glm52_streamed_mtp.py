@@ -189,9 +189,11 @@ def _accept_glm_artifact(
     return verified
 
 
-def test_glm52_expert_q2_dispatches_to_glm_family(
+@pytest.mark.parametrize("model_key", ["glm52-expert-q2", "glm52-q4"])
+def test_glm52_streamed_dispatches_to_glm_family(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    model_key: str,
 ) -> None:
     root = _model_root(tmp_path)
     artifacts = tmp_path / "mtp"
@@ -202,6 +204,7 @@ def test_glm52_expert_q2_dispatches_to_glm_family(
         monkeypatch,
         model=model,
         events=events,
+        model_key=model_key,
     )
     verified = _accept_glm_artifact(monkeypatch, artifacts, events)
     glm_args = SimpleNamespace()
@@ -275,7 +278,7 @@ def test_glm52_expert_q2_dispatches_to_glm_family(
     runtime = load(
         root,
         mtp=True,
-        expert_streaming_config=_streaming_config(),
+        expert_streaming_config=_streaming_config(model_key),
         expert_manifest=root / "expert-manifest.json",
         mtp_artifacts=artifacts,
         mtp_precision="bf16",
@@ -310,9 +313,11 @@ def test_glm52_expert_q2_dispatches_to_glm_family(
     assert events.index(injection) < events.index("artifact-exit")
 
 
+@pytest.mark.parametrize("model_key", ["glm52-expert-q2", "glm52-q4"])
 def test_glm52_incompatible_contract_fails_before_artifact_or_target_allocation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    model_key: str,
 ) -> None:
     root = _model_root(tmp_path)
     artifacts = tmp_path / "mtp"
@@ -323,6 +328,7 @@ def test_glm52_incompatible_contract_fails_before_artifact_or_target_allocation(
         model=_PlainTarget(),
         events=events,
         reject_allocation=True,
+        model_key=model_key,
     )
     _accept_glm_artifact(monkeypatch, artifacts, events)
 
@@ -331,7 +337,7 @@ def test_glm52_incompatible_contract_fails_before_artifact_or_target_allocation(
             root,
             mtp=True,
             contract=MTPContract(mtp_position_mode="absolute"),
-            expert_streaming_config=_streaming_config(),
+            expert_streaming_config=_streaming_config(model_key),
             expert_manifest=root / "expert-manifest.json",
             mtp_artifacts=artifacts,
             mtp_precision="bf16",
@@ -340,9 +346,11 @@ def test_glm52_incompatible_contract_fails_before_artifact_or_target_allocation(
     assert events == []
 
 
+@pytest.mark.parametrize("model_key", ["glm52-expert-q2", "glm52-q4"])
 def test_glm52_nonfitting_memory_plan_rejects_before_head_or_target_allocation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    model_key: str,
 ) -> None:
     root = _model_root(tmp_path)
     artifacts = tmp_path / "mtp"
@@ -353,6 +361,7 @@ def test_glm52_nonfitting_memory_plan_rejects_before_head_or_target_allocation(
         model=_PlainTarget(),
         events=events,
         reject_allocation=True,
+        model_key=model_key,
         plan_fits=False,
     )
     _accept_glm_artifact(monkeypatch, artifacts, events)
@@ -365,7 +374,7 @@ def test_glm52_nonfitting_memory_plan_rejects_before_head_or_target_allocation(
         load(
             root,
             mtp=True,
-            expert_streaming_config=_streaming_config(),
+            expert_streaming_config=_streaming_config(model_key),
             expert_manifest=root / "expert-manifest.json",
             mtp_artifacts=artifacts,
             mtp_precision="bf16",
@@ -378,9 +387,11 @@ def test_glm52_nonfitting_memory_plan_rejects_before_head_or_target_allocation(
     ]
 
 
+@pytest.mark.parametrize("model_key", ["glm52-expert-q2", "glm52-q4"])
 def test_streamed_runtime_closes_when_post_injection_setup_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    model_key: str,
 ) -> None:
     root = _model_root(tmp_path)
     artifacts = tmp_path / "mtp"
@@ -390,6 +401,7 @@ def test_streamed_runtime_closes_when_post_injection_setup_fails(
         monkeypatch,
         model=_PlainTarget(),
         events=events,
+        model_key=model_key,
     )
     _accept_glm_artifact(monkeypatch, artifacts, events)
     monkeypatch.setattr(
@@ -420,7 +432,7 @@ def test_streamed_runtime_closes_when_post_injection_setup_fails(
         load(
             root,
             mtp=True,
-            expert_streaming_config=_streaming_config(),
+            expert_streaming_config=_streaming_config(model_key),
             expert_manifest=root / "expert-manifest.json",
             mtp_artifacts=artifacts,
             mtp_precision="bf16",
@@ -575,16 +587,21 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
     assert events[-1] == "artifact-exit"
 
 
-def test_glm52_expert_q2_accepts_bf16_only_before_target_allocation() -> None:
-    assert _streamed_mtp_backend("glm52-expert-q2", "bf16") == "glm52"
+@pytest.mark.parametrize("model_key", ["glm52-expert-q2", "glm52-q4"])
+def test_glm52_streamed_accepts_bf16_only_before_target_allocation(
+    model_key: str,
+) -> None:
+    assert _streamed_mtp_backend(model_key, "bf16") == "glm52"
 
     with pytest.raises(RuntimeError, match="BF16"):
-        _streamed_mtp_backend("glm52-expert-q2", "q4")
+        _streamed_mtp_backend(model_key, "q4")
 
 
-def test_glm52_expert_q2_missing_artifact_fails_before_target_allocation(
+@pytest.mark.parametrize("model_key", ["glm52-expert-q2", "glm52-q4"])
+def test_glm52_streamed_missing_artifact_fails_before_target_allocation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    model_key: str,
 ) -> None:
     root = _model_root(tmp_path)
     events: list[Any] = []
@@ -593,22 +610,25 @@ def test_glm52_expert_q2_missing_artifact_fails_before_target_allocation(
         model=_PlainTarget(),
         events=events,
         reject_allocation=True,
+        model_key=model_key,
     )
 
     with pytest.raises(RuntimeError, match="mtp_artifacts"):
         load(
             root,
             mtp=True,
-            expert_streaming_config=_streaming_config(),
+            expert_streaming_config=_streaming_config(model_key),
             expert_manifest=root / "expert-manifest.json",
         )
 
     assert events == []
 
 
-def test_glm52_expert_q2_invalid_provenance_fails_before_target_allocation(
+@pytest.mark.parametrize("model_key", ["glm52-expert-q2", "glm52-q4"])
+def test_glm52_streamed_invalid_provenance_fails_before_target_allocation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    model_key: str,
 ) -> None:
     root = _model_root(tmp_path)
     artifacts = tmp_path / "invalid-mtp"
@@ -620,13 +640,14 @@ def test_glm52_expert_q2_invalid_provenance_fails_before_target_allocation(
         model=_PlainTarget(),
         events=events,
         reject_allocation=True,
+        model_key=model_key,
     )
 
-    with pytest.raises(RuntimeError, match="artifact|manifest|provenance|MTP"):
+    with pytest.raises(RuntimeError, match="artifact|manifest|provenance"):
         load(
             root,
             mtp=True,
-            expert_streaming_config=_streaming_config(),
+            expert_streaming_config=_streaming_config(model_key),
             expert_manifest=root / "expert-manifest.json",
             mtp_artifacts=artifacts,
             mtp_precision="bf16",
