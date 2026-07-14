@@ -26,6 +26,8 @@ DEFAULT_CONTEXTS = (1024, 2048)
 OUTPUT_TOKENS = 128
 WARMUP_TOKENS = 8
 SEED = 0
+VERIFY_STRATEGIES = ("batched", "capture_commit")
+COMPILED_VERIFY_MODES = ("off", "parity", "on")
 
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 _FIXED_DEPTH_ENV_KEYS = (
@@ -101,6 +103,15 @@ def _generation_environment() -> dict[str, str | None]:
         ),
         **{name: os.environ.get(name) for name in _FIXED_DEPTH_ENV_KEYS},
     }
+
+
+def _compiled_verify_environment_mode() -> str:
+    raw = (os.environ.get("MTPLX_COMPILED_VERIFY") or "off").strip().lower()
+    if raw in {"", "0", "false", "no", "off"}:
+        return "off"
+    if raw in _TRUTHY_ENV_VALUES:
+        return "on"
+    return raw
 
 
 Checkpoint = Callable[[Mapping[str, Any]], None]
@@ -290,6 +301,21 @@ def build_parser() -> argparse.ArgumentParser:
             "Load the streamed Q2 target without an MTP artifact and run only "
             "the AR warmup/retained baseline rows."
         ),
+    )
+    parser.add_argument(
+        "--verify-strategy",
+        choices=VERIFY_STRATEGIES,
+        default="batched",
+    )
+    parser.add_argument(
+        "--compiled-verify-mode",
+        choices=COMPILED_VERIFY_MODES,
+        default="off",
+    )
+    parser.add_argument(
+        "--trace-routes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
     parser.add_argument("--output-json", type=Path)
     return parser
@@ -1197,6 +1223,9 @@ def _run_observation(
     resource_telemetry_enabled: bool,
     ar_tokens: Sequence[int] | None,
     ar_finish_reason: str | None,
+    verify_strategy: str,
+    compiled_verify_mode: str,
+    draft_observer: Callable[[Mapping[str, Any]], None] | None,
 ) -> tuple[dict[str, Any], list[int], str | None]:
     _reset_expert_streaming(runtime)
     resource_before = (
@@ -1223,13 +1252,19 @@ def _run_observation(
         if depth == 0:
             result = apis.generate_ar(runtime, prompt_copy, **common)
         else:
+            mtpk_options: dict[str, Any] = {
+                "speculative_depth": depth,
+                "mtp_cache_policy": "persistent",
+                "mtp_history_policy": "committed",
+                "capture_final_state": True,
+                "verify_strategy": verify_strategy,
+            }
+            if draft_observer is not None:
+                mtpk_options["draft_observer"] = draft_observer
             result = apis.generate_mtpk(
                 runtime,
                 prompt_copy,
-                speculative_depth=depth,
-                mtp_cache_policy="persistent",
-                mtp_history_policy="committed",
-                capture_final_state=True,
+                **mtpk_options,
                 **common,
             )
     apis.synchronize()
@@ -1289,6 +1324,41 @@ def _run_observation(
         effective_exact = effective_depth == depth
         committed_history = depth == 0 or history_policy == "committed"
         guards_disabled = _guards_disabled(stats)
+        compiled_verify = None
+        graphbank = _field(stats, "graphbank", {})
+        if isinstance(graphbank, Mapping):
+            candidate_evidence = graphbank.get("compiled_verify")
+            if isinstance(candidate_evidence, Mapping):
+                compiled_verify = dict(candidate_evidence)
+        compiled_verify_evidence = depth == 0
+        if depth > 0 and compiled_verify_mode in {"parity", "on"}:
+            if compiled_verify is None:
+                raise BenchmarkGateError("compiled verifier emitted no evidence")
+            calls = _optional_int(compiled_verify, "calls")
+            compiled_calls = _optional_int(compiled_verify, "compiled_calls")
+            fallback_calls = _optional_int(compiled_verify, "fallback_calls")
+            if calls is None or calls <= 0:
+                raise BenchmarkGateError("compiled verifier emitted no calls")
+            if fallback_calls != 0:
+                raise BenchmarkGateError("compiled verifier used fallback calls")
+            if compiled_calls != calls:
+                raise BenchmarkGateError(
+                    "compiled verifier calls were not fully compiled"
+                )
+            if compiled_verify.get("mode") != compiled_verify_mode:
+                raise BenchmarkGateError("compiled verifier mode evidence disagrees")
+            compiled_verify_evidence = True
+        elif depth > 0:
+            compiled_calls = (
+                _optional_int(compiled_verify, "compiled_calls")
+                if compiled_verify is not None
+                else 0
+            )
+            if compiled_calls not in {None, 0}:
+                raise BenchmarkGateError(
+                    "compiled verifier ran while declared mode was off"
+                )
+            compiled_verify_evidence = True
         if not ar_finish_parity:
             raise BenchmarkGateError(f"{model} d{depth} finish reason diverged from AR")
         if not requested_exact or not effective_exact:
@@ -1345,6 +1415,7 @@ def _run_observation(
         "finish_reason": finish_reason,
         "token_ids": tokens,
         "generation_events": _jsonable(_field(stats, "events", [])),
+        "compiled_verify": _jsonable(compiled_verify),
         "ar_comparison": ar_comparison,
         "speculative_event_contract": speculative_event_contract,
         "final_state_contract": final_state_contract,
@@ -1377,6 +1448,7 @@ def _run_observation(
             "speculative_event_contract": depth == 0
             or speculative_event_contract is not None,
             "final_state_contract": depth == 0 or final_state_contract is not None,
+            "compiled_verify_evidence": compiled_verify_evidence,
         },
     }
     if not row["gates"]["new_prefill_tokens_exact"]:
@@ -1427,6 +1499,7 @@ def _runtime_config(
         max_read_chunk_bytes=apis.parse_memory_bytes(options["read_chunk"]),
         bypass_page_cache=bool(options["bypass_page_cache"]),
         resource_telemetry=bool(options["resource_telemetry"]),
+        trace_routes=bool(options["trace_routes"]),
     )
 
 
@@ -1489,6 +1562,9 @@ def _checkpoint_skeleton(
     contexts: Sequence[int],
     runtime_options: Mapping[str, Any] | None,
     mtp_disabled_baseline: bool,
+    verify_strategy: str,
+    compiled_verify_mode: str,
+    trace_routes: bool,
 ) -> dict[str, Any]:
     """Return a uniform payload for failures before validated setup exists."""
 
@@ -1515,6 +1591,11 @@ def _checkpoint_skeleton(
             "mtp_resident": None if baseline is None else not baseline,
             "requested_contexts": _jsonable(list(contexts)),
             "requested_runtime": _jsonable(dict(runtime_options or {})),
+            "requested_candidate": {
+                "verify_strategy": verify_strategy,
+                "compiled_verify_mode": compiled_verify_mode,
+                "trace_routes": trace_routes,
+            },
         },
         "models": [],
     }
@@ -1526,6 +1607,10 @@ def run_depth_matrix(
     contexts: Sequence[int] = DEFAULT_CONTEXTS,
     runtime_options: Mapping[str, Any] | None = None,
     mtp_disabled_baseline: bool = False,
+    verify_strategy: str = "batched",
+    compiled_verify_mode: str = "off",
+    trace_routes: bool = False,
+    draft_observer: Callable[[Mapping[str, Any]], None] | None = None,
     checkpoint: Checkpoint | None = None,
     apis: RunnerAPIs | None = None,
 ) -> dict[str, Any]:
@@ -1536,6 +1621,9 @@ def run_depth_matrix(
             contexts=contexts,
             runtime_options=runtime_options,
             mtp_disabled_baseline=mtp_disabled_baseline,
+            verify_strategy=verify_strategy,
+            compiled_verify_mode=compiled_verify_mode,
+            trace_routes=trace_routes,
         )
     }
     try:
@@ -1544,6 +1632,10 @@ def run_depth_matrix(
             contexts=contexts,
             runtime_options=runtime_options,
             mtp_disabled_baseline=mtp_disabled_baseline,
+            verify_strategy=verify_strategy,
+            compiled_verify_mode=compiled_verify_mode,
+            trace_routes=trace_routes,
+            draft_observer=draft_observer,
             checkpoint=checkpoint,
             apis=apis,
             _live_payload=live_payload,
@@ -1571,6 +1663,10 @@ def _run_depth_matrix_impl(
     contexts: Sequence[int] = DEFAULT_CONTEXTS,
     runtime_options: Mapping[str, Any] | None = None,
     mtp_disabled_baseline: bool = False,
+    verify_strategy: str = "batched",
+    compiled_verify_mode: str = "off",
+    trace_routes: bool = False,
+    draft_observer: Callable[[Mapping[str, Any]], None] | None = None,
     checkpoint: Checkpoint | None = None,
     apis: RunnerAPIs | None = None,
     _live_payload: dict[str, Any],
@@ -1581,6 +1677,19 @@ def _run_depth_matrix_impl(
         raise BenchmarkConfigurationError("at least one model must be selected")
     if not isinstance(mtp_disabled_baseline, bool):
         raise BenchmarkConfigurationError("mtp_disabled_baseline must be bool")
+    if verify_strategy not in VERIFY_STRATEGIES:
+        raise BenchmarkConfigurationError("unsupported verify strategy")
+    if compiled_verify_mode not in COMPILED_VERIFY_MODES:
+        raise BenchmarkConfigurationError("unsupported compiled verify mode")
+    if compiled_verify_mode != "off" and verify_strategy != "capture_commit":
+        raise BenchmarkConfigurationError(
+            "compiled verify requires capture_commit verify strategy"
+        )
+    observed_compiled_mode = _compiled_verify_environment_mode()
+    if observed_compiled_mode != compiled_verify_mode:
+        raise BenchmarkConfigurationError(
+            "declared compiled verify mode differs from process environment"
+        )
     normalized = [
         _normalized_request(
             request,
@@ -1598,7 +1707,11 @@ def _run_depth_matrix_impl(
         or len(set(context_values)) != len(context_values)
     ):
         raise BenchmarkConfigurationError("contexts must be unique positive integers")
-    options = {**DEFAULT_RUNTIME_OPTIONS, **dict(runtime_options or {})}
+    options = {
+        **DEFAULT_RUNTIME_OPTIONS,
+        **dict(runtime_options or {}),
+        "trace_routes": bool(trace_routes),
+    }
     if max(context_values) + OUTPUT_TOKENS > int(options["max_live_kv_tokens"]):
         raise BenchmarkConfigurationError(
             "context plus 128 output tokens exceeds max_live_kv_tokens"
@@ -1658,6 +1771,11 @@ def _run_depth_matrix_impl(
                 "prompt_output_depth_counters_and_cache_metrics": "hard_gate",
             },
             "runtime": _jsonable(options),
+            "candidate": {
+                "verify_strategy": verify_strategy,
+                "compiled_verify_mode": compiled_verify_mode,
+                "trace_routes": bool(trace_routes),
+            },
         },
         "models": models,
     }
@@ -1809,6 +1927,9 @@ def _run_depth_matrix_impl(
                     resource_telemetry_enabled=bool(options["resource_telemetry"]),
                     ar_tokens=None,
                     ar_finish_reason=None,
+                    verify_strategy=verify_strategy,
+                    compiled_verify_mode=compiled_verify_mode,
+                    draft_observer=draft_observer,
                 )
                 hard_peak_memory_bytes = max(
                     hard_peak_memory_bytes,
@@ -1838,6 +1959,9 @@ def _run_depth_matrix_impl(
                     resource_telemetry_enabled=bool(options["resource_telemetry"]),
                     ar_tokens=None,
                     ar_finish_reason=None,
+                    verify_strategy=verify_strategy,
+                    compiled_verify_mode=compiled_verify_mode,
+                    draft_observer=draft_observer,
                 )
                 hard_peak_memory_bytes = max(
                     hard_peak_memory_bytes,
@@ -1870,6 +1994,9 @@ def _run_depth_matrix_impl(
                         resource_telemetry_enabled=bool(options["resource_telemetry"]),
                         ar_tokens=warmup_ar_tokens,
                         ar_finish_reason=warmup_ar_finish,
+                        verify_strategy=verify_strategy,
+                        compiled_verify_mode=compiled_verify_mode,
+                        draft_observer=draft_observer,
                     )
                     _record_token_divergence(
                         model_payload,
@@ -1904,6 +2031,9 @@ def _run_depth_matrix_impl(
                         resource_telemetry_enabled=bool(options["resource_telemetry"]),
                         ar_tokens=ar_tokens,
                         ar_finish_reason=ar_finish,
+                        verify_strategy=verify_strategy,
+                        compiled_verify_mode=compiled_verify_mode,
+                        draft_observer=draft_observer,
                     )
                     _record_token_divergence(
                         model_payload,
@@ -1999,6 +2129,9 @@ def main(argv: Sequence[str] | None = None, *, apis: RunnerAPIs | None = None) -
             contexts=args.contexts,
             runtime_options=_runtime_options_from_args(args),
             mtp_disabled_baseline=args.mtp_disabled_baseline,
+            verify_strategy=args.verify_strategy,
+            compiled_verify_mode=args.compiled_verify_mode,
+            trace_routes=args.trace_routes,
             checkpoint=persist_checkpoint,
             apis=apis,
         )

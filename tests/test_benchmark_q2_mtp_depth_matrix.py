@@ -19,6 +19,7 @@ _SCRIPT = (
 def _fixed_matrix_environment(monkeypatch):
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "auto")
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "off")
     for name in (
         "MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS",
         "MTPLX_LATE_DEPTH_BEFORE",
@@ -109,6 +110,7 @@ def _stats(
     depth: int = 0,
     generated_tokens: int = 128,
     tokens: list[int] | None = None,
+    graphbank: dict[str, object] | None = None,
 ):
     output_tokens = list(tokens or [index % 97 for index in range(generated_tokens)])
     accepted = [0 for _ in range(depth)]
@@ -205,10 +207,17 @@ def _stats(
         loop_guard={},
         peak_memory_bytes=3 * 1024**3,
         events=events,
+        graphbank={} if graphbank is None else graphbank,
     )
 
 
-def _fake_apis(module, *, output_tokens: int = 128, mismatch_depth: int | None = None):
+def _fake_apis(
+    module,
+    *,
+    output_tokens: int = 128,
+    mismatch_depth: int | None = None,
+    compiled_evidence: dict[str, object] | None = None,
+):
     calls = SimpleNamespace(
         loads=[],
         configs=[],
@@ -279,6 +288,7 @@ def _fake_apis(module, *, output_tokens: int = 128, mismatch_depth: int | None =
                 depth=depth,
                 generated_tokens=len(tokens),
                 tokens=tokens,
+                graphbank=compiled_evidence,
             ),
             final_state=SimpleNamespace(
                 safe_to_commit=True,
@@ -353,6 +363,94 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
     assert args.max_live_kv_tokens == 4096
     assert args.resource_telemetry is False
     assert args.mtp_disabled_baseline is False
+    assert args.verify_strategy == "batched"
+    assert args.compiled_verify_mode == "off"
+    assert args.trace_routes is False
+
+
+def test_compiled_verify_requires_capture_commit_before_model_load(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "parity")
+
+    with pytest.raises(
+        module.BenchmarkConfigurationError,
+        match="compiled verify requires capture_commit",
+    ):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (1,)}],
+            contexts=(1024,),
+            verify_strategy="batched",
+            compiled_verify_mode="parity",
+            apis=apis,
+        )
+
+    assert calls.loads == []
+
+
+def test_compiled_verify_requires_complete_per_row_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    apis, _calls = _fake_apis(module)
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "on")
+
+    with pytest.raises(
+        module.BenchmarkGateError,
+        match="compiled verifier emitted no evidence",
+    ):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (1,)}],
+            contexts=(1024,),
+            verify_strategy="capture_commit",
+            compiled_verify_mode="on",
+            apis=apis,
+        )
+
+
+def test_compiled_verify_records_candidate_and_forwards_diagnostic_inputs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    evidence = {
+        "compiled_verify": {
+            "calls": 4,
+            "compiled_calls": 4,
+            "fallback_calls": 0,
+            "fallback_reasons": {},
+            "mode": "on",
+        }
+    }
+    apis, calls = _fake_apis(module, compiled_evidence=evidence)
+    observer = object()
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "on")
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (1,)}],
+        contexts=(1024,),
+        verify_strategy="capture_commit",
+        compiled_verify_mode="on",
+        trace_routes=True,
+        draft_observer=observer,
+        apis=apis,
+    )
+
+    assert payload["configuration"]["candidate"] == {
+        "verify_strategy": "capture_commit",
+        "compiled_verify_mode": "on",
+        "trace_routes": True,
+    }
+    assert calls.configs[0]["trace_routes"] is True
+    assert calls.mtpk
+    assert all(call[2]["verify_strategy"] == "capture_commit" for call in calls.mtpk)
+    assert all(call[2]["draft_observer"] is observer for call in calls.mtpk)
+    d1 = payload["models"][0]["observations"][1]
+    assert d1["compiled_verify"] == evidence["compiled_verify"]
 
 
 @pytest.mark.parametrize("value", [None, "0", "false"])
@@ -1356,6 +1454,7 @@ def test_rows_recompute_ingestion_decode_and_acceptance_metrics(tmp_path: Path) 
         "decode_expert_cache_metrics": True,
         "speculative_event_contract": True,
         "final_state_contract": True,
+        "compiled_verify_evidence": True,
     }
 
 
