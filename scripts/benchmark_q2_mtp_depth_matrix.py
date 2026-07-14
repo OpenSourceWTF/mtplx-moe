@@ -221,6 +221,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated exact prompt sizes (default: 1024,2048).",
     )
     parser.add_argument(
+        "--output-tokens",
+        type=_positive_int,
+        default=OUTPUT_TOKENS,
+        help="Exact retained output length per matrix row (default: 128).",
+    )
+    parser.add_argument(
         "--hy3-depths",
         type=_integer_csv,
         default=MODEL_SPECS["hy3-q2"]["depths"],
@@ -1673,6 +1679,7 @@ def _normalized_request(
 def _checkpoint_skeleton(
     *,
     contexts: Sequence[int],
+    output_tokens: int,
     runtime_options: Mapping[str, Any] | None,
     mtp_disabled_baseline: bool,
     verify_strategy: str,
@@ -1703,6 +1710,7 @@ def _checkpoint_skeleton(
             "lane": lane,
             "mtp_resident": None if baseline is None else not baseline,
             "requested_contexts": _jsonable(list(contexts)),
+            "requested_output_tokens": _jsonable(output_tokens),
             "requested_runtime": _jsonable(dict(runtime_options or {})),
             "requested_candidate": {
                 "verify_strategy": verify_strategy,
@@ -1718,6 +1726,7 @@ def run_depth_matrix(
     model_requests: Sequence[Mapping[str, Any]],
     *,
     contexts: Sequence[int] = DEFAULT_CONTEXTS,
+    output_tokens: int = OUTPUT_TOKENS,
     runtime_options: Mapping[str, Any] | None = None,
     mtp_disabled_baseline: bool = False,
     verify_strategy: str = "batched",
@@ -1732,6 +1741,7 @@ def run_depth_matrix(
     live_payload = {
         "payload": _checkpoint_skeleton(
             contexts=contexts,
+            output_tokens=output_tokens,
             runtime_options=runtime_options,
             mtp_disabled_baseline=mtp_disabled_baseline,
             verify_strategy=verify_strategy,
@@ -1743,6 +1753,7 @@ def run_depth_matrix(
         return _run_depth_matrix_impl(
             model_requests,
             contexts=contexts,
+            output_tokens=output_tokens,
             runtime_options=runtime_options,
             mtp_disabled_baseline=mtp_disabled_baseline,
             verify_strategy=verify_strategy,
@@ -1774,6 +1785,7 @@ def _run_depth_matrix_impl(
     model_requests: Sequence[Mapping[str, Any]],
     *,
     contexts: Sequence[int] = DEFAULT_CONTEXTS,
+    output_tokens: int = OUTPUT_TOKENS,
     runtime_options: Mapping[str, Any] | None = None,
     mtp_disabled_baseline: bool = False,
     verify_strategy: str = "batched",
@@ -1790,6 +1802,12 @@ def _run_depth_matrix_impl(
         raise BenchmarkConfigurationError("at least one model must be selected")
     if not isinstance(mtp_disabled_baseline, bool):
         raise BenchmarkConfigurationError("mtp_disabled_baseline must be bool")
+    if (
+        isinstance(output_tokens, bool)
+        or not isinstance(output_tokens, int)
+        or output_tokens <= 0
+    ):
+        raise BenchmarkConfigurationError("output_tokens must be a positive integer")
     if verify_strategy not in VERIFY_STRATEGIES:
         raise BenchmarkConfigurationError("unsupported verify strategy")
     if compiled_verify_mode not in COMPILED_VERIFY_MODES:
@@ -1825,9 +1843,9 @@ def _run_depth_matrix_impl(
         **dict(runtime_options or {}),
         "trace_routes": bool(trace_routes),
     }
-    if max(context_values) + OUTPUT_TOKENS > int(options["max_live_kv_tokens"]):
+    if max(context_values) + output_tokens > int(options["max_live_kv_tokens"]):
         raise BenchmarkConfigurationError(
-            "context plus 128 output tokens exceeds max_live_kv_tokens"
+            f"context plus {output_tokens} output tokens exceeds max_live_kv_tokens"
         )
     generation_environment = _generation_environment()
     apis = apis or _default_apis()
@@ -1856,7 +1874,7 @@ def _run_depth_matrix_impl(
                 else "headline-uninstrumented"
             ),
             "contexts": list(context_values),
-            "output_tokens": OUTPUT_TOKENS,
+            "output_tokens": output_tokens,
             "warmup_output_tokens": WARMUP_TOKENS,
             "retained_replicates": 1,
             "sampler": {
@@ -2068,7 +2086,7 @@ def _run_depth_matrix_impl(
                     sampler=sampler,
                     depth=0,
                     position=1,
-                    max_tokens=OUTPUT_TOKENS,
+                    max_tokens=output_tokens,
                     resource_telemetry_enabled=bool(options["resource_telemetry"]),
                     ar_tokens=None,
                     ar_finish_reason=None,
@@ -2140,7 +2158,7 @@ def _run_depth_matrix_impl(
                         sampler=sampler,
                         depth=depth,
                         position=position,
-                        max_tokens=OUTPUT_TOKENS,
+                        max_tokens=output_tokens,
                         resource_telemetry_enabled=bool(options["resource_telemetry"]),
                         ar_tokens=ar_tokens,
                         ar_finish_reason=ar_finish,
@@ -2240,6 +2258,7 @@ def main(argv: Sequence[str] | None = None, *, apis: RunnerAPIs | None = None) -
         payload = run_depth_matrix(
             _requests_from_args(args),
             contexts=args.contexts,
+            output_tokens=args.output_tokens,
             runtime_options=_runtime_options_from_args(args),
             mtp_disabled_baseline=args.mtp_disabled_baseline,
             verify_strategy=args.verify_strategy,

@@ -374,6 +374,7 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
 
     assert args.models is None
     assert args.contexts == (1024, 2048)
+    assert args.output_tokens == 128
     assert args.hy3_depths == (1, 2, 3, 4, 5, 6)
     assert args.glm52_depths == (1, 2, 3, 4, 5)
     assert args.memory_limit == "112GiB"
@@ -402,6 +403,23 @@ def test_hy3_depth_six_is_a_supported_recursive_depth(tmp_path: Path) -> None:
         0,
         6,
     ]
+
+
+def test_matrix_supports_explicit_long_retained_output(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, _calls = _fake_apis(module)
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (1,)}],
+        contexts=(1024,),
+        output_tokens=1028,
+        apis=apis,
+    )
+
+    assert payload["configuration"]["output_tokens"] == 1028
+    assert [
+        row["generated_tokens"] for row in payload["models"][0]["observations"]
+    ] == [1028, 1028]
 
 
 def test_compiled_verify_requires_capture_commit_before_model_load(
