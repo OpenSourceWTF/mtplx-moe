@@ -374,7 +374,7 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
 
     assert args.models is None
     assert args.contexts == (1024, 2048)
-    assert args.hy3_depths == (1, 2, 3, 4, 5)
+    assert args.hy3_depths == (1, 2, 3, 4, 5, 6)
     assert args.glm52_depths == (1, 2, 3, 4, 5)
     assert args.memory_limit == "112GiB"
     assert args.runtime_reserve == "12GiB"
@@ -385,6 +385,23 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
     assert args.verify_strategy == "batched"
     assert args.compiled_verify_mode == "off"
     assert args.trace_routes is False
+
+
+def test_hy3_depth_six_is_a_supported_recursive_depth(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (6,)}],
+        contexts=(1024,),
+        apis=apis,
+    )
+
+    assert [row[2]["speculative_depth"] for row in calls.mtpk] == [6, 6]
+    assert [row["requested_depth"] for row in payload["models"][0]["observations"]] == [
+        0,
+        6,
+    ]
 
 
 def test_compiled_verify_requires_capture_commit_before_model_load(
@@ -554,12 +571,12 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
     assert all(kwargs["mtp"] is True for _root, kwargs in calls.loads)
     assert all(kwargs["mtp_precision"] == "bf16" for _root, kwargs in calls.loads)
     assert len(calls.ar) == 8
-    assert len(calls.mtpk) == 40
-    assert calls.peak_resets == 48
-    assert calls.synchronizations >= 48
-    assert [len(model["observations"]) for model in payload["models"]] == [12, 12]
+    assert len(calls.mtpk) == 44
+    assert calls.peak_resets == 52
+    assert calls.synchronizations >= 52
+    assert [len(model["observations"]) for model in payload["models"]] == [14, 12]
     assert [model["discarded_warmup_count"] for model in payload["models"]] == [
-        12,
+        14,
         12,
     ]
     assert all(
@@ -584,7 +601,7 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
             row for row in payload["models"] if row["model_key"] == runtime.model_key
         )
         assert runtime.expert_streaming.reset_calls == 2 * len(model["observations"])
-        cells = 6
+        cells = 7 if runtime.model_key == "hy3-expert-q2" else 6
         assert runtime.admissions == [
             tokens
             for context in (1024, 2048)
@@ -606,7 +623,7 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
         assert kwargs["repetition_stop"] is False
         assert kwargs["loop_guard"] is False
     assert sum(kwargs["max_tokens"] == 8 for *_rest, kwargs in calls.ar) == 4
-    assert sum(kwargs["max_tokens"] == 8 for *_rest, kwargs in calls.mtpk) == 20
+    assert sum(kwargs["max_tokens"] == 8 for *_rest, kwargs in calls.mtpk) == 22
 
     assert len(calls.prompt_builds) == 4
     assert all(

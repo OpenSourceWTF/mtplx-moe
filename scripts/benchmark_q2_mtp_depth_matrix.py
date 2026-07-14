@@ -39,7 +39,7 @@ _FIXED_DEPTH_ENV_KEYS = (
 MODEL_SPECS = {
     "hy3-q2": {
         "model_key": "hy3-expert-q2",
-        "depths": (1, 2, 3, 4, 5),
+        "depths": (1, 2, 3, 4, 5, 6),
         "model_root": Path("~/.cache/huggingface/hy3-expert-only-mlx-q2"),
         "mtp_artifacts": Path("~/.cache/huggingface/hy3-mtp-layer80"),
         "prompt_tail": _ROOT
