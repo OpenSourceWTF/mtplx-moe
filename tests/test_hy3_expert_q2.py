@@ -9,6 +9,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+import mtplx.hy3_expert_q2 as q2_module
 from mtplx.expert_manifest import ExpertRecord, TensorSegment
 from mtplx.hy3_expert_q2 import (
     ProjectionDiagnostics,
@@ -299,7 +300,7 @@ def test_projection_rejects_noncanonical_q2_output_metadata(
         )
 
 
-def test_canonical_record_converts_and_writes_one_projection_at_a_time(
+def test_canonical_record_converts_one_projection_at_a_time_then_writes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     record, source = _q4_record()
@@ -333,11 +334,9 @@ def test_canonical_record_converts_and_writes_one_projection_at_a_time(
     assert tuple(outputs) == canonical
     assert events == [
         "clear",
-        *canonical[:3],
         "clear",
-        *canonical[3:6],
         "clear",
-        *canonical[6:],
+        *canonical,
     ]
     assert tuple(item.component for item in diagnostics) == _PROJECTIONS
     assert all(item.finite for item in diagnostics)
@@ -407,6 +406,56 @@ def test_canonical_record_rejects_short_source_read_before_output_acceptance() -
         )
 
     assert written == []
+
+
+@pytest.mark.parametrize("projection_index", [1, 2], ids=["up", "down"])
+@pytest.mark.parametrize("fault", ["short", "oversized", "nonfinite"])
+def test_canonical_record_late_source_fault_never_emits_partial_output(
+    monkeypatch: pytest.MonkeyPatch,
+    projection_index: int,
+    fault: str,
+) -> None:
+    record, source = _q4_record()
+    first_segment = record.segments[projection_index * 3]
+    scales_segment = record.segments[projection_index * 3 + 1]
+    written: list[str] = []
+    conversions: list[str] = []
+    original_requantize = q2_module.requantize_projection_q4_to_q2
+
+    def tracking_requantize(*args, **kwargs):
+        conversions.append(kwargs["projection"])
+        return original_requantize(*args, **kwargs)
+
+    monkeypatch.setattr(
+        q2_module,
+        "requantize_projection_q4_to_q2",
+        tracking_requantize,
+    )
+
+    def faulty_read(segment: TensorSegment) -> bytes:
+        payload = source[segment.offset : segment.offset + segment.length]
+        if fault == "short" and segment is first_segment:
+            return payload[:-1]
+        if fault == "oversized" and segment is first_segment:
+            return payload + b"\0"
+        if fault == "nonfinite" and segment is scales_segment:
+            return np.full(segment.shape, 0x7F80, dtype="<u2").tobytes()
+        return payload
+
+    with pytest.raises(ValueError, match="short|oversized|non-finite"):
+        requantize_expert_record_q4_to_q2(
+            record,
+            faulty_read,
+            lambda component, _payload: written.append(component),
+            hidden_size=64,
+            expert_hidden_size=128,
+        )
+
+    assert written == []
+    if fault in {"short", "oversized"}:
+        assert conversions == []
+    else:
+        assert conversions == list(_PROJECTIONS[: projection_index + 1])
 
 
 @pytest.mark.parametrize("nonfinite_stage", ["source", "target"])

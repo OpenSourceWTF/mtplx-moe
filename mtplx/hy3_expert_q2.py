@@ -356,31 +356,37 @@ def requantize_expert_record_q4_to_q2(
         "up_proj": (hidden_size, expert_hidden_size),
         "down_proj": (expert_hidden_size, hidden_size),
     }
+    source_payloads = tuple(
+        bytes(
+            _byte_view(
+                read_component(segment),
+                component=segment.component,
+                expected_bytes=segment.length,
+            )
+        )
+        for segment in record.segments
+    )
     diagnostics = []
+    staged_outputs: list[tuple[str, bytes]] = []
     for projection_index, projection in enumerate(_PROJECTIONS):
         projection_segments = record.segments[
             projection_index * 3 : projection_index * 3 + 3
         ]
-        source_payloads = tuple(
-            bytes(
-                _byte_view(
-                    read_component(segment),
-                    component=segment.component,
-                    expected_bytes=segment.length,
-                )
-            )
-            for segment in projection_segments
-        )
+        projection_payloads = source_payloads[
+            projection_index * 3 : projection_index * 3 + 3
+        ]
         input_size, output_size = dimensions[projection]
         converted, projection_diagnostics = requantize_projection_q4_to_q2(
-            *source_payloads,
+            *projection_payloads,
             projection=projection,
             input_size=input_size,
             output_size=output_size,
             group_size=group_size,
         )
         for segment, payload in zip(projection_segments, converted, strict=True):
-            write_component(segment.component, payload)
+            staged_outputs.append((segment.component, payload))
         diagnostics.append(projection_diagnostics)
-        del source_payloads, converted, projection_diagnostics
+        del projection_payloads, converted, projection_diagnostics
+    for component, payload in staged_outputs:
+        write_component(component, payload)
     return tuple(diagnostics)
