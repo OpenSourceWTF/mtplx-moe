@@ -352,6 +352,29 @@ class PendingBonusThenRejectTinyMTPModel(CycleTrackingTinyMTPModel):
         self.cycle_base = None
 
 
+class BatchShapeDriftTinyMTPModel(PendingBonusThenRejectTinyMTPModel):
+    """Expose a verifier correction that differs from qlen=1 replay."""
+
+    verifier_correction = 6
+
+    def __call__(self, input_ids, *, cache=None, **kwargs):
+        result = super().__call__(input_ids, cache=cache, **kwargs)
+        if int(input_ids.shape[1]) <= 1:
+            return result
+
+        if isinstance(result, tuple):
+            logits, hidden = result
+            logits = mx.array(logits)
+            logits[:, 0, :] = -100.0
+            logits[:, 0, self.verifier_correction] = 100.0
+            return logits, hidden
+
+        logits = mx.array(result)
+        logits[:, 0, :] = -100.0
+        logits[:, 0, self.verifier_correction] = 100.0
+        return logits
+
+
 def _runtime(model: TinyModel, *, mtp_enabled: bool = True) -> MTPLXRuntime:
     return MTPLXRuntime(
         model=model,
@@ -548,6 +571,7 @@ def test_generate_mtpk_final_state_commits_terminal_primary_to_both_caches(
     assert output.final_state is not None
     assert output.final_state.safe_to_commit is True
     assert output.final_state.finish_reason == expected_finish_reason
+    assert output.stats.final_state_capture_time_s > 0.0
     assert model.target_cache_offset == 2
     assert model.mtp_committed_offset == 1
 
@@ -595,6 +619,34 @@ def test_generate_mtpk_pending_bonus_then_rejection_matches_ar():
     assert mtpk.stats.events[1]["rejected_at_depth"] == 2
     assert mtpk_model.target_cache_offset == 1 + mtpk.stats.generated_tokens
     assert mtpk_model.mtp_committed_offset == mtpk.stats.generated_tokens
+
+
+def test_generate_mtpk_greedy_rejection_commits_batched_verifier_correction():
+    model = BatchShapeDriftTinyMTPModel()
+
+    output = generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=3,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=8),
+        speculative_depth=1,
+        mtp_history_policy="committed",
+        verify_strategy="batched",
+        stop_token_ids=set(),
+        capture_final_state=True,
+    )
+
+    rejected = output.stats.events[0]
+    correction = rejected["drafts"][0]["correction"]
+    assert rejected["rejected_at_depth"] == 1
+    assert correction == model.verifier_correction
+    assert output.tokens[:2] == [1, correction]
+    assert len(output.tokens) == 3
+    assert output.final_state is not None
+    assert output.final_state.safe_to_commit is True
+    assert output.final_state.generated_token_ids == tuple(output.tokens)
+    assert model.target_cache_offset == 1 + len(output.tokens)
+    assert model.mtp_committed_offset == len(output.tokens)
 
 
 def test_contiguous_then_repage_cache_layout_restores_paged_env(monkeypatch):
@@ -1042,7 +1094,9 @@ def test_omit_speculative_bonus_skips_bonus_distribution_row(monkeypatch):
     assert out.stats.bonus_tokens == 0
 
 
-def test_trim_commit_keeps_rejected_verify_prefix_without_reforward(monkeypatch):
+def test_trim_commit_reuses_rejected_verify_prefix_and_forwards_correction(
+    monkeypatch,
+):
     monkeypatch.delenv("MTPLX_LAZY_BONUS_VERIFY", raising=False)
     model = RejectingTinyMTPModel()
 
@@ -1058,10 +1112,10 @@ def test_trim_commit_keeps_rejected_verify_prefix_without_reforward(monkeypatch)
     )
 
     assert out.tokens == [1, 1]
-    assert [call["tokens"] for call in model.calls] == [1, 2]
+    assert [call["tokens"] for call in model.calls] == [1, 2, 1]
     assert model.target_cache[0].trimmed == [1]
-    assert out.stats.events[0]["capture_repair"] == "trimmed_prefix_commit"
-    assert "repair_forward" not in out.stats.events[0].get("timing_s", {})
+    assert out.stats.events[0]["capture_repair"] == "trimmed_prefix_correction_forward"
+    assert "repair_forward" in out.stats.events[0]["timing_s"]
 
 
 def test_sustained_prefill_chunks_without_full_prompt_logits(monkeypatch):

@@ -15,6 +15,18 @@ _SCRIPT = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _fixed_matrix_environment(monkeypatch):
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "auto")
+    for name in (
+        "MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS",
+        "MTPLX_LATE_DEPTH_BEFORE",
+        "MTPLX_LATE_DEPTH_AFTER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 def _load_module():
     name = "benchmark_q2_mtp_depth_matrix"
     spec = importlib.util.spec_from_file_location(name, _SCRIPT)
@@ -96,10 +108,71 @@ def _stats(
     *,
     depth: int = 0,
     generated_tokens: int = 128,
+    tokens: list[int] | None = None,
 ):
-    accepted = [max(0, 5 - index) for index in range(depth)]
-    evaluated = [6 - index for index in range(depth)]
-    drafted = [6 for _ in range(depth)]
+    output_tokens = list(tokens or [index % 97 for index in range(generated_tokens)])
+    accepted = [0 for _ in range(depth)]
+    evaluated = [0 for _ in range(depth)]
+    drafted = [0 for _ in range(depth)]
+    events = []
+    fully_accepted = 0
+    bonus_tokens = 0
+    cursor = 0
+    event_index = 0
+    while depth and cursor < len(output_tokens):
+        primary = output_tokens[cursor]
+        remaining = len(output_tokens) - cursor - 1
+        if remaining == 0:
+            events.append(
+                {
+                    "step": event_index,
+                    "primary": primary,
+                    "primary_already_emitted": bool(events),
+                    "pending_primary": primary,
+                    "depth": depth,
+                    "requested_depth": depth,
+                    "drafts": [],
+                    "accepted_depths": 0,
+                    "rejected_at_depth": None,
+                }
+            )
+            break
+        cycle_depth = min(depth, remaining)
+        event_drafts = []
+        for depth_index in range(cycle_depth):
+            token = output_tokens[cursor + depth_index + 1]
+            event_drafts.append(
+                {
+                    "depth": depth_index + 1,
+                    "token": token,
+                    "accepted": True,
+                    "accept_probability": 1.0,
+                    "correction": token,
+                }
+            )
+            drafted[depth_index] += 1
+            evaluated[depth_index] += 1
+            accepted[depth_index] += 1
+        event = {
+            "step": event_index,
+            "primary": primary,
+            "primary_already_emitted": bool(events),
+            "depth": depth,
+            "requested_depth": depth,
+            "drafts": event_drafts,
+            "accepted_depths": cycle_depth,
+            "rejected_at_depth": None,
+        }
+        cursor += cycle_depth
+        if cursor + 1 < len(output_tokens):
+            cursor += 1
+            event["bonus_token"] = output_tokens[cursor]
+            bonus_tokens += 1
+        fully_accepted += 1
+        events.append(event)
+        event_index += 1
+        if cursor >= len(output_tokens) - 1:
+            break
     return SimpleNamespace(
         generated_tokens=generated_tokens,
         elapsed_s=16.0,
@@ -113,20 +186,25 @@ def _stats(
         prompt_mtp_history_time_s=4.0 if depth else 0.0,
         prompt_mtp_history_tokens=max(0, prompt_tokens - 1) if depth else 0,
         accepted_drafts=sum(accepted),
+        rejected_drafts=0,
         evaluated_drafts=sum(evaluated),
         drafted_tokens=sum(drafted),
         accepted_by_depth=accepted,
         evaluated_by_depth=evaluated,
         drafted_by_depth=drafted,
-        mean_accept_probability_by_depth=[0.75 for _ in range(depth)],
-        fully_accepted_verify_calls=2 if depth else 0,
-        verify_calls=4 if depth else 127,
+        mean_accept_probability_by_depth=[1.0 for _ in range(depth)],
+        fully_accepted_verify_calls=fully_accepted,
+        correction_tokens=0,
+        bonus_tokens=bonus_tokens,
+        verify_calls=fully_accepted if depth else 127,
         requested_speculative_depth=depth,
         speculative_depth=depth,
         mtp_history_policy="committed" if depth else "none",
+        mtp_history_position_base=0,
         repetition_stop_triggered=False,
         loop_guard={},
         peak_memory_bytes=3 * 1024**3,
+        events=events,
     )
 
 
@@ -183,7 +261,7 @@ def _fake_apis(module, *, output_tokens: int = 128, mismatch_depth: int | None =
         return SimpleNamespace(
             tokens=tokens,
             finish_reason="length",
-            stats=_stats(len(prompt_ids), generated_tokens=len(tokens)),
+            stats=_stats(len(prompt_ids), generated_tokens=len(tokens), tokens=tokens),
         )
 
     def generate_mtpk(runtime, prompt_ids, **kwargs):
@@ -200,6 +278,19 @@ def _fake_apis(module, *, output_tokens: int = 128, mismatch_depth: int | None =
                 len(prompt_ids),
                 depth=depth,
                 generated_tokens=len(tokens),
+                tokens=tokens,
+            ),
+            final_state=SimpleNamespace(
+                safe_to_commit=True,
+                generated_token_ids=tuple(tokens),
+                finish_reason="length",
+                final_trunk_cache=[
+                    SimpleNamespace(offset=len(prompt_ids) + len(tokens))
+                ],
+                final_committed_mtp_cache=[
+                    SimpleNamespace(offset=len(prompt_ids) + len(tokens) - 1)
+                ],
+                mtp_history_position_base=0,
             ),
         )
 
@@ -254,7 +345,7 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
 
     assert args.models is None
     assert args.contexts == (1024, 2048)
-    assert args.hy3_depths == (1, 2, 3, 4)
+    assert args.hy3_depths == (1, 2, 3, 4, 5)
     assert args.glm52_depths == (1, 2, 3, 4, 5)
     assert args.memory_limit == "112GiB"
     assert args.runtime_reserve == "12GiB"
@@ -262,6 +353,67 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
     assert args.max_live_kv_tokens == 4096
     assert args.resource_telemetry is False
     assert args.mtp_disabled_baseline is False
+
+
+@pytest.mark.parametrize("value", [None, "0", "false"])
+def test_matrix_requires_and_records_sustained_prefill(
+    tmp_path: Path,
+    monkeypatch,
+    value: str | None,
+) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+    if value is None:
+        monkeypatch.delenv("MTPLX_SUSTAINED_PREFILL", raising=False)
+    else:
+        monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", value)
+
+    with pytest.raises(
+        module.BenchmarkConfigurationError,
+        match="MTPLX_SUSTAINED_PREFILL=1",
+    ):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (1,)}],
+            contexts=(1024,),
+            apis=apis,
+        )
+
+    assert calls.loads == []
+
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "yes")
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (1,)}],
+        contexts=(1024,),
+        apis=_fake_apis(module)[0],
+    )
+    assert payload["configuration"]["generation_environment"] == {
+        "MTPLX_SUSTAINED_PREFILL": "yes",
+        "MTPLX_SUSTAINED_PREFILL_LAYOUT": "auto",
+        "MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS": None,
+        "MTPLX_LATE_DEPTH_BEFORE": None,
+        "MTPLX_LATE_DEPTH_AFTER": None,
+    }
+
+
+def test_fixed_matrix_rejects_late_depth_environment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+    monkeypatch.setenv("MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS", "64")
+
+    with pytest.raises(
+        module.BenchmarkConfigurationError,
+        match="fixed-depth matrix forbids MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS",
+    ):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (5,)}],
+            contexts=(1024,),
+            apis=apis,
+        )
+
+    assert calls.loads == []
 
 
 def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
@@ -272,7 +424,7 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
 
     payload = module.run_depth_matrix(_requests(tmp_path), apis=apis)
 
-    assert payload["schema"] == "mtplx-q2-bf16-mtp-depth-matrix-v1"
+    assert payload["schema"] == "mtplx-q2-bf16-mtp-depth-matrix-v3"
     assert payload["passed"] is True
     assert payload["lane"] == "mtp-resident-depth-matrix"
     assert all(model["mtp_resident"] is True for model in payload["models"])
@@ -285,12 +437,12 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
     assert all(kwargs["mtp"] is True for _root, kwargs in calls.loads)
     assert all(kwargs["mtp_precision"] == "bf16" for _root, kwargs in calls.loads)
     assert len(calls.ar) == 8
-    assert len(calls.mtpk) == 36
-    assert calls.peak_resets == 44
-    assert calls.synchronizations >= 44
-    assert [len(model["observations"]) for model in payload["models"]] == [10, 12]
+    assert len(calls.mtpk) == 40
+    assert calls.peak_resets == 48
+    assert calls.synchronizations >= 48
+    assert [len(model["observations"]) for model in payload["models"]] == [12, 12]
     assert [model["discarded_warmup_count"] for model in payload["models"]] == [
-        10,
+        12,
         12,
     ]
     assert all(
@@ -303,13 +455,19 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
         for model in payload["models"]
         for row in model["observations"]
     )
+    assert all(
+        row["gates"]["speculative_event_contract"]
+        for model in payload["models"]
+        for row in model["observations"]
+        if row["requested_depth"] > 0
+    )
 
     for runtime in calls.runtimes:
         model = next(
             row for row in payload["models"] if row["model_key"] == runtime.model_key
         )
         assert runtime.expert_streaming.reset_calls == 2 * len(model["observations"])
-        cells = 5 if runtime.model_key == "hy3-expert-q2" else 6
+        cells = 6
         assert runtime.admissions == [
             tokens
             for context in (1024, 2048)
@@ -331,7 +489,7 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
         assert kwargs["repetition_stop"] is False
         assert kwargs["loop_guard"] is False
     assert sum(kwargs["max_tokens"] == 8 for *_rest, kwargs in calls.ar) == 4
-    assert sum(kwargs["max_tokens"] == 8 for *_rest, kwargs in calls.mtpk) == 18
+    assert sum(kwargs["max_tokens"] == 8 for *_rest, kwargs in calls.mtpk) == 20
 
     assert len(calls.prompt_builds) == 4
     assert all(
@@ -344,6 +502,505 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
         }
         for _tokenizer, _context, kwargs in calls.prompt_builds
     )
+
+
+def test_ar_path_drift_is_retained_as_diagnostic_and_matrix_continues(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    apis, _calls = _fake_apis(module, mismatch_depth=2)
+    snapshots = []
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (1, 2, 3)}],
+        contexts=(1024,),
+        checkpoint=snapshots.append,
+        apis=apis,
+    )
+
+    assert payload["status"] == "passed"
+    assert payload["passed"] is True
+    model = payload["models"][0]
+    assert [row["cell"] for row in model["observations"]] == ["ar", "d1", "d2", "d3"]
+    d2 = model["observations"][2]
+    assert d2["ar_comparison"] == {
+        "status": "token_divergence",
+        "token_parity": False,
+        "first_divergence": 127,
+        "differing_token_count": 1,
+        "reference_token_at_first_divergence": 30,
+        "observed_token_at_first_divergence": 31,
+        "reference_token_sha256": d2["ar_comparison"]["reference_token_sha256"],
+        "observed_token_sha256": d2["ar_comparison"]["observed_token_sha256"],
+        "divergence_attribution": "unclassified",
+    }
+    assert (
+        d2["ar_comparison"]["reference_token_sha256"]
+        != d2["ar_comparison"]["observed_token_sha256"]
+    )
+    assert "ar_token_parity" not in d2["gates"]
+    assert d2["gates"]["speculative_event_contract"] is True
+    assert [warning["phase"] for warning in model["token_divergence_observations"]] == [
+        "warmup",
+        "retained",
+    ]
+    assert all(
+        warning["depth"] == 2 for warning in model["token_divergence_observations"]
+    )
+    assert snapshots[-1] == payload
+
+
+def test_accepted_draft_without_matching_target_correction_fails_closed(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    apis, _calls = _fake_apis(module)
+    original = apis.generate_mtpk
+
+    def invalid_acceptance(runtime, prompt_ids, **kwargs):
+        result = original(runtime, prompt_ids, **kwargs)
+        if kwargs["max_tokens"] == 128 and kwargs["speculative_depth"] == 1:
+            accepted = next(
+                draft
+                for event in result.stats.events
+                for draft in event["drafts"]
+                if draft.get("accepted") is True
+            )
+            accepted["correction"] = accepted["token"] + 1
+        return result
+
+    apis.generate_mtpk = invalid_acceptance
+
+    with pytest.raises(module.BenchmarkGateError, match="accepted draft token"):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (1,)}],
+            contexts=(1024,),
+            apis=apis,
+        )
+
+
+def test_event_contract_appends_new_primary_after_eager_rejection_correction() -> None:
+    module = _load_module()
+    stats = SimpleNamespace(
+        events=[
+            {
+                "primary": 1,
+                "primary_already_emitted": False,
+                "depth": 1,
+                "requested_depth": 1,
+                "drafts": [
+                    {
+                        "depth": 1,
+                        "token": 2,
+                        "accepted": False,
+                        "accept_probability": 0.0,
+                        "correction": 6,
+                    }
+                ],
+                "accepted_depths": 0,
+                "rejected_at_depth": 1,
+            },
+            {
+                "primary": 7,
+                "primary_already_emitted": False,
+                "pending_primary": 7,
+                "depth": 1,
+                "requested_depth": 1,
+                "drafts": [],
+                "accepted_depths": 0,
+                "rejected_at_depth": None,
+            },
+        ],
+        drafted_tokens=1,
+        evaluated_drafts=1,
+        accepted_drafts=0,
+        rejected_drafts=1,
+        drafted_by_depth=[1],
+        evaluated_by_depth=[1],
+        accepted_by_depth=[0],
+        mean_accept_probability_by_depth=[0.0],
+        correction_tokens=1,
+        bonus_tokens=0,
+        fully_accepted_verify_calls=0,
+        verify_calls=1,
+    )
+
+    summary = module._validate_speculative_event_contract(
+        stats,
+        model="hy3-q2",
+        depth=1,
+        tokens=[1, 6, 7],
+    )
+
+    assert summary == {
+        "events": 2,
+        "verify_events": 1,
+        "drafted_records": 1,
+        "evaluated_records": 1,
+        "accepted_records": 0,
+    }
+
+
+def test_fixed_depth_event_contract_rejects_shallower_effective_depth() -> None:
+    module = _load_module()
+    stats = _stats(1024, depth=5, generated_tokens=6)
+    stats.events[0]["depth"] = 1
+
+    with pytest.raises(module.BenchmarkGateError, match="effective depth 1"):
+        module._validate_speculative_event_contract(
+            stats,
+            model="hy3-q2",
+            depth=5,
+            tokens=[0, 1, 2, 3, 4, 5],
+        )
+
+
+def test_rejected_event_with_bonus_fails_contract() -> None:
+    module = _load_module()
+    stats = SimpleNamespace(
+        events=[
+            {
+                "primary": 1,
+                "primary_already_emitted": False,
+                "depth": 1,
+                "requested_depth": 1,
+                "drafts": [
+                    {
+                        "depth": 1,
+                        "token": 2,
+                        "accepted": False,
+                        "accept_probability": 0.0,
+                        "correction": 6,
+                    }
+                ],
+                "accepted_depths": 0,
+                "rejected_at_depth": 1,
+                "bonus_token": 99,
+            }
+        ],
+        drafted_tokens=1,
+        evaluated_drafts=1,
+        accepted_drafts=0,
+        rejected_drafts=1,
+        drafted_by_depth=[1],
+        evaluated_by_depth=[1],
+        accepted_by_depth=[0],
+        mean_accept_probability_by_depth=[0.0],
+        correction_tokens=1,
+        bonus_tokens=0,
+        fully_accepted_verify_calls=0,
+        verify_calls=1,
+    )
+
+    with pytest.raises(module.BenchmarkGateError, match="rejected event.*bonus"):
+        module._validate_speculative_event_contract(
+            stats,
+            model="hy3-q2",
+            depth=1,
+            tokens=[1, 6],
+        )
+
+
+def test_cache_offsets_reject_missing_entries() -> None:
+    module = _load_module()
+
+    with pytest.raises(module.BenchmarkGateError, match="cache 0 is missing"):
+        module._cache_offsets(
+            [None, SimpleNamespace(offset=128)],
+            label="target",
+        )
+
+
+def test_rejected_draft_cannot_equal_greedy_target_correction() -> None:
+    module = _load_module()
+    stats = SimpleNamespace(
+        events=[
+            {
+                "primary": 1,
+                "primary_already_emitted": False,
+                "depth": 1,
+                "requested_depth": 1,
+                "drafts": [
+                    {
+                        "depth": 1,
+                        "token": 2,
+                        "accepted": False,
+                        "accept_probability": 0.0,
+                        "correction": 2,
+                    }
+                ],
+                "accepted_depths": 0,
+                "rejected_at_depth": 1,
+            }
+        ],
+        drafted_tokens=1,
+        evaluated_drafts=1,
+        accepted_drafts=0,
+        rejected_drafts=1,
+        drafted_by_depth=[1],
+        evaluated_by_depth=[1],
+        accepted_by_depth=[0],
+        mean_accept_probability_by_depth=[0.0],
+        correction_tokens=1,
+        bonus_tokens=0,
+        fully_accepted_verify_calls=0,
+        verify_calls=1,
+    )
+
+    with pytest.raises(module.BenchmarkGateError, match="rejected.*correction"):
+        module._validate_speculative_event_contract(
+            stats,
+            model="hy3-q2",
+            depth=1,
+            tokens=[1, 2],
+        )
+
+
+def test_primary_already_emitted_requires_prior_pending_decision() -> None:
+    module = _load_module()
+    stats = SimpleNamespace(
+        events=[
+            {
+                "primary": 1,
+                "primary_already_emitted": False,
+                "depth": 1,
+                "requested_depth": 1,
+                "drafts": [
+                    {
+                        "depth": 1,
+                        "token": 2,
+                        "accepted": False,
+                        "accept_probability": 0.0,
+                        "correction": 6,
+                    }
+                ],
+                "accepted_depths": 0,
+                "rejected_at_depth": 1,
+            },
+            {
+                "primary": 6,
+                "primary_already_emitted": True,
+                "depth": 1,
+                "requested_depth": 1,
+                "drafts": [
+                    {
+                        "depth": 1,
+                        "token": 7,
+                        "accepted": True,
+                        "accept_probability": 1.0,
+                        "correction": 7,
+                    }
+                ],
+                "accepted_depths": 1,
+                "rejected_at_depth": None,
+            },
+        ],
+        drafted_tokens=2,
+        evaluated_drafts=2,
+        accepted_drafts=1,
+        rejected_drafts=1,
+        drafted_by_depth=[2],
+        evaluated_by_depth=[2],
+        accepted_by_depth=[1],
+        mean_accept_probability_by_depth=[0.5],
+        correction_tokens=1,
+        bonus_tokens=0,
+        fully_accepted_verify_calls=1,
+        verify_calls=2,
+    )
+
+    with pytest.raises(module.BenchmarkGateError, match="prior pending"):
+        module._validate_speculative_event_contract(
+            stats,
+            model="hy3-q2",
+            depth=1,
+            tokens=[1, 6, 7],
+        )
+
+
+def test_event_contract_recomputes_fully_accepted_totals() -> None:
+    module = _load_module()
+    stats = SimpleNamespace(
+        events=[
+            {
+                "primary": 1,
+                "primary_already_emitted": False,
+                "depth": 1,
+                "requested_depth": 1,
+                "drafts": [
+                    {
+                        "depth": 1,
+                        "token": 2,
+                        "accepted": False,
+                        "accept_probability": 0.0,
+                        "correction": 6,
+                    }
+                ],
+                "accepted_depths": 0,
+                "rejected_at_depth": 1,
+            }
+        ],
+        drafted_tokens=1,
+        evaluated_drafts=1,
+        accepted_drafts=0,
+        rejected_drafts=1,
+        drafted_by_depth=[1],
+        evaluated_by_depth=[1],
+        accepted_by_depth=[0],
+        mean_accept_probability_by_depth=[0.0],
+        correction_tokens=1,
+        bonus_tokens=0,
+        fully_accepted_verify_calls=1,
+        verify_calls=1,
+    )
+
+    with pytest.raises(module.BenchmarkGateError, match="derived event totals"):
+        module._validate_speculative_event_contract(
+            stats,
+            model="hy3-q2",
+            depth=1,
+            tokens=[1, 6],
+        )
+
+
+def test_mtp_row_requires_safe_final_state_and_exact_cache_offsets(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    apis, _calls = _fake_apis(module)
+    original = apis.generate_mtpk
+
+    def invalid_final_state(runtime, prompt_ids, **kwargs):
+        result = original(runtime, prompt_ids, **kwargs)
+        result.final_state = SimpleNamespace(
+            safe_to_commit=True,
+            generated_token_ids=tuple(result.tokens),
+            finish_reason=result.finish_reason,
+            final_trunk_cache=[
+                SimpleNamespace(offset=len(prompt_ids) + len(result.tokens) - 1)
+            ],
+            final_committed_mtp_cache=[
+                SimpleNamespace(offset=len(prompt_ids) + len(result.tokens) - 1)
+            ],
+            mtp_history_position_base=0,
+        )
+        return result
+
+    apis.generate_mtpk = invalid_final_state
+
+    with pytest.raises(module.BenchmarkGateError, match="target cache offsets"):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (1,)}],
+            contexts=(1024,),
+            apis=apis,
+        )
+
+
+def test_mtp_row_requires_exact_prompt_history_length(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, _calls = _fake_apis(module)
+    original = apis.generate_mtpk
+
+    def invalid_history(runtime, prompt_ids, **kwargs):
+        result = original(runtime, prompt_ids, **kwargs)
+        result.stats.prompt_mtp_history_tokens = len(prompt_ids) - 2
+        return result
+
+    apis.generate_mtpk = invalid_history
+
+    with pytest.raises(module.BenchmarkGateError, match="prompt MTP history"):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (1,)}],
+            contexts=(1024,),
+            apis=apis,
+        )
+
+
+def test_failing_event_gate_retains_generated_evidence(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, _calls = _fake_apis(module)
+    original = apis.generate_mtpk
+    snapshots = []
+
+    def invalid_event(runtime, prompt_ids, **kwargs):
+        result = original(runtime, prompt_ids, **kwargs)
+        if kwargs["max_tokens"] == 128:
+            accepted = next(
+                draft
+                for event in result.stats.events
+                for draft in event["drafts"]
+                if draft.get("accepted") is True
+            )
+            accepted["correction"] += 1
+        return result
+
+    apis.generate_mtpk = invalid_event
+
+    with pytest.raises(module.BenchmarkGateError, match="accepted draft token"):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (1,)}],
+            contexts=(1024,),
+            checkpoint=snapshots.append,
+            apis=apis,
+        )
+
+    evidence = snapshots[-1]["failure"]["evidence"]
+    assert evidence["model"] == "hy3-q2"
+    assert evidence["depth"] == 1
+    assert len(evidence["token_ids"]) == 128
+    assert evidence["generation_events"]
+    assert evidence["generation_stats"]["accepted_drafts"] > 0
+
+
+def test_decode_cache_gate_retains_generated_evidence(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, _calls = _fake_apis(module)
+    original_load = apis.load
+    snapshots = []
+
+    def load_with_empty_decode_cache(*args, **kwargs):
+        runtime = original_load(*args, **kwargs)
+
+        def empty_decode_cache():
+            return {
+                "cache": {"expert_hits": 0, "expert_misses": 0, "hit_rate": 0.0},
+                "cache_by_phase": {
+                    "prefill": {
+                        "expert_hits": 1,
+                        "expert_misses": 1,
+                        "hit_rate": 0.5,
+                    },
+                    "decode": {
+                        "expert_hits": 0,
+                        "expert_misses": 0,
+                        "hit_rate": 0.0,
+                    },
+                },
+            }
+
+        runtime.expert_streaming_snapshot = empty_decode_cache
+        return runtime
+
+    apis.load = load_with_empty_decode_cache
+
+    with pytest.raises(module.BenchmarkGateError, match="no routed assignments"):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (1,)}],
+            contexts=(1024,),
+            checkpoint=snapshots.append,
+            apis=apis,
+        )
+
+    evidence = snapshots[-1]["failure"]["evidence"]
+    assert evidence["model"] == "hy3-q2"
+    assert evidence["depth"] == 0
+    assert len(evidence["token_ids"]) == 8
+    assert evidence["generation_stats"]["generated_tokens"] == 8
+    assert evidence["expert_streaming_counters_by_phase"]["decode"] == {
+        "expert_hits": 0,
+        "expert_misses": 0,
+        "hit_rate": 0.0,
+    }
 
 
 def test_checkpoint_callback_emits_independent_running_and_terminal_snapshots(
@@ -386,16 +1043,22 @@ def test_runner_emits_live_terminal_failure_checkpoint(
     apis, _calls = _fake_apis(module)
     original = apis.generate_mtpk
 
-    def mismatch_retained_d1(runtime, prompt_ids, **kwargs):
+    def invalid_retained_d1(runtime, prompt_ids, **kwargs):
         result = original(runtime, prompt_ids, **kwargs)
         if kwargs["max_tokens"] == 128:
-            result.tokens[-1] += 1
+            accepted = next(
+                draft
+                for event in result.stats.events
+                for draft in event["drafts"]
+                if draft.get("accepted") is True
+            )
+            accepted["correction"] = accepted["token"] + 1
         return result
 
-    apis.generate_mtpk = mismatch_retained_d1
+    apis.generate_mtpk = invalid_retained_d1
     snapshots = []
 
-    with pytest.raises(module.BenchmarkGateError, match="diverged from AR"):
+    with pytest.raises(module.BenchmarkGateError, match="accepted draft token"):
         module.run_depth_matrix(
             [{**_requests(tmp_path)[0], "depths": (1,)}],
             contexts=(1024,),
@@ -410,7 +1073,9 @@ def test_runner_emits_live_terminal_failure_checkpoint(
     assert {
         key: failed["failure"][key] for key in ("error", "error_type", "active_cell")
     } == {
-        "error": "hy3-q2 d1 diverged from AR at output token 127",
+        "error": (
+            "hy3-q2 d1 accepted draft token 1 without matching target correction 2"
+        ),
         "error_type": "BenchmarkGateError",
         "active_cell": {
             "model": "hy3-q2",
@@ -420,8 +1085,6 @@ def test_runner_emits_live_terminal_failure_checkpoint(
             "phase": "retained",
         },
     }
-    assert failed["failure"]["evidence"]["first_divergence"] == 127
-    assert len(failed["failure"]["evidence"]["token_ids"]) == 128
 
 
 def test_runner_preserves_primary_gate_when_runtime_close_also_fails(
@@ -432,10 +1095,16 @@ def test_runner_preserves_primary_gate_when_runtime_close_also_fails(
     original_generate = apis.generate_mtpk
     original_load = apis.load
 
-    def mismatch_retained_d1(runtime, prompt_ids, **kwargs):
+    def invalid_retained_d1(runtime, prompt_ids, **kwargs):
         result = original_generate(runtime, prompt_ids, **kwargs)
         if kwargs["max_tokens"] == 128:
-            result.tokens[-1] += 1
+            accepted = next(
+                draft
+                for event in result.stats.events
+                for draft in event["drafts"]
+                if draft.get("accepted") is True
+            )
+            accepted["correction"] = accepted["token"] + 1
         return result
 
     def load_with_failed_close(*args, **kwargs):
@@ -447,11 +1116,11 @@ def test_runner_preserves_primary_gate_when_runtime_close_also_fails(
         runtime.close = failed_close
         return runtime
 
-    apis.generate_mtpk = mismatch_retained_d1
+    apis.generate_mtpk = invalid_retained_d1
     apis.load = load_with_failed_close
     snapshots = []
 
-    with pytest.raises(module.BenchmarkGateError, match="diverged from AR"):
+    with pytest.raises(module.BenchmarkGateError, match="accepted draft token"):
         module.run_depth_matrix(
             [{**_requests(tmp_path)[0], "depths": (1,)}],
             contexts=(1024,),
@@ -579,6 +1248,22 @@ def test_mtp_disabled_baseline_loads_once_and_runs_only_two_ar_contexts(
     assert calls.runtimes[0].closed is True
 
 
+def test_metrics_exclude_final_state_validation_time_from_mtp_throughput() -> None:
+    module = _load_module()
+    stats = _stats(1024, depth=1)
+    stats.final_state_capture_time_s = 2.0
+
+    metrics = module._metrics(stats, completion_tokens=128, depth=1)
+
+    assert metrics["raw_elapsed_s"] == 16.0
+    assert metrics["raw_decode_elapsed_s"] == 8.0
+    assert metrics["final_state_capture_time_s"] == 2.0
+    assert metrics["elapsed_s"] == 14.0
+    assert metrics["decode_elapsed_s"] == 6.0
+    assert metrics["decode_tok_s"] == pytest.approx(128 / 6)
+    assert metrics["end_to_end_tok_s"] == pytest.approx(128 / 14)
+
+
 def test_rows_recompute_ingestion_decode_and_acceptance_metrics(tmp_path: Path) -> None:
     module = _load_module()
     apis, calls = _fake_apis(module)
@@ -631,31 +1316,31 @@ def test_rows_recompute_ingestion_decode_and_acceptance_metrics(tmp_path: Path) 
         telemetry["after"]["cache"]["expert_bytes_read"]
         > telemetry["before"]["cache"]["expert_bytes_read"]
     )
-    assert depth_two["accepted_drafts"] == 9
-    assert depth_two["evaluated_drafts"] == 11
-    assert depth_two["drafted_tokens"] == 12
-    assert depth_two["conditional_hit_rate"] == pytest.approx(9 / 11)
-    assert depth_two["cumulative_accepted_drafted_yield"] == 0.75
-    assert depth_two["accepted_per_verify"] == 2.25
-    assert depth_two["fully_accepted_verify_ratio"] == 0.5
+    assert depth_two["accepted_drafts"] == 85
+    assert depth_two["evaluated_drafts"] == 85
+    assert depth_two["drafted_tokens"] == 85
+    assert depth_two["conditional_hit_rate"] == 1.0
+    assert depth_two["cumulative_accepted_drafted_yield"] == 1.0
+    assert depth_two["accepted_per_verify"] == pytest.approx(85 / 43)
+    assert depth_two["fully_accepted_verify_ratio"] == 1.0
     assert depth_two["acceptance_by_depth"] == [
         {
             "depth": 1,
-            "drafted": 6,
-            "evaluated": 6,
-            "accepted": 5,
-            "conditional_hit_rate": pytest.approx(5 / 6),
-            "cumulative_accepted_drafted_yield": pytest.approx(5 / 6),
-            "mean_accept_probability": 0.75,
+            "drafted": 43,
+            "evaluated": 43,
+            "accepted": 43,
+            "conditional_hit_rate": 1.0,
+            "cumulative_accepted_drafted_yield": 1.0,
+            "mean_accept_probability": 1.0,
         },
         {
             "depth": 2,
-            "drafted": 6,
-            "evaluated": 5,
-            "accepted": 4,
-            "conditional_hit_rate": 0.8,
-            "cumulative_accepted_drafted_yield": pytest.approx(4 / 6),
-            "mean_accept_probability": 0.75,
+            "drafted": 42,
+            "evaluated": 42,
+            "accepted": 42,
+            "conditional_hit_rate": 1.0,
+            "cumulative_accepted_drafted_yield": 1.0,
+            "mean_accept_probability": 1.0,
         },
     ]
     assert depth_two["gates"] == {
@@ -664,13 +1349,13 @@ def test_rows_recompute_ingestion_decode_and_acceptance_metrics(tmp_path: Path) 
         "output_tokens_exact": True,
         "generated_count_consistent": True,
         "length_finish": True,
-        "ar_token_parity": True,
-        "ar_finish_reason_parity": True,
         "requested_depth_exact": True,
         "effective_depth_exact": True,
         "committed_history": True,
         "guards_disabled": True,
         "decode_expert_cache_metrics": True,
+        "speculative_event_contract": True,
+        "final_state_contract": True,
     }
 
 
@@ -681,8 +1366,13 @@ def test_exact_prompt_and_output_gates_fail_closed(tmp_path: Path) -> None:
         module.run_depth_matrix([_requests(tmp_path)[0]], contexts=(1024,), apis=apis)
 
     apis, _calls = _fake_apis(module, mismatch_depth=2)
-    with pytest.raises(module.BenchmarkGateError, match="diverged from AR"):
-        module.run_depth_matrix([_requests(tmp_path)[0]], contexts=(1024,), apis=apis)
+    payload = module.run_depth_matrix(
+        [_requests(tmp_path)[0]], contexts=(1024,), apis=apis
+    )
+    depth_two = next(
+        row for row in payload["models"][0]["observations"] if row["cell"] == "d2"
+    )
+    assert depth_two["ar_comparison"]["status"] == "token_divergence"
 
     bad_apis, _calls = _fake_apis(module)
     original = bad_apis.prompt_builder
@@ -699,38 +1389,55 @@ def test_exact_prompt_and_output_gates_fail_closed(tmp_path: Path) -> None:
         )
 
 
-def test_failed_parity_cell_retains_its_observation_evidence(tmp_path: Path) -> None:
+def test_later_hard_failure_retains_completed_drift_observation(tmp_path: Path) -> None:
     module = _load_module()
     apis, _calls = _fake_apis(module)
     original = apis.generate_mtpk
 
-    def mismatch_retained_d2(runtime, prompt_ids, **kwargs):
+    def drift_d2_then_fail_d3(runtime, prompt_ids, **kwargs):
         result = original(runtime, prompt_ids, **kwargs)
         if kwargs["max_tokens"] == 128 and kwargs["speculative_depth"] == 2:
             result.tokens[-1] += 1
+            result.stats = _stats(
+                len(prompt_ids),
+                depth=2,
+                generated_tokens=len(result.tokens),
+                tokens=result.tokens,
+            )
+            result.final_state.generated_token_ids = tuple(result.tokens)
+        if kwargs["max_tokens"] == 128 and kwargs["speculative_depth"] == 3:
+            accepted = next(
+                draft
+                for event in result.stats.events
+                for draft in event["drafts"]
+                if draft.get("accepted") is True
+            )
+            accepted["correction"] = accepted["token"] + 1
         return result
 
-    apis.generate_mtpk = mismatch_retained_d2
+    apis.generate_mtpk = drift_d2_then_fail_d3
     snapshots = []
 
-    with pytest.raises(module.BenchmarkGateError, match="diverged from AR"):
+    with pytest.raises(module.BenchmarkGateError, match="accepted draft token"):
         module.run_depth_matrix(
-            [_requests(tmp_path)[0]],
+            [{**_requests(tmp_path)[0], "depths": (1, 2, 3)}],
             contexts=(1024,),
             checkpoint=snapshots.append,
             apis=apis,
         )
 
-    failure = snapshots[-1]["failure"]
-    evidence = failure["evidence"]
-    assert evidence["model"] == "hy3-q2"
-    assert evidence["depth"] == 2
-    assert evidence["first_divergence"] == 127
-    assert len(evidence["token_ids"]) == 128
-    assert len(evidence["expected_ar_token_ids"]) == 128
-    assert evidence["accepted_drafts"] == 9
-    assert evidence["decode_expert_cache_hit_rate"] == pytest.approx(2 / 3)
-    assert evidence["expert_streaming_counters_by_phase"]["decode"] == {
+    failed = snapshots[-1]
+    assert failed["failure"]["active_cell"]["depth"] == 3
+    assert [row["cell"] for row in failed["models"][0]["observations"]] == [
+        "ar",
+        "d1",
+        "d2",
+    ]
+    depth_two = failed["models"][0]["observations"][-1]
+    assert depth_two["ar_comparison"]["first_divergence"] == 127
+    assert depth_two["accepted_drafts"] == 85
+    assert depth_two["decode_expert_cache_hit_rate"] == pytest.approx(2 / 3)
+    assert depth_two["expert_streaming_counters_by_phase"]["decode"] == {
         "expert_hits": 2,
         "expert_misses": 1,
         "hit_rate": pytest.approx(2 / 3),
@@ -785,7 +1492,7 @@ def test_decode_expert_cache_metrics_reject_empty_or_stale_ratios() -> None:
         )
 
 
-def test_warmup_parity_and_acceptance_counter_errors_fail_closed(
+def test_warmup_drift_is_recorded_and_acceptance_counter_errors_fail_closed(
     tmp_path: Path,
 ) -> None:
     module = _load_module()
@@ -796,11 +1503,24 @@ def test_warmup_parity_and_acceptance_counter_errors_fail_closed(
         result = original(runtime, prompt_ids, **kwargs)
         if kwargs["max_tokens"] == 8 and kwargs["speculative_depth"] == 1:
             result.tokens[-1] += 1
+            result.stats = _stats(
+                len(prompt_ids),
+                depth=1,
+                generated_tokens=len(result.tokens),
+                tokens=result.tokens,
+            )
+            result.final_state.generated_token_ids = tuple(result.tokens)
         return result
 
     apis.generate_mtpk = bad_warmup
-    with pytest.raises(module.BenchmarkGateError, match="diverged from AR"):
-        module.run_depth_matrix([_requests(tmp_path)[0]], contexts=(1024,), apis=apis)
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (1,)}],
+        contexts=(1024,),
+        apis=apis,
+    )
+    assert payload["models"][0]["token_divergence_observations"][0]["phase"] == (
+        "warmup"
+    )
 
     apis, _calls = _fake_apis(module)
     original = apis.generate_mtpk
@@ -813,7 +1533,7 @@ def test_warmup_parity_and_acceptance_counter_errors_fail_closed(
         return result
 
     apis.generate_mtpk = inconsistent
-    with pytest.raises(module.BenchmarkGateError, match="accepted <= evaluated"):
+    with pytest.raises(module.BenchmarkGateError, match="event counts disagree"):
         module.run_depth_matrix([_requests(tmp_path)[0]], contexts=(1024,), apis=apis)
 
 
@@ -857,7 +1577,7 @@ def test_main_writes_and_prints_machine_readable_json(
     assert [model["model"] for model in saved["models"]] == ["hy3-q2"]
 
 
-def test_main_persists_completed_ar_when_retained_d1_fails(
+def test_main_persists_completed_cells_when_later_hard_gate_fails(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -865,13 +1585,19 @@ def test_main_persists_completed_ar_when_retained_d1_fails(
     apis, _calls = _fake_apis(module)
     original = apis.generate_mtpk
 
-    def mismatch_retained_d1(runtime, prompt_ids, **kwargs):
+    def fail_retained_d2(runtime, prompt_ids, **kwargs):
         result = original(runtime, prompt_ids, **kwargs)
-        if kwargs["max_tokens"] == 128 and kwargs["speculative_depth"] == 1:
-            result.tokens[-1] += 1
+        if kwargs["max_tokens"] == 128 and kwargs["speculative_depth"] == 2:
+            accepted = next(
+                draft
+                for event in result.stats.events
+                for draft in event["drafts"]
+                if draft.get("accepted") is True
+            )
+            accepted["correction"] = accepted["token"] + 1
         return result
 
-    apis.generate_mtpk = mismatch_retained_d1
+    apis.generate_mtpk = fail_retained_d2
     prompt_tail = tmp_path / "tail.txt"
     prompt_tail.write_text("fixed tail", encoding="utf-8")
     output = tmp_path / "partial.json"
@@ -900,20 +1626,18 @@ def test_main_persists_completed_ar_when_retained_d1_fails(
     saved = json.loads(output.read_text(encoding="utf-8"))
     assert saved["status"] == "failed"
     assert saved["passed"] is False
-    assert [row["cell"] for row in saved["models"][0]["observations"]] == ["ar"]
+    assert [row["cell"] for row in saved["models"][0]["observations"]] == [
+        "ar",
+        "d1",
+    ]
     assert saved["failure"]["error_type"] == "BenchmarkGateError"
     assert saved["failure"]["active_cell"] == {
         "model": "hy3-q2",
         "context_tokens": 1024,
-        "depth": 1,
-        "cell": "d1",
+        "depth": 2,
+        "cell": "d2",
         "phase": "retained",
     }
-    assert saved["failure"]["evidence"]["first_divergence"] == 127
-    assert len(saved["failure"]["evidence"]["token_ids"]) == 128
-    assert saved["failure"]["evidence"]["decode_expert_cache_hit_rate"] == (
-        pytest.approx(2 / 3)
-    )
     assert json.loads(capsys.readouterr().out) == saved
     assert list(tmp_path.glob(".partial.json.tmp-*")) == []
 
@@ -995,7 +1719,7 @@ def test_main_renders_loader_failures_as_machine_readable_json(
 
     assert exit_code == 1
     printed = json.loads(capsys.readouterr().out)
-    assert printed["schema"] == "mtplx-q2-bf16-mtp-depth-matrix-v1"
+    assert printed["schema"] == "mtplx-q2-bf16-mtp-depth-matrix-v3"
     assert printed["status"] == "failed"
     assert printed["passed"] is False
     assert printed["models"][0]["observations"] == []

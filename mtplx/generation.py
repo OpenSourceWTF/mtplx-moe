@@ -1544,6 +1544,7 @@ class GenerationStats:
     repair_time_s: float = 0.0
     commit_time_s: float = 0.0
     capture_commit_time_s: float = 0.0
+    final_state_capture_time_s: float = 0.0
     mtp_history_materialize_every: int = 0
     mtp_history_materialize_events: int = 0
     clear_cache_every: int = 0
@@ -7033,8 +7034,7 @@ def generate_mtpk(
                 event["drafts"][depth_index]["online_correction_cache"][
                     "stored_token"
                 ] = cached_target
-            if sampler.temperature > 0:
-                rejection_correction = int(correction)
+            rejection_correction = int(correction)
             break
         if (
             draft_tokens
@@ -7470,12 +7470,14 @@ def generate_mtpk(
         emit_trace()
 
     final_state: GenerationFinalState | None = None
+    final_state_capture_time = 0.0
     if (
         capture_final_state
         and pending_primary is not None
         and tokens
         and repetition_result is None
     ):
+        final_state_capture_started = time.perf_counter()
         pending_token = int(pending_primary)
         if (
             _mtp_history_uses_committed_cache(mtp_history_policy)
@@ -7510,6 +7512,7 @@ def generate_mtpk(
         maybe_detach_dirty_state(len(tokens))
         maybe_rebase_decode_state(len(tokens))
         maybe_eval_state_roots({"final_pending_commit": True}, len(tokens))
+        final_state_capture_time = time.perf_counter() - final_state_capture_started
 
     emit_trace(force=True, final=True)
     elapsed = time.perf_counter() - started_all
@@ -7624,6 +7627,7 @@ def generate_mtpk(
         repair_time_s=repair_time,
         commit_time_s=commit_time,
         capture_commit_time_s=capture_commit_time,
+        final_state_capture_time_s=final_state_capture_time,
         mtp_history_materialize_every=mtp_history_materialize_every,
         mtp_history_materialize_events=mtp_history_materialize_events,
         clear_cache_every=clear_cache_every,

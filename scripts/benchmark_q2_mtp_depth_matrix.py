@@ -21,16 +21,23 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 
-SCHEMA = "mtplx-q2-bf16-mtp-depth-matrix-v1"
+SCHEMA = "mtplx-q2-bf16-mtp-depth-matrix-v3"
 DEFAULT_CONTEXTS = (1024, 2048)
 OUTPUT_TOKENS = 128
 WARMUP_TOKENS = 8
 SEED = 0
 
+_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+_FIXED_DEPTH_ENV_KEYS = (
+    "MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS",
+    "MTPLX_LATE_DEPTH_BEFORE",
+    "MTPLX_LATE_DEPTH_AFTER",
+)
+
 MODEL_SPECS = {
     "hy3-q2": {
         "model_key": "hy3-expert-q2",
-        "depths": (1, 2, 3, 4),
+        "depths": (1, 2, 3, 4, 5),
         "model_root": Path("~/.cache/huggingface/hy3-expert-only-mlx-q2"),
         "mtp_artifacts": Path("~/.cache/huggingface/hy3-mtp-layer80"),
         "prompt_tail": _ROOT
@@ -75,6 +82,25 @@ class BenchmarkGateError(RuntimeError):
     def __init__(self, message: str, *, evidence: Mapping[str, Any] | None = None):
         super().__init__(message)
         self.evidence = dict(evidence) if evidence is not None else None
+
+
+def _generation_environment() -> dict[str, str | None]:
+    sustained_prefill = os.environ.get("MTPLX_SUSTAINED_PREFILL")
+    if (sustained_prefill or "").strip().lower() not in _TRUTHY_ENV_VALUES:
+        raise BenchmarkConfigurationError(
+            "MTPLX_SUSTAINED_PREFILL=1 is required for the retained matrix"
+        )
+    for name in _FIXED_DEPTH_ENV_KEYS:
+        value = os.environ.get(name)
+        if value is not None and value.strip():
+            raise BenchmarkConfigurationError(f"fixed-depth matrix forbids {name}")
+    return {
+        "MTPLX_SUSTAINED_PREFILL": sustained_prefill,
+        "MTPLX_SUSTAINED_PREFILL_LAYOUT": os.environ.get(
+            "MTPLX_SUSTAINED_PREFILL_LAYOUT"
+        ),
+        **{name: os.environ.get(name) for name in _FIXED_DEPTH_ENV_KEYS},
+    }
 
 
 Checkpoint = Callable[[Mapping[str, Any]], None]
@@ -431,6 +457,455 @@ def _first_divergence(left: Sequence[int], right: Sequence[int]) -> int | None:
     return min(len(left), len(right)) if len(left) != len(right) else None
 
 
+def _token_sha256(tokens: Sequence[int]) -> str:
+    encoded = json.dumps(
+        [int(token) for token in tokens], separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _ar_comparison(
+    tokens: Sequence[int],
+    reference_tokens: Sequence[int] | None,
+    *,
+    is_reference: bool,
+) -> dict[str, Any]:
+    observed = [int(token) for token in tokens]
+    if is_reference:
+        reference = observed
+        status = "reference"
+    else:
+        reference = [int(token) for token in (reference_tokens or [])]
+        status = "exact" if observed == reference else "token_divergence"
+    first = _first_divergence(observed, reference)
+    differing = sum(
+        left != right for left, right in zip(observed, reference, strict=False)
+    ) + abs(len(observed) - len(reference))
+    return {
+        "status": status,
+        "token_parity": observed == reference,
+        "first_divergence": first,
+        "differing_token_count": differing,
+        "reference_token_at_first_divergence": (
+            reference[first] if first is not None and first < len(reference) else None
+        ),
+        "observed_token_at_first_divergence": (
+            observed[first] if first is not None and first < len(observed) else None
+        ),
+        "reference_token_sha256": _token_sha256(reference),
+        "observed_token_sha256": _token_sha256(observed),
+        "divergence_attribution": (None if observed == reference else "unclassified"),
+    }
+
+
+def _validate_speculative_event_contract(
+    stats: Any,
+    *,
+    model: str,
+    depth: int,
+    tokens: Sequence[int],
+) -> dict[str, int] | None:
+    if depth == 0:
+        return None
+    events = _field(stats, "events")
+    if not isinstance(events, (list, tuple)) or not events:
+        raise BenchmarkGateError(
+            f"{model} d{depth} did not expose speculative verification events"
+        )
+
+    drafted_records = 0
+    evaluated_records = 0
+    accepted_records = 0
+    verify_events = 0
+    drafted_by_depth = [0 for _ in range(depth)]
+    evaluated_by_depth = [0 for _ in range(depth)]
+    accepted_by_depth = [0 for _ in range(depth)]
+    accept_probability_sums = [0.0 for _ in range(depth)]
+    rejected_records = 0
+    correction_records = 0
+    bonus_records = 0
+    fully_accepted_events = 0
+    reconstructed_tokens: list[int] = []
+    expected_pending_primary: int | None = None
+    for event_index, event in enumerate(events):
+        if not isinstance(event, Mapping):
+            raise BenchmarkGateError(
+                f"{model} d{depth} event {event_index} is not a mapping"
+            )
+        requested = event.get("requested_depth")
+        if isinstance(requested, bool) or not isinstance(requested, int):
+            raise BenchmarkGateError(
+                f"{model} d{depth} event {event_index} has invalid requested depth"
+            )
+        if requested != depth:
+            raise BenchmarkGateError(
+                f"{model} d{depth} event {event_index} requested depth {requested}"
+            )
+        primary = event.get("primary")
+        if isinstance(primary, bool) or not isinstance(primary, int):
+            raise BenchmarkGateError(
+                f"{model} d{depth} event {event_index} has invalid primary token"
+            )
+        primary_already_emitted = event.get("primary_already_emitted")
+        if not isinstance(primary_already_emitted, bool):
+            raise BenchmarkGateError(
+                f"{model} d{depth} event {event_index} has invalid primary emission state"
+            )
+        if primary_already_emitted:
+            if expected_pending_primary is None:
+                raise BenchmarkGateError(
+                    f"{model} d{depth} event {event_index} marks its primary as "
+                    "already emitted without a prior pending verifier decision"
+                )
+            if expected_pending_primary != primary:
+                raise BenchmarkGateError(
+                    f"{model} d{depth} event {event_index} primary token does not "
+                    "continue the prior pending verifier decision"
+                )
+            expected_pending_primary = None
+        else:
+            if expected_pending_primary is not None:
+                raise BenchmarkGateError(
+                    f"{model} d{depth} event {event_index} did not consume the "
+                    "prior pending verifier decision"
+                )
+            reconstructed_tokens.append(primary)
+        event_depth = event.get("depth")
+        if isinstance(event_depth, bool) or not isinstance(event_depth, int):
+            raise BenchmarkGateError(
+                f"{model} d{depth} event {event_index} has invalid effective depth"
+            )
+        if event_depth != depth:
+            raise BenchmarkGateError(
+                f"{model} d{depth} event {event_index} has effective depth "
+                f"{event_depth}; fixed-depth rows require {depth}"
+            )
+        drafts = event.get("drafts")
+        if not isinstance(drafts, (list, tuple)):
+            raise BenchmarkGateError(
+                f"{model} d{depth} event {event_index} has invalid draft records"
+            )
+        if not drafts:
+            if (
+                event_index != len(events) - 1
+                or event.get("pending_primary") != primary
+            ):
+                raise BenchmarkGateError(
+                    f"{model} d{depth} event {event_index} has an empty nonterminal "
+                    "verification decision"
+                )
+            expected_pending_primary = primary
+            continue
+        if len(drafts) > event_depth:
+            raise BenchmarkGateError(
+                f"{model} d{depth} event {event_index} exceeds its effective depth"
+            )
+
+        verify_events += 1
+        drafted_records += len(drafts)
+        for draft_index in range(len(drafts)):
+            drafted_by_depth[draft_index] += 1
+        accepted_prefix = 0
+        first_rejection: int | None = None
+        evaluation_closed = False
+        for draft_index, draft in enumerate(drafts, start=1):
+            if not isinstance(draft, Mapping):
+                raise BenchmarkGateError(
+                    f"{model} d{depth} event {event_index} has invalid draft record"
+                )
+            token = draft.get("token")
+            if isinstance(token, bool) or not isinstance(token, int):
+                raise BenchmarkGateError(
+                    f"{model} d{depth} event {event_index} has invalid draft token"
+                )
+            declared_depth = draft.get("depth")
+            if (
+                isinstance(declared_depth, bool)
+                or not isinstance(declared_depth, int)
+                or declared_depth != draft_index
+            ):
+                raise BenchmarkGateError(
+                    f"{model} d{depth} event {event_index} draft {draft_index} "
+                    "has invalid depth metadata"
+                )
+            accepted = draft.get("accepted")
+            if accepted is None:
+                evaluation_closed = True
+                continue
+            if evaluation_closed or not isinstance(accepted, bool):
+                raise BenchmarkGateError(
+                    f"{model} d{depth} event {event_index} has non-prefix evaluation"
+                )
+            correction = draft.get("correction")
+            if isinstance(correction, bool) or not isinstance(correction, int):
+                raise BenchmarkGateError(
+                    f"{model} d{depth} event {event_index} has invalid target correction"
+                )
+            accept_probability = draft.get("accept_probability")
+            if (
+                isinstance(accept_probability, bool)
+                or not isinstance(accept_probability, (int, float))
+                or not math.isfinite(float(accept_probability))
+                or float(accept_probability) not in {0.0, 1.0}
+                or float(accept_probability) != (1.0 if accepted else 0.0)
+            ):
+                raise BenchmarkGateError(
+                    f"{model} d{depth} event {event_index} draft {draft_index} "
+                    "has invalid greedy acceptance probability"
+                )
+            evaluated_records += 1
+            evaluated_by_depth[draft_index - 1] += 1
+            accept_probability_sums[draft_index - 1] += float(accept_probability)
+            if accepted:
+                if first_rejection is not None:
+                    raise BenchmarkGateError(
+                        f"{model} d{depth} event {event_index} accepts after rejection"
+                    )
+                if token != correction:
+                    raise BenchmarkGateError(
+                        f"{model} d{depth} accepted draft token {token} without "
+                        f"matching target correction {correction}"
+                    )
+                accepted_prefix += 1
+                accepted_records += 1
+                accepted_by_depth[draft_index - 1] += 1
+                reconstructed_tokens.append(token)
+            else:
+                if token == correction:
+                    raise BenchmarkGateError(
+                        f"{model} d{depth} rejected draft token {token} but its "
+                        "greedy target correction is identical"
+                    )
+                first_rejection = draft_index
+                evaluation_closed = True
+                rejected_records += 1
+                correction_records += 1
+                reconstructed_tokens.append(correction)
+
+        if event.get("accepted_depths") != accepted_prefix:
+            raise BenchmarkGateError(
+                f"{model} d{depth} event {event_index} accepted-depth count disagrees"
+            )
+        if event.get("rejected_at_depth") != first_rejection:
+            raise BenchmarkGateError(
+                f"{model} d{depth} event {event_index} rejection depth disagrees"
+            )
+        if accepted_prefix == len(drafts):
+            fully_accepted_events += 1
+        if first_rejection is not None and event.get("bonus_token") is not None:
+            raise BenchmarkGateError(
+                f"{model} d{depth} event {event_index} is a rejected event with "
+                "a bonus token"
+            )
+        if first_rejection is None and event.get("bonus_token") is not None:
+            bonus = event["bonus_token"]
+            if isinstance(bonus, bool) or not isinstance(bonus, int):
+                raise BenchmarkGateError(
+                    f"{model} d{depth} event {event_index} has invalid bonus token"
+                )
+            reconstructed_tokens.append(bonus)
+            bonus_records += 1
+            expected_pending_primary = bonus
+        pending = event.get("pending_primary")
+        if pending is not None:
+            if isinstance(pending, bool) or not isinstance(pending, int):
+                raise BenchmarkGateError(
+                    f"{model} d{depth} event {event_index} has invalid pending primary"
+                )
+            if not reconstructed_tokens or reconstructed_tokens[-1] != pending:
+                raise BenchmarkGateError(
+                    f"{model} d{depth} event {event_index} pending primary does not "
+                    "match the verifier decision"
+                )
+            if (
+                expected_pending_primary is not None
+                and expected_pending_primary != pending
+            ):
+                raise BenchmarkGateError(
+                    f"{model} d{depth} event {event_index} has conflicting pending "
+                    "verifier decisions"
+                )
+            expected_pending_primary = pending
+
+    expected = {
+        "drafted_records": _required_int(stats, "drafted_tokens"),
+        "evaluated_records": _required_int(stats, "evaluated_drafts"),
+        "accepted_records": _required_int(stats, "accepted_drafts"),
+    }
+    actual = {
+        "drafted_records": drafted_records,
+        "evaluated_records": evaluated_records,
+        "accepted_records": accepted_records,
+    }
+    if actual != expected:
+        raise BenchmarkGateError(
+            f"{model} d{depth} speculative event counts disagree with generation stats"
+        )
+    expected_depth_counts = {
+        "drafted_by_depth": _integer_list(stats, "drafted_by_depth"),
+        "evaluated_by_depth": _integer_list(stats, "evaluated_by_depth"),
+        "accepted_by_depth": _integer_list(stats, "accepted_by_depth"),
+    }
+    actual_depth_counts = {
+        "drafted_by_depth": drafted_by_depth,
+        "evaluated_by_depth": evaluated_by_depth,
+        "accepted_by_depth": accepted_by_depth,
+    }
+    if actual_depth_counts != expected_depth_counts:
+        raise BenchmarkGateError(
+            f"{model} d{depth} per-depth event counts disagree with generation stats"
+        )
+    if verify_events != _required_int(stats, "verify_calls"):
+        raise BenchmarkGateError(
+            f"{model} d{depth} verification-event count disagrees with generation stats"
+        )
+    derived_totals = {
+        "rejected_drafts": rejected_records,
+        "correction_tokens": correction_records,
+        "bonus_tokens": bonus_records,
+        "fully_accepted_verify_calls": fully_accepted_events,
+    }
+    reported_totals = {name: _required_int(stats, name) for name in derived_totals}
+    if reported_totals != derived_totals:
+        raise BenchmarkGateError(
+            f"{model} d{depth} derived event totals disagree with generation stats"
+        )
+    reported_mean_probabilities = _number_list(
+        stats, "mean_accept_probability_by_depth"
+    )
+    derived_mean_probabilities = [
+        (total / count if count else None)
+        for total, count in zip(
+            accept_probability_sums,
+            evaluated_by_depth,
+            strict=True,
+        )
+    ]
+    if len(reported_mean_probabilities) != depth or any(
+        (reported is None) != (derived is None)
+        or (
+            reported is not None
+            and derived is not None
+            and not math.isclose(reported, derived, rel_tol=1e-12, abs_tol=1e-12)
+        )
+        for reported, derived in zip(
+            reported_mean_probabilities,
+            derived_mean_probabilities,
+            strict=False,
+        )
+    ):
+        raise BenchmarkGateError(
+            f"{model} d{depth} acceptance probabilities disagree with event trace"
+        )
+    observed_tokens = [int(token) for token in tokens]
+    if reconstructed_tokens != observed_tokens:
+        divergence = _first_divergence(reconstructed_tokens, observed_tokens)
+        raise BenchmarkGateError(
+            f"{model} d{depth} verifier decision trace does not reconstruct output "
+            f"at token {divergence}"
+        )
+    return {"events": len(events), "verify_events": verify_events, **actual}
+
+
+def _cache_offsets(cache: Any, *, label: str) -> list[int]:
+    if not isinstance(cache, (list, tuple)) or not cache:
+        raise BenchmarkGateError(f"generation final state has no {label} cache")
+    offsets: list[int] = []
+    for index, entry in enumerate(cache):
+        if entry is None:
+            raise BenchmarkGateError(
+                f"generation final state {label} cache {index} is missing"
+            )
+        value = getattr(entry, "offset", None)
+        if value is None:
+            size = getattr(entry, "size", None)
+            if callable(size):
+                value = size()
+        try:
+            parsed = int(value.item()) if hasattr(value, "item") else int(value)
+        except (TypeError, ValueError):
+            raise BenchmarkGateError(
+                f"generation final state {label} cache {index} has no logical offset"
+            ) from None
+        if parsed < 0:
+            raise BenchmarkGateError(
+                f"generation final state {label} cache {index} has a negative offset"
+            )
+        offsets.append(parsed)
+    if not offsets:
+        raise BenchmarkGateError(f"generation final state has no {label} offsets")
+    return offsets
+
+
+def _validate_final_state_contract(
+    result: Any,
+    stats: Any,
+    *,
+    model: str,
+    depth: int,
+    prompt_tokens: int,
+    tokens: Sequence[int],
+    finish_reason: str | None,
+) -> dict[str, Any] | None:
+    if depth == 0:
+        return None
+    final_state = _field(result, "final_state")
+    if final_state is None:
+        raise BenchmarkGateError(f"{model} d{depth} did not capture final state")
+    if _field(final_state, "safe_to_commit") is not True:
+        raise BenchmarkGateError(f"{model} d{depth} final state is unsafe to commit")
+    generated = _field(final_state, "generated_token_ids")
+    if not isinstance(generated, (list, tuple)) or [
+        int(item) for item in generated
+    ] != [int(item) for item in tokens]:
+        raise BenchmarkGateError(
+            f"{model} d{depth} final state token history disagrees with output"
+        )
+    if _field(final_state, "finish_reason") != finish_reason:
+        raise BenchmarkGateError(
+            f"{model} d{depth} final state finish reason disagrees with output"
+        )
+    expected_prompt_history = max(0, prompt_tokens - 1)
+    if _required_int(stats, "prompt_mtp_history_tokens") != expected_prompt_history:
+        raise BenchmarkGateError(
+            f"{model} d{depth} prompt MTP history does not contain N-1 rows"
+        )
+    if (
+        _required_int(stats, "mtp_history_position_base") != 0
+        or _field(final_state, "mtp_history_position_base") != 0
+    ):
+        raise BenchmarkGateError(
+            f"{model} d{depth} committed MTP history position base is not zero"
+        )
+    target_offsets = _cache_offsets(
+        _field(final_state, "final_trunk_cache"),
+        label="target",
+    )
+    mtp_offsets = _cache_offsets(
+        _field(final_state, "final_committed_mtp_cache"),
+        label="committed MTP",
+    )
+    expected_target_offset = prompt_tokens + len(tokens)
+    expected_mtp_offset = expected_target_offset - 1
+    if any(offset != expected_target_offset for offset in target_offsets):
+        raise BenchmarkGateError(
+            f"{model} d{depth} target cache offsets do not match prompt plus output"
+        )
+    if any(offset != expected_mtp_offset for offset in mtp_offsets):
+        raise BenchmarkGateError(
+            f"{model} d{depth} committed MTP cache offsets do not match N-1"
+        )
+    return {
+        "safe_to_commit": True,
+        "generated_token_ids_match": True,
+        "finish_reason_match": True,
+        "prompt_mtp_history_tokens": expected_prompt_history,
+        "mtp_history_position_base": 0,
+        "target_cache_offsets": target_offsets,
+        "committed_mtp_cache_offsets": mtp_offsets,
+    }
+
+
 def _guards_disabled(stats: Any) -> bool:
     if bool(_field(stats, "repetition_stop_triggered", False)):
         return False
@@ -450,8 +925,23 @@ def _metrics(stats: Any, *, completion_tokens: int, depth: int) -> dict[str, Any
     target_prefill_time = _required_number(stats, "prompt_target_prefill_time_s")
     decode_elapsed = _required_number(stats, "decode_elapsed_s")
     elapsed = _required_number(stats, "elapsed_s")
+    final_state_capture_time = _optional_number(stats, "final_state_capture_time_s")
     if min(prompt_eval_time, target_prefill_time, decode_elapsed, elapsed) <= 0.0:
         raise BenchmarkGateError("generation timing denominators must be positive")
+    if final_state_capture_time < 0.0:
+        raise BenchmarkGateError("final-state capture time must be non-negative")
+    if depth == 0 and final_state_capture_time != 0.0:
+        raise BenchmarkGateError(
+            "AR timing reports unexpected final-state capture work"
+        )
+    if final_state_capture_time >= min(decode_elapsed, elapsed):
+        raise BenchmarkGateError(
+            "final-state capture time must be smaller than measured generation time"
+        )
+    raw_decode_elapsed = decode_elapsed
+    raw_elapsed = elapsed
+    decode_elapsed -= final_state_capture_time
+    elapsed -= final_state_capture_time
     if generated_tokens != completion_tokens:
         raise BenchmarkGateError(
             "generation stats count does not match the emitted token count"
@@ -530,6 +1020,9 @@ def _metrics(stats: Any, *, completion_tokens: int, depth: int) -> dict[str, Any
 
     return {
         "generated_tokens": generated_tokens,
+        "raw_elapsed_s": raw_elapsed,
+        "raw_decode_elapsed_s": raw_decode_elapsed,
+        "final_state_capture_time_s": final_state_capture_time,
         "elapsed_s": elapsed,
         "decode_elapsed_s": decode_elapsed,
         "new_prefill_tokens": new_prefill_tokens,
@@ -656,54 +1149,6 @@ def _require_decode_cache_metrics(
     return dict(decode), hit_rate
 
 
-def _parity_failure_evidence(
-    *,
-    runtime: Any,
-    model: str,
-    context_tokens: int,
-    depth: int,
-    tokens: Sequence[int],
-    expected_tokens: Sequence[int],
-    stats: Any,
-    resource_before: Any,
-    resource_after: Any,
-) -> dict[str, Any]:
-    evidence: dict[str, Any] = {
-        "model": model,
-        "context_tokens": int(context_tokens),
-        "depth": int(depth),
-        "token_ids": [int(token) for token in tokens],
-        "expected_ar_token_ids": [int(token) for token in expected_tokens],
-        "first_divergence": _first_divergence(tokens, expected_tokens),
-        "generation_events": _jsonable(_field(stats, "events", [])),
-    }
-    try:
-        evidence.update(
-            _metrics(stats, completion_tokens=len(tokens), depth=int(depth))
-        )
-    except BenchmarkGateError as exc:
-        evidence["metric_extraction_error"] = str(exc)
-    streaming_counters, cache_by_phase = _streaming_cache_metrics(runtime)
-    evidence["expert_streaming_counters"] = streaming_counters
-    evidence["expert_streaming_counters_by_phase"] = cache_by_phase
-    try:
-        _decode, hit_rate = _require_decode_cache_metrics(
-            cache_by_phase,
-            model=model,
-            depth=depth,
-        )
-        evidence["decode_expert_cache_hit_rate"] = hit_rate
-    except BenchmarkGateError as exc:
-        evidence["decode_cache_metric_error"] = str(exc)
-    if resource_before is not None or resource_after is not None:
-        evidence["expert_resource_telemetry"] = {
-            "before": resource_before,
-            "after": resource_after,
-            "numeric_delta": _numeric_delta(resource_before, resource_after),
-        }
-    return evidence
-
-
 def _resource_telemetry(runtime: Any) -> dict[str, Any] | None:
     snapshot_fn = getattr(runtime, "expert_resource_telemetry_snapshot", None)
     if not callable(snapshot_fn):
@@ -784,6 +1229,7 @@ def _run_observation(
                 speculative_depth=depth,
                 mtp_cache_policy="persistent",
                 mtp_history_policy="committed",
+                capture_final_state=True,
                 **common,
             )
     apis.synchronize()
@@ -798,60 +1244,92 @@ def _run_observation(
     stats = _field(result, "stats")
     if stats is None:
         raise BenchmarkGateError("generation result is missing stats")
-    if len(tokens) != max_tokens:
-        raise BenchmarkGateError(
-            f"{model} d{depth} emitted {len(tokens)} tokens; expected exactly "
-            f"{max_tokens}"
-        )
-    if finish_reason != "length":
-        raise BenchmarkGateError(
-            f"{model} d{depth} finished as {finish_reason!r}; expected 'length'"
-        )
-
-    requested_depth = _optional_int(stats, "requested_speculative_depth")
-    effective_depth = _optional_int(stats, "speculative_depth")
-    history_policy = _field(stats, "mtp_history_policy", "none")
-    ar_token_parity = depth == 0 or tokens == list(ar_tokens or [])
-    ar_finish_parity = depth == 0 or finish_reason == ar_finish_reason
-    requested_exact = requested_depth == depth
-    effective_exact = effective_depth == depth
-    committed_history = depth == 0 or history_policy == "committed"
-    guards_disabled = _guards_disabled(stats)
-    if not ar_token_parity:
-        expected_tokens = list(ar_tokens or [])
-        divergence = _first_divergence(tokens, expected_tokens)
-        raise BenchmarkGateError(
-            f"{model} d{depth} diverged from AR at output token {divergence}",
-            evidence=_parity_failure_evidence(
-                runtime=runtime,
-                model=model,
-                context_tokens=context_tokens,
-                depth=depth,
-                tokens=tokens,
-                expected_tokens=expected_tokens,
-                stats=stats,
-                resource_before=resource_before,
-                resource_after=resource_after,
-            ),
-        )
-    if not ar_finish_parity:
-        raise BenchmarkGateError(f"{model} d{depth} finish reason diverged from AR")
-    if not requested_exact or not effective_exact:
-        raise BenchmarkGateError(
-            f"{model} d{depth} reported requested/effective depth "
-            f"{requested_depth}/{effective_depth}"
-        )
-    if not committed_history:
-        raise BenchmarkGateError(f"{model} d{depth} did not use committed MTP history")
-    if not guards_disabled:
-        raise BenchmarkGateError(f"{model} d{depth} triggered a generation guard")
-
     streaming_counters, streaming_counters_by_phase = _streaming_cache_metrics(runtime)
-    _decode_streaming_counters, decode_cache_hit_rate = _require_decode_cache_metrics(
-        streaming_counters_by_phase,
-        model=model,
-        depth=depth,
-    )
+    failure_evidence = {
+        "model": model,
+        "depth": depth,
+        "context_tokens": context_tokens,
+        "token_ids": tokens,
+        "finish_reason": finish_reason,
+        "generation_events": _jsonable(_field(stats, "events", [])),
+        "generation_stats": _jsonable(stats),
+        "expert_streaming_counters": streaming_counters,
+        "expert_streaming_counters_by_phase": streaming_counters_by_phase,
+        "expert_resource_telemetry": (
+            {
+                "before": resource_before,
+                "after": resource_after,
+                "numeric_delta": _numeric_delta(resource_before, resource_after),
+            }
+            if resource_telemetry_enabled
+            else None
+        ),
+    }
+    try:
+        if len(tokens) != max_tokens:
+            raise BenchmarkGateError(
+                f"{model} d{depth} emitted {len(tokens)} tokens; expected exactly "
+                f"{max_tokens}"
+            )
+        if finish_reason != "length":
+            raise BenchmarkGateError(
+                f"{model} d{depth} finished as {finish_reason!r}; expected 'length'"
+            )
+
+        requested_depth = _optional_int(stats, "requested_speculative_depth")
+        effective_depth = _optional_int(stats, "speculative_depth")
+        history_policy = _field(stats, "mtp_history_policy", "none")
+        ar_comparison = _ar_comparison(
+            tokens,
+            ar_tokens,
+            is_reference=depth == 0,
+        )
+        ar_finish_parity = depth == 0 or finish_reason == ar_finish_reason
+        requested_exact = requested_depth == depth
+        effective_exact = effective_depth == depth
+        committed_history = depth == 0 or history_policy == "committed"
+        guards_disabled = _guards_disabled(stats)
+        if not ar_finish_parity:
+            raise BenchmarkGateError(f"{model} d{depth} finish reason diverged from AR")
+        if not requested_exact or not effective_exact:
+            raise BenchmarkGateError(
+                f"{model} d{depth} reported requested/effective depth "
+                f"{requested_depth}/{effective_depth}"
+            )
+        if not committed_history:
+            raise BenchmarkGateError(
+                f"{model} d{depth} did not use committed MTP history"
+            )
+        if not guards_disabled:
+            raise BenchmarkGateError(f"{model} d{depth} triggered a generation guard")
+
+        _decode_streaming_counters, decode_cache_hit_rate = (
+            _require_decode_cache_metrics(
+                streaming_counters_by_phase,
+                model=model,
+                depth=depth,
+            )
+        )
+        speculative_event_contract = _validate_speculative_event_contract(
+            stats,
+            model=model,
+            depth=depth,
+            tokens=tokens,
+        )
+        final_state_contract = _validate_final_state_contract(
+            result,
+            stats,
+            model=model,
+            depth=depth,
+            prompt_tokens=len(prompt_ids),
+            tokens=tokens,
+            finish_reason=finish_reason,
+        )
+        metrics = _metrics(stats, completion_tokens=len(tokens), depth=depth)
+    except BenchmarkGateError as exc:
+        if exc.evidence is None:
+            exc.evidence = failure_evidence
+        raise
     row = {
         "model": model,
         "context_tokens": context_tokens,
@@ -866,7 +1344,11 @@ def _run_observation(
         "mtp_history_policy": None if depth == 0 else "committed",
         "finish_reason": finish_reason,
         "token_ids": tokens,
-        **_metrics(stats, completion_tokens=len(tokens), depth=depth),
+        "generation_events": _jsonable(_field(stats, "events", [])),
+        "ar_comparison": ar_comparison,
+        "speculative_event_contract": speculative_event_contract,
+        "final_state_contract": final_state_contract,
+        **metrics,
         "expert_streaming_counters": streaming_counters,
         "expert_streaming_counters_by_phase": streaming_counters_by_phase,
         "decode_expert_cache_hit_rate": decode_cache_hit_rate,
@@ -887,13 +1369,14 @@ def _run_observation(
             "generated_count_consistent": _field(stats, "generated_tokens")
             == len(tokens),
             "length_finish": finish_reason == "length",
-            "ar_token_parity": ar_token_parity,
-            "ar_finish_reason_parity": ar_finish_parity,
             "requested_depth_exact": requested_exact,
             "effective_depth_exact": effective_exact,
             "committed_history": committed_history,
             "guards_disabled": guards_disabled,
             "decode_expert_cache_metrics": True,
+            "speculative_event_contract": depth == 0
+            or speculative_event_contract is not None,
+            "final_state_contract": depth == 0 or final_state_contract is not None,
         },
     }
     if not row["gates"]["new_prefill_tokens_exact"]:
@@ -901,6 +1384,29 @@ def _run_observation(
             f"{model} d{depth} did not ingest the full exact prompt"
         )
     return row, tokens, finish_reason
+
+
+def _record_token_divergence(
+    model_payload: dict[str, Any],
+    row: Mapping[str, Any],
+    *,
+    phase: str,
+) -> None:
+    comparison = row.get("ar_comparison")
+    if not isinstance(comparison, Mapping):
+        return
+    if comparison.get("status") != "token_divergence":
+        return
+    model_payload["token_divergence_observations"].append(
+        {
+            "model": row["model"],
+            "context_tokens": row["context_tokens"],
+            "depth": row["requested_depth"],
+            "cell": row["cell"],
+            "phase": phase,
+            **dict(comparison),
+        }
+    )
 
 
 def _runtime_config(
@@ -1097,6 +1603,7 @@ def _run_depth_matrix_impl(
         raise BenchmarkConfigurationError(
             "context plus 128 output tokens exceeds max_live_kv_tokens"
         )
+    generation_environment = _generation_environment()
     apis = apis or _default_apis()
     sampler = apis.sampler_factory(temperature=0.0, top_p=1.0, top_k=1)
     lane = (
@@ -1140,6 +1647,15 @@ def _run_depth_matrix_impl(
                 "loop_guard": False,
                 "mtp_cache_policy": (None if mtp_disabled_baseline else "persistent"),
                 "mtp_history_policy": (None if mtp_disabled_baseline else "committed"),
+                "capture_final_state": not mtp_disabled_baseline,
+            },
+            "generation_environment": generation_environment,
+            "correctness_contract": {
+                "ar_token_parity": "diagnostic",
+                "cross_shape_token_divergence": "retained_unclassified_warning",
+                "speculative_event_integrity": "hard_gate",
+                "safe_final_state_and_cache_offsets": "hard_gate",
+                "prompt_output_depth_counters_and_cache_metrics": "hard_gate",
             },
             "runtime": _jsonable(options),
         },
@@ -1179,6 +1695,7 @@ def _run_depth_matrix_impl(
             "runtime_config": _jsonable(config),
             "prompts": prompts,
             "observations": observations,
+            "token_divergence_observations": [],
             "passed": False,
         }
         if not mtp_disabled_baseline:
@@ -1354,6 +1871,11 @@ def _run_depth_matrix_impl(
                         ar_tokens=warmup_ar_tokens,
                         ar_finish_reason=warmup_ar_finish,
                     )
+                    _record_token_divergence(
+                        model_payload,
+                        _warmup_row,
+                        phase="warmup",
+                    )
                     hard_peak_memory_bytes = max(
                         hard_peak_memory_bytes,
                         int(_warmup_row["peak_memory_bytes"]),
@@ -1382,6 +1904,11 @@ def _run_depth_matrix_impl(
                         resource_telemetry_enabled=bool(options["resource_telemetry"]),
                         ar_tokens=ar_tokens,
                         ar_finish_reason=ar_finish,
+                    )
+                    _record_token_divergence(
+                        model_payload,
+                        row,
+                        phase="retained",
                     )
                     hard_peak_memory_bytes = max(
                         hard_peak_memory_bytes,

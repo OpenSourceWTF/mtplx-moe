@@ -1599,9 +1599,7 @@ def verify_expert_manifest(
         expected_safetensors = {
             shard.name for shard in manifest.shards if shard.kind == "safetensors"
         }
-        actual_safetensors = {
-            path.name for path in artifact_root.glob("model*.safetensors")
-        }
+        actual_safetensors = {path.name for path in artifact_root.glob("*.safetensors")}
         if actual_safetensors != expected_safetensors:
             extra = sorted(actual_safetensors - expected_safetensors)
             missing = sorted(expected_safetensors - actual_safetensors)

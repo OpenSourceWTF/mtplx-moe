@@ -728,6 +728,42 @@ def test_authoritative_resident_inventory_rejects_missing_index_and_extra_shard(
         verify_expert_manifest(extra, extra_root)
 
 
+def test_authoritative_resident_inventory_accepts_non_model_shard_names(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "resident-names"
+    _spec, authoritative = _make_authoritative_checkpoint(root)
+    old_shard = next(
+        shard for shard in authoritative.shards if shard.kind == "safetensors"
+    )
+    new_name = "resident-00001-of-00001.safetensors"
+    (root / old_shard.name).rename(root / new_name)
+
+    index_path = root / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["weight_map"] = {tensor: new_name for tensor in index["weight_map"]}
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+
+    renamed = replace(
+        authoritative,
+        shards=tuple(
+            replace(shard, name=new_name) if shard.name == old_shard.name else shard
+            for shard in authoritative.shards
+        ),
+        resident_tensors=tuple(
+            replace(tensor, shard=new_name)
+            if tensor.shard == old_shard.name
+            else tensor
+            for tensor in authoritative.resident_tensors
+        ),
+        manifest_sha256=None,
+    ).with_digest()
+
+    report = verify_expert_manifest(renamed, root)
+
+    assert report["checked_shards"] == 2
+
+
 def test_authoritative_filter_retains_18_residents_and_drops_34_q4_shards(
     tmp_path: Path,
 ) -> None:
