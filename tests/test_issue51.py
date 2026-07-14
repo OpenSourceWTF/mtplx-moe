@@ -504,6 +504,7 @@ def test_runner_builds_exact_one_candidate_child_command(tmp_path: Path) -> None
     assert command[command.index("--model") + 1] == "hy3-q2"
     assert command[command.index("--contexts") + 1] == "1024,2048"
     assert command[command.index("--hy3-depths") + 1] == "1"
+    assert command[command.index("--transient-slots") + 1] == "32"
     assert command[command.index("--verify-strategy") + 1] == "capture_commit"
     assert command[command.index("--compiled-verify-mode") + 1] == "parity"
     assert command[command.index("--output-json") + 1] == str(output)

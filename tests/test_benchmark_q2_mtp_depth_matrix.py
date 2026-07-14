@@ -101,6 +101,11 @@ class _FakeRuntime:
                 "observation_ns": observation_ns,
                 "active_work_ns": 4 * observation_ns,
                 "queued_work_ns": observation_ns // 2,
+                "active_work_histogram_ns": {
+                    "0": observation_ns // 2,
+                    "8": observation_ns // 2,
+                    "32": 0,
+                },
                 "active_work_peak": 8,
                 "queued_work_peak": 2,
             },
@@ -1425,6 +1430,11 @@ def test_rows_recompute_ingestion_decode_and_acceptance_metrics(tmp_path: Path) 
             "observation_ns": 2_000_000_000,
             "active_work_ns": 8_000_000_000,
             "queued_work_ns": 1_000_000_000,
+            "active_work_histogram_ns": {
+                "0": 1_000_000_000,
+                "8": 1_000_000_000,
+                "32": 0,
+            },
             "active_work_peak": 0,
             "queued_work_peak": 0,
         },
@@ -1440,6 +1450,8 @@ def test_rows_recompute_ingestion_decode_and_acceptance_metrics(tmp_path: Path) 
         "elapsed_seconds": 1.0,
         "mean_active_readers": 4.0,
         "active_capacity_fraction": 0.125,
+        "peak_active_readers": 8,
+        "full_capacity_fraction": 0.0,
         "mean_queued_reads": 0.5,
     }
     assert all("prefill_callback" in kwargs for *_rest, kwargs in calls.ar + calls.mtpk)

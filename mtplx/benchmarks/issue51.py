@@ -28,6 +28,9 @@ A1_PROCESS_CONFIG = {
     "capture-compiled": ("on", "capture_commit"),
 }
 A1_ALLOWED_DEPTHS = frozenset({1, 2})
+HY3_ROUTER_TOP_K = 8
+ISSUE51_MAX_TARGET_ROWS = 4
+ISSUE51_READER_CAPACITY = HY3_ROUTER_TOP_K * ISSUE51_MAX_TARGET_ROWS
 REQUIRED_A1_GATES = frozenset(
     {
         "prompt_length_exact",
@@ -185,7 +188,7 @@ def _mean_active_readers(
     )
     _exact_int(
         reader_pool.get("worker_capacity"),
-        expected=32,
+        expected=ISSUE51_READER_CAPACITY,
         context=f"observation {observation_index} reader worker capacity",
     )
     return _finite_positive(

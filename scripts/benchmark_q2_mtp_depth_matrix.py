@@ -1235,13 +1235,61 @@ def _reader_pool_interval(
         raise BenchmarkGateError("reader_pool decode interval is empty")
     active_work_ns = interval("active_work_ns")
     queued_work_ns = interval("queued_work_ns")
+    before_histogram = before_pool.get("active_work_histogram_ns")
+    after_histogram = after_pool.get("active_work_histogram_ns")
+    if not isinstance(before_histogram, Mapping) or not isinstance(
+        after_histogram, Mapping
+    ):
+        raise BenchmarkGateError("reader_pool active occupancy histogram is missing")
+
+    histogram_ns: dict[int, int] = {}
+    for active_readers in range(capacity + 1):
+        key = str(active_readers)
+        if key not in before_histogram and key not in after_histogram:
+            histogram_ns[active_readers] = 0
+            continue
+        start = before_histogram.get(key)
+        end = after_histogram.get(key)
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+            or end < start
+        ):
+            raise BenchmarkGateError(
+                "reader_pool active occupancy histogram interval is invalid"
+            )
+        histogram_ns[active_readers] = end - start
+    if sum(histogram_ns.values()) != elapsed_ns:
+        raise BenchmarkGateError(
+            "reader_pool active occupancy histogram disagrees with elapsed time"
+        )
+    integrated_active_ns = sum(
+        active_readers * duration_ns
+        for active_readers, duration_ns in histogram_ns.items()
+    )
+    if integrated_active_ns != active_work_ns:
+        raise BenchmarkGateError(
+            "reader_pool active occupancy histogram disagrees with active time"
+        )
     mean_active = active_work_ns / elapsed_ns
     mean_queued = queued_work_ns / elapsed_ns
+    peak_active = max(
+        (
+            active_readers
+            for active_readers, duration_ns in histogram_ns.items()
+            if duration_ns > 0
+        ),
+        default=0,
+    )
     return {
         "worker_capacity": capacity,
         "elapsed_seconds": elapsed_ns / 1_000_000_000,
         "mean_active_readers": mean_active,
         "active_capacity_fraction": mean_active / capacity,
+        "peak_active_readers": peak_active,
+        "full_capacity_fraction": histogram_ns[capacity] / elapsed_ns,
         "mean_queued_reads": mean_queued,
     }
 

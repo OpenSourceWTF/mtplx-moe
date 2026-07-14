@@ -22,6 +22,7 @@ if str(_ROOT) not in sys.path:
 from mtplx.benchmarks.issue51 import (  # noqa: E402
     A1_CANDIDATES,
     A1_PROCESS_CONFIG,
+    ISSUE51_READER_CAPACITY,
     build_abba_schedule,
     validate_a1_child,
 )
@@ -144,6 +145,8 @@ def build_a1_child_invocation(
         ",".join(str(item) for item in contexts),
         "--hy3-depths",
         ",".join(str(item) for item in depths),
+        "--transient-slots",
+        str(ISSUE51_READER_CAPACITY),
         "--verify-strategy",
         strategy,
         "--compiled-verify-mode",

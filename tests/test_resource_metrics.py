@@ -26,21 +26,31 @@ def test_pool_occupancy_integrates_queue_workers_and_units() -> None:
     clock.advance(10)
     metrics.started(100)
     clock.advance(20)
+    metrics.submitted(50)
+    metrics.started(50)
+    clock.advance(10)
+    metrics.completed(50)
+    clock.advance(5)
     metrics.completed(100)
 
     snapshot = metrics.snapshot()
 
-    assert snapshot["accepted_submissions"] == 1
-    assert snapshot["started"] == 1
-    assert snapshot["completed"] == 1
+    assert snapshot["accepted_submissions"] == 2
+    assert snapshot["started"] == 2
+    assert snapshot["completed"] == 2
     assert snapshot["queued_work_ns"] == 10
-    assert snapshot["active_work_ns"] == 20
+    assert snapshot["active_work_ns"] == 45
     assert snapshot["queued_unit_ns"] == 1_000
-    assert snapshot["active_unit_ns"] == 2_000
+    assert snapshot["active_unit_ns"] == 4_000
     assert snapshot["queued_work_peak"] == 1
-    assert snapshot["active_work_peak"] == 1
+    assert snapshot["active_work_peak"] == 2
+    assert snapshot["active_work_histogram_ns"] == {
+        "0": 10,
+        "1": 25,
+        "2": 10,
+    }
     assert snapshot["queued_units_peak"] == 100
-    assert snapshot["active_units_peak"] == 100
+    assert snapshot["active_units_peak"] == 150
     assert snapshot["queued_work"] == 0
     assert snapshot["active_work"] == 0
 
