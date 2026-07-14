@@ -278,7 +278,10 @@ def _load_validated_plist(plist: Path, *, uid: int) -> _ValidatedPlist:
     direct_server = module_pair and any("Qwen3.6" in item for item in arguments)
     wrapper = len(arguments) == 1
     if direct_server:
-        return _ValidatedPlist(path, value, payload, None)
+        raise ValueError(
+            "Qwen direct-server executable forms are unsupported without use binding; "
+            "use one validated wrapper"
+        )
     if wrapper:
         wrapper_payload = _validate_qwen_launcher(arguments[0], uid=uid)
         return _ValidatedPlist(path, value, payload, wrapper_payload)

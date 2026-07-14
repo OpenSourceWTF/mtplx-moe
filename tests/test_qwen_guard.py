@@ -31,19 +31,26 @@ DOMAIN = f"gui/{UID}"
 PROCESS_PATTERN = "mtplx.server.openai.*Qwen3.6"
 
 
+@pytest.fixture(autouse=True)
+def _isolated_guard_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "isolated-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+
 def _write_plist(root: Path) -> Path:
+    launcher = root / "start-qwen-test.sh"
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o755)
     path = root / "com.tea.qwen.plist"
     path.write_bytes(
         plistlib.dumps(
             {
                 "Label": "com.tea.qwen",
-                "ProgramArguments": [
-                    sys.executable,
-                    "-m",
-                    "mtplx.server.openai",
-                    "--model",
-                    "/models/Qwen3.6-27B-MTPLX-Optimized-Speed",
-                ],
+                "ProgramArguments": [str(launcher)],
             }
         )
     )
@@ -465,6 +472,79 @@ def test_plist_program_key_is_rejected_before_state_mutation(tmp_path: Path) -> 
             replacement.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
             replacement.chmod(0o755)
             os.replace(replacement, program)
+
+    assert fake.commands == []
+
+
+def test_user_owned_direct_server_executable_is_rejected_before_mutation(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "qwen-python-shim"
+    executable.write_text(
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n',
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    plist = tmp_path / "com.tea.qwen.plist"
+    plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "com.tea.qwen",
+                "ProgramArguments": [
+                    str(executable),
+                    "-m",
+                    "mtplx.server.openai",
+                    "--model",
+                    "/models/Qwen3.6-27B-MTPLX-Optimized-Speed",
+                ],
+            }
+        )
+    )
+    plist.chmod(0o644)
+    fake = FakeQwen(
+        loaded=True,
+        models=EXPECTED_QWEN_MODELS,
+        processes=(101,),
+    )
+
+    with pytest.raises(ValueError, match="direct.*executable|system Python"):
+        with _guard(plist, fake):
+            replacement = tmp_path / "replacement-direct-executable"
+            replacement.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+            replacement.chmod(0o755)
+            os.replace(replacement, executable)
+
+    assert fake.commands == []
+
+
+def test_unbound_system_python_direct_server_form_is_rejected_before_mutation(
+    tmp_path: Path,
+) -> None:
+    plist = tmp_path / "com.tea.qwen.plist"
+    plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "com.tea.qwen",
+                "ProgramArguments": [
+                    "/usr/bin/python3",
+                    "-m",
+                    "mtplx.server.openai",
+                    "--model",
+                    "/models/Qwen3.6-27B-MTPLX-Optimized-Speed",
+                ],
+            }
+        )
+    )
+    plist.chmod(0o644)
+    fake = FakeQwen(
+        loaded=True,
+        models=EXPECTED_QWEN_MODELS,
+        processes=(101,),
+    )
+
+    with pytest.raises(ValueError, match="direct.*executable|unsupported"):
+        with _guard(plist, fake):
+            raise AssertionError("unbound direct-server form must not yield")
 
     assert fake.commands == []
 
