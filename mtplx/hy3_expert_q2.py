@@ -14,15 +14,12 @@ from typing import Any, Callable
 
 import numpy as np
 
-from . import expert_manifest as expert_manifest_module
 from .expert_manifest import (
     ExpertManifest,
-    ExpertManifestError,
     ExpertRecord,
     ResidentTensor,
     ShardInfo,
     TensorSegment,
-    resolve_artifact_member,
 )
 
 
@@ -96,6 +93,30 @@ class _CopyReceipt:
     source_inode: int
     target_device: int
     target_inode: int
+
+
+@dataclass(frozen=True)
+class _SourceArtifact:
+    name: str
+    fd: int
+    size: int
+    device: int
+    inode: int
+    entry_directory_fd: int
+    entry_name: str
+    entry_device: int
+    entry_inode: int
+    link_device: int | None = None
+    link_inode: int | None = None
+    link_target: str | None = None
+
+
+@dataclass(frozen=True)
+class _HfBlobLayout:
+    source_name: str
+    snapshots_fd: int
+    repository_fd: int
+    blobs_fd: int
 
 
 def _read_flags() -> int:
@@ -223,20 +244,282 @@ def _require_flat_target_name(name: str) -> str:
     return name
 
 
+def _close_hf_blob_layout(layout: _HfBlobLayout) -> None:
+    os.close(layout.blobs_fd)
+    os.close(layout.repository_fd)
+    os.close(layout.snapshots_fd)
+
+
+def _open_hf_blob_directory(source_root: Path, source_fd: int) -> _HfBlobLayout:
+    if source_root.parent.name != "snapshots":
+        raise ValueError("source artifact symlink is outside an HF snapshot layout")
+    snapshot_name = _require_flat_target_name(source_root.name)
+    snapshots_fd = os.open("..", _directory_flags(), dir_fd=source_fd)
+    repository_fd: int | None = None
+    blob_fd: int | None = None
+    try:
+        source_entry = os.stat(
+            snapshot_name,
+            dir_fd=snapshots_fd,
+            follow_symlinks=False,
+        )
+        source_status = os.fstat(source_fd)
+        if not stat.S_ISDIR(source_entry.st_mode) or (
+            source_entry.st_dev,
+            source_entry.st_ino,
+        ) != (source_status.st_dev, source_status.st_ino):
+            raise ValueError("source root is not pinned inside its HF snapshot")
+        repository_fd = os.open("..", _directory_flags(), dir_fd=snapshots_fd)
+        snapshots_entry = os.stat(
+            "snapshots",
+            dir_fd=repository_fd,
+            follow_symlinks=False,
+        )
+        snapshots_status = os.fstat(snapshots_fd)
+        if not stat.S_ISDIR(snapshots_entry.st_mode) or (
+            snapshots_entry.st_dev,
+            snapshots_entry.st_ino,
+        ) != (snapshots_status.st_dev, snapshots_status.st_ino):
+            raise ValueError("HF snapshots directory identity changed")
+        blob_entry = os.stat(
+            "blobs",
+            dir_fd=repository_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(blob_entry.st_mode):
+            raise ValueError("HF blobs entry must be a real directory")
+        blob_fd = os.open("blobs", _directory_flags(), dir_fd=repository_fd)
+        blob_status = os.fstat(blob_fd)
+        if (blob_entry.st_dev, blob_entry.st_ino) != (
+            blob_status.st_dev,
+            blob_status.st_ino,
+        ):
+            raise ValueError("HF blobs directory changed while opening")
+        result = _HfBlobLayout(
+            source_name=snapshot_name,
+            snapshots_fd=snapshots_fd,
+            repository_fd=repository_fd,
+            blobs_fd=blob_fd,
+        )
+        snapshots_fd = None
+        repository_fd = None
+        blob_fd = None
+        return result
+    except OSError as exc:
+        raise ValueError(f"HF blob directory is unavailable: {exc}") from exc
+    finally:
+        if blob_fd is not None:
+            os.close(blob_fd)
+        if repository_fd is not None:
+            os.close(repository_fd)
+        if snapshots_fd is not None:
+            os.close(snapshots_fd)
+
+
+def _open_source_artifact(
+    source_root: Path,
+    source_fd: int,
+    name: str,
+    hf_blob_layout: _HfBlobLayout | None,
+) -> tuple[_SourceArtifact, _HfBlobLayout | None]:
+    name = _require_flat_target_name(name)
+    try:
+        initial_entry = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(
+            f"required source artifact {name} is unavailable: {exc}"
+        ) from exc
+    artifact_fd: int | None = None
+    opened_blob_fd = False
+    try:
+        if stat.S_ISREG(initial_entry.st_mode):
+            artifact_fd = os.open(name, _read_flags(), dir_fd=source_fd)
+            entry_directory_fd = source_fd
+            entry_name = name
+            link_device = None
+            link_inode = None
+            link_target = None
+        elif stat.S_ISLNK(initial_entry.st_mode):
+            link_target = os.readlink(name, dir_fd=source_fd)
+            target = PurePosixPath(link_target)
+            if (
+                "\\" in link_target
+                or len(target.parts) != 4
+                or target.parts[:3] != ("..", "..", "blobs")
+            ):
+                raise ValueError(
+                    f"source artifact {name} is not an exact HF blob symlink"
+                )
+            blob_name = _require_flat_target_name(target.parts[3])
+            if link_target != f"../../blobs/{blob_name}":
+                raise ValueError(
+                    f"source artifact {name} is not an exact HF blob symlink"
+                )
+            repeated_link = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+            if not stat.S_ISLNK(repeated_link.st_mode) or (
+                repeated_link.st_dev,
+                repeated_link.st_ino,
+            ) != (initial_entry.st_dev, initial_entry.st_ino):
+                raise ValueError(f"source artifact {name} changed while resolving")
+            if hf_blob_layout is None:
+                hf_blob_layout = _open_hf_blob_directory(source_root, source_fd)
+                opened_blob_fd = True
+            blob_entry = os.stat(
+                blob_name,
+                dir_fd=hf_blob_layout.blobs_fd,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISREG(blob_entry.st_mode):
+                raise ValueError(f"HF blob for {name} is not a regular file")
+            artifact_fd = os.open(
+                blob_name,
+                _read_flags(),
+                dir_fd=hf_blob_layout.blobs_fd,
+            )
+            entry_directory_fd = hf_blob_layout.blobs_fd
+            entry_name = blob_name
+            initial_entry = blob_entry
+            link_device = repeated_link.st_dev
+            link_inode = repeated_link.st_ino
+        else:
+            raise ValueError(f"source artifact {name} is not a regular file")
+        descriptor_status = os.fstat(artifact_fd)
+        repeated_entry = os.stat(
+            entry_name,
+            dir_fd=entry_directory_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(descriptor_status.st_mode)
+            or not stat.S_ISREG(repeated_entry.st_mode)
+            or (descriptor_status.st_dev, descriptor_status.st_ino)
+            != (initial_entry.st_dev, initial_entry.st_ino)
+            or (repeated_entry.st_dev, repeated_entry.st_ino)
+            != (descriptor_status.st_dev, descriptor_status.st_ino)
+        ):
+            raise ValueError(f"source artifact {name} changed while opening")
+        artifact = _SourceArtifact(
+            name=name,
+            fd=artifact_fd,
+            size=descriptor_status.st_size,
+            device=descriptor_status.st_dev,
+            inode=descriptor_status.st_ino,
+            entry_directory_fd=entry_directory_fd,
+            entry_name=entry_name,
+            entry_device=repeated_entry.st_dev,
+            entry_inode=repeated_entry.st_ino,
+            link_device=link_device,
+            link_inode=link_inode,
+            link_target=link_target,
+        )
+        artifact_fd = None
+        return artifact, hf_blob_layout
+    except OSError as exc:
+        if opened_blob_fd and hf_blob_layout is not None:
+            _close_hf_blob_layout(hf_blob_layout)
+        raise ValueError(f"could not open source artifact {name}: {exc}") from exc
+    except BaseException:
+        if opened_blob_fd and hf_blob_layout is not None:
+            _close_hf_blob_layout(hf_blob_layout)
+        raise
+    finally:
+        if artifact_fd is not None:
+            os.close(artifact_fd)
+
+
+def _recheck_source_artifacts(
+    source_fd: int,
+    artifacts: dict[str, _SourceArtifact],
+    receipts: dict[str, _CopyReceipt],
+    hf_blob_layout: _HfBlobLayout | None,
+    *,
+    chunk_bytes: int,
+) -> None:
+    if hf_blob_layout is not None:
+        source_entry = os.stat(
+            hf_blob_layout.source_name,
+            dir_fd=hf_blob_layout.snapshots_fd,
+            follow_symlinks=False,
+        )
+        snapshots_entry = os.stat(
+            "snapshots",
+            dir_fd=hf_blob_layout.repository_fd,
+            follow_symlinks=False,
+        )
+        blobs_entry = os.stat(
+            "blobs",
+            dir_fd=hf_blob_layout.repository_fd,
+            follow_symlinks=False,
+        )
+        source_status = os.fstat(source_fd)
+        snapshots_status = os.fstat(hf_blob_layout.snapshots_fd)
+        blobs_status = os.fstat(hf_blob_layout.blobs_fd)
+        if (
+            not stat.S_ISDIR(source_entry.st_mode)
+            or (source_entry.st_dev, source_entry.st_ino)
+            != (source_status.st_dev, source_status.st_ino)
+            or not stat.S_ISDIR(snapshots_entry.st_mode)
+            or (snapshots_entry.st_dev, snapshots_entry.st_ino)
+            != (snapshots_status.st_dev, snapshots_status.st_ino)
+            or not stat.S_ISDIR(blobs_entry.st_mode)
+            or (blobs_entry.st_dev, blobs_entry.st_ino)
+            != (blobs_status.st_dev, blobs_status.st_ino)
+        ):
+            raise ValueError("HF blob directory identity changed during staging")
+    for name, artifact in artifacts.items():
+        receipt = receipts[name]
+        descriptor_status = os.fstat(artifact.fd)
+        entry_status = os.stat(
+            artifact.entry_name,
+            dir_fd=artifact.entry_directory_fd,
+            follow_symlinks=False,
+        )
+        identity = (artifact.device, artifact.inode)
+        if (
+            not stat.S_ISREG(descriptor_status.st_mode)
+            or not stat.S_ISREG(entry_status.st_mode)
+            or descriptor_status.st_size != artifact.size
+            or (descriptor_status.st_dev, descriptor_status.st_ino) != identity
+            or (entry_status.st_dev, entry_status.st_ino)
+            != (artifact.entry_device, artifact.entry_inode)
+            or (artifact.entry_device, artifact.entry_inode) != identity
+            or (receipt.source_device, receipt.source_inode) != identity
+            or receipt.size != artifact.size
+        ):
+            raise ValueError(f"source artifact {name} identity changed during staging")
+        if artifact.link_target is not None:
+            link_status = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISLNK(link_status.st_mode)
+                or (link_status.st_dev, link_status.st_ino)
+                != (artifact.link_device, artifact.link_inode)
+                or os.readlink(name, dir_fd=source_fd) != artifact.link_target
+            ):
+                raise ValueError(f"source HF link {name} changed during staging")
+        if (
+            _hash_fd(
+                artifact.fd,
+                length=descriptor_status.st_size,
+                chunk_bytes=chunk_bytes,
+            )
+            != receipt.sha256
+        ):
+            raise ValueError(f"source artifact {name} contents changed during staging")
+
+
 def _copy_independent_file(
-    source: Path,
+    source_fd: int,
     directory_fd: int,
     target_name: str,
     *,
     chunk_bytes: int,
     expected_sha256: str | None,
 ) -> _CopyReceipt:
-    source_fd = os.open(source, _read_flags())
     target_fd: int | None = None
     try:
         source_before = os.fstat(source_fd)
         if not stat.S_ISREG(source_before.st_mode):
-            raise ValueError(f"source artifact is not a regular file: {source}")
+            raise ValueError(f"source artifact is not a regular file: {target_name}")
         target_fd = os.open(target_name, _write_flags(), 0o644, dir_fd=directory_fd)
         copied_digest = hashlib.sha256()
         copied = 0
@@ -257,10 +540,11 @@ def _copy_independent_file(
         os.fsync(target_fd)
         source_after = os.fstat(source_fd)
         target_status = os.fstat(target_fd)
-        if (
-            source_after.st_size != source_before.st_size
-            or target_status.st_size != source_before.st_size
-        ):
+        if (source_after.st_dev, source_after.st_ino, source_after.st_size) != (
+            source_before.st_dev,
+            source_before.st_ino,
+            source_before.st_size,
+        ) or target_status.st_size != source_before.st_size:
             raise ValueError(
                 f"source or target size changed while copying {target_name}"
             )
@@ -315,7 +599,6 @@ def _copy_independent_file(
                 target_fd = None
         raise
     finally:
-        os.close(source_fd)
         if target_fd is not None:
             os.close(target_fd)
 
@@ -667,6 +950,8 @@ def stage_exact_residents(
     except BaseException:
         os.close(source_fd)
         raise
+    source_artifacts: dict[str, _SourceArtifact] = {}
+    hf_blob_layout: _HfBlobLayout | None = None
     try:
         _assert_directory_path_identity(source_root, source_fd, label="source root")
         _assert_directory_path_identity(work_root, work_fd, label="target work root")
@@ -680,22 +965,95 @@ def stage_exact_residents(
             != source_manifest.with_digest().manifest_sha256
         ):
             raise ValueError("source manifest digest is missing or invalid")
-        try:
-            index_source = resolve_artifact_member(source_root, _INDEX_FILE)
-        except ExpertManifestError as exc:
-            raise ValueError(f"required resident index is unavailable: {exc}") from exc
-        source_shards, source_tensors = expert_manifest_module._checkpoint_inventory(
+        index_source, hf_blob_layout = _open_source_artifact(
             source_root,
-            hash_shards=True,
+            source_fd,
+            _INDEX_FILE,
+            hf_blob_layout,
         )
-        index_names = set(source_tensors)
+        source_artifacts[_INDEX_FILE] = index_source
+        weight_map, declared_total_size = _parse_index_fd(index_source.fd)
+        shard_names = sorted(set(weight_map.values()))
+        if not shard_names:
+            raise ValueError("resident index contains no safetensors shards")
+        reserved_names = {_INDEX_FILE, *_ANCILLARY_FILES}
+        if reserved_names.intersection(shard_names):
+            raise ValueError("resident index uses a reserved artifact as a shard")
         manifest_tensors = {
             tensor.tensor: tensor for tensor in source_manifest.resident_tensors
         }
         _reject_resident_contamination(
-            index_names | set(manifest_tensors),
-            {shard.name for shard in source_shards},
+            set(weight_map) | set(manifest_tensors),
+            set(shard_names),
         )
+        manifest_shards = {
+            shard.name: shard
+            for shard in source_manifest.shards
+            if shard.kind == "safetensors"
+        }
+        selected_shards: list[ShardInfo] = []
+        source_tensors: dict[str, ResidentTensor] = {}
+        source_members: list[tuple[str, _SourceArtifact, str | None]] = []
+        for shard_name in shard_names:
+            shard_source, hf_blob_layout = _open_source_artifact(
+                source_root,
+                source_fd,
+                shard_name,
+                hf_blob_layout,
+            )
+            source_artifacts[shard_name] = shard_source
+            shard_sha256 = _hash_fd(
+                shard_source.fd,
+                length=shard_source.size,
+                chunk_bytes=copy_chunk_bytes,
+            )
+            shard, shard_tensors = _parse_safetensors_fd(
+                shard_source.fd,
+                name=shard_name,
+                sha256=shard_sha256,
+            )
+            for tensor_name, tensor in shard_tensors.items():
+                if tensor_name in source_tensors:
+                    raise ValueError(
+                        f"resident tensor appears in multiple shards: {tensor_name}"
+                    )
+                if weight_map.get(tensor_name) != shard_name:
+                    raise ValueError(
+                        f"resident index maps {tensor_name} to the wrong shard"
+                    )
+                source_tensors[tensor_name] = tensor
+            expected = manifest_shards.get(shard_name)
+            if expected is None or expected.sha256 is None:
+                raise ValueError(
+                    f"resident shard lacks manifest provenance: {shard_name}"
+                )
+            if (
+                shard.size != expected.size
+                or shard.header_bytes != expected.header_bytes
+                or shard.header_sha256 != expected.header_sha256
+                or shard.sha256 != expected.sha256
+            ):
+                raise ValueError(
+                    "resident shard header, size, or hash provenance mismatch: "
+                    f"{shard_name}"
+                )
+            selected_shards.append(expected)
+            source_members.append((shard_name, shard_source, expected.sha256))
+
+        index_names = set(source_tensors)
+        if set(weight_map) != index_names:
+            missing = sorted(set(weight_map) - index_names)
+            extra = sorted(index_names - set(weight_map))
+            raise ValueError(
+                "resident index/header tensor mismatch; "
+                f"missing={missing[:4]}, extra={extra[:4]}"
+            )
+        if declared_total_size is not None and declared_total_size != sum(
+            tensor.length for tensor in source_tensors.values()
+        ):
+            raise ValueError(
+                "resident index total_size does not match header inventory"
+            )
         if index_names != set(manifest_tensors):
             missing = sorted(set(manifest_tensors) - index_names)
             extra = sorted(index_names - set(manifest_tensors))
@@ -705,58 +1063,20 @@ def stage_exact_residents(
             )
         for name, tensor in source_tensors.items():
             expected = manifest_tensors[name]
-            if (
-                tensor.shard != expected.shard
-                or tensor.offset != expected.offset
-                or tensor.length != expected.length
-                or tensor.dtype != expected.dtype
-                or tensor.shape != expected.shape
-            ):
+            if tensor != expected:
                 raise ValueError(
                     f"resident metadata does not match index headers: {name}"
                 )
 
-        manifest_shards = {
-            shard.name: shard
-            for shard in source_manifest.shards
-            if shard.kind == "safetensors"
-        }
-        selected_shards = []
-        source_members: list[tuple[str, Path, str | None]] = []
-        for shard in source_shards:
-            _require_flat_target_name(shard.name)
-            expected = manifest_shards.get(shard.name)
-            if expected is None or expected.sha256 is None:
-                raise ValueError(
-                    f"resident shard lacks manifest provenance: {shard.name}"
-                )
-            if (
-                shard.size != expected.size
-                or shard.header_bytes != expected.header_bytes
-                or shard.header_sha256 != expected.header_sha256
-                or shard.sha256 != expected.sha256
-            ):
-                raise ValueError(
-                    f"resident shard header, size, or hash provenance mismatch: {shard.name}"
-                )
-            selected_shards.append(expected)
-            source_members.append(
-                (
-                    shard.name,
-                    resolve_artifact_member(source_root, shard.name),
-                    expected.sha256,
-                )
-            )
-
         source_members.append((_INDEX_FILE, index_source, None))
         for name in _ANCILLARY_FILES:
-            _require_flat_target_name(name)
-            try:
-                source = resolve_artifact_member(source_root, name)
-            except ExpertManifestError as exc:
-                raise ValueError(
-                    f"required ancillary {name} is unavailable: {exc}"
-                ) from exc
+            source, hf_blob_layout = _open_source_artifact(
+                source_root,
+                source_fd,
+                name,
+                hf_blob_layout,
+            )
+            source_artifacts[name] = source
             source_members.append((name, source, None))
         target_names = [name for name, _source, _digest in source_members]
         if len(target_names) != len(set(target_names)):
@@ -767,7 +1087,7 @@ def stage_exact_residents(
         try:
             for name, source, expected_sha256 in source_members:
                 receipts[name] = _copy_independent_file(
-                    source,
+                    source.fd,
                     work_fd,
                     name,
                     chunk_bytes=copy_chunk_bytes,
@@ -809,6 +1129,13 @@ def stage_exact_residents(
                 receipts,
                 chunk_bytes=copy_chunk_bytes,
             )
+            _recheck_source_artifacts(
+                source_fd,
+                source_artifacts,
+                receipts,
+                hf_blob_layout,
+                chunk_bytes=copy_chunk_bytes,
+            )
             _assert_directory_path_identity(
                 source_root,
                 source_fd,
@@ -830,6 +1157,10 @@ def stage_exact_residents(
             for fd in final_fds.values():
                 os.close(fd)
     finally:
+        for source in source_artifacts.values():
+            os.close(source.fd)
+        if hf_blob_layout is not None:
+            _close_hf_blob_layout(hf_blob_layout)
         os.close(work_fd)
         os.close(source_fd)
 

@@ -169,6 +169,23 @@ def _resident_source(
     return manifest, copied_payloads
 
 
+def _resident_hf_source(
+    root: Path,
+) -> tuple[Path, Path, ExpertManifest, dict[str, bytes]]:
+    repository = root / "repository"
+    source_root = repository / "snapshots" / ("a" * 40)
+    source_root.parent.mkdir(parents=True)
+    manifest, expected_payloads = _resident_source(source_root)
+    blobs = repository / "blobs"
+    blobs.mkdir()
+    for name, payload in expected_payloads.items():
+        blob_name = hashlib.sha256(payload).hexdigest()
+        source = source_root / name
+        source.replace(blobs / blob_name)
+        source.symlink_to(Path("..") / ".." / "blobs" / blob_name)
+    return source_root, blobs, manifest, expected_payloads
+
+
 def _bf16_matrix(rows: int, columns: int, *, offset: float) -> mx.array:
     values = np.linspace(
         -1.75 + offset,
@@ -940,7 +957,7 @@ def test_resident_final_identity_detects_swap_during_descriptor_validation(
     ]
 
 
-def test_resident_final_index_and_headers_are_parsed_from_held_descriptors(
+def test_resident_source_and_final_inventory_are_parsed_from_held_descriptors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -948,22 +965,79 @@ def test_resident_final_index_and_headers_are_parsed_from_held_descriptors(
     work_root = tmp_path / "work"
     manifest, _payloads = _resident_source(source_root)
     work_root.mkdir()
-    original_inventory = expert_manifest_module._checkpoint_inventory
 
-    def reject_path_following_target_inventory(root: Path, *, hash_shards: bool):
-        if Path(root).resolve() == work_root.resolve():
-            raise AssertionError("final inventory followed target paths")
-        return original_inventory(root, hash_shards=hash_shards)
+    def reject_path_following_inventory(root: Path, *, hash_shards: bool):
+        raise AssertionError(f"inventory followed paths under {root}")
 
     monkeypatch.setattr(
         expert_manifest_module,
         "_checkpoint_inventory",
-        reject_path_following_target_inventory,
+        reject_path_following_inventory,
     )
 
     result = stage_exact_residents(source_root, manifest, work_root)
 
     assert result.tensors == manifest.resident_tensors
+
+
+def test_resident_staging_accepts_only_pinned_hf_blob_symlinks(
+    tmp_path: Path,
+) -> None:
+    source_root, _blobs, manifest, expected_payloads = _resident_hf_source(tmp_path)
+    work_root = tmp_path / "work"
+    work_root.mkdir()
+
+    result = stage_exact_residents(source_root, manifest, work_root)
+
+    assert result.tensors == manifest.resident_tensors
+    for name, payload in expected_payloads.items():
+        assert (work_root / name).read_bytes() == payload
+
+
+def test_resident_staging_rejects_hf_looking_link_outside_snapshot_layout(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    work_root = tmp_path / "work"
+    manifest, _payloads = _resident_source(source_root)
+    work_root.mkdir()
+    config = source_root / "config.json"
+    config.unlink()
+    config.symlink_to(Path("..") / ".." / "blobs" / ("b" * 64))
+
+    with pytest.raises(ValueError, match="HF snapshot|symlink"):
+        stage_exact_residents(source_root, manifest, work_root)
+
+    assert list(work_root.iterdir()) == []
+
+
+def test_resident_staging_rejects_persistent_hf_blob_directory_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root, blobs, manifest, _payloads = _resident_hf_source(tmp_path)
+    moved_blobs = blobs.with_name("blobs-moved")
+    work_root = tmp_path / "work"
+    work_root.mkdir()
+    original_copy = q2_module._copy_independent_file
+
+    def swap_blobs_after_last_copy(*args, **kwargs):
+        receipt = original_copy(*args, **kwargs)
+        if args[2] == "chat_template.jinja":
+            blobs.rename(moved_blobs)
+            blobs.mkdir()
+        return receipt
+
+    monkeypatch.setattr(
+        q2_module,
+        "_copy_independent_file",
+        swap_blobs_after_last_copy,
+    )
+
+    with pytest.raises(ValueError, match="HF|blob|identity"):
+        stage_exact_residents(source_root, manifest, work_root)
+
+    assert list(work_root.iterdir()) == []
 
 
 @pytest.mark.parametrize("symlinked_root", ["source", "work"])
@@ -1046,6 +1120,42 @@ def test_resident_final_source_identity_rejects_path_swap(
         stage_exact_residents(source_root, manifest, work_root)
 
     assert list(work_root.iterdir()) == []
+
+
+def test_resident_transient_source_root_swap_cannot_supply_attacker_ancillary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    moved_source = tmp_path / "source-moved"
+    work_root = tmp_path / "work"
+    manifest, expected_payloads = _resident_source(source_root)
+    work_root.mkdir()
+    original_copy = q2_module._copy_independent_file
+
+    def swap_source_path_while_copying_config(*args, **kwargs):
+        if args[2] != "config.json":
+            return original_copy(*args, **kwargs)
+        source_root.rename(moved_source)
+        source_root.mkdir()
+        (source_root / "config.json").write_bytes(b"attacker-config")
+        try:
+            return original_copy(*args, **kwargs)
+        finally:
+            (source_root / "config.json").unlink()
+            source_root.rmdir()
+            moved_source.rename(source_root)
+
+    monkeypatch.setattr(
+        q2_module,
+        "_copy_independent_file",
+        swap_source_path_while_copying_config,
+    )
+
+    result = stage_exact_residents(source_root, manifest, work_root)
+
+    assert result.tensors == manifest.resident_tensors
+    assert (work_root / "config.json").read_bytes() == expected_payloads["config.json"]
 
 
 def test_resident_final_directory_fsync_failure_cleans_and_allows_retry(
