@@ -237,6 +237,63 @@ def test_hy3_mtp_layer_forward_produces_finite_logits_and_hidden(
     assert mx.all(mx.isfinite(hidden.astype(mx.float32))).item()
 
 
+@pytest.mark.parametrize("precision", ["q4", "bf16"])
+@pytest.mark.parametrize("lm_head_fp32", [False, True])
+def test_hy3_mtp_recycles_the_final_normalized_hidden(
+    tmp_path: Path, precision: str, lm_head_fp32: bool
+) -> None:
+    """The reference NextN recurrence consumes the LM-head-normalized state."""
+
+    args = _tiny_args()
+    args.enable_lm_head_fp32 = lm_head_fp32
+    if precision == "bf16":
+        _write_tiny_bf16_artifact(tmp_path)
+    else:
+        _write_tiny_artifacts(tmp_path)
+    mtp = build_hy3_mtp_module(
+        tmp_path, args, expected_revision=TEST_REVISION, precision=precision
+    )
+    trunk = Hy3Model(args)
+    captured_head_inputs: list[mx.array] = []
+
+    class RecordingNorm(nn.Module):
+        def __init__(self, base: nn.Module) -> None:
+            super().__init__()
+            self.base = base
+            self.output = None
+
+        def __call__(self, hidden: mx.array) -> mx.array:
+            self.output = self.base(hidden)
+            return self.output
+
+    recording_norm = RecordingNorm(mtp.layers[0].final_layernorm)
+    mtp.layers[0].final_layernorm = recording_norm
+
+    def capture_head(hidden: mx.array) -> mx.array:
+        captured_head_inputs.append(hidden)
+        return hidden
+
+    token_ids = mx.array([[3, 5]], dtype=mx.int32)
+    previous_hidden = mx.random.normal((1, 2, args.hidden_size)).astype(mx.bfloat16)
+    logits, recurrent_hidden = mtp.layers[0](
+        token_ids,
+        previous_hidden,
+        embed_tokens=trunk.model.embed_tokens,
+        lm_head=capture_head,
+    )
+    mx.eval(logits, recurrent_hidden)
+
+    assert len(captured_head_inputs) == 1
+    assert recording_norm.output is not None
+    assert recurrent_hidden.dtype == recording_norm.output.dtype
+    assert mx.array_equal(recurrent_hidden, recording_norm.output).item()
+    expected_head_dtype = mx.float32 if lm_head_fp32 else recurrent_hidden.dtype
+    assert captured_head_inputs[0].dtype == expected_head_dtype
+    assert mx.array_equal(
+        captured_head_inputs[0], recurrent_hidden.astype(expected_head_dtype)
+    ).item()
+
+
 def test_loader_rejects_revision_mismatch(tmp_path: Path) -> None:
     args = _tiny_args()
     _write_tiny_artifacts(tmp_path, revision="unexpected")

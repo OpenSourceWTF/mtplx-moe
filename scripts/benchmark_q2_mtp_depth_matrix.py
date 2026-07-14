@@ -573,15 +573,83 @@ def _reset_expert_streaming(runtime: Any) -> None:
     reset()
 
 
-def _streaming_counters(runtime: Any) -> dict[str, Any] | None:
+def _streaming_cache_metrics(
+    runtime: Any,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     snapshot_fn = getattr(runtime, "expert_streaming_snapshot", None)
     if not callable(snapshot_fn):
-        return None
+        return None, None
     snapshot = snapshot_fn()
     if not isinstance(snapshot, Mapping):
-        return None
+        return None, None
     cache = snapshot.get("cache")
-    return _jsonable(cache) if isinstance(cache, Mapping) else None
+    cache_by_phase = snapshot.get("cache_by_phase")
+    return (
+        _jsonable(cache) if isinstance(cache, Mapping) else None,
+        _jsonable(cache_by_phase) if isinstance(cache_by_phase, Mapping) else None,
+    )
+
+
+def _streaming_counters(runtime: Any) -> dict[str, Any] | None:
+    """Return aggregate counters for compatibility with existing artifacts."""
+
+    return _streaming_cache_metrics(runtime)[0]
+
+
+def _cache_hit_rate(counters: Any) -> float | None:
+    if not isinstance(counters, Mapping):
+        return None
+    hit_rate = counters.get("hit_rate")
+    if isinstance(hit_rate, (int, float)) and not isinstance(hit_rate, bool):
+        return float(hit_rate)
+    hits = counters.get("expert_hits")
+    misses = counters.get("expert_misses")
+    if not all(
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        for value in (hits, misses)
+    ):
+        return None
+    return _ratio(hits, hits + misses)
+
+
+def _require_decode_cache_metrics(
+    cache_by_phase: Any, *, model: str, depth: int
+) -> tuple[dict[str, Any], float]:
+    decode = (
+        cache_by_phase.get("decode") if isinstance(cache_by_phase, Mapping) else None
+    )
+    if not isinstance(decode, Mapping):
+        raise BenchmarkGateError(
+            f"{model} d{depth} did not expose decode expert-cache counters"
+        )
+    for name in ("expert_hits", "expert_misses"):
+        value = decode.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise BenchmarkGateError(
+                f"{model} d{depth} decode expert-cache {name} is invalid"
+            )
+    hits = int(decode["expert_hits"])
+    misses = int(decode["expert_misses"])
+    denominator = hits + misses
+    if denominator <= 0:
+        raise BenchmarkGateError(
+            f"{model} d{depth} decode expert-cache has no routed assignments"
+        )
+    hit_rate = hits / denominator
+    reported_hit_rate = decode.get("hit_rate")
+    if (
+        isinstance(reported_hit_rate, bool)
+        or not isinstance(reported_hit_rate, (int, float))
+        or not math.isfinite(float(reported_hit_rate))
+    ):
+        raise BenchmarkGateError(
+            f"{model} d{depth} decode expert-cache hit rate is invalid"
+        )
+    if not math.isclose(float(reported_hit_rate), hit_rate, abs_tol=1e-12):
+        raise BenchmarkGateError(
+            f"{model} d{depth} decode expert-cache hit rate disagrees with counts"
+        )
+    return dict(decode), hit_rate
 
 
 def _resource_telemetry(runtime: Any) -> dict[str, Any] | None:
@@ -714,6 +782,12 @@ def _run_observation(
     if not guards_disabled:
         raise BenchmarkGateError(f"{model} d{depth} triggered a generation guard")
 
+    streaming_counters, streaming_counters_by_phase = _streaming_cache_metrics(runtime)
+    _decode_streaming_counters, decode_cache_hit_rate = _require_decode_cache_metrics(
+        streaming_counters_by_phase,
+        model=model,
+        depth=depth,
+    )
     row = {
         "model": model,
         "context_tokens": context_tokens,
@@ -729,7 +803,9 @@ def _run_observation(
         "finish_reason": finish_reason,
         "token_ids": tokens,
         **_metrics(stats, completion_tokens=len(tokens), depth=depth),
-        "expert_streaming_counters": _streaming_counters(runtime),
+        "expert_streaming_counters": streaming_counters,
+        "expert_streaming_counters_by_phase": streaming_counters_by_phase,
+        "decode_expert_cache_hit_rate": decode_cache_hit_rate,
         "expert_resource_telemetry": (
             {
                 "before": resource_before,
@@ -753,6 +829,7 @@ def _run_observation(
             "effective_depth_exact": effective_exact,
             "committed_history": committed_history,
             "guards_disabled": guards_disabled,
+            "decode_expert_cache_metrics": True,
         },
     }
     if not row["gates"]["new_prefill_tokens_exact"]:

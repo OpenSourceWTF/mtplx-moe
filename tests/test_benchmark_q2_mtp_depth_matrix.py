@@ -55,8 +55,21 @@ class _FakeRuntime:
             "cache": {
                 "route_calls": self.expert_streaming.reset_calls,
                 "expert_hits": 3,
-                "expert_misses": 1,
-            }
+                "expert_misses": 3,
+                "hit_rate": 0.5,
+            },
+            "cache_by_phase": {
+                "prefill": {
+                    "expert_hits": 1,
+                    "expert_misses": 2,
+                    "hit_rate": 1 / 3,
+                },
+                "decode": {
+                    "expert_hits": 2,
+                    "expert_misses": 1,
+                    "hit_rate": 2 / 3,
+                },
+            },
         }
 
     def expert_resource_telemetry_snapshot(self):
@@ -582,6 +595,19 @@ def test_rows_recompute_ingestion_decode_and_acceptance_metrics(tmp_path: Path) 
     assert depth_two["prompt_target_prefill_time_s"] == 4.0
     assert depth_two["prompt_target_prefill_tok_s"] == 256.0
     assert depth_two["decode_tok_s"] == 16.0
+    assert depth_two["expert_streaming_counters_by_phase"] == {
+        "prefill": {
+            "expert_hits": 1,
+            "expert_misses": 2,
+            "hit_rate": pytest.approx(1 / 3),
+        },
+        "decode": {
+            "expert_hits": 2,
+            "expert_misses": 1,
+            "hit_rate": pytest.approx(2 / 3),
+        },
+    }
+    assert depth_two["decode_expert_cache_hit_rate"] == pytest.approx(2 / 3)
     assert depth_two["peak_memory_bytes"] == 3 * 1024**3
     assert payload["models"][0]["hard_peak_memory_bytes"] == 5 * 1024**3
     assert calls.configs[0]["resource_telemetry"] is True
@@ -640,6 +666,7 @@ def test_rows_recompute_ingestion_decode_and_acceptance_metrics(tmp_path: Path) 
         "effective_depth_exact": True,
         "committed_history": True,
         "guards_disabled": True,
+        "decode_expert_cache_metrics": True,
     }
 
 
@@ -665,6 +692,54 @@ def test_exact_prompt_and_output_gates_fail_closed(tmp_path: Path) -> None:
     with pytest.raises(module.BenchmarkGateError, match="prompt builder returned"):
         module.run_depth_matrix(
             [_requests(tmp_path)[0]], contexts=(1024,), apis=bad_apis
+        )
+
+
+def test_decode_expert_cache_metrics_are_required_evidence(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, _calls = _fake_apis(module)
+    original_load = apis.load
+
+    def load_without_phase_counters(*args, **kwargs):
+        runtime = original_load(*args, **kwargs)
+        runtime.expert_streaming_snapshot = lambda: {
+            "cache": {"expert_hits": 3, "expert_misses": 1, "hit_rate": 0.75}
+        }
+        return runtime
+
+    apis.load = load_without_phase_counters
+
+    with pytest.raises(module.BenchmarkGateError, match="decode expert-cache"):
+        module.run_depth_matrix([_requests(tmp_path)[0]], contexts=(1024,), apis=apis)
+
+
+def test_decode_expert_cache_metrics_reject_empty_or_stale_ratios() -> None:
+    module = _load_module()
+
+    with pytest.raises(module.BenchmarkGateError, match="no routed assignments"):
+        module._require_decode_cache_metrics(
+            {
+                "decode": {
+                    "expert_hits": 0,
+                    "expert_misses": 0,
+                    "hit_rate": 0.0,
+                }
+            },
+            model="hy3-q2",
+            depth=1,
+        )
+
+    with pytest.raises(module.BenchmarkGateError, match="disagrees"):
+        module._require_decode_cache_metrics(
+            {
+                "decode": {
+                    "expert_hits": 2,
+                    "expert_misses": 1,
+                    "hit_rate": 0.5,
+                }
+            },
+            model="hy3-q2",
+            depth=1,
         )
 
 

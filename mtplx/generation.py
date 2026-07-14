@@ -3937,6 +3937,12 @@ def _rollback_mtp_cache(mtp_cache, offset: int) -> None:
     if not mtp_cache:
         return
     for cache in mtp_cache:
+        rollback_to = getattr(cache, "rollback_to", None)
+        if callable(rollback_to):
+            # Backend-owned cycle metadata may need committing even when the
+            # physical offset is already at the requested boundary.
+            rollback_to(offset)
+            continue
         current = int(getattr(cache, "offset", 0))
         trim = max(0, current - offset)
         if trim and hasattr(cache, "trim"):
@@ -6108,6 +6114,12 @@ def generate_mtpk(
             event["mtp_topk_reranker"] = mtp_topk_reranker.to_dict()
         step += 1
         if len(tokens) >= max_tokens or _is_stop(primary, stop_token_ids):
+            # The primary has been emitted but has not yet been consumed by
+            # either the target cache or committed MTP history.  Preserve it
+            # for the final-state synchronization path before advertising the
+            # captured state as safe for a resumed request.
+            pending_primary = primary
+            event["pending_primary"] = int(primary)
             append_event(event)
             emit_trace()
             break

@@ -534,7 +534,7 @@ def test_glm52_recurrent_depth_requires_a_persistent_cache(
         )
 
 
-def test_glm52_cache_keeps_only_d1_committed_and_snapshots_exclude_scratch() -> None:
+def test_glm52_cache_snapshots_exclude_recurrent_scratch() -> None:
     from mlx_lm.models.cache import KVCache
 
     from mtplx.glm52_mtp_patch import GLM52MTPCache
@@ -553,9 +553,10 @@ def test_glm52_cache_keeps_only_d1_committed_and_snapshots_exclude_scratch() -> 
 
     snapshot = snapshot_cache([cache])
     cache.finish_cycle()
-    assert cache.main_kv.offset == 1
+    assert cache.main_kv.offset == 4
     assert cache.indexer_kv.offset == 1
-    assert cache.cycle is None
+    assert cache.cycle is not None
+    assert cache.cycle.finished is True
 
     _append(cache.main_kv, 2)
     _append(cache.indexer_kv, 2)
@@ -563,6 +564,101 @@ def test_glm52_cache_keeps_only_d1_committed_and_snapshots_exclude_scratch() -> 
     assert cache.main_kv.offset == 1
     assert cache.indexer_kv.offset == 1
     assert cache.cycle is None
+
+
+def test_glm52_cache_preserves_recurrent_main_kv_until_explicit_rollback() -> None:
+    """IndexShare reuses D1 indices; it does not discard D2+ attention KV."""
+
+    from mlx_lm.models.cache import KVCache
+
+    from mtplx.glm52_mtp_patch import GLM52MTPCache
+
+    cache = GLM52MTPCache(KVCache(), KVCache(), index_topk=4)
+    _append(cache.main_kv, 2)
+    _append(cache.indexer_kv, 2)
+    cache.begin_cycle()
+    _append(cache.main_kv, 1)
+    _append(cache.indexer_kv, 1)
+    topk = mx.array([[[[0]]]], dtype=mx.uint32)
+    cache.finish_d1(topk_indices=topk)
+    _append(cache.main_kv, 2)
+
+    recurrent_state = cache.recurrent_view()
+    assert not isinstance(recurrent_state, tuple)
+    assert mx.array_equal(recurrent_state, topk).item()
+
+    cache.finish_cycle()
+    assert cache.main_kv.offset == 5
+    assert cache.indexer_kv.offset == 3
+
+    cache.rollback_to(3)
+    assert cache.main_kv.offset == 3
+    assert cache.indexer_kv.offset == 3
+
+
+def test_glm52_finished_cycle_retains_rollback_ownership() -> None:
+    from mlx_lm.models.cache import KVCache
+
+    from mtplx.glm52_mtp_patch import GLM52MTPCache
+
+    cache = GLM52MTPCache(KVCache(), KVCache(), index_topk=4)
+    _append(cache.main_kv, 2)
+    _append(cache.indexer_kv, 2)
+    cache.begin_cycle()
+    _append(cache.main_kv, 1)
+    _append(cache.indexer_kv, 1)
+    cache.finish_d1(topk_indices=mx.array([[[[0]]]], dtype=mx.uint32))
+    _append(cache.main_kv, 2)
+
+    cache.finish_cycle()
+
+    assert cache.cycle is not None
+    assert cache.cycle.finished is True
+    snapshot = snapshot_cache([cache])
+    restored = GLM52MTPCache(KVCache(), KVCache(), index_topk=4)
+    restore_cache([restored], snapshot)
+    assert restored.main_kv.offset == 3
+    assert restored.indexer_kv.offset == 3
+
+    # A later request can recover after verification failed before the normal
+    # accepted-boundary rollback. It must discard this cycle's D1 and D2+ KV.
+    cache.begin_cycle()
+    assert cache.main_kv.offset == 2
+    assert cache.indexer_kv.offset == 2
+    assert cache.cycle is not None
+    assert cache.cycle.base_offset == 2
+    assert cache.cycle.finished is False
+
+
+def test_glm52_zero_delta_rollback_releases_finished_cycle() -> None:
+    from mlx_lm.models.cache import KVCache
+
+    from mtplx.generation import _rollback_mtp_cache
+    from mtplx.glm52_mtp_patch import GLM52MTPCache
+
+    cache = GLM52MTPCache(KVCache(), KVCache(), index_topk=4)
+    _append(cache.main_kv, 2)
+    _append(cache.indexer_kv, 2)
+    cache.begin_cycle()
+    _append(cache.main_kv, 1)
+    _append(cache.indexer_kv, 1)
+    cache.finish_d1(topk_indices=mx.array([[[[0]]]], dtype=mx.uint32))
+    cache.finish_cycle()
+
+    # D1 is already at the accepted boundary, so no physical trim is needed.
+    # The generic generation helper must still release rollback ownership.
+    _rollback_mtp_cache([cache], 3)
+    assert cache.cycle is None
+    assert cache.main_kv.offset == 3
+    assert cache.indexer_kv.offset == 3
+
+    _append(cache.main_kv, 1)
+    _append(cache.indexer_kv, 1)
+    cache.begin_cycle()
+    assert cache.offset == 4
+    assert cache.indexer_kv.offset == 4
+    assert cache.cycle is not None
+    assert cache.cycle.base_offset == 4
 
 
 @pytest.mark.parametrize(
@@ -588,12 +684,10 @@ def test_glm52_cache_distinguishes_dense_prefix_from_missing_full_indexer_result
             cache.finish_d1(topk_indices=None)
     else:
         cache.finish_d1(topk_indices=None)
-        topk_indices, boundary = cache.recurrent_view()
-        assert topk_indices is None
-        assert boundary == indexed_length
+        assert cache.recurrent_view() is None
 
 
-def test_glm52_injection_shares_target_heads_and_reuses_indexer_across_d1_d5(
+def test_glm52_injection_shares_target_heads_and_only_reuses_d1_indexer_topk(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -635,6 +729,15 @@ def test_glm52_injection_shares_target_heads_and_reuses_indexer_across_d1_d5(
             return indexer(*call_args, **call_kwargs)
 
     model.mtp.layers[0].mtp_block.self_attn.indexer = CountingIndexer()
+    original_block = model.mtp.layers[0].mtp_block
+    kv_read_boundaries: list[int | None] = []
+
+    class RecordingBlock:
+        def __call__(self, *call_args, **call_kwargs):
+            kv_read_boundaries.append(call_kwargs.get("kv_read_boundary"))
+            return original_block(*call_args, **call_kwargs)
+
+    model.mtp.layers[0].mtp_block = RecordingBlock()
     hidden = mx.zeros((1, 1, args.hidden_size), dtype=mx.bfloat16)
     token = mx.array([[1]], dtype=mx.int32)
     main_offsets = []
@@ -652,9 +755,13 @@ def test_glm52_injection_shares_target_heads_and_reuses_indexer_across_d1_d5(
         indexer_offsets.append(cache[0].indexer_kv.offset)
 
     assert calls == 1
+    assert kv_read_boundaries == [None] * 5
     assert main_offsets == [5, 6, 7, 8, 9]
     assert indexer_offsets == [5, 5, 5, 5, 5]
     model.finish_mtp_cycle(cache)
+    assert cache[0].main_kv.offset == 9
+    assert cache[0].indexer_kv.offset == 5
+    cache[0].rollback_to(5)
     assert cache[0].main_kv.offset == 5
     assert cache[0].indexer_kv.offset == 5
     assert cache[0].cycle is None

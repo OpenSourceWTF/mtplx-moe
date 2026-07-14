@@ -288,6 +288,14 @@ recomputable from raw fields.
   separately, never under the decode label.
 - **MTP hit rate by configured draft length:** accepted drafts divided by
   evaluated drafts, plus accepted drafts per verification cycle.
+- **Decode expert-cache hit rate:** read
+  `expert_streaming_counters_by_phase.decode`, using `expert_hits /
+  (expert_hits + expert_misses)`. The row also exposes the same derived value
+  as `decode_expert_cache_hit_rate`. This measures routed-expert assignments
+  served from the expert cache; it is not MTP acceptance. Do not use the
+  aggregate `expert_streaming_counters.hit_rate` as the decode headline,
+  because that aggregate also includes prompt prefill. Missing decode hits,
+  misses, or hit rate is a failed evidence gate rather than a nullable metric.
 
 ### Per-depth acceptance metrics
 

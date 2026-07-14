@@ -522,6 +522,46 @@ def test_cold_committed_history_reports_exact_rows_and_tps(monkeypatch):
     assert output.stats.prompt_mtp_history_tok_s == pytest.approx(1.5)
 
 
+@pytest.mark.parametrize(
+    ("stop_token_ids", "expected_finish_reason"),
+    [(set(), "length"), ({1}, "stop")],
+    ids=["length", "stop"],
+)
+def test_generate_mtpk_final_state_commits_terminal_primary_to_both_caches(
+    stop_token_ids: set[int], expected_finish_reason: str
+):
+    model = PendingBonusThenRejectTinyMTPModel()
+
+    output = generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=1,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=1,
+        mtp_history_policy="committed",
+        verify_strategy="batched",
+        stop_token_ids=stop_token_ids,
+        capture_final_state=True,
+    )
+
+    assert output.tokens == [1]
+    assert output.final_state is not None
+    assert output.final_state.safe_to_commit is True
+    assert output.final_state.finish_reason == expected_finish_reason
+    assert model.target_cache_offset == 2
+    assert model.mtp_committed_offset == 1
+
+    cold_continuation = generate_ar(
+        _runtime(PendingBonusThenRejectTinyMTPModel(), mtp_enabled=False),
+        [0, 1],
+        max_tokens=1,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        stop_token_ids=set(),
+    )
+    resumed_token = int(mx.argmax(output.final_state.final_logits[0]).item())
+    assert resumed_token == cold_continuation.tokens[0] == 2
+
+
 def test_generate_mtpk_pending_bonus_then_rejection_matches_ar():
     sampler = SamplerConfig(temperature=0.6, top_p=1.0, top_k=1)
     ar_model = PendingBonusThenRejectTinyMTPModel()

@@ -50,7 +50,7 @@ def test_hy3_q4_exact_expert_layout() -> None:
     assert spec.routed_expert_bytes + spec.resident_bytes == spec.total_tensor_bytes
     assert spec.router_bytes == 66_071_808
     assert spec.router_storage == "affine-q8 with fp32 correction bias"
-    assert spec.router_matmul_dtype == "float32"
+    assert spec.router_matmul_dtype == "activation_dtype"
     assert spec.source_revision == "716aa7241bd6d95896be4ebfc761162a9c4d49ef"
     assert spec.quant_revision == "160619d3f96c8470350b6dac0ef033a8381551e3"
     assert spec.kv_bytes_per_token == 327_680
@@ -116,7 +116,7 @@ def test_hy3_q4_is_unchanged_by_hy3_expert_q2_registry_expansion() -> None:
         "quant_group_size": 64,
         "quant_parameter_bytes": 2,
         "router_storage": "affine-q8 with fp32 correction bias",
-        "router_matmul_dtype": "float32",
+        "router_matmul_dtype": "activation_dtype",
         "router_bytes": 66_071_808,
         "kv_bytes_per_token": 327_680,
         "mtp_layer_index": 80,
@@ -209,7 +209,7 @@ def test_existing_descriptors_are_unchanged_by_glm52_expert_q2_registry_expansio
     None
 ):
     expected_digests = {
-        "hy3-q4": "533a0ef2255a5db82374d8c7731c95ae5ddda5251c290de3b667c2954954fb87",
+        "hy3-q4": "c907c56bf100c7701fc2e2e0554b54ff71c3b0b2bd5a90aef25522aaea068698",
         "hy3-expert-only-q4": "22f6af1e3dd702ab968af86ce31ba50308ebae62e7ee638587d79ddd75187373",
         "hy3-expert-q2": "dfc46bf9641b64bc8119361032a1cc1d0f11a60f751887494a37f9c041ab32ed",
         "glm52-q4": "09813b5e03a43226212adbee85ac3cc7df92fa4ca693c4f46505ca3f4c278a5d",

@@ -2,7 +2,7 @@
 
 GLM-5.2 uses the DeepSeek-style NextN fusion sequence, but its trained head
 is not a stock DeepSeek decoder: it owns GLM DSA indexer weights, uses FP32
-MoE routing, and recurrently shares the D1 index/KV view through D5.  This
+MoE routing, and recurrently shares the D1 index selection through D5.  This
 module mirrors the fail-closed external-artifact boundary used by Hy3 while
 keeping the already-working streamed GLM target unchanged.
 """
@@ -46,6 +46,7 @@ class GLM52MTPCycleState:
     d1_boundary: int | None = None
     topk_indices: Any | None = None
     topk_computed: bool = False
+    finished: bool = False
 
 
 class GLM52MTPCache:
@@ -152,7 +153,7 @@ class GLM52MTPCache:
 
     def begin_cycle(self) -> None:
         if self.cycle is not None:
-            self.finish_cycle()
+            self.abort_cycle()
         if int(self.indexer_kv.offset) != self.offset:
             raise Glm52MTPLoadError(
                 "GLM MTP committed MLA/indexer offsets diverged before D1: "
@@ -164,6 +165,8 @@ class GLM52MTPCache:
         state = self.cycle
         if state is None:
             raise Glm52MTPLoadError("GLM MTP D1 completed outside a draft cycle")
+        if state.finished:
+            raise Glm52MTPLoadError("GLM MTP D1 completed after its draft cycle")
         expected = state.base_offset + 1
         if self.offset != expected or int(self.indexer_kv.offset) != expected:
             raise Glm52MTPLoadError(
@@ -177,19 +180,36 @@ class GLM52MTPCache:
         state.topk_indices = topk_indices
         state.topk_computed = True
 
-    def recurrent_view(self) -> tuple[Any | None, int]:
+    def recurrent_view(self) -> Any | None:
         state = self.cycle
-        if state is None or not state.topk_computed or state.d1_boundary is None:
+        if (
+            state is None
+            or state.finished
+            or not state.topk_computed
+            or state.d1_boundary is None
+        ):
             raise Glm52MTPLoadError("GLM MTP D2+ requires a completed D1 state")
-        return state.topk_indices, state.d1_boundary
+        return state.topk_indices
 
     def finish_cycle(self) -> None:
+        """End index sharing without discarding recurrent main-attention KV.
+
+        The generation loop rolls speculative entries back to the accepted
+        boundary after target verification.  D2+ advances the normal MTP
+        attention cache even though it reuses D1's DSA top-k indices.
+        """
+
+        state = self.cycle
+        if state is not None:
+            state.finished = True
+
+    def abort_cycle(self) -> None:
+        """Discard every append from an incomplete or failed draft cycle."""
+
         state = self.cycle
         if state is None:
             return
-        target = (
-            state.d1_boundary if state.d1_boundary is not None else state.base_offset
-        )
+        target = state.base_offset
         for child in (self.main_kv, self.indexer_kv):
             excess = max(0, int(child.offset) - int(target))
             if excess:
@@ -565,13 +585,12 @@ def inject_glm52_streamed_mtp_support(
                     raise TypeError("GLM-5.2 MTP requires GLM52MTPCache")
 
             topk_indices = None
-            boundary = None
             compute_topk = True
             if layer_cache is not None:
                 if depth == 1:
                     layer_cache.begin_cycle()
                 else:
-                    topk_indices, boundary = layer_cache.recurrent_view()
+                    topk_indices = layer_cache.recurrent_view()
                     compute_topk = False
             try:
                 logits, hidden, produced_topk = self.mtp.layers[0](
@@ -582,13 +601,13 @@ def inject_glm52_streamed_mtp_support(
                     cache=layer_cache,
                     prev_topk_indices=topk_indices,
                     compute_topk=compute_topk,
-                    kv_read_boundary=boundary,
+                    kv_read_boundary=None,
                 )
                 if layer_cache is not None and depth == 1:
                     layer_cache.finish_d1(topk_indices=produced_topk)
             except BaseException:
                 if layer_cache is not None:
-                    layer_cache.finish_cycle()
+                    layer_cache.abort_cycle()
                 raise
             if not return_hidden:
                 return logits

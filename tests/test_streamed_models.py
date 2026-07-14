@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 import pytest
 from mlx.utils import tree_flatten
@@ -123,6 +124,143 @@ def test_hy3_router_uses_unbiased_scores_for_weights() -> None:
     assert indices.item() == 1
     # Correction bias selects expert 1 but is not part of its returned weight.
     assert weights.item() == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize(
+    ("hidden_dtype", "weight_dtype"),
+    [
+        (mx.bfloat16, mx.bfloat16),
+        (mx.float32, mx.bfloat16),
+        (mx.bfloat16, mx.float32),
+        (mx.float32, mx.float32),
+    ],
+    ids=("bf16-bf16", "fp32-bf16", "bf16-fp32", "fp32-fp32"),
+)
+def test_hy3_router_projects_source_weights_and_activations_in_fp32(
+    hidden_dtype, weight_dtype
+) -> None:
+    model = Hy3Model(_hy3_args())
+    router = model.model.layers[1].mlp.router
+    router.route_norm = False
+    router.gate.weight = mx.array(
+        [
+            [0.1] * 64,
+            [0.0] * 64,
+        ],
+        dtype=weight_dtype,
+    )
+    router.expert_bias = mx.zeros((2,), dtype=mx.float32)
+    hidden = mx.full((1, 1, 64), 0.1, dtype=hidden_dtype)
+
+    indices, weights = router(hidden)
+    reference_logits = (
+        hidden.astype(mx.float32) @ router.gate.weight.astype(mx.float32).T
+    )
+    reference_scores = mx.sigmoid(reference_logits)
+    expected_weight = reference_scores[..., 0] * router.router_scaling_factor
+    mx.eval(indices, weights, expected_weight)
+
+    assert indices.item() == 0
+    assert weights.dtype == mx.float32
+    assert weights.item() == pytest.approx(expected_weight.item(), abs=1e-7)
+
+
+def test_hy3_router_keeps_bf16_gate_wrappers_on_the_fp32_call_path() -> None:
+    from mtplx.mtp_activation_stats import ActivationStatsLinear
+
+    model = Hy3Model(_hy3_args())
+    router = model.model.layers[1].mlp.router
+    router.route_norm = False
+    router.gate.weight = mx.array(
+        [[0.1] * 64, [0.0] * 64],
+        dtype=mx.bfloat16,
+    )
+    recorder = ActivationStatsLinear(router.gate, target="mtp.router.gate")
+    router.gate = recorder
+    hidden = mx.full((1, 1, 64), 0.1, dtype=mx.bfloat16)
+
+    indices, weights = router(hidden)
+    reference_logits = (
+        hidden.astype(mx.float32) @ recorder.base.weight.astype(mx.float32).T
+    )
+    expected_weight = mx.sigmoid(reference_logits)[..., 0] * 2.0
+    mx.eval(indices, weights, expected_weight)
+
+    assert recorder.calls == 1
+    assert recorder.rows == 1
+    assert indices.item() == 0
+    assert weights.item() == pytest.approx(expected_weight.item(), abs=1e-7)
+
+
+def test_hy3_router_preserves_affine_q8_activation_dtype_projection() -> None:
+    model = Hy3Model(_hy3_args())
+    router = model.model.layers[1].mlp.router
+    router.route_norm = False
+    source_gate = nn.Linear(64, 2, bias=False)
+    source_gate.weight = mx.array(
+        [
+            [0.1] * 64,
+            [0.0] * 64,
+        ],
+        dtype=mx.bfloat16,
+    )
+    router.gate = nn.QuantizedLinear.from_linear(
+        source_gate,
+        group_size=64,
+        bits=8,
+        mode="affine",
+    )
+    router.expert_bias = mx.zeros((2,), dtype=mx.float32)
+    hidden = mx.full((1, 1, 64), 0.1, dtype=mx.bfloat16)
+
+    indices, weights = router(hidden)
+    reference_scores = mx.sigmoid(router.gate(hidden).astype(mx.float32))
+    expected_weight = reference_scores[..., 0] * router.router_scaling_factor
+    mx.eval(indices, weights, expected_weight)
+
+    assert indices.item() == 0
+    assert weights.dtype == mx.float32
+    assert weights.item() == pytest.approx(expected_weight.item(), abs=1e-7)
+
+
+def test_hy3_router_preserves_wrapped_affine_q8_activation_dtype() -> None:
+    class RecordingWrapper(nn.Module):
+        def __init__(self, base: nn.Module) -> None:
+            super().__init__()
+            self.base = base
+            self.input_dtype = None
+
+        def __call__(self, x):
+            self.input_dtype = x.dtype
+            return self.base(x)
+
+    model = Hy3Model(_hy3_args())
+    router = model.model.layers[1].mlp.router
+    router.route_norm = False
+    source_gate = nn.Linear(64, 2, bias=False)
+    source_gate.weight = mx.array(
+        [[0.1] * 64, [0.0] * 64],
+        dtype=mx.bfloat16,
+    )
+    quantized_gate = nn.QuantizedLinear.from_linear(
+        source_gate,
+        group_size=64,
+        bits=8,
+        mode="affine",
+    )
+    wrapper = RecordingWrapper(quantized_gate)
+    router.gate = wrapper
+    router.expert_bias = mx.zeros((2,), dtype=mx.float32)
+    hidden = mx.full((1, 1, 64), 0.1, dtype=mx.bfloat16)
+    reference_scores = mx.sigmoid(quantized_gate(hidden).astype(mx.float32))
+    expected_weight = reference_scores[..., 0] * router.router_scaling_factor
+
+    indices, weights = router(hidden)
+    mx.eval(indices, weights, expected_weight)
+
+    assert wrapper.input_dtype == mx.bfloat16
+    assert indices.item() == 0
+    assert weights.item() == pytest.approx(expected_weight.item(), abs=1e-7)
 
 
 def test_hy3_non_fp32_combine_casts_routing_weights_to_activation_dtype() -> None:
