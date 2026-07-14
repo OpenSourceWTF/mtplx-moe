@@ -72,6 +72,10 @@ class BenchmarkConfigurationError(ValueError):
 class BenchmarkGateError(RuntimeError):
     """Raised as soon as a correctness or metric gate fails."""
 
+    def __init__(self, message: str, *, evidence: Mapping[str, Any] | None = None):
+        super().__init__(message)
+        self.evidence = dict(evidence) if evidence is not None else None
+
 
 Checkpoint = Callable[[Mapping[str, Any]], None]
 
@@ -652,6 +656,54 @@ def _require_decode_cache_metrics(
     return dict(decode), hit_rate
 
 
+def _parity_failure_evidence(
+    *,
+    runtime: Any,
+    model: str,
+    context_tokens: int,
+    depth: int,
+    tokens: Sequence[int],
+    expected_tokens: Sequence[int],
+    stats: Any,
+    resource_before: Any,
+    resource_after: Any,
+) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "model": model,
+        "context_tokens": int(context_tokens),
+        "depth": int(depth),
+        "token_ids": [int(token) for token in tokens],
+        "expected_ar_token_ids": [int(token) for token in expected_tokens],
+        "first_divergence": _first_divergence(tokens, expected_tokens),
+        "generation_events": _jsonable(_field(stats, "events", [])),
+    }
+    try:
+        evidence.update(
+            _metrics(stats, completion_tokens=len(tokens), depth=int(depth))
+        )
+    except BenchmarkGateError as exc:
+        evidence["metric_extraction_error"] = str(exc)
+    streaming_counters, cache_by_phase = _streaming_cache_metrics(runtime)
+    evidence["expert_streaming_counters"] = streaming_counters
+    evidence["expert_streaming_counters_by_phase"] = cache_by_phase
+    try:
+        _decode, hit_rate = _require_decode_cache_metrics(
+            cache_by_phase,
+            model=model,
+            depth=depth,
+        )
+        evidence["decode_expert_cache_hit_rate"] = hit_rate
+    except BenchmarkGateError as exc:
+        evidence["decode_cache_metric_error"] = str(exc)
+    if resource_before is not None or resource_after is not None:
+        evidence["expert_resource_telemetry"] = {
+            "before": resource_before,
+            "after": resource_after,
+            "numeric_delta": _numeric_delta(resource_before, resource_after),
+        }
+    return evidence
+
+
 def _resource_telemetry(runtime: Any) -> dict[str, Any] | None:
     snapshot_fn = getattr(runtime, "expert_resource_telemetry_snapshot", None)
     if not callable(snapshot_fn):
@@ -766,9 +818,21 @@ def _run_observation(
     committed_history = depth == 0 or history_policy == "committed"
     guards_disabled = _guards_disabled(stats)
     if not ar_token_parity:
-        divergence = _first_divergence(tokens, ar_tokens or [])
+        expected_tokens = list(ar_tokens or [])
+        divergence = _first_divergence(tokens, expected_tokens)
         raise BenchmarkGateError(
-            f"{model} d{depth} diverged from AR at output token {divergence}"
+            f"{model} d{depth} diverged from AR at output token {divergence}",
+            evidence=_parity_failure_evidence(
+                runtime=runtime,
+                model=model,
+                context_tokens=context_tokens,
+                depth=depth,
+                tokens=tokens,
+                expected_tokens=expected_tokens,
+                stats=stats,
+                resource_before=resource_before,
+                resource_after=resource_after,
+            ),
         )
     if not ar_finish_parity:
         raise BenchmarkGateError(f"{model} d{depth} finish reason diverged from AR")
@@ -988,6 +1052,9 @@ def run_depth_matrix(
             "error_type": type(exc).__name__,
             "active_cell": active_cell,
         }
+        evidence = getattr(exc, "evidence", None)
+        if isinstance(evidence, Mapping):
+            failed["failure"]["evidence"] = _jsonable(evidence)
         _emit_checkpoint(failed, checkpoint)
         raise
 
@@ -1419,6 +1486,12 @@ def main(argv: Sequence[str] | None = None, *, apis: RunnerAPIs | None = None) -
         else:
             failed = latest_checkpoint
             active_cell = copy.deepcopy(failed.get("active_cell"))
+            checkpoint_failure = failed.get("failure")
+            checkpoint_evidence = (
+                checkpoint_failure.get("evidence")
+                if isinstance(checkpoint_failure, Mapping)
+                else None
+            )
             failed["status"] = "failed"
             failed["passed"] = False
             failed["failure"] = {
@@ -1426,6 +1499,8 @@ def main(argv: Sequence[str] | None = None, *, apis: RunnerAPIs | None = None) -
                 "error_type": type(exc).__name__,
                 "active_cell": active_cell,
             }
+            if isinstance(checkpoint_evidence, Mapping):
+                failed["failure"]["evidence"] = _jsonable(checkpoint_evidence)
         rendered_failure = json.dumps(
             failed,
             indent=2 if latest_checkpoint is not None else None,

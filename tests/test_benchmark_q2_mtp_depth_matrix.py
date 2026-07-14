@@ -407,7 +407,9 @@ def test_runner_emits_live_terminal_failure_checkpoint(
     assert failed["status"] == "failed"
     assert failed["passed"] is False
     assert [row["cell"] for row in failed["models"][0]["observations"]] == ["ar"]
-    assert failed["failure"] == {
+    assert {
+        key: failed["failure"][key] for key in ("error", "error_type", "active_cell")
+    } == {
         "error": "hy3-q2 d1 diverged from AR at output token 127",
         "error_type": "BenchmarkGateError",
         "active_cell": {
@@ -418,6 +420,8 @@ def test_runner_emits_live_terminal_failure_checkpoint(
             "phase": "retained",
         },
     }
+    assert failed["failure"]["evidence"]["first_divergence"] == 127
+    assert len(failed["failure"]["evidence"]["token_ids"]) == 128
 
 
 def test_runner_preserves_primary_gate_when_runtime_close_also_fails(
@@ -695,6 +699,44 @@ def test_exact_prompt_and_output_gates_fail_closed(tmp_path: Path) -> None:
         )
 
 
+def test_failed_parity_cell_retains_its_observation_evidence(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, _calls = _fake_apis(module)
+    original = apis.generate_mtpk
+
+    def mismatch_retained_d2(runtime, prompt_ids, **kwargs):
+        result = original(runtime, prompt_ids, **kwargs)
+        if kwargs["max_tokens"] == 128 and kwargs["speculative_depth"] == 2:
+            result.tokens[-1] += 1
+        return result
+
+    apis.generate_mtpk = mismatch_retained_d2
+    snapshots = []
+
+    with pytest.raises(module.BenchmarkGateError, match="diverged from AR"):
+        module.run_depth_matrix(
+            [_requests(tmp_path)[0]],
+            contexts=(1024,),
+            checkpoint=snapshots.append,
+            apis=apis,
+        )
+
+    failure = snapshots[-1]["failure"]
+    evidence = failure["evidence"]
+    assert evidence["model"] == "hy3-q2"
+    assert evidence["depth"] == 2
+    assert evidence["first_divergence"] == 127
+    assert len(evidence["token_ids"]) == 128
+    assert len(evidence["expected_ar_token_ids"]) == 128
+    assert evidence["accepted_drafts"] == 9
+    assert evidence["decode_expert_cache_hit_rate"] == pytest.approx(2 / 3)
+    assert evidence["expert_streaming_counters_by_phase"]["decode"] == {
+        "expert_hits": 2,
+        "expert_misses": 1,
+        "hit_rate": pytest.approx(2 / 3),
+    }
+
+
 def test_decode_expert_cache_metrics_are_required_evidence(tmp_path: Path) -> None:
     module = _load_module()
     apis, _calls = _fake_apis(module)
@@ -867,6 +909,11 @@ def test_main_persists_completed_ar_when_retained_d1_fails(
         "cell": "d1",
         "phase": "retained",
     }
+    assert saved["failure"]["evidence"]["first_divergence"] == 127
+    assert len(saved["failure"]["evidence"]["token_ids"]) == 128
+    assert saved["failure"]["evidence"]["decode_expert_cache_hit_rate"] == (
+        pytest.approx(2 / 3)
+    )
     assert json.loads(capsys.readouterr().out) == saved
     assert list(tmp_path.glob(".partial.json.tmp-*")) == []
 
