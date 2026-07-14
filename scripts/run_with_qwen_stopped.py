@@ -69,6 +69,8 @@ class _SignalRelay:
             os.killpg(process_group_id, 0)
         except ProcessLookupError:
             return False
+        except PermissionError:
+            return True
         return True
 
     @staticmethod
@@ -110,28 +112,31 @@ class _SignalRelay:
         process_group_id = self.process_group_id
         if process_group_id is None:
             return
-        while self._group_exists(process_group_id):
+        while True:
             process.poll()
+            if not self._group_exists(process_group_id):
+                return
             if deadline is not None and time.monotonic() >= deadline:
                 return
             time.sleep(_GROUP_POLL_SECONDS)
 
     def _terminate_process_group(self, process: Any) -> None:
         process_group_id = self.process_group_id
+        process.poll()
         if process_group_id is None or not self._group_exists(process_group_id):
-            process.poll()
             return
         self._signal_group(process_group_id, signal.SIGTERM)
         self._wait_for_group_exit(
             process,
             deadline=time.monotonic() + _TERMINATION_GRACE_SECONDS,
         )
+        process.poll()
         if self._group_exists(process_group_id):
             self._signal_group(process_group_id, signal.SIGKILL)
             self._wait_for_group_exit(process, deadline=None)
+        process.poll()
         if self._group_exists(process_group_id):
             raise RuntimeError("child process group remained alive after SIGKILL")
-        process.poll()
 
     def run_child(self, command: tuple[str, ...], *, popen: PopenFactory) -> int:
         if self.received is not None:

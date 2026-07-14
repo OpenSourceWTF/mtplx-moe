@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import plistlib
 import stat
 import subprocess
+import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -24,6 +24,15 @@ EXPECTED_QWEN_MODELS = ("mtplx-qwen36-27b-optimized-speed",)
 _MAX_PLIST_BYTES = 1024 * 1024
 _MAX_API_BYTES = 1024 * 1024
 _POLL_SECONDS = 0.1
+_FETCH_MODELS_HELPER = """
+import sys
+import urllib.request
+
+response = urllib.request.urlopen(sys.argv[1], timeout=float(sys.argv[2]))
+payload = response.read(int(sys.argv[3]) + 1)
+response.close()
+sys.stdout.buffer.write(payload)
+"""
 
 
 @dataclass(frozen=True)
@@ -56,6 +65,7 @@ class _ValidatedPlist:
 
 @dataclass(frozen=True)
 class _PlistSnapshot:
+    uid: int
     path: Path
     directory_fd: int
     parent_fd: int
@@ -63,6 +73,10 @@ class _PlistSnapshot:
     directory_identity: tuple[int, int]
     plist_identity: tuple[int, int]
     plist_payload: bytes
+    wrapper_directory_fd: int | None
+    wrapper_directory_name: str | None
+    wrapper_directory_identity: tuple[int, int] | None
+    wrapper_name: str | None
     wrapper_identity: tuple[int, int] | None
     wrapper_payload: bytes | None
 
@@ -89,11 +103,27 @@ def _run_command(command: tuple[str, ...], timeout: float) -> CommandResult:
 
 
 def _fetch_models(api_url: str, timeout: float) -> tuple[str, ...] | None:
+    deadline = time.monotonic() + timeout
     try:
-        with urllib.request.urlopen(api_url, timeout=timeout) as response:  # noqa: S310
-            payload = response.read(_MAX_API_BYTES + 1)
-    except (OSError, TimeoutError, urllib.error.URLError):
+        result = subprocess.run(
+            (
+                sys.executable,
+                "-c",
+                _FETCH_MODELS_HELPER,
+                api_url,
+                str(timeout),
+                str(_MAX_API_BYTES),
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=max(0.0, deadline - time.monotonic()),
+        )
+    except (OSError, subprocess.TimeoutExpired):
         return None
+    if result.returncode != 0 or time.monotonic() >= deadline:
+        return None
+    payload = result.stdout
     if len(payload) > _MAX_API_BYTES:
         raise RuntimeError("Qwen /v1/models response exceeds its size bound")
     try:
@@ -230,6 +260,10 @@ def _load_validated_plist(plist: Path, *, uid: int) -> _ValidatedPlist:
         raise ValueError(f"Qwen plist is malformed: {exc}") from exc
     if not isinstance(value, dict) or value.get("Label") != QWEN_LABEL:
         raise ValueError(f"Qwen plist Label must be exactly {QWEN_LABEL}")
+    if "Program" in value:
+        raise ValueError(
+            "Qwen plist Program is unsupported; use validated ProgramArguments only"
+        )
     arguments = value.get("ProgramArguments")
     if (
         not isinstance(arguments, list)
@@ -290,17 +324,19 @@ def _write_snapshot_file(
         os.close(fd)
 
 
-def _read_snapshot_file(
-    snapshot: _PlistSnapshot,
+def _validate_bound_file(
+    directory_fd: int,
     name: str,
     *,
     expected_identity: tuple[int, int],
     expected_payload: bytes,
+    uid: int,
+    require_executable: bool,
 ) -> None:
     fd = os.open(
         name,
         os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-        dir_fd=snapshot.directory_fd,
+        dir_fd=directory_fd,
     )
     try:
         status = os.fstat(fd)
@@ -308,8 +344,83 @@ def _read_snapshot_file(
         payload = os.read(fd, len(expected_payload) + 1)
     finally:
         os.close(fd)
-    if identity != expected_identity or payload != expected_payload:
+    if (
+        identity != expected_identity
+        or payload != expected_payload
+        or not stat.S_ISREG(status.st_mode)
+        or status.st_nlink != 1
+        or status.st_uid != uid
+        or bool(status.st_mode & 0o022)
+        or (require_executable and not status.st_mode & stat.S_IXUSR)
+    ):
         raise RuntimeError("private Qwen plist snapshot changed before launchctl")
+
+
+def _open_wrapper_cache(
+    parent: Path,
+    *,
+    parent_fd: int,
+    uid: int,
+) -> tuple[Path, int, tuple[int, int]]:
+    name = ".mtplx-qwen-guard"
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    try:
+        directory_fd = os.open(name, _directory_flags(), dir_fd=parent_fd)
+    except OSError as exc:
+        raise ValueError(
+            f"Qwen wrapper cache must be a no-follow directory: {exc}"
+        ) from exc
+    status = os.fstat(directory_fd)
+    if (
+        not stat.S_ISDIR(status.st_mode)
+        or status.st_uid != uid
+        or bool(status.st_mode & 0o077)
+    ):
+        os.close(directory_fd)
+        raise ValueError(
+            "Qwen wrapper cache must be a private directory owned by the current user"
+        )
+    return parent / name, directory_fd, (status.st_dev, status.st_ino)
+
+
+def _cache_wrapper(
+    directory_fd: int,
+    payload: bytes,
+    *,
+    uid: int,
+) -> tuple[str, tuple[int, int]]:
+    name = f"qwen-wrapper-{hashlib.sha256(payload).hexdigest()}"
+    try:
+        identity = _write_snapshot_file(
+            directory_fd,
+            name,
+            payload,
+            mode=0o500,
+        )
+    except FileExistsError:
+        fd = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        try:
+            status = os.fstat(fd)
+            identity = (status.st_dev, status.st_ino)
+        finally:
+            os.close(fd)
+        _validate_bound_file(
+            directory_fd,
+            name,
+            expected_identity=identity,
+            expected_payload=payload,
+            uid=uid,
+            require_executable=True,
+        )
+    os.fsync(directory_fd)
+    return name, identity
 
 
 def _validate_snapshot(snapshot: _PlistSnapshot) -> None:
@@ -320,19 +431,37 @@ def _validate_snapshot(snapshot: _PlistSnapshot) -> None:
     )
     if (named.st_dev, named.st_ino) != snapshot.directory_identity:
         raise RuntimeError("private Qwen snapshot directory identity changed")
-    _read_snapshot_file(
-        snapshot,
+    _validate_bound_file(
+        snapshot.directory_fd,
         f"{QWEN_LABEL}.plist",
         expected_identity=snapshot.plist_identity,
         expected_payload=snapshot.plist_payload,
+        uid=snapshot.uid,
+        require_executable=False,
     )
     if snapshot.wrapper_payload is not None:
+        assert snapshot.wrapper_directory_fd is not None
+        assert snapshot.wrapper_directory_name is not None
+        assert snapshot.wrapper_directory_identity is not None
+        assert snapshot.wrapper_name is not None
         assert snapshot.wrapper_identity is not None
-        _read_snapshot_file(
-            snapshot,
-            "qwen-wrapper",
+        named_wrapper_directory = os.stat(
+            snapshot.wrapper_directory_name,
+            dir_fd=snapshot.parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            named_wrapper_directory.st_dev,
+            named_wrapper_directory.st_ino,
+        ) != snapshot.wrapper_directory_identity:
+            raise RuntimeError("private Qwen wrapper cache identity changed")
+        _validate_bound_file(
+            snapshot.wrapper_directory_fd,
+            snapshot.wrapper_name,
             expected_identity=snapshot.wrapper_identity,
             expected_payload=snapshot.wrapper_payload,
+            uid=snapshot.uid,
+            require_executable=True,
         )
 
 
@@ -344,6 +473,7 @@ def _validated_plist_snapshot(plist: Path, *, uid: int) -> Iterator[_PlistSnapsh
     directory: Path | None = None
     directory_fd: int | None = None
     directory_identity: tuple[int, int] | None = None
+    wrapper_directory_fd: int | None = None
     try:
         directory = Path(tempfile.mkdtemp(prefix=".mtplx-qwen-guard-", dir=parent))
         directory_fd = os.open(
@@ -358,15 +488,25 @@ def _validated_plist_snapshot(plist: Path, *, uid: int) -> Iterator[_PlistSnapsh
         wrapper_payload = source.wrapper_payload
         snapshot_value = dict(source.value)
         if wrapper_payload is not None:
-            wrapper_identity = _write_snapshot_file(
-                directory_fd,
-                "qwen-wrapper",
-                wrapper_payload,
-                mode=0o700,
+            (
+                wrapper_directory,
+                wrapper_directory_fd,
+                wrapper_directory_identity,
+            ) = _open_wrapper_cache(
+                parent,
+                parent_fd=parent_fd,
+                uid=uid,
             )
-            snapshot_value["ProgramArguments"] = [str(directory / "qwen-wrapper")]
+            wrapper_name, wrapper_identity = _cache_wrapper(
+                wrapper_directory_fd,
+                wrapper_payload,
+                uid=uid,
+            )
+            snapshot_value["ProgramArguments"] = [str(wrapper_directory / wrapper_name)]
             plist_payload = plistlib.dumps(snapshot_value)
         else:
+            wrapper_directory_identity = None
+            wrapper_name = None
             plist_payload = source.payload
         plist_identity = _write_snapshot_file(
             directory_fd,
@@ -376,6 +516,7 @@ def _validated_plist_snapshot(plist: Path, *, uid: int) -> Iterator[_PlistSnapsh
         )
         os.fsync(directory_fd)
         snapshot = _PlistSnapshot(
+            uid=uid,
             path=directory / f"{QWEN_LABEL}.plist",
             directory_fd=directory_fd,
             parent_fd=parent_fd,
@@ -383,6 +524,12 @@ def _validated_plist_snapshot(plist: Path, *, uid: int) -> Iterator[_PlistSnapsh
             directory_identity=directory_identity,
             plist_identity=plist_identity,
             plist_payload=plist_payload,
+            wrapper_directory_fd=wrapper_directory_fd,
+            wrapper_directory_name=(
+                wrapper_directory.name if wrapper_payload is not None else None
+            ),
+            wrapper_directory_identity=wrapper_directory_identity,
+            wrapper_name=wrapper_name,
             wrapper_identity=wrapper_identity,
             wrapper_payload=wrapper_payload,
         )
@@ -390,6 +537,9 @@ def _validated_plist_snapshot(plist: Path, *, uid: int) -> Iterator[_PlistSnapsh
         yield snapshot
     finally:
         try:
+            if wrapper_directory_fd is not None:
+                os.close(wrapper_directory_fd)
+                wrapper_directory_fd = None
             if directory_fd is not None:
                 for name in (f"{QWEN_LABEL}.plist", "qwen-wrapper"):
                     try:

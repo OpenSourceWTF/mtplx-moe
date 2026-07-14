@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import importlib.util
+import http.server
+import json
 import os
 import plistlib
 import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -306,6 +309,85 @@ def test_default_command_runner_kills_stuck_observation_at_deadline() -> None:
     assert time.monotonic() - started < 0.5
 
 
+def test_default_model_fetcher_enforces_total_slow_drip_deadline() -> None:
+    payload = json.dumps(
+        {"data": [{"id": EXPECTED_QWEN_MODELS[0]}]},
+        separators=(",", ":"),
+    ).encode()
+
+    class SlowDripHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                for value in payload:
+                    self.wfile.write(bytes((value,)))
+                    self.wfile.flush()
+                    time.sleep(0.01)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, _format: str, *args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SlowDripHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        result = qwen_guard_module._fetch_models(
+            f"http://127.0.0.1:{server.server_port}/v1/models",
+            timeout=0.05,
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1.0)
+
+    assert result is None
+    assert elapsed < 0.15
+
+
+def test_default_model_fetcher_returns_fast_valid_model_list() -> None:
+    payload = json.dumps(
+        {"data": [{"id": EXPECTED_QWEN_MODELS[0]}]},
+        separators=(",", ":"),
+    ).encode()
+
+    class ImmediateHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format: str, *args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ImmediateHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        result = qwen_guard_module._fetch_models(
+            f"http://127.0.0.1:{server.server_port}/v1/models",
+            timeout=1.0,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1.0)
+
+    assert result == EXPECTED_QWEN_MODELS
+
+
 def test_plist_symlink_is_rejected_before_state_commands(tmp_path: Path) -> None:
     real = _write_plist(tmp_path)
     link_root = tmp_path / "link"
@@ -350,7 +432,50 @@ def test_plist_label_and_program_are_validated_before_state_commands(
     assert fake.commands == []
 
 
-def test_owned_qwen_wrapper_plist_is_safely_accepted(tmp_path: Path) -> None:
+def test_plist_program_key_is_rejected_before_state_mutation(tmp_path: Path) -> None:
+    program = tmp_path / "qwen-program"
+    program.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    program.chmod(0o755)
+    plist = tmp_path / "com.tea.qwen.plist"
+    plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "com.tea.qwen",
+                "Program": str(program),
+                "ProgramArguments": [
+                    sys.executable,
+                    "-m",
+                    "mtplx.server.openai",
+                    "--model",
+                    "/models/Qwen3.6-27B-MTPLX-Optimized-Speed",
+                ],
+            }
+        )
+    )
+    plist.chmod(0o644)
+    fake = FakeQwen(
+        loaded=True,
+        models=EXPECTED_QWEN_MODELS,
+        processes=(101,),
+    )
+
+    with pytest.raises(ValueError, match="Program"):
+        with _guard(plist, fake):
+            replacement = tmp_path / "replacement-program"
+            replacement.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+            replacement.chmod(0o755)
+            os.replace(replacement, program)
+
+    assert fake.commands == []
+
+
+def test_owned_qwen_wrapper_plist_is_safely_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
     launcher = tmp_path / "start-qwen-mtp.sh"
     launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     launcher.chmod(0o755)
@@ -407,7 +532,13 @@ def test_plist_replacement_cannot_change_bootstrap_content(tmp_path: Path) -> No
     assert not bootout[1].exists()
 
 
-def test_wrapper_replacement_cannot_change_bootstrap_executable(tmp_path: Path) -> None:
+def test_wrapper_replacement_cannot_change_bootstrap_executable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
     wrapper = tmp_path / "start-qwen-mtp.sh"
     original_payload = b"#!/bin/sh\n# ORIGINAL-QWEN-WRAPPER\nexit 0\n"
     wrapper.write_bytes(original_payload)
@@ -435,7 +566,42 @@ def test_wrapper_replacement_cannot_change_bootstrap_executable(tmp_path: Path) 
     assert bootstrap[3] == original_payload
     snapshot_wrapper = Path(bootstrap[2]["ProgramArguments"][0])
     assert snapshot_wrapper != wrapper
-    assert not snapshot_wrapper.exists()
+    assert snapshot_wrapper.exists()
+    assert snapshot_wrapper.read_bytes() == original_payload
+    assert subprocess.run((str(snapshot_wrapper),), check=False).returncode == 0
+    assert not bootstrap[1].exists()
+
+
+def test_cached_wrapper_substitution_before_bootstrap_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    wrapper = tmp_path / "start-qwen-mtp.sh"
+    wrapper.write_bytes(b"#!/bin/sh\n# ORIGINAL-QWEN-WRAPPER\nexit 0\n")
+    wrapper.chmod(0o755)
+    plist = tmp_path / "com.tea.qwen.plist"
+    plist.write_bytes(
+        plistlib.dumps({"Label": "com.tea.qwen", "ProgramArguments": [str(wrapper)]})
+    )
+    plist.chmod(0o644)
+    fake = FakeQwen(
+        loaded=True,
+        models=EXPECTED_QWEN_MODELS,
+        processes=(101,),
+    )
+
+    with pytest.raises(RuntimeError, match="snapshot changed"):
+        with _guard(plist, fake):
+            cached_wrapper = Path(fake.launch_inputs[0][2]["ProgramArguments"][0])
+            replacement = cached_wrapper.with_name("replacement-wrapper")
+            replacement.write_bytes(b"#!/bin/sh\n# SUBSTITUTED-WRAPPER\nexit 99\n")
+            replacement.chmod(0o500)
+            os.replace(replacement, cached_wrapper)
+
+    assert not any(item[0] == "bootstrap" for item in fake.launch_inputs)
 
 
 def test_plist_with_symlink_ancestor_is_rejected_before_commands(
@@ -809,4 +975,104 @@ def test_cli_signal_kills_ignoring_descendant_group_before_restore(
         assert events[-1] == ("guard-restored-with-descendant-alive", False)
         assert not _pid_is_alive(_read_pid(pid_file))
     finally:
+        _cleanup_pid(pid_file)
+
+
+def test_cli_wait_exception_reaps_leader_before_eperm_group_probe_and_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_cli_module()
+    plist = _write_plist(tmp_path)
+    pid_file = tmp_path / "descendant.pid"
+    events: list[object] = []
+    real_killpg = os.killpg
+    holder: dict[str, object] = {}
+    killed = False
+
+    class WaitFailureProcess:
+        def __init__(self, process: subprocess.Popen) -> None:
+            self.process = process
+            self.pid = process.pid
+            self.reaped = False
+
+        def wait(self) -> int:
+            raise OSError("injected wait failure")
+
+        def poll(self) -> int | None:
+            result = self.process.poll()
+            if result is not None:
+                self.reaped = True
+            return result
+
+    def guarded_killpg(process_group_id: int, signum: int) -> None:
+        nonlocal killed
+        process = holder.get("process")
+        if signum == signal.SIGKILL:
+            killed = True
+        if (
+            signum == 0
+            and killed
+            and isinstance(process, WaitFailureProcess)
+            and not process.reaped
+        ):
+            raise PermissionError("injected Darwin EPERM before leader reap")
+        real_killpg(process_group_id, signum)
+
+    command = (
+        "zsh",
+        "-lc",
+        "trap '' TERM HUP; "
+        f"{shlex.quote(sys.executable)} -c "
+        f"{shlex.quote(_descendant_program(pid_file))} & "
+        f"while [[ ! -s {shlex.quote(str(pid_file))} ]]; do sleep 0.01; done; "
+        "while true; do sleep 1; done",
+    )
+
+    def popen(command_value, **kwargs):
+        process = subprocess.Popen(command_value, **kwargs)
+        wrapped = WaitFailureProcess(process)
+        holder["process"] = wrapped
+        _read_pid(pid_file)
+        return wrapped
+
+    @contextmanager
+    def guard(**_kwargs):
+        try:
+            yield QwenState(loaded=True, models=EXPECTED_QWEN_MODELS)
+        finally:
+            process = holder["process"]
+            assert isinstance(process, WaitFailureProcess)
+            try:
+                real_killpg(process.pid, 0)
+            except ProcessLookupError:
+                group_exists = False
+            except PermissionError:
+                group_exists = True
+            else:
+                group_exists = True
+            events.append(("guard-restored", process.reaped, group_exists))
+
+    monkeypatch.setattr(module.os, "killpg", guarded_killpg)
+    try:
+        result = module.main(
+            ["--plist", str(plist), "--", *command],
+            _guard_factory=guard,
+            _popen=popen,
+        )
+
+        assert result == 1
+        assert events == [("guard-restored", True, False)]
+    finally:
+        process = holder.get("process")
+        if isinstance(process, WaitFailureProcess):
+            try:
+                process.process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                process.process.kill()
+                process.process.wait(timeout=5.0)
+            try:
+                real_killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
         _cleanup_pid(pid_file)
