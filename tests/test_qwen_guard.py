@@ -3,13 +3,17 @@ from __future__ import annotations
 import importlib.util
 import os
 import plistlib
+import shlex
 import signal
+import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
+import mtplx.qwen_guard as qwen_guard_module
 from mtplx.qwen_guard import (
     EXPECTED_QWEN_MODELS,
     CommandResult,
@@ -60,10 +64,18 @@ class FakeQwen:
         self.bootstrap_ready = True
         self.bootstrap_models = EXPECTED_QWEN_MODELS
         self.bootstrap_processes = (909,)
+        self.launch_inputs: list[tuple[str, Path, dict, bytes | None]] = []
+        self.command_timeouts: list[float | None] = []
+        self.api_timeouts: list[float] = []
 
-    def run_command(self, command: tuple[str, ...]) -> CommandResult:
+    def run_command(
+        self,
+        command: tuple[str, ...],
+        timeout: float | None = None,
+    ) -> CommandResult:
         command = tuple(command)
         self.commands.append(command)
+        self.command_timeouts.append(timeout)
         if command == ("launchctl", "print", SERVICE):
             return CommandResult(0 if self.loaded else 113, "", "")
         if command == ("pgrep", "-f", PROCESS_PATTERN):
@@ -75,11 +87,13 @@ class FakeQwen:
                 )
             return CommandResult(1, "", "")
         if command[:3] == ("launchctl", "bootout", DOMAIN):
+            self._record_launch_input(command)
             self.loaded = False
             self.models = None
             self.processes = ()
             return CommandResult(0, "", "")
         if command[:3] == ("launchctl", "bootstrap", DOMAIN):
+            self._record_launch_input(command)
             self.loaded = True
             if self.bootstrap_ready:
                 self.models = self.bootstrap_models
@@ -90,9 +104,19 @@ class FakeQwen:
             return CommandResult(0, "", "")
         raise AssertionError(f"unexpected command: {command}")
 
+    def _record_launch_input(self, command: tuple[str, ...]) -> None:
+        path = Path(command[3])
+        payload = plistlib.loads(path.read_bytes())
+        arguments = payload["ProgramArguments"]
+        wrapper_payload = None
+        if len(arguments) == 1:
+            wrapper_payload = Path(arguments[0]).read_bytes()
+        self.launch_inputs.append((command[1], path, payload, wrapper_payload))
+
     def fetch_models(self, url: str, timeout: float) -> tuple[str, ...] | None:
         assert url == "http://qwen.test/v1/models"
         assert timeout > 0
+        self.api_timeouts.append(timeout)
         return self.models
 
     def monotonic(self) -> float:
@@ -133,8 +157,11 @@ def test_loaded_qwen_is_stopped_and_exactly_restored(tmp_path: Path) -> None:
     assert fake.loaded is True
     assert fake.models == EXPECTED_QWEN_MODELS
     assert fake.processes == (909,)
-    assert ("launchctl", "bootout", DOMAIN, str(plist)) in fake.commands
-    assert ("launchctl", "bootstrap", DOMAIN, str(plist)) in fake.commands
+    bootout, bootstrap = fake.launch_inputs
+    assert bootout[0] == "bootout"
+    assert bootstrap[0] == "bootstrap"
+    assert bootout[1] == bootstrap[1]
+    assert bootout[1] != plist
 
 
 def test_initially_unloaded_qwen_remains_unloaded(tmp_path: Path) -> None:
@@ -214,7 +241,9 @@ def test_restore_timeout_overrides_body_result(tmp_path: Path) -> None:
         with _guard(plist, fake, timeout=0.5):
             pass
 
-    assert ("launchctl", "bootstrap", DOMAIN, str(plist)) in fake.commands
+    assert any(
+        command[:3] == ("launchctl", "bootstrap", DOMAIN) for command in fake.commands
+    )
 
 
 def test_wrong_model_list_never_counts_as_restored(tmp_path: Path) -> None:
@@ -231,17 +260,50 @@ def test_wrong_model_list_never_counts_as_restored(tmp_path: Path) -> None:
             pass
 
 
-def test_initially_unloaded_service_appearing_during_window_fails_closed(
+def test_initially_unloaded_service_appearing_during_window_is_booted_out(
     tmp_path: Path,
 ) -> None:
     plist = _write_plist(tmp_path)
     fake = FakeQwen(loaded=False, models=None, processes=())
 
-    with pytest.raises(RuntimeError, match="initially unloaded|became active"):
-        with _guard(plist, fake):
-            fake.loaded = True
-            fake.models = EXPECTED_QWEN_MODELS
-            fake.processes = (404,)
+    with _guard(plist, fake):
+        fake.loaded = True
+        fake.models = EXPECTED_QWEN_MODELS
+        fake.processes = (404,)
+
+    assert fake.loaded is False
+    assert fake.models is None
+    assert fake.processes == ()
+    assert any(
+        command[:3] == ("launchctl", "bootout", DOMAIN) for command in fake.commands
+    )
+
+
+def test_timeout_is_propagated_to_every_state_observation(tmp_path: Path) -> None:
+    plist = _write_plist(tmp_path)
+    fake = FakeQwen(loaded=False, models=None, processes=())
+
+    with _guard(plist, fake, timeout=0.01):
+        pass
+
+    assert fake.command_timeouts
+    assert all(
+        timeout is not None and 0 < timeout <= 0.01 for timeout in fake.command_timeouts
+    )
+    assert fake.api_timeouts
+    assert all(0 < timeout <= 0.01 for timeout in fake.api_timeouts)
+
+
+def test_default_command_runner_kills_stuck_observation_at_deadline() -> None:
+    started = time.monotonic()
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        qwen_guard_module._run_command(
+            (sys.executable, "-c", "import time; time.sleep(10)"),
+            timeout=0.01,
+        )
+
+    assert time.monotonic() - started < 0.5
 
 
 def test_plist_symlink_is_rejected_before_state_commands(tmp_path: Path) -> None:
@@ -306,6 +368,100 @@ def test_owned_qwen_wrapper_plist_is_safely_accepted(tmp_path: Path) -> None:
 
     with _guard(plist, fake) as state:
         assert state == QwenState(loaded=False, models=())
+
+
+def test_plist_replacement_cannot_change_bootstrap_content(tmp_path: Path) -> None:
+    plist = _write_plist(tmp_path)
+    fake = FakeQwen(
+        loaded=True,
+        models=EXPECTED_QWEN_MODELS,
+        processes=(101,),
+    )
+
+    with _guard(plist, fake):
+        replacement = tmp_path / "replacement.plist"
+        replacement.write_bytes(
+            plistlib.dumps(
+                {
+                    "Label": "com.tea.qwen",
+                    "ProgramArguments": [
+                        sys.executable,
+                        "-m",
+                        "mtplx.server.openai",
+                        "--model",
+                        "/models/Qwen3.6-SUBSTITUTED",
+                    ],
+                }
+            )
+        )
+        replacement.chmod(0o644)
+        os.replace(replacement, plist)
+
+    bootout, bootstrap = fake.launch_inputs
+    assert bootout[0] == "bootout"
+    assert bootstrap[0] == "bootstrap"
+    assert bootout[1] == bootstrap[1]
+    assert bootout[1] != plist
+    assert bootout[2] == bootstrap[2]
+    assert "SUBSTITUTED" not in repr(bootstrap[2])
+    assert not bootout[1].exists()
+
+
+def test_wrapper_replacement_cannot_change_bootstrap_executable(tmp_path: Path) -> None:
+    wrapper = tmp_path / "start-qwen-mtp.sh"
+    original_payload = b"#!/bin/sh\n# ORIGINAL-QWEN-WRAPPER\nexit 0\n"
+    wrapper.write_bytes(original_payload)
+    wrapper.chmod(0o755)
+    plist = tmp_path / "com.tea.qwen.plist"
+    plist.write_bytes(
+        plistlib.dumps({"Label": "com.tea.qwen", "ProgramArguments": [str(wrapper)]})
+    )
+    plist.chmod(0o644)
+    fake = FakeQwen(
+        loaded=True,
+        models=EXPECTED_QWEN_MODELS,
+        processes=(101,),
+    )
+
+    with _guard(plist, fake):
+        replacement = tmp_path / "replacement-wrapper"
+        replacement.write_bytes(b"#!/bin/sh\n# SUBSTITUTED-WRAPPER\nexit 0\n")
+        replacement.chmod(0o755)
+        os.replace(replacement, wrapper)
+
+    bootout, bootstrap = fake.launch_inputs
+    assert bootout[1] == bootstrap[1]
+    assert bootout[3] == original_payload
+    assert bootstrap[3] == original_payload
+    snapshot_wrapper = Path(bootstrap[2]["ProgramArguments"][0])
+    assert snapshot_wrapper != wrapper
+    assert not snapshot_wrapper.exists()
+
+
+def test_plist_with_symlink_ancestor_is_rejected_before_commands(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    _write_plist(first)
+    _write_plist(second)
+    link = tmp_path / "current"
+    link.symlink_to(first, target_is_directory=True)
+    plist = link / "com.tea.qwen.plist"
+    fake = FakeQwen(
+        loaded=True,
+        models=EXPECTED_QWEN_MODELS,
+        processes=(101,),
+    )
+
+    with pytest.raises(ValueError, match="ancestor|symlink|no-follow"):
+        with _guard(plist, fake):
+            link.unlink()
+            link.symlink_to(second, target_is_directory=True)
+
+    assert fake.commands == []
 
 
 def _load_cli_module():
@@ -383,7 +539,8 @@ def test_cli_returns_child_exit_only_after_restoration(
     events: list[object] = []
     process = FakeProcess(events, returncode=child_exit)
 
-    def popen(command):
+    def popen(command, **kwargs):
+        assert kwargs == {"start_new_session": True}
         events.append(("popen", command))
         return process
 
@@ -424,7 +581,7 @@ def test_cli_restoration_failure_overrides_nonzero_child_exit(
             events,
             restore_error=RuntimeError("restore timed out"),
         ),
-        _popen=lambda command: process,
+        _popen=lambda command, **kwargs: process,
     )
 
     assert result == 1
@@ -449,10 +606,34 @@ def test_cli_child_exception_or_keyboard_interrupt_restores_qwen(
     result = module.main(
         ["--plist", str(plist), "--", "python", "job.py"],
         _guard_factory=_fake_guard(events),
-        _popen=lambda command: process,
+        _popen=lambda command, **kwargs: process,
     )
 
     assert result == expected_exit
+    assert events[-1] == "guard-restored"
+
+
+def test_cli_spawn_exception_restores_qwen(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_cli_module()
+    plist = _write_plist(tmp_path)
+    events: list[object] = []
+
+    def failed_spawn(command, **kwargs):
+        assert command == ("python", "job.py")
+        assert kwargs == {"start_new_session": True}
+        raise OSError("spawn failed")
+
+    result = module.main(
+        ["--plist", str(plist), "--", "python", "job.py"],
+        _guard_factory=_fake_guard(events),
+        _popen=failed_spawn,
+    )
+
+    assert result == 1
+    assert "spawn failed" in capsys.readouterr().err
     assert events[-1] == "guard-restored"
 
 
@@ -468,7 +649,7 @@ def test_cli_real_sigterm_is_forwarded_then_restores_before_signal_exit(
     result = module.main(
         ["--plist", str(plist), "--", "python", "job.py"],
         _guard_factory=_fake_guard(events),
-        _popen=lambda command: process,
+        _popen=lambda command, **kwargs: process,
     )
 
     assert result == 128 + signal.SIGTERM
@@ -485,7 +666,8 @@ def test_cli_signal_during_child_launch_is_forwarded_after_spawn(
     events: list[object] = []
     process = FakeProcess(events)
 
-    def signal_during_popen(command):
+    def signal_during_popen(command, **kwargs):
+        assert kwargs == {"start_new_session": True}
         signal.raise_signal(signal.SIGTERM)
         events.append(("popen", command))
         return process
@@ -499,3 +681,132 @@ def test_cli_signal_during_child_launch_is_forwarded_after_spawn(
     assert result == 128 + signal.SIGTERM
     assert ("child-signal", signal.SIGTERM) in events
     assert events[-1] == "guard-restored"
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _read_pid(path: Path) -> int:
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if path.exists() and path.stat().st_size:
+            return int(path.read_text(encoding="utf-8"))
+        time.sleep(0.01)
+    raise AssertionError(f"child did not write PID file: {path}")
+
+
+def _cleanup_pid(path: Path) -> None:
+    if not path.exists() or not path.stat().st_size:
+        return
+    pid = int(path.read_text(encoding="utf-8"))
+    if _pid_is_alive(pid):
+        os.kill(pid, signal.SIGKILL)
+    deadline = time.monotonic() + 5.0
+    while _pid_is_alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def _descendant_program(pid_file: Path) -> str:
+    return (
+        "import os,signal,time;"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+        "signal.signal(signal.SIGHUP,signal.SIG_IGN);"
+        f"open({str(pid_file)!r},'w').write(str(os.getpid()));"
+        "time.sleep(60)"
+    )
+
+
+def _guard_observing_descendant(
+    events: list[object],
+    pid_file: Path,
+):
+    @contextmanager
+    def guard(**kwargs):
+        events.append(("guard-enter", kwargs))
+        try:
+            yield QwenState(loaded=True, models=EXPECTED_QWEN_MODELS)
+        finally:
+            pid = _read_pid(pid_file)
+            events.append(("guard-restored-with-descendant-alive", _pid_is_alive(pid)))
+
+    return guard
+
+
+@pytest.mark.parametrize("leader_exit", (0, 7))
+def test_cli_reaps_surviving_descendant_before_restore_after_leader_exit(
+    tmp_path: Path,
+    leader_exit: int,
+) -> None:
+    module = _load_cli_module()
+    plist = _write_plist(tmp_path)
+    pid_file = tmp_path / "descendant.pid"
+    events: list[object] = []
+    command = (
+        "zsh",
+        "-lc",
+        f"{shlex.quote(sys.executable)} -c "
+        f"{shlex.quote(_descendant_program(pid_file))} & "
+        f"while [[ ! -s {shlex.quote(str(pid_file))} ]]; do sleep 0.01; done; "
+        f"exit {leader_exit}",
+    )
+
+    try:
+        result = module.main(
+            ["--plist", str(plist), "--", *command],
+            _guard_factory=_guard_observing_descendant(events, pid_file),
+            _popen=subprocess.Popen,
+        )
+
+        assert result == leader_exit
+        assert events[-1] == ("guard-restored-with-descendant-alive", False)
+        assert not _pid_is_alive(_read_pid(pid_file))
+    finally:
+        _cleanup_pid(pid_file)
+
+
+@pytest.mark.parametrize(
+    ("signum", "signal_name", "expected_exit"),
+    (
+        (signal.SIGTERM, "TERM", 143),
+        (signal.SIGHUP, "HUP", 129),
+    ),
+)
+def test_cli_signal_kills_ignoring_descendant_group_before_restore(
+    tmp_path: Path,
+    signum: int,
+    signal_name: str,
+    expected_exit: int,
+) -> None:
+    module = _load_cli_module()
+    plist = _write_plist(tmp_path)
+    pid_file = tmp_path / "descendant.pid"
+    events: list[object] = []
+    command = (
+        "zsh",
+        "-lc",
+        f"trap 'exit {expected_exit}' {signal_name}; "
+        f"{shlex.quote(sys.executable)} -c "
+        f"{shlex.quote(_descendant_program(pid_file))} & "
+        f"while [[ ! -s {shlex.quote(str(pid_file))} ]]; do sleep 0.01; done; "
+        f"kill -{signal_name} {os.getpid()}; "
+        "while true; do sleep 1; done",
+    )
+
+    try:
+        result = module.main(
+            ["--plist", str(plist), "--", *command],
+            _guard_factory=_guard_observing_descendant(events, pid_file),
+            _popen=subprocess.Popen,
+        )
+
+        assert result == 128 + signum
+        assert result == expected_exit
+        assert events[-1] == ("guard-restored-with-descendant-alive", False)
+        assert not _pid_is_alive(_read_pid(pid_file))
+    finally:
+        _cleanup_pid(pid_file)

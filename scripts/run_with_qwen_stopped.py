@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import FrameType
@@ -16,7 +18,9 @@ from mtplx.qwen_guard import qwen_stopped_for_mlx
 
 
 GuardFactory = Callable[..., Any]
-PopenFactory = Callable[[tuple[str, ...]], Any]
+PopenFactory = Callable[..., Any]
+_TERMINATION_GRACE_SECONDS = 0.25
+_GROUP_POLL_SECONDS = 0.01
 
 
 def _positive_float(value: str) -> float:
@@ -56,12 +60,32 @@ class _SignalRelay:
     def __init__(self) -> None:
         self.received: int | None = None
         self.process: Any | None = None
+        self.process_group_id: int | None = None
         self._previous: dict[int, Any] = {}
+
+    @staticmethod
+    def _group_exists(process_group_id: int) -> bool:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    @staticmethod
+    def _signal_group(process_group_id: int, signum: int) -> None:
+        try:
+            os.killpg(process_group_id, signum)
+        except ProcessLookupError:
+            pass
 
     def _handler(self, signum: int, _frame: FrameType | None) -> None:
         if self.received is None:
             self.received = signum
         process = self.process
+        process_group_id = self.process_group_id
+        if process_group_id is not None:
+            self._signal_group(process_group_id, signum)
+            return
         if process is None or process.poll() is not None:
             return
         try:
@@ -82,19 +106,54 @@ class _SignalRelay:
         for signum, handler in self._previous.items():
             signal.signal(signum, handler)
 
+    def _wait_for_group_exit(self, process: Any, *, deadline: float | None) -> None:
+        process_group_id = self.process_group_id
+        if process_group_id is None:
+            return
+        while self._group_exists(process_group_id):
+            process.poll()
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+            time.sleep(_GROUP_POLL_SECONDS)
+
+    def _terminate_process_group(self, process: Any) -> None:
+        process_group_id = self.process_group_id
+        if process_group_id is None or not self._group_exists(process_group_id):
+            process.poll()
+            return
+        self._signal_group(process_group_id, signal.SIGTERM)
+        self._wait_for_group_exit(
+            process,
+            deadline=time.monotonic() + _TERMINATION_GRACE_SECONDS,
+        )
+        if self._group_exists(process_group_id):
+            self._signal_group(process_group_id, signal.SIGKILL)
+            self._wait_for_group_exit(process, deadline=None)
+        if self._group_exists(process_group_id):
+            raise RuntimeError("child process group remained alive after SIGKILL")
+        process.poll()
+
     def run_child(self, command: tuple[str, ...], *, popen: PopenFactory) -> int:
         if self.received is not None:
             return 128 + self.received
-        process = popen(command)
+        process = popen(command, start_new_session=True)
         self.process = process
+        process_id = getattr(process, "pid", None)
+        if isinstance(process_id, int) and process_id > 0:
+            self.process_group_id = process_id
         try:
-            if self.received is not None and process.poll() is None:
-                try:
-                    process.send_signal(self.received)
-                except ProcessLookupError:
-                    pass
+            if self.received is not None:
+                if self.process_group_id is not None:
+                    self._signal_group(self.process_group_id, self.received)
+                elif process.poll() is None:
+                    try:
+                        process.send_signal(self.received)
+                    except ProcessLookupError:
+                        pass
             returncode = process.wait()
         finally:
+            self._terminate_process_group(process)
+            self.process_group_id = None
             self.process = None
         if self.received is not None:
             return 128 + self.received
