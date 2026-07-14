@@ -655,7 +655,12 @@ def _validate_artifact_binding(
                 errors.append(f"{label} has an invalid or repeated name")
                 continue
             file_names.add(name)
-            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            valid_size = (
+                isinstance(size, int)
+                and not isinstance(size, bool)
+                and 0 < size < 2**64
+            )
+            if not valid_size:
                 errors.append(f"{label} has invalid bytes")
             if item.get("page_cache_bypassed") is not True:
                 errors.append(f"{label} did not prove F_NOCACHE hashing")
@@ -663,12 +668,7 @@ def _validate_artifact_binding(
                 errors.append(f"{label} has an invalid actual or declared SHA-256")
             elif actual != declared:
                 errors.append(f"{label} actual SHA-256 does not match declared SHA-256")
-            if (
-                isinstance(size, int)
-                and not isinstance(size, bool)
-                and size > 0
-                and _valid_sha256(actual)
-            ):
+            if valid_size and _valid_sha256(actual):
                 file_receipts.append((name, size, actual))
         composite = hashlib.sha256()
         for name, size, actual in sorted(file_receipts):

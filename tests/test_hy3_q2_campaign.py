@@ -656,6 +656,18 @@ def test_quality_receipt_must_bind_every_benchmark_artifact(location: str) -> No
     assert summary["artifact_binding"]["passed"] is False
 
 
+def test_oversized_resident_file_receipt_fails_closed_without_exception() -> None:
+    resource, headline, quality = _campaigns()
+    quality["lanes"]["q2"]["artifact"]["residents"]["files"][0]["bytes"] = 2**64
+
+    summary = summarize_hy3_q2_campaign(resource, headline, quality_payload=quality)
+
+    assert summary["artifact_binding"]["passed"] is False
+    assert summary["integrity_gate"]["passed"] is False
+    assert summary["decision"]["eligible"] is False
+    assert any("bytes" in error.lower() for error in summary["errors"])
+
+
 @pytest.mark.parametrize(
     "mutation",
     ("quality_failed", "nonfinite", "too_high", "lane_key", "resident_mismatch"),
@@ -812,6 +824,40 @@ def test_cli_writes_complete_rejection_before_exit_two(tmp_path: Path) -> None:
     assert written["comparable"] is True
     assert written["resource_gate"]["passed"] is False
     assert written["resource"]["swap_pressure"]["status"] == "unavailable"
+
+
+def test_cli_writes_rejection_for_oversized_resident_file_receipt(
+    tmp_path: Path,
+) -> None:
+    module = _load_script()
+    resource, headline, quality = _campaigns()
+    quality["lanes"]["q2"]["artifact"]["residents"]["files"][0]["bytes"] = 2**64
+    resource_paths = _write_payloads(tmp_path, resource, "resource")
+    headline_paths = _write_payloads(tmp_path, headline, "headline")
+    quality_path = tmp_path / "quality.json"
+    quality_path.write_text(json.dumps(quality), encoding="utf-8")
+    output_dir = tmp_path / "external"
+    output_dir.mkdir()
+    output = output_dir / "summary.json"
+
+    status = module.main(
+        [
+            "--resource",
+            *map(str, resource_paths),
+            "--headline",
+            *map(str, headline_paths),
+            "--quality",
+            str(quality_path),
+            "--output-json",
+            str(output),
+        ]
+    )
+
+    assert status == 2
+    written = json.loads(output.read_text(encoding="utf-8"))
+    assert written["artifact_binding"]["passed"] is False
+    assert written["integrity_gate"]["passed"] is False
+    assert any("bytes" in error.lower() for error in written["errors"])
 
 
 def test_cli_exit_zero_is_reserved_for_an_eligible_summary(tmp_path: Path) -> None:
