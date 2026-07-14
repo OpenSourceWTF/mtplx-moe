@@ -41,7 +41,9 @@ class ToyHybridRuntime:
         mx.random.seed(seed)
         scale = 0.3
         self.embed = mx.random.normal((self.V, self.D)).astype(mx.float32)
-        self.w_conv = scale * mx.random.normal((self.K * self.D, self.D)).astype(mx.float32)
+        self.w_conv = scale * mx.random.normal((self.K * self.D, self.D)).astype(
+            mx.float32
+        )
         self.w_q = scale * mx.random.normal((self.D, self.D)).astype(mx.float32)
         self.w_out = scale * mx.random.normal((self.D, self.V)).astype(mx.float32)
         self.calls: list[str] = []
@@ -132,7 +134,9 @@ def _leaf_arrays(cache) -> list[mx.array]:
         elif isinstance(entry, ArraysCache):
             leaves.extend(item for item in entry.cache if item is not None)
         elif isinstance(entry, KVCache):
-            leaves.extend(item for item in (entry.keys, entry.values) if item is not None)
+            leaves.extend(
+                item for item in (entry.keys, entry.values) if item is not None
+            )
     return leaves
 
 
@@ -453,9 +457,7 @@ def test_fallback_reasons_for_unsupported_cache_containers():
     result = bank.forward_ar_capture(mx.array([[0, 1]]), cache=rotating_cache)
     assert result == ("eager-logits", "eager-hidden", {})
     assert (
-        bank.stats["fallback_reasons"][
-            "promotion_failure:rotating_or_indexed_cache"
-        ]
+        bank.stats["fallback_reasons"]["promotion_failure:rotating_or_indexed_cache"]
         == 1
     )
 
@@ -788,7 +790,8 @@ def test_parity2_divergence_logging_caps_at_ten_calls(capsys):
     assert bank.stats["parity2_divergent_calls"] == 12
     out = capsys.readouterr().out
     divergence_lines = [
-        line for line in out.splitlines()
+        line
+        for line in out.splitlines()
         if line.startswith("[parity2] divergence call=")
     ]
     cap_lines = [line for line in out.splitlines() if "log cap reached" in line]
@@ -854,6 +857,78 @@ def test_compare_verify_outputs_truncates_report():
     report = compare_verify_outputs(reference, candidate, max_report_lines=5)
     assert len(report) == 6
     assert report[-1] == "... report truncated ..."
+
+
+def test_capture_commit_supports_pure_attention_hy3_cache() -> None:
+    import mlx.nn as nn
+
+    from mtplx.gdn_capture import forward_with_gdn_capture
+    from mtplx.models.hy3_mlx import Hy3Model, ModelArgs
+
+    args = ModelArgs(
+        model_type="hy_v3",
+        hidden_size=8,
+        num_hidden_layers=2,
+        intermediate_size=16,
+        moe_intermediate_size=4,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_experts=4,
+        num_experts_per_tok=2,
+        num_shared_experts=1,
+        first_k_dense_replace=2,
+        rms_norm_eps=1e-5,
+        vocab_size=32,
+        max_position_embeddings=128,
+        head_dim=4,
+        mlp_layer_types=["dense", "dense"],
+    )
+
+    class TinyHy3Target(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.args = args
+            self.model = Hy3Model(args)
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+        def __call__(
+            self,
+            inputs,
+            *,
+            cache=None,
+            return_hidden: bool = False,
+            hidden_variant: str | None = None,
+        ):
+            post_norm, pre_norm = self.model(inputs, cache, return_pre_norm=True)
+            logits = self.lm_head(post_norm)
+            if not return_hidden:
+                return logits
+            hidden = pre_norm if hidden_variant == "pre_norm" else post_norm
+            return logits, hidden
+
+    target = TinyHy3Target()
+    cache = [KVCache() for _ in target.model.layers]
+
+    logits, hidden, captures = forward_with_gdn_capture(
+        target,
+        mx.array([[1, 2]]),
+        cache=cache,
+        return_hidden=True,
+        hidden_variant="post_norm",
+    )
+    mx.eval(logits, hidden)
+
+    assert logits.shape == (1, 2, args.vocab_size)
+    assert hidden.shape == (1, 2, args.hidden_size)
+    assert captures == {}
+    assert [entry.offset for entry in cache] == [2, 2]
+    assert commit_captured_prefix(
+        cache,
+        captures,
+        keep_tokens=1,
+        verified_tokens=2,
+    )
+    assert [entry.offset for entry in cache] == [1, 1]
 
 
 # -- generation wiring (step 3) ------------------------------------------------
@@ -1176,7 +1251,9 @@ def test_exactness_gate_script_row_logic(monkeypatch):
     script_path = (
         Path(__file__).resolve().parents[1] / "scripts" / "compiled_verify_exactness.py"
     )
-    spec = importlib.util.spec_from_file_location("compiled_verify_exactness", script_path)
+    spec = importlib.util.spec_from_file_location(
+        "compiled_verify_exactness", script_path
+    )
     gate = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(gate)
 
@@ -1335,7 +1412,14 @@ def test_donation_and_legacy_hold_paths_are_bit_identical(monkeypatch):
     legacy = run_session("0")
     for step, (got, want) in enumerate(zip(donated, legacy)):
         assert got["offset"] == want["offset"], f"step {step}"
-        for name in ("logits", "hidden", "kv_prefix", "v_prefix", "gdn_conv", "gdn_state"):
+        for name in (
+            "logits",
+            "hidden",
+            "kv_prefix",
+            "v_prefix",
+            "gdn_conv",
+            "gdn_state",
+        ):
             assert np.array_equal(got[name], want[name]), f"step {step}: {name}"
 
 

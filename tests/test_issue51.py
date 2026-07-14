@@ -391,7 +391,31 @@ def test_runner_builds_exact_one_candidate_child_command(tmp_path: Path) -> None
     assert command[command.index("--compiled-verify-mode") + 1] == "parity"
     assert command[command.index("--output-json") + 1] == str(output)
     assert environment["MTPLX_COMPILED_VERIFY"] == "parity"
+    assert environment["MTPLX_COMPILED_VERIFY_FORCE"] == "1"
     assert environment["MTPLX_SUSTAINED_PREFILL"] == "1"
+
+
+def test_runner_forces_only_q2_compiled_candidates(tmp_path: Path, monkeypatch) -> None:
+    runner = _load_script(_RUNNER, "run_issue51_force")
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_FORCE", "inherited-host-value")
+
+    _command, stock_environment = runner.build_a1_child_invocation(
+        arm="batched-stock",
+        contexts=(1024, 2048),
+        depths=(1, 2),
+        output_tokens=128,
+        output_path=tmp_path / "stock.json",
+    )
+    _command, compiled_environment = runner.build_a1_child_invocation(
+        arm="capture-compiled",
+        contexts=(1024, 2048),
+        depths=(1, 2),
+        output_tokens=128,
+        output_path=tmp_path / "compiled.json",
+    )
+
+    assert "MTPLX_COMPILED_VERIFY_FORCE" not in stock_environment
+    assert compiled_environment["MTPLX_COMPILED_VERIFY_FORCE"] == "1"
 
 
 def test_runner_refuses_to_replace_existing_child_artifact(tmp_path: Path) -> None:

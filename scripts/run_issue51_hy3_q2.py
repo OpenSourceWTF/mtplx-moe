@@ -127,6 +127,13 @@ def build_a1_child_invocation(
             "MTPLX_SUSTAINED_PREFILL": "1",
         }
     )
+    if mode in {"parity", "on"}:
+        # Q2 is deliberately outside the production measured-win allowlist.
+        # Issue #51 is its isolated promotion experiment, so force only these
+        # compiled children and prove actual compiled calls in their payloads.
+        environment["MTPLX_COMPILED_VERIFY_FORCE"] = "1"
+    else:
+        environment.pop("MTPLX_COMPILED_VERIFY_FORCE", None)
     for name in (
         "MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS",
         "MTPLX_LATE_DEPTH_BEFORE",
