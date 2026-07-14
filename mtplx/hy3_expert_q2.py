@@ -6,6 +6,7 @@ import hashlib
 import importlib.metadata
 import ctypes
 import errno
+import fcntl
 import json
 import math
 import os
@@ -60,7 +61,8 @@ _SOURCE_DIRECTORY_NAME = "hy3-expert-only-mlx-q4"
 _TARGET_DIRECTORY_NAME = "hy3-expert-only-mlx-q2"
 _WORK_DIRECTORY_NAME = ".hy3-expert-only-mlx-q2.incomplete"
 _JOURNAL_FILE = "conversion-journal.jsonl"
-_RETAINED_JOURNAL_PREFIX = ".mtplx-hy3-q2-journal-"
+_RETAINED_JOURNAL_DIRECTORY = ".mtplx-hy3-q2-journals"
+_MAX_RECEIPT_RECOVERY_ENTRIES = 256
 _SIDECAR_FILE = "experts.bin"
 _EXPERT_MANIFEST_FILE = "expert-manifest.json"
 _CONVERSION_MANIFEST_FILE = "conversion-manifest.json"
@@ -3819,6 +3821,7 @@ def _publish_verified_work(
     context: _PreflightContext,
     work_fd: int,
     verified: _VerifiedDirectory,
+    journal_lease: _RetainedJournalLease,
 ) -> Path:
     parent_fd = context.pinned.output_parent_fd
     _assert_pinned_preflight_identities(context.pinned)
@@ -3833,8 +3836,10 @@ def _publish_verified_work(
     else:
         raise ValueError("final output root appeared before atomic publish")
     verified.assert_unchanged(work_fd)
+    journal_lease.assert_discoverable()
     _assert_work_root_identity(parent_fd, work_fd)
     private_name = _stage_private_publication_source(parent_fd, work_fd)
+    journal_lease.assert_discoverable()
     try:
         _exclusive_directory_rename(
             parent_fd,
@@ -3871,6 +3876,7 @@ def _publish_verified_work(
             work_fd,
             label="published output root",
         )
+        journal_lease.assert_discoverable()
     except BaseException:
         _recover_after_publication_failure(
             parent_fd,
@@ -3883,6 +3889,26 @@ def _publish_verified_work(
         if published_fd is not None:
             os.close(published_fd)
     return config.output_root
+
+
+def _publish_with_journal_recovery(
+    config: ConversionConfig,
+    context: _PreflightContext,
+    work_fd: int,
+    verified: _VerifiedDirectory,
+    journal_lease: _RetainedJournalLease,
+) -> Path:
+    try:
+        return _publish_verified_work(
+            config,
+            context,
+            work_fd,
+            verified,
+            journal_lease,
+        )
+    except BaseException:
+        journal_lease.recover()
+        raise
 
 
 def _assert_named_file_identity(
@@ -3905,82 +3931,274 @@ def _assert_named_file_identity(
         raise ValueError(f"{label} identity changed")
 
 
+def _open_retained_journal_directory(parent_fd: int) -> int:
+    try:
+        entry = os.stat(
+            _RETAINED_JOURNAL_DIRECTORY,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        os.mkdir(_RETAINED_JOURNAL_DIRECTORY, 0o700, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        entry = os.stat(
+            _RETAINED_JOURNAL_DIRECTORY,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    if (
+        not stat.S_ISDIR(entry.st_mode)
+        or stat.S_IMODE(entry.st_mode) != 0o700
+        or entry.st_uid != os.geteuid()
+    ):
+        raise ValueError("retained journal receipt directory is not private")
+    directory_fd = os.open(
+        _RETAINED_JOURNAL_DIRECTORY,
+        _directory_flags(),
+        dir_fd=parent_fd,
+    )
+    try:
+        descriptor = os.fstat(directory_fd)
+        repeated = os.stat(
+            _RETAINED_JOURNAL_DIRECTORY,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (entry.st_dev, entry.st_ino) != (
+            descriptor.st_dev,
+            descriptor.st_ino,
+        ) or (repeated.st_dev, repeated.st_ino) != (
+            descriptor.st_dev,
+            descriptor.st_ino,
+        ):
+            raise ValueError("retained journal receipt directory identity changed")
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def _retained_journal_name(journal_sha256: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", journal_sha256) is None:
+        raise ValueError("retained journal receipt hash is invalid")
+    return f"{journal_sha256}.jsonl"
+
+
+def _scan_directory_for_file_identity(
+    directory_fd: int,
+    member_fd: int,
+    *,
+    max_entries: int = _MAX_RECEIPT_RECOVERY_ENTRIES,
+) -> str | None:
+    if max_entries < 1:
+        raise ValueError("retained journal recovery scan bound must be positive")
+    descriptor = os.fstat(member_fd)
+    matches: list[str] = []
+    seen = 0
+    with os.scandir(directory_fd) as entries:
+        for candidate in entries:
+            seen += 1
+            if seen > max_entries:
+                raise ValueError("retained journal recovery candidate scan is bounded")
+            try:
+                entry = candidate.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(entry.st_mode) and (
+                entry.st_dev,
+                entry.st_ino,
+            ) == (descriptor.st_dev, descriptor.st_ino):
+                matches.append(candidate.name)
+    if len(matches) > 1:
+        raise ValueError("retained journal inode has multiple candidate names")
+    return matches[0] if matches else None
+
+
+def _fd_name_in_directory(
+    member_fd: int,
+    directory_fd: int,
+) -> str | None:
+    if sys.platform == "darwin" and hasattr(fcntl, "F_GETPATH"):
+        try:
+            raw = fcntl.fcntl(member_fd, fcntl.F_GETPATH, b"\0" * 1024)
+            current = Path(os.fsdecode(raw.split(b"\0", 1)[0]))
+        except OSError:
+            current = None
+        try:
+            current_parent = os.stat(current.parent) if current is not None else None
+        except OSError:
+            current_parent = None
+        directory = os.fstat(directory_fd)
+        if current_parent is not None and (
+            current_parent.st_dev,
+            current_parent.st_ino,
+        ) == (directory.st_dev, directory.st_ino):
+            name = _require_flat_target_name(current.name)
+            try:
+                _assert_named_file_identity(
+                    directory_fd,
+                    name,
+                    member_fd,
+                    label="held retained journal",
+                )
+            except ValueError:
+                pass
+            else:
+                return name
+    return _scan_directory_for_file_identity(directory_fd, member_fd)
+
+
+@dataclass
+class _RetainedJournalLease:
+    parent_fd: int
+    directory_fd: int
+    name: str
+    member_fd: int
+    journal_sha256: str
+    journal_bytes: int
+    closed: bool = False
+
+    def assert_discoverable(self) -> None:
+        if self.closed:
+            raise ValueError("retained journal lease is closed")
+        _assert_named_file_identity(
+            self.directory_fd,
+            self.name,
+            self.member_fd,
+            label="retained conversion journal",
+        )
+
+    def recover(self) -> None:
+        if self.closed:
+            raise ValueError("retained journal lease is closed")
+        try:
+            self.assert_discoverable()
+            return
+        except ValueError:
+            pass
+        source_directory_fd: int | None = None
+        source_name = _fd_name_in_directory(self.member_fd, self.directory_fd)
+        if source_name is not None:
+            source_directory_fd = self.directory_fd
+        else:
+            source_name = _fd_name_in_directory(self.member_fd, self.parent_fd)
+            if source_name is not None:
+                source_directory_fd = self.parent_fd
+        if source_directory_fd is None or source_name is None:
+            raise ValueError("exact retained journal inode is not recoverable")
+        if _named_entry_exists(self.directory_fd, self.name):
+            _quarantine_named_entry(
+                self.directory_fd,
+                self.name,
+                reason="rejected-journal",
+            )
+        _exclusive_name_rename(
+            source_directory_fd,
+            source_name,
+            self.directory_fd,
+            self.name,
+        )
+        self.assert_discoverable()
+        if source_directory_fd != self.directory_fd:
+            os.fsync(source_directory_fd)
+        os.fsync(self.directory_fd)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        os.close(self.member_fd)
+        os.close(self.directory_fd)
+
+
 def _retain_verified_journal(
     work_fd: int,
     parent_fd: int,
     member_fd: int,
     verified: _VerifiedDirectory,
     journal_sha256: str,
-) -> str:
-    """Move the exact journal outside publish inventory and retain it."""
+) -> _RetainedJournalLease:
+    """Move the exact journal to its private content-addressed receipt."""
 
     _assert_conversion_file_identity(work_fd, _JOURNAL_FILE, member_fd)
-    retained_name = (
-        f"{_RETAINED_JOURNAL_PREFIX}{journal_sha256[:16]}-{secrets.token_hex(16)}"
-    )
-    _exclusive_name_rename(
-        work_fd,
-        _JOURNAL_FILE,
-        parent_fd,
-        retained_name,
-    )
-    _assert_named_file_identity(
-        parent_fd,
-        retained_name,
-        member_fd,
-        label="retained conversion journal",
-    )
-    verified.remove(_JOURNAL_FILE)
-    _assert_named_file_identity(
-        parent_fd,
-        retained_name,
-        member_fd,
-        label="retained conversion journal",
-    )
-    os.fsync(work_fd)
-    os.fsync(parent_fd)
-    return retained_name
+    directory_fd = _open_retained_journal_directory(parent_fd)
+    retained_fd = os.dup(member_fd)
+    name = _retained_journal_name(journal_sha256)
+    lease: _RetainedJournalLease | None = None
+    try:
+        _exclusive_name_rename(
+            work_fd,
+            _JOURNAL_FILE,
+            directory_fd,
+            name,
+        )
+        lease = _RetainedJournalLease(
+            parent_fd=parent_fd,
+            directory_fd=directory_fd,
+            name=name,
+            member_fd=retained_fd,
+            journal_sha256=journal_sha256,
+            journal_bytes=os.fstat(retained_fd).st_size,
+        )
+        lease.assert_discoverable()
+        verified.remove(_JOURNAL_FILE)
+        lease.assert_discoverable()
+        os.fsync(work_fd)
+        os.fsync(directory_fd)
+        os.fsync(parent_fd)
+        return lease
+    except BaseException:
+        if lease is not None:
+            try:
+                lease.recover()
+            except BaseException:
+                pass
+            lease.close()
+        else:
+            os.close(retained_fd)
+            os.close(directory_fd)
+        raise
 
 
-def _verify_retained_journal_receipt(
+def _open_retained_journal_receipt(
     parent_fd: int,
     receipt: dict[str, Any],
-) -> str:
+) -> _RetainedJournalLease:
     expected_sha256 = receipt.get("sha256")
     expected_bytes = receipt.get("bytes")
-    for name in os.listdir(parent_fd):
-        if not name.startswith(_RETAINED_JOURNAL_PREFIX):
-            continue
-        try:
-            entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
+    if not isinstance(expected_sha256, str) or not isinstance(expected_bytes, int):
+        raise ValueError("retained conversion journal receipt is invalid")
+    directory_fd = _open_retained_journal_directory(parent_fd)
+    name = _retained_journal_name(expected_sha256)
+    fd: int | None = None
+    try:
+        entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        fd = os.open(name, _read_flags(), dir_fd=directory_fd)
+        descriptor = os.fstat(fd)
         if (
             not stat.S_ISREG(entry.st_mode)
             or entry.st_nlink != 1
             or entry.st_size != expected_bytes
+            or (entry.st_dev, entry.st_ino) != (descriptor.st_dev, descriptor.st_ino)
+            or _hash_fd(fd, length=descriptor.st_size, chunk_bytes=8 * 1024**2)
+            != expected_sha256
         ):
-            continue
-        fd = os.open(name, _read_flags(), dir_fd=parent_fd)
-        try:
-            descriptor = os.fstat(fd)
-            if (entry.st_dev, entry.st_ino) != (
-                descriptor.st_dev,
-                descriptor.st_ino,
-            ) or _hash_fd(
-                fd, length=descriptor.st_size, chunk_bytes=8 * 1024**2
-            ) != expected_sha256:
-                continue
-            _assert_named_file_identity(
-                parent_fd,
-                name,
-                fd,
-                label="retained conversion journal receipt",
-            )
-            return name
-        finally:
+            raise ValueError("retained conversion journal receipt mismatch")
+        lease = _RetainedJournalLease(
+            parent_fd=parent_fd,
+            directory_fd=directory_fd,
+            name=name,
+            member_fd=fd,
+            journal_sha256=expected_sha256,
+            journal_bytes=expected_bytes,
+        )
+        lease.assert_discoverable()
+        return lease
+    except BaseException:
+        if fd is not None:
             os.close(fd)
-    raise ValueError("retained conversion journal receipt is unavailable")
+        os.close(directory_fd)
+        raise
 
 
 def _validate_pilot_report(
@@ -4123,6 +4341,7 @@ def finalize_hy3_expert_q2(config: ConversionConfig) -> Path:
     journal_fd: int | None = None
     output_fd: int | None = None
     verified: _VerifiedDirectory | None = None
+    retained_journal: _RetainedJournalLease | None = None
     try:
         pilot = _validate_pilot_report(config, context)
         parent_fd = context.pinned.output_parent_fd
@@ -4171,7 +4390,10 @@ def finalize_hy3_expert_q2(config: ConversionConfig) -> Path:
             journal_receipt = conversion.get("journal")
             if not isinstance(journal_receipt, dict):
                 raise ValueError("verified work journal receipt is missing")
-            _verify_retained_journal_receipt(parent_fd, journal_receipt)
+            retained_journal = _open_retained_journal_receipt(
+                parent_fd,
+                journal_receipt,
+            )
             manifest_value, _manifest_digest, _manifest_bytes = _read_json_member(
                 work_fd,
                 _EXPERT_MANIFEST_FILE,
@@ -4180,7 +4402,13 @@ def finalize_hy3_expert_q2(config: ConversionConfig) -> Path:
             )
             manifest = ExpertManifest.from_dict(manifest_value)
             _bind_pilot_to_built_records(pilot, manifest.records, None)
-            return _publish_verified_work(config, context, work_fd, verified)
+            return _publish_with_journal_recovery(
+                config,
+                context,
+                work_fd,
+                verified,
+                retained_journal,
+            )
         except OSError as exc:
             raise ValueError(f"conversion journal is unavailable: {exc}") from exc
         _assert_conversion_file_identity(work_fd, _SIDECAR_FILE, output_fd)
@@ -4254,7 +4482,7 @@ def finalize_hy3_expert_q2(config: ConversionConfig) -> Path:
             allow_journal=True,
         )
         _assert_conversion_file_identity(work_fd, _JOURNAL_FILE, journal_fd)
-        _retain_verified_journal(
+        retained_journal = _retain_verified_journal(
             work_fd,
             parent_fd,
             journal_fd,
@@ -4262,8 +4490,16 @@ def finalize_hy3_expert_q2(config: ConversionConfig) -> Path:
             journal_sha256,
         )
         verified.assert_unchanged(work_fd)
-        return _publish_verified_work(config, context, work_fd, verified)
+        return _publish_with_journal_recovery(
+            config,
+            context,
+            work_fd,
+            verified,
+            retained_journal,
+        )
     finally:
+        if retained_journal is not None:
+            retained_journal.close()
         if journal_fd is not None:
             os.close(journal_fd)
         if output_fd is not None:

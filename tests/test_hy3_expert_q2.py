@@ -2236,8 +2236,11 @@ def test_finalize_publishes_authoritative_output_atomically_and_records_journal(
     conversion = json.loads((published / "conversion-manifest.json").read_text())
     assert conversion["journal"]["record_count"] == 3
     assert len(conversion["journal"]["sha256"]) == 64
-    retained_journals = list(tmp_path.glob(f"{q2_module._RETAINED_JOURNAL_PREFIX}*"))
+    receipt_directory = tmp_path / q2_module._RETAINED_JOURNAL_DIRECTORY
+    retained_journals = list(receipt_directory.iterdir())
     assert len(retained_journals) == 1
+    assert stat.S_IMODE(receipt_directory.stat().st_mode) == 0o700
+    assert retained_journals[0].name == f"{conversion['journal']['sha256']}.jsonl"
     assert (
         hashlib.sha256(retained_journals[0].read_bytes()).hexdigest()
         == conversion["journal"]["sha256"]
@@ -2305,9 +2308,15 @@ def test_finalize_interruption_after_journal_removal_is_safely_retryable(
     assert env["work_root"].is_dir()
     assert not (env["work_root"] / "conversion-journal.jsonl").exists()
     assert not env["output_root"].exists()
-    assert len(list(tmp_path.glob(f"{q2_module._RETAINED_JOURNAL_PREFIX}*"))) == 1
+    receipt_directory = tmp_path / q2_module._RETAINED_JOURNAL_DIRECTORY
+    retained_before_retry = list(receipt_directory.iterdir())
+    assert len(retained_before_retry) == 1
+    retained_inode = retained_before_retry[0].stat().st_ino
 
     assert finalize_hy3_expert_q2(config) == env["output_root"]
+    retained_after_retry = list(receipt_directory.iterdir())
+    assert len(retained_after_retry) == 1
+    assert retained_after_retry[0].stat().st_ino == retained_inode
     assert verify_hy3_expert_q2(env["output_root"], deep=True)["passed"] is True
 
 
@@ -2591,6 +2600,7 @@ def test_finalize_does_not_unlink_a_substituted_journal(
     config = _complete_staged_conversion(env)
     journal = env["work_root"] / "conversion-journal.jsonl"
     held_journal = env["work_root"] / "conversion-journal.held"
+    retained_name = f"{hashlib.sha256(journal.read_bytes()).hexdigest()}.jsonl"
     original_rename = q2_module._exclusive_name_rename
     substituted = False
 
@@ -2601,9 +2611,7 @@ def test_finalize_does_not_unlink_a_substituted_journal(
         target,
     ):
         nonlocal substituted
-        if source == journal.name and target.startswith(
-            q2_module._RETAINED_JOURNAL_PREFIX
-        ):
+        if source == journal.name and target == retained_name:
             journal.rename(held_journal)
             journal.write_bytes(b"attacker-owned replacement\n")
             substituted = True
@@ -2625,7 +2633,8 @@ def test_finalize_does_not_unlink_a_substituted_journal(
 
     assert substituted is True
     assert held_journal.is_file()
-    retained = list(tmp_path.glob(f"{q2_module._RETAINED_JOURNAL_PREFIX}*"))
+    receipt_directory = tmp_path / q2_module._RETAINED_JOURNAL_DIRECTORY
+    retained = list(receipt_directory.iterdir())
     assert len(retained) == 1
     assert retained[0].read_bytes() == b"attacker-owned replacement\n"
     assert not env["output_root"].exists()
@@ -2637,7 +2646,8 @@ def test_finalize_does_not_unlink_tombstone_substituted_after_lease_drop(
 ) -> None:
     env = _conversion_test_environment(tmp_path, monkeypatch)
     config = _complete_staged_conversion(env)
-    held_journal = tmp_path / ".conversion-journal.held"
+    receipt_directory = tmp_path / q2_module._RETAINED_JOURNAL_DIRECTORY
+    held_journal = receipt_directory / ".conversion-journal.held"
     original_remove = q2_module._VerifiedDirectory.remove
     replacement: Path | None = None
 
@@ -2645,7 +2655,9 @@ def test_finalize_does_not_unlink_tombstone_substituted_after_lease_drop(
         nonlocal replacement
         original_remove(verified, name)
         if name == "conversion-journal.jsonl":
-            tombstones = list(tmp_path.glob(f"{q2_module._RETAINED_JOURNAL_PREFIX}*"))
+            tombstones = [
+                path for path in receipt_directory.iterdir() if path.suffix == ".jsonl"
+            ]
             assert len(tombstones) == 1
             replacement = tombstones[0]
             replacement.rename(held_journal)
@@ -2661,8 +2673,17 @@ def test_finalize_does_not_unlink_tombstone_substituted_after_lease_drop(
         finalize_hy3_expert_q2(config)
 
     assert replacement is not None
-    assert replacement.read_bytes() == b"attacker-owned replacement\n"
-    assert held_journal.is_file()
+    conversion = json.loads((env["work_root"] / "conversion-manifest.json").read_text())
+    assert (
+        hashlib.sha256(replacement.read_bytes()).hexdigest()
+        == conversion["journal"]["sha256"]
+    )
+    assert not held_journal.exists()
+    assert any(
+        path.read_bytes() == b"attacker-owned replacement\n"
+        for path in receipt_directory.iterdir()
+        if path.is_file() and path != replacement
+    )
     assert not env["output_root"].exists()
 
 
@@ -2672,7 +2693,8 @@ def test_finalize_never_deletes_a_finally_substituted_journal_tombstone(
 ) -> None:
     env = _conversion_test_environment(tmp_path, monkeypatch)
     config = _complete_staged_conversion(env)
-    held_journal = tmp_path / ".conversion-journal.final-held"
+    receipt_directory = tmp_path / q2_module._RETAINED_JOURNAL_DIRECTORY
+    held_journal = receipt_directory / ".conversion-journal.final-held"
     original_assert = q2_module._assert_named_file_identity
     replacement: Path | None = None
     retained_checks = 0
@@ -2691,10 +2713,10 @@ def test_finalize_never_deletes_a_finally_substituted_journal_tombstone(
             member_fd,
             label=label,
         )
-        if name.startswith(q2_module._RETAINED_JOURNAL_PREFIX):
+        if label == "retained conversion journal":
             retained_checks += 1
-            if retained_checks == 2:
-                replacement = tmp_path / name
+            if retained_checks == 5:
+                replacement = receipt_directory / name
                 os.rename(
                     name,
                     held_journal.name,
@@ -2712,11 +2734,128 @@ def test_finalize_never_deletes_a_finally_substituted_journal_tombstone(
 
     published = finalize_hy3_expert_q2(config)
 
-    assert retained_checks == 2
+    assert retained_checks == 5
     assert replacement is not None
     assert replacement.read_bytes() == b"attacker-owned replacement\n"
     assert held_journal.is_file()
     assert verify_hy3_expert_q2(published, deep=True)["passed"] is True
+
+
+def test_retained_journal_recovery_candidate_scan_is_bounded(tmp_path: Path) -> None:
+    receipt_directory = tmp_path / "receipts"
+    receipt_directory.mkdir(mode=0o700)
+    held = receipt_directory / "held"
+    held.write_bytes(b"held receipt")
+    for ordinal in range(3):
+        (receipt_directory / f"candidate-{ordinal}").write_bytes(b"candidate")
+    directory_fd = os.open(receipt_directory, q2_module._directory_flags())
+    held_fd = os.open(held, q2_module._read_flags())
+    try:
+        with pytest.raises(ValueError, match="candidate scan is bounded"):
+            q2_module._scan_directory_for_file_identity(
+                directory_fd,
+                held_fd,
+                max_entries=3,
+            )
+    finally:
+        os.close(held_fd)
+        os.close(directory_fd)
+
+
+def test_retained_journal_swap_and_publish_failure_remain_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    config = _complete_staged_conversion(env)
+    receipt_directory = tmp_path / q2_module._RETAINED_JOURNAL_DIRECTORY
+    held_journal = receipt_directory / ".conversion-journal.non-prefix-held"
+    original_assert = q2_module._assert_named_file_identity
+    original_rename = q2_module._exclusive_directory_rename
+    retained_checks = 0
+    publish_failed = False
+
+    def swap_after_final_retained_check(
+        directory_fd,
+        name,
+        member_fd,
+        *,
+        label,
+    ):
+        nonlocal retained_checks
+        result = original_assert(
+            directory_fd,
+            name,
+            member_fd,
+            label=label,
+        )
+        if label == "retained conversion journal":
+            retained_checks += 1
+            if retained_checks == 4:
+                retained = receipt_directory / name
+                retained.rename(held_journal)
+                retained.write_bytes(b"attacker-owned replacement\n")
+        return result
+
+    def fail_publication_once(
+        source_directory_fd,
+        source,
+        target_directory_fd,
+        target,
+    ):
+        nonlocal publish_failed
+        if target == env["output_root"].name and not publish_failed:
+            publish_failed = True
+            raise OSError("injected publication failure after retained swap")
+        return original_rename(
+            source_directory_fd,
+            source,
+            target_directory_fd,
+            target,
+        )
+
+    monkeypatch.setattr(
+        q2_module,
+        "_assert_named_file_identity",
+        swap_after_final_retained_check,
+    )
+    monkeypatch.setattr(
+        q2_module,
+        "_exclusive_directory_rename",
+        fail_publication_once,
+    )
+
+    with pytest.raises(OSError, match="publication failure after retained swap"):
+        finalize_hy3_expert_q2(config)
+
+    assert retained_checks == 5
+    assert publish_failed is True
+    assert not env["output_root"].exists()
+    assert env["work_root"].is_dir()
+    assert not held_journal.exists()
+    conversion = json.loads((env["work_root"] / "conversion-manifest.json").read_text())
+    deterministic = receipt_directory / f"{conversion['journal']['sha256']}.jsonl"
+    assert (
+        hashlib.sha256(deterministic.read_bytes()).hexdigest()
+        == conversion["journal"]["sha256"]
+    )
+    assert any(
+        path.read_bytes() == b"attacker-owned replacement\n"
+        for path in receipt_directory.iterdir()
+        if path.is_file() and path != deterministic
+    )
+
+    monkeypatch.setattr(
+        q2_module,
+        "_assert_named_file_identity",
+        original_assert,
+    )
+    monkeypatch.setattr(
+        q2_module,
+        "_exclusive_directory_rename",
+        original_rename,
+    )
+    assert finalize_hy3_expert_q2(config) == env["output_root"]
 
 
 def test_finalize_rolls_back_when_parent_fsync_fails_after_directory_rename(
