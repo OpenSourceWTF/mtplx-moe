@@ -1,0 +1,48 @@
+{
+  "schema": "mtplx-issue31-hy3-shared-gate-up-curated-v1",
+  "issue": 31,
+  "arm": "C2",
+  "decision": "retain_c2_after_positive_operator_and_full_decode_results",
+  "runtime_predecessor_commit": "1faa0f960fc8b73a2eb828a563f352f101d2cf6f",
+  "artifact_revision": "160619d3f96c8470350b6dac0ef033a8381551e3",
+  "layer": 1,
+  "shape": {
+    "input": [1, 1, 4096],
+    "output": [1, 1, 1536],
+    "bits": 4,
+    "group_size": 64,
+    "mode": "affine"
+  },
+  "correctness": {
+    "swiglu_output_bit_exact": true,
+    "focused_tests_passed": 2
+  },
+  "packing": {
+    "original_bytes": 7077888,
+    "packed_bytes": 7077888,
+    "one_time_pack_us_per_layer": 3729.292,
+    "temporary_pack_peak_bytes_per_layer": 14155776,
+    "steady_candidate_requires_original_release": true
+  },
+  "operator": {
+    "warmup": 32,
+    "iterations_per_pair": 256,
+    "pairs": 16,
+    "bootstrap_resamples": 20000,
+    "control_mean_us": 236.88159228515624,
+    "candidate_mean_us": 230.08446264648438,
+    "paired_speedup_mean": 1.0300605418767608,
+    "paired_speedup_median": 1.0150243481103767,
+    "paired_speedup_mean_95_ci": [1.005980652737468, 1.0665153583407956]
+  },
+  "production": {
+    "shared_mlp_integration": "implemented behind MTPLX_FUSE_HY3_SHARED_GATE_UP_PROJECTIONS",
+    "packed_model_layout": "replaces source arrays without persistent duplicates",
+    "full_model_benchmark": "benchmarks/results/hy3-shared-gate-up-decode-issue31-20260713.json"
+  },
+  "lifecycle": {
+    "qwen_restore_verified": true,
+    "exclusive_lane_released": true
+  },
+  "raw_artifact": "/tmp/mtplx-issue31-c2-shared-gate-up.json"
+}
