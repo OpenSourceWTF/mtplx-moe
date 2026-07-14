@@ -2575,11 +2575,11 @@ def _source_record_state(
             f"source record hash mismatch: ({record.layer}, {record.expert})"
         )
     components = []
-    for segment in record.segments:
-        relative = segment.offset - record.sidecar_offset
-        if relative < 0 or relative + segment.length > len(payload):
-            raise ValueError("source component escapes its sidecar record")
-        component_payload = payload[relative : relative + segment.length]
+    for segment, component_payload in zip(
+        record.segments,
+        _source_sidecar_component_payloads(record, payload),
+        strict=True,
+    ):
         components.append(
             {
                 "component": segment.component,
@@ -2597,6 +2597,25 @@ def _source_record_state(
         "sha256": digest,
         "components": components,
     }
+
+
+def _source_sidecar_component_payloads(
+    record: ExpertRecord,
+    payload: bytes,
+) -> tuple[bytes, ...]:
+    if len(payload) != record.logical_bytes:
+        raise ValueError("source sidecar record length differs from logical bytes")
+    components = []
+    cursor = 0
+    for segment in record.segments:
+        end = cursor + segment.length
+        if end > len(payload):
+            raise ValueError("source components exceed their packed sidecar record")
+        components.append(payload[cursor:end])
+        cursor = end
+    if cursor != len(payload):
+        raise ValueError("source components do not cover their packed sidecar record")
+    return tuple(components)
 
 
 def _output_record_metadata(
@@ -2669,16 +2688,22 @@ def _convert_one_record(
         output_offset=output_offset,
     )
     source_by_component = {
-        segment.component: segment for segment in source_record.segments
+        segment.component: (segment, component_payload)
+        for segment, component_payload in zip(
+            source_record.segments,
+            _source_sidecar_component_payloads(source_record, source_payload),
+            strict=True,
+        )
     }
+    if len(source_by_component) != len(source_record.segments):
+        raise ValueError("source record contains duplicate components")
     outputs: dict[str, bytes] = {}
 
     def read_component(segment: TensorSegment) -> bytes:
         expected = source_by_component.get(segment.component)
-        if expected != segment or source_record.sidecar_offset is None:
+        if expected is None or expected[0] != segment:
             raise ValueError("converter requested an unexpected source component")
-        relative = segment.offset - source_record.sidecar_offset
-        return source_payload[relative : relative + segment.length]
+        return expected[1]
 
     def write_component(component: str, payload: bytes) -> None:
         if component in outputs:

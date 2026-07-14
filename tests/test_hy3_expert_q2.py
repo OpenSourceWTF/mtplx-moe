@@ -1601,6 +1601,115 @@ def _conversion_test_environment(
     }
 
 
+def _packed_source_record_with_original_shard_offsets(
+    source_spec: ExpertStreamingModelSpec,
+) -> tuple[ExpertRecord, bytes, tuple[bytes, ...]]:
+    component_payloads = tuple(
+        bytes([index + 1]) * length
+        for index, (_component, _dtype, _shape, length) in enumerate(
+            _test_component_metadata(source_spec)
+        )
+    )
+    segments = tuple(
+        TensorSegment(
+            component=component,
+            tensor=f"model.layers.1.mlp.switch_mlp.experts.0.{component}",
+            shard="model-00001-of-00034.safetensors",
+            offset=1_000_000_000 + index * 20_000_000,
+            length=length,
+            dtype=dtype,
+            shape=shape,
+        )
+        for index, (component, dtype, shape, length) in enumerate(
+            _test_component_metadata(source_spec)
+        )
+    )
+    payload = b"".join(component_payloads)
+    return (
+        ExpertRecord(
+            layer=1,
+            expert=0,
+            logical_bytes=len(payload),
+            segments=segments,
+            sha256=hashlib.sha256(payload).hexdigest(),
+            sidecar_offset=256,
+            sidecar_length=len(payload),
+        ),
+        payload,
+        component_payloads,
+    )
+
+
+def test_source_record_state_hashes_packed_components_in_segment_order(
+    tmp_path: Path,
+) -> None:
+    source_record, payload, component_payloads = (
+        _packed_source_record_with_original_shard_offsets(
+            _test_conversion_spec(bits=4, resident_bytes=16)
+        )
+    )
+    sidecar = tmp_path / "experts.bin"
+    sidecar.write_bytes(b"x" * 256 + payload)
+    sidecar_fd = os.open(sidecar, os.O_RDONLY)
+    try:
+        actual_payload, state = q2_module._source_record_state(
+            sidecar_fd,
+            source_record,
+        )
+    finally:
+        os.close(sidecar_fd)
+
+    assert actual_payload == payload
+    assert [item["offset"] for item in state["components"]] == [
+        segment.offset for segment in source_record.segments
+    ]
+    assert [item["sha256"] for item in state["components"]] == [
+        hashlib.sha256(component_payload).hexdigest()
+        for component_payload in component_payloads
+    ]
+
+
+def test_convert_record_reads_packed_components_in_segment_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_record, source_payload, component_payloads = (
+        _packed_source_record_with_original_shard_offsets(
+            _test_conversion_spec(bits=4, resident_bytes=16)
+        )
+    )
+    target_spec = _test_conversion_spec(bits=2, resident_bytes=16)
+    observed: list[bytes] = []
+
+    def fake_requantize(record, read_component, write_component, **_kwargs):
+        observed.extend(read_component(segment) for segment in record.segments)
+        for component, _dtype, _shape, length in _test_component_metadata(target_spec):
+            write_component(component, b"q" * length)
+        return tuple(
+            ProjectionDiagnostics(
+                component=projection,
+                cosine_q4_q2=0.99,
+                normalized_error_q4_q2=0.01,
+                finite=True,
+            )
+            for projection in _PROJECTIONS
+        )
+
+    monkeypatch.setattr(
+        q2_module,
+        "requantize_expert_record_q4_to_q2",
+        fake_requantize,
+    )
+
+    q2_module._convert_one_record(
+        source_record,
+        source_payload,
+        target_spec,
+        output_offset=0,
+    )
+
+    assert observed == list(component_payloads)
+
+
 def _rewrite_conversion_test_manifest(
     env: dict[str, object],
     manifest: ExpertManifest,
