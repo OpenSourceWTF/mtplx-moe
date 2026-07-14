@@ -257,6 +257,22 @@ class FusedSharedMLP(nn.Module):
         return self.down_proj(swiglu(gate, up))
 
 
+def _router_storage_module(module: nn.Module) -> nn.Module:
+    """Find the stored linear beneath instrumentation or adapter wrappers."""
+
+    current = module
+    seen: set[int] = set()
+    while id(current) not in seen:
+        if isinstance(current, (nn.Linear, nn.QuantizedLinear)):
+            return current
+        seen.add(id(current))
+        base = getattr(current, "base", None)
+        if not isinstance(base, nn.Module):
+            break
+        current = base
+    return current
+
+
 class Router(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -268,10 +284,20 @@ class Router(nn.Module):
         self.expert_bias = mx.zeros((args.num_experts,), dtype=mx.float32)
 
     def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
-        # The pinned artifact uses an affine-Q8 router.  Run that projection in
-        # the activation dtype, then promote its logits for stable sigmoid and
-        # top-k selection, exactly as the Hy3 MLX reference does.
-        logits = self.gate(x).astype(mx.float32)
+        storage_gate = _router_storage_module(self.gate)
+        if isinstance(storage_gate, nn.QuantizedLinear):
+            # Preserve the pinned community-Q4 affine-Q8 execution contract.
+            # Its packed approximation is a separate model from Tencent's
+            # source-BF16 router and was validated in the activation dtype.
+            gate_input = x
+        else:
+            # Official Hy3 stores router weights in BF16 but promotes both
+            # operands before the reduction so its 4,096-term logits and
+            # discrete top-k choice are computed in FP32.
+            gate_input = x.astype(mx.float32)
+        # Always dispatch through the installed module so activation-stat and
+        # LoRA wrappers retain their behavior.
+        logits = self.gate(gate_input).astype(mx.float32)
         scores = mx.sigmoid(logits)
         selection_scores = scores + self.expert_bias.astype(mx.float32)
         top_k = self.top_k
@@ -413,10 +439,11 @@ class Hy3MTPLayer(nn.Module):
         )
         mask = create_attention_mask(mixed, cache, return_array=True)
         hidden = self.mtp_block(mixed, mask, cache)
-        normalized = self.final_layernorm(hidden)
+        recurrent_hidden = self.final_layernorm(hidden)
+        head_hidden = recurrent_hidden
         if self._lm_head_fp32:
-            normalized = normalized.astype(mx.float32)
-        return lm_head(normalized), hidden
+            head_hidden = head_hidden.astype(mx.float32)
+        return lm_head(head_hidden), recurrent_hidden
 
 
 class Hy3MTP(nn.Module):

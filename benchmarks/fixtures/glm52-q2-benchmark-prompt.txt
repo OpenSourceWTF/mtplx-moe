@@ -1,0 +1,1 @@
+You are working in an existing software repository. Diagnose a failing cache-invalidation path, implement the smallest correct fix, add regression tests, and report the evidence that the tests pass. Preserve unrelated behavior and explain any remaining risk.

@@ -16,6 +16,7 @@ from .expert_manifest import (
     ExpertManifest,
     ExpertManifestError,
     load_expert_manifest,
+    validate_expert_manifest_spec,
     verify_expert_manifest,
 )
 from .expert_slots import (
@@ -214,7 +215,12 @@ class ExpertStreamingConfig:
                 "prefill admission is not implemented; prefill must use transient slots"
             )
 
-    def memory_plan(self, spec: ExpertStreamingModelSpec) -> ExpertMemoryPlan:
+    def memory_plan(
+        self,
+        spec: ExpertStreamingModelSpec,
+        *,
+        additional_resident_bytes: int = 0,
+    ) -> ExpertMemoryPlan:
         # File-backed Metal records use the OS page cache as their physical
         # tier and never consume fixed MLX expert slots. Retain only a tiny
         # unreachable transient pool so the generic runtime invariants and
@@ -233,6 +239,7 @@ class ExpertStreamingConfig:
             transient_slots=transient_slots,
             io_staging_bytes=self.io_staging_bytes,
             execution_workspace_bytes=self.execution_workspace_bytes,
+            additional_resident_bytes=additional_resident_bytes,
             cache_scope=self.cache_scope,
         )
 
@@ -1218,6 +1225,7 @@ class ExpertStreamingRuntime:
         apply_memory_cap: bool = True,
         mx_module: Any | None = None,
         env: dict[str, str] | None = None,
+        additional_resident_bytes: int = 0,
     ) -> ExpertStreamingRuntime:
         artifact_root = Path(root).resolve()
         model_spec = get_model_spec(config.model_key) if spec is None else spec
@@ -1236,7 +1244,10 @@ class ExpertStreamingRuntime:
                 artifact_root,
                 verify_sidecar_hash=config.verify_sidecar_hash_at_open,
             )
-        plan = config.memory_plan(model_spec)
+        plan = config.memory_plan(
+            model_spec,
+            additional_resident_bytes=additional_resident_bytes,
+        )
         if not plan.fits_fixed:
             raise ExpertStreamingConfigurationError(
                 f"fixed expert-streaming footprint exceeds limit by {-plan.unallocated_bytes} bytes"
@@ -1296,23 +1307,12 @@ class ExpertStreamingRuntime:
         manifest: ExpertManifest,
         spec: ExpertStreamingModelSpec,
     ) -> None:
-        errors: list[str] = []
-        if manifest.model_key != spec.key:
-            errors.append("model key")
-        if manifest.source_repo != spec.quant_model:
-            errors.append("source repository")
-        if manifest.source_revision != spec.quant_revision:
-            errors.append("source revision")
-        if manifest.quant_bits != spec.quant_bits:
-            errors.append("quantization bits")
-        if manifest.quant_group_size != spec.quant_group_size:
-            errors.append("quantization group size")
-        if manifest.artifact_tensor_bytes != spec.total_tensor_bytes:
-            errors.append("artifact tensor bytes")
-        if errors:
+        try:
+            validate_expert_manifest_spec(manifest, spec)
+        except ExpertManifestError as exc:
             raise ExpertStreamingConfigurationError(
-                "manifest does not match pinned model descriptor: " + ", ".join(errors)
-            )
+                "manifest does not match pinned model descriptor: " + str(exc)
+            ) from exc
 
     def _record_cleanup_error(self, error: BaseException) -> None:
         with self._cleanup_error_lock:

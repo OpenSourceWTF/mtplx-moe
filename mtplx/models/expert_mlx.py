@@ -1,4 +1,4 @@
-"""MLX execution adapters for slot-backed affine-Q4 routed experts."""
+"""MLX execution adapters for slot-backed affine-quantized routed experts."""
 
 from __future__ import annotations
 
@@ -443,7 +443,7 @@ def make_mlx_component_bank_allocator(
     """Allocate slot bytes as component-major banks usable by ``gather_qmm``.
 
     Unlike a record-major byte bank, these arrays are both directly writable
-    through unified-memory views and directly consumable by MLX grouped Q4
+    through unified-memory views and directly consumable by MLX grouped QMM
     kernels. No persistent slice or stacked weight copy is materialized.
     """
 
@@ -641,7 +641,11 @@ def _release_mlx_cache() -> None:
 
 
 def _run_q4_expert(
-    x: mx.array, binding: ExpertSlotBinding, *, group_size: int
+    x: mx.array,
+    binding: ExpertSlotBinding,
+    *,
+    group_size: int,
+    bits: int = 4,
 ) -> mx.array:
     gate_weight = _component_array(binding, "gate_proj.weight")
     gate_scales = _component_array(binding, "gate_proj.scales")
@@ -659,7 +663,7 @@ def _run_q4_expert(
         scales=gate_scales,
         biases=gate_biases,
         group_size=group_size,
-        bits=4,
+        bits=bits,
         mode="affine",
     )
     up = mx.quantized_matmul(
@@ -668,7 +672,7 @@ def _run_q4_expert(
         scales=up_scales,
         biases=up_biases,
         group_size=group_size,
-        bits=4,
+        bits=bits,
         mode="affine",
     )
     hidden = swiglu(gate, up)
@@ -678,7 +682,7 @@ def _run_q4_expert(
         scales=down_scales,
         biases=down_biases,
         group_size=group_size,
-        bits=4,
+        bits=bits,
         mode="affine",
     )
 
@@ -688,6 +692,7 @@ def _run_component_bank_q4(
     bindings: tuple[ExpertSlotBinding, ...],
     *,
     group_size: int,
+    bits: int = 4,
 ) -> mx.array:
     """Execute assignment-aligned rows from one component-major slot bank."""
 
@@ -715,7 +720,7 @@ def _run_component_bank_q4(
             rhs_indices=slot_indices,
             transpose=True,
             group_size=group_size,
-            bits=4,
+            bits=bits,
             mode="affine",
         )
 
@@ -730,6 +735,7 @@ def _run_mapped_q4(
     mapped: MappedExpertRecord,
     *,
     group_size: int,
+    bits: int = 4,
 ) -> mx.array:
     arrays = mapped.arrays
 
@@ -740,7 +746,7 @@ def _run_mapped_q4(
             scales=arrays[f"{projection}.scales"],
             biases=arrays[f"{projection}.biases"],
             group_size=group_size,
-            bits=4,
+            bits=bits,
             mode="affine",
         )
 
@@ -748,7 +754,7 @@ def _run_mapped_q4(
 
 
 class MappedExpertSwitchGLU(nn.Module):
-    """Execute routed Q4 experts from record-sized file-backed MTLBuffers."""
+    """Execute routed quantized experts from record-sized file-backed MTLBuffers."""
 
     def __init__(
         self,
@@ -761,6 +767,7 @@ class MappedExpertSwitchGLU(nn.Module):
         self.store = store
         self.layer_index = int(layer_index)
         self.group_size = runtime.spec.quant_group_size
+        self.bits = runtime.spec.quant_bits
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         hidden_size = int(x.shape[-1])
@@ -794,6 +801,7 @@ class MappedExpertSwitchGLU(nn.Module):
                     selected,
                     self.store.get(self.layer_index, expert),
                     group_size=self.group_size,
+                    bits=self.bits,
                 )
             )
             output_positions.extend(positions)
@@ -817,6 +825,7 @@ class HotExpertSwitchGLU(nn.Module):
         self.runtime = runtime
         self.layer_index = int(layer_index)
         self.group_size = runtime.spec.quant_group_size
+        self.bits = runtime.spec.quant_bits
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         output, _overlap_result = self._run(
@@ -995,6 +1004,7 @@ class HotExpertSwitchGLU(nn.Module):
                         selected,
                         grouped_bindings,
                         group_size=self.group_size,
+                        bits=self.bits,
                     )
                 )
                 wave_positions.extend(grouped_positions)
@@ -1034,6 +1044,7 @@ class HotExpertSwitchGLU(nn.Module):
                         selected,
                         binding_by_expert[expert],
                         group_size=self.group_size,
+                        bits=self.bits,
                     )
                 )
                 wave_positions.extend(expert_positions)
@@ -1119,6 +1130,7 @@ class HotExpertSwitchGLU(nn.Module):
                                 assignment_inputs,
                                 ready.bindings,
                                 group_size=self.group_size,
+                                bits=self.bits,
                             )
                             # Slot pins may be released only after the lazy graph
                             # has consumed the currently bound bank generations.

@@ -175,6 +175,206 @@ class RejectingTinyMTPModel(AcceptingTinyMTPModel):
         )
 
 
+class CycleTrackingTinyMTPModel(AcceptingTinyMTPModel):
+    def __init__(
+        self,
+        *,
+        draft_token: int = 1,
+        target_verify_token: int = 1,
+        fail_on_draft: int | None = None,
+    ):
+        super().__init__()
+        self.draft_token = int(draft_token)
+        self.target_verify_token = int(target_verify_token)
+        self.fail_on_draft = fail_on_draft
+        self.cycle_active = False
+        self.draft_calls = 0
+        self.finish_calls: list[object] = []
+
+    def make_mtp_cache(self):
+        return [OffsetCache()]
+
+    def finish_mtp_cycle(self, mtp_cache):
+        self.finish_calls.append(mtp_cache)
+        self.cycle_active = False
+
+    def __call__(self, input_ids, *, cache=None, **kwargs):
+        if self.cycle_active:
+            raise AssertionError("target verification observed active MTP cycle")
+        result = super().__call__(input_ids, cache=cache, **kwargs)
+        if int(input_ids.shape[1]) <= 1:
+            return result
+        token_logits = mx.full((4,), -1.0, dtype=mx.float32)
+        token_logits[self.target_verify_token] = 1.0
+        if isinstance(result, tuple):
+            logits, hidden = result
+            return mx.zeros_like(logits) + token_logits, hidden
+        return mx.zeros_like(result) + token_logits
+
+    def mtp_forward(self, hidden_states, next_token_ids, **kwargs):
+        self.draft_calls += 1
+        self.cycle_active = True
+        if self.fail_on_draft == self.draft_calls:
+            raise RuntimeError("synthetic recurrent draft failure")
+        length = int(next_token_ids.shape[1])
+        hidden = mx.zeros((1, length, 2), dtype=mx.float32)
+        token_logits = mx.full((4,), -1.0, dtype=mx.float32)
+        token_logits[self.draft_token] = 1.0
+        logits = mx.zeros((1, length, 4), dtype=mx.float32) + token_logits
+        if kwargs.get("return_hidden", False):
+            return logits, hidden
+        return logits
+
+
+class StopAfterFirstDraftPolicy:
+    current_depth = 3
+    wants_draft_metrics = False
+
+    def should_continue_after_draft(self, **_kwargs):
+        return {"continue": False, "reason": "synthetic_early_exit"}
+
+    def observe(self, **_kwargs):
+        return {"action": "hold", "next_depth": self.current_depth}
+
+
+class RejectAtSecondDepthTinyMTPModel(CycleTrackingTinyMTPModel):
+    def __init__(self):
+        super().__init__()
+
+    def __call__(self, input_ids, *, cache=None, **kwargs):
+        if self.cycle_active:
+            raise AssertionError("target verification observed active MTP cycle")
+        result = TinyModel.__call__(self, input_ids, cache=cache, **kwargs)
+        row_tokens = [int(token) for row in input_ids.tolist() for token in row]
+        logits = mx.full((1, len(row_tokens), 4), -100.0, dtype=mx.float32)
+        for index, token in enumerate(row_tokens):
+            logits[0, index, (token + 1) % 4] = 100.0
+        if isinstance(result, tuple):
+            _unused_logits, hidden = result
+            return logits, hidden
+        return logits
+
+    def mtp_forward(self, hidden_states, next_token_ids, **kwargs):
+        self.draft_calls += 1
+        self.cycle_active = True
+        draft_tokens = (2, 0, 1)
+        draft_token = draft_tokens[min(self.draft_calls - 1, len(draft_tokens) - 1)]
+        hidden = mx.zeros((1, 1, 2), dtype=mx.float32)
+        logits = mx.full((1, 1, 4), -100.0, dtype=mx.float32)
+        logits[0, 0, draft_token] = 100.0
+        if kwargs.get("return_hidden", False):
+            return logits, hidden
+        return logits
+
+
+class PendingBonusThenRejectTinyMTPModel(CycleTrackingTinyMTPModel):
+    def __init__(self):
+        super().__init__()
+        self.target_cache = [OffsetCache()]
+        self.committed_mtp_cache: list[OffsetCache] | None = None
+        self.cycle_base: int | None = None
+
+    @property
+    def target_cache_offset(self) -> int:
+        return self.target_cache[0].offset
+
+    @property
+    def mtp_committed_offset(self) -> int:
+        assert self.committed_mtp_cache is not None
+        return self.committed_mtp_cache[0].offset
+
+    def make_cache(self):
+        return self.target_cache
+
+    def make_mtp_cache(self):
+        self.committed_mtp_cache = [OffsetCache()]
+        return self.committed_mtp_cache
+
+    def __call__(self, input_ids, *, cache=None, **kwargs):
+        if self.cycle_active:
+            raise AssertionError("target verification observed active MTP cycle")
+        if cache:
+            for entry in cache:
+                entry.offset += int(input_ids.shape[1])
+        result = TinyModel.__call__(self, input_ids, cache=cache, **kwargs)
+        row_tokens = [int(token) for row in input_ids.tolist() for token in row]
+        logits = mx.full((1, len(row_tokens), 8), -100.0, dtype=mx.float32)
+        for index, token in enumerate(row_tokens):
+            logits[0, index, (token + 1) % 8] = 100.0
+        if isinstance(result, tuple):
+            _unused_logits, hidden = result
+            return logits, hidden
+        return logits
+
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        *,
+        mtp_cache=None,
+        **kwargs,
+    ):
+        self.draft_calls += 1
+        if not self.cycle_active:
+            self.cycle_base = mtp_cache[0].offset if mtp_cache else 0
+        self.cycle_active = True
+        source_token = int(next_token_ids.item())
+        draft_token = 0 if self.draft_calls == 4 else (source_token + 1) % 8
+        if mtp_cache:
+            for entry in mtp_cache:
+                entry.offset += 1
+        hidden = mx.zeros((1, 1, 2), dtype=mx.float32)
+        logits = mx.full((1, 1, 8), -100.0, dtype=mx.float32)
+        logits[0, 0, draft_token] = 100.0
+        if kwargs.get("return_hidden", False):
+            return logits, hidden
+        return logits
+
+    def mtp_update_cache(
+        self,
+        hidden_states,
+        next_token_ids,
+        *,
+        mtp_cache=None,
+        **_kwargs,
+    ):
+        if mtp_cache:
+            for entry in mtp_cache:
+                entry.offset += int(next_token_ids.shape[1])
+        return hidden_states
+
+    def finish_mtp_cycle(self, mtp_cache):
+        super().finish_mtp_cycle(mtp_cache)
+        if mtp_cache and self.cycle_base is not None:
+            target = self.cycle_base + 1
+            for entry in mtp_cache:
+                entry.trim(max(0, entry.offset - target))
+        self.cycle_base = None
+
+
+class BatchShapeDriftTinyMTPModel(PendingBonusThenRejectTinyMTPModel):
+    """Expose a verifier correction that differs from qlen=1 replay."""
+
+    verifier_correction = 6
+
+    def __call__(self, input_ids, *, cache=None, **kwargs):
+        result = super().__call__(input_ids, cache=cache, **kwargs)
+        if int(input_ids.shape[1]) <= 1:
+            return result
+
+        if isinstance(result, tuple):
+            logits, hidden = result
+            logits = mx.array(logits)
+            logits[:, 0, :] = -100.0
+            logits[:, 0, self.verifier_correction] = 100.0
+            return logits, hidden
+
+        logits = mx.array(result)
+        logits[:, 0, :] = -100.0
+        logits[:, 0, self.verifier_correction] = 100.0
+        return logits
+
+
 def _runtime(model: TinyModel, *, mtp_enabled: bool = True) -> MTPLXRuntime:
     return MTPLXRuntime(
         model=model,
@@ -183,6 +383,270 @@ def _runtime(model: TinyModel, *, mtp_enabled: bool = True) -> MTPLXRuntime:
         mtp_enabled=mtp_enabled,
         contract=MTPContract(),
     )
+
+
+def _run_cycle_tracking_mtpk(
+    model: CycleTrackingTinyMTPModel,
+    *,
+    max_tokens: int = 2,
+    speculative_depth: int = 1,
+    stop_token_ids: set[int] | None = None,
+    adaptive_policy=None,
+):
+    return generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=max_tokens,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=speculative_depth,
+        mtp_history_policy="cycle",
+        verify_strategy="batched",
+        stop_token_ids=set() if stop_token_ids is None else stop_token_ids,
+        adaptive_policy=adaptive_policy,
+    )
+
+
+def test_generate_mtpk_rejects_fresh_recurrent_cache_before_prefill():
+    model = AcceptingTinyMTPModel()
+    model.mtp_recurrent_requires_persistent_cache = True
+
+    with pytest.raises(ValueError, match="persistent cache"):
+        generate_mtpk(
+            _runtime(model, mtp_enabled=True),
+            [0],
+            max_tokens=3,
+            sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+            speculative_depth=2,
+            mtp_cache_policy="fresh",
+            mtp_history_policy="cycle",
+            verify_strategy="batched",
+            stop_token_ids=set(),
+        )
+
+    assert model.calls == []
+
+
+def test_generate_mtpk_cycle_cleanup_precedes_rejection_verify():
+    model = CycleTrackingTinyMTPModel(draft_token=2, target_verify_token=1)
+
+    output = _run_cycle_tracking_mtpk(model)
+
+    assert output.stats.rejected_drafts == 1
+    assert len(model.finish_calls) == 1
+    assert model.cycle_active is False
+
+
+def test_generate_mtpk_cycle_cleanup_precedes_accepted_stop_verify():
+    model = CycleTrackingTinyMTPModel(draft_token=2, target_verify_token=2)
+
+    output = _run_cycle_tracking_mtpk(
+        model,
+        max_tokens=3,
+        speculative_depth=2,
+        stop_token_ids={2},
+    )
+
+    assert output.tokens == [1, 2]
+    assert len(model.finish_calls) == 1
+    assert model.cycle_active is False
+
+
+def test_generate_mtpk_cycle_cleanup_precedes_adaptive_early_exit_verify():
+    model = CycleTrackingTinyMTPModel()
+
+    output = _run_cycle_tracking_mtpk(
+        model,
+        max_tokens=3,
+        speculative_depth=3,
+        adaptive_policy=StopAfterFirstDraftPolicy(),
+    )
+
+    assert output.stats.events[0]["gated_stop_depth"] == 1
+    assert len(model.finish_calls) == 1
+    assert model.cycle_active is False
+
+
+def test_generate_mtpk_cycle_cleanup_runs_when_recurrent_draft_raises():
+    model = CycleTrackingTinyMTPModel(fail_on_draft=1)
+
+    with pytest.raises(RuntimeError, match="synthetic recurrent draft failure"):
+        _run_cycle_tracking_mtpk(model)
+
+    assert len(model.finish_calls) == 1
+    assert model.cycle_active is False
+
+
+def test_generate_mtpk_evaluated_by_depth_stops_at_first_rejection():
+    model = RejectAtSecondDepthTinyMTPModel()
+
+    output = generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=4,
+        sampler=SamplerConfig(temperature=0.6, top_p=1.0, top_k=1),
+        speculative_depth=3,
+        mtp_history_policy="cycle",
+        verify_strategy="batched",
+        stop_token_ids={3},
+    )
+
+    assert output.tokens == [1, 2, 3]
+    assert output.stats.drafted_by_depth == [1, 1, 1]
+    assert output.stats.evaluated_by_depth == [1, 1, 0]
+    assert output.stats.accepted_by_depth == [1, 0, 0]
+    assert output.stats.evaluated_drafts == 2
+    assert output.stats.fully_accepted_verify_calls == 0
+    assert output.stats.mean_accept_probability_by_depth == [1.0, 0.0, None]
+
+
+def test_generate_mtpk_counts_a_fully_accepted_verify_call():
+    model = CycleTrackingTinyMTPModel()
+
+    output = _run_cycle_tracking_mtpk(
+        model,
+        max_tokens=4,
+        speculative_depth=3,
+    )
+
+    assert output.stats.evaluated_by_depth == [1, 1, 1]
+    assert output.stats.evaluated_drafts == 3
+    assert output.stats.fully_accepted_verify_calls == 1
+
+
+def test_cold_committed_history_reports_exact_rows_and_tps(monkeypatch):
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "0")
+    appended: list[tuple[list[int], int]] = []
+
+    def append_history(
+        _rt,
+        _mtp_cache,
+        hidden_states,
+        token_ids,
+        **_kwargs,
+    ):
+        appended.append((list(token_ids), int(hidden_states.shape[1])))
+        return 2.0
+
+    monkeypatch.setattr("mtplx.generation._append_mtp_history", append_history)
+    output = generate_mtpk(
+        _runtime(CycleTrackingTinyMTPModel(), mtp_enabled=True),
+        [0, 1, 2, 3],
+        max_tokens=1,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=1,
+        mtp_history_policy="committed",
+        stop_token_ids=set(),
+    )
+
+    assert appended == [([1, 2, 3], 3)]
+    assert output.stats.new_prefill_tokens == 4
+    assert output.stats.prompt_mtp_history_tokens == 3
+    assert output.stats.prompt_mtp_history_time_s == 2.0
+    assert output.stats.prompt_mtp_history_tok_s == pytest.approx(1.5)
+
+
+@pytest.mark.parametrize(
+    ("stop_token_ids", "expected_finish_reason"),
+    [(set(), "length"), ({1}, "stop")],
+    ids=["length", "stop"],
+)
+def test_generate_mtpk_final_state_commits_terminal_primary_to_both_caches(
+    stop_token_ids: set[int], expected_finish_reason: str
+):
+    model = PendingBonusThenRejectTinyMTPModel()
+
+    output = generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=1,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=1,
+        mtp_history_policy="committed",
+        verify_strategy="batched",
+        stop_token_ids=stop_token_ids,
+        capture_final_state=True,
+    )
+
+    assert output.tokens == [1]
+    assert output.final_state is not None
+    assert output.final_state.safe_to_commit is True
+    assert output.final_state.finish_reason == expected_finish_reason
+    assert output.stats.final_state_capture_time_s > 0.0
+    assert model.target_cache_offset == 2
+    assert model.mtp_committed_offset == 1
+
+    cold_continuation = generate_ar(
+        _runtime(PendingBonusThenRejectTinyMTPModel(), mtp_enabled=False),
+        [0, 1],
+        max_tokens=1,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        stop_token_ids=set(),
+    )
+    resumed_token = int(mx.argmax(output.final_state.final_logits[0]).item())
+    assert resumed_token == cold_continuation.tokens[0] == 2
+
+
+def test_generate_mtpk_pending_bonus_then_rejection_matches_ar():
+    sampler = SamplerConfig(temperature=0.6, top_p=1.0, top_k=1)
+    ar_model = PendingBonusThenRejectTinyMTPModel()
+    mtpk_model = PendingBonusThenRejectTinyMTPModel()
+
+    ar = generate_ar(
+        _runtime(ar_model, mtp_enabled=False),
+        [0],
+        max_tokens=6,
+        sampler=sampler,
+        stop_token_ids=set(),
+    )
+    mtpk = generate_mtpk(
+        _runtime(mtpk_model, mtp_enabled=True),
+        [0],
+        max_tokens=6,
+        sampler=sampler,
+        speculative_depth=2,
+        mtp_history_policy="committed",
+        verify_strategy="batched",
+        stop_token_ids=set(),
+        capture_final_state=True,
+    )
+
+    assert mtpk.tokens == ar.tokens == [1, 2, 3, 4, 5, 6]
+    assert mtpk.finish_reason == ar.finish_reason == "length"
+    assert mtpk.stats.generated_tokens == ar.stats.generated_tokens
+    assert mtpk.stats.events[0]["accepted_depths"] == 2
+    assert mtpk.stats.events[0]["bonus_token"] == 4
+    assert mtpk.stats.events[1]["accepted_depths"] == 1
+    assert mtpk.stats.events[1]["rejected_at_depth"] == 2
+    assert mtpk_model.target_cache_offset == 1 + mtpk.stats.generated_tokens
+    assert mtpk_model.mtp_committed_offset == mtpk.stats.generated_tokens
+
+
+def test_generate_mtpk_greedy_rejection_commits_batched_verifier_correction():
+    model = BatchShapeDriftTinyMTPModel()
+
+    output = generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=3,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=8),
+        speculative_depth=1,
+        mtp_history_policy="committed",
+        verify_strategy="batched",
+        stop_token_ids=set(),
+        capture_final_state=True,
+    )
+
+    rejected = output.stats.events[0]
+    correction = rejected["drafts"][0]["correction"]
+    assert rejected["rejected_at_depth"] == 1
+    assert correction == model.verifier_correction
+    assert output.tokens[:2] == [1, correction]
+    assert len(output.tokens) == 3
+    assert output.final_state is not None
+    assert output.final_state.safe_to_commit is True
+    assert output.final_state.generated_token_ids == tuple(output.tokens)
+    assert model.target_cache_offset == 1 + len(output.tokens)
+    assert model.mtp_committed_offset == len(output.tokens)
 
 
 def test_contiguous_then_repage_cache_layout_restores_paged_env(monkeypatch):
@@ -366,7 +830,9 @@ def test_auto_sustained_prefill_policy_keeps_dense_decode_through_128k(monkeypat
     assert _clear_cache_every() == 0
 
 
-def test_auto_sustained_prefill_policy_repages_when_paged_kv_quant_is_enabled(monkeypatch):
+def test_auto_sustained_prefill_policy_repages_when_paged_kv_quant_is_enabled(
+    monkeypatch,
+):
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "auto")
     monkeypatch.setenv("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", "131072")
     monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", "65536")
@@ -628,7 +1094,9 @@ def test_omit_speculative_bonus_skips_bonus_distribution_row(monkeypatch):
     assert out.stats.bonus_tokens == 0
 
 
-def test_trim_commit_keeps_rejected_verify_prefix_without_reforward(monkeypatch):
+def test_trim_commit_reuses_rejected_verify_prefix_and_forwards_correction(
+    monkeypatch,
+):
     monkeypatch.delenv("MTPLX_LAZY_BONUS_VERIFY", raising=False)
     model = RejectingTinyMTPModel()
 
@@ -644,10 +1112,10 @@ def test_trim_commit_keeps_rejected_verify_prefix_without_reforward(monkeypatch)
     )
 
     assert out.tokens == [1, 1]
-    assert [call["tokens"] for call in model.calls] == [1, 2]
+    assert [call["tokens"] for call in model.calls] == [1, 2, 1]
     assert model.target_cache[0].trimmed == [1]
-    assert out.stats.events[0]["capture_repair"] == "trimmed_prefix_commit"
-    assert "repair_forward" not in out.stats.events[0].get("timing_s", {})
+    assert out.stats.events[0]["capture_repair"] == "trimmed_prefix_correction_forward"
+    assert "repair_forward" in out.stats.events[0]["timing_s"]
 
 
 def test_sustained_prefill_chunks_without_full_prompt_logits(monkeypatch):
