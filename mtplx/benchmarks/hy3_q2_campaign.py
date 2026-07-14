@@ -561,13 +561,19 @@ def _valid_sha256(value: object) -> bool:
 
 
 def _valid_flat_name(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and value not in {"", ".", ".."}
-        and "/" not in value
-        and "\\" not in value
-        and "\x00" not in value
-    )
+    if (
+        not isinstance(value, str)
+        or value in {"", ".", ".."}
+        or "/" in value
+        or "\\" in value
+        or "\x00" in value
+    ):
+        return False
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return len(encoded) < 2**32
 
 
 def _resident_range_map(
