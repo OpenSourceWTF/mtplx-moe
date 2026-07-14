@@ -633,12 +633,17 @@ class SessionBankColdTier:
         return stats
 
     def flush(self, *, timeout_s: float = 30.0) -> bool:
-        deadline = time.time() + max(0.0, float(timeout_s))
-        while time.time() < deadline:
-            if self._queue.empty():
-                return True
-            time.sleep(0.05)
-        return self._queue.empty()
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        # Queue.empty() becomes true as soon as the writer dequeues an item,
+        # before the corresponding disk write and task_done() complete. Use
+        # Queue.join()'s unfinished-task condition with a bounded wait.
+        with self._queue.all_tasks_done:
+            while self._queue.unfinished_tasks:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self._queue.all_tasks_done.wait(timeout=remaining)
+        return True
 
     def cancel_pending(self) -> int:
         """Drop queued writes without encoding them.
