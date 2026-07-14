@@ -551,6 +551,58 @@ def _resident_shards(artifact: Mapping[str, Any]) -> set[str]:
     }
 
 
+def _valid_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _resident_range_map(
+    values: object,
+    *,
+    label: str,
+    errors: list[str],
+) -> dict[tuple[str, str, int, int], str]:
+    result: dict[tuple[str, str, int, int], str] = {}
+    rows = _sequence(values)
+    if not rows:
+        errors.append(f"{label} has no authenticated resident ranges")
+        return result
+    for index, raw in enumerate(rows):
+        item = _mapping(raw)
+        tensor = item.get("tensor")
+        shard = item.get("shard")
+        offset = item.get("offset")
+        length = item.get("length")
+        digest = item.get("sha256")
+        row_label = f"{label}[{index + 1}]"
+        if not isinstance(tensor, str) or not tensor:
+            errors.append(f"{row_label} has an invalid tensor name")
+            continue
+        if not isinstance(shard, str) or not shard:
+            errors.append(f"{row_label} has an invalid shard name")
+            continue
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            errors.append(f"{row_label} has an invalid offset")
+            continue
+        if isinstance(length, bool) or not isinstance(length, int) or length <= 0:
+            errors.append(f"{row_label} has an invalid length")
+            continue
+        if item.get("size", length) != length:
+            errors.append(f"{row_label} size does not match its range length")
+        if not _valid_sha256(digest):
+            errors.append(f"{row_label} has an invalid SHA-256")
+            continue
+        key = (tensor, shard, offset, length)
+        if key in result:
+            errors.append(f"{row_label} repeats resident range {key!r}")
+            continue
+        result[key] = digest
+    return result
+
+
 def _validate_artifact_binding(
     entries: Sequence[tuple[str, Mapping[str, Any], Mapping[str, Any]]],
     quality: Mapping[str, Any],
@@ -558,6 +610,47 @@ def _validate_artifact_binding(
     errors: list[str],
 ) -> dict[str, Any]:
     quality_lanes = _mapping(quality.get("lanes"))
+    quality_range_maps: dict[str, dict[tuple[str, str, int, int], str]] = {}
+    quality_shards: dict[str, set[str]] = {}
+    for lane in MODEL_KEYS:
+        quality_lane = _mapping(quality_lanes.get(lane))
+        quality_artifact = _mapping(quality_lane.get("artifact"))
+        residents = _mapping(quality_artifact.get("residents"))
+        _append_expected(
+            errors,
+            f"quality {lane} resident range algorithm",
+            residents.get("range_algorithm"),
+            "sha256-tensor-shard-offset-length-and-content-v1",
+        )
+        file_names: set[str] = set()
+        files = _sequence(residents.get("files"))
+        if not files:
+            errors.append(f"quality {lane} has no authenticated resident files")
+        for index, raw in enumerate(files):
+            item = _mapping(raw)
+            name = item.get("name")
+            actual = item.get("sha256")
+            declared = item.get("declared_sha256")
+            label = f"quality {lane} resident file[{index + 1}]"
+            if not isinstance(name, str) or not name or name in file_names:
+                errors.append(f"{label} has an invalid or repeated name")
+                continue
+            file_names.add(name)
+            if not _valid_sha256(actual) or not _valid_sha256(declared):
+                errors.append(f"{label} has an invalid actual or declared SHA-256")
+            elif actual != declared:
+                errors.append(f"{label} actual SHA-256 does not match declared SHA-256")
+        quality_shards[lane] = file_names
+        quality_range_maps[lane] = _resident_range_map(
+            residents.get("ranges"),
+            label=f"quality {lane} resident ranges",
+            errors=errors,
+        )
+        range_shards = {key[1] for key in quality_range_maps[lane]}
+        if range_shards != file_names:
+            errors.append(
+                f"quality {lane} resident range and file shard inventories differ"
+            )
     lane_references: dict[str, str] = {}
     harness_reference: str | None = None
     resident_reference: str | None = None
@@ -680,14 +773,18 @@ def _validate_artifact_binding(
                 item.get("sha256"),
                 benchmark_file.get("sha256"),
             )
-        receipt_residents = _mapping(quality_artifact.get("residents"))
-        receipt_shards = {
-            str(item.get("name"))
-            for raw in _sequence(receipt_residents.get("files"))
-            if (item := _mapping(raw)) and isinstance(item.get("name"), str)
-        }
-        if receipt_shards != _resident_shards(artifact):
+        if quality_shards[lane] != _resident_shards(artifact):
             errors.append(f"{label} quality resident shard inventory mismatch")
+        benchmark_ranges = _resident_range_map(
+            artifact.get("resident_tensors"),
+            label=f"{label} benchmark resident ranges",
+            errors=errors,
+        )
+        if benchmark_ranges != quality_range_maps[lane]:
+            errors.append(
+                f"{label} benchmark resident range content does not match "
+                f"the quality receipt for {lane}"
+            )
     return {"passed": not errors, "checked_artifacts": checked, "errors": list(errors)}
 
 

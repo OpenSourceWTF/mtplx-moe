@@ -496,6 +496,8 @@ def _write_lane_files(
                     {
                         "tensor": "model.embed_tokens.weight",
                         "shard": resident_name,
+                        "offset": 0,
+                        "length": len(resident_payload),
                     }
                 ],
             },
@@ -610,6 +612,19 @@ def test_compare_quality_records_receipts_and_never_co_resides_lanes(
     assert (
         result["lanes"]["q2"]["artifact"]["residents"]["files"][0]["sha256"]
         == expected_resident_sha256
+    )
+    assert result["lanes"]["q4"]["artifact"]["residents"]["ranges"] == [
+        {
+            "tensor": "model.embed_tokens.weight",
+            "shard": "model-00001-of-00001.safetensors",
+            "offset": 0,
+            "length": len(b"resident fixture\n"),
+            "sha256": expected_resident_sha256,
+        }
+    ]
+    assert (
+        result["lanes"]["q4"]["artifact"]["residents"]["ranges"]
+        == result["lanes"]["q2"]["artifact"]["residents"]["ranges"]
     )
     assert result["relative_perplexity_regression"] == pytest.approx(0.0)
     assert result["quality_passed"] is True

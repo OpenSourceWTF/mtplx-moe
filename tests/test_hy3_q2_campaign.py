@@ -385,11 +385,23 @@ def _quality() -> dict:
                 "index": {"sha256": "2" * 64},
                 "residents": {
                     "sha256": "0" * 64,
+                    "range_algorithm": (
+                        "sha256-tensor-shard-offset-length-and-content-v1"
+                    ),
                     "files": [
                         {
                             "name": "model-00001-of-00018.safetensors",
                             "sha256": "5" * 64,
                             "declared_sha256": "5" * 64,
+                        }
+                    ],
+                    "ranges": [
+                        {
+                            "tensor": "model.embed_tokens.weight",
+                            "shard": "model-00001-of-00018.safetensors",
+                            "offset": 4096,
+                            "length": 8192,
+                            "sha256": "5" * 64,
                         }
                     ],
                 },
@@ -578,7 +590,15 @@ def test_requires_exact_global_cache_capacity(lane: str, capacity: int) -> None:
 
 @pytest.mark.parametrize(
     "location",
-    ("manifest", "index", "tokenizer", "expert_payload", "harness"),
+    (
+        "manifest",
+        "index",
+        "tokenizer",
+        "expert_payload",
+        "harness",
+        "quality_resident_hash",
+        "benchmark_resident_range_hash",
+    ),
 )
 def test_quality_receipt_must_bind_every_benchmark_artifact(location: str) -> None:
     resource, headline, quality = _campaigns()
@@ -598,8 +618,18 @@ def test_quality_receipt_must_bind_every_benchmark_artifact(location: str) -> No
         ] = "f" * 64
     elif location == "expert_payload":
         model["expert_payload"]["verification_level"] = "declared_only"
-    else:
+    elif location == "harness":
         model["harness_source"]["source_sha256"] = "f" * 64
+    elif location == "quality_resident_hash":
+        quality["lanes"]["q2"]["artifact"]["residents"]["files"][0]["sha256"] = "f" * 64
+    else:
+        for candidate in [*resource, *headline]:
+            full = candidate["artifact_verification"]["model"]
+            stable = candidate["configuration_summary"]["performance_settings"][
+                "model_artifact"
+            ]
+            full["resident_tensors"][0]["sha256"] = "f" * 64
+            stable["resident_tensors"][0]["sha256"] = "f" * 64
 
     summary = summarize_hy3_q2_campaign(resource, headline, quality_payload=quality)
 

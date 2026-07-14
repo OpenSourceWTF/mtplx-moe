@@ -13,7 +13,7 @@ import os
 import re
 import stat
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -405,13 +405,29 @@ def _hash_bound_regular_file(
     *,
     label: str,
     bypass_page_cache: bool,
-) -> dict[str, Any]:
+    ranges: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     descriptor = _open_bound_regular_file(root_fd, name, label=label)
     try:
         opened = os.fstat(descriptor)
         expected_identity = _stable_identity(opened)
         if opened.st_size != expected_size:
             raise ValueError(f"{label} size does not match provenance")
+        range_states = []
+        previous_end = 0
+        for item in sorted(
+            ranges,
+            key=lambda value: (value["offset"], value["length"], value["tensor"]),
+        ):
+            offset = item["offset"]
+            length = item["length"]
+            end = offset + length
+            if offset < previous_end:
+                raise ValueError(f"{label} resident byte ranges overlap")
+            if end > expected_size:
+                raise ValueError(f"{label} resident byte range exceeds the shard")
+            previous_end = end
+            range_states.append((dict(item), hashlib.sha256()))
         page_cache_bypassed = False
         if bypass_page_cache:
             command = getattr(fcntl, "F_NOCACHE", None)
@@ -424,11 +440,31 @@ def _hash_bound_regular_file(
             page_cache_bypassed = True
         digest = hashlib.sha256()
         remaining = expected_size
+        position = 0
+        range_index = 0
         while remaining:
             payload = os.read(descriptor, min(remaining, 8 * 1024 * 1024))
             if not payload:
                 raise ValueError(f"{label} ended before its declared size")
             digest.update(payload)
+            chunk_end = position + len(payload)
+            while range_index < len(range_states):
+                item, range_digest = range_states[range_index]
+                range_start = item["offset"]
+                range_end = range_start + item["length"]
+                if range_start >= chunk_end:
+                    break
+                if range_end <= position:
+                    range_index += 1
+                    continue
+                start = max(position, range_start) - position
+                end = min(chunk_end, range_end) - position
+                range_digest.update(payload[start:end])
+                if range_end <= chunk_end:
+                    range_index += 1
+                    continue
+                break
+            position = chunk_end
             remaining -= len(payload)
         _revalidate_member_binding(
             root_fd,
@@ -437,13 +473,24 @@ def _hash_bound_regular_file(
             expected_identity,
             label=label,
         )
-        return {
-            "name": name,
-            "path": str(path),
-            "bytes": expected_size,
-            "sha256": digest.hexdigest(),
-            "page_cache_bypassed": page_cache_bypassed,
-        }
+        if range_index != len(range_states):
+            raise ValueError(f"{label} ended before all resident ranges were hashed")
+        return (
+            {
+                "name": name,
+                "path": str(path),
+                "bytes": expected_size,
+                "sha256": digest.hexdigest(),
+                "page_cache_bypassed": page_cache_bypassed,
+            },
+            [
+                {
+                    **item,
+                    "sha256": range_digest.hexdigest(),
+                }
+                for item, range_digest in range_states
+            ],
+        )
     finally:
         os.close(descriptor)
 
@@ -502,11 +549,33 @@ def _artifact_receipt(
     if not isinstance(raw_residents, list) or not isinstance(raw_shards, list):
         raise ValueError("expert manifest has no resident shard provenance")
     resident_names: set[str] = set()
+    resident_ranges: dict[str, list[dict[str, Any]]] = {}
+    resident_keys: set[tuple[str, str, int, int]] = set()
     for item in raw_residents:
         if not isinstance(item, dict):
             raise ValueError("expert manifest resident tensor must be an object")
-        resident_names.add(
-            _flat_artifact_name(item.get("shard"), label="resident shard")
+        tensor = item.get("tensor")
+        if not isinstance(tensor, str) or not tensor:
+            raise ValueError("expert manifest resident tensor has no name")
+        shard = _flat_artifact_name(item.get("shard"), label="resident shard")
+        offset = item.get("offset")
+        length = item.get("length")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError(f"resident tensor {tensor} has an invalid offset")
+        if isinstance(length, bool) or not isinstance(length, int) or length <= 0:
+            raise ValueError(f"resident tensor {tensor} has an invalid length")
+        key = (tensor, shard, offset, length)
+        if key in resident_keys:
+            raise ValueError(f"expert manifest repeats resident tensor range: {tensor}")
+        resident_keys.add(key)
+        resident_names.add(shard)
+        resident_ranges.setdefault(shard, []).append(
+            {
+                "tensor": tensor,
+                "shard": shard,
+                "offset": offset,
+                "length": length,
+            }
         )
     if not resident_names:
         raise ValueError("expert manifest has no resident tensors")
@@ -523,6 +592,7 @@ def _artifact_receipt(
     root_fd = _open_anchored_directory(resolved_root, label="model root")
     root_identity = _stable_identity(os.fstat(root_fd))
     resident_files = []
+    resident_range_receipts = []
     resident_digest = hashlib.sha256()
     try:
         for name in sorted(resident_names):
@@ -540,13 +610,14 @@ def _artifact_receipt(
                 raise ValueError(
                     f"resident shard has invalid SHA-256 provenance: {name}"
                 )
-            receipt = _hash_bound_regular_file(
+            receipt, range_receipts = _hash_bound_regular_file(
                 root_fd,
                 resolved_root / name,
                 name,
                 size,
                 label=f"resident shard {name}",
                 bypass_page_cache=bypass_page_cache,
+                ranges=resident_ranges[name],
             )
             if receipt["sha256"] != declared_sha256:
                 raise ValueError(
@@ -559,6 +630,7 @@ def _artifact_receipt(
             resident_digest.update(bytes.fromhex(receipt["sha256"]))
             receipt["declared_sha256"] = declared_sha256
             resident_files.append(receipt)
+            resident_range_receipts.extend(range_receipts)
 
         index_name = "model.safetensors.index.json"
         index_path = resolved_root / index_name
@@ -600,6 +672,16 @@ def _artifact_receipt(
             "algorithm": "sha256-name-size-and-verified-file-digest-v1",
             "sha256": resident_digest.hexdigest(),
             "files": resident_files,
+            "range_algorithm": "sha256-tensor-shard-offset-length-and-content-v1",
+            "ranges": sorted(
+                resident_range_receipts,
+                key=lambda item: (
+                    item["tensor"],
+                    item["shard"],
+                    item["offset"],
+                    item["length"],
+                ),
+            ),
         },
     }
 
