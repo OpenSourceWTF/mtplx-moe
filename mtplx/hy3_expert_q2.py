@@ -21,9 +21,12 @@ from .expert_manifest import (
     ExpertManifest,
     ExpertRecord,
     ResidentTensor,
+    SidecarInfo,
     ShardInfo,
     TensorSegment,
+    make_sidecar_authoritative,
     validate_expert_manifest_spec,
+    verify_expert_manifest,
 )
 from .expert_streaming_models import ExpertStreamingModelSpec, get_model_spec
 
@@ -55,6 +58,8 @@ _TARGET_DIRECTORY_NAME = "hy3-expert-only-mlx-q2"
 _WORK_DIRECTORY_NAME = ".hy3-expert-only-mlx-q2.incomplete"
 _JOURNAL_FILE = "conversion-journal.jsonl"
 _SIDECAR_FILE = "experts.bin"
+_EXPERT_MANIFEST_FILE = "expert-manifest.json"
+_CONVERSION_MANIFEST_FILE = "conversion-manifest.json"
 _DEFAULT_ALIGNMENT = 16 * 1024
 _SOURCE_RECORD_BYTES = 10_616_832
 _TARGET_RECORD_BYTES = 5_898_240
@@ -3265,3 +3270,933 @@ def convert_expert_records(
             os.close(work_fd)
         if context is not None:
             _close_preflight_context(context)
+
+
+def pilot_hy3_expert_q2(
+    config: ConversionConfig,
+    records: tuple[tuple[int, int], ...],
+) -> dict[str, Any]:
+    """Convert selected held source records in memory without artifact mutation."""
+
+    if not isinstance(records, tuple) or not records:
+        raise ValueError("pilot records must be a non-empty tuple")
+    normalized: list[tuple[int, int]] = []
+    for item in records:
+        if (
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) for value in item
+            )
+        ):
+            raise ValueError(
+                "pilot records must contain exact (layer, expert) integers"
+            )
+        normalized.append(item)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("pilot records must be unique")
+
+    context = _preflight_context(config, deep_source_hash=True)
+    try:
+        sidecar_fd = context.pinned.artifacts[_SIDECAR_FILE].fd
+        results: list[dict[str, Any]] = []
+        for layer, expert in normalized:
+            source_record = context.manifest.record(layer, expert)
+            source_payload, source_state = _source_record_state(
+                sidecar_fd,
+                source_record,
+            )
+            _record, _payload, output_state, diagnostics = _convert_one_record(
+                source_record,
+                source_payload,
+                context.target_descriptor,
+                output_offset=0,
+            )
+            results.append(
+                {
+                    "layer": layer,
+                    "expert": expert,
+                    "source_sha256": source_state["sha256"],
+                    "output_sha256": output_state["sha256"],
+                    "output_bytes": output_state["length"],
+                    "diagnostics": diagnostics,
+                }
+            )
+        _assert_pinned_preflight_identities(context.pinned)
+        return {
+            "schema": "mtplx-hy3-expert-q2-pilot-v1",
+            "passed": True,
+            "source_fingerprint_sha256": context.report["source"]["fingerprint_sha256"],
+            "target_descriptor": context.report["target_descriptor"],
+            "records": results,
+        }
+    finally:
+        _close_preflight_context(context)
+
+
+def stage_hy3_expert_q2(config: ConversionConfig) -> Path:
+    """Deep-gate and copy the exact resident/ancillary allowlist into work."""
+
+    context = _preflight_context(config, deep_source_hash=True)
+    work_fd: int | None = None
+    try:
+        parent_fd = context.pinned.output_parent_fd
+        _assert_pinned_preflight_identities(context.pinned)
+        work_fd = _open_or_create_work_root(config, parent_fd)
+        if os.listdir(work_fd):
+            raise ValueError("conversion work root must be empty before staging")
+        work_root = _work_root(config)
+        _assert_work_root_identity(parent_fd, work_fd)
+        _assert_directory_path_identity(
+            work_root,
+            work_fd,
+            label="conversion work root",
+        )
+        os.close(work_fd)
+        work_fd = None
+        resident = stage_exact_residents(
+            context.pinned.source_root,
+            context.manifest,
+            work_root,
+        )
+        if len(resident.shards) != context.expectations.resident_shard_count:
+            raise ValueError("staged resident shard count mismatch")
+        if resident.tensors != context.manifest.resident_tensors:
+            raise ValueError("staged resident tensor inventory mismatch")
+        expected_files = {
+            *(shard.name for shard in resident.shards),
+            _INDEX_FILE,
+            *_ANCILLARY_FILES,
+        }
+        if set(resident.copied_files) != expected_files:
+            raise ValueError("staged resident and ancillary file inventory mismatch")
+        _assert_pinned_preflight_identities(context.pinned)
+        return work_root
+    finally:
+        if work_fd is not None:
+            os.close(work_fd)
+        _close_preflight_context(context)
+
+
+def _open_existing_work_root(config: ConversionConfig, parent_fd: int) -> int:
+    _assert_directory_path_identity(
+        config.output_root.parent,
+        parent_fd,
+        label="output parent",
+    )
+    try:
+        os.stat(
+            config.output_root.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        pass
+    else:
+        raise ValueError("final output root already exists")
+    try:
+        entry = os.stat(
+            _WORK_DIRECTORY_NAME,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(entry.st_mode):
+            raise ValueError("conversion work root must be a real directory")
+        work_fd = os.open(
+            _WORK_DIRECTORY_NAME,
+            _directory_flags(),
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        raise ValueError(f"conversion work root is unavailable: {exc}") from exc
+    try:
+        descriptor = os.fstat(work_fd)
+        repeated = os.stat(
+            _WORK_DIRECTORY_NAME,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (entry.st_dev, entry.st_ino) != (descriptor.st_dev, descriptor.st_ino) or (
+            repeated.st_dev,
+            repeated.st_ino,
+        ) != (descriptor.st_dev, descriptor.st_ino):
+            raise ValueError("conversion work root changed while opening")
+        return work_fd
+    except BaseException:
+        os.close(work_fd)
+        raise
+
+
+def _durable_write_json_member(
+    directory_fd: int,
+    name: str,
+    value: Any,
+) -> tuple[str, int]:
+    name = _require_flat_target_name(name)
+    payload = (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    temporary = f".{name}.tmp"
+    try:
+        stale = os.stat(temporary, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        stale = None
+    if stale is not None:
+        if not stat.S_ISREG(stale.st_mode) or stale.st_nlink != 1:
+            raise ValueError(f"unsafe stale manifest temporary: {temporary}")
+        os.unlink(temporary, dir_fd=directory_fd)
+    fd: int | None = None
+    try:
+        fd = os.open(temporary, _write_flags(), 0o644, dir_fd=directory_fd)
+        _pwrite_all(fd, payload, 0)
+        os.ftruncate(fd, len(payload))
+        os.fsync(fd)
+        descriptor = os.fstat(fd)
+        entry = os.stat(temporary, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or entry.st_nlink != 1
+            or (entry.st_dev, entry.st_ino) != (descriptor.st_dev, descriptor.st_ino)
+        ):
+            raise ValueError(f"manifest temporary identity changed: {temporary}")
+        os.close(fd)
+        fd = None
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+        return hashlib.sha256(payload).hexdigest(), len(payload)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _read_json_member(
+    directory_fd: int,
+    name: str,
+    *,
+    max_bytes: int,
+    label: str,
+) -> tuple[Any, str, int]:
+    name = _require_flat_target_name(name)
+    try:
+        entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        fd = os.open(name, _read_flags(), dir_fd=directory_fd)
+    except OSError as exc:
+        raise ValueError(f"{label} is unavailable: {exc}") from exc
+    try:
+        descriptor = os.fstat(fd)
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or entry.st_size > max_bytes
+            or (entry.st_dev, entry.st_ino) != (descriptor.st_dev, descriptor.st_ino)
+        ):
+            raise ValueError(f"{label} must be a bounded regular file")
+        payload = _pread_exact(fd, 0, descriptor.st_size, label=label)
+    finally:
+        os.close(fd)
+    try:
+        value = json.loads(payload, object_pairs_hook=_strict_json_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid {label} JSON: {exc}") from exc
+    return value, hashlib.sha256(payload).hexdigest(), len(payload)
+
+
+def _journal_header_without_pilot(
+    config: ConversionConfig,
+    context: _PreflightContext,
+) -> dict[str, Any]:
+    header = _journal_header(config, context)
+    body = {key: value for key, value in header.items() if key != "header_sha256"}
+    body["pilot_report_sha256"] = None
+    return {
+        **body,
+        "header_sha256": hashlib.sha256(_canonical_json_bytes(body)).hexdigest(),
+    }
+
+
+def _build_authoritative_manifest(
+    context: _PreflightContext,
+    records: tuple[ExpertRecord, ...],
+    *,
+    sidecar_sha256: str,
+) -> ExpertManifest:
+    resident_names = {tensor.shard for tensor in context.manifest.resident_tensors}
+    resident_shards = tuple(
+        shard
+        for shard in context.manifest.shards
+        if shard.kind == "safetensors" and shard.name in resident_names
+    )
+    if len(resident_shards) != context.expectations.resident_shard_count:
+        raise ValueError("authoritative resident shard count mismatch")
+    sidecar = SidecarInfo(
+        file=_SIDECAR_FILE,
+        alignment=context.expectations.alignment,
+        size=context.expectations.target_sidecar_bytes,
+        sha256=sidecar_sha256,
+    )
+    sidecar_shard = ShardInfo(
+        name=_SIDECAR_FILE,
+        size=sidecar.size,
+        header_bytes=0,
+        header_sha256=hashlib.sha256(b"").hexdigest(),
+        sha256=sidecar.sha256,
+        kind="sidecar",
+    )
+    spec = context.target_descriptor
+    candidate = ExpertManifest(
+        model_key=spec.key,
+        source_repo=spec.quant_model,
+        source_revision=spec.quant_revision,
+        quant_bits=spec.quant_bits,
+        quant_group_size=spec.quant_group_size,
+        quant_mode="affine",
+        artifact_tensor_bytes=context.expectations.target_tensor_bytes,
+        resident_tensor_bytes=context.expectations.resident_tensor_bytes,
+        routed_expert_bytes=context.expectations.target_sidecar_bytes,
+        shards=(*resident_shards, sidecar_shard),
+        resident_tensors=context.manifest.resident_tensors,
+        records=records,
+        sidecar=sidecar,
+        manifest_sha256=None,
+    ).with_digest()
+    return make_sidecar_authoritative(candidate, spec)
+
+
+def _publish_verified_work(
+    config: ConversionConfig,
+    context: _PreflightContext,
+    work_fd: int,
+) -> Path:
+    parent_fd = context.pinned.output_parent_fd
+    _assert_pinned_preflight_identities(context.pinned)
+    _assert_work_root_identity(parent_fd, work_fd)
+    try:
+        os.stat(
+            config.output_root.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        pass
+    else:
+        raise ValueError("final output root appeared before atomic publish")
+    os.replace(
+        _WORK_DIRECTORY_NAME,
+        config.output_root.name,
+        src_dir_fd=parent_fd,
+        dst_dir_fd=parent_fd,
+    )
+    os.fsync(parent_fd)
+    _assert_directory_path_identity(
+        config.output_root,
+        work_fd,
+        label="published output root",
+    )
+    return config.output_root
+
+
+def _validate_pilot_report(
+    config: ConversionConfig,
+    context: _PreflightContext,
+) -> None:
+    if config.pilot_report is None:
+        raise ValueError("finalization requires a pilot report")
+    report, digest, _size = _read_json_path(
+        config.pilot_report,
+        max_bytes=_MAX_PROVENANCE_BYTES,
+        label="Hy3 Q2 pilot report",
+    )
+    if digest != context.report["pilot_report_sha256"]:
+        raise ValueError("Hy3 Q2 pilot report hash changed after preflight")
+    expected_keys = {
+        "schema",
+        "passed",
+        "source_fingerprint_sha256",
+        "target_descriptor",
+        "records",
+    }
+    if (
+        not isinstance(report, dict)
+        or set(report) != expected_keys
+        or report.get("schema") != "mtplx-hy3-expert-q2-pilot-v1"
+        or report.get("passed") is not True
+        or report.get("source_fingerprint_sha256")
+        != context.report["source"]["fingerprint_sha256"]
+        or report.get("target_descriptor") != context.report["target_descriptor"]
+        or not isinstance(report.get("records"), list)
+        or not report["records"]
+    ):
+        raise ValueError("Hy3 Q2 pilot report provenance is invalid")
+    coordinates: list[tuple[int, int]] = []
+    for item in report["records"]:
+        if (
+            not isinstance(item, dict)
+            or set(item)
+            != {
+                "layer",
+                "expert",
+                "source_sha256",
+                "output_sha256",
+                "output_bytes",
+                "diagnostics",
+            }
+            or isinstance(item.get("layer"), bool)
+            or not isinstance(item.get("layer"), int)
+            or isinstance(item.get("expert"), bool)
+            or not isinstance(item.get("expert"), int)
+            or item.get("output_bytes") != context.expectations.target_record_bytes
+            or any(
+                not isinstance(item.get(key), str)
+                or re.fullmatch(r"[0-9a-f]{64}", item[key]) is None
+                for key in ("source_sha256", "output_sha256")
+            )
+            or not isinstance(item.get("diagnostics"), list)
+            or len(item["diagnostics"]) != len(_PROJECTIONS)
+        ):
+            raise ValueError("Hy3 Q2 pilot record receipt is invalid")
+        coordinates.append((item["layer"], item["expert"]))
+        source_record = context.manifest.record(item["layer"], item["expert"])
+        if item["source_sha256"] != source_record.sha256:
+            raise ValueError("Hy3 Q2 pilot source record receipt is invalid")
+        for projection, diagnostic in zip(
+            _PROJECTIONS,
+            item["diagnostics"],
+            strict=True,
+        ):
+            if (
+                not isinstance(diagnostic, dict)
+                or set(diagnostic)
+                != {
+                    "component",
+                    "cosine_q4_q2",
+                    "normalized_error_q4_q2",
+                    "finite",
+                }
+                or diagnostic.get("component") != projection
+                or diagnostic.get("finite") is not True
+                or not isinstance(diagnostic.get("cosine_q4_q2"), (int, float))
+                or not math.isfinite(diagnostic["cosine_q4_q2"])
+                or not isinstance(
+                    diagnostic.get("normalized_error_q4_q2"),
+                    (int, float),
+                )
+                or not math.isfinite(diagnostic["normalized_error_q4_q2"])
+            ):
+                raise ValueError("Hy3 Q2 pilot diagnostics are invalid")
+    if len(coordinates) != len(set(coordinates)):
+        raise ValueError("Hy3 Q2 pilot records are duplicated")
+
+
+def finalize_hy3_expert_q2(config: ConversionConfig) -> Path:
+    """Assemble, deeply verify, and atomically publish the completed artifact."""
+
+    if config.pilot_report is None:
+        raise ValueError("finalization requires a pilot report")
+    context = _preflight_context(config, deep_source_hash=True)
+    work_fd: int | None = None
+    journal_fd: int | None = None
+    output_fd: int | None = None
+    try:
+        _validate_pilot_report(config, context)
+        parent_fd = context.pinned.output_parent_fd
+        work_fd = _open_existing_work_root(config, parent_fd)
+        work_root = _work_root(config)
+        _assert_work_root_identity(parent_fd, work_fd)
+        _assert_directory_path_identity(
+            work_root,
+            work_fd,
+            label="conversion work root",
+        )
+        try:
+            output_fd = os.open(_SIDECAR_FILE, _read_flags(), dir_fd=work_fd)
+        except OSError as exc:
+            raise ValueError(
+                f"completed conversion sidecar is unavailable: {exc}"
+            ) from exc
+        try:
+            journal_fd = os.open(_JOURNAL_FILE, _read_flags(), dir_fd=work_fd)
+        except FileNotFoundError:
+            _assert_conversion_file_identity(work_fd, _SIDECAR_FILE, output_fd)
+            _verify_hy3_root(work_root, deep=True, allow_journal=False)
+            conversion, _digest, _size = _read_json_member(
+                work_fd,
+                _CONVERSION_MANIFEST_FILE,
+                max_bytes=_MAX_PROVENANCE_BYTES,
+                label="target conversion provenance",
+            )
+            if (
+                not isinstance(conversion, dict)
+                or conversion.get("producer") != context.report["producer"]
+                or conversion.get("mlx_version") != context.report["mlx_version"]
+                or conversion.get("target_descriptor")
+                != context.report["target_descriptor"]
+                or not isinstance(conversion.get("source"), dict)
+                or conversion["source"].get("fingerprint_sha256")
+                != context.report["source"]["fingerprint_sha256"]
+                or conversion.get("pilot_report_sha256")
+                != context.report["pilot_report_sha256"]
+            ):
+                raise ValueError("verified work build or pilot receipt mismatch")
+            return _publish_verified_work(config, context, work_fd)
+        except OSError as exc:
+            raise ValueError(f"conversion journal is unavailable: {exc}") from exc
+        _assert_conversion_file_identity(work_fd, _SIDECAR_FILE, output_fd)
+        _assert_conversion_file_identity(work_fd, _JOURNAL_FILE, journal_fd)
+        parsed, complete_end, partial_tail = _parse_journal(journal_fd)
+        if partial_tail or complete_end != os.fstat(journal_fd).st_size:
+            raise ValueError("conversion journal has an incomplete tail")
+        expected_header = _journal_header_without_pilot(config, context)
+        _validate_journal_chain(parsed, expected_header, context.manifest.records)
+        if len(parsed) - 1 != context.expectations.record_count:
+            raise ValueError("conversion journal is not complete")
+        if os.fstat(output_fd).st_size != context.expectations.target_sidecar_bytes:
+            raise ValueError("conversion output sidecar size mismatch")
+        records = tuple(
+            _record_from_output_state(
+                context.manifest.records[ordinal],
+                context.target_descriptor,
+                line["output"],
+                ordinal=ordinal,
+                target_record_bytes=context.expectations.target_record_bytes,
+            )
+            for ordinal, (line, _start, _end) in enumerate(parsed[1:])
+        )
+        sidecar_sha256 = _hash_fd(
+            output_fd,
+            length=context.expectations.target_sidecar_bytes,
+            chunk_bytes=8 * 1024**2,
+        )
+        journal_bytes = os.fstat(journal_fd).st_size
+        journal_sha256 = _hash_fd(
+            journal_fd,
+            length=journal_bytes,
+            chunk_bytes=8 * 1024**2,
+        )
+        authoritative = _build_authoritative_manifest(
+            context,
+            records,
+            sidecar_sha256=sidecar_sha256,
+        )
+        expert_file_sha256, expert_file_bytes = _durable_write_json_member(
+            work_fd,
+            _EXPERT_MANIFEST_FILE,
+            authoritative.to_dict(),
+        )
+        conversion = json.loads(_canonical_json_bytes(context.report))
+        conversion["target"].update(
+            {
+                "sidecar_sha256": sidecar_sha256,
+                "expert_manifest_sha256": authoritative.manifest_sha256,
+                "expert_manifest_file_sha256": expert_file_sha256,
+                "expert_manifest_file_bytes": expert_file_bytes,
+            }
+        )
+        conversion["journal"] = {
+            "schema": "mtplx-hy3-expert-q2-journal-receipt-v1",
+            "sha256": journal_sha256,
+            "bytes": journal_bytes,
+            "header_sha256": parsed[0][0]["header_sha256"],
+            "last_entry_sha256": parsed[-1][0]["entry_sha256"],
+            "record_count": len(parsed) - 1,
+        }
+        _durable_write_json_member(
+            work_fd,
+            _CONVERSION_MANIFEST_FILE,
+            conversion,
+        )
+        _verify_hy3_root(work_root, deep=True, allow_journal=True)
+        _assert_conversion_file_identity(work_fd, _JOURNAL_FILE, journal_fd)
+        os.unlink(_JOURNAL_FILE, dir_fd=work_fd)
+        os.fsync(work_fd)
+        _verify_hy3_root(work_root, deep=False, allow_journal=False)
+        return _publish_verified_work(config, context, work_fd)
+    finally:
+        if journal_fd is not None:
+            os.close(journal_fd)
+        if output_fd is not None:
+            os.close(output_fd)
+        if work_fd is not None:
+            os.close(work_fd)
+        _close_preflight_context(context)
+
+
+def _verify_hy3_root(
+    root: Path,
+    *,
+    deep: bool,
+    allow_journal: bool,
+) -> dict[str, Any]:
+    if not isinstance(deep, bool) or not isinstance(allow_journal, bool):
+        raise TypeError("verification flags must be bool")
+    root = _require_real_directory(Path(root), label="Hy3 Q2 artifact root")
+    root_fd = os.open(root, _directory_flags())
+    try:
+        _assert_directory_path_identity(root, root_fd, label="Hy3 Q2 artifact root")
+        manifest_value, manifest_file_sha256, manifest_file_bytes = _read_json_member(
+            root_fd,
+            _EXPERT_MANIFEST_FILE,
+            max_bytes=_MAX_MANIFEST_BYTES,
+            label="target expert manifest",
+        )
+        conversion, _conversion_sha256, _conversion_bytes = _read_json_member(
+            root_fd,
+            _CONVERSION_MANIFEST_FILE,
+            max_bytes=_MAX_PROVENANCE_BYTES,
+            label="target conversion provenance",
+        )
+        try:
+            manifest = ExpertManifest.from_dict(manifest_value)
+        except ValueError as exc:
+            raise ValueError(f"target expert manifest is invalid: {exc}") from exc
+        spec = _target_descriptor()
+        expectations = _conversion_expectations()
+        validate_expert_manifest_spec(manifest, spec)
+        if (
+            manifest.model_key != TARGET_MODEL_KEY
+            or manifest.quant_bits != 2
+            or manifest.quant_group_size != 64
+            or manifest.quant_mode != "affine"
+            or manifest.artifact_tensor_bytes != expectations.target_tensor_bytes
+            or manifest.resident_tensor_bytes != expectations.resident_tensor_bytes
+            or manifest.routed_expert_bytes != expectations.target_sidecar_bytes
+            or len(manifest.records) != expectations.record_count
+        ):
+            raise ValueError(
+                "target expert manifest exact byte or record contract failed"
+            )
+        resident_shards = tuple(
+            shard for shard in manifest.shards if shard.kind == "safetensors"
+        )
+        sidecar_shards = tuple(
+            shard for shard in manifest.shards if shard.kind == "sidecar"
+        )
+        if (
+            len(resident_shards) != expectations.resident_shard_count
+            or len(sidecar_shards) != 1
+            or sidecar_shards[0].name != _SIDECAR_FILE
+            or manifest.sidecar is None
+            or manifest.sidecar.file != _SIDECAR_FILE
+            or manifest.sidecar.size != expectations.target_sidecar_bytes
+            or manifest.sidecar.sha256 != sidecar_shards[0].sha256
+        ):
+            raise ValueError(
+                "authoritative sidecar or resident shard inventory mismatch"
+            )
+        if not isinstance(conversion, dict):
+            raise ValueError("target conversion provenance must be an object")
+        expected_conversion_keys = {
+            "schema",
+            "source",
+            "derivation",
+            "target",
+            "producer",
+            "mlx_version",
+            "target_descriptor",
+            "alignment",
+            "resident_copy_policy",
+            "pilot_report_sha256",
+            "space",
+            "journal",
+        }
+        if set(conversion) != expected_conversion_keys:
+            raise ValueError("target conversion provenance fields mismatch")
+        minimum = _minimum_conversion_manifest(expectations)
+        if conversion.get("schema") != minimum["schema"]:
+            raise ValueError("target conversion provenance schema mismatch")
+        if conversion.get("derivation") != minimum["derivation"]:
+            raise ValueError("target conversion provenance derivation mismatch")
+        target = conversion.get("target")
+        source = conversion.get("source")
+        journal = conversion.get("journal")
+        expected_target_keys = {
+            *minimum["target"],
+            "sidecar_sha256",
+            "expert_manifest_sha256",
+            "expert_manifest_file_sha256",
+            "expert_manifest_file_bytes",
+        }
+        if (
+            not isinstance(target, dict)
+            or set(target) != expected_target_keys
+            or any(target.get(key) != value for key, value in minimum["target"].items())
+        ):
+            raise ValueError("target conversion provenance byte contract mismatch")
+        if (
+            target.get("sidecar_sha256") != manifest.sidecar.sha256
+            or target.get("expert_manifest_sha256") != manifest.manifest_sha256
+            or target.get("expert_manifest_file_sha256") != manifest_file_sha256
+            or target.get("expert_manifest_file_bytes") != manifest_file_bytes
+        ):
+            raise ValueError("target conversion provenance manifest receipt mismatch")
+        if (
+            conversion.get("target_descriptor") != _target_descriptor_state(spec)
+            or conversion.get("alignment") != expectations.alignment
+            or conversion.get("resident_copy_policy") != "exact-independent-whole-file"
+        ):
+            raise ValueError("target conversion provenance descriptor mismatch")
+        producer = conversion.get("producer")
+        mlx_version = conversion.get("mlx_version")
+        pilot_sha256 = conversion.get("pilot_report_sha256")
+        if (
+            not isinstance(producer, dict)
+            or set(producer) != {"git_commit", "dirty"}
+            or producer.get("dirty") is not False
+            or not isinstance(producer.get("git_commit"), str)
+            or re.fullmatch(r"[0-9a-f]{40}", producer["git_commit"]) is None
+            or not isinstance(mlx_version, str)
+            or not mlx_version
+            or not isinstance(pilot_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", pilot_sha256) is None
+        ):
+            raise ValueError("target conversion provenance producer receipt mismatch")
+        expected_source_keys = {
+            "model_key",
+            "manifest_file_sha256",
+            "manifest_sha256",
+            "conversion_provenance_sha256",
+            "sidecar_sha256",
+            "path",
+            "record_count",
+            "record_bytes",
+            "sidecar_bytes",
+            "index_sha256",
+            "config_sha256",
+            "fingerprint_sha256",
+            "resident_files",
+            "ancillary_files",
+        }
+        if (
+            not isinstance(source, dict)
+            or set(source) != expected_source_keys
+            or source.get("model_key") != SOURCE_MODEL_KEY
+            or source.get("path") != os.fspath(expectations.source_root)
+            or source.get("record_count") != expectations.record_count
+            or source.get("record_bytes") != expectations.source_record_bytes
+            or source.get("sidecar_bytes") != expectations.source_sidecar_bytes
+            or source.get("manifest_file_sha256") != expectations.manifest_file_sha256
+            or source.get("manifest_sha256") != expectations.manifest_sha256
+            or source.get("conversion_provenance_sha256")
+            != expectations.provenance_sha256
+            or source.get("index_sha256") != expectations.index_sha256
+            or source.get("config_sha256") != expectations.config_sha256
+            or source.get("sidecar_sha256") != expectations.sidecar_sha256
+        ):
+            raise ValueError("target conversion provenance source mismatch")
+        if (
+            not isinstance(journal, dict)
+            or set(journal)
+            != {
+                "schema",
+                "sha256",
+                "bytes",
+                "header_sha256",
+                "last_entry_sha256",
+                "record_count",
+            }
+            or journal.get("schema") != "mtplx-hy3-expert-q2-journal-receipt-v1"
+            or journal.get("record_count") != expectations.record_count
+            or not isinstance(journal.get("bytes"), int)
+            or journal["bytes"] <= 0
+            or any(
+                not isinstance(journal.get(key), str)
+                or re.fullmatch(r"[0-9a-f]{64}", journal[key]) is None
+                for key in ("sha256", "header_sha256", "last_entry_sha256")
+            )
+        ):
+            raise ValueError("target conversion provenance journal receipt mismatch")
+        if allow_journal:
+            try:
+                journal_fd = os.open(_JOURNAL_FILE, _read_flags(), dir_fd=root_fd)
+            except OSError as exc:
+                raise ValueError(
+                    f"staged journal receipt is unavailable: {exc}"
+                ) from exc
+            try:
+                parsed_journal, journal_end, journal_tail = _parse_journal(journal_fd)
+                journal_size = os.fstat(journal_fd).st_size
+                if (
+                    journal_tail
+                    or journal_end != journal_size
+                    or journal_size != journal["bytes"]
+                    or len(parsed_journal) - 1 != journal["record_count"]
+                    or parsed_journal[0][0].get("header_sha256")
+                    != journal["header_sha256"]
+                    or parsed_journal[-1][0].get("entry_sha256")
+                    != journal["last_entry_sha256"]
+                    or _hash_fd(
+                        journal_fd,
+                        length=journal_size,
+                        chunk_bytes=8 * 1024**2,
+                    )
+                    != journal["sha256"]
+                ):
+                    raise ValueError("staged journal receipt does not match its file")
+            finally:
+                os.close(journal_fd)
+
+        resident_receipts = source.get("resident_files")
+        ancillary_receipts = source.get("ancillary_files")
+        if not isinstance(resident_receipts, list) or not isinstance(
+            ancillary_receipts, list
+        ):
+            raise ValueError("target conversion provenance file receipts are missing")
+        resident_by_name = {
+            item.get("file"): item
+            for item in resident_receipts
+            if isinstance(item, dict)
+        }
+        shard_by_name = {shard.name: shard for shard in resident_shards}
+        if len(resident_receipts) != len(resident_by_name) or set(
+            resident_by_name
+        ) != set(shard_by_name):
+            raise ValueError("resident provenance inventory mismatch")
+        for name, shard in shard_by_name.items():
+            receipt = resident_by_name[name]
+            if (
+                receipt.get("size") != shard.size
+                or receipt.get("sha256") != shard.sha256
+            ):
+                raise ValueError(f"resident provenance mismatch: {name}")
+
+        ancillary_by_name = {
+            item.get("file"): item
+            for item in ancillary_receipts
+            if isinstance(item, dict)
+        }
+        expected_ancillary = {_INDEX_FILE, *_ANCILLARY_FILES}
+        if (
+            len(ancillary_receipts) != len(ancillary_by_name)
+            or set(ancillary_by_name) != expected_ancillary
+        ):
+            raise ValueError("ancillary provenance inventory mismatch")
+        for name, receipt in ancillary_by_name.items():
+            digest, size = _sha256_path(root / name)
+            if receipt.get("size") != size or receipt.get("sha256") != digest:
+                raise ValueError(f"ancillary hash mismatch: {name}")
+
+        fingerprint_value = {
+            "source_root": source["path"],
+            "manifest_file_sha256": source["manifest_file_sha256"],
+            "manifest_sha256": source["manifest_sha256"],
+            "provenance_sha256": source["conversion_provenance_sha256"],
+            "index_sha256": source["index_sha256"],
+            "config_sha256": source["config_sha256"],
+            "sidecar_sha256": source["sidecar_sha256"],
+            "sidecar_bytes": source["sidecar_bytes"],
+            "resident_files": resident_receipts,
+            "ancillary_files": ancillary_receipts,
+        }
+        if (
+            source.get("fingerprint_sha256")
+            != hashlib.sha256(_canonical_json_bytes(fingerprint_value)).hexdigest()
+        ):
+            raise ValueError("target conversion provenance fingerprint mismatch")
+
+        space = conversion.get("space")
+        expected_space_keys = {
+            "target_sidecar_bytes",
+            "resident_file_bytes",
+            "ancillary_file_bytes",
+            "manifest_header_overhead_bytes",
+            "base_bytes",
+            "safety_margin_percent",
+            "projection_working_reserve_bytes",
+            "required_bytes",
+            "free_bytes",
+        }
+        if not isinstance(space, dict) or set(space) != expected_space_keys:
+            raise ValueError("target conversion provenance space receipt mismatch")
+        resident_file_bytes = sum(item["size"] for item in resident_receipts)
+        ancillary_file_bytes = sum(item["size"] for item in ancillary_receipts)
+        overhead = space.get("manifest_header_overhead_bytes")
+        if (
+            space.get("target_sidecar_bytes") != expectations.target_sidecar_bytes
+            or space.get("resident_file_bytes") != resident_file_bytes
+            or space.get("ancillary_file_bytes") != ancillary_file_bytes
+            or not isinstance(overhead, int)
+            or overhead <= 0
+            or space.get("base_bytes")
+            != expectations.target_sidecar_bytes
+            + resident_file_bytes
+            + ancillary_file_bytes
+            + overhead
+            or space.get("safety_margin_percent") != 5
+            or space.get("projection_working_reserve_bytes")
+            != _PROJECTION_WORKING_RESERVE
+            or space.get("required_bytes")
+            != (space["base_bytes"] * 105 + 99) // 100 + _PROJECTION_WORKING_RESERVE
+            or not isinstance(space.get("free_bytes"), int)
+            or space["free_bytes"] < space["required_bytes"]
+        ):
+            raise ValueError("target conversion provenance space accounting mismatch")
+
+        expected_inventory = {
+            *shard_by_name,
+            _SIDECAR_FILE,
+            _INDEX_FILE,
+            *_ANCILLARY_FILES,
+            _EXPERT_MANIFEST_FILE,
+            _CONVERSION_MANIFEST_FILE,
+        }
+        if allow_journal:
+            expected_inventory.add(_JOURNAL_FILE)
+        actual_inventory = set(os.listdir(root_fd))
+        if "mtp" in actual_inventory or any(
+            "mtp" in name.lower() for name in actual_inventory
+        ):
+            raise ValueError("MTP content is forbidden in the AR-only target")
+        if actual_inventory != expected_inventory:
+            raise ValueError(
+                "authoritative output inventory mismatch; "
+                f"extra={sorted(actual_inventory - expected_inventory)[:4]}, "
+                f"missing={sorted(expected_inventory - actual_inventory)[:4]}"
+            )
+        for name in actual_inventory:
+            entry = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+                raise ValueError(
+                    f"authoritative output entry is not independent: {name}"
+                )
+
+        report = verify_expert_manifest(
+            manifest,
+            root,
+            verify_records=deep,
+            verify_shard_hashes=deep,
+            verify_sidecar_hash=deep,
+        )
+        _assert_directory_path_identity(root, root_fd, label="Hy3 Q2 artifact root")
+        return {
+            "schema": "mtplx-hy3-expert-q2-verification-v1",
+            "passed": True,
+            "deep": deep,
+            "model_key": manifest.model_key,
+            "record_count": len(manifest.records),
+            "resident_shard_count": len(resident_shards),
+            "sidecar_bytes": manifest.sidecar.size,
+            "sidecar_sha256": manifest.sidecar.sha256,
+            "expert_manifest_sha256": manifest.manifest_sha256,
+            "journal_receipt_sha256": journal["sha256"],
+            "checked_records": report["checked_records"],
+            "checked_shards": report["checked_shards"],
+            "sidecar_verified": report["sidecar_verified"],
+        }
+    finally:
+        os.close(root_fd)
+
+
+def verify_hy3_expert_q2(root: Path, *, deep: bool = True) -> dict[str, Any]:
+    """Verify the final authoritative Hy3 expert-Q2 artifact fail closed."""
+
+    return _verify_hy3_root(Path(root), deep=deep, allow_journal=False)

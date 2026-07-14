@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import math
 import hashlib
 import json
@@ -35,10 +36,14 @@ from mtplx.hy3_expert_q2 import (
     SOURCE_MODEL_KEY,
     TARGET_MODEL_KEY,
     convert_expert_records,
+    finalize_hy3_expert_q2,
+    pilot_hy3_expert_q2,
     preflight_hy3_expert_q2,
     requantize_expert_record_q4_to_q2,
     requantize_projection_q4_to_q2,
     stage_exact_residents,
+    stage_hy3_expert_q2,
+    verify_hy3_expert_q2,
 )
 
 
@@ -1613,10 +1618,24 @@ def _rewrite_conversion_test_manifest(
     return finalized
 
 
+def _complete_staged_conversion(env: dict[str, object]) -> ConversionConfig:
+    pilot = pilot_hy3_expert_q2(env["config"], ((1, 0),))
+    pilot_report = env["source_root"].parent / "pilot-report.json"
+    pilot_report.write_text(
+        json.dumps(pilot, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    env["conversions"].clear()
+    stage_hy3_expert_q2(env["config"])
+    convert_expert_records(env["config"], resume=True)
+    return replace(env["config"], pilot_report=pilot_report)
+
+
 def test_provenance_contract_uses_exact_hy3_counts_bytes_and_derivation() -> None:
     expectations = q2_module._conversion_expectations()
     manifest = q2_module._minimum_conversion_manifest(expectations)
 
+    assert expectations.resident_shard_count == 18
     assert manifest["schema"] == "mtplx-hy3-expert-q2-conversion-v1"
     assert manifest["derivation"] == {
         "kind": "q4_to_q2",
@@ -2104,3 +2123,267 @@ def test_resume_output_corruption_truncates_to_prefix_and_recomputes(
     assert len(records) == 3
     assert env["conversions"] == [(1, 1), (1, 2)]
     assert output.read_bytes() == expected_output
+
+
+def test_pilot_is_read_only_and_reports_requested_real_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+
+    report = pilot_hy3_expert_q2(env["config"], ((1, 0), (1, 2)))
+
+    assert report["passed"] is True
+    assert [(item["layer"], item["expert"]) for item in report["records"]] == [
+        (1, 0),
+        (1, 2),
+    ]
+    assert all(len(item["diagnostics"]) == 3 for item in report["records"])
+    assert not env["work_root"].exists()
+    assert not env["output_root"].exists()
+
+
+def test_stage_refuses_existing_target_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    env["output_root"].mkdir()
+    sentinel = env["output_root"] / "sentinel"
+    sentinel.write_bytes(b"unchanged")
+
+    with pytest.raises(ValueError, match="final output.*exists"):
+        stage_hy3_expert_q2(env["config"])
+
+    assert sentinel.read_bytes() == b"unchanged"
+    assert not env["work_root"].exists()
+
+
+def test_stage_interruption_leaves_only_sibling_work_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+
+    def interrupt(*_args, **_kwargs):
+        raise KeyboardInterrupt("injected stage interruption")
+
+    monkeypatch.setattr(q2_module, "stage_exact_residents", interrupt)
+
+    with pytest.raises(KeyboardInterrupt, match="injected stage interruption"):
+        stage_hy3_expert_q2(env["config"])
+
+    assert env["work_root"].is_dir()
+    assert list(env["work_root"].iterdir()) == []
+    assert not env["output_root"].exists()
+
+
+def test_finalize_publishes_authoritative_output_atomically_and_records_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    config = _complete_staged_conversion(env)
+    parent_inode = tmp_path.stat().st_ino
+    original_replace = q2_module.os.replace
+    original_fsync = q2_module.os.fsync
+    events: list[str] = []
+
+    def record_replace(source, target, *args, **kwargs):
+        result = original_replace(source, target, *args, **kwargs)
+        if source == env["work_root"].name and target == env["output_root"].name:
+            events.append("directory_replace")
+        return result
+
+    def record_fsync(fd: int) -> None:
+        original_fsync(fd)
+        if events and events[-1] == "directory_replace":
+            metadata = os.fstat(fd)
+            if stat.S_ISDIR(metadata.st_mode) and metadata.st_ino == parent_inode:
+                events.append("parent_fsync")
+
+    monkeypatch.setattr(q2_module.os, "replace", record_replace)
+    monkeypatch.setattr(q2_module.os, "fsync", record_fsync)
+
+    published = finalize_hy3_expert_q2(config)
+
+    assert published == env["output_root"]
+    assert events[-2:] == ["directory_replace", "parent_fsync"]
+    assert not env["work_root"].exists()
+    assert not (published / "conversion-journal.jsonl").exists()
+    assert not (published / "mtp").exists()
+    manifest = ExpertManifest.from_dict(
+        json.loads((published / "expert-manifest.json").read_text())
+    )
+    resident_shards = [
+        shard for shard in manifest.shards if shard.kind == "safetensors"
+    ]
+    sidecar_shards = [shard for shard in manifest.shards if shard.kind == "sidecar"]
+    assert len(resident_shards) == env["expectation_box"][0].resident_shard_count
+    assert len(sidecar_shards) == 1
+    assert sidecar_shards[0].name == "experts.bin"
+    assert {
+        segment.shard for record in manifest.records for segment in record.segments
+    } == {"experts.bin"}
+    conversion = json.loads((published / "conversion-manifest.json").read_text())
+    assert conversion["journal"]["record_count"] == 3
+    assert len(conversion["journal"]["sha256"]) == 64
+    assert conversion["target"]["expert_manifest_sha256"] == manifest.manifest_sha256
+    assert verify_hy3_expert_q2(published, deep=True)["passed"] is True
+
+
+def test_failed_deep_verify_prevents_atomic_publish_and_preserves_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    config = _complete_staged_conversion(env)
+
+    def reject(*_args, **_kwargs):
+        raise ValueError("injected deep verification failure")
+
+    monkeypatch.setattr(q2_module, "_verify_hy3_root", reject)
+
+    with pytest.raises(ValueError, match="deep verification failure"):
+        finalize_hy3_expert_q2(config)
+
+    assert not env["output_root"].exists()
+    assert env["work_root"].is_dir()
+    assert (env["work_root"] / "conversion-journal.jsonl").is_file()
+
+
+def test_finalize_interruption_after_journal_removal_is_safely_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    config = _complete_staged_conversion(env)
+    original_replace = q2_module.os.replace
+    interrupted = False
+
+    def interrupt_first_directory_publish(source, target, *args, **kwargs):
+        nonlocal interrupted
+        if source == env["work_root"].name and not interrupted:
+            interrupted = True
+            raise OSError("injected publish interruption")
+        return original_replace(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(
+        q2_module.os,
+        "replace",
+        interrupt_first_directory_publish,
+    )
+
+    with pytest.raises(OSError, match="publish interruption"):
+        finalize_hy3_expert_q2(config)
+
+    assert interrupted is True
+    assert env["work_root"].is_dir()
+    assert not (env["work_root"] / "conversion-journal.jsonl").exists()
+    assert not env["output_root"].exists()
+
+    assert finalize_hy3_expert_q2(config) == env["output_root"]
+    assert verify_hy3_expert_q2(env["output_root"], deep=True)["passed"] is True
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["sidecar", "resident", "ancillary", "provenance", "mtp", "extra_q4"],
+)
+def test_deep_verify_rejects_every_authoritative_output_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    env = _conversion_test_environment(tmp_path, monkeypatch)
+    published = finalize_hy3_expert_q2(_complete_staged_conversion(env))
+    manifest = ExpertManifest.from_dict(
+        json.loads((published / "expert-manifest.json").read_text())
+    )
+    if corruption == "sidecar":
+        target = published / "experts.bin"
+        payload = bytearray(target.read_bytes())
+        payload[-1] ^= 0xFF
+        target.write_bytes(payload)
+    elif corruption == "resident":
+        target = published / manifest.resident_tensors[0].shard
+        payload = bytearray(target.read_bytes())
+        payload[-1] ^= 0xFF
+        target.write_bytes(payload)
+    elif corruption == "ancillary":
+        (published / "config.json").write_bytes(b"corrupt")
+    elif corruption == "provenance":
+        target = published / "conversion-manifest.json"
+        value = json.loads(target.read_text())
+        value["derivation"]["external_q2_artifact_used"] = True
+        target.write_text(json.dumps(value), encoding="utf-8")
+    elif corruption == "mtp":
+        (published / "mtp").mkdir()
+    else:
+        (published / "model-99999-of-99999.safetensors").write_bytes(b"q4")
+
+    with pytest.raises(
+        ValueError,
+        match="sidecar|record|shard|hash|ancillary|provenance|inventory|MTP|unexpected",
+    ):
+        verify_hy3_expert_q2(published, deep=True)
+
+
+def test_cpu_only_cli_phases_have_isolated_lazy_import_paths(
+    tmp_path: Path,
+) -> None:
+    script = Path(__file__).resolve().parents[1] / "scripts/build_hy3_expert_q2.py"
+    tree = ast.parse(script.read_text(encoding="utf-8"))
+    assert not any(
+        isinstance(node, ast.ImportFrom) and (node.module or "").startswith("mtplx")
+        for node in tree.body
+    )
+    blocker = tmp_path / "blocker"
+    blocker.mkdir()
+    (blocker / "sitecustomize.py").write_text(
+        """
+import builtins
+_original_import = builtins.__import__
+def _guard(name, *args, **kwargs):
+    if name == 'mlx' or name.startswith('mlx.'):
+        raise RuntimeError('forbidden MLX import in CPU phase')
+    return _original_import(name, *args, **kwargs)
+builtins.__import__ = _guard
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    missing = tmp_path / "missing"
+    common = [
+        "--source-manifest",
+        os.fspath(missing / "expert-manifest.json"),
+        "--source-provenance",
+        os.fspath(missing / "conversion-provenance.json"),
+    ]
+    commands = [
+        ["preflight", os.fspath(missing), *common],
+        ["stage", os.fspath(missing), os.fspath(tmp_path / "output"), *common],
+        [
+            "finalize",
+            os.fspath(missing),
+            os.fspath(tmp_path / "output"),
+            *common,
+            "--pilot-report",
+            os.fspath(missing / "pilot.json"),
+        ],
+        ["verify", os.fspath(missing), "--deep"],
+    ]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (os.fspath(blocker), os.fspath(Path(__file__).resolve().parents[1]))
+    )
+    for command in commands:
+        completed = subprocess.run(
+            [sys.executable, os.fspath(script), *command],
+            capture_output=True,
+            text=True,
+            env=environment,
+            check=False,
+        )
+        assert completed.returncode != 0
+        assert "forbidden MLX import" not in completed.stderr
