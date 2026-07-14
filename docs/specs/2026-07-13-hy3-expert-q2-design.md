@@ -69,7 +69,7 @@ Build an explicit local artifact with this precision policy:
 | Component | Output representation | Runtime placement |
 | --- | --- | --- |
 | Routed experts, layers 1-79 | MLX affine Q2, group size 64 | `experts.bin` plus bounded cache |
-| Routers and correction biases | Source tensor bytes unchanged | Resident |
+| Routers and correction biases | Source BF16 gates plus FP32 correction biases, bytes unchanged | Resident |
 | Attention and shared experts | Source tensor bytes unchanged | Resident |
 | Embedding, norms, and LM head | Source tensor bytes unchanged | Resident |
 | Layer-80 MTP head | Not included | Separate existing artifact only |
@@ -93,6 +93,8 @@ Thus:
 - scales and biases per record: `1,179,648` bytes;
 - record: `5,898,240` bytes, exactly 360 16-KiB alignment units;
 - routed sidecar: `89,464,504,320` bytes;
+- unchanged router payload: `124,316,928` bytes, stored as source BF16 gate
+  weights plus FP32 correction biases;
 - unchanged resident tensor payload: `17,494,289,664` bytes;
 - total logical tensor bytes: `106,958,793,984` bytes.
 
