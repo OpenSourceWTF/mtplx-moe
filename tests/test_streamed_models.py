@@ -300,7 +300,12 @@ class _OverlapPending:
 class _OverlapRuntime:
     def __init__(self, events: list[str]) -> None:
         self.events = events
-        self.spec = SimpleNamespace(top_k=1, hidden_size=2, quant_group_size=64)
+        self.spec = SimpleNamespace(
+            top_k=1,
+            hidden_size=2,
+            quant_group_size=64,
+            quant_bits=4,
+        )
         self.manifest = SimpleNamespace(sidecar=None)
         self.config = SimpleNamespace(
             slot_layout="direct-slots",
@@ -339,8 +344,9 @@ def test_streamed_decode_evaluates_shared_work_before_waiting_for_misses(
     runtime = _OverlapRuntime(events)
     switch = HotExpertSwitchGLU(runtime, 1)
 
-    def fake_q4(selected, _binding, *, group_size):
+    def fake_q4(selected, _binding, *, group_size, bits):
         assert group_size == 64
+        assert bits == 4
         events.append("miss-q4")
         return selected
 
@@ -513,8 +519,9 @@ def test_component_bank_overlaps_hit_and_shared_work_with_incremental_misses(
     events: list[str] = []
     pending = _BankOverlapPending(events)
 
-    def fake_q4(selected, bindings, *, group_size):
+    def fake_q4(selected, bindings, *, group_size, bits):
         assert group_size == 64
+        assert bits == 4
         events.append(f"q4:{tuple(item.expert for item in bindings)}")
         return selected
 
@@ -558,8 +565,9 @@ def test_component_bank_claims_runnable_work_immediately_before_dispatch(
         pipeline_ledger=ledger,
     )
 
-    def fake_q4(selected, bindings, *, group_size):
+    def fake_q4(selected, bindings, *, group_size, bits):
         assert group_size == 64
+        assert bits == 4
         events.append(f"q4:{tuple(item.expert for item in bindings)}")
         return selected
 
@@ -777,8 +785,9 @@ def test_128k_prefill_preserves_bounded_routed_then_shared_order(
     runtime = _OverlapRuntime(events)
     switch = HotExpertSwitchGLU(runtime, 1)
 
-    def fake_q4(selected, _binding, *, group_size):
+    def fake_q4(selected, _binding, *, group_size, bits):
         assert group_size == 64
+        assert bits == 4
         events.append("routed-q4")
         return selected
 
@@ -1063,16 +1072,18 @@ def _raw_array(value: mx.array, dtype: str) -> bytes:
     )
 
 
-def test_portable_q4_slot_execution_matches_direct_quantized_matmul() -> None:
-    mx.random.seed(7)
+def _quantized_expert_fixture(
+    *, bits: int
+) -> tuple[mx.array, ExpertSlotBinding, dict[str, mx.array]]:
+    mx.random.seed(100 + bits)
     hidden = 64
     intermediate = 64
     gate_source = mx.random.normal((intermediate, hidden)).astype(mx.bfloat16)
     up_source = mx.random.normal((intermediate, hidden)).astype(mx.bfloat16)
     down_source = mx.random.normal((hidden, intermediate)).astype(mx.bfloat16)
-    gate = mx.quantize(gate_source, group_size=64, bits=4)
-    up = mx.quantize(up_source, group_size=64, bits=4)
-    down = mx.quantize(down_source, group_size=64, bits=4)
+    gate = mx.quantize(gate_source, group_size=64, bits=bits, mode="affine")
+    up = mx.quantize(up_source, group_size=64, bits=bits, mode="affine")
+    down = mx.quantize(down_source, group_size=64, bits=bits, mode="affine")
     arrays = {
         "gate_proj.weight": (gate[0], "U32"),
         "gate_proj.scales": (gate[1], "BF16"),
@@ -1110,34 +1121,242 @@ def test_portable_q4_slot_execution_matches_direct_quantized_matmul() -> None:
     )
     binding = ExpertSlotBinding(1, 0, 0, 1, record, payload)
     x = mx.random.normal((3, hidden)).astype(mx.bfloat16)
+    return (
+        x,
+        binding,
+        {component: value for component, (value, _dtype) in arrays.items()},
+    )
 
-    actual = _run_q4_expert(x, binding, group_size=64)
+
+def test_portable_q4_slot_execution_matches_direct_quantized_matmul(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    x, binding, arrays = _quantized_expert_fixture(bits=4)
+
     reference_gate = mx.quantized_matmul(
         x,
-        gate[0],
-        scales=gate[1],
-        biases=gate[2],
+        arrays["gate_proj.weight"],
+        scales=arrays["gate_proj.scales"],
+        biases=arrays["gate_proj.biases"],
         group_size=64,
         bits=4,
     )
     reference_up = mx.quantized_matmul(
         x,
-        up[0],
-        scales=up[1],
-        biases=up[2],
+        arrays["up_proj.weight"],
+        scales=arrays["up_proj.scales"],
+        biases=arrays["up_proj.biases"],
         group_size=64,
         bits=4,
     )
     reference = mx.quantized_matmul(
         swiglu(reference_gate, reference_up),
-        down[0],
-        scales=down[1],
-        biases=down[2],
+        arrays["down_proj.weight"],
+        scales=arrays["down_proj.scales"],
+        biases=arrays["down_proj.biases"],
         group_size=64,
         bits=4,
     )
+    mx.eval(reference)
+    observed_bits: list[int] = []
+    original_qmm = expert_mlx.mx.quantized_matmul
+
+    def observe_qmm(*args, **kwargs):
+        observed_bits.append(kwargs["bits"])
+        return original_qmm(*args, **kwargs)
+
+    monkeypatch.setattr(expert_mlx.mx, "quantized_matmul", observe_qmm)
+    actual = _run_q4_expert(x, binding, group_size=64)
     mx.eval(actual, reference)
+
+    assert observed_bits == [4, 4, 4]
     assert mx.allclose(actual, reference, atol=1e-5, rtol=1e-5).item()
+
+
+def test_q2_qmm_direct_slot_uses_descriptor_bits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    x, binding, _arrays = _quantized_expert_fixture(bits=2)
+    observed_bits: list[int] = []
+    original_qmm = expert_mlx.mx.quantized_matmul
+
+    def observe_qmm(*args, **kwargs):
+        observed_bits.append(kwargs["bits"])
+        return original_qmm(*args, **kwargs)
+
+    monkeypatch.setattr(expert_mlx.mx, "quantized_matmul", observe_qmm)
+    output = _run_q4_expert(x, binding, group_size=64, bits=2)
+    mx.eval(output)
+
+    assert observed_bits == [2, 2, 2]
+    assert output.shape == x.shape
+    assert mx.all(mx.isfinite(output)).item()
+
+
+def test_q2_qmm_component_bank_uses_descriptor_bits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    x, binding, arrays = _quantized_expert_fixture(bits=2)
+    bank = SimpleNamespace(
+        arrays={
+            component: mx.stack((value,), axis=0) for component, value in arrays.items()
+        }
+    )
+    bank_binding = replace(
+        binding,
+        buffer=SimpleNamespace(bank=bank, bank_index=0),
+    )
+    observed_bits: list[int] = []
+    original_gather_qmm = expert_mlx.mx.gather_qmm
+
+    def observe_gather_qmm(*args, **kwargs):
+        observed_bits.append(kwargs["bits"])
+        return original_gather_qmm(*args, **kwargs)
+
+    monkeypatch.setattr(expert_mlx.mx, "gather_qmm", observe_gather_qmm)
+    output = expert_mlx._run_component_bank_q4(
+        x,
+        (bank_binding,) * int(x.shape[0]),
+        group_size=64,
+        bits=2,
+    )
+    mx.eval(output)
+
+    assert observed_bits == [2, 2, 2]
+    assert output.shape == x.shape
+    assert mx.all(mx.isfinite(output)).item()
+
+
+def test_q2_qmm_mapped_execution_uses_descriptor_bits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    x, _binding, arrays = _quantized_expert_fixture(bits=2)
+    observed_bits: list[int] = []
+    original_qmm = expert_mlx.mx.quantized_matmul
+
+    def observe_qmm(*args, **kwargs):
+        observed_bits.append(kwargs["bits"])
+        return original_qmm(*args, **kwargs)
+
+    monkeypatch.setattr(expert_mlx.mx, "quantized_matmul", observe_qmm)
+    output = expert_mlx._run_mapped_q4(
+        x,
+        SimpleNamespace(arrays=arrays),
+        group_size=64,
+        bits=2,
+    )
+    mx.eval(output)
+
+    assert observed_bits == [2, 2, 2]
+    assert output.shape == x.shape
+    assert mx.all(mx.isfinite(output)).item()
+
+
+def test_descriptor_bits_reach_direct_slot_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _OverlapRuntime([])
+    runtime.spec.quant_bits = 2
+    observed_bits: list[int] = []
+
+    def observe_qmm(selected, _binding, *, group_size, bits):
+        assert group_size == 64
+        observed_bits.append(bits)
+        return selected
+
+    monkeypatch.setattr(expert_mlx, "_run_q4_expert", observe_qmm)
+    output = HotExpertSwitchGLU(runtime, 1)(
+        mx.zeros((1, 1, 2), dtype=mx.bfloat16),
+        mx.zeros((1, 1, 1), dtype=mx.int32),
+    )
+    mx.eval(output)
+
+    assert observed_bits == [2]
+
+
+def test_descriptor_bits_reach_component_bank_all_hit_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    runtime = _BankOverlapRuntime(events, _BankOverlapPending(events))
+    runtime.spec.quant_bits = 2
+    bank = object()
+    bindings = tuple(
+        SimpleNamespace(expert=expert, buffer=SimpleNamespace(bank=bank))
+        for expert in (0, 1, 2)
+    )
+    ready = SimpleNamespace(
+        plan=SimpleNamespace(hits=(0, 1, 2)),
+        bindings=bindings,
+        release=lambda **_kwargs: None,
+    )
+    runtime.try_all_hit_route = lambda *_args, **_kwargs: ready
+
+    def unexpected_split(*_args, **_kwargs):
+        raise AssertionError("descriptor-bit all-hit fixture used split routing")
+
+    runtime.begin_split_route = unexpected_split
+    observed_bits: list[int] = []
+
+    def observe_qmm(selected, _bindings, *, group_size, bits):
+        assert group_size == 64
+        observed_bits.append(bits)
+        return selected
+
+    monkeypatch.setattr(expert_mlx, "_run_component_bank_q4", observe_qmm)
+    output = HotExpertSwitchGLU(runtime, 1)(*_bank_overlap_inputs())
+    mx.eval(output)
+
+    assert observed_bits == [2]
+
+
+def test_descriptor_bits_reach_component_bank_split_hit_and_misses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    pending = _BankOverlapPending(events)
+    runtime = _BankOverlapRuntime(events, pending)
+    runtime.spec.quant_bits = 2
+    observed: list[tuple[tuple[int, ...], int]] = []
+
+    def observe_qmm(selected, bindings, *, group_size, bits):
+        assert group_size == 64
+        observed.append((tuple(binding.expert for binding in bindings), bits))
+        return selected
+
+    monkeypatch.setattr(expert_mlx, "_run_component_bank_q4", observe_qmm)
+    output = HotExpertSwitchGLU(runtime, 1)(*_bank_overlap_inputs())
+    mx.eval(output)
+
+    assert observed == [((0,), 2), ((1,), 2), ((2,), 2)]
+
+
+def test_descriptor_bits_reach_mapped_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = SimpleNamespace(
+        spec=SimpleNamespace(top_k=1, quant_group_size=64, quant_bits=2),
+        observe_route=lambda *_args, **_kwargs: None,
+    )
+    store = SimpleNamespace(
+        get=lambda *_args: object(),
+        observe_qmm=lambda *_args: None,
+    )
+    observed_bits: list[int] = []
+
+    def observe_qmm(selected, _mapped, *, group_size, bits):
+        assert group_size == 64
+        observed_bits.append(bits)
+        return selected
+
+    monkeypatch.setattr(expert_mlx, "_run_mapped_q4", observe_qmm)
+    output = expert_mlx.MappedExpertSwitchGLU(runtime, store, 1)(
+        mx.zeros((1, 1, 2), dtype=mx.bfloat16),
+        mx.zeros((1, 1, 1), dtype=mx.int32),
+    )
+    mx.eval(output)
+
+    assert observed_bits == [2]
 
 
 def _integrated_hy3_artifact(tmp_path: Path):
@@ -1767,8 +1986,10 @@ def test_component_bank_all_hit_decode_keeps_router_order_without_split_route_op
         bindings: tuple[ExpertSlotBinding, ...],
         *,
         group_size: int,
+        bits: int,
     ) -> mx.array:
         assert group_size == spec.quant_group_size
+        assert bits == spec.quant_bits
         expert_offsets = mx.array(
             [binding.expert * 100 for binding in bindings],
             dtype=selected.dtype,
@@ -1855,6 +2076,7 @@ def test_global_component_bank_all_hit_decode_binds_without_reads(
             bindings: tuple[ExpertSlotBinding, ...],
             *,
             group_size: int,
+            bits: int,
         ) -> mx.array:
             observed.append(
                 tuple(
@@ -1867,7 +2089,12 @@ def test_global_component_bank_all_hit_decode_binds_without_reads(
                 binding.buffer.bank_index == binding.logical_slot
                 for binding in bindings
             )
-            return original_run(selected, bindings, group_size=group_size)
+            return original_run(
+                selected,
+                bindings,
+                group_size=group_size,
+                bits=bits,
+            )
 
         def unexpected_split(*_args, **_kwargs):
             raise AssertionError("global all-hit decode used the split route")
@@ -1927,8 +2154,10 @@ def test_component_bank_all_hit_decode_preserves_route_waves_counters_and_shared
         bindings: tuple[ExpertSlotBinding, ...],
         *,
         group_size: int,
+        bits: int,
     ) -> mx.array:
         assert group_size == spec.quant_group_size
+        assert bits == spec.quant_bits
         experts = tuple(binding.expert for binding in bindings)
         events.append(f"q4:{experts}")
         expert_offsets = mx.array(
@@ -2061,9 +2290,11 @@ def test_component_bank_all_hit_decode_releases_pins_on_q4_error(
             bindings: tuple[ExpertSlotBinding, ...],
             *,
             group_size: int,
+            bits: int,
         ) -> mx.array:
             nonlocal q4_calls
             assert group_size == spec.quant_group_size
+            assert bits == spec.quant_bits
             assert len(bindings) == int(selected.shape[0])
             q4_calls += 1
             if q4_calls == 2:
