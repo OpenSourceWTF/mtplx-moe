@@ -1,0 +1,1500 @@
+{
+  "artifacts": {
+    "model_root": "/Users/davidtai/.cache/huggingface/hy3-expert-only-mlx-q2",
+    "mtp_artifacts": "/Users/davidtai/.cache/huggingface/hy3-mtp-layer80",
+    "mtp_bf16_file_bytes": 7505299360
+  },
+  "command": [
+    "benchmarks/hy3_mtp_shared_gate_up.py",
+    "--scope",
+    "shared",
+    "--candidates=",
+    "--metal-frontier",
+    "--depths",
+    "1,3",
+    "--warmup",
+    "4",
+    "--iterations",
+    "64",
+    "--rounds",
+    "8",
+    "--bootstrap-resamples",
+    "10000",
+    "--output-json",
+    "/tmp/issue69-hy3-mtp-metal-frontier-r2.json"
+  ],
+  "dispatch_contract": {
+    "candidate_savings_at_k3": {
+      "metal_n12_v16_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 3145728,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 384,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 384
+      },
+      "metal_n12_v1_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 3145728,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 384,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 384
+      },
+      "metal_n12_v2_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 3145728,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 384,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 384
+      },
+      "metal_n12_v4_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 3145728,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 384,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 384
+      },
+      "metal_n12_v8_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 3145728,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 384,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 384
+      },
+      "metal_n16_v16_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 2359296,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 288,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 288
+      },
+      "metal_n16_v1_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 2359296,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 288,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 288
+      },
+      "metal_n16_v2_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 2359296,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 288,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 288
+      },
+      "metal_n16_v4_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 2359296,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 288,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 288
+      },
+      "metal_n16_v8_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 2359296,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 288,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 288
+      },
+      "metal_n1_v16_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 37748736,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 4608,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 4608
+      },
+      "metal_n1_v1_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 37748736,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 4608,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 4608
+      },
+      "metal_n1_v2_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 37748736,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 4608,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 4608
+      },
+      "metal_n1_v4_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 37748736,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 4608,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 4608
+      },
+      "metal_n1_v8_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 37748736,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 4608,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 4608
+      },
+      "metal_n24_v16_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 1572864,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 192,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 192
+      },
+      "metal_n24_v1_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 1572864,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 192,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 192
+      },
+      "metal_n24_v2_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 1572864,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 192,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 192
+      },
+      "metal_n24_v4_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 1572864,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 192,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 192
+      },
+      "metal_n24_v8_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 1572864,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 192,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 192
+      },
+      "metal_n2_v16_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 18874368,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 2304,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 2304
+      },
+      "metal_n2_v1_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 18874368,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 2304,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 2304
+      },
+      "metal_n2_v2_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 18874368,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 2304,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 2304
+      },
+      "metal_n2_v4_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 18874368,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 2304,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 2304
+      },
+      "metal_n2_v8_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 18874368,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 2304,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 2304
+      },
+      "metal_n32_v16_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 1179648,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 144,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 144
+      },
+      "metal_n32_v1_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 1179648,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 144,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 144
+      },
+      "metal_n32_v2_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 1179648,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 144,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 144
+      },
+      "metal_n32_v4_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 1179648,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 144,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 144
+      },
+      "metal_n32_v8_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 1179648,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 144,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 144
+      },
+      "metal_n3_v16_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 12582912,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 1536,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 1536
+      },
+      "metal_n3_v1_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 12582912,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 1536,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 1536
+      },
+      "metal_n3_v2_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 12582912,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 1536,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 1536
+      },
+      "metal_n3_v4_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 12582912,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 1536,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 1536
+      },
+      "metal_n3_v8_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 12582912,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 1536,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 1536
+      },
+      "metal_n4_v16_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 9437184,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 1152,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 1152
+      },
+      "metal_n4_v1_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 9437184,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 1152,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 1152
+      },
+      "metal_n4_v2_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 9437184,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 1152,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 1152
+      },
+      "metal_n4_v4_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 9437184,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 1152,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 1152
+      },
+      "metal_n4_v8_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 9437184,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 1152,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 1152
+      },
+      "metal_n6_v16_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 6291456,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 768,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 768
+      },
+      "metal_n6_v1_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 6291456,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 768,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 768
+      },
+      "metal_n6_v2_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 6291456,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 768,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 768
+      },
+      "metal_n6_v4_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 6291456,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 768,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 768
+      },
+      "metal_n6_v8_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 6291456,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 768,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 768
+      },
+      "metal_n8_v16_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 4718592,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 576,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 576
+      },
+      "metal_n8_v1_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 4718592,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 576,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 576
+      },
+      "metal_n8_v2_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 4718592,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 576,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 576
+      },
+      "metal_n8_v4_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 4718592,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 576,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 576
+      },
+      "metal_n8_v8_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 4718592,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 576,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 576
+      }
+    },
+    "control_gate_up_matmuls_per_depth": 2,
+    "metal_gate_up_swiglu_dispatches_saved_at_k3": 6,
+    "packed_candidate_gate_up_matmuls_per_depth": 1,
+    "packed_projection_dispatches_saved_at_k3": 3
+  },
+  "environment": {
+    "commit": "01e27ce95e6d214daa682cd38fe20b964e2e41d9",
+    "machine": "arm64",
+    "metal_device": {
+      "architecture": "applegpu_g17s",
+      "device_name": "Apple M5 Max",
+      "max_buffer_length": 86586540032,
+      "max_recommended_working_set_size": 107374182400,
+      "memory_size": 137438953472,
+      "resource_limit": 499000
+    },
+    "platform": "macOS-26.5.2-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "finished_at": "2026-07-15T20:03:16.153524+00:00",
+  "measurement": {
+    "bootstrap_resamples": 10000,
+    "candidates": [
+      "metal_n1_v1_exact",
+      "metal_n1_v2_exact",
+      "metal_n1_v4_exact",
+      "metal_n1_v8_exact",
+      "metal_n1_v16_exact",
+      "metal_n2_v1_exact",
+      "metal_n2_v2_exact",
+      "metal_n2_v4_exact",
+      "metal_n2_v8_exact",
+      "metal_n2_v16_exact",
+      "metal_n3_v1_exact",
+      "metal_n3_v2_exact",
+      "metal_n3_v4_exact",
+      "metal_n3_v8_exact",
+      "metal_n3_v16_exact",
+      "metal_n4_v1_exact",
+      "metal_n4_v2_exact",
+      "metal_n4_v4_exact",
+      "metal_n4_v8_exact",
+      "metal_n4_v16_exact",
+      "metal_n6_v1_exact",
+      "metal_n6_v2_exact",
+      "metal_n6_v4_exact",
+      "metal_n6_v8_exact",
+      "metal_n6_v16_exact",
+      "metal_n8_v1_exact",
+      "metal_n8_v2_exact",
+      "metal_n8_v4_exact",
+      "metal_n8_v8_exact",
+      "metal_n8_v16_exact",
+      "metal_n12_v1_exact",
+      "metal_n12_v2_exact",
+      "metal_n12_v4_exact",
+      "metal_n12_v8_exact",
+      "metal_n12_v16_exact",
+      "metal_n16_v1_exact",
+      "metal_n16_v2_exact",
+      "metal_n16_v4_exact",
+      "metal_n16_v8_exact",
+      "metal_n16_v16_exact",
+      "metal_n24_v1_exact",
+      "metal_n24_v2_exact",
+      "metal_n24_v4_exact",
+      "metal_n24_v8_exact",
+      "metal_n24_v16_exact",
+      "metal_n32_v1_exact",
+      "metal_n32_v2_exact",
+      "metal_n32_v4_exact",
+      "metal_n32_v8_exact",
+      "metal_n32_v16_exact"
+    ],
+    "depths": [
+      1,
+      3
+    ],
+    "gate_up_swiglu_correctness": {
+      "metal_n12_v16_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 12;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n12_v1_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 12;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n12_v2_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 12;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n12_v4_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 12;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n12_v8_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 12;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n16_v16_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n16_v1_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n16_v2_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n16_v4_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n16_v8_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n1_v16_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n1_v1_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n1_v2_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n1_v4_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n1_v8_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n24_v16_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 24;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n24_v1_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 24;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n24_v2_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 24;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n24_v4_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 24;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n24_v8_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 24;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n2_v16_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n2_v1_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n2_v2_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n2_v4_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n2_v8_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n32_v16_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 32;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n32_v1_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 32;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n32_v2_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 32;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n32_v4_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 32;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n32_v8_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 32;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n3_v16_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 3;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n3_v1_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 3;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n3_v2_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 3;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n3_v4_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 3;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n3_v8_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 3;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n4_v16_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n4_v1_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n4_v2_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n4_v4_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n4_v8_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n6_v16_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 6;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n6_v1_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 6;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n6_v2_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 6;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n6_v4_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 6;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n6_v8_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 6;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n8_v16_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n8_v1_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n8_v2_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n8_v4_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      },
+      "metal_n8_v8_exact": {
+        "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+        "error_type": "RuntimeError",
+        "status": "failed"
+      }
+    },
+    "iterations": 64,
+    "results": {
+      "1": {
+        "metal_n12_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 12;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n12_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 12;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n12_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 12;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n12_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 12;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n12_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 12;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n16_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n16_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n16_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n16_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n16_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n1_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n1_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n1_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n1_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n1_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n24_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 24;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n24_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 24;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n24_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 24;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n24_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 24;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n24_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 24;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n2_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n2_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n2_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n2_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n2_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n32_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 32;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n32_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 32;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n32_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 32;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n32_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 32;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n32_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 32;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n3_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 3;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n3_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 3;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n3_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 3;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n3_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 3;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n3_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 3;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n4_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n4_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n4_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n4_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n4_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n6_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 6;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n6_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 6;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n6_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 6;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n6_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 6;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n6_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 6;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n8_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n8_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n8_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n8_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n8_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        }
+      },
+      "3": {
+        "metal_n12_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 12;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n12_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 12;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n12_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 12;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n12_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 12;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n12_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 12;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n16_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n16_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n16_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n16_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n16_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n1_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n1_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n1_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n1_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n1_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n24_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 24;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n24_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 24;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n24_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 24;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n24_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 24;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n24_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 24;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n2_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n2_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n2_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n2_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n2_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n32_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 32;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n32_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 32;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n32_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 32;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n32_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 32;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n32_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 32;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n3_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 3;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n3_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 3;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n3_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 3;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n3_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 3;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n3_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 3;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n4_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n4_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n4_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n4_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n4_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n6_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 6;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n6_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 6;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n6_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 6;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n6_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 6;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n6_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 6;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n8_v16_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 16;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n8_v1_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 1;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n8_v2_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 2;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n8_v4_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 4;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        },
+        "metal_n8_v8_exact": {
+          "error": "[metal::Device] Unable to build metal library from source\nmlx/backend/metal/kernels/utils.h:453:33: error: automatic variable qualified with an address space\n        constant constexpr uint K = 4096;\n                                ^\nmlx/backend/metal/kernels/utils.h:454:33: error: automatic variable qualified with an address space\n        constant constexpr uint N = 1536;\n                                ^\nmlx/backend/metal/kernels/utils.h:455:33: error: automatic variable qualified with an address space\n        constant constexpr uint N_TILE = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:456:33: error: automatic variable qualified with an address space\n        constant constexpr uint K_VECTOR = 8;\n                                ^\nmlx/backend/metal/kernels/utils.h:457:33: error: automatic variable qualified with an address space\n        constant constexpr uint THREADS = N_TILE * 32;\n                                ^\n\n",
+          "error_type": "RuntimeError",
+          "status": "failed"
+        }
+      }
+    },
+    "rounds": 8,
+    "scope_detail": "shared gate/up, SwiGLU, and down",
+    "warmup": 4
+  },
+  "parameters": {
+    "benchmark_extra_bytes_per_metal_candidate": 0,
+    "benchmark_extra_bytes_per_packed_candidate": 25165824,
+    "candidate_steady_extra_bytes_after_source_release": 0,
+    "gate_up": 12582912,
+    "gate_up_bytes": 25165824,
+    "shared_mlp_total": 18874368,
+    "shared_mlp_total_bytes": 37748736
+  },
+  "schema": "mtplx-issue69-hy3-mtp-shared-gate-up-v1",
+  "scope": "shared",
+  "shape": {
+    "M": 1,
+    "down": [
+      4096,
+      1536
+    ],
+    "dtype": "mlx.core.bfloat16",
+    "gate": [
+      1536,
+      4096
+    ],
+    "hidden_size": 4096,
+    "shared_intermediate_size": 1536,
+    "up": [
+      1536,
+      4096
+    ]
+  },
+  "started_at": "2026-07-15T20:03:14.116889+00:00"
+}
