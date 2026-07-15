@@ -51,6 +51,8 @@ def test_mtp_gate_up_candidate_rejects_invalid_tiling() -> None:
             k_vector=16,
             reduction_layout="stock_tn4",
         )
+    with pytest.raises(ValueError, match="input_mode"):
+        Hy3MTPGateUpCandidate(n_tile=4, k_vector=4, input_mode="unknown")
 
 
 def test_mtp_gate_up_source_caches_m1_input_and_selects_exact_math() -> None:
@@ -100,6 +102,25 @@ def test_mtp_gate_up_stock_tn4_source_matches_mlx_gemv_reduction_order() -> None
     assert "simd_sum" not in source
 
 
+def test_mtp_gate_up_direct_input_source_removes_threadgroup_cache_and_barrier() -> (
+    None
+):
+    candidate = Hy3MTPGateUpCandidate(
+        n_tile=24,
+        k_vector=4,
+        rows_per_simdgroup=2,
+        reduction_layout="stock_tn4",
+        input_mode="direct",
+    )
+
+    source = render_hy3_mtp_gate_up_source(candidate)
+
+    assert candidate.name == "n24_r2_v4_exact_stock_tn4_direct"
+    assert "threadgroup T activation_tile[4096]" not in source
+    assert "threadgroup_barrier" not in source
+    assert "float activation = float(input_values[k]);" in source
+
+
 def test_mtp_gate_up_savings_are_explicit_at_k3() -> None:
     candidate = Hy3MTPGateUpCandidate(
         n_tile=4,
@@ -121,3 +142,19 @@ def test_mtp_gate_up_savings_are_explicit_at_k3() -> None:
         "input_fill_load_instruction_bytes": 2_359_296,
         "steady_extra_weight_bytes": 0,
     }
+
+
+def test_mtp_gate_up_direct_input_savings_report_no_tg_storage_or_barriers() -> None:
+    candidate = Hy3MTPGateUpCandidate(
+        n_tile=24,
+        k_vector=4,
+        rows_per_simdgroup=2,
+        reduction_layout="stock_tn4",
+        input_mode="direct",
+    )
+
+    savings = hy3_mtp_gate_up_savings(candidate, depth=3)
+
+    assert savings["threadgroup_storage_bytes"] == 0
+    assert savings["threadgroup_barriers"] == 0
+    assert savings["input_fill_load_instruction_bytes"] == 0

@@ -17,6 +17,7 @@ HY3_MTP_K_VECTORS = (1, 2, 4, 8, 16)
 HY3_MTP_ROWS_PER_SIMDGROUP = (1, 2, 4, 8)
 HY3_MTP_ACTIVATION_MODES = ("exact", "fast")
 HY3_MTP_REDUCTION_LAYOUTS = ("striped", "stock_tn4")
+HY3_MTP_INPUT_MODES = ("threadgroup", "direct")
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,7 @@ class Hy3MTPGateUpCandidate:
     rows_per_simdgroup: int = 1
     activation_mode: str = "exact"
     reduction_layout: str = "striped"
+    input_mode: str = "threadgroup"
 
     def __post_init__(self) -> None:
         if self.n_tile not in HY3_MTP_N_TILES:
@@ -53,6 +55,8 @@ class Hy3MTPGateUpCandidate:
             )
         if self.reduction_layout == "stock_tn4" and self.k_vector != 4:
             raise ValueError("stock_tn4 reduction_layout requires k_vector=4")
+        if self.input_mode not in HY3_MTP_INPUT_MODES:
+            raise ValueError(f"input_mode must be one of {HY3_MTP_INPUT_MODES}")
 
     @property
     def threads(self) -> int:
@@ -66,6 +70,8 @@ class Hy3MTPGateUpCandidate:
         )
         if self.reduction_layout != "striped":
             name += f"_{self.reduction_layout}"
+        if self.input_mode != "threadgroup":
+            name += f"_{self.input_mode}"
         return name
 
 
@@ -73,6 +79,7 @@ def hy3_mtp_gate_up_candidates(
     *,
     activation_modes: tuple[str, ...] = ("exact",),
     reduction_layouts: tuple[str, ...] = ("striped",),
+    input_modes: tuple[str, ...] = ("threadgroup",),
 ) -> tuple[Hy3MTPGateUpCandidate, ...]:
     """Return the exhaustive shape-specific tiling frontier."""
 
@@ -82,6 +89,9 @@ def hy3_mtp_gate_up_candidates(
     unknown_layouts = set(reduction_layouts) - set(HY3_MTP_REDUCTION_LAYOUTS)
     if unknown_layouts:
         raise ValueError(f"unknown reduction layouts: {sorted(unknown_layouts)}")
+    unknown_input_modes = set(input_modes) - set(HY3_MTP_INPUT_MODES)
+    if unknown_input_modes:
+        raise ValueError(f"unknown input modes: {sorted(unknown_input_modes)}")
     return tuple(
         Hy3MTPGateUpCandidate(
             n_tile=n_tile,
@@ -89,8 +99,10 @@ def hy3_mtp_gate_up_candidates(
             rows_per_simdgroup=rows_per_simdgroup,
             activation_mode=activation_mode,
             reduction_layout=reduction_layout,
+            input_mode=input_mode,
         )
-        for reduction_layout, activation_mode, n_tile, rows_per_simdgroup, k_vector in product(
+        for input_mode, reduction_layout, activation_mode, n_tile, rows_per_simdgroup, k_vector in product(
+            input_modes,
             reduction_layouts,
             activation_modes,
             HY3_MTP_N_TILES,
@@ -125,6 +137,20 @@ def render_hy3_mtp_gate_up_source(candidate: Hy3MTPGateUpCandidate) -> str:
                 up_reduced += simd_shuffle_down(up_reduced, delta);
             }"""
     )
+    input_prelude = (
+        """threadgroup T activation_tile[4096];
+        for (uint k = thread_id; k < K; k += THREADS) {
+            activation_tile[k] = input_values[k];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);"""
+        if candidate.input_mode == "threadgroup"
+        else ""
+    )
+    activation_source = (
+        "activation_tile[k]"
+        if candidate.input_mode == "threadgroup"
+        else "input_values[k]"
+    )
     return f"""
         constexpr uint K = {HY3_MTP_HIDDEN_SIZE};
         constexpr uint N = {HY3_MTP_SHARED_INTERMEDIATE_SIZE};
@@ -133,17 +159,13 @@ def render_hy3_mtp_gate_up_source(candidate: Hy3MTPGateUpCandidate) -> str:
         constexpr uint K_VECTOR = {candidate.k_vector};
         constexpr uint THREADS = N_TILE * 32;
 
-        threadgroup T activation_tile[4096];
         uint thread_id = thread_index_in_threadgroup;
         uint simd_id = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
         uint n_base = (threadgroup_position_in_grid.x * N_TILE + simd_id)
             * ROWS_PER_SIMDGROUP;
 
-        for (uint k = thread_id; k < K; k += THREADS) {{
-            activation_tile[k] = input_values[k];
-        }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {input_prelude}
 
         float gate_sum[ROWS_PER_SIMDGROUP] = {{0.0f}};
         float up_sum[ROWS_PER_SIMDGROUP] = {{0.0f}};
@@ -153,7 +175,7 @@ def render_hy3_mtp_gate_up_source(candidate: Hy3MTPGateUpCandidate) -> str:
             _Pragma("clang loop unroll(full)")
             for (uint offset = 0; offset < K_VECTOR; ++offset) {{
                 uint k = {k_index};
-                float activation = float(activation_tile[k]);
+                float activation = float({activation_source});
                 _Pragma("clang loop unroll(full)")
                 for (uint row = 0; row < ROWS_PER_SIMDGROUP; ++row) {{
                     uint n = n_base + row;
@@ -201,6 +223,7 @@ def hy3_mtp_gate_up_savings(
         2 * HY3_MTP_SHARED_INTERMEDIATE_SIZE * HY3_MTP_HIDDEN_SIZE * 2
     )
     threadgroups = threadgroups_per_depth * depth
+    uses_threadgroup_input = candidate.input_mode == "threadgroup"
     return {
         "depth": depth,
         # Two GEMVs plus SwiGLU become one kernel. The down GEMV is unchanged.
@@ -210,11 +233,13 @@ def hy3_mtp_gate_up_savings(
         "gate_up_weight_bytes_required": gate_up_weight_bytes * depth,
         # Gate/up BF16 arrays are neither written nor read by a separate SwiGLU.
         "intermediate_device_bytes_avoided": 4 * intermediate_bytes * depth,
-        "threadgroup_storage_bytes": activation_bytes,
+        "threadgroup_storage_bytes": activation_bytes if uses_threadgroup_input else 0,
         "threadgroups": threadgroups,
-        "threadgroup_barriers": threadgroups,
+        "threadgroup_barriers": threadgroups if uses_threadgroup_input else 0,
         # Address-space load instructions; cache residency determines DRAM traffic.
-        "input_fill_load_instruction_bytes": activation_bytes * threadgroups,
+        "input_fill_load_instruction_bytes": (
+            activation_bytes * threadgroups if uses_threadgroup_input else 0
+        ),
         "steady_extra_weight_bytes": 0,
     }
 
