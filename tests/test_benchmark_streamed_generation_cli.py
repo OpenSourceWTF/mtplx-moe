@@ -915,7 +915,52 @@ def test_enable_mtp_parses_with_artifacts_for_hy3() -> None:
     assert str(args.mtp_artifacts) == "/artifacts"
 
 
-def test_enable_mtp_requires_artifacts_and_hy3(capsys) -> None:
+def test_enable_mtp_parses_with_bf16_artifacts_for_glm52_q4() -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [
+            *_BASE_ARGS,
+            "--model-key",
+            "glm52-q4",
+            "--enable-mtp",
+            "--mtp-artifacts",
+            "/artifacts",
+            "--mtp-precision",
+            "bf16",
+        ]
+    )
+
+    module.validate_mtp_flags(parser, args)
+
+    assert args.enable_mtp is True
+    assert args.mtp_precision == "bf16"
+    assert str(args.mtp_artifacts) == "/artifacts"
+
+
+def test_glm52_q4_rejects_q4_mtp_precision_before_load(capsys) -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [
+            *_BASE_ARGS,
+            "--model-key",
+            "glm52-q4",
+            "--enable-mtp",
+            "--mtp-artifacts",
+            "/artifacts",
+            "--mtp-precision",
+            "q4",
+        ]
+    )
+
+    with pytest.raises(SystemExit):
+        module.validate_mtp_flags(parser, args)
+
+    assert "BF16" in capsys.readouterr().err
+
+
+def test_enable_mtp_requires_artifacts(capsys) -> None:
     import pytest
 
     module = _load_module()
@@ -925,20 +970,6 @@ def test_enable_mtp_requires_artifacts_and_hy3(capsys) -> None:
     with pytest.raises(SystemExit):
         module.validate_mtp_flags(parser, args)
     assert "--mtp-artifacts" in capsys.readouterr().err
-
-    args = parser.parse_args(
-        [
-            *_BASE_ARGS,
-            "--model-key",
-            "glm52-q4",
-            "--enable-mtp",
-            "--mtp-artifacts",
-            "/artifacts",
-        ]
-    )
-    with pytest.raises(SystemExit):
-        module.validate_mtp_flags(parser, args)
-    assert "hy3-q4" in capsys.readouterr().err
 
     args = parser.parse_args(
         [*_BASE_ARGS, "--model-key", "hy3-q4", "--mtp-artifacts", "/artifacts"]
@@ -969,7 +1000,7 @@ def test_benchmark_rejects_mtp_for_explicit_hy3_expert_lanes_before_load(
     with pytest.raises(SystemExit):
         module.validate_mtp_flags(parser, args)
 
-    assert "hy3-q4 only" in capsys.readouterr().err
+    assert "hy3-q4 or glm52-q4" in capsys.readouterr().err
 
 
 def test_sidecar_trust_requires_validated_sidecar_and_preserves_source_hashes(

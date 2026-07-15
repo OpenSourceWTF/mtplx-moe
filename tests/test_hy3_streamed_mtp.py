@@ -427,7 +427,7 @@ def test_load_requires_artifacts_for_streamed_mtp(tmp_path: Path) -> None:
         )
 
 
-def test_load_rejects_streamed_mtp_for_unsupported_glm_q4(tmp_path: Path) -> None:
+def test_load_rejects_q4_mtp_precision_for_glm_q4(tmp_path: Path) -> None:
     root = _guard_config_dir(tmp_path)
     config = ExpertStreamingConfig(
         model_key="glm52-q4",
@@ -435,13 +435,14 @@ def test_load_rejects_streamed_mtp_for_unsupported_glm_q4(tmp_path: Path) -> Non
         max_live_kv_tokens=0,
         runtime_reserve_bytes=0,
     )
-    with pytest.raises(RuntimeError, match="not supported"):
+    with pytest.raises(RuntimeError, match="BF16"):
         load(
             root,
             mtp=True,
             expert_streaming_config=config,
             expert_manifest=root / "expert-manifest.json",
             mtp_artifacts=tmp_path,
+            mtp_precision="q4",
         )
 
 
@@ -483,13 +484,14 @@ def test_streamed_mtp_dispatch_and_precision_matrix() -> None:
     assert _streamed_mtp_backend("hy3-q4", "q4") == "hy3"
     assert _streamed_mtp_backend("hy3-expert-q2", "bf16") == "hy3"
     assert _streamed_mtp_backend("glm52-expert-q2", "bf16") == "glm52"
+    assert _streamed_mtp_backend("glm52-q4", "bf16") == "glm52"
 
     with pytest.raises(RuntimeError, match="BF16"):
         _streamed_mtp_backend("hy3-expert-q2", "q4")
     with pytest.raises(RuntimeError, match="BF16"):
         _streamed_mtp_backend("glm52-expert-q2", "q4")
-    with pytest.raises(RuntimeError, match="not supported"):
-        _streamed_mtp_backend("glm52-q4", "bf16")
+    with pytest.raises(RuntimeError, match="BF16"):
+        _streamed_mtp_backend("glm52-q4", "q4")
 
 
 def test_load_rejects_mtp_artifacts_without_streaming(tmp_path: Path) -> None:
