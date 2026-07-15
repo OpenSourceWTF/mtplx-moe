@@ -60,6 +60,17 @@ class _MappingChatTokenizer(_CharTokenizer):
         return {"input_ids": ids, "attention_mask": [1] * len(ids)}
 
 
+class _StalledChatTokenizer(_CharTokenizer):
+    def __init__(self) -> None:
+        self.chat_calls = 0
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **kwargs):
+        self.chat_calls += 1
+        if self.chat_calls > 3:
+            raise AssertionError("prompt sizing did not detect stalled chat encoding")
+        return [1]
+
+
 def test_programming_context_is_deterministic_and_structurally_varied() -> None:
     first = build_programming_context(minimum_characters=80_000)
     second = build_programming_context(minimum_characters=80_000)
@@ -147,6 +158,18 @@ def test_realistic_programming_prompt_accepts_mapping_chat_template() -> None:
 
     assert len(prompt.token_ids) == 1024
     assert prompt.metadata["prompt_tail_preserved"] is True
+
+
+def test_realistic_programming_prompt_rejects_stalled_chat_template() -> None:
+    with pytest.raises(
+        ValueError,
+        match="chat template made no progress while sizing programming context",
+    ):
+        _prompt_build_for_context(
+            _StalledChatTokenizer(),
+            1024,
+            prompt_tail="Fix the queue.",
+        )
 
 
 def test_prefill_prompt_legacy_mode_keeps_diagnostic_hard_truncate() -> None:

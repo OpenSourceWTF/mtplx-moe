@@ -238,6 +238,7 @@ def _coherent_tail_token_ids_for_context(
         enable_thinking=enable_thinking,
     )
     while len(token_ids) < context_tokens:
+        previous_prompt_length = len(token_ids)
         filler_target += max(1, int(context_tokens) - len(token_ids))
         while len(filler_ids) < filler_target:
             previous_length = len(filler_ids)
@@ -257,6 +258,10 @@ def _coherent_tail_token_ids_for_context(
             prompt_format=prompt_format,
             enable_thinking=enable_thinking,
         )
+        if len(token_ids) <= previous_prompt_length:
+            raise ValueError(
+                "chat template made no progress while sizing programming context"
+            )
     head_trimmed_tokens = max(0, len(token_ids) - int(context_tokens))
     token_ids = token_ids[-context_tokens:]
     rendered_prompt = tokenizer.decode(token_ids)
