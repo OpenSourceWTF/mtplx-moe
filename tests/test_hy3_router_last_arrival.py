@@ -15,12 +15,14 @@ from mtplx.hy3_router_last_arrival import (  # noqa: E402
 def test_tagged_arrival_layout_is_uninitialized_and_independently_checkable() -> None:
     layout = TaggedArrivalLayout(threadgroups=16, elections=1024)
 
-    assert layout.flag_words == 16
+    assert layout.ready_words == 16
+    assert layout.check_words == 16
+    assert layout.flag_words == 32
     assert layout.payload_words == 16
     assert layout.metadata_words == 3
-    assert layout.words_per_election == 35
-    assert layout.total_words == 35 * 1024
-    assert layout.total_bytes == 35 * 1024 * 4
+    assert layout.words_per_election == 51
+    assert layout.total_words == 51 * 1024
+    assert layout.total_bytes == 51 * 1024 * 4
 
 
 @pytest.mark.parametrize("threadgroups", (0, 1, 3, 12, 17, 32))
@@ -60,10 +62,12 @@ def test_tagged_arrival_source_has_no_initialized_counter_or_readiness_spin() ->
     assert "atomic_thread_fence(" in source
     assert "memory_order_seq_cst" in source
     assert "thread_scope_device" in source
-    assert "atomic_store_explicit(&flags[local_group]" in source
-    assert "atomic_load_explicit(&flags[producer]" in source
+    assert "atomic_store_explicit(&ready[local_group]" in source
+    assert "atomic_store_explicit(&checks[local_group]" in source
+    assert "atomic_load_explicit(&ready[producer]" in source
+    assert "atomic_load_explicit(&checks[producer]" in source
     assert "atomic_compare_exchange_weak_explicit(" in source
-    assert "&flags[0]" in source
+    assert "&ready[0]" in source
     assert "metadata[0] = local_group" in source
     assert "threadgroup_position_in_grid.x" in source
     assert "threadgroup_barrier(mem_flags::mem_device)" in source

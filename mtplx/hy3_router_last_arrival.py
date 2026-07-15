@@ -41,8 +41,16 @@ class TaggedArrivalLayout:
             raise ValueError("tagged arrival elections must be positive")
 
     @property
-    def flag_words(self) -> int:
+    def ready_words(self) -> int:
         return int(self.threadgroups)
+
+    @property
+    def check_words(self) -> int:
+        return int(self.threadgroups)
+
+    @property
+    def flag_words(self) -> int:
+        return self.ready_words + self.check_words
 
     @property
     def payload_words(self) -> int:
@@ -116,7 +124,9 @@ def tagged_arrival_litmus_source(layout: TaggedArrivalLayout) -> str:
 
         constexpr uint THREADGROUPS = {int(layout.threadgroups)};
         constexpr uint ELECTIONS = {int(layout.elections)};
-        constexpr uint FLAG_WORDS = THREADGROUPS;
+        constexpr uint READY_WORDS = THREADGROUPS;
+        constexpr uint CHECK_WORDS = THREADGROUPS;
+        constexpr uint FLAG_WORDS = READY_WORDS + CHECK_WORDS;
         constexpr uint PAYLOAD_WORDS = THREADGROUPS;
         constexpr uint METADATA_WORDS = 3;
         constexpr uint WORDS_PER_ELECTION =
@@ -137,8 +147,11 @@ def tagged_arrival_litmus_source(layout: TaggedArrivalLayout) -> str:
 
         device uint* event_scratch =
             scratch + election * WORDS_PER_ELECTION;
-        device atomic_uint* flags =
+        device atomic_uint* ready =
             reinterpret_cast<device atomic_uint*>(event_scratch);
+        device atomic_uint* checks =
+            reinterpret_cast<device atomic_uint*>(
+                event_scratch + READY_WORDS);
         device atomic_uint* payloads =
             reinterpret_cast<device atomic_uint*>(event_scratch + FLAG_WORDS);
         device uint* metadata =
@@ -162,7 +175,8 @@ def tagged_arrival_litmus_source(layout: TaggedArrivalLayout) -> str:
                 mem_flags::mem_device,
                 memory_order_seq_cst,
                 thread_scope_device);
-            atomic_store_explicit(&flags[local_group], tag, memory_order_relaxed);
+            atomic_store_explicit(&ready[local_group], tag, memory_order_relaxed);
+            atomic_store_explicit(&checks[local_group], ~tag, memory_order_relaxed);
             atomic_thread_fence(
                 mem_flags::mem_device,
                 memory_order_seq_cst,
@@ -171,8 +185,10 @@ def tagged_arrival_litmus_source(layout: TaggedArrivalLayout) -> str:
             bool all_ready = true;
             for (uint producer = 0; producer < THREADGROUPS; ++producer) {{
                 all_ready = all_ready
-                    && atomic_load_explicit(&flags[producer], memory_order_relaxed)
-                        == tag;
+                    && atomic_load_explicit(&ready[producer], memory_order_relaxed)
+                        == tag
+                    && atomic_load_explicit(&checks[producer], memory_order_relaxed)
+                        == ~tag;
             }}
             if (all_ready) {{
                 atomic_thread_fence(
@@ -183,7 +199,7 @@ def tagged_arrival_litmus_source(layout: TaggedArrivalLayout) -> str:
                 bool won = false;
                 do {{
                     won = atomic_compare_exchange_weak_explicit(
-                        &flags[0],
+                        &ready[0],
                         &expected,
                         ~tag,
                         memory_order_relaxed,

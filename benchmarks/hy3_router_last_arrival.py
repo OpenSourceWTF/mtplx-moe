@@ -92,9 +92,14 @@ def validate_litmus_scratch(
         event = int(base_event) + election
         tag = tagged_arrival_tag(event)
         expected_claim = (~tag) & 0xFFFFFFFF
-        flag_failure = int(row[0]) != expected_claim or any(
-            int(value) != tag for value in row[1 : layout.flag_words]
+        ready_failure = int(row[0]) != expected_claim or any(
+            int(value) != tag for value in row[1 : layout.ready_words]
         )
+        check_failure = any(
+            int(value) != expected_claim
+            for value in row[layout.ready_words : layout.flag_words]
+        )
+        flag_failure = ready_failure or check_failure
         payload_failure = False
         for group in range(layout.threadgroups):
             observed = int(row[layout.flag_words + group])

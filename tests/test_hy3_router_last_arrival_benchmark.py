@@ -39,7 +39,11 @@ def _valid_scratch(
         event = base_event + election
         tag = tagged_arrival_tag(event)
         scratch[election, 0] = np.uint32((~tag) & 0xFFFFFFFF)
-        scratch[election, 1 : layout.flag_words] = np.uint32(tag)
+        scratch[election, 1 : layout.ready_words] = np.uint32(tag)
+        scratch[
+            election,
+            layout.ready_words : layout.flag_words,
+        ] = np.uint32((~tag) & 0xFFFFFFFF)
         for group in range(layout.threadgroups):
             scratch[election, layout.flag_words + group] = np.uint32(
                 tagged_arrival_payload(event=event, group=group, seed=seed)
@@ -98,6 +102,28 @@ def test_litmus_validator_attributes_stale_payload_and_missing_claim() -> None:
     assert observed["flag_failures"] == 1
     assert observed["payload_failures"] == 1
     assert observed["first_failure"]["event"] == 200
+
+
+def test_litmus_validator_rejects_a_stale_complement_word() -> None:
+    module = _load_script()
+    layout = TaggedArrivalLayout(elections=2)
+    scratch = _valid_scratch(layout, base_event=300, seed=53).reshape(
+        layout.elections,
+        layout.words_per_election,
+    )
+    scratch[1, layout.ready_words + 7] = np.uint32(tagged_arrival_tag(301))
+
+    observed = module.validate_litmus_scratch(
+        scratch.reshape(-1),
+        layout=layout,
+        base_event=300,
+        seed=53,
+    )
+
+    assert observed["successful_elections"] == 1
+    assert observed["failed_elections"] == 1
+    assert observed["flag_failures"] == 1
+    assert observed["first_failure"]["event"] == 301
 
 
 def test_litmus_dispatch_omits_output_initialization(monkeypatch) -> None:
