@@ -34,6 +34,7 @@ WARMUP_TOKENS = 8
 SEED = 0
 VERIFY_STRATEGIES = ("batched", "capture_commit")
 COMPILED_VERIFY_MODES = ("off", "parity", "on")
+DRAFT_CORES = ("stock", "device-k", "device-d2")
 
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 _FIXED_DEPTH_ENV_KEYS = (
@@ -45,7 +46,7 @@ _FIXED_DEPTH_ENV_KEYS = (
 MODEL_SPECS = {
     "hy3-q2": {
         "model_key": "hy3-expert-q2",
-        "depths": (1, 2, 3, 4, 5, 6),
+        "depths": (1, 2, 3, 4, 5, 6, 7),
         "model_root": Path("~/.cache/huggingface/hy3-expert-only-mlx-q2"),
         "mtp_artifacts": Path("~/.cache/huggingface/hy3-mtp-layer80"),
         "prompt_tail": None,
@@ -378,6 +379,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--compiled-verify-mode",
         choices=COMPILED_VERIFY_MODES,
         default="off",
+    )
+    parser.add_argument(
+        "--draft-core",
+        choices=DRAFT_CORES,
+        default="stock",
+        help=(
+            "MTP draft execution core. device-k is the D1...D7 fixed compiled "
+            "committed-history lane (primary K3/M4)."
+        ),
     )
     parser.add_argument(
         "--trace-routes",
@@ -1383,6 +1393,94 @@ def _result_tokens(result: Any) -> list[int]:
     return [int(token) for token in value]
 
 
+def _require_compiled_draft_evidence(
+    stats: Any,
+    *,
+    model: str,
+    depth: int,
+    draft_core: str,
+) -> dict[str, Any] | None:
+    evidence = _field(stats, "draft_core")
+    if draft_core == "stock":
+        return dict(evidence) if isinstance(evidence, Mapping) else None
+    if not isinstance(evidence, Mapping):
+        raise BenchmarkGateError(
+            f"{model} d{depth} compiled draft emitted no evidence"
+        )
+    report = dict(evidence)
+    if report.get("requested") != draft_core:
+        raise BenchmarkGateError(
+            f"{model} d{depth} compiled draft request evidence disagrees"
+        )
+    if report.get("selected") != "device-k":
+        raise BenchmarkGateError(
+            f"{model} d{depth} silently selected a non-compiled draft core"
+        )
+    compiled_calls = _optional_int(report, "compiled_calls")
+    if compiled_calls is None or compiled_calls <= 0:
+        raise BenchmarkGateError(
+            f"{model} d{depth} compiled draft emitted no measured calls"
+        )
+    if _optional_int(report, "organic_compile_calls") != 0:
+        raise BenchmarkGateError(
+            f"{model} d{depth} compiled draft compiled during measured dispatch"
+        )
+    fallbacks = _optional_int(report, "fallbacks")
+    if fallbacks != 0 or report.get("fallback_reasons"):
+        raise BenchmarkGateError(
+            f"{model} d{depth} compiled draft used fallback calls"
+        )
+    if report.get("history_policy") != "committed":
+        raise BenchmarkGateError(
+            f"{model} d{depth} compiled draft did not use committed history"
+        )
+    if report.get("cache_state_mode") != "explicit-live-io":
+        raise BenchmarkGateError(
+            f"{model} d{depth} compiled draft did not expose live cache state"
+        )
+    prewarm = report.get("prewarm")
+    if not isinstance(prewarm, Mapping) or prewarm.get("compiled") is not True:
+        raise BenchmarkGateError(
+            f"{model} d{depth} compiled draft was not prewarmed"
+        )
+    per_depth = report.get("per_depth")
+    depth_evidence = (
+        per_depth.get(str(depth)) if isinstance(per_depth, Mapping) else None
+    )
+    if not isinstance(depth_evidence, Mapping):
+        raise BenchmarkGateError(
+            f"{model} d{depth} compiled draft omitted per-depth evidence"
+        )
+    depth_calls = _optional_int(depth_evidence, "calls")
+    live_commits = _optional_int(depth_evidence, "live_cache_commits")
+    if depth_calls is None or depth_calls <= 0 or live_commits != depth_calls:
+        raise BenchmarkGateError(
+            f"{model} d{depth} compiled draft live-cache commits disagree"
+        )
+    if draft_core == "device-k":
+        if report.get("qualification_eligible") is not True:
+            raise BenchmarkGateError(
+                f"{model} d{depth} compiled draft is not qualification eligible"
+            )
+        if report.get("primary_depth") != 3 or report.get("primary_width") != 4:
+            raise BenchmarkGateError(
+                f"{model} d{depth} compiled draft K3/M4 marker disagrees"
+            )
+        supported = [int(value) for value in report.get("supported_depths", ())]
+        if supported != list(range(1, 8)):
+            raise BenchmarkGateError(
+                f"{model} d{depth} compiled draft D1...D7 support disagrees"
+            )
+        prewarmed = [int(value) for value in report.get("prewarmed_depths", ())]
+        if prewarmed != list(range(1, depth + 1)):
+            raise BenchmarkGateError(
+                f"{model} d{depth} compiled draft prewarm coverage disagrees"
+            )
+    elif depth != 2:
+        raise BenchmarkGateError("legacy device-d2 requires an exact D2 row")
+    return report
+
+
 def _run_observation(
     *,
     apis: RunnerAPIs,
@@ -1400,6 +1498,7 @@ def _run_observation(
     ar_finish_reason: str | None,
     verify_strategy: str,
     compiled_verify_mode: str,
+    draft_core: str,
     draft_observer: Callable[[Mapping[str, Any]], None] | None,
 ) -> tuple[dict[str, Any], list[int], str | None]:
     _reset_expert_streaming(runtime)
@@ -1476,6 +1575,7 @@ def _run_observation(
                     "speculative_depth": depth,
                     "mtp_cache_policy": "persistent",
                     "mtp_history_policy": "committed",
+                    "draft_core": draft_core,
                     "capture_final_state": True,
                     "verify_strategy": verify_strategy,
                 }
@@ -1568,6 +1668,12 @@ def _run_observation(
         effective_exact = effective_depth == depth
         committed_history = depth == 0 or history_policy == "committed"
         guards_disabled = _guards_disabled(stats)
+        compiled_draft = _require_compiled_draft_evidence(
+            stats,
+            model=model,
+            depth=depth,
+            draft_core=draft_core,
+        ) if depth > 0 else None
         compiled_verify = None
         graphbank = _field(stats, "graphbank", {})
         if isinstance(graphbank, Mapping):
@@ -1690,6 +1796,8 @@ def _run_observation(
         "token_ids": tokens,
         "generation_events": _jsonable(_field(stats, "events", [])),
         "compiled_verify": _jsonable(compiled_verify),
+        "draft_core": None if depth == 0 else draft_core,
+        "compiled_draft": _jsonable(compiled_draft),
         "ar_comparison": ar_comparison,
         "speculative_event_contract": speculative_event_contract,
         "final_state_contract": final_state_contract,
@@ -1718,6 +1826,9 @@ def _run_observation(
             or speculative_event_contract is not None,
             "final_state_contract": depth == 0 or final_state_contract is not None,
             "compiled_verify_evidence": compiled_verify_evidence,
+            "compiled_draft_evidence": depth == 0
+            or draft_core == "stock"
+            or compiled_draft is not None,
         },
     }
     if not row["gates"]["new_prefill_tokens_exact"]:
@@ -1839,6 +1950,7 @@ def _checkpoint_skeleton(
     mtp_disabled_baseline: bool,
     verify_strategy: str,
     compiled_verify_mode: str,
+    draft_core: str,
     trace_routes: bool,
 ) -> dict[str, Any]:
     """Return a uniform payload for failures before validated setup exists."""
@@ -1870,6 +1982,7 @@ def _checkpoint_skeleton(
             "requested_candidate": {
                 "verify_strategy": verify_strategy,
                 "compiled_verify_mode": compiled_verify_mode,
+                "draft_core": draft_core,
                 "trace_routes": trace_routes,
             },
         },
@@ -1886,6 +1999,7 @@ def run_depth_matrix(
     mtp_disabled_baseline: bool = False,
     verify_strategy: str = "batched",
     compiled_verify_mode: str = "off",
+    draft_core: str = "stock",
     trace_routes: bool = False,
     draft_observer: Callable[[Mapping[str, Any]], None] | None = None,
     checkpoint: Checkpoint | None = None,
@@ -1901,6 +2015,7 @@ def run_depth_matrix(
             mtp_disabled_baseline=mtp_disabled_baseline,
             verify_strategy=verify_strategy,
             compiled_verify_mode=compiled_verify_mode,
+            draft_core=draft_core,
             trace_routes=trace_routes,
         )
     }
@@ -1913,6 +2028,7 @@ def run_depth_matrix(
             mtp_disabled_baseline=mtp_disabled_baseline,
             verify_strategy=verify_strategy,
             compiled_verify_mode=compiled_verify_mode,
+            draft_core=draft_core,
             trace_routes=trace_routes,
             draft_observer=draft_observer,
             checkpoint=checkpoint,
@@ -1945,6 +2061,7 @@ def _run_depth_matrix_impl(
     mtp_disabled_baseline: bool = False,
     verify_strategy: str = "batched",
     compiled_verify_mode: str = "off",
+    draft_core: str = "stock",
     trace_routes: bool = False,
     draft_observer: Callable[[Mapping[str, Any]], None] | None = None,
     checkpoint: Checkpoint | None = None,
@@ -1967,6 +2084,12 @@ def _run_depth_matrix_impl(
         raise BenchmarkConfigurationError("unsupported verify strategy")
     if compiled_verify_mode not in COMPILED_VERIFY_MODES:
         raise BenchmarkConfigurationError("unsupported compiled verify mode")
+    if draft_core not in DRAFT_CORES:
+        raise BenchmarkConfigurationError("unsupported draft core")
+    if mtp_disabled_baseline and draft_core != "stock":
+        raise BenchmarkConfigurationError(
+            "MTP-disabled baseline requires the stock draft core"
+        )
     if compiled_verify_mode != "off" and verify_strategy != "capture_commit":
         raise BenchmarkConfigurationError(
             "compiled verify requires capture_commit verify strategy"
@@ -1983,6 +2106,12 @@ def _run_depth_matrix_impl(
         )
         for request in model_requests
     ]
+    if draft_core == "device-d2" and any(
+        request["depths"] != (2,) for request in normalized
+    ):
+        raise BenchmarkConfigurationError(
+            "legacy device-d2 requires every requested matrix to contain only D2"
+        )
     names = [request["model"] for request in normalized]
     if len(set(names)) != len(names):
         raise BenchmarkConfigurationError("models must not repeat")
@@ -2067,6 +2196,7 @@ def _run_depth_matrix_impl(
                 "loop_guard": False,
                 "mtp_cache_policy": (None if mtp_disabled_baseline else "persistent"),
                 "mtp_history_policy": (None if mtp_disabled_baseline else "committed"),
+                "draft_core": None if mtp_disabled_baseline else draft_core,
                 "capture_final_state": not mtp_disabled_baseline,
             },
             "generation_environment": generation_environment,
@@ -2081,6 +2211,7 @@ def _run_depth_matrix_impl(
             "candidate": {
                 "verify_strategy": verify_strategy,
                 "compiled_verify_mode": compiled_verify_mode,
+                "draft_core": draft_core,
                 "trace_routes": bool(trace_routes),
             },
         },
@@ -2250,6 +2381,7 @@ def _run_depth_matrix_impl(
                     ar_finish_reason=None,
                     verify_strategy=verify_strategy,
                     compiled_verify_mode=compiled_verify_mode,
+                    draft_core=draft_core,
                     draft_observer=draft_observer,
                 )
                 hard_peak_memory_bytes = max(
@@ -2282,6 +2414,7 @@ def _run_depth_matrix_impl(
                     ar_finish_reason=None,
                     verify_strategy=verify_strategy,
                     compiled_verify_mode=compiled_verify_mode,
+                    draft_core=draft_core,
                     draft_observer=draft_observer,
                 )
                 hard_peak_memory_bytes = max(
@@ -2317,6 +2450,7 @@ def _run_depth_matrix_impl(
                         ar_finish_reason=warmup_ar_finish,
                         verify_strategy=verify_strategy,
                         compiled_verify_mode=compiled_verify_mode,
+                        draft_core=draft_core,
                         draft_observer=draft_observer,
                     )
                     _record_token_divergence(
@@ -2354,6 +2488,7 @@ def _run_depth_matrix_impl(
                         ar_finish_reason=ar_finish,
                         verify_strategy=verify_strategy,
                         compiled_verify_mode=compiled_verify_mode,
+                        draft_core=draft_core,
                         draft_observer=draft_observer,
                     )
                     _record_token_divergence(
@@ -2453,6 +2588,7 @@ def main(argv: Sequence[str] | None = None, *, apis: RunnerAPIs | None = None) -
             mtp_disabled_baseline=args.mtp_disabled_baseline,
             verify_strategy=args.verify_strategy,
             compiled_verify_mode=args.compiled_verify_mode,
+            draft_core=args.draft_core,
             trace_routes=args.trace_routes,
             checkpoint=persist_checkpoint,
             apis=apis,

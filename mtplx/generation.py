@@ -47,9 +47,8 @@ from .gdn_capture import resolve_gdn_capture_backend
 from .graphbank import (
     CompiledVerifyBank,
     SpecDecodeGraphBank,
-    cache_array_tree,
+    TensorOffsetKVCache,
     compiled_verify_mode,
-    promote_kv_cache_offsets,
 )
 from .native_mlp import set_native_mlp_context
 from .loop_guard import LoopGuard, loop_guard_config_from_env
@@ -3440,84 +3439,490 @@ def _seed_prompt_correction_cache(
     }
 
 
-def _reset_tensor_offset_cache(cache: Any) -> None:
-    for entry in cache or []:
-        if hasattr(entry, "offset"):
-            entry.offset = 0
-        if hasattr(entry, "rollback_state"):
-            entry.rollback_state = [None, None, None]
+COMPILED_MTP_DRAFT_DEPTHS = tuple(range(1, 8))
+COMPILED_MTP_DRAFT_PRIMARY_DEPTH = 3
+COMPILED_MTP_DRAFT_PRIMARY_WIDTH = COMPILED_MTP_DRAFT_PRIMARY_DEPTH + 1
 
 
-def _make_device_d2_draft_core(
-    rt: MTPLXRuntime,
+class CompiledMTPDraftNotPrewarmed(RuntimeError):
+    """Raised when measured dispatch would need to compile organically."""
+
+
+def _device_argmax_token(logits: mx.array) -> mx.array:
+    """Keep the recurrent token edge on device as a shape-(1, 1) array."""
+    return mx.argmax(logits[:, -1, :], axis=-1).reshape(1, 1)
+
+
+def _compiled_mtp_state_signature(
     hidden: mx.array,
     token_ids: mx.array,
+    state: tuple[mx.array, ...],
+) -> tuple[tuple[tuple[int, ...], str], ...]:
+    arrays = (hidden, token_ids, *state)
+    return tuple(
+        (tuple(int(dim) for dim in value.shape), str(value.dtype)) for value in arrays
+    )
+
+
+def _prepare_committed_mtp_cache_state(
+    mtp_cache: Any,
     *,
-    mtp_hidden_variant: str,
+    reserve_tokens: int,
+    commit_capacity: bool,
 ) -> dict[str, Any]:
-    mtp_cache = rt.make_mtp_cache()
-    logits, draft_hidden = rt.draft_mtp(
-        hidden,
-        token_ids,
-        mtp_cache=mtp_cache,
-        return_hidden=True,
-        mtp_hidden_variant=mtp_hidden_variant,
-        mtp_depth=1,
-    )
-    _eval(logits, draft_hidden)
-    promoted, failures = promote_kv_cache_offsets(mtp_cache, reserve_tokens=4)
-    _reset_tensor_offset_cache(mtp_cache)
+    """Expose one Hy3 committed KV cache as explicit array state.
 
-    def draft2_fn(hidden_states, first_token_ids):
-        logits1, hidden1 = rt.draft_mtp(
-            hidden_states,
-            first_token_ids,
-            mtp_cache=mtp_cache,
-            return_hidden=True,
-            mtp_hidden_variant=mtp_hidden_variant,
-            mtp_depth=1,
+    The live cache container remains the target of stock rollback/history
+    commit logic.  A tensor-offset adapter is used only to present keys,
+    values, and offset as pure compiled inputs/outputs.
+    """
+    if not isinstance(mtp_cache, list) or len(mtp_cache) != 1:
+        raise RuntimeError(
+            "compiled committed MTP draft requires exactly one live cache slot"
         )
-        token1 = mx.argmax(logits1[:, -1, :], axis=-1).reshape(1, 1)
-        logits2, _hidden2 = rt.draft_mtp(
-            hidden1[:, -1:, :],
-            token1,
-            mtp_cache=mtp_cache,
-            return_hidden=True,
-            mtp_hidden_variant=mtp_hidden_variant,
-            mtp_depth=2,
-        )
-        token2 = mx.argmax(logits2[:, -1, :], axis=-1).reshape(1, 1)
-        return token1, token2
+    entry = mtp_cache[0]
+    if entry is None or getattr(entry, "_idx", None) is not None:
+        raise RuntimeError("compiled committed MTP draft cache is unsupported")
 
-    compiled = mx.compile(
-        draft2_fn,
-        inputs=cache_array_tree(mtp_cache),
-        outputs=cache_array_tree(mtp_cache),
-    )
-    smoke = compiled(hidden, token_ids)
-    _eval(smoke)
-    _reset_tensor_offset_cache(mtp_cache)
+    if isinstance(entry, TensorOffsetKVCache):
+        base_offset = int(entry.offset)
+        entry.ensure_capacity(base_offset + max(1, int(reserve_tokens)))
+        adapter = entry
+        container_kind = "tensor-offset"
+    else:
+        offset = getattr(entry, "offset", None)
+        keys = getattr(entry, "keys", None)
+        values = getattr(entry, "values", None)
+        if not isinstance(offset, int) or keys is None or values is None:
+            raise RuntimeError(
+                "compiled committed MTP draft requires initialized dense KV state"
+            )
+        if len(keys.shape) != 4 or len(values.shape) != 4:
+            raise RuntimeError(
+                "compiled committed MTP draft requires rank-4 dense KV state"
+            )
+        base_offset = int(offset)
+        adapter = TensorOffsetKVCache.from_kv_cache(
+            entry,
+            reserve_tokens=max(1, int(reserve_tokens)),
+        )
+        container_kind = "stock-kv"
+        if commit_capacity:
+            # Capacity-only preallocation is semantic no-op state preparation:
+            # committed rows and the Python offset are unchanged.
+            entry.keys = adapter.keys
+            entry.values = adapter.values
+
+    state = tuple(adapter.cache)
+    if len(state) != 3 or not all(isinstance(value, mx.array) for value in state):
+        raise RuntimeError(
+            "compiled committed MTP draft requires explicit keys/values/offset leaves"
+        )
     return {
-        "fn": compiled,
-        "cache": mtp_cache,
-        "promoted": promoted,
-        "promotion_failures": failures,
+        "entry": entry,
+        "state": state,
+        "base_offset": base_offset,
+        "container_kind": container_kind,
+        "capacity_tokens": int(state[0].shape[2]),
     }
 
 
-def _run_device_d2_draft_core(
-    core: dict[str, Any],
-    hidden: mx.array,
-    primary: int,
-) -> list[int]:
-    _reset_tensor_offset_cache(core["cache"])
-    result = core["fn"](hidden, mx.array([[primary]]))
-    _eval(result)
-    token1, token2 = result
-    return [
-        int(token1.reshape(-1)[0].item()),
-        int(token2.reshape(-1)[0].item()),
-    ]
+def _commit_compiled_mtp_cache_state(
+    prepared: dict[str, Any],
+    state: tuple[mx.array, mx.array, mx.array],
+    *,
+    depth: int,
+) -> None:
+    entry = prepared["entry"]
+    if isinstance(entry, TensorOffsetKVCache):
+        entry.cache[:] = list(state)
+        rollback_state = entry.rollback_state
+        rollback_state[:] = [None] * len(rollback_state)
+        return
+    entry.keys = state[0]
+    entry.values = state[1]
+    # The supported Hy3 topology has one recurrent cache slot, so every
+    # fixed draft step advances this live committed cache exactly once.
+    entry.offset = int(prepared["base_offset"]) + int(depth)
+
+
+def compiled_mtp_draft_fallback_reason(
+    *,
+    requested: str,
+    depth: int,
+    requested_depth: int,
+    draft_temperature: float,
+    mtp_cache_policy: str,
+    mtp_history_policy: str,
+    draft_margin_threshold: float | None,
+    adaptive: bool,
+    mtp_corrector: bool,
+    online_hidden_corrector: bool,
+    correction_cache: bool,
+    adapter_ensemble: bool,
+    topk_reranker: bool,
+    position_mode: str,
+    dynamic_depth: bool,
+) -> str | None:
+    """Return why fixed compiled draft must fail closed, or ``None``."""
+    depth = int(depth)
+    requested_depth = int(requested_depth)
+    if depth not in COMPILED_MTP_DRAFT_DEPTHS:
+        return "unsupported_depth"
+    if requested not in {"device-k", "device-d2"}:
+        return f"unsupported_core:{requested}"
+    if requested == "device-d2" and depth != 2:
+        return "legacy_device_d2_depth"
+    if depth > requested_depth:
+        return "depth_above_requested"
+    if float(draft_temperature) > 0.0:
+        return "non_greedy_draft_sampler"
+    if mtp_cache_policy != "persistent":
+        return f"mtp_cache_policy:{mtp_cache_policy}"
+    if mtp_history_policy != "committed":
+        return f"mtp_history_policy:{mtp_history_policy}"
+    if draft_margin_threshold is not None:
+        return "draft_margin_threshold"
+    if adaptive:
+        return "adaptive_depth"
+    if mtp_corrector:
+        return "mtp_corrector"
+    if online_hidden_corrector:
+        return "online_hidden_corrector"
+    if correction_cache:
+        return "correction_cache"
+    if adapter_ensemble:
+        return "adapter_ensemble"
+    if topk_reranker:
+        return "topk_reranker"
+    normalized_position = str(position_mode or "cache").strip().lower()
+    if normalized_position not in {"", "0", "off", "false", "default", "cache"}:
+        return f"mtp_position_policy:{normalized_position}"
+    if dynamic_depth:
+        return "dynamic_depth"
+    return None
+
+
+class CompiledMTPDraftBank:
+    """One pure compiled recurrent callable per fixed committed-history depth."""
+
+    def __init__(
+        self,
+        runtime: MTPLXRuntime,
+        *,
+        mtp_hidden_variant: str,
+    ) -> None:
+        self.runtime = runtime
+        self.mtp_hidden_variant = str(mtp_hidden_variant)
+        self._cores: dict[int, dict[str, Any]] = {}
+        self._disabled: dict[int, str] = {}
+        self._per_depth: dict[int, dict[str, Any]] = {}
+        self._organic_compile_calls = 0
+
+    def _depth_stats(self, depth: int) -> dict[str, Any]:
+        return self._per_depth.setdefault(
+            int(depth),
+            {
+                "compile_count": 0,
+                "prewarm_calls": 0,
+                "prewarm_cache_hits": 0,
+                "shape_prewarm_count": 0,
+                "cache_prepare_time_s": 0.0,
+                "graph_construct_time_s": 0.0,
+                "graph_prewarm_time_s": 0.0,
+                "prewarm_time_s": 0.0,
+                "prewarm_host_syncs": 0,
+                "calls": 0,
+                "dispatch_time_s": 0.0,
+                "host_syncs": 0,
+                "host_token_transfers": 0,
+                "live_cache_commits": 0,
+                "device_dependency_edges": max(0, int(depth) - 1),
+                "verify_width": int(depth) + 1,
+                "cache_leaf_count": 0,
+                "promoted": 0,
+                "promotion_failures": {},
+                "errors": 0,
+            },
+        )
+
+    def _trace_depth(self, depth: int, mtp_cache: list[Any]):
+        def draft_fn(hidden_states, first_token_ids, *state_in):
+            if len(state_in) != 3:
+                raise ValueError("compiled committed MTP state must have 3 leaves")
+            entry = mtp_cache[0]
+            entry.cache[0] = state_in[0]
+            entry.cache[1] = state_in[1]
+            entry.cache[2] = state_in[2]
+            entry.rollback_state[:] = [None, None, None]
+            current_hidden = hidden_states
+            current_token = first_token_ids
+            tokens = []
+            for draft_depth in range(1, int(depth) + 1):
+                draft_logits, next_hidden = self.runtime.draft_mtp(
+                    current_hidden,
+                    current_token,
+                    mtp_cache=mtp_cache,
+                    return_hidden=True,
+                    mtp_hidden_variant=self.mtp_hidden_variant,
+                    mtp_depth=draft_depth,
+                )
+                current_token = _device_argmax_token(draft_logits)
+                current_hidden = next_hidden[:, -1:, :]
+                tokens.append(current_token)
+            return (
+                mx.concatenate(tokens, axis=1),
+                entry.cache[0],
+                entry.cache[1],
+                entry.cache[2],
+            )
+
+        return draft_fn
+
+    def _build_core(
+        self,
+        depth: int,
+        prepared: dict[str, Any],
+    ) -> tuple[dict[str, Any], float]:
+        construct_started = time.perf_counter()
+        state = prepared["state"]
+        scratch_entry = TensorOffsetKVCache(
+            state[0],
+            state[1],
+            state[2],
+            step=getattr(prepared["entry"], "step", 256),
+        )
+        scratch_cache = [scratch_entry]
+        compiled = mx.compile(
+            self._trace_depth(depth, scratch_cache),
+        )
+        graph_construct_time = time.perf_counter() - construct_started
+        core = {
+            "fn": compiled,
+            "scratch_cache": scratch_cache,
+            "depth": int(depth),
+            "prewarmed_signatures": set(),
+        }
+        return core, graph_construct_time
+
+    def prewarm(
+        self,
+        depth: int,
+        hidden: mx.array,
+        token_ids: mx.array,
+        *,
+        mtp_cache: Any,
+        reserve_tokens: int,
+    ) -> dict[str, Any]:
+        depth = int(depth)
+        token_ids = token_ids.astype(mx.int32)
+        if depth not in COMPILED_MTP_DRAFT_DEPTHS:
+            raise ValueError(f"compiled MTP draft depth must be D1...D7; got D{depth}")
+        if depth in self._disabled:
+            raise RuntimeError(self._disabled[depth])
+        total_started = time.perf_counter()
+        stats = self._depth_stats(depth)
+        stats["prewarm_calls"] += 1
+        prepare_started = time.perf_counter()
+        prepared = _prepare_committed_mtp_cache_state(
+            mtp_cache,
+            reserve_tokens=max(int(depth), int(reserve_tokens)),
+            commit_capacity=True,
+        )
+        cache_prepare_time = time.perf_counter() - prepare_started
+        signature = _compiled_mtp_state_signature(
+            hidden,
+            token_ids,
+            prepared["state"],
+        )
+        core = self._cores.get(depth)
+        compiled_callable = core is None
+        graph_construct_time = 0.0
+        if core is None:
+            core, graph_construct_time = self._build_core(depth, prepared)
+            self._cores[depth] = core
+            stats["compile_count"] += 1
+        if signature in core["prewarmed_signatures"]:
+            stats["prewarm_cache_hits"] += 1
+            return {
+                "phase": "prewarm",
+                "depth": depth,
+                "compiled": True,
+                "compiled_callable": False,
+                "cache_hit": True,
+                "cache_prepare_time_s": cache_prepare_time,
+                "graph_construct_time_s": 0.0,
+                "graph_prewarm_time_s": 0.0,
+                "prewarm_time_s": time.perf_counter() - total_started,
+                "prewarm_host_syncs": 0,
+                "device_dependency_edges": max(0, depth - 1),
+                "cache_leaf_count": 3,
+                "cache_slots": 1,
+                "container_kind": prepared["container_kind"],
+                "capacity_tokens": prepared["capacity_tokens"],
+            }
+        try:
+            graph_prewarm_started = time.perf_counter()
+            try:
+                outputs = core["fn"](hidden, token_ids, *prepared["state"])
+                _eval(*outputs)
+            finally:
+                self.runtime.finish_mtp_cycle(core["scratch_cache"])
+            graph_prewarm_time = time.perf_counter() - graph_prewarm_started
+        except Exception as exc:
+            stats["errors"] += 1
+            self._disabled[depth] = f"prewarm:{type(exc).__name__}"
+            raise
+        core["prewarmed_signatures"].add(signature)
+        stats["shape_prewarm_count"] += 1
+        report = {
+            "phase": "prewarm",
+            "depth": depth,
+            "compiled": True,
+            "compiled_callable": compiled_callable,
+            "cache_hit": False,
+            "cache_prepare_time_s": cache_prepare_time,
+            "graph_construct_time_s": graph_construct_time,
+            "graph_prewarm_time_s": graph_prewarm_time,
+            "prewarm_time_s": time.perf_counter() - total_started,
+            "prewarm_host_syncs": 1,
+            "device_dependency_edges": max(0, depth - 1),
+            "cache_leaf_count": 3,
+            "cache_slots": 1,
+            "container_kind": prepared["container_kind"],
+            "capacity_tokens": prepared["capacity_tokens"],
+        }
+        for name in (
+            "cache_prepare_time_s",
+            "graph_construct_time_s",
+            "graph_prewarm_time_s",
+            "prewarm_time_s",
+            "prewarm_host_syncs",
+        ):
+            stats[name] += report[name]
+        stats["cache_leaf_count"] = 3
+        return report
+
+    def run(
+        self,
+        depth: int,
+        hidden: mx.array,
+        *,
+        primary: int,
+        mtp_cache: Any,
+        reserve_tokens: int,
+    ) -> tuple[list[int], dict[str, Any]]:
+        depth = int(depth)
+        core = self._cores.get(depth)
+        if core is None:
+            raise CompiledMTPDraftNotPrewarmed(
+                f"D{depth} must be prewarmed before measured dispatch"
+            )
+        started = time.perf_counter()
+        prepared = _prepare_committed_mtp_cache_state(
+            mtp_cache,
+            reserve_tokens=max(int(depth), int(reserve_tokens)),
+            commit_capacity=False,
+        )
+        token_ids = mx.array([[int(primary)]], dtype=mx.int32)
+        signature = _compiled_mtp_state_signature(
+            hidden,
+            token_ids,
+            prepared["state"],
+        )
+        if signature not in core["prewarmed_signatures"]:
+            raise CompiledMTPDraftNotPrewarmed(
+                f"D{depth} live cache shape was not prewarmed"
+            )
+        try:
+            outputs = core["fn"](hidden, token_ids, *prepared["state"])
+            _eval(*outputs)
+        finally:
+            self.runtime.finish_mtp_cycle(core["scratch_cache"])
+        token_matrix = outputs[0]
+        state_out = (outputs[1], outputs[2], outputs[3])
+        tokens = [int(value) for value in np.asarray(token_matrix).reshape(-1)]
+        if len(tokens) != depth:
+            raise RuntimeError(f"compiled D{depth} returned {len(tokens)} draft tokens")
+        _commit_compiled_mtp_cache_state(prepared, state_out, depth=depth)
+        elapsed = time.perf_counter() - started
+        stats = self._depth_stats(depth)
+        stats["calls"] += 1
+        stats["dispatch_time_s"] += elapsed
+        stats["host_syncs"] += 1
+        stats["host_token_transfers"] += 1
+        stats["live_cache_commits"] += 1
+        return tokens, {
+            "phase": "dispatch",
+            "depth": depth,
+            "elapsed_s": elapsed,
+            "host_syncs": 1,
+            "host_token_transfers": 1,
+            "live_cache_commits": 1,
+            "committed_history": True,
+            "device_dependency_edges": max(0, depth - 1),
+        }
+
+    def disable(self, depth: int, reason: str) -> None:
+        self._disabled[int(depth)] = str(reason)
+        self._depth_stats(int(depth))["errors"] += 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": "compiled-mtp-draft-v1",
+            "history_policy": "committed",
+            "cache_state_mode": "explicit-live-io",
+            "primary_depth": COMPILED_MTP_DRAFT_PRIMARY_DEPTH,
+            "primary_width": COMPILED_MTP_DRAFT_PRIMARY_WIDTH,
+            "supported_depths": list(COMPILED_MTP_DRAFT_DEPTHS),
+            "cached_depths": sorted(self._cores),
+            "disabled_depths": {
+                str(depth): reason for depth, reason in sorted(self._disabled.items())
+            },
+            "organic_compile_calls": int(self._organic_compile_calls),
+            "per_depth": {
+                str(depth): {
+                    **stats,
+                    "promotion_failures": dict(stats["promotion_failures"]),
+                }
+                for depth, stats in sorted(self._per_depth.items())
+            },
+        }
+
+
+def _get_compiled_mtp_draft_bank(
+    rt: MTPLXRuntime,
+    *,
+    mtp_hidden_variant: str,
+) -> CompiledMTPDraftBank:
+    banks = getattr(rt, "_compiled_mtp_draft_banks", None)
+    if not isinstance(banks, dict):
+        banks = {}
+        setattr(rt, "_compiled_mtp_draft_banks", banks)
+    key = str(mtp_hidden_variant)
+    bank = banks.get(key)
+    if bank is None:
+        bank = CompiledMTPDraftBank(rt, mtp_hidden_variant=key)
+        banks[key] = bank
+    return bank
+
+
+def compiled_mtp_draft_report(rt: MTPLXRuntime) -> dict[str, Any]:
+    """Return cumulative per-depth compile/dispatch data for benchmarks."""
+    banks = getattr(rt, "_compiled_mtp_draft_banks", {})
+    return {
+        "schema": "compiled-mtp-draft-v1",
+        "history_policy": "committed",
+        "cache_state_mode": "explicit-live-io",
+        "primary_depth": COMPILED_MTP_DRAFT_PRIMARY_DEPTH,
+        "primary_width": COMPILED_MTP_DRAFT_PRIMARY_WIDTH,
+        "supported_depths": list(COMPILED_MTP_DRAFT_DEPTHS),
+        "variants": {
+            str(name): bank.to_dict()
+            for name, bank in sorted(banks.items())
+            if isinstance(bank, CompiledMTPDraftBank)
+        },
+    }
 
 
 def _draft_confidence_metrics(logits: mx.array, *, topk: int = 8) -> dict[str, float]:
@@ -5222,8 +5627,10 @@ def generate_mtpk(
             "online_correction_cache_key must be 'local_prefix', "
             "'source_token', or 'primary_source'"
         )
-    if draft_core not in {"stock", "device-d2"}:
-        raise ValueError("draft_core must be 'stock' or 'device-d2'")
+    if draft_core not in {"stock", "device-k", "device-d2"}:
+        raise ValueError(
+            "draft_core must be 'stock', 'device-k', or legacy 'device-d2'"
+        )
     if not 0.0 <= adapter_ensemble_epsilon <= 1.0:
         raise ValueError("adapter_ensemble_epsilon must be in [0, 1]")
     if adapter_ensemble_min_depth < 1:
@@ -5455,10 +5862,13 @@ def generate_mtpk(
     topk_reranker_changed = 0
     topk_reranker_fallbacks = 0
     topk_reranker_selected_rank_sum = 0
-    device_d2_core: dict[str, Any] | None = None
-    device_d2_compile_time = 0.0
-    device_d2_calls = 0
-    device_d2_fallbacks = 0
+    compiled_draft_bank: CompiledMTPDraftBank | None = None
+    compiled_draft_prewarm: dict[str, Any] = {}
+    compiled_draft_prewarm_time = 0.0
+    compiled_draft_calls = 0
+    compiled_draft_fallbacks = 0
+    compiled_draft_fallback_reasons: dict[str, int] = {}
+    compiled_draft_per_depth: dict[str, dict[str, Any]] = {}
     streamed_token_count = 0
     mtp_history_materialize_every = max(
         0,
@@ -6055,6 +6465,133 @@ def generate_mtpk(
         if new_tokens:
             token_callback(new_tokens)
 
+    def compiled_depth_metrics(depth: int) -> dict[str, Any]:
+        return compiled_draft_per_depth.setdefault(
+            str(int(depth)),
+            {
+                "calls": 0,
+                "dispatch_time_s": 0.0,
+                "host_syncs": 0,
+                "host_token_transfers": 0,
+                "live_cache_commits": 0,
+                "device_dependency_edges": max(0, int(depth) - 1),
+                "verify_width": int(depth) + 1,
+                "prewarm_time_s": 0.0,
+                "cache_prepare_time_s": 0.0,
+                "graph_construct_time_s": 0.0,
+                "graph_prewarm_time_s": 0.0,
+                "prewarm_host_syncs": 0,
+                "cache_leaf_count": 0,
+                "compile_count": 0,
+            },
+        )
+
+    def compiled_draft_reason(depth: int) -> str | None:
+        return compiled_mtp_draft_fallback_reason(
+            requested=draft_core,
+            depth=depth,
+            requested_depth=speculative_depth,
+            draft_temperature=float(draft_sampler.temperature),
+            mtp_cache_policy=mtp_cache_policy,
+            mtp_history_policy=mtp_history_policy,
+            draft_margin_threshold=draft_margin_threshold,
+            adaptive=adaptive_policy is not None,
+            mtp_corrector=mtp_corrector is not None,
+            online_hidden_corrector=online_hidden_enabled,
+            correction_cache=bool(online_correction_cache or prompt_correction_cache),
+            adapter_ensemble=bool(adapter_ensemble_q),
+            topk_reranker=mtp_topk_reranker is not None,
+            position_mode=mtp_position_mode,
+            dynamic_depth=late_depth_switch_after > 0,
+        )
+
+    if draft_core in {"device-k", "device-d2"}:
+        prewarm_reason = compiled_draft_reason(speculative_depth)
+        if prewarm_reason is None:
+            compiled_draft_bank = _get_compiled_mtp_draft_bank(
+                rt,
+                mtp_hidden_variant=mtp_hidden_variant,
+            )
+            warm_logits = logits.reshape(-1, int(logits.shape[-1]))
+            warm_token_ids = mx.argmax(warm_logits[-1], axis=-1).reshape(1, 1)
+            prewarm_depths = (
+                list(range(1, speculative_depth + 1))
+                if draft_core == "device-k"
+                else [2]
+            )
+            prewarm_started = time.perf_counter()
+            try:
+                depth_reports: dict[str, dict[str, Any]] = {}
+                for prewarm_depth in prewarm_depths:
+                    depth_report = compiled_draft_bank.prewarm(
+                        prewarm_depth,
+                        hidden,
+                        warm_token_ids,
+                        mtp_cache=mtp_history_cache,
+                        reserve_tokens=max_tokens,
+                    )
+                    depth_reports[str(prewarm_depth)] = depth_report
+                    metrics = compiled_depth_metrics(prewarm_depth)
+                    for name in (
+                        "prewarm_time_s",
+                        "cache_prepare_time_s",
+                        "graph_construct_time_s",
+                        "graph_prewarm_time_s",
+                        "prewarm_host_syncs",
+                    ):
+                        metrics[name] += depth_report[name]
+                    metrics["cache_leaf_count"] = int(depth_report["cache_leaf_count"])
+                    metrics["compile_count"] = int(depth_report["compiled_callable"])
+                compiled_draft_prewarm_time = time.perf_counter() - prewarm_started
+                compiled_draft_prewarm = {
+                    "phase": "prewarm",
+                    "depth": int(speculative_depth),
+                    "depths": depth_reports,
+                    "compiled": True,
+                    "cache_hit": all(
+                        bool(report["cache_hit"]) for report in depth_reports.values()
+                    ),
+                    "prewarm_time_s": compiled_draft_prewarm_time,
+                    "cache_prepare_time_s": sum(
+                        float(report["cache_prepare_time_s"])
+                        for report in depth_reports.values()
+                    ),
+                    "graph_construct_time_s": sum(
+                        float(report["graph_construct_time_s"])
+                        for report in depth_reports.values()
+                    ),
+                    "graph_prewarm_time_s": sum(
+                        float(report["graph_prewarm_time_s"])
+                        for report in depth_reports.values()
+                    ),
+                    "prewarm_host_syncs": sum(
+                        int(report["prewarm_host_syncs"])
+                        for report in depth_reports.values()
+                    ),
+                }
+            except Exception as exc:
+                prewarm_reason = f"prewarm:{type(exc).__name__}"
+                compiled_draft_prewarm_time = time.perf_counter() - prewarm_started
+                # A bank with no successfully prewarmed core must never enter
+                # measured dispatch, even though the runtime-level bank object
+                # remains cached for its fail-closed diagnostics.
+                compiled_draft_bank = None
+                compiled_draft_prewarm = {
+                    "phase": "prewarm",
+                    "depth": int(speculative_depth),
+                    "compiled": False,
+                    "cache_hit": False,
+                    "skipped": prewarm_reason,
+                }
+        else:
+            compiled_draft_prewarm = {
+                "phase": "prewarm",
+                "depth": int(speculative_depth),
+                "compiled": False,
+                "cache_hit": False,
+                "skipped": prewarm_reason,
+            }
+
     step = 0
     while len(tokens) < max_tokens:
         repetition_result = _trim_repeated_suffix(tokens, repetition_config)
@@ -6203,51 +6740,53 @@ def generate_mtpk(
         draft_hidden = hidden
         next_token = primary
 
-        used_device_d2_core = False
-        device_d2_eligible = (
-            draft_core == "device-d2"
-            and cycle_depth == 2
-            and speculative_depth == 2
-            and mtp_cache_policy == "persistent"
-            and mtp_history_policy == "cycle"
-            and draft_sampler.temperature <= 0
-            and draft_margin_threshold is None
-            and adaptive_policy is None
-            and mtp_corrector is None
-            and not online_hidden_enabled
-            and not online_correction_cache
+        used_compiled_draft = False
+        compiled_reason = (
+            compiled_draft_reason(cycle_depth)
+            if draft_core in {"device-k", "device-d2"}
+            else None
         )
-        if device_d2_eligible:
+        if (
+            draft_core in {"device-k", "device-d2"}
+            and compiled_reason is None
+            and compiled_draft_bank is None
+        ):
+            compiled_reason = str(
+                compiled_draft_prewarm.get("skipped", "not_prewarmed")
+            )
+        if compiled_reason is None and compiled_draft_bank is not None:
             try:
-                if device_d2_core is None:
-                    compile_started = time.perf_counter()
-                    device_d2_core = _make_device_d2_draft_core(
-                        rt,
-                        draft_hidden,
-                        mx.array([[primary]]),
-                        mtp_hidden_variant=mtp_hidden_variant,
-                    )
-                    elapsed_compile = time.perf_counter() - compile_started
-                    device_d2_compile_time += elapsed_compile
-                    draft_time += elapsed_compile
-                    _add_timing(event, "draft_core_compile", elapsed_compile)
-                    event["draft_core_compile"] = {
-                        "kind": "device-d2",
-                        "mtp_cache_promoted": int(device_d2_core["promoted"]),
-                        "promotion_failures": dict(
-                            device_d2_core["promotion_failures"]
-                        ),
-                    }
-                started = time.perf_counter()
-                draft_tokens = _run_device_d2_draft_core(
-                    device_d2_core,
+                draft_tokens, dispatch = compiled_draft_bank.run(
+                    cycle_depth,
                     draft_hidden,
-                    int(primary),
+                    primary=int(primary),
+                    mtp_cache=mtp_cache,
+                    reserve_tokens=max(1, max_tokens - len(tokens) + 1),
                 )
-                elapsed_draft = time.perf_counter() - started
+            except Exception as exc:
+                compiled_reason = f"dispatch:{type(exc).__name__}"
+                compiled_draft_bank.disable(cycle_depth, compiled_reason)
+                event["draft_core_error"] = repr(exc)
+                used_compiled_draft = False
+            else:
+                elapsed_draft = float(dispatch["elapsed_s"])
                 draft_time += elapsed_draft
-                device_d2_calls += 1
-                used_device_d2_core = True
+                compiled_draft_calls += 1
+                used_compiled_draft = True
+                metrics = compiled_depth_metrics(cycle_depth)
+                metrics["calls"] += 1
+                metrics["dispatch_time_s"] += elapsed_draft
+                metrics["host_syncs"] += int(dispatch["host_syncs"])
+                metrics["host_token_transfers"] += int(dispatch["host_token_transfers"])
+                metrics["live_cache_commits"] += int(dispatch["live_cache_commits"])
+                trace_current_mtp_cache = mtp_cache
+                event["draft_core_dispatch"] = {
+                    **dispatch,
+                    "kind": "device-k",
+                    "primary_optimized_depth": (
+                        cycle_depth == COMPILED_MTP_DRAFT_PRIMARY_DEPTH
+                    ),
+                }
                 for depth_index, draft_token in enumerate(draft_tokens):
                     draft_probs.append(
                         SparseDistribution.one_hot(
@@ -6269,25 +6808,25 @@ def generate_mtpk(
                                 else 0.0,
                             },
                             "mtp_corrector": None,
-                            "draft_core": "device-d2",
+                            "draft_core": "device-k",
                         }
                     )
                 next_token = draft_tokens[-1]
-            except Exception as exc:
-                device_d2_fallbacks += 1
-                event["draft_core_error"] = repr(exc)
-                used_device_d2_core = False
 
-        if not used_device_d2_core:
-            if draft_core == "device-d2" and not device_d2_eligible:
-                device_d2_fallbacks += 1
-                event["draft_core_fallback"] = {
-                    "requested": "device-d2",
-                    "reason": "ineligible_contract",
-                }
+        if not used_compiled_draft and draft_core in {"device-k", "device-d2"}:
+            reason = compiled_reason or "ineligible_contract"
+            compiled_draft_fallbacks += 1
+            compiled_draft_fallback_reasons[reason] = (
+                compiled_draft_fallback_reasons.get(reason, 0) + 1
+            )
+            event["draft_core_fallback"] = {
+                "requested": draft_core,
+                "selected": "stock",
+                "reason": reason,
+            }
         step_mtp_cache = None
         try:
-            for depth_index in range(0 if used_device_d2_core else cycle_depth):
+            for depth_index in range(0 if used_compiled_draft else cycle_depth):
                 source_token = int(next_token)
                 step_mtp_cache = (
                     mtp_cache
@@ -6603,7 +7142,8 @@ def generate_mtpk(
                         break
 
         finally:
-            rt.finish_mtp_cycle(step_mtp_cache)
+            if not used_compiled_draft:
+                rt.finish_mtp_cycle(step_mtp_cache)
 
         before_verify = None
         if _env_truthy("MTPLX_SKIP_VERIFY_SNAPSHOT"):
@@ -7616,7 +8156,7 @@ def generate_mtpk(
         **_generation_rate_fields(
             generated_tokens=len(tokens),
             elapsed_s=elapsed,
-            prompt_eval_time_s=prompt_eval_time,
+            prompt_eval_time_s=(prompt_eval_time + compiled_draft_prewarm_time),
             cache_restore_time_s=prompt_state.cache_restore_time_s,
         ),
         accepted_drafts=accepted,
@@ -7794,10 +8334,72 @@ def generate_mtpk(
             **(mtp_topk_reranker.to_dict() if mtp_topk_reranker is not None else {}),
         },
         draft_core={
+            "schema": "compiled-mtp-draft-v1",
             "requested": draft_core,
-            "device_d2_calls": device_d2_calls,
-            "device_d2_fallbacks": device_d2_fallbacks,
-            "device_d2_compile_time_s": device_d2_compile_time,
+            "selected": ("device-k" if compiled_draft_calls > 0 else "stock"),
+            "primary_depth": COMPILED_MTP_DRAFT_PRIMARY_DEPTH,
+            "primary_width": COMPILED_MTP_DRAFT_PRIMARY_WIDTH,
+            "supported_depths": list(COMPILED_MTP_DRAFT_DEPTHS),
+            "prewarmed_depths": (
+                list(range(1, speculative_depth + 1))
+                if draft_core == "device-k"
+                and bool(compiled_draft_prewarm.get("compiled"))
+                else []
+            ),
+            "history_policy": mtp_history_policy,
+            "cache_state_mode": "explicit-live-io",
+            "compiled_calls": compiled_draft_calls,
+            "organic_compile_calls": (
+                int(compiled_draft_bank.to_dict()["organic_compile_calls"])
+                if compiled_draft_bank is not None
+                else 0
+            ),
+            "fallbacks": compiled_draft_fallbacks,
+            "qualification_eligible": bool(
+                draft_core == "device-k"
+                and mtp_history_policy == "committed"
+                and compiled_draft_calls > 0
+                and (
+                    compiled_draft_bank is not None
+                    and int(compiled_draft_bank.to_dict()["organic_compile_calls"]) == 0
+                )
+                and compiled_draft_fallbacks == 0
+                and bool(compiled_draft_prewarm.get("compiled"))
+            ),
+            "fallback_reasons": dict(compiled_draft_fallback_reasons),
+            "prewarm": dict(compiled_draft_prewarm),
+            "prewarm_time_s": compiled_draft_prewarm_time,
+            "cache_prepare_time_s": sum(
+                float(value["cache_prepare_time_s"])
+                for value in compiled_draft_per_depth.values()
+            ),
+            "graph_construct_time_s": sum(
+                float(value["graph_construct_time_s"])
+                for value in compiled_draft_per_depth.values()
+            ),
+            "graph_prewarm_time_s": sum(
+                float(value["graph_prewarm_time_s"])
+                for value in compiled_draft_per_depth.values()
+            ),
+            "host_syncs": sum(
+                int(value["host_syncs"]) + int(value["prewarm_host_syncs"])
+                for value in compiled_draft_per_depth.values()
+            ),
+            "host_token_transfers": sum(
+                int(value["host_token_transfers"])
+                for value in compiled_draft_per_depth.values()
+            ),
+            "per_depth": compiled_draft_per_depth,
+            # Compatibility fields retained for existing artifact readers.
+            "device_d2_calls": (
+                compiled_draft_calls if draft_core == "device-d2" else 0
+            ),
+            "device_d2_fallbacks": (
+                compiled_draft_fallbacks if draft_core == "device-d2" else 0
+            ),
+            "device_d2_compile_time_s": (
+                compiled_draft_prewarm_time if draft_core == "device-d2" else 0.0
+            ),
         },
         owned_recurrent_state=owned_recurrent_state_stats(cache),
         owned_attn_kv=tail_owned_attention_kv_stats(cache),

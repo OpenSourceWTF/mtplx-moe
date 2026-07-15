@@ -124,6 +124,8 @@ def _stats(
     generated_tokens: int = 128,
     tokens: list[int] | None = None,
     graphbank: dict[str, object] | None = None,
+    draft_core: str = "stock",
+    draft_fallbacks: int = 0,
 ):
     output_tokens = list(tokens or [index % 97 for index in range(generated_tokens)])
     accepted = [0 for _ in range(depth)]
@@ -188,6 +190,37 @@ def _stats(
         event_index += 1
         if cursor >= len(output_tokens) - 1:
             break
+    compiled_calls = 1 if depth and draft_core != "stock" else 0
+    draft_core_report = {
+        "schema": "compiled-mtp-draft-v1",
+        "requested": draft_core,
+        "selected": "device-k" if compiled_calls else "stock",
+        "primary_depth": 3,
+        "primary_width": 4,
+        "supported_depths": list(range(1, 8)),
+        "prewarmed_depths": (
+            list(range(1, depth + 1)) if draft_core == "device-k" else []
+        ),
+        "history_policy": "committed" if depth else "none",
+        "cache_state_mode": "explicit-live-io",
+        "compiled_calls": compiled_calls,
+        "organic_compile_calls": 0,
+        "fallbacks": draft_fallbacks,
+        "qualification_eligible": bool(
+            draft_core == "device-k" and compiled_calls and not draft_fallbacks
+        ),
+        "fallback_reasons": (
+            {"synthetic_fallback": draft_fallbacks} if draft_fallbacks else {}
+        ),
+        "prewarm": {"compiled": bool(compiled_calls)},
+        "per_depth": {
+            str(index): {
+                "calls": int(index == depth and compiled_calls > 0),
+                "live_cache_commits": int(index == depth and compiled_calls > 0),
+            }
+            for index in range(1, depth + 1)
+        },
+    }
     return SimpleNamespace(
         generated_tokens=generated_tokens,
         elapsed_s=16.0,
@@ -221,6 +254,7 @@ def _stats(
         peak_memory_bytes=3 * 1024**3,
         events=events,
         graphbank={} if graphbank is None else graphbank,
+        draft_core=draft_core_report,
     )
 
 
@@ -230,6 +264,7 @@ def _fake_apis(
     output_tokens: int = 128,
     mismatch_depth: int | None = None,
     compiled_evidence: dict[str, object] | None = None,
+    draft_fallbacks: int = 0,
 ):
     calls = SimpleNamespace(
         loads=[],
@@ -313,6 +348,8 @@ def _fake_apis(
                 generated_tokens=len(tokens),
                 tokens=tokens,
                 graphbank=compiled_evidence,
+                draft_core=kwargs.get("draft_core", "stock"),
+                draft_fallbacks=draft_fallbacks,
             ),
             final_state=SimpleNamespace(
                 safe_to_commit=True,
@@ -378,7 +415,7 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
     assert args.models is None
     assert args.contexts == (1024, 2048)
     assert args.output_tokens == 128
-    assert args.hy3_depths == (1, 2, 3, 4, 5, 6)
+    assert args.hy3_depths == (1, 2, 3, 4, 5, 6, 7)
     assert args.glm52_depths == (1, 2, 3, 4, 5)
     assert args.memory_limit == "112GiB"
     assert args.runtime_reserve == "12GiB"
@@ -395,6 +432,7 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
     assert args.mtp_disabled_baseline is False
     assert args.verify_strategy == "batched"
     assert args.compiled_verify_mode == "off"
+    assert args.draft_core == "stock"
     assert args.trace_routes is False
     assert args.hy3_q2_prompt_tail is None
     assert args.glm52_q2_prompt_tail is None
@@ -414,6 +452,51 @@ def test_issue51_kernel_selectors_parse_independently() -> None:
 
     assert args.q2_expert_kernel == "fused-nax"
     assert args.hy3_router_kernel == "fused-fp32"
+
+
+def test_device_k_draft_core_selector_parses() -> None:
+    module = _load_module()
+
+    args = module.build_parser().parse_args(["--draft-core", "device-k"])
+
+    assert args.draft_core == "device-k"
+
+
+def test_device_k_draft_core_is_forwarded_recorded_and_gated(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (3,)}],
+        contexts=(1024,),
+        draft_core="device-k",
+        apis=apis,
+    )
+
+    assert all(kwargs["draft_core"] == "device-k" for *_rest, kwargs in calls.mtpk)
+    assert payload["configuration"]["generation"]["draft_core"] == "device-k"
+    assert payload["configuration"]["candidate"]["draft_core"] == "device-k"
+    row = payload["models"][0]["observations"][1]
+    assert row["draft_core"] == "device-k"
+    assert row["compiled_draft"]["qualification_eligible"] is True
+    assert row["compiled_draft"]["prewarmed_depths"] == [1, 2, 3]
+    assert row["gates"]["compiled_draft_evidence"] is True
+
+
+def test_device_k_draft_core_fails_on_any_silent_fallback(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, _calls = _fake_apis(module, draft_fallbacks=1)
+
+    with pytest.raises(
+        module.BenchmarkGateError,
+        match="compiled draft used fallback calls",
+    ):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (3,)}],
+            contexts=(1024,),
+            draft_core="device-k",
+            apis=apis,
+        )
 
 
 @pytest.mark.parametrize(
@@ -562,6 +645,7 @@ def test_compiled_verify_records_candidate_and_forwards_diagnostic_inputs(
     assert payload["configuration"]["candidate"] == {
         "verify_strategy": "capture_commit",
         "compiled_verify_mode": "on",
+        "draft_core": "stock",
         "trace_routes": True,
     }
     assert calls.configs[0]["trace_routes"] is True
@@ -654,12 +738,12 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
     assert all(kwargs["mtp"] is True for _root, kwargs in calls.loads)
     assert all(kwargs["mtp_precision"] == "bf16" for _root, kwargs in calls.loads)
     assert len(calls.ar) == 8
-    assert len(calls.mtpk) == 44
-    assert calls.peak_resets == 52
-    assert calls.synchronizations >= 52
-    assert [len(model["observations"]) for model in payload["models"]] == [14, 12]
+    assert len(calls.mtpk) == 48
+    assert calls.peak_resets == 56
+    assert calls.synchronizations >= 56
+    assert [len(model["observations"]) for model in payload["models"]] == [16, 12]
     assert [model["discarded_warmup_count"] for model in payload["models"]] == [
-        14,
+        16,
         12,
     ]
     assert all(
@@ -684,7 +768,7 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
             row for row in payload["models"] if row["model_key"] == runtime.model_key
         )
         assert runtime.expert_streaming.reset_calls == 2 * len(model["observations"])
-        cells = 7 if runtime.model_key == "hy3-expert-q2" else 6
+        cells = 8 if runtime.model_key == "hy3-expert-q2" else 6
         assert runtime.admissions == [
             tokens
             for context in (1024, 2048)
@@ -706,7 +790,7 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
         assert kwargs["repetition_stop"] is False
         assert kwargs["loop_guard"] is False
     assert sum(kwargs["max_tokens"] == 8 for *_rest, kwargs in calls.ar) == 4
-    assert sum(kwargs["max_tokens"] == 8 for *_rest, kwargs in calls.mtpk) == 22
+    assert sum(kwargs["max_tokens"] == 8 for *_rest, kwargs in calls.mtpk) == 24
 
     assert len(calls.prompt_builds) == 4
     assert all(
@@ -1639,6 +1723,7 @@ def test_rows_recompute_ingestion_decode_and_acceptance_metrics(tmp_path: Path) 
         "speculative_event_contract": True,
         "final_state_contract": True,
         "compiled_verify_evidence": True,
+        "compiled_draft_evidence": True,
     }
 
 

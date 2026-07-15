@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from mtplx.benchmarks.runners import mtp_depth_sweep
 
 
@@ -88,3 +90,83 @@ def test_depth_sweep_passes_merge_mtp_adapter_to_runtime(monkeypatch, tmp_path) 
     assert result["mtp_adapter_kind"] == "c4_mtp_lora_adapter"
     assert result["mtp_adapter_merged"] is True
     assert result["mtp_adapter_merge_report"] == {"merged": 1, "targets": [{"target": "fc"}]}
+
+
+def test_sum_draft_core_keeps_benchmarkable_per_depth_report() -> None:
+    summary = mtp_depth_sweep._sum_draft_core(
+        [
+            {
+                "requested": "device-k",
+                "selected": "device-k",
+                "compiled_calls": 2,
+                "organic_compile_calls": 0,
+                "fallbacks": 1,
+                "qualification_eligible": False,
+                "history_policy": "committed",
+                "cache_state_mode": "explicit-live-io",
+                "fallback_reasons": {"non_fixed_depth": 1},
+                "prewarm_time_s": 0.3,
+                "graph_construct_time_s": 0.1,
+                "host_syncs": 4,
+                "host_token_transfers": 2,
+                "per_depth": {
+                    "3": {
+                        "calls": 2,
+                        "dispatch_time_s": 0.4,
+                        "host_syncs": 2,
+                        "host_token_transfers": 2,
+                        "live_cache_commits": 2,
+                        "verify_width": 4,
+                    }
+                },
+            },
+            {
+                "requested": "device-k",
+                "selected": "device-k",
+                "compiled_calls": 1,
+                "organic_compile_calls": 0,
+                "fallbacks": 0,
+                "qualification_eligible": True,
+                "history_policy": "committed",
+                "cache_state_mode": "explicit-live-io",
+                "fallback_reasons": {},
+                "prewarm_time_s": 0.0,
+                "graph_construct_time_s": 0.0,
+                "host_syncs": 1,
+                "host_token_transfers": 1,
+                "per_depth": {
+                    "3": {
+                        "calls": 1,
+                        "dispatch_time_s": 0.2,
+                        "host_syncs": 1,
+                        "host_token_transfers": 1,
+                        "live_cache_commits": 1,
+                        "verify_width": 4,
+                    }
+                },
+            },
+        ]
+    )
+
+    assert summary["schema"] == "compiled-mtp-draft-v1"
+    assert summary["primary_depth"] == 3
+    assert summary["primary_width"] == 4
+    assert summary["compiled_calls"] == 3
+    assert summary["organic_compile_calls"] == 0
+    assert summary["fallbacks"] == 1
+    assert summary["fallback_reasons"] == {"non_fixed_depth": 1}
+    assert summary["qualification_eligible"] is False
+    assert summary["history_policy"] == "committed"
+    assert summary["cache_state_mode"] == "explicit-live-io"
+    assert summary["prewarm_time_s"] == pytest.approx(0.3)
+    assert summary["graph_construct_time_s"] == pytest.approx(0.1)
+    assert summary["host_syncs"] == 5
+    assert summary["host_token_transfers"] == 3
+    assert summary["per_depth"]["3"] == {
+        "calls": 3,
+        "dispatch_time_s": pytest.approx(0.6),
+        "host_syncs": 3,
+        "host_token_transfers": 3,
+        "live_cache_commits": 3,
+        "verify_width": 4,
+    }

@@ -12,7 +12,13 @@ from typing import Any
 from mtplx.benchmarks.schema import encode_prompt_case, load_prompt_suite
 from mtplx.benchmarks.validators.basic import validate_benchmark_output
 from mtplx.correctors import load_runtime_corrector
-from mtplx.generation import generate_ar, generate_mtpk
+from mtplx.generation import (
+    COMPILED_MTP_DRAFT_DEPTHS,
+    COMPILED_MTP_DRAFT_PRIMARY_DEPTH,
+    COMPILED_MTP_DRAFT_PRIMARY_WIDTH,
+    generate_ar,
+    generate_mtpk,
+)
 from mtplx.mtp_patch import MTPContract
 from mtplx.proposal_reranker import TopKProposalReranker
 from mtplx.runtime import load
@@ -792,8 +798,105 @@ def _sum_draft_core(values: list[dict[str, object]]) -> dict[str, object]:
             if value.get("requested") is not None
         }
     )
+    selected = sorted(
+        {
+            str(value.get("selected"))
+            for value in values
+            if value.get("selected") is not None
+        }
+    )
+    fallback_reasons: dict[str, int] = {}
+    per_depth: dict[str, dict[str, int | float]] = {}
+    integer_fields = (
+        "calls",
+        "compile_count",
+        "host_syncs",
+        "host_token_transfers",
+        "prewarm_host_syncs",
+        "live_cache_commits",
+    )
+    float_fields = (
+        "dispatch_time_s",
+        "prewarm_time_s",
+        "cache_prepare_time_s",
+        "graph_construct_time_s",
+        "graph_prewarm_time_s",
+    )
+    max_fields = ("device_dependency_edges", "verify_width", "cache_leaf_count")
+    for value in values:
+        reasons = value.get("fallback_reasons", {})
+        if isinstance(reasons, dict):
+            for reason, count in reasons.items():
+                fallback_reasons[str(reason)] = fallback_reasons.get(
+                    str(reason), 0
+                ) + int(count or 0)
+        depth_values = value.get("per_depth", {})
+        if not isinstance(depth_values, dict):
+            continue
+        for depth, raw in depth_values.items():
+            if not isinstance(raw, dict):
+                continue
+            aggregate = per_depth.setdefault(str(depth), {})
+            for name in integer_fields:
+                if name in raw:
+                    aggregate[name] = int(aggregate.get(name, 0)) + int(
+                        raw.get(name, 0) or 0
+                    )
+            for name in float_fields:
+                if name in raw:
+                    aggregate[name] = float(aggregate.get(name, 0.0)) + float(
+                        raw.get(name, 0.0) or 0.0
+                    )
+            for name in max_fields:
+                if name in raw:
+                    aggregate[name] = max(
+                        int(aggregate.get(name, 0)),
+                        int(raw.get(name, 0) or 0),
+                    )
     return {
+        "schema": "compiled-mtp-draft-v1",
+        "primary_depth": COMPILED_MTP_DRAFT_PRIMARY_DEPTH,
+        "primary_width": COMPILED_MTP_DRAFT_PRIMARY_WIDTH,
+        "supported_depths": list(COMPILED_MTP_DRAFT_DEPTHS),
+        "history_policy": (
+            str(values[0].get("history_policy")) if values else ""
+        ),
+        "cache_state_mode": (
+            str(values[0].get("cache_state_mode")) if values else ""
+        ),
         "requested": requested[0] if len(requested) == 1 else ",".join(requested),
+        "selected": selected[0] if len(selected) == 1 else ",".join(selected),
+        "compiled_calls": sum(
+            int(value.get("compiled_calls", 0) or 0) for value in values
+        ),
+        "organic_compile_calls": sum(
+            int(value.get("organic_compile_calls", 0) or 0) for value in values
+        ),
+        "fallbacks": sum(int(value.get("fallbacks", 0) or 0) for value in values),
+        "fallback_reasons": fallback_reasons,
+        "qualification_eligible": bool(values) and all(
+            bool(value.get("qualification_eligible", False)) for value in values
+        ),
+        "prewarm_time_s": sum(
+            float(value.get("prewarm_time_s", 0.0) or 0.0) for value in values
+        ),
+        "cache_prepare_time_s": sum(
+            float(value.get("cache_prepare_time_s", 0.0) or 0.0)
+            for value in values
+        ),
+        "graph_construct_time_s": sum(
+            float(value.get("graph_construct_time_s", 0.0) or 0.0)
+            for value in values
+        ),
+        "graph_prewarm_time_s": sum(
+            float(value.get("graph_prewarm_time_s", 0.0) or 0.0)
+            for value in values
+        ),
+        "host_syncs": sum(int(value.get("host_syncs", 0) or 0) for value in values),
+        "host_token_transfers": sum(
+            int(value.get("host_token_transfers", 0) or 0) for value in values
+        ),
+        "per_depth": per_depth,
         "device_d2_calls": sum(
             int(value.get("device_d2_calls", 0) or 0) for value in values
         ),
