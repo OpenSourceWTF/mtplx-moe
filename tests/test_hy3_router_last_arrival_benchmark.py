@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from mtplx.hy3_router_last_arrival import (
     TaggedArrivalLayout,
@@ -51,6 +52,7 @@ def _valid_scratch(
         checksum_sum, checksum_xor = tagged_arrival_checksums(
             event=event,
             seed=seed,
+            threadgroups=layout.threadgroups,
         )
         metadata = layout.flag_words + layout.payload_words
         scratch[election, metadata] = np.uint32(election % layout.threadgroups)
@@ -59,9 +61,10 @@ def _valid_scratch(
     return scratch.reshape(-1)
 
 
-def test_litmus_validator_accepts_exact_no_init_elections() -> None:
+@pytest.mark.parametrize("threadgroups", (16, 48))
+def test_litmus_validator_accepts_exact_no_init_elections(threadgroups: int) -> None:
     module = _load_script()
-    layout = TaggedArrivalLayout(elections=4)
+    layout = TaggedArrivalLayout(threadgroups=threadgroups, elections=4)
     scratch = _valid_scratch(layout, base_event=100, seed=51)
 
     observed = module.validate_litmus_scratch(
@@ -154,4 +157,13 @@ def test_litmus_cli_defaults_to_at_least_one_million_elections() -> None:
 
     assert args.total_elections >= 1_000_000
     assert args.total_elections % args.elections_per_dispatch == 0
+    assert args.threadgroups == 16
     assert str(args.lock_path) == "/tmp/mtplx-gpu-exclusive.lock"
+
+
+def test_litmus_cli_accepts_the_measured_t48_finalist() -> None:
+    module = _load_script()
+
+    args = module._parser().parse_args(["--threadgroups", "48"])
+
+    assert args.threadgroups == 48

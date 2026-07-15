@@ -25,11 +25,23 @@ def test_tagged_arrival_layout_is_uninitialized_and_independently_checkable() ->
     assert layout.total_bytes == 51 * 1024 * 4
 
 
-@pytest.mark.parametrize("threadgroups", (0, 1, 3, 12, 17, 32))
-def test_tagged_arrival_layout_requires_the_router_power_of_two_group_count(
+@pytest.mark.parametrize("threadgroups", (16, 24, 32, 48))
+def test_tagged_arrival_layout_supports_retained_router_group_counts(
     threadgroups: int,
 ) -> None:
-    with pytest.raises(ValueError, match="16 threadgroups"):
+    layout = TaggedArrivalLayout(threadgroups=threadgroups, elections=7)
+
+    assert layout.ready_words == threadgroups
+    assert layout.check_words == threadgroups
+    assert layout.payload_words == threadgroups
+    assert layout.words_per_election == 3 * threadgroups + 3
+
+
+@pytest.mark.parametrize("threadgroups", (0, 1, 3, 12, 17, 40, 64))
+def test_tagged_arrival_layout_rejects_unretained_router_group_counts(
+    threadgroups: int,
+) -> None:
+    with pytest.raises(ValueError, match="16, 24, 32, or 48 threadgroups"):
         TaggedArrivalLayout(threadgroups=threadgroups, elections=1)
 
 
@@ -83,5 +95,6 @@ def test_tagged_arrival_source_maps_one_group_of_each_election() -> None:
 
     assert "global_group / ELECTIONS" in source
     assert "global_group - group_round * ELECTIONS" in source
-    assert "(group_round + event_id) & (THREADGROUPS - 1)" in source
+    assert "(group_round + event_id) % THREADGROUPS" in source
+    assert "& (THREADGROUPS - 1)" not in source
     assert "event_id * TAG_MULTIPLIER + TAG_OFFSET" in source

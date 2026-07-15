@@ -11,6 +11,7 @@ _TAG_OFFSET = 0x51F15EED
 _PAYLOAD_MULTIPLIER = 0x85EBCA6B
 _LCG_MULTIPLIER = 1_664_525
 _LCG_INCREMENT = 1_013_904_223
+_SUPPORTED_THREADGROUPS = frozenset((16, 24, 32, 48))
 
 
 def _lcg_coefficients(limit: int = 287) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -35,8 +36,10 @@ class TaggedArrivalLayout:
     elections: int = 1024
 
     def __post_init__(self) -> None:
-        if int(self.threadgroups) != 16:
-            raise ValueError("tagged Hy3 arrival requires exactly 16 threadgroups")
+        if int(self.threadgroups) not in _SUPPORTED_THREADGROUPS:
+            raise ValueError(
+                "tagged Hy3 arrival requires 16, 24, 32, or 48 threadgroups"
+            )
         if int(self.elections) <= 0:
             raise ValueError("tagged arrival elections must be positive")
 
@@ -96,12 +99,17 @@ def tagged_arrival_payload(*, event: int, group: int, seed: int) -> int:
     ) & _UINT32_MASK
 
 
-def tagged_arrival_checksums(*, event: int, seed: int) -> tuple[int, int]:
+def tagged_arrival_checksums(
+    *,
+    event: int,
+    seed: int,
+    threadgroups: int = 16,
+) -> tuple[int, int]:
     """Return the sum and rotated-XOR payload checksums for one election."""
 
     payloads = [
         tagged_arrival_payload(event=event, group=group, seed=seed)
-        for group in range(16)
+        for group in range(int(threadgroups))
     ]
     payload_sum = sum(payloads) & _UINT32_MASK
     payload_xor = 0
@@ -141,7 +149,7 @@ def tagged_arrival_litmus_source(layout: TaggedArrivalLayout) -> str:
         uint group_round = global_group / ELECTIONS;
         uint election = global_group - group_round * ELECTIONS;
         uint event_id = base_event + election;
-        uint local_group = (group_round + event_id) & (THREADGROUPS - 1);
+        uint local_group = (group_round + event_id) % THREADGROUPS;
         uint local_thread = thread_index_in_threadgroup;
         uint tag = event_id * TAG_MULTIPLIER + TAG_OFFSET;
 

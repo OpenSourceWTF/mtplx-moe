@@ -33,7 +33,10 @@ def build_litmus_kernel(layout: TaggedArrivalLayout):
     """Build one exact-size lazy MLX custom kernel."""
 
     return mx.fast.metal_kernel(
-        name=f"mtplx_hy3_router_tagged_arrival_e{layout.elections}",
+        name=(
+            "mtplx_hy3_router_tagged_arrival_"
+            f"t{layout.threadgroups}_e{layout.elections}"
+        ),
         input_names=["base_event", "seed"],
         output_names=["scratch"],
         source=tagged_arrival_litmus_source(layout),
@@ -108,6 +111,7 @@ def validate_litmus_scratch(
         checksum_sum, checksum_xor = tagged_arrival_checksums(
             event=event,
             seed=seed,
+            threadgroups=layout.threadgroups,
         )
         winner = int(row[metadata_offset])
         winner_failure = not 0 <= winner < layout.threadgroups
@@ -144,6 +148,7 @@ def run_litmus(
     total_elections: int,
     elections_per_dispatch: int,
     seed: int,
+    threadgroups: int = 16,
 ) -> dict[str, Any]:
     """Run and validate the complete device litmus campaign."""
 
@@ -151,7 +156,10 @@ def run_litmus(
         raise ValueError("litmus election counts must be positive")
     if total_elections % elections_per_dispatch:
         raise ValueError("total elections must divide evenly into dispatch batches")
-    layout = TaggedArrivalLayout(elections=elections_per_dispatch)
+    layout = TaggedArrivalLayout(
+        threadgroups=threadgroups,
+        elections=elections_per_dispatch,
+    )
     source = tagged_arrival_litmus_source(layout)
     aggregate: dict[str, Any] = {
         "successful_elections": 0,
@@ -202,7 +210,7 @@ def run_litmus(
             )
     elapsed = time.perf_counter() - started
     return {
-        "schema": "mtplx-issue58-tagged-last-arrival-litmus-v1",
+        "schema": "mtplx-issue58-tagged-last-arrival-litmus-v2",
         "status": "pass" if aggregate["failed_elections"] == 0 else "fail",
         "requested_elections": int(total_elections),
         "completed_batches": completed_batches,
@@ -218,6 +226,8 @@ def run_litmus(
         "kernel": {
             "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
             "output_initialized": False,
+            "readiness_words_per_producer": 2,
+            "readiness_encoding": "tag-and-bitwise-complement",
             "ordinary_atomic_order": "relaxed",
             "publication_fence": "seq_cst mem_device thread_scope_device",
             "readiness_spin": False,
@@ -242,6 +252,12 @@ def _parser() -> argparse.ArgumentParser:
         default=4096,
     )
     parser.add_argument("--seed", type=int, default=58_051)
+    parser.add_argument(
+        "--threadgroups",
+        type=int,
+        choices=(16, 24, 32, 48),
+        default=16,
+    )
     parser.add_argument(
         "--qwen-plist",
         type=Path,
@@ -270,6 +286,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             total_elections=args.total_elections,
             elections_per_dispatch=args.elections_per_dispatch,
             seed=args.seed,
+            threadgroups=args.threadgroups,
         )
         result["exclusive_window"] = {
             "lock_path": str(receipt.lock_path),
