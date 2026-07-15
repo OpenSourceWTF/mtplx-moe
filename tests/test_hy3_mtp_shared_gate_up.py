@@ -138,6 +138,9 @@ def test_mtp_gate_up_fp32_cache_converts_input_once_during_fill() -> None:
     assert "float activation = float(activation_tile[k]);" in source
     assert savings["threadgroup_storage_bytes"] == 16_384
     assert savings["threadgroup_barriers"] == 96
+    assert savings["input_device_load_instruction_bytes"] == 786_432
+    assert savings["input_threadgroup_load_instruction_bytes"] == 37_748_736
+    assert savings["input_bf16_to_fp32_conversions"] == 393_216
 
 
 def test_mtp_gate_up_savings_are_explicit_at_k3() -> None:
@@ -159,6 +162,9 @@ def test_mtp_gate_up_savings_are_explicit_at_k3() -> None:
         "threadgroups": 288,
         "threadgroup_barriers": 288,
         "input_fill_load_instruction_bytes": 2_359_296,
+        "input_device_load_instruction_bytes": 2_359_296,
+        "input_threadgroup_load_instruction_bytes": 9_437_184,
+        "input_bf16_to_fp32_conversions": 4_718_592,
         "steady_extra_weight_bytes": 0,
     }
 
@@ -177,3 +183,6 @@ def test_mtp_gate_up_direct_input_savings_report_no_tg_storage_or_barriers() -> 
     assert savings["threadgroup_storage_bytes"] == 0
     assert savings["threadgroup_barriers"] == 0
     assert savings["input_fill_load_instruction_bytes"] == 0
+    assert savings["input_device_load_instruction_bytes"] == 18_874_368
+    assert savings["input_threadgroup_load_instruction_bytes"] == 0
+    assert savings["input_bf16_to_fp32_conversions"] == 9_437_184

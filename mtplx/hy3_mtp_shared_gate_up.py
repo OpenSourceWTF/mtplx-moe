@@ -234,6 +234,22 @@ def hy3_mtp_gate_up_savings(
         if uses_threadgroup_input
         else 0
     )
+    compute_input_repetitions = candidate.n_tile * threadgroups
+    input_device_load_instruction_bytes = (
+        activation_bytes * threadgroups
+        if uses_threadgroup_input
+        else activation_bytes * compute_input_repetitions
+    )
+    input_threadgroup_load_instruction_bytes = (
+        threadgroup_storage_bytes * compute_input_repetitions
+        if uses_threadgroup_input
+        else 0
+    )
+    input_bf16_to_fp32_conversions = (
+        HY3_MTP_HIDDEN_SIZE * threadgroups
+        if candidate.input_mode == "threadgroup_f32"
+        else HY3_MTP_HIDDEN_SIZE * compute_input_repetitions
+    )
     return {
         "depth": depth,
         # Two GEMVs plus SwiGLU become one kernel. The down GEMV is unchanged.
@@ -250,6 +266,11 @@ def hy3_mtp_gate_up_savings(
         "input_fill_load_instruction_bytes": (
             activation_bytes * threadgroups if uses_threadgroup_input else 0
         ),
+        "input_device_load_instruction_bytes": input_device_load_instruction_bytes,
+        "input_threadgroup_load_instruction_bytes": (
+            input_threadgroup_load_instruction_bytes
+        ),
+        "input_bf16_to_fp32_conversions": input_bf16_to_fp32_conversions,
         "steady_extra_weight_bytes": 0,
     }
 
