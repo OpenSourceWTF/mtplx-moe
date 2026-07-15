@@ -10,6 +10,7 @@ import json
 import math
 import os
 import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from pathlib import Path
@@ -19,6 +20,11 @@ from typing import Any
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+from mtplx.benchmarks.resource_telemetry import (  # noqa: E402
+    PowermetricsCollector,
+    ResourceTelemetrySampler,
+)
 
 
 SCHEMA = "mtplx-q2-bf16-mtp-depth-matrix-v3"
@@ -42,20 +48,14 @@ MODEL_SPECS = {
         "depths": (1, 2, 3, 4, 5, 6),
         "model_root": Path("~/.cache/huggingface/hy3-expert-only-mlx-q2"),
         "mtp_artifacts": Path("~/.cache/huggingface/hy3-mtp-layer80"),
-        "prompt_tail": _ROOT
-        / "benchmarks"
-        / "fixtures"
-        / "hy3-q2-benchmark-prompt.txt",
+        "prompt_tail": None,
     },
     "glm52-q2": {
         "model_key": "glm52-expert-q2",
         "depths": (1, 2, 3, 4, 5),
         "model_root": Path("~/.cache/huggingface/glm52-expert-only-mlx-q2"),
         "mtp_artifacts": Path("~/.cache/huggingface/glm52-mtp-layer78"),
-        "prompt_tail": _ROOT
-        / "benchmarks"
-        / "fixtures"
-        / "glm52-q2-benchmark-prompt.txt",
+        "prompt_tail": None,
     },
 }
 
@@ -71,6 +71,11 @@ DEFAULT_RUNTIME_OPTIONS = {
     "read_chunk": "8MiB",
     "bypass_page_cache": True,
     "resource_telemetry": False,
+    "resource_sample_interval": 0.25,
+    "resource_max_samples": 4096,
+    "ssd_ceiling_gib_s": None,
+    "powermetrics": False,
+    "powermetrics_interval_ms": 250,
 }
 
 
@@ -138,6 +143,10 @@ class RunnerAPIs:
         reset_peak_memory,
         get_peak_memory,
         synchronize,
+        resource_sampler_factory=ResourceTelemetrySampler,
+        powermetrics_factory=PowermetricsCollector,
+        thread_time_ns=time.thread_time_ns,
+        monotonic_ns=time.monotonic_ns,
     ) -> None:
         self.load = load
         self.config_factory = config_factory
@@ -149,6 +158,10 @@ class RunnerAPIs:
         self.reset_peak_memory = reset_peak_memory
         self.get_peak_memory = get_peak_memory
         self.synchronize = synchronize
+        self.resource_sampler_factory = resource_sampler_factory
+        self.powermetrics_factory = powermetrics_factory
+        self.thread_time_ns = thread_time_ns
+        self.monotonic_ns = monotonic_ns
 
 
 def _default_apis() -> RunnerAPIs:
@@ -301,6 +314,40 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--resource-sample-interval",
+        type=float,
+        default=0.25,
+        help="Decode resource-sampling interval in seconds (default: 0.25).",
+    )
+    parser.add_argument(
+        "--resource-max-samples",
+        type=_positive_int,
+        default=4096,
+        help="Maximum retained decode resource samples per row (default: 4096).",
+    )
+    parser.add_argument(
+        "--ssd-ceiling-gib-s",
+        type=float,
+        help=(
+            "Measured uncached SSD ceiling used only to calculate utilization; "
+            "requires --resource-telemetry and --f-nocache."
+        ),
+    )
+    parser.add_argument(
+        "--powermetrics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Collect non-interactive process CPU/GPU evidence during decode. "
+            "Unavailable authorization is recorded, never treated as zero use."
+        ),
+    )
+    parser.add_argument(
+        "--powermetrics-interval-ms",
+        type=_positive_int,
+        default=250,
+    )
+    parser.add_argument(
         "--mtp-disabled-baseline",
         action="store_true",
         help=(
@@ -354,9 +401,10 @@ def _requests_from_args(args: argparse.Namespace) -> list[dict[str, Any]]:
             "model": model,
             "model_root": model_root,
             "manifest": _expand(manifest or model_root / "expert-manifest.json"),
-            "prompt_tail": _expand(prompt_tail),
             "depths": tuple(depths),
         }
+        if prompt_tail is not None:
+            request["prompt_tail"] = _expand(prompt_tail)
         if not args.mtp_disabled_baseline:
             request["mtp_artifacts"] = _expand(mtp_artifacts)
         requests.append(request)
@@ -376,6 +424,11 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "read_chunk": args.read_chunk,
         "bypass_page_cache": args.bypass_page_cache,
         "resource_telemetry": args.resource_telemetry,
+        "resource_sample_interval": args.resource_sample_interval,
+        "resource_max_samples": args.resource_max_samples,
+        "ssd_ceiling_gib_s": args.ssd_ceiling_gib_s,
+        "powermetrics": args.powermetrics,
+        "powermetrics_interval_ms": args.powermetrics_interval_ms,
     }
 
 
@@ -472,13 +525,20 @@ def _ratio(numerator: int | float, denominator: int | float) -> float | None:
     return float(numerator) / float(denominator) if denominator else None
 
 
-def _prompt_identity(token_ids: Sequence[int], prompt_tail: str) -> dict[str, Any]:
+def _prompt_identity(
+    token_ids: Sequence[int], prompt_metadata: Mapping[str, Any]
+) -> dict[str, Any]:
     tokens = [int(token) for token in token_ids]
     encoded = json.dumps(tokens, separators=(",", ":")).encode("utf-8")
     return {
         "token_count": len(tokens),
         "token_sha256": hashlib.sha256(encoded).hexdigest(),
-        "tail_sha256": hashlib.sha256(prompt_tail.encode("utf-8")).hexdigest(),
+        "prompt_policy": prompt_metadata.get("prompt_policy"),
+        "prompt_format": prompt_metadata.get("prompt_format"),
+        "prompt_release_valid": prompt_metadata.get("prompt_release_valid"),
+        "prompt_tail_sha256": prompt_metadata.get("prompt_tail_sha256"),
+        "prompt_filler_sha256": prompt_metadata.get("prompt_filler_sha256"),
+        "prompt_artifact_kinds": prompt_metadata.get("prompt_artifact_kinds"),
     }
 
 
@@ -1319,7 +1379,7 @@ def _run_observation(
     depth: int,
     position: int,
     max_tokens: int,
-    resource_telemetry_enabled: bool,
+    resource_options: Mapping[str, Any],
     ar_tokens: Sequence[int] | None,
     ar_finish_reason: str | None,
     verify_strategy: str,
@@ -1327,15 +1387,49 @@ def _run_observation(
     draft_observer: Callable[[Mapping[str, Any]], None] | None,
 ) -> tuple[dict[str, Any], list[int], str | None]:
     _reset_expert_streaming(runtime)
+    resource_telemetry_enabled = bool(resource_options["resource_telemetry"])
     resource_before = (
         _resource_telemetry(runtime) if resource_telemetry_enabled else None
     )
     resource_prefill_complete = None
+    resource_sampler: ResourceTelemetrySampler | None = None
+    power_collector: PowermetricsCollector | None = None
+    resource_completion_tokens = 0
+    generation_thread_started_ns: int | None = None
+    generation_thread_finished_ns: int | None = None
+    generation_started_ns: int | None = None
+    generation_finished_ns: int | None = None
+
+    def capture_tokens(token_ids: Sequence[int]) -> None:
+        nonlocal resource_completion_tokens
+        resource_completion_tokens += len(token_ids)
 
     def capture_prefill_boundary(event: Mapping[str, Any]) -> None:
         nonlocal resource_prefill_complete
+        nonlocal resource_sampler, power_collector
+        nonlocal generation_thread_started_ns, generation_started_ns
         if resource_prefill_complete is None and event.get("phase") == "completed":
-            resource_prefill_complete = _resource_telemetry(runtime)
+            power_collector = apis.powermetrics_factory(
+                enabled=bool(resource_options["powermetrics"]),
+                pid=os.getpid(),
+                interval_ms=int(resource_options["powermetrics_interval_ms"]),
+            )
+            power_collector.start()
+            resource_sampler = apis.resource_sampler_factory(
+                lambda: _resource_telemetry(runtime),
+                token_count=lambda: resource_completion_tokens,
+                interval_s=float(resource_options["resource_sample_interval"]),
+                max_samples=int(resource_options["resource_max_samples"]),
+            )
+            resource_sampler.__enter__()
+            ticks = resource_sampler.ticks
+            if not ticks:
+                raise BenchmarkGateError(
+                    "resource sampler did not capture the prefill boundary"
+                )
+            resource_prefill_complete = _jsonable(ticks[0].snapshot)
+            generation_thread_started_ns = int(apis.thread_time_ns())
+            generation_started_ns = int(apis.monotonic_ns())
 
     apis.synchronize()
     apis.reset_peak_memory()
@@ -1356,29 +1450,38 @@ def _run_observation(
     }
     if resource_telemetry_enabled:
         common["prefill_callback"] = capture_prefill_boundary
-    with admission:
-        if depth == 0:
-            result = apis.generate_ar(runtime, prompt_copy, **common)
-        else:
-            mtpk_options: dict[str, Any] = {
-                "speculative_depth": depth,
-                "mtp_cache_policy": "persistent",
-                "mtp_history_policy": "committed",
-                "capture_final_state": True,
-                "verify_strategy": verify_strategy,
-            }
-            if draft_observer is not None:
-                mtpk_options["draft_observer"] = draft_observer
-            result = apis.generate_mtpk(
-                runtime,
-                prompt_copy,
-                **mtpk_options,
-                **common,
-            )
-    apis.synchronize()
-    resource_after = (
-        _resource_telemetry(runtime) if resource_telemetry_enabled else None
-    )
+        common["token_callback"] = capture_tokens
+    try:
+        with admission:
+            if depth == 0:
+                result = apis.generate_ar(runtime, prompt_copy, **common)
+            else:
+                mtpk_options: dict[str, Any] = {
+                    "speculative_depth": depth,
+                    "mtp_cache_policy": "persistent",
+                    "mtp_history_policy": "committed",
+                    "capture_final_state": True,
+                    "verify_strategy": verify_strategy,
+                }
+                if draft_observer is not None:
+                    mtpk_options["draft_observer"] = draft_observer
+                result = apis.generate_mtpk(
+                    runtime,
+                    prompt_copy,
+                    **mtpk_options,
+                    **common,
+                )
+        apis.synchronize()
+    finally:
+        if resource_sampler is not None:
+            generation_finished_ns = int(apis.monotonic_ns())
+            generation_thread_finished_ns = int(apis.thread_time_ns())
+            resource_sampler.__exit__(None, None, None)
+        if power_collector is not None:
+            power_collector.stop()
+    resource_after = None
+    if resource_sampler is not None and resource_sampler.ticks:
+        resource_after = _jsonable(resource_sampler.ticks[-1].snapshot)
     if resource_telemetry_enabled and resource_prefill_complete is None:
         raise BenchmarkGateError(
             "resource telemetry did not observe the prefill-complete boundary"
@@ -1525,6 +1628,36 @@ def _run_observation(
         if exc.evidence is None:
             exc.evidence = failure_evidence
         raise
+    resource_report = None
+    if resource_telemetry_enabled:
+        assert resource_sampler is not None
+        assert power_collector is not None
+        assert generation_thread_started_ns is not None
+        assert generation_thread_finished_ns is not None
+        assert generation_started_ns is not None
+        assert generation_finished_ns is not None
+        resource_report = resource_sampler.report(
+            ssd_ceiling_gib_s=resource_options["ssd_ceiling_gib_s"],
+            powermetrics=power_collector.report(),
+            generation_thread_cpu_ns=(
+                generation_thread_finished_ns - generation_thread_started_ns
+            ),
+            generation_elapsed_ns=generation_finished_ns - generation_started_ns,
+            final_completion_tokens=len(tokens),
+        )
+        memory_limit_bytes = int(
+            apis.parse_memory_bytes(resource_options["memory_limit"])
+        )
+        resource_report["memory"] = {
+            "peak_memory_bytes": metrics["peak_memory_bytes"],
+            "limit_bytes": memory_limit_bytes,
+            "utilization_of_limit": (
+                metrics["peak_memory_bytes"] / memory_limit_bytes
+                if memory_limit_bytes > 0
+                else None
+            ),
+        }
+
     row = {
         "model": model,
         "context_tokens": context_tokens,
@@ -1551,6 +1684,7 @@ def _run_observation(
         "expert_resource_telemetry": (
             resource_evidence if resource_telemetry_enabled else None
         ),
+        "resource_telemetry": resource_report,
         "gates": {
             "prompt_length_exact": len(prompt_ids) == context_tokens,
             "new_prefill_tokens_exact": _field(stats, "new_prefill_tokens")
@@ -1654,13 +1788,16 @@ def _normalized_request(
         raise BenchmarkConfigurationError(
             f"{model} is missing required paths: {', '.join(missing)}"
         )
-    if "prompt_tail_text" in request:
-        prompt_tail_text = str(request["prompt_tail_text"])
+    if request.get("prompt_tail_text") is not None:
+        prompt_tail_text: str | None = str(request["prompt_tail_text"])
         prompt_tail_path = request.get("prompt_tail")
-    else:
-        prompt_tail_path = request.get("prompt_tail", spec["prompt_tail"])
+    elif request.get("prompt_tail") is not None:
+        prompt_tail_path = request["prompt_tail"]
         prompt_tail_text = _expand(prompt_tail_path).read_text(encoding="utf-8")
-    if not prompt_tail_text:
+    else:
+        prompt_tail_path = None
+        prompt_tail_text = None
+    if prompt_tail_text is not None and not prompt_tail_text:
         raise BenchmarkConfigurationError(f"{model} prompt tail must not be empty")
     normalized = {
         "model": model,
@@ -1843,6 +1980,27 @@ def _run_depth_matrix_impl(
         **dict(runtime_options or {}),
         "trace_routes": bool(trace_routes),
     }
+    if options["powermetrics"] and not options["resource_telemetry"]:
+        raise BenchmarkConfigurationError(
+            "powermetrics requires resource telemetry"
+        )
+    if options["ssd_ceiling_gib_s"] is not None:
+        if not options["resource_telemetry"]:
+            raise BenchmarkConfigurationError(
+                "SSD ceiling requires resource telemetry"
+            )
+        if not options["bypass_page_cache"]:
+            raise BenchmarkConfigurationError("SSD ceiling requires F_NOCACHE")
+        if float(options["ssd_ceiling_gib_s"]) <= 0:
+            raise BenchmarkConfigurationError("SSD ceiling must be positive")
+    if float(options["resource_sample_interval"]) <= 0:
+        raise BenchmarkConfigurationError(
+            "resource sample interval must be positive"
+        )
+    if int(options["resource_max_samples"]) < 2:
+        raise BenchmarkConfigurationError(
+            "resource max samples must be at least 2"
+        )
     if max(context_values) + output_tokens > int(options["max_live_kv_tokens"]):
         raise BenchmarkConfigurationError(
             f"context plus {output_tokens} output tokens exceeds max_live_kv_tokens"
@@ -2007,13 +2165,17 @@ def _run_depth_matrix_impl(
                     "cell": None,
                     "phase": "prompt",
                 }
+                prompt_options: dict[str, Any] = {
+                    "prompt_style": "coding-agent",
+                    "prompt_format": "chat",
+                    "enable_thinking": False,
+                }
+                if request["prompt_tail_text"] is not None:
+                    prompt_options["prompt_tail"] = request["prompt_tail_text"]
                 prompt = apis.prompt_builder(
                     runtime.tokenizer,
                     context_tokens,
-                    prompt_style="coding-agent",
-                    prompt_tail=request["prompt_tail_text"],
-                    prompt_format="raw",
-                    enable_thinking=False,
+                    **prompt_options,
                 )
                 prompt_ids = tuple(int(token) for token in prompt.token_ids)
                 if len(prompt_ids) != context_tokens:
@@ -2022,14 +2184,24 @@ def _run_depth_matrix_impl(
                         f"tokens for requested context {context_tokens}"
                     )
                 metadata = _jsonable(getattr(prompt, "metadata", {}))
-                if (
-                    isinstance(metadata, Mapping)
-                    and metadata.get("prompt_tail_preserved") is False
-                ):
+                if not isinstance(metadata, Mapping):
+                    raise BenchmarkGateError(
+                        f"{request['model']} prompt builder emitted no metadata"
+                    )
+                if metadata.get("prompt_tail_preserved") is not True:
                     raise BenchmarkGateError(
                         f"{request['model']} prompt builder did not preserve the tail"
                     )
-                identity = _prompt_identity(prompt_ids, request["prompt_tail_text"])
+                if (
+                    metadata.get("prompt_policy") != "realistic_programming_v1"
+                    or metadata.get("prompt_format") != "chat"
+                    or metadata.get("prompt_release_valid") is not True
+                ):
+                    raise BenchmarkGateError(
+                        f"{request['model']} prompt builder did not use the release "
+                        "realistic programming chat policy"
+                    )
+                identity = _prompt_identity(prompt_ids, metadata)
                 prompts.append(
                     {
                         "context_tokens": context_tokens,
@@ -2055,7 +2227,7 @@ def _run_depth_matrix_impl(
                     depth=0,
                     position=1,
                     max_tokens=WARMUP_TOKENS,
-                    resource_telemetry_enabled=bool(options["resource_telemetry"]),
+                    resource_options=options,
                     ar_tokens=None,
                     ar_finish_reason=None,
                     verify_strategy=verify_strategy,
@@ -2087,7 +2259,7 @@ def _run_depth_matrix_impl(
                     depth=0,
                     position=1,
                     max_tokens=output_tokens,
-                    resource_telemetry_enabled=bool(options["resource_telemetry"]),
+                    resource_options=options,
                     ar_tokens=None,
                     ar_finish_reason=None,
                     verify_strategy=verify_strategy,
@@ -2122,7 +2294,7 @@ def _run_depth_matrix_impl(
                         depth=depth,
                         position=position,
                         max_tokens=WARMUP_TOKENS,
-                        resource_telemetry_enabled=bool(options["resource_telemetry"]),
+                        resource_options=options,
                         ar_tokens=warmup_ar_tokens,
                         ar_finish_reason=warmup_ar_finish,
                         verify_strategy=verify_strategy,
@@ -2159,7 +2331,7 @@ def _run_depth_matrix_impl(
                         depth=depth,
                         position=position,
                         max_tokens=output_tokens,
-                        resource_telemetry_enabled=bool(options["resource_telemetry"]),
+                        resource_options=options,
                         ar_tokens=ar_tokens,
                         ar_finish_reason=ar_finish,
                         verify_strategy=verify_strategy,

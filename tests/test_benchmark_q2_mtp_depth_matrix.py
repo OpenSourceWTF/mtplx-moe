@@ -267,9 +267,14 @@ def _fake_apis(
         return SimpleNamespace(
             token_ids=list(range(context_tokens)),
             metadata={
-                "prompt_policy": "coding_agent_tail_v2",
+                "prompt_policy": "realistic_programming_v1",
+                "prompt_format": "chat",
                 "prompt_actual_tokens": context_tokens,
                 "prompt_tail_preserved": True,
+                "prompt_release_valid": True,
+                "prompt_tail_sha256": "a" * 64,
+                "prompt_filler_sha256": "b" * 64,
+                "prompt_artifact_kinds": 6,
             },
         )
 
@@ -356,14 +361,12 @@ def _requests(tmp_path: Path):
             "model_root": tmp_path / "hy3-model",
             "manifest": tmp_path / "hy3-manifest.json",
             "mtp_artifacts": tmp_path / "hy3-mtp",
-            "prompt_tail_text": "Hy3 fixed prompt tail.",
         },
         {
             "model": "glm52-q2",
             "model_root": tmp_path / "glm-model",
             "manifest": tmp_path / "glm-manifest.json",
             "mtp_artifacts": tmp_path / "glm-mtp",
-            "prompt_tail_text": "GLM fixed prompt tail.",
         },
     ]
 
@@ -382,10 +385,54 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
     assert args.expert_cache_limit == "64GiB"
     assert args.max_live_kv_tokens == 4096
     assert args.resource_telemetry is False
+    assert args.resource_sample_interval == 0.25
+    assert args.resource_max_samples == 4096
+    assert args.ssd_ceiling_gib_s is None
+    assert args.powermetrics is False
+    assert args.powermetrics_interval_ms == 250
     assert args.mtp_disabled_baseline is False
     assert args.verify_strategy == "batched"
     assert args.compiled_verify_mode == "off"
     assert args.trace_routes is False
+    assert args.hy3_q2_prompt_tail is None
+    assert args.glm52_q2_prompt_tail is None
+
+
+@pytest.mark.parametrize(
+    ("runtime_options", "message"),
+    [
+        ({"powermetrics": True}, "powermetrics requires resource telemetry"),
+        (
+            {"ssd_ceiling_gib_s": 12.47},
+            "SSD ceiling requires resource telemetry",
+        ),
+        (
+            {
+                "resource_telemetry": True,
+                "ssd_ceiling_gib_s": 12.47,
+                "bypass_page_cache": False,
+            },
+            "SSD ceiling requires F_NOCACHE",
+        ),
+    ],
+)
+def test_resource_utilization_options_fail_closed_before_model_load(
+    tmp_path: Path,
+    runtime_options: dict[str, object],
+    message: str,
+) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+
+    with pytest.raises(module.BenchmarkConfigurationError, match=message):
+        module.run_depth_matrix(
+            [_requests(tmp_path)[0]],
+            contexts=(1024,),
+            runtime_options=runtime_options,
+            apis=apis,
+        )
+
+    assert calls.loads == []
 
 
 def test_hy3_depth_six_is_a_supported_recursive_depth(tmp_path: Path) -> None:
@@ -648,11 +695,18 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
         kwargs
         == {
             "prompt_style": "coding-agent",
-            "prompt_tail": kwargs["prompt_tail"],
-            "prompt_format": "raw",
+            "prompt_format": "chat",
             "enable_thinking": False,
         }
         for _tokenizer, _context, kwargs in calls.prompt_builds
+    )
+    assert all(
+        prompt["prompt_policy"] == "realistic_programming_v1"
+        and prompt["prompt_format"] == "chat"
+        and prompt["prompt_release_valid"] is True
+        and prompt["prompt_artifact_kinds"] == 6
+        for model in payload["models"]
+        for prompt in model["prompts"]
     )
 
 
@@ -1330,7 +1384,6 @@ def test_second_model_config_failure_names_the_unstarted_model(
 def test_preflight_failure_uses_the_checkpoint_schema(tmp_path: Path) -> None:
     module = _load_module()
     request = _requests(tmp_path)[0]
-    request.pop("prompt_tail_text")
     request["prompt_tail"] = tmp_path / "missing.txt"
     snapshots = []
 
@@ -1488,6 +1541,19 @@ def test_rows_recompute_ingestion_decode_and_acceptance_metrics(tmp_path: Path) 
         "peak_active_readers": 8,
         "full_capacity_fraction": 0.0,
         "mean_queued_reads": 0.5,
+    }
+    resource = depth_two["resource_telemetry"]
+    assert resource["schema"] == "mtplx-resource-telemetry-v2"
+    assert resource["memory"] == {
+        "peak_memory_bytes": 3 * 1024**3,
+        "limit_bytes": 112 * 1024**3,
+        "utilization_of_limit": pytest.approx(3 / 112),
+    }
+    assert resource["coverage"]["generation_thread_cpu"] == "measured"
+    assert resource["host"]["generation_thread_core_fraction"] >= 0.0
+    assert resource["powermetrics"] == {
+        "available": False,
+        "reason": "disabled",
     }
     assert all("prefill_callback" in kwargs for *_rest, kwargs in calls.ar + calls.mtpk)
     assert depth_two["accepted_drafts"] == 85
