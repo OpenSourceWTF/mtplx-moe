@@ -35,6 +35,16 @@ def test_module_names_include_a_non_stock_control_once() -> None:
         ("exact", "fast"),
         control_candidate="exact",
     ) == ("exact", "fast")
-    assert benchmark._module_names(("fast",), control_candidate="stock") == (
-        "fast",
-    )
+    assert benchmark._module_names(("fast",), control_candidate="stock") == ("fast",)
+
+
+def test_metal_candidate_map_includes_separate_stock_tn4_exact_arms() -> None:
+    benchmark = _benchmark_module()
+
+    candidates = benchmark._metal_candidate_map()
+    stock = candidates["metal_n24_r2_v4_exact_stock_tn4"]
+
+    assert stock.reduction_layout == "stock_tn4"
+    assert stock.k_vector == 4
+    assert "metal_n24_r2_v16_exact" in candidates
+    assert "metal_n24_r2_v4_fast_stock_tn4" not in candidates

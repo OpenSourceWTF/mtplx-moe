@@ -43,6 +43,14 @@ def test_mtp_gate_up_candidate_rejects_invalid_tiling() -> None:
         Hy3MTPGateUpCandidate(n_tile=4, k_vector=4, rows_per_simdgroup=3)
     with pytest.raises(ValueError, match="activation_mode"):
         Hy3MTPGateUpCandidate(n_tile=4, k_vector=4, activation_mode="approx")
+    with pytest.raises(ValueError, match="reduction_layout"):
+        Hy3MTPGateUpCandidate(n_tile=4, k_vector=4, reduction_layout="unknown")
+    with pytest.raises(ValueError, match="k_vector=4"):
+        Hy3MTPGateUpCandidate(
+            n_tile=4,
+            k_vector=16,
+            reduction_layout="stock_tn4",
+        )
 
 
 def test_mtp_gate_up_source_caches_m1_input_and_selects_exact_math() -> None:
@@ -71,6 +79,25 @@ def test_mtp_gate_up_source_caches_m1_input_and_selects_exact_math() -> None:
     assert "lane * K_VECTOR" not in source
     assert "constexpr uint K = 4096" in source
     assert "constant constexpr" not in source
+
+
+def test_mtp_gate_up_stock_tn4_source_matches_mlx_gemv_reduction_order() -> None:
+    candidate = Hy3MTPGateUpCandidate(
+        n_tile=24,
+        k_vector=4,
+        rows_per_simdgroup=2,
+        reduction_layout="stock_tn4",
+    )
+
+    source = render_hy3_mtp_gate_up_source(candidate)
+
+    assert candidate.name == "n24_r2_v4_exact_stock_tn4"
+    assert "uint k = k_base + lane * K_VECTOR + offset;" in source
+    assert "k_base += 32 * K_VECTOR" in source
+    assert "for (ushort delta = 16; delta >= 1; delta >>= 1)" in source
+    assert "simd_shuffle_down(gate_reduced, delta)" in source
+    assert "simd_shuffle_down(up_reduced, delta)" in source
+    assert "simd_sum" not in source
 
 
 def test_mtp_gate_up_savings_are_explicit_at_k3() -> None:

@@ -27,6 +27,7 @@ from mlx_lm.models.activations import swiglu
 
 from mtplx.hy3_mtp_patch import build_hy3_mtp_module
 from mtplx.hy3_mtp_shared_gate_up import (
+    Hy3MTPGateUpCandidate,
     MetalFusedMTPSharedMLP,
     hy3_mtp_gate_up_candidates,
     hy3_mtp_gate_up_savings,
@@ -116,6 +117,19 @@ def _block_packed_shared(
     return module
 
 
+def _metal_candidate_map() -> dict[str, Hy3MTPGateUpCandidate]:
+    """Expose coalesced arms plus exact MLX TN4-order arms by stable names."""
+
+    candidates = hy3_mtp_gate_up_candidates(
+        activation_modes=("exact", "fast"),
+    )
+    candidates += hy3_mtp_gate_up_candidates(
+        activation_modes=("exact",),
+        reduction_layouts=("stock_tn4",),
+    )
+    return {f"metal_{candidate.name}": candidate for candidate in candidates}
+
+
 def _candidate_shared(
     name: str,
     args: ModelArgs,
@@ -130,12 +144,7 @@ def _candidate_shared(
     elif name == "batched":
         module = BatchedSharedMLP(gate, up, down)
     elif name.startswith("metal_"):
-        metal_candidates = {
-            f"metal_{candidate.name}": candidate
-            for candidate in hy3_mtp_gate_up_candidates(
-                activation_modes=("exact", "fast")
-            )
-        }
+        metal_candidates = _metal_candidate_map()
         candidate = metal_candidates.get(name)
         if candidate is None:
             raise ValueError(f"unknown candidate {name!r}")
@@ -499,10 +508,7 @@ def main() -> int:
 
     shared_params = int(gate.size + up.size + down.size)
     gate_up_params = int(gate.size + up.size)
-    metal_candidates = {
-        f"metal_{candidate.name}": candidate
-        for candidate in hy3_mtp_gate_up_candidates(activation_modes=("exact", "fast"))
-    }
+    metal_candidates = _metal_candidate_map()
     candidate_savings_at_k3 = {}
     for name in candidates:
         metal_candidate = metal_candidates.get(name)

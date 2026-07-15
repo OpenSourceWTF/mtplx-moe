@@ -16,6 +16,7 @@ HY3_MTP_N_TILES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
 HY3_MTP_K_VECTORS = (1, 2, 4, 8, 16)
 HY3_MTP_ROWS_PER_SIMDGROUP = (1, 2, 4, 8)
 HY3_MTP_ACTIVATION_MODES = ("exact", "fast")
+HY3_MTP_REDUCTION_LAYOUTS = ("striped", "stock_tn4")
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class Hy3MTPGateUpCandidate:
     k_vector: int
     rows_per_simdgroup: int = 1
     activation_mode: str = "exact"
+    reduction_layout: str = "striped"
 
     def __post_init__(self) -> None:
         if self.n_tile not in HY3_MTP_N_TILES:
@@ -34,12 +36,10 @@ class Hy3MTPGateUpCandidate:
             raise ValueError(f"k_vector must be one of {HY3_MTP_K_VECTORS}")
         if self.rows_per_simdgroup not in HY3_MTP_ROWS_PER_SIMDGROUP:
             raise ValueError(
-                "rows_per_simdgroup must be one of "
-                f"{HY3_MTP_ROWS_PER_SIMDGROUP}"
+                f"rows_per_simdgroup must be one of {HY3_MTP_ROWS_PER_SIMDGROUP}"
             )
         if (
-            HY3_MTP_SHARED_INTERMEDIATE_SIZE
-            % (self.n_tile * self.rows_per_simdgroup)
+            HY3_MTP_SHARED_INTERMEDIATE_SIZE % (self.n_tile * self.rows_per_simdgroup)
             != 0
         ):
             raise ValueError("output tile must divide the fixed Hy3 MTP width")
@@ -47,6 +47,12 @@ class Hy3MTPGateUpCandidate:
             raise ValueError(
                 f"activation_mode must be one of {HY3_MTP_ACTIVATION_MODES}"
             )
+        if self.reduction_layout not in HY3_MTP_REDUCTION_LAYOUTS:
+            raise ValueError(
+                f"reduction_layout must be one of {HY3_MTP_REDUCTION_LAYOUTS}"
+            )
+        if self.reduction_layout == "stock_tn4" and self.k_vector != 4:
+            raise ValueError("stock_tn4 reduction_layout requires k_vector=4")
 
     @property
     def threads(self) -> int:
@@ -54,34 +60,44 @@ class Hy3MTPGateUpCandidate:
 
     @property
     def name(self) -> str:
-        return (
+        name = (
             f"n{self.n_tile}_r{self.rows_per_simdgroup}"
             f"_v{self.k_vector}_{self.activation_mode}"
         )
+        if self.reduction_layout != "striped":
+            name += f"_{self.reduction_layout}"
+        return name
 
 
 def hy3_mtp_gate_up_candidates(
     *,
     activation_modes: tuple[str, ...] = ("exact",),
+    reduction_layouts: tuple[str, ...] = ("striped",),
 ) -> tuple[Hy3MTPGateUpCandidate, ...]:
     """Return the exhaustive shape-specific tiling frontier."""
 
     unknown = set(activation_modes) - set(HY3_MTP_ACTIVATION_MODES)
     if unknown:
         raise ValueError(f"unknown activation modes: {sorted(unknown)}")
+    unknown_layouts = set(reduction_layouts) - set(HY3_MTP_REDUCTION_LAYOUTS)
+    if unknown_layouts:
+        raise ValueError(f"unknown reduction layouts: {sorted(unknown_layouts)}")
     return tuple(
         Hy3MTPGateUpCandidate(
             n_tile=n_tile,
             k_vector=k_vector,
             rows_per_simdgroup=rows_per_simdgroup,
             activation_mode=activation_mode,
+            reduction_layout=reduction_layout,
         )
-        for activation_mode, n_tile, rows_per_simdgroup, k_vector in product(
+        for reduction_layout, activation_mode, n_tile, rows_per_simdgroup, k_vector in product(
+            reduction_layouts,
             activation_modes,
             HY3_MTP_N_TILES,
             HY3_MTP_ROWS_PER_SIMDGROUP,
             HY3_MTP_K_VECTORS,
         )
+        if reduction_layout != "stock_tn4" or k_vector == 4
     )
 
 
@@ -92,6 +108,22 @@ def render_hy3_mtp_gate_up_source(candidate: Hy3MTPGateUpCandidate) -> str:
         "metal::exp(metal::abs(gate_value))"
         if candidate.activation_mode == "exact"
         else "fast::exp(metal::abs(gate_value))"
+    )
+    k_index = (
+        "k_base + offset * 32 + lane"
+        if candidate.reduction_layout == "striped"
+        else "k_base + lane * K_VECTOR + offset"
+    )
+    reduction = (
+        """float gate_reduced = simd_sum(gate_sum[row]);
+            float up_reduced = simd_sum(up_sum[row]);"""
+        if candidate.reduction_layout == "striped"
+        else """float gate_reduced = gate_sum[row];
+            float up_reduced = up_sum[row];
+            for (ushort delta = 16; delta >= 1; delta >>= 1) {
+                gate_reduced += simd_shuffle_down(gate_reduced, delta);
+                up_reduced += simd_shuffle_down(up_reduced, delta);
+            }"""
     )
     return f"""
         constexpr uint K = {HY3_MTP_HIDDEN_SIZE};
@@ -120,7 +152,7 @@ def render_hy3_mtp_gate_up_source(candidate: Hy3MTPGateUpCandidate) -> str:
              k_base += 32 * K_VECTOR) {{
             _Pragma("clang loop unroll(full)")
             for (uint offset = 0; offset < K_VECTOR; ++offset) {{
-                uint k = k_base + offset * 32 + lane;
+                uint k = {k_index};
                 float activation = float(activation_tile[k]);
                 _Pragma("clang loop unroll(full)")
                 for (uint row = 0; row < ROWS_PER_SIMDGROUP; ++row) {{
@@ -136,8 +168,7 @@ def render_hy3_mtp_gate_up_source(candidate: Hy3MTPGateUpCandidate) -> str:
         }}
         _Pragma("clang loop unroll(full)")
         for (uint row = 0; row < ROWS_PER_SIMDGROUP; ++row) {{
-            float gate_reduced = simd_sum(gate_sum[row]);
-            float up_reduced = simd_sum(up_sum[row]);
+            {reduction}
             if (lane == 0) {{
                 uint n = n_base + row;
                 T gate_value = T(gate_reduced);
@@ -163,9 +194,7 @@ def hy3_mtp_gate_up_savings(
     if depth < 1:
         raise ValueError("depth must be positive")
     outputs_per_threadgroup = candidate.n_tile * candidate.rows_per_simdgroup
-    threadgroups_per_depth = (
-        HY3_MTP_SHARED_INTERMEDIATE_SIZE // outputs_per_threadgroup
-    )
+    threadgroups_per_depth = HY3_MTP_SHARED_INTERMEDIATE_SIZE // outputs_per_threadgroup
     activation_bytes = HY3_MTP_HIDDEN_SIZE * 2
     intermediate_bytes = HY3_MTP_SHARED_INTERMEDIATE_SIZE * 2
     gate_up_weight_bytes = (
