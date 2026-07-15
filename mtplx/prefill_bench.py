@@ -9,6 +9,7 @@ import shlex
 import subprocess
 import time
 import gc
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -466,16 +467,18 @@ def _encode_prompt_content(
     }
     if enable_thinking is not None:
         kwargs["enable_thinking"] = enable_thinking
-    return [
-        int(token)
-        for token in tokenizer.apply_chat_template(
-            [
-                {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
-                {"role": "user", "content": content},
-            ],
-            **kwargs,
-        )
-    ]
+    encoded = tokenizer.apply_chat_template(
+        [
+            {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
+            {"role": "user", "content": content},
+        ],
+        **kwargs,
+    )
+    if isinstance(encoded, Mapping):
+        encoded = encoded.get("input_ids")
+        if encoded is None:
+            raise TypeError("chat template result does not contain input_ids")
+    return [int(token) for token in encoded]
 
 
 def _prompt_build_for_context(

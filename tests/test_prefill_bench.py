@@ -49,6 +49,17 @@ class _StalledTokenizer(_CharTokenizer):
         return [1]
 
 
+class _MappingChatTokenizer(_CharTokenizer):
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **kwargs):
+        ids = super().apply_chat_template(
+            messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
+        )
+        return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+
+
 def test_programming_context_is_deterministic_and_structurally_varied() -> None:
     first = build_programming_context(minimum_characters=80_000)
     second = build_programming_context(minimum_characters=80_000)
@@ -125,6 +136,17 @@ def test_realistic_programming_prompt_rejects_stalled_tokenizer() -> None:
             prompt_tail="Fix the queue.",
             prompt_format="raw",
         )
+
+
+def test_realistic_programming_prompt_accepts_mapping_chat_template() -> None:
+    prompt = _prompt_build_for_context(
+        _MappingChatTokenizer(),
+        1024,
+        prompt_tail="Fix the queue.",
+    )
+
+    assert len(prompt.token_ids) == 1024
+    assert prompt.metadata["prompt_tail_preserved"] is True
 
 
 def test_prefill_prompt_legacy_mode_keeps_diagnostic_hard_truncate() -> None:
