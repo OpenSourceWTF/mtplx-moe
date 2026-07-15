@@ -161,6 +161,87 @@ def test_trim_verified_window_to_prefix_requires_all_trimmable_snapshot():
     assert kv.offset == 8
 
 
+def test_trim_verified_window_to_prefix_supports_mlx_cache_list():
+    from mlx_lm.models.cache import CacheList, KVCache
+
+    main = KVCache()
+    indexer = KVCache()
+    tail = mx.zeros((1, 1, 8, 1), dtype=mx.bfloat16)
+    main.update_and_fetch(tail, tail)
+    indexer.update_and_fetch(tail, tail)
+    wrapped = CacheList(main, indexer)
+    snap = snapshot_untrimmable_cache([wrapped])
+
+    assert trim_verified_window_to_prefix(
+        [wrapped],
+        snap,
+        verified_tokens=5,
+        keep_tokens=2,
+    )
+    assert main.offset == 5
+    assert indexer.offset == 5
+
+
+def test_trim_verified_window_to_prefix_preflights_every_nested_cache():
+    from mlx_lm.models.cache import CacheList, KVCache
+
+    main = KVCache()
+    indexer = KVCache()
+    main_tail = mx.zeros((1, 1, 8, 1), dtype=mx.bfloat16)
+    indexer_tail = mx.zeros((1, 1, 2, 1), dtype=mx.bfloat16)
+    main.update_and_fetch(main_tail, main_tail)
+    indexer.update_and_fetch(indexer_tail, indexer_tail)
+    wrapped = CacheList(main, indexer)
+    snap = snapshot_untrimmable_cache([wrapped])
+
+    assert not trim_verified_window_to_prefix(
+        [wrapped],
+        snap,
+        verified_tokens=5,
+        keep_tokens=2,
+    )
+    assert main.offset == 8
+    assert indexer.offset == 2
+
+
+def test_restore_cache_uses_cache_list_state_setter():
+    from mlx_lm.models.cache import CacheList, KVCache
+
+    main = KVCache()
+    indexer = KVCache()
+    prefix = mx.arange(8).reshape(1, 1, 8, 1)
+    main.update_and_fetch(prefix, prefix)
+    indexer.update_and_fetch(prefix + 10, prefix + 20)
+    wrapped = CacheList(main, indexer)
+    snapshot = snapshot_cache([wrapped])
+    mx.eval(*snapshot.states[0][0], *snapshot.states[0][1])
+
+    tail = mx.full((1, 1, 2, 1), 99)
+    main.update_and_fetch(tail, tail)
+    indexer.update_and_fetch(tail, tail)
+    restore_cache([wrapped], snapshot)
+
+    assert main.offset == 8
+    assert indexer.offset == 8
+    assert main.keys.tolist() == prefix.tolist()
+    assert indexer.keys.tolist() == (prefix + 10).tolist()
+
+
+def test_restore_cache_preserves_arrays_cache_container_identity():
+    from mlx_lm.models.cache import ArraysCache
+
+    cache = ArraysCache(2)
+    cache.cache[:] = [mx.array([1]), mx.array([2])]
+    original_container = cache.cache
+    snapshot = snapshot_cache([cache])
+
+    cache.cache[:] = [mx.array([9]), mx.array([10])]
+    restore_cache([cache], snapshot)
+
+    assert cache.cache is original_container
+    assert [item.tolist() for item in cache.cache] == [[1], [2]]
+
+
 def test_detach_recurrent_cache_state_replaces_requested_list_leaves():
     recurrent = DummyCache()
     recurrent.state = [

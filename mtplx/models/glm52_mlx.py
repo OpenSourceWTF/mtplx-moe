@@ -28,7 +28,36 @@ from mlx_lm.models.deepseek_v32 import (
 )
 from mlx_lm.models.switch_layers import SwitchGLU
 
+from ..attention_context import current_attention_phase
 from .expert_mlx import UnboundExpertSwitch, run_switch_with_shared_overlap
+
+
+def _use_decode_row_math(
+    length: int,
+    cache: Any | None,
+    kv_read_boundary: int | None = None,
+) -> bool:
+    return (
+        current_attention_phase() == "decode_verify"
+        and length > 1
+        and cache is not None
+        and kv_read_boundary is None
+    )
+
+
+def _topk_row(topk_indices: Any, row: int) -> Any:
+    if topk_indices is None:
+        return None
+    if isinstance(topk_indices, (list, tuple)):
+        return topk_indices[row]
+    return topk_indices[..., row : row + 1, :]
+
+
+def _apply_per_row(module: Any, values: mx.array) -> mx.array:
+    return mx.concatenate(
+        [module(values[:, row : row + 1, :]) for row in range(values.shape[1])],
+        axis=1,
+    )
 
 
 @dataclass
@@ -117,7 +146,7 @@ class FP32MoEGate(nn.Module):
         self.weight = original.weight
         self.e_score_correction_bias = original.e_score_correction_bias
 
-    def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
+    def _route(self, x: mx.array) -> tuple[mx.array, mx.array]:
         logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
         return group_expert_select(
             logits,
@@ -128,6 +157,18 @@ class FP32MoEGate(nn.Module):
             self.routed_scaling_factor,
             self.norm_topk_prob,
         )
+
+    def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
+        length = int(x.shape[-2])
+        if current_attention_phase() != "decode_verify" or length <= 1:
+            return self._route(x)
+        indices = []
+        scores = []
+        for row in range(length):
+            row_indices, row_scores = self._route(x[:, row : row + 1, :])
+            indices.append(row_indices)
+            scores.append(row_scores)
+        return mx.concatenate(indices, axis=1), mx.concatenate(scores, axis=1)
 
 
 class GlmMoeDsaAttention(DeepseekV32Attention):
@@ -159,6 +200,26 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         kv_read_boundary: int | None = None,
     ) -> tuple[mx.array, mx.array | None]:
         batch, length, _ = x.shape
+        if _use_decode_row_math(length, cache, kv_read_boundary):
+            # Run the ordinary qlen=1 attention path for every verifier row.
+            # This preserves the exact projection, RoPE, indexer threshold,
+            # sparse gather, SDPA, output projection, and cache-update shapes
+            # used by autoregressive decode while retaining one model call.
+            outputs = []
+            row_topk_indices = []
+            for row in range(length):
+                output, topk_indices = self(
+                    x[:, row : row + 1, :],
+                    mask=None,
+                    cache=cache,
+                    prev_topk_indices=_topk_row(prev_topk_indices, row),
+                    compute_topk=compute_topk,
+                    kv_read_boundary=None,
+                )
+                outputs.append(output)
+                row_topk_indices.append(topk_indices)
+            return mx.concatenate(outputs, axis=1), row_topk_indices
+
         qr = self.q_a_layernorm(self.q_a_proj(x))
         queries = self.q_b_proj(qr)
         queries = queries.reshape(
@@ -199,6 +260,11 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             k_pe = k_pe[..., :read_boundary, :]
             if mask is not None:
                 mask = mask[..., :read_boundary]
+        if should_compute_topk and cache[0] is not None:
+            cache[0].keys = mx.depends(
+                cache[0].keys,
+                (cache[1].keys, cache[1].values),
+            )
         if topk_indices is not None:
             if length == 1:
                 index = topk_indices[:, :, 0, :, None]
@@ -227,11 +293,6 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 if mask is not None:
                     sparse_mask = sparse_mask & mask
                 mask = sparse_mask
-        if should_compute_topk and cache[0] is not None:
-            cache[0].keys = mx.depends(
-                cache[0].keys,
-                (cache[1].keys, cache[1].values),
-            )
         pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:
             pe_scores = mx.where(
@@ -280,11 +341,19 @@ class StreamedMoE(nn.Module):
             output = self.switch_mlp(x, indices)
             shared = None
         else:
+            def shared_work() -> mx.array:
+                if (
+                    current_attention_phase() == "decode_verify"
+                    and x.shape[1] > 1
+                ):
+                    return _apply_per_row(self.shared_experts, x)
+                return self.shared_experts(x)
+
             output, shared = run_switch_with_shared_overlap(
                 self.switch_mlp,
                 x,
                 indices,
-                lambda: self.shared_experts(x),
+                shared_work,
             )
         output = (output * scores[..., None]).sum(axis=-2).astype(output.dtype)
         if shared is not None:
@@ -371,17 +440,49 @@ class GlmMoeDsaDecoderLayer(nn.Module):
         compute_topk: bool | None = None,
         kv_read_boundary: int | None = None,
     ) -> tuple[mx.array, mx.array | None]:
+        use_decode_row_math = _use_decode_row_math(
+            int(x.shape[1]),
+            cache,
+            kv_read_boundary,
+        )
+        normalized = (
+            _apply_per_row(self.input_layernorm, x)
+            if use_decode_row_math
+            else self.input_layernorm(x)
+        )
         residual, topk_indices = self.self_attn(
-            self.input_layernorm(x),
+            normalized,
             mask,
             cache,
             prev_topk_indices,
             compute_topk=compute_topk,
             kv_read_boundary=kv_read_boundary,
         )
-        hidden = x + residual
-        residual = self.mlp(self.post_attention_layernorm(hidden))
-        return hidden + residual, topk_indices
+        if not use_decode_row_math:
+            hidden = x + residual
+            residual = self.mlp(self.post_attention_layernorm(hidden))
+            return hidden + residual, topk_indices
+
+        hidden_rows = []
+        for row in range(x.shape[1]):
+            hidden = x[:, row : row + 1, :] + residual[:, row : row + 1, :]
+            hidden_rows.append(hidden)
+        hidden = mx.concatenate(hidden_rows, axis=1)
+        normalized_hidden = _apply_per_row(self.post_attention_layernorm, hidden)
+        if isinstance(self.mlp, StreamedMoE):
+            # Keep routed expert tokens grouped across verifier rows so the
+            # SSD runtime loads each unique expert once. The shape-sensitive
+            # router and resident shared expert still use qlen=1 arithmetic.
+            residual = self.mlp(normalized_hidden)
+        else:
+            residual = _apply_per_row(self.mlp, normalized_hidden)
+        return mx.concatenate(
+            [
+                hidden[:, row : row + 1, :] + residual[:, row : row + 1, :]
+                for row in range(x.shape[1])
+            ],
+            axis=1,
+        ), topk_indices
 
 
 class Glm52MTPLayer(nn.Module):
@@ -436,8 +537,17 @@ class Glm52MTPLayer(nn.Module):
             compute_topk=compute_topk,
             kv_read_boundary=kv_read_boundary,
         )
-        recycle_hidden = self.shared_head_norm(hidden)
-        logits = lm_head(recycle_hidden)
+        use_decode_row_math = _use_decode_row_math(
+            int(hidden.shape[1]),
+            cache,
+            kv_read_boundary,
+        )
+        if use_decode_row_math:
+            recycle_hidden = _apply_per_row(self.shared_head_norm, hidden)
+            logits = _apply_per_row(lm_head, recycle_hidden)
+        else:
+            recycle_hidden = self.shared_head_norm(hidden)
+            logits = lm_head(recycle_hidden)
         return logits, recycle_hidden, topk_indices
 
 
@@ -489,6 +599,9 @@ class GlmMoeDsaModel(nn.Module):
                 cache[index],
                 previous_topk,
             )
+        first_layer_cache = cache[0] if cache else None
+        if _use_decode_row_math(int(hidden.shape[1]), first_layer_cache):
+            return _apply_per_row(self.norm, hidden)
         return self.norm(hidden)
 
 
@@ -508,3 +621,13 @@ class Model(DeepseekV32CausalModel):
             else:
                 caches.append(CacheList(KVCache(), KVCache()))
         return caches
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        hidden = self.model(inputs, cache)
+        if _use_decode_row_math(int(hidden.shape[1]), cache):
+            return _apply_per_row(self.lm_head, hidden)
+        return self.lm_head(hidden)

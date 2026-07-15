@@ -18,6 +18,7 @@ from mtplx.generation import (
     _prefill_chunk_cache_cleanup_every,
     _prefill_chunk_size,
     _prefill_committed_mtp_history_streaming,
+    _prefill_with_hidden_sequence,
     _sustained_prefill_layout,
     generate_ar,
     generate_mtpk,
@@ -27,6 +28,7 @@ from mtplx.models.expert_mlx import current_expert_routing_phase
 from mtplx.mtp_patch import MTPContract
 from mtplx.runtime import MTPLXRuntime
 from mtplx.sampling import SamplerConfig
+from mtplx.vision.splice import VisionSplice
 
 
 class TinyTokenizer:
@@ -224,6 +226,22 @@ class CycleTrackingTinyMTPModel(AcceptingTinyMTPModel):
         if kwargs.get("return_hidden", False):
             return logits, hidden
         return logits
+
+
+class VisionTinyMTPModel(CycleTrackingTinyMTPModel):
+    def __init__(self):
+        super().__init__()
+        self.model = SimpleNamespace(
+            embed_tokens=lambda token_ids: mx.zeros(
+                (*token_ids.shape, 2),
+                dtype=mx.float32,
+            )
+        )
+        self.input_embeddings: list[mx.array | None] = []
+
+    def __call__(self, input_ids, *, input_embeddings=None, cache=None, **kwargs):
+        self.input_embeddings.append(input_embeddings)
+        return super().__call__(input_ids, cache=cache, **kwargs)
 
 
 class StopAfterFirstDraftPolicy:
@@ -515,6 +533,7 @@ def test_generate_mtpk_counts_a_fully_accepted_verify_call():
 
 def test_cold_committed_history_reports_exact_rows_and_tps(monkeypatch):
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "0")
+    model = CycleTrackingTinyMTPModel()
     appended: list[tuple[list[int], int]] = []
 
     def append_history(
@@ -529,7 +548,7 @@ def test_cold_committed_history_reports_exact_rows_and_tps(monkeypatch):
 
     monkeypatch.setattr("mtplx.generation._append_mtp_history", append_history)
     output = generate_mtpk(
-        _runtime(CycleTrackingTinyMTPModel(), mtp_enabled=True),
+        _runtime(model, mtp_enabled=True),
         [0, 1, 2, 3],
         max_tokens=1,
         sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
@@ -543,6 +562,30 @@ def test_cold_committed_history_reports_exact_rows_and_tps(monkeypatch):
     assert output.stats.prompt_mtp_history_tokens == 3
     assert output.stats.prompt_mtp_history_time_s == 2.0
     assert output.stats.prompt_mtp_history_tok_s == pytest.approx(1.5)
+    assert [call["tokens"] for call in model.calls] == [3, 1]
+    assert [call["return_hidden"] for call in model.calls] == [True, True]
+
+
+@pytest.mark.parametrize("prompt_ids", [[7], [0, 7]], ids=["only", "final"])
+def test_prefill_with_hidden_sequence_splices_final_vision_token(prompt_ids):
+    model = VisionTinyMTPModel()
+    vision_row = mx.array([[9.0, 10.0]], dtype=mx.float32)
+    splice = VisionSplice(
+        image_pad_token_id=7,
+        embeddings=vision_row,
+    )
+
+    _prefill_with_hidden_sequence(
+        _runtime(model, mtp_enabled=True),
+        prompt_ids,
+        hidden_variant="post_norm",
+        vision_splice=splice,
+    )
+
+    final_embeddings = model.input_embeddings[-1]
+    assert final_embeddings is not None
+    assert mx.array_equal(final_embeddings, vision_row[None, :, :]).item()
+    assert splice.remaining() == 0
 
 
 @pytest.mark.parametrize(

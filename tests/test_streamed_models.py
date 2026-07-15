@@ -10,6 +10,7 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 from mlx.utils import tree_flatten
+from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.activations import swiglu
 from mlx_lm.models.cache import CacheList, KVCache
 from mlx_lm.models.deepseek_v32 import group_expert_select
@@ -17,6 +18,7 @@ from mlx_lm.models.switch_layers import SwitchGLU
 
 import mtplx.models.glm52_mlx as glm52_mlx
 import mtplx.models.expert_mlx as expert_mlx
+from mtplx.attention_context import attention_phase
 from mtplx.expert_manifest import (
     build_expert_manifest,
     load_expert_manifest,
@@ -1300,6 +1302,43 @@ def test_glm52_resident_and_streamed_router_match_near_tie_in_fp32() -> None:
     assert abs(float(streamed_scores[0, 0, 0] - streamed_scores[0, 0, 1])) < 0.001
 
 
+def test_glm52_decode_verify_router_uses_single_row_math(monkeypatch) -> None:
+    args = _glm_args()
+    gate = glm52_mlx.FP32MoEGate(glm52_mlx.MoEGate(args))
+    mx.random.seed(51)
+    hidden = mx.random.normal((1, 3, args.hidden_size)).astype(mx.bfloat16)
+
+    sequential_indices = []
+    sequential_scores = []
+    for row in range(3):
+        indices, scores = gate(hidden[:, row : row + 1, :])
+        sequential_indices.append(indices)
+        sequential_scores.append(scores)
+    sequential_indices = mx.concatenate(sequential_indices, axis=1)
+    sequential_scores = mx.concatenate(sequential_scores, axis=1)
+
+    route_lengths: list[int] = []
+    original_select = glm52_mlx.group_expert_select
+
+    def record_select(logits, *args, **kwargs):
+        route_lengths.append(int(logits.shape[-2]))
+        return original_select(logits, *args, **kwargs)
+
+    monkeypatch.setattr(glm52_mlx, "group_expert_select", record_select)
+    with attention_phase("decode_verify"):
+        batched_indices, batched_scores = gate(hidden)
+    mx.eval(
+        sequential_indices,
+        sequential_scores,
+        batched_indices,
+        batched_scores,
+    )
+
+    assert route_lengths == [1, 1, 1]
+    assert mx.array_equal(batched_indices, sequential_indices).item()
+    assert mx.array_equal(batched_scores, sequential_scores).item()
+
+
 def _glm52_attention_cache(args: GlmArgs, offset: int) -> CacheList:
     main = KVCache()
     indexer = KVCache()
@@ -1312,6 +1351,207 @@ def _glm52_attention_cache(args: GlmArgs, offset: int) -> CacheList:
         mx.zeros((1, 1, offset, 0), dtype=mx.bfloat16),
     )
     return CacheList(main, indexer)
+
+
+def test_glm52_short_multirow_attention_matches_sequential_decode_math(
+    monkeypatch,
+) -> None:
+    args = _glm_args(first_sparse=6)
+    attention = glm52_mlx.GlmMoeDsaAttention(args, 0)
+    attention.set_dtype(mx.bfloat16)
+    attention.indexer = None
+    mx.random.seed(49)
+    prefix_kv = mx.random.normal(
+        (1, 1, 8, args.kv_lora_rank),
+    ).astype(mx.bfloat16)
+    prefix_k_pe = mx.random.normal(
+        (1, 1, 8, args.qk_rope_head_dim),
+    ).astype(mx.bfloat16)
+    hidden = mx.random.normal((1, 3, args.hidden_size)).astype(mx.bfloat16)
+
+    def make_cache() -> CacheList:
+        main = KVCache()
+        main.update_and_fetch(prefix_kv, prefix_k_pe)
+        return CacheList(main)
+
+    sequential_cache = make_cache()
+    sequential_rows = []
+    for row in range(hidden.shape[1]):
+        output, _ = attention(
+            hidden[:, row : row + 1, :],
+            cache=sequential_cache,
+            compute_topk=False,
+        )
+        mx.eval(output)
+        sequential_rows.append(output)
+    sequential = mx.concatenate(sequential_rows, axis=1)
+
+    query_lengths: list[int] = []
+    projection_lengths: list[int] = []
+    original_sdpa = glm52_mlx.scaled_dot_product_attention
+    original_q_a_proj = attention.q_a_proj
+
+    class RecordingProjection(nn.Module):
+        def __call__(self, values):
+            projection_lengths.append(int(values.shape[1]))
+            return original_q_a_proj(values)
+
+    def record_sdpa(queries, *args, **kwargs):
+        query_lengths.append(int(queries.shape[2]))
+        return original_sdpa(queries, *args, **kwargs)
+
+    monkeypatch.setattr(glm52_mlx, "scaled_dot_product_attention", record_sdpa)
+    attention.q_a_proj = RecordingProjection()
+    batched_cache = make_cache()
+    with attention_phase("decode_verify"):
+        batched, _ = attention(
+            hidden,
+            cache=batched_cache,
+            compute_topk=False,
+        )
+    mx.eval(sequential, batched)
+
+    assert query_lengths == [1, 1, 1]
+    assert projection_lengths == [1, 1, 1]
+    assert mx.array_equal(batched, sequential).item()
+
+
+def test_glm52_short_verify_crosses_sparse_threshold_exactly() -> None:
+    args = replace(_glm_args(first_sparse=6), index_topk=4)
+    attention = glm52_mlx.GlmMoeDsaAttention(args, 0)
+    attention.set_dtype(mx.bfloat16)
+    mx.random.seed(52)
+    hidden = mx.random.normal((1, 3, args.hidden_size)).astype(mx.bfloat16)
+
+    sequential_cache = _glm52_attention_cache(args, offset=2)
+    sequential_rows = []
+    for row in range(hidden.shape[1]):
+        output, _ = attention(
+            hidden[:, row : row + 1, :],
+            cache=sequential_cache,
+        )
+        mx.eval(output)
+        sequential_rows.append(output)
+    sequential = mx.concatenate(sequential_rows, axis=1)
+
+    batched_cache = _glm52_attention_cache(args, offset=2)
+    causal_mask = create_attention_mask(
+        hidden,
+        batched_cache[0],
+        return_array=True,
+    )
+    with attention_phase("decode_verify"):
+        batched, _ = attention(
+            hidden,
+            mask=causal_mask,
+            cache=batched_cache,
+        )
+    mx.eval(sequential, batched)
+
+    assert mx.array_equal(batched, sequential).item()
+    for batched_entry, sequential_entry in zip(
+        batched_cache.caches,
+        sequential_cache.caches,
+    ):
+        assert batched_entry.offset == sequential_entry.offset
+        assert mx.array_equal(batched_entry.keys, sequential_entry.keys).item()
+        assert mx.array_equal(batched_entry.values, sequential_entry.values).item()
+
+
+def test_glm52_short_full_model_verify_matches_sequential_decode() -> None:
+    args = _glm_args(layers=2, first_sparse=2)
+    model = GlmModel(args)
+    model.set_dtype(mx.bfloat16)
+    prefix = mx.array([[1, 2]], dtype=mx.int32)
+    verify_tokens = mx.array([[3, 4, 5]], dtype=mx.int32)
+
+    sequential_cache = model.make_cache()
+    batched_cache = model.make_cache()
+    sequential_prefix = model(prefix, cache=sequential_cache)
+    batched_prefix = model(prefix, cache=batched_cache)
+    mx.eval(sequential_prefix, batched_prefix)
+
+    sequential_rows = []
+    for row in range(verify_tokens.shape[1]):
+        logits = model(
+            verify_tokens[:, row : row + 1],
+            cache=sequential_cache,
+        )
+        mx.eval(logits)
+        sequential_rows.append(logits)
+    sequential = mx.concatenate(sequential_rows, axis=1)
+
+    with attention_phase("decode_verify"):
+        batched = model(verify_tokens, cache=batched_cache)
+    mx.eval(sequential, batched)
+
+    assert mx.array_equal(batched, sequential).item()
+    for batched_layer, sequential_layer in zip(batched_cache, sequential_cache):
+        for batched_entry, sequential_entry in zip(
+            batched_layer.caches,
+            sequential_layer.caches,
+        ):
+            assert batched_entry.offset == sequential_entry.offset
+            assert mx.array_equal(batched_entry.keys, sequential_entry.keys).item()
+            assert mx.array_equal(batched_entry.values, sequential_entry.values).item()
+
+
+def test_glm52_short_multirow_sparse_attention_gathers_per_query() -> None:
+    args = _glm_args(first_sparse=6)
+    attention = glm52_mlx.GlmMoeDsaAttention(args, 0)
+    attention.set_dtype(mx.bfloat16)
+    attention.indexer = None
+    mx.random.seed(50)
+    prefix_kv = mx.random.normal(
+        (1, 1, 8, args.kv_lora_rank),
+    ).astype(mx.bfloat16)
+    prefix_k_pe = mx.random.normal(
+        (1, 1, 8, args.qk_rope_head_dim),
+    ).astype(mx.bfloat16)
+    hidden = mx.random.normal((1, 2, args.hidden_size)).astype(mx.bfloat16)
+    topk = mx.array(
+        [
+            [
+                [[0, 2, 4, 8], [1, 3, 8, 9]],
+                [[1, 3, 5, 8], [0, 4, 8, 9]],
+                [[0, 1, 6, 8], [2, 5, 8, 9]],
+                [[2, 4, 7, 8], [3, 6, 8, 9]],
+            ]
+        ]
+    )
+
+    def make_cache() -> CacheList:
+        main = KVCache()
+        main.update_and_fetch(prefix_kv, prefix_k_pe)
+        return CacheList(main)
+
+    sequential_cache = make_cache()
+    first, _ = attention(
+        hidden[:, :1, :],
+        cache=sequential_cache,
+        prev_topk_indices=topk[:, :, :1, :],
+        compute_topk=False,
+    )
+    mx.eval(first)
+    second, _ = attention(
+        hidden[:, 1:, :],
+        cache=sequential_cache,
+        prev_topk_indices=topk[:, :, 1:, :],
+        compute_topk=False,
+    )
+
+    batched_cache = make_cache()
+    with attention_phase("decode_verify"):
+        batched, _ = attention(
+            hidden,
+            cache=batched_cache,
+            prev_topk_indices=topk,
+            compute_topk=False,
+        )
+    sequential = mx.concatenate((first, second), axis=1)
+    mx.eval(sequential, batched)
+
+    assert mx.array_equal(batched, sequential).item()
 
 
 def test_glm52_recurrent_compute_topk_false_never_advances_indexer() -> None:
