@@ -56,6 +56,7 @@ def test_metal_candidate_map_includes_separate_stock_tn4_exact_arms() -> None:
     assert "metal_n24_r2_v16_exact_packed2" in candidates
     assert "metal_n24_r2_v16_exact_direct_packed2" in candidates
     assert "metal_n24_r2_v16_exact_threadgroup_f32_packed2" in candidates
+    assert "metal_n24_r2_v4_exact_stock_tn4_packed2" in candidates
 
 
 def test_packed2_candidate_interleaves_weights_once_at_construction(
