@@ -69,7 +69,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "slot_layout": "component-banks",
     "transient_slots": 8,
     "q2_expert_kernel": "stock",
-    "hy3_router_kernel": "stock",
+    "hy3_router_kernel": "mpp-r1-fused-r2",
     "read_chunk": "8MiB",
     "bypass_page_cache": True,
     "resource_telemetry": False,
@@ -307,9 +307,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--hy3-router-kernel",
-        choices=("stock", "fused-fp32"),
-        default="stock",
-        help="Issue 51 Hy3 router execution arm (default: stock).",
+        choices=(
+            "stock",
+            "steel-r1-fused-r2",
+            "mpp-r1-fused-r2",
+            "mpp-fp32-splitk-r1-fused-r2",
+        ),
+        default="mpp-r1-fused-r2",
+        help=(
+            "Issue 51 authoritative Hy3 router arithmetic mode "
+            "(default: mpp-r1-fused-r2)."
+        ),
     )
     parser.add_argument("--read-chunk", default="8MiB")
     parser.add_argument(
