@@ -318,7 +318,7 @@ def test_bench_prefill_ladder_dry_run_json(monkeypatch, capsys):
     assert payload["prompt"]["style"] == "coding-agent"
     assert payload["prompt"]["format"] == "chat"
     assert payload["prompt"]["enable_thinking"] is False
-    assert payload["prompt"]["policy"] == "coding_agent_tail_v2"
+    assert payload["prompt"]["policy"] == "realistic_programming_v1"
     assert payload["prompt"]["tail_sha256"]
     assert payload["prompt"]["release_valid"] is True
     assert payload["prefill_layout"]["requested"] == "profile"
@@ -333,6 +333,29 @@ def test_bench_prefill_ladder_dry_run_json(monkeypatch, capsys):
     assert payload["profile"]["env"]["MTPLX_LAZY_VERIFY_LOGITS"] == "1"
     assert payload["profile"]["env"]["MTPLX_BATCH_TARGET_ARRAYS"] == "1"
     assert payload["profile"]["env"]["MTPLX_LAZY_TARGET_DISTRIBUTIONS"] == "1"
+
+
+def test_bench_prefill_ladder_dry_run_uses_programming_context_defaults(
+    monkeypatch, capsys
+):
+    import mtplx.prefill_bench as prefill_bench
+
+    monkeypatch.setattr(
+        prefill_bench,
+        "inspect_hardware",
+        lambda: {
+            "chip": "Apple M5 Max",
+            "hardware_acceleration_eligible": True,
+            "hardware_acceleration_confirmed": False,
+        },
+    )
+
+    code = main(["bench", "prefill-ladder", "--dry-run", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["contexts"] == [1024, 2048, 4096, 8192, 16384]
+    assert payload["prompt"]["policy"] == "realistic_programming_v1"
     assert payload["profile"]["env"]["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP"] == "1"
     assert (
         payload["profile"]["env"]["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY"] == "auto"
