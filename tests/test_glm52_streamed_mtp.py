@@ -503,6 +503,8 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
         *,
         expected_revision,
         precision,
+        shared_kernel,
+        shared_kernel_min_depth,
         verified_artifacts,
     ):
         events.append(
@@ -512,6 +514,8 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
                 args,
                 expected_revision,
                 precision,
+                shared_kernel,
+                shared_kernel_min_depth,
                 verified_artifacts,
             )
         )
@@ -527,6 +531,8 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
         *,
         expected_revision,
         mtp_precision,
+        shared_kernel,
+        shared_kernel_min_depth,
         mtp_module,
     ):
         events.append(
@@ -538,6 +544,8 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
                 contract,
                 expected_revision,
                 mtp_precision,
+                shared_kernel,
+                shared_kernel_min_depth,
                 mtp_module,
             )
         )
@@ -579,6 +587,8 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
         runtime.contract,
         "hy3-source-revision",
         "bf16",
+        "stock",
+        3,
         prebuilt_mtp,
     )
     assert tuple_events[1][-1] is verified

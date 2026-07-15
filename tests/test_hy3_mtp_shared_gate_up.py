@@ -2,15 +2,152 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import mlx.core as mx
 import pytest
 
 import mtplx.hy3_mtp_shared_gate_up as shared_gate_up
 from mtplx.hy3_mtp_shared_gate_up import (
+    DepthGatedMTPSharedMLP,
     Hy3MTPGateUpCandidate,
     hy3_mtp_gate_up_savings,
     hy3_mtp_gate_up_candidates,
+    install_depth_gated_mtp_shared_mlp,
     render_hy3_mtp_gate_up_source,
 )
+
+
+def test_depth_gated_exact_shared_mlp_switches_once_per_configured_depth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class Projection:
+        def __init__(self, name: str) -> None:
+            self.weight = f"{name}-weight"
+            self.name = name
+
+        def __call__(self, value):
+            calls.append((self.name, value))
+            return (self.name, value)
+
+    class StockShared:
+        def __init__(self) -> None:
+            self.gate_proj = Projection("gate")
+            self.up_proj = Projection("up")
+            self.down_proj = Projection("down")
+
+        def __call__(self, value):
+            calls.append(("stock", value))
+            return ("stock", value)
+
+    candidate = Hy3MTPGateUpCandidate(
+        n_tile=24,
+        k_vector=16,
+        rows_per_simdgroup=2,
+    )
+
+    def fake_fused(value, gate_weight, up_weight, *, candidate):
+        calls.append(("metal", (value, gate_weight, up_weight, candidate.name)))
+        return ("activated", value)
+
+    monkeypatch.setattr(
+        shared_gate_up,
+        "hy3_mtp_fused_gate_up_swiglu",
+        fake_fused,
+    )
+    module = DepthGatedMTPSharedMLP(
+        StockShared(),
+        candidate=candidate,
+        minimum_depth=3,
+    )
+
+    assert module.active_mode == "stock"
+    assert module("d1") == ("stock", "d1")
+    module.configure_depth(3)
+    assert module.active_mode == "metal-exact"
+    assert module("d3") == ("down", ("activated", "d3"))
+    module.configure_depth(1)
+    assert module.active_mode == "stock"
+    assert module("d1-again") == ("stock", "d1-again")
+    assert calls == [
+        ("stock", "d1"),
+        (
+            "metal",
+            ("d3", "gate-weight", "up-weight", "n24_r2_v16_exact"),
+        ),
+        ("down", ("activated", "d3")),
+        ("stock", "d1-again"),
+    ]
+
+
+def test_depth_gated_shared_mlp_rejects_approximate_or_packed_runtime_arms() -> None:
+    with pytest.raises(ValueError, match="exact split-weight"):
+        DepthGatedMTPSharedMLP(
+            object(),
+            candidate=Hy3MTPGateUpCandidate(
+                n_tile=24,
+                k_vector=16,
+                rows_per_simdgroup=2,
+                activation_mode="fast",
+            ),
+            minimum_depth=3,
+        )
+    with pytest.raises(ValueError, match="exact split-weight"):
+        DepthGatedMTPSharedMLP(
+            object(),
+            candidate=Hy3MTPGateUpCandidate(
+                n_tile=24,
+                k_vector=16,
+                rows_per_simdgroup=2,
+                weight_layout="packed2",
+            ),
+            minimum_depth=3,
+        )
+    with pytest.raises(ValueError, match="minimum_depth"):
+        DepthGatedMTPSharedMLP(
+            object(),
+            candidate=Hy3MTPGateUpCandidate(
+                n_tile=24,
+                k_vector=16,
+                rows_per_simdgroup=2,
+            ),
+            minimum_depth=0,
+        )
+
+
+def test_depth_gated_install_reuses_the_loaded_projection_arrays() -> None:
+    class Weight:
+        def __init__(self, shape) -> None:
+            self.shape = shape
+            self.dtype = mx.bfloat16
+
+    stock = SimpleNamespace(
+        gate_proj=SimpleNamespace(weight=Weight((1536, 4096))),
+        up_proj=SimpleNamespace(weight=Weight((1536, 4096))),
+        down_proj=SimpleNamespace(weight=Weight((4096, 1536))),
+    )
+    mtp = SimpleNamespace(
+        layers=[
+            SimpleNamespace(
+                mtp_block=SimpleNamespace(
+                    mlp=SimpleNamespace(shared_mlp=stock),
+                )
+            )
+        ]
+    )
+
+    assert install_depth_gated_mtp_shared_mlp(mtp, minimum_depth=3) == 1
+    wrapped = mtp.layers[0].mtp_block.mlp.shared_mlp
+    assert isinstance(wrapped, DepthGatedMTPSharedMLP)
+    assert wrapped.stock is stock
+    assert wrapped.stock.gate_proj.weight is stock.gate_proj.weight
+    assert wrapped.stock.up_proj.weight is stock.up_proj.weight
+    assert wrapped.stock.down_proj.weight is stock.down_proj.weight
+    assert not hasattr(wrapped, "gate_weight")
+    assert not hasattr(wrapped, "up_weight")
+    assert not hasattr(wrapped, "down_weight")
 
 
 def test_mtp_gate_up_frontier_is_pinned_to_the_real_m1_shape() -> None:

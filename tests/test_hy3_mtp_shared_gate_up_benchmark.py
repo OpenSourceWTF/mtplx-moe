@@ -61,6 +61,26 @@ def test_metal_candidate_map_includes_separate_stock_tn4_exact_arms() -> None:
     assert "metal_n24_r2_v4_exact_stock_tn4_sum" in candidates
 
 
+def test_k3_refinement_frontier_factors_one_axis_at_a_time() -> None:
+    benchmark = _benchmark_module()
+
+    assert benchmark.K3_REFINEMENT_CANDIDATES == (
+        "metal_n24_r2_v16_exact",
+        "metal_n24_r2_v16_exact_direct",
+        "metal_n24_r2_v16_exact_threadgroup_f32",
+        "metal_n24_r2_v16_exact_striped_tree",
+        "metal_n24_r2_v4_exact_stock_tn4",
+        "metal_n24_r2_v4_exact_stock_tn4_sum",
+        "metal_n24_r2_v16_exact_packed2",
+        "metal_n24_r2_v16_exact_direct_packed2",
+        "metal_n24_r2_v16_exact_threadgroup_f32_packed2",
+        "metal_n24_r2_v4_exact_stock_tn4_packed2",
+    )
+    assert set(benchmark.K3_REFINEMENT_CANDIDATES) <= set(
+        benchmark._metal_candidate_map()
+    )
+
+
 def test_packed2_candidate_interleaves_weights_once_at_construction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

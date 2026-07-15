@@ -40,6 +40,18 @@ from mtplx.models.hy3_mlx import FusedSharedMLP, ModelArgs
 DEFAULT_MODEL = Path("~/.cache/huggingface/hy3-expert-only-mlx-q2").expanduser()
 DEFAULT_MTP = Path("~/.cache/huggingface/hy3-mtp-layer80").expanduser()
 SOURCE_PREFIX = "model.layers.80.mlp.shared_mlp"
+K3_REFINEMENT_CANDIDATES = (
+    "metal_n24_r2_v16_exact",
+    "metal_n24_r2_v16_exact_direct",
+    "metal_n24_r2_v16_exact_threadgroup_f32",
+    "metal_n24_r2_v16_exact_striped_tree",
+    "metal_n24_r2_v4_exact_stock_tn4",
+    "metal_n24_r2_v4_exact_stock_tn4_sum",
+    "metal_n24_r2_v16_exact_packed2",
+    "metal_n24_r2_v16_exact_direct_packed2",
+    "metal_n24_r2_v16_exact_threadgroup_f32_packed2",
+    "metal_n24_r2_v4_exact_stock_tn4_packed2",
+)
 
 
 class InterleavedSharedMLP(nn.Module):
@@ -451,6 +463,14 @@ def main() -> int:
         help="Append all exact Metal M=1 n-tile/k-vector candidates.",
     )
     parser.add_argument(
+        "--k3-refinement-frontier",
+        action="store_true",
+        help=(
+            "Append the exact K=3-focused input, reduction, and packed2 "
+            "factor arms."
+        ),
+    )
+    parser.add_argument(
         "--control-candidate",
         default="stock",
         help="Use stock or a named candidate as the paired timing control.",
@@ -472,6 +492,9 @@ def main() -> int:
         candidates += tuple(
             f"metal_{candidate.name}" for candidate in hy3_mtp_gate_up_candidates()
         )
+    if args.k3_refinement_frontier:
+        candidates += K3_REFINEMENT_CANDIDATES
+    candidates = tuple(dict.fromkeys(candidates))
     depths = tuple(int(part) for part in args.depths.split(",") if part.strip())
     if not candidates or not depths or any(depth < 1 for depth in depths):
         raise ValueError("at least one candidate and positive depth are required")

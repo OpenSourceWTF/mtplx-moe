@@ -5263,6 +5263,12 @@ def generate_mtpk(
     stop_token_ids = (
         _default_stop_tokens(rt.tokenizer) if stop_token_ids is None else stop_token_ids
     )
+    configure_mtp_depth = getattr(rt, "configure_mtp_execution_depth", None)
+    if callable(configure_mtp_depth):
+        # One selector swap per fixed-depth generation keeps the MTP operator
+        # hot path branch-free while allowing the same loaded runtime to run a
+        # K=0..7 qualification matrix.
+        configure_mtp_depth(speculative_depth)
     started_all = time.perf_counter()
     repetition_config = _repetition_stop_config(bool(repetition_stop))
     repetition_result: RepetitionStopResult | None = None

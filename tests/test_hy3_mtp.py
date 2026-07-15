@@ -464,6 +464,56 @@ def test_default_build_precision_is_bf16_with_no_quantized_modules(
     assert all(name.startswith("layers.0.") for name in parameters)
 
 
+def test_bf16_build_installs_explicit_depth_gated_exact_shared_kernel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = _tiny_args()
+    _write_tiny_bf16_artifact(tmp_path)
+    observed = {}
+
+    def fake_install(mtp, *, minimum_depth):
+        observed["mtp"] = mtp
+        observed["minimum_depth"] = minimum_depth
+        return 1
+
+    monkeypatch.setattr(
+        "mtplx.hy3_mtp_shared_gate_up.install_depth_gated_mtp_shared_mlp",
+        fake_install,
+    )
+    mtp = build_hy3_mtp_module(
+        tmp_path,
+        args,
+        expected_revision=TEST_REVISION,
+        shared_kernel="metal-exact",
+        shared_kernel_min_depth=3,
+    )
+
+    assert observed == {"mtp": mtp, "minimum_depth": 3}
+
+
+def test_shared_kernel_selection_fails_closed_before_artifact_loading(
+    tmp_path: Path,
+) -> None:
+    args = _tiny_args()
+
+    with pytest.raises(Hy3MTPLoadError, match="shared kernel"):
+        build_hy3_mtp_module(tmp_path, args, shared_kernel="unknown")
+    with pytest.raises(Hy3MTPLoadError, match="positive integer"):
+        build_hy3_mtp_module(
+            tmp_path,
+            args,
+            shared_kernel_min_depth=0,
+        )
+    with pytest.raises(Hy3MTPLoadError, match="requires the BF16"):
+        build_hy3_mtp_module(
+            tmp_path,
+            args,
+            precision="q4",
+            shared_kernel="metal-exact",
+        )
+
+
 def test_bf16_head_forward_produces_finite_logits_and_hidden(
     tmp_path: Path,
 ) -> None:

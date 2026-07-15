@@ -142,6 +142,8 @@ class ExpertStreamingConfig:
     resource_telemetry: bool = False
     q2_expert_kernel: str = "stock"
     hy3_router_kernel: str = "stock"
+    hy3_mtp_shared_kernel: str = "stock"
+    hy3_mtp_shared_kernel_min_depth: int = 3
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -189,6 +191,19 @@ class ExpertStreamingConfig:
             )
         if self.hy3_router_kernel not in {"stock", "fused-fp32"}:
             raise ValueError("hy3_router_kernel must be 'stock' or 'fused-fp32'")
+        if self.hy3_mtp_shared_kernel not in {"stock", "metal-exact"}:
+            raise ValueError(
+                "hy3_mtp_shared_kernel must be 'stock' or 'metal-exact'"
+            )
+        object.__setattr__(
+            self,
+            "hy3_mtp_shared_kernel_min_depth",
+            _integer(
+                "hy3_mtp_shared_kernel_min_depth",
+                self.hy3_mtp_shared_kernel_min_depth,
+                minimum=1,
+            ),
+        )
         if self.slot_layout not in {
             "direct-slots",
             "component-banks",

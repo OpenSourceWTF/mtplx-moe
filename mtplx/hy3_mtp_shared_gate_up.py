@@ -24,6 +24,7 @@ HY3_MTP_REDUCTION_LAYOUTS = (
 )
 HY3_MTP_INPUT_MODES = ("threadgroup", "threadgroup_f32", "direct")
 HY3_MTP_WEIGHT_LAYOUTS = ("split", "packed2")
+HY3_MTP_SHARED_KERNELS = ("stock", "metal-exact")
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,13 @@ class Hy3MTPGateUpCandidate:
         if self.weight_layout != "split":
             name += f"_{self.weight_layout}"
         return name
+
+
+HY3_MTP_K3_EXACT_CANDIDATE = Hy3MTPGateUpCandidate(
+    n_tile=24,
+    k_vector=16,
+    rows_per_simdgroup=2,
+)
 
 
 def hy3_mtp_gate_up_candidates(
@@ -460,6 +468,126 @@ class MetalFusedMTPSharedMLP(nn.Module):
     def __call__(self, value: mx.array) -> mx.array:
         activated = self.activate(value)
         return mx.matmul(activated, self.down_weight.T)
+
+
+class DepthGatedMTPSharedMLP(nn.Module):
+    """Select stock or exact Metal once per configured speculative depth.
+
+    The wrapper owns only the original shared MLP.  The Metal path reads that
+    module's existing gate/up/down arrays, so selecting it creates no duplicate
+    resident weights.  ``configure_depth`` swaps a bound callable before a
+    generation begins; ``__call__`` contains no per-dispatch flag branch.
+    """
+
+    def __init__(
+        self,
+        stock: Any,
+        *,
+        candidate: Hy3MTPGateUpCandidate = HY3_MTP_K3_EXACT_CANDIDATE,
+        minimum_depth: int = 3,
+    ) -> None:
+        super().__init__()
+        if (
+            candidate.activation_mode != "exact"
+            or candidate.weight_layout != "split"
+        ):
+            raise ValueError(
+                "depth-gated runtime requires an exact split-weight candidate"
+            )
+        if isinstance(minimum_depth, bool) or not isinstance(minimum_depth, int):
+            raise TypeError("minimum_depth must be an integer")
+        if minimum_depth < 1:
+            raise ValueError("minimum_depth must be positive")
+        self.stock = stock
+        self.candidate = candidate
+        self.minimum_depth = minimum_depth
+        self.active_mode = "stock"
+        self._active_call = self._call_stock
+
+    def _call_stock(self, value: mx.array) -> mx.array:
+        return self.stock(value)
+
+    def _call_exact(self, value: mx.array) -> mx.array:
+        activated = hy3_mtp_fused_gate_up_swiglu(
+            value,
+            self.stock.gate_proj.weight,
+            self.stock.up_proj.weight,
+            candidate=self.candidate,
+        )
+        return self.stock.down_proj(activated)
+
+    def configure_depth(self, depth: int) -> str:
+        """Swap the active implementation for one complete generation."""
+
+        if isinstance(depth, bool) or not isinstance(depth, int):
+            raise TypeError("depth must be an integer")
+        if depth < 0:
+            raise ValueError("depth must be non-negative")
+        if depth >= self.minimum_depth:
+            self.active_mode = "metal-exact"
+            self._active_call = self._call_exact
+        else:
+            self.active_mode = "stock"
+            self._active_call = self._call_stock
+        return self.active_mode
+
+    def __call__(self, value: mx.array) -> mx.array:
+        return self._active_call(value)
+
+
+def install_depth_gated_mtp_shared_mlp(
+    mtp: Any,
+    *,
+    minimum_depth: int = 3,
+    candidate: Hy3MTPGateUpCandidate = HY3_MTP_K3_EXACT_CANDIDATE,
+) -> int:
+    """Wrap every Hy3 MTP shared MLP after strict weight loading."""
+
+    layers = getattr(mtp, "layers", None)
+    if not isinstance(layers, list) or not layers:
+        raise ValueError("Hy3 MTP module exposes no layers to wrap")
+    installed = 0
+    for layer in layers:
+        shared = layer.mtp_block.mlp.shared_mlp
+        if isinstance(shared, DepthGatedMTPSharedMLP):
+            if shared.minimum_depth != minimum_depth or shared.candidate != candidate:
+                raise ValueError("Hy3 MTP shared MLP is already wrapped differently")
+            installed += 1
+            continue
+        required = ("gate_proj", "up_proj", "down_proj")
+        if any(not hasattr(shared, name) for name in required):
+            raise ValueError("Hy3 MTP shared MLP does not expose split projections")
+        gate_weight = shared.gate_proj.weight
+        up_weight = shared.up_proj.weight
+        down_weight = shared.down_proj.weight
+        expected_gate_up = (
+            HY3_MTP_SHARED_INTERMEDIATE_SIZE,
+            HY3_MTP_HIDDEN_SIZE,
+        )
+        expected_down = (
+            HY3_MTP_HIDDEN_SIZE,
+            HY3_MTP_SHARED_INTERMEDIATE_SIZE,
+        )
+        if tuple(gate_weight.shape) != expected_gate_up:
+            raise ValueError(
+                f"Hy3 MTP gate weight must have shape {expected_gate_up}"
+            )
+        if tuple(up_weight.shape) != expected_gate_up:
+            raise ValueError(f"Hy3 MTP up weight must have shape {expected_gate_up}")
+        if tuple(down_weight.shape) != expected_down:
+            raise ValueError(f"Hy3 MTP down weight must have shape {expected_down}")
+        if any(
+            weight.dtype != mx.bfloat16
+            for weight in (gate_weight, up_weight, down_weight)
+        ):
+            raise ValueError("depth-gated Hy3 MTP shared weights must be BF16")
+        layer.mtp_block.mlp.shared_mlp = DepthGatedMTPSharedMLP(
+            shared,
+            candidate=candidate,
+            minimum_depth=minimum_depth,
+        )
+        installed += 1
+    return installed
 
 
 class MetalPackedFusedMTPSharedMLP(nn.Module):

@@ -444,6 +444,31 @@ def test_generate_mtpk_rejects_fresh_recurrent_cache_before_prefill():
     assert model.calls == []
 
 
+def test_generate_mtpk_configures_one_depth_gated_operator_mode_before_prefill():
+    class DepthConfiguredModel(CycleTrackingTinyMTPModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.configured_depths: list[int] = []
+
+        def configure_mtp_execution_depth(self, depth: int) -> None:
+            assert self.calls == []
+            self.configured_depths.append(depth)
+
+    model = DepthConfiguredModel()
+    generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=2,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=3,
+        mtp_history_policy="cycle",
+        verify_strategy="batched",
+        stop_token_ids=set(),
+    )
+
+    assert model.configured_depths == [3]
+
+
 def test_generate_mtpk_cycle_cleanup_precedes_rejection_verify():
     model = CycleTrackingTinyMTPModel(draft_token=2, target_verify_token=1)
 
