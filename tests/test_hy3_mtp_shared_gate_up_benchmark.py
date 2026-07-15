@@ -6,6 +6,8 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 def _benchmark_module():
     path = Path(__file__).parents[1] / "benchmarks" / "hy3_mtp_shared_gate_up.py"
@@ -51,3 +53,62 @@ def test_metal_candidate_map_includes_separate_stock_tn4_exact_arms() -> None:
     assert "metal_n24_r2_v4_exact_stock_tn4_direct" in candidates
     assert "metal_n24_r2_v16_exact_direct" in candidates
     assert "metal_n24_r2_v16_exact_threadgroup_f32" in candidates
+    assert "metal_n24_r2_v16_exact_packed2" in candidates
+
+
+def test_packed2_candidate_interleaves_weights_once_at_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    benchmark = _benchmark_module()
+    gate, up, down, packed = object(), object(), object(), object()
+    observed = {}
+
+    def fake_stack(values, *, axis):
+        observed["stack"] = (values, axis)
+        return packed
+
+    class FakePackedModule:
+        def __init__(self, packed_weight, down_weight, *, candidate):
+            observed["module"] = (packed_weight, down_weight, candidate)
+
+        def parameters(self):
+            return ()
+
+    monkeypatch.setattr(benchmark.mx, "stack", fake_stack)
+    monkeypatch.setattr(benchmark.mx, "eval", lambda *_args: None)
+    monkeypatch.setattr(benchmark, "MetalPackedFusedMTPSharedMLP", FakePackedModule)
+
+    module = benchmark._candidate_shared(
+        "metal_n24_r2_v16_exact_packed2",
+        SimpleNamespace(),
+        gate,
+        up,
+        down,
+    )
+
+    assert isinstance(module, FakePackedModule)
+    assert observed["stack"] == ((gate, up), -1)
+    packed_weight, down_weight, candidate = observed["module"]
+    assert packed_weight is packed
+    assert down_weight is down
+    assert candidate.weight_layout == "packed2"
+
+
+def test_candidate_extra_bytes_distinguishes_benchmark_only_packing() -> None:
+    benchmark = _benchmark_module()
+
+    assert benchmark._candidate_extra_bytes("block", gate_up_bytes=1234) == 1234
+    assert (
+        benchmark._candidate_extra_bytes(
+            "metal_n24_r2_v16_exact_packed2",
+            gate_up_bytes=1234,
+        )
+        == 1234
+    )
+    assert (
+        benchmark._candidate_extra_bytes(
+            "metal_n24_r2_v16_exact",
+            gate_up_bytes=1234,
+        )
+        == 0
+    )

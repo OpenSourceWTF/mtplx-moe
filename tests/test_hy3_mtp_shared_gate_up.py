@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+import mtplx.hy3_mtp_shared_gate_up as shared_gate_up
 from mtplx.hy3_mtp_shared_gate_up import (
     Hy3MTPGateUpCandidate,
     hy3_mtp_gate_up_savings,
@@ -53,6 +54,8 @@ def test_mtp_gate_up_candidate_rejects_invalid_tiling() -> None:
         )
     with pytest.raises(ValueError, match="input_mode"):
         Hy3MTPGateUpCandidate(n_tile=4, k_vector=4, input_mode="unknown")
+    with pytest.raises(ValueError, match="weight_layout"):
+        Hy3MTPGateUpCandidate(n_tile=4, k_vector=4, weight_layout="unknown")
 
 
 def test_mtp_gate_up_source_caches_m1_input_and_selects_exact_math() -> None:
@@ -141,6 +144,47 @@ def test_mtp_gate_up_fp32_cache_converts_input_once_during_fill() -> None:
     assert savings["input_device_load_instruction_bytes"] == 786_432
     assert savings["input_threadgroup_load_instruction_bytes"] == 37_748_736
     assert savings["input_bf16_to_fp32_conversions"] == 393_216
+
+
+def test_mtp_gate_up_packed2_source_vector_loads_interleaved_gate_up() -> None:
+    candidate = Hy3MTPGateUpCandidate(
+        n_tile=24,
+        k_vector=16,
+        rows_per_simdgroup=2,
+        weight_layout="packed2",
+    )
+
+    source = render_hy3_mtp_gate_up_source(candidate)
+
+    assert candidate.name == "n24_r2_v16_exact_packed2"
+    assert "device const vec<T, 2>* packed_pairs" in source
+    assert "vec<T, 2> weight_pair = packed_pairs[n * K + k];" in source
+    assert "float(weight_pair[0])" in source
+    assert "float(weight_pair[1])" in source
+    assert "gate_weight" not in source
+    assert "up_weight" not in source
+
+
+def test_mtp_gate_up_packed2_kernel_declares_one_weight_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = Hy3MTPGateUpCandidate(
+        n_tile=24,
+        k_vector=16,
+        rows_per_simdgroup=2,
+        weight_layout="packed2",
+    )
+    captured = {}
+
+    def fake_metal_kernel(**kwargs):
+        captured.update(kwargs)
+        return "kernel"
+
+    shared_gate_up._KERNEL_CACHE.clear()
+    monkeypatch.setattr(shared_gate_up.mx.fast, "metal_kernel", fake_metal_kernel)
+
+    assert shared_gate_up.build_hy3_mtp_gate_up_kernel(candidate) == "kernel"
+    assert captured["input_names"] == ["input_values", "packed_weight"]
 
 
 def test_mtp_gate_up_savings_are_explicit_at_k3() -> None:

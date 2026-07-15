@@ -29,6 +29,7 @@ from mtplx.hy3_mtp_patch import build_hy3_mtp_module
 from mtplx.hy3_mtp_shared_gate_up import (
     Hy3MTPGateUpCandidate,
     MetalFusedMTPSharedMLP,
+    MetalPackedFusedMTPSharedMLP,
     hy3_mtp_gate_up_candidates,
     hy3_mtp_gate_up_savings,
 )
@@ -136,7 +137,22 @@ def _metal_candidate_map() -> dict[str, Hy3MTPGateUpCandidate]:
         activation_modes=("exact",),
         input_modes=("direct", "threadgroup_f32"),
     )
+    candidates += hy3_mtp_gate_up_candidates(
+        activation_modes=("exact",),
+        weight_layouts=("packed2",),
+    )
     return {f"metal_{candidate.name}": candidate for candidate in candidates}
+
+
+def _candidate_extra_bytes(name: str, *, gate_up_bytes: int) -> int:
+    """Return benchmark-only packing bytes; production releases source arrays."""
+
+    if name == "block":
+        return int(gate_up_bytes)
+    candidate = _metal_candidate_map().get(name)
+    if candidate is not None and candidate.weight_layout == "packed2":
+        return int(gate_up_bytes)
+    return 0
 
 
 def _candidate_shared(
@@ -157,12 +173,20 @@ def _candidate_shared(
         candidate = metal_candidates.get(name)
         if candidate is None:
             raise ValueError(f"unknown candidate {name!r}")
-        module = MetalFusedMTPSharedMLP(
-            gate,
-            up,
-            down,
-            candidate=candidate,
-        )
+        if candidate.weight_layout == "packed2":
+            packed_weight = mx.stack((gate, up), axis=-1)
+            module = MetalPackedFusedMTPSharedMLP(
+                packed_weight,
+                down,
+                candidate=candidate,
+            )
+        else:
+            module = MetalFusedMTPSharedMLP(
+                gate,
+                up,
+                down,
+                candidate=candidate,
+            )
     else:
         raise ValueError(f"unknown candidate {name!r}")
     mx.eval(module.parameters())
@@ -517,6 +541,7 @@ def main() -> int:
 
     shared_params = int(gate.size + up.size + down.size)
     gate_up_params = int(gate.size + up.size)
+    gate_up_bytes = int(gate.nbytes + up.nbytes)
     metal_candidates = _metal_candidate_map()
     candidate_savings_at_k3 = {}
     for name in candidates:
@@ -571,11 +596,15 @@ def main() -> int:
         "parameters": {
             "gate_up": gate_up_params,
             "shared_mlp_total": shared_params,
-            "gate_up_bytes": int(gate.nbytes + up.nbytes),
+            "gate_up_bytes": gate_up_bytes,
             "shared_mlp_total_bytes": int(gate.nbytes + up.nbytes + down.nbytes),
             "candidate_steady_extra_bytes_after_source_release": 0,
-            "benchmark_extra_bytes_per_packed_candidate": int(gate.nbytes + up.nbytes),
-            "benchmark_extra_bytes_per_metal_candidate": 0,
+            "benchmark_extra_bytes_per_packed_candidate": gate_up_bytes,
+            "benchmark_extra_bytes_per_split_metal_candidate": 0,
+            "benchmark_extra_bytes_by_module": {
+                name: _candidate_extra_bytes(name, gate_up_bytes=gate_up_bytes)
+                for name in module_names
+            },
         },
         "dispatch_contract": {
             "control_gate_up_matmuls_per_depth": 2,

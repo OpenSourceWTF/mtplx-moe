@@ -18,6 +18,7 @@ HY3_MTP_ROWS_PER_SIMDGROUP = (1, 2, 4, 8)
 HY3_MTP_ACTIVATION_MODES = ("exact", "fast")
 HY3_MTP_REDUCTION_LAYOUTS = ("striped", "stock_tn4")
 HY3_MTP_INPUT_MODES = ("threadgroup", "threadgroup_f32", "direct")
+HY3_MTP_WEIGHT_LAYOUTS = ("split", "packed2")
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class Hy3MTPGateUpCandidate:
     activation_mode: str = "exact"
     reduction_layout: str = "striped"
     input_mode: str = "threadgroup"
+    weight_layout: str = "split"
 
     def __post_init__(self) -> None:
         if self.n_tile not in HY3_MTP_N_TILES:
@@ -57,6 +59,8 @@ class Hy3MTPGateUpCandidate:
             raise ValueError("stock_tn4 reduction_layout requires k_vector=4")
         if self.input_mode not in HY3_MTP_INPUT_MODES:
             raise ValueError(f"input_mode must be one of {HY3_MTP_INPUT_MODES}")
+        if self.weight_layout not in HY3_MTP_WEIGHT_LAYOUTS:
+            raise ValueError(f"weight_layout must be one of {HY3_MTP_WEIGHT_LAYOUTS}")
 
     @property
     def threads(self) -> int:
@@ -72,6 +76,8 @@ class Hy3MTPGateUpCandidate:
             name += f"_{self.reduction_layout}"
         if self.input_mode != "threadgroup":
             name += f"_{self.input_mode}"
+        if self.weight_layout != "split":
+            name += f"_{self.weight_layout}"
         return name
 
 
@@ -80,6 +86,7 @@ def hy3_mtp_gate_up_candidates(
     activation_modes: tuple[str, ...] = ("exact",),
     reduction_layouts: tuple[str, ...] = ("striped",),
     input_modes: tuple[str, ...] = ("threadgroup",),
+    weight_layouts: tuple[str, ...] = ("split",),
 ) -> tuple[Hy3MTPGateUpCandidate, ...]:
     """Return the exhaustive shape-specific tiling frontier."""
 
@@ -92,6 +99,9 @@ def hy3_mtp_gate_up_candidates(
     unknown_input_modes = set(input_modes) - set(HY3_MTP_INPUT_MODES)
     if unknown_input_modes:
         raise ValueError(f"unknown input modes: {sorted(unknown_input_modes)}")
+    unknown_weight_layouts = set(weight_layouts) - set(HY3_MTP_WEIGHT_LAYOUTS)
+    if unknown_weight_layouts:
+        raise ValueError(f"unknown weight layouts: {sorted(unknown_weight_layouts)}")
     return tuple(
         Hy3MTPGateUpCandidate(
             n_tile=n_tile,
@@ -100,8 +110,10 @@ def hy3_mtp_gate_up_candidates(
             activation_mode=activation_mode,
             reduction_layout=reduction_layout,
             input_mode=input_mode,
+            weight_layout=weight_layout,
         )
-        for input_mode, reduction_layout, activation_mode, n_tile, rows_per_simdgroup, k_vector in product(
+        for weight_layout, input_mode, reduction_layout, activation_mode, n_tile, rows_per_simdgroup, k_vector in product(
+            weight_layouts,
             input_modes,
             reduction_layouts,
             activation_modes,
@@ -154,6 +166,19 @@ def render_hy3_mtp_gate_up_source(candidate: Hy3MTPGateUpCandidate) -> str:
     activation_source = (
         "input_values[k]" if candidate.input_mode == "direct" else "activation_tile[k]"
     )
+    if candidate.weight_layout == "packed2":
+        weight_prelude = (
+            "device const vec<T, 2>* packed_pairs = "
+            "reinterpret_cast<device const vec<T, 2>*>(packed_weight);"
+        )
+        weight_load = "vec<T, 2> weight_pair = packed_pairs[n * K + k];"
+        gate_weight_value = "weight_pair[0]"
+        up_weight_value = "weight_pair[1]"
+    else:
+        weight_prelude = ""
+        weight_load = ""
+        gate_weight_value = "gate_weight[n * K + k]"
+        up_weight_value = "up_weight[n * K + k]"
     return f"""
         constexpr uint K = {HY3_MTP_HIDDEN_SIZE};
         constexpr uint N = {HY3_MTP_SHARED_INTERMEDIATE_SIZE};
@@ -167,6 +192,7 @@ def render_hy3_mtp_gate_up_source(candidate: Hy3MTPGateUpCandidate) -> str:
         uint lane = thread_index_in_simdgroup;
         uint n_base = (threadgroup_position_in_grid.x * N_TILE + simd_id)
             * ROWS_PER_SIMDGROUP;
+        {weight_prelude}
 
         {input_prelude}
 
@@ -182,11 +208,12 @@ def render_hy3_mtp_gate_up_source(candidate: Hy3MTPGateUpCandidate) -> str:
                 _Pragma("clang loop unroll(full)")
                 for (uint row = 0; row < ROWS_PER_SIMDGROUP; ++row) {{
                     uint n = n_base + row;
+                    {weight_load}
                     gate_sum[row] += (
-                        activation * float(gate_weight[n * K + k])
+                        activation * float({gate_weight_value})
                     );
                     up_sum[row] += (
-                        activation * float(up_weight[n * K + k])
+                        activation * float({up_weight_value})
                     );
                 }}
             }}
@@ -284,9 +311,14 @@ def build_hy3_mtp_gate_up_kernel(candidate: Hy3MTPGateUpCandidate) -> Any:
     cached = _KERNEL_CACHE.get(candidate)
     if cached is not None:
         return cached
+    input_names = (
+        ["input_values", "packed_weight"]
+        if candidate.weight_layout == "packed2"
+        else ["input_values", "gate_weight", "up_weight"]
+    )
     kernel = mx.fast.metal_kernel(
         name=f"mtplx_hy3_mtp_gate_up_{candidate.name}",
-        input_names=["input_values", "gate_weight", "up_weight"],
+        input_names=input_names,
         output_names=["output_values"],
         source=render_hy3_mtp_gate_up_source(candidate),
     )
@@ -311,6 +343,23 @@ def _validate_arrays(
         raise ValueError("Hy3 MTP fused gate/up requires BF16 inputs and weights")
 
 
+def _validate_packed_arrays(value: mx.array, packed_weight: mx.array) -> None:
+    expected_input = (1, 1, HY3_MTP_HIDDEN_SIZE)
+    expected_packed = (
+        HY3_MTP_SHARED_INTERMEDIATE_SIZE,
+        HY3_MTP_HIDDEN_SIZE,
+        2,
+    )
+    if tuple(value.shape) != expected_input:
+        raise ValueError(f"Hy3 MTP fused gate/up requires input {expected_input}")
+    if tuple(packed_weight.shape) != expected_packed:
+        raise ValueError(
+            f"Hy3 MTP packed gate/up weight must have shape {expected_packed}"
+        )
+    if value.dtype != mx.bfloat16 or packed_weight.dtype != mx.bfloat16:
+        raise ValueError("Hy3 MTP packed gate/up requires BF16 input and weights")
+
+
 def hy3_mtp_fused_gate_up_swiglu(
     value: mx.array,
     gate_weight: mx.array,
@@ -320,6 +369,8 @@ def hy3_mtp_fused_gate_up_swiglu(
 ) -> mx.array:
     """Run one fused shape-pinned M=1 gate/up/SwiGLU operation."""
 
+    if candidate.weight_layout != "split":
+        raise ValueError("split gate/up arrays require weight_layout='split'")
     _validate_arrays(value, gate_weight, up_weight)
     kernel = build_hy3_mtp_gate_up_kernel(candidate)
     groups = HY3_MTP_SHARED_INTERMEDIATE_SIZE // (
@@ -330,6 +381,35 @@ def hy3_mtp_fused_gate_up_swiglu(
             mx.contiguous(value.reshape(HY3_MTP_HIDDEN_SIZE)),
             mx.contiguous(gate_weight),
             mx.contiguous(up_weight),
+        ],
+        template=[("T", mx.bfloat16)],
+        grid=(candidate.threads * groups, 1, 1),
+        threadgroup=(candidate.threads, 1, 1),
+        output_shapes=[(HY3_MTP_SHARED_INTERMEDIATE_SIZE,)],
+        output_dtypes=[mx.bfloat16],
+    )
+    return output.reshape(1, 1, HY3_MTP_SHARED_INTERMEDIATE_SIZE)
+
+
+def hy3_mtp_fused_packed_gate_up_swiglu(
+    value: mx.array,
+    packed_weight: mx.array,
+    *,
+    candidate: Hy3MTPGateUpCandidate,
+) -> mx.array:
+    """Run fused M=1 gate/up/SwiGLU from [N,K,2] interleaved BF16 pairs."""
+
+    if candidate.weight_layout != "packed2":
+        raise ValueError("packed gate/up array requires weight_layout='packed2'")
+    _validate_packed_arrays(value, packed_weight)
+    kernel = build_hy3_mtp_gate_up_kernel(candidate)
+    groups = HY3_MTP_SHARED_INTERMEDIATE_SIZE // (
+        candidate.n_tile * candidate.rows_per_simdgroup
+    )
+    (output,) = kernel(
+        inputs=[
+            mx.contiguous(value.reshape(HY3_MTP_HIDDEN_SIZE)),
+            mx.contiguous(packed_weight),
         ],
         template=[("T", mx.bfloat16)],
         grid=(candidate.threads * groups, 1, 1),
@@ -364,6 +444,35 @@ class MetalFusedMTPSharedMLP(nn.Module):
             value,
             self.gate_weight,
             self.up_weight,
+            candidate=self.candidate,
+        )
+
+    def __call__(self, value: mx.array) -> mx.array:
+        activated = self.activate(value)
+        return mx.matmul(activated, self.down_weight.T)
+
+
+class MetalPackedFusedMTPSharedMLP(nn.Module):
+    """Fused shared MLP retaining only packed gate/up pairs and down weight."""
+
+    def __init__(
+        self,
+        packed_weight: mx.array,
+        down_weight: mx.array,
+        *,
+        candidate: Hy3MTPGateUpCandidate,
+    ):
+        super().__init__()
+        self.packed_weight = packed_weight
+        self.down_weight = down_weight
+        self.candidate = candidate
+
+    def activate(self, value: mx.array) -> mx.array:
+        """Return the fused gate/up/SwiGLU boundary before down projection."""
+
+        return hy3_mtp_fused_packed_gate_up_swiglu(
+            value,
+            self.packed_weight,
             candidate=self.candidate,
         )
 
