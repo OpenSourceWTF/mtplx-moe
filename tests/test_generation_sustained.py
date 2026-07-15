@@ -659,6 +659,21 @@ def test_device_k_draft_preserves_serial_tokens_and_verification(
     assert compiled.stats.accepted_by_depth == stock.stats.accepted_by_depth
     assert compiled.stats.evaluated_by_depth == stock.stats.evaluated_by_depth
     assert compiled.stats.verify_calls == stock.stats.verify_calls
+    trace_fields = ("depth", "token", "accepted", "accept_probability", "correction")
+    assert [
+        {name: draft.get(name) for name in trace_fields}
+        for draft in compiled.stats.events[0]["drafts"]
+    ] == [
+        {name: draft.get(name) for name in trace_fields}
+        for draft in stock.stats.events[0]["drafts"]
+    ]
+    assert (
+        compiled.stats.events[0]["accepted_depths"]
+        == stock.stats.events[0]["accepted_depths"]
+    )
+    assert compiled.stats.events[0].get("rejected_at_depth") == stock.stats.events[
+        0
+    ].get("rejected_at_depth")
     assert compiled.stats.events[0]["verify_strategy"] == "batched"
     assert compiled.stats.draft_core["selected"] == "device-k"
     assert compiled.stats.draft_core["per_depth"][str(depth)]["calls"] == 1
@@ -666,6 +681,35 @@ def test_device_k_draft_preserves_serial_tokens_and_verification(
     assert compiled.stats.draft_core["fallbacks"] == 0
     assert compiled.stats.draft_core["organic_compile_calls"] == 0
     assert compiled.stats.draft_core["per_depth"][str(depth)]["live_cache_commits"] == 1
+    assert compiled.stats.draft_core["per_depth"][str(depth)]["host_syncs"] == 0
+    assert (
+        compiled.stats.draft_core["per_depth"][str(depth)]["host_token_transfers"] == 0
+    )
+    assert (
+        compiled.stats.draft_core["per_depth"][str(depth)]["device_handoff_calls"] == 1
+    )
+    assert (
+        compiled.stats.draft_core["per_depth"][str(depth)]["acceptance_host_transfers"]
+        == 1
+    )
+    assert (
+        compiled.stats.draft_core["per_depth"][str(depth)]["per_row_argmax_host_reads"]
+        == 0
+    )
+    assert compiled.stats.events[0]["draft_device_handoff"]["enabled"] is True
+    assert compiled.stats.events[0]["draft_device_handoff"]["proposal_rows"] == depth
+    assert compiled.stats.events[0]["draft_device_handoff"]["verify_rows"] == depth + 1
+    assert compiled.stats.draft_core["device_handoff"] == {
+        "schema": "compiled-mtp-device-handoff-v1",
+        "full_verify_width": True,
+        "calls": 1,
+        "fallbacks": 0,
+        "fallback_reasons": {},
+        "acceptance_host_transfers": 1,
+        "acceptance_payload_ints": depth + 3,
+        "per_row_argmax_host_reads": 0,
+        "qualification_eligible": True,
+    }
     assert compiled.stats.events[0]["draft_core_dispatch"][
         "primary_optimized_depth"
     ] is (depth == 3)
@@ -721,6 +765,84 @@ def test_device_k_prewarm_failure_falls_back_without_dispatch(monkeypatch):
     assert bank.run_calls == 0
     assert output.stats.draft_core["selected"] == "stock"
     assert output.stats.draft_core["fallback_reasons"] == {"prewarm:RuntimeError": 1}
+
+
+def test_device_k_handoff_setup_failure_falls_back_before_state_commit(monkeypatch):
+    import mtplx.generation as generation
+
+    monkeypatch.setattr(generation.mx, "compile", lambda fn: fn)
+
+    def fail_before_commit(self, *_args, **_kwargs):
+        del self
+        raise RuntimeError("synthetic device handoff setup failure")
+
+    monkeypatch.setattr(
+        generation.CompiledMTPDraftBank,
+        "run_device",
+        fail_before_commit,
+    )
+
+    output = generate_mtpk(
+        _runtime(CompilableCycleTrackingTinyMTPModel(), mtp_enabled=True),
+        [0, 1],
+        max_tokens=4,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=3,
+        mtp_history_policy="committed",
+        verify_strategy="batched",
+        draft_core="device-k",
+        stop_token_ids=set(),
+    )
+
+    assert output.tokens == [1, 1, 1, 1]
+    assert output.stats.draft_core["selected"] == "stock"
+    assert output.stats.draft_core["fallbacks"] == 1
+    assert output.stats.draft_core["fallback_reasons"] == {"dispatch:RuntimeError": 1}
+    assert output.stats.draft_core["device_handoff"]["fallbacks"] == 1
+    assert output.stats.draft_core["device_handoff"]["fallback_reasons"] == {
+        "dispatch:RuntimeError": 1
+    }
+    assert output.stats.events[0]["draft_core_fallback"]["reason"] == (
+        "dispatch:RuntimeError"
+    )
+
+
+def test_device_k_full_width_handoff_preserves_lazy_bonus_host_path(monkeypatch):
+    import mtplx.generation as generation
+
+    monkeypatch.setattr(generation.mx, "compile", lambda fn: fn)
+    monkeypatch.setenv("MTPLX_LAZY_BONUS_VERIFY", "1")
+
+    output = generate_mtpk(
+        _runtime(CompilableCycleTrackingTinyMTPModel(), mtp_enabled=True),
+        [0, 1],
+        max_tokens=4,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=3,
+        mtp_history_policy="committed",
+        verify_strategy="batched",
+        draft_core="device-k",
+        stop_token_ids=set(),
+    )
+
+    event = output.stats.events[0]
+    depth = output.stats.draft_core["per_depth"]["3"]
+    assert event["draft_device_handoff"] == {
+        "enabled": False,
+        "reason": "lazy_bonus_verify",
+        "proposal_rows": 3,
+        "verify_rows": 4,
+    }
+    assert event["lazy_bonus_verify"]["enabled"] is True
+    assert event["lazy_bonus_verify"]["verify_input_tokens"] == 3
+    assert depth["host_syncs"] == 1
+    assert depth["host_token_transfers"] == 1
+    assert depth["device_handoff_calls"] == 0
+    assert output.stats.draft_core["device_handoff"]["qualification_eligible"] is False
+    assert output.stats.draft_core["device_handoff"]["fallbacks"] == 1
+    assert output.stats.draft_core["device_handoff"]["fallback_reasons"] == {
+        "lazy_bonus_verify": 1
+    }
 
 
 def test_device_k_committed_history_reject_rolls_back_exact_live_cache(monkeypatch):

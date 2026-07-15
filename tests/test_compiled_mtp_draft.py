@@ -303,6 +303,135 @@ def test_real_mx_compile_commits_live_cache_state(depth: int) -> None:
     )
 
 
+def test_device_dispatch_keeps_proposals_lazy_until_the_consumer(monkeypatch) -> None:
+    _install_fake_compile(monkeypatch)
+    hidden = mx.zeros((1, 1, 1), dtype=mx.float32)
+    cache = _seeded_cache()
+    bank = CompiledMTPDraftBank(
+        _ToyDraftRuntime(),
+        mtp_hidden_variant="post_norm",
+    )
+    bank.prewarm(
+        3,
+        hidden,
+        mx.array([[5]], dtype=mx.int32),
+        mtp_cache=cache,
+        reserve_tokens=16,
+    )
+    eval_calls = 0
+
+    def fail_on_host_boundary(*_values, **_kwargs) -> None:
+        nonlocal eval_calls
+        eval_calls += 1
+        raise AssertionError("device dispatch must not evaluate proposal outputs")
+
+    monkeypatch.setattr(generation, "_eval", fail_on_host_boundary)
+
+    proposal_matrix, dispatch = bank.run_device(
+        3,
+        hidden,
+        primary=5,
+        mtp_cache=cache,
+        reserve_tokens=16,
+    )
+
+    assert isinstance(proposal_matrix, mx.array)
+    assert proposal_matrix.shape == (1, 3)
+    assert dispatch["device_resident_handoff"] is True
+    assert dispatch["host_syncs"] == 0
+    assert dispatch["host_token_transfers"] == 0
+    assert dispatch["elapsed_scope"] == "host_graph_construction"
+    assert dispatch["device_execution_attribution"] == "downstream_verify_eval"
+    assert dispatch["live_cache_commits"] == 1
+    assert cache[0].offset == 5
+    assert eval_calls == 0
+
+    mx.eval(proposal_matrix, cache[0].keys, cache[0].values)
+    assert np.asarray(proposal_matrix).reshape(-1).tolist() == [6, 8, 11]
+
+    bank.record_device_acceptance(3, payload_ints=6)
+    depth_report = bank.to_dict()["per_depth"]["3"]
+    assert depth_report["device_handoff_calls"] == 1
+    assert depth_report["acceptance_host_transfers"] == 1
+    assert depth_report["acceptance_payload_ints"] == 6
+    assert depth_report["per_row_argmax_host_reads"] == 0
+
+
+@pytest.mark.parametrize(
+    ("proposals", "targets", "stop_tokens", "expected"),
+    [
+        ([3, 2, 1], [3, 2, 1], set(), [3, -1, 3, 3, 2, 1]),
+        ([3, 2, 1], [3, 0, 0], set(), [1, 0, 2, 3, 2, 1]),
+        ([3, 2, 1], [3, 2, 1], {2}, [2, -1, 2, 3, 2, 1]),
+        ([3, 2, 1], [0, 2, 1], {3}, [0, 0, 1, 3, 2, 1]),
+    ],
+    ids=["all-accept", "first-mismatch", "accepted-stop", "mismatch-before-stop"],
+)
+def test_greedy_device_acceptance_returns_one_authoritative_payload(
+    proposals: list[int],
+    targets: list[int],
+    stop_tokens: set[int],
+    expected: list[int],
+) -> None:
+    proposal_matrix = mx.array([proposals], dtype=mx.int32)
+    vocab = 8
+    rows = []
+    for target in targets:
+        row = mx.full((vocab,), -100.0, dtype=mx.float32)
+        row[target] = 100.0
+        rows.append(row)
+    verify_logits = mx.stack(rows, axis=0)[None, ...]
+
+    payload = generation._pack_greedy_device_acceptance(
+        proposal_matrix,
+        verify_logits,
+        stop_token_ids=stop_tokens,
+    )
+    mx.eval(payload)
+
+    assert payload.shape == (1, len(proposals) + 3)
+    assert np.asarray(payload).reshape(-1).tolist() == expected
+
+
+@pytest.mark.parametrize("depth", COMPILED_MTP_DRAFT_DEPTHS)
+def test_real_compiled_device_dispatch_chains_into_greedy_consumer(depth: int) -> None:
+    hidden = mx.zeros((1, 1, 1), dtype=mx.float32)
+    cache = _seeded_cache()
+    bank = CompiledMTPDraftBank(
+        _ToyDraftRuntime(),
+        mtp_hidden_variant="post_norm",
+    )
+    bank.prewarm(
+        depth,
+        hidden,
+        mx.array([[5]], dtype=mx.int32),
+        mtp_cache=cache,
+        reserve_tokens=16,
+    )
+
+    proposals, dispatch = bank.run_device(
+        depth,
+        hidden,
+        primary=5,
+        mtp_cache=cache,
+        reserve_tokens=16,
+    )
+    vocab = mx.arange(_ToyDraftRuntime.vocab_size)[None, None, :]
+    verify_logits = -mx.abs(vocab - proposals[:, :, None]).astype(mx.float32)
+    payload = generation._pack_greedy_device_acceptance(
+        proposals,
+        verify_logits,
+        stop_token_ids=set(),
+    )
+    mx.eval(payload, cache[0].keys, cache[0].values)
+    values = np.asarray(payload).reshape(-1).tolist()
+
+    assert values[:3] == [depth, -1, depth]
+    assert len(values[3:]) == depth
+    assert dispatch["host_syncs"] == 0
+    assert cache[0].offset == 2 + depth
+
+
 def test_compiled_dispatch_never_compiles_or_retraces_organically(monkeypatch) -> None:
     compile_calls = _install_fake_compile(monkeypatch)
     runtime = _ToyDraftRuntime()

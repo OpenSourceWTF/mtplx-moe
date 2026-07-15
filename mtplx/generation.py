@@ -790,7 +790,11 @@ def _eval_cache_roots(cache: Any) -> None:
 
 
 def _eval_verify_outputs(
-    verify_logits: mx.array, verify_hidden: mx.array, captures: Any | None = None
+    verify_logits: mx.array,
+    verify_hidden: mx.array,
+    captures: Any | None = None,
+    *,
+    acceptance_payload: mx.array | None = None,
 ) -> dict[str, float]:
     # Keep capture tensors lazy; commit_captured_prefix materializes only the selected prefix slice.
     timings = {
@@ -798,21 +802,22 @@ def _eval_verify_outputs(
         "verify_hidden_eval_time_s": 0.0,
         "verify_joint_eval_time_s": 0.0,
     }
+    acceptance_values = (acceptance_payload,) if acceptance_payload is not None else ()
     if _env_truthy("MTPLX_LAZY_VERIFY_LOGITS"):
         started = time.perf_counter()
-        _eval(verify_hidden, _caller_depth=2)
+        _eval(verify_hidden, *acceptance_values, _caller_depth=2)
         timings["verify_hidden_eval_time_s"] += time.perf_counter() - started
         return timings
     if _env_truthy("MTPLX_SPLIT_VERIFY_EVAL"):
         started = time.perf_counter()
-        _eval(verify_logits, _caller_depth=2)
+        _eval(verify_logits, *acceptance_values, _caller_depth=2)
         timings["verify_logits_eval_time_s"] += time.perf_counter() - started
         started = time.perf_counter()
         _eval(verify_hidden, _caller_depth=2)
         timings["verify_hidden_eval_time_s"] += time.perf_counter() - started
         return timings
     started = time.perf_counter()
-    _eval(verify_logits, verify_hidden, _caller_depth=2)
+    _eval(verify_logits, verify_hidden, *acceptance_values, _caller_depth=2)
     timings["verify_joint_eval_time_s"] += time.perf_counter() - started
     return timings
 
@@ -3636,6 +3641,10 @@ class CompiledMTPDraftBank:
                 "dispatch_time_s": 0.0,
                 "host_syncs": 0,
                 "host_token_transfers": 0,
+                "device_handoff_calls": 0,
+                "acceptance_host_transfers": 0,
+                "acceptance_payload_ints": 0,
+                "per_row_argmax_host_reads": 0,
                 "live_cache_commits": 0,
                 "device_dependency_edges": max(0, int(depth) - 1),
                 "verify_width": int(depth) + 1,
@@ -3863,9 +3872,86 @@ class CompiledMTPDraftBank:
             "device_dependency_edges": max(0, depth - 1),
         }
 
+    def run_device(
+        self,
+        depth: int,
+        hidden: mx.array,
+        *,
+        primary: int,
+        mtp_cache: Any,
+        reserve_tokens: int,
+    ) -> tuple[mx.array, dict[str, Any]]:
+        """Dispatch fixed Draft-K without materializing its token matrix.
+
+        The returned proposal array and committed cache leaves remain lazy MLX
+        values.  The caller must feed the proposal array into a downstream
+        device consumer before crossing a host boundary.  Once the live cache
+        is rebound, a deferred execution failure is fatal for the generation;
+        silently replaying the eager path would double-advance committed MTP
+        history.
+        """
+
+        depth = int(depth)
+        core = self._cores.get(depth)
+        if core is None:
+            raise CompiledMTPDraftNotPrewarmed(
+                f"D{depth} must be prewarmed before measured dispatch"
+            )
+        started = time.perf_counter()
+        prepared = _prepare_committed_mtp_cache_state(
+            mtp_cache,
+            reserve_tokens=max(depth, int(reserve_tokens)),
+            commit_capacity=False,
+        )
+        token_ids = mx.array([[int(primary)]], dtype=mx.int32)
+        signature = _compiled_mtp_state_signature(
+            hidden,
+            token_ids,
+            prepared["state"],
+        )
+        if signature not in core["prewarmed_signatures"]:
+            raise CompiledMTPDraftNotPrewarmed(
+                f"D{depth} live cache shape was not prewarmed"
+            )
+        try:
+            outputs = core["fn"](hidden, token_ids, *prepared["state"])
+        finally:
+            self.runtime.finish_mtp_cycle(core["scratch_cache"])
+        token_matrix = outputs[0]
+        if token_matrix.shape != (1, depth):
+            raise RuntimeError(
+                f"compiled D{depth} returned proposal shape {token_matrix.shape}"
+            )
+        state_out = (outputs[1], outputs[2], outputs[3])
+        _commit_compiled_mtp_cache_state(prepared, state_out, depth=depth)
+        elapsed = time.perf_counter() - started
+        stats = self._depth_stats(depth)
+        stats["calls"] += 1
+        stats["device_handoff_calls"] += 1
+        stats["dispatch_time_s"] += elapsed
+        stats["live_cache_commits"] += 1
+        return token_matrix, {
+            "phase": "dispatch",
+            "depth": depth,
+            "elapsed_s": elapsed,
+            "elapsed_scope": "host_graph_construction",
+            "device_execution_attribution": "downstream_verify_eval",
+            "host_syncs": 0,
+            "host_token_transfers": 0,
+            "live_cache_commits": 1,
+            "committed_history": True,
+            "device_resident_handoff": True,
+            "device_dependency_edges": max(0, depth - 1),
+        }
+
     def disable(self, depth: int, reason: str) -> None:
         self._disabled[int(depth)] = str(reason)
         self._depth_stats(int(depth))["errors"] += 1
+
+    def record_device_acceptance(self, depth: int, *, payload_ints: int) -> None:
+        stats = self._depth_stats(int(depth))
+        stats["acceptance_host_transfers"] += 1
+        stats["acceptance_payload_ints"] += int(payload_ints)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -3888,6 +3974,78 @@ class CompiledMTPDraftBank:
                 for depth, stats in sorted(self._per_depth.items())
             },
         }
+
+
+def _pack_greedy_device_acceptance(
+    proposal_token_matrix: mx.array,
+    verify_logits: mx.array,
+    *,
+    stop_token_ids: set[int],
+) -> mx.array:
+    """Return one compact host payload for greedy first-mismatch authority.
+
+    Layout is ``[accepted_count, correction_or_-1, evaluated_count, D1...DK]``.
+    Target argmax, prefix matching, and accepted-stop termination all remain in
+    the MLX graph.  The proposal IDs are included because accepted tokens and
+    the event trace must eventually become authoritative Python state.
+    """
+
+    if (
+        len(proposal_token_matrix.shape) != 2
+        or int(proposal_token_matrix.shape[0]) != 1
+    ):
+        raise ValueError("device proposals must have shape [1, K]")
+    depth = int(proposal_token_matrix.shape[1])
+    if depth < 1:
+        raise ValueError("device proposals require K >= 1")
+    if len(verify_logits.shape) != 3 or int(verify_logits.shape[0]) != 1:
+        raise ValueError("verify logits must have shape [1, rows, vocab]")
+    if int(verify_logits.shape[1]) < depth:
+        raise ValueError("verify logits do not cover every proposal depth")
+
+    proposals = proposal_token_matrix.astype(mx.int32)
+    target_ids = mx.argmax(verify_logits[:, :depth, :], axis=-1).astype(mx.int32)
+    matches = proposals == target_ids
+    if stop_token_ids:
+        stops = mx.array(sorted(stop_token_ids), dtype=mx.int32)
+        stop_mask = mx.any(proposals[:, :, None] == stops[None, None, :], axis=-1)
+    else:
+        stop_mask = mx.zeros_like(matches)
+    terminal = (~matches) | stop_mask
+    positions = mx.arange(depth, dtype=mx.int32)[None, :]
+    terminal_index = mx.min(
+        mx.where(terminal, positions, mx.array(depth, dtype=mx.int32)),
+        axis=1,
+    )
+    has_terminal = terminal_index < depth
+    safe_index = mx.minimum(terminal_index, depth - 1)
+    first_matches = mx.take_along_axis(matches, safe_index[:, None], axis=1)[:, 0]
+    mismatch = has_terminal & (~first_matches)
+    first_target = mx.take_along_axis(target_ids, safe_index[:, None], axis=1)[:, 0]
+    accepted_count = mx.where(
+        has_terminal,
+        mx.where(mismatch, terminal_index, terminal_index + 1),
+        mx.array(depth, dtype=mx.int32),
+    ).astype(mx.int32)
+    correction = mx.where(
+        mismatch,
+        first_target,
+        mx.array(-1, dtype=mx.int32),
+    ).astype(mx.int32)
+    evaluated_count = mx.where(
+        has_terminal,
+        terminal_index + 1,
+        mx.array(depth, dtype=mx.int32),
+    ).astype(mx.int32)
+    return mx.concatenate(
+        (
+            accepted_count[:, None],
+            correction[:, None],
+            evaluated_count[:, None],
+            proposals,
+        ),
+        axis=1,
+    )
 
 
 def _get_compiled_mtp_draft_bank(
@@ -5868,6 +6026,8 @@ def generate_mtpk(
     compiled_draft_calls = 0
     compiled_draft_fallbacks = 0
     compiled_draft_fallback_reasons: dict[str, int] = {}
+    compiled_device_handoff_fallbacks = 0
+    compiled_device_handoff_fallback_reasons: dict[str, int] = {}
     compiled_draft_per_depth: dict[str, dict[str, Any]] = {}
     streamed_token_count = 0
     mtp_history_materialize_every = max(
@@ -6473,6 +6633,10 @@ def generate_mtpk(
                 "dispatch_time_s": 0.0,
                 "host_syncs": 0,
                 "host_token_transfers": 0,
+                "device_handoff_calls": 0,
+                "acceptance_host_transfers": 0,
+                "acceptance_payload_ints": 0,
+                "per_row_argmax_host_reads": 0,
                 "live_cache_commits": 0,
                 "device_dependency_edges": max(0, int(depth) - 1),
                 "verify_width": int(depth) + 1,
@@ -6726,6 +6890,8 @@ def generate_mtpk(
         draft_cache_keys: list[tuple[int, ...]] = []
         draft_hidden_for_update: list[mx.array] = []
         draft_hidden_update_keys: list[object] = []
+        device_proposal_matrix: mx.array | None = None
+        device_dispatch_report: dict[str, Any] | None = None
         if _mtp_history_uses_committed_cache(mtp_history_policy):
             mtp_cache = mtp_history_cache
             cycle_mtp_offset = _mtp_cache_offset(mtp_cache)
@@ -6741,6 +6907,20 @@ def generate_mtpk(
         next_token = primary
 
         used_compiled_draft = False
+        device_handoff_reason: str | None = None
+        if sampler.temperature > 0:
+            device_handoff_reason = "target_sampler_non_greedy"
+        elif _penalties_active:
+            device_handoff_reason = "target_penalties"
+        elif _guard_armed:
+            device_handoff_reason = "loop_guard_armed"
+        elif target_prefix_verify:
+            device_handoff_reason = "target_prefix_verify"
+        elif _lazy_bonus_verify_enabled():
+            # Issue #64's primary lane is the full Rows=K+1 verifier.  Keep
+            # the existing shortened verifier path exact until it receives an
+            # independently qualified device handoff.
+            device_handoff_reason = "lazy_bonus_verify"
         compiled_reason = (
             compiled_draft_reason(cycle_depth)
             if draft_core in {"device-k", "device-d2"}
@@ -6756,15 +6936,31 @@ def generate_mtpk(
             )
         if compiled_reason is None and compiled_draft_bank is not None:
             try:
-                draft_tokens, dispatch = compiled_draft_bank.run(
-                    cycle_depth,
-                    draft_hidden,
-                    primary=int(primary),
-                    mtp_cache=mtp_cache,
-                    reserve_tokens=max(1, max_tokens - len(tokens) + 1),
-                )
+                if device_handoff_reason is None:
+                    device_proposal_matrix, dispatch = compiled_draft_bank.run_device(
+                        cycle_depth,
+                        draft_hidden,
+                        primary=int(primary),
+                        mtp_cache=mtp_cache,
+                        reserve_tokens=max(1, max_tokens - len(tokens) + 1),
+                    )
+                    device_dispatch_report = dispatch
+                else:
+                    draft_tokens, dispatch = compiled_draft_bank.run(
+                        cycle_depth,
+                        draft_hidden,
+                        primary=int(primary),
+                        mtp_cache=mtp_cache,
+                        reserve_tokens=max(1, max_tokens - len(tokens) + 1),
+                    )
             except Exception as exc:
                 compiled_reason = f"dispatch:{type(exc).__name__}"
+                if device_handoff_reason is None:
+                    compiled_device_handoff_fallbacks += 1
+                    compiled_device_handoff_fallback_reasons[compiled_reason] = (
+                        compiled_device_handoff_fallback_reasons.get(compiled_reason, 0)
+                        + 1
+                    )
                 compiled_draft_bank.disable(cycle_depth, compiled_reason)
                 event["draft_core_error"] = repr(exc)
                 used_compiled_draft = False
@@ -6779,6 +6975,9 @@ def generate_mtpk(
                 metrics["host_syncs"] += int(dispatch["host_syncs"])
                 metrics["host_token_transfers"] += int(dispatch["host_token_transfers"])
                 metrics["live_cache_commits"] += int(dispatch["live_cache_commits"])
+                metrics["device_handoff_calls"] += int(
+                    bool(dispatch.get("device_resident_handoff"))
+                )
                 trace_current_mtp_cache = mtp_cache
                 event["draft_core_dispatch"] = {
                     **dispatch,
@@ -6787,31 +6986,51 @@ def generate_mtpk(
                         cycle_depth == COMPILED_MTP_DRAFT_PRIMARY_DEPTH
                     ),
                 }
-                for depth_index, draft_token in enumerate(draft_tokens):
-                    draft_probs.append(
-                        SparseDistribution.one_hot(
-                            draft_token,
-                            int(logits.shape[-1]),
+                event["draft_device_handoff"] = {
+                    "enabled": device_proposal_matrix is not None,
+                    "reason": device_handoff_reason,
+                    "proposal_rows": int(cycle_depth),
+                    "verify_rows": int(cycle_depth) + 1,
+                }
+                if device_proposal_matrix is None and device_handoff_reason is not None:
+                    compiled_device_handoff_fallbacks += 1
+                    compiled_device_handoff_fallback_reasons[device_handoff_reason] = (
+                        compiled_device_handoff_fallback_reasons.get(
+                            device_handoff_reason, 0
                         )
-                        if sampler.temperature > 0
-                        else None
+                        + 1
                     )
-                    drafted += 1
-                    drafted_by_depth[depth_index] += 1
-                    event["drafts"].append(
-                        {
-                            "depth": depth_index + 1,
-                            "token": int(draft_token),
-                            "timing_s": {
-                                "draft": elapsed_draft
-                                if depth_index == len(draft_tokens) - 1
-                                else 0.0,
-                            },
-                            "mtp_corrector": None,
-                            "draft_core": "device-k",
-                        }
-                    )
-                next_token = draft_tokens[-1]
+                if device_proposal_matrix is not None:
+                    for depth_index in range(cycle_depth):
+                        draft_probs.append(None)
+                        drafted += 1
+                        drafted_by_depth[depth_index] += 1
+                else:
+                    for depth_index, draft_token in enumerate(draft_tokens):
+                        draft_probs.append(
+                            SparseDistribution.one_hot(
+                                draft_token,
+                                int(logits.shape[-1]),
+                            )
+                            if sampler.temperature > 0
+                            else None
+                        )
+                        drafted += 1
+                        drafted_by_depth[depth_index] += 1
+                        event["drafts"].append(
+                            {
+                                "depth": depth_index + 1,
+                                "token": int(draft_token),
+                                "timing_s": {
+                                    "draft": elapsed_draft
+                                    if depth_index == len(draft_tokens) - 1
+                                    else 0.0,
+                                },
+                                "mtp_corrector": None,
+                                "draft_core": "device-k",
+                            }
+                        )
+                    next_token = draft_tokens[-1]
 
         if not used_compiled_draft and draft_core in {"device-k", "device-d2"}:
             reason = compiled_reason or "ineligible_contract"
@@ -7156,6 +7375,11 @@ def generate_mtpk(
             _add_timing(event, "snapshot", elapsed_snapshot)
         lazy_bonus_verify_min_depth = _lazy_bonus_verify_min_depth()
         lazy_bonus_verify_requested = _lazy_bonus_verify_enabled()
+        draft_count = (
+            int(device_proposal_matrix.shape[1])
+            if device_proposal_matrix is not None
+            else len(draft_tokens)
+        )
         lazy_bonus_verify = (
             lazy_bonus_verify_requested
             and not lazy_target_distributions
@@ -7168,18 +7392,30 @@ def generate_mtpk(
         bonus_distribution_row_needed = (
             not omit_speculative_bonus
             and not lazy_bonus_verify
-            and len(draft_tokens) > 0
-            and len(tokens) + len(draft_tokens) < max_tokens
+            and draft_count > 0
+            and len(tokens) + draft_count < max_tokens
             and not any(_is_stop(token, stop_token_ids) for token in draft_tokens)
         )
-        target_distribution_rows_needed = len(draft_tokens) + (
+        target_distribution_rows_needed = draft_count + (
             1 if bonus_distribution_row_needed else 0
         )
         if lazy_bonus_verify:
             lazy_bonus_verify_calls += 1
-        verify_input = [primary] + (
-            draft_tokens[:-1] if lazy_bonus_verify else draft_tokens
-        )
+        if device_proposal_matrix is not None:
+            verify_input_array = mx.concatenate(
+                (
+                    mx.array([[int(primary)]], dtype=mx.int32),
+                    device_proposal_matrix,
+                ),
+                axis=1,
+            )
+            verify_input_tokens = int(verify_input_array.shape[1])
+        else:
+            verify_input = [primary] + (
+                draft_tokens[:-1] if lazy_bonus_verify else draft_tokens
+            )
+            verify_input_array = mx.array([verify_input], dtype=mx.int32)
+            verify_input_tokens = len(verify_input)
         event["lazy_bonus_verify"] = {
             "enabled": bool(lazy_bonus_verify),
             "requested": bool(lazy_bonus_verify_requested),
@@ -7189,8 +7425,8 @@ def generate_mtpk(
             and not target_prefix_verify
             else None,
             "min_depth": int(lazy_bonus_verify_min_depth),
-            "verify_input_tokens": int(len(verify_input)),
-            "draft_tokens": int(len(draft_tokens)),
+            "verify_input_tokens": int(verify_input_tokens),
+            "draft_tokens": int(draft_count),
         }
         event["speculative_bonus"] = {
             "omitted": bool(omit_speculative_bonus),
@@ -7204,7 +7440,7 @@ def generate_mtpk(
                 if compiled_verify_bank is not None:
                     verify_logits, verify_hidden, captures = (
                         compiled_verify_bank.forward_ar_capture(
-                            mx.array([verify_input]),
+                            verify_input_array,
                             cache=cache,
                             return_hidden=True,
                             hidden_variant=base_hidden_variant,
@@ -7213,7 +7449,7 @@ def generate_mtpk(
                 elif graphbank is not None:
                     verify_logits, verify_hidden, captures = (
                         graphbank.forward_ar_capture(
-                            mx.array([verify_input]),
+                            verify_input_array,
                             cache=cache,
                             return_hidden=True,
                             hidden_variant=base_hidden_variant,
@@ -7221,7 +7457,7 @@ def generate_mtpk(
                     )
                 else:
                     verify_logits, verify_hidden, captures = rt.forward_ar_capture(
-                        mx.array([verify_input]),
+                        verify_input_array,
                         cache=cache,
                         return_hidden=True,
                         hidden_variant=base_hidden_variant,
@@ -7229,14 +7465,14 @@ def generate_mtpk(
                     )
             elif graphbank is not None:
                 verify_logits, verify_hidden = graphbank.forward_ar(
-                    mx.array([verify_input]),
+                    verify_input_array,
                     cache=cache,
                     return_hidden=True,
                     hidden_variant=base_hidden_variant,
                 )
             else:
                 verify_logits, verify_hidden = rt.forward_ar(
-                    mx.array([verify_input]),
+                    verify_input_array,
                     cache=cache,
                     return_hidden=True,
                     hidden_variant=base_hidden_variant,
@@ -7244,6 +7480,15 @@ def generate_mtpk(
         elapsed_verify_forward = time.perf_counter() - started_forward
         verify_forward_time += elapsed_verify_forward
         _add_timing(event, "verify_forward", elapsed_verify_forward)
+        device_acceptance_payload = (
+            _pack_greedy_device_acceptance(
+                device_proposal_matrix,
+                verify_logits,
+                stop_token_ids=stop_token_ids,
+            )
+            if device_proposal_matrix is not None
+            else None
+        )
         target_distribution_batch = None
         target_distributions = None
         target_prefix_tokens: list[int] | None = None
@@ -7315,10 +7560,17 @@ def generate_mtpk(
                 }
             elif captures is not None:
                 verify_eval_timings = _eval_verify_outputs(
-                    verify_logits, verify_hidden, captures
+                    verify_logits,
+                    verify_hidden,
+                    captures,
+                    acceptance_payload=device_acceptance_payload,
                 )
             else:
-                verify_eval_timings = _eval_verify_outputs(verify_logits, verify_hidden)
+                verify_eval_timings = _eval_verify_outputs(
+                    verify_logits,
+                    verify_hidden,
+                    acceptance_payload=device_acceptance_payload,
+                )
         elif (
             defer_verify_hidden_eval
             and sampler.temperature > 0
@@ -7368,10 +7620,17 @@ def generate_mtpk(
             }
         elif captures is not None:
             verify_eval_timings = _eval_verify_outputs(
-                verify_logits, verify_hidden, captures
+                verify_logits,
+                verify_hidden,
+                captures,
+                acceptance_payload=device_acceptance_payload,
             )
         else:
-            verify_eval_timings = _eval_verify_outputs(verify_logits, verify_hidden)
+            verify_eval_timings = _eval_verify_outputs(
+                verify_logits,
+                verify_hidden,
+                acceptance_payload=device_acceptance_payload,
+            )
         elapsed_verify_eval = time.perf_counter() - started_eval
         eval_attributed = sum(float(value) for value in verify_eval_timings.values())
         elapsed_verify_eval_unattributed = max(
@@ -7423,6 +7682,68 @@ def generate_mtpk(
         if compiled_verify_bank is not None:
             event.setdefault("graphbank", {})["compiled_verify"] = (
                 compiled_verify_bank.to_dict()
+            )
+
+        device_authoritative_accepted: int | None = None
+        device_authoritative_correction: int | None = None
+        device_authoritative_evaluated: int | None = None
+        if device_acceptance_payload is not None:
+            host_transfer_started = time.perf_counter()
+            authoritative = np.asarray(
+                device_acceptance_payload,
+                dtype=np.int32,
+            ).reshape(-1)
+            host_transfer_elapsed = time.perf_counter() - host_transfer_started
+            expected_payload_ints = draft_count + 3
+            if authoritative.size != expected_payload_ints:
+                raise RuntimeError(
+                    "device acceptance payload has "
+                    f"{authoritative.size} ints; expected {expected_payload_ints}"
+                )
+            device_authoritative_accepted = int(authoritative[0])
+            correction_value = int(authoritative[1])
+            device_authoritative_correction = (
+                correction_value if correction_value >= 0 else None
+            )
+            device_authoritative_evaluated = int(authoritative[2])
+            draft_tokens = [int(token) for token in authoritative[3:]]
+            if not (
+                0 <= device_authoritative_accepted <= draft_count
+                and 1 <= device_authoritative_evaluated <= draft_count
+                and len(draft_tokens) == draft_count
+            ):
+                raise RuntimeError("invalid authoritative device acceptance result")
+            elapsed_draft = float((device_dispatch_report or {}).get("elapsed_s", 0.0))
+            for depth_index, draft_token in enumerate(draft_tokens):
+                event["drafts"].append(
+                    {
+                        "depth": depth_index + 1,
+                        "token": int(draft_token),
+                        "timing_s": {
+                            "draft": elapsed_draft
+                            if depth_index == len(draft_tokens) - 1
+                            else 0.0,
+                        },
+                        "mtp_corrector": None,
+                        "draft_core": "device-k",
+                    }
+                )
+            metrics = compiled_depth_metrics(cycle_depth)
+            metrics["acceptance_host_transfers"] += 1
+            metrics["acceptance_payload_ints"] += int(authoritative.size)
+            if compiled_draft_bank is not None:
+                compiled_draft_bank.record_device_acceptance(
+                    cycle_depth,
+                    payload_ints=int(authoritative.size),
+                )
+            event["draft_device_handoff"].update(
+                {
+                    "acceptance_host_transfers": 1,
+                    "acceptance_payload_ints": int(authoritative.size),
+                    "additional_host_syncs": 0,
+                    "per_row_argmax_host_reads": 0,
+                    "host_transfer_time_s": float(host_transfer_elapsed),
+                }
             )
 
         accepted_count = 0
@@ -7480,6 +7801,11 @@ def generate_mtpk(
             target_distribution_batch = None
         evaluated_this_call = 0
         for depth_index, draft_token in enumerate(draft_tokens):
+            if (
+                device_authoritative_evaluated is not None
+                and depth_index >= device_authoritative_evaluated
+            ):
+                break
             target_logits_for_draft = verify_logits[:, depth_index, :]
             if _guard_armed:
                 _row_guard_overlay = _loop_guard.penalties_for(
@@ -7498,7 +7824,20 @@ def generate_mtpk(
             evaluated += 1
             evaluated_this_call += 1
             evaluated_by_depth[depth_index] += 1
-            if sampler.temperature <= 0:
+            if device_authoritative_accepted is not None:
+                accepted_now = depth_index < device_authoritative_accepted
+                if accepted_now:
+                    target_token = int(draft_token)
+                    correction = int(draft_token)
+                else:
+                    if device_authoritative_correction is None:
+                        raise RuntimeError(
+                            "device rejection omitted its authoritative correction"
+                        )
+                    target_token = int(device_authoritative_correction)
+                    correction = target_token
+                accept_prob = 1.0 if accepted_now else 0.0
+            elif sampler.temperature <= 0:
                 _greedy_row = target_logits_for_draft[0]
                 if _penalties_active or _row_guard_overlay:
                     _greedy_row = apply_penalties_mlx(
@@ -7634,6 +7973,13 @@ def generate_mtpk(
                 ] = cached_target
             rejection_correction = int(correction)
             break
+        if (
+            device_authoritative_accepted is not None
+            and accepted_count != device_authoritative_accepted
+        ):
+            raise RuntimeError(
+                "device acceptance replay diverged from its authoritative count"
+            )
         if (
             draft_tokens
             and evaluated_this_call == len(draft_tokens)
@@ -7920,7 +8266,7 @@ def generate_mtpk(
                 cache,
                 captures,
                 keep_tokens=committed_prefix_len,
-                verified_tokens=len(verify_input),
+                verified_tokens=verify_input_tokens,
                 detach_components=capture_commit_detach_components,
                 detach_mode=capture_commit_detach_mode,
                 detach_stats=commit_detach_stats,
@@ -7943,7 +8289,7 @@ def generate_mtpk(
             committed_from_trim = trim_verified_window_to_prefix(
                 cache,
                 before_verify,
-                verified_tokens=len(verify_input),
+                verified_tokens=verify_input_tokens,
                 keep_tokens=committed_prefix_len,
             )
             elapsed_trim_commit = time.perf_counter() - started_trim_commit
@@ -8013,7 +8359,7 @@ def generate_mtpk(
             )
             started_rollback = time.perf_counter()
             rollback_after_verify(
-                cache, before_verify, verified_tokens=len(verify_input)
+                cache, before_verify, verified_tokens=verify_input_tokens
             )
             elapsed_rollback = time.perf_counter() - started_rollback
             rollback_time += elapsed_rollback
@@ -8348,6 +8694,46 @@ def generate_mtpk(
             ),
             "history_policy": mtp_history_policy,
             "cache_state_mode": "explicit-live-io",
+            "device_handoff": {
+                "schema": "compiled-mtp-device-handoff-v1",
+                "full_verify_width": True,
+                "calls": sum(
+                    int(value["device_handoff_calls"])
+                    for value in compiled_draft_per_depth.values()
+                ),
+                "fallbacks": int(compiled_device_handoff_fallbacks),
+                "fallback_reasons": dict(compiled_device_handoff_fallback_reasons),
+                "acceptance_host_transfers": sum(
+                    int(value["acceptance_host_transfers"])
+                    for value in compiled_draft_per_depth.values()
+                ),
+                "acceptance_payload_ints": sum(
+                    int(value["acceptance_payload_ints"])
+                    for value in compiled_draft_per_depth.values()
+                ),
+                "per_row_argmax_host_reads": sum(
+                    int(value["per_row_argmax_host_reads"])
+                    for value in compiled_draft_per_depth.values()
+                ),
+                "qualification_eligible": bool(
+                    draft_core == "device-k"
+                    and sum(
+                        int(value["device_handoff_calls"])
+                        for value in compiled_draft_per_depth.values()
+                    )
+                    > 0
+                    and compiled_device_handoff_fallbacks == 0
+                    and compiled_draft_fallbacks == 0
+                    and sum(
+                        int(value["acceptance_host_transfers"])
+                        for value in compiled_draft_per_depth.values()
+                    )
+                    == sum(
+                        int(value["device_handoff_calls"])
+                        for value in compiled_draft_per_depth.values()
+                    )
+                ),
+            },
             "compiled_calls": compiled_draft_calls,
             "organic_compile_calls": (
                 int(compiled_draft_bank.to_dict()["organic_compile_calls"])

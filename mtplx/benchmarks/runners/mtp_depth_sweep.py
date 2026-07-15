@@ -43,7 +43,9 @@ def _token_budget(max_tokens: int, case_max_tokens: int) -> int:
     return min(int(max_tokens), int(case_max_tokens))
 
 
-def _hit_token_budget(generated_tokens: int, token_budget: int, finish_reason: str | None) -> bool:
+def _hit_token_budget(
+    generated_tokens: int, token_budget: int, finish_reason: str | None
+) -> bool:
     if finish_reason == "length":
         return True
     return int(generated_tokens) >= int(token_budget)
@@ -139,8 +141,12 @@ def run_mtp_depth_sweep(
     )
     contract = getattr(rt, "contract", None)
     is_gemma4_assistant = getattr(rt, "backend_id", None) == "gemma4_assistant"
-    resolved_base_hidden_variant = str(getattr(contract, "base_hidden_variant", "gemma4_assistant"))
-    resolved_mtp_hidden_variant = str(getattr(contract, "hidden_variant", "gemma4_assistant"))
+    resolved_base_hidden_variant = str(
+        getattr(contract, "base_hidden_variant", "gemma4_assistant")
+    )
+    resolved_mtp_hidden_variant = str(
+        getattr(contract, "hidden_variant", "gemma4_assistant")
+    )
     resolved_concat_order = str(getattr(contract, "concat_order", "assistant_pair"))
     draft_lm_head_report: dict[str, Any] | None = None
     if draft_lm_head_bits is not None and not is_gemma4_assistant:
@@ -398,7 +404,9 @@ def run_mtp_depth_sweep(
 
         validations = [v for row in rows for v in row["validations"]]
         finish_reasons = _finish_reason_counts(rows)
-        accepted_by_depth = _sum_lists([row["accepted_by_depth"] for row in rows], depth)
+        accepted_by_depth = _sum_lists(
+            [row["accepted_by_depth"] for row in rows], depth
+        )
         drafted_by_depth = _sum_lists([row["drafted_by_depth"] for row in rows], depth)
         accept_probability_sum_by_depth = _sum_float_lists(
             [row["accept_probability_sum_by_depth"] for row in rows],
@@ -414,12 +422,8 @@ def run_mtp_depth_sweep(
         target_distribution_windows = sum(
             row["target_distribution_materialized_windows"] for row in rows
         )
-        lazy_bonus_verify_calls = sum(
-            row["lazy_bonus_verify_calls"] for row in rows
-        )
-        lazy_bonus_commit_time_s = sum(
-            row["lazy_bonus_commit_time_s"] for row in rows
-        )
+        lazy_bonus_verify_calls = sum(row["lazy_bonus_verify_calls"] for row in rows)
+        lazy_bonus_commit_time_s = sum(row["lazy_bonus_commit_time_s"] for row in rows)
         depth_results.append(
             {
                 "depth": depth,
@@ -518,9 +522,7 @@ def run_mtp_depth_sweep(
                     "verify_target_distribution_time_s": (
                         verify_target_distribution_time_s
                     ),
-                    "target_distribution_materialized_rows": (
-                        target_distribution_rows
-                    ),
+                    "target_distribution_materialized_rows": (target_distribution_rows),
                     "target_distribution_materialized_windows": (
                         target_distribution_windows
                     ),
@@ -806,12 +808,31 @@ def _sum_draft_core(values: list[dict[str, object]]) -> dict[str, object]:
         }
     )
     fallback_reasons: dict[str, int] = {}
+    device_handoff_values = [
+        handoff
+        for value in values
+        if isinstance((handoff := value.get("device_handoff")), dict)
+    ]
+    device_handoff_fallback_reasons: dict[str, int] = {}
+    for handoff in device_handoff_values:
+        reasons = handoff.get("fallback_reasons", {})
+        if not isinstance(reasons, dict):
+            continue
+        for reason, count in reasons.items():
+            key = str(reason)
+            device_handoff_fallback_reasons[key] = device_handoff_fallback_reasons.get(
+                key, 0
+            ) + int(count or 0)
     per_depth: dict[str, dict[str, int | float]] = {}
     integer_fields = (
         "calls",
         "compile_count",
         "host_syncs",
         "host_token_transfers",
+        "device_handoff_calls",
+        "acceptance_host_transfers",
+        "acceptance_payload_ints",
+        "per_row_argmax_host_reads",
         "prewarm_host_syncs",
         "live_cache_commits",
     )
@@ -858,12 +879,8 @@ def _sum_draft_core(values: list[dict[str, object]]) -> dict[str, object]:
         "primary_depth": COMPILED_MTP_DRAFT_PRIMARY_DEPTH,
         "primary_width": COMPILED_MTP_DRAFT_PRIMARY_WIDTH,
         "supported_depths": list(COMPILED_MTP_DRAFT_DEPTHS),
-        "history_policy": (
-            str(values[0].get("history_policy")) if values else ""
-        ),
-        "cache_state_mode": (
-            str(values[0].get("cache_state_mode")) if values else ""
-        ),
+        "history_policy": (str(values[0].get("history_policy")) if values else ""),
+        "cache_state_mode": (str(values[0].get("cache_state_mode")) if values else ""),
         "requested": requested[0] if len(requested) == 1 else ",".join(requested),
         "selected": selected[0] if len(selected) == 1 else ",".join(selected),
         "compiled_calls": sum(
@@ -874,28 +891,55 @@ def _sum_draft_core(values: list[dict[str, object]]) -> dict[str, object]:
         ),
         "fallbacks": sum(int(value.get("fallbacks", 0) or 0) for value in values),
         "fallback_reasons": fallback_reasons,
-        "qualification_eligible": bool(values) and all(
-            bool(value.get("qualification_eligible", False)) for value in values
-        ),
+        "qualification_eligible": bool(values)
+        and all(bool(value.get("qualification_eligible", False)) for value in values),
         "prewarm_time_s": sum(
             float(value.get("prewarm_time_s", 0.0) or 0.0) for value in values
         ),
         "cache_prepare_time_s": sum(
-            float(value.get("cache_prepare_time_s", 0.0) or 0.0)
-            for value in values
+            float(value.get("cache_prepare_time_s", 0.0) or 0.0) for value in values
         ),
         "graph_construct_time_s": sum(
-            float(value.get("graph_construct_time_s", 0.0) or 0.0)
-            for value in values
+            float(value.get("graph_construct_time_s", 0.0) or 0.0) for value in values
         ),
         "graph_prewarm_time_s": sum(
-            float(value.get("graph_prewarm_time_s", 0.0) or 0.0)
-            for value in values
+            float(value.get("graph_prewarm_time_s", 0.0) or 0.0) for value in values
         ),
         "host_syncs": sum(int(value.get("host_syncs", 0) or 0) for value in values),
         "host_token_transfers": sum(
             int(value.get("host_token_transfers", 0) or 0) for value in values
         ),
+        "device_handoff": {
+            "schema": "compiled-mtp-device-handoff-v1",
+            "full_verify_width": bool(device_handoff_values)
+            and all(
+                bool(value.get("full_verify_width")) for value in device_handoff_values
+            ),
+            "calls": sum(
+                int(value.get("calls", 0) or 0) for value in device_handoff_values
+            ),
+            "fallbacks": sum(
+                int(value.get("fallbacks", 0) or 0) for value in device_handoff_values
+            ),
+            "fallback_reasons": device_handoff_fallback_reasons,
+            "acceptance_host_transfers": sum(
+                int(value.get("acceptance_host_transfers", 0) or 0)
+                for value in device_handoff_values
+            ),
+            "acceptance_payload_ints": sum(
+                int(value.get("acceptance_payload_ints", 0) or 0)
+                for value in device_handoff_values
+            ),
+            "per_row_argmax_host_reads": sum(
+                int(value.get("per_row_argmax_host_reads", 0) or 0)
+                for value in device_handoff_values
+            ),
+            "qualification_eligible": bool(device_handoff_values)
+            and all(
+                bool(value.get("qualification_eligible", False))
+                for value in device_handoff_values
+            ),
+        },
         "per_depth": per_depth,
         "device_d2_calls": sum(
             int(value.get("device_d2_calls", 0) or 0) for value in values
