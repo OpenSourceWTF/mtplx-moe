@@ -1,0 +1,323 @@
+{
+  "artifacts": {
+    "model_root": "/Users/davidtai/.cache/huggingface/hy3-expert-only-mlx-q2",
+    "mtp_artifacts": "/Users/davidtai/.cache/huggingface/hy3-mtp-layer80",
+    "mtp_bf16_file_bytes": 7505299360
+  },
+  "command": [
+    "benchmarks/hy3_mtp_shared_gate_up.py",
+    "--scope",
+    "recurrent",
+    "--candidates",
+    "metal_n24_r2_v16_exact",
+    "--depths",
+    "1,3",
+    "--warmup",
+    "4",
+    "--iterations",
+    "16",
+    "--rounds",
+    "16",
+    "--bootstrap-resamples",
+    "20000",
+    "--output-json",
+    "/tmp/issue69-hy3-mtp-metal-recurrent-r8.json"
+  ],
+  "dispatch_contract": {
+    "candidate_savings_at_k3": {
+      "metal_n24_r2_v16_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_bf16_to_fp32_conversions": 9437184,
+        "input_device_load_instruction_bytes": 786432,
+        "input_fill_load_instruction_bytes": 786432,
+        "input_threadgroup_load_instruction_bytes": 18874368,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 96,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 96
+      }
+    },
+    "control_gate_up_matmuls_per_depth": 2,
+    "metal_gate_up_swiglu_dispatches_saved_at_k3": 6,
+    "packed_candidate_gate_up_matmuls_per_depth": 1,
+    "packed_projection_dispatches_saved_at_k3": 3
+  },
+  "environment": {
+    "commit": "cf809a686acaf8a8692ac93b8a10022290d5ddf2",
+    "machine": "arm64",
+    "metal_device": {
+      "architecture": "applegpu_g17s",
+      "device_name": "Apple M5 Max",
+      "max_buffer_length": 86586540032,
+      "max_recommended_working_set_size": 107374182400,
+      "memory_size": 137438953472,
+      "resource_limit": 499000
+    },
+    "platform": "macOS-26.5.2-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "finished_at": "2026-07-15T21:52:06.512741+00:00",
+  "measurement": {
+    "bootstrap_resamples": 20000,
+    "candidates": [
+      "metal_n24_r2_v16_exact"
+    ],
+    "control_candidate": "stock",
+    "depths": [
+      1,
+      3
+    ],
+    "gate_up_swiglu_correctness": {
+      "metal_n24_r2_v16_exact": {
+        "array_equal": false,
+        "candidate_dtype": "mlx.core.bfloat16",
+        "control_dtype": "mlx.core.bfloat16",
+        "max_abs_error": 1.52587890625e-05,
+        "rmse": 3.9236581983459473e-07,
+        "shape": [
+          1,
+          1,
+          1536
+        ]
+      }
+    },
+    "iterations": 16,
+    "results": {
+      "1": {
+        "metal_n24_r2_v16_exact": {
+          "cold_us": {
+            "candidate_second": 2226.917,
+            "control_first": 2821.333,
+            "order_caveat": "one-shot graph/compiler order; paired warm timings decide"
+          },
+          "correctness": {
+            "array_equal": true,
+            "candidate_dtype": "mlx.core.bfloat16",
+            "control_dtype": "mlx.core.bfloat16",
+            "max_abs_error": 0.0,
+            "rmse": 0.0,
+            "shape": [
+              1,
+              1,
+              4096
+            ]
+          },
+          "warm": {
+            "candidate": {
+              "max_us": 1303.583375,
+              "mean_us": 1281.9262734375,
+              "median_us": 1281.5703125,
+              "min_us": 1267.9140625,
+              "samples_us": [
+                1287.2890625,
+                1291.578125,
+                1283.849,
+                1303.583375,
+                1285.841125,
+                1298.3854375,
+                1282.0885625,
+                1287.8046875,
+                1267.9140625,
+                1272.859375,
+                1270.7578125,
+                1272.8359375,
+                1277.765625,
+                1278.29425,
+                1281.0520625,
+                1268.921875
+              ]
+            },
+            "control": {
+              "max_us": 1285.1198125,
+              "mean_us": 1273.1193046875,
+              "median_us": 1272.6796875,
+              "min_us": 1261.453125,
+              "samples_us": [
+                1282.765625,
+                1272.7864375,
+                1285.1198125,
+                1279.08075,
+                1266.76825,
+                1275.4556875,
+                1278.6328125,
+                1278.971375,
+                1272.5260625,
+                1261.453125,
+                1272.565125,
+                1265.4453125,
+                1265.4270625,
+                1263.10675,
+                1272.5729375,
+                1277.23175
+              ]
+            },
+            "paired_speedup": {
+              "bootstrap_mean_95_ci": [
+                0.9895865794193403,
+                0.9968483645517193
+              ],
+              "mean": 0.9931729358289718,
+              "median": 0.9932609608982882,
+              "samples": [
+                0.9964860747816693,
+                0.9854505994362516,
+                1.0009898457684667,
+                0.9812036380104956,
+                0.9851670049828279,
+                0.9823397973069149,
+                0.9973045933790552,
+                0.9931407979907668,
+                1.0036374705008844,
+                0.99103887654518,
+                1.0014222320588724,
+                0.9941935761065043,
+                0.9903436418552893,
+                0.9881189327105242,
+                0.9933811238058096,
+                1.0065487680240361
+              ]
+            }
+          }
+        }
+      },
+      "3": {
+        "metal_n24_r2_v16_exact": {
+          "cold_us": {
+            "candidate_second": 3611.583,
+            "control_first": 4309.375,
+            "order_caveat": "one-shot graph/compiler order; paired warm timings decide"
+          },
+          "correctness": {
+            "array_equal": true,
+            "candidate_dtype": "mlx.core.bfloat16",
+            "control_dtype": "mlx.core.bfloat16",
+            "max_abs_error": 0.0,
+            "rmse": 0.0,
+            "shape": [
+              1,
+              1,
+              4096
+            ]
+          },
+          "warm": {
+            "candidate": {
+              "max_us": 3530.158875,
+              "mean_us": 3509.85757421875,
+              "median_us": 3508.08853125,
+              "min_us": 3496.859375,
+              "samples_us": [
+                3501.7083125,
+                3519.6926875,
+                3530.158875,
+                3511.765625,
+                3506.09375,
+                3502.7551875,
+                3509.8775625,
+                3509.9713125,
+                3516.4739375,
+                3515.3359375,
+                3506.1796875,
+                3506.2995,
+                3503.385375,
+                3496.859375,
+                3521.716125,
+                3499.4479375
+              ]
+            },
+            "control": {
+              "max_us": 3861.5390625,
+              "mean_us": 3665.38721484375,
+              "median_us": 3666.98178125,
+              "min_us": 3500.2083125,
+              "samples_us": [
+                3615.10675,
+                3500.2083125,
+                3614.2630625,
+                3650.5286875,
+                3683.109375,
+                3711.4010625,
+                3815.9166875,
+                3672.85675,
+                3661.1068125,
+                3534.828125,
+                3620.466125,
+                3673.9635625,
+                3679.29425,
+                3583.9635625,
+                3767.64325,
+                3861.5390625
+              ]
+            },
+            "paired_speedup": {
+              "bootstrap_mean_95_ci": [
+                1.0314661465233264,
+                1.0577539719682945
+              ],
+              "mean": 1.0443345066880212,
+              "median": 1.0437682863505438,
+              "samples": [
+                1.0323837474112858,
+                0.9944641828903991,
+                1.0238244765966802,
+                1.039513759549372,
+                1.0504879896608583,
+                1.0595662168297053,
+                1.0871936754346543,
+                1.0464064868336442,
+                1.041130085867443,
+                1.005544900358474,
+                1.032595716045999,
+                1.0478179523740057,
+                1.050211111873469,
+                1.0249092623291436,
+                1.0698316151191771,
+                1.1034709278340278
+              ]
+            }
+          }
+        }
+      }
+    },
+    "rounds": 16,
+    "scope_detail": "recurrent hidden through full Hy3 MTP layer; shared trunk embedding and LM head excluded",
+    "warmup": 4
+  },
+  "parameters": {
+    "benchmark_extra_bytes_by_module": {
+      "metal_n24_r2_v16_exact": 0
+    },
+    "benchmark_extra_bytes_per_packed_candidate": 25165824,
+    "benchmark_extra_bytes_per_split_metal_candidate": 0,
+    "benchmark_unique_shared_packed_bytes": 0,
+    "candidate_steady_extra_bytes_after_source_release": 0,
+    "gate_up": 12582912,
+    "gate_up_bytes": 25165824,
+    "shared_mlp_total": 18874368,
+    "shared_mlp_total_bytes": 37748736
+  },
+  "schema": "mtplx-issue69-hy3-mtp-shared-gate-up-v1",
+  "scope": "recurrent",
+  "shape": {
+    "M": 1,
+    "down": [
+      4096,
+      1536
+    ],
+    "dtype": "mlx.core.bfloat16",
+    "gate": [
+      1536,
+      4096
+    ],
+    "hidden_size": 4096,
+    "shared_intermediate_size": 1536,
+    "up": [
+      1536,
+      4096
+    ]
+  },
+  "started_at": "2026-07-15T21:52:03.095703+00:00"
+}
