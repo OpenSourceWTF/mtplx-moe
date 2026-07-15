@@ -10,6 +10,7 @@ from mtplx.hy3_router_fp32 import (  # noqa: E402
     Hy3RouterFP32Ineligible,
     Hy3RouterFP32Tiling,
     _balanced_splitk_reduction_source,
+    _sigmoid_exp_call,
     hy3_router_fp32_available,
     hy3_router_fp32_eligible,
     hy3_router_fp32_exact_project,
@@ -23,6 +24,11 @@ from mtplx.hy3_router_fp32 import (  # noqa: E402
     prepare_hy3_router_fp32_exact_weight,
     prepare_hy3_router_fp32_weight,
 )
+
+
+def test_issue59_precise_r2_rejects_issue60_fast_exp_mode() -> None:
+    with pytest.raises(Hy3RouterFP32Ineligible, match="must be precise"):
+        _sigmoid_exp_call("fast-exp", "-total")
 
 
 def test_hy3_router_fp32_p32_reduction_is_a_complete_balanced_tree() -> None:
@@ -70,7 +76,7 @@ def test_hy3_router_rejects_unsupported_simd_topology_before_dispatch() -> None:
 
 
 @pytest.mark.parametrize("rows", tuple(range(1, 9)))
-@pytest.mark.parametrize("sigmoid_mode", ("precise", "fast-exp"))
+@pytest.mark.parametrize("sigmoid_mode", ("precise",))
 @pytest.mark.parametrize("simd_groups", (1, 2, 3, 4, 5, 7, 8))
 def test_hy3_router_candidate_simd_finalize_matches_six_simd_on_g17(
     rows: int,
@@ -100,10 +106,7 @@ def test_hy3_router_candidate_simd_finalize_matches_six_simd_on_g17(
     mx.eval(control_ids, control_weights, candidate_ids, candidate_weights)
 
     assert bool(mx.array_equal(candidate_ids, control_ids).item())
-    tolerance = 1e-7 if sigmoid_mode == "precise" else 1e-5
-    assert (
-        float(mx.max(mx.abs(candidate_weights - control_weights)).item()) <= tolerance
-    )
+    assert float(mx.max(mx.abs(candidate_weights - control_weights)).item()) <= 1e-7
 
 
 @pytest.mark.parametrize("rows", (1, 8))
@@ -173,32 +176,6 @@ def test_hy3_router_fp32_finalize_matches_stock_logits_on_g17(rows: int) -> None
 
     assert bool(mx.array_equal(observed_ids, reference_ids).item())
     assert float(mx.max(mx.abs(observed_weights - reference_weights)).item()) <= 1e-7
-
-
-@pytest.mark.parametrize("rows", tuple(range(1, 9)))
-def test_hy3_router_fp32_fast_exp_sigmoid_stays_close_on_g17(rows: int) -> None:
-    if not hy3_router_fp32_available():
-        pytest.skip("router tensor-op execution requires Apple G17 and macOS 26.2+")
-
-    mx.random.seed(516_000 + rows)
-    logits = (mx.random.normal((rows, 192)) * 3.0).astype(mx.float32)
-    expert_bias = (mx.random.normal((192,)) * 0.01).astype(mx.float32)
-    exact_ids, exact_weights = hy3_router_fp32_finalize(
-        logits,
-        expert_bias,
-        finalizer_mode="simd",
-        sigmoid_mode="precise",
-    )
-    fast_ids, fast_weights = hy3_router_fp32_finalize(
-        logits,
-        expert_bias,
-        finalizer_mode="simd",
-        sigmoid_mode="fast-exp",
-    )
-    mx.eval(exact_ids, exact_weights, fast_ids, fast_weights)
-
-    assert bool(mx.array_equal(fast_ids, exact_ids).item())
-    assert float(mx.max(mx.abs(fast_weights - exact_weights)).item()) <= 1e-5
 
 
 def test_hy3_router_fp32_tiling_accounts_for_grid_work() -> None:

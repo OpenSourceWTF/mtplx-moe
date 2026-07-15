@@ -107,9 +107,7 @@ def _sigmoid_exp_call(sigmoid_mode: str, operand: str) -> str:
 
     if sigmoid_mode == "precise":
         return f"exp({operand})"
-    if sigmoid_mode == "fast-exp":
-        return f"fast::exp({operand})"
-    raise Hy3RouterFP32Ineligible("Hy3 router sigmoid mode must be precise or fast-exp")
+    raise Hy3RouterFP32Ineligible("Hy3 router sigmoid mode must be precise")
 
 
 def _balanced_splitk_reduction_source(grid_k_parts: int) -> str:
@@ -1069,7 +1067,7 @@ def hy3_router_fp32_finalize(
     scaling_factor: float = 2.826,
     finalizer_mode: Literal["serial", "simd"] = "simd",
     simd_groups: Literal[1, 2, 3, 4, 5, 6, 7, 8] = 6,
-    sigmoid_mode: Literal["precise", "fast-exp"] = "precise",
+    sigmoid_mode: Literal["precise"] = "precise",
 ) -> tuple[mx.array, mx.array]:
     """Finalize stock FP32 logits with the selected sigmoid implementation."""
 
@@ -1150,7 +1148,7 @@ def hy3_router_fp32_exact_route(
     scaling_factor: float = 2.826,
     finalizer_mode: Literal["serial", "simd"] = "simd",
     simd_groups: Literal[1, 2, 3, 4, 5, 6, 7, 8] = 6,
-    sigmoid_mode: Literal["precise", "fast-exp"] = "precise",
+    sigmoid_mode: Literal["precise"] = "precise",
 ) -> tuple[mx.array, mx.array]:
     """Run exact stock R1 once, then the exact fused R2 finalizer once."""
 
@@ -1259,7 +1257,7 @@ def hy3_router_fp32_exact_splitk_route(
     scaling_factor: float = 2.826,
     finalizer_mode: Literal["serial", "simd"] = "simd",
     simd_groups: Literal[1, 2, 3, 4, 5, 6, 7, 8] = 6,
-    sigmoid_mode: Literal["precise", "fast-exp"] = "precise",
+    sigmoid_mode: Literal["precise"] = "precise",
 ) -> tuple[mx.array, mx.array]:
     """Run K-major FP32 split-K R1 and consume its partials directly in R2.
 
@@ -1385,7 +1383,7 @@ def hy3_router_fp32_route(
     scaling_factor: float = 2.826,
     finalizer_mode: Literal["serial", "simd"] = "serial",
     simd_groups: Literal[1, 2, 3, 4, 5, 6, 7, 8] = 6,
-    sigmoid_mode: Literal["precise", "fast-exp"] = "precise",
+    sigmoid_mode: Literal["precise"] = "precise",
 ) -> tuple[mx.array, mx.array]:
     """Project and finalize source-Hy3 K0..K7 router rows."""
 

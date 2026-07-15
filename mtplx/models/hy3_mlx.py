@@ -324,13 +324,11 @@ class Router(nn.Module):
             "stock",
             "steel-r1-fused-r2",
             "mpp-r1-fused-r2",
-            "mpp-r1-fast-fused-r2",
             "mpp-fp32-splitk-r1-fused-r2",
         }:
             raise ValueError(
                 "Hy3 router kernel must be 'stock', 'steel-r1-fused-r2', "
-                "'mpp-r1-fused-r2', 'mpp-r1-fast-fused-r2', or "
-                "'mpp-fp32-splitk-r1-fused-r2'"
+                "'mpp-r1-fused-r2', or 'mpp-fp32-splitk-r1-fused-r2'"
             )
         if splitk_m1 and selector != "mpp-fp32-splitk-r1-fused-r2":
             raise ValueError("splitk_m1 requires the FP32 split-K router selector")
@@ -466,11 +464,7 @@ class Router(nn.Module):
                 route_norm=self.route_norm,
                 scaling_factor=self.router_scaling_factor,
                 finalizer_mode="simd",
-                sigmoid_mode=(
-                    "fast-exp"
-                    if state.selector == "mpp-r1-fast-fused-r2"
-                    else "precise"
-                ),
+                sigmoid_mode="precise",
             )
         if isinstance(storage_gate, nn.QuantizedLinear):
             # Preserve the pinned community-Q4 affine-Q8 execution contract.
@@ -552,13 +546,11 @@ def estimate_hy3_router_kernel_incremental_bytes(
         "stock",
         "steel-r1-fused-r2",
         "mpp-r1-fused-r2",
-        "mpp-r1-fast-fused-r2",
         "mpp-fp32-splitk-r1-fused-r2",
     }:
         raise ValueError(
             "Hy3 router kernel must be 'stock', 'steel-r1-fused-r2', "
-            "'mpp-r1-fused-r2', 'mpp-r1-fast-fused-r2', or "
-            "'mpp-fp32-splitk-r1-fused-r2'"
+            "'mpp-r1-fused-r2', or 'mpp-fp32-splitk-r1-fused-r2'"
         )
     if selector == "stock":
         return 0

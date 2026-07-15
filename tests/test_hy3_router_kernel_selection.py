@@ -131,27 +131,11 @@ def test_router_mpp_r1_selector_prepares_once_and_dispatches_precise_r2(
     }
 
 
-def test_router_mpp_fast_r2_is_a_separate_selector(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_issue59_rejects_issue60_fast_r2_selector() -> None:
     router = _exact_router()
-    calls = []
 
-    def fake_mpp_route(value, weight, expert_bias, **kwargs):
-        calls.append((value, weight, expert_bias, kwargs))
-        output_shape = (*value.shape[:-1], 8)
-        return (
-            mx.zeros(output_shape, dtype=mx.int32),
-            mx.ones(output_shape, dtype=mx.float32),
-        )
-
-    monkeypatch.setattr(hy3_mlx, "hy3_router_fp32_route", fake_mpp_route)
-
-    report = router.configure_kernel("mpp-r1-fast-fused-r2", available=True)
-    router(mx.zeros((1, 3, 4096), dtype=mx.bfloat16))
-
-    assert report["selector"] == "mpp-r1-fast-fused-r2"
-    assert calls[0][3]["sigmoid_mode"] == "fast-exp"
+    with pytest.raises(ValueError, match="Hy3 router kernel"):
+        router.configure_kernel("mpp-r1-fast-fused-r2", available=True)
 
 
 def test_router_mpp_fp32_splitk_selector_dispatches_m4_precise_route(
@@ -377,7 +361,6 @@ def test_router_mpp_fp32_splitk_selector_matches_stock_routes_on_g17(
     (
         ("steel-r1-fused-r2", "hy3_router_fp32_exact_route"),
         ("mpp-r1-fused-r2", "hy3_router_fp32_route"),
-        ("mpp-r1-fast-fused-r2", "hy3_router_fp32_route"),
         (
             "mpp-fp32-splitk-r1-fused-r2",
             "hy3_router_fp32_exact_splitk_route",
@@ -419,7 +402,6 @@ def test_router_optimized_selectors_dispatch_native_m8(
     (
         "steel-r1-fused-r2",
         "mpp-r1-fused-r2",
-        "mpp-r1-fast-fused-r2",
         "mpp-fp32-splitk-r1-fused-r2",
     ),
 )
@@ -505,7 +487,6 @@ def test_configure_hy3_router_kernels_reports_incremental_memory() -> None:
         ("stock", 0),
         ("steel-r1-fused-r2", 4 * 192 * 4096 * 2),
         ("mpp-r1-fused-r2", 4 * 192 * 4096 * 2),
-        ("mpp-r1-fast-fused-r2", 4 * 192 * 4096 * 2),
         ("mpp-fp32-splitk-r1-fused-r2", 4 * 192 * 4096 * 4),
     ),
 )
