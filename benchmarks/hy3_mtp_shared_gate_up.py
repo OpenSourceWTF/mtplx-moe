@@ -141,6 +141,11 @@ def _metal_candidate_map() -> dict[str, Hy3MTPGateUpCandidate]:
         activation_modes=("exact",),
         weight_layouts=("packed2",),
     )
+    candidates += hy3_mtp_gate_up_candidates(
+        activation_modes=("exact",),
+        input_modes=("direct", "threadgroup_f32"),
+        weight_layouts=("packed2",),
+    )
     return {f"metal_{candidate.name}": candidate for candidate in candidates}
 
 
