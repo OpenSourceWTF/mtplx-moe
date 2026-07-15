@@ -150,6 +150,28 @@ def test_named_pairwise_comparisons_preserve_the_requested_boundary() -> None:
     assert observed["mlx_over_simd"]["bootstrap_mean_ratio_95_ci"][0] > 1.0
 
 
+def test_operator_gate_uses_incumbent_pair_instead_of_stock_speedup() -> None:
+    module = _load_script()
+    measurement = {
+        "comparisons": {
+            "candidate": {"bootstrap_mean_ratio_95_ci": [1.20, 1.30]},
+        },
+        "pairwise_comparisons": {
+            "incumbent_over_candidate": {
+                "bootstrap_mean_ratio_95_ci": [0.95, 0.99],
+            },
+        },
+    }
+
+    observed = module.operator_gate_speed_interval(
+        measurement,
+        candidate="candidate",
+        incumbent="incumbent",
+    )
+
+    assert observed == [0.95, 0.99]
+
+
 @pytest.mark.parametrize(
     (
         "candidate_topk_exact",

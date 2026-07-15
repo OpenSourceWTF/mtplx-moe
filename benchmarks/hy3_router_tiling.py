@@ -10,7 +10,7 @@ import statistics
 import struct
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -264,6 +264,33 @@ def router_candidate_passes(
         and bool(within_mode_deterministic)
         and float(bootstrap_mean_ratio_95_ci[0]) > 1.0
     )
+
+
+def operator_gate_speed_interval(
+    measurement: Mapping[str, Any],
+    *,
+    candidate: str,
+    incumbent: str = "n16_p8_tg96",
+) -> list[float] | None:
+    """Return the promotion boundary: stock for incumbent, incumbent otherwise."""
+
+    if candidate == incumbent:
+        comparisons = measurement.get("comparisons", {})
+        key = candidate
+    else:
+        comparisons = measurement.get("pairwise_comparisons", {})
+        key = f"{incumbent}_over_{candidate}"
+    if not isinstance(comparisons, Mapping):
+        return None
+    comparison = comparisons.get(key)
+    if not isinstance(comparison, Mapping):
+        return None
+    interval = comparison.get("bootstrap_mean_ratio_95_ci")
+    if not isinstance(interval, Sequence) or isinstance(interval, (str, bytes)):
+        return None
+    if len(interval) != 2:
+        return None
+    return [float(interval[0]), float(interval[1])]
 
 
 def authoritative_candidate_contract(
@@ -697,8 +724,11 @@ def run_benchmark(
         )
         decisions = {}
         for name in candidates:
-            comparison = complete_fused_router_simd["comparisons"].get(name)
-            if name not in correctness or comparison is None:
+            speed_interval = operator_gate_speed_interval(
+                complete_fused_router_simd,
+                candidate=name,
+            )
+            if name not in correctness or speed_interval is None:
                 decisions[name] = False
                 continue
             decisions[name] = router_candidate_passes(
@@ -707,7 +737,7 @@ def run_benchmark(
                 within_mode_deterministic=correctness[name][
                     "within_mode_deterministic"
                 ],
-                bootstrap_mean_ratio_95_ci=comparison["bootstrap_mean_ratio_95_ci"],
+                bootstrap_mean_ratio_95_ci=speed_interval,
             )
         result_rows.append(
             {
