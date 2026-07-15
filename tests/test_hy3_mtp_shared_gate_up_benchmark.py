@@ -49,3 +49,5 @@ def test_metal_candidate_map_includes_separate_stock_tn4_exact_arms() -> None:
     assert "metal_n24_r2_v16_exact" in candidates
     assert "metal_n24_r2_v4_fast_stock_tn4" not in candidates
     assert "metal_n24_r2_v4_exact_stock_tn4_direct" in candidates
+    assert "metal_n24_r2_v16_exact_direct" in candidates
+    assert "metal_n24_r2_v16_exact_threadgroup_f32" in candidates

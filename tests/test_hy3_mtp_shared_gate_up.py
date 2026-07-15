@@ -121,6 +121,25 @@ def test_mtp_gate_up_direct_input_source_removes_threadgroup_cache_and_barrier()
     assert "float activation = float(input_values[k]);" in source
 
 
+def test_mtp_gate_up_fp32_cache_converts_input_once_during_fill() -> None:
+    candidate = Hy3MTPGateUpCandidate(
+        n_tile=24,
+        k_vector=16,
+        rows_per_simdgroup=2,
+        input_mode="threadgroup_f32",
+    )
+
+    source = render_hy3_mtp_gate_up_source(candidate)
+    savings = hy3_mtp_gate_up_savings(candidate, depth=3)
+
+    assert candidate.name == "n24_r2_v16_exact_threadgroup_f32"
+    assert "threadgroup float activation_tile[4096]" in source
+    assert "activation_tile[k] = float(input_values[k]);" in source
+    assert "float activation = float(activation_tile[k]);" in source
+    assert savings["threadgroup_storage_bytes"] == 16_384
+    assert savings["threadgroup_barriers"] == 96
+
+
 def test_mtp_gate_up_savings_are_explicit_at_k3() -> None:
     candidate = Hy3MTPGateUpCandidate(
         n_tile=4,

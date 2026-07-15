@@ -17,7 +17,7 @@ HY3_MTP_K_VECTORS = (1, 2, 4, 8, 16)
 HY3_MTP_ROWS_PER_SIMDGROUP = (1, 2, 4, 8)
 HY3_MTP_ACTIVATION_MODES = ("exact", "fast")
 HY3_MTP_REDUCTION_LAYOUTS = ("striped", "stock_tn4")
-HY3_MTP_INPUT_MODES = ("threadgroup", "direct")
+HY3_MTP_INPUT_MODES = ("threadgroup", "threadgroup_f32", "direct")
 
 
 @dataclass(frozen=True)
@@ -137,19 +137,22 @@ def render_hy3_mtp_gate_up_source(candidate: Hy3MTPGateUpCandidate) -> str:
                 up_reduced += simd_shuffle_down(up_reduced, delta);
             }"""
     )
-    input_prelude = (
-        """threadgroup T activation_tile[4096];
+    if candidate.input_mode == "threadgroup":
+        input_prelude = """threadgroup T activation_tile[4096];
         for (uint k = thread_id; k < K; k += THREADS) {
             activation_tile[k] = input_values[k];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);"""
-        if candidate.input_mode == "threadgroup"
-        else ""
-    )
+    elif candidate.input_mode == "threadgroup_f32":
+        input_prelude = """threadgroup float activation_tile[4096];
+        for (uint k = thread_id; k < K; k += THREADS) {
+            activation_tile[k] = float(input_values[k]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);"""
+    else:
+        input_prelude = ""
     activation_source = (
-        "activation_tile[k]"
-        if candidate.input_mode == "threadgroup"
-        else "input_values[k]"
+        "input_values[k]" if candidate.input_mode == "direct" else "activation_tile[k]"
     )
     return f"""
         constexpr uint K = {HY3_MTP_HIDDEN_SIZE};
@@ -223,7 +226,14 @@ def hy3_mtp_gate_up_savings(
         2 * HY3_MTP_SHARED_INTERMEDIATE_SIZE * HY3_MTP_HIDDEN_SIZE * 2
     )
     threadgroups = threadgroups_per_depth * depth
-    uses_threadgroup_input = candidate.input_mode == "threadgroup"
+    uses_threadgroup_input = candidate.input_mode != "direct"
+    threadgroup_storage_bytes = (
+        HY3_MTP_HIDDEN_SIZE * 4
+        if candidate.input_mode == "threadgroup_f32"
+        else activation_bytes
+        if uses_threadgroup_input
+        else 0
+    )
     return {
         "depth": depth,
         # Two GEMVs plus SwiGLU become one kernel. The down GEMV is unchanged.
@@ -233,7 +243,7 @@ def hy3_mtp_gate_up_savings(
         "gate_up_weight_bytes_required": gate_up_weight_bytes * depth,
         # Gate/up BF16 arrays are neither written nor read by a separate SwiGLU.
         "intermediate_device_bytes_avoided": 4 * intermediate_bytes * depth,
-        "threadgroup_storage_bytes": activation_bytes if uses_threadgroup_input else 0,
+        "threadgroup_storage_bytes": threadgroup_storage_bytes,
         "threadgroups": threadgroups,
         "threadgroup_barriers": threadgroups if uses_threadgroup_input else 0,
         # Address-space load instructions; cache residency determines DRAM traffic.
