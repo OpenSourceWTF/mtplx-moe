@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .attention_context import current_attention_phase
 from .glm52_mtp_artifact import (
     VerifiedGlm52MtpArtifact,
     open_verified_glm52_mtp_layer78,
@@ -28,6 +29,16 @@ GLM52_MTP_BF16_FILE = "layer78-bf16.safetensors"
 
 _EXPERT_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 _HEAD_LOCAL_MODULES = ("eh_proj", "enorm", "hnorm")
+
+
+def _apply_independent_rows(module: Any, values: Any) -> Any:
+    # Preserve M=1 arithmetic while dispatching all verifier rows together on
+    # the batch axis. This is exact qlen=1 math, not a post-hoc comparison.
+    batch = int(values.shape[0])
+    length = int(values.shape[1])
+    independent = values.reshape((batch * length, 1, *values.shape[2:]))
+    output = module(independent)
+    return output.reshape((batch, length, *output.shape[2:]))
 
 
 class Glm52MTPLoadError(RuntimeError):
@@ -548,7 +559,13 @@ def inject_glm52_streamed_mtp_support(
                     if keep < 1:
                         raise ValueError("logits_keep must be positive when supplied")
                     head_hidden = hidden[:, -keep:, :]
-                logits = self.lm_head(head_hidden)
+                if (
+                    current_attention_phase() == "decode_verify"
+                    and head_hidden.shape[1] > 1
+                ):
+                    logits = _apply_independent_rows(self.lm_head, head_hidden)
+                else:
+                    logits = self.lm_head(head_hidden)
             if not return_hidden:
                 return logits
             return logits, hidden

@@ -3864,33 +3864,91 @@ def _prefill_with_hidden_sequence(
     hidden_variant: str,
     vision_splice: Any | None = None,
 ):
+    """Prefill once while retaining every target hidden row for MTP history.
+
+    Keep the target call shapes identical to ordinary AR prefill. A single
+    full-prompt BF16 call can leave a numerically different final cache row
+    from the canonical body-chunks-plus-final-token schedule, which makes a
+    later batched verifier condition on a different target state.
+    """
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty")
 
     cache = _make_target_prefill_cache(rt)
-    prompt_array = mx.array([prompt_ids])
-    prompt_embeddings = None
+    target_forward_time = 0.0
+    hidden_chunks: list[mx.array] = []
+    final_logits_only = _final_logits_prefill_enabled()
+
+    if len(prompt_ids) > 1:
+        body = prompt_ids[:-1]
+        body_array = mx.array([body])
+        for start, end in _iter_prefill_chunk_spans(len(body)):
+            chunk_array = body_array[:, start:end]
+            chunk_embeddings = None
+            if vision_splice is not None:
+                from mtplx.vision.splice import spliced_chunk_embeddings
+
+                chunk_embeddings = spliced_chunk_embeddings(
+                    rt.embed_tokens,
+                    chunk_array,
+                    vision_splice,
+                )
+            started = time.perf_counter()
+            with attention_phase("prefill"):
+                chunk_logits, chunk_hidden = rt.forward_ar(
+                    chunk_array,
+                    cache=cache,
+                    return_hidden=True,
+                    hidden_variant=hidden_variant,
+                    emit_logits=not final_logits_only,
+                    input_embeddings=chunk_embeddings,
+                )
+            if chunk_logits is None:
+                _eval(chunk_hidden)
+            else:
+                _eval(chunk_logits, chunk_hidden)
+            hidden_chunks.append(chunk_hidden)
+            target_forward_time += time.perf_counter() - started
+            _runtime_count(rt, "prefill_chunks")
+            target_forward_time += _prefill_chunk_cache_cleanup(rt)
+    final_array = mx.array([[prompt_ids[-1]]])
+    final_embeddings = None
     if vision_splice is not None:
         from mtplx.vision.splice import spliced_chunk_embeddings
 
-        prompt_embeddings = spliced_chunk_embeddings(
-            rt.embed_tokens, prompt_array, vision_splice
+        final_embeddings = spliced_chunk_embeddings(
+            rt.embed_tokens,
+            final_array,
+            vision_splice,
         )
+        if vision_splice.remaining() > 0:
+            raise ValueError(
+                "vision splice overflow: request supplied more vision rows "
+                f"({vision_splice.total_rows}) than image pad tokens in the prompt"
+            )
     started = time.perf_counter()
     with attention_phase("prefill"):
-        logits, hidden = rt.forward_ar(
-            prompt_array,
+        logits, final_hidden = rt.forward_ar(
+            final_array,
             cache=cache,
             return_hidden=True,
             hidden_variant=hidden_variant,
             emit_logits=True,
-            logits_keep=1 if _final_logits_prefill_enabled() else None,
-            input_embeddings=prompt_embeddings,
+            logits_keep=1 if final_logits_only else None,
+            input_embeddings=final_embeddings,
         )
-    _eval(logits, hidden)
-    target_forward_time = time.perf_counter() - started
+    _eval(logits, final_hidden)
+    target_forward_time += time.perf_counter() - started
+    hidden_chunks.append(final_hidden)
     target_forward_time += _maybe_repage_target_prefill_cache(cache)
-    return cache, logits[:, -1, :], hidden[:, -1:, :], hidden, target_forward_time
+    prompt_hidden = mx.concatenate(hidden_chunks, axis=1)
+    return (
+        cache,
+        logits[:, -1, :],
+        final_hidden[:, -1:, :],
+        prompt_hidden,
+        target_forward_time,
+    )
 
 
 def _mtp_cache_offset(mtp_cache) -> int:

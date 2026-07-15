@@ -8,9 +8,11 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 
+from mtplx.attention_context import attention_phase
 from mtplx.cache_state import restore_cache, snapshot_cache
 from mtplx.models.glm52_mlx import Model as GlmModel
 from mtplx.models.glm52_mlx import ModelArgs as GlmArgs
@@ -500,6 +502,49 @@ def test_glm52_injection_uses_prebuilt_head_without_reloading_artifact(
         mtp_module=prebuilt,
     )
     assert model.mtp is prebuilt
+
+
+def test_glm52_injected_target_verify_batches_independent_m1_head_rows(
+    tmp_path: Path,
+) -> None:
+    import mtplx.glm52_mtp_patch as glm52_mtp_patch
+
+    hidden = np.arange(3 * 4, dtype=np.float32).reshape(1, 3, 4)
+    head_shapes: list[tuple[int, ...]] = []
+
+    class StaticBackbone:
+        def __call__(self, _inputs, _cache=None):
+            return hidden
+
+    class RecordingHead:
+        def __call__(self, values):
+            head_shapes.append(tuple(int(size) for size in values.shape))
+            return values
+
+    class DummyOuter:
+        pass
+
+    model = DummyOuter()
+    model.args = SimpleNamespace(
+        num_nextn_predict_layers=1,
+        index_share_for_mtp_iteration=True,
+        index_topk=4,
+    )
+    model.model = StaticBackbone()
+    model.lm_head = RecordingHead()
+    assert glm52_mtp_patch.inject_glm52_streamed_mtp_support(
+        model,
+        tmp_path,
+        {"model_type": "glm_moe_dsa"},
+        MTPContract(),
+        expected_revision=TEST_REVISION,
+        mtp_module=SimpleNamespace(layers=[object()]),
+    )
+    with attention_phase("decode_verify"):
+        batched = model(np.array([[1, 2, 3]]), cache=object())
+
+    assert head_shapes == [(3, 1, 4)]
+    np.testing.assert_array_equal(batched, hidden)
 
 
 def test_glm52_recurrent_depth_requires_a_persistent_cache(
