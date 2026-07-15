@@ -140,6 +140,8 @@ class ExpertStreamingConfig:
     cache_scope: str = "layer"
     bypass_page_cache: bool = False
     resource_telemetry: bool = False
+    q2_expert_kernel: str = "stock"
+    hy3_router_kernel: str = "stock"
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -176,6 +178,17 @@ class ExpertStreamingConfig:
             raise ValueError("cache_policy must be 'frequency' or 'lru'")
         if self.cache_scope not in {"layer", "global"}:
             raise ValueError("cache_scope must be 'layer' or 'global'")
+        if self.q2_expert_kernel not in {
+            "stock",
+            "nax",
+            "fused",
+            "fused-nax",
+        }:
+            raise ValueError(
+                "q2_expert_kernel must be 'stock', 'nax', 'fused', or 'fused-nax'"
+            )
+        if self.hy3_router_kernel not in {"stock", "fused-fp32"}:
+            raise ValueError("hy3_router_kernel must be 'stock' or 'fused-fp32'")
         if self.slot_layout not in {
             "direct-slots",
             "component-banks",

@@ -384,6 +384,8 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
     assert args.runtime_reserve == "12GiB"
     assert args.expert_cache_limit == "64GiB"
     assert args.max_live_kv_tokens == 4096
+    assert args.q2_expert_kernel == "stock"
+    assert args.hy3_router_kernel == "stock"
     assert args.resource_telemetry is False
     assert args.resource_sample_interval == 0.25
     assert args.resource_max_samples == 4096
@@ -396,6 +398,22 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
     assert args.trace_routes is False
     assert args.hy3_q2_prompt_tail is None
     assert args.glm52_q2_prompt_tail is None
+
+
+def test_issue51_kernel_selectors_parse_independently() -> None:
+    module = _load_module()
+
+    args = module.build_parser().parse_args(
+        [
+            "--q2-expert-kernel",
+            "fused-nax",
+            "--hy3-router-kernel",
+            "fused-fp32",
+        ]
+    )
+
+    assert args.q2_expert_kernel == "fused-nax"
+    assert args.hy3_router_kernel == "fused-fp32"
 
 
 @pytest.mark.parametrize(
@@ -707,6 +725,30 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
         and prompt["prompt_artifact_kinds"] == 6
         for model in payload["models"]
         for prompt in model["prompts"]
+    )
+
+
+def test_issue51_kernel_selectors_reach_runtime_and_artifact(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (1,)}],
+        contexts=(1024,),
+        runtime_options={
+            "q2_expert_kernel": "nax",
+            "hy3_router_kernel": "fused-fp32",
+        },
+        apis=apis,
+    )
+
+    assert calls.configs[0]["q2_expert_kernel"] == "nax"
+    assert calls.configs[0]["hy3_router_kernel"] == "fused-fp32"
+    assert payload["configuration"]["runtime"]["q2_expert_kernel"] == "nax"
+    assert payload["configuration"]["runtime"]["hy3_router_kernel"] == "fused-fp32"
+    assert payload["models"][0]["runtime_config"]["q2_expert_kernel"] == "nax"
+    assert payload["models"][0]["runtime_config"]["hy3_router_kernel"] == (
+        "fused-fp32"
     )
 
 
