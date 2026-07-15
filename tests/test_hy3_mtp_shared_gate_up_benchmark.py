@@ -115,3 +115,50 @@ def test_candidate_extra_bytes_distinguishes_benchmark_only_packing() -> None:
         )
         == 0
     )
+
+
+def test_candidate_modules_share_one_packed_tensor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    benchmark = _benchmark_module()
+    gate, up, down, packed = object(), object(), object(), object()
+    stack_calls = []
+    module_calls = []
+
+    def fake_stack(values, *, axis):
+        stack_calls.append((values, axis))
+        return packed
+
+    def fake_candidate_shared(
+        name,
+        args,
+        gate_weight,
+        up_weight,
+        down_weight,
+        *,
+        packed_weight=None,
+    ):
+        module_calls.append(
+            (name, args, gate_weight, up_weight, down_weight, packed_weight)
+        )
+        return name
+
+    monkeypatch.setattr(benchmark.mx, "stack", fake_stack)
+    monkeypatch.setattr(benchmark, "_candidate_shared", fake_candidate_shared)
+    names = (
+        "metal_n24_r2_v16_exact_packed2",
+        "metal_n24_r2_v16_exact_direct_packed2",
+        "metal_n24_r2_v16_exact",
+    )
+
+    modules = benchmark._candidate_modules(
+        names,
+        SimpleNamespace(),
+        gate,
+        up,
+        down,
+    )
+
+    assert modules == {name: name for name in names}
+    assert stack_calls == [((gate, up), -1)]
+    assert [call[-1] for call in module_calls] == [packed, packed, None]

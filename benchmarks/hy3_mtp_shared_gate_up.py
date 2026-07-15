@@ -171,6 +171,8 @@ def _candidate_shared(
     gate: mx.array,
     up: mx.array,
     down: mx.array,
+    *,
+    packed_weight: mx.array | None = None,
 ) -> nn.Module:
     if name == "block":
         return _block_packed_shared(args, gate, up, down)
@@ -184,7 +186,8 @@ def _candidate_shared(
         if candidate is None:
             raise ValueError(f"unknown candidate {name!r}")
         if candidate.weight_layout == "packed2":
-            packed_weight = mx.stack((gate, up), axis=-1)
+            if packed_weight is None:
+                packed_weight = mx.stack((gate, up), axis=-1)
             module = MetalPackedFusedMTPSharedMLP(
                 packed_weight,
                 down,
@@ -201,6 +204,40 @@ def _candidate_shared(
         raise ValueError(f"unknown candidate {name!r}")
     mx.eval(module.parameters())
     return module
+
+
+def _candidate_modules(
+    names: tuple[str, ...],
+    args: ModelArgs,
+    gate: mx.array,
+    up: mx.array,
+    down: mx.array,
+) -> dict[str, nn.Module]:
+    """Construct candidates while sharing one benchmark-only packed tensor."""
+
+    metal_candidates = _metal_candidate_map()
+    needs_packed = any(
+        (candidate := metal_candidates.get(name)) is not None
+        and candidate.weight_layout == "packed2"
+        for name in names
+    )
+    packed_weight = mx.stack((gate, up), axis=-1) if needs_packed else None
+    return {
+        name: _candidate_shared(
+            name,
+            args,
+            gate,
+            up,
+            down,
+            packed_weight=(
+                packed_weight
+                if (candidate := metal_candidates.get(name)) is not None
+                and candidate.weight_layout == "packed2"
+                else None
+            ),
+        )
+        for name in names
+    }
 
 
 def _module_names(
@@ -443,10 +480,13 @@ def main() -> int:
         args.mtp_artifacts.expanduser() / "layer80-bf16.safetensors"
     )
     control_shared = _control_shared(gate, up, down)
-    candidate_modules = {
-        name: _candidate_shared(name, model_args, gate, up, down)
-        for name in module_names
-    }
+    candidate_modules = _candidate_modules(
+        module_names,
+        model_args,
+        gate,
+        up,
+        down,
+    )
     mx.eval(control_shared.parameters())
     mx.random.seed(6903)
     value = mx.random.normal((1, 1, model_args.hidden_size)).astype(mx.bfloat16)
@@ -467,10 +507,13 @@ def main() -> int:
         up = loaded_shared.up_proj.weight
         down = loaded_shared.down_proj.weight
         control_shared = loaded_shared
-        candidate_modules = {
-            name: _candidate_shared(name, model_args, gate, up, down)
-            for name in module_names
-        }
+        candidate_modules = _candidate_modules(
+            module_names,
+            model_args,
+            gate,
+            up,
+            down,
+        )
 
     measurement_control_shared = (
         control_shared
@@ -611,6 +654,15 @@ def main() -> int:
             "candidate_steady_extra_bytes_after_source_release": 0,
             "benchmark_extra_bytes_per_packed_candidate": gate_up_bytes,
             "benchmark_extra_bytes_per_split_metal_candidate": 0,
+            "benchmark_unique_shared_packed_bytes": (
+                gate_up_bytes
+                if any(
+                    _candidate_extra_bytes(name, gate_up_bytes=gate_up_bytes)
+                    for name in module_names
+                    if name.startswith("metal_")
+                )
+                else 0
+            ),
             "benchmark_extra_bytes_by_module": {
                 name: _candidate_extra_bytes(name, gate_up_bytes=gate_up_bytes)
                 for name in module_names
