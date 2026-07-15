@@ -7,15 +7,15 @@
 > `superpowers-optimized:verification-before-completion` before completion
 > claims. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add independently measurable Q2 NAX, fused K-row, and fused-plus-NAX
-expert execution arms for streamed Hy3 without changing router, cache, or slot
-ownership semantics.
+**Goal:** Add independently measurable fused FP32 router, Q2 NAX, fused K-row,
+and combined execution arms for streamed Hy3 without changing route decisions,
+cache behavior, or slot ownership semantics.
 
-**Architecture:** Keep the stock component-bank path as the default and add one
-fail-closed runtime selector. Q2 NAX groups rows that share a pinned expert;
-the fused arm keeps assignment-indexed mixed-expert rows and replaces the
-gate/up/SwiGLU sequence with one Metal kernel plus a Q2 down kernel. The
-combined arm reuses NAX grouping while fusing gate/up/SwiGLU.
+**Architecture:** Keep both stock stages as defaults and add independent,
+fail-closed router and expert selectors. Stage R fuses the batched FP32 router
+through deterministic top-k; the CPU then resolves and pins authoritative
+expert slots. Stage E tests shared-RHS Q2 NAX and assignment-indexed fused
+gate/up/SwiGLU plus down kernels independently before combining them.
 
 **Tech Stack:** Python 3.12, MLX 0.31.x, `mx.fast.metal_kernel`, Metal 4
 MetalPerformancePrimitives tensor operations, pytest, Ruff, and the existing
@@ -42,11 +42,14 @@ Hy3 component-bank runtime.
   counters.
 - `mtplx/kernels/q2_fused_expert.py`: assignment-indexed Q2
   gate+up+SwiGLU and down kernels.
+- `mtplx/kernels/hy3_router_fp32.py`: batched fused FP32 router projection,
+  deterministic top-k, normalization, and scaling.
 - `scripts/benchmark_q2_expert_kernels.py`: real-record operator benchmark for
   stock, NAX, fused, and fused-NAX arms.
 - `tests/test_q2_nax.py`: Q2 NAX eligibility, unpacking, exactness, and fallback.
 - `tests/test_q2_fused_expert.py`: mixed-slot fused-kernel exactness and shape
   tests.
+- `tests/test_hy3_router_fp32.py`: exact router IDs/order/weights and fallback.
 - `tests/test_benchmark_q2_expert_kernels.py`: pure CLI/schema/gate tests.
 
 ### Modify
@@ -55,6 +58,8 @@ Hy3 component-bank runtime.
   immutable streaming config.
 - `mtplx/models/expert_mlx.py`: dispatch the selected arm inside the existing
   pinned component-bank wave.
+- `mtplx/models/hy3_mlx.py`: dispatch the independently selected fused FP32
+  router while preserving the public router result.
 - `scripts/benchmark_q2_mtp_depth_matrix.py`: expose and serialize the selector.
 - `tests/test_expert_slots_runtime.py`: config validation and serialization.
 - `tests/test_streamed_models.py`: assignment order, fallback, pin/fence, and
@@ -152,8 +157,10 @@ Expected: FAIL because the selector does not exist.
 - [ ] **Step 3: Add the immutable selector**
 
 Add `q2_expert_kernel: str = "stock"` and validate exactly
-`{"stock", "nax", "fused", "fused-nax"}`. Add the matching CLI choice and
-pass it into `ExpertStreamingConfig`. Serialize it in every matrix artifact.
+`{"stock", "nax", "fused", "fused-nax"}`. Also add
+`hy3_router_kernel: str = "stock"`, validated against
+`{"stock", "fused-fp32"}`. Add matching CLI choices, pass both into
+`ExpertStreamingConfig`, and serialize both in every matrix artifact.
 
 - [ ] **Step 4: Run GREEN**
 
@@ -273,7 +280,55 @@ sample, and emit per-stage and total timings plus exactness and counters.
 
 Expected: complete K=0...6 NAX table before fused-kernel timing begins.
 
-## Task 5: Implement assignment-indexed fused K-row Q2 kernels
+## Task 5: Implement and benchmark the independent FP32 router stage
+
+**Files:**
+
+- Create: `mtplx/kernels/hy3_router_fp32.py`
+- Create: `tests/test_hy3_router_fp32.py`
+- Modify: `mtplx/models/hy3_mlx.py`
+- Modify: `mtplx/models/expert_mlx.py`
+
+**Security flag:** `none`
+
+**Does NOT cover:** Expert arithmetic, cross-layer router execution, predicted
+routes, or any change to SSD admission.
+
+- [ ] **Step 1: Write failing exact-router tests**
+
+For K=0...6, compare stock and candidate on deterministic BF16 inputs and the
+real Hy3 router geometry. Require exact top-8 membership/order and exact FP32
+routing weights with route normalization both enabled and disabled. Include
+equal-score/tie fixtures and reject unsupported shapes/dtypes before dispatch.
+
+- [ ] **Step 2: Run RED**
+
+```bash
+.venv/bin/python -m pytest -q tests/test_hy3_router_fp32.py
+```
+
+Expected: FAIL because the fused router module does not exist.
+
+- [ ] **Step 3: Implement Stage R**
+
+Fuse FP32 projection, sigmoid, expert-bias selection score, deterministic
+top-8, original-score gather, normalization, and scaling. Return exactly
+`(indices, weights)` with `[K+1,8]` shapes. Bind the immutable router selector
+during `bind_streamed_switches`; keep stock as the default and fallback.
+
+- [ ] **Step 4: Run GREEN and microbenchmark**
+
+```bash
+.venv/bin/python -m pytest -q tests/test_hy3_router_fp32.py \
+  tests/test_streamed_models.py -k router
+.venv/bin/python scripts/benchmark_q2_expert_kernels.py \
+  --arms stock,router-fused --depths 0,1,2,3,4,5,6 \
+  --output-json /tmp/issue51-router-fp32.json
+```
+
+Expected: exact router parity and a separately reported Stage-R decision.
+
+## Task 6: Implement assignment-indexed fused K-row Q2 kernels
 
 **Files:**
 
@@ -322,7 +377,7 @@ Return `[M,4096]` in input assignment order so no new scatter is required.
 Expected: PASS with deterministic bounded-error parity against three stock
 `mx.gather_qmm` operations.
 
-## Task 6: Wire and benchmark fused K-row execution alone
+## Task 7: Wire and benchmark fused K-row execution alone
 
 **Files:**
 
@@ -367,7 +422,7 @@ eligible; otherwise execute the unchanged stock path before any custom launch.
 Expected: per-K stock/fused operator table with grouping absent from fused
 timings and exactness gates passed.
 
-## Task 7: Implement and benchmark fused plus NAX
+## Task 8: Implement and benchmark fused plus NAX
 
 **Files:**
 
@@ -413,7 +468,7 @@ rounded SwiGLU intermediate. Keep the existing NAX down primitive as launch 2.
 Expected: fused-NAX is compared directly with both individual arms and all
 correctness fields pass.
 
-## Task 8: Run end-to-end promotion gates and publish Issue 51
+## Task 9: Run two-stage combinations, promotion gates, and publish Issue 51
 
 **Files:**
 
@@ -436,6 +491,10 @@ For each eligible arm, run 1,024/2,048/4,096 inputs with 1,028 outputs, fixed 56
 reader slots, max-live-KV 8192, one resident model load, interactive QoS, and
 the exact Qwen unload/restore guard.
 
+Run stock, R, N, F, FN, R+F, and R+FN only when their individual dependency
+gates authorize them. Compare every combination with its faster immediate
+constituent.
+
 - [ ] **Step 3: Run the 128-output qualification lane**
 
 Only an arm with positive sustained paired decode evidence advances. Require
@@ -445,11 +504,13 @@ all Issue 51 event/cache/final-state gates and exact token parity.
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_q2_nax.py \
-  tests/test_q2_fused_expert.py tests/test_streamed_models.py \
+  tests/test_q2_fused_expert.py tests/test_hy3_router_fp32.py \
+  tests/test_streamed_models.py \
   tests/test_expert_slots_runtime.py \
   tests/test_benchmark_q2_expert_kernels.py \
   tests/test_benchmark_q2_mtp_depth_matrix.py
 .venv/bin/ruff check mtplx/q2_nax.py mtplx/kernels/q2_fused_expert.py \
+  mtplx/kernels/hy3_router_fp32.py mtplx/models/hy3_mlx.py \
   mtplx/models/expert_mlx.py mtplx/expert_runtime.py \
   scripts/benchmark_q2_expert_kernels.py \
   scripts/benchmark_q2_mtp_depth_matrix.py tests
@@ -463,4 +524,3 @@ Expected: all tests and lint pass.
 Post operator and end-to-end tables to Issue 51 as context blocks complete.
 Restore `com.tea.qwen`, wait for `/v1/models`, and require exact model
 `mtplx-qwen36-27b-optimized-speed` before releasing the exclusive lane.
-

@@ -30,9 +30,10 @@ The target is the streamed Hy3 expert-only affine-Q2 artifact:
 - assignment rows `M = R * 8`, split only when the bounded route-wave and slot
   ownership contracts require it.
 
-The work changes only expert arithmetic below the authoritative router. It does
-not predict routes, admit speculative slots, alter the artifact, weaken cache
-ownership, change verifier acceptance, or make NAX a hardware requirement.
+The work preserves the router as authoritative but may replace its arithmetic
+with an exact fused FP32 implementation before optimizing expert arithmetic.
+It does not predict routes, admit speculative slots, alter the artifact, weaken
+cache ownership, change verifier acceptance, or make NAX a hardware requirement.
 
 ## Existing boundary
 
@@ -51,6 +52,12 @@ Hy3 applies routing scores and the top-k reduction.
 The existing NAX patch does not cover this path: it dispatches 4/6/8-bit
 `nn.QuantizedLinear`, while Hy3 streamed experts call 2-bit `mx.gather_qmm`.
 
+Immediately before that boundary, `Router` already evaluates all `K+1` target
+rows together, but leaves FP32 projection, sigmoid, expert-bias addition,
+top-k, score gather, normalization, and scaling as separate graph operations.
+The selected IDs must be known before the CPU can resolve and pin streamed
+expert slots, so router and expert work are necessarily two stages.
+
 ## Considered approaches
 
 ### A. One full-MLP kernel per down-output tile
@@ -61,7 +68,17 @@ threadgroup memory or recomputes gate/up for every 4,096-output down tile.
 The latter repeats most expert weight reads; the former does not scale to a
 large mixed-assignment tile. This approach is rejected.
 
-### B. Two-stage assignment-indexed fusion
+### B. Two fused stages separated by authoritative routing
+
+Stage R fuses the batched FP32 router projection and deterministic top-k score
+pipeline for all `K+1` rows. It emits `(K+1,8)` expert IDs and FP32 routing
+weights. The existing runtime then resolves slots and starts required reads.
+Stage E performs the parallel Q2 expert work for `8*(K+1)` assignments.
+
+This is the recommended system boundary. There can be no router-to-expert
+single kernel because streamed weight residency is decided between the stages.
+
+### C. Two-stage assignment-indexed expert fusion
 
 Use one gather-aware kernel for gate+up+exact-SwiGLU and one gather-aware down
 kernel. Both accept all assignment rows in the current component-bank wave and
@@ -71,7 +88,7 @@ It supports singleton and mixed-expert rows without Python grouping.
 
 This is the recommended fused K-row arm.
 
-### C. Group by expert and use a shared-RHS NAX tile
+### D. Group by expert and use a shared-RHS NAX tile
 
 Group assignment rows by `(component bank, slot generation)`, pad each group to
 the NAX tile, and reuse one expert matrix across its rows. This matches
@@ -98,6 +115,18 @@ Every custom operator is fail-closed. It is eligible only for:
 Ineligible calls use the unchanged `mx.gather_qmm` path. Prefill remains stock.
 Kernel selection is fixed before an expert wave starts and never changes while
 that wave is in flight.
+
+### Arm R: fused FP32 router independently
+
+`hy3_router_fp32.py` accepts `[K+1,4096]` activation rows plus the resident
+router weight and expert bias. It performs the FP32 projection, sigmoid,
+selection-bias addition, deterministic top-8 selection, original-score gather,
+optional route normalization, and scaling. Its public result is exactly the
+same pair used today: `(indices, routing_weights)` with shapes `(K+1,8)`.
+
+The implementation must preserve the existing top-k membership and order,
+including ties, and the FP32 normalization reduction order. It is benchmarked
+alone with stock experts before it participates in any Stage-E combination.
 
 ### Arm N: Q2 NAX independently
 
@@ -148,6 +177,13 @@ ownership, and fallback match Arm N exactly, isolating the value of fusion.
 The combination is compared against stock, Arm N, and Arm F. It is retained
 only if it adds value over the faster individual arm.
 
+### Two-stage combinations
+
+After Arm R and the Stage-E arms complete independently, measure R+F and R+FN.
+R+F is the complete non-NAX two-stage fused pipeline. R+FN is the final
+router-fused, expert-fused, NAX-powered pipeline. Each combination must beat
+its faster immediate constituent, not only the all-stock control.
+
 ## Exactness and ownership contracts
 
 Operator tests compare every arm with stock Q2 at M=1...7 per shared expert and
@@ -167,6 +203,10 @@ Required invariants:
 - no pin release before the final custom-kernel consumer completes;
 - no unsupported hardware or shape silently enters a custom lane.
 
+Router tests additionally cover K=0...6, exact expert-ID membership and order,
+exact gathered/scaled FP32 weights, tie behavior, route normalization on/off,
+and downstream route identity at every layer.
+
 The known 2,048-token stock serial-versus-batched divergence must be classified
 and fixed before a custom arm can be promoted. A custom arm may not use that
 pre-existing drift to relax its comparison.
@@ -179,14 +219,16 @@ Use real component-bank records and retained route geometries. For each arm and
 K=0...6 report:
 
 - gate/up/SwiGLU, down, grouping, scatter, and total elapsed time;
+- FP32 router projection, selection, normalization, and total Stage-R time;
 - assignment count, unique experts, repeated-expert fraction, and group-size
   histogram;
 - effective packed-weight bandwidth;
 - median and paired distribution versus immediate stock control;
 - maximum and percentile elementwise error.
 
-Arm N must be tested first. Arm F follows independently. Arm FN is forbidden
-until both individual operator arms complete their gates.
+Arm N must be tested first. Arm R and Arm F follow independently. Arm FN is
+forbidden until both Stage-E individual arms complete their gates; R+F and
+R+FN are forbidden until Arm R also passes.
 
 ### End-to-end gate
 
@@ -198,7 +240,8 @@ saturation, memory, and token parity.
 An arm advances only with a positive paired decode interval against its
 immediate control and no material regression in prefill, memory, cache hit
 rate, correctness, or final health. Arm FN must beat the faster of Arm N and
-Arm F, not merely stock.
+Arm F, R+F must beat both R and F, and R+FN must beat both R and FN. A
+combination does not pass merely by beating stock.
 
 ## Error handling and rollout
 
@@ -227,4 +270,6 @@ the 128-output qualification lane after sustained evidence passes.
    The existing wave/bank partition is retained and charged in real-geometry
    benchmarks. Cross-bank fusion is a non-goal because it would broaden slot
    ownership and memory-layout risk.
-
+5. **Critical: fused top-k changes membership or ordering on a close/tied
+   router score.** The stock router output is compared exactly for every row
+   and layer; any membership, order, or FP32 weight difference rejects Arm R.
