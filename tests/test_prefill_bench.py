@@ -4,8 +4,15 @@ import os
 from argparse import Namespace
 from types import SimpleNamespace
 
+import pytest
+
 import mtplx.generation as generation
 import mtplx.runtime as runtime
+from mtplx.benchmarks.programming_prompts import (
+    PROGRAMMING_ARTIFACT_KINDS,
+    build_programming_context,
+    programming_context_stats,
+)
 from mtplx.prefill_bench import (
     DEFAULT_FINAL_REQUEST,
     _prompt_build_for_context,
@@ -28,6 +35,25 @@ class _CharTokenizer:
         if add_generation_prompt:
             text += "<assistant>\n"
         return self.encode(text) if tokenize else text
+
+
+def test_programming_context_is_deterministic_and_structurally_varied() -> None:
+    first = build_programming_context(minimum_characters=80_000)
+    second = build_programming_context(minimum_characters=80_000)
+
+    assert first == second
+    assert len(first) >= 80_000
+    stats = programming_context_stats(first)
+    assert set(stats["artifact_kinds"]) == set(PROGRAMMING_ARTIFACT_KINDS)
+    assert stats["artifact_count"] >= len(PROGRAMMING_ARTIFACT_KINDS) * 2
+    assert stats["largest_duplicate_count"] <= 2
+    for phrase in ("def ", "class ", "pytest", "README", "pyproject.toml"):
+        assert phrase in first
+
+
+def test_programming_context_rejects_non_positive_target() -> None:
+    with pytest.raises(ValueError, match="minimum_characters must be positive"):
+        build_programming_context(minimum_characters=0)
 
 
 def test_prefill_prompt_preserves_coherent_tail() -> None:
