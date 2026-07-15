@@ -105,6 +105,32 @@ def test_mtp_gate_up_stock_tn4_source_matches_mlx_gemv_reduction_order() -> None
     assert "simd_sum" not in source
 
 
+def test_mtp_gate_up_reduction_factor_arms_separate_k_order_from_tree() -> None:
+    striped_tree = render_hy3_mtp_gate_up_source(
+        Hy3MTPGateUpCandidate(
+            n_tile=24,
+            k_vector=16,
+            rows_per_simdgroup=2,
+            reduction_layout="striped_tree",
+        )
+    )
+    stock_sum = render_hy3_mtp_gate_up_source(
+        Hy3MTPGateUpCandidate(
+            n_tile=24,
+            k_vector=4,
+            rows_per_simdgroup=2,
+            reduction_layout="stock_tn4_sum",
+        )
+    )
+
+    assert "uint k = k_base + offset * 32 + lane;" in striped_tree
+    assert "simd_shuffle_down(gate_reduced, delta)" in striped_tree
+    assert "simd_sum" not in striped_tree
+    assert "uint k = k_base + lane * K_VECTOR + offset;" in stock_sum
+    assert "simd_sum(gate_sum[row])" in stock_sum
+    assert "simd_shuffle_down" not in stock_sum
+
+
 def test_mtp_gate_up_direct_input_source_removes_threadgroup_cache_and_barrier() -> (
     None
 ):

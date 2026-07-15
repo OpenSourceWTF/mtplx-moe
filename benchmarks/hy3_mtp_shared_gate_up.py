@@ -151,6 +151,10 @@ def _metal_candidate_map() -> dict[str, Hy3MTPGateUpCandidate]:
         reduction_layouts=("stock_tn4",),
         weight_layouts=("packed2",),
     )
+    candidates += hy3_mtp_gate_up_candidates(
+        activation_modes=("exact",),
+        reduction_layouts=("striped_tree", "stock_tn4_sum"),
+    )
     return {f"metal_{candidate.name}": candidate for candidate in candidates}
 
 

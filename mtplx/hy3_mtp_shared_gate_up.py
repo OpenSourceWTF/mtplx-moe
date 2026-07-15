@@ -16,7 +16,12 @@ HY3_MTP_N_TILES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
 HY3_MTP_K_VECTORS = (1, 2, 4, 8, 16)
 HY3_MTP_ROWS_PER_SIMDGROUP = (1, 2, 4, 8)
 HY3_MTP_ACTIVATION_MODES = ("exact", "fast")
-HY3_MTP_REDUCTION_LAYOUTS = ("striped", "stock_tn4")
+HY3_MTP_REDUCTION_LAYOUTS = (
+    "striped",
+    "striped_tree",
+    "stock_tn4",
+    "stock_tn4_sum",
+)
 HY3_MTP_INPUT_MODES = ("threadgroup", "threadgroup_f32", "direct")
 HY3_MTP_WEIGHT_LAYOUTS = ("split", "packed2")
 
@@ -55,8 +60,8 @@ class Hy3MTPGateUpCandidate:
             raise ValueError(
                 f"reduction_layout must be one of {HY3_MTP_REDUCTION_LAYOUTS}"
             )
-        if self.reduction_layout == "stock_tn4" and self.k_vector != 4:
-            raise ValueError("stock_tn4 reduction_layout requires k_vector=4")
+        if self.reduction_layout.startswith("stock_tn4") and self.k_vector != 4:
+            raise ValueError("stock_tn4 reduction layouts require k_vector=4")
         if self.input_mode not in HY3_MTP_INPUT_MODES:
             raise ValueError(f"input_mode must be one of {HY3_MTP_INPUT_MODES}")
         if self.weight_layout not in HY3_MTP_WEIGHT_LAYOUTS:
@@ -121,7 +126,7 @@ def hy3_mtp_gate_up_candidates(
             HY3_MTP_ROWS_PER_SIMDGROUP,
             HY3_MTP_K_VECTORS,
         )
-        if reduction_layout != "stock_tn4" or k_vector == 4
+        if not reduction_layout.startswith("stock_tn4") or k_vector == 4
     )
 
 
@@ -133,21 +138,26 @@ def render_hy3_mtp_gate_up_source(candidate: Hy3MTPGateUpCandidate) -> str:
         if candidate.activation_mode == "exact"
         else "fast::exp(metal::abs(gate_value))"
     )
+    uses_stock_tn4_k_order = candidate.reduction_layout.startswith("stock_tn4")
+    uses_explicit_tree = candidate.reduction_layout in {
+        "striped_tree",
+        "stock_tn4",
+    }
     k_index = (
-        "k_base + offset * 32 + lane"
-        if candidate.reduction_layout == "striped"
-        else "k_base + lane * K_VECTOR + offset"
+        "k_base + lane * K_VECTOR + offset"
+        if uses_stock_tn4_k_order
+        else "k_base + offset * 32 + lane"
     )
     reduction = (
-        """float gate_reduced = simd_sum(gate_sum[row]);
-            float up_reduced = simd_sum(up_sum[row]);"""
-        if candidate.reduction_layout == "striped"
-        else """float gate_reduced = gate_sum[row];
+        """float gate_reduced = gate_sum[row];
             float up_reduced = up_sum[row];
             for (ushort delta = 16; delta >= 1; delta >>= 1) {
                 gate_reduced += simd_shuffle_down(gate_reduced, delta);
                 up_reduced += simd_shuffle_down(up_reduced, delta);
             }"""
+        if uses_explicit_tree
+        else """float gate_reduced = simd_sum(gate_sum[row]);
+            float up_reduced = simd_sum(up_sum[row]);"""
     )
     if candidate.input_mode == "threadgroup":
         input_prelude = """threadgroup T activation_tile[4096];
