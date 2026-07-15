@@ -28,6 +28,7 @@ def _streamed_mtp_backend(model_key: str, precision: str) -> str:
         "hy3-q4": ("hy3", {"bf16", "q4"}),
         "hy3-expert-q2": ("hy3", {"bf16"}),
         "glm52-expert-q2": ("glm52", {"bf16"}),
+        "glm52-q4": ("glm52", {"bf16"}),
     }
     selected = support.get(str(model_key))
     if selected is None:
@@ -397,8 +398,8 @@ def _load_impl(
     """Load an MLX model and optionally inject native MTP support.
 
     ``mtp_precision`` selects the streamed external draft head. Both expert-Q2
-    lanes require their exact BF16 head; the legacy Hy3-Q4 lane also retains
-    its explicit Q4 diagnostic mode.
+    lanes and GLM-5.2 Q4 require their exact BF16 head; the legacy Hy3-Q4 lane
+    also retains its explicit Q4 diagnostic mode.
     """
     from .hy3_mtp_patch import HY3_MTP_PRECISIONS
 
