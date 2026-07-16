@@ -1458,12 +1458,23 @@ class ExpertStreamingRuntime:
             self._deferred_slot_releases = pending
         pending.append((ready, wave_output))
 
-    def flush_deferred_slot_releases(self) -> None:
-        """Release queued routes; the caller just completed a covering eval."""
+    def flush_deferred_slot_releases(self, *, evaluate: bool = False) -> None:
+        """Release queued routes; the caller just completed a covering eval.
+
+        ``evaluate=True`` fences the pending wave outputs first and is safe at
+        any generation-thread boundary (row end, reset, close) where no later
+        eval is guaranteed to cover them.
+        """
 
         pending = getattr(self, "_deferred_slot_releases", None)
         if not pending:
             return
+        if evaluate:
+            # Local import: this module stays MLX-free at import time so the
+            # I/O layer never touches MLX from worker contexts.
+            import mlx.core as mx
+
+            mx.eval(*[wave_output for _ready, wave_output in pending])
         first_error: BaseException | None = None
         while pending:
             ready, _wave_output = pending.pop(0)
@@ -2050,6 +2061,9 @@ class ExpertStreamingRuntime:
             return self._banks[layer].prepare_prefill_seed(expert_ids)
 
     def reset(self) -> None:
+        # Deferred pin releases must flush (with a covering fence) before the
+        # pool resets, or reset waits forever on the final routes' pins.
+        self.flush_deferred_slot_releases(evaluate=True)
         locks = tuple(dict.fromkeys(self._layer_locks.values()))
         for lock in locks:
             lock.acquire()
@@ -2192,6 +2206,7 @@ class ExpertStreamingRuntime:
         return snapshot
 
     def close(self, *, timeout: float | None = None) -> None:
+        self.flush_deferred_slot_releases(evaluate=True)
         deadline = None if timeout is None else time.monotonic() + timeout
         if deadline is None:
             self._close_lock.acquire()

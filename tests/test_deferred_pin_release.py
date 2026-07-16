@@ -75,6 +75,51 @@ def test_flush_releases_remaining_entries_when_one_raises() -> None:
     assert not runtime._deferred_slot_releases
 
 
+def test_flush_with_evaluate_fences_pending_outputs_first(monkeypatch) -> None:
+    runtime = _runtime_stub()
+    log: list = []
+    order: list[str] = []
+    ready = _FakeReady(log, "pending")
+    marker = mx.zeros((1,))
+    runtime.defer_slot_release(ready, marker)
+    monkeypatch.setattr(
+        "mlx.core.eval",
+        lambda *values: order.append(f"eval:{len(values)}"),
+    )
+    original = _FakeReady.release
+
+    def logged_release(self, *, synchronize: bool = True) -> None:
+        order.append("release")
+        original(self, synchronize=synchronize)
+
+    monkeypatch.setattr(_FakeReady, "release", logged_release)
+    runtime.flush_deferred_slot_releases(evaluate=True)
+    assert order == ["eval:1", "release"]
+
+
+def test_reset_and_close_boundaries_flush_pending(monkeypatch) -> None:
+    runtime = _runtime_stub()
+    log: list = []
+    runtime.defer_slot_release(_FakeReady(log, "boundary"), mx.zeros((1,)))
+    flushed: list[bool] = []
+
+    def fake_flush(*, evaluate: bool = False) -> None:
+        flushed.append(evaluate)
+        runtime._deferred_slot_releases.clear()
+
+    runtime.flush_deferred_slot_releases = fake_flush
+    from mtplx.expert_runtime import ExpertStreamingRuntime
+
+    # reset() and close() must flush (with a covering fence) before touching
+    # the slot pool; otherwise pinned deferred routes deadlock the teardown.
+    src_reset = ExpertStreamingRuntime.reset
+    src_close = ExpertStreamingRuntime.close
+    import inspect
+
+    assert "flush_deferred_slot_releases" in inspect.getsource(src_reset)
+    assert "flush_deferred_slot_releases" in inspect.getsource(src_close)
+
+
 def test_all_hit_switch_defers_release_when_enabled(monkeypatch) -> None:
     from types import SimpleNamespace
 
