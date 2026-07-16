@@ -1443,6 +1443,38 @@ class ExpertStreamingRuntime:
             assert ready is not None
             return ready
 
+    def defer_slot_release(self, ready, wave_output) -> None:
+        """Queue a pinned route for release after the next generation eval.
+
+        The wave output is an ancestor of the next layer's router indices, so
+        the next ``mx.eval`` on the generation thread materializes it; pins
+        release then without a per-layer blocking fence. The output reference
+        is retained so the lazy graph cannot drop it before that eval.
+        """
+
+        pending = getattr(self, "_deferred_slot_releases", None)
+        if pending is None:
+            pending = []
+            self._deferred_slot_releases = pending
+        pending.append((ready, wave_output))
+
+    def flush_deferred_slot_releases(self) -> None:
+        """Release queued routes; the caller just completed a covering eval."""
+
+        pending = getattr(self, "_deferred_slot_releases", None)
+        if not pending:
+            return
+        first_error: BaseException | None = None
+        while pending:
+            ready, _wave_output = pending.pop(0)
+            try:
+                ready.release(synchronize=False)
+            except BaseException as error:  # noqa: BLE001 - propagate after drain
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
     def try_all_hit_route(
         self,
         layer: int,
