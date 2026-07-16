@@ -13,6 +13,9 @@ from mtplx.hy3_router_fp32 import (
     hy3_router_fp32_route,
     prepare_hy3_router_fp32_weight,
 )
+from mtplx.hy3_router_row_owned import (
+    prepare_hy3_router_row_owned_weight,
+)
 
 _ROWS = range(1, 9)
 _HARDWARE = os.environ.get("MTPLX_ROW_OWNED_HARDWARE") == "1"
@@ -54,6 +57,31 @@ def test_source_reproduces_incumbent_r2_semantics() -> None:
     assert "constexpr float ROUTING_SCALE = 2.826f;" in source
 
 
+def test_source_streams_tile_major_weight_blocks() -> None:
+    source = row_owned.hy3_router_row_owned_source()
+    assert "(device bfloat*)weight + (simd_gid * K + k0) * BN" in source
+    assert "array<int, 2>{1, BN});" in source
+
+
+def test_source_sigmoid_modes() -> None:
+    precise = row_owned.hy3_router_row_owned_source(sigmoid_mode="precise")
+    assert "1.0f / (1.0f + exp(-total))" in precise
+    fast = row_owned.hy3_router_row_owned_source(sigmoid_mode="fast")
+    assert "1.0f / (1.0f + metal::fast::exp(-total))" in fast
+    with pytest.raises(Hy3RouterFP32Ineligible):
+        row_owned.hy3_router_row_owned_source(sigmoid_mode="approximate")
+
+
+def test_prepare_weight_is_tile_major_and_value_preserving() -> None:
+    source = mx.arange(192 * 4096).reshape(192, 4096).astype(mx.bfloat16)
+    tiled = prepare_hy3_router_row_owned_weight(source)
+    assert tuple(tiled.shape) == (12, 4096, 16)
+    assert tiled.dtype == mx.bfloat16
+    # Tile t, k-row k, lane j holds source[t*16+j, k].
+    assert mx.array_equal(tiled[3, 17, :], source[3 * 16 : 4 * 16, 17]).item()
+    assert mx.array_equal(tiled[11, 4095, :], source[176:192, 4095]).item()
+
+
 def test_source_uses_sixteen_part_balanced_reduction() -> None:
     source = row_owned.hy3_router_row_owned_source()
     assert "constexpr int P = 16;" in source
@@ -88,7 +116,7 @@ def test_dispatch_launches_one_threadgroup_per_row(rows, monkeypatch) -> None:
         lambda *_args: _FakeKernel(captured),
     )
     value = mx.zeros((1, rows, 4096), dtype=mx.float32)
-    weight = mx.zeros((4096, 192), dtype=mx.bfloat16)
+    weight = mx.zeros((12, 4096, 16), dtype=mx.bfloat16)
     bias = mx.zeros((192,), dtype=mx.float32)
     ids, scores = row_owned.hy3_router_row_owned_route(
         value, weight, bias, available=True
@@ -105,10 +133,10 @@ def test_dispatch_launches_one_threadgroup_per_row(rows, monkeypatch) -> None:
 @pytest.mark.parametrize(
     "value_shape, weight_shape, bias_shape, message",
     [
-        ((1, 9, 4096), (4096, 192), (192,), "row-owned M1..M8"),
-        ((1, 4, 4095), (4096, 192), (192,), "widths do not match"),
-        ((1, 4, 4096), (4096, 191), (192,), "row-owned M1..M8"),
-        ((1, 4, 4096), (4096, 192), (191,), "expert bias"),
+        ((1, 9, 4096), (12, 4096, 16), (192,), "row-owned M1..M8"),
+        ((1, 4, 4095), (12, 4095, 16), (192,), "tile-major"),
+        ((1, 4, 4096), (4096, 192), (192,), "tile-major"),
+        ((1, 4, 4096), (12, 4096, 16), (191,), "expert bias"),
     ],
 )
 def test_dispatch_rejects_out_of_contract_shapes(
@@ -123,7 +151,7 @@ def test_dispatch_rejects_out_of_contract_shapes(
 
 def test_dispatch_rejects_unavailable_device() -> None:
     value = mx.zeros((1, 4, 4096), dtype=mx.float32)
-    weight = mx.zeros((4096, 192), dtype=mx.bfloat16)
+    weight = mx.zeros((12, 4096, 16), dtype=mx.bfloat16)
     bias = mx.zeros((192,), dtype=mx.float32)
     with pytest.raises(Hy3RouterFP32Ineligible):
         row_owned.hy3_router_row_owned_route(value, weight, bias, available=False)
@@ -145,9 +173,11 @@ def _reference_route(value: mx.array, weight: mx.array, bias: mx.array):
     )
 
 
-def _assert_bitwise_parity(value, weight, bias) -> None:
-    expected_ids, expected_scores = _reference_route(value, weight, bias)
-    ids, scores = row_owned.hy3_router_row_owned_route(value, weight, bias)
+def _assert_bitwise_parity(value, source_weight, bias) -> None:
+    k_major = prepare_hy3_router_fp32_weight(source_weight)
+    tiled = prepare_hy3_router_row_owned_weight(source_weight)
+    expected_ids, expected_scores = _reference_route(value, k_major, bias)
+    ids, scores = row_owned.hy3_router_row_owned_route(value, tiled, bias)
     assert mx.array_equal(ids, expected_ids).item()
     assert mx.array_equal(scores, expected_scores).item()
 
@@ -160,11 +190,9 @@ def _assert_bitwise_parity(value, weight, bias) -> None:
 def test_hardware_parity_random(rows) -> None:
     mx.random.seed(51 + rows)
     value = mx.random.normal((1, rows, 4096)).astype(mx.float32)
-    weight = prepare_hy3_router_fp32_weight(
-        mx.random.normal((192, 4096)).astype(mx.bfloat16)
-    )
+    source_weight = mx.random.normal((192, 4096)).astype(mx.bfloat16)
     bias = (mx.random.normal((192,)) * 0.01).astype(mx.float32)
-    _assert_bitwise_parity(value, weight, bias)
+    _assert_bitwise_parity(value, source_weight, bias)
 
 
 @pytest.mark.skipif(
@@ -173,7 +201,7 @@ def test_hardware_parity_random(rows) -> None:
 )
 @pytest.mark.parametrize("rows", (1, 4, 8))
 def test_hardware_parity_adversarial_ties(rows) -> None:
-    weight = prepare_hy3_router_fp32_weight(mx.zeros((192, 4096), dtype=mx.bfloat16))
+    weight = mx.zeros((192, 4096), dtype=mx.bfloat16)
     zero_value = mx.zeros((1, rows, 4096), dtype=mx.float32)
 
     # Full tie: identical logits and identical bias; later index must win.
@@ -201,7 +229,7 @@ def test_hardware_parity_adversarial_ties(rows) -> None:
 def test_hardware_repeated_execution_is_deterministic() -> None:
     mx.random.seed(58)
     value = mx.random.normal((1, 4, 4096)).astype(mx.float32)
-    weight = prepare_hy3_router_fp32_weight(
+    weight = prepare_hy3_router_row_owned_weight(
         mx.random.normal((192, 4096)).astype(mx.bfloat16)
     )
     bias = (mx.random.normal((192,)) * 0.01).astype(mx.float32)
@@ -251,11 +279,32 @@ def test_configure_kernel_accepts_row_owned_selector() -> None:
     assert report["enabled"] is True
     assert report["dispatch_count"] == 1
     assert report["device_synchronization"] == "none"
-    assert report["topology"] == "row-owned-g12-p16-precise-g6"
+    assert report["topology"] == "row-owned-g12-p16-tiled-g6"
+    assert report["sigmoid_mode"] == "precise"
+    assert report["weight_layout"] == "tile-major-12x4096x16"
     state = router._mtplx_router_kernel_state
     assert state.selector == "mpp-row-owned-fused"
-    assert tuple(state.prepared_weight.shape) == (4096, 192)
+    assert state.sigmoid_mode == "precise"
+    assert tuple(state.prepared_weight.shape) == (12, 4096, 16)
     assert state.prepared_weight.dtype == mx.bfloat16
+
+
+def test_configure_kernel_fast_sigmoid_toggle() -> None:
+    from mtplx.models import hy3_mlx
+
+    router = hy3_mlx.Router(_router_args())
+    router.gate.weight = mx.zeros((192, 4096), dtype=mx.bfloat16)
+    report = router.configure_kernel(
+        "mpp-row-owned-fused", available=True, sigmoid_mode="fast"
+    )
+    assert report["sigmoid_mode"] == "fast"
+    assert router._mtplx_router_kernel_state.sigmoid_mode == "fast"
+    with pytest.raises(ValueError, match="precise' or 'fast"):
+        router.configure_kernel(
+            "mpp-row-owned-fused", available=True, sigmoid_mode="approx"
+        )
+    with pytest.raises(ValueError, match="row-owned"):
+        router.configure_kernel("mpp-r1-fused-r2", available=True, sigmoid_mode="fast")
 
 
 @pytest.mark.parametrize("rows", (2, 4, 8))

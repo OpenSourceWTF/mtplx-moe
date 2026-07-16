@@ -28,9 +28,23 @@ import mlx.core as mx
 from mtplx.hy3_router_fp32 import (
     Hy3RouterFP32Ineligible,
     _balanced_splitk_reduction_source,
-    _sigmoid_exp_call,
     hy3_router_fp32_available,
 )
+
+_SIGMOID_MODES = ("precise", "fast")
+
+
+def _row_owned_exp_call(sigmoid_mode: str, operand: str) -> str:
+    """Emit the selected Metal exponential for the fused finalizer."""
+
+    if sigmoid_mode == "precise":
+        return f"exp({operand})"
+    if sigmoid_mode == "fast":
+        return f"metal::fast::exp({operand})"
+    raise Hy3RouterFP32Ineligible(
+        "Hy3 row-owned sigmoid mode must be 'precise' or 'fast'"
+    )
+
 
 _EXPERTS = 192
 _INPUT_WIDTH = 4096
@@ -45,6 +59,28 @@ _THREADS = _SIMD_GROUPS * 32
 _KERNEL_CACHE: dict[tuple[float, str], object] = {}
 
 
+def prepare_hy3_router_row_owned_weight(weight: mx.array) -> mx.array:
+    """Build the tile-major layout streamed sequentially by each SIMD group.
+
+    Source BF16 [192, 4096] becomes contiguous [12, 4096, 16]: SIMD group ``t``
+    reads its 16-expert tile as one sequential 128 KiB block instead of 32-byte
+    rows strided 384 bytes apart. Values and MAC order are unchanged, so the
+    kernel remains bitwise-exact versus the K-major incumbent.
+    """
+
+    if (
+        weight.ndim != 2
+        or tuple(int(dimension) for dimension in weight.shape)
+        != (_EXPERTS, _INPUT_WIDTH)
+        or weight.dtype != mx.bfloat16
+    ):
+        raise Hy3RouterFP32Ineligible(
+            "source Hy3 router weight must be BF16 with shape (192, 4096)"
+        )
+    k_major = weight.T.reshape(_INPUT_WIDTH, _SIMD_GROUPS, _N_TILE)
+    return mx.contiguous(k_major.transpose(1, 0, 2))
+
+
 def hy3_router_row_owned_source(
     *,
     scaling_factor: float = 2.826,
@@ -52,7 +88,7 @@ def hy3_router_row_owned_source(
 ) -> str:
     """Emit the complete row-owned fused R1+R2 Metal body."""
 
-    exp_call = _sigmoid_exp_call(sigmoid_mode, "-total")
+    exp_call = _row_owned_exp_call(sigmoid_mode, "-total")
     reduction = _balanced_splitk_reduction_source(_K_PARTS)
     scaling_literal = format(float(scaling_factor), ".9g")
     if "." not in scaling_literal and "e" not in scaling_literal.lower():
@@ -121,9 +157,9 @@ def hy3_router_row_owned_source(
                 dextents<int, 2>{{KS, BM}},
                 array<int, 2>{{1, KS}});
             tensor<device bfloat, dextents<int, 2>, tensor_inline> B(
-                (device bfloat*)weight + k0 * N + n0,
+                (device bfloat*)weight + (simd_gid * K + k0) * BN,
                 dextents<int, 2>{{BN, KS}},
-                array<int, 2>{{1, N}});
+                array<int, 2>{{1, BN}});
             tensor<threadgroup float, dextents<int, 2>, tensor_inline> C(
                 c_tile[simd_gid],
                 dextents<int, 2>{{BN, BM}},
@@ -271,7 +307,7 @@ def _build_hy3_router_row_owned_kernel(
     if cached is not None:
         return cached
     kernel = mx.fast.metal_kernel(
-        name="mtplx_hy3_router_row_owned_g12_p16_precise",
+        name=(f"mtplx_hy3_router_row_owned_g12_p16_tiled_{sigmoid_mode}"),
         input_names=["x", "weight", "expert_bias"],
         output_names=["expert_ids", "router_scores"],
         header=("#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"),
@@ -325,12 +361,19 @@ def hy3_router_row_owned_route(
             "Hy3 router input must include rows and hidden width"
         )
     rows = math.prod(int(dimension) for dimension in value.shape[:-1])
-    if weight.ndim != 2:
-        raise Hy3RouterFP32Ineligible("Hy3 router weight must be rank two")
-    input_width, experts = (int(dimension) for dimension in weight.shape)
+    if weight.ndim != 3 or tuple(int(dimension) for dimension in weight.shape) != (
+        _SIMD_GROUPS,
+        _INPUT_WIDTH,
+        _N_TILE,
+    ):
+        raise Hy3RouterFP32Ineligible(
+            "Hy3 row-owned weight must be the tile-major (12, 4096, 16) layout"
+        )
+    input_width = int(weight.shape[1])
+    experts = int(weight.shape[0]) * int(weight.shape[2])
     if int(value.shape[-1]) != input_width:
         raise Hy3RouterFP32Ineligible(
-            "Hy3 router input and transposed-weight widths do not match"
+            "Hy3 router input and tiled-weight widths do not match"
         )
     if not hy3_router_row_owned_eligible(
         rows=rows,

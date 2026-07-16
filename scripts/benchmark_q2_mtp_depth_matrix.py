@@ -71,6 +71,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "transient_slots": 8,
     "q2_expert_kernel": "stock",
     "hy3_router_kernel": "mpp-r1-fused-r2",
+    "hy3_router_sigmoid": "precise",
     "read_chunk": "8MiB",
     "bypass_page_cache": True,
     "resource_telemetry": False,
@@ -322,6 +323,15 @@ def build_parser() -> argparse.ArgumentParser:
             "(default: mpp-r1-fused-r2)."
         ),
     )
+    parser.add_argument(
+        "--hy3-router-sigmoid",
+        choices=("precise", "fast"),
+        default="precise",
+        help=(
+            "Row-owned router finalizer exponential "
+            "(fast is a selectable experiment; default: precise)."
+        ),
+    )
     parser.add_argument("--read-chunk", default="8MiB")
     parser.add_argument(
         "--f-nocache",
@@ -457,6 +467,7 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "transient_slots": args.transient_slots,
         "q2_expert_kernel": args.q2_expert_kernel,
         "hy3_router_kernel": args.hy3_router_kernel,
+        "hy3_router_sigmoid": args.hy3_router_sigmoid,
         "read_chunk": args.read_chunk,
         "bypass_page_cache": args.bypass_page_cache,
         "resource_telemetry": args.resource_telemetry,
@@ -1414,9 +1425,7 @@ def _require_compiled_draft_evidence(
     if draft_core == "stock":
         return dict(evidence) if isinstance(evidence, Mapping) else None
     if not isinstance(evidence, Mapping):
-        raise BenchmarkGateError(
-            f"{model} d{depth} compiled draft emitted no evidence"
-        )
+        raise BenchmarkGateError(f"{model} d{depth} compiled draft emitted no evidence")
     report = dict(evidence)
     if report.get("requested") != draft_core:
         raise BenchmarkGateError(
@@ -1437,9 +1446,7 @@ def _require_compiled_draft_evidence(
         )
     fallbacks = _optional_int(report, "fallbacks")
     if fallbacks != 0 or report.get("fallback_reasons"):
-        raise BenchmarkGateError(
-            f"{model} d{depth} compiled draft used fallback calls"
-        )
+        raise BenchmarkGateError(f"{model} d{depth} compiled draft used fallback calls")
     if report.get("history_policy") != "committed":
         raise BenchmarkGateError(
             f"{model} d{depth} compiled draft did not use committed history"
@@ -1450,9 +1457,7 @@ def _require_compiled_draft_evidence(
         )
     prewarm = report.get("prewarm")
     if not isinstance(prewarm, Mapping) or prewarm.get("compiled") is not True:
-        raise BenchmarkGateError(
-            f"{model} d{depth} compiled draft was not prewarmed"
-        )
+        raise BenchmarkGateError(f"{model} d{depth} compiled draft was not prewarmed")
     per_depth = report.get("per_depth")
     depth_evidence = (
         per_depth.get(str(depth)) if isinstance(per_depth, Mapping) else None
@@ -1678,12 +1683,16 @@ def _run_observation(
         effective_exact = effective_depth == depth
         committed_history = depth == 0 or history_policy == "committed"
         guards_disabled = _guards_disabled(stats)
-        compiled_draft = _require_compiled_draft_evidence(
-            stats,
-            model=model,
-            depth=depth,
-            draft_core=draft_core,
-        ) if depth > 0 else None
+        compiled_draft = (
+            _require_compiled_draft_evidence(
+                stats,
+                model=model,
+                depth=depth,
+                draft_core=draft_core,
+            )
+            if depth > 0
+            else None
+        )
         compiled_verify = None
         graphbank = _field(stats, "graphbank", {})
         if isinstance(graphbank, Mapping):
@@ -1889,6 +1898,7 @@ def _runtime_config(
         transient_slots=int(options["transient_slots"]),
         q2_expert_kernel=str(options["q2_expert_kernel"]),
         hy3_router_kernel=str(options["hy3_router_kernel"]),
+        hy3_router_sigmoid=str(options["hy3_router_sigmoid"]),
         max_read_chunk_bytes=apis.parse_memory_bytes(options["read_chunk"]),
         bypass_page_cache=bool(options["bypass_page_cache"]),
         resource_telemetry=bool(options["resource_telemetry"]),

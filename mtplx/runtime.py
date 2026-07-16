@@ -680,6 +680,7 @@ def _load_impl(
                     router_kernel_report = configure_hy3_router_kernels(
                         model,
                         expert_streaming_config.hy3_router_kernel,
+                        sigmoid_mode=expert_streaming_config.hy3_router_sigmoid,
                     )
                     actual_incremental = int(
                         router_kernel_report.get("incremental_bytes", -1)

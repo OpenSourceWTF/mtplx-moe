@@ -142,6 +142,7 @@ class ExpertStreamingConfig:
     resource_telemetry: bool = False
     q2_expert_kernel: str = "stock"
     hy3_router_kernel: str = "mpp-r1-fused-r2"
+    hy3_router_sigmoid: str = "precise"
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -199,6 +200,15 @@ class ExpertStreamingConfig:
                 "hy3_router_kernel must be 'stock', 'steel-r1-fused-r2', "
                 "'mpp-r1-fused-r2', 'mpp-fp32-splitk-r1-fused-r2', "
                 "'mpp-r1-last-arrival-fused-r2', or 'mpp-row-owned-fused'"
+            )
+        if self.hy3_router_sigmoid not in {"precise", "fast"}:
+            raise ValueError("hy3_router_sigmoid must be 'precise' or 'fast'")
+        if (
+            self.hy3_router_sigmoid == "fast"
+            and self.hy3_router_kernel != "mpp-row-owned-fused"
+        ):
+            raise ValueError(
+                "fast router sigmoid is selectable only with mpp-row-owned-fused"
             )
         if self.slot_layout not in {
             "direct-slots",
