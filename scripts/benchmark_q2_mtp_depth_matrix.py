@@ -1319,8 +1319,12 @@ def _cache_hit_rate(counters: Any) -> float | None:
 
 
 def _require_decode_cache_metrics(
-    cache_by_phase: Any, *, model: str, depth: int
-) -> tuple[dict[str, Any], float]:
+    cache_by_phase: Any,
+    *,
+    model: str,
+    depth: int,
+    fully_islanded: bool = False,
+) -> tuple[dict[str, Any], float | None]:
     decode = (
         cache_by_phase.get("decode") if isinstance(cache_by_phase, Mapping) else None
     )
@@ -1337,6 +1341,15 @@ def _require_decode_cache_metrics(
     hits = int(decode["expert_hits"])
     misses = int(decode["expert_misses"])
     denominator = hits + misses
+    if fully_islanded:
+        # Every routed layer executes on an island bank; a streamed cache
+        # assignment here is a wiring bug, not routing evidence.
+        if denominator != 0:
+            raise BenchmarkGateError(
+                f"{model} d{depth} routed {denominator} assignments through "
+                "the streamed expert cache despite full island coverage"
+            )
+        return dict(decode), None
     if denominator <= 0:
         raise BenchmarkGateError(
             f"{model} d{depth} decode expert-cache has no routed assignments"
@@ -1812,11 +1825,22 @@ def _run_observation(
         if not guards_disabled:
             raise BenchmarkGateError(f"{model} d{depth} triggered a generation guard")
 
+        expert_streaming = getattr(runtime, "expert_streaming", None)
+        fully_islanded = False
+        if expert_streaming is not None:
+            streaming_config = expert_streaming.config
+            island_total = len(streaming_config.island_layers) + len(
+                getattr(streaming_config, "mmap_island_layers", ())
+            )
+            fully_islanded = island_total == len(
+                expert_streaming.spec.routed_layer_indices
+            )
         _decode_streaming_counters, decode_cache_hit_rate = (
             _require_decode_cache_metrics(
                 streaming_counters_by_phase,
                 model=model,
                 depth=depth,
+                fully_islanded=fully_islanded,
             )
         )
         speculative_event_contract = _validate_speculative_event_contract(

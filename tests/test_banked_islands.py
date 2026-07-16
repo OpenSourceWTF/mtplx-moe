@@ -382,6 +382,44 @@ def test_runtime_open_rejects_uncovered_mmap_layer(tmp_path) -> None:
         )
 
 
+# ------------------------------------------------------- benchmark gate
+
+
+def _load_benchmark_module():
+    import importlib.util
+    import sys
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "benchmark_q2_mtp_depth_matrix.py"
+    )
+    spec = importlib.util.spec_from_file_location("bench_depth_matrix_c6", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault("bench_depth_matrix_c6", module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_decode_cache_gate_understands_full_island_coverage() -> None:
+    bench = _load_benchmark_module()
+    idle = {"decode": {"expert_hits": 0, "expert_misses": 0, "hit_rate": 0.0}}
+    counters, hit_rate = bench._require_decode_cache_metrics(
+        idle, model="hy3-q2", depth=3, fully_islanded=True
+    )
+    assert hit_rate is None
+    assert counters["expert_hits"] == 0
+    # Streamed traffic on a fully-islanded model is a wiring bug.
+    busy = {"decode": {"expert_hits": 5, "expert_misses": 0, "hit_rate": 1.0}}
+    with pytest.raises(bench.BenchmarkGateError, match="full island coverage"):
+        bench._require_decode_cache_metrics(
+            busy, model="hy3-q2", depth=3, fully_islanded=True
+        )
+    # Default behavior is unchanged: zero traffic still fails.
+    with pytest.raises(bench.BenchmarkGateError, match="no routed assignments"):
+        bench._require_decode_cache_metrics(idle, model="hy3-q2", depth=3)
+
+
 # ---------------------------------------------------------- metal store
 
 
