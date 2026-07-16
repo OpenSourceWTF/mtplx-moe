@@ -74,6 +74,9 @@ DEFAULT_RUNTIME_OPTIONS = {
     "hy3_router_sigmoid": "precise",
     "deferred_pin_release": True,
     "island_layers": "",
+    "mmap_island_layers": "",
+    "banked_manifest": "",
+    "banked_codec": "none",
     "read_chunk": "8MiB",
     "bypass_page_cache": True,
     "resource_telemetry": False,
@@ -434,6 +437,29 @@ def build_parser() -> argparse.ArgumentParser:
             "C5), e.g. '1-38,60-79'. Empty disables islands."
         ),
     )
+    parser.add_argument(
+        "--mmap-island-layers",
+        default="",
+        help=(
+            "Banked mmap island layers served from a repacked component-major "
+            "sidecar via the page cache (issue #51 C6), e.g. '39-59'. "
+            "Requires --banked-manifest. Empty disables the mmap band."
+        ),
+    )
+    parser.add_argument(
+        "--banked-manifest",
+        default="",
+        help="Path to the banked expert sidecar manifest JSON (C6).",
+    )
+    parser.add_argument(
+        "--banked-codec",
+        default="none",
+        choices=["none", "rans32x-v1"],
+        help=(
+            "Lossless codec of the banked sidecar. 'rans32x-v1' requires the "
+            "in-kernel decoder (issue #51 C7) and is rejected until it ships."
+        ),
+    )
     parser.add_argument("--output-json", type=Path)
     return parser
 
@@ -509,6 +535,9 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "hy3_router_sigmoid": args.hy3_router_sigmoid,
         "deferred_pin_release": bool(args.deferred_pin_release),
         "island_layers": args.island_layers,
+        "mmap_island_layers": args.mmap_island_layers,
+        "banked_manifest": args.banked_manifest,
+        "banked_codec": args.banked_codec,
         "read_chunk": args.read_chunk,
         "bypass_page_cache": args.bypass_page_cache,
         "resource_telemetry": args.resource_telemetry,
@@ -1946,6 +1975,15 @@ def _runtime_config(
         resource_telemetry=bool(options["resource_telemetry"]),
         trace_routes=bool(options["trace_routes"]),
         island_layers=parse_island_layers(options.get("island_layers", "")),
+        mmap_island_layers=parse_island_layers(
+            options.get("mmap_island_layers", "")
+        ),
+        banked_manifest=(
+            str(options["banked_manifest"])
+            if options.get("banked_manifest")
+            else None
+        ),
+        banked_codec=str(options.get("banked_codec", "none")),
     )
 
 

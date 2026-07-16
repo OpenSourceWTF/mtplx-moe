@@ -208,6 +208,8 @@ class ExpertMemoryPlan:
     fits_fixed: bool
     island_layer_count: int = 0
     island_bytes: int = 0
+    mmap_island_layer_count: int = 0
+    mmap_island_bytes: int = 0
 
     @property
     def fixed_bytes(self) -> int:
@@ -398,6 +400,7 @@ def plan_expert_memory(
     additional_resident_bytes: int = 0,
     cache_scope: str = "layer",
     island_layer_count: int = 0,
+    mmap_island_layer_count: int = 0,
 ) -> ExpertMemoryPlan:
     """Fit uniform persistent expert slots under an explicit memory ceiling.
 
@@ -410,6 +413,13 @@ def plan_expert_memory(
     resident in dense per-layer banks outside the uniform slot pool; their
     full cost lands on the fixed side and the uniform slot math spans only
     the remaining streamed layers.
+
+    ``mmap_island_layer_count`` routed layers hold every expert in
+    file-backed banks whose physical pages belong to the OS page cache, not
+    to MLX: they leave the fixed budget untouched, contribute no uniform
+    slots, and shrink the streamed layer count exactly like wired islands.
+    ``mmap_island_bytes`` is advisory — the pager's working set, not an
+    allocation.
 
     A plan with ``fits_fixed=False`` is diagnostic and must not be used to
     start inference.  Its negative ``unallocated_bytes`` is the fixed-footprint
@@ -447,6 +457,17 @@ def plan_expert_memory(
         )
     if island_layer_count and cache_scope != "layer":
         raise ValueError("dense island layers require cache_scope 'layer'")
+    mmap_island_layer_count = _integer(
+        "mmap_island_layer_count", mmap_island_layer_count, minimum=0
+    )
+    if island_layer_count + mmap_island_layer_count > spec.routed_layer_count:
+        raise ValueError(
+            f"island_layer_count {island_layer_count} and "
+            f"mmap_island_layer_count {mmap_island_layer_count} together "
+            f"exceed routed layer count {spec.routed_layer_count}"
+        )
+    if mmap_island_layer_count and cache_scope != "layer":
+        raise ValueError("mmap island layers require cache_scope 'layer'")
 
     service_slots = spec.top_k if transient_slots is None else transient_slots
     service_slots = _integer("transient_slots", service_slots, minimum=0)
@@ -459,7 +480,12 @@ def plan_expert_memory(
     island_bytes = (
         island_layer_count * spec.expert_count * spec.expert_record_bytes
     )
-    streamed_layer_count = spec.routed_layer_count - island_layer_count
+    mmap_island_bytes = (
+        mmap_island_layer_count * spec.expert_count * spec.expert_record_bytes
+    )
+    streamed_layer_count = (
+        spec.routed_layer_count - island_layer_count - mmap_island_layer_count
+    )
     fixed_bytes = (
         resident_bytes
         + kv_bytes
@@ -522,4 +548,6 @@ def plan_expert_memory(
         fits_fixed=fixed_bytes <= total_limit_bytes,
         island_layer_count=island_layer_count,
         island_bytes=island_bytes,
+        mmap_island_layer_count=mmap_island_layer_count,
+        mmap_island_bytes=mmap_island_bytes,
     )

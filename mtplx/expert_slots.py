@@ -626,10 +626,14 @@ class ExpertSlotPool:
             raise ValueError("dense island layers require cache_scope 'layer'")
         if not island_set <= set(spec.routed_layer_indices):
             raise ValueError("island layers must be routed layers of the model")
-        if len(island_set) != plan.island_layer_count:
+        planned_islands = plan.island_layer_count + getattr(
+            plan, "mmap_island_layer_count", 0
+        )
+        if len(island_set) != planned_islands:
             raise ValueError(
                 f"pool island layers ({len(island_set)}) do not match memory "
-                f"plan island_layer_count ({plan.island_layer_count})"
+                f"plan island_layer_count + mmap_island_layer_count "
+                f"({planned_islands})"
             )
         self.island_layers = island_set
         if (

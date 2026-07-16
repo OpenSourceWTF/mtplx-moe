@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import os
 import re
 import threading
@@ -617,6 +618,167 @@ class DenseIslandSwitchGLU(nn.Module):
             bits=self.bits,
         )
         return output.reshape((*indices.shape, hidden_size))
+
+
+class BankedMmapBank:
+    """Duck-typed component bank whose mapped row index is the expert id."""
+
+    __slots__ = ("arrays",)
+
+    def __init__(self, arrays: dict[str, mx.array]) -> None:
+        self.arrays = arrays
+
+
+class BankedMmapIslandStore:
+    """Dense island banks served from a mapped banked sidecar (issue #51, C6).
+
+    Same dispatch contract as ``DenseIslandStore`` — bank row == expert id,
+    raw router indices feed ``gather_qmm`` — but physical residency belongs
+    to the macOS pager: the banked file regions are mapped into Metal
+    without copies, pages arrive on first touch, and the page cache keeps
+    or evicts them under normal kernel policy. No slot pool, no reads, no
+    misses exist for these layers. ``prepare`` verifies each region hash by
+    reading the file once, which doubles as the page-cache warmup.
+    """
+
+    def __init__(
+        self,
+        banked_manifest: Path | str,
+        layers: Iterable[int],
+        *,
+        expert_count: int,
+        verify_hash: bool = True,
+    ) -> None:
+        from mtplx.expert_banked import BankedManifestError, load_banked_manifest
+
+        self.layers = tuple(sorted({int(layer) for layer in layers}))
+        if not self.layers:
+            raise ValueError("banked island store requires at least one layer")
+        self._banked = load_banked_manifest(banked_manifest)
+        if self._banked.codec != "none":
+            raise BankedManifestError(
+                f"banked codec {self._banked.codec!r} requires the in-kernel "
+                "decoder (issue #51, C7); repack with codec 'none'"
+            )
+        if self._banked.expert_count != int(expert_count):
+            raise BankedManifestError(
+                f"banked manifest holds {self._banked.expert_count} experts "
+                f"per layer; the model routes {expert_count}"
+            )
+        missing = [
+            layer for layer in self.layers if layer not in self._banked.layer_set
+        ]
+        if missing:
+            raise BankedManifestError(
+                f"banked manifest does not cover layers {missing}"
+            )
+        self.expert_count = int(expert_count)
+        self._verify_hash = bool(verify_hash)
+        self._banks: dict[int, BankedMmapBank] = {}
+        self._bases: list[mx.array] = []
+        self._verify_seconds = 0.0
+        self._closed = False
+
+    def prepare(self) -> None:
+        from mtplx.expert_banked import BankedManifestError
+
+        if self._closed:
+            raise RuntimeError("banked island store is closed")
+        if self._banks:
+            return
+        path = self._banked.bin_path()
+        alignment = self._banked.alignment
+        file_size = path.stat().st_size
+        for layer in self.layers:
+            entry = self._banked.layer_entry(layer)
+            if self._verify_hash:
+                started = time.perf_counter()
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    handle.seek(entry.offset)
+                    remaining = entry.length
+                    while remaining:
+                        chunk = handle.read(min(remaining, 8 << 20))
+                        if not chunk:
+                            raise BankedManifestError(
+                                f"banked layer {layer} region is truncated"
+                            )
+                        digest.update(chunk)
+                        remaining -= len(chunk)
+                if digest.hexdigest() != entry.sha256:
+                    raise BankedManifestError(
+                        f"banked layer {layer} region hash mismatch"
+                    )
+                self._verify_seconds += time.perf_counter() - started
+            mapped_length = -(-entry.length // alignment) * alignment
+            if entry.offset + mapped_length > file_size:
+                raise BankedManifestError(
+                    f"banked layer {layer} extent exceeds {path.name}"
+                )
+            base = mmap_u32(path, entry.offset, mapped_length)
+            arrays: dict[str, mx.array] = {}
+            for component in entry.components:
+                if component.dtype == "U32":
+                    typed = base
+                    item_size = 4
+                elif component.dtype == "BF16":
+                    typed = mx.view(base, mx.bfloat16)
+                    item_size = 2
+                else:
+                    raise TypeError(
+                        f"unsupported banked component dtype {component.dtype}"
+                    )
+                if component.offset % item_size:
+                    raise BankedManifestError(
+                        f"banked component {component.component} is not "
+                        "dtype-aligned"
+                    )
+                arrays[component.component] = mx.as_strided(
+                    typed,
+                    shape=(self.expert_count, *component.shape),
+                    offset=component.offset // item_size,
+                )
+            self._banks[layer] = BankedMmapBank(arrays)
+            self._bases.append(base)
+
+    def prefetch_all(self) -> int:
+        """Issue one MADV_WILLNEED batch across every mapped layer region."""
+
+        from mtplx.mmap_mlx import prefetch
+
+        if not self._bases:
+            return 0
+        return prefetch(list(self._bases))
+
+    def bank_for_layer(self, layer: int) -> BankedMmapBank:
+        if self._closed:
+            raise RuntimeError("banked island store is closed")
+        bank = self._banks.get(layer)
+        if bank is None:
+            raise RuntimeError(f"banked island layer {layer} is not prepared")
+        return bank
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "backend": "banked-mmap-island-banks",
+            "layers": list(self.layers),
+            "expert_count": self.expert_count,
+            "mapped_bytes": sum(
+                self._banked.layer_entry(layer).length for layer in self.layers
+            ),
+            "verify_seconds": self._verify_seconds,
+            "prepared_layers": len(self._banks),
+        }
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._banks.clear()
+        self._bases.clear()
+        # Evaluated MLX arrays can retain graph-input cycles until cyclic GC.
+        # Collect now so every external MTLBuffer releases before its mmap.
+        gc.collect()
 
 
 def make_mlx_component_bank_allocator(
@@ -1621,6 +1783,17 @@ def bind_streamed_switches(model: Any, runtime: ExpertStreamingRuntime) -> int:
             ),
         )
         runtime._island_store = island_store
+    banked_layers = frozenset(runtime.config.mmap_island_layers)
+    banked_store = None
+    if banked_layers:
+        banked_store = BankedMmapIslandStore(
+            Path(runtime.config.banked_manifest),
+            banked_layers,
+            expert_count=runtime.spec.expert_count,
+        )
+        banked_store.prepare()
+        banked_store.prefetch_all()
+        runtime._banked_island_store = banked_store
     for layer_index in runtime.spec.routed_layer_indices:
         layer = layers[layer_index]
         mlp = getattr(layer, "mlp", None)
@@ -1630,6 +1803,12 @@ def bind_streamed_switches(model: Any, runtime: ExpertStreamingRuntime) -> int:
             mlp.switch_mlp = DenseIslandSwitchGLU(
                 runtime,
                 island_store,
+                layer_index,
+            )
+        elif banked_store is not None and layer_index in banked_layers:
+            mlp.switch_mlp = DenseIslandSwitchGLU(
+                runtime,
+                banked_store,
                 layer_index,
             )
         elif mapped_store is None:

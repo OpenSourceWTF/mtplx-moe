@@ -145,6 +145,9 @@ class ExpertStreamingConfig:
     hy3_router_sigmoid: str = "precise"
     deferred_pin_release: bool = False
     island_layers: tuple[int, ...] = ()
+    mmap_island_layers: tuple[int, ...] = ()
+    banked_manifest: str | None = None
+    banked_codec: str = "none"
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -231,6 +234,53 @@ class ExpertStreamingConfig:
                     "island_layers execute without host route observation; "
                     "trace_routes must be disabled"
                 )
+        mmap_islands = self.mmap_island_layers
+        if isinstance(mmap_islands, (str, bytes)) or not isinstance(
+            mmap_islands, (tuple, list)
+        ):
+            raise TypeError("mmap_island_layers must be a tuple of layer indices")
+        normalized_mmap = tuple(
+            sorted(
+                {
+                    _integer("mmap_island_layers entry", layer, minimum=0)
+                    for layer in mmap_islands
+                }
+            )
+        )
+        object.__setattr__(self, "mmap_island_layers", normalized_mmap)
+        if self.banked_codec not in {"none", "rans32x-v1"}:
+            raise ValueError(
+                "banked_codec must be 'none' or 'rans32x-v1'"
+            )
+        if self.banked_codec != "none":
+            raise ValueError(
+                "banked_codec 'rans32x-v1' requires the in-kernel decoder "
+                "(issue #51, C7); use 'none' until it ships"
+            )
+        if normalized_mmap:
+            if self.banked_manifest is None:
+                raise ValueError(
+                    "mmap_island_layers require a banked_manifest path"
+                )
+            if self.cache_scope != "layer":
+                raise ValueError(
+                    "mmap_island_layers require cache_scope 'layer'"
+                )
+            if self.slot_layout != "component-banks":
+                raise ValueError(
+                    "mmap_island_layers require the component-banks slot layout"
+                )
+            if self.trace_routes:
+                raise ValueError(
+                    "mmap_island_layers execute without host route observation; "
+                    "trace_routes must be disabled"
+                )
+            overlap = set(normalized_mmap) & set(normalized_islands)
+            if overlap:
+                raise ValueError(
+                    "island_layers and mmap_island_layers must be disjoint; "
+                    f"both claim {sorted(overlap)}"
+                )
         if self.hy3_router_sigmoid not in {"precise", "fast"}:
             raise ValueError("hy3_router_sigmoid must be 'precise' or 'fast'")
         if (
@@ -306,6 +356,7 @@ class ExpertStreamingConfig:
             additional_resident_bytes=additional_resident_bytes,
             cache_scope=self.cache_scope,
             island_layer_count=len(self.island_layers),
+            mmap_island_layer_count=len(self.mmap_island_layers),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1229,7 +1280,11 @@ class ExpertStreamingRuntime:
             if config.cache_scope == "global"
             else None
         )
-        self.island_layer_set = frozenset(config.island_layers)
+        # Wired and mmap-banked islands share the routing contract: streamed
+        # route entry points reject both, and neither owns slot-pool state.
+        self.island_layer_set = frozenset(config.island_layers) | frozenset(
+            config.mmap_island_layers
+        )
         self._banks = (
             {}
             if self._global_bank is not None
@@ -1268,6 +1323,7 @@ class ExpertStreamingRuntime:
         self._cleanup_error: BaseException | None = None
         self._mapped_expert_store: Any | None = None
         self._island_store: Any | None = None
+        self._banked_island_store: Any | None = None
         self._route_trace_lock = threading.Lock()
         self._route_trace: list[dict[str, Any]] = []
         self._route_trace_epoch = 0
@@ -1309,6 +1365,38 @@ class ExpertStreamingRuntime:
                 f"{model_spec.key}: {sorted(model_spec.routed_layer_indices)[:3]}"
                 f"..{sorted(model_spec.routed_layer_indices)[-1]}"
             )
+        if config.mmap_island_layers:
+            if not set(config.mmap_island_layers) <= set(
+                model_spec.routed_layer_indices
+            ):
+                raise ExpertStreamingConfigurationError(
+                    "mmap_island_layers must be routed layers of "
+                    f"{model_spec.key}"
+                )
+            from mtplx.expert_banked import (
+                BankedManifestError,
+                load_banked_manifest,
+            )
+
+            try:
+                banked = load_banked_manifest(Path(config.banked_manifest))
+            except BankedManifestError as exc:
+                raise ExpertStreamingConfigurationError(
+                    f"banked manifest is unusable: {exc}"
+                ) from exc
+            uncovered = sorted(
+                set(config.mmap_island_layers) - banked.layer_set
+            )
+            if uncovered:
+                raise ExpertStreamingConfigurationError(
+                    f"banked manifest does not cover mmap island layers "
+                    f"{uncovered}"
+                )
+            if banked.expert_count != model_spec.expert_count:
+                raise ExpertStreamingConfigurationError(
+                    f"banked manifest holds {banked.expert_count} experts per "
+                    f"layer; {model_spec.key} routes {model_spec.expert_count}"
+                )
         integrity_report = None
         if config.verify_artifact_headers or config.verify_sidecar_hash_at_open:
             if config.verify_sidecar_hash_at_open and manifest.sidecar is None:
@@ -1360,7 +1448,9 @@ class ExpertStreamingRuntime:
                 device_synchronize=device_synchronize,
                 cache_scope=config.cache_scope,
                 resource_telemetry=config.resource_telemetry,
-                island_layers=config.island_layers,
+                island_layers=(
+                    config.island_layers + config.mmap_island_layers
+                ),
                 **pipeline_kwargs,
             )
         except Exception:
@@ -2219,6 +2309,10 @@ class ExpertStreamingRuntime:
             snapshot["mapped_experts"] = self._mapped_expert_store.snapshot()
         if self._island_store is not None:
             snapshot["island_experts"] = self._island_store.snapshot()
+        if self._banked_island_store is not None:
+            snapshot["banked_island_experts"] = (
+                self._banked_island_store.snapshot()
+            )
         if self._pipeline_ledger is not None:
             snapshot["expert_pipeline"] = self._pipeline_ledger.snapshot()
         self._raise_if_unhealthy()
@@ -2306,6 +2400,9 @@ class ExpertStreamingRuntime:
             if self._island_store is not None:
                 self._island_store.close()
                 self._island_store = None
+            if self._banked_island_store is not None:
+                self._banked_island_store.close()
+                self._banked_island_store = None
             self._closed = True
             self._closing = False
             if slots_error is not None:

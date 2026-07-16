@@ -38,7 +38,10 @@ std::size_t prefetch_arrays(const nb::list& values) {
   ranges.reserve(nb::len(values));
   for (nb::handle value : values) {
     const auto* array = nb::inst_ptr<mx::array>(value);
-    auto* buffer = static_cast<MTL::Buffer*>(array->buffer().ptr());
+    // MLX >= 0.31 returns const void* from Buffer::ptr(); madvise needs the
+    // mutable pointer to the same shared storage.
+    auto* buffer =
+        static_cast<MTL::Buffer*>(const_cast<void*>(array->buffer().ptr()));
     if (buffer == nullptr || buffer->contents() == nullptr) {
       throw std::invalid_argument("prefetch input has no shared Metal storage");
     }
