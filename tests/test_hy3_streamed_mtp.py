@@ -287,7 +287,7 @@ def test_injection_uses_prebuilt_head_without_reloading_artifact(
 def test_injected_model_propagates_execution_depth_to_shared_operator(
     tmp_path: Path,
 ) -> None:
-    configured: list[int] = []
+    configured: list[int | None] = []
     shared = SimpleNamespace(configure_depth=configured.append)
     layer = SimpleNamespace(
         mtp_block=SimpleNamespace(
@@ -308,7 +308,8 @@ def test_injected_model_propagates_execution_depth_to_shared_operator(
 
     model.configure_mtp_execution_depth(1)
     model.configure_mtp_execution_depth(3)
-    assert configured == [1, 3]
+    model.configure_mtp_execution_depth(None)
+    assert configured == [1, 3, None]
 
 
 def test_mtp_enabled_runtime_classifies_verify_batches_as_decode(

@@ -5270,19 +5270,19 @@ def test_issue51_kernel_selectors_default_serialize_and_fail_closed() -> None:
     assert stock.q2_expert_kernel == "stock"
     assert stock.hy3_router_kernel == "stock"
     assert stock.hy3_mtp_shared_kernel == "stock"
-    assert stock.hy3_mtp_shared_kernel_min_depth == 3
+    assert stock.hy3_mtp_shared_kernel_depth == 3
 
     selected = ExpertStreamingConfig(
         **base,
         q2_expert_kernel="fused-nax",
         hy3_router_kernel="fused-fp32",
         hy3_mtp_shared_kernel="metal-exact",
-        hy3_mtp_shared_kernel_min_depth=3,
+        hy3_mtp_shared_kernel_depth=3,
     )
     assert selected.to_dict()["q2_expert_kernel"] == "fused-nax"
     assert selected.to_dict()["hy3_router_kernel"] == "fused-fp32"
     assert selected.to_dict()["hy3_mtp_shared_kernel"] == "metal-exact"
-    assert selected.to_dict()["hy3_mtp_shared_kernel_min_depth"] == 3
+    assert selected.to_dict()["hy3_mtp_shared_kernel_depth"] == 3
 
     with pytest.raises(ValueError, match="q2_expert_kernel"):
         ExpertStreamingConfig(**base, q2_expert_kernel="unknown")
@@ -5290,8 +5290,8 @@ def test_issue51_kernel_selectors_default_serialize_and_fail_closed() -> None:
         ExpertStreamingConfig(**base, hy3_router_kernel="unknown")
     with pytest.raises(ValueError, match="hy3_mtp_shared_kernel"):
         ExpertStreamingConfig(**base, hy3_mtp_shared_kernel="unknown")
-    with pytest.raises(ValueError, match="hy3_mtp_shared_kernel_min_depth"):
-        ExpertStreamingConfig(**base, hy3_mtp_shared_kernel_min_depth=0)
+    with pytest.raises(ValueError, match="hy3_mtp_shared_kernel_depth"):
+        ExpertStreamingConfig(**base, hy3_mtp_shared_kernel_depth=0)
 
 
 def test_metal_mmap_resource_telemetry_does_not_claim_pipeline_coverage() -> None:

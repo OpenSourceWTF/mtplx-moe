@@ -471,7 +471,7 @@ class MetalFusedMTPSharedMLP(nn.Module):
 
 
 class DepthGatedMTPSharedMLP(nn.Module):
-    """Select stock or exact Metal once per configured speculative depth.
+    """Select exact Metal only for its proven fixed speculative depth.
 
     The wrapper owns only the original shared MLP.  The Metal path reads that
     module's existing gate/up/down arrays, so selecting it creates no duplicate
@@ -484,7 +484,7 @@ class DepthGatedMTPSharedMLP(nn.Module):
         stock: Any,
         *,
         candidate: Hy3MTPGateUpCandidate = HY3_MTP_K3_EXACT_CANDIDATE,
-        minimum_depth: int = 3,
+        target_depth: int = 3,
     ) -> None:
         super().__init__()
         if (
@@ -494,13 +494,13 @@ class DepthGatedMTPSharedMLP(nn.Module):
             raise ValueError(
                 "depth-gated runtime requires an exact split-weight candidate"
             )
-        if isinstance(minimum_depth, bool) or not isinstance(minimum_depth, int):
-            raise TypeError("minimum_depth must be an integer")
-        if minimum_depth < 1:
-            raise ValueError("minimum_depth must be positive")
+        if isinstance(target_depth, bool) or not isinstance(target_depth, int):
+            raise TypeError("target_depth must be an integer")
+        if target_depth < 1:
+            raise ValueError("target_depth must be positive")
         self.stock = stock
         self.candidate = candidate
-        self.minimum_depth = minimum_depth
+        self.target_depth = target_depth
         self.active_mode = "stock"
         self._active_call = self._call_stock
 
@@ -516,14 +516,16 @@ class DepthGatedMTPSharedMLP(nn.Module):
         )
         return self.stock.down_proj(activated)
 
-    def configure_depth(self, depth: int) -> str:
+    def configure_depth(self, depth: int | None) -> str:
         """Swap the active implementation for one complete generation."""
 
-        if isinstance(depth, bool) or not isinstance(depth, int):
-            raise TypeError("depth must be an integer")
-        if depth < 0:
+        if depth is not None and (
+            isinstance(depth, bool) or not isinstance(depth, int)
+        ):
+            raise TypeError("depth must be an integer or None")
+        if depth is not None and depth < 0:
             raise ValueError("depth must be non-negative")
-        if depth >= self.minimum_depth:
+        if depth == self.target_depth:
             self.active_mode = "metal-exact"
             self._active_call = self._call_exact
         else:
@@ -538,7 +540,7 @@ class DepthGatedMTPSharedMLP(nn.Module):
 def install_depth_gated_mtp_shared_mlp(
     mtp: Any,
     *,
-    minimum_depth: int = 3,
+    target_depth: int = 3,
     candidate: Hy3MTPGateUpCandidate = HY3_MTP_K3_EXACT_CANDIDATE,
 ) -> int:
     """Wrap every Hy3 MTP shared MLP after strict weight loading."""
@@ -550,7 +552,7 @@ def install_depth_gated_mtp_shared_mlp(
     for layer in layers:
         shared = layer.mtp_block.mlp.shared_mlp
         if isinstance(shared, DepthGatedMTPSharedMLP):
-            if shared.minimum_depth != minimum_depth or shared.candidate != candidate:
+            if shared.target_depth != target_depth or shared.candidate != candidate:
                 raise ValueError("Hy3 MTP shared MLP is already wrapped differently")
             installed += 1
             continue
@@ -584,7 +586,7 @@ def install_depth_gated_mtp_shared_mlp(
         layer.mtp_block.mlp.shared_mlp = DepthGatedMTPSharedMLP(
             shared,
             candidate=candidate,
-            minimum_depth=minimum_depth,
+            target_depth=target_depth,
         )
         installed += 1
     return installed

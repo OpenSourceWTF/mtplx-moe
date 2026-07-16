@@ -387,7 +387,7 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
     assert args.q2_expert_kernel == "stock"
     assert args.hy3_router_kernel == "stock"
     assert args.hy3_mtp_shared_kernel == "stock"
-    assert args.hy3_mtp_shared_kernel_min_depth == 3
+    assert args.hy3_mtp_shared_kernel_depth == 3
     assert args.resource_telemetry is False
     assert args.resource_sample_interval == 0.25
     assert args.resource_max_samples == 4096
@@ -413,7 +413,7 @@ def test_issue51_kernel_selectors_parse_independently() -> None:
             "fused-fp32",
             "--hy3-mtp-shared-kernel",
             "metal-exact",
-            "--hy3-mtp-shared-kernel-min-depth",
+            "--hy3-mtp-shared-kernel-depth",
             "3",
         ]
     )
@@ -421,7 +421,7 @@ def test_issue51_kernel_selectors_parse_independently() -> None:
     assert args.q2_expert_kernel == "fused-nax"
     assert args.hy3_router_kernel == "fused-fp32"
     assert args.hy3_mtp_shared_kernel == "metal-exact"
-    assert args.hy3_mtp_shared_kernel_min_depth == 3
+    assert args.hy3_mtp_shared_kernel_depth == 3
     assert module._runtime_options_from_args(args)["hy3_mtp_shared_kernel"] == (
         "metal-exact"
     )
@@ -750,7 +750,7 @@ def test_issue51_kernel_selectors_reach_runtime_and_artifact(tmp_path: Path) -> 
             "q2_expert_kernel": "nax",
             "hy3_router_kernel": "fused-fp32",
             "hy3_mtp_shared_kernel": "metal-exact",
-            "hy3_mtp_shared_kernel_min_depth": 3,
+            "hy3_mtp_shared_kernel_depth": 3,
         },
         apis=apis,
     )
@@ -758,7 +758,7 @@ def test_issue51_kernel_selectors_reach_runtime_and_artifact(tmp_path: Path) -> 
     assert calls.configs[0]["q2_expert_kernel"] == "nax"
     assert calls.configs[0]["hy3_router_kernel"] == "fused-fp32"
     assert calls.configs[0]["hy3_mtp_shared_kernel"] == "metal-exact"
-    assert calls.configs[0]["hy3_mtp_shared_kernel_min_depth"] == 3
+    assert calls.configs[0]["hy3_mtp_shared_kernel_depth"] == 3
     assert payload["configuration"]["runtime"]["q2_expert_kernel"] == "nax"
     assert payload["configuration"]["runtime"]["hy3_router_kernel"] == "fused-fp32"
     assert payload["configuration"]["runtime"]["hy3_mtp_shared_kernel"] == (

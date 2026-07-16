@@ -143,7 +143,7 @@ class ExpertStreamingConfig:
     q2_expert_kernel: str = "stock"
     hy3_router_kernel: str = "stock"
     hy3_mtp_shared_kernel: str = "stock"
-    hy3_mtp_shared_kernel_min_depth: int = 3
+    hy3_mtp_shared_kernel_depth: int = 3
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -197,10 +197,10 @@ class ExpertStreamingConfig:
             )
         object.__setattr__(
             self,
-            "hy3_mtp_shared_kernel_min_depth",
+            "hy3_mtp_shared_kernel_depth",
             _integer(
-                "hy3_mtp_shared_kernel_min_depth",
-                self.hy3_mtp_shared_kernel_min_depth,
+                "hy3_mtp_shared_kernel_depth",
+                self.hy3_mtp_shared_kernel_depth,
                 minimum=1,
             ),
         )

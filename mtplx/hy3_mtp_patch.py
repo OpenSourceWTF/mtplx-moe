@@ -825,7 +825,7 @@ def build_hy3_mtp_module(
     group_size: int = 64,
     precision: str = HY3_MTP_DEFAULT_PRECISION,
     shared_kernel: str = "stock",
-    shared_kernel_min_depth: int = 3,
+    shared_kernel_depth: int = 3,
     verified_artifacts: VerifiedHy3MTPArtifacts | None = None,
 ) -> Any:
     """Construct, strictly load, and evaluate the Hy3 NextN head.
@@ -852,11 +852,11 @@ def build_hy3_mtp_module(
             f"{shared_kernel!r}; choose 'stock' or 'metal-exact'"
         )
     if (
-        isinstance(shared_kernel_min_depth, bool)
-        or not isinstance(shared_kernel_min_depth, int)
-        or shared_kernel_min_depth < 1
+        isinstance(shared_kernel_depth, bool)
+        or not isinstance(shared_kernel_depth, int)
+        or shared_kernel_depth < 1
     ):
-        raise Hy3MTPLoadError("shared_kernel_min_depth must be a positive integer")
+        raise Hy3MTPLoadError("shared_kernel_depth must be a positive integer")
     if shared_kernel != "stock" and precision != "bf16":
         raise Hy3MTPLoadError("metal-exact shared kernel requires the BF16 MTP head")
     artifact_dir = Path(artifact_dir).expanduser().resolve()
@@ -873,7 +873,7 @@ def build_hy3_mtp_module(
                 group_size=group_size,
                 precision=precision,
                 shared_kernel=shared_kernel,
-                shared_kernel_min_depth=shared_kernel_min_depth,
+                shared_kernel_depth=shared_kernel_depth,
                 verified_artifacts=verified,
             )
     _require_verified_artifacts(
@@ -920,7 +920,7 @@ def build_hy3_mtp_module(
         try:
             install_depth_gated_mtp_shared_mlp(
                 mtp,
-                minimum_depth=shared_kernel_min_depth,
+                target_depth=shared_kernel_depth,
             )
         except Exception as exc:
             raise Hy3MTPLoadError(
@@ -928,11 +928,11 @@ def build_hy3_mtp_module(
             ) from exc
     mx.eval(mtp.parameters())
     logger.info(
-        "[Hy3 MTP] loaded %d tensors (%s, shared=%s at depth >=%d) from %s",
+        "[Hy3 MTP] loaded %d tensors (%s, shared=%s at fixed depth %d) from %s",
         len(weights),
         precision,
         shared_kernel,
-        shared_kernel_min_depth,
+        shared_kernel_depth,
         Path(artifact_dir).expanduser(),
     )
     return mtp
@@ -947,7 +947,7 @@ def inject_hy3_streamed_mtp_support(
     expected_revision: str = HY3_MTP_SOURCE_REVISION,
     mtp_precision: str = HY3_MTP_DEFAULT_PRECISION,
     shared_kernel: str = "stock",
-    shared_kernel_min_depth: int = 3,
+    shared_kernel_depth: int = 3,
     mtp_module: Any | None = None,
 ) -> bool:
     """Attach layer-80 NextN speculative support to a streamed Hy3 model.
@@ -989,7 +989,7 @@ def inject_hy3_streamed_mtp_support(
             expected_revision=expected_revision,
             precision=mtp_precision,
             shared_kernel=shared_kernel,
-            shared_kernel_min_depth=shared_kernel_min_depth,
+            shared_kernel_depth=shared_kernel_depth,
         )
     original_outer_class = model.__class__
 
@@ -1066,7 +1066,9 @@ def inject_hy3_streamed_mtp_support(
                 return logits
             return logits, hidden
 
-        def configure_mtp_execution_depth(self, depth: int) -> tuple[str, ...]:
+        def configure_mtp_execution_depth(
+            self, depth: int | None
+        ) -> tuple[str, ...]:
             """Swap depth-gated shared operators once before generation."""
 
             modes = []

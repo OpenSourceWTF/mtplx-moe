@@ -5250,6 +5250,16 @@ def generate_mtpk(
         if online_hidden_corrector_max_feed_depth is None
         else int(online_hidden_corrector_max_feed_depth)
     )
+    late_depth_switch_after = max(
+        0,
+        int(os.environ.get("MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS") or 0),
+    )
+    late_depth_before = int(
+        os.environ.get("MTPLX_LATE_DEPTH_BEFORE") or speculative_depth
+    )
+    late_depth_after = int(
+        os.environ.get("MTPLX_LATE_DEPTH_AFTER") or speculative_depth
+    )
 
     rng = np.random.default_rng(seed)
     draft_sampler = _env_scaled_draft_sampler(sampler, draft_sampler)
@@ -5265,10 +5275,19 @@ def generate_mtpk(
     )
     configure_mtp_depth = getattr(rt, "configure_mtp_execution_depth", None)
     if callable(configure_mtp_depth):
-        # One selector swap per fixed-depth generation keeps the MTP operator
-        # hot path branch-free while allowing the same loaded runtime to run a
-        # K=0..7 qualification matrix.
-        configure_mtp_depth(speculative_depth)
+        # A dynamic policy can execute the measured-regressing D1 path even
+        # when its configured ceiling is K=3.  Fail closed to stock in that
+        # case; fixed K=3 still gets one branch-free selector swap before
+        # prefill, and every other fixed K remains stock until separately
+        # qualified.
+        fixed_execution_depth = (
+            None
+            if adaptive_policy is not None
+            or draft_margin_threshold is not None
+            or late_depth_switch_after > 0
+            else speculative_depth
+        )
+        configure_mtp_depth(fixed_execution_depth)
     started_all = time.perf_counter()
     repetition_config = _repetition_stop_config(bool(repetition_stop))
     repetition_result: RepetitionStopResult | None = None
@@ -5469,16 +5488,6 @@ def generate_mtpk(
     mtp_history_materialize_every = max(
         0,
         int(os.environ.get("MTPLX_MTP_HISTORY_MATERIALIZE_EVERY") or 0),
-    )
-    late_depth_switch_after = max(
-        0,
-        int(os.environ.get("MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS") or 0),
-    )
-    late_depth_before = int(
-        os.environ.get("MTPLX_LATE_DEPTH_BEFORE") or speculative_depth
-    )
-    late_depth_after = int(
-        os.environ.get("MTPLX_LATE_DEPTH_AFTER") or speculative_depth
     )
     mtp_position_mode = _resolve_runtime_mtp_position_mode(rt)
     mtp_position_cap = max(

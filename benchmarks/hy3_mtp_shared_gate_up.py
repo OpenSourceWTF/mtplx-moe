@@ -39,6 +39,7 @@ from mtplx.models.hy3_mlx import FusedSharedMLP, ModelArgs
 
 DEFAULT_MODEL = Path("~/.cache/huggingface/hy3-expert-only-mlx-q2").expanduser()
 DEFAULT_MTP = Path("~/.cache/huggingface/hy3-mtp-layer80").expanduser()
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PREFIX = "model.layers.80.mlp.shared_mlp"
 K3_REFINEMENT_CANDIDATES = (
     "metal_n24_r2_v16_exact",
@@ -379,6 +380,19 @@ def _device_info(core: Any) -> dict[str, Any]:
     return json.loads(json.dumps(core.device_info(), default=str))
 
 
+def _source_provenance() -> dict[str, str]:
+    """Identify tested source independently of the wrapper's working directory."""
+
+    return {
+        "commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=SOURCE_ROOT,
+            text=True,
+        ).strip(),
+        "source_root": str(SOURCE_ROOT),
+    }
+
+
 def _correctness(expected: mx.array, actual: mx.array) -> dict[str, Any]:
     mx.eval(expected, actual)
     difference = mx.abs(actual.astype(mx.float32) - expected.astype(mx.float32))
@@ -649,10 +663,7 @@ def main() -> int:
             "machine": platform.machine(),
             "python": platform.python_version(),
             "metal_device": _device_info(mx),
-            "commit": subprocess.check_output(
-                ["git", "rev-parse", "HEAD"],
-                text=True,
-            ).strip(),
+            **_source_provenance(),
         },
         "artifacts": {
             "model_root": str(args.model_root.expanduser().resolve()),

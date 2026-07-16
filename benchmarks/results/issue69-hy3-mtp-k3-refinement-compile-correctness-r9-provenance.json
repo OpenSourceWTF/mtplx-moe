@@ -1,0 +1,25 @@
+{
+  "schema": "mtplx-issue69-provenance-correction-v1",
+  "artifact": "issue69-hy3-mtp-k3-refinement-compile-correctness-r9.json",
+  "artifact_sha256": "f5b724848820b86400f27e14ee2bbc119593433498b64fb3bf8922d9914fde7b",
+  "decision_scope": "compile-and-correctness-only",
+  "performance_claim": null,
+  "metadata_correction": {
+    "embedded_commit": "b9901d05950fb2a55df8070c4a5ee2ba80fa4589",
+    "embedded_commit_meaning": "wrapper working-directory commit; not tested source",
+    "tested_source_commit": "5e2e7f89a97792f5876a431e6d8cda4508bf0d43",
+    "tested_source_script": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/69-mtp-gate-up/benchmarks/hy3_mtp_shared_gate_up.py",
+    "tested_pythonpath": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/69-mtp-gate-up",
+    "cause": "the r9 harness ran git rev-parse without pinning cwd to the benchmark source repository",
+    "fix": "later harness revisions resolve commit with cwd set to SOURCE_ROOT"
+  },
+  "qualification": {
+    "compiled_candidates": 10,
+    "requested_candidates": 10,
+    "depths": [1, 3],
+    "warmup": 1,
+    "iterations": 2,
+    "rounds": 2,
+    "timing_use": "insufficient samples; do not use for performance selection"
+  }
+}

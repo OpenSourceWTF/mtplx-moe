@@ -26,6 +26,27 @@ def test_device_metadata_uses_the_current_mlx_api() -> None:
     assert calls == ["called"]
 
 
+def test_source_provenance_is_resolved_from_the_benchmark_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    benchmark = _benchmark_module()
+    calls = []
+
+    def fake_check_output(command, *, cwd, text):
+        calls.append((command, cwd, text))
+        return "source-commit\n"
+
+    monkeypatch.setattr(benchmark.subprocess, "check_output", fake_check_output)
+
+    assert benchmark._source_provenance() == {
+        "commit": "source-commit",
+        "source_root": str(benchmark.SOURCE_ROOT),
+    }
+    assert calls == [
+        (["git", "rev-parse", "HEAD"], benchmark.SOURCE_ROOT, True),
+    ]
+
+
 def test_module_names_include_a_non_stock_control_once() -> None:
     benchmark = _benchmark_module()
 

@@ -18,7 +18,7 @@ from mtplx.hy3_mtp_shared_gate_up import (
 )
 
 
-def test_depth_gated_exact_shared_mlp_switches_once_per_configured_depth(
+def test_depth_gated_exact_shared_mlp_switches_only_for_the_proven_fixed_depth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[str, object]] = []
@@ -60,7 +60,7 @@ def test_depth_gated_exact_shared_mlp_switches_once_per_configured_depth(
     module = DepthGatedMTPSharedMLP(
         StockShared(),
         candidate=candidate,
-        minimum_depth=3,
+        target_depth=3,
     )
 
     assert module.active_mode == "stock"
@@ -71,6 +71,9 @@ def test_depth_gated_exact_shared_mlp_switches_once_per_configured_depth(
     module.configure_depth(1)
     assert module.active_mode == "stock"
     assert module("d1-again") == ("stock", "d1-again")
+    module.configure_depth(4)
+    assert module.active_mode == "stock"
+    assert module("d4") == ("stock", "d4")
     assert calls == [
         ("stock", "d1"),
         (
@@ -79,6 +82,7 @@ def test_depth_gated_exact_shared_mlp_switches_once_per_configured_depth(
         ),
         ("down", ("activated", "d3")),
         ("stock", "d1-again"),
+        ("stock", "d4"),
     ]
 
 
@@ -92,7 +96,7 @@ def test_depth_gated_shared_mlp_rejects_approximate_or_packed_runtime_arms() -> 
                 rows_per_simdgroup=2,
                 activation_mode="fast",
             ),
-            minimum_depth=3,
+            target_depth=3,
         )
     with pytest.raises(ValueError, match="exact split-weight"):
         DepthGatedMTPSharedMLP(
@@ -103,9 +107,9 @@ def test_depth_gated_shared_mlp_rejects_approximate_or_packed_runtime_arms() -> 
                 rows_per_simdgroup=2,
                 weight_layout="packed2",
             ),
-            minimum_depth=3,
+            target_depth=3,
         )
-    with pytest.raises(ValueError, match="minimum_depth"):
+    with pytest.raises(ValueError, match="target_depth"):
         DepthGatedMTPSharedMLP(
             object(),
             candidate=Hy3MTPGateUpCandidate(
@@ -113,7 +117,7 @@ def test_depth_gated_shared_mlp_rejects_approximate_or_packed_runtime_arms() -> 
                 k_vector=16,
                 rows_per_simdgroup=2,
             ),
-            minimum_depth=0,
+            target_depth=0,
         )
 
 
@@ -138,7 +142,7 @@ def test_depth_gated_install_reuses_the_loaded_projection_arrays() -> None:
         ]
     )
 
-    assert install_depth_gated_mtp_shared_mlp(mtp, minimum_depth=3) == 1
+    assert install_depth_gated_mtp_shared_mlp(mtp, target_depth=3) == 1
     wrapped = mtp.layers[0].mtp_block.mlp.shared_mlp
     assert isinstance(wrapped, DepthGatedMTPSharedMLP)
     assert wrapped.stock is stock

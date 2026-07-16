@@ -71,7 +71,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "q2_expert_kernel": "stock",
     "hy3_router_kernel": "stock",
     "hy3_mtp_shared_kernel": "stock",
-    "hy3_mtp_shared_kernel_min_depth": 3,
+    "hy3_mtp_shared_kernel_depth": 3,
     "read_chunk": "8MiB",
     "bypass_page_cache": True,
     "resource_telemetry": False,
@@ -320,10 +320,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Issue 69 Hy3 MTP shared-MLP execution arm (default: stock).",
     )
     parser.add_argument(
-        "--hy3-mtp-shared-kernel-min-depth",
+        "--hy3-mtp-shared-kernel-depth",
         type=_positive_int,
         default=3,
-        help="Minimum fixed MTP depth that selects metal-exact (default: 3).",
+        help="Only fixed MTP depth that selects metal-exact (default: 3).",
     )
     parser.add_argument("--read-chunk", default="8MiB")
     parser.add_argument(
@@ -452,7 +452,7 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "q2_expert_kernel": args.q2_expert_kernel,
         "hy3_router_kernel": args.hy3_router_kernel,
         "hy3_mtp_shared_kernel": args.hy3_mtp_shared_kernel,
-        "hy3_mtp_shared_kernel_min_depth": args.hy3_mtp_shared_kernel_min_depth,
+        "hy3_mtp_shared_kernel_depth": args.hy3_mtp_shared_kernel_depth,
         "read_chunk": args.read_chunk,
         "bypass_page_cache": args.bypass_page_cache,
         "resource_telemetry": args.resource_telemetry,
@@ -1784,8 +1784,8 @@ def _runtime_config(
         q2_expert_kernel=str(options["q2_expert_kernel"]),
         hy3_router_kernel=str(options["hy3_router_kernel"]),
         hy3_mtp_shared_kernel=str(options["hy3_mtp_shared_kernel"]),
-        hy3_mtp_shared_kernel_min_depth=int(
-            options["hy3_mtp_shared_kernel_min_depth"]
+        hy3_mtp_shared_kernel_depth=int(
+            options["hy3_mtp_shared_kernel_depth"]
         ),
         max_read_chunk_bytes=apis.parse_memory_bytes(options["read_chunk"]),
         bypass_page_cache=bool(options["bypass_page_cache"]),

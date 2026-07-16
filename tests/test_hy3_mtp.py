@@ -472,9 +472,9 @@ def test_bf16_build_installs_explicit_depth_gated_exact_shared_kernel(
     _write_tiny_bf16_artifact(tmp_path)
     observed = {}
 
-    def fake_install(mtp, *, minimum_depth):
+    def fake_install(mtp, *, target_depth):
         observed["mtp"] = mtp
-        observed["minimum_depth"] = minimum_depth
+        observed["target_depth"] = target_depth
         return 1
 
     monkeypatch.setattr(
@@ -486,10 +486,10 @@ def test_bf16_build_installs_explicit_depth_gated_exact_shared_kernel(
         args,
         expected_revision=TEST_REVISION,
         shared_kernel="metal-exact",
-        shared_kernel_min_depth=3,
+        shared_kernel_depth=3,
     )
 
-    assert observed == {"mtp": mtp, "minimum_depth": 3}
+    assert observed == {"mtp": mtp, "target_depth": 3}
 
 
 def test_shared_kernel_selection_fails_closed_before_artifact_loading(
@@ -503,7 +503,7 @@ def test_shared_kernel_selection_fails_closed_before_artifact_loading(
         build_hy3_mtp_module(
             tmp_path,
             args,
-            shared_kernel_min_depth=0,
+            shared_kernel_depth=0,
         )
     with pytest.raises(Hy3MTPLoadError, match="requires the BF16"):
         build_hy3_mtp_module(

@@ -504,7 +504,7 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
         expected_revision,
         precision,
         shared_kernel,
-        shared_kernel_min_depth,
+        shared_kernel_depth,
         verified_artifacts,
     ):
         events.append(
@@ -515,7 +515,7 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
                 expected_revision,
                 precision,
                 shared_kernel,
-                shared_kernel_min_depth,
+                shared_kernel_depth,
                 verified_artifacts,
             )
         )
@@ -532,7 +532,7 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
         expected_revision,
         mtp_precision,
         shared_kernel,
-        shared_kernel_min_depth,
+        shared_kernel_depth,
         mtp_module,
     ):
         events.append(
@@ -545,7 +545,7 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
                 expected_revision,
                 mtp_precision,
                 shared_kernel,
-                shared_kernel_min_depth,
+                shared_kernel_depth,
                 mtp_module,
             )
         )
