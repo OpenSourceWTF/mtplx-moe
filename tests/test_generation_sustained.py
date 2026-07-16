@@ -339,6 +339,95 @@ class CompilableCaptureCommitRejectTinyMTPModel(
         return super().__call__(input_ids, cache=cache, **kwargs)
 
 
+class PatternedCaptureCommitTinyMTPModel(AcceptingTinyMTPModel):
+    """Deterministic long-run fixture with mixed accept/reject prefixes."""
+
+    vocab_size = 17
+
+    def __init__(self):
+        super().__init__()
+        self.target_cache = [OffsetCache()]
+
+    def make_cache(self):
+        return self.target_cache
+
+    def make_mtp_cache(self):
+        return [CompilableOffsetCache()]
+
+    @classmethod
+    def _target_token(cls, source_token: int) -> int:
+        return (int(source_token) * 5 + 3) % cls.vocab_size
+
+    @classmethod
+    def _draft_token(cls, source_token: int, depth: int) -> int:
+        target = cls._target_token(source_token)
+        if (int(source_token) + 2 * int(depth)) % 6 in {2, 3}:
+            return (target + 2) % cls.vocab_size
+        return target
+
+    @staticmethod
+    def _append_cache(mtp_cache, next_token_ids) -> None:
+        if mtp_cache is None:
+            return
+        values = next_token_ids.astype(mx.float32).reshape(
+            1,
+            1,
+            int(next_token_ids.shape[1]),
+            1,
+        )
+        mtp_cache[0].update_and_fetch(values, values + 100.0)
+
+    def __call__(self, input_ids, *, cache=None, return_hidden=False, **_kwargs):
+        if cache:
+            for entry in cache:
+                entry.offset += int(input_ids.shape[1])
+        row_tokens = [int(token) for row in input_ids.tolist() for token in row]
+        hidden = mx.array(row_tokens, dtype=mx.float32).reshape(1, -1, 1)
+        hidden = mx.concatenate((hidden, hidden + 0.5), axis=-1)
+        logits = mx.full(
+            (1, len(row_tokens), self.vocab_size),
+            -100.0,
+            dtype=mx.float32,
+        )
+        for index, token in enumerate(row_tokens):
+            logits[0, index, self._target_token(token)] = 100.0
+        if return_hidden:
+            return logits, hidden
+        return logits
+
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        *,
+        mtp_cache=None,
+        return_hidden=False,
+        mtp_depth=None,
+        **_kwargs,
+    ):
+        source_token = int(next_token_ids.item())
+        depth = int(mtp_depth or 1)
+        draft_token = self._draft_token(source_token, depth)
+        self._append_cache(mtp_cache, next_token_ids)
+        hidden = mx.array([[[float(draft_token), float(depth)]]], dtype=mx.float32)
+        logits = mx.full((1, 1, self.vocab_size), -100.0, dtype=mx.float32)
+        logits[0, 0, draft_token] = 100.0
+        if return_hidden:
+            return logits, hidden
+        return logits
+
+    def mtp_update_cache(
+        self,
+        hidden_states,
+        next_token_ids,
+        *,
+        mtp_cache=None,
+        **_kwargs,
+    ):
+        self._append_cache(mtp_cache, next_token_ids)
+        return hidden_states
+
+
 class StopAfterFirstDraftPolicy:
     current_depth = 3
     wants_draft_metrics = False
@@ -910,7 +999,9 @@ def test_device_k_capture_commit_avoids_target_rollback_and_reforward(monkeypatc
     monkeypatch.setenv("MTPLX_LAZY_BONUS_VERIFY", "0")
 
     def fail_target_rollback(*_args, **_kwargs):
-        raise AssertionError("successful capture commit must not roll target cache back")
+        raise AssertionError(
+            "successful capture commit must not roll target cache back"
+        )
 
     monkeypatch.setattr(generation, "rollback_after_verify", fail_target_rollback)
     model = CompilableCaptureCommitRejectTinyMTPModel()
@@ -968,6 +1059,176 @@ def test_device_k_capture_commit_avoids_target_rollback_and_reforward(monkeypatc
     )
     assert output.stats.events[0]["verify_strategy"] == "capture_commit"
     assert output.stats.draft_core["selected"] == "device-k"
+
+
+@pytest.mark.parametrize("depth", range(1, 8))
+def test_device_k_capture_commit_matches_stock_across_patterned_cycles(
+    monkeypatch,
+    depth: int,
+):
+    import mtplx.generation as generation
+
+    monkeypatch.setattr(generation.mx, "compile", lambda fn: fn)
+    monkeypatch.setenv("MTPLX_LAZY_BONUS_VERIFY", "0")
+
+    def fail_target_rollback(*_args, **_kwargs):
+        raise AssertionError("capture_commit parity must not roll back and re-forward")
+
+    monkeypatch.setattr(generation, "rollback_after_verify", fail_target_rollback)
+
+    def run(draft_core: str):
+        model = PatternedCaptureCommitTinyMTPModel()
+        runtime = _runtime(model, mtp_enabled=True)
+        call_kinds: list[str] = []
+        capture_widths: list[int] = []
+        forward_widths: list[int] = []
+        original_forward = runtime.forward_ar
+
+        def tracked_forward(input_ids, **kwargs):
+            call_kinds.append("forward")
+            forward_widths.append(int(input_ids.shape[1]))
+            return original_forward(input_ids, **kwargs)
+
+        def tracked_capture(input_ids, *, cache=None, return_hidden=False, **kwargs):
+            del kwargs
+            call_kinds.append("capture")
+            capture_widths.append(int(input_ids.shape[1]))
+            result = model(
+                input_ids,
+                cache=cache,
+                return_hidden=return_hidden,
+            )
+            if return_hidden:
+                logits, hidden = result
+                return logits, hidden, {}
+            return result, {}
+
+        runtime.forward_ar = tracked_forward
+        runtime.forward_ar_capture = tracked_capture
+        output = generate_mtpk(
+            runtime,
+            [4, 9, 2, 11],
+            max_tokens=43,
+            sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=1),
+            speculative_depth=depth,
+            mtp_history_policy="committed",
+            verify_strategy="capture_commit",
+            draft_core=draft_core,
+            stop_token_ids=set(),
+            capture_final_state=True,
+        )
+        return (
+            model,
+            output,
+            call_kinds,
+            capture_widths,
+            forward_widths,
+        )
+
+    stock_model, stock, stock_calls, stock_captures, stock_forwards = run("stock")
+    device_model, device, device_calls, device_captures, device_forwards = run(
+        "device-k"
+    )
+
+    def event_contract(output):
+        draft_fields = (
+            "depth",
+            "token",
+            "accepted",
+            "accept_probability",
+            "correction",
+        )
+        event_fields = (
+            "primary",
+            "primary_already_emitted",
+            "depth",
+            "accepted_depths",
+            "rejected_at_depth",
+            "bonus_token",
+            "pending_primary",
+            "capture_repair",
+        )
+        return [
+            {
+                **{name: event.get(name) for name in event_fields},
+                "drafts": [
+                    {name: draft.get(name) for name in draft_fields}
+                    for draft in event["drafts"]
+                ],
+            }
+            for event in output.stats.events
+        ]
+
+    assert device.tokens == stock.tokens
+    assert event_contract(device) == event_contract(stock)
+    for name in (
+        "accepted_drafts",
+        "rejected_drafts",
+        "drafted_tokens",
+        "evaluated_drafts",
+        "fully_accepted_verify_calls",
+        "bonus_tokens",
+        "correction_tokens",
+        "verify_calls",
+        "accepted_by_depth",
+        "drafted_by_depth",
+        "evaluated_by_depth",
+        "accept_probability_sum_by_depth",
+    ):
+        assert getattr(device.stats, name) == getattr(stock.stats, name)
+    assert device.stats.rejected_drafts > 2
+    assert device.stats.accepted_drafts > 2
+    assert device.stats.fully_accepted_verify_calls > 0
+    assert device.stats.evaluated_by_depth[-1] > 0
+
+    assert device_captures == stock_captures
+    assert len(device_captures) == device.stats.verify_calls
+    assert len(stock_captures) == stock.stats.verify_calls
+    assert device_calls.count("capture") == stock_calls.count("capture")
+    assert device_forwards == stock_forwards
+
+    assert stock.final_state is not None
+    assert device.final_state is not None
+    assert (
+        device.final_state.generated_token_ids == stock.final_state.generated_token_ids
+    )
+    assert device.final_state.safe_to_commit == stock.final_state.safe_to_commit
+    assert device.final_state.finish_reason == stock.final_state.finish_reason
+    assert (
+        device.final_state.mtp_history_window_tokens
+        == stock.final_state.mtp_history_window_tokens
+    )
+    assert (
+        device.final_state.mtp_history_position_base
+        == stock.final_state.mtp_history_position_base
+    )
+    mx.eval(
+        stock.final_state.final_logits,
+        stock.final_state.final_hidden,
+        device.final_state.final_logits,
+        device.final_state.final_hidden,
+    )
+    assert mx.array_equal(
+        device.final_state.final_logits,
+        stock.final_state.final_logits,
+    ).item()
+    assert mx.array_equal(
+        device.final_state.final_hidden,
+        stock.final_state.final_hidden,
+    ).item()
+    assert device_model.target_cache[0].offset == stock_model.target_cache[0].offset
+    assert device_model.target_cache[0].trimmed == stock_model.target_cache[0].trimmed
+
+    stock_cache = stock.final_state.final_committed_mtp_cache[0]
+    device_cache = device.final_state.final_committed_mtp_cache[0]
+    mx.eval(
+        stock_cache.keys, stock_cache.values, device_cache.keys, device_cache.values
+    )
+    assert device_cache.offset == stock_cache.offset
+    assert mx.array_equal(device_cache.keys, stock_cache.keys).item()
+    assert mx.array_equal(device_cache.values, stock_cache.values).item()
+    assert device.stats.draft_core["selected"] == "device-k"
+    assert device.stats.draft_core["fallbacks"] == 0
 
 
 def test_cold_committed_history_reports_exact_rows_and_tps(monkeypatch):
