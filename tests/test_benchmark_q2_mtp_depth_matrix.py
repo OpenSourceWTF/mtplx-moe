@@ -422,7 +422,7 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
     assert args.expert_cache_limit == "64GiB"
     assert args.max_live_kv_tokens == 4096
     assert args.q2_expert_kernel == "stock"
-    assert args.hy3_router_kernel == "stock"
+    assert args.hy3_router_kernel == "mpp-r1-fused-r2"
     assert args.resource_telemetry is False
     assert args.resource_sample_interval == 0.25
     assert args.resource_max_samples == 4096
@@ -446,12 +446,25 @@ def test_issue51_kernel_selectors_parse_independently() -> None:
             "--q2-expert-kernel",
             "fused-nax",
             "--hy3-router-kernel",
-            "fused-fp32",
+            "mpp-r1-fused-r2",
         ]
     )
 
     assert args.q2_expert_kernel == "fused-nax"
-    assert args.hy3_router_kernel == "fused-fp32"
+    assert args.hy3_router_kernel == "mpp-r1-fused-r2"
+
+    for selector in (
+        "steel-r1-fused-r2",
+        "mpp-fp32-splitk-r1-fused-r2",
+        "mpp-r1-last-arrival-fused-r2",
+    ):
+        selected = module.build_parser().parse_args(["--hy3-router-kernel", selector])
+        assert selected.hy3_router_kernel == selector
+
+    with pytest.raises(SystemExit):
+        module.build_parser().parse_args(
+            ["--hy3-router-kernel", "mpp-r1-fast-fused-r2"]
+        )
 
 
 def test_device_k_draft_core_selector_parses() -> None:
@@ -857,9 +870,7 @@ def test_issue51_kernel_selectors_reach_runtime_and_artifact(tmp_path: Path) -> 
     assert payload["configuration"]["runtime"]["q2_expert_kernel"] == "nax"
     assert payload["configuration"]["runtime"]["hy3_router_kernel"] == "fused-fp32"
     assert payload["models"][0]["runtime_config"]["q2_expert_kernel"] == "nax"
-    assert payload["models"][0]["runtime_config"]["hy3_router_kernel"] == (
-        "fused-fp32"
-    )
+    assert payload["models"][0]["runtime_config"]["hy3_router_kernel"] == ("fused-fp32")
 
 
 def test_ar_path_drift_is_retained_as_diagnostic_and_matrix_continues(

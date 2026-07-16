@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -18,6 +19,19 @@ from mlx_lm.models.base import (
 from mlx_lm.models.cache import KVCache
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
+
+from mtplx.attention_context import current_attention_phase
+from mtplx.hy3_router_last_arrival import hy3_router_last_arrival_route
+from mtplx.hy3_router_fp32 import (
+    Hy3RouterFP32Ineligible,
+    hy3_router_fp32_available,
+    hy3_router_fp32_exact_route,
+    hy3_router_fp32_exact_splitk_route,
+    hy3_router_fp32_route,
+    prepare_hy3_router_fp32_exact_splitk_weight,
+    prepare_hy3_router_fp32_exact_weight,
+    prepare_hy3_router_fp32_weight,
+)
 
 from .expert_mlx import UnboundExpertSwitch, run_switch_with_shared_overlap
 
@@ -273,6 +287,15 @@ def _router_storage_module(module: nn.Module) -> nn.Module:
     return current
 
 
+@dataclass(slots=True)
+class _RouterKernelState:
+    """Private non-parameter state for one load-time router selection."""
+
+    selector: str = "stock"
+    prepared_weight: mx.array | None = None
+    splitk_m1: bool = False
+
+
 class Router(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -282,9 +305,195 @@ class Router(nn.Module):
         self.router_scaling_factor = args.router_scaling_factor
         self.gate = nn.Linear(args.hidden_size, args.num_experts, bias=False)
         self.expert_bias = mx.zeros((args.num_experts,), dtype=mx.float32)
+        # Leading underscore keeps an optional alternate layout out of MLX's
+        # parameter tree. It is a load-time runtime artifact, not a checkpoint
+        # parameter, and is accounted for explicitly by configure_kernel().
+        self._mtplx_router_kernel_state = _RouterKernelState()
+
+    def configure_kernel(
+        self,
+        selector: str,
+        *,
+        available: bool | None = None,
+        splitk_m1: bool = False,
+    ) -> dict[str, int | bool | str]:
+        """Select and prepare one router implementation at model load time."""
+
+        if not isinstance(splitk_m1, bool):
+            raise TypeError("splitk_m1 must be bool")
+
+        if selector not in {
+            "stock",
+            "steel-r1-fused-r2",
+            "mpp-r1-fused-r2",
+            "mpp-fp32-splitk-r1-fused-r2",
+            "mpp-r1-last-arrival-fused-r2",
+        }:
+            raise ValueError(
+                "Hy3 router kernel must be 'stock', 'steel-r1-fused-r2', "
+                "'mpp-r1-fused-r2', 'mpp-fp32-splitk-r1-fused-r2', or "
+                "'mpp-r1-last-arrival-fused-r2'"
+            )
+        if splitk_m1 and selector != "mpp-fp32-splitk-r1-fused-r2":
+            raise ValueError("splitk_m1 requires the FP32 split-K router selector")
+
+        storage_gate = _router_storage_module(self.gate)
+        source_weight = getattr(storage_gate, "weight", None)
+        source_bytes = int(getattr(source_weight, "nbytes", 0))
+        if selector == "stock":
+            self._mtplx_router_kernel_state = _RouterKernelState()
+            return {
+                "selector": selector,
+                "enabled": False,
+                "source_weight_bytes": source_bytes,
+                "prepared_weight_bytes": 0,
+                "incremental_bytes": 0,
+            }
+
+        if self.gate is not storage_gate or not isinstance(storage_gate, nn.Linear):
+            raise Hy3RouterFP32Ineligible(
+                "optimized Hy3 router requires an unwrapped nn.Linear gate"
+            )
+        if (
+            source_weight is None
+            or source_weight.ndim != 2
+            or tuple(int(dimension) for dimension in source_weight.shape) != (192, 4096)
+            or source_weight.dtype != mx.bfloat16
+        ):
+            raise Hy3RouterFP32Ineligible(
+                "optimized Hy3 router requires a BF16 [192, 4096] gate"
+            )
+        if self.top_k != 8 or self.num_experts != 192 or not self.route_norm:
+            raise Hy3RouterFP32Ineligible(
+                "optimized Hy3 router requires the exact top-8 normalized contract"
+            )
+        supported = (
+            hy3_router_fp32_available() if available is None else bool(available)
+        )
+        if not supported:
+            raise Hy3RouterFP32Ineligible(
+                "optimized Hy3 router is unavailable on this Metal device"
+            )
+
+        if selector == "steel-r1-fused-r2":
+            prepared_weight = prepare_hy3_router_fp32_exact_weight(source_weight)
+            # Replace the BF16 checkpoint array. This preserves the stock
+            # row-major dispatch while avoiding a per-call BF16->FP32 promote.
+            storage_gate.weight = prepared_weight
+            state_weight = None
+        elif selector == "mpp-fp32-splitk-r1-fused-r2":
+            prepared_weight = prepare_hy3_router_fp32_exact_splitk_weight(source_weight)
+            # Retain the source row-major BF16 gate for target AR at M1.
+            # MTP-head M1 and all M2..M8 calls consume this K-major FP32
+            # split-K layout so K>=1 draft and verification use one R1 order.
+            state_weight = prepared_weight
+        else:
+            prepared_weight = prepare_hy3_router_fp32_weight(source_weight)
+            # MPP consumes a K-major BF16 layout while stock large-M fallback
+            # continues to use the source row-major gate.
+            state_weight = prepared_weight
+
+        prepared_bytes = int(prepared_weight.nbytes)
+        self._mtplx_router_kernel_state = _RouterKernelState(
+            selector=selector,
+            prepared_weight=state_weight,
+            splitk_m1=splitk_m1,
+        )
+        report: dict[str, int | bool | str] = {
+            "selector": selector,
+            "enabled": True,
+            "source_weight_bytes": source_bytes,
+            "prepared_weight_bytes": prepared_bytes,
+            "incremental_bytes": (
+                prepared_bytes - source_bytes
+                if selector == "steel-r1-fused-r2"
+                else prepared_bytes
+            ),
+        }
+        if selector == "mpp-fp32-splitk-r1-fused-r2":
+            report["m1_policy"] = "splitk" if splitk_m1 else "stock"
+            report["m4_grid_k_parts"] = 32
+            report["other_grid_k_parts"] = 16
+        elif selector == "mpp-r1-last-arrival-fused-r2":
+            report["supported_rows"] = 4
+            report["dispatch_count"] = 1
+            report["sigmoid_mode"] = "precise"
+            report["topology"] = "n16-p16-sg4-in-kernel-pad"
+            report["threadgroups"] = 48
+            report["attention_phase"] = "decode_verify"
+        return report
 
     def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
+        state = self._mtplx_router_kernel_state
         storage_gate = _router_storage_module(self.gate)
+        rows = math.prod(int(dimension) for dimension in x.shape[:-1])
+        last_arrival_eligible = state.selector != ("mpp-r1-last-arrival-fused-r2") or (
+            x.ndim == 3
+            and tuple(int(dimension) for dimension in x.shape) == (1, 4, 4096)
+            and current_attention_phase() == "decode_verify"
+        )
+        if (
+            state.selector != "stock"
+            and 1 <= rows <= 8
+            and last_arrival_eligible
+            and not (
+                state.selector == "mpp-fp32-splitk-r1-fused-r2"
+                and rows == 1
+                and not state.splitk_m1
+            )
+            and self.gate is storage_gate
+            and isinstance(storage_gate, nn.Linear)
+        ):
+            value = x.astype(mx.float32)
+            if state.selector == "steel-r1-fused-r2":
+                return hy3_router_fp32_exact_route(
+                    value,
+                    storage_gate.weight,
+                    self.expert_bias,
+                    top_k=self.top_k,
+                    route_norm=self.route_norm,
+                    scaling_factor=self.router_scaling_factor,
+                    finalizer_mode="simd",
+                )
+            assert state.prepared_weight is not None
+            if state.selector == "mpp-fp32-splitk-r1-fused-r2":
+                return hy3_router_fp32_exact_splitk_route(
+                    value,
+                    state.prepared_weight,
+                    self.expert_bias,
+                    n_tile=32,
+                    grid_k_parts=32 if rows == 4 else 16,
+                    operand_mode="direct",
+                    top_k=self.top_k,
+                    route_norm=self.route_norm,
+                    scaling_factor=self.router_scaling_factor,
+                    finalizer_mode="simd",
+                    sigmoid_mode="precise",
+                )
+            if state.selector == "mpp-r1-last-arrival-fused-r2":
+                output = hy3_router_last_arrival_route(
+                    value,
+                    state.prepared_weight,
+                    self.expert_bias,
+                    top_k=self.top_k,
+                    route_norm=self.route_norm,
+                    scaling_factor=self.router_scaling_factor,
+                    sigmoid_mode="precise",
+                )
+                return output.expert_ids, output.route_weights
+            return hy3_router_fp32_route(
+                value,
+                state.prepared_weight,
+                self.expert_bias,
+                n_tile=16,
+                grid_k_parts=8,
+                operand_mode="direct",
+                top_k=self.top_k,
+                route_norm=self.route_norm,
+                scaling_factor=self.router_scaling_factor,
+                finalizer_mode="simd",
+                sigmoid_mode="precise",
+            )
         if isinstance(storage_gate, nn.QuantizedLinear):
             # Preserve the pinned community-Q4 affine-Q8 execution contract.
             # Its packed approximation is a separate model from Tencent's
@@ -306,6 +515,113 @@ class Router(nn.Module):
         if self.route_norm:
             weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
         return indices, weights * self.router_scaling_factor
+
+
+def configure_hy3_router_kernels(
+    root: nn.Module,
+    selector: str,
+    *,
+    available: bool | None = None,
+) -> dict[str, int | str]:
+    """Configure every Hy3 router and return explicit model memory accounting."""
+
+    reports = []
+    for name, module in root.named_modules():
+        if not isinstance(module, Router):
+            continue
+        splitk_m1 = selector == "mpp-fp32-splitk-r1-fused-r2" and "mtp" in name.split(
+            "."
+        )
+        reports.append(
+            module.configure_kernel(
+                selector,
+                available=available,
+                splitk_m1=splitk_m1,
+            )
+        )
+    summary: dict[str, int | str] = {
+        "selector": selector,
+        "router_count": len(reports),
+        "enabled_count": sum(bool(report["enabled"]) for report in reports),
+        "source_weight_bytes": sum(
+            int(report["source_weight_bytes"]) for report in reports
+        ),
+        "prepared_weight_bytes": sum(
+            int(report["prepared_weight_bytes"]) for report in reports
+        ),
+        "incremental_bytes": sum(
+            int(report["incremental_bytes"]) for report in reports
+        ),
+    }
+    if selector == "mpp-fp32-splitk-r1-fused-r2":
+        summary["m1_splitk_count"] = sum(
+            report.get("m1_policy") == "splitk" for report in reports
+        )
+        summary["m4_grid_k_parts"] = 32
+        summary["other_grid_k_parts"] = 16
+    elif selector == "mpp-r1-last-arrival-fused-r2":
+        summary["supported_rows"] = 4
+        summary["dispatch_count"] = 1
+        summary["sigmoid_mode"] = "precise"
+        summary["topology"] = "n16-p16-sg4-in-kernel-pad"
+        summary["threadgroups"] = 48
+        summary["attention_phase"] = "decode_verify"
+    return summary
+
+
+def estimate_hy3_router_kernel_incremental_bytes(
+    config: dict[str, Any],
+    selector: str,
+    *,
+    include_mtp: bool,
+) -> int:
+    """Estimate prepared-layout bytes before expert-cache admission."""
+
+    if selector not in {
+        "stock",
+        "steel-r1-fused-r2",
+        "mpp-r1-fused-r2",
+        "mpp-fp32-splitk-r1-fused-r2",
+        "mpp-r1-last-arrival-fused-r2",
+    }:
+        raise ValueError(
+            "Hy3 router kernel must be 'stock', 'steel-r1-fused-r2', "
+            "'mpp-r1-fused-r2', 'mpp-fp32-splitk-r1-fused-r2', or "
+            "'mpp-r1-last-arrival-fused-r2'"
+        )
+    if selector == "stock":
+        return 0
+    if str(config.get("model_type") or "") != "hy_v3":
+        raise Hy3RouterFP32Ineligible(
+            "optimized Hy3 router requires model_type='hy_v3'"
+        )
+    try:
+        layer_count = int(config["num_hidden_layers"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise Hy3RouterFP32Ineligible(
+            "optimized Hy3 router requires num_hidden_layers"
+        ) from exc
+    explicit_types = config.get("mlp_layer_types")
+    if explicit_types is None:
+        try:
+            dense_prefix = int(config.get("first_k_dense_replace", 0))
+        except (TypeError, ValueError) as exc:
+            raise Hy3RouterFP32Ineligible(
+                "optimized Hy3 router requires a valid dense-layer prefix"
+            ) from exc
+        sparse_count = max(0, layer_count - dense_prefix)
+    else:
+        if (
+            not isinstance(explicit_types, (list, tuple))
+            or len(explicit_types) != layer_count
+        ):
+            raise Hy3RouterFP32Ineligible(
+                "optimized Hy3 router requires one MLP type per target layer"
+            )
+        sparse_count = sum(str(layer_type) == "sparse" for layer_type in explicit_types)
+    router_count = sparse_count + (1 if include_mtp else 0)
+    prepared_element_bytes = 4 if selector == "mpp-fp32-splitk-r1-fused-r2" else 2
+    return router_count * 192 * 4096 * prepared_element_bytes
 
 
 class SparseMLP(nn.Module):

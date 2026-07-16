@@ -141,7 +141,7 @@ class ExpertStreamingConfig:
     bypass_page_cache: bool = False
     resource_telemetry: bool = False
     q2_expert_kernel: str = "stock"
-    hy3_router_kernel: str = "stock"
+    hy3_router_kernel: str = "mpp-r1-fused-r2"
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -187,8 +187,18 @@ class ExpertStreamingConfig:
             raise ValueError(
                 "q2_expert_kernel must be 'stock', 'nax', 'fused', or 'fused-nax'"
             )
-        if self.hy3_router_kernel not in {"stock", "fused-fp32"}:
-            raise ValueError("hy3_router_kernel must be 'stock' or 'fused-fp32'")
+        if self.hy3_router_kernel not in {
+            "stock",
+            "steel-r1-fused-r2",
+            "mpp-r1-fused-r2",
+            "mpp-fp32-splitk-r1-fused-r2",
+            "mpp-r1-last-arrival-fused-r2",
+        }:
+            raise ValueError(
+                "hy3_router_kernel must be 'stock', 'steel-r1-fused-r2', "
+                "'mpp-r1-fused-r2', 'mpp-fp32-splitk-r1-fused-r2', or "
+                "'mpp-r1-last-arrival-fused-r2'"
+            )
         if self.slot_layout not in {
             "direct-slots",
             "component-banks",

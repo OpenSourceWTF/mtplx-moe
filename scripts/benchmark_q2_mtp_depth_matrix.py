@@ -70,7 +70,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "slot_layout": "component-banks",
     "transient_slots": 8,
     "q2_expert_kernel": "stock",
-    "hy3_router_kernel": "stock",
+    "hy3_router_kernel": "mpp-r1-fused-r2",
     "read_chunk": "8MiB",
     "bypass_page_cache": True,
     "resource_telemetry": False,
@@ -308,9 +308,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--hy3-router-kernel",
-        choices=("stock", "fused-fp32"),
-        default="stock",
-        help="Issue 51 Hy3 router execution arm (default: stock).",
+        choices=(
+            "stock",
+            "steel-r1-fused-r2",
+            "mpp-r1-fused-r2",
+            "mpp-fp32-splitk-r1-fused-r2",
+            "mpp-r1-last-arrival-fused-r2",
+        ),
+        default="mpp-r1-fused-r2",
+        help=(
+            "Issue 51 authoritative Hy3 router arithmetic mode "
+            "(default: mpp-r1-fused-r2)."
+        ),
     )
     parser.add_argument("--read-chunk", default="8MiB")
     parser.add_argument(
@@ -2129,26 +2138,18 @@ def _run_depth_matrix_impl(
         "trace_routes": bool(trace_routes),
     }
     if options["powermetrics"] and not options["resource_telemetry"]:
-        raise BenchmarkConfigurationError(
-            "powermetrics requires resource telemetry"
-        )
+        raise BenchmarkConfigurationError("powermetrics requires resource telemetry")
     if options["ssd_ceiling_gib_s"] is not None:
         if not options["resource_telemetry"]:
-            raise BenchmarkConfigurationError(
-                "SSD ceiling requires resource telemetry"
-            )
+            raise BenchmarkConfigurationError("SSD ceiling requires resource telemetry")
         if not options["bypass_page_cache"]:
             raise BenchmarkConfigurationError("SSD ceiling requires F_NOCACHE")
         if float(options["ssd_ceiling_gib_s"]) <= 0:
             raise BenchmarkConfigurationError("SSD ceiling must be positive")
     if float(options["resource_sample_interval"]) <= 0:
-        raise BenchmarkConfigurationError(
-            "resource sample interval must be positive"
-        )
+        raise BenchmarkConfigurationError("resource sample interval must be positive")
     if int(options["resource_max_samples"]) < 2:
-        raise BenchmarkConfigurationError(
-            "resource max samples must be at least 2"
-        )
+        raise BenchmarkConfigurationError("resource max samples must be at least 2")
     if max(context_values) + output_tokens > int(options["max_live_kv_tokens"]):
         raise BenchmarkConfigurationError(
             f"context plus {output_tokens} output tokens exceeds max_live_kv_tokens"

@@ -471,6 +471,7 @@ def _load_impl(
     resident_load_report = None
     streamed_mtp_backend = None
     streamed_mtp_resident_bytes = 0
+    hy3_router_incremental_bytes = 0
     mtp_enabled = False
     if streaming_requested:
         from .expert_runtime import (
@@ -544,9 +545,27 @@ def _load_impl(
                 ):
                     raise RuntimeError("Hy3 MTP artifact payload byte count is invalid")
 
+            if (
+                str(config.get("model_type") or "") == "hy_v3"
+                and expert_streaming_config.hy3_router_kernel != "stock"
+            ):
+                from .models.hy3_mlx import (
+                    estimate_hy3_router_kernel_incremental_bytes,
+                )
+
+                hy3_router_incremental_bytes = (
+                    estimate_hy3_router_kernel_incremental_bytes(
+                        config,
+                        expert_streaming_config.hy3_router_kernel,
+                        include_mtp=streamed_mtp_backend == "hy3" and bool(mtp),
+                    )
+                )
+            additional_resident_bytes = (
+                streamed_mtp_resident_bytes + hy3_router_incremental_bytes
+            )
             plan_kwargs = (
-                {"additional_resident_bytes": streamed_mtp_resident_bytes}
-                if streamed_mtp_resident_bytes
+                {"additional_resident_bytes": additional_resident_bytes}
+                if additional_resident_bytes
                 else {}
             )
             streaming_plan = expert_streaming_config.memory_plan(
@@ -652,6 +671,32 @@ def _load_impl(
                         )
                     if not mtp_enabled or not validate_mtp_support(model):
                         raise RuntimeError(f"streamed MTP injection failed for {path}")
+                if (
+                    str(config.get("model_type") or "") == "hy_v3"
+                    and expert_streaming_config.hy3_router_kernel != "stock"
+                ):
+                    from .models.hy3_mlx import configure_hy3_router_kernels
+
+                    router_kernel_report = configure_hy3_router_kernels(
+                        model,
+                        expert_streaming_config.hy3_router_kernel,
+                    )
+                    actual_incremental = int(
+                        router_kernel_report.get("incremental_bytes", -1)
+                    )
+                    if actual_incremental != hy3_router_incremental_bytes:
+                        raise RuntimeError(
+                            "Hy3 router prepared-layout bytes do not match "
+                            f"admission plan: {actual_incremental} != "
+                            f"{hy3_router_incremental_bytes}"
+                        )
+                    setattr(
+                        model,
+                        "_mtplx_hy3_router_kernel_report",
+                        router_kernel_report,
+                    )
+                    if isinstance(resident_load_report, dict):
+                        resident_load_report["hy3_router_kernel"] = router_kernel_report
             except BaseException:
                 expert_runtime.close()
                 raise

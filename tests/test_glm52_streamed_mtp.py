@@ -38,12 +38,14 @@ class _PlainTarget:
 
 def _streaming_config(
     model_key: str = "glm52-expert-q2",
+    **overrides: Any,
 ) -> ExpertStreamingConfig:
     return ExpertStreamingConfig(
         model_key=model_key,
         memory_limit_bytes=1,
         max_live_kv_tokens=0,
         runtime_reserve_bytes=0,
+        **overrides,
     )
 
 
@@ -449,7 +451,14 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
     root = tmp_path / "hy3-q2"
     root.mkdir()
     (root / "config.json").write_text(
-        json.dumps({"model_type": "hy_v3", "num_nextn_predict_layers": 1}),
+        json.dumps(
+            {
+                "model_type": "hy_v3",
+                "num_hidden_layers": 80,
+                "first_k_dense_replace": 1,
+                "num_nextn_predict_layers": 1,
+            }
+        ),
         encoding="utf-8",
     )
     artifacts = tmp_path / "mtp"
@@ -548,11 +557,29 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
         inject_hy3,
     )
     monkeypatch.setattr("mtplx.runtime.validate_mtp_support", lambda _model: True)
+    router_bytes = 80 * 192 * 4096 * 2
+
+    def configure_router(target, selector):
+        events.append(("configure-router", target, selector))
+        return {
+            "selector": selector,
+            "router_count": 80,
+            "enabled_count": 80,
+            "incremental_bytes": router_bytes,
+        }
+
+    monkeypatch.setattr(
+        "mtplx.models.hy3_mlx.configure_hy3_router_kernels",
+        configure_router,
+    )
 
     runtime = load(
         root,
         mtp=True,
-        expert_streaming_config=_streaming_config("hy3-expert-q2"),
+        expert_streaming_config=_streaming_config(
+            "hy3-expert-q2",
+            hy3_router_kernel="mpp-r1-fused-r2",
+        ),
         expert_manifest=root / "expert-manifest.json",
         mtp_artifacts=artifacts,
         mtp_precision="bf16",
@@ -561,16 +588,17 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
     assert runtime.model is model
     assert runtime.mtp_enabled is True
     assert {tuple(event.items())[0] for event in events if isinstance(event, dict)} == {
-        ("planned_mtp_resident_bytes", HY3_MTP_HEAD_BYTES),
-        ("opened_mtp_resident_bytes", HY3_MTP_HEAD_BYTES),
+        ("planned_mtp_resident_bytes", HY3_MTP_HEAD_BYTES + router_bytes),
+        ("opened_mtp_resident_bytes", HY3_MTP_HEAD_BYTES + router_bytes),
     }
     tuple_events = [event for event in events if isinstance(event, tuple)]
     assert [event[0] for event in tuple_events] == [
         "memory-cap",
         "build-mtp",
         "hy3-inject",
+        "configure-router",
     ]
-    injection = tuple_events[-1]
+    injection = tuple_events[2]
     assert injection[0] == "hy3-inject"
     assert injection[1:] == (
         model,
@@ -582,6 +610,11 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
         prebuilt_mtp,
     )
     assert tuple_events[1][-1] is verified
+    assert tuple_events[-1] == (
+        "configure-router",
+        model,
+        "mpp-r1-fused-r2",
+    )
     assert events.index("artifact-enter") < events.index(tuple_events[1])
     assert events.index(tuple_events[1]) < events.index("allocate")
     assert events[-1] == "artifact-exit"

@@ -5266,22 +5266,33 @@ def test_issue51_kernel_selectors_default_serialize_and_fail_closed() -> None:
         runtime_reserve_bytes=0,
     )
 
-    stock = ExpertStreamingConfig(**base)
-    assert stock.q2_expert_kernel == "stock"
-    assert stock.hy3_router_kernel == "stock"
+    defaults = ExpertStreamingConfig(**base)
+    assert defaults.q2_expert_kernel == "stock"
+    assert defaults.hy3_router_kernel == "mpp-r1-fused-r2"
 
-    selected = ExpertStreamingConfig(
-        **base,
-        q2_expert_kernel="fused-nax",
-        hy3_router_kernel="fused-fp32",
-    )
-    assert selected.to_dict()["q2_expert_kernel"] == "fused-nax"
-    assert selected.to_dict()["hy3_router_kernel"] == "fused-fp32"
+    for router_selector in (
+        "steel-r1-fused-r2",
+        "mpp-r1-fused-r2",
+        "mpp-fp32-splitk-r1-fused-r2",
+        "mpp-r1-last-arrival-fused-r2",
+    ):
+        selected = ExpertStreamingConfig(
+            **base,
+            q2_expert_kernel="fused-nax",
+            hy3_router_kernel=router_selector,
+        )
+        assert selected.to_dict()["q2_expert_kernel"] == "fused-nax"
+        assert selected.to_dict()["hy3_router_kernel"] == router_selector
 
     with pytest.raises(ValueError, match="q2_expert_kernel"):
         ExpertStreamingConfig(**base, q2_expert_kernel="unknown")
     with pytest.raises(ValueError, match="hy3_router_kernel"):
         ExpertStreamingConfig(**base, hy3_router_kernel="unknown")
+    with pytest.raises(ValueError, match="hy3_router_kernel"):
+        ExpertStreamingConfig(
+            **base,
+            hy3_router_kernel="mpp-r1-fast-fused-r2",
+        )
 
 
 def test_metal_mmap_resource_telemetry_does_not_claim_pipeline_coverage() -> None:
