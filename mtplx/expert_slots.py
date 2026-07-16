@@ -8,7 +8,7 @@ from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Collection, Iterable
 
 from .expert_io import ExpertIOError, PositionalExpertReader
 from .expert_manifest import ExpertManifest, ExpertManifestError, ExpertRecord
@@ -617,9 +617,21 @@ class ExpertSlotPool:
         cache_scope: str = "layer",
         resource_telemetry: bool = False,
         pipeline_ledger: ExpertPipelineLedger | None = None,
+        island_layers: Collection[int] = (),
     ) -> None:
         if plan.model_key != spec.key or manifest.model_key != spec.key:
             raise ValueError("spec, memory plan, and manifest model keys must match")
+        island_set = frozenset(int(layer) for layer in island_layers)
+        if island_set and cache_scope != "layer":
+            raise ValueError("dense island layers require cache_scope 'layer'")
+        if not island_set <= set(spec.routed_layer_indices):
+            raise ValueError("island layers must be routed layers of the model")
+        if len(island_set) != plan.island_layer_count:
+            raise ValueError(
+                f"pool island layers ({len(island_set)}) do not match memory "
+                f"plan island_layer_count ({plan.island_layer_count})"
+            )
+        self.island_layers = island_set
         if (
             manifest.quant_bits != spec.quant_bits
             or manifest.quant_group_size != spec.quant_group_size
@@ -694,6 +706,7 @@ class ExpertSlotPool:
                 else (
                     (layer, slot_index)
                     for layer in spec.routed_layer_indices
+                    if layer not in island_set
                     for slot_index in range(plan.slots_per_layer)
                 )
             )

@@ -206,6 +206,8 @@ class ExpertMemoryPlan:
     persistent_cache_bytes: int
     unallocated_bytes: int
     fits_fixed: bool
+    island_layer_count: int = 0
+    island_bytes: int = 0
 
     @property
     def fixed_bytes(self) -> int:
@@ -216,6 +218,7 @@ class ExpertMemoryPlan:
             + self.io_staging_bytes
             + self.execution_workspace_bytes
             + self.runtime_reserve_bytes
+            + self.island_bytes
         )
 
     @property
@@ -394,6 +397,7 @@ def plan_expert_memory(
     execution_workspace_bytes: int = 0,
     additional_resident_bytes: int = 0,
     cache_scope: str = "layer",
+    island_layer_count: int = 0,
 ) -> ExpertMemoryPlan:
     """Fit uniform persistent expert slots under an explicit memory ceiling.
 
@@ -401,6 +405,11 @@ def plan_expert_memory(
     weights, KV state, runtime headroom, and transient miss service are removed
     first.  ``expert_cache_limit_bytes`` can impose a stricter secondary cap.
     The returned slot count is bounded by the model's expert count.
+
+    ``island_layer_count`` routed layers hold every expert permanently
+    resident in dense per-layer banks outside the uniform slot pool; their
+    full cost lands on the fixed side and the uniform slot math spans only
+    the remaining streamed layers.
 
     A plan with ``fits_fixed=False`` is diagnostic and must not be used to
     start inference.  Its negative ``unallocated_bytes`` is the fixed-footprint
@@ -428,6 +437,16 @@ def plan_expert_memory(
         )
     if cache_scope not in {"layer", "global"}:
         raise ValueError("cache_scope must be 'layer' or 'global'")
+    island_layer_count = _integer(
+        "island_layer_count", island_layer_count, minimum=0
+    )
+    if island_layer_count > spec.routed_layer_count:
+        raise ValueError(
+            f"island_layer_count {island_layer_count} exceeds routed layer "
+            f"count {spec.routed_layer_count}"
+        )
+    if island_layer_count and cache_scope != "layer":
+        raise ValueError("dense island layers require cache_scope 'layer'")
 
     service_slots = spec.top_k if transient_slots is None else transient_slots
     service_slots = _integer("transient_slots", service_slots, minimum=0)
@@ -437,6 +456,10 @@ def plan_expert_memory(
     kv_bytes = context_tokens * spec.kv_bytes_per_token
     transient_bytes = service_slots * spec.expert_record_bytes
     resident_bytes = spec.resident_bytes + additional_resident_bytes
+    island_bytes = (
+        island_layer_count * spec.expert_count * spec.expert_record_bytes
+    )
+    streamed_layer_count = spec.routed_layer_count - island_layer_count
     fixed_bytes = (
         resident_bytes
         + kv_bytes
@@ -444,13 +467,17 @@ def plan_expert_memory(
         + transient_bytes
         + io_staging_bytes
         + execution_workspace_bytes
+        + island_bytes
     )
     available_bytes = max(0, total_limit_bytes - fixed_bytes)
-    persistent_budget_bytes = min(available_bytes, spec.routed_expert_bytes)
+    streamed_expert_bytes = (
+        streamed_layer_count * spec.expert_count * spec.expert_record_bytes
+    )
+    persistent_budget_bytes = min(available_bytes, streamed_expert_bytes)
     if expert_cache_limit_bytes is not None:
         persistent_budget_bytes = min(persistent_budget_bytes, expert_cache_limit_bytes)
 
-    bytes_per_uniform_slot = spec.routed_layer_count * spec.expert_record_bytes
+    bytes_per_uniform_slot = streamed_layer_count * spec.expert_record_bytes
     if cache_scope == "global":
         persistent_slots = min(
             spec.routed_layer_count * spec.expert_count,
@@ -462,12 +489,16 @@ def plan_expert_memory(
             spec.expert_count, persistent_slots // spec.routed_layer_count
         )
         persistent_cache_bytes = persistent_slots * spec.expert_record_bytes
+    elif streamed_layer_count == 0:
+        slots_per_layer = 0
+        persistent_slots = 0
+        persistent_cache_bytes = 0
     else:
         slots_per_layer = min(
             spec.expert_count, persistent_budget_bytes // bytes_per_uniform_slot
         )
-        persistent_slots = slots_per_layer * spec.routed_layer_count
-        persistent_cache_bytes = spec.persistent_cache_bytes(slots_per_layer)
+        persistent_slots = slots_per_layer * streamed_layer_count
+        persistent_cache_bytes = persistent_slots * spec.expert_record_bytes
     unallocated_bytes = total_limit_bytes - fixed_bytes - persistent_cache_bytes
 
     return ExpertMemoryPlan(
@@ -489,4 +520,6 @@ def plan_expert_memory(
         persistent_cache_bytes=persistent_cache_bytes,
         unallocated_bytes=unallocated_bytes,
         fits_fixed=fixed_bytes <= total_limit_bytes,
+        island_layer_count=island_layer_count,
+        island_bytes=island_bytes,
     )

@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -21,6 +21,7 @@ from mlx_lm.models.activations import swiglu
 
 from mtplx import expert_route_probe as _route_probe
 
+from mtplx.expert_io import PositionalExpertReader
 from mtplx.expert_runtime import ExpertStreamingRuntime
 from mtplx.expert_manifest import ExpertManifest, ExpertRecord
 from mtplx.expert_slots import ExpertSlotBinding, ReadyRoute
@@ -439,6 +440,185 @@ class MappedExpertStore:
         gc.collect()
 
 
+class DenseIslandStore:
+    """Capacity-guaranteed dense per-layer expert banks (issue #63, C5).
+
+    An island layer holds all of its experts resident for the model's
+    lifetime in one component-major bank whose row index IS the expert id.
+    Router indices therefore address ``gather_qmm`` directly: no
+    expert-to-slot translation, no residency probe, no pins, no fences.
+    A miss is impossible by construction, so the streamed route machinery
+    never runs for these layers.
+    """
+
+    def __init__(
+        self,
+        manifest: ExpertManifest,
+        layers: Iterable[int],
+        *,
+        expert_count: int,
+    ) -> None:
+        self.layers = tuple(sorted({int(layer) for layer in layers}))
+        self.expert_count = int(expert_count)
+        if not self.layers:
+            raise ValueError("dense island store requires at least one layer")
+        records = {
+            (record.layer, record.expert): record for record in manifest.records
+        }
+        self._records: dict[int, tuple[ExpertRecord, ...]] = {}
+        self._banks: dict[int, MlxComponentBank] = {}
+        self._fill_seconds = 0.0
+        self._filled_layers: set[int] = set()
+        self._closed = False
+        try:
+            for layer in self.layers:
+                layer_records = []
+                for expert in range(self.expert_count):
+                    record = records.get((layer, expert))
+                    if record is None:
+                        raise ValueError(
+                            f"manifest has no record for island layer {layer} "
+                            f"expert {expert}"
+                        )
+                    layer_records.append(record)
+                self._records[layer] = tuple(layer_records)
+                self._banks[layer] = MlxComponentBank(
+                    capacity=self.expert_count,
+                    record=layer_records[0],
+                    label=f"island-layer-{layer}",
+                )
+        except Exception:
+            self.close()
+            raise
+
+    @property
+    def island_bytes(self) -> int:
+        return sum(
+            bank.capacity * bank.record_bytes for bank in self._banks.values()
+        )
+
+    def fill(
+        self,
+        manifest: ExpertManifest,
+        reader: PositionalExpertReader,
+        *,
+        verify_hash: bool = True,
+    ) -> None:
+        """Bulk-read every island expert into its bank row (one-time cost)."""
+
+        if self._closed:
+            raise RuntimeError("dense island store is closed")
+        started = time.perf_counter()
+        for layer in self.layers:
+            if layer in self._filled_layers:
+                continue
+            bank = self._banks[layer]
+            items = tuple(
+                (
+                    record,
+                    MlxComponentSlot(
+                        bank,
+                        expert,
+                        label=f"island-layer-{layer}-expert-{expert}",
+                    ),
+                )
+                for expert, record in enumerate(self._records[layer])
+            )
+            reader.read_component_records_into(
+                manifest,
+                items,
+                verify_hash=verify_hash,
+            )
+            self._filled_layers.add(layer)
+        self._fill_seconds += time.perf_counter() - started
+
+    def bank_for_layer(self, layer: int) -> MlxComponentBank:
+        if self._closed:
+            raise RuntimeError("dense island store is closed")
+        if layer not in self._filled_layers:
+            raise RuntimeError(f"island layer {layer} has not been filled")
+        return self._banks[layer]
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "backend": "dense-island-banks",
+            "layers": list(self.layers),
+            "expert_count": self.expert_count,
+            "island_bytes": self.island_bytes,
+            "filled_layers": len(self._filled_layers),
+            "fill_seconds": self._fill_seconds,
+        }
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for bank in self._banks.values():
+            bank.close()
+        self._banks.clear()
+        self._records.clear()
+        self._filled_layers.clear()
+
+
+class DenseIslandSwitchGLU(nn.Module):
+    """Expert dispatch for a dense island layer: raw indices, zero host asks.
+
+    The layer's bank row index equals the expert id, so the router's device
+    indices are the ``gather_qmm`` rhs_indices as-is. No host sync, no route
+    planning, no pin lifecycle: the wave stays inside the lazy graph and
+    materializes with the next streamed layer's blocking sync (or the
+    row-end fence).
+    """
+
+    def __init__(
+        self,
+        runtime: ExpertStreamingRuntime,
+        store: DenseIslandStore,
+        layer_index: int,
+    ) -> None:
+        super().__init__()
+        self.runtime = runtime
+        self.layer_index = int(layer_index)
+        self.group_size = runtime.spec.quant_group_size
+        self.bits = runtime.spec.quant_bits
+        self._bank = store.bank_for_layer(self.layer_index)
+
+    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+        if indices.ndim < 1:
+            raise ValueError("expert indices must include a top-k dimension")
+        if int(indices.shape[-1]) != self.runtime.spec.top_k:
+            raise ValueError(
+                f"router selected {indices.shape[-1]} experts; expected "
+                f"{self.runtime.spec.top_k}"
+            )
+        hidden_size = int(x.shape[-1])
+        if hidden_size != self.runtime.spec.hidden_size:
+            raise ValueError(
+                f"expert input width {hidden_size} does not match "
+                f"{self.runtime.spec.hidden_size}"
+            )
+        tokens = x.reshape(-1, hidden_size)
+        top_k = int(indices.shape[-1])
+        rows = int(tokens.shape[0])
+        phase = current_expert_routing_phase(token_count=int(x.shape[-2]))
+        _route_probe.count(
+            f"hot.island.{phase.name.lower()}.layer{self.layer_index:02d}"
+        )
+        assignment_inputs = mx.broadcast_to(
+            tokens[:, None, :],
+            (rows, top_k, hidden_size),
+        ).reshape(-1, hidden_size)
+        slot_indices = indices.reshape((-1, 1)).astype(mx.int32)
+        output = _gather_component_bank(
+            assignment_inputs,
+            self._bank,
+            slot_indices,
+            group_size=self.group_size,
+            bits=self.bits,
+        )
+        return output.reshape((*indices.shape, hidden_size))
+
+
 def make_mlx_component_bank_allocator(
     plan: ExpertMemoryPlan,
     spec: ExpertStreamingModelSpec,
@@ -709,11 +889,31 @@ def _run_component_bank_q4(
         getattr(binding.buffer, "bank", None) is not bank for binding in bindings
     ):
         raise ValueError("component-bank execution requires one shared bank")
-    selected = x.reshape((len(bindings), 1, 1, int(x.shape[-1])))
     slot_indices = mx.array(
         [int(binding.buffer.bank_index) for binding in bindings],
         dtype=mx.int32,
     ).reshape((-1, 1))
+    return _gather_component_bank(
+        x,
+        bank,
+        slot_indices,
+        group_size=group_size,
+        bits=bits,
+    )
+
+
+def _gather_component_bank(
+    x: mx.array,
+    bank: MlxComponentBank,
+    slot_indices: mx.array,
+    *,
+    group_size: int,
+    bits: int,
+) -> mx.array:
+    """Row-gathered three-matrix expert MLP against one component bank."""
+
+    rows = int(x.shape[0])
+    selected = x.reshape((rows, 1, 1, int(x.shape[-1])))
 
     def qmm(values: mx.array, projection: str) -> mx.array:
         return mx.gather_qmm(
@@ -731,7 +931,7 @@ def _run_component_bank_q4(
     gate = qmm(selected, "gate_proj")
     up = qmm(selected, "up_proj")
     output = qmm(swiglu(gate, up), "down_proj")
-    return output.reshape((len(bindings), int(output.shape[-1])))
+    return output.reshape((rows, int(output.shape[-1])))
 
 
 def _run_mapped_q4(
@@ -1404,12 +1604,35 @@ def bind_streamed_switches(model: Any, runtime: ExpertStreamingRuntime) -> int:
         )
         mapped_store.prepare()
         runtime._mapped_expert_store = mapped_store
+    island_layers = frozenset(runtime.config.island_layers)
+    island_store = None
+    if island_layers:
+        island_store = DenseIslandStore(
+            runtime.manifest,
+            island_layers,
+            expert_count=runtime.spec.expert_count,
+        )
+        island_store.fill(
+            runtime.manifest,
+            runtime.reader,
+            verify_hash=(
+                runtime.config.verify_record_hashes
+                and not runtime.config.verify_sidecar_hash_at_open
+            ),
+        )
+        runtime._island_store = island_store
     for layer_index in runtime.spec.routed_layer_indices:
         layer = layers[layer_index]
         mlp = getattr(layer, "mlp", None)
         if mlp is None or not hasattr(mlp, "switch_mlp"):
             raise TypeError(f"layer {layer_index} has no switch_mlp seam")
-        if mapped_store is None:
+        if island_store is not None and layer_index in island_layers:
+            mlp.switch_mlp = DenseIslandSwitchGLU(
+                runtime,
+                island_store,
+                layer_index,
+            )
+        elif mapped_store is None:
             mlp.switch_mlp = HotExpertSwitchGLU(runtime, layer_index)
         else:
             mlp.switch_mlp = MappedExpertSwitchGLU(

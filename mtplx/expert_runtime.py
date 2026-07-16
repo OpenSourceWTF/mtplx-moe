@@ -144,6 +144,7 @@ class ExpertStreamingConfig:
     hy3_router_kernel: str = "mpp-r1-fused-r2"
     hy3_router_sigmoid: str = "precise"
     deferred_pin_release: bool = False
+    island_layers: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -204,6 +205,32 @@ class ExpertStreamingConfig:
             )
         if not isinstance(self.deferred_pin_release, bool):
             raise ValueError("deferred_pin_release must be bool")
+        island_layers = self.island_layers
+        if isinstance(island_layers, (str, bytes)) or not isinstance(
+            island_layers, (tuple, list)
+        ):
+            raise TypeError("island_layers must be a tuple of layer indices")
+        normalized_islands = tuple(
+            sorted(
+                {
+                    _integer("island_layers entry", layer, minimum=0)
+                    for layer in island_layers
+                }
+            )
+        )
+        object.__setattr__(self, "island_layers", normalized_islands)
+        if normalized_islands:
+            if self.cache_scope != "layer":
+                raise ValueError("island_layers require cache_scope 'layer'")
+            if self.slot_layout != "component-banks":
+                raise ValueError(
+                    "island_layers require the component-banks slot layout"
+                )
+            if self.trace_routes:
+                raise ValueError(
+                    "island_layers execute without host route observation; "
+                    "trace_routes must be disabled"
+                )
         if self.hy3_router_sigmoid not in {"precise", "fast"}:
             raise ValueError("hy3_router_sigmoid must be 'precise' or 'fast'")
         if (
@@ -278,6 +305,7 @@ class ExpertStreamingConfig:
             execution_workspace_bytes=self.execution_workspace_bytes,
             additional_resident_bytes=additional_resident_bytes,
             cache_scope=self.cache_scope,
+            island_layer_count=len(self.island_layers),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1201,6 +1229,7 @@ class ExpertStreamingRuntime:
             if config.cache_scope == "global"
             else None
         )
+        self.island_layer_set = frozenset(config.island_layers)
         self._banks = (
             {}
             if self._global_bank is not None
@@ -1213,6 +1242,7 @@ class ExpertStreamingRuntime:
                     cache_policy=config.cache_policy,
                 )
                 for layer in spec.routed_layer_indices
+                if layer not in self.island_layer_set
             }
         )
         if self._global_bank is not None:
@@ -1237,6 +1267,7 @@ class ExpertStreamingRuntime:
         self._cleanup_error_lock = threading.Lock()
         self._cleanup_error: BaseException | None = None
         self._mapped_expert_store: Any | None = None
+        self._island_store: Any | None = None
         self._route_trace_lock = threading.Lock()
         self._route_trace: list[dict[str, Any]] = []
         self._route_trace_epoch = 0
@@ -1270,6 +1301,14 @@ class ExpertStreamingRuntime:
             raise ExpertStreamingConfigurationError("config and spec model keys differ")
         manifest = load_expert_manifest(manifest_path)
         cls._validate_manifest_identity(manifest, model_spec)
+        if config.island_layers and not set(config.island_layers) <= set(
+            model_spec.routed_layer_indices
+        ):
+            raise ExpertStreamingConfigurationError(
+                "island_layers must be routed layers of "
+                f"{model_spec.key}: {sorted(model_spec.routed_layer_indices)[:3]}"
+                f"..{sorted(model_spec.routed_layer_indices)[-1]}"
+            )
         integrity_report = None
         if config.verify_artifact_headers or config.verify_sidecar_hash_at_open:
             if config.verify_sidecar_hash_at_open and manifest.sidecar is None:
@@ -1321,6 +1360,7 @@ class ExpertStreamingRuntime:
                 device_synchronize=device_synchronize,
                 cache_scope=config.cache_scope,
                 resource_telemetry=config.resource_telemetry,
+                island_layers=config.island_layers,
                 **pipeline_kwargs,
             )
         except Exception:
@@ -1365,6 +1405,16 @@ class ExpertStreamingRuntime:
     def _raise_if_unhealthy(self) -> None:
         self.slots.raise_if_unhealthy()
         self._raise_cleanup_error()
+
+    def _reject_island_layer(self, layer: int) -> None:
+        # Island layers execute dense against their own full-resident bank;
+        # reaching the streamed route machinery for one is a wiring bug, not
+        # a runtime condition to fall back from.
+        if layer in self.island_layer_set:
+            raise ExpertStreamingConfigurationError(
+                f"layer {layer} is a dense island layer; streamed routing is "
+                "not available for it"
+            )
 
     def admit_kv_tokens(self, tokens: int) -> KVAdmission:
         # Lifecycle order is close -> slot/runtime health -> KV accounting.
@@ -1508,6 +1558,7 @@ class ExpertStreamingRuntime:
             raise ExpertSlotError("expert streaming runtime is closed")
         if self._closing:
             raise ExpertSlotError("expert streaming runtime is closing")
+        self._reject_island_layer(layer)
         try:
             lock = self._layer_locks[layer]
         except KeyError as exc:
@@ -1847,6 +1898,7 @@ class ExpertStreamingRuntime:
             raise ExpertSlotError("expert streaming runtime is closed")
         if self._closing:
             raise ExpertSlotError("expert streaming runtime is closing")
+        self._reject_island_layer(layer)
         try:
             lock = self._layer_locks[layer]
         except KeyError as exc:
@@ -2051,6 +2103,7 @@ class ExpertStreamingRuntime:
         layer: int,
         expert_ids: Iterable[int],
     ) -> tuple[int, ...]:
+        self._reject_island_layer(layer)
         try:
             lock = self._layer_locks[layer]
         except KeyError as exc:
@@ -2164,6 +2217,8 @@ class ExpertStreamingRuntime:
             }
         if self._mapped_expert_store is not None:
             snapshot["mapped_experts"] = self._mapped_expert_store.snapshot()
+        if self._island_store is not None:
+            snapshot["island_experts"] = self._island_store.snapshot()
         if self._pipeline_ledger is not None:
             snapshot["expert_pipeline"] = self._pipeline_ledger.snapshot()
         self._raise_if_unhealthy()
@@ -2248,6 +2303,9 @@ class ExpertStreamingRuntime:
             if self._mapped_expert_store is not None:
                 self._mapped_expert_store.close()
                 self._mapped_expert_store = None
+            if self._island_store is not None:
+                self._island_store.close()
+                self._island_store = None
             self._closed = True
             self._closing = False
             if slots_error is not None:

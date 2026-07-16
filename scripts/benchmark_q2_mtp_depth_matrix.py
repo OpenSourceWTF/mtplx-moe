@@ -73,6 +73,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "hy3_router_kernel": "mpp-r1-fused-r2",
     "hy3_router_sigmoid": "precise",
     "deferred_pin_release": True,
+    "island_layers": "",
     "read_chunk": "8MiB",
     "bypass_page_cache": True,
     "resource_telemetry": False,
@@ -425,8 +426,35 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
+    parser.add_argument(
+        "--island-layers",
+        default="",
+        help=(
+            "Dense island layers holding every expert resident (issue #63 "
+            "C5), e.g. '1-38,60-79'. Empty disables islands."
+        ),
+    )
     parser.add_argument("--output-json", type=Path)
     return parser
+
+
+def parse_island_layers(text: str) -> tuple[int, ...]:
+    """Parse '1-38,60-79' style layer ranges into a sorted unique tuple."""
+
+    layers: set[int] = set()
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            low_text, high_text = part.split("-", 1)
+            low, high = int(low_text), int(high_text)
+            if high < low:
+                raise ValueError(f"island layer range {part!r} is inverted")
+            layers.update(range(low, high + 1))
+        else:
+            layers.add(int(part))
+    return tuple(sorted(layers))
 
 
 def _expand(path: Path | str) -> Path:
@@ -480,6 +508,7 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "hy3_router_kernel": args.hy3_router_kernel,
         "hy3_router_sigmoid": args.hy3_router_sigmoid,
         "deferred_pin_release": bool(args.deferred_pin_release),
+        "island_layers": args.island_layers,
         "read_chunk": args.read_chunk,
         "bypass_page_cache": args.bypass_page_cache,
         "resource_telemetry": args.resource_telemetry,
@@ -1916,6 +1945,7 @@ def _runtime_config(
         bypass_page_cache=bool(options["bypass_page_cache"]),
         resource_telemetry=bool(options["resource_telemetry"]),
         trace_routes=bool(options["trace_routes"]),
+        island_layers=parse_island_layers(options.get("island_layers", "")),
     )
 
 
