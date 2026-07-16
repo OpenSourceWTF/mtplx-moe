@@ -19,6 +19,7 @@ _SCRIPT = (
 def _fixed_matrix_environment(monkeypatch):
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "auto")
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "off")
     for name in (
         "MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS",
         "MTPLX_LATE_DEPTH_BEFORE",
@@ -86,6 +87,7 @@ class _FakeRuntime:
 
     def expert_resource_telemetry_snapshot(self):
         self.telemetry_reads += 1
+        observation_ns = 1_000_000_000 * self.telemetry_reads
         return {
             "cache": {
                 "expert_bytes_read": 4096 * self.telemetry_reads,
@@ -94,7 +96,19 @@ class _FakeRuntime:
             "cache_by_phase": {
                 "decode": {"expert_bytes_read": 4096 * self.telemetry_reads}
             },
-            "reader": {"active_reads": 0, "peak_active_reads": 2},
+            "reader_pool": {
+                "worker_capacity": 32,
+                "observation_ns": observation_ns,
+                "active_work_ns": 4 * observation_ns,
+                "queued_work_ns": observation_ns // 2,
+                "active_work_histogram_ns": {
+                    "0": observation_ns // 2,
+                    "8": observation_ns // 2,
+                    "32": 0,
+                },
+                "active_work_peak": 8,
+                "queued_work_peak": 2,
+            },
             "expert_pipeline": {"completion_fences": 3 * self.telemetry_reads},
             "mlx_memory": {"active_memory_bytes": 1024},
         }
@@ -109,6 +123,9 @@ def _stats(
     depth: int = 0,
     generated_tokens: int = 128,
     tokens: list[int] | None = None,
+    graphbank: dict[str, object] | None = None,
+    draft_core: str = "stock",
+    draft_fallbacks: int = 0,
 ):
     output_tokens = list(tokens or [index % 97 for index in range(generated_tokens)])
     accepted = [0 for _ in range(depth)]
@@ -173,6 +190,37 @@ def _stats(
         event_index += 1
         if cursor >= len(output_tokens) - 1:
             break
+    compiled_calls = 1 if depth and draft_core != "stock" else 0
+    draft_core_report = {
+        "schema": "compiled-mtp-draft-v1",
+        "requested": draft_core,
+        "selected": "device-k" if compiled_calls else "stock",
+        "primary_depth": 3,
+        "primary_width": 4,
+        "supported_depths": list(range(1, 8)),
+        "prewarmed_depths": (
+            list(range(1, depth + 1)) if draft_core == "device-k" else []
+        ),
+        "history_policy": "committed" if depth else "none",
+        "cache_state_mode": "explicit-live-io",
+        "compiled_calls": compiled_calls,
+        "organic_compile_calls": 0,
+        "fallbacks": draft_fallbacks,
+        "qualification_eligible": bool(
+            draft_core == "device-k" and compiled_calls and not draft_fallbacks
+        ),
+        "fallback_reasons": (
+            {"synthetic_fallback": draft_fallbacks} if draft_fallbacks else {}
+        ),
+        "prewarm": {"compiled": bool(compiled_calls)},
+        "per_depth": {
+            str(index): {
+                "calls": int(index == depth and compiled_calls > 0),
+                "live_cache_commits": int(index == depth and compiled_calls > 0),
+            }
+            for index in range(1, depth + 1)
+        },
+    }
     return SimpleNamespace(
         generated_tokens=generated_tokens,
         elapsed_s=16.0,
@@ -205,10 +253,19 @@ def _stats(
         loop_guard={},
         peak_memory_bytes=3 * 1024**3,
         events=events,
+        graphbank={} if graphbank is None else graphbank,
+        draft_core=draft_core_report,
     )
 
 
-def _fake_apis(module, *, output_tokens: int = 128, mismatch_depth: int | None = None):
+def _fake_apis(
+    module,
+    *,
+    output_tokens: int = 128,
+    mismatch_depth: int | None = None,
+    compiled_evidence: dict[str, object] | None = None,
+    draft_fallbacks: int = 0,
+):
     calls = SimpleNamespace(
         loads=[],
         configs=[],
@@ -245,9 +302,14 @@ def _fake_apis(module, *, output_tokens: int = 128, mismatch_depth: int | None =
         return SimpleNamespace(
             token_ids=list(range(context_tokens)),
             metadata={
-                "prompt_policy": "coding_agent_tail_v2",
+                "prompt_policy": "realistic_programming_v1",
+                "prompt_format": "chat",
                 "prompt_actual_tokens": context_tokens,
                 "prompt_tail_preserved": True,
+                "prompt_release_valid": True,
+                "prompt_tail_sha256": "a" * 64,
+                "prompt_filler_sha256": "b" * 64,
+                "prompt_artifact_kinds": 6,
             },
         )
 
@@ -256,6 +318,9 @@ def _fake_apis(module, *, output_tokens: int = 128, mismatch_depth: int | None =
 
     def generate_ar(runtime, prompt_ids, **kwargs):
         calls.ar.append((runtime, tuple(prompt_ids), kwargs))
+        prefill_callback = kwargs.get("prefill_callback")
+        if prefill_callback is not None:
+            prefill_callback({"phase": "completed"})
         count = output_tokens if kwargs["max_tokens"] == 128 else kwargs["max_tokens"]
         tokens = [index % 97 for index in range(count)]
         return SimpleNamespace(
@@ -266,6 +331,9 @@ def _fake_apis(module, *, output_tokens: int = 128, mismatch_depth: int | None =
 
     def generate_mtpk(runtime, prompt_ids, **kwargs):
         calls.mtpk.append((runtime, tuple(prompt_ids), kwargs))
+        prefill_callback = kwargs.get("prefill_callback")
+        if prefill_callback is not None:
+            prefill_callback({"phase": "completed"})
         depth = kwargs["speculative_depth"]
         count = output_tokens if kwargs["max_tokens"] == 128 else kwargs["max_tokens"]
         tokens = [index % 97 for index in range(count)]
@@ -279,6 +347,9 @@ def _fake_apis(module, *, output_tokens: int = 128, mismatch_depth: int | None =
                 depth=depth,
                 generated_tokens=len(tokens),
                 tokens=tokens,
+                graphbank=compiled_evidence,
+                draft_core=kwargs.get("draft_core", "stock"),
+                draft_fallbacks=draft_fallbacks,
             ),
             final_state=SimpleNamespace(
                 safe_to_commit=True,
@@ -327,14 +398,12 @@ def _requests(tmp_path: Path):
             "model_root": tmp_path / "hy3-model",
             "manifest": tmp_path / "hy3-manifest.json",
             "mtp_artifacts": tmp_path / "hy3-mtp",
-            "prompt_tail_text": "Hy3 fixed prompt tail.",
         },
         {
             "model": "glm52-q2",
             "model_root": tmp_path / "glm-model",
             "manifest": tmp_path / "glm-manifest.json",
             "mtp_artifacts": tmp_path / "glm-mtp",
-            "prompt_tail_text": "GLM fixed prompt tail.",
         },
     ]
 
@@ -345,14 +414,285 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
 
     assert args.models is None
     assert args.contexts == (1024, 2048)
-    assert args.hy3_depths == (1, 2, 3, 4, 5)
+    assert args.output_tokens == 128
+    assert args.hy3_depths == (1, 2, 3, 4, 5, 6, 7)
     assert args.glm52_depths == (1, 2, 3, 4, 5)
     assert args.memory_limit == "112GiB"
     assert args.runtime_reserve == "12GiB"
     assert args.expert_cache_limit == "64GiB"
     assert args.max_live_kv_tokens == 4096
+    assert args.q2_expert_kernel == "stock"
+    assert args.hy3_router_kernel == "mpp-r1-fused-r2"
     assert args.resource_telemetry is False
+    assert args.resource_sample_interval == 0.25
+    assert args.resource_max_samples == 4096
+    assert args.ssd_ceiling_gib_s is None
+    assert args.powermetrics is False
+    assert args.powermetrics_interval_ms == 250
     assert args.mtp_disabled_baseline is False
+    assert args.verify_strategy == "batched"
+    assert args.compiled_verify_mode == "off"
+    assert args.draft_core == "stock"
+    assert args.trace_routes is False
+    assert args.hy3_q2_prompt_tail is None
+    assert args.glm52_q2_prompt_tail is None
+
+
+def test_issue51_kernel_selectors_parse_independently() -> None:
+    module = _load_module()
+
+    args = module.build_parser().parse_args(
+        [
+            "--q2-expert-kernel",
+            "fused-nax",
+            "--hy3-router-kernel",
+            "mpp-r1-fused-r2",
+        ]
+    )
+
+    assert args.q2_expert_kernel == "fused-nax"
+    assert args.hy3_router_kernel == "mpp-r1-fused-r2"
+
+    for selector in (
+        "steel-r1-fused-r2",
+        "mpp-fp32-splitk-r1-fused-r2",
+        "mpp-r1-last-arrival-fused-r2",
+    ):
+        selected = module.build_parser().parse_args(["--hy3-router-kernel", selector])
+        assert selected.hy3_router_kernel == selector
+
+    with pytest.raises(SystemExit):
+        module.build_parser().parse_args(
+            ["--hy3-router-kernel", "mpp-r1-fast-fused-r2"]
+        )
+
+
+def test_device_k_draft_core_selector_parses() -> None:
+    module = _load_module()
+
+    args = module.build_parser().parse_args(["--draft-core", "device-k"])
+
+    assert args.draft_core == "device-k"
+
+
+def test_device_k_draft_core_is_forwarded_recorded_and_gated(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (3,)}],
+        contexts=(1024,),
+        draft_core="device-k",
+        apis=apis,
+    )
+
+    assert all(kwargs["draft_core"] == "device-k" for *_rest, kwargs in calls.mtpk)
+    assert payload["configuration"]["generation"]["draft_core"] == "device-k"
+    assert payload["configuration"]["candidate"]["draft_core"] == "device-k"
+    row = payload["models"][0]["observations"][1]
+    assert row["draft_core"] == "device-k"
+    assert row["compiled_draft"]["qualification_eligible"] is True
+    assert row["compiled_draft"]["prewarmed_depths"] == [1, 2, 3]
+    assert row["gates"]["compiled_draft_evidence"] is True
+
+
+def test_device_k_capture_commit_qualification_is_explicit(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (3,)}],
+        contexts=(1024,),
+        verify_strategy="capture_commit",
+        draft_core="device-k",
+        apis=apis,
+    )
+
+    assert payload["configuration"]["candidate"] == {
+        "verify_strategy": "capture_commit",
+        "compiled_verify_mode": "off",
+        "draft_core": "device-k",
+        "trace_routes": False,
+    }
+    assert all(call[2]["verify_strategy"] == "capture_commit" for call in calls.mtpk)
+    assert all(call[2]["draft_core"] == "device-k" for call in calls.mtpk)
+    row = payload["models"][0]["observations"][1]
+    assert row["verify_strategy"] == "capture_commit"
+    assert row["draft_core"] == "device-k"
+    assert row["gates"]["compiled_draft_evidence"] is True
+
+
+def test_device_k_draft_core_fails_on_any_silent_fallback(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, _calls = _fake_apis(module, draft_fallbacks=1)
+
+    with pytest.raises(
+        module.BenchmarkGateError,
+        match="compiled draft used fallback calls",
+    ):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (3,)}],
+            contexts=(1024,),
+            draft_core="device-k",
+            apis=apis,
+        )
+
+
+@pytest.mark.parametrize(
+    ("runtime_options", "message"),
+    [
+        ({"powermetrics": True}, "powermetrics requires resource telemetry"),
+        (
+            {"ssd_ceiling_gib_s": 12.47},
+            "SSD ceiling requires resource telemetry",
+        ),
+        (
+            {
+                "resource_telemetry": True,
+                "ssd_ceiling_gib_s": 12.47,
+                "bypass_page_cache": False,
+            },
+            "SSD ceiling requires F_NOCACHE",
+        ),
+    ],
+)
+def test_resource_utilization_options_fail_closed_before_model_load(
+    tmp_path: Path,
+    runtime_options: dict[str, object],
+    message: str,
+) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+
+    with pytest.raises(module.BenchmarkConfigurationError, match=message):
+        module.run_depth_matrix(
+            [_requests(tmp_path)[0]],
+            contexts=(1024,),
+            runtime_options=runtime_options,
+            apis=apis,
+        )
+
+    assert calls.loads == []
+
+
+def test_hy3_depth_six_is_a_supported_recursive_depth(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (6,)}],
+        contexts=(1024,),
+        apis=apis,
+    )
+
+    assert [row[2]["speculative_depth"] for row in calls.mtpk] == [6, 6]
+    assert [row["requested_depth"] for row in payload["models"][0]["observations"]] == [
+        0,
+        6,
+    ]
+
+
+def test_matrix_supports_explicit_long_retained_output(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, _calls = _fake_apis(module)
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (1,)}],
+        contexts=(1024,),
+        output_tokens=1028,
+        apis=apis,
+    )
+
+    assert payload["configuration"]["output_tokens"] == 1028
+    assert [
+        row["generated_tokens"] for row in payload["models"][0]["observations"]
+    ] == [1028, 1028]
+
+
+def test_compiled_verify_requires_capture_commit_before_model_load(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "parity")
+
+    with pytest.raises(
+        module.BenchmarkConfigurationError,
+        match="compiled verify requires capture_commit",
+    ):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (1,)}],
+            contexts=(1024,),
+            verify_strategy="batched",
+            compiled_verify_mode="parity",
+            apis=apis,
+        )
+
+    assert calls.loads == []
+
+
+def test_compiled_verify_requires_complete_per_row_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    apis, _calls = _fake_apis(module)
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "on")
+
+    with pytest.raises(
+        module.BenchmarkGateError,
+        match="compiled verifier emitted no evidence",
+    ):
+        module.run_depth_matrix(
+            [{**_requests(tmp_path)[0], "depths": (1,)}],
+            contexts=(1024,),
+            verify_strategy="capture_commit",
+            compiled_verify_mode="on",
+            apis=apis,
+        )
+
+
+def test_compiled_verify_records_candidate_and_forwards_diagnostic_inputs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    evidence = {
+        "compiled_verify": {
+            "calls": 4,
+            "compiled_calls": 4,
+            "fallback_calls": 0,
+            "fallback_reasons": {},
+            "mode": "on",
+        }
+    }
+    apis, calls = _fake_apis(module, compiled_evidence=evidence)
+    observer = object()
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "on")
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (1,)}],
+        contexts=(1024,),
+        verify_strategy="capture_commit",
+        compiled_verify_mode="on",
+        trace_routes=True,
+        draft_observer=observer,
+        apis=apis,
+    )
+
+    assert payload["configuration"]["candidate"] == {
+        "verify_strategy": "capture_commit",
+        "compiled_verify_mode": "on",
+        "draft_core": "stock",
+        "trace_routes": True,
+    }
+    assert calls.configs[0]["trace_routes"] is True
+    assert calls.mtpk
+    assert all(call[2]["verify_strategy"] == "capture_commit" for call in calls.mtpk)
+    assert all(call[2]["draft_observer"] is observer for call in calls.mtpk)
+    d1 = payload["models"][0]["observations"][1]
+    assert d1["compiled_verify"] == evidence["compiled_verify"]
 
 
 @pytest.mark.parametrize("value", [None, "0", "false"])
@@ -437,12 +777,12 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
     assert all(kwargs["mtp"] is True for _root, kwargs in calls.loads)
     assert all(kwargs["mtp_precision"] == "bf16" for _root, kwargs in calls.loads)
     assert len(calls.ar) == 8
-    assert len(calls.mtpk) == 40
-    assert calls.peak_resets == 48
-    assert calls.synchronizations >= 48
-    assert [len(model["observations"]) for model in payload["models"]] == [12, 12]
+    assert len(calls.mtpk) == 48
+    assert calls.peak_resets == 56
+    assert calls.synchronizations >= 56
+    assert [len(model["observations"]) for model in payload["models"]] == [16, 12]
     assert [model["discarded_warmup_count"] for model in payload["models"]] == [
-        12,
+        16,
         12,
     ]
     assert all(
@@ -467,7 +807,7 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
             row for row in payload["models"] if row["model_key"] == runtime.model_key
         )
         assert runtime.expert_streaming.reset_calls == 2 * len(model["observations"])
-        cells = 6
+        cells = 8 if runtime.model_key == "hy3-expert-q2" else 6
         assert runtime.admissions == [
             tokens
             for context in (1024, 2048)
@@ -489,19 +829,48 @@ def test_matrix_loads_each_model_once_and_uses_only_canonical_generators(
         assert kwargs["repetition_stop"] is False
         assert kwargs["loop_guard"] is False
     assert sum(kwargs["max_tokens"] == 8 for *_rest, kwargs in calls.ar) == 4
-    assert sum(kwargs["max_tokens"] == 8 for *_rest, kwargs in calls.mtpk) == 20
+    assert sum(kwargs["max_tokens"] == 8 for *_rest, kwargs in calls.mtpk) == 24
 
     assert len(calls.prompt_builds) == 4
     assert all(
         kwargs
         == {
             "prompt_style": "coding-agent",
-            "prompt_tail": kwargs["prompt_tail"],
-            "prompt_format": "raw",
+            "prompt_format": "chat",
             "enable_thinking": False,
         }
         for _tokenizer, _context, kwargs in calls.prompt_builds
     )
+    assert all(
+        prompt["prompt_policy"] == "realistic_programming_v1"
+        and prompt["prompt_format"] == "chat"
+        and prompt["prompt_release_valid"] is True
+        and prompt["prompt_artifact_kinds"] == 6
+        for model in payload["models"]
+        for prompt in model["prompts"]
+    )
+
+
+def test_issue51_kernel_selectors_reach_runtime_and_artifact(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (1,)}],
+        contexts=(1024,),
+        runtime_options={
+            "q2_expert_kernel": "nax",
+            "hy3_router_kernel": "fused-fp32",
+        },
+        apis=apis,
+    )
+
+    assert calls.configs[0]["q2_expert_kernel"] == "nax"
+    assert calls.configs[0]["hy3_router_kernel"] == "fused-fp32"
+    assert payload["configuration"]["runtime"]["q2_expert_kernel"] == "nax"
+    assert payload["configuration"]["runtime"]["hy3_router_kernel"] == "fused-fp32"
+    assert payload["models"][0]["runtime_config"]["q2_expert_kernel"] == "nax"
+    assert payload["models"][0]["runtime_config"]["hy3_router_kernel"] == ("fused-fp32")
 
 
 def test_ar_path_drift_is_retained_as_diagnostic_and_matrix_continues(
@@ -1178,7 +1547,6 @@ def test_second_model_config_failure_names_the_unstarted_model(
 def test_preflight_failure_uses_the_checkpoint_schema(tmp_path: Path) -> None:
     module = _load_module()
     request = _requests(tmp_path)[0]
-    request.pop("prompt_tail_text")
     request["prompt_tail"] = tmp_path / "missing.txt"
     snapshots = []
 
@@ -1306,16 +1674,51 @@ def test_rows_recompute_ingestion_decode_and_acceptance_metrics(tmp_path: Path) 
     )
     telemetry = depth_two["expert_resource_telemetry"]
     assert telemetry["numeric_delta"] == {
-        "cache": {"expert_bytes_read": 4096, "read_operations": 2},
-        "cache_by_phase": {"decode": {"expert_bytes_read": 4096}},
-        "reader": {"active_reads": 0, "peak_active_reads": 0},
-        "expert_pipeline": {"completion_fences": 3},
+        "cache": {"expert_bytes_read": 8192, "read_operations": 4},
+        "cache_by_phase": {"decode": {"expert_bytes_read": 8192}},
+        "reader_pool": {
+            "worker_capacity": 0,
+            "observation_ns": 2_000_000_000,
+            "active_work_ns": 8_000_000_000,
+            "queued_work_ns": 1_000_000_000,
+            "active_work_histogram_ns": {
+                "0": 1_000_000_000,
+                "8": 1_000_000_000,
+                "32": 0,
+            },
+            "active_work_peak": 0,
+            "queued_work_peak": 0,
+        },
+        "expert_pipeline": {"completion_fences": 6},
         "mlx_memory": {"active_memory_bytes": 0},
     }
     assert (
         telemetry["after"]["cache"]["expert_bytes_read"]
         > telemetry["before"]["cache"]["expert_bytes_read"]
     )
+    assert telemetry["decode"]["reader_pool"] == {
+        "worker_capacity": 32,
+        "elapsed_seconds": 1.0,
+        "mean_active_readers": 4.0,
+        "active_capacity_fraction": 0.125,
+        "peak_active_readers": 8,
+        "full_capacity_fraction": 0.0,
+        "mean_queued_reads": 0.5,
+    }
+    resource = depth_two["resource_telemetry"]
+    assert resource["schema"] == "mtplx-resource-telemetry-v2"
+    assert resource["memory"] == {
+        "peak_memory_bytes": 3 * 1024**3,
+        "limit_bytes": 112 * 1024**3,
+        "utilization_of_limit": pytest.approx(3 / 112),
+    }
+    assert resource["coverage"]["generation_thread_cpu"] == "measured"
+    assert resource["host"]["generation_thread_core_fraction"] >= 0.0
+    assert resource["powermetrics"] == {
+        "available": False,
+        "reason": "disabled",
+    }
+    assert all("prefill_callback" in kwargs for *_rest, kwargs in calls.ar + calls.mtpk)
     assert depth_two["accepted_drafts"] == 85
     assert depth_two["evaluated_drafts"] == 85
     assert depth_two["drafted_tokens"] == 85
@@ -1356,6 +1759,8 @@ def test_rows_recompute_ingestion_decode_and_acceptance_metrics(tmp_path: Path) 
         "decode_expert_cache_metrics": True,
         "speculative_event_contract": True,
         "final_state_contract": True,
+        "compiled_verify_evidence": True,
+        "compiled_draft_evidence": True,
     }
 
 

@@ -956,7 +956,9 @@ def resolve_gdn_capture_backend(backend: str | None = None) -> str:
     )
 
 
-def _linear_conv1d_capture(qkv: mx.array, base_conv_state: mx.array, conv_weight: mx.array):
+def _linear_conv1d_capture(
+    qkv: mx.array, base_conv_state: mx.array, conv_weight: mx.array
+):
     if _linear_conv1d_kernel is None:
         return None
     B, T, conv_dim = qkv.shape
@@ -981,7 +983,9 @@ def _linear_conv1d_capture(qkv: mx.array, base_conv_state: mx.array, conv_weight
 
 
 def _matching_quantized_linears(left: Any, right: Any) -> bool:
-    if not isinstance(left, nn.QuantizedLinear) or not isinstance(right, nn.QuantizedLinear):
+    if not isinstance(left, nn.QuantizedLinear) or not isinstance(
+        right, nn.QuantizedLinear
+    ):
         return False
     if "bias" in left or "bias" in right:
         return False
@@ -1068,7 +1072,9 @@ def _fused_quantized_many(
     return tuple(mx.split(out, list(split_points), axis=-1))
 
 
-def _gdn_input_projections(gdn: Any, inputs: mx.array) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+def _gdn_input_projections(
+    gdn: Any, inputs: mx.array
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
     fuse_mode = os.environ.get("MTPLX_FUSE_GDN_PROJECTIONS", "").lower()
     if fuse_mode in {"all", "4to1", "one"}:
         fused = _fused_quantized_many(
@@ -1500,7 +1506,9 @@ def gdn_forward_with_capture(
 
     state = cache[1] if cache and cache[1] is not None else None
     if state is None:
-        state = mx.zeros((B, gdn.num_v_heads, gdn.head_v_dim, gdn.head_k_dim), dtype=mx.float32)
+        state = mx.zeros(
+            (B, gdn.num_v_heads, gdn.head_v_dim, gdn.head_k_dim), dtype=mx.float32
+        )
 
     final_only_capture = False
     capture_start = 0
@@ -1529,7 +1537,10 @@ def gdn_forward_with_capture(
             return gdn(inputs, mask=mask, cache=cache), None
         out, final_state, tape = delta_result
         states = final_state[:, None, :, :, :]
-    elif backend in {"linear_gdn_from_conv_stream", "linear_gdn_from_conv_stream_skip0"}:
+    elif backend in {
+        "linear_gdn_from_conv_stream",
+        "linear_gdn_from_conv_stream_skip0",
+    }:
         beta = mx.sigmoid(b)
         g = compute_g(gdn.A_log, a, gdn.dt_bias)
         capture_start = 1 if backend == "linear_gdn_from_conv_stream_skip0" else 0
@@ -1556,7 +1567,9 @@ def gdn_forward_with_capture(
         beta = mx.sigmoid(b)
         g = compute_g(gdn.A_log, a, gdn.dt_bias)
         if use_from_conv:
-            delta_result = _linear_gated_delta_from_conv_capture(conv_out, g, beta, state, gdn)
+            delta_result = _linear_gated_delta_from_conv_capture(
+                conv_out, g, beta, state, gdn
+            )
         else:
             q, k, v = [
                 t.reshape(B, S, h, d)
@@ -1689,9 +1702,26 @@ def forward_with_gdn_capture(
 ):
     text_model = getattr(model, "language_model", model)
     inner = text_model.model
+    layers = tuple(inner.layers)
+    hybrid_metadata = hasattr(inner, "fa_idx") and hasattr(inner, "ssm_idx")
+    if not hybrid_metadata:
+        if any(bool(getattr(layer, "is_linear", False)) for layer in layers):
+            raise RuntimeError(
+                "hybrid capture target is missing fa_idx/ssm_idx metadata"
+            )
+        result = text_model(
+            inputs,
+            cache=cache,
+            return_hidden=return_hidden,
+            hidden_variant=hidden_variant,
+        )
+        if return_hidden:
+            logits, hidden = result
+            return logits, hidden, {}
+        return result, {}
     hidden_states = inner.embed_tokens(inputs)
     if cache is None:
-        cache = [None] * len(inner.layers)
+        cache = [None] * len(layers)
 
     from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
@@ -1711,7 +1741,7 @@ def forward_with_gdn_capture(
         and context_len >= max(0, layer_eval_threshold)
     )
 
-    for layer_idx, (layer, layer_cache) in enumerate(zip(inner.layers, cache)):
+    for layer_idx, (layer, layer_cache) in enumerate(zip(layers, cache)):
         mask = ssm_mask if layer.is_linear else fa_mask
         normed = layer.input_layernorm(hidden_states)
         if layer.is_linear:
@@ -1766,7 +1796,11 @@ def forward_with_gdn_capture(
 
     pre_norm = hidden_states
     post_norm = inner.norm(hidden_states)
-    logits = inner.embed_tokens.as_linear(post_norm) if text_model.args.tie_word_embeddings else text_model.lm_head(post_norm)
+    logits = (
+        inner.embed_tokens.as_linear(post_norm)
+        if text_model.args.tie_word_embeddings
+        else text_model.lm_head(post_norm)
+    )
     if return_hidden:
         hidden = pre_norm if hidden_variant == "pre_norm" else post_norm
         return logits, hidden, captures
@@ -1811,7 +1845,9 @@ def commit_captured_prefix(
                 conv_state = detach_array_leaf(conv_state, mode=detach_mode)
                 if detach_stats is not None:
                     detach_stats["arrays"] = int(detach_stats.get("arrays", 0)) + 1
-                    detach_stats["bytes"] = int(detach_stats.get("bytes", 0)) + int(conv_state.nbytes)
+                    detach_stats["bytes"] = int(detach_stats.get("bytes", 0)) + int(
+                        conv_state.nbytes
+                    )
             if "tape" in capture:
                 replayed_state = _linear_gated_delta_from_conv_tape_replay(
                     capture["tape"],
@@ -1834,7 +1870,9 @@ def commit_captured_prefix(
                 gdn_state = detach_array_leaf(gdn_state, mode=detach_mode)
                 if detach_stats is not None:
                     detach_stats["arrays"] = int(detach_stats.get("arrays", 0)) + 1
-                    detach_stats["bytes"] = int(detach_stats.get("bytes", 0)) + int(gdn_state.nbytes)
+                    detach_stats["bytes"] = int(detach_stats.get("bytes", 0)) + int(
+                        gdn_state.nbytes
+                    )
             from .cache_state import replace_recurrent_cache_state
 
             replace_recurrent_cache_state(entry, [conv_state, gdn_state])

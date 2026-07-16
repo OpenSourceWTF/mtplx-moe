@@ -4155,6 +4155,21 @@ def test_public_qa_distribution_parser_dry_shape():
     assert args.qa_action == "distribution"
 
 
+def test_mtp_depth_sweep_accepts_compiled_device_k_core() -> None:
+    args = build_parser().parse_args(
+        [
+            "mtp-depth-sweep",
+            "--depths",
+            "1,2,3,4,5,6,7",
+            "--draft-core",
+            "device-k",
+        ]
+    )
+
+    assert args.depths == "1,2,3,4,5,6,7"
+    assert args.draft_core == "device-k"
+
+
 def test_public_profile_dispatch_without_trace_is_actionable(capsys):
     code = main(
         [

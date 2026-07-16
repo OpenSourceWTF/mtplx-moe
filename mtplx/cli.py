@@ -3470,11 +3470,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     depth_p.add_argument(
         "--draft-core",
-        choices=["stock", "device-d2"],
+        choices=["stock", "device-k", "device-d2"],
         default="stock",
         help=(
-            "Experimental DraftCore backend. device-d2 compiles the greedy D2 "
-            "native-MTP argmax chain for the exact draft-temperature 0 path."
+            "Experimental DraftCore backend. device-k caches one greedy "
+            "native-MTP argmax chain per requested fixed D1...D7 depth "
+            "(primary K3/M4) and requires persistent committed history; "
+            "device-d2 is the legacy D2-only alias."
         ),
     )
     depth_p.add_argument("--mtp-quant-bits", type=int)

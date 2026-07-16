@@ -55,6 +55,7 @@ class PoolOccupancy:
         self._active_units_peak = 0
         self._queued_work_ns = 0
         self._active_work_ns = 0
+        self._active_work_histogram_ns = [0] * (worker_capacity + 1)
         self._queued_unit_ns = 0
         self._active_unit_ns = 0
         self._accepted_submissions = 0
@@ -66,6 +67,8 @@ class PoolOccupancy:
         span = max(0, now_ns - self._last_ns)
         self._queued_work_ns += self._queued_work * span
         self._active_work_ns += self._active_work * span
+        active_bucket = min(self._active_work, self.worker_capacity)
+        self._active_work_histogram_ns[active_bucket] += span
         self._queued_unit_ns += self._queued_units * span
         self._active_unit_ns += self._active_units * span
         self._last_ns = max(self._last_ns, now_ns)
@@ -119,7 +122,7 @@ class PoolOccupancy:
             self._active_work -= 1
             self._active_units -= value
 
-    def snapshot(self) -> dict[str, int]:
+    def snapshot(self) -> dict[str, int | dict[str, int]]:
         with self._lock:
             now_ns = int(self._clock_ns())
             self._accrue(now_ns)
@@ -140,6 +143,10 @@ class PoolOccupancy:
                 "active_units_peak": self._active_units_peak,
                 "queued_work_ns": self._queued_work_ns,
                 "active_work_ns": self._active_work_ns,
+                "active_work_histogram_ns": {
+                    str(active): elapsed_ns
+                    for active, elapsed_ns in enumerate(self._active_work_histogram_ns)
+                },
                 "queued_unit_ns": self._queued_unit_ns,
                 "active_unit_ns": self._active_unit_ns,
             }

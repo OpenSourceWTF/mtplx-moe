@@ -140,6 +140,10 @@ class ExpertStreamingConfig:
     cache_scope: str = "layer"
     bypass_page_cache: bool = False
     resource_telemetry: bool = False
+    q2_expert_kernel: str = "stock"
+    hy3_router_kernel: str = "mpp-r1-fused-r2"
+    hy3_router_sigmoid: str = "precise"
+    deferred_pin_release: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -176,6 +180,39 @@ class ExpertStreamingConfig:
             raise ValueError("cache_policy must be 'frequency' or 'lru'")
         if self.cache_scope not in {"layer", "global"}:
             raise ValueError("cache_scope must be 'layer' or 'global'")
+        if self.q2_expert_kernel not in {
+            "stock",
+            "nax",
+            "fused",
+            "fused-nax",
+        }:
+            raise ValueError(
+                "q2_expert_kernel must be 'stock', 'nax', 'fused', or 'fused-nax'"
+            )
+        if self.hy3_router_kernel not in {
+            "stock",
+            "steel-r1-fused-r2",
+            "mpp-r1-fused-r2",
+            "mpp-fp32-splitk-r1-fused-r2",
+            "mpp-r1-last-arrival-fused-r2",
+            "mpp-row-owned-fused",
+        }:
+            raise ValueError(
+                "hy3_router_kernel must be 'stock', 'steel-r1-fused-r2', "
+                "'mpp-r1-fused-r2', 'mpp-fp32-splitk-r1-fused-r2', "
+                "'mpp-r1-last-arrival-fused-r2', or 'mpp-row-owned-fused'"
+            )
+        if not isinstance(self.deferred_pin_release, bool):
+            raise ValueError("deferred_pin_release must be bool")
+        if self.hy3_router_sigmoid not in {"precise", "fast"}:
+            raise ValueError("hy3_router_sigmoid must be 'precise' or 'fast'")
+        if (
+            self.hy3_router_sigmoid == "fast"
+            and self.hy3_router_kernel != "mpp-row-owned-fused"
+        ):
+            raise ValueError(
+                "fast router sigmoid is selectable only with mpp-row-owned-fused"
+            )
         if self.slot_layout not in {
             "direct-slots",
             "component-banks",
@@ -1409,6 +1446,49 @@ class ExpertStreamingRuntime:
             assert ready is not None
             return ready
 
+    def defer_slot_release(self, ready, wave_output) -> None:
+        """Queue a pinned route for release after the next generation eval.
+
+        The wave output is an ancestor of the next layer's router indices, so
+        the next ``mx.eval`` on the generation thread materializes it; pins
+        release then without a per-layer blocking fence. The output reference
+        is retained so the lazy graph cannot drop it before that eval.
+        """
+
+        pending = getattr(self, "_deferred_slot_releases", None)
+        if pending is None:
+            pending = []
+            self._deferred_slot_releases = pending
+        pending.append((ready, wave_output))
+
+    def flush_deferred_slot_releases(self, *, evaluate: bool = False) -> None:
+        """Release queued routes; the caller just completed a covering eval.
+
+        ``evaluate=True`` fences the pending wave outputs first and is safe at
+        any generation-thread boundary (row end, reset, close) where no later
+        eval is guaranteed to cover them.
+        """
+
+        pending = getattr(self, "_deferred_slot_releases", None)
+        if not pending:
+            return
+        if evaluate:
+            # Local import: this module stays MLX-free at import time so the
+            # I/O layer never touches MLX from worker contexts.
+            import mlx.core as mx
+
+            mx.eval(*[wave_output for _ready, wave_output in pending])
+        first_error: BaseException | None = None
+        while pending:
+            ready, _wave_output = pending.pop(0)
+            try:
+                ready.release(synchronize=False)
+            except BaseException as error:  # noqa: BLE001 - propagate after drain
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
     def try_all_hit_route(
         self,
         layer: int,
@@ -1984,6 +2064,9 @@ class ExpertStreamingRuntime:
             return self._banks[layer].prepare_prefill_seed(expert_ids)
 
     def reset(self) -> None:
+        # Deferred pin releases must flush (with a covering fence) before the
+        # pool resets, or reset waits forever on the final routes' pins.
+        self.flush_deferred_slot_releases(evaluate=True)
         locks = tuple(dict.fromkeys(self._layer_locks.values()))
         for lock in locks:
             lock.acquire()
@@ -2126,6 +2209,7 @@ class ExpertStreamingRuntime:
         return snapshot
 
     def close(self, *, timeout: float | None = None) -> None:
+        self.flush_deferred_slot_releases(evaluate=True)
         deadline = None if timeout is None else time.monotonic() + timeout
         if deadline is None:
             self._close_lock.acquire()

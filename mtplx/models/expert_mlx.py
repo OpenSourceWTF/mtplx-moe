@@ -19,12 +19,16 @@ import numpy as np
 
 from mlx_lm.models.activations import swiglu
 
+from mtplx import expert_route_probe as _route_probe
+
 from mtplx.expert_runtime import ExpertStreamingRuntime
 from mtplx.expert_manifest import ExpertManifest, ExpertRecord
 from mtplx.expert_slots import ExpertSlotBinding, ReadyRoute
 from mtplx.expert_streaming import RoutingPhase
 from mtplx.expert_streaming_models import ExpertMemoryPlan, ExpertStreamingModelSpec
 from mtplx.mmap_mlx import mmap_u32
+
+
 
 
 _ROUTING_PHASE: ContextVar[RoutingPhase | None] = ContextVar(
@@ -873,8 +877,15 @@ class HotExpertSwitchGLU(nn.Module):
             )
         tokens = x.reshape(-1, hidden_size)
         top_k = int(indices.shape[-1])
-        mx.eval(indices)
-        expert_ids = tuple(int(value) for value in indices.reshape(-1).tolist())
+        with _route_probe.bracket("hot.eval_indices"):
+            mx.eval(indices)
+        # This eval materialized every earlier layer's wave output, so any
+        # deferred pin releases are now covered without their own fence.
+        flush_deferred = getattr(self.runtime, "flush_deferred_slot_releases", None)
+        if flush_deferred is not None:
+            flush_deferred()
+        with _route_probe.bracket("hot.route_host"):
+            expert_ids = tuple(int(value) for value in indices.reshape(-1).tolist())
         # Batch size is not a generation phase. A batched decode has shape
         # ``[B, 1, H]`` and must still train/use the persistent decode hot set;
         # only the sequence length distinguishes prefill from decode here.
@@ -1086,10 +1097,14 @@ class HotExpertSwitchGLU(nn.Module):
                     phase is RoutingPhase.DECODE
                     and self.runtime.config.slot_layout == "component-banks"
                 ):
-                    ready = self.runtime.try_all_hit_route(
-                        self.layer_index,
-                        wave.experts,
-                        phase=phase,
+                    with _route_probe.bracket("hot.try_all_hit"):
+                        ready = self.runtime.try_all_hit_route(
+                            self.layer_index,
+                            wave.experts,
+                            phase=phase,
+                        )
+                    _route_probe.count(
+                        "hot.all_hit" if ready is not None else "hot.split_route"
                     )
                     if ready is not None:
                         hit_pipeline_work = None
@@ -1126,15 +1141,32 @@ class HotExpertSwitchGLU(nn.Module):
                                     "claim",
                                     phase=phase,
                                 )
-                            wave_output = _run_component_bank_q4(
-                                assignment_inputs,
-                                ready.bindings,
-                                group_size=self.group_size,
-                                bits=self.bits,
-                            )
+                            with _route_probe.bracket("hot.allhit_dispatch_build"):
+                                wave_output = _run_component_bank_q4(
+                                    assignment_inputs,
+                                    ready.bindings,
+                                    group_size=self.group_size,
+                                    bits=self.bits,
+                                )
                             # Slot pins may be released only after the lazy graph
                             # has consumed the currently bound bank generations.
-                            synchronous_fence(ready, wave_output)
+                            # Deferred mode: the next generation-thread eval is
+                            # that consumption proof; no per-layer fence runs.
+                            deferred_release = False
+                            # Promoted default via ExpertStreamingConfig after
+                            # the C3 matrix; fakes without the field keep the
+                            # fence path.
+                            if getattr(
+                                self.runtime.config,
+                                "deferred_pin_release",
+                                False,
+                            ):
+                                self.runtime.defer_slot_release(ready, wave_output)
+                                deferred_release = True
+                                _route_probe.count("hot.allhit_defer")
+                            else:
+                                with _route_probe.bracket("hot.allhit_fence_eval"):
+                                    synchronous_fence(ready, wave_output)
                             outputs.append(wave_output)
                             output_positions.extend(wave.positions)
                         finally:
@@ -1148,7 +1180,8 @@ class HotExpertSwitchGLU(nn.Module):
                                     "close",
                                     phase=phase,
                                 )
-                            ready.release(synchronize=False)
+                            if not deferred_release:
+                                ready.release(synchronize=False)
                         continue
 
                 # Both layouts pin hits and start miss reads first, then run the
@@ -1158,11 +1191,12 @@ class HotExpertSwitchGLU(nn.Module):
                     if self.runtime.config.slot_layout == "component-banks"
                     else evaluate_direct_bindings
                 )
-                pending = self.runtime.begin_split_route(
-                    self.layer_index,
-                    wave.experts,
-                    phase=phase,
-                )
+                with _route_probe.bracket("hot.begin_split_route"):
+                    pending = self.runtime.begin_split_route(
+                        self.layer_index,
+                        wave.experts,
+                        phase=phase,
+                    )
                 try:
                     hit_pipeline_work = None
                     if pipeline_ledger is not None and pending.hit_ready is not None:

@@ -10,6 +10,7 @@ import json
 import math
 import os
 import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from pathlib import Path
@@ -20,12 +21,20 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from mtplx.benchmarks.resource_telemetry import (  # noqa: E402
+    PowermetricsCollector,
+    ResourceTelemetrySampler,
+)
+
 
 SCHEMA = "mtplx-q2-bf16-mtp-depth-matrix-v3"
 DEFAULT_CONTEXTS = (1024, 2048)
 OUTPUT_TOKENS = 128
 WARMUP_TOKENS = 8
 SEED = 0
+VERIFY_STRATEGIES = ("batched", "capture_commit")
+COMPILED_VERIFY_MODES = ("off", "parity", "on")
+DRAFT_CORES = ("stock", "device-k", "device-d2")
 
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 _FIXED_DEPTH_ENV_KEYS = (
@@ -37,23 +46,17 @@ _FIXED_DEPTH_ENV_KEYS = (
 MODEL_SPECS = {
     "hy3-q2": {
         "model_key": "hy3-expert-q2",
-        "depths": (1, 2, 3, 4, 5),
+        "depths": (1, 2, 3, 4, 5, 6, 7),
         "model_root": Path("~/.cache/huggingface/hy3-expert-only-mlx-q2"),
         "mtp_artifacts": Path("~/.cache/huggingface/hy3-mtp-layer80"),
-        "prompt_tail": _ROOT
-        / "benchmarks"
-        / "fixtures"
-        / "hy3-q2-benchmark-prompt.txt",
+        "prompt_tail": None,
     },
     "glm52-q2": {
         "model_key": "glm52-expert-q2",
         "depths": (1, 2, 3, 4, 5),
         "model_root": Path("~/.cache/huggingface/glm52-expert-only-mlx-q2"),
         "mtp_artifacts": Path("~/.cache/huggingface/glm52-mtp-layer78"),
-        "prompt_tail": _ROOT
-        / "benchmarks"
-        / "fixtures"
-        / "glm52-q2-benchmark-prompt.txt",
+        "prompt_tail": None,
     },
 }
 
@@ -66,9 +69,18 @@ DEFAULT_RUNTIME_OPTIONS = {
     "cache_scope": "layer",
     "slot_layout": "component-banks",
     "transient_slots": 8,
+    "q2_expert_kernel": "stock",
+    "hy3_router_kernel": "mpp-r1-fused-r2",
+    "hy3_router_sigmoid": "precise",
+    "deferred_pin_release": True,
     "read_chunk": "8MiB",
     "bypass_page_cache": True,
     "resource_telemetry": False,
+    "resource_sample_interval": 0.25,
+    "resource_max_samples": 4096,
+    "ssd_ceiling_gib_s": None,
+    "powermetrics": False,
+    "powermetrics_interval_ms": 250,
 }
 
 
@@ -103,6 +115,15 @@ def _generation_environment() -> dict[str, str | None]:
     }
 
 
+def _compiled_verify_environment_mode() -> str:
+    raw = (os.environ.get("MTPLX_COMPILED_VERIFY") or "off").strip().lower()
+    if raw in {"", "0", "false", "no", "off"}:
+        return "off"
+    if raw in _TRUTHY_ENV_VALUES:
+        return "on"
+    return raw
+
+
 Checkpoint = Callable[[Mapping[str, Any]], None]
 
 
@@ -127,6 +148,10 @@ class RunnerAPIs:
         reset_peak_memory,
         get_peak_memory,
         synchronize,
+        resource_sampler_factory=ResourceTelemetrySampler,
+        powermetrics_factory=PowermetricsCollector,
+        thread_time_ns=time.thread_time_ns,
+        monotonic_ns=time.monotonic_ns,
     ) -> None:
         self.load = load
         self.config_factory = config_factory
@@ -138,6 +163,10 @@ class RunnerAPIs:
         self.reset_peak_memory = reset_peak_memory
         self.get_peak_memory = get_peak_memory
         self.synchronize = synchronize
+        self.resource_sampler_factory = resource_sampler_factory
+        self.powermetrics_factory = powermetrics_factory
+        self.thread_time_ns = thread_time_ns
+        self.monotonic_ns = monotonic_ns
 
 
 def _default_apis() -> RunnerAPIs:
@@ -210,6 +239,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated exact prompt sizes (default: 1024,2048).",
     )
     parser.add_argument(
+        "--output-tokens",
+        type=_positive_int,
+        default=OUTPUT_TOKENS,
+        help="Exact retained output length per matrix row (default: 128).",
+    )
+    parser.add_argument(
         "--hy3-depths",
         type=_integer_csv,
         default=MODEL_SPECS["hy3-q2"]["depths"],
@@ -267,6 +302,47 @@ def build_parser() -> argparse.ArgumentParser:
         default="component-banks",
     )
     parser.add_argument("--transient-slots", type=_positive_int, default=8)
+    parser.add_argument(
+        "--q2-expert-kernel",
+        choices=("stock", "nax", "fused", "fused-nax"),
+        default="stock",
+        help="Issue 51 Q2 expert execution arm (default: stock).",
+    )
+    parser.add_argument(
+        "--hy3-router-kernel",
+        choices=(
+            "stock",
+            "steel-r1-fused-r2",
+            "mpp-r1-fused-r2",
+            "mpp-fp32-splitk-r1-fused-r2",
+            "mpp-r1-last-arrival-fused-r2",
+            "mpp-row-owned-fused",
+        ),
+        default="mpp-r1-fused-r2",
+        help=(
+            "Issue 51 authoritative Hy3 router arithmetic mode "
+            "(default: mpp-r1-fused-r2)."
+        ),
+    )
+    parser.add_argument(
+        "--deferred-pin-release",
+        dest="deferred_pin_release",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "All-hit pin release defers to the next generation eval "
+            "(C3-promoted; --no-deferred-pin-release restores the fence)."
+        ),
+    )
+    parser.add_argument(
+        "--hy3-router-sigmoid",
+        choices=("precise", "fast"),
+        default="precise",
+        help=(
+            "Row-owned router finalizer exponential "
+            "(fast is a selectable experiment; default: precise)."
+        ),
+    )
     parser.add_argument("--read-chunk", default="8MiB")
     parser.add_argument(
         "--f-nocache",
@@ -284,12 +360,70 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--resource-sample-interval",
+        type=float,
+        default=0.25,
+        help="Decode resource-sampling interval in seconds (default: 0.25).",
+    )
+    parser.add_argument(
+        "--resource-max-samples",
+        type=_positive_int,
+        default=4096,
+        help="Maximum retained decode resource samples per row (default: 4096).",
+    )
+    parser.add_argument(
+        "--ssd-ceiling-gib-s",
+        type=float,
+        help=(
+            "Measured uncached SSD ceiling used only to calculate utilization; "
+            "requires --resource-telemetry and --f-nocache."
+        ),
+    )
+    parser.add_argument(
+        "--powermetrics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Collect non-interactive process CPU/GPU evidence during decode. "
+            "Unavailable authorization is recorded, never treated as zero use."
+        ),
+    )
+    parser.add_argument(
+        "--powermetrics-interval-ms",
+        type=_positive_int,
+        default=250,
+    )
+    parser.add_argument(
         "--mtp-disabled-baseline",
         action="store_true",
         help=(
             "Load the streamed Q2 target without an MTP artifact and run only "
             "the AR warmup/retained baseline rows."
         ),
+    )
+    parser.add_argument(
+        "--verify-strategy",
+        choices=VERIFY_STRATEGIES,
+        default="batched",
+    )
+    parser.add_argument(
+        "--compiled-verify-mode",
+        choices=COMPILED_VERIFY_MODES,
+        default="off",
+    )
+    parser.add_argument(
+        "--draft-core",
+        choices=DRAFT_CORES,
+        default="stock",
+        help=(
+            "MTP draft execution core. device-k is the D1...D7 fixed compiled "
+            "committed-history lane (primary K3/M4)."
+        ),
+    )
+    parser.add_argument(
+        "--trace-routes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
     parser.add_argument("--output-json", type=Path)
     return parser
@@ -322,9 +456,10 @@ def _requests_from_args(args: argparse.Namespace) -> list[dict[str, Any]]:
             "model": model,
             "model_root": model_root,
             "manifest": _expand(manifest or model_root / "expert-manifest.json"),
-            "prompt_tail": _expand(prompt_tail),
             "depths": tuple(depths),
         }
+        if prompt_tail is not None:
+            request["prompt_tail"] = _expand(prompt_tail)
         if not args.mtp_disabled_baseline:
             request["mtp_artifacts"] = _expand(mtp_artifacts)
         requests.append(request)
@@ -341,9 +476,18 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "cache_scope": args.cache_scope,
         "slot_layout": args.slot_layout,
         "transient_slots": args.transient_slots,
+        "q2_expert_kernel": args.q2_expert_kernel,
+        "hy3_router_kernel": args.hy3_router_kernel,
+        "hy3_router_sigmoid": args.hy3_router_sigmoid,
+        "deferred_pin_release": bool(args.deferred_pin_release),
         "read_chunk": args.read_chunk,
         "bypass_page_cache": args.bypass_page_cache,
         "resource_telemetry": args.resource_telemetry,
+        "resource_sample_interval": args.resource_sample_interval,
+        "resource_max_samples": args.resource_max_samples,
+        "ssd_ceiling_gib_s": args.ssd_ceiling_gib_s,
+        "powermetrics": args.powermetrics,
+        "powermetrics_interval_ms": args.powermetrics_interval_ms,
     }
 
 
@@ -440,13 +584,20 @@ def _ratio(numerator: int | float, denominator: int | float) -> float | None:
     return float(numerator) / float(denominator) if denominator else None
 
 
-def _prompt_identity(token_ids: Sequence[int], prompt_tail: str) -> dict[str, Any]:
+def _prompt_identity(
+    token_ids: Sequence[int], prompt_metadata: Mapping[str, Any]
+) -> dict[str, Any]:
     tokens = [int(token) for token in token_ids]
     encoded = json.dumps(tokens, separators=(",", ":")).encode("utf-8")
     return {
         "token_count": len(tokens),
         "token_sha256": hashlib.sha256(encoded).hexdigest(),
-        "tail_sha256": hashlib.sha256(prompt_tail.encode("utf-8")).hexdigest(),
+        "prompt_policy": prompt_metadata.get("prompt_policy"),
+        "prompt_format": prompt_metadata.get("prompt_format"),
+        "prompt_release_valid": prompt_metadata.get("prompt_release_valid"),
+        "prompt_tail_sha256": prompt_metadata.get("prompt_tail_sha256"),
+        "prompt_filler_sha256": prompt_metadata.get("prompt_filler_sha256"),
+        "prompt_artifact_kinds": prompt_metadata.get("prompt_artifact_kinds"),
     }
 
 
@@ -1175,11 +1326,186 @@ def _numeric_delta(before: Any, after: Any) -> Any:
     return None
 
 
+def _reader_pool_interval(
+    before: Mapping[str, Any], after: Mapping[str, Any]
+) -> dict[str, float | int]:
+    before_pool = before.get("reader_pool")
+    after_pool = after.get("reader_pool")
+    if not isinstance(before_pool, Mapping) or not isinstance(after_pool, Mapping):
+        raise BenchmarkGateError("resource telemetry is missing reader_pool counters")
+    capacity = after_pool.get("worker_capacity")
+    if (
+        isinstance(capacity, bool)
+        or not isinstance(capacity, int)
+        or capacity <= 0
+        or before_pool.get("worker_capacity") != capacity
+    ):
+        raise BenchmarkGateError("reader_pool worker capacity is invalid or changed")
+
+    def interval(name: str) -> int:
+        start = before_pool.get(name)
+        end = after_pool.get(name)
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+            or end < start
+        ):
+            raise BenchmarkGateError(f"reader_pool {name} interval is invalid")
+        return end - start
+
+    elapsed_ns = interval("observation_ns")
+    if elapsed_ns <= 0:
+        raise BenchmarkGateError("reader_pool decode interval is empty")
+    active_work_ns = interval("active_work_ns")
+    queued_work_ns = interval("queued_work_ns")
+    before_histogram = before_pool.get("active_work_histogram_ns")
+    after_histogram = after_pool.get("active_work_histogram_ns")
+    if not isinstance(before_histogram, Mapping) or not isinstance(
+        after_histogram, Mapping
+    ):
+        raise BenchmarkGateError("reader_pool active occupancy histogram is missing")
+
+    histogram_ns: dict[int, int] = {}
+    for active_readers in range(capacity + 1):
+        key = str(active_readers)
+        if key not in before_histogram and key not in after_histogram:
+            histogram_ns[active_readers] = 0
+            continue
+        start = before_histogram.get(key)
+        end = after_histogram.get(key)
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+            or end < start
+        ):
+            raise BenchmarkGateError(
+                "reader_pool active occupancy histogram interval is invalid"
+            )
+        histogram_ns[active_readers] = end - start
+    if sum(histogram_ns.values()) != elapsed_ns:
+        raise BenchmarkGateError(
+            "reader_pool active occupancy histogram disagrees with elapsed time"
+        )
+    integrated_active_ns = sum(
+        active_readers * duration_ns
+        for active_readers, duration_ns in histogram_ns.items()
+    )
+    if integrated_active_ns != active_work_ns:
+        raise BenchmarkGateError(
+            "reader_pool active occupancy histogram disagrees with active time"
+        )
+    mean_active = active_work_ns / elapsed_ns
+    mean_queued = queued_work_ns / elapsed_ns
+    peak_active = max(
+        (
+            active_readers
+            for active_readers, duration_ns in histogram_ns.items()
+            if duration_ns > 0
+        ),
+        default=0,
+    )
+    return {
+        "worker_capacity": capacity,
+        "elapsed_seconds": elapsed_ns / 1_000_000_000,
+        "mean_active_readers": mean_active,
+        "active_capacity_fraction": mean_active / capacity,
+        "peak_active_readers": peak_active,
+        "full_capacity_fraction": histogram_ns[capacity] / elapsed_ns,
+        "mean_queued_reads": mean_queued,
+    }
+
+
 def _result_tokens(result: Any) -> list[int]:
     value = _field(result, "tokens")
     if not isinstance(value, (list, tuple)):
         raise BenchmarkGateError("generation result tokens must be a sequence")
     return [int(token) for token in value]
+
+
+def _require_compiled_draft_evidence(
+    stats: Any,
+    *,
+    model: str,
+    depth: int,
+    draft_core: str,
+) -> dict[str, Any] | None:
+    evidence = _field(stats, "draft_core")
+    if draft_core == "stock":
+        return dict(evidence) if isinstance(evidence, Mapping) else None
+    if not isinstance(evidence, Mapping):
+        raise BenchmarkGateError(f"{model} d{depth} compiled draft emitted no evidence")
+    report = dict(evidence)
+    if report.get("requested") != draft_core:
+        raise BenchmarkGateError(
+            f"{model} d{depth} compiled draft request evidence disagrees"
+        )
+    if report.get("selected") != "device-k":
+        raise BenchmarkGateError(
+            f"{model} d{depth} silently selected a non-compiled draft core"
+        )
+    compiled_calls = _optional_int(report, "compiled_calls")
+    if compiled_calls is None or compiled_calls <= 0:
+        raise BenchmarkGateError(
+            f"{model} d{depth} compiled draft emitted no measured calls"
+        )
+    if _optional_int(report, "organic_compile_calls") != 0:
+        raise BenchmarkGateError(
+            f"{model} d{depth} compiled draft compiled during measured dispatch"
+        )
+    fallbacks = _optional_int(report, "fallbacks")
+    if fallbacks != 0 or report.get("fallback_reasons"):
+        raise BenchmarkGateError(f"{model} d{depth} compiled draft used fallback calls")
+    if report.get("history_policy") != "committed":
+        raise BenchmarkGateError(
+            f"{model} d{depth} compiled draft did not use committed history"
+        )
+    if report.get("cache_state_mode") != "explicit-live-io":
+        raise BenchmarkGateError(
+            f"{model} d{depth} compiled draft did not expose live cache state"
+        )
+    prewarm = report.get("prewarm")
+    if not isinstance(prewarm, Mapping) or prewarm.get("compiled") is not True:
+        raise BenchmarkGateError(f"{model} d{depth} compiled draft was not prewarmed")
+    per_depth = report.get("per_depth")
+    depth_evidence = (
+        per_depth.get(str(depth)) if isinstance(per_depth, Mapping) else None
+    )
+    if not isinstance(depth_evidence, Mapping):
+        raise BenchmarkGateError(
+            f"{model} d{depth} compiled draft omitted per-depth evidence"
+        )
+    depth_calls = _optional_int(depth_evidence, "calls")
+    live_commits = _optional_int(depth_evidence, "live_cache_commits")
+    if depth_calls is None or depth_calls <= 0 or live_commits != depth_calls:
+        raise BenchmarkGateError(
+            f"{model} d{depth} compiled draft live-cache commits disagree"
+        )
+    if draft_core == "device-k":
+        if report.get("qualification_eligible") is not True:
+            raise BenchmarkGateError(
+                f"{model} d{depth} compiled draft is not qualification eligible"
+            )
+        if report.get("primary_depth") != 3 or report.get("primary_width") != 4:
+            raise BenchmarkGateError(
+                f"{model} d{depth} compiled draft K3/M4 marker disagrees"
+            )
+        supported = [int(value) for value in report.get("supported_depths", ())]
+        if supported != list(range(1, 8)):
+            raise BenchmarkGateError(
+                f"{model} d{depth} compiled draft D1...D7 support disagrees"
+            )
+        prewarmed = [int(value) for value in report.get("prewarmed_depths", ())]
+        if prewarmed != list(range(1, depth + 1)):
+            raise BenchmarkGateError(
+                f"{model} d{depth} compiled draft prewarm coverage disagrees"
+            )
+    elif depth != 2:
+        raise BenchmarkGateError("legacy device-d2 requires an exact D2 row")
+    return report
 
 
 def _run_observation(
@@ -1194,14 +1520,59 @@ def _run_observation(
     depth: int,
     position: int,
     max_tokens: int,
-    resource_telemetry_enabled: bool,
+    resource_options: Mapping[str, Any],
     ar_tokens: Sequence[int] | None,
     ar_finish_reason: str | None,
+    verify_strategy: str,
+    compiled_verify_mode: str,
+    draft_core: str,
+    draft_observer: Callable[[Mapping[str, Any]], None] | None,
 ) -> tuple[dict[str, Any], list[int], str | None]:
     _reset_expert_streaming(runtime)
+    resource_telemetry_enabled = bool(resource_options["resource_telemetry"])
     resource_before = (
         _resource_telemetry(runtime) if resource_telemetry_enabled else None
     )
+    resource_prefill_complete = None
+    resource_sampler: ResourceTelemetrySampler | None = None
+    power_collector: PowermetricsCollector | None = None
+    resource_completion_tokens = 0
+    generation_thread_started_ns: int | None = None
+    generation_thread_finished_ns: int | None = None
+    generation_started_ns: int | None = None
+    generation_finished_ns: int | None = None
+
+    def capture_tokens(token_ids: Sequence[int]) -> None:
+        nonlocal resource_completion_tokens
+        resource_completion_tokens += len(token_ids)
+
+    def capture_prefill_boundary(event: Mapping[str, Any]) -> None:
+        nonlocal resource_prefill_complete
+        nonlocal resource_sampler, power_collector
+        nonlocal generation_thread_started_ns, generation_started_ns
+        if resource_prefill_complete is None and event.get("phase") == "completed":
+            power_collector = apis.powermetrics_factory(
+                enabled=bool(resource_options["powermetrics"]),
+                pid=os.getpid(),
+                interval_ms=int(resource_options["powermetrics_interval_ms"]),
+            )
+            power_collector.start()
+            resource_sampler = apis.resource_sampler_factory(
+                lambda: _resource_telemetry(runtime),
+                token_count=lambda: resource_completion_tokens,
+                interval_s=float(resource_options["resource_sample_interval"]),
+                max_samples=int(resource_options["resource_max_samples"]),
+            )
+            resource_sampler.__enter__()
+            ticks = resource_sampler.ticks
+            if not ticks:
+                raise BenchmarkGateError(
+                    "resource sampler did not capture the prefill boundary"
+                )
+            resource_prefill_complete = _jsonable(ticks[0].snapshot)
+            generation_thread_started_ns = int(apis.thread_time_ns())
+            generation_started_ns = int(apis.monotonic_ns())
+
     apis.synchronize()
     apis.reset_peak_memory()
     prompt_copy = list(prompt_ids)
@@ -1219,23 +1590,64 @@ def _run_observation(
         "repetition_stop": False,
         "loop_guard": False,
     }
-    with admission:
-        if depth == 0:
-            result = apis.generate_ar(runtime, prompt_copy, **common)
-        else:
-            result = apis.generate_mtpk(
-                runtime,
-                prompt_copy,
-                speculative_depth=depth,
-                mtp_cache_policy="persistent",
-                mtp_history_policy="committed",
-                capture_final_state=True,
-                **common,
-            )
-    apis.synchronize()
-    resource_after = (
-        _resource_telemetry(runtime) if resource_telemetry_enabled else None
-    )
+    if resource_telemetry_enabled:
+        common["prefill_callback"] = capture_prefill_boundary
+        common["token_callback"] = capture_tokens
+    try:
+        with admission:
+            if depth == 0:
+                result = apis.generate_ar(runtime, prompt_copy, **common)
+            else:
+                mtpk_options: dict[str, Any] = {
+                    "speculative_depth": depth,
+                    "mtp_cache_policy": "persistent",
+                    "mtp_history_policy": "committed",
+                    "draft_core": draft_core,
+                    "capture_final_state": True,
+                    "verify_strategy": verify_strategy,
+                }
+                if draft_observer is not None:
+                    mtpk_options["draft_observer"] = draft_observer
+                result = apis.generate_mtpk(
+                    runtime,
+                    prompt_copy,
+                    **mtpk_options,
+                    **common,
+                )
+        apis.synchronize()
+    finally:
+        if resource_sampler is not None:
+            generation_finished_ns = int(apis.monotonic_ns())
+            generation_thread_finished_ns = int(apis.thread_time_ns())
+            resource_sampler.__exit__(None, None, None)
+        if power_collector is not None:
+            power_collector.stop()
+    resource_after = None
+    if resource_sampler is not None and resource_sampler.ticks:
+        resource_after = _jsonable(resource_sampler.ticks[-1].snapshot)
+    if resource_telemetry_enabled and resource_prefill_complete is None:
+        raise BenchmarkGateError(
+            "resource telemetry did not observe the prefill-complete boundary"
+        )
+    resource_evidence = None
+    if resource_telemetry_enabled:
+        assert resource_before is not None
+        assert resource_prefill_complete is not None
+        assert resource_after is not None
+        resource_evidence = {
+            "before": resource_before,
+            "prefill_complete": resource_prefill_complete,
+            "after": resource_after,
+            "numeric_delta": _numeric_delta(resource_before, resource_after),
+            "decode": {
+                "numeric_delta": _numeric_delta(
+                    resource_prefill_complete, resource_after
+                ),
+                "reader_pool": _reader_pool_interval(
+                    resource_prefill_complete, resource_after
+                ),
+            },
+        }
 
     if tuple(int(token) for token in prompt_copy) != prompt_ids:
         raise BenchmarkGateError("generation mutated the exact benchmark prompt")
@@ -1256,13 +1668,7 @@ def _run_observation(
         "expert_streaming_counters": streaming_counters,
         "expert_streaming_counters_by_phase": streaming_counters_by_phase,
         "expert_resource_telemetry": (
-            {
-                "before": resource_before,
-                "after": resource_after,
-                "numeric_delta": _numeric_delta(resource_before, resource_after),
-            }
-            if resource_telemetry_enabled
-            else None
+            resource_evidence if resource_telemetry_enabled else None
         ),
     }
     try:
@@ -1289,6 +1695,51 @@ def _run_observation(
         effective_exact = effective_depth == depth
         committed_history = depth == 0 or history_policy == "committed"
         guards_disabled = _guards_disabled(stats)
+        compiled_draft = (
+            _require_compiled_draft_evidence(
+                stats,
+                model=model,
+                depth=depth,
+                draft_core=draft_core,
+            )
+            if depth > 0
+            else None
+        )
+        compiled_verify = None
+        graphbank = _field(stats, "graphbank", {})
+        if isinstance(graphbank, Mapping):
+            candidate_evidence = graphbank.get("compiled_verify")
+            if isinstance(candidate_evidence, Mapping):
+                compiled_verify = dict(candidate_evidence)
+        compiled_verify_evidence = depth == 0
+        if depth > 0 and compiled_verify_mode in {"parity", "on"}:
+            if compiled_verify is None:
+                raise BenchmarkGateError("compiled verifier emitted no evidence")
+            calls = _optional_int(compiled_verify, "calls")
+            compiled_calls = _optional_int(compiled_verify, "compiled_calls")
+            fallback_calls = _optional_int(compiled_verify, "fallback_calls")
+            if calls is None or calls <= 0:
+                raise BenchmarkGateError("compiled verifier emitted no calls")
+            if fallback_calls != 0:
+                raise BenchmarkGateError("compiled verifier used fallback calls")
+            if compiled_calls != calls:
+                raise BenchmarkGateError(
+                    "compiled verifier calls were not fully compiled"
+                )
+            if compiled_verify.get("mode") != compiled_verify_mode:
+                raise BenchmarkGateError("compiled verifier mode evidence disagrees")
+            compiled_verify_evidence = True
+        elif depth > 0:
+            compiled_calls = (
+                _optional_int(compiled_verify, "compiled_calls")
+                if compiled_verify is not None
+                else 0
+            )
+            if compiled_calls not in {None, 0}:
+                raise BenchmarkGateError(
+                    "compiled verifier ran while declared mode was off"
+                )
+            compiled_verify_evidence = True
         if not ar_finish_parity:
             raise BenchmarkGateError(f"{model} d{depth} finish reason diverged from AR")
         if not requested_exact or not effective_exact:
@@ -1330,6 +1781,36 @@ def _run_observation(
         if exc.evidence is None:
             exc.evidence = failure_evidence
         raise
+    resource_report = None
+    if resource_telemetry_enabled:
+        assert resource_sampler is not None
+        assert power_collector is not None
+        assert generation_thread_started_ns is not None
+        assert generation_thread_finished_ns is not None
+        assert generation_started_ns is not None
+        assert generation_finished_ns is not None
+        resource_report = resource_sampler.report(
+            ssd_ceiling_gib_s=resource_options["ssd_ceiling_gib_s"],
+            powermetrics=power_collector.report(),
+            generation_thread_cpu_ns=(
+                generation_thread_finished_ns - generation_thread_started_ns
+            ),
+            generation_elapsed_ns=generation_finished_ns - generation_started_ns,
+            final_completion_tokens=len(tokens),
+        )
+        memory_limit_bytes = int(
+            apis.parse_memory_bytes(resource_options["memory_limit"])
+        )
+        resource_report["memory"] = {
+            "peak_memory_bytes": metrics["peak_memory_bytes"],
+            "limit_bytes": memory_limit_bytes,
+            "utilization_of_limit": (
+                metrics["peak_memory_bytes"] / memory_limit_bytes
+                if memory_limit_bytes > 0
+                else None
+            ),
+        }
+
     row = {
         "model": model,
         "context_tokens": context_tokens,
@@ -1342,9 +1823,13 @@ def _run_observation(
         "effective_depth": effective_depth,
         "mtp_cache_policy": None if depth == 0 else "persistent",
         "mtp_history_policy": None if depth == 0 else "committed",
+        "verify_strategy": None if depth == 0 else verify_strategy,
         "finish_reason": finish_reason,
         "token_ids": tokens,
         "generation_events": _jsonable(_field(stats, "events", [])),
+        "compiled_verify": _jsonable(compiled_verify),
+        "draft_core": None if depth == 0 else draft_core,
+        "compiled_draft": _jsonable(compiled_draft),
         "ar_comparison": ar_comparison,
         "speculative_event_contract": speculative_event_contract,
         "final_state_contract": final_state_contract,
@@ -1353,14 +1838,9 @@ def _run_observation(
         "expert_streaming_counters_by_phase": streaming_counters_by_phase,
         "decode_expert_cache_hit_rate": decode_cache_hit_rate,
         "expert_resource_telemetry": (
-            {
-                "before": resource_before,
-                "after": resource_after,
-                "numeric_delta": _numeric_delta(resource_before, resource_after),
-            }
-            if resource_telemetry_enabled
-            else None
+            resource_evidence if resource_telemetry_enabled else None
         ),
+        "resource_telemetry": resource_report,
         "gates": {
             "prompt_length_exact": len(prompt_ids) == context_tokens,
             "new_prefill_tokens_exact": _field(stats, "new_prefill_tokens")
@@ -1377,6 +1857,10 @@ def _run_observation(
             "speculative_event_contract": depth == 0
             or speculative_event_contract is not None,
             "final_state_contract": depth == 0 or final_state_contract is not None,
+            "compiled_verify_evidence": compiled_verify_evidence,
+            "compiled_draft_evidence": depth == 0
+            or draft_core == "stock"
+            or compiled_draft is not None,
         },
     }
     if not row["gates"]["new_prefill_tokens_exact"]:
@@ -1424,9 +1908,14 @@ def _runtime_config(
         cache_scope=str(options["cache_scope"]),
         slot_layout=str(options["slot_layout"]),
         transient_slots=int(options["transient_slots"]),
+        q2_expert_kernel=str(options["q2_expert_kernel"]),
+        hy3_router_kernel=str(options["hy3_router_kernel"]),
+        hy3_router_sigmoid=str(options["hy3_router_sigmoid"]),
+        deferred_pin_release=bool(options["deferred_pin_release"]),
         max_read_chunk_bytes=apis.parse_memory_bytes(options["read_chunk"]),
         bypass_page_cache=bool(options["bypass_page_cache"]),
         resource_telemetry=bool(options["resource_telemetry"]),
+        trace_routes=bool(options["trace_routes"]),
     )
 
 
@@ -1462,13 +1951,16 @@ def _normalized_request(
         raise BenchmarkConfigurationError(
             f"{model} is missing required paths: {', '.join(missing)}"
         )
-    if "prompt_tail_text" in request:
-        prompt_tail_text = str(request["prompt_tail_text"])
+    if request.get("prompt_tail_text") is not None:
+        prompt_tail_text: str | None = str(request["prompt_tail_text"])
         prompt_tail_path = request.get("prompt_tail")
-    else:
-        prompt_tail_path = request.get("prompt_tail", spec["prompt_tail"])
+    elif request.get("prompt_tail") is not None:
+        prompt_tail_path = request["prompt_tail"]
         prompt_tail_text = _expand(prompt_tail_path).read_text(encoding="utf-8")
-    if not prompt_tail_text:
+    else:
+        prompt_tail_path = None
+        prompt_tail_text = None
+    if prompt_tail_text is not None and not prompt_tail_text:
         raise BenchmarkConfigurationError(f"{model} prompt tail must not be empty")
     normalized = {
         "model": model,
@@ -1487,8 +1979,13 @@ def _normalized_request(
 def _checkpoint_skeleton(
     *,
     contexts: Sequence[int],
+    output_tokens: int,
     runtime_options: Mapping[str, Any] | None,
     mtp_disabled_baseline: bool,
+    verify_strategy: str,
+    compiled_verify_mode: str,
+    draft_core: str,
+    trace_routes: bool,
 ) -> dict[str, Any]:
     """Return a uniform payload for failures before validated setup exists."""
 
@@ -1514,7 +2011,14 @@ def _checkpoint_skeleton(
             "lane": lane,
             "mtp_resident": None if baseline is None else not baseline,
             "requested_contexts": _jsonable(list(contexts)),
+            "requested_output_tokens": _jsonable(output_tokens),
             "requested_runtime": _jsonable(dict(runtime_options or {})),
+            "requested_candidate": {
+                "verify_strategy": verify_strategy,
+                "compiled_verify_mode": compiled_verify_mode,
+                "draft_core": draft_core,
+                "trace_routes": trace_routes,
+            },
         },
         "models": [],
     }
@@ -1524,8 +2028,14 @@ def run_depth_matrix(
     model_requests: Sequence[Mapping[str, Any]],
     *,
     contexts: Sequence[int] = DEFAULT_CONTEXTS,
+    output_tokens: int = OUTPUT_TOKENS,
     runtime_options: Mapping[str, Any] | None = None,
     mtp_disabled_baseline: bool = False,
+    verify_strategy: str = "batched",
+    compiled_verify_mode: str = "off",
+    draft_core: str = "stock",
+    trace_routes: bool = False,
+    draft_observer: Callable[[Mapping[str, Any]], None] | None = None,
     checkpoint: Checkpoint | None = None,
     apis: RunnerAPIs | None = None,
 ) -> dict[str, Any]:
@@ -1534,16 +2044,27 @@ def run_depth_matrix(
     live_payload = {
         "payload": _checkpoint_skeleton(
             contexts=contexts,
+            output_tokens=output_tokens,
             runtime_options=runtime_options,
             mtp_disabled_baseline=mtp_disabled_baseline,
+            verify_strategy=verify_strategy,
+            compiled_verify_mode=compiled_verify_mode,
+            draft_core=draft_core,
+            trace_routes=trace_routes,
         )
     }
     try:
         return _run_depth_matrix_impl(
             model_requests,
             contexts=contexts,
+            output_tokens=output_tokens,
             runtime_options=runtime_options,
             mtp_disabled_baseline=mtp_disabled_baseline,
+            verify_strategy=verify_strategy,
+            compiled_verify_mode=compiled_verify_mode,
+            draft_core=draft_core,
+            trace_routes=trace_routes,
+            draft_observer=draft_observer,
             checkpoint=checkpoint,
             apis=apis,
             _live_payload=live_payload,
@@ -1569,8 +2090,14 @@ def _run_depth_matrix_impl(
     model_requests: Sequence[Mapping[str, Any]],
     *,
     contexts: Sequence[int] = DEFAULT_CONTEXTS,
+    output_tokens: int = OUTPUT_TOKENS,
     runtime_options: Mapping[str, Any] | None = None,
     mtp_disabled_baseline: bool = False,
+    verify_strategy: str = "batched",
+    compiled_verify_mode: str = "off",
+    draft_core: str = "stock",
+    trace_routes: bool = False,
+    draft_observer: Callable[[Mapping[str, Any]], None] | None = None,
     checkpoint: Checkpoint | None = None,
     apis: RunnerAPIs | None = None,
     _live_payload: dict[str, Any],
@@ -1581,6 +2108,31 @@ def _run_depth_matrix_impl(
         raise BenchmarkConfigurationError("at least one model must be selected")
     if not isinstance(mtp_disabled_baseline, bool):
         raise BenchmarkConfigurationError("mtp_disabled_baseline must be bool")
+    if (
+        isinstance(output_tokens, bool)
+        or not isinstance(output_tokens, int)
+        or output_tokens <= 0
+    ):
+        raise BenchmarkConfigurationError("output_tokens must be a positive integer")
+    if verify_strategy not in VERIFY_STRATEGIES:
+        raise BenchmarkConfigurationError("unsupported verify strategy")
+    if compiled_verify_mode not in COMPILED_VERIFY_MODES:
+        raise BenchmarkConfigurationError("unsupported compiled verify mode")
+    if draft_core not in DRAFT_CORES:
+        raise BenchmarkConfigurationError("unsupported draft core")
+    if mtp_disabled_baseline and draft_core != "stock":
+        raise BenchmarkConfigurationError(
+            "MTP-disabled baseline requires the stock draft core"
+        )
+    if compiled_verify_mode != "off" and verify_strategy != "capture_commit":
+        raise BenchmarkConfigurationError(
+            "compiled verify requires capture_commit verify strategy"
+        )
+    observed_compiled_mode = _compiled_verify_environment_mode()
+    if observed_compiled_mode != compiled_verify_mode:
+        raise BenchmarkConfigurationError(
+            "declared compiled verify mode differs from process environment"
+        )
     normalized = [
         _normalized_request(
             request,
@@ -1588,6 +2140,12 @@ def _run_depth_matrix_impl(
         )
         for request in model_requests
     ]
+    if draft_core == "device-d2" and any(
+        request["depths"] != (2,) for request in normalized
+    ):
+        raise BenchmarkConfigurationError(
+            "legacy device-d2 requires every requested matrix to contain only D2"
+        )
     names = [request["model"] for request in normalized]
     if len(set(names)) != len(names):
         raise BenchmarkConfigurationError("models must not repeat")
@@ -1598,10 +2156,27 @@ def _run_depth_matrix_impl(
         or len(set(context_values)) != len(context_values)
     ):
         raise BenchmarkConfigurationError("contexts must be unique positive integers")
-    options = {**DEFAULT_RUNTIME_OPTIONS, **dict(runtime_options or {})}
-    if max(context_values) + OUTPUT_TOKENS > int(options["max_live_kv_tokens"]):
+    options = {
+        **DEFAULT_RUNTIME_OPTIONS,
+        **dict(runtime_options or {}),
+        "trace_routes": bool(trace_routes),
+    }
+    if options["powermetrics"] and not options["resource_telemetry"]:
+        raise BenchmarkConfigurationError("powermetrics requires resource telemetry")
+    if options["ssd_ceiling_gib_s"] is not None:
+        if not options["resource_telemetry"]:
+            raise BenchmarkConfigurationError("SSD ceiling requires resource telemetry")
+        if not options["bypass_page_cache"]:
+            raise BenchmarkConfigurationError("SSD ceiling requires F_NOCACHE")
+        if float(options["ssd_ceiling_gib_s"]) <= 0:
+            raise BenchmarkConfigurationError("SSD ceiling must be positive")
+    if float(options["resource_sample_interval"]) <= 0:
+        raise BenchmarkConfigurationError("resource sample interval must be positive")
+    if int(options["resource_max_samples"]) < 2:
+        raise BenchmarkConfigurationError("resource max samples must be at least 2")
+    if max(context_values) + output_tokens > int(options["max_live_kv_tokens"]):
         raise BenchmarkConfigurationError(
-            "context plus 128 output tokens exceeds max_live_kv_tokens"
+            f"context plus {output_tokens} output tokens exceeds max_live_kv_tokens"
         )
     generation_environment = _generation_environment()
     apis = apis or _default_apis()
@@ -1630,7 +2205,7 @@ def _run_depth_matrix_impl(
                 else "headline-uninstrumented"
             ),
             "contexts": list(context_values),
-            "output_tokens": OUTPUT_TOKENS,
+            "output_tokens": output_tokens,
             "warmup_output_tokens": WARMUP_TOKENS,
             "retained_replicates": 1,
             "sampler": {
@@ -1647,6 +2222,7 @@ def _run_depth_matrix_impl(
                 "loop_guard": False,
                 "mtp_cache_policy": (None if mtp_disabled_baseline else "persistent"),
                 "mtp_history_policy": (None if mtp_disabled_baseline else "committed"),
+                "draft_core": None if mtp_disabled_baseline else draft_core,
                 "capture_final_state": not mtp_disabled_baseline,
             },
             "generation_environment": generation_environment,
@@ -1658,6 +2234,12 @@ def _run_depth_matrix_impl(
                 "prompt_output_depth_counters_and_cache_metrics": "hard_gate",
             },
             "runtime": _jsonable(options),
+            "candidate": {
+                "verify_strategy": verify_strategy,
+                "compiled_verify_mode": compiled_verify_mode,
+                "draft_core": draft_core,
+                "trace_routes": bool(trace_routes),
+            },
         },
         "models": models,
     }
@@ -1758,13 +2340,17 @@ def _run_depth_matrix_impl(
                     "cell": None,
                     "phase": "prompt",
                 }
+                prompt_options: dict[str, Any] = {
+                    "prompt_style": "coding-agent",
+                    "prompt_format": "chat",
+                    "enable_thinking": False,
+                }
+                if request["prompt_tail_text"] is not None:
+                    prompt_options["prompt_tail"] = request["prompt_tail_text"]
                 prompt = apis.prompt_builder(
                     runtime.tokenizer,
                     context_tokens,
-                    prompt_style="coding-agent",
-                    prompt_tail=request["prompt_tail_text"],
-                    prompt_format="raw",
-                    enable_thinking=False,
+                    **prompt_options,
                 )
                 prompt_ids = tuple(int(token) for token in prompt.token_ids)
                 if len(prompt_ids) != context_tokens:
@@ -1773,14 +2359,24 @@ def _run_depth_matrix_impl(
                         f"tokens for requested context {context_tokens}"
                     )
                 metadata = _jsonable(getattr(prompt, "metadata", {}))
-                if (
-                    isinstance(metadata, Mapping)
-                    and metadata.get("prompt_tail_preserved") is False
-                ):
+                if not isinstance(metadata, Mapping):
+                    raise BenchmarkGateError(
+                        f"{request['model']} prompt builder emitted no metadata"
+                    )
+                if metadata.get("prompt_tail_preserved") is not True:
                     raise BenchmarkGateError(
                         f"{request['model']} prompt builder did not preserve the tail"
                     )
-                identity = _prompt_identity(prompt_ids, request["prompt_tail_text"])
+                if (
+                    metadata.get("prompt_policy") != "realistic_programming_v1"
+                    or metadata.get("prompt_format") != "chat"
+                    or metadata.get("prompt_release_valid") is not True
+                ):
+                    raise BenchmarkGateError(
+                        f"{request['model']} prompt builder did not use the release "
+                        "realistic programming chat policy"
+                    )
+                identity = _prompt_identity(prompt_ids, metadata)
                 prompts.append(
                     {
                         "context_tokens": context_tokens,
@@ -1806,9 +2402,13 @@ def _run_depth_matrix_impl(
                     depth=0,
                     position=1,
                     max_tokens=WARMUP_TOKENS,
-                    resource_telemetry_enabled=bool(options["resource_telemetry"]),
+                    resource_options=options,
                     ar_tokens=None,
                     ar_finish_reason=None,
+                    verify_strategy=verify_strategy,
+                    compiled_verify_mode=compiled_verify_mode,
+                    draft_core=draft_core,
+                    draft_observer=draft_observer,
                 )
                 hard_peak_memory_bytes = max(
                     hard_peak_memory_bytes,
@@ -1834,10 +2434,14 @@ def _run_depth_matrix_impl(
                     sampler=sampler,
                     depth=0,
                     position=1,
-                    max_tokens=OUTPUT_TOKENS,
-                    resource_telemetry_enabled=bool(options["resource_telemetry"]),
+                    max_tokens=output_tokens,
+                    resource_options=options,
                     ar_tokens=None,
                     ar_finish_reason=None,
+                    verify_strategy=verify_strategy,
+                    compiled_verify_mode=compiled_verify_mode,
+                    draft_core=draft_core,
+                    draft_observer=draft_observer,
                 )
                 hard_peak_memory_bytes = max(
                     hard_peak_memory_bytes,
@@ -1867,9 +2471,13 @@ def _run_depth_matrix_impl(
                         depth=depth,
                         position=position,
                         max_tokens=WARMUP_TOKENS,
-                        resource_telemetry_enabled=bool(options["resource_telemetry"]),
+                        resource_options=options,
                         ar_tokens=warmup_ar_tokens,
                         ar_finish_reason=warmup_ar_finish,
+                        verify_strategy=verify_strategy,
+                        compiled_verify_mode=compiled_verify_mode,
+                        draft_core=draft_core,
+                        draft_observer=draft_observer,
                     )
                     _record_token_divergence(
                         model_payload,
@@ -1900,10 +2508,14 @@ def _run_depth_matrix_impl(
                         sampler=sampler,
                         depth=depth,
                         position=position,
-                        max_tokens=OUTPUT_TOKENS,
-                        resource_telemetry_enabled=bool(options["resource_telemetry"]),
+                        max_tokens=output_tokens,
+                        resource_options=options,
                         ar_tokens=ar_tokens,
                         ar_finish_reason=ar_finish,
+                        verify_strategy=verify_strategy,
+                        compiled_verify_mode=compiled_verify_mode,
+                        draft_core=draft_core,
+                        draft_observer=draft_observer,
                     )
                     _record_token_divergence(
                         model_payload,
@@ -1997,8 +2609,13 @@ def main(argv: Sequence[str] | None = None, *, apis: RunnerAPIs | None = None) -
         payload = run_depth_matrix(
             _requests_from_args(args),
             contexts=args.contexts,
+            output_tokens=args.output_tokens,
             runtime_options=_runtime_options_from_args(args),
             mtp_disabled_baseline=args.mtp_disabled_baseline,
+            verify_strategy=args.verify_strategy,
+            compiled_verify_mode=args.compiled_verify_mode,
+            draft_core=args.draft_core,
+            trace_routes=args.trace_routes,
             checkpoint=persist_checkpoint,
             apis=apis,
         )
