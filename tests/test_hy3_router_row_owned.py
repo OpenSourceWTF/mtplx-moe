@@ -258,8 +258,8 @@ def test_configure_kernel_accepts_row_owned_selector() -> None:
     assert state.prepared_weight.dtype == mx.bfloat16
 
 
-@pytest.mark.parametrize("rows", (1, 4, 8))
-def test_router_call_dispatches_row_owned_for_m1_m8(rows, monkeypatch) -> None:
+@pytest.mark.parametrize("rows", (2, 4, 8))
+def test_router_call_dispatches_row_owned_for_m2_m8(rows, monkeypatch) -> None:
     from mtplx.models import hy3_mlx
 
     router, _ = _configured_router()
@@ -287,18 +287,19 @@ def test_router_call_dispatches_row_owned_for_m1_m8(rows, monkeypatch) -> None:
     assert tuple(weights.shape) == (1, rows, 8)
 
 
-def test_router_call_falls_back_to_stock_above_m8(monkeypatch) -> None:
+@pytest.mark.parametrize("rows", (1, 9))
+def test_router_call_falls_back_to_stock_outside_m2_m8(rows, monkeypatch) -> None:
     from mtplx.models import hy3_mlx
 
     router, _ = _configured_router()
 
     def forbidden_route(*args, **kwargs):
-        raise AssertionError("row-owned lane must not serve rows > 8")
+        raise AssertionError("row-owned lane must serve only rows 2..8")
 
     monkeypatch.setattr(hy3_mlx, "hy3_router_row_owned_route", forbidden_route)
-    ids, weights = router(mx.zeros((1, 9, 4096), dtype=mx.bfloat16))
-    assert tuple(ids.shape) == (1, 9, 8)
-    assert tuple(weights.shape) == (1, 9, 8)
+    ids, weights = router(mx.zeros((1, rows, 4096), dtype=mx.bfloat16))
+    assert tuple(ids.shape) == (1, rows, 8)
+    assert tuple(weights.shape) == (1, rows, 8)
 
 
 def test_estimate_accepts_row_owned_selector() -> None:

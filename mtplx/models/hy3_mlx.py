@@ -440,7 +440,9 @@ class Router(nn.Module):
         state = self._mtplx_router_kernel_state
         if state.selector == "mpp-row-owned-fused":
             rows = math.prod(int(dimension) for dimension in x.shape[:-1])
-            if 1 <= rows <= 8:
+            # M1 stays on the stock path: one row-owned threadgroup cannot
+            # saturate DRAM alone, and M1 serves every MTP draft call.
+            if 2 <= rows <= 8:
                 assert state.prepared_weight is not None
                 expert_ids, route_weights = hy3_router_row_owned_route(
                     x.reshape(1, rows, 4096).astype(mx.float32),
