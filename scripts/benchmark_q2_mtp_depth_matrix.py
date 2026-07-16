@@ -2007,26 +2007,18 @@ def _run_depth_matrix_impl(
         "trace_routes": bool(trace_routes),
     }
     if options["powermetrics"] and not options["resource_telemetry"]:
-        raise BenchmarkConfigurationError(
-            "powermetrics requires resource telemetry"
-        )
+        raise BenchmarkConfigurationError("powermetrics requires resource telemetry")
     if options["ssd_ceiling_gib_s"] is not None:
         if not options["resource_telemetry"]:
-            raise BenchmarkConfigurationError(
-                "SSD ceiling requires resource telemetry"
-            )
+            raise BenchmarkConfigurationError("SSD ceiling requires resource telemetry")
         if not options["bypass_page_cache"]:
             raise BenchmarkConfigurationError("SSD ceiling requires F_NOCACHE")
         if float(options["ssd_ceiling_gib_s"]) <= 0:
             raise BenchmarkConfigurationError("SSD ceiling must be positive")
     if float(options["resource_sample_interval"]) <= 0:
-        raise BenchmarkConfigurationError(
-            "resource sample interval must be positive"
-        )
+        raise BenchmarkConfigurationError("resource sample interval must be positive")
     if int(options["resource_max_samples"]) < 2:
-        raise BenchmarkConfigurationError(
-            "resource max samples must be at least 2"
-        )
+        raise BenchmarkConfigurationError("resource max samples must be at least 2")
     if max(context_values) + output_tokens > int(options["max_live_kv_tokens"]):
         raise BenchmarkConfigurationError(
             f"context plus {output_tokens} output tokens exceeds max_live_kv_tokens"

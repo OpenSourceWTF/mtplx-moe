@@ -419,9 +419,7 @@ def test_issue51_kernel_selectors_parse_independently() -> None:
         "steel-r1-fused-r2",
         "mpp-fp32-splitk-r1-fused-r2",
     ):
-        selected = module.build_parser().parse_args(
-            ["--hy3-router-kernel", selector]
-        )
+        selected = module.build_parser().parse_args(["--hy3-router-kernel", selector])
         assert selected.hy3_router_kernel == selector
 
     with pytest.raises(SystemExit):
@@ -761,9 +759,7 @@ def test_issue51_kernel_selectors_reach_runtime_and_artifact(tmp_path: Path) -> 
     assert payload["configuration"]["runtime"]["q2_expert_kernel"] == "nax"
     assert payload["configuration"]["runtime"]["hy3_router_kernel"] == "fused-fp32"
     assert payload["models"][0]["runtime_config"]["q2_expert_kernel"] == "nax"
-    assert payload["models"][0]["runtime_config"]["hy3_router_kernel"] == (
-        "fused-fp32"
-    )
+    assert payload["models"][0]["runtime_config"]["hy3_router_kernel"] == ("fused-fp32")
 
 
 def test_ar_path_drift_is_retained_as_diagnostic_and_matrix_continues(
