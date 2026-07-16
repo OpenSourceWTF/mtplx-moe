@@ -210,3 +210,107 @@ def test_hardware_repeated_execution_is_deterministic() -> None:
         ids, scores = row_owned.hy3_router_row_owned_route(value, weight, bias)
         assert mx.array_equal(ids, first_ids).item()
         assert mx.array_equal(scores, first_scores).item()
+
+
+def _router_args():
+    from mtplx.models import hy3_mlx
+
+    return hy3_mlx.ModelArgs(
+        model_type="hy_v3",
+        hidden_size=4096,
+        num_hidden_layers=1,
+        intermediate_size=8192,
+        moe_intermediate_size=1536,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        num_experts=192,
+        num_experts_per_tok=8,
+        num_shared_experts=1,
+        first_k_dense_replace=0,
+        rms_norm_eps=1e-5,
+        vocab_size=128,
+        max_position_embeddings=128,
+        head_dim=128,
+        route_norm=True,
+        router_scaling_factor=2.826,
+    )
+
+
+def _configured_router():
+    from mtplx.models import hy3_mlx
+
+    router = hy3_mlx.Router(_router_args())
+    router.gate.weight = mx.zeros((192, 4096), dtype=mx.bfloat16)
+    report = router.configure_kernel("mpp-row-owned-fused", available=True)
+    return router, report
+
+
+def test_configure_kernel_accepts_row_owned_selector() -> None:
+    router, report = _configured_router()
+    assert report["selector"] == "mpp-row-owned-fused"
+    assert report["enabled"] is True
+    assert report["dispatch_count"] == 1
+    assert report["device_synchronization"] == "none"
+    assert report["topology"] == "row-owned-g12-p16-precise-g6"
+    state = router._mtplx_router_kernel_state
+    assert state.selector == "mpp-row-owned-fused"
+    assert tuple(state.prepared_weight.shape) == (4096, 192)
+    assert state.prepared_weight.dtype == mx.bfloat16
+
+
+@pytest.mark.parametrize("rows", (1, 4, 8))
+def test_router_call_dispatches_row_owned_for_m1_m8(rows, monkeypatch) -> None:
+    from mtplx.models import hy3_mlx
+
+    router, _ = _configured_router()
+    calls: list[dict] = []
+
+    def fake_route(value, weight, bias, **kwargs):
+        calls.append({"shape": tuple(value.shape), **kwargs})
+        return (
+            mx.zeros((1, rows, 8), dtype=mx.int32),
+            mx.zeros((1, rows, 8), dtype=mx.float32),
+        )
+
+    monkeypatch.setattr(hy3_mlx, "hy3_router_row_owned_route", fake_route)
+    ids, weights = router(mx.zeros((1, rows, 4096), dtype=mx.bfloat16))
+    assert calls == [
+        {
+            "shape": (1, rows, 4096),
+            "top_k": 8,
+            "route_norm": True,
+            "scaling_factor": 2.826,
+            "sigmoid_mode": "precise",
+        }
+    ]
+    assert tuple(ids.shape) == (1, rows, 8)
+    assert tuple(weights.shape) == (1, rows, 8)
+
+
+def test_router_call_falls_back_to_stock_above_m8(monkeypatch) -> None:
+    from mtplx.models import hy3_mlx
+
+    router, _ = _configured_router()
+
+    def forbidden_route(*args, **kwargs):
+        raise AssertionError("row-owned lane must not serve rows > 8")
+
+    monkeypatch.setattr(hy3_mlx, "hy3_router_row_owned_route", forbidden_route)
+    ids, weights = router(mx.zeros((1, 9, 4096), dtype=mx.bfloat16))
+    assert tuple(ids.shape) == (1, 9, 8)
+    assert tuple(weights.shape) == (1, 9, 8)
+
+
+def test_estimate_accepts_row_owned_selector() -> None:
+    from mtplx.models import hy3_mlx
+
+    estimate = hy3_mlx.estimate_hy3_router_kernel_incremental_bytes(
+        {
+            "model_type": "hy_v3",
+            "num_hidden_layers": 2,
+            "first_k_dense_replace": 0,
+        },
+        "mpp-row-owned-fused",
+        include_mtp=False,
+    )
+    assert estimate > 0

@@ -22,6 +22,9 @@ from mlx_lm.models.switch_layers import SwitchGLU
 
 from mtplx.attention_context import current_attention_phase
 from mtplx.hy3_router_last_arrival import hy3_router_last_arrival_route
+from mtplx.hy3_router_row_owned import (
+    hy3_router_row_owned_route,
+)
 from mtplx.hy3_router_fp32 import (
     Hy3RouterFP32Ineligible,
     hy3_router_fp32_available,
@@ -328,11 +331,12 @@ class Router(nn.Module):
             "mpp-r1-fused-r2",
             "mpp-fp32-splitk-r1-fused-r2",
             "mpp-r1-last-arrival-fused-r2",
+            "mpp-row-owned-fused",
         }:
             raise ValueError(
                 "Hy3 router kernel must be 'stock', 'steel-r1-fused-r2', "
-                "'mpp-r1-fused-r2', 'mpp-fp32-splitk-r1-fused-r2', or "
-                "'mpp-r1-last-arrival-fused-r2'"
+                "'mpp-r1-fused-r2', 'mpp-fp32-splitk-r1-fused-r2', "
+                "'mpp-r1-last-arrival-fused-r2', or 'mpp-row-owned-fused'"
             )
         if splitk_m1 and selector != "mpp-fp32-splitk-r1-fused-r2":
             raise ValueError("splitk_m1 requires the FP32 split-K router selector")
@@ -421,10 +425,38 @@ class Router(nn.Module):
             report["topology"] = "n16-p16-sg4-in-kernel-pad"
             report["threadgroups"] = 48
             report["attention_phase"] = "decode_verify"
+        elif selector == "mpp-row-owned-fused":
+            report["supported_rows"] = "1-8"
+            report["mpp_descriptor_rows"] = 8
+            report["dispatch_count"] = 1
+            report["sigmoid_mode"] = "precise"
+            report["topology"] = "row-owned-g12-p16-precise-g6"
+            report["threadgroups_per_dispatch"] = "one-per-row"
+            report["device_synchronization"] = "none"
+            report["authority_phases"] = "all"
         return report
 
     def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
         state = self._mtplx_router_kernel_state
+        if state.selector == "mpp-row-owned-fused":
+            rows = math.prod(int(dimension) for dimension in x.shape[:-1])
+            if 1 <= rows <= 8:
+                assert state.prepared_weight is not None
+                expert_ids, route_weights = hy3_router_row_owned_route(
+                    x.reshape(1, rows, 4096).astype(mx.float32),
+                    state.prepared_weight,
+                    self.expert_bias,
+                    top_k=self.top_k,
+                    route_norm=self.route_norm,
+                    scaling_factor=self.router_scaling_factor,
+                    sigmoid_mode="precise",
+                )
+                output_shape = (*x.shape[:-1], 8)
+                return (
+                    expert_ids.reshape(output_shape),
+                    route_weights.reshape(output_shape),
+                )
+
         storage_gate = _router_storage_module(self.gate)
         rows = math.prod(int(dimension) for dimension in x.shape[:-1])
         last_arrival_eligible = state.selector != ("mpp-r1-last-arrival-fused-r2") or (
@@ -434,6 +466,7 @@ class Router(nn.Module):
         )
         if (
             state.selector != "stock"
+            and state.selector != "mpp-row-owned-fused"
             and 1 <= rows <= 8
             and last_arrival_eligible
             and not (
@@ -566,6 +599,13 @@ def configure_hy3_router_kernels(
         summary["topology"] = "n16-p16-sg4-in-kernel-pad"
         summary["threadgroups"] = 48
         summary["attention_phase"] = "decode_verify"
+    elif selector == "mpp-row-owned-fused":
+        summary["supported_rows"] = "1-8"
+        summary["dispatch_count"] = 1
+        summary["sigmoid_mode"] = "precise"
+        summary["topology"] = "row-owned-g12-p16-precise-g6"
+        summary["device_synchronization"] = "none"
+        summary["authority_phases"] = "all"
     return summary
 
 
@@ -583,11 +623,12 @@ def estimate_hy3_router_kernel_incremental_bytes(
         "mpp-r1-fused-r2",
         "mpp-fp32-splitk-r1-fused-r2",
         "mpp-r1-last-arrival-fused-r2",
+        "mpp-row-owned-fused",
     }:
         raise ValueError(
             "Hy3 router kernel must be 'stock', 'steel-r1-fused-r2', "
-            "'mpp-r1-fused-r2', 'mpp-fp32-splitk-r1-fused-r2', or "
-            "'mpp-r1-last-arrival-fused-r2'"
+            "'mpp-r1-fused-r2', 'mpp-fp32-splitk-r1-fused-r2', "
+            "'mpp-r1-last-arrival-fused-r2', or 'mpp-row-owned-fused'"
         )
     if selector == "stock":
         return 0

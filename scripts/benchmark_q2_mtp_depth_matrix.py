@@ -314,6 +314,7 @@ def build_parser() -> argparse.ArgumentParser:
             "mpp-r1-fused-r2",
             "mpp-fp32-splitk-r1-fused-r2",
             "mpp-r1-last-arrival-fused-r2",
+            "mpp-row-owned-fused",
         ),
         default="mpp-r1-fused-r2",
         help=(
