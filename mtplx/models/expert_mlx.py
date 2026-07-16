@@ -28,7 +28,7 @@ from mtplx.expert_streaming import RoutingPhase
 from mtplx.expert_streaming_models import ExpertMemoryPlan, ExpertStreamingModelSpec
 from mtplx.mmap_mlx import mmap_u32
 
-_DEFERRED_PIN_RELEASE = os.environ.get("MTPLX_DEFERRED_PIN_RELEASE", "").strip() == "1"
+
 
 
 _ROUTING_PHASE: ContextVar[RoutingPhase | None] = ContextVar(
@@ -1153,7 +1153,14 @@ class HotExpertSwitchGLU(nn.Module):
                             # Deferred mode: the next generation-thread eval is
                             # that consumption proof; no per-layer fence runs.
                             deferred_release = False
-                            if _DEFERRED_PIN_RELEASE:
+                            # Promoted default via ExpertStreamingConfig after
+                            # the C3 matrix; fakes without the field keep the
+                            # fence path.
+                            if getattr(
+                                self.runtime.config,
+                                "deferred_pin_release",
+                                False,
+                            ):
                                 self.runtime.defer_slot_release(ready, wave_output)
                                 deferred_release = True
                                 _route_probe.count("hot.allhit_defer")

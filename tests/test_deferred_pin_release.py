@@ -154,13 +154,33 @@ def test_all_hit_switch_defers_release_when_enabled(monkeypatch) -> None:
     fences: list[object] = []
     monkeypatch.setattr(expert_mlx.mx, "eval", lambda *values: fences.append(values))
 
-    monkeypatch.setattr(expert_mlx, "_DEFERRED_PIN_RELEASE", True)
+    runtime.config.deferred_pin_release = True
     HotExpertSwitchGLU(runtime, 1)(*_bank_overlap_inputs())
     assert len(deferred) == 1 and deferred[0][0] is ready
     assert released == []
 
     deferred.clear()
-    monkeypatch.setattr(expert_mlx, "_DEFERRED_PIN_RELEASE", False)
+    runtime.config.deferred_pin_release = False
     HotExpertSwitchGLU(runtime, 1)(*_bank_overlap_inputs())
     assert deferred == []
     assert released == [False]
+
+
+def test_streaming_config_deferred_release_field() -> None:
+    from mtplx.expert_runtime import ExpertStreamingConfig
+
+    config = ExpertStreamingConfig(
+        model_key="hy3-q2",
+        memory_limit_bytes=1 << 30,
+        max_live_kv_tokens=1024,
+    )
+    assert config.deferred_pin_release is False
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="deferred_pin_release"):
+        ExpertStreamingConfig(
+            model_key="hy3-q2",
+            memory_limit_bytes=1 << 30,
+            max_live_kv_tokens=1024,
+            deferred_pin_release="yes",
+        )

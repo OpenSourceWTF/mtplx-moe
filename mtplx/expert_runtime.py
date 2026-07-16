@@ -143,6 +143,7 @@ class ExpertStreamingConfig:
     q2_expert_kernel: str = "stock"
     hy3_router_kernel: str = "mpp-r1-fused-r2"
     hy3_router_sigmoid: str = "precise"
+    deferred_pin_release: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -201,6 +202,8 @@ class ExpertStreamingConfig:
                 "'mpp-r1-fused-r2', 'mpp-fp32-splitk-r1-fused-r2', "
                 "'mpp-r1-last-arrival-fused-r2', or 'mpp-row-owned-fused'"
             )
+        if not isinstance(self.deferred_pin_release, bool):
+            raise ValueError("deferred_pin_release must be bool")
         if self.hy3_router_sigmoid not in {"precise", "fast"}:
             raise ValueError("hy3_router_sigmoid must be 'precise' or 'fast'")
         if (
