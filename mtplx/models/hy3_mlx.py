@@ -20,6 +20,8 @@ from mlx_lm.models.cache import KVCache
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
 
+from mtplx.attention_context import current_attention_phase
+from mtplx.hy3_router_last_arrival import hy3_router_last_arrival_route
 from mtplx.hy3_router_fp32 import (
     Hy3RouterFP32Ineligible,
     hy3_router_fp32_available,
@@ -325,10 +327,12 @@ class Router(nn.Module):
             "steel-r1-fused-r2",
             "mpp-r1-fused-r2",
             "mpp-fp32-splitk-r1-fused-r2",
+            "mpp-r1-last-arrival-fused-r2",
         }:
             raise ValueError(
                 "Hy3 router kernel must be 'stock', 'steel-r1-fused-r2', "
-                "'mpp-r1-fused-r2', or 'mpp-fp32-splitk-r1-fused-r2'"
+                "'mpp-r1-fused-r2', 'mpp-fp32-splitk-r1-fused-r2', or "
+                "'mpp-r1-last-arrival-fused-r2'"
             )
         if splitk_m1 and selector != "mpp-fp32-splitk-r1-fused-r2":
             raise ValueError("splitk_m1 requires the FP32 split-K router selector")
@@ -410,15 +414,28 @@ class Router(nn.Module):
             report["m1_policy"] = "splitk" if splitk_m1 else "stock"
             report["m4_grid_k_parts"] = 32
             report["other_grid_k_parts"] = 16
+        elif selector == "mpp-r1-last-arrival-fused-r2":
+            report["supported_rows"] = 4
+            report["dispatch_count"] = 1
+            report["sigmoid_mode"] = "precise"
+            report["topology"] = "n16-p16-sg4-in-kernel-pad"
+            report["threadgroups"] = 48
+            report["attention_phase"] = "decode_verify"
         return report
 
     def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
         state = self._mtplx_router_kernel_state
         storage_gate = _router_storage_module(self.gate)
         rows = math.prod(int(dimension) for dimension in x.shape[:-1])
+        last_arrival_eligible = state.selector != ("mpp-r1-last-arrival-fused-r2") or (
+            x.ndim == 3
+            and tuple(int(dimension) for dimension in x.shape) == (1, 4, 4096)
+            and current_attention_phase() == "decode_verify"
+        )
         if (
             state.selector != "stock"
             and 1 <= rows <= 8
+            and last_arrival_eligible
             and not (
                 state.selector == "mpp-fp32-splitk-r1-fused-r2"
                 and rows == 1
@@ -453,6 +470,17 @@ class Router(nn.Module):
                     finalizer_mode="simd",
                     sigmoid_mode="precise",
                 )
+            if state.selector == "mpp-r1-last-arrival-fused-r2":
+                output = hy3_router_last_arrival_route(
+                    value,
+                    state.prepared_weight,
+                    self.expert_bias,
+                    top_k=self.top_k,
+                    route_norm=self.route_norm,
+                    scaling_factor=self.router_scaling_factor,
+                    sigmoid_mode="precise",
+                )
+                return output.expert_ids, output.route_weights
             return hy3_router_fp32_route(
                 value,
                 state.prepared_weight,
@@ -531,6 +559,13 @@ def configure_hy3_router_kernels(
         )
         summary["m4_grid_k_parts"] = 32
         summary["other_grid_k_parts"] = 16
+    elif selector == "mpp-r1-last-arrival-fused-r2":
+        summary["supported_rows"] = 4
+        summary["dispatch_count"] = 1
+        summary["sigmoid_mode"] = "precise"
+        summary["topology"] = "n16-p16-sg4-in-kernel-pad"
+        summary["threadgroups"] = 48
+        summary["attention_phase"] = "decode_verify"
     return summary
 
 
@@ -547,10 +582,12 @@ def estimate_hy3_router_kernel_incremental_bytes(
         "steel-r1-fused-r2",
         "mpp-r1-fused-r2",
         "mpp-fp32-splitk-r1-fused-r2",
+        "mpp-r1-last-arrival-fused-r2",
     }:
         raise ValueError(
             "Hy3 router kernel must be 'stock', 'steel-r1-fused-r2', "
-            "'mpp-r1-fused-r2', or 'mpp-fp32-splitk-r1-fused-r2'"
+            "'mpp-r1-fused-r2', 'mpp-fp32-splitk-r1-fused-r2', or "
+            "'mpp-r1-last-arrival-fused-r2'"
         )
     if selector == "stock":
         return 0

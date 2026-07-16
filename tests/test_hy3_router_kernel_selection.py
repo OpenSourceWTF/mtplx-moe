@@ -403,6 +403,7 @@ def test_router_optimized_selectors_dispatch_native_m8(
         "steel-r1-fused-r2",
         "mpp-r1-fused-r2",
         "mpp-fp32-splitk-r1-fused-r2",
+        "mpp-r1-last-arrival-fused-r2",
     ),
 )
 def test_router_optimized_selectors_reject_wrappers_and_nonexact_contracts(
@@ -488,6 +489,7 @@ def test_configure_hy3_router_kernels_reports_incremental_memory() -> None:
         ("steel-r1-fused-r2", 4 * 192 * 4096 * 2),
         ("mpp-r1-fused-r2", 4 * 192 * 4096 * 2),
         ("mpp-fp32-splitk-r1-fused-r2", 4 * 192 * 4096 * 4),
+        ("mpp-r1-last-arrival-fused-r2", 4 * 192 * 4096 * 2),
     ),
 )
 def test_router_kernel_memory_estimate_counts_sparse_trunk_and_mtp(

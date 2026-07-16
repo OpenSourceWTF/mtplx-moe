@@ -192,10 +192,12 @@ class ExpertStreamingConfig:
             "steel-r1-fused-r2",
             "mpp-r1-fused-r2",
             "mpp-fp32-splitk-r1-fused-r2",
+            "mpp-r1-last-arrival-fused-r2",
         }:
             raise ValueError(
                 "hy3_router_kernel must be 'stock', 'steel-r1-fused-r2', "
-                "'mpp-r1-fused-r2', or 'mpp-fp32-splitk-r1-fused-r2'"
+                "'mpp-r1-fused-r2', 'mpp-fp32-splitk-r1-fused-r2', or "
+                "'mpp-r1-last-arrival-fused-r2'"
             )
         if self.slot_layout not in {
             "direct-slots",

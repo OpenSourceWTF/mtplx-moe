@@ -5274,6 +5274,7 @@ def test_issue51_kernel_selectors_default_serialize_and_fail_closed() -> None:
         "steel-r1-fused-r2",
         "mpp-r1-fused-r2",
         "mpp-fp32-splitk-r1-fused-r2",
+        "mpp-r1-last-arrival-fused-r2",
     ):
         selected = ExpertStreamingConfig(
             **base,
