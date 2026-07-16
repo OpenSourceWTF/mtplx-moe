@@ -420,6 +420,39 @@ def test_island_switch_matches_component_bank_dispatch(tmp_path, mlx) -> None:
         reader.close()
 
 
+def test_scatter_read_survives_more_views_than_iov_max(tmp_path) -> None:
+    """A full island layer scatters into 192 records x 9 views = 1728
+    iovecs; preadv rejects vectors above IOV_MAX (1024 on macOS) with
+    EINVAL, so the reader must slice the vector per syscall."""
+
+    import mtplx.expert_io as expert_io_module
+
+    payload = bytes(range(256)) * 64  # 16 KiB
+    source = tmp_path / "artifact"
+    source.mkdir()
+    (source / "record.bin").write_bytes(payload)
+    reader = PositionalExpertReader(source)
+    try:
+        view_count = expert_io_module._IOV_MAX + 704
+        chunk = len(payload) // view_count
+        assert chunk > 0
+        buffer = bytearray(chunk * view_count)
+        destinations = tuple(
+            memoryview(buffer)[index * chunk : (index + 1) * chunk]
+            for index in range(view_count)
+        )
+        reader._readv_range_into(
+            "record.bin",
+            0,
+            destinations,
+            cancel_event=None,
+            deadline_ns=None,
+        )
+        assert bytes(buffer) == payload[: len(buffer)]
+    finally:
+        reader.close()
+
+
 def test_island_switch_source_is_protocol_free() -> None:
     import inspect
 

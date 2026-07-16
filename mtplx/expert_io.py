@@ -20,6 +20,13 @@ from .expert_manifest import (
     resolve_artifact_member,
 )
 
+try:
+    _IOV_MAX = os.sysconf("SC_IOV_MAX")
+except (ValueError, OSError, AttributeError):
+    _IOV_MAX = 512
+if _IOV_MAX <= 0:
+    _IOV_MAX = 512
+
 
 class ExpertIOError(RuntimeError):
     """Base error for a record that did not reach a complete verified state."""
@@ -438,8 +445,14 @@ class PositionalExpertReader:
                     self._check_cancelled(cancel_event, deadline_ns)
                     try:
                         python_preadv_invocations += 1
+                        # preadv rejects vectors above IOV_MAX with EINVAL;
+                        # the partial-read loop below resumes the remainder.
                         read_now = int(
-                            os.preadv(fd, pending, source_offset + read_total)
+                            os.preadv(
+                                fd,
+                                pending[:_IOV_MAX],
+                                source_offset + read_total,
+                            )
                         )
                     except InterruptedError:
                         continue
