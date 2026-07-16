@@ -483,6 +483,32 @@ def test_device_k_draft_core_is_forwarded_recorded_and_gated(tmp_path: Path) -> 
     assert row["gates"]["compiled_draft_evidence"] is True
 
 
+def test_device_k_capture_commit_qualification_is_explicit(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (3,)}],
+        contexts=(1024,),
+        verify_strategy="capture_commit",
+        draft_core="device-k",
+        apis=apis,
+    )
+
+    assert payload["configuration"]["candidate"] == {
+        "verify_strategy": "capture_commit",
+        "compiled_verify_mode": "off",
+        "draft_core": "device-k",
+        "trace_routes": False,
+    }
+    assert all(call[2]["verify_strategy"] == "capture_commit" for call in calls.mtpk)
+    assert all(call[2]["draft_core"] == "device-k" for call in calls.mtpk)
+    row = payload["models"][0]["observations"][1]
+    assert row["verify_strategy"] == "capture_commit"
+    assert row["draft_core"] == "device-k"
+    assert row["gates"]["compiled_draft_evidence"] is True
+
+
 def test_device_k_draft_core_fails_on_any_silent_fallback(tmp_path: Path) -> None:
     module = _load_module()
     apis, _calls = _fake_apis(module, draft_fallbacks=1)

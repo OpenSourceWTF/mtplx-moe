@@ -1792,6 +1792,7 @@ def _run_observation(
         "effective_depth": effective_depth,
         "mtp_cache_policy": None if depth == 0 else "persistent",
         "mtp_history_policy": None if depth == 0 else "committed",
+        "verify_strategy": None if depth == 0 else verify_strategy,
         "finish_reason": finish_reason,
         "token_ids": tokens,
         "generation_events": _jsonable(_field(stats, "events", [])),

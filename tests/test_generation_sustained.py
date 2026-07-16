@@ -322,6 +322,23 @@ class CompilableRejectAtSecondDepthTinyMTPModel(CompilableCycleTrackingTinyMTPMo
         return logits
 
 
+class CompilableCaptureCommitRejectTinyMTPModel(
+    CompilableRejectAtSecondDepthTinyMTPModel
+):
+    def __init__(self):
+        super().__init__()
+        self.target_cache = [OffsetCache()]
+
+    def make_cache(self):
+        return self.target_cache
+
+    def __call__(self, input_ids, *, cache=None, **kwargs):
+        if cache:
+            for entry in cache:
+                entry.offset += int(input_ids.shape[1])
+        return super().__call__(input_ids, cache=cache, **kwargs)
+
+
 class StopAfterFirstDraftPolicy:
     current_depth = 3
     wants_draft_metrics = False
@@ -884,6 +901,73 @@ def test_device_k_committed_history_reject_rolls_back_exact_live_cache(monkeypat
     assert compiled_cache.offset == stock_cache.offset
     assert mx.array_equal(compiled_cache.keys, stock_cache.keys).item()
     assert mx.array_equal(compiled_cache.values, stock_cache.values).item()
+
+
+def test_device_k_capture_commit_avoids_target_rollback_and_reforward(monkeypatch):
+    import mtplx.generation as generation
+
+    monkeypatch.setattr(generation.mx, "compile", lambda fn: fn)
+    monkeypatch.setenv("MTPLX_LAZY_BONUS_VERIFY", "0")
+
+    def fail_target_rollback(*_args, **_kwargs):
+        raise AssertionError("successful capture commit must not roll target cache back")
+
+    monkeypatch.setattr(generation, "rollback_after_verify", fail_target_rollback)
+    model = CompilableCaptureCommitRejectTinyMTPModel()
+    runtime = _runtime(model, mtp_enabled=True)
+    call_kinds: list[str] = []
+    forward_widths: list[int] = []
+    capture_widths: list[int] = []
+    original_forward = runtime.forward_ar
+
+    def tracked_forward(input_ids, **kwargs):
+        call_kinds.append("forward")
+        forward_widths.append(int(input_ids.shape[1]))
+        return original_forward(input_ids, **kwargs)
+
+    def tracked_capture(input_ids, *, cache=None, return_hidden=False, **kwargs):
+        del kwargs
+        call_kinds.append("capture")
+        capture_widths.append(int(input_ids.shape[1]))
+        result = model(
+            input_ids,
+            cache=cache,
+            return_hidden=return_hidden,
+        )
+        if return_hidden:
+            logits, hidden = result
+            return logits, hidden, {}
+        return result, {}
+
+    runtime.forward_ar = tracked_forward
+    runtime.forward_ar_capture = tracked_capture
+
+    output = generate_mtpk(
+        runtime,
+        [0, 1],
+        max_tokens=4,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=3,
+        mtp_history_policy="committed",
+        verify_strategy="capture_commit",
+        draft_core="device-k",
+        stop_token_ids={0},
+    )
+
+    assert output.tokens == [2, 3, 0]
+    assert capture_widths == [4]
+    assert sum(forward_widths) == 2
+    capture_index = call_kinds.index("capture")
+    assert "forward" not in call_kinds[capture_index + 1 :]
+    assert model.target_cache[0].offset == 4
+    assert output.stats.rollback_time_s == 0.0
+    assert output.stats.repair_time_s == 0.0
+    assert output.stats.capture_commit_time_s > 0.0
+    assert output.stats.events[0]["capture_repair"] == (
+        "captured_prefix_pending_correction"
+    )
+    assert output.stats.events[0]["verify_strategy"] == "capture_commit"
+    assert output.stats.draft_core["selected"] == "device-k"
 
 
 def test_cold_committed_history_reports_exact_rows_and_tps(monkeypatch):
