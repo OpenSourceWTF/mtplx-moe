@@ -1161,12 +1161,32 @@ def reconcile_mlx_memory_cap(
 ) -> int:
     """Resolve the MLX-owned portion and reject a conflicting env cap."""
 
+    mmap_island_bytes = getattr(plan, "mmap_island_bytes", 0)
     mlx_limit = (
-        plan.total_limit_bytes - plan.runtime_reserve_bytes - plan.io_staging_bytes
+        plan.total_limit_bytes
+        - plan.runtime_reserve_bytes
+        - plan.io_staging_bytes
+        - mmap_island_bytes
     )
     if mlx_limit <= 0:
         raise ExpertStreamingConfigurationError(
             "memory plan leaves no MLX allocation budget"
+        )
+    # The mmap island band lives in the page cache, outside MLX accounting.
+    # If MLX's buffer cache may balloon into the band's physical pages the
+    # pager evicts them and every decode wave re-faults from SSD — fail fast
+    # instead. (Measured: 10.85 -> 2.77 tok/s under exactly this squeeze.)
+    wired_need = (
+        plan.fixed_bytes
+        - plan.runtime_reserve_bytes
+        - plan.io_staging_bytes
+        + plan.persistent_cache_bytes
+    )
+    if mmap_island_bytes and mlx_limit < wired_need:
+        raise ExpertStreamingConfigurationError(
+            "MLX budget cannot hold the wired footprint next to the mmap "
+            f"island band: cap {mlx_limit} < wired need {wired_need}; raise "
+            "memory_limit_bytes or shrink the band"
         )
     source = os.environ if env is None else env
     existing = source.get("MTPLX_MEMORY_LIMIT_BYTES")

@@ -382,6 +382,57 @@ def test_runtime_open_rejects_uncovered_mmap_layer(tmp_path) -> None:
         )
 
 
+# ----------------------------------------------------------- memory cap
+
+
+def test_mlx_cap_charges_the_mmap_island_band() -> None:
+    from mtplx.expert_runtime import reconcile_mlx_memory_cap
+
+    spec = _two_layer_spec()
+    band = spec.expert_count * spec.expert_record_bytes
+    plan = plan_expert_memory(spec, mmap_island_layer_count=1, **_plan_kwargs())
+    limit = reconcile_mlx_memory_cap(plan, env={})
+    assert limit == (
+        plan.total_limit_bytes
+        - plan.runtime_reserve_bytes
+        - plan.io_staging_bytes
+        - band
+    )
+    base = plan_expert_memory(spec, **_plan_kwargs())
+    assert reconcile_mlx_memory_cap(base, env={}) == (
+        base.total_limit_bytes
+        - base.runtime_reserve_bytes
+        - base.io_staging_bytes
+    )
+
+
+def test_mlx_cap_rejects_band_squeezing_the_wired_side() -> None:
+    from mtplx.expert_runtime import reconcile_mlx_memory_cap
+
+    spec = _two_layer_spec()
+    band = spec.expert_count * spec.expert_record_bytes
+    tight = plan_expert_memory(
+        spec,
+        island_layer_count=1,
+        mmap_island_layer_count=1,
+        **_plan_kwargs(
+            total_limit_bytes=(
+                spec.resident_bytes
+                + 16 * spec.kv_bytes_per_token
+                + 2 * spec.expert_record_bytes
+                + spec.expert_count * spec.expert_record_bytes
+                + band
+                - 1
+            )
+        ),
+    )
+    assert tight.fits_fixed
+    with pytest.raises(
+        ExpertStreamingConfigurationError, match="wired footprint"
+    ):
+        reconcile_mlx_memory_cap(tight, env={})
+
+
 # ------------------------------------------------------- benchmark gate
 
 
