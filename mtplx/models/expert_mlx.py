@@ -1103,8 +1103,11 @@ class HotExpertSwitchGLU(nn.Module):
                             wave.experts,
                             phase=phase,
                         )
+                    outcome = "all_hit" if ready is not None else "split_route"
+                    _route_probe.count(f"hot.{outcome}")
                     _route_probe.count(
-                        "hot.all_hit" if ready is not None else "hot.split_route"
+                        f"hot.{outcome}.{phase.name.lower()}"
+                        f".layer{self.layer_index:02d}"
                     )
                     if ready is not None:
                         hit_pipeline_work = None
