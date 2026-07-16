@@ -559,8 +559,8 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
     monkeypatch.setattr("mtplx.runtime.validate_mtp_support", lambda _model: True)
     router_bytes = 80 * 192 * 4096 * 2
 
-    def configure_router(target, selector):
-        events.append(("configure-router", target, selector))
+    def configure_router(target, selector, *, sigmoid_mode):
+        events.append(("configure-router", target, selector, sigmoid_mode))
         return {
             "selector": selector,
             "router_count": 80,
@@ -614,6 +614,7 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
         "configure-router",
         model,
         "mpp-r1-fused-r2",
+        "precise",
     )
     assert events.index("artifact-enter") < events.index(tuple_events[1])
     assert events.index(tuple_events[1]) < events.index("allocate")

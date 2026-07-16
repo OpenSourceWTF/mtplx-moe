@@ -20,22 +20,45 @@ from .profiles import (
     PROFILE_CHOICES,
     get_profile,
     list_profiles,
-    resolve_profile_name,
 )
-from .runtime_options import normalize_paged_kv_quantization
 from .version import DISPLAY_VERSION, __version__
+from .cli_app.help import (  # noqa: F401 - compatibility re-exports
+    ADVANCED_COMMANDS,
+    PUBLIC_COMMANDS,
+    _ascii_banner,
+    _color_enabled,
+    _command,
+    _command_cell,
+    _flag_entries_for_action,
+    _flag_section_for_subparser,
+    _format_advanced_help,
+    _format_commands_help,
+    _format_flags_help as _format_flags_help_impl,
+    _format_public_help,
+    _format_start_help,
+    _format_verbose_help,
+    _heading,
+    _help_banner_prefix,
+    _muted,
+    _paint,
+    _parser_command_names,
+    _print_help_topic as _print_help_topic_impl,
+    _print_unknown_command,
+    _shell_banner_already_shown,
+)
+from .cli_app.parsing import (
+    _FlagRecordingArgumentParser,
+    _comma_floats,
+    _explicit_cli_flags,
+    _kv_quant_arg,
+    _positive_int,
+    _profile_arg,
+)
 
 # Help/usage advertises only the canonical profiles; the parser itself
 # resolves through resolve_profile_name so historical aliases that
 # shipped app configs still carry ("auto", "sustained-max") keep working.
 _PROFILE_METAVAR = "{" + ",".join(PROFILE_CHOICES) + "}"
-
-
-def _profile_arg(value: str) -> str:
-    try:
-        return resolve_profile_name(value)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 DEFAULT_TRUTH_MODES = (
@@ -75,450 +98,12 @@ VERIFY_CORE_CHOICES = [
 NATIVE_MTP_60_MODEL = DEFAULT_MODEL_ID
 
 
-PUBLIC_COMMANDS = (
-    ("start", "Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Swival)"),
-    ("tune", "Find the fastest AR/D1/D2/D3 depth for this Mac"),
-    ("help", "Detailed help; `help commands` / `help flags` / `help <name>`"),
-    ("setup", "Prepare config and the model cache"),
-    ("quickstart", "Run the local OpenAI/Anthropic server"),
-    ("connect", "Copy settings for Open WebUI or Claude Code"),
-    ("ask", "Ask the verified local model once"),
-    ("status", "Check install, model, and integration health"),
-    ("stop", "Stop the MTPLX daemon answering on a port"),
-    ("settings", "Get or set live daemon settings"),
-    ("inspect", "Check whether a model is MTPLX-compatible"),
-    ("forge", "Forge, verify, brand, discover, and publish MTP models"),
-    ("hardware", "Inspect Apple Silicon / MLX acceleration eligibility"),
-    ("models", "List models in the local MTPLX cache"),
-)
-
-ADVANCED_COMMANDS = {
-    "Benchmark and QA": (
-        ("bench *", "Nightly gates, no-fan runs, envelope compare"),
-        ("qa *", "Exactness and distribution gates"),
-        ("profile *", "Dispatch, thermal, compile, and eval attribution"),
-    ),
-    "Support": (
-        ("doctor --deep", "Deep install and integration checks"),
-        ("debug bundle", "Redacted support bundle"),
-        ("metrics watch", "Live server metrics view"),
-    ),
-    "Models": (
-        ("pull", "Download a model into the cache"),
-        ("forge *", "Forge and publish MTPLX-branded MTP artifacts"),
-        ("models", "List local cached models"),
-        ("model architectures", "Architecture support matrix"),
-        ("model publish-check", "HF staging readiness"),
-    ),
-    "Kernel Lab": (
-        ("debug hotpath", "Next verify-cycle boundary map"),
-        ("runtime-smoke", "Load/inject/generate smoke"),
-        ("verify-profile", "Target verify section timings"),
-        ("mtp-depth-sweep", "Native-MTP depth sweep"),
-    ),
-}
-
-
-def _color_enabled() -> bool:
-    return (
-        sys.stdout.isatty()
-        and os.environ.get("NO_COLOR") is None
-        and os.environ.get("MTPLX_NO_COLOR") not in {"1", "true", "TRUE", "yes"}
-    )
-
-
-def _paint(text: str, code: str) -> str:
-    if not _color_enabled():
-        return text
-    return f"\033[{code}m{text}\033[0m"
-
-
-def _heading(text: str) -> str:
-    return _paint(text, "1;36")
-
-
-def _command(text: str) -> str:
-    return _paint(text, "1;33")
-
-
-def _muted(text: str) -> str:
-    return _paint(text, "2")
-
-
-def _command_cell(text: str, width: int) -> str:
-    return _command(text) + " " * max(1, width - len(text))
-
-
-def _ascii_banner() -> str:
-    """Inline copy of the MTPLX ASCII banner.
-
-    Duplicated here (rather than importing ``mtplx.ui.banner``) so the
-    top-level help survives even when ``rich`` and the rest of the runtime
-    stack are not installed yet.
-    """
-
-    rows = [
-        "███╗   ███╗ ████████╗ ██████╗  ██╗      ██╗  ██╗",
-        "████╗ ████║ ╚══██╔══╝ ██╔══██╗ ██║      ╚██╗██╔╝",
-        "██╔████╔██║    ██║    ██████╔╝ ██║       ╚███╔╝ ",
-        "██║╚██╔╝██║    ██║    ██╔═══╝  ██║       ██╔██╗ ",
-        "██║ ╚═╝ ██║    ██║    ██║      ███████╗ ██╔╝ ██╗",
-        "╚═╝     ╚═╝    ╚═╝    ╚═╝      ╚══════╝ ╚═╝  ╚═╝",
-    ]
-    return "\n".join("  " + _paint(line, "1;36") for line in rows)
-
-
-def _shell_banner_already_shown() -> bool:
-    value = os.environ.get("MTPLX_SHELL_BANNER_SHOWN") or os.environ.get("MTPLX_NO_BANNER")
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _help_banner_prefix() -> str:
-    if _shell_banner_already_shown():
-        return ""
-    return f"{_ascii_banner()}\n\n"
-
-
-def _format_public_help() -> str:
-    command_lines = "\n".join(
-        f"  {_command_cell(name, 12)} {summary}" for name, summary in PUBLIC_COMMANDS
-    )
-    version_line = _muted(f"v{DISPLAY_VERSION}  ·  Native MTP speculative decoding on Apple Silicon")
-    footer = _muted(
-        "more: `mtplx help <command>` · `mtplx help advanced` · `mtplx --help` · `mtplx --version`"
-    )
-    return f"""{_help_banner_prefix()}  {version_line}
-
-{_heading("Commands")}
-{command_lines}
-
-{_heading("Examples")}
-  mtplx start                       Interactive setup, then chat
-  mtplx start --fresh               Re-run the onboarding (new model/mode/surface)
-  mtplx start --max --port 8000       Sustained Max browser chat with fan boost
-  mtplx start pi --port 8000           Configure Pi, then start the local server
-  mtplx start opencode --port 18083    Configure OpenCode Desktop for MTPLX-owned generation
-  mtplx start swival --port 18084      Print Swival generic-provider command
-  mtplx start hermes --port 18085      Launch Hermes Agent against MTPLX
-  mtplx quickstart --profile sustained --port 8000  API server only, no chat
-
-  {footer}
-"""
-
-
-def _format_advanced_help() -> str:
-    sections: list[str] = []
-    for title, commands in ADVANCED_COMMANDS.items():
-        sections.append(f"{_heading(title)}:")
-        sections.extend(
-            f"  {_command_cell(command, 28)} {summary}" for command, summary in commands
-        )
-    return f"""{_heading("MTPLX advanced tools")}
-
-Usage: mtplx <command> [options]
-
-Commands suffixed with * have subcommands. Run `mtplx help <command>` for details.
-The everyday path is start first. Servers, integrations, QA, and kernels live here when needed.
-
-""" + "\n".join(sections) + """
-
-Examples:
-  mtplx bench nightly --json --dry-run
-  mtplx doctor --deep
-  mtplx model architectures
-  mtplx debug hotpath
-
-Docs: README.md
-"""
-
-
-def _format_start_help() -> str:
-    return f"""{_heading("MTPLX start")}
-
-Interactive end-to-end setup. On first run MTPLX walks you through three
-quick choices: model, runtime mode, and where to chat (browser, terminal, Pi, OpenCode, Swival, or Hermes).
-On later runs it offers "same as last time?" so the chat is one keypress away.
-
-What gets asked:
-  1. Model — your configured model, the verified default, custom HF, or local
-  2. Mode  — Sustained, Turbo, Sustained Max, or Burst (Stable remains available via --profile safe)
-  3. Where — Web UI (default), terminal CLI, Pi, OpenCode Desktop, Swival, or Hermes
-
-Power-user shortcuts (any of these skip the onboarding wizard):
-  mtplx start --fresh                 Walk the onboarding again from scratch
-  mtplx start cli                     Skip onboarding; terminal chat directly
-  mtplx start pi                      Configure Pi, then serve MTPLX for Pi
-  mtplx start opencode --port 18083   Configure OpenCode Desktop for MTPLX-owned generation
-  mtplx start swival --port 18084     Serve MTPLX and print the Swival command
-  mtplx start hermes --port 18085     Serve MTPLX and open Hermes Agent in Terminal
-  mtplx start --max                   Sustained Max: long-context mode with ThermalForge fan boost
-  mtplx start --profile performance-cold --max
-                                      Burst: old max-fan lane, max 8K context
-  mtplx start --download              Pull the verified model from HF first
-  mtplx start --model /path/...       Use a specific local or HF model
-  mtplx start --prompt "hi"           One-shot ask and exit (non-interactive)
-  mtplx start cli --no-mtp            Use target-only AR generation
-
-Useful controls:
-  --download       Download the selected/default model if missing
-  --model PATH     Use a local model folder or HF repo id
-  --profile sustained
-                  Use the explicit long-context memory-safe native-MTP profile
-  --profile safe   Use the compatibility long-response profile
-  --mtp            Use native-MTP speculative generation (default)
-  --no-mtp         Use target-only AR generation; MTP can be turned back on
-  --prompt TEXT    (cli) Ask once and exit instead of opening chat
-  --max-tokens N   (cli) Optional response cap; default uses remaining context
-  --no-stats       Hide the TPS footer
-  --dry-run        Preview without loading MLX
-
-Inside terminal chat:
-  /mtp status      Show whether the next turn uses MTP or AR
-  /mtp off         Switch the next turn to target-only AR generation
-  /mtp on          Switch the next turn back to MTP without reloading
-  /stats           Print the last response stats again
-  /speed           Run a 192-token comparison sample
-  /exit            Quit
-
-Aliases:
-  `web` and `openwebui` -> browser chat (same as default)
-  `terminal`            -> terminal chat (same as `cli`)
-  `pi`                  -> Pi coding-agent connection
-  `opencode`, `oc`      -> OpenCode Desktop coding-agent connection
-  `swival`, `sv`        -> Swival generic-provider connection
-  `hermes`              -> Hermes Agent with terminal/file/web/browser/messaging tools
-"""
-
-
-def _format_verbose_help() -> str:
-    """Verbose help printed by `mtplx help` (no topic).
-
-    The bare ``mtplx`` invocation prints the compact help; ``mtplx help``
-    prints this fuller version with options, more examples, and pointers to
-    every help subtopic (``commands``, ``flags``, ``advanced``, ``<command>``).
-    """
-
-    public_lines = "\n".join(
-        f"  {_command_cell(name, 12)} {summary}" for name, summary in PUBLIC_COMMANDS
-    )
-    return f"""{_help_banner_prefix()}  {_muted(f"v{DISPLAY_VERSION}  ·  Native MTP speculative decoding on Apple Silicon")}
-
-{_heading("Overview")}
-
-  Open the local chat in your browser, or chat in this terminal. Inference
-  parameters (temperature, top-p, top-k, draft depth, max tokens) live in the
-  browser sidebar and persist across sessions. The OpenAI/Anthropic-compatible
-  server comes up the same way.
-
-{_heading("Usage")}
-
-  mtplx [options] [command] [command-options]
-
-{_heading("Options")}
-
-  --version        Show the installed version
-  --no-color       Disable terminal colors
-  -h, --help       Compact help (this view is the verbose one)
-
-{_heading("Commands (consumer surface)")}
-{public_lines}
-
-{_heading("Examples")}
-
-  mtplx start                       Open the local chat in your browser
-  mtplx start cli                   Chat in this terminal instead
-  mtplx start --download            Pull the verified model from Hugging Face
-  mtplx quickstart --profile sustained --port 8000  Run the API server only
-  mtplx connect openwebui           Print Open WebUI integration settings
-  mtplx ask "Write a tiny FastAPI app"
-  mtplx inspect Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed
-
-{_heading("Help subtopics")}
-
-  mtplx help commands         Every command across the consumer + advanced surface
-  mtplx help flags            Every flag, grouped by command
-  mtplx help advanced         Benchmarks, QA, publishing, and kernel tools
-  mtplx help <command>        Detailed flags for one command (argparse view)
-  mtplx help start            The start user journey
-
-  Docs: README.md
-"""
-
-
-def _format_commands_help() -> str:
-    """Print the full list of commands across public and advanced surfaces."""
-
-    public_lines = "\n".join(
-        f"  {_command_cell(name, 16)} {summary}" for name, summary in PUBLIC_COMMANDS
-    )
-    advanced_sections: list[str] = []
-    for title, commands in ADVANCED_COMMANDS.items():
-        advanced_sections.append(_heading(title))
-        advanced_sections.extend(
-            f"  {_command_cell(command, 28)} {summary}" for command, summary in commands
-        )
-        advanced_sections.append("")
-    return f"""{_heading("MTPLX commands")}
-
-{_heading("Consumer commands")}
-{public_lines}
-
-""" + "\n".join(advanced_sections) + f"""
-  {_muted("Run `mtplx help <command>` for flags on any command above.")}
-"""
-
-
 def _format_flags_help() -> str:
-    """Walk argparse subparsers and print every flag under every command."""
-
-    parser = build_parser()
-    sections: list[str] = []
-    sections.append(_heading("MTPLX flags"))
-    sections.append("")
-    sections.append("  Top-level options:")
-    for action in parser._actions:
-        for entry in _flag_entries_for_action(action):
-            sections.append(f"    {entry}")
-    sections.append("")
-
-    for sub in parser._actions:
-        if not isinstance(sub, argparse._SubParsersAction):
-            continue
-        for command_name, sub_parser in sorted(sub.choices.items(), key=lambda item: item[0]):
-            command_section = _flag_section_for_subparser(command_name, sub_parser, depth=0)
-            if command_section:
-                sections.extend(command_section)
-                sections.append("")
-
-    sections.append(_muted("  Run `mtplx help <command>` for the argparse view of one command."))
-    return "\n".join(sections) + "\n"
-
-
-def _flag_entries_for_action(action: argparse.Action) -> list[str]:
-    if isinstance(action, (argparse._SubParsersAction, argparse._HelpAction)):
-        return []
-    if not action.option_strings:
-        return []
-    flags = ", ".join(action.option_strings)
-    metavar = ""
-    if action.nargs not in (0, None) or isinstance(
-        action,
-        (argparse._StoreAction, argparse._AppendAction),
-    ):
-        if not isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction, argparse._CountAction)):
-            metavar = " " + (action.metavar or action.dest.upper())
-    summary = (action.help or "").replace("\n", " ").strip()
-    line = f"{flags}{metavar}"
-    if summary:
-        line = f"{line:<28}  {summary}"
-    return [line]
-
-
-def _flag_section_for_subparser(
-    command_name: str,
-    sub_parser: argparse.ArgumentParser,
-    *,
-    depth: int,
-) -> list[str]:
-    indent = "  " * (depth + 1)
-    lines: list[str] = []
-    flag_lines: list[str] = []
-    nested_sections: list[list[str]] = []
-    for action in sub_parser._actions:
-        if isinstance(action, argparse._SubParsersAction):
-            for nested_name, nested_parser in sorted(action.choices.items(), key=lambda item: item[0]):
-                nested = _flag_section_for_subparser(
-                    f"{command_name} {nested_name}",
-                    nested_parser,
-                    depth=depth + 1,
-                )
-                if nested:
-                    nested_sections.append(nested)
-            continue
-        for entry in _flag_entries_for_action(action):
-            flag_lines.append(f"{indent}    {entry}")
-    if not flag_lines and not nested_sections:
-        return []
-    lines.append(f"{indent}{_command(command_name)}")
-    lines.extend(flag_lines)
-    for section in nested_sections:
-        lines.extend(section)
-    return lines
+    return _format_flags_help_impl(build_parser)
 
 
 def _print_help_topic(topic: str | None, parser: argparse.ArgumentParser) -> int:
-    if topic in (None, ""):
-        print(_format_verbose_help())
-        return 0
-    if topic in ("commands", "all-commands"):
-        print(_format_commands_help())
-        return 0
-    if topic in ("flags", "options", "all-flags"):
-        print(_format_flags_help())
-        return 0
-    if topic == "start":
-        print(_format_start_help())
-        return 0
-    if topic in ("advanced", "expert", "lab"):
-        print(_format_advanced_help())
-        return 0
-    command_names = _parser_command_names(parser)
-    if topic in command_names:
-        try:
-            parser.parse_args([topic, "--help"])
-        except SystemExit as exc:
-            return int(exc.code or 0)
-        return 0
-    print(f"Unknown help topic: {topic}\n")
-    print(_format_verbose_help())
-    return 2
-
-
-def _parser_command_names(parser: argparse.ArgumentParser) -> set[str]:
-    for action in parser._actions:
-        if isinstance(action, argparse._SubParsersAction):
-            return set(action.choices)
-    return set()
-
-
-def _print_unknown_command(command: str) -> int:
-    print(f"Unknown command: {_command(command)}\n")
-    print("Try:")
-    for name, summary in PUBLIC_COMMANDS:
-        print(f"  mtplx {_command_cell(name, 10)} {summary}")
-    print("\nFor the full lab surface: mtplx help advanced")
-    return 2
-
-
-def _comma_floats(value: str) -> tuple[float, ...]:
-    parts = [part.strip() for part in value.split(",") if part.strip()]
-    if not parts:
-        raise argparse.ArgumentTypeError("expected comma-separated floats")
-    try:
-        return tuple(float(part) for part in parts)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from exc
-
-
-def _positive_int(value: str) -> int:
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from exc
-    if parsed < 1:
-        raise argparse.ArgumentTypeError("must be >= 1")
-    return parsed
-
-
-def _kv_quant_arg(value: str) -> str:
-    try:
-        normalized = normalize_paged_kv_quantization(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from exc
-    assert normalized is not None
-    return normalized
-
-
+    return _print_help_topic_impl(topic, parser, build_parser)
 def _add_reasoning_arg(parser: argparse.ArgumentParser, *, default: str | None = None) -> None:
     parser.add_argument(
         "--reasoning",
@@ -612,6 +197,12 @@ def _add_mtp_toggle_args(parser: argparse.ArgumentParser) -> None:
             "where live switching is supported."
         ),
     )
+
+
+def _add_generic_settings_args(parser: argparse.ArgumentParser) -> None:
+    from .settings.argparse import add_settings_options
+
+    add_settings_options(parser)
 
 
 def _add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
@@ -739,25 +330,37 @@ def _add_adaptive_args(parser: argparse.ArgumentParser) -> None:
 
 
 def cmd_bench_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_bench_public as handler
+    from .commands.benchmarks import cmd_bench_public as handler
 
     return handler(args)
 
 
 def cmd_tune_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_tune_public as handler
+    from .commands.benchmarks import cmd_tune_public as handler
 
     return handler(args)
 
 
 def cmd_stop_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_stop_public as handler
+    from .commands.support import cmd_stop_public as handler
 
     return handler(args)
 
 
 def cmd_settings_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_settings_public as handler
+    from .commands.settings import cmd_settings_public as handler
+
+    return handler(args)
+
+
+def cmd_settings(args: argparse.Namespace) -> int:
+    from .commands.settings import cmd_settings as handler
+
+    return handler(args)
+
+
+def cmd_lab(args: argparse.Namespace) -> int:
+    from .commands.lab import cmd_lab as handler
 
     return handler(args)
 
@@ -787,97 +390,97 @@ def cmd_hardware_public(args: argparse.Namespace) -> int:
 
 
 def cmd_chat_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_chat_public as handler
+    from .commands.runtime import cmd_chat_public as handler
 
     return handler(args)
 
 
 def cmd_quickstart_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_quickstart_public as handler
+    from .commands.runtime import cmd_quickstart_public as handler
 
     return handler(args)
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_doctor as handler
+    from .commands.support import cmd_doctor as handler
 
     return handler(args)
 
 
 def cmd_inspect_model_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_inspect_model_public as handler
+    from .commands.models import cmd_inspect_model_public as handler
 
     return handler(args)
 
 
 def cmd_profile_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_profile_public as handler
+    from .commands.benchmarks import cmd_profile_public as handler
 
     return handler(args)
 
 
 def cmd_pull_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_pull_public as handler
+    from .commands.models import cmd_pull_public as handler
 
     return handler(args)
 
 
 def cmd_list_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_list_public as handler
+    from .commands.models import cmd_list_public as handler
 
     return handler(args)
 
 
 def cmd_remove_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_remove_public as handler
+    from .commands.models import cmd_remove_public as handler
 
     return handler(args)
 
 
 def cmd_run_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_run_public as handler
+    from .commands.runtime import cmd_run_public as handler
 
     return handler(args)
 
 
 def cmd_qa_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_qa_public as handler
+    from .commands.benchmarks import cmd_qa_public as handler
 
     return handler(args)
 
 
 def cmd_serve_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_serve_public as handler
+    from .commands.runtime import cmd_serve_public as handler
 
     return handler(args)
 
 
 def cmd_thermal_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_thermal_public as handler
+    from .commands.benchmarks import cmd_thermal_public as handler
 
     return handler(args)
 
 
 def cmd_max_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_max_public as handler
+    from .commands.benchmarks import cmd_max_public as handler
 
     return handler(args)
 
 
 def cmd_debug_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_debug_public as handler
+    from .commands.support import cmd_debug_public as handler
 
     return handler(args)
 
 
 def cmd_openwebui_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_openwebui_public as handler
+    from .commands.integrations import cmd_openwebui_public as handler
 
     return handler(args)
 
 
 def cmd_dashboard_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_dashboard_public as handler
+    from .commands.integrations import cmd_dashboard_public as handler
 
     return handler(args)
 
@@ -889,19 +492,19 @@ def cmd_metrics_public(args: argparse.Namespace) -> int:
 
 
 def cmd_integrate_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_integrate_public as handler
+    from .commands.integrations import cmd_integrate_public as handler
 
     return handler(args)
 
 
 def cmd_model_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_model_public as handler
+    from .commands.models import cmd_model_public as handler
 
     return handler(args)
 
 
 def cmd_config_public(args: argparse.Namespace) -> int:
-    from .commands.public import cmd_config_public as handler
+    from .commands.models import cmd_config_public as handler
 
     return handler(args)
 
@@ -1837,24 +1440,6 @@ def _cmd_session_bank(args: argparse.Namespace) -> int:
     return 0 if result["exact"] else 2
 
 
-class _FlagRecordingArgumentParser(argparse.ArgumentParser):
-    """Root parser that always records which flags were actually typed.
-
-    Measured-default and override helpers key off ``args._cli_flags`` to
-    distinguish user intent from values written onto the namespace by
-    internal default appliers. Recording the flags inside ``parse_args``
-    keeps that signal correct for every caller (cli.main, tests, and
-    programmatic invocations), not just the console entry point.
-    """
-
-    def parse_args(self, args=None, namespace=None):  # type: ignore[override]
-        raw = list(sys.argv[1:]) if args is None else list(args)
-        parsed = super().parse_args(raw, namespace)
-        if not hasattr(parsed, "_cli_flags"):
-            parsed._cli_flags = _explicit_cli_flags(raw)
-        return parsed
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = _FlagRecordingArgumentParser(prog="mtplx")
     parser.add_argument(
@@ -1877,6 +1462,23 @@ def build_parser() -> argparse.ArgumentParser:
     advanced_p = sub.add_parser("advanced", help=argparse.SUPPRESS)
     advanced_p.set_defaults(func=lambda _args: (print(_format_advanced_help()) or 0))
 
+    lab_p = sub.add_parser("lab", help="Inspect validated experiment settings recipes")
+    lab_sub = lab_p.add_subparsers(dest="lab_action", required=True)
+    lab_list_p = lab_sub.add_parser("list", help="List active experiment recipes")
+    lab_list_p.add_argument("--all", action="store_true")
+    lab_list_p.add_argument("--json", action="store_true")
+    lab_list_p.set_defaults(func=cmd_lab)
+    lab_show_p = lab_sub.add_parser("show", help="Show an active experiment recipe")
+    lab_show_p.add_argument("experiment_id")
+    lab_show_p.add_argument("--json", action="store_true")
+    lab_show_p.set_defaults(func=cmd_lab)
+    lab_validate_p = lab_sub.add_parser(
+        "validate", help="Validate a data-only experiment recipe file"
+    )
+    lab_validate_p.add_argument("path")
+    lab_validate_p.add_argument("--json", action="store_true")
+    lab_validate_p.set_defaults(func=cmd_lab)
+
     hardware_p = sub.add_parser("hardware", help="Inspect local Apple Silicon hardware")
     hardware_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     hardware_p.set_defaults(func=cmd_hardware_public, hardware_action="inspect")
@@ -1894,6 +1496,7 @@ def build_parser() -> argparse.ArgumentParser:
         usage="mtplx start [cli|web|pi|opencode|swival|hermes|dashboard] [--fresh] [--max] [--profile sustained] [--model PATH_OR_REPO] [--prompt TEXT]",
         description="Walk through model / mode / surface in three quick steps, then chat. Returning users get a 'same as last time?' prompt. Use --fresh to redo the onboarding, or pass any of --model / --profile / --max / cli|web|pi|opencode|swival|hermes|dashboard to skip it entirely.",
     )
+    _add_generic_settings_args(start_flow_p)
     start_flow_p.add_argument(
         "target",
         nargs="?",
@@ -2046,26 +1649,110 @@ def build_parser() -> argparse.ArgumentParser:
 
     settings_p = sub.add_parser(
         "settings",
-        help="Read or change live MTPLX server settings",
-    )
-    settings_p.add_argument(
-        "settings_action",
-        nargs="?",
-        choices=["get", "set"],
-        default="get",
-        help="get prints current settings; set applies key=value pairs.",
-    )
-    settings_p.add_argument(
-        "pairs",
-        nargs="*",
-        help="key=value pairs for set, e.g. depth=2 reasoning=off",
+        help="Inspect and change MTPLX settings",
     )
     settings_p.add_argument("--host", default="127.0.0.1")
     settings_p.add_argument("--port", type=int, default=8000)
     settings_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    settings_p.set_defaults(func=cmd_settings_public)
+    settings_p.set_defaults(
+        func=cmd_settings_public,
+        settings_action="get",
+        pairs=[],
+    )
+    settings_sub = settings_p.add_subparsers(dest="settings_command")
+
+    settings_show_p = settings_sub.add_parser(
+        "show", help="Show effective settings and their winning sources"
+    )
+    settings_show_p.add_argument("--config")
+    settings_show_p.add_argument("--json", action="store_true")
+    settings_show_p.set_defaults(
+        func=cmd_settings,
+        settings_scope="effective",
+        settings_operation="show",
+    )
+
+    settings_list_p = settings_sub.add_parser(
+        "list", help="List canonical settings and metadata"
+    )
+    settings_list_p.add_argument("--group", dest="settings_group")
+    settings_list_p.add_argument(
+        "--visibility",
+        choices=["public", "advanced", "experimental", "internal"],
+    )
+    settings_list_p.add_argument("--json", action="store_true")
+    settings_list_p.set_defaults(
+        func=cmd_settings,
+        settings_scope="catalog",
+        settings_operation="list",
+    )
+
+    settings_explain_p = settings_sub.add_parser(
+        "explain", help="Explain one effective setting and its provenance"
+    )
+    settings_explain_p.add_argument("name")
+    settings_explain_p.add_argument("--config")
+    settings_explain_p.add_argument("--json", action="store_true")
+    settings_explain_p.set_defaults(
+        func=cmd_settings,
+        settings_scope="effective",
+        settings_operation="explain",
+    )
+
+    settings_user_p = settings_sub.add_parser(
+        "user", help="Read or change persisted user settings"
+    )
+    settings_user_sub = settings_user_p.add_subparsers(
+        dest="settings_operation", required=True
+    )
+    settings_user_show_p = settings_user_sub.add_parser("show")
+    settings_user_show_p.add_argument("--config")
+    settings_user_show_p.add_argument("--json", action="store_true")
+    settings_user_show_p.set_defaults(func=cmd_settings, settings_scope="user")
+    settings_user_set_p = settings_user_sub.add_parser("set")
+    settings_user_set_p.add_argument("pairs", nargs="+")
+    settings_user_set_p.add_argument("--config")
+    settings_user_set_p.add_argument("--json", action="store_true")
+    settings_user_set_p.set_defaults(func=cmd_settings, settings_scope="user")
+    settings_user_unset_p = settings_user_sub.add_parser("unset")
+    settings_user_unset_p.add_argument("names", nargs="+")
+    settings_user_unset_p.add_argument("--config")
+    settings_user_unset_p.add_argument("--json", action="store_true")
+    settings_user_unset_p.set_defaults(func=cmd_settings, settings_scope="user")
+
+    settings_live_p = settings_sub.add_parser(
+        "live", help="Read or change a running daemon"
+    )
+    settings_live_sub = settings_live_p.add_subparsers(
+        dest="settings_operation", required=True
+    )
+    settings_live_show_p = settings_live_sub.add_parser("show")
+    settings_live_show_p.add_argument("--host", default="127.0.0.1")
+    settings_live_show_p.add_argument("--port", type=int, default=8000)
+    settings_live_show_p.add_argument("--json", action="store_true")
+    settings_live_show_p.set_defaults(func=cmd_settings, settings_scope="live")
+    settings_live_set_p = settings_live_sub.add_parser("set")
+    settings_live_set_p.add_argument("pairs", nargs="+")
+    settings_live_set_p.add_argument("--host", default="127.0.0.1")
+    settings_live_set_p.add_argument("--port", type=int, default=8000)
+    settings_live_set_p.add_argument("--json", action="store_true")
+    settings_live_set_p.set_defaults(func=cmd_settings, settings_scope="live")
+
+    # Compatibility commands intentionally keep their historical Namespace
+    # shape because callers may invoke the live handler programmatically.
+    for action in ("get", "set"):
+        legacy_p = settings_sub.add_parser(action, help=argparse.SUPPRESS)
+        legacy_p.add_argument("pairs", nargs="*")
+        legacy_p.add_argument("--host", default="127.0.0.1")
+        legacy_p.add_argument("--port", type=int, default=8000)
+        legacy_p.add_argument("--json", action="store_true")
+        legacy_p.set_defaults(
+            func=cmd_settings_public,
+            settings_action=action,
+        )
 
     ask_p = sub.add_parser("ask", help="Ask the verified local MTPLX model one question")
+    _add_generic_settings_args(ask_p)
     ask_p.add_argument("prompt_arg", nargs="?", help="Prompt text")
     ask_p.add_argument("--model", default=default_model)
     ask_p.add_argument("--cache-dir")
@@ -2101,6 +1788,7 @@ def build_parser() -> argparse.ArgumentParser:
         aliases=["quick-start"],
         help="Start the local MTPLX server",
     )
+    _add_generic_settings_args(quickstart_server_p)
     quickstart_server_p.add_argument("--model", default=default_model)
     quickstart_server_p.add_argument("--cache-dir")
     quickstart_server_p.add_argument(
@@ -2438,6 +2126,7 @@ def build_parser() -> argparse.ArgumentParser:
     remove_p.set_defaults(func=cmd_remove_public)
 
     run_p = sub.add_parser("run", help="Run a one-shot verified MTPLX completion")
+    _add_generic_settings_args(run_p)
     run_p.add_argument("prompt_arg", nargs="?", help="Prompt text")
     run_p.add_argument("--model", default=default_model)
     run_p.add_argument("--cache-dir")
@@ -2470,6 +2159,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.set_defaults(func=cmd_run_public)
 
     chat_p = sub.add_parser("chat", help="Run one native-MTP chat smoke generation")
+    _add_generic_settings_args(chat_p)
     chat_p.add_argument("--model", default=default_model)
     chat_p.add_argument("--cache-dir")
     chat_p.add_argument("--profile", type=_profile_arg, metavar=_PROFILE_METAVAR, default=DEFAULT_PROFILE_NAME)
@@ -2499,6 +2189,7 @@ def build_parser() -> argparse.ArgumentParser:
     chat_p.set_defaults(func=cmd_chat_public)
 
     serve_p = sub.add_parser("serve", help="Choose model/mode, then start the OpenAI-compatible MTPLX server")
+    _add_generic_settings_args(serve_p)
     serve_p.add_argument("--model", default=default_model)
     serve_p.add_argument("--cache-dir")
     serve_p.add_argument(
@@ -2698,6 +2389,7 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_p.set_defaults(func=_cmd_inspect_model)
 
     bench_p = sub.add_parser("bench", help="Run benchmark harness")
+    _add_generic_settings_args(bench_p)
     bench_p.add_argument(
         "bench_action",
         nargs="?",
@@ -3806,6 +3498,26 @@ def build_parser() -> argparse.ArgumentParser:
     session_p.add_argument("--output")
     session_p.set_defaults(func=_cmd_session_bank)
 
+    from .cli_app.groups.benchmarks import (
+        BenchmarkGroupContext,
+        register_benchmark_commands,
+    )
+    from .cli_app.groups.models import ModelGroupContext, register_model_commands
+    from .cli_app.groups.operations import (
+        OperationsGroupContext,
+        register_operations_commands,
+    )
+    from .cli_app.groups.product import ProductGroupContext, register_product_commands
+
+    register_product_commands(sub, ProductGroupContext(default_model=default_model))
+    register_model_commands(sub, ModelGroupContext(default_model=default_model))
+    register_operations_commands(
+        sub, OperationsGroupContext(default_model=default_model)
+    )
+    register_benchmark_commands(
+        sub, BenchmarkGroupContext(default_model=default_model)
+    )
+
     return parser
 
 
@@ -3817,6 +3529,12 @@ def main(argv: list[str] | None = None) -> int:
     if not raw_args or raw_args[0] in ("-h", "--help"):
         print(_format_public_help())
         return 0
+    if (
+        len(raw_args) > 1
+        and raw_args[0] == "settings"
+        and "=" in raw_args[1]
+    ):
+        raw_args.insert(1, "set")
     parser = build_parser()
     if raw_args[0] == "help":
         return _print_help_topic(raw_args[1] if len(raw_args) > 1 else None, parser)
@@ -3831,33 +3549,20 @@ def main(argv: list[str] | None = None) -> int:
     from .config import apply_user_config
 
     apply_user_config(args)
+    if hasattr(args, "setting_overrides"):
+        from .settings.argparse import resolve_args_settings
+
+        try:
+            resolve_args_settings(args)
+        except (OSError, ValueError) as exc:
+            print(f"error: {exc}")
+            return 2
     return int(args.func(args))
 
 
 def main_tune(argv: list[str] | None = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
     return main(["tune", *raw_args])
-
-
-def _explicit_cli_flags(raw_args: list[str]) -> set[str]:
-    """Return the set of long/short flag names actually typed on the CLI.
-
-    This is the only reliable signal for "did the user type ``--model``?"
-    because parser defaults and ``apply_user_config`` both write onto the
-    parsed Namespace, masking the user's actual intent. Used by the quickstart
-    onboarding to know when to fall through to the interactive flow.
-    """
-
-    flags: set[str] = set()
-    for token in raw_args:
-        if not token.startswith("-") or token == "-" or token == "--":
-            continue
-        head = token.split("=", 1)[0]
-        if head.startswith("--"):
-            flags.add(head[2:])
-        else:
-            flags.add(head[1:])
-    return flags
 
 
 if __name__ == "__main__":

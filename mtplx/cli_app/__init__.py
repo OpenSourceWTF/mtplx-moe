@@ -1,0 +1,1 @@
+"""Lightweight CLI composition package."""

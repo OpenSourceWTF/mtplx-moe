@@ -1,0 +1,35 @@
+MTPLX advanced tools
+
+Usage: mtplx <command> [options]
+
+Commands suffixed with * have subcommands. Run `mtplx help <command>` for details.
+The everyday path is start first. Servers, integrations, QA, and kernels live here when needed.
+
+Benchmark and QA:
+  bench *                      Nightly gates, no-fan runs, envelope compare
+  qa *                         Exactness and distribution gates
+  profile *                    Dispatch, thermal, compile, and eval attribution
+Support:
+  doctor --deep                Deep install and integration checks
+  debug bundle                 Redacted support bundle
+  metrics watch                Live server metrics view
+Models:
+  pull                         Download a model into the cache
+  forge *                      Forge and publish MTPLX-branded MTP artifacts
+  models                       List local cached models
+  model architectures          Architecture support matrix
+  model publish-check          HF staging readiness
+Kernel Lab:
+  debug hotpath                Next verify-cycle boundary map
+  runtime-smoke                Load/inject/generate smoke
+  verify-profile               Target verify section timings
+  mtp-depth-sweep              Native-MTP depth sweep
+
+Examples:
+  mtplx bench nightly --json --dry-run
+  mtplx doctor --deep
+  mtplx model architectures
+  mtplx debug hotpath
+
+Docs: README.md
+

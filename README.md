@@ -12,101 +12,108 @@
 
 </div>
 
-MTPLX is a native Mac app and a command line for running local language models with multi-token prediction. Modern models like Qwen 3.5/3.6 ship with built-in MTP heads. Almost no runtime uses them. MTPLX does: the model drafts several tokens ahead of itself, verifies them in one batched forward pass, and keeps only what passes exact rejection sampling. Same model, same output distribution, measured 1.6x faster on a 16 GB M4 Mac mini and 2.24x on an M5 Max.
+MTPLX is a native Mac app and command line for running local language models
+with multi-token prediction. Modern Qwen 3.5/3.6 models ship with built-in MTP
+heads; MTPLX uses them to draft ahead, verify in one batched forward pass, and
+keep only tokens that pass exact rejection sampling. Same model, same output
+distribution, measured 1.6x faster on a 16 GB M4 Mac mini and 2.24x on an M5
+Max.
 
-There is no second draft model eating your RAM, and no greedy shortcut that quietly changes what the model would have said at real sampling settings. The acceptance math is the Leviathan and Chen rejection sampling theorem with residual correction, so `temperature=0.6, top_p=0.95` behaves exactly like normal decoding, just faster.
+There is no second draft model eating RAM and no greedy shortcut that changes
+what the model would have said at real sampling settings. The acceptance math
+is the Leviathan and Chen rejection sampling theorem with residual correction,
+so `temperature=0.6, top_p=0.95` behaves like normal decoding, just faster.
 
 ## Get it
 
-**The Mac app** is the easiest way in. Download the DMG at [mtplx.com](https://mtplx.com/download), drag it to Applications, and the app takes care of everything else: it checks your hardware, recommends a model that actually fits your memory, downloads it, sets up its own Python engine (no Homebrew needed), installs fan control, puts `mtplx` on your PATH, and then measures your machine to pick the fastest decoding depth.
+**The Mac app** is the easiest route. Download the DMG at
+[mtplx.com](https://mtplx.com/download), drag it to Applications, and the app
+checks hardware, recommends and downloads a model that fits, installs its own
+Python engine, configures fan control, puts `mtplx` on `PATH`, and tunes draft
+depth on the Mac.
 
-**The CLI** on its own:
+**The CLI**:
 
 ```bash
 brew install youssofal/mtplx/mtplx
+```
+
+Pip also works: `python3 -m pip install mtplx`. Releases are listed at
+[mtplx.com/releases](https://mtplx.com/releases/).
+
+Requirements: Apple Silicon (M1 or newer), macOS 14+. 16 GB runs the 4B and 9B
+models comfortably; 27B wants 32 GB and up. The app checks before recommending
+anything.
+
+## Start in 60 seconds
+
+```bash
 mtplx start
 ```
 
-or `python3 -m pip install mtplx` if you prefer pip. All releases are listed at [mtplx.com/releases](https://mtplx.com/releases/).
+Onboarding chooses the model, runtime mode, and chat surface. To make the
+normal long-context profile persistent and inspect why it won:
 
-Requirements: Apple Silicon (M1 or newer), macOS 14+. 16 GB of memory runs the 4B and 9B models comfortably; 27B wants 32 GB and up. The app checks this for you before recommending anything.
+```bash
+mtplx settings user set runtime.profile=sustained
+mtplx settings explain runtime.profile
+```
 
-## The app
+For one run only:
+
+```bash
+mtplx start --set generation.temperature=0.7
+```
+
+See [Getting started](docs/getting-started.md) for server and client setup.
+
+## Configure with settings
+
+Reusable configuration has canonical dotted names. Persist it with `settings
+user set`, override one run with repeatable `--set`, or layer data-only TOML and
+active experiment recipes with repeatable `--settings`.
+
+```bash
+mtplx settings show
+mtplx settings list --group generation
+mtplx serve --set runtime.mtp.depth=2
+mtplx serve --settings ./run.toml
+```
+
+Resolution records the winning source and any hard model constraint. User TOML
+writes are atomic and private; raw API keys cannot be persisted, only an API
+key file reference. Read [Settings](docs/settings.md), the generated [settings
+reference](docs/reference/settings.md), and the [migration
+guide](docs/migration-settings.md).
+
+## App
 
 <img src="docs/assets/readme/app-dashboard.jpg" alt="MTPLX dashboard with live decode gauge" width="100%" />
 
-The dashboard shows what your model is doing while it does it: live tokens per second, acceptance rate by draft depth, the verify waterfall, cache state, and system pressure. When you start a chat, code an agent against the local server, or run a benchmark, the numbers are right there.
+The dashboard shows live tokens per second, acceptance by draft depth, verify
+waterfall, cache state, and system pressure while the model runs.
 
 <img src="docs/assets/readme/app-chat.jpg" alt="Chat streaming with live speed badge" width="100%" />
 
-Chat is native, streams with thinking cards, takes file attachments, and can search the web. One click launches OpenCode, Pi, Hermes, Open WebUI, or anything else that speaks the OpenAI or Anthropic API against your local server. There is also a built-in AIME benchmark runner with fully disclosed, coaching-free prompts, so you can score a model yourself instead of trusting a chart.
+Chat is native, streams with thinking cards, accepts file attachments, and can
+search the web. One click launches OpenCode, Pi, Hermes, Open WebUI, or another
+OpenAI/Anthropic-compatible client against the local server. The app also has
+an AIME runner with disclosed, coaching-free prompts.
 
-## Auto-tune
+## Connect clients and APIs
 
-The right draft depth depends on your specific Mac: chip, memory bandwidth, thermals. During onboarding (and any time after), MTPLX runs the real model on your machine at each depth, with fans pinned for clean timing, and keeps autoregressive decoding as the baseline. If an MTP depth beats it, that depth is saved. If nothing beats the baseline, nothing is saved and the app says so. From the terminal it is one command:
-
-```bash
-mtplx tune --model <model-or-path> --retune
-```
-
-On a 16 GB M4 Mac mini, tuning the 9B model lands on depth 1: 14.4 tok/s baseline becomes 23.0 tok/s.
-
-## Forge: make your own MTP models
-
-<img src="docs/assets/readme/app-forge.jpg" alt="Forge verifying a freshly built MTP model" width="100%" />
-
-Forge takes a Hugging Face repo and turns it into an MTPLX-ready MTP model: convert to MLX, train the MTP adapter, verify that the result is actually faster and still exact, and publish back to the Hub if you want to share it. The honest part matters: Forge measures before and after on your hardware and shows you the verdict ("Depth 1 is fastest: 227.1 to 296.1, 1.30x") rather than assuming the adapter helped. Available in the app and as `mtplx forge`.
-
-The official catalog lives on Hugging Face under [Youssofal](https://huggingface.co/Youssofal): Qwen 3.5 (4B, 9B), Qwen 3.6 (27B, 35B MoE) in speed, balance, and quality builds, plus Gemma 4. The app recommends from these based on your hardware.
-
-## Experimental SSD-streamed MoE
-
-The `codex/moe-ssd-hy3-glm52` branch contains an opt-in autoregressive path for the pinned `pipenetwork/Hy3-4bit` and `mlx-community/GLM-5.2-4bit` artifacts. It keeps attention, shared experts, and each router resident; the router runs first at every sparse layer, and only its selected Q4 experts are read into a user-bounded hot slot bank. Fixed MLX/Metal byte banks are filled in place with positional reads, so routed expert tensors are never instantiated as a full parameter tree.
-
-This is not enabled by default and has not yet earned a full-checkpoint performance claim. Tiny end-to-end model fixtures, failure injection, exact artifact-layout audits, GLM FP32 near-tie routing, and IndexShare tests pass. The 166 GB Hy3 and 418 GB GLM Q4 checkpoints still require hardware parity and sustained benchmark runs using the included gates.
+Start the API server and print client configuration:
 
 ```bash
-# Optional native GIL-free positional reader
-DEBUG=0 uv pip install -e native_extensions/expert_io
-
-# Build and verify an exact manifest; an aligned sidecar is optional
-uv run python scripts/build_expert_manifest.py /path/to/model --model hy3-q4
-uv run python scripts/verify_expert_manifest.py /path/to/model /path/to/model/expert-manifest.json
-
-# The total threshold includes resident weights, KV reservation, slots, and reserve.
-mtplx serve --model /path/to/model \
-  --expert-streaming \
-  --expert-manifest /path/to/model/expert-manifest.json \
-  --expert-memory-limit 96GiB \
-  --expert-max-live-kv-tokens 32768
+mtplx quickstart --port 8000
+mtplx connect openwebui
+mtplx start opencode --port 18083
 ```
 
-For a 128 GB Mac, this is the conservative starting profile for the pinned
-GLM-5.2 affine-Q4 checkpoint. The 104 GiB ceiling leaves system headroom while
-reserving 16 GiB inside the runtime plan; MTP is disabled automatically because
-the checkpoint does not contain its declared MTP layer.
-
-```bash
-MODEL=/path/to/mlx-community/GLM-5.2-4bit
-
-uv run python scripts/build_expert_manifest.py "$MODEL" --model glm52-q4
-uv run python scripts/verify_expert_manifest.py \
-  "$MODEL" "$MODEL/expert-manifest.json" --records
-
-uv run mtplx serve --model "$MODEL" \
-  --expert-streaming \
-  --expert-model-key glm52-q4 \
-  --expert-manifest "$MODEL/expert-manifest.json" \
-  --expert-memory-limit 104GiB \
-  --expert-runtime-reserve 16GiB \
-  --expert-max-live-kv-tokens 32768
-```
-
-These two community Q4 artifacts omit their declared MTP layers, so streamed loading intentionally selects target-only AR and rejects MTP adapters. See [the implementation and validation guide](docs/MOE_SSD_STREAMING_PLAN.md) for pinned revisions, GLM IndexShare details, sidecar packaging, memory planning, parity, and benchmark commands.
-
-## The server
-
-`mtplx start` (or the app's play button) serves an OpenAI-compatible API on `127.0.0.1:8000`: `/v1/chat/completions`, `/v1/completions`, `/v1/models`, plus an Anthropic-compatible `/v1/messages` with streaming, tool calls in both styles, `/health`, and `/metrics`. Claude Code, Cline, Continue, Open WebUI, curl, the openai and anthropic Python clients: if it speaks the API, it works. The app and CLI share one server, so `mtplx start` attaches to the app's running model instead of loading a second copy.
+The server exposes OpenAI-compatible `/v1/chat/completions`,
+`/v1/completions`, and `/v1/models`, plus Anthropic-compatible `/v1/messages`,
+streaming, tool calls, `/health`, and `/metrics`. The app and CLI share one
+server, so attaching a client does not load a second model.
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -114,56 +121,87 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"mtplx","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-Sessions survive: a warm-prefix session bank keeps multi-turn chats fast, and an optional SSD cache restores sessions near-instantly across restarts.
+Warm-prefix session state keeps multi-turn chats fast, and an optional SSD
+cache restores sessions across restarts.
 
-Sampler controls cover `temperature`, `top_p`, `top_k`, and the OpenAI penalty pair `presence_penalty` / `frequency_penalty` — per request, as server defaults (`--default-presence-penalty` / `--default-frequency-penalty` on `start`/`serve`/`quickstart`), or live via `mtplx settings set` and the app's Presence Penalty dial. Penalties default to 0, which is an exact no-op that preserves MTP exactness. Qwen's guidance: leave them at 0 for coding and agent work; ~0.5–1.5 presence penalty helps creative writing or when a model loops on itself.
+## Tune and benchmark
 
-## CLI quick reference
+Draft depth depends on chip, memory bandwidth, and thermals. MTPLX measures the
+real model at each depth with autoregressive decoding as the baseline, saves a
+depth only when it wins, and says so when none does.
 
 ```bash
-mtplx start                # interactive: pick model, mode, surface, then chat
-mtplx serve --port 8000    # API server only
-mtplx stop                 # stop the running server cleanly
-mtplx pull <hf-repo>       # download a model safely
-mtplx models               # what is cached, sizes, validation
-mtplx inspect <model>      # compatibility report before anything runs
-mtplx tune --retune        # measure AR vs D1/D2/D3 on your Mac
-mtplx forge                # build, verify, and publish MTP models
-mtplx bench aime --quick   # run the AIME benchmark from the terminal
-mtplx doctor               # install and integration health
-mtplx max --install        # fan control (one sudo prompt, crash-safe)
-mtplx settings get/set     # read or change live server settings
+mtplx tune --retune
+mtplx bench aime --quick
+mtplx bench run --settings lab:compiled-verify-control --dry-run
 ```
 
-Every command takes `--json` and `--help`. The CLI works without MLX installed for everything that does not need a model, so `doctor` and `inspect` run on any machine.
+On a 16 GB M4 Mac mini, tuning the 9B model lands on depth 1: 14.4 tok/s
+baseline becomes 23.0 tok/s. Experiment bundles are strict data-only controls
+with lifecycle and normalized hashes; read [Experiments](docs/experiments.md).
 
 ## Modes
 
 | Mode | What it does | When |
 |---|---|---|
-| **Sustained** | Default. Long-context MTP path with chunked prefill and request-sized KV | Everyday use, big files, 16K-200K prompts |
-| **Sustained Max** | Sustained with fans pinned at 100% | Long work where you want maximum cooling |
+| **Sustained** | Default long-context MTP with chunked prefill and request-sized KV | Everyday use, big files, 16K-200K prompts |
+| **Sustained Max** | Sustained with fans pinned at 100% | Long work where maximum cooling matters |
 | **Burst** | Legacy short-context benchmark lane, loud | Short prompts and benchmarks only |
 
-Fan-backed modes restore your fans to automatic if MTPLX dies for any reason, including `kill -9` and closing the terminal. A detached watchdog handles it; this is verified on hardware, not assumed.
+Fan-backed modes restore automatic fan control even after `kill -9` or closing
+the terminal; a detached watchdog handles it.
 
-## Compatibility, honestly
+## Forge
 
-`mtplx inspect` classifies any model into four tiers before anything runs: verified, architecture-compatible but unverified, incompatible architecture, or no MTP heads at all. Unverified models refuse to run unless you explicitly force them. There are no silent fallbacks: if MTPLX cannot run a model correctly, it tells you instead of running it badly.
+<img src="docs/assets/readme/app-forge.jpg" alt="Forge verifying a freshly built MTP model" width="100%" />
+
+Forge converts a Hugging Face repository to MLX, trains an MTP adapter, verifies
+that it is exact and actually faster, and can publish it back to the Hub. It
+reports measured verdicts rather than assuming training helped (for example,
+"Depth 1 is fastest: 227.1 to 296.1, 1.30x"). Use the app or `mtplx forge`.
+
+The official [Youssofal catalog](https://huggingface.co/Youssofal) includes
+Qwen 3.5 (4B, 9B), Qwen 3.6 (27B, 35B MoE) speed/balance/quality builds, and
+Gemma 4. The app recommends among them for the detected hardware.
+
+## Advanced and compatibility
+
+`mtplx inspect` classifies models before loading: verified,
+architecture-compatible but unverified, incompatible architecture, or no MTP
+heads. There are no silent fallbacks. Existing individual flags, flat config
+keys, reviewed environment variables, and `mtplx settings get/set` remain
+compatibility aliases; new automation should use canonical settings and
+explicit `settings live` scope.
+
+MTPLX also has an opt-in target-only AR path for two pinned community MoE Q4
+artifacts that streams routed experts into a bounded hot bank. It is not on by
+default and has no full-checkpoint performance claim. See the [advanced
+SSD-streamed MoE guide](docs/advanced/ssd-streamed-moe.md).
+
+Use `mtplx help advanced` for QA, profiling, support bundles, and kernel tools.
+See the [CLI guide](docs/cli.md), [compatibility mappings](docs/migration-settings.md),
+and [documentation index](docs/README.md).
 
 ## What MTPLX is not
 
 - Not an external-drafter system. The drafter is the target model's own MTP heads.
-- Not a greedy-argmax trick. Acceptance is exact rejection sampling, correct at any temperature.
+- Not a greedy-argmax trick. Acceptance is exact rejection sampling at any temperature.
 - Not a CUDA project. MTPLX is MLX-native and Apple Silicon first. For Linux, use vLLM.
 
 ## License and credit
 
-Apache-2.0: use it, modify it, ship it commercially. Keep the license and [NOTICE](NOTICE) attribution if you redistribute. MTPLX builds on [MLX](https://github.com/ml-explore/mlx) and the Qwen and Gemma model families; the speculative sampling math follows Leviathan and Chen (2023). Fan control via [ThermalForge](https://github.com/ProducerGuy/ThermalForge). Model weights remain governed by their upstream licenses.
+Apache-2.0: use it, modify it, and ship it commercially. Keep the license and
+[NOTICE](NOTICE) attribution when redistributing. MTPLX builds on
+[MLX](https://github.com/ml-explore/mlx), Qwen, and Gemma; speculative sampling
+follows Leviathan and Chen (2023). Fan control uses
+[ThermalForge](https://github.com/ProducerGuy/ThermalForge). Model weights keep
+their upstream licenses.
 
 If MTPLX powers a public project, benchmark, or paper, please credit it:
 
 > Powered by MTPLX by Youssof Altoukhi
 > https://github.com/youssofal/MTPLX
 
-Built by [Youssof Altoukhi](https://github.com/youssofal). Bug reports and benchmark replications welcome via [Issues](https://github.com/youssofal/MTPLX/issues).
+Built by [Youssof Altoukhi](https://github.com/youssofal). Bug reports and
+benchmark replications are welcome via
+[Issues](https://github.com/youssofal/MTPLX/issues).
