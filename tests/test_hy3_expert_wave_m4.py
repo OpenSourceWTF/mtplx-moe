@@ -77,7 +77,7 @@ def _inputs() -> tuple[FakeTensor, FakeTensor, FakeTensor]:
     return (
         FakeTensor((1, 4, 4096), mx.bfloat16, "hidden"),
         FakeTensor((1, 4, 8), mx.int32, "slots"),
-        FakeTensor((1, 4, 8), mx.bfloat16, "weights"),
+        FakeTensor((1, 4, 8), mx.float32, "weights"),
     )
 
 
@@ -190,8 +190,8 @@ def test_m4_runtime_uses_three_tuned_qmms_without_copying_source_banks(
         (0, FakeTensor((1, 4, 4096), mx.float32, "hidden"), "BF16"),
         (1, FakeTensor((1, 4, 7), mx.int32, "slots"), r"\[1, 4, 8\]"),
         (1, FakeTensor((1, 4, 8), mx.uint32, "slots"), "int32"),
-        (2, FakeTensor((1, 4, 7), mx.bfloat16, "weights"), r"\[1, 4, 8\]"),
-        (2, FakeTensor((1, 4, 8), mx.float32, "weights"), "BF16"),
+        (2, FakeTensor((1, 4, 7), mx.float32, "weights"), r"\[1, 4, 8\]"),
+        (2, FakeTensor((1, 4, 8), mx.bfloat16, "weights"), "FP32"),
     ),
 )
 def test_m4_runtime_fails_closed_on_noncontract_inputs(

@@ -324,8 +324,11 @@ def _execute_tuned_m4(
     per_assignment = down.reshape(
         (HY3_M4_BATCH, HY3_M4_ROWS, HY3_M4_TOP_K, HY3_M4_HIDDEN_SIZE)
     )
+    # Route weights stay FP32 through the combine: FP32 products and an
+    # FP32 reduction reproduce MLX's stock promotion semantics, with one
+    # BF16 rounding at the output row (#65 contract; #31 Arm-B precedent).
     return (
-        (per_assignment * route_weights[..., None])
+        (per_assignment.astype(mx.float32) * route_weights[..., None])
         .sum(axis=-2)
         .astype(hidden_rows.dtype)
     )
@@ -344,7 +347,7 @@ def hy3_q2_m4_expert_wave(
     Args:
         hidden_rows: BF16 ``[1, 4, 4096]`` authoritative target rows.
         slot_indices: int32 ``[1, 4, 8]`` component-bank rows in router order.
-        route_weights: BF16 ``[1, 4, 8]`` authoritative routing weights.
+        route_weights: FP32 ``[1, 4, 8]`` authoritative routing weights; the combine multiplies and reduces in FP32 and rounds once to BF16.
         bank_arrays: The original nine component-major resident arrays.  Their
             exact Hy3 affine-Q2 shapes are required and they are passed directly
             to MLX without a replacement or duplicate packing layout.
@@ -380,8 +383,8 @@ def hy3_q2_m4_expert_wave(
         route_weights,
         label="fixed-M4 route weights",
         shape=(HY3_M4_BATCH, HY3_M4_ROWS, HY3_M4_TOP_K),
-        dtype=mx.bfloat16,
-        dtype_label="BF16",
+        dtype=mx.float32,
+        dtype_label="FP32",
     )
     if not isinstance(bank_arrays, Mapping):
         raise Hy3M4ExpertWaveIneligible(
