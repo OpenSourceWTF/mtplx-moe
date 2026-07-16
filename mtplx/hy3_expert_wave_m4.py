@@ -307,6 +307,7 @@ def _execute_tuned_m4(
     slot_indices: Any,
     route_weights: Any,
     bank_arrays: Mapping[str, Any],
+    combine_mode: str,
 ) -> Any:
     """Build one vectorized graph over the complete ordered assignment axis."""
 
@@ -324,14 +325,17 @@ def _execute_tuned_m4(
     per_assignment = down.reshape(
         (HY3_M4_BATCH, HY3_M4_ROWS, HY3_M4_TOP_K, HY3_M4_HIDDEN_SIZE)
     )
-    # Route weights stay FP32 through the combine: FP32 products and an
-    # FP32 reduction reproduce MLX's stock promotion semantics, with one
-    # BF16 rounding at the output row (#65 contract; #31 Arm-B precedent).
-    return (
-        (per_assignment.astype(mx.float32) * route_weights[..., None])
-        .sum(axis=-2)
-        .astype(hidden_rows.dtype)
-    )
+    if combine_mode == "fp32":
+        # Mirrors enable_moe_fp32_combine=True: FP32 products and reduction,
+        # FP32 rows returned so the caller adds the shared expert before the
+        # single BF16 rounding (#31 Arm-B precedent).
+        return (per_assignment.astype(mx.float32) * route_weights[..., None]).sum(
+            axis=-2
+        )
+    # Default mirrors the pinned Hy3 reference (enable_moe_fp32_combine=False):
+    # BF16 weights, BF16 products, BF16 reduction — bitwise-identical to the
+    # canonical lane's block combine.
+    return (per_assignment * route_weights[..., None]).sum(axis=-2)
 
 
 def hy3_q2_m4_expert_wave(
@@ -341,13 +345,14 @@ def hy3_q2_m4_expert_wave(
     bank_arrays: Mapping[str, Any],
     *,
     validated_slot_bounds: tuple[int, int],
+    combine_mode: str = "bf16",
 ) -> Hy3M4ExpertWaveOutput:
     """Execute the complete fixed-M4 Q2 expert wave.
 
     Args:
         hidden_rows: BF16 ``[1, 4, 4096]`` authoritative target rows.
         slot_indices: int32 ``[1, 4, 8]`` component-bank rows in router order.
-        route_weights: FP32 ``[1, 4, 8]`` authoritative routing weights; the combine multiplies and reduces in FP32 and rounds once to BF16.
+        route_weights: ``[1, 4, 8]`` authoritative routing weights — BF16 in the default ``bf16`` combine mode (bitwise-matches the pinned reference), FP32 in ``fp32`` mode (mirrors enable_moe_fp32_combine; returns FP32 rows so the caller adds the shared expert before one BF16 rounding).
         bank_arrays: The original nine component-major resident arrays.  Their
             exact Hy3 affine-Q2 shapes are required and they are passed directly
             to MLX without a replacement or duplicate packing layout.
@@ -379,12 +384,19 @@ def hy3_q2_m4_expert_wave(
         dtype=mx.int32,
         dtype_label="int32",
     )
+    if combine_mode not in ("bf16", "fp32"):
+        raise Hy3M4ExpertWaveIneligible(
+            "fixed-M4 combine mode must be 'bf16' or 'fp32'"
+        )
+    weights_dtype, weights_label = (
+        (mx.float32, "FP32") if combine_mode == "fp32" else (mx.bfloat16, "BF16")
+    )
     _require_tensor(
         route_weights,
         label="fixed-M4 route weights",
         shape=(HY3_M4_BATCH, HY3_M4_ROWS, HY3_M4_TOP_K),
-        dtype=mx.float32,
-        dtype_label="FP32",
+        dtype=weights_dtype,
+        dtype_label=weights_label,
     )
     if not isinstance(bank_arrays, Mapping):
         raise Hy3M4ExpertWaveIneligible(
@@ -404,15 +416,14 @@ def hy3_q2_m4_expert_wave(
         slot_indices,
         route_weights,
         bank_arrays,
+        combine_mode,
     )
-    if (
-        _shape(output, label="fixed-M4 expert-wave output")
-        != (
-            HY3_M4_BATCH,
-            HY3_M4_ROWS,
-            HY3_M4_HIDDEN_SIZE,
-        )
-        or getattr(output, "dtype", None) != mx.bfloat16
+    if _shape(output, label="fixed-M4 expert-wave output") != (
+        HY3_M4_BATCH,
+        HY3_M4_ROWS,
+        HY3_M4_HIDDEN_SIZE,
+    ) or getattr(output, "dtype", None) != (
+        mx.float32 if combine_mode == "fp32" else mx.bfloat16
     ):
         raise RuntimeError(
             "fixed-M4 expert-wave graph violated its [1, 4, 4096] BF16 output contract"
