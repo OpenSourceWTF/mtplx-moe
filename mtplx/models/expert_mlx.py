@@ -1472,7 +1472,16 @@ class HotExpertSwitchGLU(nn.Module):
                     )
                 )
                 wave_positions.extend(grouped_positions)
-            if not defer:
+            if defer:
+                # No release obligation here (the lease replay is queued),
+                # but the GPU still needs the part submitted now — without
+                # it the device idles through every miss wait.
+                async_eval = getattr(mx, "async_eval", None)
+                if callable(async_eval):
+                    async_eval(wave_outputs)
+                else:
+                    mx.eval(wave_outputs)
+            else:
                 fence_bindings(
                     ready,
                     bindings,
@@ -1514,7 +1523,16 @@ class HotExpertSwitchGLU(nn.Module):
                     )
                 )
                 wave_positions.extend(expert_positions)
-            if not defer:
+            if defer:
+                # No release obligation here (the lease replay is queued),
+                # but the GPU still needs the part submitted now — without
+                # it the device idles through every miss wait.
+                async_eval = getattr(mx, "async_eval", None)
+                if callable(async_eval):
+                    async_eval(wave_outputs)
+                else:
+                    mx.eval(wave_outputs)
+            else:
                 fence_bindings(
                     ready,
                     bindings,
