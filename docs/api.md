@@ -1,6 +1,6 @@
 # API
 
-MTPLX v0.1 targets OpenAI-compatible local serving first.
+MTPLX exposes OpenAI-compatible local serving plus an Anthropic Messages compatibility endpoint.
 
 ## `GET /health`
 
@@ -59,8 +59,12 @@ mtplx serve --rate-limit 120
 mtplx serve --stream-interval 4
 mtplx serve --warmup-tokens 16
 mtplx serve --reasoning-parser qwen3
-mtplx serve --no-mtp
+mtplx serve --set runtime.mtp.enabled=false
 ```
+
+The host, port, API-key, warmup, and stream controls above are invocation mechanics. Reusable runtime
+configuration uses canonical settings; see [Settings](settings.md) and the generated
+[settings reference](reference/settings.md).
 
 Non-localhost binds require `--api-key`. Requests may authenticate with either:
 

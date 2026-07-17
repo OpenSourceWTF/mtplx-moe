@@ -93,6 +93,20 @@ def test_root_readme_has_settings_native_normal_path():
         assert phrase in text
 
 
+def test_configuration_sources_of_truth_are_easy_to_find():
+    root = (ROOT / "README.md").read_text(encoding="utf-8")
+    index = _text("README.md")
+    settings = _text("settings.md")
+    migration = _text("migration-settings.md")
+
+    for text in (root, index, settings):
+        assert "mtplx settings list --json" in text
+        assert "reference/settings.md" in text
+        assert "migration-settings.md" in text
+    assert "generated" in migration.lower()
+    assert "do not hand-edit" in migration.lower()
+
+
 def test_root_readme_normal_sections_do_not_teach_legacy_runtime_flags():
     text = (ROOT / "README.md").read_text(encoding="utf-8")
     normal = text.split("## Advanced and compatibility", 1)[0]

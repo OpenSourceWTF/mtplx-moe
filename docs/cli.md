@@ -12,6 +12,18 @@
 Run `mtplx help`, `mtplx help commands`, or `mtplx help flags` for generated
 parser help. Specialized commands remain under `mtplx help advanced`.
 
+For configuration lookup, use the machine-readable catalog and generated mappings instead of copying
+parser output into another tool:
+
+```bash
+mtplx settings list --json
+mtplx help flags
+```
+
+The [canonical settings reference](reference/settings.md) covers reusable settings. The generated
+[migration tables](migration-settings.md) cover supported legacy flags and reviewed environment
+aliases. An unlisted `MTPLX_*` variable found in source is not automatically a public interface.
+
 ## Settings versus command inputs
 
 A setting is a reusable value that can reasonably be saved across runs, such

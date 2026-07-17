@@ -8,6 +8,27 @@ The generated [settings reference](reference/settings.md) lists every supported
 name, type, default, lifecycle, visibility, apply behavior, and compatibility
 alias.
 
+## Find the authoritative name
+
+The installed catalog and its checked-in generated references divide the configuration surface:
+
+```bash
+mtplx settings list --json
+mtplx settings list --visibility public
+mtplx settings explain runtime.mtp.depth --json
+```
+
+- [Canonical settings reference](reference/settings.md): all cataloged names and metadata.
+- [Flag and environment migration tables](migration-settings.md): every supported compatibility
+  alias for reusable configuration.
+- [CLI guide](cli.md): operands and invocation mechanics such as input/output paths, `--json`, and
+  confirmations.
+- [Experiment inventory](experiments/inventory.md): internal, diagnostic, and experiment switches;
+  their presence in source does not make them public settings.
+
+Both reference tables are generated from code and checked for drift. Do not hand-edit them or infer
+a supported environment interface from a repository-wide search for `MTPLX_*`.
+
 ## Inspect effective settings
 
 These commands do not import MLX or load a model:

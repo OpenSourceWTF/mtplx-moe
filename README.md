@@ -86,6 +86,20 @@ key file reference. Read [Settings](docs/settings.md), the generated [settings
 reference](docs/reference/settings.md), and the [migration
 guide](docs/migration-settings.md).
 
+For agents and integrations, these are the configuration sources of truth:
+
+| Need | Use |
+|---|---|
+| Discover the installed canonical catalog | `mtplx settings list --json` |
+| Read every canonical name, type, default, lifecycle, visibility, and alias | Generated [settings reference](docs/reference/settings.md) |
+| Translate an older flag or reviewed environment variable | Generated [migration tables](docs/migration-settings.md) |
+| Find command operands and mechanical flags | `mtplx help flags` or the command's `--help` |
+| Classify internal experiment switches | Generated [experiment inventory](docs/experiments/inventory.md) |
+
+Do not infer a public setting from an arbitrary `MTPLX_*` name in source. Environment variables not
+listed in the generated migration tables are internal, experimental, diagnostic, or command-owned
+until explicitly cataloged.
+
 ## App
 
 <img src="docs/assets/readme/app-dashboard.jpg" alt="MTPLX dashboard with live decode gauge" width="100%" />

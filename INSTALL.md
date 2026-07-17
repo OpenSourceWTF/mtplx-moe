@@ -37,11 +37,12 @@ For local development:
 python -m pip install -e ".[dev,server]"
 ```
 
-## Runtime Dependencies
+## Runtime dependencies
 
-`mtplx --help`, `mtplx doctor`, `mtplx inspect`, and `mtplx init` are designed to work even before MLX is installed. Generation and serving require MLX and a verified model.
-
-The v0.1 default dependency path uses vanilla `mlx`. The opt-in `performance-cold` profile may require the MTPLX MLX fork until the custom-kernel work is upstreamed or extracted.
+`mtplx --help`, `mtplx doctor`, `mtplx inspect`, `mtplx settings`, and `mtplx init` are designed to
+work without loading MLX. Generation and serving require the Apple-Silicon `mlx`/`mlx-lm` dependencies
+declared by the installed MTPLX release and a compatible model. Use `mtplx doctor --summary` instead
+of installing an old dependency recipe from a copied guide.
 
 ## Optional Thermal Tools
 
