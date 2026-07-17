@@ -644,3 +644,51 @@ def test_prefill_route_stays_exact_with_shadow_enabled(tmp_path: Path) -> None:
         assert cache["bytes_read"] > 0
     finally:
         runtime.close()
+
+
+def test_miss_shadow_layers_caps_coverage_and_pricing() -> None:
+    from mtplx.expert_streaming_models import (
+        get_model_spec,
+        plan_expert_memory,
+        shadow_record_bytes,
+    )
+
+    spec = get_model_spec("hy3-expert-q2")
+    kwargs = dict(total_limit_bytes=110 * 1024**3, context_tokens=4096,
+                  island_layer_count=49, miss_shadow="b1")
+    full = plan_expert_memory(spec, **kwargs)
+    capped = plan_expert_memory(spec, miss_shadow_layers=6, **kwargs)
+    per_layer = spec.expert_count * shadow_record_bytes(
+        "b1", spec.expert_source_parameters
+    )
+    assert capped.shadow_bytes == 6 * per_layer
+    assert full.shadow_bytes > capped.shadow_bytes
+    # Cap larger than the streamed set clamps to the streamed count.
+    clamped = plan_expert_memory(spec, miss_shadow_layers=10_000, **kwargs)
+    assert clamped.shadow_bytes == full.shadow_bytes
+    with pytest.raises(ValueError, match="requires miss_shadow"):
+        plan_expert_memory(
+            spec, total_limit_bytes=110 * 1024**3, context_tokens=4096,
+            miss_shadow_layers=4,
+        )
+
+
+def test_miss_shadow_layers_config_validation() -> None:
+    from mtplx.expert_runtime import ExpertStreamingConfig
+
+    base = dict(model_key="hy3-expert-q2", memory_limit_bytes=96 * 1024**3,
+                max_live_kv_tokens=4096)
+    config = ExpertStreamingConfig(
+        **base, slot_layout="component-banks",
+        miss_shadow="b1", miss_shadow_layers=6,
+    )
+    assert config.miss_shadow_layers == 6
+    with pytest.raises(ValueError, match="requires miss_shadow"):
+        ExpertStreamingConfig(
+            **base, slot_layout="component-banks", miss_shadow_layers=6
+        )
+    with pytest.raises(ValueError, match="miss_shadow_layers"):
+        ExpertStreamingConfig(
+            **base, slot_layout="component-banks",
+            miss_shadow="b1", miss_shadow_layers=0,
+        )
