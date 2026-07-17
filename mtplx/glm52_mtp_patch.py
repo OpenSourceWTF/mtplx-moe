@@ -5,6 +5,17 @@ is not a stock DeepSeek decoder: it owns GLM DSA indexer weights, uses FP32
 MoE routing, and recurrently shares the D1 index selection through D5.  This
 module mirrors the fail-closed external-artifact boundary used by Hy3 while
 keeping the already-working streamed GLM target unchanged.
+
+Two head precisions are packaged (issue #100):
+
+``bf16``
+    the bit-exact 18.54 GiB artifact (default; acceptance-validated).
+``q4``
+    the sibling artifact whose 256 routed experts are affine Q4 group-size
+    64 with BF16 scales/biases while every trunk-side tensor stays a
+    bit-exact BF16/F32 copy.  ~5.60 GiB resident, freeing ~12.9 GiB of the
+    fixed streamed budget.  The head is speculative-only, so the quality
+    cost of quantization is bounded to acceptance, never correctness.
 """
 
 from __future__ import annotations
@@ -17,8 +28,12 @@ from typing import Any
 
 from .attention_context import current_attention_phase
 from .glm52_mtp_artifact import (
+    Q4_MANIFEST_SCHEMA as GLM52_MTP_Q4_MANIFEST_SCHEMA,
+    Q4_QUANT_BITS as GLM52_MTP_Q4_BITS,
+    Q4_QUANT_GROUP_SIZE as GLM52_MTP_Q4_GROUP_SIZE,
     VerifiedGlm52MtpArtifact,
     open_verified_glm52_mtp_layer78,
+    open_verified_glm52_mtp_layer78_q4,
 )
 
 logger = logging.getLogger(__name__)
@@ -26,8 +41,14 @@ logger = logging.getLogger(__name__)
 GLM52_MTP_SOURCE_REPO = "zai-org/GLM-5.2"
 GLM52_MTP_SOURCE_REVISION = "b4734de4facf877f85769a911abafc5283eab3d9"
 GLM52_MTP_BF16_FILE = "layer78-bf16.safetensors"
+GLM52_MTP_Q4_FILE = "layer78-q4.safetensors"
+GLM52_MTP_PRECISIONS = ("bf16", "q4")
+# The BF16 head remains the default until a Q4 acceptance-rate validation
+# run lands; quantized heads cost acceptance, not correctness.
+GLM52_MTP_DEFAULT_PRECISION = "bf16"
 
 _EXPERT_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+_QUANT_LEAVES = ("weight", "scales", "biases")
 _HEAD_LOCAL_MODULES = ("eh_proj", "enorm", "hnorm")
 
 
@@ -290,6 +311,38 @@ def expected_glm52_mtp_inventory(args: Any) -> dict[str, GLM52MTPTensorSpec]:
     return inventory
 
 
+def expected_glm52_mtp_q4_inventory(args: Any) -> dict[str, GLM52MTPTensorSpec]:
+    """Return the exact Q4 sibling tensor contract for the trained head.
+
+    Trunk-side tensors keep the BF16 contract; each routed expert projection
+    is the pinned affine Q4/gs64 triplet.
+    """
+
+    inventory: dict[str, GLM52MTPTensorSpec] = {}
+    for name, spec in expected_glm52_mtp_inventory(args).items():
+        if ".mlp.experts." not in name:
+            inventory[name] = spec
+            continue
+        rows, cols = spec.shape
+        if cols % GLM52_MTP_Q4_GROUP_SIZE:
+            raise Glm52MTPLoadError(
+                f"expert tensor {name!r} columns {cols} are incompatible with "
+                f"the pinned Q4 group size {GLM52_MTP_Q4_GROUP_SIZE}"
+            )
+        base = name[: -len(".weight")]
+        inventory[base + ".weight"] = GLM52MTPTensorSpec(
+            dtype="U32", shape=(rows, cols * GLM52_MTP_Q4_BITS // 32)
+        )
+        group_shape = (rows, cols // GLM52_MTP_Q4_GROUP_SIZE)
+        inventory[base + ".scales"] = GLM52MTPTensorSpec(
+            dtype="BF16", shape=group_shape
+        )
+        inventory[base + ".biases"] = GLM52MTPTensorSpec(
+            dtype="BF16", shape=group_shape
+        )
+    return inventory
+
+
 def _receipt_revision(receipt: dict[str, Any]) -> str | None:
     direct = receipt.get("source_revision")
     if direct is not None:
@@ -308,27 +361,37 @@ def _mapped_target(suffix: str) -> str:
     return "layers.0.mtp_block." + suffix
 
 
-def _map_glm52_mtp_bf16_weights(
+def _wanted_mx_dtype(spec_dtype: str, mx: Any) -> tuple[Any, str]:
+    if spec_dtype == "BF16":
+        return mx.bfloat16, "bfloat16"
+    if spec_dtype == "F32":
+        return mx.float32, "float32"
+    if spec_dtype == "U32":
+        return mx.uint32, "uint32"
+    raise Glm52MTPLoadError(f"unsupported artifact dtype {spec_dtype!r}")
+
+
+def _validate_exact_inventory(
     tensors: dict[str, Any],
-    args: Any,
+    expected: dict[str, GLM52MTPTensorSpec],
+    *,
+    artifact_file: str,
     mx: Any,
-) -> dict[str, Any]:
-    expected = expected_glm52_mtp_inventory(args)
+) -> None:
     missing = set(expected) - set(tensors)
     extra = set(tensors) - set(expected)
     if missing:
         raise Glm52MTPLoadError(
-            f"{GLM52_MTP_BF16_FILE} is missing tensors: {sorted(missing)[:4]}"
+            f"{artifact_file} is missing tensors: {sorted(missing)[:4]}"
         )
     if extra:
         raise Glm52MTPLoadError(
-            f"{GLM52_MTP_BF16_FILE} has unexpected tensors: {sorted(extra)[:4]}"
+            f"{artifact_file} has unexpected tensors: {sorted(extra)[:4]}"
         )
     for name, value in tensors.items():
         tensor_spec = expected[name]
-        wanted_dtype = mx.bfloat16 if tensor_spec.dtype == "BF16" else mx.float32
+        wanted_dtype, label = _wanted_mx_dtype(tensor_spec.dtype, mx)
         if value.dtype != wanted_dtype:
-            label = "bfloat16" if tensor_spec.dtype == "BF16" else "float32"
             raise Glm52MTPLoadError(f"{name} must be {label}, found {value.dtype}")
         shape = tuple(int(dim) for dim in value.shape)
         if shape != tensor_spec.shape:
@@ -336,6 +399,12 @@ def _map_glm52_mtp_bf16_weights(
                 f"{name} has shape {shape}; expected shape {tensor_spec.shape}"
             )
 
+
+def _map_glm52_trunk_tensors(
+    tensors: dict[str, Any],
+    args: Any,
+    mx: Any,
+) -> dict[str, Any]:
     prefix = _layer_prefix(args)
     mapped: dict[str, Any] = {}
     for name, value in tensors.items():
@@ -355,7 +424,22 @@ def _map_glm52_mtp_bf16_weights(
     mapped["layers.0.mtp_block.self_attn.unembed_out.weight"] = mx.contiguous(
         kv_b[:, nope:, :]
     )
+    return mapped
 
+
+def _map_glm52_mtp_bf16_weights(
+    tensors: dict[str, Any],
+    args: Any,
+    mx: Any,
+) -> dict[str, Any]:
+    _validate_exact_inventory(
+        tensors,
+        expected_glm52_mtp_inventory(args),
+        artifact_file=GLM52_MTP_BF16_FILE,
+        mx=mx,
+    )
+    prefix = _layer_prefix(args)
+    mapped = _map_glm52_trunk_tensors(tensors, args, mx)
     for projection in _EXPERT_PROJECTIONS:
         values = [
             tensors[f"{prefix}mlp.experts.{expert}.{projection}.weight"]
@@ -367,6 +451,35 @@ def _map_glm52_mtp_bf16_weights(
     if len(mapped) != 27:
         raise Glm52MTPLoadError(
             f"GLM-5.2 layer-78 mapped to {len(mapped)} leaves; expected 27"
+        )
+    return mapped
+
+
+def _map_glm52_mtp_q4_weights(
+    tensors: dict[str, Any],
+    args: Any,
+    mx: Any,
+) -> dict[str, Any]:
+    _validate_exact_inventory(
+        tensors,
+        expected_glm52_mtp_q4_inventory(args),
+        artifact_file=GLM52_MTP_Q4_FILE,
+        mx=mx,
+    )
+    prefix = _layer_prefix(args)
+    mapped = _map_glm52_trunk_tensors(tensors, args, mx)
+    for projection in _EXPERT_PROJECTIONS:
+        for leaf in _QUANT_LEAVES:
+            values = [
+                tensors[f"{prefix}mlp.experts.{expert}.{projection}.{leaf}"]
+                for expert in range(int(args.n_routed_experts))
+            ]
+            mapped[f"layers.0.mtp_block.mlp.switch_mlp.{projection}.{leaf}"] = (
+                mx.stack(values)
+            )
+    if len(mapped) != 33:
+        raise Glm52MTPLoadError(
+            f"GLM-5.2 layer-78 Q4 mapped to {len(mapped)} leaves; expected 33"
         )
     return mapped
 
@@ -424,26 +537,149 @@ def load_glm52_mtp_bf16_weights(
         ) from exc
 
 
+def load_glm52_mtp_q4_weights(
+    artifact_dir: Path | str,
+    args: Any,
+    *,
+    expected_revision: str = GLM52_MTP_SOURCE_REVISION,
+    mx_module: Any | None = None,
+    verified_artifact: VerifiedGlm52MtpArtifact | None = None,
+) -> dict[str, Any]:
+    """Verify, load, validate, and map the exact Q4 layer-78 artifact."""
+
+    artifact_dir = Path(artifact_dir).expanduser().resolve()
+    path = artifact_dir / GLM52_MTP_Q4_FILE
+    if not path.is_file():
+        raise Glm52MTPLoadError(f"missing GLM-5.2 MTP Q4 artifact {path}")
+
+    if mx_module is None:
+        import mlx.core as mx
+    else:
+        mx = mx_module
+    verification_context = (
+        open_verified_glm52_mtp_layer78_q4(artifact_dir, deep=True)
+        if verified_artifact is None
+        else contextlib.nullcontext(verified_artifact)
+    )
+    try:
+        with verification_context as verified:
+            if verified.file.closed:
+                raise Glm52MTPLoadError(
+                    "borrowed GLM-5.2 MTP artifact handle is closed"
+                )
+            verified_root = Path(verified.root).expanduser().resolve()
+            if verified_root != artifact_dir:
+                raise Glm52MTPLoadError(
+                    "borrowed GLM-5.2 MTP artifact root does not match artifact_dir"
+                )
+            schema = verified.manifest.get("schema")
+            if schema != GLM52_MTP_Q4_MANIFEST_SCHEMA:
+                raise Glm52MTPLoadError(
+                    f"GLM-5.2 MTP artifact schema {schema!r} is not the Q4 "
+                    f"head schema {GLM52_MTP_Q4_MANIFEST_SCHEMA!r}"
+                )
+            revision = _receipt_revision(verified.manifest)
+            if revision != expected_revision:
+                raise Glm52MTPLoadError(
+                    f"GLM-5.2 MTP artifact revision {revision!r}; "
+                    f"expected {expected_revision!r}"
+                )
+            tensors = dict(mx.load(verified.file, format="safetensors"))
+            mapped = _map_glm52_mtp_q4_weights(tensors, args, mx)
+            mx.eval(mapped)
+            return mapped
+    except Glm52MTPLoadError:
+        raise
+    except Exception as exc:
+        raise Glm52MTPLoadError(
+            f"GLM-5.2 MTP Q4 artifact verification or load failed: {exc}"
+        ) from exc
+
+
+def _quantization_spec_for(
+    path: str,
+    module: Any,
+    weights: dict[str, Any],
+    *,
+    group_size: int,
+) -> bool | dict[str, Any]:
+    if not hasattr(module, "to_quantized"):
+        return False
+    packed = weights.get(f"{path}.weight")
+    scales = weights.get(f"{path}.scales")
+    if packed is None or scales is None:
+        return False
+    logical_in = int(module.weight.shape[-1])
+    packed_words = int(packed.shape[-1])
+    bits, remainder = divmod(packed_words * 32, logical_in)
+    if remainder or bits != GLM52_MTP_Q4_BITS:
+        raise Glm52MTPLoadError(
+            f"{path}.weight packs {packed_words} words for {logical_in} inputs; "
+            "cannot derive the pinned 4-bit affine layout"
+        )
+    derived_group, remainder = divmod(logical_in, int(scales.shape[-1]))
+    if remainder or derived_group != group_size:
+        raise Glm52MTPLoadError(
+            f"{path}.scales implies group size {derived_group}; expected {group_size}"
+        )
+    return {"bits": bits, "group_size": group_size, "mode": "affine"}
+
+
 def build_glm52_mtp_module(
     artifact_dir: Path | str,
     args: Any,
     *,
     expected_revision: str = GLM52_MTP_SOURCE_REVISION,
+    precision: str = GLM52_MTP_DEFAULT_PRECISION,
     verified_artifact: VerifiedGlm52MtpArtifact | None = None,
 ) -> Any:
-    """Construct and strictly load the resident BF16 GLM-5.2 MTP head."""
+    """Construct and strictly load the resident GLM-5.2 MTP head.
+
+    ``precision="bf16"`` (default) loads the bit-exact BF16 artifact with no
+    quantized modules anywhere.  ``precision="q4"`` loads the Q4 sibling
+    artifact: the 256 routed experts become one quantized ``SwitchGLU``
+    (affine Q4 group-size 64) while every trunk-side module stays BF16.
+    """
 
     import mlx.core as mx
+    import mlx.nn as nn
 
     from .models.glm52_mlx import Glm52MTP
 
-    weights = load_glm52_mtp_bf16_weights(
-        artifact_dir,
-        args,
-        expected_revision=expected_revision,
-        verified_artifact=verified_artifact,
-    )
-    mtp = Glm52MTP(args, num_mtp_layers=1)
+    if precision not in GLM52_MTP_PRECISIONS:
+        raise Glm52MTPLoadError(
+            f"unsupported GLM-5.2 MTP precision {precision!r}; "
+            f"choose one of {GLM52_MTP_PRECISIONS}"
+        )
+    if precision == "bf16":
+        weights = load_glm52_mtp_bf16_weights(
+            artifact_dir,
+            args,
+            expected_revision=expected_revision,
+            verified_artifact=verified_artifact,
+        )
+        mtp = Glm52MTP(args, num_mtp_layers=1)
+    else:
+        weights = load_glm52_mtp_q4_weights(
+            artifact_dir,
+            args,
+            expected_revision=expected_revision,
+            verified_artifact=verified_artifact,
+        )
+        mtp = Glm52MTP(args, num_mtp_layers=1)
+
+        def class_predicate(path: str, module: Any) -> bool | dict[str, Any]:
+            return _quantization_spec_for(
+                path, module, weights, group_size=GLM52_MTP_Q4_GROUP_SIZE
+            )
+
+        nn.quantize(
+            mtp,
+            group_size=GLM52_MTP_Q4_GROUP_SIZE,
+            bits=GLM52_MTP_Q4_BITS,
+            mode="affine",
+            class_predicate=class_predicate,
+        )
     mtp.eval()
     try:
         mtp.load_weights(list(weights.items()), strict=True)
@@ -453,8 +689,9 @@ def build_glm52_mtp_module(
         ) from exc
     mx.eval(mtp.parameters())
     logger.info(
-        "[GLM-5.2 MTP] loaded %d BF16 leaves from %s",
+        "[GLM-5.2 MTP] loaded %d %s leaves from %s",
         len(weights),
+        precision,
         Path(artifact_dir).expanduser(),
     )
     return mtp
@@ -499,10 +736,16 @@ def inject_glm52_streamed_mtp_support(
     contract: Any | None = None,
     *,
     expected_revision: str = GLM52_MTP_SOURCE_REVISION,
+    precision: str = GLM52_MTP_DEFAULT_PRECISION,
     verified_artifact: VerifiedGlm52MtpArtifact | None = None,
     mtp_module: Any | None = None,
 ) -> bool:
-    """Attach the strict external layer-78 head to a streamed GLM target."""
+    """Attach the strict external layer-78 head to a streamed GLM target.
+
+    ``precision`` selects the head artifact when this call builds it (bf16 by
+    default, or the Q4 sibling).  When ``mtp_module`` is supplied the caller
+    has already built the head at its chosen precision and this is ignored.
+    """
 
     from mlx_lm.models.cache import KVCache
 
@@ -527,6 +770,7 @@ def inject_glm52_streamed_mtp_support(
             artifact_dir,
             args,
             expected_revision=expected_revision,
+            precision=precision,
             verified_artifact=verified_artifact,
         )
     original_outer_class = model.__class__

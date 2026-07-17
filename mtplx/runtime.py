@@ -27,8 +27,12 @@ def _streamed_mtp_backend(model_key: str, precision: str) -> str:
     support = {
         "hy3-q4": ("hy3", {"bf16", "q4"}),
         "hy3-expert-q2": ("hy3", {"bf16"}),
-        "glm52-expert-q2": ("glm52", {"bf16"}),
-        "glm52-q4": ("glm52", {"bf16"}),
+        # The Q4 head sibling (issue #100) is lane-agnostic: it is selectable
+        # for either GLM streamed lane so its ~12.9 GiB budget saving reaches
+        # the memory-constrained expert-Q2 config too. BF16 stays the default
+        # until a Q4 acceptance-rate validation run lands.
+        "glm52-expert-q2": ("glm52", {"bf16", "q4"}),
+        "glm52-q4": ("glm52", {"bf16", "q4"}),
     }
     selected = support.get(str(model_key))
     if selected is None:
@@ -412,9 +416,10 @@ def _load_impl(
 ) -> MTPLXRuntime:
     """Load an MLX model and optionally inject native MTP support.
 
-    ``mtp_precision`` selects the streamed external draft head. Both expert-Q2
-    lanes and GLM-5.2 Q4 require their exact BF16 head; the legacy Hy3-Q4 lane
-    also retains its explicit Q4 diagnostic mode.
+    ``mtp_precision`` selects the streamed external draft head. The Hy3-expert-Q2
+    lane requires its exact BF16 head; the Hy3-Q4 and both GLM-5.2 lanes also
+    accept a Q4 head (BF16 default, Q4 selectable and priced from its own
+    artifact) pending each lane's acceptance-rate validation.
     """
     from .hy3_mtp_patch import HY3_MTP_PRECISIONS
 
@@ -520,13 +525,27 @@ def _load_impl(
                     "load with mtp=False"
                 )
             if streamed_mtp_backend == "glm52":
-                from .glm52_mtp_artifact import open_verified_glm52_mtp_layer78
                 from .glm52_mtp_patch import _validate_glm52_mtp_contract
 
                 _validate_glm52_mtp_contract(contract)
-                verified_artifact_context = open_verified_glm52_mtp_layer78(
-                    Path(mtp_artifacts), deep=True
-                )
+                if mtp_precision == "q4":
+                    from .glm52_mtp_artifact import (
+                        open_verified_glm52_mtp_layer78_q4,
+                    )
+
+                    verified_artifact_context = (
+                        open_verified_glm52_mtp_layer78_q4(
+                            Path(mtp_artifacts), deep=True
+                        )
+                    )
+                else:
+                    from .glm52_mtp_artifact import (
+                        open_verified_glm52_mtp_layer78,
+                    )
+
+                    verified_artifact_context = open_verified_glm52_mtp_layer78(
+                        Path(mtp_artifacts), deep=True
+                    )
             elif streamed_mtp_backend == "hy3":
                 from .hy3_mtp_patch import open_verified_hy3_mtp_artifacts
 
@@ -620,6 +639,7 @@ def _load_impl(
                     mtp_artifacts,
                     Glm52ModelArgs.from_dict(config),
                     expected_revision=streaming_spec.source_revision,
+                    precision=mtp_precision,
                     verified_artifact=verified_streamed_artifact,
                 )
             elif streamed_mtp_backend == "hy3":
