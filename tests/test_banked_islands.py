@@ -446,57 +446,6 @@ def test_runtime_open_rejects_uncovered_mmap_layer(tmp_path) -> None:
         )
 
 
-def test_plan_override_charges_true_band_bytes() -> None:
-    spec = _two_layer_spec()
-    raw = plan_expert_memory(spec, mmap_island_layer_count=1, **_plan_kwargs())
-    override = 777
-    plan = plan_expert_memory(
-        spec,
-        mmap_island_layer_count=1,
-        mmap_island_bytes_override=override,
-        **_plan_kwargs(),
-    )
-    assert plan.mmap_island_bytes == override
-    assert plan.fixed_bytes == raw.fixed_bytes - raw.mmap_island_bytes + override
-
-
-def test_runtime_open_charges_compressed_band_true_bytes(tmp_path) -> None:
-    root, spec, manifest, _expected = _sidecar_artifact(tmp_path)
-    from mtplx.expert_manifest import save_expert_manifest
-
-    manifest_path = tmp_path / "manifest.json"
-    save_expert_manifest(manifest, manifest_path)
-    banked_layer = spec.routed_layer_indices[0]
-    out_bin = tmp_path / "huff" / "experts.bin"
-    out_manifest = tmp_path / "huff" / "manifest.json"
-    banked = write_banked_expert_banks(
-        manifest,
-        root,
-        (banked_layer,),
-        output_bin=out_bin,
-        output_manifest=out_manifest,
-        codec="huffman-l12-v1",
-    )
-    config = _config(
-        mmap_island_layers=(banked_layer,),
-        banked_manifest=str(out_manifest),
-        banked_codec="huffman-l12-v1",
-        verify_artifact_headers=False,
-    )
-    runtime = ExpertStreamingRuntime.open(
-        root,
-        manifest_path,
-        config,
-        spec=spec,
-        apply_memory_cap=False,
-    )
-    try:
-        expected_bytes = banked.layer_entry(banked_layer).length
-        assert runtime.plan.mmap_island_bytes == expected_bytes
-    finally:
-        runtime.close()
-
-
 # ----------------------------------------------------------- memory cap
 
 

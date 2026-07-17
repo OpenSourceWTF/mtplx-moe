@@ -340,7 +340,6 @@ class ExpertStreamingConfig:
         spec: ExpertStreamingModelSpec,
         *,
         additional_resident_bytes: int = 0,
-        mmap_island_bytes_override: int | None = None,
     ) -> ExpertMemoryPlan:
         # File-backed Metal records use the OS page cache as their physical
         # tier and never consume fixed MLX expert slots. Retain only a tiny
@@ -365,7 +364,6 @@ class ExpertStreamingConfig:
             island_layer_count=len(self.island_layers),
             mmap_island_layer_count=len(self.mmap_island_layers),
             mmap_islands_wired=(self.mmap_island_residency != "paged"),
-            mmap_island_bytes_override=mmap_island_bytes_override,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1401,7 +1399,6 @@ class ExpertStreamingRuntime:
                 f"{model_spec.key}: {sorted(model_spec.routed_layer_indices)[:3]}"
                 f"..{sorted(model_spec.routed_layer_indices)[-1]}"
             )
-        banked_band_bytes = None
         if config.mmap_island_layers:
             if not set(config.mmap_island_layers) <= set(
                 model_spec.routed_layer_indices
@@ -1434,11 +1431,6 @@ class ExpertStreamingRuntime:
                     f"banked manifest holds {banked.expert_count} experts per "
                     f"layer; {model_spec.key} routes {model_spec.expert_count}"
                 )
-            if banked.codec != "none":
-                banked_band_bytes = sum(
-                    banked.layer_entry(layer).length
-                    for layer in config.mmap_island_layers
-                )
         integrity_report = None
         if config.verify_artifact_headers or config.verify_sidecar_hash_at_open:
             if config.verify_sidecar_hash_at_open and manifest.sidecar is None:
@@ -1453,7 +1445,6 @@ class ExpertStreamingRuntime:
         plan = config.memory_plan(
             model_spec,
             additional_resident_bytes=additional_resident_bytes,
-            mmap_island_bytes_override=banked_band_bytes,
         )
         if not plan.fits_fixed:
             raise ExpertStreamingConfigurationError(
