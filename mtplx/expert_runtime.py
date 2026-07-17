@@ -364,11 +364,6 @@ class ExpertStreamingConfig:
             raise ValueError(
                 "banked_codec must be 'none' or 'rans32x-v1'"
             )
-        if self.banked_codec != "none":
-            raise ValueError(
-                "banked_codec 'rans32x-v1' requires the in-kernel decoder "
-                "(issue #51, C7); use 'none' until it ships"
-            )
         if normalized_mmap:
             if self.banked_manifest is None:
                 raise ValueError(
