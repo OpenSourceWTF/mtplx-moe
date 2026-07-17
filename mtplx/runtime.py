@@ -583,9 +583,22 @@ def _load_impl(
                 if additional_resident_bytes
                 else {}
             )
+            # ExpertStreamingRuntime.open computes the same discount from the
+            # manifest itself, so plan_kwargs stays free of it.
+            preflight_plan_kwargs = dict(plan_kwargs)
+            if expert_streaming_config.resident_quant:
+                from .expert_manifest import load_expert_manifest
+                from .expert_runtime import resident_quant_plan_discount
+
+                preflight_plan_kwargs["resident_discount_bytes"] = (
+                    resident_quant_plan_discount(
+                        load_expert_manifest(expert_manifest),
+                        expert_streaming_config.resident_quant,
+                    )
+                )
             streaming_plan = expert_streaming_config.memory_plan(
                 streaming_spec,
-                **plan_kwargs,
+                **preflight_plan_kwargs,
             )
             if not streaming_plan.fits_fixed:
                 raise ExpertStreamingConfigurationError(
