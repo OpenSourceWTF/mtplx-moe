@@ -464,14 +464,8 @@ def _write_compressed_banked_banks(
                         payload.append(stream.words)
                         payload_words += stream.words.size
                 directory_arr = np.concatenate(directory).astype(np.uint32)
-                dir_bytes = directory_arr.tobytes()
-                # Pad the directory block to the mapping alignment so the
-                # payload starts on its own page-aligned extent (directory
-                # and payload map as separate clean regions).
-                dir_pad = -len(dir_bytes) % BANKED_ALIGNMENT
                 region = (
-                    dir_bytes
-                    + b"\x00" * dir_pad
+                    directory_arr.tobytes()
                     + b"".join(w.tobytes() for w in payload)
                 )
                 components = []
@@ -548,12 +542,9 @@ def decode_banked_layer_reference(
     directory = np.frombuffer(
         region[: entry.directory_words * 4], dtype=np.uint32
     )
-    payload_start = (
-        (entry.directory_words * 4 + banked.alignment - 1)
-        // banked.alignment
-        * banked.alignment
+    payload = np.frombuffer(
+        region[entry.directory_words * 4 :], dtype=np.uint32
     )
-    payload = np.frombuffer(region[payload_start:], dtype=np.uint32)
     tables = {}
     luts = {}
     for kind, lengths_list in (banked.tables or {}).items():
