@@ -1050,32 +1050,16 @@ class CompressedIslandSwitchGLU(nn.Module):
             f"hot.island.compressed.{phase.name.lower()}"
             f".layer{self.layer_index:02d}"
         )
-        expert_count = self.store.expert_count
-        # Prefill routes thousands of assignments: decoding per assignment
-        # would materialize tens of GiB (and overflow the 2^31 element shape
-        # limit). Decode the full bank once and gather with raw indices —
-        # C5 island semantics over decoded scratch. Decode waves stay on the
-        # per-assignment path (~32 rows), which reads less than the bank.
-        if assignments >= expert_count:
-            bank_indices = mx.arange(expert_count, dtype=mx.int32)
-            decoded = {
-                component["component"]: self._decode(
-                    component, bank_indices, expert_count
-                )
-                for component in self._data["components"]
-            }
-            rhs = indices.reshape((-1, 1)).astype(mx.int32)
-        else:
-            flat = indices.reshape((-1,)).astype(mx.int32)
-            decoded = {
-                component["component"]: self._decode(component, flat, assignments)
-                for component in self._data["components"]
-            }
-            rhs = mx.arange(assignments, dtype=mx.int32).reshape((-1, 1))
+        flat = indices.reshape((-1,)).astype(mx.int32)
+        decoded = {
+            component["component"]: self._decode(component, flat, assignments)
+            for component in self._data["components"]
+        }
         assignment_inputs = mx.broadcast_to(
             tokens[:, None, :],
             (rows, top_k, hidden_size),
         ).reshape(-1, 1, 1, hidden_size)
+        identity = mx.arange(assignments, dtype=mx.int32).reshape((-1, 1))
 
         def qmm(values: mx.array, projection: str) -> mx.array:
             return mx.gather_qmm(
@@ -1083,7 +1067,7 @@ class CompressedIslandSwitchGLU(nn.Module):
                 decoded[f"{projection}.weight"],
                 decoded[f"{projection}.scales"],
                 decoded[f"{projection}.biases"],
-                rhs_indices=rhs,
+                rhs_indices=identity,
                 transpose=True,
                 group_size=self.group_size,
                 bits=self.bits,
