@@ -214,7 +214,7 @@ def test_validate_against_base_rejects_wrong_raw_length(tmp_path: Path) -> None:
 # --------------------------------------------------------- reader decode-on-miss
 
 
-def _open_runtime(root, manifest_path, spec, config_dict, *, streamed_codec, codec_manifest):
+def _open_runtime(root, manifest_path, spec, config_dict, *, streamed_codec, codec_manifest, codec_verify=True):
     fixed = spec.resident_bytes + spec.transient_scratch_bytes
     cfg = ExpertStreamingConfig(
         model_key=spec.key,
@@ -224,6 +224,7 @@ def _open_runtime(root, manifest_path, spec, config_dict, *, streamed_codec, cod
         slot_layout="component-banks",
         streamed_codec=streamed_codec,
         streamed_codec_manifest=(str(codec_manifest) if streamed_codec != "none" else None),
+        streamed_codec_verify=codec_verify,
     )
     plan = cfg.memory_plan(spec)
     runtime = ExpertStreamingRuntime.open(
@@ -401,4 +402,93 @@ def test_open_rejects_mismatched_codec_manifest(tmp_path: Path) -> None:
             ),
             device_synchronize=mx.synchronize,
             apply_memory_cap=False,
+        )
+
+
+def test_streamed_codec_verify_off_skips_hash_but_stays_bitwise(tmp_path: Path) -> None:
+    """verify=False must skip the post-decode sha256 (David: optional, default
+    flips off after the 16k validation) while output stays bitwise-identical —
+    the container's structural guards, not the hash, carry correctness."""
+
+    root, config, spec, manifest_path, base = _base_with_sidecar(tmp_path)
+    codec_manifest_path = root / "expert-streamed-codec-rans32x.json"
+    write_streamed_rans_sidecar(
+        base,
+        root,
+        output_bin=root / "experts-rans32x.bin",
+        output_manifest=codec_manifest_path,
+    )
+
+    def forward(codec, verify=True):
+        runtime, _plan = _open_runtime(
+            root, manifest_path, spec, config,
+            streamed_codec=codec, codec_manifest=codec_manifest_path,
+            codec_verify=verify,
+        )
+        try:
+            assert runtime.reader.codec_verify is verify
+            resident = construct_resident_model(root, runtime, config=config)
+            logits = resident.model(mx.array([[1, 2]], dtype=mx.int32))
+            mx.eval(logits)
+            return mx.array(logits), runtime.reader.metrics.as_dict()
+        finally:
+            runtime.close()
+
+    logits_ref, _ = forward("none")
+    logits_off, io_off = forward("rans32x-v1", verify=False)
+    assert bool(mx.array_equal(logits_ref, logits_off).item())
+    assert io_off["decoded_records"] >= 1
+    assert io_off["integrity_errors"] == 0
+
+    # verify=True catches container-payload corruption the structural guards
+    # cannot see: flip bytes mid-payload in the FIRST record's compressed
+    # container (past the header/freq table, before the tail guard).
+    import json as _json
+
+    codec_doc = _json.loads(codec_manifest_path.read_text())
+    entry = sorted(codec_doc["records"], key=lambda r: r["offset"])[0]
+    bin_path = root / "experts-rans32x.bin"
+    blob = bytearray(bin_path.read_bytes())
+    # 85% depth lands in payload symbols (past header/freq/directory, before
+    # the tail guard) so the container stays structurally valid but decodes
+    # to different bytes -- exactly what only the hash can catch.
+    deep = entry["offset"] + (entry["length"] * 17) // 20
+    for i in range(deep, deep + 8):
+        blob[i] ^= 0xFF
+    bin_path.write_bytes(bytes(blob))
+
+    def forward_expect(codec_verify):
+        runtime, _plan = _open_runtime(
+            root, manifest_path, spec, config,
+            streamed_codec="rans32x-v1", codec_manifest=codec_manifest_path,
+            codec_verify=codec_verify,
+        )
+        try:
+            resident = construct_resident_model(root, runtime, config=config)
+            mx.eval(resident.model(mx.array([[1, 2]], dtype=mx.int32)))
+            return runtime.reader.metrics.as_dict()
+        finally:
+            runtime.close()
+
+    with pytest.raises(Exception, match="hash mismatch|integrity|decode|guard|container|directory"):
+        forward_expect(True)
+    # verify=False must NOT raise the integrity error for the same corruption
+    # (the hash is never consulted); the decode may still trip a structural
+    # guard, in which case the OFF path degrades identically -- accept either
+    # a clean pass (integrity_errors == 0) or the structural error, but never
+    # the hash-mismatch integrity path.
+    try:
+        io_corrupt_off = forward_expect(False)
+    except Exception as exc:  # structural guard, not the hash path
+        assert "hash mismatch" not in str(exc)
+    else:
+        assert io_corrupt_off["integrity_errors"] == 0
+
+def test_streamed_codec_verify_validation() -> None:
+    with pytest.raises(TypeError, match="streamed_codec_verify"):
+        ExpertStreamingConfig(
+            model_key="hy3-expert-q2",
+            memory_limit_bytes=96 * 1024**3,
+            max_live_kv_tokens=4096,
+            streamed_codec_verify="yes",
         )

@@ -178,6 +178,10 @@ class ExpertStreamingConfig:
     # "none" leaves every streamed read byte-unchanged.
     streamed_codec: str = "none"
     streamed_codec_manifest: str | None = None
+    # Post-decode sha256 of rANS-decoded records. Default ON until the 16k
+    # long-context validation passes (David 2026-07-17); the container's own
+    # structural guards remain regardless.
+    streamed_codec_verify: bool = True
     mmap_island_wired: bool = True
     resident_quant: str | None = None
     kv_quant: str | None = None
@@ -374,6 +378,8 @@ class ExpertStreamingConfig:
             raise ValueError(
                 "streamed_codec must be 'none' or 'rans32x-v1'"
             )
+        if not isinstance(self.streamed_codec_verify, bool):
+            raise TypeError("streamed_codec_verify must be bool")
         if self.streamed_codec != "none":
             if self.streamed_codec_manifest is None:
                 raise ValueError(
@@ -1847,6 +1853,7 @@ class ExpertStreamingRuntime:
             max_read_chunk_bytes=config.max_read_chunk_bytes,
             bypass_page_cache=config.bypass_page_cache,
             codec_sidecar=codec_sidecar,
+            codec_verify=config.streamed_codec_verify,
             **pipeline_kwargs,
         )
         try:

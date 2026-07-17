@@ -147,6 +147,7 @@ class PositionalExpertReader:
         bypass_page_cache: bool = False,
         pipeline_ledger: Any | None = None,
         codec_sidecar: Any | None = None,
+        codec_verify: bool = True,
     ) -> None:
         if isinstance(max_open_files, bool) or not isinstance(max_open_files, int):
             raise TypeError("max_open_files must be an integer")
@@ -173,6 +174,12 @@ class PositionalExpertReader:
         # decoder before landing in the slot -- bitwise-identical to reading
         # the uncompressed record. ``None`` leaves every read byte-unchanged.
         self.codec_sidecar = codec_sidecar
+        # Decoded-record hash verification rides on top of the caller's
+        # verify_hash: the rANS container carries its own structural guards
+        # (lane directory + guard bytes), so the post-decode sha256 is a
+        # separately priced belt the config can drop without touching the
+        # uncompressed path's integrity mode.
+        self.codec_verify = bool(codec_verify)
         self._codec_record_map = (
             codec_sidecar.record_map() if codec_sidecar is not None else None
         )
@@ -587,6 +594,7 @@ class PositionalExpertReader:
         import numpy as np
 
         assert self.codec_sidecar is not None
+        verify_hash = verify_hash and self.codec_verify
         self.metrics.update(record_requests=1, sidecar_record_requests=1)
         view, component_views = self._decode_targets(destination, record)
         try:

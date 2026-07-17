@@ -1300,6 +1300,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--no-streamed-codec-verify",
+        action="store_true",
+        help=(
+            "Skip the post-decode sha256 of rANS-decoded records (the "
+            "container's structural guards still apply). Default: verify, "
+            "until the 16k long-context validation flips the default."
+        ),
+    )
+    parser.add_argument(
         "--streamed-codec-manifest",
         type=Path,
         default=None,
@@ -1931,6 +1940,7 @@ def _main() -> int:
         bypass_page_cache=args.f_nocache,
         slot_layout=args.slot_layout,
         streamed_codec=args.streamed_codec,
+        streamed_codec_verify=not args.no_streamed_codec_verify,
         streamed_codec_manifest=(
             str(args.streamed_codec_manifest.expanduser().resolve())
             if args.streamed_codec_manifest is not None
