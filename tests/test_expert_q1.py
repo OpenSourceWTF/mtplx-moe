@@ -142,3 +142,43 @@ def test_expert_codec_field_is_validated() -> None:
 
     with pytest.raises(ValueError, match="expert_codec"):
         replace(GLM52_EXPERT_Q2, expert_codec="q9")
+
+
+def test_resume_continues_interrupted_burn_bitwise(tmp_path: Path) -> None:
+    root, spec, manifest_path = _shadow_hy3_artifact(tmp_path)
+    source = load_expert_manifest(manifest_path)
+
+    fresh = convert_expert_q1(
+        source, root, tmp_path / "full", codec="t158", spec=spec, layers=(1,)
+    )
+    reference = fresh.bin_path().read_bytes()
+
+    # Interrupted run: one complete record plus a torn tail.
+    partial_dir = tmp_path / "resume"
+    convert_expert_q1(
+        source, root, partial_dir, codec="t158", spec=spec, layers=(1,), limit=1
+    )
+    bin_path = partial_dir / "experts-q1-t158.bin"
+    (partial_dir / "expert-manifest-q1-t158.json").unlink()
+    with bin_path.open("ab") as handle:
+        handle.write(b"\xde\xad\xbe\xef")
+
+    resumed = convert_expert_q1(
+        source,
+        root,
+        partial_dir,
+        codec="t158",
+        spec=spec,
+        layers=(1,),
+        resume=True,
+    )
+    assert bin_path.read_bytes() == reference
+    assert [
+        (record.layer, record.expert, record.offset, record.sha256)
+        for record in resumed.records
+    ] == [
+        (record.layer, record.expert, record.offset, record.sha256)
+        for record in fresh.records
+    ]
+    assert resumed.records[0].segments == fresh.records[0].segments
+    list(verify_q1_against_source(resumed, source, root, sample=2))

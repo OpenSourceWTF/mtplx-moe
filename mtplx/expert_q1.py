@@ -204,6 +204,46 @@ def read_q1_record(manifest: Q1Manifest, record: Q1Record) -> bytes:
     return blob
 
 
+def _q1_segment_template(codec: str, spec) -> tuple[Q1Segment, ...]:
+    """The segment table every record of this codec/spec shares.
+
+    Records are homogeneous: projection shapes derive from the spec, so a
+    resume scan can rebuild manifest entries for already-written records
+    without decoding them.
+    """
+
+    dims = {
+        "gate_proj": (spec.expert_hidden_size, spec.hidden_size),
+        "up_proj": (spec.expert_hidden_size, spec.hidden_size),
+        "down_proj": (spec.hidden_size, spec.expert_hidden_size),
+    }
+    segments: list[Q1Segment] = []
+    cursor = 0
+    for projection in _PROJECTIONS:
+        rows, cols = dims[projection]
+        packed_shape = _packed_shape(codec, rows, cols)
+        scales_shape = (rows, cols // SHADOW_GROUP)
+        for leaf, shape, dtype in (
+            ("packed", packed_shape, _PACKED_DTYPES[codec]),
+            ("scales", scales_shape, "U16"),
+        ):
+            elements = 1
+            for size in shape:
+                elements *= size
+            length = elements * _DTYPE_ITEM_SIZE[dtype]
+            segments.append(
+                Q1Segment(
+                    component=f"{projection}.{leaf}",
+                    dtype=dtype,
+                    shape=shape,
+                    offset=cursor,
+                    length=length,
+                )
+            )
+            cursor += length
+    return tuple(segments)
+
+
 def convert_expert_q1(
     source_manifest: ExpertManifest,
     source_root: Path | str,
@@ -216,12 +256,20 @@ def convert_expert_q1(
     limit: int | None = None,
     verify_source_hashes: bool = False,
     progress: bool = False,
+    resume: bool = False,
 ) -> Q1Manifest:
     """Convert (a slice of) an affine expert artifact into a q1 artifact.
 
     ``layers``/``experts``/``limit`` bound the record set for smoke runs;
     omitting them converts every routed record (the full burn). Streaming:
     one record is dequantized, encoded, and written at a time.
+
+    ``resume=True`` continues an interrupted burn: records are fixed
+    length, so any torn tail is truncated, completed records are rehashed
+    from the bin (their manifest entries rebuilt from the codec's segment
+    template), and encoding restarts at the first missing record. The
+    manifest is only written when the whole selection is on disk, so a
+    manifest's existence certifies a complete artifact.
     """
 
     codec = normalize_shadow_codec(codec)
@@ -250,12 +298,54 @@ def convert_expert_q1(
     )
     bin_name = f"experts-q1-{codec}.bin"
     manifest_name = f"expert-manifest-q1-{codec}.json"
+    bin_path = output_dir / bin_name
+    template = _q1_segment_template(codec, spec)
+    template_bytes = sum(segment.length for segment in template)
+    if template_bytes != expected_record_bytes:
+        raise Q1ManifestError(
+            f"q1 segment template covers {template_bytes} bytes; spec "
+            f"prices {expected_record_bytes}"
+        )
     started = time.perf_counter()
     records: list[Q1Record] = []
     bytes_in = 0
-    with (output_dir / bin_name).open("wb") as out:
-        cursor = 0
-        for index, record in enumerate(selected):
+    skip = 0
+    if resume and bin_path.exists():
+        existing = bin_path.stat().st_size
+        skip = min(existing // expected_record_bytes, len(selected))
+        boundary = skip * expected_record_bytes
+        if existing != boundary:
+            # Torn tail from the interrupted run; drop it.
+            with bin_path.open("r+b") as out:
+                out.truncate(boundary)
+        with bin_path.open("rb") as done:
+            for index in range(skip):
+                payload = done.read(expected_record_bytes)
+                if len(payload) != expected_record_bytes:
+                    raise Q1ManifestError(
+                        f"short resume scan at record {index}"
+                    )
+                record = selected[index]
+                records.append(
+                    Q1Record(
+                        layer=record.layer,
+                        expert=record.expert,
+                        offset=index * expected_record_bytes,
+                        length=expected_record_bytes,
+                        sha256=hashlib.sha256(payload).hexdigest(),
+                        segments=template,
+                    )
+                )
+        if progress and skip:
+            print(
+                f"q1[{codec}] resuming after {skip}/{len(selected)} "
+                "completed records",
+                flush=True,
+            )
+    with bin_path.open("r+b" if skip else "wb") as out:
+        out.seek(skip * expected_record_bytes)
+        cursor = skip * expected_record_bytes
+        for index, record in enumerate(selected[skip:], start=skip):
             blob = read_expert_record(
                 source_manifest,
                 source_root,

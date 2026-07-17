@@ -55,6 +55,13 @@ def main() -> int:
         help="sha256-verify every source record read (slower).",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue an interrupted burn: truncate any torn tail, "
+        "rehash completed fixed-length records, restart at the first "
+        "missing one. The manifest is only written on completion.",
+    )
+    parser.add_argument(
         "--verify-sample",
         type=int,
         default=3,
@@ -82,6 +89,7 @@ def main() -> int:
         limit=args.limit,
         verify_source_hashes=args.verify_source_hashes,
         progress=True,
+        resume=args.resume,
     )
     elapsed = time.perf_counter() - started
     total_bytes = sum(record.length for record in manifest.records)
