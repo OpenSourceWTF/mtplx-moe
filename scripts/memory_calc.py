@@ -64,16 +64,6 @@ def main() -> int:
     parser.add_argument("--cache-bytes", default="0B",
                         help="Streamed slot-cache budget, e.g. '20GiB'")
     parser.add_argument("--kv-tokens", type=int, default=2560)
-    parser.add_argument(
-        "--kv-quant",
-        default="bf16",
-        choices=["bf16", "q8", "q4"],
-        help=(
-            "KV cache storage pricing. Quantized KV is NOT wired into the "
-            "Hy3 runtime yet (campaign item; QuantizedKVCache exists in "
-            "mlx_lm); this prices the target shape."
-        ),
-    )
     parser.add_argument("--transient-slots", type=int, default=8)
     parser.add_argument("--additional-resident", default="7.1GiB",
                         help="MTP head + router kernels (measured 7.1GiB for hy3-q2 K3)")
@@ -95,13 +85,7 @@ def main() -> int:
     additional = parse_bytes(args.additional_resident)
     island_bytes = len(islands) * spec.expert_count * record
     cache_bytes = parse_bytes(args.cache_bytes)
-    kv_scale = {
-        "bf16": 1.0,
-        # bits/16 plus one bf16 scale+bias pair per 64-value group.
-        "q8": (8 + 64 / 64) / 16,
-        "q4": (4 + 64 / 64) / 16,
-    }[args.kv_quant]
-    kv_bytes = int(args.kv_tokens * spec.kv_bytes_per_token * kv_scale)
+    kv_bytes = args.kv_tokens * spec.kv_bytes_per_token
     transient_bytes = max(args.transient_slots, spec.top_k) * record
 
     band_bytes = 0
@@ -149,8 +133,7 @@ def main() -> int:
     print(f"  + compressed band     {len(band):3d} layers {gib(band_bytes)}   [{band_source}]")
     print(f"  + streamed slot cache {len(streamed):3d} layers {gib(cache_bytes)}"
           f"   ({slots_per_layer}/{spec.expert_count} slots/layer)")
-    print(f"  + KV cache ({args.kv_tokens} tokens, {args.kv_quant})"
-          f"  {gib(kv_bytes)}")
+    print(f"  + KV cache ({args.kv_tokens} tokens)       {gib(kv_bytes)}")
     print(f"  + transient slots                {gib(transient_bytes)}")
     print(f"  = WIRED TOTAL                    {gib(wired_total)}")
     print()
