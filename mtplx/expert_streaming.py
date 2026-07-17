@@ -202,10 +202,12 @@ class LayerExpertSlotBank:
         transient_slots: int,
         frequency_decay: float = 0.995,
         cache_policy: str = "frequency",
+        prefetch_slots: int = 0,
     ) -> None:
         expert_count = _integer("expert_count", expert_count, minimum=1)
         persistent_slots = _integer("persistent_slots", persistent_slots, minimum=0)
         transient_slots = _integer("transient_slots", transient_slots, minimum=1)
+        prefetch_slots = _integer("prefetch_slots", prefetch_slots, minimum=0)
         if persistent_slots > expert_count:
             raise ValueError("persistent_slots cannot exceed expert_count")
         if isinstance(frequency_decay, bool):
@@ -220,7 +222,8 @@ class LayerExpertSlotBank:
         self.expert_count = expert_count
         self.persistent_slots = persistent_slots
         self.transient_slots = transient_slots
-        self.slot_count = persistent_slots + transient_slots
+        self.prefetch_slots = prefetch_slots
+        self.slot_count = persistent_slots + transient_slots + prefetch_slots
         self.frequency_decay = frequency_decay
         if cache_policy not in {"frequency", "lru"}:
             raise ValueError("cache_policy must be 'frequency' or 'lru'")
@@ -234,6 +237,11 @@ class LayerExpertSlotBank:
         self._expert_to_slot: dict[int, int] = {}
         self._history = [_ExpertHistory() for _ in range(expert_count)]
         self._prefill_seed_candidates: set[int] = set()
+        # Speculative lookahead ring: bypasses frequency admission, never
+        # evicts an earned persistent resident, round-robin replacement.
+        self._prefetch_slot_to_expert: list[int | None] = [None] * prefetch_slots
+        self._prefetch_expert_to_slot: dict[int, int] = {}
+        self._prefetch_cursor = 0
 
     @property
     def resident_experts(self) -> tuple[int, ...]:
@@ -262,6 +270,59 @@ class LayerExpertSlotBank:
         self._expert_to_slot.clear()
         self._history = [_ExpertHistory() for _ in range(self.expert_count)]
         self._prefill_seed_candidates.clear()
+        self._prefetch_slot_to_expert = [None] * self.prefetch_slots
+        self._prefetch_expert_to_slot.clear()
+        self._prefetch_cursor = 0
+
+    def plan_prefetch(self, expert_ids: Iterable[int]) -> tuple[SlotLoad, ...]:
+        """Assign ring slots for predicted experts and return their loads.
+
+        Experts already resident (persistent or ring) are skipped. Ring
+        replacement is round-robin over the ring only — an earned
+        persistent resident is never evicted by speculation. The caller
+        owns issuing the returned loads and must respect pin state at the
+        pool layer; this planner only tracks the mapping.
+        """
+
+        if not self.prefetch_slots:
+            return ()
+        experts = tuple(
+            _integer("expert id", expert, minimum=0) for expert in expert_ids
+        )
+        for expert in experts:
+            if expert >= self.expert_count:
+                raise ValueError(
+                    f"expert id {expert} is outside [0, {self.expert_count})"
+                )
+        base = self.persistent_slots + self.transient_slots
+        loads: list[SlotLoad] = []
+        for expert in dict.fromkeys(experts):
+            if (
+                expert in self._expert_to_slot
+                or expert in self._prefetch_expert_to_slot
+            ):
+                continue
+            ring_index = self._prefetch_cursor % self.prefetch_slots
+            self._prefetch_cursor += 1
+            victim = self._prefetch_slot_to_expert[ring_index]
+            if victim is not None:
+                self._prefetch_expert_to_slot.pop(victim, None)
+            self._prefetch_slot_to_expert[ring_index] = expert
+            self._prefetch_expert_to_slot[expert] = base + ring_index
+            loads.append(
+                SlotLoad(expert=expert, slot=base + ring_index, persistent=False)
+            )
+        return tuple(loads)
+
+    def invalidate_prefetch(self, expert_id: int) -> int | None:
+        """Forget a failed ring load and return its slot."""
+
+        expert = _integer("expert id", expert_id, minimum=0)
+        slot = self._prefetch_expert_to_slot.pop(expert, None)
+        if slot is not None:
+            base = self.persistent_slots + self.transient_slots
+            self._prefetch_slot_to_expert[slot - base] = None
+        return slot
 
     def prepare_prefill_seed(self, expert_ids: Iterable[int]) -> tuple[int, ...]:
         """Choose prompt-frequent experts for empty slots without eviction."""
@@ -385,10 +446,22 @@ class LayerExpertSlotBank:
         hit_set = {
             expert for expert in unique_experts if expert in self._expert_to_slot
         }
-        miss_order = [expert for expert in unique_experts if expert not in hit_set]
+        prefetch_hits = {
+            expert
+            for expert in unique_experts
+            if expert not in hit_set and expert in self._prefetch_expert_to_slot
+        }
+        miss_order = [
+            expert
+            for expert in unique_experts
+            if expert not in hit_set and expert not in prefetch_hits
+        ]
         resolved: dict[int, int] = {
             expert: self._expert_to_slot[expert] for expert in hit_set
         }
+        for expert in prefetch_hits:
+            resolved[expert] = self._prefetch_expert_to_slot[expert]
+        hit_set |= prefetch_hits
         loads: list[SlotLoad] = []
         evictions: list[SlotEviction] = []
         pinned = set(hit_set)

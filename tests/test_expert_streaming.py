@@ -629,3 +629,49 @@ def test_simulation_reports_full_allocated_bank_for_a_partial_trace() -> None:
     assert summary["persistent_cache_scope"] == "configured_model"
     assert summary["persistent_cache_bytes"] == 75 * 32 * 21_233_664
     assert summary["observed_layer_cache_bytes"] == 32 * 21_233_664
+
+
+def test_prefetch_ring_resolves_hits_without_touching_persistent_tier():
+    bank = LayerExpertSlotBank(
+        expert_count=16,
+        persistent_slots=2,
+        transient_slots=3,
+        prefetch_slots=2,
+    )
+    assert bank.slot_count == 7
+
+    loads = bank.plan_prefetch([5, 6])
+    assert [(load.expert, load.slot, load.persistent) for load in loads] == [
+        (5, 5, False),
+        (6, 6, False),
+    ]
+    # Already-resident predictions are skipped.
+    assert bank.plan_prefetch([5, 6]) == ()
+
+    plan = bank.plan([5, 6, 7, 7], phase="decode")
+    assert set(plan.hits) == {5, 6}
+    slot_by_expert = dict(zip(plan.experts, plan.slots))
+    assert slot_by_expert[5] == 5 and slot_by_expert[6] == 6
+    assert all(load.expert == 7 for load in plan.loads)
+
+    # Ring replacement is round-robin over the ring only.
+    ring2 = bank.plan_prefetch([8, 9])
+    assert [(load.expert, load.slot) for load in ring2] == [(8, 5), (9, 6)]
+    follow_up = bank.plan([5], phase="decode")
+    assert 5 not in follow_up.hits
+
+    # The persistent tier is untouched by speculation.
+    assert bank.occupancy <= 2
+    assert bank.invalidate_prefetch(8) == 5
+    assert bank.plan([8], phase="decode").hits == ()
+
+
+def test_prefetch_ring_disabled_by_default_matches_legacy_shape():
+    bank = LayerExpertSlotBank(
+        expert_count=8,
+        persistent_slots=2,
+        transient_slots=2,
+    )
+    assert bank.slot_count == 4
+    assert bank.plan_prefetch([1, 2]) == ()
+    bank.reset()
