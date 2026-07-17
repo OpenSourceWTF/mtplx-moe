@@ -79,6 +79,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "island_layer_count": None,
     "resident_quant": None,
     "kv_quant": None,
+    "miss_shadow": None,
     "expert_integrity": "per-read",
     "prefetch_slots": 0,
     "split_route_release": "fenced",
@@ -545,6 +546,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--miss-shadow",
+        choices=("b1", "t158"),
+        default=None,
+        help=(
+            "Resident low-precision shadow banks for every streamed layer "
+            "(built at load from the sidecar, no artifact rebuild). Decode "
+            "cache misses are served instantly from the shadow instead of "
+            "waiting on SSD; the exact tier warms asynchronously. Output "
+            "is a quality tier, not bitwise — read ar_comparison / "
+            "token-divergence for the quality report. Requires cache-scope "
+            "layer and the component-banks slot layout."
+        ),
+    )
+    parser.add_argument(
         "--prefetch-slots",
         type=int,
         default=0,
@@ -635,6 +650,7 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "island_layer_count": args.island_layer_count,
         "resident_quant": args.resident_quant,
         "kv_quant": args.kv_quant,
+        "miss_shadow": args.miss_shadow,
         "expert_integrity": args.expert_integrity,
         "prefetch_slots": args.prefetch_slots,
         "split_route_release": args.split_route_release,
@@ -2110,6 +2126,7 @@ def _runtime_config(
         island_layer_count=options.get("island_layer_count"),
         resident_quant=options.get("resident_quant") or None,
         kv_quant=options.get("kv_quant") or None,
+        miss_shadow=options.get("miss_shadow") or None,
         prefetch_slots=int(options.get("prefetch_slots") or 0),
         verify_record_hashes=(
             options.get("expert_integrity", "per-read") == "per-read"
