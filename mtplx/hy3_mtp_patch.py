@@ -1020,9 +1020,12 @@ def inject_hy3_streamed_mtp_support(
                     if keep < 1:
                         raise ValueError("logits_keep must be positive when supplied")
                     head_input = head_input[:, -keep:, :]
-                if self.args.enable_lm_head_fp32:
-                    head_input = head_input.astype(mx.float32)
+                # Cast logits, not the head input: fp32 x BF16 matmul
+                # materializes an fp32 weight copy per call (see
+                # Hy3ForCausalLM.__call__).
                 logits = self.lm_head(head_input)
+                if self.args.enable_lm_head_fp32:
+                    logits = logits.astype(mx.float32)
             if not return_hidden:
                 return logits
             # Gate v1/v2 measured the head prefers the POST-norm trunk

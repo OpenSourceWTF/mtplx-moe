@@ -827,10 +827,12 @@ class Hy3MTPLayer(nn.Module):
         mask = create_attention_mask(mixed, cache, return_array=True)
         hidden = self.mtp_block(mixed, mask, cache)
         recurrent_hidden = self.final_layernorm(hidden)
-        head_hidden = recurrent_hidden
+        # Cast logits, not the head input: fp32 x BF16 matmul materializes
+        # an fp32 weight copy per call (see Hy3ForCausalLM.__call__).
+        logits = lm_head(recurrent_hidden)
         if self._lm_head_fp32:
-            head_hidden = head_hidden.astype(mx.float32)
-        return lm_head(head_hidden), recurrent_hidden
+            logits = logits.astype(mx.float32)
+        return logits, recurrent_hidden
 
 
 class Hy3MTP(nn.Module):
@@ -900,9 +902,15 @@ class Model(nn.Module):
 
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
         hidden = self.model(inputs, cache)
+        # fp32 activations against the BF16 head weight force MLX to
+        # materialize an fp32 copy of the full [vocab, hidden] matrix per
+        # call (~9.4 ms vs ~1.9 ms measured at Hy3 shapes). The GEMM already
+        # accumulates in fp32, so casting the logits keeps the flag's
+        # fp32-softmax semantics at BF16 output rounding.
+        logits = self.lm_head(hidden)
         if self.args.enable_lm_head_fp32:
-            hidden = hidden.astype(mx.float32)
-        return self.lm_head(hidden)
+            logits = logits.astype(mx.float32)
+        return logits
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         result: dict[str, mx.array] = {}
