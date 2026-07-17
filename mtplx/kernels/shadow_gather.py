@@ -1,12 +1,46 @@
-"""Shadow-bank gather matmul (issue #51 miss fallback).
+"""Shadow-bank gather matmul (issue #51 miss fallback, #114 optimized).
 
 ``shadow_gather_mm`` runs one projection of the expert MLP against a
 dense low-precision shadow bank: for each routed assignment (hidden row,
 expert id) it computes ``W_e @ x`` where ``W_e`` is the expert's shadow
 row block. Row index into the bank is the expert id (island-bank
-convention). Decode row counts are tiny (1-8), so the kernel gives each
-output element one thread that walks the g64 groups, unpacking sign bits
-(``b1``) or base-3 trits (``t158``) and accumulating in fp32.
+convention). Decode row counts are tiny (1-8).
+
+Kernel design (issue #114 — the shipped PR #102 kernel was a naive
+one-thread-per-output baseline flagged "perf unmeasured"; the GPU window
+measured it slow and a t158-hybrid regression). The measured lessons that
+shaped this rewrite:
+
+- **Keep one thread per output.** At decode sizes the matmul is limited
+  by how many independent weight streams are in flight (memory-level
+  parallelism). A SIMD-group-per-output variant that had 32 lanes
+  cooperate on a single output was measured *slower* than the naive
+  kernel here (it collapses MLP 32x and adds a reduction). One thread per
+  output maximizes MLP and won.
+- **Read the packed weights vectorized.** Each thread walks its own
+  output row (contiguous in the bank), reading b1 sign words as a single
+  ``uint2`` load per group. This, plus the large system cache absorbing
+  the strided cross-thread pattern, keeps b1 near ``mx.gather_qmm``.
+- **Decode t158 trits with a compile-time base-3 LUT.** The naive kernel
+  spent most of its t158 time on per-slot ``%3``/``/3`` chains; a 1215-
+  entry ``constant`` lookup (byte, slot -> trit-1) replaced that and cut
+  t158 ~2.5x. t158 remains ALU-heavy.
+- **Stage x per threadgroup for b1, read it broadcast-from-device for
+  t158.** b1 benefits from the staged reuse; the ALU-bound t158 prefers
+  the occupancy freed by dropping the staging barrier and threadgroup
+  buffer (measured).
+
+Honest standing versus stock ``mx.gather_qmm`` at hy3 decode shapes
+(queued-lane microbench, see research notes / the PR): **b1 matches or
+beats gather_qmm** (viable for the #111 q1-primary lane on zero-free
+sources), but **t158 still trails gather_qmm ~1.6-2.1x** — it is only
+~25% lighter than Q2 yet much heavier to unpack, so the Q2 shadow/hybrid
+lane stays disadvantaged (the #26/#65 "custom loses to stock" precedent).
+This kernel is nonetheless ~2-3x faster than the shipped naive baseline.
+
+The bank layout is unchanged from PR #102, so callers
+(``mtplx.models.expert_mlx``) and the numpy-reference parity tests are
+untouched.
 
 Scales are stored as bf16 bit patterns in u16 and widened in-kernel via
 ``as_type`` so the CPU (numpy) and GPU decode paths share one
@@ -32,98 +66,168 @@ from mtplx.expert_shadow import (
 
 _DTYPE_TAG = {mx.bfloat16: "bf16", mx.float16: "fp16", mx.float32: "fp32"}
 
-_HEADER = """
+# Per-codec defaults tuned on the hy3 decode shapes (gate/up out=1536
+# in=4096, down out=4096 in=1536, rows 1-8) via the queued-lane microbench.
+_DEFAULTS = {
+    "b1": {"threads_per_tg": 256, "stage": True},
+    "t158": {"threads_per_tg": 128, "stage": False},
+}
+# Above this input width, x staging would exceed the threadgroup memory
+# budget (4 bytes/element); fall back to broadcast-from-device reads.
+_STAGE_MAX_IN = 8192
+
+# base-3 trit LUT for t158: LUT[byte * 5 + slot] = decoded (trit - 1),
+# with trit = (byte // 3**slot) % 3. Values are in {-1, 0, 1}.
+_POW3 = (1, 3, 9, 27, 81)
+_T158_LUT = ",".join(
+    f"{((bv // _POW3[j]) % 3) - 1}.0f" for bv in range(243) for j in range(5)
+)
+
+
+def _header() -> str:
+    return f"""
 using namespace metal;
 constant constexpr uint SHADOW_GROUP = 64;
+constant float T158_LUT[1215] = {{ {_T158_LUT} }};
 
-inline float shadow_scale(ushort bits) {
+inline float shadow_scale(ushort bits) {{
     return as_type<float>(uint(bits) << 16);
-}
+}}
 """
 
-_B1_SOURCE = """
-    uint tid = thread_position_in_grid.x;
+
+def _x_access(stage: bool) -> tuple[str, str, str]:
+    """Return (staging preamble, x-index prefix, x-index suffix)."""
+
+    if stage:
+        preamble = (
+            "    threadgroup float xs[IN_STAGE];\n"
+            "    for (uint i = tid; i < in_dim; i += TPB) {\n"
+            "        xs[i] = float(x[size_t(row) * in_dim + i]);\n"
+            "    }\n"
+            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        )
+        return preamble, "xs[", "]"
+    return "", "float(x[size_t(row) * in_dim + ", "])"
+
+
+_COMMON_HEAD = """
+    uint tg = threadgroup_position_in_grid.x;
+    uint tid = thread_index_in_threadgroup;
     uint rows = uint(row_count);
     uint out_dim = uint(out_size);
     uint in_dim = uint(in_size);
-    uint total = rows * out_dim;
-    if (tid >= total) {
+    uint blocks_per_row = (out_dim + TPB - 1) / TPB;
+    uint row = tg / blocks_per_row;
+    if (row >= rows) {
         return;
     }
-    uint row = tid / out_dim;
-    uint out_index = tid % out_dim;
-    uint expert = uint(ids[row]);
-    uint groups = in_dim / SHADOW_GROUP;
-    const device uint* w = packed + (size_t(expert) * out_dim + out_index) * (groups * 2);
-    const device ushort* s = scales + (size_t(expert) * out_dim + out_index) * groups;
-    const device T* xr = x + size_t(row) * in_dim;
-    float acc = 0.0f;
-    for (uint g = 0; g < groups; ++g) {
-        float dot = 0.0f;
-        for (uint word = 0; word < 2; ++word) {
-            uint sign_bits = w[g * 2 + word];
-            uint base = g * SHADOW_GROUP + word * 32;
-            for (uint bit = 0; bit < 32; ++bit) {
-                float value = float(xr[base + bit]);
-                dot += ((sign_bits >> bit) & 1u) ? value : -value;
-            }
-        }
-        acc += shadow_scale(s[g]) * dot;
-    }
-    out[size_t(row) * out_dim + out_index] = static_cast<T>(acc);
+    uint block = tg % blocks_per_row;
 """
 
-_T158_SOURCE = """
-    uint tid = thread_position_in_grid.x;
-    uint rows = uint(row_count);
-    uint out_dim = uint(out_size);
-    uint in_dim = uint(in_size);
-    uint total = rows * out_dim;
-    if (tid >= total) {
+
+def _b1_source(threads_per_tg: int, in_dim: int, stage: bool) -> str:
+    pre, xa, xt = _x_access(stage)
+    return f"""
+    constexpr uint TPB = {int(threads_per_tg)}u;
+    constexpr uint IN_STAGE = {int(in_dim)}u;
+{_COMMON_HEAD}
+{pre}
+    uint o = block * TPB + tid;
+    if (o >= out_dim) {{
         return;
-    }
-    uint row = tid / out_dim;
-    uint out_index = tid % out_dim;
+    }}
     uint expert = uint(ids[row]);
     uint groups = in_dim / SHADOW_GROUP;
-    const device uchar* w = packed + (size_t(expert) * out_dim + out_index) * (groups * 13);
-    const device ushort* s = scales + (size_t(expert) * out_dim + out_index) * groups;
-    const device T* xr = x + size_t(row) * in_dim;
+    // b1 packs 2 u32 sign words per group; read them as one uint2 load.
+    const device uint2* pw = (const device uint2*)packed;
+    size_t rbase = (size_t(expert) * out_dim + o) * size_t(groups);
     float acc = 0.0f;
-    for (uint g = 0; g < groups; ++g) {
-        float dot = 0.0f;
-        for (uint byte_index = 0; byte_index < 13; ++byte_index) {
-            uint trits = uint(w[g * 13 + byte_index]);
-            uint slot = byte_index * 5;
-            for (uint lane = 0; lane < 5; ++lane) {
-                uint trit = trits % 3u;
-                trits /= 3u;
-                uint element = slot + lane;
-                if (element < SHADOW_GROUP) {
-                    dot += (float(trit) - 1.0f) * float(xr[g * SHADOW_GROUP + element]);
-                }
-            }
-        }
-        acc += shadow_scale(s[g]) * dot;
-    }
-    out[size_t(row) * out_dim + out_index] = static_cast<T>(acc);
+    for (uint g = 0; g < groups; ++g) {{
+        uint2 w = pw[rbase + g];
+        float sc = shadow_scale(scales[rbase + g]);
+        float gd = 0.0f;
+        uint base = g * SHADOW_GROUP;
+        _Pragma("unroll")
+        for (uint b = 0; b < 32u; ++b) {{
+            float xv = {xa}base + b{xt};
+            gd += ((w.x >> b) & 1u) ? xv : -xv;
+        }}
+        _Pragma("unroll")
+        for (uint b = 0; b < 32u; ++b) {{
+            float xv = {xa}base + 32u + b{xt};
+            gd += ((w.y >> b) & 1u) ? xv : -xv;
+        }}
+        acc += sc * gd;
+    }}
+    out[size_t(row) * out_dim + o] = static_cast<T>(acc);
+"""
+
+
+def _t158_source(threads_per_tg: int, in_dim: int, stage: bool) -> str:
+    pre, xa, xt = _x_access(stage)
+    # bytes 0..11 hold 5 trits each (slots 0..59); byte 12 holds slots
+    # 60..63 (its 5th slot, element 64, is unused padding).
+    body = []
+    for bi in range(12):
+        body.append(f"        {{ uint bv = uint(packed[gb + {bi}u]) * 5u; uint k = base + {bi * 5}u;")
+        for j in range(5):
+            body.append(
+                f"          gd = fma(T158_LUT[bv + {j}u], {xa}k + {j}u{xt}, gd);"
+            )
+        body.append("        }")
+    body.append("        { uint bv = uint(packed[gb + 12u]) * 5u; uint k = base + 60u;")
+    for j in range(4):
+        body.append(
+            f"          gd = fma(T158_LUT[bv + {j}u], {xa}k + {j}u{xt}, gd);"
+        )
+    body.append("        }")
+    inner = "\n".join(body)
+    return f"""
+    constexpr uint TPB = {int(threads_per_tg)}u;
+    constexpr uint IN_STAGE = {int(in_dim)}u;
+{_COMMON_HEAD}
+{pre}
+    uint o = block * TPB + tid;
+    if (o >= out_dim) {{
+        return;
+    }}
+    uint expert = uint(ids[row]);
+    uint groups = in_dim / SHADOW_GROUP;
+    size_t rbytes = (size_t(expert) * out_dim + o) * size_t(groups * 13u);
+    size_t rscale = (size_t(expert) * out_dim + o) * size_t(groups);
+    float acc = 0.0f;
+    for (uint g = 0; g < groups; ++g) {{
+        float sc = shadow_scale(scales[rscale + g]);
+        float gd = 0.0f;
+        uint base = g * SHADOW_GROUP;
+        size_t gb = rbytes + size_t(g) * 13u;
+{inner}
+        acc += sc * gd;
+    }}
+    out[size_t(row) * out_dim + o] = static_cast<T>(acc);
 """
 
 
 @lru_cache(maxsize=None)
-def _shadow_gather_kernel(codec: str, dtype: mx.Dtype):
+def _shadow_gather_kernel(
+    codec: str, dtype: mx.Dtype, threads_per_tg: int, in_dim: int, stage: bool
+):
     if codec == "b1":
-        source = _B1_SOURCE
+        source = _b1_source(threads_per_tg, in_dim, stage)
     elif codec == "t158":
-        source = _T158_SOURCE
+        source = _t158_source(threads_per_tg, in_dim, stage)
     else:  # pragma: no cover - guarded by callers
         raise ShadowCodecError(f"unknown shadow codec {codec!r}")
     dtype_tag = _DTYPE_TAG.get(dtype, "generic")
     return mx.fast.metal_kernel(
-        name=f"mtplx_shadow_gather_{codec}_{dtype_tag}",
+        name=(
+            f"mtplx_shadow_gather_{codec}_{dtype_tag}_t{threads_per_tg}"
+            f"_k{in_dim}_s{int(stage)}"
+        ),
         input_names=["x", "ids", "packed", "scales", "row_count", "out_size", "in_size"],
         output_names=["out"],
-        header=_HEADER,
+        header=_header(),
         source=source,
     )
 
@@ -135,7 +239,8 @@ def shadow_gather_mm(
     scales: mx.array,
     *,
     codec: str,
-    threadgroup_size: int = 64,
+    threads_per_tg: int | None = None,
+    stage: bool | None = None,
 ) -> mx.array:
     """Gather-matmul one projection from a shadow bank.
 
@@ -144,6 +249,10 @@ def shadow_gather_mm(
     ``b1`` / (experts, out, bytes) u8 for ``t158``. ``scales``:
     (experts, out, in/64) u16 bf16 bits. Returns (rows, out) in
     ``x.dtype`` (fp32 accumulate).
+
+    ``threads_per_tg`` / ``stage`` override the per-codec tuned defaults
+    (one output element per thread; optionally stage ``x[row]`` in
+    threadgroup memory). Callers normally leave these at the defaults.
     """
 
     if x.ndim != 2:
@@ -170,13 +279,27 @@ def shadow_gather_mm(
             f"shadow packed shape {tuple(packed.shape)} does not match "
             f"codec {codec!r} groups={groups}"
         )
+
+    defaults = _DEFAULTS.get(codec)
+    if defaults is None:  # pragma: no cover - guarded above via expected_words
+        raise ShadowCodecError(f"unknown shadow codec {codec!r}")
+    tpt = int(defaults["threads_per_tg"] if threads_per_tg is None else threads_per_tg)
+    if tpt < 1:
+        raise ShadowCodecError("threads_per_tg must be >= 1")
+    use_stage = bool(defaults["stage"] if stage is None else stage)
+    if use_stage and in_dim > _STAGE_MAX_IN:
+        use_stage = False  # keep threadgroup memory within budget
+
     total = rows * out_dim
     if total <= 0:
         raise ShadowCodecError("shadow_gather_mm requires at least one assignment")
     if total >= 2**31:  # metal_kernel output element counts must stay < 2^31
         raise ShadowCodecError(f"shadow gather grid too large: {total}")
-    kernel = _shadow_gather_kernel(codec, x.dtype)
-    grid_x = -(-total // threadgroup_size) * threadgroup_size
+
+    kernel = _shadow_gather_kernel(codec, x.dtype, tpt, in_dim, use_stage)
+    blocks_per_row = -(-out_dim // tpt)
+    threadgroups = rows * blocks_per_row
+    grid_x = threadgroups * tpt
     (out,) = kernel(
         inputs=[
             mx.contiguous(x),
@@ -189,7 +312,7 @@ def shadow_gather_mm(
         ],
         template=[("T", x.dtype)],
         grid=(grid_x, 1, 1),
-        threadgroup=(int(threadgroup_size), 1, 1),
+        threadgroup=(tpt, 1, 1),
         output_shapes=[(rows, out_dim)],
         output_dtypes=[x.dtype],
     )
