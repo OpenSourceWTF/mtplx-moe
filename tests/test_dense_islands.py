@@ -490,19 +490,32 @@ def test_island_layer_count_resolves_from_pin_order() -> None:
     assert config.island_layer_count == 4
 
 
-def test_island_layer_count_validation() -> None:
+def test_island_layer_count_validation(tmp_path) -> None:
     with pytest.raises(ValueError, match="mutually exclusive"):
         _config(island_layers=(1,), island_layer_count=2)
-    # glm52-q4 remains unmeasured; glm52-expert-q2 gained a measured pin
-    # order on 2026-07-17 and no longer exercises this error path.
-    with pytest.raises(ValueError, match="pin order"):
-        ExpertStreamingConfig(
-            model_key="glm52-q4",
-            memory_limit_bytes=1 << 30,
-            max_live_kv_tokens=16,
-            slot_layout="component-banks",
-            island_layer_count=1,
-        )
+    # A spec without a measured pin order defers count resolution to the
+    # model root (issue #98: island-placement.json). glm52-q4 remains
+    # unmeasured (glm52-expert-q2 gained a measured order on 2026-07-17,
+    # so it resolves from the spec and no longer exercises this path).
+    # Without a placement file the count is unresolved: memory_plan
+    # refuses, and resolving against a rootless directory raises the
+    # precedence-documenting error.
+    from mtplx.expert_runtime import resolve_island_placement
+    from mtplx.expert_streaming_models import get_model_spec
+
+    deferred = ExpertStreamingConfig(
+        model_key="glm52-q4",
+        memory_limit_bytes=1 << 30,
+        max_live_kv_tokens=16,
+        slot_layout="component-banks",
+        island_layer_count=1,
+    )
+    assert deferred.island_layers == ()
+    assert deferred.island_layer_count == 1
+    with pytest.raises(ValueError, match="unresolved"):
+        deferred.memory_plan(get_model_spec("glm52-q4"))
+    with pytest.raises(ValueError, match="island-placement.json"):
+        resolve_island_placement(deferred, tmp_path)
     with pytest.raises(ValueError, match="island_layer_count"):
         ExpertStreamingConfig(
             model_key="hy3-expert-q2",
