@@ -455,7 +455,12 @@ def test_load_requires_artifacts_for_streamed_mtp(tmp_path: Path) -> None:
         )
 
 
-def test_load_rejects_q4_mtp_precision_for_glm_q4(tmp_path: Path) -> None:
+def test_load_glm_q4_precision_accepted_but_fails_closed_without_q4_artifact(
+    tmp_path: Path,
+) -> None:
+    # Issue #100: glm52-q4 now accepts the Q4 head sibling, so precision="q4"
+    # clears the backend gate and instead fails closed at the Q4 artifact
+    # boundary when the directory has no verified layer78-q4 artifact.
     root = _guard_config_dir(tmp_path)
     config = ExpertStreamingConfig(
         model_key="glm52-q4",
@@ -463,7 +468,7 @@ def test_load_rejects_q4_mtp_precision_for_glm_q4(tmp_path: Path) -> None:
         max_live_kv_tokens=0,
         runtime_reserve_bytes=0,
     )
-    with pytest.raises(RuntimeError, match="BF16"):
+    with pytest.raises(RuntimeError, match="layer78-q4|artifact|manifest"):
         load(
             root,
             mtp=True,
@@ -513,13 +518,12 @@ def test_streamed_mtp_dispatch_and_precision_matrix() -> None:
     assert _streamed_mtp_backend("hy3-expert-q2", "bf16") == "hy3"
     assert _streamed_mtp_backend("glm52-expert-q2", "bf16") == "glm52"
     assert _streamed_mtp_backend("glm52-q4", "bf16") == "glm52"
+    # Issue #100: the Q4 head sibling is selectable for both GLM lanes.
+    assert _streamed_mtp_backend("glm52-expert-q2", "q4") == "glm52"
+    assert _streamed_mtp_backend("glm52-q4", "q4") == "glm52"
 
     with pytest.raises(RuntimeError, match="BF16"):
         _streamed_mtp_backend("hy3-expert-q2", "q4")
-    with pytest.raises(RuntimeError, match="BF16"):
-        _streamed_mtp_backend("glm52-expert-q2", "q4")
-    with pytest.raises(RuntimeError, match="BF16"):
-        _streamed_mtp_backend("glm52-q4", "q4")
 
 
 def test_load_rejects_mtp_artifacts_without_streaming(tmp_path: Path) -> None:
