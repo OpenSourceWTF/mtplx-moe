@@ -44,6 +44,10 @@ from .expert_streaming_models import (
     resident_quant_covers,
     resident_quant_kept_bytes,
 )
+from .optimization_profiles import (
+    ENFORCEABLE_KNOBS,
+    not_applicable_violations,
+)
 from .resource_metrics import ExpertPipelineLedger, ExpertPipelineRoute
 from .route_census import (
     ISLAND_PLACEMENT_FILENAME,
@@ -1683,6 +1687,18 @@ class ExpertStreamingRuntime:
         model_spec = get_model_spec(config.model_key) if spec is None else spec
         if model_spec.key != config.model_key:
             raise ExpertStreamingConfigurationError("config and spec model keys differ")
+        # Optimization-profile enforcement (issue #99): knobs the profile
+        # marks not_applicable fail loudly when explicitly forced. This
+        # generalizes resident_loader's _verify_kv_quant_honored probe to
+        # config time — pure config inspection, no new runtime probes.
+        profile_violations = not_applicable_violations(
+            config.model_key,
+            {knob: getattr(config, knob, None) for knob in ENFORCEABLE_KNOBS},
+        )
+        if profile_violations:
+            raise ExpertStreamingConfigurationError(
+                "; ".join(profile_violations)
+            )
         config = resolve_island_placement(config, artifact_root, spec=model_spec)
         manifest = load_expert_manifest(manifest_path)
         cls._validate_manifest_identity(manifest, model_spec)

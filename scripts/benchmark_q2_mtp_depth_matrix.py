@@ -25,6 +25,9 @@ from mtplx.benchmarks.resource_telemetry import (  # noqa: E402
     PowermetricsCollector,
     ResourceTelemetrySampler,
 )
+from mtplx.optimization_profiles import (  # noqa: E402
+    profile_conflict_warnings,
+)
 
 
 SCHEMA = "mtplx-q2-bf16-mtp-depth-matrix-v3"
@@ -682,6 +685,38 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "powermetrics": args.powermetrics,
         "powermetrics_interval_ms": args.powermetrics_interval_ms,
     }
+
+
+def _profile_advisories(
+    requests: Sequence[Mapping[str, Any]],
+    runtime_options: Mapping[str, Any],
+    *,
+    verify_strategy: str,
+) -> list[str]:
+    """Optimization-profile advisories for the requested matrix (#99).
+
+    Compares the effective flags against each model's measured-default
+    profile and returns "profile suggests" lines. Warning only — nothing
+    here changes what runs.
+    """
+
+    lines: list[str] = []
+    for request in requests:
+        model_key = MODEL_SPECS[request["model"]]["model_key"]
+        observed = {
+            "resident_quant": runtime_options.get("resident_quant") or None,
+            "kv_quant": runtime_options.get("kv_quant") or None,
+            "expert_integrity": runtime_options.get("expert_integrity"),
+            "split_route_release": runtime_options.get("split_route_release"),
+            "prefetch_slots": int(runtime_options.get("prefetch_slots") or 0),
+            "miss_shadow": runtime_options.get("miss_shadow") or None,
+            "miss_shadow_layers": runtime_options.get("miss_shadow_layers"),
+            "island_layer_count": runtime_options.get("island_layer_count"),
+            "mtp_depth": tuple(request["depths"]),
+            "verify_strategy": verify_strategy,
+        }
+        lines.extend(profile_conflict_warnings(model_key, observed))
+    return lines
 
 
 def _jsonable(value: Any) -> Any:
@@ -2856,11 +2891,21 @@ def main(argv: Sequence[str] | None = None, *, apis: RunnerAPIs | None = None) -
             _write_json_atomic(args.output_json, rendered_checkpoint)
 
     try:
+        requests = _requests_from_args(args)
+        runtime_options = _runtime_options_from_args(args)
+        try:
+            advisories = _profile_advisories(
+                requests, runtime_options, verify_strategy=args.verify_strategy
+            )
+        except Exception as exc:  # advisory must never block a run
+            advisories = [f"profile advisory computation failed: {exc}"]
+        for line in advisories:
+            print(line, file=sys.stderr)
         payload = run_depth_matrix(
-            _requests_from_args(args),
+            requests,
             contexts=args.contexts,
             output_tokens=args.output_tokens,
-            runtime_options=_runtime_options_from_args(args),
+            runtime_options=runtime_options,
             mtp_disabled_baseline=args.mtp_disabled_baseline,
             verify_strategy=args.verify_strategy,
             compiled_verify_mode=args.compiled_verify_mode,
