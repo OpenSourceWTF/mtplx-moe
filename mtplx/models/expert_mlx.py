@@ -1696,10 +1696,19 @@ class HotExpertSwitchGLU(nn.Module):
                         try:
                             shared = shared_work()
                             # Submit the shared branch so the GPU has work
-                            # during miss I/O; blocking the generation thread
-                            # here serialized host-side service instead.
+                            # during miss I/O. Deferred-pin mode already
+                            # trusts the next generation-thread eval for
+                            # coverage, so the blocking barrier serves no
+                            # release obligation there; strict mode keeps it.
                             async_eval = getattr(mx, "async_eval", None)
-                            if callable(async_eval):
+                            if (
+                                getattr(
+                                    self.runtime.config,
+                                    "deferred_pin_release",
+                                    False,
+                                )
+                                and callable(async_eval)
+                            ):
                                 async_eval(shared)
                             else:
                                 mx.eval(shared)
