@@ -173,6 +173,7 @@ class ExpertStreamingConfig:
     kv_quant: str | None = None
     split_route_release: str = "fenced"
     prefetch_slots: int = 0
+    speculative_io_fraction: float = 0.25
     route_census: bool = True
     miss_shadow: str | None = None
     miss_shadow_layers: int | None = None
@@ -272,6 +273,14 @@ class ExpertStreamingConfig:
         )
         if self.prefetch_slots and self.cache_scope != "layer":
             raise ValueError("prefetch_slots require cache_scope 'layer'")
+        if isinstance(self.speculative_io_fraction, bool) or not isinstance(
+            self.speculative_io_fraction, (int, float)
+        ):
+            raise TypeError("speculative_io_fraction must be a number")
+        fraction = float(self.speculative_io_fraction)
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError("speculative_io_fraction must be in (0, 1]")
+        object.__setattr__(self, "speculative_io_fraction", fraction)
         if self.island_layer_count is not None:
             if self.island_layers:
                 raise ValueError(
@@ -1615,9 +1624,29 @@ class ExpertStreamingRuntime:
         self._prefetch_backlog_limit = 4 * max(
             1, plan.prefetch_slots_per_layer
         )
+        # Speculative I/O admission: speculation may occupy at most a
+        # configured fraction of the inflight read budget, so a demand
+        # miss read never queues behind a burst of predictions at the
+        # SSD. Concurrency floors at one read (speculation is throttled,
+        # never starved) and the ring width still bounds it above.
+        if config.prefetch_slots > 0:
+            inflight_budget = (
+                config.max_inflight_io_bytes
+                if config.max_inflight_io_bytes is not None
+                else slots.max_inflight_io_bytes
+            )
+            budget_reads = int(
+                inflight_budget * config.speculative_io_fraction
+            ) // max(1, spec.expert_record_bytes)
+            self._prefetch_max_reads = max(
+                1,
+                min(budget_reads, max(1, plan.prefetch_slots_per_layer)),
+            )
+        else:
+            self._prefetch_max_reads = 0
         self._prefetch_executor = (
             ThreadPoolExecutor(
-                max_workers=max(1, plan.prefetch_slots_per_layer),
+                max_workers=self._prefetch_max_reads,
                 thread_name_prefix="mtplx-prefetch",
             )
             if config.prefetch_slots > 0
@@ -2870,6 +2899,13 @@ class ExpertStreamingRuntime:
                 shadow["served_assignments"] = self._shadow_serve_assignments
                 shadow["served_experts"] = self._shadow_serve_experts
             snapshot["shadow_experts"] = shadow
+        snapshot["speculative_io"] = {
+            "fraction": self.config.speculative_io_fraction,
+            "max_concurrent_reads": self._prefetch_max_reads,
+            "max_inflight_bytes": (
+                self._prefetch_max_reads * self.spec.expert_record_bytes
+            ),
+        }
         if self._pipeline_ledger is not None:
             snapshot["expert_pipeline"] = self._pipeline_ledger.snapshot()
         self._raise_if_unhealthy()

@@ -3323,6 +3323,86 @@ def test_deferred_split_route_release_matches_fenced_bitwise(
     assert mx.array_equal(fenced_logits, deferred_logits).item()
 
 
+def test_speculative_io_admission_caps_prefetch_read_concurrency(
+    tmp_path: Path,
+) -> None:
+    """Speculative reads are capped at a configurable fraction of the
+    inflight I/O budget so demand miss reads never queue behind
+    speculation at the SSD."""
+
+    root, config, spec, manifest_path = _integrated_hy3_artifact(
+        tmp_path, expert_count=4, top_k=1
+    )
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    record = spec.expert_record_bytes
+
+    def open_runtime(*, prefetch_slots: int = 4, **overrides):
+        stream_config = ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=(
+                fixed
+                + spec.persistent_cache_bytes(1)
+                + prefetch_slots * record
+            ),
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            prefetch_slots=prefetch_slots,
+            max_inflight_io_bytes=8 * record,
+            **overrides,
+        )
+        return ExpertStreamingRuntime.open(
+            root,
+            manifest_path,
+            stream_config,
+            spec=spec,
+            buffer_allocator=make_mlx_slot_buffer_allocator(
+                stream_config.memory_plan(spec), spec
+            ),
+            device_synchronize=mx.synchronize,
+            apply_memory_cap=False,
+        )
+
+    # Default fraction 0.25 of an 8-record budget: 2 concurrent reads.
+    runtime = open_runtime()
+    try:
+        assert runtime._prefetch_executor._max_workers == 2
+        surface = runtime.snapshot(mx_module=mx)["speculative_io"]
+        assert surface == {
+            "fraction": 0.25,
+            "max_concurrent_reads": 2,
+            "max_inflight_bytes": 2 * record,
+        }
+    finally:
+        runtime.close()
+
+    # A tighter fraction floors at one read — speculation is never
+    # starved outright.
+    runtime = open_runtime(speculative_io_fraction=0.1)
+    try:
+        assert runtime._prefetch_executor._max_workers == 1
+        surface = runtime.snapshot(mx_module=mx)["speculative_io"]
+        assert surface["max_concurrent_reads"] == 1
+        assert surface["max_inflight_bytes"] == record
+    finally:
+        runtime.close()
+
+    # The ring width still bounds concurrency above.
+    runtime = open_runtime(speculative_io_fraction=1.0)
+    try:
+        assert runtime._prefetch_executor._max_workers == 4
+    finally:
+        runtime.close()
+
+    # Disabled prefetch reports an idle admission surface.
+    runtime = open_runtime(prefetch_slots=0)
+    try:
+        surface = runtime.snapshot(mx_module=mx)["speculative_io"]
+        assert surface["max_concurrent_reads"] == 0
+        assert surface["max_inflight_bytes"] == 0
+    finally:
+        runtime.close()
+
+
 def test_prefetch_ring_load_resolves_as_route_hit_bitwise(
     tmp_path: Path,
 ) -> None:
@@ -3439,6 +3519,11 @@ def _open_prefetch_runtime(
         max_live_kv_tokens=0,
         runtime_reserve_bytes=0,
         prefetch_slots=prefetch_slots,
+        # A multi-record I/O budget, as on real configs: the default
+        # speculative admission fraction (0.25) then grants two
+        # concurrent speculative reads, which the gated choreographies
+        # rely on (one parked load must not serialize the ring).
+        max_inflight_io_bytes=8 * spec.expert_record_bytes,
     )
     return ExpertStreamingRuntime.open(
         root,

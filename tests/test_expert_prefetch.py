@@ -52,6 +52,26 @@ def test_prefetch_slots_require_layer_cache_scope() -> None:
     assert config.prefetch_slots == 0
 
 
+def test_speculative_io_fraction_validation() -> None:
+    config = ExpertStreamingConfig(**_config_kwargs())
+    assert config.speculative_io_fraction == 0.25
+
+    for fraction in (0.1, 0.5, 1.0):
+        config = ExpertStreamingConfig(
+            **_config_kwargs(speculative_io_fraction=fraction)
+        )
+        assert config.speculative_io_fraction == fraction
+
+    for bad in (0.0, -0.25, 1.01, 2):
+        with pytest.raises(ValueError, match="speculative_io_fraction"):
+            ExpertStreamingConfig(**_config_kwargs(speculative_io_fraction=bad))
+    for wrong_type in (True, "0.5", None):
+        with pytest.raises(TypeError, match="speculative_io_fraction"):
+            ExpertStreamingConfig(
+                **_config_kwargs(speculative_io_fraction=wrong_type)
+            )
+
+
 def test_memory_plan_carries_prefetch_slots_per_layer() -> None:
     spec = get_model_spec("hy3-expert-q2")
     config = ExpertStreamingConfig(**_config_kwargs(prefetch_slots=8))
