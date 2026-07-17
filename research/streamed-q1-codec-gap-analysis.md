@@ -42,7 +42,13 @@ The affine assumption is expressed as four independent invariants:
 `params*bits/8 + groups*2*parameter_bytes`. Each gate below enforces at
 least one of them.
 
-## Gate 1 — manifest schema (hard-fails first)
+## Gate 1 — manifest schema (CLOSED)
+
+Closed: `ExpertManifest` now carries a codec-conditional component schema
+(`quant_mode` == codec name, nominal `quant_bits` 1/2, six `packed`/`scales`
+components) and `expert_q1.build_streamed_expert_manifest` unifies a q1
+artifact (resident-only safetensors + record bin) into the authoritative
+streamed manifest — route (a). The original per-invariant analysis follows.
 
 `mtplx/expert_manifest.py`:
 
@@ -85,7 +91,11 @@ b1/t158 (10 and 15 bytes per g64). `packed_weight_bytes`/
 `scale_bias_bytes` remain affine-only helpers; nothing on the q1 path
 reads them when `expert_codec != "affine"`.
 
-## Gate 3 — slot pool and bank allocators
+## Gate 3 — slot pool and bank allocators (CLOSED)
+
+Closed: `_component_array` / `MlxComponentBank` grew the U8/U16 dtype map and
+`make_mlx_component_bank_allocator` grew the codec-aware `expected_signature`
+(packed+scales geometry). The pool guard passes on the nominal q1 values.
 
 - `mtplx/expert_slots.py` L639-643: pool guard compares
   `manifest.quant_bits/quant_group_size` to the spec — passes once the
@@ -101,7 +111,14 @@ reads them when `expert_codec != "affine"`.
 - `make_mlx_slot_buffer_allocator` (L178-242) sizes raw byte slots from
   `spec.expert_record_bytes` — already correct via Gate 2.
 
-## Gate 4 — execution
+## Gate 4 — execution (CLOSED for the streamed component-bank path)
+
+Closed: `HotExpertSwitchGLU._dispatch_component_bank` routes affine records
+through `gather_qmm` and shadow-codec records through `shadow_gather_mm`
+(fed slot-bank rows, not expert ids); `open()` requires the component-banks
+layout and rejects direct-slot / mapped / island / `miss_shadow` for a
+q1-primary spec. Items 4-5 below (tuned prefill kernel, banked-mmap/island
+q1 support) remain open. The original analysis follows.
 
 - Streamed component-bank path: `_run_component_bank_q4` →
   `_gather_component_bank` (L1152-1212) calls
@@ -160,5 +177,10 @@ q1 converter already hashes per record).
 5. Optional: banked-mmap band + island support for q1 layers;
    `miss_shadow`/q1 mutual exclusion.
 
-Until 1-3 land, q1 artifacts are priced (registry), produced
-(converter), and quality-gated (probe) but not servable.
+Items 1-3 have landed: t158/b1 q1 artifacts now stream through the SSD
+expert machinery and execute from component-bank slots via
+`shadow_gather_mm` (tests: `tests/test_expert_q1_serve.py`). q1 artifacts
+are priced (registry), produced (converter), quality-gated (probe), and
+servable through the component-banks streamed path. Items 4-5 (a
+prefill-tuned q1 gather kernel + benchmark rows; banked-mmap/island q1
+support) remain open follow-ups.
