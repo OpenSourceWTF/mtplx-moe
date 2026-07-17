@@ -157,6 +157,7 @@ class ExpertStreamingConfig:
     resident_quant: str | None = None
     kv_quant: str | None = None
     split_route_release: str = "fenced"
+    prefetch_slots: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -225,6 +226,13 @@ class ExpertStreamingConfig:
             raise ValueError(
                 "split_route_release must be 'fenced' or 'deferred'"
             )
+        object.__setattr__(
+            self,
+            "prefetch_slots",
+            _integer("prefetch_slots", self.prefetch_slots, minimum=0),
+        )
+        if self.prefetch_slots and self.cache_scope != "layer":
+            raise ValueError("prefetch_slots require cache_scope 'layer'")
         if self.island_layer_count is not None:
             if self.island_layers:
                 raise ValueError(
@@ -419,6 +427,7 @@ class ExpertStreamingConfig:
             island_layer_count=len(self.island_layers),
             mmap_island_layer_count=len(self.mmap_island_layers),
             mmap_islands_wired=self.mmap_island_wired,
+            prefetch_slots_per_layer=self.prefetch_slots,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1410,6 +1419,7 @@ class ExpertStreamingRuntime:
                     transient_slots=plan.transient_slots,
                     frequency_decay=config.frequency_decay,
                     cache_policy=config.cache_policy,
+                    prefetch_slots=plan.prefetch_slots_per_layer,
                 )
                 for layer in spec.routed_layer_indices
                 if layer not in self.island_layer_set
