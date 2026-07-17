@@ -41,19 +41,33 @@ def _load_module():
 
 
 class _FakeStreaming:
-    def __init__(self) -> None:
+    def __init__(self, config: dict | None = None) -> None:
         self.reset_calls = 0
+        options = dict(config or {})
+        # The runner's fully-islanded gate reads the streaming config and
+        # spec attributes; mirror the real runtime's surface for them.
+        self.config = SimpleNamespace(
+            island_layers=tuple(options.get("island_layers") or ()),
+            mmap_island_layers=tuple(options.get("mmap_island_layers") or ()),
+        )
+        self.spec = SimpleNamespace(routed_layer_indices=(1, 2, 3))
 
     def reset(self) -> None:
         self.reset_calls += 1
 
 
 class _FakeRuntime:
-    def __init__(self, model_key: str, *, mtp_enabled: bool = True) -> None:
+    def __init__(
+        self,
+        model_key: str,
+        *,
+        mtp_enabled: bool = True,
+        streaming_config: dict | None = None,
+    ) -> None:
         self.model_key = model_key
         self.mtp_enabled = mtp_enabled
         self.tokenizer = object()
-        self.expert_streaming = _FakeStreaming()
+        self.expert_streaming = _FakeStreaming(streaming_config)
         self.admissions: list[int] = []
         self.closed = False
         self.telemetry_reads = 0
@@ -293,6 +307,7 @@ def _fake_apis(
         runtime = _FakeRuntime(
             kwargs["expert_streaming_config"]["model_key"],
             mtp_enabled=bool(kwargs["mtp"]),
+            streaming_config=kwargs["expert_streaming_config"],
         )
         calls.runtimes.append(runtime)
         return runtime
@@ -438,6 +453,40 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
     assert args.trace_routes is False
     assert args.hy3_q2_prompt_tail is None
     assert args.glm52_q2_prompt_tail is None
+
+
+def test_miss_shadow_flag_parses_and_reaches_runtime_options() -> None:
+    module = _load_module()
+
+    defaults = module.build_parser().parse_args([])
+    assert defaults.miss_shadow is None
+    assert module.DEFAULT_RUNTIME_OPTIONS["miss_shadow"] is None
+
+    for codec in ("b1", "t158"):
+        args = module.build_parser().parse_args(["--miss-shadow", codec])
+        assert args.miss_shadow == codec
+        assert module._runtime_options_from_args(args)["miss_shadow"] == codec
+
+    with pytest.raises(SystemExit):
+        module.build_parser().parse_args(["--miss-shadow", "q4"])
+
+
+def test_miss_shadow_survives_to_runtime_config_and_payload(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (1,)}],
+        contexts=(1024,),
+        runtime_options={"miss_shadow": "t158"},
+        apis=apis,
+    )
+
+    assert calls.configs[0]["miss_shadow"] == "t158"
+    assert payload["configuration"]["runtime"]["miss_shadow"] == "t158"
+    assert payload["models"][0]["runtime_config"]["miss_shadow"] == "t158"
 
 
 def test_issue51_kernel_selectors_parse_independently() -> None:
