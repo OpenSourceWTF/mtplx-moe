@@ -9,4 +9,6 @@ MTPLX separates detection from support.
 | Incompatible architecture | MTP markers exist for an unsupported architecture | Exit with roadmap pointer |
 | No MTP | No MTP head detected | Exit with a clear message |
 
-Only verified Qwen3-Next-MTP models are supported for v0.3.0 product runs.
+Product runs require a verified artifact contract for a backend the installed architecture registry
+marks runnable. Use `mtplx model architectures --json` for the current family matrix and `mtplx
+inspect MODEL --json` for the artifact-level decision.

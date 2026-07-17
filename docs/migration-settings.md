@@ -5,6 +5,11 @@ The first settings release keeps existing individual CLI flags, reviewed
 environment aliases, and flat TOML keys working through compatibility adapters.
 They are not removed by this migration.
 
+The alias sections below are generated from the canonical setting catalog. Do not hand-edit them;
+run `scripts/generate_settings_reference.py` and commit its output when an alias intentionally
+changes. Environment variables absent from this table are not supported reusable configuration
+unless another focused guide explicitly classifies them.
+
 Prefer explicit scopes:
 
 - Replace reusable flag clusters with `mtplx settings user set NAME=VALUE`.

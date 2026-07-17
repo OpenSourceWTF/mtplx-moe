@@ -3,8 +3,11 @@
 Status: experimental, off by default, pending exactness-policy review.
 
 ```bash
-MTPLX_NAX_VERIFY=1 mtplx serve ...
+mtplx serve --set verify.nax.enabled=true
 ```
+
+`MTPLX_NAX_VERIFY=1` remains a reviewed compatibility alias. New automation should use the canonical
+setting; see the generated [migration table](migration-settings.md).
 
 When enabled at model load, 4-bit affine projections route through
 verify-specialized Metal kernels (ported from bstnxbt/dflash-mlx, Apache-2.0)

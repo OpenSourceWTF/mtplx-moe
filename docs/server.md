@@ -1,7 +1,7 @@
 # Server
 
-The v0.1 server target is OpenAI-compatible local serving, with Anthropic
-Messages compatibility available for coding harness smoke tests.
+The server provides OpenAI-compatible local serving and Anthropic Messages compatibility for coding
+clients and harnesses.
 
 ```bash
 mtplx serve --host 127.0.0.1 --port 8000 --no-stats-footer
