@@ -287,11 +287,13 @@ def test_hy3_mtp_recycles_the_final_normalized_hidden(
     assert recording_norm.output is not None
     assert recurrent_hidden.dtype == recording_norm.output.dtype
     assert mx.array_equal(recurrent_hidden, recording_norm.output).item()
-    expected_head_dtype = mx.float32 if lm_head_fp32 else recurrent_hidden.dtype
-    assert captured_head_inputs[0].dtype == expected_head_dtype
-    assert mx.array_equal(
-        captured_head_inputs[0], recurrent_hidden.astype(expected_head_dtype)
-    ).item()
+    # The head consumes the BF16 hidden directly; fp32 semantics apply to
+    # the logits (casting the head input would materialize an fp32 copy of
+    # the full vocab matrix on every call).
+    assert captured_head_inputs[0].dtype == recurrent_hidden.dtype
+    assert mx.array_equal(captured_head_inputs[0], recurrent_hidden).item()
+    expected_logits_dtype = mx.float32 if lm_head_fp32 else recurrent_hidden.dtype
+    assert logits.dtype == expected_logits_dtype
 
 
 def test_loader_rejects_revision_mismatch(tmp_path: Path) -> None:
