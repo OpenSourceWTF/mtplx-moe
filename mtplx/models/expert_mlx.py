@@ -805,6 +805,282 @@ class BankedMmapIslandStore:
         gc.collect()
 
 
+class CompressedBankedIslandStore:
+    """Compressed island banks decoded per wave on device (issue #51, C7c).
+
+    Every expert of every covered layer is resident as Huffman lane streams
+    (~1.2-1.3x smaller than raw); a per-wave Metal decode expands only the
+    routed assignments into scratch that stock ``gather_qmm`` consumes with
+    identity indices. Misses cannot exist; routing never touches the host;
+    decode is part of the lazy graph.
+    """
+
+    def __init__(
+        self,
+        banked_manifest: Path | str,
+        layers: Iterable[int],
+        *,
+        expert_count: int,
+        residency: str = "wired",
+        verify_hash: bool = True,
+    ) -> None:
+        from mtplx.expert_banked import (
+            BankedManifestError,
+            component_class,
+            load_banked_manifest,
+        )
+        from mtplx.expert_huffman_metal import build_class_tables
+
+        if residency not in {"wired", "paged", "copy"}:
+            raise ValueError(
+                "banked residency must be 'wired', 'paged', or 'copy'"
+            )
+        self.residency = str(residency)
+        self.layers = tuple(sorted({int(layer) for layer in layers}))
+        if not self.layers:
+            raise ValueError("compressed island store requires layers")
+        self._banked = load_banked_manifest(banked_manifest)
+        if self._banked.codec != "huffman-l12-v1":
+            raise BankedManifestError(
+                f"compressed island store requires codec 'huffman-l12-v1'; "
+                f"manifest has {self._banked.codec!r}"
+            )
+        missing = [
+            layer for layer in self.layers if layer not in self._banked.layer_set
+        ]
+        if missing:
+            raise BankedManifestError(
+                f"banked manifest does not cover layers {missing}"
+            )
+        if self._banked.expert_count != int(expert_count):
+            raise BankedManifestError(
+                f"banked manifest holds {self._banked.expert_count} experts "
+                f"per layer; the model routes {expert_count}"
+            )
+        self.expert_count = int(expert_count)
+        self._verify_hash = bool(verify_hash)
+        self._tables = build_class_tables(self._banked.tables)
+        self._component_class = component_class
+        self._layers_data: dict[int, dict] = {}
+        self._bases: list[mx.array] = []
+        self._verify_seconds = 0.0
+        self._closed = False
+
+    def prepare(self) -> None:
+        from mtplx.expert_banked import BankedManifestError
+
+        if self._closed:
+            raise RuntimeError("compressed island store is closed")
+        if self._layers_data:
+            return
+        path = self._banked.bin_path()
+        alignment = self._banked.alignment
+        for layer in self.layers:
+            entry = self._banked.layer_entry(layer)
+            if self._verify_hash:
+                started = time.perf_counter()
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    handle.seek(entry.offset)
+                    remaining = entry.length
+                    while remaining:
+                        chunk = handle.read(min(remaining, 8 << 20))
+                        if not chunk:
+                            raise BankedManifestError(
+                                f"banked layer {layer} region is truncated"
+                            )
+                        digest.update(chunk)
+                        remaining -= len(chunk)
+                if digest.hexdigest() != entry.sha256:
+                    raise BankedManifestError(
+                        f"banked layer {layer} region hash mismatch"
+                    )
+                self._verify_seconds += time.perf_counter() - started
+            dir_extent = (
+                (entry.directory_words * 4 + alignment - 1)
+                // alignment
+                * alignment
+            )
+            payload_len = entry.length - dir_extent
+            payload_extent = -(-payload_len // alignment) * alignment
+            wired = self.residency == "wired"
+            dir_base_arr = mmap_u32(path, entry.offset, dir_extent, wired=wired)
+            payload_arr = mmap_u32(
+                path, entry.offset + dir_extent, payload_extent, wired=wired
+            )
+            directory = dir_base_arr
+            payload = payload_arr
+            if self.residency == "copy":
+                directory = mx.contiguous(dir_base_arr)
+                payload = mx.contiguous(payload_arr)
+                mx.eval(directory, payload)
+            else:
+                self._bases.extend((dir_base_arr, payload_arr))
+            components = []
+            dir_stride = sum(c.lanes for c in entry.components)
+            dir_base = 0
+            for component in entry.components:
+                seg_len = component.segment_length
+                components.append(
+                    {
+                        "component": component.component,
+                        "class": self._component_class(component.component),
+                        "dtype": component.dtype,
+                        "shape": tuple(component.shape),
+                        "lanes": component.lanes,
+                        "lane_bytes": seg_len // component.lanes,
+                        "seg_len": seg_len,
+                        "dir_base": dir_base,
+                    }
+                )
+                dir_base += component.lanes
+            self._layers_data[layer] = {
+                "directory": directory,
+                "payload": payload,
+                "dir_stride": dir_stride,
+                "components": components,
+            }
+
+    def layer_data(self, layer: int) -> dict:
+        if self._closed:
+            raise RuntimeError("compressed island store is closed")
+        data = self._layers_data.get(layer)
+        if data is None:
+            raise RuntimeError(f"compressed island layer {layer} not prepared")
+        return data
+
+    def class_table(self, kind: str) -> tuple[mx.array, mx.array]:
+        return self._tables[kind]
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "backend": "compressed-banked-island-banks",
+            "codec": self._banked.codec,
+            "residency": self.residency,
+            "layers": list(self.layers),
+            "expert_count": self.expert_count,
+            "compressed_bytes": sum(
+                self._banked.layer_entry(layer).length for layer in self.layers
+            ),
+            "verify_seconds": self._verify_seconds,
+            "prepared_layers": len(self._layers_data),
+        }
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._layers_data.clear()
+        self._bases.clear()
+        # Evaluated MLX arrays can retain graph-input cycles until cyclic GC.
+        # Collect now so every external MTLBuffer releases before its mmap.
+        gc.collect()
+
+
+class CompressedIslandSwitchGLU(nn.Module):
+    """Expert dispatch for a compressed island layer: decode + gather.
+
+    Router indices resolve compressed lane streams on device; the decode
+    kernel emits raw per-assignment segments into scratch; ``gather_qmm``
+    consumes scratch with identity indices. No host sync, no route
+    planning, no pins — misses are impossible by construction.
+    """
+
+    def __init__(
+        self,
+        runtime: ExpertStreamingRuntime,
+        store: CompressedBankedIslandStore,
+        layer_index: int,
+    ) -> None:
+        super().__init__()
+        self.runtime = runtime
+        self.layer_index = int(layer_index)
+        self.group_size = runtime.spec.quant_group_size
+        self.bits = runtime.spec.quant_bits
+        self.store = store
+        self._data = store.layer_data(self.layer_index)
+
+    def _decode(self, component: dict, indices: mx.array, assignments: int):
+        from mtplx.expert_huffman_metal import decode_component
+
+        l1, sym_len = self.store.class_table(component["class"])
+        raw = decode_component(
+            self._data["payload"],
+            self._data["directory"],
+            indices,
+            l1,
+            sym_len,
+            lanes=component["lanes"],
+            lane_bytes=component["lane_bytes"],
+            seg_len=component["seg_len"],
+            dir_stride=self._data["dir_stride"],
+            dir_base=component["dir_base"],
+            plane=(component["dtype"] == "BF16"),
+            assignments=assignments,
+        )
+        shaped = raw.reshape((assignments, component["seg_len"]))
+        if component["dtype"] == "U32":
+            return mx.view(shaped, mx.uint32).reshape(
+                (assignments, *component["shape"])
+            )
+        return mx.view(shaped, mx.bfloat16).reshape(
+            (assignments, *component["shape"])
+        )
+
+    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+        if indices.ndim < 1:
+            raise ValueError("expert indices must include a top-k dimension")
+        if int(indices.shape[-1]) != self.runtime.spec.top_k:
+            raise ValueError(
+                f"router selected {indices.shape[-1]} experts; expected "
+                f"{self.runtime.spec.top_k}"
+            )
+        hidden_size = int(x.shape[-1])
+        if hidden_size != self.runtime.spec.hidden_size:
+            raise ValueError(
+                f"expert input width {hidden_size} does not match "
+                f"{self.runtime.spec.hidden_size}"
+            )
+        tokens = x.reshape(-1, hidden_size)
+        top_k = int(indices.shape[-1])
+        rows = int(tokens.shape[0])
+        assignments = rows * top_k
+        phase = current_expert_routing_phase(token_count=int(x.shape[-2]))
+        _route_probe.count(
+            f"hot.island.compressed.{phase.name.lower()}"
+            f".layer{self.layer_index:02d}"
+        )
+        flat = indices.reshape((-1,)).astype(mx.int32)
+        decoded = {
+            component["component"]: self._decode(component, flat, assignments)
+            for component in self._data["components"]
+        }
+        assignment_inputs = mx.broadcast_to(
+            tokens[:, None, :],
+            (rows, top_k, hidden_size),
+        ).reshape(-1, 1, 1, hidden_size)
+        identity = mx.arange(assignments, dtype=mx.int32).reshape((-1, 1))
+
+        def qmm(values: mx.array, projection: str) -> mx.array:
+            return mx.gather_qmm(
+                values,
+                decoded[f"{projection}.weight"],
+                decoded[f"{projection}.scales"],
+                decoded[f"{projection}.biases"],
+                rhs_indices=identity,
+                transpose=True,
+                group_size=self.group_size,
+                bits=self.bits,
+                mode="affine",
+            )
+
+        gate = qmm(assignment_inputs, "gate_proj")
+        up = qmm(assignment_inputs, "up_proj")
+        output = qmm(swiglu(gate, up), "down_proj")
+        output = output.reshape((assignments, int(output.shape[-1])))
+        return output.reshape((*indices.shape, hidden_size))
+
+
 def make_mlx_component_bank_allocator(
     plan: ExpertMemoryPlan,
     spec: ExpertStreamingModelSpec,
@@ -1809,15 +2085,30 @@ def bind_streamed_switches(model: Any, runtime: ExpertStreamingRuntime) -> int:
         runtime._island_store = island_store
     banked_layers = frozenset(runtime.config.mmap_island_layers)
     banked_store = None
+    banked_compressed = False
     if banked_layers:
-        banked_store = BankedMmapIslandStore(
-            Path(runtime.config.banked_manifest),
-            banked_layers,
-            expert_count=runtime.spec.expert_count,
-            residency=runtime.config.mmap_island_residency,
-        )
-        banked_store.prepare()
-        banked_store.prefetch_all()
+        from mtplx.expert_banked import load_banked_manifest
+
+        banked_path = Path(runtime.config.banked_manifest)
+        banked_codec = load_banked_manifest(banked_path).codec
+        if banked_codec == "huffman-l12-v1":
+            banked_store = CompressedBankedIslandStore(
+                banked_path,
+                banked_layers,
+                expert_count=runtime.spec.expert_count,
+                residency=runtime.config.mmap_island_residency,
+            )
+            banked_store.prepare()
+            banked_compressed = True
+        else:
+            banked_store = BankedMmapIslandStore(
+                banked_path,
+                banked_layers,
+                expert_count=runtime.spec.expert_count,
+                residency=runtime.config.mmap_island_residency,
+            )
+            banked_store.prepare()
+            banked_store.prefetch_all()
         runtime._banked_island_store = banked_store
     for layer_index in runtime.spec.routed_layer_indices:
         layer = layers[layer_index]
@@ -1831,11 +2122,18 @@ def bind_streamed_switches(model: Any, runtime: ExpertStreamingRuntime) -> int:
                 layer_index,
             )
         elif banked_store is not None and layer_index in banked_layers:
-            mlp.switch_mlp = DenseIslandSwitchGLU(
-                runtime,
-                banked_store,
-                layer_index,
-            )
+            if banked_compressed:
+                mlp.switch_mlp = CompressedIslandSwitchGLU(
+                    runtime,
+                    banked_store,
+                    layer_index,
+                )
+            else:
+                mlp.switch_mlp = DenseIslandSwitchGLU(
+                    runtime,
+                    banked_store,
+                    layer_index,
+                )
         elif mapped_store is None:
             mlp.switch_mlp = HotExpertSwitchGLU(runtime, layer_index)
         else:

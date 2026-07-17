@@ -816,6 +816,77 @@ def test_metal_decode_component_matches_raw_segments(tmp_path, mlx) -> None:
         dir_base += component.lanes
 
 
+def test_compressed_island_switch_bitwise_parity(tmp_path, mlx) -> None:
+    """Decode-then-gather must be bitwise-identical to the wired island
+    dispatch over the same routes."""
+
+    import mlx.core as mx
+
+    from mtplx.models.expert_mlx import (
+        CompressedBankedIslandStore,
+        CompressedIslandSwitchGLU,
+        DenseIslandStore,
+        DenseIslandSwitchGLU,
+    )
+
+    root, spec, manifest, _expected = _sidecar_artifact(tmp_path)
+    island_layer = spec.routed_layer_indices[0]
+    out_bin = tmp_path / "huff" / "experts.bin"
+    out_manifest = tmp_path / "huff" / "manifest.json"
+    write_banked_expert_banks(
+        manifest,
+        root,
+        (island_layer,),
+        output_bin=out_bin,
+        output_manifest=out_manifest,
+        codec="huffman-l12-v1",
+    )
+    compressed = CompressedBankedIslandStore(
+        out_manifest,
+        (island_layer,),
+        expert_count=spec.expert_count,
+        residency="copy",
+    )
+    wired = DenseIslandStore(
+        manifest, (island_layer,), expert_count=spec.expert_count
+    )
+    reader = PositionalExpertReader(root)
+    try:
+        compressed.prepare()
+        wired.fill(manifest, reader, verify_hash=True)
+        runtime = SimpleNamespace(spec=spec)
+
+        comp_switch = CompressedIslandSwitchGLU.__new__(CompressedIslandSwitchGLU)
+        comp_switch.runtime = runtime
+        comp_switch.layer_index = island_layer
+        comp_switch.group_size = spec.quant_group_size
+        comp_switch.bits = spec.quant_bits
+        comp_switch.store = compressed
+        comp_switch._data = compressed.layer_data(island_layer)
+
+        wired_switch = DenseIslandSwitchGLU.__new__(DenseIslandSwitchGLU)
+        wired_switch.runtime = runtime
+        wired_switch.layer_index = island_layer
+        wired_switch.group_size = spec.quant_group_size
+        wired_switch.bits = spec.quant_bits
+        wired_switch._bank = wired.bank_for_layer(island_layer)
+
+        rows = 3
+        mx.random.seed(7)
+        x = mx.random.normal((1, rows, spec.hidden_size)).astype(mx.bfloat16)
+        indices = mx.array([[[1], [0], [1]]], dtype=mx.uint32)
+        got = comp_switch(x, indices)
+        want = wired_switch(x, indices)
+        assert got.shape == want.shape
+        assert mx.array_equal(got, want).item(), "compressed dispatch diverged"
+        snapshot = compressed.snapshot()
+        assert snapshot["backend"] == "compressed-banked-island-banks"
+    finally:
+        compressed.close()
+        wired.close()
+        reader.close()
+
+
 # ------------------------------------------------------------- source scan
 
 

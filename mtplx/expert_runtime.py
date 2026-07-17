@@ -253,14 +253,15 @@ class ExpertStreamingConfig:
             )
         )
         object.__setattr__(self, "mmap_island_layers", normalized_mmap)
-        if self.banked_codec not in {"none", "rans32x-v1"}:
+        if self.banked_codec not in {"none", "huffman-l12-v1", "rans32x-v1"}:
             raise ValueError(
-                "banked_codec must be 'none' or 'rans32x-v1'"
+                "banked_codec must be 'none', 'huffman-l12-v1', or "
+                "'rans32x-v1'"
             )
-        if self.banked_codec != "none":
+        if self.banked_codec == "rans32x-v1":
             raise ValueError(
-                "banked_codec 'rans32x-v1' requires the in-kernel decoder "
-                "(issue #51, C7); use 'none' until it ships"
+                "banked_codec 'rans32x-v1' has no decoder; use 'none' or "
+                "'huffman-l12-v1'"
             )
         if normalized_mmap:
             if self.banked_manifest is None:
