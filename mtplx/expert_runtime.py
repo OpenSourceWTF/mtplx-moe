@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
@@ -43,7 +45,20 @@ from .expert_streaming_models import (
     resident_quant_kept_bytes,
 )
 from .resource_metrics import ExpertPipelineLedger, ExpertPipelineRoute
+from .route_census import (
+    ISLAND_PLACEMENT_FILENAME,
+    ROUTE_CENSUS_FILENAME,
+    RouteCensus,
+    RouteCensusError,
+    derive_placement,
+    load_census,
+    load_placement,
+    save_census,
+    save_placement,
+)
 
+
+_LOGGER = logging.getLogger(__name__)
 
 _MEMORY_RE = re.compile(r"^([0-9]+)([kmgt]i?b?|b)?$", re.IGNORECASE)
 
@@ -158,6 +173,7 @@ class ExpertStreamingConfig:
     kv_quant: str | None = None
     split_route_release: str = "fenced"
     prefetch_slots: int = 0
+    route_census: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -242,23 +258,30 @@ class ExpertStreamingConfig:
             count = _integer(
                 "island_layer_count", self.island_layer_count, minimum=1
             )
-            spec = get_model_spec(self.model_key)
-            if not spec.island_pin_order:
-                raise ValueError(
-                    f"{self.model_key} has no measured island pin order; "
-                    "count-based selection requires explicit island_layers"
-                )
-            if count > len(spec.island_pin_order):
-                raise ValueError(
-                    f"island_layer_count {count} exceeds the {self.model_key} "
-                    f"pin order ({len(spec.island_pin_order)} layers)"
-                )
-            object.__setattr__(
-                self,
-                "island_layers",
-                tuple(sorted(spec.island_pin_order[:count])),
-            )
             object.__setattr__(self, "island_layer_count", count)
+            try:
+                spec = get_model_spec(self.model_key)
+            except ValueError:
+                # Unregistered model keys carry their spec into open()
+                # directly; count resolution defers there with the rest of
+                # the placement precedence chain.
+                spec = None
+            if spec is not None and spec.island_pin_order:
+                if count > len(spec.island_pin_order):
+                    raise ValueError(
+                        f"island_layer_count {count} exceeds the "
+                        f"{self.model_key} pin order "
+                        f"({len(spec.island_pin_order)} layers)"
+                    )
+                object.__setattr__(
+                    self,
+                    "island_layers",
+                    tuple(sorted(spec.island_pin_order[:count])),
+                )
+            # else: unresolved (island_layers stays empty while the count is
+            # set). resolve_island_placement() maps the count to layers from
+            # the model root's island-placement.json; precedence is explicit
+            # island_layers > spec.island_pin_order > placement file > error.
         island_layers = self.island_layers
         if isinstance(island_layers, (str, bytes)) or not isinstance(
             island_layers, (tuple, list)
@@ -373,6 +396,7 @@ class ExpertStreamingConfig:
             "trace_routes",
             "bypass_page_cache",
             "resource_telemetry",
+            "route_census",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be bool")
@@ -402,6 +426,14 @@ class ExpertStreamingConfig:
         additional_resident_bytes: int = 0,
         resident_discount_bytes: int = 0,
     ) -> ExpertMemoryPlan:
+        if self.island_layer_count is not None and not self.island_layers:
+            raise ExpertStreamingConfigurationError(
+                f"island_layer_count {self.island_layer_count} is unresolved "
+                f"for {self.model_key}; resolve_island_placement() (or "
+                "ExpertStreamingRuntime.open) maps the count to layers. "
+                "Selection precedence: explicit island_layers > "
+                "spec.island_pin_order > island-placement.json > error"
+            )
         # File-backed Metal records use the OS page cache as their physical
         # tier and never consume fixed MLX expert slots. Retain only a tiny
         # unreachable transient pool so the generic runtime invariants and
@@ -1225,6 +1257,81 @@ class PendingSplitRoute:
         self.close()
 
 
+def resolve_island_placement(
+    config: ExpertStreamingConfig,
+    root: Path | str,
+    *,
+    spec: ExpertStreamingModelSpec | None = None,
+) -> ExpertStreamingConfig:
+    """Resolve a pending island_layer_count into explicit island_layers.
+
+    Selection precedence: explicit ``island_layers`` >
+    ``spec.island_pin_order`` > ``<root>/island-placement.json`` (the
+    auto-census artifact, issue #98) > error. Idempotent: a config whose
+    count already resolved (or that requests no count) returns unchanged.
+    The placement file stores a budget-independent ranking, so this is the
+    only point where a count meets a concrete model root.
+    """
+
+    count = config.island_layer_count
+    if count is None or config.island_layers:
+        return config
+    model_spec = get_model_spec(config.model_key) if spec is None else spec
+    if model_spec.key != config.model_key:
+        raise ExpertStreamingConfigurationError(
+            "config and spec model keys differ"
+        )
+    placement_path = Path(root) / ISLAND_PLACEMENT_FILENAME
+    if model_spec.island_pin_order:
+        order = model_spec.island_pin_order
+        source = f"{model_spec.key} spec island_pin_order"
+    else:
+        if not placement_path.is_file():
+            raise ExpertStreamingConfigurationError(
+                f"island_layer_count {count} cannot be resolved for "
+                f"{model_spec.key}: the spec has no measured island pin "
+                f"order and {placement_path} does not exist. Selection "
+                "precedence: explicit island_layers > spec.island_pin_order "
+                f"> {ISLAND_PLACEMENT_FILENAME} (auto-census, issue #98) > "
+                "this error. Run the model once without islands — the "
+                "route census records decode routes and writes the "
+                "placement at close — or pass explicit island_layers."
+            )
+        try:
+            placement = load_placement(placement_path)
+        except RouteCensusError as exc:
+            raise ExpertStreamingConfigurationError(
+                f"island_layer_count {count} cannot be resolved: {exc}"
+            ) from exc
+        if placement.model_key != model_spec.key:
+            raise ExpertStreamingConfigurationError(
+                f"{placement_path} was derived for "
+                f"{placement.model_key!r}, not {model_spec.key!r}"
+            )
+        if placement.advisory:
+            _LOGGER.warning(
+                "island placement %s is advisory: derived from only %d "
+                "routed assignments; rankings may still be noise-ordered",
+                placement_path,
+                placement.census_total_routed_assignments,
+            )
+        order = placement.layer_pin_order
+        source = str(placement_path)
+    if count > len(order):
+        raise ExpertStreamingConfigurationError(
+            f"island_layer_count {count} exceeds the {model_spec.key} pin "
+            f"order from {source} ({len(order)} layers)"
+        )
+    try:
+        return dataclass_replace(
+            config,
+            island_layer_count=None,
+            island_layers=tuple(sorted(order[:count])),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ExpertStreamingConfigurationError(str(exc)) from exc
+
+
 def resident_quant_plan_discount(manifest: Any, resident_quant: str | None) -> int:
     """Bytes the load-time resident quantization removes from the fixed side.
 
@@ -1449,6 +1556,12 @@ class ExpertStreamingRuntime:
         self._mapped_expert_store: Any | None = None
         self._island_store: Any | None = None
         self._banked_island_store: Any | None = None
+        # Decode-route census (issue #98): pure host-side counters, flushed
+        # to the model root at close(). Never touches routing or numerics.
+        self._census_lock = threading.Lock()
+        self._route_census = (
+            RouteCensus(spec.key) if config.route_census else None
+        )
         self._route_trace_lock = threading.Lock()
         self._route_trace: list[dict[str, Any]] = []
         self._route_trace_epoch = 0
@@ -1501,6 +1614,7 @@ class ExpertStreamingRuntime:
         model_spec = get_model_spec(config.model_key) if spec is None else spec
         if model_spec.key != config.model_key:
             raise ExpertStreamingConfigurationError("config and spec model keys differ")
+        config = resolve_island_placement(config, artifact_root, spec=model_spec)
         manifest = load_expert_manifest(manifest_path)
         cls._validate_manifest_identity(manifest, model_spec)
         if config.island_layers and not set(config.island_layers) <= set(
@@ -2306,10 +2420,28 @@ class ExpertStreamingRuntime:
         *,
         token_count: int,
     ) -> None:
-        if not self.config.trace_routes:
+        census = self._route_census
+        if census is None and not self.config.trace_routes:
             return
         normalized_phase = RoutingPhase(phase)
         routed_experts = [int(expert) for expert in expert_ids]
+        if census is not None and normalized_phase is RoutingPhase.DECODE:
+            # Placement census: decode routes only (prefill routing shape
+            # does not predict the decode hot set). Accumulation is pure
+            # host-side counting; any failure disables the census for the
+            # session rather than perturbing the decode path.
+            try:
+                with self._census_lock:
+                    census.observe(layer, routed_experts)
+            except Exception:
+                self._route_census = None
+                _LOGGER.warning(
+                    "route census recording failed; census disabled for "
+                    "this session",
+                    exc_info=True,
+                )
+        if not self.config.trace_routes:
+            return
         with self._route_trace_lock:
             entry = {
                 "layer": int(layer),
@@ -2662,6 +2794,69 @@ class ExpertStreamingRuntime:
             snapshot["expert_pipeline"] = self._pipeline_ledger.snapshot()
         return snapshot
 
+    def _flush_route_census(self) -> None:
+        """Merge session decode counts to disk and re-derive the placement.
+
+        Runs once, off the decode path, at close(). Merges into any
+        existing ``route-census.json`` (windowed decay lives in
+        ``RouteCensus.merge``) and rewrites ``island-placement.json`` from
+        the merged census. Every write is atomic (tempfile + rename) and
+        best-effort: failures log and never fail close(). ``reset()``
+        deliberately does not clear the census — it is session-scoped
+        diagnostic state, not routing policy.
+        """
+
+        with self._census_lock:
+            census = self._route_census
+            self._route_census = None
+        if census is None or census.total_routed_assignments == 0:
+            return
+        try:
+            updated_at = datetime.now(timezone.utc).isoformat(
+                timespec="seconds"
+            )
+            census_path = self.root / ROUTE_CENSUS_FILENAME
+            merged = census
+            if census_path.is_file():
+                try:
+                    existing = load_census(census_path)
+                except RouteCensusError:
+                    _LOGGER.warning(
+                        "existing %s is unusable; rebuilding from this "
+                        "session's census",
+                        census_path,
+                        exc_info=True,
+                    )
+                else:
+                    if existing.model_key == census.model_key:
+                        existing.merge(census)
+                        merged = existing
+                    else:
+                        _LOGGER.warning(
+                            "existing %s belongs to %r, not %r; rebuilding",
+                            census_path,
+                            existing.model_key,
+                            census.model_key,
+                        )
+            save_census(merged, census_path, updated_at=updated_at)
+            placement = derive_placement(
+                merged,
+                expert_count=self.spec.expert_count,
+                slots_per_layer_hint=(
+                    self.plan.slots_per_layer or self.spec.top_k
+                ),
+            )
+            save_placement(
+                placement,
+                self.root / ISLAND_PLACEMENT_FILENAME,
+                updated_at=updated_at,
+            )
+        except Exception:
+            _LOGGER.warning(
+                "route census flush failed; placement artifacts unchanged",
+                exc_info=True,
+            )
+
     def close(self, *, timeout: float | None = None) -> None:
         self.flush_deferred_slot_releases(evaluate=True)
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -2717,6 +2912,7 @@ class ExpertStreamingRuntime:
             if self._banked_island_store is not None:
                 self._banked_island_store.close()
                 self._banked_island_store = None
+            self._flush_route_census()
             self._closed = True
             self._closing = False
             if slots_error is not None:
