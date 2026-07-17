@@ -509,3 +509,51 @@ def test_island_layer_count_validation() -> None:
             slot_layout="component-banks",
             island_layer_count=100,
         )
+
+
+def test_island_layer_count_survives_benchmark_option_pipeline() -> None:
+    """End-to-end through the benchmark's own plumbing: CLI vector ->
+    parser -> runtime options -> config factory. Guards against option
+    keys silently dropping between argparse and ExpertStreamingConfig
+    (the count knob parsed but vanished in the 2026-07-17 sub-90 run)."""
+
+    from types import SimpleNamespace
+
+    from mtplx.expert_runtime import parse_memory_bytes
+
+    bench = _load_benchmark_module()
+    parser = bench._build_parser() if hasattr(bench, "_build_parser") else None
+    if parser is None:
+        parser = bench.build_parser() if hasattr(bench, "build_parser") else None
+    if parser is None:
+        import argparse as _argparse
+
+        for name in dir(bench):
+            fn = getattr(bench, name)
+            if callable(fn) and name.endswith("parser"):
+                candidate = fn()
+                if isinstance(candidate, _argparse.ArgumentParser):
+                    parser = candidate
+                    break
+    assert parser is not None, "benchmark parser factory not found"
+    args = parser.parse_args(
+        [
+            "--model", "hy3-q2",
+            "--hy3-q2-model-root", "/tmp",
+            "--memory-limit", "96GiB",
+            "--island-layer-count", "40",
+        ]
+    )
+    options = {
+        **bench.DEFAULT_RUNTIME_OPTIONS,
+        "trace_routes": False,
+        **bench._runtime_options_from_args(args),
+    }
+    assert options["island_layer_count"] == 40
+    apis = SimpleNamespace(
+        config_factory=ExpertStreamingConfig,
+        parse_memory_bytes=parse_memory_bytes,
+    )
+    config = bench._runtime_config(apis, "hy3-expert-q2", options)
+    assert config.island_layer_count == 40
+    assert len(config.island_layers) == 40

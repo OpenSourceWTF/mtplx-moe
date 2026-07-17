@@ -74,6 +74,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "hy3_router_sigmoid": "precise",
     "deferred_pin_release": True,
     "island_layers": "",
+    "island_layer_count": None,
     "mmap_island_layers": "",
     "banked_manifest": "",
     "banked_codec": "none",
@@ -557,6 +558,7 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "hy3_router_sigmoid": args.hy3_router_sigmoid,
         "deferred_pin_release": bool(args.deferred_pin_release),
         "island_layers": args.island_layers,
+        "island_layer_count": args.island_layer_count,
         "mmap_island_layers": args.mmap_island_layers,
         "banked_manifest": args.banked_manifest,
         "banked_codec": args.banked_codec,
@@ -2022,6 +2024,7 @@ def _runtime_config(
         resource_telemetry=bool(options["resource_telemetry"]),
         trace_routes=bool(options["trace_routes"]),
         island_layers=parse_island_layers(options.get("island_layers", "")),
+        island_layer_count=options.get("island_layer_count"),
         mmap_island_layers=parse_island_layers(
             options.get("mmap_island_layers", "")
         ),
