@@ -3492,15 +3492,102 @@ def test_stale_prefetch_commit_never_publishes_a_reassigned_ring_slot(
     """Regression for the depth-matrix failure 'expert slot did not reach
     the requested generation' (issue #51 C6 A/B, d0/AR retained cell).
 
-    Commit callbacks used to be keyed by expert id alone. When an expert's
-    ring assignment was recycled and the expert later re-assigned to a
-    DIFFERENT ring slot whose read had not started yet (queued behind a
-    busy prefetch executor), the delayed callback of the ORIGINAL load
-    popped the new inflight entry and published it: the bank then mapped
-    the expert to a physical slot holding another expert's bytes, and the
-    next decode route hit-resolved it straight into _wait_ready's
-    generation failure. The gates below deterministically replay that
-    executor/callback timing; every step is state the real system reaches.
+    Commit callbacks used to be keyed by expert id alone, so a delayed
+    callback could publish the expert's NEWER, unfilled ring assignment.
+    The runtime now prevents the precondition outright: a ring slot whose
+    load has not fully settled (fill + completion callback) is excluded
+    from recycling, so an expert with an outstanding load can never be
+    re-assigned while its commit is pending. This choreography holds a
+    load's callback open and asserts the busy slot is skipped, spillover
+    predictions land in the free slot, and the late commit publishes the
+    original — correctly filled — slot.
+    """
+
+    root, config, spec, manifest_path = _integrated_hy3_artifact(
+        tmp_path, expert_count=4, top_k=1
+    )
+    runtime = _open_prefetch_runtime(
+        root, manifest_path, spec, prefetch_slots=2
+    )
+    layer = 1
+    bank = runtime._banks[layer]
+    lock = runtime._layer_locks[layer]
+    pool = runtime.slots
+    ring_base = runtime.plan.slots_per_layer + runtime.plan.transient_slots
+
+    original = pool.load_speculative
+    zero_filled = threading.Event()
+    release_zero = threading.Event()
+    zero_load_count = [0]
+
+    def gated(layer_arg, load):
+        if load.expert == 0:
+            zero_load_count[0] += 1
+            # Fill ring slot 0 normally, then hold the future open so the
+            # commit callback lags behind later prefetch traffic.
+            original(layer_arg, load)
+            zero_filled.set()
+            assert release_zero.wait(20.0)
+            return
+        original(layer_arg, load)
+
+    pool.load_speculative = gated
+    try:
+        # 0 -> ring0; the fill completes but its callback is held open.
+        _drive_prefetch(runtime, layer, 0)
+        assert zero_filled.wait(10.0)
+        # 1 -> ring1, fills and publishes.
+        _drive_prefetch(runtime, layer, 1)
+        _wait_ring_published(runtime, layer, {1})
+        # Expert 2 arrives while ring0's load is unsettled: the ring must
+        # skip the busy slot and replace ring1's published entry instead.
+        _drive_prefetch(runtime, layer, 2)
+        _wait_ring_published(runtime, layer, {2})
+        with lock:
+            published = dict(bank._prefetch_expert_to_slot)
+            assert published[2] == ring_base + 1
+            assert 1 not in published
+            # The unsettled assignment was never recycled.
+            assert 0 in bank._prefetch_inflight
+        # Release the held callback: its commit publishes ring0, whose
+        # bytes the load wrote before parking — a correct, exact entry.
+        release_zero.set()
+        _wait_ring_published(runtime, layer, {0, 2})
+        with lock:
+            assert bank._prefetch_expert_to_slot[0] == ring_base
+        assert zero_load_count[0] == 1, "expert 0 must never be re-loaded"
+
+        # Every published entry is physically consistent: a decode route
+        # resolving it pins exactly that expert. Before busy-gating this
+        # choreography ended in ExpertSlotError('expert slot did not
+        # reach the requested generation').
+        for expert in (0, 2):
+            ready = runtime.ensure_route(layer, [expert], phase="decode")
+            try:
+                assert [
+                    binding.expert for binding in ready.bindings
+                ] == [expert]
+            finally:
+                ready.release()
+    finally:
+        release_zero.set()
+        del pool.load_speculative  # restore the bound method
+        runtime.close()
+
+
+def test_recycled_ring_assignment_load_never_claims_a_published_slot(
+    tmp_path: Path,
+) -> None:
+    """Deterministic replay of the six-suite stress flake.
+
+    A speculative load can stall between _run_speculative_load's
+    ticket-liveness check and load_speculative's physical claim (scheduler
+    preemption under CPU contention). Its ring assignment is then
+    recycled, the slot refilled and PUBLISHED for another expert — and
+    the stale claim used to re-own the published slot, so the next route
+    hit-resolving it died in _wait_ready with 'expert slot did not reach
+    the requested generation'. Ring recycling must never hand out a slot
+    whose previous load has not fully settled.
     """
 
     root, config, spec, manifest_path = _integrated_hy3_artifact(
@@ -3515,81 +3602,57 @@ def test_stale_prefetch_commit_never_publishes_a_reassigned_ring_slot(
     pool = runtime.slots
 
     original = pool.load_speculative
-    first_zero_filled = threading.Event()
-    release_first_zero = threading.Event()
-    second_zero_started = threading.Event()
-    release_second_zero = threading.Event()
-    zero_load_count = [0]
+    parked = threading.Event()
+    release = threading.Event()
 
     def gated(layer_arg, load):
         if load.expert == 0:
-            zero_load_count[0] += 1
-            if zero_load_count[0] == 1:
-                # First speculative load of expert 0: fill ring slot 0
-                # normally, then hold the future open so its commit
-                # callback lags behind recycling + re-assignment.
-                original(layer_arg, load)
-                first_zero_filled.set()
-                assert release_first_zero.wait(20.0)
-                return
-            # Second assignment of expert 0: its read has not started
-            # (queued behind a busy executor).
-            second_zero_started.set()
-            assert release_second_zero.wait(20.0)
-            original(layer_arg, load)
-            return
+            # Stall in the post-ticket-check, pre-claim window.
+            parked.set()
+            assert release.wait(20.0)
         original(layer_arg, load)
 
     pool.load_speculative = gated
     try:
-        # 0 -> ring0; the fill completes but its callback is held open.
+        # 0 -> ring slot A; its worker parks before claiming the slot.
         _drive_prefetch(runtime, layer, 0)
-        assert first_zero_filled.wait(10.0)
-        # 1 -> ring1, fills and publishes.
+        assert parked.wait(10.0)
+        # 1 -> ring slot B, fills and publishes.
         _drive_prefetch(runtime, layer, 1)
         _wait_ring_published(runtime, layer, {1})
-        # Recycle ring0 (victim: the still-inflight 0), 2 -> ring0.
+        # Expert 2 needs a ring slot. Recycling slot A (whose stale load
+        # is still parked) would let that load re-own the slot after 2's
+        # fill publishes it.
         _drive_prefetch(runtime, layer, 2)
-        _wait_ring_published(runtime, layer, {1, 2})
-        # Recycle ring1 (victim: published 1) and RE-ASSIGN 0 -> ring1.
-        # Physically ring1 still holds expert 1; 0's new read is gated.
-        _drive_prefetch(runtime, layer, 3)
-        _wait_ring_published(runtime, layer, {2, 3})
-        _drive_prefetch(runtime, layer, 0)
-        assert second_zero_started.wait(10.0)
-        with lock:
-            assert 0 in bank._prefetch_inflight
-        # Release the FIRST load's future: its stale commit callback runs
-        # now. It must NOT publish 0 -> ring1 (never filled with 0).
-        release_first_zero.set()
-        deadline = time.monotonic() + 5.0
+        _wait_ring_published(runtime, layer, {2})
+        release.set()
+        deadline = time.monotonic() + 10.0
         while True:
             with runtime._prefetch_lock:
-                pending = len(runtime._prefetch_futures)
-            if pending <= 1:  # only the gated second-zero load remains
-                break
+                if not runtime._prefetch_futures:
+                    break
             if time.monotonic() > deadline:
-                pytest.fail("stale prefetch callback never completed")
+                pytest.fail("speculative loads never drained")
             time.sleep(0.005)
         time.sleep(0.25)  # cover the discard-to-commit callback window
 
-        # A decode route for expert 0 must plan a plain miss (or wait for
-        # a real fill) — never hit-resolve an unfilled ring slot. Before
-        # the fix this raised ExpertSlotError('expert slot did not reach
-        # the requested generation'), the exact production failure.
-        ready = runtime.ensure_route(layer, [0], phase="decode")
-        try:
-            assert [binding.expert for binding in ready.bindings] == [0]
-        finally:
-            ready.release()
+        # Every published ring entry must be physically consistent: a
+        # decode route resolving it pins exactly that expert. Before the
+        # fix, expert 2's published slot held expert 0's bytes and this
+        # raised the production ExpertSlotError.
         with lock:
-            assert 0 not in bank._prefetch_expert_to_slot
-            # The live (second) assignment must have survived the stale
-            # callback untouched.
-            assert 0 in bank._prefetch_inflight
+            published = sorted(bank._prefetch_expert_to_slot)
+        assert 2 in published
+        for expert in published:
+            ready = runtime.ensure_route(layer, [expert], phase="decode")
+            try:
+                assert [
+                    binding.expert for binding in ready.bindings
+                ] == [expert]
+            finally:
+                ready.release()
     finally:
-        release_first_zero.set()
-        release_second_zero.set()
+        release.set()
         del pool.load_speculative  # restore the bound method
         runtime.close()
 

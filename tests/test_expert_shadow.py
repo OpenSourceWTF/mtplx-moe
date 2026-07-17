@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -621,6 +622,121 @@ def test_decode_miss_is_served_from_shadow_without_ssd(
         assert after["cache"]["expert_hits"] >= 1
         np.testing.assert_array_equal(np.asarray(warm), np.asarray(exact))
     finally:
+        runtime.close()
+
+
+def test_shadow_dispatch_volume_keeps_ring_and_routes_healthy(
+    tmp_path: Path,
+) -> None:
+    """High-volume regression for the shadow-26 GPU arm failure.
+
+    The shadow dispatch admission-fills every shadow-served miss through
+    the speculative ring (prefetch_experts -> load_speculative), so at
+    ~78 misses/token the ring recycles constantly. The old recycling
+    contract could hand a slot with an unsettled read to a second load;
+    the surviving assignment's commit then published a slot the OTHER
+    load had filled, and the next route hit-resolving it died with
+    'expert slot did not reach the requested generation'. Drive the real
+    dispatch at that intensity — a tight two-slot ring, a concurrent
+    lookahead-style prefetch thread, and hundreds of decode waves over a
+    starved exact tier — and require every route, serve, and publication
+    to stay coherent.
+    """
+
+    root, spec, manifest_path = _shadow_hy3_artifact(
+        tmp_path, expert_count=8, top_k=2
+    )
+    config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=(
+            spec.resident_bytes + spec.transient_scratch_bytes + 4 * 1024 * 1024
+        ),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        cache_scope="layer",
+        slot_layout="component-banks",
+        miss_shadow="b1",
+        prefetch_slots=2,
+        # One persistent slot: the exact tier stays starved so nearly
+        # every wave shadow-serves and admission-fills through the ring.
+        expert_cache_limit_bytes=spec.expert_record_bytes,
+    )
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        config,
+        spec=spec,
+        buffer_allocator=make_mlx_component_bank_allocator(
+            config.memory_plan(spec),
+            spec,
+            load_expert_manifest(manifest_path),
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+    layer = 1
+    stop = threading.Event()
+    prefetch_errors: list[BaseException] = []
+
+    def prefetch_loop() -> None:
+        # Lookahead-style pressure stacked on the dispatch's own
+        # admission fills: both lanes share the two ring slots.
+        index = 0
+        while not stop.is_set():
+            ids = [(index * 3) % 8, (index * 5 + 1) % 8]
+            try:
+                issued = runtime.prefetch_experts(layer, ids)
+            except BaseException as exc:  # noqa: BLE001 - fail the test
+                prefetch_errors.append(exc)
+                return
+            index += 1
+            if not issued:
+                time.sleep(0.0002)
+
+    thread = threading.Thread(target=prefetch_loop, daemon=True)
+    thread.start()
+    try:
+        switch = HotExpertSwitchGLU(runtime, layer)
+        assert switch._shadow_bank is not None
+        x_row = mx.array(
+            np.random.default_rng(23)
+            .standard_normal((1, 1, 64))
+            .astype(np.float32)
+        )
+        for step in range(400):
+            first = (step * 3) % 8
+            second = (first + 1 + step % 5) % 8
+            if second == first:
+                second = (second + 1) % 8
+            indices = mx.array([[[first, second]]], dtype=mx.uint32)
+            output = switch(x_row, indices)
+            mx.eval(output)
+        assert not prefetch_errors, prefetch_errors
+        snapshot = runtime.snapshot(mx_module=mx)
+        assert snapshot["slots"]["pins"] == 0
+        assert snapshot["shadow_experts"]["serve_routes"] > 0
+        assert snapshot["cache"]["prefetch_issued"] > 0
+        assert snapshot["cache"]["prefetch_committed"] > 0
+        # Physical consistency sweep: every published ring entry must pin
+        # exactly its expert on a real route.
+        bank = runtime._banks[layer]
+        lock = runtime._layer_locks[layer]
+        stop.set()
+        thread.join(timeout=30.0)
+        assert not thread.is_alive(), "prefetch thread wedged"
+        with lock:
+            published = sorted(bank._prefetch_expert_to_slot)
+        for expert in published:
+            ready = runtime.ensure_route(layer, [expert], phase="decode")
+            try:
+                assert [
+                    binding.expert for binding in ready.bindings
+                ] == [expert]
+            finally:
+                ready.release()
+    finally:
+        stop.set()
+        thread.join(timeout=30.0)
         runtime.close()
 
 

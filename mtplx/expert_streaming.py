@@ -312,6 +312,14 @@ class LayerExpertSlotBank:
         inflight are skipped. Ring replacement is round-robin over the
         ring only — an earned persistent resident is never evicted by
         speculation.
+
+        A slot whose tenant is still INFLIGHT is never recycled: its load
+        may be queued, running, or completed-but-uncommitted, and handing
+        the slot to a second load would race two claims on one physical
+        buffer (the later fill can be published under the earlier fill's
+        bytes). Committed tenants are always safe to replace — commit runs
+        strictly after the fill settles. When every slot is inflight the
+        prediction is dropped; speculation is best-effort.
         """
 
         if not self.prefetch_slots:
@@ -333,12 +341,20 @@ class LayerExpertSlotBank:
                 or expert in self._prefetch_inflight
             ):
                 continue
-            ring_index = self._prefetch_cursor % self.prefetch_slots
-            self._prefetch_cursor += 1
+            ring_index: int | None = None
+            for _probe in range(self.prefetch_slots):
+                candidate = self._prefetch_cursor % self.prefetch_slots
+                self._prefetch_cursor += 1
+                tenant = self._prefetch_slot_to_expert[candidate]
+                if tenant is not None and tenant in self._prefetch_inflight:
+                    continue
+                ring_index = candidate
+                break
+            if ring_index is None:
+                continue
             victim = self._prefetch_slot_to_expert[ring_index]
             if victim is not None:
                 self._prefetch_expert_to_slot.pop(victim, None)
-                self._prefetch_inflight.pop(victim, None)
             self._prefetch_slot_to_expert[ring_index] = expert
             ticket = self._prefetch_ticket
             self._prefetch_ticket += 1

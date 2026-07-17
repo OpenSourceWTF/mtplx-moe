@@ -662,11 +662,19 @@ def test_prefetch_ring_resolves_hits_without_touching_persistent_tier():
     assert slot_by_expert[5] == 5 and slot_by_expert[6] == 6
     assert all(load.expert == 7 for load in plan.loads)
 
-    # Ring replacement is round-robin over the ring only; a recycled
-    # assignment refuses its stale commit.
+    # Ring replacement is round-robin over the ring only, and committed
+    # tenants are the only replaceable ones: a slot whose tenant is still
+    # inflight may have a read outstanding, and handing it to a second
+    # load would race two fills on one physical buffer.
     ring2 = bank.plan_prefetch([8, 9])
     assert [(load.expert, load.slot) for load in ring2] == [(8, 5), (9, 6)]
     assert 5 not in bank.plan([5], phase="decode").hits
+    # Both tenants are inflight: further predictions are dropped, never
+    # double-assigned.
+    assert bank.plan_prefetch([10]) == ()
+    assert bank.commit_prefetch(8) is True
+    # 8 is committed, so its slot recycles; the displaced publication then
+    # refuses a (now stale) repeat commit.
     ring3 = bank.plan_prefetch([10])
     assert [(load.expert, load.slot) for load in ring3] == [(10, 5)]
     assert bank.commit_prefetch(8) is False
@@ -676,6 +684,27 @@ def test_prefetch_ring_resolves_hits_without_touching_persistent_tier():
     assert bank.occupancy <= 2
     assert bank.invalidate_prefetch(10) == 5
     assert bank.plan([10], phase="decode").hits == ()
+
+
+def test_prefetch_commit_ticket_binds_exactly_one_assignment():
+    bank = LayerExpertSlotBank(
+        expert_count=8,
+        persistent_slots=1,
+        transient_slots=1,
+        prefetch_slots=1,
+    )
+    (load,) = bank.plan_prefetch([3])
+    assert (load.expert, load.slot) == (3, 2)
+    ticket = bank.prefetch_ticket(3)
+    assert ticket is not None
+    # A stale ticket neither publishes nor consumes the live assignment
+    # (callbacks that straddle a reset re-use expert ids, never tickets).
+    assert bank.commit_prefetch(3, ticket=ticket - 1) is False
+    assert bank.prefetch_ticket(3) == ticket
+    assert bank.invalidate_prefetch(3, ticket=ticket - 1) is None
+    assert bank.prefetch_ticket(3) == ticket
+    assert bank.commit_prefetch(3, ticket=ticket) is True
+    assert 3 in bank.plan([3], phase="decode").hits
 
 
 def test_prefetch_ring_disabled_by_default_matches_legacy_shape():
