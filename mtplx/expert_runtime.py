@@ -252,11 +252,29 @@ class ExpertStreamingConfig:
                 "prefill admission is not implemented; prefill must use transient slots"
             )
 
+    @property
+    def derived_expert_cache_policy(self) -> bool:
+        """Whether the expert-cache byte allowance is derived at runtime.
+
+        With no explicit ``expert_cache_limit_bytes``, ``memory_limit_bytes``
+        is the single memory knob: the runtime recomputes the streamed
+        expert-cache allowance from it at every KV admission boundary instead
+        of reserving the whole ``max_live_kv_tokens`` context up front.  The
+        metal-mmap layout has no slot cache to budget, so it keeps the static
+        plan.
+        """
+
+        return (
+            self.expert_cache_limit_bytes is None
+            and self.slot_layout != "metal-mmap"
+        )
+
     def memory_plan(
         self,
         spec: ExpertStreamingModelSpec,
         *,
         additional_resident_bytes: int = 0,
+        live_kv_tokens: int | None = None,
     ) -> ExpertMemoryPlan:
         # File-backed Metal records use the OS page cache as their physical
         # tier and never consume fixed MLX expert slots. Retain only a tiny
@@ -267,10 +285,26 @@ class ExpertStreamingConfig:
         if self.slot_layout == "metal-mmap":
             expert_cache_limit_bytes = 0
             transient_slots = spec.top_k
+        if live_kv_tokens is not None and not self.derived_expert_cache_policy:
+            raise ExpertStreamingConfigurationError(
+                "live_kv_tokens applies only to the derived expert-cache "
+                "policy; static plans always reserve max_live_kv_tokens"
+            )
+        if self.derived_expert_cache_policy:
+            # Derived single-limit policy: the plan carries one KV boundary,
+            # not a whole-context reservation. The post-load boundary is zero
+            # live tokens; admit_kv_tokens re-plans before every growth.
+            context_tokens = (
+                0
+                if live_kv_tokens is None
+                else _integer("live_kv_tokens", live_kv_tokens, minimum=0)
+            )
+        else:
+            context_tokens = self.max_live_kv_tokens
         return plan_expert_memory(
             spec,
             total_limit_bytes=self.memory_limit_bytes,
-            context_tokens=self.max_live_kv_tokens,
+            context_tokens=context_tokens,
             runtime_reserve_bytes=self.runtime_reserve_bytes,
             expert_cache_limit_bytes=expert_cache_limit_bytes,
             transient_slots=transient_slots,
@@ -1075,6 +1109,34 @@ class PendingSplitRoute:
         self.close()
 
 
+def derived_expert_cache_allowance_bytes(plan: ExpertMemoryPlan) -> int:
+    """Byte allowance for the streamed slot cache under one boundary plan.
+
+    A pure function of the plan: ``plan.fixed_bytes`` is authoritative for
+    everything permanently resident (model weights, live KV, transient miss
+    service, workspace, staging, allocator headroom, and any dense-island or
+    wired mmap-band layers a plan may carry), so the derivation stays correct
+    as fixed-side categories evolve.  A paged (unwired) mmap band lives in
+    the page cache outside MLX and additionally shrinks the MLX cap by its
+    own bytes (see :func:`reconcile_mlx_memory_cap`); the slot cache must fit
+    under that reduced cap too, or the pager evicts band pages on every
+    decode wave.
+
+    Returns a negative value when even an empty cache oversubscribes the
+    limit: the caller must fail the admission rather than clamp.
+    """
+
+    paged_band_bytes = (
+        0
+        if getattr(plan, "mmap_islands_wired", True)
+        else getattr(plan, "mmap_island_bytes", 0)
+    )
+    available = plan.total_limit_bytes - plan.fixed_bytes - paged_band_bytes
+    if available < 0:
+        return available
+    return min(plan.persistent_budget_bytes, available)
+
+
 def reconcile_mlx_memory_cap(
     plan: ExpertMemoryPlan,
     *,
@@ -1231,6 +1293,26 @@ class ExpertStreamingRuntime:
         self._kv_lock = threading.Lock()
         self._live_kv_tokens = 0
         self._live_kv_peak = 0
+        self._pending_kv_tokens = 0
+        # Derived single-limit policy state. The allowance is recomputed only
+        # at KV boundaries; cache hits never touch any of this.
+        self._additional_resident_bytes = plan.resident_bytes - spec.resident_bytes
+        self._derived_cache_policy = config.derived_expert_cache_policy
+        self._allowance_lock = threading.Lock()
+        self._derived_allowance_bytes: int | None = None
+        self._derived_capacity_slots: int | None = None
+        if self._derived_cache_policy:
+            # Post-load boundary: the open-time plan is the zero-KV plan, so
+            # its budget is the initial allowance and the pool size is the
+            # initial capacity.
+            self._derived_allowance_bytes = max(
+                0, derived_expert_cache_allowance_bytes(plan)
+            )
+            self._derived_capacity_slots = (
+                plan.persistent_slots
+                if config.cache_scope == "global"
+                else plan.slots_per_layer
+            )
         self._close_lock = threading.Lock()
         self._closing = False
         self._closed = False
@@ -1366,6 +1448,109 @@ class ExpertStreamingRuntime:
         self.slots.raise_if_unhealthy()
         self._raise_cleanup_error()
 
+    def _derived_expert_plan(self, live_kv_tokens: int) -> ExpertMemoryPlan:
+        """One boundary plan of the single-limit policy at a live KV level."""
+
+        return self.config.memory_plan(
+            self.spec,
+            additional_resident_bytes=self._additional_resident_bytes,
+            live_kv_tokens=live_kv_tokens,
+        )
+
+    def _apply_derived_allowance(self) -> None:
+        """Recompute the derived expert-cache allowance and evict down to it.
+
+        Runs only at KV boundaries (admission, release, reset); cache hits
+        never reach this path.  Byte accounting is record-granular: every
+        streamed slot holds exactly ``spec.expert_record_bytes``, so a byte
+        allowance maps to an exact entry capacity.
+        """
+
+        with self._allowance_lock:
+            with self._kv_lock:
+                admitted = self._live_kv_tokens + self._pending_kv_tokens
+            plan = self._derived_expert_plan(admitted)
+            allowance = derived_expert_cache_allowance_bytes(plan)
+            if allowance < 0:
+                raise ExpertStreamingConfigurationError(
+                    f"admitting {admitted} live KV tokens oversubscribes "
+                    f"memory_limit_bytes={self.config.memory_limit_bytes} by "
+                    f"{-allowance} bytes even with an empty expert cache; "
+                    "the admission is refused before any allocation"
+                )
+            record_bytes = self.spec.expert_record_bytes
+            if self._global_bank is not None:
+                capacity = allowance // record_bytes
+                lock = self._layer_locks[self.spec.routed_layer_indices[0]]
+                with lock:
+                    self._evict_global_bank_to_capacity(capacity)
+            else:
+                # Uniform per-layer capacity over the streamed banks, exactly
+                # mirroring the plan's uniform slots-per-layer derivation.
+                streamed_layers = len(self._banks)
+                capacity = (
+                    allowance // (streamed_layers * record_bytes)
+                    if streamed_layers
+                    else 0
+                )
+                for layer in sorted(self._banks):
+                    with self._layer_locks[layer]:
+                        self._evict_layer_bank_to_capacity(layer, capacity)
+            self._derived_allowance_bytes = allowance
+            self._derived_capacity_slots = capacity
+
+    def _evict_layer_bank_to_capacity(self, layer: int, capacity: int) -> None:
+        """Synchronously evict one layer bank's policy victims to a cap.
+
+        A failure below leaves this and already-processed banks at the
+        stricter cap with the admission unpublished, which under-uses but
+        never oversubscribes the limit; the next boundary relaxes it.
+        """
+
+        bank = self._banks[layer]
+        bank.set_persistent_capacity(capacity)
+        skipped: set[int] = set()
+        while bank.occupancy > capacity:
+            victim = bank.peek_victim(excluded=skipped)
+            if victim is None:
+                raise ExpertStreamingConfigurationError(
+                    f"cannot evict streamed experts on layer {layer} below "
+                    f"the derived allowance: {bank.occupancy} resident "
+                    f"entries exceed the {capacity}-entry cap and every "
+                    "candidate is pinned or loading"
+                )
+            expert, slot = victim
+            try:
+                self.slots.invalidate(layer, slot, expert=expert)
+            except ExpertSlotError:
+                skipped.add(expert)
+                continue
+            bank.invalidate_expert(expert)
+
+    def _evict_global_bank_to_capacity(self, capacity: int) -> None:
+        """Synchronously evict the global bank's policy victims to a cap."""
+
+        bank = self._global_bank
+        assert bank is not None
+        bank.set_persistent_capacity(capacity)
+        skipped: set[tuple[int, int]] = set()
+        while bank.occupancy > capacity:
+            victim = bank.peek_victim(excluded=skipped)
+            if victim is None:
+                raise ExpertStreamingConfigurationError(
+                    "cannot evict streamed experts below the derived "
+                    f"allowance: {bank.occupancy} resident entries exceed "
+                    f"the {capacity}-entry cap and every candidate is "
+                    "pinned or loading"
+                )
+            layer, expert, slot = victim
+            try:
+                self.slots.invalidate(layer, slot, expert=expert)
+            except ExpertSlotError:
+                skipped.add((layer, expert))
+                continue
+            bank.invalidate_expert(layer, expert)
+
     def admit_kv_tokens(self, tokens: int) -> KVAdmission:
         # Lifecycle order is close -> slot/runtime health -> KV accounting.
         # Release takes only the KV lock so an existing lease can always drain.
@@ -1376,6 +1561,20 @@ class ExpertStreamingRuntime:
                 raise ExpertSlotError("expert streaming runtime is closing")
             self._raise_if_unhealthy()
             count = _integer("tokens", tokens, minimum=1)
+            if not self._derived_cache_policy:
+                with self._kv_lock:
+                    requested = self._live_kv_tokens + count
+                    if requested > self.config.max_live_kv_tokens:
+                        raise ExpertStreamingConfigurationError(
+                            f"live KV admission {requested} exceeds planned "
+                            f"{self.config.max_live_kv_tokens} tokens"
+                        )
+                    self._live_kv_tokens = requested
+                    self._live_kv_peak = max(self._live_kv_peak, requested)
+                return KVAdmission(self, count)
+            # Derived single-limit policy: shrink the expert-cache allowance
+            # and synchronously evict down to it first, so KV growth is
+            # admitted only once the cache is within budget.
             with self._kv_lock:
                 requested = self._live_kv_tokens + count
                 if requested > self.config.max_live_kv_tokens:
@@ -1383,8 +1582,17 @@ class ExpertStreamingRuntime:
                         f"live KV admission {requested} exceeds planned "
                         f"{self.config.max_live_kv_tokens} tokens"
                     )
-                self._live_kv_tokens = requested
-                self._live_kv_peak = max(self._live_kv_peak, requested)
+                self._pending_kv_tokens += count
+            try:
+                self._apply_derived_allowance()
+            except BaseException:
+                with self._kv_lock:
+                    self._pending_kv_tokens -= count
+                raise
+            with self._kv_lock:
+                self._pending_kv_tokens -= count
+                self._live_kv_tokens += count
+                self._live_kv_peak = max(self._live_kv_peak, self._live_kv_tokens)
             return KVAdmission(self, count)
 
     def release_kv_tokens(self, tokens: int) -> None:
@@ -1393,6 +1601,11 @@ class ExpertStreamingRuntime:
             if count > self._live_kv_tokens:
                 raise RuntimeError("KV admission accounting underflow")
             self._live_kv_tokens -= count
+        if self._derived_cache_policy and not self._closed and not self._closing:
+            # KV shrink recomputes the larger allowance but allocates
+            # nothing: later misses refill the cache naturally up to the
+            # raised cap.
+            self._apply_derived_allowance()
 
     def ensure_route(
         self,
@@ -2104,6 +2317,11 @@ class ExpertStreamingRuntime:
         finally:
             for lock in reversed(locks):
                 lock.release()
+        if self._derived_cache_policy:
+            # A bank reset drops residency but keeps each bank's capacity
+            # cap; re-derive it from the current KV accounting outside the
+            # layer locks (the allowance path acquires them itself).
+            self._apply_derived_allowance()
 
     def snapshot(self, *, mx_module: Any | None = None) -> dict[str, Any]:
         with self._kv_lock:
@@ -2142,6 +2360,17 @@ class ExpertStreamingRuntime:
                 "transient_slots": self.plan.transient_slots,
                 "allocated_bytes": self.plan.allocated_bytes,
                 "unallocated_bytes": self.plan.unallocated_bytes,
+            },
+            "expert_cache_policy": {
+                "derived": self._derived_cache_policy,
+                "allowance_bytes": self._derived_allowance_bytes,
+                "persistent_capacity": self._derived_capacity_slots,
+                "cached_bytes": (
+                    self._global_bank.occupancy
+                    if self._global_bank is not None
+                    else sum(bank.occupancy for bank in self._banks.values())
+                )
+                * self.spec.expert_record_bytes,
             },
             "memory_cap": self.memory_cap_report,
             "integrity": self.integrity_report,

@@ -234,6 +234,7 @@ class LayerExpertSlotBank:
         self._expert_to_slot: dict[int, int] = {}
         self._history = [_ExpertHistory() for _ in range(expert_count)]
         self._prefill_seed_candidates: set[int] = set()
+        self._persistent_capacity = self.persistent_slots
 
     @property
     def resident_experts(self) -> tuple[int, ...]:
@@ -242,6 +243,36 @@ class LayerExpertSlotBank:
     @property
     def occupancy(self) -> int:
         return len(self._expert_to_slot)
+
+    @property
+    def persistent_capacity(self) -> int:
+        """Resident-entry cap currently admitted by the memory policy."""
+
+        return self._persistent_capacity
+
+    def set_persistent_capacity(self, capacity: int) -> int:
+        """Cap resident persistent entries without changing physical slots.
+
+        The runtime lowers this at a KV-growth boundary (then evicts down to
+        it) and raises it again on KV shrink.  Entries above the cap are
+        never admitted; existing entries above it may only be replaced.
+        """
+
+        capacity = _integer("capacity", capacity, minimum=0)
+        self._persistent_capacity = min(capacity, self.persistent_slots)
+        return self._persistent_capacity
+
+    def peek_victim(
+        self, *, excluded: Iterable[int] = ()
+    ) -> tuple[int, int] | None:
+        """Return the policy's next eviction candidate without mutating state."""
+
+        slot = self._victim_slot(pinned=set(excluded))
+        if slot is None:
+            return None
+        expert = self._slot_to_expert[slot]
+        assert expert is not None
+        return expert, slot
 
     def invalidate_expert(self, expert_id: int) -> int | None:
         """Forget a failed/stale persistent mapping and return its slot."""
@@ -266,7 +297,7 @@ class LayerExpertSlotBank:
     def prepare_prefill_seed(self, expert_ids: Iterable[int]) -> tuple[int, ...]:
         """Choose prompt-frequent experts for empty slots without eviction."""
 
-        empty = self.persistent_slots - self.occupancy
+        empty = self._persistent_capacity - self.occupancy
         if empty <= 0:
             self._prefill_seed_candidates.clear()
             return ()
@@ -328,6 +359,8 @@ class LayerExpertSlotBank:
         history.last_used = self._decode_epoch
 
     def _empty_persistent_slot(self) -> int | None:
+        if self.occupancy >= self._persistent_capacity:
+            return None
         for slot, expert in enumerate(self._slot_to_expert):
             if expert is None:
                 return slot
@@ -633,10 +666,41 @@ class GlobalExpertSlotBank:
         self._prefill_seed_candidates: dict[int, set[int]] = {
             layer: set() for layer in self.layer_indices
         }
+        self._persistent_capacity = self.persistent_slots
 
     @property
     def occupancy(self) -> int:
         return len(self._key_to_slot)
+
+    @property
+    def persistent_capacity(self) -> int:
+        """Resident-entry cap currently admitted by the memory policy."""
+
+        return self._persistent_capacity
+
+    def set_persistent_capacity(self, capacity: int) -> int:
+        """Cap resident persistent entries without changing physical slots.
+
+        The runtime lowers this at a KV-growth boundary (then evicts down to
+        it) and raises it again on KV shrink.  Entries above the cap are
+        never admitted; existing entries above it may only be replaced.
+        """
+
+        capacity = _integer("capacity", capacity, minimum=0)
+        self._persistent_capacity = min(capacity, self.persistent_slots)
+        return self._persistent_capacity
+
+    def peek_victim(
+        self, *, excluded: Iterable[tuple[int, int]] = ()
+    ) -> tuple[int, int, int] | None:
+        """Return the policy's next (layer, expert, slot) eviction candidate."""
+
+        slot = self._victim_slot(pinned=set(excluded))
+        if slot is None:
+            return None
+        key = self._slot_to_key[slot]
+        assert key is not None
+        return key[0], key[1], slot
 
     @property
     def resident_experts_by_layer(self) -> dict[int, tuple[int, ...]]:
@@ -708,6 +772,8 @@ class GlobalExpertSlotBank:
         history.last_used = self._decode_epoch
 
     def _empty_slot(self) -> int | None:
+        if self.occupancy >= self._persistent_capacity:
+            return None
         if not self._free_slots:
             return None
         slot = self._free_slots.popleft()
@@ -829,7 +895,7 @@ class GlobalExpertSlotBank:
         remaining_layer = max(
             0, self.prefill_slots_per_layer - self._layer_occupancy[layer]
         )
-        empty = self.persistent_slots - self.occupancy
+        empty = self._persistent_capacity - self.occupancy
         available = min(remaining_layer, empty)
         if available <= 0:
             self._prefill_seed_candidates[layer].clear()

@@ -405,7 +405,9 @@ def plan_expert_memory(
     A plan with ``fits_fixed=False`` is diagnostic and must not be used to
     start inference.  Its negative ``unallocated_bytes`` is the fixed-footprint
     deficit.  ``context_tokens=0`` is an explicit load-only plan; an inference
-    runtime must reject KV growth beyond the planned live-token total.
+    runtime must reject KV growth beyond the planned live-token total unless
+    it re-plans every admission boundary (the derived single-limit policy in
+    :class:`mtplx.expert_runtime.ExpertStreamingConfig`).
     """
 
     if not isinstance(spec, ExpertStreamingModelSpec):

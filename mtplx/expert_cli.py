@@ -63,7 +63,12 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
         "--expert-runtime-reserve", help="Runtime/OS headroom (default 16GiB)."
     )
     group.add_argument(
-        "--expert-cache-limit", help="Optional persistent expert-cache cap."
+        "--expert-cache-limit",
+        help=(
+            "Optional static persistent expert-cache cap. When omitted, the "
+            "cache allowance is derived from --expert-memory-limit at every "
+            "KV admission boundary."
+        ),
     )
     group.add_argument(
         "--expert-cache-policy",
