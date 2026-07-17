@@ -212,6 +212,79 @@ def test_manifest_plan_discount_scopes_and_prices_tensors() -> None:
     assert resident_quant_plan_discount(manifest, "q4") == expected
 
 
+def test_kv_quant_config_validation() -> None:
+    for mode in (None, "q8", "q4"):
+        assert ExpertStreamingConfig(**_config_kwargs(kv_quant=mode)).kv_quant == mode
+    with pytest.raises(ValueError, match="kv_quant"):
+        ExpertStreamingConfig(**_config_kwargs(kv_quant="int8"))
+
+
+def test_plan_prices_quantized_kv() -> None:
+    spec = get_model_spec("hy3-expert-q2")
+    base = plan_expert_memory(
+        spec, total_limit_bytes=110 * 1024**3, context_tokens=8192
+    )
+    quant = plan_expert_memory(
+        spec, total_limit_bytes=110 * 1024**3, context_tokens=8192, kv_quant="q4"
+    )
+    raw = 8192 * spec.kv_bytes_per_token
+    assert base.kv_bytes == raw
+    assert quant.kv_bytes == resident_quant_kept_bytes(raw, "q4")
+    with pytest.raises(ValueError, match="kv_quant"):
+        plan_expert_memory(
+            spec, total_limit_bytes=110 * 1024**3, context_tokens=8192,
+            kv_quant="int8",
+        )
+
+
+def test_make_cache_honors_kv_quant_attribute() -> None:
+    from mlx_lm.models.cache import KVCache, QuantizedKVCache
+
+    model = Hy3Model(_tiny_args())
+    default = model.make_cache()
+    assert len(default) == 2
+    assert all(type(c) is KVCache for c in default)
+
+    model._mtplx_kv_quant = "q4"
+    quantized = model.make_cache()
+    assert all(type(c) is QuantizedKVCache for c in quantized)
+    assert all(c.bits == 4 and c.group_size == 64 for c in quantized)
+
+
+def test_hy3_attention_matches_between_stock_and_quantized_cache() -> None:
+    """Decode-shaped forward parity: q8 KV should track the stock cache
+    closely (loose tolerance — quantization noise, not correctness)."""
+
+    from mlx_lm.models.cache import KVCache, QuantizedKVCache
+
+    args = _tiny_args()
+    # mx.quantize needs group_size >= 32 and group_size | head_dim.
+    args.head_dim = 32
+    model = Hy3Model(args)
+
+    class _NullMoE(nn.Module):
+        """The sparse layer's experts need a bound runtime; attention
+        parity does not."""
+
+        def __call__(self, x: mx.array) -> mx.array:
+            return x * 0
+
+    model.model.layers[1].mlp = _NullMoE()
+    tokens = mx.array([[3, 5, 7, 11, 2, 9, 4, 8]], dtype=mx.int32)
+    step = mx.array([[6]], dtype=mx.int32)
+
+    stock = [KVCache() for _ in model.layers]
+    quant = [QuantizedKVCache(group_size=32, bits=8) for _ in model.layers]
+    mx.eval(model(tokens, cache=stock))
+    mx.eval(model(tokens, cache=quant))
+    a = model(step, cache=stock).astype(mx.float32)
+    b = model(step, cache=quant).astype(mx.float32)
+    mx.eval(a, b)
+    scale = float(mx.abs(a).mean().item()) + 1e-6
+    drift = float(mx.abs(a - b).mean().item()) / scale
+    assert drift < 0.05, f"quantized-KV forward drifted: {drift}"
+
+
 def test_resident_quant_survives_benchmark_option_pipeline() -> None:
     """CLI vector -> parser -> runtime options -> config factory, mirroring
     the island-count guard (option keys have silently dropped between
@@ -251,3 +324,30 @@ def test_resident_quant_survives_benchmark_option_pipeline() -> None:
     )
     config = bench._runtime_config(apis, "hy3-expert-q2", options)
     assert config.resident_quant == "q4"
+
+    kv_args = parser.parse_args(
+        [
+            "--model", "hy3-q2",
+            "--hy3-q2-model-root", "/tmp",
+            "--memory-limit", "96GiB",
+            "--kv-quant", "q4",
+        ]
+    )
+    kv_options = {
+        **bench.DEFAULT_RUNTIME_OPTIONS,
+        "trace_routes": False,
+        **bench._runtime_options_from_args(kv_args),
+    }
+    assert kv_options["kv_quant"] == "q4"
+    kv_config = bench._runtime_config(apis, "hy3-expert-q2", kv_options)
+    assert kv_config.kv_quant == "q4"
+
+    with pytest.raises(SystemExit):
+        bench.main(
+            [
+                "--model", "hy3-q2",
+                "--hy3-q2-model-root", "/tmp",
+                "--kv-quant", "q4",
+                "--verify-strategy", "capture_commit",
+            ]
+        )

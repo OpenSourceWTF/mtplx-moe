@@ -450,6 +450,7 @@ def plan_expert_memory(
     execution_workspace_bytes: int = 0,
     additional_resident_bytes: int = 0,
     resident_discount_bytes: int = 0,
+    kv_quant: str | None = None,
     cache_scope: str = "layer",
     island_layer_count: int = 0,
     mmap_island_layer_count: int = 0,
@@ -531,6 +532,13 @@ def plan_expert_memory(
         raise ValueError(f"transient_slots must be at least top_k ({spec.top_k})")
 
     kv_bytes = context_tokens * spec.kv_bytes_per_token
+    if kv_quant is not None:
+        if kv_quant not in RESIDENT_QUANT_KEEP_NUMERATOR:
+            raise ValueError("kv_quant must be None, 'q8', or 'q4'")
+        # QuantizedKVCache uses the same group-64 affine layout as the
+        # resident pass; the MTP layer's stock cache is not in
+        # kv_bytes_per_token (mtp_included=False) and stays in reserve.
+        kv_bytes = resident_quant_kept_bytes(kv_bytes, kv_quant)
     transient_bytes = service_slots * spec.expert_record_bytes
     resident_bytes = (
         spec.resident_bytes + additional_resident_bytes - resident_discount_bytes

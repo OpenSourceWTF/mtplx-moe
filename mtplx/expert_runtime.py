@@ -155,6 +155,7 @@ class ExpertStreamingConfig:
     banked_codec: str = "none"
     mmap_island_wired: bool = True
     resident_quant: str | None = None
+    kv_quant: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -217,6 +218,8 @@ class ExpertStreamingConfig:
             raise ValueError("deferred_pin_release must be bool")
         if self.resident_quant not in {None, "q8", "q4"}:
             raise ValueError("resident_quant must be None, 'q8', or 'q4'")
+        if self.kv_quant not in {None, "q8", "q4"}:
+            raise ValueError("kv_quant must be None, 'q8', or 'q4'")
         if self.island_layer_count is not None:
             if self.island_layers:
                 raise ValueError(
@@ -406,6 +409,7 @@ class ExpertStreamingConfig:
             execution_workspace_bytes=self.execution_workspace_bytes,
             additional_resident_bytes=additional_resident_bytes,
             resident_discount_bytes=resident_discount_bytes,
+            kv_quant=self.kv_quant,
             cache_scope=self.cache_scope,
             island_layer_count=len(self.island_layers),
             mmap_island_layer_count=len(self.mmap_island_layers),

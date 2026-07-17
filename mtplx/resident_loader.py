@@ -317,6 +317,9 @@ def construct_resident_model(
     )
     setattr(model, "_mtplx_expert_runtime", runtime)
     setattr(model, "_mtplx_resident_load_report", report.as_dict())
+    kv_quant = getattr(runtime.config, "kv_quant", None)
+    if kv_quant:
+        setattr(model, "_mtplx_kv_quant", kv_quant)
     return ResidentModel(model=model, config=config, report=report)
 
 

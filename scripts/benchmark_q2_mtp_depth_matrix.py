@@ -78,6 +78,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "island_layers": "",
     "island_layer_count": None,
     "resident_quant": None,
+    "kv_quant": None,
     "mmap_island_layers": "",
     "banked_manifest": "",
     "banked_codec": "none",
@@ -508,6 +509,16 @@ def build_parser() -> argparse.ArgumentParser:
             "head keep their loaded precision. No artifact rebuild."
         ),
     )
+    parser.add_argument(
+        "--kv-quant",
+        choices=("q8", "q4"),
+        default=None,
+        help=(
+            "Quantized trunk KV cache (group 64 affine). The MTP draft "
+            "cache stays BF16; use --verify-strategy batched — "
+            "capture_commit adapts dense trunk KV state."
+        ),
+    )
     parser.add_argument("--output-json", type=Path)
     return parser
 
@@ -587,6 +598,7 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "island_layers": args.island_layers,
         "island_layer_count": args.island_layer_count,
         "resident_quant": args.resident_quant,
+        "kv_quant": args.kv_quant,
         "mmap_island_layers": args.mmap_island_layers,
         "banked_manifest": args.banked_manifest,
         "banked_codec": args.banked_codec,
@@ -2058,6 +2070,7 @@ def _runtime_config(
         island_layers=parse_island_layers(options.get("island_layers", "")),
         island_layer_count=options.get("island_layer_count"),
         resident_quant=options.get("resident_quant") or None,
+        kv_quant=options.get("kv_quant") or None,
         mmap_island_layers=parse_island_layers(
             options.get("mmap_island_layers", "")
         ),
@@ -2743,6 +2756,11 @@ def _write_json_atomic(path: Path, rendered: str) -> None:
 def main(argv: Sequence[str] | None = None, *, apis: RunnerAPIs | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.kv_quant and args.verify_strategy == "capture_commit":
+        parser.error(
+            "--kv-quant requires --verify-strategy batched: capture_commit "
+            "adapts dense trunk KV state and cannot wrap a quantized cache"
+        )
     latest_checkpoint: dict[str, Any] | None = None
 
     def persist_checkpoint(snapshot: Mapping[str, Any]) -> None:

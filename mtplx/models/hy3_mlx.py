@@ -953,4 +953,17 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self):
+        # Set by the resident loader when the runtime requests quantized
+        # trunk KV. The MTP draft cache stays a stock KVCache — the
+        # compiled draft's tensor-offset adapter reads dense KV state, and
+        # one layer of BF16 KV is within the plan's runtime reserve.
+        mode = getattr(self, "_mtplx_kv_quant", None)
+        if mode:
+            from mlx_lm.models.cache import QuantizedKVCache
+
+            bits = {"q8": 8, "q4": 4}[mode]
+            return [
+                QuantizedKVCache(group_size=64, bits=bits)
+                for _layer in self.layers
+            ]
         return [KVCache() for _layer in self.layers]
