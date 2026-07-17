@@ -686,6 +686,58 @@ def estimate_hy3_router_kernel_incremental_bytes(
     return router_count * 192 * 4096 * prepared_element_bytes
 
 
+_LOOKAHEAD_ROWS: list[tuple[int, Any, Any]] | None = None
+
+
+def _lookahead_capture(layer_index: int, x: mx.array, indices: mx.array) -> None:
+    """Diagnostic lane: capture decode hiddens + routed ids per sparse layer.
+
+    MTPLX_LOOKAHEAD_CAPTURE_PATH enables it; MTPLX_LOOKAHEAD_CAPTURE_TOKENS
+    bounds the row count (default 300 tokens x layers). Rows persist to an
+    .npz at exit. Decode rows only (single-token calls).
+    """
+
+    global _LOOKAHEAD_ROWS
+    path = os.environ.get("MTPLX_LOOKAHEAD_CAPTURE_PATH")
+    if not path or int(x.shape[-2]) != 1:
+        return
+    limit = int(os.environ.get("MTPLX_LOOKAHEAD_CAPTURE_TOKENS", "300"))
+    if _LOOKAHEAD_ROWS is None:
+        _LOOKAHEAD_ROWS = []
+
+        def _save() -> None:
+            import numpy as _np
+
+            rows = _LOOKAHEAD_ROWS or []
+            if not rows:
+                return
+            mx.eval(*[r[1] for r in rows], *[r[2] for r in rows])
+            _np.savez_compressed(
+                path,
+                layers=_np.array([r[0] for r in rows], dtype=_np.int16),
+                hiddens=_np.stack(
+                    [_np.array(r[1], copy=False) for r in rows]
+                ).astype(_np.float16),
+                expert_ids=_np.stack(
+                    [_np.array(r[2], copy=False) for r in rows]
+                ).astype(_np.int16),
+            )
+
+        import atexit
+
+        atexit.register(_save)
+    # 79 sparse layers per token; bound total rows by tokens * layers.
+    if len(_LOOKAHEAD_ROWS) >= limit * 79:
+        return
+    _LOOKAHEAD_ROWS.append(
+        (
+            int(layer_index),
+            x.reshape(-1).astype(mx.float32),
+            indices.reshape(-1).astype(mx.int32),
+        )
+    )
+
+
 class SparseMLP(nn.Module):
     def __init__(
         self,
@@ -696,6 +748,7 @@ class SparseMLP(nn.Module):
     ):
         super().__init__()
         self.router = Router(args)
+        self.layer_index = int(layer_index)
         self.switch_mlp = UnboundExpertSwitch(layer_index)
         shared_width = args.moe_intermediate_size * args.num_shared_experts
         shared_cls = FusedSharedMLP if fuse_shared_gate_up else MLP
@@ -707,6 +760,7 @@ class SparseMLP(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         indices, scores = self.router(x)
+        _lookahead_capture(self.layer_index, x, indices)
         # Match the pinned Hy3 MLX reference: when FP32 MoE combining is
         # disabled, both the routing multiply and its reduction happen in the
         # activation dtype.  Keeping ``scores`` in FP32 here subtly changes
