@@ -163,6 +163,11 @@ def decode_component(
 ) -> mx.array:
     """Decode one component's raw bytes for every routed assignment."""
 
+    if assignments * seg_len >= (1 << 31):
+        raise ValueError(
+            f"decode output of {assignments} x {seg_len} bytes exceeds the "
+            "2^31 element shape limit; chunk or deduplicate assignments"
+        )
     kernel = _kernel(lanes, lane_bytes, seg_len, dir_stride, dir_base, plane)
     total_threads = assignments * lanes
     (out,) = kernel(

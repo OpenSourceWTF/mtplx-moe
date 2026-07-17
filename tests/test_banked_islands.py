@@ -946,14 +946,21 @@ def test_compressed_island_switch_bitwise_parity(tmp_path, mlx) -> None:
         wired_switch.bits = spec.quant_bits
         wired_switch._bank = wired.bank_for_layer(island_layer)
 
-        rows = 3
         mx.random.seed(7)
-        x = mx.random.normal((1, rows, spec.hidden_size)).astype(mx.bfloat16)
-        indices = mx.array([[[1], [0], [1]]], dtype=mx.uint32)
-        got = comp_switch(x, indices)
-        want = wired_switch(x, indices)
-        assert got.shape == want.shape
-        assert mx.array_equal(got, want).item(), "compressed dispatch diverged"
+        # assignments >= expert_count exercises the full-bank (prefill)
+        # branch; a single row exercises the per-assignment decode branch.
+        cases = (
+            (3, mx.array([[[1], [0], [1]]], dtype=mx.uint32)),
+            (1, mx.array([[[1]]], dtype=mx.uint32)),
+        )
+        for rows, indices in cases:
+            x = mx.random.normal((1, rows, spec.hidden_size)).astype(mx.bfloat16)
+            got = comp_switch(x, indices)
+            want = wired_switch(x, indices)
+            assert got.shape == want.shape
+            assert mx.array_equal(got, want).item(), (
+                f"compressed dispatch diverged at rows={rows}"
+            )
         snapshot = compressed.snapshot()
         assert snapshot["backend"] == "compressed-banked-island-banks"
     finally:
