@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -48,7 +49,7 @@ from mtplx.models.hy3_mlx import ModelArgs as Hy3Args
 from mtplx.resident_loader import construct_resident_model
 
 
-def _hy3_args() -> Hy3Args:
+def _hy3_args(*, num_experts: int = 2, top_k: int = 1) -> Hy3Args:
     return Hy3Args(
         model_type="hy_v3",
         hidden_size=64,
@@ -57,8 +58,8 @@ def _hy3_args() -> Hy3Args:
         moe_intermediate_size=64,
         num_attention_heads=4,
         num_key_value_heads=2,
-        num_experts=2,
-        num_experts_per_tok=1,
+        num_experts=num_experts,
+        num_experts_per_tok=top_k,
         num_shared_experts=1,
         first_k_dense_replace=1,
         rms_norm_eps=1e-5,
@@ -2017,20 +2018,25 @@ def test_descriptor_bits_reach_mapped_switch(
     assert observed_bits == [2]
 
 
-def _integrated_hy3_artifact(tmp_path: Path):
-    args = _hy3_args()
+def _integrated_hy3_artifact(
+    tmp_path: Path,
+    *,
+    expert_count: int = 2,
+    top_k: int = 1,
+):
+    args = _hy3_args(num_experts=expert_count, top_k=top_k)
     model = Hy3Model(args)
     weights = dict(tree_flatten(model.parameters()))
     expert_shapes = {
-        "gate_proj.weight": (2, 64, 8),
-        "gate_proj.scales": (2, 64, 1),
-        "gate_proj.biases": (2, 64, 1),
-        "up_proj.weight": (2, 64, 8),
-        "up_proj.scales": (2, 64, 1),
-        "up_proj.biases": (2, 64, 1),
-        "down_proj.weight": (2, 64, 8),
-        "down_proj.scales": (2, 64, 1),
-        "down_proj.biases": (2, 64, 1),
+        "gate_proj.weight": (expert_count, 64, 8),
+        "gate_proj.scales": (expert_count, 64, 1),
+        "gate_proj.biases": (expert_count, 64, 1),
+        "up_proj.weight": (expert_count, 64, 8),
+        "up_proj.scales": (expert_count, 64, 1),
+        "up_proj.biases": (expert_count, 64, 1),
+        "down_proj.weight": (expert_count, 64, 8),
+        "down_proj.scales": (expert_count, 64, 1),
+        "down_proj.biases": (expert_count, 64, 1),
     }
     for component, shape in expert_shapes.items():
         dtype = mx.uint32 if component.endswith("weight") else mx.bfloat16
@@ -2045,7 +2051,7 @@ def _integrated_hy3_artifact(tmp_path: Path):
     config = asdict(args)
     config["model_type"] = "hy_v3"
     (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
-    routed_bytes = 2 * 6_912
+    routed_bytes = expert_count * 6_912
     total_bytes = sum(int(value.nbytes) for value in weights.values())
     spec = ExpertStreamingModelSpec(
         key="tiny-hy3-q4",
@@ -2058,8 +2064,8 @@ def _integrated_hy3_artifact(tmp_path: Path):
         total_layers=2,
         routed_layer_start=1,
         routed_layer_count=1,
-        expert_count=2,
-        top_k=1,
+        expert_count=expert_count,
+        top_k=top_k,
         hidden_size=64,
         expert_hidden_size=64,
         quant_bits=4,
@@ -2067,7 +2073,7 @@ def _integrated_hy3_artifact(tmp_path: Path):
         quant_parameter_bytes=2,
         router_storage="float32",
         router_matmul_dtype="float32",
-        router_bytes=2 * 64 * 4 + 2 * 4,
+        router_bytes=expert_count * 64 * 4 + expert_count * 4,
         kv_bytes_per_token=0,
         mtp_layer_index=2,
         mtp_included=False,
@@ -3413,3 +3419,244 @@ def test_prefetch_ring_load_resolves_as_route_hit_bitwise(
     assert prefetch_snapshot["slots"]["metrics"]["owned_loads"] >= 2
 
     assert mx.array_equal(plain_logits, prefetch_logits).item()
+
+
+def _open_prefetch_runtime(
+    root,
+    manifest_path,
+    spec,
+    *,
+    prefetch_slots: int,
+):
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=(
+            fixed
+            + spec.persistent_cache_bytes(1)
+            + prefetch_slots * spec.expert_record_bytes
+        ),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        prefetch_slots=prefetch_slots,
+    )
+    return ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=make_mlx_slot_buffer_allocator(
+            stream_config.memory_plan(spec), spec
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+
+
+def _drive_prefetch(runtime, layer: int, expert: int) -> None:
+    """Issue one speculative assignment, retrying lost try-lock races."""
+
+    bank = runtime._banks[layer]
+    lock = runtime._layer_locks[layer]
+    deadline = time.monotonic() + 5.0
+    while True:
+        runtime.prefetch_experts(layer, [expert])
+        with lock:
+            if (
+                expert in bank._prefetch_inflight
+                or expert in bank._prefetch_expert_to_slot
+            ):
+                return
+        if time.monotonic() > deadline:
+            pytest.fail(f"expert {expert} never reached the prefetch ring")
+        time.sleep(0.005)
+
+
+def _wait_ring_published(runtime, layer: int, experts: set[int]) -> None:
+    bank = runtime._banks[layer]
+    lock = runtime._layer_locks[layer]
+    deadline = time.monotonic() + 10.0
+    while True:
+        with lock:
+            published = set(bank._prefetch_expert_to_slot)
+        if experts <= published:
+            return
+        if time.monotonic() > deadline:
+            pytest.fail(f"ring never published {sorted(experts - published)}")
+        time.sleep(0.005)
+
+
+def test_stale_prefetch_commit_never_publishes_a_reassigned_ring_slot(
+    tmp_path: Path,
+) -> None:
+    """Regression for the depth-matrix failure 'expert slot did not reach
+    the requested generation' (issue #51 C6 A/B, d0/AR retained cell).
+
+    Commit callbacks used to be keyed by expert id alone. When an expert's
+    ring assignment was recycled and the expert later re-assigned to a
+    DIFFERENT ring slot whose read had not started yet (queued behind a
+    busy prefetch executor), the delayed callback of the ORIGINAL load
+    popped the new inflight entry and published it: the bank then mapped
+    the expert to a physical slot holding another expert's bytes, and the
+    next decode route hit-resolved it straight into _wait_ready's
+    generation failure. The gates below deterministically replay that
+    executor/callback timing; every step is state the real system reaches.
+    """
+
+    root, config, spec, manifest_path = _integrated_hy3_artifact(
+        tmp_path, expert_count=4, top_k=1
+    )
+    runtime = _open_prefetch_runtime(
+        root, manifest_path, spec, prefetch_slots=2
+    )
+    layer = 1
+    bank = runtime._banks[layer]
+    lock = runtime._layer_locks[layer]
+    pool = runtime.slots
+
+    original = pool.load_speculative
+    first_zero_filled = threading.Event()
+    release_first_zero = threading.Event()
+    second_zero_started = threading.Event()
+    release_second_zero = threading.Event()
+    zero_load_count = [0]
+
+    def gated(layer_arg, load):
+        if load.expert == 0:
+            zero_load_count[0] += 1
+            if zero_load_count[0] == 1:
+                # First speculative load of expert 0: fill ring slot 0
+                # normally, then hold the future open so its commit
+                # callback lags behind recycling + re-assignment.
+                original(layer_arg, load)
+                first_zero_filled.set()
+                assert release_first_zero.wait(20.0)
+                return
+            # Second assignment of expert 0: its read has not started
+            # (queued behind a busy executor).
+            second_zero_started.set()
+            assert release_second_zero.wait(20.0)
+            original(layer_arg, load)
+            return
+        original(layer_arg, load)
+
+    pool.load_speculative = gated
+    try:
+        # 0 -> ring0; the fill completes but its callback is held open.
+        _drive_prefetch(runtime, layer, 0)
+        assert first_zero_filled.wait(10.0)
+        # 1 -> ring1, fills and publishes.
+        _drive_prefetch(runtime, layer, 1)
+        _wait_ring_published(runtime, layer, {1})
+        # Recycle ring0 (victim: the still-inflight 0), 2 -> ring0.
+        _drive_prefetch(runtime, layer, 2)
+        _wait_ring_published(runtime, layer, {1, 2})
+        # Recycle ring1 (victim: published 1) and RE-ASSIGN 0 -> ring1.
+        # Physically ring1 still holds expert 1; 0's new read is gated.
+        _drive_prefetch(runtime, layer, 3)
+        _wait_ring_published(runtime, layer, {2, 3})
+        _drive_prefetch(runtime, layer, 0)
+        assert second_zero_started.wait(10.0)
+        with lock:
+            assert 0 in bank._prefetch_inflight
+        # Release the FIRST load's future: its stale commit callback runs
+        # now. It must NOT publish 0 -> ring1 (never filled with 0).
+        release_first_zero.set()
+        deadline = time.monotonic() + 5.0
+        while True:
+            with runtime._prefetch_lock:
+                pending = len(runtime._prefetch_futures)
+            if pending <= 1:  # only the gated second-zero load remains
+                break
+            if time.monotonic() > deadline:
+                pytest.fail("stale prefetch callback never completed")
+            time.sleep(0.005)
+        time.sleep(0.25)  # cover the discard-to-commit callback window
+
+        # A decode route for expert 0 must plan a plain miss (or wait for
+        # a real fill) — never hit-resolve an unfilled ring slot. Before
+        # the fix this raised ExpertSlotError('expert slot did not reach
+        # the requested generation'), the exact production failure.
+        ready = runtime.ensure_route(layer, [0], phase="decode")
+        try:
+            assert [binding.expert for binding in ready.bindings] == [0]
+        finally:
+            ready.release()
+        with lock:
+            assert 0 not in bank._prefetch_expert_to_slot
+            # The live (second) assignment must have survived the stale
+            # callback untouched.
+            assert 0 in bank._prefetch_inflight
+    finally:
+        release_first_zero.set()
+        release_second_zero.set()
+        del pool.load_speculative  # restore the bound method
+        runtime.close()
+
+
+def test_prefetch_stress_concurrent_recycling_keeps_routes_healthy(
+    tmp_path: Path,
+) -> None:
+    """A prefetch thread hammering the streamed layer while the main
+    thread decodes must never corrupt ring publication: every forward
+    stays healthy and the output matches a prefetch-free run bitwise."""
+
+    root, config, spec, manifest_path = _integrated_hy3_artifact(
+        tmp_path, expert_count=4, top_k=2
+    )
+    steps = 120
+
+    def run(prefetch_slots: int):
+        runtime = _open_prefetch_runtime(
+            root, manifest_path, spec, prefetch_slots=prefetch_slots
+        )
+        stop = threading.Event()
+        prefetch_errors: list[BaseException] = []
+
+        def prefetch_loop() -> None:
+            patterns = ([0, 1], [2, 3], [1, 2], [3, 0], [0, 2], [1, 3])
+            index = 0
+            while not stop.is_set():
+                try:
+                    issued = runtime.prefetch_experts(
+                        1, patterns[index % len(patterns)]
+                    )
+                except BaseException as exc:  # noqa: BLE001 - fail the test
+                    prefetch_errors.append(exc)
+                    return
+                index += 1
+                if not issued:
+                    # Throttled (backlog cap or lost try-lock): yield the
+                    # GIL instead of spinning against the decode thread.
+                    time.sleep(0.0005)
+
+        thread = None
+        if prefetch_slots:
+            thread = threading.Thread(target=prefetch_loop, daemon=True)
+            thread.start()
+        try:
+            resident = construct_resident_model(root, runtime, config=config)
+            outputs = []
+            for step in range(steps):
+                logits = resident.model(
+                    mx.array([[1 + (step % 7)]], dtype=mx.int32)
+                )
+                mx.eval(logits)
+                outputs.append(logits)
+            snapshot = runtime.snapshot(mx_module=mx)
+            assert snapshot["slots"]["pins"] == 0
+            assert not prefetch_errors, prefetch_errors
+            return outputs, snapshot
+        finally:
+            stop.set()
+            if thread is not None:
+                thread.join(timeout=30.0)
+                assert not thread.is_alive(), "prefetch thread wedged"
+            runtime.close()
+
+    plain_outputs, _plain_snapshot = run(0)
+    stressed_outputs, stressed_snapshot = run(2)
+
+    assert stressed_snapshot["cache"]["prefetch_issued"] > 0
+    for plain, stressed in zip(plain_outputs, stressed_outputs, strict=True):
+        assert mx.array_equal(plain, stressed).item()

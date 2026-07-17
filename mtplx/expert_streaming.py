@@ -243,10 +243,17 @@ class LayerExpertSlotBank:
         self._prefill_seed_candidates: set[int] = set()
         # Speculative lookahead ring: bypasses frequency admission, never
         # evicts an earned persistent resident, round-robin replacement.
+        # Inflight entries carry a monotonically increasing assignment
+        # ticket: an expert can be assigned, recycled, and re-assigned
+        # while its first load's completion callback is still queued, and
+        # that stale callback must not publish (or invalidate) the newer
+        # assignment. The ticket survives reset() so callbacks straddling
+        # a reset can never collide with fresh assignments either.
         self._prefetch_slot_to_expert: list[int | None] = [None] * prefetch_slots
         self._prefetch_expert_to_slot: dict[int, int] = {}
-        self._prefetch_inflight: dict[int, int] = {}
+        self._prefetch_inflight: dict[int, tuple[int, int]] = {}
         self._prefetch_cursor = 0
+        self._prefetch_ticket = 0
 
     @property
     def resident_experts(self) -> tuple[int, ...]:
@@ -318,39 +325,92 @@ class LayerExpertSlotBank:
                 self._prefetch_expert_to_slot.pop(victim, None)
                 self._prefetch_inflight.pop(victim, None)
             self._prefetch_slot_to_expert[ring_index] = expert
-            self._prefetch_inflight[expert] = base + ring_index
+            ticket = self._prefetch_ticket
+            self._prefetch_ticket += 1
+            self._prefetch_inflight[expert] = (base + ring_index, ticket)
             loads.append(
                 SlotLoad(expert=expert, slot=base + ring_index, persistent=False)
             )
         return tuple(loads)
 
-    def commit_prefetch(self, expert_id: int) -> bool:
+    def prefetch_ticket(self, expert_id: int) -> int | None:
+        """Return the inflight assignment ticket for an expert, if any.
+
+        The caller records it at plan time (under its route lock) and hands
+        it back to ``commit_prefetch``/``invalidate_prefetch`` so a delayed
+        completion can only act on the exact assignment its load belongs to.
+        """
+
+        expert = _integer("expert id", expert_id, minimum=0)
+        entry = self._prefetch_inflight.get(expert)
+        return None if entry is None else entry[1]
+
+    def commit_prefetch(
+        self,
+        expert_id: int,
+        *,
+        ticket: int | None = None,
+    ) -> bool:
         """Publish a completed ring load as hit-eligible.
 
         Returns False when the assignment was recycled by a later
         plan_prefetch before the load completed (the slot is no longer
-        this expert's; its bytes must not be published).
+        this expert's; its bytes must not be published). ``ticket`` binds
+        the commit to one specific assignment: a stale callback whose
+        assignment was recycled while the SAME expert was re-assigned to
+        another ring slot must neither publish that newer (possibly
+        unfilled) slot nor consume its inflight entry. ``ticket=None``
+        commits whatever assignment is inflight and is only safe for
+        callers that never overlap loads of one expert.
         """
 
         expert = _integer("expert id", expert_id, minimum=0)
-        slot = self._prefetch_inflight.pop(expert, None)
-        if slot is None:
+        entry = self._prefetch_inflight.get(expert)
+        if entry is None:
             return False
+        slot, assignment_ticket = entry
+        if ticket is not None and ticket != assignment_ticket:
+            # Stale completion for a recycled assignment; the live entry
+            # belongs to a newer load and must stay untouched.
+            return False
+        del self._prefetch_inflight[expert]
         base = self.persistent_slots + self.transient_slots
         if self._prefetch_slot_to_expert[slot - base] != expert:
             return False
         self._prefetch_expert_to_slot[expert] = slot
         return True
 
-    def invalidate_prefetch(self, expert_id: int) -> int | None:
-        """Forget a failed or stale ring assignment and return its slot."""
+    def invalidate_prefetch(
+        self,
+        expert_id: int,
+        *,
+        ticket: int | None = None,
+    ) -> int | None:
+        """Forget a failed or stale ring assignment and return its slot.
+
+        A ticketed invalidation only retires the exact inflight assignment
+        that failed; if that assignment was already recycled (and the
+        expert possibly re-assigned or even published by a newer load),
+        nothing is touched. ``ticket=None`` keeps the administrative
+        behavior: drop whatever published or inflight state the expert has.
+        """
 
         expert = _integer("expert id", expert_id, minimum=0)
+        base = self.persistent_slots + self.transient_slots
+        if ticket is not None:
+            entry = self._prefetch_inflight.get(expert)
+            if entry is None or entry[1] != ticket:
+                return None
+            del self._prefetch_inflight[expert]
+            slot = entry[0]
+            if self._prefetch_slot_to_expert[slot - base] == expert:
+                self._prefetch_slot_to_expert[slot - base] = None
+            return slot
         slot = self._prefetch_expert_to_slot.pop(expert, None)
         if slot is None:
-            slot = self._prefetch_inflight.pop(expert, None)
+            entry = self._prefetch_inflight.pop(expert, None)
+            slot = None if entry is None else entry[0]
         if slot is not None:
-            base = self.persistent_slots + self.transient_slots
             if self._prefetch_slot_to_expert[slot - base] == expert:
                 self._prefetch_slot_to_expert[slot - base] = None
         return slot

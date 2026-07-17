@@ -1464,6 +1464,15 @@ class ExpertStreamingRuntime:
         # prediction burst can never starve a real miss read.
         self._prefetch_lock = threading.Lock()
         self._prefetch_futures: set[Future] = set()
+        # Sustained decode can predict faster than the executor reads.
+        # Without a ceiling the queue grows without bound: every queued
+        # load is stale by the time it runs (its assignment recycled many
+        # times over), reads are wasted, and reset/close must drain the
+        # whole backlog. Beyond this ceiling prefetch_experts plans
+        # nothing — speculation is best-effort.
+        self._prefetch_backlog_limit = 4 * max(
+            1, plan.prefetch_slots_per_layer
+        )
         self._prefetch_executor = (
             ThreadPoolExecutor(
                 max_workers=max(1, plan.prefetch_slots_per_layer),
@@ -2369,6 +2378,10 @@ class ExpertStreamingRuntime:
         executor = self._prefetch_executor
         if executor is None:
             return 0
+        with self._prefetch_lock:
+            backlog = len(self._prefetch_futures)
+        if backlog >= self._prefetch_backlog_limit:
+            return 0
         lock = self._layer_locks[layer]
         # Never block the generation thread on a layer transaction: under
         # deferred split-route release the previous token's pending split
@@ -2379,28 +2392,40 @@ class ExpertStreamingRuntime:
             return 0
         try:
             loads = bank.plan_prefetch(expert_ids)
+            # Assignment tickets bind each load's completion to the exact
+            # assignment it filled: the same expert can be recycled and
+            # re-assigned while a callback is still queued, and that stale
+            # callback must not publish (or retire) the newer assignment.
+            tickets = {
+                load.expert: bank.prefetch_ticket(load.expert)
+                for load in loads
+            }
         finally:
             lock.release()
         issued = 0
         for load in loads:
             try:
                 future = executor.submit(
-                    self.slots.load_speculative,
+                    self._run_speculative_load,
                     layer,
                     load,
+                    tickets[load.expert],
                 )
             except RuntimeError:
                 # The executor shut down mid-flight; forget the assignment
                 # so a later plan_prefetch can reuse the ring slot.
                 with lock:
-                    bank.invalidate_prefetch(load.expert)
+                    bank.invalidate_prefetch(
+                        load.expert,
+                        ticket=tickets[load.expert],
+                    )
                 continue
             with self._prefetch_lock:
                 self._prefetch_futures.add(future)
             future.add_done_callback(
-                lambda completed, layer=layer, expert=load.expert: (
-                    self._finish_prefetch_load(layer, expert, completed)
-                )
+                lambda completed, layer=layer, expert=load.expert, ticket=(
+                    tickets[load.expert]
+                ): self._finish_prefetch_load(layer, expert, ticket, completed)
             )
             issued += 1
         if issued:
@@ -2409,10 +2434,36 @@ class ExpertStreamingRuntime:
                 self._layer_counters[layer].prefetch_issued += issued
         return issued
 
+    def _run_speculative_load(
+        self,
+        layer: int,
+        load: Any,
+        ticket: int | None,
+    ) -> None:
+        """Read one predicted expert unless its assignment already recycled.
+
+        A load can sit in the executor queue while later plan_prefetch
+        calls recycle its ring assignment; performing the read anyway
+        would waste SSD bandwidth on bytes whose ticketed commit is
+        guaranteed to be refused. The check is advisory — recycling after
+        it is still caught by the ticket at commit time.
+        """
+
+        bank = self._banks.get(layer)
+        lock = self._layer_locks.get(layer)
+        if bank is None or lock is None:
+            return
+        with lock:
+            live = bank.prefetch_ticket(load.expert) == ticket
+        if not live:
+            return
+        self.slots.load_speculative(layer, load)
+
     def _finish_prefetch_load(
         self,
         layer: int,
         expert: int,
+        ticket: int | None,
         future: Future,
     ) -> None:
         with self._prefetch_lock:
@@ -2430,9 +2481,9 @@ class ExpertStreamingRuntime:
         committed = False
         with lock:
             if succeeded:
-                committed = bank.commit_prefetch(expert)
+                committed = bank.commit_prefetch(expert, ticket=ticket)
             else:
-                bank.invalidate_prefetch(expert)
+                bank.invalidate_prefetch(expert, ticket=ticket)
         if committed:
             with self._counter_lock:
                 self.counters.prefetch_committed += 1
