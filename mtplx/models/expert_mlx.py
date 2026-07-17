@@ -1695,7 +1695,14 @@ class HotExpertSwitchGLU(nn.Module):
                             )
                         try:
                             shared = shared_work()
-                            mx.eval(shared)
+                            # Submit the shared branch so the GPU has work
+                            # during miss I/O; blocking the generation thread
+                            # here serialized host-side service instead.
+                            async_eval = getattr(mx, "async_eval", None)
+                            if callable(async_eval):
+                                async_eval(shared)
+                            else:
+                                mx.eval(shared)
                         finally:
                             if (
                                 pipeline_ledger is not None
