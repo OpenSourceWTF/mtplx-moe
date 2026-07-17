@@ -80,6 +80,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "resident_quant": None,
     "kv_quant": None,
     "expert_integrity": "per-read",
+    "prefetch_slots": 0,
     "split_route_release": "fenced",
     "mmap_island_layers": "",
     "banked_manifest": "",
@@ -543,6 +544,17 @@ def build_parser() -> argparse.ArgumentParser:
             "capture_commit adapts dense trunk KV state."
         ),
     )
+    parser.add_argument(
+        "--prefetch-slots",
+        type=int,
+        default=0,
+        help=(
+            "Speculative expert-prefetch ring slots per streamed layer "
+            "(default 0: disabled). Decode applies the next sparse layers' "
+            "routers to the current hidden state and overlaps predicted "
+            "miss reads with compute. Requires layer cache scope."
+        ),
+    )
     parser.add_argument("--output-json", type=Path)
     return parser
 
@@ -624,6 +636,7 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "resident_quant": args.resident_quant,
         "kv_quant": args.kv_quant,
         "expert_integrity": args.expert_integrity,
+        "prefetch_slots": args.prefetch_slots,
         "split_route_release": args.split_route_release,
         "mmap_island_layers": args.mmap_island_layers,
         "banked_manifest": args.banked_manifest,
@@ -2097,6 +2110,7 @@ def _runtime_config(
         island_layer_count=options.get("island_layer_count"),
         resident_quant=options.get("resident_quant") or None,
         kv_quant=options.get("kv_quant") or None,
+        prefetch_slots=int(options.get("prefetch_slots") or 0),
         verify_record_hashes=(
             options.get("expert_integrity", "per-read") == "per-read"
         ),

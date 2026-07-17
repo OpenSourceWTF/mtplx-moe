@@ -392,3 +392,63 @@ def test_resident_quant_survives_benchmark_option_pipeline() -> None:
         )
         assert integrity_config.verify_record_hashes is per_read, mode
         assert integrity_config.verify_sidecar_hash_at_open is at_open, mode
+
+
+def test_prefetch_slots_survive_benchmark_option_pipeline() -> None:
+    """Same CLI -> options -> config path as resident/kv-quant: the
+    prefetch knob must not silently drop between argparse and
+    ExpertStreamingConfig."""
+
+    from types import SimpleNamespace
+
+    bench = _load_benchmark_module()
+    parser = None
+    import argparse as _argparse
+
+    for name in dir(bench):
+        fn = getattr(bench, name)
+        if callable(fn) and name.endswith("parser"):
+            candidate = fn()
+            if isinstance(candidate, _argparse.ArgumentParser):
+                parser = candidate
+                break
+    assert parser is not None, "benchmark parser factory not found"
+    assert bench.DEFAULT_RUNTIME_OPTIONS["prefetch_slots"] == 0
+
+    apis = SimpleNamespace(
+        config_factory=ExpertStreamingConfig,
+        parse_memory_bytes=parse_memory_bytes,
+    )
+
+    args = parser.parse_args(
+        [
+            "--model", "hy3-q2",
+            "--hy3-q2-model-root", "/tmp",
+            "--memory-limit", "96GiB",
+            "--prefetch-slots", "8",
+        ]
+    )
+    options = {
+        **bench.DEFAULT_RUNTIME_OPTIONS,
+        "trace_routes": False,
+        **bench._runtime_options_from_args(args),
+    }
+    assert options["prefetch_slots"] == 8
+    config = bench._runtime_config(apis, "hy3-expert-q2", options)
+    assert config.prefetch_slots == 8
+
+    default_args = parser.parse_args(
+        [
+            "--model", "hy3-q2",
+            "--hy3-q2-model-root", "/tmp",
+            "--memory-limit", "96GiB",
+        ]
+    )
+    default_options = {
+        **bench.DEFAULT_RUNTIME_OPTIONS,
+        "trace_routes": False,
+        **bench._runtime_options_from_args(default_args),
+    }
+    assert default_options["prefetch_slots"] == 0
+    default_config = bench._runtime_config(apis, "hy3-expert-q2", default_options)
+    assert default_config.prefetch_slots == 0
