@@ -217,6 +217,65 @@ def shadow_record_bytes(codec: str, source_parameters: int) -> int:
 _SHADOW_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 
 
+def dequantize_record_projections(
+    mx,
+    record,
+    blob: bytes,
+    *,
+    bits: int,
+    group_size: int,
+) -> dict[str, np.ndarray]:
+    """Decode one sidecar record into fp32 (out, in) per projection.
+
+    Record segments are cursor-sequential within the record blob; the
+    segment ``shard``/``offset`` fields address the original safetensors
+    and are ignored here. Uses ``mx.dequantize`` — the exact affine math
+    the runtime executes.
+    """
+
+    leaves: dict[str, object] = {}
+    cursor = 0
+    for segment in record.segments:
+        view = memoryview(blob)[cursor : cursor + segment.length]
+        cursor += segment.length
+        shape = tuple(segment.shape)
+        if segment.dtype == "U32":
+            value = mx.array(np.frombuffer(view, dtype="<u4").reshape(shape))
+        elif segment.dtype == "BF16":
+            value = mx.array(
+                np.frombuffer(view, dtype="<u2").reshape(shape)
+            ).view(mx.bfloat16)
+        else:
+            raise ShadowCodecError(
+                f"unsupported segment dtype {segment.dtype!r} for "
+                f"({record.layer}, {record.expert})"
+            )
+        leaves[segment.component] = value
+    dense: dict[str, np.ndarray] = {}
+    for projection in _SHADOW_PROJECTIONS:
+        try:
+            weight = leaves[f"{projection}.weight"]
+            scales = leaves[f"{projection}.scales"]
+            biases = leaves[f"{projection}.biases"]
+        except KeyError as exc:
+            raise ShadowCodecError(
+                f"record ({record.layer}, {record.expert}) lacks "
+                f"component {exc.args[0]!r}"
+            ) from None
+        dequantized = mx.dequantize(
+            weight,
+            scales,
+            biases,
+            bits=bits,
+            group_size=group_size,
+            mode="affine",
+        )
+        dense[projection] = np.asarray(
+            dequantized.astype(mx.float32), dtype=np.float32
+        )
+    return dense
+
+
 class ShadowLayerBank:
     """Dense per-layer shadow bank: row index is the expert id.
 
@@ -409,56 +468,9 @@ class ShadowBankStore:
         bits: int,
         group_size: int,
     ) -> dict[str, np.ndarray]:
-        """Decode one sidecar record into fp32 (out, in) per projection.
-
-        Record segments are cursor-sequential within the record blob; the
-        segment ``shard``/``offset`` fields address the original
-        safetensors and are ignored here.
-        """
-
-        leaves: dict[str, "mx.array"] = {}
-        cursor = 0
-        for segment in record.segments:
-            view = memoryview(blob)[cursor : cursor + segment.length]
-            cursor += segment.length
-            shape = tuple(segment.shape)
-            if segment.dtype == "U32":
-                value = mx.array(
-                    np.frombuffer(view, dtype="<u4").reshape(shape)
-                )
-            elif segment.dtype == "BF16":
-                value = mx.array(
-                    np.frombuffer(view, dtype="<u2").reshape(shape)
-                ).view(mx.bfloat16)
-            else:
-                raise ShadowCodecError(
-                    f"unsupported segment dtype {segment.dtype!r} for "
-                    f"({record.layer}, {record.expert})"
-                )
-            leaves[segment.component] = value
-        dense: dict[str, np.ndarray] = {}
-        for projection in _SHADOW_PROJECTIONS:
-            try:
-                weight = leaves[f"{projection}.weight"]
-                scales = leaves[f"{projection}.scales"]
-                biases = leaves[f"{projection}.biases"]
-            except KeyError as exc:
-                raise ShadowCodecError(
-                    f"record ({record.layer}, {record.expert}) lacks "
-                    f"component {exc.args[0]!r}"
-                ) from None
-            dequantized = mx.dequantize(
-                weight,
-                scales,
-                biases,
-                bits=bits,
-                group_size=group_size,
-                mode="affine",
-            )
-            dense[projection] = np.asarray(
-                dequantized.astype(mx.float32), dtype=np.float32
-            )
-        return dense
+        return dequantize_record_projections(
+            mx, record, blob, bits=bits, group_size=group_size
+        )
 
     def _allocate_staging(
         self, dense: dict[str, np.ndarray]
