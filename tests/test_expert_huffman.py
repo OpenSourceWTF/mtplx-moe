@@ -130,6 +130,34 @@ def test_l1_entries_match_reference_decode() -> None:
             assert len1 <= rem
 
 
+def test_plane_split_roundtrip_and_shape() -> None:
+    from mtplx.expert_huffman import plane_split_groups, plane_unsplit_groups
+
+    rng = np.random.default_rng(9)
+    data = rng.integers(0, 256, size=128 * 33, dtype=np.uint8)
+    split = plane_split_groups(data)
+    assert split.size == data.size
+    # First 64 bytes of the split are the low bytes of the first group.
+    assert np.array_equal(split[:64], data[0:128:2])
+    assert np.array_equal(split[64:128], data[1:128:2])
+    assert np.array_equal(plane_unsplit_groups(split), data)
+    with pytest.raises(ValueError, match="whole number"):
+        plane_split_groups(data[:100])
+
+
+def test_encode_lanes_fast_matches_reference_encoder() -> None:
+    from mtplx.expert_huffman import encode_lanes_fast
+
+    data = _random_weightlike(4096 * 24, seed=10)
+    table = build_table(np.bincount(data, minlength=256), max_bits=12)
+    slow = encode_lanes(data, table, per_lane=4096)
+    fast = encode_lanes_fast(data, table, per_lane=4096)
+    assert np.array_equal(slow.words, fast.words)
+    assert np.array_equal(slow.word_offsets, fast.word_offsets)
+    decoded = decode_lanes_reference(fast, table)
+    assert np.array_equal(decoded.reshape(-1), data[: decoded.size])
+
+
 def test_ratio_reported_matches_stream_size() -> None:
     data = _random_weightlike(1 << 18, seed=8)
     table = build_table(np.bincount(data, minlength=256), max_bits=12)

@@ -151,6 +151,85 @@ def encode_lanes(
     )
 
 
+def plane_split_groups(data: np.ndarray, *, group_values: int = 64) -> np.ndarray:
+    """Group-local byte-plane split for BF16 segments.
+
+    Within each group of ``group_values`` BF16 values (128 bytes), store the
+    64 low bytes then the 64 high bytes. Keeps decode locality inside a
+    128-byte window while exposing the highly-compressible exponent plane.
+    """
+
+    data = np.asarray(data, dtype=np.uint8)
+    group_bytes = group_values * 2
+    if data.size % group_bytes:
+        raise ValueError("segment is not a whole number of BF16 groups")
+    groups = data.reshape(-1, group_values, 2)
+    return np.concatenate(
+        (groups[:, :, 0], groups[:, :, 1]), axis=1
+    ).reshape(-1)
+
+
+def plane_unsplit_groups(data: np.ndarray, *, group_values: int = 64) -> np.ndarray:
+    """Inverse of :func:`plane_split_groups`."""
+
+    data = np.asarray(data, dtype=np.uint8)
+    group_bytes = group_values * 2
+    if data.size % group_bytes:
+        raise ValueError("segment is not a whole number of BF16 groups")
+    halves = data.reshape(-1, 2, group_values)
+    out = np.empty((halves.shape[0], group_values, 2), dtype=np.uint8)
+    out[:, :, 0] = halves[:, 0, :]
+    out[:, :, 1] = halves[:, 1, :]
+    return out.reshape(-1)
+
+
+def encode_lanes_fast(
+    data: np.ndarray,
+    table: HuffmanTable,
+    *,
+    per_lane: int,
+) -> LaneStream:
+    """Fully vectorized encoder (all lanes at once).
+
+    The per-lane loop encodes ~24 MiB/s — hours for a real band. This
+    variant scatters each code-bit plane across every lane in one pass
+    (max_bits passes total) and packs once.
+    """
+
+    data = np.asarray(data, dtype=np.uint8)
+    lanes = data.size // per_lane
+    if lanes == 0:
+        raise ValueError("input smaller than one lane")
+    rows = data[: lanes * per_lane].reshape(lanes, per_lane)
+    sym_len = table.lengths[rows].astype(np.int64)
+    lane_bits = sym_len.sum(axis=1)
+    lane_bytes = ((lane_bits + 7) // 8 + 4 + 3) // 4 * 4
+    byte_offsets = np.zeros(lanes + 1, dtype=np.int64)
+    np.cumsum(lane_bytes, out=byte_offsets[1:])
+    total_bits = int(byte_offsets[-1]) * 8
+
+    # Global bit position of each symbol's code start.
+    starts = np.cumsum(sym_len, axis=1) - sym_len
+    starts += (byte_offsets[:-1] * 8)[:, None]
+    starts = starts.reshape(-1)
+    lens = sym_len.reshape(-1)
+    cs = table.codes[rows].reshape(-1)
+
+    bits = np.zeros(total_bits, dtype=np.uint8)
+    for bit in range(int(table.max_bits)):
+        mask = lens > bit
+        bits[starts[mask] + bit] = (cs[mask] >> (lens[mask] - 1 - bit)) & 1
+    stream = np.packbits(bits)
+    words = stream.view(np.uint32).byteswap()
+    return LaneStream(
+        words=words,
+        word_offsets=(byte_offsets[:-1] // 4).astype(np.uint32),
+        lanes=lanes,
+        per_lane=int(per_lane),
+        ratio=float(rows.size / words.nbytes),
+    )
+
+
 def build_l1_entries(table: HuffmanTable) -> np.ndarray:
     """First-level decode table in the v1 kernel layout.
 
