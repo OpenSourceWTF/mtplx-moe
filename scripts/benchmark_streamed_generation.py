@@ -1290,6 +1290,22 @@ def build_parser() -> argparse.ArgumentParser:
         default="direct-slots",
     )
     parser.add_argument(
+        "--streamed-codec",
+        choices=["none", "rans32x-v1"],
+        default="none",
+        help=(
+            "Streamed miss-read codec (issue #113). 'rans32x-v1' reads per-record "
+            "rANS containers from --streamed-codec-manifest and decodes them "
+            "in-kernel before slot residency; 'none' reads records uncompressed."
+        ),
+    )
+    parser.add_argument(
+        "--streamed-codec-manifest",
+        type=Path,
+        default=None,
+        help="StreamedCodecManifest JSON for --streamed-codec rans32x-v1.",
+    )
+    parser.add_argument(
         "--verified-sidecar",
         action="store_true",
         help="Verify the full sidecar once at open, then skip repeated record hashes.",
@@ -1914,6 +1930,12 @@ def _main() -> int:
         max_read_chunk_bytes=parse_memory_bytes(args.read_chunk),
         bypass_page_cache=args.f_nocache,
         slot_layout=args.slot_layout,
+        streamed_codec=args.streamed_codec,
+        streamed_codec_manifest=(
+            str(args.streamed_codec_manifest.expanduser().resolve())
+            if args.streamed_codec_manifest is not None
+            else None
+        ),
         verify_record_hashes=should_verify_source_records(args, validated_manifest),
         verify_sidecar_hash_at_open=args.verified_sidecar,
         trace_routes=args.route_trace_json is not None,
