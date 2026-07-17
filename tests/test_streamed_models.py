@@ -3355,6 +3355,13 @@ def test_prefetch_ring_load_resolves_as_route_hit_bitwise(
             if prefetch_slots:
                 bank = runtime._banks[streamed_layer]
                 assert bank.prefetch_slots == prefetch_slots
+                # A held layer transaction lock (deferred split-route
+                # release keeps it across evals) must skip speculation
+                # without planning anything, never block the caller.
+                with runtime._layer_locks[streamed_layer]:
+                    assert (
+                        runtime.prefetch_experts(streamed_layer, [0, 1]) == 0
+                    )
                 # Both experts are uncached; each must get a ring load.
                 issued = runtime.prefetch_experts(streamed_layer, [0, 1])
                 assert issued == 2

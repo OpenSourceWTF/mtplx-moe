@@ -2370,8 +2370,17 @@ class ExpertStreamingRuntime:
         if executor is None:
             return 0
         lock = self._layer_locks[layer]
-        with lock:
+        # Never block the generation thread on a layer transaction: under
+        # deferred split-route release the previous token's pending split
+        # holds this lock until the next covering-eval flush, and that
+        # flush runs on the very thread calling here. Speculation is
+        # best-effort — skip the step instead of waiting.
+        if not lock.acquire(blocking=False):
+            return 0
+        try:
             loads = bank.plan_prefetch(expert_ids)
+        finally:
+            lock.release()
         issued = 0
         for load in loads:
             try:
