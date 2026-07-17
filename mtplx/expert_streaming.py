@@ -241,6 +241,7 @@ class LayerExpertSlotBank:
         # evicts an earned persistent resident, round-robin replacement.
         self._prefetch_slot_to_expert: list[int | None] = [None] * prefetch_slots
         self._prefetch_expert_to_slot: dict[int, int] = {}
+        self._prefetch_inflight: dict[int, int] = {}
         self._prefetch_cursor = 0
 
     @property
@@ -272,16 +273,19 @@ class LayerExpertSlotBank:
         self._prefill_seed_candidates.clear()
         self._prefetch_slot_to_expert = [None] * self.prefetch_slots
         self._prefetch_expert_to_slot.clear()
+        self._prefetch_inflight.clear()
         self._prefetch_cursor = 0
 
     def plan_prefetch(self, expert_ids: Iterable[int]) -> tuple[SlotLoad, ...]:
         """Assign ring slots for predicted experts and return their loads.
 
-        Experts already resident (persistent or ring) are skipped. Ring
-        replacement is round-robin over the ring only — an earned
-        persistent resident is never evicted by speculation. The caller
-        owns issuing the returned loads and must respect pin state at the
-        pool layer; this planner only tracks the mapping.
+        Assignment reserves the slot but does NOT publish it as a hit —
+        plan() only resolves ring entries the caller has committed via
+        ``commit_prefetch`` after the load completed, so a route can never
+        consume a slot mid-write. Experts already resident, published, or
+        inflight are skipped. Ring replacement is round-robin over the
+        ring only — an earned persistent resident is never evicted by
+        speculation.
         """
 
         if not self.prefetch_slots:
@@ -300,6 +304,7 @@ class LayerExpertSlotBank:
             if (
                 expert in self._expert_to_slot
                 or expert in self._prefetch_expert_to_slot
+                or expert in self._prefetch_inflight
             ):
                 continue
             ring_index = self._prefetch_cursor % self.prefetch_slots
@@ -307,21 +312,43 @@ class LayerExpertSlotBank:
             victim = self._prefetch_slot_to_expert[ring_index]
             if victim is not None:
                 self._prefetch_expert_to_slot.pop(victim, None)
+                self._prefetch_inflight.pop(victim, None)
             self._prefetch_slot_to_expert[ring_index] = expert
-            self._prefetch_expert_to_slot[expert] = base + ring_index
+            self._prefetch_inflight[expert] = base + ring_index
             loads.append(
                 SlotLoad(expert=expert, slot=base + ring_index, persistent=False)
             )
         return tuple(loads)
 
+    def commit_prefetch(self, expert_id: int) -> bool:
+        """Publish a completed ring load as hit-eligible.
+
+        Returns False when the assignment was recycled by a later
+        plan_prefetch before the load completed (the slot is no longer
+        this expert's; its bytes must not be published).
+        """
+
+        expert = _integer("expert id", expert_id, minimum=0)
+        slot = self._prefetch_inflight.pop(expert, None)
+        if slot is None:
+            return False
+        base = self.persistent_slots + self.transient_slots
+        if self._prefetch_slot_to_expert[slot - base] != expert:
+            return False
+        self._prefetch_expert_to_slot[expert] = slot
+        return True
+
     def invalidate_prefetch(self, expert_id: int) -> int | None:
-        """Forget a failed ring load and return its slot."""
+        """Forget a failed or stale ring assignment and return its slot."""
 
         expert = _integer("expert id", expert_id, minimum=0)
         slot = self._prefetch_expert_to_slot.pop(expert, None)
+        if slot is None:
+            slot = self._prefetch_inflight.pop(expert, None)
         if slot is not None:
             base = self.persistent_slots + self.transient_slots
-            self._prefetch_slot_to_expert[slot - base] = None
+            if self._prefetch_slot_to_expert[slot - base] == expert:
+                self._prefetch_slot_to_expert[slot - base] = None
         return slot
 
     def prepare_prefill_seed(self, expert_ids: Iterable[int]) -> tuple[int, ...]:

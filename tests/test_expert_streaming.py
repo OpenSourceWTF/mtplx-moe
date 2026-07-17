@@ -640,30 +640,42 @@ def test_prefetch_ring_resolves_hits_without_touching_persistent_tier():
     )
     assert bank.slot_count == 7
 
+    # Fill the persistent tier so later probe routes cannot be admitted
+    # (singletons cannot evict past the frequency floor).
+    bank.plan([0, 1], phase="decode")
+    assert bank.occupancy == 2
+
     loads = bank.plan_prefetch([5, 6])
     assert [(load.expert, load.slot, load.persistent) for load in loads] == [
         (5, 5, False),
         (6, 6, False),
     ]
-    # Already-resident predictions are skipped.
+    # Assigned-but-uncommitted entries are neither hits nor reassignable.
     assert bank.plan_prefetch([5, 6]) == ()
+    assert 5 not in bank.plan([5], phase="decode").hits
 
+    assert bank.commit_prefetch(5) is True
+    assert bank.commit_prefetch(6) is True
     plan = bank.plan([5, 6, 7, 7], phase="decode")
     assert set(plan.hits) == {5, 6}
     slot_by_expert = dict(zip(plan.experts, plan.slots))
     assert slot_by_expert[5] == 5 and slot_by_expert[6] == 6
     assert all(load.expert == 7 for load in plan.loads)
 
-    # Ring replacement is round-robin over the ring only.
+    # Ring replacement is round-robin over the ring only; a recycled
+    # assignment refuses its stale commit.
     ring2 = bank.plan_prefetch([8, 9])
     assert [(load.expert, load.slot) for load in ring2] == [(8, 5), (9, 6)]
-    follow_up = bank.plan([5], phase="decode")
-    assert 5 not in follow_up.hits
+    assert 5 not in bank.plan([5], phase="decode").hits
+    ring3 = bank.plan_prefetch([10])
+    assert [(load.expert, load.slot) for load in ring3] == [(10, 5)]
+    assert bank.commit_prefetch(8) is False
+    assert bank.commit_prefetch(10) is True
 
     # The persistent tier is untouched by speculation.
     assert bank.occupancy <= 2
-    assert bank.invalidate_prefetch(8) == 5
-    assert bank.plan([8], phase="decode").hits == ()
+    assert bank.invalidate_prefetch(10) == 5
+    assert bank.plan([10], phase="decode").hits == ()
 
 
 def test_prefetch_ring_disabled_by_default_matches_legacy_shape():
