@@ -72,6 +72,8 @@ DEFAULT_RUNTIME_OPTIONS = {
     "q2_expert_kernel": "stock",
     "hy3_router_kernel": "mpp-r1-fused-r2",
     "hy3_router_sigmoid": "precise",
+    "hy3_mtp_shared_kernel": "stock",
+    "hy3_mtp_shared_kernel_depth": 3,
     "deferred_pin_release": True,
     "island_layers": "",
     "island_layer_count": None,
@@ -349,6 +351,18 @@ def build_parser() -> argparse.ArgumentParser:
             "(fast is a selectable experiment; default: precise)."
         ),
     )
+    parser.add_argument(
+        "--hy3-mtp-shared-kernel",
+        choices=("stock", "metal-exact"),
+        default="stock",
+        help="Issue 69 Hy3 MTP shared-MLP execution arm (default: stock).",
+    )
+    parser.add_argument(
+        "--hy3-mtp-shared-kernel-depth",
+        type=_positive_int,
+        default=3,
+        help="Only fixed MTP depth that selects metal-exact (default: 3).",
+    )
     parser.add_argument("--read-chunk", default="8MiB")
     parser.add_argument(
         "--f-nocache",
@@ -556,6 +570,8 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "q2_expert_kernel": args.q2_expert_kernel,
         "hy3_router_kernel": args.hy3_router_kernel,
         "hy3_router_sigmoid": args.hy3_router_sigmoid,
+        "hy3_mtp_shared_kernel": args.hy3_mtp_shared_kernel,
+        "hy3_mtp_shared_kernel_depth": args.hy3_mtp_shared_kernel_depth,
         "deferred_pin_release": bool(args.deferred_pin_release),
         "island_layers": args.island_layers,
         "island_layer_count": args.island_layer_count,
@@ -2018,6 +2034,10 @@ def _runtime_config(
         q2_expert_kernel=str(options["q2_expert_kernel"]),
         hy3_router_kernel=str(options["hy3_router_kernel"]),
         hy3_router_sigmoid=str(options["hy3_router_sigmoid"]),
+        hy3_mtp_shared_kernel=str(options["hy3_mtp_shared_kernel"]),
+        hy3_mtp_shared_kernel_depth=int(
+            options["hy3_mtp_shared_kernel_depth"]
+        ),
         deferred_pin_release=bool(options["deferred_pin_release"]),
         max_read_chunk_bytes=apis.parse_memory_bytes(options["read_chunk"]),
         bypass_page_cache=bool(options["bypass_page_cache"]),

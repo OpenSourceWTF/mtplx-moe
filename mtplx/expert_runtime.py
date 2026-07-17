@@ -143,6 +143,8 @@ class ExpertStreamingConfig:
     q2_expert_kernel: str = "stock"
     hy3_router_kernel: str = "mpp-r1-fused-r2"
     hy3_router_sigmoid: str = "precise"
+    hy3_mtp_shared_kernel: str = "stock"
+    hy3_mtp_shared_kernel_depth: int = 3
     deferred_pin_release: bool = False
     island_layers: tuple[int, ...] = ()
     island_layer_count: int | None = None
@@ -320,6 +322,19 @@ class ExpertStreamingConfig:
             raise ValueError(
                 "fast router sigmoid is selectable only with mpp-row-owned-fused"
             )
+        if self.hy3_mtp_shared_kernel not in {"stock", "metal-exact"}:
+            raise ValueError(
+                "hy3_mtp_shared_kernel must be 'stock' or 'metal-exact'"
+            )
+        object.__setattr__(
+            self,
+            "hy3_mtp_shared_kernel_depth",
+            _integer(
+                "hy3_mtp_shared_kernel_depth",
+                self.hy3_mtp_shared_kernel_depth,
+                minimum=1,
+            ),
+        )
         if self.slot_layout not in {
             "direct-slots",
             "component-banks",

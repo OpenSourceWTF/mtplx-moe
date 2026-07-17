@@ -258,6 +258,21 @@ class MTPLXRuntime:
                 kwargs["mtp_depth"] = mtp_depth
             return self.model.mtp_forward(hidden_states, next_token_ids, **kwargs)
 
+    def configure_mtp_execution_depth(self, depth: int | None) -> Any | None:
+        """Select any depth-gated MTP operators before prefill/decode starts."""
+
+        if depth is not None and (
+            isinstance(depth, bool) or not isinstance(depth, int)
+        ):
+            raise TypeError("MTP execution depth must be an integer or None")
+        if depth is not None and depth < 1:
+            raise ValueError("MTP execution depth must be positive")
+        configure = getattr(self.model, "configure_mtp_execution_depth", None)
+        if not callable(configure):
+            return None
+        self._count("mtp_execution_depth_configurations")
+        return configure(depth)
+
     def update_mtp_cache(
         self,
         hidden_states,
@@ -603,6 +618,10 @@ def _load_impl(
                     Hy3ModelArgs.from_dict(config),
                     expected_revision=streaming_spec.source_revision,
                     precision=mtp_precision,
+                    shared_kernel=expert_streaming_config.hy3_mtp_shared_kernel,
+                    shared_kernel_depth=(
+                        expert_streaming_config.hy3_mtp_shared_kernel_depth
+                    ),
                     verified_artifacts=verified_streamed_artifact,
                 )
             if expert_streaming_config.slot_layout == "component-banks":
@@ -649,6 +668,12 @@ def _load_impl(
                             contract,
                             expected_revision=streaming_spec.source_revision,
                             mtp_precision=mtp_precision,
+                            shared_kernel=(
+                                expert_streaming_config.hy3_mtp_shared_kernel
+                            ),
+                            shared_kernel_depth=(
+                                expert_streaming_config.hy3_mtp_shared_kernel_depth
+                            ),
                             mtp_module=prebuilt_hy3_mtp,
                         )
                     elif streamed_mtp_backend == "glm52":

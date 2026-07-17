@@ -284,6 +284,34 @@ def test_injection_uses_prebuilt_head_without_reloading_artifact(
     assert model.mtp is prebuilt
 
 
+def test_injected_model_propagates_execution_depth_to_shared_operator(
+    tmp_path: Path,
+) -> None:
+    configured: list[int | None] = []
+    shared = SimpleNamespace(configure_depth=configured.append)
+    layer = SimpleNamespace(
+        mtp_block=SimpleNamespace(
+            mlp=SimpleNamespace(shared_mlp=shared),
+        )
+    )
+    prebuilt = SimpleNamespace(layers=[layer])
+    model = Hy3Model(_streamed_args())
+
+    assert inject_hy3_streamed_mtp_support(
+        model,
+        tmp_path,
+        {"model_type": "hy_v3"},
+        MTPContract(),
+        expected_revision=TEST_REVISION,
+        mtp_module=prebuilt,
+    )
+
+    model.configure_mtp_execution_depth(1)
+    model.configure_mtp_execution_depth(3)
+    model.configure_mtp_execution_depth(None)
+    assert configured == [1, 3, None]
+
+
 def test_mtp_enabled_runtime_classifies_verify_batches_as_decode(
     tmp_path: Path,
 ) -> None:

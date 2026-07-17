@@ -5283,6 +5283,16 @@ def test_issue51_kernel_selectors_default_serialize_and_fail_closed() -> None:
         )
         assert selected.to_dict()["q2_expert_kernel"] == "fused-nax"
         assert selected.to_dict()["hy3_router_kernel"] == router_selector
+    assert defaults.hy3_mtp_shared_kernel == "stock"
+    assert defaults.hy3_mtp_shared_kernel_depth == 3
+
+    shared_selected = ExpertStreamingConfig(
+        **base,
+        hy3_mtp_shared_kernel="metal-exact",
+        hy3_mtp_shared_kernel_depth=4,
+    )
+    assert shared_selected.to_dict()["hy3_mtp_shared_kernel"] == "metal-exact"
+    assert shared_selected.to_dict()["hy3_mtp_shared_kernel_depth"] == 4
 
     with pytest.raises(ValueError, match="q2_expert_kernel"):
         ExpertStreamingConfig(**base, q2_expert_kernel="unknown")
@@ -5293,6 +5303,10 @@ def test_issue51_kernel_selectors_default_serialize_and_fail_closed() -> None:
             **base,
             hy3_router_kernel="mpp-r1-fast-fused-r2",
         )
+    with pytest.raises(ValueError, match="hy3_mtp_shared_kernel"):
+        ExpertStreamingConfig(**base, hy3_mtp_shared_kernel="unknown")
+    with pytest.raises(ValueError, match="hy3_mtp_shared_kernel_depth"):
+        ExpertStreamingConfig(**base, hy3_mtp_shared_kernel_depth=0)
 
 
 def test_metal_mmap_resource_telemetry_does_not_claim_pipeline_coverage() -> None:

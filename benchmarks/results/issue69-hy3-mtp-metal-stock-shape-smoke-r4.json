@@ -1,0 +1,243 @@
+{
+  "artifacts": {
+    "model_root": "/Users/davidtai/.cache/huggingface/hy3-expert-only-mlx-q2",
+    "mtp_artifacts": "/Users/davidtai/.cache/huggingface/hy3-mtp-layer80",
+    "mtp_bf16_file_bytes": 7505299360
+  },
+  "command": [
+    "benchmarks/hy3_mtp_shared_gate_up.py",
+    "--scope",
+    "shared",
+    "--candidates",
+    "metal_n4_r4_v4_exact",
+    "--depths",
+    "1,3",
+    "--warmup",
+    "2",
+    "--iterations",
+    "8",
+    "--rounds",
+    "4",
+    "--bootstrap-resamples",
+    "2000",
+    "--output-json",
+    "/tmp/issue69-hy3-mtp-metal-stock-shape-smoke-r4.json"
+  ],
+  "dispatch_contract": {
+    "candidate_savings_at_k3": {
+      "metal_n4_r4_v4_exact": {
+        "depth": 3,
+        "gate_up_weight_bytes_required": 75497472,
+        "host_synchronizations_saved": 0,
+        "input_fill_load_instruction_bytes": 2359296,
+        "intermediate_device_bytes_avoided": 36864,
+        "logical_dispatches_saved": 6,
+        "steady_extra_weight_bytes": 0,
+        "threadgroup_barriers": 288,
+        "threadgroup_storage_bytes": 8192,
+        "threadgroups": 288
+      }
+    },
+    "control_gate_up_matmuls_per_depth": 2,
+    "metal_gate_up_swiglu_dispatches_saved_at_k3": 6,
+    "packed_candidate_gate_up_matmuls_per_depth": 1,
+    "packed_projection_dispatches_saved_at_k3": 3
+  },
+  "environment": {
+    "commit": "01e27ce95e6d214daa682cd38fe20b964e2e41d9",
+    "machine": "arm64",
+    "metal_device": {
+      "architecture": "applegpu_g17s",
+      "device_name": "Apple M5 Max",
+      "max_buffer_length": 86586540032,
+      "max_recommended_working_set_size": 107374182400,
+      "memory_size": 137438953472,
+      "resource_limit": 499000
+    },
+    "platform": "macOS-26.5.2-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "finished_at": "2026-07-15T20:25:09.224036+00:00",
+  "measurement": {
+    "bootstrap_resamples": 2000,
+    "candidates": [
+      "metal_n4_r4_v4_exact"
+    ],
+    "depths": [
+      1,
+      3
+    ],
+    "gate_up_swiglu_correctness": {
+      "metal_n4_r4_v4_exact": {
+        "array_equal": false,
+        "candidate_dtype": "mlx.core.bfloat16",
+        "control_dtype": "mlx.core.bfloat16",
+        "max_abs_error": 1.52587890625e-05,
+        "rmse": 3.9236581983459473e-07,
+        "shape": [
+          1,
+          1,
+          1536
+        ]
+      }
+    },
+    "iterations": 8,
+    "results": {
+      "1": {
+        "metal_n4_r4_v4_exact": {
+          "cold_us": {
+            "candidate_second": 503.917,
+            "control_first": 495.959,
+            "order_caveat": "one-shot graph/compiler order; paired warm timings decide"
+          },
+          "correctness": {
+            "array_equal": false,
+            "candidate_dtype": "mlx.core.bfloat16",
+            "control_dtype": "mlx.core.bfloat16",
+            "max_abs_error": 0.0001220703125,
+            "rmse": 3.10367499878339e-06,
+            "shape": [
+              1,
+              1,
+              4096
+            ]
+          },
+          "warm": {
+            "candidate": {
+              "max_us": 401.5885,
+              "mean_us": 371.92449999999997,
+              "median_us": 380.83074999999997,
+              "min_us": 324.448,
+              "samples_us": [
+                390.364625,
+                371.296875,
+                401.5885,
+                324.448
+              ]
+            },
+            "control": {
+              "max_us": 391.442625,
+              "mean_us": 336.1900625,
+              "median_us": 322.4400625,
+              "min_us": 308.4375,
+              "samples_us": [
+                391.442625,
+                308.4375,
+                326.135375,
+                318.74475
+              ]
+            },
+            "paired_speedup": {
+              "bootstrap_mean_95_ci": [
+                0.8214082632348747,
+                0.9976765611307192
+              ],
+              "mean": 0.9069999323885312,
+              "median": 0.9065624382031406,
+              "samples": [
+                1.0027615207192506,
+                0.8307031940411564,
+                0.812113332428593,
+                0.9824216823651248
+              ]
+            }
+          }
+        }
+      },
+      "3": {
+        "metal_n4_r4_v4_exact": {
+          "cold_us": {
+            "candidate_second": 555.833,
+            "control_first": 1116.542,
+            "order_caveat": "one-shot graph/compiler order; paired warm timings decide"
+          },
+          "correctness": {
+            "array_equal": false,
+            "candidate_dtype": "mlx.core.bfloat16",
+            "control_dtype": "mlx.core.bfloat16",
+            "max_abs_error": 7.275957614183426e-12,
+            "rmse": 6.736218028692564e-13,
+            "shape": [
+              1,
+              1,
+              4096
+            ]
+          },
+          "warm": {
+            "candidate": {
+              "max_us": 469.9635,
+              "mean_us": 456.01821875,
+              "median_us": 455.635375,
+              "min_us": 442.838625,
+              "samples_us": [
+                469.9635,
+                450.859375,
+                460.411375,
+                442.838625
+              ]
+            },
+            "control": {
+              "max_us": 397.114625,
+              "mean_us": 385.12634375,
+              "median_us": 384.9870625,
+              "min_us": 373.416625,
+              "samples_us": [
+                373.416625,
+                380.573,
+                389.401125,
+                397.114625
+              ]
+            },
+            "paired_speedup": {
+              "bootstrap_mean_95_ci": [
+                0.8073658273136772,
+                0.8835873980298263
+              ],
+              "mean": 0.8452966735090679,
+              "median": 0.8449367951836999,
+              "samples": [
+                0.7945651630392573,
+                0.8441057702304626,
+                0.8457678201369372,
+                0.8967479406296143
+              ]
+            }
+          }
+        }
+      }
+    },
+    "rounds": 4,
+    "scope_detail": "shared gate/up, SwiGLU, and down",
+    "warmup": 2
+  },
+  "parameters": {
+    "benchmark_extra_bytes_per_metal_candidate": 0,
+    "benchmark_extra_bytes_per_packed_candidate": 25165824,
+    "candidate_steady_extra_bytes_after_source_release": 0,
+    "gate_up": 12582912,
+    "gate_up_bytes": 25165824,
+    "shared_mlp_total": 18874368,
+    "shared_mlp_total_bytes": 37748736
+  },
+  "schema": "mtplx-issue69-hy3-mtp-shared-gate-up-v1",
+  "scope": "shared",
+  "shape": {
+    "M": 1,
+    "down": [
+      4096,
+      1536
+    ],
+    "dtype": "mlx.core.bfloat16",
+    "gate": [
+      1536,
+      4096
+    ],
+    "hidden_size": 4096,
+    "shared_intermediate_size": 1536,
+    "up": [
+      1536,
+      4096
+    ]
+  },
+  "started_at": "2026-07-15T20:25:09.002473+00:00"
+}
