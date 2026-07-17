@@ -731,11 +731,30 @@ class ExpertSlotPool:
                 transient.append(_PhysicalSlot(label, buffer))
                 allocated += spec.expert_record_bytes
             self._transient = tuple(transient)
+            self._prefetch: dict[tuple[int, int], _PhysicalSlot] = {}
+            if plan.prefetch_slots_per_layer:
+                if self.cache_scope == "global":
+                    raise ExpertSlotError(
+                        "the prefetch ring requires layer cache scope"
+                    )
+                for layer in spec.routed_layer_indices:
+                    if layer in island_set:
+                        continue
+                    for slot_index in range(plan.prefetch_slots_per_layer):
+                        label = f"layer-{layer}-prefetch-{slot_index}"
+                        buffer = self._allocate_buffer(label)
+                        self._prefetch[(layer, slot_index)] = _PhysicalSlot(
+                            label, buffer
+                        )
+                        allocated += spec.expert_record_bytes
         except Exception:
             self._persistent.clear()
             self._transient = ()
+            self._prefetch = {}
             raise
-        expected = plan.persistent_cache_bytes + plan.transient_bytes
+        expected = (
+            plan.persistent_cache_bytes + plan.transient_bytes + plan.prefetch_bytes
+        )
         if allocated != expected:
             raise ExpertSlotError(
                 f"allocated slot bytes {allocated} do not match memory plan {expected}"
@@ -1086,9 +1105,13 @@ class ExpertSlotPool:
                     "persistent slot is outside the memory plan"
                 ) from exc
         transient_index = logical_slot - self._persistent_route_capacity
-        if not 0 <= transient_index < len(self._transient):
+        if 0 <= transient_index < len(self._transient):
+            return self._transient[transient_index]
+        prefetch_index = transient_index - len(self._transient)
+        prefetch_slot = self._prefetch.get((layer, prefetch_index))
+        if prefetch_slot is None:
             raise ExpertSlotError("transient slot is outside the memory plan")
-        return self._transient[transient_index]
+        return prefetch_slot
 
     @staticmethod
     def _remaining(deadline_ns: int | None) -> float | None:

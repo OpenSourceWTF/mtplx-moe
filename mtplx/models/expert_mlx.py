@@ -43,6 +43,9 @@ _LAYER_PERSISTENT_LABEL = re.compile(
 )
 _GLOBAL_PERSISTENT_LABEL = re.compile(rf"global-persistent-({_SLOT_INDEX_PATTERN})")
 _GLOBAL_TRANSIENT_LABEL = re.compile(rf"global-transient-({_SLOT_INDEX_PATTERN})")
+_LAYER_PREFETCH_LABEL = re.compile(
+    rf"layer-({_SLOT_INDEX_PATTERN})-prefetch-({_SLOT_INDEX_PATTERN})"
+)
 
 
 @contextmanager
@@ -210,6 +213,12 @@ def make_mlx_slot_buffer_allocator(
             count = plan.slots_per_layer
             if layer not in spec.routed_layer_indices:
                 raise ValueError(f"persistent slot layer {layer} is not routed")
+        elif label.startswith("layer-") and "-prefetch-" in label:
+            layer = int(parts[1])
+            slot = int(parts[-1])
+            count = plan.prefetch_slots_per_layer
+            if layer not in spec.routed_layer_indices:
+                raise ValueError(f"prefetch slot layer {layer} is not routed")
         elif label.startswith("global-persistent-"):
             slot = int(parts[-1])
             count = plan.persistent_slots
@@ -989,7 +998,7 @@ def make_mlx_component_bank_allocator(
     backend = "mlx-metal-component-banks"
 
     def bank_for(kind: str, layer: int) -> MlxComponentBank:
-        key = (kind, layer if kind == "persistent" else -1)
+        key = (kind, layer if kind in {"persistent", "prefetch"} else -1)
         bank = banks.get(key)
         if bank is not None:
             return bank
@@ -997,6 +1006,10 @@ def make_mlx_component_bank_allocator(
             capacity = plan.slots_per_layer
             record = record_by_layer[layer]
             label = f"layer-{layer}-persistent-bank"
+        elif kind == "prefetch":
+            capacity = plan.prefetch_slots_per_layer
+            record = record_by_layer[layer]
+            label = f"layer-{layer}-prefetch-bank"
         elif kind == "global-persistent":
             capacity = plan.persistent_slots
             record = record_by_layer[exemplar_layer]
@@ -1015,7 +1028,20 @@ def make_mlx_component_bank_allocator(
         layer_persistent = _LAYER_PERSISTENT_LABEL.fullmatch(label)
         global_persistent = _GLOBAL_PERSISTENT_LABEL.fullmatch(label)
         global_transient = _GLOBAL_TRANSIENT_LABEL.fullmatch(label)
-        if layer_persistent is not None:
+        layer_prefetch = _LAYER_PREFETCH_LABEL.fullmatch(label)
+        if layer_prefetch is not None:
+            if plan.cache_scope != "layer":
+                raise ValueError(
+                    "prefetch slot label conflicts with global cache scope"
+                )
+            layer = int(layer_prefetch.group(1))
+            slot_index = int(layer_prefetch.group(2))
+            if layer not in spec.routed_layer_indices:
+                raise ValueError(f"prefetch slot layer {layer} is not routed")
+            if not 0 <= slot_index < plan.prefetch_slots_per_layer:
+                raise ValueError("prefetch slot is outside planned capacity")
+            bank = bank_for("prefetch", layer)
+        elif layer_persistent is not None:
             if plan.cache_scope != "layer":
                 raise ValueError(
                     "layer-persistent slot label conflicts with global cache scope"
