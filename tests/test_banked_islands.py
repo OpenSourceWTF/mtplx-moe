@@ -740,6 +740,82 @@ def test_banked_island_switch_bitwise_parity(tmp_path, mlx) -> None:
         reader.close()
 
 
+def test_metal_decode_component_matches_raw_segments(tmp_path, mlx) -> None:
+    """The Metal segment decoder must reproduce raw sidecar bytes exactly
+    for arbitrary routed assignments, including the BF16 plane unsplit."""
+
+    import mlx.core as mx
+    import numpy as np
+
+    from mtplx.expert_banked import component_class
+    from mtplx.expert_huffman_metal import build_class_tables, decode_component
+
+    root, spec, manifest, expected = _sidecar_artifact(tmp_path)
+    layers = tuple(spec.routed_layer_indices)
+    out_bin = tmp_path / "huff" / "experts.bin"
+    out_manifest = tmp_path / "huff" / "manifest.json"
+    banked = write_banked_expert_banks(
+        manifest,
+        root,
+        layers,
+        output_bin=out_bin,
+        output_manifest=out_manifest,
+        codec="huffman-l12-v1",
+    )
+    reloaded = load_banked_manifest(out_manifest)
+    tables = build_class_tables(reloaded.tables)
+    blob = out_bin.read_bytes()
+    reference = next(iter(manifest.records))
+    slices = _component_slices(reference)
+
+    layer = layers[0]
+    entry = reloaded.layer_entry(layer)
+    dir_extent = (
+        (entry.directory_words * 4 + reloaded.alignment - 1)
+        // reloaded.alignment
+        * reloaded.alignment
+    )
+    region = blob[entry.offset : entry.offset + entry.length]
+    directory = mx.array(
+        np.frombuffer(region[: entry.directory_words * 4], dtype=np.uint32)
+    )
+    payload = mx.array(np.frombuffer(region[dir_extent:], dtype=np.uint32))
+
+    assignments = 5
+    rng = np.random.default_rng(11)
+    idx = rng.integers(0, spec.expert_count, size=assignments).astype(np.int32)
+    indices = mx.array(idx)
+    dir_stride = sum(c.lanes for c in entry.components)
+    dir_base = 0
+    for component in entry.components:
+        seg_len = component.segment_length
+        lane_bytes = seg_len // component.lanes
+        kind = component_class(component.component)
+        l1, sym_len = tables[kind]
+        out = decode_component(
+            payload,
+            directory,
+            indices,
+            l1,
+            sym_len,
+            lanes=component.lanes,
+            lane_bytes=lane_bytes,
+            seg_len=seg_len,
+            dir_stride=dir_stride,
+            dir_base=dir_base,
+            plane=(component.dtype == "BF16"),
+            assignments=assignments,
+        )
+        decoded = np.array(out, copy=False).reshape(assignments, seg_len)
+        start, length = slices[component.component]
+        for a, expert in enumerate(idx.tolist()):
+            want = expected[(layer, expert)][start : start + length]
+            assert decoded[a].tobytes() == want, (
+                f"{component.component} assignment {a} expert {expert}"
+            )
+        dir_base += component.lanes
+
+
 # ------------------------------------------------------------- source scan
 
 
