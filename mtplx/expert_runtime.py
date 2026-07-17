@@ -156,6 +156,7 @@ class ExpertStreamingConfig:
     mmap_island_wired: bool = True
     resident_quant: str | None = None
     kv_quant: str | None = None
+    split_route_release: str = "fenced"
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -220,6 +221,10 @@ class ExpertStreamingConfig:
             raise ValueError("resident_quant must be None, 'q8', or 'q4'")
         if self.kv_quant not in {None, "q8", "q4"}:
             raise ValueError("kv_quant must be None, 'q8', or 'q4'")
+        if self.split_route_release not in {"fenced", "deferred"}:
+            raise ValueError(
+                "split_route_release must be 'fenced' or 'deferred'"
+            )
         if self.island_layer_count is not None:
             if self.island_layers:
                 raise ValueError(

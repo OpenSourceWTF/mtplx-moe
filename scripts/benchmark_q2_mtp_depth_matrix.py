@@ -80,6 +80,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "resident_quant": None,
     "kv_quant": None,
     "expert_integrity": "per-read",
+    "split_route_release": "fenced",
     "mmap_island_layers": "",
     "banked_manifest": "",
     "banked_codec": "none",
@@ -511,6 +512,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--split-route-release",
+        choices=("fenced", "deferred"),
+        default="fenced",
+        help=(
+            "Split-route slot release. fenced: per-part synchronous GPU "
+            "fences (3-6 pipeline drains per streamed layer). deferred: "
+            "lease bookkeeping replays at the next generation eval "
+            "(requires deferred pin release; decode only)."
+        ),
+    )
+    parser.add_argument(
         "--expert-integrity",
         choices=("per-read", "at-open", "headers-only"),
         default="per-read",
@@ -612,6 +624,7 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "resident_quant": args.resident_quant,
         "kv_quant": args.kv_quant,
         "expert_integrity": args.expert_integrity,
+        "split_route_release": args.split_route_release,
         "mmap_island_layers": args.mmap_island_layers,
         "banked_manifest": args.banked_manifest,
         "banked_codec": args.banked_codec,
@@ -2090,6 +2103,7 @@ def _runtime_config(
         verify_sidecar_hash_at_open=(
             options.get("expert_integrity") == "at-open"
         ),
+        split_route_release=options.get("split_route_release", "fenced"),
         mmap_island_layers=parse_island_layers(
             options.get("mmap_island_layers", "")
         ),

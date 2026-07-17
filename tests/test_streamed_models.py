@@ -3264,3 +3264,53 @@ def test_resident_loader_runs_indexshare_glm_with_streamed_sparse_layers(
         assert runtime.snapshot(mx_module=mx)["cache"]["route_calls"] == 5
     finally:
         runtime.close()
+
+
+def test_deferred_split_route_release_matches_fenced_bitwise(
+    tmp_path: Path,
+) -> None:
+    """split_route_release=deferred must produce bitwise-identical logits
+    to the fenced default, hold its leases until the deferred flush, and
+    leave zero pins after it."""
+
+    root, config, spec, manifest_path = _integrated_hy3_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+
+    def run(mode: str):
+        stream_config = ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=fixed + spec.persistent_cache_bytes(1),
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            deferred_pin_release=True,
+            split_route_release=mode,
+        )
+        runtime = ExpertStreamingRuntime.open(
+            root,
+            manifest_path,
+            stream_config,
+            spec=spec,
+            buffer_allocator=make_mlx_slot_buffer_allocator(
+                stream_config.memory_plan(spec), spec
+            ),
+            device_synchronize=mx.synchronize,
+            apply_memory_cap=False,
+        )
+        try:
+            resident = construct_resident_model(root, runtime, config=config)
+            logits = resident.model(mx.array([[1]], dtype=mx.int32))
+            mx.eval(logits)
+            held = runtime.snapshot(mx_module=mx)["slots"]["pins"]
+            runtime.flush_deferred_slot_releases(evaluate=True)
+            drained = runtime.snapshot(mx_module=mx)["slots"]["pins"]
+            return logits, held, drained
+        finally:
+            runtime.close()
+
+    fenced_logits, _fenced_held, fenced_drained = run("fenced")
+    deferred_logits, deferred_held, deferred_drained = run("deferred")
+
+    assert fenced_drained == 0
+    assert deferred_held > 0, "deferred mode must hold leases until flush"
+    assert deferred_drained == 0
+    assert mx.array_equal(fenced_logits, deferred_logits).item()

@@ -98,6 +98,38 @@ def _pipeline_work_call(
         _mark_pipeline_incomplete(ledger, phase)
 
 
+class _DeferredSplitClose:
+    """Replay a split route's release/close sequence at deferred-flush time.
+
+    The split-route lease bookkeeping (consumer leases, finalize, the layer
+    lock) must run through release_miss/close — releasing raw routes would
+    corrupt the state machine. This adapter duck-types the ``release``
+    surface ``defer_slot_release`` expects and performs today's exact call
+    order, one covering eval later.
+    """
+
+    def __init__(self, pending: Any, parts: tuple[Any, ...]) -> None:
+        self._pending = pending
+        self._parts = parts
+
+    def release(self, *, synchronize: bool = False) -> None:
+        del synchronize
+        first_error: BaseException | None = None
+        for part in self._parts:
+            try:
+                self._pending.release_miss(part)
+            except BaseException as exc:  # noqa: BLE001 - drain all parts
+                if first_error is None:
+                    first_error = exc
+        try:
+            self._pending.close()
+        except BaseException as exc:  # noqa: BLE001 - propagate after close
+            if first_error is None:
+                first_error = exc
+        if first_error is not None:
+            raise first_error
+
+
 class UnboundExpertSwitch(nn.Module):
     """Parameter-free placeholder installed before resident-only loading."""
 
@@ -1412,6 +1444,7 @@ class HotExpertSwitchGLU(nn.Module):
             ready: ReadyRoute,
             *,
             force_sync: bool = False,
+            defer: bool = False,
         ) -> None:
             if not positions:
                 return
@@ -1439,12 +1472,13 @@ class HotExpertSwitchGLU(nn.Module):
                     )
                 )
                 wave_positions.extend(grouped_positions)
-            fence_bindings(
-                ready,
-                bindings,
-                wave_outputs,
-                force_sync=force_sync,
-            )
+            if not defer:
+                fence_bindings(
+                    ready,
+                    bindings,
+                    wave_outputs,
+                    force_sync=force_sync,
+                )
             outputs.extend(wave_outputs)
             output_positions.extend(wave_positions)
 
@@ -1454,6 +1488,7 @@ class HotExpertSwitchGLU(nn.Module):
             ready: ReadyRoute,
             *,
             force_sync: bool = False,
+            defer: bool = False,
         ) -> None:
             if not positions:
                 return
@@ -1479,12 +1514,13 @@ class HotExpertSwitchGLU(nn.Module):
                     )
                 )
                 wave_positions.extend(expert_positions)
-            fence_bindings(
-                ready,
-                bindings,
-                wave_outputs,
-                force_sync=force_sync,
-            )
+            if not defer:
+                fence_bindings(
+                    ready,
+                    bindings,
+                    wave_outputs,
+                    force_sync=force_sync,
+                )
             outputs.extend(wave_outputs)
             output_positions.extend(wave_positions)
 
@@ -1614,6 +1650,20 @@ class HotExpertSwitchGLU(nn.Module):
                     if self.runtime.config.slot_layout == "component-banks"
                     else evaluate_direct_bindings
                 )
+                # Deferred split release: no per-part fence; lease
+                # bookkeeping replays at the next generation-thread eval
+                # (the same coverage proof deferred pins already rely on).
+                deferred_split = (
+                    phase is RoutingPhase.DECODE
+                    and getattr(
+                        self.runtime.config, "split_route_release", "fenced"
+                    )
+                    == "deferred"
+                    and getattr(self.runtime.config, "deferred_pin_release", False)
+                )
+                deferred_parts: list[ReadyRoute] = []
+                split_completed = False
+                wave_output_start = len(outputs)
                 with _route_probe.bracket("hot.begin_split_route"):
                     pending = self.runtime.begin_split_route(
                         self.layer_index,
@@ -1657,6 +1707,7 @@ class HotExpertSwitchGLU(nn.Module):
                                 pending.hit_ready.bindings,
                                 pending.hit_ready,
                                 force_sync=True,
+                                defer=deferred_split,
                             )
                     finally:
                         if (
@@ -1669,7 +1720,7 @@ class HotExpertSwitchGLU(nn.Module):
                                 "close",
                                 phase=phase,
                             )
-                    if pending.hit_ready is not None:
+                    if pending.hit_ready is not None and not deferred_split:
                         pending.release_hits()
                     # The resident shared branch depends only on ``x``.  Force it
                     # on Metal while the native readers own miss futures, so
@@ -1748,21 +1799,34 @@ class HotExpertSwitchGLU(nn.Module):
                                 miss_ready.bindings,
                                 miss_ready,
                                 force_sync=True,
+                                defer=deferred_split,
                             )
                         except BaseException as exc:
                             part_error = exc
                             raise
                         finally:
-                            try:
-                                pending.release_miss(miss_ready)
-                            except BaseException:
-                                if part_error is None:
-                                    raise
+                            if deferred_split and part_error is None:
+                                deferred_parts.append(miss_ready)
+                            else:
+                                try:
+                                    pending.release_miss(miss_ready)
+                                except BaseException:
+                                    if part_error is None:
+                                        raise
+                    split_completed = True
                 except BaseException as exc:
                     pending.abort(exc)
                     raise
                 finally:
-                    pending.close()
+                    if deferred_split and split_completed:
+                        self.runtime.defer_slot_release(
+                            _DeferredSplitClose(
+                                pending, tuple(deferred_parts)
+                            ),
+                            tuple(outputs[wave_output_start:]),
+                        )
+                    else:
+                        pending.close()
 
             if not outputs:
                 raise ValueError("router produced no expert assignments")
