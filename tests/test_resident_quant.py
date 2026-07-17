@@ -254,6 +254,31 @@ def test_plan_prices_prefetch_ring_on_the_fixed_side() -> None:
     assert ring.prefetch_slots_per_layer == 8
 
 
+def test_kv_quant_guard_rejects_models_that_ignore_it() -> None:
+    from mlx_lm.models.cache import KVCache, QuantizedKVCache
+
+    from mtplx.resident_loader import _verify_kv_quant_honored
+
+    class _IgnoringModel(nn.Module):
+        def make_cache(self):
+            return [KVCache()]
+
+    class _HonoringModel(nn.Module):
+        def make_cache(self):
+            return [QuantizedKVCache(group_size=64, bits=4)]
+
+    with pytest.raises(ResidentLoadError, match="ignores it"):
+        _verify_kv_quant_honored(_IgnoringModel(), "q4")
+    _verify_kv_quant_honored(_HonoringModel(), "q4")
+
+    class _BrokenModel(nn.Module):
+        def make_cache(self):
+            raise RuntimeError("boom")
+
+    with pytest.raises(ResidentLoadError, match="probe failed"):
+        _verify_kv_quant_honored(_BrokenModel(), "q4")
+
+
 def test_make_cache_honors_kv_quant_attribute() -> None:
     from mlx_lm.models.cache import KVCache, QuantizedKVCache
 

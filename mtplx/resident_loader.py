@@ -236,6 +236,28 @@ def _runtime_quantize_resident(model: Any, mode: str) -> list[str]:
     return quantized
 
 
+def _verify_kv_quant_honored(model: Any, kv_quant: str) -> None:
+    """Reject models whose make_cache silently ignores _mtplx_kv_quant.
+
+    The attribute is honored per-model overlay; an ignored kv_quant would
+    desync the memory plan's discounted KV pricing from reality.
+    """
+
+    try:
+        from mlx_lm.models.cache import QuantizedKVCache
+
+        probe_cache = model.make_cache()
+    except Exception as exc:
+        raise ResidentLoadError(
+            f"kv_quant={kv_quant!r} probe failed: {exc}"
+        ) from exc
+    if not any(isinstance(entry, QuantizedKVCache) for entry in probe_cache):
+        raise ResidentLoadError(
+            f"kv_quant={kv_quant!r} requested but "
+            f"{type(model).__name__}.make_cache ignores it"
+        )
+
+
 def construct_resident_model(
     root: Path | str,
     runtime: ExpertStreamingRuntime,
@@ -320,6 +342,7 @@ def construct_resident_model(
     kv_quant = getattr(runtime.config, "kv_quant", None)
     if kv_quant:
         setattr(model, "_mtplx_kv_quant", kv_quant)
+        _verify_kv_quant_honored(model, kv_quant)
     return ResidentModel(model=model, config=config, report=report)
 
 
