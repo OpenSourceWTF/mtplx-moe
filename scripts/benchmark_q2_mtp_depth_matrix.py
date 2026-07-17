@@ -79,6 +79,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "island_layer_count": None,
     "resident_quant": None,
     "kv_quant": None,
+    "expert_integrity": "per-read",
     "mmap_island_layers": "",
     "banked_manifest": "",
     "banked_codec": "none",
@@ -510,6 +511,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--expert-integrity",
+        choices=("per-read", "at-open", "headers-only"),
+        default="per-read",
+        help=(
+            "Expert record integrity mode. per-read: sha256 every record "
+            "read (measured ~10 ms/token of decode CPU at 27%% miss). "
+            "at-open: verify the sidecar hash once at load, no per-read "
+            "hashing. headers-only: artifact header checks only."
+        ),
+    )
+    parser.add_argument(
         "--kv-quant",
         choices=("q8", "q4"),
         default=None,
@@ -599,6 +611,7 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "island_layer_count": args.island_layer_count,
         "resident_quant": args.resident_quant,
         "kv_quant": args.kv_quant,
+        "expert_integrity": args.expert_integrity,
         "mmap_island_layers": args.mmap_island_layers,
         "banked_manifest": args.banked_manifest,
         "banked_codec": args.banked_codec,
@@ -2071,6 +2084,12 @@ def _runtime_config(
         island_layer_count=options.get("island_layer_count"),
         resident_quant=options.get("resident_quant") or None,
         kv_quant=options.get("kv_quant") or None,
+        verify_record_hashes=(
+            options.get("expert_integrity", "per-read") == "per-read"
+        ),
+        verify_sidecar_hash_at_open=(
+            options.get("expert_integrity") == "at-open"
+        ),
         mmap_island_layers=parse_island_layers(
             options.get("mmap_island_layers", "")
         ),

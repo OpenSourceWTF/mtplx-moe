@@ -351,3 +351,27 @@ def test_resident_quant_survives_benchmark_option_pipeline() -> None:
                 "--verify-strategy", "capture_commit",
             ]
         )
+
+    for mode, per_read, at_open in (
+        ("per-read", True, False),
+        ("at-open", False, True),
+        ("headers-only", False, False),
+    ):
+        integrity_args = parser.parse_args(
+            [
+                "--model", "hy3-q2",
+                "--hy3-q2-model-root", "/tmp",
+                "--memory-limit", "96GiB",
+                "--expert-integrity", mode,
+            ]
+        )
+        integrity_options = {
+            **bench.DEFAULT_RUNTIME_OPTIONS,
+            "trace_routes": False,
+            **bench._runtime_options_from_args(integrity_args),
+        }
+        integrity_config = bench._runtime_config(
+            apis, "hy3-expert-q2", integrity_options
+        )
+        assert integrity_config.verify_record_hashes is per_read, mode
+        assert integrity_config.verify_sidecar_hash_at_open is at_open, mode
