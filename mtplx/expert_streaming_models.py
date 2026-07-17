@@ -17,6 +17,39 @@ from dataclasses import dataclass
 from operator import index
 
 
+# Load-time resident quantization (group 64 affine over BF16): kept bytes
+# per source byte are packed bits plus one BF16 scale and bias per group:
+# bits/16 + 1/32, i.e. 9/32 for q4 and 17/32 for q8.
+RESIDENT_QUANT_KEEP_NUMERATOR = {"q8": 17, "q4": 9}
+RESIDENT_QUANT_KEEP_DENOMINATOR = 32
+_ATTENTION_PROJ_SUFFIXES = (".q_proj", ".k_proj", ".v_proj", ".o_proj")
+_MLP_PROJ_SUFFIXES = (".gate_proj", ".up_proj", ".down_proj", ".gate_up_proj")
+
+
+def resident_quant_covers(path: str) -> bool:
+    """Module/tensor paths quantized by the load-time resident-quant pass.
+
+    Attention projections, shared-expert MLPs, and dense-layer MLP
+    projections. Router gates, embeddings, the LM head, norms, and biases
+    stay at loaded precision. The loader's module predicate and the memory
+    plan's byte discount must agree, so both use this single source.
+    """
+
+    if ".self_attn." in path and path.endswith(_ATTENTION_PROJ_SUFFIXES):
+        return True
+    if path.endswith(_MLP_PROJ_SUFFIXES):
+        segments = path.split(".")
+        return "mlp" in segments or "shared_mlp" in segments
+    return False
+
+
+def resident_quant_kept_bytes(length: int, mode: str) -> int:
+    """Post-quantization byte size of a BF16 tensor, rounded up."""
+
+    numerator = RESIDENT_QUANT_KEEP_NUMERATOR[mode]
+    return -(-length * numerator // RESIDENT_QUANT_KEEP_DENOMINATOR)
+
+
 def _integer(name: str, value: object, *, minimum: int | None = None) -> int:
     """Normalize an integer-like value without accepting lossy coercions."""
 
@@ -416,6 +449,7 @@ def plan_expert_memory(
     io_staging_bytes: int = 0,
     execution_workspace_bytes: int = 0,
     additional_resident_bytes: int = 0,
+    resident_discount_bytes: int = 0,
     cache_scope: str = "layer",
     island_layer_count: int = 0,
     mmap_island_layer_count: int = 0,
@@ -460,6 +494,9 @@ def plan_expert_memory(
     additional_resident_bytes = _integer(
         "additional_resident_bytes", additional_resident_bytes, minimum=0
     )
+    resident_discount_bytes = _integer(
+        "resident_discount_bytes", resident_discount_bytes, minimum=0
+    )
     if expert_cache_limit_bytes is not None:
         expert_cache_limit_bytes = _integer(
             "expert_cache_limit_bytes", expert_cache_limit_bytes, minimum=0
@@ -495,7 +532,14 @@ def plan_expert_memory(
 
     kv_bytes = context_tokens * spec.kv_bytes_per_token
     transient_bytes = service_slots * spec.expert_record_bytes
-    resident_bytes = spec.resident_bytes + additional_resident_bytes
+    resident_bytes = (
+        spec.resident_bytes + additional_resident_bytes - resident_discount_bytes
+    )
+    if resident_bytes <= 0:
+        raise ValueError(
+            "resident_discount_bytes exceeds the resident footprint: "
+            f"{resident_discount_bytes} vs {spec.resident_bytes}"
+        )
     island_bytes = (
         island_layer_count * spec.expert_count * spec.expert_record_bytes
     )

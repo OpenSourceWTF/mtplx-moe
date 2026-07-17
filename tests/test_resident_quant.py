@@ -10,7 +10,17 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from mtplx.expert_runtime import ExpertStreamingConfig, parse_memory_bytes
+from mtplx.expert_runtime import (
+    ExpertStreamingConfig,
+    parse_memory_bytes,
+    resident_quant_plan_discount,
+)
+from mtplx.expert_streaming_models import (
+    get_model_spec,
+    plan_expert_memory,
+    resident_quant_covers,
+    resident_quant_kept_bytes,
+)
 from mtplx.models.hy3_mlx import Model as Hy3Model
 from mtplx.models.hy3_mlx import ModelArgs as Hy3Args
 from mtplx.resident_loader import ResidentLoadError, _runtime_quantize_resident
@@ -121,6 +131,85 @@ def test_runtime_quantize_rejects_matchless_model() -> None:
 
     with pytest.raises(ResidentLoadError, match="matched no resident"):
         _runtime_quantize_resident(Bare(), "q4")
+
+
+@pytest.mark.parametrize(
+    ("path", "covered"),
+    [
+        ("model.layers.3.self_attn.q_proj", True),
+        ("model.layers.3.self_attn.o_proj", True),
+        ("model.layers.1.mlp.shared_mlp.gate_proj", True),
+        ("model.layers.1.mlp.shared_mlp.gate_up_proj", True),
+        ("model.layers.0.mlp.down_proj", True),
+        ("model.layers.1.mlp.router.gate", False),
+        ("model.layers.1.mlp.gate", False),
+        ("lm_head", False),
+        ("model.embed_tokens", False),
+        ("model.layers.1.input_layernorm", False),
+        ("model.layers.80.eh_proj", False),
+    ],
+)
+def test_resident_quant_scope(path: str, covered: bool) -> None:
+    assert resident_quant_covers(path) is covered
+
+
+def test_resident_quant_kept_bytes_matches_group64_affine() -> None:
+    # 1 MiB of BF16 = 512 Ki elements; q4 packs to 256 KiB + 32 KiB of
+    # BF16 scales and biases (one pair per 64-element group).
+    assert resident_quant_kept_bytes(1024 * 1024, "q4") == 256 * 1024 + 32 * 1024
+    assert resident_quant_kept_bytes(1024 * 1024, "q8") == 512 * 1024 + 32 * 1024
+
+
+def test_plan_discount_shrinks_fixed_bytes_exactly() -> None:
+    spec = get_model_spec("hy3-expert-q2")
+    base = plan_expert_memory(
+        spec, total_limit_bytes=110 * 1024**3, context_tokens=4096
+    )
+    discounted = plan_expert_memory(
+        spec,
+        total_limit_bytes=110 * 1024**3,
+        context_tokens=4096,
+        resident_discount_bytes=10 * 1024**3,
+    )
+    assert base.fixed_bytes - discounted.fixed_bytes == 10 * 1024**3
+    with pytest.raises(ValueError, match="exceeds the resident footprint"):
+        plan_expert_memory(
+            spec,
+            total_limit_bytes=110 * 1024**3,
+            context_tokens=4096,
+            resident_discount_bytes=spec.resident_bytes,
+        )
+
+
+def test_manifest_plan_discount_scopes_and_prices_tensors() -> None:
+    from types import SimpleNamespace
+
+    tensors = (
+        SimpleNamespace(
+            tensor="model.layers.1.self_attn.q_proj.weight",
+            dtype="BF16",
+            length=1024 * 1024,
+        ),
+        SimpleNamespace(  # router stays exact
+            tensor="model.layers.1.mlp.router.gate.weight",
+            dtype="BF16",
+            length=1024 * 1024,
+        ),
+        SimpleNamespace(  # non-BF16 never discounts
+            tensor="model.layers.2.self_attn.q_proj.weight",
+            dtype="F32",
+            length=1024 * 1024,
+        ),
+        SimpleNamespace(  # biases keep loaded precision
+            tensor="model.layers.1.self_attn.q_proj.bias",
+            dtype="BF16",
+            length=4096,
+        ),
+    )
+    manifest = SimpleNamespace(resident_tensors=tensors)
+    assert resident_quant_plan_discount(manifest, None) == 0
+    expected = 1024 * 1024 - resident_quant_kept_bytes(1024 * 1024, "q4")
+    assert resident_quant_plan_discount(manifest, "q4") == expected
 
 
 def test_resident_quant_survives_benchmark_option_pipeline() -> None:

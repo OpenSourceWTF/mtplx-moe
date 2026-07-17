@@ -39,6 +39,8 @@ from .expert_streaming_models import (
     ExpertStreamingModelSpec,
     get_model_spec,
     plan_expert_memory,
+    resident_quant_covers,
+    resident_quant_kept_bytes,
 )
 from .resource_metrics import ExpertPipelineLedger, ExpertPipelineRoute
 
@@ -382,6 +384,7 @@ class ExpertStreamingConfig:
         spec: ExpertStreamingModelSpec,
         *,
         additional_resident_bytes: int = 0,
+        resident_discount_bytes: int = 0,
     ) -> ExpertMemoryPlan:
         # File-backed Metal records use the OS page cache as their physical
         # tier and never consume fixed MLX expert slots. Retain only a tiny
@@ -402,6 +405,7 @@ class ExpertStreamingConfig:
             io_staging_bytes=self.io_staging_bytes,
             execution_workspace_bytes=self.execution_workspace_bytes,
             additional_resident_bytes=additional_resident_bytes,
+            resident_discount_bytes=resident_discount_bytes,
             cache_scope=self.cache_scope,
             island_layer_count=len(self.island_layers),
             mmap_island_layer_count=len(self.mmap_island_layers),
@@ -1203,6 +1207,32 @@ class PendingSplitRoute:
         self.close()
 
 
+def resident_quant_plan_discount(manifest: Any, resident_quant: str | None) -> int:
+    """Bytes the load-time resident quantization removes from the fixed side.
+
+    Computed per manifest tensor with the same scope predicate the loader
+    applies, so the plan prices the post-quantization footprint instead of
+    the stored BF16 one (kept bytes round up — the discount understates).
+    """
+
+    if not resident_quant:
+        return 0
+    discount = 0
+    for tensor in manifest.resident_tensors:
+        if tensor.dtype.upper() not in {"BF16", "BFLOAT16"}:
+            continue
+        name = tensor.tensor
+        if name.endswith(".weight"):
+            name = name[: -len(".weight")]
+        else:
+            continue
+        if resident_quant_covers(name):
+            discount += tensor.length - resident_quant_kept_bytes(
+                tensor.length, resident_quant
+            )
+    return discount
+
+
 def reconcile_mlx_memory_cap(
     plan: ExpertMemoryPlan,
     *,
@@ -1487,6 +1517,9 @@ class ExpertStreamingRuntime:
         plan = config.memory_plan(
             model_spec,
             additional_resident_bytes=additional_resident_bytes,
+            resident_discount_bytes=resident_quant_plan_discount(
+                manifest, config.resident_quant
+            ),
         )
         if not plan.fits_fixed:
             raise ExpertStreamingConfigurationError(

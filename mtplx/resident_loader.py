@@ -12,6 +12,7 @@ from .expert_manifest import (
     resolve_artifact_member,
 )
 from .expert_runtime import ExpertStreamingRuntime
+from .expert_streaming_models import resident_quant_covers
 
 
 class ResidentLoadError(RuntimeError):
@@ -195,17 +196,15 @@ def _quantize_resident_model(
 
 
 _RESIDENT_QUANT_BITS = {"q8": 8, "q4": 4}
-_ATTENTION_PROJ_SUFFIXES = (".q_proj", ".k_proj", ".v_proj", ".o_proj")
-_MLP_PROJ_SUFFIXES = (".gate_proj", ".up_proj", ".down_proj", ".gate_up_proj")
 
 
 def _runtime_quantize_resident(model: Any, mode: str) -> list[str]:
     """Quantize the bandwidth-dominant resident Linears after a BF16 load.
 
-    Scope: attention projections, shared-expert MLPs (split or fused), and
-    dense-layer MLP projections. Router gates, embeddings, the LM head,
-    norms, and MTP glue keep their loaded precision — the router picks
-    experts, so its numerics stay exact.
+    Scope comes from ``resident_quant_covers`` — the memory plan discounts
+    the same tensors, so the two must never diverge. Router gates,
+    embeddings, the LM head, norms, and MTP glue keep their loaded
+    precision — the router picks experts, so its numerics stay exact.
     """
 
     try:
@@ -222,13 +221,7 @@ def _runtime_quantize_resident(model: Any, mode: str) -> list[str]:
             module, nn.QuantizedLinear
         ):
             return False
-        if ".self_attn." in path and path.endswith(_ATTENTION_PROJ_SUFFIXES):
-            quantized.append(path)
-            return True
-        if ".shared_mlp." in path and path.endswith(_MLP_PROJ_SUFFIXES):
-            quantized.append(path)
-            return True
-        if ".mlp" in path and path.endswith(_MLP_PROJ_SUFFIXES):
+        if resident_quant_covers(path):
             quantized.append(path)
             return True
         return False
