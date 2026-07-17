@@ -1460,6 +1460,18 @@ class ExpertStreamingRuntime:
             max_workers=max(1, plan.transient_slots),
             thread_name_prefix="mtplx-route-miss",
         )
+        # Speculative ring loads run off the route-miss executor so a
+        # prediction burst can never starve a real miss read.
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_futures: set[Future] = set()
+        self._prefetch_executor = (
+            ThreadPoolExecutor(
+                max_workers=max(1, plan.prefetch_slots_per_layer),
+                thread_name_prefix="mtplx-prefetch",
+            )
+            if config.prefetch_slots > 0
+            else None
+        )
 
     @classmethod
     def open(
@@ -2334,10 +2346,115 @@ class ExpertStreamingRuntime:
                 return self._global_bank.prepare_prefill_seed(layer, expert_ids)
             return self._banks[layer].prepare_prefill_seed(expert_ids)
 
+    def prefetch_experts(self, layer: int, expert_ids: Iterable[int]) -> int:
+        """Speculatively load predicted experts into the layer's ring tier.
+
+        Returns the number of asynchronous loads issued. Zero when prefetch
+        is disabled, the layer is an island or unrouted, or every prediction
+        is already resident, published, or inflight. A completed load
+        publishes through ``commit_prefetch`` and resolves as an ordinary
+        ``plan()`` hit; a failed load only invalidates its ring assignment —
+        speculation never marks the runtime unhealthy.
+        """
+
+        if self.config.prefetch_slots <= 0:
+            return 0
+        if layer in self.island_layer_set:
+            return 0
+        bank = self._banks.get(layer)
+        if bank is None:
+            return 0
+        if self._closed or self._closing:
+            return 0
+        executor = self._prefetch_executor
+        if executor is None:
+            return 0
+        lock = self._layer_locks[layer]
+        with lock:
+            loads = bank.plan_prefetch(expert_ids)
+        issued = 0
+        for load in loads:
+            try:
+                future = executor.submit(
+                    self.slots.load_speculative,
+                    layer,
+                    load,
+                )
+            except RuntimeError:
+                # The executor shut down mid-flight; forget the assignment
+                # so a later plan_prefetch can reuse the ring slot.
+                with lock:
+                    bank.invalidate_prefetch(load.expert)
+                continue
+            with self._prefetch_lock:
+                self._prefetch_futures.add(future)
+            future.add_done_callback(
+                lambda completed, layer=layer, expert=load.expert: (
+                    self._finish_prefetch_load(layer, expert, completed)
+                )
+            )
+            issued += 1
+        if issued:
+            with self._counter_lock:
+                self.counters.prefetch_issued += issued
+                self._layer_counters[layer].prefetch_issued += issued
+        return issued
+
+    def _finish_prefetch_load(
+        self,
+        layer: int,
+        expert: int,
+        future: Future,
+    ) -> None:
+        with self._prefetch_lock:
+            self._prefetch_futures.discard(future)
+        try:
+            future.result()
+        except BaseException:
+            succeeded = False
+        else:
+            succeeded = True
+        bank = self._banks.get(layer)
+        lock = self._layer_locks.get(layer)
+        if bank is None or lock is None:
+            return
+        committed = False
+        with lock:
+            if succeeded:
+                committed = bank.commit_prefetch(expert)
+            else:
+                bank.invalidate_prefetch(expert)
+        if committed:
+            with self._counter_lock:
+                self.counters.prefetch_committed += 1
+                self._layer_counters[layer].prefetch_committed += 1
+
+    def _drain_prefetch_loads(self) -> None:
+        """Wait out in-flight speculative loads (bounded single-record reads).
+
+        Reset and close call this before touching pool or bank state. The
+        layer locks must NOT be held here: a pending commit callback takes
+        its layer lock, and waiting on its future while holding that lock
+        would deadlock.
+        """
+
+        with self._prefetch_lock:
+            pending = tuple(self._prefetch_futures)
+        for future in pending:
+            try:
+                future.result()
+            except BaseException:
+                pass
+
     def reset(self) -> None:
         # Deferred pin releases must flush (with a covering fence) before the
         # pool resets, or reset waits forever on the final routes' pins.
         self.flush_deferred_slot_releases(evaluate=True)
+        # Straggler speculative loads hold pool lifecycle claims; without
+        # this drain the pool reset below would reject them as active
+        # routes. The bank reset then retires any not-yet-committed
+        # assignment, so a late commit callback publishes nothing.
+        self._drain_prefetch_loads()
         locks = tuple(dict.fromkeys(self._layer_locks.values()))
         for lock in locks:
             lock.acquire()
@@ -2511,6 +2628,15 @@ class ExpertStreamingRuntime:
                 self._raise_cleanup_error()
                 return
             self._closing = True
+            # In-flight speculative loads hold pool lifecycle claims; drain
+            # them (and stop accepting more) before the pool close waits on
+            # active routes.
+            self._drain_prefetch_loads()
+            if self._prefetch_executor is not None:
+                self._prefetch_executor.shutdown(
+                    wait=deadline is None,
+                    cancel_futures=True,
+                )
             slots_error: BaseException | None = None
             try:
                 self.slots.close(timeout=remaining)

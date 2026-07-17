@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -3314,3 +3315,94 @@ def test_deferred_split_route_release_matches_fenced_bitwise(
     assert deferred_held > 0, "deferred mode must hold leases until flush"
     assert deferred_drained == 0
     assert mx.array_equal(fenced_logits, deferred_logits).item()
+
+
+def test_prefetch_ring_load_resolves_as_route_hit_bitwise(
+    tmp_path: Path,
+) -> None:
+    """A committed speculative ring load must satisfy the next decode route
+    as an ordinary hit (no route read), and prefetch must not perturb the
+    generated logits."""
+
+    root, config, spec, manifest_path = _integrated_hy3_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    streamed_layer = 1
+
+    def run(prefetch_slots: int):
+        stream_config = ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=(
+                fixed
+                + spec.persistent_cache_bytes(1)
+                + prefetch_slots * spec.expert_record_bytes
+            ),
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            prefetch_slots=prefetch_slots,
+        )
+        runtime = ExpertStreamingRuntime.open(
+            root,
+            manifest_path,
+            stream_config,
+            spec=spec,
+            buffer_allocator=make_mlx_slot_buffer_allocator(
+                stream_config.memory_plan(spec), spec
+            ),
+            device_synchronize=mx.synchronize,
+            apply_memory_cap=False,
+        )
+        try:
+            if prefetch_slots:
+                bank = runtime._banks[streamed_layer]
+                assert bank.prefetch_slots == prefetch_slots
+                # Both experts are uncached; each must get a ring load.
+                issued = runtime.prefetch_experts(streamed_layer, [0, 1])
+                assert issued == 2
+                # Duplicate predictions are absorbed by the inflight set.
+                assert runtime.prefetch_experts(streamed_layer, [0, 1]) == 0
+                deadline = time.monotonic() + 10.0
+                lock = runtime._layer_locks[streamed_layer]
+                while True:
+                    with lock:
+                        committed = set(bank._prefetch_expert_to_slot)
+                    if committed == {0, 1}:
+                        break
+                    if time.monotonic() > deadline:
+                        pytest.fail(
+                            "speculative loads did not commit: "
+                            f"{sorted(committed)}"
+                        )
+                    time.sleep(0.01)
+            else:
+                # Disabled prefetch is a no-op, not an error.
+                assert runtime.prefetch_experts(streamed_layer, [0, 1]) == 0
+            resident = construct_resident_model(root, runtime, config=config)
+            logits = resident.model(mx.array([[1]], dtype=mx.int32))
+            mx.eval(logits)
+            snapshot = runtime.snapshot(mx_module=mx)
+            assert snapshot["slots"]["pins"] == 0
+            return logits, snapshot
+        finally:
+            runtime.close()
+
+    plain_logits, plain_snapshot = run(0)
+    prefetch_logits, prefetch_snapshot = run(2)
+
+    # Baseline: the single decode route misses and loads from SSD.
+    assert plain_snapshot["cache"]["expert_hits"] == 0
+    assert plain_snapshot["cache"]["expert_misses"] == 1
+    assert plain_snapshot["cache"]["prefetch_issued"] == 0
+    assert plain_snapshot["cache"]["prefetch_committed"] == 0
+    assert plain_snapshot["slots"]["prefetch_slot_count"] == 0
+
+    # Prefetched: the same route resolves inside the ring with no load.
+    assert prefetch_snapshot["cache"]["prefetch_issued"] == 2
+    assert prefetch_snapshot["cache"]["prefetch_committed"] == 2
+    assert prefetch_snapshot["cache"]["expert_hits"] == 1
+    assert prefetch_snapshot["cache"]["expert_misses"] == 0
+    assert prefetch_snapshot["cache"]["bytes_read"] == 0
+    assert prefetch_snapshot["slots"]["prefetch_slot_count"] == 2
+    # The speculative reads themselves went through the checked pool path.
+    assert prefetch_snapshot["slots"]["metrics"]["owned_loads"] >= 2
+
+    assert mx.array_equal(plain_logits, prefetch_logits).item()

@@ -1677,6 +1677,61 @@ class ExpertSlotPool:
             pipeline_route=pipeline_route,
         )
 
+    def load_speculative(self, layer: int, load: SlotLoad) -> None:
+        """Claim one ring slot and read its expert record, route-free.
+
+        Speculative counterpart of the ensure_route miss path reusing the
+        same slot state machine: ``_prepare_load`` claims the physical slot
+        (waiting out pins and foreign loads) and ``_fill`` performs the
+        checked read, leaving the slot READY with this (layer, expert,
+        generation) exactly as a route load would, so a later route can pin
+        it as an ordinary hit. There is no policy transaction and no pin
+        here: the caller publishes the completed load through its bank's
+        ``commit_prefetch`` (or forgets it via ``invalidate_prefetch``),
+        and the runtime's layer transaction lock guarantees a route never
+        hit-resolves the ring slot before that publication. The lifecycle
+        claim keeps close() from finalizing buffers under the read.
+        """
+
+        self._raise_completion_error()
+        try:
+            record = self._record_map[(layer, load.expert)]
+        except KeyError as exc:
+            raise ExpertSlotError(
+                f"manifest has no expert record ({layer}, {load.expert})"
+            ) from exc
+        lifecycle = self.retain_split_lifecycle()
+        try:
+            slot, generation, owned, _previous = self._prepare_load(
+                layer,
+                load,
+                deadline_ns=None,
+            )
+            if owned:
+                # A failed read leaves the slot FAILED; the next
+                # ``_prepare_load`` claiming this ring slot takes ownership
+                # from that state, so no restore pass is needed here.
+                self._fill(
+                    slot,
+                    generation,
+                    record,
+                    cancel_event=None,
+                    deadline_ns=None,
+                )
+            else:
+                # The slot already holds (or is loading) this expert at
+                # this generation; wait for READY so the caller commits
+                # only settled bytes.
+                self._wait_ready(
+                    slot,
+                    layer=layer,
+                    expert=load.expert,
+                    generation=generation,
+                    deadline_ns=None,
+                )
+        finally:
+            lifecycle.release()
+
     def _ensure_route_locked(
         self,
         layer: int,
@@ -2122,7 +2177,11 @@ class ExpertSlotPool:
         self._raise_completion_error()
         states: dict[str, int] = {state.value: 0 for state in ExpertSlotState}
         pins = 0
-        for slot in (*self._persistent.values(), *self._transient):
+        for slot in (
+            *self._persistent.values(),
+            *self._transient,
+            *self._prefetch.values(),
+        ):
             with slot.condition:
                 states[slot.state.value] += 1
                 pins += slot.pins
@@ -2135,6 +2194,7 @@ class ExpertSlotPool:
             "cache_scope": self.cache_scope,
             "persistent_route_capacity": self._persistent_route_capacity,
             "transient_slot_count": len(self._transient),
+            "prefetch_slot_count": len(self._prefetch),
             "states": states,
             "pins": pins,
             "metrics": self.metrics.as_dict(),
@@ -2169,7 +2229,11 @@ class ExpertSlotPool:
         with self._lifecycle:
             if self.metrics.as_dict()["active_routes"]:
                 raise ExpertSlotError("cannot reset while expert routes are active")
-        for slot in (*self._persistent.values(), *self._transient):
+        for slot in (
+            *self._persistent.values(),
+            *self._transient,
+            *self._prefetch.values(),
+        ):
             with slot.condition:
                 if slot.state is ExpertSlotState.LOADING or slot.pins:
                     raise ExpertSlotError("cannot reset an active expert slot")
@@ -2217,7 +2281,11 @@ class ExpertSlotPool:
             if not finalized:
                 self._completion_executor.shutdown(wait=True, cancel_futures=False)
                 self._executor.shutdown(wait=True, cancel_futures=True)
-                for slot in (*self._persistent.values(), *self._transient):
+                for slot in (
+                    *self._persistent.values(),
+                    *self._transient,
+                    *self._prefetch.values(),
+                ):
                     with slot.condition:
                         slot.state = ExpertSlotState.CLOSED
                         slot.condition.notify_all()
@@ -2225,7 +2293,11 @@ class ExpertSlotPool:
                 allocator_close = getattr(self._allocator, "close", None)
                 if callable(allocator_close):
                     allocator_close()
-                for slot in (*self._persistent.values(), *self._transient):
+                for slot in (
+                    *self._persistent.values(),
+                    *self._transient,
+                    *self._prefetch.values(),
+                ):
                     slot.buffer = None
                 self._allocator = _closed_allocator
                 with self._lifecycle:

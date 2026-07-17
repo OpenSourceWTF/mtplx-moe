@@ -126,6 +126,8 @@ class CacheCounters:
     transient_loads: int = 0
     evictions: int = 0
     bytes_read: int = 0
+    prefetch_issued: int = 0
+    prefetch_committed: int = 0
 
     def observe(self, plan: RoutePlan, *, expert_record_bytes: int) -> None:
         expert_record_bytes = _integer(
@@ -163,6 +165,8 @@ class CacheCounters:
             "transient_loads": self.transient_loads,
             "evictions": self.evictions,
             "bytes_read": self.bytes_read,
+            "prefetch_issued": self.prefetch_issued,
+            "prefetch_committed": self.prefetch_committed,
         }
 
 
