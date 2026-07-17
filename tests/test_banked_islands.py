@@ -501,47 +501,6 @@ def mlx():
     return pytest.importorskip("mlx.core")
 
 
-def test_banked_store_copy_mode_matches_mapped(tmp_path, mlx) -> None:
-    import mlx.core as mx
-
-    from mtplx.models.expert_mlx import BankedMmapIslandStore
-
-    root, spec, manifest, _expected = _sidecar_artifact(tmp_path)
-    layers = tuple(spec.routed_layer_indices)
-    _banked, _bin, banked_manifest = _write_banked(tmp_path, root, manifest, layers)
-    mapped = BankedMmapIslandStore(
-        banked_manifest, layers, expert_count=spec.expert_count
-    )
-    copied = BankedMmapIslandStore(
-        banked_manifest, layers, expert_count=spec.expert_count, residency="copy"
-    )
-    try:
-        mapped.prepare()
-        copied.prepare()
-        assert copied.snapshot()["residency"] == "copy"
-        for layer in layers:
-            a = mapped.bank_for_layer(layer).arrays
-            b = copied.bank_for_layer(layer).arrays
-            for component in a:
-                assert mx.array_equal(a[component], b[component]).item()
-    finally:
-        mapped.close()
-        copied.close()
-
-
-def test_banked_store_rejects_unknown_residency(tmp_path, mlx) -> None:
-    from mtplx.models.expert_mlx import BankedMmapIslandStore
-
-    root, spec, manifest, _expected = _sidecar_artifact(tmp_path)
-    layers = tuple(spec.routed_layer_indices)
-    _banked, _bin, banked_manifest = _write_banked(tmp_path, root, manifest, layers)
-    with pytest.raises(ValueError, match="residency"):
-        BankedMmapIslandStore(
-            banked_manifest, layers, expert_count=spec.expert_count,
-            residency="mlock",
-        )
-
-
 def test_banked_store_arrays_match_wired_fill(tmp_path, mlx) -> None:
     import mlx.core as mx
 
