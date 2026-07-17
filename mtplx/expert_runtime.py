@@ -174,6 +174,7 @@ class ExpertStreamingConfig:
     split_route_release: str = "fenced"
     prefetch_slots: int = 0
     route_census: bool = True
+    miss_shadow: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -238,6 +239,15 @@ class ExpertStreamingConfig:
             raise ValueError("resident_quant must be None, 'q8', or 'q4'")
         if self.kv_quant not in {None, "q8", "q4"}:
             raise ValueError("kv_quant must be None, 'q8', or 'q4'")
+        if self.miss_shadow is not None:
+            if self.miss_shadow not in {"b1", "t158"}:
+                raise ValueError("miss_shadow must be None, 'b1', or 't158'")
+            if self.cache_scope != "layer":
+                raise ValueError("miss_shadow requires cache_scope 'layer'")
+            if self.slot_layout != "component-banks":
+                raise ValueError(
+                    "miss_shadow requires the component-banks slot layout"
+                )
         if self.split_route_release not in {"fenced", "deferred"}:
             raise ValueError(
                 "split_route_release must be 'fenced' or 'deferred'"
@@ -460,6 +470,7 @@ class ExpertStreamingConfig:
             mmap_island_layer_count=len(self.mmap_island_layers),
             mmap_islands_wired=self.mmap_island_wired,
             prefetch_slots_per_layer=self.prefetch_slots,
+            miss_shadow=self.miss_shadow,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1556,6 +1567,10 @@ class ExpertStreamingRuntime:
         self._mapped_expert_store: Any | None = None
         self._island_store: Any | None = None
         self._banked_island_store: Any | None = None
+        self._shadow_store: Any | None = None
+        self._shadow_serve_routes = 0
+        self._shadow_serve_assignments = 0
+        self._shadow_serve_experts = 0
         # Decode-route census (issue #98): pure host-side counters, flushed
         # to the model root at close(). Never touches routing or numerics.
         self._census_lock = threading.Lock()
@@ -1719,7 +1734,7 @@ class ExpertStreamingRuntime:
         except Exception:
             reader.close()
             raise
-        return cls(
+        runtime = cls(
             artifact_root,
             model_spec,
             config,
@@ -1731,6 +1746,36 @@ class ExpertStreamingRuntime:
             integrity_report=integrity_report,
             **pipeline_kwargs,
         )
+        if config.miss_shadow is not None:
+            from mtplx.expert_shadow import ShadowBankStore
+
+            try:
+                streamed_layers = tuple(
+                    layer
+                    for layer in model_spec.routed_layer_indices
+                    if layer not in runtime.island_layer_set
+                )
+                # The store constructor is the loud fence: it rejects a plan
+                # whose shadow pricing does not match this codec/layer set.
+                shadow_store = ShadowBankStore(
+                    model_spec,
+                    streamed_layers,
+                    codec=config.miss_shadow,
+                    plan=plan,
+                )
+                shadow_store.fill(
+                    manifest,
+                    artifact_root,
+                    verify_hash=(
+                        config.verify_record_hashes
+                        and not config.verify_sidecar_hash_at_open
+                    ),
+                )
+                runtime._shadow_store = shadow_store
+            except BaseException:
+                runtime.close()
+                raise
+        return runtime
 
     @staticmethod
     def _validate_manifest_identity(
@@ -2487,6 +2532,42 @@ class ExpertStreamingRuntime:
                 return self._global_bank.prepare_prefill_seed(layer, expert_ids)
             return self._banks[layer].prepare_prefill_seed(expert_ids)
 
+    def shadow_bank_for_layer(self, layer: int) -> Any | None:
+        """The layer's shadow miss-fallback bank, or None when disabled."""
+
+        store = self._shadow_store
+        if store is None:
+            return None
+        try:
+            return store.bank_for_layer(layer)
+        except Exception:
+            return None
+
+    def peek_resident_experts(
+        self, layer: int, expert_ids: Iterable[int]
+    ) -> frozenset[int]:
+        """Which of ``expert_ids`` are hit-eligible right now (no pinning).
+
+        A snapshot, not a reservation: residency can change between this
+        peek and a subsequent route, in which case the route machinery
+        simply services the expert exactly (slower, never wrong).
+        """
+
+        bank = self._banks.get(layer)
+        if bank is None:
+            return frozenset()
+        lock = self._layer_locks[layer]
+        with lock:
+            return bank.published_experts(expert_ids)
+
+    def note_shadow_serve(
+        self, layer: int, *, assignments: int, experts: int
+    ) -> None:
+        with self._counter_lock:
+            self._shadow_serve_routes += 1
+            self._shadow_serve_assignments += int(assignments)
+            self._shadow_serve_experts += int(experts)
+
     def prefetch_experts(self, layer: int, expert_ids: Iterable[int]) -> int:
         """Speculatively load predicted experts into the layer's ring tier.
 
@@ -2722,6 +2803,8 @@ class ExpertStreamingRuntime:
                 "transient_slots": self.plan.transient_slots,
                 "allocated_bytes": self.plan.allocated_bytes,
                 "unallocated_bytes": self.plan.unallocated_bytes,
+                "miss_shadow": self.plan.miss_shadow,
+                "shadow_bytes": self.plan.shadow_bytes,
             },
             "memory_cap": self.memory_cap_report,
             "integrity": self.integrity_report,
@@ -2750,6 +2833,13 @@ class ExpertStreamingRuntime:
             snapshot["banked_island_experts"] = (
                 self._banked_island_store.snapshot()
             )
+        if self._shadow_store is not None:
+            shadow = self._shadow_store.snapshot()
+            with self._counter_lock:
+                shadow["serve_routes"] = self._shadow_serve_routes
+                shadow["served_assignments"] = self._shadow_serve_assignments
+                shadow["served_experts"] = self._shadow_serve_experts
+            snapshot["shadow_experts"] = shadow
         if self._pipeline_ledger is not None:
             snapshot["expert_pipeline"] = self._pipeline_ledger.snapshot()
         self._raise_if_unhealthy()

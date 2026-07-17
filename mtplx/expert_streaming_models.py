@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from operator import index
 
+from mtplx.expert_shadow import SHADOW_CODECS, shadow_record_bytes
+
 
 # Load-time resident quantization (group 64 affine over BF16): kept bytes
 # per source byte are packed bits plus one BF16 scale and bias per group:
@@ -251,6 +253,8 @@ class ExpertMemoryPlan:
     prefetch_slots_per_layer: int = 0
     prefetch_bytes: int = 0
     mmap_islands_wired: bool = True
+    miss_shadow: str | None = None
+    shadow_bytes: int = 0
 
     @property
     def fixed_bytes(self) -> int:
@@ -270,6 +274,7 @@ class ExpertMemoryPlan:
             + self.runtime_reserve_bytes
             + self.island_bytes
             + wired_band
+            + self.shadow_bytes
         )
 
     @property
@@ -472,6 +477,7 @@ def plan_expert_memory(
     mmap_island_layer_count: int = 0,
     mmap_islands_wired: bool = True,
     prefetch_slots_per_layer: int = 0,
+    miss_shadow: str | None = None,
 ) -> ExpertMemoryPlan:
     """Fit uniform persistent expert slots under an explicit memory ceiling.
 
@@ -491,6 +497,11 @@ def plan_expert_memory(
     slots, and shrink the streamed layer count exactly like wired islands.
     ``mmap_island_bytes`` is advisory — the pager's working set, not an
     allocation.
+
+    ``miss_shadow`` prices one dense low-precision shadow bank per
+    *streamed* layer (routed minus islands minus mmap band) so decode
+    misses can be served in memory instead of from SSD; the full cost
+    lands on the fixed side.
 
     A plan with ``fits_fixed=False`` is diagnostic and must not be used to
     start inference.  Its negative ``unallocated_bytes`` is the fixed-footprint
@@ -580,6 +591,16 @@ def plan_expert_memory(
     prefetch_bytes = (
         streamed_layer_count * prefetch_slots_per_layer * spec.expert_record_bytes
     )
+    if miss_shadow is not None and miss_shadow not in SHADOW_CODECS:
+        choices = ", ".join(repr(codec) for codec in SHADOW_CODECS)
+        raise ValueError(f"miss_shadow must be None, {choices}")
+    shadow_bytes = (
+        streamed_layer_count
+        * spec.expert_count
+        * shadow_record_bytes(miss_shadow, spec.expert_source_parameters)
+        if miss_shadow is not None
+        else 0
+    )
     fixed_bytes = (
         resident_bytes
         + kv_bytes
@@ -590,6 +611,7 @@ def plan_expert_memory(
         + execution_workspace_bytes
         + island_bytes
         + (mmap_island_bytes if mmap_islands_wired else 0)
+        + shadow_bytes
     )
     available_bytes = max(0, total_limit_bytes - fixed_bytes)
     streamed_expert_bytes = (
@@ -649,4 +671,6 @@ def plan_expert_memory(
         mmap_islands_wired=bool(mmap_islands_wired),
         prefetch_slots_per_layer=prefetch_slots_per_layer,
         prefetch_bytes=prefetch_bytes,
+        miss_shadow=miss_shadow,
+        shadow_bytes=shadow_bytes,
     )

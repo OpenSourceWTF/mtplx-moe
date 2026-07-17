@@ -259,6 +259,21 @@ class LayerExpertSlotBank:
     def resident_experts(self) -> tuple[int, ...]:
         return tuple(expert for expert in self._slot_to_expert if expert is not None)
 
+    def published_experts(self, expert_ids: Iterable[int]) -> frozenset[int]:
+        """Subset of ``expert_ids`` that would hit-resolve right now.
+
+        Persistent residents plus committed prefetch-ring entries; inflight
+        ring assignments are excluded because a route may not consume a
+        slot mid-write. Pure peek — no history, epoch, or slot mutation.
+        """
+
+        return frozenset(
+            expert
+            for expert in expert_ids
+            if expert in self._expert_to_slot
+            or expert in self._prefetch_expert_to_slot
+        )
+
     @property
     def occupancy(self) -> int:
         return len(self._expert_to_slot)

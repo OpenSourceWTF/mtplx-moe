@@ -1212,6 +1212,35 @@ def _gather_component_bank(
     return output.reshape((rows, int(output.shape[-1])))
 
 
+def _run_shadow_bank(
+    x: mx.array,
+    expert_rows: mx.array,
+    bank: Any,
+) -> mx.array:
+    """Three-projection expert MLP against a low-precision shadow bank.
+
+    ``expert_rows`` are raw expert ids — the shadow bank row index is the
+    expert id (island-bank convention). Output is a quality tier, close to
+    the exact quantized path but not bitwise. Eager-only: the shadow
+    kernel is not traceable under ``mx.compile``.
+    """
+
+    from mtplx.kernels.shadow_gather import shadow_gather_mm
+
+    def projection(values: mx.array, name: str) -> mx.array:
+        return shadow_gather_mm(
+            values,
+            expert_rows,
+            bank.arrays[f"{name}.packed"],
+            bank.arrays[f"{name}.scales"],
+            codec=bank.codec,
+        )
+
+    gate = projection(x, "gate_proj")
+    up = projection(x, "up_proj")
+    return projection(swiglu(gate, up), "down_proj")
+
+
 def _run_mapped_q4(
     x: mx.array,
     mapped: MappedExpertRecord,
@@ -1308,6 +1337,13 @@ class HotExpertSwitchGLU(nn.Module):
         self.layer_index = int(layer_index)
         self.group_size = runtime.spec.quant_group_size
         self.bits = runtime.spec.quant_bits
+        # Shadow miss fallback (issue #51): when the runtime opened with
+        # miss_shadow, decode misses on this streamed layer are served from
+        # a resident low-precision bank instead of waiting on SSD.
+        shadow_lookup = getattr(runtime, "shadow_bank_for_layer", None)
+        self._shadow_bank = (
+            shadow_lookup(self.layer_index) if callable(shadow_lookup) else None
+        )
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         output, _overlap_result = self._run(
@@ -1589,6 +1625,116 @@ class HotExpertSwitchGLU(nn.Module):
                     and self.runtime.manifest.sidecar is not None
                 ),
             ):
+                # Shadow miss fallback (issue #51): with a shadow bank bound,
+                # a decode wave never waits on SSD.  Resident experts run
+                # exactly from cache; every other assignment is served from
+                # the resident low-precision shadow bank, and the exact tier
+                # warms asynchronously through the speculative-prefetch lane
+                # so future routes turn these serves into exact hits.
+                # Prefill is untouched (exact, transient-served).
+                shadow_bank = self._shadow_bank
+                resident: frozenset[int] = frozenset()
+                if shadow_bank is not None and phase is RoutingPhase.DECODE:
+                    resident = self.runtime.peek_resident_experts(
+                        self.layer_index, wave.experts
+                    )
+                if (
+                    shadow_bank is not None
+                    and phase is RoutingPhase.DECODE
+                    and not all(expert in resident for expert in wave.experts)
+                ):
+                    exact_assignments = tuple(
+                        (position, expert)
+                        for position, expert in zip(
+                            wave.positions, wave.experts, strict=True
+                        )
+                        if expert in resident
+                    )
+                    shadow_positions = [
+                        position
+                        for position, expert in zip(
+                            wave.positions, wave.experts, strict=True
+                        )
+                        if expert not in resident
+                    ]
+                    shadow_experts = [
+                        expert for expert in wave.experts if expert not in resident
+                    ]
+                    if exact_assignments:
+                        with _route_probe.bracket("hot.begin_shadow_route"):
+                            pending = self.runtime.begin_split_route(
+                                self.layer_index,
+                                tuple(
+                                    expert for _position, expert in exact_assignments
+                                ),
+                                phase=phase,
+                            )
+                        try:
+                            hit_set = set(pending.plan.hits)
+                            hit_positions = tuple(
+                                position
+                                for position, expert in exact_assignments
+                                if expert in hit_set
+                            )
+                            if pending.hit_ready is not None:
+                                evaluate_component_bindings(
+                                    hit_positions,
+                                    pending.hit_ready.bindings,
+                                    pending.hit_ready,
+                                    force_sync=True,
+                                )
+                                pending.release_hits()
+                            # The residency peek is a snapshot, not a
+                            # reservation: an expert evicted between peek and
+                            # pin becomes a planned miss here and is serviced
+                            # exactly (slower on this route, never wrong).
+                            for miss_ready in pending.iter_ready_misses():
+                                try:
+                                    ready_experts = set(miss_ready.plan.experts)
+                                    miss_positions = tuple(
+                                        position
+                                        for position, expert in exact_assignments
+                                        if expert not in hit_set
+                                        and expert in ready_experts
+                                    )
+                                    evaluate_component_bindings(
+                                        miss_positions,
+                                        miss_ready.bindings,
+                                        miss_ready,
+                                        force_sync=True,
+                                    )
+                                finally:
+                                    pending.release_miss(miss_ready)
+                        except BaseException as exc:
+                            pending.abort(exc)
+                            raise
+                        finally:
+                            pending.close()
+                    with _route_probe.bracket("hot.shadow_serve"):
+                        token_positions = mx.array(
+                            [position // top_k for position in shadow_positions],
+                            dtype=mx.int32,
+                        )
+                        selected = mx.take(tokens, token_positions, axis=0)
+                        outputs.append(
+                            _run_shadow_bank(
+                                selected,
+                                mx.array(shadow_experts, dtype=mx.int32),
+                                shadow_bank,
+                            )
+                        )
+                        output_positions.extend(shadow_positions)
+                    unique_shadowed = tuple(dict.fromkeys(shadow_experts))
+                    _route_probe.count("hot.shadow_route")
+                    self.runtime.note_shadow_serve(
+                        self.layer_index,
+                        assignments=len(shadow_positions),
+                        experts=len(unique_shadowed),
+                    )
+                    self.runtime.prefetch_experts(
+                        self.layer_index, unique_shadowed
+                    )
+                    continue
                 # Keep the all-hit optimization inside the authoritative bounded
                 # route-wave loop.  A successful probe avoids split-route futures
                 # and per-expert grouping while retaining the normal policy epoch,
