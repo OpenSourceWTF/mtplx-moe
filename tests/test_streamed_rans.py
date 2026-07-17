@@ -440,49 +440,37 @@ def test_streamed_codec_verify_off_skips_hash_but_stays_bitwise(tmp_path: Path) 
     assert io_off["decoded_records"] >= 1
     assert io_off["integrity_errors"] == 0
 
-    # verify=True catches container-payload corruption the structural guards
-    # cannot see: flip bytes mid-payload in the FIRST record's compressed
-    # container (past the header/freq table, before the tail guard).
-    import json as _json
-
-    codec_doc = _json.loads(codec_manifest_path.read_text())
-    entry = sorted(codec_doc["records"], key=lambda r: r["offset"])[0]
-    bin_path = root / "experts-rans32x.bin"
-    blob = bytearray(bin_path.read_bytes())
-    # 85% depth lands in payload symbols (past header/freq/directory, before
-    # the tail guard) so the container stays structurally valid but decodes
-    # to different bytes -- exactly what only the hash can catch.
-    deep = entry["offset"] + (entry["length"] * 17) // 20
-    for i in range(deep, deep + 8):
-        blob[i] ^= 0xFF
-    bin_path.write_bytes(bytes(blob))
-
-    def forward_expect(codec_verify):
+    # verify=True catches decode output that no structural guard can see:
+    # deterministically corrupt by wrapping the decoder to flip one byte of
+    # its (structurally valid) output -- byte-position gambling on the real
+    # container is flaky because random fixture layouts move the payload.
+    def forward_corrupted(codec_verify):
         runtime, _plan = _open_runtime(
             root, manifest_path, spec, config,
             streamed_codec="rans32x-v1", codec_manifest=codec_manifest_path,
             codec_verify=codec_verify,
         )
         try:
+            real = runtime.reader._decode_container_fn()
+
+            def corrupting(payload):
+                import numpy as _np
+
+                out = _np.array(real(payload), dtype=_np.uint8).reshape(-1).copy()
+                out[out.size // 2] ^= 0xFF
+                return out
+
+            runtime.reader._decode_container = corrupting
             resident = construct_resident_model(root, runtime, config=config)
             mx.eval(resident.model(mx.array([[1, 2]], dtype=mx.int32)))
             return runtime.reader.metrics.as_dict()
         finally:
             runtime.close()
 
-    with pytest.raises(Exception, match="hash mismatch|integrity|decode|guard|container|directory"):
-        forward_expect(True)
-    # verify=False must NOT raise the integrity error for the same corruption
-    # (the hash is never consulted); the decode may still trip a structural
-    # guard, in which case the OFF path degrades identically -- accept either
-    # a clean pass (integrity_errors == 0) or the structural error, but never
-    # the hash-mismatch integrity path.
-    try:
-        io_corrupt_off = forward_expect(False)
-    except Exception as exc:  # structural guard, not the hash path
-        assert "hash mismatch" not in str(exc)
-    else:
-        assert io_corrupt_off["integrity_errors"] == 0
+    with pytest.raises(Exception, match="hash mismatch|integrity"):
+        forward_corrupted(True)
+    io_corrupt_off = forward_corrupted(False)
+    assert io_corrupt_off["integrity_errors"] == 0  # hash never consulted
 
 def test_streamed_codec_verify_validation() -> None:
     with pytest.raises(TypeError, match="streamed_codec_verify"):
