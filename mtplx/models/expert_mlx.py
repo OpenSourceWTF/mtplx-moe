@@ -648,9 +648,11 @@ class BankedMmapIslandStore:
         *,
         expert_count: int,
         verify_hash: bool = True,
+        wired: bool = True,
     ) -> None:
         from mtplx.expert_banked import BankedManifestError, load_banked_manifest
 
+        self.wired = bool(wired)
         self.layers = tuple(sorted({int(layer) for layer in layers}))
         if not self.layers:
             raise ValueError("banked island store requires at least one layer")
@@ -715,7 +717,13 @@ class BankedMmapIslandStore:
                 raise BankedManifestError(
                     f"banked layer {layer} extent exceeds {path.name}"
                 )
-            base = mmap_u32(path, entry.offset, mapped_length)
+            # wired=True registers the mapping in MLX's process-wide residency
+            # set: Metal keeps it permanently resident like ordinary weights.
+            # Untracked (unwired) buffers make Metal rebuild residency around
+            # every submission — measured as the ENTIRE MLX residency set
+            # wiring/unwiring (~85 GiB swings) per wave, ~4x decode slowdown.
+            # Unwired remains selectable for bands larger than RAM (Q4/GLM).
+            base = mmap_u32(path, entry.offset, mapped_length, wired=self.wired)
             arrays: dict[str, mx.array] = {}
             for component in entry.components:
                 if component.dtype == "U32":
@@ -761,6 +769,7 @@ class BankedMmapIslandStore:
     def snapshot(self) -> dict[str, Any]:
         return {
             "backend": "banked-mmap-island-banks",
+            "wired": self.wired,
             "layers": list(self.layers),
             "expert_count": self.expert_count,
             "mapped_bytes": sum(
@@ -1790,6 +1799,7 @@ def bind_streamed_switches(model: Any, runtime: ExpertStreamingRuntime) -> int:
             Path(runtime.config.banked_manifest),
             banked_layers,
             expert_count=runtime.spec.expert_count,
+            wired=runtime.config.mmap_island_wired,
         )
         banked_store.prepare()
         banked_store.prefetch_all()

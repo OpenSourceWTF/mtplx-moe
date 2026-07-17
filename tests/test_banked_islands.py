@@ -41,19 +41,34 @@ from tests.test_expert_slots_runtime import _global_artifact
 # ---------------------------------------------------------------- plan math
 
 
-def test_plan_mmap_islands_stay_off_the_fixed_side() -> None:
+def test_plan_wired_mmap_islands_land_on_the_fixed_side() -> None:
     spec = _two_layer_spec()
     base = plan_expert_memory(spec, **_plan_kwargs())
     plan = plan_expert_memory(spec, mmap_island_layer_count=1, **_plan_kwargs())
     band_bytes = spec.expert_count * spec.expert_record_bytes
     assert plan.mmap_island_layer_count == 1
     assert plan.mmap_island_bytes == band_bytes
+    assert plan.mmap_islands_wired is True
     assert plan.island_bytes == 0
-    # Unwired pages are the pager's, not MLX's: fixed budget must not move.
-    assert plan.fixed_bytes == base.fixed_bytes
+    # Wired bands sit in MLX's residency set and accounting: fixed side.
+    assert plan.fixed_bytes == base.fixed_bytes + band_bytes
     # Slot math spans only the one remaining streamed layer.
     assert plan.slots_per_layer == spec.expert_count
     assert plan.persistent_slots == spec.expert_count
+
+
+def test_plan_paged_mmap_islands_stay_off_the_fixed_side() -> None:
+    spec = _two_layer_spec()
+    base = plan_expert_memory(spec, **_plan_kwargs())
+    plan = plan_expert_memory(
+        spec,
+        mmap_island_layer_count=1,
+        mmap_islands_wired=False,
+        **_plan_kwargs(),
+    )
+    # Paged pages are the pager's, not MLX's: fixed budget must not move.
+    assert plan.mmap_islands_wired is False
+    assert plan.fixed_bytes == base.fixed_bytes
 
 
 def test_plan_wired_plus_mmap_islands_cover_all_layers() -> None:
@@ -385,28 +400,34 @@ def test_runtime_open_rejects_uncovered_mmap_layer(tmp_path) -> None:
 # ----------------------------------------------------------- memory cap
 
 
-def test_mlx_cap_charges_the_mmap_island_band() -> None:
+def test_mlx_cap_charges_only_the_paged_band() -> None:
     from mtplx.expert_runtime import reconcile_mlx_memory_cap
 
     spec = _two_layer_spec()
     band = spec.expert_count * spec.expert_record_bytes
-    plan = plan_expert_memory(spec, mmap_island_layer_count=1, **_plan_kwargs())
-    limit = reconcile_mlx_memory_cap(plan, env={})
-    assert limit == (
-        plan.total_limit_bytes
-        - plan.runtime_reserve_bytes
-        - plan.io_staging_bytes
+    paged = plan_expert_memory(
+        spec,
+        mmap_island_layer_count=1,
+        mmap_islands_wired=False,
+        **_plan_kwargs(),
+    )
+    assert reconcile_mlx_memory_cap(paged, env={}) == (
+        paged.total_limit_bytes
+        - paged.runtime_reserve_bytes
+        - paged.io_staging_bytes
         - band
     )
-    base = plan_expert_memory(spec, **_plan_kwargs())
-    assert reconcile_mlx_memory_cap(base, env={}) == (
-        base.total_limit_bytes
-        - base.runtime_reserve_bytes
-        - base.io_staging_bytes
+    # A wired band already counts inside MLX accounting (fixed side):
+    # subtracting it again would double-charge.
+    wired = plan_expert_memory(spec, mmap_island_layer_count=1, **_plan_kwargs())
+    assert reconcile_mlx_memory_cap(wired, env={}) == (
+        wired.total_limit_bytes
+        - wired.runtime_reserve_bytes
+        - wired.io_staging_bytes
     )
 
 
-def test_mlx_cap_rejects_band_squeezing_the_wired_side() -> None:
+def test_mlx_cap_rejects_paged_band_squeezing_the_wired_side() -> None:
     from mtplx.expert_runtime import reconcile_mlx_memory_cap
 
     spec = _two_layer_spec()
@@ -415,6 +436,7 @@ def test_mlx_cap_rejects_band_squeezing_the_wired_side() -> None:
         spec,
         island_layer_count=1,
         mmap_island_layer_count=1,
+        mmap_islands_wired=False,
         **_plan_kwargs(
             total_limit_bytes=(
                 spec.resident_bytes

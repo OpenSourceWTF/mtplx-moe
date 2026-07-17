@@ -210,9 +210,16 @@ class ExpertMemoryPlan:
     island_bytes: int = 0
     mmap_island_layer_count: int = 0
     mmap_island_bytes: int = 0
+    mmap_islands_wired: bool = True
 
     @property
     def fixed_bytes(self) -> int:
+        # Wired mmap islands are registered in MLX's process-wide residency
+        # set and count in MLX memory accounting, so they live on the fixed
+        # side exactly like ordinary islands. Paged (unwired) bands live in
+        # the page cache outside MLX and are charged by the cap reconciler
+        # instead.
+        wired_band = self.mmap_island_bytes if self.mmap_islands_wired else 0
         return (
             self.resident_bytes
             + self.kv_bytes
@@ -221,6 +228,7 @@ class ExpertMemoryPlan:
             + self.execution_workspace_bytes
             + self.runtime_reserve_bytes
             + self.island_bytes
+            + wired_band
         )
 
     @property
@@ -401,6 +409,7 @@ def plan_expert_memory(
     cache_scope: str = "layer",
     island_layer_count: int = 0,
     mmap_island_layer_count: int = 0,
+    mmap_islands_wired: bool = True,
 ) -> ExpertMemoryPlan:
     """Fit uniform persistent expert slots under an explicit memory ceiling.
 
@@ -494,6 +503,7 @@ def plan_expert_memory(
         + io_staging_bytes
         + execution_workspace_bytes
         + island_bytes
+        + (mmap_island_bytes if mmap_islands_wired else 0)
     )
     available_bytes = max(0, total_limit_bytes - fixed_bytes)
     streamed_expert_bytes = (
@@ -550,4 +560,5 @@ def plan_expert_memory(
         island_bytes=island_bytes,
         mmap_island_layer_count=mmap_island_layer_count,
         mmap_island_bytes=mmap_island_bytes,
+        mmap_islands_wired=bool(mmap_islands_wired),
     )

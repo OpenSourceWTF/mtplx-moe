@@ -148,6 +148,7 @@ class ExpertStreamingConfig:
     mmap_island_layers: tuple[int, ...] = ()
     banked_manifest: str | None = None
     banked_codec: str = "none"
+    mmap_island_wired: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -234,6 +235,8 @@ class ExpertStreamingConfig:
                     "island_layers execute without host route observation; "
                     "trace_routes must be disabled"
                 )
+        if not isinstance(self.mmap_island_wired, bool):
+            raise TypeError("mmap_island_wired must be bool")
         mmap_islands = self.mmap_island_layers
         if isinstance(mmap_islands, (str, bytes)) or not isinstance(
             mmap_islands, (tuple, list)
@@ -357,6 +360,7 @@ class ExpertStreamingConfig:
             cache_scope=self.cache_scope,
             island_layer_count=len(self.island_layers),
             mmap_island_layer_count=len(self.mmap_island_layers),
+            mmap_islands_wired=self.mmap_island_wired,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1161,32 +1165,39 @@ def reconcile_mlx_memory_cap(
 ) -> int:
     """Resolve the MLX-owned portion and reject a conflicting env cap."""
 
-    mmap_island_bytes = getattr(plan, "mmap_island_bytes", 0)
+    # A wired band is registered in MLX's residency set and counted by MLX
+    # memory accounting (it already sits on the plan's fixed side); only a
+    # paged band lives in the page cache outside the cap.
+    paged_band_bytes = (
+        0
+        if getattr(plan, "mmap_islands_wired", True)
+        else getattr(plan, "mmap_island_bytes", 0)
+    )
     mlx_limit = (
         plan.total_limit_bytes
         - plan.runtime_reserve_bytes
         - plan.io_staging_bytes
-        - mmap_island_bytes
+        - paged_band_bytes
     )
     if mlx_limit <= 0:
         raise ExpertStreamingConfigurationError(
             "memory plan leaves no MLX allocation budget"
         )
-    # The mmap island band lives in the page cache, outside MLX accounting.
-    # If MLX's buffer cache may balloon into the band's physical pages the
-    # pager evicts them and every decode wave re-faults from SSD — fail fast
-    # instead. (Measured: 10.85 -> 2.77 tok/s under exactly this squeeze.)
+    # A paged band's pages are the pager's first eviction victims. If MLX's
+    # buffer cache may balloon into them, every decode wave re-faults from
+    # SSD — fail fast instead. (Measured: 10.85 -> 2.77 tok/s under exactly
+    # this squeeze.)
     wired_need = (
         plan.fixed_bytes
         - plan.runtime_reserve_bytes
         - plan.io_staging_bytes
         + plan.persistent_cache_bytes
     )
-    if mmap_island_bytes and mlx_limit < wired_need:
+    if paged_band_bytes and mlx_limit < wired_need:
         raise ExpertStreamingConfigurationError(
-            "MLX budget cannot hold the wired footprint next to the mmap "
-            f"island band: cap {mlx_limit} < wired need {wired_need}; raise "
-            "memory_limit_bytes or shrink the band"
+            "MLX budget cannot hold the wired footprint next to the paged "
+            f"mmap island band: cap {mlx_limit} < wired need {wired_need}; "
+            "raise memory_limit_bytes or shrink the band"
         )
     source = os.environ if env is None else env
     existing = source.get("MTPLX_MEMORY_LIMIT_BYTES")
