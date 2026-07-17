@@ -271,6 +271,50 @@ def test_load_banked_manifest_rejects_tampering(tmp_path) -> None:
         load_banked_manifest(bad_path)
 
 
+def test_write_compressed_banked_roundtrips_byte_exact(tmp_path) -> None:
+    from mtplx.expert_banked import decode_banked_layer_reference
+
+    root, spec, manifest, expected = _sidecar_artifact(tmp_path)
+    layers = tuple(spec.routed_layer_indices)
+    out_bin = tmp_path / "banked-huff" / "experts-banked.bin"
+    out_manifest = tmp_path / "banked-huff" / "experts-banked-manifest.json"
+    banked = write_banked_expert_banks(
+        manifest,
+        root,
+        layers,
+        output_bin=out_bin,
+        output_manifest=out_manifest,
+        codec="huffman-l12-v1",
+    )
+    assert banked.codec == "huffman-l12-v1"
+    assert set(banked.tables) == {"weight", "scales", "biases"}
+    reloaded = load_banked_manifest(out_manifest)
+    assert reloaded.per_lane == banked.per_lane
+    payload = out_bin.read_bytes()
+    reference = next(iter(manifest.records))
+    slices = _component_slices(reference)
+    for entry in reloaded.layers:
+        assert entry.offset % BANKED_ALIGNMENT == 0
+        assert entry.directory_words > 0
+        region = payload[entry.offset : entry.offset + entry.length]
+        assert hashlib.sha256(region).hexdigest() == entry.sha256
+        banks = decode_banked_layer_reference(reloaded, entry.layer, region)
+        for component in entry.components:
+            start, length = slices[component.component]
+            want = b"".join(
+                expected[(entry.layer, expert)][start : start + length]
+                for expert in range(spec.expert_count)
+            )
+            got = banks[component.component].tobytes()
+            assert got == want, f"layer {entry.layer} {component.component}"
+    # Compression must actually shrink the payload region vs raw banks.
+    raw_bytes = sum(
+        c.length for e in reloaded.layers for c in e.components
+    )
+    packed_bytes = sum(e.length for e in reloaded.layers)
+    assert packed_bytes < raw_bytes
+
+
 # ------------------------------------------------------------------ pool
 
 

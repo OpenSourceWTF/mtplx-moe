@@ -27,8 +27,24 @@ from mtplx.expert_manifest import ExpertManifest
 
 BANKED_FORMAT = "mtplx-banked-expert-banks-v1"
 BANKED_ALIGNMENT = 16384
-BANKED_CODECS = ("none", "rans32x-v1")
+BANKED_CODECS = ("none", "huffman-l12-v1", "rans32x-v1")
+BANKED_PER_LANE = 4096
 _DTYPE_ITEM_SIZE = {"U32": 4, "BF16": 2}
+_CLASS_OF_COMPONENT = {
+    "weight": "weight",
+    "scales": "scales",
+    "biases": "biases",
+}
+
+
+def component_class(component: str) -> str:
+    kind = component.rsplit(".", 1)[-1]
+    try:
+        return _CLASS_OF_COMPONENT[kind]
+    except KeyError as exc:
+        raise BankedManifestError(
+            f"component {component!r} has no codec class"
+        ) from exc
 
 
 class BankedManifestError(ValueError):
@@ -42,15 +58,27 @@ class BankedComponent:
     shape: tuple[int, ...]
     offset: int
     length: int
+    lanes: int = 0  # per-expert decode lanes (compressed codecs only)
+
+    @property
+    def segment_length(self) -> int:
+        item = _DTYPE_ITEM_SIZE[self.dtype]
+        elements = 1
+        for value in self.shape:
+            elements *= value
+        return elements * item
 
     def to_json(self) -> dict:
-        return {
+        result = {
             "component": self.component,
             "dtype": self.dtype,
             "shape": list(self.shape),
             "offset": self.offset,
             "length": self.length,
         }
+        if self.lanes:
+            result["lanes"] = self.lanes
+        return result
 
 
 @dataclass(frozen=True)
@@ -60,15 +88,19 @@ class BankedLayer:
     length: int
     sha256: str
     components: tuple[BankedComponent, ...]
+    directory_words: int = 0  # compressed codecs: u32 lane offsets before payload
 
     def to_json(self) -> dict:
-        return {
+        result = {
             "layer": self.layer,
             "offset": self.offset,
             "length": self.length,
             "sha256": self.sha256,
             "components": [component.to_json() for component in self.components],
         }
+        if self.directory_words:
+            result["directory_words"] = self.directory_words
+        return result
 
 
 @dataclass(frozen=True)
@@ -80,6 +112,8 @@ class BankedManifest:
     alignment: int
     expert_count: int
     layers: tuple[BankedLayer, ...]
+    tables: dict | None = None  # codec class -> 256 code lengths
+    per_lane: int = 0
     path: Path | None = field(default=None, compare=False)
 
     def layer_entry(self, layer: int) -> BankedLayer:
@@ -98,7 +132,7 @@ class BankedManifest:
         return self.path.parent / self.file
 
     def to_json(self) -> dict:
-        return {
+        result = {
             "format": self.format,
             "model_key": self.model_key,
             "file": self.file,
@@ -107,6 +141,11 @@ class BankedManifest:
             "expert_count": self.expert_count,
             "layers": [entry.to_json() for entry in self.layers],
         }
+        if self.tables is not None:
+            result["tables"] = self.tables
+        if self.per_lane:
+            result["per_lane"] = self.per_lane
+        return result
 
 
 def _component_order(record) -> tuple:
@@ -131,11 +170,27 @@ def write_banked_expert_banks(
     codec: str = "none",
     verify_record_hashes: bool = True,
 ) -> BankedManifest:
-    """Repack selected layers of the raw sidecar into component-major banks."""
+    """Repack selected layers of the raw sidecar into component-major banks.
 
-    if codec != "none":
+    ``codec="huffman-l12-v1"`` writes each expert segment as independent
+    length-limited-Huffman lane streams (weights raw-byte, BF16 scales and
+    biases group-plane-split first), preceded per layer by a u32 directory
+    of payload-relative lane word offsets. Tables are global per component
+    class across the packed layers (measured: per-layer tables add 0.1%).
+    """
+
+    if codec == "rans32x-v1":
         raise BankedManifestError(
             f"banked codec {codec!r} has no encoder yet; use 'none'"
+        )
+    if codec == "huffman-l12-v1":
+        return _write_compressed_banked_banks(
+            manifest,
+            root,
+            layers,
+            output_bin=Path(output_bin),
+            output_manifest=Path(output_manifest),
+            verify_record_hashes=verify_record_hashes,
         )
     if manifest.sidecar is None:
         raise BankedManifestError("banked repack requires a sidecar manifest")
@@ -260,6 +315,291 @@ def write_banked_expert_banks(
     return banked
 
 
+def _read_layer_segments(
+    manifest: ExpertManifest,
+    sidecar_fd: int,
+    records: dict,
+    layer: int,
+    expert_count: int,
+    *,
+    verify_record_hashes: bool,
+):
+    """Yield (expert, segments, blob-slices) for one layer, hash-verified."""
+
+    for expert in range(expert_count):
+        record = records.get((layer, expert))
+        if record is None:
+            raise BankedManifestError(
+                f"manifest has no record for layer {layer} expert {expert}"
+            )
+        if record.sidecar_offset is None or record.sidecar_length is None:
+            raise BankedManifestError(
+                f"record ({layer}, {expert}) has no sidecar range"
+            )
+        blob = os.pread(sidecar_fd, record.sidecar_length, record.sidecar_offset)
+        if len(blob) != record.sidecar_length:
+            raise BankedManifestError(
+                f"short sidecar read for record ({layer}, {expert})"
+            )
+        if verify_record_hashes:
+            if record.sha256 is None:
+                raise BankedManifestError(
+                    f"record ({layer}, {expert}) has no hash"
+                )
+            if hashlib.sha256(blob).hexdigest() != record.sha256:
+                raise BankedManifestError(
+                    f"record hash mismatch: ({layer}, {expert})"
+                )
+        yield expert, record, blob
+
+
+def _transform_segment(seg_bytes: bytes, dtype: str):
+    import numpy as np
+
+    from mtplx.expert_huffman import plane_split_groups
+
+    data = np.frombuffer(seg_bytes, dtype=np.uint8)
+    if dtype == "BF16":
+        return plane_split_groups(data)
+    return data
+
+
+def _write_compressed_banked_banks(
+    manifest: ExpertManifest,
+    root: Path | str,
+    layers,
+    *,
+    output_bin: Path,
+    output_manifest: Path,
+    verify_record_hashes: bool,
+) -> BankedManifest:
+    import numpy as np
+
+    from mtplx.expert_huffman import build_table, encode_lanes_fast
+
+    if manifest.sidecar is None:
+        raise BankedManifestError("banked repack requires a sidecar manifest")
+    requested = tuple(sorted({int(layer) for layer in layers}))
+    if not requested:
+        raise BankedManifestError("banked repack requires at least one layer")
+    records = {
+        (record.layer, record.expert): record for record in manifest.records
+    }
+    expert_count = 1 + max(record.expert for record in manifest.records)
+    sidecar_path = Path(root).resolve() / manifest.sidecar.file
+    output_bin.parent.mkdir(parents=True, exist_ok=True)
+
+    # Pass 1: global per-class byte histograms over the transformed data.
+    hists = {
+        "weight": np.zeros(256, dtype=np.int64),
+        "scales": np.zeros(256, dtype=np.int64),
+        "biases": np.zeros(256, dtype=np.int64),
+    }
+    fd = os.open(sidecar_path, os.O_RDONLY)
+    try:
+        for layer in requested:
+            for _expert, record, blob in _read_layer_segments(
+                manifest, fd, records, layer, expert_count,
+                verify_record_hashes=verify_record_hashes,
+            ):
+                cursor = 0
+                for segment in record.segments:
+                    kind = component_class(segment.component)
+                    transformed = _transform_segment(
+                        blob[cursor : cursor + segment.length], segment.dtype
+                    )
+                    hists[kind] += np.bincount(transformed, minlength=256)
+                    cursor += segment.length
+        tables = {
+            kind: build_table(hist, max_bits=12)
+            for kind, hist in hists.items()
+        }
+
+        # Pass 2: encode per (layer, expert, component) and write regions.
+        entries: list[BankedLayer] = []
+        with output_bin.open("wb") as out:
+            cursor = 0
+            for layer in requested:
+                per_expert_streams: list[list] = []
+                segments_ref = None
+                for _expert, record, blob in _read_layer_segments(
+                    manifest, fd, records, layer, expert_count,
+                    verify_record_hashes=False,
+                ):
+                    segments_ref = record.segments
+                    seg_streams = []
+                    seg_cursor = 0
+                    for segment in record.segments:
+                        kind = component_class(segment.component)
+                        transformed = _transform_segment(
+                            blob[seg_cursor : seg_cursor + segment.length],
+                            segment.dtype,
+                        )
+                        lane_bytes = min(BANKED_PER_LANE, segment.length)
+                        if segment.length % lane_bytes:
+                            raise BankedManifestError(
+                                f"segment {segment.component} length "
+                                f"{segment.length} is not lane-divisible"
+                            )
+                        seg_streams.append(
+                            encode_lanes_fast(
+                                transformed,
+                                tables[kind],
+                                per_lane=lane_bytes,
+                            )
+                        )
+                        seg_cursor += segment.length
+                    per_expert_streams.append(seg_streams)
+                assert segments_ref is not None
+
+                directory: list[np.ndarray] = []
+                payload: list[np.ndarray] = []
+                payload_words = 0
+                for seg_streams in per_expert_streams:
+                    for stream in seg_streams:
+                        directory.append(
+                            stream.word_offsets.astype(np.uint32)
+                            + np.uint32(payload_words)
+                        )
+                        payload.append(stream.words)
+                        payload_words += stream.words.size
+                directory_arr = np.concatenate(directory).astype(np.uint32)
+                region = (
+                    directory_arr.tobytes()
+                    + b"".join(w.tobytes() for w in payload)
+                )
+                components = []
+                raw_cursor = 0
+                for index, segment in enumerate(segments_ref):
+                    lane_bytes = min(BANKED_PER_LANE, segment.length)
+                    components.append(
+                        BankedComponent(
+                            component=segment.component,
+                            dtype=segment.dtype,
+                            shape=tuple(segment.shape),
+                            offset=raw_cursor,
+                            length=expert_count * segment.length,
+                            lanes=segment.length // lane_bytes,
+                        )
+                    )
+                    raw_cursor += expert_count * segment.length
+                entries.append(
+                    BankedLayer(
+                        layer=layer,
+                        offset=cursor,
+                        length=len(region),
+                        sha256=hashlib.sha256(region).hexdigest(),
+                        components=tuple(components),
+                        directory_words=directory_arr.size,
+                    )
+                )
+                out.write(region)
+                cursor += len(region)
+                padding = -cursor % BANKED_ALIGNMENT
+                if padding:
+                    out.write(b"\x00" * padding)
+                    cursor += padding
+    finally:
+        os.close(fd)
+
+    banked = BankedManifest(
+        format=BANKED_FORMAT,
+        model_key=manifest.model_key,
+        file=output_bin.name,
+        codec="huffman-l12-v1",
+        alignment=BANKED_ALIGNMENT,
+        expert_count=expert_count,
+        layers=tuple(entries),
+        tables={
+            kind: table.lengths.astype(int).tolist()
+            for kind, table in tables.items()
+        },
+        per_lane=BANKED_PER_LANE,
+        path=output_manifest,
+    )
+    output_manifest.write_text(json.dumps(banked.to_json(), indent=1))
+    return banked
+
+
+def decode_banked_layer_reference(
+    banked: BankedManifest,
+    layer: int,
+    region: bytes,
+) -> dict[str, "np.ndarray"]:
+    """Pure-numpy reference decode of one compressed layer region (tests)."""
+
+    import numpy as np
+
+    from mtplx.expert_huffman import (
+        HuffmanTable,
+        _canonical_codes,
+        plane_unsplit_groups,
+    )
+
+    if banked.codec != "huffman-l12-v1":
+        raise BankedManifestError("reference decode requires the huffman codec")
+    entry = banked.layer_entry(layer)
+    directory = np.frombuffer(
+        region[: entry.directory_words * 4], dtype=np.uint32
+    )
+    payload = np.frombuffer(
+        region[entry.directory_words * 4 :], dtype=np.uint32
+    )
+    tables = {}
+    luts = {}
+    for kind, lengths_list in (banked.tables or {}).items():
+        lengths = np.asarray(lengths_list, dtype=np.uint8)
+        table = HuffmanTable(
+            lengths=lengths, codes=_canonical_codes(lengths), max_bits=12
+        )
+        lut_sym = np.zeros(1 << 12, dtype=np.uint8)
+        lut_len = np.zeros(1 << 12, dtype=np.uint8)
+        for sym in range(256):
+            length = int(lengths[sym])
+            base = int(table.codes[sym]) << (12 - length)
+            span = 1 << (12 - length)
+            lut_sym[base : base + span] = sym
+            lut_len[base : base + span] = length
+        tables[kind] = table
+        luts[kind] = (lut_sym, lut_len)
+
+    raw_bytes = payload.byteswap().tobytes()
+    banks: dict[str, np.ndarray] = {
+        c.component: np.zeros(c.length, dtype=np.uint8)
+        for c in entry.components
+    }
+    dir_cursor = 0
+    for expert in range(banked.expert_count):
+        for component in entry.components:
+            seg_len = component.segment_length
+            lanes = component.lanes
+            lane_bytes = seg_len // lanes
+            lut_sym, lut_len = luts[component_class(component.component)]
+            decoded = np.zeros(seg_len, dtype=np.uint8)
+            for lane in range(lanes):
+                word_off = int(directory[dir_cursor + lane])
+                byte_base = word_off * 4
+                bitpos = 0
+                for i in range(lane_bytes):
+                    b0 = byte_base + (bitpos >> 3)
+                    window = (
+                        (raw_bytes[b0] << 24)
+                        | (raw_bytes[b0 + 1] << 16)
+                        | (raw_bytes[b0 + 2] << 8)
+                        | raw_bytes[b0 + 3]
+                    )
+                    peek = (window >> (32 - (bitpos & 7) - 12)) & 0xFFF
+                    decoded[lane * lane_bytes + i] = lut_sym[peek]
+                    bitpos += int(lut_len[peek])
+            dir_cursor += lanes
+            if component.dtype == "BF16":
+                decoded = plane_unsplit_groups(decoded)
+            banks[component.component][
+                expert * seg_len : (expert + 1) * seg_len
+            ] = decoded
+    return banks
+
+
 def load_banked_manifest(path: Path | str) -> BankedManifest:
     path = Path(path)
     try:
@@ -284,6 +624,29 @@ def load_banked_manifest(path: Path | str) -> BankedManifest:
     layers_obj = obj.get("layers")
     if not isinstance(layers_obj, list) or not layers_obj:
         raise BankedManifestError("banked manifest lists no layers")
+    compressed = codec == "huffman-l12-v1"
+    tables = obj.get("tables")
+    per_lane = obj.get("per_lane", 0)
+    if compressed:
+        if not isinstance(tables, dict) or set(tables) != {
+            "weight",
+            "scales",
+            "biases",
+        }:
+            raise BankedManifestError(
+                "compressed banked manifest requires weight/scales/biases tables"
+            )
+        for kind, lengths in tables.items():
+            if len(lengths) != 256 or not all(
+                isinstance(v, int) and 1 <= v <= 12 for v in lengths
+            ):
+                raise BankedManifestError(
+                    f"banked codec table {kind!r} must be 256 lengths in 1..12"
+                )
+        if not isinstance(per_lane, int) or per_lane <= 0:
+            raise BankedManifestError(
+                "compressed banked manifest requires a positive per_lane"
+            )
     layers: list[BankedLayer] = []
     for layer_obj in layers_obj:
         components: list[BankedComponent] = []
@@ -303,7 +666,7 @@ def load_banked_manifest(path: Path | str) -> BankedManifest:
             elements = expert_count
             for value in shape:
                 elements *= value
-            if codec == "none" and length != elements * item_size:
+            if codec != "rans32x-v1" and length != elements * item_size:
                 raise BankedManifestError(
                     f"banked component {comp_obj.get('component')!r} length "
                     f"{length} does not match shape {shape} x {expert_count}"
@@ -313,6 +676,14 @@ def load_banked_manifest(path: Path | str) -> BankedManifest:
                     f"banked component {comp_obj.get('component')!r} offset "
                     f"{offset} is not densely packed"
                 )
+            lanes = int(comp_obj.get("lanes", 0))
+            if compressed:
+                seg_len = length // expert_count
+                if lanes <= 0 or seg_len % lanes:
+                    raise BankedManifestError(
+                        f"banked component {comp_obj.get('component')!r} lane "
+                        f"count {lanes} does not divide its segment"
+                    )
             cursor += length
             components.append(
                 BankedComponent(
@@ -321,12 +692,32 @@ def load_banked_manifest(path: Path | str) -> BankedManifest:
                     shape=shape,
                     offset=offset,
                     length=length,
+                    lanes=lanes,
                 )
             )
         if not components:
             raise BankedManifestError("banked layer lists no components")
         entry_length = layer_obj.get("length")
-        if entry_length != cursor:
+        directory_words = int(layer_obj.get("directory_words", 0))
+        if compressed:
+            if directory_words <= 0:
+                raise BankedManifestError(
+                    f"banked layer {layer_obj.get('layer')} lists no directory"
+                )
+            if not isinstance(entry_length, int) or entry_length <= (
+                directory_words * 4
+            ):
+                raise BankedManifestError(
+                    f"banked layer {layer_obj.get('layer')} region is smaller "
+                    "than its directory"
+                )
+            expected_dir = sum(c.lanes for c in components) * expert_count
+            if directory_words != expected_dir:
+                raise BankedManifestError(
+                    f"banked layer {layer_obj.get('layer')} directory has "
+                    f"{directory_words} words; lanes require {expected_dir}"
+                )
+        elif entry_length != cursor:
             raise BankedManifestError(
                 f"banked layer {layer_obj.get('layer')} length {entry_length} "
                 f"does not cover its components ({cursor})"
@@ -343,6 +734,7 @@ def load_banked_manifest(path: Path | str) -> BankedManifest:
                 length=int(entry_length),
                 sha256=str(layer_obj.get("sha256")),
                 components=tuple(components),
+                directory_words=directory_words,
             )
         )
     return BankedManifest(
@@ -353,5 +745,7 @@ def load_banked_manifest(path: Path | str) -> BankedManifest:
         alignment=alignment,
         expert_count=expert_count,
         layers=tuple(layers),
+        tables=tables if compressed else None,
+        per_lane=int(per_lane) if compressed else 0,
         path=path,
     )
