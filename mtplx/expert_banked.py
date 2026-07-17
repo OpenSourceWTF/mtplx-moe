@@ -169,7 +169,6 @@ def write_banked_expert_banks(
     output_manifest: Path | str,
     codec: str = "none",
     verify_record_hashes: bool = True,
-    workers: int = 1,
 ) -> BankedManifest:
     """Repack selected layers of the raw sidecar into component-major banks.
 
@@ -192,7 +191,6 @@ def write_banked_expert_banks(
             output_bin=Path(output_bin),
             output_manifest=Path(output_manifest),
             verify_record_hashes=verify_record_hashes,
-            workers=workers,
         )
     if manifest.sidecar is None:
         raise BankedManifestError("banked repack requires a sidecar manifest")
@@ -366,119 +364,6 @@ def _transform_segment(seg_bytes: bytes, dtype: str):
     return data
 
 
-def _layer_class_histograms(args) -> dict:
-    """Worker: per-class byte histograms of one layer's transformed data."""
-
-    import numpy as np
-
-    sidecar_path, layer, layer_records, verify = args
-    hists = {
-        "weight": np.zeros(256, dtype=np.int64),
-        "scales": np.zeros(256, dtype=np.int64),
-        "biases": np.zeros(256, dtype=np.int64),
-    }
-    fd = os.open(sidecar_path, os.O_RDONLY)
-    try:
-        for record in layer_records:
-            blob = os.pread(fd, record.sidecar_length, record.sidecar_offset)
-            if len(blob) != record.sidecar_length:
-                raise BankedManifestError(
-                    f"short sidecar read for record ({layer}, {record.expert})"
-                )
-            if verify:
-                if record.sha256 is None or (
-                    hashlib.sha256(blob).hexdigest() != record.sha256
-                ):
-                    raise BankedManifestError(
-                        f"record hash mismatch: ({layer}, {record.expert})"
-                    )
-            cursor = 0
-            for segment in record.segments:
-                kind = component_class(segment.component)
-                transformed = _transform_segment(
-                    blob[cursor : cursor + segment.length], segment.dtype
-                )
-                hists[kind] += np.bincount(transformed, minlength=256)
-                cursor += segment.length
-    finally:
-        os.close(fd)
-    return hists
-
-
-def _encode_layer_worker(args) -> tuple:
-    """Worker: encode one layer's region to a temp file; return metadata."""
-
-    import numpy as np
-
-    from mtplx.expert_huffman import HuffmanTable, _canonical_codes, encode_lanes_fast
-
-    (
-        sidecar_path,
-        layer,
-        layer_records,
-        table_lengths,
-        tmp_path,
-    ) = args
-    tables = {}
-    for kind, lengths_list in table_lengths.items():
-        lengths = np.asarray(lengths_list, dtype=np.uint8)
-        tables[kind] = HuffmanTable(
-            lengths=lengths, codes=_canonical_codes(lengths), max_bits=12
-        )
-    directory: list[np.ndarray] = []
-    payload: list[np.ndarray] = []
-    payload_words = 0
-    segments_ref = None
-    fd = os.open(sidecar_path, os.O_RDONLY)
-    try:
-        for record in layer_records:
-            blob = os.pread(fd, record.sidecar_length, record.sidecar_offset)
-            segments_ref = record.segments
-            seg_cursor = 0
-            for segment in record.segments:
-                kind = component_class(segment.component)
-                transformed = _transform_segment(
-                    blob[seg_cursor : seg_cursor + segment.length],
-                    segment.dtype,
-                )
-                lane_bytes = min(BANKED_PER_LANE, segment.length)
-                if segment.length % lane_bytes:
-                    raise BankedManifestError(
-                        f"segment {segment.component} length "
-                        f"{segment.length} is not lane-divisible"
-                    )
-                stream = encode_lanes_fast(
-                    transformed, tables[kind], per_lane=lane_bytes
-                )
-                directory.append(
-                    stream.word_offsets.astype(np.uint32)
-                    + np.uint32(payload_words)
-                )
-                payload.append(stream.words)
-                payload_words += stream.words.size
-                seg_cursor += segment.length
-    finally:
-        os.close(fd)
-    assert segments_ref is not None
-    directory_arr = np.concatenate(directory).astype(np.uint32)
-    dir_bytes = directory_arr.tobytes()
-    dir_pad = -len(dir_bytes) % BANKED_ALIGNMENT
-    digest = hashlib.sha256()
-    with open(tmp_path, "wb") as out:
-        for chunk in (dir_bytes, b"\x00" * dir_pad):
-            digest.update(chunk)
-            out.write(chunk)
-        for words in payload:
-            chunk = words.tobytes()
-            digest.update(chunk)
-            out.write(chunk)
-    length = len(dir_bytes) + dir_pad + payload_words * 4
-    seg_meta = tuple(
-        (s.component, s.dtype, tuple(s.shape), s.length) for s in segments_ref
-    )
-    return layer, length, digest.hexdigest(), directory_arr.size, seg_meta
-
-
 def _write_compressed_banked_banks(
     manifest: ExpertManifest,
     root: Path | str,
@@ -487,7 +372,6 @@ def _write_compressed_banked_banks(
     output_bin: Path,
     output_manifest: Path,
     verify_record_hashes: bool,
-    workers: int = 1,
 ) -> BankedManifest:
     import numpy as np
 
@@ -505,111 +389,124 @@ def _write_compressed_banked_banks(
     sidecar_path = Path(root).resolve() / manifest.sidecar.file
     output_bin.parent.mkdir(parents=True, exist_ok=True)
 
-    layer_records = {}
-    for layer in requested:
-        rows = []
-        for expert in range(expert_count):
-            record = records.get((layer, expert))
-            if record is None:
-                raise BankedManifestError(
-                    f"manifest has no record for layer {layer} expert {expert}"
-                )
-            if record.sidecar_offset is None or record.sidecar_length is None:
-                raise BankedManifestError(
-                    f"record ({layer}, {expert}) has no sidecar range"
-                )
-            rows.append(record)
-        layer_records[layer] = tuple(rows)
-
-    workers = max(1, int(workers))
-    hist_args = [
-        (str(sidecar_path), layer, layer_records[layer], verify_record_hashes)
-        for layer in requested
-    ]
-    if workers > 1:
-        import multiprocessing
-
-        with multiprocessing.get_context("spawn").Pool(workers) as pool:
-            partials = pool.map(_layer_class_histograms, hist_args)
-    else:
-        partials = [_layer_class_histograms(args) for args in hist_args]
+    # Pass 1: global per-class byte histograms over the transformed data.
     hists = {
-        kind: sum((p[kind] for p in partials), np.zeros(256, dtype=np.int64))
-        for kind in ("weight", "scales", "biases")
+        "weight": np.zeros(256, dtype=np.int64),
+        "scales": np.zeros(256, dtype=np.int64),
+        "biases": np.zeros(256, dtype=np.int64),
     }
-    tables = {
-        kind: build_table(hist, max_bits=12) for kind, hist in hists.items()
-    }
-    table_lengths = {
-        kind: table.lengths.astype(int).tolist()
-        for kind, table in tables.items()
-    }
-
-    tmp_dir = output_bin.parent / (output_bin.name + ".layers")
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    encode_args = [
-        (
-            str(sidecar_path),
-            layer,
-            layer_records[layer],
-            table_lengths,
-            str(tmp_dir / f"layer-{layer}.region"),
-        )
-        for layer in requested
-    ]
-    if workers > 1:
-        import multiprocessing
-
-        with multiprocessing.get_context("spawn").Pool(workers) as pool:
-            results = pool.map(_encode_layer_worker, encode_args)
-    else:
-        results = [_encode_layer_worker(args) for args in encode_args]
-    by_layer = {r[0]: r for r in results}
-
-    entries: list[BankedLayer] = []
-    with output_bin.open("wb") as out:
-        cursor = 0
+    fd = os.open(sidecar_path, os.O_RDONLY)
+    try:
         for layer in requested:
-            _layer, length, sha, directory_words, seg_meta = by_layer[layer]
-            components = []
-            raw_cursor = 0
-            for component, dtype, shape, seg_length in seg_meta:
-                lane_bytes = min(BANKED_PER_LANE, seg_length)
-                components.append(
-                    BankedComponent(
-                        component=component,
-                        dtype=dtype,
-                        shape=tuple(shape),
-                        offset=raw_cursor,
-                        length=expert_count * seg_length,
-                        lanes=seg_length // lane_bytes,
+            for _expert, record, blob in _read_layer_segments(
+                manifest, fd, records, layer, expert_count,
+                verify_record_hashes=verify_record_hashes,
+            ):
+                cursor = 0
+                for segment in record.segments:
+                    kind = component_class(segment.component)
+                    transformed = _transform_segment(
+                        blob[cursor : cursor + segment.length], segment.dtype
+                    )
+                    hists[kind] += np.bincount(transformed, minlength=256)
+                    cursor += segment.length
+        tables = {
+            kind: build_table(hist, max_bits=12)
+            for kind, hist in hists.items()
+        }
+
+        # Pass 2: encode per (layer, expert, component) and write regions.
+        entries: list[BankedLayer] = []
+        with output_bin.open("wb") as out:
+            cursor = 0
+            for layer in requested:
+                per_expert_streams: list[list] = []
+                segments_ref = None
+                for _expert, record, blob in _read_layer_segments(
+                    manifest, fd, records, layer, expert_count,
+                    verify_record_hashes=False,
+                ):
+                    segments_ref = record.segments
+                    seg_streams = []
+                    seg_cursor = 0
+                    for segment in record.segments:
+                        kind = component_class(segment.component)
+                        transformed = _transform_segment(
+                            blob[seg_cursor : seg_cursor + segment.length],
+                            segment.dtype,
+                        )
+                        lane_bytes = min(BANKED_PER_LANE, segment.length)
+                        if segment.length % lane_bytes:
+                            raise BankedManifestError(
+                                f"segment {segment.component} length "
+                                f"{segment.length} is not lane-divisible"
+                            )
+                        seg_streams.append(
+                            encode_lanes_fast(
+                                transformed,
+                                tables[kind],
+                                per_lane=lane_bytes,
+                            )
+                        )
+                        seg_cursor += segment.length
+                    per_expert_streams.append(seg_streams)
+                assert segments_ref is not None
+
+                directory: list[np.ndarray] = []
+                payload: list[np.ndarray] = []
+                payload_words = 0
+                for seg_streams in per_expert_streams:
+                    for stream in seg_streams:
+                        directory.append(
+                            stream.word_offsets.astype(np.uint32)
+                            + np.uint32(payload_words)
+                        )
+                        payload.append(stream.words)
+                        payload_words += stream.words.size
+                directory_arr = np.concatenate(directory).astype(np.uint32)
+                dir_bytes = directory_arr.tobytes()
+                # Pad the directory block to the mapping alignment so the
+                # payload starts on its own page-aligned extent (directory
+                # and payload map as separate clean regions).
+                dir_pad = -len(dir_bytes) % BANKED_ALIGNMENT
+                region = (
+                    dir_bytes
+                    + b"\x00" * dir_pad
+                    + b"".join(w.tobytes() for w in payload)
+                )
+                components = []
+                raw_cursor = 0
+                for index, segment in enumerate(segments_ref):
+                    lane_bytes = min(BANKED_PER_LANE, segment.length)
+                    components.append(
+                        BankedComponent(
+                            component=segment.component,
+                            dtype=segment.dtype,
+                            shape=tuple(segment.shape),
+                            offset=raw_cursor,
+                            length=expert_count * segment.length,
+                            lanes=segment.length // lane_bytes,
+                        )
+                    )
+                    raw_cursor += expert_count * segment.length
+                entries.append(
+                    BankedLayer(
+                        layer=layer,
+                        offset=cursor,
+                        length=len(region),
+                        sha256=hashlib.sha256(region).hexdigest(),
+                        components=tuple(components),
+                        directory_words=directory_arr.size,
                     )
                 )
-                raw_cursor += expert_count * seg_length
-            entries.append(
-                BankedLayer(
-                    layer=layer,
-                    offset=cursor,
-                    length=length,
-                    sha256=sha,
-                    components=tuple(components),
-                    directory_words=directory_words,
-                )
-            )
-            region_path = tmp_dir / f"layer-{layer}.region"
-            with region_path.open("rb") as src:
-                while True:
-                    chunk = src.read(64 << 20)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-            region_path.unlink()
-            cursor += length
-            padding = -cursor % BANKED_ALIGNMENT
-            if padding:
-                out.write(b"\x00" * padding)
-                cursor += padding
-    tmp_dir.rmdir()
+                out.write(region)
+                cursor += len(region)
+                padding = -cursor % BANKED_ALIGNMENT
+                if padding:
+                    out.write(b"\x00" * padding)
+                    cursor += padding
+    finally:
+        os.close(fd)
 
     banked = BankedManifest(
         format=BANKED_FORMAT,

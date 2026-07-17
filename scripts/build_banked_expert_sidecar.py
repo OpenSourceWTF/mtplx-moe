@@ -63,12 +63,7 @@ def main() -> int:
             "(default: <model-root>/experts-banked-manifest.json)"
         ),
     )
-    parser.add_argument(
-        "--codec",
-        default="none",
-        choices=["none", "huffman-l12-v1", "rans32x-v1"],
-    )
-    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--codec", default="none", choices=["none", "rans32x-v1"])
     parser.add_argument(
         "--no-verify-record-hashes",
         action="store_true",
@@ -98,7 +93,6 @@ def main() -> int:
         output_manifest=output_manifest,
         codec=args.codec,
         verify_record_hashes=not args.no_verify_record_hashes,
-        workers=args.workers,
     )
     elapsed = time.perf_counter() - started
     total = sum(entry.length for entry in banked.layers)
