@@ -584,6 +584,55 @@ class DenseIslandSwitchGLU(nn.Module):
         self.bits = runtime.spec.quant_bits
         self._bank = store.bank_for_layer(self.layer_index)
 
+    def wave_call(
+        self,
+        x: mx.array,
+        indices: mx.array,
+        scores: mx.array,
+    ) -> mx.array | None:
+        """Fused K3 expert wave over the island bank (issue #65).
+
+        Owns the routing multiply and reduction in the wave kernel's BF16
+        combine mode, which bitwise-matches the block's external combine.
+        Returns None for any shape the fixed-M4 wave does not cover; the
+        caller then runs the classic dispatch unchanged.
+        """
+
+        from mtplx.hy3_expert_wave_m4 import (
+            HY3_M4_BATCH,
+            HY3_M4_HIDDEN_SIZE,
+            HY3_M4_ROWS,
+            HY3_M4_TOP_K,
+            Hy3M4ExpertWaveIneligible,
+            hy3_q2_m4_expert_wave,
+        )
+
+        shape = tuple(int(dim) for dim in x.shape)
+        if shape != (HY3_M4_BATCH, HY3_M4_ROWS, HY3_M4_HIDDEN_SIZE):
+            return None
+        if tuple(int(dim) for dim in indices.shape) != (
+            HY3_M4_BATCH,
+            HY3_M4_ROWS,
+            HY3_M4_TOP_K,
+        ):
+            return None
+        phase = current_expert_routing_phase(token_count=int(x.shape[-2]))
+        try:
+            output = hy3_q2_m4_expert_wave(
+                x,
+                indices.astype(mx.int32),
+                scores,
+                self._bank.arrays,
+                validated_slot_bounds=(0, self.runtime.spec.expert_count - 1),
+                combine_mode="bf16",
+            )
+        except Hy3M4ExpertWaveIneligible:
+            return None
+        _route_probe.count(
+            f"hot.island.wave.{phase.name.lower()}.layer{self.layer_index:02d}"
+        )
+        return output.hidden_rows
+
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         if indices.ndim < 1:
             raise ValueError("expert indices must include a top-k dimension")

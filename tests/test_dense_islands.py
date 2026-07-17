@@ -557,3 +557,80 @@ def test_island_layer_count_survives_benchmark_option_pipeline() -> None:
     config = bench._runtime_config(apis, "hy3-expert-q2", options)
     assert config.island_layer_count == 40
     assert len(config.island_layers) == 40
+
+
+def test_island_wave_call_matches_external_combine(mlx) -> None:
+    """The fused K3 wave must be bitwise-identical to the classic island
+    dispatch followed by the block's BF16 combine, at real Hy3 shapes."""
+
+    import mlx.core as mx
+    import numpy as np
+
+    from types import SimpleNamespace
+
+    from mtplx.models.expert_mlx import DenseIslandSwitchGLU
+
+    hidden, expert_hidden, group = 4096, 1536, 64
+    capacity, rows, top_k = 16, 4, 8
+    rng = np.random.default_rng(65)
+
+    def quantized(shape_out, shape_in):
+        weight = mx.array(
+            rng.integers(0, 2**32, size=(capacity, shape_out, shape_in // 16),
+                         dtype=np.uint64).astype(np.uint32)
+        )
+        scales = mx.array(
+            (rng.standard_normal((capacity, shape_out, shape_in // group)) * 0.01)
+            .astype(np.float32)
+        ).astype(mx.bfloat16)
+        biases = mx.array(
+            (rng.standard_normal((capacity, shape_out, shape_in // group)) * 0.01)
+            .astype(np.float32)
+        ).astype(mx.bfloat16)
+        return weight, scales, biases
+
+    arrays = {}
+    for projection, (o, i) in (
+        ("gate_proj", (expert_hidden, hidden)),
+        ("up_proj", (expert_hidden, hidden)),
+        ("down_proj", (hidden, expert_hidden)),
+    ):
+        w, s, b = quantized(o, i)
+        arrays[f"{projection}.weight"] = w
+        arrays[f"{projection}.scales"] = s
+        arrays[f"{projection}.biases"] = b
+    mx.eval(*arrays.values())
+
+    spec = SimpleNamespace(
+        top_k=top_k, hidden_size=hidden, quant_group_size=group,
+        quant_bits=2, expert_count=capacity,
+    )
+    switch = DenseIslandSwitchGLU.__new__(DenseIslandSwitchGLU)
+    switch.runtime = SimpleNamespace(spec=spec)
+    switch.layer_index = 1
+    switch.group_size = group
+    switch.bits = 2
+    switch._bank = SimpleNamespace(arrays=arrays, capacity=capacity)
+
+    mx.random.seed(65)
+    x = mx.random.normal((1, rows, hidden)).astype(mx.bfloat16)
+    indices = mx.array(
+        rng.integers(0, capacity, size=(1, rows, top_k)).astype(np.uint32)
+    )
+    scores = mx.softmax(
+        mx.random.normal((1, rows, top_k)), axis=-1
+    ).astype(mx.bfloat16)
+
+    fused = switch.wave_call(x, indices, scores)
+    assert fused is not None, "wave declined an eligible K3 shape"
+
+    routed = switch(x, indices)
+    classic = (routed * scores[..., None]).sum(axis=-2)
+    assert fused.shape == classic.shape
+    assert mx.array_equal(fused, classic).item(), "wave combine diverged"
+
+    # Ineligible shapes must decline, never raise.
+    x1 = mx.random.normal((1, 1, hidden)).astype(mx.bfloat16)
+    i1 = mx.array(rng.integers(0, capacity, size=(1, 1, top_k)).astype(np.uint32))
+    s1 = mx.softmax(mx.random.normal((1, 1, top_k)), axis=-1).astype(mx.bfloat16)
+    assert switch.wave_call(x1, i1, s1) is None

@@ -713,6 +713,15 @@ class SparseMLP(nn.Module):
         # target logits even though the selected experts are identical.
         if not self.enable_moe_fp32_combine:
             scores = scores.astype(x.dtype)
+            # Issue #65: dense-bank switches expose a fused expert wave that
+            # owns the routing multiply and reduction (bitwise-identical BF16
+            # combine). It declines ineligible shapes by returning None, and
+            # the classic path below remains the only other execution.
+            wave_call = getattr(self.switch_mlp, "wave_call", None)
+            if wave_call is not None:
+                combined = wave_call(x, indices, scores)
+                if combined is not None:
+                    return combined.astype(x.dtype) + self.shared_mlp(x)
         routed, shared = run_switch_with_shared_overlap(
             self.switch_mlp,
             x,
