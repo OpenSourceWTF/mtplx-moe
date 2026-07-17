@@ -25,6 +25,11 @@ from mtplx.expert_shadow import (
     encode_shadow,
     shadow_record_bytes,
 )
+from mtplx.expert_streaming_models import (
+    GLM52_EXPERT_Q2,
+    get_model_spec,
+    plan_expert_memory,
+)
 
 
 @pytest.mark.parametrize("codec", ("b1", "t158"))
@@ -95,3 +100,45 @@ def test_convert_selection_bounds_and_corruption_detection(tmp_path: Path) -> No
     bin_path.write_bytes(bytes(payload))
     with pytest.raises(Q1ManifestError, match="hash mismatch"):
         read_q1_record(written, written.records[0])
+
+
+# ---------------------------------------------------------------------------
+# q1 registry entries
+
+
+@pytest.mark.parametrize(
+    ("key", "codec"),
+    (("glm52-expert-q1t", "t158"), ("glm52-expert-q1b1", "b1")),
+)
+def test_q1_spec_entries_price_shadow_records(key: str, codec: str) -> None:
+    spec = get_model_spec(key)
+    assert spec.expert_codec == codec
+    assert spec.expert_record_bytes == shadow_record_bytes(
+        codec, spec.expert_source_parameters
+    )
+    # Same checkpoint: only the routed record bytes differ from Q2.
+    assert spec.resident_bytes == GLM52_EXPERT_Q2.resident_bytes
+    assert spec.expert_record_bytes < GLM52_EXPERT_Q2.expert_record_bytes
+    assert spec.island_pin_order == GLM52_EXPERT_Q2.island_pin_order
+    plan = plan_expert_memory(
+        spec,
+        total_limit_bytes=96 * 1024**3,
+        context_tokens=4096,
+        runtime_reserve_bytes=12 * 1024**3,
+    )
+    baseline = plan_expert_memory(
+        GLM52_EXPERT_Q2,
+        total_limit_bytes=96 * 1024**3,
+        context_tokens=4096,
+        runtime_reserve_bytes=12 * 1024**3,
+    )
+    # Smaller records => the same knob holds strictly more experts.
+    assert plan.fits_fixed
+    assert plan.slots_per_layer > baseline.slots_per_layer
+
+
+def test_expert_codec_field_is_validated() -> None:
+    from dataclasses import replace
+
+    with pytest.raises(ValueError, match="expert_codec"):
+        replace(GLM52_EXPERT_Q2, expert_codec="q9")
