@@ -446,7 +446,7 @@ def test_runtime_open_rejects_uncovered_mmap_layer(tmp_path) -> None:
         )
 
 
-def test_plan_override_charges_explicit_band_bytes() -> None:
+def test_plan_override_charges_true_band_bytes() -> None:
     spec = _two_layer_spec()
     raw = plan_expert_memory(spec, mmap_island_layer_count=1, **_plan_kwargs())
     override = 777
@@ -460,7 +460,7 @@ def test_plan_override_charges_explicit_band_bytes() -> None:
     assert plan.fixed_bytes == raw.fixed_bytes - raw.mmap_island_bytes + override
 
 
-def test_runtime_open_enforces_explicit_band_budget(tmp_path) -> None:
+def test_runtime_open_charges_compressed_band_true_bytes(tmp_path) -> None:
     root, spec, manifest, _expected = _sidecar_artifact(tmp_path)
     from mtplx.expert_manifest import save_expert_manifest
 
@@ -477,35 +477,10 @@ def test_runtime_open_enforces_explicit_band_budget(tmp_path) -> None:
         output_manifest=out_manifest,
         codec="huffman-l12-v1",
     )
-    actual = banked.layer_entry(banked_layer).length
-    # Missing budget: config construction fails loudly.
-    with pytest.raises(ValueError, match="banked_band_bytes"):
-        _config(
-            mmap_island_layers=(banked_layer,),
-            banked_manifest=str(out_manifest),
-            banked_codec="huffman-l12-v1",
-            verify_artifact_headers=False,
-        )
-    # Budget below reality: open() fails loudly with both numbers.
-    starved = _config(
-        mmap_island_layers=(banked_layer,),
-        banked_manifest=str(out_manifest),
-        banked_codec="huffman-l12-v1",
-        banked_band_bytes=actual - 1,
-        verify_artifact_headers=False,
-    )
-    with pytest.raises(
-        ExpertStreamingConfigurationError, match="budgets only"
-    ):
-        ExpertStreamingRuntime.open(
-            root, manifest_path, starved, spec=spec, apply_memory_cap=False
-        )
-    # Explicit budget covering reality: the plan charges exactly the budget.
     config = _config(
         mmap_island_layers=(banked_layer,),
         banked_manifest=str(out_manifest),
         banked_codec="huffman-l12-v1",
-        banked_band_bytes=actual,
         verify_artifact_headers=False,
     )
     runtime = ExpertStreamingRuntime.open(
@@ -516,7 +491,8 @@ def test_runtime_open_enforces_explicit_band_budget(tmp_path) -> None:
         apply_memory_cap=False,
     )
     try:
-        assert runtime.plan.mmap_island_bytes == actual
+        expected_bytes = banked.layer_entry(banked_layer).length
+        assert runtime.plan.mmap_island_bytes == expected_bytes
     finally:
         runtime.close()
 

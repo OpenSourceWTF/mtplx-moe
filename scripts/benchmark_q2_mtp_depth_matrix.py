@@ -77,7 +77,6 @@ DEFAULT_RUNTIME_OPTIONS = {
     "mmap_island_layers": "",
     "banked_manifest": "",
     "banked_codec": "none",
-    "banked_band_bytes": "",
     "mmap_island_residency": "wired",
     "read_chunk": "8MiB",
     "bypass_page_cache": True,
@@ -463,15 +462,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--banked-band-bytes",
-        default="",
-        help=(
-            "Explicit memory budget for a compressed banked band (e.g. "
-            "'35GiB'). Required with --banked-codec huffman-l12-v1; size it "
-            "with scripts/memory_calc.py."
-        ),
-    )
-    parser.add_argument(
         "--mmap-island-residency",
         default="wired",
         choices=["wired", "paged", "copy"],
@@ -560,7 +550,6 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "mmap_island_layers": args.mmap_island_layers,
         "banked_manifest": args.banked_manifest,
         "banked_codec": args.banked_codec,
-        "banked_band_bytes": args.banked_band_bytes,
         "mmap_island_residency": str(args.mmap_island_residency),
         "read_chunk": args.read_chunk,
         "bypass_page_cache": args.bypass_page_cache,
@@ -2032,11 +2021,6 @@ def _runtime_config(
             else None
         ),
         banked_codec=str(options.get("banked_codec", "none")),
-        banked_band_bytes=(
-            apis.parse_memory_bytes(options["banked_band_bytes"])
-            if options.get("banked_band_bytes")
-            else None
-        ),
         mmap_island_residency=str(
             options.get("mmap_island_residency", "wired")
         ),

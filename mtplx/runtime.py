@@ -568,6 +568,13 @@ def _load_impl(
                 if additional_resident_bytes
                 else {}
             )
+            from .expert_runtime import banked_band_bytes_for_config
+
+            banked_band_bytes = banked_band_bytes_for_config(
+                expert_streaming_config
+            )
+            if banked_band_bytes is not None:
+                plan_kwargs["mmap_island_bytes_override"] = banked_band_bytes
             streaming_plan = expert_streaming_config.memory_plan(
                 streaming_spec,
                 **plan_kwargs,
