@@ -3403,6 +3403,83 @@ def test_speculative_io_admission_caps_prefetch_read_concurrency(
         runtime.close()
 
 
+def test_prefetch_workers_never_block_on_layer_locks(
+    tmp_path: Path,
+) -> None:
+    """Publication is decoupled from layer locks: completion callbacks
+    only enqueue, and the next prefetch_experts call on the generation
+    thread batch-applies commits under the lock it already holds. A
+    route-held layer lock therefore can no longer hold a prefetch worker
+    captive (measured convoy: 34us -> 7.6ms per 5ms lock hold)."""
+
+    root, config, spec, manifest_path = _integrated_hy3_artifact(
+        tmp_path, expert_count=4, top_k=1
+    )
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    record = spec.expert_record_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=(
+            fixed + spec.persistent_cache_bytes(1) + 2 * record
+        ),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        prefetch_slots=2,
+        max_inflight_io_bytes=8 * record,
+        # Exactly one speculative worker: a blocked callback would wedge
+        # the whole lane, which is precisely what must not happen.
+        speculative_io_fraction=0.125,
+    )
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=make_mlx_slot_buffer_allocator(
+            stream_config.memory_plan(spec), spec
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+    layer = 1
+    bank = runtime._banks[layer]
+    lock = runtime._layer_locks[layer]
+    try:
+        assert runtime._prefetch_executor._max_workers == 1
+        assert runtime.prefetch_experts(layer, [0]) == 1
+        lock.acquire()
+        try:
+            # The load settles (claim, fill, completion bookkeeping)
+            # while the lock is held by this thread.
+            deadline = time.monotonic() + 5.0
+            while True:
+                with runtime._prefetch_lock:
+                    if not runtime._prefetch_futures:
+                        break
+                if time.monotonic() > deadline:
+                    pytest.fail("speculative load never completed")
+                time.sleep(0.005)
+            # The single worker is FREE despite the held layer lock: a
+            # probe task runs promptly. Pre-fix the callback blocked on
+            # this lock and the probe would time out.
+            probe = runtime._prefetch_executor.submit(lambda: 42)
+            assert probe.result(timeout=2.0) == 42
+            # Publication waits for the generation thread.
+            assert 0 not in bank._prefetch_expert_to_slot
+            assert 0 in bank._prefetch_inflight
+        finally:
+            lock.release()
+        # The next generation-thread prefetch call applies the commit.
+        assert runtime.prefetch_experts(layer, []) == 0
+        with lock:
+            assert bank._prefetch_expert_to_slot.get(0) is not None
+            assert 0 not in bank._prefetch_inflight
+        with runtime._counter_lock:
+            assert runtime.counters.prefetch_committed == 1
+    finally:
+        runtime.close()
+
+
 def test_prefetch_ring_load_resolves_as_route_hit_bitwise(
     tmp_path: Path,
 ) -> None:
@@ -3453,19 +3530,7 @@ def test_prefetch_ring_load_resolves_as_route_hit_bitwise(
                 assert issued == 2
                 # Duplicate predictions are absorbed by the inflight set.
                 assert runtime.prefetch_experts(streamed_layer, [0, 1]) == 0
-                deadline = time.monotonic() + 10.0
-                lock = runtime._layer_locks[streamed_layer]
-                while True:
-                    with lock:
-                        committed = set(bank._prefetch_expert_to_slot)
-                    if committed == {0, 1}:
-                        break
-                    if time.monotonic() > deadline:
-                        pytest.fail(
-                            "speculative loads did not commit: "
-                            f"{sorted(committed)}"
-                        )
-                    time.sleep(0.01)
+                _wait_ring_published(runtime, streamed_layer, {0, 1})
             else:
                 # Disabled prefetch is a no-op, not an error.
                 assert runtime.prefetch_experts(streamed_layer, [0, 1]) == 0
@@ -3562,6 +3627,9 @@ def _wait_ring_published(runtime, layer: int, experts: set[int]) -> None:
     lock = runtime._layer_locks[layer]
     deadline = time.monotonic() + 10.0
     while True:
+        # Publication happens on the generation thread: an empty
+        # prefetch call is the flush that applies settled loads.
+        runtime.prefetch_experts(layer, [])
         with lock:
             published = set(bank._prefetch_expert_to_slot)
         if experts <= published:
@@ -3711,15 +3779,9 @@ def test_recycled_ring_assignment_load_never_claims_a_published_slot(
         _drive_prefetch(runtime, layer, 2)
         _wait_ring_published(runtime, layer, {2})
         release.set()
-        deadline = time.monotonic() + 10.0
-        while True:
-            with runtime._prefetch_lock:
-                if not runtime._prefetch_futures:
-                    break
-            if time.monotonic() > deadline:
-                pytest.fail("speculative loads never drained")
-            time.sleep(0.005)
-        time.sleep(0.25)  # cover the discard-to-commit callback window
+        # The released load fills its own still-live assignment; the next
+        # generation-thread flush publishes it.
+        _wait_ring_published(runtime, layer, {0, 2})
 
         # Every published ring entry must be physically consistent: a
         # decode route resolving it pins exactly that expert. Before the

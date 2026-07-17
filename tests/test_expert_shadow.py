@@ -606,10 +606,12 @@ def test_decode_miss_is_served_from_shadow_without_ssd(
             / (np.linalg.norm(exact_vec) * np.linalg.norm(shadow_vec))
         )
         assert cosine > minimum_cosine
-        # The speculative admission fill lands asynchronously and turns
-        # the same expert into an exact hit.
+        # The speculative admission fill lands asynchronously; settled
+        # loads publish on the generation thread, so flush while polling
+        # (an empty prefetch call applies pending completions).
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
+            runtime.prefetch_experts(1, [])
             counters = runtime.snapshot(mx_module=mx)["cache"]
             if counters["prefetch_committed"] >= 1:
                 break

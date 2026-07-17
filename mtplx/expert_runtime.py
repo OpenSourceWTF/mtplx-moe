@@ -1615,6 +1615,12 @@ class ExpertStreamingRuntime:
         # prediction burst can never starve a real miss read.
         self._prefetch_lock = threading.Lock()
         self._prefetch_futures: set[Future] = set()
+        # Settled speculative loads awaiting publication, per layer.
+        # Workers only enqueue here; the generation thread applies them
+        # at its next prefetch_experts call for the layer.
+        self._prefetch_completions: dict[
+            int, list[tuple[int, int | None, bool]]
+        ] = {}
         # Sustained decode can predict faster than the executor reads.
         # Without a ceiling the queue grows without bound: every queued
         # load is stale by the time it runs (its assignment recycled many
@@ -2632,9 +2638,11 @@ class ExpertStreamingRuntime:
 
         Returns the number of asynchronous loads issued. Zero when prefetch
         is disabled, the layer is an island or unrouted, or every prediction
-        is already resident, published, or inflight. A completed load
-        publishes through ``commit_prefetch`` and resolves as an ordinary
-        ``plan()`` hit; a failed load only invalidates its ring assignment —
+        is already resident, published, or inflight. Completed loads are
+        NOT published by their worker callbacks — they queue, and this
+        call batch-applies them under the layer lock it already holds, so
+        workers never touch layer locks. An empty ``expert_ids`` is a pure
+        flush. A failed load only invalidates its ring assignment —
         speculation never marks the runtime unhealthy.
         """
 
@@ -2650,10 +2658,6 @@ class ExpertStreamingRuntime:
         executor = self._prefetch_executor
         if executor is None:
             return 0
-        with self._prefetch_lock:
-            backlog = len(self._prefetch_futures)
-        if backlog >= self._prefetch_backlog_limit:
-            return 0
         lock = self._layer_locks[layer]
         # Never block the generation thread on a layer transaction: under
         # deferred split-route release the previous token's pending split
@@ -2663,6 +2667,11 @@ class ExpertStreamingRuntime:
         if not lock.acquire(blocking=False):
             return 0
         try:
+            self._apply_prefetch_completions(layer, bank)
+            with self._prefetch_lock:
+                backlog = len(self._prefetch_futures)
+            if backlog >= self._prefetch_backlog_limit:
+                return 0
             loads = bank.plan_prefetch(expert_ids)
             # Assignment tickets bind each load's completion to the exact
             # assignment it filled: the same expert can be recycled and
@@ -2725,10 +2734,16 @@ class ExpertStreamingRuntime:
         lock = self._layer_locks.get(layer)
         if bank is None or lock is None:
             return
-        with lock:
-            live = bank.prefetch_ticket(load.expert) == ticket
-        if not live:
-            return
+        # Advisory only, so never block a worker on a route-held layer
+        # lock: when the lock is contended just perform the read — a
+        # recycled assignment's bytes are refused at commit time anyway.
+        if lock.acquire(blocking=False):
+            try:
+                live = bank.prefetch_ticket(load.expert) == ticket
+            finally:
+                lock.release()
+            if not live:
+                return
         self.slots.load_speculative(layer, load)
 
     def _finish_prefetch_load(
@@ -2738,6 +2753,16 @@ class ExpertStreamingRuntime:
         ticket: int | None,
         future: Future,
     ) -> None:
+        """Record a settled load; never touch banks or layer locks here.
+
+        This runs on a prefetch worker. Publication happens on the
+        generation thread at its next ``prefetch_experts`` call for the
+        layer (``_apply_prefetch_completions``), under the layer lock it
+        already holds — a route-held lock therefore cannot hold a worker
+        captive (measured: a 5 ms route hold turned a 34 us
+        issue-to-publish path into 7.6 ms of captive-worker convoy).
+        """
+
         with self._prefetch_lock:
             self._prefetch_futures.discard(future)
         try:
@@ -2746,28 +2771,43 @@ class ExpertStreamingRuntime:
             succeeded = False
         else:
             succeeded = True
-        bank = self._banks.get(layer)
-        lock = self._layer_locks.get(layer)
-        if bank is None or lock is None:
+        with self._prefetch_lock:
+            self._prefetch_completions.setdefault(layer, []).append(
+                (expert, ticket, succeeded)
+            )
+
+    def _apply_prefetch_completions(self, layer: int, bank: Any) -> None:
+        """Publish settled loads for one layer; caller holds its lock.
+
+        Ticketed commits keep the settled-tenant invariant: an assignment
+        stays inflight (and its slot unrecyclable) until applied here, so
+        publication still implies the physical slot holds the expert's
+        bytes.
+        """
+
+        with self._prefetch_lock:
+            completions = self._prefetch_completions.pop(layer, None)
+        if not completions:
             return
-        committed = False
-        with lock:
+        committed = 0
+        for expert, ticket, succeeded in completions:
             if succeeded:
-                committed = bank.commit_prefetch(expert, ticket=ticket)
+                if bank.commit_prefetch(expert, ticket=ticket):
+                    committed += 1
             else:
                 bank.invalidate_prefetch(expert, ticket=ticket)
         if committed:
             with self._counter_lock:
-                self.counters.prefetch_committed += 1
-                self._layer_counters[layer].prefetch_committed += 1
+                self.counters.prefetch_committed += committed
+                self._layer_counters[layer].prefetch_committed += committed
 
     def _drain_prefetch_loads(self) -> None:
         """Wait out in-flight speculative loads (bounded single-record reads).
 
-        Reset and close call this before touching pool or bank state. The
-        layer locks must NOT be held here: a pending commit callback takes
-        its layer lock, and waiting on its future while holding that lock
-        would deadlock.
+        Reset and close call this before touching pool or bank state, then
+        discard the settled-but-unapplied completions: their assignments
+        die with the bank state, and applying them later would only be a
+        chain of ticket-refused no-ops.
         """
 
         with self._prefetch_lock:
@@ -2777,6 +2817,8 @@ class ExpertStreamingRuntime:
                 future.result()
             except BaseException:
                 pass
+        with self._prefetch_lock:
+            self._prefetch_completions.clear()
 
     def reset(self) -> None:
         # Deferred pin releases must flush (with a covering fence) before the
