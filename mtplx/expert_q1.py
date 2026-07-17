@@ -28,7 +28,21 @@ from typing import Iterable, Iterator
 
 import numpy as np
 
-from mtplx.expert_manifest import ExpertManifest, read_expert_record
+from mtplx.expert_manifest import (
+    EMPTY_SHA256,
+    ExpertManifest,
+    ExpertRecord,
+    ResidentTensor,
+    ShardInfo,
+    SidecarInfo,
+    TensorSegment,
+    _checkpoint_inventory,
+    _classify_expert_name,
+    _hash_file,
+    _safe_relative_name,
+    read_expert_record,
+    validate_expert_manifest_spec,
+)
 from mtplx.expert_shadow import (
     SHADOW_GROUP,
     _B1_WORDS_PER_GROUP,
@@ -398,6 +412,121 @@ def convert_expert_q1(
         path=output_dir / manifest_name,
     )
     (output_dir / manifest_name).write_text(json.dumps(manifest.to_json()))
+    return manifest
+
+
+def build_streamed_expert_manifest(
+    root: Path | str,
+    q1_manifest: Q1Manifest,
+    spec,
+) -> ExpertManifest:
+    """Unify a q1 artifact into the streamed :class:`ExpertManifest` schema.
+
+    ``root`` is the assembled q1 artifact directory: resident-only
+    safetensors (with ``model.safetensors.index.json``) plus the q1 record
+    bin next to them. The result is an authoritative manifest — the bin is
+    the single sidecar shard and every expert record addresses it — so the
+    streamed runtime opens the artifact through the exact affine machinery
+    (``load_expert_manifest`` + slot reads), with ``quantization.mode`` set
+    to the shadow codec. Closes gate 1 of
+    research/streamed-q1-codec-gap-analysis.md.
+    """
+
+    if getattr(spec, "expert_codec", "affine") != q1_manifest.codec:
+        raise Q1ManifestError(
+            f"spec codec {getattr(spec, 'expert_codec', 'affine')!r} does "
+            f"not match q1 artifact codec {q1_manifest.codec!r}"
+        )
+    root = Path(root).resolve()
+    bin_name = _safe_relative_name(q1_manifest.file, label="q1 bin name")
+    bin_path = root / bin_name
+    if not bin_path.is_file():
+        raise Q1ManifestError(f"q1 record bin is not in the artifact: {bin_path}")
+    shards, tensors = _checkpoint_inventory(root, hash_shards=True)
+    routed = [
+        name
+        for name in tensors
+        if _classify_expert_name(name, spec) is not None
+    ]
+    if routed:
+        raise Q1ManifestError(
+            "q1 artifact safetensors must hold only resident tensors; found "
+            f"routed expert tensors: {sorted(routed)[:4]}"
+        )
+    resident_tensors = tuple(
+        ResidentTensor(
+            tensor=tensor.name,
+            shard=tensor.shard,
+            offset=tensor.offset,
+            length=tensor.length,
+            dtype=tensor.dtype,
+            shape=tensor.shape,
+        )
+        for tensor in sorted(tensors.values(), key=lambda item: item.name)
+    )
+    resident_bytes = sum(tensor.length for tensor in resident_tensors)
+    bin_size = bin_path.stat().st_size
+    bin_sha256 = _hash_file(bin_path)
+    sidecar_shard = ShardInfo(
+        name=bin_name,
+        size=bin_size,
+        header_bytes=0,
+        header_sha256=EMPTY_SHA256,
+        sha256=bin_sha256,
+        kind="sidecar",
+    )
+    records: list[ExpertRecord] = []
+    routed_bytes = 0
+    for record in q1_manifest.records:
+        segments = tuple(
+            TensorSegment(
+                component=segment.component,
+                tensor=(
+                    f"model.layers.{record.layer}.mlp.experts."
+                    f"{record.expert}.{segment.component}"
+                ),
+                shard=bin_name,
+                offset=record.offset + segment.offset,
+                length=segment.length,
+                dtype=segment.dtype,
+                shape=segment.shape,
+            )
+            for segment in record.segments
+        )
+        records.append(
+            ExpertRecord(
+                layer=record.layer,
+                expert=record.expert,
+                logical_bytes=record.length,
+                segments=segments,
+                sha256=record.sha256,
+                sidecar_offset=record.offset,
+                sidecar_length=record.length,
+            )
+        )
+        routed_bytes += record.length
+    manifest = ExpertManifest(
+        model_key=spec.key,
+        source_repo=spec.quant_model,
+        source_revision=spec.quant_revision,
+        quant_bits=spec.quant_bits,
+        quant_group_size=spec.quant_group_size,
+        quant_mode=q1_manifest.codec,
+        artifact_tensor_bytes=resident_bytes + routed_bytes,
+        resident_tensor_bytes=resident_bytes,
+        routed_expert_bytes=routed_bytes,
+        shards=tuple(shards) + (sidecar_shard,),
+        resident_tensors=resident_tensors,
+        records=tuple(records),
+        sidecar=SidecarInfo(
+            file=bin_name,
+            alignment=1,
+            size=bin_size,
+            sha256=bin_sha256,
+        ),
+    ).with_digest()
+    manifest.validate_structure()
+    validate_expert_manifest_spec(manifest, spec)
     return manifest
 
 

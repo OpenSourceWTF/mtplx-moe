@@ -162,6 +162,10 @@ def _component_array(binding: ExpertSlotBinding, component: str) -> mx.array:
             return raw.view(mx.uint32).reshape(segment.shape)
         if segment.dtype == "BF16":
             return raw.view(mx.bfloat16).reshape(segment.shape)
+        if segment.dtype == "U16":
+            return raw.view(mx.uint16).reshape(segment.shape)
+        if segment.dtype == "U8":
+            return raw.reshape(segment.shape)
         raise TypeError(f"unsupported streamed component dtype {segment.dtype}")
     view = binding.component_view(component)
     if segment.dtype == "U32":
@@ -170,6 +174,12 @@ def _component_array(binding: ExpertSlotBinding, component: str) -> mx.array:
     elif segment.dtype == "BF16":
         host = np.frombuffer(view, dtype=np.dtype("<u2")).reshape(segment.shape)
         value = mx.array(host).view(mx.bfloat16)
+    elif segment.dtype == "U16":
+        host = np.frombuffer(view, dtype=np.dtype("<u2")).reshape(segment.shape)
+        value = mx.array(host)
+    elif segment.dtype == "U8":
+        host = np.frombuffer(view, dtype=np.dtype("u1")).reshape(segment.shape)
+        value = mx.array(host)
     else:
         raise TypeError(f"unsupported streamed component dtype {segment.dtype}")
     return value
@@ -269,6 +279,8 @@ class MlxComponentBank:
                 dtype = {
                     "U32": mx.uint32,
                     "BF16": mx.bfloat16,
+                    "U16": mx.uint16,
+                    "U8": mx.uint8,
                 }.get(segment.dtype)
                 if dtype is None:
                     raise TypeError(f"unsupported component-bank dtype {segment.dtype}")
@@ -934,6 +946,7 @@ def make_mlx_component_bank_allocator(
             for segment in record.segments
         )
 
+    expert_codec = getattr(spec, "expert_codec", "affine")
     expected_signature: list[tuple[str, str, tuple[int, ...], int]] = []
     for projection in ("gate_proj", "up_proj", "down_proj"):
         output_size = (
@@ -946,6 +959,42 @@ def make_mlx_component_bank_allocator(
             if projection in {"gate_proj", "up_proj"}
             else spec.expert_hidden_size
         )
+        if expert_codec != "affine":
+            # Shadow-codec (q1) records: packed sign/trit words plus one
+            # bf16-bit scale per g64 group, no bias leaf (gate 3 of
+            # research/streamed-q1-codec-gap-analysis.md).
+            from mtplx.expert_shadow import (
+                SHADOW_GROUP,
+                _B1_WORDS_PER_GROUP,
+                _T158_BYTES_PER_GROUP,
+            )
+
+            groups = input_size // SHADOW_GROUP
+            if expert_codec == "b1":
+                packed_dtype = "U32"
+                packed_shape = (output_size, groups * _B1_WORDS_PER_GROUP)
+                packed_length = output_size * groups * _B1_WORDS_PER_GROUP * 4
+            else:
+                packed_dtype = "U8"
+                packed_shape = (output_size, groups * _T158_BYTES_PER_GROUP)
+                packed_length = output_size * groups * _T158_BYTES_PER_GROUP
+            expected_signature.extend(
+                (
+                    (
+                        f"{projection}.packed",
+                        packed_dtype,
+                        packed_shape,
+                        packed_length,
+                    ),
+                    (
+                        f"{projection}.scales",
+                        "U16",
+                        (output_size, groups),
+                        output_size * groups * 2,
+                    ),
+                )
+            )
+            continue
         weight_shape = (output_size, input_size * spec.quant_bits // 32)
         parameter_shape = (output_size, input_size // spec.quant_group_size)
         expected_signature.extend(
@@ -1212,6 +1261,62 @@ def _gather_component_bank(
     return output.reshape((rows, int(output.shape[-1])))
 
 
+def _run_component_bank_shadow(
+    x: mx.array,
+    bindings: tuple[ExpertSlotBinding, ...],
+    *,
+    codec: str,
+) -> mx.array:
+    """Execute assignment-aligned rows of a shadow-codec (q1) slot bank.
+
+    The q2 lane's equal (gate 4 of the gap analysis): records were read
+    into component-bank slots by the ordinary slot machinery, and the rows
+    execute through ``shadow_gather_mm`` — the bank row fed to the kernel
+    is the slot index, not the expert id.  Eager-only, like the miss-shadow
+    lane: the shadow kernel is not traceable under ``mx.compile``.
+    """
+
+    if not bindings or int(x.shape[0]) != len(bindings):
+        raise ValueError(
+            "component-bank inputs and bindings must be non-empty and aligned"
+        )
+    bank = getattr(bindings[0].buffer, "bank", None)
+    if bank is None or any(
+        getattr(binding.buffer, "bank", None) is not bank for binding in bindings
+    ):
+        raise ValueError("component-bank execution requires one shared bank")
+    slot_rows = mx.array(
+        [int(binding.buffer.bank_index) for binding in bindings],
+        dtype=mx.int32,
+    )
+    return _shadow_gather_component_bank(x, bank, slot_rows, codec=codec)
+
+
+def _shadow_gather_component_bank(
+    x: mx.array,
+    bank: MlxComponentBank,
+    slot_rows: mx.array,
+    *,
+    codec: str,
+) -> mx.array:
+    """Row-gathered three-projection shadow MLP against one component bank."""
+
+    from mtplx.kernels.shadow_gather import shadow_gather_mm
+
+    def projection(values: mx.array, name: str) -> mx.array:
+        return shadow_gather_mm(
+            values,
+            slot_rows,
+            bank.arrays[f"{name}.packed"],
+            bank.arrays[f"{name}.scales"],
+            codec=codec,
+        )
+
+    gate = projection(x, "gate_proj")
+    up = projection(x, "up_proj")
+    return projection(swiglu(gate, up), "down_proj")
+
+
 def _run_shadow_bank(
     x: mx.array,
     expert_rows: mx.array,
@@ -1337,6 +1442,12 @@ class HotExpertSwitchGLU(nn.Module):
         self.layer_index = int(layer_index)
         self.group_size = runtime.spec.quant_group_size
         self.bits = runtime.spec.quant_bits
+        # Streamed record codec (issue #51 q1 lane): "affine" executes
+        # slot-resident records through gather_qmm; a shadow codec ("b1",
+        # "t158") executes them through shadow_gather_mm instead.  The read
+        # path is identical either way — only the component-bank dispatch
+        # differs (gate 4 of the gap analysis).
+        self.codec = getattr(runtime.spec, "expert_codec", "affine")
         # Shadow miss fallback (issue #51): when the runtime opened with
         # miss_shadow, decode misses on this streamed layer are served from
         # a resident low-precision bank instead of waiting on SSD.
@@ -1344,6 +1455,22 @@ class HotExpertSwitchGLU(nn.Module):
         self._shadow_bank = (
             shadow_lookup(self.layer_index) if callable(shadow_lookup) else None
         )
+
+    def _dispatch_component_bank(
+        self,
+        selected: mx.array,
+        bindings: tuple[ExpertSlotBinding, ...],
+    ) -> mx.array:
+        """Execute one component-bank wave under this layer's record codec."""
+
+        if self.codec == "affine":
+            return _run_component_bank_q4(
+                selected,
+                bindings,
+                group_size=self.group_size,
+                bits=self.bits,
+            )
+        return _run_component_bank_shadow(selected, bindings, codec=self.codec)
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         output, _overlap_result = self._run(
@@ -1526,12 +1653,7 @@ class HotExpertSwitchGLU(nn.Module):
                 )
                 selected = mx.take(tokens, token_positions, axis=0)
                 wave_outputs.append(
-                    _run_component_bank_q4(
-                        selected,
-                        grouped_bindings,
-                        group_size=self.group_size,
-                        bits=self.bits,
-                    )
+                    self._dispatch_component_bank(selected, grouped_bindings)
                 )
                 wave_positions.extend(grouped_positions)
             if defer:
@@ -1791,11 +1913,9 @@ class HotExpertSwitchGLU(nn.Module):
                                     phase=phase,
                                 )
                             with _route_probe.bracket("hot.allhit_dispatch_build"):
-                                wave_output = _run_component_bank_q4(
+                                wave_output = self._dispatch_component_bank(
                                     assignment_inputs,
                                     ready.bindings,
-                                    group_size=self.group_size,
-                                    bits=self.bits,
                                 )
                             # Slot pins may be released only after the lazy graph
                             # has consumed the currently bound bank generations.

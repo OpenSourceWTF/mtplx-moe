@@ -1,11 +1,15 @@
 """Strict safetensors manifests for SSD-streamed MoE experts.
 
 The manifest is the trust boundary between a revision-pinned checkpoint and
-the native slot loader.  It maps every ``(layer, expert)`` to the nine affine
-Q4 leaves used by gate/up/down projections without materializing tensors.
+the native slot loader.  It maps every ``(layer, expert)`` to its streamed
+record components without materializing tensors: nine affine Q2/Q4 leaves
+(``weight``/``scales``/``biases`` per gate/up/down projection) or, for
+shadow-codec (q1) artifacts, six leaves (``packed``/``scales`` per
+projection).  ``quantization.mode`` selects the component schema: "affine"
+or a shadow codec name ("b1", "t158") with nominal bits 1/2.
 
-Only Python's standard library is used here so manifests can be inspected and
-verified on machines without MLX.
+Only Python's standard library (plus numpy transitively) is used here so
+manifests can be inspected and verified on machines without MLX.
 """
 
 from __future__ import annotations
@@ -20,6 +24,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Iterator
 
+from .expert_shadow import (
+    SHADOW_CODECS,
+    SHADOW_GROUP,
+    _B1_WORDS_PER_GROUP,
+    _T158_BYTES_PER_GROUP,
+)
 from .expert_streaming_models import ExpertStreamingModelSpec, get_model_spec
 
 
@@ -35,10 +45,36 @@ EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 _PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 _LEAVES = ("weight", "scales", "biases")
+_SHADOW_LEAVES = ("packed", "scales")
 _SHARD_KINDS = ("safetensors", "sidecar")
 _COMPONENTS = tuple(
     f"{projection}.{leaf}" for projection in _PROJECTIONS for leaf in _LEAVES
 )
+# Shadow-codec (q1 lane, issue #51) records store six components per expert:
+# per projection one packed sign/trit tensor plus one bf16-bit scale row.
+_SHADOW_COMPONENTS = tuple(
+    f"{projection}.{leaf}"
+    for projection in _PROJECTIONS
+    for leaf in _SHADOW_LEAVES
+)
+_KNOWN_COMPONENTS = frozenset(_COMPONENTS) | frozenset(_SHADOW_COMPONENTS)
+# Nominal quantization bits carried by shadow-codec manifests; the byte
+# math lives in the codec (10 or 15 bytes per g64 group), the nominal bits
+# keep spec/manifest/pool guards single-valued.
+_SHADOW_NOMINAL_BITS = {"b1": 1, "t158": 2}
+
+
+def expert_components_for_mode(quant_mode: str) -> tuple[str, ...]:
+    """The ordered per-record component names for a manifest quant mode."""
+
+    if quant_mode == "affine":
+        return _COMPONENTS
+    if quant_mode in SHADOW_CODECS:
+        return _SHADOW_COMPONENTS
+    raise ExpertManifestError(
+        f"unsupported manifest quantization mode {quant_mode!r}; expected "
+        f"'affine' or one of {', '.join(SHADOW_CODECS)}"
+    )
 _LAYER_RE = re.compile(
     r"(?:^|\.)layers\.(?P<layer>\d+)\.mlp\."
     r"(?P<container>switch_mlp|experts)\.(?P<tail>.+)$"
@@ -374,7 +410,7 @@ class TensorSegment:
             ),
         )
         component = _string(obj["component"], label="segment component")
-        if component not in _COMPONENTS:
+        if component not in _KNOWN_COMPONENTS:
             raise ExpertManifestError(f"unsupported expert component {component!r}")
         dtype = _string(obj["dtype"], label="segment dtype")
         if dtype not in _DTYPE_BYTES:
@@ -466,14 +502,17 @@ class ExpertRecord:
         raw_segments = obj["segments"]
         if not isinstance(raw_segments, list):
             raise ExpertManifestError("expert record segments must be an array")
-        if len(raw_segments) != len(_COMPONENTS):
+        if len(raw_segments) not in {len(_COMPONENTS), len(_SHADOW_COMPONENTS)}:
             raise ExpertManifestError(
-                "expert record must contain the nine ordered quantized components"
+                "expert record must contain the nine ordered affine components "
+                "or the six ordered shadow-codec components"
             )
         segments = tuple(TensorSegment.from_dict(item) for item in raw_segments)
-        if tuple(segment.component for segment in segments) != _COMPONENTS:
+        ordered = tuple(segment.component for segment in segments)
+        if ordered not in {_COMPONENTS, _SHADOW_COMPONENTS}:
             raise ExpertManifestError(
-                "expert record must contain the nine ordered quantized components"
+                "expert record must contain the nine ordered affine components "
+                "or the six ordered shadow-codec components"
             )
         digest = obj.get("sha256")
         sidecar_offset = obj.get("sidecar_offset")
@@ -699,10 +738,27 @@ class ExpertManifest:
         return manifest
 
     def validate_structure(self) -> None:
-        if self.quant_bits not in {2, 4} or self.quant_mode != "affine":
+        if self.quant_mode == "affine":
+            if self.quant_bits not in {2, 4}:
+                raise ExpertManifestError(
+                    "only affine Q2 or Q4 expert manifests are supported"
+                )
+        elif self.quant_mode in SHADOW_CODECS:
+            if self.quant_bits != _SHADOW_NOMINAL_BITS[self.quant_mode]:
+                raise ExpertManifestError(
+                    f"shadow codec {self.quant_mode!r} manifests carry nominal "
+                    f"quantization bits {_SHADOW_NOMINAL_BITS[self.quant_mode]}"
+                )
+            if self.quant_group_size != SHADOW_GROUP:
+                raise ExpertManifestError(
+                    f"shadow codec manifests group in {SHADOW_GROUP}s"
+                )
+        else:
             raise ExpertManifestError(
-                "only affine Q2 or Q4 expert manifests are supported"
+                "only affine Q2/Q4 or shadow-codec (b1, t158) expert "
+                "manifests are supported"
             )
+        expected_components = expert_components_for_mode(self.quant_mode)
         if len(self.shards) > MAX_MANIFEST_SHARDS:
             raise ExpertManifestError("manifest shard count exceeds the shard limit")
         if len(self.resident_tensors) > MAX_MANIFEST_RESIDENT_TENSORS:
@@ -756,9 +812,13 @@ class ExpertManifest:
         shard_sizes = {shard.name: shard.size for shard in self.shards}
         routed_bytes = 0
         for record in self.records:
-            if tuple(segment.component for segment in record.segments) != _COMPONENTS:
+            if (
+                tuple(segment.component for segment in record.segments)
+                != expected_components
+            ):
                 raise ExpertManifestError(
-                    "expert record must contain the nine ordered quantized components"
+                    f"expert record components do not match quantization "
+                    f"mode {self.quant_mode!r}"
                 )
             if (
                 sum(segment.length for segment in record.segments)
@@ -1147,7 +1207,24 @@ def _expected_component_shape(
         if projection in {"gate_proj", "up_proj"}
         else spec.expert_hidden_size
     )
-    if leaf == "weight":
+    if spec.expert_codec != "affine":
+        groups = input_size // SHADOW_GROUP
+        if leaf == "packed":
+            if spec.expert_codec == "b1":
+                dtype = "U32"
+                shape = (output, groups * _B1_WORDS_PER_GROUP)
+            else:
+                dtype = "U8"
+                shape = (output, groups * _T158_BYTES_PER_GROUP)
+        elif leaf == "scales":
+            dtype = "U16"
+            shape = (output, groups)
+        else:
+            raise ExpertManifestError(
+                f"component {component!r} is not part of the "
+                f"{spec.expert_codec!r} record layout"
+            )
+    elif leaf == "weight":
         dtype = "U32"
         shape = (output, input_size * spec.quant_bits // 32)
     else:
@@ -1197,9 +1274,15 @@ def _expert_segments(
     tensors: dict[str, _TensorInfo],
     spec: ExpertStreamingModelSpec,
 ) -> tuple[tuple[ExpertRecord, ...], set[str]]:
-    if spec.quant_bits not in {2, 4} or spec.quant_parameter_bytes != 2:
+    if (
+        spec.expert_codec != "affine"
+        or spec.quant_bits not in {2, 4}
+        or spec.quant_parameter_bytes != 2
+    ):
         raise ExpertManifestError(
-            "manifest builder supports affine Q2/Q4 metadata with BF16 parameters"
+            "manifest builder supports affine Q2/Q4 metadata with BF16 "
+            "parameters; shadow-codec (q1) manifests are emitted by "
+            "the converter (mtplx.expert_q1)"
         )
     grouped: dict[tuple[int, int, str], TensorSegment] = {}
     expert_tensor_names: set[str] = set()
@@ -1428,8 +1511,14 @@ def validate_expert_manifest_spec(
         raise ExpertManifestError(
             "manifest quantization group size does not match the descriptor"
         )
-    if manifest.quant_mode != "affine":
-        raise ExpertManifestError("manifest quantization mode must be affine")
+    expected_mode = (
+        "affine" if spec.expert_codec == "affine" else spec.expert_codec
+    )
+    if manifest.quant_mode != expected_mode:
+        raise ExpertManifestError(
+            f"manifest quantization mode {manifest.quant_mode!r} does not "
+            f"match descriptor codec {expected_mode!r}"
+        )
     if manifest.model_key != spec.key:
         raise ExpertManifestError(
             f"manifest model key {manifest.model_key!r} does not match "
@@ -1453,13 +1542,16 @@ def validate_expert_manifest_spec(
         raise ExpertManifestError(
             "manifest record keys do not match the descriptor Cartesian product"
         )
+    expected_components = expert_components_for_mode(expected_mode)
     for record in manifest.records:
         if record.logical_bytes != spec.expert_record_bytes:
             raise ExpertManifestError(
                 f"record ({record.layer}, {record.expert}) bytes do not match "
                 "the descriptor"
             )
-        for component, segment in zip(_COMPONENTS, record.segments, strict=True):
+        for component, segment in zip(
+            expected_components, record.segments, strict=True
+        ):
             expected_dtype, expected_shape, expected_length = _expected_component_shape(
                 spec, component
             )

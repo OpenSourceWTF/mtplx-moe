@@ -1700,6 +1700,32 @@ class ExpertStreamingRuntime:
                 "; ".join(profile_violations)
             )
         config = resolve_island_placement(config, artifact_root, spec=model_spec)
+        if getattr(model_spec, "expert_codec", "affine") != "affine":
+            # q1 (shadow-codec) artifacts (issue #51): records are packed
+            # sign/trit words plus one bf16 scale, executed through
+            # shadow_gather_mm. Only the component-banks streamed dispatch
+            # carries the codec branch (gate 4). The direct-slot, mapped,
+            # and dense-island dispatches all assume the affine triple and
+            # would silently misread the record, so reject them loudly.
+            if config.slot_layout != "component-banks":
+                raise ExpertStreamingConfigurationError(
+                    f"{model_spec.key} is a q1 ({model_spec.expert_codec}) "
+                    "shadow-codec artifact; it requires the component-banks "
+                    f"slot layout, not {config.slot_layout!r}"
+                )
+            if config.miss_shadow is not None:
+                raise ExpertStreamingConfigurationError(
+                    "miss_shadow shadows an exact affine artifact with a "
+                    f"low-precision bank; a q1 ({model_spec.expert_codec}) "
+                    "artifact is already a shadow codec, so shadowing it is "
+                    "nonsense — set miss_shadow to None on a q1-primary spec"
+                )
+            if config.island_layers or config.mmap_island_layers:
+                raise ExpertStreamingConfigurationError(
+                    "dense-island execution dispatches through the affine "
+                    "gather kernel; q1 shadow-codec artifacts cannot serve "
+                    "island or mmap-island layers"
+                )
         manifest = load_expert_manifest(manifest_path)
         cls._validate_manifest_identity(manifest, model_spec)
         if config.island_layers and not set(config.island_layers) <= set(
@@ -2942,6 +2968,7 @@ class ExpertStreamingRuntime:
         slots = self.slots.snapshot()
         snapshot = {
             "model_key": self.spec.key,
+            "expert_codec": self.spec.expert_codec,
             "manifest_sha256": self.manifest.manifest_sha256,
             "memory_plan": {
                 "total_limit_bytes": self.plan.total_limit_bytes,

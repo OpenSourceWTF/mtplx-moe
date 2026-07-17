@@ -51,6 +51,8 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
             "hy3-expert-only-q4",
             "hy3-expert-q2",
             "glm52-expert-q2",
+            "glm52-expert-q1t",
+            "glm52-expert-q1b1",
         ],
         help="Pinned streamed model descriptor; inferred from config.json by default.",
     )
