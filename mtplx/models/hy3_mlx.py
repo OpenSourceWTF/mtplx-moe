@@ -41,6 +41,20 @@ from .expert_mlx import UnboundExpertSwitch, run_switch_with_shared_overlap
 
 
 FUSE_SHARED_GATE_UP_ENV = "MTPLX_FUSE_HY3_SHARED_GATE_UP_PROJECTIONS"
+SUBMIT_CADENCE_ENV = "MTPLX_HY3_SUBMIT_CADENCE"
+
+
+def _decode_submit_cadence() -> int:
+    """Layers between decode-lane GPU submission checkpoints (0 = off)."""
+
+    raw = os.environ.get(SUBMIT_CADENCE_ENV, "").strip()
+    if not raw:
+        return 0
+    try:
+        cadence = int(raw)
+    except ValueError:
+        return 0
+    return cadence if cadence > 0 else 0
 _PACKABLE_LINEAR_SUFFIXES = ("weight", "scales", "biases", "bias")
 
 
@@ -1007,8 +1021,24 @@ class Hy3Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
         mask = create_attention_mask(hidden, cache[0])
+        # Decode-lane submission cadence: without checkpoints the island
+        # segments accumulate as unsubmitted lazy graph while Python walks
+        # the layers, and the GPU idles until the next streamed seam's eval
+        # drains the whole backlog at once. async_eval every N layers keeps
+        # the device fed during host graph-build. Scheduling only — kernel
+        # math and ordering are unchanged, so outputs are bit-identical.
+        cadence = _decode_submit_cadence()
+        async_eval = getattr(mx, "async_eval", None) if cadence else None
+        if async_eval is not None and int(hidden.shape[-2]) > 8:
+            async_eval = None
+        pending_layers = 0
         for layer, layer_cache in zip(self.layers, cache, strict=True):
             hidden = layer(hidden, mask, layer_cache)
+            if async_eval is not None:
+                pending_layers += 1
+                if pending_layers >= cadence:
+                    async_eval(hidden)
+                    pending_layers = 0
         if return_pre_norm:
             # NextN heads normalize the trunk hidden themselves (hnorm); hand
             # them the raw last-layer output, not the lm_head's normed view.
