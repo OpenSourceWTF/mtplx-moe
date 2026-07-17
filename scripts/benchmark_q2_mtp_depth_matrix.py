@@ -80,6 +80,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "resident_quant": None,
     "kv_quant": None,
     "miss_shadow": None,
+    "miss_shadow_layers": None,
     "expert_integrity": "per-read",
     "prefetch_slots": 0,
     "split_route_release": "fenced",
@@ -546,6 +547,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--miss-shadow-layers",
+        type=int,
+        default=None,
+        help=(
+            "Cap shadow coverage to the N worst streamed layers (pin-order-"
+            "first: flattest routing, lowest exact-cache hit). Requires "
+            "--miss-shadow. Default: all streamed layers."
+        ),
+    )
+    parser.add_argument(
         "--miss-shadow",
         choices=("b1", "t158"),
         default=None,
@@ -556,7 +567,10 @@ def build_parser() -> argparse.ArgumentParser:
             "waiting on SSD; the exact tier warms asynchronously. Output "
             "is a quality tier, not bitwise — read ar_comparison / "
             "token-divergence for the quality report. Requires cache-scope "
-            "layer and the component-banks slot layout."
+            "layer and the component-banks slot layout. Use t158: b1 "
+            "collapses when encoded from Q2 sources (the Q2 grid's "
+            "exact-zero level; probe cosine 0.02-0.09) and is only a "
+            "mechanism-speed arm there."
         ),
     )
     parser.add_argument(
@@ -651,6 +665,7 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "resident_quant": args.resident_quant,
         "kv_quant": args.kv_quant,
         "miss_shadow": args.miss_shadow,
+        "miss_shadow_layers": args.miss_shadow_layers,
         "expert_integrity": args.expert_integrity,
         "prefetch_slots": args.prefetch_slots,
         "split_route_release": args.split_route_release,
@@ -2127,6 +2142,7 @@ def _runtime_config(
         resident_quant=options.get("resident_quant") or None,
         kv_quant=options.get("kv_quant") or None,
         miss_shadow=options.get("miss_shadow") or None,
+        miss_shadow_layers=options.get("miss_shadow_layers"),
         prefetch_slots=int(options.get("prefetch_slots") or 0),
         verify_record_hashes=(
             options.get("expert_integrity", "per-read") == "per-read"

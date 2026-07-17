@@ -13,7 +13,7 @@ allocate MLX arrays.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from operator import index
 
 from mtplx.expert_shadow import SHADOW_CODECS, shadow_record_bytes
@@ -100,6 +100,13 @@ class ExpertStreamingModelSpec:
     # Empty when unmeasured; count-based selection then requires an explicit
     # layer list instead.
     island_pin_order: tuple[int, ...] = ()
+    # Streamed record codec: "affine" (Q2/Q4 weight+scales+biases triples)
+    # or a shadow codec ("b1", "t158") whose records store packed+scales
+    # pairs (the q1 lane, issue #51). Shadow-codec specs are pricing and
+    # registry entries: the streamed runtime cannot open their artifacts
+    # until the affine assumptions catalogued in
+    # research/streamed-q1-codec-gap-analysis.md are closed.
+    expert_codec: str = "affine"
 
     def __post_init__(self) -> None:
         integer_fields = {
@@ -155,6 +162,9 @@ class ExpertStreamingModelSpec:
             raise ValueError("full indexer layers must be inside the target model")
         if tuple(sorted(set(self.full_indexer_layers))) != self.full_indexer_layers:
             raise ValueError("full indexer layers must be sorted and unique")
+        if self.expert_codec != "affine" and self.expert_codec not in SHADOW_CODECS:
+            choices = ", ".join(repr(codec) for codec in SHADOW_CODECS)
+            raise ValueError(f"expert_codec must be 'affine', {choices}")
         if self.routed_expert_bytes >= self.total_tensor_bytes:
             raise ValueError("resident model footprint must be positive")
         if self.router_bytes > self.resident_bytes:
@@ -191,8 +201,17 @@ class ExpertStreamingModelSpec:
 
     @property
     def expert_record_bytes(self) -> int:
-        """Packed quantized weights plus affine scale and bias leaves per expert."""
+        """Bytes of one streamed expert record under the spec's codec.
 
+        Affine: packed quantized weights plus scale and bias leaves.
+        Shadow codecs (q1 lane): packed sign/trit words plus one bf16
+        scale per group — no bias leaf.
+        """
+
+        if self.expert_codec != "affine":
+            return shadow_record_bytes(
+                self.expert_codec, self.expert_source_parameters
+            )
         return self.packed_weight_bytes + self.scale_bias_bytes
 
     @property
@@ -437,6 +456,41 @@ GLM52_EXPERT_Q2 = ExpertStreamingModelSpec(
 )
 
 
+# q1 lane (issue #51): the same GLM checkpoint with shadow-codec expert
+# records produced by scripts/convert_expert_q1.py. Same resident tensors,
+# routers, KV, and routing (island_pin_order carries over — routing is a
+# model property, not a record-codec property); only the routed record
+# bytes change. Probe (research/glm52-shadow-codec-probe-20260717.json):
+# t158 combine-cosine 0.922 from Q2 sources; b1 0.017 (NO-GO from Q2 —
+# priced here only for a potential bf16-source encode).
+_GLM52_RESIDENT_BYTES = (
+    GLM52_EXPERT_Q2.total_tensor_bytes - GLM52_EXPERT_Q2.routed_expert_bytes
+)
+
+GLM52_EXPERT_Q1T = replace(
+    GLM52_EXPERT_Q2,
+    key="glm52-expert-q1t",
+    display_name="GLM-5.2 expert-only ternary t158 (q1 lane)",
+    expert_codec="t158",
+    total_tensor_bytes=_GLM52_RESIDENT_BYTES
+    + GLM52_EXPERT_Q2.routed_layer_count
+    * GLM52_EXPERT_Q2.expert_count
+    * shadow_record_bytes("t158", GLM52_EXPERT_Q2.expert_source_parameters),
+)
+
+GLM52_EXPERT_Q1B1 = replace(
+    GLM52_EXPERT_Q2,
+    key="glm52-expert-q1b1",
+    display_name="GLM-5.2 expert-only binary b1 (q1 lane)",
+    expert_codec="b1",
+    quant_bits=1,
+    total_tensor_bytes=_GLM52_RESIDENT_BYTES
+    + GLM52_EXPERT_Q2.routed_layer_count
+    * GLM52_EXPERT_Q2.expert_count
+    * shadow_record_bytes("b1", GLM52_EXPERT_Q2.expert_source_parameters),
+)
+
+
 MODEL_SPECS: dict[str, ExpertStreamingModelSpec] = {
     spec.key: spec
     for spec in (
@@ -445,6 +499,8 @@ MODEL_SPECS: dict[str, ExpertStreamingModelSpec] = {
         HY3_EXPERT_Q2,
         GLM52_Q4,
         GLM52_EXPERT_Q2,
+        GLM52_EXPERT_Q1T,
+        GLM52_EXPERT_Q1B1,
     )
 }
 
@@ -478,6 +534,7 @@ def plan_expert_memory(
     mmap_islands_wired: bool = True,
     prefetch_slots_per_layer: int = 0,
     miss_shadow: str | None = None,
+    miss_shadow_layers: int | None = None,
 ) -> ExpertMemoryPlan:
     """Fit uniform persistent expert slots under an explicit memory ceiling.
 
@@ -594,8 +651,19 @@ def plan_expert_memory(
     if miss_shadow is not None and miss_shadow not in SHADOW_CODECS:
         choices = ", ".join(repr(codec) for codec in SHADOW_CODECS)
         raise ValueError(f"miss_shadow must be None, {choices}")
+    if miss_shadow_layers is not None:
+        miss_shadow_layers = _integer(
+            "miss_shadow_layers", miss_shadow_layers, minimum=1
+        )
+        if miss_shadow is None:
+            raise ValueError("miss_shadow_layers requires miss_shadow")
+    shadow_layer_count = (
+        min(miss_shadow_layers, streamed_layer_count)
+        if miss_shadow is not None and miss_shadow_layers is not None
+        else streamed_layer_count
+    )
     shadow_bytes = (
-        streamed_layer_count
+        shadow_layer_count
         * spec.expert_count
         * shadow_record_bytes(miss_shadow, spec.expert_source_parameters)
         if miss_shadow is not None
