@@ -10,8 +10,11 @@ repacks selected layers component-major:
 
 Every layer region starts on a 16 KiB boundary so it can be mapped into
 Metal directly. The manifest carries a ``codec`` field; ``none`` stores
-raw bank bytes, ``rans32x-v1`` is reserved for the entropy-coded variant
-(issue #51, C7) and is rejected by loaders until its decoder ships.
+raw bank bytes, ``rans32x-v1`` stores each component bank as a static
+order-0 byte-rANS container (issue #51, C7) that the in-kernel decoder
+(``mtplx.expert_rans_metal``) rebuilds into raw banks at load. Compressed
+components record ``raw_length`` (the decoded size) alongside the stored
+``length``; the loader accepts the codec only because that decoder ships.
 """
 
 from __future__ import annotations
@@ -42,15 +45,30 @@ class BankedComponent:
     shape: tuple[int, ...]
     offset: int
     length: int
+    # Uncompressed byte length of the component bank. For codec "none" this
+    # equals ``length``; for an entropy-coded codec ``length`` is the stored
+    # (compressed) size and ``raw_length`` is what it decodes back to.
+    raw_length: int | None = None
+
+    @property
+    def stored_bytes(self) -> int:
+        return self.length
+
+    @property
+    def raw_bytes(self) -> int:
+        return self.length if self.raw_length is None else self.raw_length
 
     def to_json(self) -> dict:
-        return {
+        payload = {
             "component": self.component,
             "dtype": self.dtype,
             "shape": list(self.shape),
             "offset": self.offset,
             "length": self.length,
         }
+        if self.raw_length is not None:
+            payload["raw_length"] = self.raw_length
+        return payload
 
 
 @dataclass(frozen=True)
@@ -97,6 +115,32 @@ class BankedManifest:
             raise BankedManifestError("banked manifest has no on-disk location")
         return self.path.parent / self.file
 
+    @property
+    def stored_bytes(self) -> int:
+        """Total component bytes as stored on disk (compressed under a codec)."""
+
+        return sum(
+            component.stored_bytes
+            for layer in self.layers
+            for component in layer.components
+        )
+
+    @property
+    def raw_bytes(self) -> int:
+        """Total component bytes after decode (== stored_bytes for codec none)."""
+
+        return sum(
+            component.raw_bytes
+            for layer in self.layers
+            for component in layer.components
+        )
+
+    def compression_ratio(self) -> float:
+        """Raw bytes per stored byte (1.0 for codec none; >1 when compressed)."""
+
+        stored = self.stored_bytes
+        return float(self.raw_bytes) / stored if stored else 1.0
+
     def to_json(self) -> dict:
         return {
             "format": self.format,
@@ -121,6 +165,42 @@ def _component_order(record) -> tuple:
     return tuple(record.segments)
 
 
+def _encode_component_bank(
+    bank: bytes | bytearray, expert_count: int, segment, codec: str
+) -> bytes:
+    """Entropy-code one raw component bank into a self-describing container."""
+
+    if codec != "rans32x-v1":
+        raise BankedManifestError(f"unsupported banked codec {codec!r}")
+    import numpy as np
+
+    from mtplx import expert_rans as rans
+
+    seg_len = len(bank) // expert_count
+    if seg_len * expert_count != len(bank):
+        raise BankedManifestError(
+            f"component {segment.component!r} bank is not a whole number of "
+            "expert segments"
+        )
+    if seg_len % rans.LANES:
+        raise BankedManifestError(
+            f"component {segment.component!r} segment length {seg_len} is not "
+            f"divisible by the {rans.LANES}-lane interleave; codec "
+            f"{codec!r} requires 32-byte-aligned component segments"
+        )
+    segments = np.frombuffer(bytes(bank), dtype=np.uint8).reshape(
+        expert_count, seg_len
+    )
+    try:
+        table = rans.build_table(rans.histogram(segments.reshape(-1)))
+        streams = rans.encode_bank(segments, table)
+        return rans.serialize_component(streams, table)
+    except rans.RansError as exc:  # pragma: no cover - defensive
+        raise BankedManifestError(
+            f"cannot encode component {segment.component!r}: {exc}"
+        ) from exc
+
+
 def write_banked_expert_banks(
     manifest: ExpertManifest,
     root: Path | str,
@@ -133,10 +213,8 @@ def write_banked_expert_banks(
 ) -> BankedManifest:
     """Repack selected layers of the raw sidecar into component-major banks."""
 
-    if codec != "none":
-        raise BankedManifestError(
-            f"banked codec {codec!r} has no encoder yet; use 'none'"
-        )
+    if codec not in BANKED_CODECS:
+        raise BankedManifestError(f"unsupported banked codec {codec!r}")
     if manifest.sidecar is None:
         raise BankedManifestError("banked repack requires a sidecar manifest")
     requested = tuple(sorted({int(layer) for layer in layers}))
@@ -215,19 +293,28 @@ def write_banked_expert_banks(
                 components: list[BankedComponent] = []
                 component_cursor = 0
                 for segment, bank in zip(segments, banks):
-                    digest.update(bank)
+                    if codec == "none":
+                        stored = bytes(bank)
+                        raw_length: int | None = None
+                    else:
+                        stored = _encode_component_bank(
+                            bank, expert_count, segment, codec
+                        )
+                        raw_length = len(bank)
+                    digest.update(stored)
                     components.append(
                         BankedComponent(
                             component=segment.component,
                             dtype=segment.dtype,
                             shape=tuple(segment.shape),
                             offset=component_cursor,
-                            length=len(bank),
+                            length=len(stored),
+                            raw_length=raw_length,
                         )
                     )
-                    out.write(bank)
-                    component_cursor += len(bank)
-                    cursor += len(bank)
+                    out.write(stored)
+                    component_cursor += len(stored)
+                    cursor += len(stored)
                 entries.append(
                     BankedLayer(
                         layer=layer,
@@ -300,14 +387,39 @@ def load_banked_manifest(path: Path | str) -> BankedManifest:
             offset = comp_obj.get("offset")
             if not isinstance(length, int) or not isinstance(offset, int):
                 raise BankedManifestError("banked component range must be integral")
+            if length <= 0:
+                raise BankedManifestError(
+                    f"banked component {comp_obj.get('component')!r} length "
+                    "must be positive"
+                )
             elements = expert_count
             for value in shape:
                 elements *= value
-            if codec == "none" and length != elements * item_size:
-                raise BankedManifestError(
-                    f"banked component {comp_obj.get('component')!r} length "
-                    f"{length} does not match shape {shape} x {expert_count}"
-                )
+            expected_raw = elements * item_size
+            raw_length = comp_obj.get("raw_length")
+            if codec == "none":
+                if raw_length is not None:
+                    raise BankedManifestError(
+                        f"banked component {comp_obj.get('component')!r} carries "
+                        "raw_length under codec 'none'"
+                    )
+                if length != expected_raw:
+                    raise BankedManifestError(
+                        f"banked component {comp_obj.get('component')!r} length "
+                        f"{length} does not match shape {shape} x {expert_count}"
+                    )
+            else:
+                if not isinstance(raw_length, int):
+                    raise BankedManifestError(
+                        f"banked component {comp_obj.get('component')!r} under "
+                        f"codec {codec!r} needs an integral raw_length"
+                    )
+                if raw_length != expected_raw:
+                    raise BankedManifestError(
+                        f"banked component {comp_obj.get('component')!r} "
+                        f"raw_length {raw_length} does not match shape {shape} "
+                        f"x {expert_count}"
+                    )
             if offset != cursor:
                 raise BankedManifestError(
                     f"banked component {comp_obj.get('component')!r} offset "
@@ -321,6 +433,7 @@ def load_banked_manifest(path: Path | str) -> BankedManifest:
                     shape=shape,
                     offset=offset,
                     length=length,
+                    raw_length=None if codec == "none" else int(raw_length),
                 )
             )
         if not components:

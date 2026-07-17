@@ -479,8 +479,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="none",
         choices=["none", "rans32x-v1"],
         help=(
-            "Lossless codec of the banked sidecar. 'rans32x-v1' requires the "
-            "in-kernel decoder (issue #51 C7) and is rejected until it ships."
+            "Lossless codec of the banked sidecar. 'rans32x-v1' stores each "
+            "component bank as a static order-0 byte-rANS container that the "
+            "in-kernel decoder rebuilds at load (issue #51 C7)."
         ),
     )
     parser.add_argument(

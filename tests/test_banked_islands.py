@@ -28,7 +28,6 @@ from mtplx.expert_banked import (
 from mtplx.expert_io import PositionalExpertReader
 from mtplx.expert_manifest import build_expert_sidecar
 from mtplx.expert_runtime import (
-    ExpertStreamingConfig,
     ExpertStreamingConfigurationError,
     ExpertStreamingRuntime,
 )
@@ -148,12 +147,13 @@ def test_config_mmap_island_validation(tmp_path) -> None:
             mmap_island_layers=(1, 2),
             banked_manifest=str(manifest_path),
         )
-    with pytest.raises(ValueError, match="banked_codec"):
-        _config(
-            mmap_island_layers=(1,),
-            banked_manifest=str(manifest_path),
-            banked_codec="rans32x-v1",
-        )
+    # rans32x-v1 is accepted now that the in-kernel decoder ships (issue #51).
+    accepted = _config(
+        mmap_island_layers=(1,),
+        banked_manifest=str(manifest_path),
+        banked_codec="rans32x-v1",
+    )
+    assert accepted.banked_codec == "rans32x-v1"
     with pytest.raises(ValueError, match="banked_codec"):
         _config(banked_codec="gzip")
 
@@ -668,3 +668,171 @@ def test_banked_store_hot_path_is_protocol_free() -> None:
         "atomic",
     ):
         assert banned not in source, f"banked island path must not use {banned}"
+
+
+# ----------------------------------------------------- rANS codec (issue #51 C7)
+
+
+def _write_banked_codec(tmp_path, root, manifest, layers, codec):
+    out_bin = tmp_path / f"banked-{codec}" / "experts-banked.bin"
+    out_manifest = tmp_path / f"banked-{codec}" / "experts-banked-manifest.json"
+    banked = write_banked_expert_banks(
+        manifest,
+        root,
+        layers,
+        output_bin=out_bin,
+        output_manifest=out_manifest,
+        codec=codec,
+    )
+    return banked, out_bin, out_manifest
+
+
+def test_write_banked_rans_schema_and_pricing(tmp_path) -> None:
+    from mtplx.expert_banked import BANKED_CODECS
+
+    assert "rans32x-v1" in BANKED_CODECS
+    root, spec, manifest, _expected = _sidecar_artifact(tmp_path)
+    layers = tuple(spec.routed_layer_indices)
+    none_banked, _nb, _nm = _write_banked_codec(
+        tmp_path, root, manifest, layers, "none"
+    )
+    banked, _bin, out_manifest = _write_banked_codec(
+        tmp_path, root, manifest, layers, "rans32x-v1"
+    )
+
+    assert banked.codec == "rans32x-v1"
+    # Every compressed component records its uncompressed size; the stored
+    # length is the entropy-coded container and differs from raw.
+    for layer in banked.layers:
+        for comp in layer.components:
+            assert comp.raw_length is not None
+            assert comp.raw_bytes == comp.raw_length
+            assert comp.stored_bytes == comp.length
+    # Decoded footprint equals the raw (codec none) footprint exactly.
+    assert banked.raw_bytes == none_banked.raw_bytes
+    assert banked.raw_bytes == none_banked.stored_bytes
+    # Pricing is self-consistent.
+    assert banked.compression_ratio() == pytest.approx(
+        banked.raw_bytes / banked.stored_bytes
+    )
+    assert none_banked.compression_ratio() == 1.0
+
+    reloaded = load_banked_manifest(out_manifest)
+    assert reloaded.codec == "rans32x-v1"
+    assert reloaded.raw_bytes == banked.raw_bytes
+    assert reloaded.stored_bytes == banked.stored_bytes
+
+
+def test_load_banked_manifest_rans_validation(tmp_path) -> None:
+    root, spec, manifest, _expected = _sidecar_artifact(tmp_path)
+    layers = tuple(spec.routed_layer_indices)
+    _banked, _bin, out_manifest = _write_banked_codec(
+        tmp_path, root, manifest, layers, "rans32x-v1"
+    )
+    obj = json.loads(out_manifest.read_text())
+
+    # raw_length that disagrees with shape x expert_count is rejected.
+    bad_raw = json.loads(json.dumps(obj))
+    bad_raw["layers"][0]["components"][0]["raw_length"] += 4
+    bad_path = tmp_path / "bad-raw.json"
+    bad_path.write_text(json.dumps(bad_raw))
+    with pytest.raises(BankedManifestError, match="raw_length"):
+        load_banked_manifest(bad_path)
+
+    # A compressed component with no raw_length is rejected.
+    missing = json.loads(json.dumps(obj))
+    missing["layers"][0]["components"][0].pop("raw_length")
+    miss_path = tmp_path / "missing-raw.json"
+    miss_path.write_text(json.dumps(missing))
+    with pytest.raises(BankedManifestError, match="raw_length"):
+        load_banked_manifest(miss_path)
+
+
+def test_none_codec_rejects_raw_length(tmp_path) -> None:
+    root, spec, manifest, _expected = _sidecar_artifact(tmp_path)
+    _banked, _bin, out_manifest = _write_banked(
+        tmp_path, root, manifest, tuple(spec.routed_layer_indices)
+    )
+    obj = json.loads(out_manifest.read_text())
+    obj["layers"][0]["components"][0]["raw_length"] = 1
+    bad = tmp_path / "none-with-raw.json"
+    bad.write_text(json.dumps(obj))
+    with pytest.raises(BankedManifestError, match="raw_length"):
+        load_banked_manifest(bad)
+
+
+def test_banked_rans_store_matches_wired_fill(tmp_path, mlx) -> None:
+    import mlx.core as mx
+
+    from mtplx.models.expert_mlx import BankedMmapIslandStore, DenseIslandStore
+
+    root, spec, manifest, _expected = _sidecar_artifact(tmp_path)
+    layers = tuple(spec.routed_layer_indices)
+    _banked, _bin, banked_manifest = _write_banked_codec(
+        tmp_path, root, manifest, layers, "rans32x-v1"
+    )
+
+    rans_store = BankedMmapIslandStore(
+        banked_manifest,
+        layers,
+        expert_count=spec.expert_count,
+    )
+    wired_store = DenseIslandStore(
+        manifest,
+        layers,
+        expert_count=spec.expert_count,
+    )
+    reader = PositionalExpertReader(root)
+    try:
+        rans_store.prepare()
+        # Compressed banks are decoded, not mmapped: prefetch is a no-op.
+        assert rans_store.prefetch_all() == 0
+        wired_store.fill(manifest, reader, verify_hash=True)
+        reference = next(iter(manifest.records))
+        for layer in layers:
+            decoded = rans_store.bank_for_layer(layer)
+            wired = wired_store.bank_for_layer(layer)
+            for segment in reference.segments:
+                component = segment.component
+                assert decoded.arrays[component].shape == (
+                    wired.arrays[component].shape
+                )
+                assert decoded.arrays[component].dtype == (
+                    wired.arrays[component].dtype
+                )
+                assert mx.array_equal(
+                    decoded.arrays[component], wired.arrays[component]
+                ).item(), f"layer {layer} {component}"
+        snapshot = rans_store.snapshot()
+        assert snapshot["backend"] == "banked-rans-island-banks"
+        assert snapshot["codec"] == "rans32x-v1"
+        # Decoded banks are materialized: resident bytes are the raw footprint,
+        # stored (on-disk) bytes are the smaller compressed region.
+        assert snapshot["resident_bytes"] > snapshot["mapped_bytes"]
+    finally:
+        rans_store.close()
+        wired_store.close()
+        reader.close()
+
+
+def test_banked_rans_store_detects_corruption(tmp_path, mlx) -> None:
+    from mtplx.models.expert_mlx import BankedMmapIslandStore
+
+    root, spec, manifest, _expected = _sidecar_artifact(tmp_path)
+    layers = tuple(spec.routed_layer_indices)
+    banked, out_bin, banked_manifest = _write_banked_codec(
+        tmp_path, root, manifest, layers, "rans32x-v1"
+    )
+    payload = bytearray(out_bin.read_bytes())
+    payload[banked.layers[0].offset] ^= 0xFF
+    out_bin.write_bytes(payload)
+    store = BankedMmapIslandStore(
+        banked_manifest,
+        layers,
+        expert_count=spec.expert_count,
+    )
+    try:
+        with pytest.raises(BankedManifestError, match="hash"):
+            store.prepare()
+    finally:
+        store.close()

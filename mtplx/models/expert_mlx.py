@@ -747,11 +747,15 @@ class BankedMmapIslandStore:
         if not self.layers:
             raise ValueError("banked island store requires at least one layer")
         self._banked = load_banked_manifest(banked_manifest)
-        if self._banked.codec != "none":
+        # ``none`` maps raw bank bytes into Metal zero-copy; ``rans32x-v1``
+        # reads the compressed region and rebuilds each bank with the in-kernel
+        # rANS decoder in ``prepare`` (issue #51, C7). Any other codec has no
+        # decode path here.
+        if self._banked.codec not in ("none", "rans32x-v1"):
             raise BankedManifestError(
-                f"banked codec {self._banked.codec!r} requires the in-kernel "
-                "decoder (issue #51, C7); repack with codec 'none'"
+                f"banked codec {self._banked.codec!r} has no island decode path"
             )
+        self._codec = self._banked.codec
         if self._banked.expert_count != int(expert_count):
             raise BankedManifestError(
                 f"banked manifest holds {self._banked.expert_count} experts "
@@ -802,6 +806,11 @@ class BankedMmapIslandStore:
                         f"banked layer {layer} region hash mismatch"
                     )
                 self._verify_seconds += time.perf_counter() - started
+            if self._codec != "none":
+                self._banks[layer] = BankedMmapBank(
+                    self._decode_layer_banks(path, entry)
+                )
+                continue
             mapped_length = -(-entry.length // alignment) * alignment
             if entry.offset + mapped_length > file_size:
                 raise BankedManifestError(
@@ -839,6 +848,43 @@ class BankedMmapIslandStore:
             self._banks[layer] = BankedMmapBank(arrays)
             self._bases.append(base)
 
+    def _decode_layer_banks(self, path, entry) -> dict[str, mx.array]:
+        """Rebuild one layer's component banks from its compressed region.
+
+        Reads the entropy-coded region, runs the in-kernel rANS decoder per
+        component, and materializes each bank as ``[expert_count, *shape]`` in
+        its native dtype — row index == expert id, identical to the mmap path.
+        Decode happens once at prepare; the banks are then plain resident
+        arrays consumed by ``gather_qmm`` with no per-call host work.
+        """
+
+        from mtplx.expert_banked import BankedManifestError
+        from mtplx.expert_rans_metal import decode_container
+
+        with path.open("rb") as handle:
+            handle.seek(entry.offset)
+            region = handle.read(entry.length)
+        if len(region) != entry.length:
+            raise BankedManifestError(
+                f"banked layer {entry.layer} region is truncated"
+            )
+        arrays: dict[str, mx.array] = {}
+        for component in entry.components:
+            blob = region[component.offset : component.offset + component.length]
+            decoded = decode_container(blob)  # uint8[expert_count * seg_len]
+            if component.dtype == "U32":
+                typed = mx.view(decoded, mx.uint32)
+            elif component.dtype == "BF16":
+                typed = mx.view(decoded, mx.bfloat16)
+            else:
+                raise TypeError(
+                    f"unsupported banked component dtype {component.dtype}"
+                )
+            bank = typed.reshape(self.expert_count, *component.shape)
+            mx.eval(bank)  # materialize; releases the compressed payload graph
+            arrays[component.component] = bank
+        return arrays
+
     def prefetch_all(self) -> int:
         """Issue one MADV_WILLNEED batch across every mapped layer region."""
 
@@ -857,14 +903,26 @@ class BankedMmapIslandStore:
         return bank
 
     def snapshot(self) -> dict[str, Any]:
+        stored_bytes = sum(
+            self._banked.layer_entry(layer).length for layer in self.layers
+        )
+        resident_bytes = sum(
+            component.raw_bytes
+            for layer in self.layers
+            for component in self._banked.layer_entry(layer).components
+        )
         return {
-            "backend": "banked-mmap-island-banks",
+            "backend": (
+                "banked-mmap-island-banks"
+                if self._codec == "none"
+                else "banked-rans-island-banks"
+            ),
+            "codec": self._codec,
             "wired": self.wired,
             "layers": list(self.layers),
             "expert_count": self.expert_count,
-            "mapped_bytes": sum(
-                self._banked.layer_entry(layer).length for layer in self.layers
-            ),
+            "mapped_bytes": stored_bytes,
+            "resident_bytes": resident_bytes,
             "verify_seconds": self._verify_seconds,
             "prepared_layers": len(self._banks),
         }
