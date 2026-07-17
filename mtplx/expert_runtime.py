@@ -148,6 +148,7 @@ class ExpertStreamingConfig:
     mmap_island_layers: tuple[int, ...] = ()
     banked_manifest: str | None = None
     banked_codec: str = "none"
+    banked_band_bytes: int | None = None
     mmap_island_residency: str = "wired"
 
     def __post_init__(self) -> None:
@@ -263,6 +264,19 @@ class ExpertStreamingConfig:
                 "banked_codec 'rans32x-v1' has no decoder; use 'none' or "
                 "'huffman-l12-v1'"
             )
+        if self.banked_band_bytes is not None:
+            object.__setattr__(
+                self,
+                "banked_band_bytes",
+                _integer("banked_band_bytes", self.banked_band_bytes, minimum=1),
+            )
+        if self.banked_codec != "none" and self.mmap_island_layers and (
+            self.banked_band_bytes is None
+        ):
+            raise ValueError(
+                "compressed banked bands require an explicit banked_band_bytes "
+                "budget (run the memory calculator to size it)"
+            )
         if normalized_mmap:
             if self.banked_manifest is None:
                 raise ValueError(
@@ -340,7 +354,6 @@ class ExpertStreamingConfig:
         spec: ExpertStreamingModelSpec,
         *,
         additional_resident_bytes: int = 0,
-        mmap_island_bytes_override: int | None = None,
     ) -> ExpertMemoryPlan:
         # File-backed Metal records use the OS page cache as their physical
         # tier and never consume fixed MLX expert slots. Retain only a tiny
@@ -365,7 +378,7 @@ class ExpertStreamingConfig:
             island_layer_count=len(self.island_layers),
             mmap_island_layer_count=len(self.mmap_island_layers),
             mmap_islands_wired=(self.mmap_island_residency != "paged"),
-            mmap_island_bytes_override=mmap_island_bytes_override,
+            mmap_island_bytes_override=self.banked_band_bytes,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1163,33 +1176,6 @@ class PendingSplitRoute:
         self.close()
 
 
-def banked_band_bytes_for_config(config: "ExpertStreamingConfig") -> int | None:
-    """True on-disk bytes of a compressed banked band, for plan accounting.
-
-    Returns None when no compressed band is configured (raw bands are
-    charged at their raw footprint by the plan itself). Every plan
-    computation for a config MUST use this same override — envelope math
-    recomputed with different inputs at different call sites is how the
-    fits-check and the cap drift apart.
-    """
-
-    if not config.mmap_island_layers or not config.banked_manifest:
-        return None
-    from mtplx.expert_banked import BankedManifestError, load_banked_manifest
-
-    try:
-        banked = load_banked_manifest(Path(config.banked_manifest))
-    except BankedManifestError:
-        return None  # open() raises the descriptive error
-    if banked.codec == "none":
-        return None
-    return sum(
-        banked.layer_entry(layer).length
-        for layer in config.mmap_island_layers
-        if layer in banked.layer_set
-    )
-
-
 def reconcile_mlx_memory_cap(
     plan: ExpertMemoryPlan,
     *,
@@ -1428,7 +1414,6 @@ class ExpertStreamingRuntime:
                 f"{model_spec.key}: {sorted(model_spec.routed_layer_indices)[:3]}"
                 f"..{sorted(model_spec.routed_layer_indices)[-1]}"
             )
-        banked_band_bytes = banked_band_bytes_for_config(config)
         if config.mmap_island_layers:
             if not set(config.mmap_island_layers) <= set(
                 model_spec.routed_layer_indices
@@ -1461,6 +1446,23 @@ class ExpertStreamingRuntime:
                     f"banked manifest holds {banked.expert_count} experts per "
                     f"layer; {model_spec.key} routes {model_spec.expert_count}"
                 )
+            if banked.codec != "none":
+                actual = sum(
+                    banked.layer_entry(layer).length
+                    for layer in config.mmap_island_layers
+                )
+                if config.banked_band_bytes is None:
+                    raise ExpertStreamingConfigurationError(
+                        "compressed banked band requires banked_band_bytes; "
+                        f"the manifest's covered layers occupy {actual} bytes "
+                        "(size it with the memory calculator)"
+                    )
+                if actual > config.banked_band_bytes:
+                    raise ExpertStreamingConfigurationError(
+                        f"banked band occupies {actual} bytes but "
+                        f"banked_band_bytes budgets only "
+                        f"{config.banked_band_bytes}"
+                    )
         integrity_report = None
         if config.verify_artifact_headers or config.verify_sidecar_hash_at_open:
             if config.verify_sidecar_hash_at_open and manifest.sidecar is None:
@@ -1475,7 +1477,6 @@ class ExpertStreamingRuntime:
         plan = config.memory_plan(
             model_spec,
             additional_resident_bytes=additional_resident_bytes,
-            mmap_island_bytes_override=banked_band_bytes,
         )
         if not plan.fits_fixed:
             raise ExpertStreamingConfigurationError(
