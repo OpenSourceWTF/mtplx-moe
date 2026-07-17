@@ -478,6 +478,7 @@ def plan_expert_memory(
     mmap_islands_wired: bool = True,
     prefetch_slots_per_layer: int = 0,
     miss_shadow: str | None = None,
+    miss_shadow_layers: int | None = None,
 ) -> ExpertMemoryPlan:
     """Fit uniform persistent expert slots under an explicit memory ceiling.
 
@@ -594,8 +595,19 @@ def plan_expert_memory(
     if miss_shadow is not None and miss_shadow not in SHADOW_CODECS:
         choices = ", ".join(repr(codec) for codec in SHADOW_CODECS)
         raise ValueError(f"miss_shadow must be None, {choices}")
+    if miss_shadow_layers is not None:
+        miss_shadow_layers = _integer(
+            "miss_shadow_layers", miss_shadow_layers, minimum=1
+        )
+        if miss_shadow is None:
+            raise ValueError("miss_shadow_layers requires miss_shadow")
+    shadow_layer_count = (
+        min(miss_shadow_layers, streamed_layer_count)
+        if miss_shadow is not None and miss_shadow_layers is not None
+        else streamed_layer_count
+    )
     shadow_bytes = (
-        streamed_layer_count
+        shadow_layer_count
         * spec.expert_count
         * shadow_record_bytes(miss_shadow, spec.expert_source_parameters)
         if miss_shadow is not None

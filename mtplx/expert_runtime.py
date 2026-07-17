@@ -175,6 +175,7 @@ class ExpertStreamingConfig:
     prefetch_slots: int = 0
     route_census: bool = True
     miss_shadow: str | None = None
+    miss_shadow_layers: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -248,6 +249,18 @@ class ExpertStreamingConfig:
                 raise ValueError(
                     "miss_shadow requires the component-banks slot layout"
                 )
+        if self.miss_shadow_layers is not None:
+            if self.miss_shadow is None:
+                raise ValueError(
+                    "miss_shadow_layers requires miss_shadow to be set"
+                )
+            object.__setattr__(
+                self,
+                "miss_shadow_layers",
+                _integer(
+                    "miss_shadow_layers", self.miss_shadow_layers, minimum=1
+                ),
+            )
         if self.split_route_release not in {"fenced", "deferred"}:
             raise ValueError(
                 "split_route_release must be 'fenced' or 'deferred'"
@@ -471,6 +484,7 @@ class ExpertStreamingConfig:
             mmap_islands_wired=self.mmap_island_wired,
             prefetch_slots_per_layer=self.prefetch_slots,
             miss_shadow=self.miss_shadow,
+            miss_shadow_layers=self.miss_shadow_layers,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1755,6 +1769,22 @@ class ExpertStreamingRuntime:
                     for layer in model_spec.routed_layer_indices
                     if layer not in runtime.island_layer_set
                 )
+                if config.miss_shadow_layers is not None:
+                    # Worst layers first: pin-order-first streamed layers
+                    # route flattest, so their exact-cache hit rate is
+                    # lowest and shadows displace the most stall time.
+                    streamed_set = set(streamed_layers)
+                    ranked = [
+                        layer
+                        for layer in model_spec.island_pin_order
+                        if layer in streamed_set
+                    ]
+                    ranked += [
+                        layer for layer in streamed_layers if layer not in ranked
+                    ]
+                    streamed_layers = tuple(
+                        sorted(ranked[: config.miss_shadow_layers])
+                    )
                 # The store constructor is the loud fence: it rejects a plan
                 # whose shadow pricing does not match this codec/layer set.
                 shadow_store = ShadowBankStore(
