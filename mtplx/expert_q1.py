@@ -190,9 +190,9 @@ def decode_q1_record(
 
 
 def read_q1_record(manifest: Q1Manifest, record: Q1Record) -> bytes:
-    blob = manifest.bin_path().read_bytes()[
-        record.offset : record.offset + record.length
-    ]
+    with manifest.bin_path().open("rb") as handle:
+        handle.seek(record.offset)
+        blob = handle.read(record.length)
     if len(blob) != record.length:
         raise Q1ManifestError(
             f"short q1 read for ({record.layer}, {record.expert})"
