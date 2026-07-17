@@ -1163,33 +1163,6 @@ class PendingSplitRoute:
         self.close()
 
 
-def banked_band_bytes_for_config(config: "ExpertStreamingConfig") -> int | None:
-    """True on-disk bytes of a compressed banked band, for plan accounting.
-
-    Returns None when no compressed band is configured (raw bands are
-    charged at their raw footprint by the plan itself). Every plan
-    computation for a config MUST use this same override — envelope math
-    recomputed with different inputs at different call sites is how the
-    fits-check and the cap drift apart.
-    """
-
-    if not config.mmap_island_layers or not config.banked_manifest:
-        return None
-    from mtplx.expert_banked import BankedManifestError, load_banked_manifest
-
-    try:
-        banked = load_banked_manifest(Path(config.banked_manifest))
-    except BankedManifestError:
-        return None  # open() raises the descriptive error
-    if banked.codec == "none":
-        return None
-    return sum(
-        banked.layer_entry(layer).length
-        for layer in config.mmap_island_layers
-        if layer in banked.layer_set
-    )
-
-
 def reconcile_mlx_memory_cap(
     plan: ExpertMemoryPlan,
     *,
@@ -1428,7 +1401,7 @@ class ExpertStreamingRuntime:
                 f"{model_spec.key}: {sorted(model_spec.routed_layer_indices)[:3]}"
                 f"..{sorted(model_spec.routed_layer_indices)[-1]}"
             )
-        banked_band_bytes = banked_band_bytes_for_config(config)
+        banked_band_bytes = None
         if config.mmap_island_layers:
             if not set(config.mmap_island_layers) <= set(
                 model_spec.routed_layer_indices
@@ -1460,6 +1433,11 @@ class ExpertStreamingRuntime:
                 raise ExpertStreamingConfigurationError(
                     f"banked manifest holds {banked.expert_count} experts per "
                     f"layer; {model_spec.key} routes {model_spec.expert_count}"
+                )
+            if banked.codec != "none":
+                banked_band_bytes = sum(
+                    banked.layer_entry(layer).length
+                    for layer in config.mmap_island_layers
                 )
         integrity_report = None
         if config.verify_artifact_headers or config.verify_sidecar_hash_at_open:
