@@ -77,6 +77,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "deferred_pin_release": True,
     "island_layers": "",
     "island_layer_count": None,
+    "resident_quant": None,
     "mmap_island_layers": "",
     "banked_manifest": "",
     "banked_codec": "none",
@@ -497,6 +498,16 @@ def build_parser() -> argparse.ArgumentParser:
             "via --expert-cache-limit."
         ),
     )
+    parser.add_argument(
+        "--resident-quant",
+        choices=("q8", "q4"),
+        default=None,
+        help=(
+            "Quantize the resident attention/shared/dense-MLP Linears at "
+            "load time (group 64 affine). Routers, embeddings, and the LM "
+            "head keep their loaded precision. No artifact rebuild."
+        ),
+    )
     parser.add_argument("--output-json", type=Path)
     return parser
 
@@ -575,6 +586,7 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "deferred_pin_release": bool(args.deferred_pin_release),
         "island_layers": args.island_layers,
         "island_layer_count": args.island_layer_count,
+        "resident_quant": args.resident_quant,
         "mmap_island_layers": args.mmap_island_layers,
         "banked_manifest": args.banked_manifest,
         "banked_codec": args.banked_codec,
@@ -2045,6 +2057,7 @@ def _runtime_config(
         trace_routes=bool(options["trace_routes"]),
         island_layers=parse_island_layers(options.get("island_layers", "")),
         island_layer_count=options.get("island_layer_count"),
+        resident_quant=options.get("resident_quant") or None,
         mmap_island_layers=parse_island_layers(
             options.get("mmap_island_layers", "")
         ),

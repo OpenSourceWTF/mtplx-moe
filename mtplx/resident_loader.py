@@ -26,8 +26,10 @@ class ResidentLoadReport:
     evaluated_parameter_count: int
     bound_sparse_layers: int
     strict: bool
+    resident_quant: str | None = None
+    resident_quantized_modules: int = 0
 
-    def as_dict(self) -> dict[str, int | bool]:
+    def as_dict(self) -> dict[str, int | bool | str | None]:
         return {
             "shard_count": self.shard_count,
             "tensor_count": self.tensor_count,
@@ -35,6 +37,8 @@ class ResidentLoadReport:
             "evaluated_parameter_count": self.evaluated_parameter_count,
             "bound_sparse_layers": self.bound_sparse_layers,
             "strict": self.strict,
+            "resident_quant": self.resident_quant,
+            "resident_quantized_modules": self.resident_quantized_modules,
         }
 
 
@@ -190,6 +194,55 @@ def _quantize_resident_model(
     )
 
 
+_RESIDENT_QUANT_BITS = {"q8": 8, "q4": 4}
+_ATTENTION_PROJ_SUFFIXES = (".q_proj", ".k_proj", ".v_proj", ".o_proj")
+_MLP_PROJ_SUFFIXES = (".gate_proj", ".up_proj", ".down_proj", ".gate_up_proj")
+
+
+def _runtime_quantize_resident(model: Any, mode: str) -> list[str]:
+    """Quantize the bandwidth-dominant resident Linears after a BF16 load.
+
+    Scope: attention projections, shared-expert MLPs (split or fused), and
+    dense-layer MLP projections. Router gates, embeddings, the LM head,
+    norms, and MTP glue keep their loaded precision — the router picks
+    experts, so its numerics stay exact.
+    """
+
+    try:
+        import mlx.nn as nn
+    except Exception as exc:
+        raise ResidentLoadError(
+            f"MLX NN is required for resident quantization: {exc}"
+        ) from exc
+    bits = _RESIDENT_QUANT_BITS[mode]
+    quantized: list[str] = []
+
+    def predicate(path: str, module: Any) -> bool:
+        if not isinstance(module, nn.Linear) or isinstance(
+            module, nn.QuantizedLinear
+        ):
+            return False
+        if ".self_attn." in path and path.endswith(_ATTENTION_PROJ_SUFFIXES):
+            quantized.append(path)
+            return True
+        if ".shared_mlp." in path and path.endswith(_MLP_PROJ_SUFFIXES):
+            quantized.append(path)
+            return True
+        if ".mlp" in path and path.endswith(_MLP_PROJ_SUFFIXES):
+            quantized.append(path)
+            return True
+        return False
+
+    nn.quantize(
+        model, group_size=64, bits=bits, mode="affine", class_predicate=predicate
+    )
+    if not quantized:
+        raise ResidentLoadError(
+            f"resident_quant={mode!r} matched no resident Linear modules"
+        )
+    return quantized
+
+
 def construct_resident_model(
     root: Path | str,
     runtime: ExpertStreamingRuntime,
@@ -242,6 +295,13 @@ def construct_resident_model(
         model.load_weights(list(weights.items()), strict=strict)
     except Exception as exc:
         raise ResidentLoadError(f"resident parameter validation failed: {exc}") from exc
+    resident_quant = getattr(runtime.config, "resident_quant", None)
+    quantized_paths: list[str] = []
+    if resident_quant:
+        # Drop the loader's references first so each replaced BF16 weight
+        # frees as its quantized module lands, instead of at function exit.
+        weights.clear()
+        quantized_paths = _runtime_quantize_resident(model, resident_quant)
     if mx_module is None:
         import mlx.core as mx
     else:
@@ -259,6 +319,8 @@ def construct_resident_model(
         evaluated_parameter_count=parameter_count,
         bound_sparse_layers=bound,
         strict=strict,
+        resident_quant=resident_quant,
+        resident_quantized_modules=len(quantized_paths),
     )
     setattr(model, "_mtplx_expert_runtime", runtime)
     setattr(model, "_mtplx_resident_load_report", report.as_dict())

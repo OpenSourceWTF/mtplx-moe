@@ -152,6 +152,7 @@ class ExpertStreamingConfig:
     banked_manifest: str | None = None
     banked_codec: str = "none"
     mmap_island_wired: bool = True
+    resident_quant: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -212,6 +213,8 @@ class ExpertStreamingConfig:
             )
         if not isinstance(self.deferred_pin_release, bool):
             raise ValueError("deferred_pin_release must be bool")
+        if self.resident_quant not in {None, "q8", "q4"}:
+            raise ValueError("resident_quant must be None, 'q8', or 'q4'")
         if self.island_layer_count is not None:
             if self.island_layers:
                 raise ValueError(
