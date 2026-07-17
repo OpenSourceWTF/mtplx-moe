@@ -392,6 +392,12 @@ GLM52_Q4 = ExpertStreamingModelSpec(
 
 
 GLM52_EXPERT_Q2 = ExpertStreamingModelSpec(
+    # island_pin_order below: measured 2026-07-17 from 1023 decode steps /
+    # 613,800 routed assignments (ctx 1024 deterministic AR, 44 GiB cache =
+    # 53 slots/layer), ranked by ascending top-53 expert coverage.
+    # Rank-stable across K (Spearman >= 0.956 for K in 32..128); mean
+    # cov@53 0.499 vs 0.517 measured decode hit rate. Earliest routed
+    # layers route flattest, like hy3.
     key="glm52-expert-q2",
     display_name="GLM-5.2 expert-only affine Q2",
     source_model="zai-org/GLM-5.2",
@@ -416,6 +422,13 @@ GLM52_EXPERT_Q2 = ExpertStreamingModelSpec(
     mtp_layer_index=78,
     mtp_included=False,
     full_indexer_layers=(0, 1, 2, *range(6, 75, 4)),
+    island_pin_order=(
+        5, 3, 4, 9, 7, 11, 8, 10, 6, 16, 13, 26, 14, 25, 24,
+        49, 65, 70, 23, 54, 67, 66, 12, 52, 59, 15, 47, 71, 69, 62,
+        17, 48, 61, 68, 74, 53, 57, 76, 75, 73, 60, 55, 77, 30, 29,
+        72, 56, 27, 46, 63, 51, 28, 50, 64, 22, 58, 44, 38, 45, 39,
+        43, 31, 42, 21, 35, 41, 40, 34, 37, 19, 36, 32, 33, 18, 20,
+    ),
 )
 
 
