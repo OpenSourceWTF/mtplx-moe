@@ -410,6 +410,7 @@ def plan_expert_memory(
     island_layer_count: int = 0,
     mmap_island_layer_count: int = 0,
     mmap_islands_wired: bool = True,
+    mmap_island_bytes_override: int | None = None,
 ) -> ExpertMemoryPlan:
     """Fit uniform persistent expert slots under an explicit memory ceiling.
 
@@ -492,6 +493,13 @@ def plan_expert_memory(
     mmap_island_bytes = (
         mmap_island_layer_count * spec.expert_count * spec.expert_record_bytes
     )
+    if mmap_island_bytes_override is not None:
+        # Compressed banked bands occupy their true on-disk region bytes,
+        # not the raw record footprint; the caller reads them from the
+        # banked manifest.
+        mmap_island_bytes = _integer(
+            "mmap_island_bytes_override", mmap_island_bytes_override, minimum=0
+        )
     streamed_layer_count = (
         spec.routed_layer_count - island_layer_count - mmap_island_layer_count
     )
