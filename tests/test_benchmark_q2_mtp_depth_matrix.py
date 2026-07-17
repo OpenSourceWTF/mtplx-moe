@@ -461,6 +461,9 @@ def test_issue51_kernel_selectors_parse_independently() -> None:
     assert args.hy3_mtp_shared_kernel == "metal-exact"
     assert args.hy3_mtp_shared_kernel_depth == 3
     assert module._runtime_options_from_args(args)["hy3_mtp_shared_kernel"] == (
+        "metal-exact"
+    )
+
     for selector in (
         "steel-r1-fused-r2",
         "mpp-fp32-splitk-r1-fused-r2",
