@@ -810,17 +810,36 @@ class SparseMLP(nn.Module):
         prefetch = getattr(runtime, "prefetch_experts", None)
         if prefetch is None or int(x.shape[-2]) != 1:
             return
-        islands = getattr(runtime, "island_layer_set", frozenset())
-        predictions = [
-            (next_layer, router(x)[0])
-            for next_layer, router in lookahead.entries
-            if next_layer not in islands
-        ]
-        if not predictions:
+        # Fire only from STREAMED source layers, for STREAMED targets.
+        # Island layers have no per-layer host sync of their own, so
+        # firing there added a brand-new sync per island per token —
+        # measured d0 12.5 -> 9.2 at the 90 GiB config. The selection is
+        # config-dependent; cache it per layer as plain ints (a tuple of
+        # modules would re-register parameters under Module.__setattr__).
+        selection = getattr(self, "_mtplx_lookahead_selection", None)
+        if selection is None:
+            islands = getattr(runtime, "island_layer_set", frozenset())
+            if self.layer_index in islands:
+                selection = ()
+            else:
+                selection = tuple(
+                    position
+                    for position, (next_layer, _router) in enumerate(
+                        lookahead.entries
+                    )
+                    if next_layer not in islands
+                )[:3]
+            self._mtplx_lookahead_selection = selection
+        if not selection:
             return
+        predictions = [
+            (lookahead.entries[position][0], lookahead.entries[position][1](x)[0])
+            for position in selection
+        ]
         # The predictions are not ancestors of this layer's output, so they
         # would not ride along with the switch's own eval; materialize them
-        # together with the layer's own indices in one host sync.
+        # together with the layer's own indices in one host sync (the
+        # streamed switch would sync on these indices anyway).
         mx.eval(indices, *(predicted for _layer, predicted in predictions))
         for next_layer, predicted in predictions:
             prefetch(
@@ -1001,12 +1020,15 @@ class Hy3Model(nn.Module):
             for layer_index, layer in enumerate(self.layers)
             if isinstance(layer.mlp, SparseMLP)
         ]
+        # A wide window (8) lets a streamed layer reach past intervening
+        # island layers to the next few STREAMED targets; the hook filters
+        # and caps at fire time.
         for position, (_layer_index, mlp) in enumerate(sparse_mlps):
             mlp._mtplx_next_routers = _LookaheadRouters(
                 tuple(
                     (next_index, next_mlp.router)
                     for next_index, next_mlp in sparse_mlps[
-                        position + 1 : position + 4
+                        position + 1 : position + 9
                     ]
                 )
             )
