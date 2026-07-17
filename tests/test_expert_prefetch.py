@@ -141,14 +141,27 @@ def test_lookahead_router_refs_stay_out_of_parameter_tree() -> None:
 
 
 class _RuntimeStub:
-    def __init__(self, *, prefetch_slots: int, islands=frozenset()) -> None:
+    def __init__(
+        self,
+        *,
+        prefetch_slots: int,
+        islands=frozenset(),
+        saturate_after: int | None = None,
+    ) -> None:
         self.config = SimpleNamespace(prefetch_slots=prefetch_slots)
         self.island_layer_set = frozenset(islands)
         self.calls: list[tuple[int, list[int]]] = []
+        self.speculation_saturated = False
+        self._saturate_after = saturate_after
 
     def prefetch_experts(self, layer: int, expert_ids) -> int:
         ids = [int(expert) for expert in expert_ids]
         self.calls.append((layer, ids))
+        if (
+            self._saturate_after is not None
+            and len(self.calls) >= self._saturate_after
+        ):
+            self.speculation_saturated = True
         return len(ids)
 
 
@@ -196,6 +209,37 @@ def test_sparse_mlp_decode_call_prefetches_next_streamed_layers() -> None:
     tail.switch_mlp = _StubSwitch(tail_runtime)
     mx.eval(tail(x))
     assert tail_runtime.calls == []
+
+
+def test_lookahead_drops_far_layers_first_under_admission_pressure() -> None:
+    """Overlap decays with lookahead depth (74.3% at L=1, 61% at L=3):
+    predictions issue nearest-first, and once the speculative lane
+    saturates, the farther (lower-value) layers are dropped."""
+
+    args = _model_args()
+    model = Hy3Model(args)
+    mlp = model.model.layers[2].mlp
+
+    # Saturated at entry: no prediction work at all.
+    runtime = _RuntimeStub(prefetch_slots=4)
+    runtime.speculation_saturated = True
+    mlp.switch_mlp = _StubSwitch(runtime)
+    x = mx.random.normal((1, 1, args.hidden_size))
+    mx.eval(mlp(x))
+    assert runtime.calls == []
+
+    # Saturation after the first issue: only the nearest lookahead layer
+    # (highest overlap) gets its prediction in; L>=2 are dropped.
+    runtime = _RuntimeStub(prefetch_slots=4, saturate_after=1)
+    mlp.switch_mlp = _StubSwitch(runtime)
+    mx.eval(mlp(x))
+    assert [layer for layer, _ids in runtime.calls] == [3]
+
+    # Unsaturated: the full nearest-first order is preserved.
+    runtime = _RuntimeStub(prefetch_slots=4)
+    mlp.switch_mlp = _StubSwitch(runtime)
+    mx.eval(mlp(x))
+    assert [layer for layer, _ids in runtime.calls] == [3, 4, 5]
 
 
 def test_lookahead_hook_is_inert_without_a_bound_runtime() -> None:

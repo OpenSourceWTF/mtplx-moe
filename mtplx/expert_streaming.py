@@ -198,6 +198,11 @@ class LayerExpertSlotBank:
     aligned ``pread``.
     """
 
+    # Decode epochs a ring-evicted expert stays unpredictable. Ring
+    # turnover at high miss volume otherwise evicts and re-reads the same
+    # hot experts every couple of tokens, multiplying SSD traffic.
+    prefetch_reeviction_window = 2
+
     def __init__(
         self,
         *,
@@ -254,6 +259,10 @@ class LayerExpertSlotBank:
         self._prefetch_inflight: dict[int, tuple[int, int]] = {}
         self._prefetch_cursor = 0
         self._prefetch_ticket = 0
+        # Ring-evicted experts under re-prediction embargo: expert ->
+        # decode epoch at eviction. Rapid ring turnover otherwise
+        # re-reads the same hot experts token after token.
+        self._prefetch_evicted: dict[int, int] = {}
 
     @property
     def resident_experts(self) -> tuple[int, ...]:
@@ -301,6 +310,7 @@ class LayerExpertSlotBank:
         self._prefetch_expert_to_slot.clear()
         self._prefetch_inflight.clear()
         self._prefetch_cursor = 0
+        self._prefetch_evicted.clear()
 
     def plan_prefetch(self, expert_ids: Iterable[int]) -> tuple[SlotLoad, ...]:
         """Assign ring slots for predicted experts and return their loads.
@@ -341,6 +351,16 @@ class LayerExpertSlotBank:
                 or expert in self._prefetch_inflight
             ):
                 continue
+            evicted_epoch = self._prefetch_evicted.get(expert)
+            if evicted_epoch is not None:
+                if (
+                    self._decode_epoch - evicted_epoch
+                    < self.prefetch_reeviction_window
+                ):
+                    # Just evicted from the ring: re-reading it now is the
+                    # turnover churn this embargo exists to stop.
+                    continue
+                del self._prefetch_evicted[expert]
             ring_index: int | None = None
             for _probe in range(self.prefetch_slots):
                 candidate = self._prefetch_cursor % self.prefetch_slots
@@ -355,6 +375,7 @@ class LayerExpertSlotBank:
             victim = self._prefetch_slot_to_expert[ring_index]
             if victim is not None:
                 self._prefetch_expert_to_slot.pop(victim, None)
+                self._prefetch_evicted[victim] = self._decode_epoch
             self._prefetch_slot_to_expert[ring_index] = expert
             ticket = self._prefetch_ticket
             self._prefetch_ticket += 1

@@ -1621,6 +1621,11 @@ class ExpertStreamingRuntime:
         self._prefetch_completions: dict[
             int, list[tuple[int, int | None, bool]]
         ] = {}
+        # Each layer's most recent route-plan misses (updated under the
+        # layer lock): their bytes are streaming in on the demand path or
+        # freshly transient-resident, so predicting them again would only
+        # duplicate the read.
+        self._recent_route_misses: dict[int, frozenset[int]] = {}
         # Sustained decode can predict faster than the executor reads.
         # Without a ceiling the queue grows without bound: every queued
         # load is stale by the time it runs (its assignment recycled many
@@ -2171,7 +2176,17 @@ class ExpertStreamingRuntime:
                 expert_ids,
                 phase=phase,
             )
-        return self._banks[layer].plan_transaction(expert_ids, phase=phase)
+        plan, policy_txn = self._banks[layer].plan_transaction(
+            expert_ids, phase=phase
+        )
+        # Advisory record for the speculative lane (caller holds the layer
+        # lock): the demand path is about to stream these records, so
+        # predicting them again would duplicate the read. An all-hit plan
+        # clears the record — its previous misses are resident by now.
+        self._recent_route_misses[layer] = frozenset(
+            load.expert for load in plan.loads
+        )
+        return plan, policy_txn
 
     def _invalidate_policy_expert(self, layer: int, expert: int) -> int | None:
         if self._global_bank is not None:
@@ -2633,6 +2648,20 @@ class ExpertStreamingRuntime:
             self._shadow_serve_assignments += int(assignments)
             self._shadow_serve_experts += int(experts)
 
+    @property
+    def speculation_saturated(self) -> bool:
+        """True when the speculative lane should not take more predictions.
+
+        The lookahead hook consults this before spending router compute
+        and between per-layer issues, so under admission pressure the
+        farther (lower-overlap) lookahead layers are dropped first.
+        """
+
+        if self._prefetch_executor is None:
+            return True
+        with self._prefetch_lock:
+            return len(self._prefetch_futures) >= self._prefetch_backlog_limit
+
     def prefetch_experts(self, layer: int, expert_ids: Iterable[int]) -> int:
         """Speculatively load predicted experts into the layer's ring tier.
 
@@ -2672,6 +2701,13 @@ class ExpertStreamingRuntime:
                 backlog = len(self._prefetch_futures)
             if backlog >= self._prefetch_backlog_limit:
                 return 0
+            recent_misses = self._recent_route_misses.get(layer)
+            if recent_misses:
+                expert_ids = [
+                    expert
+                    for expert in expert_ids
+                    if expert not in recent_misses
+                ]
             loads = bank.plan_prefetch(expert_ids)
             # Assignment tickets bind each load's completion to the exact
             # assignment it filled: the same expert can be recycled and
@@ -2840,6 +2876,7 @@ class ExpertStreamingRuntime:
             else:
                 for bank in self._banks.values():
                     bank.reset()
+            self._recent_route_misses.clear()
             with self._counter_lock:
                 self.counters = CacheCounters()
                 self._layer_counters = {

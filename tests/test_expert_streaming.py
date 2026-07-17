@@ -686,6 +686,39 @@ def test_prefetch_ring_resolves_hits_without_touching_persistent_tier():
     assert bank.plan([10], phase="decode").hits == ()
 
 
+def test_prefetch_ring_defers_repredicting_recent_evictions():
+    """A just-evicted ring expert is not immediately re-assignable: ring
+    turnover otherwise re-reads the same hot experts token after token
+    (churn measured at the 90g operating point). The embargo is measured
+    in decode epochs and lifts after prefetch_reeviction_window plans."""
+
+    bank = LayerExpertSlotBank(
+        expert_count=8,
+        persistent_slots=1,
+        transient_slots=1,
+        prefetch_slots=1,
+    )
+    assert bank.prefetch_reeviction_window == 2
+    (first,) = bank.plan_prefetch([3])
+    assert first.expert == 3
+    assert bank.commit_prefetch(3) is True
+    # Recycling for 4 evicts published 3 and starts its embargo.
+    (second,) = bank.plan_prefetch([4])
+    assert second.expert == 4
+    assert bank.commit_prefetch(4) is True
+    assert bank.plan_prefetch([3]) == ()
+    bank.plan([0], phase="decode")
+    assert bank.plan_prefetch([3]) == ()
+    bank.plan([0], phase="decode")
+    # Window elapsed: 3 is predictable again (and evicts published 4).
+    (third,) = bank.plan_prefetch([3])
+    assert third.expert == 3
+    # Failure invalidation is NOT an eviction: retrying is legitimate.
+    assert bank.invalidate_prefetch(3, ticket=bank.prefetch_ticket(3)) is not None
+    (retry,) = bank.plan_prefetch([3])
+    assert retry.expert == 3
+
+
 def test_prefetch_commit_ticket_binds_exactly_one_assignment():
     bank = LayerExpertSlotBank(
         expert_count=8,

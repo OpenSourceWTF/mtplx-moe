@@ -3403,6 +3403,55 @@ def test_speculative_io_admission_caps_prefetch_read_concurrency(
         runtime.close()
 
 
+def test_prefetch_skips_experts_the_route_is_already_loading(
+    tmp_path: Path,
+) -> None:
+    """Speculation must not duplicate the demand path: predictions that
+    match the layer's most recent route misses are dropped (their bytes
+    are already streaming in or freshly transient-resident)."""
+
+    root, config, spec, manifest_path = _integrated_hy3_artifact(
+        tmp_path, expert_count=4, top_k=1
+    )
+    runtime = _open_prefetch_runtime(
+        root, manifest_path, spec, prefetch_slots=2
+    )
+    layer = 1
+    bank = runtime._banks[layer]
+    lock = runtime._layer_locks[layer]
+    try:
+        # Occupy the single persistent slot with a repeat visitor so the
+        # next miss is transient-served (not persistent-resident, which
+        # the ring would already skip on its own).
+        for _repeat in range(2):
+            ready = runtime.ensure_route(layer, [1], phase="decode")
+            ready.release()
+        ready = runtime.ensure_route(layer, [2], phase="decode")
+        ready.release()
+        with lock:
+            assert 2 not in bank._expert_to_slot
+        # 2 was the route's own miss: the prediction is dropped; 3 issues.
+        issued = runtime.prefetch_experts(layer, [2, 3])
+        assert issued == 1
+        with lock:
+            assert 3 in bank._prefetch_inflight
+            assert 2 not in bank._prefetch_inflight
+
+        # Saturation surface for the lookahead hook: an idle enabled lane
+        # is not saturated; a disabled lane always is.
+        assert runtime.speculation_saturated is False
+    finally:
+        runtime.close()
+
+    disabled = _open_prefetch_runtime(
+        root, manifest_path, spec, prefetch_slots=0
+    )
+    try:
+        assert disabled.speculation_saturated is True
+    finally:
+        disabled.close()
+
+
 def test_prefetch_workers_never_block_on_layer_locks(
     tmp_path: Path,
 ) -> None:
