@@ -648,11 +648,15 @@ class BankedMmapIslandStore:
         *,
         expert_count: int,
         verify_hash: bool = True,
-        wired: bool = True,
+        residency: str = "wired",
     ) -> None:
         from mtplx.expert_banked import BankedManifestError, load_banked_manifest
 
-        self.wired = bool(wired)
+        if residency not in {"wired", "paged", "copy"}:
+            raise ValueError(
+                "banked residency must be 'wired', 'paged', or 'copy'"
+            )
+        self.residency = str(residency)
         self.layers = tuple(sorted({int(layer) for layer in layers}))
         if not self.layers:
             raise ValueError("banked island store requires at least one layer")
@@ -717,13 +721,18 @@ class BankedMmapIslandStore:
                 raise BankedManifestError(
                     f"banked layer {layer} extent exceeds {path.name}"
                 )
-            # wired=True registers the mapping in MLX's process-wide residency
-            # set: Metal keeps it permanently resident like ordinary weights.
-            # Untracked (unwired) buffers make Metal rebuild residency around
-            # every submission — measured as the ENTIRE MLX residency set
-            # wiring/unwiring (~85 GiB swings) per wave, ~4x decode slowdown.
-            # Unwired remains selectable for bands larger than RAM (Q4/GLM).
-            base = mmap_u32(path, entry.offset, mapped_length, wired=self.wired)
+            # 'wired' registers the mapping in MLX's process-wide residency
+            # set (permanently resident, like ordinary weights); 'paged'
+            # leaves residency to the pager (bands larger than RAM); 'copy'
+            # materializes MLX-owned banks from the mapping at open — the
+            # control arm that separates file-backed-buffer cost from the
+            # banked layout itself.
+            base = mmap_u32(
+                path,
+                entry.offset,
+                mapped_length,
+                wired=(self.residency == "wired"),
+            )
             arrays: dict[str, mx.array] = {}
             for component in entry.components:
                 if component.dtype == "U32":
@@ -741,13 +750,19 @@ class BankedMmapIslandStore:
                         f"banked component {component.component} is not "
                         "dtype-aligned"
                     )
-                arrays[component.component] = mx.as_strided(
+                view = mx.as_strided(
                     typed,
                     shape=(self.expert_count, *component.shape),
                     offset=component.offset // item_size,
                 )
+                if self.residency == "copy":
+                    view = mx.contiguous(view)
+                arrays[component.component] = view
+            if self.residency == "copy":
+                mx.eval(*arrays.values())
+            else:
+                self._bases.append(base)
             self._banks[layer] = BankedMmapBank(arrays)
-            self._bases.append(base)
 
     def prefetch_all(self) -> int:
         """Issue one MADV_WILLNEED batch across every mapped layer region."""
@@ -769,7 +784,7 @@ class BankedMmapIslandStore:
     def snapshot(self) -> dict[str, Any]:
         return {
             "backend": "banked-mmap-island-banks",
-            "wired": self.wired,
+            "residency": self.residency,
             "layers": list(self.layers),
             "expert_count": self.expert_count,
             "mapped_bytes": sum(
@@ -1799,7 +1814,7 @@ def bind_streamed_switches(model: Any, runtime: ExpertStreamingRuntime) -> int:
             Path(runtime.config.banked_manifest),
             banked_layers,
             expert_count=runtime.spec.expert_count,
-            wired=runtime.config.mmap_island_wired,
+            residency=runtime.config.mmap_island_residency,
         )
         banked_store.prepare()
         banked_store.prefetch_all()

@@ -77,7 +77,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "mmap_island_layers": "",
     "banked_manifest": "",
     "banked_codec": "none",
-    "mmap_island_wired": True,
+    "mmap_island_residency": "wired",
     "read_chunk": "8MiB",
     "bypass_page_cache": True,
     "resource_telemetry": False,
@@ -462,13 +462,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--mmap-island-wired",
-        action=argparse.BooleanOptionalAction,
-        default=True,
+        "--mmap-island-residency",
+        default="wired",
+        choices=["wired", "paged", "copy"],
         help=(
-            "Register banked mmap regions in MLX's residency set (permanently "
-            "resident, counted on the plan's fixed side). --no-mmap-island-wired "
-            "leaves residency to the pager for bands larger than RAM."
+            "Physical residency of banked island regions: 'wired' registers "
+            "the mappings in MLX's residency set; 'paged' leaves them to the "
+            "pager (bands larger than RAM); 'copy' materializes MLX-owned "
+            "banks at open."
         ),
     )
     parser.add_argument("--output-json", type=Path)
@@ -549,7 +550,7 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "mmap_island_layers": args.mmap_island_layers,
         "banked_manifest": args.banked_manifest,
         "banked_codec": args.banked_codec,
-        "mmap_island_wired": bool(args.mmap_island_wired),
+        "mmap_island_residency": str(args.mmap_island_residency),
         "read_chunk": args.read_chunk,
         "bypass_page_cache": args.bypass_page_cache,
         "resource_telemetry": args.resource_telemetry,
@@ -2020,7 +2021,9 @@ def _runtime_config(
             else None
         ),
         banked_codec=str(options.get("banked_codec", "none")),
-        mmap_island_wired=bool(options.get("mmap_island_wired", True)),
+        mmap_island_residency=str(
+            options.get("mmap_island_residency", "wired")
+        ),
     )
 
 

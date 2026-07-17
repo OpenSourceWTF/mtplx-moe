@@ -148,7 +148,7 @@ class ExpertStreamingConfig:
     mmap_island_layers: tuple[int, ...] = ()
     banked_manifest: str | None = None
     banked_codec: str = "none"
-    mmap_island_wired: bool = True
+    mmap_island_residency: str = "wired"
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -235,8 +235,10 @@ class ExpertStreamingConfig:
                     "island_layers execute without host route observation; "
                     "trace_routes must be disabled"
                 )
-        if not isinstance(self.mmap_island_wired, bool):
-            raise TypeError("mmap_island_wired must be bool")
+        if self.mmap_island_residency not in {"wired", "paged", "copy"}:
+            raise ValueError(
+                "mmap_island_residency must be 'wired', 'paged', or 'copy'"
+            )
         mmap_islands = self.mmap_island_layers
         if isinstance(mmap_islands, (str, bytes)) or not isinstance(
             mmap_islands, (tuple, list)
@@ -360,7 +362,7 @@ class ExpertStreamingConfig:
             cache_scope=self.cache_scope,
             island_layer_count=len(self.island_layers),
             mmap_island_layer_count=len(self.mmap_island_layers),
-            mmap_islands_wired=self.mmap_island_wired,
+            mmap_islands_wired=(self.mmap_island_residency != "paged"),
         )
 
     def to_dict(self) -> dict[str, Any]:
