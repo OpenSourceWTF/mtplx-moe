@@ -6,6 +6,15 @@ served instantly instead of waiting on SSD. Shadows are a quality tier:
 outputs are close to the exact Q2 path, not bitwise — the benchmark's
 ar_comparison / token-divergence diagnostics are the quality report.
 
+Codec choice: **t158 is the default and only recommended codec when the
+source is a Q2 artifact.** The Q2 affine grid has an exact-zero level
+carrying ~50% of the weight mass; a 1-bit sign code cannot represent
+zero, so b1 encoded from Q2 collapses (output cosine 0.02-0.09 measured
+on real hy3 and GLM experts — see
+research/streamed-q1-codec-gap-analysis.md for the probe
+reconciliation). b1 is viable only from zero-free sources (direct BF16
+or Q4 — untested).
+
 Two codecs, both grouped along the input axis with group size 64:
 
 ``b1``

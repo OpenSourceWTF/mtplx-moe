@@ -19,6 +19,23 @@ has a working reference implementation: the miss-shadow lane
 `{packed, scales}` layout today, just from resident banks rather than
 streamed slots.
 
+**Probe reconciliation (why b1 was ever considered).** The original hy3
+probe reported binary combine-cosine 0.90-0.91, which drove b1 into the
+miss-shadow lane and this q1 scope. That probe's binary encoder used
+numpy `sign()` semantics, where `sign(0) = 0` — on Q2-dequantized
+weights (whose affine grid has an exact-zero level carrying ~50% of the
+mass) it was therefore *accidentally ternary*: zeros stayed zero and
+only the nonzero half was sign-coded. The shipped b1 codec is a true
+1-bit code (a sign bit has no zero; zeros must emit +/-mean|w|), and
+measuring it honestly gives 0.02-0.09 output cosine on both hy3 and GLM
+Q2 experts (research/*-shadow-codec-probe-20260717.json). Consequences:
+**t158 is the default and only recommended codec from Q2 sources,
+everywhere** (miss-shadow lane and q1 burn); any b1 benchmark arm run
+against Q2-sourced shadows is a mechanism-speed datapoint whose output
+quality is expected garbage, not a quality result; and b1 remains
+theoretically viable only when encoded from a source without a zero
+level (direct BF16 or Q4 — untested).
+
 The affine assumption is expressed as four independent invariants:
 **9 components** (3 projections x 3 leaves), leaf names
 `weight/scales/biases`, dtypes `U32`/`BF16`, and byte math

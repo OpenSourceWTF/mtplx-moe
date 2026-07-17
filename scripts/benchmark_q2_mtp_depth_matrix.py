@@ -567,7 +567,10 @@ def build_parser() -> argparse.ArgumentParser:
             "waiting on SSD; the exact tier warms asynchronously. Output "
             "is a quality tier, not bitwise — read ar_comparison / "
             "token-divergence for the quality report. Requires cache-scope "
-            "layer and the component-banks slot layout."
+            "layer and the component-banks slot layout. Use t158: b1 "
+            "collapses when encoded from Q2 sources (the Q2 grid's "
+            "exact-zero level; probe cosine 0.02-0.09) and is only a "
+            "mechanism-speed arm there."
         ),
     )
     parser.add_argument(
