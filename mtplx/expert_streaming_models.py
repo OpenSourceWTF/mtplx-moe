@@ -248,6 +248,8 @@ class ExpertMemoryPlan:
     island_bytes: int = 0
     mmap_island_layer_count: int = 0
     mmap_island_bytes: int = 0
+    prefetch_slots_per_layer: int = 0
+    prefetch_bytes: int = 0
     mmap_islands_wired: bool = True
 
     @property
@@ -262,6 +264,7 @@ class ExpertMemoryPlan:
             self.resident_bytes
             + self.kv_bytes
             + self.transient_bytes
+            + self.prefetch_bytes
             + self.io_staging_bytes
             + self.execution_workspace_bytes
             + self.runtime_reserve_bytes
@@ -455,6 +458,7 @@ def plan_expert_memory(
     island_layer_count: int = 0,
     mmap_island_layer_count: int = 0,
     mmap_islands_wired: bool = True,
+    prefetch_slots_per_layer: int = 0,
 ) -> ExpertMemoryPlan:
     """Fit uniform persistent expert slots under an explicit memory ceiling.
 
@@ -517,6 +521,9 @@ def plan_expert_memory(
     mmap_island_layer_count = _integer(
         "mmap_island_layer_count", mmap_island_layer_count, minimum=0
     )
+    prefetch_slots_per_layer = _integer(
+        "prefetch_slots_per_layer", prefetch_slots_per_layer, minimum=0
+    )
     if island_layer_count + mmap_island_layer_count > spec.routed_layer_count:
         raise ValueError(
             f"island_layer_count {island_layer_count} and "
@@ -557,11 +564,15 @@ def plan_expert_memory(
     streamed_layer_count = (
         spec.routed_layer_count - island_layer_count - mmap_island_layer_count
     )
+    prefetch_bytes = (
+        streamed_layer_count * prefetch_slots_per_layer * spec.expert_record_bytes
+    )
     fixed_bytes = (
         resident_bytes
         + kv_bytes
         + runtime_reserve_bytes
         + transient_bytes
+        + prefetch_bytes
         + io_staging_bytes
         + execution_workspace_bytes
         + island_bytes
@@ -623,4 +634,6 @@ def plan_expert_memory(
         mmap_island_layer_count=mmap_island_layer_count,
         mmap_island_bytes=mmap_island_bytes,
         mmap_islands_wired=bool(mmap_islands_wired),
+        prefetch_slots_per_layer=prefetch_slots_per_layer,
+        prefetch_bytes=prefetch_bytes,
     )

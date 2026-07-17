@@ -237,6 +237,23 @@ def test_plan_prices_quantized_kv() -> None:
         )
 
 
+def test_plan_prices_prefetch_ring_on_the_fixed_side() -> None:
+    spec = get_model_spec("hy3-expert-q2")
+    base = plan_expert_memory(
+        spec, total_limit_bytes=110 * 1024**3, context_tokens=4096,
+        island_layer_count=49,
+    )
+    ring = plan_expert_memory(
+        spec, total_limit_bytes=110 * 1024**3, context_tokens=4096,
+        island_layer_count=49, prefetch_slots_per_layer=8,
+    )
+    streamed = spec.routed_layer_count - 49
+    expected = streamed * 8 * spec.expert_record_bytes
+    assert ring.prefetch_bytes == expected
+    assert ring.fixed_bytes - base.fixed_bytes == expected
+    assert ring.prefetch_slots_per_layer == 8
+
+
 def test_make_cache_honors_kv_quant_attribute() -> None:
     from mlx_lm.models.cache import KVCache, QuantizedKVCache
 
