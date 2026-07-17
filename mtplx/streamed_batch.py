@@ -470,21 +470,10 @@ class StreamedBatchRunner:
         batch = mx.array([[stream.tokens[-1]] for stream in streams])
         with attention_phase("ar_decode"), expert_routing_phase(RoutingPhase.DECODE):
             hidden = inner.embed_tokens(batch)
-            for layer_index, layer in enumerate(inner.layers):
-                normed = layer.input_layernorm(hidden)
-                attn_rows = []
-                for position, stream in enumerate(streams):
-                    row = normed[position : position + 1]
-                    layer_cache = stream.cache[layer_index]
-                    mask = create_attention_mask(row, layer_cache)
-                    attn_rows.append(layer.self_attn(row, mask, layer_cache))
-                attended = (
-                    attn_rows[0]
-                    if len(attn_rows) == 1
-                    else mx.concatenate(attn_rows, axis=0)
-                )
-                hidden = hidden + attended
-                hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
+            if getattr(model, "model_type", None) == "glm_moe_dsa":
+                hidden = self._glm_layer_walk(inner, hidden, streams)
+            else:
+                hidden = self._split_attention_layer_walk(inner, hidden, streams)
             hidden = inner.norm(hidden)
             if getattr(getattr(model, "args", None), "enable_lm_head_fp32", False):
                 hidden = hidden.astype(mx.float32)
@@ -493,6 +482,71 @@ class StreamedBatchRunner:
         for position, stream in enumerate(streams):
             stream.decode_steps += 1
             stream.sample(logits[position, -1, :])
+
+    @staticmethod
+    def _split_attention_layer_walk(
+        inner: Any,
+        hidden: mx.array,
+        streams: list["_LiveStream"],
+    ) -> mx.array:
+        """Hy3-shaped layers: per-stream attention, batched MLP.
+
+        Attention runs per row (each stream owns its cache and mask) while
+        the MLP sees all rows at once so the expert runtime loads each
+        unique routed expert a single time per layer.
+        """
+
+        for layer_index, layer in enumerate(inner.layers):
+            normed = layer.input_layernorm(hidden)
+            attn_rows = []
+            for position, stream in enumerate(streams):
+                row = normed[position : position + 1]
+                layer_cache = stream.cache[layer_index]
+                mask = create_attention_mask(row, layer_cache)
+                attn_rows.append(layer.self_attn(row, mask, layer_cache))
+            attended = (
+                attn_rows[0]
+                if len(attn_rows) == 1
+                else mx.concatenate(attn_rows, axis=0)
+            )
+            hidden = hidden + attended
+            hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
+        return hidden
+
+    @staticmethod
+    def _glm_layer_walk(
+        inner: Any,
+        hidden: mx.array,
+        streams: list["_LiveStream"],
+    ) -> mx.array:
+        """GLM MoE-DSA layers: run each stream through the layer forward.
+
+        GLM attention returns ``(hidden, topk_indices)`` and threads the
+        DSA indexer's top-k across layers, its per-layer cache is a
+        ``CacheList`` (mask reads entry 0), and the layer forward owns the
+        residual/per-row arithmetic — hand-rolling the hy3 split here is
+        what produced 'array + tuple' failures. Per-stream full-layer
+        calls keep the contract intact; grouping routed experts across
+        streams within a layer is a future batching optimization.
+        """
+
+        rows = [hidden[position : position + 1] for position in range(len(streams))]
+        stream_topk: list[Any] = [None] * len(streams)
+        for layer_index, layer in enumerate(inner.layers):
+            for position, stream in enumerate(streams):
+                layer_cache = stream.cache[layer_index]
+                mask = create_attention_mask(
+                    rows[position],
+                    layer_cache[0] if layer_cache else None,
+                    return_array=True,
+                )
+                rows[position], stream_topk[position] = layer(
+                    rows[position],
+                    mask,
+                    layer_cache,
+                    stream_topk[position],
+                )
+        return rows[0] if len(rows) == 1 else mx.concatenate(rows, axis=0)
 
     def _finalize_finished(self) -> None:
         remaining: list[_LiveStream] = []
