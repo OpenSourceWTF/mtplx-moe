@@ -172,6 +172,12 @@ class ExpertStreamingConfig:
     mmap_island_layers: tuple[int, ...] = ()
     banked_manifest: str | None = None
     banked_codec: str = "none"
+    # Streamed compressed sidecar (issue #113): when "rans32x-v1", streamed
+    # miss reads pull per-record rANS containers and decode them in-kernel
+    # before slot residency -- fewer bytes/token off SSD at zero quality cost.
+    # "none" leaves every streamed read byte-unchanged.
+    streamed_codec: str = "none"
+    streamed_codec_manifest: str | None = None
     mmap_island_wired: bool = True
     resident_quant: str | None = None
     kv_quant: str | None = None
@@ -363,6 +369,24 @@ class ExpertStreamingConfig:
         if self.banked_codec not in {"none", "rans32x-v1"}:
             raise ValueError(
                 "banked_codec must be 'none' or 'rans32x-v1'"
+            )
+        if self.streamed_codec not in {"none", "rans32x-v1"}:
+            raise ValueError(
+                "streamed_codec must be 'none' or 'rans32x-v1'"
+            )
+        if self.streamed_codec != "none":
+            if self.streamed_codec_manifest is None:
+                raise ValueError(
+                    "streamed_codec requires a streamed_codec_manifest path"
+                )
+            if self.slot_layout == "metal-mmap":
+                raise ValueError(
+                    "streamed_codec decodes compressed records into slots; it is "
+                    "incompatible with the metal-mmap zero-copy layout"
+                )
+        elif self.streamed_codec_manifest is not None:
+            raise ValueError(
+                "streamed_codec_manifest requires streamed_codec 'rans32x-v1'"
             )
         if normalized_mmap:
             if self.banked_manifest is None:
@@ -1790,6 +1814,29 @@ class ExpertStreamingRuntime:
             if apply_memory_cap
             else None
         )
+        codec_sidecar = None
+        if config.streamed_codec != "none":
+            from mtplx.expert_streamed_codec import (
+                StreamedCodecError,
+                load_streamed_codec_manifest,
+                validate_against_base,
+            )
+
+            codec_manifest_path = Path(config.streamed_codec_manifest)
+            if not codec_manifest_path.is_absolute():
+                codec_manifest_path = artifact_root / codec_manifest_path
+            try:
+                codec_sidecar = load_streamed_codec_manifest(codec_manifest_path)
+                if codec_sidecar.codec != config.streamed_codec:
+                    raise StreamedCodecError(
+                        f"streamed codec sidecar codec {codec_sidecar.codec!r} "
+                        f"does not match config {config.streamed_codec!r}"
+                    )
+                validate_against_base(codec_sidecar, manifest)
+            except StreamedCodecError as exc:
+                raise ExpertStreamingConfigurationError(
+                    f"streamed codec sidecar is unusable: {exc}"
+                ) from exc
         pipeline_ledger = _pipeline_ledger_for_config(config)
         pipeline_kwargs = (
             {} if pipeline_ledger is None else {"pipeline_ledger": pipeline_ledger}
@@ -1799,6 +1846,7 @@ class ExpertStreamingRuntime:
             max_open_files=config.max_open_files,
             max_read_chunk_bytes=config.max_read_chunk_bytes,
             bypass_page_cache=config.bypass_page_cache,
+            codec_sidecar=codec_sidecar,
             **pipeline_kwargs,
         )
         try:
