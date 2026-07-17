@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import mlx.core as mx
 import pytest
+from mlx.utils import tree_flatten
 
 from mtplx.expert_runtime import ExpertStreamingConfig
 from mtplx.expert_streaming_models import get_model_spec
+from mtplx.models.hy3_mlx import Model as Hy3Model
+from mtplx.models.hy3_mlx import ModelArgs as Hy3Args
+from mtplx.models.hy3_mlx import SparseMLP
 
 
 def _config_kwargs(**overrides):
@@ -57,3 +64,127 @@ def test_memory_plan_carries_prefetch_slots_per_layer() -> None:
     baseline = ExpertStreamingConfig(**_config_kwargs()).memory_plan(spec)
     assert baseline.prefetch_slots_per_layer == 0
     assert baseline.prefetch_bytes == 0
+
+
+def _model_args(*, layers: int = 6, first_dense: int = 2) -> Hy3Args:
+    return Hy3Args(
+        model_type="hy_v3",
+        hidden_size=64,
+        num_hidden_layers=layers,
+        intermediate_size=128,
+        moe_intermediate_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_experts=4,
+        num_experts_per_tok=2,
+        num_shared_experts=1,
+        first_k_dense_replace=first_dense,
+        rms_norm_eps=1e-5,
+        vocab_size=128,
+        max_position_embeddings=128,
+        head_dim=16,
+        router_scaling_factor=2.0,
+    )
+
+
+def test_lookahead_router_refs_stay_out_of_parameter_tree() -> None:
+    args = _model_args()
+    model = Hy3Model(args)
+    layers = model.model.layers
+    sparse_indices = [
+        index
+        for index, layer in enumerate(layers)
+        if isinstance(layer.mlp, SparseMLP)
+    ]
+    assert sparse_indices == [2, 3, 4, 5]
+
+    # Each sparse layer sees the next up-to-3 sparse layers' routers, by
+    # identity, and the tail sees fewer.
+    for position, index in enumerate(sparse_indices):
+        entries = layers[index].mlp._mtplx_next_routers.entries
+        expected = sparse_indices[position + 1 : position + 4]
+        assert [next_index for next_index, _router in entries] == expected
+        for next_index, router in entries:
+            assert router is layers[next_index].mlp.router
+
+    # The references live outside the module tree: never registered as a
+    # child (Module is a dict of children) and absent from the parameter
+    # tree, so sibling routers are not double-registered.
+    for index in sparse_indices:
+        mlp = layers[index].mlp
+        assert "_mtplx_next_routers" not in mlp
+        assert "_mtplx_next_routers" in vars(mlp)
+    names = [name for name, _value in tree_flatten(model.parameters())]
+    assert not any("_mtplx_next_routers" in name for name in names)
+    router_weights = [name for name in names if name.endswith("router.gate.weight")]
+    assert len(router_weights) == len(sparse_indices)
+
+
+class _RuntimeStub:
+    def __init__(self, *, prefetch_slots: int, islands=frozenset()) -> None:
+        self.config = SimpleNamespace(prefetch_slots=prefetch_slots)
+        self.island_layer_set = frozenset(islands)
+        self.calls: list[tuple[int, list[int]]] = []
+
+    def prefetch_experts(self, layer: int, expert_ids) -> int:
+        ids = [int(expert) for expert in expert_ids]
+        self.calls.append((layer, ids))
+        return len(ids)
+
+
+class _StubSwitch:
+    """Callable switch seam carrying the runtime, like the streamed switch."""
+
+    def __init__(self, runtime) -> None:
+        self.runtime = runtime
+
+    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+        return mx.zeros((*indices.shape, x.shape[-1]), dtype=x.dtype)
+
+
+def test_sparse_mlp_decode_call_prefetches_next_streamed_layers() -> None:
+    args = _model_args()
+    model = Hy3Model(args)
+    mlp = model.model.layers[2].mlp
+    runtime = _RuntimeStub(prefetch_slots=4, islands={4})
+    mlp.switch_mlp = _StubSwitch(runtime)
+
+    x = mx.random.normal((1, 1, args.hidden_size))
+    mx.eval(mlp(x))
+
+    # Island layer 4 is skipped; streamed lookahead layers 3 and 5 get one
+    # prediction each with in-range router ids.
+    assert [layer for layer, _ids in runtime.calls] == [3, 5]
+    for _layer, ids in runtime.calls:
+        assert len(ids) == args.num_experts_per_tok
+        assert all(0 <= expert < args.num_experts for expert in ids)
+
+    # Prefill-shaped calls never predict.
+    runtime.calls.clear()
+    mx.eval(mlp(mx.random.normal((1, 3, args.hidden_size))))
+    assert runtime.calls == []
+
+    # Disabled prefetch keeps decode free of prediction work.
+    runtime.calls.clear()
+    runtime.config = SimpleNamespace(prefetch_slots=0)
+    mx.eval(mlp(x))
+    assert runtime.calls == []
+
+    # The tail sparse layer has no lookahead targets and stays silent.
+    tail = model.model.layers[5].mlp
+    tail_runtime = _RuntimeStub(prefetch_slots=4)
+    tail.switch_mlp = _StubSwitch(tail_runtime)
+    mx.eval(tail(x))
+    assert tail_runtime.calls == []
+
+
+def test_lookahead_hook_is_inert_without_a_bound_runtime() -> None:
+    args = _model_args()
+    model = Hy3Model(args)
+    mlp = model.model.layers[2].mlp
+    # The unbound switch seam has no runtime attribute; the hook must be a
+    # silent no-op (construction-time forward paths raise later, in the
+    # switch itself, exactly as before).
+    x = mx.random.normal((1, 1, args.hidden_size))
+    indices, _scores = mlp.router(x)
+    assert mlp._maybe_prefetch_lookahead(x, indices) is None

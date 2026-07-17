@@ -738,6 +738,22 @@ def _lookahead_capture(layer_index: int, x: mx.array, indices: mx.array) -> None
     )
 
 
+class _LookaheadRouters:
+    """Plain holder for sibling router references; deliberately NOT a Module.
+
+    ``mlx.nn.Module.__setattr__`` registers array/dict/list/tuple values as
+    children, so assigning the sibling routers directly would re-register
+    their parameters under a second path in the tree. A plain object rides
+    outside the parameter tree entirely.
+    """
+
+    __slots__ = ("entries",)
+
+    def __init__(self, entries: tuple) -> None:
+        # tuple of (layer_index, Router) for the next up-to-3 sparse layers.
+        self.entries = entries
+
+
 class SparseMLP(nn.Module):
     def __init__(
         self,
@@ -758,9 +774,50 @@ class SparseMLP(nn.Module):
         )
         self.enable_moe_fp32_combine = args.enable_moe_fp32_combine
 
+    def _maybe_prefetch_lookahead(self, x: mx.array, indices: mx.array) -> None:
+        """Residual-stream lookahead prefetch (issue #51 C6).
+
+        Applies the next up-to-3 sparse layers' routers to this layer's
+        hidden state (measured 74.3%/66%/61% top-k overlap at L=1/2/3
+        against a 4.2% identity baseline) and hands the predicted expert
+        ids to the runtime's speculative ring. Decode single-token calls
+        only; free unless an attached runtime enables prefetch.
+        """
+
+        lookahead = getattr(self, "_mtplx_next_routers", None)
+        if lookahead is None or not lookahead.entries:
+            return
+        runtime = getattr(self.switch_mlp, "runtime", None)
+        if runtime is None:
+            return
+        config = getattr(runtime, "config", None)
+        if config is None or getattr(config, "prefetch_slots", 0) <= 0:
+            return
+        prefetch = getattr(runtime, "prefetch_experts", None)
+        if prefetch is None or int(x.shape[-2]) != 1:
+            return
+        islands = getattr(runtime, "island_layer_set", frozenset())
+        predictions = [
+            (next_layer, router(x)[0])
+            for next_layer, router in lookahead.entries
+            if next_layer not in islands
+        ]
+        if not predictions:
+            return
+        # The predictions are not ancestors of this layer's output, so they
+        # would not ride along with the switch's own eval; materialize them
+        # together with the layer's own indices in one host sync.
+        mx.eval(indices, *(predicted for _layer, predicted in predictions))
+        for next_layer, predicted in predictions:
+            prefetch(
+                next_layer,
+                [int(value) for value in predicted.reshape(-1).tolist()],
+            )
+
     def __call__(self, x: mx.array) -> mx.array:
         indices, scores = self.router(x)
         _lookahead_capture(self.layer_index, x, indices)
+        self._maybe_prefetch_lookahead(x, indices)
         # Match the pinned Hy3 MLX reference: when FP32 MoE combining is
         # disabled, both the routing multiply and its reduction happen in the
         # activation dtype.  Keeping ``scores`` in FP32 here subtly changes
@@ -922,6 +979,23 @@ class Hy3Model(nn.Module):
             for layer_index in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        # Lookahead prefetch wiring: each sparse layer holds plain
+        # references to the next up-to-3 sparse layers' routers so decode
+        # can predict their expert routes from the current hidden state.
+        sparse_mlps = [
+            (layer_index, layer.mlp)
+            for layer_index, layer in enumerate(self.layers)
+            if isinstance(layer.mlp, SparseMLP)
+        ]
+        for position, (_layer_index, mlp) in enumerate(sparse_mlps):
+            mlp._mtplx_next_routers = _LookaheadRouters(
+                tuple(
+                    (next_index, next_mlp.router)
+                    for next_index, next_mlp in sparse_mlps[
+                        position + 1 : position + 4
+                    ]
+                )
+            )
 
     def __call__(
         self,
