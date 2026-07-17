@@ -312,16 +312,20 @@ class ShadowBankStore:
 
         import mlx.core as mx
 
-        if manifest.sidecar is None:
-            raise ShadowCodecError("shadow banks require a sidecar manifest")
+        from mtplx.expert_manifest import read_expert_record
+
         started = time.perf_counter()
         records = {
             (record.layer, record.expert): record for record in manifest.records
         }
-        sidecar_path = Path(root).resolve() / manifest.sidecar.file
+        root_path = Path(root).resolve()
         bits = int(self.spec.quant_bits)
         group_size = int(self.spec.quant_group_size)
-        fd = os.open(sidecar_path, os.O_RDONLY)
+        fd = (
+            os.open(root_path / manifest.sidecar.file, os.O_RDONLY)
+            if manifest.sidecar is not None
+            else None
+        )
         try:
             for layer in self.layers:
                 staging: dict[str, np.ndarray] | None = None
@@ -332,26 +336,38 @@ class ShadowBankStore:
                             f"manifest has no record for layer {layer} "
                             f"expert {expert}"
                         )
-                    if record.sidecar_offset is None or record.sidecar_length is None:
-                        raise ShadowCodecError(
-                            f"record ({layer}, {expert}) has no sidecar range"
+                    if (
+                        fd is not None
+                        and record.sidecar_offset is not None
+                        and record.sidecar_length is not None
+                    ):
+                        blob = os.pread(
+                            fd, record.sidecar_length, record.sidecar_offset
                         )
-                    blob = os.pread(
-                        fd, record.sidecar_length, record.sidecar_offset
-                    )
-                    if len(blob) != record.sidecar_length:
-                        raise ShadowCodecError(
-                            f"short sidecar read for record ({layer}, {expert})"
+                        if len(blob) != record.sidecar_length:
+                            raise ShadowCodecError(
+                                f"short sidecar read for record ({layer}, {expert})"
+                            )
+                        if verify_hash:
+                            if record.sha256 is None:
+                                raise ShadowCodecError(
+                                    f"record ({layer}, {expert}) has no hash"
+                                )
+                            if hashlib.sha256(blob).hexdigest() != record.sha256:
+                                raise ShadowCodecError(
+                                    f"record hash mismatch: ({layer}, {expert})"
+                                )
+                    else:
+                        # No sidecar: the manifest's source-safetensors
+                        # segments are the fallback, as for slot reads.
+                        blob = read_expert_record(
+                            manifest,
+                            root_path,
+                            layer,
+                            expert,
+                            prefer_sidecar=False,
+                            verify_hash=verify_hash and record.sha256 is not None,
                         )
-                    if verify_hash:
-                        if record.sha256 is None:
-                            raise ShadowCodecError(
-                                f"record ({layer}, {expert}) has no hash"
-                            )
-                        if hashlib.sha256(blob).hexdigest() != record.sha256:
-                            raise ShadowCodecError(
-                                f"record hash mismatch: ({layer}, {expert})"
-                            )
                     dense = self._dequantize_record(
                         mx, record, blob, bits=bits, group_size=group_size
                     )
@@ -370,7 +386,8 @@ class ShadowBankStore:
                     layer, self.codec, self.expert_count, arrays
                 )
         finally:
-            os.close(fd)
+            if fd is not None:
+                os.close(fd)
         self._fill_seconds += time.perf_counter() - started
         _LOGGER.info(
             "shadow banks ready: codec=%s layers=%d experts=%d bytes=%d "
