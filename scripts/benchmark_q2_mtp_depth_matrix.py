@@ -2657,13 +2657,6 @@ def _run_depth_matrix_impl(
             model_payload["discarded_warmup_count"] = discarded_warmup_count
             model_payload["hard_peak_memory_bytes"] = hard_peak_memory_bytes
             model_payload["passed"] = True
-            trace_path = os.environ.get("MTPLX_ROUTE_TRACE_JSON")
-            if trace_path:
-                expert_streaming = getattr(runtime, "expert_streaming", None)
-                drain = getattr(expert_streaming, "route_trace", None)
-                if callable(drain):
-                    with open(trace_path, "w") as handle:
-                        json.dump(drain(), handle)
             payload["active_cell"] = {
                 "model": request["model"],
                 "context_tokens": None,
