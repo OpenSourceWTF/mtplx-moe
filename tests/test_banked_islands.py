@@ -307,12 +307,17 @@ def test_write_compressed_banked_roundtrips_byte_exact(tmp_path) -> None:
             )
             got = banks[component.component].tobytes()
             assert got == want, f"layer {entry.layer} {component.component}"
-    # Compression must actually shrink the payload region vs raw banks.
-    raw_bytes = sum(
-        c.length for e in reloaded.layers for c in e.components
-    )
-    packed_bytes = sum(e.length for e in reloaded.layers)
-    assert packed_bytes < raw_bytes
+    # Compression must actually shrink the payload vs raw banks (the
+    # page-aligned directory padding dominates at fixture scale, so compare
+    # payload bytes only).
+    for entry in reloaded.layers:
+        raw_bytes = sum(c.length for c in entry.components)
+        dir_extent = (
+            (entry.directory_words * 4 + BANKED_ALIGNMENT - 1)
+            // BANKED_ALIGNMENT
+            * BANKED_ALIGNMENT
+        )
+        assert entry.length - dir_extent < raw_bytes
 
 
 # ------------------------------------------------------------------ pool
