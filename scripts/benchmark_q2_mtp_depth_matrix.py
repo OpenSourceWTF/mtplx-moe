@@ -455,7 +455,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--banked-codec",
         default="none",
-        choices=["none", "rans32x-v1"],
+        choices=["none", "huffman-l12-v1", "rans32x-v1"],
         help=(
             "Lossless codec of the banked sidecar. 'rans32x-v1' requires the "
             "in-kernel decoder (issue #51 C7) and is rejected until it ships."
