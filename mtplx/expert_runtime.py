@@ -145,6 +145,7 @@ class ExpertStreamingConfig:
     hy3_router_sigmoid: str = "precise"
     deferred_pin_release: bool = False
     island_layers: tuple[int, ...] = ()
+    island_layer_count: int | None = None
     mmap_island_layers: tuple[int, ...] = ()
     banked_manifest: str | None = None
     banked_codec: str = "none"
@@ -209,6 +210,32 @@ class ExpertStreamingConfig:
             )
         if not isinstance(self.deferred_pin_release, bool):
             raise ValueError("deferred_pin_release must be bool")
+        if self.island_layer_count is not None:
+            if self.island_layers:
+                raise ValueError(
+                    "island_layers and island_layer_count are mutually "
+                    "exclusive; give the count OR the explicit list"
+                )
+            count = _integer(
+                "island_layer_count", self.island_layer_count, minimum=1
+            )
+            spec = get_model_spec(self.model_key)
+            if not spec.island_pin_order:
+                raise ValueError(
+                    f"{self.model_key} has no measured island pin order; "
+                    "count-based selection requires explicit island_layers"
+                )
+            if count > len(spec.island_pin_order):
+                raise ValueError(
+                    f"island_layer_count {count} exceeds the {self.model_key} "
+                    f"pin order ({len(spec.island_pin_order)} layers)"
+                )
+            object.__setattr__(
+                self,
+                "island_layers",
+                tuple(sorted(spec.island_pin_order[:count])),
+            )
+            object.__setattr__(self, "island_layer_count", count)
         island_layers = self.island_layers
         if isinstance(island_layers, (str, bytes)) or not isinstance(
             island_layers, (tuple, list)

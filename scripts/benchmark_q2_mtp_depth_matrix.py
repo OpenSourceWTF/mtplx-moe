@@ -471,6 +471,17 @@ def build_parser() -> argparse.ArgumentParser:
             "leaves residency to the pager for bands larger than RAM."
         ),
     )
+    parser.add_argument(
+        "--island-layer-count",
+        type=int,
+        default=None,
+        help=(
+            "Pin the N worst-streaming layers as dense islands using the "
+            "model's measured pin order. Mutually exclusive with "
+            "--island-layers. The experts cache stays independently sized "
+            "via --expert-cache-limit."
+        ),
+    )
     parser.add_argument("--output-json", type=Path)
     return parser
 

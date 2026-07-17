@@ -60,6 +60,11 @@ class ExpertStreamingModelSpec:
     mtp_layer_index: int | None
     mtp_included: bool
     full_indexer_layers: tuple[int, ...] = ()
+    # Pin-first ordering for count-based island selection: layers ranked by
+    # ascending top-147 routing coverage (worst streamed-cache layers first).
+    # Empty when unmeasured; count-based selection then requires an explicit
+    # layer list instead.
+    island_pin_order: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         integer_fields = {
@@ -314,6 +319,11 @@ HY3_EXPERT_Q2 = ExpertStreamingModelSpec(
     kv_bytes_per_token=327_680,
     mtp_layer_index=80,
     mtp_included=False,
+    # Measured 2026-07-16: 511-step decode route trace (issue #63 heatmap),
+    # ranked by ascending top-147 expert coverage per layer.
+    island_pin_order=(
+        1, 4, 5, 13, 2, 3, 12, 18, 14, 15, 11, 10, 16, 17, 22, 28, 24, 26, 6, 25, 66, 29, 71, 27, 31, 19, 7, 69, 67, 23, 33, 32, 74, 9, 8, 50, 73, 79, 65, 72, 75, 70, 20, 30, 57, 21, 60, 64, 35, 51, 49, 68, 48, 59, 61, 77, 54, 38, 47, 52, 78, 53, 45, 62, 34, 58, 76, 63, 46, 55, 56, 44, 36, 37, 41, 43, 39, 40, 42,
+    )
 )
 
 

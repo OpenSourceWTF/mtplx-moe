@@ -471,3 +471,41 @@ def test_island_switch_source_is_protocol_free() -> None:
         "atomic",
     ):
         assert banned not in source, f"island path must not use {banned}"
+
+
+def test_island_layer_count_resolves_from_pin_order() -> None:
+    from mtplx.expert_streaming_models import get_model_spec
+
+    spec = get_model_spec("hy3-expert-q2")
+    assert len(spec.island_pin_order) == spec.routed_layer_count
+    assert set(spec.island_pin_order) == set(spec.routed_layer_indices)
+    config = ExpertStreamingConfig(
+        model_key="hy3-expert-q2",
+        memory_limit_bytes=1 << 40,
+        max_live_kv_tokens=16,
+        slot_layout="component-banks",
+        island_layer_count=4,
+    )
+    assert config.island_layers == tuple(sorted(spec.island_pin_order[:4]))
+    assert config.island_layer_count == 4
+
+
+def test_island_layer_count_validation() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _config(island_layers=(1,), island_layer_count=2)
+    with pytest.raises(ValueError, match="pin order"):
+        ExpertStreamingConfig(
+            model_key="glm52-expert-q2",
+            memory_limit_bytes=1 << 30,
+            max_live_kv_tokens=16,
+            slot_layout="component-banks",
+            island_layer_count=1,
+        )
+    with pytest.raises(ValueError, match="island_layer_count"):
+        ExpertStreamingConfig(
+            model_key="hy3-expert-q2",
+            memory_limit_bytes=1 << 40,
+            max_live_kv_tokens=16,
+            slot_layout="component-banks",
+            island_layer_count=100,
+        )
