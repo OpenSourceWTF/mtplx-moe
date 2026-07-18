@@ -49,6 +49,7 @@ from .optimization_profiles import (
     not_applicable_violations,
 )
 from .resource_metrics import ExpertPipelineLedger, ExpertPipelineRoute
+from .belady_oracle import BeladyOracle
 from .route_census import (
     ISLAND_PLACEMENT_FILENAME,
     ROUTE_CENSUS_FILENAME,
@@ -1629,6 +1630,15 @@ class ExpertStreamingRuntime:
         self._route_census = (
             RouteCensus(spec.key) if config.route_census else None
         )
+        # Runtime Belady oracle (diagnostic, env MTPLX_BELADY_ORACLE=1): the
+        # eviction-ceiling analog of the census. Records decode routes for
+        # streamed layers and reports the clairvoyant fetch floor at snapshot.
+        # Zero cost when unset; never touches the decode data path.
+        self._belady_oracle = (
+            BeladyOracle(island_layers=self.island_layer_set)
+            if BeladyOracle.enabled()
+            else None
+        )
         self._route_trace_lock = threading.Lock()
         self._route_trace: list[dict[str, Any]] = []
         self._route_trace_epoch = 0
@@ -2638,10 +2648,25 @@ class ExpertStreamingRuntime:
         token_count: int,
     ) -> None:
         census = self._route_census
-        if census is None and not self.config.trace_routes:
+        if (
+            census is None
+            and not self.config.trace_routes
+            and self._belady_oracle is None
+        ):
             return
         normalized_phase = RoutingPhase(phase)
         routed_experts = [int(expert) for expert in expert_ids]
+        if (
+            self._belady_oracle is not None
+            and normalized_phase is RoutingPhase.DECODE
+        ):
+            # Diagnostic only; the oracle self-excludes island layers. Failure
+            # disables it for the session rather than perturbing decode.
+            try:
+                with self._census_lock:
+                    self._belady_oracle.observe(layer, routed_experts)
+            except Exception:
+                self._belady_oracle = None
         if census is not None and normalized_phase is RoutingPhase.DECODE:
             # Placement census: decode routes only (prefill routing shape
             # does not predict the decode hot set). Accumulation is pure
@@ -3048,6 +3073,17 @@ class ExpertStreamingRuntime:
             "incremental_misses": incremental_misses,
             "slots": slots,
         }
+        if self._belady_oracle is not None:
+            # The clairvoyant fetch floor over the full decode window, at the
+            # actual per-layer slot budget — the runtime analog of the offline
+            # replay, reported alongside the measured loads for a live gap.
+            try:
+                with self._census_lock:
+                    snapshot["belady_oracle"] = self._belady_oracle.report(
+                        self.plan.slots_per_layer
+                    )
+            except Exception:
+                pass
         if self._global_bank is not None:
             snapshot["global_cache"] = {
                 **self._global_bank.snapshot(),
