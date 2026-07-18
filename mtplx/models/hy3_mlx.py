@@ -77,6 +77,7 @@ def _moe_read_nbytes(switch_mlp) -> int:
 
 
 FUSE_SHARED_GATE_UP_ENV = "MTPLX_FUSE_HY3_SHARED_GATE_UP_PROJECTIONS"
+FUSE_QKV_ENV = "MTPLX_FUSE_HY3_QKV_PROJECTIONS"
 SUBMIT_CADENCE_ENV = "MTPLX_HY3_SUBMIT_CADENCE"
 
 
@@ -220,26 +221,24 @@ class Attention(nn.Module):
         self.n_kv_heads = args.num_key_value_heads
         self.head_dim = args.head_dim
         self.scale = self.head_dim**-0.5
-        self.q_proj = nn.Linear(
-            args.hidden_size,
-            self.n_heads * self.head_dim,
-            bias=args.attention_bias,
-        )
-        self.k_proj = nn.Linear(
-            args.hidden_size,
-            self.n_kv_heads * self.head_dim,
-            bias=args.attention_bias,
-        )
-        self.v_proj = nn.Linear(
-            args.hidden_size,
-            self.n_kv_heads * self.head_dim,
-            bias=args.attention_bias,
-        )
-        self.o_proj = nn.Linear(
-            self.n_heads * self.head_dim,
-            args.hidden_size,
-            bias=args.attention_bias,
-        )
+        q_dim = self.n_heads * self.head_dim
+        kv_dim = self.n_kv_heads * self.head_dim
+        # QKV fusion (issue #51 T1a, flag-gated). One packed projection replaces
+        # three: BIT-EXACT because g64 quant groups run along the input axis, so
+        # concatenating output rows keeps each row's own scale/bias. Folds the two
+        # low-occupancy 1024-wide k/v matvecs into the 10240-wide grid -> fewer
+        # launches and more rows in flight at batch=1 (the measured attention tax).
+        self._fuse_qkv = _env_enabled(FUSE_QKV_ENV)
+        if self._fuse_qkv:
+            self._qkv_splits = [q_dim, q_dim + kv_dim]
+            self.qkv_proj = nn.Linear(
+                args.hidden_size, q_dim + 2 * kv_dim, bias=args.attention_bias
+            )
+        else:
+            self.q_proj = nn.Linear(args.hidden_size, q_dim, bias=args.attention_bias)
+            self.k_proj = nn.Linear(args.hidden_size, kv_dim, bias=args.attention_bias)
+            self.v_proj = nn.Linear(args.hidden_size, kv_dim, bias=args.attention_bias)
+        self.o_proj = nn.Linear(q_dim, args.hidden_size, bias=args.attention_bias)
         self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.rope = initialize_rope(
@@ -257,21 +256,19 @@ class Attention(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         batch, length, _ = x.shape
-        queries = (
-            self.q_proj(x)
-            .reshape(batch, length, self.n_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-        keys = (
-            self.k_proj(x)
-            .reshape(batch, length, self.n_kv_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-        values = (
-            self.v_proj(x)
-            .reshape(batch, length, self.n_kv_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
-        )
+        if self._fuse_qkv:
+            q, k, v = mx.split(self.qkv_proj(x), self._qkv_splits, axis=-1)
+        else:
+            q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        queries = q.reshape(
+            batch, length, self.n_heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
+        keys = k.reshape(
+            batch, length, self.n_kv_heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
+        values = v.reshape(
+            batch, length, self.n_kv_heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
         queries = self.q_norm(queries)
         keys = self.k_norm(keys)
         offset = cache.offset if cache is not None else 0
@@ -1169,6 +1166,7 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         self._fuse_shared_gate_up = _env_enabled(FUSE_SHARED_GATE_UP_ENV)
+        self._fuse_qkv = _env_enabled(FUSE_QKV_ENV)
         self.model = Hy3Model(
             args,
             fuse_shared_gate_up=self._fuse_shared_gate_up,
@@ -1215,6 +1213,21 @@ class Model(nn.Module):
                     target=f"{base}.gate_up_proj",
                     sources=(f"{base}.gate_proj", f"{base}.up_proj"),
                     equal_output_widths=True,
+                )
+                if plan is not None:
+                    plans.append(plan)
+        if self._fuse_qkv:
+            for layer_index in range(self.args.num_hidden_layers):
+                base = f"model.layers.{layer_index}.self_attn"
+                plan = _projection_pack_plan(
+                    result,
+                    target=f"{base}.qkv_proj",
+                    sources=(
+                        f"{base}.q_proj",
+                        f"{base}.k_proj",
+                        f"{base}.v_proj",
+                    ),
+                    equal_output_widths=False,
                 )
                 if plan is not None:
                     plans.append(plan)

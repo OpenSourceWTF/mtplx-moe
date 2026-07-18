@@ -24,7 +24,7 @@ from mtplx.expert_shadow import SHADOW_CODECS, shadow_record_bytes
 # bits/16 + 1/32, i.e. 9/32 for q4 and 17/32 for q8.
 RESIDENT_QUANT_KEEP_NUMERATOR = {"q8": 17, "q4": 9}
 RESIDENT_QUANT_KEEP_DENOMINATOR = 32
-_ATTENTION_PROJ_SUFFIXES = (".q_proj", ".k_proj", ".v_proj", ".o_proj")
+_ATTENTION_PROJ_SUFFIXES = (".q_proj", ".k_proj", ".v_proj", ".o_proj", ".qkv_proj")
 _MLP_PROJ_SUFFIXES = (".gate_proj", ".up_proj", ".down_proj", ".gate_up_proj")
 
 
