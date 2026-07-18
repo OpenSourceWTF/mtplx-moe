@@ -18,6 +18,7 @@ verdicts — the queued-vs-eager law). Method:
 from __future__ import annotations
 
 import atexit
+import copy
 import os
 import time
 
@@ -83,11 +84,55 @@ def capture_dense(name: str, module, x, nbytes: int) -> None:
     _reg(name, lambda m=module, xx=xc: m(xx), nbytes)
 
 
+def snapshot_cache(cache):
+    """An INDEPENDENT copy of a KV cache, or None if one cannot be made safely.
+
+    capture_attention replays its thunk ~61 times (1 warm + _N=60). Attention's
+    forward calls cache.update_and_fetch, which APPENDS a token per call. Against
+    the live cache that injects ~61 phantom tokens into layers 0-7 only (the
+    captured ones), which:
+      * corrupts the run's generated text from that point on, so tok/s and token
+        hashes from any MTPLX_ROOFLINE_PROFILE=1 run are not trustworthy, and
+      * makes the measurement non-idempotent (offset crosses KVCache.step=256
+        boundaries, triggering whole-buffer reallocation mid-bench).
+    Copying arrays via an arithmetic op (arr + 0) rather than a constructor
+    guarantees a distinct buffer regardless of MLX's aliasing rules; this is
+    asserted by tests/test_roofline_cache_isolation.py rather than assumed.
+
+    Returning None makes the caller SKIP the capture. Losing one component's
+    number is strictly better than silently corrupting the run producing it.
+    """
+    if cache is None:
+        return None
+    try:
+        snap = copy.copy(cache)
+        copied = False
+        for attr in ("keys", "values"):
+            arr = getattr(cache, attr, None)
+            if isinstance(arr, mx.array):
+                setattr(snap, attr, arr + 0)  # forces an independent buffer
+                copied = True
+            elif arr is not None:
+                # Quantized caches hold tuples of arrays; not handled -> skip
+                # rather than risk sharing a buffer with the live cache.
+                return None
+        if not copied:
+            return None
+        mx.eval(snap.keys, snap.values)
+        return snap
+    except Exception:  # pragma: no cover - never corrupt a run over a profile
+        return None
+
+
 def capture_attention(module, normed, mask, cache, nbytes: int) -> None:
     if not enabled():
         return
+    # Replay against an isolated copy so the live cache is never advanced.
+    snap = snapshot_cache(cache)
+    if cache is not None and snap is None:
+        return
     nc = _concrete(normed)
-    _reg("attention", lambda m=module, n=nc: m(n, mask, cache), nbytes)
+    _reg("attention", lambda m=module, n=nc, c=snap: m(n, mask, c), nbytes)
 
 
 def capture_moe(switch_mlp, x, indices, nbytes: int) -> None:
