@@ -73,6 +73,7 @@ def selfcheck_enabled() -> bool:
     return (
         _env_on("MTPLX_NAX_VERIFY")
         or _env_on("MTPLX_GQA_PACKED_SDPA")
+        or _env_on("MTPLX_QWEN_ROW_OWNED_ROUTER")
         or _env_on("MTPLX_FUSE_GDN_POST_CONV")
     )
 
@@ -137,6 +138,30 @@ def _check_qmm_lane(mx, fn, m: int, bits: int, group_size: int, dtype) -> float:
     if tuple(y.shape) != tuple(ref.shape):
         return float("inf")
     return _max_abs_diff(mx, y, ref)
+
+
+def _check_qwen_row_owned_router(mx, dtype) -> float:
+    """Require bitwise stock routing for every installed M1-M16 row count."""
+
+    if dtype != mx.bfloat16:
+        return float("inf")
+    from .qwen_row_owned_router import qwen_row_owned_route
+
+    mx.random.seed(358)
+    logits = (mx.random.normal((16, 256), dtype=mx.float32) * 0.5).astype(dtype)
+    probabilities = mx.softmax(logits, axis=-1, precise=True)
+    for rows in range(1, 17):
+        current = probabilities[:rows]
+        stock_ids = mx.argpartition(current, kth=-8, axis=-1)[..., -8:]
+        stock_scores = mx.take_along_axis(current, stock_ids, axis=-1)
+        stock_scores = stock_scores / stock_scores.sum(axis=-1, keepdims=True)
+        candidate_ids, candidate_scores = qwen_row_owned_route(current)
+        mx.eval(stock_ids, stock_scores, candidate_ids, candidate_scores)
+        if not bool(mx.array_equal(candidate_ids, stock_ids).item()):
+            return float("inf")
+        if not bool(mx.array_equal(candidate_scores, stock_scores).item()):
+            return float("inf")
+    return 0.0
 
 
 def _check_gqa_packed(mx, dtype) -> float:
@@ -452,6 +477,15 @@ def run_kernel_selfcheck(dtype, bits: int, group_size: int) -> dict[str, Any]:
     lanes["qmm_m8_ksplit"] = _STATUS_SKIPPED
     # lm_head_topk kernels exist but are not routed on the serve path.
     lanes["lm_head_topk"] = _STATUS_SKIPPED
+
+    if _env_on("MTPLX_QWEN_ROW_OWNED_ROUTER"):
+        _record(
+            "qwen_row_owned_router",
+            0.002,
+            lambda: _check_qwen_row_owned_router(mx, dtype),
+        )
+    else:
+        lanes["qwen_row_owned_router"] = _STATUS_SKIPPED
 
     if _env_on("MTPLX_GQA_PACKED_SDPA"):
         _record("gqa_packed_sdpa", _SDPA_TOLERANCE, lambda: _check_gqa_packed(mx, dtype))

@@ -426,15 +426,24 @@ def load(
     if nax_env_enabled():
         nax_report = install_nax_qlinear_patch()
         logger.info("[nax-verify] %s", nax_report)
+    from .qwen_row_owned_router import (
+        install_qwen_row_owned_routers,
+        prepare_qwen_row_owned_routers,
+    )
+
     from .gdn_capture import (
         install_a3b_gdn_postconv,
         prepare_a3b_gdn_postconv,
     )
 
+    router_plan = prepare_qwen_row_owned_routers(model, config=config)
     postconv_plan = prepare_a3b_gdn_postconv(model, config=config)
     from .kernel_selfcheck import maybe_run_model_selfcheck
 
     selfcheck_report = maybe_run_model_selfcheck(model)
+    if router_plan is not None:
+        router_report = install_qwen_row_owned_routers(router_plan, selfcheck_report)
+        logger.info("[qwen-row-owned-router] %s", router_report)
     if postconv_plan is not None:
         postconv_report = install_a3b_gdn_postconv(
             postconv_plan, selfcheck_report
