@@ -13,6 +13,9 @@ import mtplx.qwen_row_owned_router as router_module
 from mtplx.qwen_row_owned_router import (
     install_qwen_row_owned_routers,
     prepare_qwen_row_owned_routers,
+    qwen_combine_tail_enabled,
+    qwen_combine_tail_m1,
+    qwen_combine_tail_m2,
     qwen_row_owned_route,
     qwen_row_owned_router_eligible,
     qwen_row_owned_router_enabled,
@@ -138,6 +141,10 @@ def _stock_route(probabilities: mx.array) -> tuple[mx.array, mx.array]:
     return indices, scores / scores.sum(axis=-1, keepdims=True)
 
 
+def _stock_combine(routed: mx.array, scores: mx.array) -> mx.array:
+    return (routed * scores[..., None]).sum(axis=-2)
+
+
 @pytest.fixture(autouse=True)
 def _clean_installation_and_selfcheck():
     router_module._reset_qwen_row_owned_router_for_tests()
@@ -152,6 +159,46 @@ def test_row_owned_router_is_default_off(monkeypatch) -> None:
     assert not qwen_row_owned_router_enabled()
     monkeypatch.setenv("MTPLX_QWEN_ROW_OWNED_ROUTER", "1")
     assert qwen_row_owned_router_enabled()
+
+
+def test_combine_tail_is_read_only_at_construction(monkeypatch) -> None:
+    monkeypatch.delenv("MTPLX_QWEN_COMBINE_TAIL", raising=False)
+    assert not qwen_combine_tail_enabled()
+    monkeypatch.setenv("MTPLX_QWEN_COMBINE_TAIL", "1")
+    assert qwen_combine_tail_enabled()
+
+
+def test_fixed_m1_m2_combine_entrypoints_are_bitwise_stock() -> None:
+    mx.random.seed(174)
+    for rows, entrypoint in ((1, qwen_combine_tail_m1), (2, qwen_combine_tail_m2)):
+        routed = mx.random.normal(
+            (1, rows, 8, 2048), dtype=mx.float32
+        ).astype(mx.bfloat16)
+        scores = mx.softmax(
+            mx.random.normal((1, rows, 8), dtype=mx.float32), axis=-1
+        ).astype(mx.bfloat16)
+        stock = _stock_combine(routed, scores)
+        candidate = entrypoint(routed, scores)
+        mx.eval(stock, candidate)
+        assert candidate.shape == (1, rows, 2048)
+        assert mx.array_equal(candidate, stock).item()
+
+
+def test_fixed_combine_entrypoints_contain_no_runtime_validation() -> None:
+    for entrypoint in (qwen_combine_tail_m1, qwen_combine_tail_m2):
+        source = inspect.getsource(entrypoint)
+        for forbidden in (
+            "os.environ",
+            "lane_disabled",
+            "selfcheck",
+            ".dtype",
+            "eligible",
+            "fallback",
+            "try:",
+            "raise ",
+            "_STATS",
+        ):
+            assert forbidden not in source
 
 
 def test_checked_public_helper_has_exact_m1_to_m16_contract() -> None:
@@ -240,6 +287,66 @@ def test_configuration_validates_then_installs_all_41_after_selfcheck(
     assert all(type(block).__call__ is router_module._installed_a3b_router_call for block in targets + mtp)
 
 
+def test_combine_flag_installs_the_fixed_m1_m2_class_after_both_selfchecks(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MTPLX_QWEN_ROW_OWNED_ROUTER", "1")
+    monkeypatch.setenv("MTPLX_QWEN_COMBINE_TAIL", "1")
+    model, targets, mtp = _fake_a3b_model()
+
+    plan = prepare_qwen_row_owned_routers(model, config=_fake_a3b_config())
+    assert plan is not None
+    assert plan.combine_tail
+    report = install_qwen_row_owned_routers(
+        plan,
+        {
+            "lanes": {
+                "qwen_row_owned_router": "ok",
+                "qwen_combine_tail_m1_m2": "ok",
+            }
+        },
+    )
+
+    assert report["validated_contract"]["combine_tail"] == {
+        "decode_verify": [1, 2],
+        "ar_decode": [1, 2],
+        "other_rows": "stock_weighted_reduction",
+    }
+    assert all(
+        type(block).__call__ is router_module._installed_a3b_router_combine_call
+        for block in targets + mtp
+    )
+
+
+def test_combine_requires_row_owned_router_installation(monkeypatch) -> None:
+    monkeypatch.delenv("MTPLX_QWEN_ROW_OWNED_ROUTER", raising=False)
+    monkeypatch.setenv("MTPLX_QWEN_COMBINE_TAIL", "1")
+    model, targets, mtp = _fake_a3b_model()
+
+    with pytest.raises(router_module.QwenRowOwnedRouterConfigError, match="requires"):
+        prepare_qwen_row_owned_routers(model, config=_fake_a3b_config())
+    assert all(type(block) is _FakeSparseBlock for block in targets + mtp)
+
+
+def test_combine_selfcheck_failure_prevents_installation(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_QWEN_ROW_OWNED_ROUTER", "1")
+    monkeypatch.setenv("MTPLX_QWEN_COMBINE_TAIL", "1")
+    model, targets, mtp = _fake_a3b_model()
+    plan = prepare_qwen_row_owned_routers(model, config=_fake_a3b_config())
+
+    with pytest.raises(router_module.QwenRowOwnedRouterConfigError, match="combine"):
+        install_qwen_row_owned_routers(
+            plan,
+            {
+                "lanes": {
+                    "qwen_row_owned_router": "ok",
+                    "qwen_combine_tail_m1_m2": "fallback",
+                }
+            },
+        )
+    assert all(type(block) is _FakeSparseBlock for block in targets + mtp)
+
+
 def test_flag_off_leaves_every_stock_block_unchanged() -> None:
     model, targets, mtp = _fake_a3b_model()
     original_classes = [type(block) for block in targets + mtp]
@@ -325,6 +432,51 @@ def test_installed_m2_decode_routes_directly(monkeypatch) -> None:
     assert targets[0].stock_calls == []
 
 
+def test_installed_combine_routes_m1_m2_directly_and_m3_explicitly_stock(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MTPLX_QWEN_ROW_OWNED_ROUTER", "1")
+    monkeypatch.setenv("MTPLX_QWEN_COMBINE_TAIL", "1")
+    model, targets, _mtp = _fake_a3b_model()
+    plan = prepare_qwen_row_owned_routers(model, config=_fake_a3b_config())
+    install_qwen_row_owned_routers(
+        plan,
+        {
+            "lanes": {
+                "qwen_row_owned_router": "ok",
+                "qwen_combine_tail_m1_m2": "ok",
+            }
+        },
+    )
+    observed: list[int] = []
+
+    def fake_route(probabilities, *, rows):
+        shape = (*probabilities.shape[:-1], 8)
+        return (
+            mx.zeros(shape, dtype=mx.uint32),
+            mx.full(shape, 1.0 / 8.0, dtype=mx.bfloat16),
+        )
+
+    def fake_m1(routed, scores):
+        observed.append(1)
+        return _stock_combine(routed, scores)
+
+    def fake_m2(routed, scores):
+        observed.append(2)
+        return _stock_combine(routed, scores)
+
+    monkeypatch.setattr(router_module, "current_attention_phase", lambda: "decode_verify")
+    monkeypatch.setattr(router_module, "_qwen_row_owned_route_unchecked", fake_route)
+    monkeypatch.setattr(router_module, "qwen_combine_tail_m1", fake_m1)
+    monkeypatch.setattr(router_module, "qwen_combine_tail_m2", fake_m2)
+    for rows in (1, 2, 3):
+        output = targets[0](mx.zeros((1, rows, 2048), dtype=mx.bfloat16))
+        mx.eval(output)
+        assert output.shape == (1, rows, 2048)
+    assert observed == [1, 2]
+    assert targets[0].stock_calls == []
+
+
 def test_prefill_and_unsupported_phase_are_explicit_stock_routes(monkeypatch) -> None:
     monkeypatch.setenv("MTPLX_QWEN_ROW_OWNED_ROUTER", "1")
     model, targets, _mtp = _fake_a3b_model()
@@ -372,6 +524,27 @@ def test_installed_execution_checks_only_dynamic_phase_and_rows() -> None:
     assert prepare < selfcheck < install
 
 
+def test_installed_combine_execution_has_no_validation_or_fallback_accounting() -> None:
+    hot_source = inspect.getsource(router_module._installed_a3b_router_combine_call)
+    assert "current_attention_phase" in hot_source
+    assert "value.shape[:-1]" in hot_source
+    for forbidden in (
+        "os.environ",
+        "lane_disabled",
+        "selfcheck",
+        "sharding_group",
+        ".dtype",
+        "top_k",
+        "norm_topk_prob",
+        "num_experts",
+        "eligible",
+        "fallback",
+        "_STATS",
+        "try:",
+    ):
+        assert forbidden not in hot_source
+
+
 def test_kernel_selfcheck_validates_the_complete_m1_m16_route(monkeypatch) -> None:
     monkeypatch.setenv("MTPLX_QWEN_ROW_OWNED_ROUTER", "1")
     monkeypatch.delenv("MTPLX_NAX_VERIFY", raising=False)
@@ -379,3 +552,13 @@ def test_kernel_selfcheck_validates_the_complete_m1_m16_route(monkeypatch) -> No
     report = kernel_selfcheck.run_kernel_selfcheck(mx.bfloat16, 4, 64)
     assert report["lanes"]["qwen_row_owned_router"] == "ok"
     assert report["dmax"]["qwen_row_owned_router"] == 0.0
+
+
+def test_kernel_selfcheck_validates_exact_combine_m1_m2(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_QWEN_ROW_OWNED_ROUTER", "1")
+    monkeypatch.setenv("MTPLX_QWEN_COMBINE_TAIL", "1")
+    monkeypatch.delenv("MTPLX_NAX_VERIFY", raising=False)
+    monkeypatch.delenv("MTPLX_GQA_PACKED_SDPA", raising=False)
+    report = kernel_selfcheck.run_kernel_selfcheck(mx.bfloat16, 4, 64)
+    assert report["lanes"]["qwen_combine_tail_m1_m2"] == "ok"
+    assert report["dmax"]["qwen_combine_tail_m1_m2"] == 0.0

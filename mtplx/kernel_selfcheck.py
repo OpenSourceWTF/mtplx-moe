@@ -74,6 +74,7 @@ def selfcheck_enabled() -> bool:
         _env_on("MTPLX_NAX_VERIFY")
         or _env_on("MTPLX_GQA_PACKED_SDPA")
         or _env_on("MTPLX_QWEN_ROW_OWNED_ROUTER")
+        or _env_on("MTPLX_QWEN_COMBINE_TAIL")
         or _env_on("MTPLX_FUSE_GDN_POST_CONV")
     )
 
@@ -160,6 +161,34 @@ def _check_qwen_row_owned_router(mx, dtype) -> float:
         if not bool(mx.array_equal(candidate_ids, stock_ids).item()):
             return float("inf")
         if not bool(mx.array_equal(candidate_scores, stock_scores).item()):
+            return float("inf")
+    return 0.0
+
+
+def _check_qwen_combine_tail_m1_m2(mx, dtype) -> float:
+    """Require bitwise stock arithmetic for the installed K1 shapes."""
+
+    if dtype != mx.bfloat16:
+        return float("inf")
+    from .qwen_row_owned_router import (
+        qwen_combine_tail_m1,
+        qwen_combine_tail_m2,
+    )
+
+    mx.random.seed(174)
+    for rows, entrypoint in ((1, qwen_combine_tail_m1), (2, qwen_combine_tail_m2)):
+        routed = mx.random.normal(
+            (1, rows, 8, 2048), dtype=mx.float32
+        ).astype(dtype)
+        scores = mx.softmax(
+            mx.random.normal((1, rows, 8), dtype=mx.float32), axis=-1
+        ).astype(dtype)
+        stock = (routed * scores[..., None]).sum(axis=-2)
+        candidate = entrypoint(routed, scores)
+        mx.eval(stock, candidate)
+        if tuple(candidate.shape) != (1, rows, 2048):
+            return float("inf")
+        if not bool(mx.array_equal(candidate, stock).item()):
             return float("inf")
     return 0.0
 
@@ -486,6 +515,15 @@ def run_kernel_selfcheck(dtype, bits: int, group_size: int) -> dict[str, Any]:
         )
     else:
         lanes["qwen_row_owned_router"] = _STATUS_SKIPPED
+
+    if _env_on("MTPLX_QWEN_COMBINE_TAIL"):
+        _record(
+            "qwen_combine_tail_m1_m2",
+            0.0,
+            lambda: _check_qwen_combine_tail_m1_m2(mx, dtype),
+        )
+    else:
+        lanes["qwen_combine_tail_m1_m2"] = _STATUS_SKIPPED
 
     if _env_on("MTPLX_GQA_PACKED_SDPA"):
         _record("gqa_packed_sdpa", _SDPA_TOLERANCE, lambda: _check_gqa_packed(mx, dtype))

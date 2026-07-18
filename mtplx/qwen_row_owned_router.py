@@ -24,7 +24,10 @@ _TOP_K = 8
 _EXACT_ROWS = tuple(range(1, 17))
 _SIMD_GROUPS = 8
 _THREADS = _SIMD_GROUPS * 32
+_COMBINE_HIDDEN = 2048
+_COMBINE_TOP_K = 8
 _KERNEL = None
+_COMBINE_KERNEL = None
 _A3B_LAYER_TYPES = tuple(
     "linear_attention" if index % 4 != 3 else "full_attention"
     for index in range(40)
@@ -39,7 +42,7 @@ _STATS: dict[str, Any] = {
     "validated_contract": None,
 }
 _INSTALLED_ROUTERS: list[tuple[Any, type]] = []
-_INSTALLED_CLASSES: dict[type, type] = {}
+_INSTALLED_CLASSES: dict[tuple[type, bool], type] = {}
 
 
 class QwenRowOwnedRouterIneligible(ValueError):
@@ -56,6 +59,7 @@ class QwenRowOwnedRouterInstallPlan:
 
     target_blocks: tuple[Any, ...]
     mtp_blocks: tuple[Any, ...]
+    combine_tail: bool
 
 
 @dataclass(frozen=True)
@@ -63,8 +67,8 @@ class _InstalledA3BRouterRoute:
     stock_call: Any
 
 
-def _a3b_router_contract() -> dict[str, Any]:
-    return {
+def _a3b_router_contract(*, combine_tail: bool = False) -> dict[str, Any]:
+    contract = {
         "model": "Qwen3.6-35B-A3B",
         "target_routers": 40,
         "mtp_routers": 1,
@@ -82,11 +86,28 @@ def _a3b_router_contract() -> dict[str, Any]:
             "other": "stock",
         },
     }
+    if combine_tail:
+        contract["combine_tail"] = {
+            "decode_verify": [1, 2],
+            "ar_decode": [1, 2],
+            "other_rows": "stock_weighted_reduction",
+        }
+    return contract
 
 
 def qwen_row_owned_router_enabled() -> bool:
     """Read the experimental switch at the construction boundary only."""
     return os.environ.get("MTPLX_QWEN_ROW_OWNED_ROUTER", "").strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
+
+
+def qwen_combine_tail_enabled() -> bool:
+    """Read the fixed M1/M2 combine switch at construction only."""
+    return os.environ.get("MTPLX_QWEN_COMBINE_TAIL", "").strip().lower() in {
         "1",
         "true",
         "on",
@@ -214,6 +235,31 @@ def qwen_row_owned_router_source() -> str:
     """
 
 
+def qwen_combine_tail_source() -> str:
+    """Preserve the A3B BF16 multiply/add order with one output owner."""
+    return f"""
+        using namespace metal;
+
+        constexpr int TOPK = {_COMBINE_TOP_K};
+        constexpr int HIDDEN = {_COMBINE_HIDDEN};
+
+        uint output_index = thread_position_in_grid.x;
+        uint row = output_index / HIDDEN;
+        uint column = output_index - row * HIDDEN;
+
+        bfloat accumulator = bfloat(0.0f);
+        _Pragma("unroll")
+        for (int expert = 0; expert < TOPK; ++expert) {{
+            uint routed_index = (row * TOPK + uint(expert)) * HIDDEN + column;
+            uint score_index = row * TOPK + uint(expert);
+            bfloat product = bfloat(
+                float(routed[routed_index]) * float(scores[score_index]));
+            accumulator = bfloat(float(accumulator) + float(product));
+        }}
+        combined[output_index] = accumulator;
+    """
+
+
 def _build_qwen_row_owned_router_kernel():
     global _KERNEL
     if _KERNEL is None:
@@ -225,6 +271,51 @@ def _build_qwen_row_owned_router_kernel():
             ensure_row_contiguous=True,
         )
     return _KERNEL
+
+
+def _build_qwen_combine_tail_kernel():
+    global _COMBINE_KERNEL
+    if _COMBINE_KERNEL is None:
+        _COMBINE_KERNEL = mx.fast.metal_kernel(
+            name="mtplx_qwen_a3b_combine_bf16_exact",
+            input_names=["routed", "scores"],
+            output_names=["combined"],
+            source=qwen_combine_tail_source(),
+            ensure_row_contiguous=True,
+        )
+    return _COMBINE_KERNEL
+
+
+def qwen_combine_tail_m1(
+    routed: mx.array,
+    scores: mx.array,
+) -> mx.array:
+    """Launch the installed BF16 [1,1,8,2048] combine geometry."""
+    kernel = _build_qwen_combine_tail_kernel()
+    (combined,) = kernel(
+        inputs=[routed, scores],
+        grid=(2048, 1, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(1, 2048)],
+        output_dtypes=[mx.bfloat16],
+    )
+    return combined.reshape(1, 1, 2048)
+
+
+def qwen_combine_tail_m2(
+    routed: mx.array,
+    scores: mx.array,
+) -> mx.array:
+    """Launch the installed BF16 [1,2,8,2048] combine geometry."""
+    kernel = _build_qwen_combine_tail_kernel()
+    (combined,) = kernel(
+        inputs=[routed, scores],
+        grid=(4096, 1, 1),
+        threadgroup=(64, 1, 1),
+        output_shapes=[(2, 2048)],
+        output_dtypes=[mx.bfloat16],
+    )
+    return combined.reshape(1, 2, 2048)
 
 
 def _qwen_row_owned_route_unchecked(
@@ -290,21 +381,50 @@ def _installed_a3b_router_call(self: Any, value: mx.array) -> mx.array:
     return routed + shared
 
 
-def _installed_class(base_class: type) -> type:
-    installed = _INSTALLED_CLASSES.get(base_class)
+def _installed_a3b_router_combine_call(self: Any, value: mx.array) -> mx.array:
+    """Use the installed K1 M1/M2 combine route without revalidating it."""
+    route = type(self)._mtplx_a3b_router_route
+    phase = current_attention_phase()
+    if phase == "prefill":
+        return route.stock_call(self, value)
+    rows = math.prod(int(dimension) for dimension in value.shape[:-1])
+    if phase not in {"decode_verify", "ar_decode"} or rows not in _EXACT_ROWS:
+        return route.stock_call(self, value)
+    probabilities = mx.softmax(self.gate(value), axis=-1, precise=True)
+    indices, scores = _qwen_row_owned_route_unchecked(probabilities, rows=rows)
+    routed = self.switch_mlp(value, indices)
+    if rows == 1:
+        routed = qwen_combine_tail_m1(routed, scores)
+    elif rows == 2:
+        routed = qwen_combine_tail_m2(routed, scores)
+    else:
+        routed = (routed * scores[..., None]).sum(axis=-2)
+    shared = self.shared_expert(value)
+    shared = mx.sigmoid(self.shared_expert_gate(value)) * shared
+    return routed + shared
+
+
+def _installed_class(base_class: type, *, combine_tail: bool) -> type:
+    key = (base_class, combine_tail)
+    installed = _INSTALLED_CLASSES.get(key)
     if installed is None:
+        installed_call = (
+            _installed_a3b_router_combine_call
+            if combine_tail
+            else _installed_a3b_router_call
+        )
         installed = type(
-            f"A3BInstalledRowOwned{base_class.__name__}",
+            f"A3BInstalledRowOwned{'Combine' if combine_tail else ''}{base_class.__name__}",
             (base_class,),
             {
                 "__module__": __name__,
-                "__call__": _installed_a3b_router_call,
+                "__call__": installed_call,
                 "_mtplx_a3b_router_route": _InstalledA3BRouterRoute(
                     stock_call=base_class.__call__
                 ),
             },
         )
-        _INSTALLED_CLASSES[base_class] = installed
+        _INSTALLED_CLASSES[key] = installed
     return installed
 
 
@@ -413,7 +533,13 @@ def prepare_qwen_row_owned_routers(
 ) -> QwenRowOwnedRouterInstallPlan | None:
     """Validate checkpoint-owned A3B facts once without installing execution."""
     _reset_qwen_row_owned_router_for_tests()
-    if not qwen_row_owned_router_enabled():
+    router_enabled = qwen_row_owned_router_enabled()
+    combine_tail = qwen_combine_tail_enabled()
+    if combine_tail and not router_enabled:
+        _fail_router_configuration(
+            "A3B combine tail requires the row-owned router installation"
+        )
+    if not router_enabled:
         return None
     _STATS["enabled"] = True
     text_config = config.get("text_config")
@@ -485,12 +611,13 @@ def prepare_qwen_row_owned_routers(
             "installation_error": None,
             "target_routers": 40,
             "mtp_routers": 1,
-            "validated_contract": _a3b_router_contract(),
+            "validated_contract": _a3b_router_contract(combine_tail=combine_tail),
         }
     )
     return QwenRowOwnedRouterInstallPlan(
         target_blocks=tuple(target_blocks),
         mtp_blocks=tuple(mtp_blocks),
+        combine_tail=combine_tail,
     )
 
 
@@ -504,11 +631,17 @@ def install_qwen_row_owned_routers(
         _fail_router_configuration(
             "A3B row-owned router selfcheck did not validate the exact M1-M16 route"
         )
+    if plan.combine_tail and lanes.get("qwen_combine_tail_m1_m2") != "ok":
+        _fail_router_configuration(
+            "A3B combine tail selfcheck did not validate fixed M1/M2 arithmetic"
+        )
     installed: list[tuple[Any, type]] = []
     try:
         for block in (*plan.target_blocks, *plan.mtp_blocks):
             original_class = type(block)
-            block.__class__ = _installed_class(original_class)
+            block.__class__ = _installed_class(
+                original_class, combine_tail=plan.combine_tail
+            )
             installed.append((block, original_class))
     except Exception:
         for block, original_class in reversed(installed):
@@ -528,9 +661,10 @@ def qwen_row_owned_router_stats() -> dict[str, Any]:
 
 
 def _reset_qwen_row_owned_router_for_tests() -> None:
-    global _KERNEL
+    global _COMBINE_KERNEL, _KERNEL
     _clear_installed_routers()
     _KERNEL = None
+    _COMBINE_KERNEL = None
     _STATS.update(
         {
             "enabled": False,
