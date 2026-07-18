@@ -30,6 +30,11 @@ from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..attention_context import current_attention_phase
 from .expert_mlx import UnboundExpertSwitch, run_switch_with_shared_overlap
+from .lookahead_prefetch import (
+    install_lookahead_routers,
+    maybe_prefetch_lookahead,
+    sparse_layer_entries,
+)
 
 
 def _use_decode_row_math(
@@ -337,6 +342,7 @@ class StreamedMoE(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         indices, scores = self.gate(x)
+        maybe_prefetch_lookahead(self, x, indices)
         if self.config.n_shared_experts is None:
             output = self.switch_mlp(x, indices)
             shared = None
@@ -581,6 +587,17 @@ class GlmMoeDsaModel(nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pipeline_rank = 0
         self.pipeline_size = 1
+        # Lookahead prefetch wiring (#99 "needs GLM wiring"): each streamed
+        # sparse layer holds plain references to the following sparse layers'
+        # gates so decode can predict their routes from the current hidden
+        # state. Inert unless --prefetch-slots is set.
+        install_lookahead_routers(
+            sparse_layer_entries(
+                self.layers,
+                module_type=StreamedMoE,
+                router_attr="gate",
+            )
+        )
 
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
         hidden = self.embed_tokens(inputs)
