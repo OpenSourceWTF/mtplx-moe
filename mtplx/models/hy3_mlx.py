@@ -937,6 +937,10 @@ class SparseMLP(nn.Module):
         _rp.capture_moe(
             self.switch_mlp, x, indices, _moe_read_nbytes(self.switch_mlp)
         )
+        # T0a: 32-assignment wave reads 4x the experts (32 distinct)
+        _rp.capture_moe_wave(
+            self.switch_mlp, x, _moe_read_nbytes(self.switch_mlp) * 4
+        )
         _rp.capture_dense(
             "shared_expert", self.shared_mlp, x, _rp.module_nbytes(self.shared_mlp)
         )
@@ -987,6 +991,12 @@ class DecoderLayer(nn.Module):
     ) -> mx.array:
         if _rp.enabled() and int(x.shape[-2]) == 1:
             normed = self.input_layernorm(x)
+            # T0b: prove the norm weights are bf16 (fp32 -> fp32 keys -> KV trap)
+            for _nm in ("q_norm", "k_norm"):
+                _w = getattr(getattr(self.self_attn, _nm, None), "weight", None)
+                if _w is not None:
+                    _rp.note_dtype(f"self_attn.{_nm}.weight", _w)
+            _rp.note_dtype("kv_cache.keys", getattr(cache, "keys", None))
             _rp.capture_attention(
                 self.self_attn, normed, mask, cache,
                 _rp.module_nbytes(self.self_attn) + _kv_nbytes(cache),

@@ -54,6 +54,10 @@ def _bench_now(name: str) -> None:
     is still live (the MoE bank is cleared at teardown, so atexit is too late)."""
     thunks = _SAMPLES.pop(name, [])
     try:
+        probe = thunks[0]()
+        if probe is None:
+            _RESULTS[name] = (None, "ineligible (wave declined shape)")
+            return
         _RESULTS[name] = (_queued_seconds(thunks), _BYTES.get(name, 0))
     except Exception as exc:  # pragma: no cover - diagnostic only
         _RESULTS[name] = (None, repr(exc))
@@ -96,6 +100,41 @@ def capture_moe(switch_mlp, x, indices, nbytes: int) -> None:
     idx = mx.array(indices)
     mx.eval(idx)
     _reg("moe_experts", lambda m=switch_mlp, xx=xc, ii=idx: m(xx, ii), nbytes)
+
+
+def capture_moe_wave(switch_mlp, x, nbytes_32: int) -> None:
+    """T0a: bench the 32-assignment M4 wave (the real MTP-depth hot path shape)
+    vs the single-token 8-assignment gather. If the wave runs materially above
+    the single-token 44%, MoE occupancy starvation is a batch=1-only artifact.
+    Weights/kernel/shape are real; only x values are broadcast (they don't affect
+    bandwidth), and 32 DISTINCT experts are gathered so the bank streams from DRAM."""
+    if not enabled():
+        return
+    xc = _concrete(x)
+
+    def thunk(m=switch_mlp, xx=xc):
+        wave_call = getattr(m, "wave_call", None)
+        if wave_call is None:
+            return None
+        x4 = mx.broadcast_to(xx.reshape(1, 1, -1), (1, 4, xx.shape[-1])) + 0.0
+        idx = (mx.arange(32, dtype=mx.uint32) % _EXPERTS).reshape(1, 4, 8)
+        scores = mx.ones((1, 4, 8), dtype=mx.bfloat16)
+        return wave_call(x4, idx, scores)
+
+    _reg("moe_wave(32)", thunk, nbytes_32)
+
+
+_DTYPES: dict[str, str] = {}
+
+
+def note_dtype(key: str, arr) -> None:
+    """T0b: record a tensor's dtype once (norm weights / cache keys) to prove the
+    bf16 invariant and surface the latent fp32-KV trap."""
+    if not enabled() or key in _DTYPES:
+        return
+    dtype = getattr(arr, "dtype", None)
+    if dtype is not None:
+        _DTYPES[key] = str(dtype)
 
 
 def _measure_ceiling() -> float:
@@ -170,3 +209,17 @@ def _dump() -> None:
     print(f"reconstructed decode ~{tot_ms:.1f} ms/token  ({1000/tot_ms if tot_ms else 0:.1f} tok/s)"
           f"  vs measured ~35 tok/s (~28.4 ms)", flush=True)
     print("per-call = one layer; ms/tok = per-call x layers (attention 80, MoE/shared/router 79).", flush=True)
+    if "moe_experts" in _RESULTS and "moe_wave(32)" in _RESULTS:
+        s8, b8 = _RESULTS["moe_experts"]
+        sw, bw = _RESULTS["moe_wave(32)"]
+        if s8 and sw:
+            g8 = b8 / s8 / 1e9
+            gw = int(bw) / sw / 1e9
+            print(f"\nT0a: single-token 8-assign {g8:.0f} GB/s vs 32-assign wave {gw:.0f} GB/s "
+                  f"({gw/g8:.2f}x) -> occupancy starvation is "
+                  f"{'batch=1-ONLY (MoE deprioritizes)' if gw > 1.3*g8 else 'STRUCTURAL (kernel work justified)'}", flush=True)
+    if _DTYPES:
+        print("\nT0b dtype invariants (bf16 expected; fp32 = latent KV trap):", flush=True)
+        for key, dtype in _DTYPES.items():
+            flag = "  <-- FP32 TRAP" if "float32" in dtype else ""
+            print(f"  {key:24s} {dtype}{flag}", flush=True)
