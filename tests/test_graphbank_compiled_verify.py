@@ -859,7 +859,7 @@ def test_compare_verify_outputs_truncates_report():
 # -- generation wiring (step 3) ------------------------------------------------
 
 
-def _tiny_mtpk_runtime():
+def _tiny_mtpk_runtime(*, mtp_token: int = 1):
     """Stub runtime in the style of tests/test_generation_sustained.py."""
     from pathlib import Path
     from types import SimpleNamespace
@@ -875,6 +875,7 @@ def _tiny_mtpk_runtime():
         def __init__(self):
             self.mtp = SimpleNamespace(_mtplx_lora_targets=[])
             self.capture_calls: list[int] = []
+            self.mtp_token = int(mtp_token)
 
         def make_cache(self):
             return []
@@ -914,9 +915,11 @@ def _tiny_mtpk_runtime():
         ):
             length = int(next_token_ids.shape[1])
             hidden = mx.zeros((1, length, 2), dtype=mx.float32)
+            logits = mx.zeros((1, length, 4), dtype=mx.float32)
+            logits = logits + mx.eye(4, dtype=mx.float32)[self.mtp_token]
             if return_hidden:
-                return self._logits(length), hidden
-            return self._logits(length)
+                return logits, hidden
+            return logits
 
         def mtp_update_cache(self, hidden_states, next_token_ids, **_kwargs):
             return hidden_states
@@ -948,11 +951,16 @@ def _tiny_mtpk_runtime():
     return rt, model
 
 
-def _run_tiny_mtpk(max_tokens: int = 5):
+def _run_tiny_mtpk(
+    max_tokens: int = 5,
+    *,
+    verify_strategy: str = "capture_commit",
+    mtp_token: int = 1,
+):
     from mtplx.generation import generate_mtpk
     from mtplx.sampling import SamplerConfig
 
-    rt, model = _tiny_mtpk_runtime()
+    rt, model = _tiny_mtpk_runtime(mtp_token=mtp_token)
     out = generate_mtpk(
         rt,
         [0],
@@ -960,7 +968,7 @@ def _run_tiny_mtpk(max_tokens: int = 5):
         sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=20),
         speculative_depth=3,
         mtp_history_policy="committed",
-        verify_strategy="capture_commit",
+        verify_strategy=verify_strategy,
         stop_token_ids=set(),
     )
     return out, model
@@ -996,6 +1004,55 @@ def test_generation_flag_on_attaches_stats_and_matches_flag_off(monkeypatch):
     assert out.stats.events[0]["graphbank"]["compiled_verify"]["calls"] >= 1
     # No adapters existed in the empty stub cache, so nothing to demote.
     assert bank_stats["demotions"] == 0
+
+
+def test_generation_target_prefix_compile_is_separately_default_off(monkeypatch):
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "1")
+    monkeypatch.delenv("MTPLX_COMPILED_TARGET_PREFIX", raising=False)
+
+    out, _ = _run_tiny_mtpk(verify_strategy="target_prefix")
+
+    assert out.stats.graphbank == {}
+
+
+def test_generation_flag_on_compiles_target_prefix_without_changing_tokens(monkeypatch):
+    monkeypatch.delenv("MTPLX_COMPILED_VERIFY", raising=False)
+    monkeypatch.delenv("MTPLX_COMPILED_TARGET_PREFIX", raising=False)
+    baseline, _ = _run_tiny_mtpk(verify_strategy="target_prefix")
+
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "1")
+    monkeypatch.setenv("MTPLX_COMPILED_TARGET_PREFIX", "1")
+    out, _ = _run_tiny_mtpk(verify_strategy="target_prefix")
+
+    assert out.tokens == baseline.tokens
+    assert out.stats.generated_tokens == baseline.stats.generated_tokens
+    bank_stats = out.stats.graphbank["compiled_verify"]
+    assert bank_stats["mode"] == "on"
+    assert bank_stats["calls"] == out.stats.verify_calls
+    assert bank_stats["compiled_calls"] >= 1
+    assert bank_stats["fallback_calls"] == 0
+
+
+def test_generation_target_prefix_compiles_rejection_correction_forward(monkeypatch):
+    monkeypatch.delenv("MTPLX_COMPILED_VERIFY", raising=False)
+    monkeypatch.delenv("MTPLX_COMPILED_TARGET_PREFIX", raising=False)
+    baseline, _ = _run_tiny_mtpk(
+        verify_strategy="target_prefix",
+        mtp_token=2,
+    )
+
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "1")
+    monkeypatch.setenv("MTPLX_COMPILED_TARGET_PREFIX", "1")
+    out, _ = _run_tiny_mtpk(
+        verify_strategy="target_prefix",
+        mtp_token=2,
+    )
+
+    assert out.tokens == baseline.tokens
+    bank_stats = out.stats.graphbank["compiled_verify"]
+    assert bank_stats["calls"] > out.stats.verify_calls
+    assert bank_stats["compiled_calls"] == bank_stats["calls"]
+    assert bank_stats["fallback_calls"] == 0
 
 
 def test_generation_flag_parity_double_runs_each_verify(monkeypatch):
@@ -1057,12 +1114,18 @@ def test_profiles_accept_compiled_verify_env_keys():
 
     assert "MTPLX_COMPILED_VERIFY" in MODEL_RUNTIME_ENV_OVERRIDE_KEYS
     assert "MTPLX_COMPILED_VERIFY_MAX_LEN" in MODEL_RUNTIME_ENV_OVERRIDE_KEYS
+    assert "MTPLX_COMPILED_TARGET_PREFIX" in MODEL_RUNTIME_ENV_OVERRIDE_KEYS
     normalized = normalize_runtime_env_overrides(
-        {"MTPLX_COMPILED_VERIFY": "parity", "MTPLX_COMPILED_VERIFY_MAX_LEN": 6}
+        {
+            "MTPLX_COMPILED_VERIFY": "parity",
+            "MTPLX_COMPILED_VERIFY_MAX_LEN": 6,
+            "MTPLX_COMPILED_TARGET_PREFIX": True,
+        }
     )
     assert normalized == {
         "MTPLX_COMPILED_VERIFY": "parity",
         "MTPLX_COMPILED_VERIFY_MAX_LEN": "6",
+        "MTPLX_COMPILED_TARGET_PREFIX": "1",
     }
     # parity2 is a VALUE of the exact-match MTPLX_COMPILED_VERIFY key, so the
     # existing key list already carries it through contract overrides.

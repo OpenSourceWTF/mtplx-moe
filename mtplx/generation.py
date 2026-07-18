@@ -5468,6 +5468,9 @@ def generate_mtpk(
         else None
     )
     _compiled_verify_mode = compiled_verify_mode()
+    compiled_target_prefix = verify_strategy == "target_prefix" and _env_truthy(
+        "MTPLX_COMPILED_TARGET_PREFIX"
+    )
     compiled_verify_bank = (
         CompiledVerifyBank(
             rt,
@@ -5476,7 +5479,10 @@ def generate_mtpk(
             parity2=_compiled_verify_mode == "parity2",
         )
         if _compiled_verify_mode != "off"
-        and verify_strategy in {"capture_commit", "graphbank_capture_commit"}
+        and (
+            verify_strategy in {"capture_commit", "graphbank_capture_commit"}
+            or compiled_target_prefix
+        )
         else None
     )
     snapshot_time = accept_time = rollback_time = repair_time = 0.0
@@ -6744,6 +6750,18 @@ def generate_mtpk(
                         hidden_variant=base_hidden_variant,
                         capture_backend=verify_core_backend,
                     )
+            elif compiled_verify_bank is not None:
+                # Replace only the target forward. target_prefix keeps its
+                # authoritative snapshot/trim, pre-sampling, and correction
+                # forward; captures here must not change its commit semantics.
+                verify_logits, verify_hidden, _compiled_captures = (
+                    compiled_verify_bank.forward_ar_capture(
+                        mx.array([verify_input]),
+                        cache=cache,
+                        return_hidden=True,
+                        hidden_variant=base_hidden_variant,
+                    )
+                )
             elif graphbank is not None:
                 verify_logits, verify_hidden = graphbank.forward_ar(
                     mx.array([verify_input]),
@@ -7495,12 +7513,22 @@ def generate_mtpk(
             else:
                 started = time.perf_counter()
                 with attention_phase("decode_verify"):
-                    repair_logits, repair_hidden = rt.forward_ar(
-                        mx.array([[int(rejection_correction)]]),
-                        cache=cache,
-                        return_hidden=True,
-                        hidden_variant=base_hidden_variant,
-                    )
+                    if compiled_verify_bank is not None:
+                        repair_logits, repair_hidden, _repair_captures = (
+                            compiled_verify_bank.forward_ar_capture(
+                                mx.array([[int(rejection_correction)]]),
+                                cache=cache,
+                                return_hidden=True,
+                                hidden_variant=base_hidden_variant,
+                            )
+                        )
+                    else:
+                        repair_logits, repair_hidden = rt.forward_ar(
+                            mx.array([[int(rejection_correction)]]),
+                            cache=cache,
+                            return_hidden=True,
+                            hidden_variant=base_hidden_variant,
+                        )
                 _eval(repair_logits, repair_hidden)
                 elapsed_repair = time.perf_counter() - started
                 target_time += elapsed_repair
@@ -7524,12 +7552,22 @@ def generate_mtpk(
             _add_timing(event, "rollback", elapsed_rollback)
             started = time.perf_counter()
             with attention_phase("decode_verify"):
-                repair_logits, repair_hidden = rt.forward_ar(
-                    mx.array([committed]),
-                    cache=cache,
-                    return_hidden=True,
-                    hidden_variant=base_hidden_variant,
-                )
+                if compiled_target_prefix and compiled_verify_bank is not None:
+                    repair_logits, repair_hidden, _repair_captures = (
+                        compiled_verify_bank.forward_ar_capture(
+                            mx.array([committed]),
+                            cache=cache,
+                            return_hidden=True,
+                            hidden_variant=base_hidden_variant,
+                        )
+                    )
+                else:
+                    repair_logits, repair_hidden = rt.forward_ar(
+                        mx.array([committed]),
+                        cache=cache,
+                        return_hidden=True,
+                        hidden_variant=base_hidden_variant,
+                    )
             _eval(repair_logits, repair_hidden)
             elapsed_repair = time.perf_counter() - started
             target_time += elapsed_repair
