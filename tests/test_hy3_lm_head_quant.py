@@ -1,7 +1,7 @@
 """T2a: trunk lm_head quant (MTPLX_HY3_LM_HEAD_QUANT_BITS) via Model._logits_head.
 
-Model._logits_head returns self.lm_head unquantized when the flag is unset, and a
-cached QuantizedLinear.from_linear copy (g64, q8/q4) when it is >0 — used for BOTH
+Model._logits_head returns self.lm_head unquantized when the flag is unset, and
+REPLACES self.lm_head with a QuantizedLinear (g64, q8/q4) when it is >0 — used for BOTH
 the AR logits (Model.__call__) and the MTP verify projection (the patched model
 inherits the hook). Quantizing the trunk head frees the ~990 MB bf16 read that was
 tripping the GPU watchdog at the 98 GiB memory edge (throttle relief). Unlike the

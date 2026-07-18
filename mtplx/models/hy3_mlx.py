@@ -1183,14 +1183,27 @@ class Model(nn.Module):
         bits = int(os.environ.get("MTPLX_HY3_LM_HEAD_QUANT_BITS", "0") or "0")
         if bits <= 0:
             return self.lm_head
-        head = getattr(self, "_mtplx_quant_lm_head", None)
-        if head is None:
+        if not int(getattr(self, "_mtplx_lm_head_quant_bits", 0) or 0):
+            if isinstance(self.lm_head, nn.QuantizedLinear):
+                # Already quantized upstream (e.g. a q4 checkpoint) — nothing to do.
+                self._mtplx_lm_head_quant_bits = int(self.lm_head.bits)
+                return self.lm_head
             head = nn.QuantizedLinear.from_linear(
                 self.lm_head, group_size=64, bits=bits
             )
             mx.eval(head.parameters())
-            self._mtplx_quant_lm_head = head
-        return head
+            # REPLACE the module; do NOT cache the quantized head alongside it.
+            # Keeping self.lm_head bound holds the 990MB bf16 weight resident, which
+            # inverts this lever's premise: instead of freeing ~712MB it ADDS ~278MB.
+            # That matters because the 79-island config peaks at 98 of the 100 GiB
+            # wired limit, where a retained copy is enough to trip the GPU
+            # command-buffer watchdog (kIOGPUCommandBufferCallbackErrorTimeout).
+            self.lm_head = head
+            self._mtplx_lm_head_quant_bits = bits
+            clear = getattr(mx, "clear_cache", None)
+            if clear is not None:
+                clear()
+        return self.lm_head
 
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
         hidden = self.model(inputs, cache)

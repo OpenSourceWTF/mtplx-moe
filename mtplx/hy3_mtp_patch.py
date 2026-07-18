@@ -1051,10 +1051,25 @@ def inject_hy3_streamed_mtp_support(
                 import mlx.core as mx
                 import mlx.nn as nn
 
-                cached = nn.QuantizedLinear.from_linear(
-                    self.lm_head, group_size=64, bits=bits
-                )
-                mx.eval(cached.parameters())
+                # T2a may have already replaced the trunk head with a quantized
+                # module. Building a second copy of the same weights would add
+                # another ~278MB on a config that peaks at 98 of 100 GiB, so at
+                # matching bits the draft SHARES the trunk head instead.
+                trunk = self._logits_head()
+                if isinstance(trunk, nn.QuantizedLinear):
+                    if int(trunk.bits) != bits:
+                        raise ValueError(
+                            "MTPLX_HY3_DRAFT_LM_HEAD_BITS="
+                            f"{bits} conflicts with an already-quantized trunk head at "
+                            f"{int(trunk.bits)} bits; re-quantizing a quantized head is "
+                            "not well-defined here. Set both flags to the same bits."
+                        )
+                    cached = trunk
+                else:
+                    cached = nn.QuantizedLinear.from_linear(
+                        trunk, group_size=64, bits=bits
+                    )
+                    mx.eval(cached.parameters())
                 self._mtplx_draft_lm_head = cached
             return cached
 
