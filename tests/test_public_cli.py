@@ -7126,3 +7126,54 @@ def test_quickstart_dashboard_handoff_does_not_crash(capsys):
     out = capsys.readouterr().out
     assert "Loading model: ~/.mtplx/models/demo" in out
     assert "Dashboard URL:" in out
+
+
+def test_model_contract_depth_uses_ceiling_when_no_default_declared():
+    """``mtp_depth_max`` alone still selects the ceiling (unchanged behaviour)."""
+    contract = {
+        "public_model_id": "some-third-party-artifact",
+        "mtp_depth_max": 3,
+    }
+    inspection = {"compatibility": {"runtime_contract": contract}}
+    sustained = public.get_profile("sustained")
+
+    assert public._model_contract_depth(inspection, profile=sustained, fallback=1) == 3
+
+
+def test_model_contract_depth_prefers_declared_default_over_ceiling():
+    """An artifact may declare a shallower default than its sidecar ceiling."""
+    contract = {
+        "public_model_id": "some-third-party-artifact",
+        "mtp_depth_max": 3,
+        "mtp_depth_default": 1,
+    }
+    inspection = {"compatibility": {"runtime_contract": contract}}
+    sustained = public.get_profile("sustained")
+
+    assert public._model_contract_depth(inspection, profile=sustained, fallback=3) == 1
+
+
+def test_model_contract_depth_clamps_declared_default_to_ceiling():
+    """A declared default never exceeds the artifact's supported depth."""
+    contract = {
+        "public_model_id": "some-third-party-artifact",
+        "mtp_depth_max": 2,
+        "mtp_depth_default": 5,
+    }
+    inspection = {"compatibility": {"runtime_contract": contract}}
+    sustained = public.get_profile("sustained")
+
+    assert public._model_contract_depth(inspection, profile=sustained, fallback=3) == 2
+
+
+def test_qwen36_35b_a3b_defaults_to_measured_best_depth():
+    """A3B's published sweep peaks at D1 (138.39 tok/s) vs its D3 ceiling (107.67)."""
+    contract = {
+        "public_model_id": public.QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        "recommended_profile": "sustained",
+        "mtp_depth_max": 3,
+    }
+    inspection = {"compatibility": {"runtime_contract": contract}}
+    sustained = public.get_profile("sustained")
+
+    assert public._model_contract_depth(inspection, profile=sustained, fallback=3) == 1

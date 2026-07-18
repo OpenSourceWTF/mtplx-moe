@@ -795,6 +795,22 @@ def _model_draft_sampler_spec(
         return fallback
 
 
+# Artifacts whose fastest published mode is shallower than their sidecar
+# ceiling. Same shape as _TURBO_DEFAULT_PUBLIC_MODEL_IDS below: measured-win
+# only, keyed by public model id. Artifacts that declare ``mtp_depth_default``
+# in their runtime contract take precedence over this table.
+#
+# Qwen3.6-35B-A3B (published depth sweep, greedy):
+#     AR 94.46 | D1 138.39 | D2 135.66 | D3 107.67 tok/s
+# Per-level acceptance decays steeply on this MoE (D3: 0.829 / 0.541 / 0.278),
+# so verify cost outruns the extra accepted tokens past D1. Running the D3
+# ceiling as the default costs -22.2% against D1.
+_MODEL_CONTRACT_DEPTH_DEFAULTS: dict[str, int] = {
+    QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID: 1,
+    QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID: 1,
+}
+
+
 def _model_contract_depth(
     inspection: dict[str, Any],
     *,
@@ -805,9 +821,23 @@ def _model_contract_depth(
     if not isinstance(contract, dict):
         return int(fallback)
     try:
-        depth = int(contract.get("mtp_depth_max", fallback))
+        depth_max = int(contract.get("mtp_depth_max", fallback))
     except (TypeError, ValueError):
         return int(fallback)
+    # ``mtp_depth_max`` is a CEILING (the deepest sidecar the artifact supports),
+    # not a recommendation. Artifacts whose fastest mode is shallower than that
+    # ceiling declare it via ``mtp_depth_default``; the ceiling then only bounds
+    # it. Without this split every artifact runs at its maximum depth, which is
+    # a measured loss whenever per-level acceptance decays quickly (Qwen3.6-35B-A3B:
+    # published D1 138.39 tok/s vs D3 107.67 tok/s, so the ceiling costs -22%).
+    measured_default = _MODEL_CONTRACT_DEPTH_DEFAULTS.get(
+        str(contract.get("public_model_id") or "").strip()
+    )
+    try:
+        depth = int(contract.get("mtp_depth_default", measured_default or depth_max))
+    except (TypeError, ValueError):
+        depth = measured_default or depth_max
+    depth = min(depth, depth_max)
     depth_ceiling = (
         MAX_GEMMA4_SPECULATIVE_DEPTH
         if _inspection_is_gemma4_assistant(inspection)
