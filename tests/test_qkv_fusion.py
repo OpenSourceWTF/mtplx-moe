@@ -45,3 +45,29 @@ def test_fused_split_shapes() -> None:
     assert q.shape[-1] == Q_DIM
     assert k.shape[-1] == KV_DIM
     assert v.shape[-1] == KV_DIM
+
+
+def test_sanitize_pack_engages() -> None:
+    """The load-time pack must actually fold q/k/v into qkv_proj (engagement
+    proof — a flat A/B is only creditable if the fusion truly ran)."""
+    from mtplx.models.hy3_mlx import _pack_linear_projection, _projection_pack_plan
+
+    weights = {}
+    for layer in (0, 1):
+        base = f"model.layers.{layer}.self_attn"
+        weights[f"{base}.q_proj.weight"] = mx.zeros((Q_DIM, H), dtype=mx.bfloat16)
+        weights[f"{base}.k_proj.weight"] = mx.zeros((KV_DIM, H), dtype=mx.bfloat16)
+        weights[f"{base}.v_proj.weight"] = mx.zeros((KV_DIM, H), dtype=mx.bfloat16)
+    for layer in (0, 1):
+        base = f"model.layers.{layer}.self_attn"
+        plan = _projection_pack_plan(
+            weights,
+            target=f"{base}.qkv_proj",
+            sources=(f"{base}.q_proj", f"{base}.k_proj", f"{base}.v_proj"),
+            equal_output_widths=False,
+        )
+        assert plan is not None
+        _pack_linear_projection(weights, plan)
+        assert f"{base}.qkv_proj.weight" in weights
+        assert f"{base}.q_proj.weight" not in weights
+        assert tuple(weights[f"{base}.qkv_proj.weight"].shape) == (Q_DIM + 2 * KV_DIM, H)
