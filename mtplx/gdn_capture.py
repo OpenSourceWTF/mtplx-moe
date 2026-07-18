@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import mlx.core as mx
@@ -14,6 +16,268 @@ def _env_enabled(name: str, *, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+_GDN_POSTCONV_STATS: dict[str, Any] = {
+    "enabled": False,
+    "installed": False,
+    "installation_status": "disabled",
+    "installation_error": None,
+    "gdn_layers": 0,
+    "validated_contract": None,
+}
+_A3B_GDN_POSTCONV_LAYER_TYPES = tuple(
+    "linear_attention" if index % 4 != 3 else "full_attention"
+    for index in range(40)
+)
+_A3B_GDN_POSTCONV_INSTALLED_GDNS: list[Any] = []
+
+
+class A3BGDNPostconvConfigError(RuntimeError):
+    """The exact A3B GDN post-conv lane could not be installed."""
+
+
+@dataclass(frozen=True)
+class A3BGDNPostconvInstallPlan:
+    """Externally validated A3B GDN ownership awaiting its self-check."""
+
+    gdns: tuple[Any, ...]
+
+
+def _a3b_gdn_postconv_contract() -> dict[str, Any]:
+    return {
+        "batch": 1,
+        "logical_m": 2,
+        "conv_shape": [1, 2, 8192],
+        "gate_shapes": {"a": [1, 2, 32], "b": [1, 2, 32]},
+        "state_shape": [1, 32, 128, 128],
+        "output_shape": [1, 2, 32, 128],
+        "captured_states_shape": [1, 2, 32, 128, 128],
+        "input_dtype": "bfloat16",
+        "state_dtype": "float32",
+        "key_heads": 16,
+        "value_heads": 32,
+        "key_axis": 128,
+        "value_axis": 128,
+        "threadgroup": [32, 4, 1],
+    }
+
+
+def a3b_gdn_postconv_enabled() -> bool:
+    return _env_enabled("MTPLX_FUSE_GDN_POST_CONV")
+
+
+def _clear_a3b_gdn_postconv_markers() -> None:
+    for gdn in _A3B_GDN_POSTCONV_INSTALLED_GDNS:
+        try:
+            delattr(gdn, "_mtplx_a3b_gdn_postconv_impl")
+        except AttributeError:
+            pass
+    _A3B_GDN_POSTCONV_INSTALLED_GDNS.clear()
+
+
+def _fail_a3b_gdn_postconv_configuration(message: str) -> None:
+    _clear_a3b_gdn_postconv_markers()
+    _GDN_POSTCONV_STATS["installed"] = False
+    _GDN_POSTCONV_STATS["installation_status"] = "configuration_error"
+    _GDN_POSTCONV_STATS["installation_error"] = str(message)
+    raise A3BGDNPostconvConfigError(message)
+
+
+def _validate_a3b_quant_projection(
+    gdn: Any,
+    name: str,
+    scales_shape: tuple[int, ...],
+    layer_index: int,
+) -> None:
+    projection = getattr(gdn, name, None)
+    scales = getattr(projection, "scales", None)
+    if (
+        int(getattr(projection, "bits", -1)) != 4
+        or int(getattr(projection, "group_size", -1)) != 64
+        or getattr(projection, "mode", None) != "affine"
+        or tuple(getattr(scales, "shape", ())) != scales_shape
+        or getattr(scales, "dtype", None) != mx.bfloat16
+    ):
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv projection_quantization mismatch for "
+            f"{name} at GDN layer {layer_index}"
+        )
+
+
+def prepare_a3b_gdn_postconv(
+    model: Any,
+    *,
+    config: dict[str, Any],
+) -> A3BGDNPostconvInstallPlan | None:
+    """Validate checkpoint/model facts once for the exact A3B M2/TGY4 lane."""
+    _reset_gdn_postconv_stats_for_tests()
+    if not a3b_gdn_postconv_enabled():
+        return None
+    _GDN_POSTCONV_STATS["enabled"] = True
+    if _env_enabled("MTPLX_NATIVE_GDN_TAIL"):
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv topology conflicts with MTPLX_NATIVE_GDN_TAIL"
+        )
+
+    text_config = config.get("text_config")
+    if (
+        config.get("model_type") != "qwen3_5_moe"
+        or config.get("architectures") != ["Qwen3_5MoeForConditionalGeneration"]
+        or not isinstance(text_config, dict)
+        or text_config.get("model_type") != "qwen3_5_moe_text"
+        or int(text_config.get("hidden_size", -1)) != 2048
+    ):
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv topology requires the exact A3B model"
+        )
+
+    text_model = getattr(model, "language_model", None)
+    inner = getattr(text_model, "model", None)
+    layers = list(getattr(inner, "layers", ()) or ())
+    if len(layers) != 40 or int(text_config.get("num_hidden_layers", -1)) != 40:
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv layer_count requires exactly 40 layers"
+        )
+    actual_linear = [bool(getattr(layer, "is_linear", False)) for layer in layers]
+    configured_types = tuple(text_config.get("layer_types", ()))
+    expected_linear = [
+        kind == "linear_attention" for kind in _A3B_GDN_POSTCONV_LAYER_TYPES
+    ]
+    if (
+        actual_linear != expected_linear
+        or configured_types != _A3B_GDN_POSTCONV_LAYER_TYPES
+    ):
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv topology requires exact 30-layer ownership"
+        )
+    gdns = [
+        getattr(layer, "linear_attn", None)
+        for layer, is_linear in zip(layers, actual_linear)
+        if is_linear
+    ]
+    if len(gdns) != 30 or any(gdn is None for gdn in gdns):
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv topology requires all 30 GDN modules"
+        )
+
+    config_geometry = {
+        "linear_num_value_heads": 32,
+        "linear_num_key_heads": 16,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+    }
+    if any(
+        int(text_config.get(name, -1)) != expected
+        for name, expected in config_geometry.items()
+    ) or float(text_config.get("rms_norm_eps", -1.0)) != 1e-6:
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv head_geometry mismatch in model config"
+        )
+
+    for index, gdn in enumerate(gdns):
+        if getattr(gdn, "sharding_group", None) is not None:
+            _fail_a3b_gdn_postconv_configuration(
+                f"A3B GDN postconv sharding is forbidden at GDN layer {index}"
+            )
+        if (
+            int(getattr(gdn, "conv_dim", -1)) != 8192
+            or int(getattr(gdn, "key_dim", -1)) != 2048
+            or int(getattr(gdn, "conv_kernel_size", -1)) != 4
+        ):
+            _fail_a3b_gdn_postconv_configuration(
+                f"A3B GDN postconv conv_geometry mismatch at GDN layer {index}"
+            )
+        if (
+            int(getattr(gdn, "num_k_heads", -1)) != 16
+            or int(getattr(gdn, "num_v_heads", -1)) != 32
+            or int(getattr(gdn, "head_k_dim", -1)) != 128
+            or int(getattr(gdn, "head_v_dim", -1)) != 128
+        ):
+            _fail_a3b_gdn_postconv_configuration(
+                f"A3B GDN postconv head_geometry mismatch at GDN layer {index}"
+            )
+        parameters = (
+            ("A_log", (32,)),
+            ("dt_bias", (32,)),
+            ("conv1d.weight", (8192, 4, 1)),
+        )
+        for parameter_name, expected_shape in parameters:
+            node = gdn
+            for part in parameter_name.split("."):
+                node = getattr(node, part, None)
+            if tuple(getattr(node, "shape", ())) != expected_shape:
+                _fail_a3b_gdn_postconv_configuration(
+                    "A3B GDN postconv parameter_shape mismatch for "
+                    f"{parameter_name} at GDN layer {index}"
+                )
+            if getattr(node, "dtype", None) != mx.bfloat16:
+                _fail_a3b_gdn_postconv_configuration(
+                    "A3B GDN postconv parameter_dtype requires BF16 for "
+                    f"{parameter_name} at GDN layer {index}"
+                )
+        _validate_a3b_quant_projection(gdn, "in_proj_qkv", (8192, 32), index)
+        _validate_a3b_quant_projection(gdn, "in_proj_a", (32, 32), index)
+        _validate_a3b_quant_projection(gdn, "in_proj_b", (32, 32), index)
+
+    _GDN_POSTCONV_STATS.update(
+        {
+            "installation_status": "awaiting_selfcheck",
+            "installation_error": None,
+            "gdn_layers": 30,
+            "validated_contract": _a3b_gdn_postconv_contract(),
+        }
+    )
+    return A3BGDNPostconvInstallPlan(gdns=tuple(gdns))
+
+
+def install_a3b_gdn_postconv(
+    plan: A3BGDNPostconvInstallPlan,
+    selfcheck_report: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Install the exact M2/TGY4 callables only after their one self-check."""
+    lanes = {} if selfcheck_report is None else selfcheck_report.get("lanes", {})
+    if lanes.get("gdn_postconv_inline_g") != "ok":
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv selfcheck did not validate the exact M2/TGY4 kernel"
+        )
+    for gdn in plan.gdns:
+        setattr(
+            gdn,
+            "_mtplx_a3b_gdn_postconv_impl",
+            partial(
+                _apply_enabled_a3b_gdn_postconv_m2_tgy4,
+                A_log=gdn.A_log,
+                dt_bias=gdn.dt_bias,
+            ),
+        )
+    _A3B_GDN_POSTCONV_INSTALLED_GDNS.extend(plan.gdns)
+    _GDN_POSTCONV_STATS["installed"] = True
+    _GDN_POSTCONV_STATS["installation_status"] = "installed"
+    return gdn_postconv_stats()
+
+
+def gdn_postconv_stats() -> dict[str, Any]:
+    """Report the immutable installation contract, never hot-path counters."""
+    report = dict(_GDN_POSTCONV_STATS)
+    contract = report.get("validated_contract")
+    report["validated_contract"] = dict(contract) if isinstance(contract, dict) else None
+    return report
+
+
+def _reset_gdn_postconv_stats_for_tests() -> None:
+    _clear_a3b_gdn_postconv_markers()
+    _GDN_POSTCONV_STATS.update(
+        {
+            "enabled": False,
+            "installed": False,
+            "installation_status": "disabled",
+            "installation_error": None,
+            "gdn_layers": 0,
+            "validated_contract": None,
+        }
+    )
 
 
 def _cache_context_len(cache: Any) -> int:
@@ -1427,6 +1691,55 @@ def _linear_gated_delta_from_conv_inline_g_capture(
     )
 
 
+def _a3b_compiled_target_gdn_postconv_m2_tgy4(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Launch the fixed A3B compiled-target M2 recurrence with TGY4."""
+    return _linear_gated_delta_from_conv_inline_g_kernel(
+        inputs=[conv_out, a, b, A_log, dt_bias, state, 2],
+        template=[
+            ("InT", mx.bfloat16),
+            ("StT", mx.float32),
+            ("Dk", 128),
+            ("Dv", 128),
+            ("Hk", 16),
+            ("Hv", 32),
+            ("KeyDim", 2048),
+            ("ConvDim", 8192),
+        ],
+        grid=(32, 128, 32),
+        threadgroup=(32, 4, 1),
+        output_shapes=[(1, 2, 32, 128), (1, 2, 32, 128, 128)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+
+
+def _apply_enabled_a3b_gdn_postconv_m2_tgy4(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Execute the construction-installed exact A3B M2/TGY4 route."""
+    return _a3b_compiled_target_gdn_postconv_m2_tgy4(
+        conv_out,
+        a,
+        b,
+        state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+
+
 def _stock_gated_delta_capture(
     q: mx.array,
     k: mx.array,
@@ -1504,7 +1817,12 @@ def gdn_forward_with_capture(
 
     final_only_capture = False
     capture_start = 0
-    if backend == "linear_gdn_from_conv_inline_g":
+    postconv_implementation = getattr(
+        gdn, "_mtplx_a3b_gdn_postconv_impl", None
+    )
+    if backend == "stock" and postconv_implementation is not None:
+        out, states = postconv_implementation(conv_out, a, b, state)
+    elif backend == "linear_gdn_from_conv_inline_g":
         delta_result = _linear_gated_delta_from_conv_inline_g_capture(
             conv_out,
             a,

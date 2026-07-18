@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from types import SimpleNamespace
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -69,7 +70,11 @@ def selfcheck_enabled() -> bool:
         return False
     if raw in {"1", "true", "on", "yes"}:
         return True
-    return _env_on("MTPLX_NAX_VERIFY") or _env_on("MTPLX_GQA_PACKED_SDPA")
+    return (
+        _env_on("MTPLX_NAX_VERIFY")
+        or _env_on("MTPLX_GQA_PACKED_SDPA")
+        or _env_on("MTPLX_FUSE_GDN_POST_CONV")
+    )
 
 
 def lane_disabled(lane: str) -> bool:
@@ -199,6 +204,66 @@ def _check_fused_gdn_norm_gate(mx, dtype) -> float:
     gate_f = gate.astype(mx.float32)
     ref = (gate_f * mx.sigmoid(gate_f) * normed.astype(mx.float32)).astype(dtype)
     return _max_abs_diff(mx, y, ref)
+
+
+def _check_gdn_postconv_inline_g(mx, dtype) -> float:
+    """Compare the exact A3B K1/M2 stock capture with the fused recurrence."""
+    if dtype != mx.bfloat16:
+        return float("inf")
+
+    from .gdn_capture import (
+        _a3b_compiled_target_gdn_postconv_m2_tgy4,
+        _stock_gated_delta_capture,
+    )
+
+    conv_values = mx.arange(2 * 8192, dtype=mx.float32).reshape(1, 2, 8192)
+    conv_out = (mx.sin(conv_values * 0.013) * 0.5).astype(mx.bfloat16)
+    gate_values = mx.arange(64, dtype=mx.float32).reshape(1, 2, 32)
+    a = (mx.sin(gate_values * 0.11) * 0.5).astype(mx.bfloat16)
+    b = (mx.cos(gate_values * 0.07) * 0.5).astype(mx.bfloat16)
+    state_values = mx.arange(32 * 128 * 128, dtype=mx.float32).reshape(
+        1, 32, 128, 128
+    )
+    state = mx.sin(state_values * 0.001) * 0.1
+    gdn = SimpleNamespace(
+        A_log=mx.linspace(0.0, 2.0, 32).astype(dtype),
+        dt_bias=mx.linspace(-5.0, -3.0, 32).astype(dtype),
+        conv_dim=8192,
+        key_dim=2048,
+        num_k_heads=16,
+        num_v_heads=32,
+        head_k_dim=128,
+        head_v_dim=128,
+        training=False,
+    )
+    q, k, v = [
+        tensor.reshape(1, 2, heads, 128)
+        for tensor, heads in zip(
+            mx.split(conv_out, [2048, 4096], axis=-1),
+            [16, 16, 32],
+        )
+    ]
+    inv_scale = 128**-0.5
+    q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+    k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+    ref_out, ref_states = _stock_gated_delta_capture(q, k, v, a, b, state, None, gdn)
+    out, states = _a3b_compiled_target_gdn_postconv_m2_tgy4(
+        conv_out,
+        a,
+        b,
+        state,
+        A_log=gdn.A_log,
+        dt_bias=gdn.dt_bias,
+    )
+    mx.eval(ref_out, ref_states, out, states)
+    if tuple(out.shape) != tuple(ref_out.shape) or tuple(states.shape) != tuple(
+        ref_states.shape
+    ):
+        return float("inf")
+    return max(
+        _max_abs_diff(mx, out, ref_out),
+        _max_abs_diff(mx, states, ref_states),
+    )
 
 
 def run_kernel_selfcheck(dtype, bits: int, group_size: int) -> dict[str, Any]:
@@ -410,6 +475,15 @@ def run_kernel_selfcheck(dtype, bits: int, group_size: int) -> dict[str, Any]:
         )
     else:
         lanes["fused_gdn_norm_gate"] = _STATUS_SKIPPED
+
+    if _env_on("MTPLX_FUSE_GDN_POST_CONV"):
+        _record(
+            "gdn_postconv_inline_g",
+            0.03125,
+            lambda: _check_gdn_postconv_inline_g(mx, dtype),
+        )
+    else:
+        lanes["gdn_postconv_inline_g"] = _STATUS_SKIPPED
 
     elapsed_ms = (time.perf_counter() - started) * 1000.0
 

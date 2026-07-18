@@ -8,7 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from mtplx import kernel_selfcheck, nax_verify
+from mtplx import gdn_capture, kernel_selfcheck, nax_verify
 from mtplx.kernel_selfcheck import (
     lane_disabled,
     report_for_health,
@@ -135,7 +135,11 @@ def test_selfcheck_enabled_gating(monkeypatch) -> None:
     monkeypatch.delenv("MTPLX_KERNEL_SELFCHECK", raising=False)
     monkeypatch.delenv("MTPLX_NAX_VERIFY", raising=False)
     monkeypatch.delenv("MTPLX_GQA_PACKED_SDPA", raising=False)
+    monkeypatch.delenv("MTPLX_FUSE_GDN_POST_CONV", raising=False)
     assert selfcheck_enabled() is False
+    monkeypatch.setenv("MTPLX_FUSE_GDN_POST_CONV", "1")
+    assert selfcheck_enabled() is True
+    monkeypatch.delenv("MTPLX_FUSE_GDN_POST_CONV", raising=False)
     monkeypatch.setenv("MTPLX_NAX_VERIFY", "1")
     assert selfcheck_enabled() is True
     monkeypatch.setenv("MTPLX_KERNEL_SELFCHECK", "0")
@@ -143,6 +147,67 @@ def test_selfcheck_enabled_gating(monkeypatch) -> None:
     monkeypatch.setenv("MTPLX_KERNEL_SELFCHECK", "1")
     monkeypatch.delenv("MTPLX_NAX_VERIFY", raising=False)
     assert selfcheck_enabled() is True
+
+
+def test_postconv_fusion_has_a_fail_closed_selfcheck_lane(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_FUSE_GDN_POST_CONV", "1")
+    monkeypatch.setattr(
+        kernel_selfcheck,
+        "_check_gdn_postconv_inline_g",
+        lambda mx_module, dtype: 0.0,
+        raising=False,
+    )
+    report = run_kernel_selfcheck(mx.bfloat16, 4, 64)
+    assert report["lanes"]["gdn_postconv_inline_g"] == "ok"
+
+
+def test_postconv_selfcheck_rejects_output_or_captured_state_corruption(
+    monkeypatch,
+) -> None:
+    observed_states = []
+    mode = {"value": "exact"}
+    reference_out = mx.zeros((1, 2, 32, 128), dtype=mx.bfloat16)
+    reference_states = mx.zeros((1, 2, 32, 128, 128), dtype=mx.float32)
+
+    def stock(q, k, v, a, b, state, mask, gdn):
+        mx.eval(state)
+        assert bool(mx.all(mx.isfinite(state)).item())
+        assert float(mx.abs(state).max()) > 0.0
+        observed_states.append(state)
+        return reference_out, reference_states
+
+    def candidate(conv_out, a, b, state, *, A_log, dt_bias):
+        if mode["value"] == "output":
+            return reference_out + 0.125, reference_states
+        if mode["value"] == "state":
+            corrupted_second_token = mx.concatenate(
+                [
+                    reference_states[:, :1],
+                    reference_states[:, 1:] + 0.125,
+                ],
+                axis=1,
+            )
+            return reference_out, corrupted_second_token
+        return reference_out, reference_states
+
+    monkeypatch.setattr(gdn_capture, "_stock_gated_delta_capture", stock)
+    monkeypatch.setattr(
+        gdn_capture,
+        "_a3b_compiled_target_gdn_postconv_m2_tgy4",
+        candidate,
+    )
+
+    assert kernel_selfcheck._check_gdn_postconv_inline_g(mx, mx.bfloat16) == 0.0
+    mode["value"] = "output"
+    assert kernel_selfcheck._check_gdn_postconv_inline_g(mx, mx.bfloat16) > 0.03125
+    mode["value"] = "state"
+    assert kernel_selfcheck._check_gdn_postconv_inline_g(mx, mx.bfloat16) > 0.03125
+    mx.eval(*observed_states)
+    assert len(observed_states) == 3
+    assert all(
+        bool(mx.array_equal(observed_states[0], state).item())
+        for state in observed_states[1:]
+    )
 
 
 def test_health_payload_before_any_run_is_safe() -> None:
