@@ -636,6 +636,20 @@ class DenseIslandSwitchGLU(nn.Module):
         self.group_size = runtime.spec.quant_group_size
         self.bits = runtime.spec.quant_bits
         self._bank = store.bank_for_layer(self.layer_index)
+        # Lazily-built compiled expert gather (issue #51, 70 tps full-residency
+        # goal). Full residency rebuilds the 79-layer graph in Python every
+        # decode step; compiling the per-layer gather traces it once and
+        # replays. The island bank is fully resident and never mutated, so it
+        # is safe to capture in the compiled closure. A plain callable is not
+        # registered as an nn.Module child.
+        # NUMERICS: NOT bitwise vs eager. fp32 matmul compiles exactly, but
+        # mx.compile selects a different fused kernel for the quantized
+        # gather_qmm that diverges ~0.1-0.6% — non-associative FP, the same
+        # class as the vk_k split-K divergence (#171), tagged as a documented
+        # FP issue per David's 2026-07-18 ruling. Whether it holds token-sha
+        # end-to-end is a guarded-A/B question; if it flips tokens it is a
+        # divergent secondary line, not a bug. Default OFF.
+        self._compiled_gather = None
 
     def wave_call(
         self,
@@ -712,14 +726,36 @@ class DenseIslandSwitchGLU(nn.Module):
             (rows, top_k, hidden_size),
         ).reshape(-1, hidden_size)
         slot_indices = indices.reshape((-1, 1)).astype(mx.int32)
-        output = _gather_component_bank(
-            assignment_inputs,
-            self._bank,
-            slot_indices,
-            group_size=self.group_size,
-            bits=self.bits,
-        )
+        if os.environ.get("MTPLX_HY3_COMPILE_ISLAND") == "1":
+            output = self._compiled_island_gather()(assignment_inputs, slot_indices)
+        else:
+            output = _gather_component_bank(
+                assignment_inputs,
+                self._bank,
+                slot_indices,
+                group_size=self.group_size,
+                bits=self.bits,
+            )
         return output.reshape((*indices.shape, hidden_size))
+
+    def _compiled_island_gather(self):
+        """Build-once compiled expert gather closing over this layer's bank."""
+        if self._compiled_gather is None:
+            bank = self._bank
+            group_size = self.group_size
+            bits = self.bits
+
+            def gather(assignment_inputs: mx.array, slot_indices: mx.array) -> mx.array:
+                return _gather_component_bank(
+                    assignment_inputs,
+                    bank,
+                    slot_indices,
+                    group_size=group_size,
+                    bits=bits,
+                )
+
+            self._compiled_gather = mx.compile(gather)
+        return self._compiled_gather
 
 
 class BankedMmapBank:
