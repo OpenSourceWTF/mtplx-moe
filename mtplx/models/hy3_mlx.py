@@ -1173,18 +1173,35 @@ class Model(nn.Module):
         )
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
+    def _logits_head(self):
+        """T2a (flag-gated): trunk lm_head quantized to MTPLX_HY3_LM_HEAD_QUANT_BITS
+        (q8/q4). The head is bf16 990MB/token — the one saturated resident read left
+        unquantized. Quantizing it FREES memory below the plan budget (safe), and the
+        q-weight dequants to bf16 -> fp32 accumulate -> fp32 logit cast, so the
+        enable_lm_head_fp32 softmax precision is preserved (David's accumulate rule).
+        CHANGES the output distribution -> quality-gated, off by default. Built once."""
+        bits = int(os.environ.get("MTPLX_HY3_LM_HEAD_QUANT_BITS", "0") or "0")
+        if bits <= 0:
+            return self.lm_head
+        head = getattr(self, "_mtplx_quant_lm_head", None)
+        if head is None:
+            head = nn.QuantizedLinear.from_linear(
+                self.lm_head, group_size=64, bits=bits
+            )
+            mx.eval(head.parameters())
+            self._mtplx_quant_lm_head = head
+        return head
+
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
         hidden = self.model(inputs, cache)
-        # fp32 activations against the BF16 head weight force MLX to
-        # materialize an fp32 copy of the full [vocab, hidden] matrix per
-        # call (~9.4 ms vs ~1.9 ms measured at Hy3 shapes). The GEMM already
-        # accumulates in fp32, so casting the logits keeps the flag's
-        # fp32-softmax semantics at BF16 output rounding.
+        # fp32 activations against the head weight would force MLX to materialize
+        # an fp32 copy of the full [vocab, hidden] matrix per call (~9.4 ms). The
+        # GEMM already accumulates in fp32, so casting the LOGITS keeps the flag's
+        # fp32-softmax semantics at the head's output rounding without that copy.
+        head = self._logits_head()
         if _rp.enabled() and int(inputs.shape[-1]) == 1:
-            _rp.capture_dense(
-                "lm_head", self.lm_head, hidden, _rp.module_nbytes(self.lm_head)
-            )
-        logits = self.lm_head(hidden)
+            _rp.capture_dense("lm_head", head, hidden, _rp.module_nbytes(head))
+        logits = head(hidden)
         if self.args.enable_lm_head_fp32:
             logits = logits.astype(mx.float32)
         return logits
