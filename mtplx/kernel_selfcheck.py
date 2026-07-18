@@ -148,8 +148,11 @@ def _check_qwen_row_owned_router(mx, dtype) -> float:
         return float("inf")
     from .qwen_row_owned_router import qwen_row_owned_route
 
-    mx.random.seed(358)
-    logits = (mx.random.normal((16, 256), dtype=mx.float32) * 0.5).astype(dtype)
+    fixture = mx.arange(16 * 256, dtype=mx.float32).reshape(16, 256)
+    logits = (
+        mx.sin(fixture * 0.017) * 0.5
+        + mx.cos(fixture * 0.031) * 0.125
+    ).astype(dtype)
     probabilities = mx.softmax(logits, axis=-1, precise=True)
     for rows in range(1, 17):
         current = probabilities[:rows]

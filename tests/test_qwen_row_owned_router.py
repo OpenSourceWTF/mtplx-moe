@@ -570,3 +570,9 @@ def test_combine_selfcheck_fixture_does_not_mutate_global_rng() -> None:
     )
 
     assert "mx.random" not in combine_source
+
+
+def test_router_selfcheck_fixture_does_not_mutate_global_rng() -> None:
+    source = inspect.getsource(kernel_selfcheck._check_qwen_row_owned_router)
+
+    assert "mx.random" not in source
