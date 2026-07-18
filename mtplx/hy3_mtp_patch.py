@@ -1035,6 +1035,27 @@ def inject_hy3_streamed_mtp_support(
             hidden = pre_norm if hidden_variant == "pre_norm" else post_norm
             return logits, hidden
 
+        def _draft_lm_head(self):
+            """T1c: a quantized COPY of the trunk head for the DRAFT projection only.
+            OUTPUT-LOSSLESS — the target verify uses self.lm_head at full precision;
+            the draft head only shapes proposals, so quantizing it can move only the
+            acceptance rate, never the emitted distribution. Off by default; enable
+            with MTPLX_HY3_DRAFT_LM_HEAD_BITS=4 (or 8). Built once, then cached."""
+            bits = int(os.environ.get("MTPLX_HY3_DRAFT_LM_HEAD_BITS", "0") or "0")
+            if bits <= 0:
+                return self.lm_head
+            cached = getattr(self, "_mtplx_draft_lm_head", None)
+            if cached is None:
+                import mlx.core as mx
+                import mlx.nn as nn
+
+                cached = nn.QuantizedLinear.from_linear(
+                    self.lm_head, group_size=64, bits=bits
+                )
+                mx.eval(cached.parameters())
+                self._mtplx_draft_lm_head = cached
+            return cached
+
         def mtp_forward(
             self,
             hidden_states,
@@ -1062,7 +1083,7 @@ def inject_hy3_streamed_mtp_support(
                 next_token_ids,
                 hidden_states,
                 embed_tokens=self.model.embed_tokens,
-                lm_head=self.lm_head,
+                lm_head=self._draft_lm_head(),
                 cache=layer_cache,
             )
             if not return_hidden:
