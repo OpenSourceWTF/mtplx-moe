@@ -1370,8 +1370,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("bf16", "q4"),
         help=(
             "External NextN head precision (default bf16). bf16 loads the "
-            "bit-exact BF16 head (~7.5 GB resident; quantized MTP heads "
-            "collapse acceptance, docs/FORGE_BACKEND_CONTRACT.md section 6) "
+            "bit-exact BF16 head (~7.5 GB resident; quantizing the head costs "
+            "acceptance, never correctness) "
             "- budget it against --expert-cache-limit. q4 loads the pinned "
             "Hy3 quantized artifacts (~1.94 GiB expert bank); GLM-5.2 supports "
             "BF16 only. Requires --enable-mtp."

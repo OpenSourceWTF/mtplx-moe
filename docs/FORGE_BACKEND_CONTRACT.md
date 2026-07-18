@@ -289,7 +289,18 @@ For the build pipeline, generalise the existing one-off scripts:
 
 ## 6. Hard rule from mlx-lm PR #990 reviewer evidence
 
-Quantising MTP weights collapses MoE acceptance to **5-11%** (vs 79-85% with BF16 MTP). The frontend's PlanStage defaults `mtp_policy: keep_bf16` and surfaces a loud warning chip + checkbox if the user overrides to `requantize`. The backend MUST refuse a build whose recipe has `mtp_policy: requantize` UNLESS `--allow-degraded-mtp` is passed:
+Quantising MTP weights collapses MoE acceptance to **5-11%** (vs 79-85% with BF16 MTP).
+
+> **Scope.** This is external evidence from the mlx-lm PR #990 review of the
+> **Qwen3.6 forge pipeline**. It has not been reproduced in this repo and it
+> does not govern the Hy3/GLM streamed NextN heads. Measured directly on the
+> Hy3 layer-80 head (2026-07-18, teacher-forced, paired positions, n=280):
+> bf16 accept@1 0.264 vs q8 0.243 — a real but modest regression (paired rank
+> sign-test p=0.0013; McNemar on accept@1 p=0.11), nowhere near a collapse.
+> Treat the 5-11% figure as governing `mtplx forge` recipes only. The rule
+> below is still enforced for forge builds.
+
+The frontend's PlanStage defaults `mtp_policy: keep_bf16` and surfaces a loud warning chip + checkbox if the user overrides to `requantize`. The backend MUST refuse a build whose recipe has `mtp_policy: requantize` UNLESS `--allow-degraded-mtp` is passed:
 
 ```bash
 mtplx forge build cyankiwi/X --recipe '{"mtp_policy":"requantize",...}'
