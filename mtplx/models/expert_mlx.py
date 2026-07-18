@@ -1576,6 +1576,25 @@ class HotExpertSwitchGLU(nn.Module):
             )
         tokens = x.reshape(-1, hidden_size)
         top_k = int(indices.shape[-1])
+        # Shared-branch hoist (issue #51, flag-gated, exact-quality). Normally
+        # the resident shared MLP is submitted AFTER begin_split_route so it
+        # overlaps the miss reads (~0.44 ms). But the router host-sync below
+        # (mx.eval(indices), the per-streamed-layer barrier, p50 ~1 ms) is the
+        # bigger exposed cost, and the shared branch depends only on x — not on
+        # the routed indices — so it can be dispatched HERE to fill the GPU-idle
+        # window of the sync round-trip instead. Pure execution reorder: same
+        # shared_mlp(x), same combine, bitwise-identical output. Decode single
+        # token only; requires async_eval so the dispatch does not itself block.
+        _hoisted_shared: mx.array | None = None
+        if (
+            shared_work is not None
+            and int(x.shape[-2]) == 1
+            and os.environ.get("MTPLX_HY3_SHARED_HOIST") == "1"
+        ):
+            _async_eval = getattr(mx, "async_eval", None)
+            if callable(_async_eval):
+                _hoisted_shared = shared_work()
+                _async_eval(_hoisted_shared)
         with _route_probe.bracket("hot.eval_indices"):
             mx.eval(indices)
         # This eval materialized every earlier layer's wave output, so any
@@ -1600,7 +1619,9 @@ class HotExpertSwitchGLU(nn.Module):
 
         outputs: list[mx.array] = []
         output_positions: list[int] = []
-        shared: mx.array | None = None
+        # Seed from the hoist (above): when set, the shared branch is already
+        # computed and submitted, so the late dispatch sites skip recomputing it.
+        shared: mx.array | None = _hoisted_shared
 
         def update_fence_metrics(ready: ReadyRoute, **values: int) -> None:
             metrics = getattr(getattr(ready, "pool", None), "metrics", None)
@@ -2230,7 +2251,8 @@ class HotExpertSwitchGLU(nn.Module):
                         phase=phase,
                     )
                 try:
-                    shared = shared_work()
+                    if shared is None:
+                        shared = shared_work()
                 finally:
                     if pipeline_ledger is not None and shared_pipeline_work is not None:
                         _pipeline_work_call(
