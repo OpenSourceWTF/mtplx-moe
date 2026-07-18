@@ -562,3 +562,11 @@ def test_kernel_selfcheck_validates_exact_combine_m1_m2(monkeypatch) -> None:
     report = kernel_selfcheck.run_kernel_selfcheck(mx.bfloat16, 4, 64)
     assert report["lanes"]["qwen_combine_tail_m1_m2"] == "ok"
     assert report["dmax"]["qwen_combine_tail_m1_m2"] == 0.0
+
+
+def test_combine_selfcheck_fixture_does_not_mutate_global_rng() -> None:
+    combine_source = inspect.getsource(
+        kernel_selfcheck._check_qwen_combine_tail_m1_m2
+    )
+
+    assert "mx.random" not in combine_source

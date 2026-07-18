@@ -175,13 +175,21 @@ def _check_qwen_combine_tail_m1_m2(mx, dtype) -> float:
         qwen_combine_tail_m2,
     )
 
-    mx.random.seed(174)
     for rows, entrypoint in ((1, qwen_combine_tail_m1), (2, qwen_combine_tail_m2)):
-        routed = mx.random.normal(
-            (1, rows, 8, 2048), dtype=mx.float32
+        routed_fixture = mx.arange(
+            rows * 8 * 2048, dtype=mx.float32
+        ).reshape(1, rows, 8, 2048)
+        routed = (
+            mx.sin(routed_fixture * 0.013) * 0.5
+            + mx.cos(routed_fixture * 0.007) * 0.125
         ).astype(dtype)
+        score_fixture = mx.arange(rows * 8, dtype=mx.float32).reshape(
+            1, rows, 8
+        )
         scores = mx.softmax(
-            mx.random.normal((1, rows, 8), dtype=mx.float32), axis=-1
+            mx.sin(score_fixture * 0.11)
+            + mx.cos(score_fixture * 0.07) * 0.25,
+            axis=-1,
         ).astype(dtype)
         stock = (routed * scores[..., None]).sum(axis=-2)
         candidate = entrypoint(routed, scores)
