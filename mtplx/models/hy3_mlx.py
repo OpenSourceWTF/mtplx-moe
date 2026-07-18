@@ -38,7 +38,42 @@ from mtplx.hy3_router_fp32 import (
 )
 
 from mtplx.compile_state import compile_trace_active
+from mtplx import roofline_profile as _rp
 from .expert_mlx import UnboundExpertSwitch, run_switch_with_shared_overlap
+
+
+def _kv_nbytes(cache) -> int:
+    """Real bytes of the KV a decode attention step reads (0 if unavailable)."""
+    try:
+        keys = getattr(cache, "keys", None)
+        values = getattr(cache, "values", None)
+        if keys is not None and values is not None:
+            return int(keys.nbytes) + int(values.nbytes)
+        state = getattr(cache, "state", None)
+        if isinstance(state, (list, tuple)):
+            return sum(int(a.nbytes) for a in state if hasattr(a, "nbytes"))
+    except Exception:
+        pass
+    return 0
+
+
+def _moe_read_nbytes(switch_mlp) -> int:
+    """Real bytes a decode token reads from the expert bank: top_k of E experts,
+    not the whole resident bank."""
+    try:
+        bank = getattr(switch_mlp, "_bank", None)
+        top_k = int(switch_mlp.runtime.spec.top_k)
+        record_bytes = getattr(bank, "record_bytes", None)
+        if record_bytes is not None:
+            return int(record_bytes) * top_k
+        arrays = getattr(bank, "arrays", None)
+        if arrays:
+            total = sum(int(a.nbytes) for a in arrays.values())
+            experts = int(switch_mlp.runtime.spec.expert_count)
+            return total * top_k // max(experts, 1)
+    except Exception:
+        pass
+    return 0
 
 
 FUSE_SHARED_GATE_UP_ENV = "MTPLX_FUSE_HY3_SHARED_GATE_UP_PROJECTIONS"
@@ -858,6 +893,8 @@ class SparseMLP(nn.Module):
                 break
 
     def __call__(self, x: mx.array) -> mx.array:
+        if _rp.enabled() and int(x.shape[-2]) == 1:
+            return self._profiled_call(x)
         indices, scores = self.router(x)
         _lookahead_capture(self.layer_index, x, indices)
         self._maybe_prefetch_lookahead(x, indices)
@@ -882,6 +919,31 @@ class SparseMLP(nn.Module):
             indices,
             lambda: self.shared_mlp(x),
         )
+        routed = (routed * scores[..., None]).sum(axis=-2)
+        if self.enable_moe_fp32_combine:
+            return (routed.astype(mx.float32) + shared.astype(mx.float32)).astype(
+                x.dtype
+            )
+        return routed.astype(x.dtype) + shared
+
+    def _profiled_call(self, x: mx.array) -> mx.array:
+        """Same math as __call__, but captures real (module, input) samples for
+        router / routed experts / shared expert so the profiler can bench each on
+        the queued lane at exit (MTPLX_ROOFLINE_PROFILE). Bypasses the wave and the
+        shared-overlap wrapper so the three are separable; for a single decode
+        token the wave declines anyway, so the arithmetic matches __call__."""
+        _rp.capture_dense("router", self.router, x, _rp.module_nbytes(self.router))
+        indices, scores = self.router(x)
+        _rp.capture_moe(
+            self.switch_mlp, x, indices, _moe_read_nbytes(self.switch_mlp)
+        )
+        _rp.capture_dense(
+            "shared_expert", self.shared_mlp, x, _rp.module_nbytes(self.shared_mlp)
+        )
+        routed = self.switch_mlp(x, indices)
+        shared = self.shared_mlp(x)
+        if not self.enable_moe_fp32_combine:
+            scores = scores.astype(x.dtype)
         routed = (routed * scores[..., None]).sum(axis=-2)
         if self.enable_moe_fp32_combine:
             return (routed.astype(mx.float32) + shared.astype(mx.float32)).astype(
@@ -923,6 +985,14 @@ class DecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
+        if _rp.enabled() and int(x.shape[-2]) == 1:
+            normed = self.input_layernorm(x)
+            _rp.capture_attention(
+                self.self_attn, normed, mask, cache,
+                _rp.module_nbytes(self.self_attn) + _kv_nbytes(cache),
+            )
+            hidden = x + self.self_attn(normed, mask, cache)
+            return hidden + self.mlp(self.post_attention_layernorm(hidden))
         hidden = x + self.self_attn(self.input_layernorm(x), mask, cache)
         return hidden + self.mlp(self.post_attention_layernorm(hidden))
 
@@ -1102,6 +1172,10 @@ class Model(nn.Module):
         # call (~9.4 ms vs ~1.9 ms measured at Hy3 shapes). The GEMM already
         # accumulates in fp32, so casting the logits keeps the flag's
         # fp32-softmax semantics at BF16 output rounding.
+        if _rp.enabled() and int(inputs.shape[-1]) == 1:
+            _rp.capture_dense(
+                "lm_head", self.lm_head, hidden, _rp.module_nbytes(self.lm_head)
+            )
         logits = self.lm_head(hidden)
         if self.args.enable_lm_head_fp32:
             logits = logits.astype(mx.float32)
