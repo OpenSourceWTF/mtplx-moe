@@ -416,8 +416,21 @@ class ReadyRoute:
     def _complete_slot_claim(self, slot_id: int) -> None:
         slot = self._pending_slots.get(slot_id)
         claim = self._pin_claims.get(slot_id)
-        if slot is not None and claim is not None and claim in slot.pin_claims:
-            slot.pin_claims.remove(claim)
+        if slot is not None and claim is not None:
+            # pin_claims is read by the generation thread under slot.condition
+            # (it appends a claim and recomputes slot.pins as a sum over the
+            # list). Removing without the lock lets that sum iterate a list
+            # that is shifting underneath it, so slot.pins can be published
+            # as 0 while a pin is live -- after which _prepare_load refills a
+            # buffer that a live binding still points at, and the matmul reads
+            # the wrong expert with no exception and no metric.
+            #
+            # Safe against deadlock: _release_physical_claim just above takes
+            # slot.condition on this same path while _release_condition is
+            # held, so this lock order already exists.
+            with slot.condition:
+                if claim in slot.pin_claims:
+                    slot.pin_claims.remove(claim)
         self._pending_slots.pop(slot_id, None)
         self._pin_claims.pop(slot_id, None)
         self._scheduled_slots.discard(slot_id)
