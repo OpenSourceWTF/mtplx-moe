@@ -489,6 +489,70 @@ def test_miss_shadow_survives_to_runtime_config_and_payload(
     assert payload["models"][0]["runtime_config"]["miss_shadow"] == "t158"
 
 
+def test_streamed_codec_flags_parse_and_reach_runtime_options() -> None:
+    module = _load_module()
+
+    defaults = module.build_parser().parse_args([])
+    assert defaults.streamed_codec == "none"
+    assert defaults.streamed_codec_manifest == ""
+    assert defaults.streamed_codec_verify is True
+    assert module.DEFAULT_RUNTIME_OPTIONS["streamed_codec"] == "none"
+    assert module.DEFAULT_RUNTIME_OPTIONS["streamed_codec_verify"] is True
+
+    args = module.build_parser().parse_args(
+        [
+            "--streamed-codec", "rans32x-v1",
+            "--streamed-codec-manifest", "/tmp/codec.json",
+            "--no-streamed-codec-verify",
+        ]
+    )
+    options = module._runtime_options_from_args(args)
+    assert options["streamed_codec"] == "rans32x-v1"
+    assert options["streamed_codec_manifest"] == "/tmp/codec.json"
+    assert options["streamed_codec_verify"] is False
+
+    with pytest.raises(SystemExit):
+        module.build_parser().parse_args(["--streamed-codec", "zstd"])
+
+
+def test_streamed_codec_survives_to_runtime_config(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+
+    module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (1,)}],
+        contexts=(1024,),
+        runtime_options={
+            "streamed_codec": "rans32x-v1",
+            "streamed_codec_manifest": str(tmp_path / "codec.json"),
+            "streamed_codec_verify": False,
+        },
+        apis=apis,
+    )
+
+    assert calls.configs[0]["streamed_codec"] == "rans32x-v1"
+    assert calls.configs[0]["streamed_codec_manifest"] == str(
+        tmp_path / "codec.json"
+    )
+    assert calls.configs[0]["streamed_codec_verify"] is False
+
+
+def test_mtp_precision_flag_parses_and_reaches_requests() -> None:
+    module = _load_module()
+
+    defaults = module.build_parser().parse_args([])
+    assert defaults.mtp_precision == "bf16"
+    for request in module._requests_from_args(defaults):
+        assert request["mtp_precision"] == "bf16"
+
+    args = module.build_parser().parse_args(["--mtp-precision", "q4"])
+    for request in module._requests_from_args(args):
+        assert request["mtp_precision"] == "q4"
+
+    with pytest.raises(SystemExit):
+        module.build_parser().parse_args(["--mtp-precision", "q8"])
+
+
 def test_issue51_kernel_selectors_parse_independently() -> None:
     module = _load_module()
 

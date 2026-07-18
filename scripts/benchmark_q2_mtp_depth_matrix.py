@@ -90,6 +90,9 @@ DEFAULT_RUNTIME_OPTIONS = {
     "mmap_island_layers": "",
     "banked_manifest": "",
     "banked_codec": "none",
+    "streamed_codec": "none",
+    "streamed_codec_manifest": "",
+    "streamed_codec_verify": True,
     "mmap_island_wired": True,
     "read_chunk": "8MiB",
     "bypass_page_cache": True,
@@ -488,6 +491,39 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--streamed-codec",
+        default="none",
+        choices=["none", "rans32x-v1"],
+        help=(
+            "Lossless codec of the streamed miss-read sidecar (issue #113). "
+            "'rans32x-v1' reads per-record rANS containers and decodes them "
+            "in-kernel on the miss path."
+        ),
+    )
+    parser.add_argument(
+        "--streamed-codec-manifest",
+        default="",
+        help="Path to the streamed codec sidecar manifest JSON.",
+    )
+    parser.add_argument(
+        "--streamed-codec-verify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Verify decoded record payload hashes on the streamed codec path.",
+    )
+    parser.add_argument(
+        "--mtp-precision",
+        default="bf16",
+        choices=["bf16", "q4"],
+        help=(
+            "Streamed external MTP head precision. 'bf16' is the bit-exact "
+            "default; 'q4' loads the quantized sibling artifact (speculative-"
+            "only head: costs acceptance, never correctness). Point the "
+            "matching --*-mtp-artifacts flag at the artifact directory of the "
+            "chosen precision."
+        ),
+    )
+    parser.add_argument(
         "--mmap-island-wired",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -644,6 +680,7 @@ def _requests_from_args(args: argparse.Namespace) -> list[dict[str, Any]]:
             request["prompt_tail"] = _expand(prompt_tail)
         if not args.mtp_disabled_baseline:
             request["mtp_artifacts"] = _expand(mtp_artifacts)
+            request["mtp_precision"] = args.mtp_precision
         requests.append(request)
     return requests
 
@@ -676,6 +713,9 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "mmap_island_layers": args.mmap_island_layers,
         "banked_manifest": args.banked_manifest,
         "banked_codec": args.banked_codec,
+        "streamed_codec": args.streamed_codec,
+        "streamed_codec_manifest": args.streamed_codec_manifest,
+        "streamed_codec_verify": bool(args.streamed_codec_verify),
         "mmap_island_wired": bool(args.mmap_island_wired),
         "read_chunk": args.read_chunk,
         "bypass_page_cache": args.bypass_page_cache,
@@ -2197,6 +2237,13 @@ def _runtime_config(
         ),
         banked_codec=str(options.get("banked_codec", "none")),
         mmap_island_wired=bool(options.get("mmap_island_wired", True)),
+        streamed_codec=str(options.get("streamed_codec", "none")),
+        streamed_codec_manifest=(
+            str(options["streamed_codec_manifest"])
+            if options.get("streamed_codec_manifest")
+            else None
+        ),
+        streamed_codec_verify=bool(options.get("streamed_codec_verify", True)),
     )
 
 
@@ -2565,7 +2612,7 @@ def _run_depth_matrix_impl(
             model_payload.update(
                 {
                     "mtp_artifacts": str(request["mtp_artifacts"]),
-                    "mtp_precision": "bf16",
+                    "mtp_precision": request.get("mtp_precision", "bf16"),
                 }
             )
         models.append(model_payload)
@@ -2585,7 +2632,7 @@ def _run_depth_matrix_impl(
             load_kwargs.update(
                 {
                     "mtp_artifacts": request["mtp_artifacts"],
-                    "mtp_precision": "bf16",
+                    "mtp_precision": request.get("mtp_precision", "bf16"),
                 }
             )
         runtime = apis.load(request["model_root"], **load_kwargs)
