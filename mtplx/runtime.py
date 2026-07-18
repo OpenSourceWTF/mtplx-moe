@@ -194,6 +194,9 @@ class MTPLXRuntime:
                 self._count("full_logits_tokens_emitted", emitted)
         with self._expert_routing_context(input_ids):
             if not return_hidden and hidden_variant is None and not kwargs:
+                compiled = self._compiled_full_residency_forward(cache)
+                if compiled is not None:
+                    return compiled(input_ids, cache)
                 return self.model(input_ids, cache=cache)
             return self.model(
                 input_ids,
@@ -201,6 +204,35 @@ class MTPLXRuntime:
                 return_hidden=return_hidden,
                 **kwargs,
             )
+
+    def _compiled_full_residency_forward(self, cache):
+        """Compiled target forward (MTPLX_HY3_COMPILE_FORWARD), full residency only.
+
+        Kills the ~12 ms/token Python graph rebuild by tracing the 79-layer
+        forward once (CompiledARForward, KV state threaded). Only when every
+        routed layer is an island (no per-layer host sync to break the region)
+        and the flag is set. Rebuilds per cache identity so a new generation
+        gets fresh threaded state. Returns None (the eager path) otherwise.
+        """
+        from .compiled_forward import CompiledARForward, compile_forward_enabled
+
+        if not compile_forward_enabled() or cache is None:
+            return None
+        es = self.expert_streaming
+        if es is None:
+            return None
+        routed = set(getattr(es.spec, "routed_layer_indices", ()))
+        if not routed or not (routed <= getattr(es, "island_layer_set", frozenset())):
+            return None  # streamed layers host-sync -> break compile; eager path
+        cache_key = id(cache[0]) if cache else None
+        if (
+            getattr(self, "_compiled_ar", None) is None
+            or getattr(self, "_compiled_ar_key", None) != cache_key
+        ):
+            reserve = int(getattr(es.config, "max_live_kv_tokens", 4096))
+            self._compiled_ar = CompiledARForward(self.model, reserve_tokens=reserve)
+            self._compiled_ar_key = cache_key
+        return self._compiled_ar
 
     def forward_ar_capture(
         self,
