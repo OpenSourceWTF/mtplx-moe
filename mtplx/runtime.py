@@ -406,10 +406,21 @@ def load(
         if not mtp_enabled or not validate_mtp_support(model):
             raise RuntimeError(f"MTP injection failed for {path}")
     from .attention_split import configure_split_full_attention
+    from .moe_packed_projections import (
+        configure_moe_packed_projections,
+        moe_pack_gate_up_enabled,
+    )
     from .native_mlp import configure_native_mlp
 
     configure_split_full_attention(model)
     configure_native_mlp(model)
+    # Construction-time only: replaces the MoE gate/up projections with one
+    # packed matmul each. Must run after MTP injection so the draft block's
+    # MoE layer is packed too, and after load-coverage validation so the
+    # packed parameter tree is never compared against checkpoint keys.
+    if moe_pack_gate_up_enabled():
+        pack_report = configure_moe_packed_projections(model)
+        logger.info("[moe-pack] %s", pack_report)
     from .nax_verify import install_nax_qlinear_patch, nax_env_enabled
 
     if nax_env_enabled():
