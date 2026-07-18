@@ -569,6 +569,57 @@ def test_to_dict_exposes_stats_and_buckets():
     assert isinstance(data["buckets"], dict)
 
 
+def test_request_reserve_keeps_1024_outputs_compiled_and_parity_exact(monkeypatch):
+    """A known 1024-token request must not hit the legacy 512-token cliff."""
+
+    class ExactKVRuntime:
+        V = 5
+
+        def forward_ar_capture(
+            self,
+            input_ids,
+            cache=None,
+            return_hidden=False,
+            hidden_variant=None,
+            capture_backend=None,
+        ):
+            del hidden_variant, capture_backend
+            hidden = input_ids.astype(mx.float32)[..., None]
+            kv = hidden[:, None, :, :]
+            cache[0].update_and_fetch(kv, kv)
+            logits = mx.concatenate((hidden, hidden + 1.0), axis=-1)
+            if return_hidden:
+                return logits, hidden, {}
+            return logits, {}
+
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_PREWARM", "0")
+    rt = ExactKVRuntime()
+    cache = [KVCache()]
+    rt.forward_ar_capture(mx.array([[0, 1, 2]]), cache=cache)
+    bank = CompiledVerifyBank(rt, request_max_tokens=1024, parity=True)
+
+    for token_index in range(1024):
+        bank.forward_ar_capture(
+            mx.array([[token_index % rt.V]]),
+            cache=cache,
+            return_hidden=True,
+        )
+
+    stats = bank.to_dict()
+    assert stats["request_max_tokens"] == 1024
+    assert stats["speculative_headroom"] == bank.max_verify_len == 6
+    assert stats["compiled_calls"] == 1024
+    assert stats["fallback_calls"] == 0
+    assert stats["fallback_reasons"] == {}
+    assert stats["growth_demotions"] == 0
+    assert stats["parity_checks"] == 1024
+    assert stats["parity_failures"] == 0
+    assert isinstance(cache[0], TensorOffsetKVCache)
+    assert cache[0].size() == 1027
+    assert int(cache[0].keys.shape[2]) == 1280
+    assert int(cache[0].keys.shape[2]) % int(cache[0].step) == 0
+
+
 def test_parity_mode_passes_on_toy_model_and_commits_eager_state():
     rt = ToyHybridRuntime()
     bank = CompiledVerifyBank(rt, parity=True)
@@ -1031,6 +1082,29 @@ def test_generation_flag_on_compiles_target_prefix_without_changing_tokens(monke
     assert bank_stats["calls"] == out.stats.verify_calls
     assert bank_stats["compiled_calls"] >= 1
     assert bank_stats["fallback_calls"] == 0
+
+
+def test_generation_passes_known_output_budget_to_compiled_bank(monkeypatch):
+    import mtplx.generation as generation
+
+    real_bank = generation.CompiledVerifyBank
+    seen: list[dict] = []
+
+    def recording_bank(*args, **kwargs):
+        seen.append(dict(kwargs))
+        return real_bank(*args, **kwargs)
+
+    monkeypatch.setattr(generation, "CompiledVerifyBank", recording_bank)
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "1")
+    monkeypatch.setenv("MTPLX_COMPILED_TARGET_PREFIX", "1")
+
+    out, _ = _run_tiny_mtpk(
+        max_tokens=17,
+        verify_strategy="target_prefix",
+    )
+
+    assert len(out.tokens) == 17
+    assert seen and seen[0]["request_max_tokens"] == 17
 
 
 def test_generation_target_prefix_compiles_rejection_correction_forward(monkeypatch):

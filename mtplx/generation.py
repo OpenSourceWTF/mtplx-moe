@@ -5474,6 +5474,7 @@ def generate_mtpk(
     compiled_verify_bank = (
         CompiledVerifyBank(
             rt,
+            request_max_tokens=max_tokens,
             capture_backend=verify_core_backend,
             parity=_compiled_verify_mode == "parity",
             parity2=_compiled_verify_mode == "parity2",
