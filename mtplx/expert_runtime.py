@@ -41,8 +41,8 @@ from .expert_streaming_models import (
     ExpertStreamingModelSpec,
     get_model_spec,
     plan_expert_memory,
-    resident_quant_covers,
-    resident_quant_kept_bytes,
+    proj_quant_covers,
+    affine_quant_kept_bytes,
 )
 from .optimization_profiles import (
     ENFORCEABLE_KNOBS,
@@ -184,7 +184,7 @@ class ExpertStreamingConfig:
     # structural guards remain regardless.
     streamed_codec_verify: bool = True
     mmap_island_wired: bool = True
-    resident_quant: str | None = None
+    proj_quant: str | None = None
     kv_quant: str | None = None
     split_route_release: str = "fenced"
     prefetch_slots: int = 0
@@ -252,8 +252,8 @@ class ExpertStreamingConfig:
             )
         if not isinstance(self.deferred_pin_release, bool):
             raise ValueError("deferred_pin_release must be bool")
-        if self.resident_quant not in {None, "q8", "q4"}:
-            raise ValueError("resident_quant must be None, 'q8', or 'q4'")
+        if self.proj_quant not in {None, "q8", "q4"}:
+            raise ValueError("proj_quant must be None, 'q8', or 'q4'")
         if self.kv_quant not in {None, "q8", "q4"}:
             raise ValueError("kv_quant must be None, 'q8', or 'q4'")
         if self.miss_shadow is not None:
@@ -1396,7 +1396,7 @@ def resolve_island_placement(
         raise ExpertStreamingConfigurationError(str(exc)) from exc
 
 
-def resident_quant_plan_discount(manifest: Any, resident_quant: str | None) -> int:
+def proj_quant_plan_discount(manifest: Any, proj_quant: str | None) -> int:
     """Bytes the load-time resident quantization removes from the fixed side.
 
     Computed per manifest tensor with the same scope predicate the loader
@@ -1404,7 +1404,7 @@ def resident_quant_plan_discount(manifest: Any, resident_quant: str | None) -> i
     the stored BF16 one (kept bytes round up — the discount understates).
     """
 
-    if not resident_quant:
+    if not proj_quant:
         return 0
     discount = 0
     for tensor in manifest.resident_tensors:
@@ -1415,9 +1415,9 @@ def resident_quant_plan_discount(manifest: Any, resident_quant: str | None) -> i
             name = name[: -len(".weight")]
         else:
             continue
-        if resident_quant_covers(name):
-            discount += tensor.length - resident_quant_kept_bytes(
-                tensor.length, resident_quant
+        if proj_quant_covers(name):
+            discount += tensor.length - affine_quant_kept_bytes(
+                tensor.length, proj_quant
             )
     return discount
 
@@ -1817,8 +1817,8 @@ class ExpertStreamingRuntime:
         plan = config.memory_plan(
             model_spec,
             additional_resident_bytes=additional_resident_bytes,
-            resident_discount_bytes=resident_quant_plan_discount(
-                manifest, config.resident_quant
+            resident_discount_bytes=proj_quant_plan_discount(
+                manifest, config.proj_quant
             ),
         )
         if not plan.fits_fixed:

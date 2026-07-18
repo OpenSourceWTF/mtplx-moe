@@ -13,17 +13,17 @@ import pytest
 from mtplx.expert_runtime import (
     ExpertStreamingConfig,
     parse_memory_bytes,
-    resident_quant_plan_discount,
+    proj_quant_plan_discount,
 )
 from mtplx.expert_streaming_models import (
     get_model_spec,
     plan_expert_memory,
-    resident_quant_covers,
-    resident_quant_kept_bytes,
+    proj_quant_covers,
+    affine_quant_kept_bytes,
 )
 from mtplx.models.hy3_mlx import Model as Hy3Model
 from mtplx.models.hy3_mlx import ModelArgs as Hy3Args
-from mtplx.resident_loader import ResidentLoadError, _runtime_quantize_resident
+from mtplx.resident_loader import ResidentLoadError, _runtime_quantize_projections
 
 
 def _tiny_args() -> Hy3Args:
@@ -70,15 +70,15 @@ def _config_kwargs(**overrides):
     return kwargs
 
 
-def test_resident_quant_config_accepts_supported_modes() -> None:
+def test_proj_quant_config_accepts_supported_modes() -> None:
     for mode in (None, "q8", "q4"):
-        config = ExpertStreamingConfig(**_config_kwargs(resident_quant=mode))
-        assert config.resident_quant == mode
+        config = ExpertStreamingConfig(**_config_kwargs(proj_quant=mode))
+        assert config.proj_quant == mode
 
 
-def test_resident_quant_config_rejects_unknown_mode() -> None:
-    with pytest.raises(ValueError, match="resident_quant"):
-        ExpertStreamingConfig(**_config_kwargs(resident_quant="int8"))
+def test_proj_quant_config_rejects_unknown_mode() -> None:
+    with pytest.raises(ValueError, match="proj_quant"):
+        ExpertStreamingConfig(**_config_kwargs(proj_quant="int8"))
 
 
 def test_runtime_quantize_scopes_attention_shared_and_dense_mlp() -> None:
@@ -88,7 +88,7 @@ def test_runtime_quantize_scopes_attention_shared_and_dense_mlp() -> None:
         mx.float32
     )
 
-    quantized = _runtime_quantize_resident(model, "q4")
+    quantized = _runtime_quantize_projections(model, "q4")
 
     expected = set()
     for layer in range(args.num_hidden_layers):
@@ -129,8 +129,8 @@ def test_runtime_quantize_rejects_matchless_model() -> None:
             super().__init__()
             self.head = nn.Linear(8, 8, bias=False)
 
-    with pytest.raises(ResidentLoadError, match="matched no resident"):
-        _runtime_quantize_resident(Bare(), "q4")
+    with pytest.raises(ResidentLoadError, match=r"matched no trunk \*_proj"):
+        _runtime_quantize_projections(Bare(), "q4")
 
 
 @pytest.mark.parametrize(
@@ -149,15 +149,15 @@ def test_runtime_quantize_rejects_matchless_model() -> None:
         ("model.layers.80.eh_proj", False),
     ],
 )
-def test_resident_quant_scope(path: str, covered: bool) -> None:
-    assert resident_quant_covers(path) is covered
+def test_proj_quant_scope(path: str, covered: bool) -> None:
+    assert proj_quant_covers(path) is covered
 
 
-def test_resident_quant_kept_bytes_matches_group64_affine() -> None:
+def test_affine_quant_kept_bytes_matches_group64_affine() -> None:
     # 1 MiB of BF16 = 512 Ki elements; q4 packs to 256 KiB + 32 KiB of
     # BF16 scales and biases (one pair per 64-element group).
-    assert resident_quant_kept_bytes(1024 * 1024, "q4") == 256 * 1024 + 32 * 1024
-    assert resident_quant_kept_bytes(1024 * 1024, "q8") == 512 * 1024 + 32 * 1024
+    assert affine_quant_kept_bytes(1024 * 1024, "q4") == 256 * 1024 + 32 * 1024
+    assert affine_quant_kept_bytes(1024 * 1024, "q8") == 512 * 1024 + 32 * 1024
 
 
 def test_plan_discount_shrinks_fixed_bytes_exactly() -> None:
@@ -207,9 +207,9 @@ def test_manifest_plan_discount_scopes_and_prices_tensors() -> None:
         ),
     )
     manifest = SimpleNamespace(resident_tensors=tensors)
-    assert resident_quant_plan_discount(manifest, None) == 0
-    expected = 1024 * 1024 - resident_quant_kept_bytes(1024 * 1024, "q4")
-    assert resident_quant_plan_discount(manifest, "q4") == expected
+    assert proj_quant_plan_discount(manifest, None) == 0
+    expected = 1024 * 1024 - affine_quant_kept_bytes(1024 * 1024, "q4")
+    assert proj_quant_plan_discount(manifest, "q4") == expected
 
 
 def test_kv_quant_config_validation() -> None:
@@ -229,7 +229,7 @@ def test_plan_prices_quantized_kv() -> None:
     )
     raw = 8192 * spec.kv_bytes_per_token
     assert base.kv_bytes == raw
-    assert quant.kv_bytes == resident_quant_kept_bytes(raw, "q4")
+    assert quant.kv_bytes == affine_quant_kept_bytes(raw, "q4")
     with pytest.raises(ValueError, match="kv_quant"):
         plan_expert_memory(
             spec, total_limit_bytes=110 * 1024**3, context_tokens=8192,
@@ -327,7 +327,7 @@ def test_hy3_attention_matches_between_stock_and_quantized_cache() -> None:
     assert drift < 0.05, f"quantized-KV forward drifted: {drift}"
 
 
-def test_resident_quant_survives_benchmark_option_pipeline() -> None:
+def test_proj_quant_survives_benchmark_option_pipeline() -> None:
     """CLI vector -> parser -> runtime options -> config factory, mirroring
     the island-count guard (option keys have silently dropped between
     argparse and ExpertStreamingConfig before)."""
@@ -351,7 +351,7 @@ def test_resident_quant_survives_benchmark_option_pipeline() -> None:
             "--model", "hy3-q2",
             "--hy3-q2-model-root", "/tmp",
             "--memory-limit", "96GiB",
-            "--resident-quant", "q4",
+            "--proj-quant", "q4",
         ]
     )
     options = {
@@ -359,13 +359,13 @@ def test_resident_quant_survives_benchmark_option_pipeline() -> None:
         "trace_routes": False,
         **bench._runtime_options_from_args(args),
     }
-    assert options["resident_quant"] == "q4"
+    assert options["proj_quant"] == "q4"
     apis = SimpleNamespace(
         config_factory=ExpertStreamingConfig,
         parse_memory_bytes=parse_memory_bytes,
     )
     config = bench._runtime_config(apis, "hy3-expert-q2", options)
-    assert config.resident_quant == "q4"
+    assert config.proj_quant == "q4"
 
     kv_args = parser.parse_args(
         [

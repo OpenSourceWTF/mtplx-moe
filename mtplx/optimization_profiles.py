@@ -61,7 +61,7 @@ VALID_STATES = ("default_on", "default_off", "not_applicable", "unvalidated")
 # knob so "we never looked" (unvalidated) is always distinguishable from
 # "the profile is silent".
 KNOB_NAMES = (
-    "resident_quant",
+    "proj_quant",
     "kv_quant",
     "expert_integrity",
     "split_route_release",
@@ -80,12 +80,12 @@ KNOB_NAMES = (
 # pure ExpertStreamingConfig inspection, and (b) the inapplicability is
 # structural — the runtime would fail loudly later anyway (kv_quant:
 # glm make_cache ignores the overlay, guarded in resident_loader;
-# resident_quant: load-time nn.quantize matches no resident Linears).
+# proj_quant: load-time nn.quantize matches no resident Linears).
 # island_layer_count is deliberately NOT here even where a profile marks
 # it not_applicable: GLM's verdict is envelope-conditional (net negative
 # at 96 GiB) and the census lane (#101) ships GLM as its first consumer —
 # the benchmark advisory surfaces the conflict instead.
-ENFORCEABLE_KNOBS = frozenset({"resident_quant", "kv_quant"})
+ENFORCEABLE_KNOBS = frozenset({"proj_quant", "kv_quant"})
 
 
 @dataclass(frozen=True)
@@ -146,7 +146,7 @@ class OptimizationProfile:
 _HY3_EXPERT_Q2 = OptimizationProfile(
     model_key="hy3-expert-q2",
     knobs={
-        "resident_quant": KnobEntry(
+        "proj_quant": KnobEntry(
             state="default_on",
             value="q4",
             provenance=(
@@ -276,7 +276,7 @@ _HY3_EXPERT_Q2 = OptimizationProfile(
 _GLM52_EXPERT_Q2 = OptimizationProfile(
     model_key="glm52-expert-q2",
     knobs={
-        "resident_quant": KnobEntry(
+        "proj_quant": KnobEntry(
             state="not_applicable",
             value=None,
             provenance=(
@@ -400,7 +400,7 @@ _GLM52_EXPERT_Q2 = OptimizationProfile(
 _QWEN36_27B = OptimizationProfile(
     model_key="qwen36-27b",
     knobs={
-        "resident_quant": KnobEntry(
+        "proj_quant": KnobEntry(
             state="not_applicable",
             value=None,
             provenance=(

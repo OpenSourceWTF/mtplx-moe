@@ -12,7 +12,7 @@ from .expert_manifest import (
     resolve_artifact_member,
 )
 from .expert_runtime import ExpertStreamingRuntime
-from .expert_streaming_models import resident_quant_covers
+from .expert_streaming_models import proj_quant_covers
 
 
 class ResidentLoadError(RuntimeError):
@@ -27,8 +27,8 @@ class ResidentLoadReport:
     evaluated_parameter_count: int
     bound_sparse_layers: int
     strict: bool
-    resident_quant: str | None = None
-    resident_quantized_modules: int = 0
+    proj_quant: str | None = None
+    proj_quantized_modules: int = 0
 
     def as_dict(self) -> dict[str, int | bool | str | None]:
         return {
@@ -38,8 +38,8 @@ class ResidentLoadReport:
             "evaluated_parameter_count": self.evaluated_parameter_count,
             "bound_sparse_layers": self.bound_sparse_layers,
             "strict": self.strict,
-            "resident_quant": self.resident_quant,
-            "resident_quantized_modules": self.resident_quantized_modules,
+            "proj_quant": self.proj_quant,
+            "proj_quantized_modules": self.proj_quantized_modules,
         }
 
 
@@ -195,25 +195,24 @@ def _quantize_resident_model(
     )
 
 
-_RESIDENT_QUANT_BITS = {"q8": 8, "q4": 4}
+_PROJ_QUANT_BITS = {"q8": 8, "q4": 4}
 
 
-def _runtime_quantize_resident(model: Any, mode: str) -> list[str]:
-    """Quantize the bandwidth-dominant resident Linears after a BF16 load.
+def _runtime_quantize_projections(model: Any, mode: str) -> list[str]:
+    """Quantize the bandwidth-dominant trunk ``*_proj`` Linears after a BF16 load.
 
-    Scope comes from ``resident_quant_covers`` — the memory plan discounts
-    the same tensors, so the two must never diverge. Router gates,
-    embeddings, the LM head, norms, and MTP glue keep their loaded
-    precision — the router picks experts, so its numerics stay exact.
+    Scope comes from ``proj_quant_covers`` — the memory plan discounts the
+    same tensors, so the two must never diverge. Router gates, embeddings,
+    the LM head, norms, and MTP glue keep their loaded precision.
     """
 
     try:
         import mlx.nn as nn
     except Exception as exc:
         raise ResidentLoadError(
-            f"MLX NN is required for resident quantization: {exc}"
+            f"MLX NN is required for projection quantization: {exc}"
         ) from exc
-    bits = _RESIDENT_QUANT_BITS[mode]
+    bits = _PROJ_QUANT_BITS[mode]
     quantized: list[str] = []
 
     def predicate(path: str, module: Any) -> bool:
@@ -221,7 +220,7 @@ def _runtime_quantize_resident(model: Any, mode: str) -> list[str]:
             module, nn.QuantizedLinear
         ):
             return False
-        if resident_quant_covers(path):
+        if proj_quant_covers(path):
             quantized.append(path)
             return True
         return False
@@ -231,7 +230,7 @@ def _runtime_quantize_resident(model: Any, mode: str) -> list[str]:
     )
     if not quantized:
         raise ResidentLoadError(
-            f"resident_quant={mode!r} matched no resident Linear modules"
+            f"proj_quant={mode!r} matched no trunk *_proj Linear modules"
         )
     return quantized
 
@@ -310,13 +309,13 @@ def construct_resident_model(
         model.load_weights(list(weights.items()), strict=strict)
     except Exception as exc:
         raise ResidentLoadError(f"resident parameter validation failed: {exc}") from exc
-    resident_quant = getattr(runtime.config, "resident_quant", None)
+    proj_quant = getattr(runtime.config, "proj_quant", None)
     quantized_paths: list[str] = []
-    if resident_quant:
+    if proj_quant:
         # Drop the loader's references first so each replaced BF16 weight
         # frees as its quantized module lands, instead of at function exit.
         weights.clear()
-        quantized_paths = _runtime_quantize_resident(model, resident_quant)
+        quantized_paths = _runtime_quantize_projections(model, proj_quant)
     if mx_module is None:
         import mlx.core as mx
     else:
@@ -334,8 +333,8 @@ def construct_resident_model(
         evaluated_parameter_count=parameter_count,
         bound_sparse_layers=bound,
         strict=strict,
-        resident_quant=resident_quant,
-        resident_quantized_modules=len(quantized_paths),
+        proj_quant=proj_quant,
+        proj_quantized_modules=len(quantized_paths),
     )
     setattr(model, "_mtplx_expert_runtime", runtime)
     setattr(model, "_mtplx_resident_load_report", report.as_dict())

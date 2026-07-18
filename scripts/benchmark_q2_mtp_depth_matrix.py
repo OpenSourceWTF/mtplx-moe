@@ -80,7 +80,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "deferred_pin_release": True,
     "island_layers": "",
     "island_layer_count": None,
-    "resident_quant": None,
+    "proj_quant": None,
     "kv_quant": None,
     "miss_shadow": None,
     "miss_shadow_layers": None,
@@ -545,13 +545,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--resident-quant",
+        "--proj-quant",
+        "--resident-quant",  # deprecated alias, kept so saved runners still work
+        dest="proj_quant",
         choices=("q8", "q4"),
         default=None,
         help=(
-            "Quantize the resident attention/shared/dense-MLP Linears at "
-            "load time (group 64 affine). Routers, embeddings, and the LM "
-            "head keep their loaded precision. No artifact rebuild."
+            "Quantize the trunk *_proj Linears at load time (group 64 "
+            "affine): attention q/k/v/o_proj and gate/up/down_proj in the "
+            "mlp and shared_mlp blocks. Routers, embeddings, the LM head, "
+            "and norms keep their loaded precision. No artifact rebuild. "
+            "(--resident-quant is a deprecated alias for this flag.)"
         ),
     )
     parser.add_argument(
@@ -703,7 +707,7 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "deferred_pin_release": bool(args.deferred_pin_release),
         "island_layers": args.island_layers,
         "island_layer_count": args.island_layer_count,
-        "resident_quant": args.resident_quant,
+        "proj_quant": args.proj_quant,
         "kv_quant": args.kv_quant,
         "miss_shadow": args.miss_shadow,
         "miss_shadow_layers": args.miss_shadow_layers,
@@ -745,7 +749,7 @@ def _profile_advisories(
     for request in requests:
         model_key = MODEL_SPECS[request["model"]]["model_key"]
         observed = {
-            "resident_quant": runtime_options.get("resident_quant") or None,
+            "proj_quant": runtime_options.get("proj_quant") or None,
             "kv_quant": runtime_options.get("kv_quant") or None,
             "expert_integrity": runtime_options.get("expert_integrity"),
             "split_route_release": runtime_options.get("split_route_release"),
@@ -2215,7 +2219,7 @@ def _runtime_config(
         trace_routes=bool(options["trace_routes"]),
         island_layers=parse_island_layers(options.get("island_layers", "")),
         island_layer_count=options.get("island_layer_count"),
-        resident_quant=options.get("resident_quant") or None,
+        proj_quant=options.get("proj_quant") or None,
         kv_quant=options.get("kv_quant") or None,
         miss_shadow=options.get("miss_shadow") or None,
         miss_shadow_layers=options.get("miss_shadow_layers"),

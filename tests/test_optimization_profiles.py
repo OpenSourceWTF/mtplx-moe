@@ -79,7 +79,7 @@ def test_profile_knobs_are_read_only() -> None:
     profile = get_profile("hy3-expert-q2")
     assert profile is not None
     with pytest.raises(TypeError):
-        profile.knobs["resident_quant"] = KnobEntry("default_off", None, "tamper-attempt")
+        profile.knobs["proj_quant"] = KnobEntry("default_off", None, "tamper-attempt")
 
 
 def test_enforceable_knobs_are_config_fields_and_known_knobs() -> None:
@@ -111,8 +111,8 @@ def test_not_applicable_entries_carry_no_value() -> None:
 
 def test_hy3_measured_winners() -> None:
     knobs = PROFILES["hy3-expert-q2"].knobs
-    assert knobs["resident_quant"].state == "default_on"
-    assert knobs["resident_quant"].value == "q4"
+    assert knobs["proj_quant"].state == "default_on"
+    assert knobs["proj_quant"].value == "q4"
     assert knobs["expert_integrity"].state == "default_on"
     assert knobs["expert_integrity"].value == "headers-only"
     assert knobs["split_route_release"].state == "default_on"
@@ -128,8 +128,8 @@ def test_hy3_measured_winners() -> None:
 def test_glm52_not_applicable_facts() -> None:
     knobs = PROFILES["glm52-expert-q2"].knobs
     # resident/kv-quant NOT applicable, with the why in provenance.
-    assert knobs["resident_quant"].state == "not_applicable"
-    assert "already ships quantized" in knobs["resident_quant"].provenance
+    assert knobs["proj_quant"].state == "not_applicable"
+    assert "already ships quantized" in knobs["proj_quant"].provenance
     assert knobs["kv_quant"].state == "not_applicable"
     assert "make_cache ignores" in knobs["kv_quant"].provenance
     # headers-only 1.43x measured; deferred 1.05x measured.
@@ -170,21 +170,21 @@ def test_qwen36_mostly_not_applicable_streaming_knobs() -> None:
 
 def test_resolve_profile_defaults_empty_for_unregistered_model() -> None:
     assert resolve_profile_defaults("no-such-model") == {}
-    assert profile_conflict_warnings("no-such-model", {"resident_quant": "q4"}) == []
+    assert profile_conflict_warnings("no-such-model", {"proj_quant": "q4"}) == []
 
 
 def test_default_on_conflict_emits_advisory() -> None:
-    # hy3 resident_quant default is q4; running with None conflicts.
-    lines = profile_conflict_warnings("hy3-expert-q2", {"resident_quant": None})
+    # hy3 proj_quant default is q4; running with None conflicts.
+    lines = profile_conflict_warnings("hy3-expert-q2", {"proj_quant": None})
     assert len(lines) == 1
-    assert "resident_quant" in lines[0]
+    assert "proj_quant" in lines[0]
     assert "advisory only" in lines[0]
     # provenance is carried into the advisory.
     assert "d7a695a" in lines[0]
 
 
 def test_default_on_agreement_is_silent() -> None:
-    lines = profile_conflict_warnings("hy3-expert-q2", {"resident_quant": "q4"})
+    lines = profile_conflict_warnings("hy3-expert-q2", {"proj_quant": "q4"})
     assert lines == []
 
 
@@ -246,8 +246,8 @@ def test_not_applicable_violations_ignores_unforced_and_non_enforceable() -> Non
 
 
 def test_not_applicable_violations_empty_for_default_on_knob() -> None:
-    # hy3 resident_quant is default_on, not not_applicable -> never a violation.
-    assert not_applicable_violations("hy3-expert-q2", {"resident_quant": "q4"}) == []
+    # hy3 proj_quant is default_on, not not_applicable -> never a violation.
+    assert not_applicable_violations("hy3-expert-q2", {"proj_quant": "q4"}) == []
 
 
 def test_not_applicable_violations_empty_for_unregistered_model() -> None:
@@ -276,10 +276,10 @@ def test_runtime_open_raises_on_forced_not_applicable_kv_quant() -> None:
         )
 
 
-def test_runtime_open_raises_on_forced_not_applicable_resident_quant() -> None:
-    config = _minimal_config(resident_quant="q4")
+def test_runtime_open_raises_on_forced_not_applicable_proj_quant() -> None:
+    config = _minimal_config(proj_quant="q4")
     with pytest.raises(
-        ExpertStreamingConfigurationError, match="resident_quant.*not_applicable"
+        ExpertStreamingConfigurationError, match="proj_quant.*not_applicable"
     ):
         ExpertStreamingRuntime.open(
             "/nonexistent/root", "/nonexistent/manifest.json", config

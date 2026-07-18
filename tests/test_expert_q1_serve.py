@@ -292,15 +292,15 @@ def test_q1_requires_component_banks_slot_layout(tmp_path: Path) -> None:
         )
 
 
-def test_kv_and_resident_quant_stay_orthogonal_to_q1(tmp_path: Path) -> None:
-    # kv_quant / resident_quant are untouched by the q1 lane: a q1 config
+def test_kv_and_proj_quant_stay_orthogonal_to_q1(tmp_path: Path) -> None:
+    # kv_quant / proj_quant are untouched by the q1 lane: a q1 config
     # accepts them and the codec still routes through the shadow kernel.
     q1_root, config_json, q1_spec, manifest_path, _q1 = _assemble_q1_artifact(
         tmp_path, codec="t158", expert_count=2, top_k=1
     )
     config = replace(
         _q1_config(q1_spec),
-        resident_quant="q4",
+        proj_quant="q4",
     )
     runtime = ExpertStreamingRuntime.open(
         q1_root,

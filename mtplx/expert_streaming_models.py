@@ -22,19 +22,24 @@ from mtplx.expert_shadow import SHADOW_CODECS, shadow_record_bytes
 # Load-time resident quantization (group 64 affine over BF16): kept bytes
 # per source byte are packed bits plus one BF16 scale and bias per group:
 # bits/16 + 1/32, i.e. 9/32 for q4 and 17/32 for q8.
-RESIDENT_QUANT_KEEP_NUMERATOR = {"q8": 17, "q4": 9}
-RESIDENT_QUANT_KEEP_DENOMINATOR = 32
+AFFINE_QUANT_KEEP_NUMERATOR = {"q8": 17, "q4": 9}
+AFFINE_QUANT_KEEP_DENOMINATOR = 32
 _ATTENTION_PROJ_SUFFIXES = (".q_proj", ".k_proj", ".v_proj", ".o_proj", ".qkv_proj")
 _MLP_PROJ_SUFFIXES = (".gate_proj", ".up_proj", ".down_proj", ".gate_up_proj")
 
 
-def resident_quant_covers(path: str) -> bool:
-    """Module/tensor paths quantized by the load-time resident-quant pass.
+def proj_quant_covers(path: str) -> bool:
+    """Module/tensor paths quantized by the load-time proj-quant pass.
 
-    Attention projections, shared-expert MLPs, and dense-layer MLP
-    projections. Router gates, embeddings, the LM head, norms, and biases
-    stay at loaded precision. The loader's module predicate and the memory
-    plan's byte discount must agree, so both use this single source.
+    Covers exactly the ``*_proj`` weights of the trunk: attention
+    ``q/k/v/o_proj`` plus ``gate/up/down/gate_up_proj`` in ``mlp`` and
+    ``shared_mlp`` blocks. Router gates, embeddings, the LM head, norms,
+    and biases stay at loaded precision — the router picks experts, so its
+    numerics stay exact.
+
+    This is deliberately NARROWER than "everything resident"; the loader's
+    module predicate and the memory plan's byte discount must agree, so
+    both read scope from this single source.
     """
 
     if ".self_attn." in path and path.endswith(_ATTENTION_PROJ_SUFFIXES):
@@ -45,11 +50,11 @@ def resident_quant_covers(path: str) -> bool:
     return False
 
 
-def resident_quant_kept_bytes(length: int, mode: str) -> int:
+def affine_quant_kept_bytes(length: int, mode: str) -> int:
     """Post-quantization byte size of a BF16 tensor, rounded up."""
 
-    numerator = RESIDENT_QUANT_KEEP_NUMERATOR[mode]
-    return -(-length * numerator // RESIDENT_QUANT_KEEP_DENOMINATOR)
+    numerator = AFFINE_QUANT_KEEP_NUMERATOR[mode]
+    return -(-length * numerator // AFFINE_QUANT_KEEP_DENOMINATOR)
 
 
 def _integer(name: str, value: object, *, minimum: int | None = None) -> int:
@@ -621,12 +626,12 @@ def plan_expert_memory(
 
     kv_bytes = context_tokens * spec.kv_bytes_per_token
     if kv_quant is not None:
-        if kv_quant not in RESIDENT_QUANT_KEEP_NUMERATOR:
+        if kv_quant not in AFFINE_QUANT_KEEP_NUMERATOR:
             raise ValueError("kv_quant must be None, 'q8', or 'q4'")
         # QuantizedKVCache uses the same group-64 affine layout as the
         # resident pass; the MTP layer's stock cache is not in
         # kv_bytes_per_token (mtp_included=False) and stays in reserve.
-        kv_bytes = resident_quant_kept_bytes(kv_bytes, kv_quant)
+        kv_bytes = affine_quant_kept_bytes(kv_bytes, kv_quant)
     transient_bytes = service_slots * spec.expert_record_bytes
     resident_bytes = (
         spec.resident_bytes + additional_resident_bytes - resident_discount_bytes
