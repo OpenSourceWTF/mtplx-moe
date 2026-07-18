@@ -1052,7 +1052,10 @@ def test_generation_flag_on_attaches_stats_and_matches_flag_off(monkeypatch):
     assert bank_stats["compiled_calls"] >= 1
     assert bank_stats["fallback_calls"] == 0
     assert bank_stats["permanent_eager"] is False
-    assert out.stats.events[0]["graphbank"]["compiled_verify"]["calls"] >= 1
+    assert all(
+        "compiled_verify" not in event.get("graphbank", {})
+        for event in out.stats.events
+    )
     # No adapters existed in the empty stub cache, so nothing to demote.
     assert bank_stats["demotions"] == 0
 
@@ -1127,6 +1130,97 @@ def test_generation_target_prefix_compiles_rejection_correction_forward(monkeypa
     assert bank_stats["calls"] > out.stats.verify_calls
     assert bank_stats["compiled_calls"] == bank_stats["calls"]
     assert bank_stats["fallback_calls"] == 0
+
+
+@pytest.mark.parametrize(("mtp_token", "has_rejections"), ((1, False), (2, True)))
+def test_generation_exact_a3b_k1_route_is_m2_only_and_never_probes_trim(
+    monkeypatch,
+    mtp_token,
+    has_rejections,
+):
+    import mtplx.generation as generation
+    from mtplx.a3b_compiled_target_prefix import A3BCompiledTargetPrefixFactory
+    from mtplx.sampling import SamplerConfig
+
+    rt, model = _tiny_mtpk_runtime(mtp_token=mtp_token)
+    model._mtplx_a3b_compiled_target_prefix_factory = (
+        A3BCompiledTargetPrefixFactory(
+            layer_types=tuple(
+                "linear_attention" if index % 4 != 3 else "full_attention"
+                for index in range(40)
+            ),
+            gdn_layers=30,
+            full_attention_layers=10,
+            hidden_size=2048,
+            quantization="affine_q4_group64",
+        )
+    )
+    calls: list[int] = []
+
+    class SpyRoute:
+        def __init__(self, cache):
+            self.cache = cache
+
+        def verify_m2(self, input_ids):
+            calls.append(int(input_ids.shape[1]))
+            return rt.forward_ar_capture(
+                input_ids,
+                cache=self.cache,
+                return_hidden=True,
+            )
+
+        repair_m2 = verify_m2
+
+        def final_report(self, *, verify_calls, repair_calls):
+            total = int(verify_calls) + int(repair_calls)
+            return {
+                "calls": total,
+                "compiled_calls": total,
+                "m2_calls": total,
+                "fallback_calls": 0,
+                "growth_demotions": 0,
+            }
+
+        def demote(self):
+            return 0
+
+    monkeypatch.setattr(
+        generation,
+        "install_a3b_k1_target_prefix_route",
+        lambda _rt, cache, **_kwargs: SpyRoute(cache),
+    )
+    monkeypatch.setattr(
+        generation,
+        "trim_verified_window_to_prefix",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("exact A3B route must not probe trim")
+        ),
+    )
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "1")
+    monkeypatch.setenv("MTPLX_COMPILED_TARGET_PREFIX", "1")
+    monkeypatch.delenv("MTPLX_STATE_REBASE_EVERY", raising=False)
+
+    out = generation.generate_mtpk(
+        rt,
+        [0],
+        max_tokens=5,
+        sampler=SamplerConfig(temperature=0.5, top_p=1.0, top_k=1),
+        speculative_depth=1,
+        min_speculative_depth=1,
+        mtp_history_policy="committed",
+        verify_strategy="target_prefix",
+        stop_token_ids=set(),
+    )
+
+    rejected = out.stats.drafted_tokens - out.stats.accepted_drafts
+    assert bool(rejected) is has_rejections
+    repair_calls = out.stats.correction_tokens
+    if has_rejections:
+        assert repair_calls > 0, out.stats.events
+    assert calls == [2] * (out.stats.verify_calls + repair_calls)
+    report = out.stats.graphbank["compiled_verify"]
+    assert report["m2_calls"] == out.stats.verify_calls + repair_calls
+    assert all("compiled_verify" not in event.get("graphbank", {}) for event in out.stats.events)
 
 
 def test_generation_flag_parity_double_runs_each_verify(monkeypatch):

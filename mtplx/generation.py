@@ -22,6 +22,10 @@ from typing import Any, Callable, Literal
 import mlx.core as mx
 import numpy as np
 
+from .a3b_compiled_target_prefix import (
+    a3b_compiled_target_prefix_factory,
+    install_a3b_k1_target_prefix_route,
+)
 from .adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from .attention_context import attention_phase
 from .cache_state import (
@@ -5471,6 +5475,10 @@ def generate_mtpk(
     compiled_target_prefix = verify_strategy == "target_prefix" and _env_truthy(
         "MTPLX_COMPILED_TARGET_PREFIX"
     )
+    exact_a3b_target_prefix = bool(
+        compiled_target_prefix
+        and a3b_compiled_target_prefix_factory(getattr(rt, "model", None)) is not None
+    )
     compiled_verify_bank = (
         CompiledVerifyBank(
             rt,
@@ -5482,10 +5490,11 @@ def generate_mtpk(
         if _compiled_verify_mode != "off"
         and (
             verify_strategy in {"capture_commit", "graphbank_capture_commit"}
-            or compiled_target_prefix
+            or (compiled_target_prefix and not exact_a3b_target_prefix)
         )
         else None
     )
+    a3b_target_prefix_route = None
     snapshot_time = accept_time = rollback_time = repair_time = 0.0
     commit_time = capture_commit_time = 0.0
     bonus_time = 0.0
@@ -6137,6 +6146,24 @@ def generate_mtpk(
         if new_tokens:
             token_callback(new_tokens)
 
+    if exact_a3b_target_prefix:
+        if _compiled_verify_mode != "on":
+            raise RuntimeError(
+                "exact A3B compiled target-prefix requires compiled verify mode 'on'"
+            )
+        a3b_target_prefix_route = install_a3b_k1_target_prefix_route(
+            rt,
+            cache,
+            max_tokens=max_tokens,
+            prompt_tokens=len(prompt_ids),
+            verify_strategy=verify_strategy,
+            speculative_depth=speculative_depth,
+            requested_speculative_depth=requested_speculative_depth,
+            verify_core=verify_core_backend,
+            hidden_variant=base_hidden_variant,
+            state_rebase_every=state_rebase_every,
+        )
+
     step = 0
     while len(tokens) < max_tokens:
         repetition_result = _trim_repeated_suffix(tokens, repetition_config)
@@ -6751,6 +6778,10 @@ def generate_mtpk(
                         hidden_variant=base_hidden_variant,
                         capture_backend=verify_core_backend,
                     )
+            elif a3b_target_prefix_route is not None:
+                verify_logits, verify_hidden, _compiled_captures = (
+                    a3b_target_prefix_route.verify_m2(mx.array([verify_input]))
+                )
             elif compiled_verify_bank is not None:
                 # Replace only the target forward. target_prefix keeps its
                 # authoritative snapshot/trim, pre-sampling, and correction
@@ -6958,10 +6989,6 @@ def generate_mtpk(
             trace_accounting_time_s += time.perf_counter() - trace_accounting_started
         if graphbank is not None:
             event["graphbank"] = graphbank.to_dict()
-        if compiled_verify_bank is not None:
-            event.setdefault("graphbank", {})["compiled_verify"] = (
-                compiled_verify_bank.to_dict()
-            )
 
         accepted_count = 0
         rejection_correction: int | None = None
@@ -7457,7 +7484,11 @@ def generate_mtpk(
                 capture_commit_detach_bytes += int(commit_detach_stats["bytes"])
             _add_timing(event, "capture_commit", elapsed_commit)
 
-        if (
+        if a3b_target_prefix_route is not None:
+            committed_from_trim = rejection_correction is None
+            if committed_from_trim:
+                event["capture_repair"] = "installed_a3b_m2_full_accept"
+        elif (
             not committed_from_capture
             and verify_strategy in {"trim_commit", "target_prefix"}
             and before_verify is not None
@@ -7553,7 +7584,11 @@ def generate_mtpk(
             _add_timing(event, "rollback", elapsed_rollback)
             started = time.perf_counter()
             with attention_phase("decode_verify"):
-                if compiled_target_prefix and compiled_verify_bank is not None:
+                if a3b_target_prefix_route is not None:
+                    repair_logits, repair_hidden, _repair_captures = (
+                        a3b_target_prefix_route.repair_m2(mx.array([committed]))
+                    )
+                elif compiled_target_prefix and compiled_verify_bank is not None:
                     repair_logits, repair_hidden, _repair_captures = (
                         compiled_verify_bank.forward_ar_capture(
                             mx.array([committed]),
@@ -7654,12 +7689,20 @@ def generate_mtpk(
 
     emit_trace(force=True, final=True)
     elapsed = time.perf_counter() - started_all
-    if compiled_verify_bank is not None:
+    compiled_verify_report: dict[str, Any] | None = None
+    if a3b_target_prefix_route is not None:
+        compiled_verify_report = a3b_target_prefix_route.final_report(
+            verify_calls=verify_calls,
+            repair_calls=correction_tokens,
+        )
+        a3b_target_prefix_route.demote()
+    elif compiled_verify_bank is not None:
+        compiled_verify_report = compiled_verify_bank.to_dict()
         if _env_truthy("MTPLX_COMPILED_VERIFY_STATS"):
             try:
                 print(
                     "[mtplx] compiled-verify stats "
-                    + json.dumps(compiled_verify_bank.to_dict()),
+                    + json.dumps(compiled_verify_report),
                     file=sys.stderr,
                     flush=True,
                 )
@@ -7820,8 +7863,8 @@ def generate_mtpk(
         graphbank={
             **(graphbank.to_dict() if graphbank is not None else {}),
             **(
-                {"compiled_verify": compiled_verify_bank.to_dict()}
-                if compiled_verify_bank is not None
+                {"compiled_verify": compiled_verify_report}
+                if compiled_verify_report is not None
                 else {}
             ),
         },

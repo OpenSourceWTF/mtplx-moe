@@ -435,9 +435,11 @@ def load(
         install_a3b_gdn_postconv,
         prepare_a3b_gdn_postconv,
     )
+    from .a3b_compiled_target_prefix import prepare_a3b_compiled_target_prefix
 
     router_plan = prepare_qwen_row_owned_routers(model, config=config)
     postconv_plan = prepare_a3b_gdn_postconv(model, config=config)
+    prepare_a3b_compiled_target_prefix(model, config=config)
     from .kernel_selfcheck import maybe_run_model_selfcheck
 
     selfcheck_report = maybe_run_model_selfcheck(model)
