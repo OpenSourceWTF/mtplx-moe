@@ -25,11 +25,13 @@ engagement counter so a null is never credited as control-vs-control.
 
 from __future__ import annotations
 
+import atexit
 import os
 from typing import Any, Callable
 
 import mlx.core as mx
 
+from mtplx.compile_state import compile_trace
 from mtplx.graphbank import TensorOffsetKVCache
 
 # Engagement proof: incremented every time the compiled forward actually runs, so
@@ -39,6 +41,25 @@ _COMPILED_FORWARD_CALLS = 0
 
 def compiled_forward_calls() -> int:
     return _COMPILED_FORWARD_CALLS
+
+
+def _write_engagement_count_file() -> None:
+    """Persist the final call count to a file so an out-of-process A/B driver can
+    verify engagement (arm-off must read 0, arm-on > 0). The in-memory counter and
+    the runtime's diagnostic_counters never cross the subprocess boundary; the
+    benchmark does not serialize either into its JSON, so a file is the only
+    channel the driver can read. Registered at import; fires on normal exit."""
+    path = os.environ.get("MTPLX_HY3_COMPILE_FORWARD_COUNT_FILE")
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(str(_COMPILED_FORWARD_CALLS))
+    except OSError:
+        pass
+
+
+atexit.register(_write_engagement_count_file)
 
 
 def compile_forward_enabled() -> bool:
@@ -102,7 +123,22 @@ class CompiledARForward:
     def __call__(self, input_ids: mx.array, cache: list[Any]) -> mx.array:
         global _COMPILED_FORWARD_CALLS
         self._ensure_compiled(cache)
-        result = self._compiled(input_ids, *self._state)  # type: ignore[misc]
+        try:
+            # Mark the trace so the model forward suppresses its per-layer
+            # async_eval submit cadence (illegal inside a graph transformation,
+            # and obsolete once the whole forward is one traced submission).
+            with compile_trace():
+                result = self._compiled(input_ids, *self._state)  # type: ignore[misc]
+        except Exception:
+            # The trace fires on the first call; a host-sync buried in the model
+            # forward (async_eval/eval) only surfaces here. Dump the full stack
+            # so the offending line is visible in the driver log, then re-raise.
+            if os.environ.get("MTPLX_HY3_COMPILE_FORWARD_DEBUG") == "1":
+                import sys
+                import traceback
+
+                traceback.print_exc(file=sys.stderr)
+            raise
         self._state = list(result[1:])
         _COMPILED_FORWARD_CALLS += 1
         return result[0]

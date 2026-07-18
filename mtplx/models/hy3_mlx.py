@@ -37,6 +37,7 @@ from mtplx.hy3_router_fp32 import (
     prepare_hy3_router_fp32_weight,
 )
 
+from mtplx.compile_state import compile_trace_active
 from .expert_mlx import UnboundExpertSwitch, run_switch_with_shared_overlap
 
 
@@ -1059,6 +1060,11 @@ class Hy3Model(nn.Module):
         # the device fed during host graph-build. Scheduling only — kernel
         # math and ordering are unchanged, so outputs are bit-identical.
         cadence = _decode_submit_cadence()
+        if compile_trace_active():
+            # Inside a compiled forward the per-layer async_eval is both illegal
+            # (graph transformation) and moot — the traced graph is a single
+            # submission, so there is no host graph-build window left to fill.
+            cadence = 0
         async_eval = getattr(mx, "async_eval", None) if cadence else None
         if async_eval is not None and int(hidden.shape[-2]) > 8:
             async_eval = None

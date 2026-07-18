@@ -194,8 +194,19 @@ class MTPLXRuntime:
                 self._count("full_logits_tokens_emitted", emitted)
         with self._expert_routing_context(input_ids):
             if not return_hidden and hidden_variant is None and not kwargs:
-                compiled = self._compiled_full_residency_forward(cache)
+                # Decode-only (seq_len == 1). Prefill is multi-token over an
+                # unprimed cache: seeding the compiled graph from its None KV
+                # leaves throws mx.slice(None), and its shape differs from a
+                # single-token decode step, forcing a retrace. Prefill stays eager.
+                compiled = (
+                    self._compiled_full_residency_forward(cache)
+                    if sequence_len == 1
+                    else None
+                )
                 if compiled is not None:
+                    # Engagement proof: arm A (flag off) must report 0 here,
+                    # arm B (on) > 0 — the A/B credits nothing without it.
+                    self._count("compiled_forward_calls")
                     return compiled(input_ids, cache)
                 return self.model(input_ids, cache=cache)
             return self.model(
@@ -217,6 +228,11 @@ class MTPLXRuntime:
         from .compiled_forward import CompiledARForward, compile_forward_enabled
 
         if not compile_forward_enabled() or cache is None:
+            return None
+        # Belt-and-suspenders with the forward_ar seq_len==1 gate: an unprimed
+        # cache (empty context / first token) has None KV leaves that would
+        # crash the compiled graph. Only compile once the cache holds real keys.
+        if getattr(cache[0], "keys", None) is None:
             return None
         es = self.expert_streaming
         if es is None:
