@@ -2301,6 +2301,12 @@ def _normalized_request(
     }
     if not mtp_disabled_baseline:
         normalized["mtp_artifacts"] = _expand(request["mtp_artifacts"])
+        precision = str(request.get("mtp_precision", "bf16"))
+        if precision not in ("bf16", "q4"):
+            raise BenchmarkConfigurationError(
+                f"{model} mtp_precision must be 'bf16' or 'q4'; got {precision!r}"
+            )
+        normalized["mtp_precision"] = precision
     return normalized
 
 

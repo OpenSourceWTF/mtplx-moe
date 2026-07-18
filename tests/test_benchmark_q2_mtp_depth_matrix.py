@@ -553,6 +553,52 @@ def test_mtp_precision_flag_parses_and_reaches_requests() -> None:
         module.build_parser().parse_args(["--mtp-precision", "q8"])
 
 
+def test_mtp_precision_survives_request_normalization(tmp_path: Path) -> None:
+    """Regression: _normalized_request whitelists keys and dropped precision.
+
+    The drop was silent — the q4 arm fell back to bf16 and opened the BF16
+    verifier against the Q4 artifact directory, failing at load with
+    ArtifactValidationError.
+    """
+    module = _load_module()
+
+    for precision in ("bf16", "q4"):
+        normalized = module._normalized_request(
+            {**_requests(tmp_path)[0], "depths": (1,), "mtp_precision": precision},
+            mtp_disabled_baseline=False,
+        )
+        assert normalized["mtp_precision"] == precision
+
+    # default when a caller omits it entirely
+    normalized = module._normalized_request(
+        {**_requests(tmp_path)[0], "depths": (1,)},
+        mtp_disabled_baseline=False,
+    )
+    assert normalized["mtp_precision"] == "bf16"
+
+    with pytest.raises(module.BenchmarkConfigurationError):
+        module._normalized_request(
+            {**_requests(tmp_path)[0], "depths": (1,), "mtp_precision": "q8"},
+            mtp_disabled_baseline=False,
+        )
+
+
+def test_mtp_precision_reaches_the_loader(tmp_path: Path) -> None:
+    """The precision must arrive in apis.load kwargs, not just the request."""
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (1,), "mtp_precision": "q4"}],
+        contexts=(1024,),
+        apis=apis,
+    )
+
+    _model_root, load_kwargs = calls.loads[0]
+    assert load_kwargs["mtp_precision"] == "q4"
+    assert payload["models"][0]["mtp_precision"] == "q4"
+
+
 def test_issue51_kernel_selectors_parse_independently() -> None:
     module = _load_module()
 
