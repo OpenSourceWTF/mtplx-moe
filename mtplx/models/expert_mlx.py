@@ -1798,13 +1798,24 @@ class HotExpertSwitchGLU(nn.Module):
             )
 
         try:
-            for wave in self.runtime.route_waves(
-                expert_ids,
-                sort_unique=(
-                    phase is RoutingPhase.PREFILL
-                    and self.runtime.manifest.sidecar is not None
-                ),
-            ):
+            waves = tuple(
+                self.runtime.route_waves(
+                    expert_ids,
+                    sort_unique=(
+                        phase is RoutingPhase.PREFILL
+                        and self.runtime.manifest.sidecar is not None
+                    ),
+                )
+            )
+            # Deferring hands this layer's lock and slot pins to the next
+            # generation-thread flush, so it is only legal on the wave that
+            # ends the layer's routing.  A wide verify batch splits into
+            # several waves, and the layer lock is not reentrant: a deferred
+            # non-final wave would park the generation thread on its own lock
+            # when the next wave re-entered the same layer (issue #120,
+            # GLM depth>=4 at 6-row verify / 32 transient slots).
+            final_wave = len(waves) - 1
+            for wave_index, wave in enumerate(waves):
                 # Shadow miss fallback (issue #51): with a shadow bank bound,
                 # a decode wave never waits on SSD.  Resident experts run
                 # exactly from cache; every other assignment is served from
@@ -1983,7 +1994,7 @@ class HotExpertSwitchGLU(nn.Module):
                             # Promoted default via ExpertStreamingConfig after
                             # the C3 matrix; fakes without the field keep the
                             # fence path.
-                            if getattr(
+                            if wave_index == final_wave and getattr(
                                 self.runtime.config,
                                 "deferred_pin_release",
                                 False,
@@ -2021,8 +2032,11 @@ class HotExpertSwitchGLU(nn.Module):
                 # Deferred split release: no per-part fence; lease
                 # bookkeeping replays at the next generation-thread eval
                 # (the same coverage proof deferred pins already rely on).
+                # A deferred split also keeps the layer lock until that
+                # flush, so only the final wave may take this path.
                 deferred_split = (
-                    phase is RoutingPhase.DECODE
+                    wave_index == final_wave
+                    and phase is RoutingPhase.DECODE
                     and getattr(
                         self.runtime.config, "split_route_release", "fenced"
                     )
