@@ -1022,8 +1022,10 @@ def inject_hy3_streamed_mtp_support(
                     head_input = head_input[:, -keep:, :]
                 # Cast logits, not the head input: fp32 x BF16 matmul
                 # materializes an fp32 weight copy per call (see
-                # Hy3ForCausalLM.__call__).
-                logits = self.lm_head(head_input)
+                # Hy3ForCausalLM.__call__). _logits_head() (inherited from the
+                # base Model) applies T2a's optional trunk-head quant here so it
+                # reaches the MTP verify, not only the AR path.
+                logits = self._logits_head()(head_input)
                 if self.args.enable_lm_head_fp32:
                     logits = logits.astype(mx.float32)
             if not return_hidden:
