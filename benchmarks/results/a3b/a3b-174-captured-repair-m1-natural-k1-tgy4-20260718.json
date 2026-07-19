@@ -1,0 +1,137 @@
+{
+  "schema": "a3b-feature-branch-benchmark-v1",
+  "feature": "captured-primary M1 rejection repair",
+  "branch": "perf/a3b-174-captured-repair-m1",
+  "measured_commit": "fab42c81b074a93dcb1b9149f0e033c978c2334d",
+  "base_branch": "perf/a3b-174-beneficial-stack",
+  "base_commit": "960849b0a76181338b82ced875e237ee18ee3770",
+  "benchmark_contract": {
+    "workload": "upstream long_code_uncapped",
+    "stop": "natural",
+    "k": 1,
+    "gdn_postconv_threadgroup": 4,
+    "sequence": "C/X/C/X",
+    "repeat_verdict_cells": 2,
+    "process_isolated": true,
+    "unchanged_control": true
+  },
+  "command": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/a3b-174-captured-repair-m1/.venv/bin/python /Users/davidtai/projects/OpenSourceWTF/bench/a3b/run_a3b_174_captured_repair_m1.py --expected-candidate-commit fab42c81b074a93dcb1b9149f0e033c978c2334d --out /Users/davidtai/projects/OpenSourceWTF/bench/a3b/a3b-174-captured-repair-m1-natural-k1-tgy4-20260718-correctbyconstruction.jsonl",
+  "means": {
+    "control_tok_s": 153.8485135192958,
+    "candidate_tok_s": 158.82669805409776,
+    "throughput_delta_percent": 3.2357703177792407,
+    "control_cycle_ms": 10.999206099829205,
+    "candidate_cycle_ms": 10.630649423778413,
+    "cycle_delta_percent": -3.350757070153587,
+    "control_tokens_per_cycle": 1.691870379574897,
+    "candidate_tokens_per_cycle": 1.688275463221252,
+    "control_acceptance": 0.8180063471646397,
+    "candidate_acceptance": 0.8155005278104045,
+    "control_spread_percent": 3.1211894831281386,
+    "candidate_spread_percent": 1.9101570676340076
+  },
+  "passes": [
+    {
+      "pass": 1,
+      "arm": "control",
+      "tok_s": 156.24946533125242,
+      "cycle_ms": 10.85712545726955,
+      "tokens_per_cycle": 1.696420047732697,
+      "acceptance": 0.8210467079347215,
+      "compiled_m2_verify_calls": 2095,
+      "compiled_m1_repair_calls": 0,
+      "sha": "5ac5906ddfcb3def"
+    },
+    {
+      "pass": 1,
+      "arm": "candidate",
+      "tok_s": 160.3436177531828,
+      "cycle_ms": 10.528150307797407,
+      "tokens_per_cycle": 1.6881217086015214,
+      "acceptance": 0.8155339805825242,
+      "compiled_m2_verify_calls": 1442,
+      "compiled_m1_repair_calls": 266,
+      "sha": "9c41ee3428695b1e"
+    },
+    {
+      "pass": 2,
+      "arm": "control",
+      "tok_s": 151.4475617073392,
+      "cycle_ms": 11.14128674238886,
+      "tokens_per_cycle": 1.687320711417097,
+      "acceptance": 0.8149659863945579,
+      "compiled_m2_verify_calls": 1742,
+      "compiled_m1_repair_calls": 0,
+      "sha": "f0dfcccbb9f2d51d"
+    },
+    {
+      "pass": 2,
+      "arm": "candidate",
+      "tok_s": 157.30977835501272,
+      "cycle_ms": 10.73314853975942,
+      "tokens_per_cycle": 1.6884292178409825,
+      "acceptance": 0.8154670750382849,
+      "compiled_m2_verify_calls": 1306,
+      "compiled_m1_repair_calls": 241,
+      "sha": "5c30b3194c730933"
+    }
+  ],
+  "engagement": {
+    "source": "existing compiled and generation statistics",
+    "formula": "M2 = verify_calls; M1 = compiled_calls - verify_calls = drafted - accepted",
+    "candidate_pass_1": {
+      "m2": 1442,
+      "m1": 266
+    },
+    "candidate_pass_2": {
+      "m2": 1306,
+      "m1": 241
+    },
+    "compiled_verifier_fallbacks": 0,
+    "compiled_verifier_growth_demotions": 0,
+    "compiled_verifier_permanent_eager_demotions": 0,
+    "added_hot_path_counters": 0
+  },
+  "correctness": {
+    "exact_output_by_pass": {
+      "1": false,
+      "2": false
+    },
+    "output_mismatch_disclosure": "Natural stochastic SHAs differed in both paired arms and between unchanged control processes. No RNG compensation was added.",
+    "failures": [],
+    "harness_promotion_candidate": false,
+    "harness_promotion_disclosure": "The harness exact-output gate was not satisfied; the result is retained as experimental-math evidence and is not represented as exact-output parity."
+  },
+  "verification": {
+    "focused": "114 passed",
+    "full_tests": "2008 passed, 4 skipped",
+    "harness_integrity": "126 passed",
+    "touched_ruff": "passed",
+    "whole_repo_ruff": "16 pre-existing findings, identical on control",
+    "git_diff_check": "passed",
+    "independent_review": "no findings"
+  },
+  "artifacts": {
+    "raw": {
+      "path": "/Users/davidtai/projects/OpenSourceWTF/bench/a3b/a3b-174-captured-repair-m1-natural-k1-tgy4-20260718-correctbyconstruction.jsonl",
+      "sha256": "5d2765241a7f56c85252f16a011bcad01c4c20034b4106f47e0fa5e15f6e199d"
+    },
+    "summary": {
+      "path": "/Users/davidtai/projects/OpenSourceWTF/bench/a3b/a3b-174-captured-repair-m1-natural-k1-tgy4-20260718-correctbyconstruction.summary.json",
+      "sha256": "9cc5a30086279815487ab626231035c2a87aba0bb806437575d633b403ab7c1d"
+    },
+    "post_repair_profile": {
+      "path": "/Users/davidtai/projects/OpenSourceWTF/bench/a3b/a3b-174-captured-repair-m1-post-profile-natural-k1-tgy4-20260719.jsonl",
+      "sha256": "46a782cb1c3350ab7005dc4a987429d108b858632a88bd2a8694045596b9e48b"
+    },
+    "post_repair_sample": {
+      "path": "/Users/davidtai/projects/OpenSourceWTF/bench/a3b/a3b-174-captured-repair-m1-post-profile-natural-k1-tgy4-20260719-sample.txt",
+      "sha256": "1e4d5c31e5cb3fa423b0e473ccf15df3773c0cd0f932cff47e2eab1eec484ba5"
+    }
+  },
+  "decision": {
+    "status": "accepted_into_local_beneficial_stack",
+    "basis": "Candidate cycle time improved 3.351% and throughput improved 3.236%, clearing both measured arm spreads.",
+    "remote_mutation": false
+  }
+}
