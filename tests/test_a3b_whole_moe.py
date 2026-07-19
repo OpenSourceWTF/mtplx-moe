@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
 
 import mtplx.a3b_whole_moe as whole_moe_module
+from mtplx import a3b_compiled_target_prefix as compiled_target_module
 from mtplx import generation as generation_module
 from mtplx import runtime as runtime_module
 from mtplx.a3b_whole_moe import (
@@ -20,6 +22,12 @@ from mtplx.a3b_whole_moe import (
     validate_a3b_whole_moe_request,
 )
 from mtplx.kernels import a3b_whole_moe as kernel_module
+from mtplx.moe_packed_projections import (
+    PackedGateUpMLP,
+    PackedSwitchGLU,
+    _PackedDenseProjection,
+    _PackedQuantizedProjection,
+)
 
 
 _LAYER_TYPES = tuple(
@@ -124,35 +132,53 @@ def _quantized_routed_projection(output: int, *, group_size: int):
     )
 
 
-def _sparse_block(*, gate, routed_group_size: int, shared_quantized: bool, scalar_gate):
-    switch_mlp = SimpleNamespace(
-        gate_up_proj=_quantized_routed_projection(
-            1024, group_size=routed_group_size
-        ),
-        down_proj=_Projection(
-            (256, 2048, 512 * 4 // 32),
-            bits=4,
-            group_size=routed_group_size,
-            scales_shape=(256, 2048, 512 // routed_group_size),
-            biases_shape=(256, 2048, 512 // routed_group_size),
-        ),
+def _packed_quantized_projection(
+    weight_shape,
+    *,
+    group_size: int,
+    scales_shape,
+):
+    return _PackedQuantizedProjection(
+        _ArraySpec(weight_shape, mx.uint32),
+        _ArraySpec(scales_shape),
+        _ArraySpec(scales_shape),
+        group_size=group_size,
+        bits=4,
+        mode="affine",
     )
+
+
+def _sparse_block(*, gate, routed_group_size: int, shared_quantized: bool, scalar_gate):
+    routed_gate_up = _packed_quantized_projection(
+        (256, 1024, 2048 * 4 // 32),
+        group_size=routed_group_size,
+        scales_shape=(256, 1024, 2048 // routed_group_size),
+    )
+    routed_down = _Projection(
+        (256, 2048, 512 * 4 // 32),
+        bits=4,
+        group_size=routed_group_size,
+        scales_shape=(256, 2048, 512 // routed_group_size),
+        biases_shape=(256, 2048, 512 // routed_group_size),
+    )
+    switch_mlp = PackedSwitchGLU(routed_gate_up, routed_down, object(), 512)
     if shared_quantized:
-        shared_expert = SimpleNamespace(
-            gate_up_proj=_Projection(
-                (1024, 256), bits=4, group_size=64,
-                scales_shape=(1024, 32), biases_shape=(1024, 32),
-            ),
-            down_proj=_Projection(
-                (2048, 64), bits=4, group_size=64,
-                scales_shape=(2048, 8), biases_shape=(2048, 8),
-            ),
+        shared_gate_up = _packed_quantized_projection(
+            (1024, 256),
+            group_size=64,
+            scales_shape=(1024, 32),
+        )
+        shared_down = _Projection(
+            (2048, 64),
+            bits=4,
+            group_size=64,
+            scales_shape=(2048, 8),
+            biases_shape=(2048, 8),
         )
     else:
-        shared_expert = SimpleNamespace(
-            gate_up_proj=_Projection((1024, 2048)),
-            down_proj=_Projection((2048, 512)),
-        )
+        shared_gate_up = _PackedDenseProjection(_ArraySpec((1024, 2048)))
+        shared_down = _Projection((2048, 512))
+    shared_expert = PackedGateUpMLP(shared_gate_up, shared_down, 512)
     return _FakeSparseBlock(
         gate=gate,
         switch_mlp=switch_mlp,
@@ -242,6 +268,56 @@ def test_exact_checkpoint_builds_40_target_and_one_mtp_binding(monkeypatch):
     )
     assert plan.target_bindings[0].shared_gate_up.weight.shape == (1024, 256)
     assert plan.mtp_bindings[0].shared_gate_up.weight.shape == (1024, 2048)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (
+            lambda block: setattr(
+                block,
+                "switch_mlp",
+                SimpleNamespace(
+                    gate_up_proj=block.switch_mlp.gate_up_proj,
+                    down_proj=block.switch_mlp.down_proj,
+                    _split_at=512,
+                ),
+            ),
+            "PackedSwitchGLU",
+        ),
+        (
+            lambda block: setattr(block.switch_mlp, "_split_at", 256),
+            "split 512",
+        ),
+        (
+            lambda block: setattr(block.shared_expert, "_split_at", 256),
+            "split 512",
+        ),
+        (
+            lambda block: setattr(block.switch_mlp.down_proj, "bias", _ArraySpec((2048,))),
+            "additive bias",
+        ),
+    ],
+)
+def test_exact_packed_ownership_is_required_at_construction(monkeypatch, mutate, match):
+    monkeypatch.setenv("MTPLX_A3B_WHOLE_MOE_FUSION", "1")
+    model, targets, _ = _exact_model()
+    mutate(targets[0])
+
+    with pytest.raises(A3BWholeMoeConfigError, match=match):
+        prepare_a3b_whole_moe(model, config=_exact_config())
+
+
+def test_existing_installed_or_row_owned_route_conflict_is_rejected(monkeypatch):
+    monkeypatch.setenv("MTPLX_A3B_WHOLE_MOE_FUSION", "1")
+    for marker in ("_mtplx_a3b_whole_moe_route", "_mtplx_a3b_router_route"):
+        model, targets, _ = _exact_model()
+        setattr(type(targets[0]), marker, object())
+        try:
+            with pytest.raises(A3BWholeMoeConfigError, match="route conflict"):
+                prepare_a3b_whole_moe(model, config=_exact_config())
+        finally:
+            delattr(type(targets[0]), marker)
 
 
 @pytest.mark.parametrize(
@@ -544,13 +620,55 @@ def test_all_fixed_entrypoints_launch_directly_without_runtime_validation(monkey
             assert forbidden not in source
 
 
+def test_installed_routes_prebind_kernel_objects_before_hot_call():
+    for name in ("bind_target_m1", "bind_target_m2", "bind_mtp_m1"):
+        binder = getattr(kernel_module, name)
+        source = inspect.getsource(binder)
+        call_start = source.index("def call(")
+        assert "_build_" in source[:call_start]
+        assert "_build_" not in source[call_start:]
+        assert "_KERNELS" not in source[call_start:]
+
+
 def _exact_selfcheck_report():
     return {
         "lanes": {
             "a3b_whole_moe_target_m1": "ok",
             "a3b_whole_moe_target_m2": "ok",
             "a3b_whole_moe_mtp_m1": "ok",
-        }
+        },
+        "dmax": {
+            "a3b_whole_moe_target_m1": 0.125,
+            "a3b_whole_moe_target_m2": 0.25,
+            "a3b_whole_moe_mtp_m1": 0.125,
+        },
+        "a3b_whole_moe_components": {
+            "a3b_whole_moe_target_m1": {
+                "route_scores": 0.001,
+                "shared_gate": 0.01,
+                "activations": 0.0625,
+                "output": 0.125,
+            },
+            "a3b_whole_moe_target_m2": {
+                "route_scores": 0.001,
+                "shared_gate": 0.01,
+                "activations": 0.0625,
+                "output": 0.25,
+            },
+            "a3b_whole_moe_mtp_m1": {
+                "route_scores": 0.001,
+                "shared_gate": 0.01,
+                "activations": 0.0625,
+                "output": 0.125,
+            },
+        },
+    }
+
+
+def _passing_full_graph_preflight():
+    return {
+        "a3b_whole_moe_target_prefix_full_graph_m1": "ok",
+        "a3b_whole_moe_target_prefix_full_graph_m2": "ok",
     }
 
 
@@ -562,7 +680,12 @@ def test_model_bound_selfcheck_runs_exact_three_compiled_geometries(monkeypatch)
 
     def check(binding, *, rows):
         calls.append((binding.variant, rows))
-        return float(rows) / 128.0
+        return {
+            "route_scores": 0.001,
+            "shared_gate": 0.01,
+            "activations": float(rows) / 128.0,
+            "output": float(rows) / 64.0,
+        }
 
     monkeypatch.setattr(whole_moe_module, "_check_whole_moe_lane", check)
     report = run_a3b_whole_moe_selfcheck(
@@ -571,8 +694,8 @@ def test_model_bound_selfcheck_runs_exact_three_compiled_geometries(monkeypatch)
     )
 
     assert calls == [
-        ("target_q8g64_q4g64", 1),
-        ("target_q8g64_q4g64", 2),
+        *(("target_q8g64_q4g64", 1),) * 40,
+        *(("target_q8g64_q4g64", 2),) * 40,
         ("mtp_dense_q4g32_dense", 1),
     ]
     assert report["lanes"] == {
@@ -581,7 +704,19 @@ def test_model_bound_selfcheck_runs_exact_three_compiled_geometries(monkeypatch)
         "a3b_whole_moe_target_m2": "ok",
         "a3b_whole_moe_mtp_m1": "ok",
     }
-    assert report["dmax"]["a3b_whole_moe_target_m2"] == 2.0 / 128.0
+    assert report["dmax"]["a3b_whole_moe_target_m2"] == 2.0 / 64.0
+    assert report["a3b_whole_moe_components"][
+        "a3b_whole_moe_target_m2"
+    ]["activations"] == 2.0 / 128.0
+
+
+def test_selfcheck_applies_component_specific_limits() -> None:
+    assert whole_moe_module._SELFCHECK_LIMITS == {
+        "route_scores": 0.0078125,
+        "shared_gate": 0.0625,
+        "activations": 0.125,
+        "output": 0.5,
+    }
 
 
 def test_whole_moe_flag_requires_load_time_selfcheck(monkeypatch):
@@ -608,51 +743,20 @@ def test_model_bound_selfcheck_is_deterministic_and_compilation_gated():
 
 
 def _patch_whole_moe_stages(monkeypatch):
-    def stage1(rows):
-        return (
-            _ArraySpec((rows, 8), mx.uint32),
-            _ArraySpec((rows, 8)),
-            _ArraySpec((rows, 1)),
-        )
-
     monkeypatch.setattr(
-        kernel_module, "target_m1_stage1", lambda value, binding: stage1(1)
-    )
-    monkeypatch.setattr(
-        kernel_module, "target_m2_stage1", lambda value, binding: stage1(2)
-    )
-    monkeypatch.setattr(
-        kernel_module, "mtp_m1_stage1", lambda value, binding: stage1(1)
+        kernel_module,
+        "bind_target_m1",
+        lambda binding: lambda value: _ResultSpec("target_m1", value.shape),
     )
     monkeypatch.setattr(
         kernel_module,
-        "target_m1_stage2",
-        lambda value, ids, binding: _ArraySpec((1, 9, 512)),
+        "bind_target_m2",
+        lambda binding: lambda value: _ResultSpec("target_m2", value.shape),
     )
     monkeypatch.setattr(
         kernel_module,
-        "target_m2_stage2",
-        lambda value, ids, binding: _ArraySpec((2, 9, 512)),
-    )
-    monkeypatch.setattr(
-        kernel_module,
-        "mtp_m1_stage2",
-        lambda value, ids, binding: _ArraySpec((1, 9, 512)),
-    )
-    monkeypatch.setattr(
-        kernel_module,
-        "target_m1_stage3",
-        lambda *args: _ResultSpec("target_m1", (1, 2048)),
-    )
-    monkeypatch.setattr(
-        kernel_module,
-        "target_m2_stage3",
-        lambda *args: _ResultSpec("target_m2", (2, 2048)),
-    )
-    monkeypatch.setattr(
-        kernel_module,
-        "mtp_m1_stage3",
-        lambda *args: _ResultSpec("mtp_m1", (1, 2048)),
+        "bind_mtp_m1",
+        lambda binding: lambda value: _ResultSpec("mtp_m1", value.shape),
     )
 
 
@@ -663,7 +767,11 @@ def test_successful_selfcheck_atomically_installs_all_41_blocks(monkeypatch):
     plan = prepare_a3b_whole_moe(model, config=_exact_config())
     assert tuple(type(block) for block in (*targets, *mtp)) == original_classes
 
-    report = install_a3b_whole_moe(plan, _exact_selfcheck_report())
+    report = install_a3b_whole_moe(
+        plan,
+        _exact_selfcheck_report(),
+        compiled_preflight=_passing_full_graph_preflight,
+    )
 
     assert report["installation_status"] == "installed"
     assert report["target_blocks"] == 40
@@ -674,7 +782,10 @@ def test_successful_selfcheck_atomically_installs_all_41_blocks(monkeypatch):
     assert report["validated_contract"]["mtp"]["shared_gate_up"] == (
         "dense_bf16_[1024,2048]"
     )
-    assert report["selfcheck_lanes"] == _exact_selfcheck_report()["lanes"]
+    assert report["selfcheck_lanes"] == {
+        **_exact_selfcheck_report()["lanes"],
+        **_passing_full_graph_preflight(),
+    }
     assert all(
         type(block).__call__ is whole_moe_module._target_a3b_whole_moe_call
         for block in targets
@@ -692,6 +803,7 @@ def test_selfcheck_failure_prevents_every_installation(monkeypatch):
         install_a3b_whole_moe(
             plan,
             {"lanes": {"a3b_whole_moe_target_m1": "fallback"}},
+            compiled_preflight=_passing_full_graph_preflight,
         )
 
     assert tuple(type(block) for block in (*targets, *mtp)) == original_classes
@@ -708,7 +820,11 @@ def test_installed_route_uses_explicit_prefill_and_direct_small_row_calls(monkey
     )
     model, targets, mtp = _exact_model()
     plan = prepare_a3b_whole_moe(model, config=_exact_config())
-    install_a3b_whole_moe(plan, _exact_selfcheck_report())
+    install_a3b_whole_moe(
+        plan,
+        _exact_selfcheck_report(),
+        compiled_preflight=_passing_full_graph_preflight,
+    )
 
     assert targets[0](_ArraySpec((1, 64, 2048))).label == "stock"
     phase["value"] = "ar_decode"
@@ -721,6 +837,35 @@ def test_installed_route_uses_explicit_prefill_and_direct_small_row_calls(monkey
     with pytest.raises(A3BWholeMoeRouteError, match="rows=3"):
         targets[0](_ArraySpec((1, 3, 2048)))
     assert len(targets[0].stock_calls) == 1
+
+
+def test_compiled_full_graph_failure_rolls_back_every_class(monkeypatch):
+    monkeypatch.setenv("MTPLX_A3B_WHOLE_MOE_FUSION", "1")
+    _patch_whole_moe_stages(monkeypatch)
+    model, targets, mtp = _exact_model()
+    blocks = (*targets, *mtp)
+    original_classes = tuple(type(block) for block in blocks)
+    plan = prepare_a3b_whole_moe(model, config=_exact_config())
+
+    def fail_after_swap():
+        assert all(type(block) is not original for block, original in zip(blocks, original_classes))
+        raise RuntimeError("full graph compile failed")
+
+    with pytest.raises(A3BWholeMoeConfigError, match="full compiled target-prefix"):
+        install_a3b_whole_moe(
+            plan,
+            _exact_selfcheck_report(),
+            compiled_preflight=fail_after_swap,
+        )
+
+    assert tuple(type(block) for block in blocks) == original_classes
+
+
+def test_installation_keeps_no_global_model_or_block_references():
+    source = inspect.getsource(whole_moe_module)
+
+    assert "_INSTALLED_BLOCKS" not in source
+    assert "extend(changed)" not in source
 
 
 def test_installed_hot_call_only_routes_on_phase_and_logical_m():
@@ -756,21 +901,216 @@ def test_installed_hot_call_only_routes_on_phase_and_logical_m():
 def test_runtime_constructs_one_whole_block_owner_after_packing() -> None:
     source = inspect.getsource(runtime_module.load)
 
+    adapter_guard = source.index("validate_a3b_whole_moe_load_options(")
     packing = source.index("configure_moe_packed_projections(model)")
     prepare_whole = source.index("prepare_a3b_whole_moe(model, config=config)")
     prepare_router = source.index("prepare_qwen_row_owned_routers(")
     selfcheck = source.index("maybe_run_model_selfcheck(model)")
     whole_selfcheck = source.index("run_a3b_whole_moe_selfcheck(")
     compiled_factory = source.index("prepare_a3b_compiled_target_prefix(")
+    runtime_construction = source.index("runtime = MTPLXRuntime(")
     install_whole = source.index("install_a3b_whole_moe(")
+    compiled_preflight = source.index("preflight_a3b_k1_target_prefix_load_graph(")
     install_router = source.index("install_qwen_row_owned_routers(")
 
-    assert packing < prepare_whole < prepare_router < selfcheck
-    assert selfcheck < whole_selfcheck < compiled_factory < install_whole
+    assert adapter_guard < packing < prepare_whole < prepare_router < selfcheck
+    assert selfcheck < whole_selfcheck < compiled_factory < runtime_construction
+    assert runtime_construction < install_whole < compiled_preflight
     assert selfcheck < install_router < compiled_factory
     assert "if whole_moe_plan is None" in source
     assert "if whole_moe_plan is not None" in source
     assert "elif router_plan is not None" in source
+
+
+def test_full_graph_preflight_executes_both_compiled_target_geometries():
+    source = inspect.getsource(
+        compiled_target_module.preflight_a3b_k1_target_prefix_full_graph
+    )
+
+    assert "cache: list[Any]" in source
+    assert "prompt_tokens: int" in source
+    assert "max_tokens: int" in source
+    assert "hidden_variant: str | None" in source
+    assert "runtime.make_cache" not in source
+    assert "runtime.forward_ar" not in source
+    assert "install_a3b_k1_target_prefix_route(" in source
+    assert "route.compiled_m2(" in source
+    assert "route.compiled_m1(" in source
+    assert "route.verify_m2(" not in source
+    assert "route.repair_m1(" not in source
+    assert "len(m2_outputs) != 182" in source
+    assert "len(m1_outputs) != 92" in source
+    assert source.count("mx.eval(") >= 2
+    assert "mx.random" not in source
+
+
+def test_load_graph_preflight_is_only_the_minimum_installation_compatibility_probe():
+    source = inspect.getsource(
+        compiled_target_module.preflight_a3b_k1_target_prefix_load_graph
+    )
+
+    assert "_preflight_a3b_k1_target_prefix_request_geometry(" in source
+    assert "prompt_tokens=1" in source
+    assert "max_tokens=2" in source
+
+
+def test_request_preflight_synthesizes_exact_geometry_and_memoizes_by_shape(
+    monkeypatch,
+):
+    factory = object()
+    calls = []
+    runtime = SimpleNamespace(
+        a3b_whole_moe_installed=True,
+        a3b_compiled_target_prefix_factory=factory,
+        _a3b_whole_moe_request_preflights={},
+        _a3b_whole_moe_request_geometry_keys={},
+    )
+
+    def fake_fresh_geometry(
+        rt,
+        selected_factory,
+        *,
+        prompt_tokens: int,
+        max_tokens: int,
+        hidden_variant: str | None,
+        cache_factory,
+        prefill_layout: str,
+    ):
+        calls.append(
+            (
+                "fresh_geometry",
+                rt,
+                selected_factory,
+                prompt_tokens,
+                max_tokens,
+                hidden_variant,
+                prefill_layout,
+            )
+        )
+        return {
+            "canonical_key": "a" * 64,
+            "full_attention_key_shape": [1, 2, 256, 256],
+            "full_attention_value_shape": [1, 2, 256, 256],
+            "hidden_variant": hidden_variant,
+            "lanes": {
+                "a3b_whole_moe_request_full_graph_m1": "ok",
+                "a3b_whole_moe_request_full_graph_m2": "ok",
+            },
+        }
+
+    monkeypatch.setattr(
+        compiled_target_module,
+        "_preflight_a3b_k1_target_prefix_request_geometry",
+        fake_fresh_geometry,
+    )
+
+    first = compiled_target_module.ensure_a3b_whole_moe_request_preflight(
+        runtime,
+        factory,
+        prompt_tokens=181,
+        max_tokens=64,
+        hidden_variant="post_norm",
+        cache_factory=lambda: None,
+        prefill_layout="contiguous_dense_decode",
+    )
+    second = compiled_target_module.ensure_a3b_whole_moe_request_preflight(
+        runtime,
+        factory,
+        prompt_tokens=180,
+        max_tokens=65,
+        hidden_variant="post_norm",
+        cache_factory=lambda: None,
+        prefill_layout="contiguous_dense_decode",
+    )
+
+    assert calls == [
+        (
+            "fresh_geometry",
+            runtime,
+            factory,
+            181,
+            64,
+            "post_norm",
+            "contiguous_dense_decode",
+        ),
+    ]
+    assert first["status"] == second["status"] == "ok"
+    assert (first["prompt_tokens"], first["max_tokens"]) == (181, 64)
+    assert (second["prompt_tokens"], second["max_tokens"]) == (180, 65)
+    assert first["full_attention_key_shape"] == second[
+        "full_attention_key_shape"
+    ]
+
+
+def test_fresh_request_preflight_builds_shape_state_without_duplicate_prompt_prefill():
+    source = inspect.getsource(
+        compiled_target_module._preflight_a3b_k1_target_prefix_request_geometry
+    )
+
+    assert "cache_factory()" in source
+    assert "runtime.make_cache()" not in source
+    assert "mx.array([[0]])" in source
+    assert "entry.offset = int(prompt_tokens)" in source
+    assert "preflight_a3b_k1_target_prefix_full_graph(" in source
+    assert "prompt_ids" not in source
+    assert "restore_or_prefill_prompt_state" not in source
+    assert "_prefill(" not in source
+
+
+def test_disabled_whole_moe_request_preflight_constructs_nothing(monkeypatch):
+    runtime = SimpleNamespace(a3b_whole_moe_installed=False)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError((args, kwargs))
+
+    monkeypatch.setattr(
+        generation_module,
+        "_ensure_a3b_whole_moe_request_preflight",
+        unexpected,
+    )
+
+    assert generation_module.ensure_a3b_whole_moe_request_preflight(
+        runtime,
+        [1],
+        max_tokens=8,
+        base_hidden_variant="post_norm",
+    ) == {"status": "disabled"}
+
+
+def test_compiled_target_cache_does_not_pin_the_runtime():
+    for helper in (
+        compiled_target_module._shared_m1_step,
+        compiled_target_module._shared_m2_step,
+    ):
+        source = inspect.getsource(helper)
+        assert '"runtime": runtime' not in source
+        assert '"runtime_ref": weakref.ref(runtime)' in source
+    for builder in (
+        compiled_target_module._make_a3b_k1_target_prefix_m1_step,
+        compiled_target_module._make_a3b_k1_target_prefix_m2_step,
+    ):
+        assert 'host["runtime_ref"]()' in inspect.getsource(builder)
+
+
+def test_non_k1_generation_entrypoints_reject_installed_whole_moe_before_prefill():
+    for entrypoint in (generation_module.generate_ar, generation_module.generate_mtp1):
+        source = inspect.getsource(entrypoint)
+        rejection = source.index("reject_non_k1_a3b_whole_moe_request(")
+        prefill = min(
+            position
+            for marker in ("_prefill(", "restore_or_prefill_prompt_state(")
+            if (position := source.find(marker)) >= 0
+        )
+        assert rejection < prefill
+
+
+def test_server_shared_prefix_is_explicitly_constructed_as_prefill():
+    server_source = (
+        Path(__file__).parents[1] / "mtplx" / "server" / "openai.py"
+    ).read_text()
+
+    assert 'with attention_phase("ar_batch_shared_prefill")' not in server_source
+    assert 'with attention_phase("prefill")' in server_source
 
 
 @pytest.mark.parametrize(
@@ -782,6 +1122,9 @@ def test_runtime_constructs_one_whole_block_owner_after_packing() -> None:
         ({"verify_core": "linear-gdn-from-conv-tape"}, "stock capture"),
         ({"draft_core": "device-d2"}, "stock draft"),
         ({"compiled_target_prefix": False}, "compiled target-prefix"),
+        ({"session_bank_present": True}, "cold prompt"),
+        ({"vision_splice_present": True}, "vision"),
+        ({"prefill_layout": "contiguous_then_repage"}, "contiguous dense"),
     ],
 )
 def test_request_mismatch_fails_before_generation(override, match):
@@ -792,6 +1135,9 @@ def test_request_mismatch_fails_before_generation(override, match):
         "verify_core": "stock",
         "draft_core": "stock",
         "compiled_target_prefix": True,
+        "session_bank_present": False,
+        "vision_splice_present": False,
+        "prefill_layout": "contiguous_dense_decode",
     }
     request.update(override)
 
@@ -799,13 +1145,58 @@ def test_request_mismatch_fails_before_generation(override, match):
         validate_a3b_whole_moe_request(**request)
 
 
+@pytest.mark.parametrize(
+    ("mtp_adapter", "merge_mtp_adapter"),
+    [(Path("adapter"), False), (None, True)],
+)
+def test_whole_moe_rejects_mtp_adapter_configuration_at_load_boundary(
+    monkeypatch,
+    mtp_adapter,
+    merge_mtp_adapter,
+):
+    monkeypatch.setenv("MTPLX_A3B_WHOLE_MOE_FUSION", "1")
+
+    with pytest.raises(A3BWholeMoeConfigError, match="MTP adapters"):
+        whole_moe_module.validate_a3b_whole_moe_load_options(
+            mtp_adapter=mtp_adapter,
+            merge_mtp_adapter=merge_mtp_adapter,
+        )
+
+
 def test_generation_validates_whole_moe_request_before_prefill():
     source = inspect.getsource(generation_module.generate_mtpk)
 
     validation = source.index("validate_a3b_whole_moe_request(")
+    request_preflight = source.index("ensure_a3b_whole_moe_request_preflight(")
+    counter_start = source.index("counter_start = _runtime_counter_snapshot(rt)")
     prefill = source.index("restore_or_prefill_prompt_state(")
-    assert validation < prefill
+    assert validation < request_preflight < counter_start < prefill
     assert 'getattr(rt, "a3b_whole_moe_installed", False)' in source
+
+
+def test_actual_request_route_requires_the_preflighted_leaf_signature_before_decode():
+    install_source = inspect.getsource(
+        compiled_target_module.install_a3b_k1_target_prefix_route
+    )
+    generation_source = inspect.getsource(generation_module.generate_mtpk)
+
+    assert "_route_compile_specialization_key(" in install_source
+    assert "runtime._a3b_whole_moe_request_preflights" in install_source
+    assert 'route.request_preflight_status = "matched"' in install_source
+    route_install = generation_source.index("install_a3b_k1_target_prefix_route(")
+    decode_loop = generation_source.index("while len(tokens) < max_tokens:")
+    assert route_install < decode_loop
+    assert '"request_preflight_key": self.request_preflight_key' in inspect.getsource(
+        compiled_target_module.A3BK1TargetPrefixRoute.final_report
+    )
+
+
+def test_mtp_history_construction_uses_the_explicit_stock_prefill_phase():
+    source = inspect.getsource(generation_module._append_mtp_history)
+
+    phase = source.index('with attention_phase("prefill")')
+    update = source.index("rt.update_mtp_cache(")
+    assert phase < update
 
 
 def test_runtime_contract_propagates_only_the_whole_moe_enable_flag() -> None:

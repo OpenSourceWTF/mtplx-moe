@@ -16,6 +16,12 @@ import mlx.core as mx
 
 from .attention_context import current_attention_phase
 from .kernels import a3b_whole_moe as kernel_module
+from .moe_packed_projections import (
+    PackedGateUpMLP,
+    PackedSwitchGLU,
+    _PackedDenseProjection,
+    _PackedQuantizedProjection,
+)
 
 
 A3BWholeMoeVariant = Literal[
@@ -50,6 +56,7 @@ class A3BWholeMoeBinding:
     """One model-owned sparse block and its fixed storage variant."""
 
     block: Any
+    stock_call: Callable[[Any, Any], Any]
     variant: A3BWholeMoeVariant
     router: ProjectionStorage
     routed_gate_up: ProjectionStorage
@@ -84,8 +91,12 @@ class _MTPA3BWholeMoeRoute:
     m1_call: Callable[[Any], Any]
 
 
-_INSTALLED_BLOCKS: list[tuple[Any, type]] = []
-_SELFCHECK_TOLERANCE = 0.5
+_SELFCHECK_LIMITS = {
+    "route_scores": 0.0078125,
+    "shared_gate": 0.0625,
+    "activations": 0.125,
+    "output": 0.5,
+}
 _STATS: dict[str, Any] = {
     "enabled": False,
     "installed": False,
@@ -96,6 +107,7 @@ _STATS: dict[str, Any] = {
     "validated_contract": None,
     "selfcheck_lanes": {},
     "selfcheck_dmax": {},
+    "selfcheck_components": {},
 }
 
 
@@ -144,6 +156,21 @@ def a3b_whole_moe_enabled() -> bool:
     }
 
 
+def validate_a3b_whole_moe_load_options(
+    *,
+    mtp_adapter: Any | None,
+    merge_mtp_adapter: bool,
+) -> None:
+    """Reject load options that would mutate storage after it is bound."""
+
+    if a3b_whole_moe_enabled() and (
+        mtp_adapter is not None or bool(merge_mtp_adapter)
+    ):
+        raise A3BWholeMoeConfigError(
+            "whole-MoE does not support MTP adapters; use the exact checkpoint"
+        )
+
+
 def validate_a3b_whole_moe_request(
     *,
     verify_strategy: str,
@@ -152,6 +179,9 @@ def validate_a3b_whole_moe_request(
     verify_core: str,
     draft_core: str,
     compiled_target_prefix: bool,
+    session_bank_present: bool,
+    vision_splice_present: bool,
+    prefill_layout: str,
 ) -> None:
     """Validate request-owned facts once before prefill or measured decode."""
 
@@ -175,10 +205,27 @@ def validate_a3b_whole_moe_request(
         raise A3BWholeMoeConfigError(
             "whole-MoE requires the exact compiled target-prefix factory"
         )
+    if session_bank_present:
+        raise A3BWholeMoeConfigError(
+            "whole-MoE requires cold prompt ownership for exact cache geometry"
+        )
+    if vision_splice_present:
+        raise A3BWholeMoeConfigError(
+            "whole-MoE does not install a vision request geometry"
+        )
+    if prefill_layout != "contiguous_dense_decode":
+        raise A3BWholeMoeConfigError(
+            "whole-MoE requires the contiguous dense request cache layout"
+        )
 
 
 def _shape(value: Any) -> tuple[int, ...]:
     return tuple(int(dimension) for dimension in value.shape)
+
+
+def _require_no_additive_bias(module: Any, *, label: str) -> None:
+    if getattr(module, "bias", None) is not None:
+        raise A3BWholeMoeConfigError(f"{label} must not carry an additive bias")
 
 
 def _require_quantized(
@@ -190,6 +237,7 @@ def _require_quantized(
     weight_shape: tuple[int, ...],
     metadata_shape: tuple[int, ...],
 ) -> ProjectionStorage:
+    _require_no_additive_bias(module, label=label)
     if (
         int(getattr(module, "bits", 0) or 0) != bits
         or int(getattr(module, "group_size", 0) or 0) != group_size
@@ -224,6 +272,7 @@ def _require_dense(
     label: str,
     weight_shape: tuple[int, ...],
 ) -> ProjectionStorage:
+    _require_no_additive_bias(module, label=label)
     weight = getattr(module, "weight", None)
     if (
         weight is None
@@ -239,7 +288,41 @@ def _require_dense(
     return ProjectionStorage(weight=weight)
 
 
+def _require_exact_packed_owners(
+    block: Any,
+    *,
+    label: str,
+    variant: A3BWholeMoeVariant,
+) -> None:
+    switch = block.switch_mlp
+    shared = block.shared_expert
+    if type(switch) is not PackedSwitchGLU:
+        raise A3BWholeMoeConfigError(f"{label} requires exact PackedSwitchGLU ownership")
+    if type(shared) is not PackedGateUpMLP:
+        raise A3BWholeMoeConfigError(f"{label} requires exact PackedGateUpMLP ownership")
+    if int(switch._split_at) != 512 or int(shared._split_at) != 512:
+        raise A3BWholeMoeConfigError(f"{label} requires exact gate-before-up split 512")
+    if type(switch.gate_up_proj) is not _PackedQuantizedProjection:
+        raise A3BWholeMoeConfigError(
+            f"{label} requires exact packed routed quantized projection ownership"
+        )
+    expected_shared_type = (
+        _PackedQuantizedProjection
+        if variant == "target_q8g64_q4g64"
+        else _PackedDenseProjection
+    )
+    if type(shared.gate_up_proj) is not expected_shared_type:
+        raise A3BWholeMoeConfigError(
+            f"{label} requires exact packed shared projection ownership"
+        )
+
+
 def _require_common_block(block: Any, *, label: str, norm_weight: Any) -> None:
+    block_type = type(block)
+    if hasattr(block_type, "_mtplx_a3b_whole_moe_route") or hasattr(
+        block_type, "_mtplx_a3b_router_route"
+    ):
+        raise A3BWholeMoeConfigError(f"{label} has an installed route conflict")
     for attribute in (
         "gate",
         "switch_mlp",
@@ -273,10 +356,16 @@ def _require_common_block(block: Any, *, label: str, norm_weight: Any) -> None:
 def _target_binding(block: Any, *, norm_weight: Any) -> A3BWholeMoeBinding:
     label = "target whole-MoE"
     _require_common_block(block, label=label, norm_weight=norm_weight)
+    _require_exact_packed_owners(
+        block,
+        label=label,
+        variant="target_q8g64_q4g64",
+    )
     switch = block.switch_mlp
     shared = block.shared_expert
     return A3BWholeMoeBinding(
         block=block,
+        stock_call=type(block).__call__,
         variant="target_q8g64_q4g64",
         router=_require_quantized(
             block.gate,
@@ -332,10 +421,16 @@ def _target_binding(block: Any, *, norm_weight: Any) -> A3BWholeMoeBinding:
 def _mtp_binding(block: Any, *, norm_weight: Any) -> A3BWholeMoeBinding:
     label = "MTP whole-MoE"
     _require_common_block(block, label=label, norm_weight=norm_weight)
+    _require_exact_packed_owners(
+        block,
+        label=label,
+        variant="mtp_dense_q4g32_dense",
+    )
     switch = block.switch_mlp
     shared = block.shared_expert
     return A3BWholeMoeBinding(
         block=block,
+        stock_call=type(block).__call__,
         variant="mtp_dense_q4g32_dense",
         router=_require_dense(
             block.gate,
@@ -465,69 +560,22 @@ def prepare_a3b_whole_moe(
             "validated_contract": _validated_contract(),
             "selfcheck_lanes": {},
             "selfcheck_dmax": {},
+            "selfcheck_components": {},
         }
     )
     return plan
 
 
 def _target_m1_route(binding: A3BWholeMoeBinding) -> Callable[[Any], Any]:
-    stage1 = kernel_module.target_m1_stage1
-    stage2 = kernel_module.target_m1_stage2
-    stage3 = kernel_module.target_m1_stage3
-
-    def call(value: Any) -> Any:
-        expert_ids, route_scores, shared_gate = stage1(value, binding)
-        activations = stage2(value, expert_ids, binding)
-        output = stage3(
-            activations,
-            expert_ids,
-            route_scores,
-            shared_gate,
-            binding,
-        )
-        return output.reshape(*value.shape)
-
-    return call
+    return kernel_module.bind_target_m1(binding)
 
 
 def _target_m2_route(binding: A3BWholeMoeBinding) -> Callable[[Any], Any]:
-    stage1 = kernel_module.target_m2_stage1
-    stage2 = kernel_module.target_m2_stage2
-    stage3 = kernel_module.target_m2_stage3
-
-    def call(value: Any) -> Any:
-        expert_ids, route_scores, shared_gate = stage1(value, binding)
-        activations = stage2(value, expert_ids, binding)
-        output = stage3(
-            activations,
-            expert_ids,
-            route_scores,
-            shared_gate,
-            binding,
-        )
-        return output.reshape(*value.shape)
-
-    return call
+    return kernel_module.bind_target_m2(binding)
 
 
 def _mtp_m1_route(binding: A3BWholeMoeBinding) -> Callable[[Any], Any]:
-    stage1 = kernel_module.mtp_m1_stage1
-    stage2 = kernel_module.mtp_m1_stage2
-    stage3 = kernel_module.mtp_m1_stage3
-
-    def call(value: Any) -> Any:
-        expert_ids, route_scores, shared_gate = stage1(value, binding)
-        activations = stage2(value, expert_ids, binding)
-        output = stage3(
-            activations,
-            expert_ids,
-            route_scores,
-            shared_gate,
-            binding,
-        )
-        return output.reshape(*value.shape)
-
-    return call
+    return kernel_module.bind_mtp_m1(binding)
 
 
 def _max_abs_diff(candidate: Any, reference: Any) -> float:
@@ -544,7 +592,7 @@ def _check_whole_moe_lane(
     binding: A3BWholeMoeBinding,
     *,
     rows: int,
-) -> float:
+) -> dict[str, float]:
     """Check all three stages and the compiled route on deterministic input."""
 
     fixture = mx.arange(rows * 2048, dtype=mx.float32).reshape(1, rows, 2048)
@@ -626,13 +674,13 @@ def _check_whole_moe_lane(
         compiled_reference,
     )
     if not bool(mx.array_equal(expert_ids, reference_ids).item()):
-        return float("inf")
-    return max(
-        _max_abs_diff(route_scores, reference_scores),
-        _max_abs_diff(shared_gate, reference_shared_gate),
-        _max_abs_diff(activations, reference_activations),
-        _max_abs_diff(compiled_candidate, compiled_reference),
-    )
+        return {component: float("inf") for component in _SELFCHECK_LIMITS}
+    return {
+        "route_scores": _max_abs_diff(route_scores, reference_scores),
+        "shared_gate": _max_abs_diff(shared_gate, reference_shared_gate),
+        "activations": _max_abs_diff(activations, reference_activations),
+        "output": _max_abs_diff(compiled_candidate, compiled_reference),
+    }
 
 
 def run_a3b_whole_moe_selfcheck(
@@ -644,20 +692,45 @@ def run_a3b_whole_moe_selfcheck(
     report = dict(base_report or {})
     lanes = dict(report.get("lanes") or {})
     dmax = dict(report.get("dmax") or {})
+    component_report: dict[str, dict[str, float]] = {}
     checks = (
-        ("a3b_whole_moe_target_m1", plan.target_bindings[0], 1),
-        ("a3b_whole_moe_target_m2", plan.target_bindings[0], 2),
-        ("a3b_whole_moe_mtp_m1", plan.mtp_bindings[0], 1),
+        (
+            "a3b_whole_moe_target_m1",
+            tuple((binding, 1) for binding in plan.target_bindings),
+        ),
+        (
+            "a3b_whole_moe_target_m2",
+            tuple((binding, 2) for binding in plan.target_bindings),
+        ),
+        ("a3b_whole_moe_mtp_m1", ((plan.mtp_bindings[0], 1),)),
     )
-    for lane, binding, rows in checks:
-        try:
-            difference = _check_whole_moe_lane(binding, rows=rows)
-        except Exception:
-            difference = float("inf")
-        dmax[lane] = difference
-        lanes[lane] = "ok" if difference <= _SELFCHECK_TOLERANCE else "failed"
+    for lane, lane_checks in checks:
+        aggregate = {component: 0.0 for component in _SELFCHECK_LIMITS}
+        for binding, rows in lane_checks:
+            try:
+                differences = _check_whole_moe_lane(binding, rows=rows)
+            except Exception:
+                differences = {
+                    component: float("inf") for component in _SELFCHECK_LIMITS
+                }
+            for component in aggregate:
+                aggregate[component] = max(
+                    aggregate[component],
+                    float(differences[component]),
+                )
+        component_report[lane] = aggregate
+        dmax[lane] = max(aggregate.values())
+        lanes[lane] = (
+            "ok"
+            if all(
+                aggregate[component] <= limit
+                for component, limit in _SELFCHECK_LIMITS.items()
+            )
+            else "failed"
+        )
     report["lanes"] = lanes
     report["dmax"] = dmax
+    report["a3b_whole_moe_components"] = component_report
     return report
 
 
@@ -719,15 +792,14 @@ def _installed_class(
 def _route_for_binding(
     binding: A3BWholeMoeBinding,
 ) -> _TargetA3BWholeMoeRoute | _MTPA3BWholeMoeRoute:
-    stock_call = type(binding.block).__call__
     if binding.variant == "target_q8g64_q4g64":
         return _TargetA3BWholeMoeRoute(
-            stock_call=stock_call,
+            stock_call=binding.stock_call,
             m1_call=_target_m1_route(binding),
             m2_call=_target_m2_route(binding),
         )
     return _MTPA3BWholeMoeRoute(
-        stock_call=stock_call,
+        stock_call=binding.stock_call,
         m1_call=_mtp_m1_route(binding),
     )
 
@@ -735,8 +807,10 @@ def _route_for_binding(
 def install_a3b_whole_moe(
     plan: A3BWholeMoeInstallPlan,
     selfcheck_report: dict[str, Any] | None,
+    *,
+    compiled_preflight: Callable[[], dict[str, str]],
 ) -> dict[str, Any]:
-    """Atomically install all 41 exact routes after their fixed self-checks."""
+    """Commit all 41 routes only after the full compiled graph executes."""
 
     lanes = {} if selfcheck_report is None else selfcheck_report.get("lanes", {})
     required_lanes = (
@@ -758,6 +832,11 @@ def install_a3b_whole_moe(
         )
         raise A3BWholeMoeConfigError(_STATS["installation_error"])
 
+    full_graph_lanes = (
+        "a3b_whole_moe_target_prefix_full_graph_m1",
+        "a3b_whole_moe_target_prefix_full_graph_m2",
+    )
+
     bindings = (*plan.target_bindings, *plan.mtp_bindings)
     prepared = tuple(
         (
@@ -777,12 +856,33 @@ def install_a3b_whole_moe(
         for block, original_class, installed_class in prepared:
             block.__class__ = installed_class
             changed.append((block, original_class))
-    except Exception:
+        full_graph_report = dict(compiled_preflight())
+        failed_full_graph = tuple(
+            lane for lane in full_graph_lanes if full_graph_report.get(lane) != "ok"
+        )
+        if failed_full_graph:
+            raise A3BWholeMoeConfigError(
+                "whole-MoE full compiled target-prefix preflight failed for "
+                + ", ".join(failed_full_graph)
+            )
+    except Exception as exc:
         for block, original_class in reversed(changed):
             block.__class__ = original_class
-        raise
+        message = "whole-MoE full compiled target-prefix preflight failed"
+        _STATS.update(
+            {
+                "enabled": True,
+                "installed": False,
+                "installation_status": "configuration_error",
+                "installation_error": f"{message}: {exc}",
+            }
+        )
+        raise A3BWholeMoeConfigError(_STATS["installation_error"]) from exc
 
-    _INSTALLED_BLOCKS.extend(changed)
+    installed_lanes = {
+        **{lane: lanes[lane] for lane in required_lanes},
+        **{lane: full_graph_report[lane] for lane in full_graph_lanes},
+    }
     _STATS.update(
         {
             "enabled": True,
@@ -792,13 +892,17 @@ def install_a3b_whole_moe(
             "target_blocks": len(plan.target_bindings),
             "mtp_blocks": len(plan.mtp_bindings),
             "validated_contract": _validated_contract(),
-            "selfcheck_lanes": {
-                lane: lanes[lane] for lane in required_lanes
-            },
+            "selfcheck_lanes": installed_lanes,
             "selfcheck_dmax": {
-                lane: (selfcheck_report or {}).get("dmax", {}).get(lane)
-                for lane in required_lanes
+                **{
+                    lane: (selfcheck_report or {}).get("dmax", {}).get(lane)
+                    for lane in required_lanes
+                },
+                **{lane: 0.0 for lane in full_graph_lanes},
             },
+            "selfcheck_components": dict(
+                (selfcheck_report or {}).get("a3b_whole_moe_components") or {}
+            ),
         }
     )
     return a3b_whole_moe_stats()
@@ -811,9 +915,6 @@ def a3b_whole_moe_stats() -> dict[str, Any]:
 
 
 def _reset_a3b_whole_moe_for_tests() -> None:
-    for block, original_class in reversed(_INSTALLED_BLOCKS):
-        block.__class__ = original_class
-    _INSTALLED_BLOCKS.clear()
     _STATS.update(
         {
             "enabled": False,
@@ -825,5 +926,6 @@ def _reset_a3b_whole_moe_for_tests() -> None:
             "validated_contract": None,
             "selfcheck_lanes": {},
             "selfcheck_dmax": {},
+            "selfcheck_components": {},
         }
     )

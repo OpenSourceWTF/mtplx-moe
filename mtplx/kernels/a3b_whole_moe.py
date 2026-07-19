@@ -979,12 +979,9 @@ def _build_mtp_m1_stage3_kernel():
     )
 
 
-def target_m1_stage1(value: Any, binding: Any):
-    """Launch fixed target M1 route and shared-gate ownership."""
-
+def _launch_target_stage1(kernel: Any, value: Any, binding: Any, *, rows: int):
     router = binding.router
     shared_gate = binding.shared_scalar_gate
-    kernel = _build_target_m1_stage1_kernel()
     return kernel(
         inputs=[
             value,
@@ -995,40 +992,14 @@ def target_m1_stage1(value: Any, binding: Any):
             shared_gate.scales,
             shared_gate.biases,
         ],
-        grid=(256, 1, 1),
+        grid=(rows * 256, 1, 1),
         threadgroup=(256, 1, 1),
-        output_shapes=[(1, 8), (1, 8), (1, 1)],
+        output_shapes=[(rows, 8), (rows, 8), (rows, 1)],
         output_dtypes=[mx.uint32, mx.bfloat16, mx.bfloat16],
     )
 
 
-def target_m2_stage1(value: Any, binding: Any):
-    """Launch fixed target M2 route and shared-gate ownership."""
-
-    router = binding.router
-    shared_gate = binding.shared_scalar_gate
-    kernel = _build_target_m2_stage1_kernel()
-    return kernel(
-        inputs=[
-            value,
-            router.weight,
-            router.scales,
-            router.biases,
-            shared_gate.weight,
-            shared_gate.scales,
-            shared_gate.biases,
-        ],
-        grid=(512, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[(2, 8), (2, 8), (2, 1)],
-        output_dtypes=[mx.uint32, mx.bfloat16, mx.bfloat16],
-    )
-
-
-def mtp_m1_stage1(value: Any, binding: Any):
-    """Launch fixed MTP M1 route and shared-gate ownership."""
-
-    kernel = _build_mtp_m1_stage1_kernel()
+def _launch_mtp_stage1(kernel: Any, value: Any, binding: Any):
     return kernel(
         inputs=[
             value,
@@ -1040,6 +1011,28 @@ def mtp_m1_stage1(value: Any, binding: Any):
         output_shapes=[(1, 8), (1, 8), (1, 1)],
         output_dtypes=[mx.uint32, mx.bfloat16, mx.bfloat16],
     )
+
+
+def target_m1_stage1(value: Any, binding: Any):
+    """Launch fixed target M1 route and shared-gate ownership."""
+
+    return _launch_target_stage1(
+        _build_target_m1_stage1_kernel(), value, binding, rows=1
+    )
+
+
+def target_m2_stage1(value: Any, binding: Any):
+    """Launch fixed target M2 route and shared-gate ownership."""
+
+    return _launch_target_stage1(
+        _build_target_m2_stage1_kernel(), value, binding, rows=2
+    )
+
+
+def mtp_m1_stage1(value: Any, binding: Any):
+    """Launch fixed MTP M1 route and shared-gate ownership."""
+
+    return _launch_mtp_stage1(_build_mtp_m1_stage1_kernel(), value, binding)
 
 
 def _target_stage2_inputs(value: Any, expert_ids: Any, binding: Any) -> list[Any]:
@@ -1057,39 +1050,31 @@ def _target_stage2_inputs(value: Any, expert_ids: Any, binding: Any) -> list[Any
     ]
 
 
-def target_m1_stage2(value: Any, expert_ids: Any, binding: Any):
-    """Launch fixed BF16 target M1 `[1,9,512]` activation ownership."""
-
-    kernel = _build_target_m1_stage2_kernel()
+def _launch_target_stage2(
+    kernel: Any,
+    value: Any,
+    expert_ids: Any,
+    binding: Any,
+    *,
+    rows: int,
+):
     (activations,) = kernel(
         inputs=_target_stage2_inputs(value, expert_ids, binding),
         grid=(STAGE2_THREADGROUPS * TILED_THREADS, 1, 1),
         threadgroup=(TILED_THREADS, 1, 1),
-        output_shapes=[(1, ACTIVATION_SLOTS, INTERMEDIATE)],
+        output_shapes=[(rows, ACTIVATION_SLOTS, INTERMEDIATE)],
         output_dtypes=[mx.bfloat16],
     )
     return activations
 
 
-def target_m2_stage2(value: Any, expert_ids: Any, binding: Any):
-    """Launch fixed BF16 target M2 `[2,9,512]` activation ownership."""
-
-    kernel = _build_target_m2_stage2_kernel()
-    (activations,) = kernel(
-        inputs=_target_stage2_inputs(value, expert_ids, binding),
-        grid=(STAGE2_THREADGROUPS * TILED_THREADS, 1, 1),
-        threadgroup=(TILED_THREADS, 1, 1),
-        output_shapes=[(2, ACTIVATION_SLOTS, INTERMEDIATE)],
-        output_dtypes=[mx.bfloat16],
-    )
-    return activations
-
-
-def mtp_m1_stage2(value: Any, expert_ids: Any, binding: Any):
-    """Launch fixed BF16 MTP M1 `[1,9,512]` activation ownership."""
-
+def _launch_mtp_stage2(
+    kernel: Any,
+    value: Any,
+    expert_ids: Any,
+    binding: Any,
+):
     routed_gate_up = binding.routed_gate_up
-    kernel = _build_mtp_m1_stage2_kernel()
     (activations,) = kernel(
         inputs=[
             value,
@@ -1105,6 +1090,30 @@ def mtp_m1_stage2(value: Any, expert_ids: Any, binding: Any):
         output_dtypes=[mx.bfloat16],
     )
     return activations
+
+
+def target_m1_stage2(value: Any, expert_ids: Any, binding: Any):
+    """Launch fixed BF16 target M1 `[1,9,512]` activation ownership."""
+
+    return _launch_target_stage2(
+        _build_target_m1_stage2_kernel(), value, expert_ids, binding, rows=1
+    )
+
+
+def target_m2_stage2(value: Any, expert_ids: Any, binding: Any):
+    """Launch fixed BF16 target M2 `[2,9,512]` activation ownership."""
+
+    return _launch_target_stage2(
+        _build_target_m2_stage2_kernel(), value, expert_ids, binding, rows=2
+    )
+
+
+def mtp_m1_stage2(value: Any, expert_ids: Any, binding: Any):
+    """Launch fixed BF16 MTP M1 `[1,9,512]` activation ownership."""
+
+    return _launch_mtp_stage2(
+        _build_mtp_m1_stage2_kernel(), value, expert_ids, binding
+    )
 
 
 def _target_stage3_inputs(
@@ -1130,61 +1139,37 @@ def _target_stage3_inputs(
     ]
 
 
-def target_m1_stage3(
+def _launch_target_stage3(
+    kernel: Any,
     activations: Any,
     expert_ids: Any,
     route_scores: Any,
     shared_gate: Any,
     binding: Any,
+    *,
+    rows: int,
 ):
-    """Launch fixed target M1 output ownership."""
-
-    kernel = _build_target_m1_stage3_kernel()
     (output,) = kernel(
         inputs=_target_stage3_inputs(
             activations, expert_ids, route_scores, shared_gate, binding
         ),
         grid=(STAGE3_THREADGROUPS * TILED_THREADS, 1, 1),
         threadgroup=(TILED_THREADS, 1, 1),
-        output_shapes=[(1, HIDDEN)],
+        output_shapes=[(rows, HIDDEN)],
         output_dtypes=[mx.bfloat16],
     )
     return output
 
 
-def target_m2_stage3(
+def _launch_mtp_stage3(
+    kernel: Any,
     activations: Any,
     expert_ids: Any,
     route_scores: Any,
     shared_gate: Any,
     binding: Any,
 ):
-    """Launch fixed row-paired target M2 output ownership."""
-
-    kernel = _build_target_m2_stage3_kernel()
-    (output,) = kernel(
-        inputs=_target_stage3_inputs(
-            activations, expert_ids, route_scores, shared_gate, binding
-        ),
-        grid=(STAGE3_THREADGROUPS * TILED_THREADS, 1, 1),
-        threadgroup=(TILED_THREADS, 1, 1),
-        output_shapes=[(2, HIDDEN)],
-        output_dtypes=[mx.bfloat16],
-    )
-    return output
-
-
-def mtp_m1_stage3(
-    activations: Any,
-    expert_ids: Any,
-    route_scores: Any,
-    shared_gate: Any,
-    binding: Any,
-):
-    """Launch fixed MTP M1 output ownership."""
-
     routed_down = binding.routed_down
-    kernel = _build_mtp_m1_stage3_kernel()
     (output,) = kernel(
         inputs=[
             activations,
@@ -1202,3 +1187,145 @@ def mtp_m1_stage3(
         output_dtypes=[mx.bfloat16],
     )
     return output
+
+
+def target_m1_stage3(
+    activations: Any,
+    expert_ids: Any,
+    route_scores: Any,
+    shared_gate: Any,
+    binding: Any,
+):
+    """Launch fixed target M1 output ownership."""
+
+    return _launch_target_stage3(
+        _build_target_m1_stage3_kernel(),
+        activations,
+        expert_ids,
+        route_scores,
+        shared_gate,
+        binding,
+        rows=1,
+    )
+
+
+def target_m2_stage3(
+    activations: Any,
+    expert_ids: Any,
+    route_scores: Any,
+    shared_gate: Any,
+    binding: Any,
+):
+    """Launch fixed row-paired target M2 output ownership."""
+
+    return _launch_target_stage3(
+        _build_target_m2_stage3_kernel(),
+        activations,
+        expert_ids,
+        route_scores,
+        shared_gate,
+        binding,
+        rows=2,
+    )
+
+
+def mtp_m1_stage3(
+    activations: Any,
+    expert_ids: Any,
+    route_scores: Any,
+    shared_gate: Any,
+    binding: Any,
+):
+    """Launch fixed MTP M1 output ownership."""
+
+    return _launch_mtp_stage3(
+        _build_mtp_m1_stage3_kernel(),
+        activations,
+        expert_ids,
+        route_scores,
+        shared_gate,
+        binding,
+    )
+
+
+def bind_target_m1(binding: Any):
+    """Bind the three fixed target M1 kernels once at installation."""
+
+    stage1_kernel = _build_target_m1_stage1_kernel()
+    stage2_kernel = _build_target_m1_stage2_kernel()
+    stage3_kernel = _build_target_m1_stage3_kernel()
+
+    def call(value: Any):
+        expert_ids, route_scores, shared_gate = _launch_target_stage1(
+            stage1_kernel, value, binding, rows=1
+        )
+        activations = _launch_target_stage2(
+            stage2_kernel, value, expert_ids, binding, rows=1
+        )
+        output = _launch_target_stage3(
+            stage3_kernel,
+            activations,
+            expert_ids,
+            route_scores,
+            shared_gate,
+            binding,
+            rows=1,
+        )
+        return output.reshape(*value.shape)
+
+    return call
+
+
+def bind_target_m2(binding: Any):
+    """Bind the three fixed row-paired target M2 kernels once at installation."""
+
+    stage1_kernel = _build_target_m2_stage1_kernel()
+    stage2_kernel = _build_target_m2_stage2_kernel()
+    stage3_kernel = _build_target_m2_stage3_kernel()
+
+    def call(value: Any):
+        expert_ids, route_scores, shared_gate = _launch_target_stage1(
+            stage1_kernel, value, binding, rows=2
+        )
+        activations = _launch_target_stage2(
+            stage2_kernel, value, expert_ids, binding, rows=2
+        )
+        output = _launch_target_stage3(
+            stage3_kernel,
+            activations,
+            expert_ids,
+            route_scores,
+            shared_gate,
+            binding,
+            rows=2,
+        )
+        return output.reshape(*value.shape)
+
+    return call
+
+
+def bind_mtp_m1(binding: Any):
+    """Bind the three fixed MTP M1 kernels once at installation."""
+
+    stage1_kernel = _build_mtp_m1_stage1_kernel()
+    stage2_kernel = _build_mtp_m1_stage2_kernel()
+    stage3_kernel = _build_mtp_m1_stage3_kernel()
+
+    def call(value: Any):
+        expert_ids, route_scores, shared_gate = _launch_mtp_stage1(
+            stage1_kernel, value, binding
+        )
+        activations = _launch_mtp_stage2(
+            stage2_kernel, value, expert_ids, binding
+        )
+        output = _launch_mtp_stage3(
+            stage3_kernel,
+            activations,
+            expert_ids,
+            route_scores,
+            shared_gate,
+            binding,
+        )
+        return output.reshape(*value.shape)
+
+    return call
