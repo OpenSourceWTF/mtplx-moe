@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-from mtplx.expert_manifest import ExpertManifest
+from mtplx.expert_manifest import ExpertManifest, _safe_relative_name
 
 BANKED_FORMAT = "mtplx-banked-expert-banks-v1"
 BANKED_ALIGNMENT = 16384
@@ -461,7 +461,13 @@ def load_banked_manifest(path: Path | str) -> BankedManifest:
     return BankedManifest(
         format=BANKED_FORMAT,
         model_key=str(obj.get("model_key")),
-        file=str(obj.get("file")),
+        # Every sibling manifest validates this field; banked was the lone
+        # outlier reading it as a bare str(). bin_path() does
+        # `self.path.parent / self.file`, so an absolute string replaces the
+        # base entirely and a "../" escapes the artifact root. Harmless while
+        # banks are built locally, a real vector once they are downloaded from
+        # the Hub.
+        file=_safe_relative_name(str(obj.get("file")), label="banked bin file"),
         codec=str(codec),
         alignment=alignment,
         expert_count=expert_count,
