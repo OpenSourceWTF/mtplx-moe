@@ -379,3 +379,105 @@ def test_diagnostics_json_rejects_a_noise_projection() -> None:
     assert len(_diagnostics_json(build(Q2_MIN_ROUNDTRIP_COSINE))) == len(_PROJECTIONS)
     with pytest.raises(ValueError, match="below the pinned floor"):
         _diagnostics_json(build(Q2_MIN_ROUNDTRIP_COSINE - 0.01))
+
+
+# --- Finding 2: prefetch() on the wired mmap flavor -------------------------
+#
+# The audit alleged that mmap_u32(wired=True) yields an mx::array whose
+# allocator::Buffer holds the raw mmap pointer, so prefetch_arrays' cast to
+# MTL::Buffer* plus the virtual ->contents() call would dispatch through
+# mapped expert-weight bytes reinterpreted as an ObjC isa.
+#
+# That is REFUTED. MLX's raw-pointer array constructor routes through
+# allocator().make_buffer(), and MetalAllocator::make_buffer wraps the pointer
+# with newBufferWithBytesNoCopy: -- so both flavors store a real MTL::Buffer*.
+# MLX's own allocator::Buffer::raw_ptr() performs the identical contents()
+# message send for every array on the Metal backend.
+#
+# What the boundary DID lack is a type check: nb::inst_ptr is unchecked, so
+# handing prefetch() any non-mlx.core.array segfaulted the interpreter.
+
+
+@pytest.fixture
+def _mmap_bridge():
+    pytest.importorskip("mlx.core")
+    mmap_mlx = pytest.importorskip("mtplx.mmap_mlx")
+    try:
+        mmap_mlx.load_mmap_extension()
+    except Exception as error:  # pragma: no cover - non-Metal hosts
+        pytest.skip(f"file-backed MLX bridge unavailable: {error}")
+    return mmap_mlx
+
+
+def _poison_page(path: Path, pages: int = 1) -> int:
+    """A mapping whose every 8-byte word is an obviously invalid ObjC isa.
+
+    If prefetch ever did message-send through the mapped bytes, this payload
+    makes the fault deterministic rather than data-dependent.
+    """
+
+    import mmap as _mmap
+
+    length = _mmap.PAGESIZE * pages
+    path.write_bytes((0xDEADBEEFDEADBEEF).to_bytes(8, "little") * (length // 8))
+    return length
+
+
+@pytest.mark.parametrize("wired", [True, False])
+def test_prefetch_survives_both_mmap_flavors(tmp_path, _mmap_bridge, wired) -> None:
+    """The wired flavor is the DEFAULT (mmap_island_wired=True) yet was only
+    ever covered incidentally. Pin it directly."""
+
+    source = tmp_path / "poison.bin"
+    length = _poison_page(source)
+    array = _mmap_bridge.mmap_u32(source, 0, length, wired=wired)
+    assert array.shape == (length // 4,)
+    assert array[0].item() == 0xDEADBEEF
+    # No crash, and MADV_WILLNEED lands on a genuinely mapped range.
+    assert _mmap_bridge.prefetch([array]) == 0
+
+
+def test_prefetch_rejects_non_arrays_instead_of_segfaulting(_mmap_bridge) -> None:
+    """nb::inst_ptr is an unchecked cast; without a type check this crashed
+    the interpreter rather than raising."""
+
+    for bad in (12345, "not an array", None, object(), [1, 2]):
+        with pytest.raises(ValueError, match="must be mlx.core.array"):
+            _mmap_bridge.prefetch([bad])
+
+
+def test_prefetch_rejects_a_bad_input_mixed_with_good_ones(
+    tmp_path, _mmap_bridge
+) -> None:
+    source = tmp_path / "poison.bin"
+    length = _poison_page(source)
+    good = _mmap_bridge.mmap_u32(source, 0, length, wired=True)
+    with pytest.raises(ValueError, match="must be mlx.core.array"):
+        _mmap_bridge.prefetch([good, 12345, good])
+
+
+def test_wired_mmap_flavor_is_no_copy(tmp_path, _mmap_bridge) -> None:
+    """A copy would defeat the whole point: the sidecar is larger than RAM.
+
+    make_buffer returning nullptr would silently fall back to malloc+memcpy,
+    which stays *safe* but blows the memory envelope. Guard the envelope.
+    """
+
+    import resource
+
+    length = 256 * 1024 * 1024
+    source = tmp_path / "big.bin"
+    with source.open("wb") as handle:
+        chunk = b"\xa5" * (1 << 20)
+        for _ in range(length >> 20):
+            handle.write(chunk)
+
+    def maxrss() -> int:
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+    before = maxrss()
+    array = _mmap_bridge.mmap_u32(source, 0, length, wired=True)
+    growth = maxrss() - before
+    assert array[0].item() == 0xA5A5A5A5
+    # A memcpy fallback would add ~256 MiB of resident anonymous memory.
+    assert growth < length // 4, f"wired map grew RSS by {growth} bytes"
