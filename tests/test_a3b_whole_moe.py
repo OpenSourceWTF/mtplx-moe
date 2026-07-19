@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -11,6 +12,7 @@ from mtplx.a3b_whole_moe import (
     A3BWholeMoeConfigError,
     prepare_a3b_whole_moe,
 )
+from mtplx.kernels import a3b_whole_moe as kernel_module
 
 
 _LAYER_TYPES = tuple(
@@ -308,3 +310,195 @@ def test_external_contract_mismatch_fails_before_install(
         prepare_a3b_whole_moe(model, config=config)
 
     assert tuple(type(block) for block in (*targets, *mtp)) == original_classes
+
+
+def test_fixed_kernel_sources_encode_exact_geometry_without_hot_validation():
+    sources = kernel_module.all_whole_moe_sources()
+    assert len(sources) == 9
+    for source in sources.values():
+        assert "constexpr uint HIDDEN = 2048" in source
+        assert "constexpr uint EXPERTS = 256" in source
+        assert "constexpr uint TOP_K = 8" in source
+        assert "constexpr uint INTERMEDIATE = 512" in source
+        for forbidden in (
+            "getenv",
+            "dtype",
+            "shape",
+            "eligible",
+            "fallback",
+            "lane_disabled",
+            "record_",
+            "counter",
+        ):
+            assert forbidden not in source
+    for name, source in sources.items():
+        if "stage1" not in name:
+            assert "threadgroup_barrier" not in source
+
+
+class _CapturedKernel:
+    def __init__(self) -> None:
+        self.call = None
+
+    def __call__(self, **kwargs):
+        self.call = kwargs
+        return tuple(
+            _ArraySpec(shape, dtype)
+            for shape, dtype in zip(
+                kwargs["output_shapes"], kwargs["output_dtypes"]
+            )
+        )
+
+
+def test_target_m2_stage2_is_row_paired_with_fixed_288_threadgroups(monkeypatch):
+    monkeypatch.setenv("MTPLX_A3B_WHOLE_MOE_FUSION", "1")
+    kernel = _CapturedKernel()
+    monkeypatch.setattr(
+        kernel_module,
+        "_build_target_m2_stage2_kernel",
+        lambda: kernel,
+    )
+    model, _, _ = _exact_model()
+    binding = prepare_a3b_whole_moe(
+        model,
+        config=_exact_config(),
+    ).target_bindings[0]
+
+    output = kernel_module.target_m2_stage2(
+        _ArraySpec((2, 2048)),
+        _ArraySpec((2, 8), mx.uint32),
+        binding,
+    )
+
+    assert output.shape == (2, 9, 512)
+    assert kernel.call["grid"] == (288 * 128, 1, 1)
+    assert kernel.call["threadgroup"] == (128, 1, 1)
+    assert kernel.call["output_shapes"] == [(2, 9, 512)]
+    assert kernel.call["output_dtypes"] == [mx.bfloat16]
+
+
+def test_fixed_entrypoint_launch_table(monkeypatch):
+    expected = {
+        "target_m1_stage1": ((256, 1, 1), (256, 1, 1)),
+        "target_m2_stage1": ((512, 1, 1), (256, 1, 1)),
+        "mtp_m1_stage1": ((256, 1, 1), (256, 1, 1)),
+        "target_m1_stage2": ((288 * 128, 1, 1), (128, 1, 1)),
+        "target_m2_stage2": ((288 * 128, 1, 1), (128, 1, 1)),
+        "mtp_m1_stage2": ((288 * 128, 1, 1), (128, 1, 1)),
+        "target_m1_stage3": ((128 * 128, 1, 1), (128, 1, 1)),
+        "target_m2_stage3": ((128 * 128, 1, 1), (128, 1, 1)),
+        "mtp_m1_stage3": ((128 * 128, 1, 1), (128, 1, 1)),
+    }
+    assert kernel_module.whole_moe_launch_table() == expected
+
+
+def test_stage1_sources_encode_router_softmax_top8_and_score_rounding():
+    sources = kernel_module.all_whole_moe_sources()
+    for name in ("target_m1_stage1", "target_m2_stage1"):
+        source = sources[name]
+        assert "qdot8_affine" in source
+        assert "constexpr uint ROUTER_GROUP = 64" in source
+        assert "threadgroup bfloat router_logits[ROWS * EXPERTS]" in source
+        assert "metal::exp" in source
+        assert "simd_max" in source
+        assert "bfloat rounded_denominator = bfloat(0.0f)" in source
+        assert "candidate_probability == winner_probability" in source
+    source = sources["mtp_m1_stage1"]
+    assert "dense_bf16_dot" in source
+    assert "threadgroup bfloat router_logits[ROWS * EXPERTS]" in source
+    assert "metal::exp" in source
+    assert "bfloat rounded_denominator = bfloat(0.0f)" in source
+
+
+def test_stage2_sources_encode_selected_q4_and_exact_bf16_swiglu():
+    sources = kernel_module.all_whole_moe_sources()
+    for name in ("target_m1_stage2", "target_m2_stage2"):
+        source = sources[name]
+        assert "constexpr uint ROUTED_GROUP = 64" in source
+        assert "qdot4_affine" in source
+        assert "sigmoid_mlx_exact" in source
+        assert "bfloat gate_value = bfloat(gate_sum)" in source
+        assert "bfloat up_value = bfloat(up_sum)" in source
+        assert "activations[output_index] = bfloat(silu * up_value)" in source
+    source = sources["mtp_m1_stage2"]
+    assert "constexpr uint ROUTED_GROUP = 32" in source
+    assert "qdot4_affine" in source
+    assert "dense_shared_dot" in source
+    assert "sigmoid_mlx_exact" in source
+
+
+def test_stage3_sources_encode_down_reduction_shared_gate_and_only_final_store():
+    sources = kernel_module.all_whole_moe_sources()
+    for name in ("target_m1_stage3", "target_m2_stage3"):
+        source = sources[name]
+        assert "constexpr uint ROUTED_GROUP = 64" in source
+        assert "qdot4_affine" in source
+        assert "bfloat down_value = bfloat(down_sum)" in source
+        assert "bfloat route_product = bfloat(" in source
+        assert "routed_accumulator[result_index] = bfloat(" in source
+        assert "sigmoid_mlx_exact" in source
+        assert "output[output_index] = bfloat(" in source
+        assert "routed_outputs" not in source
+        assert "shared_output" not in source
+    source = sources["mtp_m1_stage3"]
+    assert "constexpr uint ROUTED_GROUP = 32" in source
+    assert "qdot4_affine" in source
+    assert "dense_shared_down" in source
+    assert "output[output_index] = bfloat(" in source
+
+
+def test_all_fixed_entrypoints_launch_directly_without_runtime_validation(monkeypatch):
+    monkeypatch.setenv("MTPLX_A3B_WHOLE_MOE_FUSION", "1")
+    model, _, _ = _exact_model()
+    plan = prepare_a3b_whole_moe(model, config=_exact_config())
+    target = plan.target_bindings[0]
+    mtp = plan.mtp_bindings[0]
+    for name, (grid, threadgroup) in kernel_module.whole_moe_launch_table().items():
+        rows = 2 if "m2" in name else 1
+        binding = mtp if name.startswith("mtp") else target
+        captured = _CapturedKernel()
+        monkeypatch.setattr(
+            kernel_module,
+            f"_build_{name}_kernel",
+            lambda captured=captured: captured,
+        )
+        entrypoint = getattr(kernel_module, name)
+        if name.endswith("stage1"):
+            result = entrypoint(_ArraySpec((rows, 2048)), binding)
+            assert tuple(item.shape for item in result) == (
+                (rows, 8),
+                (rows, 8),
+                (rows, 1),
+            )
+        elif name.endswith("stage2"):
+            result = entrypoint(
+                _ArraySpec((rows, 2048)),
+                _ArraySpec((rows, 8), mx.uint32),
+                binding,
+            )
+            assert result.shape == (rows, 9, 512)
+        else:
+            result = entrypoint(
+                _ArraySpec((rows, 9, 512)),
+                _ArraySpec((rows, 8), mx.uint32),
+                _ArraySpec((rows, 8)),
+                _ArraySpec((rows, 1)),
+                binding,
+            )
+            assert result.shape == (rows, 2048)
+        assert captured.call["grid"] == grid
+        assert captured.call["threadgroup"] == threadgroup
+        source = inspect.getsource(entrypoint)
+        for forbidden in (
+            "os.environ",
+            "metal.is_available",
+            ".dtype",
+            ".shape",
+            "eligible",
+            "fallback",
+            "lane_disabled",
+            "try:",
+            "except",
+            "raise ",
+        ):
+            assert forbidden not in source
