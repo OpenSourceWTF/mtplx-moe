@@ -501,7 +501,7 @@ def test_fixed_entrypoint_launch_table(monkeypatch):
         "target_m2_stage2": ((288 * 128, 1, 1), (128, 1, 1)),
         "mtp_m1_stage2": ((288 * 128, 1, 1), (128, 1, 1)),
         "target_m1_stage3": ((128 * 128, 1, 1), (128, 1, 1)),
-        "target_m2_stage3": ((2 * 128 * 128, 1, 1), (128, 1, 1)),
+        "target_m2_stage3": ((128 * 128, 1, 1), (128, 1, 1)),
         "mtp_m1_stage3": ((128 * 128, 1, 1), (128, 1, 1)),
     }
     assert kernel_module.whole_moe_launch_table() == expected
@@ -558,9 +558,17 @@ def test_stage3_sources_encode_down_reduction_shared_gate_and_only_final_store()
         assert "qdot4_affine" in source
         assert "bfloat down_value = bfloat(down_sum)" in source
         assert "bfloat route_product = bfloat(" in source
-        assert "routed_accumulator[result_index] = bfloat(" in source
+        if name == "target_m2_stage3":
+            assert "routed_accumulator0[result_index] = bfloat(" in source
+            assert "routed_accumulator1[result_index] = bfloat(" in source
+        else:
+            assert "routed_accumulator[result_index] = bfloat(" in source
         assert "sigmoid_mlx_exact" in source
-        assert "output[output_index] = bfloat(" in source
+        if name == "target_m2_stage3":
+            assert "output[output_column] = bfloat(" in source
+            assert "output[HIDDEN + output_column] = bfloat(" in source
+        else:
+            assert "output[output_index] = bfloat(" in source
         assert "routed_outputs" not in source
         assert "shared_output" not in source
     source = sources["mtp_m1_stage3"]
@@ -570,15 +578,39 @@ def test_stage3_sources_encode_down_reduction_shared_gate_and_only_final_store()
     assert "output[output_index] = bfloat(" in source
 
 
-def test_stage3_sources_assign_one_exact_row_per_threadgroup():
+def test_stage3_sources_use_exact_m1_and_row_paired_m2_ownership():
     sources = kernel_module.all_whole_moe_sources()
-    for name in ("target_m1_stage3", "target_m2_stage3", "mtp_m1_stage3"):
+    for name in ("target_m1_stage3", "mtp_m1_stage3"):
         source = sources[name]
         assert "constexpr uint OUTPUT_TILES = HIDDEN / 16" in source
         assert "uint group = threadgroup_position_in_grid.x" in source
         assert "uint row = group / OUTPUT_TILES" in source
         assert "uint tile = group - row * OUTPUT_TILES" in source
         assert "for (uint row = 0; row < ROWS; ++row)" not in source
+
+    source = sources["target_m2_stage3"]
+    assert "constexpr uint OUTPUT_TILES = HIDDEN / 16" in source
+    assert "uint tile = threadgroup_position_in_grid.x" in source
+    assert "uint group =" not in source
+    assert "uint row =" not in source
+    assert "threadgroup bfloat shared_inputs[ROWS * 4 * INTERMEDIATE]" in source
+    assert "routed_accumulator0" in source
+    assert "routed_accumulator1" in source
+
+
+def test_target_m2_stage3_loads_each_shared_down_word_once_for_both_rows():
+    source = kernel_module.all_whole_moe_sources()["target_m2_stage3"]
+
+    assert source.count("ushort packed = shared_down_packed[piece]") == 1
+    assert "shared_quantized_dot0" in source
+    assert "shared_quantized_dot1" in source
+    assert "shared_inputs[shared_input_base0 + item]" in source
+    assert "shared_inputs[shared_input_base1 + item]" in source
+    assert "shared_inputs[shared_input_base0 + item + 1] = x01" in source
+    assert "shared_inputs[shared_input_base1 + item + 1] = x11" in source
+    assert "float(shared_inputs[shared_input_base0 + item + 1]) / 16.0f" in source
+    assert "float(shared_inputs[shared_input_base1 + item + 1]) / 16.0f" in source
+    assert "bfloat(float(x" not in source
 
 
 def test_all_fixed_entrypoints_launch_directly_without_runtime_validation(monkeypatch):
@@ -898,7 +930,7 @@ def test_successful_selfcheck_installs_only_40_target_m2_overrides(monkeypatch):
     )
     assert report["validated_contract"]["target"]["routes"] == {
         "M1": "accepted_row_owned_router_combine",
-        "M2": "accepted_stage12_fused_down_row_separated",
+        "M2": "accepted_stage12_fused_down_row_paired",
     }
     assert report["validated_contract"]["mtp"]["routes"] == {
         "M1": "accepted_row_owned_router_combine"

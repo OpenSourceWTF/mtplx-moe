@@ -35,7 +35,10 @@ def _fixed_source(*, stage: int, rows: int, variant: str) -> str:
         return common + _stage1_source(target=variant.startswith("target"))
     if stage == 2:
         return common + _stage2_source(target=variant.startswith("target"))
-    return common + _stage3_source(target=variant.startswith("target"))
+    return common + _stage3_source(
+        target=variant.startswith("target"),
+        rows=rows,
+    )
 
 
 def _stage1_source(*, target: bool) -> str:
@@ -531,10 +534,228 @@ def _mtp_stage2_source() -> str:
     """
 
 
-def _stage3_source(*, target: bool) -> str:
+def _stage3_source(*, target: bool, rows: int) -> str:
     if target:
+        if rows == 2:
+            return _target_m2_stage3_source()
         return _target_stage3_source()
     return _mtp_stage3_source()
+
+
+def _target_m2_routed_row_source(row: int) -> str:
+    accumulator = f"routed_accumulator{row}"
+    return f"""
+        for (uint slot = 0; slot < TOP_K; ++slot) {{
+            uint expert = expert_ids[{row} * TOP_K + slot];
+            const device uchar* down_bytes =
+                reinterpret_cast<const device uchar*>(
+                    routed_down_weight
+                    + expert * HIDDEN * (INTERMEDIATE / 8));
+            const device bfloat* down_scale_values = routed_down_scales
+                + expert * HIDDEN * (INTERMEDIATE / ROUTED_GROUP);
+            const device bfloat* down_bias_values = routed_down_biases
+                + expert * HIDDEN * (INTERMEDIATE / ROUTED_GROUP);
+            uint k_lane = lane * VALUES_PER_LANE;
+            float input_values[VALUES_PER_LANE];
+            float input_sum = 0.0f;
+            for (uint item = 0; item < VALUES_PER_LANE; item += 4) {{
+                uint activation_base =
+                    ({row} * ACTIVATION_SLOTS + slot) * INTERMEDIATE
+                    + k_lane + item;
+                float x0 = float(activations[activation_base]);
+                float x1 = float(activations[activation_base + 1]);
+                float x2 = float(activations[activation_base + 2]);
+                float x3 = float(activations[activation_base + 3]);
+                input_sum += x0 + x1 + x2 + x3;
+                input_values[item] = x0;
+                input_values[item + 1] = x1 / 16.0f;
+                input_values[item + 2] = x2 / 256.0f;
+                input_values[item + 3] = x3 / 4096.0f;
+            }}
+            float down_result[4] = {{0.0f, 0.0f, 0.0f, 0.0f}};
+            for (uint result_index = 0; result_index < 4; ++result_index) {{
+                uint output_column = output_base + result_index;
+                uint weight_offset =
+                    output_column * (INTERMEDIATE / 2) + k_lane / 2;
+                const device ushort* down_packed =
+                    reinterpret_cast<const device ushort*>(
+                        down_bytes + weight_offset);
+                float quantized_dot = 0.0f;
+                // qdot4_affine routed row {row}
+                for (uint piece = 0; piece < VALUES_PER_LANE / 4; ++piece) {{
+                    ushort packed = down_packed[piece];
+                    uint item = piece * 4;
+                    quantized_dot +=
+                        input_values[item] * float(packed & 0x000f)
+                        + input_values[item + 1] * float(packed & 0x00f0)
+                        + input_values[item + 2] * float(packed & 0x0f00)
+                        + input_values[item + 3] * float(packed & 0xf000);
+                }}
+                uint metadata_index =
+                    output_column * (INTERMEDIATE / ROUTED_GROUP)
+                    + k_lane / ROUTED_GROUP;
+                down_result[result_index] =
+                    float(down_scale_values[metadata_index]) * quantized_dot
+                    + input_sum * float(down_bias_values[metadata_index]);
+            }}
+            for (uint result_index = 0; result_index < 4; ++result_index) {{
+                float down_sum = simd_sum(down_result[result_index]);
+                if (lane == 0) {{
+                    bfloat down_value = bfloat(down_sum);
+                    bfloat route_product = bfloat(
+                        float(down_value)
+                        * float(route_scores[{row} * TOP_K + slot]));
+                    {accumulator}[result_index] = bfloat(
+                        float({accumulator}[result_index])
+                        + float(route_product));
+                }}
+            }}
+        }}
+    """
+
+
+def _target_m2_stage3_source() -> str:
+    """Pair exact M2 rows so shared-down storage is consumed once per tile."""
+
+    return (
+        """
+        constexpr uint ROUTED_GROUP = 64;
+        constexpr uint VALUES_PER_LANE = 16;
+        constexpr uint OUTPUT_TILES = HIDDEN / 16;
+        constexpr uint SIMD_GROUPS = 4;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint output_base = tile * 16 + simd_gid * 4;
+
+        bfloat routed_accumulator0[4] = {
+            bfloat(0.0f), bfloat(0.0f), bfloat(0.0f), bfloat(0.0f)};
+        bfloat routed_accumulator1[4] = {
+            bfloat(0.0f), bfloat(0.0f), bfloat(0.0f), bfloat(0.0f)};
+        """
+        + _target_m2_routed_row_source(0)
+        + _target_m2_routed_row_source(1)
+        + """
+        threadgroup bfloat shared_inputs[ROWS * 4 * INTERMEDIATE];
+        uint shared_k_lane = lane * VALUES_PER_LANE;
+        uint shared_input_base0 =
+            (0 * SIMD_GROUPS + simd_gid) * INTERMEDIATE + shared_k_lane;
+        uint shared_input_base1 =
+            (1 * SIMD_GROUPS + simd_gid) * INTERMEDIATE + shared_k_lane;
+        float shared_input_sum0 = 0.0f;
+        float shared_input_sum1 = 0.0f;
+        for (uint item = 0; item < VALUES_PER_LANE; item += 4) {
+            uint activation_base0 =
+                (0 * ACTIVATION_SLOTS + TOP_K) * INTERMEDIATE
+                + shared_k_lane + item;
+            uint activation_base1 =
+                (1 * ACTIVATION_SLOTS + TOP_K) * INTERMEDIATE
+                + shared_k_lane + item;
+            bfloat x00 = activations[activation_base0];
+            bfloat x01 = activations[activation_base0 + 1];
+            bfloat x02 = activations[activation_base0 + 2];
+            bfloat x03 = activations[activation_base0 + 3];
+            bfloat x10 = activations[activation_base1];
+            bfloat x11 = activations[activation_base1 + 1];
+            bfloat x12 = activations[activation_base1 + 2];
+            bfloat x13 = activations[activation_base1 + 3];
+            shared_input_sum0 +=
+                float(x00) + float(x01) + float(x02) + float(x03);
+            shared_input_sum1 +=
+                float(x10) + float(x11) + float(x12) + float(x13);
+            shared_inputs[shared_input_base0 + item] = x00;
+            shared_inputs[shared_input_base0 + item + 1] = x01;
+            shared_inputs[shared_input_base0 + item + 2] = x02;
+            shared_inputs[shared_input_base0 + item + 3] = x03;
+            shared_inputs[shared_input_base1 + item] = x10;
+            shared_inputs[shared_input_base1 + item + 1] = x11;
+            shared_inputs[shared_input_base1 + item + 2] = x12;
+            shared_inputs[shared_input_base1 + item + 3] = x13;
+        }
+
+        const device uchar* shared_down_bytes =
+            reinterpret_cast<const device uchar*>(shared_down_weight);
+        float shared_result0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float shared_result1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (uint result_index = 0; result_index < 4; ++result_index) {
+            uint output_column = output_base + result_index;
+            uint weight_offset =
+                output_column * (INTERMEDIATE / 2) + shared_k_lane / 2;
+            const device ushort* shared_down_packed =
+                reinterpret_cast<const device ushort*>(
+                    shared_down_bytes + weight_offset);
+            float shared_quantized_dot0 = 0.0f;
+            float shared_quantized_dot1 = 0.0f;
+            // qdot4_affine shared, one packed load for both rows
+            for (uint piece = 0; piece < VALUES_PER_LANE / 4; ++piece) {
+                ushort packed = shared_down_packed[piece];
+                uint item = piece * 4;
+                shared_quantized_dot0 +=
+                    float(shared_inputs[shared_input_base0 + item])
+                        * float(packed & 0x000f)
+                    + float(shared_inputs[shared_input_base0 + item + 1]) / 16.0f
+                        * float(packed & 0x00f0)
+                    + float(shared_inputs[shared_input_base0 + item + 2]) / 256.0f
+                        * float(packed & 0x0f00)
+                    + float(shared_inputs[shared_input_base0 + item + 3]) / 4096.0f
+                        * float(packed & 0xf000);
+                shared_quantized_dot1 +=
+                    float(shared_inputs[shared_input_base1 + item])
+                        * float(packed & 0x000f)
+                    + float(shared_inputs[shared_input_base1 + item + 1]) / 16.0f
+                        * float(packed & 0x00f0)
+                    + float(shared_inputs[shared_input_base1 + item + 2]) / 256.0f
+                        * float(packed & 0x0f00)
+                    + float(shared_inputs[shared_input_base1 + item + 3]) / 4096.0f
+                        * float(packed & 0xf000);
+            }
+            uint metadata_index =
+                output_column * (INTERMEDIATE / ROUTED_GROUP)
+                + shared_k_lane / ROUTED_GROUP;
+            float shared_scale = float(shared_down_scales[metadata_index]);
+            float shared_bias = float(shared_down_biases[metadata_index]);
+            shared_result0[result_index] =
+                shared_scale * shared_quantized_dot0
+                + shared_input_sum0 * shared_bias;
+            shared_result1[result_index] =
+                shared_scale * shared_quantized_dot1
+                + shared_input_sum1 * shared_bias;
+        }
+
+        for (uint result_index = 0; result_index < 4; ++result_index) {
+            float shared_sum0 = simd_sum(shared_result0[result_index]);
+            float shared_sum1 = simd_sum(shared_result1[result_index]);
+            if (lane == 0) {
+                bfloat gate_value0 = shared_gate[0];
+                auto sigmoid_y0 = 1 / (
+                    1 + metal::exp(metal::abs(gate_value0)));
+                bfloat sigmoid_mlx_exact0 = gate_value0 < bfloat(0.0f)
+                    ? bfloat(sigmoid_y0)
+                    : bfloat(1 - sigmoid_y0);
+                bfloat shared_value0 = bfloat(shared_sum0);
+                bfloat gated_shared0 = bfloat(
+                    sigmoid_mlx_exact0 * shared_value0);
+                bfloat gate_value1 = shared_gate[1];
+                auto sigmoid_y1 = 1 / (
+                    1 + metal::exp(metal::abs(gate_value1)));
+                bfloat sigmoid_mlx_exact1 = gate_value1 < bfloat(0.0f)
+                    ? bfloat(sigmoid_y1)
+                    : bfloat(1 - sigmoid_y1);
+                bfloat shared_value1 = bfloat(shared_sum1);
+                bfloat gated_shared1 = bfloat(
+                    sigmoid_mlx_exact1 * shared_value1);
+                uint output_column = output_base + result_index;
+                output[output_column] = bfloat(
+                    float(routed_accumulator0[result_index])
+                    + float(gated_shared0));
+                output[HIDDEN + output_column] = bfloat(
+                    float(routed_accumulator1[result_index])
+                    + float(gated_shared1));
+            }
+        }
+    """
+    )
 
 
 def _target_stage3_source() -> str:
@@ -830,10 +1051,7 @@ def whole_moe_launch_table() -> dict[str, tuple[tuple[int, int, int], tuple[int,
         "target_m2_stage2": ((STAGE2_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
         "mtp_m1_stage2": ((STAGE2_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
         "target_m1_stage3": ((STAGE3_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
-        "target_m2_stage3": (
-            (2 * STAGE3_THREADGROUPS * 128, 1, 1),
-            (128, 1, 1),
-        ),
+        "target_m2_stage3": ((STAGE3_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
         "mtp_m1_stage3": ((STAGE3_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
     }
 
@@ -1158,7 +1376,7 @@ def _launch_target_stage3(
         inputs=_target_stage3_inputs(
             activations, expert_ids, route_scores, shared_gate, binding
         ),
-        grid=(rows * STAGE3_THREADGROUPS * TILED_THREADS, 1, 1),
+        grid=(STAGE3_THREADGROUPS * TILED_THREADS, 1, 1),
         threadgroup=(TILED_THREADS, 1, 1),
         output_shapes=[(rows, HIDDEN)],
         output_dtypes=[mx.bfloat16],
