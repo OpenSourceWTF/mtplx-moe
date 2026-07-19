@@ -360,18 +360,44 @@ def pass_at_k(n: int, c: int, k: int) -> float:
     return 1.0 - product
 
 
-def summarize(results: Sequence[TaskResult], *, k: int = 1, n: int = 1) -> dict[str, Any]:
-    """Aggregate per-task results into a report."""
+def summarize(results: Sequence[TaskResult], *, k: int = 1) -> dict[str, Any]:
+    """Aggregate sample-level results into a report.
 
-    total = len(results)
-    passed = sum(1 for r in results if r.passed)
+    ``results`` may contain several samples per task (same ``task_id``).
+    pass@k is computed **per task and then averaged**, which is the Codex-paper
+    definition — ``pass_at_k`` is a per-task estimator and feeding it a
+    corpus-wide correct count is meaningless.
+
+    An earlier signature took an ``n=`` argument and did exactly that, which
+    raised as soon as the corpus-wide pass count exceeded the sample count.
+    Sample counts are now derived per task, so callers cannot get it wrong.
+    """
+
+    by_task: dict[str, list[TaskResult]] = {}
+    for result in results:
+        by_task.setdefault(result.task_id, []).append(result)
+
     by_status: dict[str, int] = {}
     for result in results:
         by_status[result.status] = by_status.get(result.status, 0) + 1
+
+    per_task: list[float] = []
+    for samples in by_task.values():
+        n_samples = len(samples)
+        n_correct = sum(1 for s in samples if s.passed)
+        if n_samples < k:
+            # Cannot estimate pass@k from fewer than k samples; skip rather
+            # than silently reporting an optimistic value.
+            continue
+        per_task.append(pass_at_k(n_samples, n_correct, k))
+
+    tasks = len(by_task)
+    fully_passed = sum(1 for s in by_task.values() if any(r.passed for r in s))
     return {
-        "tasks": total,
-        "passed": passed,
-        f"pass@{k}": (pass_at_k(n, passed, k) if n > 1 else (passed / total if total else 0.0)),
+        "tasks": tasks,
+        "samples": len(results),
+        "passed": fully_passed,
+        f"pass@{k}": (sum(per_task) / len(per_task)) if per_task else 0.0,
         "by_status": by_status,
         "failures": [
             {"task_id": r.task_id, "status": r.status, "detail": r.detail}

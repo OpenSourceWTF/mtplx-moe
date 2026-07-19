@@ -216,3 +216,44 @@ def test_summarize_counts_and_lists_failures() -> None:
     assert report["pass@1"] == pytest.approx(1 / 3)
     assert report["by_status"] == {"passed": 1, "failed": 1, "timeout": 1}
     assert {f["task_id"] for f in report["failures"]} == {"b", "c"}
+
+
+# --------------------------------------------------------------------------
+# summarize with multiple samples per task
+# --------------------------------------------------------------------------
+
+
+def test_summarize_groups_samples_by_task_for_pass_at_k() -> None:
+    """pass@k is a PER-TASK estimator averaged across tasks.
+
+    The earlier signature took n= and fed the corpus-wide pass count into
+    pass_at_k, which raised as soon as that count exceeded n. Sample counts
+    are now derived per task so callers cannot get it wrong.
+    """
+
+    # 2 tasks x 4 samples. Task A: 2/4 correct. Task B: 0/4.
+    results = (
+        [ce.TaskResult("A", i < 2, "passed" if i < 2 else "failed") for i in range(4)]
+        + [ce.TaskResult("B", False, "failed") for _ in range(4)]
+    )
+    report = ce.summarize(results, k=1)
+    assert report["tasks"] == 2 and report["samples"] == 8
+    assert report["passed"] == 1, "one task had at least one correct sample"
+    # pass@1 = mean(2/4, 0/4) = 0.25
+    assert report["pass@1"] == pytest.approx(0.25)
+
+
+def test_summarize_single_sample_per_task_is_plain_accuracy() -> None:
+    results = [
+        ce.TaskResult("a", True, "passed"),
+        ce.TaskResult("b", False, "failed"),
+        ce.TaskResult("c", False, "timeout"),
+    ]
+    assert ce.summarize(results, k=1)["pass@1"] == pytest.approx(1 / 3)
+
+
+def test_summarize_skips_tasks_with_fewer_samples_than_k() -> None:
+    """Estimating pass@5 from 2 samples would be optimistic; skip instead."""
+
+    results = [ce.TaskResult("a", True, "passed"), ce.TaskResult("a", False, "failed")]
+    assert ce.summarize(results, k=5)["pass@5"] == 0.0
