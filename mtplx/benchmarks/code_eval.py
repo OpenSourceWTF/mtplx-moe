@@ -34,14 +34,12 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
-from itertools import chain
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 __all__ = [
     "CodeTask",

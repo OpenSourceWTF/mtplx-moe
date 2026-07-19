@@ -31,7 +31,6 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
-from pathlib import Path
 
 from ..qwen_guard import (
     DEFAULT_MLX_LOCK_PATH,
