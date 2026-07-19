@@ -2421,6 +2421,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pull_p.add_argument("--cache-dir")
     pull_p.add_argument("--revision")
+    pull_p.add_argument(
+        "--no-expert-banks",
+        dest="include_expert_banks",
+        action="store_false",
+        default=True,
+        help=(
+            "Skip the large *.bin streamed-expert banks. The pull still fetches "
+            "config, tokenizer, manifests and resident safetensors, and marks "
+            "the result as a deliberate partial download (not runnable)."
+        ),
+    )
     pull_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     pull_p.add_argument("--progress-json", action="store_true", help="Emit newline-delimited JSON progress events")
     pull_p.set_defaults(func=cmd_pull_public)

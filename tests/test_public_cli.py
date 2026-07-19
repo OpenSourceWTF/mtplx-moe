@@ -6805,7 +6805,15 @@ def test_profiles_command_lists_default_without_mlx(capsys):
 def test_pull_progress_json_emits_ndjson_events(tmp_path, monkeypatch, capsys):
     import mtplx.hf_loader as hf_loader
 
-    def fake_pull_model(model, *, cache_dir, revision, progress_callback, progress_interval_s):
+    def fake_pull_model(
+        model,
+        *,
+        cache_dir,
+        revision,
+        progress_callback,
+        progress_interval_s,
+        include_expert_banks=True,
+    ):
         assert model == "mtplx/example"
         assert cache_dir == str(tmp_path)
         assert revision is None

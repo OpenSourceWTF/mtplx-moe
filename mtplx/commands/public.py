@@ -4722,6 +4722,7 @@ def cmd_pull_public(args: Any) -> int:
             revision=args.revision,
             progress_callback=callback,
             progress_interval_s=progress_interval_s,
+            include_expert_banks=bool(getattr(args, "include_expert_banks", True)),
         )
     except KeyboardInterrupt:
         finalize()
@@ -4762,6 +4763,10 @@ def cmd_pull_public(args: Any) -> int:
         print(
             f"runtime contract: {str(bool(result.get('has_runtime_contract'))).lower()}"
         )
+        if result.get("partial_download"):
+            excluded = ", ".join(result.get("excluded_patterns") or []) or "some files"
+            print(f"partial download: yes (excluded {excluded})")
+            print("note: this copy is not runnable; re-pull without --no-expert-banks")
     return 0
 
 

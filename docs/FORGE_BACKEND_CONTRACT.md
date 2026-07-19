@@ -164,6 +164,21 @@ On SIGINT / SIGTERM the backend should:
 2. Leave partial files on disk for resume.
 3. Exit non-zero (the frontend treats `terminationReason == .uncaughtSignal` as `.cancelled`).
 
+`forge cancel <run_id>` additionally drops a marker file (`$MTPLX_FORGE_CANCEL_DIR`,
+default `~/.mtplx/forge-cancel/<run_id>.json`) that a running `build` or `publish`
+polls **between phases**, exiting with code 130 and the message `forge cancelled`.
+
+Marker granularity, exactly:
+
+- `build` checks after probe, after source preparation, and after conversion.
+- `publish` checks before repo creation, after repo creation, and after the
+  folder upload.
+
+A single Hub call is not interruptible from the marker. In particular, a cancel
+issued while `upload_folder` is streaming a large artifact takes effect only when
+that call returns — the bytes already in flight still finish. Use the signal path
+(step 1–3 above) if you need to stop mid-transfer.
+
 ### Backend-not-available detection
 
 When the user is on a pre-Forge MTPLX install, argparse exits with code 2 and prints `argument: invalid choice 'forge'`. The frontend matches this exact pattern in stderr and surfaces a clean "Forge backend not available" empty state. Don't change the exit code or the error string without updating the matchers in `ForgeBuilder.swift:227` and `HFPublisher.swift:170`.
