@@ -374,6 +374,23 @@ Q4-era sections above do not mention. All are on
 | `--q2-expert-kernel` | `stock`/`nax`/`fused`/`fused-nax`, default `stock` | Q2 expert execution arm. |
 | `--slot-layout` | `direct-slots`/`component-banks`/`metal-mmap` | Expert slot backing. Note the default differs by script: `component-banks` here, `direct-slots` in `benchmark_streamed_generation.py`, `probe_mtp_draft_rank.py`, and `compare_streamed_quality.py`. |
 
+**Router precision differs by checkpoint — this trips people up.** On the
+shipping Q2 line (`--model hy3-q2` → spec `hy3-expert-q2`,
+`~/.cache/huggingface/hy3-expert-only-mlx-q2`) the router gates are **BF16**,
+all 79 of them, and `--proj-quant` does not touch them: `proj_quant_covers`
+matches only `.self_attn.` and `*_proj` suffixes, and `router.gate` has
+neither. So the championship configuration runs **bf16 routers**.
+
+Q8 routers belong to the *other* artifact — `hy3-q4-mlx-mtp` and the pinned
+`pipenetwork/Hy3-4bit` snapshot (spec `hy3-q4`, whose `router_storage` is
+`"affine-q8 with fp32 correction bias"`), which is the older streamed regime.
+The design note earlier in this document recommended A/B-ing BF16 gates
+because all 79 are only ~124 MiB in BF16; the Q2 conversion took that
+recommendation, which is why the two artifacts differ.
+
+Routing is a discrete, precision-sensitive boundary; router math and selection
+run in FP32 in both cases.
+
 ### Router kernel A/B (2026-07-18, 3 reps, arms interleaved per rep)
 
 Measured on the config below; the router kernel was the only variable.
