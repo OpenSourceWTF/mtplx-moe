@@ -453,6 +453,11 @@ def load(
         install_qwen_row_owned_routers,
         prepare_qwen_row_owned_routers,
     )
+    from .a3b_whole_moe import (
+        install_a3b_whole_moe,
+        prepare_a3b_whole_moe,
+        run_a3b_whole_moe_selfcheck,
+    )
 
     from .gdn_capture import (
         install_a3b_gdn_postconv,
@@ -460,13 +465,28 @@ def load(
     )
     from .a3b_compiled_target_prefix import prepare_a3b_compiled_target_prefix
 
-    router_plan = prepare_qwen_row_owned_routers(model, config=config)
+    whole_moe_plan = prepare_a3b_whole_moe(model, config=config)
+    router_plan = (
+        prepare_qwen_row_owned_routers(model, config=config)
+        if whole_moe_plan is None
+        else None
+    )
     postconv_plan = prepare_a3b_gdn_postconv(model, config=config)
     postconv_factory = None
     from .kernel_selfcheck import maybe_run_model_selfcheck
 
     selfcheck_report = maybe_run_model_selfcheck(model)
-    if router_plan is not None:
+    if whole_moe_plan is not None:
+        selfcheck_report = run_a3b_whole_moe_selfcheck(
+            whole_moe_plan,
+            selfcheck_report,
+        )
+        whole_moe_report = install_a3b_whole_moe(
+            whole_moe_plan,
+            selfcheck_report,
+        )
+        logger.info("[a3b-whole-moe] %s", whole_moe_report)
+    elif router_plan is not None:
         router_report = install_qwen_row_owned_routers(router_plan, selfcheck_report)
         logger.info("[qwen-row-owned-router] %s", router_report)
     if postconv_plan is not None:

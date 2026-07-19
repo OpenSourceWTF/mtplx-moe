@@ -9,11 +9,13 @@ import mlx.core as mx
 import pytest
 
 import mtplx.a3b_whole_moe as whole_moe_module
+from mtplx import runtime as runtime_module
 from mtplx.a3b_whole_moe import (
     A3BWholeMoeConfigError,
     A3BWholeMoeRouteError,
     install_a3b_whole_moe,
     prepare_a3b_whole_moe,
+    run_a3b_whole_moe_selfcheck,
 )
 from mtplx.kernels import a3b_whole_moe as kernel_module
 
@@ -550,6 +552,59 @@ def _exact_selfcheck_report():
     }
 
 
+def test_model_bound_selfcheck_runs_exact_three_compiled_geometries(monkeypatch):
+    monkeypatch.setenv("MTPLX_A3B_WHOLE_MOE_FUSION", "1")
+    model, _, _ = _exact_model()
+    plan = prepare_a3b_whole_moe(model, config=_exact_config())
+    calls = []
+
+    def check(binding, *, rows):
+        calls.append((binding.variant, rows))
+        return float(rows) / 128.0
+
+    monkeypatch.setattr(whole_moe_module, "_check_whole_moe_lane", check)
+    report = run_a3b_whole_moe_selfcheck(
+        plan,
+        {"lanes": {"existing_lane": "ok"}, "dmax": {"existing_lane": 0.0}},
+    )
+
+    assert calls == [
+        ("target_q8g64_q4g64", 1),
+        ("target_q8g64_q4g64", 2),
+        ("mtp_dense_q4g32_dense", 1),
+    ]
+    assert report["lanes"] == {
+        "existing_lane": "ok",
+        "a3b_whole_moe_target_m1": "ok",
+        "a3b_whole_moe_target_m2": "ok",
+        "a3b_whole_moe_mtp_m1": "ok",
+    }
+    assert report["dmax"]["a3b_whole_moe_target_m2"] == 2.0 / 128.0
+
+
+def test_whole_moe_flag_requires_load_time_selfcheck(monkeypatch):
+    from mtplx.kernel_selfcheck import selfcheck_enabled
+
+    monkeypatch.delenv("MTPLX_KERNEL_SELFCHECK", raising=False)
+    monkeypatch.delenv("MTPLX_QWEN_ROW_OWNED_ROUTER", raising=False)
+    monkeypatch.delenv("MTPLX_FUSE_GDN_POST_CONV", raising=False)
+    monkeypatch.setenv("MTPLX_A3B_WHOLE_MOE_FUSION", "1")
+
+    assert selfcheck_enabled() is True
+
+
+def test_model_bound_selfcheck_is_deterministic_and_compilation_gated():
+    source = inspect.getsource(whole_moe_module._check_whole_moe_lane)
+
+    assert "mx.arange" in source
+    assert "mx.random" not in source
+    assert "mx.compile(route)" in source
+    assert "mx.compile(lambda current: binding.block(current))" in source
+    assert "stage1(value, binding)" in source
+    assert "stage2(value, expert_ids, binding)" in source
+    assert "mx.array_equal(expert_ids, reference_ids)" in source
+
+
 def _patch_whole_moe_stages(monkeypatch):
     def stage1(rows):
         return (
@@ -611,6 +666,13 @@ def test_successful_selfcheck_atomically_installs_all_41_blocks(monkeypatch):
     assert report["installation_status"] == "installed"
     assert report["target_blocks"] == 40
     assert report["mtp_blocks"] == 1
+    assert report["validated_contract"]["target"]["routed_gate_up"] == (
+        "affine_q4_group64_[256,1024,256]"
+    )
+    assert report["validated_contract"]["mtp"]["shared_gate_up"] == (
+        "dense_bf16_[1024,2048]"
+    )
+    assert report["selfcheck_lanes"] == _exact_selfcheck_report()["lanes"]
     assert all(
         type(block).__call__ is whole_moe_module._target_a3b_whole_moe_call
         for block in targets
@@ -685,3 +747,29 @@ def test_installed_hot_call_only_routes_on_phase_and_logical_m():
             "m2_call is not None",
         ):
             assert forbidden not in source
+
+
+def test_runtime_constructs_one_whole_block_owner_after_packing() -> None:
+    source = inspect.getsource(runtime_module.load)
+
+    packing = source.index("configure_moe_packed_projections(model)")
+    prepare_whole = source.index("prepare_a3b_whole_moe(model, config=config)")
+    prepare_router = source.index("prepare_qwen_row_owned_routers(")
+    selfcheck = source.index("maybe_run_model_selfcheck(model)")
+    whole_selfcheck = source.index("run_a3b_whole_moe_selfcheck(")
+    install_whole = source.index("install_a3b_whole_moe(")
+    install_router = source.index("install_qwen_row_owned_routers(")
+
+    assert packing < prepare_whole < prepare_router < selfcheck
+    assert selfcheck < whole_selfcheck < install_whole < install_router
+    assert "if whole_moe_plan is None" in source
+    assert "if whole_moe_plan is not None" in source
+    assert "elif router_plan is not None" in source
+
+
+def test_runtime_contract_propagates_only_the_whole_moe_enable_flag() -> None:
+    from mtplx.profiles import normalize_runtime_env_overrides
+
+    assert normalize_runtime_env_overrides(
+        {"MTPLX_A3B_WHOLE_MOE_FUSION": True}
+    ) == {"MTPLX_A3B_WHOLE_MOE_FUSION": "1"}
