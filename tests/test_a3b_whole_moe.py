@@ -909,7 +909,7 @@ def test_successful_selfcheck_atomically_installs_all_41_blocks(monkeypatch):
     )
     assert report["validated_contract"]["target"]["routes"] == {
         "M1": "row_owned_packed_gate_up_fused_down",
-        "M2": "row_owned_packed_gate_up_fused_down_row_paired",
+        "M2": "row_owned_packed_gate_up_fused_down_row_separated",
     }
     assert report["validated_contract"]["mtp"]["routes"] == {
         "M1": "row_owned_packed_gate_up_fused_down"
