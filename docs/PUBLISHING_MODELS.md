@@ -111,7 +111,14 @@ one.
 
 - **No HF token on this machine.** Blocks steps 4 and 5.
 - **Version skew.** PyPI ships `mtplx` **2.1.0**; this branch is **2.0.2**.
-  The 2.1.0 release commit (`a391973`, community-fixes: bounded MLX allocator
-  cache, re-clamped session admission under 96 GB, a q4 kv-quant crash fix,
-  `--memory-budget`) is on `upstream/main`, not here. Someone who
-  `pip install mtplx` today gets code this branch does not contain.
+  Someone who `pip install mtplx` today gets code this branch does not
+  contain: bounded MLX allocator cache, re-clamped session admission under
+  96 GB, a q4 kv-quant crash fix on the split-SDPA path, and `--memory-budget`.
+
+  Measured, so the size of the decision is clear: the 2.1.0 line
+  (`a391973`, authored by Youssof) is **8 commits / 95 files / +8,791 lines**
+  ahead of the merge base, and merging it into the default branch produces
+  **12 conflicting regions**. That is a real integration of someone else's
+  release, not a version bump — and bumping the version string without the
+  code would be worse than the skew, since it would claim fixes that are not
+  present.
