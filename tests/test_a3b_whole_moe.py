@@ -579,29 +579,89 @@ def test_all_fixed_entrypoints_launch_directly_without_runtime_validation(monkey
             lambda captured=captured: captured,
         )
         entrypoint = getattr(kernel_module, name)
+        value = _ArraySpec((rows, 2048))
         if name.endswith("stage1"):
-            result = entrypoint(_ArraySpec((rows, 2048)), binding)
+            result = entrypoint(value, binding)
             assert tuple(item.shape for item in result) == (
                 (rows, 8),
                 (rows, 8),
                 (rows, 1),
             )
+            if binding is target:
+                expected_inputs = [
+                    value,
+                    binding.router.weight,
+                    binding.router.scales,
+                    binding.router.biases,
+                    binding.shared_scalar_gate.weight,
+                    binding.shared_scalar_gate.scales,
+                    binding.shared_scalar_gate.biases,
+                ]
+            else:
+                expected_inputs = [
+                    value,
+                    binding.router.weight,
+                    binding.shared_scalar_gate.weight,
+                ]
+            expected_shapes = [(rows, 8), (rows, 8), (rows, 1)]
+            expected_dtypes = [mx.uint32, mx.bfloat16, mx.bfloat16]
         elif name.endswith("stage2"):
-            result = entrypoint(
-                _ArraySpec((rows, 2048)),
-                _ArraySpec((rows, 8), mx.uint32),
-                binding,
-            )
+            expert_ids = _ArraySpec((rows, 8), mx.uint32)
+            result = entrypoint(value, expert_ids, binding)
             assert result.shape == (rows, 9, 512)
+            expected_inputs = [
+                value,
+                expert_ids,
+                binding.routed_gate_up.weight,
+                binding.routed_gate_up.scales,
+                binding.routed_gate_up.biases,
+                binding.shared_gate_up.weight,
+            ]
+            if binding is target:
+                expected_inputs.extend(
+                    [
+                        binding.shared_gate_up.scales,
+                        binding.shared_gate_up.biases,
+                    ]
+                )
+            expected_shapes = [(rows, 9, 512)]
+            expected_dtypes = [mx.bfloat16]
         else:
+            activations = _ArraySpec((rows, 9, 512))
+            expert_ids = _ArraySpec((rows, 8), mx.uint32)
+            route_scores = _ArraySpec((rows, 8))
+            shared_gate = _ArraySpec((rows, 1))
             result = entrypoint(
-                _ArraySpec((rows, 9, 512)),
-                _ArraySpec((rows, 8), mx.uint32),
-                _ArraySpec((rows, 8)),
-                _ArraySpec((rows, 1)),
+                activations,
+                expert_ids,
+                route_scores,
+                shared_gate,
                 binding,
             )
             assert result.shape == (rows, 2048)
+            expected_inputs = [
+                activations,
+                expert_ids,
+                route_scores,
+                shared_gate,
+                binding.routed_down.weight,
+                binding.routed_down.scales,
+                binding.routed_down.biases,
+                binding.shared_down.weight,
+            ]
+            if binding is target:
+                expected_inputs.extend(
+                    [binding.shared_down.scales, binding.shared_down.biases]
+                )
+            expected_shapes = [(rows, 2048)]
+            expected_dtypes = [mx.bfloat16]
+        assert len(captured.call["inputs"]) == len(expected_inputs)
+        assert all(
+            actual is expected
+            for actual, expected in zip(captured.call["inputs"], expected_inputs)
+        )
+        assert captured.call["output_shapes"] == expected_shapes
+        assert captured.call["output_dtypes"] == expected_dtypes
         assert captured.call["grid"] == grid
         assert captured.call["threadgroup"] == threadgroup
         source = inspect.getsource(entrypoint)
@@ -644,21 +704,27 @@ def _exact_selfcheck_report():
         },
         "a3b_whole_moe_components": {
             "a3b_whole_moe_target_m1": {
+                "expert_ids": 0.0,
                 "route_scores": 0.001,
                 "shared_gate": 0.01,
                 "activations": 0.0625,
+                "stage3_output": 0.125,
                 "output": 0.125,
             },
             "a3b_whole_moe_target_m2": {
+                "expert_ids": 0.0,
                 "route_scores": 0.001,
                 "shared_gate": 0.01,
                 "activations": 0.0625,
+                "stage3_output": 0.25,
                 "output": 0.25,
             },
             "a3b_whole_moe_mtp_m1": {
+                "expert_ids": 0.0,
                 "route_scores": 0.001,
                 "shared_gate": 0.01,
                 "activations": 0.0625,
+                "stage3_output": 0.125,
                 "output": 0.125,
             },
         },
@@ -681,9 +747,11 @@ def test_model_bound_selfcheck_runs_exact_three_compiled_geometries(monkeypatch)
     def check(binding, *, rows):
         calls.append((binding.variant, rows))
         return {
+            "expert_ids": 0.0,
             "route_scores": 0.001,
             "shared_gate": 0.01,
             "activations": float(rows) / 128.0,
+            "stage3_output": float(rows) / 64.0,
             "output": float(rows) / 64.0,
         }
 
@@ -712,9 +780,11 @@ def test_model_bound_selfcheck_runs_exact_three_compiled_geometries(monkeypatch)
 
 def test_selfcheck_applies_component_specific_limits() -> None:
     assert whole_moe_module._SELFCHECK_LIMITS == {
+        "expert_ids": 0.0,
         "route_scores": 0.0078125,
         "shared_gate": 0.0625,
         "activations": 0.125,
+        "stage3_output": 0.5,
         "output": 0.5,
     }
 
@@ -739,6 +809,9 @@ def test_model_bound_selfcheck_is_deterministic_and_compilation_gated():
     assert "mx.compile(lambda current: binding.block(current))" in source
     assert "stage1(value, binding)" in source
     assert "stage2(value, expert_ids, binding)" in source
+    assert "stage3(" in source
+    assert "reference_activations" in source
+    assert '"stage3_output"' in source
     assert "mx.array_equal(expert_ids, reference_ids)" in source
 
 

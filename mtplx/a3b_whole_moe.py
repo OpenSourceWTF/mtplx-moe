@@ -92,9 +92,11 @@ class _MTPA3BWholeMoeRoute:
 
 
 _SELFCHECK_LIMITS = {
+    "expert_ids": 0.0,
     "route_scores": 0.0078125,
     "shared_gate": 0.0625,
     "activations": 0.125,
+    "stage3_output": 0.5,
     "output": 0.5,
 }
 _STATS: dict[str, Any] = {
@@ -612,10 +614,16 @@ def _check_whole_moe_lane(
             if rows == 1
             else kernel_module.target_m2_stage2
         )
+        stage3 = (
+            kernel_module.target_m1_stage3
+            if rows == 1
+            else kernel_module.target_m2_stage3
+        )
         route = _target_m1_route(binding) if rows == 1 else _target_m2_route(binding)
     else:
         stage1 = kernel_module.mtp_m1_stage1
         stage2 = kernel_module.mtp_m1_stage2
+        stage3 = kernel_module.mtp_m1_stage3
         route = _mtp_m1_route(binding)
 
     expert_ids, route_scores, shared_gate = stage1(value, binding)
@@ -658,6 +666,13 @@ def _check_whole_moe_lane(
         [routed_activations, shared_activations],
         axis=1,
     )
+    stage3_candidate = stage3(
+        reference_activations,
+        reference_ids,
+        reference_scores,
+        reference_shared_gate,
+        binding,
+    ).reshape(*value.shape)
 
     compiled_candidate = mx.compile(route)(value)
     compiled_reference = mx.compile(lambda current: binding.block(current))(value)
@@ -670,15 +685,18 @@ def _check_whole_moe_lane(
         reference_shared_gate,
         activations,
         reference_activations,
+        stage3_candidate,
         compiled_candidate,
         compiled_reference,
     )
     if not bool(mx.array_equal(expert_ids, reference_ids).item()):
         return {component: float("inf") for component in _SELFCHECK_LIMITS}
     return {
+        "expert_ids": 0.0,
         "route_scores": _max_abs_diff(route_scores, reference_scores),
         "shared_gate": _max_abs_diff(shared_gate, reference_shared_gate),
         "activations": _max_abs_diff(activations, reference_activations),
+        "stage3_output": _max_abs_diff(stage3_candidate, compiled_reference),
         "output": _max_abs_diff(compiled_candidate, compiled_reference),
     }
 
