@@ -1,6 +1,7 @@
 # Sharded safetensors expert banks
 
-**Status: design, not implemented.** Written 2026-07-18. Every number below was
+**Status: reader IMPLEMENTED 2026-07-18 (commit fff6a23). Converter not written.**
+Written 2026-07-18. Every number below was
 verified from disk; the "verified" markers say how.
 
 ## The two questions
@@ -200,3 +201,46 @@ convert artifacts one at a time.
   `conversion-manifest.json` embeds another. No secrets were found — token
   handling is stdin-only and test-enforced — but the paths leak build-machine
   detail and should be stripped by the publish path.
+
+
+---
+
+## Implementation notes 2026-07-18 — where this plan was wrong
+
+The reader landed as specified. Three corrections found while building it:
+
+**1. The single-sidecar rule was not the only blocker — and the converter will
+hit the other one.** Sidecar-kind shards are additionally required to have
+`header_bytes == 0` and `header_sha256 == EMPTY_SHA256`. That is correct for a
+raw `.bin`, and it directly contradicts a safetensors-framed part, which has a
+real JSON header. The reader sidesteps it by carrying the framing in
+`SidecarPart.data_start` and leaving the shard-kind rule alone. **A converter
+that writes real safetensors parts must reconcile this**, and the change table
+above does not mention it. This is the single most important omission here.
+
+**2. `replace(sidecar, sha256=...)` is load-bearing.** An existing test
+(`test_make_sidecar_authoritative_rejects_stale_input_digest`) relies on it, so
+the scalar single-part spelling has to work as an *override on an existing
+bank*, not merely as a construction form. A clean "parts XOR scalars"
+constructor breaks it.
+
+**3. The io tests duck-type.** `test_expert_io_metrics.py` passes
+`SimpleNamespace` records and sidecars, so reading `record.part` /
+`sidecar.parts` directly raises `AttributeError`. The read path needs `getattr`
+tolerance.
+
+Backward compatibility was verified against the real artifacts, not fixtures:
+hy3 q2/q4 (15,168 records) and glm52 q2 (19,200 records, 62 MB) each parse,
+re-serialize to a dict identical to what is on disk, and keep their
+`manifest_sha256`.
+
+Left out deliberately: the converter; `expert_banked.py` (its
+`BankedManifest.file` gap is real but unrelated — banked/rANS arms stay
+single-part and raise clearly on a multi-part bank); the codec sidecar
+(`StreamedCodecManifest` is a different type with its own offset convention);
+and the non-recursive `glob("*.safetensors")`, so parts must live at the
+artifact root — a converter constraint, not a reader bug.
+
+Unrelated pre-existing defect noticed in passing:
+`hy3-q4-mlx-mtp/conversion-manifest.json` fails to parse with
+`unknown keys: ['auxiliary_files']`.
