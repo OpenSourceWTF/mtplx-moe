@@ -1,5 +1,7 @@
 # Hy3 Q2 Fused K-Row Expert Implementation Plan
 
+**Status: NOT IMPLEMENTED (verified 2026-07-18).** None of the deliverables below landed -- `mtplx/kernels/q2_fused_expert.py`, `tests/test_q2_fused_expert.py`, `scripts/benchmark_q2_expert_kernels.py`, and `mtplx/q2_nax.py` do not exist. The fused-expert arm shipped instead as `--q2-expert-kernel {fused,nax,fused-nax}` on the depth-matrix runner. Kept as a record of the design, not as a guide to the tree.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > `superpowers-optimized:executing-plans` to implement this plan task-by-task.
 > Use `superpowers-optimized:test-driven-development` for behavior changes,
@@ -42,7 +44,7 @@ Hy3 component-bank runtime.
   counters.
 - `mtplx/kernels/q2_fused_expert.py`: assignment-indexed Q2
   gate+up+SwiGLU and down kernels.
-- `mtplx/kernels/hy3_router_fp32.py`: batched fused FP32 router projection,
+- `mtplx/hy3_router_fp32.py`: batched fused FP32 router projection,
   deterministic top-k, normalization, and scaling.
 - `scripts/benchmark_q2_expert_kernels.py`: real-record operator benchmark for
   stock, NAX, fused, and fused-NAX arms.
@@ -284,7 +286,7 @@ Expected: complete K=0...6 NAX table before fused-kernel timing begins.
 
 **Files:**
 
-- Create: `mtplx/kernels/hy3_router_fp32.py`
+- Create: `mtplx/hy3_router_fp32.py`
 - Create: `tests/test_hy3_router_fp32.py`
 - Modify: `mtplx/models/hy3_mlx.py`
 - Modify: `mtplx/models/expert_mlx.py`
@@ -510,7 +512,7 @@ all Issue 51 event/cache/final-state gates and exact token parity.
   tests/test_benchmark_q2_expert_kernels.py \
   tests/test_benchmark_q2_mtp_depth_matrix.py
 .venv/bin/ruff check mtplx/q2_nax.py mtplx/kernels/q2_fused_expert.py \
-  mtplx/kernels/hy3_router_fp32.py mtplx/models/hy3_mlx.py \
+  mtplx/hy3_router_fp32.py mtplx/models/hy3_mlx.py \
   mtplx/models/expert_mlx.py mtplx/expert_runtime.py \
   scripts/benchmark_q2_expert_kernels.py \
   scripts/benchmark_q2_mtp_depth_matrix.py tests

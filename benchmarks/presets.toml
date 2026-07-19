@@ -47,7 +47,6 @@ MTPLX_SUSTAINED_PREFILL = "1"
 description = "All 79 routed layers pinned resident; nothing streams from SSD."
 extends = "hy3-q2"
 island-layer-count = 79
-proj-quant = "q4"
 q2-expert-kernel = "stock"
 verify-strategy = "capture_commit"
 compiled-verify-mode = "off"
@@ -66,13 +65,22 @@ MTPLX_HY3_SUBMIT_CADENCE = "8"
 description = "The 40.59 tok/s configuration (router A/B winner, 2026-07-18)."
 extends = "full-residency"
 hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
+proj-quant = "q4"
+
+[preset.championship-bf16proj]
+description = "Championship with the trunk projections left at BF16. ~+10.3 GiB resident; needs --memory-limit 112GiB."
+extends = "full-residency"
+hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
+memory-limit = "112GiB"
 
 [preset.shipped-default]
 description = "Same envelope as championship but the SHIPPED router kernel. The A/B baseline (40.01)."
 extends = "full-residency"
 hy3-router-kernel = "mpp-r1-fused-r2"
+proj-quant = "q4"
 
 [preset.streamed]
+proj-quant = "q4"
 description = "SSD-streamed experts (the ~6 tok/s regime). Islands off, real expert cache."
 extends = "hy3-q2"
 island-layer-count = 0

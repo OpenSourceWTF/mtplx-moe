@@ -7,6 +7,8 @@
 
 ## Objective
 
+**Status: NOT IMPLEMENTED (verified 2026-07-18).** Every deliverable is absent -- the `tests/parity/`, `tests/integration/`, and `docs/benchmarks/` directories do not exist, and no parser accepts the `--mode ar|mtp` or `--mtp-manifest` flags described below. Kept as a design record.
+
 Build a reproducible correctness and performance gate for Hy3 Q4 and GLM-5.2
 Q4 expert streaming. Ship autoregressive (AR) streaming first. Treat MTP as a
 separate artifact and correctness milestone, because both community Q4 targets

@@ -282,7 +282,7 @@ Backend behaviour:
 
 For the build pipeline, generalise the existing one-off scripts:
 
-- `/Users/youssof/Documents/MTPLX/scripts/build_flat4_cyankiwi_mtp_requant.py` — the 27B requant path that built `Qwen3.6-27B-MTPLX-Optimized-Speed`. Handles the MLX-affine → MLX-affine requantisation case (body bits picker, MTP sidecar repack, runtime_metadata write, trunk symlink). Forge's bf16Native / mlxAffine / mlxAffineWithMtp source-format paths all collapse to variations of this script.
+- `build_flat4_cyankiwi_mtp_requant.py` (external, not in this repo) — the 27B requant path that built `Qwen3.6-27B-MTPLX-Optimized-Speed`. Handles the MLX-affine → MLX-affine requantisation case (body bits picker, MTP sidecar repack, runtime_metadata write, trunk symlink). Forge's bf16Native / mlxAffine / mlxAffineWithMtp source-format paths all collapse to variations of this script.
 - (To be written) **35B compressed-tensors AWQ → MLX-affine** — genuinely new work. The existing 35B artifacts (`/Users/youssof/Documents/MTPLX/models/Qwen3.6-35B-A3B-MTPLX-Official-4bit-*`) already pass the MoE MTP gate (commits `939b537`, `9f5b7be`, `739415b`) so the runtime side is ready; only the conversion is missing.
 
 ---

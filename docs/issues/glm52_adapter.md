@@ -35,7 +35,7 @@ config.
 
 ## Proposed files and integration seam
 
-- `mtplx/models/glm52_streaming.py`
+- `mtplx/models/glm52_mlx.py`
   - resident GLM-5.2 module wrapper, FP32 router, IndexShare schedule, resident
     shared expert, and streamed `HotExpertSwitchGLU`.
 - `mtplx/models/hot_expert_switch_glu.py`
@@ -46,7 +46,7 @@ config.
     `mlx_lm.load` before expert tensors are intercepted.
 - `mtplx/runtime.py`
   - branch to the streamed loader before the current generic load seam.
-- `tests/test_glm52_streaming.py`
+- `tests/test_glm52_streamed_mtp.py`
   - tensor allowlist, router math, IndexShare, shape, and end-to-end parity.
 
 Base IndexShare support on the relevant upstream `mlx-lm` GLM-5.2 work (PR
