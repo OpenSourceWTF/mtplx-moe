@@ -442,3 +442,47 @@ with exclusive_mlx_lock(timeout_seconds=28800.0):
 ```
 
 Aborts cluster at window start, so discard a warm-up cell before measuring.
+
+### Presets — don't memorize the flags
+
+The reference configuration above is a named preset. These are equivalent:
+
+```bash
+# the 25-flag command
+python3 scripts/benchmark_q2_mtp_depth_matrix.py --model hy3-q2 --contexts 2048 ... 
+
+# the same thing
+python3 scripts/benchmark_q2_mtp_depth_matrix.py --preset championship
+```
+
+```bash
+--list-presets              # what's defined, one line each
+--show-preset championship  # the fully expanded flags + env, without running
+--preset championship       # run it
+--preset championship --proj-quant q8   # run it with one flag substituted
+```
+
+Presets are applied as argparse **defaults**, so anything you type explicitly
+beats the preset — there is no precedence surprise. Order is:
+
+    runner defaults  <  preset (through its `extends` chain)  <  typed flags
+
+Shipped presets live in `benchmarks/presets.toml` (in-repo, so a change to an
+operating point is a reviewable diff). Machine-local bundles that shouldn't be
+committed go in `~/.mtplx/benchmark-presets.toml`, which layers on top.
+
+| Preset | What it is |
+| --- | --- |
+| `hy3-q2` | Base: Q2 streamed experts + BF16 layer-80 MTP head |
+| `full-residency` | All 79 layers resident, nothing streams |
+| `championship` | The 40.59 tok/s router A/B winner |
+| `shipped-default` | Same envelope, shipped router kernel (the 40.01 baseline) |
+| `streamed` | The ~6 tok/s SSD-streamed regime |
+| `q8-projections` | Championship with `--proj-quant q8` |
+| `k3` | Championship at depth 3 (a measured net loss; kept for reproduction) |
+| `kv-q8` | Championship with a q8 KV cache |
+| `telemetry` / `roofline` | Diagnostic variants |
+
+A preset naming a flag the runner doesn't have is a **hard error**, not a
+silent no-op — a preset that quietly drops `--proj-quant` would be a silently
+different experiment. Values are checked against each flag's `choices` too.

@@ -25,6 +25,11 @@ from mtplx.benchmarks.resource_telemetry import (  # noqa: E402
     PowermetricsCollector,
     ResourceTelemetrySampler,
 )
+from mtplx.benchmarks.presets import (  # noqa: E402
+    PresetError,
+    add_preset_arguments,
+    preselect_preset,
+)
 from mtplx.optimization_profiles import (  # noqa: E402
     profile_conflict_warnings,
 )
@@ -246,6 +251,7 @@ def _integer_csv(value: str) -> tuple[int, ...]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_preset_arguments(parser)
     parser.add_argument(
         "--model",
         dest="models",
@@ -2928,7 +2934,21 @@ def _write_json_atomic(path: Path, rendered: str) -> None:
 
 def main(argv: Sequence[str] | None = None, *, apis: RunnerAPIs | None = None) -> int:
     parser = build_parser()
+    # Presets are pushed in as DEFAULTS before parse_args, so an explicitly
+    # typed flag still wins. --list-presets / --show-preset exit here.
+    try:
+        preset = preselect_preset(
+            parser, list(sys.argv[1:] if argv is None else argv)
+        )
+    except PresetError as exc:
+        parser.error(str(exc))
     args = parser.parse_args(argv)
+    if preset is not None:
+        print(
+            f"[preset] {preset.name}"
+            + (f" ({' -> '.join(preset.chain)})" if len(preset.chain) > 1 else ""),
+            file=sys.stderr,
+        )
     if args.kv_quant and args.verify_strategy == "capture_commit":
         parser.error(
             "--kv-quant requires --verify-strategy batched: capture_commit "
