@@ -172,12 +172,25 @@ convert artifacts one at a time.
   conventions (banked offsets are region-relative — a second, incompatible
   scheme). They are experimental arms, not publishable deliverables, and are out
   of scope.
-- **A live bug, unrelated but adjacent:** the top-level
+- **The `rans-shards` artifact is unloadable, and that is the code working.**
   `expert-streamed-codec-rans32x.json` carries `size` 12,784,969,412 and
-  shard00's `sha256`, while the file it describes is 194,261,709,700 bytes —
-  both fields were copied from `rans-shards/shard00.json` instead of being
-  recomputed for the concatenation. Verified by direct comparison. Any load
-  with `verify_sidecar_hash_at_open` fails on that artifact.
+  shard00's `sha256` while describing a 194,261,709,700-byte file — both
+  copied verbatim from `rans-shards/shard00.json` instead of being recomputed
+  for the concatenation. Verified by direct comparison.
+
+  But it never gets that far: `load_streamed_codec_manifest` **rejects it
+  outright** with `streamed codec record (8, 0) is not aligned`, so the
+  rebased offsets are also not on the 16 KiB boundary the format requires.
+  It fails closed at load, unconditionally — not only under
+  `verify_sidecar_hash_at_open`, which is what I first assumed.
+
+  So there is **no code fix owed here.** The validation caught a hand-merged
+  artifact, which is exactly its job. The artifact is an experimental arm and
+  is not a publishable deliverable; the producing script is not in version
+  control. If that lane is ever revived, the merge step needs to recompute
+  `size`/`sha256` and re-align offsets — which the parts-aware design above
+  would make unnecessary, because per-shard digests replace the concatenated
+  whole-file digest entirely.
 - Publishing itself. `forge publish` is one `upload_folder` call with no
   chunking, resume, retry, or filtering; a failed 90 GB upload leaves
   `bytes_uploaded: 0` and no way to resume. Sharding makes that *survivable*
