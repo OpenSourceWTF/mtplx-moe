@@ -8,8 +8,11 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
+import mtplx.a3b_whole_moe as whole_moe_module
 from mtplx.a3b_whole_moe import (
     A3BWholeMoeConfigError,
+    A3BWholeMoeRouteError,
+    install_a3b_whole_moe,
     prepare_a3b_whole_moe,
 )
 from mtplx.kernels import a3b_whole_moe as kernel_module
@@ -26,6 +29,28 @@ class _ArraySpec:
         self.shape = tuple(shape)
         self.ndim = len(self.shape)
         self.dtype = dtype
+
+    def reshape(self, *shape):
+        return _ArraySpec(shape, self.dtype)
+
+
+class _ResultSpec(_ArraySpec):
+    def __init__(self, label: str, shape) -> None:
+        super().__init__(shape)
+        self.label = label
+
+    def reshape(self, *shape):
+        return _ResultSpec(self.label, shape)
+
+
+class _FakeSparseBlock:
+    def __init__(self, **attributes) -> None:
+        vars(self).update(attributes)
+        self.stock_calls = []
+
+    def __call__(self, value):
+        self.stock_calls.append(value)
+        return _ResultSpec("stock", value.shape)
 
 
 class _Projection:
@@ -128,7 +153,7 @@ def _sparse_block(*, gate, routed_group_size: int, shared_quantized: bool, scala
             up_proj=_Projection((512, 2048)),
             down_proj=_Projection((2048, 512)),
         )
-    return SimpleNamespace(
+    return _FakeSparseBlock(
         gate=gate,
         switch_mlp=switch_mlp,
         shared_expert=shared_expert,
@@ -500,5 +525,152 @@ def test_all_fixed_entrypoints_launch_directly_without_runtime_validation(monkey
             "try:",
             "except",
             "raise ",
+        ):
+            assert forbidden not in source
+
+
+def _exact_selfcheck_report():
+    return {
+        "lanes": {
+            "a3b_whole_moe_target_m1": "ok",
+            "a3b_whole_moe_target_m2": "ok",
+            "a3b_whole_moe_mtp_m1": "ok",
+        }
+    }
+
+
+def _patch_whole_moe_stages(monkeypatch):
+    def stage1(rows):
+        return (
+            _ArraySpec((rows, 8), mx.uint32),
+            _ArraySpec((rows, 8)),
+            _ArraySpec((rows, 1)),
+        )
+
+    monkeypatch.setattr(
+        kernel_module, "target_m1_stage1", lambda value, binding: stage1(1)
+    )
+    monkeypatch.setattr(
+        kernel_module, "target_m2_stage1", lambda value, binding: stage1(2)
+    )
+    monkeypatch.setattr(
+        kernel_module, "mtp_m1_stage1", lambda value, binding: stage1(1)
+    )
+    monkeypatch.setattr(
+        kernel_module,
+        "target_m1_stage2",
+        lambda value, ids, binding: _ArraySpec((1, 9, 512)),
+    )
+    monkeypatch.setattr(
+        kernel_module,
+        "target_m2_stage2",
+        lambda value, ids, binding: _ArraySpec((2, 9, 512)),
+    )
+    monkeypatch.setattr(
+        kernel_module,
+        "mtp_m1_stage2",
+        lambda value, ids, binding: _ArraySpec((1, 9, 512)),
+    )
+    monkeypatch.setattr(
+        kernel_module,
+        "target_m1_stage3",
+        lambda *args: _ResultSpec("target_m1", (1, 2048)),
+    )
+    monkeypatch.setattr(
+        kernel_module,
+        "target_m2_stage3",
+        lambda *args: _ResultSpec("target_m2", (2, 2048)),
+    )
+    monkeypatch.setattr(
+        kernel_module,
+        "mtp_m1_stage3",
+        lambda *args: _ResultSpec("mtp_m1", (1, 2048)),
+    )
+
+
+def test_successful_selfcheck_atomically_installs_all_41_blocks(monkeypatch):
+    monkeypatch.setenv("MTPLX_A3B_WHOLE_MOE_FUSION", "1")
+    model, targets, mtp = _exact_model()
+    original_classes = tuple(type(block) for block in (*targets, *mtp))
+    plan = prepare_a3b_whole_moe(model, config=_exact_config())
+    assert tuple(type(block) for block in (*targets, *mtp)) == original_classes
+
+    report = install_a3b_whole_moe(plan, _exact_selfcheck_report())
+
+    assert report["installation_status"] == "installed"
+    assert report["target_blocks"] == 40
+    assert report["mtp_blocks"] == 1
+    assert all(
+        type(block).__call__ is whole_moe_module._target_a3b_whole_moe_call
+        for block in targets
+    )
+    assert type(mtp[0]).__call__ is whole_moe_module._mtp_a3b_whole_moe_call
+
+
+def test_selfcheck_failure_prevents_every_installation(monkeypatch):
+    monkeypatch.setenv("MTPLX_A3B_WHOLE_MOE_FUSION", "1")
+    model, targets, mtp = _exact_model()
+    original_classes = tuple(type(block) for block in (*targets, *mtp))
+    plan = prepare_a3b_whole_moe(model, config=_exact_config())
+
+    with pytest.raises(A3BWholeMoeConfigError, match="self-check"):
+        install_a3b_whole_moe(
+            plan,
+            {"lanes": {"a3b_whole_moe_target_m1": "fallback"}},
+        )
+
+    assert tuple(type(block) for block in (*targets, *mtp)) == original_classes
+
+
+def test_installed_route_uses_explicit_prefill_and_direct_small_row_calls(monkeypatch):
+    monkeypatch.setenv("MTPLX_A3B_WHOLE_MOE_FUSION", "1")
+    _patch_whole_moe_stages(monkeypatch)
+    phase = {"value": "prefill"}
+    monkeypatch.setattr(
+        whole_moe_module,
+        "current_attention_phase",
+        lambda: phase["value"],
+    )
+    model, targets, mtp = _exact_model()
+    plan = prepare_a3b_whole_moe(model, config=_exact_config())
+    install_a3b_whole_moe(plan, _exact_selfcheck_report())
+
+    assert targets[0](_ArraySpec((1, 64, 2048))).label == "stock"
+    phase["value"] = "ar_decode"
+    assert targets[0](_ArraySpec((1, 1, 2048))).label == "target_m1"
+    assert mtp[0](_ArraySpec((1, 1, 2048))).label == "mtp_m1"
+    phase["value"] = "decode_verify"
+    assert targets[0](_ArraySpec((1, 2, 2048))).label == "target_m2"
+    with pytest.raises(A3BWholeMoeRouteError, match="rows=3"):
+        targets[0](_ArraySpec((1, 3, 2048)))
+    assert len(targets[0].stock_calls) == 1
+
+
+def test_installed_hot_call_only_routes_on_phase_and_logical_m():
+    for hot_call in (
+        whole_moe_module._target_a3b_whole_moe_call,
+        whole_moe_module._mtp_a3b_whole_moe_call,
+    ):
+        source = inspect.getsource(hot_call)
+        assert "current_attention_phase" in source
+        assert "value.shape" in source
+        for forbidden in (
+            "os.environ",
+            ".dtype",
+            "bits",
+            "group_size",
+            "eligible",
+            "selfcheck",
+            "installed",
+            "installation_status",
+            "_STATS",
+            "fallback",
+            "lane_disabled",
+            "try:",
+            "except",
+            "switch_mlp",
+            "shared_expert",
+            "mx.softmax",
+            "m2_call is not None",
         ):
             assert forbidden not in source

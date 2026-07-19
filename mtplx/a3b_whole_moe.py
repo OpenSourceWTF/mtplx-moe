@@ -8,10 +8,14 @@ Metal stages pass their exact self-checks.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import mlx.core as mx
+
+from .attention_context import current_attention_phase
+from .kernels import a3b_whole_moe as kernel_module
 
 
 A3BWholeMoeVariant = Literal[
@@ -26,6 +30,10 @@ _A3B_LAYER_TYPES = tuple(
 
 class A3BWholeMoeConfigError(RuntimeError):
     """The external model contract cannot install the whole-MoE route."""
+
+
+class A3BWholeMoeRouteError(RuntimeError):
+    """A request reached a phase or row geometry outside its installed route."""
 
 
 @dataclass(frozen=True)
@@ -59,6 +67,34 @@ class A3BWholeMoeInstallPlan:
 
     target_bindings: tuple[A3BWholeMoeBinding, ...]
     mtp_bindings: tuple[A3BWholeMoeBinding, ...]
+
+
+@dataclass(frozen=True)
+class _TargetA3BWholeMoeRoute:
+    """Prebound execution selected only after the exact contract passes."""
+
+    stock_call: Callable[[Any, Any], Any]
+    m1_call: Callable[[Any], Any]
+    m2_call: Callable[[Any], Any]
+
+
+@dataclass(frozen=True)
+class _MTPA3BWholeMoeRoute:
+    """Prebound MTP execution with no representable M2 implementation."""
+
+    stock_call: Callable[[Any, Any], Any]
+    m1_call: Callable[[Any], Any]
+
+
+_INSTALLED_BLOCKS: list[tuple[Any, type]] = []
+_STATS: dict[str, Any] = {
+    "enabled": False,
+    "installed": False,
+    "installation_status": "disabled",
+    "installation_error": None,
+    "target_blocks": 0,
+    "mtp_blocks": 0,
+}
 
 
 def a3b_whole_moe_enabled() -> bool:
@@ -377,4 +413,221 @@ def prepare_a3b_whole_moe(
             )
             for layer in mtp_layers
         ),
+    )
+
+
+def _target_m1_route(binding: A3BWholeMoeBinding) -> Callable[[Any], Any]:
+    stage1 = kernel_module.target_m1_stage1
+    stage2 = kernel_module.target_m1_stage2
+    stage3 = kernel_module.target_m1_stage3
+
+    def call(value: Any) -> Any:
+        expert_ids, route_scores, shared_gate = stage1(value, binding)
+        activations = stage2(value, expert_ids, binding)
+        output = stage3(
+            activations,
+            expert_ids,
+            route_scores,
+            shared_gate,
+            binding,
+        )
+        return output.reshape(*value.shape)
+
+    return call
+
+
+def _target_m2_route(binding: A3BWholeMoeBinding) -> Callable[[Any], Any]:
+    stage1 = kernel_module.target_m2_stage1
+    stage2 = kernel_module.target_m2_stage2
+    stage3 = kernel_module.target_m2_stage3
+
+    def call(value: Any) -> Any:
+        expert_ids, route_scores, shared_gate = stage1(value, binding)
+        activations = stage2(value, expert_ids, binding)
+        output = stage3(
+            activations,
+            expert_ids,
+            route_scores,
+            shared_gate,
+            binding,
+        )
+        return output.reshape(*value.shape)
+
+    return call
+
+
+def _mtp_m1_route(binding: A3BWholeMoeBinding) -> Callable[[Any], Any]:
+    stage1 = kernel_module.mtp_m1_stage1
+    stage2 = kernel_module.mtp_m1_stage2
+    stage3 = kernel_module.mtp_m1_stage3
+
+    def call(value: Any) -> Any:
+        expert_ids, route_scores, shared_gate = stage1(value, binding)
+        activations = stage2(value, expert_ids, binding)
+        output = stage3(
+            activations,
+            expert_ids,
+            route_scores,
+            shared_gate,
+            binding,
+        )
+        return output.reshape(*value.shape)
+
+    return call
+
+
+def _target_a3b_whole_moe_call(self: Any, value: Any) -> Any:
+    """Route the target block only on phase and logical rows."""
+
+    route = type(self)._mtplx_a3b_whole_moe_route
+    phase = current_attention_phase()
+    if phase == "prefill":
+        return route.stock_call(self, value)
+    rows = math.prod(int(dimension) for dimension in value.shape[:-1])
+    if rows == 1 and phase in {"ar_decode", "decode_verify"}:
+        return route.m1_call(value)
+    if rows == 2 and phase == "decode_verify":
+        return route.m2_call(value)
+    raise A3BWholeMoeRouteError(
+        f"whole-MoE has no constructed route for phase={phase!r}, rows={rows}"
+    )
+
+
+def _mtp_a3b_whole_moe_call(self: Any, value: Any) -> Any:
+    """Route the MTP block only on phase and its constructed M1 geometry."""
+
+    route = type(self)._mtplx_a3b_whole_moe_route
+    phase = current_attention_phase()
+    if phase == "prefill":
+        return route.stock_call(self, value)
+    rows = math.prod(int(dimension) for dimension in value.shape[:-1])
+    if rows == 1 and phase in {"ar_decode", "decode_verify"}:
+        return route.m1_call(value)
+    raise A3BWholeMoeRouteError(
+        f"whole-MoE has no constructed MTP route for phase={phase!r}, rows={rows}"
+    )
+
+
+def _installed_class(
+    base_class: type,
+    route: _TargetA3BWholeMoeRoute | _MTPA3BWholeMoeRoute,
+    *,
+    index: int,
+    variant: A3BWholeMoeVariant,
+) -> type:
+    call = (
+        _target_a3b_whole_moe_call
+        if variant == "target_q8g64_q4g64"
+        else _mtp_a3b_whole_moe_call
+    )
+    return type(
+        f"A3BWholeMoe{index}_{variant}_{base_class.__name__}",
+        (base_class,),
+        {
+            "__module__": __name__,
+            "__call__": call,
+            "_mtplx_a3b_whole_moe_route": route,
+        },
+    )
+
+
+def _route_for_binding(
+    binding: A3BWholeMoeBinding,
+) -> _TargetA3BWholeMoeRoute | _MTPA3BWholeMoeRoute:
+    stock_call = type(binding.block).__call__
+    if binding.variant == "target_q8g64_q4g64":
+        return _TargetA3BWholeMoeRoute(
+            stock_call=stock_call,
+            m1_call=_target_m1_route(binding),
+            m2_call=_target_m2_route(binding),
+        )
+    return _MTPA3BWholeMoeRoute(
+        stock_call=stock_call,
+        m1_call=_mtp_m1_route(binding),
+    )
+
+
+def install_a3b_whole_moe(
+    plan: A3BWholeMoeInstallPlan,
+    selfcheck_report: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Atomically install all 41 exact routes after their fixed self-checks."""
+
+    lanes = {} if selfcheck_report is None else selfcheck_report.get("lanes", {})
+    required_lanes = (
+        "a3b_whole_moe_target_m1",
+        "a3b_whole_moe_target_m2",
+        "a3b_whole_moe_mtp_m1",
+    )
+    failed = tuple(lane for lane in required_lanes if lanes.get(lane) != "ok")
+    if failed:
+        _STATS.update(
+            {
+                "enabled": True,
+                "installed": False,
+                "installation_status": "configuration_error",
+                "installation_error": (
+                    "whole-MoE self-check failed for " + ", ".join(failed)
+                ),
+            }
+        )
+        raise A3BWholeMoeConfigError(_STATS["installation_error"])
+
+    bindings = (*plan.target_bindings, *plan.mtp_bindings)
+    prepared = tuple(
+        (
+            binding.block,
+            type(binding.block),
+            _installed_class(
+                type(binding.block),
+                _route_for_binding(binding),
+                index=index,
+                variant=binding.variant,
+            ),
+        )
+        for index, binding in enumerate(bindings)
+    )
+    changed: list[tuple[Any, type]] = []
+    try:
+        for block, original_class, installed_class in prepared:
+            block.__class__ = installed_class
+            changed.append((block, original_class))
+    except Exception:
+        for block, original_class in reversed(changed):
+            block.__class__ = original_class
+        raise
+
+    _INSTALLED_BLOCKS.extend(changed)
+    _STATS.update(
+        {
+            "enabled": True,
+            "installed": True,
+            "installation_status": "installed",
+            "installation_error": None,
+            "target_blocks": len(plan.target_bindings),
+            "mtp_blocks": len(plan.mtp_bindings),
+        }
+    )
+    return a3b_whole_moe_stats()
+
+
+def a3b_whole_moe_stats() -> dict[str, Any]:
+    """Return construction status without execution-path counters."""
+
+    return dict(_STATS)
+
+
+def _reset_a3b_whole_moe_for_tests() -> None:
+    for block, original_class in reversed(_INSTALLED_BLOCKS):
+        block.__class__ = original_class
+    _INSTALLED_BLOCKS.clear()
+    _STATS.update(
+        {
+            "enabled": False,
+            "installed": False,
+            "installation_status": "disabled",
+            "installation_error": None,
+            "target_blocks": 0,
+            "mtp_blocks": 0,
+        }
     )
