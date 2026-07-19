@@ -541,15 +541,17 @@ def _target_stage3_source() -> str:
     return """
         constexpr uint ROUTED_GROUP = 64;
         constexpr uint VALUES_PER_LANE = 16;
+        constexpr uint OUTPUT_TILES = HIDDEN / 16;
 
-        uint tile = threadgroup_position_in_grid.x;
+        uint group = threadgroup_position_in_grid.x;
+        uint row = group / OUTPUT_TILES;
+        uint tile = group - row * OUTPUT_TILES;
         uint simd_gid = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
         uint output_base = tile * 16 + simd_gid * 4;
 
-        for (uint row = 0; row < ROWS; ++row) {
-            bfloat routed_accumulator[4] = {
-                bfloat(0.0f), bfloat(0.0f), bfloat(0.0f), bfloat(0.0f)};
+        bfloat routed_accumulator[4] = {
+            bfloat(0.0f), bfloat(0.0f), bfloat(0.0f), bfloat(0.0f)};
             for (uint slot = 0; slot < TOP_K; ++slot) {
                 uint expert = expert_ids[row * TOP_K + slot];
                 const device uchar* down_bytes =
@@ -681,7 +683,6 @@ def _target_stage3_source() -> str:
                         float(routed_accumulator[result_index])
                         + float(gated_shared));
                 }
-            }
         }
     """
 
@@ -690,15 +691,17 @@ def _mtp_stage3_source() -> str:
     return """
         constexpr uint ROUTED_GROUP = 32;
         constexpr uint VALUES_PER_LANE = 16;
+        constexpr uint OUTPUT_TILES = HIDDEN / 16;
 
-        uint tile = threadgroup_position_in_grid.x;
+        uint group = threadgroup_position_in_grid.x;
+        uint row = group / OUTPUT_TILES;
+        uint tile = group - row * OUTPUT_TILES;
         uint simd_gid = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
         uint output_base = tile * 16 + simd_gid * 4;
 
-        for (uint row = 0; row < ROWS; ++row) {
-            bfloat routed_accumulator[4] = {
-                bfloat(0.0f), bfloat(0.0f), bfloat(0.0f), bfloat(0.0f)};
+        bfloat routed_accumulator[4] = {
+            bfloat(0.0f), bfloat(0.0f), bfloat(0.0f), bfloat(0.0f)};
             for (uint slot = 0; slot < TOP_K; ++slot) {
                 uint expert = expert_ids[row * TOP_K + slot];
                 const device uchar* down_bytes =
@@ -796,7 +799,6 @@ def _mtp_stage3_source() -> str:
                         float(routed_accumulator[result_index])
                         + float(gated_shared));
                 }
-            }
         }
     """
 
@@ -828,7 +830,10 @@ def whole_moe_launch_table() -> dict[str, tuple[tuple[int, int, int], tuple[int,
         "target_m2_stage2": ((STAGE2_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
         "mtp_m1_stage2": ((STAGE2_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
         "target_m1_stage3": ((STAGE3_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
-        "target_m2_stage3": ((STAGE3_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
+        "target_m2_stage3": (
+            (2 * STAGE3_THREADGROUPS * 128, 1, 1),
+            (128, 1, 1),
+        ),
         "mtp_m1_stage3": ((STAGE3_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
     }
 
@@ -1153,7 +1158,7 @@ def _launch_target_stage3(
         inputs=_target_stage3_inputs(
             activations, expert_ids, route_scores, shared_gate, binding
         ),
-        grid=(STAGE3_THREADGROUPS * TILED_THREADS, 1, 1),
+        grid=(rows * STAGE3_THREADGROUPS * TILED_THREADS, 1, 1),
         threadgroup=(TILED_THREADS, 1, 1),
         output_shapes=[(rows, HIDDEN)],
         output_dtypes=[mx.bfloat16],

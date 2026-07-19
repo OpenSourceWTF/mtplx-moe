@@ -494,7 +494,7 @@ def test_fixed_entrypoint_launch_table(monkeypatch):
         "target_m2_stage2": ((288 * 128, 1, 1), (128, 1, 1)),
         "mtp_m1_stage2": ((288 * 128, 1, 1), (128, 1, 1)),
         "target_m1_stage3": ((128 * 128, 1, 1), (128, 1, 1)),
-        "target_m2_stage3": ((128 * 128, 1, 1), (128, 1, 1)),
+        "target_m2_stage3": ((2 * 128 * 128, 1, 1), (128, 1, 1)),
         "mtp_m1_stage3": ((128 * 128, 1, 1), (128, 1, 1)),
     }
     assert kernel_module.whole_moe_launch_table() == expected
@@ -561,6 +561,17 @@ def test_stage3_sources_encode_down_reduction_shared_gate_and_only_final_store()
     assert "qdot4_affine" in source
     assert "dense_shared_down" in source
     assert "output[output_index] = bfloat(" in source
+
+
+def test_stage3_sources_assign_one_exact_row_per_threadgroup():
+    sources = kernel_module.all_whole_moe_sources()
+    for name in ("target_m1_stage3", "target_m2_stage3", "mtp_m1_stage3"):
+        source = sources[name]
+        assert "constexpr uint OUTPUT_TILES = HIDDEN / 16" in source
+        assert "uint group = threadgroup_position_in_grid.x" in source
+        assert "uint row = group / OUTPUT_TILES" in source
+        assert "uint tile = group - row * OUTPUT_TILES" in source
+        assert "for (uint row = 0; row < ROWS; ++row)" not in source
 
 
 def test_all_fixed_entrypoints_launch_directly_without_runtime_validation(monkeypatch):
