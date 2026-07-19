@@ -182,3 +182,92 @@ def test_resume_continues_interrupted_burn_bitwise(tmp_path: Path) -> None:
     ]
     assert resumed.records[0].segments == fresh.records[0].segments
     list(verify_q1_against_source(resumed, source, root, sample=2))
+
+
+def test_resume_refuses_a_changed_selection(tmp_path: Path) -> None:
+    """A resume whose selection moved must not relabel the old bytes.
+
+    The record identity axis is ``(layer, expert)``; this fixture has one
+    routed layer, so the selection is moved along the expert axis. The
+    guard compares the full identity, so a changed ``layers=`` set trips
+    the same check.
+    """
+
+    root, spec, manifest_path = _shadow_hy3_artifact(tmp_path, expert_count=4)
+    source = load_expert_manifest(manifest_path)
+    output = tmp_path / "q1"
+
+    convert_expert_q1(
+        source, root, output, codec="t158", spec=spec, layers=(1,), experts=(0, 1)
+    )
+    (output / "expert-manifest-q1-t158.json").unlink()
+
+    with pytest.raises(Q1ManifestError, match="identity"):
+        convert_expert_q1(
+            source,
+            root,
+            output,
+            codec="t158",
+            spec=spec,
+            layers=(1,),
+            experts=(2, 3),
+            resume=True,
+        )
+
+
+def test_resume_refuses_without_a_progress_journal(tmp_path: Path) -> None:
+    root, spec, manifest_path = _shadow_hy3_artifact(tmp_path)
+    source = load_expert_manifest(manifest_path)
+    output = tmp_path / "q1"
+
+    convert_expert_q1(
+        source, root, output, codec="t158", spec=spec, layers=(1,), limit=1
+    )
+    (output / "expert-manifest-q1-t158.json").unlink()
+    (output / "experts-q1-t158.progress.jsonl").unlink()
+
+    with pytest.raises(Q1ManifestError, match="progress journal"):
+        convert_expert_q1(
+            source, root, output, codec="t158", spec=spec, layers=(1,), resume=True
+        )
+
+
+def test_resume_rejects_bytes_that_do_not_match_the_journaled_hash(
+    tmp_path: Path,
+) -> None:
+    root, spec, manifest_path = _shadow_hy3_artifact(tmp_path)
+    source = load_expert_manifest(manifest_path)
+    output = tmp_path / "q1"
+
+    convert_expert_q1(
+        source, root, output, codec="t158", spec=spec, layers=(1,), limit=1
+    )
+    (output / "expert-manifest-q1-t158.json").unlink()
+    bin_path = output / "experts-q1-t158.bin"
+    payload = bytearray(bin_path.read_bytes())
+    payload[3] ^= 0xFF
+    bin_path.write_bytes(bytes(payload))
+
+    with pytest.raises(Q1ManifestError, match="hash mismatch"):
+        convert_expert_q1(
+            source, root, output, codec="t158", spec=spec, layers=(1,), resume=True
+        )
+
+
+def test_resume_rejects_a_different_source_artifact(tmp_path: Path) -> None:
+    root, spec, manifest_path = _shadow_hy3_artifact(tmp_path)
+    source = load_expert_manifest(manifest_path)
+    output = tmp_path / "q1"
+
+    convert_expert_q1(
+        source, root, output, codec="t158", spec=spec, layers=(1,), limit=1
+    )
+    (output / "expert-manifest-q1-t158.json").unlink()
+
+    from dataclasses import replace
+
+    other = replace(source, model_key="some-other-checkpoint")
+    with pytest.raises(Q1ManifestError, match="different source"):
+        convert_expert_q1(
+            other, root, output, codec="t158", spec=spec, layers=(1,), resume=True
+        )

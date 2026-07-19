@@ -218,6 +218,55 @@ def read_q1_record(manifest: Q1Manifest, record: Q1Record) -> bytes:
     return blob
 
 
+def _progress_journal_name(codec: str) -> str:
+    return f"experts-q1-{codec}.progress.jsonl"
+
+
+def _write_progress_header(path: Path, header: dict) -> None:
+    with path.open("w", encoding="utf-8") as journal:
+        journal.write(json.dumps(header) + "\n")
+
+
+def _append_progress_entry(path: Path, entry: dict) -> None:
+    """Record one completed record's identity and hash, durably.
+
+    Appended *after* the payload is on disk, so the journal can trail the
+    bin by at most one record; a trailing bin is truncated back to the
+    journal on resume rather than trusted.
+    """
+
+    with path.open("a", encoding="utf-8") as journal:
+        journal.write(json.dumps(entry) + "\n")
+        journal.flush()
+
+
+def _read_progress_journal(path: Path, expected_header: dict) -> list[dict]:
+    """Parse the journal and reject one written by a different burn."""
+
+    lines = [
+        line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    if not lines:
+        raise Q1ManifestError(
+            f"q1 progress journal {path.name} is empty; cannot resume"
+        )
+    try:
+        header = json.loads(lines[0])
+        entries = [json.loads(line) for line in lines[1:]]
+    except json.JSONDecodeError as error:
+        raise Q1ManifestError(
+            f"q1 progress journal {path.name} is unreadable: {error}"
+        ) from None
+    for key, expected in expected_header.items():
+        if header.get(key) != expected:
+            raise Q1ManifestError(
+                f"q1 resume refused: progress journal was written for a "
+                f"different source or codec ({key}={header.get(key)!r}, "
+                f"this run has {expected!r})"
+            )
+    return entries
+
+
 def _q1_segment_template(codec: str, spec) -> tuple[Q1Segment, ...]:
     """The segment table every record of this codec/spec shares.
 
@@ -279,11 +328,21 @@ def convert_expert_q1(
     one record is dequantized, encoded, and written at a time.
 
     ``resume=True`` continues an interrupted burn: records are fixed
-    length, so any torn tail is truncated, completed records are rehashed
-    from the bin (their manifest entries rebuilt from the codec's segment
-    template), and encoding restarts at the first missing record. The
-    manifest is only written when the whole selection is on disk, so a
-    manifest's existence certifies a complete artifact.
+    length, so any torn tail is truncated, completed records are validated
+    against the progress journal written alongside the bin (their manifest
+    entries rebuilt from the codec's segment template), and encoding
+    restarts at the first missing record. The manifest is only written when
+    the whole selection is on disk, so a manifest's existence certifies a
+    complete artifact.
+
+    The journal records each completed record's ``(layer, expert)`` and
+    payload hash as it is written. Resume refuses rather than guessing when
+    the journal is absent, when it was written for a different source or
+    codec, when an on-disk record's identity does not match the position
+    this run's selection wants there, or when the bytes no longer hash to
+    what was journalled. Without that, a resume with a changed ``layers=``
+    or ``experts=`` set would relabel the previous run's bytes and then
+    ratify the mislabelling by rehashing from disk.
     """
 
     codec = normalize_shadow_codec(codec)
@@ -324,12 +383,32 @@ def convert_expert_q1(
     records: list[Q1Record] = []
     bytes_in = 0
     skip = 0
+    journal_path = output_dir / _progress_journal_name(codec)
+    journal_header = {
+        "format": Q1_FORMAT,
+        "codec": codec,
+        "record_bytes": expected_record_bytes,
+        "source_model_key": source_manifest.model_key,
+        "source_manifest_sha256": source_manifest.manifest_sha256,
+    }
     if resume and bin_path.exists():
+        if not journal_path.exists():
+            raise Q1ManifestError(
+                f"q1 resume refused: {bin_path.name} exists but its progress "
+                f"journal {journal_path.name} does not, so the identity of the "
+                "already-written records cannot be established. Delete the bin "
+                "and convert from scratch."
+            )
+        entries = _read_progress_journal(journal_path, journal_header)
         existing = bin_path.stat().st_size
-        skip = min(existing // expected_record_bytes, len(selected))
+        # The journal is authoritative for identity, the bin for bytes; take
+        # the shorter of the two so a torn tail (or a record written but not
+        # yet journalled) is re-encoded rather than adopted.
+        skip = min(
+            existing // expected_record_bytes, len(entries), len(selected)
+        )
         boundary = skip * expected_record_bytes
         if existing != boundary:
-            # Torn tail from the interrupted run; drop it.
             with bin_path.open("r+b") as out:
                 out.truncate(boundary)
         with bin_path.open("rb") as done:
@@ -339,23 +418,48 @@ def convert_expert_q1(
                     raise Q1ManifestError(
                         f"short resume scan at record {index}"
                     )
-                record = selected[index]
+                entry = entries[index]
+                wanted = selected[index]
+                journalled = (entry.get("layer"), entry.get("expert"))
+                if journalled != (wanted.layer, wanted.expert):
+                    raise Q1ManifestError(
+                        f"q1 resume refused: record {index} on disk has "
+                        f"identity {journalled}, but this run's selection "
+                        f"wants ({wanted.layer}, {wanted.expert}). Resuming "
+                        "would relabel the previous run's bytes. Convert the "
+                        "changed selection into a fresh output directory."
+                    )
+                digest = hashlib.sha256(payload).hexdigest()
+                if digest != entry.get("sha256"):
+                    raise Q1ManifestError(
+                        f"q1 resume hash mismatch at record {index} "
+                        f"({wanted.layer}, {wanted.expert}): the bin does not "
+                        "match the hash journalled when it was written"
+                    )
                 records.append(
                     Q1Record(
-                        layer=record.layer,
-                        expert=record.expert,
+                        layer=wanted.layer,
+                        expert=wanted.expert,
                         offset=index * expected_record_bytes,
                         length=expected_record_bytes,
-                        sha256=hashlib.sha256(payload).hexdigest(),
+                        sha256=digest,
                         segments=template,
                     )
                 )
+        # Drop any journal entries past the accepted prefix so appends stay
+        # aligned with the bin.
+        if len(entries) != skip:
+            _write_progress_header(journal_path, journal_header)
+            for entry in entries[:skip]:
+                _append_progress_entry(journal_path, entry)
         if progress and skip:
             print(
                 f"q1[{codec}] resuming after {skip}/{len(selected)} "
                 "completed records",
                 flush=True,
             )
+    if not skip:
+        _write_progress_header(journal_path, journal_header)
     with bin_path.open("r+b" if skip else "wb") as out:
         out.seek(skip * expected_record_bytes)
         cursor = skip * expected_record_bytes
@@ -382,13 +486,25 @@ def convert_expert_q1(
                     f"{len(payload)} bytes; spec prices {expected_record_bytes}"
                 )
             out.write(payload)
+            out.flush()
+            digest = hashlib.sha256(payload).hexdigest()
+            # Journal only after the bytes are out, so the journal never
+            # claims a record the bin does not hold.
+            _append_progress_entry(
+                journal_path,
+                {
+                    "layer": record.layer,
+                    "expert": record.expert,
+                    "sha256": digest,
+                },
+            )
             records.append(
                 Q1Record(
                     layer=record.layer,
                     expert=record.expert,
                     offset=cursor,
                     length=len(payload),
-                    sha256=hashlib.sha256(payload).hexdigest(),
+                    sha256=digest,
                     segments=segments,
                 )
             )
