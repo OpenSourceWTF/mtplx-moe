@@ -26,6 +26,7 @@ from .a3b_compiled_target_prefix import (
     install_a3b_k1_target_prefix_route,
     validate_a3b_k1_target_prefix_sampler,
 )
+from .a3b_whole_moe import validate_a3b_whole_moe_request
 from .adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from .attention_context import attention_phase
 from .cache_state import (
@@ -5331,6 +5332,15 @@ def generate_mtpk(
         rt.a3b_compiled_target_prefix_factory if target_prefix_verify else None
     )
     exact_a3b_target_prefix = exact_a3b_target_prefix_factory is not None
+    if bool(getattr(rt, "a3b_whole_moe_installed", False)):
+        validate_a3b_whole_moe_request(
+            verify_strategy=verify_strategy,
+            requested_speculative_depth=requested_speculative_depth,
+            speculative_depth=speculative_depth,
+            verify_core=verify_core,
+            draft_core=draft_core,
+            compiled_target_prefix=exact_a3b_target_prefix,
+        )
     if target_prefix_verify:
         if exact_a3b_target_prefix:
             validate_a3b_k1_target_prefix_sampler(sampler)

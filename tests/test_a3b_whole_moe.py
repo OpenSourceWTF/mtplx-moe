@@ -9,6 +9,7 @@ import mlx.core as mx
 import pytest
 
 import mtplx.a3b_whole_moe as whole_moe_module
+from mtplx import generation as generation_module
 from mtplx import runtime as runtime_module
 from mtplx.a3b_whole_moe import (
     A3BWholeMoeConfigError,
@@ -16,6 +17,7 @@ from mtplx.a3b_whole_moe import (
     install_a3b_whole_moe,
     prepare_a3b_whole_moe,
     run_a3b_whole_moe_selfcheck,
+    validate_a3b_whole_moe_request,
 )
 from mtplx.kernels import a3b_whole_moe as kernel_module
 
@@ -712,6 +714,8 @@ def test_installed_route_uses_explicit_prefill_and_direct_small_row_calls(monkey
     phase["value"] = "ar_decode"
     assert targets[0](_ArraySpec((1, 1, 2048))).label == "target_m1"
     assert mtp[0](_ArraySpec((1, 1, 2048))).label == "mtp_m1"
+    phase["value"] = "unknown"
+    assert mtp[0](_ArraySpec((1, 1, 2048))).label == "mtp_m1"
     phase["value"] = "decode_verify"
     assert targets[0](_ArraySpec((1, 2, 2048))).label == "target_m2"
     with pytest.raises(A3BWholeMoeRouteError, match="rows=3"):
@@ -757,14 +761,51 @@ def test_runtime_constructs_one_whole_block_owner_after_packing() -> None:
     prepare_router = source.index("prepare_qwen_row_owned_routers(")
     selfcheck = source.index("maybe_run_model_selfcheck(model)")
     whole_selfcheck = source.index("run_a3b_whole_moe_selfcheck(")
+    compiled_factory = source.index("prepare_a3b_compiled_target_prefix(")
     install_whole = source.index("install_a3b_whole_moe(")
     install_router = source.index("install_qwen_row_owned_routers(")
 
     assert packing < prepare_whole < prepare_router < selfcheck
-    assert selfcheck < whole_selfcheck < install_whole < install_router
+    assert selfcheck < whole_selfcheck < compiled_factory < install_whole
+    assert selfcheck < install_router < compiled_factory
     assert "if whole_moe_plan is None" in source
     assert "if whole_moe_plan is not None" in source
     assert "elif router_plan is not None" in source
+
+
+@pytest.mark.parametrize(
+    ("override", "match"),
+    [
+        ({"verify_strategy": "capture_commit"}, "target-prefix"),
+        ({"requested_speculative_depth": 2}, "K1"),
+        ({"speculative_depth": 0}, "K1"),
+        ({"verify_core": "linear-gdn-from-conv-tape"}, "stock capture"),
+        ({"draft_core": "device-d2"}, "stock draft"),
+        ({"compiled_target_prefix": False}, "compiled target-prefix"),
+    ],
+)
+def test_request_mismatch_fails_before_generation(override, match):
+    request = {
+        "verify_strategy": "target_prefix",
+        "requested_speculative_depth": 1,
+        "speculative_depth": 1,
+        "verify_core": "stock",
+        "draft_core": "stock",
+        "compiled_target_prefix": True,
+    }
+    request.update(override)
+
+    with pytest.raises(A3BWholeMoeConfigError, match=match):
+        validate_a3b_whole_moe_request(**request)
+
+
+def test_generation_validates_whole_moe_request_before_prefill():
+    source = inspect.getsource(generation_module.generate_mtpk)
+
+    validation = source.index("validate_a3b_whole_moe_request(")
+    prefill = source.index("restore_or_prefill_prompt_state(")
+    assert validation < prefill
+    assert 'getattr(rt, "a3b_whole_moe_installed", False)' in source
 
 
 def test_runtime_contract_propagates_only_the_whole_moe_enable_flag() -> None:

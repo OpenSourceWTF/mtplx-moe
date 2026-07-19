@@ -36,6 +36,7 @@ class MTPLXRuntime:
     mtp_adapter_metadata: dict[str, Any] | None = None
     mtp_adapter_merge_report: dict[str, Any] | None = None
     a3b_compiled_target_prefix_factory: A3BCompiledTargetPrefixFactory | None = None
+    a3b_whole_moe_installed: bool = False
     diagnostic_counters: dict[str, int] = field(default_factory=dict)
     _forward_ar_supports_emit_logits: bool | None = field(default=None, init=False, repr=False)
     _forward_ar_supports_logits_keep: bool | None = field(default=None, init=False, repr=False)
@@ -481,11 +482,6 @@ def load(
             whole_moe_plan,
             selfcheck_report,
         )
-        whole_moe_report = install_a3b_whole_moe(
-            whole_moe_plan,
-            selfcheck_report,
-        )
-        logger.info("[a3b-whole-moe] %s", whole_moe_report)
     elif router_plan is not None:
         router_report = install_qwen_row_owned_routers(router_plan, selfcheck_report)
         logger.info("[qwen-row-owned-router] %s", router_report)
@@ -501,6 +497,18 @@ def load(
         config=config,
         gdn_postconv_factory=postconv_factory,
     )
+    if whole_moe_plan is not None:
+        if compiled_target_factory is None:
+            from .a3b_whole_moe import A3BWholeMoeConfigError
+
+            raise A3BWholeMoeConfigError(
+                "whole-MoE requires exact compiled target-prefix construction"
+            )
+        whole_moe_report = install_a3b_whole_moe(
+            whole_moe_plan,
+            selfcheck_report,
+        )
+        logger.info("[a3b-whole-moe] %s", whole_moe_report)
     adapter_path = Path(mtp_adapter) if mtp_adapter is not None else None
     adapter_metadata = None
     adapter_merge_report = None
@@ -522,6 +530,7 @@ def load(
         mtp_adapter_metadata=adapter_metadata,
         mtp_adapter_merge_report=adapter_merge_report,
         a3b_compiled_target_prefix_factory=compiled_target_factory,
+        a3b_whole_moe_installed=whole_moe_plan is not None,
     )
 
 

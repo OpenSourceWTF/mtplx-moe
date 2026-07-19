@@ -144,6 +144,39 @@ def a3b_whole_moe_enabled() -> bool:
     }
 
 
+def validate_a3b_whole_moe_request(
+    *,
+    verify_strategy: str,
+    requested_speculative_depth: int,
+    speculative_depth: int,
+    verify_core: str,
+    draft_core: str,
+    compiled_target_prefix: bool,
+) -> None:
+    """Validate request-owned facts once before prefill or measured decode."""
+
+    if verify_strategy != "target_prefix":
+        raise A3BWholeMoeConfigError(
+            "whole-MoE requires the exact target-prefix request route"
+        )
+    if requested_speculative_depth != 1 or speculative_depth != 1:
+        raise A3BWholeMoeConfigError(
+            "whole-MoE requires exact K1 ownership with maximum verify length 2"
+        )
+    if verify_core != "stock":
+        raise A3BWholeMoeConfigError(
+            "whole-MoE requires the stock capture arithmetic contract"
+        )
+    if draft_core != "stock":
+        raise A3BWholeMoeConfigError(
+            "whole-MoE requires the stock draft arithmetic contract"
+        )
+    if not compiled_target_prefix:
+        raise A3BWholeMoeConfigError(
+            "whole-MoE requires the exact compiled target-prefix factory"
+        )
+
+
 def _shape(value: Any) -> tuple[int, ...]:
     return tuple(int(dimension) for dimension in value.shape)
 
@@ -653,7 +686,7 @@ def _mtp_a3b_whole_moe_call(self: Any, value: Any) -> Any:
     if phase == "prefill":
         return route.stock_call(self, value)
     rows = math.prod(int(dimension) for dimension in value.shape[:-1])
-    if rows == 1 and phase in {"ar_decode", "decode_verify"}:
+    if rows == 1:
         return route.m1_call(value)
     raise A3BWholeMoeRouteError(
         f"whole-MoE has no constructed MTP route for phase={phase!r}, rows={rows}"
