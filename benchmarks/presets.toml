@@ -1,0 +1,128 @@
+# Shorthand configurations for the benchmark runners.
+#
+#   ./runner --list-presets            what is defined
+#   ./runner --show-preset NAME        the expanded flags, without running
+#   ./runner --preset NAME             run it
+#   ./runner --preset NAME --proj-quant q8    run it with one flag substituted
+#
+# Presets are applied as argparse DEFAULTS, so any flag you type explicitly
+# beats the preset. `extends` inherits, and the extending preset wins.
+#
+# Machine-local bundles that should not be committed go in
+# ~/.mtplx/benchmark-presets.toml, which is layered on top of this file.
+#
+# Keys are flag names without the leading `--` (either `proj-quant` or
+# `proj_quant`). An unknown key is a hard error, not a silent no-op.
+
+# --------------------------------------------------------------------------
+# Bases
+# --------------------------------------------------------------------------
+
+[preset.hy3-q2]
+description = "Hy3 Q2 streamed experts + BF16 layer-80 MTP head. Base for everything hy3."
+models = ["hy3-q2"]
+contexts = "2048"
+output-tokens = 1024
+hy3-depths = "2"
+memory-limit = "108GiB"
+runtime-reserve = "7GiB"
+expert-cache-limit = "2GiB"
+max-live-kv-tokens = 3072
+cache-policy = "frequency"
+cache-scope = "layer"
+slot-layout = "component-banks"
+transient-slots = 8
+read-chunk = "8MiB"
+bypass-page-cache = true   # the --f-nocache flag
+expert-integrity = "headers-only"
+
+[preset.hy3-q2.env]
+MTPLX_SUSTAINED_PREFILL = "1"
+
+# --------------------------------------------------------------------------
+# Operating points
+# --------------------------------------------------------------------------
+
+[preset.full-residency]
+description = "All 79 routed layers pinned resident; nothing streams from SSD."
+extends = "hy3-q2"
+island-layer-count = 79
+q2-expert-kernel = "stock"
+verify-strategy = "capture_commit"
+compiled-verify-mode = "off"
+draft-core = "device-k"
+trace-routes = false
+split-route-release = "deferred"
+
+[preset.full-residency.env]
+MTPLX_DEFERRED_PIN_RELEASE = "1"
+MTPLX_HY3_SUBMIT_CADENCE = "8"
+
+# At --island-layer-count 79 nothing streams, so --expert-cache-limit is
+# vestigial here; it is inherited from hy3-q2 and simply unused.
+
+[preset.championship]
+description = "The 40.59 tok/s configuration (router A/B winner, 2026-07-18)."
+extends = "full-residency"
+hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
+proj-quant = "q4"
+
+[preset.championship-bf16proj]
+description = "Championship with the trunk projections left at BF16. ~+10.3 GiB resident; needs --memory-limit 112GiB."
+extends = "full-residency"
+hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
+memory-limit = "112GiB"
+
+[preset.shipped-default]
+description = "Same envelope as championship but the SHIPPED router kernel. The A/B baseline (40.01)."
+extends = "full-residency"
+hy3-router-kernel = "mpp-r1-fused-r2"
+proj-quant = "q4"
+
+[preset.streamed]
+proj-quant = "q4"
+description = "SSD-streamed experts (the ~6 tok/s regime). Islands off, real expert cache."
+extends = "hy3-q2"
+island-layer-count = 0
+expert-cache-limit = "64GiB"
+memory-limit = "112GiB"
+runtime-reserve = "12GiB"
+split-route-release = "fenced"
+
+# --------------------------------------------------------------------------
+# Variations, meant to be composed on top via --preset
+# --------------------------------------------------------------------------
+
+[preset.q8-projections]
+description = "Championship envelope with q8 trunk projections instead of q4. Doubles per-token projection bytes."
+extends = "championship"
+proj-quant = "q8"
+
+[preset.k3]
+description = "Championship at MTP depth 3. Measured a net LOSS vs depth 2 (35.29 vs 38.73) -- kept for reproduction."
+extends = "championship"
+hy3-depths = "3"
+
+[preset.kv-q8]
+description = "Championship with a q8 trunk KV cache. Requires the batched verify strategy."
+extends = "championship"
+kv-quant = "q8"
+verify-strategy = "batched"
+
+# --------------------------------------------------------------------------
+# Diagnostics
+# --------------------------------------------------------------------------
+
+[preset.telemetry]
+description = "Championship plus resource telemetry. Token rates under telemetry are diagnostic, not headline numbers."
+extends = "championship"
+resource-telemetry = true
+resource-sample-interval = 0.25
+ssd-ceiling-gib-s = 12.47
+
+[preset.roofline]
+description = "Championship with the per-component decode roofline profiler. The profiler mx.evals inside the live forward, so the forward it measures IS distorted -- use for ranking components, never for a tok/s claim."
+extends = "championship"
+
+[preset.roofline.env]
+MTPLX_ROOFLINE_PROFILE = "1"

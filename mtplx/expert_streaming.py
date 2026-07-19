@@ -126,6 +126,8 @@ class CacheCounters:
     transient_loads: int = 0
     evictions: int = 0
     bytes_read: int = 0
+    prefetch_issued: int = 0
+    prefetch_committed: int = 0
 
     def observe(self, plan: RoutePlan, *, expert_record_bytes: int) -> None:
         expert_record_bytes = _integer(
@@ -163,6 +165,8 @@ class CacheCounters:
             "transient_loads": self.transient_loads,
             "evictions": self.evictions,
             "bytes_read": self.bytes_read,
+            "prefetch_issued": self.prefetch_issued,
+            "prefetch_committed": self.prefetch_committed,
         }
 
 
@@ -194,6 +198,11 @@ class LayerExpertSlotBank:
     aligned ``pread``.
     """
 
+    # Decode epochs a ring-evicted expert stays unpredictable. Ring
+    # turnover at high miss volume otherwise evicts and re-reads the same
+    # hot experts every couple of tokens, multiplying SSD traffic.
+    prefetch_reeviction_window = 2
+
     def __init__(
         self,
         *,
@@ -202,10 +211,12 @@ class LayerExpertSlotBank:
         transient_slots: int,
         frequency_decay: float = 0.995,
         cache_policy: str = "frequency",
+        prefetch_slots: int = 0,
     ) -> None:
         expert_count = _integer("expert_count", expert_count, minimum=1)
         persistent_slots = _integer("persistent_slots", persistent_slots, minimum=0)
         transient_slots = _integer("transient_slots", transient_slots, minimum=1)
+        prefetch_slots = _integer("prefetch_slots", prefetch_slots, minimum=0)
         if persistent_slots > expert_count:
             raise ValueError("persistent_slots cannot exceed expert_count")
         if isinstance(frequency_decay, bool):
@@ -220,7 +231,8 @@ class LayerExpertSlotBank:
         self.expert_count = expert_count
         self.persistent_slots = persistent_slots
         self.transient_slots = transient_slots
-        self.slot_count = persistent_slots + transient_slots
+        self.prefetch_slots = prefetch_slots
+        self.slot_count = persistent_slots + transient_slots + prefetch_slots
         self.frequency_decay = frequency_decay
         if cache_policy not in {"frequency", "lru"}:
             raise ValueError("cache_policy must be 'frequency' or 'lru'")
@@ -235,10 +247,42 @@ class LayerExpertSlotBank:
         self._history = [_ExpertHistory() for _ in range(expert_count)]
         self._prefill_seed_candidates: set[int] = set()
         self._persistent_capacity = self.persistent_slots
+        # Speculative lookahead ring: bypasses frequency admission, never
+        # evicts an earned persistent resident, round-robin replacement.
+        # Inflight entries carry a monotonically increasing assignment
+        # ticket: an expert can be assigned, recycled, and re-assigned
+        # while its first load's completion callback is still queued, and
+        # that stale callback must not publish (or invalidate) the newer
+        # assignment. The ticket survives reset() so callbacks straddling
+        # a reset can never collide with fresh assignments either.
+        self._prefetch_slot_to_expert: list[int | None] = [None] * prefetch_slots
+        self._prefetch_expert_to_slot: dict[int, int] = {}
+        self._prefetch_inflight: dict[int, tuple[int, int]] = {}
+        self._prefetch_cursor = 0
+        self._prefetch_ticket = 0
+        # Ring-evicted experts under re-prediction embargo: expert ->
+        # decode epoch at eviction. Rapid ring turnover otherwise
+        # re-reads the same hot experts token after token.
+        self._prefetch_evicted: dict[int, int] = {}
 
     @property
     def resident_experts(self) -> tuple[int, ...]:
         return tuple(expert for expert in self._slot_to_expert if expert is not None)
+
+    def published_experts(self, expert_ids: Iterable[int]) -> frozenset[int]:
+        """Subset of ``expert_ids`` that would hit-resolve right now.
+
+        Persistent residents plus committed prefetch-ring entries; inflight
+        ring assignments are excluded because a route may not consume a
+        slot mid-write. Pure peek — no history, epoch, or slot mutation.
+        """
+
+        return frozenset(
+            expert
+            for expert in expert_ids
+            if expert in self._expert_to_slot
+            or expert in self._prefetch_expert_to_slot
+        )
 
     @property
     def occupancy(self) -> int:
@@ -293,6 +337,166 @@ class LayerExpertSlotBank:
         self._expert_to_slot.clear()
         self._history = [_ExpertHistory() for _ in range(self.expert_count)]
         self._prefill_seed_candidates.clear()
+        self._prefetch_slot_to_expert = [None] * self.prefetch_slots
+        self._prefetch_expert_to_slot.clear()
+        self._prefetch_inflight.clear()
+        self._prefetch_cursor = 0
+        self._prefetch_evicted.clear()
+
+    def plan_prefetch(self, expert_ids: Iterable[int]) -> tuple[SlotLoad, ...]:
+        """Assign ring slots for predicted experts and return their loads.
+
+        Assignment reserves the slot but does NOT publish it as a hit —
+        plan() only resolves ring entries the caller has committed via
+        ``commit_prefetch`` after the load completed, so a route can never
+        consume a slot mid-write. Experts already resident, published, or
+        inflight are skipped. Ring replacement is round-robin over the
+        ring only — an earned persistent resident is never evicted by
+        speculation.
+
+        A slot whose tenant is still INFLIGHT is never recycled: its load
+        may be queued, running, or completed-but-uncommitted, and handing
+        the slot to a second load would race two claims on one physical
+        buffer (the later fill can be published under the earlier fill's
+        bytes). Committed tenants are always safe to replace — commit runs
+        strictly after the fill settles. When every slot is inflight the
+        prediction is dropped; speculation is best-effort.
+        """
+
+        if not self.prefetch_slots:
+            return ()
+        experts = tuple(
+            _integer("expert id", expert, minimum=0) for expert in expert_ids
+        )
+        for expert in experts:
+            if expert >= self.expert_count:
+                raise ValueError(
+                    f"expert id {expert} is outside [0, {self.expert_count})"
+                )
+        base = self.persistent_slots + self.transient_slots
+        loads: list[SlotLoad] = []
+        for expert in dict.fromkeys(experts):
+            if (
+                expert in self._expert_to_slot
+                or expert in self._prefetch_expert_to_slot
+                or expert in self._prefetch_inflight
+            ):
+                continue
+            evicted_epoch = self._prefetch_evicted.get(expert)
+            if evicted_epoch is not None:
+                if (
+                    self._decode_epoch - evicted_epoch
+                    < self.prefetch_reeviction_window
+                ):
+                    # Just evicted from the ring: re-reading it now is the
+                    # turnover churn this embargo exists to stop.
+                    continue
+                del self._prefetch_evicted[expert]
+            ring_index: int | None = None
+            for _probe in range(self.prefetch_slots):
+                candidate = self._prefetch_cursor % self.prefetch_slots
+                self._prefetch_cursor += 1
+                tenant = self._prefetch_slot_to_expert[candidate]
+                if tenant is not None and tenant in self._prefetch_inflight:
+                    continue
+                ring_index = candidate
+                break
+            if ring_index is None:
+                continue
+            victim = self._prefetch_slot_to_expert[ring_index]
+            if victim is not None:
+                self._prefetch_expert_to_slot.pop(victim, None)
+                self._prefetch_evicted[victim] = self._decode_epoch
+            self._prefetch_slot_to_expert[ring_index] = expert
+            ticket = self._prefetch_ticket
+            self._prefetch_ticket += 1
+            self._prefetch_inflight[expert] = (base + ring_index, ticket)
+            loads.append(
+                SlotLoad(expert=expert, slot=base + ring_index, persistent=False)
+            )
+        return tuple(loads)
+
+    def prefetch_ticket(self, expert_id: int) -> int | None:
+        """Return the inflight assignment ticket for an expert, if any.
+
+        The caller records it at plan time (under its route lock) and hands
+        it back to ``commit_prefetch``/``invalidate_prefetch`` so a delayed
+        completion can only act on the exact assignment its load belongs to.
+        """
+
+        expert = _integer("expert id", expert_id, minimum=0)
+        entry = self._prefetch_inflight.get(expert)
+        return None if entry is None else entry[1]
+
+    def commit_prefetch(
+        self,
+        expert_id: int,
+        *,
+        ticket: int | None = None,
+    ) -> bool:
+        """Publish a completed ring load as hit-eligible.
+
+        Returns False when the assignment was recycled by a later
+        plan_prefetch before the load completed (the slot is no longer
+        this expert's; its bytes must not be published). ``ticket`` binds
+        the commit to one specific assignment: a stale callback whose
+        assignment was recycled while the SAME expert was re-assigned to
+        another ring slot must neither publish that newer (possibly
+        unfilled) slot nor consume its inflight entry. ``ticket=None``
+        commits whatever assignment is inflight and is only safe for
+        callers that never overlap loads of one expert.
+        """
+
+        expert = _integer("expert id", expert_id, minimum=0)
+        entry = self._prefetch_inflight.get(expert)
+        if entry is None:
+            return False
+        slot, assignment_ticket = entry
+        if ticket is not None and ticket != assignment_ticket:
+            # Stale completion for a recycled assignment; the live entry
+            # belongs to a newer load and must stay untouched.
+            return False
+        del self._prefetch_inflight[expert]
+        base = self.persistent_slots + self.transient_slots
+        if self._prefetch_slot_to_expert[slot - base] != expert:
+            return False
+        self._prefetch_expert_to_slot[expert] = slot
+        return True
+
+    def invalidate_prefetch(
+        self,
+        expert_id: int,
+        *,
+        ticket: int | None = None,
+    ) -> int | None:
+        """Forget a failed or stale ring assignment and return its slot.
+
+        A ticketed invalidation only retires the exact inflight assignment
+        that failed; if that assignment was already recycled (and the
+        expert possibly re-assigned or even published by a newer load),
+        nothing is touched. ``ticket=None`` keeps the administrative
+        behavior: drop whatever published or inflight state the expert has.
+        """
+
+        expert = _integer("expert id", expert_id, minimum=0)
+        base = self.persistent_slots + self.transient_slots
+        if ticket is not None:
+            entry = self._prefetch_inflight.get(expert)
+            if entry is None or entry[1] != ticket:
+                return None
+            del self._prefetch_inflight[expert]
+            slot = entry[0]
+            if self._prefetch_slot_to_expert[slot - base] == expert:
+                self._prefetch_slot_to_expert[slot - base] = None
+            return slot
+        slot = self._prefetch_expert_to_slot.pop(expert, None)
+        if slot is None:
+            entry = self._prefetch_inflight.pop(expert, None)
+            slot = None if entry is None else entry[0]
+        if slot is not None:
+            if self._prefetch_slot_to_expert[slot - base] == expert:
+                self._prefetch_slot_to_expert[slot - base] = None
+        return slot
 
     def prepare_prefill_seed(self, expert_ids: Iterable[int]) -> tuple[int, ...]:
         """Choose prompt-frequent experts for empty slots without eviction."""
@@ -418,10 +622,22 @@ class LayerExpertSlotBank:
         hit_set = {
             expert for expert in unique_experts if expert in self._expert_to_slot
         }
-        miss_order = [expert for expert in unique_experts if expert not in hit_set]
+        prefetch_hits = {
+            expert
+            for expert in unique_experts
+            if expert not in hit_set and expert in self._prefetch_expert_to_slot
+        }
+        miss_order = [
+            expert
+            for expert in unique_experts
+            if expert not in hit_set and expert not in prefetch_hits
+        ]
         resolved: dict[int, int] = {
             expert: self._expert_to_slot[expert] for expert in hit_set
         }
+        for expert in prefetch_hits:
+            resolved[expert] = self._prefetch_expert_to_slot[expert]
+        hit_set |= prefetch_hits
         loads: list[SlotLoad] = []
         evictions: list[SlotEviction] = []
         pinned = set(hit_set)

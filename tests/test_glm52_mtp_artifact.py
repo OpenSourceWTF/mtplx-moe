@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -18,6 +19,7 @@ import mtplx.glm52_mtp_artifact as artifact
 
 PREFIX = "model.layers.78."
 SCRIPT = Path(__file__).parents[1] / "scripts" / "extract_glm52_mtp_layer78.py"
+QUANTIZE_CLI = Path(__file__).parents[1] / "scripts" / "quantize_glm52_mtp_head.py"
 
 
 @dataclass
@@ -777,3 +779,360 @@ def test_verify_cli_has_no_unauthenticated_no_deep_mode(tmp_path: Path) -> None:
 
     assert result.returncode == 2
     assert "unrecognized arguments: --no-deep" in result.stderr
+
+
+# --- Q4 head sibling conversion (issue #100) ------------------------------
+
+Q4_PREFIX = PREFIX  # "model.layers.78."
+
+
+def _bf16_bytes(shape: tuple[int, ...]) -> bytes:
+    import numpy as np
+    import mlx.core as mx
+
+    array = mx.random.normal(shape).astype(mx.bfloat16)
+    mx.eval(array)
+    return np.array(array.view(mx.uint16)).tobytes()
+
+
+@dataclass
+class Q4Fixture:
+    source: Path
+    bf16_output: Path
+    q4_output: Path
+    producer: Path
+    bf16_expectations: dict[str, artifact.TensorExpectation]
+
+    @property
+    def bf16_config(self) -> artifact.Glm52MtpArtifactConfig:
+        return artifact.Glm52MtpArtifactConfig(
+            source_root=self.source,
+            output_root=self.bf16_output,
+            producer_root=self.producer,
+        )
+
+    @property
+    def q4_config(self) -> artifact.Glm52MtpQ4Config:
+        return artifact.Glm52MtpQ4Config(
+            bf16_root=self.bf16_output,
+            output_root=self.q4_output,
+            producer_root=self.producer,
+        )
+
+
+def _pin_q4_expectations(
+    monkeypatch: pytest.MonkeyPatch,
+    bf16_expectations: dict[str, artifact.TensorExpectation],
+) -> dict[str, artifact.Q4TensorExpectation]:
+    q4 = artifact.expected_q4_inventory_from_bf16(bf16_expectations)
+    monkeypatch.setattr(artifact, "EXPECTED_Q4_TENSOR_COUNT", len(q4))
+    monkeypatch.setattr(
+        artifact, "EXPECTED_Q4_PAYLOAD_BYTES", sum(t.nbytes for t in q4.values())
+    )
+    monkeypatch.setattr(
+        artifact,
+        "EXPECTED_Q4_BF16_COUNT",
+        sum(t.dtype == "BF16" for t in q4.values()),
+    )
+    monkeypatch.setattr(
+        artifact, "EXPECTED_Q4_F32_COUNT", sum(t.dtype == "F32" for t in q4.values())
+    )
+    monkeypatch.setattr(
+        artifact, "EXPECTED_Q4_U32_COUNT", sum(t.dtype == "U32" for t in q4.values())
+    )
+    return q4
+
+
+@pytest.fixture
+def q4_synthetic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Q4Fixture:
+    """A tiny BF16 head with routed experts, ready to extract then quantize."""
+
+    import numpy as np
+
+    source = tmp_path / "glm52-mtp-layer78-source"
+    source.mkdir(mode=0o700)
+    bf16_output = tmp_path / "glm52-mtp-layer78"
+    q4_output = tmp_path / "glm52-mtp-layer78-q4"
+    producer = tmp_path / "producer"
+    _init_clean_producer(producer)
+
+    # Two trunk tensors (kept bit-exact) plus one routed expert whose three
+    # projections (64 columns => Q4/gs64 clean) are the quantization target.
+    tensors: dict[str, tuple[str, tuple[int, ...], bytes]] = {
+        Q4_PREFIX + "enorm.weight": ("BF16", (8,), _bf16_bytes((8,))),
+        Q4_PREFIX + "mlp.gate.e_score_correction_bias": (
+            "F32",
+            (2,),
+            np.zeros(2, np.float32).tobytes(),
+        ),
+        Q4_PREFIX + "mlp.experts.0.gate_proj.weight": (
+            "BF16",
+            (8, 64),
+            _bf16_bytes((8, 64)),
+        ),
+        Q4_PREFIX + "mlp.experts.0.up_proj.weight": (
+            "BF16",
+            (8, 64),
+            _bf16_bytes((8, 64)),
+        ),
+        Q4_PREFIX + "mlp.experts.0.down_proj.weight": (
+            "BF16",
+            (8, 64),
+            _bf16_bytes((8, 64)),
+        ),
+    }
+    names = list(tensors)
+    shard_names = (
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+    )
+    _write_safetensors(source / shard_names[0], {n: tensors[n] for n in names[:3]})
+    _write_safetensors(source / shard_names[1], {n: tensors[n] for n in names[3:]})
+    _write_json(source / "config.json", {"synthetic": True})
+    _write_json(
+        source / "model.safetensors.index.json",
+        {
+            "metadata": {"total_size": 1},
+            "weight_map": {
+                **{n: shard_names[0] for n in names[:3]},
+                **{n: shard_names[1] for n in names[3:]},
+            },
+        },
+    )
+    expectations = {
+        name: artifact.TensorExpectation(dtype, shape)
+        for name, (dtype, shape, _raw) in tensors.items()
+    }
+    _pin_synthetic_source(
+        monkeypatch,
+        SyntheticFixture(source, bf16_output, producer, tensors, shard_names),
+        expectations,
+        shard_counts={shard_names[0]: 3, shard_names[1]: 2},
+    )
+    _pin_q4_expectations(monkeypatch, expectations)
+    return Q4Fixture(source, bf16_output, q4_output, producer, expectations)
+
+
+def test_quantize_publishes_a_self_verifying_q4_artifact(
+    q4_synthetic: Q4Fixture,
+) -> None:
+    artifact.extract_glm52_mtp_layer78(q4_synthetic.bf16_config)
+    published = artifact.quantize_glm52_mtp_layer78_q4(q4_synthetic.q4_config)
+
+    assert published == q4_synthetic.q4_output
+    assert sorted(path.name for path in published.iterdir()) == sorted(
+        [artifact.Q4_ARTIFACT_FILE, artifact.MANIFEST_FILE]
+    )
+
+    manifest = artifact.verify_glm52_mtp_layer78_q4(published, deep=True)
+    assert manifest["schema"] == artifact.Q4_MANIFEST_SCHEMA
+    assert set(manifest) == artifact.Q4_MANIFEST_KEYS
+    assert manifest["quantization"]["bits"] == artifact.Q4_QUANT_BITS
+    assert manifest["quantization"]["group_size"] == artifact.Q4_QUANT_GROUP_SIZE
+    assert manifest["quantization"]["min_roundtrip_cosine"] >= (
+        artifact.Q4_MIN_ROUNDTRIP_COSINE
+    )
+    # The head shrank: Q4 payload is strictly smaller than the BF16 source.
+    bf16_payload = sum(t.nbytes for t in q4_synthetic.bf16_expectations.values())
+    assert manifest["inventory"]["payload_bytes"] < bf16_payload
+    # Source provenance travels inside the signed Q4 receipt.
+    assert manifest["source"]["artifact_file"] == artifact.ARTIFACT_FILE
+    assert manifest["source"]["revision"] == artifact.SOURCE_REVISION
+    # Trunk tensors stay their original dtype; experts become the Q4 triplet.
+    treatments = {
+        row["name"]: row["treatment"] for row in manifest["artifact"]["tensors"]
+    }
+    assert treatments[Q4_PREFIX + "enorm.weight"] == "exact"
+    assert treatments[Q4_PREFIX + "mlp.experts.0.gate_proj.weight"] == "q4"
+    assert treatments[Q4_PREFIX + "mlp.experts.0.gate_proj.scales"] == "q4"
+
+
+def test_quantized_experts_roundtrip_within_the_pinned_cosine_floor(
+    q4_synthetic: Q4Fixture,
+) -> None:
+    import mlx.core as mx
+
+    artifact.extract_glm52_mtp_layer78(q4_synthetic.bf16_config)
+    published = artifact.quantize_glm52_mtp_layer78_q4(q4_synthetic.q4_config)
+
+    source = _read_safetensors(q4_synthetic.bf16_output / artifact.ARTIFACT_FILE)
+    q4 = _read_safetensors(published / artifact.Q4_ARTIFACT_FILE)
+    import numpy as np
+
+    base = Q4_PREFIX + "mlp.experts.0.gate_proj"
+    original = mx.array(
+        np.frombuffer(source[base + ".weight"], dtype=np.uint16).reshape(8, 64)
+    ).view(mx.bfloat16)
+    weight = mx.array(np.frombuffer(q4[base + ".weight"], dtype=np.uint32).reshape(8, 8))
+    scales = mx.array(
+        np.frombuffer(q4[base + ".scales"], dtype=np.uint16).reshape(8, 1)
+    ).view(mx.bfloat16)
+    biases = mx.array(
+        np.frombuffer(q4[base + ".biases"], dtype=np.uint16).reshape(8, 1)
+    ).view(mx.bfloat16)
+    dequantized = mx.dequantize(
+        weight, scales, biases, group_size=64, bits=4, mode="affine"
+    )
+    a = original.astype(mx.float32).flatten()
+    b = dequantized.astype(mx.float32).flatten()
+    cosine = (mx.sum(a * b) / (mx.linalg.norm(a) * mx.linalg.norm(b))).item()
+    assert cosine >= artifact.Q4_MIN_ROUNDTRIP_COSINE
+    # Trunk bytes are copied unchanged.
+    assert q4[Q4_PREFIX + "enorm.weight"] == source[Q4_PREFIX + "enorm.weight"]
+
+
+def test_quantize_refuses_an_existing_output_root(q4_synthetic: Q4Fixture) -> None:
+    artifact.extract_glm52_mtp_layer78(q4_synthetic.bf16_config)
+    q4_synthetic.q4_output.mkdir()
+    with pytest.raises(artifact.ArtifactPublicationError, match="already exists"):
+        artifact.quantize_glm52_mtp_layer78_q4(q4_synthetic.q4_config)
+
+
+def test_quantize_refuses_a_dirty_producer(q4_synthetic: Q4Fixture) -> None:
+    artifact.extract_glm52_mtp_layer78(q4_synthetic.bf16_config)
+    (q4_synthetic.producer / "dirty.txt").write_text("uncommitted", encoding="utf-8")
+    with pytest.raises(artifact.ArtifactValidationError, match="dirty"):
+        artifact.quantize_glm52_mtp_layer78_q4(q4_synthetic.q4_config)
+
+
+def test_q4_verify_rejects_payload_tamper(q4_synthetic: Q4Fixture) -> None:
+    artifact.extract_glm52_mtp_layer78(q4_synthetic.bf16_config)
+    published = artifact.quantize_glm52_mtp_layer78_q4(q4_synthetic.q4_config)
+    artifact_path = published / artifact.Q4_ARTIFACT_FILE
+    raw = bytearray(artifact_path.read_bytes())
+    raw[-1] ^= 0xFF
+    artifact_path.write_bytes(raw)
+    with pytest.raises(artifact.ArtifactValidationError, match="SHA-256|byte count"):
+        artifact.verify_glm52_mtp_layer78_q4(published, deep=True)
+
+
+def test_q4_verify_rejects_manifest_mutation(q4_synthetic: Q4Fixture) -> None:
+    artifact.extract_glm52_mtp_layer78(q4_synthetic.bf16_config)
+    published = artifact.quantize_glm52_mtp_layer78_q4(q4_synthetic.q4_config)
+
+    def bump_payload(manifest: dict[str, object]) -> None:
+        manifest["inventory"]["payload_bytes"] += 64
+
+    _rewrite_manifest(published, bump_payload)
+    with pytest.raises(artifact.ArtifactValidationError, match="payload byte count"):
+        artifact.verify_glm52_mtp_layer78_q4(published, deep=True)
+
+
+def test_q4_open_verified_rejects_shallow_mode(q4_synthetic: Q4Fixture) -> None:
+    artifact.extract_glm52_mtp_layer78(q4_synthetic.bf16_config)
+    published = artifact.quantize_glm52_mtp_layer78_q4(q4_synthetic.q4_config)
+    with pytest.raises(artifact.ArtifactValidationError, match="deep"):
+        with artifact.open_verified_glm52_mtp_layer78_q4(published, deep=False):
+            pass
+
+
+def _load_quantize_cli():
+    spec = importlib.util.spec_from_file_location(
+        "quantize_glm52_mtp_head", QUANTIZE_CLI
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("command", ["quantize", "verify"])
+def test_quantize_cli_modes_have_help(command: str) -> None:
+    result = subprocess.run(
+        [sys.executable, str(QUANTIZE_CLI), command, "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--output-root" in result.stdout
+    if command == "quantize":
+        assert "--bf16-root" in result.stdout
+        assert "--producer-root" in result.stdout
+
+
+def test_quantize_cli_round_trips_through_the_public_entry_point(
+    q4_synthetic: Q4Fixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = _load_quantize_cli()
+    artifact.extract_glm52_mtp_layer78(q4_synthetic.bf16_config)
+
+    assert (
+        cli.main(
+            [
+                "quantize",
+                "--bf16-root",
+                str(q4_synthetic.bf16_output),
+                "--output-root",
+                str(q4_synthetic.q4_output),
+                "--producer-root",
+                str(q4_synthetic.producer),
+            ]
+        )
+        == 0
+    )
+    published = json.loads(capsys.readouterr().out)
+    assert published["published"] == str(q4_synthetic.q4_output)
+    assert published["min_roundtrip_cosine"] >= artifact.Q4_MIN_ROUNDTRIP_COSINE
+
+    assert cli.main(["verify", "--output-root", str(q4_synthetic.q4_output)]) == 0
+    manifest = json.loads(capsys.readouterr().out)
+    assert manifest["schema"] == artifact.Q4_MANIFEST_SCHEMA
+    assert manifest["inventory"]["payload_bytes"] == published["payload_bytes"]
+
+
+def test_quantize_cli_reports_missing_artifact(tmp_path: Path) -> None:
+    cli = _load_quantize_cli()
+    result = cli.main(["verify", "--output-root", str(tmp_path / "absent")])
+    assert result == 2
+
+
+def test_expected_q4_inventory_pins_the_real_head_production_constants() -> None:
+    # The Q4 sibling of the real layer-78 head must derive to the pinned
+    # totals the streaming converter and runtime verifier check against,
+    # without ever touching the 18.5 GiB artifact.
+    bf16 = artifact.expected_glm52_layer78_inventory(
+        {
+            "hidden_size": 6144,
+            "moe_intermediate_size": 2048,
+            "n_routed_experts": 256,
+            "num_hidden_layers": 78,
+            "num_nextn_predict_layers": 1,
+            "model_type": "glm_moe_dsa",
+            "q_lora_rank": 2048,
+            "kv_lora_rank": 512,
+            "num_attention_heads": 64,
+            "qk_nope_head_dim": 192,
+            "qk_rope_head_dim": 64,
+            "index_n_heads": 32,
+            "index_head_dim": 128,
+            "n_shared_experts": 1,
+        }
+    )
+    q4 = artifact.expected_q4_inventory_from_bf16(bf16)
+
+    assert len(q4) == artifact.EXPECTED_Q4_TENSOR_COUNT == 2_327
+    assert (
+        sum(item.nbytes for item in q4.values())
+        == artifact.EXPECTED_Q4_PAYLOAD_BYTES
+        == 6_014_306_816
+    )
+    assert (
+        sum(item.dtype == "BF16" for item in q4.values())
+        == artifact.EXPECTED_Q4_BF16_COUNT
+        == 1_558
+    )
+    assert (
+        sum(item.dtype == "F32" for item in q4.values())
+        == artifact.EXPECTED_Q4_F32_COUNT
+        == 1
+    )
+    assert (
+        sum(item.dtype == "U32" for item in q4.values())
+        == artifact.EXPECTED_Q4_U32_COUNT
+        == 768
+    )
+    # The pinned totals validator accepts the real derivation unchanged.
+    artifact._validate_q4_inventory_totals(q4)
+    # The Q4 head reclaims ~12.9 GiB against the 18.5 GiB BF16 payload.
+    assert artifact.EXPECTED_PAYLOAD_BYTES - artifact.EXPECTED_Q4_PAYLOAD_BYTES > 12 * 2**30

@@ -30,7 +30,7 @@ data cannot determine route IDs and cannot be required for correctness.
     batching, completion, and cache lifetime.
 - `mtplx/runtime.py`, `mtplx/cli.py`, and server profile/config models
   - expose explicit streaming and memory-limit fields.
-- `mtplx/metrics.py` or existing metrics surface
+- `mtplx/resource_metrics.py` or existing metrics surface
   - export per-model/per-layer cache and I/O measurements with bounded label
     cardinality.
 - `scripts/simulate_expert_cache.py`

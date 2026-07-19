@@ -101,11 +101,11 @@ tests pass.
   rollback, and snapshot tests.
 - `tests/test_glm52_streamed_mtp.py`: streamed runtime and generation
   integration tests.
-- `mtplx/benchmarks/q2_mtp_depth_campaign.py`: fixed schedules, schema
+- `mtplx/benchmarks/hy3_q2_campaign.py`: fixed schedules, schema
   validation, paired statistics, and candidate selection.
-- `scripts/summarize_q2_mtp_depth_campaign.py`: pure-data campaign verifier and
+- `scripts/summarize_hy3_q2_campaign.py`: pure-data campaign verifier and
   summary CLI.
-- `tests/test_q2_mtp_depth_campaign.py`: schedule, gate, pairing, noise-floor,
+- `tests/test_benchmark_q2_mtp_depth_matrix.py`: schedule, gate, pairing, noise-floor,
   and summary tests.
 - `benchmarks/results/q2-bf16-mtp-depth-2026-07-14.md`: reviewed final results;
   create only after both valid campaigns finish.
@@ -861,9 +861,9 @@ as lock authority.
 
 **Files:**
 
-- Create: `mtplx/benchmarks/q2_mtp_depth_campaign.py`
-- Create: `scripts/summarize_q2_mtp_depth_campaign.py`
-- Create: `tests/test_q2_mtp_depth_campaign.py`
+- Create: `mtplx/benchmarks/hy3_q2_campaign.py`
+- Create: `scripts/summarize_hy3_q2_campaign.py`
+- Create: `tests/test_benchmark_q2_mtp_depth_matrix.py`
 
 **Security flag:** `none`
 
@@ -920,7 +920,7 @@ all depths lose, select the least-negative diagnostic depth and set
 - [ ] **Step 3: Run RED**
 
 ```bash
-.venv/bin/python -m pytest -q tests/test_q2_mtp_depth_campaign.py
+.venv/bin/python -m pytest -q tests/test_benchmark_q2_mtp_depth_matrix.py
 ```
 
 Expected: FAIL because the pure campaign module does not exist.
@@ -948,19 +948,19 @@ any pre-rendered field with a tight floating tolerance.
 - [ ] **Step 5: Add the summary CLI, run GREEN, and commit**
 
 ```bash
-.venv/bin/python -m pytest -q tests/test_q2_mtp_depth_campaign.py
+.venv/bin/python -m pytest -q tests/test_benchmark_q2_mtp_depth_matrix.py
 .venv/bin/ruff check \
-  mtplx/benchmarks/q2_mtp_depth_campaign.py \
-  scripts/summarize_q2_mtp_depth_campaign.py \
-  tests/test_q2_mtp_depth_campaign.py
+  mtplx/benchmarks/hy3_q2_campaign.py \
+  scripts/summarize_hy3_q2_campaign.py \
+  tests/test_benchmark_q2_mtp_depth_matrix.py
 .venv/bin/ruff format --check \
-  mtplx/benchmarks/q2_mtp_depth_campaign.py \
-  scripts/summarize_q2_mtp_depth_campaign.py \
-  tests/test_q2_mtp_depth_campaign.py
+  mtplx/benchmarks/hy3_q2_campaign.py \
+  scripts/summarize_hy3_q2_campaign.py \
+  tests/test_benchmark_q2_mtp_depth_matrix.py
 git diff --check
-git add mtplx/benchmarks/q2_mtp_depth_campaign.py \
-  scripts/summarize_q2_mtp_depth_campaign.py \
-  tests/test_q2_mtp_depth_campaign.py
+git add mtplx/benchmarks/hy3_q2_campaign.py \
+  scripts/summarize_hy3_q2_campaign.py \
+  tests/test_benchmark_q2_mtp_depth_matrix.py
 git commit -m "feat(bench): validate Q2 MTP depth campaigns"
 ```
 
@@ -1114,7 +1114,7 @@ evidence target. A validation error must leave no final payload.
 ```bash
 .venv/bin/python -m pytest -q \
   tests/test_benchmark_streamed_generation_cli.py \
-  tests/test_q2_mtp_depth_campaign.py \
+  tests/test_benchmark_q2_mtp_depth_matrix.py \
   tests/test_qwen_guard.py \
   tests/test_generation_sustained.py
 .venv/bin/ruff check \
@@ -1222,7 +1222,7 @@ PYTHONNOUSERSITE=1 .venv/bin/python -m pytest -q \
   tests/test_generation_sustained.py \
   tests/test_qwen_guard.py \
   tests/test_benchmark_streamed_generation_cli.py \
-  tests/test_q2_mtp_depth_campaign.py
+  tests/test_benchmark_q2_mtp_depth_matrix.py
 ```
 
 Expected: all tests pass. Do not enter an MLX window on failure.
@@ -1282,7 +1282,7 @@ the command exits.
 
 ```bash
 RAW_ROOT="$(cat /tmp/mtplx-q2-mtp-current-run)"
-.venv/bin/python scripts/summarize_q2_mtp_depth_campaign.py \
+.venv/bin/python scripts/summarize_hy3_q2_campaign.py \
   "$RAW_ROOT/hy3.json" --output "$RAW_ROOT/hy3-summary.json"
 curl -fsS http://127.0.0.1:8080/v1/models | \
   jq -e '.data[] | select(.id == "mtplx-qwen36-27b-optimized-speed")'
@@ -1332,7 +1332,7 @@ KVShare, memory, and restoration gates pass.
 
 ```bash
 RAW_ROOT="$(cat /tmp/mtplx-q2-mtp-current-run)"
-.venv/bin/python scripts/summarize_q2_mtp_depth_campaign.py \
+.venv/bin/python scripts/summarize_hy3_q2_campaign.py \
   "$RAW_ROOT/glm52.json" --output "$RAW_ROOT/glm52-summary.json"
 curl -fsS http://127.0.0.1:8080/v1/models | \
   jq -e '.data[] | select(.id == "mtplx-qwen36-27b-optimized-speed")'
@@ -1394,21 +1394,21 @@ PYTHONNOUSERSITE=1 .venv/bin/python -m pytest -q \
   tests/test_qwen_guard.py \
   tests/test_issue30_starvation_campaign.py \
   tests/test_benchmark_streamed_generation_cli.py \
-  tests/test_q2_mtp_depth_campaign.py
+  tests/test_benchmark_q2_mtp_depth_matrix.py
 .venv/bin/ruff check \
   mtplx/glm52_mtp_artifact.py mtplx/glm52_mtp_patch.py \
   mtplx/models/glm52_mlx.py mtplx/runtime.py mtplx/generation.py \
-  mtplx/qwen_guard.py mtplx/benchmarks/q2_mtp_depth_campaign.py \
+  mtplx/qwen_guard.py mtplx/benchmarks/hy3_q2_campaign.py \
   scripts/extract_glm52_mtp_layer78.py \
   scripts/benchmark_streamed_generation.py \
-  scripts/summarize_q2_mtp_depth_campaign.py \
+  scripts/summarize_hy3_q2_campaign.py \
   scripts/run_with_qwen_stopped.py \
   scripts/run_issue30_starvation_attribution.py \
   tests/test_glm52_mtp_artifact.py tests/test_glm52_mtp.py \
   tests/test_glm52_streamed_mtp.py tests/test_generation_sustained.py \
   tests/test_qwen_guard.py tests/test_issue30_starvation_campaign.py \
   tests/test_benchmark_streamed_generation_cli.py \
-  tests/test_q2_mtp_depth_campaign.py
+  tests/test_benchmark_q2_mtp_depth_matrix.py
 .venv/bin/python -m compileall -q mtplx scripts tests
 git diff --check
 ```

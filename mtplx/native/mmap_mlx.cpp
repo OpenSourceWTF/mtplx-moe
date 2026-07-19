@@ -36,9 +36,28 @@ std::size_t prefetch_arrays(const nb::list& values) {
   };
   std::vector<Range> ranges;
   ranges.reserve(nb::len(values));
+  // nb::inst_ptr is an unchecked cast: handed a Python object that is not an
+  // mlx.core.array it reinterprets arbitrary object storage as an mx::array
+  // and segfaults. MLX's Python module and this extension carry separate
+  // hidden nanobind RTTI, so nb::isinstance<mx::array> cannot be trusted to
+  // recognise MLX's own type; compare against the real class object instead.
+  static const nb::object array_class =
+      nb::module_::import_("mlx.core").attr("array");
   for (nb::handle value : values) {
+    if (!nb::isinstance(value, array_class)) {
+      throw std::invalid_argument("prefetch inputs must be mlx.core.array");
+    }
     const auto* array = nb::inst_ptr<mx::array>(value);
-    auto* buffer = static_cast<MTL::Buffer*>(array->buffer().ptr());
+    // Every MLX array on the Metal backend holds an MTL::Buffer* in
+    // allocator::Buffer, whichever mmap_u32 flavor produced it: the wired
+    // flavor's raw-pointer constructor routes through
+    // MetalAllocator::make_buffer (newBufferWithBytesNoCopy:), and the
+    // unwired flavor builds the MTLBuffer here. MLX's own Buffer::raw_ptr()
+    // performs this identical contents() message send.
+    // MLX >= 0.31 returns const void* from Buffer::ptr(); madvise needs the
+    // mutable pointer to the same shared storage.
+    auto* buffer =
+        static_cast<MTL::Buffer*>(const_cast<void*>(array->buffer().ptr()));
     if (buffer == nullptr || buffer->contents() == nullptr) {
       throw std::invalid_argument("prefetch input has no shared Metal storage");
     }

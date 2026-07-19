@@ -21,6 +21,7 @@ from .profiles import (
     get_profile,
     list_profiles,
 )
+from .runtime_options import canonicalize_flag_tokens
 from .version import DISPLAY_VERSION, __version__
 from .cli_app.help import (  # noqa: F401 - compatibility re-exports
     ADVANCED_COMMANDS,
@@ -2109,6 +2110,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pull_p.add_argument("--cache-dir")
     pull_p.add_argument("--revision")
+    pull_p.add_argument(
+        "--no-expert-banks",
+        dest="include_expert_banks",
+        action="store_false",
+        default=True,
+        help=(
+            "Skip the large *.bin streamed-expert banks. The pull still fetches "
+            "config, tokenizer, manifests and resident safetensors, and marks "
+            "the result as a deliberate partial download (not runnable)."
+        ),
+    )
     pull_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     pull_p.add_argument("--progress-json", action="store_true", help="Emit newline-delimited JSON progress events")
     pull_p.set_defaults(func=cmd_pull_public)
@@ -3545,7 +3557,9 @@ def main(argv: list[str] | None = None) -> int:
     if raw_args[0] not in command_names and not raw_args[0].startswith("-"):
         return _print_unknown_command(raw_args[0])
     args = parser.parse_args(raw_args)
-    args._cli_flags = _explicit_cli_flags(raw_args)
+    args._cli_flags = canonicalize_flag_tokens(
+        _explicit_cli_flags(raw_args), parser, args
+    )
     from .config import apply_user_config
 
     apply_user_config(args)

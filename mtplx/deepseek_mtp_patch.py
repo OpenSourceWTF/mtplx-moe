@@ -171,6 +171,32 @@ def _stack_moe_experts(weights: dict[str, Any], prefix: str, args: Any) -> None:
             weights[f"{prefix}.mlp.switch_mlp.{module}.{leaf}"] = mx.stack(values)
 
 
+def _has_complete_deepseek_mtp_payload(
+    weights: dict[str, Any],
+    *,
+    num_mtp_layers: int,
+) -> bool:
+    """Return true only when every declared DeepSeek MTP layer has real weights.
+
+    A prefix-mismatched checkpoint still yields a non-empty ``mapped`` from
+    stray keys, and ``strict=False`` then loads nothing -- injection would
+    report success while the draft head stays randomly initialized.
+    """
+
+    for local_idx in range(num_mtp_layers):
+        prefix = f"layers.{local_idx}."
+        required = (
+            f"{prefix}enorm.weight",
+            f"{prefix}hnorm.weight",
+            f"{prefix}eh_proj.weight",
+        )
+        if not all(key in weights for key in required):
+            return False
+        if not any(key.startswith(f"{prefix}mtp_block.") for key in weights):
+            return False
+    return True
+
+
 def _rewrite_deepseek_mtp_weights(
     raw: dict[str, Any],
     *,
@@ -321,7 +347,9 @@ def inject_deepseek_mtp_support(
         start_layer=int(getattr(args, "num_hidden_layers")),
         num_mtp_layers=_num_mtp_layers(config),
     )
-    if not mapped:
+    if not mapped or not _has_complete_deepseek_mtp_payload(
+        mapped, num_mtp_layers=_num_mtp_layers(config)
+    ):
         logger.warning("[DeepSeek MTP inject] No DeepSeek MTP weights found in %s", model_path)
         return False
 

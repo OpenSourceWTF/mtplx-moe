@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -47,7 +49,7 @@ from mtplx.models.hy3_mlx import ModelArgs as Hy3Args
 from mtplx.resident_loader import construct_resident_model
 
 
-def _hy3_args() -> Hy3Args:
+def _hy3_args(*, num_experts: int = 2, top_k: int = 1) -> Hy3Args:
     return Hy3Args(
         model_type="hy_v3",
         hidden_size=64,
@@ -56,8 +58,8 @@ def _hy3_args() -> Hy3Args:
         moe_intermediate_size=64,
         num_attention_heads=4,
         num_key_value_heads=2,
-        num_experts=2,
-        num_experts_per_tok=1,
+        num_experts=num_experts,
+        num_experts_per_tok=top_k,
         num_shared_experts=1,
         first_k_dense_replace=1,
         rms_norm_eps=1e-5,
@@ -2016,20 +2018,25 @@ def test_descriptor_bits_reach_mapped_switch(
     assert observed_bits == [2]
 
 
-def _integrated_hy3_artifact(tmp_path: Path):
-    args = _hy3_args()
+def _integrated_hy3_artifact(
+    tmp_path: Path,
+    *,
+    expert_count: int = 2,
+    top_k: int = 1,
+):
+    args = _hy3_args(num_experts=expert_count, top_k=top_k)
     model = Hy3Model(args)
     weights = dict(tree_flatten(model.parameters()))
     expert_shapes = {
-        "gate_proj.weight": (2, 64, 8),
-        "gate_proj.scales": (2, 64, 1),
-        "gate_proj.biases": (2, 64, 1),
-        "up_proj.weight": (2, 64, 8),
-        "up_proj.scales": (2, 64, 1),
-        "up_proj.biases": (2, 64, 1),
-        "down_proj.weight": (2, 64, 8),
-        "down_proj.scales": (2, 64, 1),
-        "down_proj.biases": (2, 64, 1),
+        "gate_proj.weight": (expert_count, 64, 8),
+        "gate_proj.scales": (expert_count, 64, 1),
+        "gate_proj.biases": (expert_count, 64, 1),
+        "up_proj.weight": (expert_count, 64, 8),
+        "up_proj.scales": (expert_count, 64, 1),
+        "up_proj.biases": (expert_count, 64, 1),
+        "down_proj.weight": (expert_count, 64, 8),
+        "down_proj.scales": (expert_count, 64, 1),
+        "down_proj.biases": (expert_count, 64, 1),
     }
     for component, shape in expert_shapes.items():
         dtype = mx.uint32 if component.endswith("weight") else mx.bfloat16
@@ -2044,7 +2051,7 @@ def _integrated_hy3_artifact(tmp_path: Path):
     config = asdict(args)
     config["model_type"] = "hy_v3"
     (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
-    routed_bytes = 2 * 6_912
+    routed_bytes = expert_count * 6_912
     total_bytes = sum(int(value.nbytes) for value in weights.values())
     spec = ExpertStreamingModelSpec(
         key="tiny-hy3-q4",
@@ -2057,8 +2064,8 @@ def _integrated_hy3_artifact(tmp_path: Path):
         total_layers=2,
         routed_layer_start=1,
         routed_layer_count=1,
-        expert_count=2,
-        top_k=1,
+        expert_count=expert_count,
+        top_k=top_k,
         hidden_size=64,
         expert_hidden_size=64,
         quant_bits=4,
@@ -2066,7 +2073,7 @@ def _integrated_hy3_artifact(tmp_path: Path):
         quant_parameter_bytes=2,
         router_storage="float32",
         router_matmul_dtype="float32",
-        router_bytes=2 * 64 * 4 + 2 * 4,
+        router_bytes=expert_count * 64 * 4 + expert_count * 4,
         kv_bytes_per_token=0,
         mtp_layer_index=2,
         mtp_included=False,
@@ -3264,3 +3271,651 @@ def test_resident_loader_runs_indexshare_glm_with_streamed_sparse_layers(
         assert runtime.snapshot(mx_module=mx)["cache"]["route_calls"] == 5
     finally:
         runtime.close()
+
+
+def test_deferred_split_route_release_matches_fenced_bitwise(
+    tmp_path: Path,
+) -> None:
+    """split_route_release=deferred must produce bitwise-identical logits
+    to the fenced default, hold its leases until the deferred flush, and
+    leave zero pins after it."""
+
+    root, config, spec, manifest_path = _integrated_hy3_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+
+    def run(mode: str):
+        stream_config = ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=fixed + spec.persistent_cache_bytes(1),
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            deferred_pin_release=True,
+            split_route_release=mode,
+        )
+        runtime = ExpertStreamingRuntime.open(
+            root,
+            manifest_path,
+            stream_config,
+            spec=spec,
+            buffer_allocator=make_mlx_slot_buffer_allocator(
+                stream_config.memory_plan(spec), spec
+            ),
+            device_synchronize=mx.synchronize,
+            apply_memory_cap=False,
+        )
+        try:
+            resident = construct_resident_model(root, runtime, config=config)
+            logits = resident.model(mx.array([[1]], dtype=mx.int32))
+            mx.eval(logits)
+            held = runtime.snapshot(mx_module=mx)["slots"]["pins"]
+            runtime.flush_deferred_slot_releases(evaluate=True)
+            drained = runtime.snapshot(mx_module=mx)["slots"]["pins"]
+            return logits, held, drained
+        finally:
+            runtime.close()
+
+    fenced_logits, _fenced_held, fenced_drained = run("fenced")
+    deferred_logits, deferred_held, deferred_drained = run("deferred")
+
+    assert fenced_drained == 0
+    assert deferred_held > 0, "deferred mode must hold leases until flush"
+    assert deferred_drained == 0
+    assert mx.array_equal(fenced_logits, deferred_logits).item()
+
+
+def test_speculative_io_admission_caps_prefetch_read_concurrency(
+    tmp_path: Path,
+) -> None:
+    """Speculative reads are capped at a configurable fraction of the
+    inflight I/O budget so demand miss reads never queue behind
+    speculation at the SSD."""
+
+    root, config, spec, manifest_path = _integrated_hy3_artifact(
+        tmp_path, expert_count=4, top_k=1
+    )
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    record = spec.expert_record_bytes
+
+    def open_runtime(*, prefetch_slots: int = 4, **overrides):
+        stream_config = ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=(
+                fixed
+                + spec.persistent_cache_bytes(1)
+                + prefetch_slots * record
+            ),
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            prefetch_slots=prefetch_slots,
+            max_inflight_io_bytes=8 * record,
+            **overrides,
+        )
+        return ExpertStreamingRuntime.open(
+            root,
+            manifest_path,
+            stream_config,
+            spec=spec,
+            buffer_allocator=make_mlx_slot_buffer_allocator(
+                stream_config.memory_plan(spec), spec
+            ),
+            device_synchronize=mx.synchronize,
+            apply_memory_cap=False,
+        )
+
+    # Default fraction 0.25 of an 8-record budget: 2 concurrent reads.
+    runtime = open_runtime()
+    try:
+        assert runtime._prefetch_executor._max_workers == 2
+        surface = runtime.snapshot(mx_module=mx)["speculative_io"]
+        assert surface == {
+            "fraction": 0.25,
+            "max_concurrent_reads": 2,
+            "max_inflight_bytes": 2 * record,
+        }
+    finally:
+        runtime.close()
+
+    # A tighter fraction floors at one read — speculation is never
+    # starved outright.
+    runtime = open_runtime(speculative_io_fraction=0.1)
+    try:
+        assert runtime._prefetch_executor._max_workers == 1
+        surface = runtime.snapshot(mx_module=mx)["speculative_io"]
+        assert surface["max_concurrent_reads"] == 1
+        assert surface["max_inflight_bytes"] == record
+    finally:
+        runtime.close()
+
+    # The ring width still bounds concurrency above.
+    runtime = open_runtime(speculative_io_fraction=1.0)
+    try:
+        assert runtime._prefetch_executor._max_workers == 4
+    finally:
+        runtime.close()
+
+    # Disabled prefetch reports an idle admission surface.
+    runtime = open_runtime(prefetch_slots=0)
+    try:
+        surface = runtime.snapshot(mx_module=mx)["speculative_io"]
+        assert surface["max_concurrent_reads"] == 0
+        assert surface["max_inflight_bytes"] == 0
+    finally:
+        runtime.close()
+
+
+def test_prefetch_skips_experts_the_route_is_already_loading(
+    tmp_path: Path,
+) -> None:
+    """Speculation must not duplicate the demand path: predictions that
+    match the layer's most recent route misses are dropped (their bytes
+    are already streaming in or freshly transient-resident)."""
+
+    root, config, spec, manifest_path = _integrated_hy3_artifact(
+        tmp_path, expert_count=4, top_k=1
+    )
+    runtime = _open_prefetch_runtime(
+        root, manifest_path, spec, prefetch_slots=2
+    )
+    layer = 1
+    bank = runtime._banks[layer]
+    lock = runtime._layer_locks[layer]
+    try:
+        # Occupy the single persistent slot with a repeat visitor so the
+        # next miss is transient-served (not persistent-resident, which
+        # the ring would already skip on its own).
+        for _repeat in range(2):
+            ready = runtime.ensure_route(layer, [1], phase="decode")
+            ready.release()
+        ready = runtime.ensure_route(layer, [2], phase="decode")
+        ready.release()
+        with lock:
+            assert 2 not in bank._expert_to_slot
+        # 2 was the route's own miss: the prediction is dropped; 3 issues.
+        issued = runtime.prefetch_experts(layer, [2, 3])
+        assert issued == 1
+        with lock:
+            assert 3 in bank._prefetch_inflight
+            assert 2 not in bank._prefetch_inflight
+
+        # Saturation surface for the lookahead hook: an idle enabled lane
+        # is not saturated; a disabled lane always is.
+        assert runtime.speculation_saturated is False
+    finally:
+        runtime.close()
+
+    disabled = _open_prefetch_runtime(
+        root, manifest_path, spec, prefetch_slots=0
+    )
+    try:
+        assert disabled.speculation_saturated is True
+    finally:
+        disabled.close()
+
+
+def test_prefetch_workers_never_block_on_layer_locks(
+    tmp_path: Path,
+) -> None:
+    """Publication is decoupled from layer locks: completion callbacks
+    only enqueue, and the next prefetch_experts call on the generation
+    thread batch-applies commits under the lock it already holds. A
+    route-held layer lock therefore can no longer hold a prefetch worker
+    captive (measured convoy: 34us -> 7.6ms per 5ms lock hold)."""
+
+    root, config, spec, manifest_path = _integrated_hy3_artifact(
+        tmp_path, expert_count=4, top_k=1
+    )
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    record = spec.expert_record_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=(
+            fixed + spec.persistent_cache_bytes(1) + 2 * record
+        ),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        prefetch_slots=2,
+        max_inflight_io_bytes=8 * record,
+        # Exactly one speculative worker: a blocked callback would wedge
+        # the whole lane, which is precisely what must not happen.
+        speculative_io_fraction=0.125,
+    )
+    runtime = ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=make_mlx_slot_buffer_allocator(
+            stream_config.memory_plan(spec), spec
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+    layer = 1
+    bank = runtime._banks[layer]
+    lock = runtime._layer_locks[layer]
+    try:
+        assert runtime._prefetch_executor._max_workers == 1
+        assert runtime.prefetch_experts(layer, [0]) == 1
+        lock.acquire()
+        try:
+            # The load settles (claim, fill, completion bookkeeping)
+            # while the lock is held by this thread.
+            deadline = time.monotonic() + 5.0
+            while True:
+                with runtime._prefetch_lock:
+                    if not runtime._prefetch_futures:
+                        break
+                if time.monotonic() > deadline:
+                    pytest.fail("speculative load never completed")
+                time.sleep(0.005)
+            # The single worker is FREE despite the held layer lock: a
+            # probe task runs promptly. Pre-fix the callback blocked on
+            # this lock and the probe would time out.
+            probe = runtime._prefetch_executor.submit(lambda: 42)
+            assert probe.result(timeout=2.0) == 42
+            # Publication waits for the generation thread.
+            assert 0 not in bank._prefetch_expert_to_slot
+            assert 0 in bank._prefetch_inflight
+        finally:
+            lock.release()
+        # The next generation-thread prefetch call applies the commit.
+        assert runtime.prefetch_experts(layer, []) == 0
+        with lock:
+            assert bank._prefetch_expert_to_slot.get(0) is not None
+            assert 0 not in bank._prefetch_inflight
+        with runtime._counter_lock:
+            assert runtime.counters.prefetch_committed == 1
+    finally:
+        runtime.close()
+
+
+def test_prefetch_ring_load_resolves_as_route_hit_bitwise(
+    tmp_path: Path,
+) -> None:
+    """A committed speculative ring load must satisfy the next decode route
+    as an ordinary hit (no route read), and prefetch must not perturb the
+    generated logits."""
+
+    root, config, spec, manifest_path = _integrated_hy3_artifact(tmp_path)
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    streamed_layer = 1
+
+    def run(prefetch_slots: int):
+        stream_config = ExpertStreamingConfig(
+            model_key=spec.key,
+            memory_limit_bytes=(
+                fixed
+                + spec.persistent_cache_bytes(1)
+                + prefetch_slots * spec.expert_record_bytes
+            ),
+            max_live_kv_tokens=0,
+            runtime_reserve_bytes=0,
+            prefetch_slots=prefetch_slots,
+        )
+        runtime = ExpertStreamingRuntime.open(
+            root,
+            manifest_path,
+            stream_config,
+            spec=spec,
+            buffer_allocator=make_mlx_slot_buffer_allocator(
+                stream_config.memory_plan(spec), spec
+            ),
+            device_synchronize=mx.synchronize,
+            apply_memory_cap=False,
+        )
+        try:
+            if prefetch_slots:
+                bank = runtime._banks[streamed_layer]
+                assert bank.prefetch_slots == prefetch_slots
+                # A held layer transaction lock (deferred split-route
+                # release keeps it across evals) must skip speculation
+                # without planning anything, never block the caller.
+                with runtime._layer_locks[streamed_layer]:
+                    assert (
+                        runtime.prefetch_experts(streamed_layer, [0, 1]) == 0
+                    )
+                # Both experts are uncached; each must get a ring load.
+                issued = runtime.prefetch_experts(streamed_layer, [0, 1])
+                assert issued == 2
+                # Duplicate predictions are absorbed by the inflight set.
+                assert runtime.prefetch_experts(streamed_layer, [0, 1]) == 0
+                _wait_ring_published(runtime, streamed_layer, {0, 1})
+            else:
+                # Disabled prefetch is a no-op, not an error.
+                assert runtime.prefetch_experts(streamed_layer, [0, 1]) == 0
+            resident = construct_resident_model(root, runtime, config=config)
+            logits = resident.model(mx.array([[1]], dtype=mx.int32))
+            mx.eval(logits)
+            snapshot = runtime.snapshot(mx_module=mx)
+            assert snapshot["slots"]["pins"] == 0
+            return logits, snapshot
+        finally:
+            runtime.close()
+
+    plain_logits, plain_snapshot = run(0)
+    prefetch_logits, prefetch_snapshot = run(2)
+
+    # Baseline: the single decode route misses and loads from SSD.
+    assert plain_snapshot["cache"]["expert_hits"] == 0
+    assert plain_snapshot["cache"]["expert_misses"] == 1
+    assert plain_snapshot["cache"]["prefetch_issued"] == 0
+    assert plain_snapshot["cache"]["prefetch_committed"] == 0
+    assert plain_snapshot["slots"]["prefetch_slot_count"] == 0
+
+    # Prefetched: the same route resolves inside the ring with no load.
+    assert prefetch_snapshot["cache"]["prefetch_issued"] == 2
+    assert prefetch_snapshot["cache"]["prefetch_committed"] == 2
+    assert prefetch_snapshot["cache"]["expert_hits"] == 1
+    assert prefetch_snapshot["cache"]["expert_misses"] == 0
+    assert prefetch_snapshot["cache"]["bytes_read"] == 0
+    assert prefetch_snapshot["slots"]["prefetch_slot_count"] == 2
+    # The speculative reads themselves went through the checked pool path.
+    assert prefetch_snapshot["slots"]["metrics"]["owned_loads"] >= 2
+
+    assert mx.array_equal(plain_logits, prefetch_logits).item()
+
+
+def _open_prefetch_runtime(
+    root,
+    manifest_path,
+    spec,
+    *,
+    prefetch_slots: int,
+):
+    fixed = spec.resident_bytes + spec.transient_scratch_bytes
+    stream_config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=(
+            fixed
+            + spec.persistent_cache_bytes(1)
+            + prefetch_slots * spec.expert_record_bytes
+        ),
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        prefetch_slots=prefetch_slots,
+        # A multi-record I/O budget, as on real configs: the default
+        # speculative admission fraction (0.25) then grants two
+        # concurrent speculative reads, which the gated choreographies
+        # rely on (one parked load must not serialize the ring).
+        max_inflight_io_bytes=8 * spec.expert_record_bytes,
+    )
+    return ExpertStreamingRuntime.open(
+        root,
+        manifest_path,
+        stream_config,
+        spec=spec,
+        buffer_allocator=make_mlx_slot_buffer_allocator(
+            stream_config.memory_plan(spec), spec
+        ),
+        device_synchronize=mx.synchronize,
+        apply_memory_cap=False,
+    )
+
+
+def _drive_prefetch(runtime, layer: int, expert: int) -> None:
+    """Issue one speculative assignment, retrying lost try-lock races."""
+
+    bank = runtime._banks[layer]
+    lock = runtime._layer_locks[layer]
+    deadline = time.monotonic() + 5.0
+    while True:
+        runtime.prefetch_experts(layer, [expert])
+        with lock:
+            if (
+                expert in bank._prefetch_inflight
+                or expert in bank._prefetch_expert_to_slot
+            ):
+                return
+        if time.monotonic() > deadline:
+            pytest.fail(f"expert {expert} never reached the prefetch ring")
+        time.sleep(0.005)
+
+
+def _wait_ring_published(runtime, layer: int, experts: set[int]) -> None:
+    bank = runtime._banks[layer]
+    lock = runtime._layer_locks[layer]
+    deadline = time.monotonic() + 10.0
+    while True:
+        # Publication happens on the generation thread: an empty
+        # prefetch call is the flush that applies settled loads.
+        runtime.prefetch_experts(layer, [])
+        with lock:
+            published = set(bank._prefetch_expert_to_slot)
+        if experts <= published:
+            return
+        if time.monotonic() > deadline:
+            pytest.fail(f"ring never published {sorted(experts - published)}")
+        time.sleep(0.005)
+
+
+def test_stale_prefetch_commit_never_publishes_a_reassigned_ring_slot(
+    tmp_path: Path,
+) -> None:
+    """Regression for the depth-matrix failure 'expert slot did not reach
+    the requested generation' (issue #51 C6 A/B, d0/AR retained cell).
+
+    Commit callbacks used to be keyed by expert id alone, so a delayed
+    callback could publish the expert's NEWER, unfilled ring assignment.
+    The runtime now prevents the precondition outright: a ring slot whose
+    load has not fully settled (fill + completion callback) is excluded
+    from recycling, so an expert with an outstanding load can never be
+    re-assigned while its commit is pending. This choreography holds a
+    load's callback open and asserts the busy slot is skipped, spillover
+    predictions land in the free slot, and the late commit publishes the
+    original — correctly filled — slot.
+    """
+
+    root, config, spec, manifest_path = _integrated_hy3_artifact(
+        tmp_path, expert_count=4, top_k=1
+    )
+    runtime = _open_prefetch_runtime(
+        root, manifest_path, spec, prefetch_slots=2
+    )
+    layer = 1
+    bank = runtime._banks[layer]
+    lock = runtime._layer_locks[layer]
+    pool = runtime.slots
+    ring_base = runtime.plan.slots_per_layer + runtime.plan.transient_slots
+
+    original = pool.load_speculative
+    zero_filled = threading.Event()
+    release_zero = threading.Event()
+    zero_load_count = [0]
+
+    def gated(layer_arg, load):
+        if load.expert == 0:
+            zero_load_count[0] += 1
+            # Fill ring slot 0 normally, then hold the future open so the
+            # commit callback lags behind later prefetch traffic.
+            original(layer_arg, load)
+            zero_filled.set()
+            assert release_zero.wait(20.0)
+            return
+        original(layer_arg, load)
+
+    pool.load_speculative = gated
+    try:
+        # 0 -> ring0; the fill completes but its callback is held open.
+        _drive_prefetch(runtime, layer, 0)
+        assert zero_filled.wait(10.0)
+        # 1 -> ring1, fills and publishes.
+        _drive_prefetch(runtime, layer, 1)
+        _wait_ring_published(runtime, layer, {1})
+        # Expert 2 arrives while ring0's load is unsettled: the ring must
+        # skip the busy slot and replace ring1's published entry instead.
+        _drive_prefetch(runtime, layer, 2)
+        _wait_ring_published(runtime, layer, {2})
+        with lock:
+            published = dict(bank._prefetch_expert_to_slot)
+            assert published[2] == ring_base + 1
+            assert 1 not in published
+            # The unsettled assignment was never recycled.
+            assert 0 in bank._prefetch_inflight
+        # Release the held callback: its commit publishes ring0, whose
+        # bytes the load wrote before parking — a correct, exact entry.
+        release_zero.set()
+        _wait_ring_published(runtime, layer, {0, 2})
+        with lock:
+            assert bank._prefetch_expert_to_slot[0] == ring_base
+        assert zero_load_count[0] == 1, "expert 0 must never be re-loaded"
+
+        # Every published entry is physically consistent: a decode route
+        # resolving it pins exactly that expert. Before busy-gating this
+        # choreography ended in ExpertSlotError('expert slot did not
+        # reach the requested generation').
+        for expert in (0, 2):
+            ready = runtime.ensure_route(layer, [expert], phase="decode")
+            try:
+                assert [
+                    binding.expert for binding in ready.bindings
+                ] == [expert]
+            finally:
+                ready.release()
+    finally:
+        release_zero.set()
+        del pool.load_speculative  # restore the bound method
+        runtime.close()
+
+
+def test_recycled_ring_assignment_load_never_claims_a_published_slot(
+    tmp_path: Path,
+) -> None:
+    """Deterministic replay of the six-suite stress flake.
+
+    A speculative load can stall between _run_speculative_load's
+    ticket-liveness check and load_speculative's physical claim (scheduler
+    preemption under CPU contention). Its ring assignment is then
+    recycled, the slot refilled and PUBLISHED for another expert — and
+    the stale claim used to re-own the published slot, so the next route
+    hit-resolving it died in _wait_ready with 'expert slot did not reach
+    the requested generation'. Ring recycling must never hand out a slot
+    whose previous load has not fully settled.
+    """
+
+    root, config, spec, manifest_path = _integrated_hy3_artifact(
+        tmp_path, expert_count=4, top_k=1
+    )
+    runtime = _open_prefetch_runtime(
+        root, manifest_path, spec, prefetch_slots=2
+    )
+    layer = 1
+    bank = runtime._banks[layer]
+    lock = runtime._layer_locks[layer]
+    pool = runtime.slots
+
+    original = pool.load_speculative
+    parked = threading.Event()
+    release = threading.Event()
+
+    def gated(layer_arg, load):
+        if load.expert == 0:
+            # Stall in the post-ticket-check, pre-claim window.
+            parked.set()
+            assert release.wait(20.0)
+        original(layer_arg, load)
+
+    pool.load_speculative = gated
+    try:
+        # 0 -> ring slot A; its worker parks before claiming the slot.
+        _drive_prefetch(runtime, layer, 0)
+        assert parked.wait(10.0)
+        # 1 -> ring slot B, fills and publishes.
+        _drive_prefetch(runtime, layer, 1)
+        _wait_ring_published(runtime, layer, {1})
+        # Expert 2 needs a ring slot. Recycling slot A (whose stale load
+        # is still parked) would let that load re-own the slot after 2's
+        # fill publishes it.
+        _drive_prefetch(runtime, layer, 2)
+        _wait_ring_published(runtime, layer, {2})
+        release.set()
+        # The released load fills its own still-live assignment; the next
+        # generation-thread flush publishes it.
+        _wait_ring_published(runtime, layer, {0, 2})
+
+        # Every published ring entry must be physically consistent: a
+        # decode route resolving it pins exactly that expert. Before the
+        # fix, expert 2's published slot held expert 0's bytes and this
+        # raised the production ExpertSlotError.
+        with lock:
+            published = sorted(bank._prefetch_expert_to_slot)
+        assert 2 in published
+        for expert in published:
+            ready = runtime.ensure_route(layer, [expert], phase="decode")
+            try:
+                assert [
+                    binding.expert for binding in ready.bindings
+                ] == [expert]
+            finally:
+                ready.release()
+    finally:
+        release.set()
+        del pool.load_speculative  # restore the bound method
+        runtime.close()
+
+
+def test_prefetch_stress_concurrent_recycling_keeps_routes_healthy(
+    tmp_path: Path,
+) -> None:
+    """A prefetch thread hammering the streamed layer while the main
+    thread decodes must never corrupt ring publication: every forward
+    stays healthy and the output matches a prefetch-free run bitwise."""
+
+    root, config, spec, manifest_path = _integrated_hy3_artifact(
+        tmp_path, expert_count=4, top_k=2
+    )
+    steps = 120
+
+    def run(prefetch_slots: int):
+        runtime = _open_prefetch_runtime(
+            root, manifest_path, spec, prefetch_slots=prefetch_slots
+        )
+        stop = threading.Event()
+        prefetch_errors: list[BaseException] = []
+
+        def prefetch_loop() -> None:
+            patterns = ([0, 1], [2, 3], [1, 2], [3, 0], [0, 2], [1, 3])
+            index = 0
+            while not stop.is_set():
+                try:
+                    issued = runtime.prefetch_experts(
+                        1, patterns[index % len(patterns)]
+                    )
+                except BaseException as exc:  # noqa: BLE001 - fail the test
+                    prefetch_errors.append(exc)
+                    return
+                index += 1
+                if not issued:
+                    # Throttled (backlog cap or lost try-lock): yield the
+                    # GIL instead of spinning against the decode thread.
+                    time.sleep(0.0005)
+
+        thread = None
+        if prefetch_slots:
+            thread = threading.Thread(target=prefetch_loop, daemon=True)
+            thread.start()
+        try:
+            resident = construct_resident_model(root, runtime, config=config)
+            outputs = []
+            for step in range(steps):
+                logits = resident.model(
+                    mx.array([[1 + (step % 7)]], dtype=mx.int32)
+                )
+                mx.eval(logits)
+                outputs.append(logits)
+            snapshot = runtime.snapshot(mx_module=mx)
+            assert snapshot["slots"]["pins"] == 0
+            assert not prefetch_errors, prefetch_errors
+            return outputs, snapshot
+        finally:
+            stop.set()
+            if thread is not None:
+                thread.join(timeout=30.0)
+                assert not thread.is_alive(), "prefetch thread wedged"
+            runtime.close()
+
+    plain_outputs, _plain_snapshot = run(0)
+    stressed_outputs, stressed_snapshot = run(2)
+
+    assert stressed_snapshot["cache"]["prefetch_issued"] > 0
+    for plain, stressed in zip(plain_outputs, stressed_outputs, strict=True):
+        assert mx.array_equal(plain, stressed).item()

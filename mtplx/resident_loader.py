@@ -12,6 +12,7 @@ from .expert_manifest import (
     resolve_artifact_member,
 )
 from .expert_runtime import ExpertStreamingRuntime
+from .expert_streaming_models import proj_quant_covers
 
 
 class ResidentLoadError(RuntimeError):
@@ -26,8 +27,10 @@ class ResidentLoadReport:
     evaluated_parameter_count: int
     bound_sparse_layers: int
     strict: bool
+    proj_quant: str | None = None
+    proj_quantized_modules: int = 0
 
-    def as_dict(self) -> dict[str, int | bool]:
+    def as_dict(self) -> dict[str, int | bool | str | None]:
         return {
             "shard_count": self.shard_count,
             "tensor_count": self.tensor_count,
@@ -35,6 +38,8 @@ class ResidentLoadReport:
             "evaluated_parameter_count": self.evaluated_parameter_count,
             "bound_sparse_layers": self.bound_sparse_layers,
             "strict": self.strict,
+            "proj_quant": self.proj_quant,
+            "proj_quantized_modules": self.proj_quantized_modules,
         }
 
 
@@ -190,6 +195,68 @@ def _quantize_resident_model(
     )
 
 
+_PROJ_QUANT_BITS = {"q8": 8, "q4": 4}
+
+
+def _runtime_quantize_projections(model: Any, mode: str) -> list[str]:
+    """Quantize the bandwidth-dominant trunk ``*_proj`` Linears after a BF16 load.
+
+    Scope comes from ``proj_quant_covers`` — the memory plan discounts the
+    same tensors, so the two must never diverge. Router gates, embeddings,
+    the LM head, norms, and MTP glue keep their loaded precision.
+    """
+
+    try:
+        import mlx.nn as nn
+    except Exception as exc:
+        raise ResidentLoadError(
+            f"MLX NN is required for projection quantization: {exc}"
+        ) from exc
+    bits = _PROJ_QUANT_BITS[mode]
+    quantized: list[str] = []
+
+    def predicate(path: str, module: Any) -> bool:
+        if not isinstance(module, nn.Linear) or isinstance(
+            module, nn.QuantizedLinear
+        ):
+            return False
+        if proj_quant_covers(path):
+            quantized.append(path)
+            return True
+        return False
+
+    nn.quantize(
+        model, group_size=64, bits=bits, mode="affine", class_predicate=predicate
+    )
+    if not quantized:
+        raise ResidentLoadError(
+            f"proj_quant={mode!r} matched no trunk *_proj Linear modules"
+        )
+    return quantized
+
+
+def _verify_kv_quant_honored(model: Any, kv_quant: str) -> None:
+    """Reject models whose make_cache silently ignores _mtplx_kv_quant.
+
+    The attribute is honored per-model overlay; an ignored kv_quant would
+    desync the memory plan's discounted KV pricing from reality.
+    """
+
+    try:
+        from mlx_lm.models.cache import QuantizedKVCache
+
+        probe_cache = model.make_cache()
+    except Exception as exc:
+        raise ResidentLoadError(
+            f"kv_quant={kv_quant!r} probe failed: {exc}"
+        ) from exc
+    if not any(isinstance(entry, QuantizedKVCache) for entry in probe_cache):
+        raise ResidentLoadError(
+            f"kv_quant={kv_quant!r} requested but "
+            f"{type(model).__name__}.make_cache ignores it"
+        )
+
+
 def construct_resident_model(
     root: Path | str,
     runtime: ExpertStreamingRuntime,
@@ -242,6 +309,13 @@ def construct_resident_model(
         model.load_weights(list(weights.items()), strict=strict)
     except Exception as exc:
         raise ResidentLoadError(f"resident parameter validation failed: {exc}") from exc
+    proj_quant = getattr(runtime.config, "proj_quant", None)
+    quantized_paths: list[str] = []
+    if proj_quant:
+        # Drop the loader's references first so each replaced BF16 weight
+        # frees as its quantized module lands, instead of at function exit.
+        weights.clear()
+        quantized_paths = _runtime_quantize_projections(model, proj_quant)
     if mx_module is None:
         import mlx.core as mx
     else:
@@ -259,9 +333,15 @@ def construct_resident_model(
         evaluated_parameter_count=parameter_count,
         bound_sparse_layers=bound,
         strict=strict,
+        proj_quant=proj_quant,
+        proj_quantized_modules=len(quantized_paths),
     )
     setattr(model, "_mtplx_expert_runtime", runtime)
     setattr(model, "_mtplx_resident_load_report", report.as_dict())
+    kv_quant = getattr(runtime.config, "kv_quant", None)
+    if kv_quant:
+        setattr(model, "_mtplx_kv_quant", kv_quant)
+        _verify_kv_quant_honored(model, kv_quant)
     return ResidentModel(model=model, config=config, report=report)
 
 

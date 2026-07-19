@@ -370,7 +370,6 @@ When disabled, never access experimental runtime/spec fields. When enabled, mate
 
 - [ ] **Step 3: Verify, commit, and gate**
 
-First prove disabled candidate matches the prior tip. Then run at least three alternating pairs with `MTPLX_EXPERIMENTAL_METAL_ROUTE_RESOLUTION=1`. Require token/stop parity, positive median+mean, `all_hits > 0`, zero leaked pins/routes, and no material memory/SSD regression.
 
 ### Task 7: Repair and gate PR #11 prompt-wide hotsets
 

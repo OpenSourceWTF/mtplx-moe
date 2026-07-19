@@ -25,6 +25,14 @@ from mtplx.benchmarks.resource_telemetry import (  # noqa: E402
     PowermetricsCollector,
     ResourceTelemetrySampler,
 )
+from mtplx.benchmarks.presets import (  # noqa: E402
+    PresetError,
+    add_preset_arguments,
+    preselect_preset,
+)
+from mtplx.optimization_profiles import (  # noqa: E402
+    profile_conflict_warnings,
+)
 
 
 SCHEMA = "mtplx-q2-bf16-mtp-depth-matrix-v3"
@@ -72,7 +80,25 @@ DEFAULT_RUNTIME_OPTIONS = {
     "q2_expert_kernel": "stock",
     "hy3_router_kernel": "mpp-r1-fused-r2",
     "hy3_router_sigmoid": "precise",
+    "hy3_mtp_shared_kernel": "stock",
+    "hy3_mtp_shared_kernel_depth": 3,
     "deferred_pin_release": True,
+    "island_layers": "",
+    "island_layer_count": None,
+    "proj_quant": None,
+    "kv_quant": None,
+    "miss_shadow": None,
+    "miss_shadow_layers": None,
+    "expert_integrity": "per-read",
+    "prefetch_slots": 0,
+    "split_route_release": "fenced",
+    "mmap_island_layers": "",
+    "banked_manifest": "",
+    "banked_codec": "none",
+    "streamed_codec": "none",
+    "streamed_codec_manifest": "",
+    "streamed_codec_verify": True,
+    "mmap_island_wired": True,
     "read_chunk": "8MiB",
     "bypass_page_cache": True,
     "resource_telemetry": False,
@@ -225,6 +251,7 @@ def _integer_csv(value: str) -> tuple[int, ...]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_preset_arguments(parser)
     parser.add_argument(
         "--model",
         dest="models",
@@ -343,6 +370,18 @@ def build_parser() -> argparse.ArgumentParser:
             "(fast is a selectable experiment; default: precise)."
         ),
     )
+    parser.add_argument(
+        "--hy3-mtp-shared-kernel",
+        choices=("stock", "metal-exact"),
+        default="stock",
+        help="Issue 69 Hy3 MTP shared-MLP execution arm (default: stock).",
+    )
+    parser.add_argument(
+        "--hy3-mtp-shared-kernel-depth",
+        type=_positive_int,
+        default=3,
+        help="Only fixed MTP depth that selects metal-exact (default: 3).",
+    )
     parser.add_argument("--read-chunk", default="8MiB")
     parser.add_argument(
         "--f-nocache",
@@ -425,8 +464,197 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
+    parser.add_argument(
+        "--island-layers",
+        default="",
+        help=(
+            "Dense island layers holding every expert resident (issue #63 "
+            "C5), e.g. '1-38,60-79'. Empty disables islands."
+        ),
+    )
+    parser.add_argument(
+        "--mmap-island-layers",
+        default="",
+        help=(
+            "Banked mmap island layers served from a repacked component-major "
+            "sidecar via the page cache (issue #51 C6), e.g. '39-59'. "
+            "Requires --banked-manifest. Empty disables the mmap band."
+        ),
+    )
+    parser.add_argument(
+        "--banked-manifest",
+        default="",
+        help="Path to the banked expert sidecar manifest JSON (C6).",
+    )
+    parser.add_argument(
+        "--banked-codec",
+        default="none",
+        choices=["none", "rans32x-v1"],
+        help=(
+            "Lossless codec of the banked sidecar. 'rans32x-v1' stores each "
+            "component bank as a static order-0 byte-rANS container that the "
+            "in-kernel decoder rebuilds at load (issue #51 C7)."
+        ),
+    )
+    parser.add_argument(
+        "--streamed-codec",
+        default="none",
+        choices=["none", "rans32x-v1"],
+        help=(
+            "Lossless codec of the streamed miss-read sidecar (issue #113). "
+            "'rans32x-v1' reads per-record rANS containers and decodes them "
+            "in-kernel on the miss path."
+        ),
+    )
+    parser.add_argument(
+        "--streamed-codec-manifest",
+        default="",
+        help="Path to the streamed codec sidecar manifest JSON.",
+    )
+    parser.add_argument(
+        "--streamed-codec-verify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Verify decoded record payload hashes on the streamed codec path.",
+    )
+    parser.add_argument(
+        "--mtp-precision",
+        default="bf16",
+        choices=["bf16", "q4"],
+        help=(
+            "Streamed external MTP head precision. 'bf16' is the bit-exact "
+            "default; 'q4' loads the quantized sibling artifact (speculative-"
+            "only head: costs acceptance, never correctness). Point the "
+            "matching --*-mtp-artifacts flag at the artifact directory of the "
+            "chosen precision."
+        ),
+    )
+    parser.add_argument(
+        "--mmap-island-wired",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Register banked mmap regions in MLX's residency set (permanently "
+            "resident, counted on the plan's fixed side). --no-mmap-island-wired "
+            "leaves residency to the pager for bands larger than RAM."
+        ),
+    )
+    parser.add_argument(
+        "--island-layer-count",
+        type=int,
+        default=None,
+        help=(
+            "Pin the N worst-streaming layers as dense islands using the "
+            "model's measured pin order. Mutually exclusive with "
+            "--island-layers. The experts cache stays independently sized "
+            "via --expert-cache-limit."
+        ),
+    )
+    parser.add_argument(
+        "--proj-quant",
+        "--resident-quant",  # deprecated alias, kept so saved runners still work
+        dest="proj_quant",
+        choices=("q8", "q4"),
+        default=None,
+        help=(
+            "Quantize the trunk *_proj Linears at load time (group 64 "
+            "affine): attention q/k/v/o_proj and gate/up/down_proj in the "
+            "mlp and shared_mlp blocks. Routers, embeddings, the LM head, "
+            "and norms keep their loaded precision. No artifact rebuild. "
+            "(--resident-quant is a deprecated alias for this flag.)"
+        ),
+    )
+    parser.add_argument(
+        "--split-route-release",
+        choices=("fenced", "deferred"),
+        default="fenced",
+        help=(
+            "Split-route slot release. fenced: per-part synchronous GPU "
+            "fences (3-6 pipeline drains per streamed layer). deferred: "
+            "lease bookkeeping replays at the next generation eval "
+            "(requires deferred pin release; decode only)."
+        ),
+    )
+    parser.add_argument(
+        "--expert-integrity",
+        choices=("per-read", "at-open", "headers-only"),
+        default="per-read",
+        help=(
+            "Expert record integrity mode. per-read: sha256 every record "
+            "read (measured ~10 ms/token of decode CPU at 27%% miss). "
+            "at-open: verify the sidecar hash once at load, no per-read "
+            "hashing. headers-only: artifact header checks only."
+        ),
+    )
+    parser.add_argument(
+        "--kv-quant",
+        choices=("q8", "q4"),
+        default=None,
+        help=(
+            "Quantized trunk KV cache (group 64 affine). The MTP draft "
+            "cache stays BF16; use --verify-strategy batched — "
+            "capture_commit adapts dense trunk KV state."
+        ),
+    )
+    parser.add_argument(
+        "--miss-shadow-layers",
+        type=int,
+        default=None,
+        help=(
+            "Cap shadow coverage to the N worst streamed layers (pin-order-"
+            "first: flattest routing, lowest exact-cache hit). Requires "
+            "--miss-shadow. Default: all streamed layers."
+        ),
+    )
+    parser.add_argument(
+        "--miss-shadow",
+        choices=("b1", "t158"),
+        default=None,
+        help=(
+            "Resident low-precision shadow banks for every streamed layer "
+            "(built at load from the sidecar, no artifact rebuild). Decode "
+            "cache misses are served instantly from the shadow instead of "
+            "waiting on SSD; the exact tier warms asynchronously. Output "
+            "is a quality tier, not bitwise — read ar_comparison / "
+            "token-divergence for the quality report. Requires cache-scope "
+            "layer and the component-banks slot layout. Use t158: b1 "
+            "collapses when encoded from Q2 sources (the Q2 grid's "
+            "exact-zero level; probe cosine 0.02-0.09) and is only a "
+            "mechanism-speed arm there."
+        ),
+    )
+    parser.add_argument(
+        "--prefetch-slots",
+        type=int,
+        default=0,
+        help=(
+            "Speculative expert-prefetch ring slots per streamed layer "
+            "(default 0: disabled). Decode applies the next sparse layers' "
+            "routers to the current hidden state and overlaps predicted "
+            "miss reads with compute. Requires layer cache scope."
+        ),
+    )
     parser.add_argument("--output-json", type=Path)
     return parser
+
+
+def parse_island_layers(text: str) -> tuple[int, ...]:
+    """Parse '1-38,60-79' style layer ranges into a sorted unique tuple."""
+
+    layers: set[int] = set()
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            low_text, high_text = part.split("-", 1)
+            low, high = int(low_text), int(high_text)
+            if high < low:
+                raise ValueError(f"island layer range {part!r} is inverted")
+            layers.update(range(low, high + 1))
+        else:
+            layers.add(int(part))
+    return tuple(sorted(layers))
 
 
 def _expand(path: Path | str) -> Path:
@@ -462,6 +690,7 @@ def _requests_from_args(args: argparse.Namespace) -> list[dict[str, Any]]:
             request["prompt_tail"] = _expand(prompt_tail)
         if not args.mtp_disabled_baseline:
             request["mtp_artifacts"] = _expand(mtp_artifacts)
+            request["mtp_precision"] = args.mtp_precision
         requests.append(request)
     return requests
 
@@ -479,7 +708,25 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "q2_expert_kernel": args.q2_expert_kernel,
         "hy3_router_kernel": args.hy3_router_kernel,
         "hy3_router_sigmoid": args.hy3_router_sigmoid,
+        "hy3_mtp_shared_kernel": args.hy3_mtp_shared_kernel,
+        "hy3_mtp_shared_kernel_depth": args.hy3_mtp_shared_kernel_depth,
         "deferred_pin_release": bool(args.deferred_pin_release),
+        "island_layers": args.island_layers,
+        "island_layer_count": args.island_layer_count,
+        "proj_quant": args.proj_quant,
+        "kv_quant": args.kv_quant,
+        "miss_shadow": args.miss_shadow,
+        "miss_shadow_layers": args.miss_shadow_layers,
+        "expert_integrity": args.expert_integrity,
+        "prefetch_slots": args.prefetch_slots,
+        "split_route_release": args.split_route_release,
+        "mmap_island_layers": args.mmap_island_layers,
+        "banked_manifest": args.banked_manifest,
+        "banked_codec": args.banked_codec,
+        "streamed_codec": args.streamed_codec,
+        "streamed_codec_manifest": args.streamed_codec_manifest,
+        "streamed_codec_verify": bool(args.streamed_codec_verify),
+        "mmap_island_wired": bool(args.mmap_island_wired),
         "read_chunk": args.read_chunk,
         "bypass_page_cache": args.bypass_page_cache,
         "resource_telemetry": args.resource_telemetry,
@@ -489,6 +736,38 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "powermetrics": args.powermetrics,
         "powermetrics_interval_ms": args.powermetrics_interval_ms,
     }
+
+
+def _profile_advisories(
+    requests: Sequence[Mapping[str, Any]],
+    runtime_options: Mapping[str, Any],
+    *,
+    verify_strategy: str,
+) -> list[str]:
+    """Optimization-profile advisories for the requested matrix (#99).
+
+    Compares the effective flags against each model's measured-default
+    profile and returns "profile suggests" lines. Warning only — nothing
+    here changes what runs.
+    """
+
+    lines: list[str] = []
+    for request in requests:
+        model_key = MODEL_SPECS[request["model"]]["model_key"]
+        observed = {
+            "proj_quant": runtime_options.get("proj_quant") or None,
+            "kv_quant": runtime_options.get("kv_quant") or None,
+            "expert_integrity": runtime_options.get("expert_integrity"),
+            "split_route_release": runtime_options.get("split_route_release"),
+            "prefetch_slots": int(runtime_options.get("prefetch_slots") or 0),
+            "miss_shadow": runtime_options.get("miss_shadow") or None,
+            "miss_shadow_layers": runtime_options.get("miss_shadow_layers"),
+            "island_layer_count": runtime_options.get("island_layer_count"),
+            "mtp_depth": tuple(request["depths"]),
+            "verify_strategy": verify_strategy,
+        }
+        lines.extend(profile_conflict_warnings(model_key, observed))
+    return lines
 
 
 def _jsonable(value: Any) -> Any:
@@ -1261,8 +1540,12 @@ def _cache_hit_rate(counters: Any) -> float | None:
 
 
 def _require_decode_cache_metrics(
-    cache_by_phase: Any, *, model: str, depth: int
-) -> tuple[dict[str, Any], float]:
+    cache_by_phase: Any,
+    *,
+    model: str,
+    depth: int,
+    fully_islanded: bool = False,
+) -> tuple[dict[str, Any], float | None]:
     decode = (
         cache_by_phase.get("decode") if isinstance(cache_by_phase, Mapping) else None
     )
@@ -1279,6 +1562,15 @@ def _require_decode_cache_metrics(
     hits = int(decode["expert_hits"])
     misses = int(decode["expert_misses"])
     denominator = hits + misses
+    if fully_islanded:
+        # Every routed layer executes on an island bank; a streamed cache
+        # assignment here is a wiring bug, not routing evidence.
+        if denominator != 0:
+            raise BenchmarkGateError(
+                f"{model} d{depth} routed {denominator} assignments through "
+                "the streamed expert cache despite full island coverage"
+            )
+        return dict(decode), None
     if denominator <= 0:
         raise BenchmarkGateError(
             f"{model} d{depth} decode expert-cache has no routed assignments"
@@ -1754,11 +2046,22 @@ def _run_observation(
         if not guards_disabled:
             raise BenchmarkGateError(f"{model} d{depth} triggered a generation guard")
 
+        expert_streaming = getattr(runtime, "expert_streaming", None)
+        fully_islanded = False
+        if expert_streaming is not None:
+            streaming_config = expert_streaming.config
+            island_total = len(streaming_config.island_layers) + len(
+                getattr(streaming_config, "mmap_island_layers", ())
+            )
+            fully_islanded = island_total == len(
+                expert_streaming.spec.routed_layer_indices
+            )
         _decode_streaming_counters, decode_cache_hit_rate = (
             _require_decode_cache_metrics(
                 streaming_counters_by_phase,
                 model=model,
                 depth=depth,
+                fully_islanded=fully_islanded,
             )
         )
         speculative_event_contract = _validate_speculative_event_contract(
@@ -1911,11 +2214,46 @@ def _runtime_config(
         q2_expert_kernel=str(options["q2_expert_kernel"]),
         hy3_router_kernel=str(options["hy3_router_kernel"]),
         hy3_router_sigmoid=str(options["hy3_router_sigmoid"]),
+        hy3_mtp_shared_kernel=str(options["hy3_mtp_shared_kernel"]),
+        hy3_mtp_shared_kernel_depth=int(
+            options["hy3_mtp_shared_kernel_depth"]
+        ),
         deferred_pin_release=bool(options["deferred_pin_release"]),
         max_read_chunk_bytes=apis.parse_memory_bytes(options["read_chunk"]),
         bypass_page_cache=bool(options["bypass_page_cache"]),
         resource_telemetry=bool(options["resource_telemetry"]),
         trace_routes=bool(options["trace_routes"]),
+        island_layers=parse_island_layers(options.get("island_layers", "")),
+        island_layer_count=options.get("island_layer_count"),
+        proj_quant=options.get("proj_quant") or None,
+        kv_quant=options.get("kv_quant") or None,
+        miss_shadow=options.get("miss_shadow") or None,
+        miss_shadow_layers=options.get("miss_shadow_layers"),
+        prefetch_slots=int(options.get("prefetch_slots") or 0),
+        verify_record_hashes=(
+            options.get("expert_integrity", "per-read") == "per-read"
+        ),
+        verify_sidecar_hash_at_open=(
+            options.get("expert_integrity") == "at-open"
+        ),
+        split_route_release=options.get("split_route_release", "fenced"),
+        mmap_island_layers=parse_island_layers(
+            options.get("mmap_island_layers", "")
+        ),
+        banked_manifest=(
+            str(options["banked_manifest"])
+            if options.get("banked_manifest")
+            else None
+        ),
+        banked_codec=str(options.get("banked_codec", "none")),
+        mmap_island_wired=bool(options.get("mmap_island_wired", True)),
+        streamed_codec=str(options.get("streamed_codec", "none")),
+        streamed_codec_manifest=(
+            str(options["streamed_codec_manifest"])
+            if options.get("streamed_codec_manifest")
+            else None
+        ),
+        streamed_codec_verify=bool(options.get("streamed_codec_verify", True)),
     )
 
 
@@ -1973,6 +2311,12 @@ def _normalized_request(
     }
     if not mtp_disabled_baseline:
         normalized["mtp_artifacts"] = _expand(request["mtp_artifacts"])
+        precision = str(request.get("mtp_precision", "bf16"))
+        if precision not in ("bf16", "q4"):
+            raise BenchmarkConfigurationError(
+                f"{model} mtp_precision must be 'bf16' or 'q4'; got {precision!r}"
+            )
+        normalized["mtp_precision"] = precision
     return normalized
 
 
@@ -2284,7 +2628,7 @@ def _run_depth_matrix_impl(
             model_payload.update(
                 {
                     "mtp_artifacts": str(request["mtp_artifacts"]),
-                    "mtp_precision": "bf16",
+                    "mtp_precision": request.get("mtp_precision", "bf16"),
                 }
             )
         models.append(model_payload)
@@ -2304,7 +2648,7 @@ def _run_depth_matrix_impl(
             load_kwargs.update(
                 {
                     "mtp_artifacts": request["mtp_artifacts"],
-                    "mtp_precision": "bf16",
+                    "mtp_precision": request.get("mtp_precision", "bf16"),
                 }
             )
         runtime = apis.load(request["model_root"], **load_kwargs)
@@ -2590,7 +2934,26 @@ def _write_json_atomic(path: Path, rendered: str) -> None:
 
 def main(argv: Sequence[str] | None = None, *, apis: RunnerAPIs | None = None) -> int:
     parser = build_parser()
+    # Presets are pushed in as DEFAULTS before parse_args, so an explicitly
+    # typed flag still wins. --list-presets / --show-preset exit here.
+    try:
+        preset = preselect_preset(
+            parser, list(sys.argv[1:] if argv is None else argv)
+        )
+    except PresetError as exc:
+        parser.error(str(exc))
     args = parser.parse_args(argv)
+    if preset is not None:
+        print(
+            f"[preset] {preset.name}"
+            + (f" ({' -> '.join(preset.chain)})" if len(preset.chain) > 1 else ""),
+            file=sys.stderr,
+        )
+    if args.kv_quant and args.verify_strategy == "capture_commit":
+        parser.error(
+            "--kv-quant requires --verify-strategy batched: capture_commit "
+            "adapts dense trunk KV state and cannot wrap a quantized cache"
+        )
     latest_checkpoint: dict[str, Any] | None = None
 
     def persist_checkpoint(snapshot: Mapping[str, Any]) -> None:
@@ -2606,11 +2969,21 @@ def main(argv: Sequence[str] | None = None, *, apis: RunnerAPIs | None = None) -
             _write_json_atomic(args.output_json, rendered_checkpoint)
 
     try:
+        requests = _requests_from_args(args)
+        runtime_options = _runtime_options_from_args(args)
+        try:
+            advisories = _profile_advisories(
+                requests, runtime_options, verify_strategy=args.verify_strategy
+            )
+        except Exception as exc:  # advisory must never block a run
+            advisories = [f"profile advisory computation failed: {exc}"]
+        for line in advisories:
+            print(line, file=sys.stderr)
         payload = run_depth_matrix(
-            _requests_from_args(args),
+            requests,
             contexts=args.contexts,
             output_tokens=args.output_tokens,
-            runtime_options=_runtime_options_from_args(args),
+            runtime_options=runtime_options,
             mtp_disabled_baseline=args.mtp_disabled_baseline,
             verify_strategy=args.verify_strategy,
             compiled_verify_mode=args.compiled_verify_mode,

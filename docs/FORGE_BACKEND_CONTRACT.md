@@ -164,6 +164,21 @@ On SIGINT / SIGTERM the backend should:
 2. Leave partial files on disk for resume.
 3. Exit non-zero (the frontend treats `terminationReason == .uncaughtSignal` as `.cancelled`).
 
+`forge cancel <run_id>` additionally drops a marker file (`$MTPLX_FORGE_CANCEL_DIR`,
+default `~/.mtplx/forge-cancel/<run_id>.json`) that a running `build` or `publish`
+polls **between phases**, exiting with code 130 and the message `forge cancelled`.
+
+Marker granularity, exactly:
+
+- `build` checks after probe, after source preparation, and after conversion.
+- `publish` checks before repo creation, after repo creation, and after the
+  folder upload.
+
+A single Hub call is not interruptible from the marker. In particular, a cancel
+issued while `upload_folder` is streaming a large artifact takes effect only when
+that call returns — the bytes already in flight still finish. Use the signal path
+(step 1–3 above) if you need to stop mid-transfer.
+
 ### Backend-not-available detection
 
 When the user is on a pre-Forge MTPLX install, argparse exits with code 2 and prints `argument: invalid choice 'forge'`. The frontend matches this exact pattern in stderr and surfaces a clean "Forge backend not available" empty state. Don't change the exit code or the error string without updating the matchers in `ForgeBuilder.swift:227` and `HFPublisher.swift:170`.
@@ -282,14 +297,25 @@ Backend behaviour:
 
 For the build pipeline, generalise the existing one-off scripts:
 
-- `/Users/youssof/Documents/MTPLX/scripts/build_flat4_cyankiwi_mtp_requant.py` — the 27B requant path that built `Qwen3.6-27B-MTPLX-Optimized-Speed`. Handles the MLX-affine → MLX-affine requantisation case (body bits picker, MTP sidecar repack, runtime_metadata write, trunk symlink). Forge's bf16Native / mlxAffine / mlxAffineWithMtp source-format paths all collapse to variations of this script.
+- `build_flat4_cyankiwi_mtp_requant.py` (external, not in this repo) — the 27B requant path that built `Qwen3.6-27B-MTPLX-Optimized-Speed`. Handles the MLX-affine → MLX-affine requantisation case (body bits picker, MTP sidecar repack, runtime_metadata write, trunk symlink). Forge's bf16Native / mlxAffine / mlxAffineWithMtp source-format paths all collapse to variations of this script.
 - (To be written) **35B compressed-tensors AWQ → MLX-affine** — genuinely new work. The existing 35B artifacts (`/Users/youssof/Documents/MTPLX/models/Qwen3.6-35B-A3B-MTPLX-Official-4bit-*`) already pass the MoE MTP gate (commits `939b537`, `9f5b7be`, `739415b`) so the runtime side is ready; only the conversion is missing.
 
 ---
 
 ## 6. Hard rule from mlx-lm PR #990 reviewer evidence
 
-Quantising MTP weights collapses MoE acceptance to **5-11%** (vs 79-85% with BF16 MTP). The frontend's PlanStage defaults `mtp_policy: keep_bf16` and surfaces a loud warning chip + checkbox if the user overrides to `requantize`. The backend MUST refuse a build whose recipe has `mtp_policy: requantize` UNLESS `--allow-degraded-mtp` is passed:
+Quantising MTP weights collapses MoE acceptance to **5-11%** (vs 79-85% with BF16 MTP).
+
+> **Scope.** This is external evidence from the mlx-lm PR #990 review of the
+> **Qwen3.6 forge pipeline**. It has not been reproduced in this repo and it
+> does not govern the Hy3/GLM streamed NextN heads. Measured directly on the
+> Hy3 layer-80 head (2026-07-18, teacher-forced, paired positions, n=280):
+> bf16 accept@1 0.264 vs q8 0.243 — a real but modest regression (paired rank
+> sign-test p=0.0013; McNemar on accept@1 p=0.11), nowhere near a collapse.
+> Treat the 5-11% figure as governing `mtplx forge` recipes only. The rule
+> below is still enforced for forge builds.
+
+The frontend's PlanStage defaults `mtp_policy: keep_bf16` and surfaces a loud warning chip + checkbox if the user overrides to `requantize`. The backend MUST refuse a build whose recipe has `mtp_policy: requantize` UNLESS `--allow-degraded-mtp` is passed:
 
 ```bash
 mtplx forge build cyankiwi/X --recipe '{"mtp_policy":"requantize",...}'

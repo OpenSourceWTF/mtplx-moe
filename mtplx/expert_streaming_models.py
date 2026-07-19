@@ -13,8 +13,48 @@ allocate MLX arrays.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from operator import index
+
+from mtplx.expert_shadow import SHADOW_CODECS, shadow_record_bytes
+
+
+# Load-time resident quantization (group 64 affine over BF16): kept bytes
+# per source byte are packed bits plus one BF16 scale and bias per group:
+# bits/16 + 1/32, i.e. 9/32 for q4 and 17/32 for q8.
+AFFINE_QUANT_KEEP_NUMERATOR = {"q8": 17, "q4": 9}
+AFFINE_QUANT_KEEP_DENOMINATOR = 32
+_ATTENTION_PROJ_SUFFIXES = (".q_proj", ".k_proj", ".v_proj", ".o_proj", ".qkv_proj")
+_MLP_PROJ_SUFFIXES = (".gate_proj", ".up_proj", ".down_proj", ".gate_up_proj")
+
+
+def proj_quant_covers(path: str) -> bool:
+    """Module/tensor paths quantized by the load-time proj-quant pass.
+
+    Covers exactly the ``*_proj`` weights of the trunk: attention
+    ``q/k/v/o_proj`` plus ``gate/up/down/gate_up_proj`` in ``mlp`` and
+    ``shared_mlp`` blocks. Router gates, embeddings, the LM head, norms,
+    and biases stay at loaded precision — the router picks experts, so its
+    numerics stay exact.
+
+    This is deliberately NARROWER than "everything resident"; the loader's
+    module predicate and the memory plan's byte discount must agree, so
+    both read scope from this single source.
+    """
+
+    if ".self_attn." in path and path.endswith(_ATTENTION_PROJ_SUFFIXES):
+        return True
+    if path.endswith(_MLP_PROJ_SUFFIXES):
+        segments = path.split(".")
+        return "mlp" in segments or "shared_mlp" in segments
+    return False
+
+
+def affine_quant_kept_bytes(length: int, mode: str) -> int:
+    """Post-quantization byte size of a BF16 tensor, rounded up."""
+
+    numerator = AFFINE_QUANT_KEEP_NUMERATOR[mode]
+    return -(-length * numerator // AFFINE_QUANT_KEEP_DENOMINATOR)
 
 
 def _integer(name: str, value: object, *, minimum: int | None = None) -> int:
@@ -60,6 +100,18 @@ class ExpertStreamingModelSpec:
     mtp_layer_index: int | None
     mtp_included: bool
     full_indexer_layers: tuple[int, ...] = ()
+    # Pin-first ordering for count-based island selection: layers ranked by
+    # ascending top-147 routing coverage (worst streamed-cache layers first).
+    # Empty when unmeasured; count-based selection then requires an explicit
+    # layer list instead.
+    island_pin_order: tuple[int, ...] = ()
+    # Streamed record codec: "affine" (Q2/Q4 weight+scales+biases triples)
+    # or a shadow codec ("b1", "t158") whose records store packed+scales
+    # pairs (the q1 lane, issue #51). Shadow-codec specs are pricing and
+    # registry entries: the streamed runtime cannot open their artifacts
+    # until the affine assumptions catalogued in
+    # research/streamed-q1-codec-gap-analysis.md are closed.
+    expert_codec: str = "affine"
 
     def __post_init__(self) -> None:
         integer_fields = {
@@ -115,6 +167,9 @@ class ExpertStreamingModelSpec:
             raise ValueError("full indexer layers must be inside the target model")
         if tuple(sorted(set(self.full_indexer_layers))) != self.full_indexer_layers:
             raise ValueError("full indexer layers must be sorted and unique")
+        if self.expert_codec != "affine" and self.expert_codec not in SHADOW_CODECS:
+            choices = ", ".join(repr(codec) for codec in SHADOW_CODECS)
+            raise ValueError(f"expert_codec must be 'affine', {choices}")
         if self.routed_expert_bytes >= self.total_tensor_bytes:
             raise ValueError("resident model footprint must be positive")
         if self.router_bytes > self.resident_bytes:
@@ -151,8 +206,17 @@ class ExpertStreamingModelSpec:
 
     @property
     def expert_record_bytes(self) -> int:
-        """Packed quantized weights plus affine scale and bias leaves per expert."""
+        """Bytes of one streamed expert record under the spec's codec.
 
+        Affine: packed quantized weights plus scale and bias leaves.
+        Shadow codecs (q1 lane): packed sign/trit words plus one bf16
+        scale per group — no bias leaf.
+        """
+
+        if self.expert_codec != "affine":
+            return shadow_record_bytes(
+                self.expert_codec, self.expert_source_parameters
+            )
         return self.packed_weight_bytes + self.scale_bias_bytes
 
     @property
@@ -206,16 +270,35 @@ class ExpertMemoryPlan:
     persistent_cache_bytes: int
     unallocated_bytes: int
     fits_fixed: bool
+    island_layer_count: int = 0
+    island_bytes: int = 0
+    mmap_island_layer_count: int = 0
+    mmap_island_bytes: int = 0
+    prefetch_slots_per_layer: int = 0
+    prefetch_bytes: int = 0
+    mmap_islands_wired: bool = True
+    miss_shadow: str | None = None
+    shadow_bytes: int = 0
 
     @property
     def fixed_bytes(self) -> int:
+        # Wired mmap islands are registered in MLX's process-wide residency
+        # set and count in MLX memory accounting, so they live on the fixed
+        # side exactly like ordinary islands. Paged (unwired) bands live in
+        # the page cache outside MLX and are charged by the cap reconciler
+        # instead.
+        wired_band = self.mmap_island_bytes if self.mmap_islands_wired else 0
         return (
             self.resident_bytes
             + self.kv_bytes
             + self.transient_bytes
+            + self.prefetch_bytes
             + self.io_staging_bytes
             + self.execution_workspace_bytes
             + self.runtime_reserve_bytes
+            + self.island_bytes
+            + wired_band
+            + self.shadow_bytes
         )
 
     @property
@@ -301,6 +384,11 @@ HY3_EXPERT_Q2 = ExpertStreamingModelSpec(
     kv_bytes_per_token=327_680,
     mtp_layer_index=80,
     mtp_included=False,
+    # Measured 2026-07-16: 511-step decode route trace (issue #63 heatmap),
+    # ranked by ascending top-147 expert coverage per layer.
+    island_pin_order=(
+        1, 4, 5, 13, 2, 3, 12, 18, 14, 15, 11, 10, 16, 17, 22, 28, 24, 26, 6, 25, 66, 29, 71, 27, 31, 19, 7, 69, 67, 23, 33, 32, 74, 9, 8, 50, 73, 79, 65, 72, 75, 70, 20, 30, 57, 21, 60, 64, 35, 51, 49, 68, 48, 59, 61, 77, 54, 38, 47, 52, 78, 53, 45, 62, 34, 58, 76, 63, 46, 55, 56, 44, 36, 37, 41, 43, 39, 40, 42,
+    )
 )
 
 
@@ -333,6 +421,12 @@ GLM52_Q4 = ExpertStreamingModelSpec(
 
 
 GLM52_EXPERT_Q2 = ExpertStreamingModelSpec(
+    # island_pin_order below: measured 2026-07-17 from 1023 decode steps /
+    # 613,800 routed assignments (ctx 1024 deterministic AR, 44 GiB cache =
+    # 53 slots/layer), ranked by ascending top-53 expert coverage.
+    # Rank-stable across K (Spearman >= 0.956 for K in 32..128); mean
+    # cov@53 0.499 vs 0.517 measured decode hit rate. Earliest routed
+    # layers route flattest, like hy3.
     key="glm52-expert-q2",
     display_name="GLM-5.2 expert-only affine Q2",
     source_model="zai-org/GLM-5.2",
@@ -357,6 +451,48 @@ GLM52_EXPERT_Q2 = ExpertStreamingModelSpec(
     mtp_layer_index=78,
     mtp_included=False,
     full_indexer_layers=(0, 1, 2, *range(6, 75, 4)),
+    island_pin_order=(
+        5, 3, 4, 9, 7, 11, 8, 10, 6, 16, 13, 26, 14, 25, 24,
+        49, 65, 70, 23, 54, 67, 66, 12, 52, 59, 15, 47, 71, 69, 62,
+        17, 48, 61, 68, 74, 53, 57, 76, 75, 73, 60, 55, 77, 30, 29,
+        72, 56, 27, 46, 63, 51, 28, 50, 64, 22, 58, 44, 38, 45, 39,
+        43, 31, 42, 21, 35, 41, 40, 34, 37, 19, 36, 32, 33, 18, 20,
+    ),
+)
+
+
+# q1 lane (issue #51): the same GLM checkpoint with shadow-codec expert
+# records produced by scripts/convert_expert_q1.py. Same resident tensors,
+# routers, KV, and routing (island_pin_order carries over — routing is a
+# model property, not a record-codec property); only the routed record
+# bytes change. Probe (research/glm52-shadow-codec-probe-20260717.json):
+# t158 combine-cosine 0.922 from Q2 sources; b1 0.017 (NO-GO from Q2 —
+# priced here only for a potential bf16-source encode).
+_GLM52_RESIDENT_BYTES = (
+    GLM52_EXPERT_Q2.total_tensor_bytes - GLM52_EXPERT_Q2.routed_expert_bytes
+)
+
+GLM52_EXPERT_Q1T = replace(
+    GLM52_EXPERT_Q2,
+    key="glm52-expert-q1t",
+    display_name="GLM-5.2 expert-only ternary t158 (q1 lane)",
+    expert_codec="t158",
+    total_tensor_bytes=_GLM52_RESIDENT_BYTES
+    + GLM52_EXPERT_Q2.routed_layer_count
+    * GLM52_EXPERT_Q2.expert_count
+    * shadow_record_bytes("t158", GLM52_EXPERT_Q2.expert_source_parameters),
+)
+
+GLM52_EXPERT_Q1B1 = replace(
+    GLM52_EXPERT_Q2,
+    key="glm52-expert-q1b1",
+    display_name="GLM-5.2 expert-only binary b1 (q1 lane)",
+    expert_codec="b1",
+    quant_bits=1,
+    total_tensor_bytes=_GLM52_RESIDENT_BYTES
+    + GLM52_EXPERT_Q2.routed_layer_count
+    * GLM52_EXPERT_Q2.expert_count
+    * shadow_record_bytes("b1", GLM52_EXPERT_Q2.expert_source_parameters),
 )
 
 
@@ -368,6 +504,8 @@ MODEL_SPECS: dict[str, ExpertStreamingModelSpec] = {
         HY3_EXPERT_Q2,
         GLM52_Q4,
         GLM52_EXPERT_Q2,
+        GLM52_EXPERT_Q1T,
+        GLM52_EXPERT_Q1B1,
     )
 }
 
@@ -393,7 +531,15 @@ def plan_expert_memory(
     io_staging_bytes: int = 0,
     execution_workspace_bytes: int = 0,
     additional_resident_bytes: int = 0,
+    resident_discount_bytes: int = 0,
+    kv_quant: str | None = None,
     cache_scope: str = "layer",
+    island_layer_count: int = 0,
+    mmap_island_layer_count: int = 0,
+    mmap_islands_wired: bool = True,
+    prefetch_slots_per_layer: int = 0,
+    miss_shadow: str | None = None,
+    miss_shadow_layers: int | None = None,
 ) -> ExpertMemoryPlan:
     """Fit uniform persistent expert slots under an explicit memory ceiling.
 
@@ -401,6 +547,23 @@ def plan_expert_memory(
     weights, KV state, runtime headroom, and transient miss service are removed
     first.  ``expert_cache_limit_bytes`` can impose a stricter secondary cap.
     The returned slot count is bounded by the model's expert count.
+
+    ``island_layer_count`` routed layers hold every expert permanently
+    resident in dense per-layer banks outside the uniform slot pool; their
+    full cost lands on the fixed side and the uniform slot math spans only
+    the remaining streamed layers.
+
+    ``mmap_island_layer_count`` routed layers hold every expert in
+    file-backed banks whose physical pages belong to the OS page cache, not
+    to MLX: they leave the fixed budget untouched, contribute no uniform
+    slots, and shrink the streamed layer count exactly like wired islands.
+    ``mmap_island_bytes`` is advisory — the pager's working set, not an
+    allocation.
+
+    ``miss_shadow`` prices one dense low-precision shadow bank per
+    *streamed* layer (routed minus islands minus mmap band) so decode
+    misses can be served in memory instead of from SSD; the full cost
+    lands on the fixed side.
 
     A plan with ``fits_fixed=False`` is diagnostic and must not be used to
     start inference.  Its negative ``unallocated_bytes`` is the fixed-footprint
@@ -424,12 +587,39 @@ def plan_expert_memory(
     additional_resident_bytes = _integer(
         "additional_resident_bytes", additional_resident_bytes, minimum=0
     )
+    resident_discount_bytes = _integer(
+        "resident_discount_bytes", resident_discount_bytes, minimum=0
+    )
     if expert_cache_limit_bytes is not None:
         expert_cache_limit_bytes = _integer(
             "expert_cache_limit_bytes", expert_cache_limit_bytes, minimum=0
         )
     if cache_scope not in {"layer", "global"}:
         raise ValueError("cache_scope must be 'layer' or 'global'")
+    island_layer_count = _integer(
+        "island_layer_count", island_layer_count, minimum=0
+    )
+    if island_layer_count > spec.routed_layer_count:
+        raise ValueError(
+            f"island_layer_count {island_layer_count} exceeds routed layer "
+            f"count {spec.routed_layer_count}"
+        )
+    if island_layer_count and cache_scope != "layer":
+        raise ValueError("dense island layers require cache_scope 'layer'")
+    mmap_island_layer_count = _integer(
+        "mmap_island_layer_count", mmap_island_layer_count, minimum=0
+    )
+    prefetch_slots_per_layer = _integer(
+        "prefetch_slots_per_layer", prefetch_slots_per_layer, minimum=0
+    )
+    if island_layer_count + mmap_island_layer_count > spec.routed_layer_count:
+        raise ValueError(
+            f"island_layer_count {island_layer_count} and "
+            f"mmap_island_layer_count {mmap_island_layer_count} together "
+            f"exceed routed layer count {spec.routed_layer_count}"
+        )
+    if mmap_island_layer_count and cache_scope != "layer":
+        raise ValueError("mmap island layers require cache_scope 'layer'")
 
     service_slots = spec.top_k if transient_slots is None else transient_slots
     service_slots = _integer("transient_slots", service_slots, minimum=0)
@@ -437,22 +627,76 @@ def plan_expert_memory(
         raise ValueError(f"transient_slots must be at least top_k ({spec.top_k})")
 
     kv_bytes = context_tokens * spec.kv_bytes_per_token
+    if kv_quant is not None:
+        if kv_quant not in AFFINE_QUANT_KEEP_NUMERATOR:
+            raise ValueError("kv_quant must be None, 'q8', or 'q4'")
+        # QuantizedKVCache uses the same group-64 affine layout as the
+        # resident pass; the MTP layer's stock cache is not in
+        # kv_bytes_per_token (mtp_included=False) and stays in reserve.
+        kv_bytes = affine_quant_kept_bytes(kv_bytes, kv_quant)
     transient_bytes = service_slots * spec.expert_record_bytes
-    resident_bytes = spec.resident_bytes + additional_resident_bytes
+    resident_bytes = (
+        spec.resident_bytes + additional_resident_bytes - resident_discount_bytes
+    )
+    if resident_bytes <= 0:
+        raise ValueError(
+            "resident_discount_bytes exceeds the resident footprint: "
+            f"{resident_discount_bytes} vs {spec.resident_bytes}"
+        )
+    island_bytes = (
+        island_layer_count * spec.expert_count * spec.expert_record_bytes
+    )
+    mmap_island_bytes = (
+        mmap_island_layer_count * spec.expert_count * spec.expert_record_bytes
+    )
+    streamed_layer_count = (
+        spec.routed_layer_count - island_layer_count - mmap_island_layer_count
+    )
+    prefetch_bytes = (
+        streamed_layer_count * prefetch_slots_per_layer * spec.expert_record_bytes
+    )
+    if miss_shadow is not None and miss_shadow not in SHADOW_CODECS:
+        choices = ", ".join(repr(codec) for codec in SHADOW_CODECS)
+        raise ValueError(f"miss_shadow must be None, {choices}")
+    if miss_shadow_layers is not None:
+        miss_shadow_layers = _integer(
+            "miss_shadow_layers", miss_shadow_layers, minimum=1
+        )
+        if miss_shadow is None:
+            raise ValueError("miss_shadow_layers requires miss_shadow")
+    shadow_layer_count = (
+        min(miss_shadow_layers, streamed_layer_count)
+        if miss_shadow is not None and miss_shadow_layers is not None
+        else streamed_layer_count
+    )
+    shadow_bytes = (
+        shadow_layer_count
+        * spec.expert_count
+        * shadow_record_bytes(miss_shadow, spec.expert_source_parameters)
+        if miss_shadow is not None
+        else 0
+    )
     fixed_bytes = (
         resident_bytes
         + kv_bytes
         + runtime_reserve_bytes
         + transient_bytes
+        + prefetch_bytes
         + io_staging_bytes
         + execution_workspace_bytes
+        + island_bytes
+        + (mmap_island_bytes if mmap_islands_wired else 0)
+        + shadow_bytes
     )
     available_bytes = max(0, total_limit_bytes - fixed_bytes)
-    persistent_budget_bytes = min(available_bytes, spec.routed_expert_bytes)
+    streamed_expert_bytes = (
+        streamed_layer_count * spec.expert_count * spec.expert_record_bytes
+    )
+    persistent_budget_bytes = min(available_bytes, streamed_expert_bytes)
     if expert_cache_limit_bytes is not None:
         persistent_budget_bytes = min(persistent_budget_bytes, expert_cache_limit_bytes)
 
-    bytes_per_uniform_slot = spec.routed_layer_count * spec.expert_record_bytes
+    bytes_per_uniform_slot = streamed_layer_count * spec.expert_record_bytes
     if cache_scope == "global":
         persistent_slots = min(
             spec.routed_layer_count * spec.expert_count,
@@ -464,12 +708,16 @@ def plan_expert_memory(
             spec.expert_count, persistent_slots // spec.routed_layer_count
         )
         persistent_cache_bytes = persistent_slots * spec.expert_record_bytes
+    elif streamed_layer_count == 0:
+        slots_per_layer = 0
+        persistent_slots = 0
+        persistent_cache_bytes = 0
     else:
         slots_per_layer = min(
             spec.expert_count, persistent_budget_bytes // bytes_per_uniform_slot
         )
-        persistent_slots = slots_per_layer * spec.routed_layer_count
-        persistent_cache_bytes = spec.persistent_cache_bytes(slots_per_layer)
+        persistent_slots = slots_per_layer * streamed_layer_count
+        persistent_cache_bytes = persistent_slots * spec.expert_record_bytes
     unallocated_bytes = total_limit_bytes - fixed_bytes - persistent_cache_bytes
 
     return ExpertMemoryPlan(
@@ -491,4 +739,13 @@ def plan_expert_memory(
         persistent_cache_bytes=persistent_cache_bytes,
         unallocated_bytes=unallocated_bytes,
         fits_fixed=fixed_bytes <= total_limit_bytes,
+        island_layer_count=island_layer_count,
+        island_bytes=island_bytes,
+        mmap_island_layer_count=mmap_island_layer_count,
+        mmap_island_bytes=mmap_island_bytes,
+        mmap_islands_wired=bool(mmap_islands_wired),
+        prefetch_slots_per_layer=prefetch_slots_per_layer,
+        prefetch_bytes=prefetch_bytes,
+        miss_shadow=miss_shadow,
+        shadow_bytes=shadow_bytes,
     )

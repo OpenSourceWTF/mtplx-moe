@@ -1,5 +1,7 @@
 # Issue 51 Hy3-Q2 MTP Look-ahead Implementation Plan
 
+**Status: PARTIALLY IMPLEMENTED (verified 2026-07-18).** `mtplx/expert_hints.py` and `tests/test_expert_hints.py` never landed, and the `--candidate-widths`, `--group-sizes`, `--predictor`, and `--q2-nax` flags do not exist. The lookahead work that did ship is on the issue-51 line under different names.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > `superpowers-optimized:executing-plans` to implement this plan task-by-task.
 > Use `superpowers-optimized:test-driven-development` for every behavior

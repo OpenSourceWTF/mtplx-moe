@@ -20,6 +20,13 @@ from .expert_manifest import (
     resolve_artifact_member,
 )
 
+try:
+    _IOV_MAX = os.sysconf("SC_IOV_MAX")
+except (ValueError, OSError, AttributeError):
+    _IOV_MAX = 512
+if _IOV_MAX <= 0:
+    _IOV_MAX = 512
+
 
 class ExpertIOError(RuntimeError):
     """Base error for a record that did not reach a complete verified state."""
@@ -41,6 +48,35 @@ class ExpertIOIntegrityError(ExpertIOError):
     pass
 
 
+def _record_part_index(record: Any) -> int:
+    """Which sidecar part a record lives in; 0 for single-file banks."""
+
+    return int(getattr(record, "part", 0) or 0)
+
+
+def _sidecar_placement(sidecar: Any, record: Any) -> tuple[str, int]:
+    """The part file a record lives in and where that part's data begins.
+
+    Kept tolerant of a sidecar that only carries the scalar ``file`` so the
+    single-file bank -- every artifact that exists today -- resolves through
+    the same call without a parts list being synthesized for it.
+    """
+
+    index = _record_part_index(record)
+    parts = getattr(sidecar, "parts", None)
+    if parts is None:
+        if index:
+            raise ExpertIOError(
+                f"record names sidecar part {index}, but the sidecar is single-file"
+            )
+        return getattr(sidecar, "file"), 0
+    try:
+        part = parts[index]
+    except (IndexError, TypeError) as exc:
+        raise ExpertIOError(f"sidecar has no part {index}") from exc
+    return part.file, int(getattr(part, "data_start", 0) or 0)
+
+
 @dataclass
 class ExpertIOMetrics:
     record_requests: int = 0
@@ -55,6 +91,14 @@ class ExpertIOMetrics:
     requested_bytes: int = 0
     read_bytes: int = 0
     read_ns: int = 0
+    # Streamed rANS decode-on-miss (issue #113): compressed records read
+    # fewer bytes off SSD than they decode to. ``read_bytes`` already counts
+    # only the (smaller) bytes actually pulled; ``bytes_read_saved`` makes the
+    # win explicit as ``raw - stored`` and never changes the memory plan.
+    decoded_records: int = 0
+    decoded_raw_bytes: int = 0
+    bytes_read_saved: int = 0
+    decode_ns: int = 0
     open_files_peak: int = 0
     short_reads: int = 0
     integrity_errors: int = 0
@@ -88,6 +132,10 @@ class ExpertIOMetrics:
                     "requested_bytes",
                     "read_bytes",
                     "read_ns",
+                    "decoded_records",
+                    "decoded_raw_bytes",
+                    "bytes_read_saved",
+                    "decode_ns",
                     "open_files_peak",
                     "short_reads",
                     "integrity_errors",
@@ -127,6 +175,8 @@ class PositionalExpertReader:
         use_native: bool = True,
         bypass_page_cache: bool = False,
         pipeline_ledger: Any | None = None,
+        codec_sidecar: Any | None = None,
+        codec_verify: bool = True,
     ) -> None:
         if isinstance(max_open_files, bool) or not isinstance(max_open_files, int):
             raise TypeError("max_open_files must be an integer")
@@ -147,6 +197,22 @@ class PositionalExpertReader:
             raise TypeError("bypass_page_cache must be bool")
         self.bypass_page_cache = bypass_page_cache
         self.pipeline_ledger = pipeline_ledger
+        # Streamed compressed sidecar (issue #113). When present with a
+        # ``rans32x-v1`` codec, records with a codec entry are read from the
+        # (smaller) compressed sidecar and decoded through the in-kernel rANS
+        # decoder before landing in the slot -- bitwise-identical to reading
+        # the uncompressed record. ``None`` leaves every read byte-unchanged.
+        self.codec_sidecar = codec_sidecar
+        # Decoded-record hash verification rides on top of the caller's
+        # verify_hash: the rANS container carries its own structural guards
+        # (lane directory + guard bytes), so the post-decode sha256 is a
+        # separately priced belt the config can drop without touching the
+        # uncompressed path's integrity mode.
+        self.codec_verify = bool(codec_verify)
+        self._codec_record_map = (
+            codec_sidecar.record_map() if codec_sidecar is not None else None
+        )
+        self._decode_container = None  # lazily bound Metal decoder (needs MLX)
         self.metrics = ExpertIOMetrics()
         self._condition = threading.Condition()
         self._entries: OrderedDict[str, _FDEntry] = OrderedDict()
@@ -438,8 +504,14 @@ class PositionalExpertReader:
                     self._check_cancelled(cancel_event, deadline_ns)
                     try:
                         python_preadv_invocations += 1
+                        # preadv rejects vectors above IOV_MAX with EINVAL;
+                        # the partial-read loop below resumes the remainder.
                         read_now = int(
-                            os.preadv(fd, pending, source_offset + read_total)
+                            os.preadv(
+                                fd,
+                                pending[:_IOV_MAX],
+                                source_offset + read_total,
+                            )
                         )
                     except InterruptedError:
                         continue
@@ -491,6 +563,135 @@ class PositionalExpertReader:
                 read_ns=read_elapsed_ns,
             )
 
+    def _codec_entry(self, record: ExpertRecord) -> Any | None:
+        """The compressed-sidecar entry for a record, or None (codec inactive)."""
+
+        if self._codec_record_map is None:
+            return None
+        return self._codec_record_map.get((record.layer, record.expert))
+
+    def _decode_container_fn(self) -> Any:
+        """Lazily bind the Metal rANS decoder (importing MLX only on demand)."""
+
+        fn = self._decode_container
+        if fn is None:
+            from mtplx.expert_rans_metal import decode_container
+
+            fn = decode_container
+            self._decode_container = fn
+        return fn
+
+    def _decode_targets(
+        self, destination: Any, record: ExpertRecord
+    ) -> tuple[memoryview | None, tuple[memoryview, ...] | None]:
+        record_views = getattr(destination, "record_views", None)
+        if callable(record_views):
+            component_views = tuple(record_views(record))
+            if len(component_views) != len(record.segments):
+                raise ValueError("component slot does not cover every record segment")
+            if sum(len(view) for view in component_views) != record.logical_bytes:
+                raise ValueError("component slot byte count differs from expert record")
+            return None, component_views
+        view = self._writable_bytes(destination)
+        if len(view) != record.logical_bytes:
+            raise ValueError(
+                f"slot buffer has {len(view)} bytes; record needs {record.logical_bytes}"
+            )
+        return view, None
+
+    def _read_record_decoded(
+        self,
+        codec_entry: Any,
+        manifest: ExpertManifest,
+        record: ExpertRecord,
+        destination: Any,
+        *,
+        verify_hash: bool,
+        cancel_event: threading.Event | None,
+        deadline_ns: int | None,
+        pipeline_phase: str | None,
+    ) -> str:
+        """Read a compressed record, decode it, and land raw bytes in the slot.
+
+        The SSD read pulls only the compressed container (accounted in
+        ``read_bytes``); the in-kernel rANS decoder rebuilds the raw record;
+        the raw bytes are copied into the slot's component/flat views exactly
+        as the uncompressed path would have written them. Bitwise-identical to
+        reading the uncompressed record (the #112 decode-store parity).
+        """
+
+        import numpy as np
+
+        assert self.codec_sidecar is not None
+        verify_hash = verify_hash and self.codec_verify
+        self.metrics.update(record_requests=1, sidecar_record_requests=1)
+        view, component_views = self._decode_targets(destination, record)
+        try:
+            # 1) Pull the (smaller) compressed container off SSD. Reusing the
+            #    range reader keeps native/preadv, cancel/deadline, and the
+            #    read-bytes accounting identical -- read_bytes counts only the
+            #    compressed bytes actually moved.
+            staging = bytearray(int(codec_entry.length))
+            self._read_range_into(
+                self.codec_sidecar.file,
+                int(codec_entry.offset),
+                memoryview(staging),
+                cancel_event=cancel_event,
+                deadline_ns=deadline_ns,
+                pipeline_phase=pipeline_phase,
+            )
+            # 2) Decode through the Metal kernel (host round-trip is a fast
+            #    unified-memory copy, far below the SSD read it replaces).
+            decode_started = time.monotonic_ns()
+            decoded = self._decode_container_fn()(bytes(staging))
+            raw = np.array(decoded, dtype=np.uint8).reshape(-1)
+            if raw.size < record.logical_bytes:
+                raise ExpertIOShortRead(
+                    f"decoded record ({record.layer}, {record.expert}) is "
+                    f"{raw.size} bytes; record needs {record.logical_bytes}"
+                )
+            raw_view = memoryview(raw)[: record.logical_bytes]
+            # 3) Land raw bytes exactly where the uncompressed path would.
+            if component_views is None:
+                assert view is not None
+                view[:] = raw_view
+            else:
+                cursor = 0
+                for target in component_views:
+                    end = cursor + len(target)
+                    target[:] = raw_view[cursor:end]
+                    cursor = end
+            decode_ns = time.monotonic_ns() - decode_started
+            self.metrics.update(
+                decoded_records=1,
+                decoded_raw_bytes=record.logical_bytes,
+                bytes_read_saved=max(
+                    record.logical_bytes - int(codec_entry.length), 0
+                ),
+                decode_ns=decode_ns,
+            )
+            if verify_hash:
+                digest = hashlib.sha256(raw_view).hexdigest()
+            else:
+                digest = "unverified"
+        finally:
+            if component_views is not None:
+                for component_view in component_views:
+                    try:
+                        component_view.release()
+                    except Exception:
+                        pass
+        if verify_hash:
+            if record.sha256 is None:
+                self.metrics.update(integrity_errors=1)
+                raise ExpertIOIntegrityError("expert record has no trusted hash")
+            if digest != record.sha256:
+                self.metrics.update(integrity_errors=1)
+                raise ExpertIOIntegrityError(
+                    f"expert record hash mismatch: ({record.layer}, {record.expert})"
+                )
+        return digest
+
     def read_record_into(
         self,
         manifest: ExpertManifest,
@@ -504,6 +705,19 @@ class PositionalExpertReader:
         pipeline_phase: str | None = None,
     ) -> str:
         """Fill a fixed record buffer and return its SHA-256 digest."""
+
+        codec_entry = self._codec_entry(record)
+        if codec_entry is not None:
+            return self._read_record_decoded(
+                codec_entry,
+                manifest,
+                record,
+                destination,
+                verify_hash=verify_hash,
+                cancel_event=cancel_event,
+                deadline_ns=deadline_ns,
+                pipeline_phase=pipeline_phase,
+            )
 
         record_views = getattr(destination, "record_views", None)
         component_views: tuple[memoryview, ...] | None = None
@@ -526,11 +740,16 @@ class PositionalExpertReader:
                 if record.sidecar_offset is None or record.sidecar_length is None:
                     raise ExpertIOError("manifest sidecar record is incomplete")
                 self.metrics.update(sidecar_record_requests=1)
+                # A record lives wholly inside one part; pick that part's file
+                # and make the offset absolute within it.  The descriptor cache
+                # is keyed by resolved path, so N parts cost N fds at most.
+                part_file, data_start = _sidecar_placement(manifest.sidecar, record)
+                sidecar_offset = data_start + record.sidecar_offset
                 if component_views is None:
                     assert view is not None
                     self._read_range_into(
-                        manifest.sidecar.file,
-                        record.sidecar_offset,
+                        part_file,
+                        sidecar_offset,
                         view,
                         cancel_event=cancel_event,
                         deadline_ns=deadline_ns,
@@ -538,8 +757,8 @@ class PositionalExpertReader:
                     )
                 else:
                     self._readv_range_into(
-                        manifest.sidecar.file,
-                        record.sidecar_offset,
+                        part_file,
+                        sidecar_offset,
                         component_views,
                         cancel_event=cancel_event,
                         deadline_ns=deadline_ns,
@@ -613,6 +832,30 @@ class PositionalExpertReader:
 
         if not items:
             return ()
+        if self._codec_record_map is not None and all(
+            self._codec_entry(record) is not None for record, _destination in items
+        ):
+            # Compressed records are entropy-coded, not scatter-contiguous:
+            # decode each one individually (the batch scatter fast path has no
+            # meaning under a codec). Per-record decode still lands bytes in
+            # slot order, bitwise-identical to the uncompressed batch.
+            digests: list[str] = []
+            for record, destination in items:
+                codec_entry = self._codec_entry(record)
+                assert codec_entry is not None
+                digests.append(
+                    self._read_record_decoded(
+                        codec_entry,
+                        manifest,
+                        record,
+                        destination,
+                        verify_hash=verify_hash,
+                        cancel_event=cancel_event,
+                        deadline_ns=deadline_ns,
+                        pipeline_phase=pipeline_phase,
+                    )
+                )
+            return tuple(digests)
         if manifest.sidecar is None:
             raise ExpertIOError("component record batch requires a sidecar")
         prepared: list[tuple[int, ExpertRecord, tuple[memoryview, ...]]] = []
@@ -626,7 +869,15 @@ class PositionalExpertReader:
             if record.sidecar_offset is None or record.sidecar_length is None:
                 raise ExpertIOError("manifest sidecar record is incomplete")
             prepared.append((index, record, views))
-        prepared.sort(key=lambda item: int(item[1].sidecar_offset or 0))
+        # Sort within a part, never across: two records at the same offset in
+        # different parts are different bytes, so the part index has to lead
+        # the ordering that the adjacency test below relies on.
+        prepared.sort(
+            key=lambda item: (
+                _record_part_index(item[1]),
+                int(item[1].sidecar_offset or 0),
+            )
+        )
         self.metrics.update(
             record_requests=len(prepared),
             sidecar_record_requests=len(prepared),
@@ -642,7 +893,13 @@ class PositionalExpertReader:
                 expected = int(previous.sidecar_offset or 0) + int(
                     previous.sidecar_length or 0
                 )
-                if int(item[1].sidecar_offset or 0) == expected:
+                # One preadv is one fd at one offset.  Adjacency in offset
+                # means nothing across a part boundary -- coalescing there
+                # would read the wrong file -- so the part must match too.
+                if (
+                    _record_part_index(item[1]) == _record_part_index(previous)
+                    and int(item[1].sidecar_offset or 0) == expected
+                ):
                     groups[-1].append(item)
                 else:
                     groups.append([item])
@@ -650,9 +907,11 @@ class PositionalExpertReader:
                 flat_views = tuple(
                     view for _index, _record, views in group for view in views
                 )
+                leader = group[0][1]
+                part_file, data_start = _sidecar_placement(manifest.sidecar, leader)
                 self._readv_range_into(
-                    manifest.sidecar.file,
-                    int(group[0][1].sidecar_offset or 0),
+                    part_file,
+                    data_start + int(leader.sidecar_offset or 0),
                     flat_views,
                     cancel_event=cancel_event,
                     deadline_ns=deadline_ns,

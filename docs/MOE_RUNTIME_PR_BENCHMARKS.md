@@ -155,7 +155,7 @@ reads, I/O errors, or integrity errors.
 The separate runner-hook replay (excluded from headline timing) measured:
 
 - SSD: 5.369 GiB/s mean, 5.239 p50, 6.998 p95, 9.112 max;
-- 928,933,768 physical expert bytes per decode token and 43.06% of the measured
+- 928,933,768 (note: this divides by 1904 tokens; the run completed 1905 — see the token count above) physical expert bytes per decode token and 43.06% of the measured
   12.469 GiB/s SSD ceiling;
 - routed-weight memory-traffic floor: 48.49 GB/s mean, 59.78 GB/s p95;
 - 80.44 evictions per decode token; classification: `mixed: no single resource dominates`;
@@ -312,7 +312,7 @@ intervals and measured:
 
 - SSD: 4.988902 GiB/s mean, 4.885349 p50, 6.630601 p95, 9.304924 max;
 - 1,768,689,893,376 bytes read, or 928,933,767.53 bytes per decode token;
-- SSD utilization: 40.0104% of the measured 12.469 GiB/s ceiling;
+- SSD utilization: 40.0104% of the configured 12.47 GiB/s ceiling;
 - routed-weight memory-traffic floor: 45.055829 GB/s mean and 54.971803 GB/s
   p95, or 7.3381% of the 614 GB/s published ceiling;
 - 80.440126 evictions per decode token; classification: `mixed`;
@@ -452,7 +452,7 @@ The instrumentation-only replay was excluded from the promotion timing pairs.
 Its runner hooks measured the actual PR #13 workload at 0.5-second intervals:
 
 - SSD: 5.313 GiB/s mean, 5.188 p50, 6.910 p95, 9.216 max
-- 928,933,768 SSD bytes per decode token and no idle sample intervals
+- 928,933,768 (note: this divides by 1904 tokens; the run completed 1905 — see the token count above) SSD bytes per decode token and no idle sample intervals
 - routed-weight unified-memory traffic floor: 47.99 GB/s mean, 59.34 GB/s p95
 - classification: `mixed: no single resource dominates`
 

@@ -28,6 +28,7 @@ from mtplx.gemma4_pair import (
     is_gemma4_pair_repo_id,
     resolve_gemma4_pair_paths,
 )
+from mtplx.metadata_scrub import runtime_metadata_leaks, scrub_runtime_metadata
 from mtplx.mtp_patch import MTPContract
 from mtplx.version import __version__
 
@@ -2955,6 +2956,11 @@ def _cmd_publish(args: Any) -> int:
     if readme_path and readme_path.exists():
         total += readme_path.stat().st_size
     _write_publish(run, bytes_uploaded=0, total_bytes=total, repo=args.repo, finished=False)
+    # Cancellation is checked between phases. `upload_folder` is a single
+    # blocking Hub call, so a cancel that lands mid-transfer takes effect when
+    # that call returns (see docs/FORGE_BACKEND_CONTRACT.md).
+    if _cancel_requested(args.run_id):
+        raise ForgeError("forge cancelled", code=130)
     api = _make_hf_api()
     private = str(args.visibility) == "private"
     _err(f"[forge] creating/updating Hugging Face repo {args.repo}")
@@ -2973,16 +2979,38 @@ def _cmd_publish(args: Any) -> int:
         repo=args.repo,
         finished=False,
     )
+    if _cancel_requested(args.run_id):
+        raise ForgeError("forge cancelled", code=130)
     started = time.monotonic()
     _err(f"[forge] uploading {local}")
+    # The local mtplx_runtime.json carries absolute forge_inputs paths. Upload a
+    # scrubbed copy instead of the raw file, and keep the raw one out of the
+    # folder commit so it never lands in the repo's history.
+    scrubbed_runtime = _staged_scrubbed_runtime(local, run)
+    folder_kwargs: dict[str, Any] = {}
+    if scrubbed_runtime is not None:
+        folder_kwargs["ignore_patterns"] = ["mtplx_runtime.json"]
     upload_result = api.upload_folder(
         folder_path=str(local),
         repo_id=args.repo,
         repo_type="model",
         token=token,
         commit_message="Publish MTPLX forged model",
+        **folder_kwargs,
     )
     revision = _revision_from_upload_result(upload_result)
+    if _cancel_requested(args.run_id):
+        raise ForgeError("forge cancelled", code=130)
+    if scrubbed_runtime is not None:
+        runtime_result = api.upload_file(
+            path_or_fileobj=str(scrubbed_runtime),
+            path_in_repo="mtplx_runtime.json",
+            repo_id=args.repo,
+            repo_type="model",
+            token=token,
+            commit_message="Publish MTPLX runtime contract",
+        )
+        revision = _revision_from_upload_result(runtime_result) or revision
     if readme_path and readme_path.exists():
         readme_result = api.upload_file(
             path_or_fileobj=str(readme_path),
@@ -3017,6 +3045,33 @@ def _cmd_publish(args: Any) -> int:
         finished=True,
     )
     return 0
+
+
+def _staged_scrubbed_runtime(local: Path, run: Path) -> Path | None:
+    """Write a publish-safe ``mtplx_runtime.json`` into the run dir.
+
+    Returns the staged path, or ``None`` when the artifact has no runtime
+    contract (nothing to scrub, so the folder upload can carry everything).
+    The local artifact is never modified.
+    """
+
+    runtime_path = local / "mtplx_runtime.json"
+    if not runtime_path.is_file():
+        return None
+    try:
+        runtime = _load_json(runtime_path)
+    except Exception as exc:
+        raise ForgeError(f"could not read {runtime_path}: {exc}") from exc
+    scrubbed = scrub_runtime_metadata(runtime)
+    leaks = runtime_metadata_leaks(scrubbed)
+    if leaks:
+        raise ForgeError(
+            "refusing to publish: local paths survived metadata scrubbing: "
+            + ", ".join(sorted(set(leaks))[:5])
+        )
+    staged = run / "mtplx_runtime.publish.json"
+    atomic_write_json(staged, scrubbed)
+    return staged
 
 
 def _cmd_cancel(args: Any) -> int:

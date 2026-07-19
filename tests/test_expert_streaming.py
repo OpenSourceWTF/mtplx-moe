@@ -629,3 +629,123 @@ def test_simulation_reports_full_allocated_bank_for_a_partial_trace() -> None:
     assert summary["persistent_cache_scope"] == "configured_model"
     assert summary["persistent_cache_bytes"] == 75 * 32 * 21_233_664
     assert summary["observed_layer_cache_bytes"] == 32 * 21_233_664
+
+
+def test_prefetch_ring_resolves_hits_without_touching_persistent_tier():
+    bank = LayerExpertSlotBank(
+        expert_count=16,
+        persistent_slots=2,
+        transient_slots=3,
+        prefetch_slots=2,
+    )
+    assert bank.slot_count == 7
+
+    # Fill the persistent tier so later probe routes cannot be admitted
+    # (singletons cannot evict past the frequency floor).
+    bank.plan([0, 1], phase="decode")
+    assert bank.occupancy == 2
+
+    loads = bank.plan_prefetch([5, 6])
+    assert [(load.expert, load.slot, load.persistent) for load in loads] == [
+        (5, 5, False),
+        (6, 6, False),
+    ]
+    # Assigned-but-uncommitted entries are neither hits nor reassignable.
+    assert bank.plan_prefetch([5, 6]) == ()
+    assert 5 not in bank.plan([5], phase="decode").hits
+
+    assert bank.commit_prefetch(5) is True
+    assert bank.commit_prefetch(6) is True
+    plan = bank.plan([5, 6, 7, 7], phase="decode")
+    assert set(plan.hits) == {5, 6}
+    slot_by_expert = dict(zip(plan.experts, plan.slots))
+    assert slot_by_expert[5] == 5 and slot_by_expert[6] == 6
+    assert all(load.expert == 7 for load in plan.loads)
+
+    # Ring replacement is round-robin over the ring only, and committed
+    # tenants are the only replaceable ones: a slot whose tenant is still
+    # inflight may have a read outstanding, and handing it to a second
+    # load would race two fills on one physical buffer.
+    ring2 = bank.plan_prefetch([8, 9])
+    assert [(load.expert, load.slot) for load in ring2] == [(8, 5), (9, 6)]
+    assert 5 not in bank.plan([5], phase="decode").hits
+    # Both tenants are inflight: further predictions are dropped, never
+    # double-assigned.
+    assert bank.plan_prefetch([10]) == ()
+    assert bank.commit_prefetch(8) is True
+    # 8 is committed, so its slot recycles; the displaced publication then
+    # refuses a (now stale) repeat commit.
+    ring3 = bank.plan_prefetch([10])
+    assert [(load.expert, load.slot) for load in ring3] == [(10, 5)]
+    assert bank.commit_prefetch(8) is False
+    assert bank.commit_prefetch(10) is True
+
+    # The persistent tier is untouched by speculation.
+    assert bank.occupancy <= 2
+    assert bank.invalidate_prefetch(10) == 5
+    assert bank.plan([10], phase="decode").hits == ()
+
+
+def test_prefetch_ring_defers_repredicting_recent_evictions():
+    """A just-evicted ring expert is not immediately re-assignable: ring
+    turnover otherwise re-reads the same hot experts token after token
+    (churn measured at the 90g operating point). The embargo is measured
+    in decode epochs and lifts after prefetch_reeviction_window plans."""
+
+    bank = LayerExpertSlotBank(
+        expert_count=8,
+        persistent_slots=1,
+        transient_slots=1,
+        prefetch_slots=1,
+    )
+    assert bank.prefetch_reeviction_window == 2
+    (first,) = bank.plan_prefetch([3])
+    assert first.expert == 3
+    assert bank.commit_prefetch(3) is True
+    # Recycling for 4 evicts published 3 and starts its embargo.
+    (second,) = bank.plan_prefetch([4])
+    assert second.expert == 4
+    assert bank.commit_prefetch(4) is True
+    assert bank.plan_prefetch([3]) == ()
+    bank.plan([0], phase="decode")
+    assert bank.plan_prefetch([3]) == ()
+    bank.plan([0], phase="decode")
+    # Window elapsed: 3 is predictable again (and evicts published 4).
+    (third,) = bank.plan_prefetch([3])
+    assert third.expert == 3
+    # Failure invalidation is NOT an eviction: retrying is legitimate.
+    assert bank.invalidate_prefetch(3, ticket=bank.prefetch_ticket(3)) is not None
+    (retry,) = bank.plan_prefetch([3])
+    assert retry.expert == 3
+
+
+def test_prefetch_commit_ticket_binds_exactly_one_assignment():
+    bank = LayerExpertSlotBank(
+        expert_count=8,
+        persistent_slots=1,
+        transient_slots=1,
+        prefetch_slots=1,
+    )
+    (load,) = bank.plan_prefetch([3])
+    assert (load.expert, load.slot) == (3, 2)
+    ticket = bank.prefetch_ticket(3)
+    assert ticket is not None
+    # A stale ticket neither publishes nor consumes the live assignment
+    # (callbacks that straddle a reset re-use expert ids, never tickets).
+    assert bank.commit_prefetch(3, ticket=ticket - 1) is False
+    assert bank.prefetch_ticket(3) == ticket
+    assert bank.invalidate_prefetch(3, ticket=ticket - 1) is None
+    assert bank.prefetch_ticket(3) == ticket
+    assert bank.commit_prefetch(3, ticket=ticket) is True
+    assert 3 in bank.plan([3], phase="decode").hits
+
+
+def test_prefetch_ring_disabled_by_default_matches_legacy_shape():
+    bank = LayerExpertSlotBank(
+        expert_count=8,
+        persistent_slots=2,
+        transient_slots=2,
+    )
+    assert bank.slot_count == 4
+    assert bank.plan_prefetch([1, 2]) == ()
+    bank.reset()

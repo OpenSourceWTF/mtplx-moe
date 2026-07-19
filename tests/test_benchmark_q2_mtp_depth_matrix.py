@@ -41,19 +41,33 @@ def _load_module():
 
 
 class _FakeStreaming:
-    def __init__(self) -> None:
+    def __init__(self, config: dict | None = None) -> None:
         self.reset_calls = 0
+        options = dict(config or {})
+        # The runner's fully-islanded gate reads the streaming config and
+        # spec attributes; mirror the real runtime's surface for them.
+        self.config = SimpleNamespace(
+            island_layers=tuple(options.get("island_layers") or ()),
+            mmap_island_layers=tuple(options.get("mmap_island_layers") or ()),
+        )
+        self.spec = SimpleNamespace(routed_layer_indices=(1, 2, 3))
 
     def reset(self) -> None:
         self.reset_calls += 1
 
 
 class _FakeRuntime:
-    def __init__(self, model_key: str, *, mtp_enabled: bool = True) -> None:
+    def __init__(
+        self,
+        model_key: str,
+        *,
+        mtp_enabled: bool = True,
+        streaming_config: dict | None = None,
+    ) -> None:
         self.model_key = model_key
         self.mtp_enabled = mtp_enabled
         self.tokenizer = object()
-        self.expert_streaming = _FakeStreaming()
+        self.expert_streaming = _FakeStreaming(streaming_config)
         self.admissions: list[int] = []
         self.closed = False
         self.telemetry_reads = 0
@@ -293,6 +307,7 @@ def _fake_apis(
         runtime = _FakeRuntime(
             kwargs["expert_streaming_config"]["model_key"],
             mtp_enabled=bool(kwargs["mtp"]),
+            streaming_config=kwargs["expert_streaming_config"],
         )
         calls.runtimes.append(runtime)
         return runtime
@@ -423,6 +438,8 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
     assert args.max_live_kv_tokens == 4096
     assert args.q2_expert_kernel == "stock"
     assert args.hy3_router_kernel == "mpp-r1-fused-r2"
+    assert args.hy3_mtp_shared_kernel == "stock"
+    assert args.hy3_mtp_shared_kernel_depth == 3
     assert args.resource_telemetry is False
     assert args.resource_sample_interval == 0.25
     assert args.resource_max_samples == 4096
@@ -438,6 +455,150 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
     assert args.glm52_q2_prompt_tail is None
 
 
+def test_miss_shadow_flag_parses_and_reaches_runtime_options() -> None:
+    module = _load_module()
+
+    defaults = module.build_parser().parse_args([])
+    assert defaults.miss_shadow is None
+    assert module.DEFAULT_RUNTIME_OPTIONS["miss_shadow"] is None
+
+    for codec in ("b1", "t158"):
+        args = module.build_parser().parse_args(["--miss-shadow", codec])
+        assert args.miss_shadow == codec
+        assert module._runtime_options_from_args(args)["miss_shadow"] == codec
+
+    with pytest.raises(SystemExit):
+        module.build_parser().parse_args(["--miss-shadow", "q4"])
+
+
+def test_miss_shadow_survives_to_runtime_config_and_payload(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (1,)}],
+        contexts=(1024,),
+        runtime_options={"miss_shadow": "t158"},
+        apis=apis,
+    )
+
+    assert calls.configs[0]["miss_shadow"] == "t158"
+    assert payload["configuration"]["runtime"]["miss_shadow"] == "t158"
+    assert payload["models"][0]["runtime_config"]["miss_shadow"] == "t158"
+
+
+def test_streamed_codec_flags_parse_and_reach_runtime_options() -> None:
+    module = _load_module()
+
+    defaults = module.build_parser().parse_args([])
+    assert defaults.streamed_codec == "none"
+    assert defaults.streamed_codec_manifest == ""
+    assert defaults.streamed_codec_verify is True
+    assert module.DEFAULT_RUNTIME_OPTIONS["streamed_codec"] == "none"
+    assert module.DEFAULT_RUNTIME_OPTIONS["streamed_codec_verify"] is True
+
+    args = module.build_parser().parse_args(
+        [
+            "--streamed-codec", "rans32x-v1",
+            "--streamed-codec-manifest", "/tmp/codec.json",
+            "--no-streamed-codec-verify",
+        ]
+    )
+    options = module._runtime_options_from_args(args)
+    assert options["streamed_codec"] == "rans32x-v1"
+    assert options["streamed_codec_manifest"] == "/tmp/codec.json"
+    assert options["streamed_codec_verify"] is False
+
+    with pytest.raises(SystemExit):
+        module.build_parser().parse_args(["--streamed-codec", "zstd"])
+
+
+def test_streamed_codec_survives_to_runtime_config(tmp_path: Path) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+
+    module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (1,)}],
+        contexts=(1024,),
+        runtime_options={
+            "streamed_codec": "rans32x-v1",
+            "streamed_codec_manifest": str(tmp_path / "codec.json"),
+            "streamed_codec_verify": False,
+        },
+        apis=apis,
+    )
+
+    assert calls.configs[0]["streamed_codec"] == "rans32x-v1"
+    assert calls.configs[0]["streamed_codec_manifest"] == str(
+        tmp_path / "codec.json"
+    )
+    assert calls.configs[0]["streamed_codec_verify"] is False
+
+
+def test_mtp_precision_flag_parses_and_reaches_requests() -> None:
+    module = _load_module()
+
+    defaults = module.build_parser().parse_args([])
+    assert defaults.mtp_precision == "bf16"
+    for request in module._requests_from_args(defaults):
+        assert request["mtp_precision"] == "bf16"
+
+    args = module.build_parser().parse_args(["--mtp-precision", "q4"])
+    for request in module._requests_from_args(args):
+        assert request["mtp_precision"] == "q4"
+
+    with pytest.raises(SystemExit):
+        module.build_parser().parse_args(["--mtp-precision", "q8"])
+
+
+def test_mtp_precision_survives_request_normalization(tmp_path: Path) -> None:
+    """Regression: _normalized_request whitelists keys and dropped precision.
+
+    The drop was silent — the q4 arm fell back to bf16 and opened the BF16
+    verifier against the Q4 artifact directory, failing at load with
+    ArtifactValidationError.
+    """
+    module = _load_module()
+
+    for precision in ("bf16", "q4"):
+        normalized = module._normalized_request(
+            {**_requests(tmp_path)[0], "depths": (1,), "mtp_precision": precision},
+            mtp_disabled_baseline=False,
+        )
+        assert normalized["mtp_precision"] == precision
+
+    # default when a caller omits it entirely
+    normalized = module._normalized_request(
+        {**_requests(tmp_path)[0], "depths": (1,)},
+        mtp_disabled_baseline=False,
+    )
+    assert normalized["mtp_precision"] == "bf16"
+
+    with pytest.raises(module.BenchmarkConfigurationError):
+        module._normalized_request(
+            {**_requests(tmp_path)[0], "depths": (1,), "mtp_precision": "q8"},
+            mtp_disabled_baseline=False,
+        )
+
+
+def test_mtp_precision_reaches_the_loader(tmp_path: Path) -> None:
+    """The precision must arrive in apis.load kwargs, not just the request."""
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (1,), "mtp_precision": "q4"}],
+        contexts=(1024,),
+        apis=apis,
+    )
+
+    _model_root, load_kwargs = calls.loads[0]
+    assert load_kwargs["mtp_precision"] == "q4"
+    assert payload["models"][0]["mtp_precision"] == "q4"
+
+
 def test_issue51_kernel_selectors_parse_independently() -> None:
     module = _load_module()
 
@@ -447,11 +608,20 @@ def test_issue51_kernel_selectors_parse_independently() -> None:
             "fused-nax",
             "--hy3-router-kernel",
             "mpp-r1-fused-r2",
+            "--hy3-mtp-shared-kernel",
+            "metal-exact",
+            "--hy3-mtp-shared-kernel-depth",
+            "3",
         ]
     )
 
     assert args.q2_expert_kernel == "fused-nax"
     assert args.hy3_router_kernel == "mpp-r1-fused-r2"
+    assert args.hy3_mtp_shared_kernel == "metal-exact"
+    assert args.hy3_mtp_shared_kernel_depth == 3
+    assert module._runtime_options_from_args(args)["hy3_mtp_shared_kernel"] == (
+        "metal-exact"
+    )
 
     for selector in (
         "steel-r1-fused-r2",
@@ -861,16 +1031,28 @@ def test_issue51_kernel_selectors_reach_runtime_and_artifact(tmp_path: Path) -> 
         runtime_options={
             "q2_expert_kernel": "nax",
             "hy3_router_kernel": "fused-fp32",
+            "hy3_mtp_shared_kernel": "metal-exact",
+            "hy3_mtp_shared_kernel_depth": 3,
         },
         apis=apis,
     )
 
     assert calls.configs[0]["q2_expert_kernel"] == "nax"
     assert calls.configs[0]["hy3_router_kernel"] == "fused-fp32"
+    assert calls.configs[0]["hy3_mtp_shared_kernel"] == "metal-exact"
+    assert calls.configs[0]["hy3_mtp_shared_kernel_depth"] == 3
     assert payload["configuration"]["runtime"]["q2_expert_kernel"] == "nax"
     assert payload["configuration"]["runtime"]["hy3_router_kernel"] == "fused-fp32"
+    assert payload["configuration"]["runtime"]["hy3_mtp_shared_kernel"] == (
+        "metal-exact"
+    )
     assert payload["models"][0]["runtime_config"]["q2_expert_kernel"] == "nax"
-    assert payload["models"][0]["runtime_config"]["hy3_router_kernel"] == ("fused-fp32")
+    assert payload["models"][0]["runtime_config"]["hy3_router_kernel"] == (
+        "fused-fp32"
+    )
+    assert payload["models"][0]["runtime_config"]["hy3_mtp_shared_kernel"] == (
+        "metal-exact"
+    )
 
 
 def test_ar_path_drift_is_retained_as_diagnostic_and_matrix_continues(

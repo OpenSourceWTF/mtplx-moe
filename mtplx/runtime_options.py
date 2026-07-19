@@ -8,6 +8,47 @@ from typing import Mapping
 
 KV_QUANT_MODES = ("off", "q8", "q4")
 
+#: The one boolean vocabulary for MTPLX env flags.
+#:
+#: Every reader of a boolean ``MTPLX_*`` var should go through
+#: :func:`env_bool` so a spelling means the same thing everywhere. Values
+#: outside these sets raise rather than being silently read as "off" by one
+#: reader and "on" by another — the failure mode catalogued in
+#: docs/AUDIT_2026-07-18.md, where ``=enabled`` disabled a feature in the
+#: server while enabling it in the generation loop.
+ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on", "enable", "enabled"})
+ENV_FALSE_VALUES = frozenset({"0", "false", "no", "off", "disable", "disabled"})
+
+
+def env_bool(
+    name: str,
+    *,
+    default: bool,
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Parse a boolean ``MTPLX_*`` env var, or raise on an unknown spelling.
+
+    Unset (and set-but-empty) yields ``default``. Anything that is neither
+    a recognized true nor a recognized false value is a configuration
+    error: guessing is what let one variable mean three things.
+    """
+
+    source = os.environ if env is None else env
+    raw = source.get(name)
+    if raw is None:
+        return bool(default)
+    token = str(raw).strip().lower()
+    if not token:
+        return bool(default)
+    if token in ENV_TRUE_VALUES:
+        return True
+    if token in ENV_FALSE_VALUES:
+        return False
+    accepted = ", ".join(sorted(ENV_TRUE_VALUES | ENV_FALSE_VALUES))
+    raise ValueError(
+        f"{name}={raw!r} is not a boolean; expected one of: {accepted}"
+    )
+
 
 @dataclass(frozen=True)
 class ResolvedAPIKey:
@@ -17,6 +58,87 @@ class ResolvedAPIKey:
     @property
     def required(self) -> bool:
         return bool(self.value)
+
+
+def parser_option_names(parser: object, namespace: object = None) -> set[str]:
+    """Every option name reachable in the parse context, without dashes.
+
+    Walks the root parser plus whichever subparsers the parse actually
+    descended into (using ``namespace`` to pick the branch), which is the
+    same scope argparse resolves abbreviations against.
+    """
+
+    names: set[str] = set()
+    seen: set[int] = set()
+    pending = [parser]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        for action in getattr(current, "_actions", ()):
+            for option in getattr(action, "option_strings", ()) or ():
+                names.add(str(option).lstrip("-"))
+            choices = getattr(action, "choices", None)
+            dest = getattr(action, "dest", None)
+            if not isinstance(choices, dict) or not dest:
+                continue
+            # A subparsers action: follow only the branch that was taken.
+            picked = getattr(namespace, str(dest), None) if namespace else None
+            if picked is not None and picked in choices:
+                pending.append(choices[picked])
+            elif namespace is None:
+                pending.extend(choices.values())
+    return names
+
+
+def canonicalize_flag_tokens(
+    tokens: set[str],
+    parser: object,
+    namespace: object = None,
+) -> set[str]:
+    """Expand argparse abbreviations to the flag names they resolved to.
+
+    ``--temp 0.9`` sets ``args.temperature`` but was recorded as ``temp``,
+    so every ``"temperature" in cli_flags`` check read it as *not typed*
+    and the config file happily overwrote the user's value. Resolving here
+    (rather than setting ``allow_abbrev=False``) keeps abbreviations
+    working while making the explicit-flag signal true.
+
+    The raw token is kept alongside the expansion, so checks written
+    against either spelling keep working. Ambiguous prefixes expand to
+    nothing — argparse would have rejected the command anyway.
+    """
+
+    known = parser_option_names(parser, namespace)
+    resolved = set(tokens)
+    for token in tokens:
+        if token in known:
+            continue
+        matches = {name for name in known if name.startswith(token)}
+        if len(matches) == 1:
+            resolved |= matches
+    return resolved
+
+
+def block_prefix_restore_enabled() -> bool:
+    """The single parse of ``MTPLX_SESSION_BLOCK_PREFIX_RESTORE``.
+
+    Default ON. Every reader — the decode loop, the engine session, the
+    session bank's cold tier, and the server's settings view — goes through
+    this, so one spelling cannot mean ON in one and OFF in another. Unset
+    used to mean OFF in the cold tier and ON everywhere else, which
+    silently disabled cold-tier block-prefix restore for library embedders
+    (the CLI path masks it by force-setting "1"); and the server's
+    allowlist-only read reported "off" for spellings the runtime honours as
+    on, e.g. ``=enabled``.
+
+    Lives here rather than in :mod:`mtplx.session_bank` because this module
+    has no heavy imports: the server reads the setting on paths where the
+    mlx-backed runtime may be unavailable.
+    """
+
+    return env_bool("MTPLX_SESSION_BLOCK_PREFIX_RESTORE", default=True)
 
 
 def normalize_paged_kv_quantization(value: object | None, *, allow_none: bool = False) -> str | None:

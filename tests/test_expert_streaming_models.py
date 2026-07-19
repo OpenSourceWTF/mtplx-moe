@@ -122,6 +122,8 @@ def test_hy3_q4_is_unchanged_by_hy3_expert_q2_registry_expansion() -> None:
         "mtp_layer_index": 80,
         "mtp_included": False,
         "full_indexer_layers": (),
+        "island_pin_order": (),
+        "expert_codec": "affine",
     }
     before = asdict(HY3_Q4)
 
@@ -209,10 +211,14 @@ def test_existing_descriptors_are_unchanged_by_glm52_expert_q2_registry_expansio
     None
 ):
     expected_digests = {
-        "hy3-q4": "c907c56bf100c7701fc2e2e0554b54ff71c3b0b2bd5a90aef25522aaea068698",
-        "hy3-expert-only-q4": "22f6af1e3dd702ab968af86ce31ba50308ebae62e7ee638587d79ddd75187373",
-        "hy3-expert-q2": "dfc46bf9641b64bc8119361032a1cc1d0f11a60f751887494a37f9c041ab32ed",
-        "glm52-q4": "09813b5e03a43226212adbee85ac3cc7df92fa4ca693c4f46505ca3f4c278a5d",
+        # Digests track the intentional field set: island_pin_order
+        # (auto-census #98) and expert_codec (q1 lane, issue #51) are
+        # spec fields now; a digest change without a matching field-set
+        # change is the drift this test exists to catch.
+        "hy3-q4": "bc121154d4d6286e9499995e06632e10007ef5c9b343254018a60bff59ef344c",
+        "hy3-expert-only-q4": "d6ac448f353a988d77c27b5e81d6cb7b9de2eba3c93b67bfd0efa35729473140",
+        "hy3-expert-q2": "286bc48306801005db9b32d96362ac2553bbe4ce5e53112503b1a12c9a6a78ea",
+        "glm52-q4": "6372e17bf28658526de0b2150cda8fad486f077849b5d0c5be23ff19e6b770b1",
     }
     existing = (HY3_Q4, HY3_EXPERT_ONLY_Q4, HY3_EXPERT_Q2, GLM52_Q4)
 

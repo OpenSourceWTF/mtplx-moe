@@ -37,10 +37,61 @@ from mtplx.hy3_router_fp32 import (
     prepare_hy3_router_fp32_weight,
 )
 
+from mtplx.compile_state import compile_trace_active
+from mtplx import roofline_profile as _rp
 from .expert_mlx import UnboundExpertSwitch, run_switch_with_shared_overlap
 
 
+def _kv_nbytes(cache) -> int:
+    """Real bytes of the KV a decode attention step reads (0 if unavailable)."""
+    try:
+        keys = getattr(cache, "keys", None)
+        values = getattr(cache, "values", None)
+        if keys is not None and values is not None:
+            return int(keys.nbytes) + int(values.nbytes)
+        state = getattr(cache, "state", None)
+        if isinstance(state, (list, tuple)):
+            return sum(int(a.nbytes) for a in state if hasattr(a, "nbytes"))
+    except Exception:
+        pass
+    return 0
+
+
+def _moe_read_nbytes(switch_mlp) -> int:
+    """Real bytes a decode token reads from the expert bank: top_k of E experts,
+    not the whole resident bank."""
+    try:
+        bank = getattr(switch_mlp, "_bank", None)
+        top_k = int(switch_mlp.runtime.spec.top_k)
+        record_bytes = getattr(bank, "record_bytes", None)
+        if record_bytes is not None:
+            return int(record_bytes) * top_k
+        arrays = getattr(bank, "arrays", None)
+        if arrays:
+            total = sum(int(a.nbytes) for a in arrays.values())
+            experts = int(switch_mlp.runtime.spec.expert_count)
+            return total * top_k // max(experts, 1)
+    except Exception:
+        pass
+    return 0
+
+
 FUSE_SHARED_GATE_UP_ENV = "MTPLX_FUSE_HY3_SHARED_GATE_UP_PROJECTIONS"
+FUSE_QKV_ENV = "MTPLX_FUSE_HY3_QKV_PROJECTIONS"
+SUBMIT_CADENCE_ENV = "MTPLX_HY3_SUBMIT_CADENCE"
+
+
+def _decode_submit_cadence() -> int:
+    """Layers between decode-lane GPU submission checkpoints (0 = off)."""
+
+    raw = os.environ.get(SUBMIT_CADENCE_ENV, "").strip()
+    if not raw:
+        return 0
+    try:
+        cadence = int(raw)
+    except ValueError:
+        return 0
+    return cadence if cadence > 0 else 0
 _PACKABLE_LINEAR_SUFFIXES = ("weight", "scales", "biases", "bias")
 
 
@@ -170,26 +221,24 @@ class Attention(nn.Module):
         self.n_kv_heads = args.num_key_value_heads
         self.head_dim = args.head_dim
         self.scale = self.head_dim**-0.5
-        self.q_proj = nn.Linear(
-            args.hidden_size,
-            self.n_heads * self.head_dim,
-            bias=args.attention_bias,
-        )
-        self.k_proj = nn.Linear(
-            args.hidden_size,
-            self.n_kv_heads * self.head_dim,
-            bias=args.attention_bias,
-        )
-        self.v_proj = nn.Linear(
-            args.hidden_size,
-            self.n_kv_heads * self.head_dim,
-            bias=args.attention_bias,
-        )
-        self.o_proj = nn.Linear(
-            self.n_heads * self.head_dim,
-            args.hidden_size,
-            bias=args.attention_bias,
-        )
+        q_dim = self.n_heads * self.head_dim
+        kv_dim = self.n_kv_heads * self.head_dim
+        # QKV fusion (issue #51 T1a, flag-gated). One packed projection replaces
+        # three: BIT-EXACT because g64 quant groups run along the input axis, so
+        # concatenating output rows keeps each row's own scale/bias. Folds the two
+        # low-occupancy 1024-wide k/v matvecs into the 10240-wide grid -> fewer
+        # launches and more rows in flight at batch=1 (the measured attention tax).
+        self._fuse_qkv = _env_enabled(FUSE_QKV_ENV)
+        if self._fuse_qkv:
+            self._qkv_splits = [q_dim, q_dim + kv_dim]
+            self.qkv_proj = nn.Linear(
+                args.hidden_size, q_dim + 2 * kv_dim, bias=args.attention_bias
+            )
+        else:
+            self.q_proj = nn.Linear(args.hidden_size, q_dim, bias=args.attention_bias)
+            self.k_proj = nn.Linear(args.hidden_size, kv_dim, bias=args.attention_bias)
+            self.v_proj = nn.Linear(args.hidden_size, kv_dim, bias=args.attention_bias)
+        self.o_proj = nn.Linear(q_dim, args.hidden_size, bias=args.attention_bias)
         self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.rope = initialize_rope(
@@ -207,21 +256,19 @@ class Attention(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         batch, length, _ = x.shape
-        queries = (
-            self.q_proj(x)
-            .reshape(batch, length, self.n_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-        keys = (
-            self.k_proj(x)
-            .reshape(batch, length, self.n_kv_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-        values = (
-            self.v_proj(x)
-            .reshape(batch, length, self.n_kv_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
-        )
+        if self._fuse_qkv:
+            q, k, v = mx.split(self.qkv_proj(x), self._qkv_splits, axis=-1)
+        else:
+            q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        queries = q.reshape(
+            batch, length, self.n_heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
+        keys = k.reshape(
+            batch, length, self.n_kv_heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
+        values = v.reshape(
+            batch, length, self.n_kv_heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
         queries = self.q_norm(queries)
         keys = self.k_norm(keys)
         offset = cache.offset if cache is not None else 0
@@ -686,6 +733,74 @@ def estimate_hy3_router_kernel_incremental_bytes(
     return router_count * 192 * 4096 * prepared_element_bytes
 
 
+_LOOKAHEAD_ROWS: list[tuple[int, Any, Any]] | None = None
+
+
+def _lookahead_capture(layer_index: int, x: mx.array, indices: mx.array) -> None:
+    """Diagnostic lane: capture decode hiddens + routed ids per sparse layer.
+
+    MTPLX_LOOKAHEAD_CAPTURE_PATH enables it; MTPLX_LOOKAHEAD_CAPTURE_TOKENS
+    bounds the row count (default 300 tokens x layers). Rows persist to an
+    .npz at exit. Decode rows only (single-token calls).
+    """
+
+    global _LOOKAHEAD_ROWS
+    path = os.environ.get("MTPLX_LOOKAHEAD_CAPTURE_PATH")
+    if not path or int(x.shape[-2]) != 1:
+        return
+    limit = int(os.environ.get("MTPLX_LOOKAHEAD_CAPTURE_TOKENS", "300"))
+    if _LOOKAHEAD_ROWS is None:
+        _LOOKAHEAD_ROWS = []
+
+        def _save() -> None:
+            import numpy as _np
+
+            rows = _LOOKAHEAD_ROWS or []
+            if not rows:
+                return
+            mx.eval(*[r[1] for r in rows], *[r[2] for r in rows])
+            _np.savez_compressed(
+                path,
+                layers=_np.array([r[0] for r in rows], dtype=_np.int16),
+                hiddens=_np.stack(
+                    [_np.array(r[1], copy=False) for r in rows]
+                ).astype(_np.float16),
+                expert_ids=_np.stack(
+                    [_np.array(r[2], copy=False) for r in rows]
+                ).astype(_np.int16),
+            )
+
+        import atexit
+
+        atexit.register(_save)
+    # 79 sparse layers per token; bound total rows by tokens * layers.
+    if len(_LOOKAHEAD_ROWS) >= limit * 79:
+        return
+    _LOOKAHEAD_ROWS.append(
+        (
+            int(layer_index),
+            x.reshape(-1).astype(mx.float32),
+            indices.reshape(-1).astype(mx.int32),
+        )
+    )
+
+
+class _LookaheadRouters:
+    """Plain holder for sibling router references; deliberately NOT a Module.
+
+    ``mlx.nn.Module.__setattr__`` registers array/dict/list/tuple values as
+    children, so assigning the sibling routers directly would re-register
+    their parameters under a second path in the tree. A plain object rides
+    outside the parameter tree entirely.
+    """
+
+    __slots__ = ("entries",)
+
+    def __init__(self, entries: tuple) -> None:
+        # tuple of (layer_index, Router) for the next up-to-3 sparse layers.
+        self.entries = entries
+
+
 class SparseMLP(nn.Module):
     def __init__(
         self,
@@ -696,6 +811,7 @@ class SparseMLP(nn.Module):
     ):
         super().__init__()
         self.router = Router(args)
+        self.layer_index = int(layer_index)
         self.switch_mlp = UnboundExpertSwitch(layer_index)
         shared_width = args.moe_intermediate_size * args.num_shared_experts
         shared_cls = FusedSharedMLP if fuse_shared_gate_up else MLP
@@ -705,20 +821,130 @@ class SparseMLP(nn.Module):
         )
         self.enable_moe_fp32_combine = args.enable_moe_fp32_combine
 
+    def _maybe_prefetch_lookahead(self, x: mx.array, indices: mx.array) -> None:
+        """Residual-stream lookahead prefetch (issue #51 C6).
+
+        Applies the next up-to-3 sparse layers' routers to this layer's
+        hidden state (measured 74.3%/66%/61% top-k overlap at L=1/2/3
+        against a 4.2% identity baseline) and hands the predicted expert
+        ids to the runtime's speculative ring. Decode single-token calls
+        only; free unless an attached runtime enables prefetch.
+        """
+
+        lookahead = getattr(self, "_mtplx_next_routers", None)
+        if lookahead is None or not lookahead.entries:
+            return
+        runtime = getattr(self.switch_mlp, "runtime", None)
+        if runtime is None:
+            return
+        config = getattr(runtime, "config", None)
+        if config is None or getattr(config, "prefetch_slots", 0) <= 0:
+            return
+        prefetch = getattr(runtime, "prefetch_experts", None)
+        if prefetch is None or int(x.shape[-2]) != 1:
+            return
+        # Fire only from STREAMED source layers, for STREAMED targets.
+        # Island layers have no per-layer host sync of their own, so
+        # firing there added a brand-new sync per island per token —
+        # measured d0 12.5 -> 9.2 at the 90 GiB config. The selection is
+        # config-dependent; cache it per layer as plain ints (a tuple of
+        # modules would re-register parameters under Module.__setattr__).
+        selection = getattr(self, "_mtplx_lookahead_selection", None)
+        if selection is None:
+            islands = getattr(runtime, "island_layer_set", frozenset())
+            if self.layer_index in islands:
+                selection = ()
+            else:
+                selection = tuple(
+                    position
+                    for position, (next_layer, _router) in enumerate(
+                        lookahead.entries
+                    )
+                    if next_layer not in islands
+                )[:3]
+            self._mtplx_lookahead_selection = selection
+        if not selection:
+            return
+        # Admission pressure: skip the router compute entirely rather
+        # than predict into a saturated lane.
+        if getattr(runtime, "speculation_saturated", False):
+            return
+        predictions = [
+            (lookahead.entries[position][0], lookahead.entries[position][1](x)[0])
+            for position in selection
+        ]
+        # The predictions are not ancestors of this layer's output, so they
+        # would not ride along with the switch's own eval; materialize them
+        # together with the layer's own indices in one host sync (the
+        # streamed switch would sync on these indices anyway).
+        mx.eval(indices, *(predicted for _layer, predicted in predictions))
+        # Nearest lookahead first: measured route overlap decays with
+        # depth (74.3% at L=1 vs 61% at L=3), so when the lane saturates
+        # mid-set the farther, lower-value layers are the ones dropped.
+        for next_layer, predicted in predictions:
+            prefetch(
+                next_layer,
+                [int(value) for value in predicted.reshape(-1).tolist()],
+            )
+            if getattr(runtime, "speculation_saturated", False):
+                break
+
     def __call__(self, x: mx.array) -> mx.array:
+        if _rp.enabled() and int(x.shape[-2]) == 1:
+            return self._profiled_call(x)
         indices, scores = self.router(x)
+        _lookahead_capture(self.layer_index, x, indices)
+        self._maybe_prefetch_lookahead(x, indices)
         # Match the pinned Hy3 MLX reference: when FP32 MoE combining is
         # disabled, both the routing multiply and its reduction happen in the
         # activation dtype.  Keeping ``scores`` in FP32 here subtly changes
         # target logits even though the selected experts are identical.
         if not self.enable_moe_fp32_combine:
             scores = scores.astype(x.dtype)
+            # Issue #65: dense-bank switches expose a fused expert wave that
+            # owns the routing multiply and reduction (bitwise-identical BF16
+            # combine). It declines ineligible shapes by returning None, and
+            # the classic path below remains the only other execution.
+            wave_call = getattr(self.switch_mlp, "wave_call", None)
+            if wave_call is not None:
+                combined = wave_call(x, indices, scores)
+                if combined is not None:
+                    return combined.astype(x.dtype) + self.shared_mlp(x)
         routed, shared = run_switch_with_shared_overlap(
             self.switch_mlp,
             x,
             indices,
             lambda: self.shared_mlp(x),
         )
+        routed = (routed * scores[..., None]).sum(axis=-2)
+        if self.enable_moe_fp32_combine:
+            return (routed.astype(mx.float32) + shared.astype(mx.float32)).astype(
+                x.dtype
+            )
+        return routed.astype(x.dtype) + shared
+
+    def _profiled_call(self, x: mx.array) -> mx.array:
+        """Same math as __call__, but captures real (module, input) samples for
+        router / routed experts / shared expert so the profiler can bench each on
+        the queued lane at exit (MTPLX_ROOFLINE_PROFILE). Bypasses the wave and the
+        shared-overlap wrapper so the three are separable; for a single decode
+        token the wave declines anyway, so the arithmetic matches __call__."""
+        _rp.capture_dense("router", self.router, x, _rp.module_nbytes(self.router))
+        indices, scores = self.router(x)
+        _rp.capture_moe(
+            self.switch_mlp, x, indices, _moe_read_nbytes(self.switch_mlp)
+        )
+        # T0a: 32-assignment wave reads 4x the experts (32 distinct)
+        _rp.capture_moe_wave(
+            self.switch_mlp, x, _moe_read_nbytes(self.switch_mlp) * 4
+        )
+        _rp.capture_dense(
+            "shared_expert", self.shared_mlp, x, _rp.module_nbytes(self.shared_mlp)
+        )
+        routed = self.switch_mlp(x, indices)
+        shared = self.shared_mlp(x)
+        if not self.enable_moe_fp32_combine:
+            scores = scores.astype(x.dtype)
         routed = (routed * scores[..., None]).sum(axis=-2)
         if self.enable_moe_fp32_combine:
             return (routed.astype(mx.float32) + shared.astype(mx.float32)).astype(
@@ -760,6 +986,20 @@ class DecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
+        if _rp.enabled() and int(x.shape[-2]) == 1:
+            normed = self.input_layernorm(x)
+            # T0b: prove the norm weights are bf16 (fp32 -> fp32 keys -> KV trap)
+            for _nm in ("q_norm", "k_norm"):
+                _w = getattr(getattr(self.self_attn, _nm, None), "weight", None)
+                if _w is not None:
+                    _rp.note_dtype(f"self_attn.{_nm}.weight", _w)
+            _rp.note_dtype("kv_cache.keys", getattr(cache, "keys", None))
+            _rp.capture_attention(
+                self.self_attn, normed, mask, cache,
+                _rp.module_nbytes(self.self_attn) + _kv_nbytes(cache),
+            )
+            hidden = x + self.self_attn(normed, mask, cache)
+            return hidden + self.mlp(self.post_attention_layernorm(hidden))
         hidden = x + self.self_attn(self.input_layernorm(x), mask, cache)
         return hidden + self.mlp(self.post_attention_layernorm(hidden))
 
@@ -818,10 +1058,12 @@ class Hy3MTPLayer(nn.Module):
         mask = create_attention_mask(mixed, cache, return_array=True)
         hidden = self.mtp_block(mixed, mask, cache)
         recurrent_hidden = self.final_layernorm(hidden)
-        head_hidden = recurrent_hidden
+        # Cast logits, not the head input: fp32 x BF16 matmul materializes
+        # an fp32 weight copy per call (see Hy3ForCausalLM.__call__).
+        logits = lm_head(recurrent_hidden)
         if self._lm_head_fp32:
-            head_hidden = head_hidden.astype(mx.float32)
-        return lm_head(head_hidden), recurrent_hidden
+            logits = logits.astype(mx.float32)
+        return logits, recurrent_hidden
 
 
 class Hy3MTP(nn.Module):
@@ -857,6 +1099,26 @@ class Hy3Model(nn.Module):
             for layer_index in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        # Lookahead prefetch wiring: each sparse layer holds plain
+        # references to the next up-to-3 sparse layers' routers so decode
+        # can predict their expert routes from the current hidden state.
+        sparse_mlps = [
+            (layer_index, layer.mlp)
+            for layer_index, layer in enumerate(self.layers)
+            if isinstance(layer.mlp, SparseMLP)
+        ]
+        # A wide window (8) lets a streamed layer reach past intervening
+        # island layers to the next few STREAMED targets; the hook filters
+        # and caps at fire time.
+        for position, (_layer_index, mlp) in enumerate(sparse_mlps):
+            mlp._mtplx_next_routers = _LookaheadRouters(
+                tuple(
+                    (next_index, next_mlp.router)
+                    for next_index, next_mlp in sparse_mlps[
+                        position + 1 : position + 9
+                    ]
+                )
+            )
 
     def __call__(
         self,
@@ -868,8 +1130,29 @@ class Hy3Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
         mask = create_attention_mask(hidden, cache[0])
+        # Decode-lane submission cadence: without checkpoints the island
+        # segments accumulate as unsubmitted lazy graph while Python walks
+        # the layers, and the GPU idles until the next streamed seam's eval
+        # drains the whole backlog at once. async_eval every N layers keeps
+        # the device fed during host graph-build. Scheduling only — kernel
+        # math and ordering are unchanged, so outputs are bit-identical.
+        cadence = _decode_submit_cadence()
+        if compile_trace_active():
+            # Inside a compiled forward the per-layer async_eval is both illegal
+            # (graph transformation) and moot — the traced graph is a single
+            # submission, so there is no host graph-build window left to fill.
+            cadence = 0
+        async_eval = getattr(mx, "async_eval", None) if cadence else None
+        if async_eval is not None and int(hidden.shape[-2]) > 8:
+            async_eval = None
+        pending_layers = 0
         for layer, layer_cache in zip(self.layers, cache, strict=True):
             hidden = layer(hidden, mask, layer_cache)
+            if async_eval is not None:
+                pending_layers += 1
+                if pending_layers >= cadence:
+                    async_eval(hidden)
+                    pending_layers = 0
         if return_pre_norm:
             # NextN heads normalize the trunk hidden themselves (hnorm); hand
             # them the raw last-layer output, not the lm_head's normed view.
@@ -883,17 +1166,58 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         self._fuse_shared_gate_up = _env_enabled(FUSE_SHARED_GATE_UP_ENV)
+        self._fuse_qkv = _env_enabled(FUSE_QKV_ENV)
         self.model = Hy3Model(
             args,
             fuse_shared_gate_up=self._fuse_shared_gate_up,
         )
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
+    def _logits_head(self):
+        """T2a (flag-gated): trunk lm_head quantized to MTPLX_HY3_LM_HEAD_QUANT_BITS
+        (q8/q4). The head is bf16 990MB/token — the one saturated resident read left
+        unquantized. Quantizing it FREES memory below the plan budget (safe), and the
+        q-weight dequants to bf16 -> fp32 accumulate -> fp32 logit cast, so the
+        enable_lm_head_fp32 softmax precision is preserved (David's accumulate rule).
+        CHANGES the output distribution -> quality-gated, off by default. Built once."""
+        bits = int(os.environ.get("MTPLX_HY3_LM_HEAD_QUANT_BITS", "0") or "0")
+        if bits <= 0:
+            return self.lm_head
+        if not int(getattr(self, "_mtplx_lm_head_quant_bits", 0) or 0):
+            if isinstance(self.lm_head, nn.QuantizedLinear):
+                # Already quantized upstream (e.g. a q4 checkpoint) — nothing to do.
+                self._mtplx_lm_head_quant_bits = int(self.lm_head.bits)
+                return self.lm_head
+            head = nn.QuantizedLinear.from_linear(
+                self.lm_head, group_size=64, bits=bits
+            )
+            mx.eval(head.parameters())
+            # REPLACE the module; do NOT cache the quantized head alongside it.
+            # Keeping self.lm_head bound holds the 990MB bf16 weight resident, which
+            # inverts this lever's premise: instead of freeing ~712MB it ADDS ~278MB.
+            # That matters because the 79-island config peaks at 98 of the 100 GiB
+            # wired limit, where a retained copy is enough to trip the GPU
+            # command-buffer watchdog (kIOGPUCommandBufferCallbackErrorTimeout).
+            self.lm_head = head
+            self._mtplx_lm_head_quant_bits = bits
+            clear = getattr(mx, "clear_cache", None)
+            if clear is not None:
+                clear()
+        return self.lm_head
+
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
         hidden = self.model(inputs, cache)
+        # fp32 activations against the head weight would force MLX to materialize
+        # an fp32 copy of the full [vocab, hidden] matrix per call (~9.4 ms). The
+        # GEMM already accumulates in fp32, so casting the LOGITS keeps the flag's
+        # fp32-softmax semantics at the head's output rounding without that copy.
+        head = self._logits_head()
+        if _rp.enabled() and int(inputs.shape[-1]) == 1:
+            _rp.capture_dense("lm_head", head, hidden, _rp.module_nbytes(head))
+        logits = head(hidden)
         if self.args.enable_lm_head_fp32:
-            hidden = hidden.astype(mx.float32)
-        return self.lm_head(hidden)
+            logits = logits.astype(mx.float32)
+        return logits
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         result: dict[str, mx.array] = {}
@@ -922,6 +1246,21 @@ class Model(nn.Module):
                 )
                 if plan is not None:
                     plans.append(plan)
+        if self._fuse_qkv:
+            for layer_index in range(self.args.num_hidden_layers):
+                base = f"model.layers.{layer_index}.self_attn"
+                plan = _projection_pack_plan(
+                    result,
+                    target=f"{base}.qkv_proj",
+                    sources=(
+                        f"{base}.q_proj",
+                        f"{base}.k_proj",
+                        f"{base}.v_proj",
+                    ),
+                    equal_output_widths=False,
+                )
+                if plan is not None:
+                    plans.append(plan)
         if plans:
             # The caller replaces its source mapping with this return value.
             # Clearing it first lets each evaluated packed layer release its
@@ -936,4 +1275,17 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self):
+        # Set by the resident loader when the runtime requests quantized
+        # trunk KV. The MTP draft cache stays a stock KVCache — the
+        # compiled draft's tensor-offset adapter reads dense KV state, and
+        # one layer of BF16 KV is within the plan's runtime reserve.
+        mode = getattr(self, "_mtplx_kv_quant", None)
+        if mode:
+            from mlx_lm.models.cache import QuantizedKVCache
+
+            bits = {"q8": 8, "q4": 4}[mode]
+            return [
+                QuantizedKVCache(group_size=64, bits=bits)
+                for _layer in self.layers
+            ]
         return [KVCache() for _layer in self.layers]

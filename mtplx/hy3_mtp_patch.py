@@ -824,6 +824,8 @@ def build_hy3_mtp_module(
     expected_revision: str = HY3_MTP_SOURCE_REVISION,
     group_size: int = 64,
     precision: str = HY3_MTP_DEFAULT_PRECISION,
+    shared_kernel: str = "stock",
+    shared_kernel_depth: int = 3,
     verified_artifacts: VerifiedHy3MTPArtifacts | None = None,
 ) -> Any:
     """Construct, strictly load, and evaluate the Hy3 NextN head.
@@ -844,6 +846,19 @@ def build_hy3_mtp_module(
             f"unsupported Hy3 MTP precision {precision!r}; "
             f"choose one of {HY3_MTP_PRECISIONS}"
         )
+    if shared_kernel not in {"stock", "metal-exact"}:
+        raise Hy3MTPLoadError(
+            "unsupported Hy3 MTP shared kernel "
+            f"{shared_kernel!r}; choose 'stock' or 'metal-exact'"
+        )
+    if (
+        isinstance(shared_kernel_depth, bool)
+        or not isinstance(shared_kernel_depth, int)
+        or shared_kernel_depth < 1
+    ):
+        raise Hy3MTPLoadError("shared_kernel_depth must be a positive integer")
+    if shared_kernel != "stock" and precision != "bf16":
+        raise Hy3MTPLoadError("metal-exact shared kernel requires the BF16 MTP head")
     artifact_dir = Path(artifact_dir).expanduser().resolve()
     if verified_artifacts is None:
         with open_verified_hy3_mtp_artifacts(
@@ -857,6 +872,8 @@ def build_hy3_mtp_module(
                 expected_revision=expected_revision,
                 group_size=group_size,
                 precision=precision,
+                shared_kernel=shared_kernel,
+                shared_kernel_depth=shared_kernel_depth,
                 verified_artifacts=verified,
             )
     _require_verified_artifacts(
@@ -897,11 +914,25 @@ def build_hy3_mtp_module(
         mtp.load_weights(list(weights.items()), strict=True)
     except Exception as exc:
         raise Hy3MTPLoadError(f"Hy3 MTP weight validation failed: {exc}") from exc
+    if shared_kernel == "metal-exact":
+        from .hy3_mtp_shared_gate_up import install_depth_gated_mtp_shared_mlp
+
+        try:
+            install_depth_gated_mtp_shared_mlp(
+                mtp,
+                target_depth=shared_kernel_depth,
+            )
+        except Exception as exc:
+            raise Hy3MTPLoadError(
+                f"Hy3 MTP shared-kernel installation failed: {exc}"
+            ) from exc
     mx.eval(mtp.parameters())
     logger.info(
-        "[Hy3 MTP] loaded %d tensors (%s) from %s",
+        "[Hy3 MTP] loaded %d tensors (%s, shared=%s at fixed depth %d) from %s",
         len(weights),
         precision,
+        shared_kernel,
+        shared_kernel_depth,
         Path(artifact_dir).expanduser(),
     )
     return mtp
@@ -915,6 +946,8 @@ def inject_hy3_streamed_mtp_support(
     *,
     expected_revision: str = HY3_MTP_SOURCE_REVISION,
     mtp_precision: str = HY3_MTP_DEFAULT_PRECISION,
+    shared_kernel: str = "stock",
+    shared_kernel_depth: int = 3,
     mtp_module: Any | None = None,
 ) -> bool:
     """Attach layer-80 NextN speculative support to a streamed Hy3 model.
@@ -955,6 +988,8 @@ def inject_hy3_streamed_mtp_support(
             args,
             expected_revision=expected_revision,
             precision=mtp_precision,
+            shared_kernel=shared_kernel,
+            shared_kernel_depth=shared_kernel_depth,
         )
     original_outer_class = model.__class__
 
@@ -985,9 +1020,14 @@ def inject_hy3_streamed_mtp_support(
                     if keep < 1:
                         raise ValueError("logits_keep must be positive when supplied")
                     head_input = head_input[:, -keep:, :]
+                # Cast logits, not the head input: fp32 x BF16 matmul
+                # materializes an fp32 weight copy per call (see
+                # Hy3ForCausalLM.__call__). _logits_head() (inherited from the
+                # base Model) applies T2a's optional trunk-head quant here so it
+                # reaches the MTP verify, not only the AR path.
+                logits = self._logits_head()(head_input)
                 if self.args.enable_lm_head_fp32:
-                    head_input = head_input.astype(mx.float32)
-                logits = self.lm_head(head_input)
+                    logits = logits.astype(mx.float32)
             if not return_hidden:
                 return logits
             # Gate v1/v2 measured the head prefers the POST-norm trunk
@@ -996,6 +1036,42 @@ def inject_hy3_streamed_mtp_support(
             # pre_norm stays selectable for A/B probing.
             hidden = pre_norm if hidden_variant == "pre_norm" else post_norm
             return logits, hidden
+
+        def _draft_lm_head(self):
+            """T1c: a quantized COPY of the trunk head for the DRAFT projection only.
+            OUTPUT-LOSSLESS — the target verify uses self.lm_head at full precision;
+            the draft head only shapes proposals, so quantizing it can move only the
+            acceptance rate, never the emitted distribution. Off by default; enable
+            with MTPLX_HY3_DRAFT_LM_HEAD_BITS=4 (or 8). Built once, then cached."""
+            bits = int(os.environ.get("MTPLX_HY3_DRAFT_LM_HEAD_BITS", "0") or "0")
+            if bits <= 0:
+                return self.lm_head
+            cached = getattr(self, "_mtplx_draft_lm_head", None)
+            if cached is None:
+                import mlx.core as mx
+                import mlx.nn as nn
+
+                # T2a may have already replaced the trunk head with a quantized
+                # module. Building a second copy of the same weights would add
+                # another ~278MB on a config that peaks at 98 of 100 GiB, so at
+                # matching bits the draft SHARES the trunk head instead.
+                trunk = self._logits_head()
+                if isinstance(trunk, nn.QuantizedLinear):
+                    if int(trunk.bits) != bits:
+                        raise ValueError(
+                            "MTPLX_HY3_DRAFT_LM_HEAD_BITS="
+                            f"{bits} conflicts with an already-quantized trunk head at "
+                            f"{int(trunk.bits)} bits; re-quantizing a quantized head is "
+                            "not well-defined here. Set both flags to the same bits."
+                        )
+                    cached = trunk
+                else:
+                    cached = nn.QuantizedLinear.from_linear(
+                        trunk, group_size=64, bits=bits
+                    )
+                    mx.eval(cached.parameters())
+                self._mtplx_draft_lm_head = cached
+            return cached
 
         def mtp_forward(
             self,
@@ -1024,12 +1100,25 @@ def inject_hy3_streamed_mtp_support(
                 next_token_ids,
                 hidden_states,
                 embed_tokens=self.model.embed_tokens,
-                lm_head=self.lm_head,
+                lm_head=self._draft_lm_head(),
                 cache=layer_cache,
             )
             if not return_hidden:
                 return logits
             return logits, hidden
+
+        def configure_mtp_execution_depth(
+            self, depth: int | None
+        ) -> tuple[str, ...]:
+            """Swap depth-gated shared operators once before generation."""
+
+            modes = []
+            for layer in self.mtp.layers:
+                shared = layer.mtp_block.mlp.shared_mlp
+                configure = getattr(shared, "configure_depth", None)
+                if callable(configure):
+                    modes.append(str(configure(depth)))
+            return tuple(modes)
 
         def mtp_update_cache(
             self,

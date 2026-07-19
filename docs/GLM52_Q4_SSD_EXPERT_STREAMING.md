@@ -302,9 +302,12 @@ The official BF16 model has an additional layer 78, but the selected community
 Q4 artifact omits it. MTP also shares top-level embeddings and output head and
 has its own router/expert bank; constructing an independent random output head
 is incorrect. A separate community MTP conversion is not assumed trustworthy
-or layout-compatible with this target. Generate a Q4 MTP artifact from the
-pinned official source, validate router dtype/correction bias, and add it as a
-separate manifest and memory reservation.
+or layout-compatible with this target. Generate a BF16 MTP artifact from the
+pinned official source (`scripts/extract_glm52_mtp_layer78.py`), validate
+router dtype/correction bias, and add it as a separate manifest and memory
+reservation. The GLM MTP head has since shipped and the runtime rejects any
+non-BF16 GLM head: `--model-key glm52-q4` errors unless
+`--mtp-precision bf16` (`scripts/benchmark_streamed_generation.py`).
 
 MTP verification selects experts for several speculative positions, so its
 record union and I/O behavior differ from one-token AR decode. It is enabled

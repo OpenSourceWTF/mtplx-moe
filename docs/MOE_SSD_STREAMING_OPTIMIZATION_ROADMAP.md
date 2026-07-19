@@ -5,7 +5,9 @@ the 128 GB M5 Max. It keeps Python as the control plane, the router resident,
 the expert cache user-bounded, and the model artifacts bit-identical. Each
 stage must earn its place with a matched benchmark before the next stage.
 
-## Current baseline
+## Baseline as of 2026-07-12 (superseded)
+
+These figures predate dense islands and load-time projection quantization; the current K3 line is roughly 4x faster. Raw artifacts live in the gitignored `benchmarks/raw/` and are not verifiable from this repo.
 
 - Hy3 Q4 source shards, realistic 313-token prompt:
   - 8.14 prompt tok/s cold, 9.42 warm.

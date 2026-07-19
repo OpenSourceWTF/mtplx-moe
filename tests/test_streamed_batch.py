@@ -450,3 +450,55 @@ def test_runner_rejects_duplicate_and_empty_submissions(tmp_path: Path) -> None:
             runner.submit(_request("dup", [3, 4], max_tokens=1))
     finally:
         rt.close()
+
+
+def test_glm_layer_walk_threads_topk_and_isolates_streams() -> None:
+    """GLM layers return (hidden, topk) and receive the previous layer's
+    topk per stream; the walk must thread per-stream state and never mix
+    rows across streams."""
+
+    from mlx_lm.models.cache import KVCache
+
+    calls: list[tuple[int, int, object]] = []
+
+    class _GlmLayer:
+        def __init__(self, index: int) -> None:
+            self.index = index
+
+        def __call__(self, x, mask, cache, prev_topk):
+            stream_id = int(x[0, 0, 0].item())
+            calls.append((self.index, stream_id, prev_topk))
+            return x, (self.index, stream_id)
+
+    class _Inner:
+        layers = [_GlmLayer(0), _GlmLayer(1)]
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.cache = [[KVCache()], [KVCache()]]
+
+    streams = [_Stream(), _Stream()]
+    hidden = mx.array(
+        [[[1.0] * 4], [[2.0] * 4]]
+    )  # stream id encoded in the row values
+    out = StreamedBatchRunner._glm_layer_walk(_Inner(), hidden, streams)
+    assert out.shape == (2, 1, 4)
+    assert mx.array_equal(out, hidden).item()
+
+    # Layer 0 sees no prior topk; layer 1 sees layer 0's PER-STREAM topk.
+    layer0 = [c for c in calls if c[0] == 0]
+    layer1 = [c for c in calls if c[0] == 1]
+    assert [c[2] for c in layer0] == [None, None]
+    assert [c[2] for c in layer1] == [(0, 1), (0, 2)]
+
+
+def test_decode_walk_dispatch_selects_by_model_type() -> None:
+    """model_type glm_moe_dsa routes to the GLM walk; everything else
+    keeps the split-attention walk (the hy3 contract)."""
+
+    import inspect
+
+    source = inspect.getsource(StreamedBatchRunner._decode_step)
+    assert "glm_moe_dsa" in source
+    assert "_glm_layer_walk" in source
+    assert "_split_attention_layer_walk" in source

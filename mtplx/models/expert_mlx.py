@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import os
 import re
 import threading
@@ -11,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -21,6 +22,7 @@ from mlx_lm.models.activations import swiglu
 
 from mtplx import expert_route_probe as _route_probe
 
+from mtplx.expert_io import PositionalExpertReader
 from mtplx.expert_runtime import ExpertStreamingRuntime
 from mtplx.expert_manifest import ExpertManifest, ExpertRecord
 from mtplx.expert_slots import ExpertSlotBinding, ReadyRoute
@@ -41,6 +43,9 @@ _LAYER_PERSISTENT_LABEL = re.compile(
 )
 _GLOBAL_PERSISTENT_LABEL = re.compile(rf"global-persistent-({_SLOT_INDEX_PATTERN})")
 _GLOBAL_TRANSIENT_LABEL = re.compile(rf"global-transient-({_SLOT_INDEX_PATTERN})")
+_LAYER_PREFETCH_LABEL = re.compile(
+    rf"layer-({_SLOT_INDEX_PATTERN})-prefetch-({_SLOT_INDEX_PATTERN})"
+)
 
 
 @contextmanager
@@ -96,6 +101,38 @@ def _pipeline_work_call(
         _mark_pipeline_incomplete(ledger, phase)
 
 
+class _DeferredSplitClose:
+    """Replay a split route's release/close sequence at deferred-flush time.
+
+    The split-route lease bookkeeping (consumer leases, finalize, the layer
+    lock) must run through release_miss/close — releasing raw routes would
+    corrupt the state machine. This adapter duck-types the ``release``
+    surface ``defer_slot_release`` expects and performs today's exact call
+    order, one covering eval later.
+    """
+
+    def __init__(self, pending: Any, parts: tuple[Any, ...]) -> None:
+        self._pending = pending
+        self._parts = parts
+
+    def release(self, *, synchronize: bool = False) -> None:
+        del synchronize
+        first_error: BaseException | None = None
+        for part in self._parts:
+            try:
+                self._pending.release_miss(part)
+            except BaseException as exc:  # noqa: BLE001 - drain all parts
+                if first_error is None:
+                    first_error = exc
+        try:
+            self._pending.close()
+        except BaseException as exc:  # noqa: BLE001 - propagate after close
+            if first_error is None:
+                first_error = exc
+        if first_error is not None:
+            raise first_error
+
+
 class UnboundExpertSwitch(nn.Module):
     """Parameter-free placeholder installed before resident-only loading."""
 
@@ -125,6 +162,10 @@ def _component_array(binding: ExpertSlotBinding, component: str) -> mx.array:
             return raw.view(mx.uint32).reshape(segment.shape)
         if segment.dtype == "BF16":
             return raw.view(mx.bfloat16).reshape(segment.shape)
+        if segment.dtype == "U16":
+            return raw.view(mx.uint16).reshape(segment.shape)
+        if segment.dtype == "U8":
+            return raw.reshape(segment.shape)
         raise TypeError(f"unsupported streamed component dtype {segment.dtype}")
     view = binding.component_view(component)
     if segment.dtype == "U32":
@@ -133,6 +174,12 @@ def _component_array(binding: ExpertSlotBinding, component: str) -> mx.array:
     elif segment.dtype == "BF16":
         host = np.frombuffer(view, dtype=np.dtype("<u2")).reshape(segment.shape)
         value = mx.array(host).view(mx.bfloat16)
+    elif segment.dtype == "U16":
+        host = np.frombuffer(view, dtype=np.dtype("<u2")).reshape(segment.shape)
+        value = mx.array(host)
+    elif segment.dtype == "U8":
+        host = np.frombuffer(view, dtype=np.dtype("u1")).reshape(segment.shape)
+        value = mx.array(host)
     else:
         raise TypeError(f"unsupported streamed component dtype {segment.dtype}")
     return value
@@ -176,6 +223,12 @@ def make_mlx_slot_buffer_allocator(
             count = plan.slots_per_layer
             if layer not in spec.routed_layer_indices:
                 raise ValueError(f"persistent slot layer {layer} is not routed")
+        elif label.startswith("layer-") and "-prefetch-" in label:
+            layer = int(parts[1])
+            slot = int(parts[-1])
+            count = plan.prefetch_slots_per_layer
+            if layer not in spec.routed_layer_indices:
+                raise ValueError(f"prefetch slot layer {layer} is not routed")
         elif label.startswith("global-persistent-"):
             slot = int(parts[-1])
             count = plan.persistent_slots
@@ -226,6 +279,8 @@ class MlxComponentBank:
                 dtype = {
                     "U32": mx.uint32,
                     "BF16": mx.bfloat16,
+                    "U16": mx.uint16,
+                    "U8": mx.uint8,
                 }.get(segment.dtype)
                 if dtype is None:
                     raise TypeError(f"unsupported component-bank dtype {segment.dtype}")
@@ -355,7 +410,11 @@ class MappedExpertStore:
         if manifest.sidecar is None:
             raise ValueError("metal-mmap execution requires a sidecar manifest")
         self.root = Path(root).resolve()
-        self.path = self.root / manifest.sidecar.file
+        self.sidecar = manifest.sidecar
+        # One mapped path per bank part; ``path`` stays meaningful for the
+        # single-part banks every existing artifact uses.
+        self.paths = tuple(self.root / part.file for part in manifest.sidecar.parts)
+        self.path = self.paths[0]
         self.records = tuple(manifest.records)
         self.workers = max(1, min(int(workers), 256))
         self._mapped: dict[tuple[int, int], MappedExpertRecord] = {}
@@ -372,6 +431,11 @@ class MappedExpertStore:
                 raise ValueError("metal-mmap record has no sidecar range")
             if record.sidecar_length != record.logical_bytes:
                 raise ValueError("metal-mmap sidecar length differs from record")
+            if not 0 <= record.part < len(self.paths):
+                raise ValueError("metal-mmap record names a missing sidecar part")
+            part = manifest.sidecar.part(record.part)
+            if part.data_start % page_size:
+                raise ValueError("metal-mmap sidecar parts must start on a page")
             if record.sidecar_offset % page_size or record.sidecar_length % page_size:
                 raise ValueError("metal-mmap sidecar records must be page aligned")
 
@@ -387,9 +451,10 @@ class MappedExpertStore:
         ) -> tuple[tuple[int, int], MappedExpertRecord]:
             assert record.sidecar_offset is not None
             assert record.sidecar_length is not None
+            part = self.sidecar.part(record.part)
             base = mmap_u32(
-                self.path,
-                record.sidecar_offset,
+                self.paths[record.part],
+                part.data_start + record.sidecar_offset,
                 record.sidecar_length,
                 wired=False,
             )
@@ -434,6 +499,498 @@ class MappedExpertStore:
             return
         self._closed = True
         self._mapped.clear()
+        # Evaluated MLX arrays can retain graph-input cycles until cyclic GC.
+        # Collect now so every external MTLBuffer releases before its mmap.
+        gc.collect()
+
+
+class DenseIslandStore:
+    """Capacity-guaranteed dense per-layer expert banks (issue #63, C5).
+
+    An island layer holds all of its experts resident for the model's
+    lifetime in one component-major bank whose row index IS the expert id.
+    Router indices therefore address ``gather_qmm`` directly: no
+    expert-to-slot translation, no residency probe, no pins, no fences.
+    A miss is impossible by construction, so the streamed route machinery
+    never runs for these layers.
+    """
+
+    def __init__(
+        self,
+        manifest: ExpertManifest,
+        layers: Iterable[int],
+        *,
+        expert_count: int,
+    ) -> None:
+        self.layers = tuple(sorted({int(layer) for layer in layers}))
+        self.expert_count = int(expert_count)
+        if not self.layers:
+            raise ValueError("dense island store requires at least one layer")
+        records = {
+            (record.layer, record.expert): record for record in manifest.records
+        }
+        self._records: dict[int, tuple[ExpertRecord, ...]] = {}
+        self._banks: dict[int, MlxComponentBank] = {}
+        self._fill_seconds = 0.0
+        self._filled_layers: set[int] = set()
+        self._closed = False
+        try:
+            for layer in self.layers:
+                layer_records = []
+                for expert in range(self.expert_count):
+                    record = records.get((layer, expert))
+                    if record is None:
+                        raise ValueError(
+                            f"manifest has no record for island layer {layer} "
+                            f"expert {expert}"
+                        )
+                    layer_records.append(record)
+                self._records[layer] = tuple(layer_records)
+                self._banks[layer] = MlxComponentBank(
+                    capacity=self.expert_count,
+                    record=layer_records[0],
+                    label=f"island-layer-{layer}",
+                )
+        except Exception:
+            self.close()
+            raise
+
+    @property
+    def island_bytes(self) -> int:
+        return sum(
+            bank.capacity * bank.record_bytes for bank in self._banks.values()
+        )
+
+    def fill(
+        self,
+        manifest: ExpertManifest,
+        reader: PositionalExpertReader,
+        *,
+        verify_hash: bool = True,
+    ) -> None:
+        """Bulk-read every island expert into its bank row (one-time cost)."""
+
+        if self._closed:
+            raise RuntimeError("dense island store is closed")
+        started = time.perf_counter()
+        for layer in self.layers:
+            if layer in self._filled_layers:
+                continue
+            bank = self._banks[layer]
+            items = tuple(
+                (
+                    record,
+                    MlxComponentSlot(
+                        bank,
+                        expert,
+                        label=f"island-layer-{layer}-expert-{expert}",
+                    ),
+                )
+                for expert, record in enumerate(self._records[layer])
+            )
+            reader.read_component_records_into(
+                manifest,
+                items,
+                verify_hash=verify_hash,
+            )
+            self._filled_layers.add(layer)
+        self._fill_seconds += time.perf_counter() - started
+
+    def bank_for_layer(self, layer: int) -> MlxComponentBank:
+        if self._closed:
+            raise RuntimeError("dense island store is closed")
+        if layer not in self._filled_layers:
+            raise RuntimeError(f"island layer {layer} has not been filled")
+        return self._banks[layer]
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "backend": "dense-island-banks",
+            "layers": list(self.layers),
+            "expert_count": self.expert_count,
+            "island_bytes": self.island_bytes,
+            "filled_layers": len(self._filled_layers),
+            "fill_seconds": self._fill_seconds,
+        }
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for bank in self._banks.values():
+            bank.close()
+        self._banks.clear()
+        self._records.clear()
+        self._filled_layers.clear()
+
+
+class DenseIslandSwitchGLU(nn.Module):
+    """Expert dispatch for a dense island layer: raw indices, zero host asks.
+
+    The layer's bank row index equals the expert id, so the router's device
+    indices are the ``gather_qmm`` rhs_indices as-is. No host sync, no route
+    planning, no pin lifecycle: the wave stays inside the lazy graph and
+    materializes with the next streamed layer's blocking sync (or the
+    row-end fence).
+    """
+
+    def __init__(
+        self,
+        runtime: ExpertStreamingRuntime,
+        store: DenseIslandStore,
+        layer_index: int,
+    ) -> None:
+        super().__init__()
+        self.runtime = runtime
+        self.layer_index = int(layer_index)
+        self.group_size = runtime.spec.quant_group_size
+        self.bits = runtime.spec.quant_bits
+        self._bank = store.bank_for_layer(self.layer_index)
+        # Lazily-built compiled expert gather (issue #51, 70 tps full-residency
+        # goal). Full residency rebuilds the 79-layer graph in Python every
+        # decode step; compiling the per-layer gather traces it once and
+        # replays. The island bank is fully resident and never mutated, so it
+        # is safe to capture in the compiled closure. A plain callable is not
+        # registered as an nn.Module child.
+        # NUMERICS: NOT bitwise vs eager. fp32 matmul compiles exactly, but
+        # mx.compile selects a different fused kernel for the quantized
+        # gather_qmm that diverges ~0.1-0.6% — non-associative FP, the same
+        # class as the vk_k split-K divergence (#171), tagged as a documented
+        # FP issue per David's 2026-07-18 ruling. Whether it holds token-sha
+        # end-to-end is a guarded-A/B question; if it flips tokens it is a
+        # divergent secondary line, not a bug. Default OFF.
+        self._compiled_gather = None
+
+    def wave_call(
+        self,
+        x: mx.array,
+        indices: mx.array,
+        scores: mx.array,
+    ) -> mx.array | None:
+        """Fused K3 expert wave over the island bank (issue #65).
+
+        Owns the routing multiply and reduction in the wave kernel's BF16
+        combine mode, which bitwise-matches the block's external combine.
+        Returns None for any shape the fixed-M4 wave does not cover; the
+        caller then runs the classic dispatch unchanged.
+        """
+
+        from mtplx.hy3_expert_wave_m4 import (
+            HY3_M4_BATCH,
+            HY3_M4_HIDDEN_SIZE,
+            HY3_M4_ROWS,
+            HY3_M4_TOP_K,
+            Hy3M4ExpertWaveIneligible,
+            hy3_q2_m4_expert_wave,
+        )
+
+        shape = tuple(int(dim) for dim in x.shape)
+        if shape != (HY3_M4_BATCH, HY3_M4_ROWS, HY3_M4_HIDDEN_SIZE):
+            return None
+        if tuple(int(dim) for dim in indices.shape) != (
+            HY3_M4_BATCH,
+            HY3_M4_ROWS,
+            HY3_M4_TOP_K,
+        ):
+            return None
+        phase = current_expert_routing_phase(token_count=int(x.shape[-2]))
+        try:
+            output = hy3_q2_m4_expert_wave(
+                x,
+                indices.astype(mx.int32),
+                scores,
+                self._bank.arrays,
+                validated_slot_bounds=(0, self.runtime.spec.expert_count - 1),
+                combine_mode="bf16",
+            )
+        except Hy3M4ExpertWaveIneligible:
+            return None
+        _route_probe.count(
+            f"hot.island.wave.{phase.name.lower()}.layer{self.layer_index:02d}"
+        )
+        return output.hidden_rows
+
+    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+        if indices.ndim < 1:
+            raise ValueError("expert indices must include a top-k dimension")
+        if int(indices.shape[-1]) != self.runtime.spec.top_k:
+            raise ValueError(
+                f"router selected {indices.shape[-1]} experts; expected "
+                f"{self.runtime.spec.top_k}"
+            )
+        hidden_size = int(x.shape[-1])
+        if hidden_size != self.runtime.spec.hidden_size:
+            raise ValueError(
+                f"expert input width {hidden_size} does not match "
+                f"{self.runtime.spec.hidden_size}"
+            )
+        tokens = x.reshape(-1, hidden_size)
+        top_k = int(indices.shape[-1])
+        rows = int(tokens.shape[0])
+        phase = current_expert_routing_phase(token_count=int(x.shape[-2]))
+        _route_probe.count(
+            f"hot.island.{phase.name.lower()}.layer{self.layer_index:02d}"
+        )
+        assignment_inputs = mx.broadcast_to(
+            tokens[:, None, :],
+            (rows, top_k, hidden_size),
+        ).reshape(-1, hidden_size)
+        slot_indices = indices.reshape((-1, 1)).astype(mx.int32)
+        if os.environ.get("MTPLX_HY3_COMPILE_ISLAND") == "1":
+            output = self._compiled_island_gather()(assignment_inputs, slot_indices)
+        else:
+            output = _gather_component_bank(
+                assignment_inputs,
+                self._bank,
+                slot_indices,
+                group_size=self.group_size,
+                bits=self.bits,
+            )
+        return output.reshape((*indices.shape, hidden_size))
+
+    def _compiled_island_gather(self):
+        """Build-once compiled expert gather closing over this layer's bank."""
+        if self._compiled_gather is None:
+            bank = self._bank
+            group_size = self.group_size
+            bits = self.bits
+
+            def gather(assignment_inputs: mx.array, slot_indices: mx.array) -> mx.array:
+                return _gather_component_bank(
+                    assignment_inputs,
+                    bank,
+                    slot_indices,
+                    group_size=group_size,
+                    bits=bits,
+                )
+
+            self._compiled_gather = mx.compile(gather)
+        return self._compiled_gather
+
+
+class BankedMmapBank:
+    """Duck-typed component bank whose mapped row index is the expert id."""
+
+    __slots__ = ("arrays",)
+
+    def __init__(self, arrays: dict[str, mx.array]) -> None:
+        self.arrays = arrays
+
+
+class BankedMmapIslandStore:
+    """Dense island banks served from a mapped banked sidecar (issue #51, C6).
+
+    Same dispatch contract as ``DenseIslandStore`` — bank row == expert id,
+    raw router indices feed ``gather_qmm`` — but physical residency belongs
+    to the macOS pager: the banked file regions are mapped into Metal
+    without copies, pages arrive on first touch, and the page cache keeps
+    or evicts them under normal kernel policy. No slot pool, no reads, no
+    misses exist for these layers. ``prepare`` verifies each region hash by
+    reading the file once, which doubles as the page-cache warmup.
+    """
+
+    def __init__(
+        self,
+        banked_manifest: Path | str,
+        layers: Iterable[int],
+        *,
+        expert_count: int,
+        verify_hash: bool = True,
+        wired: bool = True,
+    ) -> None:
+        from mtplx.expert_banked import BankedManifestError, load_banked_manifest
+
+        self.wired = bool(wired)
+        self.layers = tuple(sorted({int(layer) for layer in layers}))
+        if not self.layers:
+            raise ValueError("banked island store requires at least one layer")
+        self._banked = load_banked_manifest(banked_manifest)
+        # ``none`` maps raw bank bytes into Metal zero-copy; ``rans32x-v1``
+        # reads the compressed region and rebuilds each bank with the in-kernel
+        # rANS decoder in ``prepare`` (issue #51, C7). Any other codec has no
+        # decode path here.
+        if self._banked.codec not in ("none", "rans32x-v1"):
+            raise BankedManifestError(
+                f"banked codec {self._banked.codec!r} has no island decode path"
+            )
+        self._codec = self._banked.codec
+        if self._banked.expert_count != int(expert_count):
+            raise BankedManifestError(
+                f"banked manifest holds {self._banked.expert_count} experts "
+                f"per layer; the model routes {expert_count}"
+            )
+        missing = [
+            layer for layer in self.layers if layer not in self._banked.layer_set
+        ]
+        if missing:
+            raise BankedManifestError(
+                f"banked manifest does not cover layers {missing}"
+            )
+        self.expert_count = int(expert_count)
+        self._verify_hash = bool(verify_hash)
+        self._banks: dict[int, BankedMmapBank] = {}
+        self._bases: list[mx.array] = []
+        self._verify_seconds = 0.0
+        self._closed = False
+
+    def prepare(self) -> None:
+        from mtplx.expert_banked import BankedManifestError
+
+        if self._closed:
+            raise RuntimeError("banked island store is closed")
+        if self._banks:
+            return
+        path = self._banked.bin_path()
+        alignment = self._banked.alignment
+        file_size = path.stat().st_size
+        for layer in self.layers:
+            entry = self._banked.layer_entry(layer)
+            if self._verify_hash:
+                started = time.perf_counter()
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    handle.seek(entry.offset)
+                    remaining = entry.length
+                    while remaining:
+                        chunk = handle.read(min(remaining, 8 << 20))
+                        if not chunk:
+                            raise BankedManifestError(
+                                f"banked layer {layer} region is truncated"
+                            )
+                        digest.update(chunk)
+                        remaining -= len(chunk)
+                if digest.hexdigest() != entry.sha256:
+                    raise BankedManifestError(
+                        f"banked layer {layer} region hash mismatch"
+                    )
+                self._verify_seconds += time.perf_counter() - started
+            if self._codec != "none":
+                self._banks[layer] = BankedMmapBank(
+                    self._decode_layer_banks(path, entry)
+                )
+                continue
+            mapped_length = -(-entry.length // alignment) * alignment
+            if entry.offset + mapped_length > file_size:
+                raise BankedManifestError(
+                    f"banked layer {layer} extent exceeds {path.name}"
+                )
+            # wired=True registers the mapping in MLX's process-wide residency
+            # set: Metal keeps it permanently resident like ordinary weights.
+            # Untracked (unwired) buffers make Metal rebuild residency around
+            # every submission — measured as the ENTIRE MLX residency set
+            # wiring/unwiring (~85 GiB swings) per wave, ~4x decode slowdown.
+            # Unwired remains selectable for bands larger than RAM (Q4/GLM).
+            base = mmap_u32(path, entry.offset, mapped_length, wired=self.wired)
+            arrays: dict[str, mx.array] = {}
+            for component in entry.components:
+                if component.dtype == "U32":
+                    typed = base
+                    item_size = 4
+                elif component.dtype == "BF16":
+                    typed = mx.view(base, mx.bfloat16)
+                    item_size = 2
+                else:
+                    raise TypeError(
+                        f"unsupported banked component dtype {component.dtype}"
+                    )
+                if component.offset % item_size:
+                    raise BankedManifestError(
+                        f"banked component {component.component} is not "
+                        "dtype-aligned"
+                    )
+                arrays[component.component] = mx.as_strided(
+                    typed,
+                    shape=(self.expert_count, *component.shape),
+                    offset=component.offset // item_size,
+                )
+            self._banks[layer] = BankedMmapBank(arrays)
+            self._bases.append(base)
+
+    def _decode_layer_banks(self, path, entry) -> dict[str, mx.array]:
+        """Rebuild one layer's component banks from its compressed region.
+
+        Reads the entropy-coded region, runs the in-kernel rANS decoder per
+        component, and materializes each bank as ``[expert_count, *shape]`` in
+        its native dtype — row index == expert id, identical to the mmap path.
+        Decode happens once at prepare; the banks are then plain resident
+        arrays consumed by ``gather_qmm`` with no per-call host work.
+        """
+
+        from mtplx.expert_banked import BankedManifestError
+        from mtplx.expert_rans_metal import decode_container
+
+        with path.open("rb") as handle:
+            handle.seek(entry.offset)
+            region = handle.read(entry.length)
+        if len(region) != entry.length:
+            raise BankedManifestError(
+                f"banked layer {entry.layer} region is truncated"
+            )
+        arrays: dict[str, mx.array] = {}
+        for component in entry.components:
+            blob = region[component.offset : component.offset + component.length]
+            decoded = decode_container(blob)  # uint8[expert_count * seg_len]
+            if component.dtype == "U32":
+                typed = mx.view(decoded, mx.uint32)
+            elif component.dtype == "BF16":
+                typed = mx.view(decoded, mx.bfloat16)
+            else:
+                raise TypeError(
+                    f"unsupported banked component dtype {component.dtype}"
+                )
+            bank = typed.reshape(self.expert_count, *component.shape)
+            mx.eval(bank)  # materialize; releases the compressed payload graph
+            arrays[component.component] = bank
+        return arrays
+
+    def prefetch_all(self) -> int:
+        """Issue one MADV_WILLNEED batch across every mapped layer region."""
+
+        from mtplx.mmap_mlx import prefetch
+
+        if not self._bases:
+            return 0
+        return prefetch(list(self._bases))
+
+    def bank_for_layer(self, layer: int) -> BankedMmapBank:
+        if self._closed:
+            raise RuntimeError("banked island store is closed")
+        bank = self._banks.get(layer)
+        if bank is None:
+            raise RuntimeError(f"banked island layer {layer} is not prepared")
+        return bank
+
+    def snapshot(self) -> dict[str, Any]:
+        stored_bytes = sum(
+            self._banked.layer_entry(layer).length for layer in self.layers
+        )
+        resident_bytes = sum(
+            component.raw_bytes
+            for layer in self.layers
+            for component in self._banked.layer_entry(layer).components
+        )
+        return {
+            "backend": (
+                "banked-mmap-island-banks"
+                if self._codec == "none"
+                else "banked-rans-island-banks"
+            ),
+            "codec": self._codec,
+            "wired": self.wired,
+            "layers": list(self.layers),
+            "expert_count": self.expert_count,
+            "mapped_bytes": stored_bytes,
+            "resident_bytes": resident_bytes,
+            "verify_seconds": self._verify_seconds,
+            "prepared_layers": len(self._banks),
+        }
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._banks.clear()
+        self._bases.clear()
         # Evaluated MLX arrays can retain graph-input cycles until cyclic GC.
         # Collect now so every external MTLBuffer releases before its mmap.
         gc.collect()
@@ -493,6 +1050,7 @@ def make_mlx_component_bank_allocator(
             for segment in record.segments
         )
 
+    expert_codec = getattr(spec, "expert_codec", "affine")
     expected_signature: list[tuple[str, str, tuple[int, ...], int]] = []
     for projection in ("gate_proj", "up_proj", "down_proj"):
         output_size = (
@@ -505,6 +1063,42 @@ def make_mlx_component_bank_allocator(
             if projection in {"gate_proj", "up_proj"}
             else spec.expert_hidden_size
         )
+        if expert_codec != "affine":
+            # Shadow-codec (q1) records: packed sign/trit words plus one
+            # bf16-bit scale per g64 group, no bias leaf (gate 3 of
+            # research/streamed-q1-codec-gap-analysis.md).
+            from mtplx.expert_shadow import (
+                SHADOW_GROUP,
+                _B1_WORDS_PER_GROUP,
+                _T158_BYTES_PER_GROUP,
+            )
+
+            groups = input_size // SHADOW_GROUP
+            if expert_codec == "b1":
+                packed_dtype = "U32"
+                packed_shape = (output_size, groups * _B1_WORDS_PER_GROUP)
+                packed_length = output_size * groups * _B1_WORDS_PER_GROUP * 4
+            else:
+                packed_dtype = "U8"
+                packed_shape = (output_size, groups * _T158_BYTES_PER_GROUP)
+                packed_length = output_size * groups * _T158_BYTES_PER_GROUP
+            expected_signature.extend(
+                (
+                    (
+                        f"{projection}.packed",
+                        packed_dtype,
+                        packed_shape,
+                        packed_length,
+                    ),
+                    (
+                        f"{projection}.scales",
+                        "U16",
+                        (output_size, groups),
+                        output_size * groups * 2,
+                    ),
+                )
+            )
+            continue
         weight_shape = (output_size, input_size * spec.quant_bits // 32)
         parameter_shape = (output_size, input_size // spec.quant_group_size)
         expected_signature.extend(
@@ -557,7 +1151,7 @@ def make_mlx_component_bank_allocator(
     backend = "mlx-metal-component-banks"
 
     def bank_for(kind: str, layer: int) -> MlxComponentBank:
-        key = (kind, layer if kind == "persistent" else -1)
+        key = (kind, layer if kind in {"persistent", "prefetch"} else -1)
         bank = banks.get(key)
         if bank is not None:
             return bank
@@ -565,6 +1159,10 @@ def make_mlx_component_bank_allocator(
             capacity = plan.slots_per_layer
             record = record_by_layer[layer]
             label = f"layer-{layer}-persistent-bank"
+        elif kind == "prefetch":
+            capacity = plan.prefetch_slots_per_layer
+            record = record_by_layer[layer]
+            label = f"layer-{layer}-prefetch-bank"
         elif kind == "global-persistent":
             capacity = plan.persistent_slots
             record = record_by_layer[exemplar_layer]
@@ -583,7 +1181,20 @@ def make_mlx_component_bank_allocator(
         layer_persistent = _LAYER_PERSISTENT_LABEL.fullmatch(label)
         global_persistent = _GLOBAL_PERSISTENT_LABEL.fullmatch(label)
         global_transient = _GLOBAL_TRANSIENT_LABEL.fullmatch(label)
-        if layer_persistent is not None:
+        layer_prefetch = _LAYER_PREFETCH_LABEL.fullmatch(label)
+        if layer_prefetch is not None:
+            if plan.cache_scope != "layer":
+                raise ValueError(
+                    "prefetch slot label conflicts with global cache scope"
+                )
+            layer = int(layer_prefetch.group(1))
+            slot_index = int(layer_prefetch.group(2))
+            if layer not in spec.routed_layer_indices:
+                raise ValueError(f"prefetch slot layer {layer} is not routed")
+            if not 0 <= slot_index < plan.prefetch_slots_per_layer:
+                raise ValueError("prefetch slot is outside planned capacity")
+            bank = bank_for("prefetch", layer)
+        elif layer_persistent is not None:
             if plan.cache_scope != "layer":
                 raise ValueError(
                     "layer-persistent slot label conflicts with global cache scope"
@@ -709,11 +1320,31 @@ def _run_component_bank_q4(
         getattr(binding.buffer, "bank", None) is not bank for binding in bindings
     ):
         raise ValueError("component-bank execution requires one shared bank")
-    selected = x.reshape((len(bindings), 1, 1, int(x.shape[-1])))
     slot_indices = mx.array(
         [int(binding.buffer.bank_index) for binding in bindings],
         dtype=mx.int32,
     ).reshape((-1, 1))
+    return _gather_component_bank(
+        x,
+        bank,
+        slot_indices,
+        group_size=group_size,
+        bits=bits,
+    )
+
+
+def _gather_component_bank(
+    x: mx.array,
+    bank: MlxComponentBank,
+    slot_indices: mx.array,
+    *,
+    group_size: int,
+    bits: int,
+) -> mx.array:
+    """Row-gathered three-matrix expert MLP against one component bank."""
+
+    rows = int(x.shape[0])
+    selected = x.reshape((rows, 1, 1, int(x.shape[-1])))
 
     def qmm(values: mx.array, projection: str) -> mx.array:
         return mx.gather_qmm(
@@ -731,7 +1362,92 @@ def _run_component_bank_q4(
     gate = qmm(selected, "gate_proj")
     up = qmm(selected, "up_proj")
     output = qmm(swiglu(gate, up), "down_proj")
-    return output.reshape((len(bindings), int(output.shape[-1])))
+    return output.reshape((rows, int(output.shape[-1])))
+
+
+def _run_component_bank_shadow(
+    x: mx.array,
+    bindings: tuple[ExpertSlotBinding, ...],
+    *,
+    codec: str,
+) -> mx.array:
+    """Execute assignment-aligned rows of a shadow-codec (q1) slot bank.
+
+    The q2 lane's equal (gate 4 of the gap analysis): records were read
+    into component-bank slots by the ordinary slot machinery, and the rows
+    execute through ``shadow_gather_mm`` — the bank row fed to the kernel
+    is the slot index, not the expert id.  Eager-only, like the miss-shadow
+    lane: the shadow kernel is not traceable under ``mx.compile``.
+    """
+
+    if not bindings or int(x.shape[0]) != len(bindings):
+        raise ValueError(
+            "component-bank inputs and bindings must be non-empty and aligned"
+        )
+    bank = getattr(bindings[0].buffer, "bank", None)
+    if bank is None or any(
+        getattr(binding.buffer, "bank", None) is not bank for binding in bindings
+    ):
+        raise ValueError("component-bank execution requires one shared bank")
+    slot_rows = mx.array(
+        [int(binding.buffer.bank_index) for binding in bindings],
+        dtype=mx.int32,
+    )
+    return _shadow_gather_component_bank(x, bank, slot_rows, codec=codec)
+
+
+def _shadow_gather_component_bank(
+    x: mx.array,
+    bank: MlxComponentBank,
+    slot_rows: mx.array,
+    *,
+    codec: str,
+) -> mx.array:
+    """Row-gathered three-projection shadow MLP against one component bank."""
+
+    from mtplx.kernels.shadow_gather import shadow_gather_mm
+
+    def projection(values: mx.array, name: str) -> mx.array:
+        return shadow_gather_mm(
+            values,
+            slot_rows,
+            bank.arrays[f"{name}.packed"],
+            bank.arrays[f"{name}.scales"],
+            codec=codec,
+        )
+
+    gate = projection(x, "gate_proj")
+    up = projection(x, "up_proj")
+    return projection(swiglu(gate, up), "down_proj")
+
+
+def _run_shadow_bank(
+    x: mx.array,
+    expert_rows: mx.array,
+    bank: Any,
+) -> mx.array:
+    """Three-projection expert MLP against a low-precision shadow bank.
+
+    ``expert_rows`` are raw expert ids — the shadow bank row index is the
+    expert id (island-bank convention). Output is a quality tier, close to
+    the exact quantized path but not bitwise. Eager-only: the shadow
+    kernel is not traceable under ``mx.compile``.
+    """
+
+    from mtplx.kernels.shadow_gather import shadow_gather_mm
+
+    def projection(values: mx.array, name: str) -> mx.array:
+        return shadow_gather_mm(
+            values,
+            expert_rows,
+            bank.arrays[f"{name}.packed"],
+            bank.arrays[f"{name}.scales"],
+            codec=bank.codec,
+        )
+
+    gate = projection(x, "gate_proj")
+    up = projection(x, "up_proj")
+    return projection(swiglu(gate, up), "down_proj")
 
 
 def _run_mapped_q4(
@@ -830,6 +1546,35 @@ class HotExpertSwitchGLU(nn.Module):
         self.layer_index = int(layer_index)
         self.group_size = runtime.spec.quant_group_size
         self.bits = runtime.spec.quant_bits
+        # Streamed record codec (issue #51 q1 lane): "affine" executes
+        # slot-resident records through gather_qmm; a shadow codec ("b1",
+        # "t158") executes them through shadow_gather_mm instead.  The read
+        # path is identical either way — only the component-bank dispatch
+        # differs (gate 4 of the gap analysis).
+        self.codec = getattr(runtime.spec, "expert_codec", "affine")
+        # Shadow miss fallback (issue #51): when the runtime opened with
+        # miss_shadow, decode misses on this streamed layer are served from
+        # a resident low-precision bank instead of waiting on SSD.
+        shadow_lookup = getattr(runtime, "shadow_bank_for_layer", None)
+        self._shadow_bank = (
+            shadow_lookup(self.layer_index) if callable(shadow_lookup) else None
+        )
+
+    def _dispatch_component_bank(
+        self,
+        selected: mx.array,
+        bindings: tuple[ExpertSlotBinding, ...],
+    ) -> mx.array:
+        """Execute one component-bank wave under this layer's record codec."""
+
+        if self.codec == "affine":
+            return _run_component_bank_q4(
+                selected,
+                bindings,
+                group_size=self.group_size,
+                bits=self.bits,
+            )
+        return _run_component_bank_shadow(selected, bindings, codec=self.codec)
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         output, _overlap_result = self._run(
@@ -877,6 +1622,25 @@ class HotExpertSwitchGLU(nn.Module):
             )
         tokens = x.reshape(-1, hidden_size)
         top_k = int(indices.shape[-1])
+        # Shared-branch hoist (issue #51, flag-gated, exact-quality). Normally
+        # the resident shared MLP is submitted AFTER begin_split_route so it
+        # overlaps the miss reads (~0.44 ms). But the router host-sync below
+        # (mx.eval(indices), the per-streamed-layer barrier, p50 ~1 ms) is the
+        # bigger exposed cost, and the shared branch depends only on x — not on
+        # the routed indices — so it can be dispatched HERE to fill the GPU-idle
+        # window of the sync round-trip instead. Pure execution reorder: same
+        # shared_mlp(x), same combine, bitwise-identical output. Decode single
+        # token only; requires async_eval so the dispatch does not itself block.
+        _hoisted_shared: mx.array | None = None
+        if (
+            shared_work is not None
+            and int(x.shape[-2]) == 1
+            and os.environ.get("MTPLX_HY3_SHARED_HOIST") == "1"
+        ):
+            _async_eval = getattr(mx, "async_eval", None)
+            if callable(_async_eval):
+                _hoisted_shared = shared_work()
+                _async_eval(_hoisted_shared)
         with _route_probe.bracket("hot.eval_indices"):
             mx.eval(indices)
         # This eval materialized every earlier layer's wave output, so any
@@ -901,7 +1665,9 @@ class HotExpertSwitchGLU(nn.Module):
 
         outputs: list[mx.array] = []
         output_positions: list[int] = []
-        shared: mx.array | None = None
+        # Seed from the hoist (above): when set, the shared branch is already
+        # computed and submitted, so the late dispatch sites skip recomputing it.
+        shared: mx.array | None = _hoisted_shared
 
         def update_fence_metrics(ready: ReadyRoute, **values: int) -> None:
             metrics = getattr(getattr(ready, "pool", None), "metrics", None)
@@ -992,6 +1758,7 @@ class HotExpertSwitchGLU(nn.Module):
             ready: ReadyRoute,
             *,
             force_sync: bool = False,
+            defer: bool = False,
         ) -> None:
             if not positions:
                 return
@@ -1011,20 +1778,25 @@ class HotExpertSwitchGLU(nn.Module):
                 )
                 selected = mx.take(tokens, token_positions, axis=0)
                 wave_outputs.append(
-                    _run_component_bank_q4(
-                        selected,
-                        grouped_bindings,
-                        group_size=self.group_size,
-                        bits=self.bits,
-                    )
+                    self._dispatch_component_bank(selected, grouped_bindings)
                 )
                 wave_positions.extend(grouped_positions)
-            fence_bindings(
-                ready,
-                bindings,
-                wave_outputs,
-                force_sync=force_sync,
-            )
+            if defer:
+                # No release obligation here (the lease replay is queued),
+                # but the GPU still needs the part submitted now — without
+                # it the device idles through every miss wait.
+                async_eval = getattr(mx, "async_eval", None)
+                if callable(async_eval):
+                    async_eval(wave_outputs)
+                else:
+                    mx.eval(wave_outputs)
+            else:
+                fence_bindings(
+                    ready,
+                    bindings,
+                    wave_outputs,
+                    force_sync=force_sync,
+                )
             outputs.extend(wave_outputs)
             output_positions.extend(wave_positions)
 
@@ -1034,6 +1806,7 @@ class HotExpertSwitchGLU(nn.Module):
             ready: ReadyRoute,
             *,
             force_sync: bool = False,
+            defer: bool = False,
         ) -> None:
             if not positions:
                 return
@@ -1059,12 +1832,22 @@ class HotExpertSwitchGLU(nn.Module):
                     )
                 )
                 wave_positions.extend(expert_positions)
-            fence_bindings(
-                ready,
-                bindings,
-                wave_outputs,
-                force_sync=force_sync,
-            )
+            if defer:
+                # No release obligation here (the lease replay is queued),
+                # but the GPU still needs the part submitted now — without
+                # it the device idles through every miss wait.
+                async_eval = getattr(mx, "async_eval", None)
+                if callable(async_eval):
+                    async_eval(wave_outputs)
+                else:
+                    mx.eval(wave_outputs)
+            else:
+                fence_bindings(
+                    ready,
+                    bindings,
+                    wave_outputs,
+                    force_sync=force_sync,
+                )
             outputs.extend(wave_outputs)
             output_positions.extend(wave_positions)
 
@@ -1082,13 +1865,134 @@ class HotExpertSwitchGLU(nn.Module):
             )
 
         try:
-            for wave in self.runtime.route_waves(
-                expert_ids,
-                sort_unique=(
-                    phase is RoutingPhase.PREFILL
-                    and self.runtime.manifest.sidecar is not None
-                ),
-            ):
+            waves = tuple(
+                self.runtime.route_waves(
+                    expert_ids,
+                    sort_unique=(
+                        phase is RoutingPhase.PREFILL
+                        and self.runtime.manifest.sidecar is not None
+                    ),
+                )
+            )
+            # Deferring hands this layer's lock and slot pins to the next
+            # generation-thread flush, so it is only legal on the wave that
+            # ends the layer's routing.  A wide verify batch splits into
+            # several waves, and the layer lock is not reentrant: a deferred
+            # non-final wave would park the generation thread on its own lock
+            # when the next wave re-entered the same layer (issue #120,
+            # GLM depth>=4 at 6-row verify / 32 transient slots).
+            final_wave = len(waves) - 1
+            for wave_index, wave in enumerate(waves):
+                # Shadow miss fallback (issue #51): with a shadow bank bound,
+                # a decode wave never waits on SSD.  Resident experts run
+                # exactly from cache; every other assignment is served from
+                # the resident low-precision shadow bank, and the exact tier
+                # warms asynchronously through the speculative-prefetch lane
+                # so future routes turn these serves into exact hits.
+                # Prefill is untouched (exact, transient-served).
+                shadow_bank = self._shadow_bank
+                resident: frozenset[int] = frozenset()
+                if shadow_bank is not None and phase is RoutingPhase.DECODE:
+                    resident = self.runtime.peek_resident_experts(
+                        self.layer_index, wave.experts
+                    )
+                if (
+                    shadow_bank is not None
+                    and phase is RoutingPhase.DECODE
+                    and not all(expert in resident for expert in wave.experts)
+                ):
+                    exact_assignments = tuple(
+                        (position, expert)
+                        for position, expert in zip(
+                            wave.positions, wave.experts, strict=True
+                        )
+                        if expert in resident
+                    )
+                    shadow_positions = [
+                        position
+                        for position, expert in zip(
+                            wave.positions, wave.experts, strict=True
+                        )
+                        if expert not in resident
+                    ]
+                    shadow_experts = [
+                        expert for expert in wave.experts if expert not in resident
+                    ]
+                    if exact_assignments:
+                        with _route_probe.bracket("hot.begin_shadow_route"):
+                            pending = self.runtime.begin_split_route(
+                                self.layer_index,
+                                tuple(
+                                    expert for _position, expert in exact_assignments
+                                ),
+                                phase=phase,
+                            )
+                        try:
+                            hit_set = set(pending.plan.hits)
+                            hit_positions = tuple(
+                                position
+                                for position, expert in exact_assignments
+                                if expert in hit_set
+                            )
+                            if pending.hit_ready is not None:
+                                evaluate_component_bindings(
+                                    hit_positions,
+                                    pending.hit_ready.bindings,
+                                    pending.hit_ready,
+                                    force_sync=True,
+                                )
+                                pending.release_hits()
+                            # The residency peek is a snapshot, not a
+                            # reservation: an expert evicted between peek and
+                            # pin becomes a planned miss here and is serviced
+                            # exactly (slower on this route, never wrong).
+                            for miss_ready in pending.iter_ready_misses():
+                                try:
+                                    ready_experts = set(miss_ready.plan.experts)
+                                    miss_positions = tuple(
+                                        position
+                                        for position, expert in exact_assignments
+                                        if expert not in hit_set
+                                        and expert in ready_experts
+                                    )
+                                    evaluate_component_bindings(
+                                        miss_positions,
+                                        miss_ready.bindings,
+                                        miss_ready,
+                                        force_sync=True,
+                                    )
+                                finally:
+                                    pending.release_miss(miss_ready)
+                        except BaseException as exc:
+                            pending.abort(exc)
+                            raise
+                        finally:
+                            pending.close()
+                    with _route_probe.bracket("hot.shadow_serve"):
+                        token_positions = mx.array(
+                            [position // top_k for position in shadow_positions],
+                            dtype=mx.int32,
+                        )
+                        selected = mx.take(tokens, token_positions, axis=0)
+                        outputs.append(
+                            _run_shadow_bank(
+                                selected,
+                                mx.array(shadow_experts, dtype=mx.int32),
+                                shadow_bank,
+                            )
+                        )
+                        output_positions.extend(shadow_positions)
+                    unique_shadowed = tuple(dict.fromkeys(shadow_experts))
+                    _route_probe.count("hot.shadow_route")
+                    self.runtime.note_shadow_serve(
+                        self.layer_index,
+                        assignments=len(shadow_positions),
+                        experts=len(unique_shadowed),
+                    )
+                    self.runtime.prefetch_experts(
+                        self.layer_index, unique_shadowed
+                    )
+                    continue
                 # Keep the all-hit optimization inside the authoritative bounded
                 # route-wave loop.  A successful probe avoids split-route futures
                 # and per-expert grouping while retaining the normal policy epoch,
@@ -1103,8 +2007,11 @@ class HotExpertSwitchGLU(nn.Module):
                             wave.experts,
                             phase=phase,
                         )
+                    outcome = "all_hit" if ready is not None else "split_route"
+                    _route_probe.count(f"hot.{outcome}")
                     _route_probe.count(
-                        "hot.all_hit" if ready is not None else "hot.split_route"
+                        f"hot.{outcome}.{phase.name.lower()}"
+                        f".layer{self.layer_index:02d}"
                     )
                     if ready is not None:
                         hit_pipeline_work = None
@@ -1142,11 +2049,9 @@ class HotExpertSwitchGLU(nn.Module):
                                     phase=phase,
                                 )
                             with _route_probe.bracket("hot.allhit_dispatch_build"):
-                                wave_output = _run_component_bank_q4(
+                                wave_output = self._dispatch_component_bank(
                                     assignment_inputs,
                                     ready.bindings,
-                                    group_size=self.group_size,
-                                    bits=self.bits,
                                 )
                             # Slot pins may be released only after the lazy graph
                             # has consumed the currently bound bank generations.
@@ -1156,7 +2061,7 @@ class HotExpertSwitchGLU(nn.Module):
                             # Promoted default via ExpertStreamingConfig after
                             # the C3 matrix; fakes without the field keep the
                             # fence path.
-                            if getattr(
+                            if wave_index == final_wave and getattr(
                                 self.runtime.config,
                                 "deferred_pin_release",
                                 False,
@@ -1191,6 +2096,23 @@ class HotExpertSwitchGLU(nn.Module):
                     if self.runtime.config.slot_layout == "component-banks"
                     else evaluate_direct_bindings
                 )
+                # Deferred split release: no per-part fence; lease
+                # bookkeeping replays at the next generation-thread eval
+                # (the same coverage proof deferred pins already rely on).
+                # A deferred split also keeps the layer lock until that
+                # flush, so only the final wave may take this path.
+                deferred_split = (
+                    wave_index == final_wave
+                    and phase is RoutingPhase.DECODE
+                    and getattr(
+                        self.runtime.config, "split_route_release", "fenced"
+                    )
+                    == "deferred"
+                    and getattr(self.runtime.config, "deferred_pin_release", False)
+                )
+                deferred_parts: list[ReadyRoute] = []
+                split_completed = False
+                wave_output_start = len(outputs)
                 with _route_probe.bracket("hot.begin_split_route"):
                     pending = self.runtime.begin_split_route(
                         self.layer_index,
@@ -1234,6 +2156,7 @@ class HotExpertSwitchGLU(nn.Module):
                                 pending.hit_ready.bindings,
                                 pending.hit_ready,
                                 force_sync=True,
+                                defer=deferred_split,
                             )
                     finally:
                         if (
@@ -1246,7 +2169,7 @@ class HotExpertSwitchGLU(nn.Module):
                                 "close",
                                 phase=phase,
                             )
-                    if pending.hit_ready is not None:
+                    if pending.hit_ready is not None and not deferred_split:
                         pending.release_hits()
                     # The resident shared branch depends only on ``x``.  Force it
                     # on Metal while the native readers own miss futures, so
@@ -1272,7 +2195,23 @@ class HotExpertSwitchGLU(nn.Module):
                             )
                         try:
                             shared = shared_work()
-                            mx.eval(shared)
+                            # Submit the shared branch so the GPU has work
+                            # during miss I/O. Deferred-pin mode already
+                            # trusts the next generation-thread eval for
+                            # coverage, so the blocking barrier serves no
+                            # release obligation there; strict mode keeps it.
+                            async_eval = getattr(mx, "async_eval", None)
+                            if (
+                                getattr(
+                                    self.runtime.config,
+                                    "deferred_pin_release",
+                                    False,
+                                )
+                                and callable(async_eval)
+                            ):
+                                async_eval(shared)
+                            else:
+                                mx.eval(shared)
                         finally:
                             if (
                                 pipeline_ledger is not None
@@ -1309,21 +2248,34 @@ class HotExpertSwitchGLU(nn.Module):
                                 miss_ready.bindings,
                                 miss_ready,
                                 force_sync=True,
+                                defer=deferred_split,
                             )
                         except BaseException as exc:
                             part_error = exc
                             raise
                         finally:
-                            try:
-                                pending.release_miss(miss_ready)
-                            except BaseException:
-                                if part_error is None:
-                                    raise
+                            if deferred_split and part_error is None:
+                                deferred_parts.append(miss_ready)
+                            else:
+                                try:
+                                    pending.release_miss(miss_ready)
+                                except BaseException:
+                                    if part_error is None:
+                                        raise
+                    split_completed = True
                 except BaseException as exc:
                     pending.abort(exc)
                     raise
                 finally:
-                    pending.close()
+                    if deferred_split and split_completed:
+                        self.runtime.defer_slot_release(
+                            _DeferredSplitClose(
+                                pending, tuple(deferred_parts)
+                            ),
+                            tuple(outputs[wave_output_start:]),
+                        )
+                    else:
+                        pending.close()
 
             if not outputs:
                 raise ValueError("router produced no expert assignments")
@@ -1345,7 +2297,8 @@ class HotExpertSwitchGLU(nn.Module):
                         phase=phase,
                     )
                 try:
-                    shared = shared_work()
+                    if shared is None:
+                        shared = shared_work()
                 finally:
                     if pipeline_ledger is not None and shared_pipeline_work is not None:
                         _pipeline_work_call(
@@ -1401,12 +2354,53 @@ def bind_streamed_switches(model: Any, runtime: ExpertStreamingRuntime) -> int:
         )
         mapped_store.prepare()
         runtime._mapped_expert_store = mapped_store
+    island_layers = frozenset(runtime.config.island_layers)
+    island_store = None
+    if island_layers:
+        island_store = DenseIslandStore(
+            runtime.manifest,
+            island_layers,
+            expert_count=runtime.spec.expert_count,
+        )
+        island_store.fill(
+            runtime.manifest,
+            runtime.reader,
+            verify_hash=(
+                runtime.config.verify_record_hashes
+                and not runtime.config.verify_sidecar_hash_at_open
+            ),
+        )
+        runtime._island_store = island_store
+    banked_layers = frozenset(runtime.config.mmap_island_layers)
+    banked_store = None
+    if banked_layers:
+        banked_store = BankedMmapIslandStore(
+            Path(runtime.config.banked_manifest),
+            banked_layers,
+            expert_count=runtime.spec.expert_count,
+            wired=runtime.config.mmap_island_wired,
+        )
+        banked_store.prepare()
+        banked_store.prefetch_all()
+        runtime._banked_island_store = banked_store
     for layer_index in runtime.spec.routed_layer_indices:
         layer = layers[layer_index]
         mlp = getattr(layer, "mlp", None)
         if mlp is None or not hasattr(mlp, "switch_mlp"):
             raise TypeError(f"layer {layer_index} has no switch_mlp seam")
-        if mapped_store is None:
+        if island_store is not None and layer_index in island_layers:
+            mlp.switch_mlp = DenseIslandSwitchGLU(
+                runtime,
+                island_store,
+                layer_index,
+            )
+        elif banked_store is not None and layer_index in banked_layers:
+            mlp.switch_mlp = DenseIslandSwitchGLU(
+                runtime,
+                banked_store,
+                layer_index,
+            )
+        elif mapped_store is None:
             mlp.switch_mlp = HotExpertSwitchGLU(runtime, layer_index)
         else:
             mlp.switch_mlp = MappedExpertSwitchGLU(

@@ -451,12 +451,14 @@ def test_glm52_injection_forwards_borrowed_verified_artifact(
         args,
         *,
         expected_revision,
+        precision="bf16",
         verified_artifact=None,
     ):
         observed.update(
             artifact_dir=artifact_dir,
             args=args,
             expected_revision=expected_revision,
+            precision=precision,
             verified_artifact=verified_artifact,
         )
         return SimpleNamespace()
@@ -469,6 +471,7 @@ def test_glm52_injection_forwards_borrowed_verified_artifact(
         {"model_type": "glm_moe_dsa"},
         MTPContract(),
         expected_revision=TEST_REVISION,
+        precision="q4",
         verified_artifact=borrowed,
     )
 
@@ -476,6 +479,7 @@ def test_glm52_injection_forwards_borrowed_verified_artifact(
         "artifact_dir": tmp_path,
         "args": args,
         "expected_revision": TEST_REVISION,
+        "precision": "q4",
         "verified_artifact": borrowed,
     }
 
@@ -819,6 +823,281 @@ def test_glm52_injection_shares_target_heads_and_only_reuses_d1_indexer_topk(
     assert cache[0].main_kv.offset == 7
     assert cache[0].indexer_kv.offset == 7
     assert cache[0].cycle is None
+
+
+def _raw_q4_tensors(args: GlmArgs) -> dict[str, mx.array]:
+    """The tiny head with its routed experts quantized to affine Q4/gs64."""
+
+    prefix = f"model.layers.{args.num_hidden_layers}."
+    quantized: dict[str, mx.array] = {}
+    for name, value in _raw_tensors(args).items():
+        if ".mlp.experts." in name and name.endswith(".weight"):
+            weight, scales, biases = mx.quantize(
+                value, group_size=64, bits=4, mode="affine"
+            )
+            base = name[: -len(".weight")]
+            quantized[base + ".weight"] = weight
+            quantized[base + ".scales"] = scales
+            quantized[base + ".biases"] = biases
+        else:
+            quantized[name] = value
+    del prefix
+    mx.eval(list(quantized.values()))
+    return quantized
+
+
+def _write_q4_artifact(root: Path, tensors: dict[str, mx.array]) -> None:
+    from mtplx.glm52_mtp_patch import GLM52_MTP_Q4_FILE
+
+    root.mkdir(parents=True, exist_ok=True)
+    mx.save_safetensors(str(root / GLM52_MTP_Q4_FILE), tensors)
+
+
+def _trust_q4_artifact(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mtplx.glm52_mtp_patch import (
+        GLM52_MTP_Q4_FILE,
+        GLM52_MTP_Q4_MANIFEST_SCHEMA,
+    )
+
+    @contextlib.contextmanager
+    def open_verified(root: Path, *, deep: bool = True):
+        resolved_root = Path(root).resolve()
+        with (resolved_root / GLM52_MTP_Q4_FILE).open("rb") as artifact_file:
+            yield SimpleNamespace(
+                file=artifact_file,
+                root=resolved_root,
+                manifest={
+                    "schema": GLM52_MTP_Q4_MANIFEST_SCHEMA,
+                    "source_revision": TEST_REVISION,
+                    "deep": deep,
+                },
+            )
+
+    monkeypatch.setattr(
+        "mtplx.glm52_mtp_patch.open_verified_glm52_mtp_layer78_q4",
+        open_verified,
+    )
+
+
+def test_glm52_q4_inventory_derives_from_the_bf16_contract() -> None:
+    from mtplx.glm52_mtp_patch import (
+        expected_glm52_mtp_inventory,
+        expected_glm52_mtp_q4_inventory,
+    )
+
+    args = _args()
+    bf16 = expected_glm52_mtp_inventory(args)
+    q4 = expected_glm52_mtp_q4_inventory(args)
+    experts = args.n_routed_experts * 3
+    # Trunk tensors are unchanged; each expert weight becomes a Q4 triplet.
+    assert len(q4) == (len(bf16) - experts) + experts * 3
+    for expert in range(args.n_routed_experts):
+        base = f"model.layers.{args.num_hidden_layers}.mlp.experts.{expert}.gate_proj"
+        assert q4[base + ".weight"].dtype == "U32"
+        assert q4[base + ".scales"].dtype == "BF16"
+        assert q4[base + ".biases"].dtype == "BF16"
+        assert q4[base + ".weight"].shape == (
+            args.moe_intermediate_size,
+            args.hidden_size * 4 // 32,
+        )
+        assert q4[base + ".scales"].shape == (
+            args.moe_intermediate_size,
+            args.hidden_size // 64,
+        )
+    # Trunk-side tensors keep their BF16/F32 contract.
+    trunk = f"model.layers.{args.num_hidden_layers}.enorm.weight"
+    assert q4[trunk].dtype == "BF16"
+
+
+def test_glm52_q4_loader_maps_quantized_experts_and_bf16_trunk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mtplx.glm52_mtp_patch import load_glm52_mtp_q4_weights
+
+    args = _args()
+    tensors = _raw_q4_tensors(args)
+    _write_q4_artifact(tmp_path, tensors)
+    _trust_q4_artifact(monkeypatch)
+
+    mapped = load_glm52_mtp_q4_weights(tmp_path, args, expected_revision=TEST_REVISION)
+
+    assert len(mapped) == 33
+    assert not any(".experts." in name for name in mapped)
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        for leaf in ("weight", "scales", "biases"):
+            name = f"layers.0.mtp_block.mlp.switch_mlp.{projection}.{leaf}"
+            stacked = mapped[name]
+            assert stacked.shape[0] == args.n_routed_experts
+            wanted = mx.uint32 if leaf == "weight" else mx.bfloat16
+            assert stacked.dtype == wanted
+    assert (
+        mapped["layers.0.mtp_block.mlp.gate.e_score_correction_bias"].dtype
+        == mx.float32
+    )
+    # A stacked expert leaf preserves per-expert artifact order.
+    prefix = f"model.layers.{args.num_hidden_layers}."
+    stacked = mapped["layers.0.mtp_block.mlp.switch_mlp.gate_proj.weight"]
+    for expert in range(args.n_routed_experts):
+        source = tensors[f"{prefix}mlp.experts.{expert}.gate_proj.weight"]
+        assert mx.array_equal(stacked[expert], source).item()
+
+
+def test_glm52_q4_build_installs_quantized_switch_and_plain_trunk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+
+    from mtplx.glm52_mtp_patch import build_glm52_mtp_module
+
+    args = _args()
+    _write_q4_artifact(tmp_path, _raw_q4_tensors(args))
+    _trust_q4_artifact(monkeypatch)
+
+    mtp = build_glm52_mtp_module(
+        tmp_path, args, expected_revision=TEST_REVISION, precision="q4"
+    )
+    layer = mtp.layers[0]
+    switch = layer.mtp_block.mlp.switch_mlp
+    assert isinstance(switch.gate_proj, QuantizedSwitchLinear)
+    assert switch.gate_proj.bits == 4 and switch.gate_proj.group_size == 64
+    # Only the routed expert bank is quantized; the trunk stays BF16.
+    assert isinstance(layer.eh_proj, nn.Linear)
+    assert not isinstance(layer.eh_proj, nn.QuantizedLinear)
+    assert layer.eh_proj.weight.dtype == mx.bfloat16
+    router = layer.mtp_block.mlp.gate
+    assert not any(
+        "Quantized" in type(module).__name__
+        for module in _modules(mtp)
+        if module is not switch.gate_proj
+        and module is not switch.up_proj
+        and module is not switch.down_proj
+    )
+    del router
+
+
+def test_glm52_q4_forward_produces_finite_logits_and_hidden(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mtplx.glm52_mtp_patch import build_glm52_mtp_module
+
+    args = _args()
+    _write_q4_artifact(tmp_path, _raw_q4_tensors(args))
+    _trust_q4_artifact(monkeypatch)
+    mtp = build_glm52_mtp_module(
+        tmp_path, args, expected_revision=TEST_REVISION, precision="q4"
+    )
+    trunk = GlmModel(args)
+
+    token_ids = mx.array([[3, 5]], dtype=mx.int32)
+    previous_hidden = mx.random.normal((1, 2, args.hidden_size)).astype(mx.bfloat16)
+    logits, hidden, _topk = mtp.layers[0](
+        token_ids,
+        previous_hidden,
+        embed_tokens=trunk.model.embed_tokens,
+        lm_head=trunk.lm_head,
+    )
+    mx.eval(logits, hidden)
+    assert logits.shape == (1, 2, args.vocab_size)
+    assert hidden.shape == (1, 2, args.hidden_size)
+    assert mx.all(mx.isfinite(logits.astype(mx.float32))).item()
+    assert mx.all(mx.isfinite(hidden.astype(mx.float32))).item()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing", "missing tensors"),
+        ("extra", "unexpected tensors"),
+        ("weight_as_bf16", "must be uint32"),
+        ("scales_as_f32", "must be bfloat16"),
+        ("wrong_shape", "expected shape"),
+    ],
+)
+def test_glm52_q4_loader_fails_closed_on_inventory_corruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    message: str,
+) -> None:
+    from mtplx.glm52_mtp_patch import Glm52MTPLoadError, load_glm52_mtp_q4_weights
+
+    args = _args()
+    tensors = _raw_q4_tensors(args)
+    prefix = f"model.layers.{args.num_hidden_layers}."
+    if mutation == "missing":
+        tensors.pop(prefix + "mlp.experts.0.gate_proj.scales")
+    elif mutation == "extra":
+        tensors[prefix + "unexpected.weight"] = mx.zeros((1,), dtype=mx.bfloat16)
+    elif mutation == "weight_as_bf16":
+        tensors[prefix + "mlp.experts.0.gate_proj.weight"] = mx.zeros(
+            (args.moe_intermediate_size, args.hidden_size * 4 // 32),
+            dtype=mx.bfloat16,
+        )
+    elif mutation == "scales_as_f32":
+        tensors[prefix + "mlp.experts.0.gate_proj.scales"] = mx.zeros(
+            (args.moe_intermediate_size, args.hidden_size // 64), dtype=mx.float32
+        )
+    elif mutation == "wrong_shape":
+        tensors[prefix + "enorm.weight"] = mx.zeros(
+            (args.hidden_size - 1,), dtype=mx.bfloat16
+        )
+    _write_q4_artifact(tmp_path, tensors)
+    _trust_q4_artifact(monkeypatch)
+
+    with pytest.raises(Glm52MTPLoadError, match=message):
+        load_glm52_mtp_q4_weights(tmp_path, args, expected_revision=TEST_REVISION)
+
+
+def test_glm52_q4_loader_rejects_bf16_schema_and_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mtplx.glm52_mtp_patch import (
+        GLM52_MTP_Q4_FILE,
+        Glm52MTPLoadError,
+        load_glm52_mtp_q4_weights,
+    )
+
+    args = _args()
+    _write_q4_artifact(tmp_path, _raw_q4_tensors(args))
+
+    # A BF16-schema manifest must not satisfy the Q4 loader.
+    @contextlib.contextmanager
+    def wrong_schema(root: Path, *, deep: bool = True):
+        with (Path(root).resolve() / GLM52_MTP_Q4_FILE).open("rb") as artifact_file:
+            yield SimpleNamespace(
+                file=artifact_file,
+                root=Path(root).resolve(),
+                manifest={
+                    "schema": "mtplx-glm52-mtp-layer78-v1",
+                    "source_revision": TEST_REVISION,
+                },
+            )
+
+    monkeypatch.setattr(
+        "mtplx.glm52_mtp_patch.open_verified_glm52_mtp_layer78_q4",
+        wrong_schema,
+    )
+    with pytest.raises(Glm52MTPLoadError, match="Q4 head schema"):
+        load_glm52_mtp_q4_weights(tmp_path, args, expected_revision=TEST_REVISION)
+
+    _trust_q4_artifact(monkeypatch)
+    with pytest.raises(Glm52MTPLoadError, match="revision"):
+        load_glm52_mtp_q4_weights(tmp_path, args, expected_revision="other-revision")
+
+
+def test_glm52_build_rejects_unknown_precision(
+    tmp_path: Path,
+) -> None:
+    from mtplx.glm52_mtp_patch import Glm52MTPLoadError, build_glm52_mtp_module
+
+    with pytest.raises(Glm52MTPLoadError, match="precision"):
+        build_glm52_mtp_module(
+            tmp_path, _args(), expected_revision=TEST_REVISION, precision="fp8"
+        )
 
 
 def _append(cache, count: int) -> None:

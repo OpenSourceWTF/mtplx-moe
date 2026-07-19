@@ -7,7 +7,11 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from .expert_runtime import ExpertStreamingConfig, parse_memory_bytes
+from .expert_runtime import (
+    ExpertStreamingConfig,
+    parse_memory_bytes,
+    resolve_island_placement,
+)
 
 
 _BYTE_FIELDS = {
@@ -47,6 +51,8 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
             "hy3-expert-only-q4",
             "hy3-expert-q2",
             "glm52-expert-q2",
+            "glm52-expert-q1t",
+            "glm52-expert-q1b1",
         ],
         help="Pinned streamed model descriptor; inferred from config.json by default.",
     )
@@ -227,6 +233,11 @@ def expert_streaming_load_kwargs(
         config = ExpertStreamingConfig(**values)
     except TypeError as exc:
         raise ValueError(f"invalid expert streaming config: {exc}") from exc
+    # A pending island_layer_count (spec without a measured pin order)
+    # resolves here, where the config first meets the model root, so every
+    # downstream memory_plan prices the islands. Precedence: explicit
+    # island_layers > spec.island_pin_order > island-placement.json > error.
+    config = resolve_island_placement(config, root)
     manifest = Path(
         getattr(args, "expert_manifest", None) or root / "expert-manifest.json"
     ).resolve()

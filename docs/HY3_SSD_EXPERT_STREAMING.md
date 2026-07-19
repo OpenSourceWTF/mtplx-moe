@@ -1,5 +1,13 @@
 # Hy3 SSD expert streaming — fork design
 
+**Scope note (2026-07): this document describes the original Q4, depth-1
+design.** The shipping line is Q2 streamed experts (`hy3-expert-q2`,
+`~/.cache/huggingface/hy3-expert-only-mlx-q2`) at MTP depth 3, with dense
+islands (`--island-layer-count`) and load-time projection quantization
+(`--proj-quant`). Sizing figures below are Q4-era planning numbers, not
+measurements of the current path. See "Current levers" at the end for the
+flags that actually drive today's results.
+
 Status: AR implementation complete on the experimental branch, including the
 resident Hy3 overlay, native positional I/O, and direct MLX/Metal slot-bank
 execution. MTP through the layer-80 NextN head is implemented behind an
@@ -350,3 +358,148 @@ kernels see different shapes, so `B > 1` outputs legitimately differ from
 batch sizes. The benchmark harness exposes this lane as
 `scripts/benchmark_streamed_generation.py --concurrency N`, reporting both
 aggregate and per-stream tok/s.
+
+## Current levers (2026-07)
+
+The flags below drive the shipping Q2 results. They are the levers the
+Q4-era sections above do not mention. All are on
+`scripts/benchmark_q2_mtp_depth_matrix.py`.
+
+| Flag | Choices / default | What it does |
+| --- | --- | --- |
+| `--island-layer-count N` | int, default `None` | Pins the N worst-streaming layers fully resident as dense "islands" using the model's measured pin order. `79` means zero streamed layers (full residency). Independent of `--expert-cache-limit`. |
+| `--proj-quant {q8,q4}` | default `None` | Quantizes the trunk `*_proj` Linears at load (group-64 affine): attention `q/k/v/o_proj` and `gate/up/down_proj` in `mlp` and `shared_mlp`. Routers, embeddings, the LM head, and norms keep loaded precision. No artifact rebuild. `--resident-quant` is a deprecated alias. |
+| `--kv-quant {q8,q4}` | default `None` | Quantizes the trunk KV cache. **Requires `--verify-strategy batched`.** |
+| `--hy3-router-kernel` | 6 choices, default `mpp-r1-fused-r2` | Router arithmetic mode. See the measured A/B below. |
+| `--q2-expert-kernel` | `stock`/`nax`/`fused`/`fused-nax`, default `stock` | Q2 expert execution arm. |
+| `--slot-layout` | `direct-slots`/`component-banks`/`metal-mmap` | Expert slot backing. Note the default differs by script: `component-banks` here, `direct-slots` in `benchmark_streamed_generation.py`, `probe_mtp_draft_rank.py`, and `compare_streamed_quality.py`. |
+
+**Router precision differs by checkpoint — this trips people up.** On the
+shipping Q2 line (`--model hy3-q2` → spec `hy3-expert-q2`,
+`~/.cache/huggingface/hy3-expert-only-mlx-q2`) the router gates are **BF16**,
+all 79 of them, and `--proj-quant` does not touch them: `proj_quant_covers`
+matches only `.self_attn.` and `*_proj` suffixes, and `router.gate` has
+neither. So the championship configuration runs **bf16 routers**.
+
+Q8 routers belong to the *other* artifact — `hy3-q4-mlx-mtp` and the pinned
+`pipenetwork/Hy3-4bit` snapshot (spec `hy3-q4`, whose `router_storage` is
+`"affine-q8 with fp32 correction bias"`), which is the older streamed regime.
+The design note earlier in this document recommended A/B-ing BF16 gates
+because all 79 are only ~124 MiB in BF16; the Q2 conversion took that
+recommendation, which is why the two artifacts differ.
+
+Routing is a discrete, precision-sensitive boundary; router math and selection
+run in FP32 in both cases.
+
+### Router kernel A/B (2026-07-18, 3 reps, arms interleaved per rep)
+
+Measured on the config below; the router kernel was the only variable.
+
+| Kernel | mean tok/s |
+| --- | --- |
+| `mpp-fp32-splitk-r1-fused-r2` | **40.59** |
+| `mpp-r1-fused-r2` (current default) | 40.01 |
+| `mpp-row-owned-fused` | 38.27 |
+| `steel-r1-fused-r2` | 38.25 |
+| `mpp-r1-last-arrival-fused-r2` | 37.90 |
+| `stock` | 37.77 |
+
+`mpp-fp32-splitk-r1-fused-r2` applies split-K to the **MTP** routers only
+(`splitk_m1 = selector == "mpp-fp32-splitk-r1-fused-r2" and is_mtp_router`,
+`configure_hy3_router_kernels` in `mtplx/models/hy3_mlx.py`), which is why it
+separates from plain `mpp-r1-fused-r2`.
+
+**The default is still `mpp-r1-fused-r2`** — the fastest kernel is opt-in.
+
+### Reference configuration
+
+```bash
+python3 scripts/benchmark_q2_mtp_depth_matrix.py \
+  --model hy3-q2 --contexts 2048 --output-tokens 1024 --hy3-depths 2 \
+  --hy3-q2-model-root    ~/.cache/huggingface/hy3-expert-only-mlx-q2 \
+  --hy3-q2-manifest      ~/.cache/huggingface/hy3-expert-only-mlx-q2/expert-manifest.json \
+  --hy3-q2-mtp-artifacts ~/.cache/huggingface/hy3-mtp-layer80 \
+  --memory-limit 108GiB --runtime-reserve 7GiB \
+  --expert-cache-limit 2GiB --max-live-kv-tokens 3072 \
+  --cache-policy frequency --cache-scope layer \
+  --slot-layout component-banks --transient-slots 8 \
+  --q2-expert-kernel stock \
+  --hy3-router-kernel mpp-fp32-splitk-r1-fused-r2 \
+  --read-chunk 8MiB --f-nocache \
+  --verify-strategy capture_commit --compiled-verify-mode off \
+  --draft-core device-k --no-trace-routes \
+  --island-layer-count 79 \
+  --proj-quant q4 \
+  --expert-integrity headers-only \
+  --split-route-release deferred
+```
+
+Environment: `MTPLX_SUSTAINED_PREFILL=1`, `MTPLX_DEFERRED_PIN_RELEASE=1`,
+`MTPLX_HY3_SUBMIT_CADENCE=8`, with `MTPLX_MEMORY_LIMIT_BYTES` unset.
+
+At `--island-layer-count 79` nothing streams, so `--expert-cache-limit` is
+vestigial in this configuration.
+
+### Running a guarded window
+
+Never run two benchmarks at once — two concurrent ~95 GB Hy3 runs
+kernel-panicked this box on 2026-07-17. Use the shared harness rather than
+hand-rolling the guards:
+
+```python
+from mtplx.benchmarks.window import (
+    exclusive_mlx_lock, gpu_run_lock_clear, guarded_qwen,
+)
+from mtplx.qwen_guard import qwen_stopped_for_mlx
+
+assert gpu_run_lock_clear(), "another benchmark holds the GPU"
+with exclusive_mlx_lock(timeout_seconds=28800.0):
+    with guarded_qwen(lambda: qwen_stopped_for_mlx(plist=plist)):
+        ...  # arms interleaved within each rep; burn a warm-up cell first
+```
+
+Aborts cluster at window start, so discard a warm-up cell before measuring.
+
+### Presets — don't memorize the flags
+
+The reference configuration above is a named preset. These are equivalent:
+
+```bash
+# the 25-flag command
+python3 scripts/benchmark_q2_mtp_depth_matrix.py --model hy3-q2 --contexts 2048 ... 
+
+# the same thing
+python3 scripts/benchmark_q2_mtp_depth_matrix.py --preset championship
+```
+
+```bash
+--list-presets              # what's defined, one line each
+--show-preset championship  # the fully expanded flags + env, without running
+--preset championship       # run it
+--preset championship --proj-quant q8   # run it with one flag substituted
+```
+
+Presets are applied as argparse **defaults**, so anything you type explicitly
+beats the preset — there is no precedence surprise. Order is:
+
+    runner defaults  <  preset (through its `extends` chain)  <  typed flags
+
+Shipped presets live in `benchmarks/presets.toml` (in-repo, so a change to an
+operating point is a reviewable diff). Machine-local bundles that shouldn't be
+committed go in `~/.mtplx/benchmark-presets.toml`, which layers on top.
+
+| Preset | What it is |
+| --- | --- |
+| `hy3-q2` | Base: Q2 streamed experts + BF16 layer-80 MTP head |
+| `full-residency` | All 79 layers resident, nothing streams |
+| `championship` | The 40.59 tok/s router A/B winner |
+| `shipped-default` | Same envelope, shipped router kernel (the 40.01 baseline) |
+| `streamed` | The ~6 tok/s SSD-streamed regime |
+| `q8-projections` | Championship with `--proj-quant q8` |
+| `k3` | Championship at depth 3 (a measured net loss; kept for reproduction) |
+| `kv-q8` | Championship with a q8 KV cache |
+| `telemetry` / `roofline` | Diagnostic variants |
+
+A preset naming a flag the runner doesn't have is a **hard error**, not a
+silent no-op — a preset that quietly drops `--proj-quant` would be a silently
+different experiment. Values are checked against each flag's `choices` too.

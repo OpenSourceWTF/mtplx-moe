@@ -77,7 +77,7 @@ def _inputs() -> tuple[FakeTensor, FakeTensor, FakeTensor]:
     return (
         FakeTensor((1, 4, 4096), mx.bfloat16, "hidden"),
         FakeTensor((1, 4, 8), mx.int32, "slots"),
-        FakeTensor((1, 4, 8), mx.float32, "weights"),
+        FakeTensor((1, 4, 8), mx.bfloat16, "weights"),
     )
 
 
@@ -190,8 +190,8 @@ def test_m4_runtime_uses_three_tuned_qmms_without_copying_source_banks(
         (0, FakeTensor((1, 4, 4096), mx.float32, "hidden"), "BF16"),
         (1, FakeTensor((1, 4, 7), mx.int32, "slots"), r"\[1, 4, 8\]"),
         (1, FakeTensor((1, 4, 8), mx.uint32, "slots"), "int32"),
-        (2, FakeTensor((1, 4, 7), mx.float32, "weights"), r"\[1, 4, 8\]"),
-        (2, FakeTensor((1, 4, 8), mx.bfloat16, "weights"), "FP32"),
+        (2, FakeTensor((1, 4, 7), mx.bfloat16, "weights"), r"\[1, 4, 8\]"),
+        (2, FakeTensor((1, 4, 8), mx.float32, "weights"), "BF16"),
     ),
 )
 def test_m4_runtime_fails_closed_on_noncontract_inputs(
@@ -250,4 +250,56 @@ def test_m4_runtime_fails_closed_on_bank_layout_or_slot_bounds() -> None:
             route_weights,
             _bank(capacity=5),
             validated_slot_bounds=(0, 5),
+        )
+
+
+def test_fp32_combine_mode_takes_fp32_weights_and_returns_fp32(monkeypatch) -> None:
+    """FP32 mode mirrors enable_moe_fp32_combine: FP32 products/reduction and
+    FP32 output rows so the caller adds the shared expert before one rounding."""
+
+    import mtplx.hy3_expert_wave_m4 as wave_m4
+
+    hidden_rows, slot_indices, _ = _inputs()
+    fp32_weights = FakeTensor((1, 4, 8), mx.float32, "weights")
+
+    def fake_broadcast(value, shape):
+        return FakeTensor(tuple(int(v) for v in shape), value.dtype, "broadcast")
+
+    def fake_qmm(values, weight, *args, **kwargs):
+        width = int(weight.shape[1])
+        return FakeTensor((32, 1, 1, width), mx.bfloat16, "qmm")
+
+    monkeypatch.setattr(wave_m4.mx, "broadcast_to", fake_broadcast)
+    monkeypatch.setattr(wave_m4.mx, "gather_qmm", fake_qmm)
+    monkeypatch.setattr(
+        wave_m4, "swiglu", lambda gate, up: FakeTensor(gate.shape, gate.dtype, "act")
+    )
+    result = wave_m4.hy3_q2_m4_expert_wave(
+        hidden_rows,
+        slot_indices,
+        fp32_weights,
+        _bank(),
+        validated_slot_bounds=(0, 4),
+        combine_mode="fp32",
+    )
+    assert result.hidden_rows.dtype == mx.float32
+
+    with pytest.raises(wave_m4.Hy3M4ExpertWaveIneligible, match="FP32"):
+        wave_m4.hy3_q2_m4_expert_wave(
+            hidden_rows,
+            slot_indices,
+            FakeTensor((1, 4, 8), mx.bfloat16, "weights"),
+            _bank(),
+            validated_slot_bounds=(0, 4),
+            combine_mode="fp32",
+        )
+
+    with pytest.raises(wave_m4.Hy3M4ExpertWaveIneligible, match="combine"):
+        wave_m4.hy3_q2_m4_expert_wave(
+            hidden_rows,
+            slot_indices,
+            fp32_weights,
+            _bank(),
+            validated_slot_bounds=(0, 4),
+            combine_mode="fp16",
         )

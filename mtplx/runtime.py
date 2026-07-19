@@ -27,8 +27,12 @@ def _streamed_mtp_backend(model_key: str, precision: str) -> str:
     support = {
         "hy3-q4": ("hy3", {"bf16", "q4"}),
         "hy3-expert-q2": ("hy3", {"bf16"}),
-        "glm52-expert-q2": ("glm52", {"bf16"}),
-        "glm52-q4": ("glm52", {"bf16"}),
+        # The Q4 head sibling (issue #100) is lane-agnostic: it is selectable
+        # for either GLM streamed lane so its ~12.9 GiB budget saving reaches
+        # the memory-constrained expert-Q2 config too. BF16 stays the default
+        # until a Q4 acceptance-rate validation run lands.
+        "glm52-expert-q2": ("glm52", {"bf16", "q4"}),
+        "glm52-q4": ("glm52", {"bf16", "q4"}),
     }
     selected = support.get(str(model_key))
     if selected is None:
@@ -190,6 +194,20 @@ class MTPLXRuntime:
                 self._count("full_logits_tokens_emitted", emitted)
         with self._expert_routing_context(input_ids):
             if not return_hidden and hidden_variant is None and not kwargs:
+                # Decode-only (seq_len == 1). Prefill is multi-token over an
+                # unprimed cache: seeding the compiled graph from its None KV
+                # leaves throws mx.slice(None), and its shape differs from a
+                # single-token decode step, forcing a retrace. Prefill stays eager.
+                compiled = (
+                    self._compiled_full_residency_forward(cache)
+                    if sequence_len == 1
+                    else None
+                )
+                if compiled is not None:
+                    # Engagement proof: arm A (flag off) must report 0 here,
+                    # arm B (on) > 0 — the A/B credits nothing without it.
+                    self._count("compiled_forward_calls")
+                    return compiled(input_ids, cache)
                 return self.model(input_ids, cache=cache)
             return self.model(
                 input_ids,
@@ -197,6 +215,40 @@ class MTPLXRuntime:
                 return_hidden=return_hidden,
                 **kwargs,
             )
+
+    def _compiled_full_residency_forward(self, cache):
+        """Compiled target forward (MTPLX_HY3_COMPILE_FORWARD), full residency only.
+
+        Kills the ~12 ms/token Python graph rebuild by tracing the 79-layer
+        forward once (CompiledARForward, KV state threaded). Only when every
+        routed layer is an island (no per-layer host sync to break the region)
+        and the flag is set. Rebuilds per cache identity so a new generation
+        gets fresh threaded state. Returns None (the eager path) otherwise.
+        """
+        from .compiled_forward import CompiledARForward, compile_forward_enabled
+
+        if not compile_forward_enabled() or cache is None:
+            return None
+        # Belt-and-suspenders with the forward_ar seq_len==1 gate: an unprimed
+        # cache (empty context / first token) has None KV leaves that would
+        # crash the compiled graph. Only compile once the cache holds real keys.
+        if getattr(cache[0], "keys", None) is None:
+            return None
+        es = self.expert_streaming
+        if es is None:
+            return None
+        routed = set(getattr(es.spec, "routed_layer_indices", ()))
+        if not routed or not (routed <= getattr(es, "island_layer_set", frozenset())):
+            return None  # streamed layers host-sync -> break compile; eager path
+        cache_key = id(cache[0]) if cache else None
+        if (
+            getattr(self, "_compiled_ar", None) is None
+            or getattr(self, "_compiled_ar_key", None) != cache_key
+        ):
+            reserve = int(getattr(es.config, "max_live_kv_tokens", 4096))
+            self._compiled_ar = CompiledARForward(self.model, reserve_tokens=reserve)
+            self._compiled_ar_key = cache_key
+        return self._compiled_ar
 
     def forward_ar_capture(
         self,
@@ -257,6 +309,21 @@ class MTPLXRuntime:
             if "mtp_depth" in params:
                 kwargs["mtp_depth"] = mtp_depth
             return self.model.mtp_forward(hidden_states, next_token_ids, **kwargs)
+
+    def configure_mtp_execution_depth(self, depth: int | None) -> Any | None:
+        """Select any depth-gated MTP operators before prefill/decode starts."""
+
+        if depth is not None and (
+            isinstance(depth, bool) or not isinstance(depth, int)
+        ):
+            raise TypeError("MTP execution depth must be an integer or None")
+        if depth is not None and depth < 1:
+            raise ValueError("MTP execution depth must be positive")
+        configure = getattr(self.model, "configure_mtp_execution_depth", None)
+        if not callable(configure):
+            return None
+        self._count("mtp_execution_depth_configurations")
+        return configure(depth)
 
     def update_mtp_cache(
         self,
@@ -397,9 +464,10 @@ def _load_impl(
 ) -> MTPLXRuntime:
     """Load an MLX model and optionally inject native MTP support.
 
-    ``mtp_precision`` selects the streamed external draft head. Both expert-Q2
-    lanes and GLM-5.2 Q4 require their exact BF16 head; the legacy Hy3-Q4 lane
-    also retains its explicit Q4 diagnostic mode.
+    ``mtp_precision`` selects the streamed external draft head. The Hy3-expert-Q2
+    lane requires its exact BF16 head; the Hy3-Q4 and both GLM-5.2 lanes also
+    accept a Q4 head (BF16 default, Q4 selectable and priced from its own
+    artifact) pending each lane's acceptance-rate validation.
     """
     from .hy3_mtp_patch import HY3_MTP_PRECISIONS
 
@@ -505,13 +573,27 @@ def _load_impl(
                     "load with mtp=False"
                 )
             if streamed_mtp_backend == "glm52":
-                from .glm52_mtp_artifact import open_verified_glm52_mtp_layer78
                 from .glm52_mtp_patch import _validate_glm52_mtp_contract
 
                 _validate_glm52_mtp_contract(contract)
-                verified_artifact_context = open_verified_glm52_mtp_layer78(
-                    Path(mtp_artifacts), deep=True
-                )
+                if mtp_precision == "q4":
+                    from .glm52_mtp_artifact import (
+                        open_verified_glm52_mtp_layer78_q4,
+                    )
+
+                    verified_artifact_context = (
+                        open_verified_glm52_mtp_layer78_q4(
+                            Path(mtp_artifacts), deep=True
+                        )
+                    )
+                else:
+                    from .glm52_mtp_artifact import (
+                        open_verified_glm52_mtp_layer78,
+                    )
+
+                    verified_artifact_context = open_verified_glm52_mtp_layer78(
+                        Path(mtp_artifacts), deep=True
+                    )
             elif streamed_mtp_backend == "hy3":
                 from .hy3_mtp_patch import open_verified_hy3_mtp_artifacts
 
@@ -568,9 +650,22 @@ def _load_impl(
                 if additional_resident_bytes
                 else {}
             )
+            # ExpertStreamingRuntime.open computes the same discount from the
+            # manifest itself, so plan_kwargs stays free of it.
+            preflight_plan_kwargs = dict(plan_kwargs)
+            if expert_streaming_config.proj_quant:
+                from .expert_manifest import load_expert_manifest
+                from .expert_runtime import proj_quant_plan_discount
+
+                preflight_plan_kwargs["resident_discount_bytes"] = (
+                    proj_quant_plan_discount(
+                        load_expert_manifest(expert_manifest),
+                        expert_streaming_config.proj_quant,
+                    )
+                )
             streaming_plan = expert_streaming_config.memory_plan(
                 streaming_spec,
-                **plan_kwargs,
+                **preflight_plan_kwargs,
             )
             if not streaming_plan.fits_fixed:
                 raise ExpertStreamingConfigurationError(
@@ -592,6 +687,7 @@ def _load_impl(
                     mtp_artifacts,
                     Glm52ModelArgs.from_dict(config),
                     expected_revision=streaming_spec.source_revision,
+                    precision=mtp_precision,
                     verified_artifact=verified_streamed_artifact,
                 )
             elif streamed_mtp_backend == "hy3":
@@ -603,6 +699,10 @@ def _load_impl(
                     Hy3ModelArgs.from_dict(config),
                     expected_revision=streaming_spec.source_revision,
                     precision=mtp_precision,
+                    shared_kernel=expert_streaming_config.hy3_mtp_shared_kernel,
+                    shared_kernel_depth=(
+                        expert_streaming_config.hy3_mtp_shared_kernel_depth
+                    ),
                     verified_artifacts=verified_streamed_artifact,
                 )
             if expert_streaming_config.slot_layout == "component-banks":
@@ -649,6 +749,12 @@ def _load_impl(
                             contract,
                             expected_revision=streaming_spec.source_revision,
                             mtp_precision=mtp_precision,
+                            shared_kernel=(
+                                expert_streaming_config.hy3_mtp_shared_kernel
+                            ),
+                            shared_kernel_depth=(
+                                expert_streaming_config.hy3_mtp_shared_kernel_depth
+                            ),
                             mtp_module=prebuilt_hy3_mtp,
                         )
                     elif streamed_mtp_backend == "glm52":

@@ -20,6 +20,7 @@ from mtplx.runtime import MTPLXRuntime, _streamed_mtp_backend, load
 
 SOURCE_REVISION = "b4734de4facf877f85769a911abafc5283eab3d9"
 MTP_HEAD_BYTES = 19_905_841_664
+MTP_Q4_HEAD_BYTES = 6_014_306_816
 HY3_MTP_HEAD_BYTES = 7_505_224_960
 
 
@@ -225,6 +226,7 @@ def test_glm52_streamed_dispatches_to_glm_family(
         args,
         *,
         expected_revision,
+        precision,
         verified_artifact,
     ):
         events.append(
@@ -233,6 +235,7 @@ def test_glm52_streamed_dispatches_to_glm_family(
                 Path(artifact_dir),
                 args,
                 expected_revision,
+                precision,
                 verified_artifact,
             )
         )
@@ -313,6 +316,118 @@ def test_glm52_streamed_dispatches_to_glm_family(
     assert events.index(tuple_events[1]) < events.index("allocate")
     assert events.index("open") < events.index("artifact-exit")
     assert events.index(injection) < events.index("artifact-exit")
+
+
+def _accept_glm_q4_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    artifacts: Path,
+    events: list[Any] | None = None,
+):
+    receipt = {
+        "schema": "mtplx-glm52-mtp-layer78-q4-v1",
+        "source": {"revision": SOURCE_REVISION},
+        "inventory": {"payload_bytes": MTP_Q4_HEAD_BYTES},
+    }
+    verified = SimpleNamespace(
+        root=artifacts.resolve(),
+        manifest=receipt,
+        file=io.BytesIO(b"verified-q4-artifact"),
+    )
+
+    @contextlib.contextmanager
+    def open_verified_q4(root: Path, *, deep: bool = True):
+        assert Path(root).resolve() == artifacts.resolve()
+        assert deep is True
+        if events is not None:
+            events.append("artifact-enter")
+        try:
+            yield verified
+        finally:
+            if events is not None:
+                events.append("artifact-exit")
+
+    monkeypatch.setattr(
+        "mtplx.glm52_mtp_artifact.open_verified_glm52_mtp_layer78_q4",
+        open_verified_q4,
+    )
+    monkeypatch.setattr(
+        "mtplx.glm52_mtp_artifact.open_verified_glm52_mtp_layer78",
+        lambda *_args, **_kwargs: pytest.fail("q4 load opened the BF16 artifact"),
+    )
+    return verified
+
+
+@pytest.mark.parametrize("model_key", ["glm52-expert-q2", "glm52-q4"])
+def test_glm52_streamed_q4_prices_and_builds_from_the_q4_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model_key: str,
+) -> None:
+    """precision=q4 opens the Q4 sibling and prices its (smaller) payload."""
+
+    root = _model_root(tmp_path)
+    artifacts = tmp_path / "mtp"
+    artifacts.mkdir()
+    events: list[Any] = []
+    model = _PlainTarget()
+    _patch_streamed_load_without_allocation(
+        monkeypatch,
+        model=model,
+        events=events,
+        model_key=model_key,
+    )
+    verified = _accept_glm_q4_artifact(monkeypatch, artifacts, events)
+    glm_args = SimpleNamespace()
+    prebuilt_mtp = SimpleNamespace(layers=[object()])
+    monkeypatch.setattr(
+        "mtplx.models.glm52_mlx.ModelArgs.from_dict",
+        lambda config: glm_args,
+    )
+    monkeypatch.setattr(
+        "mtplx.expert_runtime.apply_mlx_memory_cap",
+        lambda plan, **_kwargs: events.append(("memory-cap", plan)),
+    )
+    observed: dict[str, Any] = {}
+
+    def build_mtp(
+        artifact_dir,
+        args,
+        *,
+        expected_revision,
+        precision,
+        verified_artifact,
+    ):
+        observed["precision"] = precision
+        observed["verified_artifact"] = verified_artifact
+        return prebuilt_mtp
+
+    monkeypatch.setattr("mtplx.glm52_mtp_patch.build_glm52_mtp_module", build_mtp)
+    monkeypatch.setattr(
+        "mtplx.glm52_mtp_patch.inject_glm52_streamed_mtp_support",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr("mtplx.runtime.validate_mtp_support", lambda _model: True)
+
+    runtime = load(
+        root,
+        mtp=True,
+        expert_streaming_config=_streaming_config(model_key),
+        expert_manifest=root / "expert-manifest.json",
+        mtp_artifacts=artifacts,
+        mtp_precision="q4",
+    )
+
+    assert runtime.mtp_enabled is True
+    assert observed["precision"] == "q4"
+    assert observed["verified_artifact"] is verified
+    # The plan is priced from the Q4 artifact size (~5.6 GiB), not the 18.5
+    # GiB BF16 head: pricing follows the actual selected precision.
+    assert MTP_Q4_HEAD_BYTES < MTP_HEAD_BYTES
+    priced = {tuple(event.items())[0] for event in events if isinstance(event, dict)}
+    assert priced == {
+        ("planned_mtp_resident_bytes", MTP_Q4_HEAD_BYTES),
+        ("opened_mtp_resident_bytes", MTP_Q4_HEAD_BYTES),
+    }
 
 
 @pytest.mark.parametrize("model_key", ["glm52-expert-q2", "glm52-q4"])
@@ -512,6 +627,8 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
         *,
         expected_revision,
         precision,
+        shared_kernel,
+        shared_kernel_depth,
         verified_artifacts,
     ):
         events.append(
@@ -521,6 +638,8 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
                 args,
                 expected_revision,
                 precision,
+                shared_kernel,
+                shared_kernel_depth,
                 verified_artifacts,
             )
         )
@@ -536,6 +655,8 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
         *,
         expected_revision,
         mtp_precision,
+        shared_kernel,
+        shared_kernel_depth,
         mtp_module,
     ):
         events.append(
@@ -547,6 +668,8 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
                 contract,
                 expected_revision,
                 mtp_precision,
+                shared_kernel,
+                shared_kernel_depth,
                 mtp_module,
             )
         )
@@ -607,6 +730,8 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
         runtime.contract,
         "hy3-source-revision",
         "bf16",
+        "stock",
+        3,
         prebuilt_mtp,
     )
     assert tuple_events[1][-1] is verified
@@ -622,13 +747,16 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
 
 
 @pytest.mark.parametrize("model_key", ["glm52-expert-q2", "glm52-q4"])
-def test_glm52_streamed_accepts_bf16_only_before_target_allocation(
+def test_glm52_streamed_dispatches_bf16_and_q4_to_glm_backend(
     model_key: str,
 ) -> None:
+    # Both GLM lanes resolve to the glm52 backend for either head precision
+    # (issue #100): the Q4 sibling head is selectable, BF16 remains default.
     assert _streamed_mtp_backend(model_key, "bf16") == "glm52"
+    assert _streamed_mtp_backend(model_key, "q4") == "glm52"
 
-    with pytest.raises(RuntimeError, match="BF16"):
-        _streamed_mtp_backend(model_key, "q4")
+    with pytest.raises(RuntimeError, match="not supported"):
+        _streamed_mtp_backend(model_key, "fp8")
 
 
 @pytest.mark.parametrize("model_key", ["glm52-expert-q2", "glm52-q4"])

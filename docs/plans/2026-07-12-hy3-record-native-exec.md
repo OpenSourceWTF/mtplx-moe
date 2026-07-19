@@ -1,5 +1,7 @@
 # Hy3 Record-Native Sparse Execution Implementation Plan
 
+**Status: NOT IMPLEMENTED (verified 2026-07-18).** `mtplx/kernels/moe_record_q4.py`, `scripts/benchmark_hy3_record_q4.py`, and `tests/test_moe_record_q4.py` do not exist. Kept as a design record.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers-optimized:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Measure and, only if it wins, integrate a two-stage Hy3 affine-Q4 primitive that consumes the existing v1 expert record and reduces weighted top-8 down outputs directly.

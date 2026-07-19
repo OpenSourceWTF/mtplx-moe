@@ -125,6 +125,29 @@ def _stack_moe_experts(weights: dict[str, Any], prefix: str, n_routed_experts: i
             weights[f"{prefix}.mixer.switch_mlp.{target}.{leaf}"] = mx.stack(values)
 
 
+def _has_complete_nemotron_h_mtp_payload(
+    weights: dict[str, Any],
+    *,
+    physical_layers: int,
+) -> bool:
+    """Return true only when every Nemotron-H MTP layer has real weights.
+
+    A prefix-mismatched checkpoint still yields a non-empty ``mapped`` from
+    stray keys, and ``strict=False`` then loads nothing -- injection would
+    report success while the draft head stays randomly initialized. Only
+    ``norm`` and ``mixer`` are unconditional per block; enorm/hnorm/eh_proj
+    and final_layernorm depend on the block's position flags.
+    """
+
+    for local_idx in range(physical_layers):
+        prefix = f"layers.{local_idx}."
+        if f"{prefix}norm.weight" not in weights:
+            return False
+        if not any(key.startswith(f"{prefix}mixer.") for key in weights):
+            return False
+    return True
+
+
 def _rewrite_nemotron_h_mtp_weights(
     raw: dict[str, Any],
     *,
@@ -289,7 +312,9 @@ def inject_nemotron_h_mtp_support(
         start_layer=int(getattr(args, "num_hidden_layers")),
         physical_layers=len(mtp.layers),
     )
-    if not mapped:
+    if not mapped or not _has_complete_nemotron_h_mtp_payload(
+        mapped, physical_layers=len(mtp.layers)
+    ):
         logger.warning("[Nemotron-H MTP inject] No Nemotron-H MTP weights found in %s", model_path)
         return False
 

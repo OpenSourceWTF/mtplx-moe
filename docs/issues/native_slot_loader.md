@@ -28,7 +28,7 @@ do not exist yet.
 - `mtplx/expert_slots.py`
   - fixed per-layer slot tensors, slot-generation table, state transitions,
     and `ensure_route(...)` orchestration.
-- `tests/test_expert_io.py` and `tests/test_expert_slots.py`
+- `tests/test_expert_io_metrics.py` and `tests/test_expert_slots_runtime.py`
   - short reads, cancellation, races, reuse, eviction, and stale generation.
 
 Proposed boundary:

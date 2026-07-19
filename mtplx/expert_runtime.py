@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
@@ -39,9 +41,29 @@ from .expert_streaming_models import (
     ExpertStreamingModelSpec,
     get_model_spec,
     plan_expert_memory,
+    proj_quant_covers,
+    affine_quant_kept_bytes,
+)
+from .optimization_profiles import (
+    ENFORCEABLE_KNOBS,
+    not_applicable_violations,
 )
 from .resource_metrics import ExpertPipelineLedger, ExpertPipelineRoute
+from .belady_oracle import BeladyOracle
+from .route_census import (
+    ISLAND_PLACEMENT_FILENAME,
+    ROUTE_CENSUS_FILENAME,
+    RouteCensus,
+    RouteCensusError,
+    derive_placement,
+    load_census,
+    load_placement,
+    save_census,
+    save_placement,
+)
 
+
+_LOGGER = logging.getLogger(__name__)
 
 _MEMORY_RE = re.compile(r"^([0-9]+)([kmgt]i?b?|b)?$", re.IGNORECASE)
 
@@ -143,7 +165,33 @@ class ExpertStreamingConfig:
     q2_expert_kernel: str = "stock"
     hy3_router_kernel: str = "mpp-r1-fused-r2"
     hy3_router_sigmoid: str = "precise"
+    hy3_mtp_shared_kernel: str = "stock"
+    hy3_mtp_shared_kernel_depth: int = 3
     deferred_pin_release: bool = False
+    island_layers: tuple[int, ...] = ()
+    island_layer_count: int | None = None
+    mmap_island_layers: tuple[int, ...] = ()
+    banked_manifest: str | None = None
+    banked_codec: str = "none"
+    # Streamed compressed sidecar (issue #113): when "rans32x-v1", streamed
+    # miss reads pull per-record rANS containers and decode them in-kernel
+    # before slot residency -- fewer bytes/token off SSD at zero quality cost.
+    # "none" leaves every streamed read byte-unchanged.
+    streamed_codec: str = "none"
+    streamed_codec_manifest: str | None = None
+    # Post-decode sha256 of rANS-decoded records. Default ON until the 16k
+    # long-context validation passes (David 2026-07-17); the container's own
+    # structural guards remain regardless.
+    streamed_codec_verify: bool = True
+    mmap_island_wired: bool = True
+    proj_quant: str | None = None
+    kv_quant: str | None = None
+    split_route_release: str = "fenced"
+    prefetch_slots: int = 0
+    speculative_io_fraction: float = 0.25
+    route_census: bool = True
+    miss_shadow: str | None = None
+    miss_shadow_layers: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or not self.model_key:
@@ -204,6 +252,173 @@ class ExpertStreamingConfig:
             )
         if not isinstance(self.deferred_pin_release, bool):
             raise ValueError("deferred_pin_release must be bool")
+        if self.proj_quant not in {None, "q8", "q4"}:
+            raise ValueError("proj_quant must be None, 'q8', or 'q4'")
+        if self.kv_quant not in {None, "q8", "q4"}:
+            raise ValueError("kv_quant must be None, 'q8', or 'q4'")
+        if self.miss_shadow is not None:
+            if self.miss_shadow not in {"b1", "t158"}:
+                raise ValueError("miss_shadow must be None, 'b1', or 't158'")
+            if self.cache_scope != "layer":
+                raise ValueError("miss_shadow requires cache_scope 'layer'")
+            if self.slot_layout != "component-banks":
+                raise ValueError(
+                    "miss_shadow requires the component-banks slot layout"
+                )
+        if self.miss_shadow_layers is not None:
+            if self.miss_shadow is None:
+                raise ValueError(
+                    "miss_shadow_layers requires miss_shadow to be set"
+                )
+            object.__setattr__(
+                self,
+                "miss_shadow_layers",
+                _integer(
+                    "miss_shadow_layers", self.miss_shadow_layers, minimum=1
+                ),
+            )
+        if self.split_route_release not in {"fenced", "deferred"}:
+            raise ValueError(
+                "split_route_release must be 'fenced' or 'deferred'"
+            )
+        object.__setattr__(
+            self,
+            "prefetch_slots",
+            _integer("prefetch_slots", self.prefetch_slots, minimum=0),
+        )
+        if self.prefetch_slots and self.cache_scope != "layer":
+            raise ValueError("prefetch_slots require cache_scope 'layer'")
+        if isinstance(self.speculative_io_fraction, bool) or not isinstance(
+            self.speculative_io_fraction, (int, float)
+        ):
+            raise TypeError("speculative_io_fraction must be a number")
+        fraction = float(self.speculative_io_fraction)
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError("speculative_io_fraction must be in (0, 1]")
+        object.__setattr__(self, "speculative_io_fraction", fraction)
+        if self.island_layer_count is not None:
+            if self.island_layers:
+                raise ValueError(
+                    "island_layers and island_layer_count are mutually "
+                    "exclusive; give the count OR the explicit list"
+                )
+            count = _integer(
+                "island_layer_count", self.island_layer_count, minimum=1
+            )
+            object.__setattr__(self, "island_layer_count", count)
+            try:
+                spec = get_model_spec(self.model_key)
+            except ValueError:
+                # Unregistered model keys carry their spec into open()
+                # directly; count resolution defers there with the rest of
+                # the placement precedence chain.
+                spec = None
+            if spec is not None and spec.island_pin_order:
+                if count > len(spec.island_pin_order):
+                    raise ValueError(
+                        f"island_layer_count {count} exceeds the "
+                        f"{self.model_key} pin order "
+                        f"({len(spec.island_pin_order)} layers)"
+                    )
+                object.__setattr__(
+                    self,
+                    "island_layers",
+                    tuple(sorted(spec.island_pin_order[:count])),
+                )
+            # else: unresolved (island_layers stays empty while the count is
+            # set). resolve_island_placement() maps the count to layers from
+            # the model root's island-placement.json; precedence is explicit
+            # island_layers > spec.island_pin_order > placement file > error.
+        island_layers = self.island_layers
+        if isinstance(island_layers, (str, bytes)) or not isinstance(
+            island_layers, (tuple, list)
+        ):
+            raise TypeError("island_layers must be a tuple of layer indices")
+        normalized_islands = tuple(
+            sorted(
+                {
+                    _integer("island_layers entry", layer, minimum=0)
+                    for layer in island_layers
+                }
+            )
+        )
+        object.__setattr__(self, "island_layers", normalized_islands)
+        if normalized_islands:
+            if self.cache_scope != "layer":
+                raise ValueError("island_layers require cache_scope 'layer'")
+            if self.slot_layout != "component-banks":
+                raise ValueError(
+                    "island_layers require the component-banks slot layout"
+                )
+            if self.trace_routes:
+                raise ValueError(
+                    "island_layers execute without host route observation; "
+                    "trace_routes must be disabled"
+                )
+        if not isinstance(self.mmap_island_wired, bool):
+            raise TypeError("mmap_island_wired must be bool")
+        mmap_islands = self.mmap_island_layers
+        if isinstance(mmap_islands, (str, bytes)) or not isinstance(
+            mmap_islands, (tuple, list)
+        ):
+            raise TypeError("mmap_island_layers must be a tuple of layer indices")
+        normalized_mmap = tuple(
+            sorted(
+                {
+                    _integer("mmap_island_layers entry", layer, minimum=0)
+                    for layer in mmap_islands
+                }
+            )
+        )
+        object.__setattr__(self, "mmap_island_layers", normalized_mmap)
+        if self.banked_codec not in {"none", "rans32x-v1"}:
+            raise ValueError(
+                "banked_codec must be 'none' or 'rans32x-v1'"
+            )
+        if self.streamed_codec not in {"none", "rans32x-v1"}:
+            raise ValueError(
+                "streamed_codec must be 'none' or 'rans32x-v1'"
+            )
+        if not isinstance(self.streamed_codec_verify, bool):
+            raise TypeError("streamed_codec_verify must be bool")
+        if self.streamed_codec != "none":
+            if self.streamed_codec_manifest is None:
+                raise ValueError(
+                    "streamed_codec requires a streamed_codec_manifest path"
+                )
+            if self.slot_layout == "metal-mmap":
+                raise ValueError(
+                    "streamed_codec decodes compressed records into slots; it is "
+                    "incompatible with the metal-mmap zero-copy layout"
+                )
+        elif self.streamed_codec_manifest is not None:
+            raise ValueError(
+                "streamed_codec_manifest requires streamed_codec 'rans32x-v1'"
+            )
+        if normalized_mmap:
+            if self.banked_manifest is None:
+                raise ValueError(
+                    "mmap_island_layers require a banked_manifest path"
+                )
+            if self.cache_scope != "layer":
+                raise ValueError(
+                    "mmap_island_layers require cache_scope 'layer'"
+                )
+            if self.slot_layout != "component-banks":
+                raise ValueError(
+                    "mmap_island_layers require the component-banks slot layout"
+                )
+            if self.trace_routes:
+                raise ValueError(
+                    "mmap_island_layers execute without host route observation; "
+                    "trace_routes must be disabled"
+                )
+            overlap = set(normalized_mmap) & set(normalized_islands)
+            if overlap:
+                raise ValueError(
+                    "island_layers and mmap_island_layers must be disjoint; "
+                    f"both claim {sorted(overlap)}"
+                )
         if self.hy3_router_sigmoid not in {"precise", "fast"}:
             raise ValueError("hy3_router_sigmoid must be 'precise' or 'fast'")
         if (
@@ -213,6 +428,19 @@ class ExpertStreamingConfig:
             raise ValueError(
                 "fast router sigmoid is selectable only with mpp-row-owned-fused"
             )
+        if self.hy3_mtp_shared_kernel not in {"stock", "metal-exact"}:
+            raise ValueError(
+                "hy3_mtp_shared_kernel must be 'stock' or 'metal-exact'"
+            )
+        object.__setattr__(
+            self,
+            "hy3_mtp_shared_kernel_depth",
+            _integer(
+                "hy3_mtp_shared_kernel_depth",
+                self.hy3_mtp_shared_kernel_depth,
+                minimum=1,
+            ),
+        )
         if self.slot_layout not in {
             "direct-slots",
             "component-banks",
@@ -230,6 +458,7 @@ class ExpertStreamingConfig:
             "trace_routes",
             "bypass_page_cache",
             "resource_telemetry",
+            "route_census",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be bool")
@@ -275,7 +504,16 @@ class ExpertStreamingConfig:
         *,
         additional_resident_bytes: int = 0,
         live_kv_tokens: int | None = None,
+        resident_discount_bytes: int = 0,
     ) -> ExpertMemoryPlan:
+        if self.island_layer_count is not None and not self.island_layers:
+            raise ExpertStreamingConfigurationError(
+                f"island_layer_count {self.island_layer_count} is unresolved "
+                f"for {self.model_key}; resolve_island_placement() (or "
+                "ExpertStreamingRuntime.open) maps the count to layers. "
+                "Selection precedence: explicit island_layers > "
+                "spec.island_pin_order > island-placement.json > error"
+            )
         # File-backed Metal records use the OS page cache as their physical
         # tier and never consume fixed MLX expert slots. Retain only a tiny
         # unreachable transient pool so the generic runtime invariants and
@@ -311,7 +549,15 @@ class ExpertStreamingConfig:
             io_staging_bytes=self.io_staging_bytes,
             execution_workspace_bytes=self.execution_workspace_bytes,
             additional_resident_bytes=additional_resident_bytes,
+            resident_discount_bytes=resident_discount_bytes,
+            kv_quant=self.kv_quant,
             cache_scope=self.cache_scope,
+            island_layer_count=len(self.island_layers),
+            mmap_island_layer_count=len(self.mmap_island_layers),
+            mmap_islands_wired=self.mmap_island_wired,
+            prefetch_slots_per_layer=self.prefetch_slots,
+            miss_shadow=self.miss_shadow,
+            miss_shadow_layers=self.miss_shadow_layers,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1135,6 +1381,105 @@ def derived_expert_cache_allowance_bytes(plan: ExpertMemoryPlan) -> int:
     if available < 0:
         return available
     return min(plan.persistent_budget_bytes, available)
+def resolve_island_placement(
+    config: ExpertStreamingConfig,
+    root: Path | str,
+    *,
+    spec: ExpertStreamingModelSpec | None = None,
+) -> ExpertStreamingConfig:
+    """Resolve a pending island_layer_count into explicit island_layers.
+
+    Selection precedence: explicit ``island_layers`` >
+    ``spec.island_pin_order`` > ``<root>/island-placement.json`` (the
+    auto-census artifact, issue #98) > error. Idempotent: a config whose
+    count already resolved (or that requests no count) returns unchanged.
+    The placement file stores a budget-independent ranking, so this is the
+    only point where a count meets a concrete model root.
+    """
+
+    count = config.island_layer_count
+    if count is None or config.island_layers:
+        return config
+    model_spec = get_model_spec(config.model_key) if spec is None else spec
+    if model_spec.key != config.model_key:
+        raise ExpertStreamingConfigurationError(
+            "config and spec model keys differ"
+        )
+    placement_path = Path(root) / ISLAND_PLACEMENT_FILENAME
+    if model_spec.island_pin_order:
+        order = model_spec.island_pin_order
+        source = f"{model_spec.key} spec island_pin_order"
+    else:
+        if not placement_path.is_file():
+            raise ExpertStreamingConfigurationError(
+                f"island_layer_count {count} cannot be resolved for "
+                f"{model_spec.key}: the spec has no measured island pin "
+                f"order and {placement_path} does not exist. Selection "
+                "precedence: explicit island_layers > spec.island_pin_order "
+                f"> {ISLAND_PLACEMENT_FILENAME} (auto-census, issue #98) > "
+                "this error. Run the model once without islands — the "
+                "route census records decode routes and writes the "
+                "placement at close — or pass explicit island_layers."
+            )
+        try:
+            placement = load_placement(placement_path)
+        except RouteCensusError as exc:
+            raise ExpertStreamingConfigurationError(
+                f"island_layer_count {count} cannot be resolved: {exc}"
+            ) from exc
+        if placement.model_key != model_spec.key:
+            raise ExpertStreamingConfigurationError(
+                f"{placement_path} was derived for "
+                f"{placement.model_key!r}, not {model_spec.key!r}"
+            )
+        if placement.advisory:
+            _LOGGER.warning(
+                "island placement %s is advisory: derived from only %d "
+                "routed assignments; rankings may still be noise-ordered",
+                placement_path,
+                placement.census_total_routed_assignments,
+            )
+        order = placement.layer_pin_order
+        source = str(placement_path)
+    if count > len(order):
+        raise ExpertStreamingConfigurationError(
+            f"island_layer_count {count} exceeds the {model_spec.key} pin "
+            f"order from {source} ({len(order)} layers)"
+        )
+    try:
+        return dataclass_replace(
+            config,
+            island_layer_count=None,
+            island_layers=tuple(sorted(order[:count])),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ExpertStreamingConfigurationError(str(exc)) from exc
+
+
+def proj_quant_plan_discount(manifest: Any, proj_quant: str | None) -> int:
+    """Bytes the load-time resident quantization removes from the fixed side.
+
+    Computed per manifest tensor with the same scope predicate the loader
+    applies, so the plan prices the post-quantization footprint instead of
+    the stored BF16 one (kept bytes round up — the discount understates).
+    """
+
+    if not proj_quant:
+        return 0
+    discount = 0
+    for tensor in manifest.resident_tensors:
+        if tensor.dtype.upper() not in {"BF16", "BFLOAT16"}:
+            continue
+        name = tensor.tensor
+        if name.endswith(".weight"):
+            name = name[: -len(".weight")]
+        else:
+            continue
+        if proj_quant_covers(name):
+            discount += tensor.length - affine_quant_kept_bytes(
+                tensor.length, proj_quant
+            )
+    return discount
 
 
 def reconcile_mlx_memory_cap(
@@ -1144,12 +1489,39 @@ def reconcile_mlx_memory_cap(
 ) -> int:
     """Resolve the MLX-owned portion and reject a conflicting env cap."""
 
+    # A wired band is registered in MLX's residency set and counted by MLX
+    # memory accounting (it already sits on the plan's fixed side); only a
+    # paged band lives in the page cache outside the cap.
+    paged_band_bytes = (
+        0
+        if getattr(plan, "mmap_islands_wired", True)
+        else getattr(plan, "mmap_island_bytes", 0)
+    )
     mlx_limit = (
-        plan.total_limit_bytes - plan.runtime_reserve_bytes - plan.io_staging_bytes
+        plan.total_limit_bytes
+        - plan.runtime_reserve_bytes
+        - plan.io_staging_bytes
+        - paged_band_bytes
     )
     if mlx_limit <= 0:
         raise ExpertStreamingConfigurationError(
             "memory plan leaves no MLX allocation budget"
+        )
+    # A paged band's pages are the pager's first eviction victims. If MLX's
+    # buffer cache may balloon into them, every decode wave re-faults from
+    # SSD — fail fast instead. (Measured: 10.85 -> 2.77 tok/s under exactly
+    # this squeeze.)
+    wired_need = (
+        plan.fixed_bytes
+        - plan.runtime_reserve_bytes
+        - plan.io_staging_bytes
+        + plan.persistent_cache_bytes
+    )
+    if paged_band_bytes and mlx_limit < wired_need:
+        raise ExpertStreamingConfigurationError(
+            "MLX budget cannot hold the wired footprint next to the paged "
+            f"mmap island band: cap {mlx_limit} < wired need {wired_need}; "
+            "raise memory_limit_bytes or shrink the band"
         )
     source = os.environ if env is None else env
     existing = source.get("MTPLX_MEMORY_LIMIT_BYTES")
@@ -1263,6 +1635,11 @@ class ExpertStreamingRuntime:
             if config.cache_scope == "global"
             else None
         )
+        # Wired and mmap-banked islands share the routing contract: streamed
+        # route entry points reject both, and neither owns slot-pool state.
+        self.island_layer_set = frozenset(config.island_layers) | frozenset(
+            config.mmap_island_layers
+        )
         self._banks = (
             {}
             if self._global_bank is not None
@@ -1273,8 +1650,10 @@ class ExpertStreamingRuntime:
                     transient_slots=plan.transient_slots,
                     frequency_decay=config.frequency_decay,
                     cache_policy=config.cache_policy,
+                    prefetch_slots=plan.prefetch_slots_per_layer,
                 )
                 for layer in spec.routed_layer_indices
+                if layer not in self.island_layer_set
             }
         )
         if self._global_bank is not None:
@@ -1319,6 +1698,27 @@ class ExpertStreamingRuntime:
         self._cleanup_error_lock = threading.Lock()
         self._cleanup_error: BaseException | None = None
         self._mapped_expert_store: Any | None = None
+        self._island_store: Any | None = None
+        self._banked_island_store: Any | None = None
+        self._shadow_store: Any | None = None
+        self._shadow_serve_routes = 0
+        self._shadow_serve_assignments = 0
+        self._shadow_serve_experts = 0
+        # Decode-route census (issue #98): pure host-side counters, flushed
+        # to the model root at close(). Never touches routing or numerics.
+        self._census_lock = threading.Lock()
+        self._route_census = (
+            RouteCensus(spec.key) if config.route_census else None
+        )
+        # Runtime Belady oracle (diagnostic, env MTPLX_BELADY_ORACLE=1): the
+        # eviction-ceiling analog of the census. Records decode routes for
+        # streamed layers and reports the clairvoyant fetch floor at snapshot.
+        # Zero cost when unset; never touches the decode data path.
+        self._belady_oracle = (
+            BeladyOracle(island_layers=self.island_layer_set)
+            if BeladyOracle.enabled()
+            else None
+        )
         self._route_trace_lock = threading.Lock()
         self._route_trace: list[dict[str, Any]] = []
         self._route_trace_epoch = 0
@@ -1329,6 +1729,58 @@ class ExpertStreamingRuntime:
         self._split_executor = ThreadPoolExecutor(
             max_workers=max(1, plan.transient_slots),
             thread_name_prefix="mtplx-route-miss",
+        )
+        # Speculative ring loads run off the route-miss executor so a
+        # prediction burst can never starve a real miss read.
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_futures: set[Future] = set()
+        # Settled speculative loads awaiting publication, per layer.
+        # Workers only enqueue here; the generation thread applies them
+        # at its next prefetch_experts call for the layer.
+        self._prefetch_completions: dict[
+            int, list[tuple[int, int | None, bool]]
+        ] = {}
+        # Each layer's most recent route-plan misses (updated under the
+        # layer lock): their bytes are streaming in on the demand path or
+        # freshly transient-resident, so predicting them again would only
+        # duplicate the read.
+        self._recent_route_misses: dict[int, frozenset[int]] = {}
+        # Sustained decode can predict faster than the executor reads.
+        # Without a ceiling the queue grows without bound: every queued
+        # load is stale by the time it runs (its assignment recycled many
+        # times over), reads are wasted, and reset/close must drain the
+        # whole backlog. Beyond this ceiling prefetch_experts plans
+        # nothing — speculation is best-effort.
+        self._prefetch_backlog_limit = 4 * max(
+            1, plan.prefetch_slots_per_layer
+        )
+        # Speculative I/O admission: speculation may occupy at most a
+        # configured fraction of the inflight read budget, so a demand
+        # miss read never queues behind a burst of predictions at the
+        # SSD. Concurrency floors at one read (speculation is throttled,
+        # never starved) and the ring width still bounds it above.
+        if config.prefetch_slots > 0:
+            inflight_budget = (
+                config.max_inflight_io_bytes
+                if config.max_inflight_io_bytes is not None
+                else slots.max_inflight_io_bytes
+            )
+            budget_reads = int(
+                inflight_budget * config.speculative_io_fraction
+            ) // max(1, spec.expert_record_bytes)
+            self._prefetch_max_reads = max(
+                1,
+                min(budget_reads, max(1, plan.prefetch_slots_per_layer)),
+            )
+        else:
+            self._prefetch_max_reads = 0
+        self._prefetch_executor = (
+            ThreadPoolExecutor(
+                max_workers=self._prefetch_max_reads,
+                thread_name_prefix="mtplx-prefetch",
+            )
+            if config.prefetch_slots > 0
+            else None
         )
 
     @classmethod
@@ -1350,8 +1802,87 @@ class ExpertStreamingRuntime:
         model_spec = get_model_spec(config.model_key) if spec is None else spec
         if model_spec.key != config.model_key:
             raise ExpertStreamingConfigurationError("config and spec model keys differ")
+        # Optimization-profile enforcement (issue #99): knobs the profile
+        # marks not_applicable fail loudly when explicitly forced. This
+        # generalizes resident_loader's _verify_kv_quant_honored probe to
+        # config time — pure config inspection, no new runtime probes.
+        profile_violations = not_applicable_violations(
+            config.model_key,
+            {knob: getattr(config, knob, None) for knob in ENFORCEABLE_KNOBS},
+        )
+        if profile_violations:
+            raise ExpertStreamingConfigurationError(
+                "; ".join(profile_violations)
+            )
+        config = resolve_island_placement(config, artifact_root, spec=model_spec)
+        if getattr(model_spec, "expert_codec", "affine") != "affine":
+            # q1 (shadow-codec) artifacts (issue #51): records are packed
+            # sign/trit words plus one bf16 scale, executed through
+            # shadow_gather_mm. Only the component-banks streamed dispatch
+            # carries the codec branch (gate 4). The direct-slot, mapped,
+            # and dense-island dispatches all assume the affine triple and
+            # would silently misread the record, so reject them loudly.
+            if config.slot_layout != "component-banks":
+                raise ExpertStreamingConfigurationError(
+                    f"{model_spec.key} is a q1 ({model_spec.expert_codec}) "
+                    "shadow-codec artifact; it requires the component-banks "
+                    f"slot layout, not {config.slot_layout!r}"
+                )
+            if config.miss_shadow is not None:
+                raise ExpertStreamingConfigurationError(
+                    "miss_shadow shadows an exact affine artifact with a "
+                    f"low-precision bank; a q1 ({model_spec.expert_codec}) "
+                    "artifact is already a shadow codec, so shadowing it is "
+                    "nonsense — set miss_shadow to None on a q1-primary spec"
+                )
+            if config.island_layers or config.mmap_island_layers:
+                raise ExpertStreamingConfigurationError(
+                    "dense-island execution dispatches through the affine "
+                    "gather kernel; q1 shadow-codec artifacts cannot serve "
+                    "island or mmap-island layers"
+                )
         manifest = load_expert_manifest(manifest_path)
         cls._validate_manifest_identity(manifest, model_spec)
+        if config.island_layers and not set(config.island_layers) <= set(
+            model_spec.routed_layer_indices
+        ):
+            raise ExpertStreamingConfigurationError(
+                "island_layers must be routed layers of "
+                f"{model_spec.key}: {sorted(model_spec.routed_layer_indices)[:3]}"
+                f"..{sorted(model_spec.routed_layer_indices)[-1]}"
+            )
+        if config.mmap_island_layers:
+            if not set(config.mmap_island_layers) <= set(
+                model_spec.routed_layer_indices
+            ):
+                raise ExpertStreamingConfigurationError(
+                    "mmap_island_layers must be routed layers of "
+                    f"{model_spec.key}"
+                )
+            from mtplx.expert_banked import (
+                BankedManifestError,
+                load_banked_manifest,
+            )
+
+            try:
+                banked = load_banked_manifest(Path(config.banked_manifest))
+            except BankedManifestError as exc:
+                raise ExpertStreamingConfigurationError(
+                    f"banked manifest is unusable: {exc}"
+                ) from exc
+            uncovered = sorted(
+                set(config.mmap_island_layers) - banked.layer_set
+            )
+            if uncovered:
+                raise ExpertStreamingConfigurationError(
+                    f"banked manifest does not cover mmap island layers "
+                    f"{uncovered}"
+                )
+            if banked.expert_count != model_spec.expert_count:
+                raise ExpertStreamingConfigurationError(
+                    f"banked manifest holds {banked.expert_count} experts per "
+                    f"layer; {model_spec.key} routes {model_spec.expert_count}"
+                )
         integrity_report = None
         if config.verify_artifact_headers or config.verify_sidecar_hash_at_open:
             if config.verify_sidecar_hash_at_open and manifest.sidecar is None:
@@ -1366,6 +1897,9 @@ class ExpertStreamingRuntime:
         plan = config.memory_plan(
             model_spec,
             additional_resident_bytes=additional_resident_bytes,
+            resident_discount_bytes=proj_quant_plan_discount(
+                manifest, config.proj_quant
+            ),
         )
         if not plan.fits_fixed:
             raise ExpertStreamingConfigurationError(
@@ -1376,6 +1910,29 @@ class ExpertStreamingRuntime:
             if apply_memory_cap
             else None
         )
+        codec_sidecar = None
+        if config.streamed_codec != "none":
+            from mtplx.expert_streamed_codec import (
+                StreamedCodecError,
+                load_streamed_codec_manifest,
+                validate_against_base,
+            )
+
+            codec_manifest_path = Path(config.streamed_codec_manifest)
+            if not codec_manifest_path.is_absolute():
+                codec_manifest_path = artifact_root / codec_manifest_path
+            try:
+                codec_sidecar = load_streamed_codec_manifest(codec_manifest_path)
+                if codec_sidecar.codec != config.streamed_codec:
+                    raise StreamedCodecError(
+                        f"streamed codec sidecar codec {codec_sidecar.codec!r} "
+                        f"does not match config {config.streamed_codec!r}"
+                    )
+                validate_against_base(codec_sidecar, manifest)
+            except StreamedCodecError as exc:
+                raise ExpertStreamingConfigurationError(
+                    f"streamed codec sidecar is unusable: {exc}"
+                ) from exc
         pipeline_ledger = _pipeline_ledger_for_config(config)
         pipeline_kwargs = (
             {} if pipeline_ledger is None else {"pipeline_ledger": pipeline_ledger}
@@ -1385,6 +1942,8 @@ class ExpertStreamingRuntime:
             max_open_files=config.max_open_files,
             max_read_chunk_bytes=config.max_read_chunk_bytes,
             bypass_page_cache=config.bypass_page_cache,
+            codec_sidecar=codec_sidecar,
+            codec_verify=config.streamed_codec_verify,
             **pipeline_kwargs,
         )
         try:
@@ -1403,12 +1962,15 @@ class ExpertStreamingRuntime:
                 device_synchronize=device_synchronize,
                 cache_scope=config.cache_scope,
                 resource_telemetry=config.resource_telemetry,
+                island_layers=(
+                    config.island_layers + config.mmap_island_layers
+                ),
                 **pipeline_kwargs,
             )
         except Exception:
             reader.close()
             raise
-        return cls(
+        runtime = cls(
             artifact_root,
             model_spec,
             config,
@@ -1420,6 +1982,52 @@ class ExpertStreamingRuntime:
             integrity_report=integrity_report,
             **pipeline_kwargs,
         )
+        if config.miss_shadow is not None:
+            from mtplx.expert_shadow import ShadowBankStore
+
+            try:
+                streamed_layers = tuple(
+                    layer
+                    for layer in model_spec.routed_layer_indices
+                    if layer not in runtime.island_layer_set
+                )
+                if config.miss_shadow_layers is not None:
+                    # Worst layers first: pin-order-first streamed layers
+                    # route flattest, so their exact-cache hit rate is
+                    # lowest and shadows displace the most stall time.
+                    streamed_set = set(streamed_layers)
+                    ranked = [
+                        layer
+                        for layer in model_spec.island_pin_order
+                        if layer in streamed_set
+                    ]
+                    ranked += [
+                        layer for layer in streamed_layers if layer not in ranked
+                    ]
+                    streamed_layers = tuple(
+                        sorted(ranked[: config.miss_shadow_layers])
+                    )
+                # The store constructor is the loud fence: it rejects a plan
+                # whose shadow pricing does not match this codec/layer set.
+                shadow_store = ShadowBankStore(
+                    model_spec,
+                    streamed_layers,
+                    codec=config.miss_shadow,
+                    plan=plan,
+                )
+                shadow_store.fill(
+                    manifest,
+                    artifact_root,
+                    verify_hash=(
+                        config.verify_record_hashes
+                        and not config.verify_sidecar_hash_at_open
+                    ),
+                )
+                runtime._shadow_store = shadow_store
+            except BaseException:
+                runtime.close()
+                raise
+        return runtime
 
     @staticmethod
     def _validate_manifest_identity(
@@ -1550,6 +2158,15 @@ class ExpertStreamingRuntime:
                 skipped.add((layer, expert))
                 continue
             bank.invalidate_expert(layer, expert)
+    def _reject_island_layer(self, layer: int) -> None:
+        # Island layers execute dense against their own full-resident bank;
+        # reaching the streamed route machinery for one is a wiring bug, not
+        # a runtime condition to fall back from.
+        if layer in self.island_layer_set:
+            raise ExpertStreamingConfigurationError(
+                f"layer {layer} is a dense island layer; streamed routing is "
+                "not available for it"
+            )
 
     def admit_kv_tokens(self, tokens: int) -> KVAdmission:
         # Lifecycle order is close -> slot/runtime health -> KV accounting.
@@ -1721,6 +2338,7 @@ class ExpertStreamingRuntime:
             raise ExpertSlotError("expert streaming runtime is closed")
         if self._closing:
             raise ExpertSlotError("expert streaming runtime is closing")
+        self._reject_island_layer(layer)
         try:
             lock = self._layer_locks[layer]
         except KeyError as exc:
@@ -1870,7 +2488,17 @@ class ExpertStreamingRuntime:
                 expert_ids,
                 phase=phase,
             )
-        return self._banks[layer].plan_transaction(expert_ids, phase=phase)
+        plan, policy_txn = self._banks[layer].plan_transaction(
+            expert_ids, phase=phase
+        )
+        # Advisory record for the speculative lane (caller holds the layer
+        # lock): the demand path is about to stream these records, so
+        # predicting them again would duplicate the read. An all-hit plan
+        # clears the record — its previous misses are resident by now.
+        self._recent_route_misses[layer] = frozenset(
+            load.expert for load in plan.loads
+        )
+        return plan, policy_txn
 
     def _invalidate_policy_expert(self, layer: int, expert: int) -> int | None:
         if self._global_bank is not None:
@@ -2060,6 +2688,7 @@ class ExpertStreamingRuntime:
             raise ExpertSlotError("expert streaming runtime is closed")
         if self._closing:
             raise ExpertSlotError("expert streaming runtime is closing")
+        self._reject_island_layer(layer)
         try:
             lock = self._layer_locks[layer]
         except KeyError as exc:
@@ -2228,10 +2857,43 @@ class ExpertStreamingRuntime:
         *,
         token_count: int,
     ) -> None:
-        if not self.config.trace_routes:
+        census = self._route_census
+        if (
+            census is None
+            and not self.config.trace_routes
+            and self._belady_oracle is None
+        ):
             return
         normalized_phase = RoutingPhase(phase)
         routed_experts = [int(expert) for expert in expert_ids]
+        if (
+            self._belady_oracle is not None
+            and normalized_phase is RoutingPhase.DECODE
+        ):
+            # Diagnostic only; the oracle self-excludes island layers. Failure
+            # disables it for the session rather than perturbing decode.
+            try:
+                with self._census_lock:
+                    self._belady_oracle.observe(layer, routed_experts)
+            except Exception:
+                self._belady_oracle = None
+        if census is not None and normalized_phase is RoutingPhase.DECODE:
+            # Placement census: decode routes only (prefill routing shape
+            # does not predict the decode hot set). Accumulation is pure
+            # host-side counting; any failure disables the census for the
+            # session rather than perturbing the decode path.
+            try:
+                with self._census_lock:
+                    census.observe(layer, routed_experts)
+            except Exception:
+                self._route_census = None
+                _LOGGER.warning(
+                    "route census recording failed; census disabled for "
+                    "this session",
+                    exc_info=True,
+                )
+        if not self.config.trace_routes:
+            return
         with self._route_trace_lock:
             entry = {
                 "layer": int(layer),
@@ -2264,6 +2926,7 @@ class ExpertStreamingRuntime:
         layer: int,
         expert_ids: Iterable[int],
     ) -> tuple[int, ...]:
+        self._reject_island_layer(layer)
         try:
             lock = self._layer_locks[layer]
         except KeyError as exc:
@@ -2276,10 +2939,259 @@ class ExpertStreamingRuntime:
                 return self._global_bank.prepare_prefill_seed(layer, expert_ids)
             return self._banks[layer].prepare_prefill_seed(expert_ids)
 
+    def shadow_bank_for_layer(self, layer: int) -> Any | None:
+        """The layer's shadow miss-fallback bank, or None when disabled."""
+
+        store = self._shadow_store
+        if store is None:
+            return None
+        try:
+            return store.bank_for_layer(layer)
+        except Exception:
+            return None
+
+    def peek_resident_experts(
+        self, layer: int, expert_ids: Iterable[int]
+    ) -> frozenset[int]:
+        """Which of ``expert_ids`` are hit-eligible right now (no pinning).
+
+        A snapshot, not a reservation: residency can change between this
+        peek and a subsequent route, in which case the route machinery
+        simply services the expert exactly (slower, never wrong).
+        """
+
+        bank = self._banks.get(layer)
+        if bank is None:
+            return frozenset()
+        lock = self._layer_locks[layer]
+        with lock:
+            return bank.published_experts(expert_ids)
+
+    def note_shadow_serve(
+        self, layer: int, *, assignments: int, experts: int
+    ) -> None:
+        with self._counter_lock:
+            self._shadow_serve_routes += 1
+            self._shadow_serve_assignments += int(assignments)
+            self._shadow_serve_experts += int(experts)
+
+    @property
+    def speculation_saturated(self) -> bool:
+        """True when the speculative lane should not take more predictions.
+
+        The lookahead hook consults this before spending router compute
+        and between per-layer issues, so under admission pressure the
+        farther (lower-overlap) lookahead layers are dropped first.
+        """
+
+        if self._prefetch_executor is None:
+            return True
+        with self._prefetch_lock:
+            return len(self._prefetch_futures) >= self._prefetch_backlog_limit
+
+    def prefetch_experts(self, layer: int, expert_ids: Iterable[int]) -> int:
+        """Speculatively load predicted experts into the layer's ring tier.
+
+        Returns the number of asynchronous loads issued. Zero when prefetch
+        is disabled, the layer is an island or unrouted, or every prediction
+        is already resident, published, or inflight. Completed loads are
+        NOT published by their worker callbacks — they queue, and this
+        call batch-applies them under the layer lock it already holds, so
+        workers never touch layer locks. An empty ``expert_ids`` is a pure
+        flush. A failed load only invalidates its ring assignment —
+        speculation never marks the runtime unhealthy.
+        """
+
+        if self.config.prefetch_slots <= 0:
+            return 0
+        if layer in self.island_layer_set:
+            return 0
+        bank = self._banks.get(layer)
+        if bank is None:
+            return 0
+        if self._closed or self._closing:
+            return 0
+        executor = self._prefetch_executor
+        if executor is None:
+            return 0
+        lock = self._layer_locks[layer]
+        # Never block the generation thread on a layer transaction: under
+        # deferred split-route release the previous token's pending split
+        # holds this lock until the next covering-eval flush, and that
+        # flush runs on the very thread calling here. Speculation is
+        # best-effort — skip the step instead of waiting.
+        if not lock.acquire(blocking=False):
+            return 0
+        try:
+            self._apply_prefetch_completions(layer, bank)
+            with self._prefetch_lock:
+                backlog = len(self._prefetch_futures)
+            if backlog >= self._prefetch_backlog_limit:
+                return 0
+            recent_misses = self._recent_route_misses.get(layer)
+            if recent_misses:
+                expert_ids = [
+                    expert
+                    for expert in expert_ids
+                    if expert not in recent_misses
+                ]
+            loads = bank.plan_prefetch(expert_ids)
+            # Assignment tickets bind each load's completion to the exact
+            # assignment it filled: the same expert can be recycled and
+            # re-assigned while a callback is still queued, and that stale
+            # callback must not publish (or retire) the newer assignment.
+            tickets = {
+                load.expert: bank.prefetch_ticket(load.expert)
+                for load in loads
+            }
+        finally:
+            lock.release()
+        issued = 0
+        for load in loads:
+            try:
+                future = executor.submit(
+                    self._run_speculative_load,
+                    layer,
+                    load,
+                    tickets[load.expert],
+                )
+            except RuntimeError:
+                # The executor shut down mid-flight; forget the assignment
+                # so a later plan_prefetch can reuse the ring slot.
+                with lock:
+                    bank.invalidate_prefetch(
+                        load.expert,
+                        ticket=tickets[load.expert],
+                    )
+                continue
+            with self._prefetch_lock:
+                self._prefetch_futures.add(future)
+            future.add_done_callback(
+                lambda completed, layer=layer, expert=load.expert, ticket=(
+                    tickets[load.expert]
+                ): self._finish_prefetch_load(layer, expert, ticket, completed)
+            )
+            issued += 1
+        if issued:
+            with self._counter_lock:
+                self.counters.prefetch_issued += issued
+                self._layer_counters[layer].prefetch_issued += issued
+        return issued
+
+    def _run_speculative_load(
+        self,
+        layer: int,
+        load: Any,
+        ticket: int | None,
+    ) -> None:
+        """Read one predicted expert unless its assignment already recycled.
+
+        A load can sit in the executor queue while later plan_prefetch
+        calls recycle its ring assignment; performing the read anyway
+        would waste SSD bandwidth on bytes whose ticketed commit is
+        guaranteed to be refused. The check is advisory — recycling after
+        it is still caught by the ticket at commit time.
+        """
+
+        bank = self._banks.get(layer)
+        lock = self._layer_locks.get(layer)
+        if bank is None or lock is None:
+            return
+        # Advisory only, so never block a worker on a route-held layer
+        # lock: when the lock is contended just perform the read — a
+        # recycled assignment's bytes are refused at commit time anyway.
+        if lock.acquire(blocking=False):
+            try:
+                live = bank.prefetch_ticket(load.expert) == ticket
+            finally:
+                lock.release()
+            if not live:
+                return
+        self.slots.load_speculative(layer, load)
+
+    def _finish_prefetch_load(
+        self,
+        layer: int,
+        expert: int,
+        ticket: int | None,
+        future: Future,
+    ) -> None:
+        """Record a settled load; never touch banks or layer locks here.
+
+        This runs on a prefetch worker. Publication happens on the
+        generation thread at its next ``prefetch_experts`` call for the
+        layer (``_apply_prefetch_completions``), under the layer lock it
+        already holds — a route-held lock therefore cannot hold a worker
+        captive (measured: a 5 ms route hold turned a 34 us
+        issue-to-publish path into 7.6 ms of captive-worker convoy).
+        """
+
+        with self._prefetch_lock:
+            self._prefetch_futures.discard(future)
+        try:
+            future.result()
+        except BaseException:
+            succeeded = False
+        else:
+            succeeded = True
+        with self._prefetch_lock:
+            self._prefetch_completions.setdefault(layer, []).append(
+                (expert, ticket, succeeded)
+            )
+
+    def _apply_prefetch_completions(self, layer: int, bank: Any) -> None:
+        """Publish settled loads for one layer; caller holds its lock.
+
+        Ticketed commits keep the settled-tenant invariant: an assignment
+        stays inflight (and its slot unrecyclable) until applied here, so
+        publication still implies the physical slot holds the expert's
+        bytes.
+        """
+
+        with self._prefetch_lock:
+            completions = self._prefetch_completions.pop(layer, None)
+        if not completions:
+            return
+        committed = 0
+        for expert, ticket, succeeded in completions:
+            if succeeded:
+                if bank.commit_prefetch(expert, ticket=ticket):
+                    committed += 1
+            else:
+                bank.invalidate_prefetch(expert, ticket=ticket)
+        if committed:
+            with self._counter_lock:
+                self.counters.prefetch_committed += committed
+                self._layer_counters[layer].prefetch_committed += committed
+
+    def _drain_prefetch_loads(self) -> None:
+        """Wait out in-flight speculative loads (bounded single-record reads).
+
+        Reset and close call this before touching pool or bank state, then
+        discard the settled-but-unapplied completions: their assignments
+        die with the bank state, and applying them later would only be a
+        chain of ticket-refused no-ops.
+        """
+
+        with self._prefetch_lock:
+            pending = tuple(self._prefetch_futures)
+        for future in pending:
+            try:
+                future.result()
+            except BaseException:
+                pass
+        with self._prefetch_lock:
+            self._prefetch_completions.clear()
+
     def reset(self) -> None:
         # Deferred pin releases must flush (with a covering fence) before the
         # pool resets, or reset waits forever on the final routes' pins.
         self.flush_deferred_slot_releases(evaluate=True)
+        # Straggler speculative loads hold pool lifecycle claims; without
+        # this drain the pool reset below would reject them as active
+        # routes. The bank reset then retires any not-yet-committed
+        # assignment, so a late commit callback publishes nothing.
+        self._drain_prefetch_loads()
         locks = tuple(dict.fromkeys(self._layer_locks.values()))
         for lock in locks:
             lock.acquire()
@@ -2291,6 +3203,7 @@ class ExpertStreamingRuntime:
             else:
                 for bank in self._banks.values():
                     bank.reset()
+            self._recent_route_misses.clear()
             with self._counter_lock:
                 self.counters = CacheCounters()
                 self._layer_counters = {
@@ -2345,6 +3258,7 @@ class ExpertStreamingRuntime:
         slots = self.slots.snapshot()
         snapshot = {
             "model_key": self.spec.key,
+            "expert_codec": self.spec.expert_codec,
             "manifest_sha256": self.manifest.manifest_sha256,
             "memory_plan": {
                 "total_limit_bytes": self.plan.total_limit_bytes,
@@ -2360,6 +3274,8 @@ class ExpertStreamingRuntime:
                 "transient_slots": self.plan.transient_slots,
                 "allocated_bytes": self.plan.allocated_bytes,
                 "unallocated_bytes": self.plan.unallocated_bytes,
+                "miss_shadow": self.plan.miss_shadow,
+                "shadow_bytes": self.plan.shadow_bytes,
             },
             "expert_cache_policy": {
                 "derived": self._derived_cache_policy,
@@ -2383,6 +3299,17 @@ class ExpertStreamingRuntime:
             "incremental_misses": incremental_misses,
             "slots": slots,
         }
+        if self._belady_oracle is not None:
+            # The clairvoyant fetch floor over the full decode window, at the
+            # actual per-layer slot budget — the runtime analog of the offline
+            # replay, reported alongside the measured loads for a live gap.
+            try:
+                with self._census_lock:
+                    snapshot["belady_oracle"] = self._belady_oracle.report(
+                        self.plan.slots_per_layer
+                    )
+            except Exception:
+                pass
         if self._global_bank is not None:
             snapshot["global_cache"] = {
                 **self._global_bank.snapshot(),
@@ -2393,6 +3320,26 @@ class ExpertStreamingRuntime:
             }
         if self._mapped_expert_store is not None:
             snapshot["mapped_experts"] = self._mapped_expert_store.snapshot()
+        if self._island_store is not None:
+            snapshot["island_experts"] = self._island_store.snapshot()
+        if self._banked_island_store is not None:
+            snapshot["banked_island_experts"] = (
+                self._banked_island_store.snapshot()
+            )
+        if self._shadow_store is not None:
+            shadow = self._shadow_store.snapshot()
+            with self._counter_lock:
+                shadow["serve_routes"] = self._shadow_serve_routes
+                shadow["served_assignments"] = self._shadow_serve_assignments
+                shadow["served_experts"] = self._shadow_serve_experts
+            snapshot["shadow_experts"] = shadow
+        snapshot["speculative_io"] = {
+            "fraction": self.config.speculative_io_fraction,
+            "max_concurrent_reads": self._prefetch_max_reads,
+            "max_inflight_bytes": (
+                self._prefetch_max_reads * self.spec.expert_record_bytes
+            ),
+        }
         if self._pipeline_ledger is not None:
             snapshot["expert_pipeline"] = self._pipeline_ledger.snapshot()
         self._raise_if_unhealthy()
@@ -2437,6 +3384,69 @@ class ExpertStreamingRuntime:
             snapshot["expert_pipeline"] = self._pipeline_ledger.snapshot()
         return snapshot
 
+    def _flush_route_census(self) -> None:
+        """Merge session decode counts to disk and re-derive the placement.
+
+        Runs once, off the decode path, at close(). Merges into any
+        existing ``route-census.json`` (windowed decay lives in
+        ``RouteCensus.merge``) and rewrites ``island-placement.json`` from
+        the merged census. Every write is atomic (tempfile + rename) and
+        best-effort: failures log and never fail close(). ``reset()``
+        deliberately does not clear the census — it is session-scoped
+        diagnostic state, not routing policy.
+        """
+
+        with self._census_lock:
+            census = self._route_census
+            self._route_census = None
+        if census is None or census.total_routed_assignments == 0:
+            return
+        try:
+            updated_at = datetime.now(timezone.utc).isoformat(
+                timespec="seconds"
+            )
+            census_path = self.root / ROUTE_CENSUS_FILENAME
+            merged = census
+            if census_path.is_file():
+                try:
+                    existing = load_census(census_path)
+                except RouteCensusError:
+                    _LOGGER.warning(
+                        "existing %s is unusable; rebuilding from this "
+                        "session's census",
+                        census_path,
+                        exc_info=True,
+                    )
+                else:
+                    if existing.model_key == census.model_key:
+                        existing.merge(census)
+                        merged = existing
+                    else:
+                        _LOGGER.warning(
+                            "existing %s belongs to %r, not %r; rebuilding",
+                            census_path,
+                            existing.model_key,
+                            census.model_key,
+                        )
+            save_census(merged, census_path, updated_at=updated_at)
+            placement = derive_placement(
+                merged,
+                expert_count=self.spec.expert_count,
+                slots_per_layer_hint=(
+                    self.plan.slots_per_layer or self.spec.top_k
+                ),
+            )
+            save_placement(
+                placement,
+                self.root / ISLAND_PLACEMENT_FILENAME,
+                updated_at=updated_at,
+            )
+        except Exception:
+            _LOGGER.warning(
+                "route census flush failed; placement artifacts unchanged",
+                exc_info=True,
+            )
+
     def close(self, *, timeout: float | None = None) -> None:
         self.flush_deferred_slot_releases(evaluate=True)
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -2463,6 +3473,15 @@ class ExpertStreamingRuntime:
                 self._raise_cleanup_error()
                 return
             self._closing = True
+            # In-flight speculative loads hold pool lifecycle claims; drain
+            # them (and stop accepting more) before the pool close waits on
+            # active routes.
+            self._drain_prefetch_loads()
+            if self._prefetch_executor is not None:
+                self._prefetch_executor.shutdown(
+                    wait=deadline is None,
+                    cancel_futures=True,
+                )
             slots_error: BaseException | None = None
             try:
                 self.slots.close(timeout=remaining)
@@ -2477,6 +3496,13 @@ class ExpertStreamingRuntime:
             if self._mapped_expert_store is not None:
                 self._mapped_expert_store.close()
                 self._mapped_expert_store = None
+            if self._island_store is not None:
+                self._island_store.close()
+                self._island_store = None
+            if self._banked_island_store is not None:
+                self._banked_island_store.close()
+                self._banked_island_store = None
+            self._flush_route_census()
             self._closed = True
             self._closing = False
             if slots_error is not None:

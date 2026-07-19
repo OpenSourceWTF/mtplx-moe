@@ -1290,6 +1290,31 @@ def build_parser() -> argparse.ArgumentParser:
         default="direct-slots",
     )
     parser.add_argument(
+        "--streamed-codec",
+        choices=["none", "rans32x-v1"],
+        default="none",
+        help=(
+            "Streamed miss-read codec (issue #113). 'rans32x-v1' reads per-record "
+            "rANS containers from --streamed-codec-manifest and decodes them "
+            "in-kernel before slot residency; 'none' reads records uncompressed."
+        ),
+    )
+    parser.add_argument(
+        "--no-streamed-codec-verify",
+        action="store_true",
+        help=(
+            "Skip the post-decode sha256 of rANS-decoded records (the "
+            "container's structural guards still apply). Default: verify, "
+            "until the 16k long-context validation flips the default."
+        ),
+    )
+    parser.add_argument(
+        "--streamed-codec-manifest",
+        type=Path,
+        default=None,
+        help="StreamedCodecManifest JSON for --streamed-codec rans32x-v1.",
+    )
+    parser.add_argument(
         "--verified-sidecar",
         action="store_true",
         help="Verify the full sidecar once at open, then skip repeated record hashes.",
@@ -1345,8 +1370,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("bf16", "q4"),
         help=(
             "External NextN head precision (default bf16). bf16 loads the "
-            "bit-exact BF16 head (~7.5 GB resident; quantized MTP heads "
-            "collapse acceptance, docs/FORGE_BACKEND_CONTRACT.md section 6) "
+            "bit-exact BF16 head (~7.5 GB resident; quantizing the head costs "
+            "acceptance, never correctness) "
             "- budget it against --expert-cache-limit. q4 loads the pinned "
             "Hy3 quantized artifacts (~1.94 GiB expert bank); GLM-5.2 supports "
             "BF16 only. Requires --enable-mtp."
@@ -1914,6 +1939,13 @@ def _main() -> int:
         max_read_chunk_bytes=parse_memory_bytes(args.read_chunk),
         bypass_page_cache=args.f_nocache,
         slot_layout=args.slot_layout,
+        streamed_codec=args.streamed_codec,
+        streamed_codec_verify=not args.no_streamed_codec_verify,
+        streamed_codec_manifest=(
+            str(args.streamed_codec_manifest.expanduser().resolve())
+            if args.streamed_codec_manifest is not None
+            else None
+        ),
         verify_record_hashes=should_verify_source_records(args, validated_manifest),
         verify_sidecar_hash_at_open=args.verified_sidecar,
         trace_routes=args.route_trace_json is not None,

@@ -6,7 +6,10 @@ import argparse
 import sys
 
 from mtplx.profiles import resolve_profile_name
-from mtplx.runtime_options import normalize_paged_kv_quantization
+from mtplx.runtime_options import (
+    canonicalize_flag_tokens,
+    normalize_paged_kv_quantization,
+)
 
 
 def _profile_arg(value: str) -> str:
@@ -61,11 +64,20 @@ def _explicit_cli_flags(raw_args: list[str]) -> set[str]:
 
 
 class _FlagRecordingArgumentParser(argparse.ArgumentParser):
-    """Root parser that always records which flags were actually typed."""
+    """Root parser that always records which flags were actually typed.
+
+    Tokens are canonicalized against the option strings actually in scope,
+    because argparse accepts abbreviations while ``_explicit_cli_flags``
+    records the raw text: ``--temp 0.9`` sets ``temperature`` but would
+    record only ``temp``, so every ``_cli_flags`` check read it as not-typed
+    and the config file overwrote the user's value.
+    """
 
     def parse_args(self, args=None, namespace=None):  # type: ignore[override]
         raw = list(sys.argv[1:]) if args is None else list(args)
         parsed = super().parse_args(raw, namespace)
         if not hasattr(parsed, "_cli_flags"):
-            parsed._cli_flags = _explicit_cli_flags(raw)
+            parsed._cli_flags = canonicalize_flag_tokens(
+                _explicit_cli_flags(raw), self, parsed
+            )
         return parsed
