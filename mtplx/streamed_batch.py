@@ -475,9 +475,17 @@ class StreamedBatchRunner:
             else:
                 hidden = self._split_attention_layer_walk(inner, hidden, streams)
             hidden = inner.norm(hidden)
+            # Cast the LOGITS, not the head input: fp32 activations against the
+            # head weight force MLX to materialize an fp32 copy of the full
+            # [vocab, hidden] matrix per step (see Hy3ForCausalLM.__call__).
+            # _logits_head() also applies the optional trunk-head quant, so the
+            # batch path sees the same head the AR path does rather than
+            # whichever dtype an earlier AR generation happened to leave bound.
+            head = getattr(model, "_logits_head", None)
+            head = head() if callable(head) else model.lm_head
+            logits = head(hidden)
             if getattr(getattr(model, "args", None), "enable_lm_head_fp32", False):
-                hidden = hidden.astype(mx.float32)
-            logits = model.lm_head(hidden)
+                logits = logits.astype(mx.float32)
         _eval(logits)
         for position, stream in enumerate(streams):
             stream.decode_steps += 1

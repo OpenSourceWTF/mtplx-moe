@@ -81,6 +81,25 @@ _MAX_PROVENANCE_BYTES = 16 * 1024**2
 _MAX_JOURNAL_BYTES = 1024 * 1024**2
 
 _PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+# Q4->Q2 fidelity floor. This is a PATHOLOGY floor, not a quality target: it
+# exists so a projection that converted to noise (the audit's cosine-0.02 case)
+# cannot journal, pilot, and publish as "passed": True on an isfinite check
+# alone.
+#
+# MEASURED 2026-07-18 on the shipped banks, 24 experts sampled across all 79
+# layers, dequantizing hy3-expert-only-mlx-q2 and -q4 with mx.dequantize and
+# comparing:
+#
+#     min 0.9112 | p10 0.9193 | median 0.9197 | max 0.9199
+#
+# Two things follow. The sibling Q4 converter's Q4_MIN_ROUNDTRIP_COSINE = 0.99
+# (glm52_mtp_artifact.py) would reject 24/24 legitimate Q2 conversions — 2-bit
+# fidelity really is inherently far below 4-bit, so that bound cannot transfer.
+# But the distribution is tight, so 0.85 leaves ~7% headroom under the observed
+# minimum while still catching real degradation; 0.5 would only catch total
+# collapse. Every existing artifact clears 0.85, so enforcing this on read does
+# not invalidate anything already on disk.
+Q2_MIN_ROUNDTRIP_COSINE = 0.85
 _LEAVES = ("weight", "scales", "biases")
 _DTYPES = ("U32", "BF16", "BF16")
 _GROUP_SIZE = 64
@@ -1713,13 +1732,22 @@ def requantize_projection_q4_to_q2(
         dot = float(mx.sum(source_fp32 * target_fp32).item())
         error_norm = float(mx.linalg.norm(source_fp32 - target_fp32).item())
         if source_norm == 0.0:
-            cosine = 1.0 if target_norm == 0.0 else 0.0
-            normalized_error = error_norm
-        else:
-            cosine = dot / (source_norm * target_norm) if target_norm else 0.0
-            normalized_error = error_norm / source_norm
+            # A zero source projection has no direction to preserve. Reporting
+            # cosine=1.0 here would publish "perfect fidelity" for a dead
+            # projection, so fail closed instead of ratifying it.
+            raise ValueError(
+                f"projection {projection} has an all-zero Q4 source; "
+                "roundtrip fidelity is undefined"
+            )
+        cosine = dot / (source_norm * target_norm) if target_norm else 0.0
+        normalized_error = error_norm / source_norm
         if not all(math.isfinite(value) for value in (cosine, normalized_error)):
             raise ValueError(f"projection {projection} produced non-finite diagnostics")
+        if cosine < Q2_MIN_ROUNDTRIP_COSINE:
+            raise ValueError(
+                f"projection {projection} Q4->Q2 roundtrip cosine {cosine:.6f} "
+                f"is below the pinned floor {Q2_MIN_ROUNDTRIP_COSINE}"
+            )
 
         output = (
             np.array(q2_weight, copy=True).astype("<u4", copy=False).tobytes(),
@@ -2664,6 +2692,12 @@ def _diagnostics_json(
             or not math.isfinite(item.normalized_error_q4_q2)
         ):
             raise ValueError("conversion diagnostics are non-finite")
+        if item.cosine_q4_q2 < Q2_MIN_ROUNDTRIP_COSINE:
+            raise ValueError(
+                f"conversion diagnostics for {item.component} report cosine "
+                f"{item.cosine_q4_q2:.6f}, below the pinned floor "
+                f"{Q2_MIN_ROUNDTRIP_COSINE}"
+            )
         result.append(
             {
                 "component": item.component,
@@ -2880,6 +2914,7 @@ def _validate_journal_chain(
                 or not isinstance(item.get("normalized_error_q4_q2"), (int, float))
                 or not math.isfinite(item["cosine_q4_q2"])
                 or not math.isfinite(item["normalized_error_q4_q2"])
+                or item["cosine_q4_q2"] < Q2_MIN_ROUNDTRIP_COSINE
             ):
                 raise ValueError("conversion journal diagnostics are invalid")
         previous_sha256 = entry_sha256
@@ -4316,6 +4351,7 @@ def _validate_pilot_report(
                     (int, float),
                 )
                 or not math.isfinite(diagnostic["normalized_error_q4_q2"])
+                or diagnostic["cosine_q4_q2"] < Q2_MIN_ROUNDTRIP_COSINE
             ):
                 raise ValueError("Hy3 Q2 pilot diagnostics are invalid")
     if len(coordinates) != len(set(coordinates)):
@@ -4712,7 +4748,12 @@ def _verify_held_expert_payloads(
             parsed_shard.size != expected_shard.size
             or parsed_shard.header_bytes != expected_shard.header_bytes
             or parsed_shard.header_sha256 != expected_shard.header_sha256
-            or parsed_shard.sha256 != expected_shard.sha256
+            # Only meaningful when deep: shallow mode seeds actual_sha256 from
+            # expected_shard.sha256, so comparing them would be a tautology.
+            # The size/header checks above still fire in both modes; the shard
+            # PAYLOAD hash is verified only when deep (see the return value's
+            # "shard_payload_verified").
+            or (deep and parsed_shard.sha256 != expected_shard.sha256)
         ):
             raise ValueError(f"resident shard header or hash mismatch: {name}")
         for tensor_name, tensor in tensors.items():
@@ -4762,6 +4803,9 @@ def _verify_held_expert_payloads(
         "checked_records": checked_records,
         "checked_shards": len(manifest.shards),
         "sidecar_verified": deep,
+        # Shard headers/sizes are checked in both modes; the shard payload
+        # bytes are hashed only when deep.
+        "shard_payload_verified": deep,
     }
 
 

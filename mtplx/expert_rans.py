@@ -47,6 +47,7 @@ SCALE_BITS = 12
 M = 1 << SCALE_BITS  # 4096
 RANS_L = 1 << 23  # lower bound of the normalized state interval
 LANES = 32  # interleave width == Apple GPU SIMD-group size
+_UINT32_MAX = (1 << 32) - 1  # widest lane-directory offset the container holds
 
 # On-disk container for one compressed component bank (issue #51, C7). The
 # blob is fully self-describing: a fixed header, the normalized frequency
@@ -171,6 +172,45 @@ def histogram(data: np.ndarray) -> np.ndarray:
     return np.bincount(data, minlength=256).astype(np.int64)
 
 
+def _require_encodable(data: np.ndarray, table: RansTable) -> None:
+    """Reject data carrying a symbol the table assigns ``freq == 0``.
+
+    A zero frequency is legal in a table for symbols the stream never emits
+    (a real table is mostly zeros), so the table alone cannot be validated.
+    Encoding such a symbol is what is unrepresentable: ``x_max`` collapses to
+    0, the renormalization loop's ``x >= x_max`` is then always true, and the
+    encoder spins forever (the vectorized path also divides by zero). Fail
+    closed here rather than hang.
+    """
+
+    counts = np.bincount(np.asarray(data, dtype=np.uint8).ravel(), minlength=256)
+    # `counts > 0` first: a bitwise AND against raw counts would silently miss
+    # any symbol whose count is even (32 & 1 == 0).
+    missing = np.nonzero((counts > 0) & (np.asarray(table.freq, dtype=np.int64) == 0))[0]
+    if missing.size:
+        raise RansError(
+            "data contains symbols with zero frequency in the table and "
+            f"cannot be encoded: {missing[:8].tolist()}"
+            f"{' ...' if missing.size > 8 else ''}"
+        )
+
+
+def _require_directory_fits(max_offset: int) -> None:
+    """Reject a payload whose lane offsets overflow the uint32 directory.
+
+    The scalar reference raises naturally here (assigning past 2**32-1 into a
+    uint32 array overflows); the vectorized path's ``astype(np.uint32)`` would
+    wrap silently and decode plausible garbage, so it must raise too -- the
+    two encoders are documented and tested as bit-identical.
+    """
+
+    if max_offset > _UINT32_MAX:
+        raise RansError(
+            f"lane directory offset {max_offset} exceeds the uint32 range; "
+            f"encode this bank in chunks under {_UINT32_MAX + 1} payload bytes"
+        )
+
+
 def _encode_lane(symbols: np.ndarray, table: RansTable) -> bytes:
     """rANS-encode one lane (ryg rans_byte convention, forward-readable)."""
 
@@ -207,6 +247,7 @@ def encode_segment(
         raise RansError(
             f"segment of {data.size} bytes is not divisible by {lanes} lanes"
         )
+    _require_encodable(data, table)
     per_lane = data.size // lanes
     rows = data.reshape(lanes, per_lane)
     return [_encode_lane(rows[lane], table) for lane in range(lanes)]
@@ -270,6 +311,7 @@ def encode_bank(
         raise RansError(
             f"segment length {seg_len} is not divisible by {lanes} lanes"
         )
+    _require_encodable(segments, table)
     per_lane = seg_len // lanes
     n_lanes = expert_count * lanes
     rows = segments.reshape(expert_count, lanes, per_lane).reshape(n_lanes, per_lane)
@@ -321,6 +363,7 @@ def encode_bank(
     rev_index = offsets[lane_sorted] + (counts[lane_sorted] - 1 - pos_in_lane)
     payload_arr = np.empty(lane_sorted.size, dtype=np.uint8)
     payload_arr[rev_index] = byte_sorted
+    _require_directory_fits(int(offsets[-2]) if n_lanes else 0)
     directory = offsets[:-1].reshape(expert_count, lanes).astype(np.uint32)
     raw = expert_count * seg_len
     return LaneStreams(

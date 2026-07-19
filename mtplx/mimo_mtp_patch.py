@@ -67,6 +67,33 @@ def _candidate_weight_files(model_path: Path, config: dict[str, Any]) -> list[Pa
     return sorted(model_path.glob("model*.safetensors"))
 
 
+def _has_complete_mimo_mtp_payload(
+    weights: dict[str, Any],
+    *,
+    num_mtp_layers: int,
+) -> bool:
+    """Return true only when every declared MiMo MTP layer has real weights.
+
+    A prefix-mismatched checkpoint still yields a non-empty ``mapped`` from
+    stray keys, and ``strict=False`` then loads nothing -- injection would
+    report success while the draft head stays randomly initialized.
+    """
+
+    for local_idx in range(num_mtp_layers):
+        prefix = f"layers.{local_idx}."
+        required = (
+            f"{prefix}token_layernorm.weight",
+            f"{prefix}hidden_layernorm.weight",
+            f"{prefix}input_proj.weight",
+            f"{prefix}final_layernorm.weight",
+        )
+        if not all(key in weights for key in required):
+            return False
+        if not any(key.startswith(f"{prefix}mtp_block.") for key in weights):
+            return False
+    return True
+
+
 def _rewrite_mimo_mtp_weights(
     raw: dict[str, Any],
     *,
@@ -207,7 +234,9 @@ def inject_mimo_mtp_support(
         start_layer=int(getattr(args, "num_hidden_layers")),
         num_mtp_layers=_num_mtp_layers(config),
     )
-    if not mapped:
+    if not mapped or not _has_complete_mimo_mtp_payload(
+        mapped, num_mtp_layers=_num_mtp_layers(config)
+    ):
         logger.warning("[MiMo MTP inject] No MiMo MTP weights found in %s", model_path)
         return False
 
