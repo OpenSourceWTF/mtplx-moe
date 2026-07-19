@@ -177,3 +177,33 @@ def test_source_artifact_is_never_modified(tmp_path) -> None:
     convert(manifest, root, tmp_path / "s", part_bytes=1 << 30, progress=False)
     after = hashlib.sha256((root / "experts.bin").read_bytes()).hexdigest()
     assert before == after
+
+
+def test_parts_are_readable_by_plain_safetensors(tmp_path) -> None:
+    """The interop guarantee: a published part opens without MTPLX at all.
+
+    This is what "fully compatible with safetensors" has to mean in practice —
+    anyone who downloads a part can read it with a stock loader, so the
+    artifact stops being ours.
+    """
+
+    mx = pytest.importorskip("mlx.core")
+
+    root = tmp_path / "src"
+    manifest = _bank(root)
+    out = tmp_path / "published"
+    smallest = min(r.sidecar_length for r in manifest.records)
+    sharded = convert(manifest, root, out, part_bytes=smallest, progress=False)
+    assert len(sharded.sidecar.parts) > 1
+
+    for part in sharded.sidecar.parts:
+        tensors = mx.load(str(out / part.file))
+        assert tensors, f"{part.file} did not load as safetensors"
+        # every component of every record in this part must be present
+        expected = {
+            segment.tensor
+            for record in sharded.records
+            if record.part == sharded.sidecar.parts.index(part)
+            for segment in record.segments
+        }
+        assert expected <= set(tensors)
