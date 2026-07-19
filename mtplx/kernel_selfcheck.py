@@ -272,11 +272,12 @@ def _check_fused_gdn_norm_gate(mx, dtype) -> float:
 
 
 def _check_gdn_postconv_inline_g(mx, dtype) -> float:
-    """Compare the exact A3B K1/M2 stock capture with the fused recurrence."""
+    """Compare the exact A3B M1/M2 stock captures with their fixed routes."""
     if dtype != mx.bfloat16:
         return float("inf")
 
     from .gdn_capture import (
+        _a3b_compiled_target_gdn_postconv_m1_tgy4,
         _a3b_compiled_target_gdn_postconv_m2_tgy4,
         _stock_gated_delta_capture,
     )
@@ -301,34 +302,55 @@ def _check_gdn_postconv_inline_g(mx, dtype) -> float:
         head_v_dim=128,
         training=False,
     )
-    q, k, v = [
-        tensor.reshape(1, 2, heads, 128)
-        for tensor, heads in zip(
-            mx.split(conv_out, [2048, 4096], axis=-1),
-            [16, 16, 32],
-        )
-    ]
     inv_scale = 128**-0.5
-    q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-    k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
-    ref_out, ref_states = _stock_gated_delta_capture(q, k, v, a, b, state, None, gdn)
-    out, states = _a3b_compiled_target_gdn_postconv_m2_tgy4(
-        conv_out,
-        a,
-        b,
-        state,
-        A_log=gdn.A_log,
-        dt_bias=gdn.dt_bias,
+    routes = (
+        (1, _a3b_compiled_target_gdn_postconv_m1_tgy4),
+        (2, _a3b_compiled_target_gdn_postconv_m2_tgy4),
     )
-    mx.eval(ref_out, ref_states, out, states)
-    if tuple(out.shape) != tuple(ref_out.shape) or tuple(states.shape) != tuple(
-        ref_states.shape
-    ):
-        return float("inf")
-    return max(
-        _max_abs_diff(mx, out, ref_out),
-        _max_abs_diff(mx, states, ref_states),
-    )
+    differences = []
+    for logical_m, route in routes:
+        route_conv = conv_out[:, :logical_m]
+        route_a = a[:, :logical_m]
+        route_b = b[:, :logical_m]
+        q, k, v = [
+            tensor.reshape(1, logical_m, heads, 128)
+            for tensor, heads in zip(
+                mx.split(route_conv, [2048, 4096], axis=-1),
+                [16, 16, 32],
+            )
+        ]
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        ref_out, ref_states = _stock_gated_delta_capture(
+            q,
+            k,
+            v,
+            route_a,
+            route_b,
+            state,
+            None,
+            gdn,
+        )
+        out, states = route(
+            route_conv,
+            route_a,
+            route_b,
+            state,
+            A_log=gdn.A_log,
+            dt_bias=gdn.dt_bias,
+        )
+        mx.eval(ref_out, ref_states, out, states)
+        if tuple(out.shape) != tuple(ref_out.shape) or tuple(states.shape) != tuple(
+            ref_states.shape
+        ):
+            return float("inf")
+        differences.extend(
+            (
+                _max_abs_diff(mx, out, ref_out),
+                _max_abs_diff(mx, states, ref_states),
+            )
+        )
+    return max(differences)
 
 
 def run_kernel_selfcheck(dtype, bits: int, group_size: int) -> dict[str, Any]:

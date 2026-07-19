@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
@@ -30,7 +31,6 @@ _A3B_GDN_POSTCONV_LAYER_TYPES = tuple(
     "linear_attention" if index % 4 != 3 else "full_attention"
     for index in range(40)
 )
-_A3B_GDN_POSTCONV_INSTALLED_GDNS: list[Any] = []
 
 
 class A3BGDNPostconvConfigError(RuntimeError):
@@ -44,15 +44,33 @@ class A3BGDNPostconvInstallPlan:
     gdns: tuple[Any, ...]
 
 
+@dataclass(frozen=True)
+class A3BGDNPostconvFactory:
+    """Selfchecked, order-stable callables for the exact M1/M2 traces."""
+
+    m1_implementations: tuple[Callable[..., Any], ...]
+    m2_implementations: tuple[Callable[..., Any], ...]
+
+
 def _a3b_gdn_postconv_contract() -> dict[str, Any]:
     return {
         "batch": 1,
-        "logical_m": 2,
-        "conv_shape": [1, 2, 8192],
-        "gate_shapes": {"a": [1, 2, 32], "b": [1, 2, 32]},
+        "logical_m": [1, 2],
+        "routes": {
+            "m1_correction": {
+                "conv_shape": [1, 1, 8192],
+                "gate_shapes": {"a": [1, 1, 32], "b": [1, 1, 32]},
+                "output_shape": [1, 1, 32, 128],
+                "captured_states_shape": [1, 1, 32, 128, 128],
+            },
+            "m2_verify": {
+                "conv_shape": [1, 2, 8192],
+                "gate_shapes": {"a": [1, 2, 32], "b": [1, 2, 32]},
+                "output_shape": [1, 2, 32, 128],
+                "captured_states_shape": [1, 2, 32, 128, 128],
+            },
+        },
         "state_shape": [1, 32, 128, 128],
-        "output_shape": [1, 2, 32, 128],
-        "captured_states_shape": [1, 2, 32, 128, 128],
         "input_dtype": "bfloat16",
         "state_dtype": "float32",
         "key_heads": 16,
@@ -67,17 +85,7 @@ def a3b_gdn_postconv_enabled() -> bool:
     return _env_enabled("MTPLX_FUSE_GDN_POST_CONV")
 
 
-def _clear_a3b_gdn_postconv_markers() -> None:
-    for gdn in _A3B_GDN_POSTCONV_INSTALLED_GDNS:
-        try:
-            delattr(gdn, "_mtplx_a3b_gdn_postconv_impl")
-        except AttributeError:
-            pass
-    _A3B_GDN_POSTCONV_INSTALLED_GDNS.clear()
-
-
 def _fail_a3b_gdn_postconv_configuration(message: str) -> None:
-    _clear_a3b_gdn_postconv_markers()
     _GDN_POSTCONV_STATS["installed"] = False
     _GDN_POSTCONV_STATS["installation_status"] = "configuration_error"
     _GDN_POSTCONV_STATS["installation_error"] = str(message)
@@ -110,11 +118,15 @@ def prepare_a3b_gdn_postconv(
     *,
     config: dict[str, Any],
 ) -> A3BGDNPostconvInstallPlan | None:
-    """Validate checkpoint/model facts once for the exact A3B M2/TGY4 lane."""
+    """Validate checkpoint/model facts once for the exact A3B M1/M2 lanes."""
     _reset_gdn_postconv_stats_for_tests()
     if not a3b_gdn_postconv_enabled():
         return None
     _GDN_POSTCONV_STATS["enabled"] = True
+    if not _env_enabled("MTPLX_COMPILED_TARGET_PREFIX"):
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv compiled_target_prefix_flag must be enabled"
+        )
     if _env_enabled("MTPLX_NATIVE_GDN_TAIL"):
         _fail_a3b_gdn_postconv_configuration(
             "A3B GDN postconv topology conflicts with MTPLX_NATIVE_GDN_TAIL"
@@ -130,6 +142,10 @@ def prepare_a3b_gdn_postconv(
     ):
         _fail_a3b_gdn_postconv_configuration(
             "A3B GDN postconv topology requires the exact A3B model"
+        )
+    if text_config.get("dtype") != "bfloat16":
+        _fail_a3b_gdn_postconv_configuration(
+            "A3B GDN postconv config_dtype requires bfloat16"
         )
 
     text_model = getattr(model, "language_model", None)
@@ -235,27 +251,34 @@ def prepare_a3b_gdn_postconv(
 def install_a3b_gdn_postconv(
     plan: A3BGDNPostconvInstallPlan,
     selfcheck_report: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Install the exact M2/TGY4 callables only after their one self-check."""
+) -> A3BGDNPostconvFactory:
+    """Install the exact M1/M2 callables only after their combined self-check."""
     lanes = {} if selfcheck_report is None else selfcheck_report.get("lanes", {})
     if lanes.get("gdn_postconv_inline_g") != "ok":
         _fail_a3b_gdn_postconv_configuration(
-            "A3B GDN postconv selfcheck did not validate the exact M2/TGY4 kernel"
+            "A3B GDN postconv selfcheck did not validate the exact M1/M2 kernels"
         )
-    for gdn in plan.gdns:
-        setattr(
-            gdn,
-            "_mtplx_a3b_gdn_postconv_impl",
+    factory = A3BGDNPostconvFactory(
+        m1_implementations=tuple(
+            partial(
+                _apply_enabled_a3b_gdn_postconv_m1_tgy4,
+                A_log=gdn.A_log,
+                dt_bias=gdn.dt_bias,
+            )
+            for gdn in plan.gdns
+        ),
+        m2_implementations=tuple(
             partial(
                 _apply_enabled_a3b_gdn_postconv_m2_tgy4,
                 A_log=gdn.A_log,
                 dt_bias=gdn.dt_bias,
-            ),
-        )
-    _A3B_GDN_POSTCONV_INSTALLED_GDNS.extend(plan.gdns)
+            )
+            for gdn in plan.gdns
+        ),
+    )
     _GDN_POSTCONV_STATS["installed"] = True
     _GDN_POSTCONV_STATS["installation_status"] = "installed"
-    return gdn_postconv_stats()
+    return factory
 
 
 def gdn_postconv_stats() -> dict[str, Any]:
@@ -267,7 +290,6 @@ def gdn_postconv_stats() -> dict[str, Any]:
 
 
 def _reset_gdn_postconv_stats_for_tests() -> None:
-    _clear_a3b_gdn_postconv_markers()
     _GDN_POSTCONV_STATS.update(
         {
             "enabled": False,
@@ -1128,8 +1150,6 @@ _DEMOTED_GDN_ALIASES = {
     "linear_gdn_len6",
     "linear_gdn_mlp_gateup",
 }
-
-
 def _contiguous_recurrent_leaf(value: mx.array) -> mx.array:
     # Mirrors mlx-lm #1077's cache ownership fix: the authoritative recurrent
     # leaf must not retain the larger per-position capture buffer.
@@ -1691,6 +1711,35 @@ def _linear_gated_delta_from_conv_inline_g_capture(
     )
 
 
+def _a3b_compiled_target_gdn_postconv_m1_tgy4(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Launch the fixed A3B compiled-target M1 recurrence with TGY4."""
+    return _linear_gated_delta_from_conv_inline_g_kernel(
+        inputs=[conv_out, a, b, A_log, dt_bias, state, 1],
+        template=[
+            ("InT", mx.bfloat16),
+            ("StT", mx.float32),
+            ("Dk", 128),
+            ("Dv", 128),
+            ("Hk", 16),
+            ("Hv", 32),
+            ("KeyDim", 2048),
+            ("ConvDim", 8192),
+        ],
+        grid=(32, 128, 32),
+        threadgroup=(32, 4, 1),
+        output_shapes=[(1, 1, 32, 128), (1, 1, 32, 128, 128)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+
+
 def _a3b_compiled_target_gdn_postconv_m2_tgy4(
     conv_out: mx.array,
     a: mx.array,
@@ -1717,6 +1766,26 @@ def _a3b_compiled_target_gdn_postconv_m2_tgy4(
         threadgroup=(32, 4, 1),
         output_shapes=[(1, 2, 32, 128), (1, 2, 32, 128, 128)],
         output_dtypes=[mx.bfloat16, mx.float32],
+    )
+
+
+def _apply_enabled_a3b_gdn_postconv_m1_tgy4(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Execute the construction-installed exact A3B M1/TGY4 route."""
+    return _a3b_compiled_target_gdn_postconv_m1_tgy4(
+        conv_out,
+        a,
+        b,
+        state,
+        A_log=A_log,
+        dt_bias=dt_bias,
     )
 
 
@@ -1817,12 +1886,7 @@ def gdn_forward_with_capture(
 
     final_only_capture = False
     capture_start = 0
-    postconv_implementation = getattr(
-        gdn, "_mtplx_a3b_gdn_postconv_impl", None
-    )
-    if backend == "stock" and postconv_implementation is not None:
-        out, states = postconv_implementation(conv_out, a, b, state)
-    elif backend == "linear_gdn_from_conv_inline_g":
+    if backend == "linear_gdn_from_conv_inline_g":
         delta_result = _linear_gated_delta_from_conv_inline_g_capture(
             conv_out,
             a,
@@ -1994,6 +2058,75 @@ def gdn_forward_with_capture(
             "capture_start": capture_start,
         }
     return out, {"conv_states": conv_states, "states": states}
+
+
+def _a3b_gdn_forward_with_fixed_postconv(
+    gdn: Any,
+    inputs: mx.array,
+    cache: Any,
+    postconv_implementation: Callable[..., Any],
+):
+    """Build the unchecked exact A3B GDN graph with stock surroundings."""
+    B, S, _ = inputs.shape
+    qkv = gdn.in_proj_qkv(inputs)
+    z = gdn.in_proj_z(inputs).reshape(B, S, 32, 128)
+    b = gdn.in_proj_b(inputs)
+    a = gdn.in_proj_a(inputs)
+    conv_state = cache[0]
+    conv_out, conv_states = _stock_conv1d_capture(qkv, conv_state, gdn)
+    out, states = postconv_implementation(conv_out, a, b, cache[1])
+    cache[0] = mx.contiguous(conv_states[:, -1, :, :])
+    cache[1] = states[:, -1, :, :, :]
+    out = gdn.norm(out, z)
+    out = gdn.out_proj(out.reshape(B, S, -1))
+    return out, {"conv_states": conv_states, "states": states}
+
+
+def forward_with_a3b_gdn_postconv_capture(
+    model: Any,
+    inputs: mx.array,
+    cache: list[Any],
+    *,
+    hidden_variant: str | None,
+    postconv_implementations: tuple[Callable[..., Any], ...],
+):
+    """Build the unchecked exact 40-layer A3B target trace."""
+    text_model = model.language_model
+    inner = text_model.model
+    hidden_states = inner.embed_tokens(inputs)
+
+    from mlx_lm.models.base import create_attention_mask
+
+    attention_mask = create_attention_mask(hidden_states, cache[3])
+    captures: dict[int, dict[str, mx.array]] = {}
+    implementation_iter = iter(postconv_implementations)
+    for layer_idx, (layer, layer_cache, kind) in enumerate(
+        zip(inner.layers, cache, _A3B_GDN_POSTCONV_LAYER_TYPES)
+    ):
+        normed = layer.input_layernorm(hidden_states)
+        if kind == "linear_attention":
+            r, capture = _a3b_gdn_forward_with_fixed_postconv(
+                layer.linear_attn,
+                normed,
+                layer_cache,
+                next(implementation_iter),
+            )
+            captures[layer_idx] = capture
+        else:
+            r = layer.self_attn(normed, mask=attention_mask, cache=layer_cache)
+        h = hidden_states + r
+        mlp_input = layer.post_attention_layernorm(h)
+        hidden_states = h + layer.mlp(mlp_input)
+
+    pre_norm = hidden_states
+    post_norm = inner.norm(hidden_states)
+    logits = (
+        inner.embed_tokens.as_linear(post_norm)
+        if text_model.args.tie_word_embeddings
+        else text_model.lm_head(post_norm)
+    )
+    hidden = pre_norm if hidden_variant == "pre_norm" else post_norm
+    return logits, hidden, captures
 
 
 def forward_with_gdn_capture(

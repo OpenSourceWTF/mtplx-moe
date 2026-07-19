@@ -1132,18 +1132,19 @@ def test_generation_target_prefix_compiles_rejection_correction_forward(monkeypa
     assert bank_stats["fallback_calls"] == 0
 
 
-@pytest.mark.parametrize(("mtp_token", "has_rejections"), ((1, False), (2, True)))
-def test_generation_exact_a3b_k1_route_is_m2_only_and_never_probes_trim(
+def _run_exact_a3b_k1_schedule(
     monkeypatch,
-    mtp_token,
-    has_rejections,
+    *,
+    target_tokens: list[int],
+    max_tokens: int,
 ):
     import mtplx.generation as generation
     from mtplx.a3b_compiled_target_prefix import A3BCompiledTargetPrefixFactory
+    from mtplx.gdn_capture import A3BGDNPostconvFactory
     from mtplx.sampling import SamplerConfig
 
-    rt, model = _tiny_mtpk_runtime(mtp_token=mtp_token)
-    model._mtplx_a3b_compiled_target_prefix_factory = (
+    rt, model = _tiny_mtpk_runtime(mtp_token=1)
+    rt.a3b_compiled_target_prefix_factory = (
         A3BCompiledTargetPrefixFactory(
             layer_types=tuple(
                 "linear_attention" if index % 4 != 3 else "full_attention"
@@ -1153,30 +1154,60 @@ def test_generation_exact_a3b_k1_route_is_m2_only_and_never_probes_trim(
             full_attention_layers=10,
             hidden_size=2048,
             quantization="affine_q4_group64",
+            gdn_postconv=A3BGDNPostconvFactory(
+                m1_implementations=tuple(lambda *args: args for _ in range(30)),
+                m2_implementations=tuple(lambda *args: args for _ in range(30)),
+            ),
         )
     )
-    calls: list[int] = []
+    schedule: list[tuple] = []
+    primary_states: list[object] = []
+    history_appends: list[tuple[list[int], np.ndarray]] = []
+    exact_installed = False
 
     class SpyRoute:
         def __init__(self, cache):
             self.cache = cache
 
         def verify_m2(self, input_ids):
-            calls.append(int(input_ids.shape[1]))
-            return rt.forward_ar_capture(
-                input_ids,
-                cache=self.cache,
-                return_hidden=True,
+            cycle = len(primary_states)
+            target_token = int(target_tokens[min(cycle, len(target_tokens) - 1)])
+            primary_state = object()
+            primary_states.append(primary_state)
+            schedule.append(
+                ("m2", tuple(int(token) for token in np.asarray(input_ids).reshape(-1)))
             )
+            logits = mx.zeros((1, 2, 4), dtype=mx.float32)
+            logits = logits + mx.eye(4, dtype=mx.float32)[target_token]
+            hidden = mx.stack(
+                (
+                    mx.full((2,), 10 + cycle, dtype=mx.float32),
+                    mx.full((2,), 20 + cycle, dtype=mx.float32),
+                ),
+                axis=0,
+            )[None, ...]
+            return logits, hidden, primary_state
 
-        repair_m2 = verify_m2
+        def repair_m1(self, input_ids, primary_state):
+            cycle = len(primary_states) - 1
+            assert primary_state is primary_states[cycle]
+            correction = tuple(
+                int(token) for token in np.asarray(input_ids).reshape(-1)
+            )
+            schedule.append(("m1", correction, primary_state))
+            return (
+                model._logits(1),
+                mx.full((1, 1, 2), 90 + cycle, dtype=mx.float32),
+                None,
+            )
 
         def final_report(self, *, verify_calls, repair_calls):
             total = int(verify_calls) + int(repair_calls)
             return {
                 "calls": total,
                 "compiled_calls": total,
-                "m2_calls": total,
+                "m2_calls": int(verify_calls),
+                "m1_calls": int(repair_calls),
                 "fallback_calls": 0,
                 "growth_demotions": 0,
             }
@@ -1184,18 +1215,61 @@ def test_generation_exact_a3b_k1_route_is_m2_only_and_never_probes_trim(
         def demote(self):
             return 0
 
+    def install_spy_route(_rt, cache, **_kwargs):
+        nonlocal exact_installed
+        exact_installed = True
+        return SpyRoute(cache)
+
     monkeypatch.setattr(
         generation,
         "install_a3b_k1_target_prefix_route",
-        lambda _rt, cache, **_kwargs: SpyRoute(cache),
+        install_spy_route,
     )
+
+    def forbidden(name):
+        def fail(*_args, **_kwargs):
+            raise AssertionError(f"exact A3B route must not call {name}")
+
+        return fail
+
+    monkeypatch.setattr(generation, "snapshot_untrimmable_cache", forbidden("snapshot"))
+    monkeypatch.setattr(generation, "rollback_after_verify", forbidden("rollback"))
     monkeypatch.setattr(
         generation,
         "trim_verified_window_to_prefix",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("exact A3B route must not probe trim")
-        ),
+        forbidden("trim"),
     )
+    real_forward_ar = rt.forward_ar
+
+    def forward_ar_only_before_install(*args, **kwargs):
+        if exact_installed:
+            raise AssertionError("exact A3B route must not call generic target forward")
+        return real_forward_ar(*args, **kwargs)
+
+    monkeypatch.setattr(rt, "forward_ar", forward_ar_only_before_install)
+
+    import mtplx.gdn_capture as gdn_capture
+
+    monkeypatch.setattr(
+        gdn_capture,
+        "commit_captured_prefix",
+        forbidden("capture commit"),
+    )
+
+    def record_history(
+        _rt,
+        _mtp_cache,
+        hidden_states,
+        token_ids,
+        **_kwargs,
+    ):
+        mx.eval(hidden_states)
+        history_appends.append(
+            (list(token_ids), np.asarray(hidden_states, dtype=np.float32).copy())
+        )
+        return 0.0
+
+    monkeypatch.setattr(generation, "_append_mtp_history", record_history)
     monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "1")
     monkeypatch.setenv("MTPLX_COMPILED_TARGET_PREFIX", "1")
     monkeypatch.delenv("MTPLX_STATE_REBASE_EVERY", raising=False)
@@ -1203,7 +1277,7 @@ def test_generation_exact_a3b_k1_route_is_m2_only_and_never_probes_trim(
     out = generation.generate_mtpk(
         rt,
         [0],
-        max_tokens=5,
+        max_tokens=max_tokens,
         sampler=SamplerConfig(temperature=0.5, top_p=1.0, top_k=1),
         speculative_depth=1,
         min_speculative_depth=1,
@@ -1211,16 +1285,73 @@ def test_generation_exact_a3b_k1_route_is_m2_only_and_never_probes_trim(
         verify_strategy="target_prefix",
         stop_token_ids=set(),
     )
+    return out, schedule, primary_states, history_appends
 
-    rejected = out.stats.drafted_tokens - out.stats.accepted_drafts
-    assert bool(rejected) is has_rejections
-    repair_calls = out.stats.correction_tokens
-    if has_rejections:
-        assert repair_calls > 0, out.stats.events
-    assert calls == [2] * (out.stats.verify_calls + repair_calls)
+
+def test_generation_exact_a3b_k1_accept_keeps_m2_state_without_generic_commit(
+    monkeypatch,
+):
+    out, schedule, _primary_states, _history_appends = _run_exact_a3b_k1_schedule(
+        monkeypatch,
+        target_tokens=[1],
+        max_tokens=5,
+    )
+
+    assert out.tokens == [1, 1, 1, 1, 1]
+    assert all(call[0] == "m2" for call in schedule)
+    assert out.stats.correction_tokens == 0
     report = out.stats.graphbank["compiled_verify"]
-    assert report["m2_calls"] == out.stats.verify_calls + repair_calls
-    assert all("compiled_verify" not in event.get("graphbank", {}) for event in out.stats.events)
+    assert report["m2_calls"] == out.stats.verify_calls
+    assert report["m1_calls"] == 0
+
+
+def test_generation_exact_a3b_k1_reject_uses_primary_state_m1_schedule(
+    monkeypatch,
+):
+    out, schedule, primary_states, history_appends = _run_exact_a3b_k1_schedule(
+        monkeypatch,
+        target_tokens=[2],
+        max_tokens=4,
+    )
+
+    assert out.tokens == [1, 2, 1, 2]
+    assert [call[0] for call in schedule] == ["m2", "m1", "m2", "m1"]
+    assert schedule[1][1] == (2,)
+    assert schedule[1][2] is primary_states[0]
+    assert schedule[3][1] == (2,)
+    assert schedule[3][2] is primary_states[1]
+    assert out.stats.correction_tokens == 2
+    assert all("pending_primary" not in event for event in out.stats.events)
+    assert all(not event["primary_already_emitted"] for event in out.stats.events)
+    correction_history = [
+        hidden for token_ids, hidden in history_appends if token_ids == [2]
+    ]
+    assert len(correction_history) == 2
+    np.testing.assert_array_equal(correction_history[0], np.full((1, 1, 2), 10))
+    np.testing.assert_array_equal(correction_history[1], np.full((1, 1, 2), 11))
+    assert not any(np.all(hidden == 90) for hidden in correction_history)
+    report = out.stats.graphbank["compiled_verify"]
+    assert report["m2_calls"] == out.stats.verify_calls == 2
+    assert report["m1_calls"] == out.stats.correction_tokens == 2
+
+
+def test_generation_exact_a3b_k1_mixed_schedule_keeps_accept_and_reject_ownership(
+    monkeypatch,
+):
+    out, schedule, primary_states, _history_appends = _run_exact_a3b_k1_schedule(
+        monkeypatch,
+        target_tokens=[1, 2],
+        max_tokens=6,
+    )
+
+    assert out.tokens[:3] == [1, 1, 1]
+    assert [call[0] for call in schedule] == ["m2", "m2", "m1", "m2", "m1"]
+    assert schedule[2][2] is primary_states[1]
+    assert schedule[4][2] is primary_states[2]
+    assert out.stats.accepted_drafts == 1
+    assert out.stats.correction_tokens == 2
+    assert out.stats.events[1]["primary_already_emitted"] is True
+    assert out.stats.events[2]["primary_already_emitted"] is False
 
 
 def test_generation_flag_parity_double_runs_each_verify(monkeypatch):

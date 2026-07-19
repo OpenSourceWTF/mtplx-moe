@@ -12,17 +12,14 @@ from mlx_lm.models.cache import ArraysCache
 
 from .attention_context import attention_phase
 from .graphbank import (
-    CompiledVerifyBank,
     TensorOffsetKVCache,
     VERIFY_SPEC_KIND_FULL_ATTN,
     VERIFY_SPEC_KIND_GDN,
     _compiled_verify_boundary,
     _compiled_verify_donation_enabled,
     _owned_state_env_active,
-    build_verify_state_spec,
-    cache_has_python_offsets,
-    promote_kv_cache_offsets,
 )
+from .gdn_capture import A3BGDNPostconvFactory
 
 
 _LAYER_TYPES = tuple(
@@ -37,11 +34,21 @@ _STATE_SPEC = tuple(
     )
     for index, kind in enumerate(_LAYER_TYPES)
 )
-_CAPTURE_LEAVES = 30 * 2
-_STATE_START = 2 + _CAPTURE_LEAVES
+_STATE_LEAVES = sum(leaves for _index, _kind, leaves in _STATE_SPEC)
+_FULL_ATTENTION_INDICES = tuple(
+    index
+    for index, kind, _leaves in _STATE_SPEC
+    if kind == VERIFY_SPEC_KIND_FULL_ATTN
+)
+_PRIMARY_STATE_START = 2
+_FINAL_STATE_START = _PRIMARY_STATE_START + _STATE_LEAVES
+_M1_FINAL_STATE_START = 2
 _MAX_REQUEST_CONTEXT = 12_288
-_FACTORY_ATTRIBUTE = "_mtplx_a3b_compiled_target_prefix_factory"
 _SHARED_M2_STEPS: dict[
+    tuple[int, str],
+    tuple[Callable[..., Any], dict[str, Any], weakref.ReferenceType[Any]],
+] = {}
+_SHARED_M1_STEPS: dict[
     tuple[int, str],
     tuple[Callable[..., Any], dict[str, Any], weakref.ReferenceType[Any]],
 ] = {}
@@ -60,6 +67,7 @@ class A3BCompiledTargetPrefixFactory:
     full_attention_layers: int
     hidden_size: int
     quantization: str
+    gdn_postconv: A3BGDNPostconvFactory
 
 
 def _enabled() -> bool:
@@ -75,34 +83,28 @@ def _fail(message: str) -> None:
     raise A3BCompiledTargetPrefixConfigError(message)
 
 
+def validate_a3b_k1_target_prefix_sampler(sampler: Any) -> None:
+    """Prove the external sampler contract once before prompt construction."""
+    if float(sampler.temperature) <= 0.0 or int(sampler.top_k or 0) <= 0:
+        _fail("compiled A3B target-prefix requires a stochastic top-k sampler")
+
+
 def prepare_a3b_compiled_target_prefix(
     model: Any,
     *,
     config: dict[str, Any],
+    gdn_postconv_factory: A3BGDNPostconvFactory | None = None,
 ) -> A3BCompiledTargetPrefixFactory | None:
     """Validate checkpoint-owned facts once, while the model is constructed."""
     if not _enabled():
-        if hasattr(model, _FACTORY_ATTRIBUTE):
-            delattr(model, _FACTORY_ATTRIBUTE)
         return None
+    if gdn_postconv_factory is None:
+        _fail("compiled A3B target-prefix requires the constructed GDN postconv factory")
 
-    text = config.get("text_config")
+    text = config["text_config"]
     quant = config.get("quantization") or config.get("quantization_config")
     if (
-        config.get("model_type") != "qwen3_5_moe"
-        or config.get("architectures") != ["Qwen3_5MoeForConditionalGeneration"]
-        or not isinstance(text, dict)
-        or text.get("model_type") != "qwen3_5_moe_text"
-        or text.get("dtype") != "bfloat16"
-        or int(text.get("hidden_size", -1)) != 2048
-        or int(text.get("num_hidden_layers", -1)) != 40
-        or tuple(text.get("layer_types", ())) != _LAYER_TYPES
-        or int(text.get("linear_num_value_heads", -1)) != 32
-        or int(text.get("linear_num_key_heads", -1)) != 16
-        or int(text.get("linear_value_head_dim", -1)) != 128
-        or int(text.get("linear_key_head_dim", -1)) != 128
-        or int(text.get("linear_conv_kernel_dim", -1)) != 4
-        or int(text.get("num_attention_heads", -1)) != 16
+        int(text.get("num_attention_heads", -1)) != 16
         or int(text.get("num_key_value_heads", -1)) != 2
         or int(text.get("head_dim", -1)) != 256
         or int(text.get("mtp_num_hidden_layers", -1)) != 1
@@ -113,34 +115,18 @@ def prepare_a3b_compiled_target_prefix(
     ):
         _fail("compiled A3B target-prefix requires the exact q4/group64 A3B config")
 
-    text_model = getattr(model, "language_model", None)
-    inner = getattr(text_model, "model", None)
-    layers = list(getattr(inner, "layers", ()) or ())
-    mtp_layers = list(getattr(getattr(model, "mtp", None), "layers", ()) or ())
-    actual_types = tuple(
-        "linear_attention"
-        if bool(getattr(layer, "is_linear", hasattr(layer, "linear_attn")))
-        else "full_attention"
-        for layer in layers
-    )
-    if len(layers) != 40 or len(mtp_layers) != 1 or actual_types != _LAYER_TYPES:
-        _fail("compiled A3B target-prefix requires 30 GDN and 10 attention layers")
-
-    for index, (layer, kind) in enumerate(zip(layers, _LAYER_TYPES)):
-        if kind == "linear_attention":
-            gdn = getattr(layer, "linear_attn", None)
-            if (
-                gdn is None
-                or getattr(gdn, "sharding_group", None) is not None
-                or int(getattr(gdn, "num_v_heads", -1)) != 32
-                or int(getattr(gdn, "num_k_heads", -1)) != 16
-                or int(getattr(gdn, "head_v_dim", -1)) != 128
-                or int(getattr(gdn, "head_k_dim", -1)) != 128
-                or int(getattr(gdn, "conv_kernel_size", -1)) != 4
-                or int(getattr(gdn, "conv_dim", -1)) != 8192
-            ):
-                _fail(f"compiled A3B target-prefix GDN geometry mismatch at layer {index}")
-        elif not hasattr(layer, "self_attn"):
+    if len(model.mtp.layers) != 1:
+        _fail("compiled A3B target-prefix requires one constructed MTP layer")
+    layers = model.language_model.model.layers
+    for index in _FULL_ATTENTION_INDICES:
+        attention = getattr(layers[index], "self_attn", None)
+        if (
+            attention is None
+            or getattr(attention, "sharding_group", None) is not None
+            or int(getattr(attention, "num_attention_heads", -1)) != 16
+            or int(getattr(attention, "num_key_value_heads", -1)) != 2
+            or int(getattr(attention, "head_dim", -1)) != 256
+        ):
             _fail(f"compiled A3B target-prefix attention ownership missing at layer {index}")
 
     factory = A3BCompiledTargetPrefixFactory(
@@ -149,16 +135,9 @@ def prepare_a3b_compiled_target_prefix(
         full_attention_layers=10,
         hidden_size=2048,
         quantization="affine_q4_group64",
+        gdn_postconv=gdn_postconv_factory,
     )
-    setattr(model, _FACTORY_ATTRIBUTE, factory)
     return factory
-
-
-def a3b_compiled_target_prefix_factory(
-    model: Any,
-) -> A3BCompiledTargetPrefixFactory | None:
-    factory = getattr(model, _FACTORY_ATTRIBUTE, None)
-    return factory if isinstance(factory, A3BCompiledTargetPrefixFactory) else None
 
 
 def _make_a3b_k1_target_prefix_m2_step(
@@ -169,8 +148,7 @@ def _make_a3b_k1_target_prefix_m2_step(
     spec = _STATE_SPEC
 
     def step(input_ids, *state_in):
-        bank = host["bank"]
-        shadow = bank._shadow
+        shadow = host["shadow"]
         position = 0
         for index, kind, leaves in spec:
             entry = shadow[index]
@@ -186,55 +164,133 @@ def _make_a3b_k1_target_prefix_m2_step(
                 entry.cache[1] = state_in[position + 1]
             position += leaves
         with attention_phase("decode_verify"):
-            logits, hidden, captures = bank._runtime_forward(
+            logits, hidden, captures = host[
+                "runtime"
+            ]._forward_ar_capture_a3b_postconv(
                 input_ids,
                 cache=shadow,
-                return_hidden=True,
                 hidden_variant=host["hidden_variant"],
+                postconv_implementations=host["postconv_implementations"],
             )
-        flattened_captures: list[Any] = []
-        state_out: list[Any] = []
+        primary_state: list[Any] = []
+        final_state: list[Any] = []
         for index, kind, _leaves in spec:
             entry = shadow[index]
             if kind == VERIFY_SPEC_KIND_GDN:
                 layer_capture = captures[index]
-                flattened_captures.extend(
-                    (layer_capture["conv_states"], layer_capture["states"])
+                primary_state.extend(
+                    (
+                        layer_capture["conv_states"][:, 0, :, :],
+                        layer_capture["states"][:, 0, :, :, :],
+                    )
                 )
-                state_out.extend((entry.cache[0], entry.cache[1]))
             else:
-                state_out.extend((entry.cache[0], entry.cache[1], entry.cache[2]))
-        return (logits, hidden, *flattened_captures, *state_out)
+                primary_state.extend(
+                    (entry.cache[0], entry.cache[1], entry.cache[2] - 1)
+                )
+            final_state.extend(entry.cache)
+        return (logits, hidden, *primary_state, *final_state)
+
+    return step
+
+
+def _make_a3b_k1_target_prefix_m1_step(
+    *,
+    host: dict[str, Any],
+) -> Callable[..., Any]:
+    """Build the fixed M1 continuation trace; Python runs only while tracing."""
+    spec = _STATE_SPEC
+
+    def step(input_ids, *state_in):
+        shadow = host["shadow"]
+        position = 0
+        for index, kind, leaves in spec:
+            entry = shadow[index]
+            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                entry.cache[0] = state_in[position]
+                entry.cache[1] = state_in[position + 1]
+                entry.cache[2] = state_in[position + 2]
+                entry.rollback_state[0] = None
+                entry.rollback_state[1] = None
+                entry.rollback_state[2] = None
+            else:
+                entry.cache[0] = state_in[position]
+                entry.cache[1] = state_in[position + 1]
+            position += leaves
+        with attention_phase("decode_verify"):
+            logits, hidden, _captures = host[
+                "runtime"
+            ]._forward_ar_capture_a3b_postconv(
+                input_ids,
+                cache=shadow,
+                hidden_variant=host["hidden_variant"],
+                postconv_implementations=host["postconv_implementations"],
+            )
+        final_state: list[Any] = []
+        for index, _kind, _leaves in spec:
+            final_state.extend(shadow[index].cache)
+        return (logits, hidden, *final_state)
 
     return step
 
 
 def _shared_m2_step(
     runtime: Any,
-    bank: CompiledVerifyBank,
+    shadow: list[Any],
     hidden_variant: str | None,
+    postconv_implementations: tuple[Callable[..., Any], ...],
 ) -> Callable[..., Any]:
     key = (id(runtime), str(hidden_variant or ""))
     entry = _SHARED_M2_STEPS.get(key)
     if entry is not None:
         compiled, host, runtime_ref = entry
         if runtime_ref() is runtime:
-            host["bank"] = bank
+            host["shadow"] = shadow
             return compiled
         _SHARED_M2_STEPS.pop(key, None)
-    host = {"bank": bank, "hidden_variant": hidden_variant}
+    host = {
+        "shadow": shadow,
+        "runtime": runtime,
+        "hidden_variant": hidden_variant,
+        "postconv_implementations": postconv_implementations,
+    }
     compiled = mx.compile(_make_a3b_k1_target_prefix_m2_step(host=host))
     _SHARED_M2_STEPS[key] = (compiled, host, weakref.ref(runtime))
     return compiled
 
 
+def _shared_m1_step(
+    runtime: Any,
+    shadow: list[Any],
+    hidden_variant: str | None,
+    postconv_implementations: tuple[Callable[..., Any], ...],
+) -> Callable[..., Any]:
+    key = (id(runtime), str(hidden_variant or ""))
+    entry = _SHARED_M1_STEPS.get(key)
+    if entry is not None:
+        compiled, host, runtime_ref = entry
+        if runtime_ref() is runtime:
+            host["shadow"] = shadow
+            return compiled
+        _SHARED_M1_STEPS.pop(key, None)
+    host = {
+        "shadow": shadow,
+        "runtime": runtime,
+        "hidden_variant": hidden_variant,
+        "postconv_implementations": postconv_implementations,
+    }
+    compiled = mx.compile(_make_a3b_k1_target_prefix_m1_step(host=host))
+    _SHARED_M1_STEPS[key] = (compiled, host, weakref.ref(runtime))
+    return compiled
+
+
 @dataclass
 class A3BK1TargetPrefixRoute:
-    """Request-owned direct M2 route installed after prompt cache creation."""
+    """Request-owned fixed M2 verifier and captured-primary M1 continuation."""
 
-    bank: CompiledVerifyBank
     cache: list[Any]
     compiled_m2: Callable[..., Any]
+    compiled_m1: Callable[..., Any]
     state_slots: tuple[tuple[list[Any], int], ...]
     rollback_slots: tuple[list[Any], ...]
     request_max_tokens: int
@@ -244,15 +300,30 @@ class A3BK1TargetPrefixRoute:
     def verify_m2(self, input_ids):
         return self._forward_m2(input_ids)
 
-    def repair_m2(self, input_ids):
-        return self._forward_m2(input_ids)
+    def repair_m1(self, input_ids, primary_state):
+        return self._forward_m1(input_ids, primary_state)
 
     def _forward_m2(self, input_ids):
         state_in = [container[slot] for container, slot in self.state_slots]
         outputs = self.compiled_m2(input_ids, *state_in)
         for (container, slot), value in zip(
             self.state_slots,
-            outputs[_STATE_START:],
+            outputs[_FINAL_STATE_START:],
+        ):
+            container[slot] = value
+        for rollback in self.rollback_slots:
+            rollback[0] = None
+            rollback[1] = None
+            rollback[2] = None
+        mx.async_eval(*outputs)
+        primary_state = tuple(outputs[_PRIMARY_STATE_START:_FINAL_STATE_START])
+        return outputs[0], outputs[1], primary_state
+
+    def _forward_m1(self, input_ids, primary_state):
+        outputs = self.compiled_m1(input_ids, *primary_state)
+        for (container, slot), value in zip(
+            self.state_slots,
+            outputs[_M1_FINAL_STATE_START:],
         ):
             container[slot] = value
         for rollback in self.rollback_slots:
@@ -263,18 +334,25 @@ class A3BK1TargetPrefixRoute:
         return outputs[0], outputs[1], None
 
     def demote(self) -> int:
-        return self.bank.demote(self.cache)
+        for index in _FULL_ATTENTION_INDICES:
+            self.cache[index] = self.cache[index].demote()
+        return 10
 
     def final_report(self, *, verify_calls: int, repair_calls: int) -> dict[str, Any]:
-        m2_calls = int(verify_calls) + int(repair_calls)
+        m2_calls = int(verify_calls)
+        m1_calls = int(repair_calls)
+        compiled_calls = m2_calls + m1_calls
         return {
             "mode": "a3b_k1_target_prefix",
             "installed": True,
             "installation_status": "installed",
-            "calls": m2_calls,
-            "compiled_calls": m2_calls,
+            "calls": compiled_calls,
+            "compiled_calls": compiled_calls,
             "m2_calls": m2_calls,
-            "buckets": {"0": m2_calls},
+            "m1_calls": m1_calls,
+            "m2_verify_calls": m2_calls,
+            "m1_repair_calls": m1_calls,
+            "buckets": {"m2_verify:0": m2_calls, "m1_repair:0": m1_calls},
             "fallback_calls": 0,
             "fallback_reasons": {},
             "growth_demotions": 0,
@@ -285,53 +363,50 @@ class A3BK1TargetPrefixRoute:
             "prompt_tokens": self.prompt_tokens,
             "max_request_context": _MAX_REQUEST_CONTEXT,
             "capture_backend": "stock",
-            "compiled_entry_count": 1,
-            "compiled_keys": ["m2:default:b0"],
+            "compiled_entry_count": 2,
+            "compiled_keys": ["m2:verify:b0", "m1:repair:b0"],
             "permanent_eager": False,
         }
 
 
-def _validate_request_cache(cache: list[Any], *, required_capacity: int) -> None:
-    if len(cache) != 40:
-        _fail("compiled A3B target-prefix requires exactly 40 target cache entries")
-    spec, reason = build_verify_state_spec(cache)
-    if spec is None or tuple(spec) != _STATE_SPEC:
-        _fail(f"compiled A3B target-prefix cache ownership mismatch: {reason or spec}")
-    if cache_has_python_offsets(cache):
-        _fail("compiled A3B target-prefix requires tensor-owned KV offsets")
-
+def _construct_a3b_target_shadow(cache: list[Any]) -> list[Any]:
+    """Construct the fixed shadow topology from trusted promoted ownership."""
+    shadow: list[Any] = [None] * 40
     for index, kind, _leaves in _STATE_SPEC:
-        entry = cache[index]
         if kind == VERIFY_SPEC_KIND_GDN:
-            if not isinstance(entry, ArraysCache):
-                _fail(f"compiled A3B target-prefix requires ArraysCache at layer {index}")
-            conv_state, recurrent_state = entry.cache
-            if (
-                tuple(conv_state.shape) != (1, 3, 8192)
-                or conv_state.dtype != mx.bfloat16
-                or tuple(recurrent_state.shape) != (1, 32, 128, 128)
-                or recurrent_state.dtype != mx.float32
-            ):
-                _fail(f"compiled A3B target-prefix GDN cache mismatch at layer {index}")
+            shadow[index] = ArraysCache(2)
         else:
-            if not isinstance(entry, TensorOffsetKVCache):
-                _fail(f"compiled A3B target-prefix requires dense KV at layer {index}")
-            keys, values, _offset = entry.cache
-            if (
-                tuple(keys.shape[:2]) != (1, 2)
-                or int(keys.shape[-1]) != 256
-                or tuple(values.shape) != tuple(keys.shape)
-                or keys.dtype != mx.bfloat16
-                or values.dtype != mx.bfloat16
-                or int(keys.shape[2]) < required_capacity
-            ):
-                _fail(f"compiled A3B target-prefix dense KV mismatch at layer {index}")
+            source = cache[index]
+            entry = TensorOffsetKVCache(
+                source.cache[0],
+                source.cache[1],
+                source.cache[2],
+                step=source.step,
+            )
+            entry.cache = [None, None, None]
+            shadow[index] = entry
+    return shadow
+
+
+def _construct_a3b_target_cache(
+    cache: list[Any],
+    *,
+    reserve_tokens: int,
+) -> list[Any]:
+    """Promote the ten proven attention positions and construct their shadow."""
+    for index in _FULL_ATTENTION_INDICES:
+        cache[index] = TensorOffsetKVCache.from_kv_cache(
+            cache[index],
+            reserve_tokens=reserve_tokens,
+        )
+    return _construct_a3b_target_shadow(cache)
 
 
 def install_a3b_k1_target_prefix_route(
     runtime: Any,
     cache: list[Any],
     *,
+    factory: A3BCompiledTargetPrefixFactory,
     max_tokens: int,
     prompt_tokens: int,
     verify_strategy: str,
@@ -341,10 +416,7 @@ def install_a3b_k1_target_prefix_route(
     hidden_variant: str | None,
     state_rebase_every: int,
 ) -> A3BK1TargetPrefixRoute:
-    """Validate request/cache facts once and install the fixed bucket-0 route."""
-    factory = getattr(getattr(runtime, "model", None), _FACTORY_ATTRIBUTE, None)
-    if not isinstance(factory, A3BCompiledTargetPrefixFactory):
-        _fail("compiled A3B target-prefix model contract was not installed at load")
+    """Validate external request facts and construct the fixed route."""
     if (
         verify_strategy != "target_prefix"
         or int(speculative_depth) != 1
@@ -365,35 +437,10 @@ def install_a3b_k1_target_prefix_route(
         _fail("compiled A3B target-prefix requires the measured donation boundary")
 
     reserve = int(max_tokens) + 2
-    _promoted, failures = promote_kv_cache_offsets(
+    shadow = _construct_a3b_target_cache(
         cache,
-        reserve_tokens=2,
-        preserve_paged=True,
-        initial_reserve_tokens=reserve,
+        reserve_tokens=reserve,
     )
-    if failures:
-        _fail("compiled A3B target-prefix cache promotion failed: " + ",".join(failures))
-    full_attention_entries = [
-        cache[index]
-        for index, kind, _leaves in _STATE_SPEC
-        if kind == VERIFY_SPEC_KIND_FULL_ATTN
-    ]
-    required_capacity = max(int(entry.size()) for entry in full_attention_entries) + reserve
-    _validate_request_cache(cache, required_capacity=required_capacity)
-
-    bank = CompiledVerifyBank(
-        runtime,
-        max_verify_len=2,
-        request_max_tokens=int(max_tokens),
-        capture_backend="stock",
-    )
-    if bank.permanent_eager:
-        _fail("compiled A3B target-prefix requires affine q4/group64 target weights")
-    bank._spec = list(_STATE_SPEC)
-    bank._ensure_shadow(cache)
-    if bank._resolve_bucket(cache, 2) != 0:
-        _fail("compiled A3B target-prefix requires the fixed dense bucket-0 cache")
-    bank._clear_shadow_leaf_refs()
 
     state_slots: list[tuple[list[Any], int]] = []
     rollback_slots: list[list[Any]] = []
@@ -404,9 +451,19 @@ def install_a3b_k1_target_prefix_route(
             rollback_slots.append(entry.rollback_state)
 
     return A3BK1TargetPrefixRoute(
-        bank=bank,
         cache=cache,
-        compiled_m2=_shared_m2_step(runtime, bank, hidden_variant),
+        compiled_m2=_shared_m2_step(
+            runtime,
+            shadow,
+            hidden_variant,
+            factory.gdn_postconv.m2_implementations,
+        ),
+        compiled_m1=_shared_m1_step(
+            runtime,
+            shadow,
+            hidden_variant,
+            factory.gdn_postconv.m1_implementations,
+        ),
         state_slots=tuple(state_slots),
         rollback_slots=tuple(rollback_slots),
         request_max_tokens=int(max_tokens),

@@ -23,8 +23,8 @@ import mlx.core as mx
 import numpy as np
 
 from .a3b_compiled_target_prefix import (
-    a3b_compiled_target_prefix_factory,
     install_a3b_k1_target_prefix_route,
+    validate_a3b_k1_target_prefix_sampler,
 )
 from .adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from .attention_context import attention_phase
@@ -3424,6 +3424,18 @@ def _batched_distributions_from_mlx_logits(
     return batched_sparse_distributions_from_mlx_logits(logits, config)
 
 
+def _validate_target_prefix_sampler_request(config: SamplerConfig) -> None:
+    """Reject an unsupported external target-prefix sampler before prompt work."""
+    if (
+        config.temperature > 0
+        and int(config.top_k or 0) <= 0
+        and 0 < config.top_p < 1.0
+    ):
+        raise RuntimeError(
+            "target_prefix verification requires top-k sampling or top_p=1"
+        )
+
+
 def _sample_from_logits(
     logits: mx.array,
     config: SamplerConfig,
@@ -5315,6 +5327,15 @@ def generate_mtpk(
             "or 'trim_commit'"
         )
     target_prefix_verify = verify_strategy == "target_prefix"
+    exact_a3b_target_prefix_factory = (
+        rt.a3b_compiled_target_prefix_factory if target_prefix_verify else None
+    )
+    exact_a3b_target_prefix = exact_a3b_target_prefix_factory is not None
+    if target_prefix_verify:
+        if exact_a3b_target_prefix:
+            validate_a3b_k1_target_prefix_sampler(sampler)
+        else:
+            _validate_target_prefix_sampler_request(sampler)
     counter_start = _runtime_counter_snapshot(rt)
     verify_core_backend = resolve_gdn_capture_backend(verify_core)
     online_hidden_enabled = online_hidden_corrector_alpha > 0.0
@@ -5472,12 +5493,10 @@ def generate_mtpk(
         else None
     )
     _compiled_verify_mode = compiled_verify_mode()
-    compiled_target_prefix = verify_strategy == "target_prefix" and _env_truthy(
-        "MTPLX_COMPILED_TARGET_PREFIX"
-    )
-    exact_a3b_target_prefix = bool(
-        compiled_target_prefix
-        and a3b_compiled_target_prefix_factory(getattr(rt, "model", None)) is not None
+    generic_compiled_target_prefix = (
+        target_prefix_verify
+        and not exact_a3b_target_prefix
+        and _env_truthy("MTPLX_COMPILED_TARGET_PREFIX")
     )
     compiled_verify_bank = (
         CompiledVerifyBank(
@@ -5490,7 +5509,7 @@ def generate_mtpk(
         if _compiled_verify_mode != "off"
         and (
             verify_strategy in {"capture_commit", "graphbank_capture_commit"}
-            or (compiled_target_prefix and not exact_a3b_target_prefix)
+            or generic_compiled_target_prefix
         )
         else None
     )
@@ -6154,6 +6173,7 @@ def generate_mtpk(
         a3b_target_prefix_route = install_a3b_k1_target_prefix_route(
             rt,
             cache,
+            factory=exact_a3b_target_prefix_factory,
             max_tokens=max_tokens,
             prompt_tokens=len(prompt_ids),
             verify_strategy=verify_strategy,
@@ -6697,14 +6717,15 @@ def generate_mtpk(
                     break
 
         before_verify = None
-        if _env_truthy("MTPLX_SKIP_VERIFY_SNAPSHOT"):
-            event["snapshot"] = "skipped_capture_commit_required"
-        else:
-            started = time.perf_counter()
-            before_verify = snapshot_untrimmable_cache(cache)
-            elapsed_snapshot = time.perf_counter() - started
-            snapshot_time += elapsed_snapshot
-            _add_timing(event, "snapshot", elapsed_snapshot)
+        if a3b_target_prefix_route is None:
+            if _env_truthy("MTPLX_SKIP_VERIFY_SNAPSHOT"):
+                event["snapshot"] = "skipped_capture_commit_required"
+            else:
+                started = time.perf_counter()
+                before_verify = snapshot_untrimmable_cache(cache)
+                elapsed_snapshot = time.perf_counter() - started
+                snapshot_time += elapsed_snapshot
+                _add_timing(event, "snapshot", elapsed_snapshot)
         lazy_bonus_verify_min_depth = _lazy_bonus_verify_min_depth()
         lazy_bonus_verify_requested = _lazy_bonus_verify_enabled()
         lazy_bonus_verify = (
@@ -6779,7 +6800,7 @@ def generate_mtpk(
                         capture_backend=verify_core_backend,
                     )
             elif a3b_target_prefix_route is not None:
-                verify_logits, verify_hidden, _compiled_captures = (
+                verify_logits, verify_hidden, a3b_primary_state = (
                     a3b_target_prefix_route.verify_m2(mx.array([verify_input]))
                 )
             elif compiled_verify_bank is not None:
@@ -6847,10 +6868,6 @@ def generate_mtpk(
                 target_distribution_logits,
                 sampler,
             )
-            if sampled_target_ids is None:
-                raise RuntimeError(
-                    "target_prefix verification requires top-k sampling or top_p=1"
-                )
             _eval(sampled_target_ids)
             target_prefix_tokens = [
                 int(token) for token in np.asarray(sampled_target_ids).reshape(-1)
@@ -7444,6 +7461,54 @@ def generate_mtpk(
             continue
 
         committed = [primary] + draft_tokens[:accepted_count]
+        if a3b_target_prefix_route is not None:
+            committed.append(rejection_correction)
+            correction_tokens += 1
+            tokens.extend(committed[1:])
+            started = time.perf_counter()
+            with attention_phase("decode_verify"):
+                repair_logits, repair_hidden, _repair_captures = (
+                    a3b_target_prefix_route.repair_m1(
+                        mx.array([[rejection_correction]]),
+                        a3b_primary_state,
+                    )
+                )
+            _eval(repair_logits, repair_hidden)
+            elapsed_repair = time.perf_counter() - started
+            target_time += elapsed_repair
+            repair_time += elapsed_repair
+            _add_timing(event, "repair_forward", elapsed_repair)
+            if _mtp_history_uses_committed_cache(mtp_history_policy):
+                _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
+                draft_time += append_mtp_history(
+                    mtp_cache,
+                    verify_hidden[:, 0:1, :],
+                    [rejection_correction],
+                )
+            cache_committed_token_count = len(tokens)
+            maybe_detach_dirty_state(cache_committed_token_count)
+            logits, hidden = own_live_logits_hidden(
+                repair_logits[:, -1, :],
+                repair_hidden[:, -1:, :],
+            )
+            maybe_rebase_decode_state(cache_committed_token_count)
+            maybe_eval_state_roots(event, cache_committed_token_count)
+            append_event(event)
+
+            if any(_is_stop(token, stop_token_ids) for token in committed):
+                stop_index = next(
+                    i
+                    for i, token in enumerate(tokens)
+                    if _is_stop(token, stop_token_ids)
+                )
+                tokens = tokens[: stop_index + 1]
+                emit_new_tokens()
+                emit_trace()
+                break
+            emit_new_tokens()
+            emit_trace()
+            continue
+
         if rejection_correction is not None:
             committed.append(rejection_correction)
             correction_tokens += 1
@@ -7484,11 +7549,7 @@ def generate_mtpk(
                 capture_commit_detach_bytes += int(commit_detach_stats["bytes"])
             _add_timing(event, "capture_commit", elapsed_commit)
 
-        if a3b_target_prefix_route is not None:
-            committed_from_trim = rejection_correction is None
-            if committed_from_trim:
-                event["capture_repair"] = "installed_a3b_m2_full_accept"
-        elif (
+        if (
             not committed_from_capture
             and verify_strategy in {"trim_commit", "target_prefix"}
             and before_verify is not None
@@ -7584,11 +7645,7 @@ def generate_mtpk(
             _add_timing(event, "rollback", elapsed_rollback)
             started = time.perf_counter()
             with attention_phase("decode_verify"):
-                if a3b_target_prefix_route is not None:
-                    repair_logits, repair_hidden, _repair_captures = (
-                        a3b_target_prefix_route.repair_m2(mx.array([committed]))
-                    )
-                elif compiled_target_prefix and compiled_verify_bank is not None:
+                if generic_compiled_target_prefix and compiled_verify_bank is not None:
                     repair_logits, repair_hidden, _repair_captures = (
                         compiled_verify_bank.forward_ar_capture(
                             mx.array([committed]),

@@ -6,9 +6,10 @@ import hashlib
 import inspect as py_inspect
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .artifacts import inspect_model, load_config
 from .mtp_adapters import (
@@ -19,6 +20,9 @@ from .mtp_adapters import (
 from .mtp_patch import MTPContract, inject_mtp_support, validate_mtp_support
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .a3b_compiled_target_prefix import A3BCompiledTargetPrefixFactory
 
 
 @dataclass
@@ -31,6 +35,7 @@ class MTPLXRuntime:
     mtp_adapter_path: Path | None = None
     mtp_adapter_metadata: dict[str, Any] | None = None
     mtp_adapter_merge_report: dict[str, Any] | None = None
+    a3b_compiled_target_prefix_factory: A3BCompiledTargetPrefixFactory | None = None
     diagnostic_counters: dict[str, int] = field(default_factory=dict)
     _forward_ar_supports_emit_logits: bool | None = field(default=None, init=False, repr=False)
     _forward_ar_supports_logits_keep: bool | None = field(default=None, init=False, repr=False)
@@ -168,6 +173,24 @@ class MTPLXRuntime:
             return_hidden=return_hidden,
             hidden_variant=hidden_variant,
             capture_backend=capture_backend,
+        )
+
+    def _forward_ar_capture_a3b_postconv(
+        self,
+        input_ids,
+        *,
+        cache,
+        hidden_variant: str | None,
+        postconv_implementations: tuple[Callable[..., Any], ...],
+    ):
+        from .gdn_capture import forward_with_a3b_gdn_postconv_capture
+
+        return forward_with_a3b_gdn_postconv_capture(
+            self.model,
+            input_ids,
+            cache=cache,
+            hidden_variant=hidden_variant,
+            postconv_implementations=postconv_implementations,
         )
 
     def draft_mtp(
@@ -439,7 +462,7 @@ def load(
 
     router_plan = prepare_qwen_row_owned_routers(model, config=config)
     postconv_plan = prepare_a3b_gdn_postconv(model, config=config)
-    prepare_a3b_compiled_target_prefix(model, config=config)
+    postconv_factory = None
     from .kernel_selfcheck import maybe_run_model_selfcheck
 
     selfcheck_report = maybe_run_model_selfcheck(model)
@@ -447,10 +470,17 @@ def load(
         router_report = install_qwen_row_owned_routers(router_plan, selfcheck_report)
         logger.info("[qwen-row-owned-router] %s", router_report)
     if postconv_plan is not None:
-        postconv_report = install_a3b_gdn_postconv(
+        postconv_factory = install_a3b_gdn_postconv(
             postconv_plan, selfcheck_report
         )
-        logger.info("[a3b-gdn-postconv] %s", postconv_report)
+        from .gdn_capture import gdn_postconv_stats
+
+        logger.info("[a3b-gdn-postconv] %s", gdn_postconv_stats())
+    compiled_target_factory = prepare_a3b_compiled_target_prefix(
+        model,
+        config=config,
+        gdn_postconv_factory=postconv_factory,
+    )
     adapter_path = Path(mtp_adapter) if mtp_adapter is not None else None
     adapter_metadata = None
     adapter_merge_report = None
@@ -471,6 +501,7 @@ def load(
         mtp_adapter_path=adapter_path,
         mtp_adapter_metadata=adapter_metadata,
         mtp_adapter_merge_report=adapter_merge_report,
+        a3b_compiled_target_prefix_factory=compiled_target_factory,
     )
 
 
