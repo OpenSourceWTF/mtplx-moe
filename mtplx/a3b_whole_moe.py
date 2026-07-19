@@ -52,11 +52,9 @@ class A3BWholeMoeBinding:
     block: Any
     variant: A3BWholeMoeVariant
     router: ProjectionStorage
-    routed_gate: ProjectionStorage
-    routed_up: ProjectionStorage
+    routed_gate_up: ProjectionStorage
     routed_down: ProjectionStorage
-    shared_gate: ProjectionStorage
-    shared_up: ProjectionStorage
+    shared_gate_up: ProjectionStorage
     shared_down: ProjectionStorage
     shared_scalar_gate: ProjectionStorage
 
@@ -217,21 +215,13 @@ def _target_binding(block: Any, *, norm_weight: Any) -> A3BWholeMoeBinding:
             weight_shape=(256, 512),
             metadata_shape=(256, 32),
         ),
-        routed_gate=_require_quantized(
-            switch.gate_proj,
-            label="target routed gate",
+        routed_gate_up=_require_quantized(
+            switch.gate_up_proj,
+            label="target routed gate/up",
             bits=4,
             group_size=64,
-            weight_shape=(256, 512, 256),
-            metadata_shape=(256, 512, 32),
-        ),
-        routed_up=_require_quantized(
-            switch.up_proj,
-            label="target routed up",
-            bits=4,
-            group_size=64,
-            weight_shape=(256, 512, 256),
-            metadata_shape=(256, 512, 32),
+            weight_shape=(256, 1024, 256),
+            metadata_shape=(256, 1024, 32),
         ),
         routed_down=_require_quantized(
             switch.down_proj,
@@ -241,21 +231,13 @@ def _target_binding(block: Any, *, norm_weight: Any) -> A3BWholeMoeBinding:
             weight_shape=(256, 2048, 64),
             metadata_shape=(256, 2048, 8),
         ),
-        shared_gate=_require_quantized(
-            shared.gate_proj,
-            label="target shared gate",
+        shared_gate_up=_require_quantized(
+            shared.gate_up_proj,
+            label="target shared gate/up",
             bits=4,
             group_size=64,
-            weight_shape=(512, 256),
-            metadata_shape=(512, 32),
-        ),
-        shared_up=_require_quantized(
-            shared.up_proj,
-            label="target shared up",
-            bits=4,
-            group_size=64,
-            weight_shape=(512, 256),
-            metadata_shape=(512, 32),
+            weight_shape=(1024, 256),
+            metadata_shape=(1024, 32),
         ),
         shared_down=_require_quantized(
             shared.down_proj,
@@ -289,21 +271,13 @@ def _mtp_binding(block: Any, *, norm_weight: Any) -> A3BWholeMoeBinding:
             label="MTP router",
             weight_shape=(256, 2048),
         ),
-        routed_gate=_require_quantized(
-            switch.gate_proj,
-            label="MTP routed gate",
+        routed_gate_up=_require_quantized(
+            switch.gate_up_proj,
+            label="MTP routed gate/up",
             bits=4,
             group_size=32,
-            weight_shape=(256, 512, 256),
-            metadata_shape=(256, 512, 64),
-        ),
-        routed_up=_require_quantized(
-            switch.up_proj,
-            label="MTP routed up",
-            bits=4,
-            group_size=32,
-            weight_shape=(256, 512, 256),
-            metadata_shape=(256, 512, 64),
+            weight_shape=(256, 1024, 256),
+            metadata_shape=(256, 1024, 64),
         ),
         routed_down=_require_quantized(
             switch.down_proj,
@@ -313,15 +287,10 @@ def _mtp_binding(block: Any, *, norm_weight: Any) -> A3BWholeMoeBinding:
             weight_shape=(256, 2048, 64),
             metadata_shape=(256, 2048, 16),
         ),
-        shared_gate=_require_dense(
-            shared.gate_proj,
-            label="MTP shared gate",
-            weight_shape=(512, 2048),
-        ),
-        shared_up=_require_dense(
-            shared.up_proj,
-            label="MTP shared up",
-            weight_shape=(512, 2048),
+        shared_gate_up=_require_dense(
+            shared.gate_up_proj,
+            label="MTP shared gate/up",
+            weight_shape=(1024, 2048),
         ),
         shared_down=_require_dense(
             shared.down_proj,

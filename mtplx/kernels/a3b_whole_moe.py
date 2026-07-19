@@ -301,27 +301,23 @@ def _target_stage2_source() -> str:
                 ? expert_ids[row * TOP_K + slot]
                 : uint(0);
             const device uint* gate_words = slot < TOP_K
-                ? routed_gate_weight + expert * INTERMEDIATE * (HIDDEN / 8)
-                : shared_gate_weight;
+                ? routed_gate_up_weight
+                    + expert * 2 * INTERMEDIATE * (HIDDEN / 8)
+                : shared_gate_up_weight;
+            const device uint* up_words = gate_words
+                + INTERMEDIATE * (HIDDEN / 8);
             const device bfloat* gate_scale_values = slot < TOP_K
-                ? routed_gate_scales
-                    + expert * INTERMEDIATE * (HIDDEN / ROUTED_GROUP)
-                : shared_gate_scales;
+                ? routed_gate_up_scales
+                    + expert * 2 * INTERMEDIATE * (HIDDEN / ROUTED_GROUP)
+                : shared_gate_up_scales;
             const device bfloat* gate_bias_values = slot < TOP_K
-                ? routed_gate_biases
-                    + expert * INTERMEDIATE * (HIDDEN / ROUTED_GROUP)
-                : shared_gate_biases;
-            const device uint* up_words = slot < TOP_K
-                ? routed_up_weight + expert * INTERMEDIATE * (HIDDEN / 8)
-                : shared_up_weight;
-            const device bfloat* up_scale_values = slot < TOP_K
-                ? routed_up_scales
-                    + expert * INTERMEDIATE * (HIDDEN / ROUTED_GROUP)
-                : shared_up_scales;
-            const device bfloat* up_bias_values = slot < TOP_K
-                ? routed_up_biases
-                    + expert * INTERMEDIATE * (HIDDEN / ROUTED_GROUP)
-                : shared_up_biases;
+                ? routed_gate_up_biases
+                    + expert * 2 * INTERMEDIATE * (HIDDEN / ROUTED_GROUP)
+                : shared_gate_up_biases;
+            const device bfloat* up_scale_values = gate_scale_values
+                + INTERMEDIATE * (HIDDEN / ROUTED_GROUP);
+            const device bfloat* up_bias_values = gate_bias_values
+                + INTERMEDIATE * (HIDDEN / ROUTED_GROUP);
             const device uchar* gate_bytes =
                 reinterpret_cast<const device uchar*>(gate_words);
             const device uchar* up_bytes =
@@ -423,22 +419,21 @@ def _mtp_stage2_source() -> str:
             float up_result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             if (slot < TOP_K) {
                 uint expert = expert_ids[row * TOP_K + slot];
+                const device uint* gate_words = routed_gate_up_weight
+                    + expert * 2 * INTERMEDIATE * (HIDDEN / 8);
                 const device uchar* gate_bytes =
-                    reinterpret_cast<const device uchar*>(
-                        routed_gate_weight
-                        + expert * INTERMEDIATE * (HIDDEN / 8));
+                    reinterpret_cast<const device uchar*>(gate_words);
                 const device uchar* up_bytes =
                     reinterpret_cast<const device uchar*>(
-                        routed_up_weight
-                        + expert * INTERMEDIATE * (HIDDEN / 8));
-                const device bfloat* gate_scale_values = routed_gate_scales
-                    + expert * INTERMEDIATE * (HIDDEN / ROUTED_GROUP);
-                const device bfloat* gate_bias_values = routed_gate_biases
-                    + expert * INTERMEDIATE * (HIDDEN / ROUTED_GROUP);
-                const device bfloat* up_scale_values = routed_up_scales
-                    + expert * INTERMEDIATE * (HIDDEN / ROUTED_GROUP);
-                const device bfloat* up_bias_values = routed_up_biases
-                    + expert * INTERMEDIATE * (HIDDEN / ROUTED_GROUP);
+                        gate_words + INTERMEDIATE * (HIDDEN / 8));
+                const device bfloat* gate_scale_values = routed_gate_up_scales
+                    + expert * 2 * INTERMEDIATE * (HIDDEN / ROUTED_GROUP);
+                const device bfloat* gate_bias_values = routed_gate_up_biases
+                    + expert * 2 * INTERMEDIATE * (HIDDEN / ROUTED_GROUP);
+                const device bfloat* up_scale_values = gate_scale_values
+                    + INTERMEDIATE * (HIDDEN / ROUTED_GROUP);
+                const device bfloat* up_bias_values = gate_bias_values
+                    + INTERMEDIATE * (HIDDEN / ROUTED_GROUP);
                 for (uint k_block = 0; k_block < HIDDEN; k_block += K_BLOCK) {
                     uint k_lane = k_block + lane * VALUES_PER_LANE;
                     float input_values[VALUES_PER_LANE];
@@ -504,9 +499,11 @@ def _mtp_stage2_source() -> str:
                     for (uint result_index = 0; result_index < 4; ++result_index) {
                         uint output_column = output_base + result_index;
                         gate_result[result_index] += input_value * float(
-                            shared_gate_weight[output_column * HIDDEN + k_lane]);
+                            shared_gate_up_weight[
+                                output_column * HIDDEN + k_lane]);
                         up_result[result_index] += input_value * float(
-                            shared_up_weight[output_column * HIDDEN + k_lane]);
+                            shared_gate_up_weight[
+                                (INTERMEDIATE + output_column) * HIDDEN + k_lane]);
                     }
                 }
             }
@@ -869,30 +866,20 @@ _STAGE1_OUTPUT_NAMES = ["expert_ids", "route_scores", "shared_gate"]
 _TARGET_STAGE2_INPUT_NAMES = [
     "value",
     "expert_ids",
-    "routed_gate_weight",
-    "routed_gate_scales",
-    "routed_gate_biases",
-    "routed_up_weight",
-    "routed_up_scales",
-    "routed_up_biases",
-    "shared_gate_weight",
-    "shared_gate_scales",
-    "shared_gate_biases",
-    "shared_up_weight",
-    "shared_up_scales",
-    "shared_up_biases",
+    "routed_gate_up_weight",
+    "routed_gate_up_scales",
+    "routed_gate_up_biases",
+    "shared_gate_up_weight",
+    "shared_gate_up_scales",
+    "shared_gate_up_biases",
 ]
 _MTP_STAGE2_INPUT_NAMES = [
     "value",
     "expert_ids",
-    "routed_gate_weight",
-    "routed_gate_scales",
-    "routed_gate_biases",
-    "routed_up_weight",
-    "routed_up_scales",
-    "routed_up_biases",
-    "shared_gate_weight",
-    "shared_up_weight",
+    "routed_gate_up_weight",
+    "routed_gate_up_scales",
+    "routed_gate_up_biases",
+    "shared_gate_up_weight",
 ]
 _STAGE2_OUTPUT_NAMES = ["activations"]
 _TARGET_STAGE3_INPUT_NAMES = [
@@ -1056,25 +1043,17 @@ def mtp_m1_stage1(value: Any, binding: Any):
 
 
 def _target_stage2_inputs(value: Any, expert_ids: Any, binding: Any) -> list[Any]:
-    routed_gate = binding.routed_gate
-    routed_up = binding.routed_up
-    shared_gate = binding.shared_gate
-    shared_up = binding.shared_up
+    routed_gate_up = binding.routed_gate_up
+    shared_gate_up = binding.shared_gate_up
     return [
         value,
         expert_ids,
-        routed_gate.weight,
-        routed_gate.scales,
-        routed_gate.biases,
-        routed_up.weight,
-        routed_up.scales,
-        routed_up.biases,
-        shared_gate.weight,
-        shared_gate.scales,
-        shared_gate.biases,
-        shared_up.weight,
-        shared_up.scales,
-        shared_up.biases,
+        routed_gate_up.weight,
+        routed_gate_up.scales,
+        routed_gate_up.biases,
+        shared_gate_up.weight,
+        shared_gate_up.scales,
+        shared_gate_up.biases,
     ]
 
 
@@ -1109,21 +1088,16 @@ def target_m2_stage2(value: Any, expert_ids: Any, binding: Any):
 def mtp_m1_stage2(value: Any, expert_ids: Any, binding: Any):
     """Launch fixed BF16 MTP M1 `[1,9,512]` activation ownership."""
 
-    routed_gate = binding.routed_gate
-    routed_up = binding.routed_up
+    routed_gate_up = binding.routed_gate_up
     kernel = _build_mtp_m1_stage2_kernel()
     (activations,) = kernel(
         inputs=[
             value,
             expert_ids,
-            routed_gate.weight,
-            routed_gate.scales,
-            routed_gate.biases,
-            routed_up.weight,
-            routed_up.scales,
-            routed_up.biases,
-            binding.shared_gate.weight,
-            binding.shared_up.weight,
+            routed_gate_up.weight,
+            routed_gate_up.scales,
+            routed_gate_up.biases,
+            binding.shared_gate_up.weight,
         ],
         grid=(STAGE2_THREADGROUPS * TILED_THREADS, 1, 1),
         threadgroup=(TILED_THREADS, 1, 1),

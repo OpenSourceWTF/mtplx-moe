@@ -122,8 +122,9 @@ def _quantized_routed_projection(output: int, *, group_size: int):
 
 def _sparse_block(*, gate, routed_group_size: int, shared_quantized: bool, scalar_gate):
     switch_mlp = SimpleNamespace(
-        gate_proj=_quantized_routed_projection(512, group_size=routed_group_size),
-        up_proj=_quantized_routed_projection(512, group_size=routed_group_size),
+        gate_up_proj=_quantized_routed_projection(
+            1024, group_size=routed_group_size
+        ),
         down_proj=_Projection(
             (256, 2048, 512 * 4 // 32),
             bits=4,
@@ -134,13 +135,9 @@ def _sparse_block(*, gate, routed_group_size: int, shared_quantized: bool, scala
     )
     if shared_quantized:
         shared_expert = SimpleNamespace(
-            gate_proj=_Projection(
-                (512, 256), bits=4, group_size=64,
-                scales_shape=(512, 32), biases_shape=(512, 32),
-            ),
-            up_proj=_Projection(
-                (512, 256), bits=4, group_size=64,
-                scales_shape=(512, 32), biases_shape=(512, 32),
+            gate_up_proj=_Projection(
+                (1024, 256), bits=4, group_size=64,
+                scales_shape=(1024, 32), biases_shape=(1024, 32),
             ),
             down_proj=_Projection(
                 (2048, 64), bits=4, group_size=64,
@@ -149,8 +146,7 @@ def _sparse_block(*, gate, routed_group_size: int, shared_quantized: bool, scala
         )
     else:
         shared_expert = SimpleNamespace(
-            gate_proj=_Projection((512, 2048)),
-            up_proj=_Projection((512, 2048)),
+            gate_up_proj=_Projection((1024, 2048)),
             down_proj=_Projection((2048, 512)),
         )
     return _FakeSparseBlock(
@@ -235,6 +231,13 @@ def test_exact_checkpoint_builds_40_target_and_one_mtp_binding(monkeypatch):
         "target_q8g64_q4g64"
     }
     assert plan.mtp_bindings[0].variant == "mtp_dense_q4g32_dense"
+    assert plan.target_bindings[0].routed_gate_up.weight.shape == (
+        256,
+        1024,
+        256,
+    )
+    assert plan.target_bindings[0].shared_gate_up.weight.shape == (1024, 256)
+    assert plan.mtp_bindings[0].shared_gate_up.weight.shape == (1024, 2048)
 
 
 @pytest.mark.parametrize(
@@ -296,11 +299,11 @@ def test_exact_checkpoint_builds_40_target_and_one_mtp_binding(monkeypatch):
         ),
         (
             lambda config, model: setattr(
-                model.language_model.model.layers[0].mlp.switch_mlp.gate_proj.weight,
+                model.language_model.model.layers[0].mlp.switch_mlp.gate_up_proj.weight,
                 "shape",
-                (256, 512, 128),
+                (256, 1024, 128),
             ),
-            "target routed gate",
+            "target routed gate/up",
         ),
         (
             lambda config, model: setattr(
@@ -312,11 +315,11 @@ def test_exact_checkpoint_builds_40_target_and_one_mtp_binding(monkeypatch):
         ),
         (
             lambda config, model: setattr(
-                model.mtp.layers[0].mlp.shared_expert.up_proj.weight,
+                model.mtp.layers[0].mlp.shared_expert.gate_up_proj.weight,
                 "dtype",
                 mx.float32,
             ),
-            "MTP shared up",
+            "MTP shared gate/up",
         ),
     ],
 )
@@ -445,11 +448,19 @@ def test_stage2_sources_encode_selected_q4_and_exact_bf16_swiglu():
         assert "bfloat gate_value = bfloat(gate_sum)" in source
         assert "bfloat up_value = bfloat(up_sum)" in source
         assert "activations[output_index] = bfloat(silu * up_value)" in source
+        assert "routed_gate_up_weight" in source
+        assert "shared_gate_up_weight" in source
+        assert "routed_gate_weight" not in source
+        assert "routed_up_weight" not in source
     source = sources["mtp_m1_stage2"]
     assert "constexpr uint ROUTED_GROUP = 32" in source
     assert "qdot4_affine" in source
     assert "dense_shared_dot" in source
     assert "sigmoid_mlx_exact" in source
+    assert "routed_gate_up_weight" in source
+    assert "shared_gate_up_weight" in source
+    assert "routed_gate_weight" not in source
+    assert "routed_up_weight" not in source
 
 
 def test_stage3_sources_encode_down_reduction_shared_gate_and_only_final_store():
