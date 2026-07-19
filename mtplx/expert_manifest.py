@@ -41,6 +41,10 @@ MAX_INDEX_BYTES = 128 * 1024 * 1024
 MAX_MANIFEST_SHARDS = 4_096
 MAX_MANIFEST_RESIDENT_TENSORS = 1_000_000
 MAX_MANIFEST_RECORDS = 100_000
+# A 226 GB bank at the ~15 GiB per-part size the hosting limit suggests is
+# about 15 parts; the cap is loose enough to never bind in practice and tight
+# enough that a hostile manifest cannot ask for unbounded descriptors.
+MAX_SIDECAR_PARTS = 1_024
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 _PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
@@ -475,6 +479,10 @@ class ExpertRecord:
     sha256: str | None = None
     sidecar_offset: int | None = None
     sidecar_length: int | None = None
+    # Index into ``SidecarInfo.parts``.  Part 0 is the only part a
+    # single-file sidecar has, so the default keeps every pre-parts
+    # manifest describing exactly what it described before.
+    part: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -488,6 +496,11 @@ class ExpertRecord:
         if self.sidecar_offset is not None:
             result["sidecar_offset"] = self.sidecar_offset
             result["sidecar_length"] = self.sidecar_length
+        # Emitted only when non-default so single-part manifests serialize
+        # byte-identically to what they were before parts existed -- the
+        # manifest digest is taken over this JSON.
+        if self.part:
+            result["part"] = self.part
         return result
 
     @classmethod
@@ -497,7 +510,7 @@ class ExpertRecord:
             obj,
             label="expert record",
             required=("layer", "expert", "logical_bytes", "segments"),
-            optional=("sha256", "sidecar_offset", "sidecar_length"),
+            optional=("sha256", "sidecar_offset", "sidecar_length", "part"),
         )
         raw_segments = obj["segments"]
         if not isinstance(raw_segments, list):
@@ -539,39 +552,198 @@ class ExpertRecord:
                 if sidecar_length is None
                 else _integer(sidecar_length, label="record sidecar_length", minimum=1)
             ),
+            part=_integer(obj.get("part", 0), label="record part", minimum=0),
         )
 
 
 @dataclass(frozen=True)
-class SidecarInfo:
+class SidecarPart:
+    """One file of an expert bank.
+
+    ``data_start`` is where the record region begins inside the file.  A raw
+    ``.bin`` bank starts at 0; a safetensors-framed part starts after its
+    header, and record offsets stay relative to it so a record's position in
+    the manifest never depends on how long the header happens to be.
+    """
+
     file: str
-    alignment: int
     size: int
     sha256: str
+    data_start: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "file": self.file,
-            "alignment": self.alignment,
             "size": self.size,
             "sha256": self.sha256,
+        }
+        if self.data_start:
+            result["data_start"] = self.data_start
+        return result
+
+    @classmethod
+    def from_dict(cls, value: Any) -> SidecarPart:
+        obj = _expect_object(value, label="sidecar part")
+        _expect_keys(
+            obj,
+            label="sidecar part",
+            required=("file", "size", "sha256"),
+            optional=("data_start",),
+        )
+        return cls(
+            file=_safe_relative_name(obj["file"], label="sidecar file"),
+            size=_integer(obj["size"], label="sidecar size", minimum=1),
+            sha256=_string(obj["sha256"], label="sidecar sha256"),
+            data_start=_integer(
+                obj.get("data_start", 0), label="sidecar data_start", minimum=0
+            ),
+        )
+
+
+@dataclass(frozen=True, init=False)
+class SidecarInfo:
+    """The expert bank: one or more parts holding whole expert records.
+
+    ``pread`` does not care how many files the bank spans, so the bank may be
+    split to stay under a hosting file-size limit.  A record never straddles a
+    part, which keeps the split a matter of *which file* rather than of range
+    arithmetic.
+
+    The single-file spelling (``file``/``size``/``sha256`` as scalars) is
+    still accepted on construction and still emitted by ``to_dict`` for
+    one-part banks, so manifests written before parts existed parse and
+    re-serialize unchanged.
+    """
+
+    alignment: int
+    parts: tuple[SidecarPart, ...]
+
+    def __init__(
+        self,
+        *,
+        alignment: int,
+        parts: Iterable[SidecarPart] | None = None,
+        file: str | None = None,
+        size: int | None = None,
+        sha256: str | None = None,
+        data_start: int = 0,
+    ) -> None:
+        overrides = {
+            key: value
+            for key, value in (
+                ("file", file),
+                ("size", size),
+                ("sha256", sha256),
+            )
+            if value is not None
+        }
+        if data_start:
+            overrides["data_start"] = data_start
+        if parts is None:
+            missing = {"file", "size", "sha256"} - set(overrides)
+            if missing:
+                raise ExpertManifestError(
+                    "sidecar requires either parts or file/size/sha256"
+                )
+            resolved = (SidecarPart(**overrides),)
+        else:
+            resolved = tuple(parts)
+            if overrides:
+                # ``replace(sidecar, sha256=...)`` is the single-part spelling
+                # applied to an existing bank.  It only means something when
+                # there is exactly one part to apply it to.
+                if len(resolved) != 1:
+                    raise ExpertManifestError(
+                        "the single-part file/size/sha256 spelling cannot "
+                        "address a multi-part sidecar"
+                    )
+                resolved = (replace(resolved[0], **overrides),)
+        if not resolved:
+            raise ExpertManifestError("sidecar requires at least one part")
+        object.__setattr__(self, "alignment", alignment)
+        object.__setattr__(self, "parts", resolved)
+
+    def _only(self) -> SidecarPart:
+        if len(self.parts) != 1:
+            raise ExpertManifestError(
+                "this sidecar has multiple parts; ask for the part a record "
+                "lives in instead of the whole-bank file/size/sha256"
+            )
+        return self.parts[0]
+
+    @property
+    def file(self) -> str:
+        return self._only().file
+
+    @property
+    def size(self) -> int:
+        return self._only().size
+
+    @property
+    def sha256(self) -> str:
+        return self._only().sha256
+
+    def part(self, index: int) -> SidecarPart:
+        if not 0 <= index < len(self.parts):
+            raise ExpertManifestError(f"sidecar has no part {index}")
+        return self.parts[index]
+
+    def part_for(self, record: ExpertRecord) -> SidecarPart:
+        return self.part(record.part)
+
+    def absolute_offset(self, record: ExpertRecord) -> int:
+        """The record's byte offset inside its own part file."""
+
+        if record.sidecar_offset is None:
+            raise ExpertManifestError("manifest sidecar record is incomplete")
+        return self.part_for(record).data_start + record.sidecar_offset
+
+    def to_dict(self) -> dict[str, Any]:
+        only = self.parts[0]
+        if len(self.parts) == 1 and not only.data_start:
+            # Byte-identical to the pre-parts serialization; the manifest
+            # digest is taken over this JSON, so existing digests still verify.
+            return {
+                "file": only.file,
+                "alignment": self.alignment,
+                "size": only.size,
+                "sha256": only.sha256,
+            }
+        return {
+            "alignment": self.alignment,
+            "parts": [part.to_dict() for part in self.parts],
         }
 
     @classmethod
     def from_dict(cls, value: Any) -> SidecarInfo:
         obj = _expect_object(value, label="sidecar")
-        _expect_keys(
-            obj, label="sidecar", required=("file", "alignment", "size", "sha256")
-        )
+        if "parts" in obj:
+            _expect_keys(obj, label="sidecar", required=("alignment", "parts"))
+            raw_parts = obj["parts"]
+            if not isinstance(raw_parts, list):
+                raise ExpertManifestError("sidecar parts must be an array")
+            if not raw_parts:
+                raise ExpertManifestError("sidecar requires at least one part")
+            if len(raw_parts) > MAX_SIDECAR_PARTS:
+                raise ExpertManifestError("sidecar part count exceeds the part limit")
+            parts: Iterable[SidecarPart] | None = tuple(
+                SidecarPart.from_dict(item) for item in raw_parts
+            )
+            scalar_kwargs: dict[str, Any] = {}
+        else:
+            _expect_keys(
+                obj, label="sidecar", required=("file", "alignment", "size", "sha256")
+            )
+            parts = None
+            scalar_kwargs = {
+                "file": _safe_relative_name(obj["file"], label="sidecar file"),
+                "size": _integer(obj["size"], label="sidecar size", minimum=1),
+                "sha256": _string(obj["sha256"], label="sidecar sha256"),
+            }
         alignment = _integer(obj["alignment"], label="sidecar alignment", minimum=1)
         if alignment & (alignment - 1):
             raise ExpertManifestError("sidecar alignment must be a power of two")
-        return cls(
-            file=_safe_relative_name(obj["file"], label="sidecar file"),
-            alignment=alignment,
-            size=_integer(obj["size"], label="sidecar size", minimum=1),
-            sha256=_string(obj["sha256"], label="sidecar sha256"),
-        )
+        return cls(alignment=alignment, parts=parts, **scalar_kwargs)
 
 
 @dataclass(frozen=True)
@@ -894,7 +1066,6 @@ class ExpertManifest:
         ):
             raise ExpertManifestError("record sidecar offsets require sidecar metadata")
         if self.sidecar is not None:
-            _safe_relative_name(self.sidecar.file, label="sidecar file")
             alignment = _integer(
                 self.sidecar.alignment,
                 label="sidecar alignment",
@@ -902,43 +1073,75 @@ class ExpertManifest:
             )
             if alignment & (alignment - 1):
                 raise ExpertManifestError("sidecar alignment must be a power of two")
-            _integer(self.sidecar.size, label="sidecar size", minimum=1)
-            _string(self.sidecar.sha256, label="sidecar sha256")
-            ranges: list[tuple[int, int]] = []
+            parts = self.sidecar.parts
+            if not parts:
+                raise ExpertManifestError("sidecar requires at least one part")
+            if len(parts) > MAX_SIDECAR_PARTS:
+                raise ExpertManifestError("sidecar part count exceeds the part limit")
+            if len({part.file for part in parts}) != len(parts):
+                raise ExpertManifestError("duplicate sidecar part files")
+            for part in parts:
+                _safe_relative_name(part.file, label="sidecar file")
+                _integer(part.size, label="sidecar size", minimum=1)
+                _string(part.sha256, label="sidecar sha256")
+                _integer(part.data_start, label="sidecar data_start", minimum=0)
+                if part.data_start % alignment:
+                    raise ExpertManifestError("sidecar data_start is not aligned")
+                if part.data_start >= part.size:
+                    raise ExpertManifestError("sidecar part holds no record data")
+            # Bounds and non-overlap are per-part: each part is its own address
+            # space, so a record's range only has to make sense inside the file
+            # it actually lives in.
+            ranges_by_part: dict[int, list[tuple[int, int]]] = {}
             for record in self.records:
                 if record.sidecar_offset is None or record.sidecar_length is None:
                     raise ExpertManifestError("every record requires a sidecar offset")
-                if record.sidecar_offset % self.sidecar.alignment:
+                if not 0 <= record.part < len(parts):
+                    raise ExpertManifestError(
+                        f"record ({record.layer}, {record.expert}) names sidecar "
+                        f"part {record.part}, which does not exist"
+                    )
+                part = parts[record.part]
+                if record.sidecar_offset % alignment:
                     raise ExpertManifestError("sidecar record is not aligned")
                 end = record.sidecar_offset + record.sidecar_length
-                if end > self.sidecar.size:
+                # A record that would run past the end of its own part is a
+                # record that straddles two parts.  Refuse it here: the read
+                # path is allowed to assume one record, one file.
+                if part.data_start + end > part.size:
                     raise ExpertManifestError("sidecar record exceeds file size")
-                ranges.append((record.sidecar_offset, end))
-            if ranges != sorted(ranges) or any(
-                a[1] > b[0] for a, b in zip(ranges, ranges[1:])
-            ):
-                raise ExpertManifestError("sidecar records overlap or are unsorted")
+                ranges_by_part.setdefault(record.part, []).append(
+                    (record.sidecar_offset, end)
+                )
+            for ranges in ranges_by_part.values():
+                if ranges != sorted(ranges) or any(
+                    a[1] > b[0] for a, b in zip(ranges, ranges[1:])
+                ):
+                    raise ExpertManifestError("sidecar records overlap or are unsorted")
 
         sidecar_shards = [shard for shard in self.shards if shard.kind == "sidecar"]
-        if len(sidecar_shards) > 1:
-            raise ExpertManifestError(
-                "an authoritative manifest requires exactly one sidecar shard"
-            )
         if sidecar_shards:
             if self.sidecar is None:
                 raise ExpertManifestError(
                     "an authoritative sidecar shard requires sidecar metadata"
                 )
-            sidecar_shard = sidecar_shards[0]
-            if (
-                sidecar_shard.name != self.sidecar.file
-                or sidecar_shard.size != self.sidecar.size
-                or sidecar_shard.sha256 != self.sidecar.sha256
-            ):
-                raise ExpertManifestError("authoritative sidecar metadata mismatch")
-            if sidecar_shard.sha256 is None:
-                raise ExpertManifestError("authoritative sidecar requires a hash")
-            _sha256(sidecar_shard.sha256, label="authoritative sidecar sha256")
+            if len(sidecar_shards) != len(self.sidecar.parts):
+                raise ExpertManifestError(
+                    "an authoritative manifest requires one sidecar shard per "
+                    "sidecar part"
+                )
+            part_by_file = {part.file: part for part in self.sidecar.parts}
+            for sidecar_shard in sidecar_shards:
+                part = part_by_file.get(sidecar_shard.name)
+                if (
+                    part is None
+                    or sidecar_shard.size != part.size
+                    or sidecar_shard.sha256 != part.sha256
+                ):
+                    raise ExpertManifestError("authoritative sidecar metadata mismatch")
+                if sidecar_shard.sha256 is None:
+                    raise ExpertManifestError("authoritative sidecar requires a hash")
+                _sha256(sidecar_shard.sha256, label="authoritative sidecar sha256")
             safetensors_shards = {
                 shard.name for shard in self.shards if shard.kind == "safetensors"
             }
@@ -960,14 +1163,18 @@ class ExpertManifest:
                     raise ExpertManifestError(
                         "authoritative record requires a sidecar offset"
                     )
-                cursor = record.sidecar_offset
+                # Set membership over the parts: a record's components must
+                # all sit in the one part the record claims.
+                part = self.sidecar.part_for(record)
+                start = part.data_start + record.sidecar_offset
+                cursor = start
                 for segment in record.segments:
-                    if segment.shard != self.sidecar.file or segment.offset != cursor:
+                    if segment.shard != part.file or segment.offset != cursor:
                         raise ExpertManifestError(
                             "authoritative record components must be contiguous in the sidecar"
                         )
                     cursor += segment.length
-                if cursor != record.sidecar_offset + record.logical_bytes:
+                if cursor != start + record.logical_bytes:
                     raise ExpertManifestError(
                         "authoritative record components do not cover the record"
                     )
@@ -1619,7 +1826,7 @@ def make_sidecar_authoritative(
                 f"authoritative resident shard {name} requires a full-file hash"
             )
         resident_shards.append(shard)
-    if manifest.sidecar.file in resident_names:
+    if any(part.file in resident_names for part in manifest.sidecar.parts):
         raise ExpertManifestError("sidecar file conflicts with a resident shard")
 
     records: list[ExpertRecord] = []
@@ -1633,34 +1840,39 @@ def make_sidecar_authoritative(
                 "authoritative records require hashes and complete sidecar ranges"
             )
         _sha256(record.sha256, label="authoritative record sha256")
-        cursor = record.sidecar_offset
+        part = manifest.sidecar.part_for(record)
+        start = part.data_start + record.sidecar_offset
+        cursor = start
         segments: list[TensorSegment] = []
         for segment in record.segments:
             segments.append(
                 replace(
                     segment,
-                    shard=manifest.sidecar.file,
+                    shard=part.file,
                     offset=cursor,
                 )
             )
             cursor += segment.length
-        if cursor != record.sidecar_offset + record.logical_bytes:
+        if cursor != start + record.logical_bytes:
             raise ExpertManifestError(
                 "record components do not exactly cover the sidecar record"
             )
         records.append(replace(record, segments=tuple(segments)))
 
-    sidecar_shard = ShardInfo(
-        name=manifest.sidecar.file,
-        size=manifest.sidecar.size,
-        header_bytes=0,
-        header_sha256=EMPTY_SHA256,
-        sha256=manifest.sidecar.sha256,
-        kind="sidecar",
+    sidecar_shards = tuple(
+        ShardInfo(
+            name=part.file,
+            size=part.size,
+            header_bytes=0,
+            header_sha256=EMPTY_SHA256,
+            sha256=part.sha256,
+            kind="sidecar",
+        )
+        for part in manifest.sidecar.parts
     )
     authoritative = replace(
         manifest,
-        shards=tuple(resident_shards) + (sidecar_shard,),
+        shards=tuple(resident_shards) + sidecar_shards,
         records=tuple(records),
         manifest_sha256=None,
     ).with_digest()
@@ -1772,13 +1984,16 @@ def verify_expert_manifest(
             checked_records += 1
     sidecar_verified = False
     if manifest.sidecar is not None:
-        sidecar_path = _resolve_member(artifact_root, manifest.sidecar.file)
-        if sidecar_path.stat().st_size != manifest.sidecar.size:
-            raise ExpertManifestError("sidecar size mismatch")
-        if verify_sidecar_hash:
-            if _hash_file(sidecar_path) != manifest.sidecar.sha256:
-                raise ExpertManifestError("sidecar hash mismatch")
-            sidecar_verified = True
+        for part in manifest.sidecar.parts:
+            sidecar_path = _resolve_member(artifact_root, part.file)
+            if sidecar_path.stat().st_size != part.size:
+                raise ExpertManifestError("sidecar size mismatch")
+            if verify_sidecar_hash:
+                # Per-part digests: a mismatch names the file that is wrong
+                # rather than condemning the whole bank.
+                if _hash_file(sidecar_path) != part.sha256:
+                    raise ExpertManifestError(f"sidecar hash mismatch: {part.file}")
+        sidecar_verified = verify_sidecar_hash
     return {
         "valid": True,
         "model_key": manifest.model_key,
@@ -1804,13 +2019,15 @@ def read_expert_record(
     if prefer_sidecar and manifest.sidecar is not None:
         if record.sidecar_offset is None or record.sidecar_length is None:
             raise ExpertManifestError("manifest sidecar record is incomplete")
-        path = _resolve_member(artifact_root, manifest.sidecar.file)
+        part = manifest.sidecar.part_for(record)
+        path = _resolve_member(artifact_root, part.file)
+        offset = part.data_start + record.sidecar_offset
         try:
             flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
             flags |= getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(path, flags)
             try:
-                payload = _pread_exact(fd, record.sidecar_offset, record.sidecar_length)
+                payload = _pread_exact(fd, offset, record.sidecar_length)
             finally:
                 os.close(fd)
         except OSError as exc:

@@ -48,6 +48,35 @@ class ExpertIOIntegrityError(ExpertIOError):
     pass
 
 
+def _record_part_index(record: Any) -> int:
+    """Which sidecar part a record lives in; 0 for single-file banks."""
+
+    return int(getattr(record, "part", 0) or 0)
+
+
+def _sidecar_placement(sidecar: Any, record: Any) -> tuple[str, int]:
+    """The part file a record lives in and where that part's data begins.
+
+    Kept tolerant of a sidecar that only carries the scalar ``file`` so the
+    single-file bank -- every artifact that exists today -- resolves through
+    the same call without a parts list being synthesized for it.
+    """
+
+    index = _record_part_index(record)
+    parts = getattr(sidecar, "parts", None)
+    if parts is None:
+        if index:
+            raise ExpertIOError(
+                f"record names sidecar part {index}, but the sidecar is single-file"
+            )
+        return getattr(sidecar, "file"), 0
+    try:
+        part = parts[index]
+    except (IndexError, TypeError) as exc:
+        raise ExpertIOError(f"sidecar has no part {index}") from exc
+    return part.file, int(getattr(part, "data_start", 0) or 0)
+
+
 @dataclass
 class ExpertIOMetrics:
     record_requests: int = 0
@@ -711,11 +740,16 @@ class PositionalExpertReader:
                 if record.sidecar_offset is None or record.sidecar_length is None:
                     raise ExpertIOError("manifest sidecar record is incomplete")
                 self.metrics.update(sidecar_record_requests=1)
+                # A record lives wholly inside one part; pick that part's file
+                # and make the offset absolute within it.  The descriptor cache
+                # is keyed by resolved path, so N parts cost N fds at most.
+                part_file, data_start = _sidecar_placement(manifest.sidecar, record)
+                sidecar_offset = data_start + record.sidecar_offset
                 if component_views is None:
                     assert view is not None
                     self._read_range_into(
-                        manifest.sidecar.file,
-                        record.sidecar_offset,
+                        part_file,
+                        sidecar_offset,
                         view,
                         cancel_event=cancel_event,
                         deadline_ns=deadline_ns,
@@ -723,8 +757,8 @@ class PositionalExpertReader:
                     )
                 else:
                     self._readv_range_into(
-                        manifest.sidecar.file,
-                        record.sidecar_offset,
+                        part_file,
+                        sidecar_offset,
                         component_views,
                         cancel_event=cancel_event,
                         deadline_ns=deadline_ns,
@@ -835,7 +869,15 @@ class PositionalExpertReader:
             if record.sidecar_offset is None or record.sidecar_length is None:
                 raise ExpertIOError("manifest sidecar record is incomplete")
             prepared.append((index, record, views))
-        prepared.sort(key=lambda item: int(item[1].sidecar_offset or 0))
+        # Sort within a part, never across: two records at the same offset in
+        # different parts are different bytes, so the part index has to lead
+        # the ordering that the adjacency test below relies on.
+        prepared.sort(
+            key=lambda item: (
+                _record_part_index(item[1]),
+                int(item[1].sidecar_offset or 0),
+            )
+        )
         self.metrics.update(
             record_requests=len(prepared),
             sidecar_record_requests=len(prepared),
@@ -851,7 +893,13 @@ class PositionalExpertReader:
                 expected = int(previous.sidecar_offset or 0) + int(
                     previous.sidecar_length or 0
                 )
-                if int(item[1].sidecar_offset or 0) == expected:
+                # One preadv is one fd at one offset.  Adjacency in offset
+                # means nothing across a part boundary -- coalescing there
+                # would read the wrong file -- so the part must match too.
+                if (
+                    _record_part_index(item[1]) == _record_part_index(previous)
+                    and int(item[1].sidecar_offset or 0) == expected
+                ):
                     groups[-1].append(item)
                 else:
                     groups.append([item])
@@ -859,9 +907,11 @@ class PositionalExpertReader:
                 flat_views = tuple(
                     view for _index, _record, views in group for view in views
                 )
+                leader = group[0][1]
+                part_file, data_start = _sidecar_placement(manifest.sidecar, leader)
                 self._readv_range_into(
-                    manifest.sidecar.file,
-                    int(group[0][1].sidecar_offset or 0),
+                    part_file,
+                    data_start + int(leader.sidecar_offset or 0),
                     flat_views,
                     cancel_event=cancel_event,
                     deadline_ns=deadline_ns,

@@ -410,7 +410,11 @@ class MappedExpertStore:
         if manifest.sidecar is None:
             raise ValueError("metal-mmap execution requires a sidecar manifest")
         self.root = Path(root).resolve()
-        self.path = self.root / manifest.sidecar.file
+        self.sidecar = manifest.sidecar
+        # One mapped path per bank part; ``path`` stays meaningful for the
+        # single-part banks every existing artifact uses.
+        self.paths = tuple(self.root / part.file for part in manifest.sidecar.parts)
+        self.path = self.paths[0]
         self.records = tuple(manifest.records)
         self.workers = max(1, min(int(workers), 256))
         self._mapped: dict[tuple[int, int], MappedExpertRecord] = {}
@@ -427,6 +431,11 @@ class MappedExpertStore:
                 raise ValueError("metal-mmap record has no sidecar range")
             if record.sidecar_length != record.logical_bytes:
                 raise ValueError("metal-mmap sidecar length differs from record")
+            if not 0 <= record.part < len(self.paths):
+                raise ValueError("metal-mmap record names a missing sidecar part")
+            part = manifest.sidecar.part(record.part)
+            if part.data_start % page_size:
+                raise ValueError("metal-mmap sidecar parts must start on a page")
             if record.sidecar_offset % page_size or record.sidecar_length % page_size:
                 raise ValueError("metal-mmap sidecar records must be page aligned")
 
@@ -442,9 +451,10 @@ class MappedExpertStore:
         ) -> tuple[tuple[int, int], MappedExpertRecord]:
             assert record.sidecar_offset is not None
             assert record.sidecar_length is not None
+            part = self.sidecar.part(record.part)
             base = mmap_u32(
-                self.path,
-                record.sidecar_offset,
+                self.paths[record.part],
+                part.data_start + record.sidecar_offset,
                 record.sidecar_length,
                 wired=False,
             )
