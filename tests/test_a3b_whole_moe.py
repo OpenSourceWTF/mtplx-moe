@@ -15,7 +15,6 @@ from mtplx import generation as generation_module
 from mtplx import runtime as runtime_module
 from mtplx.a3b_whole_moe import (
     A3BWholeMoeConfigError,
-    A3BWholeMoeRouteError,
     install_a3b_whole_moe,
     prepare_a3b_whole_moe,
     run_a3b_whole_moe_selfcheck,
@@ -247,6 +246,14 @@ def test_flag_off_returns_no_plan_and_preserves_all_block_classes(monkeypatch):
 
     assert prepare_a3b_whole_moe(model, config=_exact_config()) is None
     assert tuple(type(block) for block in (*targets, *mtp)) == original_classes
+
+
+def test_reset_clears_accepted_mtp_installation_status():
+    whole_moe_module._STATS["accepted_mtp_blocks"] = 1
+
+    whole_moe_module._reset_a3b_whole_moe_for_tests()
+
+    assert whole_moe_module.a3b_whole_moe_stats()["accepted_mtp_blocks"] == 0
 
 
 def test_exact_checkpoint_builds_40_target_and_one_mtp_binding(monkeypatch):
@@ -753,7 +760,7 @@ def _passing_full_graph_preflight():
     }
 
 
-def test_model_bound_selfcheck_runs_exact_three_compiled_geometries(monkeypatch):
+def test_model_bound_selfcheck_runs_only_changed_target_m2_geometry(monkeypatch):
     monkeypatch.setenv("MTPLX_A3B_WHOLE_MOE_FUSION", "1")
     model, _, _ = _exact_model()
     plan = prepare_a3b_whole_moe(model, config=_exact_config())
@@ -777,15 +784,11 @@ def test_model_bound_selfcheck_runs_exact_three_compiled_geometries(monkeypatch)
     )
 
     assert calls == [
-        *(("target_q8g64_q4g64", 1),) * 40,
         *(("target_q8g64_q4g64", 2),) * 40,
-        ("mtp_dense_q4g32_dense", 1),
     ]
     assert report["lanes"] == {
         "existing_lane": "ok",
-        "a3b_whole_moe_target_m1": "ok",
         "a3b_whole_moe_target_m2": "ok",
-        "a3b_whole_moe_mtp_m1": "ok",
     }
     assert report["dmax"]["a3b_whole_moe_target_m2"] == 2.0 / 64.0
     assert report["a3b_whole_moe_components"][
@@ -832,22 +835,12 @@ def test_model_bound_selfcheck_is_deterministic_and_compilation_gated():
 def _patch_whole_moe_stages(monkeypatch):
     monkeypatch.setattr(
         whole_moe_module,
-        "_target_m1_route",
-        lambda binding: lambda value: _ResultSpec("target_m1", value.shape),
-    )
-    monkeypatch.setattr(
-        whole_moe_module,
         "_target_m2_route",
         lambda binding: lambda value: _ResultSpec("target_m2", value.shape),
     )
-    monkeypatch.setattr(
-        whole_moe_module,
-        "_mtp_m1_route",
-        lambda binding: lambda value: _ResultSpec("mtp_m1", value.shape),
-    )
 
 
-def test_installed_partition_reuses_row_owned_routing_and_packed_gate_up():
+def test_installed_partition_changes_only_target_m2_fused_down():
     stage1_source = inspect.getsource(whole_moe_module._row_owned_stage1_unchecked)
     assert "mx.softmax" in stage1_source
     assert "precise=True" in stage1_source
@@ -860,32 +853,27 @@ def test_installed_partition_reuses_row_owned_routing_and_packed_gate_up():
     assert "_row_owned_stage1_unchecked" in stage12_source
     assert "_packed_stage2_unchecked" in stage12_source
 
-    for route_name, stage3_name, output_shape in (
-        ("_target_m1_route", "bind_target_m1_stage3", "(1, 1, 2048)"),
-        ("_target_m2_route", "bind_target_m2_stage3", "(1, 2, 2048)"),
-        ("_mtp_m1_route", "bind_mtp_m1_stage3", "(1, 1, 2048)"),
+    source = inspect.getsource(whole_moe_module._target_m2_route)
+    assert "bind_target_m2_stage3" in source
+    assert "_packed_stage12_unchecked" in source
+    assert "(1, 2, 2048)" in source
+    call_start = source.index("def call(")
+    assert "bind_target_m2_stage3" in source[:call_start]
+    for forbidden in (
+        "os.environ",
+        "selfcheck",
+        "installed",
+        "eligible",
+        "fallback",
+        "lane_disabled",
+        "try:",
+        "except",
+        "value.shape",
     ):
-        source = inspect.getsource(getattr(whole_moe_module, route_name))
-        assert stage3_name in source
-        assert "_packed_stage12_unchecked" in source
-        assert output_shape in source
-        call_start = source.index("def call(")
-        assert stage3_name in source[:call_start]
-        for forbidden in (
-            "os.environ",
-            "selfcheck",
-            "installed",
-            "eligible",
-            "fallback",
-            "lane_disabled",
-            "try:",
-            "except",
-            "value.shape",
-        ):
-            assert forbidden not in source[call_start:]
+        assert forbidden not in source[call_start:]
 
 
-def test_successful_selfcheck_atomically_installs_all_41_blocks(monkeypatch):
+def test_successful_selfcheck_installs_only_40_target_m2_overrides(monkeypatch):
     monkeypatch.setenv("MTPLX_A3B_WHOLE_MOE_FUSION", "1")
     model, targets, mtp = _exact_model()
     original_classes = tuple(type(block) for block in (*targets, *mtp))
@@ -900,7 +888,8 @@ def test_successful_selfcheck_atomically_installs_all_41_blocks(monkeypatch):
 
     assert report["installation_status"] == "installed"
     assert report["target_blocks"] == 40
-    assert report["mtp_blocks"] == 1
+    assert report["mtp_blocks"] == 0
+    assert report["accepted_mtp_blocks"] == 1
     assert report["validated_contract"]["target"]["routed_gate_up"] == (
         "affine_q4_group64_[256,1024,256]"
     )
@@ -908,21 +897,21 @@ def test_successful_selfcheck_atomically_installs_all_41_blocks(monkeypatch):
         "dense_bf16_[1024,2048]"
     )
     assert report["validated_contract"]["target"]["routes"] == {
-        "M1": "row_owned_packed_gate_up_fused_down",
-        "M2": "row_owned_packed_gate_up_fused_down_row_separated",
+        "M1": "accepted_row_owned_router_combine",
+        "M2": "accepted_stage12_fused_down_row_separated",
     }
     assert report["validated_contract"]["mtp"]["routes"] == {
-        "M1": "row_owned_packed_gate_up_fused_down"
+        "M1": "accepted_row_owned_router_combine"
     }
     assert report["selfcheck_lanes"] == {
-        **_exact_selfcheck_report()["lanes"],
+        "a3b_whole_moe_target_m2": "ok",
         **_passing_full_graph_preflight(),
     }
     assert all(
         type(block).__call__ is whole_moe_module._target_a3b_whole_moe_call
         for block in targets
     )
-    assert type(mtp[0]).__call__ is whole_moe_module._mtp_a3b_whole_moe_call
+    assert type(mtp[0]) is original_classes[-1]
 
 
 def test_selfcheck_failure_prevents_every_installation(monkeypatch):
@@ -934,14 +923,14 @@ def test_selfcheck_failure_prevents_every_installation(monkeypatch):
     with pytest.raises(A3BWholeMoeConfigError, match="self-check"):
         install_a3b_whole_moe(
             plan,
-            {"lanes": {"a3b_whole_moe_target_m1": "fallback"}},
+            {"lanes": {"a3b_whole_moe_target_m2": "fallback"}},
             compiled_preflight=_passing_full_graph_preflight,
         )
 
     assert tuple(type(block) for block in (*targets, *mtp)) == original_classes
 
 
-def test_installed_route_uses_explicit_prefill_and_direct_small_row_calls(monkeypatch):
+def test_installed_route_delegates_everything_except_target_m2(monkeypatch):
     monkeypatch.setenv("MTPLX_A3B_WHOLE_MOE_FUSION", "1")
     _patch_whole_moe_stages(monkeypatch)
     phase = {"value": "prefill"}
@@ -952,35 +941,53 @@ def test_installed_route_uses_explicit_prefill_and_direct_small_row_calls(monkey
     )
     model, targets, mtp = _exact_model()
     plan = prepare_a3b_whole_moe(model, config=_exact_config())
+
+    class AcceptedTarget(type(targets[0])):
+        def __call__(self, value):
+            self.stock_calls.append(value)
+            return _ResultSpec("accepted_target", value.shape)
+
+    class AcceptedMTP(type(mtp[0])):
+        def __call__(self, value):
+            self.stock_calls.append(value)
+            return _ResultSpec("accepted_mtp", value.shape)
+
+    for target in targets:
+        target.__class__ = AcceptedTarget
+    mtp[0].__class__ = AcceptedMTP
     install_a3b_whole_moe(
         plan,
         _exact_selfcheck_report(),
         compiled_preflight=_passing_full_graph_preflight,
     )
 
-    assert targets[0](_ArraySpec((1, 64, 2048))).label == "stock"
+    assert targets[0](_ArraySpec((1, 64, 2048))).label == "accepted_target"
     phase["value"] = "ar_decode"
-    assert targets[0](_ArraySpec((1, 1, 2048))).label == "target_m1"
-    assert mtp[0](_ArraySpec((1, 1, 2048))).label == "mtp_m1"
+    assert targets[0](_ArraySpec((1, 1, 2048))).label == "accepted_target"
+    assert mtp[0](_ArraySpec((1, 1, 2048))).label == "accepted_mtp"
     phase["value"] = "unknown"
-    assert mtp[0](_ArraySpec((1, 1, 2048))).label == "mtp_m1"
+    assert mtp[0](_ArraySpec((1, 1, 2048))).label == "accepted_mtp"
     phase["value"] = "decode_verify"
     assert targets[0](_ArraySpec((1, 2, 2048))).label == "target_m2"
-    with pytest.raises(A3BWholeMoeRouteError, match="rows=3"):
-        targets[0](_ArraySpec((1, 3, 2048)))
-    assert len(targets[0].stock_calls) == 1
+    assert targets[0](_ArraySpec((1, 3, 2048))).label == "accepted_target"
+    assert len(targets[0].stock_calls) == 3
+    assert len(mtp[0].stock_calls) == 2
 
 
 def test_compiled_full_graph_failure_rolls_back_every_class(monkeypatch):
     monkeypatch.setenv("MTPLX_A3B_WHOLE_MOE_FUSION", "1")
     _patch_whole_moe_stages(monkeypatch)
     model, targets, mtp = _exact_model()
-    blocks = (*targets, *mtp)
-    original_classes = tuple(type(block) for block in blocks)
+    original_target_classes = tuple(type(block) for block in targets)
+    original_mtp_class = type(mtp[0])
     plan = prepare_a3b_whole_moe(model, config=_exact_config())
 
     def fail_after_swap():
-        assert all(type(block) is not original for block, original in zip(blocks, original_classes))
+        assert all(
+            type(block) is not original
+            for block, original in zip(targets, original_target_classes)
+        )
+        assert type(mtp[0]) is original_mtp_class
         raise RuntimeError("full graph compile failed")
 
     with pytest.raises(A3BWholeMoeConfigError, match="full compiled target-prefix"):
@@ -990,7 +997,8 @@ def test_compiled_full_graph_failure_rolls_back_every_class(monkeypatch):
             compiled_preflight=fail_after_swap,
         )
 
-    assert tuple(type(block) for block in blocks) == original_classes
+    assert tuple(type(block) for block in targets) == original_target_classes
+    assert type(mtp[0]) is original_mtp_class
 
 
 def test_installation_keeps_no_global_model_or_block_references():
@@ -1001,33 +1009,32 @@ def test_installation_keeps_no_global_model_or_block_references():
 
 
 def test_installed_hot_call_only_routes_on_phase_and_logical_m():
-    for hot_call in (
-        whole_moe_module._target_a3b_whole_moe_call,
-        whole_moe_module._mtp_a3b_whole_moe_call,
+    source = inspect.getsource(whole_moe_module._target_a3b_whole_moe_call)
+    assert "current_attention_phase" in source
+    assert "value.shape" in source
+    assert "route.accepted_call(self, value)" in source
+    assert "_mtp_a3b_whole_moe_call" not in inspect.getsource(whole_moe_module)
+    for forbidden in (
+        "os.environ",
+        ".dtype",
+        "bits",
+        "group_size",
+        "eligible",
+        "selfcheck",
+        "installed",
+        "installation_status",
+        "_STATS",
+        "fallback",
+        "lane_disabled",
+        "try:",
+        "except",
+        "switch_mlp",
+        "shared_expert",
+        "mx.softmax",
+        "m2_call is not None",
+        "stock_call",
     ):
-        source = inspect.getsource(hot_call)
-        assert "current_attention_phase" in source
-        assert "value.shape" in source
-        for forbidden in (
-            "os.environ",
-            ".dtype",
-            "bits",
-            "group_size",
-            "eligible",
-            "selfcheck",
-            "installed",
-            "installation_status",
-            "_STATS",
-            "fallback",
-            "lane_disabled",
-            "try:",
-            "except",
-            "switch_mlp",
-            "shared_expert",
-            "mx.softmax",
-            "m2_call is not None",
-        ):
-            assert forbidden not in source
+        assert forbidden not in source
 
 
 def test_runtime_constructs_one_whole_block_owner_after_packing() -> None:
@@ -1046,12 +1053,12 @@ def test_runtime_constructs_one_whole_block_owner_after_packing() -> None:
     install_router = source.index("install_qwen_row_owned_routers(")
 
     assert adapter_guard < packing < prepare_whole < prepare_router < selfcheck
-    assert selfcheck < whole_selfcheck < compiled_factory < runtime_construction
+    assert selfcheck < install_router < whole_selfcheck
+    assert whole_selfcheck < compiled_factory < runtime_construction
     assert runtime_construction < install_whole < compiled_preflight
-    assert selfcheck < install_router < compiled_factory
-    assert "if whole_moe_plan is None" in source
+    assert prepare_router < selfcheck < install_router < compiled_factory
     assert "if whole_moe_plan is not None" in source
-    assert "elif router_plan is not None" in source
+    assert "elif router_plan is not None" not in source
 
 
 def test_full_graph_preflight_executes_both_compiled_target_geometries():

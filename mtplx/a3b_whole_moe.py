@@ -78,19 +78,10 @@ class A3BWholeMoeInstallPlan:
 
 @dataclass(frozen=True)
 class _TargetA3BWholeMoeRoute:
-    """Prebound execution selected only after the exact contract passes."""
+    """Prebound accepted execution plus the exact target-M2 override."""
 
-    stock_call: Callable[[Any, Any], Any]
-    m1_call: Callable[[Any], Any]
+    accepted_call: Callable[[Any, Any], Any]
     m2_call: Callable[[Any], Any]
-
-
-@dataclass(frozen=True)
-class _MTPA3BWholeMoeRoute:
-    """Prebound MTP execution with no representable M2 implementation."""
-
-    stock_call: Callable[[Any, Any], Any]
-    m1_call: Callable[[Any], Any]
 
 
 _SELFCHECK_LIMITS = {
@@ -108,6 +99,7 @@ _STATS: dict[str, Any] = {
     "installation_error": None,
     "target_blocks": 0,
     "mtp_blocks": 0,
+    "accepted_mtp_blocks": 0,
     "validated_contract": None,
     "selfcheck_lanes": {},
     "selfcheck_dmax": {},
@@ -133,8 +125,8 @@ def _validated_contract() -> dict[str, Any]:
             "shared_down": "affine_q4_group64_[2048,64]",
             "shared_scalar_gate": "affine_q8_group64_[1,512]",
             "routes": {
-                "M1": "row_owned_packed_gate_up_fused_down",
-                "M2": "row_owned_packed_gate_up_fused_down_row_separated",
+                "M1": "accepted_row_owned_router_combine",
+                "M2": "accepted_stage12_fused_down_row_separated",
             },
         },
         "mtp": {
@@ -144,7 +136,7 @@ def _validated_contract() -> dict[str, Any]:
             "shared_gate_up": "dense_bf16_[1024,2048]",
             "shared_down": "dense_bf16_[2048,512]",
             "shared_scalar_gate": "dense_bf16_[1,2048]",
-            "routes": {"M1": "row_owned_packed_gate_up_fused_down"},
+            "routes": {"M1": "accepted_row_owned_router_combine"},
         },
         "materialized_activation": "bf16_[M,9,512]",
         "eliminated": ("bf16_[M,8,2048]", "bf16_[M,2048]_shared"),
@@ -563,7 +555,8 @@ def prepare_a3b_whole_moe(
             "installation_status": "awaiting_selfcheck",
             "installation_error": None,
             "target_blocks": len(plan.target_bindings),
-            "mtp_blocks": len(plan.mtp_bindings),
+            "mtp_blocks": 0,
+            "accepted_mtp_blocks": len(plan.mtp_bindings),
             "validated_contract": _validated_contract(),
             "selfcheck_lanes": {},
             "selfcheck_dmax": {},
@@ -827,14 +820,9 @@ def run_a3b_whole_moe_selfcheck(
     component_report: dict[str, dict[str, float]] = {}
     checks = (
         (
-            "a3b_whole_moe_target_m1",
-            tuple((binding, 1) for binding in plan.target_bindings),
-        ),
-        (
             "a3b_whole_moe_target_m2",
             tuple((binding, 2) for binding in plan.target_bindings),
         ),
-        ("a3b_whole_moe_mtp_m1", ((plan.mtp_bindings[0], 1),)),
     )
     for lane, lane_checks in checks:
         aggregate = {component: 0.0 for component in _SELFCHECK_LIMITS}
@@ -867,55 +855,29 @@ def run_a3b_whole_moe_selfcheck(
 
 
 def _target_a3b_whole_moe_call(self: Any, value: Any) -> Any:
-    """Route the target block only on phase and logical rows."""
+    """Override only exact target verification M2 after construction."""
 
     route = type(self)._mtplx_a3b_whole_moe_route
     phase = current_attention_phase()
-    if phase == "prefill":
-        return route.stock_call(self, value)
-    rows = math.prod(int(dimension) for dimension in value.shape[:-1])
-    if rows == 1 and phase in {"ar_decode", "decode_verify"}:
-        return route.m1_call(value)
-    if rows == 2 and phase == "decode_verify":
-        return route.m2_call(value)
-    raise A3BWholeMoeRouteError(
-        f"whole-MoE has no constructed route for phase={phase!r}, rows={rows}"
-    )
-
-
-def _mtp_a3b_whole_moe_call(self: Any, value: Any) -> Any:
-    """Route the MTP block only on phase and its constructed M1 geometry."""
-
-    route = type(self)._mtplx_a3b_whole_moe_route
-    phase = current_attention_phase()
-    if phase == "prefill":
-        return route.stock_call(self, value)
-    rows = math.prod(int(dimension) for dimension in value.shape[:-1])
-    if rows == 1:
-        return route.m1_call(value)
-    raise A3BWholeMoeRouteError(
-        f"whole-MoE has no constructed MTP route for phase={phase!r}, rows={rows}"
-    )
+    if phase == "decode_verify":
+        rows = math.prod(int(dimension) for dimension in value.shape[:-1])
+        if rows == 2:
+            return route.m2_call(value)
+    return route.accepted_call(self, value)
 
 
 def _installed_class(
     base_class: type,
-    route: _TargetA3BWholeMoeRoute | _MTPA3BWholeMoeRoute,
+    route: _TargetA3BWholeMoeRoute,
     *,
     index: int,
-    variant: A3BWholeMoeVariant,
 ) -> type:
-    call = (
-        _target_a3b_whole_moe_call
-        if variant == "target_q8g64_q4g64"
-        else _mtp_a3b_whole_moe_call
-    )
     return type(
-        f"A3BWholeMoe{index}_{variant}_{base_class.__name__}",
+        f"A3BWholeMoeTargetM2_{index}_{base_class.__name__}",
         (base_class,),
         {
             "__module__": __name__,
-            "__call__": call,
+            "__call__": _target_a3b_whole_moe_call,
             "_mtplx_a3b_whole_moe_route": route,
         },
     )
@@ -923,16 +885,10 @@ def _installed_class(
 
 def _route_for_binding(
     binding: A3BWholeMoeBinding,
-) -> _TargetA3BWholeMoeRoute | _MTPA3BWholeMoeRoute:
-    if binding.variant == "target_q8g64_q4g64":
-        return _TargetA3BWholeMoeRoute(
-            stock_call=binding.stock_call,
-            m1_call=_target_m1_route(binding),
-            m2_call=_target_m2_route(binding),
-        )
-    return _MTPA3BWholeMoeRoute(
-        stock_call=binding.stock_call,
-        m1_call=_mtp_m1_route(binding),
+) -> _TargetA3BWholeMoeRoute:
+    return _TargetA3BWholeMoeRoute(
+        accepted_call=type(binding.block).__call__,
+        m2_call=_target_m2_route(binding),
     )
 
 
@@ -942,14 +898,10 @@ def install_a3b_whole_moe(
     *,
     compiled_preflight: Callable[[], dict[str, str]],
 ) -> dict[str, Any]:
-    """Commit all 41 routes only after the full compiled graph executes."""
+    """Commit the 40 target-M2 overrides after exact compiled preflight."""
 
     lanes = {} if selfcheck_report is None else selfcheck_report.get("lanes", {})
-    required_lanes = (
-        "a3b_whole_moe_target_m1",
-        "a3b_whole_moe_target_m2",
-        "a3b_whole_moe_mtp_m1",
-    )
+    required_lanes = ("a3b_whole_moe_target_m2",)
     failed = tuple(lane for lane in required_lanes if lanes.get(lane) != "ok")
     if failed:
         _STATS.update(
@@ -969,7 +921,6 @@ def install_a3b_whole_moe(
         "a3b_whole_moe_target_prefix_full_graph_m2",
     )
 
-    bindings = (*plan.target_bindings, *plan.mtp_bindings)
     prepared = tuple(
         (
             binding.block,
@@ -978,10 +929,9 @@ def install_a3b_whole_moe(
                 type(binding.block),
                 _route_for_binding(binding),
                 index=index,
-                variant=binding.variant,
             ),
         )
-        for index, binding in enumerate(bindings)
+        for index, binding in enumerate(plan.target_bindings)
     )
     changed: list[tuple[Any, type]] = []
     try:
@@ -1022,7 +972,8 @@ def install_a3b_whole_moe(
             "installation_status": "installed",
             "installation_error": None,
             "target_blocks": len(plan.target_bindings),
-            "mtp_blocks": len(plan.mtp_bindings),
+            "mtp_blocks": 0,
+            "accepted_mtp_blocks": len(plan.mtp_bindings),
             "validated_contract": _validated_contract(),
             "selfcheck_lanes": installed_lanes,
             "selfcheck_dmax": {
@@ -1055,6 +1006,7 @@ def _reset_a3b_whole_moe_for_tests() -> None:
             "installation_error": None,
             "target_blocks": 0,
             "mtp_blocks": 0,
+            "accepted_mtp_blocks": 0,
             "validated_contract": None,
             "selfcheck_lanes": {},
             "selfcheck_dmax": {},

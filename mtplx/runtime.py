@@ -484,24 +484,26 @@ def load(
     )
 
     whole_moe_plan = prepare_a3b_whole_moe(model, config=config)
-    router_plan = (
-        prepare_qwen_row_owned_routers(model, config=config)
-        if whole_moe_plan is None
-        else None
-    )
+    router_plan = prepare_qwen_row_owned_routers(model, config=config)
     postconv_plan = prepare_a3b_gdn_postconv(model, config=config)
     postconv_factory = None
     from .kernel_selfcheck import maybe_run_model_selfcheck
 
     selfcheck_report = maybe_run_model_selfcheck(model)
+    if whole_moe_plan is not None and router_plan is None:
+        from .a3b_whole_moe import A3BWholeMoeConfigError
+
+        raise A3BWholeMoeConfigError(
+            "whole-MoE target M2 requires the accepted row-owned router/combine route"
+        )
+    if router_plan is not None:
+        router_report = install_qwen_row_owned_routers(router_plan, selfcheck_report)
+        logger.info("[qwen-row-owned-router] %s", router_report)
     if whole_moe_plan is not None:
         selfcheck_report = run_a3b_whole_moe_selfcheck(
             whole_moe_plan,
             selfcheck_report,
         )
-    elif router_plan is not None:
-        router_report = install_qwen_row_owned_routers(router_plan, selfcheck_report)
-        logger.info("[qwen-row-owned-router] %s", router_report)
     if postconv_plan is not None:
         postconv_factory = install_a3b_gdn_postconv(
             postconv_plan, selfcheck_report
