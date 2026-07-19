@@ -66,8 +66,20 @@ standalone repo — publish it alongside a trunk or not at all.
 ## Step 4 — publish
 
 ```bash
-mtplx forge publish ~/publish/hy3-expert-q2 --repo <org>/<name> --token stdin
+mtplx forge publish \
+  --path ~/publish/hy3-expert-q2 \
+  --repo org/hy3-expert-q2 \
+  --visibility public \
+  --license apache-2.0 \
+  --out /tmp/mtplx-forge-publish \
+  --run-id mtplx-forge-publish-0000001 \
+  --token stdin
 ```
+
+All seven of `--path`, `--repo`, `--visibility`, `--license`, `--out`, and
+`--run-id` are **required** alongside `--token`; the path is a flag, not a
+positional. (`--out` and `--run-id` are the run-directory contract the
+frontend uses for progress polling — see `docs/FORGE_BACKEND_CONTRACT.md`.)
 
 Token is read from stdin, never argv, and never logged — there is a test
 asserting it does not land in `publish.json` or `mtplx_runtime.json`.
