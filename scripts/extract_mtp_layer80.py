@@ -13,7 +13,7 @@ conversion of any kind. The output file therefore preserves the exact BF16
 
 Usage:
     python scripts/extract_mtp_layer80.py \
-        [--src /Users/davidtai/.cache/huggingface/hy3-mtp-layer80] \
+        [--src /Users/davidtai/.cache/huggingface/hy3-bf16-and-mtp-layer80] \
         [--out layer80-bf16.safetensors]
 """
 
@@ -85,7 +85,7 @@ def bf16_bytes_to_f32(raw: bytes) -> np.ndarray:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--src", default="/Users/davidtai/.cache/huggingface/hy3-mtp-layer80",
+    ap.add_argument("--src", default="/Users/davidtai/.cache/huggingface/hy3-bf16-and-mtp-layer80",
                     help="Directory holding the downloaded shards + index")
     ap.add_argument("--out", default="layer80-bf16.safetensors",
                     help="Output filename (relative to --src unless absolute)")

@@ -165,7 +165,7 @@ def quantize_resident_tensors(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--src", default="/Users/davidtai/.cache/huggingface/hy3-mtp-layer80",
+    ap.add_argument("--src", default="/Users/davidtai/.cache/huggingface/hy3-bf16-and-mtp-layer80",
                     help="Directory holding layer80-bf16.safetensors")
     ap.add_argument("--infile", default="layer80-bf16.safetensors")
     ap.add_argument("--out", default="layer80-residents-q.safetensors")
