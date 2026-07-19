@@ -1248,6 +1248,62 @@ def mtp_m1_stage3(
     )
 
 
+def bind_target_m1_stage3(binding: Any):
+    """Prebind the exact target M1 fused-down kernel at installation."""
+
+    kernel = _build_target_m1_stage3_kernel()
+
+    def call(activations, expert_ids, route_scores, shared_gate):
+        return _launch_target_stage3(
+            kernel,
+            activations,
+            expert_ids,
+            route_scores,
+            shared_gate,
+            binding,
+            rows=1,
+        )
+
+    return call
+
+
+def bind_target_m2_stage3(binding: Any):
+    """Prebind the exact row-paired target M2 fused-down kernel."""
+
+    kernel = _build_target_m2_stage3_kernel()
+
+    def call(activations, expert_ids, route_scores, shared_gate):
+        return _launch_target_stage3(
+            kernel,
+            activations,
+            expert_ids,
+            route_scores,
+            shared_gate,
+            binding,
+            rows=2,
+        )
+
+    return call
+
+
+def bind_mtp_m1_stage3(binding: Any):
+    """Prebind the exact MTP M1 fused-down kernel at installation."""
+
+    kernel = _build_mtp_m1_stage3_kernel()
+
+    def call(activations, expert_ids, route_scores, shared_gate):
+        return _launch_mtp_stage3(
+            kernel,
+            activations,
+            expert_ids,
+            route_scores,
+            shared_gate,
+            binding,
+        )
+
+    return call
+
+
 def bind_target_m1(binding: Any):
     """Bind the three fixed target M1 kernels once at installation."""
 

@@ -681,7 +681,11 @@ def test_all_fixed_entrypoints_launch_directly_without_runtime_validation(monkey
 
 
 def test_installed_routes_prebind_kernel_objects_before_hot_call():
-    for name in ("bind_target_m1", "bind_target_m2", "bind_mtp_m1"):
+    for name in (
+        "bind_target_m1_stage3",
+        "bind_target_m2_stage3",
+        "bind_mtp_m1_stage3",
+    ):
         binder = getattr(kernel_module, name)
         source = inspect.getsource(binder)
         call_start = source.index("def call(")
@@ -807,8 +811,7 @@ def test_model_bound_selfcheck_is_deterministic_and_compilation_gated():
     assert "mx.random" not in source
     assert "mx.compile(route)" in source
     assert "mx.compile(lambda current: binding.block(current))" in source
-    assert "stage1(value, binding)" in source
-    assert "stage2(value, expert_ids, binding)" in source
+    assert "_packed_stage12_unchecked(value, binding, rows=rows)" in source
     assert "stage3(" in source
     assert "reference_activations" in source
     assert '"stage3_output"' in source
@@ -817,20 +820,58 @@ def test_model_bound_selfcheck_is_deterministic_and_compilation_gated():
 
 def _patch_whole_moe_stages(monkeypatch):
     monkeypatch.setattr(
-        kernel_module,
-        "bind_target_m1",
+        whole_moe_module,
+        "_target_m1_route",
         lambda binding: lambda value: _ResultSpec("target_m1", value.shape),
     )
     monkeypatch.setattr(
-        kernel_module,
-        "bind_target_m2",
+        whole_moe_module,
+        "_target_m2_route",
         lambda binding: lambda value: _ResultSpec("target_m2", value.shape),
     )
     monkeypatch.setattr(
-        kernel_module,
-        "bind_mtp_m1",
+        whole_moe_module,
+        "_mtp_m1_route",
         lambda binding: lambda value: _ResultSpec("mtp_m1", value.shape),
     )
+
+
+def test_installed_partition_reuses_row_owned_routing_and_packed_gate_up():
+    stage1_source = inspect.getsource(whole_moe_module._row_owned_stage1_unchecked)
+    assert "mx.softmax" in stage1_source
+    assert "precise=True" in stage1_source
+    assert "_qwen_row_owned_route_unchecked" in stage1_source
+    stage2_source = inspect.getsource(whole_moe_module._packed_stage2_unchecked)
+    assert "gate_up_proj.gather" in stage2_source
+    assert "shared_expert.gate_up_proj" in stage2_source
+    assert "swiglu" in stage2_source
+    stage12_source = inspect.getsource(whole_moe_module._packed_stage12_unchecked)
+    assert "_row_owned_stage1_unchecked" in stage12_source
+    assert "_packed_stage2_unchecked" in stage12_source
+
+    for route_name, stage3_name, output_shape in (
+        ("_target_m1_route", "bind_target_m1_stage3", "(1, 1, 2048)"),
+        ("_target_m2_route", "bind_target_m2_stage3", "(1, 2, 2048)"),
+        ("_mtp_m1_route", "bind_mtp_m1_stage3", "(1, 1, 2048)"),
+    ):
+        source = inspect.getsource(getattr(whole_moe_module, route_name))
+        assert stage3_name in source
+        assert "_packed_stage12_unchecked" in source
+        assert output_shape in source
+        call_start = source.index("def call(")
+        assert stage3_name in source[:call_start]
+        for forbidden in (
+            "os.environ",
+            "selfcheck",
+            "installed",
+            "eligible",
+            "fallback",
+            "lane_disabled",
+            "try:",
+            "except",
+            "value.shape",
+        ):
+            assert forbidden not in source[call_start:]
 
 
 def test_successful_selfcheck_atomically_installs_all_41_blocks(monkeypatch):
@@ -855,6 +896,13 @@ def test_successful_selfcheck_atomically_installs_all_41_blocks(monkeypatch):
     assert report["validated_contract"]["mtp"]["shared_gate_up"] == (
         "dense_bf16_[1024,2048]"
     )
+    assert report["validated_contract"]["target"]["routes"] == {
+        "M1": "row_owned_packed_gate_up_fused_down",
+        "M2": "row_owned_packed_gate_up_fused_down_row_paired",
+    }
+    assert report["validated_contract"]["mtp"]["routes"] == {
+        "M1": "row_owned_packed_gate_up_fused_down"
+    }
     assert report["selfcheck_lanes"] == {
         **_exact_selfcheck_report()["lanes"],
         **_passing_full_graph_preflight(),

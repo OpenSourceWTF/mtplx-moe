@@ -13,6 +13,7 @@ import os
 from typing import Any, Callable, Literal
 
 import mlx.core as mx
+from mlx_lm.models.qwen3_next import swiglu
 
 from .attention_context import current_attention_phase
 from .kernels import a3b_whole_moe as kernel_module
@@ -22,6 +23,7 @@ from .moe_packed_projections import (
     _PackedDenseProjection,
     _PackedQuantizedProjection,
 )
+from .qwen_row_owned_router import _qwen_row_owned_route_unchecked
 
 
 A3BWholeMoeVariant = Literal[
@@ -130,7 +132,10 @@ def _validated_contract() -> dict[str, Any]:
             "shared_gate_up": "affine_q4_group64_[1024,256]",
             "shared_down": "affine_q4_group64_[2048,64]",
             "shared_scalar_gate": "affine_q8_group64_[1,512]",
-            "routes": {"M1": "three_stage", "M2": "three_stage_row_paired"},
+            "routes": {
+                "M1": "row_owned_packed_gate_up_fused_down",
+                "M2": "row_owned_packed_gate_up_fused_down_row_paired",
+            },
         },
         "mtp": {
             "router": "dense_bf16_[256,2048]",
@@ -139,7 +144,7 @@ def _validated_contract() -> dict[str, Any]:
             "shared_gate_up": "dense_bf16_[1024,2048]",
             "shared_down": "dense_bf16_[2048,512]",
             "shared_scalar_gate": "dense_bf16_[1,2048]",
-            "routes": {"M1": "three_stage"},
+            "routes": {"M1": "row_owned_packed_gate_up_fused_down"},
         },
         "materialized_activation": "bf16_[M,9,512]",
         "eliminated": ("bf16_[M,8,2048]", "bf16_[M,2048]_shared"),
@@ -568,16 +573,136 @@ def prepare_a3b_whole_moe(
     return plan
 
 
+def _row_owned_stage1_unchecked(
+    value: Any,
+    binding: A3BWholeMoeBinding,
+    *,
+    rows: int,
+) -> tuple[Any, Any, Any]:
+    """Run exact row-owned routing and the independent shared scalar gate."""
+
+    probabilities = mx.softmax(binding.block.gate(value), axis=-1, precise=True)
+    expert_ids, route_scores = _qwen_row_owned_route_unchecked(
+        probabilities,
+        rows=rows,
+    )
+    shared_gate = binding.block.shared_expert_gate(value)
+    return (
+        expert_ids.reshape(rows, 8),
+        route_scores.reshape(rows, 8),
+        shared_gate.reshape(rows, 1),
+    )
+
+
+def _packed_stage2_unchecked(
+    value: Any,
+    expert_ids: Any,
+    binding: A3BWholeMoeBinding,
+    *,
+    rows: int,
+) -> Any:
+    """Run exact packed selected/shared gate-up and BF16 SwiGLU."""
+
+    packed_routed = binding.block.switch_mlp.gate_up_proj.gather(
+        mx.expand_dims(value, (-2, -3)),
+        expert_ids.reshape(1, rows, 8),
+        False,
+    )
+    routed_gate, routed_up = mx.split(packed_routed, [512], axis=-1)
+    routed_activations = swiglu(routed_gate, routed_up).reshape(rows, 8, 512)
+    packed_shared = binding.block.shared_expert.gate_up_proj(value)
+    shared_activation_gate, shared_activation_up = mx.split(
+        packed_shared,
+        [512],
+        axis=-1,
+    )
+    shared_activations = swiglu(
+        shared_activation_gate,
+        shared_activation_up,
+    ).reshape(rows, 1, 512)
+    return mx.concatenate(
+        [routed_activations, shared_activations],
+        axis=1,
+    )
+
+
+def _packed_stage12_unchecked(
+    value: Any,
+    binding: A3BWholeMoeBinding,
+    *,
+    rows: int,
+) -> tuple[Any, Any, Any, Any]:
+    """Compose the two proven MLX boundaries before the fused-down kernel."""
+
+    expert_ids, route_scores, shared_gate = _row_owned_stage1_unchecked(
+        value,
+        binding,
+        rows=rows,
+    )
+    activations = _packed_stage2_unchecked(
+        value,
+        expert_ids,
+        binding,
+        rows=rows,
+    )
+    return expert_ids, route_scores, shared_gate, activations
+
+
 def _target_m1_route(binding: A3BWholeMoeBinding) -> Callable[[Any], Any]:
-    return kernel_module.bind_target_m1(binding)
+    """Bind exact target M1 row routing, packed gate/up, and fused down."""
+
+    stage3 = kernel_module.bind_target_m1_stage3(binding)
+
+    def call(value: Any):
+        expert_ids, route_scores, shared_gate, activations = (
+            _packed_stage12_unchecked(value, binding, rows=1)
+        )
+        return stage3(
+            activations,
+            expert_ids,
+            route_scores,
+            shared_gate,
+        ).reshape(1, 1, 2048)
+
+    return call
 
 
 def _target_m2_route(binding: A3BWholeMoeBinding) -> Callable[[Any], Any]:
-    return kernel_module.bind_target_m2(binding)
+    """Bind exact target M2 row routing, packed gate/up, and fused down."""
+
+    stage3 = kernel_module.bind_target_m2_stage3(binding)
+
+    def call(value: Any):
+        expert_ids, route_scores, shared_gate, activations = (
+            _packed_stage12_unchecked(value, binding, rows=2)
+        )
+        return stage3(
+            activations,
+            expert_ids,
+            route_scores,
+            shared_gate,
+        ).reshape(1, 2, 2048)
+
+    return call
 
 
 def _mtp_m1_route(binding: A3BWholeMoeBinding) -> Callable[[Any], Any]:
-    return kernel_module.bind_mtp_m1(binding)
+    """Bind exact MTP M1 row routing, packed gate/up, and fused down."""
+
+    stage3 = kernel_module.bind_mtp_m1_stage3(binding)
+
+    def call(value: Any):
+        expert_ids, route_scores, shared_gate, activations = (
+            _packed_stage12_unchecked(value, binding, rows=1)
+        )
+        return stage3(
+            activations,
+            expert_ids,
+            route_scores,
+            shared_gate,
+        ).reshape(1, 1, 2048)
+
+    return call
 
 
 def _max_abs_diff(candidate: Any, reference: Any) -> float:
@@ -604,16 +729,6 @@ def _check_whole_moe_lane(
     ).astype(mx.bfloat16)
 
     if binding.variant == "target_q8g64_q4g64":
-        stage1 = (
-            kernel_module.target_m1_stage1
-            if rows == 1
-            else kernel_module.target_m2_stage1
-        )
-        stage2 = (
-            kernel_module.target_m1_stage2
-            if rows == 1
-            else kernel_module.target_m2_stage2
-        )
         stage3 = (
             kernel_module.target_m1_stage3
             if rows == 1
@@ -621,12 +736,12 @@ def _check_whole_moe_lane(
         )
         route = _target_m1_route(binding) if rows == 1 else _target_m2_route(binding)
     else:
-        stage1 = kernel_module.mtp_m1_stage1
-        stage2 = kernel_module.mtp_m1_stage2
         stage3 = kernel_module.mtp_m1_stage3
         route = _mtp_m1_route(binding)
 
-    expert_ids, route_scores, shared_gate = stage1(value, binding)
+    expert_ids, route_scores, shared_gate, activations = (
+        _packed_stage12_unchecked(value, binding, rows=rows)
+    )
     probabilities = mx.softmax(binding.block.gate(value), axis=-1, precise=True)
     reference_ids = mx.argpartition(probabilities, kth=-8, axis=-1)[..., -8:]
     reference_scores = mx.take_along_axis(
@@ -642,7 +757,6 @@ def _check_whole_moe_lane(
     reference_scores = reference_scores.reshape(rows, 8)
     reference_shared_gate = binding.block.shared_expert_gate(value).reshape(rows, 1)
 
-    activations = stage2(value, expert_ids, binding)
     packed_routed = binding.block.switch_mlp.gate_up_proj.gather(
         mx.expand_dims(value, (-2, -3)),
         reference_ids.reshape(1, rows, 8),
