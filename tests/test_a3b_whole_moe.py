@@ -1191,12 +1191,29 @@ def test_actual_request_route_requires_the_preflighted_leaf_signature_before_dec
     )
 
 
-def test_mtp_history_construction_uses_the_explicit_stock_prefill_phase():
-    source = inspect.getsource(generation_module._append_mtp_history)
+def test_mtp_history_phase_is_constructed_by_prompt_and_decode_callers():
+    helper = inspect.getsource(generation_module._append_mtp_history)
+    assert 'phase: Literal["prefill", "ar_decode"]' in helper
+    assert "with attention_phase(phase)" in helper
+    assert 'attention_phase("prefill")' not in helper
 
-    phase = source.index('with attention_phase("prefill")')
-    update = source.index("rt.update_mtp_cache(")
-    assert phase < update
+    for prompt_owner in (
+        generation_module._prefill_restored_prompt_suffix,
+        generation_module.restore_or_prefill_prompt_state,
+        generation_module._prefill_committed_mtp_history_streaming,
+    ):
+        source = inspect.getsource(prompt_owner)
+        call = source.index("_append_mtp_history(")
+        next_call = source.find("_append_mtp_history(", call + 1)
+        owned = source[call : None if next_call < 0 else next_call]
+        assert 'phase="prefill"' in owned
+
+    generation = inspect.getsource(generation_module.generate_mtpk)
+    nested_start = generation.index("def append_mtp_history(")
+    nested_end = generation.index("def maybe_eval_state_roots(", nested_start)
+    nested = generation[nested_start:nested_end]
+    assert "_append_mtp_history(" in nested
+    assert 'phase="ar_decode"' in nested
 
 
 def test_runtime_contract_propagates_only_the_whole_moe_enable_flag() -> None:

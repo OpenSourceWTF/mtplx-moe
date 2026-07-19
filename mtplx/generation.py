@@ -1938,6 +1938,7 @@ def _prefill_restored_prompt_suffix(
             restored.mtp_history_cache,
             hidden_states,
             token_ids,
+            phase="prefill",
             mtp_hidden_variant=mtp_hidden_variant,
             force_eval=True,
             input_embeddings=_history_window_embeddings(token_ids, window_start),
@@ -3341,6 +3342,7 @@ def restore_or_prefill_prompt_state(
                     mtp_history_cache,
                     history_hidden,
                     history_token_ids,
+                    phase="prefill",
                     mtp_hidden_variant=mtp_hidden_variant,
                     position_offset=(
                         mtp_history_position_base
@@ -4006,6 +4008,7 @@ def _prefill_committed_mtp_history_streaming(
                     mtp_history_cache,
                     sliced_hidden,
                     sliced_token_ids,
+                    phase="prefill",
                     mtp_hidden_variant=mtp_hidden_variant,
                     position_offset=(
                         token_start_index + slice_start
@@ -4184,6 +4187,7 @@ def _append_mtp_history(
     hidden_states: mx.array,
     token_ids: list[int],
     *,
+    phase: Literal["prefill", "ar_decode"],
     mtp_hidden_variant: str,
     position_offset: int | None = None,
     force_eval: bool = False,
@@ -4197,7 +4201,7 @@ def _append_mtp_history(
         raise ValueError("input_embeddings length must match token_ids length")
     _runtime_count(rt, "mtp_history_append_calls")
     started = time.perf_counter()
-    with attention_phase("prefill"):
+    with attention_phase(phase):
         hidden = rt.update_mtp_cache(
             hidden_states,
             mx.array([token_ids]),
@@ -5921,6 +5925,7 @@ def generate_mtpk(
             mtp_cache,
             hidden_states,
             token_ids,
+            phase="ar_decode",
             mtp_hidden_variant=mtp_hidden_variant,
             position_offset=mtp_position_offset_for_cache(mtp_cache),
             force_eval=force_eval,
