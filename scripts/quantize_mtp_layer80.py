@@ -34,7 +34,6 @@ EXPERT_RE = re.compile(
     r"^model\.layers\.80\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
 )
 GROUP_SIZE = 64
-BITS = 4
 MODE = "affine"
 COSINE_MIN = 0.99
 
@@ -56,9 +55,15 @@ def main() -> int:
     ap.add_argument("--src", default="/Users/davidtai/.cache/huggingface/hy3-mtp-layer80",
                     help="Directory holding layer80-bf16.safetensors")
     ap.add_argument("--infile", default="layer80-bf16.safetensors")
-    ap.add_argument("--out", default="layer80-q4.safetensors")
+    ap.add_argument("--bits", type=int, choices=(4, 8), default=4,
+                    help="Affine bit width for the routed expert projections")
+    ap.add_argument("--out", default=None,
+                    help="Output filename (default: layer80-q{bits}.safetensors)")
     ap.add_argument("--skip-gate", action="store_true", help="Skip the GPU-benchmark guard")
     args = ap.parse_args()
+    bits = args.bits
+    if args.out is None:
+        args.out = f"layer80-q{bits}.safetensors"
 
     if not args.skip_gate and not gpu_gate_clear():
         print("ABORT: benchmark_streamed_generation is running; not touching the GPU.",
@@ -83,7 +88,7 @@ def main() -> int:
         if m is None:
             out[name] = w  # pass through untouched (BF16 / F32)
             continue
-        wq, scales, biases = mx.quantize(w, group_size=GROUP_SIZE, bits=BITS, mode=MODE)
+        wq, scales, biases = mx.quantize(w, group_size=GROUP_SIZE, bits=bits, mode=MODE)
         base = name[: -len(".weight")]
         out[base + ".weight"] = wq
         out[base + ".scales"] = scales
@@ -91,14 +96,18 @@ def main() -> int:
         n_quant += 1
     mx.eval(list(out.values()))
     print(f"quantized {n_quant} expert projection tensors "
-          f"(mode={MODE}, bits={BITS}, group_size={GROUP_SIZE})")
+          f"(mode={MODE}, bits={bits}, group_size={GROUP_SIZE})")
 
     # ---- format assertions vs pinned pipenetwork/Hy3-4bit expert segments ----
+    # Packed last dim scales with bits (in_features * bits / 32); the scales/
+    # biases last dim depends only on group size (in_features / GROUP_SIZE).
+    gu_packed = 4096 * bits // 32   # gate_proj / up_proj read 4096 inputs
+    dn_packed = 1536 * bits // 32   # down_proj reads 1536 inputs
     checks = [
-        ("model.layers.80.mlp.experts.0.gate_proj", (1536, 512), (1536, 64)),
-        ("model.layers.80.mlp.experts.0.up_proj", (1536, 512), (1536, 64)),
-        ("model.layers.80.mlp.experts.0.down_proj", (4096, 192), (4096, 24)),
-        ("model.layers.80.mlp.experts.191.down_proj", (4096, 192), (4096, 24)),
+        ("model.layers.80.mlp.experts.0.gate_proj", (1536, gu_packed), (1536, 64)),
+        ("model.layers.80.mlp.experts.0.up_proj", (1536, gu_packed), (1536, 64)),
+        ("model.layers.80.mlp.experts.0.down_proj", (4096, dn_packed), (4096, 24)),
+        ("model.layers.80.mlp.experts.191.down_proj", (4096, dn_packed), (4096, 24)),
     ]
     for base, wshape, gshape in checks:
         wq, sc, bi = out[base + ".weight"], out[base + ".scales"], out[base + ".biases"]
@@ -112,7 +121,7 @@ def main() -> int:
     for base, _, _ in checks[:3]:
         orig = tensors[base + ".weight"].astype(mx.float32).flatten()
         deq = mx.dequantize(out[base + ".weight"], out[base + ".scales"], out[base + ".biases"],
-                            group_size=GROUP_SIZE, bits=BITS, mode=MODE).astype(mx.float32).flatten()
+                            group_size=GROUP_SIZE, bits=bits, mode=MODE).astype(mx.float32).flatten()
         cos = (mx.sum(orig * deq) / (mx.linalg.norm(orig) * mx.linalg.norm(deq))).item()
         print(f"roundtrip cosine {base.split('.experts.')[-1]:14s}: {cos:.6f}")
         worst = min(worst, cos)
@@ -122,7 +131,7 @@ def main() -> int:
 
     metadata = {
         **{k: str(v) for k, v in src_meta.items()},
-        "quantization": json.dumps({"mode": MODE, "bits": BITS, "group_size": GROUP_SIZE,
+        "quantization": json.dumps({"mode": MODE, "bits": bits, "group_size": GROUP_SIZE,
                                     "scope": "mlp.experts.*.{gate,up,down}_proj only"}),
         "producer": "scripts/quantize_mtp_layer80.py",
     }

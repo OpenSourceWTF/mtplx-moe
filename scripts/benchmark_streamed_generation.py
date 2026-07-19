@@ -1367,7 +1367,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mtp-precision",
-        choices=("bf16", "q4"),
+        choices=("bf16", "q4", "q8"),
         help=(
             "External NextN head precision (default bf16). bf16 loads the "
             "bit-exact BF16 head (~7.5 GB resident; quantizing the head costs "

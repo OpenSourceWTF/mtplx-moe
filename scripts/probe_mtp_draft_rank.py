@@ -181,7 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mtp-precision",
-        choices=("bf16", "q4"),
+        choices=("bf16", "q4", "q8"),
         help=(
             "Layer-80 NextN head precision (default bf16, the bit-exact head "
             "per docs/FORGE_BACKEND_CONTRACT.md section 6; ~7.5 GB resident "
