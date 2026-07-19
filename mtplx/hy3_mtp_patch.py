@@ -48,7 +48,13 @@ HY3_MTP_SOURCE_REVISION = "716aa7241bd6d95896be4ebfc761162a9c4d49ef"
 HY3_MTP_BF16_FILE = "layer80-bf16.safetensors"
 HY3_MTP_RESIDENTS_FILE = "layer80-residents-q.safetensors"
 HY3_MTP_EXPERTS_FILE = "layer80-q4.safetensors"
-HY3_MTP_PRECISIONS = ("bf16", "q4")
+# Routed-expert artifact per quantized precision. Residents always come from
+# HY3_MTP_RESIDENTS_FILE; only the 192 routed experts change bit width.
+HY3_MTP_EXPERT_FILES = {
+    "q4": HY3_MTP_EXPERTS_FILE,
+    "q8": "layer80-q8.safetensors",
+}
+HY3_MTP_PRECISIONS = ("bf16", "q4", "q8")
 # Forge contract section 6: quantized MTP heads collapse acceptance, so the
 # bit-exact BF16 head is the default despite its larger resident footprint.
 HY3_MTP_DEFAULT_PRECISION = "bf16"
@@ -347,11 +353,9 @@ def _unchanged_while_held(before: os.stat_result, after: os.stat_result) -> bool
 
 
 def _selected_artifact_filenames(precision: str) -> tuple[str, ...]:
-    return (
-        (HY3_MTP_BF16_FILE,)
-        if precision == "bf16"
-        else (HY3_MTP_RESIDENTS_FILE, HY3_MTP_EXPERTS_FILE)
-    )
+    if precision == "bf16":
+        return (HY3_MTP_BF16_FILE,)
+    return (HY3_MTP_RESIDENTS_FILE, HY3_MTP_EXPERT_FILES[precision])
 
 
 def _validate_artifact_selection(precision: str, expected_revision: str) -> None:
@@ -603,6 +607,7 @@ def load_hy3_mtp_weights(
     expected_revision: str = HY3_MTP_SOURCE_REVISION,
     mx_module: Any | None = None,
     verified_artifacts: VerifiedHy3MTPArtifacts | None = None,
+    precision: str = "q4",
 ) -> dict[str, Any]:
     """Read and validate both layer-80 artifacts into module-path weights.
 
@@ -620,7 +625,7 @@ def load_hy3_mtp_weights(
     if verified_artifacts is None:
         with open_verified_hy3_mtp_artifacts(
             artifact_dir,
-            precision="q4",
+            precision=precision,
             expected_revision=expected_revision,
         ) as verified:
             return load_hy3_mtp_weights(
@@ -629,15 +634,17 @@ def load_hy3_mtp_weights(
                 expected_revision=expected_revision,
                 mx_module=mx,
                 verified_artifacts=verified,
+                precision=precision,
             )
     files = _require_verified_artifacts(
         verified_artifacts,
         artifact_dir,
-        precision="q4",
+        precision=precision,
         expected_revision=expected_revision,
     )
+    experts_name = HY3_MTP_EXPERT_FILES[precision]
     residents_path = artifact_dir / HY3_MTP_RESIDENTS_FILE
-    experts_path = artifact_dir / HY3_MTP_EXPERTS_FILE
+    experts_path = artifact_dir / experts_name
 
     prefix = _layer_prefix(args)
     mapped: dict[str, Any] = {}
@@ -660,7 +667,7 @@ def load_hy3_mtp_weights(
         _validate_leaf_dtype(name, value, mx)
         mapped["layers.0." + _resident_target(name[len(prefix) :])] = value
 
-    experts_file = files[HY3_MTP_EXPERTS_FILE]
+    experts_file = files[experts_name]
     experts_file.seek(0)
     experts = mx.load(experts_file, format="safetensors")
     expected_experts = expected_expert_names(args)
@@ -833,7 +840,12 @@ def build_hy3_mtp_module(
     ``precision="bf16"`` (default) builds the entire head plain BF16 from the
     bit-exact ``layer80-bf16.safetensors`` artifact — no quantized modules
     anywhere (~7.5 GB resident).  ``precision="q4"`` keeps the pinned
-    quantized artifacts and behavior (~1.94 GiB expert bank).
+    quantized artifacts and behavior (~1.94 GiB expert bank); ``"q8"`` loads
+    ``layer80-q8.safetensors`` (3.83 GiB, roundtrip cosine 0.99997).
+
+    Measured 2026-07-18, teacher-forced on paired positions: bf16 accept@1
+    0.2643 vs q8 0.2429 at n=280, paired rank sign-test p=0.0013. Acceptance
+    moves, so q8 is an available arm and NOT the default.
     """
 
     import mlx.core as mx
@@ -896,6 +908,7 @@ def build_hy3_mtp_module(
             args,
             expected_revision=expected_revision,
             verified_artifacts=verified_artifacts,
+            precision=precision,
         )
         mtp = Hy3MTP(args, num_mtp_layers=1)
 
