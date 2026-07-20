@@ -32,7 +32,10 @@ def _fixed_source(*, stage: int, rows: int, variant: str) -> str:
         constexpr uint ROWS = {rows};
     """
     if stage == 1:
-        return common + _stage1_source(target=variant.startswith("target"))
+        return common + _stage1_source(
+            target=variant.startswith("target"),
+            rows=rows,
+        )
     if stage == 2:
         return common + _stage2_source(target=variant.startswith("target"))
     return common + _stage3_source(
@@ -41,7 +44,9 @@ def _fixed_source(*, stage: int, rows: int, variant: str) -> str:
     )
 
 
-def _stage1_source(*, target: bool) -> str:
+def _stage1_source(*, target: bool, rows: int) -> str:
+    if target and rows == 2:
+        return _target_m2_stage1_source()
     projection = _target_stage1_projection() if target else _mtp_stage1_projection()
     prologue = """
         uint tid = thread_position_in_threadgroup.x;
@@ -161,6 +166,228 @@ def _stage1_source(*, target: bool) -> str:
         }
     """
     return prologue + projection + finalize
+
+
+def _target_m2_stage1_source() -> str:
+    return """
+        constexpr uint ROUTER_GROUP = 64;
+        constexpr uint Q8_VALUES_PER_LANE = 8;
+        constexpr uint Q8_BLOCK = Q8_VALUES_PER_LANE * 32;
+
+        uint tid = thread_position_in_threadgroup.x;
+        uint lane = thread_index_in_simdgroup;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+
+        threadgroup bfloat router_logits[ROWS * EXPERTS];
+        threadgroup bfloat probabilities[ROWS * EXPERTS];
+        threadgroup float simd_values[8];
+        threadgroup float local_probabilities[64];
+        threadgroup int local_indices[64];
+        threadgroup float merged_probabilities[TOP_K];
+        threadgroup int merged_indices[TOP_K];
+
+        // qdot8_affine: one threadgroup owns both exact M2 rows so every
+        // fixed router weight is loaded once and applied to both row values.
+        {
+            const device uchar* weights =
+                reinterpret_cast<const device uchar*>(router_weight);
+            float router_result[ROWS][4];
+            for (uint subtile = 0; subtile < 8; ++subtile) {
+                for (uint row = 0; row < ROWS; ++row) {
+                    for (uint result_index = 0; result_index < 4; ++result_index) {
+                        router_result[row][result_index] = 0.0f;
+                    }
+                }
+                uint expert_base = subtile * 32 + simd_gid * 4;
+                for (uint k_block = 0; k_block < HIDDEN; k_block += Q8_BLOCK) {
+                    uint k_lane = k_block + lane * Q8_VALUES_PER_LANE;
+                    float input_values[ROWS][Q8_VALUES_PER_LANE];
+                    float input_sum[ROWS] = {0.0f, 0.0f};
+                    for (uint row = 0; row < ROWS; ++row) {
+                        for (uint item = 0; item < Q8_VALUES_PER_LANE; ++item) {
+                            float input_value = float(
+                                value[row * HIDDEN + k_lane + item]);
+                            input_values[row][item] = input_value;
+                            input_sum[row] += input_value;
+                        }
+                    }
+                    for (uint result_index = 0; result_index < 4; ++result_index) {
+                        uint expert = expert_base + result_index;
+                        uint weight_base = expert * HIDDEN + k_lane;
+                        uint metadata_index = expert * (HIDDEN / ROUTER_GROUP)
+                            + k_lane / ROUTER_GROUP;
+                        float scale = float(router_scales[metadata_index]);
+                        float bias = float(router_biases[metadata_index]);
+                        float quantized_dot[ROWS] = {0.0f, 0.0f};
+                        for (uint item = 0; item < Q8_VALUES_PER_LANE; ++item) {
+                            uchar packed_weight = weights[weight_base + item];
+                            for (uint row = 0; row < ROWS; ++row) {
+                                quantized_dot[row] += input_values[row][item]
+                                    * float(packed_weight);
+                            }
+                        }
+                        for (uint row = 0; row < ROWS; ++row) {
+                            router_result[row][result_index] +=
+                                scale * quantized_dot[row] + input_sum[row] * bias;
+                        }
+                    }
+                }
+                for (uint row = 0; row < ROWS; ++row) {
+                    for (uint result_index = 0; result_index < 4; ++result_index) {
+                        float reduced = simd_sum(router_result[row][result_index]);
+                        if (lane == 0) {
+                            uint expert = expert_base + result_index;
+                            router_logits[row * EXPERTS + expert] = bfloat(reduced);
+                        }
+                    }
+                }
+            }
+        }
+
+        // The shared scalar projection has the same weights for both rows.
+        // Keep both partials live and consume each q8 byte once.
+        {
+            const device uchar* weights =
+                reinterpret_cast<const device uchar*>(shared_gate_weight);
+            float shared_partial[ROWS] = {0.0f, 0.0f};
+            if (simd_gid == 0) {
+                for (uint k_block = 0; k_block < HIDDEN; k_block += Q8_BLOCK) {
+                    uint k_lane = k_block + lane * Q8_VALUES_PER_LANE;
+                    float input_sum[ROWS] = {0.0f, 0.0f};
+                    float quantized_dot[ROWS] = {0.0f, 0.0f};
+                    uint metadata_index = k_lane / ROUTER_GROUP;
+                    float scale = float(shared_gate_scales[metadata_index]);
+                    float bias = float(shared_gate_biases[metadata_index]);
+                    for (uint item = 0; item < Q8_VALUES_PER_LANE; ++item) {
+                        uchar packed_weight = weights[k_lane + item];
+                        for (uint row = 0; row < ROWS; ++row) {
+                            float input_value = float(
+                                value[row * HIDDEN + k_lane + item]);
+                            input_sum[row] += input_value;
+                            quantized_dot[row] += input_value * float(packed_weight);
+                        }
+                    }
+                    for (uint row = 0; row < ROWS; ++row) {
+                        shared_partial[row] +=
+                            scale * quantized_dot[row] + input_sum[row] * bias;
+                    }
+                }
+                for (uint row = 0; row < ROWS; ++row) {
+                    float shared_reduced = simd_sum(shared_partial[row]);
+                    if (lane == 0) {
+                        shared_gate[row] = bfloat(shared_reduced);
+                    }
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // The top-k scratch is reused sequentially by the two rows. The loop is
+        // uniform across the threadgroup, so the row-boundary barrier is safe.
+        for (uint row = 0; row < ROWS; ++row) {
+            float local_logit = float(router_logits[row * EXPERTS + tid]);
+            float local_maximum = simd_max(local_logit);
+            if (lane == 0) {
+                simd_values[simd_gid] = local_maximum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float maximum_candidate = lane < 8 ? simd_values[lane] : -INFINITY;
+            float row_maximum = simd_max(maximum_candidate);
+            if (simd_gid == 0 && lane == 0) {
+                simd_values[0] = row_maximum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float probability = metal::exp(local_logit - simd_values[0]);
+            float local_sum = simd_sum(probability);
+            if (lane == 0) {
+                simd_values[simd_gid] = local_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float sum_candidate = lane < 8 ? simd_values[lane] : 0.0f;
+            float row_sum = simd_sum(sum_candidate);
+            if (simd_gid == 0 && lane == 0) {
+                simd_values[0] = row_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            probabilities[row * EXPERTS + tid] = bfloat(
+                probability / simd_values[0]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float candidate_probability = float(
+                probabilities[row * EXPERTS + tid]);
+            int candidate_index = int(tid);
+            for (int rank = 0; rank < int(TOP_K); ++rank) {
+                float winner_probability = simd_max(candidate_probability);
+                float winner_index_value = simd_max(
+                    candidate_probability == winner_probability
+                        ? float(candidate_index)
+                        : -1.0f);
+                int winner_index = int(winner_index_value);
+                if (lane == 0) {
+                    int destination = int(simd_gid * TOP_K) + rank;
+                    local_probabilities[destination] = winner_probability;
+                    local_indices[destination] = winner_index;
+                }
+                if (candidate_index == winner_index) {
+                    candidate_probability = -INFINITY;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (simd_gid == 0) {
+                int slot0 = int(lane);
+                int slot1 = int(lane) + 32;
+                float probability0 = local_probabilities[slot0];
+                float probability1 = local_probabilities[slot1];
+                int index0 = local_indices[slot0];
+                int index1 = local_indices[slot1];
+
+                for (int rank = 0; rank < int(TOP_K); ++rank) {
+                    bool take1 = probability1 > probability0
+                        || (probability1 == probability0 && index1 > index0);
+                    float lane_probability = take1 ? probability1 : probability0;
+                    int lane_index = take1 ? index1 : index0;
+                    float winner_probability = simd_max(lane_probability);
+                    float winner_index_value = simd_max(
+                        lane_probability == winner_probability
+                            ? float(lane_index)
+                            : -1.0f);
+                    int winner_index = int(winner_index_value);
+                    if (lane == 0) {
+                        merged_probabilities[rank] = winner_probability;
+                        merged_indices[rank] = winner_index;
+                    }
+                    if (lane_index == winner_index) {
+                        if (take1) {
+                            probability1 = -INFINITY;
+                        } else {
+                            probability0 = -INFINITY;
+                        }
+                    }
+                }
+
+                if (lane == 0) {
+                    bfloat rounded_denominator = bfloat(0.0f);
+                    for (int output_rank = 0; output_rank < int(TOP_K); ++output_rank) {
+                        rounded_denominator = bfloat(
+                            float(rounded_denominator)
+                            + merged_probabilities[TOP_K - 1 - output_rank]);
+                    }
+                    for (int output_rank = 0; output_rank < int(TOP_K); ++output_rank) {
+                        int source_rank = int(TOP_K) - 1 - output_rank;
+                        int destination = int(row * TOP_K) + output_rank;
+                        expert_ids[destination] = uint(merged_indices[source_rank]);
+                        route_scores[destination] = bfloat(
+                            merged_probabilities[source_rank]
+                            / float(rounded_denominator));
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    """
 
 
 def _target_stage1_projection() -> str:
@@ -1045,7 +1272,7 @@ def whole_moe_launch_table() -> dict[str, tuple[tuple[int, int, int], tuple[int,
 
     return {
         "target_m1_stage1": ((256, 1, 1), (256, 1, 1)),
-        "target_m2_stage1": ((512, 1, 1), (256, 1, 1)),
+        "target_m2_stage1": ((256, 1, 1), (256, 1, 1)),
         "mtp_m1_stage1": ((256, 1, 1), (256, 1, 1)),
         "target_m1_stage2": ((STAGE2_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
         "target_m2_stage2": ((STAGE2_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
@@ -1202,7 +1429,13 @@ def _build_mtp_m1_stage3_kernel():
     )
 
 
-def _launch_target_stage1(kernel: Any, value: Any, binding: Any, *, rows: int):
+def _launch_target_stage1(
+    kernel: Any,
+    value: Any,
+    binding: Any,
+    *,
+    rows: int,
+):
     router = binding.router
     shared_gate = binding.shared_scalar_gate
     return kernel(
@@ -1215,7 +1448,7 @@ def _launch_target_stage1(kernel: Any, value: Any, binding: Any, *, rows: int):
             shared_gate.scales,
             shared_gate.biases,
         ],
-        grid=(rows * 256, 1, 1),
+        grid=(256, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(rows, 8), (rows, 8), (rows, 1)],
         output_dtypes=[mx.uint32, mx.bfloat16, mx.bfloat16],
@@ -1240,7 +1473,10 @@ def target_m1_stage1(value: Any, binding: Any):
     """Launch fixed target M1 route and shared-gate ownership."""
 
     return _launch_target_stage1(
-        _build_target_m1_stage1_kernel(), value, binding, rows=1
+        _build_target_m1_stage1_kernel(),
+        value,
+        binding,
+        rows=1,
     )
 
 
@@ -1248,7 +1484,10 @@ def target_m2_stage1(value: Any, binding: Any):
     """Launch fixed target M2 route and shared-gate ownership."""
 
     return _launch_target_stage1(
-        _build_target_m2_stage1_kernel(), value, binding, rows=2
+        _build_target_m2_stage1_kernel(),
+        value,
+        binding,
+        rows=2,
     )
 
 

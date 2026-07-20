@@ -495,7 +495,7 @@ def test_target_m2_stage2_is_row_paired_with_fixed_288_threadgroups(monkeypatch)
 def test_fixed_entrypoint_launch_table(monkeypatch):
     expected = {
         "target_m1_stage1": ((256, 1, 1), (256, 1, 1)),
-        "target_m2_stage1": ((512, 1, 1), (256, 1, 1)),
+        "target_m2_stage1": ((256, 1, 1), (256, 1, 1)),
         "mtp_m1_stage1": ((256, 1, 1), (256, 1, 1)),
         "target_m1_stage2": ((288 * 128, 1, 1), (128, 1, 1)),
         "target_m2_stage2": ((288 * 128, 1, 1), (128, 1, 1)),
@@ -523,6 +523,19 @@ def test_stage1_sources_encode_router_softmax_top8_and_score_rounding():
     assert "threadgroup bfloat router_logits[ROWS * EXPERTS]" in source
     assert "metal::exp" in source
     assert "bfloat rounded_denominator = bfloat(0.0f)" in source
+
+
+def test_target_m2_stage1_loads_router_and_shared_gate_weights_once_for_both_rows():
+    source = kernel_module.all_whole_moe_sources()["target_m2_stage1"]
+
+    assert "uint row = threadgroup_position_in_grid.x" not in source
+    assert "float router_result[ROWS][4]" in source
+    assert "for (uint row = 0; row < ROWS; ++row)" in source
+    assert source.count("uchar packed_weight = weights[weight_base + item]") == 1
+    assert "router_logits[row * EXPERTS + expert] = bfloat(reduced)" in source
+    assert "float shared_partial[ROWS]" in source
+    assert source.count("uchar packed_weight = weights[k_lane + item]") == 1
+    assert "shared_gate[row] = bfloat(shared_reduced)" in source
 
 
 def test_stage2_sources_encode_selected_q4_and_exact_bf16_swiglu():
