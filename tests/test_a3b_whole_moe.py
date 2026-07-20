@@ -429,7 +429,7 @@ def test_external_contract_mismatch_fails_before_install(
 
 def test_fixed_kernel_sources_encode_exact_geometry_without_hot_validation():
     sources = kernel_module.all_whole_moe_sources()
-    assert len(sources) == 9
+    assert len(sources) == 10
     for source in sources.values():
         assert "constexpr uint HIDDEN = 2048" in source
         assert "constexpr uint EXPERTS = 256" in source
@@ -465,6 +465,45 @@ class _CapturedKernel:
         )
 
 
+def test_target_m2_stage1_runs_fixed_projection_then_exact_finalizer(monkeypatch):
+    monkeypatch.setenv("MTPLX_A3B_WHOLE_MOE_FUSION", "1")
+    projection = _CapturedKernel()
+    finalizer = _CapturedKernel()
+    monkeypatch.setattr(
+        kernel_module,
+        "_build_target_m2_stage1_projection_kernel",
+        lambda: projection,
+    )
+    monkeypatch.setattr(
+        kernel_module,
+        "_build_target_m2_stage1_finalizer_kernel",
+        lambda: finalizer,
+    )
+    model, _, _ = _exact_model()
+    binding = prepare_a3b_whole_moe(
+        model,
+        config=_exact_config(),
+    ).target_bindings[0]
+    value = _ArraySpec((2, 2048))
+
+    expert_ids, route_scores, shared_gate = kernel_module.target_m2_stage1(
+        value, binding
+    )
+
+    assert projection.call["grid"] == (8 * 256, 1, 1)
+    assert projection.call["threadgroup"] == (256, 1, 1)
+    assert projection.call["output_shapes"] == [(2, 256), (2, 1)]
+    assert projection.call["output_dtypes"] == [mx.bfloat16, mx.bfloat16]
+    assert finalizer.call["grid"] == (256, 1, 1)
+    assert finalizer.call["threadgroup"] == (256, 1, 1)
+    assert finalizer.call["output_shapes"] == [(2, 8), (2, 8)]
+    assert finalizer.call["output_dtypes"] == [mx.uint32, mx.bfloat16]
+    assert finalizer.call["inputs"][0].shape == (2, 256)
+    assert expert_ids.shape == (2, 8)
+    assert route_scores.shape == (2, 8)
+    assert shared_gate.shape == (2, 1)
+
+
 def test_target_m2_stage2_is_row_paired_with_fixed_288_threadgroups(monkeypatch):
     monkeypatch.setenv("MTPLX_A3B_WHOLE_MOE_FUSION", "1")
     kernel = _CapturedKernel()
@@ -495,7 +534,8 @@ def test_target_m2_stage2_is_row_paired_with_fixed_288_threadgroups(monkeypatch)
 def test_fixed_entrypoint_launch_table(monkeypatch):
     expected = {
         "target_m1_stage1": ((256, 1, 1), (256, 1, 1)),
-        "target_m2_stage1": ((256, 1, 1), (256, 1, 1)),
+        "target_m2_stage1_projection": ((8 * 256, 1, 1), (256, 1, 1)),
+        "target_m2_stage1_finalizer": ((256, 1, 1), (256, 1, 1)),
         "mtp_m1_stage1": ((256, 1, 1), (256, 1, 1)),
         "target_m1_stage2": ((288 * 128, 1, 1), (128, 1, 1)),
         "target_m2_stage2": ((288 * 128, 1, 1), (128, 1, 1)),
@@ -509,15 +549,27 @@ def test_fixed_entrypoint_launch_table(monkeypatch):
 
 def test_stage1_sources_encode_router_softmax_top8_and_score_rounding():
     sources = kernel_module.all_whole_moe_sources()
-    for name in ("target_m1_stage1", "target_m2_stage1"):
-        source = sources[name]
-        assert "qdot8_affine" in source
-        assert "constexpr uint ROUTER_GROUP = 64" in source
-        assert "threadgroup bfloat router_logits[ROWS * EXPERTS]" in source
-        assert "metal::exp" in source
-        assert "simd_max" in source
-        assert "bfloat rounded_denominator = bfloat(0.0f)" in source
-        assert "candidate_probability == winner_probability" in source
+    source = sources["target_m1_stage1"]
+    assert "qdot8_affine" in source
+    assert "constexpr uint ROUTER_GROUP = 64" in source
+    assert "threadgroup bfloat router_logits[ROWS * EXPERTS]" in source
+    assert "metal::exp" in source
+    assert "simd_max" in source
+    assert "bfloat rounded_denominator = bfloat(0.0f)" in source
+    assert "candidate_probability == winner_probability" in source
+
+    projection = sources["target_m2_stage1_projection"]
+    assert "qdot8_affine" in projection
+    assert "constexpr uint ROUTER_GROUP = 64" in projection
+    assert "metal::exp" not in projection
+    assert "simd_max" not in projection
+
+    finalizer = sources["target_m2_stage1_finalizer"]
+    assert "qdot8_affine" not in finalizer
+    assert "metal::exp" in finalizer
+    assert "simd_max" in finalizer
+    assert "bfloat rounded_denominator = bfloat(0.0f)" in finalizer
+    assert "candidate_probability == winner_probability" in finalizer
     source = sources["mtp_m1_stage1"]
     assert "dense_bf16_dot" in source
     assert "threadgroup bfloat router_logits[ROWS * EXPERTS]" in source
@@ -525,17 +577,51 @@ def test_stage1_sources_encode_router_softmax_top8_and_score_rounding():
     assert "bfloat rounded_denominator = bfloat(0.0f)" in source
 
 
-def test_target_m2_stage1_loads_router_and_shared_gate_weights_once_for_both_rows():
-    source = kernel_module.all_whole_moe_sources()["target_m2_stage1"]
+def test_target_m2_stage1_projection_tiles_experts_without_duplicate_row_tiles():
+    source = kernel_module.all_whole_moe_sources()[
+        "target_m2_stage1_projection"
+    ]
 
+    assert "constexpr uint OUTPUT_EXPERTS_PER_GROUP = 8 * 4" in source
+    assert kernel_module.STAGE1_PROJECTION_THREADGROUPS == 8
+    assert "uint expert_tile = threadgroup_position_in_grid.x" in source
+    assert "uint expert_base = expert_tile * OUTPUT_EXPERTS_PER_GROUP" in source
+    assert "for (uint subtile = 0; subtile < 8; ++subtile)" not in source
     assert "uint row = threadgroup_position_in_grid.x" not in source
     assert "float router_result[ROWS][4]" in source
     assert "for (uint row = 0; row < ROWS; ++row)" in source
     assert source.count("uchar packed_weight = weights[weight_base + item]") == 1
+    assert source.count("float scale = float(router_scales[metadata_index])") == 1
+    assert source.count("float bias = float(router_biases[metadata_index])") == 1
     assert "router_logits[row * EXPERTS + expert] = bfloat(reduced)" in source
+
+
+def test_target_m2_stage1_projection_loads_shared_gate_once_for_both_rows():
+    source = kernel_module.all_whole_moe_sources()[
+        "target_m2_stage1_projection"
+    ]
+
+    assert "if (expert_tile == 0 && simd_gid == 0)" in source
     assert "float shared_partial[ROWS]" in source
     assert source.count("uchar packed_weight = weights[k_lane + item]") == 1
+    assert source.count("float scale = float(shared_gate_scales[metadata_index])") == 1
+    assert source.count("float bias = float(shared_gate_biases[metadata_index])") == 1
     assert "shared_gate[row] = bfloat(shared_reduced)" in source
+
+
+def test_target_m2_stage1_finalizer_preserves_exact_two_row_arithmetic():
+    source = kernel_module.all_whole_moe_sources()[
+        "target_m2_stage1_finalizer"
+    ]
+
+    assert "for (uint row = 0; row < ROWS; ++row)" in source
+    assert "float local_logit = float(router_logits[row * EXPERTS + tid])" in source
+    assert "probabilities[row * EXPERTS + tid] = bfloat(" in source
+    assert "candidate_probability == winner_probability" in source
+    assert "probability1 == probability0 && index1 > index0" in source
+    assert "bfloat rounded_denominator = bfloat(0.0f)" in source
+    assert "merged_probabilities[TOP_K - 1 - output_rank]" in source
+    assert source.count("threadgroup_barrier(mem_flags::mem_threadgroup)") >= 6
 
 
 def test_stage2_sources_encode_selected_q4_and_exact_bf16_swiglu():
@@ -659,6 +745,8 @@ def test_all_fixed_entrypoints_launch_directly_without_runtime_validation(monkey
     target = plan.target_bindings[0]
     mtp = plan.mtp_bindings[0]
     for name, (grid, threadgroup) in kernel_module.whole_moe_launch_table().items():
+        if name.startswith("target_m2_stage1_"):
+            continue
         rows = 2 if "m2" in name else 1
         binding = mtp if name.startswith("mtp") else target
         captured = _CapturedKernel()
@@ -913,7 +1001,7 @@ def _patch_whole_moe_stages(monkeypatch):
     )
 
 
-def test_installed_partition_prebinds_all_three_exact_target_m2_stages():
+def test_installed_partition_prebinds_all_four_exact_target_m2_kernels():
     stage1_source = inspect.getsource(whole_moe_module._row_owned_stage1_unchecked)
     assert "mx.softmax" in stage1_source
     assert "precise=True" in stage1_source
@@ -931,10 +1019,14 @@ def test_installed_partition_prebinds_all_three_exact_target_m2_stages():
     assert "_packed_stage12_unchecked" not in source
 
     fixed_source = inspect.getsource(kernel_module.bind_target_m2)
-    assert "_build_target_m2_stage1_kernel()" in fixed_source
+    assert "_build_target_m2_stage1_projection_kernel()" in fixed_source
+    assert "_build_target_m2_stage1_finalizer_kernel()" in fixed_source
     assert "_build_target_m2_stage2_kernel()" in fixed_source
     assert "_build_target_m2_stage3_kernel()" in fixed_source
-    assert "_launch_target_stage1(" in fixed_source
+    assert "_launch_target_m2_stage1(" in fixed_source
+    assert "_launch_target_stage1(" not in fixed_source
+    assert "_row_owned_stage1_unchecked" not in fixed_source
+    assert "_packed_stage12_unchecked" not in fixed_source
     assert "_launch_target_stage2(" in fixed_source
     assert "_launch_target_stage3(" in fixed_source
     assert "output.reshape(1, 2, 2048)" in fixed_source
@@ -978,7 +1070,7 @@ def test_successful_selfcheck_installs_only_40_target_m2_overrides(monkeypatch):
     )
     assert report["validated_contract"]["target"]["routes"] == {
         "M1": "accepted_row_owned_router_combine",
-        "M2": "fixed_stage123_one_read_row_paired",
+        "M2": "fixed_tiled_stage1_stage23_one_read_row_paired",
     }
     assert report["validated_contract"]["mtp"]["routes"] == {
         "M1": "accepted_row_owned_router_combine"

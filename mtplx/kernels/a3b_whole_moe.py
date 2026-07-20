@@ -13,6 +13,7 @@ TOP_K = 8
 INTERMEDIATE = 512
 ACTIVATION_SLOTS = 9
 STAGE1_THREADS = 256
+STAGE1_PROJECTION_THREADGROUPS = EXPERTS // (8 * 4)
 TILED_THREADS = 128
 STAGE2_THREADGROUPS = ACTIVATION_SLOTS * (INTERMEDIATE // 16)
 STAGE3_THREADGROUPS = HIDDEN // 16
@@ -20,8 +21,8 @@ STAGE3_THREADGROUPS = HIDDEN // 16
 _KERNELS: dict[str, Any] = {}
 
 
-def _fixed_source(*, stage: int, rows: int, variant: str) -> str:
-    common = f"""
+def _source_preamble(*, rows: int) -> str:
+    return f"""
         using namespace metal;
 
         constexpr uint HIDDEN = {HIDDEN};
@@ -31,6 +32,10 @@ def _fixed_source(*, stage: int, rows: int, variant: str) -> str:
         constexpr uint ACTIVATION_SLOTS = {ACTIVATION_SLOTS};
         constexpr uint ROWS = {rows};
     """
+
+
+def _fixed_source(*, stage: int, rows: int, variant: str) -> str:
+    common = _source_preamble(rows=rows)
     if stage == 1:
         return common + _stage1_source(
             target=variant.startswith("target"),
@@ -49,7 +54,7 @@ def _fixed_source(*, stage: int, rows: int, variant: str) -> str:
 
 def _stage1_source(*, target: bool, rows: int) -> str:
     if target and rows == 2:
-        return _target_m2_stage1_source()
+        return _target_m2_stage1_projection_source()
     projection = _target_stage1_projection() if target else _mtp_stage1_projection()
     prologue = """
         uint tid = thread_position_in_threadgroup.x;
@@ -171,77 +176,69 @@ def _stage1_source(*, target: bool, rows: int) -> str:
     return prologue + projection + finalize
 
 
-def _target_m2_stage1_source() -> str:
+def _target_m2_stage1_projection_source() -> str:
     return """
         constexpr uint ROUTER_GROUP = 64;
         constexpr uint Q8_VALUES_PER_LANE = 8;
         constexpr uint Q8_BLOCK = Q8_VALUES_PER_LANE * 32;
+        constexpr uint OUTPUT_EXPERTS_PER_GROUP = 8 * 4;
 
-        uint tid = thread_position_in_threadgroup.x;
         uint lane = thread_index_in_simdgroup;
         uint simd_gid = simdgroup_index_in_threadgroup;
+        uint expert_tile = threadgroup_position_in_grid.x;
 
-        threadgroup bfloat router_logits[ROWS * EXPERTS];
-        threadgroup bfloat probabilities[ROWS * EXPERTS];
-        threadgroup float simd_values[8];
-        threadgroup float local_probabilities[64];
-        threadgroup int local_indices[64];
-        threadgroup float merged_probabilities[TOP_K];
-        threadgroup int merged_indices[TOP_K];
-
-        // qdot8_affine: one threadgroup owns both exact M2 rows so every
-        // fixed router weight is loaded once and applied to both row values.
+        // qdot8_affine: each output-column threadgroup owns 32 experts and
+        // both exact M2 rows, so every router weight feeds both row results.
         {
             const device uchar* weights =
                 reinterpret_cast<const device uchar*>(router_weight);
             float router_result[ROWS][4];
-            for (uint subtile = 0; subtile < 8; ++subtile) {
+            for (uint row = 0; row < ROWS; ++row) {
+                for (uint result_index = 0; result_index < 4; ++result_index) {
+                    router_result[row][result_index] = 0.0f;
+                }
+            }
+            uint expert_base = expert_tile * OUTPUT_EXPERTS_PER_GROUP
+                + simd_gid * 4;
+            for (uint k_block = 0; k_block < HIDDEN; k_block += Q8_BLOCK) {
+                uint k_lane = k_block + lane * Q8_VALUES_PER_LANE;
+                float input_values[ROWS][Q8_VALUES_PER_LANE];
+                float input_sum[ROWS] = {0.0f, 0.0f};
                 for (uint row = 0; row < ROWS; ++row) {
-                    for (uint result_index = 0; result_index < 4; ++result_index) {
-                        router_result[row][result_index] = 0.0f;
+                    for (uint item = 0; item < Q8_VALUES_PER_LANE; ++item) {
+                        float input_value = float(
+                            value[row * HIDDEN + k_lane + item]);
+                        input_values[row][item] = input_value;
+                        input_sum[row] += input_value;
                     }
                 }
-                uint expert_base = subtile * 32 + simd_gid * 4;
-                for (uint k_block = 0; k_block < HIDDEN; k_block += Q8_BLOCK) {
-                    uint k_lane = k_block + lane * Q8_VALUES_PER_LANE;
-                    float input_values[ROWS][Q8_VALUES_PER_LANE];
-                    float input_sum[ROWS] = {0.0f, 0.0f};
-                    for (uint row = 0; row < ROWS; ++row) {
-                        for (uint item = 0; item < Q8_VALUES_PER_LANE; ++item) {
-                            float input_value = float(
-                                value[row * HIDDEN + k_lane + item]);
-                            input_values[row][item] = input_value;
-                            input_sum[row] += input_value;
-                        }
-                    }
-                    for (uint result_index = 0; result_index < 4; ++result_index) {
-                        uint expert = expert_base + result_index;
-                        uint weight_base = expert * HIDDEN + k_lane;
-                        uint metadata_index = expert * (HIDDEN / ROUTER_GROUP)
-                            + k_lane / ROUTER_GROUP;
-                        float scale = float(router_scales[metadata_index]);
-                        float bias = float(router_biases[metadata_index]);
-                        float quantized_dot[ROWS] = {0.0f, 0.0f};
-                        for (uint item = 0; item < Q8_VALUES_PER_LANE; ++item) {
-                            uchar packed_weight = weights[weight_base + item];
-                            for (uint row = 0; row < ROWS; ++row) {
-                                quantized_dot[row] += input_values[row][item]
-                                    * float(packed_weight);
-                            }
-                        }
+                for (uint result_index = 0; result_index < 4; ++result_index) {
+                    uint expert = expert_base + result_index;
+                    uint weight_base = expert * HIDDEN + k_lane;
+                    uint metadata_index = expert * (HIDDEN / ROUTER_GROUP)
+                        + k_lane / ROUTER_GROUP;
+                    float scale = float(router_scales[metadata_index]);
+                    float bias = float(router_biases[metadata_index]);
+                    float quantized_dot[ROWS] = {0.0f, 0.0f};
+                    for (uint item = 0; item < Q8_VALUES_PER_LANE; ++item) {
+                        uchar packed_weight = weights[weight_base + item];
                         for (uint row = 0; row < ROWS; ++row) {
-                            router_result[row][result_index] +=
-                                scale * quantized_dot[row] + input_sum[row] * bias;
+                            quantized_dot[row] += input_values[row][item]
+                                * float(packed_weight);
                         }
                     }
+                    for (uint row = 0; row < ROWS; ++row) {
+                        router_result[row][result_index] +=
+                            scale * quantized_dot[row] + input_sum[row] * bias;
+                    }
                 }
-                for (uint row = 0; row < ROWS; ++row) {
-                    for (uint result_index = 0; result_index < 4; ++result_index) {
-                        float reduced = simd_sum(router_result[row][result_index]);
-                        if (lane == 0) {
-                            uint expert = expert_base + result_index;
-                            router_logits[row * EXPERTS + expert] = bfloat(reduced);
-                        }
+            }
+            for (uint row = 0; row < ROWS; ++row) {
+                for (uint result_index = 0; result_index < 4; ++result_index) {
+                    float reduced = simd_sum(router_result[row][result_index]);
+                    if (lane == 0) {
+                        uint expert = expert_base + result_index;
+                        router_logits[row * EXPERTS + expert] = bfloat(reduced);
                     }
                 }
             }
@@ -253,7 +250,7 @@ def _target_m2_stage1_source() -> str:
             const device uchar* weights =
                 reinterpret_cast<const device uchar*>(shared_gate_weight);
             float shared_partial[ROWS] = {0.0f, 0.0f};
-            if (simd_gid == 0) {
+            if (expert_tile == 0 && simd_gid == 0) {
                 for (uint k_block = 0; k_block < HIDDEN; k_block += Q8_BLOCK) {
                     uint k_lane = k_block + lane * Q8_VALUES_PER_LANE;
                     float input_sum[ROWS] = {0.0f, 0.0f};
@@ -284,7 +281,21 @@ def _target_m2_stage1_source() -> str:
             }
         }
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    """
+
+
+def _target_m2_stage1_finalizer_source() -> str:
+    return """
+        uint tid = thread_position_in_threadgroup.x;
+        uint lane = thread_index_in_simdgroup;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+
+        threadgroup bfloat probabilities[ROWS * EXPERTS];
+        threadgroup float simd_values[8];
+        threadgroup float local_probabilities[64];
+        threadgroup int local_indices[64];
+        threadgroup float merged_probabilities[TOP_K];
+        threadgroup int merged_indices[TOP_K];
 
         // The top-k scratch is reused sequentially by the two rows. The loop is
         // uniform across the threadgroup, so the row-boundary barrier is safe.
@@ -1504,7 +1515,11 @@ def all_whole_moe_sources() -> dict[str, str]:
 
     return {
         "target_m1_stage1": _fixed_source(stage=1, rows=1, variant="target_q8g64"),
-        "target_m2_stage1": _fixed_source(stage=1, rows=2, variant="target_q8g64"),
+        "target_m2_stage1_projection": _fixed_source(
+            stage=1, rows=2, variant="target_q8g64"
+        ),
+        "target_m2_stage1_finalizer": _source_preamble(rows=2)
+        + _target_m2_stage1_finalizer_source(),
         "mtp_m1_stage1": _fixed_source(stage=1, rows=1, variant="mtp_dense"),
         "target_m1_stage2": _fixed_source(stage=2, rows=1, variant="target_q4g64"),
         "target_m2_stage2": _fixed_source(stage=2, rows=2, variant="target_q4g64"),
@@ -1520,7 +1535,14 @@ def whole_moe_launch_table() -> dict[str, tuple[tuple[int, int, int], tuple[int,
 
     return {
         "target_m1_stage1": ((256, 1, 1), (256, 1, 1)),
-        "target_m2_stage1": ((256, 1, 1), (256, 1, 1)),
+        "target_m2_stage1_projection": (
+            (STAGE1_PROJECTION_THREADGROUPS * STAGE1_THREADS, 1, 1),
+            (STAGE1_THREADS, 1, 1),
+        ),
+        "target_m2_stage1_finalizer": (
+            (STAGE1_THREADS, 1, 1),
+            (STAGE1_THREADS, 1, 1),
+        ),
         "mtp_m1_stage1": ((256, 1, 1), (256, 1, 1)),
         "target_m1_stage2": ((STAGE2_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
         "target_m2_stage2": ((STAGE2_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
@@ -1561,6 +1583,9 @@ _TARGET_STAGE1_INPUT_NAMES = [
 ]
 _MTP_STAGE1_INPUT_NAMES = ["value", "router_weight", "shared_gate_weight"]
 _STAGE1_OUTPUT_NAMES = ["expert_ids", "route_scores", "shared_gate"]
+_TARGET_M2_STAGE1_PROJECTION_OUTPUT_NAMES = ["router_logits", "shared_gate"]
+_TARGET_M2_STAGE1_FINALIZER_INPUT_NAMES = ["router_logits"]
+_TARGET_M2_STAGE1_FINALIZER_OUTPUT_NAMES = ["expert_ids", "route_scores"]
 _TARGET_STAGE2_INPUT_NAMES = [
     "value",
     "expert_ids",
@@ -1613,11 +1638,19 @@ def _build_target_m1_stage1_kernel():
     )
 
 
-def _build_target_m2_stage1_kernel():
+def _build_target_m2_stage1_projection_kernel():
     return _build_kernel(
-        "target_m2_stage1",
+        "target_m2_stage1_projection",
         input_names=_TARGET_STAGE1_INPUT_NAMES,
-        output_names=_STAGE1_OUTPUT_NAMES,
+        output_names=_TARGET_M2_STAGE1_PROJECTION_OUTPUT_NAMES,
+    )
+
+
+def _build_target_m2_stage1_finalizer_kernel():
+    return _build_kernel(
+        "target_m2_stage1_finalizer",
+        input_names=_TARGET_M2_STAGE1_FINALIZER_INPUT_NAMES,
+        output_names=_TARGET_M2_STAGE1_FINALIZER_OUTPUT_NAMES,
     )
 
 
@@ -1717,6 +1750,39 @@ def _launch_mtp_stage1(kernel: Any, value: Any, binding: Any):
     )
 
 
+def _launch_target_m2_stage1(
+    projection_kernel: Any,
+    finalizer_kernel: Any,
+    value: Any,
+    binding: Any,
+):
+    router = binding.router
+    shared_gate_projection = binding.shared_scalar_gate
+    router_logits, shared_gate = projection_kernel(
+        inputs=[
+            value,
+            router.weight,
+            router.scales,
+            router.biases,
+            shared_gate_projection.weight,
+            shared_gate_projection.scales,
+            shared_gate_projection.biases,
+        ],
+        grid=(STAGE1_PROJECTION_THREADGROUPS * STAGE1_THREADS, 1, 1),
+        threadgroup=(STAGE1_THREADS, 1, 1),
+        output_shapes=[(2, EXPERTS), (2, 1)],
+        output_dtypes=[mx.bfloat16, mx.bfloat16],
+    )
+    expert_ids, route_scores = finalizer_kernel(
+        inputs=[router_logits],
+        grid=(STAGE1_THREADS, 1, 1),
+        threadgroup=(STAGE1_THREADS, 1, 1),
+        output_shapes=[(2, TOP_K), (2, TOP_K)],
+        output_dtypes=[mx.uint32, mx.bfloat16],
+    )
+    return expert_ids, route_scores, shared_gate
+
+
 def target_m1_stage1(value: Any, binding: Any):
     """Launch fixed target M1 route and shared-gate ownership."""
 
@@ -1731,11 +1797,11 @@ def target_m1_stage1(value: Any, binding: Any):
 def target_m2_stage1(value: Any, binding: Any):
     """Launch fixed target M2 route and shared-gate ownership."""
 
-    return _launch_target_stage1(
-        _build_target_m2_stage1_kernel(),
+    return _launch_target_m2_stage1(
+        _build_target_m2_stage1_projection_kernel(),
+        _build_target_m2_stage1_finalizer_kernel(),
         value,
         binding,
-        rows=2,
     )
 
 
@@ -2043,15 +2109,19 @@ def bind_target_m1(binding: Any):
 
 
 def bind_target_m2(binding: Any):
-    """Bind the three fixed row-paired target M2 kernels once at installation."""
+    """Bind the four fixed row-paired target M2 kernels once at installation."""
 
-    stage1_kernel = _build_target_m2_stage1_kernel()
+    stage1_projection_kernel = _build_target_m2_stage1_projection_kernel()
+    stage1_finalizer_kernel = _build_target_m2_stage1_finalizer_kernel()
     stage2_kernel = _build_target_m2_stage2_kernel()
     stage3_kernel = _build_target_m2_stage3_kernel()
 
     def call(value: Any):
-        expert_ids, route_scores, shared_gate = _launch_target_stage1(
-            stage1_kernel, value, binding, rows=2
+        expert_ids, route_scores, shared_gate = _launch_target_m2_stage1(
+            stage1_projection_kernel,
+            stage1_finalizer_kernel,
+            value,
+            binding,
         )
         activations = _launch_target_stage2(
             stage2_kernel, value, expert_ids, binding, rows=2

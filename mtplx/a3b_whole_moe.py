@@ -126,7 +126,7 @@ def _validated_contract() -> dict[str, Any]:
             "shared_scalar_gate": "affine_q8_group64_[1,512]",
             "routes": {
                 "M1": "accepted_row_owned_router_combine",
-                "M2": "fixed_stage123_one_read_row_paired",
+                "M2": "fixed_tiled_stage1_stage23_one_read_row_paired",
             },
         },
         "mtp": {
