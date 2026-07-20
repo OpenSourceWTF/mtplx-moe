@@ -28,6 +28,10 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 _SCHEMA = "mtplx-streamed-quality-v1"
+# c512 independent-chunk WikiText perplexity replaces the streamed-window mode
+# for external quality-ladder placement; distinct schema so the two are never
+# confused for one another.
+_SCHEMA_C512 = "mtplx-wikitext-c512-v1"
 _TOKENIZER_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",
@@ -95,6 +99,24 @@ class QualityLane:
     config: LaneConfig
     load_runtime: Callable[[], Any]
     clear_cache: Callable[[], None]
+
+
+@dataclass(frozen=True)
+class C512Params:
+    """Independent-chunk WikiText perplexity protocol parameters."""
+
+    n_ctx: int = 512
+    n_chunks: int = 128
+
+    def __post_init__(self) -> None:
+        if isinstance(self.n_ctx, bool) or not isinstance(self.n_ctx, int) or (
+            self.n_ctx < 4 or self.n_ctx % 2
+        ):
+            raise ValueError("c512 n_ctx must be an even integer >= 4")
+        if isinstance(self.n_chunks, bool) or not isinstance(self.n_chunks, int) or (
+            self.n_chunks <= 0
+        ):
+            raise ValueError("c512 n_chunks must be a positive integer")
 
 
 def _sha256(payload: bytes) -> str:
@@ -1243,6 +1265,208 @@ def teacher_forced_loss(
     }
 
 
+# --------------------------------------------------------------------------
+# WikiText c512 independent-chunk perplexity (llama.cpp-exact scoring)
+#
+# Replicates ggml-org/llama.cpp tools/perplexity/perplexity.cpp perplexity()
+# at commit 56142c5f8 (build 9909). Verified against the source: whole-corpus
+# tokenize; non-overlapping n_ctx chunks; KV cache cleared per chunk
+# (independent context); logits computed for the last half of each window and
+# scored as process_logits(..., n_token = n_ctx - 1 - first) with first =
+# n_ctx/2 -- i.e. the logit at chunk position p (first..n_ctx-2) is scored
+# against the token at p+1. BOS overwrite of chunk position 0 iff the model's
+# add_bos is set. Metric: PPL = exp(mean NLL) over scored tokens; NLL in nats.
+# --------------------------------------------------------------------------
+_LLAMA_CPP_PPL_REFERENCE = {
+    "repo": "ggml-org/llama.cpp",
+    "commit": "56142c5f8",
+    "build": 9909,
+    "file": "tools/perplexity/perplexity.cpp",
+    "function": "perplexity()",
+    "file_sha256": (
+        "380aadd9d8000bf1b95cc3a338708385ac75240a5ba1c1f2bb34b208892a1777"
+    ),
+}
+
+
+def _tokenizer_add_bos(tokenizer: Any) -> tuple[bool, int | None]:
+    """Empirically detect the model's add_bos (mirrors llama_vocab_get_add_bos).
+
+    llama.cpp derives add_bos from the same tokenizer metadata the HF tokenizer
+    carries, so probing whether ``add_special_tokens=True`` prepends the BOS id
+    is the faithful, tokenizer-class-agnostic test.
+    """
+    bos = getattr(tokenizer, "bos_token_id", None)
+    try:
+        with_special = tokenizer.encode("a", add_special_tokens=True)
+        without = tokenizer.encode("a", add_special_tokens=False)
+    except TypeError:
+        with_special = list(tokenizer.encode("a"))
+        without = with_special
+    if hasattr(with_special, "input_ids"):
+        with_special = with_special.input_ids
+    if hasattr(without, "input_ids"):
+        without = without.input_ids
+    with_special = [int(t) for t in with_special]
+    without = [int(t) for t in without]
+    add_bos = bool(
+        bos is not None
+        and len(with_special) > len(without)
+        and with_special[0] == int(bos)
+    )
+    return add_bos, (int(bos) if bos is not None else None)
+
+
+def wikitext_c512_loss(
+    runtime: Any,
+    token_ids: Sequence[int],
+    *,
+    n_ctx: int,
+    n_chunks: int,
+    add_bos: bool,
+    bos_id: int | None,
+) -> dict[str, Any]:
+    """Independent-chunk WikiText perplexity, llama.cpp perplexity()-exact."""
+
+    tokens = [int(token) for token in token_ids]
+    if n_ctx < 4 or n_ctx % 2 != 0:
+        raise ValueError("n_ctx must be an even integer >= 4")
+    if n_chunks <= 0:
+        raise ValueError("n_chunks must be positive")
+    first = n_ctx // 2
+    scored_per_chunk = n_ctx - first - 1
+    n_chunk_max = len(tokens) // n_ctx
+    n_chunk = min(n_chunks, n_chunk_max)
+    if n_chunk < 1:
+        raise ValueError(
+            f"need at least {n_ctx} tokens; corpus tokenized to {len(tokens)}"
+        )
+    if add_bos and bos_id is None:
+        raise ValueError("add_bos requires a bos_id")
+
+    nll_sum = 0.0
+    count = 0
+    nan_count = 0
+    nonfinite_count = 0
+    nll_valid = True
+    for i in range(n_chunk):
+        start = i * n_ctx
+        chunk = list(tokens[start : start + n_ctx])
+        if add_bos:
+            chunk[0] = int(bos_id)
+        _reset_streaming(runtime)
+        cache = runtime.make_cache()  # fresh cache -> independent context
+        with _admission(runtime, n_ctx), _attention_phase("prefill"):
+            logits = runtime.forward_ar(_runtime_input(runtime, chunk), cache=cache)
+        rows = _logits_array(logits, expected_tokens=n_ctx)
+        # logit at chunk position p predicts the token at p+1; score
+        # p in [first, n_ctx-2] against original tokens[start+p+1].
+        pred = rows[first : n_ctx - 1]
+        targets = np.asarray(
+            tokens[start + first + 1 : start + n_ctx], dtype=np.int64
+        )
+        if targets.shape[0] != pred.shape[0]:
+            raise ValueError("c512 target/logit length mismatch")
+        if targets.size and np.any(targets >= pred.shape[1]):
+            raise ValueError("c512 target token exceeds vocabulary")
+        row_nan = int(np.isnan(pred).sum())
+        row_nonfinite = int((~np.isfinite(pred)).sum())
+        nan_count += row_nan
+        nonfinite_count += row_nonfinite
+        count += scored_per_chunk
+        if row_nonfinite:
+            nll_valid = False
+            continue
+        maximum = np.max(pred, axis=-1).astype(np.float32, copy=False)
+        shifted = (pred - maximum[:, None]).astype(np.float32, copy=False)
+        totals = np.sum(np.exp(shifted), axis=-1, dtype=np.float32)
+        logsumexp = (maximum + np.log(totals)).astype(np.float32, copy=False)
+        selected = pred[np.arange(pred.shape[0]), targets]
+        losses = (logsumexp - selected).astype(np.float64, copy=False)
+        loss_nonfinite = int((~np.isfinite(losses)).sum())
+        nonfinite_count += loss_nonfinite
+        if loss_nonfinite:
+            nll_valid = False
+        else:
+            nll_sum += float(np.sum(losses, dtype=np.float64))
+
+    mean_nll = (nll_sum / count) if (count and nll_valid) else None
+    perplexity = None
+    if mean_nll is not None and math.isfinite(mean_nll):
+        try:
+            candidate = math.exp(mean_nll)
+        except OverflowError:
+            candidate = math.inf
+        if math.isfinite(candidate):
+            perplexity = candidate
+        else:
+            nll_valid = False
+            nonfinite_count += 1
+    finite = bool(
+        nll_valid
+        and nan_count == 0
+        and nonfinite_count == 0
+        and mean_nll is not None
+        and math.isfinite(mean_nll)
+        and perplexity is not None
+        and math.isfinite(perplexity)
+    )
+    error = None
+    if not finite:
+        error = {
+            "type": "NonFiniteQualityEvidence",
+            "message": "c512 loss produced nonfinite numeric evidence",
+        }
+    return {
+        "mode": "wikitext-c512-independent-chunks",
+        "n_ctx": n_ctx,
+        "n_chunks_requested": n_chunks,
+        "n_chunks_evaluated": n_chunk,
+        "nominal_token_count": n_chunk * n_ctx,
+        "scored_token_count": count,
+        "scored_tokens_per_chunk": scored_per_chunk,
+        "add_bos": add_bos,
+        "bos_id": bos_id if add_bos else None,
+        "nll_sum": nll_sum if finite else None,
+        "mean_nll": mean_nll if finite else None,
+        "perplexity": perplexity if finite else None,
+        "finite": finite,
+        "nan_count": nan_count,
+        "nonfinite_count": nonfinite_count,
+        "error": error,
+        "scoring_semantics": {
+            "reference": _LLAMA_CPP_PPL_REFERENCE,
+            "tokenization": (
+                "whole corpus tokenized once with the model tokenizer, "
+                "add_special_tokens honouring the model's add_bos, "
+                "parse_special=False"
+            ),
+            "chunking": (
+                "non-overlapping n_ctx-token chunks; KV cache cleared per "
+                "chunk (each chunk an independent context)"
+            ),
+            "bos_handling": (
+                f"add_bos={add_bos}; "
+                + (
+                    "chunk position 0 overwritten with BOS before decode"
+                    if add_bos
+                    else "no BOS token inserted (add_bos False for this model)"
+                )
+            ),
+            "scored_positions": (
+                f"first=n_ctx/2={first}; logit at chunk position p in "
+                f"[{first},{n_ctx - 2}] scored against token at p+1; scored "
+                f"target positions {first + 1}..{n_ctx - 1}; "
+                f"{scored_per_chunk} scored tokens per chunk"
+            ),
+            "metric": (
+                "sum of per-token NLL (natural log, nats) over scored tokens; "
+                "mean_nll = nll_sum / scored_token_count; PPL = exp(mean_nll)"
+            ),
+        },
+    }
+
+
 def _stop_token_ids(tokenizer: Any) -> set[int]:
     values = getattr(tokenizer, "eos_token_ids", None)
     if values is None:
@@ -1465,6 +1689,7 @@ def _evaluate_lane(
     evaluation_tokens: int,
     chunk_tokens: int,
     greedy_max_tokens: int,
+    c512: C512Params | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, str]], bool]:
     config = lane.config
     result: dict[str, Any] = {
@@ -1491,26 +1716,50 @@ def _evaluate_lane(
         result["artifact"] = artifact
         load_attempted = True
         runtime = lane.load_runtime()
-        token_ids, per_file_token_counts = _tokenize_corpus(
-            runtime.tokenizer,
-            corpus_texts,
-            evaluation_tokens=evaluation_tokens,
-        )
-        result["corpus"] = {
-            "token_count": len(token_ids),
-            "per_file_token_counts_before_truncation": per_file_token_counts,
-            "token_ids_sha256": _token_ids_sha256(token_ids),
-        }
-        result["loss"] = teacher_forced_loss(
-            runtime,
-            token_ids,
-            chunk_tokens=chunk_tokens,
-        )
-        result["greedy_outputs"] = greedy_outputs(
-            runtime,
-            prompts,
-            max_tokens=greedy_max_tokens,
-        )
+        if c512 is not None:
+            add_bos, bos_id = _tokenizer_add_bos(runtime.tokenizer)
+            per_file = [_encode(runtime.tokenizer, text) for text in corpus_texts]
+            all_tokens = [token for tokens in per_file for token in tokens]
+            n_chunk = min(c512.n_chunks, len(all_tokens) // c512.n_ctx)
+            used = all_tokens[: n_chunk * c512.n_ctx]
+            result["corpus"] = {
+                "token_count_total": len(all_tokens),
+                "token_count_used": len(used),
+                "per_file_token_counts": [len(tokens) for tokens in per_file],
+                "token_ids_sha256": _token_ids_sha256(used),
+                "add_bos": add_bos,
+                "bos_id": bos_id if add_bos else None,
+            }
+            result["loss"] = wikitext_c512_loss(
+                runtime,
+                all_tokens,
+                n_ctx=c512.n_ctx,
+                n_chunks=c512.n_chunks,
+                add_bos=add_bos,
+                bos_id=bos_id,
+            )
+            # Greedy generation is not part of the c512 placement protocol.
+        else:
+            token_ids, per_file_token_counts = _tokenize_corpus(
+                runtime.tokenizer,
+                corpus_texts,
+                evaluation_tokens=evaluation_tokens,
+            )
+            result["corpus"] = {
+                "token_count": len(token_ids),
+                "per_file_token_counts_before_truncation": per_file_token_counts,
+                "token_ids_sha256": _token_ids_sha256(token_ids),
+            }
+            result["loss"] = teacher_forced_loss(
+                runtime,
+                token_ids,
+                chunk_tokens=chunk_tokens,
+            )
+            result["greedy_outputs"] = greedy_outputs(
+                runtime,
+                prompts,
+                max_tokens=greedy_max_tokens,
+            )
         evaluation_ok = True
     except Exception as exc:
         errors.append(_error("lane_evaluation", exc, lane=config.label))
@@ -1543,6 +1792,7 @@ def compare_quality(
     chunk_tokens: int,
     greedy_max_tokens: int,
     max_relative_perplexity_regression: float = 0.05,
+    c512: C512Params | None = None,
 ) -> dict[str, Any]:
     """Evaluate Q4 to completion, close it, then evaluate Q2."""
 
@@ -1566,6 +1816,7 @@ def compare_quality(
         evaluation_tokens=evaluation_tokens,
         chunk_tokens=chunk_tokens,
         greedy_max_tokens=greedy_max_tokens,
+        c512=c512,
     )
     errors.extend(q4_errors)
     if q4_lane_ok:
@@ -1576,6 +1827,7 @@ def compare_quality(
             evaluation_tokens=evaluation_tokens,
             chunk_tokens=chunk_tokens,
             greedy_max_tokens=greedy_max_tokens,
+            c512=c512,
         )
         errors.extend(q2_errors)
     else:
@@ -1664,22 +1916,45 @@ def compare_quality(
     )
     q4_perplexity = q4_result.get("loss", {}).get("perplexity")
     q2_perplexity = q2_result.get("loss", {}).get("perplexity")
+    q4_mean_nll = q4_result.get("loss", {}).get("mean_nll")
+    q2_mean_nll = q2_result.get("loss", {}).get("mean_nll")
     gate = quality_gate(
         q4_perplexity,
         q2_perplexity,
         finite=finite,
         max_relative_perplexity_regression=max_relative_perplexity_regression,
     )
+    # NLL-relative and PPL-relative differ and unlabeled percentages caused
+    # confusion before; report BOTH, explicitly labelled.
+    relative_nll_regression = None
+    if (
+        finite
+        and isinstance(q4_mean_nll, (int, float))
+        and isinstance(q2_mean_nll, (int, float))
+        and math.isfinite(q4_mean_nll)
+        and math.isfinite(q2_mean_nll)
+        and q4_mean_nll > 0.0
+    ):
+        relative_nll_regression = float(
+            Decimal(str(q2_mean_nll)) / Decimal(str(q4_mean_nll)) - Decimal(1)
+        )
     passed = bool(gate["quality_passed"] and not errors)
     return {
-        "schema": _SCHEMA,
+        "schema": _SCHEMA_C512 if c512 is not None else _SCHEMA,
+        "mode": "wikitext-c512-independent-chunks" if c512 is not None else "streamed-window",
         "passed": passed,
         "quality_passed": gate["quality_passed"],
         "finite": finite,
+        "relative_regression_ppl": gate["relative_perplexity_regression"],
+        "relative_regression_nll": relative_nll_regression,
         "relative_perplexity_regression": gate["relative_perplexity_regression"],
         "max_relative_perplexity_regression": gate[
             "max_relative_perplexity_regression"
         ],
+        "q4_perplexity": q4_perplexity,
+        "q2_perplexity": q2_perplexity,
+        "q4_mean_nll": q4_mean_nll,
+        "q2_mean_nll": q2_mean_nll,
         "nan_count": nan_count,
         "nonfinite_count": nonfinite_count,
         "gate_error": gate["error"],
@@ -1762,6 +2037,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=_quality_ceiling_argument,
         default=0.05,
     )
+    parser.add_argument(
+        "--c512-independent-chunks",
+        action="store_true",
+        help=(
+            "Use the llama.cpp-exact WikiText c512 independent-chunk perplexity "
+            "mode (non-overlapping n_ctx chunks, KV cleared per chunk) instead "
+            "of the streamed-window mode."
+        ),
+    )
+    parser.add_argument("--c512-n-ctx", type=_positive_int, default=512)
+    parser.add_argument("--c512-n-chunks", type=_positive_int, default=128)
     parser.add_argument("--output-json", type=Path, required=True)
     return parser
 
@@ -1925,6 +2211,11 @@ def main(
         f_nocache=args.f_nocache,
         trust_sidecar=args.trust_sidecar,
     )
+    c512 = (
+        C512Params(n_ctx=args.c512_n_ctx, n_chunks=args.c512_n_chunks)
+        if args.c512_independent_chunks
+        else None
+    )
     try:
         payload = _compare_quality(
             _lane(q4_config),
@@ -1937,6 +2228,7 @@ def main(
             max_relative_perplexity_regression=(
                 args.max_relative_perplexity_regression
             ),
+            c512=c512,
         )
     except Exception as exc:
         payload = {
