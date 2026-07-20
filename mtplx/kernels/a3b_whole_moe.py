@@ -2065,7 +2065,7 @@ def bind_target_m2(binding: Any):
             binding,
             rows=2,
         )
-        return output.reshape(*value.shape)
+        return output.reshape(1, 2, 2048)
 
     return call
 

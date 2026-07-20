@@ -896,6 +896,8 @@ def test_model_bound_selfcheck_is_deterministic_and_compilation_gated():
     assert "mx.random" not in source
     assert "mx.compile(route)" in source
     assert "mx.compile(lambda current: binding.block(current))" in source
+    assert "kernel_module.target_m2_stage1(value, binding)" in source
+    assert "kernel_module.target_m2_stage2(" in source
     assert "_packed_stage12_unchecked(value, binding, rows=rows)" in source
     assert "stage3(" in source
     assert "reference_activations" in source
@@ -911,7 +913,7 @@ def _patch_whole_moe_stages(monkeypatch):
     )
 
 
-def test_installed_partition_changes_only_target_m2_fused_down():
+def test_installed_partition_prebinds_all_three_exact_target_m2_stages():
     stage1_source = inspect.getsource(whole_moe_module._row_owned_stage1_unchecked)
     assert "mx.softmax" in stage1_source
     assert "precise=True" in stage1_source
@@ -925,11 +927,18 @@ def test_installed_partition_changes_only_target_m2_fused_down():
     assert "_packed_stage2_unchecked" in stage12_source
 
     source = inspect.getsource(whole_moe_module._target_m2_route)
-    assert "bind_target_m2_stage3" in source
-    assert "_packed_stage12_unchecked" in source
-    assert "(1, 2, 2048)" in source
-    call_start = source.index("def call(")
-    assert "bind_target_m2_stage3" in source[:call_start]
+    assert "bind_target_m2(binding)" in source
+    assert "_packed_stage12_unchecked" not in source
+
+    fixed_source = inspect.getsource(kernel_module.bind_target_m2)
+    assert "_build_target_m2_stage1_kernel()" in fixed_source
+    assert "_build_target_m2_stage2_kernel()" in fixed_source
+    assert "_build_target_m2_stage3_kernel()" in fixed_source
+    assert "_launch_target_stage1(" in fixed_source
+    assert "_launch_target_stage2(" in fixed_source
+    assert "_launch_target_stage3(" in fixed_source
+    assert "output.reshape(1, 2, 2048)" in fixed_source
+    call_start = fixed_source.index("def call(")
     for forbidden in (
         "os.environ",
         "selfcheck",
@@ -941,7 +950,7 @@ def test_installed_partition_changes_only_target_m2_fused_down():
         "except",
         "value.shape",
     ):
-        assert forbidden not in source[call_start:]
+        assert forbidden not in fixed_source[call_start:]
 
 
 def test_successful_selfcheck_installs_only_40_target_m2_overrides(monkeypatch):
@@ -969,7 +978,7 @@ def test_successful_selfcheck_installs_only_40_target_m2_overrides(monkeypatch):
     )
     assert report["validated_contract"]["target"]["routes"] == {
         "M1": "accepted_row_owned_router_combine",
-        "M2": "accepted_stage12_fused_down_row_paired",
+        "M2": "fixed_stage123_one_read_row_paired",
     }
     assert report["validated_contract"]["mtp"]["routes"] == {
         "M1": "accepted_row_owned_router_combine"

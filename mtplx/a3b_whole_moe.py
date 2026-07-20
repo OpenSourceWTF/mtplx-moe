@@ -126,7 +126,7 @@ def _validated_contract() -> dict[str, Any]:
             "shared_scalar_gate": "affine_q8_group64_[1,512]",
             "routes": {
                 "M1": "accepted_row_owned_router_combine",
-                "M2": "accepted_stage12_fused_down_row_paired",
+                "M2": "fixed_stage123_one_read_row_paired",
             },
         },
         "mtp": {
@@ -661,22 +661,9 @@ def _target_m1_route(binding: A3BWholeMoeBinding) -> Callable[[Any], Any]:
 
 
 def _target_m2_route(binding: A3BWholeMoeBinding) -> Callable[[Any], Any]:
-    """Bind exact target M2 row routing, packed gate/up, and fused down."""
+    """Bind the three exact one-read target-M2 stages at construction."""
 
-    stage3 = kernel_module.bind_target_m2_stage3(binding)
-
-    def call(value: Any):
-        expert_ids, route_scores, shared_gate, activations = (
-            _packed_stage12_unchecked(value, binding, rows=2)
-        )
-        return stage3(
-            activations,
-            expert_ids,
-            route_scores,
-            shared_gate,
-        ).reshape(1, 2, 2048)
-
-    return call
+    return kernel_module.bind_target_m2(binding)
 
 
 def _mtp_m1_route(binding: A3BWholeMoeBinding) -> Callable[[Any], Any]:
@@ -732,9 +719,19 @@ def _check_whole_moe_lane(
         stage3 = kernel_module.mtp_m1_stage3
         route = _mtp_m1_route(binding)
 
-    expert_ids, route_scores, shared_gate, activations = (
-        _packed_stage12_unchecked(value, binding, rows=rows)
-    )
+    if binding.variant == "target_q8g64_q4g64" and rows == 2:
+        expert_ids, route_scores, shared_gate = (
+            kernel_module.target_m2_stage1(value, binding)
+        )
+        activations = kernel_module.target_m2_stage2(
+            value,
+            expert_ids,
+            binding,
+        )
+    else:
+        expert_ids, route_scores, shared_gate, activations = (
+            _packed_stage12_unchecked(value, binding, rows=rows)
+        )
     probabilities = mx.softmax(binding.block.gate(value), axis=-1, precise=True)
     reference_ids = mx.argpartition(probabilities, kth=-8, axis=-1)[..., -8:]
     reference_scores = mx.take_along_axis(
