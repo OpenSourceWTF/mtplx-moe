@@ -1349,6 +1349,7 @@ def wikitext_c512_loss(
     nan_count = 0
     nonfinite_count = 0
     nll_valid = True
+    per_chunk_ppl: list[float | None] = []
     for i in range(n_chunk):
         start = i * n_ctx
         chunk = list(tokens[start : start + n_ctx])
@@ -1376,6 +1377,7 @@ def wikitext_c512_loss(
         count += scored_per_chunk
         if row_nonfinite:
             nll_valid = False
+            per_chunk_ppl.append(None)
             continue
         maximum = np.max(pred, axis=-1).astype(np.float32, copy=False)
         shifted = (pred - maximum[:, None]).astype(np.float32, copy=False)
@@ -1387,8 +1389,14 @@ def wikitext_c512_loss(
         nonfinite_count += loss_nonfinite
         if loss_nonfinite:
             nll_valid = False
+            per_chunk_ppl.append(None)
         else:
-            nll_sum += float(np.sum(losses, dtype=np.float64))
+            chunk_nll = float(np.sum(losses, dtype=np.float64))
+            nll_sum += chunk_nll
+            try:
+                per_chunk_ppl.append(math.exp(chunk_nll / scored_per_chunk))
+            except OverflowError:
+                per_chunk_ppl.append(None)
 
     mean_nll = (nll_sum / count) if (count and nll_valid) else None
     perplexity = None
@@ -1433,6 +1441,7 @@ def wikitext_c512_loss(
         "finite": finite,
         "nan_count": nan_count,
         "nonfinite_count": nonfinite_count,
+        "per_chunk_perplexity": per_chunk_ppl,
         "error": error,
         "scoring_semantics": {
             "reference": _LLAMA_CPP_PPL_REFERENCE,
