@@ -563,6 +563,32 @@ def test_stage2_sources_encode_selected_q4_and_exact_bf16_swiglu():
     assert "routed_up_weight" not in source
 
 
+def test_target_m2_stage2_reuses_fixed_shared_expert_weights_across_rows():
+    source = kernel_module.all_whole_moe_sources()["target_m2_stage2"]
+
+    assert "// row-specific selected expert path" in source
+    assert "expert_ids[row * TOP_K + slot]" in source
+    assert "// row-paired fixed shared expert path" in source
+    assert "float shared_gate_result[ROWS][4]" in source
+    assert "float shared_up_result[ROWS][4]" in source
+    assert source.count(
+        "ushort shared_gate_bits = shared_gate_packed[piece]"
+    ) == 1
+    assert source.count("ushort shared_up_bits = shared_up_packed[piece]") == 1
+    assert source.count("float gate_scale = float(") == 1
+    assert source.count("float gate_bias = float(") == 1
+    assert source.count("float up_scale = float(") == 1
+    assert source.count("float up_bias = float(") == 1
+    weight_load = source.index(
+        "ushort shared_gate_bits = shared_gate_packed[piece]"
+    )
+    both_row_consumers = source.index(
+        "for (uint row = 0; row < ROWS; ++row)", weight_load
+    )
+    assert weight_load < both_row_consumers
+    assert "activations[output_index] = bfloat(silu * up_value)" in source
+
+
 def test_stage3_sources_encode_down_reduction_shared_gate_and_only_final_store():
     sources = kernel_module.all_whole_moe_sources()
     for name in ("target_m1_stage3", "target_m2_stage3"):

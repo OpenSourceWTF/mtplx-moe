@@ -37,7 +37,10 @@ def _fixed_source(*, stage: int, rows: int, variant: str) -> str:
             rows=rows,
         )
     if stage == 2:
-        return common + _stage2_source(target=variant.startswith("target"))
+        return common + _stage2_source(
+            target=variant.startswith("target"),
+            rows=rows,
+        )
     return common + _stage3_source(
         target=variant.startswith("target"),
         rows=rows,
@@ -507,8 +510,10 @@ def _mtp_stage1_projection() -> str:
     """
 
 
-def _stage2_source(*, target: bool) -> str:
+def _stage2_source(*, target: bool, rows: int) -> str:
     if target:
+        if rows == 2:
+            return _target_m2_stage2_source()
         return _target_stage2_source()
     return _mtp_stage2_source()
 
@@ -625,6 +630,249 @@ def _target_stage2_source() -> str:
                         (row * ACTIVATION_SLOTS + slot) * INTERMEDIATE
                         + output_column;
                     activations[output_index] = bfloat(silu * up_value);
+                }
+            }
+        }
+    """
+
+
+def _target_m2_stage2_source() -> str:
+    return """
+        constexpr uint ROUTED_GROUP = 64;
+        constexpr uint VALUES_PER_LANE = 16;
+        constexpr uint K_BLOCK = VALUES_PER_LANE * 32;
+
+        uint group = threadgroup_position_in_grid.x;
+        uint slot = group / 32;
+        uint tile = group - slot * 32;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint output_base = tile * 16 + simd_gid * 4;
+
+        if (slot < TOP_K) {
+            // row-specific selected expert path
+            for (uint row = 0; row < ROWS; ++row) {
+                uint expert = expert_ids[row * TOP_K + slot];
+                const device uint* gate_words = routed_gate_up_weight
+                    + expert * 2 * INTERMEDIATE * (HIDDEN / 8);
+                const device uint* up_words = gate_words
+                    + INTERMEDIATE * (HIDDEN / 8);
+                const device bfloat* gate_scale_values = routed_gate_up_scales
+                    + expert * 2 * INTERMEDIATE * (HIDDEN / ROUTED_GROUP);
+                const device bfloat* gate_bias_values = routed_gate_up_biases
+                    + expert * 2 * INTERMEDIATE * (HIDDEN / ROUTED_GROUP);
+                const device bfloat* up_scale_values = gate_scale_values
+                    + INTERMEDIATE * (HIDDEN / ROUTED_GROUP);
+                const device bfloat* up_bias_values = gate_bias_values
+                    + INTERMEDIATE * (HIDDEN / ROUTED_GROUP);
+                const device uchar* gate_bytes =
+                    reinterpret_cast<const device uchar*>(gate_words);
+                const device uchar* up_bytes =
+                    reinterpret_cast<const device uchar*>(up_words);
+
+                float gate_result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                float up_result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                for (uint k_block = 0; k_block < HIDDEN; k_block += K_BLOCK) {
+                    uint k_lane = k_block + lane * VALUES_PER_LANE;
+                    float input_values[VALUES_PER_LANE];
+                    float input_sum = 0.0f;
+                    for (uint item = 0; item < VALUES_PER_LANE; item += 4) {
+                        float x0 = float(value[row * HIDDEN + k_lane + item]);
+                        float x1 = float(value[row * HIDDEN + k_lane + item + 1]);
+                        float x2 = float(value[row * HIDDEN + k_lane + item + 2]);
+                        float x3 = float(value[row * HIDDEN + k_lane + item + 3]);
+                        input_sum += x0 + x1 + x2 + x3;
+                        input_values[item] = x0;
+                        input_values[item + 1] = x1 / 16.0f;
+                        input_values[item + 2] = x2 / 256.0f;
+                        input_values[item + 3] = x3 / 4096.0f;
+                    }
+                    for (uint result_index = 0; result_index < 4; ++result_index) {
+                        uint output_column = output_base + result_index;
+                        uint weight_offset =
+                            output_column * (HIDDEN / 2) + k_lane / 2;
+                        const device ushort* gate_packed =
+                            reinterpret_cast<const device ushort*>(
+                                gate_bytes + weight_offset);
+                        const device ushort* up_packed =
+                            reinterpret_cast<const device ushort*>(
+                                up_bytes + weight_offset);
+                        float gate_quantized_dot = 0.0f;
+                        float up_quantized_dot = 0.0f;
+                        // qdot4_affine
+                        for (uint piece = 0;
+                             piece < VALUES_PER_LANE / 4;
+                             ++piece) {
+                            ushort gate_bits = gate_packed[piece];
+                            ushort up_bits = up_packed[piece];
+                            uint item = piece * 4;
+                            gate_quantized_dot +=
+                                input_values[item] * float(gate_bits & 0x000f)
+                                + input_values[item + 1] * float(gate_bits & 0x00f0)
+                                + input_values[item + 2] * float(gate_bits & 0x0f00)
+                                + input_values[item + 3] * float(gate_bits & 0xf000);
+                            up_quantized_dot +=
+                                input_values[item] * float(up_bits & 0x000f)
+                                + input_values[item + 1] * float(up_bits & 0x00f0)
+                                + input_values[item + 2] * float(up_bits & 0x0f00)
+                                + input_values[item + 3] * float(up_bits & 0xf000);
+                        }
+                        uint metadata_index =
+                            output_column * (HIDDEN / ROUTED_GROUP)
+                            + k_lane / ROUTED_GROUP;
+                        gate_result[result_index] +=
+                            float(gate_scale_values[metadata_index])
+                                * gate_quantized_dot
+                            + input_sum * float(gate_bias_values[metadata_index]);
+                        up_result[result_index] +=
+                            float(up_scale_values[metadata_index])
+                                * up_quantized_dot
+                            + input_sum * float(up_bias_values[metadata_index]);
+                    }
+                }
+
+                for (uint result_index = 0; result_index < 4; ++result_index) {
+                    float gate_sum = simd_sum(gate_result[result_index]);
+                    float up_sum = simd_sum(up_result[result_index]);
+                    if (lane == 0) {
+                        bfloat gate_value = bfloat(gate_sum);
+                        bfloat up_value = bfloat(up_sum);
+                        auto sigmoid_y = 1 / (
+                            1 + metal::exp(metal::abs(gate_value)));
+                        bfloat sigmoid_mlx_exact = gate_value < bfloat(0.0f)
+                            ? bfloat(sigmoid_y)
+                            : bfloat(1 - sigmoid_y);
+                        bfloat silu = bfloat(gate_value * sigmoid_mlx_exact);
+                        uint output_column = output_base + result_index;
+                        uint output_index =
+                            (row * ACTIVATION_SLOTS + slot) * INTERMEDIATE
+                            + output_column;
+                        activations[output_index] = bfloat(silu * up_value);
+                    }
+                }
+            }
+        } else {
+            // row-paired fixed shared expert path
+            const device uint* shared_up_words = shared_gate_up_weight
+                + INTERMEDIATE * (HIDDEN / 8);
+            const device bfloat* shared_up_scale_values = shared_gate_up_scales
+                + INTERMEDIATE * (HIDDEN / ROUTED_GROUP);
+            const device bfloat* shared_up_bias_values = shared_gate_up_biases
+                + INTERMEDIATE * (HIDDEN / ROUTED_GROUP);
+            const device uchar* shared_gate_bytes =
+                reinterpret_cast<const device uchar*>(shared_gate_up_weight);
+            const device uchar* shared_up_bytes =
+                reinterpret_cast<const device uchar*>(shared_up_words);
+
+            float shared_gate_result[ROWS][4];
+            float shared_up_result[ROWS][4];
+            for (uint row = 0; row < ROWS; ++row) {
+                for (uint result_index = 0; result_index < 4; ++result_index) {
+                    shared_gate_result[row][result_index] = 0.0f;
+                    shared_up_result[row][result_index] = 0.0f;
+                }
+            }
+
+            for (uint k_block = 0; k_block < HIDDEN; k_block += K_BLOCK) {
+                uint k_lane = k_block + lane * VALUES_PER_LANE;
+                float input_values[ROWS][VALUES_PER_LANE];
+                float input_sum[ROWS] = {0.0f, 0.0f};
+                for (uint row = 0; row < ROWS; ++row) {
+                    for (uint item = 0; item < VALUES_PER_LANE; item += 4) {
+                        float x0 = float(value[row * HIDDEN + k_lane + item]);
+                        float x1 = float(value[row * HIDDEN + k_lane + item + 1]);
+                        float x2 = float(value[row * HIDDEN + k_lane + item + 2]);
+                        float x3 = float(value[row * HIDDEN + k_lane + item + 3]);
+                        input_sum[row] += x0 + x1 + x2 + x3;
+                        input_values[row][item] = x0;
+                        input_values[row][item + 1] = x1 / 16.0f;
+                        input_values[row][item + 2] = x2 / 256.0f;
+                        input_values[row][item + 3] = x3 / 4096.0f;
+                    }
+                }
+                for (uint result_index = 0; result_index < 4; ++result_index) {
+                    uint output_column = output_base + result_index;
+                    uint weight_offset =
+                        output_column * (HIDDEN / 2) + k_lane / 2;
+                    const device ushort* shared_gate_packed =
+                        reinterpret_cast<const device ushort*>(
+                            shared_gate_bytes + weight_offset);
+                    const device ushort* shared_up_packed =
+                        reinterpret_cast<const device ushort*>(
+                            shared_up_bytes + weight_offset);
+                    float gate_quantized_dot[ROWS] = {0.0f, 0.0f};
+                    float up_quantized_dot[ROWS] = {0.0f, 0.0f};
+                    // qdot4_affine shared one-read M2
+                    for (uint piece = 0;
+                         piece < VALUES_PER_LANE / 4;
+                         ++piece) {
+                        ushort shared_gate_bits = shared_gate_packed[piece];
+                        ushort shared_up_bits = shared_up_packed[piece];
+                        uint item = piece * 4;
+                        for (uint row = 0; row < ROWS; ++row) {
+                            gate_quantized_dot[row] +=
+                                input_values[row][item]
+                                    * float(shared_gate_bits & 0x000f)
+                                + input_values[row][item + 1]
+                                    * float(shared_gate_bits & 0x00f0)
+                                + input_values[row][item + 2]
+                                    * float(shared_gate_bits & 0x0f00)
+                                + input_values[row][item + 3]
+                                    * float(shared_gate_bits & 0xf000);
+                            up_quantized_dot[row] +=
+                                input_values[row][item]
+                                    * float(shared_up_bits & 0x000f)
+                                + input_values[row][item + 1]
+                                    * float(shared_up_bits & 0x00f0)
+                                + input_values[row][item + 2]
+                                    * float(shared_up_bits & 0x0f00)
+                                + input_values[row][item + 3]
+                                    * float(shared_up_bits & 0xf000);
+                        }
+                    }
+                    uint metadata_index =
+                        output_column * (HIDDEN / ROUTED_GROUP)
+                        + k_lane / ROUTED_GROUP;
+                    float gate_scale = float(
+                        shared_gate_up_scales[metadata_index]);
+                    float gate_bias = float(
+                        shared_gate_up_biases[metadata_index]);
+                    float up_scale = float(
+                        shared_up_scale_values[metadata_index]);
+                    float up_bias = float(
+                        shared_up_bias_values[metadata_index]);
+                    for (uint row = 0; row < ROWS; ++row) {
+                        shared_gate_result[row][result_index] +=
+                            gate_scale * gate_quantized_dot[row]
+                            + input_sum[row] * gate_bias;
+                        shared_up_result[row][result_index] +=
+                            up_scale * up_quantized_dot[row]
+                            + input_sum[row] * up_bias;
+                    }
+                }
+            }
+
+            for (uint row = 0; row < ROWS; ++row) {
+                for (uint result_index = 0; result_index < 4; ++result_index) {
+                    float gate_sum = simd_sum(
+                        shared_gate_result[row][result_index]);
+                    float up_sum = simd_sum(
+                        shared_up_result[row][result_index]);
+                    if (lane == 0) {
+                        bfloat gate_value = bfloat(gate_sum);
+                        bfloat up_value = bfloat(up_sum);
+                        auto sigmoid_y = 1 / (
+                            1 + metal::exp(metal::abs(gate_value)));
+                        bfloat sigmoid_mlx_exact = gate_value < bfloat(0.0f)
+                            ? bfloat(sigmoid_y)
+                            : bfloat(1 - sigmoid_y);
+                        bfloat silu = bfloat(gate_value * sigmoid_mlx_exact);
+                        uint output_column = output_base + result_index;
+                        uint output_index =
+                            (row * ACTIVATION_SLOTS + slot) * INTERMEDIATE
+                            + output_column;
+                        activations[output_index] = bfloat(silu * up_value);
+                    }
                 }
             }
         }
