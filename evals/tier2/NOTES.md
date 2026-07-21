@@ -54,3 +54,51 @@ NOT re-run end-to-end: the box kernel-panicked at 23:10 (GLM freq-alloc buffered
 arm — a different lane, not this run), and HumanEval is expected ≈0 from the
 Tier-2 PPL (135.9% regression, 3.7% token agreement). The LiteLLM serving path is
 proven functional GPU-free except the model-load+generate call itself.
+
+---
+
+# Tier-2 — HumanEval COMPLETED (2026-07-20 23:49): pass@1 = 0.80 (16/20) — "expect ≈0" was WRONG
+
+Two further guarded attempts after the harness-artifact fix:
+
+1. **23:41 attempt — Metal GPU watchdog timeout** during the cold ~90 GiB
+   island-fill load on the freshly-panicked box
+   (`kIOGPUCommandBufferCallbackErrorTimeout`, proxy SIGABRT). Archived as
+   `humaneval_hy3_q2.gpu-timeout.json`. No generation occurred.
+2. **23:47 warm retry — CLEAN END-TO-END SUCCESS.** Page cache warm from the
+   aborted load; first request (load + generate) 58.9 s, run total 134.8 s
+   wall. `EXIT=0`, flock released, qwen restored. No island-count reduction
+   needed (champion config as baked).
+
+## Result
+
+- **pass@1 = 0.80 (16/20)**, HumanEvalPlus-v0.1.10 first 20 tasks, 1 sample/task,
+  chat endpoint, temp 0.0, seed 42, max_tokens 1024, `no_think`.
+- All 20 completions finished at natural `stop`: 25–152 completion tokens
+  (median 79, total 1619). No truncation, no empties, no request errors.
+- Failures (4): `HumanEval/6` NameError `current`; `/7` NameError `strings`;
+  `/10` NameError `is_palindrome` (the prompt-provided helper — possibly a
+  chat-extraction artifact dropping prompt context, which would only UNDERcount
+  passes); `/12` AssertionError. These are coherent code-shaped mistakes,
+  not gibberish.
+- Provenance: model `hy3-q2` via LiteLLM proxy :18183, handler default root
+  `~/.cache/huggingface/hy3-expert-only-mlx-q2` (no env override in
+  `serve_and_eval.sh` — verified), mtplx 2.0.2, dataset sha256 `42526ec0…`.
+
+## Interpretation — revises the lane's headline
+
+The PPL FAIL (135.9% rel regression, 3.7% greedy token agreement vs q4) is
+real, but the inference "therefore pass@1 ≈ 0" was wrong: PPL 6.747 absolute
+is degraded-but-functional, not gibberish. The bank writes mostly-correct
+short Python. Token agreement measures divergence from q4's exact path, not
+task competence.
+
+Caveats: n=20 (95% CI on 0.80 is roughly [0.58, 0.93]); first-20 task IDs,
+not a random sample; NO q4/bf16 HumanEval baseline exists on this harness
+(memory: no published Hy3 HumanEval anchor either) — so the DELTA attributable
+to q2 quantization is unmeasured. The 5% quality gate verdict stays FAIL on
+PPL; HumanEval says the failure mode is mild-on-code, not catastrophic.
+
+Completions are NOT persisted by `code_eval_gate.py` (rows carry status/usage
+only) — capturing sample generations for inspection needs either a gate flag
+or a one-off request in a future GPU window.
