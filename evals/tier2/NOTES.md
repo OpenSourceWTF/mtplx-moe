@@ -102,3 +102,58 @@ PPL; HumanEval says the failure mode is mild-on-code, not catastrophic.
 Completions are NOT persisted by `code_eval_gate.py` (rows carry status/usage
 only) — capturing sample generations for inspection needs either a gate flag
 or a one-off request in a future GPU window.
+
+---
+
+# oQ2e campaign (2026-07-21): mlx-community/Hy3-oQ2e on the mtplx runtime
+
+David's directive: serve as close to stock as possible, requantize nothing.
+Integration: spec `hy3-expert-oq2e` (2-bit gs128 experts, q8-gs64 residents via
+the config-driven pre-quantized loader path, NO proj-quant), manifest into the
+stock shards, experts.bin sidecar (byte-identical extraction, sha
+c72fb8c0…). MTP head = our external bf16 layer-80 artifacts (same base
+revision).
+
+Local checkpoint corrections (originals kept as *.orig-published):
+- index total_size 89,871,151,524 -> 89,870,806,272 (publisher metadata
+  overstates true header inventory by 345,252 B; fail-closed check caught it).
+- config num_nextn_predict_layers 0 -> 1 (quantizer stripped MTP tensors and
+  rewrote the count; base tencent/Hy3@716aa724 declares 1 — restoring the
+  architecture-true value lets the trained external head attach).
+
+Script fix en route: depth-matrix `_requests_from_args` binary hy3/glm dispatch
+sent any new campaign key down the GLM branch (crossed MTP path). Fixed +
+regression tests (71a9f03).
+
+## Decode results (1024/1024, guarded windows, zero requantization)
+
+| envelope | AR | K2 | K3 | notes |
+|---|---|---|---|---|
+| 96 GiB (limit 103, islands 79, fully resident) | 30.17 | **36.82**† | **31.81** | 0 misses; load peak 90.7 GiB, hard peak 91.9 |
+| 88 GiB (limit 95, islands 74 + 5 streamed) | 22.35 | 25.93† | 22.15 | hit rate .26-.33, 101-131 GiB read/cell; hard peak 87.7 |
+
+† K2 shows ONE token-divergence event per envelope vs the AR reference (96:
+token 893; both "unclassified" attribution). K3 is bit-exact both envelopes.
+Conservative headlines are the K3 numbers. Acceptance identical across
+envelopes (1.637@K2 / 2.024@K3) — a model property, unaffected by streaming.
+
+Reference points: our shipped q2 champion 22.74 (K3, islands 60); oMLX
+publishes 29.4 tok/s for this checkpoint on the same hardware class.
+Fully-resident pre-flight at limit 95 fails by 4.21 GiB (fixed footprint) —
+islands 74 is the honest 88 GiB configuration; the >30-at-88 goal is NOT met
+by this bank on the current streaming stack (best exact: 22.15).
+
+## Weight fidelity vs bf16 (evals/fidelity_oq2e_vs_bf16.py, CPU, committed)
+
+Median cosine **0.9212** / rel-Frobenius median **0.397** on the exact Tier-1
+sample — BEATS the shipped q2 bank (0.9148 / 0.415) at smaller size (2.44 vs
+2.50 bpw). Per-projection medians uniform (~0.920-0.9215): the imatrix rescues
+gate/up, which our plain affine recipe hurt most (they dipped to ~0.88).
+
+## Open
+
+- K2 divergence attribution (one flip/run; near-tie logit under batched
+  verify is the suspect — unproven).
+- gs128 disables the fixed-M4 island fast wave path (hardcoded 64; falls back
+  to generic gather) — island decode has headroom if a gs128 variant lands.
+- HumanEval on oQ2e via the LiteLLM lane (env switch, needs a window).
