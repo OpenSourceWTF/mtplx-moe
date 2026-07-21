@@ -27,6 +27,7 @@ def _streamed_mtp_backend(model_key: str, precision: str) -> str:
     support = {
         "hy3-q4": ("hy3", {"bf16", "q4"}),
         "hy3-expert-q2": ("hy3", {"bf16"}),
+        "hy3-expert-oq2e": ("hy3", {"bf16"}),
         # The Q4 head sibling (issue #100) is lane-agnostic: it is selectable
         # for either GLM streamed lane so its ~12.9 GiB budget saving reaches
         # the memory-constrained expert-Q2 config too. BF16 stays the default

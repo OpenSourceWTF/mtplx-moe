@@ -392,6 +392,38 @@ HY3_EXPERT_Q2 = ExpertStreamingModelSpec(
 )
 
 
+HY3_EXPERT_OQ2E = ExpertStreamingModelSpec(
+    key="hy3-expert-oq2e",
+    display_name="mlx-community Hy3 oQ2e (imatrix affine Q2, gs128 experts, q8 residents)",
+    source_model="tencent/Hy3",
+    source_revision="716aa7241bd6d95896be4ebfc761162a9c4d49ef",
+    quant_model="mlx-community/Hy3-oQ2e",
+    quant_revision="1979c306076e00eb40670335c9cb54b357824e29",
+    total_tensor_bytes=89_871_151_524,
+    total_layers=80,
+    routed_layer_start=1,
+    routed_layer_count=79,
+    expert_count=192,
+    top_k=8,
+    hidden_size=4096,
+    expert_hidden_size=1536,
+    quant_bits=2,
+    quant_group_size=128,
+    quant_parameter_bytes=2,
+    router_storage="source bfloat16 with fp32 correction bias",
+    router_matmul_dtype="float32",
+    router_bytes=124_316_928,
+    kv_bytes_per_token=327_680,
+    mtp_layer_index=80,
+    mtp_included=False,
+    # Reused from HY3_EXPERT_Q2: island_pin_order is a routing property of the
+    # shared bf16 router weights, not of the expert record codec. Residents here
+    # are q8 rather than bf16, which could perturb the hidden states feeding the
+    # router; treat this order as a starting point, not re-measured truth.
+    island_pin_order=HY3_EXPERT_Q2.island_pin_order,
+)
+
+
 GLM52_Q4 = ExpertStreamingModelSpec(
     key="glm52-q4",
     display_name="GLM-5.2 affine Q4",
@@ -502,6 +534,7 @@ MODEL_SPECS: dict[str, ExpertStreamingModelSpec] = {
         HY3_Q4,
         HY3_EXPERT_ONLY_Q4,
         HY3_EXPERT_Q2,
+        HY3_EXPERT_OQ2E,
         GLM52_Q4,
         GLM52_EXPERT_Q2,
         GLM52_EXPERT_Q1T,

@@ -43,12 +43,13 @@ from litellm.types.utils import Usage
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-MODEL_KEY = "hy3-expert-q2"  # MODEL_SPECS["hy3-q2"]["model_key"]
-
 
 def _env(name: str, default: str) -> str:
     value = os.environ.get(name)
     return default if value is None or value == "" else value
+
+
+MODEL_KEY = _env("MTPLX_HY3_MODEL_KEY", "hy3-expert-q2")  # MODEL_SPECS["hy3-q2"]["model_key"]
 
 
 def _expand(path: str) -> str:
