@@ -1,0 +1,18 @@
+{
+  "iters": 200,
+  "assignments": 32,
+  "experts": 192,
+  "gs64": {
+    "gate": 2.06,
+    "up": 2.05,
+    "down": 2.18,
+    "sum_us": 6.29
+  },
+  "gs128": {
+    "gate": 1.96,
+    "up": 1.9,
+    "down": 1.93,
+    "sum_us": 5.79
+  },
+  "gs128_over_gs64": 0.9205
+}

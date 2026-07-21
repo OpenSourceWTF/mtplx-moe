@@ -193,3 +193,19 @@ Quality triple for oQ2e vs shipped q2: cosine 0.9212 vs 0.9148; PPL 6.443 vs
 6.747 (both far over the 5% gate); HumanEval 0.95 vs 0.80. The bank-quality
 ordering is consistent across all three; PPL magnitude remains the outlier
 measure (calibration, not competence).
+
+## Wave-port K3 re-measure (2026-07-21): NULL result under AR control
+
+gs128 wave eligibility (489790b) re-measured at the champion envelope:
+AR 28.92 / K3 30.54 (both bit-exact, hard peak 91.9 unchanged) vs pre-wave
+AR 30.17 / K3 31.81. Raw drop ~4% in BOTH cells — but AR shares no wave code,
+so it is the window-drift control: K3/AR ratio 1.0560 post vs 1.0544 pre =
++0.15%, sub-noise. **The wave port recovers ~nothing at K3.** Consistent with
+the gather_qmm microbench (gs128 0.92x the time of gs64 at wave shapes —
+committed as bench_gather_qmm_gs128.json): both paths call the same kernel;
+the wave only restructures surrounding ops. Attribution revision: the q8
+residents carry essentially the entire oq2e-vs-q2-champion decode deficit;
+wave ineligibility was worth ~0. The port stays (bitwise-locked, correct,
+extends to GLM dims) as eligibility hygiene, not as a perf claim.
+Cross-window comparisons on this box carry ~4% drift under sustained load —
+single-window paired arms only.
