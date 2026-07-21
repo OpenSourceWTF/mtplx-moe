@@ -682,7 +682,7 @@ def test_hy3_expert_q2_charges_bf16_mtp_before_target_allocation(
     monkeypatch.setattr("mtplx.runtime.validate_mtp_support", lambda _model: True)
     router_bytes = 80 * 192 * 4096 * 2
 
-    def configure_router(target, selector, *, sigmoid_mode):
+    def configure_router(target, selector, *, sigmoid_mode, splitk_m1_scope="mtp"):
         events.append(("configure-router", target, selector, sigmoid_mode))
         return {
             "selector": selector,
