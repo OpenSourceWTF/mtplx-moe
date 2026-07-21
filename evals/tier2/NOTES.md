@@ -273,3 +273,13 @@ host path at M1 while K2 routed via the fp32 split-K kernel; one near-tie
 logit forks the sequence). Same kernel numerics both lanes -> parity
 restored. Follow-up (one window, when the box frees): champion + requant +
 MTPLX_HY3_ROUTER_SPLITK_M1=all — expect 42.33-class K2 with parity True.
+
+## PARITY-STAMPED CHAMPION (2026-07-21): K2 42.18 / AR 40.18, parity True
+
+oq2e + proj_requant q4 + islands 79 + MTPLX_HY3_ROUTER_SPLITK_M1=all at the
+96 envelope: AR 40.18 (parity True) / K2 42.18 (parity True), hard peak 88.4
+GiB. Reproduces the 42.33 champion within noise WITH the divergence resolved
+(router-numerics attribution confirmed by construction: same kernel both
+lanes -> exact parity). This is the complete champion config: every caveat
+closed — quality gates passed, bit-exact, one envelope tier below the old
+champion's memory.
