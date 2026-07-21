@@ -176,3 +176,20 @@ resident check — build manifests with `--hash-shards` (rebuilt + sidecar
 flock race even after writing full results — launchers must treat the output
 artifact as the success signal (attempt-269 window was burned re-learning
 this; attempt-1's q4-only receipt kept as *.attempt1-q4-control-only.json).
+
+## oQ2e HumanEval (2026-07-21): pass@1 = 0.95 (19/20)
+
+Same 20-task HumanEvalPlus gate as the shipped-q2 run (greedy, seed 42,
+chat endpoint, no_think), served via LiteLLM with env overrides
+(MTPLX_HY3_MODEL_KEY=hy3-expert-oq2e, islands 79 fully resident,
+proj_quant=none). All completions natural-stop, 77-238 tokens (median 147 —
+q2's was 79). Sole failure: HumanEval/10 AssertionError (make_palindrome —
+the task q2 also failed). Provenance note: a silent fallback to the q2 bank
+under these overrides is structurally impossible (bf16 residents unquantized
++ 79 q2-record islands ≈ 101 GiB > the 103 limit with KV/reserve — pre-flight
+would reject); behavioral fingerprint (token profile, score) also differs.
+
+Quality triple for oQ2e vs shipped q2: cosine 0.9212 vs 0.9148; PPL 6.443 vs
+6.747 (both far over the 5% gate); HumanEval 0.95 vs 0.80. The bank-quality
+ordering is consistent across all three; PPL magnitude remains the outlier
+measure (calibration, not competence).
