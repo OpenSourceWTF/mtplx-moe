@@ -403,6 +403,7 @@ class A3BK1TargetPrefixRoute:
             "prompt_tokens": self.prompt_tokens,
             "max_request_context": _MAX_REQUEST_CONTEXT,
             "capture_backend": "stock",
+            "device_draft_input": True,
             "compiled_entry_count": 2,
             "compiled_keys": ["m2:verify:b0", "m1:repair:b0"],
             "permanent_eager": False,

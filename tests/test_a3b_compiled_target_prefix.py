@@ -398,6 +398,7 @@ def test_report_derives_m2_verify_and_m1_repair_without_counters() -> None:
     assert report["compiled_keys"] == ["m2:verify:b0", "m1:repair:b0"]
     assert report["fallback_calls"] == report["growth_demotions"] == 0
     assert report["fallback_reasons"] == {}
+    assert report["device_draft_input"] is True
 
 
 def test_fixed_state_layout_has_primary_then_final_m2_outputs() -> None:
