@@ -859,7 +859,12 @@ def _load_impl(
     # Turbo lanes validate themselves once per load on the model's actual
     # dtype/quant format; a mismatching lane disables itself and serving
     # continues on the stock path (surfaced in /health kernel_selfcheck).
-    maybe_run_model_selfcheck(model)
+    # Expert-streaming loads also pass their spec so the routed expert bank's
+    # gather_qmm lane is validated at its own (possibly different) quant format.
+    maybe_run_model_selfcheck(
+        model,
+        expert_spec=expert_runtime.spec if expert_runtime is not None else None,
+    )
     adapter_path = Path(mtp_adapter) if mtp_adapter is not None else None
     adapter_metadata = None
     adapter_merge_report = None
