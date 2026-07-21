@@ -283,3 +283,25 @@ GiB. Reproduces the 42.33 champion within noise WITH the divergence resolved
 lanes -> exact parity). This is the complete champion config: every caveat
 closed — quality gates passed, bit-exact, one envelope tier below the old
 champion's memory.
+
+## q4 anchor (2026-07-21): kernel EXONERATED; serving infeasibility QUANTIFIED
+
+Kernel microbench (bench_gather_qmm_q4.json, wave shapes, queued lane):
+2-bit/gs64 6.16 µs, 2-bit/gs128 5.99, **4-bit/gs64 7.79 = 2x the bytes for
+1.26x the time — per byte the MOST efficient arm measured.** MLX's q4 gather
+needs no custom work; every q2-lane optimization (wave, router kernels,
+scope-all, proj-quant, cadence, census islands) applies to q4 as-is.
+
+q4 TPS, 96 envelope (islands 42 — ran on the q2-order placement, arms
+straddled the census revert): **AR 3.39 / K2 3.00 tok/s**, hit 8-9%,
+2.6-2.7 TiB read/cell, hard peak 95.6 GiB. Placement-corrected numbers would
+improve marginally; the binding cost is 37 streamed layers x 10.1 MiB
+records. **q4 is ~13x slower than oq2e-requant (42.33/40.18) at the same
+envelope** — the anchor row justifying the 2-bit program. 80-envelope arm
+re-armed with census-explicit islands (its count-resolution exposed a
+pre-flight gap for census-only specs — follow-up: resolve_island_placement
+before the runtime.py pre-flight plan).
+
+Ops: census-vs-spec precedence matters — q4's own island-placement.json
+ranks a DIFFERENT layer set than the q2-derived order (David's catch);
+spec pin orders must not shadow per-bank census artifacts.
