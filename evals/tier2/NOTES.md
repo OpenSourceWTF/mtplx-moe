@@ -27,3 +27,30 @@ This 135.9% is ~9× the **15.43%** recorded in `hy3-q2-never-quality-validated.m
 ## Config used
 
 `--memory-limit 103GiB --expert-cache-limit 60GiB --runtime-reserve 16GiB --max-live-kv-tokens 8192 --evaluation-tokens 4096 --chunk-tokens 64 --greedy-max-tokens 128`, corpus `mlx-kld/corpora/wiki.test.raw`, `--cache-policy frequency --cache-scope layer --slot-layout direct-slots`, full per-record hash verification. Pre-flight fit: q4 94.24 / q2 94.72 GiB of 103, `fits_fixed=True`, ~8–9 GiB headroom, memory knob never raised.
+
+---
+
+# Tier-2 — HumanEval via LiteLLM (2026-07-20): pass@1=0 is a HARNESS ARTIFACT
+
+The guarded run went fully end-to-end — proxy served, `code_eval_gate` connected,
+requests reached the handler — but **every request 500'd before any generation**:
+`ModuleNotFoundError: No module named 'mtplx.benchmarks.resource_telemetry'`.
+So `humaneval_hy3_q2.json` pass@1=0.0 (20/20 `request_error`) says **nothing about
+the model** — zero tokens were generated.
+
+Root cause: the campaign venv ships a **PEP660 editable install of `mtplx 2.0.2`**
+whose `sys.meta_path` finder points at the stale primary checkout
+`mtplx-hy3-ssd/mtplx` (branch codex/…), which lacks `benchmarks/resource_telemetry.py`.
+That finder wins over `sys.path`, so the handler's `import mtplx.*` (via
+`benchmark_q2_mtp_depth_matrix.py`) resolved to the stale worktree.
+
+Fix (handler.py `_import_benchmark_module`, GPU-free-verified under the campaign
+python where the finder is active): drop the mtplx package finder (keep the
+native-extension finder), force the eval worktree to the front of `sys.path`,
+evict stale cached `mtplx`. Verified: `mtplx` → eval worktree, `resource_telemetry`
+imports, native ext still loads.
+
+NOT re-run end-to-end: the box kernel-panicked at 23:10 (GLM freq-alloc buffered
+arm — a different lane, not this run), and HumanEval is expected ≈0 from the
+Tier-2 PPL (135.9% regression, 3.7% token agreement). The LiteLLM serving path is
+proven functional GPU-free except the model-load+generate call itself.

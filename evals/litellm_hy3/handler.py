@@ -198,8 +198,29 @@ def _import_benchmark_module() -> Any:
     import importlib.util
     import sys
 
-    if str(_REPO_ROOT) not in sys.path:
-        sys.path.insert(0, str(_REPO_ROOT))
+    # The campaign venv ships a PEP660 editable install of `mtplx` whose
+    # sys.meta_path finder points at a DIFFERENT (stale) worktree lacking newer
+    # submodules (e.g. mtplx.benchmarks.resource_telemetry). That finder wins
+    # over sys.path, so inserting the eval worktree alone is not enough: drop the
+    # mtplx package finder (keep the native-extension finder), force this
+    # worktree to the front of sys.path, and evict any stale cached mtplx so
+    # `import mtplx.*` resolves from THIS worktree.
+    repo = str(_REPO_ROOT)
+    sys.meta_path[:] = [
+        f
+        for f in sys.meta_path
+        if not (
+            type(f).__module__.startswith("__editable___mtplx_")
+            and "native" not in type(f).__module__
+        )
+    ]
+    while repo in sys.path:
+        sys.path.remove(repo)
+    sys.path.insert(0, repo)
+    for _name in [n for n in list(sys.modules) if n == "mtplx" or n.startswith("mtplx.")]:
+        _file = getattr(sys.modules.get(_name), "__file__", None) or ""
+        if not _file.startswith(repo):
+            del sys.modules[_name]
     module_path = _REPO_ROOT / "scripts" / "benchmark_q2_mtp_depth_matrix.py"
     spec = importlib.util.spec_from_file_location(
         "mtplx_benchmark_q2_mtp_depth_matrix", str(module_path)
