@@ -233,3 +233,13 @@ ms/tok @5% ceiling (occupancy — future lever); shared 469 (93%, saturated);
 component); proj-requant q8->q4 over proj_quant_covers scope is aimed
 correctly — expected ~9-10 ms/tok raw before overlap. Instrumented tok/s
 diagnostic-only.
+
+## proj_requant quality gates (2026-07-21): BOTH PASS — candidate confirmed
+
+Gate 1 HumanEval: 0.95 (19/20) identical to stock-q8 (same lone HumanEval/10
+failure, same token profile). Gate 2 WikiText-2 (config-matched): requant
+6.547 vs stock 6.443 = +1.6% relative (q4 control 2.8596 reproduced exactly,
+third time). Both inside David's "don't lose much" bar; the requant arm still
+beats shipped q2 (6.747) on PPL. Remaining: paired K2 speed A/B (stock-q8 vs
+requant-q4) to price the win — roofline predicts ~9-10 ms/tok raw attention
+savings.
