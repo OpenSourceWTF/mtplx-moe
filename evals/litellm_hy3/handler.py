@@ -119,7 +119,13 @@ def _champion_overrides() -> dict[str, Any]:
         "cache_scope": _env("MTPLX_HY3_CACHE_SCOPE", "layer"),
         "slot_layout": _env("MTPLX_HY3_SLOT_LAYOUT", "component-banks"),
         "banked_codec": _env("MTPLX_HY3_BANKED_CODEC", "none"),
-        "proj_quant": _env("MTPLX_HY3_PROJ_QUANT", "q4"),
+        # "none" sentinel: pre-quantized-resident checkpoints (e.g. oq2e's q8)
+        # must NOT set proj_quant — the loader raises when it matches nothing.
+        "proj_quant": (
+            None
+            if _env("MTPLX_HY3_PROJ_QUANT", "q4") == "none"
+            else _env("MTPLX_HY3_PROJ_QUANT", "q4")
+        ),
         "expert_integrity": _env("MTPLX_HY3_EXPERT_INTEGRITY", "headers-only"),
         "split_route_release": _env("MTPLX_HY3_SPLIT_ROUTE_RELEASE", "deferred"),
         "deferred_pin_release": True,
