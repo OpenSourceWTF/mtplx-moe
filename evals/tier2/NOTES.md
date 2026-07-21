@@ -253,3 +253,12 @@ championship) and ~38 AR. Acceptance 1.637 -> 1.564 (trunk perturbation costs
 the MTP head slightly; net K2 still +8.6%). Candidate scorecard complete:
 HumanEval identical, wiki +1.6%, K2 +8.6%, AR +26.3%, -3.5 GiB wired.
 Adoption as serving default = David's decision.
+
+## Champion-41 reproduction (2026-07-21): K2 42.33 — NEW ALL-TIME CHAMPION
+
+oq2e + proj-requant q4, 96 envelope, islands 79, championship shape (AR+K2):
+AR 37.79 / **K2 42.33** (hard peak 88.4 GiB). Beats the q2-bank championship
+40.59 by +4.3% on a smaller, higher-quality bank with quality gates passed
+(HumanEval 0.95 identical / wiki +1.6%). Projection from the paired-ratio
+scaling (~41) confirmed. Known caveats carry: K2 single-divergence signature
+(parity False), acceptance 1.564.
