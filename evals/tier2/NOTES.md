@@ -242,7 +242,8 @@ failure, same token profile). Gate 2 WikiText-2 (config-matched): requant
 third time). Both inside David's "don't lose much" bar; the requant arm still
 beats shipped q2 (6.747) on PPL. Remaining: paired K2 speed A/B (stock-q8 vs
 requant-q4) to price the win — roofline predicts ~9-10 ms/tok raw attention
-savings.
+savings. FULL-164 CONFIRMATION: see "proj_requant full-164 HumanEval" below —
+the 20-task gate's saturation resolved, McNemar p=1.0, verdict unchanged.
 
 ## proj_requant speed A/B (2026-07-21, paired single window): +8.6% K2, +26.3% AR
 
@@ -337,3 +338,28 @@ operating point: cache-heavy K1 = 6.29 tok/s, above the 5-6.4 historical
 band. Extrapolation: zero-island max-cache might add ~5%; diminishing.
 FINAL ANCHOR: q4-optimal 6.29 vs oq2e-requant champion 42.18 = 6.7x — the
 2-bit program's justification at q4's own best configuration.
+
+## proj_requant full-164 HumanEval (2026-07-21, paired one window): NO MEASURABLE COST — McNemar p=1.0
+
+The saturated 20-task gate resolved on HumanEvalPlus-164, both arms in ONE
+guarded window (attempt 1, no retries; conditions identical to the 0.95
+baselines — MTPLX_HY3_ROUTER_SPLITK_M1 deliberately NOT set):
+
+- stock-q8 **0.8720** (143/164) vs proj-requant-q4 **0.8659** (142/164);
+  request_errors 0 both arms.
+- Discordant pairs **9 (5:4)** — q8-only passes {83, 102, 130, 147, 148},
+  rq4-only passes {26, 32, 100, 108}. **McNemar exact two-sided p = 1.0000**:
+  the split is exactly what coin-flip generation divergence predicts; no
+  directional quality signal.
+- 17 both-fail tasks incl. HumanEval/10 (the lone 20-task failure — screen
+  consistent with the full run).
+- All 5 rq4-only failures are complete generations (finish=stop) failing
+  logic assertions (102/147/83 AssertionError, 130 IndexError, 148 planet-
+  ordering) — wrong-answer flips, not truncation or harness artifacts.
+
+VERDICT vs David's "don't lose much" bar: PASS — net −1 task (−0.6 pp),
+symmetric flips, p=1.0. The requant candidate's scorecard is now complete at
+full task-eval resolution: HumanEval −0.6pp (p=1.0), wiki +1.6%, K2 +8.6%,
+AR +26.3%, −3.5 GiB wired. Artifacts:
+`humaneval_oq2e_full164_{q8,rq4}.json` (+ per-arm proxy logs
+`full164_{q8,rq4}_proxy.log`).
