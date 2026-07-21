@@ -157,3 +157,22 @@ gate/up, which our plain affine recipe hurt most (they dipped to ~0.88).
 - gs128 disables the fixed-M4 island fast wave path (hardcoded 64; falls back
   to generic gather) — island decode has headroom if a gs128 variant lands.
 - HumanEval on oQ2e via the LiteLLM lane (env switch, needs a window).
+
+## oQ2e WikiText-2 PPL (2026-07-21 03:11, config-matched to Tier-2)
+
+**oQ2e 6.443 vs q4 2.860 = 125.3% relative regression** (q4 control reproduced
+Tier-2's 2.860 exactly; greedy agreement vs q4 3.9%, diverges at token 2).
+Compare: shipped q2 135.9%, `-direct` bf16-derived q2 125.7% — three
+independently derived 2-bit banks cluster at 6.4-6.7 on this config while all
+evidence says task competence survives (q2 HumanEval 0.80; oQ2e published
+benches ≈ its 2.68bpw sibling; oQ2e weight cosine 0.9212). Conclusion
+sharpened: the 5%-PPL gate at this config is structurally unpassable at 2-bit
+expert precision and mostly measures calibration loss, not task damage. Any
+future bank verdicts need a task eval alongside PPL.
+
+Ops notes: shard sha256 provenance is REQUIRED by compare_streamed_quality's
+resident check — build manifests with `--hash-shards` (rebuilt + sidecar
+--overwrite, byte-identical sha c72fb8c0…). Wrapper exits 1 on the qwen-restore
+flock race even after writing full results — launchers must treat the output
+artifact as the success signal (attempt-269 window was burned re-learning
+this; attempt-1's q4-only receipt kept as *.attempt1-q4-control-only.json).
