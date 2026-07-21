@@ -5658,8 +5658,15 @@ def generate_mtpk(
             "or 'trim_commit'"
         )
     target_prefix_verify = verify_strategy == "target_prefix"
+    # Constrained requests never engage the exact A3B route: the route
+    # pre-commits its rejection correction (no None-guard on the append),
+    # while the #186 phase-3 grammar clamp expects a grammar-illegal
+    # correction to be dropped so the next masked primary resamples it.
+    # The stock target_prefix lane below carries that contract.
     exact_a3b_target_prefix_factory = (
-        rt.a3b_compiled_target_prefix_factory if target_prefix_verify else None
+        rt.a3b_compiled_target_prefix_factory
+        if target_prefix_verify and constraint is None
+        else None
     )
     exact_a3b_target_prefix = exact_a3b_target_prefix_factory is not None
     draft_sampler = _env_scaled_draft_sampler(sampler, draft_sampler)

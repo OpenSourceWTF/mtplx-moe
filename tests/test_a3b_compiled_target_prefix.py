@@ -313,7 +313,7 @@ def test_generation_routes_on_direct_runtime_factory_ownership() -> None:
         source.index("exact_a3b_target_prefix =")
     ]
     assert 'verify_strategy == "target_prefix"' in exact_factory_assignment
-    assert "if target_prefix_verify else None" in exact_factory_assignment
+    assert "if target_prefix_verify and constraint is None" in exact_factory_assignment
     assert "generic_compiled_target_prefix" not in exact_factory_assignment
     assert "_env_truthy" not in exact_factory_assignment
     assert "a3b_compiled_target_prefix_factory(" not in source
@@ -669,3 +669,29 @@ def test_generation_exact_route_has_fixed_m2_m1_schedule_without_generic_repair(
         "pending_primary",
     ):
         assert preserved in generic_repair
+
+
+def test_generation_exact_route_never_engages_under_grammar_constraint() -> None:
+    """The exact route pre-commits its rejection correction (no None-guard on
+    the append), while the #186 phase-3 grammar clamp drops grammar-illegal
+    corrections so the next masked primary resamples them. A constrained
+    request must therefore fall back to the stock target_prefix lane."""
+    from mtplx import generation
+
+    source = inspect.getsource(generation.generate_mtpk)
+    factory_block = source[
+        source.index("exact_a3b_target_prefix_factory = (") : source.index(
+            "exact_a3b_target_prefix = "
+        )
+    ]
+    assert "if target_prefix_verify and constraint is None" in factory_block
+    # The gate exists because the exact commit path appends the correction
+    # unconditionally; if that ever changes, revisit whether the gate can lift.
+    rejection_start = source.index(
+        "committed = [primary] + draft_tokens[:accepted_count]"
+    )
+    exact_repair_block = source[
+        source.index("if a3b_target_prefix_route is not None:", rejection_start) :
+        source.index("if rejection_correction is not None:", rejection_start)
+    ]
+    assert "committed.append(rejection_correction)" in exact_repair_block
