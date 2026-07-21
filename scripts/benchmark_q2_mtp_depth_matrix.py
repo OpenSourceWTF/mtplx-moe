@@ -59,6 +59,13 @@ MODEL_SPECS = {
         "mtp_artifacts": Path("~/.cache/huggingface/hy3-bf16-and-mtp-layer80"),
         "prompt_tail": None,
     },
+    "hy3-q4": {
+        "model_key": "hy3-expert-only-q4",
+        "depths": (1, 2, 3, 4, 5, 6, 7),
+        "model_root": Path("~/.cache/huggingface/hy3-expert-only-mlx-q4"),
+        "mtp_artifacts": Path("~/.cache/huggingface/hy3-bf16-and-mtp-layer80"),
+        "prompt_tail": None,
+    },
     "hy3-oq2e": {
         "model_key": "hy3-expert-oq2e",
         "depths": (1, 2, 3, 4, 5, 6, 7),
