@@ -28,7 +28,7 @@ ITERS = 200
 WARMUP = 20
 
 
-def bench_group_size(group_size: int) -> dict:
+def bench_group_size(group_size: int, bits: int = BITS) -> dict:
     rng = np.random.default_rng(7)
     results = {}
     # One bank per projection, all 192 experts resident, like an island layer.
@@ -38,7 +38,7 @@ def bench_group_size(group_size: int) -> dict:
         ("down", HIDDEN, INTER),
     ):
         src = mx.array(rng.standard_normal((EXPERTS, out_dim, in_dim)).astype("float32")).astype(mx.bfloat16)
-        w, s, b = mx.quantize(src, bits=BITS, group_size=group_size, mode="affine")
+        w, s, b = mx.quantize(src, bits=bits, group_size=group_size, mode="affine")
         mx.eval(w, s, b)
         x = mx.array(rng.standard_normal((ASSIGNMENTS, 1, in_dim)).astype("float32")).astype(mx.bfloat16)
         lhs = mx.array(rng.integers(0, EXPERTS, size=(ASSIGNMENTS,)).astype("uint32"))
@@ -50,7 +50,7 @@ def bench_group_size(group_size: int) -> dict:
                 rhs_indices=lhs,
                 transpose=True,
                 group_size=group_size,
-                bits=BITS,
+                bits=bits,
                 mode="affine",
             )
 
@@ -75,8 +75,9 @@ def bench_group_size(group_size: int) -> dict:
 
 def main() -> int:
     out = {"iters": ITERS, "assignments": ASSIGNMENTS, "experts": EXPERTS}
-    for gs in (64, 128):
-        out[f"gs{gs}"] = bench_group_size(gs)
+    for bits, gs in ((2, 64), (2, 128), (4, 64)):
+        out[f"b{bits}gs{gs}"] = bench_group_size(gs, bits)
+    out["gs64"] = out["b2gs64"]; out["gs128"] = out["b2gs128"]
     g64, g128 = out["gs64"]["sum_us"], out["gs128"]["sum_us"]
     out["gs128_over_gs64"] = round(g128 / g64, 4)
     print(json.dumps(out, indent=2))
