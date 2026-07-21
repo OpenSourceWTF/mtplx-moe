@@ -1137,6 +1137,7 @@ def _run_exact_a3b_k1_schedule(
     *,
     target_tokens: list[int],
     max_tokens: int,
+    **generation_kwargs,
 ):
     import mtplx.generation as generation
     from mtplx.a3b_compiled_target_prefix import A3BCompiledTargetPrefixFactory
@@ -1236,6 +1237,11 @@ def _run_exact_a3b_k1_schedule(
     monkeypatch.setattr(generation, "rollback_after_verify", forbidden("rollback"))
     monkeypatch.setattr(
         generation,
+        "_sample_draft_from_logits",
+        forbidden("host draft sampler"),
+    )
+    monkeypatch.setattr(
+        generation,
         "trim_verified_window_to_prefix",
         forbidden("trim"),
     )
@@ -1284,8 +1290,33 @@ def _run_exact_a3b_k1_schedule(
         mtp_history_policy="committed",
         verify_strategy="target_prefix",
         stop_token_ids=set(),
+        **generation_kwargs,
     )
     return out, schedule, primary_states, history_appends
+
+
+def test_generation_exact_a3b_k1_rejects_host_only_draft_modifiers_before_prompt(
+    monkeypatch,
+):
+    with pytest.raises(RuntimeError, match="device draft"):
+        _run_exact_a3b_k1_schedule(
+            monkeypatch,
+            target_tokens=[1],
+            max_tokens=2,
+            online_correction_cache=True,
+        )
+
+
+def test_generation_exact_a3b_k1_rejects_env_forced_loop_guard_before_prompt(
+    monkeypatch,
+):
+    monkeypatch.setenv("MTPLX_LOOP_GUARD", "1")
+    with pytest.raises(RuntimeError, match="device draft"):
+        _run_exact_a3b_k1_schedule(
+            monkeypatch,
+            target_tokens=[1],
+            max_tokens=2,
+        )
 
 
 def test_generation_exact_a3b_k1_accept_keeps_m2_state_without_generic_commit(

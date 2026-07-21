@@ -89,6 +89,46 @@ def validate_a3b_k1_target_prefix_sampler(sampler: Any) -> None:
         _fail("compiled A3B target-prefix requires a stochastic top-k sampler")
 
 
+def validate_a3b_k1_device_draft_request(
+    draft_sampler: Any,
+    *,
+    draft_margin_threshold: float | None,
+    adaptive_policy: Any | None,
+    draft_core: str,
+    online_correction_cache: bool,
+    prompt_correction_cache: bool,
+    adapter_ensemble_q: bool,
+    mtp_topk_reranker: Any | None,
+    loop_guard: bool,
+    presence_penalty: float,
+    frequency_penalty: float,
+) -> None:
+    """Prove once that the installed K1 lane can keep its draft on-device."""
+    unsupported_sampler = (
+        float(draft_sampler.temperature) > 0.0
+        and int(draft_sampler.top_k or 0) <= 0
+        and 0.0 < float(draft_sampler.top_p) < 1.0
+    )
+    host_only_modifier = any(
+        (
+            draft_margin_threshold is not None,
+            adaptive_policy is not None,
+            str(draft_core) != "stock",
+            bool(online_correction_cache),
+            bool(prompt_correction_cache),
+            bool(adapter_ensemble_q),
+            mtp_topk_reranker is not None,
+            bool(loop_guard),
+            bool(presence_penalty),
+            bool(frequency_penalty),
+        )
+    )
+    if unsupported_sampler or host_only_modifier:
+        _fail(
+            "compiled A3B device draft requires the fixed stock K1 sampler contract"
+        )
+
+
 def prepare_a3b_compiled_target_prefix(
     model: Any,
     *,

@@ -24,6 +24,7 @@ import numpy as np
 
 from .a3b_compiled_target_prefix import (
     install_a3b_k1_target_prefix_route,
+    validate_a3b_k1_device_draft_request,
     validate_a3b_k1_target_prefix_sampler,
 )
 from .adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
@@ -5331,9 +5332,26 @@ def generate_mtpk(
         rt.a3b_compiled_target_prefix_factory if target_prefix_verify else None
     )
     exact_a3b_target_prefix = exact_a3b_target_prefix_factory is not None
+    draft_sampler = _env_scaled_draft_sampler(sampler, draft_sampler)
+    _loop_guard_config = loop_guard_config_from_env(
+        bool(loop_guard), tokenizer=getattr(rt, "tokenizer", None)
+    )
     if target_prefix_verify:
         if exact_a3b_target_prefix:
             validate_a3b_k1_target_prefix_sampler(sampler)
+            validate_a3b_k1_device_draft_request(
+                draft_sampler,
+                draft_margin_threshold=draft_margin_threshold,
+                adaptive_policy=adaptive_policy,
+                draft_core=draft_core,
+                online_correction_cache=online_correction_cache,
+                prompt_correction_cache=prompt_correction_cache,
+                adapter_ensemble_q=adapter_ensemble_q,
+                mtp_topk_reranker=mtp_topk_reranker,
+                loop_guard=_loop_guard_config.enabled,
+                presence_penalty=float(sampler.presence_penalty),
+                frequency_penalty=float(sampler.frequency_penalty),
+            )
         else:
             _validate_target_prefix_sampler_request(sampler)
     counter_start = _runtime_counter_snapshot(rt)
@@ -5346,7 +5364,6 @@ def generate_mtpk(
     )
 
     rng = np.random.default_rng(seed)
-    draft_sampler = _env_scaled_draft_sampler(sampler, draft_sampler)
     if mtp_corrector is not None:
         corrector_variant = getattr(mtp_corrector, "hidden_variant", mtp_hidden_variant)
         if corrector_variant != mtp_hidden_variant:
@@ -5530,9 +5547,6 @@ def generate_mtpk(
     # Armed = target distributions get sparse anti-cycle penalties per position;
     # the draft proposal q stays untouched (proposal mismatch only costs
     # acceptance, never correctness).
-    _loop_guard_config = loop_guard_config_from_env(
-        bool(loop_guard), tokenizer=getattr(rt, "tokenizer", None)
-    )
     _loop_guard = LoopGuard(_loop_guard_config) if _loop_guard_config.enabled else None
     events: list[dict] = []
     record_events = not _env_truthy("MTPLX_DROP_EVENTS")
@@ -6307,7 +6321,7 @@ def generate_mtpk(
             break
 
         cycle_depth = min(planned_depth, max_tokens - len(tokens))
-        draft_tokens: list[int] = []
+        draft_tokens: list[int | None] = []
         draft_probs: list[np.ndarray | None] = []
         draft_cache_keys: list[tuple[int, ...]] = []
         draft_hidden_for_update: list[mx.array] = []
@@ -6325,6 +6339,7 @@ def generate_mtpk(
         )
         draft_hidden = hidden
         next_token = primary
+        device_draft_token = None
 
         used_device_d2_core = False
         device_d2_eligible = (
@@ -6516,7 +6531,14 @@ def generate_mtpk(
             cached_token = (
                 correction_cache.get(cache_key) if cache_enabled_for_depth else None
             )
-            if cached_token is not None:
+            if a3b_target_prefix_route is not None:
+                device_draft_token = sample_token_ids_from_mlx_logits(
+                    draft_logits[:, -1, :],
+                    draft_sampler,
+                )
+                draft_token = None
+                draft_q = None
+            elif cached_token is not None:
                 draft_token = int(cached_token)
                 draft_q = (
                     SparseDistribution.one_hot(draft_token, int(draft_logits.shape[-1]))
@@ -6728,30 +6750,48 @@ def generate_mtpk(
                 _add_timing(event, "snapshot", elapsed_snapshot)
         lazy_bonus_verify_min_depth = _lazy_bonus_verify_min_depth()
         lazy_bonus_verify_requested = _lazy_bonus_verify_enabled()
-        lazy_bonus_verify = (
-            lazy_bonus_verify_requested
-            and not lazy_target_distributions
-            and not target_prefix_verify
-            and len(draft_tokens) > 0
-            and len(draft_tokens) >= lazy_bonus_verify_min_depth
-            and not any(_is_stop(token, stop_token_ids) for token in draft_tokens[:-1])
-        )
         omit_speculative_bonus = _omit_speculative_bonus_enabled()
-        bonus_distribution_row_needed = (
-            not omit_speculative_bonus
-            and not lazy_bonus_verify
-            and len(draft_tokens) > 0
-            and len(tokens) + len(draft_tokens) < max_tokens
-            and not any(_is_stop(token, stop_token_ids) for token in draft_tokens)
-        )
-        target_distribution_rows_needed = len(draft_tokens) + (
-            1 if bonus_distribution_row_needed else 0
-        )
+        if a3b_target_prefix_route is not None:
+            lazy_bonus_verify = False
+            bonus_distribution_row_needed = (
+                not omit_speculative_bonus and len(tokens) + 1 < max_tokens
+            )
+            target_distribution_rows_needed = 1 + int(
+                bonus_distribution_row_needed
+            )
+            verified_token_count = 2
+            verify_input_array = mx.concatenate(
+                (mx.array([[primary]]), device_draft_token.reshape(1, 1)),
+                axis=1,
+            )
+        else:
+            lazy_bonus_verify = (
+                lazy_bonus_verify_requested
+                and not lazy_target_distributions
+                and not target_prefix_verify
+                and len(draft_tokens) > 0
+                and len(draft_tokens) >= lazy_bonus_verify_min_depth
+                and not any(
+                    _is_stop(token, stop_token_ids) for token in draft_tokens[:-1]
+                )
+            )
+            bonus_distribution_row_needed = (
+                not omit_speculative_bonus
+                and not lazy_bonus_verify
+                and len(draft_tokens) > 0
+                and len(tokens) + len(draft_tokens) < max_tokens
+                and not any(_is_stop(token, stop_token_ids) for token in draft_tokens)
+            )
+            target_distribution_rows_needed = len(draft_tokens) + (
+                1 if bonus_distribution_row_needed else 0
+            )
+            verify_input = [primary] + (
+                draft_tokens[:-1] if lazy_bonus_verify else draft_tokens
+            )
+            verified_token_count = len(verify_input)
+            verify_input_array = mx.array([verify_input])
         if lazy_bonus_verify:
             lazy_bonus_verify_calls += 1
-        verify_input = [primary] + (
-            draft_tokens[:-1] if lazy_bonus_verify else draft_tokens
-        )
         event["lazy_bonus_verify"] = {
             "enabled": bool(lazy_bonus_verify),
             "requested": bool(lazy_bonus_verify_requested),
@@ -6761,7 +6801,7 @@ def generate_mtpk(
             and not target_prefix_verify
             else None,
             "min_depth": int(lazy_bonus_verify_min_depth),
-            "verify_input_tokens": int(len(verify_input)),
+            "verify_input_tokens": int(verified_token_count),
             "draft_tokens": int(len(draft_tokens)),
         }
         event["speculative_bonus"] = {
@@ -6776,7 +6816,7 @@ def generate_mtpk(
                 if compiled_verify_bank is not None:
                     verify_logits, verify_hidden, captures = (
                         compiled_verify_bank.forward_ar_capture(
-                            mx.array([verify_input]),
+                            verify_input_array,
                             cache=cache,
                             return_hidden=True,
                             hidden_variant=base_hidden_variant,
@@ -6785,7 +6825,7 @@ def generate_mtpk(
                 elif graphbank is not None:
                     verify_logits, verify_hidden, captures = (
                         graphbank.forward_ar_capture(
-                            mx.array([verify_input]),
+                            verify_input_array,
                             cache=cache,
                             return_hidden=True,
                             hidden_variant=base_hidden_variant,
@@ -6793,7 +6833,7 @@ def generate_mtpk(
                     )
                 else:
                     verify_logits, verify_hidden, captures = rt.forward_ar_capture(
-                        mx.array([verify_input]),
+                        verify_input_array,
                         cache=cache,
                         return_hidden=True,
                         hidden_variant=base_hidden_variant,
@@ -6801,7 +6841,7 @@ def generate_mtpk(
                     )
             elif a3b_target_prefix_route is not None:
                 verify_logits, verify_hidden, a3b_primary_state = (
-                    a3b_target_prefix_route.verify_m2(mx.array([verify_input]))
+                    a3b_target_prefix_route.verify_m2(verify_input_array)
                 )
             elif compiled_verify_bank is not None:
                 # Replace only the target forward. target_prefix keeps its
@@ -6809,7 +6849,7 @@ def generate_mtpk(
                 # forward; captures here must not change its commit semantics.
                 verify_logits, verify_hidden, _compiled_captures = (
                     compiled_verify_bank.forward_ar_capture(
-                        mx.array([verify_input]),
+                        verify_input_array,
                         cache=cache,
                         return_hidden=True,
                         hidden_variant=base_hidden_variant,
@@ -6817,14 +6857,14 @@ def generate_mtpk(
                 )
             elif graphbank is not None:
                 verify_logits, verify_hidden = graphbank.forward_ar(
-                    mx.array([verify_input]),
+                    verify_input_array,
                     cache=cache,
                     return_hidden=True,
                     hidden_variant=base_hidden_variant,
                 )
             else:
                 verify_logits, verify_hidden = rt.forward_ar(
-                    mx.array([verify_input]),
+                    verify_input_array,
                     cache=cache,
                     return_hidden=True,
                     hidden_variant=base_hidden_variant,
@@ -6868,7 +6908,13 @@ def generate_mtpk(
                 target_distribution_logits,
                 sampler,
             )
-            _eval(sampled_target_ids)
+            if a3b_target_prefix_route is not None:
+                _eval(sampled_target_ids, device_draft_token)
+                draft_token = int(np.asarray(device_draft_token).reshape(-1)[0])
+                draft_tokens[0] = draft_token
+                event["drafts"][0]["token"] = draft_token
+            else:
+                _eval(sampled_target_ids)
             target_prefix_tokens = [
                 int(token) for token in np.asarray(sampled_target_ids).reshape(-1)
             ]
@@ -7535,7 +7581,7 @@ def generate_mtpk(
                 cache,
                 captures,
                 keep_tokens=committed_prefix_len,
-                verified_tokens=len(verify_input),
+                verified_tokens=verified_token_count,
                 detach_components=capture_commit_detach_components,
                 detach_mode=capture_commit_detach_mode,
                 detach_stats=commit_detach_stats,
@@ -7558,7 +7604,7 @@ def generate_mtpk(
             committed_from_trim = trim_verified_window_to_prefix(
                 cache,
                 before_verify,
-                verified_tokens=len(verify_input),
+                verified_tokens=verified_token_count,
                 keep_tokens=committed_prefix_len,
             )
             elapsed_trim_commit = time.perf_counter() - started_trim_commit
@@ -7638,7 +7684,7 @@ def generate_mtpk(
             )
             started_rollback = time.perf_counter()
             rollback_after_verify(
-                cache, before_verify, verified_tokens=len(verify_input)
+                cache, before_verify, verified_tokens=verified_token_count
             )
             elapsed_rollback = time.perf_counter() - started_rollback
             rollback_time += elapsed_rollback

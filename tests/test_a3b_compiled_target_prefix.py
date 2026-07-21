@@ -607,7 +607,10 @@ def test_generation_exact_route_has_fixed_m2_m1_schedule_without_generic_repair(
     ]
     rejection_start = source.index("committed = [primary] + draft_tokens[:accepted_count]")
     exact_verify_start = source.index("elif a3b_target_prefix_route is not None:")
-    target_sample_start = source.index("sample_token_ids_from_mlx_logits(")
+    draft_sample_start = source.index("sample_token_ids_from_mlx_logits(")
+    target_sample_start = source.index(
+        "sample_token_ids_from_mlx_logits(", draft_sample_start + 1
+    )
     acceptance_start = source.index("accepted_count = 0")
     exact_repair_start = source.index(
         "if a3b_target_prefix_route is not None:", rejection_start
@@ -624,8 +627,11 @@ def test_generation_exact_route_has_fixed_m2_m1_schedule_without_generic_repair(
         snapshot_block.index('if _env_truthy("MTPLX_SKIP_VERIFY_SNAPSHOT")')
     )
     assert "verify_logits, verify_hidden, a3b_primary_state = (" in source
-    assert exact_verify_start < target_sample_start < acceptance_start
-    assert source.count("sample_token_ids_from_mlx_logits(") == 1
+    assert draft_sample_start < exact_verify_start < target_sample_start
+    assert target_sample_start < acceptance_start
+    assert source.count("sample_token_ids_from_mlx_logits(") == 2
+    assert "verify_input_array = mx.concatenate(" in source
+    assert "_eval(sampled_target_ids, device_draft_token)" in source
     assert "if sampled_target_ids is None" not in source
     assert "target_prefix_sampler =" not in source
     assert not hasattr(generation, "_sample_target_prefix_ids_checked")
