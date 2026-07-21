@@ -59,6 +59,20 @@ MODEL_SPECS = {
         "mtp_artifacts": Path("~/.cache/huggingface/hy3-bf16-and-mtp-layer80"),
         "prompt_tail": None,
     },
+    "hy3-q4": {
+        "model_key": "hy3-expert-only-q4",
+        "depths": (1, 2, 3, 4, 5, 6, 7),
+        "model_root": Path("~/.cache/huggingface/hy3-expert-only-mlx-q4"),
+        "mtp_artifacts": Path("~/.cache/huggingface/hy3-bf16-and-mtp-layer80"),
+        "prompt_tail": None,
+    },
+    "hy3-oq2e": {
+        "model_key": "hy3-expert-oq2e",
+        "depths": (1, 2, 3, 4, 5, 6, 7),
+        "model_root": Path("~/.cache/huggingface/hy3-oq2e-mlx"),
+        "mtp_artifacts": Path("~/.cache/huggingface/hy3-bf16-and-mtp-layer80"),
+        "prompt_tail": None,
+    },
     "glm52-q2": {
         "model_key": "glm52-expert-q2",
         "depths": (1, 2, 3, 4, 5),
@@ -86,6 +100,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "island_layers": "",
     "island_layer_count": None,
     "proj_quant": None,
+    "proj_requant": None,
     "kv_quant": None,
     "miss_shadow": None,
     "miss_shadow_layers": None,
@@ -565,6 +580,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--proj-requant",
+        dest="proj_requant",
+        choices=("q4",),
+        default=None,
+        help=(
+            "EXPERIMENT: re-quantize residents that ALREADY loaded quantized "
+            "(e.g. the oq2e checkpoint's q8/gs64 *_proj Linears) down to "
+            "q4/gs64 affine, over the same trunk scope as --proj-quant. "
+            "Distinct from --proj-quant (that only touches BF16 Linears); "
+            "the q8->q4 double quantization is deliberate. No artifact "
+            "rebuild."
+        ),
+    )
+    parser.add_argument(
         "--split-route-release",
         choices=("fenced", "deferred"),
         default="fenced",
@@ -667,18 +696,29 @@ def _requests_from_args(args: argparse.Namespace) -> list[dict[str, Any]]:
         raise BenchmarkConfigurationError("--model values must not repeat")
     requests: list[dict[str, Any]] = []
     for model in selected:
+        spec_entry = MODEL_SPECS[model]
         if model == "hy3-q2":
             model_root = args.hy3_q2_model_root
             manifest = args.hy3_q2_manifest
             mtp_artifacts = args.hy3_q2_mtp_artifacts
             prompt_tail = args.hy3_q2_prompt_tail
             depths = args.hy3_depths
-        else:
+        elif model == "glm52-q2":
             model_root = args.glm52_q2_model_root
             manifest = args.glm52_q2_manifest
             mtp_artifacts = args.glm52_q2_mtp_artifacts
             prompt_tail = args.glm52_q2_prompt_tail
             depths = args.glm52_depths
+        else:
+            model_root = spec_entry["model_root"]
+            manifest = None
+            mtp_artifacts = spec_entry["mtp_artifacts"]
+            prompt_tail = spec_entry["prompt_tail"]
+            depths = (
+                args.hy3_depths
+                if spec_entry["model_key"].startswith("hy3")
+                else args.glm52_depths
+            )
         model_root = _expand(model_root)
         request = {
             "model": model,
@@ -714,6 +754,7 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "island_layers": args.island_layers,
         "island_layer_count": args.island_layer_count,
         "proj_quant": args.proj_quant,
+        "proj_requant": args.proj_requant,
         "kv_quant": args.kv_quant,
         "miss_shadow": args.miss_shadow,
         "miss_shadow_layers": args.miss_shadow_layers,
@@ -756,6 +797,7 @@ def _profile_advisories(
         model_key = MODEL_SPECS[request["model"]]["model_key"]
         observed = {
             "proj_quant": runtime_options.get("proj_quant") or None,
+            "proj_requant": runtime_options.get("proj_requant") or None,
             "kv_quant": runtime_options.get("kv_quant") or None,
             "expert_integrity": runtime_options.get("expert_integrity"),
             "split_route_release": runtime_options.get("split_route_release"),
@@ -2226,6 +2268,7 @@ def _runtime_config(
         island_layers=parse_island_layers(options.get("island_layers", "")),
         island_layer_count=options.get("island_layer_count"),
         proj_quant=options.get("proj_quant") or None,
+        proj_requant=options.get("proj_requant") or None,
         kv_quant=options.get("kv_quant") or None,
         miss_shadow=options.get("miss_shadow") or None,
         miss_shadow_layers=options.get("miss_shadow_layers"),

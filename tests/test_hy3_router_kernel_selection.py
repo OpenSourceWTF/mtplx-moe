@@ -528,3 +528,88 @@ def test_router_kernel_memory_estimate_honors_explicit_layer_types() -> None:
         )
         == 2 * 192 * 4096 * 2
     )
+
+
+# ---------------------------------------------------------------------------
+# splitk_m1_scope (2026-07-21 experiment gate): "all" extends the split-K
+# kernel to trunk routers at rows==1; default "mtp" preserves the measured
+# ladder behavior (trunk M1 -> stock host path).
+# ---------------------------------------------------------------------------
+
+
+class _TrunkAndMtpTree(nn.Module):
+    """Two routers whose module paths mirror production naming."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.trunk_router = _exact_router()
+        self.mtp_router = _exact_router()
+
+    def named_modules(self):  # mirror nn.Module naming used in production
+        return [
+            ("model.layers.1.mlp.router", self.trunk_router),
+            ("model.mtp.router", self.mtp_router),
+        ]
+
+
+def test_configure_hy3_router_kernels_rejects_bad_scope() -> None:
+    tree = _TrunkAndMtpTree()
+    with pytest.raises(ValueError, match="splitk_m1_scope"):
+        hy3_mlx.configure_hy3_router_kernels(
+            tree,
+            "mpp-fp32-splitk-r1-fused-r2",
+            available=True,
+            splitk_m1_scope="trunk-only",
+        )
+
+
+def test_default_scope_keeps_trunk_m1_stock_and_mtp_splitk() -> None:
+    tree = _TrunkAndMtpTree()
+    summary = hy3_mlx.configure_hy3_router_kernels(
+        tree, "mpp-fp32-splitk-r1-fused-r2", available=True
+    )
+    assert summary["m1_scope"] == "mtp"
+    assert summary["m1_splitk_count"] == 1
+    assert tree.trunk_router._mtplx_router_kernel_state.splitk_m1 is False
+    assert tree.mtp_router._mtplx_router_kernel_state.splitk_m1 is True
+
+
+def test_scope_all_enables_trunk_m1_splitk() -> None:
+    tree = _TrunkAndMtpTree()
+    summary = hy3_mlx.configure_hy3_router_kernels(
+        tree,
+        "mpp-fp32-splitk-r1-fused-r2",
+        available=True,
+        splitk_m1_scope="all",
+    )
+    assert summary["m1_scope"] == "all"
+    assert summary["m1_splitk_count"] == 2
+    assert tree.trunk_router._mtplx_router_kernel_state.splitk_m1 is True
+
+
+def test_scope_all_trunk_router_dispatches_splitk_at_rows_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = _TrunkAndMtpTree()
+    hy3_mlx.configure_hy3_router_kernels(
+        tree,
+        "mpp-fp32-splitk-r1-fused-r2",
+        available=True,
+        splitk_m1_scope="all",
+    )
+    calls = []
+
+    def fake_splitk_route(value, weight, expert_bias, **kwargs):
+        calls.append(kwargs)
+        output_shape = (*value.shape[:-1], 8)
+        return (
+            mx.zeros(output_shape, dtype=mx.int32),
+            mx.ones(output_shape, dtype=mx.float32),
+        )
+
+    monkeypatch.setattr(
+        hy3_mlx, "hy3_router_fp32_exact_splitk_route", fake_splitk_route
+    )
+    tree.trunk_router(mx.zeros((1, 1, 4096), dtype=mx.bfloat16))
+    assert len(calls) == 1
+    assert calls[0]["grid_k_parts"] == 16

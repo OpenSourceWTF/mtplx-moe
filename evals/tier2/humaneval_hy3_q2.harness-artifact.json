@@ -1,0 +1,428 @@
+{
+  "params": {
+    "allow_code_execution": true,
+    "endpoint": "chat",
+    "execution_timeout_s": 15.0,
+    "limit": 20,
+    "max_tokens": 1024,
+    "model": "hy3-q2",
+    "n": 1,
+    "retries": 2,
+    "score_workers": 4,
+    "seed": 42,
+    "temperature": 0.0,
+    "timeout_s": 600.0,
+    "top_p": null,
+    "workers": 4
+  },
+  "provenance": {
+    "base_url": "http://127.0.0.1:18183",
+    "completions": 20,
+    "dataset_path": "/Users/davidtai/Library/Caches/evalplus/HumanEvalPlus-v0.1.10.jsonl",
+    "dataset_sha256": "42526ec0e7d5f3ee0b06d6ced98f8c8bae3d76519151bfb3d36f79010645bd7f",
+    "endpoint": "chat",
+    "model": "hy3-q2",
+    "mtplx_version": "2.0.2",
+    "python": "3.12.13",
+    "samples_per_task": 1,
+    "suite": "humaneval",
+    "tasks": 20,
+    "timestamp_utc": "2026-07-21T04:27:16.807113+00:00",
+    "wall_s": 6.512166250000064
+  },
+  "request_errors": 20,
+  "rows": [
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.3080141670000103,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/0",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.2184649590000163,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/1",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.4000406659999953,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/2",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.3352214159999676,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/3",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.0807362909999938,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/4",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.329782291000015,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/5",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.3411277080000445,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/6",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 0.9329681670000127,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/7",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 0.8874829579999641,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/8",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.1597677500000145,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/9",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.3807626250001022,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/10",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 0.9043406250000317,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/11",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 0.9420262500000263,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/12",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.1880803750000268,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/13",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.2859791669999368,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/14",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.2184942080000383,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/15",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.1452109169999858,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/16",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.2913410410000097,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/17",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.2788719999999785,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/18",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+      "error": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = await init_response\\\\n               ^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 588, in acompletion\\\\n    return self._run(\\\\n           ^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 491, in _run\\\\n    state = _ensure_state()\\\\n            ^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 258, in _ensure_state\\\\n    _STATE = _build_state()\\\\n             ^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 217, in _build_state\\\\n    bench = _import_benchmark_module()\\\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/litellm_hy3/handler.py\\\\\", line 210, in _import_benchmark_module\\\\n    spec.loader.exec_module(module)\\\\n  File \\\\\"<frozen importlib._bootstrap_external>\\\\\", line 999, in exec_module\\\\n  File \\\\\"<frozen importlib._bootstrap>\\\\\", line 488, in _call_with_frames_removed\\\\n  File \\\\\"/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/benchmark_q2_mtp_depth_matrix.py\\\\\", line 24, in <module>\\\\n    from mtplx.benchmarks.resource_telemetry import (  # noqa: E402\\\\nModuleNotFoundError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\n. Received Model Group=hy3-q2\\\\nAvailable Model Group Fallbacks=None\",\"type\"')",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.2728771669999333,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/19",
+      "usage": null
+    }
+  ],
+  "schema": "mtplx.code_eval_gate/1",
+  "summary": {
+    "by_status": {
+      "request_error": 20
+    },
+    "failures": [
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/0"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/1"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/2"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/3"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/4"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/5"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/6"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/7"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/8"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/9"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/10"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/11"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/12"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/13"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/14"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/15"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/16"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/17"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/18"
+      },
+      {
+        "detail": "GateHTTPError('HTTP 500: {\"error\":{\"message\":\"litellm.APIConnectionError: No module named \\'mtplx.benchmarks.resource_telemetry\\'\\\\nTraceback (most recent call last):\\\\n  File \\\\\"/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/5bc9942c-42b5-4300-bc57-4b4f43ee476e/scratchpad/litellm-serve-venv/lib/python3.12/site-packages/litellm/main.py\\\\\", line 643, in acompletion\\\\n    response = ",
+        "status": "request_error",
+        "task_id": "HumanEval/19"
+      }
+    ],
+    "pass@1": 0.0,
+    "passed": 0,
+    "samples": 20,
+    "tasks": 20
+  }
+}

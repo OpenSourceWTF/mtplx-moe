@@ -1,0 +1,83 @@
+{
+  "eval": "weight-space fidelity vs bf16",
+  "self_check_dequant_roundtrip": {
+    "bitwise_identical": true,
+    "max_abs_diff": 0.0
+  },
+  "sample": {
+    "n_experts": 45,
+    "n_tensors": 135,
+    "layer_buckets": {
+      "low": [
+        1,
+        6,
+        13
+      ],
+      "mid": [
+        27,
+        40,
+        53
+      ],
+      "high": [
+        66,
+        73,
+        79
+      ]
+    },
+    "expert_ids": [
+      0,
+      48,
+      96,
+      144,
+      191
+    ]
+  },
+  "per_tensor_cosine": {
+    "min": 0.8804485081045725,
+    "median": 0.9148329302190212,
+    "mean": 0.9132668270585033,
+    "max": 0.9302247464607406
+  },
+  "per_tensor_relerr": {
+    "min": 0.3730749061949879,
+    "median": 0.4149698918123597,
+    "mean": 0.4188403818670677,
+    "max": 0.49694345442173454
+  },
+  "per_expert_mean_cosine": {
+    "min": 0.8941595077075641,
+    "median": 0.9148110552299448,
+    "mean": 0.9132668270585032,
+    "max": 0.9150571408502568
+  },
+  "per_projection_cosine": {
+    "gate_proj": {
+      "min": 0.8804485081045725,
+      "median": 0.9148303124252644,
+      "mean": 0.9121862488953308,
+      "max": 0.9150816555705777
+    },
+    "up_proj": {
+      "min": 0.8812354557080156,
+      "median": 0.9148338849729233,
+      "mean": 0.9122386694512937,
+      "max": 0.9151361060808684
+    },
+    "down_proj": {
+      "min": 0.9131422446159031,
+      "median": 0.9148205330915017,
+      "mean": 0.9153755628288852,
+      "max": 0.9302247464607406
+    }
+  },
+  "prior": {
+    "median_cosine": 0.9197,
+    "min_cosine": 0.9112,
+    "median_matches_prior": true,
+    "per_tensor_min_below_prior_min": true,
+    "note": "Median lands within 1% of the documented prior -> loader and tensor alignment validated. Per-tensor min is below the prior's stated min because this sample enumerates individual gate/up/down tensors (gate/up dip to ~0.88); the prior min is a coarser aggregate. down_proj alone is tightly clustered ~0.913-0.930."
+  },
+  "verdict": "PASS",
+  "verdict_basis": "harness validated: dequant decode path is bitwise-identical to MLX reference AND per-tensor median cosine matches the documented prior; the reported cosine/relerr are the fidelity measurement",
+  "seconds": 6.2
+}

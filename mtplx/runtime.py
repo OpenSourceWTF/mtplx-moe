@@ -26,7 +26,9 @@ def _streamed_mtp_backend(model_key: str, precision: str) -> str:
 
     support = {
         "hy3-q4": ("hy3", {"bf16", "q4"}),
+        "hy3-expert-only-q4": ("hy3", {"bf16"}),
         "hy3-expert-q2": ("hy3", {"bf16"}),
+        "hy3-expert-oq2e": ("hy3", {"bf16"}),
         # The Q4 head sibling (issue #100) is lane-agnostic: it is selectable
         # for either GLM streamed lane so its ~12.9 GiB budget saving reaches
         # the memory-constrained expert-Q2 config too. BF16 stays the default
@@ -652,15 +654,34 @@ def _load_impl(
             )
             # ExpertStreamingRuntime.open computes the same discount from the
             # manifest itself, so plan_kwargs stays free of it.
-            preflight_plan_kwargs = dict(plan_kwargs)
-            if expert_streaming_config.proj_quant:
-                from .expert_manifest import load_expert_manifest
-                from .expert_runtime import proj_quant_plan_discount
+            # Resolve a pending island_layer_count BEFORE the pre-flight plan
+            # (census-first precedence; open() re-resolves idempotently) —
+            # census-only specs previously hit the unresolved-count guard here.
+            if expert_streaming_config.island_layer_count is not None:
+                from .expert_runtime import resolve_island_placement
 
+                expert_streaming_config = resolve_island_placement(
+                    expert_streaming_config, Path(expert_manifest).parent
+                )
+            preflight_plan_kwargs = dict(plan_kwargs)
+            if expert_streaming_config.proj_quant or getattr(
+                expert_streaming_config, "proj_requant", None
+            ):
+                from .expert_manifest import load_expert_manifest
+                from .expert_runtime import (
+                    proj_quant_plan_discount,
+                    proj_requant_plan_discount,
+                )
+
+                _preflight_manifest = load_expert_manifest(expert_manifest)
                 preflight_plan_kwargs["resident_discount_bytes"] = (
                     proj_quant_plan_discount(
-                        load_expert_manifest(expert_manifest),
+                        _preflight_manifest,
                         expert_streaming_config.proj_quant,
+                    )
+                    + proj_requant_plan_discount(
+                        _preflight_manifest,
+                        getattr(expert_streaming_config, "proj_requant", None),
                     )
                 )
             streaming_plan = expert_streaming_config.memory_plan(
@@ -783,10 +804,19 @@ def _load_impl(
                 ):
                     from .models.hy3_mlx import configure_hy3_router_kernels
 
+                    import os as _os
+
+                    # EXPERIMENT gate (2026-07-21): "all" extends the split-K
+                    # kernel to trunk routers at rows==1 (AR decode), which
+                    # historically fell back to the stock host path. Default
+                    # "mtp" preserves the measured ladder behavior exactly.
                     router_kernel_report = configure_hy3_router_kernels(
                         model,
                         expert_streaming_config.hy3_router_kernel,
                         sigmoid_mode=expert_streaming_config.hy3_router_sigmoid,
+                        splitk_m1_scope=_os.environ.get(
+                            "MTPLX_HY3_ROUTER_SPLITK_M1", "mtp"
+                        ),
                     )
                     actual_incremental = int(
                         router_kernel_report.get("incremental_bytes", -1)
@@ -858,7 +888,12 @@ def _load_impl(
     # Turbo lanes validate themselves once per load on the model's actual
     # dtype/quant format; a mismatching lane disables itself and serving
     # continues on the stock path (surfaced in /health kernel_selfcheck).
-    maybe_run_model_selfcheck(model)
+    # Expert-streaming loads also pass their spec so the routed expert bank's
+    # gather_qmm lane is validated at its own (possibly different) quant format.
+    maybe_run_model_selfcheck(
+        model,
+        expert_spec=getattr(expert_runtime, "spec", None),
+    )
     adapter_path = Path(mtp_adapter) if mtp_adapter is not None else None
     adapter_metadata = None
     adapter_merge_report = None

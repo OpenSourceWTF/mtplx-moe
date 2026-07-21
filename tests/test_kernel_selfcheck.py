@@ -149,3 +149,139 @@ def test_health_payload_before_any_run_is_safe() -> None:
     payload = report_for_health()
     assert payload == {"ran": False}
     json.dumps(payload)
+
+
+# --- Routed expert bank gather lane (expert-streaming specs) ------------------
+#
+# These use only stock mx.gather_qmm / mx.quantized_matmul / mx.quantize, so
+# they run on both the GPU and the CPU (unlike the nax/gqa Metal lanes above,
+# which are GPU-only). They deliberately leave MTPLX_NAX_VERIFY /
+# MTPLX_GQA_PACKED_SDPA unset so only the expert_gather lane engages.
+
+
+@pytest.mark.parametrize(
+    "spec_attr,expected_bits,expected_group_size",
+    [
+        ("HY3_EXPERT_OQ2E", 2, 128),
+        ("HY3_EXPERT_Q2", 2, 64),
+        ("HY3_EXPERT_ONLY_Q4", 4, 64),
+    ],
+)
+def test_expert_signature_derived_from_spec(
+    spec_attr, expected_bits, expected_group_size
+) -> None:
+    import mtplx.expert_streaming_models as esm
+
+    spec = getattr(esm, spec_attr)
+    sig = kernel_selfcheck._expert_quant_signature(spec)
+    assert sig == (mx.bfloat16, expected_bits, expected_group_size)
+
+
+def test_expert_signature_none_without_spec() -> None:
+    assert kernel_selfcheck._expert_quant_signature(None) is None
+
+
+def test_expert_signature_none_for_shadow_codec() -> None:
+    # Shadow-codec (q1 lane) banks do not run the affine gather_qmm path, so
+    # they must yield no expert signature and add no gather lane.
+    from mtplx.expert_streaming_models import GLM52_EXPERT_Q1T
+
+    assert GLM52_EXPERT_Q1T.expert_codec != "affine"
+    assert kernel_selfcheck._expert_quant_signature(GLM52_EXPERT_Q1T) is None
+
+
+@pytest.mark.parametrize("group_size", [64, 128], ids=["gs64", "gs128"])
+def test_expert_gather_lane_passes_on_healthy_bank(group_size) -> None:
+    report = run_kernel_selfcheck(
+        mx.bfloat16, 4, 64, expert_signature=(mx.bfloat16, 2, group_size)
+    )
+    assert report["lanes"]["expert_gather"] == "ok"
+    assert report["dmax"]["expert_gather"] <= kernel_selfcheck._QMM_TOLERANCE
+    assert not lane_disabled("expert_gather")
+
+
+def test_expert_gather_lane_fails_closed_on_corrupt_kernel(monkeypatch) -> None:
+    original = mx.gather_qmm
+
+    def corrupted(*args, **kwargs):
+        return original(*args, **kwargs) + 1000.0
+
+    monkeypatch.setattr(mx, "gather_qmm", corrupted)
+    report = run_kernel_selfcheck(
+        mx.bfloat16, 4, 64, expert_signature=(mx.bfloat16, 2, 128)
+    )
+    assert report["lanes"]["expert_gather"] == "fallback"
+    assert lane_disabled("expert_gather")
+
+    health = report_for_health()
+    assert health["ran"] is True
+    assert health["expert_gather"] == "fallback"
+    json.dumps(health)  # JSON primitives only
+
+
+def test_expert_gather_lane_fails_closed_on_wrong_group_size() -> None:
+    # A group_size that does not divide the synthetic bank's K raises inside
+    # the probe; the recorder catches it as a hard fallback (dmax == inf),
+    # exactly as a broken resident lane surfaces.
+    report = run_kernel_selfcheck(
+        mx.bfloat16, 4, 64, expert_signature=(mx.bfloat16, 2, 96)
+    )
+    assert report["lanes"]["expert_gather"] == "fallback"
+    assert report["dmax"]["expert_gather"] == float("inf")
+    assert lane_disabled("expert_gather")
+
+
+def test_expert_gather_check_mismatched_group_size_raises() -> None:
+    # The literal "wrong group_size fed to the check": bank quantized at gs=64,
+    # gather run at gs=128. gather_qmm's weight/scales contract fails closed.
+    with pytest.raises(Exception):
+        y = kernel_selfcheck._check_expert_gather(
+            mx, mx.bfloat16, 2, 128, bank_group_size=64
+        )
+        mx.eval(y)
+
+
+def test_no_expert_lane_without_signature() -> None:
+    # Non-streaming path: no expert_signature -> the report carries no expert
+    # lane at all (not even "skipped"), keeping dense loads byte-identical.
+    report = run_kernel_selfcheck(mx.bfloat16, 4, 64)
+    assert "expert_gather" not in report["lanes"]
+    assert "expert_gather" not in report["dmax"]
+    assert not lane_disabled("expert_gather")
+
+
+def test_maybe_run_dense_model_adds_no_expert_lane(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_KERNEL_SELFCHECK", "1")
+    monkeypatch.delenv("MTPLX_NAX_VERIFY", raising=False)
+    monkeypatch.delenv("MTPLX_GQA_PACKED_SDPA", raising=False)
+    report = kernel_selfcheck.maybe_run_model_selfcheck(object())
+    assert report is not None
+    assert "expert_gather" not in report["lanes"]
+    assert not lane_disabled("expert_gather")
+
+
+def test_maybe_run_streaming_spec_adds_expert_lane(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_KERNEL_SELFCHECK", "1")
+    monkeypatch.delenv("MTPLX_NAX_VERIFY", raising=False)
+    monkeypatch.delenv("MTPLX_GQA_PACKED_SDPA", raising=False)
+    from mtplx.expert_streaming_models import HY3_EXPERT_OQ2E
+
+    report = kernel_selfcheck.maybe_run_model_selfcheck(
+        object(), expert_spec=HY3_EXPERT_OQ2E
+    )
+    assert report is not None
+    assert report["lanes"]["expert_gather"] == "ok"
+    assert not lane_disabled("expert_gather")
+    assert report_for_health()["expert_gather"] == "ok"
+
+
+def test_maybe_run_disabled_skips_expert_lane(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_KERNEL_SELFCHECK", "0")
+    from mtplx.expert_streaming_models import HY3_EXPERT_OQ2E
+
+    assert (
+        kernel_selfcheck.maybe_run_model_selfcheck(
+            object(), expert_spec=HY3_EXPERT_OQ2E
+        )
+        is None
+    )

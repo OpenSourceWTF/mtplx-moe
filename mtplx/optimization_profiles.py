@@ -62,6 +62,7 @@ VALID_STATES = ("default_on", "default_off", "not_applicable", "unvalidated")
 # "the profile is silent".
 KNOB_NAMES = (
     "proj_quant",
+    "proj_requant",
     "kv_quant",
     "expert_integrity",
     "split_route_release",
@@ -155,6 +156,14 @@ _HY3_EXPERT_Q2 = OptimizationProfile(
                 "Linears; K3 1024/1024 11.107 -> 13.44 +/-0.05 tok/s, "
                 "wired peak 83.1 -> 71.3 GiB (acceptance 1.994 -> 1.813; "
                 "bandwidth win dominates)"
+            ),
+        ),
+        "proj_requant": KnobEntry(
+            state="unvalidated",
+            value=None,
+            provenance=(
+                "mechanism added 2026-07-21 for the oq2e resident "
+                "experiment; no measurement for this model"
             ),
         ),
         "kv_quant": KnobEntry(
@@ -287,6 +296,14 @@ _GLM52_EXPERT_Q2 = OptimizationProfile(
                 "tracked separately (#100)"
             ),
         ),
+        "proj_requant": KnobEntry(
+            state="unvalidated",
+            value=None,
+            provenance=(
+                "mechanism added 2026-07-21 for the oq2e resident "
+                "experiment; no measurement for this model"
+            ),
+        ),
         "kv_quant": KnobEntry(
             state="not_applicable",
             value=None,
@@ -409,6 +426,14 @@ _QWEN36_27B = OptimizationProfile(
                 "resident/streamed split for load-time quantization"
             ),
         ),
+        "proj_requant": KnobEntry(
+            state="unvalidated",
+            value=None,
+            provenance=(
+                "mechanism added 2026-07-21 for the oq2e resident "
+                "experiment; no measurement for this model"
+            ),
+        ),
         "kv_quant": KnobEntry(
             state="default_off",
             value=None,
@@ -492,10 +517,135 @@ _QWEN36_27B = OptimizationProfile(
 )
 
 
+_HY3_EXPERT_OQ2E = OptimizationProfile(
+    model_key="hy3-expert-oq2e",
+    knobs={
+        "proj_quant": KnobEntry(
+            state="not_applicable",
+            value=None,
+            provenance=(
+                "2026-07-21: oQ2e residents ship pre-quantized q8-gs64 and "
+                "load via the config-driven path; _runtime_quantize_projections "
+                "matches zero BF16 Linears and raises. Serving directive for "
+                "this checkpoint: stock bytes, never requantize."
+            ),
+        ),
+        "proj_requant": KnobEntry(
+            state="unvalidated",
+            value="q4",
+            provenance=(
+                "EXPERIMENT arm: q8->q4 double-quantization of "
+                "proj_quant_covers scope; quality gates = 20-task HumanEval "
+                "vs 0.95 and WikiText-2 vs 6.443 (2026-07-21); pending"
+            ),
+        ),
+        "kv_quant": KnobEntry(
+            state="unvalidated",
+            value=None,
+            provenance=(
+                "no oq2e measurement (2026-07-21 campaign ran default KV); "
+                "no basis inherited — q2-lane KV history does not transfer "
+                "automatically"
+            ),
+        ),
+        "expert_integrity": KnobEntry(
+            state="default_on",
+            value="headers-only",
+            provenance=(
+                "2026-07-21 oq2e campaign ran headers-only throughout; "
+                "measurement basis is the hy3-expert-q2 headers-only win "
+                "(no oq2e-specific A/B)"
+            ),
+        ),
+        "split_route_release": KnobEntry(
+            state="default_on",
+            value="deferred",
+            provenance=(
+                "inherited from hy3-expert-q2; NOTE: inert at "
+                "island-layer-count 79 (DenseIslandSwitchGLU never consults "
+                "it) — load-bearing only at reduced islands, e.g. the 88 GiB "
+                "islands-74 configuration"
+            ),
+        ),
+        "prefetch_slots": KnobEntry(
+            state="unvalidated",
+            value=None,
+            provenance=(
+                "no oq2e measurement; near-uniform hy3 routing made "
+                "prefetch lose on the q2 bank — re-measure before enabling "
+                "at any streamed operating point"
+            ),
+        ),
+        "miss_shadow": KnobEntry(
+            state="unvalidated",
+            value=None,
+            provenance="q2-bank-specific shadow machinery; no oq2e basis",
+        ),
+        "miss_shadow_layers": KnobEntry(
+            state="unvalidated",
+            value=None,
+            provenance="see miss_shadow; no oq2e basis",
+        ),
+        "submit_cadence_env": KnobEntry(
+            state="default_on",
+            value="8",
+            provenance=(
+                "2026-07-21 campaign ran MTPLX_HY3_SUBMIT_CADENCE=8; "
+                "confirmed load-bearing at full residency "
+                "(mtplx/models/hy3_mlx.py cadence path)"
+            ),
+        ),
+        "island_source": KnobEntry(
+            state="default_on",
+            value="spec-pin-order",
+            provenance=(
+                "spec reuses HY3_EXPERT_Q2's measured pin order (routing is "
+                "a router-weight property); order is irrelevant at 79 "
+                "islands and a starting point, not re-measured truth, at "
+                "reduced counts"
+            ),
+        ),
+        "island_layer_count": KnobEntry(
+            state="default_on",
+            value=79,
+            provenance=(
+                "2026-07-21: fully resident fits at memory-limit 103GiB "
+                "(hard peak 91.9 GiB): AR 30.17 / K2 36.82 (1 unclassified "
+                "divergence) / K3 31.81 bit-exact. At 95GiB limit the fixed "
+                "footprint exceeds by 4.21 GiB; islands 74 measured K3 22.15"
+            ),
+        ),
+        "mtp_depth": KnobEntry(
+            state="default_on",
+            value=3,
+            provenance=(
+                "2026-07-21: K3 31.81 tok/s bit-exact vs AR at both "
+                "envelopes; K2 is faster (36.82) but carried one "
+                "unclassified token divergence per run — K3 is the "
+                "exact-parity default until K2's divergence is attributed"
+            ),
+        ),
+        "verify_strategy": KnobEntry(
+            state="default_on",
+            value="batched",
+            provenance=(
+                "2026-07-21 campaign ran batched in every cell; basis "
+                "inherited from hy3-expert-q2 (no oq2e-specific A/B)"
+            ),
+        ),
+    },
+)
+
+
 PROFILES: Mapping[str, OptimizationProfile] = MappingProxyType(
     {
         profile.model_key: profile
-        for profile in (_HY3_EXPERT_Q2, _GLM52_EXPERT_Q2, _QWEN36_27B)
+        for profile in (
+            _HY3_EXPERT_Q2,
+            _HY3_EXPERT_OQ2E,
+            _GLM52_EXPERT_Q2,
+            _QWEN36_27B,
+        )
     }
 )
 

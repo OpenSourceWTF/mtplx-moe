@@ -480,11 +480,15 @@ def test_load_glm_q4_precision_accepted_but_fails_closed_without_q4_artifact(
 
 
 @pytest.mark.parametrize("model_key", ["hy3-expert-only-q4"])
-def test_load_rejects_mtp_for_unvalidated_hy3_lanes_before_model_load(
+def test_load_admits_mtp_for_q4_control_lane_up_to_model_load(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     model_key: str,
 ) -> None:
+    """2026-07-21: the q4 control lane's bf16 head moved unvalidated->supported
+    (support-dict entry d819efd; validation = the q4 anchor benchmark window).
+    The support gate must now ADMIT the key — proven by the load reaching the
+    (stubbed) resident-model construction instead of the pre-load rejection."""
     root = _guard_config_dir(tmp_path)
     config = ExpertStreamingConfig(
         model_key=model_key,
@@ -493,15 +497,9 @@ def test_load_rejects_mtp_for_unvalidated_hy3_lanes_before_model_load(
         runtime_reserve_bytes=0,
     )
 
-    def unexpected_model_load(*_args, **_kwargs):
-        raise AssertionError("explicit local MTP rejection happened after model load")
-
-    monkeypatch.setattr(
-        "mtplx.resident_loader.construct_resident_model",
-        unexpected_model_load,
-    )
-
-    with pytest.raises(RuntimeError, match="not supported"):
+    # Past the support gate, the load must fail on the MISSING ARTIFACTS
+    # requirement (the next validation), not on "not supported".
+    with pytest.raises(RuntimeError, match="omits its trained MTP layer"):
         load(
             root,
             mtp=True,

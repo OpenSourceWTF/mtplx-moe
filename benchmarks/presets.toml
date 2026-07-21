@@ -126,3 +126,220 @@ extends = "championship"
 
 [preset.roofline.env]
 MTPLX_ROOFLINE_PROFILE = "1"
+
+[preset.hy3-oq2e]
+description = "mlx-community Hy3-oQ2e stock-served: gs128 2-bit experts + q8 residents, fully resident islands 1-79, NO proj-quant (residents pre-quantized; forcing it raises). Measured 2026-07-21: AR 30.17 / K3 31.81 bit-exact."
+models = ["hy3-oq2e"]
+contexts = "1024"
+output-tokens = 1024
+hy3-depths = "3"
+memory-limit = "103GiB"
+runtime-reserve = "7GiB"
+expert-cache-limit = "2GiB"
+max-live-kv-tokens = 4096
+cache-policy = "frequency"
+cache-scope = "layer"
+slot-layout = "component-banks"
+island-layers = "1-79"
+hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
+verify-strategy = "batched"
+expert-integrity = "headers-only"
+
+[preset.hy3-oq2e.env]
+MTPLX_SUSTAINED_PREFILL = "1"
+MTPLX_HY3_SUBMIT_CADENCE = "8"
+
+[preset.hy3-oq2e-88]
+description = "Hy3-oQ2e at the 88 GiB envelope: fixed footprint exceeds limit at islands 79 (by 4.21 GiB), so islands 74 by spec pin order + 5 streamed layers. Measured 2026-07-21: K3 22.15 bit-exact. Streaming knobs load-bearing here."
+models = ["hy3-oq2e"]
+contexts = "1024"
+output-tokens = 1024
+hy3-depths = "3"
+memory-limit = "95GiB"
+runtime-reserve = "7GiB"
+expert-cache-limit = "2GiB"
+max-live-kv-tokens = 4096
+cache-policy = "frequency"
+cache-scope = "layer"
+slot-layout = "component-banks"
+island-layer-count = 74
+hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
+verify-strategy = "batched"
+expert-integrity = "headers-only"
+split-route-release = "deferred"
+deferred-pin-release = true
+
+[preset.hy3-oq2e-88.env]
+MTPLX_SUSTAINED_PREFILL = "1"
+MTPLX_HY3_SUBMIT_CADENCE = "8"
+
+[preset.hy3-oq2e-rq4-48]
+description = "oQ2e + proj-requant q4 at the 48 GiB envelope: islands 36 (43 streamed). Sweep family 48-96/8; counts sized from the measured pre-flight overhead (20.64 GiB fixed w/ requant credit, 0.949 GiB/island)."
+models = ["hy3-oq2e"]
+contexts = "1024"
+output-tokens = 1024
+hy3-depths = "3"
+memory-limit = "55GiB"
+runtime-reserve = "7GiB"
+expert-cache-limit = "2GiB"
+max-live-kv-tokens = 4096
+cache-policy = "frequency"
+cache-scope = "layer"
+slot-layout = "component-banks"
+island-layer-count = 36
+hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
+verify-strategy = "batched"
+expert-integrity = "headers-only"
+proj-requant = "q4"
+split-route-release = "deferred"
+deferred-pin-release = true
+
+[preset.hy3-oq2e-rq4-48.env]
+MTPLX_SUSTAINED_PREFILL = "1"
+MTPLX_HY3_SUBMIT_CADENCE = "8"
+
+[preset.hy3-oq2e-rq4-56]
+description = "oQ2e + proj-requant q4 at the 56 GiB envelope: islands 44 (35 streamed). Sweep family 48-96/8; counts sized from the measured pre-flight overhead (20.64 GiB fixed w/ requant credit, 0.949 GiB/island)."
+models = ["hy3-oq2e"]
+contexts = "1024"
+output-tokens = 1024
+hy3-depths = "3"
+memory-limit = "63GiB"
+runtime-reserve = "7GiB"
+expert-cache-limit = "2GiB"
+max-live-kv-tokens = 4096
+cache-policy = "frequency"
+cache-scope = "layer"
+slot-layout = "component-banks"
+island-layer-count = 44
+hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
+verify-strategy = "batched"
+expert-integrity = "headers-only"
+proj-requant = "q4"
+split-route-release = "deferred"
+deferred-pin-release = true
+
+[preset.hy3-oq2e-rq4-56.env]
+MTPLX_SUSTAINED_PREFILL = "1"
+MTPLX_HY3_SUBMIT_CADENCE = "8"
+
+[preset.hy3-oq2e-rq4-64]
+description = "oQ2e + proj-requant q4 at the 64 GiB envelope: islands 52 (27 streamed). Sweep family 48-96/8; counts sized from the measured pre-flight overhead (20.64 GiB fixed w/ requant credit, 0.949 GiB/island)."
+models = ["hy3-oq2e"]
+contexts = "1024"
+output-tokens = 1024
+hy3-depths = "3"
+memory-limit = "71GiB"
+runtime-reserve = "7GiB"
+expert-cache-limit = "2GiB"
+max-live-kv-tokens = 4096
+cache-policy = "frequency"
+cache-scope = "layer"
+slot-layout = "component-banks"
+island-layer-count = 52
+hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
+verify-strategy = "batched"
+expert-integrity = "headers-only"
+proj-requant = "q4"
+split-route-release = "deferred"
+deferred-pin-release = true
+
+[preset.hy3-oq2e-rq4-64.env]
+MTPLX_SUSTAINED_PREFILL = "1"
+MTPLX_HY3_SUBMIT_CADENCE = "8"
+
+[preset.hy3-oq2e-rq4-72]
+description = "oQ2e + proj-requant q4 at the 72 GiB envelope: islands 61 (18 streamed). Sweep family 48-96/8; counts sized from the measured pre-flight overhead (20.64 GiB fixed w/ requant credit, 0.949 GiB/island)."
+models = ["hy3-oq2e"]
+contexts = "1024"
+output-tokens = 1024
+hy3-depths = "3"
+memory-limit = "79GiB"
+runtime-reserve = "7GiB"
+expert-cache-limit = "2GiB"
+max-live-kv-tokens = 4096
+cache-policy = "frequency"
+cache-scope = "layer"
+slot-layout = "component-banks"
+island-layer-count = 61
+hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
+verify-strategy = "batched"
+expert-integrity = "headers-only"
+proj-requant = "q4"
+split-route-release = "deferred"
+deferred-pin-release = true
+
+[preset.hy3-oq2e-rq4-72.env]
+MTPLX_SUSTAINED_PREFILL = "1"
+MTPLX_HY3_SUBMIT_CADENCE = "8"
+
+[preset.hy3-oq2e-rq4-80]
+description = "oQ2e + proj-requant q4 at the 80 GiB envelope: islands 69 (10 streamed). Sweep family 48-96/8; counts sized from the measured pre-flight overhead (20.64 GiB fixed w/ requant credit, 0.949 GiB/island)."
+models = ["hy3-oq2e"]
+contexts = "1024"
+output-tokens = 1024
+hy3-depths = "3"
+memory-limit = "87GiB"
+runtime-reserve = "7GiB"
+expert-cache-limit = "2GiB"
+max-live-kv-tokens = 4096
+cache-policy = "frequency"
+cache-scope = "layer"
+slot-layout = "component-banks"
+island-layer-count = 69
+hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
+verify-strategy = "batched"
+expert-integrity = "headers-only"
+proj-requant = "q4"
+split-route-release = "deferred"
+deferred-pin-release = true
+
+[preset.hy3-oq2e-rq4-80.env]
+MTPLX_SUSTAINED_PREFILL = "1"
+MTPLX_HY3_SUBMIT_CADENCE = "8"
+
+[preset.hy3-oq2e-rq4-88]
+description = "oQ2e + proj-requant q4 at the 88 GiB envelope: islands 79 (fully resident — vestigial cache shrunk to wire the 79th island). Sweep family 48-96/8; counts sized from the measured pre-flight overhead (20.64 GiB fixed w/ requant credit, 0.949 GiB/island)."
+models = ["hy3-oq2e"]
+contexts = "1024"
+output-tokens = 1024
+hy3-depths = "3"
+memory-limit = "95GiB"
+runtime-reserve = "7GiB"
+expert-cache-limit = "1GiB"
+max-live-kv-tokens = 4096
+cache-policy = "frequency"
+cache-scope = "layer"
+slot-layout = "component-banks"
+island-layer-count = 79
+hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
+verify-strategy = "batched"
+expert-integrity = "headers-only"
+proj-requant = "q4"
+
+[preset.hy3-oq2e-rq4-88.env]
+MTPLX_SUSTAINED_PREFILL = "1"
+MTPLX_HY3_SUBMIT_CADENCE = "8"
+
+[preset.hy3-oq2e-rq4-96]
+description = "oQ2e + proj-requant q4 at the 96 GiB envelope: islands 79 (0 streamed). Sweep family 48-96/8; counts sized from the measured pre-flight overhead (20.64 GiB fixed w/ requant credit, 0.949 GiB/island)."
+models = ["hy3-oq2e"]
+contexts = "1024"
+output-tokens = 1024
+hy3-depths = "3"
+memory-limit = "103GiB"
+runtime-reserve = "7GiB"
+expert-cache-limit = "2GiB"
+max-live-kv-tokens = 4096
+cache-policy = "frequency"
+cache-scope = "layer"
+slot-layout = "component-banks"
+island-layer-count = 79
+hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
+verify-strategy = "batched"
+expert-integrity = "headers-only"
+proj-requant = "q4"
+
+[preset.hy3-oq2e-rq4-96.env]
+MTPLX_SUSTAINED_PREFILL = "1"
+MTPLX_HY3_SUBMIT_CADENCE = "8"

@@ -997,6 +997,78 @@ def test_hy3_source_segment_fallback_keeps_record_hashing_enabled(
     assert "loaded_manifest" not in captured
 
 
+def test_q2_proj_requant_threads_into_the_q2_lane_streaming_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    _install_fake_lane_modules(
+        monkeypatch,
+        captured,
+        manifest_value=SimpleNamespace(model_key="hy3-expert-oq2e", sidecar=None),
+    )
+    root = tmp_path / "oq2e"
+    manifest = root / "expert-manifest.json"
+    config = quality.LaneConfig(
+        "q2",
+        root,
+        manifest,
+        "hy3-expert-oq2e",
+        memory_limit="120259084288",
+        expert_cache_limit="83034243072",
+        trust_sidecar=False,
+        proj_requant="q4",
+    )
+
+    quality._load_lane_runtime(config)
+
+    streaming = captured["streaming"]
+    assert isinstance(streaming, dict)
+    assert streaming["proj_requant"] == "q4"
+
+
+def test_proj_requant_is_a_q2_lane_only_experiment() -> None:
+    # The q4 control lane must never carry the requant knob (keeps the A/B
+    # honest); LaneConfig enforces that structurally.
+    with pytest.raises(ValueError, match="q2 lane only"):
+        quality.LaneConfig(
+            "q4", Path("/tmp/r"), Path("/tmp/m.json"), "glm52-q4", proj_requant="q4"
+        )
+    # Only q4 is sanctioned for the requant knob.
+    with pytest.raises(ValueError, match="proj_requant"):
+        quality.LaneConfig(
+            "q2", Path("/tmp/r"), Path("/tmp/m.json"), "hy3-expert-oq2e",
+            proj_requant="q8",
+        )
+    # None is the default and stays untouched.
+    assert (
+        quality.LaneConfig(
+            "q2", Path("/tmp/r"), Path("/tmp/m.json"), "hy3-expert-oq2e"
+        ).proj_requant
+        is None
+    )
+
+
+def test_q2_proj_requant_flag_exists_and_only_feeds_the_q2_lane() -> None:
+    parser = quality.build_parser()
+    args = parser.parse_args(
+        [
+            "--q4-root", "/tmp/q4", "--q4-manifest", "/tmp/q4.json",
+            "--q2-root", "/tmp/q2", "--q2-manifest", "/tmp/q2.json",
+            "--memory-limit", "96GiB", "--expert-cache-limit", "2GiB",
+            "--max-live-kv-tokens", "4096",
+            "--corpus-file", "/tmp/c.jsonl",
+            "--evaluation-tokens", "8", "--chunk-tokens", "4",
+            "--prompt-file", "/tmp/p.txt", "--greedy-max-tokens", "4",
+            "--output-json", "/tmp/o.json",
+            "--q2-proj-requant", "q4",
+        ]
+    )
+    assert args.q2_proj_requant == "q4"
+    # No q4-side flag exists — the control lane cannot be requantized.
+    assert not hasattr(args, "q4_proj_requant")
+
+
 def test_hy3_runtime_configuration_forces_ar_and_carries_streaming_settings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1055,6 +1127,7 @@ def test_hy3_runtime_configuration_forces_ar_and_carries_streaming_settings(
         "max_read_chunk_bytes": 67108864,
         "bypass_page_cache": True,
         "verify_record_hashes": False,
+        "proj_requant": None,
     }
 
 

@@ -1,0 +1,120 @@
+{
+  "eval": "pass@k estimator unit test",
+  "scalar_pass_at_k": {
+    "anchors": [
+      {
+        "n": 5,
+        "c": 0,
+        "k": 1,
+        "code": 0.0,
+        "analytic": 0.0,
+        "match": true
+      },
+      {
+        "n": 5,
+        "c": 1,
+        "k": 1,
+        "code": 0.19999999999999996,
+        "analytic": 0.19999999999999996,
+        "match": true
+      },
+      {
+        "n": 5,
+        "c": 5,
+        "k": 1,
+        "code": 1.0,
+        "analytic": 1.0,
+        "match": true
+      },
+      {
+        "n": 10,
+        "c": 3,
+        "k": 5,
+        "code": 0.9166666666666666,
+        "analytic": 0.9166666666666666,
+        "match": true
+      },
+      {
+        "n": 10,
+        "c": 1,
+        "k": 10,
+        "code": 1.0,
+        "analytic": 1.0,
+        "match": true
+      },
+      {
+        "n": 200,
+        "c": 10,
+        "k": 1,
+        "code": 0.04999999999999982,
+        "analytic": 0.050000000000000044,
+        "match": true
+      }
+    ],
+    "grid_size": 440,
+    "grid_all_match": true,
+    "grid_matched": 440,
+    "passed": true
+  },
+  "summarize_per_task": {
+    "checks": [
+      {
+        "case": "multi-task",
+        "k": 1,
+        "code": 0.4666666666666666,
+        "analytic": 0.4666666666666666,
+        "match": true
+      },
+      {
+        "case": "multi-task",
+        "k": 2,
+        "code": 0.5666666666666667,
+        "analytic": 0.5666666666666667,
+        "match": true
+      },
+      {
+        "case": "multi-task",
+        "k": 3,
+        "code": 0.6333333333333333,
+        "analytic": 0.6333333333333333,
+        "match": true
+      },
+      {
+        "case": "skip-<k-samples",
+        "k": 3,
+        "code": 1.0,
+        "analytic": 1.0,
+        "match": true
+      },
+      {
+        "case": "corpus-passes>n (old bug)",
+        "k": 1,
+        "code": 1.0,
+        "analytic": 1.0,
+        "raised": false,
+        "match": true
+      }
+    ],
+    "passed": true
+  },
+  "repo_pytests": [
+    {
+      "target": "tests/test_code_eval.py",
+      "returncode": 0,
+      "ok": true,
+      "summary_tail": [
+        "................................                                         [100%]"
+      ]
+    },
+    {
+      "target": "tests/test_code_eval_gate.py",
+      "returncode": 0,
+      "ok": true,
+      "summary_tail": [
+        "..............................                                           [100%]"
+      ]
+    }
+  ],
+  "verdict": "PASS",
+  "seconds": 4.1
+}

@@ -1,0 +1,98 @@
+[serve_and_eval] starting litellm proxy on 127.0.0.1:18183 (num_workers=1)
+[serve_and_eval] proxy up; running HumanEval limit=20 (first request loads the model)
+{"phase": "generate", "done": 1, "total": 20, "task_id": "HumanEval/0", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 2, "total": 20, "task_id": "HumanEval/2", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 3, "total": 20, "task_id": "HumanEval/1", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 4, "total": 20, "task_id": "HumanEval/3", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 5, "total": 20, "task_id": "HumanEval/5", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 6, "total": 20, "task_id": "HumanEval/6", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 7, "total": 20, "task_id": "HumanEval/4", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 8, "total": 20, "task_id": "HumanEval/7", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 9, "total": 20, "task_id": "HumanEval/8", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 10, "total": 20, "task_id": "HumanEval/10", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 11, "total": 20, "task_id": "HumanEval/11", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 12, "total": 20, "task_id": "HumanEval/9", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 13, "total": 20, "task_id": "HumanEval/12", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 14, "total": 20, "task_id": "HumanEval/14", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 15, "total": 20, "task_id": "HumanEval/13", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 16, "total": 20, "task_id": "HumanEval/15", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 17, "total": 20, "task_id": "HumanEval/17", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 18, "total": 20, "task_id": "HumanEval/16", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 19, "total": 20, "task_id": "HumanEval/18", "error": null, "finish": "stop"}
+{"phase": "generate", "done": 20, "total": 20, "task_id": "HumanEval/19", "error": null, "finish": "stop"}
+{"phase": "score", "done": 1, "total": 20, "task_id": "HumanEval/2", "status": "passed"}
+{"phase": "score", "done": 2, "total": 20, "task_id": "HumanEval/1", "status": "passed"}
+{"phase": "score", "done": 3, "total": 20, "task_id": "HumanEval/3", "status": "passed"}
+{"phase": "score", "done": 4, "total": 20, "task_id": "HumanEval/0", "status": "passed"}
+{"phase": "score", "done": 5, "total": 20, "task_id": "HumanEval/4", "status": "passed"}
+{"phase": "score", "done": 6, "total": 20, "task_id": "HumanEval/5", "status": "passed"}
+{"phase": "score", "done": 7, "total": 20, "task_id": "HumanEval/6", "status": "failed"}
+{"phase": "score", "done": 8, "total": 20, "task_id": "HumanEval/7", "status": "failed"}
+{"phase": "score", "done": 9, "total": 20, "task_id": "HumanEval/8", "status": "passed"}
+{"phase": "score", "done": 10, "total": 20, "task_id": "HumanEval/10", "status": "failed"}
+{"phase": "score", "done": 11, "total": 20, "task_id": "HumanEval/9", "status": "passed"}
+{"phase": "score", "done": 12, "total": 20, "task_id": "HumanEval/11", "status": "passed"}
+{"phase": "score", "done": 13, "total": 20, "task_id": "HumanEval/13", "status": "passed"}
+{"phase": "score", "done": 14, "total": 20, "task_id": "HumanEval/12", "status": "failed"}
+{"phase": "score", "done": 15, "total": 20, "task_id": "HumanEval/15", "status": "passed"}
+{"phase": "score", "done": 16, "total": 20, "task_id": "HumanEval/14", "status": "passed"}
+{"phase": "score", "done": 17, "total": 20, "task_id": "HumanEval/16", "status": "passed"}
+{"phase": "score", "done": 18, "total": 20, "task_id": "HumanEval/18", "status": "passed"}
+{"phase": "score", "done": 19, "total": 20, "task_id": "HumanEval/17", "status": "passed"}
+{"phase": "score", "done": 20, "total": 20, "task_id": "HumanEval/19", "status": "passed"}
+{
+  "artifacts": {
+    "report_json": "/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/evals/tier2/humaneval_hy3_q2.json"
+  },
+  "pass_at_k": null,
+  "provenance": {
+    "base_url": "http://127.0.0.1:18183",
+    "completions": 20,
+    "dataset_path": "/Users/davidtai/Library/Caches/evalplus/HumanEvalPlus-v0.1.10.jsonl",
+    "dataset_sha256": "42526ec0e7d5f3ee0b06d6ced98f8c8bae3d76519151bfb3d36f79010645bd7f",
+    "endpoint": "chat",
+    "model": "hy3-q2",
+    "mtplx_version": "2.0.2",
+    "python": "3.12.13",
+    "samples_per_task": 1,
+    "suite": "humaneval",
+    "tasks": 20,
+    "timestamp_utc": "2026-07-21T04:49:34.333701+00:00",
+    "wall_s": 134.7884899589999
+  },
+  "request_errors": 0,
+  "schema": "mtplx.code_eval_gate/1",
+  "summary": {
+    "by_status": {
+      "failed": 4,
+      "passed": 16
+    },
+    "failures": [
+      {
+        "detail": "NameError: name 'current' is not defined",
+        "status": "failed",
+        "task_id": "HumanEval/6"
+      },
+      {
+        "detail": "NameError: name 'strings' is not defined",
+        "status": "failed",
+        "task_id": "HumanEval/7"
+      },
+      {
+        "detail": "NameError: name 'is_palindrome' is not defined. Did you mean: 'make_palindrome'?",
+        "status": "failed",
+        "task_id": "HumanEval/10"
+      },
+      {
+        "detail": "AssertionError",
+        "status": "failed",
+        "task_id": "HumanEval/12"
+      }
+    ],
+    "pass@1": 0.8,
+    "passed": 16,
+    "samples": 20,
+    "tasks": 20
+  }
+}
+[serve_and_eval] code_eval_gate exit=0
