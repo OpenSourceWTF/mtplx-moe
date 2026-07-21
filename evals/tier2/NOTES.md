@@ -209,3 +209,15 @@ wave ineligibility was worth ~0. The port stays (bitwise-locked, correct,
 extends to GLM dims) as eligibility hygiene, not as a perf claim.
 Cross-window comparisons on this box carry ~4% drift under sustained load —
 single-window paired arms only.
+
+## K2 compile-island A/B (2026-07-21, single window, paired arms): NULL
+
+base AR 30.54 / K2 38.00; MTPLX_HY3_COMPILE_ISLAND=1 AR 30.70 / K2 38.31.
+K2/AR ratio 1.2443 vs 1.2479 = +0.3%, sub-noise. Compile-island is worth
+nothing at full residency and is non-bitwise by design — verdict: leave OFF,
+permanently, at this operating point. Third op-restructuring null in a row
+(wave, compile, historic compile-the-forward): the gather kernel is the cost
+and it is ALU-bound; surrounding-op work does not move it. K2's persistent
+single-divergence signature reproduced in both arms (acc/verify 1.637
+identical). Window itself ran ~3% faster than last night's (drift confirmed);
+paired arms agreed internally.
