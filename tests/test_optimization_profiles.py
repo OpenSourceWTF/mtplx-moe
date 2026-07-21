@@ -36,7 +36,12 @@ from mtplx.optimization_profiles import (
 
 
 def test_registry_keys_match_profile_model_keys() -> None:
-    assert set(PROFILES) == {"hy3-expert-q2", "glm52-expert-q2", "qwen36-27b"}
+    assert set(PROFILES) == {
+        "hy3-expert-q2",
+        "hy3-expert-oq2e",
+        "glm52-expert-q2",
+        "qwen36-27b",
+    }
     for key, profile in PROFILES.items():
         assert profile.model_key == key
 
