@@ -654,6 +654,15 @@ def _load_impl(
             )
             # ExpertStreamingRuntime.open computes the same discount from the
             # manifest itself, so plan_kwargs stays free of it.
+            # Resolve a pending island_layer_count BEFORE the pre-flight plan
+            # (census-first precedence; open() re-resolves idempotently) —
+            # census-only specs previously hit the unresolved-count guard here.
+            if expert_streaming_config.island_layer_count is not None:
+                from .expert_runtime import resolve_island_placement
+
+                expert_streaming_config = resolve_island_placement(
+                    expert_streaming_config, Path(expert_manifest).parent
+                )
             preflight_plan_kwargs = dict(plan_kwargs)
             if expert_streaming_config.proj_quant or getattr(
                 expert_streaming_config, "proj_requant", None

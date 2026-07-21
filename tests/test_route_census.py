@@ -313,13 +313,15 @@ def test_close_survives_read_only_model_root(tmp_path: Path) -> None:
 # island-placement.json > error
 
 
-def _write_placement(root: Path, spec, pin_order: tuple[int, ...]) -> None:
+def _write_placement(
+    root: Path, spec, pin_order: tuple[int, ...], *, advisory: bool = True
+) -> None:
     placement = Placement(
         model_key=spec.key,
         expert_count=spec.expert_count,
         slots_per_layer_hint=1,
         census_total_routed_assignments=100,
-        advisory=True,
+        advisory=advisory,
         layer_pin_order=pin_order,
         coverage_by_layer={layer: 0.5 for layer in pin_order},
         expert_ranking_by_layer={
@@ -365,11 +367,24 @@ def test_resolve_prefers_explicit_layers_then_spec_order(
         spec, island_layer_count=None, island_layers=(2,)
     )
     assert resolve_island_placement(explicit, root, spec=spec) is explicit
-    # A spec pin order beats the placement file (which says layer 1 first).
+    # A spec pin order beats the ADVISORY placement file (2026-07-21
+    # census-first precedence: only a SOUND census outranks the spec).
     ordered_spec = replace(spec, island_pin_order=(2, 1))
     config = _island_count_config(spec)
     resolved = resolve_island_placement(config, root, spec=ordered_spec)
     assert resolved.island_layers == (2,)
+
+
+def test_sound_census_outranks_spec_pin_order(tmp_path: Path) -> None:
+    # 2026-07-21 (David): the bank's own measured census is per-bank truth;
+    # the spec order is a static bootstrap default (often borrowed from a
+    # sibling bank) and must not shadow a sound census.
+    root, spec, _manifest, _expected = _global_artifact(tmp_path)
+    _write_placement(root, spec, pin_order=(1, 2), advisory=False)
+    ordered_spec = replace(spec, island_pin_order=(2, 1))
+    config = _island_count_config(spec)
+    resolved = resolve_island_placement(config, root, spec=ordered_spec)
+    assert resolved.island_layers == (1,)
     assert resolved.island_layer_count is None
 
 
@@ -409,7 +424,10 @@ def test_open_without_placement_raises_precedence_error(
     config = _island_count_config(spec, verify_artifact_headers=False)
     with pytest.raises(
         ExpertStreamingConfigurationError,
-        match="explicit island_layers > spec.island_pin_order",
+        # 2026-07-21 census-first precedence (David's call): the bank's own
+        # census outranks the spec's static order; spec order is the
+        # bootstrap default, advisory census demoted below it.
+        match="island-placement.json",
     ):
         ExpertStreamingRuntime.open(
             root,

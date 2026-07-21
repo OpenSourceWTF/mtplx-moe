@@ -1399,12 +1399,16 @@ def resolve_island_placement(
 ) -> ExpertStreamingConfig:
     """Resolve a pending island_layer_count into explicit island_layers.
 
-    Selection precedence: explicit ``island_layers`` >
-    ``spec.island_pin_order`` > ``<root>/island-placement.json`` (the
-    auto-census artifact, issue #98) > error. Idempotent: a config whose
-    count already resolved (or that requests no count) returns unchanged.
-    The placement file stores a budget-independent ranking, so this is the
-    only point where a count meets a concrete model root.
+    Selection precedence (2026-07-21, census-first): explicit
+    ``island_layers`` > ``<root>/island-placement.json`` (the auto-census
+    artifact, issue #98 — the bank's OWN measured ranking) when sound >
+    ``spec.island_pin_order`` (version-controlled bootstrap default) >
+    ADVISORY census (noise-flagged; used only when no spec order exists,
+    with a loud warning) > error. Rationale: a census is measured on the
+    concrete bank at this root; a spec order is a static snapshot and, for
+    derived banks, often borrowed from a sibling. Idempotent: a config
+    whose count already resolved (or that requests no count) returns
+    unchanged.
     """
 
     count = config.island_layer_count
@@ -1416,21 +1420,8 @@ def resolve_island_placement(
             "config and spec model keys differ"
         )
     placement_path = Path(root) / ISLAND_PLACEMENT_FILENAME
-    if model_spec.island_pin_order:
-        order = model_spec.island_pin_order
-        source = f"{model_spec.key} spec island_pin_order"
-    else:
-        if not placement_path.is_file():
-            raise ExpertStreamingConfigurationError(
-                f"island_layer_count {count} cannot be resolved for "
-                f"{model_spec.key}: the spec has no measured island pin "
-                f"order and {placement_path} does not exist. Selection "
-                "precedence: explicit island_layers > spec.island_pin_order "
-                f"> {ISLAND_PLACEMENT_FILENAME} (auto-census, issue #98) > "
-                "this error. Run the model once without islands — the "
-                "route census records decode routes and writes the "
-                "placement at close — or pass explicit island_layers."
-            )
+    placement = None
+    if placement_path.is_file():
         try:
             placement = load_placement(placement_path)
         except RouteCensusError as exc:
@@ -1442,15 +1433,47 @@ def resolve_island_placement(
                 f"{placement_path} was derived for "
                 f"{placement.model_key!r}, not {model_spec.key!r}"
             )
-        if placement.advisory:
+    if placement is not None and not placement.advisory:
+        order = placement.layer_pin_order
+        source = str(placement_path)
+        _LOGGER.info(
+            "island placement resolved from census %s (%d routed "
+            "assignments)",
+            placement_path,
+            placement.census_total_routed_assignments,
+        )
+    elif model_spec.island_pin_order:
+        order = model_spec.island_pin_order
+        source = f"{model_spec.key} spec island_pin_order"
+        if placement is not None:
             _LOGGER.warning(
-                "island placement %s is advisory: derived from only %d "
-                "routed assignments; rankings may still be noise-ordered",
+                "ignoring ADVISORY census %s (only %d routed assignments; "
+                "rankings may be noise-ordered) in favor of the spec pin "
+                "order",
                 placement_path,
                 placement.census_total_routed_assignments,
             )
+    elif placement is not None:
         order = placement.layer_pin_order
         source = str(placement_path)
+        _LOGGER.warning(
+            "island placement %s is advisory: derived from only %d routed "
+            "assignments; rankings may still be noise-ordered (no spec pin "
+            "order exists to prefer)",
+            placement_path,
+            placement.census_total_routed_assignments,
+        )
+    else:
+        raise ExpertStreamingConfigurationError(
+            f"island_layer_count {count} cannot be resolved for "
+            f"{model_spec.key}: no census at {placement_path} and the spec "
+            "has no measured island pin order. Selection precedence: "
+            f"explicit island_layers > {ISLAND_PLACEMENT_FILENAME} "
+            "(auto-census, issue #98) > spec.island_pin_order > advisory "
+            "census > this error. Run the model once without islands — the "
+            "route census records decode routes and writes the placement "
+            "at close — or pass explicit island_layers."
+        )
     if count > len(order):
         raise ExpertStreamingConfigurationError(
             f"island_layer_count {count} exceeds the {model_spec.key} pin "
