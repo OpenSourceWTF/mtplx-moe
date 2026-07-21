@@ -243,3 +243,13 @@ third time). Both inside David's "don't lose much" bar; the requant arm still
 beats shipped q2 (6.747) on PPL. Remaining: paired K2 speed A/B (stock-q8 vs
 requant-q4) to price the win — roofline predicts ~9-10 ms/tok raw attention
 savings.
+
+## proj_requant speed A/B (2026-07-21, paired single window): +8.6% K2, +26.3% AR
+
+stock-q8 AR 26.89 / K2 32.63 vs requant-q4 AR 33.97 / K2 35.44; hard peak
+91.9 -> 88.4 GiB. Window globally slow (drift) — ratios are the evidence;
+scaled to fast-window baselines the projections are ~41 K2 (above the 40.59
+championship) and ~38 AR. Acceptance 1.637 -> 1.564 (trunk perturbation costs
+the MTP head slightly; net K2 still +8.6%). Candidate scorecard complete:
+HumanEval identical, wiki +1.6%, K2 +8.6%, AR +26.3%, -3.5 GiB wired.
+Adoption as serving default = David's decision.
