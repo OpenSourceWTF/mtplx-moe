@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import shutil
+import sys
+from dataclasses import replace
 from pathlib import Path
 
 import mlx.core as mx
@@ -73,9 +77,7 @@ def test_convert_round_trips_records_bitwise(tmp_path: Path, codec: str) -> None
         )
         assert cosine > 0.5
 
-    verified = list(
-        verify_q1_against_source(loaded, source, root, sample=2)
-    )
+    verified = list(verify_q1_against_source(loaded, source, root, sample=2))
     assert len(verified) == 2
 
 
@@ -182,3 +184,81 @@ def test_resume_continues_interrupted_burn_bitwise(tmp_path: Path) -> None:
     ]
     assert resumed.records[0].segments == fresh.records[0].segments
     list(verify_q1_against_source(resumed, source, root, sample=2))
+
+
+def test_cli_emits_authoritative_manifest_for_assembled_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.convert_expert_q1 import main
+    from mtplx import expert_streaming_models
+
+    source_root, source_spec, source_manifest_path = _shadow_hy3_artifact(tmp_path)
+    output_root = tmp_path / "q1-artifact"
+    output_root.mkdir()
+    shutil.copy(source_root / "config.json", output_root / "config.json")
+
+    all_weights = mx.load(str(source_root / "model.safetensors"))
+    resident = {
+        name: value for name, value in all_weights.items() if "switch_mlp" not in name
+    }
+    resident_path = output_root / "model.safetensors"
+    mx.save_safetensors(str(resident_path), resident)
+    resident_bytes = sum(int(value.nbytes) for value in resident.values())
+    (output_root / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": resident_bytes},
+                "weight_map": {name: resident_path.name for name in resident},
+            }
+        )
+    )
+
+    q1_spec = replace(
+        source_spec,
+        key="tiny-hy3-q1t158",
+        display_name="Tiny Hy3 q1 t158",
+        expert_codec="t158",
+        quant_bits=2,
+        total_tensor_bytes=(
+            resident_bytes
+            + source_spec.expert_count
+            * shadow_record_bytes("t158", source_spec.expert_source_parameters)
+        ),
+    )
+    real_get_model_spec = expert_streaming_models.get_model_spec
+
+    def get_model_spec(key: str):
+        if key == q1_spec.key:
+            return q1_spec
+        if key == source_spec.key:
+            return source_spec
+        return real_get_model_spec(key)
+
+    monkeypatch.setattr(expert_streaming_models, "get_model_spec", get_model_spec)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "convert_expert_q1.py",
+            "--source-root",
+            str(source_root),
+            "--manifest",
+            str(source_manifest_path),
+            "--output-dir",
+            str(output_root),
+            "--codec",
+            "t158",
+            "--layers",
+            "1",
+            "--streamed-model-key",
+            q1_spec.key,
+            "--verify-sample",
+            "0",
+        ],
+    )
+
+    assert main() == 0
+    authoritative = load_expert_manifest(output_root / "expert-manifest.json")
+    assert authoritative.model_key == q1_spec.key
+    assert authoritative.quant_mode == "t158"
+    assert len(authoritative.records) == source_spec.expert_count

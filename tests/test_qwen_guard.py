@@ -1068,6 +1068,8 @@ def test_cli_accepts_configurable_exclusive_lock(tmp_path: Path) -> None:
             str(lock_path),
             "--lock-timeout-seconds",
             "12.5",
+            "--child-timeout-seconds",
+            "45",
             "--",
             "python",
             "job.py",
@@ -1076,7 +1078,32 @@ def test_cli_accepts_configurable_exclusive_lock(tmp_path: Path) -> None:
 
     assert args.lock_path == lock_path
     assert args.lock_timeout_seconds == 12.5
+    assert args.child_timeout_seconds == 45.0
     assert args.command == ("python", "job.py")
+
+
+def test_cli_child_timeout_reaps_group_before_qwen_restore(tmp_path: Path) -> None:
+    module = _load_cli_module()
+    plist = _write_plist(tmp_path)
+    events: list[object] = []
+
+    result = module.main(
+        [
+            "--plist",
+            str(plist),
+            "--child-timeout-seconds",
+            "0.05",
+            "--",
+            sys.executable,
+            "-c",
+            "import time; time.sleep(60)",
+        ],
+        _guard_factory=_fake_guard(events),
+        _popen=subprocess.Popen,
+    )
+
+    assert result == 124
+    assert events[-1] == "guard-restored"
 
 
 @pytest.mark.parametrize("child_exit", (0, 7))

@@ -265,6 +265,7 @@ def construct_resident_model(
     config: dict[str, Any] | None = None,
     mx_module: Any | None = None,
     model_class_resolver: Callable[[dict[str, Any]], tuple[type, type]] | None = None,
+    switch_binder: Callable[[Any, Any], int] | None = None,
     strict: bool = True,
 ) -> ResidentModel:
     """Instantiate, bind, strictly load, and evaluate only resident parameters."""
@@ -292,7 +293,7 @@ def construct_resident_model(
     from .models.expert_mlx import bind_streamed_switches
 
     try:
-        bound = bind_streamed_switches(model, runtime)
+        bound = (switch_binder or bind_streamed_switches)(model, runtime)
     except Exception as exc:
         raise ResidentLoadError(
             f"could not bind streamed expert layers: {exc}"

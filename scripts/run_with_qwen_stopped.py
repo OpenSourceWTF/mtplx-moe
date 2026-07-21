@@ -21,6 +21,7 @@ GuardFactory = Callable[..., Any]
 PopenFactory = Callable[..., Any]
 _TERMINATION_GRACE_SECONDS = 0.25
 _GROUP_POLL_SECONDS = 0.01
+_CHILD_TIMEOUT_EXIT = 124
 
 
 def _positive_float(value: str) -> float:
@@ -43,6 +44,12 @@ def _parser() -> argparse.ArgumentParser:
         "--lock-timeout-seconds",
         type=_positive_float,
         default=None,
+    )
+    parser.add_argument(
+        "--child-timeout-seconds",
+        type=_positive_float,
+        default=None,
+        help="terminate the complete child process group after this many seconds",
     )
     return parser
 
@@ -144,7 +151,13 @@ class _SignalRelay:
         if self._group_exists(process_group_id):
             raise RuntimeError("child process group remained alive after SIGKILL")
 
-    def run_child(self, command: tuple[str, ...], *, popen: PopenFactory) -> int:
+    def run_child(
+        self,
+        command: tuple[str, ...],
+        *,
+        popen: PopenFactory,
+        timeout_seconds: float | None = None,
+    ) -> int:
         if self.received is not None:
             return 128 + self.received
         process = popen(command, start_new_session=True)
@@ -161,7 +174,20 @@ class _SignalRelay:
                         process.send_signal(self.received)
                     except ProcessLookupError:
                         pass
-            returncode = process.wait()
+            if timeout_seconds is None:
+                returncode = process.wait()
+            else:
+                deadline = time.monotonic() + float(timeout_seconds)
+                while True:
+                    observed = process.poll()
+                    if observed is not None:
+                        returncode = observed
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._terminate_process_group(process)
+                        return _CHILD_TIMEOUT_EXIT
+                    time.sleep(min(_GROUP_POLL_SECONDS, remaining))
         finally:
             self._terminate_process_group(process)
             self.process_group_id = None
@@ -188,7 +214,11 @@ def _run_guarded(
             lock_path=args.lock_path,
             lock_timeout_seconds=args.lock_timeout_seconds,
         ):
-            child_exit = relay.run_child(args.command, popen=popen)
+            child_exit = relay.run_child(
+                args.command,
+                popen=popen,
+                timeout_seconds=args.child_timeout_seconds,
+            )
         if relay.received is not None:
             return 128 + relay.received
     return child_exit

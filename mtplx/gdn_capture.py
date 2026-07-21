@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
 import os
 from typing import Any
 
@@ -1805,6 +1807,173 @@ def forward_with_gdn_capture(
         hidden = pre_norm if hidden_variant == "pre_norm" else post_norm
         return logits, hidden, captures
     return logits, captures
+
+
+@dataclass(frozen=True)
+class _StockCapturedLayerCommit:
+    layer_index: int
+    own_conv: Callable[[Any], Any]
+    own_gdn: Callable[[Any], Any]
+    replace_state: Callable[[Any, list[Any]], None]
+
+    def __call__(
+        self,
+        cache: list[Any],
+        captures: dict[int, dict[str, mx.array]],
+        capture_index: int,
+    ) -> None:
+        capture = captures[self.layer_index]
+        conv_state = self.own_conv(
+            capture["conv_states"][:, capture_index, :, :]
+        )
+        gdn_state = self.own_gdn(
+            capture["states"][:, capture_index, :, :, :]
+        )
+        self.replace_state(cache[self.layer_index], [conv_state, gdn_state])
+
+
+@dataclass(frozen=True)
+class CapturedPrefixCommitPlan:
+    """Construction-qualified direct commit for stock GDN captures.
+
+    Cache ownership, layer kinds, capture schema, shapes, dtypes, backend, and
+    detach policy are proven before installation.  Runtime keep/verify widths
+    genuinely vary (the final depth-3 cycle can be shorter), so commit uses
+    those two values directly without rechecking the installed invariants.
+    """
+
+    max_verified_tokens: int
+    _recurrent_commits: tuple[_StockCapturedLayerCommit, ...]
+    trimmable_layer_indices: tuple[int, ...]
+
+    @property
+    def recurrent_layer_indices(self) -> tuple[int, ...]:
+        return tuple(route.layer_index for route in self._recurrent_commits)
+
+    def commit(
+        self,
+        cache: list[Any],
+        captures: dict[int, dict[str, mx.array]],
+        *,
+        keep_tokens: int,
+        verified_tokens: int,
+    ) -> None:
+        capture_index = keep_tokens - 1
+        trim_tokens = verified_tokens - keep_tokens
+        for route in self._recurrent_commits:
+            route(cache, captures, capture_index)
+        for layer_index in self.trimmable_layer_indices:
+            cache[layer_index].trim(trim_tokens)
+
+
+def qualify_captured_prefix_commit(
+    cache: list[Any],
+    captures: dict[int, dict[str, mx.array]],
+    *,
+    max_verified_tokens: int,
+    capture_backend: str,
+    detach_components: set[str],
+) -> CapturedPrefixCommitPlan:
+    """Fail closed before measurement and return a direct stock committer."""
+
+    if capture_backend != "stock":
+        raise RuntimeError("direct commit requires the stock capture backend")
+    if detach_components:
+        raise RuntimeError("direct commit does not permit capture detach components")
+    if max_verified_tokens < 1:
+        raise RuntimeError("direct commit max_verified_tokens must be positive")
+    if captures.get("__final_only__"):
+        raise RuntimeError("direct commit cannot install from a final-only capture")
+
+    from .cache_state import replace_recurrent_cache_state
+
+    recurrent: list[_StockCapturedLayerCommit] = []
+    trimmable: list[int] = []
+    for layer_index, entry in enumerate(cache):
+        is_trimmable = getattr(entry, "is_trimmable", None)
+        if callable(is_trimmable) and bool(is_trimmable()):
+            if layer_index in captures:
+                raise RuntimeError(
+                    f"unexpected capture for trimmable layer {layer_index}"
+                )
+            if not callable(getattr(entry, "trim", None)):
+                raise RuntimeError(
+                    f"trimmable layer {layer_index} has no fixed trim operation"
+                )
+            trimmable.append(layer_index)
+            continue
+
+        state = getattr(entry, "state", None)
+        if not isinstance(state, (list, tuple)) or len(state) != 2:
+            raise RuntimeError(
+                f"cache layer {layer_index} is neither trimmable nor recurrent"
+            )
+        capture = captures.get(layer_index)
+        if capture is None:
+            raise RuntimeError(f"missing capture for recurrent layer {layer_index}")
+        if not isinstance(capture, dict) or set(capture) != {
+            "conv_states",
+            "states",
+        }:
+            raise RuntimeError(
+                f"recurrent layer {layer_index} does not use the stock capture schema"
+            )
+        if not all(isinstance(value, mx.array) for value in state):
+            raise RuntimeError(
+                f"recurrent cache layer {layer_index} has non-array state"
+            )
+        conv_states = capture["conv_states"]
+        gdn_states = capture["states"]
+        if not isinstance(conv_states, mx.array) or not isinstance(gdn_states, mx.array):
+            raise RuntimeError(
+                f"recurrent layer {layer_index} capture leaves are not arrays"
+            )
+        if len(conv_states.shape) != 4 or len(gdn_states.shape) != 5:
+            raise RuntimeError(
+                f"recurrent layer {layer_index} capture ranks are invalid"
+            )
+        if (
+            int(conv_states.shape[1]) != max_verified_tokens
+            or int(gdn_states.shape[1]) != max_verified_tokens
+        ):
+            raise RuntimeError(
+                f"recurrent layer {layer_index} capture width does not match "
+                f"{max_verified_tokens}"
+            )
+        if (
+            tuple(conv_states.shape[:1] + conv_states.shape[2:])
+            != tuple(state[0].shape)
+            or tuple(gdn_states.shape[:1] + gdn_states.shape[2:])
+            != tuple(state[1].shape)
+        ):
+            raise RuntimeError(
+                f"recurrent layer {layer_index} capture shapes do not match cache state"
+            )
+        if conv_states.dtype != state[0].dtype or gdn_states.dtype != state[1].dtype:
+            raise RuntimeError(
+                f"recurrent layer {layer_index} capture dtypes do not match cache state"
+            )
+        recurrent.append(
+            _StockCapturedLayerCommit(
+                layer_index=layer_index,
+                own_conv=mx.contiguous,
+                own_gdn=_contiguous_recurrent_leaf,
+                replace_state=replace_recurrent_cache_state,
+            )
+        )
+
+    capture_layers = {key for key in captures if isinstance(key, int)}
+    recurrent_layers = {route.layer_index for route in recurrent}
+    if capture_layers != recurrent_layers:
+        unexpected = sorted(capture_layers - recurrent_layers)
+        raise RuntimeError(f"unexpected recurrent capture layers: {unexpected}")
+    if not recurrent:
+        raise RuntimeError("direct commit requires at least one recurrent layer")
+    return CapturedPrefixCommitPlan(
+        max_verified_tokens=int(max_verified_tokens),
+        _recurrent_commits=tuple(recurrent),
+        trimmable_layer_indices=tuple(trimmable),
+    )
 
 
 def commit_captured_prefix(

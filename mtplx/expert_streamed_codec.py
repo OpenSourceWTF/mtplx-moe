@@ -65,7 +65,9 @@ class StreamedCodecError(ValueError):
 # ---------------------------------------------------------------- codec core
 
 
-def encode_record_payload(payload: bytes | bytearray, *, codec: str = "rans32x-v1") -> bytes:
+def encode_record_payload(
+    payload: bytes | bytearray, *, codec: str = "rans32x-v1"
+) -> bytes:
     """Encode one raw record payload into a self-describing rANS container.
 
     The payload is zero-padded up to the 32-lane interleave and encoded as a
@@ -88,7 +90,9 @@ def encode_record_payload(payload: bytes | bytearray, *, codec: str = "rans32x-v
         raise StreamedCodecError(f"cannot encode record: {exc}") from exc
 
 
-def decode_record_reference(blob, raw_length: int, *, codec: str = "rans32x-v1") -> bytes:
+def decode_record_reference(
+    blob, raw_length: int, *, codec: str = "rans32x-v1"
+) -> bytes:
     """Pure-numpy decode of a record container back to its raw payload.
 
     Mirrors what ``expert_rans_metal.decode_container`` produces on device;
@@ -289,9 +293,7 @@ def load_streamed_codec_manifest(path: Path | str) -> StreamedCodecManifest:
     try:
         obj = json.loads(path.read_text())
     except (OSError, ValueError) as exc:
-        raise StreamedCodecError(
-            f"cannot read streamed codec manifest: {exc}"
-        ) from exc
+        raise StreamedCodecError(f"cannot read streamed codec manifest: {exc}") from exc
     return StreamedCodecManifest.from_json(obj, path=path)
 
 
@@ -335,9 +337,7 @@ def validate_against_base(
         key = (record.layer, record.expert)
         codec_record = codec_map.get(key)
         if codec_record is None:
-            raise StreamedCodecError(
-                f"streamed codec sidecar is missing record {key}"
-            )
+            raise StreamedCodecError(f"streamed codec sidecar is missing record {key}")
         if codec_record.raw_length != record.logical_bytes:
             raise StreamedCodecError(
                 f"streamed codec record {key} raw_length "
@@ -354,6 +354,148 @@ def validate_against_base(
         )
 
 
+def merge_streamed_codec_shards(
+    shard_manifests: Iterable[Path | str],
+    root: Path | str,
+    *,
+    output_bin: Path | str,
+    output_manifest: Path | str,
+    base_manifest: ExpertManifest | None = None,
+) -> StreamedCodecManifest:
+    """Merge independently encoded codec shards into one validated sidecar.
+
+    Each shard starts its offsets at zero.  Its global base therefore must be
+    aligned before those offsets are rebased; plain concatenation is invalid
+    whenever the preceding shard length is not itself alignment-sized.  The
+    merge verifies every shard's declared size and digest while copying, then
+    publishes a freshly sized and hashed manifest only after the full record
+    map passes validation.
+    """
+
+    artifact_root = Path(root).resolve()
+    paths = [Path(path) for path in shard_manifests]
+    if not paths:
+        raise StreamedCodecError("no streamed codec shards supplied")
+    shards = [load_streamed_codec_manifest(path) for path in paths]
+    shards.sort(
+        key=lambda manifest: min(
+            (record.layer, record.expert) for record in manifest.records
+        )
+    )
+
+    first = shards[0]
+    identity = (
+        first.format,
+        first.model_key,
+        first.codec,
+        first.alignment,
+        first.expert_count,
+        first.base_manifest_sha256,
+    )
+    for shard in shards[1:]:
+        candidate = (
+            shard.format,
+            shard.model_key,
+            shard.codec,
+            shard.alignment,
+            shard.expert_count,
+            shard.base_manifest_sha256,
+        )
+        if candidate != identity:
+            raise StreamedCodecError("streamed codec shard metadata mismatch")
+
+    relative_output, final_path = _relative_output(artifact_root, Path(output_bin))
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path = Path(output_manifest)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    source_paths = [
+        resolve_artifact_member(artifact_root, shard.file) for shard in shards
+    ]
+    if any(source.resolve() == final_path.resolve() for source in source_paths):
+        raise StreamedCodecError("merged output must differ from every shard file")
+
+    partial = final_path.with_name(f".{final_path.name}.partial")
+    if partial.exists():
+        partial.unlink()
+    merged_digest = hashlib.sha256()
+    records: list[StreamedCodecRecord] = []
+    cursor = 0
+    zeroes = b"\x00" * (1024 * 1024)
+    try:
+        with partial.open("xb") as sink:
+            for shard, source_path in zip(shards, source_paths, strict=True):
+                actual_size = source_path.stat().st_size
+                if actual_size != shard.size:
+                    raise StreamedCodecError(
+                        f"streamed codec shard {source_path.name} size "
+                        f"{actual_size} != manifest size {shard.size}"
+                    )
+                shard_base = _align_up(cursor, first.alignment)
+                padding = shard_base - cursor
+                while padding:
+                    chunk = zeroes[: min(padding, len(zeroes))]
+                    sink.write(chunk)
+                    merged_digest.update(chunk)
+                    padding -= len(chunk)
+
+                shard_digest = hashlib.sha256()
+                copied = 0
+                with source_path.open("rb") as source:
+                    while chunk := source.read(8 * 1024 * 1024):
+                        sink.write(chunk)
+                        shard_digest.update(chunk)
+                        merged_digest.update(chunk)
+                        copied += len(chunk)
+                if copied != shard.size or shard_digest.hexdigest() != shard.sha256:
+                    raise StreamedCodecError(
+                        f"streamed codec shard {source_path.name} failed integrity"
+                    )
+                records.extend(
+                    replace(record, offset=shard_base + record.offset)
+                    for record in shard.records
+                )
+                cursor = shard_base + shard.size
+            sink.flush()
+            os.fsync(sink.fileno())
+
+        manifest = StreamedCodecManifest(
+            format=first.format,
+            model_key=first.model_key,
+            codec=first.codec,
+            file=relative_output,
+            alignment=first.alignment,
+            expert_count=first.expert_count,
+            base_manifest_sha256=first.base_manifest_sha256,
+            size=cursor,
+            sha256=merged_digest.hexdigest(),
+            records=tuple(records),
+            path=manifest_path,
+        )
+        manifest.validate()
+        if base_manifest is not None:
+            validate_against_base(manifest, base_manifest)
+        os.replace(partial, final_path)
+        directory_fd = os.open(final_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+        manifest_partial = manifest_path.with_name(f".{manifest_path.name}.partial")
+        save_streamed_codec_manifest(manifest, manifest_partial)
+        os.replace(manifest_partial, manifest_path)
+        directory_fd = os.open(manifest_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        if partial.exists():
+            partial.unlink()
+        raise
+    return manifest
+
+
 # ---------------------------------------------------------------- converter
 
 
@@ -367,7 +509,9 @@ def _relative_output(root: Path, output: Path) -> tuple[str, Path]:
             "streamed codec sidecar must be created inside the artifact root"
         ) from exc
     relative = (relative_parent / output.name).as_posix()
-    return _safe_relative_name(relative, label="streamed codec output"), parent / output.name
+    return _safe_relative_name(
+        relative, label="streamed codec output"
+    ), parent / output.name
 
 
 def write_streamed_rans_sidecar(
@@ -543,6 +687,7 @@ __all__ = [
     "load_streamed_codec_manifest",
     "save_streamed_codec_manifest",
     "validate_against_base",
+    "merge_streamed_codec_shards",
     "write_streamed_rans_sidecar",
     "resolve_artifact_member",
 ]

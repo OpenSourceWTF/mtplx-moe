@@ -518,9 +518,11 @@ def test_streamed_mtp_dispatch_and_precision_matrix() -> None:
     assert _streamed_mtp_backend("hy3-expert-q2", "bf16") == "hy3"
     assert _streamed_mtp_backend("glm52-expert-q2", "bf16") == "glm52"
     assert _streamed_mtp_backend("glm52-q4", "bf16") == "glm52"
+    assert _streamed_mtp_backend("glm52-expert-q1t", "bf16") == "glm52"
     # Issue #100: the Q4 head sibling is selectable for both GLM lanes.
     assert _streamed_mtp_backend("glm52-expert-q2", "q4") == "glm52"
     assert _streamed_mtp_backend("glm52-q4", "q4") == "glm52"
+    assert _streamed_mtp_backend("glm52-expert-q1t", "q4") == "glm52"
 
     with pytest.raises(RuntimeError, match="BF16"):
         _streamed_mtp_backend("hy3-expert-q2", "q4")

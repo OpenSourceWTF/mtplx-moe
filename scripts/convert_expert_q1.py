@@ -68,10 +68,21 @@ def main() -> int:
         help="Re-encode this many written records and require bitwise "
         "equality (0 disables).",
     )
+    parser.add_argument(
+        "--streamed-model-key",
+        default=None,
+        help="After a complete burn, validate OUTPUT_DIR as an assembled "
+        "resident checkpoint for this q1 model key and write its authoritative "
+        "expert-manifest.json for runtime/rANS consumption.",
+    )
     args = parser.parse_args()
 
-    from mtplx.expert_manifest import load_expert_manifest
-    from mtplx.expert_q1 import convert_expert_q1, verify_q1_against_source
+    from mtplx.expert_manifest import load_expert_manifest, save_expert_manifest
+    from mtplx.expert_q1 import (
+        build_streamed_expert_manifest,
+        convert_expert_q1,
+        verify_q1_against_source,
+    )
     from mtplx.expert_streaming_models import get_model_spec
 
     manifest_path = args.manifest or args.source_root / "expert-manifest.json"
@@ -100,6 +111,14 @@ def main() -> int:
         f"({source_bytes / max(total_bytes, 1):.3f}x smaller than source), "
         f"{elapsed:.1f}s -> {manifest.bin_path()}"
     )
+    if args.streamed_model_key is not None:
+        streamed_spec = get_model_spec(args.streamed_model_key)
+        streamed = build_streamed_expert_manifest(
+            args.output_dir, manifest, streamed_spec
+        )
+        streamed_path = args.output_dir / "expert-manifest.json"
+        save_expert_manifest(streamed, streamed_path)
+        print(f"authoritative streamed manifest -> {streamed_path}")
     if args.verify_sample:
         for layer, expert in verify_q1_against_source(
             manifest,
