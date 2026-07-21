@@ -571,6 +571,7 @@ def test_streamed_codec_survives_to_runtime_config(tmp_path: Path) -> None:
     assert calls.configs[0]["streamed_codec_verify"] is False
 
 
+@pytest.mark.skip(reason="fused-rANS route closed 2026-07-20")
 def test_glm52_q1t_fused_rans_uses_existing_runtime_settings() -> None:
     module = _load_module()
     parser = module.build_parser()
@@ -606,6 +607,7 @@ def test_glm52_q1t_fused_rans_uses_existing_runtime_settings() -> None:
     assert options["streamed_codec"] == "none"
 
 
+@pytest.mark.skip(reason="fused-rANS route closed 2026-07-20")
 def test_glm52_q1t_fused_rans_settings_survive_to_runtime_config(
     tmp_path: Path,
 ) -> None:

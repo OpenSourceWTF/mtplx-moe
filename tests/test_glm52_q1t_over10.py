@@ -8,6 +8,12 @@ from mtplx.expert_runtime import ExpertStreamingConfig
 from mtplx.glm52_q1t_over10 import validate_glm52_q1t_fused_rans_config
 
 
+# The fused-rANS route was closed 2026-07-20 (kernel loses to the stock control,
+# roofline below goal). These tests construct a live fused-rANS ExpertStreamingConfig,
+# which the stock config gate no longer accepts.
+pytestmark = pytest.mark.skip(reason="fused-rANS route closed 2026-07-20")
+
+
 GIB = 1024**3
 
 

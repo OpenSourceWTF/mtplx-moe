@@ -16,6 +16,13 @@ from mtplx.expert_runtime import (
 from mtplx.expert_streaming_models import GLM52_EXPERT_Q1T
 
 
+# The fused-rANS route was closed 2026-07-20 (kernel loses to the stock control,
+# roofline below goal). Its construction wiring (fused-rANS slot layout / codec
+# acceptance and the runtime lane openers) was unwired from the stock paths, so
+# every construction-route assertion below requires live wiring that no longer exists.
+pytestmark = pytest.mark.skip(reason="fused-rANS route closed 2026-07-20")
+
+
 def _strict_fused_manifest(tmp_path: Path):
     from mtplx.expert_rans import LANES, RANS_GUARD_BYTES, _HEADER_DTYPE
     from mtplx.glm52_q1t_over10 import GLM52_Q1T_BASE_MANIFEST_SHA256

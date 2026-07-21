@@ -357,7 +357,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-scope", choices=("layer", "global"), default="layer")
     parser.add_argument(
         "--slot-layout",
-        choices=("direct-slots", "component-banks", "metal-mmap", "fused-rans"),
+        choices=("direct-slots", "component-banks", "metal-mmap"),
         default="component-banks",
     )
     parser.add_argument("--transient-slots", type=_nonnegative_int, default=8)
@@ -521,12 +521,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--banked-codec",
         default="none",
-        choices=["none", "rans32x-v1", "rans32x-uniform-packed-v1"],
+        choices=["none", "rans32x-v1"],
         help=(
             "Lossless codec of the banked sidecar. 'rans32x-v1' stores each "
             "component bank as a static order-0 byte-rANS container that the "
-            "in-kernel decoder rebuilds at load (issue #51 C7); the uniform-"
-            "packed codec is restricted to the GLM Q1T fused-rANS lane."
+            "in-kernel decoder rebuilds at load (issue #51 C7)."
         ),
     )
     parser.add_argument(
