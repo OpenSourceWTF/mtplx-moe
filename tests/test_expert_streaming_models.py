@@ -216,8 +216,8 @@ def test_existing_descriptors_are_unchanged_by_glm52_expert_q2_registry_expansio
         # spec fields now; a digest change without a matching field-set
         # change is the drift this test exists to catch.
         "hy3-q4": "bc121154d4d6286e9499995e06632e10007ef5c9b343254018a60bff59ef344c",
-        # 2026-07-21: island_pin_order shared across hy3 banks (a3300f0)
-        "hy3-expert-only-q4": "831c990eaa6b87c0ff5fe434a8d79ee91d198501c1dfe3b38220808af8d7ad40",
+        # hy3-expert-only-q4 keeps its ORIGINAL digest: pin order stays empty (census-driven)
+        "hy3-expert-only-q4": "d6ac448f353a988d77c27b5e81d6cb7b9de2eba3c93b67bfd0efa35729473140",
         "hy3-expert-q2": "286bc48306801005db9b32d96362ac2553bbe4ce5e53112503b1a12c9a6a78ea",
         "glm52-q4": "6372e17bf28658526de0b2150cda8fad486f077849b5d0c5be23ff19e6b770b1",
     }

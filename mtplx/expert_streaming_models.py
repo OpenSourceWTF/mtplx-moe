@@ -366,9 +366,10 @@ HY3_EXPERT_ONLY_Q4 = ExpertStreamingModelSpec(
     kv_bytes_per_token=327_680,
     mtp_layer_index=80,
     mtp_included=False,
-    # 2026-07-21: shared pin order so --island-layer-count resolves for the
-    # q4 anchor benchmarks (see _HY3_ROUTED_PIN_ORDER rationale).
-    island_pin_order=_HY3_ROUTED_PIN_ORDER,
+    # island_pin_order deliberately EMPTY: this bank has its own measured
+    # census (<root>/island-placement.json, issue #98) whose layer_pin_order
+    # differs from the q2-derived _HY3_ROUTED_PIN_ORDER — count-based island
+    # selection must resolve from the census, not a borrowed static order.
 )
 
 
