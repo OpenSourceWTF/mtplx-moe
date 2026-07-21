@@ -661,6 +661,15 @@ def _load_impl(
                         expert_streaming_config.resident_quant,
                     )
                 )
+            if streaming_spec.is_mixed_official:
+                # Mixed-official has no uniform record size; the preflight gate
+                # must see the same manifest-derived per-layer sizes as open()
+                # (issue #51 M2, D2).
+                from .expert_manifest import load_expert_manifest
+
+                preflight_plan_kwargs["layer_record_bytes"] = load_expert_manifest(
+                    expert_manifest
+                ).record_bytes_by_layer()
             streaming_plan = expert_streaming_config.memory_plan(
                 streaming_spec,
                 **preflight_plan_kwargs,

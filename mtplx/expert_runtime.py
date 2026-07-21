@@ -37,6 +37,7 @@ from .expert_streaming import (
     RoutingPhase,
 )
 from .expert_streaming_models import (
+    MIXED_OFFICIAL_CODEC,
     ExpertMemoryPlan,
     ExpertStreamingModelSpec,
     get_model_spec,
@@ -487,6 +488,7 @@ class ExpertStreamingConfig:
         *,
         additional_resident_bytes: int = 0,
         resident_discount_bytes: int = 0,
+        layer_record_bytes: "Mapping[int, int] | None" = None,
     ) -> ExpertMemoryPlan:
         if self.island_layer_count is not None and not self.island_layers:
             raise ExpertStreamingConfigurationError(
@@ -524,6 +526,7 @@ class ExpertStreamingConfig:
             prefetch_slots_per_layer=self.prefetch_slots,
             miss_shadow=self.miss_shadow,
             miss_shadow_layers=self.miss_shadow_layers,
+            layer_record_bytes=layer_record_bytes,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1556,6 +1559,20 @@ class ExpertStreamingRuntime:
         self.memory_cap_report = memory_cap_report
         self.integrity_report = integrity_report
         self._pipeline_ledger = pipeline_ledger
+        # Mixed-official (issue #51, M2): per-layer record bytes for telemetry
+        # accounting, since ``spec.expert_record_bytes`` raises for mixed. The
+        # representative (exemplar) value stands in where a single scalar is
+        # needed for a coarse aggregate.
+        self._per_layer_record_bytes = (
+            manifest.record_bytes_by_layer()
+            if spec.is_mixed_official
+            else None
+        )
+        self._representative_record_bytes = (
+            self._per_layer_record_bytes[spec.routed_layer_indices[0]]
+            if self._per_layer_record_bytes is not None
+            else spec.expert_record_bytes
+        )
         self.counters = CacheCounters()
         self._layer_counters = {
             layer: CacheCounters() for layer in spec.routed_layer_indices
@@ -1735,7 +1752,9 @@ class ExpertStreamingRuntime:
                 "; ".join(profile_violations)
             )
         config = resolve_island_placement(config, artifact_root, spec=model_spec)
-        if getattr(model_spec, "expert_codec", "affine") != "affine":
+        streamed_codec_spec = getattr(model_spec, "expert_codec", "affine")
+        mixed_official = streamed_codec_spec == MIXED_OFFICIAL_CODEC
+        if streamed_codec_spec != "affine":
             # q1 (shadow-codec) artifacts (issue #51): records are packed
             # sign/trit words plus one bf16 scale, executed through
             # shadow_gather_mm. Only the component-banks streamed dispatch
@@ -1744,22 +1763,37 @@ class ExpertStreamingRuntime:
             # would silently misread the record, so reject them loudly.
             if config.slot_layout != "component-banks":
                 raise ExpertStreamingConfigurationError(
-                    f"{model_spec.key} is a q1 ({model_spec.expert_codec}) "
-                    "shadow-codec artifact; it requires the component-banks "
-                    f"slot layout, not {config.slot_layout!r}"
+                    f"{model_spec.key} is a {model_spec.expert_codec} streamed "
+                    "artifact; it requires the component-banks slot layout, "
+                    f"not {config.slot_layout!r}"
                 )
             if config.miss_shadow is not None:
                 raise ExpertStreamingConfigurationError(
                     "miss_shadow shadows an exact affine artifact with a "
-                    f"low-precision bank; a q1 ({model_spec.expert_codec}) "
-                    "artifact is already a shadow codec, so shadowing it is "
-                    "nonsense — set miss_shadow to None on a q1-primary spec"
+                    f"low-precision bank; a {model_spec.expert_codec} artifact "
+                    "is already low precision, so shadowing it is nonsense — "
+                    "set miss_shadow to None"
                 )
             if config.island_layers or config.mmap_island_layers:
                 raise ExpertStreamingConfigurationError(
                     "dense-island execution dispatches through the affine "
-                    "gather kernel; q1 shadow-codec artifacts cannot serve "
-                    "island or mmap-island layers"
+                    f"gather kernel; {model_spec.expert_codec} artifacts cannot "
+                    "serve island or mmap-island layers"
+                )
+        if mixed_official:
+            # Mixed-official MVP serving lane (issue #51 M2, D6): the
+            # component-banks lane with per-layer banks only. The prefetch ring
+            # and global cache scope are perf lanes not yet wired for
+            # non-uniform records; reject them loudly so E1 runs the exact path.
+            if config.prefetch_slots:
+                raise ExpertStreamingConfigurationError(
+                    "mixed-official banks do not serve the prefetch ring in the "
+                    "MVP lane; set prefetch_slots to 0"
+                )
+            if config.cache_scope != "layer":
+                raise ExpertStreamingConfigurationError(
+                    "mixed-official banks require cache_scope 'layer' (per-layer "
+                    "banks); global scope shares slots across differing records"
                 )
         manifest = load_expert_manifest(manifest_path)
         cls._validate_manifest_identity(manifest, model_spec)
@@ -1819,6 +1853,9 @@ class ExpertStreamingRuntime:
             additional_resident_bytes=additional_resident_bytes,
             resident_discount_bytes=resident_quant_plan_discount(
                 manifest, config.resident_quant
+            ),
+            layer_record_bytes=(
+                manifest.record_bytes_by_layer() if mixed_official else None
             ),
         )
         if not plan.fits_fixed:
@@ -2190,18 +2227,21 @@ class ExpertStreamingRuntime:
         with self._counter_lock:
             self._observe_plan_unlocked(layer, plan)
 
+    def _record_bytes_for_layer(self, layer: int) -> int:
+        """Streamed record bytes for a routed layer (per-layer for mixed)."""
+
+        if self._per_layer_record_bytes is not None:
+            return self._per_layer_record_bytes[int(layer)]
+        return self.spec.expert_record_bytes
+
     def _observe_plan_unlocked(self, layer: int, plan: RoutePlan) -> None:
-        self.counters.observe(
-            plan,
-            expert_record_bytes=self.spec.expert_record_bytes,
-        )
-        self._layer_counters[layer].observe(
-            plan,
-            expert_record_bytes=self.spec.expert_record_bytes,
-        )
+        # This plan is for one layer, so the layer's record size is the correct
+        # byte weight for all three counter scopes (exact for mixed too).
+        record_bytes = self._record_bytes_for_layer(layer)
+        self.counters.observe(plan, expert_record_bytes=record_bytes)
+        self._layer_counters[layer].observe(plan, expert_record_bytes=record_bytes)
         self._phase_counters[plan.phase].observe(
-            plan,
-            expert_record_bytes=self.spec.expert_record_bytes,
+            plan, expert_record_bytes=record_bytes
         )
 
     def _observe_incremental_unlocked(self, *, routes: int, parts: int) -> None:
@@ -3111,7 +3151,7 @@ class ExpertStreamingRuntime:
             "fraction": self.config.speculative_io_fraction,
             "max_concurrent_reads": self._prefetch_max_reads,
             "max_inflight_bytes": (
-                self._prefetch_max_reads * self.spec.expert_record_bytes
+                self._prefetch_max_reads * self._representative_record_bytes
             ),
         }
         if self._pipeline_ledger is not None:
@@ -3146,7 +3186,7 @@ class ExpertStreamingRuntime:
         snapshot = {
             "model_key": self.spec.key,
             "quant_bits": self.spec.quant_bits,
-            "expert_record_bytes": self.spec.expert_record_bytes,
+            "expert_record_bytes": self._representative_record_bytes,
             "mlx_memory": mlx_memory_telemetry(mx_module),
             "cache": cache,
             "cache_by_layer": cache_by_layer,

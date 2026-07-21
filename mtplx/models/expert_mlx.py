@@ -27,7 +27,16 @@ from mtplx.expert_runtime import ExpertStreamingRuntime
 from mtplx.expert_manifest import ExpertManifest, ExpertRecord
 from mtplx.expert_slots import ExpertSlotBinding, ReadyRoute
 from mtplx.expert_streaming import RoutingPhase
-from mtplx.expert_streaming_models import ExpertMemoryPlan, ExpertStreamingModelSpec
+from mtplx.expert_streaming_models import (
+    MIXED_OFFICIAL_CODEC,
+    ExpertMemoryPlan,
+    ExpertStreamingModelSpec,
+)
+
+# Mixed-official (issue #51, M2) per-tier affine bit widths: gate/up is 2-bit
+# affine when the layer's tier is "affine2"; down is always 3-bit affine.
+_MIXED_AFFINE_BITS = {"affine2": 2, "affine3": 3}
+_MIXED_DOWN_BITS = 3
 from mtplx.mmap_mlx import mmap_u32
 
 
@@ -1041,100 +1050,139 @@ def make_mlx_component_bank_allocator(
         )
 
     expert_codec = getattr(spec, "expert_codec", "affine")
-    expected_signature: list[tuple[str, str, tuple[int, ...], int]] = []
-    for projection in ("gate_proj", "up_proj", "down_proj"):
-        output_size = (
-            spec.expert_hidden_size
-            if projection in {"gate_proj", "up_proj"}
-            else spec.hidden_size
-        )
-        input_size = (
-            spec.hidden_size
-            if projection in {"gate_proj", "up_proj"}
-            else spec.expert_hidden_size
-        )
-        if expert_codec != "affine":
-            # Shadow-codec (q1) records: packed sign/trit words plus one
-            # bf16-bit scale per g64 group, no bias leaf (gate 3 of
-            # research/streamed-q1-codec-gap-analysis.md).
-            from mtplx.expert_shadow import (
-                SHADOW_GROUP,
-                _B1_WORDS_PER_GROUP,
-                _T158_BYTES_PER_GROUP,
-            )
+    is_mixed = expert_codec == MIXED_OFFICIAL_CODEC
+    routed_layers = set(spec.routed_layer_indices)
+    exemplar_layer = spec.routed_layer_indices[0]
 
-            groups = input_size // SHADOW_GROUP
-            if expert_codec == "b1":
-                packed_dtype = "U32"
-                packed_shape = (output_size, groups * _B1_WORDS_PER_GROUP)
-                packed_length = output_size * groups * _B1_WORDS_PER_GROUP * 4
-            else:
-                packed_dtype = "U8"
-                packed_shape = (output_size, groups * _T158_BYTES_PER_GROUP)
-                packed_length = output_size * groups * _T158_BYTES_PER_GROUP
+    if is_mixed:
+        # Per-layer bank geometry (D3): every routed layer has its OWN expected
+        # signature, derived from that layer's tier via the single source of
+        # truth (plan_record_segments), and enforced within the layer. There is
+        # no cross-layer exemplar because t158 and affine2 layers differ.
+        from mtplx.expert_mixed_official import plan_record_segments
+
+        mixed_dims = {
+            "gate_proj": (spec.expert_hidden_size, spec.hidden_size),
+            "up_proj": (spec.expert_hidden_size, spec.hidden_size),
+            "down_proj": (spec.hidden_size, spec.expert_hidden_size),
+        }
+        layer_signatures: dict[int, tuple[tuple[Any, ...], ...]] = {}
+        for layer in spec.routed_layer_indices:
+            gate_up_tier, down_tier = manifest.mixed_tier_for_layer(layer)
+            planned = plan_record_segments(
+                {"gate_up": gate_up_tier, "down": down_tier}, mixed_dims
+            )
+            layer_signatures[layer] = tuple(
+                (seg.component, seg.dtype, tuple(seg.shape), seg.length)
+                for seg in planned
+            )
+            if component_signature(record_by_layer[layer]) != layer_signatures[layer]:
+                raise ValueError(
+                    f"manifest component geometry for layer {layer} does not "
+                    "match the mixed-official tier layout"
+                )
+        for record in manifest.records:
+            if (
+                record.layer in routed_layers
+                and component_signature(record) != layer_signatures[record.layer]
+            ):
+                raise ValueError(
+                    "routed-layer component geometry differs for expert "
+                    f"({record.layer}, {record.expert}) from its layer's tier"
+                )
+    else:
+        expected_signature: list[tuple[str, str, tuple[int, ...], int]] = []
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            output_size = (
+                spec.expert_hidden_size
+                if projection in {"gate_proj", "up_proj"}
+                else spec.hidden_size
+            )
+            input_size = (
+                spec.hidden_size
+                if projection in {"gate_proj", "up_proj"}
+                else spec.expert_hidden_size
+            )
+            if expert_codec != "affine":
+                # Shadow-codec (q1) records: packed sign/trit words plus one
+                # bf16-bit scale per g64 group, no bias leaf (gate 3 of
+                # research/streamed-q1-codec-gap-analysis.md).
+                from mtplx.expert_shadow import (
+                    SHADOW_GROUP,
+                    _B1_WORDS_PER_GROUP,
+                    _T158_BYTES_PER_GROUP,
+                )
+
+                groups = input_size // SHADOW_GROUP
+                if expert_codec == "b1":
+                    packed_dtype = "U32"
+                    packed_shape = (output_size, groups * _B1_WORDS_PER_GROUP)
+                    packed_length = output_size * groups * _B1_WORDS_PER_GROUP * 4
+                else:
+                    packed_dtype = "U8"
+                    packed_shape = (output_size, groups * _T158_BYTES_PER_GROUP)
+                    packed_length = output_size * groups * _T158_BYTES_PER_GROUP
+                expected_signature.extend(
+                    (
+                        (
+                            f"{projection}.packed",
+                            packed_dtype,
+                            packed_shape,
+                            packed_length,
+                        ),
+                        (
+                            f"{projection}.scales",
+                            "U16",
+                            (output_size, groups),
+                            output_size * groups * 2,
+                        ),
+                    )
+                )
+                continue
+            weight_shape = (output_size, input_size * spec.quant_bits // 32)
+            parameter_shape = (output_size, input_size // spec.quant_group_size)
             expected_signature.extend(
                 (
                     (
-                        f"{projection}.packed",
-                        packed_dtype,
-                        packed_shape,
-                        packed_length,
+                        f"{projection}.weight",
+                        "U32",
+                        weight_shape,
+                        output_size * input_size * spec.quant_bits // 8,
                     ),
                     (
                         f"{projection}.scales",
-                        "U16",
-                        (output_size, groups),
-                        output_size * groups * 2,
+                        "BF16",
+                        parameter_shape,
+                        output_size
+                        * (input_size // spec.quant_group_size)
+                        * spec.quant_parameter_bytes,
+                    ),
+                    (
+                        f"{projection}.biases",
+                        "BF16",
+                        parameter_shape,
+                        output_size
+                        * (input_size // spec.quant_group_size)
+                        * spec.quant_parameter_bytes,
                     ),
                 )
             )
-            continue
-        weight_shape = (output_size, input_size * spec.quant_bits // 32)
-        parameter_shape = (output_size, input_size // spec.quant_group_size)
-        expected_signature.extend(
-            (
-                (
-                    f"{projection}.weight",
-                    "U32",
-                    weight_shape,
-                    output_size * input_size * spec.quant_bits // 8,
-                ),
-                (
-                    f"{projection}.scales",
-                    "BF16",
-                    parameter_shape,
-                    output_size
-                    * (input_size // spec.quant_group_size)
-                    * spec.quant_parameter_bytes,
-                ),
-                (
-                    f"{projection}.biases",
-                    "BF16",
-                    parameter_shape,
-                    output_size
-                    * (input_size // spec.quant_group_size)
-                    * spec.quant_parameter_bytes,
-                ),
-            )
-        )
 
-    exemplar_layer = spec.routed_layer_indices[0]
-    exemplar_signature = component_signature(record_by_layer[exemplar_layer])
-    if exemplar_signature != tuple(expected_signature):
-        raise ValueError(
-            "manifest component geometry does not match the model descriptor"
-        )
-    routed_layers = set(spec.routed_layer_indices)
-    for record in manifest.records:
-        if (
-            record.layer in routed_layers
-            and component_signature(record) != exemplar_signature
-        ):
+        exemplar_signature = component_signature(record_by_layer[exemplar_layer])
+        if exemplar_signature != tuple(expected_signature):
             raise ValueError(
-                "routed-layer component geometry differs for "
-                f"expert ({record.layer}, {record.expert}) from canonical "
-                f"layer {exemplar_layer}"
+                "manifest component geometry does not match the model descriptor"
             )
+        for record in manifest.records:
+            if (
+                record.layer in routed_layers
+                and component_signature(record) != exemplar_signature
+            ):
+                raise ValueError(
+                    "routed-layer component geometry differs for "
+                    f"expert ({record.layer}, {record.expert}) from canonical "
+                    f"layer {exemplar_layer}"
+                )
 
     banks: dict[tuple[str, int], MlxComponentBank] = {}
     slots: dict[str, MlxComponentSlot] = {}
@@ -1166,8 +1214,9 @@ def make_mlx_component_bank_allocator(
         return bank
 
     def allocate(size: int, label: str) -> MlxComponentSlot:
-        if int(size) != spec.expert_record_bytes:
-            raise ValueError("slot allocator size differs from model descriptor")
+        # The per-record byte size is validated against the resolved bank below:
+        # for mixed banks it is the layer's (or transient exemplar's) record
+        # size, not a single uniform ``spec.expert_record_bytes`` (which raises).
         layer_persistent = _LAYER_PERSISTENT_LABEL.fullmatch(label)
         global_persistent = _GLOBAL_PERSISTENT_LABEL.fullmatch(label)
         global_transient = _GLOBAL_TRANSIENT_LABEL.fullmatch(label)
@@ -1218,6 +1267,8 @@ def make_mlx_component_bank_allocator(
             raise ValueError(f"unknown expert slot label {label!r}")
         else:
             raise ValueError(f"unknown expert slot label {label!r}")
+        if int(size) != bank.record_bytes:
+            raise ValueError("slot allocator size differs from the bank record")
         if label in slots:
             raise ValueError(f"slot {label} was allocated twice")
         slot = MlxComponentSlot(bank, slot_index, label=label)
@@ -1411,6 +1462,96 @@ def _shadow_gather_component_bank(
     return projection(swiglu(gate, up), "down_proj")
 
 
+def _run_component_bank_mixed(
+    x: mx.array,
+    bindings: tuple[ExpertSlotBinding, ...],
+    *,
+    gate_up_tier: str,
+    group_size: int,
+) -> mx.array:
+    """Execute a mixed-official (issue #51, M2) component-bank wave.
+
+    Per-projection-group dispatch (D4): the layer's gate/up pair runs through
+    ``shadow_gather_mm`` (t158-tier) or ``gather_qmm(bits=2)`` (affine2-tier),
+    and ``down`` always runs through ``gather_qmm(bits=3)`` — all in one pass,
+    against one shared per-layer bank. Eager-only, like the shadow lane.
+    """
+
+    if not bindings or int(x.shape[0]) != len(bindings):
+        raise ValueError(
+            "component-bank inputs and bindings must be non-empty and aligned"
+        )
+    bank = getattr(bindings[0].buffer, "bank", None)
+    if bank is None or any(
+        getattr(binding.buffer, "bank", None) is not bank for binding in bindings
+    ):
+        raise ValueError("component-bank execution requires one shared bank")
+    slot_rows = [int(binding.buffer.bank_index) for binding in bindings]
+    slot_rows_1d = mx.array(slot_rows, dtype=mx.int32)
+    slot_indices_2d = mx.array(slot_rows, dtype=mx.int32).reshape((-1, 1))
+    return _gather_component_bank_mixed(
+        x,
+        bank,
+        slot_indices_2d,
+        slot_rows_1d,
+        gate_up_tier=gate_up_tier,
+        group_size=group_size,
+    )
+
+
+def _gather_component_bank_mixed(
+    x: mx.array,
+    bank: MlxComponentBank,
+    slot_indices_2d: mx.array,
+    slot_rows_1d: mx.array,
+    *,
+    gate_up_tier: str,
+    group_size: int,
+) -> mx.array:
+    """Row-gathered mixed-tier expert MLP against one shared per-layer bank."""
+
+    from mtplx.kernels.shadow_gather import shadow_gather_mm
+
+    rows = int(x.shape[0])
+    in_dim = int(x.shape[-1])
+
+    def affine(values: mx.array, projection: str, bits: int) -> mx.array:
+        selected = values.reshape((rows, 1, 1, int(values.shape[-1])))
+        out = mx.gather_qmm(
+            selected,
+            bank.arrays[f"{projection}.weight"],
+            bank.arrays[f"{projection}.scales"],
+            bank.arrays[f"{projection}.biases"],
+            rhs_indices=slot_indices_2d,
+            transpose=True,
+            group_size=group_size,
+            bits=bits,
+            mode="affine",
+        )
+        return out.reshape((rows, int(out.shape[-1])))
+
+    def shadow(values: mx.array, projection: str) -> mx.array:
+        return shadow_gather_mm(
+            values,
+            slot_rows_1d,
+            bank.arrays[f"{projection}.packed"],
+            bank.arrays[f"{projection}.scales"],
+            codec="t158",
+        )
+
+    if gate_up_tier == "t158":
+        gate = shadow(x.reshape((rows, in_dim)), "gate_proj")
+        up = shadow(x.reshape((rows, in_dim)), "up_proj")
+    elif gate_up_tier == "affine2":
+        bits = _MIXED_AFFINE_BITS["affine2"]
+        gate = affine(x, "gate_proj", bits)
+        up = affine(x, "up_proj", bits)
+    else:  # pragma: no cover - guarded by the manifest tier contract
+        raise ValueError(f"unsupported mixed gate/up tier {gate_up_tier!r}")
+    hidden = swiglu(gate, up)
+    return affine(hidden, "down_proj", _MIXED_DOWN_BITS)
+
+
 def _run_shadow_bank(
     x: mx.array,
     expert_rows: mx.array,
@@ -1542,6 +1683,15 @@ class HotExpertSwitchGLU(nn.Module):
         # path is identical either way — only the component-bank dispatch
         # differs (gate 4 of the gap analysis).
         self.codec = getattr(runtime.spec, "expert_codec", "affine")
+        # Mixed-official (issue #51, M2): resolve this layer's (gate_up, down)
+        # tier from the loaded manifest's layer_tier_map — never the spec (D1).
+        # Fail closed if the layer has no tier entry.
+        self._gate_up_tier: str | None = None
+        self._down_tier: str | None = None
+        if self.codec == MIXED_OFFICIAL_CODEC:
+            self._gate_up_tier, self._down_tier = (
+                runtime.manifest.mixed_tier_for_layer(self.layer_index)
+            )
         # Shadow miss fallback (issue #51): when the runtime opened with
         # miss_shadow, decode misses on this streamed layer are served from
         # a resident low-precision bank instead of waiting on SSD.
@@ -1563,6 +1713,14 @@ class HotExpertSwitchGLU(nn.Module):
                 bindings,
                 group_size=self.group_size,
                 bits=self.bits,
+            )
+        if self.codec == MIXED_OFFICIAL_CODEC:
+            assert self._gate_up_tier is not None
+            return _run_component_bank_mixed(
+                selected,
+                bindings,
+                gate_up_tier=self._gate_up_tier,
+                group_size=self.group_size,
             )
         return _run_component_bank_shadow(selected, bindings, codec=self.codec)
 

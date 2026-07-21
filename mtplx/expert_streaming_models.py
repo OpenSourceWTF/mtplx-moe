@@ -13,10 +13,20 @@ allocate MLX arrays.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from operator import index
 
 from mtplx.expert_shadow import SHADOW_CODECS, shadow_record_bytes
+
+# Mixed-precision "official recipe" streamed codec (issue #51, M2). A spec with
+# this codec has NO single uniform expert record size: every routed layer's
+# gate/up pair is either t158 or 2-bit affine and its down is 3-bit affine, on a
+# per-layer schedule that lives only in the loaded manifest's layer_tier_map
+# (never on the spec). ``expert_record_bytes`` therefore RAISES for these specs;
+# the runtime feeds ``plan_expert_memory`` manifest-derived per-layer sizes. The
+# literal must equal ``mtplx.expert_mixed_official.MIXED_MODE``.
+MIXED_OFFICIAL_CODEC = "mixed-official-v1"
 
 
 # Load-time resident quantization (group 64 affine over BF16): kept bytes
@@ -162,13 +172,28 @@ class ExpertStreamingModelSpec:
             raise ValueError("full indexer layers must be inside the target model")
         if tuple(sorted(set(self.full_indexer_layers))) != self.full_indexer_layers:
             raise ValueError("full indexer layers must be sorted and unique")
-        if self.expert_codec != "affine" and self.expert_codec not in SHADOW_CODECS:
+        if (
+            self.expert_codec != "affine"
+            and self.expert_codec != MIXED_OFFICIAL_CODEC
+            and self.expert_codec not in SHADOW_CODECS
+        ):
             choices = ", ".join(repr(codec) for codec in SHADOW_CODECS)
-            raise ValueError(f"expert_codec must be 'affine', {choices}")
-        if self.routed_expert_bytes >= self.total_tensor_bytes:
-            raise ValueError("resident model footprint must be positive")
-        if self.router_bytes > self.resident_bytes:
-            raise ValueError("router bytes cannot exceed the resident footprint")
+            raise ValueError(
+                f"expert_codec must be 'affine', {MIXED_OFFICIAL_CODEC!r}, {choices}"
+            )
+        if self.expert_codec == MIXED_OFFICIAL_CODEC:
+            # Mixed-official specs have no uniform record size, so the routed /
+            # resident footprint split is manifest-derived at plan time. The
+            # positive-resident and router-fits checks below need
+            # ``expert_record_bytes`` (which raises for mixed), so they are the
+            # plan's job instead. Keep only the codec-agnostic sanity bound.
+            if self.router_bytes >= self.total_tensor_bytes:
+                raise ValueError("router bytes cannot exceed the model footprint")
+        else:
+            if self.routed_expert_bytes >= self.total_tensor_bytes:
+                raise ValueError("resident model footprint must be positive")
+            if self.router_bytes > self.resident_bytes:
+                raise ValueError("router bytes cannot exceed the resident footprint")
         if (
             self.mtp_layer_index is not None
             and self.mtp_layer_index < self.total_layers
@@ -200,14 +225,30 @@ class ExpertStreamingModelSpec:
         return group_count * 2 * self.quant_parameter_bytes
 
     @property
+    def is_mixed_official(self) -> bool:
+        """Whether this spec streams a mixed-official (per-layer tier) bank."""
+
+        return self.expert_codec == MIXED_OFFICIAL_CODEC
+
+    @property
     def expert_record_bytes(self) -> int:
         """Bytes of one streamed expert record under the spec's codec.
 
         Affine: packed quantized weights plus scale and bias leaves.
         Shadow codecs (q1 lane): packed sign/trit words plus one bf16
         scale per group — no bias leaf.
+
+        Mixed-official banks (issue #51, M2) RAISE: there is no single record
+        size (t158 layers vs affine2 layers differ), so every consumer on the
+        mixed lane must be routed to manifest-derived per-layer sizes (D7). A
+        raise here is the loud tripwire that catches a missed uniform consumer.
         """
 
+        if self.is_mixed_official:
+            raise ValueError(
+                "mixed-official specs have no uniform expert_record_bytes; use "
+                "the manifest-derived per-layer record sizes (issue #51 D7)"
+            )
         if self.expert_codec != "affine":
             return shadow_record_bytes(
                 self.expert_codec, self.expert_source_parameters
@@ -387,6 +428,32 @@ HY3_EXPERT_Q2 = ExpertStreamingModelSpec(
 )
 
 
+# Mixed-precision "official recipe" bank (issue #51, M2). Same Hy3 checkpoint,
+# resident tensors, router, KV, and routing as HY3_EXPERT_Q2 (island_pin_order
+# carries over — routing is a model property, not a record-codec property); only
+# the routed records change to the per-layer tier schedule (40 t158-tier layers
+# at 5,701,632 B each, 39 affine2-tier layers at 6,684,672 B each, down always
+# 3-bit affine). ``total_tensor_bytes`` is the Hy3 resident footprint plus that
+# mixed routed total; there is NO scalar record size (expert_record_bytes RAISES
+# for this spec — the tier map lives only in the loaded manifest). Serving is the
+# component-banks lane; the per-layer sizes are derived from the manifest at
+# both memory gates (D2).
+_HY3_RESIDENT_BYTES = (
+    HY3_EXPERT_Q2.total_tensor_bytes - HY3_EXPERT_Q2.routed_expert_bytes
+)
+_HY3_MIXOFFICIAL_ROUTED_BYTES = HY3_EXPERT_Q2.expert_count * (
+    40 * 5_701_632 + 39 * 6_684_672
+)
+
+HY3_EXPERT_MIXOFFICIAL = replace(
+    HY3_EXPERT_Q2,
+    key="hy3-expert-mixofficial",
+    display_name="Tencent Hy3 expert-only mixed-official (issue #51)",
+    expert_codec=MIXED_OFFICIAL_CODEC,
+    total_tensor_bytes=_HY3_RESIDENT_BYTES + _HY3_MIXOFFICIAL_ROUTED_BYTES,
+)
+
+
 GLM52_Q4 = ExpertStreamingModelSpec(
     key="glm52-q4",
     display_name="GLM-5.2 affine Q4",
@@ -497,6 +564,7 @@ MODEL_SPECS: dict[str, ExpertStreamingModelSpec] = {
         HY3_Q4,
         HY3_EXPERT_ONLY_Q4,
         HY3_EXPERT_Q2,
+        HY3_EXPERT_MIXOFFICIAL,
         GLM52_Q4,
         GLM52_EXPERT_Q2,
         GLM52_EXPERT_Q1T,
@@ -535,6 +603,7 @@ def plan_expert_memory(
     prefetch_slots_per_layer: int = 0,
     miss_shadow: str | None = None,
     miss_shadow_layers: int | None = None,
+    layer_record_bytes: Mapping[int, int] | None = None,
 ) -> ExpertMemoryPlan:
     """Fit uniform persistent expert slots under an explicit memory ceiling.
 
@@ -614,6 +683,53 @@ def plan_expert_memory(
     if mmap_island_layer_count and cache_scope != "layer":
         raise ValueError("mmap island layers require cache_scope 'layer'")
 
+    # Mixed-official (issue #51, M2): resolve every per-record byte quantity from
+    # the manifest-derived ``layer_record_bytes`` instead of the (raising)
+    # ``spec.expert_record_bytes``. The uniform-slot COUNT per layer is kept; the
+    # byte size per layer differs (D2). The forbidden MVP lanes (islands, mmap
+    # band, miss-shadow, global cache scope) are rejected loudly here so no
+    # non-uniform byte term is ever priced against a single record size.
+    is_mixed = spec.is_mixed_official
+    if is_mixed:
+        if layer_record_bytes is None:
+            raise ValueError(
+                "mixed-official specs require manifest-derived layer_record_bytes"
+            )
+        routed = tuple(spec.routed_layer_indices)
+        resolved_layer_bytes = {
+            _integer("layer_record_bytes layer", layer, minimum=0): _integer(
+                "layer_record_bytes", size, minimum=1
+            )
+            for layer, size in layer_record_bytes.items()
+        }
+        if set(resolved_layer_bytes) != set(routed):
+            raise ValueError(
+                "layer_record_bytes must cover exactly the routed layers "
+                f"{routed[0]}..{routed[-1]} (mixed-official D1/D2)"
+            )
+        if island_layer_count or mmap_island_layer_count or miss_shadow is not None:
+            raise ValueError(
+                "mixed-official MVP forbids dense/mmap islands and miss-shadow"
+            )
+        if prefetch_slots_per_layer:
+            raise ValueError(
+                "mixed-official MVP forbids the prefetch ring (perf lane)"
+            )
+        if cache_scope != "layer":
+            raise ValueError("mixed-official banks require cache_scope 'layer'")
+        all_routed_bytes = sum(resolved_layer_bytes[layer] for layer in routed)
+        exemplar_record_bytes = resolved_layer_bytes[routed[0]]
+        spec_resident_bytes = spec.total_tensor_bytes - spec.expert_count * (
+            all_routed_bytes
+        )
+    else:
+        if layer_record_bytes is not None:
+            raise ValueError(
+                "layer_record_bytes only applies to mixed-official specs"
+            )
+        exemplar_record_bytes = spec.expert_record_bytes
+        spec_resident_bytes = spec.resident_bytes
+
     service_slots = spec.top_k if transient_slots is None else transient_slots
     service_slots = _integer("transient_slots", service_slots, minimum=0)
     if service_slots < spec.top_k:
@@ -627,27 +743,40 @@ def plan_expert_memory(
         # resident pass; the MTP layer's stock cache is not in
         # kv_bytes_per_token (mtp_included=False) and stays in reserve.
         kv_bytes = resident_quant_kept_bytes(kv_bytes, kv_quant)
-    transient_bytes = service_slots * spec.expert_record_bytes
+    # One transient service slot must fit a record; mixed sizes it to the
+    # exemplar (first routed) layer, matching the component-bank allocator's
+    # exemplar-record transient bank (the transient tier is reused per layer
+    # fence and, at full residency, never serves a cross-layer record).
+    transient_bytes = service_slots * exemplar_record_bytes
     resident_bytes = (
-        spec.resident_bytes + additional_resident_bytes - resident_discount_bytes
+        spec_resident_bytes + additional_resident_bytes - resident_discount_bytes
     )
     if resident_bytes <= 0:
         raise ValueError(
             "resident_discount_bytes exceeds the resident footprint: "
-            f"{resident_discount_bytes} vs {spec.resident_bytes}"
+            f"{resident_discount_bytes} vs {spec_resident_bytes}"
         )
-    island_bytes = (
-        island_layer_count * spec.expert_count * spec.expert_record_bytes
-    )
-    mmap_island_bytes = (
-        mmap_island_layer_count * spec.expert_count * spec.expert_record_bytes
-    )
     streamed_layer_count = (
         spec.routed_layer_count - island_layer_count - mmap_island_layer_count
     )
-    prefetch_bytes = (
-        streamed_layer_count * prefetch_slots_per_layer * spec.expert_record_bytes
-    )
+    if is_mixed:
+        # Islands/mmap are forbidden for mixed, so every routed layer is
+        # streamed and the streamed byte total is the sum of per-layer records.
+        island_bytes = 0
+        mmap_island_bytes = 0
+        streamed_bytes_sum = all_routed_bytes
+    else:
+        island_bytes = (
+            island_layer_count * spec.expert_count * spec.expert_record_bytes
+        )
+        mmap_island_bytes = (
+            mmap_island_layer_count * spec.expert_count * spec.expert_record_bytes
+        )
+        streamed_bytes_sum = streamed_layer_count * spec.expert_record_bytes
+    # ``streamed_bytes_sum`` is the byte cost of one persistent slot PER streamed
+    # layer summed across all streamed layers (D2): the replacement for the old
+    # uniform ``streamed_layer_count * expert_record_bytes``.
+    prefetch_bytes = prefetch_slots_per_layer * streamed_bytes_sum
     if miss_shadow is not None and miss_shadow not in SHADOW_CODECS:
         choices = ", ".join(repr(codec) for codec in SHADOW_CODECS)
         raise ValueError(f"miss_shadow must be None, {choices}")
@@ -682,14 +811,12 @@ def plan_expert_memory(
         + shadow_bytes
     )
     available_bytes = max(0, total_limit_bytes - fixed_bytes)
-    streamed_expert_bytes = (
-        streamed_layer_count * spec.expert_count * spec.expert_record_bytes
-    )
+    streamed_expert_bytes = spec.expert_count * streamed_bytes_sum
     persistent_budget_bytes = min(available_bytes, streamed_expert_bytes)
     if expert_cache_limit_bytes is not None:
         persistent_budget_bytes = min(persistent_budget_bytes, expert_cache_limit_bytes)
 
-    bytes_per_uniform_slot = streamed_layer_count * spec.expert_record_bytes
+    bytes_per_uniform_slot = streamed_bytes_sum
     if cache_scope == "global":
         persistent_slots = min(
             spec.routed_layer_count * spec.expert_count,
@@ -710,7 +837,10 @@ def plan_expert_memory(
             spec.expert_count, persistent_budget_bytes // bytes_per_uniform_slot
         )
         persistent_slots = slots_per_layer * streamed_layer_count
-        persistent_cache_bytes = persistent_slots * spec.expert_record_bytes
+        # slots_per_layer * (per-layer record bytes summed over streamed layers);
+        # equals persistent_slots * expert_record_bytes in the uniform case but
+        # holds for the mixed per-layer sizes (D2).
+        persistent_cache_bytes = slots_per_layer * streamed_bytes_sum
     unallocated_bytes = total_limit_bytes - fixed_bytes - persistent_cache_bytes
 
     return ExpertMemoryPlan(
