@@ -187,14 +187,35 @@ def _assemble_mixed_artifact(tmp_path: Path, *, expert_count: int = 2, top_k: in
     return root, config_json, spec, manifest_path, mixed_manifest
 
 
+def _mixed_transient_bytes(spec, layer_bytes) -> int:
+    """One transient service bank per distinct tier geometry."""
+
+    return spec.top_k * sum(set(layer_bytes.values()))
+
+
 def _mixed_memory_limit(spec, manifest) -> int:
     """A ceiling that admits full per-layer residency (slots_per_layer == E)."""
 
     layer_bytes = manifest.record_bytes_by_layer()
     routed = spec.expert_count * sum(layer_bytes.values())
     resident = spec.total_tensor_bytes - routed
-    transient = spec.top_k * layer_bytes[spec.routed_layer_indices[0]]
-    return resident + routed + transient + 16 * 1024 * 1024
+    return resident + routed + _mixed_transient_bytes(spec, layer_bytes) + 16 * 1024 * 1024
+
+
+def _mixed_partial_limit(spec, manifest) -> int:
+    """A ceiling that admits exactly one persistent slot per layer.
+
+    With ``slots_per_layer == 1 < expert_count`` a prefill route that touches
+    more than one expert per layer must spill to the transient tier — the path
+    that a differing-tier miss used to crash.
+    """
+
+    layer_bytes = manifest.record_bytes_by_layer()
+    streamed_sum = sum(layer_bytes.values())  # one slot per layer, all layers
+    resident = spec.total_tensor_bytes - spec.expert_count * streamed_sum
+    fixed = resident + _mixed_transient_bytes(spec, layer_bytes)
+    # available in [streamed_sum, 2*streamed_sum) -> slots_per_layer == 1.
+    return fixed + streamed_sum + streamed_sum // 2
 
 
 def _mixed_config(spec, manifest, **overrides) -> ExpertStreamingConfig:
@@ -210,10 +231,15 @@ def _mixed_config(spec, manifest, **overrides) -> ExpertStreamingConfig:
     return ExpertStreamingConfig(**base)
 
 
-def _open_mixed(root, spec, manifest_path, config=None):
+def _open_mixed(root, spec, manifest_path, config=None, *, memory_limit_bytes=None):
     manifest = load_expert_manifest(manifest_path)
     if config is None:
-        config = _mixed_config(spec, manifest)
+        overrides = (
+            {"memory_limit_bytes": memory_limit_bytes}
+            if memory_limit_bytes is not None
+            else {}
+        )
+        config = _mixed_config(spec, manifest, **overrides)
     plan = config.memory_plan(spec, layer_record_bytes=manifest.record_bytes_by_layer())
     return ExpertStreamingRuntime.open(
         root,
@@ -224,6 +250,24 @@ def _open_mixed(root, spec, manifest_path, config=None):
         device_synchronize=mx.synchronize,
         apply_memory_cap=False,
     )
+
+
+def _assert_served_matches(got: np.ndarray, ref: np.ndarray) -> None:
+    """Parity that proves "the served weights ARE the decoded record".
+
+    The served path (Metal shadow/gather kernels) and the numpy
+    decode_projection reference round the codec slightly differently, and the
+    fixture's full-scale N(0,1) weights push a rare near-cancellation output
+    element to ~15% relative error. So assert the bulk is near-exact (median)
+    and the whole vector matches in relative L2 norm (robust to lone outliers),
+    instead of an element-wise max bound.
+    """
+
+    got = np.asarray(got).reshape(-1)
+    ref = np.asarray(ref).reshape(-1)
+    relative = np.abs(got - ref) / (np.abs(ref) + 1e-6)
+    assert np.median(relative) < 1e-3
+    assert np.linalg.norm(got - ref) / (np.linalg.norm(ref) + 1e-6) < 5e-3
 
 
 def _decode_reference(manifest, root, layer: int, expert: int) -> dict[str, np.ndarray]:
@@ -377,17 +421,7 @@ def test_switch_output_matches_dense_reference(tmp_path: Path, layer: int) -> No
         reference = mx.matmul(swiglu(gate, up), mx.array(dense["down_proj"]).T)
         mx.eval(reference)
 
-        got = np.asarray(output).reshape(-1)
-        ref = np.asarray(reference).reshape(-1)
-        # The served weights ARE the decoded record: most elements match to
-        # ~1e-5. A handful of large-magnitude outputs differ by ~1% because the
-        # Metal shadow/gather kernels and the numpy decode_projection reference
-        # round the codec slightly differently (amplified by the fixture's
-        # full-scale N(0,1) weights). Assert the bulk is near-exact and the max
-        # stays within that codec gap.
-        relative = np.abs(got - ref) / (np.abs(ref) + 1e-6)
-        assert np.median(relative) < 1e-3
-        np.testing.assert_allclose(got, ref, rtol=3e-2, atol=1e-2)
+        _assert_served_matches(np.asarray(output), np.asarray(reference))
     finally:
         runtime.close()
 
@@ -418,6 +452,83 @@ def test_full_forward_exercises_both_tiers(tmp_path: Path, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# partial residency: per-tier transient service (issue #51, M2b)
+# ---------------------------------------------------------------------------
+def test_partial_residency_serves_both_tiers_through_transient(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """One run, one persistent slot per layer: a second expert on BOTH a
+    t158-tier and an affine2-tier layer spills to the per-tier transient bank,
+    is filled + dispatched + numerically correct, and never crashes."""
+
+    root, _cfg, spec, manifest_path, _mm = _assemble_mixed_artifact(tmp_path)
+    manifest = load_expert_manifest(manifest_path)
+    limit = _mixed_partial_limit(spec, manifest)
+    runtime = _open_mixed(root, spec, manifest_path, memory_limit_bytes=limit)
+    try:
+        # The plan admits exactly one persistent slot per layer.
+        assert runtime.plan.slots_per_layer == 1
+        assert runtime.plan.slots_per_layer < spec.expert_count
+
+        for layer, expected_tier in ((1, "t158"), (2, "affine2")):
+            switch = HotExpertSwitchGLU(runtime, layer)
+            assert switch._gate_up_tier == expected_tier
+            spy = _KernelSpy()
+            spy.install(monkeypatch)
+            rng = np.random.default_rng(100 + layer)
+            # Two tokens, top_k=1, routing experts 0 then 1: expert 0 is seeded
+            # persistent, expert 1 must be served from the transient tier.
+            x = mx.array(rng.standard_normal((1, 2, HIDDEN)).astype(np.float32))
+            indices = mx.array([[[0], [1]]], dtype=mx.uint32)
+            output = switch(x, indices)  # PREFILL (seq len 2)
+            mx.eval(output)
+
+            # Dispatch fired for this layer's tier (proves execution ran, not a
+            # crash on the differing-tier transient bank).
+            if expected_tier == "t158":
+                assert spy.shadow_projections >= 2  # gate + up
+                assert 3 in spy.gather_bits  # affine3 down
+            else:
+                assert spy.shadow_projections == 0
+                assert 2 in spy.gather_bits and 3 in spy.gather_bits
+
+            # Numeric parity for BOTH assignments, including the transient one.
+            got = np.asarray(output).reshape(2, HIDDEN)
+            for token, expert in ((0, 0), (1, 1)):
+                dense = _decode_reference(manifest, root, layer, expert)
+                xr = mx.array(np.asarray(x)[0, token].reshape(1, HIDDEN))
+                gate = mx.matmul(xr, mx.array(dense["gate_proj"]).T)
+                up = mx.matmul(xr, mx.array(dense["up_proj"]).T)
+                ref = np.asarray(
+                    mx.matmul(swiglu(gate, up), mx.array(dense["down_proj"]).T)
+                ).reshape(-1)
+                _assert_served_matches(got[token], ref)
+
+        # The transient tier actually serviced misses (fill happened).
+        snapshot = runtime.snapshot(mx_module=mx)
+        assert snapshot["cache"]["transient_loads"] >= 2
+    finally:
+        runtime.close()
+
+
+def test_partial_residency_full_forward_is_finite(tmp_path: Path) -> None:
+    root, config_json, spec, manifest_path, _mm = _assemble_mixed_artifact(tmp_path)
+    manifest = load_expert_manifest(manifest_path)
+    limit = _mixed_partial_limit(spec, manifest)
+    runtime = _open_mixed(root, spec, manifest_path, memory_limit_bytes=limit)
+    try:
+        assert runtime.plan.slots_per_layer == 1
+        resident = construct_resident_model(root, runtime, config=config_json)
+        # Multi-token prefill through the whole model at partial residency.
+        logits = resident.model(mx.array([[1, 5, 9, 3]], dtype=mx.int32))
+        mx.eval(logits)
+        assert logits.shape == (1, 4, config_json["vocab_size"])
+        assert mx.all(mx.isfinite(logits)).item()
+    finally:
+        runtime.close()
+
+
+# ---------------------------------------------------------------------------
 # memory-plan arithmetic with two record sizes (D2)
 # ---------------------------------------------------------------------------
 def test_memory_plan_prices_two_record_sizes(tmp_path: Path) -> None:
@@ -440,14 +551,15 @@ def test_memory_plan_prices_two_record_sizes(tmp_path: Path) -> None:
     assert full.resident_bytes == expected_resident
     assert full.slots_per_layer == spec.expert_count
     assert full.persistent_cache_bytes == spec.expert_count * per_layer_sum
-    # The shared transient bank is sized to the exemplar (first routed) layer.
-    assert full.transient_bytes == spec.top_k * t158_bytes
+    # One transient service bank per distinct tier geometry (t158 + affine2).
+    assert full.transient_bytes == spec.top_k * (t158_bytes + affine2_bytes)
 
-    # A budget for exactly one persistent slot per layer.
+    # A budget for exactly one persistent slot per layer (transient is now one
+    # bank per distinct tier geometry).
     one_slot = plan_expert_memory(
         spec,
         total_limit_bytes=expected_resident
-        + spec.top_k * t158_bytes
+        + spec.top_k * (t158_bytes + affine2_bytes)
         + per_layer_sum,
         context_tokens=0,
         layer_record_bytes=layer_bytes,

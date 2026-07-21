@@ -52,6 +52,11 @@ _LAYER_PERSISTENT_LABEL = re.compile(
 )
 _GLOBAL_PERSISTENT_LABEL = re.compile(rf"global-persistent-({_SLOT_INDEX_PATTERN})")
 _GLOBAL_TRANSIENT_LABEL = re.compile(rf"global-transient-({_SLOT_INDEX_PATTERN})")
+# Mixed-official (issue #51 M2b): one transient service bank per gate/up tier so
+# partial-residency misses on either tier class land in a matching geometry.
+_MIXED_TRANSIENT_LABEL = re.compile(
+    rf"mixed-transient-([a-z0-9]+)-({_SLOT_INDEX_PATTERN})"
+)
 _LAYER_PREFETCH_LABEL = re.compile(
     rf"layer-({_SLOT_INDEX_PATTERN})-prefetch-({_SLOT_INDEX_PATTERN})"
 )
@@ -1053,6 +1058,7 @@ def make_mlx_component_bank_allocator(
     is_mixed = expert_codec == MIXED_OFFICIAL_CODEC
     routed_layers = set(spec.routed_layer_indices)
     exemplar_layer = spec.routed_layer_indices[0]
+    record_by_gate_up_tier: dict[str, ExpertRecord] = {}
 
     if is_mixed:
         # Per-layer bank geometry (D3): every routed layer has its OWN expected
@@ -1066,9 +1072,11 @@ def make_mlx_component_bank_allocator(
             "up_proj": (spec.expert_hidden_size, spec.hidden_size),
             "down_proj": (spec.hidden_size, spec.expert_hidden_size),
         }
+        # One exemplar record per gate/up tier, for the per-tier transient banks.
         layer_signatures: dict[int, tuple[tuple[Any, ...], ...]] = {}
         for layer in spec.routed_layer_indices:
             gate_up_tier, down_tier = manifest.mixed_tier_for_layer(layer)
+            record_by_gate_up_tier.setdefault(gate_up_tier, record_by_layer[layer])
             planned = plan_record_segments(
                 {"gate_up": gate_up_tier, "down": down_tier}, mixed_dims
             )
@@ -1184,23 +1192,30 @@ def make_mlx_component_bank_allocator(
                     f"layer {exemplar_layer}"
                 )
 
-    banks: dict[tuple[str, int], MlxComponentBank] = {}
+    banks: dict[tuple[str, object], MlxComponentBank] = {}
     slots: dict[str, MlxComponentSlot] = {}
     backend = "mlx-metal-component-banks"
 
-    def bank_for(kind: str, layer: int) -> MlxComponentBank:
-        key = (kind, layer if kind in {"persistent", "prefetch"} else -1)
+    def bank_for(kind: str, discriminator: object = -1) -> MlxComponentBank:
+        keyed = {"persistent", "prefetch", "mixed-transient"}
+        key = (kind, discriminator if kind in keyed else -1)
         bank = banks.get(key)
         if bank is not None:
             return bank
         if kind == "persistent":
             capacity = plan.slots_per_layer
-            record = record_by_layer[layer]
-            label = f"layer-{layer}-persistent-bank"
+            record = record_by_layer[discriminator]
+            label = f"layer-{discriminator}-persistent-bank"
         elif kind == "prefetch":
             capacity = plan.prefetch_slots_per_layer
-            record = record_by_layer[layer]
-            label = f"layer-{layer}-prefetch-bank"
+            record = record_by_layer[discriminator]
+            label = f"layer-{discriminator}-prefetch-bank"
+        elif kind == "mixed-transient":
+            # One transient bank per gate/up tier (issue #51 M2b): a miss on a
+            # differing-tier layer lands in a bank of ITS geometry.
+            capacity = plan.transient_slots
+            record = record_by_gate_up_tier[discriminator]
+            label = f"mixed-transient-bank-{discriminator}"
         elif kind == "global-persistent":
             capacity = plan.persistent_slots
             record = record_by_layer[exemplar_layer]
@@ -1220,8 +1235,17 @@ def make_mlx_component_bank_allocator(
         layer_persistent = _LAYER_PERSISTENT_LABEL.fullmatch(label)
         global_persistent = _GLOBAL_PERSISTENT_LABEL.fullmatch(label)
         global_transient = _GLOBAL_TRANSIENT_LABEL.fullmatch(label)
+        mixed_transient = _MIXED_TRANSIENT_LABEL.fullmatch(label)
         layer_prefetch = _LAYER_PREFETCH_LABEL.fullmatch(label)
-        if layer_prefetch is not None:
+        if mixed_transient is not None:
+            tier = mixed_transient.group(1)
+            slot_index = int(mixed_transient.group(2))
+            if tier not in record_by_gate_up_tier:
+                raise ValueError(f"mixed transient tier {tier!r} is not routed")
+            if not 0 <= slot_index < plan.transient_slots:
+                raise ValueError("transient slot is outside planned capacity")
+            bank = bank_for("mixed-transient", tier)
+        elif layer_prefetch is not None:
             if plan.cache_scope != "layer":
                 raise ValueError(
                     "prefetch slot label conflicts with global cache scope"

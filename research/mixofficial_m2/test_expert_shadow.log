@@ -7,5 +7,5 @@
   <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type SwigPyObject has no __module__ attribute
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-28 passed, 2 warnings in 3.45s
+28 passed, 2 warnings in 4.12s
 sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute

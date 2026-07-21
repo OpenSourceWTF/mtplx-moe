@@ -641,8 +641,11 @@ class ExpertSlotPool:
         # routed to manifest-derived per-layer sizes. The persistent bank of a
         # layer holds that layer's record size; the shared transient tier is
         # sized to the exemplar (first routed) layer and, at full residency, is
-        # never fed a cross-layer record.
+        # partial-residency miss on either tier lands in a per-tier transient
+        # bank of the matching geometry (issue #51 M2b), so no cross-tier crash.
         self._is_mixed = spec.is_mixed_official
+        self._gate_up_tier_by_layer: dict[int, str] = {}
+        self._transient_tier_record_bytes: dict[str, int] = {}
         if self._is_mixed:
             self._layer_record_bytes = manifest.record_bytes_by_layer()
             missing = set(spec.routed_layer_indices) - set(self._layer_record_bytes)
@@ -650,6 +653,16 @@ class ExpertSlotPool:
                 raise ValueError(
                     f"manifest has no records for routed layers {sorted(missing)}"
                 )
+            self._gate_up_tier_by_layer = {
+                layer: gate_up for layer, gate_up, _down in manifest.layer_tier_map
+            }
+            for layer, size in self._layer_record_bytes.items():
+                tier = self._gate_up_tier_by_layer[layer]
+                prior = self._transient_tier_record_bytes.setdefault(tier, size)
+                if prior != size:
+                    raise ValueError(
+                        f"gate/up tier {tier!r} has non-uniform record bytes"
+                    )
             self._exemplar_record_bytes = self._layer_record_bytes[
                 spec.routed_layer_indices[0]
             ]
@@ -762,11 +775,29 @@ class ExpertSlotPool:
                 self._persistent[(key_layer, slot_index)] = _PhysicalSlot(label, buffer)
                 allocated += record_bytes
             transient: list[_PhysicalSlot] = []
-            for slot_index in range(plan.transient_slots):
-                label = f"global-transient-{slot_index}"
-                buffer = self._allocate_buffer(label, self._exemplar_record_bytes)
-                transient.append(_PhysicalSlot(label, buffer))
-                allocated += self._exemplar_record_bytes
+            self._transient_by_tier: dict[str, tuple[_PhysicalSlot, ...]] = {}
+            if self._is_mixed:
+                # One transient service bank per gate/up tier so a partial-
+                # residency miss on either tier class lands in a matching
+                # geometry (reused per layer fence). Sorted for deterministic
+                # allocation/accounting.
+                for tier in sorted(self._transient_tier_record_bytes):
+                    tier_bytes = self._transient_tier_record_bytes[tier]
+                    tier_slots: list[_PhysicalSlot] = []
+                    for slot_index in range(plan.transient_slots):
+                        label = f"mixed-transient-{tier}-{slot_index}"
+                        buffer = self._allocate_buffer(label, tier_bytes)
+                        physical = _PhysicalSlot(label, buffer)
+                        tier_slots.append(physical)
+                        transient.append(physical)
+                        allocated += tier_bytes
+                    self._transient_by_tier[tier] = tuple(tier_slots)
+            else:
+                for slot_index in range(plan.transient_slots):
+                    label = f"global-transient-{slot_index}"
+                    buffer = self._allocate_buffer(label, self._exemplar_record_bytes)
+                    transient.append(_PhysicalSlot(label, buffer))
+                    allocated += self._exemplar_record_bytes
             self._transient = tuple(transient)
             self._prefetch: dict[tuple[int, int], _PhysicalSlot] = {}
             if plan.prefetch_slots_per_layer:
@@ -788,6 +819,7 @@ class ExpertSlotPool:
         except Exception:
             self._persistent.clear()
             self._transient = ()
+            self._transient_by_tier = {}
             self._prefetch = {}
             raise
         expected = (
@@ -1150,6 +1182,14 @@ class ExpertSlotPool:
                     "persistent slot is outside the memory plan"
                 ) from exc
         transient_index = logical_slot - self._persistent_route_capacity
+        if self._is_mixed:
+            # Route the transient slot to the bank of THIS layer's gate/up tier
+            # geometry (issue #51 M2b); prefetch is forbidden for mixed.
+            tier = self._gate_up_tier_by_layer[layer]
+            tier_slots = self._transient_by_tier[tier]
+            if 0 <= transient_index < len(tier_slots):
+                return tier_slots[transient_index]
+            raise ExpertSlotError("transient slot is outside the memory plan")
         if 0 <= transient_index < len(self._transient):
             return self._transient[transient_index]
         prefetch_index = transient_index - len(self._transient)

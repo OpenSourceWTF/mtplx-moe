@@ -718,7 +718,11 @@ def plan_expert_memory(
         if cache_scope != "layer":
             raise ValueError("mixed-official banks require cache_scope 'layer'")
         all_routed_bytes = sum(resolved_layer_bytes[layer] for layer in routed)
-        exemplar_record_bytes = resolved_layer_bytes[routed[0]]
+        # The service/transient tier is per-record-geometry (issue #51 M2b): a
+        # miss on a differing-tier layer must land in a bank of ITS geometry, so
+        # the transient budget is one service bank per DISTINCT record size.
+        # Same gate/up tier => same record size, so distinct sizes == tiers.
+        transient_record_total = sum(set(resolved_layer_bytes.values()))
         spec_resident_bytes = spec.total_tensor_bytes - spec.expert_count * (
             all_routed_bytes
         )
@@ -727,7 +731,7 @@ def plan_expert_memory(
             raise ValueError(
                 "layer_record_bytes only applies to mixed-official specs"
             )
-        exemplar_record_bytes = spec.expert_record_bytes
+        transient_record_total = spec.expert_record_bytes
         spec_resident_bytes = spec.resident_bytes
 
     service_slots = spec.top_k if transient_slots is None else transient_slots
@@ -743,11 +747,10 @@ def plan_expert_memory(
         # resident pass; the MTP layer's stock cache is not in
         # kv_bytes_per_token (mtp_included=False) and stays in reserve.
         kv_bytes = resident_quant_kept_bytes(kv_bytes, kv_quant)
-    # One transient service slot must fit a record; mixed sizes it to the
-    # exemplar (first routed) layer, matching the component-bank allocator's
-    # exemplar-record transient bank (the transient tier is reused per layer
-    # fence and, at full residency, never serves a cross-layer record).
-    transient_bytes = service_slots * exemplar_record_bytes
+    # The transient service tier holds one bank per distinct record geometry
+    # (mixed: one t158-geometry, one affine2-geometry; both reused per layer
+    # fence), so it serves partial-residency misses on EITHER tier class.
+    transient_bytes = service_slots * transient_record_total
     resident_bytes = (
         spec_resident_bytes + additional_resident_bytes - resident_discount_bytes
     )
