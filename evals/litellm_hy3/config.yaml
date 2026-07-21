@@ -1,0 +1,31 @@
+# LiteLLM proxy config for the hy3 q2 MTPLX runtime.
+#
+# Validated against litellm==1.93.0. The proxy resolves
+# ``custom_handler: handler.instance`` with ``get_instance_fn`` by loading
+# ``handler.py`` from THIS directory (the config-file directory) and reading
+# its module-level ``instance`` object. Keep config.yaml and handler.py
+# side-by-side.
+#
+# Exposed model name: ``hy3-q2`` (what code_eval_gate's ``--model`` points at).
+# Internally routed as provider ``hy3`` -> the custom handler.
+
+model_list:
+  - model_name: hy3-q2
+    litellm_params:
+      model: hy3/hy3-q2
+
+litellm_settings:
+  custom_provider_map:
+    - provider: hy3
+      custom_handler: handler.instance
+  # The runtime serializes on the single MLX GPU lock; do not let litellm
+  # retry a failed generation into a second concurrent model call.
+  num_retries: 0
+  request_timeout: 1200
+
+general_settings:
+  # No master_key: this is a loopback-only, single-operator proxy launched
+  # inside a guarded GPU window. serve.sh binds it to 127.0.0.1.
+  # code_eval_gate may still send a bearer token (MTPLX_API_KEY); it is
+  # accepted and ignored when no master_key is configured.
+  telemetry: false
