@@ -21,6 +21,87 @@ from .mtp_patch import MTPContract, inject_mtp_support, validate_mtp_support
 logger = logging.getLogger(__name__)
 
 
+def _apply_streaming_memory_cap(
+    plan: Any,
+    config: Any,
+    *,
+    mx_module: Any,
+    external_residency_bytes: int = 0,
+) -> Any:
+    """Select the construction-time cap contract for the installed lane."""
+
+    if getattr(config, "slot_layout", None) == "fused-rans":
+        from .glm52_q1t_over10 import (
+            apply_glm52_q1t_fused_rans_memory_caps,
+        )
+
+        return apply_glm52_q1t_fused_rans_memory_caps(
+            plan,
+            mx_module=mx_module,
+            external_residency_bytes=external_residency_bytes,
+        )
+    if external_residency_bytes:
+        raise ValueError("external residency accounting is GLM fused-rANS only")
+    from .expert_runtime import apply_mlx_memory_cap
+
+    return apply_mlx_memory_cap(plan, mx_module=mx_module)
+
+
+def _glm52_q1t_fused_rans_cache_plan(config: Any, spec: Any) -> Any:
+    """Construct the one cache72 plan shared by cap and compressed store."""
+
+    from .glm52_q1t_over10 import (
+        GLM52_Q1T_PERSISTENT_SLOTS_PER_LAYER,
+        GLM52_Q1T_TRANSIENT_SLOTS,
+    )
+
+    plan = config.memory_plan(spec)
+    if (
+        getattr(plan, "slots_per_layer", None)
+        != GLM52_Q1T_PERSISTENT_SLOTS_PER_LAYER
+        or getattr(plan, "transient_slots", None) != GLM52_Q1T_TRANSIENT_SLOTS
+    ):
+        raise RuntimeError(
+            "glm52-expert-q1t fused-rans cache plan is not the exact "
+            "116-persistent/48-transient control geometry"
+        )
+    return plan
+
+
+def _open_glm52_q1t_fused_rans_runtime(
+    *,
+    expert_manifest: Any,
+    config: Any,
+    cache_plan: Any,
+    fused_manifest: Any | None = None,
+):
+    """Open the exact construction-qualified GLM Q1T fused-rANS owner."""
+
+    if expert_manifest is None:
+        raise RuntimeError(
+            "glm52-expert-q1t fused-rans requires an authoritative expert manifest"
+        )
+    if not getattr(config, "banked_manifest", None):
+        raise RuntimeError("glm52-expert-q1t fused-rans requires a banked manifest")
+    from .expert_manifest import load_expert_manifest
+    from .glm52_q1t_rans_artifact import load_glm52_q1t_fused_rans_manifest
+    from .models.glm52_q1t_fused_rans import (
+        construct_glm52_q1t_fused_rans_runtime,
+    )
+
+    base_manifest = load_expert_manifest(expert_manifest)
+    if fused_manifest is None:
+        fused_manifest = load_glm52_q1t_fused_rans_manifest(
+            config.banked_manifest
+        )
+    return construct_glm52_q1t_fused_rans_runtime(
+        base_manifest=base_manifest,
+        fused_manifest=fused_manifest,
+        config=config,
+        cache_plan=cache_plan,
+    )
+
+
 def _streamed_mtp_backend(model_key: str, precision: str) -> str:
     """Resolve the strict external MTP adapter before model allocation."""
 
@@ -28,10 +109,10 @@ def _streamed_mtp_backend(model_key: str, precision: str) -> str:
         "hy3-q4": ("hy3", {"bf16", "q4"}),
         "hy3-expert-q2": ("hy3", {"bf16"}),
         # The Q4 head sibling (issue #100) is lane-agnostic: it is selectable
-        # for either GLM streamed lane so its ~12.9 GiB budget saving reaches
-        # the memory-constrained expert-Q2 config too. BF16 stays the default
-        # until a Q4 acceptance-rate validation run lands.
+        # for every GLM streamed lane: q2 and q1t have the same resident trunk,
+        # router, and layer-78 contract; only routed record storage differs.
         "glm52-expert-q2": ("glm52", {"bf16", "q4"}),
+        "glm52-expert-q1t": ("glm52", {"bf16", "q4"}),
         "glm52-q4": ("glm52", {"bf16", "q4"}),
     }
     selected = support.get(str(model_key))
@@ -546,7 +627,6 @@ def _load_impl(
             ExpertStreamingConfig,
             ExpertStreamingConfigurationError,
             ExpertStreamingRuntime,
-            apply_mlx_memory_cap,
         )
         from .expert_streaming_models import get_model_spec
         from .models.expert_mlx import (
@@ -581,10 +661,8 @@ def _load_impl(
                         open_verified_glm52_mtp_layer78_q4,
                     )
 
-                    verified_artifact_context = (
-                        open_verified_glm52_mtp_layer78_q4(
-                            Path(mtp_artifacts), deep=True
-                        )
+                    verified_artifact_context = open_verified_glm52_mtp_layer78_q4(
+                        Path(mtp_artifacts), deep=True
                     )
                 else:
                     from .glm52_mtp_artifact import (
@@ -672,13 +750,38 @@ def _load_impl(
                     "fixed expert-streaming footprint exceeds limit by "
                     f"{-streaming_plan.unallocated_bytes} bytes"
                 )
+            fused_manifest = None
+            fused_cache_plan = None
+            fused_external_residency_bytes = 0
+            if expert_streaming_config.slot_layout == "fused-rans":
+                from .glm52_q1t_rans_artifact import (
+                    load_glm52_q1t_fused_rans_manifest,
+                )
+
+                fused_manifest = load_glm52_q1t_fused_rans_manifest(
+                    expert_streaming_config.banked_manifest
+                )
+                fused_cache_plan = _glm52_q1t_fused_rans_cache_plan(
+                    expert_streaming_config,
+                    streaming_spec,
+                )
+                fused_external_residency_bytes = (
+                    fused_cache_plan.persistent_cache_bytes
+                    + fused_cache_plan.transient_bytes
+                )
             prebuilt_glm_mtp = None
             prebuilt_hy3_mtp = None
-            if mtp:
+            fused_memory_cap_report = None
+            if mtp or fused_manifest is not None:
                 # Materialize external MTP heads before allocating expert-cache
                 # banks. Stacking their routed experts has a large transient
                 # footprint that can breach an otherwise-valid steady-state plan.
-                apply_mlx_memory_cap(streaming_plan, mx_module=mx)
+                fused_memory_cap_report = _apply_streaming_memory_cap(
+                    fused_cache_plan or streaming_plan,
+                    expert_streaming_config,
+                    mx_module=mx,
+                    external_residency_bytes=fused_external_residency_bytes,
+                )
             if streamed_mtp_backend == "glm52":
                 from .glm52_mtp_patch import build_glm52_mtp_module
                 from .models.glm52_mlx import ModelArgs as Glm52ModelArgs
@@ -705,36 +808,55 @@ def _load_impl(
                     ),
                     verified_artifacts=verified_streamed_artifact,
                 )
-            if expert_streaming_config.slot_layout == "component-banks":
-                from .expert_manifest import load_expert_manifest
-
-                streaming_manifest = load_expert_manifest(expert_manifest)
-                slot_allocator = make_mlx_component_bank_allocator(
-                    streaming_plan,
-                    streaming_spec,
-                    streaming_manifest,
-                )
-            else:
-                slot_allocator = make_mlx_slot_buffer_allocator(
-                    streaming_plan, streaming_spec
-                )
-
             if mtp_adapter is not None or merge_mtp_adapter:
                 raise RuntimeError("MTP adapters are unavailable for streamed loading")
-            expert_runtime = ExpertStreamingRuntime.open(
-                path,
-                expert_manifest,
-                expert_streaming_config,
-                spec=streaming_spec,
-                buffer_allocator=slot_allocator,
-                device_synchronize=mx.synchronize,
-                apply_memory_cap=True,
-                mx_module=mx,
-                **plan_kwargs,
-            )
+            switch_binder = None
+            if expert_streaming_config.slot_layout == "fused-rans":
+                from .models.glm52_q1t_fused_rans import (
+                    bind_glm52_q1t_fused_rans_switches,
+                )
+
+                expert_runtime = _open_glm52_q1t_fused_rans_runtime(
+                    expert_manifest=expert_manifest,
+                    config=expert_streaming_config,
+                    cache_plan=fused_cache_plan,
+                    fused_manifest=fused_manifest,
+                )
+                expert_runtime.memory_cap_report = fused_memory_cap_report
+                switch_binder = bind_glm52_q1t_fused_rans_switches
+            else:
+                if expert_streaming_config.slot_layout == "component-banks":
+                    from .expert_manifest import load_expert_manifest
+
+                    streaming_manifest = load_expert_manifest(expert_manifest)
+                    slot_allocator = make_mlx_component_bank_allocator(
+                        streaming_plan,
+                        streaming_spec,
+                        streaming_manifest,
+                    )
+                else:
+                    slot_allocator = make_mlx_slot_buffer_allocator(
+                        streaming_plan, streaming_spec
+                    )
+                expert_runtime = ExpertStreamingRuntime.open(
+                    path,
+                    expert_manifest,
+                    expert_streaming_config,
+                    spec=streaming_spec,
+                    buffer_allocator=slot_allocator,
+                    device_synchronize=mx.synchronize,
+                    apply_memory_cap=True,
+                    mx_module=mx,
+                    **plan_kwargs,
+                )
             _expert_runtime_owner[:] = [expert_runtime]
             try:
-                resident = construct_resident_model(path, expert_runtime, config=config)
+                resident = construct_resident_model(
+                    path,
+                    expert_runtime,
+                    config=config,
+                    switch_binder=switch_binder,
+                )
                 model = resident.model
                 resident_load_report = resident.report.as_dict()
                 tokenizer = _load_tokenizer_resilient(path, config)

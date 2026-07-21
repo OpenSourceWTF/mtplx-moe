@@ -53,6 +53,8 @@ graphs (the helper materializes its output with ``mx.eval``).
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from functools import lru_cache
 
 import mlx.core as mx
@@ -82,6 +84,154 @@ _POW3 = (1, 3, 9, 27, 81)
 _T158_LUT = ",".join(
     f"{((bv // _POW3[j]) % 3) - 1}.0f" for bv in range(243) for j in range(5)
 )
+
+
+@dataclass(frozen=True)
+class BoundShadowGather:
+    """One construction-qualified shadow gather launch.
+
+    Array ownership and shapes are invariants of the installed component-bank
+    route.  The call therefore submits the fixed launch directly; it does not
+    repeat codec, dtype, bank-shape, or grid validation.
+    """
+
+    kernel: Callable[..., tuple[mx.array]]
+    dtype: mx.Dtype
+    rows: int
+    in_dim: int
+    out_dim: int
+    threads_per_tg: int
+    grid_x: int
+
+    def __call__(
+        self,
+        x: mx.array,
+        expert_ids: mx.array,
+        packed: mx.array,
+        scales: mx.array,
+    ) -> mx.array:
+        (out,) = self.kernel(
+            inputs=[
+                mx.contiguous(x),
+                expert_ids,
+                packed,
+                scales,
+                self.rows,
+                self.out_dim,
+                self.in_dim,
+            ],
+            template=[("T", self.dtype)],
+            grid=(self.grid_x, 1, 1),
+            threadgroup=(self.threads_per_tg, 1, 1),
+            output_shapes=[(self.rows, self.out_dim)],
+            output_dtypes=[self.dtype],
+        )
+        return out
+
+
+def _validate_bound_geometry(
+    codec: str,
+    dtype: mx.Dtype,
+    rows: int,
+    in_dim: int,
+    out_dim: int,
+    packed_shape: Sequence[int],
+    scales_shape: Sequence[int],
+    threads_per_tg: int,
+    stage: bool,
+) -> int:
+    if codec not in _DEFAULTS:
+        raise ShadowCodecError(f"unknown shadow codec {codec!r}")
+    if dtype not in _DTYPE_TAG:
+        raise ShadowCodecError(f"unsupported shadow gather dtype {dtype}")
+    rows = int(rows)
+    in_dim = int(in_dim)
+    out_dim = int(out_dim)
+    threads_per_tg = int(threads_per_tg)
+    if rows < 1 or in_dim < 1 or out_dim < 1:
+        raise ShadowCodecError("bound shadow geometry must be positive")
+    if in_dim % SHADOW_GROUP:
+        raise ShadowCodecError(
+            f"shadow input dim {in_dim} is not a multiple of {SHADOW_GROUP}"
+        )
+    if threads_per_tg < 1:
+        raise ShadowCodecError("threads_per_tg must be >= 1")
+    if stage and in_dim > _STAGE_MAX_IN:
+        raise ShadowCodecError(
+            f"staged shadow input dim {in_dim} exceeds {_STAGE_MAX_IN}"
+        )
+    if len(packed_shape) != 3 or len(scales_shape) != 3:
+        raise ShadowCodecError("shadow bank arrays must be 3-D")
+    groups = in_dim // SHADOW_GROUP
+    expected_words = groups * (
+        _B1_WORDS_PER_GROUP if codec == "b1" else _T158_BYTES_PER_GROUP
+    )
+    if (
+        int(packed_shape[0]) < 1
+        or int(packed_shape[1]) != out_dim
+        or int(packed_shape[2]) != expected_words
+    ):
+        raise ShadowCodecError(
+            f"shadow packed shape {tuple(packed_shape)} does not match "
+            f"codec {codec!r}, out={out_dim}, groups={groups}"
+        )
+    if (
+        int(scales_shape[0]) != int(packed_shape[0])
+        or int(scales_shape[1]) != out_dim
+        or int(scales_shape[2]) != groups
+    ):
+        raise ShadowCodecError(
+            f"shadow scales shape {tuple(scales_shape)} does not match "
+            f"packed capacity={int(packed_shape[0])}, out={out_dim}, groups={groups}"
+        )
+    total = rows * out_dim
+    if total >= 2**31:
+        raise ShadowCodecError(f"shadow gather grid too large: {total}")
+    blocks_per_row = -(-out_dim // threads_per_tg)
+    return rows * blocks_per_row * threads_per_tg
+
+
+def bind_shadow_gather_mm(
+    *,
+    codec: str,
+    dtype: mx.Dtype,
+    rows: int,
+    in_dim: int,
+    out_dim: int,
+    packed_shape: Sequence[int],
+    scales_shape: Sequence[int],
+    threads_per_tg: int,
+    stage: bool,
+) -> BoundShadowGather:
+    """Validate fixed bank geometry once and return its direct launch."""
+
+    grid_x = _validate_bound_geometry(
+        codec,
+        dtype,
+        rows,
+        in_dim,
+        out_dim,
+        packed_shape,
+        scales_shape,
+        threads_per_tg,
+        stage,
+    )
+    kernel = _shadow_gather_kernel(
+        codec,
+        dtype,
+        int(threads_per_tg),
+        int(in_dim),
+        bool(stage),
+    )
+    return BoundShadowGather(
+        kernel=kernel,
+        dtype=dtype,
+        rows=int(rows),
+        in_dim=int(in_dim),
+        out_dim=int(out_dim),
+        threads_per_tg=int(threads_per_tg),
+        grid_x=grid_x,
+    )
 
 
 def _header() -> str:

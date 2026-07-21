@@ -371,9 +371,15 @@ class ExpertStreamingConfig:
             )
         )
         object.__setattr__(self, "mmap_island_layers", normalized_mmap)
-        if self.banked_codec not in {"none", "rans32x-v1"}:
+        allowed_banked_codecs = {"none", "rans32x-v1"}
+        if (
+            self.model_key == "glm52-expert-q1t"
+            and self.slot_layout == "fused-rans"
+        ):
+            allowed_banked_codecs.add("rans32x-uniform-packed-v1")
+        if self.banked_codec not in allowed_banked_codecs:
             raise ValueError(
-                "banked_codec must be 'none' or 'rans32x-v1'"
+                "banked_codec is incompatible with this model and slot layout"
             )
         if self.streamed_codec not in {"none", "rans32x-v1"}:
             raise ValueError(
@@ -445,10 +451,19 @@ class ExpertStreamingConfig:
             "direct-slots",
             "component-banks",
             "metal-mmap",
+            "fused-rans",
         }:
             raise ValueError(
-                "slot_layout must be 'direct-slots', 'component-banks', or 'metal-mmap'"
+                "slot_layout must be 'direct-slots', 'component-banks', "
+                "'metal-mmap', or 'fused-rans'"
             )
+        if self.slot_layout == "fused-rans":
+            from .glm52_q1t_over10 import validate_glm52_q1t_fused_rans_config
+
+            try:
+                validate_glm52_q1t_fused_rans_config(self)
+            except ValueError as exc:
+                raise ExpertStreamingConfigurationError(str(exc)) from None
         for name in (
             "prefer_sidecar",
             "verify_record_hashes",
@@ -505,7 +520,7 @@ class ExpertStreamingConfig:
         if self.slot_layout == "metal-mmap":
             expert_cache_limit_bytes = 0
             transient_slots = spec.top_k
-        return plan_expert_memory(
+        plan = plan_expert_memory(
             spec,
             total_limit_bytes=self.memory_limit_bytes,
             context_tokens=self.max_live_kv_tokens,
@@ -525,6 +540,7 @@ class ExpertStreamingConfig:
             miss_shadow=self.miss_shadow,
             miss_shadow_layers=self.miss_shadow_layers,
         )
+        return plan
 
     def to_dict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in self.__dataclass_fields__}

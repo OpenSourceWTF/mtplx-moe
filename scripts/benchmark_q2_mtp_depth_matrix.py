@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark real expert-Q2 trunks with their resident BF16 MTP heads."""
+"""Benchmark real streamed expert trunks with their resident MTP heads."""
 
 from __future__ import annotations
 
@@ -24,6 +24,13 @@ if str(_ROOT) not in sys.path:
 from mtplx.benchmarks.resource_telemetry import (  # noqa: E402
     PowermetricsCollector,
     ResourceTelemetrySampler,
+)
+from mtplx.glm52_q1t_over10 import (  # noqa: E402
+    GLM52_Q1T_FUSED_RANS_CODEC,
+    GLM52_Q1T_FUSED_RANS_GATE_UP_THREADGROUPS,
+    GLM52_Q1T_MAX_TOTAL_MEMORY_BYTES,
+    GLM52_Q1T_PERSISTENT_SLOTS_PER_LAYER,
+    GLM52_Q1T_TRANSIENT_SLOTS,
 )
 from mtplx.optimization_profiles import (  # noqa: E402
     profile_conflict_warnings,
@@ -61,7 +68,16 @@ MODEL_SPECS = {
         "mtp_artifacts": Path("~/.cache/huggingface/glm52-mtp-layer78"),
         "prompt_tail": None,
     },
+    "glm52-q1t": {
+        "model_key": "glm52-expert-q1t",
+        "depths": (1, 2, 3, 4, 5),
+        "model_root": Path("~/.cache/huggingface/glm52-expert-only-mlx-q1t"),
+        "mtp_artifacts": Path("~/.cache/huggingface/glm52-mtp-layer78-q4"),
+        "prompt_tail": None,
+    },
 }
+
+DEFAULT_MODELS = ("hy3-q2", "glm52-q2")
 
 DEFAULT_RUNTIME_OPTIONS = {
     "memory_limit": "112GiB",
@@ -103,7 +119,6 @@ DEFAULT_RUNTIME_OPTIONS = {
     "powermetrics": False,
     "powermetrics_interval_ms": 250,
 }
-
 
 class BenchmarkConfigurationError(ValueError):
     """Raised before model loading when the requested matrix is invalid."""
@@ -222,6 +237,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be nonnegative")
+    return parsed
+
+
 def _integer_csv(value: str) -> tuple[int, ...]:
     values: list[int] = []
     for piece in value.replace(";", ",").split(","):
@@ -308,6 +330,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=MODEL_SPECS["glm52-q2"]["prompt_tail"],
     )
+    parser.add_argument(
+        "--glm52-q1t-model-root",
+        type=Path,
+        default=MODEL_SPECS["glm52-q1t"]["model_root"],
+    )
+    parser.add_argument("--glm52-q1t-manifest", type=Path)
+    parser.add_argument(
+        "--glm52-q1t-mtp-artifacts",
+        type=Path,
+        default=MODEL_SPECS["glm52-q1t"]["mtp_artifacts"],
+    )
+    parser.add_argument(
+        "--glm52-q1t-prompt-tail",
+        type=Path,
+        default=MODEL_SPECS["glm52-q1t"]["prompt_tail"],
+    )
 
     parser.add_argument("--memory-limit", default="112GiB")
     parser.add_argument("--runtime-reserve", default="12GiB")
@@ -319,10 +357,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-scope", choices=("layer", "global"), default="layer")
     parser.add_argument(
         "--slot-layout",
-        choices=("direct-slots", "component-banks", "metal-mmap"),
+        choices=("direct-slots", "component-banks", "metal-mmap", "fused-rans"),
         default="component-banks",
     )
-    parser.add_argument("--transient-slots", type=_positive_int, default=8)
+    parser.add_argument("--transient-slots", type=_nonnegative_int, default=8)
     parser.add_argument(
         "--q2-expert-kernel",
         choices=("stock", "nax", "fused", "fused-nax"),
@@ -483,11 +521,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--banked-codec",
         default="none",
-        choices=["none", "rans32x-v1"],
+        choices=["none", "rans32x-v1", "rans32x-uniform-packed-v1"],
         help=(
             "Lossless codec of the banked sidecar. 'rans32x-v1' stores each "
             "component bank as a static order-0 byte-rANS container that the "
-            "in-kernel decoder rebuilds at load (issue #51 C7)."
+            "in-kernel decoder rebuilds at load (issue #51 C7); the uniform-"
+            "packed codec is restricted to the GLM Q1T fused-rANS lane."
         ),
     )
     parser.add_argument(
@@ -652,7 +691,7 @@ def _expand(path: Path | str) -> Path:
 
 
 def _requests_from_args(args: argparse.Namespace) -> list[dict[str, Any]]:
-    selected = list(args.models or MODEL_SPECS)
+    selected = list(args.models or DEFAULT_MODELS)
     if len(set(selected)) != len(selected):
         raise BenchmarkConfigurationError("--model values must not repeat")
     requests: list[dict[str, Any]] = []
@@ -663,11 +702,17 @@ def _requests_from_args(args: argparse.Namespace) -> list[dict[str, Any]]:
             mtp_artifacts = args.hy3_q2_mtp_artifacts
             prompt_tail = args.hy3_q2_prompt_tail
             depths = args.hy3_depths
-        else:
+        elif model == "glm52-q2":
             model_root = args.glm52_q2_model_root
             manifest = args.glm52_q2_manifest
             mtp_artifacts = args.glm52_q2_mtp_artifacts
             prompt_tail = args.glm52_q2_prompt_tail
+            depths = args.glm52_depths
+        else:
+            model_root = args.glm52_q1t_model_root
+            manifest = args.glm52_q1t_manifest
+            mtp_artifacts = args.glm52_q1t_mtp_artifacts
+            prompt_tail = args.glm52_q1t_prompt_tail
             depths = args.glm52_depths
         model_root = _expand(model_root)
         request = {
@@ -1490,13 +1535,23 @@ def _reset_expert_streaming(runtime: Any) -> None:
     reset()
 
 
-def _streaming_cache_metrics(
-    runtime: Any,
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+def _expert_streaming_snapshot(runtime: Any) -> dict[str, Any] | None:
     snapshot_fn = getattr(runtime, "expert_streaming_snapshot", None)
     if not callable(snapshot_fn):
-        return None, None
+        return None
     snapshot = snapshot_fn()
+    if not isinstance(snapshot, Mapping):
+        return None
+    return _jsonable(snapshot)
+
+
+def _streaming_cache_metrics(
+    runtime: Any,
+    *,
+    snapshot: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if snapshot is None:
+        snapshot = _expert_streaming_snapshot(runtime)
     if not isinstance(snapshot, Mapping):
         return None, None
     cache = snapshot.get("cache")
@@ -1505,6 +1560,109 @@ def _streaming_cache_metrics(
         _jsonable(cache) if isinstance(cache, Mapping) else None,
         _jsonable(cache_by_phase) if isinstance(cache_by_phase, Mapping) else None,
     )
+
+
+def _require_fused_rans_snapshot(snapshot: Any) -> None:
+    """Gate the exact cache72 compressed construction receipt out of path."""
+
+    if not isinstance(snapshot, Mapping):
+        raise BenchmarkGateError("fused-rANS runtime emitted no construction snapshot")
+    if snapshot.get("model_key") != "glm52-expert-q1t":
+        raise BenchmarkGateError("fused-rANS snapshot has the wrong model identity")
+    if snapshot.get("expert_codec") != GLM52_Q1T_FUSED_RANS_CODEC:
+        raise BenchmarkGateError("fused-rANS snapshot has the wrong codec")
+    if (
+        snapshot.get("gate_up_threadgroups")
+        != GLM52_Q1T_FUSED_RANS_GATE_UP_THREADGROUPS
+    ):
+        raise BenchmarkGateError(
+            "fused-rANS gate/up launch geometry is not construction-qualified"
+        )
+    source_bytes = snapshot.get("source_compressed_bytes")
+    if (
+        isinstance(source_bytes, bool)
+        or not isinstance(source_bytes, int)
+        or source_bytes <= 0
+    ):
+        raise BenchmarkGateError("fused-rANS snapshot has no compressed source")
+    if "cache" in snapshot or "cache_by_phase" in snapshot:
+        raise BenchmarkGateError("fused-rANS runtime must not expose expert-cache counters")
+    persistent_bytes = snapshot.get("compressed_rans_persistent_cache_bytes")
+    transient_bytes = snapshot.get("compressed_rans_transient_bytes")
+    allocated_bytes = snapshot.get("compressed_rans_allocated_bytes")
+    if (
+        isinstance(persistent_bytes, bool)
+        or not isinstance(persistent_bytes, int)
+        or persistent_bytes <= 0
+        or isinstance(transient_bytes, bool)
+        or not isinstance(transient_bytes, int)
+        or transient_bytes <= 0
+        or allocated_bytes != persistent_bytes + transient_bytes
+    ):
+        raise BenchmarkGateError("fused-rANS compressed cache byte plan is invalid")
+    if snapshot.get("decoded_expert_cache_bytes") != 0:
+        raise BenchmarkGateError("fused-rANS decoded expert cache must be zero")
+    if (
+        snapshot.get("persistent_slots_per_layer")
+        != GLM52_Q1T_PERSISTENT_SLOTS_PER_LAYER
+    ):
+        raise BenchmarkGateError("fused-rANS must install 116 persistent slots/layer")
+    if snapshot.get("transient_slots") != GLM52_Q1T_TRANSIENT_SLOTS:
+        raise BenchmarkGateError("fused-rANS must install 48 transient slots")
+    if snapshot.get("metal_buffer_count") != 76:
+        raise BenchmarkGateError("fused-rANS compressed cache owner is incomplete")
+    if snapshot.get("metal_slot_view_count") != 0:
+        raise BenchmarkGateError(
+            "fused-rANS must not construct Metal cache slot views"
+        )
+    memory_caps = snapshot.get("memory_caps")
+    if not isinstance(memory_caps, Mapping):
+        raise BenchmarkGateError("fused-rANS runtime emitted no memory cap receipt")
+    total_limit_bytes = memory_caps.get("total_limit_bytes")
+    runtime_reserve_bytes = memory_caps.get("runtime_reserve_bytes")
+    external_residency_bytes = memory_caps.get("external_residency_bytes")
+    mlx_memory_limit_bytes = memory_caps.get("mlx_memory_limit_bytes")
+    mlx_wired_limit_bytes = memory_caps.get("mlx_wired_limit_bytes")
+    if (
+        isinstance(total_limit_bytes, bool)
+        or not isinstance(total_limit_bytes, int)
+        or total_limit_bytes <= 0
+        or total_limit_bytes > GLM52_Q1T_MAX_TOTAL_MEMORY_BYTES
+    ):
+        raise BenchmarkGateError("fused-rANS total memory cap exceeds 96 GiB")
+    if external_residency_bytes != allocated_bytes:
+        raise BenchmarkGateError(
+            "fused-rANS compressed cache residency is not charged to the cap"
+        )
+    if (
+        isinstance(runtime_reserve_bytes, bool)
+        or not isinstance(runtime_reserve_bytes, int)
+        or runtime_reserve_bytes < 0
+        or isinstance(mlx_memory_limit_bytes, bool)
+        or not isinstance(mlx_memory_limit_bytes, int)
+        or mlx_memory_limit_bytes <= 0
+        or mlx_wired_limit_bytes != mlx_memory_limit_bytes
+        or mlx_memory_limit_bytes
+        + runtime_reserve_bytes
+        + external_residency_bytes
+        != total_limit_bytes
+    ):
+        raise BenchmarkGateError("fused-rANS memory cap receipt is inconsistent")
+    memory_plan = snapshot.get("memory_plan")
+    if not isinstance(memory_plan, Mapping):
+        raise BenchmarkGateError("fused-rANS snapshot has no memory plan")
+    if memory_plan.get("decoded_expert_cache_bytes") != 0:
+        raise BenchmarkGateError("fused-rANS decoded expert cache must be zero")
+    if (
+        memory_plan.get("compressed_rans_persistent_cache_bytes")
+        != persistent_bytes
+        or memory_plan.get("compressed_rans_transient_bytes") != transient_bytes
+        or memory_plan.get("persistent_cache_bytes") != persistent_bytes
+        or memory_plan.get("slots_per_layer")
+        != GLM52_Q1T_PERSISTENT_SLOTS_PER_LAYER
+        or memory_plan.get("transient_slots") != GLM52_Q1T_TRANSIENT_SLOTS
+    ):
+        raise BenchmarkGateError("fused-rANS memory plan is not cache72 compressed")
 
 
 def _streaming_counters(runtime: Any) -> dict[str, Any] | None:
@@ -1938,7 +2096,11 @@ def _run_observation(
     stats = _field(result, "stats")
     if stats is None:
         raise BenchmarkGateError("generation result is missing stats")
-    streaming_counters, streaming_counters_by_phase = _streaming_cache_metrics(runtime)
+    streaming_snapshot = _expert_streaming_snapshot(runtime)
+    streaming_counters, streaming_counters_by_phase = _streaming_cache_metrics(
+        runtime,
+        snapshot=streaming_snapshot,
+    )
     failure_evidence = {
         "model": model,
         "depth": depth,
@@ -1947,6 +2109,7 @@ def _run_observation(
         "finish_reason": finish_reason,
         "generation_events": _jsonable(_field(stats, "events", [])),
         "generation_stats": _jsonable(stats),
+        "expert_streaming_snapshot": streaming_snapshot,
         "expert_streaming_counters": streaming_counters,
         "expert_streaming_counters_by_phase": streaming_counters_by_phase,
         "expert_resource_telemetry": (
@@ -2037,6 +2200,10 @@ def _run_observation(
             raise BenchmarkGateError(f"{model} d{depth} triggered a generation guard")
 
         expert_streaming = getattr(runtime, "expert_streaming", None)
+        fused_rans = (
+            getattr(getattr(expert_streaming, "config", None), "slot_layout", None)
+            == "fused-rans"
+        )
         fully_islanded = False
         if expert_streaming is not None:
             streaming_config = expert_streaming.config
@@ -2046,14 +2213,18 @@ def _run_observation(
             fully_islanded = island_total == len(
                 expert_streaming.spec.routed_layer_indices
             )
-        _decode_streaming_counters, decode_cache_hit_rate = (
-            _require_decode_cache_metrics(
-                streaming_counters_by_phase,
-                model=model,
-                depth=depth,
-                fully_islanded=fully_islanded,
+        if fused_rans:
+            _require_fused_rans_snapshot(streaming_snapshot)
+            decode_cache_hit_rate = None
+        else:
+            _decode_streaming_counters, decode_cache_hit_rate = (
+                _require_decode_cache_metrics(
+                    streaming_counters_by_phase,
+                    model=model,
+                    depth=depth,
+                    fully_islanded=fully_islanded,
+                )
             )
-        )
         speculative_event_contract = _validate_speculative_event_contract(
             stats,
             model=model,
@@ -2127,6 +2298,7 @@ def _run_observation(
         "speculative_event_contract": speculative_event_contract,
         "final_state_contract": final_state_contract,
         **metrics,
+        "expert_streaming_snapshot": streaming_snapshot,
         "expert_streaming_counters": streaming_counters,
         "expert_streaming_counters_by_phase": streaming_counters_by_phase,
         "decode_expert_cache_hit_rate": decode_cache_hit_rate,
@@ -2156,6 +2328,8 @@ def _run_observation(
             or compiled_draft is not None,
         },
     }
+    if fused_rans:
+        row["gates"]["fused_rans_cache72_compressed"] = True
     if not row["gates"]["new_prefill_tokens_exact"]:
         raise BenchmarkGateError(
             f"{model} d{depth} did not ingest the full exact prompt"
@@ -2191,12 +2365,27 @@ def _runtime_config(
     model_key: str,
     options: Mapping[str, Any],
 ) -> Any:
+    fused_glm52_q1t = (
+        model_key == "glm52-expert-q1t"
+        and str(options["slot_layout"]) == "fused-rans"
+    )
+    expert_cache_limit = options["expert_cache_limit"]
+    if str(expert_cache_limit).strip().lower() in {"0", "0b"}:
+        expert_cache_limit_bytes = 0
+    else:
+        expert_cache_limit_bytes = apis.parse_memory_bytes(expert_cache_limit)
+    memory_limit_bytes = apis.parse_memory_bytes(options["memory_limit"])
+    if fused_glm52_q1t:
+        memory_limit_bytes = min(
+            memory_limit_bytes,
+            GLM52_Q1T_MAX_TOTAL_MEMORY_BYTES,
+        )
     return apis.config_factory(
         model_key=model_key,
-        memory_limit_bytes=apis.parse_memory_bytes(options["memory_limit"]),
+        memory_limit_bytes=memory_limit_bytes,
         max_live_kv_tokens=int(options["max_live_kv_tokens"]),
         runtime_reserve_bytes=apis.parse_memory_bytes(options["runtime_reserve"]),
-        expert_cache_limit_bytes=apis.parse_memory_bytes(options["expert_cache_limit"]),
+        expert_cache_limit_bytes=expert_cache_limit_bytes,
         cache_policy=str(options["cache_policy"]),
         cache_scope=str(options["cache_scope"]),
         slot_layout=str(options["slot_layout"]),
@@ -2205,14 +2394,13 @@ def _runtime_config(
         hy3_router_kernel=str(options["hy3_router_kernel"]),
         hy3_router_sigmoid=str(options["hy3_router_sigmoid"]),
         hy3_mtp_shared_kernel=str(options["hy3_mtp_shared_kernel"]),
-        hy3_mtp_shared_kernel_depth=int(
-            options["hy3_mtp_shared_kernel_depth"]
-        ),
+        hy3_mtp_shared_kernel_depth=int(options["hy3_mtp_shared_kernel_depth"]),
         deferred_pin_release=bool(options["deferred_pin_release"]),
         max_read_chunk_bytes=apis.parse_memory_bytes(options["read_chunk"]),
         bypass_page_cache=bool(options["bypass_page_cache"]),
         resource_telemetry=bool(options["resource_telemetry"]),
         trace_routes=bool(options["trace_routes"]),
+        route_census=not fused_glm52_q1t,
         island_layers=parse_island_layers(options.get("island_layers", "")),
         island_layer_count=options.get("island_layer_count"),
         resident_quant=options.get("resident_quant") or None,
@@ -2223,17 +2411,11 @@ def _runtime_config(
         verify_record_hashes=(
             options.get("expert_integrity", "per-read") == "per-read"
         ),
-        verify_sidecar_hash_at_open=(
-            options.get("expert_integrity") == "at-open"
-        ),
+        verify_sidecar_hash_at_open=(options.get("expert_integrity") == "at-open"),
         split_route_release=options.get("split_route_release", "fenced"),
-        mmap_island_layers=parse_island_layers(
-            options.get("mmap_island_layers", "")
-        ),
+        mmap_island_layers=parse_island_layers(options.get("mmap_island_layers", "")),
         banked_manifest=(
-            str(options["banked_manifest"])
-            if options.get("banked_manifest")
-            else None
+            str(options["banked_manifest"]) if options.get("banked_manifest") else None
         ),
         banked_codec=str(options.get("banked_codec", "none")),
         mmap_island_wired=bool(options.get("mmap_island_wired", True)),

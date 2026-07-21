@@ -6,6 +6,7 @@ import hashlib
 import importlib
 import importlib.util
 import subprocess
+import sys
 import sysconfig
 from pathlib import Path
 from types import ModuleType
@@ -104,6 +105,9 @@ def load_mmap_extension() -> ModuleType:
     if not output.exists():
         _build(output)
     name = "mtplx._mmap_mlx"
+    registered = sys.modules.get(name)
+    if registered is not None:
+        return registered
     loaded = importlib.util.find_spec(name)
     if loaded is not None:
         return importlib.import_module(name)
@@ -111,7 +115,12 @@ def load_mmap_extension() -> ModuleType:
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load mmap MLX extension from {output}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
     return module
 
 
@@ -133,3 +142,45 @@ def prefetch(arrays: list[object]) -> int:
     """Issue one native MADV_WILLNEED batch for mapped expert records."""
 
     return int(load_mmap_extension().prefetch(arrays))
+
+
+def plan_region(
+    path: Path | str,
+    offset: int,
+    length: int,
+    *,
+    shared_readonly: bool = False,
+):
+    """Validate and retain one fixed file range without mapping its pages."""
+
+    return load_mmap_extension().MappedRegionPlan(
+        str(Path(path)), int(offset), int(length), bool(shared_readonly)
+    )
+
+
+def activate_region(plan: object):
+    """Map one construction-validated range for a bounded execution band."""
+
+    return load_mmap_extension().MappedRegion(plan)
+
+
+def metal_u32(region: object):
+    """Create one transient no-copy Metal array over a mapped region."""
+
+    return load_mmap_extension().metal_u32(region)
+
+
+def metal_u32_slice(region: object, offset: int, length: int):
+    """Create one no-copy Metal array over a page-aligned region subrange."""
+
+    return load_mmap_extension().metal_u32_slice(
+        region,
+        int(offset),
+        int(length),
+    )
+
+
+def allocate_metal_u8(length: int):
+    """Allocate mutable shared Metal bytes without constructing an MLX zero op."""
+
+    return load_mmap_extension().allocate_metal_u8(int(length))
