@@ -93,6 +93,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "island_layers": "",
     "island_layer_count": None,
     "proj_quant": None,
+    "proj_requant": None,
     "kv_quant": None,
     "miss_shadow": None,
     "miss_shadow_layers": None,
@@ -572,6 +573,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--proj-requant",
+        dest="proj_requant",
+        choices=("q4",),
+        default=None,
+        help=(
+            "EXPERIMENT: re-quantize residents that ALREADY loaded quantized "
+            "(e.g. the oq2e checkpoint's q8/gs64 *_proj Linears) down to "
+            "q4/gs64 affine, over the same trunk scope as --proj-quant. "
+            "Distinct from --proj-quant (that only touches BF16 Linears); "
+            "the q8->q4 double quantization is deliberate. No artifact "
+            "rebuild."
+        ),
+    )
+    parser.add_argument(
         "--split-route-release",
         choices=("fenced", "deferred"),
         default="fenced",
@@ -732,6 +747,7 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "island_layers": args.island_layers,
         "island_layer_count": args.island_layer_count,
         "proj_quant": args.proj_quant,
+        "proj_requant": args.proj_requant,
         "kv_quant": args.kv_quant,
         "miss_shadow": args.miss_shadow,
         "miss_shadow_layers": args.miss_shadow_layers,
@@ -774,6 +790,7 @@ def _profile_advisories(
         model_key = MODEL_SPECS[request["model"]]["model_key"]
         observed = {
             "proj_quant": runtime_options.get("proj_quant") or None,
+            "proj_requant": runtime_options.get("proj_requant") or None,
             "kv_quant": runtime_options.get("kv_quant") or None,
             "expert_integrity": runtime_options.get("expert_integrity"),
             "split_route_release": runtime_options.get("split_route_release"),
@@ -2244,6 +2261,7 @@ def _runtime_config(
         island_layers=parse_island_layers(options.get("island_layers", "")),
         island_layer_count=options.get("island_layer_count"),
         proj_quant=options.get("proj_quant") or None,
+        proj_requant=options.get("proj_requant") or None,
         kv_quant=options.get("kv_quant") or None,
         miss_shadow=options.get("miss_shadow") or None,
         miss_shadow_layers=options.get("miss_shadow_layers"),

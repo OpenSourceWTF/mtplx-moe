@@ -94,6 +94,25 @@ def test_enforceable_knobs_are_config_fields_and_known_knobs() -> None:
         assert knob in fields, knob
 
 
+def test_proj_requant_is_a_known_but_non_enforceable_knob() -> None:
+    # The requant experiment knob is registered so every profile must carry a
+    # decision for it, but it is deliberately NOT enforced: q8 -> q4 double
+    # quantization is a sanctioned experiment, never a structural error.
+    assert "proj_requant" in KNOB_NAMES
+    assert "proj_requant" not in ENFORCEABLE_KNOBS
+    assert "proj_requant" in ExpertStreamingConfig.__dataclass_fields__
+    for profile in PROFILES.values():
+        assert "proj_requant" in profile.knobs, profile.model_key
+
+
+def test_oq2e_proj_requant_is_the_pending_experiment_arm() -> None:
+    entry = PROFILES["hy3-expert-oq2e"].knobs["proj_requant"]
+    assert entry.state == "unvalidated"
+    assert entry.value == "q4"
+    assert "q8->q4" in entry.provenance
+    assert "6.443" in entry.provenance and "0.95" in entry.provenance
+
+
 # --------------------------------------------------------------------------
 # Seed-profile content sanity
 # --------------------------------------------------------------------------
@@ -299,4 +318,32 @@ def test_runtime_open_does_not_raise_profile_error_when_knobs_off() -> None:
         ExpertStreamingRuntime.open(
             "/nonexistent/root", "/nonexistent/manifest.json", config
         )
+    assert "not_applicable" not in str(excinfo.value)
+
+
+def test_proj_requant_never_appears_in_not_applicable_violations() -> None:
+    # proj_requant is not enforceable, so even where a profile marks it (it is
+    # unvalidated everywhere) forcing it can never produce a hard violation.
+    assert not_applicable_violations("hy3-expert-oq2e", {"proj_requant": "q4"}) == []
+    assert not_applicable_violations("hy3-expert-q2", {"proj_requant": "q4"}) == []
+
+
+def test_oq2e_proj_quant_still_enforced_while_proj_requant_passes_clean() -> None:
+    # The oq2e directive is: never proj_quant (matches zero BF16 Linears), but
+    # proj_requant q8 -> q4 is the sanctioned experiment. Forcing proj_quant
+    # must still raise; forcing proj_requant must not.
+    forced_proj_quant = _minimal_config(model_key="hy3-expert-oq2e", proj_quant="q4")
+    with pytest.raises(
+        ExpertStreamingConfigurationError, match="proj_quant.*not_applicable"
+    ):
+        ExpertStreamingRuntime.open(
+            "/nonexistent/root", "/nonexistent/manifest.json", forced_proj_quant
+        )
+
+    clean_requant = _minimal_config(model_key="hy3-expert-oq2e", proj_requant="q4")
+    with pytest.raises(Exception) as excinfo:
+        ExpertStreamingRuntime.open(
+            "/nonexistent/root", "/nonexistent/manifest.json", clean_requant
+        )
+    # Fails on missing artifacts, NOT on a profile/not_applicable violation.
     assert "not_applicable" not in str(excinfo.value)

@@ -185,6 +185,12 @@ class ExpertStreamingConfig:
     streamed_codec_verify: bool = True
     mmap_island_wired: bool = True
     proj_quant: str | None = None
+    # EXPERIMENT knob (oq2e resident arm): re-quantize residents that already
+    # loaded quantized (e.g. q8/gs64) DOWN to a lower-bit affine format. This
+    # is a separate mechanism from proj_quant (which only touches BF16
+    # Linears) and does NOT trip its not_applicable enforcement — q8 -> q4
+    # double quantization is deliberate. Only "q4" is sanctioned.
+    proj_requant: str | None = None
     kv_quant: str | None = None
     split_route_release: str = "fenced"
     prefetch_slots: int = 0
@@ -254,6 +260,10 @@ class ExpertStreamingConfig:
             raise ValueError("deferred_pin_release must be bool")
         if self.proj_quant not in {None, "q8", "q4"}:
             raise ValueError("proj_quant must be None, 'q8', or 'q4'")
+        # q8 -> q4 is the only sanctioned requant experiment; reject "q8"
+        # (no-op) and anything else so a typo cannot silently pass through.
+        if self.proj_requant not in {None, "q4"}:
+            raise ValueError("proj_requant must be None or 'q4'")
         if self.kv_quant not in {None, "q8", "q4"}:
             raise ValueError("kv_quant must be None, 'q8', or 'q4'")
         if self.miss_shadow is not None:
@@ -1894,6 +1904,10 @@ class ExpertStreamingRuntime:
                 artifact_root,
                 verify_sidecar_hash=config.verify_sidecar_hash_at_open,
             )
+        # proj_requant is intentionally NOT discounted here: q8 -> q4 requant
+        # only SHRINKS resident bytes vs this manifest-derived plan, so leaving
+        # it out keeps the plan conservative (less wired than planned, never
+        # more) — the safe direction. No discount function by design.
         plan = config.memory_plan(
             model_spec,
             additional_resident_bytes=additional_resident_bytes,

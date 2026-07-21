@@ -126,6 +126,14 @@ def _champion_overrides() -> dict[str, Any]:
             if _env("MTPLX_HY3_PROJ_QUANT", "q4") == "none"
             else _env("MTPLX_HY3_PROJ_QUANT", "q4")
         ),
+        # EXPERIMENT arm for pre-quantized residents (oq2e q8/gs64): default
+        # unset/None; "q4" re-quantizes the trunk *_proj residents down to
+        # q4/gs64. Distinct from proj_quant and safe to set alongside it.
+        "proj_requant": (
+            None
+            if _env("MTPLX_HY3_PROJ_REQUANT", "none") == "none"
+            else _env("MTPLX_HY3_PROJ_REQUANT", "none")
+        ),
         "expert_integrity": _env("MTPLX_HY3_EXPERT_INTEGRITY", "headers-only"),
         "split_route_release": _env("MTPLX_HY3_SPLIT_ROUTE_RELEASE", "deferred"),
         "deferred_pin_release": True,

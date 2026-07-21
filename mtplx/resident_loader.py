@@ -29,6 +29,8 @@ class ResidentLoadReport:
     strict: bool
     proj_quant: str | None = None
     proj_quantized_modules: int = 0
+    proj_requant: str | None = None
+    proj_requantized_modules: int = 0
 
     def as_dict(self) -> dict[str, int | bool | str | None]:
         return {
@@ -40,6 +42,8 @@ class ResidentLoadReport:
             "strict": self.strict,
             "proj_quant": self.proj_quant,
             "proj_quantized_modules": self.proj_quantized_modules,
+            "proj_requant": self.proj_requant,
+            "proj_requantized_modules": self.proj_requantized_modules,
         }
 
 
@@ -235,6 +239,82 @@ def _runtime_quantize_projections(model: Any, mode: str) -> list[str]:
     return quantized
 
 
+_PROJ_REQUANT_BITS = {"q4": 4}
+
+
+def _runtime_requantize_projections(model: Any, mode: str) -> list[str]:
+    """Re-quantize already-quantized trunk ``*_proj`` Linears to fewer bits.
+
+    Distinct mechanism from ``_runtime_quantize_projections`` (proj_quant):
+    that pass only converts BF16 ``nn.Linear`` modules and skips anything
+    already quantized. This one is the deliberate opposite — for checkpoints
+    whose residents ship *pre*-quantized (e.g. oq2e's q8/gs64), it walks the
+    SAME ``proj_quant_covers`` scope but matches ``nn.QuantizedLinear``
+    modules whose bit width exceeds the target, dequantizes each via its own
+    ``(group_size, bits, mode)`` triple, and rebuilds a standard q4/gs64
+    affine ``nn.QuantizedLinear`` through ``QuantizedLinear.from_linear`` —
+    the same canonical builder a load-time quantization would use, so the
+    result is indistinguishable from one. The q8 -> q4 double quantization
+    is acknowledged and deliberate: this is a quality/speed experiment arm.
+
+    Router gates, embeddings, the LM head, norms, and MTP glue keep their
+    loaded precision, exactly as proj_quant leaves them.
+    """
+
+    try:
+        import mlx.core as mx
+        import mlx.nn as nn
+        from mlx.utils import tree_map_with_path
+    except Exception as exc:
+        raise ResidentLoadError(
+            f"MLX is required for projection requantization: {exc}"
+        ) from exc
+    target_bits = _PROJ_REQUANT_BITS[mode]
+    requantized: list[str] = []
+
+    def rebuild(path: str, module: Any) -> Any:
+        if not isinstance(module, nn.QuantizedLinear):
+            return module
+        # bits <= target means nothing to shed (also keeps the pass
+        # idempotent: a q4 module is never touched a second time).
+        if int(module.bits) <= target_bits:
+            return module
+        if not proj_quant_covers(path):
+            return module
+        weight = mx.dequantize(
+            module.weight,
+            module.scales,
+            module.biases,
+            group_size=module.group_size,
+            bits=module.bits,
+            mode=module.mode,
+        )
+        # Carry the dequantized weight (and any bias) through a throwaway
+        # Linear so from_linear runs the exact mx.quantize path a fresh
+        # load-time quantization would; the produced module is a standard
+        # QuantizedLinear, not a bespoke shape.
+        restored = nn.Linear(
+            int(weight.shape[1]), int(weight.shape[0]), bias=("bias" in module)
+        )
+        restored.weight = weight
+        if "bias" in module:
+            restored.bias = module.bias
+        requantized.append(path)
+        return nn.QuantizedLinear.from_linear(
+            restored, group_size=64, bits=target_bits, mode="affine"
+        )
+
+    leaves = model.leaf_modules()
+    leaves = tree_map_with_path(rebuild, leaves, is_leaf=nn.Module.is_module)
+    model.update_modules(leaves)
+    if not requantized:
+        raise ResidentLoadError(
+            f"proj_requant={mode!r} matched no quantized trunk *_proj "
+            f"modules above {target_bits} bits"
+        )
+    return requantized
+
+
 def _verify_kv_quant_honored(model: Any, kv_quant: str) -> None:
     """Reject models whose make_cache silently ignores _mtplx_kv_quant.
 
@@ -316,6 +396,15 @@ def construct_resident_model(
         # frees as its quantized module lands, instead of at function exit.
         weights.clear()
         quantized_paths = _runtime_quantize_projections(model, proj_quant)
+    proj_requant = getattr(runtime.config, "proj_requant", None)
+    requantized_paths: list[str] = []
+    if proj_requant:
+        # Distinct from proj_quant: this re-quantizes the ALREADY-quantized
+        # residents that config-driven loading produced (e.g. oq2e q8/gs64)
+        # down to q4/gs64. Runs after the config quantize + load_weights so
+        # the QuantizedLinears carry real scales/biases to reconstruct from.
+        weights.clear()
+        requantized_paths = _runtime_requantize_projections(model, proj_requant)
     if mx_module is None:
         import mlx.core as mx
     else:
@@ -335,6 +424,8 @@ def construct_resident_model(
         strict=strict,
         proj_quant=proj_quant,
         proj_quantized_modules=len(quantized_paths),
+        proj_requant=proj_requant,
+        proj_requantized_modules=len(requantized_paths),
     )
     setattr(model, "_mtplx_expert_runtime", runtime)
     setattr(model, "_mtplx_resident_load_report", report.as_dict())

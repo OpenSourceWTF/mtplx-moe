@@ -23,7 +23,11 @@ from mtplx.expert_streaming_models import (
 )
 from mtplx.models.hy3_mlx import Model as Hy3Model
 from mtplx.models.hy3_mlx import ModelArgs as Hy3Args
-from mtplx.resident_loader import ResidentLoadError, _runtime_quantize_projections
+from mtplx.resident_loader import (
+    ResidentLoadError,
+    _runtime_quantize_projections,
+    _runtime_requantize_projections,
+)
 
 
 def _tiny_args() -> Hy3Args:
@@ -477,3 +481,229 @@ def test_prefetch_slots_survive_benchmark_option_pipeline() -> None:
     assert default_options["prefetch_slots"] == 0
     default_config = bench._runtime_config(apis, "hy3-expert-q2", default_options)
     assert default_config.prefetch_slots == 0
+
+
+# --------------------------------------------------------------------------
+# proj_requant: q8 -> q4 double quantization of PRE-quantized residents.
+# --------------------------------------------------------------------------
+
+
+def _prequantize_covered_to_q8(model) -> None:
+    """Mimic an oq2e-style load: covered trunk *_proj Linears ship q8/gs64.
+
+    Router gates, embeddings, lm_head, and norms stay BF16 (proj_quant_covers
+    excludes them), so the model matches the checkpoint the requant experiment
+    targets.
+    """
+
+    nn.quantize(
+        model,
+        group_size=64,
+        bits=8,
+        mode="affine",
+        class_predicate=lambda path, module: (
+            isinstance(module, nn.Linear)
+            and not isinstance(module, nn.QuantizedLinear)
+            and proj_quant_covers(path)
+        ),
+    )
+
+
+def test_proj_requant_config_accepts_none_and_q4() -> None:
+    for mode in (None, "q4"):
+        config = ExpertStreamingConfig(**_config_kwargs(proj_requant=mode))
+        assert config.proj_requant == mode
+
+
+def test_proj_requant_config_rejects_q8_and_unknown() -> None:
+    # q8 is a no-op (the sanctioned experiment is strictly q8 -> q4); reject it
+    # alongside any other typo so nothing silently passes through.
+    for bad in ("q8", "q2", "int8"):
+        with pytest.raises(ValueError, match="proj_requant"):
+            ExpertStreamingConfig(**_config_kwargs(proj_requant=bad))
+
+
+def test_proj_requant_does_not_share_state_with_proj_quant() -> None:
+    # Both may be set on one config without interaction; proj_requant must not
+    # engage proj_quant's validation or vice versa.
+    config = ExpertStreamingConfig(
+        **_config_kwargs(proj_quant="q8", proj_requant="q4")
+    )
+    assert config.proj_quant == "q8"
+    assert config.proj_requant == "q4"
+
+
+def test_runtime_requantize_scopes_and_builds_standard_q4_modules() -> None:
+    args = _tiny_args()
+    model = Hy3Model(args)
+    _prequantize_covered_to_q8(model)
+
+    # The exact same scope proj_quant covers, now already-q8 QuantizedLinears.
+    expected = set()
+    for layer in range(args.num_hidden_layers):
+        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            expected.add(f"model.layers.{layer}.self_attn.{proj}")
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        expected.add(f"model.layers.0.mlp.{proj}")
+        expected.add(f"model.layers.1.mlp.shared_mlp.{proj}")
+    for path in expected:
+        module = _resolve(model, path)
+        assert isinstance(module, nn.QuantizedLinear), path
+        assert module.bits == 8 and module.group_size == 64, path
+
+    # Independent q8 -> q4 reference for one covered module, captured BEFORE
+    # the pass replaces it.
+    q8 = model.model.layers[1].self_attn.q_proj
+    ref_w = mx.dequantize(
+        q8.weight, q8.scales, q8.biases,
+        group_size=q8.group_size, bits=q8.bits, mode=q8.mode,
+    )
+    ref_wq, ref_scales, ref_biases = mx.quantize(ref_w, 64, 4, mode="affine")
+
+    requantized = _runtime_requantize_projections(model, "q4")
+    assert set(requantized) == expected
+
+    for path in expected:
+        module = _resolve(model, path)
+        assert isinstance(module, nn.QuantizedLinear), path
+        assert module.bits == 4 and module.group_size == 64, path
+        assert module.mode == "affine", path
+
+    # The router gate, lm_head, embeddings, and norms keep loaded precision.
+    router_gate = model.model.layers[1].mlp.router.gate
+    assert isinstance(router_gate, nn.Linear)
+    assert not isinstance(router_gate, nn.QuantizedLinear)
+    assert isinstance(model.lm_head, nn.Linear)
+    assert not isinstance(model.lm_head, nn.QuantizedLinear)
+    assert isinstance(model.model.embed_tokens, nn.Embedding)
+    assert isinstance(model.model.layers[1].input_layernorm, nn.RMSNorm)
+
+    # BITWISE parity with the independent dequantize(q8) -> quantize(q4)
+    # reference: from_linear runs the same mx.quantize path a load-time
+    # quantization would, so the result is a standard q4 QuantizedLinear.
+    new_qp = model.model.layers[1].self_attn.q_proj
+    mx.eval(
+        new_qp.weight, new_qp.scales, new_qp.biases,
+        ref_wq, ref_scales, ref_biases,
+    )
+    assert bool(mx.array_equal(new_qp.weight, ref_wq).item())
+    assert bool(mx.array_equal(new_qp.scales, ref_scales).item())
+    assert bool(mx.array_equal(new_qp.biases, ref_biases).item())
+
+
+def test_runtime_requantize_leaves_non_covered_quantized_modules_untouched() -> None:
+    args = _tiny_args()
+    model = Hy3Model(args)
+    _prequantize_covered_to_q8(model)
+    # Also quantize a NON-covered module (the router gate) to q8: it must be
+    # left at q8 because proj_quant_covers excludes it, even though it is a
+    # QuantizedLinear above the target bit width.
+    nn.quantize(
+        model,
+        group_size=64,
+        bits=8,
+        mode="affine",
+        class_predicate=lambda path, module: (
+            path == "model.layers.1.mlp.router.gate"
+            and isinstance(module, nn.Linear)
+            and not isinstance(module, nn.QuantizedLinear)
+        ),
+    )
+    router_gate = model.model.layers[1].mlp.router.gate
+    assert isinstance(router_gate, nn.QuantizedLinear) and router_gate.bits == 8
+
+    _runtime_requantize_projections(model, "q4")
+
+    still = model.model.layers[1].mlp.router.gate
+    assert isinstance(still, nn.QuantizedLinear)
+    assert still.bits == 8, "non-covered router gate must not be requantized"
+
+
+def test_runtime_requantize_rejects_matchless_model() -> None:
+    # A model with no covered quantized *_proj modules must fail loud, exactly
+    # like proj_quant's matchless guard.
+    class Bare(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.head = nn.Linear(8, 8, bias=False)
+
+    with pytest.raises(ResidentLoadError, match=r"proj_requant.*matched no"):
+        _runtime_requantize_projections(Bare(), "q4")
+
+
+def test_runtime_requantize_is_idempotent_on_q4_residents() -> None:
+    # Residents already at the target bit width are not touched a second time;
+    # a fresh q4-only covered scope has nothing above the target -> raises.
+    args = _tiny_args()
+    model = Hy3Model(args)
+    _runtime_quantize_projections(model, "q4")  # covered scope now q4/gs64
+    with pytest.raises(ResidentLoadError, match=r"proj_requant.*matched no"):
+        _runtime_requantize_projections(model, "q4")
+
+
+def test_proj_requant_survives_benchmark_option_pipeline() -> None:
+    """CLI vector -> parser -> runtime options -> config factory, mirroring the
+    proj_quant plumbing test: the requant knob must not silently drop."""
+
+    from types import SimpleNamespace
+
+    bench = _load_benchmark_module()
+    parser = bench.build_parser()
+    assert bench.DEFAULT_RUNTIME_OPTIONS["proj_requant"] is None
+
+    apis = SimpleNamespace(
+        config_factory=ExpertStreamingConfig,
+        parse_memory_bytes=parse_memory_bytes,
+    )
+
+    args = parser.parse_args(
+        [
+            "--model", "hy3-q2",
+            "--hy3-q2-model-root", "/tmp",
+            "--memory-limit", "96GiB",
+            "--proj-requant", "q4",
+        ]
+    )
+    options = {
+        **bench.DEFAULT_RUNTIME_OPTIONS,
+        "trace_routes": False,
+        **bench._runtime_options_from_args(args),
+    }
+    assert options["proj_requant"] == "q4"
+    config = bench._runtime_config(apis, "hy3-expert-oq2e", options)
+    assert config.proj_requant == "q4"
+    # proj_requant must not force proj_quant on.
+    assert config.proj_quant is None
+
+    default_args = parser.parse_args(
+        [
+            "--model", "hy3-q2",
+            "--hy3-q2-model-root", "/tmp",
+            "--memory-limit", "96GiB",
+        ]
+    )
+    default_options = {
+        **bench.DEFAULT_RUNTIME_OPTIONS,
+        "trace_routes": False,
+        **bench._runtime_options_from_args(default_args),
+    }
+    assert default_options["proj_requant"] is None
+    default_config = bench._runtime_config(apis, "hy3-expert-oq2e", default_options)
+    assert default_config.proj_requant is None
+
+    # q8 is rejected at the argparse boundary (choices=("q4",)).
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--model", "hy3-q2",
+                "--hy3-q2-model-root", "/tmp",
+                "--proj-requant", "q8",
+            ]
+        )
+
+
+def _resolve(model, path: str):
+    module = model
+    for part in path.split("."):
+        module = module[int(part)] if part.isdigit() else getattr(module, part)
+    return module

@@ -62,6 +62,7 @@ VALID_STATES = ("default_on", "default_off", "not_applicable", "unvalidated")
 # "the profile is silent".
 KNOB_NAMES = (
     "proj_quant",
+    "proj_requant",
     "kv_quant",
     "expert_integrity",
     "split_route_release",
@@ -155,6 +156,14 @@ _HY3_EXPERT_Q2 = OptimizationProfile(
                 "Linears; K3 1024/1024 11.107 -> 13.44 +/-0.05 tok/s, "
                 "wired peak 83.1 -> 71.3 GiB (acceptance 1.994 -> 1.813; "
                 "bandwidth win dominates)"
+            ),
+        ),
+        "proj_requant": KnobEntry(
+            state="unvalidated",
+            value=None,
+            provenance=(
+                "mechanism added 2026-07-21 for the oq2e resident "
+                "experiment; no measurement for this model"
             ),
         ),
         "kv_quant": KnobEntry(
@@ -287,6 +296,14 @@ _GLM52_EXPERT_Q2 = OptimizationProfile(
                 "tracked separately (#100)"
             ),
         ),
+        "proj_requant": KnobEntry(
+            state="unvalidated",
+            value=None,
+            provenance=(
+                "mechanism added 2026-07-21 for the oq2e resident "
+                "experiment; no measurement for this model"
+            ),
+        ),
         "kv_quant": KnobEntry(
             state="not_applicable",
             value=None,
@@ -409,6 +426,14 @@ _QWEN36_27B = OptimizationProfile(
                 "resident/streamed split for load-time quantization"
             ),
         ),
+        "proj_requant": KnobEntry(
+            state="unvalidated",
+            value=None,
+            provenance=(
+                "mechanism added 2026-07-21 for the oq2e resident "
+                "experiment; no measurement for this model"
+            ),
+        ),
         "kv_quant": KnobEntry(
             state="default_off",
             value=None,
@@ -503,6 +528,15 @@ _HY3_EXPERT_OQ2E = OptimizationProfile(
                 "load via the config-driven path; _runtime_quantize_projections "
                 "matches zero BF16 Linears and raises. Serving directive for "
                 "this checkpoint: stock bytes, never requantize."
+            ),
+        ),
+        "proj_requant": KnobEntry(
+            state="unvalidated",
+            value="q4",
+            provenance=(
+                "EXPERIMENT arm: q8->q4 double-quantization of "
+                "proj_quant_covers scope; quality gates = 20-task HumanEval "
+                "vs 0.95 and WikiText-2 vs 6.443 (2026-07-21); pending"
             ),
         ),
         "kv_quant": KnobEntry(

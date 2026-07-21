@@ -59,12 +59,20 @@ class LaneConfig:
     read_chunk: str = "8MiB"
     f_nocache: bool = False
     trust_sidecar: bool = False
+    # EXPERIMENT knob applied to the q2 lane only: re-quantize residents that
+    # already loaded quantized (e.g. oq2e q8/gs64) down to q4/gs64. The q4
+    # control lane leaves this None so the comparison stays a clean A/B.
+    proj_requant: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "model_root", Path(self.model_root))
         object.__setattr__(self, "manifest_path", Path(self.manifest_path))
         if self.label not in {"q4", "q2"}:
             raise ValueError("lane label must be 'q4' or 'q2'")
+        if self.proj_requant not in {None, "q4"}:
+            raise ValueError("proj_requant must be None or 'q4'")
+        if self.proj_requant is not None and self.label != "q2":
+            raise ValueError("proj_requant applies to the q2 lane only")
         if not self.model_key:
             raise ValueError("lane model_key must be non-empty")
         if self.cache_policy not in {"frequency", "lru"}:
@@ -1729,6 +1737,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--q2-root", type=Path, required=True)
     parser.add_argument("--q2-manifest", type=Path, required=True)
     parser.add_argument("--q2-model-key", default="glm52-expert-q2")
+    parser.add_argument(
+        "--q2-proj-requant",
+        choices=("q4",),
+        default=None,
+        help=(
+            "EXPERIMENT: re-quantize the q2 lane's already-quantized trunk "
+            "*_proj residents (e.g. oq2e q8/gs64) down to q4/gs64 affine. "
+            "Applies to the q2 lane ONLY; the q4 control lane is untouched."
+        ),
+    )
     parser.add_argument("--memory-limit", required=True)
     parser.add_argument("--expert-cache-limit", required=True)
     parser.add_argument("--runtime-reserve", default="16GiB")
@@ -1838,6 +1856,7 @@ def _load_lane_runtime(config: LaneConfig) -> Any:
         max_read_chunk_bytes=parse_memory_bytes(config.read_chunk),
         bypass_page_cache=config.f_nocache,
         verify_record_hashes=verify_record_hashes,
+        proj_requant=config.proj_requant,
     )
     return load(
         config.model_root,
@@ -1924,6 +1943,7 @@ def main(
         read_chunk=args.read_chunk,
         f_nocache=args.f_nocache,
         trust_sidecar=args.trust_sidecar,
+        proj_requant=args.q2_proj_requant,
     )
     try:
         payload = _compare_quality(
