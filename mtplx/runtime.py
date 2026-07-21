@@ -863,7 +863,7 @@ def _load_impl(
     # gather_qmm lane is validated at its own (possibly different) quant format.
     maybe_run_model_selfcheck(
         model,
-        expert_spec=expert_runtime.spec if expert_runtime is not None else None,
+        expert_spec=getattr(expert_runtime, "spec", None),
     )
     adapter_path = Path(mtp_adapter) if mtp_adapter is not None else None
     adapter_metadata = None
