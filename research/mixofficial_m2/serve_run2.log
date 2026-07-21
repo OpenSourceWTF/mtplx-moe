@@ -1,0 +1,526 @@
+.F.FFF.........                                                          [100%]
+=================================== FAILURES ===================================
+__________ test_t158_layer_dispatches_shadow_gate_up_and_affine3_down __________
+
+tmp_path = PosixPath('/private/var/folders/rp/c6zjx06j18vgfrf_fjzt517m0000gn/T/pytest-of-davidtai/pytest-37/test_t158_layer_dispatches_sha0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x1134db8c0>
+
+    def test_t158_layer_dispatches_shadow_gate_up_and_affine3_down(
+        tmp_path: Path, monkeypatch
+    ) -> None:
+        root, _cfg, spec, manifest_path, _mm = _assemble_mixed_artifact(tmp_path)
+        runtime = _open_mixed(root, spec, manifest_path)
+        try:
+            switch = HotExpertSwitchGLU(runtime, 1)
+            assert switch.codec == MIXED_OFFICIAL_CODEC
+            assert switch._gate_up_tier == "t158"
+            spy = _KernelSpy()
+            spy.install(monkeypatch)
+            rng = np.random.default_rng(3)
+            x = mx.array(rng.standard_normal((1, 1, HIDDEN)).astype(np.float32))
+>           output = switch(x, mx.array([[[1]]], dtype=mx.uint32))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_expert_mixofficial_serve.py:322: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+mtplx/models/expert_mlx.py:1728: in __call__
+    output, _overlap_result = self._run(
+mtplx/models/expert_mlx.py:2394: in _run
+    evaluate_bindings(
+mtplx/models/expert_mlx.py:1929: in evaluate_component_bindings
+    self._dispatch_component_bank(selected, grouped_bindings)
+mtplx/models/expert_mlx.py:1719: in _dispatch_component_bank
+    return _run_component_bank_mixed(
+mtplx/models/expert_mlx.py:1492: in _run_component_bank_mixed
+    return _gather_component_bank_mixed(
+mtplx/models/expert_mlx.py:1543: in _gather_component_bank_mixed
+    gate = shadow(x.reshape((rows, in_dim)), "gate_proj")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+mtplx/models/expert_mlx.py:1534: in shadow
+    return shadow_gather_mm(
+tests/test_expert_mixofficial_serve.py:296: in shadow
+    return original_shadow(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+x = array([[2.04092, -2.55567, 0.418099, ..., 0.0613535, -0.9641, 0.757221]], dtype=float32)
+expert_ids = array([0], dtype=int32)
+packed = array([[[57, 121, 222, ..., 69, 131, 76],
+        [200, 94, 48, ..., 50, 196, 16],
+        [160, 187, 76, ..., 151, 13... ...,
+        [0, 0, 0, ..., 0, 0, 0],
+        [0, 0, 0, ..., 0, 0, 0],
+        [0, 0, 0, ..., 0, 0, 0]]], dtype=uint8)
+scales = array([[[16264],
+        [16279],
+        [16274],
+        ...,
+        [16264],
+        [16283],
+        [16273]],
+       [[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]]], dtype=uint16)
+
+    def shadow_gather_mm(
+        x: mx.array,
+        expert_ids: mx.array,
+        packed: mx.array,
+        scales: mx.array,
+        *,
+        codec: str,
+        threads_per_tg: int | None = None,
+        stage: bool | None = None,
+    ) -> mx.array:
+        """Gather-matmul one projection from a shadow bank.
+    
+        ``x``: (rows, in) hidden rows, one per assignment. ``expert_ids``:
+        (rows,) int32 bank rows. ``packed``: (experts, out, words) u32 for
+        ``b1`` / (experts, out, bytes) u8 for ``t158``. ``scales``:
+        (experts, out, in/64) u16 bf16 bits. Returns (rows, out) in
+        ``x.dtype`` (fp32 accumulate).
+    
+        ``threads_per_tg`` / ``stage`` override the per-codec tuned defaults
+        (one output element per thread; optionally stage ``x[row]`` in
+        threadgroup memory). Callers normally leave these at the defaults.
+        """
+    
+        if x.ndim != 2:
+            raise ShadowCodecError(f"shadow_gather_mm expects 2-D x, got {x.shape}")
+        if packed.ndim != 3 or scales.ndim != 3:
+            raise ShadowCodecError("shadow bank arrays must be (experts, out, packed)")
+        rows, in_dim = int(x.shape[0]), int(x.shape[1])
+        out_dim = int(packed.shape[1])
+        groups = in_dim // SHADOW_GROUP
+        if in_dim % SHADOW_GROUP:
+            raise ShadowCodecError(
+                f"shadow input dim {in_dim} is not a multiple of {SHADOW_GROUP}"
+            )
+        if int(scales.shape[1]) != out_dim or int(scales.shape[2]) != groups:
+            raise ShadowCodecError(
+                f"shadow scales shape {tuple(scales.shape)} does not match "
+                f"out={out_dim} groups={groups}"
+            )
+        expected_words = groups * (
+            _B1_WORDS_PER_GROUP if codec == "b1" else _T158_BYTES_PER_GROUP
+        )
+        if int(packed.shape[2]) != expected_words:
+            raise ShadowCodecError(
+                f"shadow packed shape {tuple(packed.shape)} does not match "
+                f"codec {codec!r} groups={groups}"
+            )
+    
+        defaults = _DEFAULTS.get(codec)
+        if defaults is None:  # pragma: no cover - guarded above via expected_words
+            raise ShadowCodecError(f"unknown shadow codec {codec!r}")
+        tpt = int(defaults["threads_per_tg"] if threads_per_tg is None else threads_per_tg)
+        if tpt < 1:
+            raise ShadowCodecError("threads_per_tg must be >= 1")
+        use_stage = bool(defaults["stage"] if stage is None else stage)
+        if use_stage and in_dim > _STAGE_MAX_IN:
+            use_stage = False  # keep threadgroup memory within budget
+    
+        total = rows * out_dim
+        if total <= 0:
+            raise ShadowCodecError("shadow_gather_mm requires at least one assignment")
+        if total >= 2**31:  # metal_kernel output element counts must stay < 2^31
+            raise ShadowCodecError(f"shadow gather grid too large: {total}")
+    
+        kernel = _shadow_gather_kernel(codec, x.dtype, tpt, in_dim, use_stage)
+        blocks_per_row = -(-out_dim // tpt)
+        threadgroups = rows * blocks_per_row
+        grid_x = threadgroups * tpt
+>       (out,) = kernel(
+            inputs=[
+                mx.contiguous(x),
+                expert_ids.astype(mx.int32),
+                packed,
+                scales,
+                int(rows),
+                int(out_dim),
+                int(in_dim),
+            ],
+            template=[("T", x.dtype)],
+            grid=(grid_x, 1, 1),
+            threadgroup=(tpt, 1, 1),
+            output_shapes=[(rows, out_dim)],
+            output_dtypes=[x.dtype],
+        )
+E       ValueError: [metal_kernel] Only supports the GPU.
+
+mtplx/kernels/shadow_gather.py:453: ValueError
+________________ test_switch_output_matches_dense_reference[1] _________________
+
+tmp_path = PosixPath('/private/var/folders/rp/c6zjx06j18vgfrf_fjzt517m0000gn/T/pytest-of-davidtai/pytest-37/test_switch_output_matches_den0')
+layer = 1
+
+    @pytest.mark.parametrize("layer", ROUTED_LAYERS)
+    def test_switch_output_matches_dense_reference(tmp_path: Path, layer: int) -> None:
+        root, _cfg, spec, manifest_path, _mm = _assemble_mixed_artifact(tmp_path)
+        runtime = _open_mixed(root, spec, manifest_path)
+        manifest = load_expert_manifest(manifest_path)
+        try:
+            switch = HotExpertSwitchGLU(runtime, layer)
+            rng = np.random.default_rng(layer * 17)
+            x = mx.array(rng.standard_normal((1, 1, HIDDEN)).astype(np.float32))
+            expert = 1
+>           output = switch(x, mx.array([[[expert]]], dtype=mx.uint32))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_expert_mixofficial_serve.py:365: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+mtplx/models/expert_mlx.py:1728: in __call__
+    output, _overlap_result = self._run(
+mtplx/models/expert_mlx.py:2394: in _run
+    evaluate_bindings(
+mtplx/models/expert_mlx.py:1929: in evaluate_component_bindings
+    self._dispatch_component_bank(selected, grouped_bindings)
+mtplx/models/expert_mlx.py:1719: in _dispatch_component_bank
+    return _run_component_bank_mixed(
+mtplx/models/expert_mlx.py:1492: in _run_component_bank_mixed
+    return _gather_component_bank_mixed(
+mtplx/models/expert_mlx.py:1543: in _gather_component_bank_mixed
+    gate = shadow(x.reshape((rows, in_dim)), "gate_proj")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+mtplx/models/expert_mlx.py:1534: in shadow
+    return shadow_gather_mm(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+x = array([[1.10126, 0.338431, -0.539972, ..., -1.48153, -0.487263, 0.306196]], dtype=float32)
+expert_ids = array([0], dtype=int32)
+packed = array([[[57, 121, 222, ..., 69, 131, 76],
+        [200, 94, 48, ..., 50, 196, 16],
+        [160, 187, 76, ..., 151, 13... ...,
+        [0, 0, 0, ..., 0, 0, 0],
+        [0, 0, 0, ..., 0, 0, 0],
+        [0, 0, 0, ..., 0, 0, 0]]], dtype=uint8)
+scales = array([[[16264],
+        [16279],
+        [16274],
+        ...,
+        [16264],
+        [16283],
+        [16273]],
+       [[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]]], dtype=uint16)
+
+    def shadow_gather_mm(
+        x: mx.array,
+        expert_ids: mx.array,
+        packed: mx.array,
+        scales: mx.array,
+        *,
+        codec: str,
+        threads_per_tg: int | None = None,
+        stage: bool | None = None,
+    ) -> mx.array:
+        """Gather-matmul one projection from a shadow bank.
+    
+        ``x``: (rows, in) hidden rows, one per assignment. ``expert_ids``:
+        (rows,) int32 bank rows. ``packed``: (experts, out, words) u32 for
+        ``b1`` / (experts, out, bytes) u8 for ``t158``. ``scales``:
+        (experts, out, in/64) u16 bf16 bits. Returns (rows, out) in
+        ``x.dtype`` (fp32 accumulate).
+    
+        ``threads_per_tg`` / ``stage`` override the per-codec tuned defaults
+        (one output element per thread; optionally stage ``x[row]`` in
+        threadgroup memory). Callers normally leave these at the defaults.
+        """
+    
+        if x.ndim != 2:
+            raise ShadowCodecError(f"shadow_gather_mm expects 2-D x, got {x.shape}")
+        if packed.ndim != 3 or scales.ndim != 3:
+            raise ShadowCodecError("shadow bank arrays must be (experts, out, packed)")
+        rows, in_dim = int(x.shape[0]), int(x.shape[1])
+        out_dim = int(packed.shape[1])
+        groups = in_dim // SHADOW_GROUP
+        if in_dim % SHADOW_GROUP:
+            raise ShadowCodecError(
+                f"shadow input dim {in_dim} is not a multiple of {SHADOW_GROUP}"
+            )
+        if int(scales.shape[1]) != out_dim or int(scales.shape[2]) != groups:
+            raise ShadowCodecError(
+                f"shadow scales shape {tuple(scales.shape)} does not match "
+                f"out={out_dim} groups={groups}"
+            )
+        expected_words = groups * (
+            _B1_WORDS_PER_GROUP if codec == "b1" else _T158_BYTES_PER_GROUP
+        )
+        if int(packed.shape[2]) != expected_words:
+            raise ShadowCodecError(
+                f"shadow packed shape {tuple(packed.shape)} does not match "
+                f"codec {codec!r} groups={groups}"
+            )
+    
+        defaults = _DEFAULTS.get(codec)
+        if defaults is None:  # pragma: no cover - guarded above via expected_words
+            raise ShadowCodecError(f"unknown shadow codec {codec!r}")
+        tpt = int(defaults["threads_per_tg"] if threads_per_tg is None else threads_per_tg)
+        if tpt < 1:
+            raise ShadowCodecError("threads_per_tg must be >= 1")
+        use_stage = bool(defaults["stage"] if stage is None else stage)
+        if use_stage and in_dim > _STAGE_MAX_IN:
+            use_stage = False  # keep threadgroup memory within budget
+    
+        total = rows * out_dim
+        if total <= 0:
+            raise ShadowCodecError("shadow_gather_mm requires at least one assignment")
+        if total >= 2**31:  # metal_kernel output element counts must stay < 2^31
+            raise ShadowCodecError(f"shadow gather grid too large: {total}")
+    
+        kernel = _shadow_gather_kernel(codec, x.dtype, tpt, in_dim, use_stage)
+        blocks_per_row = -(-out_dim // tpt)
+        threadgroups = rows * blocks_per_row
+        grid_x = threadgroups * tpt
+>       (out,) = kernel(
+            inputs=[
+                mx.contiguous(x),
+                expert_ids.astype(mx.int32),
+                packed,
+                scales,
+                int(rows),
+                int(out_dim),
+                int(in_dim),
+            ],
+            template=[("T", x.dtype)],
+            grid=(grid_x, 1, 1),
+            threadgroup=(tpt, 1, 1),
+            output_shapes=[(rows, out_dim)],
+            output_dtypes=[x.dtype],
+        )
+E       ValueError: [metal_kernel] Only supports the GPU.
+
+mtplx/kernels/shadow_gather.py:453: ValueError
+________________ test_switch_output_matches_dense_reference[2] _________________
+
+tmp_path = PosixPath('/private/var/folders/rp/c6zjx06j18vgfrf_fjzt517m0000gn/T/pytest-of-davidtai/pytest-37/test_switch_output_matches_den1')
+layer = 2
+
+    @pytest.mark.parametrize("layer", ROUTED_LAYERS)
+    def test_switch_output_matches_dense_reference(tmp_path: Path, layer: int) -> None:
+        root, _cfg, spec, manifest_path, _mm = _assemble_mixed_artifact(tmp_path)
+        runtime = _open_mixed(root, spec, manifest_path)
+        manifest = load_expert_manifest(manifest_path)
+        try:
+            switch = HotExpertSwitchGLU(runtime, layer)
+            rng = np.random.default_rng(layer * 17)
+            x = mx.array(rng.standard_normal((1, 1, HIDDEN)).astype(np.float32))
+            expert = 1
+            output = switch(x, mx.array([[[expert]]], dtype=mx.uint32))
+            mx.eval(output)
+    
+            dense = _decode_reference(manifest, root, layer, expert)
+            xr = mx.array(np.asarray(x).reshape(1, HIDDEN))
+            gate = mx.matmul(xr, mx.array(dense["gate_proj"]).T)
+            up = mx.matmul(xr, mx.array(dense["up_proj"]).T)
+            reference = mx.matmul(swiglu(gate, up), mx.array(dense["down_proj"]).T)
+            mx.eval(reference)
+    
+            got = np.asarray(output).reshape(-1)
+            ref = np.asarray(reference).reshape(-1)
+>           np.testing.assert_allclose(got, ref, rtol=3e-3, atol=3e-3)
+E           AssertionError: 
+E           Not equal to tolerance rtol=0.003, atol=0.003
+E           
+E           Mismatched elements: 35 / 64 (54.7%)
+E           First 5 mismatches are at indices:
+E            [0]: -30.19061279296875 (ACTUAL), -30.48626708984375 (DESIRED)
+E            [3]: 230.06082153320312 (ACTUAL), 230.79861450195312 (DESIRED)
+E            [4]: 338.4136962890625 (ACTUAL), 337.2085876464844 (DESIRED)
+E            [5]: 461.69244384765625 (ACTUAL), 459.55059814453125 (DESIRED)
+E            [6]: -333.9866638183594 (ACTUAL), -332.5431213378906 (DESIRED)
+E           Max absolute difference among violations: 3.8631897
+E           Max relative difference among violations: 0.13836412
+E            ACTUAL: array([ -30.190613,  230.42723 ,  357.6189  ,  230.06082 ,  338.4137  ,
+E                   461.69244 , -333.98666 ,   97.618835,  364.93396 , -294.7252  ,
+E                   295.0183  ,  -23.89474 , -122.289375,  376.36694 , -269.62524 ,...
+E            DESIRED: array([ -30.486267,  230.39905 ,  356.86078 ,  230.79861 ,  337.2086  ,
+E                   459.5506  , -332.54312 ,   94.6178  ,  363.6695  , -294.69128 ,
+E                   295.05225 ,  -23.176472, -122.355835,  374.88416 , -268.71967 ,...
+
+tests/test_expert_mixofficial_serve.py:377: AssertionError
+____________________ test_full_forward_exercises_both_tiers ____________________
+
+tmp_path = PosixPath('/private/var/folders/rp/c6zjx06j18vgfrf_fjzt517m0000gn/T/pytest-of-davidtai/pytest-37/test_full_forward_exercises_bo0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x113608d10>
+
+    def test_full_forward_exercises_both_tiers(tmp_path: Path, monkeypatch) -> None:
+        root, config_json, spec, manifest_path, _mm = _assemble_mixed_artifact(tmp_path)
+        runtime = _open_mixed(root, spec, manifest_path)
+        try:
+            spy = _KernelSpy()
+            spy.install(monkeypatch)
+            resident = construct_resident_model(root, runtime, config=config_json)
+>           logits = resident.model(mx.array([[1]], dtype=mx.int32))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_expert_mixofficial_serve.py:392: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+mtplx/models/hy3_mlx.py:1209: in __call__
+    hidden = self.model(inputs, cache)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+mtplx/models/hy3_mlx.py:1150: in __call__
+    hidden = layer(hidden, mask, layer_cache)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+mtplx/models/hy3_mlx.py:1004: in __call__
+    return hidden + self.mlp(self.post_attention_layernorm(hidden))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+mtplx/models/hy3_mlx.py:913: in __call__
+    routed, shared = run_switch_with_shared_overlap(
+mtplx/models/expert_mlx.py:2480: in run_switch_with_shared_overlap
+    return overlap(x, indices, shared_work)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+mtplx/models/expert_mlx.py:1743: in run_with_shared_overlap
+    output, shared = self._run(
+mtplx/models/expert_mlx.py:2394: in _run
+    evaluate_bindings(
+mtplx/models/expert_mlx.py:1929: in evaluate_component_bindings
+    self._dispatch_component_bank(selected, grouped_bindings)
+mtplx/models/expert_mlx.py:1719: in _dispatch_component_bank
+    return _run_component_bank_mixed(
+mtplx/models/expert_mlx.py:1492: in _run_component_bank_mixed
+    return _gather_component_bank_mixed(
+mtplx/models/expert_mlx.py:1543: in _gather_component_bank_mixed
+    gate = shadow(x.reshape((rows, in_dim)), "gate_proj")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+mtplx/models/expert_mlx.py:1534: in shadow
+    return shadow_gather_mm(
+tests/test_expert_mixofficial_serve.py:296: in shadow
+    return original_shadow(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+x = array([[0.644782, 0.585808, 0.133606, ..., 0.491549, -0.834457, 1.16454]], dtype=float32)
+expert_ids = array([0], dtype=int32)
+packed = array([[[215, 134, 125, ..., 36, 42, 22],
+        [48, 112, 53, ..., 200, 11, 78],
+        [145, 38, 112, ..., 147, 96... ...,
+        [0, 0, 0, ..., 0, 0, 0],
+        [0, 0, 0, ..., 0, 0, 0],
+        [0, 0, 0, ..., 0, 0, 0]]], dtype=uint8)
+scales = array([[[16280],
+        [16294],
+        [16274],
+        ...,
+        [16283],
+        [16271],
+        [16289]],
+       [[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]]], dtype=uint16)
+
+    def shadow_gather_mm(
+        x: mx.array,
+        expert_ids: mx.array,
+        packed: mx.array,
+        scales: mx.array,
+        *,
+        codec: str,
+        threads_per_tg: int | None = None,
+        stage: bool | None = None,
+    ) -> mx.array:
+        """Gather-matmul one projection from a shadow bank.
+    
+        ``x``: (rows, in) hidden rows, one per assignment. ``expert_ids``:
+        (rows,) int32 bank rows. ``packed``: (experts, out, words) u32 for
+        ``b1`` / (experts, out, bytes) u8 for ``t158``. ``scales``:
+        (experts, out, in/64) u16 bf16 bits. Returns (rows, out) in
+        ``x.dtype`` (fp32 accumulate).
+    
+        ``threads_per_tg`` / ``stage`` override the per-codec tuned defaults
+        (one output element per thread; optionally stage ``x[row]`` in
+        threadgroup memory). Callers normally leave these at the defaults.
+        """
+    
+        if x.ndim != 2:
+            raise ShadowCodecError(f"shadow_gather_mm expects 2-D x, got {x.shape}")
+        if packed.ndim != 3 or scales.ndim != 3:
+            raise ShadowCodecError("shadow bank arrays must be (experts, out, packed)")
+        rows, in_dim = int(x.shape[0]), int(x.shape[1])
+        out_dim = int(packed.shape[1])
+        groups = in_dim // SHADOW_GROUP
+        if in_dim % SHADOW_GROUP:
+            raise ShadowCodecError(
+                f"shadow input dim {in_dim} is not a multiple of {SHADOW_GROUP}"
+            )
+        if int(scales.shape[1]) != out_dim or int(scales.shape[2]) != groups:
+            raise ShadowCodecError(
+                f"shadow scales shape {tuple(scales.shape)} does not match "
+                f"out={out_dim} groups={groups}"
+            )
+        expected_words = groups * (
+            _B1_WORDS_PER_GROUP if codec == "b1" else _T158_BYTES_PER_GROUP
+        )
+        if int(packed.shape[2]) != expected_words:
+            raise ShadowCodecError(
+                f"shadow packed shape {tuple(packed.shape)} does not match "
+                f"codec {codec!r} groups={groups}"
+            )
+    
+        defaults = _DEFAULTS.get(codec)
+        if defaults is None:  # pragma: no cover - guarded above via expected_words
+            raise ShadowCodecError(f"unknown shadow codec {codec!r}")
+        tpt = int(defaults["threads_per_tg"] if threads_per_tg is None else threads_per_tg)
+        if tpt < 1:
+            raise ShadowCodecError("threads_per_tg must be >= 1")
+        use_stage = bool(defaults["stage"] if stage is None else stage)
+        if use_stage and in_dim > _STAGE_MAX_IN:
+            use_stage = False  # keep threadgroup memory within budget
+    
+        total = rows * out_dim
+        if total <= 0:
+            raise ShadowCodecError("shadow_gather_mm requires at least one assignment")
+        if total >= 2**31:  # metal_kernel output element counts must stay < 2^31
+            raise ShadowCodecError(f"shadow gather grid too large: {total}")
+    
+        kernel = _shadow_gather_kernel(codec, x.dtype, tpt, in_dim, use_stage)
+        blocks_per_row = -(-out_dim // tpt)
+        threadgroups = rows * blocks_per_row
+        grid_x = threadgroups * tpt
+>       (out,) = kernel(
+            inputs=[
+                mx.contiguous(x),
+                expert_ids.astype(mx.int32),
+                packed,
+                scales,
+                int(rows),
+                int(out_dim),
+                int(in_dim),
+            ],
+            template=[("T", x.dtype)],
+            grid=(grid_x, 1, 1),
+            threadgroup=(tpt, 1, 1),
+            output_shapes=[(rows, out_dim)],
+            output_dtypes=[x.dtype],
+        )
+E       ValueError: [metal_kernel] Only supports the GPU.
+
+mtplx/kernels/shadow_gather.py:453: ValueError
+=============================== warnings summary ===============================
+<frozen importlib._bootstrap>:488
+  <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type SwigPyPacked has no __module__ attribute
+
+<frozen importlib._bootstrap>:488
+  <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type SwigPyObject has no __module__ attribute
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_expert_mixofficial_serve.py::test_t158_layer_dispatches_shadow_gate_up_and_affine3_down
+FAILED tests/test_expert_mixofficial_serve.py::test_switch_output_matches_dense_reference[1]
+FAILED tests/test_expert_mixofficial_serve.py::test_switch_output_matches_dense_reference[2]
+FAILED tests/test_expert_mixofficial_serve.py::test_full_forward_exercises_both_tiers
+4 failed, 11 passed, 2 warnings in 1.90s
+sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute
