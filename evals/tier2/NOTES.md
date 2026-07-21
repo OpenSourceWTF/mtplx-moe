@@ -262,3 +262,14 @@ AR 37.79 / **K2 42.33** (hard peak 88.4 GiB). Beats the q2-bank championship
 (HumanEval 0.95 identical / wiki +1.6%). Projection from the paired-ratio
 scaling (~41) confirmed. Known caveats carry: K2 single-divergence signature
 (parity False), acceptance 1.564.
+
+## Router M1 scope A/B (2026-07-21 13:10, paired): +4.6% AR; K2 DIVERGENCE ATTRIBUTED
+
+scope-mtp AR 30.60 / K2 37.96 (parity False) vs scope-all AR 32.01 / K2 38.15
+(**parity True**). AR +4.6% as predicted (trunk M1 stock->kernel); K2 +0.5% =
+control held. The persistent K2 single-token divergence is ATTRIBUTED: a
+router-numerics mismatch between lanes (AR reference routed via the stock
+host path at M1 while K2 routed via the fp32 split-K kernel; one near-tie
+logit forks the sequence). Same kernel numerics both lanes -> parity
+restored. Follow-up (one window, when the box frees): champion + requant +
+MTPLX_HY3_ROUTER_SPLITK_M1=all — expect 42.33-class K2 with parity True.
