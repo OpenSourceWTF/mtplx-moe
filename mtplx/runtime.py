@@ -784,10 +784,19 @@ def _load_impl(
                 ):
                     from .models.hy3_mlx import configure_hy3_router_kernels
 
+                    import os as _os
+
+                    # EXPERIMENT gate (2026-07-21): "all" extends the split-K
+                    # kernel to trunk routers at rows==1 (AR decode), which
+                    # historically fell back to the stock host path. Default
+                    # "mtp" preserves the measured ladder behavior exactly.
                     router_kernel_report = configure_hy3_router_kernels(
                         model,
                         expert_streaming_config.hy3_router_kernel,
                         sigmoid_mode=expert_streaming_config.hy3_router_sigmoid,
+                        splitk_m1_scope=_os.environ.get(
+                            "MTPLX_HY3_ROUTER_SPLITK_M1", "mtp"
+                        ),
                     )
                     actual_incremental = int(
                         router_kernel_report.get("incremental_bytes", -1)

@@ -620,15 +620,27 @@ def configure_hy3_router_kernels(
     *,
     available: bool | None = None,
     sigmoid_mode: str = "precise",
+    splitk_m1_scope: str = "mtp",
 ) -> dict[str, int | str]:
-    """Configure every Hy3 router and return explicit model memory accounting."""
+    """Configure every Hy3 router and return explicit model memory accounting.
 
+    ``splitk_m1_scope`` controls which routers run the split-K kernel at
+    rows==1 under the FP32 split-K selector: ``"mtp"`` (historical default —
+    only the MTP head's router; trunk routers fall back to the stock host
+    path at M1) or ``"all"`` (trunk routers too — the M1 shape already has
+    production mileage on the MTP router, this extends it to AR decode).
+    """
+
+    if splitk_m1_scope not in ("mtp", "all"):
+        raise ValueError(
+            f"splitk_m1_scope must be 'mtp' or 'all', got {splitk_m1_scope!r}"
+        )
     reports = []
     for name, module in root.named_modules():
         if not isinstance(module, Router):
             continue
-        splitk_m1 = selector == "mpp-fp32-splitk-r1-fused-r2" and "mtp" in name.split(
-            "."
+        splitk_m1 = selector == "mpp-fp32-splitk-r1-fused-r2" and (
+            splitk_m1_scope == "all" or "mtp" in name.split(".")
         )
         reports.append(
             module.configure_kernel(
@@ -656,6 +668,7 @@ def configure_hy3_router_kernels(
         summary["m1_splitk_count"] = sum(
             report.get("m1_policy") == "splitk" for report in reports
         )
+        summary["m1_scope"] = splitk_m1_scope
         summary["m4_grid_k_parts"] = 32
         summary["other_grid_k_parts"] = 16
     elif selector == "mpp-r1-last-arrival-fused-r2":
