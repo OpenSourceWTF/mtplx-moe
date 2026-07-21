@@ -263,7 +263,9 @@ def _install_split_attention_hook(attn: Any) -> bool:
             and cache is not None
             and not blockwise_enabled
             and not vllm_metal_paged_enabled
-            and 2 <= int(queries.shape[2]) <= 4
+            # 8 rows since 2026-07-21 (second float4 bank): depth 4's
+            # verify window is q_len 5; QL <= 4 compiles identically.
+            and 2 <= int(queries.shape[2]) <= 8
             and can_slice_mask
             and getattr(cache, "keys", None) is not None
             and getattr(cache, "values", None) is not None
@@ -284,7 +286,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
             and cache is not None
             and not blockwise_enabled
             and not vllm_metal_paged_enabled
-            and 2 <= int(queries.shape[2]) <= 4
+            and 2 <= int(queries.shape[2]) <= 8
         ):
             # F23b: enabled verify-shaped dense-cache window that the packed
             # route declined — record why (bail path only).

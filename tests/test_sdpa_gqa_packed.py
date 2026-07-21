@@ -42,7 +42,7 @@ def _fused_reference_tolerance(q, k_live, v_live, ref):
 
 
 @pytest.mark.skipif(not METAL, reason="requires Metal")
-@pytest.mark.parametrize("q_len", [2, 3, 4])
+@pytest.mark.parametrize("q_len", [2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("offset", [515, 2048, 2051])
 def test_packed_matches_fp32_reference_with_capacity_padding(q_len, offset):
     mx.random.seed(offset * 10 + q_len)
@@ -140,10 +140,10 @@ def test_packed_bails_out_of_contract():
     values = mx.random.normal((1, HK, 1024, D)).astype(mx.bfloat16)
     mx.eval(q4, keys, values)
 
-    # q_len outside 2..4
+    # q_len outside 2..8 (cap widened 4 -> 8 in the 2026-07-21 D4 campaign)
     q1 = mx.random.normal((1, HQ, 1, D)).astype(mx.bfloat16)
-    q5 = mx.random.normal((1, HQ, 5, D)).astype(mx.bfloat16)
-    mx.eval(q1, q5)
+    q9 = mx.random.normal((1, HQ, 9, D)).astype(mx.bfloat16)
+    mx.eval(q1, q9)
     assert (
         sdpa_gqa_packed_tail(
             queries=q1, keys=keys, values=values, offset=512, scale=SCALE
@@ -152,7 +152,17 @@ def test_packed_bails_out_of_contract():
     )
     assert (
         sdpa_gqa_packed_tail(
-            queries=q5, keys=keys, values=values, offset=512, scale=SCALE
+            queries=q9, keys=keys, values=values, offset=512, scale=SCALE
+        )
+        is None
+    )
+    # explicit max_q_len still gates below the widened cap
+    q5 = mx.random.normal((1, HQ, 5, D)).astype(mx.bfloat16)
+    mx.eval(q5)
+    assert (
+        sdpa_gqa_packed_tail(
+            queries=q5, keys=keys, values=values, offset=512, scale=SCALE,
+            max_q_len=4,
         )
         is None
     )

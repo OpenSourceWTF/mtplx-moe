@@ -20,7 +20,11 @@ latency is paid once per KV row instead of ``q_len`` times.  Measured
 class; acceptance-decision parity is gated separately before any default.
 
 Contract:
-- ``queries``: ``[1, Hq, q_len, D]`` bf16/fp16, ``2 <= q_len <= 4``.
+- ``queries``: ``[1, Hq, q_len, D]`` bf16/fp16, ``2 <= q_len <= 8`` (rows
+  0..3 in the original float4 bank; rows 4..7 in a second bank added for
+  the 2026-07-21 D4 campaign — q_len 5 is depth 4's verify window. The
+  second bank compiles out at QL <= 4, keeping the shipping D3 shape
+  byte-identical).
 - ``keys``/``values``: the FULL capacity-padded contiguous buffers
   (``KVCache.keys`` / ``TensorOffsetKVCache.cache[0]``) — never the
   ``[..., :offset, :]`` views, which would force a whole-buffer copy.
@@ -81,12 +85,15 @@ def _packed_partials_kernel():
     if not mx.metal.is_available():
         return None
 
-    # QL is a template constant in [2, 4]; the float4 lanes above QL are
-    # dead weight (zero query, outputs never written back).
+    # QL is a template constant in [2, 8]. Rows 0..3 ride the first float4
+    # bank; rows 4..7 ride a second bank that compiles out entirely at
+    # QL <= 4 (the 2026-07-05 shipping shape pays zero extra cost). Lanes
+    # above QL inside a bank are dead weight (zero query, never written).
     source = """
         constexpr int BD = 32;
         constexpr int qk_per_thread = D / BD;
         constexpr int v_per_thread = V / BD;
+        constexpr int QH = (QL > 4) ? (QL - 4) : 0;
 
         typedef float U;
 
@@ -102,6 +109,8 @@ def _packed_partials_kernel():
         thread U o[QL][v_per_thread];
         float4 max_score = Limits<U>::finite_min;
         float4 sum_exp = 0.0f;
+        float4 max_score2 = Limits<U>::finite_min;
+        float4 sum_exp2 = 0.0f;
 
         for (int j = 0; j < QL; ++j) {
             const device InT* q_ptr = queries
@@ -133,26 +142,45 @@ def _packed_partials_kernel():
                 k_vec[i] = static_cast<U>(k_ptr[i]);
             }
             float4 score = 0.0f;
+            float4 score2 = 0.0f;
             for (int i = 0; i < qk_per_thread; ++i) {
                 score.x += q[0][i] * k_vec[i];
                 if (QL > 1) score.y += q[1][i] * k_vec[i];
                 if (QL > 2) score.z += q[2][i] * k_vec[i];
                 if (QL > 3) score.w += q[3][i] * k_vec[i];
+                if (QH > 0) score2.x += q[4][i] * k_vec[i];
+                if (QH > 1) score2.y += q[5][i] * k_vec[i];
+                if (QH > 2) score2.z += q[6][i] * k_vec[i];
+                if (QH > 3) score2.w += q[7][i] * k_vec[i];
             }
             for (int off = 16; off > 0; off >>= 1) {
                 score += simd_shuffle_xor(score, off);
+                if (QH > 0) score2 += simd_shuffle_xor(score2, off);
             }
             float4 new_max = metal::max(max_score, score);
             float4 factor = fast::exp(max_score - new_max);
             float4 exp_score = fast::exp(score - new_max);
             max_score = new_max;
             sum_exp = sum_exp * factor + exp_score;
+            float4 factor2 = 1.0f;
+            float4 exp_score2 = 0.0f;
+            if (QH > 0) {
+                float4 new_max2 = metal::max(max_score2, score2);
+                factor2 = fast::exp(max_score2 - new_max2);
+                exp_score2 = fast::exp(score2 - new_max2);
+                max_score2 = new_max2;
+                sum_exp2 = sum_exp2 * factor2 + exp_score2;
+            }
             for (int i = 0; i < v_per_thread; ++i) {
                 const U v = static_cast<U>(v_ptr[i]);
                 o[0][i] = o[0][i] * factor.x + exp_score.x * v;
                 if (QL > 1) o[1][i] = o[1][i] * factor.y + exp_score.y * v;
                 if (QL > 2) o[2][i] = o[2][i] * factor.z + exp_score.z * v;
                 if (QL > 3) o[3][i] = o[3][i] * factor.w + exp_score.w * v;
+                if (QH > 0) o[4][i] = o[4][i] * factor2.x + exp_score2.x * v;
+                if (QH > 1) o[5][i] = o[5][i] * factor2.y + exp_score2.y * v;
+                if (QH > 2) o[6][i] = o[6][i] * factor2.z + exp_score2.z * v;
+                if (QH > 3) o[7][i] = o[7][i] * factor2.w + exp_score2.w * v;
             }
             k_ptr += (size_t)blocks * D;
             v_ptr += (size_t)blocks * D;
@@ -177,14 +205,20 @@ def _packed_partials_kernel():
                     k_vec[i] = static_cast<U>(k_tail[i]);
                 }
                 float4 score = 0.0f;
+                float4 score2 = 0.0f;
                 for (int i = 0; i < qk_per_thread; ++i) {
                     score.x += q[0][i] * k_vec[i];
                     if (QL > 1) score.y += q[1][i] * k_vec[i];
                     if (QL > 2) score.z += q[2][i] * k_vec[i];
                     if (QL > 3) score.w += q[3][i] * k_vec[i];
+                    if (QH > 0) score2.x += q[4][i] * k_vec[i];
+                    if (QH > 1) score2.y += q[5][i] * k_vec[i];
+                    if (QH > 2) score2.z += q[6][i] * k_vec[i];
+                    if (QH > 3) score2.w += q[7][i] * k_vec[i];
                 }
                 for (int off = 16; off > 0; off >>= 1) {
                     score += simd_shuffle_xor(score, off);
+                    if (QH > 0) score2 += simd_shuffle_xor(score2, off);
                 }
                 // Query row j attends to n iff n <= n_kv - QL + j.
                 float4 vis;
@@ -198,12 +232,31 @@ def _packed_partials_kernel():
                 float4 exp_score = fast::exp(score - new_max) * vis;
                 max_score = new_max;
                 sum_exp = sum_exp * factor + exp_score;
+                float4 factor2 = 1.0f;
+                float4 exp_score2 = 0.0f;
+                if (QH > 0) {
+                    float4 vis2;
+                    vis2.x = (n <= n_kv - QL + 4) ? 1.0f : 0.0f;
+                    vis2.y = (QH > 1 && n <= n_kv - QL + 5) ? 1.0f : 0.0f;
+                    vis2.z = (QH > 2 && n <= n_kv - QL + 6) ? 1.0f : 0.0f;
+                    vis2.w = (QH > 3 && n <= n_kv - QL + 7) ? 1.0f : 0.0f;
+                    score2 = score2 * vis2 + (1.0f - vis2) * Limits<U>::finite_min;
+                    float4 new_max2 = metal::max(max_score2, score2);
+                    factor2 = fast::exp(max_score2 - new_max2);
+                    exp_score2 = fast::exp(score2 - new_max2) * vis2;
+                    max_score2 = new_max2;
+                    sum_exp2 = sum_exp2 * factor2 + exp_score2;
+                }
                 for (int i = 0; i < v_per_thread; ++i) {
                     const U v = static_cast<U>(v_tail[i]);
                     o[0][i] = o[0][i] * factor.x + exp_score.x * v;
                     if (QL > 1) o[1][i] = o[1][i] * factor.y + exp_score.y * v;
                     if (QL > 2) o[2][i] = o[2][i] * factor.z + exp_score.z * v;
                     if (QL > 3) o[3][i] = o[3][i] * factor.w + exp_score.w * v;
+                    if (QH > 0) o[4][i] = o[4][i] * factor2.x + exp_score2.x * v;
+                    if (QH > 1) o[5][i] = o[5][i] * factor2.y + exp_score2.y * v;
+                    if (QH > 2) o[6][i] = o[6][i] * factor2.z + exp_score2.z * v;
+                    if (QH > 3) o[7][i] = o[7][i] * factor2.w + exp_score2.w * v;
                 }
                 k_tail += (size_t)blocks * D;
                 v_tail += (size_t)blocks * D;
@@ -219,8 +272,10 @@ def _packed_partials_kernel():
                 p[i] = static_cast<InT>(o[j][i]);
             }
             if (simd_lid == 0) {
-                sums[o_offset * blocks + block_idx] = sum_exp[j];
-                maxs[o_offset * blocks + block_idx] = max_score[j];
+                const float se = (j < 4) ? sum_exp[j] : sum_exp2[j - 4];
+                const float ms = (j < 4) ? max_score[j] : max_score2[j - 4];
+                sums[o_offset * blocks + block_idx] = se;
+                maxs[o_offset * blocks + block_idx] = ms;
             }
         }
     """
@@ -248,7 +303,7 @@ def sdpa_gqa_packed_tail(
     values: mx.array,
     offset: int | mx.array,
     scale: float,
-    max_q_len: int = 4,
+    max_q_len: int = 8,
 ) -> mx.array | None:
     """Tail-causal SDPA over the first ``offset`` rows of full KV buffers.
 
@@ -263,7 +318,7 @@ def sdpa_gqa_packed_tail(
     bsz, hq, q_len, d = (int(x) for x in queries.shape)
     if bsz != 1:
         return _bail("batch_size")
-    if q_len < 2 or q_len > min(4, int(max_q_len)):
+    if q_len < 2 or q_len > min(8, int(max_q_len)):
         return _bail("q_len")
     hk = int(keys.shape[1])
     capacity = int(keys.shape[2])
