@@ -305,3 +305,13 @@ before the runtime.py pre-flight plan).
 Ops: census-vs-spec precedence matters — q4's own island-placement.json
 ranks a DIFFERENT layer set than the q2-derived order (David's catch);
 spec pin orders must not shadow per-bank census artifacts.
+
+## q4 anchor complete (2026-07-21): 80-envelope AR 2.74 / K2 2.60
+
+Census islands 34 (own placement, census-first live), hard peak 79.8 GiB,
+hit 4-5%, 3.4-3.6 TiB read/cell. Microbench re-run strengthened the kernel
+verdict (4-bit 7.19 µs = 1.15x the 2-bit time for 2x bytes). Q4 GOAL CLOSED:
+kernel exonerated twice, optimization parity complete, TPS anchored at 96
+(3.39/3.00) and 80 (2.74/2.60) — q4 serving is 13-16x under the
+oq2e-requant champion at comparable envelopes; the 2-bit program is the only
+serveable path on this box.
