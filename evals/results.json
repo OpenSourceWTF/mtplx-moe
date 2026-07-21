@@ -508,5 +508,86 @@
       "passed": true
     },
     "verdict": "PASS"
+  },
+  "eval_oq2e_fidelity_vs_bf16": {
+    "comparison": {
+      "delta_median": 0.006352105624725768,
+      "shipped_q2_gs64_median_cosine": 0.9148
+    },
+    "eval": "oq2e weight-space fidelity vs bf16",
+    "per_expert_mean_cosine": {
+      "max": 0.9217052259075831,
+      "mean": 0.9162169391064403,
+      "median": 0.920935802984197,
+      "min": 0.8565023232720622
+    },
+    "per_projection_cosine": {
+      "down_proj": {
+        "max": 0.9214707284989121,
+        "mean": 0.9154108619871527,
+        "median": 0.9200162275053978,
+        "min": 0.8566399180634273
+      },
+      "gate_proj": {
+        "max": 0.9218904403415373,
+        "mean": 0.9165953253851631,
+        "median": 0.9215385291457049,
+        "min": 0.8555670189298284
+      },
+      "up_proj": {
+        "max": 0.9218624829911909,
+        "mean": 0.9166446299470052,
+        "median": 0.9215495095716643,
+        "min": 0.8573000328229308
+      }
+    },
+    "per_tensor_cosine": {
+      "max": 0.9218904403415373,
+      "mean": 0.9162169391064403,
+      "median": 0.9211521056247257,
+      "min": 0.8555670189298284
+    },
+    "per_tensor_relerr": {
+      "max": 0.5725475732074826,
+      "mean": 0.41079969343240214,
+      "median": 0.39734387259663667,
+      "min": 0.3958890173221894
+    },
+    "sample": {
+      "expert_ids": [
+        0,
+        48,
+        96,
+        144,
+        191
+      ],
+      "layer_buckets": {
+        "high": [
+          66,
+          73,
+          79
+        ],
+        "low": [
+          1,
+          6,
+          13
+        ],
+        "mid": [
+          27,
+          40,
+          53
+        ]
+      },
+      "n_experts": 45,
+      "n_tensors": 135
+    },
+    "seconds": 5.8,
+    "self_check_dequant_roundtrip": {
+      "bitwise_identical": true,
+      "device": "cpu",
+      "max_abs_diff": 0.0
+    },
+    "verdict": "PASS",
+    "verdict_basis": "harness validated by bitwise dequant self-check at gs128; the cosine/relerr numbers are the fidelity measurement"
   }
 }
