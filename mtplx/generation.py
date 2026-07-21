@@ -7,7 +7,7 @@ optimized runtime can tighten the same contracts after the MTP-1 gates pass.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 import json
@@ -29,6 +29,7 @@ from .a3b_compiled_target_prefix import (
 )
 from .adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from .attention_context import attention_phase
+from .progress_heartbeat import tick as _owner_progress_tick
 from .cache_state import (
     detach_array_leaf,
     detach_cache_state,
@@ -58,6 +59,7 @@ from .graphbank import (
 )
 from .native_mlp import set_native_mlp_context
 from .loop_guard import LoopGuard, loop_guard_config_from_env
+from .thinking_guard import ThinkingGuard, ThinkingGuardConfig
 from .profiles import resolve_long_context_mtp_depth
 from .runtime import MTPLXRuntime
 from .sampling import (
@@ -143,6 +145,9 @@ def _eval(*values: Any, _caller_depth: int = 1) -> None:
     audit_path = os.environ.get("MTPLX_EVAL_AUDIT")
     if not audit_path:
         mx.eval(*values)
+        # Every settled engine forward (prefill chunk, verify, AR step) proves
+        # the model owner is alive; the stream stall watchdog compares readings.
+        _owner_progress_tick()
         return
 
     try:
@@ -151,6 +156,7 @@ def _eval(*values: Any, _caller_depth: int = 1) -> None:
         caller = None
     started = time.perf_counter()
     mx.eval(*values)
+    _owner_progress_tick()
     elapsed_s = time.perf_counter() - started
     entry = {
         "elapsed_s": elapsed_s,
@@ -1571,6 +1577,29 @@ class GenerationStats:
     bonus_tokens: int = 0
     correction_tokens: int = 0
     verify_calls: int = 0
+    # Context-copy (prompt-lookup) drafting. Counters are cumulative per
+    # generation; the per-round detail stays in events. accepted_tokens counts
+    # verified matches (_cc_nacc), which can exceed emitted tokens when a stop
+    # token truncates the accepted block. suspended/backoff_tokens are gauges
+    # of the end-of-generation state, suspensions counts entries into backoff.
+    context_copy_active: bool = False
+    context_copy_probes: int = 0
+    context_copy_rounds: int = 0
+    context_copy_drafted_tokens: int = 0
+    context_copy_accepted_blocks: int = 0
+    context_copy_accepted_tokens: int = 0
+    context_copy_suspensions: int = 0
+    context_copy_suspended: bool = False
+    context_copy_backoff_tokens: int = 0
+    context_copy_disabled_reason: str | None = None
+    # Grammar-constrained decoding (response_format). constraint_completed is
+    # None when no constraint was active, False when generation ended before
+    # the grammar reached a complete document (truncation is never passed off
+    # as valid output).
+    constraint_active: bool = False
+    constraint_completed: bool | None = None
+    constraint_masked_steps: int = 0
+    constraint_mask_time_s: float = 0.0
     graphbank: dict[str, object] = field(default_factory=dict)
     reject_path_counts: dict[str, int] = field(default_factory=dict)
     repair_time_by_reject_depth_s: dict[str, float] = field(default_factory=dict)
@@ -1588,6 +1617,7 @@ class GenerationStats:
     repetition_stop_trimmed_tokens: int = 0
     repetition_stop_raw_tokens: int = 0
     loop_guard: dict[str, object] = field(default_factory=dict)
+    thinking_guard: dict[str, object] = field(default_factory=dict)
     events: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -3686,6 +3716,227 @@ def _run_device_d2_draft_core(
     ]
 
 
+# Depth-N device draft core ("device"): the whole draft chain — block forward,
+# head logits, and the draft sampler itself — compiled as one graph over the
+# LIVE cycle cache (the committed history cache under committed policy),
+# evaluated with a single sync per cycle. Unlike device-d2 it supports sampled
+# drafts: each level reproduces the host sampler's q construction on device
+# (temp divide, full-vocab logsumexp, top-k sort, cumulative-before top-p with
+# first-token keep, renormalize, inverse-CDF draw) and emits its truncated q
+# support, so the acceptance ratio and rejection residual downstream use
+# exactly the distribution that proposed. Output exactness therefore holds for
+# any q; the rng stream simply lives on device (per-cycle split keys).
+_DEVICE_CORE_MAX_TOP_K = 32
+_DEVICE_CORE_HISTORY_RESERVE = 4096
+
+
+def _device_draft_q_arrays(
+    row: mx.array,
+    *,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+) -> tuple[mx.array, mx.array]:
+    """On-device mirror of ``sparse_distribution_from_mlx_logits``.
+
+    Returns (sorted top-k token ids, renormalized q probs over that support;
+    top-p-dropped entries hold exact zeros). All ops trace under mx.compile.
+    """
+    flat = row.astype(mx.float32) * (1.0 / float(temperature))
+    top_idx = mx.argpartition(-flat, kth=top_k - 1, axis=-1)[:top_k]
+    top_vals = flat[top_idx]
+    order = mx.argsort(-top_vals, axis=-1)
+    top_idx = top_idx[order]
+    top_vals = top_vals[order]
+    if top_p >= 1.0:
+        probs_full = mx.softmax(top_vals, axis=-1)
+    else:
+        probs_full = mx.exp(top_vals - mx.logsumexp(flat, axis=-1))
+    if 0.0 < top_p < 1.0:
+        before = mx.cumsum(probs_full, axis=-1) - probs_full
+        keep = mx.logical_or(before < top_p, mx.arange(top_k) == 0)
+        kept = mx.where(keep, probs_full, mx.zeros_like(probs_full))
+    else:
+        kept = probs_full
+    return top_idx, kept / kept.sum()
+
+
+def _device_core_state_tree(cache: Any) -> list[Any]:
+    """State arrays the compiled draft chain reads and writes.
+
+    Deliberately narrower than ``cache_array_tree``: the rollback_state
+    snapshots that eager trims stash between cycles change shape every cycle
+    and are never touched inside the chain, so including them would force a
+    rebuild per cycle (and did).
+    """
+    tree: list[Any] = []
+    for entry in cache or []:
+        if entry is None:
+            tree.append(None)
+        elif hasattr(entry, "cache"):
+            tree.append(entry.cache)
+        else:
+            tree.append(cache_array_tree([entry]))
+    return tree
+
+
+def _device_core_state_signature(cache: Any) -> tuple[Any, ...]:
+    """Structural signature of the cache state a compiled chain depends on.
+
+    mx arrays are immutable, so eager appends between cycles swap the leaf
+    array OBJECTS while mx.compile re-reads them through the captured list
+    containers — identity changes are routine and harmless. Only the leaf
+    SHAPES/dtypes matter: a capacity growth (ensure_capacity swap to a larger
+    buffer) changes the traced shapes and requires a rebuild.
+    """
+    signature: list[Any] = []
+
+    def visit(node: Any) -> None:
+        if node is None:
+            return
+        if hasattr(node, "shape"):
+            signature.append((tuple(node.shape), str(node.dtype)))
+            return
+        if isinstance(node, (list, tuple)):
+            for child in node:
+                visit(child)
+        elif isinstance(node, dict):
+            for child in node.values():
+                visit(child)
+
+    visit(_device_core_state_tree(cache))
+    return tuple(signature)
+
+
+def _make_device_draft_core(
+    rt: MTPLXRuntime,
+    hidden: mx.array,
+    token_ids: mx.array,
+    *,
+    mtp_hidden_variant: str,
+    depth: int,
+    mtp_cache: Any,
+    draft_sampler: SamplerConfig,
+    seed: int,
+) -> dict[str, Any]:
+    temperature = float(draft_sampler.temperature)
+    top_k = int(draft_sampler.top_k)
+    top_p = float(draft_sampler.top_p)
+    greedy = temperature <= 0
+
+    base_offset = _mtp_cache_offset(mtp_cache)
+    promoted, failures = promote_kv_cache_offsets(
+        mtp_cache,
+        reserve_tokens=depth + 2,
+        initial_reserve_tokens=_DEVICE_CORE_HISTORY_RESERVE,
+    )
+    # Warm one forward per level so every module and cache view is built
+    # before tracing, then trim the warm entries back off the live history.
+    warm_hidden, warm_tok = hidden, token_ids
+    for level in range(1, depth + 1):
+        warm_logits, warm_h = rt.draft_mtp(
+            warm_hidden,
+            warm_tok,
+            mtp_cache=mtp_cache,
+            return_hidden=True,
+            mtp_hidden_variant=mtp_hidden_variant,
+            mtp_depth=level,
+        )
+        warm_tok = mx.argmax(warm_logits[:, -1, :], axis=-1).reshape(1, 1)
+        warm_hidden = warm_h[:, -1:, :]
+    _eval(warm_tok, warm_hidden)
+    vocab_size = int(warm_logits.shape[-1])
+    _rollback_mtp_cache(mtp_cache, base_offset)
+
+    def chain_fn(hidden_states, first_token_ids, level_keys):
+        h, tok = hidden_states, first_token_ids
+        tokens: list[mx.array] = []
+        q_ids: list[mx.array] = []
+        q_probs: list[mx.array] = []
+        for level in range(1, depth + 1):
+            logits_level, hidden_level = rt.draft_mtp(
+                h,
+                tok,
+                mtp_cache=mtp_cache,
+                return_hidden=True,
+                mtp_hidden_variant=mtp_hidden_variant,
+                mtp_depth=level,
+            )
+            row = logits_level[:, -1, :].reshape(-1)
+            if greedy:
+                next_tok = mx.argmax(row, axis=-1).reshape(1, 1)
+            else:
+                top_idx, q_norm = _device_draft_q_arrays(
+                    row,
+                    temperature=temperature,
+                    top_k=min(top_k, vocab_size),
+                    top_p=top_p,
+                )
+                cdf = mx.cumsum(q_norm, axis=-1)
+                u = mx.random.uniform(key=level_keys[level - 1])
+                pick = mx.minimum(
+                    (cdf <= u).sum(), int(top_idx.shape[0]) - 1
+                ).astype(mx.int32)
+                next_tok = top_idx[pick].reshape(1, 1)
+                q_ids.append(top_idx)
+                q_probs.append(q_norm)
+            tokens.append(next_tok)
+            h = hidden_level[:, -1:, :]
+            tok = next_tok
+        return tuple(tokens + q_ids + q_probs)
+
+    compiled = mx.compile(
+        chain_fn,
+        inputs=_device_core_state_tree(mtp_cache),
+        outputs=_device_core_state_tree(mtp_cache),
+    )
+    smoke_keys = mx.random.split(mx.random.key(int(seed) & 0x7FFFFFFF), depth)
+    smoke = compiled(hidden, token_ids, smoke_keys)
+    _eval(smoke)
+    _rollback_mtp_cache(mtp_cache, base_offset)
+    return {
+        "fn": compiled,
+        "depth": depth,
+        "greedy": greedy,
+        "vocab_size": vocab_size,
+        "promoted": promoted,
+        "promotion_failures": failures,
+        "state_signature": _device_core_state_signature(mtp_cache),
+    }
+
+
+def _run_device_draft_core(
+    core: dict[str, Any],
+    hidden: mx.array,
+    primary: int,
+    *,
+    seed: int,
+) -> tuple[list[int], list[SparseDistribution | None]]:
+    depth = int(core["depth"])
+    level_keys = mx.random.split(mx.random.key(int(seed) & 0x7FFFFFFF), depth)
+    result = core["fn"](hidden, mx.array([[primary]]), level_keys)
+    _eval(result)
+    tokens = [int(t.reshape(-1)[0].item()) for t in result[:depth]]
+    if core["greedy"]:
+        return tokens, [
+            SparseDistribution.one_hot(token, core["vocab_size"]) for token in tokens
+        ]
+    dists: list[SparseDistribution | None] = []
+    for ids, probs in zip(result[depth : 2 * depth], result[2 * depth : 3 * depth]):
+        ids_np = np.asarray(ids, dtype=np.int64).reshape(-1)
+        probs_np = np.asarray(probs, dtype=np.float64).reshape(-1)
+        keep = probs_np > 0
+        kept_probs = probs_np[keep]
+        dists.append(
+            SparseDistribution(
+                ids_np[keep],
+                kept_probs / kept_probs.sum(),
+                core["vocab_size"],
+            )
+        )
+    return tokens, dists
+
+
 def _draft_confidence_metrics(logits: mx.array, *, topk: int = 8) -> dict[str, float]:
     k = max(2, min(int(topk), int(logits.shape[-1])))
     top_values = mx.topk(logits.astype(mx.float32), k)
@@ -4190,8 +4441,14 @@ def generate_ar(
     prefill_callback: Callable[[dict[str, Any]], None] | None = None,
     repetition_stop: bool = False,
     loop_guard: bool = False,
+    thinking_guard: ThinkingGuardConfig | None = None,
+    constraint: Any | None = None,
 ) -> GenerationOutput:
     if getattr(rt, "backend_id", None) == "gemma4_assistant":
+        if constraint is not None:
+            raise ValueError(
+                "constrained decoding is not supported on the gemma4_assistant backend"
+            )
         from .backends.gemma4_assistant import generate_gemma4_ar
 
         return generate_gemma4_ar(
@@ -4269,12 +4526,42 @@ def generate_ar(
             pass
     tokens: list[int] = []
     events: list[dict] = []
+    if constraint is not None:
+        # The repetition trimmer retracts committed tokens, which would
+        # desync the grammar matcher; constrained output is schema-shaped.
+        repetition_stop = False
     repetition_config = _repetition_stop_config(bool(repetition_stop))
     repetition_result: RepetitionStopResult | None = None
     _loop_guard_config = loop_guard_config_from_env(
         bool(loop_guard), tokenizer=getattr(rt, "tokenizer", None)
     )
     _loop_guard = LoopGuard(_loop_guard_config) if _loop_guard_config.enabled else None
+    _thinking_guard = (
+        ThinkingGuard(thinking_guard)
+        if thinking_guard is not None and thinking_guard.enabled
+        else None
+    )
+
+    def _ar_steer_overlay(working: Sequence[int]) -> dict[int, float] | None:
+        merged = (
+            _loop_guard.penalties_for(working)
+            if _loop_guard is not None and _loop_guard.armed
+            else None
+        )
+        forced = (
+            _thinking_guard.overlay_for(working)
+            if _thinking_guard is not None and _thinking_guard.steering_active
+            else None
+        )
+        if not forced:
+            return merged
+        if not merged:
+            return forced
+        combined = dict(merged)
+        for token_id, value in forced.items():
+            combined[token_id] = combined.get(token_id, 0.0) + value
+        return combined
+
     target_decode_time = 0.0
     target_forward_graph_time = 0.0
     target_eval_time = 0.0
@@ -4308,6 +4595,10 @@ def generate_ar(
             "verify_hidden_eval_time_s": 0.0,
             "verify_joint_eval_time_s": target_eval_time,
             "verify_target_distribution_time_s": 0.0,
+            "target_distribution_materialized_rows": 0,
+            "target_distribution_materialized_windows": 0,
+            "lazy_bonus_verify_calls": 0,
+            "lazy_bonus_commit_time_s": 0.0,
             "verify_eval_unattributed_time_s": 0.0,
             "draft_time_s": 0.0,
             "accept_time_s": 0.0,
@@ -4372,22 +4663,48 @@ def generate_ar(
                         },
                     }
                 )
+        if _thinking_guard is not None:
+            _tg_transition = _thinking_guard.observe(tokens)
+            if _tg_transition is not None:
+                events.append(
+                    {
+                        "step": step,
+                        "thinking_guard": {
+                            "transition": _tg_transition,
+                            "completion_tokens": len(tokens),
+                            **_thinking_guard.summary(),
+                        },
+                    }
+                )
+        _steer_active = (
+            (_loop_guard is not None and _loop_guard.armed)
+            or (_thinking_guard is not None and _thinking_guard.steering_active)
+        )
+        logits_row = logits[0]
+        if constraint is not None:
+            # Masking precedes every shaping step in _sample_from_logits, so
+            # both the greedy and sampled branches draw from the constrained
+            # distribution (-inf survives temperature/top-p/penalties).
+            logits_row = constraint.mask_logits_row(logits_row)
         token, _ = _sample_from_logits(
-            logits[0],
+            logits_row,
             sampler,
             rng,
             token_counts=Counter(tokens)
             if (sampler.presence_penalty or sampler.frequency_penalty)
             else None,
-            penalty_overlay=(
-                _loop_guard.penalties_for(tokens)
-                if _loop_guard is not None and _loop_guard.armed
-                else None
-            ),
+            penalty_overlay=(_ar_steer_overlay(tokens) if _steer_active else None),
         )
         tokens.append(token)
         emit_token(token)
         events.append({"step": step, "token": token})
+        if constraint is not None:
+            constraint.advance(token)
+            if constraint.stopped and not _is_stop(token, stop_token_ids):
+                # The grammar reached its terminal without the model emitting
+                # a stop token; end here rather than decode past the document.
+                events.append({"step": step, "constraint_stop": True})
+                break
         repetition_result = _trim_repeated_suffix(tokens, repetition_config)
         if repetition_result is not None:
             events.append(
@@ -4476,8 +4793,19 @@ def generate_ar(
             else len(tokens) + repetition_result.repeated_tokens
         ),
         loop_guard=(_loop_guard.summary() if _loop_guard is not None else {}),
+        thinking_guard=(
+            _thinking_guard.summary() if _thinking_guard is not None else {}
+        ),
         decode_trace_path=str(trace.path) if trace.path is not None else None,
         decode_trace_run_id=trace.run_id if trace.enabled else None,
+        constraint_active=constraint is not None,
+        constraint_completed=(constraint.completed if constraint is not None else None),
+        constraint_masked_steps=(
+            constraint.masked_steps if constraint is not None else 0
+        ),
+        constraint_mask_time_s=(
+            constraint.mask_time_s if constraint is not None else 0.0
+        ),
         events=events,
     )
     _attach_runtime_diagnostics(
@@ -5221,7 +5549,9 @@ def generate_mtpk(
     prefill_callback: Callable[[dict[str, Any]], None] | None = None,
     repetition_stop: bool = False,
     loop_guard: bool = False,
+    thinking_guard: ThinkingGuardConfig | None = None,
     vision_splice: Any | None = None,
+    constraint: Any | None = None,
 ) -> GenerationOutput:
     """Generate with a fixed native-MTP depth.
 
@@ -5308,8 +5638,8 @@ def generate_mtpk(
             "online_correction_cache_key must be 'local_prefix', "
             "'source_token', or 'primary_source'"
         )
-    if draft_core not in {"stock", "device-d2"}:
-        raise ValueError("draft_core must be 'stock' or 'device-d2'")
+    if draft_core not in {"stock", "device-d2", "device"}:
+        raise ValueError("draft_core must be 'stock', 'device-d2', or 'device'")
     if not 0.0 <= adapter_ensemble_epsilon <= 1.0:
         raise ValueError("adapter_ensemble_epsilon must be in [0, 1]")
     if adapter_ensemble_min_depth < 1:
@@ -5375,6 +5705,10 @@ def generate_mtpk(
         _default_stop_tokens(rt.tokenizer) if stop_token_ids is None else stop_token_ids
     )
     started_all = time.perf_counter()
+    if constraint is not None:
+        # The repetition trimmer retracts committed tokens, which would
+        # desync the grammar matcher; constrained output is schema-shaped.
+        repetition_stop = False
     repetition_config = _repetition_stop_config(bool(repetition_stop))
     repetition_result: RepetitionStopResult | None = None
     draft_time = verify_time = 0.0
@@ -5536,6 +5870,11 @@ def generate_mtpk(
     bonus_time = 0.0
     online_hidden_corrector_time = 0.0
     tokens: list[int] = []
+    # Grammar-constrained decoding (#186 phase 3): the matcher advances only
+    # through committed tokens (synced once per cycle after the primary);
+    # speculative windows are clamped to the matcher's legal prefix before
+    # commit, so drafts stay unmasked and correctness is target-side only.
+    constraint_synced_tokens = 0
     # OpenAI-style presence/frequency penalties. When active, each token is
     # penalized by the counts of the completion-so-far (prompt excluded), and
     # every verified MTP position by its growing in-block prefix (per-position /
@@ -5548,6 +5887,36 @@ def generate_mtpk(
     # the draft proposal q stays untouched (proposal mismatch only costs
     # acceptance, never correctness).
     _loop_guard = LoopGuard(_loop_guard_config) if _loop_guard_config.enabled else None
+    # Thinking Guard: surfaced reasoning-token budget (mtplx/thinking_guard.py).
+    # Below budget = zero distribution impact; at budget the guard force-closes
+    # the reasoning segment through the same target-side overlay slot the Loop
+    # Guard uses (drafts stay untouched; rejections correct exactly).
+    _thinking_guard = (
+        ThinkingGuard(thinking_guard)
+        if thinking_guard is not None and thinking_guard.enabled
+        else None
+    )
+
+    def _steer_overlay(working: Sequence[int]) -> dict[int, float] | None:
+        merged = (
+            _loop_guard.penalties_for(working)
+            if _loop_guard is not None and _loop_guard.armed
+            else None
+        )
+        forced = (
+            _thinking_guard.overlay_for(working)
+            if _thinking_guard is not None and _thinking_guard.steering_active
+            else None
+        )
+        if not forced:
+            return merged
+        if not merged:
+            return forced
+        combined = dict(merged)
+        for token, value in forced.items():
+            combined[token] = combined.get(token, 0.0) + value
+        return combined
+
     events: list[dict] = []
     record_events = not _env_truthy("MTPLX_DROP_EVENTS")
     append_event = events.append if record_events else (lambda _event: None)
@@ -5590,6 +5959,10 @@ def generate_mtpk(
     device_d2_compile_time = 0.0
     device_d2_calls = 0
     device_d2_fallbacks = 0
+    device_core: dict[str, Any] | None = None
+    device_core_compile_time = 0.0
+    device_core_calls = 0
+    device_core_fallbacks = 0
     streamed_token_count = 0
     mtp_history_materialize_every = max(
         0,
@@ -6199,6 +6572,39 @@ def generate_mtpk(
         )
 
     step = 0
+    # ---- context-copy (prompt-lookup) drafting: always on (kill switch
+    # MTPLX_CONTEXT_COPY=0); any temperature, no repetition penalties, on
+    # capture-commit verify strategies ----
+    from .context_copy import (NgramIndex, block_for_ext, context_copy_block_k,
+                               context_copy_enabled, context_copy_min_ext,
+                               context_copy_ng_max, context_copy_ng_min)
+    # Temperature is supported through the same probability-ratio acceptance
+    # as the MTP path: the copy block is a point-mass proposal, so a copied
+    # token is accepted with the target's own shaped probability and a
+    # rejection samples the residual — the output law is exactly the target
+    # sampling distribution at any temperature (no greedy shortcut).
+    ccopy_active = (
+        context_copy_enabled()
+        and not _penalties_active
+        and verify_strategy in {"capture_commit", "graphbank_capture_commit"}
+    )
+    ccopy_rounds = ccopy_drafted = ccopy_accepted = 0
+    ccopy_probes = ccopy_blocks_accepted = ccopy_suspensions = 0
+    ccopy_disabled_reason = None
+    ccopy_ema, ccopy_seen, ccopy_suspend_until = 0.5, 0, 0
+    ccopy_backoff = 64   # doubles on each suspension (self-repetitive novel text would
+                         # otherwise re-trigger copy rounds after every backoff and pay
+                         # the probe cost recurrently); a paying round resets it.
+    ccopy_index = None
+    ccopy_k = context_copy_block_k()
+    ccopy_min_ext = context_copy_min_ext()
+    if ccopy_active:
+        ccopy_index = NgramIndex(context_copy_ng_min(), context_copy_ng_max())
+        # Prompt-lookup semantics: the index covers the PROMPT only. Matches into
+        # the model's own generated text (self-repetition) tend to have weak
+        # continuation predictiveness and can cost more to verify than they commit,
+        # while grounded re-emission matches into the prompt (see the PR benchmarks).
+        ccopy_index.sync(prompt_ids)
     while len(tokens) < max_tokens:
         repetition_result = _trim_repeated_suffix(tokens, repetition_config)
         if repetition_result is not None:
@@ -6229,20 +6635,62 @@ def generate_mtpk(
                         },
                     }
                 )
+        if _thinking_guard is not None:
+            _tg_transition = _thinking_guard.observe(tokens)
+            if _tg_transition is not None:
+                append_event(
+                    {
+                        "step": step,
+                        "thinking_guard": {
+                            "transition": _tg_transition,
+                            "completion_tokens": len(tokens),
+                            **_thinking_guard.summary(),
+                        },
+                    }
+                )
         _guard_armed = _loop_guard is not None and _loop_guard.armed
+        _steer_active = _guard_armed or (
+            _thinking_guard is not None and _thinking_guard.steering_active
+        )
+        if constraint is not None:
+            # Sync the matcher through the previous cycle's committed window
+            # BEFORE masking this cycle's primary — a stale matcher would
+            # compute the mask at the wrong grammar position.
+            constraint.advance_many(tokens[constraint_synced_tokens:])
+            constraint_synced_tokens = len(tokens)
+            if (
+                constraint.stopped
+                and tokens
+                and not _is_stop(tokens[-1], stop_token_ids)
+            ):
+                append_event({"step": len(tokens), "constraint_stop": True})
+                break
         primary_already_emitted = pending_primary is not None
         if pending_primary is None:
+            primary_row = logits[0]
+            if constraint is not None:
+                # The one guaranteed-progress mask site: every cycle's fresh
+                # position samples from the constrained target distribution.
+                # Speculative windows are handled by the legality clamp below
+                # instead of per-row masks (see #186 phase 3).
+                primary_row = constraint.mask_logits_row(primary_row)
             primary, _ = _sample_from_logits(
-                logits[0],
+                primary_row,
                 sampler,
                 rng,
                 token_counts=Counter(tokens) if _penalties_active else None,
                 penalty_overlay=(
-                    _loop_guard.penalties_for(tokens) if _guard_armed else None
+                    _steer_overlay(tokens) if _steer_active else None
                 ),
             )
             tokens.append(primary)
             emit_new_tokens()
+            if constraint is not None:
+                # Everything later this cycle (copy-block truncation, the
+                # accept-loop clamp, bonus checks) validates windows that
+                # FOLLOW the primary, so consume it now.
+                constraint.advance_many(tokens[constraint_synced_tokens:])
+                constraint_synced_tokens = len(tokens)
         else:
             primary = pending_primary
             pending_primary = None
@@ -6337,6 +6785,212 @@ def generate_mtpk(
         trace_current_mtp_cache = (
             mtp_cache if mtp_cache is not None else mtp_history_cache
         )
+        # ---- context-copy round: verbatim block from context, no MTP compute this cycle ----
+        if ccopy_active and cycle_depth >= 1 and len(tokens) >= ccopy_suspend_until:
+            _cc_hist = prompt_ids + tokens
+            ccopy_probes += 1
+            # Prompt-only contract: candidates whose continuation starts at the
+            # prompt edge are dropped inside find() (the best VALID match wins),
+            # and the block is sliced from the prompt and capped at its
+            # boundary — never from already-generated output (self-repetition).
+            _cc_pos, _cc_ext = ccopy_index.find(_cc_hist, max_pos=len(prompt_ids))
+            _cc_block: list[int] = []
+            if _cc_pos is not None and _cc_ext >= ccopy_min_ext:
+                _cc_klen = block_for_ext(_cc_ext, ccopy_k)
+                _cc_block = [int(t) for t in prompt_ids[_cc_pos:_cc_pos + _cc_klen]]
+                _cc_block = _cc_block[: max(1, max_tokens - len(tokens))]
+                if constraint is not None:
+                    # Truncate the copy proposal at the first grammar-illegal
+                    # token so masked rejections stay rare instead of
+                    # systematic; an empty result falls through to the normal
+                    # MTP round (#186 phase 3).
+                    _cc_block = _cc_block[: constraint.validate_prefix(_cc_block)]
+            if _cc_block:
+                _cc_T = 1 + len(_cc_block)
+                _cc_before = None
+                if not _env_truthy("MTPLX_SKIP_VERIFY_SNAPSHOT"):
+                    started = time.perf_counter()
+                    _cc_before = snapshot_untrimmable_cache(cache)
+                    snapshot_time += time.perf_counter() - started
+                started_forward = time.perf_counter()
+                with attention_phase("decode_verify"):
+                    _cc_logits, _cc_hidden, _cc_captures = rt.forward_ar_capture(
+                        mx.array([[primary] + _cc_block]),
+                        cache=cache,
+                        return_hidden=True,
+                        hidden_variant=base_hidden_variant,
+                        capture_backend=verify_core_backend,
+                    )
+                if sampler.temperature <= 0:
+                    _cc_g = [int(x) for x in mx.argmax(_cc_logits[0], axis=-1).tolist()]
+                else:
+                    mx.eval(_cc_logits)
+                elapsed_verify = time.perf_counter() - started_forward
+                verify_forward_time += elapsed_verify
+                verify_time += elapsed_verify
+                target_time += elapsed_verify
+                verify_calls += 1
+                _cc_correction: int | None = None
+                if sampler.temperature <= 0:
+                    _cc_nacc = 0
+                    for _cc_d, _cc_t in zip(_cc_block, _cc_g):
+                        if _cc_d == _cc_t:
+                            _cc_nacc += 1
+                        else:
+                            break
+                else:
+                    # The copy block is a point-mass proposal, so each copied
+                    # token is accepted with the target's own shaped
+                    # probability of that token, and a rejection samples the
+                    # residual (target with the copied token's mass removed,
+                    # renormalized). Identical probability-ratio contract to
+                    # the MTP verify path: the emitted stream follows the
+                    # target sampling distribution exactly at any temperature.
+                    _cc_nacc = 0
+                    _cc_vocab = int(_cc_logits.shape[-1])
+                    for _cc_i, _cc_d in enumerate(_cc_block):
+                        _cc_target_p = _distribution_from_mlx_logits(
+                            _cc_logits[0, _cc_i],
+                            sampler,
+                            token_counts=None,
+                        )
+                        _cc_draft_q = SparseDistribution(
+                            np.array([int(_cc_d)], dtype=np.int64),
+                            np.array([1.0], dtype=np.float64),
+                            _cc_vocab,
+                        )
+                        _cc_accept_prob = compute_acceptance_probability(
+                            _cc_target_p, _cc_draft_q, int(_cc_d)
+                        )
+                        if float(rng.random()) <= _cc_accept_prob:
+                            _cc_nacc += 1
+                            continue
+                        _cc_correction = int(
+                            sample_from_distribution(
+                                residual_distribution(_cc_target_p, _cc_draft_q),
+                                rng,
+                            )
+                        )
+                        break
+                # An accepted stop token ends the response: never accept, commit,
+                # or select state past it (mirrors the MTP acceptance loop's stop
+                # break). Every downstream boundary — capture-commit trim, the
+                # logits/hidden row, MTP history, and the emitted tokens — derives
+                # from _cc_nacc, so capping it here keeps them all at the stop. A
+                # rejection past the stop is void: the response is already over.
+                for _cc_i in range(_cc_nacc):
+                    if _is_stop(int(_cc_block[_cc_i]), stop_token_ids):
+                        _cc_nacc = _cc_i + 1
+                        _cc_correction = None
+                        break
+                _cc_m = _cc_nacc + 1
+                _cc_ok = True
+                if _cc_nacc < len(_cc_block):
+                    from .gdn_capture import commit_captured_prefix
+                    started_commit = time.perf_counter()
+                    _cc_ok = commit_captured_prefix(
+                        cache, _cc_captures, keep_tokens=_cc_m, verified_tokens=_cc_T,
+                    )
+                    capture_commit_time += time.perf_counter() - started_commit
+                if not _cc_ok:
+                    # This capture core cannot commit a per-position prefix (for
+                    # example final-state-only cores). Roll the whole block back,
+                    # restore the primary's logits, and stop proposing copies.
+                    if _cc_before is None:
+                        raise RuntimeError(
+                            "context-copy: capture commit failed and the verify "
+                            "snapshot was skipped (MTPLX_SKIP_VERIFY_SNAPSHOT=1)"
+                        )
+                    started_rollback = time.perf_counter()
+                    rollback_after_verify(cache, _cc_before, verified_tokens=_cc_T)
+                    rollback_time += time.perf_counter() - started_rollback
+                    started = time.perf_counter()
+                    with attention_phase("decode_verify"):
+                        _cc_l2, _cc_h2 = rt.forward_ar(
+                            mx.array([[primary]]),
+                            cache=cache,
+                            return_hidden=True,
+                            hidden_variant=base_hidden_variant,
+                        )
+                    _eval(_cc_l2, _cc_h2)
+                    repair_time += time.perf_counter() - started
+                    logits = _cc_l2[:, -1, :]
+                    hidden = _cc_h2[:, -1:, :]
+                    ccopy_active = False
+                    ccopy_disabled_reason = "no_per_position_commit"
+                    event["context_copy"] = {"disabled": "no_per_position_commit"}
+                    append_event(event)
+                    continue
+                _cc_acc = _cc_block[:_cc_nacc]
+                _cc_stop_idx = next((i for i, t in enumerate(_cc_acc)
+                                     if _is_stop(int(t), stop_token_ids)), None)
+                if _cc_stop_idx is not None:
+                    _cc_acc = _cc_acc[:_cc_stop_idx + 1]
+                tokens.extend(_cc_acc)
+                _cc_finished = _cc_stop_idx is not None
+                if constraint is not None and _cc_correction is not None and (
+                    constraint.validate_prefix([*_cc_acc, int(_cc_correction)])
+                    != len(_cc_acc) + 1
+                ):
+                    # Grammar-illegal residual: drop it; the next cycle's
+                    # masked primary resamples the position, which preserves
+                    # the masked target law exactly.
+                    _cc_correction = None
+                if _cc_correction is not None and not _cc_finished:
+                    # Exactness requires the rejected position's token to be
+                    # the residual sample drawn above, not a fresh draw from
+                    # the full distribution next cycle. Emit it now and defer
+                    # its forward exactly like an MTP rejection: the pending
+                    # primary's KV is computed by whichever forward runs next.
+                    tokens.append(int(_cc_correction))
+                    correction_tokens += 1
+                    pending_primary = int(_cc_correction)
+                    if _is_stop(int(_cc_correction), stop_token_ids):
+                        _cc_finished = True
+                ccopy_rounds += 1
+                ccopy_drafted += len(_cc_block)
+                ccopy_accepted += _cc_nacc
+                if _cc_nacc:
+                    ccopy_blocks_accepted += 1
+                ccopy_ema = 0.7 * ccopy_ema + 0.3 * (_cc_nacc / len(_cc_block))
+                ccopy_seen += 1
+                if _cc_nacc / len(_cc_block) >= 0.5:
+                    ccopy_backoff = 64          # copy is paying again: full retry rate
+                if ccopy_seen >= 4 and ccopy_ema < 0.35:
+                    # acceptance collapsed (novel region with incidental repeats):
+                    # suspend copy rounds and let the MTP head work; retry with
+                    # exponential backoff so recurring probes stay cheap
+                    ccopy_suspend_until = len(tokens) + ccopy_backoff
+                    ccopy_backoff = min(ccopy_backoff * 2, 4096)
+                    ccopy_ema, ccopy_seen = 0.5, 0
+                    ccopy_suspensions += 1
+                event["context_copy"] = {
+                    "block": len(_cc_block),
+                    "accepted": _cc_nacc,
+                    "extension": int(_cc_ext),
+                    "time_s": float(elapsed_verify),
+                    "correction": (
+                        int(_cc_correction) if _cc_correction is not None else None
+                    ),
+                }
+                # Committed-history MTP caches pair every committed token with the
+                # hidden state of the token before it, including (previous hidden,
+                # primary), which the drafting path would normally have added.
+                if _mtp_history_uses_committed_cache(mtp_history_policy) and mtp_cache is not None:
+                    _cc_committed_toks = [primary] + _cc_acc
+                    _cc_hiddens = mx.concatenate(
+                        [hidden, _cc_hidden[:, : len(_cc_acc), :]], axis=1
+                    )
+                    draft_time += append_mtp_history(
+                        mtp_cache, _cc_hiddens, _cc_committed_toks
+                    )
+                logits = _cc_logits[:, _cc_m - 1, :]
+                hidden = _cc_hidden[:, _cc_m - 1:_cc_m, :]
+                append_event(event)
+                emit_new_tokens()
+                if _cc_finished:
+                    break
+                continue
         draft_hidden = hidden
         next_token = primary
         device_draft_token = None
@@ -6423,7 +7077,123 @@ def generate_mtpk(
                     "requested": "device-d2",
                     "reason": "ineligible_contract",
                 }
-        for depth_index in range(0 if used_device_d2_core else cycle_depth):
+
+        used_device_core = used_device_d2_core
+        if not used_device_core and draft_core == "device":
+            device_core_eligible = (
+                2 <= cycle_depth <= 5
+                and cycle_depth == speculative_depth
+                and mtp_cache is not None
+                and _mtp_history_uses_committed_cache(mtp_history_policy)
+                and draft_margin_threshold is None
+                and adaptive_policy is None
+                and mtp_corrector is None
+                and mtp_topk_reranker is None
+                and not adapter_ensemble_q
+                and not online_hidden_enabled
+                and not correction_cache_enabled
+                and not target_prefix_verify
+                and (
+                    draft_sampler.temperature <= 0
+                    or 0 < draft_sampler.top_k <= _DEVICE_CORE_MAX_TOP_K
+                )
+            )
+            if device_core_eligible:
+                try:
+                    live_signature = _device_core_state_signature(mtp_cache)
+                    core_current = (
+                        device_core is not None
+                        and int(device_core["depth"]) == int(cycle_depth)
+                        and device_core["state_signature"] == live_signature
+                    )
+                    if (
+                        not core_current
+                        and device_core is not None
+                        and os.environ.get("MTPLX_DEVICE_CORE_DEBUG")
+                    ):
+                        stored = device_core["state_signature"]
+                        diffs = [
+                            (i, stored[i] if i < len(stored) else None,
+                             live_signature[i] if i < len(live_signature) else None)
+                            for i in range(max(len(stored), len(live_signature)))
+                            if (stored[i] if i < len(stored) else None)
+                            != (live_signature[i] if i < len(live_signature) else None)
+                        ]
+                        print(
+                            f"[device-core] signature diff ({len(diffs)} leaves): "
+                            f"{diffs[:4]}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    if not core_current:
+                        compile_started = time.perf_counter()
+                        device_core = _make_device_draft_core(
+                            rt,
+                            draft_hidden,
+                            mx.array([[primary]]),
+                            mtp_hidden_variant=mtp_hidden_variant,
+                            depth=cycle_depth,
+                            mtp_cache=mtp_cache,
+                            draft_sampler=draft_sampler,
+                            seed=int(rng.integers(0, 2**31 - 1)),
+                        )
+                        elapsed_compile = time.perf_counter() - compile_started
+                        device_core_compile_time += elapsed_compile
+                        draft_time += elapsed_compile
+                        _add_timing(event, "draft_core_compile", elapsed_compile)
+                        event["draft_core_compile"] = {
+                            "kind": "device",
+                            "depth": int(cycle_depth),
+                            "mtp_cache_promoted": int(device_core["promoted"]),
+                            "promotion_failures": dict(
+                                device_core["promotion_failures"]
+                            ),
+                        }
+                    started = time.perf_counter()
+                    core_tokens, core_qs = _run_device_draft_core(
+                        device_core,
+                        draft_hidden,
+                        int(primary),
+                        seed=int(rng.integers(0, 2**31 - 1)),
+                    )
+                    elapsed_draft = time.perf_counter() - started
+                    draft_time += elapsed_draft
+                    device_core_calls += 1
+                    draft_tokens = list(core_tokens)
+                    for depth_index, (draft_token, draft_q) in enumerate(
+                        zip(core_tokens, core_qs)
+                    ):
+                        draft_probs.append(
+                            draft_q if sampler.temperature > 0 else None
+                        )
+                        drafted += 1
+                        drafted_by_depth[depth_index] += 1
+                        event["drafts"].append(
+                            {
+                                "depth": depth_index + 1,
+                                "token": int(draft_token),
+                                "timing_s": {
+                                    "draft": elapsed_draft
+                                    if depth_index == len(core_tokens) - 1
+                                    else 0.0,
+                                },
+                                "mtp_corrector": None,
+                                "draft_core": "device",
+                            }
+                        )
+                    next_token = draft_tokens[-1]
+                    used_device_core = True
+                except Exception as exc:
+                    device_core_fallbacks += 1
+                    event["draft_core_error"] = repr(exc)
+                    used_device_core = False
+            else:
+                device_core_fallbacks += 1
+                event["draft_core_fallback"] = {
+                    "requested": "device",
+                    "reason": "ineligible_contract",
+                }
+        for depth_index in range(0 if used_device_core else cycle_depth):
             source_token = int(next_token)
             step_mtp_cache = (
                 mtp_cache if mtp_cache_policy == "persistent" else rt.make_mtp_cache()
@@ -6885,15 +7655,16 @@ def generate_mtpk(
             )
             target_distribution_logits = verify_logits[:, :target_distribution_rows, :]
             started_distribution = time.perf_counter()
-            if _guard_armed:
-                # Loop Guard on the target_prefix lane: the accepted token is
-                # always the pre-sampled target id, so the steering must land
-                # on the pre-sample logits. Row r conditions on the committed
-                # tokens plus the in-block draft prefix before position r.
+            if _steer_active:
+                # Steering on the target_prefix lane (Loop Guard + Thinking
+                # Guard): the accepted token is always the pre-sampled target
+                # id, so overlays must land on the pre-sample logits. Row r
+                # conditions on the committed tokens plus the in-block draft
+                # prefix before position r.
                 _guarded_rows = []
                 for _row_index in range(int(target_distribution_rows)):
                     _row = target_distribution_logits[:, _row_index, :].reshape(-1)
-                    _row_overlay = _loop_guard.penalties_for(
+                    _row_overlay = _steer_overlay(
                         [*tokens, *draft_tokens[:_row_index]]
                     )
                     if _row_overlay:
@@ -6955,7 +7726,7 @@ def generate_mtpk(
             defer_verify_hidden_eval
             and sampler.temperature > 0
             and not lazy_target_distributions
-            and not _guard_armed
+            and not _steer_active
             and (
                 _batch_target_arrays_enabled() or _batch_target_distributions_enabled()
             )
@@ -7060,7 +7831,7 @@ def generate_mtpk(
             sampler.temperature > 0
             and not target_distribution_precomputed
             and not lazy_target_distributions
-            and not _guard_armed
+            and not _steer_active
         ):
             target_distribution_rows = min(
                 int(verify_logits.shape[1]),
@@ -7097,16 +7868,26 @@ def generate_mtpk(
             # per-row counts.
             target_prefix_tokens = None
             target_distribution_batch = None
-        elif _guard_armed:
-            # Loop Guard armed: null only the batch so p/q rows rebuild per
-            # position with the guard overlay. target_prefix_tokens stays —
-            # the target_prefix pre-sample above already carried the overlay
-            # (and its lane has no draft distributions to fall back on).
+        elif _steer_active:
+            # Steering active (Loop Guard armed and/or Thinking Guard forcing):
+            # null only the batch so p/q rows rebuild per position with the
+            # merged overlay. target_prefix_tokens stays — the target_prefix
+            # pre-sample above already carried the overlay (and its lane has
+            # no draft distributions to fall back on).
             target_distribution_batch = None
+        # Grammar clamp (#186 phase 3): drafts are proposed unmasked, so the
+        # committed window must stop at the grammar's legal prefix. One
+        # stateless validate call per cycle; the matcher itself only advances
+        # through committed tokens at the top-of-cycle sync.
+        constraint_legal_prefix = (
+            constraint.validate_prefix(list(draft_tokens))
+            if constraint is not None
+            else None
+        )
         for depth_index, draft_token in enumerate(draft_tokens):
             target_logits_for_draft = verify_logits[:, depth_index, :]
-            if _guard_armed:
-                _row_guard_overlay = _loop_guard.penalties_for(
+            if _steer_active:
+                _row_guard_overlay = _steer_overlay(
                     [*tokens, *draft_tokens[:depth_index]]
                 )
             else:
@@ -7176,7 +7957,7 @@ def generate_mtpk(
                     target_distributions[depth_index]
                     if target_distributions is not None
                     and not _penalties_active
-                    and not _guard_armed
+                    and not _steer_active
                     else None
                 )
                 if target_p is None:
@@ -7217,6 +7998,26 @@ def generate_mtpk(
                     )
                 )
 
+            if (
+                constraint_legal_prefix is not None
+                and accepted_now
+                and depth_index >= constraint_legal_prefix
+            ):
+                # The model accepted a draft the grammar forbids here; reject
+                # it and let the next cycle's masked primary resample the
+                # position from the constrained distribution. Under pure
+                # temperature sampling the committed law is exactly the
+                # masked target law (Leviathan-Chen telescopes through the
+                # drop-and-resample). Under top-k/top-p the two coincide
+                # except in sub-top-k tail mass: draft-path positions commit
+                # from restrict-then-renormalize of the SHAPED unmasked law,
+                # masked-primary positions from shaping of the MASKED row.
+                # Every committed token is grammar-legal either way; a
+                # verify-row-masked variant would close the tail gap.
+                accepted_now = False
+                accept_prob = 0.0
+                event["drafts"][depth_index]["constraint_clamped"] = True
+
             event["drafts"][depth_index]["accepted"] = accepted_now
             event["drafts"][depth_index]["accept_probability"] = float(accept_prob)
             event["drafts"][depth_index]["correction"] = int(correction)
@@ -7253,7 +8054,15 @@ def generate_mtpk(
                 event["drafts"][depth_index]["online_correction_cache"][
                     "stored_token"
                 ] = cached_target
-            if sampler.temperature > 0:
+            if sampler.temperature > 0 and (
+                constraint is None
+                or constraint.validate_prefix(
+                    [*draft_tokens[:depth_index], int(correction)]
+                )
+                == depth_index + 1
+            ):
+                # A grammar-illegal residual correction is dropped, not
+                # committed; the masked primary resamples the position.
                 rejection_correction = int(correction)
             break
         elapsed_accept = max(
@@ -7428,7 +8237,7 @@ def generate_mtpk(
                     target_distributions is not None
                     and not lazy_bonus_verify
                     and not _penalties_active
-                    and not _guard_armed
+                    and not _steer_active
                     and len(target_distributions) > len(draft_tokens)
                 ):
                     bonus = sample_from_distribution(
@@ -7445,8 +8254,8 @@ def generate_mtpk(
                         rng,
                         token_counts=Counter(tokens) if _penalties_active else None,
                         penalty_overlay=(
-                            _loop_guard.penalties_for(tokens)
-                            if _guard_armed
+                            _steer_overlay(tokens)
+                            if _steer_active
                             else None
                         ),
                     )
@@ -7491,6 +8300,20 @@ def generate_mtpk(
                 )
                 bonus_time += elapsed_bonus
                 _add_timing(event, "bonus_sample", elapsed_bonus)
+                if constraint is not None and (
+                    constraint.validate_prefix([*draft_tokens, int(bonus)])
+                    != len(draft_tokens) + 1
+                ):
+                    # Grammar-illegal bonus: skip it (same control path as
+                    # omit_speculative_bonus). `logits` already holds the
+                    # bonus-position row, so the next cycle's masked primary
+                    # resamples this exact position from the constrained
+                    # distribution.
+                    event["bonus_token_constraint_skipped"] = True
+                    maybe_eval_state_roots(event, len(tokens))
+                    append_event(event)
+                    emit_trace()
+                    continue
                 tokens.append(bonus)
                 pending_primary = bonus
                 bonus_tokens += 1
@@ -7815,10 +8638,17 @@ def generate_mtpk(
         # other downstream cache consumer must never see promoted
         # tensor-offset adapters.
         compiled_verify_bank.demote(cache)
+    if constraint is not None:
+        # Final sync so `completed` reflects every committed token (the loop
+        # may exit between the per-cycle sync and the last commit).
+        constraint.advance_many(tokens[constraint_synced_tokens:])
+        constraint_synced_tokens = len(tokens)
     finish_reason = (
         "stop"
         if repetition_result is not None
         or any(_is_stop(token, stop_token_ids) for token in tokens)
+        # A grammar-terminal exit is a completed document, not truncation.
+        or (constraint is not None and constraint.stopped)
         else "length"
     )
     if capture_final_state:
@@ -7837,6 +8667,16 @@ def generate_mtpk(
     reject_path_counts, repair_time_by_reject_depth = _reject_repair_breakdown(events)
     stats = GenerationStats(
         mode="mtpk",
+        constraint_active=constraint is not None,
+        constraint_completed=(
+            constraint.completed if constraint is not None else None
+        ),
+        constraint_masked_steps=(
+            constraint.masked_steps if constraint is not None else 0
+        ),
+        constraint_mask_time_s=(
+            constraint.mask_time_s if constraint is not None else 0.0
+        ),
         generated_tokens=len(tokens),
         elapsed_s=elapsed,
         **_generation_rate_fields(
@@ -7963,6 +8803,16 @@ def generate_mtpk(
         bonus_tokens=bonus_tokens,
         correction_tokens=correction_tokens,
         verify_calls=verify_calls,
+        context_copy_active=bool(ccopy_active),
+        context_copy_probes=ccopy_probes,
+        context_copy_rounds=ccopy_rounds,
+        context_copy_drafted_tokens=ccopy_drafted,
+        context_copy_accepted_blocks=ccopy_blocks_accepted,
+        context_copy_accepted_tokens=ccopy_accepted,
+        context_copy_suspensions=ccopy_suspensions,
+        context_copy_suspended=len(tokens) < ccopy_suspend_until,
+        context_copy_backoff_tokens=ccopy_backoff if ccopy_index is not None else 0,
+        context_copy_disabled_reason=ccopy_disabled_reason,
         graphbank={
             **(graphbank.to_dict() if graphbank is not None else {}),
             **(
@@ -8016,6 +8866,9 @@ def generate_mtpk(
             "device_d2_calls": device_d2_calls,
             "device_d2_fallbacks": device_d2_fallbacks,
             "device_d2_compile_time_s": device_d2_compile_time,
+            "device_calls": device_core_calls,
+            "device_fallbacks": device_core_fallbacks,
+            "device_compile_time_s": device_core_compile_time,
         },
         owned_recurrent_state=owned_recurrent_state_stats(cache),
         owned_attn_kv=tail_owned_attention_kv_stats(cache),
@@ -8038,6 +8891,9 @@ def generate_mtpk(
             else len(tokens) + repetition_result.repeated_tokens
         ),
         loop_guard=(_loop_guard.summary() if _loop_guard is not None else {}),
+        thinking_guard=(
+            _thinking_guard.summary() if _thinking_guard is not None else {}
+        ),
         events=events,
     )
     _attach_runtime_diagnostics(stats, rt, counter_start)

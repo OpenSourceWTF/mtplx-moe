@@ -1,6 +1,16 @@
 from mtplx import thermal
 import subprocess
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _default_no_daemon_socket(monkeypatch):
+    """Default every test to "no ThermalForge daemon socket" so the suite never
+    touches a real daemon on the dev machine. Socket-path tests opt back in by
+    re-patching ``_daemon_socket_send``."""
+    monkeypatch.setattr(thermal, "_daemon_socket_send", lambda *a, **k: None)
+
 
 def test_detect_thermal_control_reports_none_without_tools(monkeypatch):
     thermal.detect_thermal_control.cache_clear()
@@ -30,6 +40,57 @@ def test_set_thermal_profile_without_tool_is_actionable(monkeypatch):
     assert result["profile"] == "performance"
     assert "mtplx max --install" in result["message"]
     thermal.detect_thermal_control.cache_clear()
+
+
+_FAKE_THERMALFORGE_DETECTION = {
+    "available": True,
+    "selected": {"kind": "thermalforge", "path": "/usr/local/bin/thermalforge"},
+    "instructions": "",
+}
+
+
+def test_set_thermal_profile_silent_prefers_daemon_socket(monkeypatch):
+    """The fan reset goes through the daemon socket (no sudo, no app-kill) and
+    does not fall back to the `auto` CLI when the socket accepts it."""
+    monkeypatch.setattr(thermal, "detect_thermal_control", lambda: _FAKE_THERMALFORGE_DETECTION)
+
+    sent: list[str] = []
+
+    def fake_socket(command, *, timeout_s=3.0):
+        sent.append(command)
+        return {"ok": True, "response": "ok", "command": ["<thermalforge-daemon-socket>", command]}
+
+    monkeypatch.setattr(thermal, "_daemon_socket_send", fake_socket)
+
+    def no_cli(command, *, timeout_s=None, cwd=None):
+        raise AssertionError(f"CLI should not run when the socket handles it: {command}")
+
+    monkeypatch.setattr(thermal, "_run_probe", no_cli)
+
+    result = thermal.set_thermal_profile("silent")
+
+    assert result["ok"] is True
+    assert sent == ["auto"]
+    assert result["command"] == ["<thermalforge-daemon-socket>", "auto"]
+
+
+def test_set_thermal_profile_silent_falls_back_to_cli_without_daemon(monkeypatch):
+    """With no daemon socket reachable (the autouse default), the reset uses the
+    `auto` CLI candidates."""
+    monkeypatch.setattr(thermal, "detect_thermal_control", lambda: _FAKE_THERMALFORGE_DETECTION)
+
+    ran: list[list[str]] = []
+
+    def fake_run(command, *, timeout_s=None, cwd=None):
+        ran.append(command)
+        return {"command": command, "returncode": 0, "ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(thermal, "_run_probe", fake_run)
+
+    result = thermal.set_thermal_profile("silent")
+
+    assert result["ok"] is True
+    assert ran and ran[0][-1] == "auto"
 
 
 _RAMPED_SUMMARY = {

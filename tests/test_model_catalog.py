@@ -35,12 +35,12 @@ from mtplx.profiles import (
 )
 
 
-def test_catalog_has_twelve_unique_entries():
+def test_catalog_has_thirteen_unique_entries():
     ids = [model.id for model in OFFICIAL_CATALOG]
-    assert len(ids) == 12
-    assert len(set(ids)) == 12
+    assert len(ids) == 13
+    assert len(set(ids)) == 13
     hf_ids = [model.hf_model_id for model in OFFICIAL_CATALOG]
-    assert len(set(hf_ids)) == 12
+    assert len(set(hf_ids)) == 13
 
 
 def test_catalog_matches_swift_official_catalog():
@@ -61,16 +61,29 @@ def test_catalog_matches_swift_official_catalog():
             re.findall(r'hfModelID: "([^"]+)"', catalog_block),
             re.findall(r"sizeBytes: ([0-9_]+)", catalog_block),
             re.findall(r"peakMemoryGiB: ([0-9.]+)", catalog_block),
+            re.findall(r"recommendedFor: \[([^\]]*)\]", catalog_block),
         )
     )
+    swift_tier_names = {".modernApple": "modern", ".legacyApple": "legacy"}
     assert len(swift_entries) == len(OFFICIAL_CATALOG)
-    for python_model, (swift_id, swift_hf, swift_size, swift_peak) in zip(
+    for python_model, (swift_id, swift_hf, swift_size, swift_peak, swift_tiers) in zip(
         OFFICIAL_CATALOG, swift_entries
     ):
         assert python_model.id == swift_id
         assert python_model.hf_model_id == swift_hf
         assert python_model.size_bytes == int(swift_size.replace("_", ""))
         assert python_model.peak_memory_gib == pytest.approx(float(swift_peak))
+        # The tier marker is load-bearing: the app's picker hides any
+        # installed official entry whose recommendedFor is empty (the
+        # orphan-protection that hid the broken 4B), so a Python-side
+        # tier without its Swift mirror makes the model invisible in
+        # the app selector on big-RAM Macs (2026-07-19 Quality 4B bug).
+        parsed_tiers = frozenset(
+            swift_tier_names[token.strip()]
+            for token in swift_tiers.split(",")
+            if token.strip()
+        )
+        assert python_model.recommended_tiers == parsed_tiers, swift_id
 
 
 def test_chip_tier_for_generation():
@@ -84,8 +97,18 @@ def test_chip_tier_for_generation():
 
 
 def test_recommended_ids_mirror_app_ram_tiers():
+    # Low-RAM tiers carry the rebuilt 4B pair (2026-07-19).
+    assert recommended_catalog_ids(memory_gib=8, chip_tier=MODERN_TIER) == [
+        "qwen35-4b-optimized-speed",
+        "qwen35-4b-optimized-quality",
+    ]
+    assert recommended_catalog_ids(memory_gib=8, chip_tier=LEGACY_TIER) == [
+        "qwen35-9b-optimized-speed-fp16"
+    ]
     assert recommended_catalog_ids(memory_gib=24, chip_tier=MODERN_TIER) == [
-        "qwen35-9b-optimized-speed"
+        "qwen35-9b-optimized-speed",
+        "qwen35-4b-optimized-speed",
+        "qwen35-4b-optimized-quality",
     ]
     assert recommended_catalog_ids(memory_gib=36, chip_tier=MODERN_TIER) == [
         "qwen35-9b-optimized-speed",
@@ -93,6 +116,8 @@ def test_recommended_ids_mirror_app_ram_tiers():
         "gemma4-optimized-speed",
         "qwen36-35b-a3b-optimized-speed",
         "optimized-quality",
+        "qwen35-4b-optimized-speed",
+        "qwen35-4b-optimized-quality",
     ]
     assert recommended_catalog_ids(memory_gib=64, chip_tier=MODERN_TIER) == [
         "optimized-speed",
@@ -101,6 +126,8 @@ def test_recommended_ids_mirror_app_ram_tiers():
         "qwen36-35b-a3b-optimized-balance",
         "gemma4-optimized-speed",
         "qwen35-9b-optimized-speed",
+        "qwen35-4b-optimized-speed",
+        "qwen35-4b-optimized-quality",
     ]
     assert recommended_catalog_ids(memory_gib=64, chip_tier=LEGACY_TIER) == [
         "optimized-speed-fp16",
@@ -134,10 +161,17 @@ def test_recommended_ids_mirror_app_ram_tiers():
 
 
 def test_recommended_models_filter_by_peak_memory():
-    # An 8 GiB Mac cannot hold even the 9B at its 10 GiB peak.
-    assert recommended_models(memory_gib=8, chip_tier=MODERN_TIER) == []
+    # An 8 GiB Mac cannot hold the 9B (10 GiB peak) but holds the 4B pair.
+    assert [model.id for model in recommended_models(memory_gib=8, chip_tier=MODERN_TIER)] == [
+        "qwen35-4b-optimized-speed",
+        "qwen35-4b-optimized-quality",
+    ]
     models = recommended_models(memory_gib=24, chip_tier=MODERN_TIER)
-    assert [model.id for model in models] == ["qwen35-9b-optimized-speed"]
+    assert [model.id for model in models] == [
+        "qwen35-9b-optimized-speed",
+        "qwen35-4b-optimized-speed",
+        "qwen35-4b-optimized-quality",
+    ]
     default = default_catalog_model(memory_gib=64, chip_tier=MODERN_TIER)
     assert default is not None and default.id == "optimized-speed"
 

@@ -434,3 +434,61 @@ def test_postcommit_skips_estimated_oversized_snapshot_before_prefill(
     assert outcome["best_prefix_len"] == 117_793
     assert outcome["history_tokens"] == 121_704
     assert restore_called is False
+
+
+def test_common_prefix_reuse_survives_mid_history_mutation() -> None:
+    """A mutated mid-prefix (compaction flip / edit rewrite) must not fork a
+    new anon session id — the 2026-07-20 chess session rotated through six
+    ids and quadrupled the RAM bank (2026-07-20 live-session forensics)."""
+    manager = EngineSessionManager()
+    session = manager.get_or_create("sess-mutated")
+    prompt = list(range(9000))
+    session.commit_prompt_prefix(
+        prompt_ids=prompt,
+        finish_reason="tool_calls",
+        boundary_kind="tool_call_prompt_prefix",
+    )
+    # History mutates 6000 tokens in (an old tool result re-rendered), the
+    # tail is rewritten, and the conversation continues longer than before.
+    mutated = prompt[:6000] + [50_000 + i for i in range(4000)]
+
+    session_id, source = manager.resolve_session_id(prompt_ids=mutated)
+
+    assert session_id == "sess-mutated"
+    assert source == "common_prefix_reuse"
+    assert manager.last_prefix_diagnostic is not None
+    assert manager.last_prefix_diagnostic["reason"] == "common_prefix_reuse"
+    assert manager.last_prefix_diagnostic["matched_prefix_len"] == 6000
+
+
+def test_common_prefix_reuse_rejects_unrelated_conversations() -> None:
+    manager = EngineSessionManager()
+    session = manager.get_or_create("sess-a")
+    session.commit_prompt_prefix(
+        prompt_ids=list(range(5000)),
+        finish_reason="stop",
+        boundary_kind="retokenized_history",
+    )
+    unrelated = [90_000 + i for i in range(5000)]
+
+    session_id, source = manager.resolve_session_id(prompt_ids=unrelated)
+
+    assert source == "new"
+    assert session_id != "sess-a"
+
+
+def test_common_prefix_reuse_requires_threshold() -> None:
+    manager = EngineSessionManager()
+    session = manager.get_or_create("sess-short")
+    session.commit_prompt_prefix(
+        prompt_ids=list(range(2000)),
+        finish_reason="stop",
+        boundary_kind="retokenized_history",
+    )
+    # Shares only 1000 tokens — below both the absolute and fractional bars.
+    candidate = list(range(1000)) + [70_000 + i for i in range(9000)]
+
+    session_id, source = manager.resolve_session_id(prompt_ids=candidate)
+
+    assert source == "new"
+    assert session_id != "sess-short"

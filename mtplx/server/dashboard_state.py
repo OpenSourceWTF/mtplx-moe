@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -249,11 +249,16 @@ class RollingMetrics:
     LIVE_SAMPLE_MIN_INTERVAL_S = 0.75
     LIVE_HISTORY_MAX_POINTS = 240
 
+    MAX_PER_SESSION_ENTRIES = 64
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._points: deque[_TPSPoint] = deque()
         self._live_points: deque[_TPSPoint] = deque()
-        self._max_per_session: dict[str, float] = {}
+        # LRU-bounded: agent clients mint fresh session ids freely, so an
+        # unpruned per-session map grows for the daemon's lifetime and is
+        # copied whole into every dashboard snapshot.
+        self._max_per_session: OrderedDict[str, float] = OrderedDict()
         self._sticky_all_time_max: float = 0.0
         self._sticky_all_time_max_when_s: float = 0.0
         self._sticky_all_time_max_session_id: str | None = None
@@ -276,6 +281,9 @@ class RollingMetrics:
                 prev = self._max_per_session.get(session_id, 0.0)
                 if float(tok_s) > prev:
                     self._max_per_session[session_id] = float(tok_s)
+                self._max_per_session.move_to_end(session_id)
+                while len(self._max_per_session) > self.MAX_PER_SESSION_ENTRIES:
+                    self._max_per_session.popitem(last=False)
             if float(tok_s) > self._sticky_all_time_max:
                 self._sticky_all_time_max = float(tok_s)
                 self._sticky_all_time_max_when_s = now

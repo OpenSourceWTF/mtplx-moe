@@ -3464,6 +3464,250 @@ def test_tune_state_round_trip(tmp_path, monkeypatch):
     assert record["payload"]["best"]["depth"] == 2
 
 
+def test_tune_collapsed_acceptance_row_cannot_win_on_multiplier():
+    # The #177 artifact: another GPU workload suppressed the AR window
+    # (86.9 -> 40.8 tok/s) so a zero-acceptance depth "beat" AR on wall
+    # clock. A 0.0-acceptance winner is mechanically impossible as a true
+    # result, so it must not win or be saved.
+    best = public._best_multiplier_summary(
+        public._annotate_multipliers(
+            [
+                {"mode": "AR", "depth": None, "tok_s": 40.8},
+                {
+                    "mode": "D2",
+                    "depth": 2,
+                    "tok_s": 45.4,
+                    "quality_passed": True,
+                    "acceptance_by_depth": [0.0, 0.0],
+                },
+            ]
+        )
+    )
+
+    assert best["winner"] is None
+    assert best["verdict"] == "mtp_acceptance_collapsed"
+    assert [row["mode"] for row in best["acceptance_collapsed"]] == ["D2"]
+
+
+def test_tune_collapsed_row_excluded_but_healthy_depth_still_wins():
+    best = public._best_multiplier_summary(
+        public._annotate_multipliers(
+            [
+                {"mode": "AR", "depth": None, "tok_s": 30.0},
+                {
+                    "mode": "D1",
+                    "depth": 1,
+                    "tok_s": 45.0,
+                    "acceptance_by_depth": [0.9],
+                },
+                {
+                    "mode": "D2",
+                    "depth": 2,
+                    "tok_s": 48.0,
+                    "acceptance_by_depth": [0.0, 0.0],
+                },
+            ]
+        )
+    )
+
+    # D2 has the higher multiplier but zero measured acceptance; the honest
+    # depth wins and the collapsed row stays visible in the summary.
+    assert best["winner"]["mode"] == "D1"
+    assert best["verdict"] == "mtp_depth_wins"
+    assert [row["mode"] for row in best["acceptance_collapsed"]] == ["D2"]
+
+
+def test_tune_state_load_quarantines_collapsed_winner(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTPLX_TUNE_STATE", str(tmp_path / "tuning.json"))
+    poisoned = {
+        "best": {"mode": "D2", "depth": 2, "tok_s": 45.4, "multiplier_vs_ar": 1.11},
+        "results": [
+            {"mode": "AR", "depth": None, "tok_s": 40.8},
+            {
+                "mode": "D2",
+                "depth": 2,
+                "tok_s": 45.4,
+                "acceptance_by_depth": [0.0, 0.0],
+            },
+        ],
+    }
+    healthy = {
+        "best": {"mode": "D3", "depth": 3, "tok_s": 57.0, "multiplier_vs_ar": 1.9},
+        "results": [
+            {"mode": "AR", "depth": None, "tok_s": 30.0},
+            {
+                "mode": "D3",
+                "depth": 3,
+                "tok_s": 57.0,
+                "acceptance_by_depth": [0.9, 0.8, 0.7],
+            },
+        ],
+    }
+
+    public._save_tune_record("poisoned", key_material={"model": "m"}, payload=poisoned)
+    public._save_tune_record("healthy", key_material={"model": "m"}, payload=healthy)
+
+    # A record whose own results show a zero-acceptance winner is treated as
+    # absent by every consumer instead of replaying the poisoned depth.
+    assert public._load_tune_record("poisoned") is None
+    record = public._load_tune_record("healthy")
+    assert record is not None
+    assert record["payload"]["best"]["depth"] == 3
+
+
+def test_tune_clear_record_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTPLX_TUNE_STATE", str(tmp_path / "tuning.json"))
+    payload = {
+        "best": {"mode": "D2", "depth": 2, "tok_s": 45.4, "multiplier_vs_ar": 1.11},
+        "results": [],
+    }
+    public._save_tune_record("key", key_material={"model": "m"}, payload=payload)
+
+    cleared = public._clear_tune_record("key")
+
+    assert cleared is not None
+    assert cleared["previous_best"]["depth"] == 2
+    assert public._load_tune_record("key") is None
+    state = json.loads((tmp_path / "tuning.json").read_text(encoding="utf-8"))
+    assert state["records"] == {}
+    assert public._clear_tune_record("key") is None
+
+
+def test_tune_measured_no_winner_clears_saved_record(tmp_path, monkeypatch, capsys):
+    # End to end over the real save path: a healthy tune saves a winner, a
+    # later honest retune that measures collapse clears the stored record
+    # instead of leaving it immortal (#177).
+    model_dir = tmp_path / "Youssofal--Qwen3.5-9B-MTPLX-Optimized-Speed"
+    model_dir.mkdir()
+    (model_dir / "mtplx_runtime.json").write_text(
+        json.dumps(
+            {
+                "arch_id": "qwen3-next-mtp",
+                "mtplx_version": "1.0.0",
+                "public_model_id": "mtplx-qwen35-9b-optimized-speed",
+                "hub": {"repo_id": "Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeMaxSession:
+        def __init__(self, **_kwargs):
+            self.thermal = {"enabled": True}
+
+        def start(self):
+            return True
+
+        def stop(self):
+            self.thermal["restore"] = {"ok": True}
+            return {"ok": True}
+
+    rows_holder: dict[str, list[dict[str, object]]] = {}
+
+    def fake_run_candidates(*_args, **_kwargs):
+        return rows_holder["rows"]
+
+    monkeypatch.setattr("mtplx.thermal.MaxSession", FakeMaxSession)
+    monkeypatch.setattr(public, "_run_tune_candidates", fake_run_candidates)
+    monkeypatch.setattr(
+        public, "_apple_hardware_context", lambda: {"chip": "Apple M5 Max"}
+    )
+    monkeypatch.setattr(
+        public, "_software_context", lambda: {"mtplx_version": "1.0.0"}
+    )
+    monkeypatch.setattr(
+        public, "_mlx_backend_context", lambda: {"stock_mlx_likely": True}
+    )
+    monkeypatch.setenv("MTPLX_TUNE_STATE", str(tmp_path / "tune-state.json"))
+
+    def make_args(*, retune: bool) -> SimpleNamespace:
+        return SimpleNamespace(
+            _cli_flags={"model"},
+            model=str(model_dir),
+            mtplx_config={},
+            run_id=f"clear-record-{int(retune)}",
+            output_dir=str(tmp_path / "runs"),
+            output=None,
+            json=True,
+            verbose=False,
+            dry_run=False,
+            cache_dir=None,
+            retune=retune,
+            depths="2",
+            max_tokens=1,
+            limit=1,
+            seed=0,
+            temperature=0.6,
+            top_p=0.95,
+            top_k=20,
+            no_save=False,
+            no_telemetry=True,
+            prompt_suite=None,
+            suite=None,
+            mtp_hidden_variant=None,
+            base_hidden_variant=None,
+            concat_order=None,
+            draft_temperature=None,
+            draft_top_p=None,
+            draft_top_k=None,
+            mtp_cache_policy="persistent",
+            mtp_history_policy="committed",
+        )
+
+    rows_holder["rows"] = [
+        {
+            "candidate": "ar",
+            "mode": "AR",
+            "depth": None,
+            "tok_s": 40.0,
+            "quality_passed": True,
+        },
+        {
+            "candidate": "2",
+            "mode": "D2",
+            "depth": 2,
+            "tok_s": 60.0,
+            "quality_passed": True,
+            "acceptance_by_depth": [0.9, 0.8],
+        },
+    ]
+    code = public._cmd_tune(
+        make_args(retune=False), action="tune", save_default=True, verbose_default=False
+    )
+    saved_payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert saved_payload["saved"] is True
+    assert saved_payload["best"]["depth"] == 2
+
+    rows_holder["rows"] = [
+        {
+            "candidate": "ar",
+            "mode": "AR",
+            "depth": None,
+            "tok_s": 86.9,
+            "quality_passed": True,
+        },
+        {
+            "candidate": "2",
+            "mode": "D2",
+            "depth": 2,
+            "tok_s": 51.0,
+            "quality_passed": True,
+            "acceptance_by_depth": [0.0, 0.0],
+        },
+    ]
+    code = public._cmd_tune(
+        make_args(retune=True), action="tune", save_default=True, verbose_default=False
+    )
+    retune_payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert retune_payload["saved"] is False
+    assert retune_payload["best_multiplier"]["verdict"] == "mtp_acceptance_collapsed"
+    assert retune_payload["cleared_saved_record"]["previous_best"]["depth"] == 2
+    state = json.loads((tmp_path / "tune-state.json").read_text(encoding="utf-8"))
+    assert state["records"] == {}
+
+
 def test_tune_model_source_notes_warn_when_config_model_differs_from_default(
     monkeypatch,
 ):
@@ -7167,7 +7411,8 @@ def test_model_contract_depth_clamps_declared_default_to_ceiling():
 
 
 def test_qwen36_35b_a3b_defaults_to_measured_best_depth():
-    """A3B's published sweep peaks at D1 (138.39 tok/s) vs its D3 ceiling (107.67)."""
+    """A3B measured best is D2 (M5 Max tune 145.0 tok/s, 1.54x; the reporter's
+    sweep has D2 within 2% of best) while the D3 ceiling loses 9-22%."""
     contract = {
         "public_model_id": public.QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
         "recommended_profile": "sustained",
@@ -7176,4 +7421,4 @@ def test_qwen36_35b_a3b_defaults_to_measured_best_depth():
     inspection = {"compatibility": {"runtime_contract": contract}}
     sustained = public.get_profile("sustained")
 
-    assert public._model_contract_depth(inspection, profile=sustained, fallback=3) == 1
+    assert public._model_contract_depth(inspection, profile=sustained, fallback=3) == 2

@@ -11,7 +11,11 @@ import Foundation
 //
 // Verdict rules mirror the daemon's `_classify_scanned_model` at
 // `mtplx/ui/onboarding.py:314-496` but for a remote repository:
-//   .ready          arch supports MTP AND mtp.safetensors is published
+//   .ready          arch supports MTP AND mtp.safetensors is published,
+//                    OR the repo is a rootless assistant-pair bundle
+//                    (mtplx_pair.json + target/config.json, the official
+//                    Gemma 4 layout — mirrors `_inspect_hf_model` in
+//                    `mtplx/artifacts.py`)
 //   .missingSidecar arch supports MTP but no sidecar weights in tree
 //   .noMTP          architecture does not declare MTP at all
 //   .probeFailed    network / 404 / private-or-gated / malformed config
@@ -141,6 +145,22 @@ public struct HuggingFaceProbe: Sendable {
         let config: [String: Any]
         switch configOutcome {
         case .failed(let probe):
+            if probe.verdict == .ready {
+                // The 404 triage recognised a rootless pair bundle —
+                // an already-finished official MTPLX artifact whose
+                // speculation comes from the draft model, not an MTP
+                // sidecar. Forge routes it to install, same as the
+                // mtplx_runtime.json short-circuit above; there is
+                // nothing to rebuild.
+                return ForgeSourceProbe(
+                    verdict: .alreadyMTPLX,
+                    hfRepo: repo,
+                    sourceFormat: .unknown,
+                    hasMtpWeights: false,
+                    message: "Official MTPLX pair bundle (target + draft). Install it instead of rebuilding.",
+                    diagnostic: nil
+                )
+            }
             return ForgeSourceProbe(
                 verdict: .probeFailed,
                 hfRepo: repo,
@@ -177,7 +197,14 @@ public struct HuggingFaceProbe: Sendable {
     }
 
     private func fetchMtplxRuntimeJSON(repo: String) async -> [String: Any]? {
-        guard let url = URL(string: "\(endpointBase)/\(repo)/resolve/main/mtplx_runtime.json") else {
+        await fetchRepoJSON(repo: repo, path: "mtplx_runtime.json")
+    }
+
+    /// GET `<endpoint>/<repo>/resolve/main/<path>` and decode a JSON
+    /// object. `nil` on any failure — callers treat these fetches as
+    /// best-effort signals, never hard errors.
+    private func fetchRepoJSON(repo: String, path: String) async -> [String: Any]? {
+        guard let url = URL(string: "\(endpointBase)/\(repo)/resolve/main/\(path)") else {
             return nil
         }
         do {
@@ -352,6 +379,21 @@ public struct HuggingFaceProbe: Sendable {
         let metadata = (try? JSONSerialization.jsonObject(with: body) as? [String: Any]) ?? [:]
         let tags = (metadata["tags"] as? [String]) ?? []
         let siblings = (metadata["siblings"] as? [[String: Any]]) ?? []
+        // Rootless assistant-pair bundles (the official Gemma 4 repos)
+        // publish NO root config.json by design: configs live under
+        // target/ and draft/ with mtplx_pair.json at the bundle root.
+        // The daemon accepts exactly this shape (`_inspect_hf_model`,
+        // mtplx/artifacts.py): the file listing names mtplx_pair.json
+        // and both the pair manifest and target/config.json load. The
+        // probe must reach the same verdict instead of refusing what
+        // the engine can run. Fetch/parse failures fall through to the
+        // honest classifications below.
+        let hasPairManifest = siblings.contains {
+            (($0["rfilename"] as? String) ?? "") == "mtplx_pair.json"
+        }
+        if hasPairManifest, let pairBundle = await classifyPairBundle(repo: repo) {
+            return pairBundle
+        }
         let hasGGUF = tags.contains { $0.lowercased() == "gguf" }
             || siblings.contains {
                 (($0["rfilename"] as? String) ?? "").lowercased().hasSuffix(".gguf")
@@ -376,6 +418,34 @@ public struct HuggingFaceProbe: Sendable {
             hfRepo: repo,
             message: "This repo exists but has no config.json, so MTPLX can't read it. If it's a converted export, paste the original repo instead.",
             diagnostic: "config_missing"
+        )
+    }
+
+    /// Validates a rootless pair bundle the way the daemon does
+    /// (`_inspect_hf_model`, mtplx/artifacts.py): the pair manifest
+    /// AND target/config.json must BOTH fetch and parse before the
+    /// repo is accepted. Returns `nil` on any failure so the caller
+    /// falls back to the existing "exists but unreadable" outcome.
+    private func classifyPairBundle(repo: String) async -> OtherModelProbe? {
+        guard await fetchRepoJSON(repo: repo, path: "mtplx_pair.json") != nil,
+              let targetConfig = await fetchRepoJSON(repo: repo, path: "target/config.json")
+        else {
+            return nil
+        }
+        // Mirror the daemon's identity extraction: architectures read
+        // the root config first, then text_config; model_type checks
+        // text_config first, then the root.
+        let textConfig = (targetConfig["text_config"] as? [String: Any]) ?? targetConfig
+        let architecture = (targetConfig["architectures"] as? [String])?.first
+            ?? (textConfig["architectures"] as? [String])?.first
+        let modelType = (textConfig["model_type"] as? String)
+            ?? (targetConfig["model_type"] as? String)
+        let described = (architecture ?? modelType).map { " (\($0) target + draft)" }
+            ?? " (target + draft)"
+        return OtherModelProbe(
+            verdict: .ready,
+            hfRepo: repo,
+            message: "MTPLX pair bundle detected\(described). Ready to download."
         )
     }
 

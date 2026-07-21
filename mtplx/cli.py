@@ -1924,7 +1924,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile",
         type=_profile_arg, metavar=_PROFILE_METAVAR,
         default=DEFAULT_PROFILE_NAME,
-        help="Runtime profile; start defaults to Sustained. Use --profile turbo for the verify-kernel fast path (4/8-bit affine), or --profile performance-cold --max for Burst.",
+        help="Runtime profile. Default resolves per model: Turbo for the quantized 27B and 9B flagships (the app's launch rule), Sustained otherwise. An explicit value always wins. Use --profile performance-cold --max for Burst.",
     )
     start_flow_p.add_argument("--download", action="store_true", help="Download the selected/default model if it is missing")
     start_flow_p.add_argument("--yes", action="store_true", help="Use defaults without interactive model prompts")
@@ -2106,7 +2106,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile",
         type=_profile_arg, metavar=_PROFILE_METAVAR,
         default=DEFAULT_PROFILE_NAME,
-        help="Runtime profile. Direct server quickstart defaults to Sustained; use --profile performance-cold --max for Burst.",
+        help="Runtime profile. Default resolves per model (Turbo for the quantized 27B and 9B flagships, Sustained otherwise); use --profile performance-cold --max for Burst.",
     )
     quickstart_server_p.add_argument("--unsafe-force-unverified", action="store_true")
     quickstart_server_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
@@ -2265,6 +2265,7 @@ def build_parser() -> argparse.ArgumentParser:
     tune_p.add_argument("--mtp-cache-policy", choices=["persistent", "fresh"], default="persistent", help=argparse.SUPPRESS)
     tune_p.add_argument("--mtp-history-policy", choices=["auto", "committed", "full", "last-window", "last_window", "cycle", "none"], default="committed", help=argparse.SUPPRESS)
     tune_p.add_argument("--draft-temperature", type=float, help=argparse.SUPPRESS)
+    tune_p.add_argument("--draft-core", choices=["stock", "device-d2", "device"], default="stock", help=argparse.SUPPRESS)
     tune_p.add_argument("--draft-top-p", type=float, help=argparse.SUPPRESS)
     tune_p.add_argument("--draft-top-k", type=int, help=argparse.SUPPRESS)
     tune_p.add_argument("--prompt-suite", help=argparse.SUPPRESS)
@@ -2330,6 +2331,13 @@ def build_parser() -> argparse.ArgumentParser:
     forge_build_p.add_argument("--max", action="store_true", help="Opt into max-fan verification")
     forge_build_p.add_argument("--max-tokens", type=int, default=2048, help="Verification response budget")
     forge_build_p.add_argument("--suite", help="Verification prompt suite")
+    forge_build_p.add_argument(
+        "--dtype",
+        choices=["auto", "bf16", "fp16"],
+        help="Dtype for non-quantized parameters (overrides recipe body_dtype). "
+        "fp16 prompt-processes faster on M1/M2 Macs, which have no native "
+        "BF16; auto picks fp16 on those chips",
+    )
     forge_build_p.add_argument(
         "--allow-degraded-mtp",
         action="store_true",
@@ -2503,8 +2511,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=_profile_arg, metavar=_PROFILE_METAVAR,
         default=DEFAULT_PROFILE_NAME,
         help=(
-            "Runtime profile. Server defaults to Sustained so long-context "
-            "prefill uses the v0.1.7 fast path; use --profile performance-cold "
+            "Runtime profile. Default resolves per model: Turbo for the "
+            "quantized 27B and 9B flagships (the app's launch rule), "
+            "Sustained otherwise; use --profile performance-cold "
             "--max for Burst."
         ),
     )
@@ -3461,7 +3470,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     depth_p.add_argument(
         "--draft-core",
-        choices=["stock", "device-d2"],
+        choices=["stock", "device-d2", "device"],
         default="stock",
         help=(
             "Experimental DraftCore backend. device-d2 compiles the greedy D2 "

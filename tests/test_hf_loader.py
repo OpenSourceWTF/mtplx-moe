@@ -183,6 +183,40 @@ def test_cached_model_is_complete_rejects_partial_index_even_with_one_shard(
     assert cached_model_is_complete(cached) is False
 
 
+def test_cached_model_is_complete_rejects_incomplete_transfer_marker(tmp_path: Path):
+    cached = tmp_path / "mtplx--example"
+    cached.mkdir()
+    (cached / "config.json").write_text("{}\n", encoding="utf-8")
+    (cached / "model.safetensors").write_bytes(b"weights")
+    (cached / "model.safetensors.incomplete").write_bytes(b"partial")
+
+    assert cached_model_is_complete(cached) is False
+
+
+def test_cached_model_is_complete_rejects_shards_that_sort_before_index(
+    tmp_path: Path,
+):
+    # Interrupted pull of Qwen/Qwen3.5-122B-A10B: shard names like
+    # "model.safetensors-00001-of-00039.safetensors" download before
+    # "model.safetensors.index.json", so a cancel leaves complete shards,
+    # no index, and no .incomplete marker.
+    cached = tmp_path / "mtplx--example"
+    cached.mkdir()
+    (cached / "config.json").write_text("{}\n", encoding="utf-8")
+    (cached / "model.safetensors-00001-of-00039.safetensors").write_bytes(b"weights")
+
+    assert cached_model_is_complete(cached) is False
+
+
+def test_cached_model_is_complete_accepts_single_file_model(tmp_path: Path):
+    cached = tmp_path / "mtplx--example"
+    cached.mkdir()
+    (cached / "config.json").write_text("{}\n", encoding="utf-8")
+    (cached / "model.safetensors").write_bytes(b"weights")
+
+    assert cached_model_is_complete(cached) is True
+
+
 def test_pull_model_reuses_complete_destination_without_redownload(
     tmp_path: Path, monkeypatch
 ):

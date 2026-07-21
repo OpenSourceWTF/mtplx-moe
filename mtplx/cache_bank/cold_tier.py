@@ -71,14 +71,15 @@ _COMMITTED_CACHE_POLICIES = frozenset({"committed", "last_window"})
 
 
 def _deferred_encode_enabled() -> bool:
-    """Writer-thread payload encode (kvcache-v2). Off-switch only.
+    """RETIRED (#169, 2026-07-17) — writer-side encode is gone; always False.
 
-    The foreground evaluates payload arrays (ms-scale GPU slice kernels) so
-    the writer thread never evaluates foreign lazy graphs — it only reads
-    settled buffers into bytes (the GB-scale memcpy that used to run on the
-    request thread)."""
-    raw = str(os.environ.get("MTPLX_SSD_DEFERRED_ENCODE", "1")).strip().lower()
-    return raw not in {"0", "false", "off", "no"}
+    The kvcache-v2 writer-thread encode block-sliced tensors at write time
+    (TreeCodec builds lazy slice arrays and mx.eval()s them), which crashed
+    on restore-derived arrays ("There is no Stream(gpu, 1) in current
+    thread") and could serialize donation-mutated KV pages from the writer
+    backlog. put_entry now always encodes at enqueue on the owner thread.
+    MTPLX_SSD_DEFERRED_ENCODE is parsed nowhere and ignored."""
+    return False
 
 
 @dataclass(frozen=True)
@@ -369,77 +370,44 @@ class SessionBankColdTier:
             (int(r[0]), r[1], r[2] if len(r) > 2 else None)
             for r in (getattr(entry, "gdn_boundaries", None) or [])
         )
-        if _deferred_encode_enabled():
-            try:
-                deferred = DeferredPayload(
-                    cache_snapshot=getattr(entry, "cache_snapshot"),
-                    logits=getattr(entry, "logits"),
-                    hidden=getattr(entry, "hidden"),
-                    mtp_history_snapshot=getattr(entry, "mtp_history_snapshot", None),
-                    gdn_boundaries=boundaries,
-                    has_recurrent=bool(getattr(entry, "has_recurrent", False)),
-                    block_size=self.block_size,
-                )
-                # Settle every payload array on the request thread so the
-                # writer only reads buffers (MLX thread discipline: never
-                # evaluate another thread's lazy graph).
-                _eval_payload_trees(
-                    deferred.cache_snapshot,
-                    deferred.logits,
-                    deferred.hidden,
-                    deferred.mtp_history_snapshot,
-                    deferred.gdn_boundaries,
-                )
-            except Exception as exc:
-                self._inc("skipped_serialize_error")
-                logger.warning(
-                    "SessionBank SSD payload prep skipped: %s: %s",
-                    type(exc).__name__,
-                    exc,
-                )
-                return False
-            metadata = self._metadata_for_entry(
-                entry,
-                capabilities=capabilities or (),
-                payload_nbytes=0,
+        # Encode ALWAYS happens here, on the enqueueing (owner) thread, never
+        # on the writer thread (#169, 2026-07-17). The retired writer-side
+        # "deferred encode" (kvcache-v2) block-sliced tensors at write time:
+        # TreeCodec._encode_tensor_blocks builds new lazy slice arrays and
+        # mx.eval()s them, which (a) crashed the process on restore-derived
+        # arrays whose graphs referenced the restore stream ("There is no
+        # Stream(gpu, 1) in current thread"), and (b) held live KV references
+        # for seconds in the writer backlog, so under buffer donation the
+        # eventual serialization could capture mutated pages — silently
+        # corrupt persisted sessions that degrade on every restore. Bytes are
+        # captured at snapshot time; the writer thread is pure file IO.
+        try:
+            encoded = encode_payload(
+                cache_snapshot=getattr(entry, "cache_snapshot"),
+                logits=getattr(entry, "logits"),
+                hidden=getattr(entry, "hidden"),
+                mtp_history_snapshot=getattr(entry, "mtp_history_snapshot", None),
+                gdn_boundaries=boundaries,
+                has_recurrent=bool(getattr(entry, "has_recurrent", False)),
+                block_size=self.block_size,
             )
-            pending = PendingWrite(
-                entry_id=str(metadata["entry_id"]),
-                token_ids=token_ids,
-                metadata=metadata,
-                payload_spec=None,
-                tensors={},
-                deferred=deferred,
-                pinned_nbytes=estimated_nbytes,
-            )
-        else:
-            try:
-                encoded = encode_payload(
-                    cache_snapshot=getattr(entry, "cache_snapshot"),
-                    logits=getattr(entry, "logits"),
-                    hidden=getattr(entry, "hidden"),
-                    mtp_history_snapshot=getattr(entry, "mtp_history_snapshot", None),
-                    gdn_boundaries=boundaries,
-                    has_recurrent=bool(getattr(entry, "has_recurrent", False)),
-                    block_size=self.block_size,
-                )
-            except Exception as exc:
-                self._inc("skipped_serialize_error")
-                logger.warning("SessionBank SSD serialize skipped: %s: %s", type(exc).__name__, exc)
-                return False
-            metadata = self._metadata_for_entry(
-                entry,
-                capabilities=capabilities or (),
-                payload_nbytes=encoded.nbytes,
-            )
-            pending = PendingWrite(
-                entry_id=str(metadata["entry_id"]),
-                token_ids=token_ids,
-                metadata=metadata,
-                payload_spec=encoded.spec,
-                tensors=encoded.tensors,
-                pinned_nbytes=max(estimated_nbytes, int(encoded.nbytes)),
-            )
+        except Exception as exc:
+            self._inc("skipped_serialize_error")
+            logger.warning("SessionBank SSD serialize skipped: %s: %s", type(exc).__name__, exc)
+            return False
+        metadata = self._metadata_for_entry(
+            entry,
+            capabilities=capabilities or (),
+            payload_nbytes=encoded.nbytes,
+        )
+        pending = PendingWrite(
+            entry_id=str(metadata["entry_id"]),
+            token_ids=token_ids,
+            metadata=metadata,
+            payload_spec=encoded.spec,
+            tensors=encoded.tensors,
+            pinned_nbytes=max(estimated_nbytes, int(encoded.nbytes)),
+        )
         try:
             self._queue.put_nowait(pending)
         except queue.Full:
@@ -879,33 +847,18 @@ class SessionBankColdTier:
 
     def _write_pending(self, pending: PendingWrite) -> bool:
         if pending.deferred is not None:
-            # Writer-side encode (kvcache-v2): arrays were settled by the
-            # request thread; this is pure buffer->bytes work off the
-            # foreground. Failures count as write failures, not serialize
-            # skips, so the stats distinguish the two eras.
-            encoded = encode_payload(
-                cache_snapshot=pending.deferred.cache_snapshot,
-                logits=pending.deferred.logits,
-                hidden=pending.deferred.hidden,
-                mtp_history_snapshot=pending.deferred.mtp_history_snapshot,
-                gdn_boundaries=pending.deferred.gdn_boundaries,
-                has_recurrent=pending.deferred.has_recurrent,
-                block_size=pending.deferred.block_size,
+            # Retired path (#169, 2026-07-17): writer-side encode ran MLX
+            # slice/eval graph work on the writer thread (crash on
+            # restore-stream arrays, donation-corruption window). put_entry
+            # now always encodes at enqueue; a deferred payload reaching the
+            # writer is a programming error, never silently encoded here.
+            self._inc("skipped_deferred_retired")
+            logger.error(
+                "SessionBank SSD writer received a deferred payload "
+                "entry_id=%s; writer-side encode is retired (#169), skipping",
+                pending.entry_id,
             )
-            metadata = dict(pending.metadata)
-            metadata["nbytes"] = int(
-                max(int(metadata.get("nbytes", 0) or 0), int(encoded.nbytes))
-            )
-            metadata["logical_nbytes"] = int(encoded.nbytes)
-            metadata["physical_nbytes"] = int(encoded.nbytes)
-            pending = PendingWrite(
-                entry_id=pending.entry_id,
-                token_ids=pending.token_ids,
-                metadata=metadata,
-                payload_spec=encoded.spec,
-                tensors=encoded.tensors,
-                created_at_s=pending.created_at_s,
-            )
+            return False
         with self._base_lock:
             self._ensure_store()
             entry_hash_prefix = pending.entry_id[:2]

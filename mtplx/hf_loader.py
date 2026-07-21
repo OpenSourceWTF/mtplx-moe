@@ -7,6 +7,7 @@ import errno
 import importlib
 import json
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -162,14 +163,44 @@ def _complete_indexed_weights(path: Path, index_name: str) -> bool:
     return True
 
 
+_SHARD_FILENAME_RE = re.compile(r"-\d+-of-\d+", re.IGNORECASE)
+
+
+def _has_incomplete_transfers(path: Path) -> bool:
+    """``snapshot_download`` stages in-flight files as ``*.incomplete``.
+
+    Markers inside the hub's ``.cache`` bookkeeping tree are ignored: they
+    can outlive a successful resume, and the weight checks verify the final
+    files directly. A marker next to the weights, however, means the final
+    file never landed.
+    """
+
+    try:
+        for marker in path.rglob("*.incomplete"):
+            if ".cache" in marker.relative_to(path).parts:
+                continue
+            return True
+    except OSError:
+        pass
+    return False
+
+
 def _complete_unindexed_weights(path: Path) -> bool:
     for pattern in ("*.safetensors", "*.bin", "*.gguf"):
         for candidate in path.glob(pattern):
             try:
-                if candidate.is_file() and candidate.stat().st_size > 0:
-                    return True
+                if not candidate.is_file() or candidate.stat().st_size <= 0:
+                    continue
             except OSError:
                 continue
+            # A shard-named file implies a weight index the download has not
+            # reached yet; shard names can sort before the index (e.g.
+            # "model.safetensors-00001-of-00039.safetensors" precedes
+            # "model.safetensors.index.json"), so treat the copy as partial
+            # rather than as a complete single-file model.
+            if _SHARD_FILENAME_RE.search(candidate.name):
+                return False
+            return True
     return False
 
 
@@ -182,6 +213,8 @@ def cached_model_is_complete(path: Path) -> bool:
     """
 
     if not path.is_dir():
+        return False
+    if _has_incomplete_transfers(path):
         return False
     # Assistant-pair bundles (Gemma 4) have no top-level config.json — the
     # weights live under target/ and assistant/ with an mtplx_pair.json

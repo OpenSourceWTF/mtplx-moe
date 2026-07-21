@@ -1999,10 +1999,12 @@ def test_policy_fingerprint_separates_tool_contract_cache_identity():
     assert plain != tools
     assert "tool_contract=none" in plain
     assert "tool_prompt_mode=hybrid" in tools
-    assert (
-        "tool_contract=soft_schema_contract:native_xml:targeted_reads:"
-        "post_tool_continue:agent_tail:dated:v12"
-    ) in tools
+    from mtplx.server.openai import _MTPLX_TOOL_CONTRACT_POLICY_VERSION
+
+    # The fingerprint must carry the current contract policy version so a
+    # contract-text change rotates cache identity (reference the constant,
+    # not a literal — the version bumps whenever the contract text changes).
+    assert f"tool_contract={_MTPLX_TOOL_CONTRACT_POLICY_VERSION}" in tools
     native = _policy_fingerprint(
         state,
         thinking_enabled=True,

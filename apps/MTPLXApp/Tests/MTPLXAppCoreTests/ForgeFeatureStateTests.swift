@@ -333,4 +333,28 @@ final class ForgeFeatureStateTests: XCTestCase {
         XCTAssertNil(s.verification)
         XCTAssertEqual(s.brand, ForgeBrandInfo())
     }
+
+    // MARK: body dtype (#166)
+
+    func testForgeRecipeDecodesLegacyPayloadWithoutBodyDtype() throws {
+        let legacy = #"{"body_bits":4,"body_group_size":64,"body_mode":"affine","mtp_policy":"keep_bf16"}"#
+        let recipe = try JSONDecoder().decode(ForgeRecipe.self, from: Data(legacy.utf8))
+        XCTAssertEqual(recipe.bodyDtype, .auto)
+        XCTAssertEqual(recipe.bodyBits, 4)
+        XCTAssertEqual(recipe.mtpPolicy, .keepBf16)
+    }
+
+    func testForgeRecipeEncodesBodyDtypeUnderSnakeCaseKey() throws {
+        var recipe = ForgeRecipe()
+        recipe.bodyDtype = .fp16
+        let data = try JSONEncoder().encode(recipe)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        XCTAssertEqual(object["body_dtype"] as? String, "fp16")
+    }
+
+    func testForgeRecipeDefaultBodyDtypeIsAuto() {
+        XCTAssertEqual(ForgeRecipe().bodyDtype, .auto)
+    }
 }

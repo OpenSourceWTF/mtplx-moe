@@ -970,3 +970,18 @@ def test_dashboard_prompt_preview_truncates_long_messages():
     assert len(preview) <= 40
     assert preview.endswith("...")
     assert preview.startswith("abc")
+
+
+def test_rolling_metrics_per_session_map_is_lru_bounded():
+    # Agent clients mint fresh session ids freely; the per-session max map is
+    # copied whole into every dashboard snapshot, so it must stay bounded for
+    # the daemon's lifetime (external review F5).
+    metrics = RollingMetrics()
+    for index in range(200):
+        metrics.append(10.0 + index, f"session-{index}")
+    snapshot = metrics.snapshot()
+    per_session = snapshot["max_per_session"]
+    assert len(per_session) == RollingMetrics.MAX_PER_SESSION_ENTRIES
+    # Most-recent sessions survive; the oldest were evicted.
+    assert "session-199" in per_session
+    assert "session-0" not in per_session

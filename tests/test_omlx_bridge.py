@@ -137,3 +137,156 @@ def test_omlx_stream_filter_suppresses_tool_markup_without_cancelling():
 
     assert "".join(visible) == "Before  after"
     assert stream_filter.suppressed_markup is True
+
+
+# ---------- #170: the extraction lane must not fabricate or deliver
+# impossible calls (contract parity with the strict streaming/final parsers) --
+
+EDIT_FILE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "search": {"type": "string"},
+                                "replace": {"type": "string"},
+                            },
+                            "required": ["search", "replace"],
+                        },
+                    },
+                },
+                "required": ["path", "edits"],
+            },
+        },
+    }
+]
+
+
+def test_omlx_tool_parser_json_body_in_function_envelope():
+    nested = {
+        "path": "config.py",
+        "edits": [{"search": "a = 1", "replace": 'a = {"b": 2}'}],
+    }
+    extraction = parse_tool_calls(
+        "<tool_call>\n<function=edit_file>\n"
+        + json.dumps(nested)
+        + "\n</function>\n</tool_call>",
+        tokenizer=None,
+        tools=EDIT_FILE_TOOLS,
+    )
+    assert extraction.status == "parsed"
+    assert json.loads(extraction.tool_calls[0]["function"]["arguments"]) == nested
+
+
+def test_omlx_tool_parser_never_fabricates_empty_arguments():
+    """#170 delivery lane: a recognized envelope with an unreadable body used
+    to come back as a schema-less call with arguments {}."""
+    extraction = parse_tool_calls(
+        "<tool_call>\n<function=edit_file>\nnot a payload at all\n</function>\n</tool_call>",
+        tokenizer=None,
+        tools=EDIT_FILE_TOOLS,
+    )
+    assert extraction.status == "malformed_as_content"
+    assert extraction.tool_calls is None
+    assert "unwrapped parameter text" in (extraction.malformed_reason or "")
+
+
+def test_omlx_tool_parser_delivers_partial_arguments_faithfully():
+    """OpenAI-protocol contract: arguments carry the model's actual output and
+    schema validation is the client's job (test_chat_stream_missing_required_
+    tool_argument_still_emits_model_tool_call pins the same rule at the stream
+    level). What the parser must never do is FABRICATE arguments — a partial
+    call here must be the model's own partial payload, not an invented {}."""
+    extraction = parse_tool_calls(
+        "<tool_call>\n<function=edit_file>\n"
+        "<parameter=path>\nconfig.py\n</parameter>\n"
+        "</function>\n</tool_call>",
+        tokenizer=None,
+        tools=EDIT_FILE_TOOLS,
+    )
+    assert extraction.status == "parsed"
+    assert json.loads(extraction.tool_calls[0]["function"]["arguments"]) == {
+        "path": "config.py"
+    }
+
+
+def test_omlx_tool_parser_empty_body_no_arg_tool_still_parses():
+    extraction = parse_tool_calls(
+        "<tool_call>\n<function=list_files>\n</function>\n</tool_call>",
+        tokenizer=None,
+        tools=[{"type": "function", "function": {"name": "list_files"}}],
+    )
+    assert extraction.status == "parsed"
+    assert json.loads(extraction.tool_calls[0]["function"]["arguments"]) == {}
+
+
+class _NativeToolTokenizer:
+    """Tokenizer double for the native tool_parser branch: mirrors the live
+    mlx-lm TokenizerWrapper shape that returned empty arguments for JSON-object
+    function bodies (the probe-2 live receipt behind the #170 fix)."""
+
+    has_tool_calling = True
+    tool_call_start = "<tool_call>"
+    tool_call_end = "</tool_call>"
+
+    @staticmethod
+    def tool_parser(_text, _tools):
+        return {"name": "grep", "arguments": {}}
+
+
+GREP_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    }
+]
+
+
+def test_omlx_native_branch_recovers_json_body_instead_of_empty_args():
+    extraction = parse_tool_calls(
+        '<tool_call>\n<function=grep>\n{"path": "config.py"}\n</function>\n</tool_call>',
+        tokenizer=_NativeToolTokenizer(),
+        tools=GREP_TOOLS,
+    )
+    assert extraction.status == "parsed"
+    assert json.loads(extraction.tool_calls[0]["function"]["arguments"]) == {
+        "path": "config.py"
+    }
+
+
+def test_omlx_native_branch_never_fabricates_empty_args_from_garbage_body():
+    extraction = parse_tool_calls(
+        "<tool_call>\n<function=grep>\nnot a payload\n</function>\n</tool_call>",
+        tokenizer=_NativeToolTokenizer(),
+        tools=GREP_TOOLS,
+    )
+    assert extraction.status == "malformed_as_content"
+    assert extraction.tool_calls is None
+
+
+def test_omlx_native_branch_keeps_blank_body_no_arg_call():
+    extraction = parse_tool_calls(
+        "<tool_call>\n<function=grep>\n</function>\n</tool_call>",
+        tokenizer=_NativeToolTokenizer(),
+        tools=GREP_TOOLS,
+    )
+    assert extraction.status == "parsed"
+    assert json.loads(extraction.tool_calls[0]["function"]["arguments"]) == {}

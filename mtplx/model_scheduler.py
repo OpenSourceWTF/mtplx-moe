@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 import sys
 from collections import Counter, deque
+
+from . import progress_heartbeat
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from threading import Condition, Thread, get_ident
@@ -68,6 +70,15 @@ class _WorkItem:
     batch_key: str | None = None
     queued_at_s: float = field(default_factory=time.monotonic)
     earliest_start_s: float = field(default_factory=time.monotonic)
+
+
+def _batch_key_class(batch_key: str) -> str:
+    """Stable telemetry class for a batch key: the prefix before the first ':'.
+
+    Keys like ``postcommit:{session_id}`` carry a per-session suffix that is
+    useful as the *active* diagnostic but would grow the started-by counter by
+    one entry per session for the daemon's lifetime."""
+    return batch_key.split(":", 1)[0]
 
 
 class ModelWorkScheduler:
@@ -178,10 +189,11 @@ class ModelWorkScheduler:
     def record_batch_step(self, *, size: int, batch_key: str | None = None) -> None:
         """Record a model-owner microbatch executed inside a long-lived pump."""
 
+        progress_heartbeat.tick()
         with self._condition:
             self._batch_histogram[max(1, int(size))] += 1
             if batch_key:
-                self._started_by_batch_key[str(batch_key)] += 1
+                self._started_by_batch_key[_batch_key_class(str(batch_key))] += 1
 
     def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
         """ThreadPoolExecutor-compatible foreground submit."""
@@ -294,12 +306,15 @@ class ModelWorkScheduler:
                 self._active_queue_wait_s = queue_wait_s
                 self._queue_wait_samples_s.append(queue_wait_s)
                 self._started += 1
-                self._started_by_batch_key[item.batch_key or "none"] += 1
+                self._started_by_batch_key[
+                    _batch_key_class(item.batch_key) if item.batch_key else "none"
+                ] += 1
             try:
                 item.future.set_result(item.fn(*item.args, **item.kwargs))
             except BaseException as exc:
                 item.future.set_exception(exc)
             finally:
+                progress_heartbeat.tick()
                 run_duration_s = max(0.0, time.monotonic() - now)
                 with self._condition:
                     self._completed += 1

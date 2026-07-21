@@ -1518,10 +1518,11 @@ def test_openai_server_health_metrics_and_models_fake_state():
     assert health.json()["startup"]["model_controls"]["draft_control"]["maximum"] == 3
     assert health.json()["startup"]["tool_prompt_mode"] == "hybrid"
     assert health.json()["startup"]["tool_contract_active"] is True
+    from mtplx.server.openai import _MTPLX_TOOL_CONTRACT_POLICY_VERSION
+
     assert (
         health.json()["startup"]["tool_contract_policy_version"]
-        == "soft_schema_contract:native_xml:targeted_reads:"
-        "post_tool_continue:agent_tail:dated:v12"
+        == _MTPLX_TOOL_CONTRACT_POLICY_VERSION
     )
     assert health.json()["thermal"]["max_requested"] is False
     assert health.json()["foreground_active"] == 0
@@ -3681,8 +3682,8 @@ def test_tool_contract_includes_exact_schema_keys_for_opencode_write(monkeypatch
     rendered = "\n".join(str(message.get("content") or "") for message in messages)
     assert "MTPLX tool contract:" in rendered
     assert "exact argument keys/case" in rendered
-    assert "Do not put full file contents" in rendered
-    assert "file content as tool arguments" in rendered
+    assert "Never print file contents" in rendered
+    assert "only inside the declared write/edit tool call arguments" in rendered
     assert "emit one declared <tool_call> now" in rendered
     assert "implementation payloads in the declared tool call arguments" in rendered
     assert "let me fix this" in rendered
@@ -6403,9 +6404,9 @@ def test_tool_contract_stabilizes_tool_schema_with_agent_tail_guardrail():
 
     assert with_contract[0]["role"] == "system"
     assert "MTPLX tool contract:" in with_contract[0]["content"]
-    assert "use the smallest read range/limit/offset" in with_contract[0]["content"]
-    assert "Do not put full file contents" in with_contract[0]["content"]
-    assert "file content as tool arguments" in with_contract[0]["content"]
+    assert "Read a file in ONE call" in with_contract[0]["content"]
+    assert "Never print file contents" in with_contract[0]["content"]
+    assert "only inside the declared write/edit tool call arguments" in with_contract[0]["content"]
     assert "MTPLX coding-agent tool protocol reminder:" in with_contract[0]["content"]
     assert "emit one declared <tool_call> now" in with_contract[0]["content"]
     assert "implementation payloads in the declared tool call arguments" in with_contract[0]["content"]
@@ -10722,3 +10723,284 @@ def test_completions_nonstream_stop_aborts_generation_early(monkeypatch):
     assert body["choices"][0]["finish_reason"] == "stop"
     assert body["usage"]["completion_tokens"] == len("Hello ") + len("STOP\n")
     assert body["mtplx_stats"]["stop_sequence_hit"] is True
+
+
+def test_anthropic_messages_bare_tools_first_request_completes(monkeypatch):
+    # Issue #86's minimal reproduction shape: a fresh server's FIRST
+    # /v1/messages request with a tiny prompt, a bare tools array, and a small
+    # output budget must stream to message_stop rather than hanging. This
+    # guards the request path (parse -> render -> schedule -> stream) for the
+    # exact payload; the live deadlock itself is contained separately by the
+    # stream stall watchdog (MTPLX_STREAM_STALL_DEADLINE_S).
+    client = TestClient(create_app(_fake_state()))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai, "_run_generation", _fake_streaming_generation("On it.")
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "model": "mtplx-test-model",
+            "max_tokens": 32,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "name": "echo",
+                    "description": "Echo a string back.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"],
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert "message_start" in response.text
+    assert "message_stop" in response.text
+    assert "On it." in response.text
+    assert '"type": "error"' not in response.text
+
+
+class _ThinkMarkerTokenizer:
+    """encode() mirroring Qwen: think markers are single dedicated ids."""
+
+    _VOCAB = {"<think>": [151667], "</think>": [151668]}
+
+    def encode(self, text, add_special_tokens=False):
+        if text in self._VOCAB:
+            return list(self._VOCAB[text])
+        return [11, 22]
+
+
+def _guard_request_state(argv):
+    return SimpleNamespace(
+        args=parse_args(["--warmup-tokens", "0", *argv]),
+        runtime=SimpleNamespace(tokenizer=_ThinkMarkerTokenizer()),
+    )
+
+
+_AGENT_LANE_OBS = {
+    "request_enable_thinking": True,
+    "request_tool_count": 4,
+    "request_reasoning_effort": "high",
+}
+
+
+def test_thinking_guard_default_is_off(monkeypatch):
+    monkeypatch.delenv("MTPLX_THINKING_BUDGET", raising=False)
+    config = openai._thinking_guard_config_for_request(
+        _guard_request_state([]),
+        prompt_ids=[1, 2, 3],
+        request_observability=dict(_AGENT_LANE_OBS),
+    )
+    assert config is None
+
+
+def test_thinking_guard_auto_optin_maps_effort(monkeypatch):
+    monkeypatch.delenv("MTPLX_THINKING_BUDGET", raising=False)
+    config = openai._thinking_guard_config_for_request(
+        _guard_request_state(["--agent-thinking-budget", "auto"]),
+        prompt_ids=[1, 2, 3],
+        request_observability=dict(_AGENT_LANE_OBS),
+    )
+    assert config is not None and config.enabled
+    assert config.budget_tokens == 6144
+
+
+def test_thinking_guard_integer_optin_sets_budget(monkeypatch):
+    monkeypatch.delenv("MTPLX_THINKING_BUDGET", raising=False)
+    config = openai._thinking_guard_config_for_request(
+        _guard_request_state(["--agent-thinking-budget", "1536"]),
+        prompt_ids=[1, 2, 3],
+        request_observability=dict(_AGENT_LANE_OBS),
+    )
+    assert config is not None and config.enabled
+    assert config.budget_tokens == 1536
+
+
+def test_thinking_guard_env_optin_beats_default_off(monkeypatch):
+    monkeypatch.setenv("MTPLX_THINKING_BUDGET", "2048")
+    config = openai._thinking_guard_config_for_request(
+        _guard_request_state([]),
+        prompt_ids=[1, 2, 3],
+        request_observability=dict(_AGENT_LANE_OBS),
+    )
+    assert config is not None and config.enabled
+    assert config.budget_tokens == 2048
+
+
+def test_thinking_guard_never_touches_plain_chat_even_opted_in(monkeypatch):
+    monkeypatch.setenv("MTPLX_THINKING_BUDGET", "2048")
+    state = _guard_request_state(["--agent-thinking-budget", "auto"])
+    no_tools = openai._thinking_guard_config_for_request(
+        state,
+        prompt_ids=[1, 2, 3],
+        request_observability={
+            "request_enable_thinking": True,
+            "request_tool_count": 0,
+        },
+    )
+    no_thinking = openai._thinking_guard_config_for_request(
+        state,
+        prompt_ids=[1, 2, 3],
+        request_observability={
+            "request_enable_thinking": False,
+            "request_tool_count": 4,
+        },
+    )
+    assert no_tools is None and no_thinking is None
+# --- parallel_tool_calls wiring ---------------------------------------------
+
+
+def _two_call_extraction(*_args, **_kwargs):
+    def _call(name):
+        return {
+            "id": f"call_{name}",
+            "type": "function",
+            "function": {"name": name, "arguments": "{\"q\": 1}"},
+        }
+
+    return SimpleNamespace(
+        cleaned_text="",
+        cleaned_thinking="",
+        tool_calls=[_call("session_status"), _call("session_status")],
+        parser_source="native",
+        status="parsed",
+        malformed_reason=None,
+        raw_tool_markup_suppressed=True,
+    )
+
+
+def test_parallel_tool_calls_false_truncates_nonstream_tool_calls(monkeypatch):
+    state = _fake_state()
+    state.runtime.tokenizer = CaptureTokenizer()
+    monkeypatch.setattr(openai, "_run_generation", lambda *a, **k: _fake_generation("x"))
+    monkeypatch.setattr(
+        openai, "omlx_extract_tool_calls_with_thinking", _two_call_extraction
+    )
+    client = TestClient(create_app(state))
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "status twice"}],
+            "tools": [_tool_schema()],
+            "parallel_tool_calls": False,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["choices"][0]["message"]["tool_calls"]) == 1
+    assert body["mtplx_stats"]["tool_calls_emitted"] == 1
+
+
+def test_parallel_tool_calls_unset_keeps_all_nonstream_tool_calls(monkeypatch):
+    state = _fake_state()
+    state.runtime.tokenizer = CaptureTokenizer()
+    monkeypatch.setattr(openai, "_run_generation", lambda *a, **k: _fake_generation("x"))
+    monkeypatch.setattr(
+        openai, "omlx_extract_tool_calls_with_thinking", _two_call_extraction
+    )
+    client = TestClient(create_app(state))
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "status twice"}],
+            "tools": [_tool_schema()],
+        },
+    )
+    assert response.status_code == 200
+    assert len(response.json()["choices"][0]["message"]["tool_calls"]) == 2
+
+
+def test_single_tool_call_stream_policy_declared_field_wins():
+    policy = openai._single_tool_call_stream_policy
+    # Declared field is authoritative in both directions.
+    assert policy(parallel_tool_calls=False, client_hint="", explicit_single_tool=False)
+    assert not policy(
+        parallel_tool_calls=True, client_hint="pi", explicit_single_tool=True
+    )
+    # Unset falls back to the legacy client-hint heuristics.
+    assert policy(parallel_tool_calls=None, client_hint="pi", explicit_single_tool=False)
+    assert policy(
+        parallel_tool_calls=None, client_hint="opencode", explicit_single_tool=True
+    )
+    assert not policy(
+        parallel_tool_calls=None, client_hint="opencode", explicit_single_tool=False
+    )
+    assert not policy(parallel_tool_calls=None, client_hint="", explicit_single_tool=False)
+
+
+def test_request_parallel_tool_calls_only_honors_booleans():
+    assert openai._request_parallel_tool_calls(SimpleNamespace(parallel_tool_calls=True)) is True
+    assert openai._request_parallel_tool_calls(SimpleNamespace(parallel_tool_calls=False)) is False
+    assert openai._request_parallel_tool_calls(SimpleNamespace(parallel_tool_calls="yes")) is None
+    assert openai._request_parallel_tool_calls(SimpleNamespace()) is None
+
+
+def test_parallel_tool_calls_false_streaming_android_studio_shape(monkeypatch):
+    # The real client shape from tests/fixtures/android_studio_issue58_chat.json:
+    # no client-identifying header, stream:true, stream_options include_usage,
+    # and an explicit parallel_tool_calls:false that must drive single-tool
+    # truncation on its own — no client-name sniffing involved.
+    state = _fake_state()
+    state.args.stream_interval = 1
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    generated = (
+        "<tool_call>\n<function=bash>\n"
+        "<parameter=command>\nls\n</parameter>\n"
+        "<parameter=description>\nList files\n</parameter>\n"
+        "</function>\n</tool_call>\n"
+        "<tool_call>\n<function=bash>\n"
+        "<parameter=command>\npwd\n</parameter>\n"
+        "<parameter=description>\nPrint cwd\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        _fake_streaming_generation(generated),
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "List files, then print cwd."}],
+            "tools": [_bash_tool_schema()],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "parallel_tool_calls": False,
+            "max_tokens": 128,
+        },
+    )
+
+    assert response.status_code == 200
+    payloads = _stream_payloads(response.text)
+    tool_deltas = [
+        item
+        for payload in payloads
+        if payload.get("choices")
+        for item in payload["choices"][0]["delta"].get("tool_calls", [])
+    ]
+    arguments = "".join(
+        item.get("function", {}).get("arguments", "") for item in tool_deltas
+    )
+    final = [
+        payload
+        for payload in payloads
+        if payload.get("choices") and payload["choices"][0]["finish_reason"]
+    ]
+    assert '"command":"ls"' in arguments
+    assert "pwd" not in arguments
+    assert final[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    assert final[-1]["mtplx_stats"]["tool_calls_emitted"] == 1

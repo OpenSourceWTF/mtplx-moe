@@ -3279,12 +3279,18 @@ final class MTPLXAppCoreTests: XCTestCase {
         })
     }
 
-    func testFourBStaysOutOfFreshRecommendationMatrix() throws {
-        let fourB = try XCTUnwrap(MTPLXModelOption.option(matching: "qwen35-4b-optimized-speed"))
+    func testFourBPairCarriesModernTierMarkerSoInstalledCopiesStayVisible() throws {
+        // The picker's installed-override hides any official entry whose
+        // recommendedFor is empty (the orphan-protection that hid the broken
+        // 4B). The rebuilt pair must carry the modern tier marker or an
+        // installed copy is invisible on big-RAM Macs (2026-07-19 bug).
+        let speed = try XCTUnwrap(MTPLXModelOption.option(matching: "qwen35-4b-optimized-speed"))
+        let quality = try XCTUnwrap(MTPLXModelOption.option(matching: "qwen35-4b-optimized-quality"))
 
-        XCTAssertEqual(fourB.recommendedFor, [])
-        XCTAssertFalse(MTPLXModelOption.recommendedCatalogIDs(for: nil).contains(fourB.id))
-        XCTAssertFalse(MTPLXModelOption.hardwareAwareOfficialCatalog(hardware: nil).contains { $0.id == fourB.id })
+        XCTAssertEqual(speed.recommendedFor, [.modernApple])
+        XCTAssertEqual(quality.recommendedFor, [.modernApple])
+        // Unknown hardware keeps the conservative big-model-first list.
+        XCTAssertFalse(MTPLXModelOption.recommendedCatalogIDs(for: nil).contains(speed.id))
     }
 
     func testFreshLegacySmallMemoryCatalogUses9BFP16AsMinimum() throws {
@@ -3342,7 +3348,9 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(quality.recommendedFor.contains(.legacyApple))
     }
 
-    func testFreshModernSmallMemoryCatalogUses9BAsMinimum() throws {
+    func testFreshModernSmallMemoryCatalogLeadsWith9BAndOffersFourBPair() throws {
+        // The rebuilt 4B pair (2026-07-19) is recommendable again: the 16 GB
+        // tier leads with the 9B and offers both 4B lanes behind it.
         let m5 = DetectedHardware(
             chipName: "Apple M5",
             appleSiliconGeneration: "m5",
@@ -3354,13 +3362,16 @@ final class MTPLXAppCoreTests: XCTestCase {
             includeInstalledOverrides: false
         ).map(\.id)
 
-        XCTAssertEqual(ids, ["qwen35-9b-optimized-speed"])
-        XCTAssertFalse(ids.contains("qwen35-4b-optimized-speed"))
+        XCTAssertEqual(ids, [
+            "qwen35-9b-optimized-speed",
+            "qwen35-4b-optimized-speed",
+            "qwen35-4b-optimized-quality",
+        ])
         XCTAssertFalse(ids.contains("qwen35-9b-optimized-speed-fp16"))
         XCTAssertFalse(ids.contains { $0.contains("step") })
     }
 
-    func testFreshModernMidMemoryCatalogShowsStrongOptionsWithoutFourB() throws {
+    func testFreshModernMidMemoryCatalogShowsStrongOptionsWithFourBTail() throws {
         let m5 = DetectedHardware(
             chipName: "Apple M5 Pro",
             appleSiliconGeneration: "m5",
@@ -3378,8 +3389,9 @@ final class MTPLXAppCoreTests: XCTestCase {
             "gemma4-optimized-speed",
             "qwen36-35b-a3b-optimized-speed",
             "optimized-quality",
+            "qwen35-4b-optimized-speed",
+            "qwen35-4b-optimized-quality",
         ])
-        XCTAssertFalse(ids.contains("qwen35-4b-optimized-speed"))
         XCTAssertFalse(ids.contains { $0.hasSuffix("-fp16") })
         XCTAssertFalse(ids.contains { $0.contains("step") })
     }
@@ -3403,8 +3415,9 @@ final class MTPLXAppCoreTests: XCTestCase {
             "qwen36-35b-a3b-optimized-balance",
             "gemma4-optimized-speed",
             "qwen35-9b-optimized-speed",
+            "qwen35-4b-optimized-speed",
+            "qwen35-4b-optimized-quality",
         ])
-        XCTAssertFalse(ids.contains("qwen35-4b-optimized-speed"))
         XCTAssertFalse(ids.contains("qwen36-35b-a3b-optimized-speed-fp16"))
         XCTAssertFalse(ids.contains("qwen36-35b-a3b-optimized-balance-fp16"))
         XCTAssertFalse(ids.contains { $0.contains("step") })

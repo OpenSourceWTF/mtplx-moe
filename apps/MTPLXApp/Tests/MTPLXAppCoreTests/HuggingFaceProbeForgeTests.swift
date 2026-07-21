@@ -380,6 +380,129 @@ final class HuggingFaceProbeForgeTests: XCTestCase {
         XCTAssertTrue(result.message.contains("no config.json"))
     }
 
+    // MARK: - Rootless pair bundles (official Gemma 4 layout)
+
+    func testProbeAcceptsRootlessPairBundle() async {
+        let fake = FakeRunner()
+        // config.json 404s (FakeRunner default) — pair bundles have no
+        // root config by design. The metadata listing names
+        // mtplx_pair.json at the bundle root and both pair files fetch
+        // cleanly, exactly the shape `_inspect_hf_model` accepts.
+        fake.install(
+            url: "https://huggingface.co/api/models/Youssofal/Gemma4-MTPLX-Optimized-Quality",
+            body: """
+            {
+              "id": "Youssofal/Gemma4-MTPLX-Optimized-Quality",
+              "tags": ["mlx"],
+              "siblings": [
+                { "rfilename": "mtplx_pair.json" },
+                { "rfilename": "target/config.json" },
+                { "rfilename": "draft/config.json" }
+              ]
+            }
+            """
+        )
+        fake.install(
+            url: "https://huggingface.co/Youssofal/Gemma4-MTPLX-Optimized-Quality/resolve/main/mtplx_pair.json",
+            body: """
+            { "layout": { "target": "target", "assistant": "draft" } }
+            """
+        )
+        fake.install(
+            url: "https://huggingface.co/Youssofal/Gemma4-MTPLX-Optimized-Quality/resolve/main/target/config.json",
+            body: """
+            { "architectures": ["Gemma3ForConditionalGeneration"], "model_type": "gemma3" }
+            """
+        )
+        let probe = HuggingFaceProbe(runner: fake.runner())
+        let result = await probe.probe(repo: "Youssofal/Gemma4-MTPLX-Optimized-Quality")
+        XCTAssertEqual(result.verdict, .ready)
+        XCTAssertNil(result.diagnostic)
+        XCTAssertTrue(result.message.contains("pair bundle"))
+        XCTAssertTrue(
+            result.message.contains("Gemma3ForConditionalGeneration"),
+            "Architecture is extracted from target/config.json"
+        )
+    }
+
+    func testProbePairBundleWithoutTargetConfigFallsBackToUnreadable() async {
+        let fake = FakeRunner()
+        // The listing advertises mtplx_pair.json and the manifest
+        // fetches, but target/config.json 404s (FakeRunner default).
+        // The daemon requires BOTH files, so the probe must fall back
+        // to the existing unreadable classification.
+        fake.install(
+            url: "https://huggingface.co/api/models/someone/broken-pair",
+            body: """
+            { "id": "someone/broken-pair", "tags": [], "siblings": [ { "rfilename": "mtplx_pair.json" } ] }
+            """
+        )
+        fake.install(
+            url: "https://huggingface.co/someone/broken-pair/resolve/main/mtplx_pair.json",
+            body: "{ }"
+        )
+        let probe = HuggingFaceProbe(runner: fake.runner())
+        let result = await probe.probe(repo: "someone/broken-pair")
+        XCTAssertEqual(result.verdict, .probeFailed)
+        XCTAssertEqual(result.diagnostic, "config_missing")
+        XCTAssertTrue(result.message.contains("no config.json"))
+    }
+
+    func testProbePairBundleManifestNetworkErrorFallsBackToUnreadable() async {
+        let fake = FakeRunner()
+        fake.install(
+            url: "https://huggingface.co/api/models/someone/flaky-pair",
+            body: """
+            { "id": "someone/flaky-pair", "tags": [], "siblings": [ { "rfilename": "mtplx_pair.json" } ] }
+            """
+        )
+        fake.errors.insert(
+            "https://huggingface.co/someone/flaky-pair/resolve/main/mtplx_pair.json"
+        )
+        let probe = HuggingFaceProbe(runner: fake.runner())
+        let result = await probe.probe(repo: "someone/flaky-pair")
+        XCTAssertEqual(result.verdict, .probeFailed)
+        XCTAssertEqual(result.diagnostic, "config_missing")
+    }
+
+    func testForgeProbeRoutesPairBundleToInstallInstead() async {
+        let fake = FakeRunner()
+        // No mtplx_runtime.json at the bundle root, so Forge falls
+        // through to the config fetch and the 404 triage recognises
+        // the pair bundle. That is a finished official artifact —
+        // SourceStage must offer "Install instead", not a failure.
+        fake.install(
+            url: "https://huggingface.co/api/models/Youssofal/Gemma4-MTPLX-Optimized-Speed",
+            body: """
+            {
+              "id": "Youssofal/Gemma4-MTPLX-Optimized-Speed",
+              "tags": ["mlx"],
+              "siblings": [ { "rfilename": "mtplx_pair.json" } ]
+            }
+            """
+        )
+        fake.install(
+            url: "https://huggingface.co/Youssofal/Gemma4-MTPLX-Optimized-Speed/resolve/main/mtplx_pair.json",
+            body: """
+            { "layout": { "target": "target", "assistant": "draft" } }
+            """
+        )
+        fake.install(
+            url: "https://huggingface.co/Youssofal/Gemma4-MTPLX-Optimized-Speed/resolve/main/target/config.json",
+            body: """
+            { "architectures": ["Gemma3ForConditionalGeneration"], "model_type": "gemma3" }
+            """
+        )
+        let probe = HuggingFaceProbe(runner: fake.runner())
+        let result = await probe.forgeProbe(repo: "Youssofal/Gemma4-MTPLX-Optimized-Speed")
+        XCTAssertEqual(result.verdict, .alreadyMTPLX)
+        XCTAssertFalse(
+            result.hasMtpWeights,
+            "Pair bundles speculate via the draft model, not an MTP sidecar"
+        )
+        XCTAssertTrue(result.message.contains("Install it instead"))
+    }
+
     func testForgeProbeSurfacesGGUFTriageMessage() async {
         let fake = FakeRunner()
         fake.install(

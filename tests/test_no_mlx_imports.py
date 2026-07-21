@@ -11,25 +11,59 @@ from mtplx.version import DISPLAY_VERSION, __version__
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BLOCK_MLX = textwrap.dedent(
-    """
-    import importlib.abc
-    import sys
 
-    class _BlockMLX(importlib.abc.MetaPathFinder):
-        def find_spec(self, fullname, path=None, target=None):
-            if (
-                fullname == "mlx"
-                or fullname.startswith("mlx.")
-                or fullname == "mlx_lm"
-                or fullname.startswith("mlx_lm.")
-            ):
-                raise ModuleNotFoundError(f"blocked {fullname}")
-            return None
 
-    sys.meta_path.insert(0, _BlockMLX())
+def _block_modules_sitecustomize(modules: tuple[str, ...]) -> str:
+    """Sitecustomize source that blocks top-level modules, then CHAINS the
+    interpreter's own sitecustomize.
+
+    Python imports exactly one ``sitecustomize`` — the first on ``sys.path``.
+    Homebrew pythons rely on their stdlib sitecustomize to wire the shared
+    ``/opt/homebrew/.../site-packages`` into ``sys.path``; shadowing it
+    silently unimports every package installed there (this machine keeps
+    huggingface_hub in user-site but httpx/httpcore in the Homebrew shared
+    dir, which made the doctor subprocess lose its HTTP stack and turned this
+    suite red on bare Homebrew python while release-venv runs stayed green).
+    Chaining keeps the blocker additive on any interpreter layout.
     """
-)
+    roots = ", ".join(repr(module) for module in modules)
+    return textwrap.dedent(
+        f"""
+        import importlib.abc
+        import importlib.util
+        import os
+        import sys
+
+        class _BlockModules(importlib.abc.MetaPathFinder):
+            _roots = frozenset(({roots},))
+
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname.split(".")[0] in self._roots:
+                    raise ModuleNotFoundError(f"blocked {{fullname}}")
+                return None
+
+        sys.meta_path.insert(0, _BlockModules())
+
+        _here = os.path.dirname(os.path.abspath(__file__))
+        for _entry in sys.path:
+            _candidate = os.path.join(_entry or os.getcwd(), "sitecustomize.py")
+            if os.path.dirname(os.path.abspath(_candidate)) == _here:
+                continue
+            if os.path.isfile(_candidate):
+                _spec = importlib.util.spec_from_file_location(
+                    "_mtplx_chained_sitecustomize", _candidate
+                )
+                _module = importlib.util.module_from_spec(_spec)
+                try:
+                    _spec.loader.exec_module(_module)
+                except Exception:
+                    pass
+                break
+        """
+    )
+
+
+BLOCK_MLX = _block_modules_sitecustomize(("mlx", "mlx_lm"))
 
 
 def _run_no_mlx(
@@ -38,10 +72,13 @@ def _run_no_mlx(
     *,
     cwd: Path | None = None,
     env_extra: dict[str, str] | None = None,
+    block_modules: tuple[str, ...] = ("mlx", "mlx_lm"),
 ) -> subprocess.CompletedProcess[str]:
     blocker = tmp_path / "blocker"
     blocker.mkdir(exist_ok=True)
-    (blocker / "sitecustomize.py").write_text(BLOCK_MLX, encoding="utf-8")
+    (blocker / "sitecustomize.py").write_text(
+        _block_modules_sitecustomize(block_modules), encoding="utf-8"
+    )
     pythonpath_parts = [str(blocker), str(ROOT)]
     if os.environ.get("PYTHONPATH"):
         pythonpath_parts.append(os.environ["PYTHONPATH"])
@@ -121,6 +158,28 @@ def test_doctor_json_reports_non_git_cwd_without_raw_git_error(tmp_path: Path) -
     assert env["git_status"] == "not a git worktree"
     assert "ERROR:" not in env["git_branch"]
     assert "ERROR:" not in env["git_status"]
+
+
+def test_doctor_json_stdout_stays_machine_parseable_with_broken_hub_deps(
+    tmp_path: Path,
+) -> None:
+    """huggingface_hub's lazy loader print()s import errors to STDOUT. With
+    hub importable but its HTTP stack broken (split or partially broken
+    installs — the exact layout this machine exposed), those lines preceded
+    the JSON document and broke every ``doctor --json`` consumer. The --json
+    contract is machine-parseable stdout no matter what a probe's imports
+    print."""
+    proc = _run_no_mlx(
+        tmp_path,
+        ["-m", "mtplx.cli", "doctor", "--deep", "--json"],
+        cwd=tmp_path,
+        block_modules=("mlx", "mlx_lm", "httpx", "httpcore"),
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["environment"]["project_root"] == str(tmp_path.resolve())
+    assert "huggingface" in payload
 
 
 def test_inspect_local_non_mtp_model_without_mlx(tmp_path: Path) -> None:

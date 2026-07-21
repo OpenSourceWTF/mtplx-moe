@@ -60,15 +60,30 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.5 4B Optimized Speed",
         detail="4-bit quantization. Fastest fit for smaller Macs.",
         hf_model_id="Youssofal/Qwen3.5-4B-MTPLX-Optimized-Speed",
-        size_bytes=3_502_366_720,
-        peak_memory_gib=3.96,
-        recommended_tiers=frozenset(),
+        size_bytes=2_474_027_992,
+        peak_memory_gib=2.86,
+        recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
             "mtplx-qwen35-4b-optimized-speed",
             "qwen3.5-4b-mtplx-optimized-speed",
             "Qwen3.5 4B Optimized Speed",
             "Qwen 3.5 4B",
             "Small Qwen",
+        ),
+    ),
+    CatalogModel(
+        id="qwen35-4b-optimized-quality",
+        display_name="Qwen 3.5 4B Optimized Quality",
+        detail="8-bit quantization. Highest-fidelity 4B; 2x MTP multiplier.",
+        hf_model_id="Youssofal/Qwen3.5-4B-MTPLX-Optimized-Quality",
+        size_bytes=4_576_423_401,
+        peak_memory_gib=4.75,
+        recommended_tiers=frozenset({MODERN_TIER}),
+        aliases=(
+            "mtplx-qwen35-4b-optimized-quality",
+            "qwen3.5-4b-mtplx-optimized-quality",
+            "Qwen3.5 4B Optimized Quality",
+            "Qwen 3.5 4B Quality",
         ),
     ),
     CatalogModel(
@@ -321,8 +336,18 @@ def recommended_catalog_ids(
         quality27 = "optimized-quality"
     if memory_gib is None or memory_gib <= 0:
         return list(_MODERN_TOP_RECOMMENDATION_IDS)
+    # The rebuilt 4B pair leads the sub-16GB tiers and trails every larger
+    # modern tier so it stays discoverable as the fast-small pick. No fp16
+    # siblings yet, so the legacy (M1/M2) matrix keeps its fp16-only entries.
+    tiny_ids = (
+        ["qwen35-4b-optimized-speed", "qwen35-4b-optimized-quality"]
+        if chip_tier != LEGACY_TIER
+        else []
+    )
+    if memory_gib < 16:
+        return tiny_ids or [small]
     if memory_gib < 32:
-        return [small]
+        return [small, *tiny_ids]
     if memory_gib < 48:
         return [
             small,
@@ -330,6 +355,7 @@ def recommended_catalog_ids(
             "gemma4-optimized-speed",
             speed35,
             quality27,
+            *tiny_ids,
         ]
     return [
         speed27,
@@ -338,6 +364,7 @@ def recommended_catalog_ids(
         balance35,
         "gemma4-optimized-speed",
         small,
+        *tiny_ids,
     ]
 
 

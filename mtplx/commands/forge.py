@@ -6,6 +6,7 @@ import json
 import math
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -266,6 +267,54 @@ def _read_recipe(raw: str) -> dict[str, Any]:
 def _guard_degraded_mtp(recipe: dict[str, Any], *, allow: bool) -> None:
     if str(recipe.get("mtp_policy") or "").strip() == "requantize" and not allow:
         raise ForgeError(REQUANTIZE_REFUSAL, code=2)
+
+
+# FP16 forge lane (#166): M1/M2 GPUs have no native BF16, so FP16-typed
+# non-quantized parameters prompt-process measurably faster there. "bf16"
+# keeps today's behaviour (mlx-lm follows the source config's torch_dtype);
+# "auto" resolves by host chip so the app and CLI share one detection.
+_BODY_DTYPE_ALIASES = {
+    "auto": "auto",
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "fp16": "fp16",
+    "float16": "fp16",
+    "f16": "fp16",
+}
+
+
+def _host_chip_brand() -> str:
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _host_prefers_fp16() -> bool:
+    """M1/M2-family GPUs have no native BF16 (emulated, slower prompt
+    processing); M3 and newer run BF16 natively. Unknown chips keep bf16."""
+    match = re.search(r"\bM(\d+)\b", _host_chip_brand())
+    if match is None:
+        return False
+    return int(match.group(1)) <= 2
+
+
+def _body_dtype(recipe: dict[str, Any]) -> str:
+    raw = str(recipe.get("body_dtype") or "bf16").strip().lower()
+    normalized = _BODY_DTYPE_ALIASES.get(raw)
+    if normalized is None:
+        raise ForgeError(
+            f"recipe body_dtype must be auto, bf16, or fp16, got {raw!r}", code=2
+        )
+    if normalized == "auto":
+        return "fp16" if _host_prefers_fp16() else "bf16"
+    return normalized
 
 
 def _normalize_source(source: str) -> tuple[Path | None, str | None]:
@@ -915,6 +964,9 @@ def _cmd_verify(args: Any) -> int:
 
 def _cmd_build(args: Any) -> int:
     recipe = _read_recipe(args.recipe)
+    if getattr(args, "dtype", None):
+        recipe["body_dtype"] = str(args.dtype)
+    _body_dtype(recipe)  # validate early, before any download starts
     _guard_degraded_mtp(recipe, allow=bool(getattr(args, "allow_degraded_mtp", False)))
     run = _run_dir(args.out, args.run_id)
     branded_name = _sanitize_branded_name(args.branded_name)
@@ -941,6 +993,11 @@ def _cmd_build(args: Any) -> int:
     source_format = str(probe.get("source_format") or SOURCE_UNKNOWN)
     _err(f"[forge] source format: {source_format}")
     if source_format in {SOURCE_MLX_AFFINE, SOURCE_MLX_AFFINE_WITH_MTP} or probe.get("already_mtplx"):
+        if _body_dtype(recipe) == "fp16":
+            _err(
+                "[forge] source is already MLX; body dtype follows the source "
+                "weights (fp16 request applies only to fresh conversions)"
+            )
         _mirror_model_tree(source_path, destination)
         _write_progress(run, "convert", progress=1.0, label="to_mlx", finished=True)
     elif source_format in {SOURCE_AUTOAWQ, SOURCE_COMPRESSED_TENSORS_AWQ}:
@@ -1145,7 +1202,7 @@ def _convert_with_mlx_lm(
     with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
         proc = subprocess.Popen(
             command,
-            cwd=Path.cwd(),
+            cwd=str(run),
             stdout=stdout,
             stderr=stderr,
             text=True,
@@ -1185,6 +1242,7 @@ def _mlx_lm_convert_command(
 ) -> list[str]:
     command = [
         sys.executable,
+        "-P",
         "-m",
         "mlx_lm",
         "convert",
@@ -1210,6 +1268,11 @@ def _mlx_lm_convert_command(
                 mode,
             ]
         )
+    # bf16 passes no --dtype so mlx-lm keeps following the source config's
+    # torch_dtype (today's behaviour); fp16 covers every non-quantized
+    # parameter, and with body_bits 0 the whole trunk.
+    if _body_dtype(recipe) == "fp16":
+        command.extend(["--dtype", "float16"])
     return command
 
 
@@ -1336,16 +1399,108 @@ def _calibrate_sidecar(source: Path, destination: Path, *, recipe: dict[str, Any
         return
     if not _ensure_mtp_sidecar(source, destination):
         _err("[forge] no standalone MTP sidecar extracted; relying on embedded MTP keys if present")
+    elif _body_dtype(recipe) == "fp16":
+        _cast_sidecar_float_tensors_fp16(destination / "mtp.safetensors")
     _write_progress(run, "calibrate", progress=0.75, label="pack_sidecar", finished=False)
     _patch_config_for_mtp(destination)
     _validate_mtp_sidecar_payload(destination)
     _write_progress(run, "calibrate", progress=1.0, label="pack_sidecar", finished=True)
 
 
+def _cast_sidecar_float_tensors_fp16(sidecar_path: Path) -> None:
+    """Cast the sidecar's floating tensors to float16 for fp16 builds.
+
+    Matches the released FP16 siblings (their mtp.safetensors carries F16
+    floats): a BF16 sidecar on an FP16 trunk would draft through the emulated
+    BF16 path on M1/M2, giving up part of the speed the build exists for.
+    Integer tensors (quantization indices) are untouched.
+    """
+    if not sidecar_path.exists():
+        return
+    import mlx.core as mx
+
+    weights = mx.load(str(sidecar_path))
+    cast: dict[str, Any] = {}
+    changed = False
+    for key, value in weights.items():
+        if value.dtype in (mx.bfloat16, mx.float32):
+            cast[key] = value.astype(mx.float16)
+            changed = True
+        else:
+            cast[key] = value
+    if not changed:
+        return
+    # mx.load is lazy (file-backed): every value in ``cast`` must be
+    # materialized before the file it references is rewritten, and the write
+    # must not target the path being read. Saving in place over the lazy
+    # handles corrupted the 4B sidecar (#176): tensors materialized mid-write
+    # read clobbered regions, silently swapping norm payloads between keys.
+    mx.eval(list(cast.values()))
+    tmp_path = sidecar_path.with_name(f"{sidecar_path.stem}.fp16-tmp.safetensors")
+    mx.save_safetensors(str(tmp_path), cast, metadata={"format": "mlx"})
+    written = mx.load(str(tmp_path))
+    for key, value in cast.items():
+        reloaded = written.get(key)
+        if reloaded is None or not bool(mx.array_equal(reloaded, value)):
+            raise ForgeError(
+                f"fp16 sidecar cast readback mismatch for tensor {key}; "
+                "refusing to replace the sidecar"
+            )
+    del written
+    os.replace(tmp_path, sidecar_path)
+    _err("[forge] MTP sidecar floats cast to fp16 to match the trunk dtype")
+
+
+_SIDECAR_RMSNORM_SUFFIXES = (
+    "input_layernorm.weight",
+    "post_attention_layernorm.weight",
+    "q_norm.weight",
+    "k_norm.weight",
+    "pre_fc_norm_hidden.weight",
+    "pre_fc_norm_embedding.weight",
+    "norm.weight",
+)
+
+
+def _sidecar_norm_degeneracy(sidecar_path: Path) -> str | None:
+    """Return a description if any sidecar RMSNorm tensor is degenerate.
+
+    Catches corrupted writes (all-zero norms) and similar clobbered payloads
+    so a stale broken sidecar can never be silently reused by a re-forge.
+    Healthy final-convention norms sit well above the 0.05 mean floor.
+    """
+    try:
+        import mlx.core as mx
+
+        weights = mx.load(str(sidecar_path))
+    except Exception as exc:
+        return f"unreadable: {exc}"
+    for key, value in weights.items():
+        if value.ndim != 1 or not any(key.endswith(sfx) for sfx in _SIDECAR_RMSNORM_SUFFIXES):
+            continue
+        if value.dtype not in (mx.bfloat16, mx.float16, mx.float32):
+            continue
+        mean = float(value.astype(mx.float32).mean().item())
+        std = float(value.astype(mx.float32).std().item())
+        if not math.isfinite(mean) or not math.isfinite(std):
+            return f"{key} has non-finite values"
+        if std < 1e-4 and abs(mean) < 1e-4:
+            return f"{key} is all-zero"
+    return None
+
+
 def _ensure_mtp_sidecar(source: Path, destination: Path) -> bool:
     target = destination / "mtp.safetensors"
     if target.exists():
-        return True
+        problem = _sidecar_norm_degeneracy(target)
+        if problem is None:
+            return True
+        quarantined = target.with_name(f"mtp.safetensors.corrupt-{int(time.time())}")
+        os.replace(target, quarantined)
+        _err(
+            f"[forge] existing MTP sidecar failed the norm sanity check ({problem}); "
+            f"moved to {quarantined.name} and re-extracting"
+        )
     try:
         config = _load_json(source / "config.json")
     except Exception:
@@ -1692,6 +1847,7 @@ def _calibrate_mtp_contract(
     output_path = run / "contract_probe.json"
     command = [
         sys.executable,
+        "-P",
         "-m",
         "mtplx.cli",
         "mtp-chain-probe",
@@ -1738,7 +1894,7 @@ def _calibrate_mtp_contract(
         with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
             proc = subprocess.run(
                 command,
-                cwd=Path.cwd(),
+                cwd=str(run),
                 stdout=stdout,
                 stderr=stderr,
                 text=True,
@@ -2179,6 +2335,7 @@ def _run_verify(
     output_root.mkdir(parents=True, exist_ok=True)
     command = [
         sys.executable,
+        "-P",
         "-m",
         "mtplx.cli",
         "tune",
@@ -2220,7 +2377,7 @@ def _run_verify(
     with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
         proc = subprocess.Popen(
             command,
-            cwd=Path.cwd(),
+            cwd=str(run),
             stdout=stdout,
             stderr=stderr,
             text=True,

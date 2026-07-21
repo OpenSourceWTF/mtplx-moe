@@ -31,6 +31,8 @@ import subprocess
 import sys
 import time
 
+from mtplx.thermal import _daemon_socket_send
+
 
 def _detach_from_terminal() -> None:
     """Best-effort detach from the controlling terminal.
@@ -79,13 +81,18 @@ def _parent_alive(pid: int) -> bool:
 
 
 def _restore_fans(binary: str) -> int:
-    """Run ``sudo -n <binary> auto``. Returns the subprocess exit code.
+    """Restore Apple-auto fans and return an exit code.
 
-    ``sudo -n`` never prompts for a password, so this either succeeds
-    immediately (NOPASSWD rule active) or fails fast with a non-zero
-    exit code. Either way the sidecar exits — there's no point staying
-    alive once the parent is gone and we've made our attempt.
+    Prefer the ThermalForge daemon socket: it resets fans as root without sudo
+    and, unlike ``thermalforge auto``, never quits the menu bar app. Fall back
+    to ``sudo -n <binary> auto`` when no daemon is reachable. ``sudo -n`` never
+    prompts, so it succeeds immediately (NOPASSWD active) or fails fast — either
+    way the sidecar exits, having made its attempt.
     """
+
+    reset = _daemon_socket_send("auto")
+    if reset is not None and reset["ok"]:
+        return 0
 
     try:
         proc = subprocess.run(

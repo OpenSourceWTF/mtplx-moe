@@ -88,21 +88,34 @@ public struct ForgeRecipe: Equatable, Sendable, Codable {
         case affine
     }
 
+    /// Dtype of the non-quantized parameters (#166). `auto` is resolved by
+    /// the engine at build time: FP16 on M1/M2 (no native BF16, faster
+    /// prompt processing), BF16 on M3 and newer. Engines that predate the
+    /// key ignore it and keep today's BF16 behaviour.
+    public enum BodyDtype: String, Equatable, Sendable, Codable {
+        case auto
+        case bf16
+        case fp16
+    }
+
     public var bodyBits: Int
     public var bodyGroupSize: Int
     public var bodyMode: QuantMode
     public var mtpPolicy: MTPPolicy
+    public var bodyDtype: BodyDtype
 
     public init(
         bodyBits: Int = 4,
         bodyGroupSize: Int = 64,
         bodyMode: QuantMode = .affine,
-        mtpPolicy: MTPPolicy = .keepBf16
+        mtpPolicy: MTPPolicy = .keepBf16,
+        bodyDtype: BodyDtype = .auto
     ) {
         self.bodyBits = bodyBits
         self.bodyGroupSize = bodyGroupSize
         self.bodyMode = bodyMode
         self.mtpPolicy = mtpPolicy
+        self.bodyDtype = bodyDtype
     }
 
     enum CodingKeys: String, CodingKey {
@@ -110,6 +123,18 @@ public struct ForgeRecipe: Equatable, Sendable, Codable {
         case bodyGroupSize = "body_group_size"
         case bodyMode = "body_mode"
         case mtpPolicy = "mtp_policy"
+        case bodyDtype = "body_dtype"
+    }
+
+    // Persisted recipes from builds that predate body_dtype must keep
+    // decoding; they resolve to `auto` like a fresh recipe would.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        bodyBits = try container.decodeIfPresent(Int.self, forKey: .bodyBits) ?? 4
+        bodyGroupSize = try container.decodeIfPresent(Int.self, forKey: .bodyGroupSize) ?? 64
+        bodyMode = try container.decodeIfPresent(QuantMode.self, forKey: .bodyMode) ?? .affine
+        mtpPolicy = try container.decodeIfPresent(MTPPolicy.self, forKey: .mtpPolicy) ?? .keepBf16
+        bodyDtype = try container.decodeIfPresent(BodyDtype.self, forKey: .bodyDtype) ?? .auto
     }
 
     /// Sensible default picked based on the detected source format.

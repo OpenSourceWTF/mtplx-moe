@@ -30,7 +30,7 @@ After the verified model is available:
 mtplx start
 mtplx start cli
 mtplx start cli --no-mtp
-mtplx quickstart --profile sustained --port 8000 --no-stats-footer
+mtplx quickstart --port 8000 --no-stats-footer
 ```
 
 `--no-mtp` switches generation to target-only AR while keeping the same runtime load path. In terminal chat, use `/mtp off`, `/mtp on`, and `/mtp status` to switch the next turn without reloading the model.

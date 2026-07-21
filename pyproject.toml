@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mtplx"
-version = "2.1.0"
+version = "2.3.0"
 description = "Native MTP speculative decoding for Qwen3-Next on Apple Silicon."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,6 +14,10 @@ authors = [{name = "Youssof Altoukhi", email = "business@youssofal.com"}]
 dependencies = [
   "fastapi>=0.136",
   "huggingface-hub>=0.36",
+  # Vision is advertised on the base install (app attachments, image_url on
+  # the server) and mtplx.vision.processing imports PIL at module load, so
+  # Pillow must be a base dependency, not a [server] extra (#103).
+  "pillow>=10",
   # 0.32.0 exactness-gated 2026-07-11: byte-identical greedy 128-tok output
   # vs 0.31.3 on Optimized-Speed q4 turbo D3 (same 34 verify calls), and 103
   # kernel/paged-verifier/graphbank/sustained tests green under 0.32.0.
@@ -60,7 +64,7 @@ competitors = [
 ]
 server = [
   "fastapi>=0.136",
-  "pillow>=10",
+  "llguidance>=1.7",
   "uvicorn>=0.46",
 ]
 dev = [

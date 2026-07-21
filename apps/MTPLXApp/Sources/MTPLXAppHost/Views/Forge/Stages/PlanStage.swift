@@ -352,6 +352,7 @@ struct PlanStage: View {
                     chip(text: "\(localRecipe.bodyBits)-bit body")
                     chip(text: "g\(localRecipe.bodyGroupSize)")
                     chip(text: localRecipe.bodyMode.rawValue)
+                    chip(text: dtypeChipLabel(localRecipe.bodyDtype))
                     chip(text: mtpPolicyLabel(localRecipe.mtpPolicy), systemImage: "shield.lefthalf.filled")
                 }
                 Text("Picked automatically for your Mac. Open Advanced to override.")
@@ -491,6 +492,15 @@ struct PlanStage: View {
         }
     }
 
+    private func dtypeChipLabel(_ dtype: ForgeRecipe.BodyDtype) -> String {
+        switch dtype {
+        case .auto:
+            return HardwareInspector.hostPrefersFP16Forge() ? "auto fp16" : "auto bf16"
+        case .bf16: return "bf16"
+        case .fp16: return "fp16"
+        }
+    }
+
     private func formatGiB(_ gib: Double) -> String {
         String(format: "%.1f GB", gib)
     }
@@ -560,6 +570,7 @@ private struct RecipeAdvancedEditor: View {
 
     private let bitsOptions: [Int] = [3, 4, 5, 6, 8]
     private let groupSizeOptions: [Int] = [32, 64, 128]
+    private let hostPrefersFP16 = HardwareInspector.hostPrefersFP16Forge()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -589,6 +600,22 @@ private struct RecipeAdvancedEditor: View {
                 }
                 .pickerStyle(.segmented)
                 .frame(maxWidth: 320)
+            }
+            row(label: "Precision") {
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("", selection: dtypeBinding) {
+                        Text(hostPrefersFP16 ? "Auto (FP16)" : "Auto (BF16)")
+                            .tag(ForgeRecipe.BodyDtype.auto)
+                        Text("BF16").tag(ForgeRecipe.BodyDtype.bf16)
+                        Text("FP16").tag(ForgeRecipe.BodyDtype.fp16)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 320)
+                    Text("Dtype for the non-quantized weights. FP16 prompt-processes faster on M1/M2 Macs, which have no native BF16.")
+                        .font(.caption2)
+                        .foregroundStyle(Brand.typeTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
         .padding(12)
@@ -641,6 +668,17 @@ private struct RecipeAdvancedEditor: View {
             get: { recipe.mtpPolicy },
             set: {
                 recipe.mtpPolicy = $0
+                Haptics.tick(.levelChange)
+                onChange(recipe)
+            }
+        )
+    }
+
+    private var dtypeBinding: Binding<ForgeRecipe.BodyDtype> {
+        Binding(
+            get: { recipe.bodyDtype },
+            set: {
+                recipe.bodyDtype = $0
                 Haptics.tick(.levelChange)
                 onChange(recipe)
             }

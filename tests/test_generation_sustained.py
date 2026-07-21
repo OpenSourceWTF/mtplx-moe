@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from mtplx.generation import (
     restore_or_prefill_prompt_state,
 )
 from mtplx.mtp_patch import MTPContract
+from mtplx.profiles import DEFAULT_HF_MODEL_ID
 from mtplx.runtime import MTPLXRuntime
 from mtplx.sampling import SamplerConfig
 
@@ -440,6 +442,28 @@ def test_generate_ar_does_not_request_hidden_by_default(monkeypatch):
     )
     assert out.stats.end_to_end_tok_s <= out.stats.decode_tok_s
     assert all(call["return_hidden"] is False for call in model.calls)
+
+
+def test_default_qwen27b_ar_decode_trace_does_not_crash(tmp_path, monkeypatch):
+    trace_path = tmp_path / "qwen27b-ar.jsonl"
+    monkeypatch.setenv("MTPLX_DECODE_TRACE_JSONL", str(trace_path))
+    monkeypatch.setenv("MTPLX_DECODE_TRACE_INTERVAL_S", "0.1")
+    runtime = _runtime(TinyModel(), mtp_enabled=True)
+    runtime.model_path = Path(DEFAULT_HF_MODEL_ID)
+
+    output = generate_ar(
+        runtime,
+        [0],
+        max_tokens=2,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        stop_token_ids=set(),
+    )
+
+    rows = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert output.tokens == [1, 1]
+    assert rows[-1]["final"] is True
+    assert rows[-1]["generated_tokens_total"] == 2
+    assert rows[-1]["target_distribution_materialized_rows_delta"] == 0
 
 
 def test_lazy_bonus_verify_shortens_full_accept_verify_input(monkeypatch):

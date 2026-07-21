@@ -114,6 +114,15 @@ public struct HardwareInspector: Sendable {
         )
     }
 
+    /// FP16 beats BF16 for prompt processing on chips without native BF16
+    /// (M1/M2). Forge's Auto precision label uses this; the engine
+    /// re-resolves independently at build time from the same signal.
+    public static func hostPrefersFP16Forge() -> Bool {
+        let chip = sysctlString("machdep.cpu.brand_string") ?? ""
+        guard let generation = parseAppleSiliconGeneration(from: chip) else { return false }
+        return generation == "m1" || generation == "m2"
+    }
+
     private static func parseAppleSiliconGeneration(from chip: String) -> String? {
         let lower = chip.lowercased()
         if lower.range(of: #"\bm1\b"#, options: .regularExpression) != nil { return "m1" }

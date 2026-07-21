@@ -1833,20 +1833,145 @@ def test_mlx_lm_convert_command_uses_supported_entrypoint(tmp_path):
         source_format="compressed_tensors_awq",
     )
 
-    assert command[1:4] == ["-m", "mlx_lm", "convert"]
+    assert command[1:5] == ["-P", "-m", "mlx_lm", "convert"]
     assert "mlx_lm.convert" not in command
     assert "--dequantize" in command
     assert command[-6:] == ["--q-bits", "4", "--q-group-size", "64", "--q-mode", "affine"]
 
 
-def test_existing_converted_mtp_sidecar_is_not_overwritten(tmp_path):
+def test_mlx_lm_convert_command_default_dtype_passes_no_dtype_flag(tmp_path):
+    command = forge._mlx_lm_convert_command(
+        tmp_path / "source",
+        tmp_path / "dest",
+        recipe={"body_bits": 4},
+        source_format="bf16_native",
+    )
+
+    assert "--dtype" not in command
+
+
+def test_mlx_lm_convert_command_fp16_recipe_sets_float16_dtype(tmp_path):
+    for spelling in ("fp16", "float16", "f16"):
+        command = forge._mlx_lm_convert_command(
+            tmp_path / "source",
+            tmp_path / "dest",
+            recipe={"body_bits": 4, "body_dtype": spelling},
+            source_format="bf16_native",
+        )
+
+        assert command[-2:] == ["--dtype", "float16"]
+
+
+def test_body_dtype_rejects_unknown_value():
+    with pytest.raises(forge.ForgeError):
+        forge._body_dtype({"body_dtype": "int8"})
+
+
+def test_body_dtype_auto_resolves_by_host_chip(monkeypatch):
+    monkeypatch.setattr(forge, "_host_chip_brand", lambda: "Apple M2 Max")
+    assert forge._body_dtype({"body_dtype": "auto"}) == "fp16"
+    monkeypatch.setattr(forge, "_host_chip_brand", lambda: "Apple M1")
+    assert forge._body_dtype({"body_dtype": "auto"}) == "fp16"
+    monkeypatch.setattr(forge, "_host_chip_brand", lambda: "Apple M5 Max")
+    assert forge._body_dtype({"body_dtype": "auto"}) == "bf16"
+    monkeypatch.setattr(forge, "_host_chip_brand", lambda: "")
+    assert forge._body_dtype({"body_dtype": "auto"}) == "bf16"
+
+
+def test_cast_sidecar_float_tensors_fp16(tmp_path):
+    sidecar = tmp_path / "mtp.safetensors"
+    mx.save_safetensors(
+        str(sidecar),
+        {
+            "mtp.weight_bf16": mx.ones((2, 2), dtype=mx.bfloat16),
+            "mtp.weight_f32": mx.ones((2, 2), dtype=mx.float32),
+            "mtp.weight_f16": mx.ones((2, 2), dtype=mx.float16),
+            "mtp.qidx": mx.zeros((2, 2), dtype=mx.uint32),
+        },
+    )
+
+    forge._cast_sidecar_float_tensors_fp16(sidecar)
+
+    reloaded = mx.load(str(sidecar))
+    assert reloaded["mtp.weight_bf16"].dtype == mx.float16
+    assert reloaded["mtp.weight_f32"].dtype == mx.float16
+    assert reloaded["mtp.weight_f16"].dtype == mx.float16
+    assert reloaded["mtp.qidx"].dtype == mx.uint32
+
+
+def _healthy_sidecar_tensors() -> dict[str, mx.array]:
+    return {
+        "mtp.layers.0.input_layernorm.weight": mx.full((4,), 1.10, dtype=mx.bfloat16),
+        "mtp.layers.0.post_attention_layernorm.weight": mx.full((4,), 1.24, dtype=mx.bfloat16),
+        "mtp.layers.0.self_attn.q_norm.weight": mx.full((4,), 1.75, dtype=mx.bfloat16),
+        "mtp.layers.0.self_attn.k_norm.weight": mx.full((4,), 1.74, dtype=mx.bfloat16),
+        "mtp.norm.weight": mx.full((4,), 2.43, dtype=mx.bfloat16),
+        "mtp.pre_fc_norm_embedding.weight": mx.full((4,), 0.52, dtype=mx.bfloat16),
+        "mtp.pre_fc_norm_hidden.weight": mx.full((4,), 0.77, dtype=mx.bfloat16),
+        "mtp.fc.weight": mx.ones((4, 8), dtype=mx.bfloat16),
+    }
+
+
+def test_existing_healthy_mtp_sidecar_is_not_overwritten(tmp_path):
     source = tmp_path / "source"
     destination = tmp_path / "destination"
     destination.mkdir()
-    (destination / "mtp.safetensors").write_bytes(b"keep-me")
+    mx.save_safetensors(str(destination / "mtp.safetensors"), _healthy_sidecar_tensors())
+    before = (destination / "mtp.safetensors").read_bytes()
 
     assert forge._ensure_mtp_sidecar(source, destination) is True
-    assert (destination / "mtp.safetensors").read_bytes() == b"keep-me"
+    assert (destination / "mtp.safetensors").read_bytes() == before
+
+
+def test_existing_degenerate_mtp_sidecar_is_quarantined_and_rebuilt(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    good = _healthy_sidecar_tensors()
+    mx.save_safetensors(str(source / "mtp.safetensors"), good)
+    corrupt = dict(good)
+    corrupt["mtp.norm.weight"] = mx.zeros((4,), dtype=mx.bfloat16)
+    mx.save_safetensors(str(destination / "mtp.safetensors"), corrupt)
+
+    assert forge._ensure_mtp_sidecar(source, destination) is True
+
+    quarantined = sorted(destination.glob("mtp.safetensors.corrupt-*"))
+    assert quarantined, "corrupt sidecar was not quarantined"
+    rebuilt = mx.load(str(destination / "mtp.safetensors"))
+    assert float(rebuilt["mtp.norm.weight"].astype(mx.float32).mean().item()) == pytest.approx(
+        2.43, abs=0.02
+    )
+
+
+def test_cast_sidecar_fp16_is_value_faithful_per_name(tmp_path):
+    # Regression for the #176 corruption: same-shape 1-D norms with distinct
+    # values must survive the fp16 cast under their own names. The old cast
+    # saved lazily over the file it was reading and clobbered these payloads.
+    sidecar = tmp_path / "mtp.safetensors"
+    expected = {
+        "mtp.layers.0.input_layernorm.weight": 1.30,
+        "mtp.layers.0.post_attention_layernorm.weight": 1.39,
+        "mtp.norm.weight": 3.58,
+        "mtp.pre_fc_norm_embedding.weight": 0.59,
+        "mtp.pre_fc_norm_hidden.weight": 0.75,
+    }
+    tensors = {key: mx.full((2560,), value, dtype=mx.bfloat16) for key, value in expected.items()}
+    tensors["mtp.fc.weight"] = mx.full((64, 128), 0.007, dtype=mx.bfloat16)
+    mx.save_safetensors(str(sidecar), tensors)
+
+    forge._cast_sidecar_float_tensors_fp16(sidecar)
+
+    reloaded = mx.load(str(sidecar))
+    for key, value in expected.items():
+        assert reloaded[key].dtype == mx.float16
+        assert float(reloaded[key].astype(mx.float32).mean().item()) == pytest.approx(
+            value, abs=0.01
+        ), key
+    assert float(reloaded["mtp.fc.weight"].astype(mx.float32).mean().item()) == pytest.approx(
+        0.007, abs=0.001
+    )
+    assert not list(tmp_path.glob("*.fp16-tmp.safetensors"))
 
 
 def test_embedded_bf16_mtp_extraction_does_not_require_torch(tmp_path):

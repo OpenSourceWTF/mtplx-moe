@@ -4,6 +4,161 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [2.3.0] - 2026-07-21
+
+The agent reliability release: the #170 tool-argument collapse is
+root-caused and fixed, structured output ships with full speculative
+speed (community-contributed), agent sessions keep their warm cache
+through client history rewrites, and eight findings from an independent
+source review of v2.2.0 are fixed, each with a regression test that
+fails on the pre-fix code.
+
+### Fixed
+
+- Agent tool calls with nested arguments no longer collapse to empty `{}`
+  arguments (#170). The streaming Qwen-XML tool parser silently discarded
+  function-body text that was not wrapped in `<parameter=>` blocks, so a
+  model that wrote its arguments as a JSON object inside the
+  `<function=...>` envelope — the common slip on nested `edits` arrays —
+  produced a schema-valid call with empty arguments on requiredless tools
+  and a silently vanished call otherwise. Both the streaming and the final
+  parser now accept a pure JSON-object function body as the arguments
+  payload, and every unwrapped, lead, or trailing text lane is a loud
+  protocol fallback with identical contracts in the two parsers.
+- The injected tool contract no longer shows degenerate `[]` examples for
+  array parameters: exemplars are populated from the item schema's own
+  keys (an `edits` array renders as
+  `[{"search": "ARGUMENT_VALUE", "replace": "ARGUMENT_VALUE"}]`), removing
+  an in-prompt template for empty-array emissions.
+- The final tool-call extraction lane (non-stream parsing and the stream
+  fallback) no longer fabricates `{}`-argument calls out of function bodies
+  it could not read — live-reproduced on v2.2.0 as a `grep` call arriving
+  with empty arguments. All extraction dialects now share the strict
+  parsers' contract: a pure JSON-object function body is the arguments
+  payload, an unreadable body stays visible content, blank-body no-argument
+  calls still parse, and partial arguments are delivered exactly as the
+  model wrote them (schema validation remains the client's job, per the
+  OpenAI protocol).
+- Context-copy speculative rounds now stop accepting at the first
+  accepted stop token, exactly like the MTP acceptance loop. Previously
+  the copy lane could accept an entire block past a stop, leaving the
+  target cache, logits/hidden selection, and MTP history advanced beyond
+  the emitted response while the final state was still marked safe to
+  commit — a session-cache poisoning risk on recurrent (GDN) models.
+- Context-copy is prompt-only again at the boundary: proposal blocks are
+  sliced from the prompt and capped at its edge instead of running into
+  the model's own generated output (the self-repetition case the feature
+  contract excludes). Boundary-less candidates are skipped inside the
+  n-gram index so the best *valid* match still fires.
+- Non-divisor packed MTP quantization widths (5-bit, 3-bit, 6-bit) now
+  infer the correct group size via total-bit arithmetic (#182; fix by
+  @Jonathangadeaharder in #183). A 5-bit group-64 head previously
+  inferred group 60, overwrote the artifact's correct declared contract,
+  and made the model unloadable.
+- Long-running daemons no longer accumulate unbounded telemetry: the
+  SessionBank eviction log is a bounded ring, the scheduler's
+  started-by-batch-key counter collapses per-session key suffixes to
+  stable classes, the dashboard per-session TPS map is LRU-bounded, and
+  the OpenCode title fast path trims request metrics like every other
+  lane (#145-adjacent slow-creep hygiene).
+- The desktop Hugging Face probe now recognizes rootless assistant-pair
+  bundles (`mtplx_pair.json` + `target/config.json`) the same way the
+  Python runtime does, so the official Gemma4 pair repos classify as
+  ready to download instead of unreadable (#107); Forge routes them to
+  install-instead-of-rebuild.
+- `mtplx doctor --json` stdout is now guaranteed machine-parseable: the
+  report is built with stdout routed to stderr, so third-party lazy
+  importers that print() their errors (huggingface_hub does, whenever its
+  HTTP dependencies are broken or split across install locations) can no
+  longer prefix the JSON document with prose and break `--json` consumers.
+- Agent tool-loop sessions no longer lose their warm cache when the
+  client rewrites history (transcript compaction, retroactive tool-result
+  digests): a common-prefix identity fallback (≥4096 shared tokens and
+  ≥25% of the prompt) keeps the session id instead of minting an
+  anonymous one, ending the cold full-context re-prefills those
+  rotations caused mid-session.
+- Fan restore goes through the ThermalForge daemon socket instead of the
+  app-killing CLI path, and `mtplx pull` detects interrupted downloads
+  as incomplete instead of treating them as ready (thanks @titan550,
+  #178/#179/#180/#181).
+
+### Changed
+
+- `parallel_tool_calls` is now honored: a request that declares it gets
+  the declared behavior in both directions (false → at most one tool
+  call per turn), with the previous client-profile heuristic kept only
+  as the fallback when the field is absent (thanks @PhilipJohnBasile,
+  #190 — Android Studio declares false today and was being ignored).
+- Agent tool contract v13: instructs whole-file reads (the old
+  "smallest read range" clause provoked storms of 1-to-5-line
+  micro-reads) and forbids echoing file contents into visible text
+  (double-emitted file bodies inflated agent turns by tens of
+  thousands of characters). Measured on live agent sessions: thinking
+  share of generated tokens 75% → 6-29%, double emissions eliminated.
+
+### Added
+
+- Structured output: `response_format` `json_object` and `json_schema`
+  are now enforced with llguidance token masks instead of silently
+  ignored — and the grammar composes with the MTP verify loop, so
+  constrained requests keep full speculative speed (measured: decode
+  parity within noise, under 5ms total mask cost per request). On
+  thinking templates a prelude grammar lets reasoning finish before the
+  document is forced. Opt-in strict tool-call grammars
+  (`MTPLX_TOOL_CALL_STRICT=1`) force every tool call to a declared tool
+  name with schema-valid arguments — a real OpenCode session built a
+  complete project through the strict lane with zero malformed calls.
+  Thanks @PhilipJohnBasile (#186, #187, #188). Requires the `[server]`
+  extra, which the desktop app installs by default; bare pip installs
+  get a clear 400 with an install hint.
+- Durable per-request telemetry: `--request-log-jsonl` (env
+  `MTPLX_REQUEST_LOG_JSONL`) appends every request record as one JSON
+  line, and `scripts/session_forensics.py` correlates that log with an
+  OpenCode database into a single timeline with detectors for re-prefill
+  rewinds, TTFT stalls, thinking marathons, double emissions,
+  session-identity rotations, and usage mismatches.
+- An **opt-in** agent-lane reasoning budget (`--agent-thinking-budget`,
+  env `MTPLX_THINKING_BUDGET`; OFF by default): at the budget the
+  reasoning segment is force-closed with a visible bridge so the turn
+  proceeds to its answer or tool call, and every engagement is surfaced
+  per-request in telemetry (`thinking_guard`). Below the budget decoding
+  is bit-exact; plain chat is never touched.
+- Stream stall watchdog (#86 containment): if a stream receives nothing
+  while the model owner's progress heartbeat is frozen for
+  `MTPLX_STREAM_STALL_DEADLINE_S` (default 300s, 0 disables), the
+  request fails with a structured, diagnosable error and releases its
+  slot instead of hanging forever. Healthy long prefills and model loads
+  tick the heartbeat and are never affected; the daemon is never killed.
+- `pip install mtplx` now includes Pillow, matching the advertised image
+  support in the app and server (#103); previously vision failed at
+  import unless the `[server]` extra was installed.
+
+## [2.2.0] - 2026-07-19
+
+The copy-drafting and small-Mac release. Decoding: context-copy
+(prompt-lookup) drafting lands on by default (PR #151 by lBroth) with an
+exact temperature path — copied blocks are accepted with the target's own
+shaped probability, so the output distribution is unchanged at any
+temperature; measured +53% on edit-heavy agent turns at temp 0.6, parity
+on novel text (disable with MTPLX_CONTEXT_COPY=0). Models: the 4B
+zero-acceptance defect (#176) is root-caused and fixed — the engine heals
+raw delta-encoded MTP sidecars at load so existing downloads recover
+without re-downloading, the 4B Speed artifact is rebuilt (227.8 tok/s D3
+on M5 Max, 1.71x AR), and a new 4B Quality artifact ships (191.7 tok/s
+D3, 2.19x — the largest MTP multiplier in the fleet); sub-16GB Macs get
+first-class catalog recommendations. Tune (#177): a 0.0-acceptance depth
+can never win, be saved, or be replayed, and poisoned records are
+quarantined at load. Forge: FP16 precision option with M1/M2 auto-select
+(#166); the fp16 cast can no longer corrupt a sidecar in place;
+degenerate sidecars are quarantined on re-forge. Server: SSD session
+writer crash fixed — encode at enqueue (#169); live requests preempt idle
+cache maintenance. MoE: mtp_depth_max is a ceiling, not the default; the
+35B-A3B launches at its measured D2 (#174 part 1 by davidtai). Also: the
+Qwen 3.6 27B AR decode-trace crash fix (#167 by davidtai), truthful
+per-model profile display, hybrid-model boundary retention across append
+churn, and an experimental --draft-core device (opt-in). Full details in
+docs/releases/v2.2.0.md.
+
 ## [2.1.0] - 2026-07-17
 
 The community-fixes release. Memory: the v2.x reports are root-caused and

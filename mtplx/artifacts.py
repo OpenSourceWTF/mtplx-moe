@@ -811,7 +811,6 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
             config = dict(target_config)
             config["assistant_pair_bundle"] = pair_manifest
             config["mtplx_pair.json"] = True
-            config_path = target_path
             config_error = None
     if config is None:
         raise RuntimeError(

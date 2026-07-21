@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -67,6 +68,37 @@ def _run_probe(command: list[str], *, timeout_s: float = 3.0) -> dict[str, Any]:
         "stdout": proc.stdout.strip(),
         "stderr": proc.stderr.strip(),
         "ok": proc.returncode == 0,
+    }
+
+
+# Unix socket the ThermalForge privileged daemon listens on (matches
+# ThermalForgeDaemon.socketPath). Reaching it resets fans as root without sudo
+# and, unlike the `thermalforge auto` CLI, without quitting the menu bar app.
+THERMALFORGE_DAEMON_SOCKET = "/tmp/thermalforge.sock"
+
+
+def _daemon_socket_send(command: str, *, timeout_s: float = 3.0) -> dict[str, Any] | None:
+    """Send one newline-terminated command to the ThermalForge daemon socket.
+
+    Returns None when no daemon is reachable, so callers fall back to the CLI;
+    otherwise ``{"ok": bool, "response": str, "command": [...]}``. The daemon
+    speaks "auto" / "max" / "set <rpm>" / "status" and replies "ok", JSON, or
+    "error: ...".
+    """
+    if not os.path.exists(THERMALFORGE_DAEMON_SOCKET):
+        return None
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout_s)
+            sock.connect(THERMALFORGE_DAEMON_SOCKET)
+            sock.sendall((command + "\n").encode())
+            response = sock.recv(8192).decode(errors="replace").strip()
+    except OSError:
+        return None
+    return {
+        "ok": bool(response) and not response.lower().startswith("error"),
+        "response": response,
+        "command": ["<thermalforge-daemon-socket>", command],
     }
 
 
@@ -215,6 +247,14 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
+def _min_or_none(values: list[int]) -> int | None:
+    return min(values) if values else None
+
+
+def _max_or_none(values: list[int]) -> int | None:
+    return max(values) if values else None
+
+
 def fan_summary() -> dict[str, Any]:
     """Best-effort fan-RPM summary, used to verify ``thermalforge max`` actually
     ramped the fans rather than silently no-op'ing.
@@ -292,14 +332,14 @@ def fan_summary() -> dict[str, Any]:
             )
     return {
         "ok": bool(rpms),
-        "min_rpm": min(rpms) if rpms else None,
-        "max_rpm": max(rpms) if rpms else None,
-        "actual_min_rpm": min(actual_rpms) if actual_rpms else None,
-        "actual_max_rpm": max(actual_rpms) if actual_rpms else None,
-        "target_min_rpm": min(target_rpms) if target_rpms else None,
-        "target_max_rpm": max(target_rpms) if target_rpms else None,
-        "capacity_min_rpm": min(capacity_rpms) if capacity_rpms else None,
-        "capacity_max_rpm": max(capacity_rpms) if capacity_rpms else None,
+        "min_rpm": _min_or_none(rpms),
+        "max_rpm": _max_or_none(rpms),
+        "actual_min_rpm": _min_or_none(actual_rpms),
+        "actual_max_rpm": _max_or_none(actual_rpms),
+        "target_min_rpm": _min_or_none(target_rpms),
+        "target_max_rpm": _max_or_none(target_rpms),
+        "capacity_min_rpm": _min_or_none(capacity_rpms),
+        "capacity_max_rpm": _max_or_none(capacity_rpms),
         "fans": fans,
         "raw": status,
     }
@@ -313,12 +353,17 @@ FAN_RAMP_TARGET_FRACTION = 0.85
 FAN_RAMP_FALLBACK_THRESHOLD_RPM = 4000
 
 
+def _fan_max_capacity(fan: dict[str, Any]) -> int | None:
+    """The fan's hardware max RPM, from the summary field or the raw status."""
+    raw = fan.get("max_capacity_rpm") or (fan.get("raw") or {}).get("max_rpm")
+    return _int_or_none(raw)
+
+
 def _fan_target_is_ramped(fan: dict[str, Any]) -> bool:
     target_int = _int_or_none(fan.get("target_rpm"))
     if target_int is None:
         return False
-    max_capacity = fan.get("max_capacity_rpm") or (fan.get("raw") or {}).get("max_rpm")
-    max_int = _int_or_none(max_capacity)
+    max_int = _fan_max_capacity(fan)
     if max_int and max_int > 0:
         return target_int >= int(max_int * FAN_RAMP_TARGET_FRACTION)
     return target_int >= FAN_RAMP_FALLBACK_THRESHOLD_RPM
@@ -332,14 +377,20 @@ def _fan_actual_is_ramped(
     actual_int = _int_or_none(fan.get("actual_rpm"))
     if actual_int is None:
         return False
-    max_capacity = fan.get("max_capacity_rpm") or (fan.get("raw") or {}).get("max_rpm")
-    max_int = _int_or_none(max_capacity)
+    max_int = _fan_max_capacity(fan)
     if max_int and max_int > 0:
         return actual_int >= int(max_int * fraction)
     target_int = _int_or_none(fan.get("target_rpm"))
     if target_int and target_int > 0:
         return actual_int >= int(target_int * fraction)
     return actual_int >= FAN_RAMP_FALLBACK_THRESHOLD_RPM
+
+
+def _ok_fans(summary: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Parsed fan rows when the summary is usable, else None."""
+    if not summary.get("ok"):
+        return None
+    return summary.get("fans") or []
 
 
 def _summary_indicates_max(summary: dict[str, Any]) -> bool:
@@ -353,9 +404,7 @@ def _summary_indicates_max(summary: dict[str, Any]) -> bool:
     earlier verification path falsely report failure.
     """
 
-    if not summary.get("ok"):
-        return False
-    for fan in summary.get("fans") or []:
+    for fan in _ok_fans(summary) or []:
         mode = (fan.get("mode") or "").lower()
         if mode in {"manual", "max"}:
             return True
@@ -369,9 +418,7 @@ def _summary_indicates_actual_ramp(
     *,
     fraction: float = FAN_RAMP_TARGET_FRACTION,
 ) -> bool:
-    if not summary.get("ok"):
-        return False
-    fans = summary.get("fans") or []
+    fans = _ok_fans(summary)
     return bool(fans) and all(_fan_actual_is_ramped(fan, fraction=fraction) for fan in fans)
 
 
@@ -390,9 +437,7 @@ def _rpm_range(min_value: Any, max_value: Any) -> str:
 def _summary_indicates_auto(summary: dict[str, Any]) -> bool:
     """Return True iff all parsed fan rows are back on the automatic curve."""
 
-    if not summary.get("ok"):
-        return False
-    fans = summary.get("fans") or []
+    fans = _ok_fans(summary)
     if not fans:
         return False
     for fan in fans:
@@ -1569,7 +1614,26 @@ def set_thermal_profile(profile: str, *, dry_run: bool = False) -> dict[str, Any
             "command": commands[0] if commands else None,
             "attempts": [],
         }
-    attempts = []
+    attempts: list[dict[str, Any]] = []
+
+    # ThermalForge exposes a privileged daemon socket that resets fans as root
+    # (no sudo) and, unlike the `auto` CLI, never quits the menu bar app. Prefer
+    # it for the fan reset so restoring fans can't take down a running app; the
+    # CLI candidates below stay the fallback when no daemon is reachable.
+    if profile == "silent" and str(selected.get("kind")) == "thermalforge":
+        reset = _daemon_socket_send("auto")
+        if reset is not None:
+            attempts.append(reset)
+            if reset["ok"]:
+                return {
+                    "ok": True,
+                    "profile": profile,
+                    "dry_run": False,
+                    "detection": detection,
+                    "command": reset["command"],
+                    "attempts": attempts,
+                }
+
     for command in commands:
         result = _run_probe(command, timeout_s=15.0)
         attempts.append(result)

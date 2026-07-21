@@ -360,7 +360,7 @@ def _restore_delta_encoded_mtp_norms(
     config: dict[str, Any],
 ) -> dict[str, Any]:
     if not _mtp_norms_are_delta_encoded(config):
-        return weights
+        return _heal_raw_delta_mtp_norms(weights)
     restored = dict(weights)
     for key, value in list(restored.items()):
         if value.ndim == 1 and any(key.endswith(suffix) for suffix in _RMSNORM_SUFFIXES):
@@ -368,10 +368,73 @@ def _restore_delta_encoded_mtp_norms(
     return restored
 
 
+_QK_NORM_SUFFIXES = ("self_attn.q_norm.weight", "self_attn.k_norm.weight")
+_LOW_SET_NORM_SUFFIXES = (
+    "input_layernorm.weight",
+    "post_attention_layernorm.weight",
+    "pre_fc_norm_hidden.weight",
+    "pre_fc_norm_embedding.weight",
+)
+
+
+def _heal_raw_delta_mtp_norms(weights: dict[str, Any]) -> dict[str, Any]:
+    """Detect and repair a sidecar whose norms were never +1-restored.
+
+    Raw Qwen3.5 exports store MTP RMSNorm weights zero-centered (delta
+    convention); mlx-lm's trunk sanitize restores +1.0 but the MTP tensors are
+    loaded separately and must be restored here. The shipped 4B artifact
+    (#176) carries raw norms with no declared encoding, which poisons every
+    draft. Detection uses two independent signals with a wide fleet margin:
+    every healthy shipped sidecar has q/k norm means >= 1.74, raw exports sit
+    near 0.75; and raw low-set norms (input/post/pre_fc) fall below 0.5 while
+    healthy ones sit >= 0.87.
+    """
+
+    def _mean(value: Any) -> float | None:
+        try:
+            if getattr(value, "ndim", None) != 1:
+                return None
+            return float(value.mean().item())
+        except Exception:
+            return None
+
+    qk_means = [
+        m
+        for key, value in weights.items()
+        if any(key.endswith(sfx) for sfx in _QK_NORM_SUFFIXES)
+        and (m := _mean(value)) is not None
+    ]
+    low_means = [
+        m
+        for key, value in weights.items()
+        if any(key.endswith(sfx) for sfx in _LOW_SET_NORM_SUFFIXES)
+        and (m := _mean(value)) is not None
+    ]
+    if not qk_means or not low_means:
+        return weights
+    if max(qk_means) >= 1.25 or min(low_means) >= 0.5:
+        return weights
+
+    from .compressed_tensors import sanitize_plain_weight
+
+    logger.warning(
+        "[MTP inject] sidecar norms are raw delta-encoded "
+        "(q/k means %.2f, lowest norm %.2f); restoring the +1.0 convention (#176)",
+        max(qk_means),
+        min(low_means),
+    )
+    healed = dict(weights)
+    for key, value in list(healed.items()):
+        if getattr(value, "ndim", None) == 1:
+            healed[key] = sanitize_plain_weight(f"mtp.{key}", value)
+    return healed
+
+
 def _infer_prequantized_group_size(weights: dict[str, Any], bits: int | None) -> int | None:
     if bits is None or bits <= 0:
         return None
-    values_per_word = max(1, 32 // int(bits))
+    bits_int = int(bits)
+    values_per_word = max(1, 32 // bits_int)
     inferred: set[int] = set()
     for key, weight in weights.items():
         if not key.endswith(".weight"):
@@ -390,7 +453,13 @@ def _infer_prequantized_group_size(weights: dict[str, Any], bits: int | None) ->
         scale_groups = int(scales_shape[-1])
         if packed_cols <= 0 or scale_groups <= 0:
             continue
-        expanded_cols = packed_cols * values_per_word
+        if 32 % bits_int == 0:
+            expanded_cols = packed_cols * values_per_word
+        else:
+            total_bits = packed_cols * 32
+            if total_bits % bits_int != 0:
+                continue
+            expanded_cols = total_bits // bits_int
         if expanded_cols % scale_groups == 0:
             inferred.add(expanded_cols // scale_groups)
     if len(inferred) == 1:

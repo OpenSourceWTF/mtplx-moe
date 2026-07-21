@@ -314,7 +314,20 @@ def hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
-IMPLICIT_SESSION_SOURCES = frozenset({"longest_prefix", "pending_postcommit_near_prefix"})
+IMPLICIT_SESSION_SOURCES = frozenset(
+    {"longest_prefix", "pending_postcommit_near_prefix", "common_prefix_reuse"}
+)
+
+# common_prefix_reuse thresholds: adopt an existing session's identity when
+# no exact prefix matches but a session shares at least this much committed
+# prefix with the incoming prompt. Two unrelated conversations essentially
+# never share 4K+ identical leading tokens (system prompt + tool contract +
+# early history), while one mutated conversation (compaction flip, edit
+# rewrite — the 2026-07-20 chess session rotated through SIX anon ids and
+# quadrupled the RAM bank to 25.9 GB) always does.
+_COMMON_PREFIX_REUSE_MIN_TOKENS = 4096
+_COMMON_PREFIX_REUSE_MIN_FRACTION = 0.25
+_COMMON_PREFIX_PROBE_TOKENS = 64
 
 
 def _new_anon_session_id() -> str:
@@ -807,6 +820,64 @@ class EngineSession:
         record.mark_finished(outcome)
         return outcome
 
+    def resolve_pending_postcommit_for_request(self) -> dict[str, Any]:
+        """Foreground-request policy for a prior turn's pending postcommit.
+
+        Default (POSTCOMMIT_STALL_DESIGN step 2, 2026-07-17): a live user
+        request never queues behind cache maintenance. If a postcommit is
+        still in flight, abort it immediately and admit the request: the
+        canonical snapshot is superseded by the turn about to run anyway,
+        and the bank still holds the prompt-prefix boundary plus any
+        live-frontier reference for warm restore. This replaces the
+        unconditional bounded wait (default 8s) that agent clients paid on
+        every tool continuation: the wait usually timed out (a 20k-history
+        re-encode needs longer than the bound), aborted the job anyway, and
+        the user watched dead air before prefill even began.
+
+        Operators restore the old blocking behavior by setting
+        MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S explicitly.
+        """
+        raw = os.environ.get("MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S")
+        if raw is not None and raw.strip():
+            return self.wait_for_pending_postcommit()
+        with self._postcommit_lock:
+            record = self._pending_postcommit
+        if record is None:
+            outcome = {
+                "waited": False,
+                "elapsed_s": 0.0,
+                "outcome": "no_pending",
+                "timeout_s": 0.0,
+            }
+            self.last_postcommit_wait = outcome
+            return outcome
+        future = record.future
+        if hasattr(future, "done") and future.done():
+            outcome = {
+                "waited": False,
+                "elapsed_s": 0.0,
+                "outcome": "completed",
+                "timeout_s": 0.0,
+            }
+        else:
+            future_cancelled = record.abort("foreground_preempted_postcommit")
+            outcome = {
+                "waited": False,
+                "elapsed_s": 0.0,
+                "outcome": "aborted_for_foreground",
+                "timeout_s": 0.0,
+                "abort_requested": True,
+                "future_cancelled": bool(future_cancelled),
+                "abort_reason": "foreground_preempted_postcommit",
+            }
+        with self._postcommit_lock:
+            if self._pending_postcommit is record:
+                self._pending_postcommit = None
+        self.last_postcommit_wait = outcome
+        self.last_postcommit_outcome = outcome
+        record.mark_finished(outcome)
+        return outcome
+
     def try_begin_generation(self) -> bool:
         if not self._lock.acquire(blocking=False):
             return False
@@ -1144,6 +1215,23 @@ class EngineSessionManager:
                 )
                 self.last_prefix_diagnostic = diagnostic
                 return pending.session_id, "pending_postcommit_near_prefix"
+            best, matched = self.best_common_prefix_session(prompt_ids)
+            if best is not None:
+                diagnostic = self._prefix_diagnostic(prompt_ids)
+                diagnostic.update(
+                    {
+                        "best_session_id": best.session_id,
+                        "best_prefix_len": len(best.committed_token_ids),
+                        "matched_prefix_len": int(matched),
+                        "divergence_at_token": int(matched),
+                        "best_token_hash": token_hash_short(
+                            best.committed_token_ids
+                        ),
+                        "reason": "common_prefix_reuse",
+                    }
+                )
+                self.last_prefix_diagnostic = diagnostic
+                return best.session_id, "common_prefix_reuse"
             self.last_prefix_diagnostic = self._prefix_diagnostic(prompt_ids)
         else:
             self.last_prefix_diagnostic = None
@@ -1198,6 +1286,43 @@ class EngineSessionManager:
             if best is None or len(prefix) > len(best.committed_token_ids):
                 best = session
         return best
+
+    def best_common_prefix_session(
+        self, token_ids: list[int] | tuple[int, ...]
+    ) -> tuple["EngineSession | None", int]:
+        """Deepest shared-prefix session past the reuse thresholds, or None.
+
+        Identity continuity for mutated histories: when a mid-prefix byte
+        changed (transcript compaction flip, client edit-rewrite), the exact
+        longest_prefix_session misses and a fresh anon id would fork the
+        session bank. Restores already handle mid-prefix divergence via
+        boundary clones, so adopting the mutated conversation's existing id
+        is strictly better than forking. A 64-token probe rejects unrelated
+        sessions before the O(prefix) compare.
+        """
+        tokens = tuple(int(token) for token in token_ids)
+        if not tokens:
+            return None, 0
+        probe = tokens[:_COMMON_PREFIX_PROBE_TOKENS]
+        best: EngineSession | None = None
+        best_common = 0
+        for session in self._sessions_snapshot():
+            prefix = session.committed_token_ids
+            if not prefix:
+                continue
+            if prefix[: len(probe)] != probe[: len(prefix)]:
+                continue
+            common = common_prefix_len(prefix, tokens)
+            if common > best_common:
+                best_common = common
+                best = session
+        threshold = max(
+            _COMMON_PREFIX_REUSE_MIN_TOKENS,
+            int(len(tokens) * _COMMON_PREFIX_REUSE_MIN_FRACTION),
+        )
+        if best is not None and best_common >= threshold:
+            return best, best_common
+        return None, 0
 
     def pending_near_prefix_session(
         self,

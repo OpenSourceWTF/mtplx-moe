@@ -21,6 +21,7 @@ import gc
 import hashlib
 import html
 import json
+import threading
 import logging
 import os
 import re
@@ -60,6 +61,7 @@ from fastapi.responses import (
 )
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
+from mtplx import progress_heartbeat
 from mtplx.adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from mtplx.attention_context import attention_phase
 from mtplx.cache_state import snapshot_cache
@@ -77,6 +79,12 @@ from mtplx.backends.descriptors import (
 from mtplx.backends.registry import load_runtime_contract
 from mtplx.batching import BatchSchedulerConfig, SchedulerMode, SchedulerPreset
 from mtplx.chat_encoding import encode_chat_messages, is_gemma4_tokenizer
+from mtplx.constrained import (
+    ResponseFormatError,
+    constraint_spec_from_response_format,
+    tool_call_constraint_spec,
+    tool_call_strict_enabled,
+)
 from mtplx.gemma4_pair import (
     GEMMA4_BACKEND,
     gemma4_pair_sampler_defaults,
@@ -172,6 +180,10 @@ try:
         restore_or_prefill_prompt_state,
     )
     from mtplx.native_mlp import native_mlp_stats
+    from mtplx.thinking_guard import (
+        think_marker_ids,
+        thinking_guard_config_from_env,
+    )
     from mtplx.engine_session import (
         EngineSessionBusy,
         EngineSessionManager,
@@ -194,6 +206,8 @@ except Exception as exc:
 
     generate_ar = _missing_runtime
     generate_mtpk = _missing_runtime
+    think_marker_ids = _missing_runtime
+    thinking_guard_config_from_env = _missing_runtime
     prefill_chunk_size_override = nullcontext
     restore_or_prefill_prompt_state = _missing_runtime
     _default_stop_tokens = _missing_runtime
@@ -265,6 +279,15 @@ CHAT_TEMPLATE_SENTINEL_RE = re.compile(
 STREAM_HEARTBEAT_INTERVAL_S = 10.0
 STREAM_SILENCE_WARN_S = 30.0
 STREAM_SILENCE_WARN_INTERVAL_S = 60.0
+# Stall containment (#86): a stream that receives nothing while the model
+# owner's progress heartbeat is frozen for this long is failed with a
+# structured error instead of hanging forever. Healthy work ticks the
+# heartbeat many times per second (every settled engine forward and every
+# scheduler item), so only a genuinely parked owner can breach; the default
+# clears even a multi-minute model load. 0 disables.
+STREAM_STALL_DEADLINE_S = float(
+    os.environ.get("MTPLX_STREAM_STALL_DEADLINE_S") or 300.0
+)
 STREAM_HIDDEN_TOOL_GUARD_TOKENS = 2048
 STREAM_HIDDEN_TOOL_GUARD_S = 30.0
 STREAM_TOOL_CALL_FINISH_GRACE_S = 0.05
@@ -1704,6 +1727,18 @@ class ServerState:
                 getattr(self.runtime, "model_path", None)
             ),
         )
+        # Keep the SSD cold-tier encode (full-KV byte conversion; post-#169
+        # it runs at enqueue, never on the writer thread) off request and
+        # stream tails: dispatch it to the scheduler's idle lane, where it
+        # reads the immutable bank entry on the model owner thread.
+        _bank = getattr(self.sessions, "bank", None)
+        if _bank is not None and hasattr(_bank, "cold_enqueue_dispatch"):
+            _scheduler = self.model_scheduler
+            _bank.cold_enqueue_dispatch = (
+                lambda job: _scheduler.submit_idle_postcommit(
+                    job, batch_key="ssd.cold_enqueue"
+                )
+            )
         self.last_metrics: list[dict[str, Any]] = []
         self.tool_parse_counters = {key: 0 for key in _TOOL_PARSE_COUNTER_KEYS}
         # Activity timestamps used by the parent-process thermal watchdog to
@@ -1772,7 +1807,6 @@ def _session_bank_cold_tier_from_args(args: argparse.Namespace) -> Any | None:
         return None
     from mtplx.cache_bank import (
         DEFAULT_COLD_TIER_DIR,
-        DEFAULT_COLD_TIER_MAX_BYTES,
         DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS,
         SessionBankColdTier,
         parse_size_bytes,
@@ -3915,7 +3949,7 @@ _OPENAI_BRIDGE_POLICY_VERSION = (
     "omlx_style:preserve_history:parse_at_completion:tool_digest:v4"
 )
 _MTPLX_TOOL_CONTRACT_POLICY_VERSION = (
-    "soft_schema_contract:native_xml:targeted_reads:post_tool_continue:agent_tail:dated:v12"
+    "soft_schema_contract:native_xml:whole_file_reads:no_content_echo:edit_oldstring:post_tool_continue:agent_tail:dated:v13"
 )
 _MTPLX_NO_TOOL_CONTRACT_POLICY_VERSION = "no_tool_direct_reply:v1"
 _MTPLX_POST_TOOL_ANSWER_POLICY_VERSION = "post_tool_full_answer:dated:v2"
@@ -4606,7 +4640,22 @@ def _tool_signature(tool: dict[str, Any]) -> str | None:
 def _tool_example_value(schema: Any) -> str:
     schema_types = _schema_type_names(schema)
     if "array" in schema_types:
-        return "[]"
+        # Never show an empty array: a degenerate exemplar in the contract is
+        # an in-prompt template for the #170 `edits: []` collapse. Populate
+        # one element from the item schema's own keys when it declares any
+        # (pure function of the client's tools — prompt bytes stay stable
+        # within a session).
+        items = schema.get("items") if isinstance(schema, dict) else None
+        item_props = items.get("properties") if isinstance(items, dict) else None
+        if isinstance(item_props, dict) and item_props:
+            required = items.get("required")
+            names = [
+                str(name) for name in required if isinstance(name, str)
+            ] if isinstance(required, list) else []
+            names = names or [str(key) for key in item_props]
+            element = {name: "ARGUMENT_VALUE" for name in names[:2]}
+            return json.dumps([element], ensure_ascii=False)
+        return '["ARGUMENT_VALUE"]'
     if "object" in schema_types:
         return "{}"
     if "boolean" in schema_types:
@@ -4727,13 +4776,19 @@ def _mtplx_tool_contract_text(
         f"Declared tools and schemas: {allowed}. "
         "Call only these exact tool names and exact argument keys/case. "
         "Include every required key shown in the signature. "
-        "For large files, search first and use the smallest read range/limit/offset "
-        "the declared read tool supports. "
+        "Read a file in ONE call with no offset/limit unless it is huge "
+        "(thousands of lines); page only huge files, in large ranges "
+        "(hundreds of lines), and never re-read a file in small slices. "
+        "For an edit call, oldString must be copied verbatim from the "
+        "current file content (exact whitespace) and must differ from "
+        "newString; an edit missing oldString is invalid. "
         "Emit tool calls using the Qwen native XML format shown by the chat template, "
         f"for example: {example}. Do not put a JSON object inside <tool_call>. "
-        "Do not put full file contents, code blocks, patches, or implementation "
-        "output in reasoning/thinking. When creating or editing files, emit the "
-        "declared write/edit tool call with the file content as tool arguments. "
+        "Never print file contents, code blocks, patches, or implementation "
+        "output in reasoning/thinking or in your visible text — file content "
+        "belongs only inside the declared write/edit tool call arguments, "
+        "written exactly once. Before tool calls, write at most one short "
+        "sentence of visible text. "
         "Never invent Agent/task/Explore or any undeclared tool. "
         "If no declared tool applies, answer normally."
         f"{forced_clause}"
@@ -4956,8 +5011,9 @@ def _mtplx_coding_agent_tail_contract_text(tools: list[dict[str, Any]]) -> str |
         "project status, emit one declared <tool_call> now. Do not end the "
         "turn with a promise such as 'let me check', 'let me fix this', or "
         "'I'll run it' unless the same assistant turn also includes the tool "
-        "call. Do not draft full files, code blocks, or patches in reasoning; "
-        "put implementation payloads in the declared tool call arguments. "
+        "call. Do not draft full files, code blocks, or patches in reasoning "
+        "or in visible text; put implementation payloads in the declared tool "
+        "call arguments, written exactly once. "
         "For review, evaluation, summarize, or inspect-only tasks, use targeted "
         "tool calls and then answer once the current evidence covers the entry "
         "points, relevant definitions, or representative line ranges; do not "
@@ -5538,6 +5594,36 @@ def _request_explicit_single_tool_then_answer(messages: list[ChatMessage]) -> bo
     return bool(_EXPLICIT_SINGLE_TOOL_THEN_ANSWER_RE.search(_last_user_text(messages)))
 
 
+def _request_parallel_tool_calls(request: Any) -> bool | None:
+    """The client's explicit parallel_tool_calls preference, or None.
+
+    Only genuine booleans count; anything else means the client expressed
+    no preference and the legacy client-hint heuristics apply.
+    """
+    value = getattr(request, "parallel_tool_calls", None)
+    return value if isinstance(value, bool) else None
+
+
+def _single_tool_call_stream_policy(
+    *,
+    parallel_tool_calls: bool | None,
+    client_hint: str,
+    explicit_single_tool: bool,
+) -> bool:
+    """Whether streaming should stop after the first complete tool call.
+
+    The request's declared ``parallel_tool_calls`` is authoritative when
+    present — previously this was decided purely by sniffing the client
+    name, and the declared field was accepted but never consulted. The
+    hint-based behavior is preserved as the fallback for clients that do
+    not send the field.
+    """
+    if parallel_tool_calls is not None:
+        return not parallel_tool_calls
+    hint = (client_hint or "").lower()
+    return "pi" in hint or ("opencode" in hint and explicit_single_tool)
+
+
 def _request_should_force_answer_for_read_only_inspection(
     messages: list[ChatMessage],
 ) -> bool:
@@ -6043,8 +6129,29 @@ def _parse_xml_tool_call(
                 f"tool '{name}' contains text outside parameters"
             )
     elif body.strip():
+        # #170: a pure JSON-object body inside the <function=> envelope is the
+        # model's arguments payload (the family is trained on both the XML and
+        # the JSON tool dialects and slips into JSON on deeply nested
+        # arguments). Unambiguous — json.loads decides; anything else stays a
+        # loud protocol error, and mixing <parameter=> blocks with stray text
+        # remains rejected above.
+        json_body = _json_object_function_body(body)
+        if json_body is not None:
+            return name, json_body
         raise _tool_protocol_error(f"tool '{name}' contains unwrapped parameter text")
     return name, arguments
+
+
+def _json_object_function_body(body: str) -> dict[str, Any] | None:
+    """Parse a function body that is exactly one JSON object, else None."""
+    text = body.strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _parse_invoke_tool_call(block: str) -> tuple[str, Any] | None:
@@ -6434,6 +6541,7 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
         self._started = False
         self._name_delta_emitted = False
         self._remaining_text = ""
+        self._finishing = False
 
     @property
     def tool_calls(self) -> list[dict[str, Any]] | None:
@@ -6450,6 +6558,37 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
     @property
     def started(self) -> bool:
         return self._started
+
+    def _adopt_json_object_body(self, body: str) -> bool:
+        """Adopt a pure JSON-object function body as the arguments (#170)."""
+        if self._params:
+            return False
+        parsed = _json_object_function_body(body)
+        if parsed is None:
+            return False
+        self._params = parsed
+        return True
+
+    def _try_consume_json_body(self) -> str:
+        """Resolve a JSON-object function body ending at some ``</function>``.
+
+        String values may embed any markup — including literal ``</function>``
+        and ``<parameter=`` — so the body ends at the first close whose prefix
+        parses as a JSON object (the final parser's anchored regex resolves
+        the same ambiguity by backtracking to a later close). Returns
+        ``"adopted"`` (params set, buffer advanced past the close), ``"wait"``
+        (need more stream), or ``"failed"``.
+        """
+        search_from = 0
+        while True:
+            close = _find_casefold(self._buf, self._FUNCTION_CLOSE, search_from)
+            if close < 0:
+                return "wait" if not self._finishing else "failed"
+            if self._adopt_json_object_body(self._buf[:close]):
+                self._buf = self._buf[close + len(self._FUNCTION_CLOSE) :]
+                self._stage = "after_function"
+                return "adopted"
+            search_from = close + len(self._FUNCTION_CLOSE)
 
     @property
     def remaining_text(self) -> str:
@@ -6542,15 +6681,46 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                 continue
 
             if self._stage == "find_parameter":
+                if not self._params and self._buf.lstrip().startswith("{"):
+                    # #170: the model slipped into the JSON dialect inside the
+                    # XML envelope. Silently dropping this body is what turned
+                    # nested edit_file calls into schema-valid {} arguments.
+                    outcome = self._try_consume_json_body()
+                    if outcome == "adopted":
+                        continue
+                    if outcome == "wait":
+                        return deltas
+                    self._fallback_reason = (
+                        f"tool '{self._name}' contains unwrapped parameter text"
+                    )
+                    return deltas
                 param_start = _find_casefold(self._buf, "<parameter=")
                 function_close = _find_casefold(self._buf, self._FUNCTION_CLOSE)
                 if function_close >= 0 and (
                     param_start < 0 or function_close < param_start
                 ):
+                    # Contract parity with _parse_xml_tool_call: unwrapped
+                    # body text is a loud protocol fallback, never a silent
+                    # drop that finishes the call with empty arguments.
+                    if self._buf[:function_close].strip():
+                        self._fallback_reason = (
+                            f"tool '{self._name}' contains "
+                            + (
+                                "text outside parameters"
+                                if self._params
+                                else "unwrapped parameter text"
+                            )
+                        )
+                        return deltas
                     self._buf = self._buf[function_close + len(self._FUNCTION_CLOSE) :]
                     self._stage = "after_function"
                     continue
                 if param_start < 0:
+                    return deltas
+                if self._buf[:param_start].strip():
+                    self._fallback_reason = (
+                        f"tool '{self._name}' contains text outside parameters"
+                    )
                     return deltas
                 param_end = self._buf.find(">", param_start)
                 if param_end < 0:
@@ -6609,6 +6779,11 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                 tool_close = _find_casefold(self._buf, self._TOOL_CALL_CLOSE)
                 if tool_close < 0:
                     return deltas
+                if self._buf[:tool_close].strip():
+                    self._fallback_reason = (
+                        f"tool '{self._name}' contains text outside parameters"
+                    )
+                    return deltas
                 self._remaining_text = self._buf[
                     tool_close + len(self._TOOL_CALL_CLOSE) :
                 ]
@@ -6620,12 +6795,22 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
     def finish(self) -> list[dict[str, Any]]:
         if self._done or self._fallback_reason:
             return []
+        self._finishing = True
         deltas = self.feed("")
         if self._done or self._fallback_reason:
             return deltas
-        if self._repair_unclosed_complete and self._started and self._name and (
-            self._stage == "after_function"
-            or (self._stage == "find_parameter" and bool(self._params))
+        if (
+            self._repair_unclosed_complete
+            and self._started
+            and self._name
+            # Truncation repair completes a call only over a clean tail —
+            # pending non-whitespace text means dropped payload, which must
+            # stay a loud fallback (#170), not a silently shortened call.
+            and not self._buf.strip()
+            and (
+                self._stage == "after_function"
+                or (self._stage == "find_parameter" and bool(self._params))
+            )
         ):
             return self._finish_call(deltas)
         if self._started:
@@ -9981,6 +10166,46 @@ def _count_text_tokens(tokenizer: Any, text: str) -> int:
         return 0
 
 
+_REQUEST_LOG_LOCK = threading.Lock()
+
+
+def _request_log_path(state: "ServerState") -> str | None:
+    raw = getattr(state.args, "request_log_jsonl", None) or os.environ.get(
+        "MTPLX_REQUEST_LOG_JSONL"
+    )
+    raw = str(raw or "").strip()
+    return raw or None
+
+
+def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> None:
+    """Single sink for per-request telemetry records.
+
+    Appends to the in-RAM ring (dashboard `recent`) and, when
+    --request-log-jsonl / MTPLX_REQUEST_LOG_JSONL is set, durably appends the
+    same record as one JSON line. The JSONL is the forensics source
+    `scripts/session_forensics.py` reads — the 2026-07-20 chess-session
+    investigation had to reconstruct history from a 32-entry RAM ring; this
+    keeps the full trail. Best-effort: telemetry must never fail a request.
+    """
+    safe = _json_safe(record)
+    state.last_metrics.append(safe)
+    state.last_metrics = state.last_metrics[-100:]
+    path = _request_log_path(state)
+    if not path:
+        return
+    try:
+        line = json.dumps(
+            {"logged_at_s": time.time(), **safe},
+            ensure_ascii=False,
+            default=str,
+        )
+        with _REQUEST_LOG_LOCK:
+            with open(path, "a", encoding="utf-8") as sink:
+                sink.write(line + "\n")
+    except Exception:
+        pass
+
+
 def _json_safe(value: Any) -> Any:
     if is_dataclass(value):
         return _json_safe(asdict(value))
@@ -10109,7 +10334,7 @@ def _opencode_title_response(
         "request_tool_count": 0,
         "request_client_hint": "opencode_title",
     }
-    state.last_metrics.append(stats)
+    _record_request_metrics(state, stats)
     state.requests_completed = int(getattr(state, "requests_completed", 0) or 0) + 1
     state.last_request_at = time.time()
     usage = {
@@ -10685,6 +10910,7 @@ def _metrics_envelope(
             stats.get("repetition_stop_raw_tokens") or 0
         ),
         "loop_guard": dict(stats.get("loop_guard") or {}),
+        "thinking_guard": dict(stats.get("thinking_guard") or {}),
         "lock_wait_time_s": lock_wait_time_s,
         "session_id": session_id,
         **generation_limits,
@@ -12213,6 +12439,76 @@ def _stream_progress_payload(
     }
 
 
+class _OwnerStallProbe:
+    """Detects a genuinely parked model owner behind a silent stream (#86).
+
+    Compares successive readings of the owner progress heartbeat each time a
+    stream poll comes back empty. A long healthy prefill keeps ticking the
+    heartbeat, so time alone never breaches — only a heartbeat frozen for the
+    full deadline while our request is still in flight does. Deadline <= 0
+    disables the probe."""
+
+    def __init__(
+        self,
+        *,
+        deadline_s: float,
+        progress: Callable[[], int] = progress_heartbeat.value,
+        clock: Callable[[], float] = time.perf_counter,
+    ) -> None:
+        self._deadline_s = float(deadline_s)
+        self._progress = progress
+        self._clock = clock
+        self._last_value = progress()
+        self._frozen_since_s = clock()
+
+    def observe(self, now_s: float | None = None) -> float | None:
+        """Return how long the owner has been frozen once past the deadline."""
+        if self._deadline_s <= 0:
+            return None
+        if now_s is None:
+            now_s = self._clock()
+        current = self._progress()
+        if current != self._last_value:
+            self._last_value = current
+            self._frozen_since_s = now_s
+            return None
+        frozen_for_s = now_s - self._frozen_since_s
+        if frozen_for_s >= self._deadline_s:
+            return frozen_for_s
+        return None
+
+
+def _log_stream_stall_break(
+    state: Any,
+    *,
+    response_id: str | None,
+    session_id: str | None,
+    frozen_for_s: float,
+    streamed_tokens: int,
+) -> None:
+    scheduler_stats: dict[str, Any] = {}
+    scheduler = getattr(state, "model_scheduler", None)
+    if scheduler is not None and hasattr(scheduler, "stats"):
+        try:
+            scheduler_stats = dict(scheduler.stats())
+        except BaseException:
+            scheduler_stats = {}
+    _safe_stdout_print(
+        json.dumps(
+            {
+                "event": "mtplx_stream_stall_break",
+                "response_id": response_id,
+                "session_id": session_id,
+                "owner_frozen_s": round(float(frozen_for_s), 1),
+                "deadline_s": STREAM_STALL_DEADLINE_S,
+                "streamed_tokens": int(streamed_tokens),
+                "scheduler": scheduler_stats,
+            },
+            default=str,
+        )
+    )
+
+
 def _stream_heartbeat_payload(
     *,
     completion_tokens: int,
@@ -12761,6 +13057,23 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "mean_accept_probability_by_depth",
     "correction_tokens",
     "bonus_tokens",
+    # Context-copy (prompt-lookup) drafting counters. Cumulative per
+    # generation; suspended/backoff_tokens are end-of-generation gauges.
+    "context_copy_active",
+    "context_copy_probes",
+    "context_copy_rounds",
+    "context_copy_drafted_tokens",
+    "context_copy_accepted_blocks",
+    "context_copy_accepted_tokens",
+    "context_copy_suspensions",
+    "context_copy_suspended",
+    "context_copy_backoff_tokens",
+    "context_copy_disabled_reason",
+    # Grammar-constrained decoding (response_format) counters.
+    "constraint_active",
+    "constraint_completed",
+    "constraint_masked_steps",
+    "constraint_mask_time_s",
     "verify_time_s",
     "draft_time_s",
     "accept_time_s",
@@ -12943,6 +13256,7 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "tool_parser_source",
     "tool_parse_status",
     "tool_calls_emitted",
+    "tool_calls_truncated_parallel_disabled",
     "raw_tool_markup_suppressed",
     "legacy_bridge_used",
     "hidden_generation_repair_used",
@@ -13091,6 +13405,7 @@ def _merge_final_bridge_stats_into_latest_metrics(
         "tool_parser_source",
         "tool_parse_status",
         "tool_calls_emitted",
+        "tool_calls_truncated_parallel_disabled",
         "tool_parse_success",
         "tool_parse_fallback",
         "tool_parse_fallback_reason",
@@ -13157,8 +13472,7 @@ def _record_stream_cancellation_metric(
         envelope["mlx_cache_cleanup"] = cleanup
     envelope.update(_mlx_allocator_public_stats())
     envelope.update(request_observability)
-    state.last_metrics.append(_json_safe(envelope))
-    state.last_metrics = state.last_metrics[-100:]
+    _record_request_metrics(state, envelope)
     state.last_request_at = time.time()
     state.requests_cancelled = int(getattr(state, "requests_cancelled", 0) or 0) + 1
     try:
@@ -15117,7 +15431,19 @@ def _run_generation_dispatched(
     history_bypass_reason = _ar_batch_history_bypass_reason(
         request_observability_for_lane
     )
-    if history_bypass_reason is not None:
+    if kwargs.get("constraint_spec") is not None:
+        # Grammar masks only exist on the serial lanes; the batched AR
+        # pump's per-job samplers carry no matcher state (issue #186 phase 1).
+        # MTP itself stays ON for constrained requests (phase 3 composes the
+        # matcher with the verify loop), so no mtp_disabled_reason here —
+        # scheduler_lane/ar_batch_bypass_reason carry the routing signal.
+        use_ar_batch = False
+        mtp_disabled_reason = None
+        request_observability_for_lane["scheduler_lane"] = "solo_constrained"
+        request_observability_for_lane["ar_batch_bypass_reason"] = (
+            "constrained_decoding"
+        )
+    elif history_bypass_reason is not None:
         use_ar_batch = False
         mtp_disabled_reason = None
         request_observability_for_lane["scheduler_lane"] = (
@@ -15269,6 +15595,7 @@ def _run_generation(
     cancel_event: Event | None = None,
     streaming_response: bool | None = None,
     vision_splice: Any | None = None,
+    constraint_spec: Any | None = None,
 ) -> dict[str, Any]:
     response_max, sampler, generation_limits = _generation_params(
         state,
@@ -15283,6 +15610,11 @@ def _run_generation(
     uncapped_repetition_stop = _uncapped_repetition_stop_enabled(generation_limits)
     generation_limits["uncapped_repetition_stop_enabled"] = bool(
         uncapped_repetition_stop
+    )
+    thinking_guard_config = _thinking_guard_config_for_request(
+        state,
+        prompt_ids=prompt_ids,
+        request_observability=request_observability,
     )
     effective_draft_sampler = draft_sampler if draft_sampler is not None else state.draft_sampler
     effective_mode = _normalize_generation_mode(
@@ -15380,6 +15712,13 @@ def _run_generation(
             with _temporary_env(
                 dynamic_kv_reservation["env"]
             ), prefill_chunk_size_override(prefill_chunk_tokens):
+                constraint = (
+                    constraint_spec.build(
+                        state.runtime.tokenizer, prompt_ids=prompt_ids
+                    )
+                    if constraint_spec is not None
+                    else None
+                )
                 if effective_mode == "ar":
                     out = generate_ar(
                         state.runtime,
@@ -15391,8 +15730,17 @@ def _run_generation(
                         trace_label=trace_label,
                         trace_metadata=trace_metadata,
                         prefill_callback=prefill_callback,
-                        repetition_stop=uncapped_repetition_stop,
+                        # The repetition trimmer retracts already-committed
+                        # tokens, which would desync the grammar matcher;
+                        # constrained output is schema-shaped, not freeform.
+                        repetition_stop=(
+                            False
+                            if constraint is not None
+                            else uncapped_repetition_stop
+                        ),
                         loop_guard=_loop_guard_enabled(),
+                        thinking_guard=thinking_guard_config,
+                        constraint=constraint,
                     )
                 else:
                     adaptive_policy = _make_adaptive_policy(
@@ -15405,6 +15753,7 @@ def _run_generation(
                     out = generate_mtpk(
                         state.runtime,
                         prompt_ids,
+                        constraint=constraint,
                         vision_splice=vision_splice,
                         abort_check=(
                             (lambda: bool(cancel_event.is_set()))
@@ -15446,6 +15795,7 @@ def _run_generation(
                         adaptive_policy=adaptive_policy,
                         repetition_stop=uncapped_repetition_stop,
                         loop_guard=_loop_guard_enabled(),
+                        thinking_guard=thinking_guard_config,
                         online_correction_cache=bool(
                             state.args.online_correction_cache
                         ),
@@ -15711,8 +16061,7 @@ def _run_generation(
         stats["server_blank_retry_suppressed"] = bool(
             response_is_streaming and blank_retry_budget
         )
-        state.last_metrics.append(dict(envelope))
-        state.last_metrics = state.last_metrics[-100:]
+        _record_request_metrics(state, dict(envelope))
         state.last_request_at = time.time()
         state.requests_completed += 1
         _dashboard_record_completion(state, envelope=envelope, stats=stats)
@@ -15727,7 +16076,12 @@ def _run_generation(
             "end_to_end_tok_s": server_tok_s,
             "_final_state": final_state,
             "finish_reason": (
-                out.final_state.finish_reason if out.final_state is not None else "stop"
+                out.final_state.finish_reason
+                if out.final_state is not None
+                # The serial AR lane has no final_state; its GenerationOutput
+                # still reports length-vs-stop correctly — don't flatten a
+                # max_tokens truncation into "stop".
+                else (getattr(out, "finish_reason", None) or "stop")
             ),
         }
         if seed_is_explicit or out.text.strip():
@@ -16209,6 +16563,15 @@ def _stats_footer_text(state: ServerState, generated: dict[str, Any]) -> str:
     if not state.args.stats_footer:
         return ""
     stats = generated["stats"]
+    constraint_active = (
+        stats.get("constraint_active")
+        if isinstance(stats, dict)
+        else getattr(stats, "constraint_active", False)
+    )
+    if constraint_active:
+        # response_format promised machine-parseable output; a prose footer
+        # appended to the content would corrupt it for every JSON client.
+        return ""
     tok_s, decode_elapsed_s = _decode_timing(stats)
     completion_tokens = int(generated.get("completion_tokens") or 0)
     footer = f"**{tok_s:.1f} tok/s** · {completion_tokens} tokens · {decode_elapsed_s:.2f}s decode"
@@ -17057,6 +17420,8 @@ def _display_text(
     if not state.args.stats_footer:
         return text
     footer = _stats_footer_text(state, generated)
+    if not footer:
+        return text
     separator = "\n\n" if text.endswith("\n") else "\n\n"
     return f"{text}{separator}{footer}"
 
@@ -18644,6 +19009,71 @@ def _reasoning_effort_for_state(
     if effort == "auto":
         effort = backend.reasoning_codec.default_effort or "low"
     return effort if effort in levels else backend.reasoning_codec.default_effort
+
+
+_AGENT_THINKING_BUDGET_BY_EFFORT = {"low": 1536, "medium": 3072, "high": 6144}
+
+
+def _thinking_guard_config_for_request(
+    state: ServerState,
+    *,
+    prompt_ids: list[int],
+    request_observability: Mapping[str, Any] | None,
+) -> Any | None:
+    """Resolve the agent-lane reasoning budget for this request, or None.
+
+    DISABLED BY DEFAULT (project policy, 2026-07-20: no generation-policy
+    intervention ships on). Opt-in surfaces: --agent-thinking-budget
+    ('auto' or an int) or the MTPLX_THINKING_BUDGET env var (an int) —
+    the env is consulted even when the CLI arg is off, so an operator can
+    enable the guard on a stock launch.
+
+    Scope when enabled: requests that declare tools AND have thinking
+    enabled (the OpenCode/agent tool loop) — plain chat and no-think
+    requests never get a guard. The guard is a surfaced budget (telemetry
+    key thinking_guard); below the budget decode is bit-exact. Mechanism
+    and the 2026-07-20 chess-marathon forensics: mtplx/thinking_guard.py.
+    """
+    obs = request_observability or {}
+    if not bool(obs.get("request_enable_thinking")):
+        return None
+    try:
+        tool_count = int(obs.get("request_tool_count") or 0)
+    except (TypeError, ValueError):
+        tool_count = 0
+    if tool_count <= 0:
+        return None
+    raw = (
+        str(getattr(state.args, "agent_thinking_budget", "off") or "off")
+        .strip()
+        .lower()
+    )
+    arg_enabled = True
+    budget = 3072
+    if raw in {"off", "0", "false", "no", "none"}:
+        arg_enabled = False
+    elif raw == "auto":
+        effort = str(obs.get("request_reasoning_effort") or "").strip().lower()
+        budget = _AGENT_THINKING_BUDGET_BY_EFFORT.get(effort, 3072)
+    else:
+        try:
+            budget = int(raw)
+        except ValueError:
+            arg_enabled = False
+        if budget <= 0:
+            arg_enabled = False
+    tokenizer = getattr(state.runtime, "tokenizer", None)
+    markers = think_marker_ids(tokenizer)
+    if markers is None:
+        return None
+    starts_in_think = int(markers[0]) in {int(t) for t in prompt_ids[-8:]}
+    config = thinking_guard_config_from_env(
+        arg_enabled,
+        budget_tokens=budget,
+        tokenizer=tokenizer,
+        starts_in_think=starts_in_think,
+    )
+    return config if getattr(config, "enabled", False) else None
 
 
 def _aime_visible_working_for_request(metadata: Mapping[str, Any]) -> bool:
@@ -20522,6 +20952,41 @@ def create_app(state: ServerState) -> FastAPI:
             request,
             allow_client_controls=client_controls_allowed,
         )
+        try:
+            constraint_spec = constraint_spec_from_response_format(
+                request.response_format,
+                tokenizer=state.runtime.tokenizer,
+            )
+        except ResponseFormatError as constraint_error:
+            raise HTTPException(status_code=400, detail=str(constraint_error))
+        if request.tools and tool_call_strict_enabled():
+            if constraint_spec is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "response_format constrained decoding cannot be "
+                        "combined with strict tool calls"
+                    ),
+                )
+            try:
+                constraint_spec = tool_call_constraint_spec(
+                    request.tools,
+                    request.tool_choice,
+                    state.runtime.tokenizer,
+                )
+            except ResponseFormatError as constraint_error:
+                raise HTTPException(status_code=400, detail=str(constraint_error))
+        if constraint_spec is not None:
+            if getattr(state.runtime, "backend_id", None) == "gemma4_assistant":
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "constrained decoding is not supported on the "
+                        "gemma4_assistant backend"
+                    ),
+                )
+            # Constrained requests ride the serial lanes (MTP included since
+            # #186 phase 3); only the batched AR pump is bypassed.
         request_depth = _request_depth_for_generation(
             state,
             request,
@@ -20676,6 +21141,10 @@ def create_app(state: ServerState) -> FastAPI:
             request_generation_mode=request_generation_mode,
             request_depth=request_depth,
         )
+        if constraint_spec is not None:
+            request_observability["constrained_decoding"] = (
+                constraint_spec.source_type
+            )
         if vision_splice is not None:
             request_observability["request_vision_images"] = len(vision_images)
             request_observability["request_vision_rows"] = vision_splice.total_rows
@@ -21185,6 +21654,7 @@ def create_app(state: ServerState) -> FastAPI:
                         seed=request.seed,
                         draft_sampler=request_draft_sampler,
                         generation_mode=request_generation_mode,
+                        constraint_spec=constraint_spec,
                         depth=request_depth,
                         resolved_mtp_depth=effective_request_depth,
                         session_id=session_id,
@@ -21223,6 +21693,7 @@ def create_app(state: ServerState) -> FastAPI:
                     seed=request.seed,
                     draft_sampler=request_draft_sampler,
                     generation_mode=request_generation_mode,
+                    constraint_spec=constraint_spec,
                     depth=request_depth,
                     resolved_mtp_depth=effective_request_depth,
                     session_id=session_id,
@@ -21347,16 +21818,19 @@ def create_app(state: ServerState) -> FastAPI:
             )
             generated["stats"]["session_postcommit_snapshot"] = postcommit
 
-        # Bounded wait for the prior turn's postcommit to land before we
-        # admit this request to the model scheduler. Done HERE - off the
+        # A live user request never queues behind cache maintenance
+        # (POSTCOMMIT_STALL_DESIGN step 2, 2026-07-17): if the prior turn's
+        # postcommit is still in flight, abort it and admit this request
+        # immediately. The old unconditional bounded wait (8s default) made
+        # agent tool continuations watch dead air, usually timed out anyway,
+        # and then paid the prefill on top. Done HERE - off the
         # scheduler-owner thread, before any foreground submit and before
-        # the session lock is acquired - so a slow postcommit cannot deadlock
-        # against this request. The wait is best-effort: timeouts fall
-        # through to a cold prefill, never a hang.
+        # the session lock is acquired. Set MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S
+        # explicitly to restore the blocking wait.
         postcommit_wait_outcome: dict[str, Any] | None = None
         if session is not None:
             postcommit_wait_outcome = await asyncio.to_thread(
-                session.wait_for_pending_postcommit
+                session.resolve_pending_postcommit_for_request
             )
             request_observability["postcommit_wait"] = postcommit_wait_outcome
             if (
@@ -21386,6 +21860,9 @@ def create_app(state: ServerState) -> FastAPI:
                 last_sse_sent_s = stream_started_s
                 last_token_s: float | None = None
                 next_silence_warn_s = stream_started_s + STREAM_SILENCE_WARN_S
+                owner_stall_probe = _OwnerStallProbe(
+                    deadline_s=STREAM_STALL_DEADLINE_S
+                )
 
                 def mark_sse_sent(chunk: str) -> str:
                     nonlocal last_sse_sent_s
@@ -21479,14 +21956,12 @@ def create_app(state: ServerState) -> FastAPI:
                 stream_client_hint = str(
                     request_observability.get("request_client_hint") or ""
                 ).lower()
-                single_tool_call_stream = (
-                    "pi" in stream_client_hint
-                    or (
-                        "opencode" in stream_client_hint
-                        and _request_explicit_single_tool_then_answer(
-                            messages_for_generation
-                        )
-                    )
+                single_tool_call_stream = _single_tool_call_stream_policy(
+                    parallel_tool_calls=_request_parallel_tool_calls(request),
+                    client_hint=stream_client_hint,
+                    explicit_single_tool=_request_explicit_single_tool_then_answer(
+                        messages_for_generation
+                    ),
                 )
                 orphan_stream_guard_enabled = bool(
                     tools_active and tool_result_history_present
@@ -21579,6 +22054,7 @@ def create_app(state: ServerState) -> FastAPI:
                         seed=None,
                         draft_sampler=request_draft_sampler,
                         generation_mode=request_generation_mode,
+                        constraint_spec=constraint_spec,
                         depth=request_depth,
                         resolved_mtp_depth=effective_request_depth,
                         token_callback=on_tokens,
@@ -21703,6 +22179,7 @@ def create_app(state: ServerState) -> FastAPI:
                         seed=None,
                         draft_sampler=request_draft_sampler,
                         generation_mode=request_generation_mode,
+                        constraint_spec=constraint_spec,
                         depth=request_depth,
                         resolved_mtp_depth=effective_request_depth,
                         token_callback=on_tokens,
@@ -21843,6 +22320,7 @@ def create_app(state: ServerState) -> FastAPI:
                         seed=None,
                         draft_sampler=request_draft_sampler,
                         generation_mode=request_generation_mode,
+                        constraint_spec=constraint_spec,
                         depth=request_depth,
                         resolved_mtp_depth=effective_request_depth,
                         token_callback=on_tokens,
@@ -22018,6 +22496,7 @@ def create_app(state: ServerState) -> FastAPI:
                         seed=None,
                         draft_sampler=request_draft_sampler,
                         generation_mode=request_generation_mode,
+                        constraint_spec=constraint_spec,
                         depth=request_depth,
                         resolved_mtp_depth=effective_request_depth,
                         token_callback=on_tokens,
@@ -22178,6 +22657,7 @@ def create_app(state: ServerState) -> FastAPI:
                         seed=None,
                         draft_sampler=request_draft_sampler,
                         generation_mode=request_generation_mode,
+                        constraint_spec=constraint_spec,
                         depth=request_depth,
                         resolved_mtp_depth=effective_request_depth,
                         token_callback=on_tokens,
@@ -22257,6 +22737,7 @@ def create_app(state: ServerState) -> FastAPI:
                                 seed=request.seed,
                                 draft_sampler=request_draft_sampler,
                                 generation_mode=request_generation_mode,
+                                constraint_spec=constraint_spec,
                                 depth=request_depth,
                                 resolved_mtp_depth=effective_request_depth,
                                 token_callback=on_tokens,
@@ -22307,6 +22788,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     seed=request.seed,
                                     draft_sampler=request_draft_sampler,
                                     generation_mode=request_generation_mode,
+                                    constraint_spec=constraint_spec,
                                     depth=request_depth,
                                     resolved_mtp_depth=effective_request_depth,
                                     token_callback=on_tokens,
@@ -23002,6 +23484,45 @@ def create_app(state: ServerState) -> FastAPI:
                                     cancel_event, generation_future
                                 )
                                 continue
+                            frozen_for_s = owner_stall_probe.observe(now_s)
+                            if (
+                                frozen_for_s is not None
+                                and not generation_future.done()
+                            ):
+                                # Stall containment (#86): the model owner has
+                                # made zero progress for the whole deadline
+                                # while this request is still in flight. Fail
+                                # the request with a diagnosable error and
+                                # release its slot — never the daemon.
+                                _log_stream_stall_break(
+                                    state,
+                                    response_id=response_id,
+                                    session_id=session_id,
+                                    frozen_for_s=frozen_for_s,
+                                    streamed_tokens=streamed_progress_tokens,
+                                )
+                                _cancel_stream_generation(
+                                    cancel_event, generation_future
+                                )
+                                if session is not None and hasattr(
+                                    session, "abort_pending_postcommit"
+                                ):
+                                    session.abort_pending_postcommit(
+                                        "stream_stall_watchdog"
+                                    )
+                                yield mark_sse_sent(
+                                    error_chunk(
+                                        TimeoutError(
+                                            "model owner made no progress for "
+                                            f"{frozen_for_s:.0f}s; request "
+                                            "aborted by the stream stall "
+                                            "watchdog "
+                                            "(MTPLX_STREAM_STALL_DEADLINE_S)"
+                                        )
+                                    )
+                                )
+                                yield mark_sse_sent("data: [DONE]\n\n")
+                                return
                             if (
                                 not generation_future.done()
                                 and now_s - last_sse_sent_s
@@ -23903,6 +24424,15 @@ def create_app(state: ServerState) -> FastAPI:
                 tool_specs,
             )
             tool_calls = extraction.tool_calls
+            if (
+                tool_calls
+                and len(tool_calls) > 1
+                and _request_parallel_tool_calls(request) is False
+            ):
+                # The client declared parallel_tool_calls=false; honor the
+                # OpenAI contract of at most one call per turn.
+                tool_calls = tool_calls[:1]
+                generated["stats"]["tool_calls_truncated_parallel_disabled"] = True
             generated["stats"]["tool_parser_source"] = extraction.parser_source
             generated["stats"]["tool_parse_status"] = extraction.status
             generated["stats"]["tool_calls_emitted"] = len(tool_calls or [])
@@ -24206,6 +24736,9 @@ def create_app(state: ServerState) -> FastAPI:
                 streamed_completion_tokens = 0
                 generated: dict[str, Any] | None = None
                 stop_hit = False
+                owner_stall_probe = _OwnerStallProbe(
+                    deadline_s=STREAM_STALL_DEADLINE_S
+                )
 
                 def on_tokens(new_tokens: list[int]) -> None:
                     _raise_if_stream_cancelled(cancel_event)
@@ -24324,6 +24857,33 @@ def create_app(state: ServerState) -> FastAPI:
                                 _cancel_stream_generation(
                                     cancel_event, generation_future
                                 )
+                                return
+                            frozen_for_s = owner_stall_probe.observe()
+                            if (
+                                frozen_for_s is not None
+                                and not generation_future.done()
+                            ):
+                                # Stall containment (#86): see the main stream
+                                # loop — fail the request, never the daemon.
+                                _log_stream_stall_break(
+                                    state,
+                                    response_id=None,
+                                    session_id=None,
+                                    frozen_for_s=frozen_for_s,
+                                    streamed_tokens=streamed_completion_tokens,
+                                )
+                                _cancel_stream_generation(
+                                    cancel_event, generation_future
+                                )
+                                yield error_chunk(
+                                    TimeoutError(
+                                        "model owner made no progress for "
+                                        f"{frozen_for_s:.0f}s; request aborted "
+                                        "by the stream stall watchdog "
+                                        "(MTPLX_STREAM_STALL_DEADLINE_S)"
+                                    )
+                                )
+                                yield "data: [DONE]\n\n"
                                 return
                             continue
                         if kind == "tokens":
@@ -25082,6 +25642,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "contract); on preserves all history reasoning; off strips it. "
             "Default auto resolves to scoped for checkpoint-capable "
             "templates, else preserve-all."
+        ),
+    )
+    parser.add_argument(
+        "--agent-thinking-budget",
+        default="off",
+        help=(
+            "Reasoning-token budget per agent (tool-loop) turn. OFF by "
+            "default: generation is never steered unless an operator opts "
+            "in. 'auto' maps reasoning effort low/medium/high to "
+            "1536/3072/6144; an integer sets the budget directly. At the "
+            "budget the reasoning segment is force-closed with a short "
+            "bridge so the turn proceeds to its answer/tool call; every "
+            "engagement is surfaced in telemetry (thinking_guard). "
+            "Applies only to requests that carry tools AND have thinking "
+            "enabled; plain chat is never touched. Env opt-in/override: "
+            "MTPLX_THINKING_BUDGET (an int enables and sets the budget "
+            "even when this flag is off; 'off' disables)."
+        ),
+    )
+    parser.add_argument(
+        "--request-log-jsonl",
+        default=None,
+        help=(
+            "Append every per-request telemetry record (the dashboard "
+            "'recent' schema) as one JSON line to this path. The durable "
+            "twin of the 100-entry RAM ring; scripts/session_forensics.py "
+            "reads it. Env: MTPLX_REQUEST_LOG_JSONL."
         ),
     )
     parser.add_argument(

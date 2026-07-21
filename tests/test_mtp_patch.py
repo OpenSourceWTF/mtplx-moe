@@ -221,6 +221,67 @@ def test_low_mtp_norm_weights_are_not_shifted_without_delta_contract() -> None:
     assert float(finalized["pre_fc_norm_embedding.weight"][0].item()) == pytest.approx(0.125)
 
 
+def test_raw_delta_qwen_sidecar_norms_are_healed() -> None:
+    # The shipped 4B (#176) stores raw zero-centered norms with no declared
+    # encoding: q/k means ~0.75 plus sub-0.5 low-set norms is the two-signal
+    # raw-delta fingerprint, and the loader must restore the +1 convention.
+    mx = pytest.importorskip("mlx.core")
+    weights = {
+        "layers.0.input_layernorm.weight": mx.full((8,), 0.30, dtype=mx.float32),
+        "layers.0.post_attention_layernorm.weight": mx.full((8,), 0.39, dtype=mx.float32),
+        "layers.0.self_attn.q_norm.weight": mx.full((8,), 0.75, dtype=mx.float32),
+        "layers.0.self_attn.k_norm.weight": mx.full((8,), 0.74, dtype=mx.float32),
+        "norm.weight": mx.full((8,), 2.58, dtype=mx.float32),
+        "pre_fc_norm_embedding.weight": mx.full((8,), -0.41, dtype=mx.float32),
+        "pre_fc_norm_hidden.weight": mx.full((8,), -0.25, dtype=mx.float32),
+        "fc.weight": mx.full((4, 8), 0.007, dtype=mx.float32),
+    }
+
+    finalized = _finalize_mtp_weights(weights, {}, prequantized=True)
+
+    assert float(finalized["layers.0.self_attn.q_norm.weight"][0].item()) == pytest.approx(1.75)
+    assert float(finalized["layers.0.input_layernorm.weight"][0].item()) == pytest.approx(1.30)
+    assert float(finalized["norm.weight"][0].item()) == pytest.approx(3.58)
+    assert float(finalized["pre_fc_norm_embedding.weight"][0].item()) == pytest.approx(0.59)
+    assert float(finalized["pre_fc_norm_hidden.weight"][0].item()) == pytest.approx(0.75)
+    assert float(finalized["fc.weight"][0, 0].item()) == pytest.approx(0.007)
+
+
+def test_healthy_final_convention_sidecar_is_untouched() -> None:
+    mx = pytest.importorskip("mlx.core")
+    weights = {
+        "layers.0.input_layernorm.weight": mx.full((8,), 1.10, dtype=mx.float32),
+        "layers.0.post_attention_layernorm.weight": mx.full((8,), 1.24, dtype=mx.float32),
+        "layers.0.self_attn.q_norm.weight": mx.full((8,), 1.75, dtype=mx.float32),
+        "layers.0.self_attn.k_norm.weight": mx.full((8,), 1.74, dtype=mx.float32),
+        "norm.weight": mx.full((8,), 2.43, dtype=mx.float32),
+        "pre_fc_norm_embedding.weight": mx.full((8,), 0.52, dtype=mx.float32),
+        "pre_fc_norm_hidden.weight": mx.full((8,), 0.77, dtype=mx.float32),
+    }
+
+    finalized = _finalize_mtp_weights(weights, {}, prequantized=True)
+
+    for key, value in weights.items():
+        assert float(finalized[key][0].item()) == pytest.approx(float(value[0].item())), key
+
+
+def test_single_signal_low_norms_are_not_healed() -> None:
+    # q/k near raw levels but a healthy low set: one signal is not enough to
+    # rewrite weights (guards against overeager shifting of unusual models).
+    mx = pytest.importorskip("mlx.core")
+    weights = {
+        "layers.0.self_attn.q_norm.weight": mx.full((8,), 0.75, dtype=mx.float32),
+        "layers.0.self_attn.k_norm.weight": mx.full((8,), 0.74, dtype=mx.float32),
+        "layers.0.input_layernorm.weight": mx.full((8,), 0.90, dtype=mx.float32),
+        "pre_fc_norm_hidden.weight": mx.full((8,), 0.77, dtype=mx.float32),
+    }
+
+    finalized = _finalize_mtp_weights(weights, {}, prequantized=True)
+
+    assert float(finalized["layers.0.self_attn.q_norm.weight"][0].item()) == pytest.approx(0.75)
+    assert float(finalized["layers.0.input_layernorm.weight"][0].item()) == pytest.approx(0.90)
+
+
 def test_delta_encoded_mtp_norm_weights_are_restored_by_contract() -> None:
     mx = pytest.importorskip("mlx.core")
     weights = {
@@ -319,3 +380,75 @@ def test_mtp_contract_detects_prequantized_switch_moe_sidecar() -> None:
     assert contract.mtp_prequantized is True
     assert contract.mtp_quant_policy == "all"
     assert contract.mtp_quant_bits == 4
+
+
+class _GeomArray:
+    def __init__(self, shape: tuple[int, ...]):
+        self.shape = shape
+
+
+def _geometry_weights(*, packed_cols: int, scale_groups: int) -> dict:
+    return {
+        "layers.0.mtp.fc.weight": _GeomArray((4096, packed_cols)),
+        "layers.0.mtp.fc.scales": _GeomArray((4096, scale_groups)),
+        "layers.0.mtp.fc.biases": _GeomArray((4096, scale_groups)),
+    }
+
+
+def _geometry_contract(bits: int, group_size: int) -> MTPContract:
+    return MTPContract(
+        mtp_quant_bits=bits,
+        mtp_quant_group_size=group_size,
+        mtp_prequantized=True,
+    )
+
+
+def test_prequantized_5bit_geometry_preserves_correct_declared_group_size() -> None:
+    # Issue #182 / PR #183 (Jonathangadeaharder): 640 uint32 words hold
+    # 640 * 32 / 5 = 4096 five-bit values. Floor division (32 // 5 = 6)
+    # undercounted to 3840 and overwrote the correct declared group size 64
+    # with an invalid 60, making the artifact unloadable.
+    contract = _geometry_contract(5, 64)
+    weights = _geometry_weights(packed_cols=640, scale_groups=64)
+    corrected = _contract_with_prequantized_tensor_geometry(contract, weights)
+    assert corrected.mtp_quant_group_size == 64
+
+
+def test_prequantized_5bit_geometry_heals_wrong_declared_group_size() -> None:
+    contract = _geometry_contract(5, 32)
+    weights = _geometry_weights(packed_cols=640, scale_groups=64)
+    corrected = _contract_with_prequantized_tensor_geometry(contract, weights)
+    assert corrected.mtp_quant_group_size == 64
+
+
+def test_prequantized_3bit_geometry_infers_exact_group_size() -> None:
+    # 384 words * 32 bits / 3 = 4096 values; groups of 64 -> 64 scale groups.
+    contract = _geometry_contract(3, 32)
+    weights = _geometry_weights(packed_cols=384, scale_groups=64)
+    corrected = _contract_with_prequantized_tensor_geometry(contract, weights)
+    assert corrected.mtp_quant_group_size == 64
+
+
+def test_prequantized_6bit_geometry_infers_exact_group_size() -> None:
+    # 768 words * 32 bits / 6 = 4096 values; groups of 64 -> 64 scale groups.
+    contract = _geometry_contract(6, 32)
+    weights = _geometry_weights(packed_cols=768, scale_groups=64)
+    corrected = _contract_with_prequantized_tensor_geometry(contract, weights)
+    assert corrected.mtp_quant_group_size == 64
+
+
+def test_prequantized_8bit_divisor_geometry_unchanged() -> None:
+    # Divisor widths keep the original arithmetic: 1024 words * 4/word = 4096.
+    contract = _geometry_contract(8, 32)
+    weights = _geometry_weights(packed_cols=1024, scale_groups=64)
+    corrected = _contract_with_prequantized_tensor_geometry(contract, weights)
+    assert corrected.mtp_quant_group_size == 64
+
+
+def test_prequantized_nondivisor_padded_geometry_keeps_declared_contract() -> None:
+    # 641 words * 32 = 20512 bits does not divide by 5: padded/ambiguous rows
+    # must be skipped rather than inferred, leaving the declared size alone.
+    contract = _geometry_contract(5, 64)
+    weights = _geometry_weights(packed_cols=641, scale_groups=64)
+    corrected = _contract_with_prequantized_tensor_geometry(contract, weights)
+    assert corrected.mtp_quant_group_size == 64

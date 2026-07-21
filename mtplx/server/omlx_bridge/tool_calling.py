@@ -191,6 +191,29 @@ def _parse_xml_tool_calls(text: str) -> tuple[str, list[dict[str, Any]] | None, 
                         params[key] = json.loads(value)
                     except (TypeError, ValueError):
                         params[key] = value
+            if not params:
+                body = func_match.group(2).strip()
+                if body:
+                    # #170: a pure JSON-object body inside the envelope is the
+                    # arguments payload (same contract as the strict parsers).
+                    parsed_body = None
+                    if body.startswith("{"):
+                        try:
+                            parsed_body = json.loads(body)
+                        except (TypeError, ValueError):
+                            parsed_body = None
+                    if isinstance(parsed_body, dict):
+                        params = parsed_body
+                    else:
+                        # Never fabricate a {}-arguments call out of a body the
+                        # parser could not read — that silent empty call is the
+                        # measured #170 client shape. The turn stays visible
+                        # content instead.
+                        malformed_reason = (
+                            f"tool '{name}' contains unwrapped parameter text"
+                        )
+                        calls = []
+                        break
             calls.append(_tool_call(name, params))
             continue
         invoke_match = re.match(
@@ -212,6 +235,12 @@ def _parse_xml_tool_calls(text: str) -> tuple[str, list[dict[str, Any]] | None, 
                     params[key] = json.loads(value)
                 except (TypeError, ValueError):
                     params[key] = value
+            if not params and invoke_match.group(2).strip():
+                malformed_reason = (
+                    f"tool '{name}' contains unwrapped parameter text"
+                )
+                calls = []
+                break
             calls.append(_tool_call(name, params))
             continue
         malformed_reason = "unrecognized <tool_call> payload"
@@ -241,6 +270,9 @@ def _parse_namespaced_tool_calls(text: str) -> tuple[str, list[dict[str, Any]] |
                     params[param.group(1)] = json.loads(value)
                 except (TypeError, ValueError):
                     params[param.group(1)] = value
+            if not params and invoke.group(2).strip():
+                # No fabricated {}-arguments calls from unread bodies (#170).
+                continue
             calls.append(_tool_call(invoke.group(1), params))
     if not calls:
         return text, None
@@ -290,6 +322,24 @@ def _filter_known_tools(
     return filtered or None
 
 
+def _function_body_is_blank(envelope: str) -> bool:
+    """True when the tool envelope carries no payload beyond its tags.
+
+    An empty ``<function=name></function>`` block is a legitimate no-argument
+    call and must keep parsing to ``{}`` (the stream-level contract pinned by
+    test_chat_stream_missing_required_tool_argument_still_emits_model_tool_call).
+    A non-blank body that no parser could read must never become ``{}``.
+    """
+    inner = re.match(
+        r"\s*<function(?:=[^>\s]+|\s+name=\"[^\"]+\")>\s*(.*?)\s*</function>\s*$",
+        envelope.strip(),
+        re.DOTALL,
+    )
+    if inner is None:
+        return not envelope.strip()
+    return not inner.group(1).strip()
+
+
 def parse_tool_calls(
     text: str,
     tokenizer: Any | None,
@@ -332,7 +382,33 @@ def parse_tool_calls(
                     name = item.get("name")
                     if not name:
                         continue
-                    calls.append(_tool_call(str(name), item.get("arguments", {})))
+                    arguments = item.get("arguments", {})
+                    if not arguments and match.strip():
+                        # #170: the native tokenizer parser returns an empty
+                        # arguments object for envelope bodies it cannot read
+                        # (a JSON-object body inside <function=...> being the
+                        # common case). Never fabricate a {}-arguments call —
+                        # give our own envelope parser a second opinion and
+                        # adopt its arguments, or skip the item entirely.
+                        _cleaned, recovered, _reason = _parse_xml_tool_calls(
+                            "<tool_call>" + match.strip() + "</tool_call>"
+                        )
+                        recovered_args = None
+                        for candidate in recovered or []:
+                            candidate_fn = candidate.get("function") or {}
+                            if str(candidate_fn.get("name")) == str(name):
+                                try:
+                                    recovered_args = json.loads(
+                                        candidate_fn.get("arguments") or "{}"
+                                    )
+                                except (TypeError, ValueError):
+                                    recovered_args = None
+                                break
+                        if recovered_args:
+                            arguments = recovered_args
+                        elif not _function_body_is_blank(match):
+                            continue
+                    calls.append(_tool_call(str(name), arguments))
             calls = _filter_known_tools(calls, tools) or []
             if calls:
                 if end:

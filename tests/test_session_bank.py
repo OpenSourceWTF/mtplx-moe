@@ -484,3 +484,25 @@ def test_session_bank_recurrent_container_without_boundaries_does_not_supersede(
     # A recurrent container with no interior boundaries fails closed on
     # sub-prefix restores, so the shorter exact frontier still adds coverage.
     assert len(bank) == 2
+
+
+def test_eviction_log_is_bounded_for_daemon_lifetime():
+    # The log is appended on every eviction/skip forever while health
+    # snapshots read only the newest entries: an unbounded list is pure
+    # retention on a long-running agent daemon (external review F5).
+    bank = SessionBank(max_entries=4, max_bytes=1024, per_session_max_bytes=512)
+    runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+    assert bank.eviction_log.maxlen == 256
+    for index in range(300):
+        bank.put(
+            runtime=runtime,
+            token_ids=[1, 2, index],
+            cache=[],
+            logits=None,
+            hidden=None,
+            session_id=f"session-{index}",
+            nbytes_override=2048,
+        )
+    assert len(bank.eviction_log) == 256
+    # Newest entry survives at the tail; the oldest 44 fell off the front.
+    assert bank.eviction_log[-1]["reason"] == "skipped_oversized_snapshot"

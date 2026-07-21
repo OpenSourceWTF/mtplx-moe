@@ -13,11 +13,36 @@ import os
 import subprocess
 import time
 
+import pytest
+
 from mtplx import thermal_sidecar
+
+
+@pytest.fixture(autouse=True)
+def _default_no_daemon_socket(monkeypatch):
+    """Default every test to "no ThermalForge daemon socket" so the suite never
+    touches a real daemon on the dev machine. The socket-path test opts in."""
+    monkeypatch.setattr(thermal_sidecar, "_daemon_socket_send", lambda *a, **k: None)
 
 
 def test_parent_alive_returns_true_for_self():
     assert thermal_sidecar._parent_alive(os.getpid()) is True
+
+
+def test_restore_fans_prefers_daemon_socket(monkeypatch):
+    """When the daemon socket answers, restore through it and never shell out
+    to sudo (which needs a password and would run the app-killing CLI)."""
+    monkeypatch.setattr(
+        thermal_sidecar,
+        "_daemon_socket_send",
+        lambda *a, **k: {"ok": True, "response": "ok", "command": ["<sock>", "auto"]},
+    )
+
+    def boom(*a, **k):
+        raise AssertionError("must not shell out when the daemon socket handles it")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert thermal_sidecar._restore_fans("/path/to/thermalforge") == 0
 
 
 def test_parent_alive_returns_false_for_dead_pid():

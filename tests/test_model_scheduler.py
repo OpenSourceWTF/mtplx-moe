@@ -145,3 +145,28 @@ def test_idle_postcommit_aborts_when_session_revision_is_stale(monkeypatch):
         assert calls == []
     finally:
         scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_batch_key_telemetry_collapses_per_session_suffixes():
+    # postcommit:{session_id}-style keys must not grow the started-by counter
+    # by one entry per session for the daemon's lifetime (external review F5):
+    # the counter records the stable class before ':', while dotted static
+    # keys ("chat.stream", "ar_batch.decode") pass through unchanged.
+    scheduler = ModelWorkScheduler(name="test-model-scheduler", idle_grace_s=0.0)
+    try:
+        for index in range(64):
+            scheduler.submit_foreground(
+                lambda: "ok", batch_key=f"postcommit:session-{index}"
+            ).result(timeout=2)
+            scheduler.record_batch_step(
+                size=1, batch_key=f"stream_tail:session-{index}"
+            )
+        stats = scheduler.stats()
+        assert stats["started_by_batch_key"]["postcommit"] == 64
+        assert stats["started_by_batch_key"]["stream_tail"] == 64
+        session_keys = [
+            key for key in stats["started_by_batch_key"] if "session-" in key
+        ]
+        assert session_keys == []
+    finally:
+        scheduler.shutdown(wait=True, cancel_futures=True)

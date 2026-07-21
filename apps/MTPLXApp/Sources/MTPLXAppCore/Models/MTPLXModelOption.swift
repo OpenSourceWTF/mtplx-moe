@@ -302,9 +302,29 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "Qwen 3.5 4B",
                 "Small Qwen",
             ],
-            sizeBytes: 3_502_366_720,
-            peakMemoryGiB: 3.96,
-            recommendedFor: []
+            sizeBytes: 2_474_027_992,
+            peakMemoryGiB: 2.86,
+            recommendedFor: [.modernApple]
+        ),
+        MTPLXModelOption(
+            id: "qwen35-4b-optimized-quality",
+            displayName: "Qwen 3.5 4B Optimized Quality",
+            shortName: "Qwen 3.5 4B Optimized Quality",
+            detail: "8-bit quantization. Highest-fidelity 4B; 2x MTP multiplier.",
+            hfModelID: "Youssofal/Qwen3.5-4B-MTPLX-Optimized-Quality",
+            localCandidates: [
+                "~/Documents/MTPLX/models/Qwen3.5-4B-MTPLX-Optimized-Quality",
+                "~/.mtplx/models/Youssofal--Qwen3.5-4B-MTPLX-Optimized-Quality",
+            ],
+            aliases: [
+                "mtplx-qwen35-4b-optimized-quality",
+                "qwen3.5-4b-mtplx-optimized-quality",
+                "Qwen3.5 4B Optimized Quality",
+                "Qwen 3.5 4B Quality",
+            ],
+            sizeBytes: 4_576_423_401,
+            peakMemoryGiB: 4.75,
+            recommendedFor: [.modernApple]
         ),
         MTPLXModelOption(
             id: "qwen35-9b-optimized-speed",
@@ -588,10 +608,12 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
     }
 
     /// Ordered fresh-user model matrix shared by the top-left picker
-    /// and first-run onboarding. The 4B artifact stays in
-    /// `officialCatalog` only so already-installed/current users are
-    /// not orphaned; it is deliberately absent from this matrix until
-    /// that artifact is calibrated well enough to recommend again.
+    /// and first-run onboarding. The rebuilt 4B pair (2026-07-19) leads
+    /// the sub-16GB tiers and trails every larger modern tier: bigger
+    /// Macs should be steered at the 27B/35B class first, but the tiny
+    /// pair stays discoverable as the fast-small pick everywhere. No
+    /// fp16 4B siblings exist yet, so the legacy (M1/M2) matrix keeps
+    /// its fp16-only entries.
     public static func recommendedCatalogIDs(for hardware: DetectedHardware?) -> [String] {
         guard let hardware else { return modernTopRecommendationIDs }
         switch hardware.tier {
@@ -607,7 +629,11 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 quality27: "optimized-quality-fp16"
             )
         case .modernApple, .unknown:
-            return recommendationIDs(
+            let tinyIDs = ["qwen35-4b-optimized-speed", "qwen35-4b-optimized-quality"]
+            if hardware.unifiedMemoryGiB < 16 {
+                return tinyIDs
+            }
+            var ids = recommendationIDs(
                 memoryGiB: hardware.unifiedMemoryGiB,
                 small: "qwen35-9b-optimized-speed",
                 speed27: "optimized-speed",
@@ -615,6 +641,8 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 balance35: "qwen36-35b-a3b-optimized-balance",
                 quality27: "optimized-quality"
             )
+            ids.append(contentsOf: tinyIDs)
+            return ids
         }
     }
 
