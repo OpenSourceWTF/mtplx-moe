@@ -497,18 +497,9 @@ def test_load_admits_mtp_for_q4_control_lane_up_to_model_load(
         runtime_reserve_bytes=0,
     )
 
-    class _ReachedModelLoad(Exception):
-        pass
-
-    def sentinel_model_load(*_args, **_kwargs):
-        raise _ReachedModelLoad
-
-    monkeypatch.setattr(
-        "mtplx.resident_loader.construct_resident_model",
-        sentinel_model_load,
-    )
-
-    with pytest.raises(_ReachedModelLoad):
+    # Past the support gate, the load must fail on the MISSING ARTIFACTS
+    # requirement (the next validation), not on "not supported".
+    with pytest.raises(RuntimeError, match="omits its trained MTP layer"):
         load(
             root,
             mtp=True,
