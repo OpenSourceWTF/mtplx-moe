@@ -315,3 +315,25 @@ kernel exonerated twice, optimization parity complete, TPS anchored at 96
 (3.39/3.00) and 80 (2.74/2.60) — q4 serving is 13-16x under the
 oq2e-requant champion at comparable envelopes; the 2-bit program is the only
 serveable path on this box.
+
+## q4-OPTIMAL found (2026-07-21, one window, 3 ratio arms x AR/K1/K2/K3)
+
+Same ~80 GiB expert budget, three arrangements (census islands + frequency
+cache), full lever stack (proj-quant q4, headers-only, deferred+pin, 8MiB
+chunks, cadence, scope-all):
+
+| arm | AR | K1 | K2 | K3 | hit |
+|---|---|---|---|---|---|
+| island-heavy 40+4GiB | 3.90 | 3.92 | 3.17 | 2.58 | .14-.17 |
+| balanced 28+26GiB | 5.02 | 5.18 | 4.61 | 3.73 | .33-.41 |
+| **cache-heavy 12+57GiB** | 5.54 | **6.29** | 5.63 | 4.67 | .41-.51 |
+
+VERDICTS: (1) On a bank that doesn't fit, CACHE BEATS ISLANDS per byte
+(dynamic frequency adaptation > static census pinning) — inverts the q2-era
+C5 conclusion, which held only because that bank nearly fit. (2) K1 > AR in
+every arm; K2+ monotonically worse (verify batches amplify misses faster
+than acceptance pays — reads grow 1.1->1.5 TiB/cell with depth). Best q4
+operating point: cache-heavy K1 = 6.29 tok/s, above the 5-6.4 historical
+band. Extrapolation: zero-island max-cache might add ~5%; diminishing.
+FINAL ANCHOR: q4-optimal 6.29 vs oq2e-requant champion 42.18 = 6.7x — the
+2-bit program's justification at q4's own best configuration.
