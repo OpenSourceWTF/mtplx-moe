@@ -677,15 +677,15 @@ class DenseIslandSwitchGLU(nn.Module):
 
         from mtplx.hy3_expert_wave_m4 import (
             HY3_M4_BATCH,
-            HY3_M4_HIDDEN_SIZE,
             HY3_M4_ROWS,
             HY3_M4_TOP_K,
             Hy3M4ExpertWaveIneligible,
             hy3_q2_m4_expert_wave,
         )
 
+        spec = self.runtime.spec
         shape = tuple(int(dim) for dim in x.shape)
-        if shape != (HY3_M4_BATCH, HY3_M4_ROWS, HY3_M4_HIDDEN_SIZE):
+        if shape != (HY3_M4_BATCH, HY3_M4_ROWS, spec.hidden_size):
             return None
         if tuple(int(dim) for dim in indices.shape) != (
             HY3_M4_BATCH,
@@ -700,8 +700,12 @@ class DenseIslandSwitchGLU(nn.Module):
                 indices.astype(mx.int32),
                 scores,
                 self._bank.arrays,
-                validated_slot_bounds=(0, self.runtime.spec.expert_count - 1),
+                validated_slot_bounds=(0, spec.expert_count - 1),
                 combine_mode="bf16",
+                hidden_size=spec.hidden_size,
+                intermediate_size=spec.expert_hidden_size,
+                group_size=self.group_size,
+                bits=self.bits,
             )
         except Hy3M4ExpertWaveIneligible:
             return None

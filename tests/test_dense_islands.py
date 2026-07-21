@@ -617,8 +617,8 @@ def test_island_wave_call_matches_external_combine(mlx) -> None:
     mx.eval(*arrays.values())
 
     spec = SimpleNamespace(
-        top_k=top_k, hidden_size=hidden, quant_group_size=group,
-        quant_bits=2, expert_count=capacity,
+        top_k=top_k, hidden_size=hidden, expert_hidden_size=expert_hidden,
+        quant_group_size=group, quant_bits=2, expert_count=capacity,
     )
     switch = DenseIslandSwitchGLU.__new__(DenseIslandSwitchGLU)
     switch.runtime = SimpleNamespace(spec=spec)
