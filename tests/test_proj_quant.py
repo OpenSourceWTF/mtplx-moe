@@ -707,3 +707,47 @@ def _resolve(model, path: str):
     for part in path.split("."):
         module = module[int(part)] if part.isdigit() else getattr(module, part)
     return module
+
+
+def test_requant_plan_discount_halves_covered_u32_weights_only() -> None:
+    from types import SimpleNamespace
+
+    from mtplx.expert_runtime import proj_requant_plan_discount
+
+    tensors = (
+        SimpleNamespace(  # covered q8 packed weight -> halves
+            tensor="model.layers.1.self_attn.q_proj.weight",
+            dtype="U32",
+            length=1_048_576,
+        ),
+        SimpleNamespace(  # scales keep their bytes (same group count)
+            tensor="model.layers.1.self_attn.q_proj.scales",
+            dtype="BF16",
+            length=32_768,
+        ),
+        SimpleNamespace(  # shared_mlp covered too
+            tensor="model.layers.1.mlp.shared_mlp.gate_proj.weight",
+            dtype="U32",
+            length=524_288,
+        ),
+        SimpleNamespace(  # router stays exact
+            tensor="model.layers.1.mlp.router.gate.weight",
+            dtype="BF16",
+            length=1_048_576,
+        ),
+        SimpleNamespace(  # lm_head not covered
+            tensor="lm_head.weight",
+            dtype="U32",
+            length=1_048_576,
+        ),
+        SimpleNamespace(  # BF16 residents untouched by requant
+            tensor="model.layers.2.self_attn.q_proj.weight",
+            dtype="BF16",
+            length=1_048_576,
+        ),
+    )
+    manifest = SimpleNamespace(resident_tensors=tensors)
+    assert proj_requant_plan_discount(manifest, None) == 0
+    assert proj_requant_plan_discount(manifest, "q4") == (
+        1_048_576 // 2 + 524_288 // 2
+    )

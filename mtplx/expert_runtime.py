@@ -1492,6 +1492,32 @@ def proj_quant_plan_discount(manifest: Any, proj_quant: str | None) -> int:
     return discount
 
 
+def proj_requant_plan_discount(manifest: Any, proj_requant: str | None) -> int:
+    """Bytes the q8->q4 resident requant removes from the fixed side.
+
+    Scope matches the loader (``proj_quant_covers`` over ``*_proj`` weights).
+    Only the packed U32 weight shrinks (q8 packs 4 values/u32, q4 packs 8 →
+    exactly half the bytes); scales/biases keep their group count at gs64 and
+    are unchanged. Non-quantized (BF16) residents are ignored — the requant
+    pass only converts already-quantized modules.
+    """
+
+    if proj_requant != "q4":
+        return 0
+    discount = 0
+    for tensor in manifest.resident_tensors:
+        if tensor.dtype.upper() != "U32":
+            continue
+        name = tensor.tensor
+        if name.endswith(".weight"):
+            name = name[: -len(".weight")]
+        else:
+            continue
+        if proj_quant_covers(name):
+            discount += tensor.length // 2
+    return discount
+
+
 def reconcile_mlx_memory_cap(
     plan: ExpertMemoryPlan,
     *,
@@ -1904,16 +1930,13 @@ class ExpertStreamingRuntime:
                 artifact_root,
                 verify_sidecar_hash=config.verify_sidecar_hash_at_open,
             )
-        # proj_requant is intentionally NOT discounted here: q8 -> q4 requant
-        # only SHRINKS resident bytes vs this manifest-derived plan, so leaving
-        # it out keeps the plan conservative (less wired than planned, never
-        # more) — the safe direction. No discount function by design.
         plan = config.memory_plan(
             model_spec,
             additional_resident_bytes=additional_resident_bytes,
             resident_discount_bytes=proj_quant_plan_discount(
                 manifest, config.proj_quant
-            ),
+            )
+            + proj_requant_plan_discount(manifest, config.proj_requant),
         )
         if not plan.fits_fixed:
             raise ExpertStreamingConfigurationError(
