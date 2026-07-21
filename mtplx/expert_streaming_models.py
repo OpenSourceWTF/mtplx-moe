@@ -399,7 +399,11 @@ HY3_EXPERT_OQ2E = ExpertStreamingModelSpec(
     source_revision="716aa7241bd6d95896be4ebfc761162a9c4d49ef",
     quant_model="mlx-community/Hy3-oQ2e",
     quant_revision="1979c306076e00eb40670335c9cb54b357824e29",
-    total_tensor_bytes=89_871_151_524,
+    # True header-inventory sum. The published index declares 89_871_151_524,
+    # overstating by 345_252 bytes (publisher metadata bug); the local index's
+    # total_size is corrected to this value (original kept alongside as
+    # model.safetensors.index.json.orig-published).
+    total_tensor_bytes=89_870_806_272,
     total_layers=80,
     routed_layer_start=1,
     routed_layer_count=79,
