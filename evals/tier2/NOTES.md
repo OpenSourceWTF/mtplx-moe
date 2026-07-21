@@ -221,3 +221,15 @@ and it is ALU-bound; surrounding-op work does not move it. K2's persistent
 single-divergence signature reproduced in both arms (acc/verify 1.637
 identical). Window itself ran ~3% faster than last night's (drift confirmed);
 paired arms agreed internally.
+
+## oQ2e per-component roofline (2026-07-21, MTPLX_ROOFLINE_PROFILE, K2 window)
+
+Ceiling 502 GB/s measured. attention 84.4 MB/call @313 GB/s (62%) = 21.6
+ms/tok DOMINANT; moe batch-1 gather 192 GB/s (38%, occupancy); router 5.5
+ms/tok @5% ceiling (occupancy — future lever); shared 469 (93%, saturated);
+32-assign wave 463 (92%, saturated). T0a: MoE inefficiency is batch=1-ONLY
+(192 vs 463 GB/s at 32 assignments). Attribution: q8 ATTENTION owns the
+4 tps deficit vs the q4-attention champion (2x bytes/call on the largest
+component); proj-requant q8->q4 over proj_quant_covers scope is aimed
+correctly — expected ~9-10 ms/tok raw before overlap. Instrumented tok/s
+diagnostic-only.
