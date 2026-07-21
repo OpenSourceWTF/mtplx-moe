@@ -306,6 +306,15 @@ class ExpertMemoryPlan:
         return self.fixed_bytes + self.persistent_cache_bytes
 
 
+# Measured 2026-07-16: 511-step decode route trace (issue #63 heatmap), layers
+# ranked by ascending top-147 expert coverage. Routing is a property of the
+# shared bf16 router weights (tencent/Hy3@716aa724), not the expert codec, so
+# every hy3 bank derived from that revision shares this order.
+_HY3_ROUTED_PIN_ORDER = (
+    1, 4, 5, 13, 2, 3, 12, 18, 14, 15, 11, 10, 16, 17, 22, 28, 24, 26, 6, 25, 66, 29, 71, 27, 31, 19, 7, 69, 67, 23, 33, 32, 74, 9, 8, 50, 73, 79, 65, 72, 75, 70, 20, 30, 57, 21, 60, 64, 35, 51, 49, 68, 48, 59, 61, 77, 54, 38, 47, 52, 78, 53, 45, 62, 34, 58, 76, 63, 46, 55, 56, 44, 36, 37, 41, 43, 39, 40, 42,
+)
+
+
 HY3_Q4 = ExpertStreamingModelSpec(
     key="hy3-q4",
     display_name="Tencent Hy3 affine Q4",
@@ -357,6 +366,9 @@ HY3_EXPERT_ONLY_Q4 = ExpertStreamingModelSpec(
     kv_bytes_per_token=327_680,
     mtp_layer_index=80,
     mtp_included=False,
+    # 2026-07-21: shared pin order so --island-layer-count resolves for the
+    # q4 anchor benchmarks (see _HY3_ROUTED_PIN_ORDER rationale).
+    island_pin_order=_HY3_ROUTED_PIN_ORDER,
 )
 
 
@@ -384,11 +396,7 @@ HY3_EXPERT_Q2 = ExpertStreamingModelSpec(
     kv_bytes_per_token=327_680,
     mtp_layer_index=80,
     mtp_included=False,
-    # Measured 2026-07-16: 511-step decode route trace (issue #63 heatmap),
-    # ranked by ascending top-147 expert coverage per layer.
-    island_pin_order=(
-        1, 4, 5, 13, 2, 3, 12, 18, 14, 15, 11, 10, 16, 17, 22, 28, 24, 26, 6, 25, 66, 29, 71, 27, 31, 19, 7, 69, 67, 23, 33, 32, 74, 9, 8, 50, 73, 79, 65, 72, 75, 70, 20, 30, 57, 21, 60, 64, 35, 51, 49, 68, 48, 59, 61, 77, 54, 38, 47, 52, 78, 53, 45, 62, 34, 58, 76, 63, 46, 55, 56, 44, 36, 37, 41, 43, 39, 40, 42,
-    )
+    island_pin_order=_HY3_ROUTED_PIN_ORDER,
 )
 
 
@@ -424,7 +432,7 @@ HY3_EXPERT_OQ2E = ExpertStreamingModelSpec(
     # shared bf16 router weights, not of the expert record codec. Residents here
     # are q8 rather than bf16, which could perturb the hidden states feeding the
     # router; treat this order as a starting point, not re-measured truth.
-    island_pin_order=HY3_EXPERT_Q2.island_pin_order,
+    island_pin_order=_HY3_ROUTED_PIN_ORDER,
 )
 
 
