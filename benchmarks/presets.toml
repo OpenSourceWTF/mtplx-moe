@@ -299,25 +299,23 @@ MTPLX_SUSTAINED_PREFILL = "1"
 MTPLX_HY3_SUBMIT_CADENCE = "8"
 
 [preset.hy3-oq2e-rq4-88]
-description = "oQ2e + proj-requant q4 at the 88 GiB envelope: islands 78 (1 streamed). Sweep family 48-96/8; counts sized from the measured pre-flight overhead (20.64 GiB fixed w/ requant credit, 0.949 GiB/island)."
+description = "oQ2e + proj-requant q4 at the 88 GiB envelope: islands 79 (fully resident — vestigial cache shrunk to wire the 79th island). Sweep family 48-96/8; counts sized from the measured pre-flight overhead (20.64 GiB fixed w/ requant credit, 0.949 GiB/island)."
 models = ["hy3-oq2e"]
 contexts = "1024"
 output-tokens = 1024
 hy3-depths = "3"
 memory-limit = "95GiB"
 runtime-reserve = "7GiB"
-expert-cache-limit = "2GiB"
+expert-cache-limit = "1GiB"
 max-live-kv-tokens = 4096
 cache-policy = "frequency"
 cache-scope = "layer"
 slot-layout = "component-banks"
-island-layer-count = 78
+island-layer-count = 79
 hy3-router-kernel = "mpp-fp32-splitk-r1-fused-r2"
 verify-strategy = "batched"
 expert-integrity = "headers-only"
 proj-requant = "q4"
-split-route-release = "deferred"
-deferred-pin-release = true
 
 [preset.hy3-oq2e-rq4-88.env]
 MTPLX_SUSTAINED_PREFILL = "1"
