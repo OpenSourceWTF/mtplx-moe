@@ -674,18 +674,29 @@ def _requests_from_args(args: argparse.Namespace) -> list[dict[str, Any]]:
         raise BenchmarkConfigurationError("--model values must not repeat")
     requests: list[dict[str, Any]] = []
     for model in selected:
+        spec_entry = MODEL_SPECS[model]
         if model == "hy3-q2":
             model_root = args.hy3_q2_model_root
             manifest = args.hy3_q2_manifest
             mtp_artifacts = args.hy3_q2_mtp_artifacts
             prompt_tail = args.hy3_q2_prompt_tail
             depths = args.hy3_depths
-        else:
+        elif model == "glm52-q2":
             model_root = args.glm52_q2_model_root
             manifest = args.glm52_q2_manifest
             mtp_artifacts = args.glm52_q2_mtp_artifacts
             prompt_tail = args.glm52_q2_prompt_tail
             depths = args.glm52_depths
+        else:
+            model_root = spec_entry["model_root"]
+            manifest = None
+            mtp_artifacts = spec_entry["mtp_artifacts"]
+            prompt_tail = spec_entry["prompt_tail"]
+            depths = (
+                args.hy3_depths
+                if spec_entry["model_key"].startswith("hy3")
+                else args.glm52_depths
+            )
         model_root = _expand(model_root)
         request = {
             "model": model,
