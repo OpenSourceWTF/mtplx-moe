@@ -363,3 +363,38 @@ full task-eval resolution: HumanEval −0.6pp (p=1.0), wiki +1.6%, K2 +8.6%,
 AR +26.3%, −3.5 GiB wired. Artifacts:
 `humaneval_oq2e_full164_{q8,rq4}.json` (+ per-arm proxy logs
 `full164_{q8,rq4}_proxy.log`).
+
+## R1 (per-layer frequency allocation) KILLED at the CPU gate (2026-07-21): the 8x table was leakage
+
+David picked R1 from the q4->10 brainstorm; its zero-GPU kill-test ran the
+route-analysis script's issue-#9 HELD-OUT gate (chronological train/eval
+split) on the same trace behind the famous 8x claim
+(`hy3-q4-route-trace-1k-64.json`, 8058 slots ~= today's 80 GiB budget):
+
+| policy (held-out, split 0.5) | hit | miss/tok |
+|---|---|---|
+| uniform_per_layer_lru | .8881 | 70.72 |
+| **trained_dynamic_quota_lru** | .8880 | **70.78** |
+| global_pool_lru | .8917 | 68.47 |
+| uniform_per_layer_belady | .9189 | 51.25 |
+
+The deployable trained allocator captures ZERO (identical to uniform; same
+at split 0.75: 88.00 vs 87.88). The rebalancer moved 15-18 slots but its own
+TRAINING curves offered only +35-47 hits of ~18-27k (~0.2%) — no signal, not
+insufficient data. Root cause measured directly on the prefill phase (8184
+samples/layer): per-layer top-102 coverage median .862 (concentrated — 53.1%
+if uniform) but CROSS-LAYER stdev just .0274 — every layer concentrates the
+same amount, so per-layer slot counts have nothing to trade. The legacy
+`oracle_decode_frequency_allocation` 8.5 miss/tok (the "8x, beats Belady"
+headline in docs/MMAP_VS_PREAD_FINDINGS.md and the mmap memory) is a pure
+evaluation-oracle artifact: on a 64-step trace it just pins whatever appears.
+
+Belady ceiling RECOMPUTED (handoff ask): perfect eviction buys 20-28% fewer
+misses than LRU at this budget (~25-35 ms/tok at 1.5 ms/miss) — the hard cap
+on ALL cache-policy work, unreachable in practice; global pooling adds ~3%.
+Receipt: `r1_alloc_killtest_heldout.json`. Consequence for the 10-tps
+program: miss COUNT is near its practical floor at this budget — the live
+levers are hiding miss latency (R3 overlap), cheapening service (R2
+page-cache L2, R4 read_chunk), or batch amortization (R5). Also cautions
+GLM W1: the hy3 half of its evidence base is now dead; GLM's own
+frequency-vs-uniform A/B remains unmeasured.
