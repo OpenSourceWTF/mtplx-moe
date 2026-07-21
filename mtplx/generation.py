@@ -23,10 +23,12 @@ import mlx.core as mx
 import numpy as np
 
 from .a3b_compiled_target_prefix import (
+    ensure_a3b_whole_moe_request_preflight as _ensure_a3b_whole_moe_request_preflight,
     install_a3b_k1_target_prefix_route,
     validate_a3b_k1_device_draft_request,
     validate_a3b_k1_target_prefix_sampler,
 )
+from .a3b_whole_moe import validate_a3b_whole_moe_request
 from .adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from .attention_context import attention_phase
 from .cache_state import (
@@ -86,6 +88,40 @@ _PREFILL_CHUNK_SIZE_OVERRIDE: ContextVar[int | None] = ContextVar(
     "mtplx_prefill_chunk_size_override",
     default=None,
 )
+
+
+def reject_non_k1_a3b_whole_moe_request(rt: MTPLXRuntime, *, entrypoint: str) -> None:
+    """Reject unsupported generation modes once, before they construct a prompt."""
+
+    if bool(getattr(rt, "a3b_whole_moe_installed", False)):
+        raise RuntimeError(
+            f"installed A3B whole-MoE is owned by exact K1 generate_mtpk, not {entrypoint}"
+        )
+
+
+def ensure_a3b_whole_moe_request_preflight(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    max_tokens: int,
+    base_hidden_variant: str,
+    prefill_layout: str | None = None,
+) -> dict[str, Any]:
+    """Prime the installed exact request geometry before prompt generation."""
+
+    if not bool(getattr(rt, "a3b_whole_moe_installed", False)):
+        return {"status": "disabled"}
+    os.environ["MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS"] = str(len(prompt_ids))
+    layout = _sustained_prefill_layout() if prefill_layout is None else prefill_layout
+    return _ensure_a3b_whole_moe_request_preflight(
+        rt,
+        rt.a3b_compiled_target_prefix_factory,
+        prompt_tokens=len(prompt_ids),
+        max_tokens=max_tokens,
+        hidden_variant=base_hidden_variant,
+        cache_factory=lambda: _make_target_prefill_cache(rt),
+        prefill_layout=layout,
+    )
 
 
 def _resolve_runtime_mtp_hidden_variant(
@@ -1903,6 +1939,7 @@ def _prefill_restored_prompt_suffix(
             restored.mtp_history_cache,
             hidden_states,
             token_ids,
+            phase="prefill",
             mtp_hidden_variant=mtp_hidden_variant,
             force_eval=True,
             input_embeddings=_history_window_embeddings(token_ids, window_start),
@@ -3306,6 +3343,7 @@ def restore_or_prefill_prompt_state(
                     mtp_history_cache,
                     history_hidden,
                     history_token_ids,
+                    phase="prefill",
                     mtp_hidden_variant=mtp_hidden_variant,
                     position_offset=(
                         mtp_history_position_base
@@ -3971,6 +4009,7 @@ def _prefill_committed_mtp_history_streaming(
                     mtp_history_cache,
                     sliced_hidden,
                     sliced_token_ids,
+                    phase="prefill",
                     mtp_hidden_variant=mtp_hidden_variant,
                     position_offset=(
                         token_start_index + slice_start
@@ -4149,6 +4188,7 @@ def _append_mtp_history(
     hidden_states: mx.array,
     token_ids: list[int],
     *,
+    phase: Literal["prefill", "ar_decode"],
     mtp_hidden_variant: str,
     position_offset: int | None = None,
     force_eval: bool = False,
@@ -4162,14 +4202,15 @@ def _append_mtp_history(
         raise ValueError("input_embeddings length must match token_ids length")
     _runtime_count(rt, "mtp_history_append_calls")
     started = time.perf_counter()
-    hidden = rt.update_mtp_cache(
-        hidden_states,
-        mx.array([token_ids]),
-        mtp_cache=mtp_cache,
-        mtp_hidden_variant=mtp_hidden_variant,
-        position_offset=position_offset,
-        input_embeddings=input_embeddings,
-    )
+    with attention_phase(phase):
+        hidden = rt.update_mtp_cache(
+            hidden_states,
+            mx.array([token_ids]),
+            mtp_cache=mtp_cache,
+            mtp_hidden_variant=mtp_hidden_variant,
+            position_offset=position_offset,
+            input_embeddings=input_embeddings,
+        )
     if _env_truthy("MTPLX_LAZY_MTP_HISTORY_APPEND") and not force_eval:
         return time.perf_counter() - started
     _eval(hidden)
@@ -4191,6 +4232,7 @@ def generate_ar(
     repetition_stop: bool = False,
     loop_guard: bool = False,
 ) -> GenerationOutput:
+    reject_non_k1_a3b_whole_moe_request(rt, entrypoint="generate_ar")
     if getattr(rt, "backend_id", None) == "gemma4_assistant":
         from .backends.gemma4_assistant import generate_gemma4_ar
 
@@ -4513,6 +4555,7 @@ def generate_mtp1(
     draft_margin_threshold: float | None = None,
     repetition_stop: bool = False,
 ) -> GenerationOutput:
+    reject_non_k1_a3b_whole_moe_request(rt, entrypoint="generate_mtp1")
     if not rt.mtp_enabled:
         raise RuntimeError("generate_mtp1 requires an MTP-enabled runtime")
     if verify_strategy not in {
@@ -5336,6 +5379,27 @@ def generate_mtpk(
     _loop_guard_config = loop_guard_config_from_env(
         bool(loop_guard), tokenizer=getattr(rt, "tokenizer", None)
     )
+    if bool(getattr(rt, "a3b_whole_moe_installed", False)):
+        os.environ["MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS"] = str(len(prompt_ids))
+        whole_moe_prefill_layout = _sustained_prefill_layout()
+        validate_a3b_whole_moe_request(
+            verify_strategy=verify_strategy,
+            requested_speculative_depth=requested_speculative_depth,
+            speculative_depth=speculative_depth,
+            verify_core=verify_core,
+            draft_core=draft_core,
+            compiled_target_prefix=exact_a3b_target_prefix,
+            session_bank_present=session_bank is not None,
+            vision_splice_present=vision_splice is not None,
+            prefill_layout=whole_moe_prefill_layout,
+        )
+        ensure_a3b_whole_moe_request_preflight(
+            rt,
+            prompt_ids,
+            max_tokens=max_tokens,
+            base_hidden_variant=base_hidden_variant,
+            prefill_layout=whole_moe_prefill_layout,
+        )
     if target_prefix_verify:
         if exact_a3b_target_prefix:
             validate_a3b_k1_target_prefix_sampler(sampler)
@@ -5875,6 +5939,7 @@ def generate_mtpk(
             mtp_cache,
             hidden_states,
             token_ids,
+            phase="ar_decode",
             mtp_hidden_variant=mtp_hidden_variant,
             position_offset=mtp_position_offset_for_cache(mtp_cache),
             force_eval=force_eval,
@@ -6196,6 +6261,9 @@ def generate_mtpk(
             verify_core=verify_core_backend,
             hidden_variant=base_hidden_variant,
             state_rebase_every=state_rebase_every,
+            require_request_preflight=bool(
+                getattr(rt, "a3b_whole_moe_installed", False)
+            ),
         )
 
     step = 0

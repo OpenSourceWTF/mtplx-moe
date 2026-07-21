@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import weakref
 from dataclasses import dataclass
@@ -44,6 +46,7 @@ _PRIMARY_STATE_START = 2
 _FINAL_STATE_START = _PRIMARY_STATE_START + _STATE_LEAVES
 _M1_FINAL_STATE_START = 2
 _MAX_REQUEST_CONTEXT = 12_288
+_FULL_ATTENTION_CACHE_STEP = 256
 _SHARED_M2_STEPS: dict[
     tuple[int, str],
     tuple[Callable[..., Any], dict[str, Any], weakref.ReferenceType[Any]],
@@ -189,6 +192,9 @@ def _make_a3b_k1_target_prefix_m2_step(
 
     def step(input_ids, *state_in):
         shadow = host["shadow"]
+        runtime = host["runtime_ref"]()
+        if runtime is None:
+            _fail("compiled A3B target-prefix runtime was released")
         position = 0
         for index, kind, leaves in spec:
             entry = shadow[index]
@@ -204,9 +210,7 @@ def _make_a3b_k1_target_prefix_m2_step(
                 entry.cache[1] = state_in[position + 1]
             position += leaves
         with attention_phase("decode_verify"):
-            logits, hidden, captures = host[
-                "runtime"
-            ]._forward_ar_capture_a3b_postconv(
+            logits, hidden, captures = runtime._forward_ar_capture_a3b_postconv(
                 input_ids,
                 cache=shadow,
                 hidden_variant=host["hidden_variant"],
@@ -243,6 +247,9 @@ def _make_a3b_k1_target_prefix_m1_step(
 
     def step(input_ids, *state_in):
         shadow = host["shadow"]
+        runtime = host["runtime_ref"]()
+        if runtime is None:
+            _fail("compiled A3B target-prefix runtime was released")
         position = 0
         for index, kind, leaves in spec:
             entry = shadow[index]
@@ -258,9 +265,7 @@ def _make_a3b_k1_target_prefix_m1_step(
                 entry.cache[1] = state_in[position + 1]
             position += leaves
         with attention_phase("decode_verify"):
-            logits, hidden, _captures = host[
-                "runtime"
-            ]._forward_ar_capture_a3b_postconv(
+            logits, hidden, _captures = runtime._forward_ar_capture_a3b_postconv(
                 input_ids,
                 cache=shadow,
                 hidden_variant=host["hidden_variant"],
@@ -290,7 +295,7 @@ def _shared_m2_step(
         _SHARED_M2_STEPS.pop(key, None)
     host = {
         "shadow": shadow,
-        "runtime": runtime,
+        "runtime_ref": weakref.ref(runtime),
         "hidden_variant": hidden_variant,
         "postconv_implementations": postconv_implementations,
     }
@@ -315,7 +320,7 @@ def _shared_m1_step(
         _SHARED_M1_STEPS.pop(key, None)
     host = {
         "shadow": shadow,
-        "runtime": runtime,
+        "runtime_ref": weakref.ref(runtime),
         "hidden_variant": hidden_variant,
         "postconv_implementations": postconv_implementations,
     }
@@ -336,6 +341,8 @@ class A3BK1TargetPrefixRoute:
     request_max_tokens: int
     growth_reserve_tokens: int
     prompt_tokens: int
+    request_preflight_key: str | None = None
+    request_preflight_status: str = "not_required"
 
     def verify_m2(self, input_ids):
         return self._forward_m2(input_ids)
@@ -406,6 +413,8 @@ class A3BK1TargetPrefixRoute:
             "device_draft_input": True,
             "compiled_entry_count": 2,
             "compiled_keys": ["m2:verify:b0", "m1:repair:b0"],
+            "request_preflight_key": self.request_preflight_key,
+            "request_preflight_status": self.request_preflight_status,
             "permanent_eager": False,
         }
 
@@ -443,6 +452,37 @@ def _construct_a3b_target_cache(
     return _construct_a3b_target_shadow(cache)
 
 
+def _array_signature(value: Any) -> tuple[tuple[int, ...], str]:
+    return (
+        tuple(int(dimension) for dimension in value.shape),
+        str(value.dtype),
+    )
+
+
+def _route_state_signature(
+    route: A3BK1TargetPrefixRoute,
+) -> tuple[tuple[tuple[int, ...], str], ...]:
+    return tuple(
+        _array_signature(container[slot]) for container, slot in route.state_slots
+    )
+
+
+def _route_compile_specialization_key(
+    route: A3BK1TargetPrefixRoute,
+    *,
+    hidden_variant: str | None,
+) -> str:
+    payload = {
+        "hidden_variant": str(hidden_variant or ""),
+        "m2_input": ((1, 2), "int32"),
+        "m1_input": ((1, 1), "int32"),
+        "state_spec": _STATE_SPEC,
+        "m2_state": _route_state_signature(route),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def install_a3b_k1_target_prefix_route(
     runtime: Any,
     cache: list[Any],
@@ -456,6 +496,7 @@ def install_a3b_k1_target_prefix_route(
     verify_core: str,
     hidden_variant: str | None,
     state_rebase_every: int,
+    require_request_preflight: bool = False,
 ) -> A3BK1TargetPrefixRoute:
     """Validate external request facts and construct the fixed route."""
     if (
@@ -491,7 +532,7 @@ def install_a3b_k1_target_prefix_route(
         if kind == VERIFY_SPEC_KIND_FULL_ATTN:
             rollback_slots.append(entry.rollback_state)
 
-    return A3BK1TargetPrefixRoute(
+    route = A3BK1TargetPrefixRoute(
         cache=cache,
         compiled_m2=_shared_m2_step(
             runtime,
@@ -511,3 +552,235 @@ def install_a3b_k1_target_prefix_route(
         growth_reserve_tokens=reserve,
         prompt_tokens=int(prompt_tokens),
     )
+    if require_request_preflight:
+        specialization_key = _route_compile_specialization_key(
+            route,
+            hidden_variant=hidden_variant,
+        )
+        certificates = runtime._a3b_whole_moe_request_preflights
+        if specialization_key not in certificates:
+            _fail(
+                "compiled A3B target-prefix request geometry was not preflighted "
+                "before generation"
+            )
+        route.request_preflight_key = specialization_key
+        route.request_preflight_status = "matched"
+    return route
+
+
+def _request_cache_capacity(*, prompt_tokens: int, max_tokens: int) -> int:
+    needed = int(prompt_tokens) + int(max_tokens) + 2
+    if int(prompt_tokens) <= 0 or int(max_tokens) <= 0:
+        _fail("compiled A3B target-prefix preflight requires positive request geometry")
+    if needed - 2 > _MAX_REQUEST_CONTEXT:
+        _fail("compiled A3B target-prefix request exceeds its installed context ceiling")
+    return (
+        (needed + _FULL_ATTENTION_CACHE_STEP - 1) // _FULL_ATTENTION_CACHE_STEP
+    ) * _FULL_ATTENTION_CACHE_STEP
+
+
+def preflight_a3b_k1_target_prefix_full_graph(
+    runtime: Any,
+    factory: A3BCompiledTargetPrefixFactory,
+    *,
+    cache: list[Any],
+    prompt_tokens: int,
+    max_tokens: int,
+    hidden_variant: str | None,
+) -> dict[str, Any]:
+    """Compile exact request-shaped target M2/M1 graphs over disposable state."""
+
+    route = install_a3b_k1_target_prefix_route(
+        runtime,
+        cache,
+        factory=factory,
+        max_tokens=max_tokens,
+        prompt_tokens=prompt_tokens,
+        verify_strategy="target_prefix",
+        speculative_depth=1,
+        requested_speculative_depth=1,
+        verify_core="stock",
+        hidden_variant=hidden_variant,
+        state_rebase_every=0,
+        require_request_preflight=False,
+    )
+    m2_input = mx.array([[0, 1]])
+    m2_state = tuple(
+        container[slot] for container, slot in route.state_slots
+    )
+    m2_outputs = tuple(route.compiled_m2(m2_input, *m2_state))
+    if len(m2_outputs) != 182:
+        _fail("compiled A3B target-prefix M2 preflight returned invalid output ownership")
+    mx.eval(*m2_outputs)
+    primary_state = tuple(m2_outputs[_PRIMARY_STATE_START:_FINAL_STATE_START])
+    m1_input = mx.array([[0]])
+    m1_outputs = tuple(route.compiled_m1(m1_input, *primary_state))
+    if len(m1_outputs) != 92:
+        _fail("compiled A3B target-prefix M1 preflight returned invalid output ownership")
+    mx.eval(*m1_outputs)
+    m2_logits, m2_hidden = m2_outputs[:2]
+    m1_logits, m1_hidden = m1_outputs[:2]
+
+    if (
+        tuple(m2_hidden.shape) != (1, 2, 2048)
+        or tuple(m1_hidden.shape) != (1, 1, 2048)
+        or m2_hidden.dtype != mx.bfloat16
+        or m1_hidden.dtype != mx.bfloat16
+    ):
+        _fail("compiled A3B target-prefix full-graph preflight returned invalid hidden ownership")
+
+    key_shapes = {
+        tuple(int(dimension) for dimension in route.cache[index].cache[0].shape)
+        for index in _FULL_ATTENTION_INDICES
+    }
+    value_shapes = {
+        tuple(int(dimension) for dimension in route.cache[index].cache[1].shape)
+        for index in _FULL_ATTENTION_INDICES
+    }
+    expected_capacity = _request_cache_capacity(
+        prompt_tokens=prompt_tokens,
+        max_tokens=max_tokens,
+    )
+    expected_shape = (1, 2, expected_capacity, 256)
+    if key_shapes != {expected_shape} or value_shapes != {expected_shape}:
+        _fail("compiled A3B target-prefix preflight returned invalid cache geometry")
+    specialization_key = _route_compile_specialization_key(
+        route,
+        hidden_variant=hidden_variant,
+    )
+    return {
+        "canonical_key": specialization_key,
+        "full_attention_key_shape": list(expected_shape),
+        "full_attention_value_shape": list(expected_shape),
+        "hidden_variant": str(hidden_variant or ""),
+        "m2_input_signature": _array_signature(m2_input),
+        "m1_input_signature": _array_signature(m1_input),
+        "m2_state_signature": _route_state_signature(route),
+        "m1_primary_signature": tuple(
+            _array_signature(value) for value in primary_state
+        ),
+        "m2_logits_signature": _array_signature(m2_logits),
+        "m2_hidden_signature": _array_signature(m2_hidden),
+        "m1_logits_signature": _array_signature(m1_logits),
+        "m1_hidden_signature": _array_signature(m1_hidden),
+        "m2_final_state_signature": tuple(
+            _array_signature(value) for value in m2_outputs[_FINAL_STATE_START:]
+        ),
+        "m1_final_state_signature": tuple(
+            _array_signature(value) for value in m1_outputs[_M1_FINAL_STATE_START:]
+        ),
+        "m2_output_count": len(m2_outputs),
+        "m1_output_count": len(m1_outputs),
+        "lanes": {
+            "a3b_whole_moe_request_full_graph_m1": "ok",
+            "a3b_whole_moe_request_full_graph_m2": "ok",
+        },
+    }
+
+
+def _preflight_a3b_k1_target_prefix_request_geometry(
+    runtime: Any,
+    factory: A3BCompiledTargetPrefixFactory,
+    *,
+    prompt_tokens: int,
+    max_tokens: int,
+    hidden_variant: str | None,
+    cache_factory: Callable[[], list[Any]],
+    prefill_layout: str,
+) -> dict[str, Any]:
+    """Build fixed-shape state without redundantly evaluating the full prompt."""
+
+    cache = cache_factory()
+    with attention_phase("prefill"):
+        prefill_logits, prefill_hidden = runtime.forward_ar(
+            mx.array([[0]]),
+            cache=cache,
+            return_hidden=True,
+            hidden_variant=hidden_variant,
+        )
+    mx.eval(prefill_logits, prefill_hidden)
+    for index in _FULL_ATTENTION_INDICES:
+        entry = cache[index]
+        entry.offset = int(prompt_tokens)
+    proof = preflight_a3b_k1_target_prefix_full_graph(
+        runtime,
+        factory,
+        cache=cache,
+        prompt_tokens=prompt_tokens,
+        max_tokens=max_tokens,
+        hidden_variant=hidden_variant,
+    )
+    proof["prefill_layout"] = str(prefill_layout)
+    return proof
+
+
+def ensure_a3b_whole_moe_request_preflight(
+    runtime: Any,
+    factory: A3BCompiledTargetPrefixFactory,
+    *,
+    prompt_tokens: int,
+    max_tokens: int,
+    hidden_variant: str | None,
+    cache_factory: Callable[[], list[Any]],
+    prefill_layout: str,
+) -> dict[str, Any]:
+    """Prime one compiled graph per exact cache shape before generation."""
+
+    capacity = _request_cache_capacity(
+        prompt_tokens=prompt_tokens,
+        max_tokens=max_tokens,
+    )
+    logical_key = (capacity, str(hidden_variant or ""), str(prefill_layout))
+    proofs = runtime._a3b_whole_moe_request_preflights
+    geometry_keys = runtime._a3b_whole_moe_request_geometry_keys
+    canonical_key = geometry_keys.get(logical_key)
+    proof = None if canonical_key is None else proofs.get(canonical_key)
+    if proof is None:
+        proof = _preflight_a3b_k1_target_prefix_request_geometry(
+            runtime,
+            factory,
+            prompt_tokens=prompt_tokens,
+            max_tokens=max_tokens,
+            hidden_variant=hidden_variant,
+            cache_factory=cache_factory,
+            prefill_layout=prefill_layout,
+        )
+        canonical_key = str(proof["canonical_key"])
+        proofs[canonical_key] = proof
+        geometry_keys[logical_key] = canonical_key
+    return {
+        **proof,
+        "status": "ok",
+        "prompt_tokens": int(prompt_tokens),
+        "max_tokens": int(max_tokens),
+        "growth_reserve_tokens": int(max_tokens) + 2,
+        "full_attention_layers": len(_FULL_ATTENTION_INDICES),
+        "m1_rows": 1,
+        "m2_rows": 2,
+    }
+
+
+def preflight_a3b_k1_target_prefix_load_graph(
+    runtime: Any,
+    factory: A3BCompiledTargetPrefixFactory,
+) -> dict[str, str]:
+    """Prove minimum full-graph compatibility before committing installation."""
+
+    proof = _preflight_a3b_k1_target_prefix_request_geometry(
+        runtime,
+        factory,
+        prompt_tokens=1,
+        max_tokens=2,
+        hidden_variant=None,
+        cache_factory=runtime.make_cache,
+        prefill_layout="load_probe",
+    )
+    lanes = proof["lanes"]
+    return {
+        "a3b_whole_moe_target_prefix_full_graph_m1": lanes[
+            "a3b_whole_moe_request_full_graph_m1"
+        ],
+        "a3b_whole_moe_target_prefix_full_graph_m2": lanes[
+            "a3b_whole_moe_request_full_graph_m2"
+        ],
+    }

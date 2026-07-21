@@ -76,6 +76,7 @@ def selfcheck_enabled() -> bool:
         or _env_on("MTPLX_QWEN_ROW_OWNED_ROUTER")
         or _env_on("MTPLX_QWEN_COMBINE_TAIL")
         or _env_on("MTPLX_FUSE_GDN_POST_CONV")
+        or _env_on("MTPLX_A3B_WHOLE_MOE_FUSION")
     )
 
 
