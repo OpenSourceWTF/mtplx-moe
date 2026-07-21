@@ -1,0 +1,237 @@
+{
+  "eval": "dequant round-trip / quant integrity (q4->q2 bit-exact)",
+  "recipe_tested": "shipped q4 record -> _convert_one_record (repo recorded q4_to_q2) -> compare to shipped q2 bytes, per component + whole record",
+  "source_identity": {
+    "recorded_source_manifest_sha256": "e7fcfd6c69486456af4261d908d95f8a84a391d6a273ff1cff02a15f73fac92d",
+    "actual_q4_manifest_sha256": "e7fcfd6c69486456af4261d908d95f8a84a391d6a273ff1cff02a15f73fac92d",
+    "q4_is_recorded_source": true,
+    "producer_git_commit": "d4209d237ac2b052040175efc4f0f20b12743e5e",
+    "producer_mlx_version": "0.31.2"
+  },
+  "n_cases": 7,
+  "metal_available": true,
+  "metal_all_bit_exact": true,
+  "cpu_all_bit_exact": false,
+  "finding": "Recipe reproduces the shipped q2 bank BIT-EXACTLY on the Metal backend it was produced on (all sampled records, all 9 components). CPU-only runs diverge deterministically due to backend FP rounding in mx.quantize/mx.dequantize (bf16 scales/biases still ~99.96% identical, ~19.5% of packed 2-bit weight bytes differ).",
+  "cases": [
+    {
+      "layer": 1,
+      "expert": 0,
+      "shipped_record_sha256": "4285e724a491d270b453dd6a4e1bd7ab1b29fadfd93c8043ffa079b611f9097c",
+      "metal_reproduced_sha256": "4285e724a491d270b453dd6a4e1bd7ab1b29fadfd93c8043ffa079b611f9097c",
+      "cpu_reproduced_sha256": "c948f64bc976ddc04f866ff1295a9caddb1579808269c8813220ba11cc19815c",
+      "metal_bit_exact": true,
+      "cpu_bit_exact": false,
+      "cpu_weight_bytes_differing": 922043,
+      "record_bytes": 5898240,
+      "cpu_q4_q2_diagnostics": [
+        {
+          "component": "gate_proj",
+          "cosine_q4_q2": 0.9043292748616699,
+          "normalized_error_q4_q2": 0.4403672870209161,
+          "finite": true
+        },
+        {
+          "component": "up_proj",
+          "cosine_q4_q2": 0.9043046353429394,
+          "normalized_error_q4_q2": 0.44022116794429145,
+          "finite": true
+        },
+        {
+          "component": "down_proj",
+          "cosine_q4_q2": 0.9216124713514778,
+          "normalized_error_q4_q2": 0.39547595957329146,
+          "finite": true
+        }
+      ]
+    },
+    {
+      "layer": 1,
+      "expert": 191,
+      "shipped_record_sha256": "1bbdc879edc7da31e653db93d086155602ed436866ff016c03d3cca4233ce110",
+      "metal_reproduced_sha256": "1bbdc879edc7da31e653db93d086155602ed436866ff016c03d3cca4233ce110",
+      "cpu_reproduced_sha256": "f9b86195bd663ba2a479b062a23d341d859fd7e5d9fb139776ec56e4ae63635f",
+      "metal_bit_exact": true,
+      "cpu_bit_exact": false,
+      "cpu_weight_bytes_differing": 952429,
+      "record_bytes": 5898240,
+      "cpu_q4_q2_diagnostics": [
+        {
+          "component": "gate_proj",
+          "cosine_q4_q2": 0.9067025214334156,
+          "normalized_error_q4_q2": 0.43444451849273663,
+          "finite": true
+        },
+        {
+          "component": "up_proj",
+          "cosine_q4_q2": 0.9065763079566943,
+          "normalized_error_q4_q2": 0.43476806802761747,
+          "finite": true
+        },
+        {
+          "component": "down_proj",
+          "cosine_q4_q2": 0.9208539652533644,
+          "normalized_error_q4_q2": 0.39738997098519624,
+          "finite": true
+        }
+      ]
+    },
+    {
+      "layer": 13,
+      "expert": 48,
+      "shipped_record_sha256": "c72738d02c477a5102a29a4f49b80b809d1690ca6792460f711a09c96dda60f8",
+      "metal_reproduced_sha256": "c72738d02c477a5102a29a4f49b80b809d1690ca6792460f711a09c96dda60f8",
+      "cpu_reproduced_sha256": "7ebe60431a98f67589403df5a6174a16647d02491a4dd9d7927afa300822e11f",
+      "metal_bit_exact": true,
+      "cpu_bit_exact": false,
+      "cpu_weight_bytes_differing": 1078826,
+      "record_bytes": 5898240,
+      "cpu_q4_q2_diagnostics": [
+        {
+          "component": "gate_proj",
+          "cosine_q4_q2": 0.918799687646408,
+          "normalized_error_q4_q2": 0.40222072407700554,
+          "finite": true
+        },
+        {
+          "component": "up_proj",
+          "cosine_q4_q2": 0.9189355763520771,
+          "normalized_error_q4_q2": 0.4018740692559658,
+          "finite": true
+        },
+        {
+          "component": "down_proj",
+          "cosine_q4_q2": 0.9187945216712241,
+          "normalized_error_q4_q2": 0.4023096732639131,
+          "finite": true
+        }
+      ]
+    },
+    {
+      "layer": 40,
+      "expert": 96,
+      "shipped_record_sha256": "4f685e3adf119e3a1931e936ae35c512ab1acf38453eb1d3e3e49a9868b62676",
+      "metal_reproduced_sha256": "4f685e3adf119e3a1931e936ae35c512ab1acf38453eb1d3e3e49a9868b62676",
+      "cpu_reproduced_sha256": "4fa6d04ff0f2fc37a80694f2ca0ac0f9ea5f0e76bb81f6bbfefa2bb88c2336d7",
+      "metal_bit_exact": true,
+      "cpu_bit_exact": false,
+      "cpu_weight_bytes_differing": 1082724,
+      "record_bytes": 5898240,
+      "cpu_q4_q2_diagnostics": [
+        {
+          "component": "gate_proj",
+          "cosine_q4_q2": 0.9189337539065503,
+          "normalized_error_q4_q2": 0.4020835246961081,
+          "finite": true
+        },
+        {
+          "component": "up_proj",
+          "cosine_q4_q2": 0.9188775515755291,
+          "normalized_error_q4_q2": 0.40235993621314886,
+          "finite": true
+        },
+        {
+          "component": "down_proj",
+          "cosine_q4_q2": 0.9188956395342943,
+          "normalized_error_q4_q2": 0.4024352424725869,
+          "finite": true
+        }
+      ]
+    },
+    {
+      "layer": 53,
+      "expert": 144,
+      "shipped_record_sha256": "641cf54cb89ef93cabb0a86193fff9d15d6ba9080e6082c12c2ea57786974334",
+      "metal_reproduced_sha256": "641cf54cb89ef93cabb0a86193fff9d15d6ba9080e6082c12c2ea57786974334",
+      "cpu_reproduced_sha256": "b5d3b71451233e60d142766a20c862381692752f91689ca20d00e6cef64a158a",
+      "metal_bit_exact": true,
+      "cpu_bit_exact": false,
+      "cpu_weight_bytes_differing": 1079662,
+      "record_bytes": 5898240,
+      "cpu_q4_q2_diagnostics": [
+        {
+          "component": "gate_proj",
+          "cosine_q4_q2": 0.9190008291509246,
+          "normalized_error_q4_q2": 0.4018830201128504,
+          "finite": true
+        },
+        {
+          "component": "up_proj",
+          "cosine_q4_q2": 0.918897394253863,
+          "normalized_error_q4_q2": 0.40235691761477566,
+          "finite": true
+        },
+        {
+          "component": "down_proj",
+          "cosine_q4_q2": 0.9185246680628769,
+          "normalized_error_q4_q2": 0.4033069770672653,
+          "finite": true
+        }
+      ]
+    },
+    {
+      "layer": 79,
+      "expert": 191,
+      "shipped_record_sha256": "c7c79335cb8216e7a3e2cc49ae70e62e7e173bd78dc2f471fdf33355cc0e82d4",
+      "metal_reproduced_sha256": "c7c79335cb8216e7a3e2cc49ae70e62e7e173bd78dc2f471fdf33355cc0e82d4",
+      "cpu_reproduced_sha256": "68466780bde4eda44b7e25e36e5f7d6b3d7101ba344a1492d43c4212b4c1d81a",
+      "metal_bit_exact": true,
+      "cpu_bit_exact": false,
+      "cpu_weight_bytes_differing": 1090816,
+      "record_bytes": 5898240,
+      "cpu_q4_q2_diagnostics": [
+        {
+          "component": "gate_proj",
+          "cosine_q4_q2": 0.9189769932902055,
+          "normalized_error_q4_q2": 0.40187425929215775,
+          "finite": true
+        },
+        {
+          "component": "up_proj",
+          "cosine_q4_q2": 0.918865701705434,
+          "normalized_error_q4_q2": 0.40216229972067435,
+          "finite": true
+        },
+        {
+          "component": "down_proj",
+          "cosine_q4_q2": 0.918642860014324,
+          "normalized_error_q4_q2": 0.40270570785343246,
+          "finite": true
+        }
+      ]
+    },
+    {
+      "layer": 66,
+      "expert": 0,
+      "shipped_record_sha256": "3c50f2ecce7d28b403734eede392821792b6f2ca8b3b33426249dbe8966915f9",
+      "metal_reproduced_sha256": "3c50f2ecce7d28b403734eede392821792b6f2ca8b3b33426249dbe8966915f9",
+      "cpu_reproduced_sha256": "79e0fee5a136e510fd08f8739740999b7d09a84794e134f7d286510372857afa",
+      "metal_bit_exact": true,
+      "cpu_bit_exact": false,
+      "cpu_weight_bytes_differing": 1081317,
+      "record_bytes": 5898240,
+      "cpu_q4_q2_diagnostics": [
+        {
+          "component": "gate_proj",
+          "cosine_q4_q2": 0.9189093474990705,
+          "normalized_error_q4_q2": 0.40187083334499973,
+          "finite": true
+        },
+        {
+          "component": "up_proj",
+          "cosine_q4_q2": 0.9190182541889903,
+          "normalized_error_q4_q2": 0.40169412285965983,
+          "finite": true
+        },
+        {
+          "component": "down_proj",
+          "cosine_q4_q2": 0.9187683042838318,
+          "normalized_error_q4_q2": 0.4028394047702311,
+          "finite": true
+        }
+      ]
+    }
+  ],
+  "verdict": "PASS",
+  "seconds": 4.1
+}

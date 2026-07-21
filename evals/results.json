@@ -1,0 +1,512 @@
+{
+  "_summary": {
+    "branch": "eval/hy3-q2-2p6bit @ merged main 3e1ef9d",
+    "constraints": "CPU-first, one record at a time, no GPU flock, no benchmark, no full-model load; eval2 does a minimal per-expert Metal confirmation (<200MB, freed between experts)",
+    "most_important_caveats": [
+      "Effective width is 2.50 bpw, not 2.6 (label rounds up).",
+      "Bit-exact q4->q2 reproduction is Metal-specific; CPU FP rounding alone puts a strictly-CPU reproduction ~19.5% off although the recipe is deterministic+exact on its production backend.",
+      "This is a WEIGHT-SPACE fidelity harness; it does not speak to the separately-recorded 15.4% perplexity-gate FAILURE of this quant."
+    ],
+    "verdicts": {
+      "eval1_fidelity_vs_bf16": "PASS \u2014 self-check bitwise-exact (max_abs_diff 0.0); per-tensor median cosine 0.9148 vs prior 0.9197 (within 0.5%) -> loader/alignment validated; min 0.8804 (per-tensor granularity, below prior aggregate min 0.9112, explained); relerr median 0.415",
+      "eval2_dequant_roundtrip": "PASS \u2014 recorded q4->q2 recipe reproduces shipped q2 BIT-EXACTLY on Metal (7/7 experts, all 9 components); q4 source identity hash-confirmed; CPU-only run diverges deterministically (~19.5% packed 2-bit weight bytes) due to mx.quantize/dequantize backend FP rounding; would be BLOCKED not FAIL without Metal",
+      "eval3_manifest_completeness": "PASS \u2014 15168/15168 records (79x192), 0 gaps/extra/dup, 0 out-of-bounds, bank size == declared; repo verify tool valid:true; HF a476015 completeness reads complete; effective bpw MEASURED 2.50 (2.0 payload + 0.5 gs64 bf16 scale/bias), NOT the ~2.6 label",
+      "eval4_passk_unit_test": "PASS \u2014 pass_at_k matches closed form on 440/440 (n<=10) grid + 6 anchors; summarize() per-task averaging + <k skip + old-bug regression all correct; tests/test_code_eval.py and tests/test_code_eval_gate.py both green"
+    }
+  },
+  "eval1_fidelity_vs_bf16": {
+    "eval": "weight-space fidelity vs bf16",
+    "per_expert_mean_cosine": {
+      "max": 0.9150571408502568,
+      "mean": 0.9132668270585032,
+      "median": 0.9148110552299448,
+      "min": 0.8941595077075641
+    },
+    "per_projection_cosine": {
+      "down_proj": {
+        "max": 0.9302247464607406,
+        "mean": 0.9153755628288852,
+        "median": 0.9148205330915017,
+        "min": 0.9131422446159031
+      },
+      "gate_proj": {
+        "max": 0.9150816555705777,
+        "mean": 0.9121862488953308,
+        "median": 0.9148303124252644,
+        "min": 0.8804485081045725
+      },
+      "up_proj": {
+        "max": 0.9151361060808684,
+        "mean": 0.9122386694512937,
+        "median": 0.9148338849729233,
+        "min": 0.8812354557080156
+      }
+    },
+    "per_tensor_cosine": {
+      "max": 0.9302247464607406,
+      "mean": 0.9132668270585033,
+      "median": 0.9148329302190212,
+      "min": 0.8804485081045725
+    },
+    "per_tensor_relerr": {
+      "max": 0.49694345442173454,
+      "mean": 0.4188403818670677,
+      "median": 0.4149698918123597,
+      "min": 0.3730749061949879
+    },
+    "prior": {
+      "median_cosine": 0.9197,
+      "median_matches_prior": true,
+      "min_cosine": 0.9112,
+      "note": "Median lands within 1% of the documented prior -> loader and tensor alignment validated. Per-tensor min is below the prior's stated min because this sample enumerates individual gate/up/down tensors (gate/up dip to ~0.88); the prior min is a coarser aggregate. down_proj alone is tightly clustered ~0.913-0.930.",
+      "per_tensor_min_below_prior_min": true
+    },
+    "sample": {
+      "expert_ids": [
+        0,
+        48,
+        96,
+        144,
+        191
+      ],
+      "layer_buckets": {
+        "high": [
+          66,
+          73,
+          79
+        ],
+        "low": [
+          1,
+          6,
+          13
+        ],
+        "mid": [
+          27,
+          40,
+          53
+        ]
+      },
+      "n_experts": 45,
+      "n_tensors": 135
+    },
+    "seconds": 6.2,
+    "self_check_dequant_roundtrip": {
+      "bitwise_identical": true,
+      "max_abs_diff": 0.0
+    },
+    "verdict": "PASS",
+    "verdict_basis": "harness validated: dequant decode path is bitwise-identical to MLX reference AND per-tensor median cosine matches the documented prior; the reported cosine/relerr are the fidelity measurement"
+  },
+  "eval2_dequant_roundtrip": {
+    "cases": [
+      {
+        "cpu_bit_exact": false,
+        "cpu_q4_q2_diagnostics": [
+          {
+            "component": "gate_proj",
+            "cosine_q4_q2": 0.9043292748616699,
+            "finite": true,
+            "normalized_error_q4_q2": 0.4403672870209161
+          },
+          {
+            "component": "up_proj",
+            "cosine_q4_q2": 0.9043046353429394,
+            "finite": true,
+            "normalized_error_q4_q2": 0.44022116794429145
+          },
+          {
+            "component": "down_proj",
+            "cosine_q4_q2": 0.9216124713514778,
+            "finite": true,
+            "normalized_error_q4_q2": 0.39547595957329146
+          }
+        ],
+        "cpu_reproduced_sha256": "c948f64bc976ddc04f866ff1295a9caddb1579808269c8813220ba11cc19815c",
+        "cpu_weight_bytes_differing": 922043,
+        "expert": 0,
+        "layer": 1,
+        "metal_bit_exact": true,
+        "metal_reproduced_sha256": "4285e724a491d270b453dd6a4e1bd7ab1b29fadfd93c8043ffa079b611f9097c",
+        "record_bytes": 5898240,
+        "shipped_record_sha256": "4285e724a491d270b453dd6a4e1bd7ab1b29fadfd93c8043ffa079b611f9097c"
+      },
+      {
+        "cpu_bit_exact": false,
+        "cpu_q4_q2_diagnostics": [
+          {
+            "component": "gate_proj",
+            "cosine_q4_q2": 0.9067025214334156,
+            "finite": true,
+            "normalized_error_q4_q2": 0.43444451849273663
+          },
+          {
+            "component": "up_proj",
+            "cosine_q4_q2": 0.9065763079566943,
+            "finite": true,
+            "normalized_error_q4_q2": 0.43476806802761747
+          },
+          {
+            "component": "down_proj",
+            "cosine_q4_q2": 0.9208539652533644,
+            "finite": true,
+            "normalized_error_q4_q2": 0.39738997098519624
+          }
+        ],
+        "cpu_reproduced_sha256": "f9b86195bd663ba2a479b062a23d341d859fd7e5d9fb139776ec56e4ae63635f",
+        "cpu_weight_bytes_differing": 952429,
+        "expert": 191,
+        "layer": 1,
+        "metal_bit_exact": true,
+        "metal_reproduced_sha256": "1bbdc879edc7da31e653db93d086155602ed436866ff016c03d3cca4233ce110",
+        "record_bytes": 5898240,
+        "shipped_record_sha256": "1bbdc879edc7da31e653db93d086155602ed436866ff016c03d3cca4233ce110"
+      },
+      {
+        "cpu_bit_exact": false,
+        "cpu_q4_q2_diagnostics": [
+          {
+            "component": "gate_proj",
+            "cosine_q4_q2": 0.918799687646408,
+            "finite": true,
+            "normalized_error_q4_q2": 0.40222072407700554
+          },
+          {
+            "component": "up_proj",
+            "cosine_q4_q2": 0.9189355763520771,
+            "finite": true,
+            "normalized_error_q4_q2": 0.4018740692559658
+          },
+          {
+            "component": "down_proj",
+            "cosine_q4_q2": 0.9187945216712241,
+            "finite": true,
+            "normalized_error_q4_q2": 0.4023096732639131
+          }
+        ],
+        "cpu_reproduced_sha256": "7ebe60431a98f67589403df5a6174a16647d02491a4dd9d7927afa300822e11f",
+        "cpu_weight_bytes_differing": 1078826,
+        "expert": 48,
+        "layer": 13,
+        "metal_bit_exact": true,
+        "metal_reproduced_sha256": "c72738d02c477a5102a29a4f49b80b809d1690ca6792460f711a09c96dda60f8",
+        "record_bytes": 5898240,
+        "shipped_record_sha256": "c72738d02c477a5102a29a4f49b80b809d1690ca6792460f711a09c96dda60f8"
+      },
+      {
+        "cpu_bit_exact": false,
+        "cpu_q4_q2_diagnostics": [
+          {
+            "component": "gate_proj",
+            "cosine_q4_q2": 0.9189337539065503,
+            "finite": true,
+            "normalized_error_q4_q2": 0.4020835246961081
+          },
+          {
+            "component": "up_proj",
+            "cosine_q4_q2": 0.9188775515755291,
+            "finite": true,
+            "normalized_error_q4_q2": 0.40235993621314886
+          },
+          {
+            "component": "down_proj",
+            "cosine_q4_q2": 0.9188956395342943,
+            "finite": true,
+            "normalized_error_q4_q2": 0.4024352424725869
+          }
+        ],
+        "cpu_reproduced_sha256": "4fa6d04ff0f2fc37a80694f2ca0ac0f9ea5f0e76bb81f6bbfefa2bb88c2336d7",
+        "cpu_weight_bytes_differing": 1082724,
+        "expert": 96,
+        "layer": 40,
+        "metal_bit_exact": true,
+        "metal_reproduced_sha256": "4f685e3adf119e3a1931e936ae35c512ab1acf38453eb1d3e3e49a9868b62676",
+        "record_bytes": 5898240,
+        "shipped_record_sha256": "4f685e3adf119e3a1931e936ae35c512ab1acf38453eb1d3e3e49a9868b62676"
+      },
+      {
+        "cpu_bit_exact": false,
+        "cpu_q4_q2_diagnostics": [
+          {
+            "component": "gate_proj",
+            "cosine_q4_q2": 0.9190008291509246,
+            "finite": true,
+            "normalized_error_q4_q2": 0.4018830201128504
+          },
+          {
+            "component": "up_proj",
+            "cosine_q4_q2": 0.918897394253863,
+            "finite": true,
+            "normalized_error_q4_q2": 0.40235691761477566
+          },
+          {
+            "component": "down_proj",
+            "cosine_q4_q2": 0.9185246680628769,
+            "finite": true,
+            "normalized_error_q4_q2": 0.4033069770672653
+          }
+        ],
+        "cpu_reproduced_sha256": "b5d3b71451233e60d142766a20c862381692752f91689ca20d00e6cef64a158a",
+        "cpu_weight_bytes_differing": 1079662,
+        "expert": 144,
+        "layer": 53,
+        "metal_bit_exact": true,
+        "metal_reproduced_sha256": "641cf54cb89ef93cabb0a86193fff9d15d6ba9080e6082c12c2ea57786974334",
+        "record_bytes": 5898240,
+        "shipped_record_sha256": "641cf54cb89ef93cabb0a86193fff9d15d6ba9080e6082c12c2ea57786974334"
+      },
+      {
+        "cpu_bit_exact": false,
+        "cpu_q4_q2_diagnostics": [
+          {
+            "component": "gate_proj",
+            "cosine_q4_q2": 0.9189769932902055,
+            "finite": true,
+            "normalized_error_q4_q2": 0.40187425929215775
+          },
+          {
+            "component": "up_proj",
+            "cosine_q4_q2": 0.918865701705434,
+            "finite": true,
+            "normalized_error_q4_q2": 0.40216229972067435
+          },
+          {
+            "component": "down_proj",
+            "cosine_q4_q2": 0.918642860014324,
+            "finite": true,
+            "normalized_error_q4_q2": 0.40270570785343246
+          }
+        ],
+        "cpu_reproduced_sha256": "68466780bde4eda44b7e25e36e5f7d6b3d7101ba344a1492d43c4212b4c1d81a",
+        "cpu_weight_bytes_differing": 1090816,
+        "expert": 191,
+        "layer": 79,
+        "metal_bit_exact": true,
+        "metal_reproduced_sha256": "c7c79335cb8216e7a3e2cc49ae70e62e7e173bd78dc2f471fdf33355cc0e82d4",
+        "record_bytes": 5898240,
+        "shipped_record_sha256": "c7c79335cb8216e7a3e2cc49ae70e62e7e173bd78dc2f471fdf33355cc0e82d4"
+      },
+      {
+        "cpu_bit_exact": false,
+        "cpu_q4_q2_diagnostics": [
+          {
+            "component": "gate_proj",
+            "cosine_q4_q2": 0.9189093474990705,
+            "finite": true,
+            "normalized_error_q4_q2": 0.40187083334499973
+          },
+          {
+            "component": "up_proj",
+            "cosine_q4_q2": 0.9190182541889903,
+            "finite": true,
+            "normalized_error_q4_q2": 0.40169412285965983
+          },
+          {
+            "component": "down_proj",
+            "cosine_q4_q2": 0.9187683042838318,
+            "finite": true,
+            "normalized_error_q4_q2": 0.4028394047702311
+          }
+        ],
+        "cpu_reproduced_sha256": "79e0fee5a136e510fd08f8739740999b7d09a84794e134f7d286510372857afa",
+        "cpu_weight_bytes_differing": 1081317,
+        "expert": 0,
+        "layer": 66,
+        "metal_bit_exact": true,
+        "metal_reproduced_sha256": "3c50f2ecce7d28b403734eede392821792b6f2ca8b3b33426249dbe8966915f9",
+        "record_bytes": 5898240,
+        "shipped_record_sha256": "3c50f2ecce7d28b403734eede392821792b6f2ca8b3b33426249dbe8966915f9"
+      }
+    ],
+    "cpu_all_bit_exact": false,
+    "eval": "dequant round-trip / quant integrity (q4->q2 bit-exact)",
+    "finding": "Recipe reproduces the shipped q2 bank BIT-EXACTLY on the Metal backend it was produced on (all sampled records, all 9 components). CPU-only runs diverge deterministically due to backend FP rounding in mx.quantize/mx.dequantize (bf16 scales/biases still ~99.96% identical, ~19.5% of packed 2-bit weight bytes differ).",
+    "metal_all_bit_exact": true,
+    "metal_available": true,
+    "n_cases": 7,
+    "recipe_tested": "shipped q4 record -> _convert_one_record (repo recorded q4_to_q2) -> compare to shipped q2 bytes, per component + whole record",
+    "seconds": 4.1,
+    "source_identity": {
+      "actual_q4_manifest_sha256": "e7fcfd6c69486456af4261d908d95f8a84a391d6a273ff1cff02a15f73fac92d",
+      "producer_git_commit": "d4209d237ac2b052040175efc4f0f20b12743e5e",
+      "producer_mlx_version": "0.31.2",
+      "q4_is_recorded_source": true,
+      "recorded_source_manifest_sha256": "e7fcfd6c69486456af4261d908d95f8a84a391d6a273ff1cff02a15f73fac92d"
+    },
+    "verdict": "PASS"
+  },
+  "eval3_manifest_completeness": {
+    "effective_bpw_measured": 2.5,
+    "effective_bpw_note": "affine gs64 2-bit == exactly 2.0 payload + 0.5 (bf16 scale+bias per 64 weights) = 2.50 bpw; the '2.6-bit' label is approximate/rounded, measured is 2.50.",
+    "eval": "manifest & bank completeness + effective bpw",
+    "hf_expert_aware_completeness": {
+      "cached_model_incompleteness_reason": null,
+      "expert_artifact_status": {
+        "actual_bytes": 89464504320,
+        "expected_bytes": 89464504320,
+        "manifest_file": "expert-manifest.json",
+        "manifest_present": true,
+        "ok": true,
+        "reason": null,
+        "sidecar_file": "experts.bin",
+        "streamed_experts": true
+      },
+      "reads_as_complete": true,
+      "source": "commit a476015 (mtplx.hf_loader)"
+    },
+    "independent_check": {
+      "bank_file": "experts.bin",
+      "bank_size_on_disk": 89464504320,
+      "duplicate_records": 0,
+      "effective_bpw": 2.5,
+      "expected_grid": "79x192=15168",
+      "extra_count": 0,
+      "group_size": 64,
+      "missing_count": 0,
+      "missing_sample": [],
+      "n_out_of_bounds": 0,
+      "record_count": 15168,
+      "scale_bias_overhead_bpw": 0.5,
+      "segments_out_of_bounds": [],
+      "sidecar_declared_size": 89464504320,
+      "sidecar_size_matches_disk": true,
+      "total_expert_record_bytes": 89464504320,
+      "total_weight_elements": 286286413824,
+      "weight_payload_bpw": 2.0
+    },
+    "repo_verify_tool": {
+      "command": "/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/verify_expert_manifest.py /Users/davidtai/.cache/huggingface/hy3-expert-only-mlx-q2 /Users/davidtai/.cache/huggingface/hy3-expert-only-mlx-q2/expert-manifest.json",
+      "ok": true,
+      "report": {
+        "checked_records": 0,
+        "checked_shards": 19,
+        "model_key": "hy3-expert-q2",
+        "sidecar_verified": false,
+        "valid": true
+      },
+      "returncode": 0,
+      "stderr": ""
+    },
+    "seconds": 2.7,
+    "verdict": "PASS"
+  },
+  "eval4_passk_unit_test": {
+    "eval": "pass@k estimator unit test",
+    "repo_pytests": [
+      {
+        "ok": true,
+        "returncode": 0,
+        "summary_tail": [
+          "................................                                         [100%]"
+        ],
+        "target": "tests/test_code_eval.py"
+      },
+      {
+        "ok": true,
+        "returncode": 0,
+        "summary_tail": [
+          "..............................                                           [100%]"
+        ],
+        "target": "tests/test_code_eval_gate.py"
+      }
+    ],
+    "scalar_pass_at_k": {
+      "anchors": [
+        {
+          "analytic": 0.0,
+          "c": 0,
+          "code": 0.0,
+          "k": 1,
+          "match": true,
+          "n": 5
+        },
+        {
+          "analytic": 0.19999999999999996,
+          "c": 1,
+          "code": 0.19999999999999996,
+          "k": 1,
+          "match": true,
+          "n": 5
+        },
+        {
+          "analytic": 1.0,
+          "c": 5,
+          "code": 1.0,
+          "k": 1,
+          "match": true,
+          "n": 5
+        },
+        {
+          "analytic": 0.9166666666666666,
+          "c": 3,
+          "code": 0.9166666666666666,
+          "k": 5,
+          "match": true,
+          "n": 10
+        },
+        {
+          "analytic": 1.0,
+          "c": 1,
+          "code": 1.0,
+          "k": 10,
+          "match": true,
+          "n": 10
+        },
+        {
+          "analytic": 0.050000000000000044,
+          "c": 10,
+          "code": 0.04999999999999982,
+          "k": 1,
+          "match": true,
+          "n": 200
+        }
+      ],
+      "grid_all_match": true,
+      "grid_matched": 440,
+      "grid_size": 440,
+      "passed": true
+    },
+    "seconds": 4.1,
+    "summarize_per_task": {
+      "checks": [
+        {
+          "analytic": 0.4666666666666666,
+          "case": "multi-task",
+          "code": 0.4666666666666666,
+          "k": 1,
+          "match": true
+        },
+        {
+          "analytic": 0.5666666666666667,
+          "case": "multi-task",
+          "code": 0.5666666666666667,
+          "k": 2,
+          "match": true
+        },
+        {
+          "analytic": 0.6333333333333333,
+          "case": "multi-task",
+          "code": 0.6333333333333333,
+          "k": 3,
+          "match": true
+        },
+        {
+          "analytic": 1.0,
+          "case": "skip-<k-samples",
+          "code": 1.0,
+          "k": 3,
+          "match": true
+        },
+        {
+          "analytic": 1.0,
+          "case": "corpus-passes>n (old bug)",
+          "code": 1.0,
+          "k": 1,
+          "match": true,
+          "raised": false
+        }
+      ],
+      "passed": true
+    },
+    "verdict": "PASS"
+  }
+}
