@@ -51,6 +51,7 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
             "hy3-expert-only-q4",
             "hy3-expert-q2",
             "hy3-expert-oq2e",
+            "hy3-expert-mixofficial",
             "glm52-expert-q2",
             "glm52-expert-q1t",
             "glm52-expert-q1b1",

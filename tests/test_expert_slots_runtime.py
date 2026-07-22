@@ -514,7 +514,8 @@ def test_positional_reader_fills_and_hashes_source_record(tmp_path: Path) -> Non
     assert bytes(destination) == expected[0]
     assert digest == manifest.records[0].sha256
     assert metrics["source_record_requests"] == 1
-    assert metrics["read_operations"] == 9
+    # Contiguous source segments coalesce into a single range read.
+    assert metrics["read_operations"] == 1
     assert metrics["read_bytes"] == len(destination)
     assert metrics["open_files_peak"] == 1
 

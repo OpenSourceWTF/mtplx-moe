@@ -30,7 +30,11 @@ from .expert_shadow import (
     _B1_WORDS_PER_GROUP,
     _T158_BYTES_PER_GROUP,
 )
-from .expert_streaming_models import ExpertStreamingModelSpec, get_model_spec
+from .expert_streaming_models import (
+    MIXED_OFFICIAL_CODEC,
+    ExpertStreamingModelSpec,
+    get_model_spec,
+)
 
 
 MANIFEST_FORMAT = "mtplx-expert-manifest-v1"
@@ -66,6 +70,31 @@ _KNOWN_COMPONENTS = frozenset(_COMPONENTS) | frozenset(_SHADOW_COMPONENTS)
 # math lives in the codec (10 or 15 bytes per g64 group), the nominal bits
 # keep spec/manifest/pool guards single-valued.
 _SHADOW_NOMINAL_BITS = {"b1": 1, "t158": 2}
+
+# Mixed-official (issue #51, M2): a per-layer tier schedule instead of one
+# uniform record. down is always 3-bit affine; the gate/up pair is t158 (shadow
+# packed+scales) or 2-bit affine, per layer. There is NO scalar ``bits`` — the
+# schedule lives in ``quantization.layer_tier_map``. Each record therefore
+# carries one of two component orders, and every segment a ``quant_tier`` stamp.
+MIXED_MODE = MIXED_OFFICIAL_CODEC
+_MIXED_GATE_UP_TIERS = ("t158", "affine2")
+_MIXED_DOWN_TIER = "affine3"
+# t158-tier layer: gate/up shadow (packed+scales), down 3-bit affine (7 leaves).
+_MIXED_T158_COMPONENTS = (
+    "gate_proj.packed",
+    "gate_proj.scales",
+    "up_proj.packed",
+    "up_proj.scales",
+    "down_proj.weight",
+    "down_proj.scales",
+    "down_proj.biases",
+)
+# affine2-tier layer: gate/up/down all affine leaves — identical to _COMPONENTS.
+_MIXED_AFFINE2_COMPONENTS = _COMPONENTS
+_MIXED_COMPONENT_ORDERS = {
+    "t158": _MIXED_T158_COMPONENTS,
+    "affine2": _MIXED_AFFINE2_COMPONENTS,
+}
 
 
 def expert_components_for_mode(quant_mode: str) -> tuple[str, ...]:
@@ -385,9 +414,13 @@ class TensorSegment:
     length: int
     dtype: str
     shape: tuple[int, ...]
+    # Mixed-official (issue #51, M2): the tier that produced this leaf
+    # ("t158"/"affine2"/"affine3"). A reader never re-derives the schedule; it
+    # is preserved verbatim from the converter (D5). None for uniform lanes.
+    quant_tier: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "component": self.component,
             "tensor": self.tensor,
             "shard": self.shard,
@@ -396,6 +429,9 @@ class TensorSegment:
             "dtype": self.dtype,
             "shape": list(self.shape),
         }
+        if self.quant_tier is not None:
+            result["quant_tier"] = self.quant_tier
+        return result
 
     @classmethod
     def from_dict(cls, value: Any) -> TensorSegment:
@@ -412,6 +448,7 @@ class TensorSegment:
                 "dtype",
                 "shape",
             ),
+            optional=("quant_tier",),
         )
         component = _string(obj["component"], label="segment component")
         if component not in _KNOWN_COMPONENTS:
@@ -419,6 +456,10 @@ class TensorSegment:
         dtype = _string(obj["dtype"], label="segment dtype")
         if dtype not in _DTYPE_BYTES:
             raise ExpertManifestError(f"unsupported safetensors dtype {dtype!r}")
+        raw_tier = obj.get("quant_tier")
+        quant_tier = (
+            None if raw_tier is None else _string(raw_tier, label="segment quant_tier")
+        )
         return cls(
             component=component,
             tensor=_string(obj["tensor"], label="segment tensor"),
@@ -427,6 +468,7 @@ class TensorSegment:
             length=_integer(obj["length"], label="segment length", minimum=1),
             dtype=dtype,
             shape=_shape(obj["shape"], label="segment shape"),
+            quant_tier=quant_tier,
         )
 
 
@@ -515,17 +557,27 @@ class ExpertRecord:
         raw_segments = obj["segments"]
         if not isinstance(raw_segments, list):
             raise ExpertManifestError("expert record segments must be an array")
-        if len(raw_segments) not in {len(_COMPONENTS), len(_SHADOW_COMPONENTS)}:
+        _valid_lengths = {
+            len(_COMPONENTS),
+            len(_SHADOW_COMPONENTS),
+            len(_MIXED_T158_COMPONENTS),
+        }
+        if len(raw_segments) not in _valid_lengths:
             raise ExpertManifestError(
-                "expert record must contain the nine ordered affine components "
-                "or the six ordered shadow-codec components"
+                "expert record must contain the nine ordered affine components, "
+                "the six ordered shadow-codec components, or a mixed-official "
+                "seven-segment (t158 gate/up + affine3 down) record"
             )
         segments = tuple(TensorSegment.from_dict(item) for item in raw_segments)
         ordered = tuple(segment.component for segment in segments)
-        if ordered not in {_COMPONENTS, _SHADOW_COMPONENTS}:
+        # _MIXED_AFFINE2_COMPONENTS == _COMPONENTS (the affine order), so the
+        # 9-segment mixed order is already covered by _COMPONENTS.
+        _valid_orders = {_COMPONENTS, _SHADOW_COMPONENTS, _MIXED_T158_COMPONENTS}
+        if ordered not in _valid_orders:
             raise ExpertManifestError(
-                "expert record must contain the nine ordered affine components "
-                "or the six ordered shadow-codec components"
+                "expert record must contain the nine ordered affine components, "
+                "the six ordered shadow-codec components, or the seven ordered "
+                "mixed-official t158 components"
             )
         digest = obj.get("sha256")
         sidecar_offset = obj.get("sidecar_offset")
@@ -746,12 +798,45 @@ class SidecarInfo:
         return cls(alignment=alignment, parts=parts, **scalar_kwargs)
 
 
+def _parse_mixed_layer_tier_map(value: Any) -> tuple[tuple[int, str, str], ...]:
+    """Parse ``{layer: {gate_up, down}}`` into a sorted, validated tuple."""
+
+    obj = _expect_object(value, label="layer_tier_map")
+    if not obj:
+        raise ExpertManifestError("mixed-official layer_tier_map is empty")
+    entries: list[tuple[int, str, str]] = []
+    for key, raw in obj.items():
+        try:
+            layer = int(key)
+        except (TypeError, ValueError):
+            raise ExpertManifestError(
+                f"layer_tier_map layer {key!r} is not an integer"
+            ) from None
+        entry = _expect_object(raw, label="layer_tier_map entry")
+        _expect_keys(entry, label="layer_tier_map entry", required=("gate_up", "down"))
+        gate_up = _string(entry["gate_up"], label="gate_up tier")
+        down = _string(entry["down"], label="down tier")
+        if gate_up not in _MIXED_GATE_UP_TIERS or down != _MIXED_DOWN_TIER:
+            raise ExpertManifestError(
+                f"layer {layer} tier assignment (gate_up={gate_up!r}, "
+                f"down={down!r}) is out of the mixed-official contract"
+            )
+        entries.append((layer, gate_up, down))
+    entries.sort()
+    layers = [layer for layer, _gate_up, _down in entries]
+    if len(set(layers)) != len(layers):
+        raise ExpertManifestError("layer_tier_map has duplicate layers")
+    return tuple(entries)
+
+
 @dataclass(frozen=True)
 class ExpertManifest:
     model_key: str
     source_repo: str
     source_revision: str
-    quant_bits: int
+    # None only for mixed-official banks (issue #51, M2): they carry no scalar
+    # bits — the per-layer tier schedule lives in ``layer_tier_map`` (D5).
+    quant_bits: int | None
     quant_group_size: int
     quant_mode: str
     artifact_tensor_bytes: int
@@ -763,18 +848,67 @@ class ExpertManifest:
     sidecar: SidecarInfo | None = None
     manifest_sha256: str | None = None
     format: str = MANIFEST_FORMAT
+    # Mixed-official per-layer schedule: sorted ``(layer, gate_up, down)`` tiers.
+    # None for uniform lanes; required (and non-empty) for MIXED_MODE.
+    layer_tier_map: tuple[tuple[int, str, str], ...] | None = None
+
+    @property
+    def is_mixed(self) -> bool:
+        return self.quant_mode == MIXED_MODE
+
+    def mixed_tier_for_layer(self, layer: int) -> tuple[str, str]:
+        """Return ``(gate_up_tier, down_tier)`` for a mixed-official layer.
+
+        Fail closed (D1): a routed layer with no tier entry is a bug, not a
+        default.
+        """
+
+        for entry_layer, gate_up, down in self.layer_tier_map or ():
+            if entry_layer == int(layer):
+                return gate_up, down
+        raise ExpertManifestError(
+            f"mixed-official manifest has no tier entry for layer {layer}"
+        )
+
+    def record_bytes_by_layer(self) -> dict[int, int]:
+        """Per-layer streamed record bytes (all experts in a layer are equal)."""
+
+        result: dict[int, int] = {}
+        for record in self.records:
+            existing = result.get(record.layer)
+            if existing is None:
+                result[record.layer] = record.logical_bytes
+            elif existing != record.logical_bytes:
+                raise ExpertManifestError(
+                    f"layer {record.layer} has non-uniform record bytes "
+                    f"({existing} vs {record.logical_bytes})"
+                )
+        return result
 
     def to_dict(self, *, include_digest: bool = True) -> dict[str, Any]:
+        if self.is_mixed:
+            # Mixed-official carries the per-layer schedule instead of a scalar
+            # ``bits``; round-trips through from_dict so the digest is stable.
+            quantization: dict[str, Any] = {
+                "group_size": self.quant_group_size,
+                "mode": self.quant_mode,
+                "layer_tier_map": {
+                    str(layer): {"gate_up": gate_up, "down": down}
+                    for layer, gate_up, down in (self.layer_tier_map or ())
+                },
+            }
+        else:
+            quantization = {
+                "bits": self.quant_bits,
+                "group_size": self.quant_group_size,
+                "mode": self.quant_mode,
+            }
         result: dict[str, Any] = {
             "format": self.format,
             "model_key": self.model_key,
             "source_repo": self.source_repo,
             "source_revision": self.source_revision,
-            "quantization": {
-                "bits": self.quant_bits,
-                "group_size": self.quant_group_size,
-                "mode": self.quant_mode,
-            },
+            "quantization": quantization,
             "artifact": {
                 "tensor_bytes": self.artifact_tensor_bytes,
                 "resident_tensor_bytes": self.resident_tensor_bytes,
@@ -824,9 +958,27 @@ class ExpertManifest:
         if obj["format"] != MANIFEST_FORMAT:
             raise ExpertManifestError(f"unsupported manifest format {obj['format']!r}")
         quant = _expect_object(obj["quantization"], label="quantization")
-        _expect_keys(
-            quant, label="quantization", required=("bits", "group_size", "mode")
-        )
+        quant_mode = _string(quant.get("mode"), label="quantization mode")
+        mixed = quant_mode == MIXED_MODE
+        if mixed:
+            # Mixed-official carries the per-layer tier schedule and no scalar
+            # bits (D5). Extra provenance keys the converter may emit (tiers,
+            # source_recipe) are tolerated but ignored — only layer_tier_map is
+            # load-bearing at serve time.
+            _expect_keys(
+                quant,
+                label="quantization",
+                required=("group_size", "mode", "layer_tier_map"),
+                optional=("tiers", "source_recipe"),
+            )
+            layer_tier_map = _parse_mixed_layer_tier_map(quant["layer_tier_map"])
+            quant_bits: int | None = None
+        else:
+            _expect_keys(
+                quant, label="quantization", required=("bits", "group_size", "mode")
+            )
+            layer_tier_map = None
+            quant_bits = _integer(quant["bits"], label="quantization bits", minimum=1)
         artifact = _expect_object(obj["artifact"], label="artifact")
         _expect_keys(
             artifact,
@@ -874,11 +1026,12 @@ class ExpertManifest:
             model_key=_string(obj["model_key"], label="model_key"),
             source_repo=_string(obj["source_repo"], label="source_repo"),
             source_revision=_string(obj["source_revision"], label="source_revision"),
-            quant_bits=_integer(quant["bits"], label="quantization bits", minimum=1),
+            quant_bits=quant_bits,
             quant_group_size=_integer(
                 quant["group_size"], label="quantization group_size", minimum=1
             ),
-            quant_mode=_string(quant["mode"], label="quantization mode"),
+            quant_mode=quant_mode,
+            layer_tier_map=layer_tier_map,
             artifact_tensor_bytes=_integer(
                 artifact["tensor_bytes"], label="artifact tensor_bytes", minimum=1
             ),
@@ -925,12 +1078,34 @@ class ExpertManifest:
                 raise ExpertManifestError(
                     f"shadow codec manifests group in {SHADOW_GROUP}s"
                 )
+        elif self.quant_mode == MIXED_MODE:
+            if self.quant_bits is not None:
+                raise ExpertManifestError(
+                    "mixed-official manifests carry no scalar quantization bits"
+                )
+            if self.quant_group_size != SHADOW_GROUP:
+                raise ExpertManifestError(
+                    f"mixed-official manifests group in {SHADOW_GROUP}s"
+                )
+            if not self.layer_tier_map:
+                raise ExpertManifestError(
+                    "mixed-official manifests require a layer_tier_map"
+                )
         else:
             raise ExpertManifestError(
-                "only affine Q2/Q4 or shadow-codec (b1, t158) expert "
-                "manifests are supported"
+                "only affine Q2/Q4, shadow-codec (b1, t158), or mixed-official "
+                "expert manifests are supported"
             )
-        expected_components = expert_components_for_mode(self.quant_mode)
+        # Mixed-official records differ per layer, so the expected component
+        # order is resolved per record below instead of once here.
+        expected_components = (
+            None if self.is_mixed else expert_components_for_mode(self.quant_mode)
+        )
+        mixed_tiers = (
+            {layer: gate_up for layer, gate_up, _down in self.layer_tier_map}
+            if self.is_mixed
+            else {}
+        )
         if len(self.shards) > MAX_MANIFEST_SHARDS:
             raise ExpertManifestError("manifest shard count exceeds the shard limit")
         if len(self.resident_tensors) > MAX_MANIFEST_RESIDENT_TENSORS:
@@ -984,9 +1159,18 @@ class ExpertManifest:
         shard_sizes = {shard.name: shard.size for shard in self.shards}
         routed_bytes = 0
         for record in self.records:
+            if self.is_mixed:
+                gate_up_tier = mixed_tiers.get(record.layer)
+                if gate_up_tier is None:
+                    raise ExpertManifestError(
+                        f"record layer {record.layer} has no layer_tier_map entry"
+                    )
+                record_expected = _MIXED_COMPONENT_ORDERS[gate_up_tier]
+            else:
+                record_expected = expected_components
             if (
                 tuple(segment.component for segment in record.segments)
-                != expected_components
+                != record_expected
             ):
                 raise ExpertManifestError(
                     f"expert record components do not match quantization "
@@ -1696,6 +1880,263 @@ def build_expert_manifest(
     return manifest
 
 
+def build_mixed_official_manifest(
+    root: Path | str,
+    mixed_manifest: dict[str, Any],
+    spec: ExpertStreamingModelSpec,
+) -> ExpertManifest:
+    """Unify a mixed-official bank into the streamed ``ExpertManifest`` schema.
+
+    ``root`` is the assembled artifact directory: the resident-only safetensors
+    (with ``model.safetensors.index.json``) plus the mixed-official record bin
+    next to them. ``mixed_manifest`` is the dict emitted by
+    ``scripts.convert_expert_mixed_official.convert_mixed_official``. The result
+    is authoritative — the bin is the single sidecar shard, every expert record
+    addresses it, ``quantization.mode`` is ``mixed-official-v1`` and the
+    per-layer ``layer_tier_map`` is preserved — so the streamed runtime opens it
+    through the ordinary ``load_expert_manifest`` + slot machinery (issue #51 M2,
+    the q1 lane's equal for a non-uniform bank).
+    """
+
+    if not spec.is_mixed_official:
+        raise ExpertManifestError(
+            f"spec {spec.key!r} is not a mixed-official descriptor"
+        )
+    quant = mixed_manifest.get("quantization")
+    if not isinstance(quant, dict) or quant.get("mode") != MIXED_MODE:
+        raise ExpertManifestError("source manifest is not a mixed-official bank")
+    sidecar_meta = mixed_manifest.get("sidecar")
+    if not isinstance(sidecar_meta, dict):
+        raise ExpertManifestError("mixed-official manifest lacks sidecar metadata")
+    root = Path(root).resolve()
+    bin_name = _safe_relative_name(sidecar_meta["file"], label="mixed bin name")
+    bin_path = root / bin_name
+    if not bin_path.is_file():
+        raise ExpertManifestError(
+            f"mixed-official record bin is not in the artifact: {bin_path}"
+        )
+    layer_tier_map = _parse_mixed_layer_tier_map(quant["layer_tier_map"])
+    group_size = _integer(quant["group_size"], label="quantization group_size", minimum=1)
+
+    shards, tensors = _checkpoint_inventory(root, hash_shards=True)
+    routed = [
+        name for name in tensors if _classify_expert_name(name, spec) is not None
+    ]
+    if routed:
+        raise ExpertManifestError(
+            "mixed-official artifact safetensors must hold only resident tensors; "
+            f"found routed expert tensors: {sorted(routed)[:4]}"
+        )
+    resident_tensors = tuple(
+        ResidentTensor(
+            tensor=tensor.name,
+            shard=tensor.shard,
+            offset=tensor.offset,
+            length=tensor.length,
+            dtype=tensor.dtype,
+            shape=tensor.shape,
+        )
+        for tensor in sorted(tensors.values(), key=lambda item: item.name)
+    )
+    resident_bytes = sum(tensor.length for tensor in resident_tensors)
+    bin_size = bin_path.stat().st_size
+    bin_sha256 = _hash_file(bin_path)
+    sidecar_shard = ShardInfo(
+        name=bin_name,
+        size=bin_size,
+        header_bytes=0,
+        header_sha256=EMPTY_SHA256,
+        sha256=bin_sha256,
+        kind="sidecar",
+    )
+    records: list[ExpertRecord] = []
+    routed_bytes = 0
+    for raw in mixed_manifest.get("records", ()):
+        segments = tuple(
+            TensorSegment(
+                component=segment["component"],
+                tensor=segment["tensor"],
+                shard=bin_name,
+                offset=_integer(segment["offset"], label="segment offset"),
+                length=_integer(segment["length"], label="segment length", minimum=1),
+                dtype=segment["dtype"],
+                shape=_shape(segment["shape"], label="segment shape"),
+                quant_tier=segment.get("quant_tier"),
+            )
+            for segment in raw["segments"]
+        )
+        logical = _integer(raw["logical_bytes"], label="record logical_bytes", minimum=1)
+        records.append(
+            ExpertRecord(
+                layer=_integer(raw["layer"], label="record layer"),
+                expert=_integer(raw["expert"], label="record expert"),
+                logical_bytes=logical,
+                segments=segments,
+                sha256=raw.get("sha256"),
+                sidecar_offset=_integer(
+                    raw["sidecar_offset"], label="record sidecar_offset"
+                ),
+                sidecar_length=_integer(
+                    raw["sidecar_length"], label="record sidecar_length", minimum=1
+                ),
+            )
+        )
+        routed_bytes += logical
+    manifest = ExpertManifest(
+        model_key=spec.key,
+        source_repo=spec.quant_model,
+        source_revision=spec.quant_revision,
+        quant_bits=None,
+        quant_group_size=group_size,
+        quant_mode=MIXED_MODE,
+        layer_tier_map=layer_tier_map,
+        artifact_tensor_bytes=resident_bytes + routed_bytes,
+        resident_tensor_bytes=resident_bytes,
+        routed_expert_bytes=routed_bytes,
+        shards=tuple(shards) + (sidecar_shard,),
+        resident_tensors=resident_tensors,
+        records=tuple(records),
+        sidecar=SidecarInfo(
+            file=bin_name,
+            alignment=_integer(sidecar_meta["alignment"], label="sidecar alignment"),
+            size=bin_size,
+            sha256=bin_sha256,
+        ),
+    ).with_digest()
+    manifest.validate_structure()
+    validate_expert_manifest_spec(manifest, spec)
+    return manifest
+
+
+def _mixed_projection_dims(
+    spec: ExpertStreamingModelSpec,
+) -> dict[str, tuple[int, int]]:
+    """(out, in) per projection for a mixed-official expert of this model."""
+
+    return {
+        "gate_proj": (spec.expert_hidden_size, spec.hidden_size),
+        "up_proj": (spec.expert_hidden_size, spec.hidden_size),
+        "down_proj": (spec.hidden_size, spec.expert_hidden_size),
+    }
+
+
+def _validate_mixed_manifest_spec(
+    manifest: ExpertManifest,
+    spec: ExpertStreamingModelSpec,
+    *,
+    require_pinned_tensor_bytes: bool,
+) -> None:
+    """Per-layer identity/geometry validation for a mixed-official bank (D5).
+
+    The tier map is the single source of truth: every record's logical bytes
+    and component layout must match ``plan_record_segments`` for that layer's
+    tier, and every routed layer must have a tier (fail closed).
+    """
+
+    from mtplx.expert_mixed_official import plan_record_segments
+
+    if manifest.quant_mode != MIXED_MODE:
+        raise ExpertManifestError(
+            f"manifest quantization mode {manifest.quant_mode!r} does not match "
+            f"mixed-official descriptor codec {spec.expert_codec!r}"
+        )
+    if manifest.quant_group_size != spec.quant_group_size:
+        raise ExpertManifestError(
+            "manifest quantization group size does not match the descriptor"
+        )
+    if manifest.model_key != spec.key:
+        raise ExpertManifestError(
+            f"manifest model key {manifest.model_key!r} does not match "
+            f"descriptor {spec.key!r}"
+        )
+    if (
+        manifest.source_repo != spec.quant_model
+        or manifest.source_revision != spec.quant_revision
+    ):
+        raise ExpertManifestError(
+            "manifest source identity does not match the pinned descriptor"
+        )
+
+    expected_keys = tuple(
+        (layer, expert)
+        for layer in spec.routed_layer_indices
+        for expert in range(spec.expert_count)
+    )
+    actual_keys = tuple((record.layer, record.expert) for record in manifest.records)
+    if actual_keys != expected_keys:
+        raise ExpertManifestError(
+            "manifest record keys do not match the descriptor Cartesian product"
+        )
+
+    dims = _mixed_projection_dims(spec)
+    # Cache the planned layout per (gate_up, down) tier so the per-record loop
+    # is O(records) rather than O(records * segments) of layout math.
+    planned_by_tiers: dict[tuple[str, str], tuple] = {}
+    for record in manifest.records:
+        gate_up_tier, down_tier = manifest.mixed_tier_for_layer(record.layer)
+        key = (gate_up_tier, down_tier)
+        planned = planned_by_tiers.get(key)
+        if planned is None:
+            planned = plan_record_segments(
+                {"gate_up": gate_up_tier, "down": down_tier}, dims
+            )
+            planned_by_tiers[key] = planned
+        if len(record.segments) != len(planned):
+            raise ExpertManifestError(
+                f"record ({record.layer}, {record.expert}) has "
+                f"{len(record.segments)} segments; expected {len(planned)}"
+            )
+        for segment, plan in zip(record.segments, planned):
+            if (
+                segment.component != plan.component
+                or segment.dtype != plan.dtype
+                or segment.shape != tuple(plan.shape)
+                or segment.length != plan.length
+                or segment.quant_tier != plan.quant_tier
+            ):
+                raise ExpertManifestError(
+                    f"record ({record.layer}, {record.expert}) component "
+                    f"{plan.component} does not match the mixed-official layout"
+                )
+        expected_logical = sum(plan.length for plan in planned)
+        if record.logical_bytes != expected_logical:
+            raise ExpertManifestError(
+                f"record ({record.layer}, {record.expert}) bytes "
+                f"{record.logical_bytes} do not match the tier layout "
+                f"{expected_logical}"
+            )
+
+    expected_routed = sum(record.logical_bytes for record in manifest.records)
+    if manifest.routed_expert_bytes != expected_routed:
+        raise ExpertManifestError(
+            "manifest routed expert bytes do not match the record layout"
+        )
+    if require_pinned_tensor_bytes:
+        expected_resident = spec.total_tensor_bytes - expected_routed
+        if manifest.resident_tensor_bytes != expected_resident:
+            raise ExpertManifestError(
+                f"manifest resident bytes {manifest.resident_tensor_bytes} do not "
+                f"match the descriptor {expected_resident}"
+            )
+        if manifest.artifact_tensor_bytes != spec.total_tensor_bytes:
+            raise ExpertManifestError(
+                "manifest total tensor bytes do not match the descriptor"
+            )
+
+    mtp_pattern = None
+    if spec.mtp_layer_index is not None:
+        mtp_pattern = re.compile(rf"(?:^|\.)layers\.{spec.mtp_layer_index}(?:\.|$)")
+    for tensor in manifest.resident_tensors:
+        if _classify_expert_name(tensor.tensor, spec) is not None:
+            raise ExpertManifestError(
+                f"resident tensor {tensor.tensor!r} is a routed expert tensor"
+            )
+        if mtp_pattern is not None and mtp_pattern.search(tensor.tensor):
+            raise ExpertManifestError(
+                f"resident tensor {tensor.tensor!r} is an MTP layer tensor"
+            )
+
+
 def validate_expert_manifest_spec(
     manifest: ExpertManifest,
     spec: ExpertStreamingModelSpec,
@@ -1709,6 +2150,11 @@ def validate_expert_manifest_spec(
     if not isinstance(spec, ExpertStreamingModelSpec):
         raise TypeError("spec must be an ExpertStreamingModelSpec")
     manifest.validate_structure()
+    if spec.is_mixed_official:
+        _validate_mixed_manifest_spec(
+            manifest, spec, require_pinned_tensor_bytes=require_pinned_tensor_bytes
+        )
+        return
     if manifest.quant_bits != spec.quant_bits:
         raise ExpertManifestError(
             f"manifest bits {manifest.quant_bits} do not match descriptor bits "

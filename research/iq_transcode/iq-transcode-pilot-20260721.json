@@ -1,0 +1,1682 @@
+{
+  "task": "O7 IQ-transcode pilot",
+  "date": "2026-07-21",
+  "question": "does transcoding published imatrix-calibrated GGUF i-quants into MLX-servable formats inherit calibration quality, or does transcode loss eat it?",
+  "source_repo": "bartowski/Hy3-GGUF",
+  "source_substitution_note": "SUBSTITUTION: LordNeel/Hy3-GGUF (the repo cited in the task/notes) EXISTS and is imatrix-calibrated, but contains NO IQ1_M/IQ2_XXS/IQ3_XXS quants -- its only IQ-family quant is IQ2_M; the rest are K-quants (Q3_K_L, Q4_K_M, Q6_K). The cited recipe (40 layers IQ1_M / 39 IQ2_XXS gate-up / IQ3_XXS down) does NOT match that repo. Substituted bartowski/Hy3-GGUF, the canonical i-quant producer, which carries exactly IQ1_M, IQ2_XXS, IQ3_XXS -- all imatrix (tag 'imatrix', embedded quantize.imatrix.* metadata below).",
+  "ground_truth": {
+    "model": "tencent/Hy3 bf16 rev 716aa724",
+    "dir": "/Users/davidtai/.cache/huggingface/hy3-mtp-layer80",
+    "index": "/Users/davidtai/.cache/huggingface/hy3-mtp-layer80/model.safetensors.index.json"
+  },
+  "config": {
+    "shapes": {
+      "gate/up": [
+        1536,
+        4096
+      ],
+      "down": [
+        4096,
+        1536
+      ]
+    },
+    "expert_count": 192,
+    "sample_plan": {
+      "layers": [
+        1,
+        12,
+        23,
+        34,
+        45,
+        56,
+        67,
+        78
+      ],
+      "projs": [
+        "gate",
+        "up",
+        "gate",
+        "up",
+        "gate",
+        "up",
+        "gate",
+        "up"
+      ],
+      "experts": [
+        0,
+        40,
+        80,
+        120,
+        160,
+        24,
+        96,
+        168
+      ],
+      "note": "gate/up_exps only; each sampled tensor's actual ggml type is verified == source format before use"
+    },
+    "targets": {
+      "t158": "mtplx.expert_shadow encode_t158/decode_t158 (ternary 1.58b, group 64, bf16 scale) -- 15 B/64w",
+      "q2_gs64": "mx.quantize/dequantize affine bits=2 group_size=64 (CPU, mode=affine -- the runtime path)",
+      "q4_gs64": "mx.quantize/dequantize affine bits=4 group_size=64 (IQ3_XXS sources only)"
+    }
+  },
+  "decoder_validation": {
+    "IQ2_XXS_hand_block": {
+      "method": "independent scalar reimpl; sign from even-parity rule (not gguf ksigns), scale from top-4 bits, grid decoded from grid_hex; matched vs gguf.quants on a real block",
+      "max_abs_diff_fp64": 0.0,
+      "bitwise_equal_fp32": true,
+      "mine_min": -0.06499254703521729,
+      "mine_max": 0.06499254703521729,
+      "ref_min": -0.06499254703521729,
+      "ref_max": 0.06499254703521729,
+      "n_nonzero": 256
+    }
+  },
+  "formats": {
+    "IQ1_M": {
+      "split_files": [
+        "Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf",
+        "Hy3-IQ1_M/Hy3-IQ1_M-00002-of-00002.gguf"
+      ],
+      "header_bytes": 9961472,
+      "imatrix_metadata": {
+        "general.architecture": "hy_v3",
+        "general.name": "Hy3",
+        "general.quantization_version": 2,
+        "general.file_type": 31,
+        "quantize.imatrix.file": "/models_out/Hy3-GGUF/Hy3-imatrix.gguf",
+        "quantize.imatrix.dataset": "/training_dir/calibration_datav5.txt",
+        "quantize.imatrix.entries_count": 876,
+        "quantize.imatrix.chunks_count": 812
+      },
+      "exps_gate_up_type_note": "gate/up_exps uniformly this format across 79 layers (+1 layer Q4_0, excluded by type filter)",
+      "n_samples": 8,
+      "source_quality": {
+        "cos_bf16_src": {
+          "mean": 0.9005694833390222,
+          "min": 0.8723299769047265,
+          "max": 0.905066712296672,
+          "n": 8
+        },
+        "relerr_bf16_src": {
+          "mean": 0.4643754320302683,
+          "min": 0.4524540868159662,
+          "max": 0.5397962795410878,
+          "n": 8
+        }
+      },
+      "verdict": {
+        "t158": {
+          "cos_bf16_from_iqx": {
+            "mean": 0.8608564620480235,
+            "min": 0.8184393428817383,
+            "max": 0.8673558865041938,
+            "n": 8
+          },
+          "cos_bf16_from_bf16": {
+            "mean": 0.8994399729932823,
+            "min": 0.8836075220701439,
+            "max": 0.9017864571391262,
+            "n": 8
+          },
+          "cos_src_from_iqx": {
+            "mean": 0.9567881418297276,
+            "min": 0.9263738494177993,
+            "max": 0.9613010565386569,
+            "n": 8
+          },
+          "delta_cos": {
+            "mean": -0.03858351094525887,
+            "min": -0.06516817918840567,
+            "max": -0.034384972603889064,
+            "n": 8
+          },
+          "relerr_bf16_from_iqx": {
+            "mean": 0.5319957433294356,
+            "min": 0.5201415884034254,
+            "max": 0.6089329365750165,
+            "n": 8
+          },
+          "relerr_bf16_from_bf16": {
+            "mean": 0.4368422867106095,
+            "min": 0.43218188964045395,
+            "max": 0.4682283064625476,
+            "n": 8
+          },
+          "relerr_src_from_iqx": {
+            "mean": 0.2886501369560042,
+            "min": 0.2755000520927747,
+            "max": 0.3766052191819428,
+            "n": 8
+          }
+        },
+        "q2_gs64": {
+          "cos_bf16_from_iqx": {
+            "mean": 0.8599872787185827,
+            "min": 0.8289871260998721,
+            "max": 0.8648823159975373,
+            "n": 8
+          },
+          "cos_bf16_from_bf16": {
+            "mean": 0.9223346423873434,
+            "min": 0.9095838949672772,
+            "max": 0.9241868265061546,
+            "n": 8
+          },
+          "cos_src_from_iqx": {
+            "mean": 0.9514060072524975,
+            "min": 0.936390394454315,
+            "max": 0.9536513787736843,
+            "n": 8
+          },
+          "delta_cos": {
+            "mean": -0.062347363668760744,
+            "min": -0.08059676886740508,
+            "max": -0.05930092428378797,
+            "n": 8
+          },
+          "relerr_bf16_from_iqx": {
+            "mean": 0.523503592446635,
+            "min": 0.5105284127748565,
+            "max": 0.6077885040655591,
+            "n": 8
+          },
+          "relerr_bf16_from_bf16": {
+            "mean": 0.3995785834385112,
+            "min": 0.39445845563420806,
+            "max": 0.4347907646199202,
+            "n": 8
+          },
+          "relerr_src_from_iqx": {
+            "mean": 0.31114093904730855,
+            "min": 0.30502172737412925,
+            "max": 0.3524698714961004,
+            "n": 8
+          }
+        }
+      },
+      "samples": [
+        {
+          "layer": 1,
+          "proj": "gate",
+          "expert": 0,
+          "bf16_tensor": "model.layers.1.mlp.experts.0.gate_proj.weight",
+          "bf16_shard": "model-00001-of-00099.safetensors",
+          "bf16_abs_begin": 12654608,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "90e5ab0fa91dc6241ae76e50164d2306df1c6908c39ccd2d992b5aaeafd56e13",
+          "gguf": {
+            "gguf_tensor": "blk.1.ffn_gate_exps.weight",
+            "split_file": "Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf",
+            "ggml_type": "IQ1_M",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 0,
+            "byte_start": 1019135040,
+            "byte_len": 1376256,
+            "sha256": "d8313865550c766a6b13cc7365f21e5c30dc1d684405ef7dd3220142b9221ed2"
+          },
+          "cos_bf16_src": 0.8723299769047265,
+          "relerr_bf16_src": 0.5397962795410878,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.8836075220701439,
+              "cos_bf16_from_iqx": 0.8184393428817383,
+              "cos_src_from_iqx": 0.9263738494177993,
+              "delta_cos": -0.06516817918840567,
+              "relerr_bf16_from_bf16": 0.4682283064625476,
+              "relerr_bf16_from_iqx": 0.6089329365750165,
+              "relerr_src_from_iqx": 0.3766052191819428
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9095838949672772,
+              "cos_bf16_from_iqx": 0.8289871260998721,
+              "cos_src_from_iqx": 0.936390394454315,
+              "delta_cos": -0.08059676886740508,
+              "relerr_bf16_from_bf16": 0.4347907646199202,
+              "relerr_bf16_from_iqx": 0.6077885040655591,
+              "relerr_src_from_iqx": 0.3524698714961004
+            }
+          }
+        },
+        {
+          "layer": 12,
+          "proj": "up",
+          "expert": 40,
+          "bf16_tensor": "model.layers.12.mlp.experts.40.up_proj.weight",
+          "bf16_shard": "model-00067-of-00099.safetensors",
+          "bf16_abs_begin": 4819327568,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "6aee9d4dbe2d36cfefc221cd24f592c29e4f3104c66602b7a8a6519a2c7d153a",
+          "gguf": {
+            "gguf_tensor": "blk.12.ffn_up_exps.weight",
+            "split_file": "Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf",
+            "ggml_type": "IQ1_M",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 40,
+            "byte_start": 11209625920,
+            "byte_len": 1376256,
+            "sha256": "64345bb69c1c6d14c8af53f0f193e92b5591cd6a7273f30c9e05d856445982f2"
+          },
+          "cos_bf16_src": 0.9043259311066022,
+          "relerr_bf16_src": 0.4545863415921665,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9016490175192557,
+              "cos_bf16_from_iqx": 0.8666092116371983,
+              "cos_src_from_iqx": 0.9611569756422386,
+              "delta_cos": -0.03503980588205746,
+              "relerr_bf16_from_bf16": 0.4324685529440097,
+              "relerr_bf16_from_iqx": 0.5218865583311773,
+              "relerr_src_from_iqx": 0.27600229741280846
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9241746085922861,
+              "cos_bf16_from_iqx": 0.8641528169948693,
+              "cos_src_from_iqx": 0.9535418170782259,
+              "delta_cos": -0.06002179159741672,
+              "relerr_bf16_from_bf16": 0.39447174573182764,
+              "relerr_bf16_from_iqx": 0.5120406473735385,
+              "relerr_src_from_iqx": 0.30532878593643537
+            }
+          }
+        },
+        {
+          "layer": 23,
+          "proj": "gate",
+          "expert": 80,
+          "bf16_tensor": "model.layers.23.mlp.experts.80.gate_proj.weight",
+          "bf16_shard": "model-00038-of-00099.safetensors",
+          "bf16_abs_begin": 6467689040,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "08b6c51751c959222be8fcc17a0242c85344a86d710a1b26d00458bca78d4133",
+          "gguf": {
+            "gguf_tensor": "blk.23.ffn_gate_exps.weight",
+            "split_file": "Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf",
+            "ggml_type": "IQ1_M",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 80,
+            "byte_start": 20373593664,
+            "byte_len": 1376256,
+            "sha256": "1b934f6e5dfd046ab231f4eb8c2978d0e37182d14dc4bd640d5c398303da8b77"
+          },
+          "cos_bf16_src": 0.904539156935632,
+          "relerr_bf16_src": 0.45378777849483354,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9016514271737257,
+              "cos_bf16_from_iqx": 0.8668026883178073,
+              "cos_src_from_iqx": 0.9611455523181796,
+              "delta_cos": -0.03484873885591844,
+              "relerr_bf16_from_bf16": 0.43246352896118934,
+              "relerr_bf16_from_iqx": 0.5212577695414939,
+              "relerr_src_from_iqx": 0.2760420751659288
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9241522284239241,
+              "cos_bf16_from_iqx": 0.8643265346284349,
+              "cos_src_from_iqx": 0.9535854877623682,
+              "delta_cos": -0.05982569379548919,
+              "relerr_bf16_from_bf16": 0.3945824629931787,
+              "relerr_bf16_from_iqx": 0.5116196575992474,
+              "relerr_src_from_iqx": 0.30515765941834655
+            }
+          }
+        },
+        {
+          "layer": 34,
+          "proj": "up",
+          "expert": 120,
+          "bf16_tensor": "model.layers.34.mlp.experts.120.up_proj.weight",
+          "bf16_shard": "model-00009-of-00099.safetensors",
+          "bf16_abs_begin": 968956496,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "0273d5137f4aaf87234c434f980ea2ef96e99bd9cb62bf41eccf20ef992e5071",
+          "gguf": {
+            "gguf_tensor": "blk.34.ffn_up_exps.weight",
+            "split_file": "Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf",
+            "ggml_type": "IQ1_M",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 120,
+            "byte_start": 30077381440,
+            "byte_len": 1376256,
+            "sha256": "c768194dfa694077d9cae0a136ec0a9638377f8dcb8ab363a97806a90c91eed1"
+          },
+          "cos_bf16_src": 0.9047863405754669,
+          "relerr_bf16_src": 0.4531921591192357,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9016294923212786,
+              "cos_bf16_from_iqx": 0.8670356321447086,
+              "cos_src_from_iqx": 0.9611911401022093,
+              "delta_cos": -0.03459386017657007,
+              "relerr_bf16_from_bf16": 0.4325092584788099,
+              "relerr_bf16_from_iqx": 0.5208028669501972,
+              "relerr_src_from_iqx": 0.27588329451583693
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9241194032138229,
+              "cos_bf16_from_iqx": 0.8646864573844159,
+              "cos_src_from_iqx": 0.9536513787736843,
+              "delta_cos": -0.05943294582940706,
+              "relerr_bf16_from_bf16": 0.3945908459389213,
+              "relerr_bf16_from_iqx": 0.5108659605353932,
+              "relerr_src_from_iqx": 0.30502172737412925
+            }
+          }
+        },
+        {
+          "layer": 45,
+          "proj": "gate",
+          "expert": 160,
+          "bf16_tensor": "model.layers.45.mlp.experts.160.gate_proj.weight",
+          "bf16_shard": "model-00075-of-00099.safetensors",
+          "bf16_abs_begin": 2617317968,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "b62084f072494b05d29eafbe1765b30bde5f96631575c217ae4a385d0d25c7ea",
+          "gguf": {
+            "gguf_tensor": "blk.45.ffn_gate_exps.weight",
+            "split_file": "Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf",
+            "ggml_type": "IQ1_M",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 160,
+            "byte_start": 39236139072,
+            "byte_len": 1376256,
+            "sha256": "6507456daff80787860dba29ae54ffdd90c8eca480cbd4e7ee6f521d2ef0279d"
+          },
+          "cos_bf16_src": 0.9047363915329503,
+          "relerr_bf16_src": 0.45319462832378854,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9016863003794318,
+              "cos_bf16_from_iqx": 0.8669681128345453,
+              "cos_src_from_iqx": 0.9610362849005508,
+              "delta_cos": -0.034718187544886425,
+              "relerr_bf16_from_bf16": 0.43239081362592796,
+              "relerr_bf16_from_iqx": 0.5207955959858519,
+              "relerr_src_from_iqx": 0.27642224796505815
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.924111417165525,
+              "cos_bf16_from_iqx": 0.8644655405575769,
+              "cos_src_from_iqx": 0.9534694493174278,
+              "delta_cos": -0.05964587660794818,
+              "relerr_bf16_from_bf16": 0.3947206524855153,
+              "relerr_bf16_from_iqx": 0.5114354739536218,
+              "relerr_src_from_iqx": 0.30538548721462994
+            }
+          }
+        },
+        {
+          "layer": 56,
+          "proj": "up",
+          "expert": 24,
+          "bf16_tensor": "model.layers.56.mlp.experts.24.up_proj.weight",
+          "bf16_shard": "model-00046-of-00099.safetensors",
+          "bf16_abs_begin": 4139850320,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "4e3cae0f80cbdb458f98390ebdfd27cd97b029d9a9a002d14076fe5c3d6857c6",
+          "gguf": {
+            "gguf_tensor": "blk.56.ffn_up_exps.weight",
+            "split_file": "Hy3-IQ1_M/Hy3-IQ1_M-00002-of-00002.gguf",
+            "ggml_type": "IQ1_M",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 24,
+            "byte_start": 8831733504,
+            "byte_len": 1376256,
+            "sha256": "96eb55437c4585dc4c6017b9a07da6c60db52fb23370a47dc30427f009ccde8c"
+          },
+          "cos_bf16_src": 0.905066712296672,
+          "relerr_bf16_src": 0.4524540868159662,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9017408591080829,
+              "cos_bf16_from_iqx": 0.8673558865041938,
+              "cos_src_from_iqx": 0.9613010565386569,
+              "delta_cos": -0.034384972603889064,
+              "relerr_bf16_from_bf16": 0.4322770212070255,
+              "relerr_bf16_from_iqx": 0.5201415884034254,
+              "relerr_src_from_iqx": 0.2755000520927747
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9241832402813253,
+              "cos_bf16_from_iqx": 0.8648823159975373,
+              "cos_src_from_iqx": 0.9535844207329732,
+              "delta_cos": -0.05930092428378797,
+              "relerr_bf16_from_bf16": 0.39445845563420806,
+              "relerr_bf16_from_iqx": 0.5105284127748565,
+              "relerr_src_from_iqx": 0.3051616618847687
+            }
+          }
+        },
+        {
+          "layer": 67,
+          "proj": "gate",
+          "expert": 96,
+          "bf16_tensor": "model.layers.67.mlp.experts.96.gate_proj.weight",
+          "bf16_shard": "model-00017-of-00099.safetensors",
+          "bf16_abs_begin": 7109417552,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "ef5fe9243a08056d2ea947019e67c8fe97f639e4299806925d06f18518ec433c",
+          "gguf": {
+            "gguf_tensor": "blk.67.ffn_gate_exps.weight",
+            "split_file": "Hy3-IQ1_M/Hy3-IQ1_M-00002-of-00002.gguf",
+            "ggml_type": "IQ1_M",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 96,
+            "byte_start": 18034531328,
+            "byte_len": 1376256,
+            "sha256": "38c22a50dddfd5b372f850cd5215c6d48166b19745b8201f8735bc7d8f7f8b3f"
+          },
+          "cos_bf16_src": 0.9050055389030598,
+          "relerr_bf16_src": 0.4526446606526669,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9017864571391262,
+              "cos_bf16_from_iqx": 0.8672748329006177,
+              "cos_src_from_iqx": 0.961268189547808,
+              "delta_cos": -0.03451162423850851,
+              "relerr_bf16_from_bf16": 0.43218188964045395,
+              "relerr_bf16_from_iqx": 0.5203316966922747,
+              "relerr_src_from_iqx": 0.27561470898492607
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9241655199484325,
+              "cos_bf16_from_iqx": 0.8648500650346423,
+              "cos_src_from_iqx": 0.9536150824149899,
+              "delta_cos": -0.0593154549137902,
+              "relerr_bf16_from_bf16": 0.39453955790904405,
+              "relerr_bf16_from_iqx": 0.5105721507541002,
+              "relerr_src_from_iqx": 0.305104152253727
+            }
+          }
+        },
+        {
+          "layer": 78,
+          "proj": "up",
+          "expert": 168,
+          "bf16_tensor": "model.layers.78.mlp.experts.168.up_proj.weight",
+          "bf16_shard": "model-00083-of-00099.safetensors",
+          "bf16_abs_begin": 2931890768,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "d726c7dee3656a6bc37261a39916108b35aa4678a5d59aabff83efba52293678",
+          "gguf": {
+            "gguf_tensor": "blk.78.ffn_up_exps.weight",
+            "split_file": "Hy3-IQ1_M/Hy3-IQ1_M-00002-of-00002.gguf",
+            "ggml_type": "IQ1_M",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 168,
+            "byte_start": 28172626176,
+            "byte_len": 1376256,
+            "sha256": "4262510189409f620dd7b9b8011fe34a9f3834c75dcf4acec3f4d38747ca03b3"
+          },
+          "cos_bf16_src": 0.9037658184570677,
+          "relerr_bf16_src": 0.4553475217024016,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9017687082352135,
+              "cos_bf16_from_iqx": 0.8663659891633781,
+              "cos_src_from_iqx": 0.9608320861703785,
+              "delta_cos": -0.03540271907183534,
+              "relerr_bf16_from_bf16": 0.43221892236491183,
+              "relerr_bf16_from_iqx": 0.5218169341560471,
+              "relerr_src_from_iqx": 0.277131200328758
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9241868265061546,
+              "cos_bf16_from_iqx": 0.863547373051313,
+              "cos_src_from_iqx": 0.9534100274859956,
+              "delta_cos": -0.06063945345484156,
+              "relerr_bf16_from_bf16": 0.39447418219547437,
+              "relerr_bf16_from_iqx": 0.5131779325167631,
+              "relerr_src_from_iqx": 0.30549816680033137
+            }
+          }
+        }
+      ]
+    },
+    "IQ2_XXS": {
+      "split_files": [
+        "Hy3-IQ2_XXS/Hy3-IQ2_XXS-00001-of-00003.gguf",
+        "Hy3-IQ2_XXS/Hy3-IQ2_XXS-00002-of-00003.gguf",
+        "Hy3-IQ2_XXS/Hy3-IQ2_XXS-00003-of-00003.gguf"
+      ],
+      "header_bytes": 10485760,
+      "imatrix_metadata": {
+        "general.architecture": "hy_v3",
+        "general.name": "Hy3",
+        "general.quantization_version": 2,
+        "general.file_type": 19,
+        "quantize.imatrix.file": "/models_out/Hy3-GGUF/Hy3-imatrix.gguf",
+        "quantize.imatrix.dataset": "/training_dir/calibration_datav5.txt",
+        "quantize.imatrix.entries_count": 876,
+        "quantize.imatrix.chunks_count": 812
+      },
+      "exps_gate_up_type_note": "gate/up_exps uniformly this format across 79 layers (+1 layer Q4_0, excluded by type filter)",
+      "n_samples": 8,
+      "source_quality": {
+        "cos_bf16_src": {
+          "mean": 0.9405610467369312,
+          "min": 0.922420228060778,
+          "max": 0.9434007533888561,
+          "n": 8
+        },
+        "relerr_bf16_src": {
+          "mean": 0.35345261005638945,
+          "min": 0.3441803472576002,
+          "max": 0.41307790605964706,
+          "n": 8
+        }
+      },
+      "verdict": {
+        "t158": {
+          "cos_bf16_from_iqx": {
+            "mean": 0.8480299648599477,
+            "min": 0.8052812901228612,
+            "max": 0.8544698889394102,
+            "n": 8
+          },
+          "cos_bf16_from_bf16": {
+            "mean": 0.8994399729932823,
+            "min": 0.8836075220701439,
+            "max": 0.9017864571391262,
+            "n": 8
+          },
+          "cos_src_from_iqx": {
+            "mean": 0.9112430340299591,
+            "min": 0.8879065553427965,
+            "max": 0.9146735984368017,
+            "n": 8
+          },
+          "delta_cos": {
+            "mean": -0.0514100081333345,
+            "min": -0.07832623194728272,
+            "max": -0.047270970168672655,
+            "n": 8
+          },
+          "relerr_bf16_from_iqx": {
+            "mean": 0.5385022216767087,
+            "min": 0.5276854151022559,
+            "max": 0.6101068352012341,
+            "n": 8
+          },
+          "relerr_bf16_from_bf16": {
+            "mean": 0.4368422867106095,
+            "min": 0.43218188964045395,
+            "max": 0.4682283064625476,
+            "n": 8
+          },
+          "relerr_src_from_iqx": {
+            "mean": 0.41136365190039836,
+            "min": 0.40419328094381984,
+            "max": 0.46002385702270643,
+            "n": 8
+          }
+        },
+        "q2_gs64": {
+          "cos_bf16_from_iqx": {
+            "mean": 0.8583008260750171,
+            "min": 0.825350880953286,
+            "max": 0.8633689090108452,
+            "n": 8
+          },
+          "cos_bf16_from_bf16": {
+            "mean": 0.9223346423873434,
+            "min": 0.9095838949672772,
+            "max": 0.9241868265061546,
+            "n": 8
+          },
+          "cos_src_from_iqx": {
+            "mean": 0.9186324467948235,
+            "min": 0.8958736948447941,
+            "max": 0.9219981333171428,
+            "n": 8
+          },
+          "delta_cos": {
+            "mean": -0.0640338163123263,
+            "min": -0.08423301401399119,
+            "max": -0.06081433127048008,
+            "n": 8
+          },
+          "relerr_bf16_from_iqx": {
+            "mean": 0.5142657850051994,
+            "min": 0.5049946188591896,
+            "max": 0.5746696341752023,
+            "n": 8
+          },
+          "relerr_bf16_from_bf16": {
+            "mean": 0.3995785834385112,
+            "min": 0.39445845563420806,
+            "max": 0.4347907646199202,
+            "n": 8
+          },
+          "relerr_src_from_iqx": {
+            "mean": 0.399819303053015,
+            "min": 0.3931575999367988,
+            "max": 0.44494154666178304,
+            "n": 8
+          }
+        }
+      },
+      "samples": [
+        {
+          "layer": 1,
+          "proj": "gate",
+          "expert": 0,
+          "bf16_tensor": "model.layers.1.mlp.experts.0.gate_proj.weight",
+          "bf16_shard": "model-00001-of-00099.safetensors",
+          "bf16_abs_begin": 12654608,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "90e5ab0fa91dc6241ae76e50164d2306df1c6908c39ccd2d992b5aaeafd56e13",
+          "gguf": {
+            "gguf_tensor": "blk.1.ffn_gate_exps.weight",
+            "split_file": "Hy3-IQ2_XXS/Hy3-IQ2_XXS-00001-of-00003.gguf",
+            "ggml_type": "IQ2_XXS",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 0,
+            "byte_start": 1056877600,
+            "byte_len": 1622016,
+            "sha256": "97159350d5c609b9a6e551226ef9a635255ab15082674bd93a85bc3cda85a089"
+          },
+          "cos_bf16_src": 0.922420228060778,
+          "relerr_bf16_src": 0.41307790605964706,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.8836075220701439,
+              "cos_bf16_from_iqx": 0.8052812901228612,
+              "cos_src_from_iqx": 0.8879065553427965,
+              "delta_cos": -0.07832623194728272,
+              "relerr_bf16_from_bf16": 0.4682283064625476,
+              "relerr_bf16_from_iqx": 0.6101068352012341,
+              "relerr_src_from_iqx": 0.46002385702270643
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9095838949672772,
+              "cos_bf16_from_iqx": 0.825350880953286,
+              "cos_src_from_iqx": 0.8958736948447941,
+              "delta_cos": -0.08423301401399119,
+              "relerr_bf16_from_bf16": 0.4347907646199202,
+              "relerr_bf16_from_iqx": 0.5746696341752023,
+              "relerr_src_from_iqx": 0.44494154666178304
+            }
+          }
+        },
+        {
+          "layer": 12,
+          "proj": "up",
+          "expert": 40,
+          "bf16_tensor": "model.layers.12.mlp.experts.40.up_proj.weight",
+          "bf16_shard": "model-00067-of-00099.safetensors",
+          "bf16_abs_begin": 4819327568,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "6aee9d4dbe2d36cfefc221cd24f592c29e4f3104c66602b7a8a6519a2c7d153a",
+          "gguf": {
+            "gguf_tensor": "blk.12.ffn_up_exps.weight",
+            "split_file": "Hy3-IQ2_XXS/Hy3-IQ2_XXS-00001-of-00003.gguf",
+            "ggml_type": "IQ2_XXS",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 40,
+            "byte_start": 12776585504,
+            "byte_len": 1622016,
+            "sha256": "d6b73648d328b464468aaed0c1e380580ae13f3931f7a0581fb9c85a2c4b556d"
+          },
+          "cos_bf16_src": 0.9426800442209152,
+          "relerr_bf16_src": 0.3465062115673954,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9016490175192557,
+              "cos_bf16_from_iqx": 0.8536162873002179,
+              "cos_src_from_iqx": 0.9144658307332109,
+              "delta_cos": -0.04803273021903787,
+              "relerr_bf16_from_bf16": 0.4324685529440097,
+              "relerr_bf16_from_iqx": 0.5292807045075005,
+              "relerr_src_from_iqx": 0.40466312484177924
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9241746085922861,
+              "cos_bf16_from_iqx": 0.8624984178297935,
+              "cos_src_from_iqx": 0.9217733934426883,
+              "delta_cos": -0.06167619076249253,
+              "relerr_bf16_from_bf16": 0.39447174573182764,
+              "relerr_bf16_from_iqx": 0.5065874052842108,
+              "relerr_src_from_iqx": 0.39346675091939187
+            }
+          }
+        },
+        {
+          "layer": 23,
+          "proj": "gate",
+          "expert": 80,
+          "bf16_tensor": "model.layers.23.mlp.experts.80.gate_proj.weight",
+          "bf16_shard": "model-00038-of-00099.safetensors",
+          "bf16_abs_begin": 6467689040,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "08b6c51751c959222be8fcc17a0242c85344a86d710a1b26d00458bca78d4133",
+          "gguf": {
+            "gguf_tensor": "blk.23.ffn_gate_exps.weight",
+            "split_file": "Hy3-IQ2_XXS/Hy3-IQ2_XXS-00001-of-00003.gguf",
+            "ggml_type": "IQ2_XXS",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 80,
+            "byte_start": 23460333088,
+            "byte_len": 1622016,
+            "sha256": "5fac68ef1e3dcaee55ea92a3bf319380801dbfa49b533110279c5e5521d1b563"
+          },
+          "cos_bf16_src": 0.9430092914892764,
+          "relerr_bf16_src": 0.34537583633501345,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9016514271737257,
+              "cos_bf16_from_iqx": 0.8539519534144231,
+              "cos_src_from_iqx": 0.9145414862330618,
+              "delta_cos": -0.04769947375930261,
+              "relerr_bf16_from_bf16": 0.43246352896118934,
+              "relerr_bf16_from_iqx": 0.5286031583030885,
+              "relerr_src_from_iqx": 0.4044921136184996
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9241522284239241,
+              "cos_bf16_from_iqx": 0.8627829916559325,
+              "cos_src_from_iqx": 0.9218208852813674,
+              "delta_cos": -0.06136923676799155,
+              "relerr_bf16_from_bf16": 0.3945824629931787,
+              "relerr_bf16_from_iqx": 0.5060499356388809,
+              "relerr_src_from_iqx": 0.39343584899668177
+            }
+          }
+        },
+        {
+          "layer": 34,
+          "proj": "up",
+          "expert": 120,
+          "bf16_tensor": "model.layers.34.mlp.experts.120.up_proj.weight",
+          "bf16_shard": "model-00009-of-00099.safetensors",
+          "bf16_abs_begin": 968956496,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "0273d5137f4aaf87234c434f980ea2ef96e99bd9cb62bf41eccf20ef992e5071",
+          "gguf": {
+            "gguf_tensor": "blk.34.ffn_up_exps.weight",
+            "split_file": "Hy3-IQ2_XXS/Hy3-IQ2_XXS-00001-of-00003.gguf",
+            "ggml_type": "IQ2_XXS",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 120,
+            "byte_start": 34778272544,
+            "byte_len": 1622016,
+            "sha256": "d83275d0fe8fe6d1db04d922575b22cd25f361266b9d95fa67bd53ab31bcb87a"
+          },
+          "cos_bf16_src": 0.9433473224780664,
+          "relerr_bf16_src": 0.34438979104168005,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9016294923212786,
+              "cos_bf16_from_iqx": 0.8543096047155249,
+              "cos_src_from_iqx": 0.9146180123755773,
+              "delta_cos": -0.047319887605753785,
+              "relerr_bf16_from_bf16": 0.4325092584788099,
+              "relerr_bf16_from_iqx": 0.5279959106216648,
+              "relerr_src_from_iqx": 0.4043190467092755
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9241194032138229,
+              "cos_bf16_from_iqx": 0.8632247336615829,
+              "cos_src_from_iqx": 0.9219072485400346,
+              "delta_cos": -0.06089466955223999,
+              "relerr_bf16_from_bf16": 0.3945908459389213,
+              "relerr_bf16_from_iqx": 0.5052404287277745,
+              "relerr_src_from_iqx": 0.3934103682623168
+            }
+          }
+        },
+        {
+          "layer": 45,
+          "proj": "gate",
+          "expert": 160,
+          "bf16_tensor": "model.layers.45.mlp.experts.160.gate_proj.weight",
+          "bf16_shard": "model-00075-of-00099.safetensors",
+          "bf16_abs_begin": 2617317968,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "b62084f072494b05d29eafbe1765b30bde5f96631575c217ae4a385d0d25c7ea",
+          "gguf": {
+            "gguf_tensor": "blk.45.ffn_gate_exps.weight",
+            "split_file": "Hy3-IQ2_XXS/Hy3-IQ2_XXS-00002-of-00003.gguf",
+            "ggml_type": "IQ2_XXS",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 160,
+            "byte_start": 5548293824,
+            "byte_len": 1622016,
+            "sha256": "fec3b3a86dbffcd93270f6fcadb9f4912b75514ccd65a47bf633f8cfc75c71b3"
+          },
+          "cos_bf16_src": 0.9432583699943319,
+          "relerr_bf16_src": 0.34458403295603734,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9016863003794318,
+              "cos_bf16_from_iqx": 0.8542107170727622,
+              "cos_src_from_iqx": 0.9146114901806263,
+              "delta_cos": -0.047475583306669566,
+              "relerr_bf16_from_bf16": 0.43239081362592796,
+              "relerr_bf16_from_iqx": 0.5281253879835179,
+              "relerr_src_from_iqx": 0.40433380029296023
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.924111417165525,
+              "cos_bf16_from_iqx": 0.8631519597227035,
+              "cos_src_from_iqx": 0.9219611366140101,
+              "delta_cos": -0.060959457442821496,
+              "relerr_bf16_from_bf16": 0.3947206524855153,
+              "relerr_bf16_from_iqx": 0.5053731160149301,
+              "relerr_src_from_iqx": 0.3932322352891893
+            }
+          }
+        },
+        {
+          "layer": 56,
+          "proj": "up",
+          "expert": 24,
+          "bf16_tensor": "model.layers.56.mlp.experts.24.up_proj.weight",
+          "bf16_shard": "model-00046-of-00099.safetensors",
+          "bf16_abs_begin": 4139850320,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "4e3cae0f80cbdb458f98390ebdfd27cd97b029d9a9a002d14076fe5c3d6857c6",
+          "gguf": {
+            "gguf_tensor": "blk.56.ffn_up_exps.weight",
+            "split_file": "Hy3-IQ2_XXS/Hy3-IQ2_XXS-00002-of-00003.gguf",
+            "ggml_type": "IQ2_XXS",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 24,
+            "byte_start": 16582822848,
+            "byte_len": 1622016,
+            "sha256": "e7b73d5a4d5b8ada014f797cab8d7946ba25d6f85cf0b1aab1aeea024b518244"
+          },
+          "cos_bf16_src": 0.9433985137527877,
+          "relerr_bf16_src": 0.34418194411997993,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9017408591080829,
+              "cos_bf16_from_iqx": 0.8544698889394102,
+              "cos_src_from_iqx": 0.9146735984368017,
+              "delta_cos": -0.047270970168672655,
+              "relerr_bf16_from_bf16": 0.4322770212070255,
+              "relerr_bf16_from_iqx": 0.5276854151022559,
+              "relerr_src_from_iqx": 0.40419328094381984
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9241832402813253,
+              "cos_bf16_from_iqx": 0.8633689090108452,
+              "cos_src_from_iqx": 0.9219981333171428,
+              "delta_cos": -0.06081433127048008,
+              "relerr_bf16_from_bf16": 0.39445845563420806,
+              "relerr_bf16_from_iqx": 0.5049946188591896,
+              "relerr_src_from_iqx": 0.3931575999367988
+            }
+          }
+        },
+        {
+          "layer": 67,
+          "proj": "gate",
+          "expert": 96,
+          "bf16_tensor": "model.layers.67.mlp.experts.96.gate_proj.weight",
+          "bf16_shard": "model-00017-of-00099.safetensors",
+          "bf16_abs_begin": 7109417552,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "ef5fe9243a08056d2ea947019e67c8fe97f639e4299806925d06f18518ec433c",
+          "gguf": {
+            "gguf_tensor": "blk.67.ffn_gate_exps.weight",
+            "split_file": "Hy3-IQ2_XXS/Hy3-IQ2_XXS-00002-of-00003.gguf",
+            "ggml_type": "IQ2_XXS",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 96,
+            "byte_start": 27313264832,
+            "byte_len": 1622016,
+            "sha256": "1b557a153e131997c812d86df57f505750d74715de0ab3c3c7f9e35e4e2ccc65"
+          },
+          "cos_bf16_src": 0.9434007533888561,
+          "relerr_bf16_src": 0.3441803472576002,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9017864571391262,
+              "cos_bf16_from_iqx": 0.8544095963621692,
+              "cos_src_from_iqx": 0.9145412968088678,
+              "delta_cos": -0.04737686077695702,
+              "relerr_bf16_from_bf16": 0.43218188964045395,
+              "relerr_bf16_from_iqx": 0.5277724555712741,
+              "relerr_src_from_iqx": 0.4044925419035538
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9241655199484325,
+              "cos_bf16_from_iqx": 0.8632130707393568,
+              "cos_src_from_iqx": 0.921825472541818,
+              "delta_cos": -0.06095244920907572,
+              "relerr_bf16_from_bf16": 0.39453955790904405,
+              "relerr_bf16_from_iqx": 0.5052628830995675,
+              "relerr_src_from_iqx": 0.3935532772884923
+            }
+          }
+        },
+        {
+          "layer": 78,
+          "proj": "up",
+          "expert": 168,
+          "bf16_tensor": "model.layers.78.mlp.experts.168.up_proj.weight",
+          "bf16_shard": "model-00083-of-00099.safetensors",
+          "bf16_abs_begin": 2931890768,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "d726c7dee3656a6bc37261a39916108b35aa4678a5d59aabff83efba52293678",
+          "gguf": {
+            "gguf_tensor": "blk.78.ffn_up_exps.weight",
+            "split_file": "Hy3-IQ2_XXS/Hy3-IQ2_XXS-00002-of-00003.gguf",
+            "ggml_type": "IQ2_XXS",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 168,
+            "byte_start": 39007315392,
+            "byte_len": 1622016,
+            "sha256": "f9f41b4e52f752cb8dcf6e9bf1d8aee6419f5cda8d82e1e4ef0232099162a0f8"
+          },
+          "cos_bf16_src": 0.9429738505104376,
+          "relerr_bf16_src": 0.3453248111137623,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9017687082352135,
+              "cos_bf16_from_iqx": 0.8539903809522137,
+              "cos_src_from_iqx": 0.9145860021287304,
+              "delta_cos": -0.0477783272829998,
+              "relerr_bf16_from_bf16": 0.43221892236491183,
+              "relerr_bf16_from_iqx": 0.5284479061231341,
+              "relerr_src_from_iqx": 0.4043914498705922
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9241868265061546,
+              "cos_bf16_from_iqx": 0.8628156450266368,
+              "cos_src_from_iqx": 0.9218996097767327,
+              "delta_cos": -0.06137118147951781,
+              "relerr_bf16_from_bf16": 0.39447418219547437,
+              "relerr_bf16_from_iqx": 0.5059482582418394,
+              "relerr_src_from_iqx": 0.3933567970694662
+            }
+          }
+        }
+      ]
+    },
+    "IQ3_XXS": {
+      "split_files": [
+        "Hy3-IQ3_XXS/Hy3-IQ3_XXS-00001-of-00004.gguf",
+        "Hy3-IQ3_XXS/Hy3-IQ3_XXS-00002-of-00004.gguf",
+        "Hy3-IQ3_XXS/Hy3-IQ3_XXS-00003-of-00004.gguf",
+        "Hy3-IQ3_XXS/Hy3-IQ3_XXS-00004-of-00004.gguf"
+      ],
+      "header_bytes": 11010048,
+      "imatrix_metadata": {
+        "general.architecture": "hy_v3",
+        "general.name": "Hy3",
+        "general.quantization_version": 2,
+        "general.file_type": 23,
+        "quantize.imatrix.file": "/models_out/Hy3-GGUF/Hy3-imatrix.gguf",
+        "quantize.imatrix.dataset": "/training_dir/calibration_datav5.txt",
+        "quantize.imatrix.entries_count": 876,
+        "quantize.imatrix.chunks_count": 812
+      },
+      "exps_gate_up_type_note": "gate/up_exps uniformly this format across 79 layers (+1 layer Q4_0, excluded by type filter)",
+      "n_samples": 8,
+      "source_quality": {
+        "cos_bf16_src": {
+          "mean": 0.9829736303043112,
+          "min": 0.9782260955231248,
+          "max": 0.9837148711076011,
+          "n": 8
+        },
+        "relerr_bf16_src": {
+          "mean": 0.18605330307951753,
+          "min": 0.18205643206154512,
+          "max": 0.21163279867359017,
+          "n": 8
+        }
+      },
+      "verdict": {
+        "t158": {
+          "cos_bf16_from_iqx": {
+            "mean": 0.8874919468753442,
+            "min": 0.8651410665486287,
+            "max": 0.8908332891073344,
+            "n": 8
+          },
+          "cos_bf16_from_bf16": {
+            "mean": 0.8994399729932823,
+            "min": 0.8836075220701439,
+            "max": 0.9017864571391262,
+            "n": 8
+          },
+          "cos_src_from_iqx": {
+            "mean": 0.9005820531380114,
+            "min": 0.8847739322210343,
+            "max": 0.9029175833969308,
+            "n": 8
+          },
+          "delta_cos": {
+            "mean": -0.011948026117938187,
+            "min": -0.018466455521515268,
+            "max": -0.010953168031791805,
+            "n": 8
+          },
+          "relerr_bf16_from_iqx": {
+            "mean": 0.46118904382203046,
+            "min": 0.4549392344585601,
+            "max": 0.5028920964513964,
+            "n": 8
+          },
+          "relerr_bf16_from_bf16": {
+            "mean": 0.4368422867106095,
+            "min": 0.43218188964045395,
+            "max": 0.4682283064625476,
+            "n": 8
+          },
+          "relerr_src_from_iqx": {
+            "mean": 0.4344814629325323,
+            "min": 0.42981372430783205,
+            "max": 0.46602048116337524,
+            "n": 8
+          }
+        },
+        "q2_gs64": {
+          "cos_bf16_from_iqx": {
+            "mean": 0.9097674366964876,
+            "min": 0.8925588502214675,
+            "max": 0.9122982428551963,
+            "n": 8
+          },
+          "cos_bf16_from_bf16": {
+            "mean": 0.9223346423873434,
+            "min": 0.9095838949672772,
+            "max": 0.9241868265061546,
+            "n": 8
+          },
+          "cos_src_from_iqx": {
+            "mean": 0.9233048465793721,
+            "min": 0.9098503472169638,
+            "max": 0.9252997412719884,
+            "n": 8
+          },
+          "delta_cos": {
+            "mean": -0.012567205690855857,
+            "min": -0.01702504474580968,
+            "max": -0.011867277093236206,
+            "n": 8
+          },
+          "relerr_bf16_from_iqx": {
+            "mean": 0.43183448060081847,
+            "min": 0.42498986231784347,
+            "max": 0.47878812043019797,
+            "n": 8
+          },
+          "relerr_bf16_from_bf16": {
+            "mean": 0.3995785834385112,
+            "min": 0.39445845563420806,
+            "max": 0.4347907646199202,
+            "n": 8
+          },
+          "relerr_src_from_iqx": {
+            "mean": 0.3948554544543438,
+            "min": 0.38923793994549477,
+            "max": 0.43288395758307696,
+            "n": 8
+          }
+        },
+        "q4_gs64": {
+          "cos_bf16_from_iqx": {
+            "mean": 0.9772307344717011,
+            "min": 0.9714857257289714,
+            "max": 0.9781346582014219,
+            "n": 8
+          },
+          "cos_bf16_from_bf16": {
+            "mean": 0.9957611460079944,
+            "min": 0.9950209748881526,
+            "max": 0.9958710748126411,
+            "n": 8
+          },
+          "cos_src_from_iqx": {
+            "mean": 0.9942095517468532,
+            "min": 0.993363702924705,
+            "max": 0.9943391474418063,
+            "n": 8
+          },
+          "delta_cos": {
+            "mean": -0.018530411536293326,
+            "min": -0.02353524915918115,
+            "max": -0.017736416611219274,
+            "n": 8
+          },
+          "relerr_bf16_from_iqx": {
+            "mean": 0.21940732835744323,
+            "min": 0.21499828462330836,
+            "max": 0.24721105651408562,
+            "n": 8
+          },
+          "relerr_bf16_from_bf16": {
+            "mean": 0.09208295978461621,
+            "min": 0.0909219940889794,
+            "max": 0.0998871640803112,
+            "n": 8
+          },
+          "relerr_src_from_iqx": {
+            "mean": 0.11049406816266667,
+            "min": 0.1092504955486908,
+            "max": 0.11838659395746572,
+            "n": 8
+          }
+        }
+      },
+      "samples": [
+        {
+          "layer": 1,
+          "proj": "gate",
+          "expert": 0,
+          "bf16_tensor": "model.layers.1.mlp.experts.0.gate_proj.weight",
+          "bf16_shard": "model-00001-of-00099.safetensors",
+          "bf16_abs_begin": 12654608,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "90e5ab0fa91dc6241ae76e50164d2306df1c6908c39ccd2d992b5aaeafd56e13",
+          "gguf": {
+            "gguf_tensor": "blk.1.ffn_gate_exps.weight",
+            "split_file": "Hy3-IQ3_XXS/Hy3-IQ3_XXS-00001-of-00004.gguf",
+            "ggml_type": "IQ3_XXS",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 0,
+            "byte_start": 1417507488,
+            "byte_len": 2408448,
+            "sha256": "a14a63a1d564ce1255579e4f0bb5f484a6db719f3de41aebecb8b984851a93a5"
+          },
+          "cos_bf16_src": 0.9782260955231248,
+          "relerr_bf16_src": 0.21163279867359017,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.8836075220701439,
+              "cos_bf16_from_iqx": 0.8651410665486287,
+              "cos_src_from_iqx": 0.8847739322210343,
+              "delta_cos": -0.018466455521515268,
+              "relerr_bf16_from_bf16": 0.4682283064625476,
+              "relerr_bf16_from_iqx": 0.5028920964513964,
+              "relerr_src_from_iqx": 0.46602048116337524
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9095838949672772,
+              "cos_bf16_from_iqx": 0.8925588502214675,
+              "cos_src_from_iqx": 0.9098503472169638,
+              "delta_cos": -0.01702504474580968,
+              "relerr_bf16_from_bf16": 0.4347907646199202,
+              "relerr_bf16_from_iqx": 0.47878812043019797,
+              "relerr_src_from_iqx": 0.43288395758307696
+            },
+            "q4_gs64": {
+              "cos_bf16_from_bf16": 0.9950209748881526,
+              "cos_bf16_from_iqx": 0.9714857257289714,
+              "cos_src_from_iqx": 0.993363702924705,
+              "delta_cos": -0.02353524915918115,
+              "relerr_bf16_from_bf16": 0.0998871640803112,
+              "relerr_bf16_from_iqx": 0.24721105651408562,
+              "relerr_src_from_iqx": 0.11838659395746572
+            }
+          }
+        },
+        {
+          "layer": 12,
+          "proj": "up",
+          "expert": 40,
+          "bf16_tensor": "model.layers.12.mlp.experts.40.up_proj.weight",
+          "bf16_shard": "model-00067-of-00099.safetensors",
+          "bf16_abs_begin": 4819327568,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "6aee9d4dbe2d36cfefc221cd24f592c29e4f3104c66602b7a8a6519a2c7d153a",
+          "gguf": {
+            "gguf_tensor": "blk.12.ffn_up_exps.weight",
+            "split_file": "Hy3-IQ3_XXS/Hy3-IQ3_XXS-00001-of-00004.gguf",
+            "ggml_type": "IQ3_XXS",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 40,
+            "byte_start": 20018462624,
+            "byte_len": 2408448,
+            "sha256": "64d3405a27acc1e8605d4ea38287c727f4e23843480f615523a8efdca77efb8d"
+          },
+          "cos_bf16_src": 0.9835863384979571,
+          "relerr_bf16_src": 0.18279745799820812,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9016490175192557,
+              "cos_bf16_from_iqx": 0.8905280088764942,
+              "cos_src_from_iqx": 0.9026991173239627,
+              "delta_cos": -0.011121008642761554,
+              "relerr_bf16_from_bf16": 0.4324685529440097,
+              "relerr_bf16_from_iqx": 0.4555490698622212,
+              "relerr_src_from_iqx": 0.4302723598614156
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9241746085922861,
+              "cos_bf16_from_iqx": 0.912216300304221,
+              "cos_src_from_iqx": 0.92522625570855,
+              "delta_cos": -0.0119583082880651,
+              "relerr_bf16_from_bf16": 0.39447174573182764,
+              "relerr_bf16_from_iqx": 0.42526330674749657,
+              "relerr_src_from_iqx": 0.3894698527754265
+            },
+            "q4_gs64": {
+              "cos_bf16_from_bf16": 0.9958592945310436,
+              "cos_bf16_from_iqx": 0.9779675855117779,
+              "cos_src_from_iqx": 0.9943236100028439,
+              "delta_cos": -0.017891709019265734,
+              "relerr_bf16_from_bf16": 0.09105109536044786,
+              "relerr_bf16_from_iqx": 0.21591231561938778,
+              "relerr_src_from_iqx": 0.10944645822153089
+            }
+          }
+        },
+        {
+          "layer": 23,
+          "proj": "gate",
+          "expert": 80,
+          "bf16_tensor": "model.layers.23.mlp.experts.80.gate_proj.weight",
+          "bf16_shard": "model-00038-of-00099.safetensors",
+          "bf16_abs_begin": 6467689040,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "08b6c51751c959222be8fcc17a0242c85344a86d710a1b26d00458bca78d4133",
+          "gguf": {
+            "gguf_tensor": "blk.23.ffn_gate_exps.weight",
+            "split_file": "Hy3-IQ3_XXS/Hy3-IQ3_XXS-00001-of-00004.gguf",
+            "ggml_type": "IQ3_XXS",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 80,
+            "byte_start": 36454337696,
+            "byte_len": 2408448,
+            "sha256": "8395ce4ab99e67dfd1d3b92a41c7b734ee2496fb61faf667f017a7c80d5ae59c"
+          },
+          "cos_bf16_src": 0.9836476397861292,
+          "relerr_bf16_src": 0.18243213513827805,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9016514271737257,
+              "cos_bf16_from_iqx": 0.890588117610742,
+              "cos_src_from_iqx": 0.9028413745654493,
+              "delta_cos": -0.011063309562983736,
+              "relerr_bf16_from_bf16": 0.43246352896118934,
+              "relerr_bf16_from_iqx": 0.45542867735005854,
+              "relerr_src_from_iqx": 0.42997378105449335
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9241522284239241,
+              "cos_bf16_from_iqx": 0.9122173667229554,
+              "cos_src_from_iqx": 0.9252505882536363,
+              "delta_cos": -0.01193486170096869,
+              "relerr_bf16_from_bf16": 0.3945824629931787,
+              "relerr_bf16_from_iqx": 0.4251530041118397,
+              "relerr_src_from_iqx": 0.38935270782291337
+            },
+            "q4_gs64": {
+              "cos_bf16_from_bf16": 0.9958630102493875,
+              "cos_bf16_from_iqx": 0.9780315451423056,
+              "cos_src_from_iqx": 0.9943267254823854,
+              "delta_cos": -0.01783146510708189,
+              "relerr_bf16_from_bf16": 0.09100874915683474,
+              "relerr_bf16_from_iqx": 0.21553408003667116,
+              "relerr_src_from_iqx": 0.10938954738225865
+            }
+          }
+        },
+        {
+          "layer": 34,
+          "proj": "up",
+          "expert": 120,
+          "bf16_tensor": "model.layers.34.mlp.experts.120.up_proj.weight",
+          "bf16_shard": "model-00009-of-00099.safetensors",
+          "bf16_abs_begin": 968956496,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "0273d5137f4aaf87234c434f980ea2ef96e99bd9cb62bf41eccf20ef992e5071",
+          "gguf": {
+            "gguf_tensor": "blk.34.ffn_up_exps.weight",
+            "split_file": "Hy3-IQ3_XXS/Hy3-IQ3_XXS-00002-of-00004.gguf",
+            "ggml_type": "IQ3_XXS",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 120,
+            "byte_start": 13987817536,
+            "byte_len": 2408448,
+            "sha256": "b6157d3b76d681fe7083c488fdc752707a357a38947df58f4108107ea98f03a7"
+          },
+          "cos_bf16_src": 0.9836772709850852,
+          "relerr_bf16_src": 0.18225363658974103,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9016294923212786,
+              "cos_bf16_from_iqx": 0.8906493528914134,
+              "cos_src_from_iqx": 0.9028042315879172,
+              "delta_cos": -0.010980139429865199,
+              "relerr_bf16_from_bf16": 0.4325092584788099,
+              "relerr_bf16_from_iqx": 0.45529988901514806,
+              "relerr_src_from_iqx": 0.4300517636602283
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9241194032138229,
+              "cos_bf16_from_iqx": 0.912146612660182,
+              "cos_src_from_iqx": 0.9251480962223895,
+              "delta_cos": -0.011972790553640866,
+              "relerr_bf16_from_bf16": 0.3945908459389213,
+              "relerr_bf16_from_iqx": 0.42515604318212663,
+              "relerr_src_from_iqx": 0.3894994107741683
+            },
+            "q4_gs64": {
+              "cos_bf16_from_bf16": 0.995867255108576,
+              "cos_bf16_from_iqx": 0.9780647912712164,
+              "cos_src_from_iqx": 0.9943229229457895,
+              "delta_cos": -0.017802463837359617,
+              "relerr_bf16_from_bf16": 0.09096257461254144,
+              "relerr_bf16_from_iqx": 0.21537667972085786,
+              "relerr_src_from_iqx": 0.10944741756172267
+            }
+          }
+        },
+        {
+          "layer": 45,
+          "proj": "gate",
+          "expert": 160,
+          "bf16_tensor": "model.layers.45.mlp.experts.160.gate_proj.weight",
+          "bf16_shard": "model-00075-of-00099.safetensors",
+          "bf16_abs_begin": 2617317968,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "b62084f072494b05d29eafbe1765b30bde5f96631575c217ae4a385d0d25c7ea",
+          "gguf": {
+            "gguf_tensor": "blk.45.ffn_gate_exps.weight",
+            "split_file": "Hy3-IQ3_XXS/Hy3-IQ3_XXS-00002-of-00004.gguf",
+            "ggml_type": "IQ3_XXS",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 160,
+            "byte_start": 30215025984,
+            "byte_len": 2408448,
+            "sha256": "7e64bd7d5cc568ab49669d8cb8d05c35dc3bd29b9eb6b56ae44e46db6c5d2404"
+          },
+          "cos_bf16_src": 0.9836672012256508,
+          "relerr_bf16_src": 0.18231101960022175,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9016863003794318,
+              "cos_bf16_from_iqx": 0.8906847277632164,
+              "cos_src_from_iqx": 0.9028266904522779,
+              "delta_cos": -0.011001572616215372,
+              "relerr_bf16_from_bf16": 0.43239081362592796,
+              "relerr_bf16_from_iqx": 0.4552303762392104,
+              "relerr_src_from_iqx": 0.430004612778961
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.924111417165525,
+              "cos_bf16_from_iqx": 0.912206233323572,
+              "cos_src_from_iqx": 0.9252021901099033,
+              "delta_cos": -0.011905183841953049,
+              "relerr_bf16_from_bf16": 0.3947206524855153,
+              "relerr_bf16_from_iqx": 0.42525735933843795,
+              "relerr_src_from_iqx": 0.3895608987654058
+            },
+            "q4_gs64": {
+              "cos_bf16_from_bf16": 0.9958683380876918,
+              "cos_bf16_from_iqx": 0.9780651096224445,
+              "cos_src_from_iqx": 0.9943332630779101,
+              "delta_cos": -0.01780322846524729,
+              "relerr_bf16_from_bf16": 0.09095362632285343,
+              "relerr_bf16_from_iqx": 0.21540009061693333,
+              "relerr_src_from_iqx": 0.10937157854986171
+            }
+          }
+        },
+        {
+          "layer": 56,
+          "proj": "up",
+          "expert": 24,
+          "bf16_tensor": "model.layers.56.mlp.experts.24.up_proj.weight",
+          "bf16_shard": "model-00046-of-00099.safetensors",
+          "bf16_abs_begin": 4139850320,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "4e3cae0f80cbdb458f98390ebdfd27cd97b029d9a9a002d14076fe5c3d6857c6",
+          "gguf": {
+            "gguf_tensor": "blk.56.ffn_up_exps.weight",
+            "split_file": "Hy3-IQ3_XXS/Hy3-IQ3_XXS-00003-of-00004.gguf",
+            "ggml_type": "IQ3_XXS",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 24,
+            "byte_start": 7227359136,
+            "byte_len": 2408448,
+            "sha256": "2abef2dc1003f1f1329bcac888a6c25572313895ae5a25937dab5c3509df039e"
+          },
+          "cos_bf16_src": 0.9837110014347057,
+          "relerr_bf16_src": 0.18206565059350896,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9017408591080829,
+              "cos_bf16_from_iqx": 0.8907823150040982,
+              "cos_src_from_iqx": 0.9028840192238327,
+              "delta_cos": -0.010958544103984669,
+              "relerr_bf16_from_bf16": 0.4322770212070255,
+              "relerr_bf16_from_iqx": 0.4550367840207546,
+              "relerr_src_from_iqx": 0.429884226082215
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9241832402813253,
+              "cos_bf16_from_iqx": 0.9122625724507446,
+              "cos_src_from_iqx": 0.9252359111990834,
+              "delta_cos": -0.011920667830580656,
+              "relerr_bf16_from_bf16": 0.39445845563420806,
+              "relerr_bf16_from_iqx": 0.42498986231784347,
+              "relerr_src_from_iqx": 0.3893662814347847
+            },
+            "q4_gs64": {
+              "cos_bf16_from_bf16": 0.9958707421037879,
+              "cos_bf16_from_iqx": 0.9781307705313456,
+              "cos_src_from_iqx": 0.9943381028700026,
+              "delta_cos": -0.017739971572442337,
+              "relerr_bf16_from_bf16": 0.09092450672835511,
+              "relerr_bf16_from_iqx": 0.21499828462330836,
+              "relerr_src_from_iqx": 0.1092504955486908
+            }
+          }
+        },
+        {
+          "layer": 67,
+          "proj": "gate",
+          "expert": 96,
+          "bf16_tensor": "model.layers.67.mlp.experts.96.gate_proj.weight",
+          "bf16_shard": "model-00017-of-00099.safetensors",
+          "bf16_abs_begin": 7109417552,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "ef5fe9243a08056d2ea947019e67c8fe97f639e4299806925d06f18518ec433c",
+          "gguf": {
+            "gguf_tensor": "blk.67.ffn_gate_exps.weight",
+            "split_file": "Hy3-IQ3_XXS/Hy3-IQ3_XXS-00003-of-00004.gguf",
+            "ggml_type": "IQ3_XXS",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 96,
+            "byte_start": 23748693152,
+            "byte_len": 2408448,
+            "sha256": "2fa796171ba3b9742f2a2f78f684cc33eb036afb1fdf94d092327eb71efa187d"
+          },
+          "cos_bf16_src": 0.9837148711076011,
+          "relerr_bf16_src": 0.18205643206154512,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9017864571391262,
+              "cos_bf16_from_iqx": 0.8908332891073344,
+              "cos_src_from_iqx": 0.9029094763326865,
+              "delta_cos": -0.010953168031791805,
+              "relerr_bf16_from_bf16": 0.43218188964045395,
+              "relerr_bf16_from_iqx": 0.4549392344585601,
+              "relerr_src_from_iqx": 0.4298307545517382
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9241655199484325,
+              "cos_bf16_from_iqx": 0.9122982428551963,
+              "cos_src_from_iqx": 0.9252256426524619,
+              "delta_cos": -0.011867277093236206,
+              "relerr_bf16_from_bf16": 0.39453955790904405,
+              "relerr_bf16_from_iqx": 0.42502025099523816,
+              "relerr_src_from_iqx": 0.38947258653347977
+            },
+            "q4_gs64": {
+              "cos_bf16_from_bf16": 0.9958710748126411,
+              "cos_bf16_from_iqx": 0.9781346582014219,
+              "cos_src_from_iqx": 0.9943289392293827,
+              "delta_cos": -0.017736416611219274,
+              "relerr_bf16_from_bf16": 0.0909219940889794,
+              "relerr_bf16_from_iqx": 0.21502798836415146,
+              "relerr_src_from_iqx": 0.10936167234664668
+            }
+          }
+        },
+        {
+          "layer": 78,
+          "proj": "up",
+          "expert": 168,
+          "bf16_tensor": "model.layers.78.mlp.experts.168.up_proj.weight",
+          "bf16_shard": "model-00083-of-00099.safetensors",
+          "bf16_abs_begin": 2931890768,
+          "bf16_nbytes": 12582912,
+          "bf16_sha256": "d726c7dee3656a6bc37261a39916108b35aa4678a5d59aabff83efba52293678",
+          "gguf": {
+            "gguf_tensor": "blk.78.ffn_up_exps.weight",
+            "split_file": "Hy3-IQ3_XXS/Hy3-IQ3_XXS-00004-of-00004.gguf",
+            "ggml_type": "IQ3_XXS",
+            "dims_ne": [
+              4096,
+              1536,
+              192
+            ],
+            "expert": 168,
+            "byte_start": 2559759840,
+            "byte_len": 2408448,
+            "sha256": "056e05c04823573a773d554bc343cb55d9c78c79be3724e60282ddad49c9a8a7"
+          },
+          "cos_bf16_src": 0.9835586238742355,
+          "relerr_bf16_src": 0.18287729398104707,
+          "targets": {
+            "t158": {
+              "cos_bf16_from_bf16": 0.9017687082352135,
+              "cos_bf16_from_iqx": 0.8907286972008256,
+              "cos_src_from_iqx": 0.9029175833969308,
+              "delta_cos": -0.011040011034387898,
+              "relerr_bf16_from_bf16": 0.43221892236491183,
+              "relerr_bf16_from_iqx": 0.4551362231788945,
+              "relerr_src_from_iqx": 0.42981372430783205
+            },
+            "q2_gs64": {
+              "cos_bf16_from_bf16": 0.9241868265061546,
+              "cos_bf16_from_iqx": 0.912233315033562,
+              "cos_src_from_iqx": 0.9252997412719884,
+              "delta_cos": -0.011953511472592604,
+              "relerr_bf16_from_bf16": 0.39447418219547437,
+              "relerr_bf16_from_iqx": 0.4250478976833674,
+              "relerr_src_from_iqx": 0.38923793994549477
+            },
+            "q4_gs64": {
+              "cos_bf16_from_bf16": 0.9958684782826744,
+              "cos_bf16_from_iqx": 0.9779656897641251,
+              "cos_src_from_iqx": 0.9943391474418063,
+              "delta_cos": -0.017902788518549317,
+              "relerr_bf16_from_bf16": 0.09095396792660647,
+              "relerr_bf16_from_iqx": 0.21579813136415016,
+              "relerr_src_from_iqx": 0.10929878173315627
+            }
+          }
+        }
+      ]
+    }
+  },
+  "download_bytes": {
+    "headers": 31457280,
+    "iq_slices": 43253760,
+    "hand_validate": 1622016,
+    "total": 76333056
+  },
+  "elapsed_seconds": 30.4
+}

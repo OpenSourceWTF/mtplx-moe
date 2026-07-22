@@ -1,0 +1,147 @@
+{
+  "format": "mtplx-glm52-q1t-ternary-cosine-v1",
+  "scope": "glm52-expert-q1t only",
+  "revision": {
+    "branch": "experiment/issue51-stack-69",
+    "git_head": "57352c10e8d8b5a813991e780cca44da78e52a45"
+  },
+  "measurement": {
+    "reference": "real glm52-expert-q2 record, record SHA verified, MLX affine Q2 g64 dequantized on Device(cpu, 0)",
+    "candidate": "real installed glm52-expert-q1t record, record SHA verified, decoded with the production t158 decoder",
+    "aggregation": "FP32 NumPy SwiGLU on deterministic synthetic standard-normal post-RMSNorm proxy hiddens; top8 uses one deterministic Dirichlet routing-weight vector",
+    "not_measured": "BF16-to-Q1T loss, captured GLM decode hiddens, end-to-end task quality, or GPU arithmetic"
+  },
+  "configuration": {
+    "layers": [3, 40, 77],
+    "experts_per_layer": 8,
+    "hidden_draws": 32,
+    "top_k": 8,
+    "seed": 51,
+    "mlx_device": "Device(cpu, 0)"
+  },
+  "artifact_identity": {
+    "q2": {
+      "root": "/Users/davidtai/.cache/huggingface/glm52-expert-only-mlx-q2",
+      "model_key": "glm52-expert-q2",
+      "manifest": "/Users/davidtai/.cache/huggingface/glm52-expert-only-mlx-q2/expert-manifest.json",
+      "manifest_file_sha256": "a24a1438608b14cc39b5bf241890aed653877d7e3005e30d6566d8cc33fe69a6",
+      "manifest_content_sha256": "d06a3eb5b9449948918297859922904e797a2815666a69f21295f9fd36edfe5c",
+      "sidecar_size": 226492416000,
+      "sidecar_declared_sha256": "8157ddb8aeb8624d4e1607b83233c75dbd40c76994c8ff7d73b875c9826f447b"
+    },
+    "q1t": {
+      "root": "/Users/davidtai/.cache/huggingface/glm52-expert-only-mlx-q1t",
+      "model_key": "glm52-expert-q1t",
+      "codec": "t158",
+      "authoritative_manifest": "/Users/davidtai/.cache/huggingface/glm52-expert-only-mlx-q1t/expert-manifest.json",
+      "authoritative_manifest_file_sha256": "f6d2916b306287a5fbb992ce39cde77c5e63bbc538b184d82ca403e0c5f24f74",
+      "authoritative_manifest_content_sha256": "5017b201e858931cfeafa466a8173e685af8dfcd3a47679bccd491d6a7122dd1",
+      "conversion_receipt": "/Users/davidtai/.cache/huggingface/glm52-expert-only-mlx-q1t/expert-manifest-q1-t158.json",
+      "conversion_receipt_file_sha256": "0fd85061a9f0c97767cf80eb5d8dce6dcfe89edfa013f6d92c54df9daa957d84",
+      "source_model_key": "glm52-expert-q2",
+      "source_manifest_sha256": "d06a3eb5b9449948918297859922904e797a2815666a69f21295f9fd36edfe5c",
+      "sidecar_size": 169869312000,
+      "sidecar_declared_sha256": "113779b686e7beda7a74e9f077b464c622b1bb4e17a05b068287b0b1e7144334"
+    },
+    "probe_source": "scripts/probe_glm52_shadow_codecs.py",
+    "probe_source_sha256": "78ad747ce9182074793da77d5b47bbe3a7ef40ae9645627f5c09e86ddaaa5a49"
+  },
+  "integrity": {
+    "sampled_q2_record_hashes_verified": 24,
+    "sampled_q1t_record_hashes_verified": 24,
+    "conversion_receipt_source_link_matches": true,
+    "whole_169869312000_byte_sidecar_rehashed_in_this_run": false,
+    "cpu_reencode_of_layer_3_expert_22_bitwise_equal_installed_q1t": false,
+    "cpu_reencode_note": "CPU and artifact-build affine arithmetic differ slightly, so this receipt reads and decodes the installed Q1T bytes directly instead of treating a fresh CPU re-encode as the candidate."
+  },
+  "sample_ids": {
+    "3": [22, 52, 76, 77, 83, 110, 187, 240],
+    "40": [29, 58, 106, 149, 154, 173, 195, 235],
+    "77": [16, 20, 21, 27, 32, 177, 187, 188]
+  },
+  "summary": {
+    "projection_weight_cosine": {
+      "all": {
+        "n": 72,
+        "min": 0.9675541786760212,
+        "median": 0.9730010985766602,
+        "p95": 0.9732228291047921,
+        "max": 0.973285747125409,
+        "mean": 0.9725718937262842
+      },
+      "gate_proj": {
+        "n": 24,
+        "min": 0.9726243101877947,
+        "median": 0.9730067532267996,
+        "p95": 0.973253855974636,
+        "max": 0.973285747125409,
+        "mean": 0.9729805966777546
+      },
+      "up_proj": {
+        "n": 24,
+        "min": 0.9725929630702085,
+        "median": 0.9730403849137413,
+        "p95": 0.9732186670504586,
+        "max": 0.9732579580487142,
+        "mean": 0.9729793116566379
+      },
+      "down_proj": {
+        "n": 24,
+        "min": 0.9675541786760212,
+        "median": 0.9727295576421657,
+        "p95": 0.9730677596250593,
+        "max": 0.9730907518023039,
+        "mean": 0.9717557728444604
+      }
+    },
+    "expert_output_cosine": {
+      "n": 24,
+      "min": 0.9135393425868864,
+      "median": 0.9204470409802451,
+      "p95": 0.925120278811161,
+      "max": 0.9256611250844927,
+      "mean": 0.9206895882601934
+    },
+    "top8_combined_cosine": {
+      "n": 3,
+      "min": 0.9221851459170423,
+      "median": 0.9224855631003678,
+      "p95": 0.9224875935208416,
+      "max": 0.9224878191231165,
+      "mean": 0.9223861760468423
+    },
+    "top8_by_layer": {
+      "3": {
+        "cosine": 0.9224855631003678,
+        "rel_l2": 0.3912276459195143
+      },
+      "40": {
+        "cosine": 0.9224878191231165,
+        "rel_l2": 0.38621237267318587
+      },
+      "77": {
+        "cosine": 0.9221851459170423,
+        "rel_l2": 0.38733585091386
+      }
+    },
+    "projection_floor_census": {
+      "0.99": {
+        "pass": 0,
+        "fail": 72
+      },
+      "0.97": {
+        "pass": 66,
+        "fail": 6
+      },
+      "0.96": {
+        "pass": 72,
+        "fail": 0
+      }
+    }
+  },
+  "raw_run": {
+    "path": "/tmp/glm52-q1t-ternary-cosine-installed-artifact-cpu-seed51-20260719.raw.json",
+    "sha256": "ca91b657b35c7ed08f93428f04ceba3a4f29d608f75de3ef9ed04e9e43ff7746",
+    "elapsed_seconds": 5.6616652500000555
+  }
+}

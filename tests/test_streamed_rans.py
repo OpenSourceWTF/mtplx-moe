@@ -8,6 +8,7 @@ uncompressed run, read-bytes dropped, and the memory plan untouched.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from mtplx.expert_streamed_codec import (
     decode_record_reference,
     encode_record_payload,
     load_streamed_codec_manifest,
+    merge_streamed_codec_shards,
     validate_against_base,
     write_streamed_rans_sidecar,
 )
@@ -65,7 +67,9 @@ def test_encode_decode_record_roundtrip_reference(payload: bytes) -> None:
     [6912, 1000, 1033, 4096],
 )
 def test_metal_decode_matches_source(size: int) -> None:
-    payload = np.random.default_rng(size).integers(0, 6, size=size).astype(np.uint8).tobytes()
+    payload = (
+        np.random.default_rng(size).integers(0, 6, size=size).astype(np.uint8).tobytes()
+    )
     blob = encode_record_payload(payload)
     decoded = decode_container(blob)
     host = bytes(np.array(decoded, dtype=np.uint8).reshape(-1)[:size])
@@ -192,6 +196,45 @@ def test_converter_smoke_slice_limits_records(tmp_path: Path) -> None:
     assert manifest.records[0].expert == 0
 
 
+def test_merge_shards_realigns_offsets_and_publishes_full_integrity(
+    tmp_path: Path,
+) -> None:
+    root, _config, _spec, _manifest_path, base = _base_with_sidecar(tmp_path)
+    shard_manifests = []
+    for record in base.records:
+        shard_manifest = root / "shards" / f"codec-e{record.expert}.json"
+        write_streamed_rans_sidecar(
+            base,
+            root,
+            output_bin=root / "shards" / f"experts-e{record.expert}.bin",
+            output_manifest=shard_manifest,
+            layers=[record.layer],
+            experts=[record.expert],
+            limit=1,
+        )
+        shard_manifests.append(shard_manifest)
+
+    merged_path = root / "experts-rans32x.bin"
+    merged_manifest_path = root / "codec.json"
+    merged = merge_streamed_codec_shards(
+        shard_manifests,
+        root,
+        output_bin=merged_path,
+        output_manifest=merged_manifest_path,
+        base_manifest=base,
+    )
+
+    assert merged.size == merged_path.stat().st_size
+    assert merged.sha256 == hashlib.sha256(merged_path.read_bytes()).hexdigest()
+    assert merged.records[1].offset % merged.alignment == 0
+    assert (
+        merged.records[1].offset >= merged.records[0].offset + merged.records[0].length
+    )
+    validate_against_base(merged, base)
+    reloaded = load_streamed_codec_manifest(merged_manifest_path)
+    assert reloaded == merged
+
+
 def test_validate_against_base_rejects_wrong_raw_length(tmp_path: Path) -> None:
     root, _config, _spec, _manifest_path, base = _base_with_sidecar(tmp_path)
     manifest = write_streamed_rans_sidecar(
@@ -204,7 +247,9 @@ def test_validate_against_base_rejects_wrong_raw_length(tmp_path: Path) -> None:
 
     broken = replace(
         manifest,
-        records=(replace(manifest.records[0], raw_length=manifest.records[0].raw_length + 1),)
+        records=(
+            replace(manifest.records[0], raw_length=manifest.records[0].raw_length + 1),
+        )
         + manifest.records[1:],
     )
     with pytest.raises(StreamedCodecError, match="raw_length"):
@@ -214,7 +259,16 @@ def test_validate_against_base_rejects_wrong_raw_length(tmp_path: Path) -> None:
 # --------------------------------------------------------- reader decode-on-miss
 
 
-def _open_runtime(root, manifest_path, spec, config_dict, *, streamed_codec, codec_manifest, codec_verify=True):
+def _open_runtime(
+    root,
+    manifest_path,
+    spec,
+    config_dict,
+    *,
+    streamed_codec,
+    codec_manifest,
+    codec_verify=True,
+):
     fixed = spec.resident_bytes + spec.transient_scratch_bytes
     cfg = ExpertStreamingConfig(
         model_key=spec.key,
@@ -223,7 +277,9 @@ def _open_runtime(root, manifest_path, spec, config_dict, *, streamed_codec, cod
         runtime_reserve_bytes=0,
         slot_layout="component-banks",
         streamed_codec=streamed_codec,
-        streamed_codec_manifest=(str(codec_manifest) if streamed_codec != "none" else None),
+        streamed_codec_manifest=(
+            str(codec_manifest) if streamed_codec != "none" else None
+        ),
         streamed_codec_verify=codec_verify,
     )
     plan = cfg.memory_plan(spec)
@@ -246,7 +302,7 @@ def test_reader_decode_on_miss_is_bitwise_identical_and_saves_read_bytes(
 ) -> None:
     root, config, spec, manifest_path, base = _base_with_sidecar(tmp_path)
     codec_manifest_path = root / "expert-streamed-codec-rans32x.json"
-    codec_manifest = write_streamed_rans_sidecar(
+    write_streamed_rans_sidecar(
         base,
         root,
         output_bin=root / "experts-rans32x.bin",
@@ -421,8 +477,12 @@ def test_streamed_codec_verify_off_skips_hash_but_stays_bitwise(tmp_path: Path) 
 
     def forward(codec, verify=True):
         runtime, _plan = _open_runtime(
-            root, manifest_path, spec, config,
-            streamed_codec=codec, codec_manifest=codec_manifest_path,
+            root,
+            manifest_path,
+            spec,
+            config,
+            streamed_codec=codec,
+            codec_manifest=codec_manifest_path,
             codec_verify=verify,
         )
         try:
@@ -446,8 +506,12 @@ def test_streamed_codec_verify_off_skips_hash_but_stays_bitwise(tmp_path: Path) 
     # container is flaky because random fixture layouts move the payload.
     def forward_corrupted(codec_verify):
         runtime, _plan = _open_runtime(
-            root, manifest_path, spec, config,
-            streamed_codec="rans32x-v1", codec_manifest=codec_manifest_path,
+            root,
+            manifest_path,
+            spec,
+            config,
+            streamed_codec="rans32x-v1",
+            codec_manifest=codec_manifest_path,
             codec_verify=codec_verify,
         )
         try:
@@ -471,6 +535,7 @@ def test_streamed_codec_verify_off_skips_hash_but_stays_bitwise(tmp_path: Path) 
         forward_corrupted(True)
     io_corrupt_off = forward_corrupted(False)
     assert io_corrupt_off["integrity_errors"] == 0  # hash never consulted
+
 
 def test_streamed_codec_verify_validation() -> None:
     with pytest.raises(TypeError, match="streamed_codec_verify"):

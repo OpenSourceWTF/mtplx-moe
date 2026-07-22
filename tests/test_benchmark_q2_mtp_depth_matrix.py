@@ -455,6 +455,40 @@ def test_parser_defaults_to_both_models_and_the_required_matrix() -> None:
     assert args.glm52_q2_prompt_tail is None
 
 
+def test_glm52_q1t_request_uses_its_installed_spec_and_artifact_paths(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    root = tmp_path / "glm-q1t"
+    mtp = tmp_path / "glm-mtp-q4"
+    args = module.build_parser().parse_args(
+        [
+            "--model",
+            "glm52-q1t",
+            "--glm52-q1t-model-root",
+            str(root),
+            "--glm52-q1t-mtp-artifacts",
+            str(mtp),
+            "--mtp-precision",
+            "q4",
+        ]
+    )
+
+    requests = module._requests_from_args(args)
+    assert requests == [
+        {
+            "model": "glm52-q1t",
+            "model_root": root.resolve(),
+            "manifest": (root / "expert-manifest.json").resolve(),
+            "depths": (1, 2, 3, 4, 5),
+            "mtp_artifacts": mtp.resolve(),
+            "mtp_precision": "q4",
+        }
+    ]
+    normalized = module._normalized_request(requests[0], mtp_disabled_baseline=False)
+    assert normalized["model_key"] == "glm52-expert-q1t"
+
+
 def test_miss_shadow_flag_parses_and_reaches_runtime_options() -> None:
     module = _load_module()
 
@@ -501,8 +535,10 @@ def test_streamed_codec_flags_parse_and_reach_runtime_options() -> None:
 
     args = module.build_parser().parse_args(
         [
-            "--streamed-codec", "rans32x-v1",
-            "--streamed-codec-manifest", "/tmp/codec.json",
+            "--streamed-codec",
+            "rans32x-v1",
+            "--streamed-codec-manifest",
+            "/tmp/codec.json",
             "--no-streamed-codec-verify",
         ]
     )
@@ -531,10 +567,96 @@ def test_streamed_codec_survives_to_runtime_config(tmp_path: Path) -> None:
     )
 
     assert calls.configs[0]["streamed_codec"] == "rans32x-v1"
-    assert calls.configs[0]["streamed_codec_manifest"] == str(
-        tmp_path / "codec.json"
-    )
+    assert calls.configs[0]["streamed_codec_manifest"] == str(tmp_path / "codec.json")
     assert calls.configs[0]["streamed_codec_verify"] is False
+
+
+@pytest.mark.skip(reason="fused-rANS route closed 2026-07-20")
+def test_glm52_q1t_fused_rans_uses_existing_runtime_settings() -> None:
+    module = _load_module()
+    parser = module.build_parser()
+    manifest = "/tmp/expert-manifest-glm52-q1t-fused-rans.json"
+
+    args = parser.parse_args(
+        [
+            "--slot-layout",
+            "fused-rans",
+            "--banked-manifest",
+            manifest,
+            "--banked-codec",
+            "rans32x-uniform-packed-v1",
+            "--expert-cache-limit",
+            "72GiB",
+            "--transient-slots",
+            "48",
+            "--memory-limit",
+            "96GiB",
+            "--split-route-release",
+            "deferred",
+        ]
+    )
+    options = module._runtime_options_from_args(args)
+
+    assert "execution_lane" not in options
+    assert options["slot_layout"] == "fused-rans"
+    assert options["banked_manifest"] == manifest
+    assert options["banked_codec"] == "rans32x-uniform-packed-v1"
+    assert options["expert_cache_limit"] == "72GiB"
+    assert options["transient_slots"] == 48
+    assert options["split_route_release"] == "deferred"
+    assert options["streamed_codec"] == "none"
+
+
+@pytest.mark.skip(reason="fused-rANS route closed 2026-07-20")
+def test_glm52_q1t_fused_rans_settings_survive_to_runtime_config(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    apis, calls = _fake_apis(module)
+
+    module.run_depth_matrix(
+        [
+            {
+                "model": "glm52-q1t",
+                "model_root": tmp_path / "glm-q1t",
+                "manifest": tmp_path / "expert-manifest.json",
+                "mtp_artifacts": tmp_path / "mtp-q4",
+                "mtp_precision": "q4",
+                "depths": (3,),
+            }
+        ],
+        contexts=(1024,),
+        runtime_options={
+            "memory_limit": "96GiB",
+            "runtime_reserve": "12GiB",
+            "expert_cache_limit": "72GiB",
+            "max_live_kv_tokens": 4096,
+            "cache_policy": "frequency",
+            "cache_scope": "layer",
+            "slot_layout": "fused-rans",
+            "banked_manifest": str(tmp_path / "fused-rans.json"),
+            "banked_codec": "rans32x-uniform-packed-v1",
+            "transient_slots": 48,
+            "deferred_pin_release": True,
+            "read_chunk": "8MiB",
+            "expert_integrity": "headers-only",
+            "split_route_release": "deferred",
+            "streamed_codec": "none",
+            "streamed_codec_manifest": None,
+            "streamed_codec_verify": False,
+        },
+        apis=apis,
+    )
+
+    assert "execution_lane" not in calls.configs[0]
+    assert calls.configs[0]["slot_layout"] == "fused-rans"
+    assert calls.configs[0]["banked_codec"] == "rans32x-uniform-packed-v1"
+    assert calls.configs[0]["streamed_codec_verify"] is False
+    assert calls.configs[0]["route_census"] is False
+    assert calls.configs[0]["memory_limit_bytes"] == 96 * 1024**3
+    assert calls.configs[0]["expert_cache_limit_bytes"] == 72 * 1024**3
+    assert calls.configs[0]["transient_slots"] == 48
+    assert calls.configs[0]["split_route_release"] == "deferred"
 
 
 def test_mtp_precision_flag_parses_and_reaches_requests() -> None:
@@ -1047,9 +1169,7 @@ def test_issue51_kernel_selectors_reach_runtime_and_artifact(tmp_path: Path) -> 
         "metal-exact"
     )
     assert payload["models"][0]["runtime_config"]["q2_expert_kernel"] == "nax"
-    assert payload["models"][0]["runtime_config"]["hy3_router_kernel"] == (
-        "fused-fp32"
-    )
+    assert payload["models"][0]["runtime_config"]["hy3_router_kernel"] == ("fused-fp32")
     assert payload["models"][0]["runtime_config"]["hy3_mtp_shared_kernel"] == (
         "metal-exact"
     )
@@ -2064,6 +2184,77 @@ def test_decode_expert_cache_metrics_reject_empty_or_stale_ratios() -> None:
             model="hy3-q2",
             depth=1,
         )
+
+
+def test_fused_rans_benchmark_requires_cache72_compressed_snapshot_not_counters() -> None:
+    module = _load_module()
+    record_bytes = 8_847_360
+    persistent_bytes = 75 * 116 * record_bytes
+    transient_bytes = 48 * record_bytes
+    allocated_bytes = persistent_bytes + transient_bytes
+    reset_calls = []
+    streaming = SimpleNamespace(
+        config=SimpleNamespace(slot_layout="fused-rans"),
+        spec=SimpleNamespace(routed_layer_indices=tuple(range(3, 78))),
+        reset=lambda: reset_calls.append("reset"),
+    )
+    runtime = SimpleNamespace(
+        expert_streaming=streaming,
+        expert_streaming_snapshot=lambda: {
+            "model_key": "glm52-expert-q1t",
+            "expert_codec": "rans32x-uniform-packed-v1",
+            "gate_up_threadgroups": 64,
+            "source_compressed_bytes": 159_000_000_000,
+            "compressed_rans_persistent_cache_bytes": persistent_bytes,
+            "compressed_rans_transient_bytes": transient_bytes,
+            "compressed_rans_allocated_bytes": allocated_bytes,
+            "decoded_expert_cache_bytes": 0,
+            "persistent_slots_per_layer": 116,
+            "transient_slots": 48,
+            "metal_buffer_count": 76,
+            "metal_slot_view_count": 0,
+            "memory_caps": {
+                "total_limit_bytes": 96 * 1024**3,
+                "runtime_reserve_bytes": 12 * 1024**3,
+                "external_residency_bytes": allocated_bytes,
+                "mlx_memory_limit_bytes": 84 * 1024**3 - allocated_bytes,
+                "mlx_wired_limit_bytes": 84 * 1024**3 - allocated_bytes,
+            },
+            "memory_plan": {
+                "decoded_expert_cache_bytes": 0,
+                "compressed_rans_persistent_cache_bytes": persistent_bytes,
+                "compressed_rans_transient_bytes": transient_bytes,
+                "persistent_cache_bytes": persistent_bytes,
+                "slots_per_layer": 116,
+                "transient_slots": 48,
+            },
+        },
+    )
+
+    module._reset_expert_streaming(runtime)
+    assert reset_calls == ["reset"]
+    snapshot = module._expert_streaming_snapshot(runtime)
+    assert module._require_fused_rans_snapshot(snapshot) is None
+    assert module._streaming_cache_metrics(runtime) == (None, None)
+
+    snapshot["memory_plan"]["decoded_expert_cache_bytes"] = 1
+    with pytest.raises(module.BenchmarkGateError, match="decoded expert cache"):
+        module._require_fused_rans_snapshot(snapshot)
+
+    snapshot["memory_plan"]["decoded_expert_cache_bytes"] = 0
+    snapshot["memory_caps"]["external_residency_bytes"] = 0
+    with pytest.raises(module.BenchmarkGateError, match="compressed cache residency"):
+        module._require_fused_rans_snapshot(snapshot)
+
+    snapshot["memory_caps"]["external_residency_bytes"] = allocated_bytes
+    snapshot["metal_slot_view_count"] = 1
+    with pytest.raises(module.BenchmarkGateError, match="slot views"):
+        module._require_fused_rans_snapshot(snapshot)
+
+    snapshot["metal_slot_view_count"] = 0
+    snapshot["persistent_slots_per_layer"] = 115
+    with pytest.raises(module.BenchmarkGateError, match="116 persistent"):
+        module._require_fused_rans_snapshot(snapshot)
 
     with pytest.raises(module.BenchmarkGateError, match="disagrees"):
         module._require_decode_cache_metrics(

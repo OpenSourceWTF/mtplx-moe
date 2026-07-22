@@ -227,6 +227,54 @@ def test_glm52_bf16_loader_maps_exact_inventory_without_quantization(
     assert not any("Quantized" in type(module).__name__ for module in _modules(mtp))
 
 
+def test_glm52_bf16_resident_head_forward_runs_bf16_without_fp32_upcast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Step-3 fp32-cast trap guard (the hy3 lm_head lesson).
+
+    Per David's ruling the layer-78 BF16 head is loaded fully resident: its
+    routed expert bank is the stacked BF16 ``SwitchGLU`` (the 18.5 GiB analog),
+    read at memory bandwidth.  The forward must stay bf16 end to end -- no
+    per-step fp32 upcast of the expert matmul or the vocab projection.  Only
+    the small FP32 router gate upcasts, by design.  If the ``.astype`` guard
+    that downcasts the fp32-weighted expert sum were dropped, or the lm_head
+    were fed an fp32-cast hidden, this asserts the leak.
+    """
+    from mtplx.glm52_mtp_patch import build_glm52_mtp_module
+    from mtplx.models.glm52_mlx import FP32MoEGate, GlmMoeDsaResidentMoE
+
+    args = _args()
+    _write_artifact(tmp_path, _raw_tensors(args))
+    _trust_artifact(monkeypatch)
+
+    mtp = build_glm52_mtp_module(tmp_path, args, expected_revision=TEST_REVISION)
+    layer = mtp.layers[0]
+    moe = layer.mtp_block.mlp
+
+    # The routed expert bank is resident and bf16; the only fp32 in the head is
+    # the small router gate, never the expert projections themselves.
+    assert isinstance(moe, GlmMoeDsaResidentMoE)
+    assert isinstance(moe.gate, FP32MoEGate)
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        assert getattr(moe.switch_mlp, projection).weight.dtype == mx.bfloat16
+
+    routed = moe(mx.random.normal((1, 1, args.hidden_size)).astype(mx.bfloat16))
+    mx.eval(routed)
+    assert routed.dtype == mx.bfloat16
+
+    # Shared-head recycle + lm_head: a bf16 trunk hidden through a bf16 head
+    # stays bf16 (no materialized fp32 copy of the vocab projection per step).
+    lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+    lm_head.set_dtype(mx.bfloat16)
+    trunk_hidden = mx.random.normal((1, 1, args.hidden_size)).astype(mx.bfloat16)
+    recycle = layer.shared_head_norm(trunk_hidden)
+    logits = lm_head(recycle)
+    mx.eval(recycle, logits)
+    assert recycle.dtype == mx.bfloat16
+    assert logits.dtype == mx.bfloat16
+
+
 def test_glm52_loader_uses_verified_handle_through_materialization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

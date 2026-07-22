@@ -30,10 +30,10 @@ def _streamed_mtp_backend(model_key: str, precision: str) -> str:
         "hy3-expert-q2": ("hy3", {"bf16"}),
         "hy3-expert-oq2e": ("hy3", {"bf16"}),
         # The Q4 head sibling (issue #100) is lane-agnostic: it is selectable
-        # for either GLM streamed lane so its ~12.9 GiB budget saving reaches
-        # the memory-constrained expert-Q2 config too. BF16 stays the default
-        # until a Q4 acceptance-rate validation run lands.
+        # for every GLM streamed lane: q2 and q1t have the same resident trunk,
+        # router, and layer-78 contract; only routed record storage differs.
         "glm52-expert-q2": ("glm52", {"bf16", "q4"}),
+        "glm52-expert-q1t": ("glm52", {"bf16", "q4"}),
         "glm52-q4": ("glm52", {"bf16", "q4"}),
     }
     selected = support.get(str(model_key))
@@ -583,10 +583,8 @@ def _load_impl(
                         open_verified_glm52_mtp_layer78_q4,
                     )
 
-                    verified_artifact_context = (
-                        open_verified_glm52_mtp_layer78_q4(
-                            Path(mtp_artifacts), deep=True
-                        )
+                    verified_artifact_context = open_verified_glm52_mtp_layer78_q4(
+                        Path(mtp_artifacts), deep=True
                     )
                 else:
                     from .glm52_mtp_artifact import (
@@ -684,6 +682,15 @@ def _load_impl(
                         getattr(expert_streaming_config, "proj_requant", None),
                     )
                 )
+            if streaming_spec.is_mixed_official:
+                # Mixed-official has no uniform record size; the preflight gate
+                # must see the same manifest-derived per-layer sizes as open()
+                # (issue #51 M2, D2).
+                from .expert_manifest import load_expert_manifest
+
+                preflight_plan_kwargs["layer_record_bytes"] = load_expert_manifest(
+                    expert_manifest
+                ).record_bytes_by_layer()
             streaming_plan = expert_streaming_config.memory_plan(
                 streaming_spec,
                 **preflight_plan_kwargs,

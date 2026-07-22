@@ -151,6 +151,49 @@ class ExpertIOMetrics:
         )
         return result
 
+    def reads_per_record(self) -> float:
+        """Positional syscalls issued per record request (I/O efficiency).
+
+        The numerator is the per-syscall counters
+        (``python_preadv_invocations`` + ``native_positional_calls``) -- the
+        real ``preadv``/native ``pread`` calls -- not ``read_operations``,
+        which counts logical range-reader invocations (one per
+        ``_read_range_into``/``_readv_range_into`` call) rather than syscalls.
+        The denominator is ``record_requests``. Returns ``0.0`` before any
+        record has been requested. Pure derived accessor; no hot-path cost.
+        """
+
+        with self._lock:
+            syscalls = int(self.python_preadv_invocations) + int(
+                self.native_positional_calls
+            )
+            records = int(self.record_requests)
+        return syscalls / records if records else 0.0
+
+    def assert_read_efficiency(self, max_reads_per_record: float) -> float:
+        """Fail closed when reads-per-record exceeds an I/O budget.
+
+        Lets a benchmark gate assert the coalesced source path actually
+        collapses a record's contiguous segments into a small number of
+        positional syscalls. Returns the measured ratio on success; raises
+        :class:`ExpertIOError` naming the actual ratio and its terms on
+        failure.
+        """
+
+        with self._lock:
+            syscalls = int(self.python_preadv_invocations) + int(
+                self.native_positional_calls
+            )
+            records = int(self.record_requests)
+        ratio = syscalls / records if records else 0.0
+        if ratio > float(max_reads_per_record):
+            raise ExpertIOError(
+                f"expert reads-per-record {ratio:.4f} exceeds the "
+                f"{float(max_reads_per_record):.4f} budget "
+                f"({syscalls} positional syscalls over {records} records)"
+            )
+        return ratio
+
 
 @dataclass
 class _FDEntry:
@@ -563,6 +606,38 @@ class PositionalExpertReader:
                 read_ns=read_elapsed_ns,
             )
 
+    @staticmethod
+    def _contiguous_source_runs(
+        segments: tuple[Any, ...],
+    ) -> list[tuple[int, int]]:
+        """Group segment indices into maximal contiguous same-shard runs.
+
+        Consecutive segments join a run when they share a shard file and the
+        next begins exactly where the previous one ends
+        (``next.offset == prev.offset + prev.length``) -- i.e. they form one
+        physical extent a single positional read can service. Each run is
+        returned as a half-open ``(start_index, count)`` span over ``segments``
+        in order; a shard change or an offset gap starts a new run so
+        genuinely non-contiguous or multi-shard records keep one read per
+        segment (the exact prior fallback).
+        """
+
+        runs: list[tuple[int, int]] = []
+        start = 0
+        for index in range(1, len(segments)):
+            previous = segments[index - 1]
+            current = segments[index]
+            if (
+                current.shard == previous.shard
+                and current.offset == previous.offset + previous.length
+            ):
+                continue
+            runs.append((start, index - start))
+            start = index
+        if segments:
+            runs.append((start, len(segments) - start))
+        return runs
+
     def _codec_entry(self, record: ExpertRecord) -> Any | None:
         """The compressed-sidecar entry for a record, or None (codec inactive)."""
 
@@ -766,27 +841,59 @@ class PositionalExpertReader:
                     )
             else:
                 self.metrics.update(source_record_requests=1)
+                segments = record.segments
+                segment_cursors: list[int] = []
                 cursor = 0
-                for index, segment in enumerate(record.segments):
-                    end = cursor + segment.length
-                    target = (
-                        component_views[index]
-                        if component_views is not None
-                        else view[cursor:end]
-                    )
-                    self._read_range_into(
-                        segment.shard,
-                        segment.offset,
-                        target,
-                        cancel_event=cancel_event,
-                        deadline_ns=deadline_ns,
-                        pipeline_phase=pipeline_phase,
-                    )
-                    cursor = end
+                for segment in segments:
+                    segment_cursors.append(cursor)
+                    cursor += segment.length
                 if cursor != record.logical_bytes:
                     raise ExpertIOShortRead(
                         "expert source segments did not fill the slot"
                     )
+                # Contiguous same-shard segments are a single physical extent
+                # on disk, so coalesce each run into ONE positional read (flat
+                # view) or ONE scatter (component views) instead of paying a
+                # syscall per segment. Non-contiguous or multi-shard runs keep
+                # the per-segment fallback, exact prior behavior.
+                for start, count in self._contiguous_source_runs(segments):
+                    run = segments[start : start + count]
+                    run_shard = run[0].shard
+                    run_offset = run[0].offset
+                    if component_views is None:
+                        assert view is not None
+                        run_start = segment_cursors[start]
+                        run_stop = run_start + sum(
+                            segment.length for segment in run
+                        )
+                        self._read_range_into(
+                            run_shard,
+                            run_offset,
+                            view[run_start:run_stop],
+                            cancel_event=cancel_event,
+                            deadline_ns=deadline_ns,
+                            pipeline_phase=pipeline_phase,
+                        )
+                    elif count == 1:
+                        # Genuinely isolated segment: keep the single-range
+                        # reader (native-backend eligible), exact prior path.
+                        self._read_range_into(
+                            run_shard,
+                            run_offset,
+                            component_views[start],
+                            cancel_event=cancel_event,
+                            deadline_ns=deadline_ns,
+                            pipeline_phase=pipeline_phase,
+                        )
+                    else:
+                        self._readv_range_into(
+                            run_shard,
+                            run_offset,
+                            component_views[start : start + count],
+                            cancel_event=cancel_event,
+                            deadline_ns=deadline_ns,
+                            pipeline_phase=pipeline_phase,
+                        )
             if verify_hash:
                 hasher = hashlib.sha256()
                 if component_views is None:

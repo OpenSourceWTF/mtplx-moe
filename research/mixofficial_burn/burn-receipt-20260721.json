@@ -1,0 +1,46 @@
+{
+  "schema": "mixofficial-burn-receipt-v1",
+  "evidence_class": "CONSTRUCTION",
+  "date": "2026-07-21",
+  "started": "2026-07-21T00:02:52-05:00",
+  "finished": "2026-07-21T00:42:34-05:00",
+  "governor": "tools/mixofficial_governor.sh (e1c65aa); 4 SIGTERM pauses for benchmark windows, all resumes byte-identical by construction (journal) and verified by final strict validation",
+  "converter_commit": "794000a",
+  "source": {
+    "bf16_root": "hy3-mtp-layer80",
+    "revision": "716aa7241bd6d95896be4ebfc761162a9c4d49ef",
+    "derivation": "every tier encoded DIRECT from bf16 (no q4 intermediate)"
+  },
+  "recipe": {
+    "bf16_source": "hy3-mtp-layer80",
+    "file": "Hy3-IQ1_M.gguf",
+    "gguf_blk_to_manifest_layer_offset": 0,
+    "map_sha256": "caf3d7a5bf68ddc48fa28078903894b275d8050075de1a3e9f4bfd4a70cfbbee",
+    "repo": "AngelSlim/Hy3-GGUF"
+  },
+  "records": 15168,
+  "record_sizes": {
+    "t158_layer": 5701632,
+    "affine2_layer": 6684672,
+    "counts": {
+      "5701632": 7680,
+      "6684672": 7488
+    }
+  },
+  "layer_tier_split": {
+    "t158": 40,
+    "affine2": 39,
+    "down_all": "affine3"
+  },
+  "sidecar": {
+    "file": "experts-mixofficial.bin",
+    "size": 93843357696,
+    "sha256": "91cbd178719d95688f819045f2ccfac3ac0a7d311d338fe5a57d5e720a3edc67"
+  },
+  "manifest_sha256": "dcd6b0503c9754231a14dd05f8646dc9631bfc275f5c8eb25637ad501f76b7b5",
+  "validation": "validate_mixed_manifest strict (require_segment_alignment=16384) PASS post-burn; converter verify-sample 8/8 bitwise vs fresh bf16 encode; bin size == manifest size == exact zero-padding arithmetic (7680*5701632 + 7488*6684672)",
+  "quality": "NOT MEASURED \u2014 E1 c512 PPL gate pending (bar: <=5% rel vs q4)",
+  "log": [
+    "burn-20260721-000252.log"
+  ]
+}
