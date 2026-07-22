@@ -494,3 +494,17 @@ depths). The 10-tps program's remaining levers: R3 overlap/host-overhead
 **mmap probe:** first launch rejected at configuration — metal-mmap requires
 --expert-integrity at-open (no per-record hashing on the mapped path);
 relaunched with at-open (one-time full-sidecar hash ~15 min). Probe pending.
+
+## mmap probe outcome (2026-07-21): metal-mmap is UNBENCHMARKABLE in this lane today
+
+With at-open integrity the config gate passed; the run then failed closed at
+WARMUP: "hy3-q4 d0 decode expert-cache has no routed assignments" — all
+expert_streaming_counters zero. Load peak 13.9 GiB (trunk-only; the
+mapped-store unwired accounting works). The mapped path executes outside the
+expert-cache counters this lane hard-gates on, so pure-mmap serving cannot
+produce a valid cell without integration work (wire counters/gates through
+MappedExpertStore). Given streamed-mmap physics is independently condemned
+(demand-fault 1.4 GiB/s flat; kernel-LRU = worst simulated policy; pread
+12.9 GiB/s), further investment is low-EV — David's call whether the
+integration is worth doing just to close the measurement.
+Artifact: q4_mmap_probe.json (failure record).
