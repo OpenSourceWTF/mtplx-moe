@@ -463,3 +463,34 @@ receipt), 2x5.06 MiB even-split arm, and David's pure-mmap probe
 (slot_layout metal-mmap, no islands — "islands only work when the bank
 nearly fits" — 256-token order-of-magnitude cell, non-gating).
 Artifacts: r4_sweep_chunk{8,4,2}.json.
+
+## I/O layer CLOSED (2026-07-21 eve): drive saturates at QD2; the lever is submission, not shape
+
+**HOL theory test** (production PositionalExpertReader, native backend,
+F_NOCACHE, predictions pre-registered; receipt hol_theory_test.json):
+QD1 whole 0.951 ms (serial chunk8 tax +0.15); at QD2 ALL shapes — whole /
+chunk8 / even-halves / even-thirds — within ±2.5% at the aggregate CEILING
+12.7-12.8 GiB/s; QD3 same. T2 (null-at-IO-layer) CONFIRMED: no quantum/HOL
+effect worth engineering; **two concurrent 10 MiB preads saturate this SSD.**
+Live even-split serving A/B agrees: 2x5.06 MiB 6.302 vs chunk8 6.304 (dead
+even; r4_even_*.json).
+
+**NVMe research (sonnet web agent, cited in #130):** Apple ANS2/ANS3 exposes
+ONE I/O queue (linear submission, per Linux nvme-apple) — no hardware
+multi-queue to unlock; 4 independent Apple-silicon MoE-streaming projects
+(ds4, hypura, mac-code, SwiftLM) all converged on N-thread sync pread +
+F_NOCACHE; MTLIO/dispatch_io/aio: no evidence, do-not-port (MTLIO's GPU-
+timeline event gating unmeasured, parked as a 50-line curiosity). F_NOCACHE
+is a HINT needing 16 KiB alignment — our offsets/chunks are exact multiples.
+
+**Synthesis:** live decode realizes ~5.4-6.1 GiB/s at mean 1.15 in-flight
+reads — between QD1 (10.4) and QD2 (12.7) — so the entire remaining I/O gap
+is SUBMISSION-SIDE serialization (the layer loop waits on 1-2 misses), not
+read shape, pool size, chunking, or API. read_chunk verdict: keep 8MiB (4MiB
++0.65% marginal, within pairing noise; 16MiB genuinely worse at QD1-ish
+depths). The 10-tps program's remaining levers: R3 overlap/host-overhead
+(~60 ms/tok pool), batch (R5), fewer bytes (2-bit program).
+
+**mmap probe:** first launch rejected at configuration — metal-mmap requires
+--expert-integrity at-open (no per-record hashing on the mapped path);
+relaunched with at-open (one-time full-sidecar hash ~15 min). Probe pending.
