@@ -2895,6 +2895,15 @@ def restore_or_prefill_prompt_state(
         mtp_history_policy,
         len(prompt_ids),
     )
+    if not rt.mtp_enabled and _mtp_history_uses_committed_cache(mtp_history_policy):
+        # Target-only AR runtimes (e.g. laguna_ar) carry no MTP head, so a
+        # committed/last_window history policy would enter the
+        # _prefill_committed_mtp_history_streaming branch and call
+        # rt.make_mtp_cache(), which raises "MTP is not enabled for this
+        # runtime". Degrade to the cycle (AR) prefill path, which banks only
+        # the trunk cache — the prefix-reuse benefit AR turns actually use.
+        # MTP-enabled runtimes keep their requested committed policy.
+        mtp_history_policy = "cycle"
     mtp_history_window_tokens = (
         _mtp_history_last_window_tokens() if mtp_history_policy == "last_window" else 0
     )

@@ -7,6 +7,7 @@ import inspect as py_inspect
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -600,16 +601,72 @@ def _load_base_model(path: Path, config: dict[str, Any]) -> tuple[Any, Any]:
     return mlx_lm_load(str(_mtp_alias_load_path(path, config)))
 
 
+# A chat_template that is nothing but a Jinja ``{% include %}`` redirect to a
+# sidecar file. The pinned Laguna-S-2.1 oQ4e checkpoint ships the 35-char stub
+# ``{% include 'chat_template.jinja' %}`` in tokenizer_config.json. transformers
+# compiles embedded chat templates in a loader-less Jinja Environment, so any
+# apply_chat_template on such a stub raises
+# ``TypeError('no loader for this environment specified')`` — the failure the
+# 2026-07-22 laguna serving window hit on both the one-shot and server paths.
+_JINJA_INCLUDE_CHAT_TEMPLATE_RE = re.compile(r"\{%-?\s*include\b")
+
+
+def _is_jinja_include_chat_template(chat_template: Any) -> bool:
+    """True when ``chat_template`` is a string carrying a Jinja include."""
+
+    return isinstance(chat_template, str) and bool(
+        _JINJA_INCLUDE_CHAT_TEMPLATE_RE.search(chat_template)
+    )
+
+
+def _pinned_chat_template_text(model_path: Path) -> str | None:
+    """Contents of the sidecar chat_template.jinja pinned next to the model.
+
+    Returns None when the file is absent or empty. The file is only read, never
+    mutated — its sha256 is load-bearing for artifact-integrity checks.
+    """
+
+    jinja = model_path / "chat_template.jinja"
+    if not jinja.exists():
+        return None
+    text = jinja.read_text(encoding="utf-8")
+    return text if text.strip() else None
+
+
+def _repair_included_chat_template(tokenizer: Any, model_path: Path) -> None:
+    """Swap an include-stub chat_template for the pinned sidecar contents.
+
+    The oQ4e tokenizer_config.json redirects its chat_template to a sidecar via
+    ``{% include 'chat_template.jinja' %}``. transformers cannot resolve the
+    include (no Jinja loader), so apply_chat_template raises the moment it runs.
+    The real template — self-contained, no include/import/extends — lives in
+    chat_template.jinja beside the weights; substitute its contents in memory.
+    Setting ``tokenizer.chat_template`` on the mlx-lm TokenizerWrapper forwards
+    to the underlying HF tokenizer, which is what apply_chat_template renders.
+    """
+
+    current = getattr(tokenizer, "chat_template", None)
+    if not _is_jinja_include_chat_template(current):
+        return
+    replacement = _pinned_chat_template_text(model_path)
+    if replacement is None:
+        return
+    tokenizer.chat_template = replacement
+
+
 def _load_tokenizer_resilient(model_path: Path, config: dict[str, Any]) -> Any:
     from mlx_lm.utils import load_tokenizer
 
     try:
-        return load_tokenizer(model_path)
+        tokenizer = load_tokenizer(model_path)
     except Exception as exc:  # noqa: BLE001 - transformers raises several strict-config errors
         logger.warning(
             "[tokenizer] AutoTokenizer parse failed (%s); using tokenizer.json fallback",
             exc,
         )
+    else:
+        _repair_included_chat_template(tokenizer, model_path)
+        return tokenizer
 
     from mlx_lm.tokenizer_utils import TokenizerWrapper
     from transformers import PreTrainedTokenizerFast
@@ -626,10 +683,14 @@ def _load_tokenizer_resilient(model_path: Path, config: dict[str, Any]) -> Any:
         **passthrough,
     )
     chat_template = tcfg.get("chat_template")
+    # An include-stub is not a usable template (transformers has no loader for
+    # it); treat it as absent so the pinned sidecar below supplies the real one.
+    if _is_jinja_include_chat_template(chat_template):
+        chat_template = None
     if not chat_template:
-        jinja = model_path / "chat_template.jinja"
-        if jinja.exists():
-            chat_template = jinja.read_text(encoding="utf-8")
+        replacement = _pinned_chat_template_text(model_path)
+        if replacement is not None:
+            chat_template = replacement
     if chat_template:
         hf_tokenizer.chat_template = chat_template
     eos = config.get("eos_token_id")

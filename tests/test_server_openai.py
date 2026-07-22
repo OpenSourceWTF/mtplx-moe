@@ -11145,3 +11145,144 @@ def test_parallel_tool_calls_false_streaming_android_studio_shape(monkeypatch):
     assert "pwd" not in arguments
     assert final[-1]["choices"][0]["finish_reason"] == "tool_calls"
     assert final[-1]["mtplx_stats"]["tool_calls_emitted"] == 1
+
+
+def _postcommit_route_state(*, mtp_enabled: bool):
+    """A minimal ServerState stub for exercising the postcommit snapshot
+    routing decision (mtp vs ar) without real generation."""
+
+    def _boom_mtp_cache():
+        # LagunaARRuntime.make_mtp_cache raises this; reaching it means the
+        # postcommit took the MTP-only history branch on an AR-only runtime.
+        raise RuntimeError("MTP is not enabled for this runtime")
+
+    class _RouteBank:
+        per_session_max_bytes = 0
+
+        def __init__(self) -> None:
+            self.puts: list[dict] = []
+
+        def longest_prefix(self, _token_ids):
+            return None
+
+        def put(self, **kwargs):
+            self.puts.append(kwargs)
+            return SimpleNamespace(
+                prefix_len=len(kwargs["token_ids"]),
+                nbytes=1,
+                token_hash="route-hash",
+            )
+
+    foreground = ForegroundState()
+    return SimpleNamespace(
+        runtime=SimpleNamespace(
+            mtp_enabled=mtp_enabled,
+            make_mtp_cache=_boom_mtp_cache,
+            tokenizer=SimpleNamespace(),
+        ),
+        sessions=SimpleNamespace(bank=_RouteBank()),
+        lock=foreground.lock,
+        begin_foreground=foreground.begin_foreground,
+        end_foreground=foreground.end_foreground,
+        template_hash="tpl",
+        draft_head_identity="head",
+    )
+
+
+def _make_route_restore(captured: dict):
+    from mtplx.generation import _mtp_history_uses_committed_cache
+
+    def _fake_restore(rt, prompt_ids, *, mtp_history_policy, **_kwargs):
+        captured["restore_policy"] = mtp_history_policy
+        if _mtp_history_uses_committed_cache(mtp_history_policy):
+            # The real committed-history prefill builds an MTP history cache;
+            # on an AR runtime that call is exactly what raised in production.
+            rt.make_mtp_cache()
+        return SimpleNamespace(
+            trunk_cache=["cache"],
+            logits="logits",
+            hidden="hidden",
+            committed_mtp_cache=None,
+            gdn_boundaries=[],
+            mtp_history_policy=mtp_history_policy,
+            cache_hit=False,
+            cached_tokens=0,
+            suffix_tokens=len(prompt_ids),
+            cache_source="none",
+            ssd_cache_hit=False,
+            ssd_cached_tokens=0,
+            ssd_restore_s=0.0,
+            cache_miss_reason=None,
+        )
+
+    return _fake_restore
+
+
+def test_ar_postcommit_snapshot_routes_through_ar_path(monkeypatch):
+    """A laguna_ar/AR-mode postcommit must re-prefill history through the AR
+    (cycle) path — never the committed MTP-history branch that calls
+    make_mtp_cache() and raises 'MTP is not enabled for this runtime'."""
+
+    state = _postcommit_route_state(mtp_enabled=False)
+    monkeypatch.setattr(
+        openai,
+        "_history_ids_for_postcommit",
+        lambda *_a, **_k: ([1, 2, 3, 4], None),
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        openai, "restore_or_prefill_prompt_state", _make_route_restore(captured)
+    )
+
+    result = openai._store_retokenized_history_snapshot(
+        state,
+        session_id="sess-1",
+        messages=[],
+        assistant_content="hello",
+        thinking_enabled=False,
+        policy_fingerprint="pf",
+    )
+
+    # Routed through the AR path (never the MTP-only committed branch).
+    assert captured["restore_policy"] == "cycle"
+    assert result["stored"] is True
+    # The banked entry's policy metadata matches what the next AR turn looks up.
+    assert state.sessions.bank.puts
+    assert state.sessions.bank.puts[0]["mtp_history_policy"] == "cycle"
+
+
+def test_mtp_postcommit_snapshot_keeps_committed_policy(monkeypatch):
+    """MTP-capable runtimes are unchanged: the postcommit still banks under the
+    committed MTP-history policy and exercises the MTP cache."""
+
+    state = _postcommit_route_state(mtp_enabled=True)
+    made = {"mtp_cache": 0}
+
+    def _ok_mtp_cache():
+        made["mtp_cache"] += 1
+        return SimpleNamespace()
+
+    state.runtime.make_mtp_cache = _ok_mtp_cache
+    monkeypatch.setattr(
+        openai,
+        "_history_ids_for_postcommit",
+        lambda *_a, **_k: ([1, 2, 3, 4], None),
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        openai, "restore_or_prefill_prompt_state", _make_route_restore(captured)
+    )
+
+    result = openai._store_retokenized_history_snapshot(
+        state,
+        session_id="sess-1",
+        messages=[],
+        assistant_content="hello",
+        thinking_enabled=False,
+        policy_fingerprint="pf",
+    )
+
+    assert captured["restore_policy"] == "committed"
+    assert made["mtp_cache"] == 1
+    assert result["stored"] is True
+    assert state.sessions.bank.puts[0]["mtp_history_policy"] == "committed"

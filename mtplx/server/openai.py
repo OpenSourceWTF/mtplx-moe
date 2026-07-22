@@ -14386,6 +14386,16 @@ def _store_retokenized_history_snapshot(
     # (chat-template encoding is deterministic for the same messages and
     # tools), so `longest_prefix` matches and only the new user turn +
     # assistant turn need to be forward-AR'd.
+    # AR-only runtimes (laguna_ar target-only) have no MTP head. Banking under
+    # the "committed" MTP-history policy would drive
+    # restore_or_prefill_prompt_state into the committed-history prefill branch,
+    # which calls rt.make_mtp_cache() and raises "MTP is not enabled for this
+    # runtime" (the 2026-07-22 laguna serving-window failure). Route the
+    # postcommit re-prefill through the AR (cycle) path instead: the trunk cache
+    # is still banked for next-turn prefix reuse, and the stored policy metadata
+    # stays consistent with what the next AR turn looks up. MTP runtimes keep
+    # the committed policy unchanged.
+    history_mtp_policy = "committed" if state.runtime.mtp_enabled else "cycle"
     try:
         try:
             if _abort_requested():
@@ -14395,7 +14405,7 @@ def _store_retokenized_history_snapshot(
                     state.runtime,
                     history_ids,
                     mtp_hidden_variant="post_norm",
-                    mtp_history_policy="committed",
+                    mtp_history_policy=history_mtp_policy,
                     session_bank=state.sessions.bank,
                     template_hash=state.template_hash,
                     draft_head_identity=state.draft_head_identity,
@@ -14422,7 +14432,7 @@ def _store_retokenized_history_snapshot(
                 keep_live_ref=bool(keep_live_ref),
                 session_id=session_id,
                 template_hash=state.template_hash,
-                mtp_history_policy="committed",
+                mtp_history_policy=history_mtp_policy,
                 draft_head_identity=state.draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
                 gdn_boundaries=list(

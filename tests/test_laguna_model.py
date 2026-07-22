@@ -601,3 +601,132 @@ def test_tiny_laguna_checkpoint_loads_and_cached_forward_matches_full(
     # Full-sequence and one-token attention use different MLX kernel shapes;
     # keep a tight numerical bound while still catching mask/cache drift.
     assert max_abs_error < 5e-3, f"max cached-logit error: {max_abs_error}"
+
+
+_TINY_CHAT_TEMPLATE = (
+    "{% for message in messages %}{{ message['role'] }}: "
+    "{{ message['content'] }}\n{% endfor %}"
+    "{% if add_generation_prompt %}assistant:{% endif %}"
+)
+
+
+def _write_tiny_tokenizer(model_dir: Path, *, chat_template: str | None) -> None:
+    """Write a minimal but real tokenizer.json + tokenizer_config.json.
+
+    Enough for _load_tokenizer_resilient to construct a working tokenizer with
+    apply_chat_template, without any model weights.
+    """
+
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+
+    vocab = {
+        "<unk>": 0,
+        "<eos>": 1,
+        "hello": 2,
+        "world": 3,
+        "user": 4,
+        "assistant": 5,
+    }
+    tokenizer = Tokenizer(WordLevel(vocab=vocab, unk_token="<unk>"))
+    tokenizer.pre_tokenizer = Whitespace()
+    tokenizer.save(str(model_dir / "tokenizer.json"))
+    tokenizer_config: dict[str, object] = {
+        "eos_token": "<eos>",
+        "unk_token": "<unk>",
+    }
+    if chat_template is not None:
+        tokenizer_config["chat_template"] = chat_template
+    (model_dir / "tokenizer_config.json").write_text(
+        json.dumps(tokenizer_config), encoding="utf-8"
+    )
+
+
+def test_jinja_include_chat_template_detection() -> None:
+    from mtplx.runtime import _is_jinja_include_chat_template
+
+    # The pinned oQ4e 35-char redirect stub and whitespace-trim variants.
+    assert _is_jinja_include_chat_template("{% include 'chat_template.jinja' %}")
+    assert _is_jinja_include_chat_template("{%- include 'chat_template.jinja' -%}")
+    # A real, self-contained template must be left alone.
+    assert not _is_jinja_include_chat_template(_TINY_CHAT_TEMPLATE)
+    assert not _is_jinja_include_chat_template(None)
+    assert not _is_jinja_include_chat_template("")
+
+
+def test_load_tokenizer_resilient_repairs_include_stub_hermetic(
+    tmp_path: Path,
+) -> None:
+    """A fake model dir whose tokenizer_config.json only redirects to the
+    sidecar must load with the sidecar contents substituted in memory."""
+
+    from mtplx import runtime
+
+    (tmp_path / "chat_template.jinja").write_text(
+        _TINY_CHAT_TEMPLATE, encoding="utf-8"
+    )
+    _write_tiny_tokenizer(
+        tmp_path, chat_template="{% include 'chat_template.jinja' %}"
+    )
+
+    tokenizer = runtime._load_tokenizer_resilient(tmp_path, {"eos_token_id": 1})
+
+    # The include stub is gone, replaced by the pinned sidecar's contents.
+    assert not runtime._is_jinja_include_chat_template(tokenizer.chat_template)
+    assert tokenizer.chat_template == _TINY_CHAT_TEMPLATE
+    # The on-disk sidecar is never mutated (artifact hashes are load-bearing).
+    assert (tmp_path / "chat_template.jinja").read_text(
+        encoding="utf-8"
+    ) == _TINY_CHAT_TEMPLATE
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "hello"}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    assert rendered == "user: hello\nassistant:"
+
+
+def test_pinned_laguna_chat_template_renders_after_include_stub_repair() -> None:
+    """The real pinned oQ4e sidecars (when present) must build a tokenizer that
+    renders a chat message instead of raising the loader-less-include TypeError.
+
+    Skips cleanly when the model dir is absent so CI stays hermetic.
+    """
+
+    import json as _json
+
+    from mtplx import runtime
+    from mtplx.hf_loader import DEFAULT_MODEL_CACHE, safe_model_name
+    from mtplx.models.laguna_config import LAGUNA_S_2_1_REPO_ID
+
+    # Resolve the real developer-machine cache directly: the suite-wide
+    # conftest isolation repoints MTPLX_MODEL_DIR at an empty tmp dir, so
+    # cached_model_path() would never see the pinned sidecars.
+    model_dir = DEFAULT_MODEL_CACHE / safe_model_name(LAGUNA_S_2_1_REPO_ID)
+    required = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja")
+    if not model_dir.exists() or not all(
+        (model_dir / name).exists() for name in required
+    ):
+        pytest.skip(f"pinned Laguna sidecars not present under {model_dir}")
+
+    # Confirm the checkpoint really ships the loader-less include stub we fix.
+    tokenizer_config = _json.loads(
+        (model_dir / "tokenizer_config.json").read_text(encoding="utf-8")
+    )
+    assert runtime._is_jinja_include_chat_template(
+        tokenizer_config.get("chat_template")
+    )
+
+    config = _json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+    tokenizer = runtime._load_tokenizer_resilient(model_dir, config)
+
+    pinned = (model_dir / "chat_template.jinja").read_text(encoding="utf-8")
+    assert not runtime._is_jinja_include_chat_template(tokenizer.chat_template)
+    assert tokenizer.chat_template == pinned
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "Hello"}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    assert isinstance(rendered, str) and rendered
