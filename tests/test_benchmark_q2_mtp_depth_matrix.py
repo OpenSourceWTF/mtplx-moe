@@ -97,6 +97,15 @@ class _FakeRuntime:
                     "hit_rate": 2 / 3,
                 },
             },
+            "slots": {
+                "metrics": {
+                    "batched_miss_parts": 7,
+                    "batched_miss_records": 11,
+                    "overlap_split_routes": 7,
+                    "overlap_gpu_dispatch_ns": 1_000,
+                    "overlap_exposed_wait_ns": 2_000,
+                },
+            },
         }
 
     def expert_resource_telemetry_snapshot(self):
@@ -487,6 +496,42 @@ def test_miss_shadow_survives_to_runtime_config_and_payload(
     assert calls.configs[0]["miss_shadow"] == "t158"
     assert payload["configuration"]["runtime"]["miss_shadow"] == "t158"
     assert payload["models"][0]["runtime_config"]["miss_shadow"] == "t158"
+
+
+def test_moe_overlap_flag_parses_and_reaches_runtime_config(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+
+    defaults = module.build_parser().parse_args([])
+    assert defaults.overlap_miss_reads is False
+    assert module.DEFAULT_RUNTIME_OPTIONS["overlap_miss_reads"] is False
+
+    args = module.build_parser().parse_args(["--moe-overlap"])
+    assert args.overlap_miss_reads is True
+    assert module._runtime_options_from_args(args)["overlap_miss_reads"] is True
+
+    apis, calls = _fake_apis(module)
+    payload = module.run_depth_matrix(
+        [{**_requests(tmp_path)[0], "depths": (1,)}],
+        contexts=(1024,),
+        runtime_options={"overlap_miss_reads": True},
+        apis=apis,
+    )
+    assert calls.configs[0]["overlap_miss_reads"] is True
+    assert (
+        payload["configuration"]["runtime"]["overlap_miss_reads"] is True
+    )
+    # The acceptance gate reads measured overlap out of the artifact, never
+    # inferred from tok/s: every observation row carries the counters.
+    for row in payload["models"][0]["observations"]:
+        assert row["overlap_telemetry"] == {
+            "batched_miss_parts": 7,
+            "batched_miss_records": 11,
+            "overlap_split_routes": 7,
+            "overlap_gpu_dispatch_ns": 1_000,
+            "overlap_exposed_wait_ns": 2_000,
+        }
 
 
 def test_streamed_codec_flags_parse_and_reach_runtime_options() -> None:

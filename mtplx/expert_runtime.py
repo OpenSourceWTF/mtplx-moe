@@ -193,6 +193,11 @@ class ExpertStreamingConfig:
     proj_requant: str | None = None
     kv_quant: str | None = None
     split_route_release: str = "fenced"
+    # Fix (B), issue #130: submit a decode route's misses as ONE batched
+    # part (single future, admission before the wait, adjacent records
+    # coalesced into scatter reads) so resident-expert compute overlaps the
+    # miss reads. OFF leaves the per-expert split-part path byte-identical.
+    overlap_miss_reads: bool = False
     prefetch_slots: int = 0
     speculative_io_fraction: float = 0.25
     route_census: bool = True
@@ -290,6 +295,12 @@ class ExpertStreamingConfig:
         if self.split_route_release not in {"fenced", "deferred"}:
             raise ValueError(
                 "split_route_release must be 'fenced' or 'deferred'"
+            )
+        if not isinstance(self.overlap_miss_reads, bool):
+            raise ValueError("overlap_miss_reads must be bool")
+        if self.overlap_miss_reads and self.slot_layout != "component-banks":
+            raise ValueError(
+                "overlap_miss_reads requires the component-banks slot layout"
             )
         object.__setattr__(
             self,
@@ -2025,6 +2036,7 @@ class ExpertStreamingRuntime:
                 island_layers=(
                     config.island_layers + config.mmap_island_layers
                 ),
+                batch_decode_reads=config.overlap_miss_reads,
                 **pipeline_kwargs,
             )
         except Exception:
@@ -2773,9 +2785,19 @@ class ExpertStreamingRuntime:
             )
             hit_plan = self._subset_route_plan(plan, hits=True)
             miss_plan = self._subset_route_plan(plan, hits=False)
+            # Fix (B) overlap: the layer's decode misses go down as ONE part
+            # (single future, admission ahead of the wait, adjacency-run
+            # scatter reads in the pool) instead of one part per expert.
+            batch_misses = (
+                self.config.overlap_miss_reads
+                and miss_plan is not None
+                and plan.phase is RoutingPhase.DECODE
+            )
             miss_parts = (
                 self._miss_route_parts(miss_plan)
-                if miss_plan is not None and plan.phase is RoutingPhase.DECODE
+                if miss_plan is not None
+                and plan.phase is RoutingPhase.DECODE
+                and not batch_misses
                 else ((miss_plan,) if miss_plan is not None else ())
             )
             pipeline_ledger = self._pipeline_ledger
@@ -2859,6 +2881,13 @@ class ExpertStreamingRuntime:
                         miss_part,
                         ordinal=ordinal,
                         io_admission=part_admission,
+                    )
+                if batch_misses:
+                    self.slots.metrics.update(
+                        batched_miss_parts=len(miss_parts),
+                        batched_miss_records=sum(
+                            len(part.loads) for part in miss_parts
+                        ),
                     )
             else:
                 pending._commit_policy()
