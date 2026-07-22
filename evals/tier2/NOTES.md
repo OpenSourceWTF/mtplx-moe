@@ -508,3 +508,41 @@ MappedExpertStore). Given streamed-mmap physics is independently condemned
 12.9 GiB/s), further investment is low-EV — David's call whether the
 integration is worth doing just to close the measurement.
 Artifact: q4_mmap_probe.json (failure record).
+
+## R3 PRICED (2026-07-21 late): 159 ms = ~100 read-wait + ~37 GPU + ~22 host; 10 tok/s is REACHABLE
+
+Instruments: per-layer replay (r3_perlayer_replay.json — production reader,
+production per-layer submission; 48 steps, 8173 misses) + roofline-profiled
+K1 cell (r3_roofline_cell.{json,log}, d1 6.229 diagnostic ~= headline 6.28).
+Caveat: oQ4e download ran concurrently (~1% drive BW; singles 1.06 ms vs
+0.93 clean — direction unaffected).
+
+DECOMPOSITION of the 159 ms K1 step:
+- **Read-wait ~100 ms** (replay: 165.7 ms/tok at 170 synthetic miss/tok,
+  scaled x103.4/170.3). Group walls scale LINEARLY with miss count
+  (k=1 1.16 / k=2 2.01 / k=3 2.92 / k=4 3.73 — ~0.97 ms per extra read).
+- **GPU ~37 ms**: attention 15.3 (46.7 MB/call, 45% of 539 GB/s ceiling),
+  routed experts ~14 (est. via shared-expert calibration 476 GB/s), router
+  4.3 (compute/occupancy-bound), shared 1.8 (88% ceiling), MTP head ~2.
+- **Host residual ~22 ms** (admission/bookkeeping/dispatch).
+
+KEY MECHANISM — BURST-READ SERIALIZATION (new, reproducible): a burst of k
+reads submitted together through the warm production executor completes in
+~sum time (pair 1.90 ms, triple 2.71) not ~max time (1.65/2.5 ideal), while
+steady-state looping workers achieve true bandwidth-sharing (HOL qd2 1.548
+ms/record at 12.7 GiB/s aggregate). Fresh-thread spawn exonerated (0.06 ms).
+The live 1.15 mean-active-readers despite 1.5-miss groups is this effect.
+Suspects for the fix: chunk-loop GIL crossings on the burst path, or route
+misses down the EXISTING batch scatter-preadv path (expert_banked) = ONE
+native call per layer group, kernel-level concurrency, no GIL.
+
+LEVER PRICES (stacking):
+- **(A) Fix burst concurrency**: group walls sum->max ~= read-wait 100 ->
+  ~50-60 ms => ~110-120 ms/tok = **8.4-9.1 tok/s**. Software artifact, not
+  hardware (drive+reader both proven QD2-capable).
+- **(B) Resident-first same-layer overlap** (David's design; canonical
+  accumulation order preserves bit-exactness): hide min(GPU ~0.5 ms/layer,
+  read/layer) => additional ~15-25 ms => **~10-11 tok/s** after (A).
+- (C) Early submission at route time: few ms, folds into (A)/(B).
+VERDICT: q4->10 is priced as reachable via (A)+(B). No implementation
+without David's pick.
