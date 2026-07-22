@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -730,3 +731,56 @@ def test_pinned_laguna_chat_template_renders_after_include_stub_repair() -> None
         add_generation_prompt=True,
     )
     assert isinstance(rendered, str) and rendered
+
+
+def test_ar_cycle_snapshot_prefill_returns_no_hidden_under_sustained_env(
+    monkeypatch,
+) -> None:
+    """Regression: the AR (cycle-policy) snapshot re-prefill must not demand
+    hidden states from a target-only runtime.
+
+    Under the sustained serving profile, an AR runtime's postcommit routes
+    through restore_or_prefill_prompt_state with the cycle policy, which
+    cold-prefills via _prefill(return_hidden=...). A LagunaARRuntime's
+    forward_ar returns logits alone, so requesting hidden unpacked a lone
+    logits array as ``(logits, hidden)`` and raised ``ValueError: not enough
+    values to unpack (expected 2, got 1)``. hidden must come back None instead.
+    """
+
+    pytest.importorskip("mlx.core")
+    from mtplx import generation
+    from mtplx.models.laguna import Model, ModelArgs
+    from mtplx.mtp_patch import MTPContract
+    from mtplx.profiles import SUSTAINED_PREFILL_ENV
+    from mtplx.runtime import LagunaARRuntime
+
+    # Snapshot the whole environ so the sustained profile's MTPLX_* keys (and
+    # anything the code writes) cannot leak into later in-process tests — the
+    # idiom from test_laguna_one_shot_uses_target_generation_defaults.
+    monkeypatch.setattr(os, "environ", os.environ.copy())
+    for key, value in SUSTAINED_PREFILL_ENV.items():
+        os.environ[key] = str(value)
+
+    config = _tiny_laguna_config(architectures=["LagunaForCausalLM"], head_dim=4)
+    runtime = LagunaARRuntime(
+        Model(ModelArgs.from_dict(config)),
+        object(),  # tokenizer: unused by the prefill path
+        Path("/tmp/laguna-ar"),
+        False,  # mtp_enabled: target-only AR runtime, no draft head
+        MTPContract(),
+    )
+    assert runtime.mtp_enabled is False
+
+    prompt_state = generation.restore_or_prefill_prompt_state(
+        runtime,
+        [1, 2, 3, 4],
+        mtp_history_policy="cycle",
+        session_bank=None,
+    )
+
+    # Reached the AR cold-prefill path and produced a usable state — no hidden
+    # (the trunk cache is all the AR snapshot banks).
+    assert prompt_state.mtp_history_policy == "cycle"
+    assert prompt_state.hidden is None
+    assert prompt_state.trunk_cache is not None
+    assert prompt_state.logits is not None

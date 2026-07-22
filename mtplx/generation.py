@@ -3354,10 +3354,20 @@ def restore_or_prefill_prompt_state(
                 )
                 prompt_eval_time += prompt_history_time
     else:
+        # Only request hidden states from a runtime that can produce them.
+        # Target-only AR runtimes (laguna_ar) have no draft head: their
+        # forward_ar returns logits alone, so _prefill(return_hidden=True)
+        # would unpack a lone logits array as (logits, hidden) and raise
+        # "not enough values to unpack (expected 2, got 1)" (the cycle-policy
+        # AR snapshot path exposed this once the committed-branch crash was
+        # fixed). MTP runtimes still get hidden — the draft head needs it —
+        # and this mirrors generate_ar, which gates return_hidden on
+        # rt.mtp_enabled. hidden stays None for AR; nothing downstream in the
+        # AR path consumes it (the bank stores trunk cache only).
         cache, logits, hidden, target_time = _prefill(
             rt,
             prompt_ids,
-            return_hidden=True,
+            return_hidden=rt.mtp_enabled,
             hidden_variant=base_hidden_variant,
             abort_check=abort_check,
             vision_splice=vision_splice,
