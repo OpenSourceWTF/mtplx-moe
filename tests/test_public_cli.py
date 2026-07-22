@@ -1754,7 +1754,7 @@ def test_laguna_opencode_payload_uses_native_tools_and_32k_context(monkeypatch):
     args = SimpleNamespace(
         host="127.0.0.1",
         port=8000,
-        model="pipenetwork/Laguna-S-2.1-MLX-4bit",
+        model="mlx-community/Laguna-S-2.1-oQ4e",
         profile="sustained",
         api_key=None,
         temperature=0.6,

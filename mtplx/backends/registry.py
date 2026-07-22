@@ -117,7 +117,7 @@ class ArchitectureSupport:
 ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
     "laguna-s-2.1-ar": ArchitectureSupport(
         arch_id="laguna-s-2.1-ar",
-        display_name="Laguna-S-2.1 MLX 4-bit",
+        display_name="Laguna-S-2.1 oQ4e (MLX)",
         family="laguna",
         backend="laguna_ar",
         support_level="verified-native-ar-only",
@@ -127,12 +127,13 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
         config_markers=(),
         family_gate="laguna-s-2.1-mlx-4bit-geometry",
         references=(
-            "https://huggingface.co/pipenetwork/Laguna-S-2.1-MLX-4bit",
+            "https://huggingface.co/mlx-community/Laguna-S-2.1-oQ4e",
             "https://huggingface.co/pipenetwork/Laguna-S-2.1-MLX-4bit/blob/5544297f819d50330bc3616dd15cbc7edb598b2f/laguna.py",
         ),
         notes=(
-            "Target-only AR runtime for the exact PipeNetwork 4-bit checkpoint; "
-            "the artifact has no native MTP head and must be loaded with mtp=False."
+            "Target-only AR runtime for the exact mlx-community Laguna-S-2.1-oQ4e "
+            "checkpoint; the artifact has no native MTP head and must be loaded "
+            "with mtp=False."
         ),
     ),
     "qwen3-next-mtp": ArchitectureSupport(

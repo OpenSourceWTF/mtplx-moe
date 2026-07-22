@@ -1,4 +1,16 @@
-"""Pure construction-time identity checks for the supported Laguna checkpoint."""
+"""Pure construction-time identity checks for the supported Laguna checkpoint.
+
+Exactly one Laguna artifact is admitted through the ``laguna_ar`` backend, by
+exact repo id + pinned revision + artifact identity:
+
+    mlx-community/Laguna-S-2.1-oQ4e @ 8e3f5cad513746264940c1c4195de48d7ea345a5
+
+It is the mixed-precision imatrix export of Laguna-S-2.1 (LagunaForCausalLM, 48
+layers, hidden 3072, 48/8 heads, head_dim 128, 256 experts top-10 + shared
+expert, layer-0 dense, sliding (full,swa,swa,swa)x12 window 512, vocab 100352).
+Every other Laguna variant — including the earlier uniform-4bit build — stays
+blocked.
+"""
 
 from __future__ import annotations
 
@@ -7,13 +19,19 @@ from pathlib import Path
 from typing import Any
 
 
-LAGUNA_S_2_1_REPO_ID = "pipenetwork/Laguna-S-2.1-MLX-4bit"
-LAGUNA_S_2_1_REVISION = "5544297f819d50330bc3616dd15cbc7edb598b2f"
-LAGUNA_S_2_1_WEIGHT_BYTES = 66_147_556_864
-LAGUNA_S_2_1_REPO_BYTES = 66_155_348_620
+LAGUNA_S_2_1_REPO_ID = "mlx-community/Laguna-S-2.1-oQ4e"
+LAGUNA_S_2_1_REVISION = "8e3f5cad513746264940c1c4195de48d7ea345a5"
+# Tensor-storage total from the index metadata (the mixed-precision weights).
+LAGUNA_S_2_1_WEIGHT_BYTES = 64_122_027_323
+# Every downloadable file in the pinned snapshot.
+LAGUNA_S_2_1_REPO_BYTES = 64_129_728_868
 LAGUNA_S_2_1_DEFAULT_CONTEXT = 32_768
 LAGUNA_S_2_1_FULL_KV_BYTES_PER_TOKEN = 49_152
 LAGUNA_S_2_1_ROTATING_KV_BYTES = 75_497_472
+# Every oQ4e tensor is exported under a ``language_model.`` wrapper; the runtime
+# strips it (weights and the per-path quantization map alike) so the vendored
+# module tree — which has no such wrapper — matches by path.
+LAGUNA_S_2_1_WEIGHT_NAME_PREFIX = "language_model."
 
 
 def laguna_s_2_1_required_resident_bytes(context_tokens: int) -> int:
@@ -32,27 +50,28 @@ LAGUNA_S_2_1_WEIGHT_SHARDS = tuple(
     f"model-{index:05d}-of-00013.safetensors" for index in range(1, 14)
 )
 LAGUNA_S_2_1_SHARD_SIZES = {
-    "model-00001-of-00013.safetensors": 5_345_218_229,
-    "model-00002-of-00013.safetensors": 5_189_210_514,
-    "model-00003-of-00013.safetensors": 5_138_878_625,
-    "model-00004-of-00013.safetensors": 5_107_862_084,
-    "model-00005-of-00013.safetensors": 5_138_878_685,
-    "model-00006-of-00013.safetensors": 5_138_878_659,
-    "model-00007-of-00013.safetensors": 5_097_203_847,
-    "model-00008-of-00013.safetensors": 5_138_878_795,
-    "model-00009-of-00013.safetensors": 5_138_878_605,
-    "model-00010-of-00013.safetensors": 5_097_203_801,
-    "model-00011-of-00013.safetensors": 5_138_878_687,
-    "model-00012-of-00013.safetensors": 5_138_878_641,
-    "model-00013-of-00013.safetensors": 4_338_941_119,
+    "model-00001-of-00013.safetensors": 5_082_945_345,
+    "model-00002-of-00013.safetensors": 5_133_833_178,
+    "model-00003-of-00013.safetensors": 5_133_833_188,
+    "model-00004-of-00013.safetensors": 5_133_833_222,
+    "model-00005-of-00013.safetensors": 5_133_833_218,
+    "model-00006-of-00013.safetensors": 5_133_833_226,
+    "model-00007-of-00013.safetensors": 5_133_833_236,
+    "model-00008-of-00013.safetensors": 5_133_833_208,
+    "model-00009-of-00013.safetensors": 5_133_833_224,
+    "model-00010-of-00013.safetensors": 5_133_833_218,
+    "model-00011-of-00013.safetensors": 5_133_833_210,
+    "model-00012-of-00013.safetensors": 5_133_833_230,
+    "model-00013-of-00013.safetensors": 2_566_916_620,
 }
 LAGUNA_S_2_1_SIDECAR_SHA256 = {
-    "config.json": "22ba23138b98e15d5452b5dc14cb88a96797bcd07fceab4fc84dcb1068c18d60",
+    "config.json": "de530f3a85f0dbef0b22c6e7caff51d21b6b75d1f04024b07947d103e22a630c",
     "generation_config.json": "2deeac08584c9177028e108a994e37dffd06acf61ca429dc064f76fee52e2bea",
     "chat_template.jinja": "2d3c724b3c2e9eb71fe9ccc5423ff268a370a8bfa89e9238b6de14fe000825c8",
-    "model.safetensors.index.json": "f5926cd1cb7c1b5a928ec8d10e2691848785f907a0837f03c959d1bd01757c8d",
-    "tokenizer.json": "ff04405d2d1e1b6c77a8be25f0fce9371003a558b055c23248d9e8ca1d956d92",
-    "tokenizer_config.json": "fb4815e0e871cd4cb1cffa77722ce798df97db11da0481489b8da4d76142596e",
+    "model.safetensors.index.json": "45709bf61be0398b4b34ed68845c80f8d2bab75f1f16d19e63c95e15571f0cc2",
+    "tokenizer.json": "807c53a95141e77c14e45f68c51db3f84d2ea6b555a6ea832bc99c88dae6a279",
+    "tokenizer_config.json": "ce5c24f821c92f73f1bf6d4d6a474636f9fb5ca1fabbbed149a8f466ccd18b56",
+    "special_tokens_map.json": "70cd3459fde61761e9440751a590e89a108c09b1803cc7727f5ad1ed1ea6122b",
 }
 LAGUNA_S_2_1_REQUIRED_FILES = frozenset(
     (
@@ -62,13 +81,14 @@ LAGUNA_S_2_1_REQUIRED_FILES = frozenset(
         "model.safetensors.index.json",
         "tokenizer.json",
         "tokenizer_config.json",
+        "special_tokens_map.json",
         *LAGUNA_S_2_1_WEIGHT_SHARDS,
     )
 )
 
 
 def laguna_s_2_1_artifact_integrity_errors(model_path: Path | str) -> tuple[str, ...]:
-    """Return pinned-file mismatches before the 61.6 GiB weight load boundary."""
+    """Return pinned-file mismatches before the 59.7 GiB weight load boundary."""
 
     root = Path(model_path)
     errors: list[str] = []
@@ -104,27 +124,82 @@ _ATTENTION_HEADS = tuple(
 )
 _MLP_LAYER_TYPES = ("dense",) + ("sparse",) * 47
 _GATING_TYPES = ("per_head",) * 48
-_ROUTER_QUANTIZATION_KEYS = tuple(
-    f"model.layers.{layer}.mlp.gate" for layer in range(1, 48)
+
+# Per-layer self-attention weight precision of the oQ4e imatrix bank, in
+# (q,k,v,o,g)_proj order for layers 0..47. Every projection is 5- or 8-bit at
+# group_size 64; layer 33 (``55585``) is the lone non-uniform row — its o_proj
+# is promoted to 8-bit. This table plus the regular blocks below reproduce the
+# checkpoint's exact quantization dict.
+_OQ4E_ATTENTION_BITS = (
+    "55555", "55555", "88888", "55555", "55555", "55555", "55555", "55555",
+    "88888", "55555", "55555", "55555", "88888", "55555", "55555", "55555",
+    "88888", "88888", "88888", "88888", "88888", "88888", "88888", "88888",
+    "88888", "88888", "88888", "88888", "88888", "88888", "88888", "55555",
+    "88888", "55585", "55555", "88888", "88888", "55555", "55555", "88888",
+    "88888", "55555", "55555", "88888", "88888", "88888", "88888", "88888",
 )
-_QUANTIZATION_KEYS = frozenset(
-    ("bits", "group_size", "mode", *_ROUTER_QUANTIZATION_KEYS)
-)
+
+
+def _build_laguna_s_2_1_quantization() -> dict[str, Any]:
+    """Reconstruct the pinned config['quantization'] map from its exact shape.
+
+    Global default is 4-bit/gs128 (the MoE experts fall here); the MoE routers
+    (``mlp.gate``) carry no entry and stay unquantized (BF16). Keys keep the
+    ``language_model.`` export prefix so this matches the on-disk config dict
+    exactly; the runtime strips the prefix before handing it to mlx-lm.
+    """
+
+    quantization: dict[str, Any] = {"group_size": 128, "bits": 4, "mode": "affine"}
+    prefix = LAGUNA_S_2_1_WEIGHT_NAME_PREFIX
+    quantization[f"{prefix}lm_head"] = {"bits": 8, "group_size": 64, "mode": "affine"}
+    quantization[f"{prefix}model.embed_tokens"] = {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+    }
+    # Layer 0 is the lone dense MLP block (5/5/6-bit at gs64).
+    quantization[f"{prefix}model.layers.0.mlp.gate_proj"] = {
+        "bits": 5,
+        "group_size": 64,
+        "mode": "affine",
+    }
+    quantization[f"{prefix}model.layers.0.mlp.up_proj"] = {
+        "bits": 5,
+        "group_size": 64,
+        "mode": "affine",
+    }
+    quantization[f"{prefix}model.layers.0.mlp.down_proj"] = {
+        "bits": 6,
+        "group_size": 64,
+        "mode": "affine",
+    }
+    # Shared experts of the 47 sparse layers are uniform 8-bit/gs128.
+    for layer in range(1, 48):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            quantization[
+                f"{prefix}model.layers.{layer}.mlp.shared_expert.{projection}"
+            ] = {"bits": 8, "group_size": 128, "mode": "affine"}
+    # Self-attention projections follow the per-layer imatrix table.
+    projections = ("q_proj", "k_proj", "v_proj", "o_proj", "g_proj")
+    for layer, row in enumerate(_OQ4E_ATTENTION_BITS):
+        for projection, bit in zip(projections, row):
+            quantization[
+                f"{prefix}model.layers.{layer}.self_attn.{projection}"
+            ] = {"bits": int(bit), "group_size": 64, "mode": "affine"}
+    return quantization
+
+
+LAGUNA_S_2_1_QUANTIZATION = _build_laguna_s_2_1_quantization()
 
 
 def _is_exact_quantization_map(value: Any) -> bool:
-    if not isinstance(value, dict) or frozenset(value) != _QUANTIZATION_KEYS:
-        return False
-    if (
-        value.get("bits") != 4
-        or value.get("group_size") != 64
-        or value.get("mode") != "affine"
-    ):
-        return False
-    return all(
-        value.get(key) == {"bits": 8, "group_size": 64}
-        for key in _ROUTER_QUANTIZATION_KEYS
-    )
+    """Match the oQ4e mixed-precision imatrix map by exact identity.
+
+    Any change to a bit width, group size, key set, or the unquantized-router
+    shape flips this to ``False``; the pinned scheme is the only admitted one.
+    """
+
+    return isinstance(value, dict) and value == LAGUNA_S_2_1_QUANTIZATION
 
 
 def is_laguna_s_2_1_mlx_4bit_config(config: dict[str, Any]) -> bool:
@@ -195,3 +270,30 @@ def is_laguna_s_2_1_mlx_4bit_config(config: dict[str, Any]) -> bool:
         )
     except (AttributeError, TypeError, ValueError):
         return False
+
+
+def laguna_module_quantization(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Per-module quantization map keyed to the sanitized module tree.
+
+    The pinned checkpoint ships its per-path quantization dict under the
+    ``language_model.`` export prefix, which the vendored module tree does not
+    carry. Strip the prefix so mlx-lm's config-driven quantizer matches each
+    Linear/Embedding by path; the (unlisted) MoE routers stay unquantized.
+    Returns ``None`` for a non-admitted config.
+    """
+
+    if not is_laguna_s_2_1_mlx_4bit_config(config):
+        return None
+    quantization = config.get("quantization")
+    if not isinstance(quantization, dict):
+        return None
+    prefix = LAGUNA_S_2_1_WEIGHT_NAME_PREFIX
+    stripped: dict[str, Any] = {}
+    for key, value in quantization.items():
+        if key in ("group_size", "bits", "mode"):
+            stripped[key] = value
+        elif isinstance(key, str) and key.startswith(prefix):
+            stripped[key[len(prefix) :]] = value
+        else:
+            stripped[key] = value
+    return stripped

@@ -15,8 +15,10 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Vendored from pipenetwork/Laguna-S-2.1-MLX-4bit at revision
-# 5544297f819d50330bc3616dd15cbc7edb598b2f. Adaptations are absolute mlx-lm
-# imports, formatting, and construction-time geometry validation.
+# 5544297f819d50330bc3616dd15cbc7edb598b2f (the architecture source is
+# unchanged; only the admitted artifact moved to mlx-community/Laguna-S-2.1-oQ4e).
+# Adaptations are absolute mlx-lm imports, formatting, construction-time geometry
+# validation, and the oQ4e weight-name layout adapter in Model.sanitize().
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -408,27 +410,33 @@ class Model(nn.Module):
         return self.lm_head(output)
 
     def sanitize(self, weights):
-        if self.args.tie_word_embeddings:
-            weights.pop("lm_head.weight", None)
-        for layer_idx in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{layer_idx}.mlp"
-            bias = weights.pop(
-                f"{prefix}.experts.e_score_correction_bias",
-                None,
-            )
-            if bias is not None:
-                weights[f"{prefix}.e_score_correction_bias"] = bias
-            if f"{prefix}.experts.0.gate_proj.weight" in weights:
-                for projection in ("gate_proj", "up_proj", "down_proj"):
-                    weights[f"{prefix}.switch_mlp.{projection}.weight"] = mx.stack(
-                        [
-                            weights.pop(
-                                f"{prefix}.experts.{expert_idx}.{projection}.weight"
-                            )
-                            for expert_idx in range(self.args.num_experts)
-                        ]
-                    )
-        return weights
+        """Map the oQ4e export layout onto the vendored module tree.
+
+        The pinned checkpoint wraps every tensor under ``language_model.`` and
+        keeps the (unquantized) MoE router inside a ``gate.proj`` submodule with
+        the load-balancing bias parked one level up under ``gate``. Strip the
+        wrapper and fold both back onto the module-native names. The transform
+        is total: every source key maps to exactly one target key, and the
+        resulting set matches the module tree. Weights already in the native
+        layout (no ``language_model.`` prefix, e.g. a directly constructed test
+        model) pass through untouched.
+        """
+
+        if not any(name.startswith("language_model.") for name in weights):
+            return weights
+        remapped = {}
+        for name, value in weights.items():
+            if name.startswith("language_model."):
+                name = name[len("language_model.") :]
+            if name.endswith(".mlp.gate.proj.weight"):
+                name = name[: -len(".proj.weight")] + ".weight"
+            elif name.endswith(".mlp.gate.e_score_correction_bias"):
+                name = (
+                    name[: -len(".gate.e_score_correction_bias")]
+                    + ".e_score_correction_bias"
+                )
+            remapped[name] = value
+        return remapped
 
     def make_cache(self):
         caches = []
@@ -441,14 +449,10 @@ class Model(nn.Module):
                 caches.append(KVCache())
         return caches
 
-    @property
-    def quant_predicate(self):
-        def predicate(path, _):
-            if path.endswith("mlp.gate"):
-                return {"group_size": 64, "bits": 8}
-            return True
-
-        return predicate
+    # No ``quant_predicate``: mlx-lm's load path quantizes from the checkpoint's
+    # own config['quantization'] dict (per-path overrides, gs128 base, BF16
+    # routers). The runtime strips the export prefix from that dict before the
+    # load so it matches this module tree.
 
     @property
     def layers(self):

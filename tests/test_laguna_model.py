@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
 import pytest
+
+from mtplx.models.laguna_config import LAGUNA_S_2_1_QUANTIZATION
 
 
 def _tiny_laguna_config(**updates):
@@ -58,18 +61,7 @@ def _target_laguna_config(**updates):
             "sliding_attention",
         )
     ]
-    quantization = {
-        "bits": 4,
-        "group_size": 64,
-        "mode": "affine",
-        **{
-            f"model.layers.{layer}.mlp.gate": {
-                "bits": 8,
-                "group_size": 64,
-            }
-            for layer in range(1, 48)
-        },
-    }
+    quantization = copy.deepcopy(LAGUNA_S_2_1_QUANTIZATION)
     config = {
         "architectures": ["LagunaForCausalLM"],
         "model_type": "laguna",
@@ -127,11 +119,30 @@ def _target_laguna_config(**updates):
         "tie_word_embeddings": False,
         "torch_dtype": "bfloat16",
         "use_cache": True,
-        "quantization": {key: value.copy() if isinstance(value, dict) else value for key, value in quantization.items()},
-        "quantization_config": {key: value.copy() if isinstance(value, dict) else value for key, value in quantization.items()},
+        "quantization": copy.deepcopy(quantization),
+        "quantization_config": copy.deepcopy(quantization),
     }
     config.update(updates)
     return config
+
+
+def _pipenetwork_laguna_config(**updates):
+    """The superseded uniform-4bit build; kept only as rejection coverage."""
+
+    quantization = {
+        "bits": 4,
+        "group_size": 64,
+        "mode": "affine",
+        **{
+            f"model.layers.{layer}.mlp.gate": {"bits": 8, "group_size": 64}
+            for layer in range(1, 48)
+        },
+    }
+    return _target_laguna_config(
+        quantization=copy.deepcopy(quantization),
+        quantization_config=copy.deepcopy(quantization),
+        **updates,
+    )
 
 
 def test_laguna_model_type_resolves_bundled_classes() -> None:
@@ -164,11 +175,26 @@ def test_other_laguna_variants_do_not_resolve_bundled_classes() -> None:
     wrong_rope["rope_parameters"]["full_attention"]["beta_fast"] = 7.0
     assert _model_classes_for_config(wrong_rope) is None
 
-    missing_router_override = _target_laguna_config()
-    missing_router_override["quantization_config"].pop(
-        "model.layers.47.mlp.gate"
-    )
-    assert _model_classes_for_config(missing_router_override) is None
+    # The superseded uniform-4bit pipenetwork build is now blocked like any
+    # other non-pinned variant: same geometry, wrong quantization map.
+    assert _model_classes_for_config(_pipenetwork_laguna_config()) is None
+
+    # Flip the lone non-uniform attention bit (layer 33 o_proj 8 -> 5) in both
+    # maps; the exact imatrix quantization map no longer matches.
+    mutated_quant = _target_laguna_config()
+    for field in ("quantization", "quantization_config"):
+        mutated_quant[field][
+            "language_model.model.layers.33.self_attn.o_proj"
+        ]["bits"] = 5
+    assert _model_classes_for_config(mutated_quant) is None
+
+    # Dropping any per-path override also breaks the exact map.
+    missing_override = _target_laguna_config()
+    for field in ("quantization", "quantization_config"):
+        missing_override[field].pop(
+            "language_model.model.layers.47.self_attn.q_proj"
+        )
+    assert _model_classes_for_config(missing_override) is None
 
     remote_code = _target_laguna_config(model_file="evil.py")
     assert _model_classes_for_config(remote_code) is None
@@ -201,9 +227,10 @@ def test_laguna_load_bypasses_mlx_lm_registry(monkeypatch, tmp_path: Path) -> No
 
     target_config = _target_laguna_config()
 
-    def fake_load_model(path, *, get_model_classes):
+    def fake_load_model(path, *, get_model_classes, model_config=None):
         observed["path"] = path
         observed["classes"] = get_model_classes(config=target_config)
+        observed["model_config"] = model_config
         return expected_model, target_config
 
     monkeypatch.setattr(mlx_lm.utils, "load_model", fake_load_model)
@@ -222,6 +249,26 @@ def test_laguna_load_bypasses_mlx_lm_registry(monkeypatch, tmp_path: Path) -> No
     assert tokenizer is expected_tokenizer
     assert observed["path"] == tmp_path
     assert observed["classes"] == runtime._model_classes_for_config(target_config)
+
+    # Quantization is driven by the checkpoint's own config['quantization'] dict
+    # (not a model predicate). For the oQ4e export the runtime must strip the
+    # ``language_model.`` key prefix so mlx-lm matches each module by tree path.
+    from mtplx.models.laguna_config import laguna_module_quantization
+
+    expected_quant = laguna_module_quantization(target_config)
+    assert expected_quant is not None
+    model_config = observed["model_config"]
+    assert model_config is not None
+    assert model_config["quantization"] == expected_quant
+    assert model_config["quantization_config"] == expected_quant
+    assert all(
+        not key.startswith("language_model.")
+        for key in model_config["quantization"]
+    )
+    # Routers (mlp.gate) carry no entry and stay unquantized (BF16).
+    assert not any(
+        key.endswith(".mlp.gate") for key in model_config["quantization"]
+    )
 
 
 def test_laguna_remote_model_file_is_rejected_before_mlx_loading(
@@ -435,6 +482,73 @@ def test_laguna_rejects_invalid_installed_geometry(updates, message) -> None:
 
     with pytest.raises(ValueError, match=message):
         ModelArgs.from_dict(_tiny_laguna_config(**updates))
+
+
+def test_sanitize_maps_oq4e_layout_onto_module_tree() -> None:
+    mx = pytest.importorskip("mlx.core")
+    from mtplx.models.laguna import Model, ModelArgs
+
+    config = _tiny_laguna_config(architectures=["LagunaForCausalLM"], head_dim=4)
+    model = Model(ModelArgs.from_dict(config))
+
+    # Synthetic oQ4e-layout weights: every key wrapped under language_model.,
+    # the router stored as gate.proj.weight, and the load-balancing bias parked
+    # under gate.e_score_correction_bias. Values are tiny placeholders.
+    oq4e = {
+        "language_model.model.embed_tokens.weight": mx.zeros((1,)),
+        "language_model.lm_head.weight": mx.zeros((1,)),
+        "language_model.model.layers.1.mlp.gate.proj.weight": mx.zeros((1,)),
+        "language_model.model.layers.1.mlp.gate.e_score_correction_bias": mx.zeros(
+            (1,)
+        ),
+        "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight": mx.zeros(
+            (1,)
+        ),
+        "language_model.model.layers.0.self_attn.q_proj.weight": mx.zeros((1,)),
+    }
+    sanitized = model.sanitize(dict(oq4e))
+
+    assert set(sanitized) == {
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "model.layers.1.mlp.gate.weight",
+        "model.layers.1.mlp.e_score_correction_bias",
+        "model.layers.1.mlp.switch_mlp.gate_proj.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+    }
+    # The remaps are pure renames — the array objects travel unchanged, and the
+    # mapping is total (no source key is dropped or collided).
+    assert (
+        sanitized["model.layers.1.mlp.gate.weight"]
+        is oq4e["language_model.model.layers.1.mlp.gate.proj.weight"]
+    )
+    assert (
+        sanitized["model.layers.1.mlp.e_score_correction_bias"]
+        is oq4e["language_model.model.layers.1.mlp.gate.e_score_correction_bias"]
+    )
+    assert len(sanitized) == len(oq4e)
+
+    # Native-layout weights (no wrapper prefix) pass through untouched.
+    native = {"model.norm.weight": mx.zeros((1,))}
+    native_result = model.sanitize(dict(native))
+    assert set(native_result) == set(native)
+    assert native_result["model.norm.weight"] is native["model.norm.weight"]
+
+
+def test_laguna_memory_floor_tracks_oq4e_weight_bytes() -> None:
+    from mtplx.models import laguna_config as lc
+
+    assert lc.LAGUNA_S_2_1_REPO_ID == "mlx-community/Laguna-S-2.1-oQ4e"
+    assert lc.LAGUNA_S_2_1_REVISION == "8e3f5cad513746264940c1c4195de48d7ea345a5"
+    assert lc.LAGUNA_S_2_1_WEIGHT_BYTES == 64_122_027_323
+    assert lc.LAGUNA_S_2_1_REPO_BYTES == 64_129_728_868
+    assert lc.LAGUNA_S_2_1_MIN_RESIDENT_BYTES == lc.laguna_s_2_1_required_resident_bytes(
+        32_768
+    )
+    # weights + 8 GiB headroom + rotating KV + per-token KV * default context.
+    assert lc.LAGUNA_S_2_1_MIN_RESIDENT_BYTES == (
+        64_122_027_323 + 8 * 1024**3 + 75_497_472 + 32_768 * 49_152
+    )
 
 
 def test_tiny_laguna_checkpoint_loads_and_cached_forward_matches_full(

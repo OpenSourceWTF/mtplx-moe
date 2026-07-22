@@ -269,6 +269,14 @@ def test_pull_model_pins_laguna_revision_and_records_source(
         LAGUNA_S_2_1_SHARD_SIZES,
     )
 
+    # This test exercises revision pinning and source-marker recording, not the
+    # disk preflight (covered separately). Mock free space so it stays hermetic
+    # regardless of the host's actual free disk.
+    monkeypatch.setattr(
+        "mtplx.hf_loader.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=256 * 1024**3),
+    )
+
     captured: dict[str, object] = {}
 
     def fake_snapshot_download(**kwargs):
@@ -293,6 +301,10 @@ def test_pull_model_pins_laguna_revision_and_records_source(
             encoding="utf-8",
         )
         (destination / "generation_config.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        (destination / "special_tokens_map.json").write_text(
             "{}",
             encoding="utf-8",
         )

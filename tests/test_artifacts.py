@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 
@@ -1661,18 +1662,9 @@ def _laguna_s_2_1_config(**updates):
             "sliding_attention",
         )
     ]
-    quantization = {
-        "bits": 4,
-        "group_size": 64,
-        "mode": "affine",
-        **{
-            f"model.layers.{layer}.mlp.gate": {
-                "bits": 8,
-                "group_size": 64,
-            }
-            for layer in range(1, 48)
-        },
-    }
+    from mtplx.models.laguna_config import LAGUNA_S_2_1_QUANTIZATION
+
+    quantization = copy.deepcopy(LAGUNA_S_2_1_QUANTIZATION)
     config = {
         "architectures": ["LagunaForCausalLM"],
         "model_type": "laguna",
@@ -1730,11 +1722,30 @@ def _laguna_s_2_1_config(**updates):
         "tie_word_embeddings": False,
         "torch_dtype": "bfloat16",
         "use_cache": True,
-        "quantization": {key: value.copy() if isinstance(value, dict) else value for key, value in quantization.items()},
-        "quantization_config": {key: value.copy() if isinstance(value, dict) else value for key, value in quantization.items()},
+        "quantization": copy.deepcopy(quantization),
+        "quantization_config": copy.deepcopy(quantization),
     }
     config.update(updates)
     return config
+
+
+def _pipenetwork_laguna_config(**updates):
+    """The superseded uniform-4bit build; kept only as rejection coverage."""
+
+    quantization = {
+        "bits": 4,
+        "group_size": 64,
+        "mode": "affine",
+        **{
+            f"model.layers.{layer}.mlp.gate": {"bits": 8, "group_size": 64}
+            for layer in range(1, 48)
+        },
+    }
+    return _laguna_s_2_1_config(
+        quantization=copy.deepcopy(quantization),
+        quantization_config=copy.deepcopy(quantization),
+        **updates,
+    )
 
 
 def _write_laguna_s_2_1_artifacts(path, monkeypatch):
@@ -1776,6 +1787,7 @@ def _write_laguna_s_2_1_artifacts(path, monkeypatch):
     (path / "tokenizer.json").write_text("{}", encoding="utf-8")
     (path / "tokenizer_config.json").write_text("{}", encoding="utf-8")
     (path / "generation_config.json").write_text("{}", encoding="utf-8")
+    (path / "special_tokens_map.json").write_text("{}", encoding="utf-8")
     (path / "chat_template.jinja").write_text(
         "{{ messages }}",
         encoding="utf-8",
@@ -1885,6 +1897,23 @@ def test_non_4bit_laguna_is_not_admitted_by_target_only_gate(tmp_path):
         ),
         encoding="utf-8",
     )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "no-MTP"
+    assert result.compatibility["can_run"] is False
+
+
+def test_superseded_pipenetwork_laguna_is_not_admitted(tmp_path, monkeypatch):
+    # The pin moved to mlx-community/Laguna-S-2.1-oQ4e; the older uniform-4bit
+    # pipenetwork build shares the geometry but not the quantization map, so it
+    # is now blocked like any other non-pinned variant even with a fully written
+    # (but wrong-hash) artifact set.
+    (tmp_path / "config.json").write_text(
+        json.dumps(_pipenetwork_laguna_config()),
+        encoding="utf-8",
+    )
+    _write_laguna_s_2_1_artifacts(tmp_path, monkeypatch)
 
     result = inspect_model(tmp_path)
 

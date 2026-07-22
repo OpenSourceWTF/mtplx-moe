@@ -442,7 +442,7 @@ def load(
     config = load_config(path)
     if mtp and _is_laguna_s_2_1_mlx_4bit_config(config):
         raise ValueError(
-            "Laguna-S-2.1-MLX-4bit has no native MTP head; "
+            "Laguna-S-2.1 has no native MTP head; "
             "load it with mtp=False (CLI: --no-mtp)."
         )
     _preflight_laguna_system_memory(config)
@@ -574,11 +574,25 @@ def _load_base_model(path: Path, config: dict[str, Any]) -> tuple[Any, Any]:
     if model_classes is not None:
         from mlx_lm.utils import load_model
 
+        from .models.laguna_config import laguna_module_quantization
+
         tokenizer = _load_tokenizer_resilient(path, config)
-        model, _loaded_config = load_model(
-            path,
-            get_model_classes=lambda config: model_classes,
-        )
+        load_kwargs: dict[str, Any] = {
+            "get_model_classes": lambda config: model_classes,
+        }
+        module_quantization = laguna_module_quantization(config)
+        if module_quantization is not None:
+            # The pinned oQ4e checkpoint keys its mixed-precision quantization
+            # dict by the ``language_model.``-prefixed export path. Strip the
+            # prefix so mlx-lm's config-driven quantizer addresses each module
+            # by its tree path (the BF16 routers carry no entry and stay
+            # unquantized). mlx-lm reads this from config["quantization"], not
+            # from any model-level predicate.
+            load_kwargs["model_config"] = {
+                "quantization": module_quantization,
+                "quantization_config": module_quantization,
+            }
+        model, _loaded_config = load_model(path, **load_kwargs)
         return model, tokenizer
 
     from mlx_lm.utils import load as mlx_lm_load
