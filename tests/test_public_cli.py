@@ -1618,6 +1618,10 @@ def test_one_shot_max_uses_verified_max_session(monkeypatch):
 
 @pytest.mark.parametrize("command", ["run", "chat"])
 def test_laguna_one_shot_uses_target_generation_defaults(monkeypatch, command):
+    # One-shot really applies the sustained profile, which writes MTPLX_* keys
+    # into process env for the remaining CLI lifetime; without isolation those
+    # keys leak into later in-process tests (cache_state env-driven configure).
+    monkeypatch.setattr(os, "environ", os.environ.copy())
     observed: dict[str, object] = {}
 
     fake_runtime = ModuleType("mtplx.runtime")
