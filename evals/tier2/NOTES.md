@@ -546,3 +546,30 @@ LEVER PRICES (stacking):
 - (C) Early submission at route time: few ms, folds into (A)/(B).
 VERDICT: q4->10 is priced as reachable via (A)+(B). No implementation
 without David's pick.
+
+## CORRECTION (2026-07-21 ~21:50): fix-A re-priced ~9 ms (was 40-50); (B) overlap carries the program
+
+Quiet-disk burst re-probe (sidecar build finished, no background traffic):
+single 1.110 ms; bursts k=2/3/4 = 1.880/2.698/3.523 ms vs concurrent-ideal
+1.56/2.34/3.11 and serial 2.22/3.33/4.44 — **51/64/69% overlap efficiency
+already present**. The earlier "sum-not-max" serialization read used a
+download-contaminated single baseline; the R1 lesson (verify before build)
+caught it pre-implementation. GIL exonerated separately (spinner probe:
+native read releases it).
+
+Re-priced against the REAL-trace burst distribution (per token: 22.0 k=1 /
+14.6 k=2 / 6.6 k=3 / 2.4 k=4 / 1.2 k>=5 groups): perfect batching recovers
+~9 ms/token. Read-wait stands at ~83-99 ms/token but is mostly IRREDUCIBLE
+read time near the drive ceiling, not serialization.
+
+REVISED PROGRAM: **(B) resident-first same-layer overlap is the primary
+lever** — hide reads behind ~37 GPU + ~22 host ms => floor max(read, rest)
+≈ 100 ms => ~10 tok/s. (A) batched non-blocking group reads DEMOTED to
+(B)'s foundation (~9 ms standalone; required so miss reads stop blocking
+the layer loop). Design: submit layer's misses at route time (batch
+scatter-preadv, non-blocking) -> compute resident experts + shared ->
+accumulate partials in canonical expert order on arrival (bit-exactness
+preserved) -> parity-gated paired A/B.
+Also: oQ4e sidecar COMPLETE (experts.bin 161,036,107,776 B — byte-identical
+geometry to old q4; manifest w/ record hashes; spec + benchmark registered
+5df7d7d). Eval ladder pending a window.
