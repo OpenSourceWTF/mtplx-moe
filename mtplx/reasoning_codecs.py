@@ -20,7 +20,7 @@ from mtplx.chat_encoding import (
 
 QWEN_THINK_OPEN = "<think>"
 QWEN_THINK_CLOSE = "</think>"
-QWEN_STYLE_REASONING_PARSERS = {"qwen3", "step3p5"}
+QWEN_STYLE_REASONING_PARSERS = {"qwen3", "step3p5", "poolside_v1"}
 QWEN_STYLE_REASONING_TAG_NAMES = (
     "think",
     "thinks",

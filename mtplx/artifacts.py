@@ -25,6 +25,14 @@ from .constants import (
     EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_TENSOR_COUNT,
     MULTIMODAL_SIDECARS,
 )
+from .models.laguna_config import (
+    LAGUNA_S_2_1_REPO_ID,
+    LAGUNA_S_2_1_REQUIRED_FILES,
+    LAGUNA_S_2_1_REVISION,
+    LAGUNA_S_2_1_WEIGHT_SHARDS,
+    is_laguna_s_2_1_mlx_4bit_config,
+    laguna_s_2_1_artifact_integrity_errors,
+)
 from .profiles import (
     DEFAULT_FP16_HF_MODEL_ID,
     DEFAULT_FP16_PUBLIC_MODEL_ID,
@@ -373,6 +381,10 @@ class ModelInspection:
     hidden_size: int | None
     num_hidden_layers: int | None
     vocab_size: int | None
+    num_experts: int | None = None
+    num_experts_per_tok: int | None = None
+    laguna_s_2_1_mlx_4bit_match: bool = False
+    laguna_s_2_1_artifacts_complete: bool = False
     mtp_pattern: str | None = None
     source: str = "local"
     quantization: dict[str, Any] = field(default_factory=dict)
@@ -419,6 +431,10 @@ class ModelInspection:
             "hidden_size": self.hidden_size,
             "num_hidden_layers": self.num_hidden_layers,
             "vocab_size": self.vocab_size,
+            "num_experts": self.num_experts,
+            "num_experts_per_tok": self.num_experts_per_tok,
+            "laguna_s_2_1_mlx_4bit_match": self.laguna_s_2_1_mlx_4bit_match,
+            "laguna_s_2_1_artifacts_complete": self.laguna_s_2_1_artifacts_complete,
             "quantization": self.quantization,
             "sidecars": self.sidecars,
             "model_files": list(self.model_files),
@@ -524,7 +540,12 @@ def _hf_repo_id_from_ref(value: Path | str) -> str | None:
     return None
 
 
-def _hf_download_json(repo_id: str, filename: str) -> tuple[dict[str, Any] | None, str | None, str | None]:
+def _hf_download_json(
+    repo_id: str,
+    filename: str,
+    *,
+    revision: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None, str | None]:
     try:
         from huggingface_hub import hf_hub_download
     except Exception as exc:
@@ -536,6 +557,7 @@ def _hf_download_json(repo_id: str, filename: str) -> tuple[dict[str, Any] | Non
             repo_id=repo_id,
             filename=filename,
             repo_type="model",
+            revision=revision,
             **kwargs,
         )
     except Exception as exc:
@@ -576,13 +598,26 @@ def _looks_like_missing_hf_file(error: str | None) -> bool:
     )
 
 
-def _hf_list_repo_files(repo_id: str) -> tuple[set[str], str | None]:
+def _hf_list_repo_files(
+    repo_id: str,
+    *,
+    revision: str | None = None,
+) -> tuple[set[str], str | None]:
     try:
         from huggingface_hub import HfApi
     except Exception as exc:
         return set(), f"huggingface_hub is required for HF inspection: {exc}"
     try:
-        return set(HfApi().list_repo_files(repo_id=repo_id, repo_type="model")), None
+        return (
+            set(
+                HfApi().list_repo_files(
+                    repo_id=repo_id,
+                    repo_type="model",
+                    revision=revision,
+                )
+            ),
+            None,
+        )
     except Exception as exc:
         return set(), str(exc)
 
@@ -790,9 +825,54 @@ def _mtp_pattern_from_config(config: dict[str, Any]) -> str | None:
     return str(raw)
 
 
+def _remote_laguna_artifacts_complete(repo_id: str, files: set[str]) -> bool:
+    return bool(
+        repo_id.casefold() == LAGUNA_S_2_1_REPO_ID.casefold()
+        and LAGUNA_S_2_1_REQUIRED_FILES.issubset(files)
+    )
+
+
+def _local_laguna_artifacts_complete(model_path: Path) -> bool:
+    try:
+        source = json.loads(
+            (model_path / ".mtplx-source.json").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if source != {
+        "repo_id": LAGUNA_S_2_1_REPO_ID,
+        "revision": LAGUNA_S_2_1_REVISION,
+    }:
+        return False
+    if laguna_s_2_1_artifact_integrity_errors(model_path):
+        return False
+    try:
+        index = json.loads(
+            (model_path / "model.safetensors.index.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    weight_map = index.get("weight_map") if isinstance(index, dict) else None
+    if not isinstance(weight_map, dict) or not weight_map:
+        return False
+    return set(weight_map.values()) == set(LAGUNA_S_2_1_WEIGHT_SHARDS)
+
+
 def _inspect_hf_model(repo_id: str) -> ModelInspection:
-    files, files_error = _hf_list_repo_files(repo_id)
-    config, config_path, config_error = _hf_download_json(repo_id, "config.json")
+    revision = (
+        LAGUNA_S_2_1_REVISION
+        if repo_id.casefold() == LAGUNA_S_2_1_REPO_ID.casefold()
+        else None
+    )
+    revision_kwargs = {"revision": revision} if revision is not None else {}
+    files, files_error = _hf_list_repo_files(repo_id, **revision_kwargs)
+    config, config_path, config_error = _hf_download_json(
+        repo_id,
+        "config.json",
+        **revision_kwargs,
+    )
     if config is None and "mtplx_pair.json" in files:
         # Assistant-pair bundles (Gemma 4) have no root config.json by
         # design: weights and configs live under target/ and assistant/
@@ -802,10 +882,14 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
         # preflight reaches the same verdict instead of refusing what
         # the engine can run.
         pair_manifest, _pair_path, _pair_error = _hf_download_json(
-            repo_id, "mtplx_pair.json"
+            repo_id,
+            "mtplx_pair.json",
+            **revision_kwargs,
         )
         target_config, target_path, _target_error = _hf_download_json(
-            repo_id, "target/config.json"
+            repo_id,
+            "target/config.json",
+            **revision_kwargs,
         )
         if pair_manifest is not None and target_config is not None:
             config = dict(target_config)
@@ -820,6 +904,7 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
     runtime_contract_data, runtime_contract_path, runtime_contract_error = _hf_download_json(
         repo_id,
         "mtplx_runtime.json",
+        **revision_kwargs,
     )
     if runtime_contract_data is None and _looks_like_missing_hf_file(runtime_contract_error):
         runtime_contract_error = None
@@ -901,6 +986,13 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
         hidden_size=tcfg.get("hidden_size"),
         num_hidden_layers=tcfg.get("num_hidden_layers"),
         vocab_size=tcfg.get("vocab_size"),
+        num_experts=tcfg.get("num_experts"),
+        num_experts_per_tok=tcfg.get("num_experts_per_tok"),
+        laguna_s_2_1_mlx_4bit_match=is_laguna_s_2_1_mlx_4bit_config(config),
+        laguna_s_2_1_artifacts_complete=_remote_laguna_artifacts_complete(
+            repo_id,
+            files,
+        ),
         mtp_pattern=_mtp_pattern_from_config(config),
         quantization=quant,
         sidecars={name: name in files for name in MULTIMODAL_SIDECARS},
@@ -926,6 +1018,10 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
         hidden_size=inspection.hidden_size,
         num_hidden_layers=inspection.num_hidden_layers,
         vocab_size=inspection.vocab_size,
+        num_experts=inspection.num_experts,
+        num_experts_per_tok=inspection.num_experts_per_tok,
+        laguna_s_2_1_mlx_4bit_match=inspection.laguna_s_2_1_mlx_4bit_match,
+        laguna_s_2_1_artifacts_complete=inspection.laguna_s_2_1_artifacts_complete,
         mtp_pattern=inspection.mtp_pattern,
         quantization=inspection.quantization,
         sidecars=inspection.sidecars,
@@ -978,6 +1074,14 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
             hidden_size=tcfg.get("hidden_size"),
             num_hidden_layers=tcfg.get("num_hidden_layers"),
             vocab_size=tcfg.get("vocab_size"),
+            num_experts=tcfg.get("num_experts"),
+            num_experts_per_tok=tcfg.get("num_experts_per_tok"),
+            laguna_s_2_1_mlx_4bit_match=is_laguna_s_2_1_mlx_4bit_config(
+                target_config
+            ),
+            laguna_s_2_1_artifacts_complete=_local_laguna_artifacts_complete(
+                Path(pair["target_model"])
+            ),
             mtp_pattern="assistant-pair",
             quantization=target_quant,
             sidecars={name: False for name in MULTIMODAL_SIDECARS},
@@ -1045,6 +1149,12 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
         hidden_size=tcfg.get("hidden_size"),
         num_hidden_layers=tcfg.get("num_hidden_layers"),
         vocab_size=tcfg.get("vocab_size"),
+        num_experts=tcfg.get("num_experts"),
+        num_experts_per_tok=tcfg.get("num_experts_per_tok"),
+        laguna_s_2_1_mlx_4bit_match=is_laguna_s_2_1_mlx_4bit_config(config),
+        laguna_s_2_1_artifacts_complete=_local_laguna_artifacts_complete(
+            model_path
+        ),
         mtp_pattern=_mtp_pattern_from_config(config),
         quantization=quant,
         sidecars={name: (model_path / name).exists() for name in MULTIMODAL_SIDECARS},
@@ -1065,6 +1175,10 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
         hidden_size=inspection.hidden_size,
         num_hidden_layers=inspection.num_hidden_layers,
         vocab_size=inspection.vocab_size,
+        num_experts=inspection.num_experts,
+        num_experts_per_tok=inspection.num_experts_per_tok,
+        laguna_s_2_1_mlx_4bit_match=inspection.laguna_s_2_1_mlx_4bit_match,
+        laguna_s_2_1_artifacts_complete=inspection.laguna_s_2_1_artifacts_complete,
         mtp_pattern=inspection.mtp_pattern,
         quantization=inspection.quantization,
         sidecars=inspection.sidecars,

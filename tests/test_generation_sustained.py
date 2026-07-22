@@ -193,6 +193,10 @@ def test_contiguous_then_repage_cache_layout_restores_paged_env(monkeypatch):
             events.append(("make_cache", os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN")))
             return cache
 
+        def repage_target_prefill_cache(self, received_cache):
+            configure(received_cache)
+            return True
+
     def configure(received_cache):
         events.append(("repage", os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN")))
         assert received_cache is cache
@@ -207,8 +211,9 @@ def test_contiguous_then_repage_cache_layout_restores_paged_env(monkeypatch):
         configure,
     )
 
-    made_cache = _make_target_prefill_cache(Runtime())
-    elapsed = _maybe_repage_target_prefill_cache(made_cache)
+    runtime = Runtime()
+    made_cache = _make_target_prefill_cache(runtime)
+    elapsed = _maybe_repage_target_prefill_cache(runtime, made_cache)
 
     assert elapsed >= 0.0
     assert events == [("make_cache", "0"), ("repage", "1")]
@@ -226,6 +231,10 @@ def test_contiguous_dense_decode_cache_layout_does_not_repage(monkeypatch):
             events.append(("make_cache", os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN")))
             return cache
 
+        def repage_target_prefill_cache(self, received_cache):
+            configure(received_cache)
+            return True
+
     def configure(_received_cache):
         raise AssertionError("dense decode layout must not repage after prefill")
 
@@ -238,8 +247,9 @@ def test_contiguous_dense_decode_cache_layout_does_not_repage(monkeypatch):
         configure,
     )
 
-    made_cache = _make_target_prefill_cache(Runtime())
-    elapsed = _maybe_repage_target_prefill_cache(made_cache)
+    runtime = Runtime()
+    made_cache = _make_target_prefill_cache(runtime)
+    elapsed = _maybe_repage_target_prefill_cache(runtime, made_cache)
 
     assert elapsed == 0.0
     assert events == [("make_cache", "0")]

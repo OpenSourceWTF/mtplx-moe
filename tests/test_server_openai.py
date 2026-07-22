@@ -101,6 +101,53 @@ def test_server_parser_accepts_step_adapter_quant_flags():
     assert args.reasoning_parser == "step3p5"
     assert args.reasoning_effort == "medium"
 
+
+def test_server_backend_defaults_apply_laguna_response_cap_and_codec():
+    args = parse_args(
+        [
+            "--backend-id",
+            "laguna_ar",
+            "--no-load-mtp",
+            "--generation-mode",
+            "ar",
+            "--warmup-tokens",
+            "0",
+        ]
+    )
+    args.max_response_tokens = None
+    args.reasoning_parser = "qwen3"
+
+    openai._apply_backend_server_defaults(args, explicit_flags=set())
+
+    assert args.max_response_tokens == 32_768
+    assert args.reasoning_parser == "poolside_v1"
+    assert args.tool_prompt_mode == "native"
+    assert args.chat_template_profile == "tokenizer"
+
+    with pytest.raises(ValueError, match="requires.*tokenizer chat template"):
+        parse_args(
+            [
+                "--backend-id",
+                "laguna_ar",
+                "--chat-template-profile",
+                "local_qwen36",
+                "--warmup-tokens",
+                "0",
+            ]
+        )
+
+    with pytest.raises(ValueError, match="requires.*tokenizer chat template"):
+        parse_args(
+            [
+                "--backend-id",
+                "laguna_ar",
+                "--chat-template-path",
+                "/tmp/qwen.jinja",
+                "--warmup-tokens",
+                "0",
+            ]
+        )
+
     inferred = parse_args(
         [
             "--model",
@@ -7066,6 +7113,55 @@ def test_opencode_agent_tool_client_uses_compact_prompt_mode(monkeypatch):
     assert "tool_prompt_mode=compact" in seen["session_policy_fingerprint"]
 
 
+def test_laguna_opencode_keeps_poolside_native_tool_protocol(monkeypatch):
+    from mtplx.backends.descriptors import LAGUNA_AR_DESCRIPTOR
+
+    seen: dict[str, object] = {}
+    state = _fake_state()
+    foreground = ForegroundState()
+    state.lock = foreground.lock
+    state.has_foreground = foreground.has_foreground
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.backend_descriptor = LAGUNA_AR_DESCRIPTOR
+    state.args.backend_id = "laguna_ar"
+    state.args.reasoning_parser = "poolside_v1"
+    state.args.tool_prompt_mode = "native"
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+
+    def fake_run_generation(*_args, **kwargs):
+        seen["request_observability"] = dict(kwargs["request_observability"])
+        return _fake_generation("Done")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": "opencode"},
+        json={
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "user", "content": "Read package.json."},
+            ],
+            "tools": [_named_tool_schema("read")],
+            "tool_choice": "auto",
+            "max_tokens": 32,
+        },
+    )
+
+    assert response.status_code == 200
+    messages, kwargs = state.runtime.tokenizer.calls[0]
+    rendered = "\n".join(str(message.get("content") or "") for message in messages)
+    stats = seen["request_observability"]
+    assert "tools" in kwargs
+    assert "Qwen native XML" not in rendered
+    assert "<function=" not in rendered
+    assert "<parameter=" not in rendered
+    assert stats["tool_prompt_mode"] == "native"
+    assert stats["tool_prompt_mode_source"] == "backend:laguna_ar"
+    assert stats["tool_prompt_mode_client_repaired"] is False
+
+
 @pytest.mark.parametrize("client_hint", ["pi", "hermes"])
 def test_agent_tool_clients_repair_native_launch_mode_to_hybrid(monkeypatch, client_hint):
     seen: dict[str, object] = {}
@@ -8914,6 +9010,51 @@ def test_chat_tool_json_returns_openai_tool_calls_nonstream(monkeypatch):
     choice = response.json()["choices"][0]
     assert choice["finish_reason"] == "tool_calls"
     assert choice["message"]["tool_calls"][0]["function"]["arguments"] == "{}"
+
+
+def test_poolside_tool_call_payload_maps_arg_pairs_to_openai_call():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+
+    calls = openai._parse_generated_tool_calls(
+        "<tool_call>get_weather"
+        "<arg_key>city</arg_key>"
+        "<arg_value>Paris</arg_value>"
+        "</tool_call>",
+        tools=tools,
+    )
+
+    assert calls is not None
+    assert calls[0]["function"] == {
+        "name": "get_weather",
+        "arguments": '{"city":"Paris"}',
+    }
+
+
+def test_poolside_reasoning_parser_keeps_target_default_thinking_enabled():
+    from mtplx.backends.descriptors import LAGUNA_AR_DESCRIPTOR
+
+    state = SimpleNamespace(
+        args=SimpleNamespace(
+            reasoning_parser="poolside_v1",
+            enable_thinking=True,
+        ),
+        backend_descriptor=LAGUNA_AR_DESCRIPTOR,
+    )
+    request = SimpleNamespace(enable_thinking=None)
+
+    assert openai._thinking_enabled_for_request(state, request) is True
 
 
 def test_anthropic_messages_returns_tool_use_nonstream(monkeypatch):

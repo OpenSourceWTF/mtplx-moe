@@ -383,6 +383,45 @@ def test_serve_parser_accepts_auto_generation_mode_as_engine_default():
     assert _generation_mode_from_args(args) == "mtp"
 
 
+def test_native_ar_only_runtime_requires_ar_and_disables_mtp_loading():
+    inspection = {
+        "compatibility": {
+            "runtime_compatibility": "native-ar-only",
+            "can_run": True,
+        }
+    }
+    lines: list[str] = []
+    mtp_args = SimpleNamespace(generation_mode="mtp", load_mtp=True)
+
+    assert (
+        public._apply_runtime_compatibility_mode(
+            mtp_args,
+            inspection,
+            printer=lines.append,
+        )
+        == 2
+    )
+    assert lines == [
+        "error: this model is target-only AR and has no native MTP head",
+        "try: rerun with --no-mtp",
+    ]
+
+    ar_args = SimpleNamespace(generation_mode="ar", load_mtp=True)
+    assert public._apply_runtime_compatibility_mode(ar_args, inspection) is None
+    assert ar_args.load_mtp is False
+
+    auto_ar_args = SimpleNamespace(
+        generation_mode="auto",
+        no_mtp=True,
+        load_mtp=True,
+    )
+    assert (
+        public._apply_runtime_compatibility_mode(auto_ar_args, inspection)
+        is None
+    )
+    assert auto_ar_args.load_mtp is False
+
+
 def test_serve_cli_accepts_native_app_thermal_poll_flag():
     parser = build_parser()
 
@@ -1480,7 +1519,7 @@ def test_depth_sweep_native60_keeps_model_runtime_env_overrides(monkeypatch):
         model="/tmp/model",
         prompt_suite="/tmp/prompts.jsonl",
         depths="1",
-        max_tokens=8,
+        max_tokens=None,
         limit=1,
         seed=0,
         temperature=0.7,
@@ -1575,6 +1614,213 @@ def test_one_shot_max_uses_verified_max_session(monkeypatch):
     assert code == 0
     assert payload["thermal"]["restore"]["ok"] is True
     assert calls == ["start", "stop"]
+
+
+@pytest.mark.parametrize("command", ["run", "chat"])
+def test_laguna_one_shot_uses_target_generation_defaults(monkeypatch, command):
+    observed: dict[str, object] = {}
+
+    fake_runtime = ModuleType("mtplx.runtime")
+
+    def fake_load(*_args, **kwargs):
+        observed["load_mtp"] = kwargs["mtp"]
+        return SimpleNamespace(tokenizer=object())
+
+    fake_runtime.load = fake_load
+    fake_schema = ModuleType("mtplx.benchmarks.schema")
+    fake_schema.PromptCase = lambda **kwargs: SimpleNamespace(**kwargs)
+
+    def fake_encode(*_args, **kwargs):
+        observed["enable_thinking"] = kwargs["enable_thinking"]
+        return [1, 2, 3]
+
+    fake_schema.encode_prompt_case = fake_encode
+    fake_generation = ModuleType("mtplx.generation")
+
+    def fake_generate_ar(*_args, **kwargs):
+        observed["sampler"] = kwargs["sampler"]
+        return SimpleNamespace(
+            text="ok",
+            tokens=[1],
+            stats=SimpleNamespace(generated_tokens=1, tok_s=1.0),
+        )
+
+    fake_generation.generate_ar = fake_generate_ar
+    fake_generation.generate_mtpk = lambda *_a, **_kw: pytest.fail(
+        "Laguna one-shot reached MTP generation"
+    )
+    fake_sampling = ModuleType("mtplx.sampling")
+    fake_sampling.SamplerConfig = lambda **kwargs: SimpleNamespace(**kwargs)
+    monkeypatch.setitem(sys.modules, "mtplx.runtime", fake_runtime)
+    monkeypatch.setitem(sys.modules, "mtplx.benchmarks.schema", fake_schema)
+    monkeypatch.setitem(sys.modules, "mtplx.generation", fake_generation)
+    monkeypatch.setitem(sys.modules, "mtplx.sampling", fake_sampling)
+    monkeypatch.setattr(
+        public,
+        "_resolve_runtime_model_path",
+        lambda model, cache_dir=None: ("/tmp/laguna", None),
+    )
+    inspection = {
+        "recommended_backend": "laguna_ar",
+        "compatibility": {
+            "runtime_compatibility": "native-ar-only",
+            "recommended_backend": "laguna_ar",
+            "can_run": True,
+        },
+    }
+    monkeypatch.setattr(
+        public,
+        "_model_gate",
+        lambda *_args, **_kwargs: (inspection, None),
+    )
+    args = SimpleNamespace(
+        prompt="hello",
+        prompt_arg=None,
+        model="/tmp/laguna",
+        cache_dir=None,
+        unsafe_force_unverified=False,
+        yes=True,
+        profile="sustained",
+        max=False,
+        system=None,
+        max_tokens=None,
+        temperature=0.6,
+        top_p=0.95,
+        top_k=20,
+        depth=3,
+        seed=0,
+        expect_python=False,
+        generation_mode="ar",
+        no_mtp=True,
+        load_mtp=True,
+        reasoning=None,
+        reasoning_parser="qwen3",
+        _cli_flags=set(),
+    )
+
+    code, payload, _validations = public._generate_one_shot_public(
+        args,
+        command=command,
+    )
+
+    sampler = observed["sampler"]
+    assert code == 0
+    assert payload["stats"]["generation_mode"] == "ar"
+    assert payload["stats"]["max_tokens"] == 32_768
+    assert observed["load_mtp"] is False
+    assert observed["enable_thinking"] is True
+    assert sampler.temperature == 1.0
+    assert sampler.top_p == 1.0
+    assert sampler.top_k == 20
+
+
+def test_laguna_backend_defaults_preserve_explicit_sampler_flags():
+    args = SimpleNamespace(
+        temperature=0.25,
+        top_p=0.8,
+        top_k=7,
+        depth=3,
+        max_tokens=None,
+        max_response_tokens=None,
+        reasoning=None,
+        reasoning_parser="qwen3",
+        _cli_flags={"temperature", "top-p", "top-k"},
+    )
+
+    public._apply_backend_serve_defaults(
+        args,
+        {"recommended_backend": "laguna_ar"},
+    )
+
+    assert args.temperature == 0.25
+    assert args.top_p == 0.8
+    assert args.top_k == 7
+    assert args.max_tokens == 32_768
+    assert args.max_response_tokens == 32_768
+    assert public._pi_sampler_top_p(args) == 0.8
+
+    from mtplx.backends.descriptors import LAGUNA_AR_DESCRIPTOR
+
+    assert LAGUNA_AR_DESCRIPTOR.context_window_policy.default == 32_768
+    assert LAGUNA_AR_DESCRIPTOR.context_window_policy.maximum == 1_048_576
+    assert LAGUNA_AR_DESCRIPTOR.to_dict()["default_max_response_tokens"] == 32_768
+
+
+def test_laguna_opencode_payload_uses_native_tools_and_32k_context(monkeypatch):
+    args = SimpleNamespace(
+        host="127.0.0.1",
+        port=8000,
+        model="pipenetwork/Laguna-S-2.1-MLX-4bit",
+        profile="sustained",
+        api_key=None,
+        temperature=0.6,
+        top_p=0.95,
+        top_k=20,
+        depth=3,
+        no_mtp=True,
+        generation_mode="ar",
+        max_response_tokens=None,
+        reasoning=None,
+        reasoning_parser="qwen3",
+        tool_prompt_mode="hybrid",
+        chat_template_profile="local_qwen36",
+        _cli_flags=set(),
+    )
+    inspection = {
+        "recommended_backend": "laguna_ar",
+        "compatibility": {"recommended_backend": "laguna_ar"},
+    }
+    monkeypatch.setattr(
+        "mtplx.opencode.detect_opencode_desktop",
+        lambda: {"installed": False},
+    )
+
+    public._apply_backend_serve_defaults(args, inspection)
+    payload = public._quickstart_opencode_payload(args, inspection=inspection)
+
+    assert args.tool_prompt_mode == "native"
+    assert args.chat_template_profile == "tokenizer"
+    assert public._inspection_context_window(inspection, args=args) == 32_768
+    assert payload["context_window"] == 32_768
+    assert payload["output_limit"] == 32_768
+    assert payload["tool_prompt_mode"] == "native"
+    assert "--tool-prompt-mode native" in payload["server_command"]
+    assert "--context-window 32768" in payload["server_command"]
+
+    args.context_window = 65_536
+    expanded = public._quickstart_opencode_payload(args, inspection=inspection)
+
+    assert expanded["context_window"] == 65_536
+    assert expanded["output_limit"] == 32_768
+    assert "--context-window 65536" in expanded["server_command"]
+    assert "--max-response-tokens 32768" in expanded["server_command"]
+
+
+@pytest.mark.parametrize(
+    ("flags", "updates"),
+    (
+        ({"chat-template-profile"}, {"chat_template_profile": "local_qwen36"}),
+        ({"chat-template-path"}, {"chat_template_path": "/tmp/qwen.jinja"}),
+    ),
+)
+def test_laguna_rejects_conflicting_chat_template_overrides(flags, updates):
+    values = {
+        "reasoning": None,
+        "reasoning_parser": "qwen3",
+        "reasoning_effort": None,
+        "tool_prompt_mode": "hybrid",
+        "chat_template_profile": "tokenizer",
+        "chat_template_path": None,
+        "_cli_flags": flags,
+    }
+    values.update(updates)
+    args = SimpleNamespace(**values)
+
+    with pytest.raises(ValueError, match="requires.*tokenizer chat template"):
+        public._apply_backend_serve_defaults(
+            args,
+            {"recommended_backend": "laguna_ar"},
+        )
 
 
 def test_serve_require_max_fans_fails_closed_before_child_launch(monkeypatch, capsys):
@@ -6156,6 +6402,60 @@ def test_serve_no_mtp_dispatches_ar_generation_mode(monkeypatch):
     assert calls["cmd"][calls["cmd"].index("--generation-mode") + 1] == "ar"
 
 
+def test_serve_native_ar_only_requires_no_mtp_and_unloads_runtime(
+    monkeypatch, tmp_path, capsys
+):
+    inspection = {
+        "model_dir": str(tmp_path),
+        "architecture": "LagunaForCausalLM",
+        "model_type": "laguna",
+        "compatibility": {
+            "tier": "AR-only",
+            "arch_id": "laguna-s-2.1-ar",
+            "can_run": True,
+            "exit_code": 0,
+            "runtime_compatibility": "native-ar-only",
+            "recommended_backend": "laguna_ar",
+        },
+    }
+    monkeypatch.setattr(public, "_serve_should_onboard", lambda _args: False)
+    monkeypatch.setattr(public, "_port_is_busy", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        public,
+        "_resolve_runtime_model_path",
+        lambda model, cache_dir=None: (str(tmp_path), None),
+    )
+    monkeypatch.setattr(
+        public,
+        "_model_gate",
+        lambda *_args, **_kwargs: (inspection, None),
+    )
+
+    rejected = build_parser().parse_args(
+        ["serve", "--model", str(tmp_path), "--yes"]
+    )
+    rejected.dry_run = True
+    assert public.cmd_serve_public(rejected) == 2
+    assert "rerun with --no-mtp" in capsys.readouterr().out
+
+    accepted = build_parser().parse_args(
+        ["serve", "--model", str(tmp_path), "--yes", "--no-mtp"]
+    )
+    accepted.dry_run = True
+    accepted.json = True
+    assert public.cmd_serve_public(accepted) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "--generation-mode ar" in payload["server_command"]
+    assert "--no-load-mtp" in payload["server_command"]
+    assert "--backend-id laguna_ar" in payload["server_command"]
+    assert "--reasoning-parser poolside_v1" in payload["server_command"]
+    assert "--enable-thinking" in payload["server_command"]
+    assert "--no-enable-thinking" not in payload["server_command"]
+    assert "--temperature 1.0" in payload["server_command"]
+    assert "--top-p 1.0" in payload["server_command"]
+    assert "--backend-id qwen3_next" not in payload["server_command"]
+
+
 def test_serve_generation_mode_ar_keeps_mtp_runtime_loaded(monkeypatch):
     calls = {}
 
@@ -7203,6 +7503,30 @@ def test_eval_attribution_dry_run_is_real_command(capsys):
     assert "--prefix-tokens" in payload["command"]
     assert "outputs,recurrent;recurrent,outputs" in payload["command"]
     assert "larger owned kernel boundary" in payload["purpose"]
+
+
+@pytest.mark.parametrize("action", ["compile-audit", "eval-attribution"])
+def test_mtp_only_profile_commands_reject_laguna_ar(
+    monkeypatch,
+    capsys,
+    action,
+):
+    inspection = {
+        "compatibility": {
+            "can_run": True,
+            "runtime_compatibility": "native-ar-only",
+        }
+    }
+    monkeypatch.setattr(
+        public,
+        "_model_gate",
+        lambda *_args, **_kwargs: (inspection, None),
+    )
+
+    code = main(["profile", action, "--model", "/models/laguna", "--dry-run"])
+
+    assert code == 2
+    assert "requires an MTP-capable runtime" in capsys.readouterr().out
 
 
 def test_model_gate_error_lines_render_for_every_tier():

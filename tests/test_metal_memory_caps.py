@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 from mtplx.server import openai
 
 
@@ -107,6 +109,98 @@ def test_apply_metal_memory_caps_preserves_128g_defaults(monkeypatch):
     assert result["memory_limit_bytes"] == 96 * GiB
     assert result["wired_limit_bytes"] == int(128 * GiB * 0.60)
     assert calls == [("memory", 96 * GiB), ("wired", int(128 * GiB * 0.60))]
+
+
+def test_apply_metal_memory_caps_raises_default_wired_floor_for_laguna(
+    monkeypatch,
+):
+    from mtplx.models.laguna_config import LAGUNA_S_2_1_MIN_RESIDENT_BYTES
+
+    mx, calls = _fake_mx(top_level=True)
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
+
+    result = openai._apply_metal_memory_caps(
+        mx_module=mx,
+        total_ram_bytes=96 * GiB,
+        minimum_resident_bytes=LAGUNA_S_2_1_MIN_RESIDENT_BYTES,
+    )
+
+    assert result["applied"] is True
+    assert result["memory_limit_bytes"] == 72 * GiB
+    assert result["wired_limit_bytes"] == LAGUNA_S_2_1_MIN_RESIDENT_BYTES
+    assert calls == [
+        ("memory", 72 * GiB),
+        ("wired", LAGUNA_S_2_1_MIN_RESIDENT_BYTES),
+    ]
+
+
+def test_apply_metal_memory_caps_rejects_insufficient_ram_for_laguna(
+    monkeypatch,
+):
+    from mtplx.models.laguna_config import LAGUNA_S_2_1_MIN_RESIDENT_BYTES
+
+    mx, calls = _fake_mx(top_level=True)
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
+
+    result = openai._apply_metal_memory_caps(
+        mx_module=mx,
+        total_ram_bytes=64 * GiB,
+        minimum_resident_bytes=LAGUNA_S_2_1_MIN_RESIDENT_BYTES,
+    )
+
+    assert result["applied"] is False
+    assert result["reason"] == "insufficient_ram"
+    assert result["minimum_resident_bytes"] == LAGUNA_S_2_1_MIN_RESIDENT_BYTES
+    assert calls == []
+
+
+def test_laguna_explicit_context_must_fit_active_metal_cap(monkeypatch):
+    from mtplx.backends.descriptors import LAGUNA_AR_DESCRIPTOR
+    from mtplx.models.laguna_config import LAGUNA_S_2_1_MIN_RESIDENT_BYTES
+
+    mx, _calls = _fake_mx(top_level=True)
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
+    caps = openai._apply_metal_memory_caps(
+        mx_module=mx,
+        total_ram_bytes=128 * GiB,
+        minimum_resident_bytes=LAGUNA_S_2_1_MIN_RESIDENT_BYTES,
+    )
+
+    openai._validate_backend_context_memory_budget(
+        LAGUNA_AR_DESCRIPTOR,
+        caps,
+        None,
+    )
+    with pytest.raises(RuntimeError, match="context window 1,048,576"):
+        openai._validate_backend_context_memory_budget(
+            LAGUNA_AR_DESCRIPTOR,
+            caps,
+            1_048_576,
+        )
+
+
+def test_laguna_server_uses_safe_default_but_preserves_explicit_context():
+    from mtplx.backends.descriptors import LAGUNA_AR_DESCRIPTOR
+
+    assert (
+        openai._select_backend_context_window(
+            LAGUNA_AR_DESCRIPTOR,
+            model_max=1_048_576,
+            requested=None,
+        )
+        == 32_768
+    )
+    assert (
+        openai._select_backend_context_window(
+            LAGUNA_AR_DESCRIPTOR,
+            model_max=1_048_576,
+            requested=65_536,
+        )
+        == 65_536
+    )
 
 
 def test_apply_metal_memory_caps_falls_back_to_deprecated_metal_apis(monkeypatch):

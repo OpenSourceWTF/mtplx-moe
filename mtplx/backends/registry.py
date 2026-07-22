@@ -12,6 +12,7 @@ from mtplx.profiles import DEFAULT_PROFILE_NAME, PROFILE_CHOICES, resolve_profil
 
 RUNTIME_CONTRACT_FILE = "mtplx_runtime.json"
 SUPPORTED_ARCH_IDS = {
+    "laguna-s-2.1-ar",
     "qwen3-next-mtp",
     "deepseek-v3-mtp",
     "glm-moe-dsa-mtp",
@@ -29,6 +30,7 @@ TIER_FAMILY_COMPATIBLE_UNVERIFIED = "family-compatible-unverified"
 TIER_ARCH_COMPATIBLE_UNVERIFIED = "architecture-compatible-but-unverified"
 TIER_INCOMPATIBLE_ARCHITECTURE = "incompatible-architecture"
 TIER_NO_MTP = "no-MTP"
+TIER_AR_ONLY = "AR-only"
 
 EXIT_VERIFIED = 0
 EXIT_NO_MTP = 2
@@ -113,6 +115,26 @@ class ArchitectureSupport:
 
 
 ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
+    "laguna-s-2.1-ar": ArchitectureSupport(
+        arch_id="laguna-s-2.1-ar",
+        display_name="Laguna-S-2.1 MLX 4-bit",
+        family="laguna",
+        backend="laguna_ar",
+        support_level="verified-native-ar-only",
+        runtime_compatibility="native-ar-only",
+        can_run_verified=True,
+        aliases=("laguna", "LagunaForCausalLM"),
+        config_markers=(),
+        family_gate="laguna-s-2.1-mlx-4bit-geometry",
+        references=(
+            "https://huggingface.co/pipenetwork/Laguna-S-2.1-MLX-4bit",
+            "https://huggingface.co/pipenetwork/Laguna-S-2.1-MLX-4bit/blob/5544297f819d50330bc3616dd15cbc7edb598b2f/laguna.py",
+        ),
+        notes=(
+            "Target-only AR runtime for the exact PipeNetwork 4-bit checkpoint; "
+            "the artifact has no native MTP head and must be loaded with mtp=False."
+        ),
+    ),
     "qwen3-next-mtp": ArchitectureSupport(
         arch_id="qwen3-next-mtp",
         display_name="Qwen3.6 / Qwen3-Next / Qwen3.5 MTP",
@@ -668,7 +690,9 @@ def _detect_arch_id(inspection: Any) -> str | None:
         reverse=True,
     )
     for support in supports:
-        if has_explicit_mtp and _support_alias_matches(support, combined):
+        if _support_alias_matches(support, combined) and (
+            has_explicit_mtp or support.runtime_compatibility == "native-ar-only"
+        ):
             return support.arch_id
     if "mtp" in combined or "nextn" in combined:
         return "generic-mtp"
@@ -947,6 +971,15 @@ def _passes_nemotron_h_gate(inspection: Any) -> bool:
 
 
 def _passes_family_runtime_gate(arch_id: str, inspection: Any, tensor_gate: bool) -> bool:
+    if arch_id == "laguna-s-2.1-ar":
+        return bool(
+            getattr(inspection, "laguna_s_2_1_mlx_4bit_match", False)
+            and getattr(
+                inspection,
+                "laguna_s_2_1_artifacts_complete",
+                False,
+            )
+        )
     if arch_id == "qwen3-next-mtp":
         return bool(
             tensor_gate
@@ -1392,6 +1425,30 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
         )
 
     if not has_mtp:
+        if (
+            support is not None
+            and support.runtime_compatibility == "native-ar-only"
+            and _passes_family_runtime_gate(support.arch_id, inspection, tensor_gate)
+        ):
+            return CompatibilityVerdict(
+                tier=TIER_AR_ONLY,
+                arch_id=support.arch_id,
+                supported=True,
+                recognized=True,
+                can_run=True,
+                exit_code=EXIT_VERIFIED,
+                message=(
+                    f"{support.display_name} matches the bundled MLX loader; "
+                    "run in target-only AR mode because the checkpoint has no "
+                    "native MTP head."
+                ),
+                recommended_backend=support.backend,
+                recommended_profile=DEFAULT_PROFILE_NAME,
+                mtp_supported="no",
+                runtime_compatibility=support.runtime_compatibility,
+                support_level=support.support_level,
+                support_notes=support.notes,
+            )
         return CompatibilityVerdict(
             tier=TIER_NO_MTP,
             arch_id=detected_arch_id,

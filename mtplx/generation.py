@@ -743,13 +743,13 @@ def _make_target_prefill_cache(rt: MTPLXRuntime):
         return rt.make_cache()
 
 
-def _maybe_repage_target_prefill_cache(cache: Any) -> float:
+def _maybe_repage_target_prefill_cache(rt: MTPLXRuntime, cache: Any) -> float:
     if not _contiguous_then_repage_prefill_enabled():
         return 0.0
-    from .cache_state import configure_tail_owned_attention_kv_cache
 
     started = time.perf_counter()
-    configure_tail_owned_attention_kv_cache(cache)
+    if not rt.repage_target_prefill_cache(cache):
+        return 0.0
     _eval_cache_roots(cache)
     return time.perf_counter() - started
 
@@ -1972,7 +1972,9 @@ def _prefill_restored_prompt_suffix(
                 [int(token) for token in suffix[1:]],
                 window_start=1,
             )
-        target_forward_time += _maybe_repage_target_prefill_cache(restored.cache)
+        target_forward_time += _maybe_repage_target_prefill_cache(
+            rt, restored.cache
+        )
         _check_splice_consumed()
         return (
             suffix_logits[:, -1, :],
@@ -2079,7 +2081,7 @@ def _prefill_restored_prompt_suffix(
     _eval(suffix_logits, suffix_hidden)
     chunk_elapsed = time.perf_counter() - started
     target_forward_time += chunk_elapsed
-    target_forward_time += _maybe_repage_target_prefill_cache(restored.cache)
+    target_forward_time += _maybe_repage_target_prefill_cache(rt, restored.cache)
     suffix_done = suffix_total
     emit_chunk(1, chunk_elapsed, started)
     _check_postcommit_abort(abort_check)
@@ -2514,7 +2516,7 @@ def _restore_near_prefix_prompt_state(
         if not suffix:
             entry.hits += 1
             entry.last_access_s = time.time()
-            repage_time = _maybe_repage_target_prefill_cache(cache)
+            repage_time = _maybe_repage_target_prefill_cache(rt, cache)
             return PromptState(
                 trunk_cache=cache,
                 logits=logits[:, -1, :],
@@ -3126,7 +3128,9 @@ def restore_or_prefill_prompt_state(
                     flush=True,
                 )
             if not suffix:
-                repage_time = _maybe_repage_target_prefill_cache(restored.cache)
+                repage_time = _maybe_repage_target_prefill_cache(
+                    rt, restored.cache
+                )
                 return _emit_prefill_complete(PromptState(
                     trunk_cache=restored.cache,
                     logits=restored.logits,
@@ -4025,7 +4029,7 @@ def _prefill(
         hidden = None
         _eval(logits)
     target_forward_time += time.perf_counter() - started
-    target_forward_time += _maybe_repage_target_prefill_cache(cache)
+    target_forward_time += _maybe_repage_target_prefill_cache(rt, cache)
     _check_postcommit_abort(abort_check)
     return cache, logits[:, -1, :], hidden, target_forward_time
 
@@ -4244,7 +4248,7 @@ def _prefill_committed_mtp_history_streaming(
         )
     _eval(logits, hidden)
     target_forward_time += time.perf_counter() - started
-    target_forward_time += _maybe_repage_target_prefill_cache(cache)
+    target_forward_time += _maybe_repage_target_prefill_cache(rt, cache)
     _check_postcommit_abort(abort_check)
     return (
         cache,
@@ -4289,7 +4293,7 @@ def _prefill_with_hidden_sequence(
         )
     _eval(logits, hidden)
     target_forward_time = time.perf_counter() - started
-    target_forward_time += _maybe_repage_target_prefill_cache(cache)
+    target_forward_time += _maybe_repage_target_prefill_cache(rt, cache)
     return cache, logits[:, -1, :], hidden[:, -1:, :], hidden, target_forward_time
 
 

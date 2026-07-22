@@ -660,6 +660,11 @@ def _generation_mode_from_args(args: Any) -> str:
         return GENERATION_MODE_AR
     explicit = getattr(args, "generation_mode", None)
     if explicit is not None:
+        if str(explicit).strip().lower() == "auto" and (
+            getattr(args, "load_mtp", True) is False
+            or bool(getattr(args, "no_mtp", False))
+        ):
+            return GENERATION_MODE_AR
         return _normalize_generation_mode(explicit)
     if getattr(args, "load_mtp", True) is False:
         return GENERATION_MODE_AR
@@ -668,6 +673,29 @@ def _generation_mode_from_args(args: Any) -> str:
         if bool(getattr(args, "no_mtp", False))
         else GENERATION_MODE_MTP
     )
+
+
+def _apply_runtime_compatibility_mode(
+    args: Any,
+    inspection: dict[str, Any],
+    *,
+    printer=print,
+) -> int | None:
+    compatibility = inspection.get("compatibility") or {}
+    runtime_compatibility = (
+        compatibility.get("runtime_compatibility")
+        or inspection.get("runtime_compatibility")
+    )
+    if runtime_compatibility != "native-ar-only":
+        return None
+    if _generation_mode_from_args(args) != GENERATION_MODE_AR:
+        printer("error: this model is target-only AR and has no native MTP head")
+        printer("try: rerun with --no-mtp")
+        return 2
+    # The mode choice is already fixed above; install the matching runtime
+    # route once so no MTP discovery or fallback reaches model execution.
+    setattr(args, "load_mtp", False)
+    return None
 
 
 def _fan_mode_from_args(args: Any) -> str:
@@ -1053,8 +1081,61 @@ def _apply_backend_serve_defaults(args: Any, inspection: dict[str, Any]) -> None
         and descriptor.reasoning_codec.default_effort
     ):
         args.reasoning_effort = descriptor.reasoning_codec.default_effort
+    required_tool_prompt_mode = descriptor.required_tool_prompt_mode
+    if required_tool_prompt_mode is not None:
+        requested_tool_prompt_mode = str(
+            getattr(args, "tool_prompt_mode", required_tool_prompt_mode)
+            or required_tool_prompt_mode
+        )
+        if (
+            "tool-prompt-mode" in cli_flags
+            and requested_tool_prompt_mode != required_tool_prompt_mode
+        ):
+            raise ValueError(
+                f"{descriptor.display_name} requires --tool-prompt-mode "
+                f"{required_tool_prompt_mode}"
+            )
+        args.tool_prompt_mode = required_tool_prompt_mode
+    elif "tool-prompt-mode" not in cli_flags and not getattr(
+        args, "tool_prompt_mode", None
+    ):
+        args.tool_prompt_mode = descriptor.default_tool_prompt_mode
+    required_chat_template_profile = descriptor.required_chat_template_profile
+    if required_chat_template_profile is not None:
+        requested_profile = str(
+            getattr(args, "chat_template_profile", required_chat_template_profile)
+            or required_chat_template_profile
+        )
+        has_conflicting_profile = (
+            "chat-template-profile" in cli_flags
+            and requested_profile != required_chat_template_profile
+        )
+        has_custom_path = bool(getattr(args, "chat_template_path", None))
+        if has_conflicting_profile or (
+            has_custom_path and not descriptor.allows_chat_template_path
+        ):
+            raise ValueError(
+                f"{descriptor.display_name} requires its tokenizer chat template"
+            )
+        args.chat_template_profile = required_chat_template_profile
+        args.chat_template_path = None
 
     sampler = descriptor.sampler_defaults.to_dict()
+    if descriptor.default_max_response_tokens is not None:
+        if (
+            "max-tokens" not in cli_flags
+            and hasattr(args, "max_tokens")
+            and getattr(args, "max_tokens", None) is None
+        ):
+            args.max_tokens = int(descriptor.default_max_response_tokens)
+        if (
+            "max-response-tokens" not in cli_flags
+            and hasattr(args, "max_response_tokens")
+            and getattr(args, "max_response_tokens", None) is None
+        ):
+            args.max_response_tokens = int(
+                descriptor.default_max_response_tokens
+            )
     if (
         "temperature" not in cli_flags
         and "default-temperature" not in cli_flags
@@ -1064,7 +1145,7 @@ def _apply_backend_serve_defaults(args: Any, inspection: dict[str, Any]) -> None
     if (
         "top-p" not in cli_flags
         and "default-top-p" not in cli_flags
-        and getattr(args, "top_p", None) is None
+        and getattr(args, "top_p", None) in (None, 0.95)
     ):
         args.top_p = sampler["top_p"]
     if "top-k" not in cli_flags and getattr(args, "top_k", None) in (None, 20):
@@ -1215,7 +1296,7 @@ def _resolve_model_context_window(tokenizer: Any, model_path: str | Path) -> int
                 if isinstance(value, int):
                     candidates.append(value)
 
-    sane = [value for value in candidates if 0 < value <= 1_000_000]
+    sane = [value for value in candidates if 0 < value <= 1_048_576]
     return max(sane) if sane else 262_144
 
 
@@ -5072,6 +5153,17 @@ def _cmd_bench_run(args: Any) -> int:
     if gate_exit is not None:
         _print({"error": "model failed MTP primary gate", "model": inspection})
         return gate_exit
+    if (
+        (inspection.get("compatibility") or {}).get("runtime_compatibility")
+        == "native-ar-only"
+    ):
+        _print(
+            {
+                "error": "bench run requires an MTP-capable runtime",
+                "detail": "Laguna-S-2.1 is target-only AR; use mtplx run --no-mtp",
+            }
+        )
+        return EXIT_UNSUPPORTED_MODEL
     runtime_env = _runtime_env_with_model_contract_overrides(
         runtime_env,
         inspection,
@@ -7021,8 +7113,33 @@ def _cmd_profile_thermal(args: Any) -> int:
     return subprocess.call(cmd, cwd=repo_root())
 
 
+def _reject_native_ar_for_mtp_diagnostic(
+    inspection: dict[str, Any],
+    *,
+    action: str,
+) -> int | None:
+    if (
+        (inspection.get("compatibility") or {}).get("runtime_compatibility")
+        != "native-ar-only"
+    ):
+        return None
+    _print(
+        {
+            "error": f"{action} requires an MTP-capable runtime",
+            "detail": "Laguna-S-2.1 is installed as target-only AR",
+        }
+    )
+    return EXIT_UNSUPPORTED_MODEL
+
+
 def _cmd_profile_compile_audit(args: Any) -> int:
     inspection, gate_exit = _model_gate(args.model)
+    native_ar_exit = _reject_native_ar_for_mtp_diagnostic(
+        inspection,
+        action="profile compile-audit",
+    )
+    if native_ar_exit is not None:
+        return native_ar_exit
     output = (
         Path(args.output)
         if args.output
@@ -7113,6 +7230,12 @@ def _cmd_profile_compile_audit(args: Any) -> int:
 
 def _cmd_profile_eval_attribution(args: Any) -> int:
     inspection, gate_exit = _model_gate(args.model)
+    native_ar_exit = _reject_native_ar_for_mtp_diagnostic(
+        inspection,
+        action="profile eval-attribution",
+    )
+    if native_ar_exit is not None:
+        return native_ar_exit
     output = (
         Path(args.output)
         if args.output
@@ -8230,6 +8353,13 @@ def cmd_serve_public(args: Any) -> int:
     if gate_exit is not None:
         _print_model_gate_error(inspection, printer=_print_serve_start_line)
         return gate_exit
+    mode_exit = _apply_runtime_compatibility_mode(
+        args,
+        inspection,
+        printer=_print_serve_start_line,
+    )
+    if mode_exit is not None:
+        return mode_exit
     model_id = _public_model_id_for_args(args, str(runtime_model))
     args.model_id = model_id
     if _apply_model_default_profile(args, model_id):
@@ -8860,6 +8990,22 @@ def _generate_one_shot_public(
             {"error": "model failed MTP primary gate", "model": inspection},
             [],
         )
+    mode_exit = _apply_runtime_compatibility_mode(
+        args,
+        inspection,
+        printer=lambda _line: None,
+    )
+    if mode_exit is not None:
+        return (
+            mode_exit,
+            {
+                "error": "model requires target-only AR",
+                "detail": "rerun with --no-mtp",
+                "model": inspection,
+            },
+            [],
+        )
+    _apply_backend_serve_defaults(args, inspection)
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     apply_profile_env(profile.name)
     generation_mode = _generation_mode_from_args(args)
@@ -8901,7 +9047,7 @@ def _generate_one_shot_public(
     from mtplx.sampling import SamplerConfig
 
     try:
-        rt = load(runtime_model, mtp=True)
+        rt = load(runtime_model, mtp=getattr(args, "load_mtp", True) is not False)
         draft_report = None
         if (
             draft_lm_head is not None
@@ -10438,7 +10584,7 @@ def _quickstart_openwebui_payload(
     port = int(getattr(args, "port", 8000))
     model_id = _public_model_id_for_args(args, str(getattr(args, "model", "")))
     base = f"http://{_connect_host_for_bind(host)}:{port}"
-    context_window = _inspection_context_window(inspection)
+    context_window = _inspection_context_window(inspection, args=args)
     return {
         "integration": "openwebui",
         "server_url": base,
@@ -10454,6 +10600,7 @@ def _quickstart_openwebui_payload(
             f"--profile {_resolved_default_profile_name(args)} "
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
+            f"--context-window {context_window} "
             f"{_batching_command_suffix(args)} "
             f"{_server_sampler_command_suffix(args, include_draft=True)} "
             f"{_reasoning_command_suffix(args)} "
@@ -10473,17 +10620,19 @@ def _pi_sampler_temperature(args: Any) -> float:
 
 
 def _pi_sampler_top_p(args: Any) -> float:
-    cli_flags = getattr(args, "_cli_flags", set()) or set()
-    if "top-p" in cli_flags or "default-top-p" in cli_flags:
-        return float(getattr(args, "top_p", 0.95))
-    return 0.95
+    return float(getattr(args, "top_p", 0.95))
 
 
 def _pi_sampler_top_k(args: Any) -> int:
     return int(getattr(args, "top_k", 20))
 
 
-def _quickstart_pi_payload(args: Any, *, write_config: bool = False) -> dict[str, Any]:
+def _quickstart_pi_payload(
+    args: Any,
+    *,
+    write_config: bool = False,
+    inspection: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     from mtplx.pi import (
         PI_LOCAL_API_KEY,
         build_pi_provider_config,
@@ -10502,12 +10651,14 @@ def _quickstart_pi_payload(args: Any, *, write_config: bool = False) -> dict[str
     pi_top_p = _pi_sampler_top_p(args)
     pi_top_k = _pi_sampler_top_k(args)
     pi_preserve_thinking = _pi_preserve_thinking_policy(args)
+    context_window = _inspection_context_window(inspection, args=args)
     api_key_command_suffix = _api_key_command_suffix(args) or "--api-key mtplx-local "
     provider = build_pi_provider_config(
         base_url=base_url,
         model_id=model_id,
         model_name=f"MTPLX {model_id}",
         api_key=api_key,
+        context_window=context_window,
     )
     payload = {
         "integration": "pi",
@@ -10516,6 +10667,7 @@ def _quickstart_pi_payload(args: Any, *, write_config: bool = False) -> dict[str
         "api_base_url": base_url,
         "model_id": model_id,
         "model_ref": pi_model_ref(model_id),
+        "context_window": context_window,
         "api_key": _api_key_display_value(api_key),
         "config_path": str(pi_models_json_path()),
         "provider": _redact_secret_from_payload(provider, api_key),
@@ -10535,6 +10687,7 @@ def _quickstart_pi_payload(args: Any, *, write_config: bool = False) -> dict[str
             f"--profile {_resolved_default_profile_name(args)} "
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
+            f"--context-window {context_window} "
             f"{_batching_command_suffix(args)} "
             f"--default-temperature {pi_temperature} "
             f"--default-top-p {pi_top_p} --top-k {pi_top_k} "
@@ -10542,6 +10695,7 @@ def _quickstart_pi_payload(args: Any, *, write_config: bool = False) -> dict[str
             f"--draft-top-p {pi_top_p} --draft-top-k {pi_top_k} "
             f"--preserve-thinking {pi_preserve_thinking} "
             f"{_reasoning_command_suffix(args)} "
+            f"{_bridge_prompt_command_suffix(args)} "
             f"{api_key_command_suffix}--no-stats-footer"
         ),
         "pi_steps": [
@@ -10556,13 +10710,22 @@ def _quickstart_pi_payload(args: Any, *, write_config: bool = False) -> dict[str
             model_id=model_id,
             model_name=f"MTPLX {model_id}",
             api_key=api_key,
+            context_window=context_window,
         )
     return payload
 
 
-def _inspection_context_window(inspection: dict[str, Any] | None) -> int:
+def _inspection_context_window(
+    inspection: dict[str, Any] | None,
+    *,
+    args: Any | None = None,
+) -> int:
+    descriptor = descriptor_from_inspection(inspection)
+    requested = getattr(args, "context_window", None) if args is not None else None
+    if requested is not None and int(requested) > 0:
+        return min(int(requested), int(descriptor.context_window_policy.maximum))
     if not isinstance(inspection, dict):
-        return 262_144
+        return int(descriptor.context_window_policy.default)
     candidates: list[int] = []
     for key in (
         "context_window",
@@ -10580,8 +10743,24 @@ def _inspection_context_window(inspection: dict[str, Any] | None) -> int:
             value = compatibility.get(key)
             if isinstance(value, int):
                 candidates.append(value)
-    sane = [value for value in candidates if 0 < value <= 1_000_000]
-    return max(sane) if sane else 262_144
+    sane = [value for value in candidates if 0 < value <= 1_048_576]
+    return max(sane) if sane else int(descriptor.context_window_policy.default)
+
+
+def _inspection_tool_prompt_mode(
+    args: Any,
+    inspection: dict[str, Any] | None,
+) -> str:
+    descriptor = descriptor_from_inspection(inspection)
+    if descriptor.required_tool_prompt_mode is not None:
+        return descriptor.required_tool_prompt_mode
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if "tool-prompt-mode" in cli_flags:
+        return str(
+            getattr(args, "tool_prompt_mode", descriptor.default_tool_prompt_mode)
+            or descriptor.default_tool_prompt_mode
+        )
+    return descriptor.default_tool_prompt_mode
 
 
 def _quickstart_opencode_payload(
@@ -10602,27 +10781,19 @@ def _quickstart_opencode_payload(
     port = int(getattr(args, "port", 8000))
     model_id = _public_model_id_for_args(args, str(getattr(args, "model", "")))
     base_url = f"http://{_connect_host_for_bind(host)}:{port}/v1"
-    context_window = _inspection_context_window(inspection)
+    context_window = _inspection_context_window(inspection, args=args)
     reasoning_mode = _reasoning_mode(args, default="auto")
     enable_thinking = reasoning_mode != "off"
-    cli_flags = getattr(args, "_cli_flags", set()) or set()
-    default_tool_prompt_mode = str(
-        OPENCODE_FAIR_BATCHING_DEFAULTS.get("tool_prompt_mode")
-        or "hybrid"
-    )
-    tool_prompt_mode = (
-        str(
-            getattr(args, "tool_prompt_mode", default_tool_prompt_mode)
-            or default_tool_prompt_mode
-        )
-        if "tool-prompt-mode" in cli_flags
-        else default_tool_prompt_mode
-    )
+    tool_prompt_mode = _inspection_tool_prompt_mode(args, inspection)
     chat_template_profile = str(
         getattr(args, "chat_template_profile", OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT)
         or OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT
     )
     opencode_max_response_tokens = getattr(args, "max_response_tokens", None)
+    output_limit = min(
+        context_window,
+        int(opencode_max_response_tokens or context_window),
+    )
     max_response_suffix = (
         f"--max-response-tokens {int(opencode_max_response_tokens)} "
         if opencode_max_response_tokens is not None
@@ -10667,7 +10838,7 @@ def _quickstart_opencode_payload(
         model_name=f"MTPLX {model_id}",
         api_key=getattr(args, "api_key", None),
         context_window=context_window,
-        output_limit=context_window,
+        output_limit=output_limit,
         enable_thinking=enable_thinking,
         top_p=float(getattr(args, "top_p", 0.95)),
         top_k=int(getattr(args, "top_k", 20)),
@@ -10690,7 +10861,7 @@ def _quickstart_opencode_payload(
         ),
         "detected": detect_opencode_desktop(),
         "context_window": context_window,
-        "output_limit": context_window,
+        "output_limit": output_limit,
         "transport_headers": {"x-mtplx-client": "opencode"},
         "reasoning_field": None,
         "no_hidden_max_tokens": True,
@@ -10714,6 +10885,7 @@ def _quickstart_opencode_payload(
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if generation_mode == GENERATION_MODE_AR else ''}"
             f"{api_key_suffix}"
+            f"--context-window {context_window} "
             f"{_batching_command_suffix(args)} "
             f"{_adaptive_command_suffix(args)} "
             f"{sampler_suffix}"
@@ -10739,7 +10911,7 @@ def _quickstart_opencode_payload(
             model_name=f"MTPLX {model_id}",
             api_key=getattr(args, "api_key", None),
             context_window=context_window,
-            output_limit=context_window,
+            output_limit=output_limit,
             enable_thinking=enable_thinking,
             top_p=float(getattr(args, "top_p", 0.95)),
             top_k=int(getattr(args, "top_k", 20)),
@@ -10762,7 +10934,7 @@ def _quickstart_swival_payload(
     port = int(getattr(args, "port", 8000))
     model_id = _public_model_id_for_args(args, str(getattr(args, "model", "")))
     server_url = f"http://{_connect_host_for_bind(host)}:{port}"
-    context_window = _inspection_context_window(inspection)
+    context_window = _inspection_context_window(inspection, args=args)
     command_argv = build_swival_command(
         base_url=server_url,
         model_id=model_id,
@@ -10797,6 +10969,7 @@ def _quickstart_swival_payload(
             f"--profile {_resolved_default_profile_name(args)} "
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
+            f"--context-window {context_window} "
             f"{_batching_command_suffix(args)} "
             "--no-stats"
         ),
@@ -10821,7 +10994,7 @@ def _quickstart_hermes_payload(
     base_url = server_url.rstrip("/") + "/v1"
     api_key = str(getattr(args, "api_key", None) or HERMES_LOCAL_API_KEY)
     workspace_path = _hermes_workspace_path(args)
-    context_window = _inspection_context_window(inspection)
+    context_window = _inspection_context_window(inspection, args=args)
     launch_command = _hermes_launch_command(model_id=model_id)
     terminal_command = _hermes_terminal_command(
         model_id=model_id,
@@ -10866,6 +11039,7 @@ def _quickstart_hermes_payload(
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
             f"{api_key_suffix}"
+            f"--context-window {context_window} "
             f"--scheduler-mode {str(getattr(args, 'scheduler_mode', 'serial'))} "
             f"--batching-preset {str(getattr(args, 'batching_preset', 'latency'))} "
             f"{_batching_command_suffix(args)} "
@@ -11304,7 +11478,7 @@ def _quickstart_run_pi(
         from mtplx.pi import PI_LOCAL_API_KEY
 
         args.api_key = PI_LOCAL_API_KEY
-    pi = _quickstart_pi_payload(args, write_config=True)
+    pi = _quickstart_pi_payload(args, write_config=True, inspection=inspection)
     _quickstart_print_pi_handoff(args, runtime_model=runtime_model, pi=pi)
     pi_temperature = _pi_sampler_temperature(args)
     pi_top_p = _pi_sampler_top_p(args)
@@ -11353,19 +11527,7 @@ def _quickstart_run_opencode(
     args: Any, *, runtime_model: str, inspection: dict[str, Any]
 ) -> int:
     model_id = _quickstart_served_model_id(args, runtime_model)
-    cli_flags = getattr(args, "_cli_flags", set()) or set()
-    default_tool_prompt_mode = str(
-        OPENCODE_FAIR_BATCHING_DEFAULTS.get("tool_prompt_mode")
-        or "hybrid"
-    )
-    opencode_tool_prompt_mode = (
-        str(
-            getattr(args, "tool_prompt_mode", default_tool_prompt_mode)
-            or default_tool_prompt_mode
-        )
-        if "tool-prompt-mode" in cli_flags
-        else default_tool_prompt_mode
-    )
+    opencode_tool_prompt_mode = _inspection_tool_prompt_mode(args, inspection)
     opencode_chat_template_profile = str(
         getattr(args, "chat_template_profile", OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT)
         or OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT
@@ -11828,7 +11990,11 @@ def _quickstart_run_terminal_chat_body(
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     apply_profile_env(profile.name)
     generation_mode = _generation_mode_from_args(args)
-    draft_lm_head = _model_draft_lm_head_spec(inspection, profile)
+    draft_lm_head = (
+        _model_draft_lm_head_spec(inspection, profile)
+        if getattr(args, "load_mtp", True) is not False
+        else None
+    )
     draft_sampler = _model_draft_sampler_spec(inspection, profile)
 
     from mtplx.runtime import load
@@ -11870,7 +12036,7 @@ def _quickstart_run_terminal_chat_body(
     quiet_progress = not sys.stdout.isatty()
     with ModelLoadProgress("Loading model", quiet=quiet_progress) as progress:
         progress.set_subtitle(f"profile {profile.name}")
-        rt = load(runtime_model, mtp=True)
+        rt = load(runtime_model, mtp=getattr(args, "load_mtp", True) is not False)
         progress.set_subtitle("ready")
     _quickstart_line(f"Model ready in {time.perf_counter() - started:.1f}s")
     _quickstart_line(f"Generation mode: {_generation_mode_label(generation_mode)}")
@@ -12323,7 +12489,11 @@ def cmd_quickstart_public(args: Any) -> int:
             if target == "openwebui"
             else None
         )
-        pi = _quickstart_pi_payload(args) if target == "pi" else None
+        pi = (
+            _quickstart_pi_payload(args, inspection=dry_run_inspection)
+            if target == "pi"
+            else None
+        )
         opencode = (
             _quickstart_opencode_payload(args, inspection=dry_run_inspection)
             if target == "opencode"
@@ -12546,6 +12716,13 @@ def cmd_quickstart_public(args: Any) -> int:
                     json_output=bool(getattr(args, "json", False)),
                 )
                 return gate_exit
+            mode_exit = _apply_runtime_compatibility_mode(
+                args,
+                inspection,
+                printer=_quickstart_line,
+            )
+            if mode_exit is not None:
+                return mode_exit
             profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
             _apply_model_contract_depth_default(args, inspection, profile)
             _apply_backend_serve_defaults(args, inspection)
@@ -12619,6 +12796,13 @@ def cmd_quickstart_public(args: Any) -> int:
             json_output=bool(getattr(args, "json", False)),
         )
         return gate_exit
+    mode_exit = _apply_runtime_compatibility_mode(
+        args,
+        inspection,
+        printer=_quickstart_line,
+    )
+    if mode_exit is not None:
+        return mode_exit
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     _apply_model_contract_depth_default(args, inspection, profile)
     _apply_backend_serve_defaults(args, inspection)

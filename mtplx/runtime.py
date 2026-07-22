@@ -6,6 +6,9 @@ import hashlib
 import inspect as py_inspect
 import json
 import logging
+import os
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -19,6 +22,53 @@ from .mtp_adapters import (
 from .mtp_patch import MTPContract, inject_mtp_support, validate_mtp_support
 
 logger = logging.getLogger(__name__)
+
+
+def _detect_total_system_memory_bytes() -> int | None:
+    try:
+        import psutil
+
+        total = int(psutil.virtual_memory().total)
+        if total > 0:
+            return total
+    except Exception:
+        pass
+    if sys.platform == "darwin":
+        try:
+            total = int(
+                subprocess.check_output(
+                    ["sysctl", "-n", "hw.memsize"],
+                    text=True,
+                ).strip()
+            )
+            if total > 0:
+                return total
+        except Exception:
+            pass
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        pages = int(os.sysconf("SC_PHYS_PAGES"))
+        total = page_size * pages
+        return total if total > 0 else None
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _preflight_laguna_system_memory(config: dict[str, Any]) -> None:
+    if not _is_laguna_s_2_1_mlx_4bit_config(config):
+        return
+    from .models.laguna_config import LAGUNA_S_2_1_MIN_RESIDENT_BYTES
+
+    system_reserve = 16 * 1024**3
+    total = _detect_total_system_memory_bytes()
+    if total is None or total >= LAGUNA_S_2_1_MIN_RESIDENT_BYTES + system_reserve:
+        return
+    required = LAGUNA_S_2_1_MIN_RESIDENT_BYTES + system_reserve
+    raise RuntimeError(
+        "Laguna-S-2.1 requires at least "
+        f"{required / 1024**3:.1f} GiB unified memory "
+        "for weights, runtime headroom, and the system reserve"
+    )
 
 
 @dataclass
@@ -289,6 +339,14 @@ class MTPLXRuntime:
         configure_tail_owned_attention_kv_cache(cache)
         return cache
 
+    def repage_target_prefill_cache(self, cache: Any) -> bool:
+        """Install the runtime's decode cache layout after contiguous prefill."""
+
+        from .cache_state import configure_tail_owned_attention_kv_cache
+
+        configure_tail_owned_attention_kv_cache(cache)
+        return True
+
     def make_mtp_cache(self):
         if not self.mtp_enabled:
             raise RuntimeError("MTP is not enabled for this runtime")
@@ -298,6 +356,37 @@ class MTPLXRuntime:
 
         configure_mtp_attention_kv_cache(cache)
         return cache
+
+
+class LagunaARRuntime(MTPLXRuntime):
+    """Target-only runtime that preserves Laguna's native cache ownership."""
+
+    def forward_ar(
+        self,
+        input_ids,
+        cache=None,
+        return_hidden: bool = False,
+        hidden_variant: str | None = None,
+        emit_logits: bool = True,
+        logits_keep: int | None = None,
+        input_embeddings=None,
+    ):
+        del return_hidden, hidden_variant
+        return self.model(
+            input_ids,
+            cache=cache,
+            input_embeddings=input_embeddings,
+            emit_logits=emit_logits,
+            logits_keep=logits_keep,
+        )
+
+    def make_cache(self):
+        inner = getattr(self.model, "language_model", self.model)
+        return inner.make_cache()
+
+    def repage_target_prefill_cache(self, cache: Any) -> bool:
+        del cache
+        return False
 
 
 def load(
@@ -351,6 +440,12 @@ def load(
             return runtime
         path = Path(gemma4_pair["target_model"])
     config = load_config(path)
+    if mtp and _is_laguna_s_2_1_mlx_4bit_config(config):
+        raise ValueError(
+            "Laguna-S-2.1-MLX-4bit has no native MTP head; "
+            "load it with mtp=False (CLI: --no-mtp)."
+        )
+    _preflight_laguna_system_memory(config)
     from .step3p5_mtp_patch import is_step3p5_mtp_config
     from .qwen3_5_mtp_patch import (
         install_qwen3_5_mtp_trunk_shim,
@@ -368,9 +463,7 @@ def load(
         tokenizer = _load_tokenizer_resilient(path, config)
         model, _loaded_config = load_model(path)
     else:
-        from mlx_lm.utils import load as mlx_lm_load
-
-        model, tokenizer = mlx_lm_load(str(_mtp_alias_load_path(path, config)))
+        model, tokenizer = _load_base_model(path, config)
     runtime_metadata = _load_runtime_metadata(path)
     contract = (
         (contract or MTPContract())
@@ -405,22 +498,23 @@ def load(
             mtp_enabled = inject_mtp_support(model, path, config, contract)
         if not mtp_enabled or not validate_mtp_support(model):
             raise RuntimeError(f"MTP injection failed for {path}")
-    from .attention_split import configure_split_full_attention
-    from .native_mlp import configure_native_mlp
+    if not _is_laguna_s_2_1_mlx_4bit_config(config):
+        from .attention_split import configure_split_full_attention
+        from .native_mlp import configure_native_mlp
 
-    configure_split_full_attention(model)
-    configure_native_mlp(model)
-    from .nax_verify import install_nax_qlinear_patch, nax_env_enabled
+        configure_split_full_attention(model)
+        configure_native_mlp(model)
+        from .nax_verify import install_nax_qlinear_patch, nax_env_enabled
 
-    if nax_env_enabled():
-        nax_report = install_nax_qlinear_patch()
-        logger.info("[nax-verify] %s", nax_report)
-    from .kernel_selfcheck import maybe_run_model_selfcheck
+        if nax_env_enabled():
+            nax_report = install_nax_qlinear_patch()
+            logger.info("[nax-verify] %s", nax_report)
+        from .kernel_selfcheck import maybe_run_model_selfcheck
 
-    # Turbo lanes validate themselves once per load on the model's actual
-    # dtype/quant format; a mismatching lane disables itself and serving
-    # continues on the stock path (surfaced in /health kernel_selfcheck).
-    maybe_run_model_selfcheck(model)
+        # Turbo lanes validate themselves once per load on the model's actual
+        # dtype/quant format; a mismatching lane disables itself and serving
+        # continues on the stock path (surfaced in /health kernel_selfcheck).
+        maybe_run_model_selfcheck(model)
     adapter_path = Path(mtp_adapter) if mtp_adapter is not None else None
     adapter_metadata = None
     adapter_merge_report = None
@@ -432,7 +526,12 @@ def load(
             adapter_merge_report = merge_installed_mtp_lora_adapters(model)
     elif merge_mtp_adapter:
         raise RuntimeError("merge_mtp_adapter requires mtp_adapter")
-    return MTPLXRuntime(
+    runtime_class = (
+        LagunaARRuntime
+        if _is_laguna_s_2_1_mlx_4bit_config(config)
+        else MTPLXRuntime
+    )
+    return runtime_class(
         model,
         tokenizer,
         path,
@@ -446,6 +545,45 @@ def load(
 
 def inspect(path: Path | str):
     return inspect_model(path)
+
+
+def _is_laguna_s_2_1_mlx_4bit_config(config: dict[str, Any]) -> bool:
+    from .models.laguna_config import is_laguna_s_2_1_mlx_4bit_config
+
+    return is_laguna_s_2_1_mlx_4bit_config(config)
+
+
+def _model_classes_for_config(config: dict[str, Any]) -> tuple[type, type] | None:
+    """Return MTPLX-owned model classes for architectures missing in mlx-lm."""
+
+    if not _is_laguna_s_2_1_mlx_4bit_config(config):
+        return None
+    from .models.laguna import Model, ModelArgs
+
+    return Model, ModelArgs
+
+
+def _load_base_model(path: Path, config: dict[str, Any]) -> tuple[Any, Any]:
+    if (
+        config.get("architectures") == ["LagunaForCausalLM"]
+        and str(config.get("model_type") or "").lower() == "laguna"
+        and "model_file" in config
+    ):
+        raise ValueError("Laguna model_file execution is not permitted")
+    model_classes = _model_classes_for_config(config)
+    if model_classes is not None:
+        from mlx_lm.utils import load_model
+
+        tokenizer = _load_tokenizer_resilient(path, config)
+        model, _loaded_config = load_model(
+            path,
+            get_model_classes=lambda config: model_classes,
+        )
+        return model, tokenizer
+
+    from mlx_lm.utils import load as mlx_lm_load
+
+    return mlx_lm_load(str(_mtp_alias_load_path(path, config)))
 
 
 def _load_tokenizer_resilient(model_path: Path, config: dict[str, Any]) -> Any:

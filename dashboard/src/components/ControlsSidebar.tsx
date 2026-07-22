@@ -156,7 +156,7 @@ function DefaultsCard() {
         <SelectField
           label="reasoning_parser"
           value={draft.reasoning_parser}
-          options={["qwen3", "none"]}
+          options={["qwen3", "poolside_v1", "none"]}
           onChange={(v) => setDraft({ ...draft, reasoning_parser: v })}
         />
         {mutation.isError ? (

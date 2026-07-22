@@ -8,7 +8,11 @@ everywhere, including CI on non-Apple platforms.
 
 from __future__ import annotations
 
-from mtplx.reasoning_codecs import QwenThinkingContentStreamSplitter
+from mtplx.reasoning_codecs import (
+    QwenThinkingContentStreamSplitter,
+    split_reasoning_text,
+    stream_splitter_for_parser,
+)
 
 
 def _split(chunks: list[str]) -> tuple[str, str]:
@@ -35,3 +39,21 @@ def test_no_reasoning_leak_when_long_alias_tag_splits_across_chunks() -> None:
 def test_visible_content_preserved_around_split_reasoning() -> None:
     content, _ = _split(["R1</think>V1 <reasoni", "ng>SECRET</reasoning> V2"])
     assert content == "V1 V2"
+
+
+def test_poolside_v1_uses_think_tag_reasoning_codec() -> None:
+    parts = split_reasoning_text(
+        "<think>inspect inputs</think>Final answer",
+        parser="poolside_v1",
+        thinking_enabled=True,
+    )
+    assert parts.reasoning == "inspect inputs"
+    assert parts.content == "Final answer"
+
+    splitter = stream_splitter_for_parser(
+        "poolside_v1",
+        thinking_enabled=True,
+    )
+    chunks = splitter.feed("inspect inputs</think>Final") + splitter.finish()
+    assert "".join(text for field, text in chunks if field == "reasoning_content") == "inspect inputs"
+    assert "".join(text for field, text in chunks if field == "content") == "Final"

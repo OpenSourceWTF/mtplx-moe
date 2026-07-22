@@ -104,7 +104,25 @@ Fan-backed modes restore your fans to automatic if MTPLX dies for any reason, in
 
 ## Compatibility, honestly
 
-`mtplx inspect` classifies any model into four tiers before anything runs: verified, architecture-compatible but unverified, incompatible architecture, or no MTP heads at all. Unverified models refuse to run unless you explicitly force them. There are no silent fallbacks: if MTPLX cannot run a model correctly, it tells you instead of running it badly.
+`mtplx inspect` classifies models before anything runs: verified, architecture-compatible but unverified, AR-only, incompatible architecture, or no MTP heads at all. Unverified models refuse to run unless you explicitly force them. There are no silent fallbacks: if MTPLX cannot run a model correctly, it tells you instead of running it badly.
+
+[PipeNetwork Laguna-S-2.1-MLX-4bit](https://huggingface.co/pipenetwork/Laguna-S-2.1-MLX-4bit) is supported through its exact MLX architecture in target-only AR mode:
+
+```bash
+mtplx start cli \
+  --model pipenetwork/Laguna-S-2.1-MLX-4bit \
+  --download \
+  --no-mtp
+```
+
+MTPLX pins that model to revision
+`5544297f819d50330bc3616dd15cbc7edb598b2f` and verifies the 13-shard layout,
+tokenizer, generation config, and Poolside chat template before admitting it.
+The checkpoint has no native MTP head, so an MTP launch is rejected before
+weights load instead of falling back during execution. The weights occupy
+61.6 GiB (66.15 GB); use a Mac with at least 96 GiB unified memory (128 GiB is
+recommended). MTPLX defaults Laguna to a 32,768-token context and response cap,
+and checks larger explicit server contexts against the active Metal memory cap.
 
 ## What MTPLX is not
 
