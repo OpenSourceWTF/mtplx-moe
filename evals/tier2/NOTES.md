@@ -425,3 +425,26 @@ fixed cap 30 GiB + launcher no longer retries watchdog aborts):
 Program re-rank: R4 (trivial, confirmed) -> R3 decomposition (hideable vs
 deletable split of the 60 ms pool) -> R5 batch (aggregate only) -> band
 (parked) . R1/page-cache-LRU remain dead. Awaiting David's pick.
+
+## R4 INVERTED by paired A/B (2026-07-21): chunk16 LOSES −2.1% K1; chunking IS the fanout
+
+One window, receipt-exact cache-heavy config, deterministic-identical routing
+across arms (103.4 miss/tok, 0.975 GiB/tok both): chunk8 AR 5.709 / K1 6.270
+(champion 6.29 reproduced) vs chunk16 AR 5.635 / K1 6.136 (−1.3%/−2.1%).
+The replay's +13 ms/tok prediction for single-pread records was an artifact
+of SERIAL microbenching: telemetry (r3_telemetry_chunk16.json, diagnostic
+cell −10% overhead) shows the live reader averages **1.15 concurrent reads**
+(8-reader pool 14% utilized), I/O active 100% of intervals, realized 5.38
+GiB/s vs 10.8 isolated single-stream. Decode misses arrive ~1.5/layer
+serially — record-chunk splitting is the ONLY queue depth the read path
+gets, so 2 chunks/record beats 1. Attribution field:
+'synchronous_fence_or_evaluation' (incomplete); GPU/DRAM counters
+unavailable in this lane.
+
+Verdict: read_chunk >= record is DEAD; the live lever is chunk-DESCENT
+(more intra-record fanout). Sweep armed: chunk8 control vs 4MiB vs 2MiB,
+same window discipline. If realized BW climbs toward the ~12.5 GiB/s
+plateau, the ~91 ms/tok I/O share compresses toward ~65-75 ms.
+Artifacts: r4_ab_chunk8.json / r4_ab_chunk16.json / r3_telemetry_chunk16.json.
+Lesson (method): I/O microbenches must mirror the production SUBMISSION
+model (concurrency), not just the syscall pattern.
