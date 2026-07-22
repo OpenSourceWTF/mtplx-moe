@@ -621,3 +621,53 @@ def test_missing_tier_entry_fails_closed(tmp_path: Path) -> None:
     tampered = replace(manifest, layer_tier_map=(manifest.layer_tier_map[0],))
     with pytest.raises(ExpertManifestError):
         tampered.validate_structure()
+
+
+# ---------------------------------------------------------------------------
+# KV boundaries under the derived single-limit policy (issue #46 meets #51 M2)
+# ---------------------------------------------------------------------------
+
+
+def test_kv_admission_replans_mixed_records(tmp_path: Path) -> None:
+    """A mixed runtime with KV admission enabled reaches the derived-allowance
+    recompute at every boundary: the replan must thread the manifest per-layer
+    record map, divide the allowance by summed per-layer record bytes, evict
+    to the derived capacity, and restore the zero-KV capacity on release."""
+
+    root, _cfg, spec, manifest_path, _mm = _assemble_mixed_artifact(tmp_path)
+    manifest = load_expert_manifest(manifest_path)
+    layer_bytes = manifest.record_bytes_by_layer()
+    kv_budget = 64
+    limit = _mixed_partial_limit(spec, manifest) + kv_budget * spec.kv_bytes_per_token
+    config = _mixed_config(
+        spec,
+        manifest,
+        memory_limit_bytes=limit,
+        max_live_kv_tokens=kv_budget,
+    )
+    runtime = _open_mixed(root, spec, manifest_path, config=config)
+    try:
+        assert runtime._derived_cache_policy
+        assert runtime._per_layer_record_bytes == layer_bytes
+        open_capacity = runtime._derived_capacity_slots
+        assert open_capacity is not None and open_capacity >= 1
+
+        admission = runtime.admit_kv_tokens(kv_budget)
+        allowance = runtime._derived_allowance_bytes
+        capacity = runtime._derived_capacity_slots
+        assert allowance is not None and allowance >= 0
+        streamed_sum = sum(layer_bytes[layer] for layer in runtime._banks)
+        assert capacity * streamed_sum <= allowance
+        assert capacity <= open_capacity
+        for bank in runtime._banks.values():
+            assert bank.occupancy <= capacity
+
+        policy = runtime.snapshot(mx_module=mx)["expert_cache_policy"]
+        assert policy["derived"] is True
+        assert policy["allowance_bytes"] == allowance
+        assert policy["persistent_capacity"] == capacity
+
+        admission.release()
+        assert runtime._derived_capacity_slots == open_capacity
+    finally:
+        runtime.close()
