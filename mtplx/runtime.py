@@ -36,6 +36,15 @@ class MTPLXRuntime:
     mtp_adapter_metadata: dict[str, Any] | None = None
     mtp_adapter_merge_report: dict[str, Any] | None = None
     a3b_compiled_target_prefix_factory: A3BCompiledTargetPrefixFactory | None = None
+    a3b_whole_moe_installed: bool = False
+    _a3b_whole_moe_request_preflights: dict[str, dict[str, Any]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _a3b_whole_moe_request_geometry_keys: dict[
+        tuple[int, str, str], str
+    ] = field(default_factory=dict, init=False, repr=False)
     diagnostic_counters: dict[str, int] = field(default_factory=dict)
     _forward_ar_supports_emit_logits: bool | None = field(default=None, init=False, repr=False)
     _forward_ar_supports_logits_keep: bool | None = field(default=None, init=False, repr=False)
@@ -374,6 +383,12 @@ def load(
             return runtime
         path = Path(gemma4_pair["target_model"])
     config = load_config(path)
+    from .a3b_whole_moe import validate_a3b_whole_moe_load_options
+
+    validate_a3b_whole_moe_load_options(
+        mtp_adapter=mtp_adapter,
+        merge_mtp_adapter=merge_mtp_adapter,
+    )
     from .step3p5_mtp_patch import is_step3p5_mtp_config
     from .qwen3_5_mtp_patch import (
         install_qwen3_5_mtp_trunk_shim,
@@ -453,22 +468,42 @@ def load(
         install_qwen_row_owned_routers,
         prepare_qwen_row_owned_routers,
     )
+    from .a3b_whole_moe import (
+        install_a3b_whole_moe,
+        prepare_a3b_whole_moe,
+        run_a3b_whole_moe_selfcheck,
+    )
 
     from .gdn_capture import (
         install_a3b_gdn_postconv,
         prepare_a3b_gdn_postconv,
     )
-    from .a3b_compiled_target_prefix import prepare_a3b_compiled_target_prefix
+    from .a3b_compiled_target_prefix import (
+        preflight_a3b_k1_target_prefix_load_graph,
+        prepare_a3b_compiled_target_prefix,
+    )
 
+    whole_moe_plan = prepare_a3b_whole_moe(model, config=config)
     router_plan = prepare_qwen_row_owned_routers(model, config=config)
     postconv_plan = prepare_a3b_gdn_postconv(model, config=config)
     postconv_factory = None
     from .kernel_selfcheck import maybe_run_model_selfcheck
 
     selfcheck_report = maybe_run_model_selfcheck(model)
+    if whole_moe_plan is not None and router_plan is None:
+        from .a3b_whole_moe import A3BWholeMoeConfigError
+
+        raise A3BWholeMoeConfigError(
+            "whole-MoE target M2 requires the accepted row-owned router/combine route"
+        )
     if router_plan is not None:
         router_report = install_qwen_row_owned_routers(router_plan, selfcheck_report)
         logger.info("[qwen-row-owned-router] %s", router_report)
+    if whole_moe_plan is not None:
+        selfcheck_report = run_a3b_whole_moe_selfcheck(
+            whole_moe_plan,
+            selfcheck_report,
+        )
     if postconv_plan is not None:
         postconv_factory = install_a3b_gdn_postconv(
             postconv_plan, selfcheck_report
@@ -492,7 +527,7 @@ def load(
             adapter_merge_report = merge_installed_mtp_lora_adapters(model)
     elif merge_mtp_adapter:
         raise RuntimeError("merge_mtp_adapter requires mtp_adapter")
-    return MTPLXRuntime(
+    runtime = MTPLXRuntime(
         model,
         tokenizer,
         path,
@@ -502,7 +537,25 @@ def load(
         mtp_adapter_metadata=adapter_metadata,
         mtp_adapter_merge_report=adapter_merge_report,
         a3b_compiled_target_prefix_factory=compiled_target_factory,
+        a3b_whole_moe_installed=False,
     )
+    if whole_moe_plan is not None:
+        if compiled_target_factory is None:
+            from .a3b_whole_moe import A3BWholeMoeConfigError
+
+            raise A3BWholeMoeConfigError(
+                "whole-MoE requires exact compiled target-prefix construction"
+            )
+        whole_moe_report = install_a3b_whole_moe(
+            whole_moe_plan,
+            selfcheck_report,
+            compiled_preflight=lambda: preflight_a3b_k1_target_prefix_load_graph(
+                runtime, compiled_target_factory
+            ),
+        )
+        runtime.a3b_whole_moe_installed = True
+        logger.info("[a3b-whole-moe] %s", whole_moe_report)
+    return runtime
 
 
 def inspect(path: Path | str):

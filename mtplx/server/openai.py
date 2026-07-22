@@ -2198,7 +2198,7 @@ class _BatchedARGenerationService:
             import mlx.core as mx
 
             prefill_started = time.perf_counter()
-            with attention_phase("ar_batch_shared_prefill"):
+            with attention_phase("prefill"):
                 logits = self.state.runtime.forward_ar(
                     mx.array([prefix_tokens]),
                     cache=cache,

@@ -719,11 +719,13 @@ def test_warm_restored_suffix_prefill_is_chunked_and_typed_for_abort(monkeypatch
         hidden_states,
         token_ids,
         *,
+        phase,
         mtp_hidden_variant,
         position_offset=None,
         force_eval=False,
         input_embeddings=None,
     ):
+        assert phase == "prefill"
         assert hidden_states.shape[1] == len(token_ids)
         assert force_eval is True
         appended.append(list(token_ids))
@@ -830,11 +832,13 @@ def test_restore_prefers_larger_near_gap_over_shorter_exact_prefix(monkeypatch):
         hidden_states,
         token_ids,
         *,
+        phase,
         mtp_hidden_variant,
         position_offset=None,
         force_eval=False,
         input_embeddings=None,
     ):
+        assert phase == "prefill"
         assert hidden_states.shape[1] == len(token_ids)
         assert force_eval is True
         appended.append(list(token_ids))
@@ -946,11 +950,13 @@ def test_opencode_compact_restore_prefers_block_prefix_over_short_exact(monkeypa
         hidden_states,
         token_ids,
         *,
+        phase,
         mtp_hidden_variant,
         position_offset=None,
         force_eval=False,
         input_embeddings=None,
     ):
+        assert phase == "prefill"
         assert hidden_states.shape[1] == len(token_ids)
         assert force_eval is True
         appended.append(list(token_ids))
@@ -1056,11 +1062,13 @@ def _install_history_stub(monkeypatch):
         hidden_states,
         token_ids,
         *,
+        phase,
         mtp_hidden_variant,
         position_offset=None,
         force_eval=False,
         input_embeddings=None,
     ):
+        assert phase == "prefill"
         assert hidden_states.shape[1] == len(token_ids)
         return 0.0
 
@@ -1226,11 +1234,13 @@ def test_ssd_near_prefix_restore_time_is_cache_time_not_decode_time(monkeypatch)
         hidden_states,
         token_ids,
         *,
+        phase,
         mtp_hidden_variant,
         position_offset=None,
         force_eval=False,
         input_embeddings=None,
     ):
+        assert phase == "prefill"
         assert hidden_states.shape[1] == len(token_ids)
         assert force_eval is True
         return 0.0
@@ -1388,11 +1398,13 @@ def test_last_window_mtp_history_skips_discarded_chunk_hidden(monkeypatch):
         hidden_states,
         token_ids,
         *,
+        phase,
         mtp_hidden_variant,
         position_offset=None,
         force_eval=False,
         input_embeddings=None,
     ):
+        assert phase == "prefill"
         appended.append((list(token_ids), position_offset))
         return 0.0
 

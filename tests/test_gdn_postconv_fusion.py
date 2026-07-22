@@ -107,6 +107,7 @@ def test_flag_off_constructs_unchanged_stock_path() -> None:
         "installation_error": None,
         "gdn_layers": 0,
         "validated_contract": None,
+        "implementation": "inline_g",
     }
 
 

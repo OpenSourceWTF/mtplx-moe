@@ -26,6 +26,7 @@ _GDN_POSTCONV_STATS: dict[str, Any] = {
     "installation_error": None,
     "gdn_layers": 0,
     "validated_contract": None,
+    "implementation": "inline_g",
 }
 _A3B_GDN_POSTCONV_LAYER_TYPES = tuple(
     "linear_attention" if index % 4 != 3 else "full_attention"
@@ -90,6 +91,39 @@ def _fail_a3b_gdn_postconv_configuration(message: str) -> None:
     _GDN_POSTCONV_STATS["installation_status"] = "configuration_error"
     _GDN_POSTCONV_STATS["installation_error"] = str(message)
     raise A3BGDNPostconvConfigError(message)
+
+
+# Post-conv recurrence implementation selection.  ``inline_g`` (default) is the
+# accepted TGY4 route; ``headquarter`` is the C1 redesigned-execution kernel.
+_A3B_GDN_POSTCONV_IMPL_ENV = "MTPLX_A3B_GDN_POSTCONV_IMPL"
+_A3B_GDN_POSTCONV_IMPL_DEFAULT = "inline_g"
+_A3B_GDN_POSTCONV_IMPLS = ("inline_g", "headquarter")
+
+
+def _a3b_gdn_postconv_impl_selection() -> str:
+    """Resolve the requested post-conv implementation, fail-closed on unknown.
+
+    Unset/empty selects the default ``inline_g`` route so the installed stack is
+    byte-identical to the accepted baseline; any other value than the exact
+    supported names hard-fails through the postconv configuration convention.
+    """
+    raw = os.environ.get(_A3B_GDN_POSTCONV_IMPL_ENV)
+    value = (raw or "").strip().lower()
+    if value == "":
+        return _A3B_GDN_POSTCONV_IMPL_DEFAULT
+    if value not in _A3B_GDN_POSTCONV_IMPLS:
+        _fail_a3b_gdn_postconv_configuration(
+            f"A3B GDN postconv {_A3B_GDN_POSTCONV_IMPL_ENV} must be one of "
+            "'inline_g' or 'headquarter' (unset defaults to 'inline_g'); "
+            f"got {raw!r}"
+        )
+    return value
+
+
+def _a3b_gdn_postconv_headquarter_requested() -> bool:
+    """Non-raising probe of whether the headquarter route is explicitly requested."""
+    raw = os.environ.get(_A3B_GDN_POSTCONV_IMPL_ENV)
+    return (raw or "").strip().lower() == "headquarter"
 
 
 def _validate_a3b_quant_projection(
@@ -254,14 +288,28 @@ def install_a3b_gdn_postconv(
 ) -> A3BGDNPostconvFactory:
     """Install the exact M1/M2 callables only after their combined self-check."""
     lanes = {} if selfcheck_report is None else selfcheck_report.get("lanes", {})
-    if lanes.get("gdn_postconv_inline_g") != "ok":
+    implementation = _a3b_gdn_postconv_impl_selection()
+    if implementation == "headquarter":
+        required_lane = "gdn_postconv_headquarter"
+        m1_apply = _apply_enabled_a3b_gdn_postconv_m1_headquarter
+        m2_apply = _apply_enabled_a3b_gdn_postconv_m2_headquarter
+    else:
+        required_lane = "gdn_postconv_inline_g"
+        m1_apply = _apply_enabled_a3b_gdn_postconv_m1_tgy4
+        m2_apply = _apply_enabled_a3b_gdn_postconv_m2_tgy4
+    if lanes.get(required_lane) != "ok":
         _fail_a3b_gdn_postconv_configuration(
             "A3B GDN postconv selfcheck did not validate the exact M1/M2 kernels"
+            + (
+                ""
+                if implementation == _A3B_GDN_POSTCONV_IMPL_DEFAULT
+                else f" for the {implementation} route"
+            )
         )
     factory = A3BGDNPostconvFactory(
         m1_implementations=tuple(
             partial(
-                _apply_enabled_a3b_gdn_postconv_m1_tgy4,
+                m1_apply,
                 A_log=gdn.A_log,
                 dt_bias=gdn.dt_bias,
             )
@@ -269,7 +317,7 @@ def install_a3b_gdn_postconv(
         ),
         m2_implementations=tuple(
             partial(
-                _apply_enabled_a3b_gdn_postconv_m2_tgy4,
+                m2_apply,
                 A_log=gdn.A_log,
                 dt_bias=gdn.dt_bias,
             )
@@ -278,6 +326,7 @@ def install_a3b_gdn_postconv(
     )
     _GDN_POSTCONV_STATS["installed"] = True
     _GDN_POSTCONV_STATS["installation_status"] = "installed"
+    _GDN_POSTCONV_STATS["implementation"] = implementation
     return factory
 
 
@@ -298,6 +347,7 @@ def _reset_gdn_postconv_stats_for_tests() -> None:
             "installation_error": None,
             "gdn_layers": 0,
             "validated_contract": None,
+            "implementation": "inline_g",
         }
     )
 
@@ -1106,6 +1156,166 @@ def _make_linear_gated_delta_from_conv_inline_g_kernel():
     )
 
 
+def _make_linear_gated_delta_from_conv_headquarter_kernel():
+    # C1 "headquarter" redesigned execution: one threadgroup per (head, Dv-quarter)
+    # => grid (SIMDS*32, QUARTERS, B*Hv), threadgroup (SIMDS*32, 1, 1) = 8 simdgroups.
+    # simd 0 computes the head's q/k rms-norm+scale + g/beta once into threadgroup
+    # memory (redundancy 32x -> 4x), one producer->consumer barrier, then each
+    # simdgroup drives RPS=(Dv/QUARTERS)/SIMDS=4 dv rows with fp32 state resident in
+    # registers across the T loop.  Source verbatim from the G3a C1 bench candidate
+    # (bit-exact vs inline_g: parity 0.0 on y and states at m1 and m2).
+    if not mx.metal.is_available():
+        return None
+
+    source = """
+    // --- geometry -----------------------------------------------------------
+    auto n = thread_position_in_grid.z;          // b_idx*Hv + hv_idx
+    auto b_idx = n / Hv;
+    auto hv_idx = n % Hv;
+    auto hk_idx = hv_idx / (Hv / Hk);
+    auto quarter = thread_position_in_grid.y;     // 0..QUARTERS-1
+    uint tptg = thread_position_in_threadgroup.x; // 0..(SIMDS*32-1)
+    uint simd_id = tptg / 32u;                     // 0..SIMDS-1
+    uint dk_idx = thread_index_in_simdgroup;       // 0..31
+    constexpr int n_per_t = Dk / 32;               // 4  (float4 per lane)
+    constexpr int QSIZE = Dv / Quarters;           // dv rows per quarter (32)
+    constexpr int RPS = QSIZE / Simds;             // dv rows per simdgroup (4)
+    int base_dv = int(quarter) * QSIZE + int(simd_id) * RPS;
+
+    float inv_scale = 1.0f / metal::sqrt(float(Dk));
+    float q_scale = inv_scale * inv_scale;
+    float k_scale = static_cast<float>(static_cast<InT>(inv_scale));
+
+    threadgroup float q_shared[Dk];
+    threadgroup float k_shared[Dk];
+    threadgroup float g_shared;
+    threadgroup float beta_shared;
+
+    // running fp32 state for this simdgroup's RPS rows, resident in registers
+    float S[RPS][n_per_t];
+    for (int r = 0; r < RPS; ++r) {
+      const device float4* s4 = reinterpret_cast<const device float4*>(
+        state_in + (n * Dv + (base_dv + r)) * Dk);
+      float4 sv = s4[dk_idx];
+      S[r][0] = sv.x; S[r][1] = sv.y; S[r][2] = sv.z; S[r][3] = sv.w;
+    }
+
+    for (int t = 0; t < T; ++t) {
+      auto conv_t = conv_out + (b_idx * T + t) * ConvDim;
+      auto q_t = conv_t + hk_idx * Dk;
+      auto k_t = conv_t + KeyDim + hk_idx * Dk;
+      auto v_t = conv_t + 2 * KeyDim + hv_idx * Dv;
+      auto a_t = a + (b_idx * T + t) * Hv;
+      auto b_t = b + (b_idx * T + t) * Hv;
+
+      // --- producer: simd 0 computes shared q/k (+ g/beta) once -------------
+      if (simd_id == 0u) {
+        if (dk_idx == 0u) {
+          InT b_val = b_t[hv_idx];
+          auto beta_y = 1 / (1 + metal::exp(metal::abs(b_val)));
+          InT beta_val = (b_val < InT(0)) ? beta_y : 1 - beta_y;
+
+          InT a_val = a_t[hv_idx] + dt_bias[hv_idx];
+          constexpr InT inf = metal::numeric_limits<InT>::infinity();
+          InT maxval = metal::max(a_val, InT(0));
+          InT minval = metal::min(a_val, InT(0));
+          InT softplus_val = (minval == -inf || maxval == inf)
+            ? maxval
+            : (maxval + log1p(metal::exp(minval - maxval)));
+          float decay_a = metal::exp(float(A_log[hv_idx]));
+          beta_shared = static_cast<float>(beta_val);
+          g_shared = metal::exp(-decay_a * float(softplus_val));
+        }
+
+        float q_sum = 0.0f;
+        float k_sum = 0.0f;
+        float q_raw[n_per_t];
+        float k_raw[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          q_raw[i] = static_cast<float>(q_t[s_idx]);
+          k_raw[i] = static_cast<float>(k_t[s_idx]);
+          q_sum += q_raw[i] * q_raw[i];
+          k_sum += k_raw[i] * k_raw[i];
+        }
+        q_sum = simd_sum(q_sum);
+        k_sum = simd_sum(k_sum);
+        float q_inv = metal::precise::rsqrt(q_sum / float(Dk) + 1.0e-6f);
+        float k_inv = metal::precise::rsqrt(k_sum / float(Dk) + 1.0e-6f);
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          auto q_norm = static_cast<InT>(q_raw[i] * q_inv);
+          auto k_norm = static_cast<InT>(k_raw[i] * k_inv);
+          q_shared[s_idx] =
+            static_cast<float>(static_cast<InT>(static_cast<float>(q_norm) * q_scale));
+          k_shared[s_idx] =
+            static_cast<float>(static_cast<InT>(static_cast<float>(k_norm) * k_scale));
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);   // BARRIER 1 (producer->consumer)
+
+      // --- consumer: each simdgroup drives its RPS rows --------------------
+      float g_local = g_shared;
+      float beta_local = beta_shared;
+      float qloc[n_per_t];
+      float kloc[n_per_t];
+      for (int i = 0; i < n_per_t; ++i) {
+        auto s_idx = n_per_t * dk_idx + i;
+        qloc[i] = q_shared[s_idx];
+        kloc[i] = k_shared[s_idx];
+      }
+
+      float kv[RPS];
+      for (int r = 0; r < RPS; ++r) {
+        float acc = 0.0f;
+        for (int i = 0; i < n_per_t; ++i) {
+          S[r][i] = S[r][i] * g_local;
+          acc += S[r][i] * kloc[i];
+        }
+        kv[r] = acc;
+      }
+      for (int r = 0; r < RPS; ++r) { kv[r] = simd_sum(kv[r]); }
+
+      float delta[RPS];
+      for (int r = 0; r < RPS; ++r) {
+        delta[r] = (static_cast<float>(v_t[base_dv + r]) - kv[r]) * beta_local;
+      }
+
+      float out[RPS];
+      for (int r = 0; r < RPS; ++r) {
+        float acc = 0.0f;
+        for (int i = 0; i < n_per_t; ++i) {
+          S[r][i] = S[r][i] + kloc[i] * delta[r];
+          acc += S[r][i] * qloc[i];
+        }
+        out[r] = acc;
+      }
+      for (int r = 0; r < RPS; ++r) { out[r] = simd_sum(out[r]); }
+
+      auto y_t = y + ((b_idx * T + t) * Hv + hv_idx) * Dv;
+      for (int r = 0; r < RPS; ++r) {
+        int dv = base_dv + r;
+        if (dk_idx == 0u) {
+          y_t[dv] = static_cast<InT>(out[r]);
+        }
+        device float4* o4 = reinterpret_cast<device float4*>(
+          states + (((b_idx * T + t) * Hv + hv_idx) * Dv + dv) * Dk);
+        o4[dk_idx] = float4(S[r][0], S[r][1], S[r][2], S[r][3]);
+      }
+
+      if (t + 1 < T) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);  // BARRIER 2 (WAR guard, T>1 only)
+      }
+    }
+    """
+    return mx.fast.metal_kernel(
+        name="mtplx_linear_gated_delta_from_conv_headquarter_v1",
+        input_names=["conv_out", "a", "b", "A_log", "dt_bias", "state_in", "T"],
+        output_names=["y", "states"],
+        source=source,
+    )
+
+
 _linear_conv1d_kernel = _make_linear_conv1d_kernel()
 _linear_gated_delta_kernel = _make_linear_gated_delta_kernel()
 _linear_gated_delta_final_kernel = _make_linear_gated_delta_final_kernel()
@@ -1121,6 +1331,9 @@ _linear_gated_delta_from_conv_tape_replay_kernel = (
 )
 _linear_gated_delta_from_conv_inline_g_kernel = (
     _make_linear_gated_delta_from_conv_inline_g_kernel()
+)
+_linear_gated_delta_from_conv_headquarter_kernel = (
+    _make_linear_gated_delta_from_conv_headquarter_kernel()
 )
 
 _LINEAR_GDN_ALIASES = {"linear_gdn", "linear_gdn_len5"}
@@ -1800,6 +2013,108 @@ def _apply_enabled_a3b_gdn_postconv_m2_tgy4(
 ):
     """Execute the construction-installed exact A3B M2/TGY4 route."""
     return _a3b_compiled_target_gdn_postconv_m2_tgy4(
+        conv_out,
+        a,
+        b,
+        state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+
+
+def _a3b_compiled_target_gdn_postconv_m1_headquarter(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Launch the fixed A3B compiled-target M1 recurrence with the C1 headquarter kernel."""
+    return _linear_gated_delta_from_conv_headquarter_kernel(
+        inputs=[conv_out, a, b, A_log, dt_bias, state, 1],
+        template=[
+            ("InT", mx.bfloat16),
+            ("StT", mx.float32),
+            ("Dk", 128),
+            ("Dv", 128),
+            ("Hk", 16),
+            ("Hv", 32),
+            ("KeyDim", 2048),
+            ("ConvDim", 8192),
+            ("Quarters", 4),
+            ("Simds", 8),
+        ],
+        grid=(256, 4, 32),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(1, 1, 32, 128), (1, 1, 32, 128, 128)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+
+
+def _a3b_compiled_target_gdn_postconv_m2_headquarter(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Launch the fixed A3B compiled-target M2 recurrence with the C1 headquarter kernel."""
+    return _linear_gated_delta_from_conv_headquarter_kernel(
+        inputs=[conv_out, a, b, A_log, dt_bias, state, 2],
+        template=[
+            ("InT", mx.bfloat16),
+            ("StT", mx.float32),
+            ("Dk", 128),
+            ("Dv", 128),
+            ("Hk", 16),
+            ("Hv", 32),
+            ("KeyDim", 2048),
+            ("ConvDim", 8192),
+            ("Quarters", 4),
+            ("Simds", 8),
+        ],
+        grid=(256, 4, 32),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(1, 2, 32, 128), (1, 2, 32, 128, 128)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+
+
+def _apply_enabled_a3b_gdn_postconv_m1_headquarter(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Execute the construction-installed exact A3B M1 headquarter route."""
+    return _a3b_compiled_target_gdn_postconv_m1_headquarter(
+        conv_out,
+        a,
+        b,
+        state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+
+
+def _apply_enabled_a3b_gdn_postconv_m2_headquarter(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Execute the construction-installed exact A3B M2 headquarter route."""
+    return _a3b_compiled_target_gdn_postconv_m2_headquarter(
         conv_out,
         a,
         b,
