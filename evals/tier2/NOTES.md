@@ -630,3 +630,71 @@ second full-suite run pending as corroboration).
 
 Acceptance window (paired, one window, champion cache-heavy config,
 armA control OFF expect ~6.28 / armB ON, gates + telemetry split): NEXT.
+
+## FIX (B) ACCEPTANCE (2026-07-21 22:28-22:43, one paired window): armB K1 5.86 vs armA 6.25 — BELOW THE 7.0 STOP LINE; telemetry shows the overlap window is structurally starved
+
+Window: run_with_qwen_stopped, armA (overlap OFF, control) then armB
+(--moe-overlap), champion cache-heavy config, MTPLX_SUSTAINED_PREFILL=1
+MTPLX_HY3_SUBMIT_CADENCE=8. Artifacts overlap_ab_{off,on}.json; gates
+14/14 true on every row, both arms; deterministic tokens.
+
+| arm | AR tok/s | K1 tok/s | K1 ms/tok |
+|---|---|---|---|
+| A control (OFF) | 5.541 | **6.253** | 159.9 |
+| B overlap (ON)  | 5.279 | **5.857** | 170.7 |
+
+armA sits in the receipt band (6.27-6.30 cross-window; paired control
+stands). armB is **-6.3% at K1, -4.7% at AR** — the mechanism not only
+missed the 8.5-10 zone, it is net negative. STOPPING per the brief; no
+tuning. Decomposition below is the deliverable.
+
+MEASURED OVERLAP TELEMETRY (armB; pool counters accumulate across rows —
+reset() clears cache counters, not slot-pool metrics — so K1 = d1-d0
+delta; the per-token record volumes 99.3/99.5 match the 103.4 miss/tok
+receipt, validating the instrument):
+- AR row: 51.2 batched routes/tok, 99.3 records/tok;
+  **overlap_gpu_dispatch 9.5 ms/tok; overlap_exposed_wait 97.4 ms/tok.**
+- K1 row: 53.3 routes/tok, 99.5 records/tok;
+  **overlap_gpu_dispatch 15.2 ms/tok; overlap_exposed_wait 88.8 ms/tok.**
+- Batch path executed on every decode split route (routes == parts);
+  knob-OFF arm counters all zero.
+
+READING:
+1. The mechanism works as built — every miss group went down as one
+   batched part and hit/shared GPU work was dispatched inside the open
+   read window (9.5-15.2 ms/tok of it).
+2. It cannot hide the reads: exposed read-wait stays at 88.8-97.4
+   ms/tok, i.e. the stock 83-99 ms band. The reason is structural, now
+   measured rather than assumed: after the router resolves, the ONLY
+   work not data-dependent on the layer's misses is that same layer's
+   hit gather + shared branch (+ graph build) — the 9.5-15.2 ms/tok.
+   Layer L+1's attention/router cannot enter the window (they need L's
+   combine, which needs the misses). The Σ max(read_L, other_L) pricing
+   assumed the full ~37 GPU + ~22 host ms/tok could slide under reads;
+   the dependency structure admits ~1/6 of it.
+3. The batching itself costs ~9-11 ms/tok net vs the per-expert path.
+   Unmeasured split between suspects: (a) single-task serial admission
+   delays first-read submission whenever an early load waits on a
+   slot/pin (old path: k concurrent admit+read tasks); (b) the miss
+   gather now dispatches after the SLOWEST record of the group instead
+   of per-part as-ready; (c) fewer per-part async_eval submissions.
+
+PROGRAM CONSEQUENCE: same-layer overlap is a dead lever at ~1-2
+misses/layer-visit — the read window dwarfs the dispatchable work.
+Routes to 10 tok/s must change the dependency structure or the byte
+volume: fewer bytes per miss (the 2-bit program), more positions per
+layer-visit (deeper verify batches raise other_L), or cross-layer
+speculation (prefetch program: KILLED separately). The exposed-wait
+counter stays available (knob ON) for any future lever to be judged
+against.
+
+Knob remains default OFF; the stock path is untouched and the in-window
+control confirms it unchanged.
+
+OPS NOTES: (1) the campaign venv's editable mtplx resolves script-mode
+children to the PARENT checkout (mtplx-hy3-ssd root, a different
+branch) — the first two launches died pre-lock on the wrapper import
+(no collateral; qwen untouched). Window drivers must export
+PYTHONPATH=<worktree> and assert mtplx.__file__ in-window (driver does
+both now). (2) The 51-c6-mmap-band lane queued windows before and after
+this one; flock launch-order coordination worked as designed both times.
