@@ -73,6 +73,13 @@ MODEL_SPECS = {
         "mtp_artifacts": Path("~/.cache/huggingface/hy3-bf16-and-mtp-layer80"),
         "prompt_tail": None,
     },
+    "hy3-oq4e": {
+        "model_key": "hy3-expert-oq4e",
+        "depths": (1, 2, 3, 4, 5, 6, 7),
+        "model_root": Path("~/.cache/huggingface/hy3-oq4e-mlx"),
+        "mtp_artifacts": Path("~/.cache/huggingface/hy3-bf16-and-mtp-layer80"),
+        "prompt_tail": None,
+    },
     "glm52-q2": {
         "model_key": "glm52-expert-q2",
         "depths": (1, 2, 3, 4, 5),

@@ -437,6 +437,42 @@ HY3_EXPERT_OQ2E = ExpertStreamingModelSpec(
 )
 
 
+HY3_EXPERT_OQ4E = ExpertStreamingModelSpec(
+    key="hy3-expert-oq4e",
+    display_name="unigilby Hy3 oQ4e (imatrix affine Q4 gs64 experts, 5-bit boosted residents)",
+    source_model="tencent/Hy3",
+    source_revision="716aa7241bd6d95896be4ebfc761162a9c4d49ef",
+    quant_model="unigilby/Hy3-oQ4e",
+    quant_revision="4b13f0ee5c9ae9b002cb7448f89d732654f3f50e",
+    # True header-inventory sum. The published index declares 169_785_226_181,
+    # overstating by 345_797 bytes — the same oMLX generator bug as oQ2e
+    # (which overstated by 345_252); local index corrected, original kept as
+    # model.safetensors.index.json.orig-published.
+    total_tensor_bytes=169_784_880_384,
+    total_layers=80,
+    routed_layer_start=1,
+    routed_layer_count=79,
+    expert_count=192,
+    top_k=8,
+    hidden_size=4096,
+    expert_hidden_size=1536,
+    # Routed expert records are uniformly affine Q4/gs64 (header-verified across
+    # sensitive layers 1-3/76-79); the imatrix 5-bit sensitivity boosts touch
+    # only RESIDENT projections (config-driven loader passes per-tensor bits).
+    quant_bits=4,
+    quant_group_size=64,
+    quant_parameter_bytes=2,
+    router_storage="source bfloat16 with fp32 correction bias",
+    router_matmul_dtype="float32",
+    router_bytes=124_316_928,
+    kv_bytes_per_token=327_680,
+    mtp_layer_index=80,
+    mtp_included=False,
+    # island_pin_order deliberately EMPTY like HY3_EXPERT_ONLY_Q4: this bank
+    # needs its own measured census before count-based island selection.
+)
+
+
 GLM52_Q4 = ExpertStreamingModelSpec(
     key="glm52-q4",
     display_name="GLM-5.2 affine Q4",
@@ -548,6 +584,7 @@ MODEL_SPECS: dict[str, ExpertStreamingModelSpec] = {
         HY3_EXPERT_ONLY_Q4,
         HY3_EXPERT_Q2,
         HY3_EXPERT_OQ2E,
+        HY3_EXPERT_OQ4E,
         GLM52_Q4,
         GLM52_EXPERT_Q2,
         GLM52_EXPERT_Q1T,
