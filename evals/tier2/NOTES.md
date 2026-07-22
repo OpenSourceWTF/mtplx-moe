@@ -398,3 +398,30 @@ levers are hiding miss latency (R3 overlap), cheapening service (R2
 page-cache L2, R4 read_chunk), or batch amortization (R5). Also cautions
 GLM W1: the hy3 half of its evidence base is now dead; GLM's own
 frequency-vs-uniform A/B remains unmeasured.
+
+## R2-band/R4 replay window (2026-07-21): R4 CONFIRMED ~13-15 ms/tok; band DEMOTED to ~5
+
+Model-free pread replay against the real q4 sidecar (wired ~0, cache fill
+19.9 GiB, receipt `r2r4_band_replay_receipt.json`; first launch self-crashed
+6x on a watchdog RSS cap that miscounted clean mmap pages as anon memory —
+fixed cap 30 GiB + launcher no longer retries watchdog aborts):
+
+- **A1 cold single pread 10.1 MiB: 0.93 ms (10.8 GiB/s).** A2 production
+  8 MiB-chunk mirror: 1.05 ms — the 2-preads-per-record tax is 0.13 ms/miss
+  = **R4 ≈ 13-15 ms/token for a read_chunk >= record-size change.**
+- **B1 warm band via mmap 0.66 ms vs deep tail 0.91 ms alongside it** (no
+  interference; band 200/200 resident after replay). Save 0.24 ms/hit x ~20
+  band-hits/tok = **~5 ms/token — band DEMOTED** (the ~22 estimate assumed
+  1.5 ms cold reads; raw cold is 0.91). Only worth revisiting as zero-copy
+  serving that also skips per-miss runtime overhead.
+- **Key discovery: ~0.6 ms/miss (~60 ms/token) of NON-READ miss overhead** —
+  production wall budget 1.5 ms/miss vs 0.91 raw read, corroborated by raw
+  read time 0.98 GiB/tok / 10.8 GiB/s = 91 ms of the 159 ms step. This pool
+  (admission/slot/host-sync + serialization) is R3's target; fully-hidden
+  reads ceiling ~11 tok/s.
+- Cold band populate: 19.9 GiB in 2.1 s (sorted offsets ~sequential);
+  warm sweeps 33-40 GiB/s.
+
+Program re-rank: R4 (trivial, confirmed) -> R3 decomposition (hideable vs
+deletable split of the 60 ms pool) -> R5 batch (aggregate only) -> band
+(parked) . R1/page-cache-LRU remain dead. Awaiting David's pick.
