@@ -448,3 +448,18 @@ plateau, the ~91 ms/tok I/O share compresses toward ~65-75 ms.
 Artifacts: r4_ab_chunk8.json / r4_ab_chunk16.json / r3_telemetry_chunk16.json.
 Lesson (method): I/O microbenches must mirror the production SUBMISSION
 model (concurrency), not just the syscall pattern.
+
+## Chunk-descent sweep (2026-07-21): FLAT — the chunk lever is exhausted at ~2% total span
+
+Paired one-window (identical routing all arms): chunk8 AR 5.611 / K1 6.282;
+chunk4 5.678 / **6.323** (+0.65%); chunk2 5.713 / 6.322. Descent past 4 MiB
+buys nothing; the whole read_chunk knob spans 16MiB 6.136 -> 4MiB 6.323
+(~2%, chunk4 marginal best). Leans T2 (null-at-IO-layer): live realized read
+bandwidth barely responds to chunk shape, so the dynamic-splitter idea is
+LOW-EV at K1 (David's test-the-theory-first call — validated before any
+build). Discriminating evidence queued in one window: HOL microbench through
+the PRODUCTION reader (QD x chunk grid, predictions pre-registered in the
+receipt), 2x5.06 MiB even-split arm, and David's pure-mmap probe
+(slot_layout metal-mmap, no islands — "islands only work when the bank
+nearly fits" — 256-token order-of-magnitude cell, non-gating).
+Artifacts: r4_sweep_chunk{8,4,2}.json.
