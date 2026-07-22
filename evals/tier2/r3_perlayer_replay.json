@@ -1,0 +1,62 @@
+{
+  "schema": "r3-perlayer-replay/1",
+  "steps": 48,
+  "misses": 8173,
+  "read_wait_per_token_ms": {
+    "mean": 165.68,
+    "p50": 161.47,
+    "p90": 177.22
+  },
+  "group_wall_by_miss_count": {
+    "1": {
+      "groups": 581,
+      "mean_ms": 1.1609,
+      "p50_ms": 1.087,
+      "p90_ms": 1.1153
+    },
+    "2": {
+      "groups": 911,
+      "mean_ms": 2.0112,
+      "p50_ms": 1.9403,
+      "p90_ms": 2.0592
+    },
+    "3": {
+      "groups": 847,
+      "mean_ms": 2.9189,
+      "p50_ms": 2.8009,
+      "p90_ms": 2.9497
+    },
+    "4": {
+      "groups": 493,
+      "mean_ms": 3.7301,
+      "p50_ms": 3.6276,
+      "p90_ms": 3.754
+    },
+    "5": {
+      "groups": 183,
+      "mean_ms": 4.5512,
+      "p50_ms": 4.4614,
+      "p90_ms": 4.6245
+    },
+    "6": {
+      "groups": 44,
+      "mean_ms": 5.3292,
+      "p50_ms": 5.2279,
+      "p90_ms": 5.4029
+    },
+    "7": {
+      "groups": 10,
+      "mean_ms": 6.0992,
+      "p50_ms": 6.1215,
+      "p90_ms": 6.2346
+    },
+    "8": {
+      "groups": 1,
+      "mean_ms": 6.5295,
+      "p50_ms": 6.5295,
+      "p90_ms": 6.5295
+    }
+  },
+  "groups_per_step_with_misses": 63.96,
+  "status": "complete"
+}

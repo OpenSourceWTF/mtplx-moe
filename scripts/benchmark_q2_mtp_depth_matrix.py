@@ -80,6 +80,13 @@ MODEL_SPECS = {
         "mtp_artifacts": Path("~/.cache/huggingface/hy3-bf16-and-mtp-layer80"),
         "prompt_tail": None,
     },
+    "hy3-oq4e": {
+        "model_key": "hy3-expert-oq4e",
+        "depths": (1, 2, 3, 4, 5, 6, 7),
+        "model_root": Path("~/.cache/huggingface/hy3-oq4e-mlx"),
+        "mtp_artifacts": Path("~/.cache/huggingface/hy3-bf16-and-mtp-layer80"),
+        "prompt_tail": None,
+    },
     "glm52-q2": {
         "model_key": "glm52-expert-q2",
         "depths": (1, 2, 3, 4, 5),
@@ -123,6 +130,7 @@ DEFAULT_RUNTIME_OPTIONS = {
     "expert_integrity": "per-read",
     "prefetch_slots": 0,
     "split_route_release": "fenced",
+    "overlap_miss_reads": False,
     "mmap_island_layers": "",
     "banked_manifest": "",
     "banked_codec": "none",
@@ -643,6 +651,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--moe-overlap",
+        dest="overlap_miss_reads",
+        action="store_true",
+        help=(
+            "Fix (B), issue #130: submit each decode layer's misses as ONE "
+            "batched part (single future, admission before the wait, "
+            "adjacent sidecar records coalesced into scatter reads) so "
+            "resident-expert compute overlaps the miss reads. Requires the "
+            "component-banks slot layout; default off leaves the stock "
+            "per-expert split-part path untouched."
+        ),
+    )
+    parser.add_argument(
         "--expert-integrity",
         choices=("per-read", "at-open", "headers-only"),
         default="per-read",
@@ -805,6 +826,7 @@ def _runtime_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "expert_integrity": args.expert_integrity,
         "prefetch_slots": args.prefetch_slots,
         "split_route_release": args.split_route_release,
+        "overlap_miss_reads": bool(args.overlap_miss_reads),
         "mmap_island_layers": args.mmap_island_layers,
         "banked_manifest": args.banked_manifest,
         "banked_codec": args.banked_codec,
@@ -1722,6 +1744,39 @@ def _streaming_counters(runtime: Any) -> dict[str, Any] | None:
     return _streaming_cache_metrics(runtime)[0]
 
 
+_OVERLAP_TELEMETRY_KEYS = (
+    "batched_miss_parts",
+    "batched_miss_records",
+    "overlap_split_routes",
+    "overlap_gpu_dispatch_ns",
+    "overlap_exposed_wait_ns",
+)
+
+
+def _overlap_telemetry(runtime: Any) -> dict[str, Any] | None:
+    """Fix (B) overlap counters from the slot pool (issue #130).
+
+    The acceptance gate reads measured coactivity out of the artifact —
+    never inferred from tok/s — so the counters ride every observation row.
+    """
+
+    snapshot_fn = getattr(runtime, "expert_streaming_snapshot", None)
+    if not callable(snapshot_fn):
+        return None
+    snapshot = snapshot_fn()
+    if not isinstance(snapshot, Mapping):
+        return None
+    slots = snapshot.get("slots")
+    metrics = slots.get("metrics") if isinstance(slots, Mapping) else None
+    if not isinstance(metrics, Mapping) or not any(
+        key in metrics for key in _OVERLAP_TELEMETRY_KEYS
+    ):
+        return None
+    return {
+        key: _jsonable(metrics.get(key, 0)) for key in _OVERLAP_TELEMETRY_KEYS
+    }
+
+
 def _cache_hit_rate(counters: Any) -> float | None:
     if not isinstance(counters, Mapping):
         return None
@@ -2152,6 +2207,7 @@ def _run_observation(
         runtime,
         snapshot=streaming_snapshot,
     )
+    overlap_telemetry = _overlap_telemetry(runtime)
     failure_evidence = {
         "model": model,
         "depth": depth,
@@ -2353,6 +2409,7 @@ def _run_observation(
         "expert_streaming_counters": streaming_counters,
         "expert_streaming_counters_by_phase": streaming_counters_by_phase,
         "decode_expert_cache_hit_rate": decode_cache_hit_rate,
+        "overlap_telemetry": overlap_telemetry,
         "expert_resource_telemetry": (
             resource_evidence if resource_telemetry_enabled else None
         ),
@@ -2465,6 +2522,7 @@ def _runtime_config(
         ),
         verify_sidecar_hash_at_open=(options.get("expert_integrity") == "at-open"),
         split_route_release=options.get("split_route_release", "fenced"),
+        overlap_miss_reads=bool(options.get("overlap_miss_reads", False)),
         mmap_island_layers=parse_island_layers(options.get("mmap_island_layers", "")),
         banked_manifest=(
             str(options["banked_manifest"]) if options.get("banked_manifest") else None

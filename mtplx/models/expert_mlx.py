@@ -2305,6 +2305,18 @@ class HotExpertSwitchGLU(nn.Module):
                         wave.experts,
                         phase=phase,
                     )
+                # Fix (B) overlap telemetry (issue #130): measured
+                # coactivity, never inferred from tok/s. The dispatch span
+                # counts only when the miss reads were still open when the
+                # GPU work went down; the exposed span is the residual
+                # blocking wait the overlap could not hide.
+                overlap_track = phase is RoutingPhase.DECODE and bool(
+                    getattr(self.runtime.config, "overlap_miss_reads", False)
+                )
+                route_ready_ns = time.monotonic_ns() if overlap_track else 0
+                dispatch_done_ns = 0
+                dispatched_open = False
+                first_miss_ready_ns = 0
                 try:
                     hit_pipeline_work = None
                     if pipeline_ledger is not None and pending.hit_ready is not None:
@@ -2410,7 +2422,12 @@ class HotExpertSwitchGLU(nn.Module):
                                     phase=phase,
                                 )
                                 shared_pipeline_work = None
+                    if overlap_track:
+                        dispatch_done_ns = time.monotonic_ns()
+                        dispatched_open = pending.misses_pending
                     for miss_ready in pending.iter_ready_misses():
+                        if overlap_track and first_miss_ready_ns == 0:
+                            first_miss_ready_ns = time.monotonic_ns()
                         part_error: BaseException | None = None
                         try:
                             ready_experts = set(miss_ready.plan.experts)
@@ -2448,6 +2465,20 @@ class HotExpertSwitchGLU(nn.Module):
                                 except BaseException:
                                     if part_error is None:
                                         raise
+                    if overlap_track and pending.plan.misses:
+                        self.runtime.slots.metrics.update(
+                            overlap_split_routes=1,
+                            overlap_gpu_dispatch_ns=(
+                                dispatch_done_ns - route_ready_ns
+                                if dispatched_open
+                                else 0
+                            ),
+                            overlap_exposed_wait_ns=(
+                                max(0, first_miss_ready_ns - dispatch_done_ns)
+                                if first_miss_ready_ns
+                                else 0
+                            ),
+                        )
                     split_completed = True
                 except BaseException as exc:
                     pending.abort(exc)

@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Collection, Iterable
 
-from .expert_io import ExpertIOError, PositionalExpertReader
+from .expert_io import ExpertIOError, PositionalExpertReader, _record_part_index
 from .expert_manifest import ExpertManifest, ExpertManifestError, ExpertRecord
 from .resource_metrics import (
     ExpertPipelineLedger,
@@ -105,6 +105,18 @@ class ExpertSlotMetrics:
     )
     synchronous_fences: int = 0
     synchronous_fence_slots: int = 0
+    # Fix (B) overlap telemetry (issue #130). batched_*: decode miss groups
+    # submitted as one part and the records they carried. overlap_*: split
+    # routes whose hit/shared work was dispatched while a miss read was
+    # still in flight, host-clock ns spent building/submitting that GPU
+    # work inside the open-read window, and the residual ns the generation
+    # thread still blocked on the miss future afterwards (the exposed
+    # read-wait the overlap could not hide).
+    batched_miss_parts: int = 0
+    batched_miss_records: int = 0
+    overlap_split_routes: int = 0
+    overlap_gpu_dispatch_ns: int = 0
+    overlap_exposed_wait_ns: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _route_claims: list[_RouteReleaseClaim] = field(default_factory=list, repr=False)
     _admission_test_hook: Callable[[str], None] | None = field(default=None, repr=False)
@@ -215,6 +227,11 @@ class ExpertSlotMetrics:
                     "completion_fence_failures",
                     "synchronous_fences",
                     "synchronous_fence_slots",
+                    "batched_miss_parts",
+                    "batched_miss_records",
+                    "overlap_split_routes",
+                    "overlap_gpu_dispatch_ns",
+                    "overlap_exposed_wait_ns",
                 )
             }
 
@@ -631,6 +648,7 @@ class ExpertSlotPool:
         resource_telemetry: bool = False,
         pipeline_ledger: ExpertPipelineLedger | None = None,
         island_layers: Collection[int] = (),
+        batch_decode_reads: bool = False,
     ) -> None:
         if plan.model_key != spec.key or manifest.model_key != spec.key:
             raise ValueError("spec, memory plan, and manifest model keys must match")
@@ -720,6 +738,9 @@ class ExpertSlotPool:
         self.prefer_sidecar = prefer_sidecar
         self.verify_hashes = verify_hashes
         self.device_synchronize = device_synchronize
+        if not isinstance(batch_decode_reads, bool):
+            raise TypeError("batch_decode_reads must be bool")
+        self._batch_decode_reads = batch_decode_reads
         if not isinstance(resource_telemetry, bool):
             raise TypeError("resource_telemetry must be bool")
         self.resource_telemetry_enabled = resource_telemetry
@@ -1539,6 +1560,61 @@ class ExpertSlotPool:
             for left, right in zip(ordered, ordered[1:], strict=False)
         )
 
+    def _decode_batch_runs(
+        self,
+        plan: RoutePlan,
+        owned: list[tuple[_PhysicalSlot, int, ExpertRecord]],
+    ) -> tuple[tuple[tuple[_PhysicalSlot, int, ExpertRecord], ...], ...] | None:
+        """Partition a decode part's owned loads into sidecar-adjacency runs.
+
+        Fix (B), issue #130: an adjacency run becomes one scatter batch (one
+        preadv range per run) while non-adjacent records keep their own
+        concurrent reads, so batching never serializes scattered misses. A
+        compressed sidecar keeps the per-record decode path: entropy-coded
+        containers are not scatter-contiguous with raw ranges.
+        """
+
+        if (
+            not self._batch_decode_reads
+            or plan.phase.value != "decode"
+            or not self.prefer_sidecar
+            or self.manifest.sidecar is None
+            or len(owned) < 2
+            or getattr(self.reader, "_codec_record_map", None) is not None
+            or not all(
+                callable(getattr(slot.buffer, "record_views", None))
+                for slot, _generation, _record in owned
+            )
+            or not all(
+                record.sidecar_offset is not None
+                and record.sidecar_length is not None
+                for _slot, _generation, record in owned
+            )
+        ):
+            return None
+        ordered = sorted(
+            owned,
+            key=lambda item: (
+                _record_part_index(item[2]),
+                int(item[2].sidecar_offset or 0),
+            ),
+        )
+        runs: list[list[tuple[_PhysicalSlot, int, ExpertRecord]]] = [[ordered[0]]]
+        for item in ordered[1:]:
+            previous = runs[-1][-1][2]
+            record = item[2]
+            expected = int(previous.sidecar_offset or 0) + int(
+                previous.sidecar_length or 0
+            )
+            if (
+                _record_part_index(record) == _record_part_index(previous)
+                and int(record.sidecar_offset or 0) == expected
+            ):
+                runs[-1].append(item)
+            else:
+                runs.append([item])
+        return tuple(tuple(run) for run in runs)
+
     def _wait_ready(
         self,
         slot: _PhysicalSlot,
@@ -1991,6 +2067,82 @@ class ExpertSlotPool:
                     elif nonowned_loads is not None:
                         nonowned_loads.add((load.expert, load.slot))
                 use_batch = self._can_batch_component_sidecar(plan, owned_loads)
+                decode_runs = (
+                    None
+                    if use_batch
+                    else self._decode_batch_runs(plan, owned_loads)
+                )
+
+                def _submit_batch_read(
+                    items: tuple[tuple[_PhysicalSlot, int, ExpertRecord], ...],
+                ) -> Future[None]:
+                    if pipeline_route is not None:
+                        return self._submit_pipeline_reader(
+                            pipeline_route,
+                            tuple(record.expert for _slot, _gen, record in items),
+                            sum(record.logical_bytes for _, _, record in items),
+                            self._fill_batch,
+                            items,
+                            cancel_event=combined_cancel,
+                            deadline_ns=deadline_ns,
+                            pipeline_route=pipeline_route,
+                        )
+                    if self._reader_pool_telemetry is None:
+                        return self._executor.submit(
+                            self._fill_batch,
+                            items,
+                            cancel_event=combined_cancel,
+                            deadline_ns=deadline_ns,
+                        )
+                    return self._submit_tracked(
+                        self._executor,
+                        self._reader_pool_telemetry,
+                        sum(record.logical_bytes for _, _, record in items),
+                        self._fill_batch,
+                        items,
+                        cancel_event=combined_cancel,
+                        deadline_ns=deadline_ns,
+                    )
+
+                def _submit_single_read(
+                    slot: _PhysicalSlot,
+                    generation: int,
+                    record: ExpertRecord,
+                ) -> Future[None]:
+                    if pipeline_route is not None:
+                        return self._submit_pipeline_reader(
+                            pipeline_route,
+                            (record.expert,),
+                            record.logical_bytes,
+                            self._fill,
+                            slot,
+                            generation,
+                            record,
+                            cancel_event=combined_cancel,
+                            deadline_ns=deadline_ns,
+                            pipeline_route=pipeline_route,
+                        )
+                    if self._reader_pool_telemetry is None:
+                        return self._executor.submit(
+                            self._fill,
+                            slot,
+                            generation,
+                            record,
+                            cancel_event=combined_cancel,
+                            deadline_ns=deadline_ns,
+                        )
+                    return self._submit_tracked(
+                        self._executor,
+                        self._reader_pool_telemetry,
+                        record.logical_bytes,
+                        self._fill,
+                        slot,
+                        generation,
+                        record,
+                        cancel_event=combined_cancel,
+                        deadline_ns=deadline_ns,
+                    )
+
                 # Completion failure recording uses this same lock.  Keeping
                 # it through every submission makes the rollback boundary
                 # exact: either no read was accepted, or policy restoration is
@@ -2041,6 +2193,24 @@ class ExpertSlotPool:
                             (id(slot), generation)
                             for slot, generation, _record in owned_loads
                         )
+                    elif decode_runs is not None:
+                        # Fix (B): one scatter batch per adjacency run keeps
+                        # coalescing where the bytes are contiguous while
+                        # scattered records still read concurrently.
+                        for run in decode_runs:
+                            if len(run) == 1:
+                                slot, generation, record = run[0]
+                                future = _submit_single_read(
+                                    slot, generation, record
+                                )
+                            else:
+                                future = _submit_batch_read(run)
+                            admission.mark_accepted()
+                            futures.append(future)
+                            submitted_loads.update(
+                                (id(slot), generation)
+                                for slot, generation, _record in run
+                            )
                     else:
                         for slot, generation, record in owned_loads:
                             if pipeline_route is not None:
