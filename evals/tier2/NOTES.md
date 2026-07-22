@@ -573,3 +573,60 @@ preserved) -> parity-gated paired A/B.
 Also: oQ4e sidecar COMPLETE (experts.bin 161,036,107,776 B — byte-identical
 geometry to old q4; manifest w/ record hashes; spec + benchmark registered
 5df7d7d). Eval ladder pending a window.
+
+## FIX (B) IMPLEMENTED (2026-07-21): --moe-overlap = single batched miss part + run-coalesced reads + measured overlap telemetry (commit 9865f0b)
+
+Design per David's pick (resident-first same-layer overlap; batched group
+reads as its foundation). Config-gated: `overlap_miss_reads` /
+`--moe-overlap`, default OFF; OFF leaves the per-expert split-part decode
+path untouched (behavior-locked by test). Requires component-banks.
+
+WHAT CHANGED (ON):
+- `begin_split_route` submits a decode layer's misses as ONE part -> one
+  future, one admission pass ahead of the wait, one policy commit, one
+  miss-gather dispatch. (Same part shape prefill always used; only the
+  phase gate is new.) Per-expert parts each paid their own executor task,
+  lifecycle claim, admission, pin pass, ReadyRoute, and per-part
+  iter/claim/commit bookkeeping — the ~0.6 ms/miss non-read overhead pool
+  (~60 ms/token at 103 miss/tok) this lever targets.
+- Pool partitions the part's loads into sidecar-adjacency runs: run >= 2
+  -> one scatter preadv batch (`_fill_batch`); scattered records keep
+  their own reads on the 8-worker pool, so batching never serializes
+  non-adjacent misses. (Near-uniform routing makes adjacent same-layer
+  miss pairs rare — the concurrency-preserving fallback is the common
+  case; coalescing is opportunistic.)
+- Hit + shared dispatch before the miss wait was already in place under
+  split-route-release=deferred; the availability split and canonical
+  accumulation were already partition-invariant — LOCKED by a new
+  bitwise test: gather_qmm subset dispatch + position-order reassembly
+  reproduces the fused 8-expert wave BIT-EXACTLY on real shapes (hidden
+  4096, expert_hidden 1536, gs64 affine q4; partitions 8/0, 6/2, 0/8,
+  interleaved 3/5; run-to-run deterministic). The [rows,1,K] gather
+  calling-convention shape is asserted inside the test harness.
+- Telemetry (the acceptance counter, measured, never tok/s-inferred):
+  slot metrics `batched_miss_parts`/`batched_miss_records` prove the
+  batch path executed; `overlap_split_routes`,
+  `overlap_gpu_dispatch_ns` (host ns of GPU work built+submitted while a
+  miss read was open), `overlap_exposed_wait_ns` (residual blocking wait
+  after dispatch = the read-wait the overlap could NOT hide). Every
+  benchmark observation row carries them as `overlap_telemetry`.
+
+TDD EVIDENCE (tests/test_expert_overlap_split.py, 9 tests, all green):
+batch == N single reads bitwise via per-record sha256 verification on a
+sidecar-backed component-banks runtime; adjacency coalescing observed via
+reader read_operations (adjacent [1,2,3] -> 1 op, scattered [5,7] -> 2);
+short-read and pre-set-cancellation FAIL CLOSED; knob OFF keeps 4
+per-expert parts and zero overlap counters; telemetry counters recorded
+under a slowed reader with a warm hit + cold miss route. Benchmark flag
+test: --moe-overlap -> runtime config -> per-row overlap_telemetry.
+
+FULL SUITE: touched-area files 309 passed. Full tests/ shows 2
+pre-existing test_settings_audit failures (MTPLX_HY3_ROUTER_SPLITK_M1
+unclassified — fails identically at HEAD b9c28c3, another lane's env
+var) plus sdpa_gqa_packed/streamed_rans failures that appear ONLY under
+the full-suite run and pass in isolation both at HEAD and with this
+change (suite-order/GPU-state flakes, statically untouched by this diff;
+second full-suite run pending as corroboration).
+
+Acceptance window (paired, one window, champion cache-heavy config,
+armA control OFF expect ~6.28 / armB ON, gates + telemetry split): NEXT.
