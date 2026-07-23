@@ -7040,6 +7040,7 @@ def generate_mtpk(
                     event["context_copy"] = {"disabled": "no_per_position_commit"}
                     append_event(event)
                     continue
+                _cc_round_pos = len(tokens)
                 _cc_acc = _cc_block[:_cc_nacc]
                 _cc_stop_idx = next((i for i, t in enumerate(_cc_acc)
                                      if _is_stop(int(t), stop_token_ids)), None)
@@ -7091,6 +7092,12 @@ def generate_mtpk(
                     "correction": (
                         int(_cc_correction) if _cc_correction is not None else None
                     ),
+                    # Completion-stream position of the round (tokens emitted
+                    # BEFORE this round's block landed): byte-exactness gates
+                    # correlate a divergence index with round windows to tell
+                    # an accept/continuation fault from post-commit state
+                    # corruption.
+                    "at_tokens": int(_cc_round_pos),
                 }
                 # Committed-history MTP caches pair every committed token with the
                 # hidden state of the token before it, including (previous hidden,
