@@ -27,21 +27,27 @@ def context_copy_enabled() -> bool:
 
 
 def context_copy_target_prefix_enabled() -> bool:
-    """Opt-in: allow context-copy rounds to run under the exact A3B target_prefix
-    verify strategy (default OFF, so the shipped/PR behaviour is unchanged).
+    """Opt-in: run context-copy on the target_prefix lane (default OFF, so the
+    shipped/PR behaviour is byte-unchanged).
 
-    Context-copy is normally gated to capture_commit because a copy round verifies
-    a variable-length ``[primary] + block`` (T+1 rows) and commits a per-position
-    prefix, while the compiled target_prefix route is frozen at the K1 verify-length-2
-    contract.  A copy round does NOT use the compiled route, though -- it runs its own
-    ``forward_ar_capture`` + ``commit_captured_prefix`` (both cache-generic, with a
-    graceful ``__final_only__`` fallback), so the two can interleave: copy when a
-    prompt match exists, the compiled target_prefix K1 route otherwise.
+    Context-copy proposes variable-length ``[primary] + block`` copy rounds (T+1
+    rows) and commits a per-position prefix.  The COMPILED K1 target_prefix route
+    is frozen at verify-length-2 with its own request-owned state (state_slots +
+    a shadow scaffold), so a copy round's main-cache ``forward_ar_capture`` cannot
+    stay cache-consistent through it (empirically corrupts state -- argmax
+    divergence).  Rather than bridge those two incompatible cache representations,
+    this flag makes the compiled K1 route STEP ASIDE (like the grammar-constraint
+    case): the whole request runs the non-compiled, capture-commit-style
+    target_prefix lane, where copy blocks and K1 draft cycles share one main-cache
+    forward_ar_capture path and context-copy is already correct.  The compiled K1
+    route stays strictly K1-only (pure-K1 requests); prompt-lookup lives on the
+    non-compiled lane.  The flag drives the lane switch REGARDLESS of whether copy
+    rounds fire, so flag-on + MTPLX_CONTEXT_COPY=0 is a clean same-lane baseline.
 
-    NOTE: this is incompatible with installed whole-MoE fusion -- that fused kernel is
-    frozen at exactly 2 rows (K1 verify length), and a copy block is T+1 rows.  The
-    caller must not enable whole-MoE together with this flag; the decode loop keeps the
-    round gated off (with a recorded reason) if whole-MoE is installed.
+    Precedence: whole-MoE fusion needs the compiled route (and its 2-row kernel
+    can't verify a copy block), and repetition penalties disable copy rounds; in
+    both cases the compiled route is KEPT and this flag is inert -- mirrored in the
+    exact_a3b_target_prefix_factory gate and the ccopy_active gate.
     """
     return (os.environ.get("MTPLX_CONTEXT_COPY_TARGET_PREFIX") or "").strip() in {
         "1",

@@ -5706,9 +5706,33 @@ def generate_mtpk(
     # while the #186 phase-3 grammar clamp expects a grammar-illegal
     # correction to be dropped so the next masked primary resamples it.
     # The stock target_prefix lane below carries that contract.
+    #
+    # Context-copy (prompt-lookup) drafting proposes variable-length copy blocks
+    # that the compiled K1 route -- frozen at verify-length-2 with its own
+    # request-owned state (state_slots + shadow) -- cannot verify or stay
+    # cache-consistent through.  So the compiled K1 route stays STRICTLY K1-only:
+    # when the opt-in ccopy-on-target_prefix flag takes over the lane, the route
+    # steps aside (exactly like the constraint case) and the whole request runs
+    # the non-compiled capture-commit-style target_prefix lane, where copy blocks
+    # and K1 draft cycles share one main-cache forward_ar_capture path.  The two
+    # improvement families never share a cycle: K1 compiled-route wins on pure-K1
+    # requests, prompt-lookup wins on the non-compiled lane.  Keyed on the FLAG
+    # (not on whether copy rounds fire) so ccopy-off on this lane is a clean
+    # byte-exactness baseline.  Whole-MoE (needs the compiled route) and penalties
+    # (disable ccopy) both keep the compiled route -- mirrors the ccopy_active
+    # gate below.
+    from .context_copy import (
+        context_copy_target_prefix_enabled as _cc_tp_enabled_early,
+    )
+    _ccopy_takes_over_lane = (
+        target_prefix_verify
+        and _cc_tp_enabled_early()
+        and not (bool(sampler.presence_penalty) or bool(sampler.frequency_penalty))
+        and not bool(getattr(rt, "a3b_whole_moe_installed", False))
+    )
     exact_a3b_target_prefix_factory = (
         rt.a3b_compiled_target_prefix_factory
-        if target_prefix_verify and constraint is None
+        if target_prefix_verify and constraint is None and not _ccopy_takes_over_lane
         else None
     )
     exact_a3b_target_prefix = exact_a3b_target_prefix_factory is not None
