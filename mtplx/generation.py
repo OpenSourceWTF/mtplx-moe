@@ -93,8 +93,17 @@ _PREFILL_CHUNK_SIZE_OVERRIDE: ContextVar[int | None] = ContextVar(
 
 
 def reject_non_k1_a3b_whole_moe_request(rt: MTPLXRuntime, *, entrypoint: str) -> None:
-    """Reject unsupported generation modes once, before they construct a prompt."""
+    """Reject unsupported generation modes once, before they construct a prompt.
 
+    generate_ar is supported: every one of its decode forwards is a single
+    row, which the installed M1 route serves with per-row arithmetic that
+    bit-matches the M2 verify route (enforced at install by the
+    a3b_whole_moe_target_m1_m2_row_parity selfcheck lane).  Pure AR under
+    whole-MoE is the ground-truth arm of the K1 AR-exactness gate.
+    """
+
+    if entrypoint == "generate_ar":
+        return
     if bool(getattr(rt, "a3b_whole_moe_installed", False)):
         raise RuntimeError(
             f"installed A3B whole-MoE is owned by exact K1 generate_mtpk, not {entrypoint}"

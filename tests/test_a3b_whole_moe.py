@@ -429,7 +429,7 @@ def test_external_contract_mismatch_fails_before_install(
 
 def test_fixed_kernel_sources_encode_exact_geometry_without_hot_validation():
     sources = kernel_module.all_whole_moe_sources()
-    assert len(sources) == 10
+    assert len(sources) == 12
     for source in sources.values():
         assert "constexpr uint HIDDEN = 2048" in source
         assert "constexpr uint EXPERTS = 256" in source
@@ -543,6 +543,8 @@ def test_fixed_entrypoint_launch_table(monkeypatch):
         "target_m1_stage3": ((128 * 128, 1, 1), (128, 1, 1)),
         "target_m2_stage3": ((128 * 128, 1, 1), (128, 1, 1)),
         "mtp_m1_stage3": ((128 * 128, 1, 1), (128, 1, 1)),
+        "target_m2r1_stage2": ((288 * 128, 1, 1), (128, 1, 1)),
+        "target_m2r1_stage3": ((128 * 128, 1, 1), (128, 1, 1)),
     }
     assert kernel_module.whole_moe_launch_table() == expected
 
@@ -747,7 +749,7 @@ def test_all_fixed_entrypoints_launch_directly_without_runtime_validation(monkey
     for name, (grid, threadgroup) in kernel_module.whole_moe_launch_table().items():
         if name.startswith("target_m2_stage1_"):
             continue
-        rows = 2 if "m2" in name else 1
+        rows = 1 if "m2r1" in name else (2 if "m2" in name else 1)
         binding = mtp if name.startswith("mtp") else target
         captured = _CapturedKernel()
         monkeypatch.setattr(
@@ -876,11 +878,13 @@ def _exact_selfcheck_report():
         "lanes": {
             "a3b_whole_moe_target_m1": "ok",
             "a3b_whole_moe_target_m2": "ok",
+            "a3b_whole_moe_target_m1_m2_row_parity": "ok",
             "a3b_whole_moe_mtp_m1": "ok",
         },
         "dmax": {
             "a3b_whole_moe_target_m1": 0.125,
             "a3b_whole_moe_target_m2": 0.25,
+            "a3b_whole_moe_target_m1_m2_row_parity": 0.0,
             "a3b_whole_moe_mtp_m1": 0.125,
         },
         "a3b_whole_moe_components": {
@@ -937,6 +941,15 @@ def test_model_bound_selfcheck_runs_only_changed_target_m2_geometry(monkeypatch)
         }
 
     monkeypatch.setattr(whole_moe_module, "_check_whole_moe_lane", check)
+    parity_calls = []
+
+    def parity(binding):
+        parity_calls.append(binding.variant)
+        return 0.0
+
+    monkeypatch.setattr(
+        whole_moe_module, "_check_whole_moe_m1_m2_row_parity", parity
+    )
     report = run_a3b_whole_moe_selfcheck(
         plan,
         {"lanes": {"existing_lane": "ok"}, "dmax": {"existing_lane": 0.0}},
@@ -945,11 +958,14 @@ def test_model_bound_selfcheck_runs_only_changed_target_m2_geometry(monkeypatch)
     assert calls == [
         *(("target_q8g64_q4g64", 2),) * 40,
     ]
+    assert parity_calls == ["target_q8g64_q4g64"] * 40
     assert report["lanes"] == {
         "existing_lane": "ok",
         "a3b_whole_moe_target_m2": "ok",
+        "a3b_whole_moe_target_m1_m2_row_parity": "ok",
     }
     assert report["dmax"]["a3b_whole_moe_target_m2"] == 2.0 / 64.0
+    assert report["dmax"]["a3b_whole_moe_target_m1_m2_row_parity"] == 0.0
     assert report["a3b_whole_moe_components"][
         "a3b_whole_moe_target_m2"
     ]["activations"] == 2.0 / 128.0
@@ -998,6 +1014,11 @@ def _patch_whole_moe_stages(monkeypatch):
         whole_moe_module,
         "_target_m2_route",
         lambda binding: lambda value: _ResultSpec("target_m2", value.shape),
+    )
+    monkeypatch.setattr(
+        whole_moe_module,
+        "_target_m1_route",
+        lambda binding: lambda value: _ResultSpec("target_m1", value.shape),
     )
 
 
@@ -1069,7 +1090,7 @@ def test_successful_selfcheck_installs_only_40_target_m2_overrides(monkeypatch):
         "dense_bf16_[1024,2048]"
     )
     assert report["validated_contract"]["target"]["routes"] == {
-        "M1": "accepted_row_owned_router_combine",
+        "M1": "m2_row_arithmetic_at_rows1_stage23_row_parity",
         "M2": "fixed_tiled_stage1_stage23_one_read_row_paired",
     }
     assert report["validated_contract"]["mtp"]["routes"] == {
@@ -1077,6 +1098,7 @@ def test_successful_selfcheck_installs_only_40_target_m2_overrides(monkeypatch):
     }
     assert report["selfcheck_lanes"] == {
         "a3b_whole_moe_target_m2": "ok",
+        "a3b_whole_moe_target_m1_m2_row_parity": "ok",
         **_passing_full_graph_preflight(),
     }
     assert all(
@@ -1135,12 +1157,16 @@ def test_installed_route_delegates_everything_except_target_m2(monkeypatch):
 
     assert targets[0](_ArraySpec((1, 64, 2048))).label == "accepted_target"
     phase["value"] = "ar_decode"
-    assert targets[0](_ArraySpec((1, 1, 2048))).label == "accepted_target"
+    # Single decode rows now run the fused M1 route: the consistent model
+    # function is what makes greedy K1 byte-comparable to greedy generate_ar.
+    assert targets[0](_ArraySpec((1, 1, 2048))).label == "target_m1"
     assert mtp[0](_ArraySpec((1, 1, 2048))).label == "accepted_mtp"
     phase["value"] = "unknown"
+    assert targets[0](_ArraySpec((1, 1, 2048))).label == "accepted_target"
     assert mtp[0](_ArraySpec((1, 1, 2048))).label == "accepted_mtp"
     phase["value"] = "decode_verify"
     assert targets[0](_ArraySpec((1, 2, 2048))).label == "target_m2"
+    assert targets[0](_ArraySpec((1, 1, 2048))).label == "target_m1"
     assert targets[0](_ArraySpec((1, 3, 2048))).label == "accepted_target"
     assert len(targets[0].stock_calls) == 3
     assert len(mtp[0].stock_calls) == 2
