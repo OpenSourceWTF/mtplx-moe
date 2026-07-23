@@ -965,11 +965,12 @@ def generate_greedy_batched(
             ragged_entries = [
                 e for e in foldin_cache if isinstance(e, RaggedBatchKVCache)
             ]
-            # Constant KV capacity: prompt + generation + pipeline lag + one
-            # admission window, identical in candidate and reference runs.  A
-            # tight growth step keeps the frozen cap (= SDPA key width every
-            # cycle) near the true bound instead of the 256-step round-up.
-            frozen_cap = 2 * prompt_len + max_new_tokens + 32
+            # Constant KV capacity = the TRUE per-slot bound: a slot admits at
+            # offset 0, prefills to prompt_len, then decodes at most max_new more
+            # (idle pin sits at prompt_len < cap).  prompt_len + max_new + a small
+            # lag margin; a tight growth step keeps the frozen cap (= the SDPA key
+            # width read EVERY cycle) near that bound, not a 256-step round-up.
+            frozen_cap = prompt_len + max_new_tokens + 16
             for rc in ragged_entries:
                 rc.step = 32
                 rc.freeze_capacity(frozen_cap)
