@@ -45,7 +45,6 @@ _FULL_ATTENTION_INDICES = tuple(
 _PRIMARY_STATE_START = 2
 _FINAL_STATE_START = _PRIMARY_STATE_START + _STATE_LEAVES
 _M1_FINAL_STATE_START = 2
-_MAX_REQUEST_CONTEXT = 12_288
 _FULL_ATTENTION_CACHE_STEP = 256
 _SHARED_M2_STEPS: dict[
     tuple[int, str],
@@ -435,7 +434,6 @@ class A3BK1TargetPrefixRoute:
             "speculative_headroom": 2,
             "growth_reserve_tokens": self.growth_reserve_tokens,
             "prompt_tokens": self.prompt_tokens,
-            "max_request_context": _MAX_REQUEST_CONTEXT,
             "capture_backend": "stock",
             "device_draft_input": True,
             "compiled_entry_count": 2,
@@ -540,8 +538,6 @@ def install_a3b_k1_target_prefix_route(
         "MTPLX_OWNED_RECURRENT_STATE"
     ):
         _fail("compiled A3B target-prefix conflicts with owned-state wrappers")
-    if int(prompt_tokens) + int(max_tokens) > _MAX_REQUEST_CONTEXT:
-        _fail("compiled A3B target-prefix request exceeds its installed context ceiling")
     if _compiled_verify_boundary() != "both" or not _compiled_verify_donation_enabled():
         _fail("compiled A3B target-prefix requires the measured donation boundary")
 
@@ -599,8 +595,6 @@ def _request_cache_capacity(*, prompt_tokens: int, max_tokens: int) -> int:
     needed = int(prompt_tokens) + int(max_tokens) + 2
     if int(prompt_tokens) <= 0 or int(max_tokens) <= 0:
         _fail("compiled A3B target-prefix preflight requires positive request geometry")
-    if needed - 2 > _MAX_REQUEST_CONTEXT:
-        _fail("compiled A3B target-prefix request exceeds its installed context ceiling")
     return (
         (needed + _FULL_ATTENTION_CACHE_STEP - 1) // _FULL_ATTENTION_CACHE_STEP
     ) * _FULL_ATTENTION_CACHE_STEP

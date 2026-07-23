@@ -764,3 +764,18 @@ def test_generation_exact_route_never_engages_under_grammar_constraint() -> None
         source.index("if rejection_correction is not None:", rejection_start)
     ]
     assert "committed.append(rejection_correction)" in exact_repair_block
+
+
+def test_no_hardcoded_context_ceiling() -> None:
+    # The compiled route sizes its KV state per request, so there is no
+    # global context cap: a batch-serving artifact (`_MAX_REQUEST_CONTEXT
+    # = 12_288`) that had leaked in was removed. A large-context request
+    # must admit and return a step-rounded capacity, not `_fail`.
+    assert not hasattr(a3b_target, "_MAX_REQUEST_CONTEXT")
+    source = inspect.getsource(a3b_target)
+    assert "installed context ceiling" not in source
+    capacity = a3b_target._request_cache_capacity(
+        prompt_tokens=60_000, max_tokens=4_096
+    )
+    step = a3b_target._FULL_ATTENTION_CACHE_STEP
+    assert capacity >= 60_000 + 4_096 and capacity % step == 0
