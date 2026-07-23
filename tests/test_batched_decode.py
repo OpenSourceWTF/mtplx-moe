@@ -1114,3 +1114,84 @@ def test_refill_instance_invariance() -> None:
     seq = [s.tokens for s in res.streams]
     assert seq[0] == seq[2] == seq[4]
     assert seq[1] == seq[3]
+
+
+# --------------------------------------------------------------------------- #
+# AR row-packing mode ([B,1] plain batched decode, decode_mode="ar")
+# --------------------------------------------------------------------------- #
+def test_ar_mode_validation() -> None:
+    with pytest.raises(ValueError, match="decode_mode"):
+        generate_greedy_batched(
+            _FakeRuntime(), _distinct_prompts(2), max_new_tokens=4,
+            decode_mode="bogus",
+        )
+
+
+def test_ar_matches_single_stream_references() -> None:
+    prompts = _distinct_prompts(4)
+    res = generate_greedy_batched(
+        _FakeRuntime(), prompts, max_new_tokens=16, cohort_slots=8,
+        decode_mode="ar",
+    )
+    ref = [
+        generate_greedy_batched(
+            _FakeRuntime(), [p], max_new_tokens=16, cohort_slots=8,
+            decode_mode="ar",
+        ).streams[0].tokens
+        for p in prompts
+    ]
+    records = diff_streams([s.tokens for s in res.streams], ref)
+    assert streams_all_match(records), records
+    # exactly 1 token/stream/cycle: forwards == cycles, and cycles is
+    # max_new + the pipeline's bounded lag.
+    assert res.forwards == res.cycles
+    assert 16 <= res.cycles <= 18
+    assert res.meta["decode_mode"] == "ar"
+
+
+def test_ar_matches_spec_committed_sequences() -> None:
+    # Greedy is decode-strategy-invariant: AR and spec commit the same tokens.
+    prompts = _distinct_prompts(4)
+    ar = generate_greedy_batched(
+        _FakeRuntime(), prompts, max_new_tokens=12, cohort_slots=4,
+        decode_mode="ar",
+    )
+    spec = generate_greedy_batched(
+        _FakeRuntime(), prompts, max_new_tokens=12, cohort_slots=4,
+        reject_mode="foldin",
+    )
+    assert [s.tokens for s in ar.streams] == [s.tokens for s in spec.streams]
+
+
+def test_ar_refill_serves_queue_and_matches_references() -> None:
+    total = 9
+    all_prompts = _distinct_prompts(total)
+    res = generate_greedy_batched(
+        _FakeRuntime(), all_prompts[:3], max_new_tokens=10, cohort_slots=4,
+        decode_mode="ar", refill_queue=all_prompts[3:],
+    )
+    assert len(res.streams) == total
+    ref = [
+        generate_greedy_batched(
+            _FakeRuntime(), [p], max_new_tokens=10, cohort_slots=4,
+            decode_mode="ar", refill_queue=[],
+        ).streams[0].tokens
+        for p in all_prompts
+    ]
+    records = diff_streams([s.tokens for s in res.streams], ref)
+    assert streams_all_match(records), records
+    assert res.meta["admission_passes"] >= 2
+    assert res.meta["refill"] is True
+
+
+def test_ar_refill_with_stops() -> None:
+    total = 6
+    all_prompts = _distinct_prompts(total)
+    stop_at = {all_prompts[i][0]: 2 + i for i in range(total)}
+    res = generate_greedy_batched(
+        _FakeRuntime(stop_at=stop_at), all_prompts[:2], max_new_tokens=20,
+        cohort_slots=2, decode_mode="ar", refill_queue=all_prompts[2:],
+        stop_token_ids={STOP_ID},
+    )
+    assert len(res.streams) == total
+    assert all(s.finish_reason == "stop" for s in res.streams)

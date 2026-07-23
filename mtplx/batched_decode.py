@@ -293,6 +293,101 @@ def _eval_bundle(bundle: Any) -> tuple[list[int], list[int], list[int], list[int
     )
 
 
+def _run_ar_loop(
+    rt: Any,
+    *,
+    cache: Any,
+    batch: int,
+    logits_last: Any,
+    hidden_last: Any,
+    max_new_tokens: int,
+    done: list[bool],
+    commit: Any,
+    admit_fn: Any = None,
+    work_remaining: Any = None,
+    max_cycles: int | None = None,
+    pin_idle_offsets: int | None = None,
+) -> tuple[int, int, int, int]:
+    """Plain batched AR decode: one ``[B,1]`` forward per cycle, 1 tok/stream.
+
+    The ROW-PACKING aggregate lane.  Speculative K=1 verify spends 2 rows per
+    stream for a per-row cadence of ``1/(2-a) <= 1`` token/row/cycle; plain AR
+    packs one stream per row at exactly 1 token/row/cycle — so at the fixed
+    16-row lane budget, 16 AR streams beat 8 spec streams on AGGREGATE for any
+    accept < 1, while spec remains the per-request LATENCY SKU.  Same pipelined
+    single-sync structure, ragged per-row KV, admission hooks, and idle-offset
+    pin as the fold-in loop; no draft, no verify decision, no replay, no
+    snapshot/restore.  Returns ``(cycles, forwards, 0, 0)``.
+    """
+    import mlx.core as mx
+
+    from mtplx.attention_context import attention_phase
+    from mtplx.ragged_kv_cache import RaggedBatchKVCache
+
+    ragged = [e for e in cache if isinstance(e, RaggedBatchKVCache)]
+
+    def _submit(ll: Any) -> dict[str, Any]:
+        x_ids = mx.argmax(ll, axis=-1)  # [batch]
+        if pin_idle_offsets is not None and ragged and any(done):
+            idle_dev = mx.array(list(done))
+            pin_off = mx.full((batch,), int(pin_idle_offsets), dtype=mx.int32)
+            for rc in ragged:
+                rc.offsets = mx.where(idle_dev, pin_off, rc.offsets).astype(mx.int32)
+        for rc in ragged:
+            rc.reserve(1)
+        with attention_phase("decode_verify"):
+            v_logits, v_hidden = rt.forward_ar(
+                mx.expand_dims(x_ids, axis=1), cache=cache, return_hidden=True
+            )
+        return {
+            "x": x_ids,
+            "v_logits": v_logits,
+            "next_ll": v_logits[:, -1, :],
+            "next_hl": v_hidden[:, -1:, :],
+        }
+
+    def _read(sub: dict[str, Any]) -> list[int]:
+        nonlocal forwards
+        mx.eval(sub["x"])  # THE one blocking sync
+        forwards += 1
+        return [int(t) for t in sub["x"].tolist()]
+
+    forwards = 0
+    if max_cycles is None:
+        max_cycles = max_new_tokens + 2
+    _more = work_remaining if work_remaining is not None else (lambda: not all(done))
+    flags_stub = [False] * batch  # admit_fn clears replay flags; AR has none
+    pending: list[int] | None = None
+
+    def _flush() -> None:
+        nonlocal pending
+        if pending is not None:
+            for b in range(batch):
+                commit(b, pending[b])
+            pending = None
+
+    sub = _submit(logits_last)
+    mx.async_eval(sub["x"], sub["v_logits"])
+    pending = _read(sub)
+    logits_last, hidden_last = sub["next_ll"], sub["next_hl"]
+    cycles = 1
+
+    while _more() and cycles < max_cycles:
+        if admit_fn is not None:
+            logits_last, hidden_last = admit_fn(
+                logits_last, hidden_last, flags_stub, _flush
+            )
+        sub = _submit(logits_last)
+        mx.async_eval(sub["x"], sub["v_logits"])
+        _flush()  # commit the previous cycle (one-cycle lag)
+        pending = _read(sub)
+        logits_last, hidden_last = sub["next_ll"], sub["next_hl"]
+        cycles += 1
+
+    _flush()
+    return cycles, forwards, 0, 0
+
+
 def _run_foldin_loop(
     rt: Any,
     *,
@@ -617,6 +712,7 @@ def generate_greedy_batched(
     serial: bool | None = None,
     reject_mode: str | None = None,
     refill_queue: list[list[int]] | None = None,
+    decode_mode: str = "spec",
 ) -> BatchedDecodeResult:
     """Greedy multi-stream batched decode.
 
@@ -679,6 +775,13 @@ def generate_greedy_batched(
     candidate and reference runs has identical shapes (the §47 discipline
     extended to admission).  Results report one stream per REQUEST; admission
     passes are counted in ``meta['admission_passes']`` (not ``forwards``).
+
+    DECODE MODE (``decode_mode``).  ``"spec"`` (default) is everything above.
+    ``"ar"`` selects the plain batched AR loop (:func:`_run_ar_loop`): one
+    ``[B,1]`` row per stream, no draft/verify — the ROW-PACKING aggregate lane
+    (16 AR streams in the 16-row budget beat 8 spec streams on aggregate for
+    any accept < 1; spec stays the latency SKU).  AR runs on the same ragged
+    fold-in cache and supports the same cohort gate and ``refill_queue``.
     """
     import mlx.core as mx
 
@@ -731,12 +834,17 @@ def generate_greedy_batched(
         )
     stop = {int(t) for t in (stop_token_ids or set())}
 
+    decode_mode = str(decode_mode).strip().lower()
+    if decode_mode not in ("spec", "ar"):
+        raise ValueError(f"decode_mode must be 'spec' or 'ar', got {decode_mode!r}")
+    ar_mode = decode_mode == "ar"
+
     refill = refill_queue is not None
     if refill:
-        if reject_mode != "foldin":
+        if not ar_mode and reject_mode != "foldin":
             raise ValueError(
-                "refill_queue requires reject_mode='foldin' (the ragged per-row "
-                "offset lane is what admission resets)"
+                "refill_queue requires reject_mode='foldin' or decode_mode='ar' "
+                "(the ragged per-row offset lane is what admission resets)"
             )
         if cohort_slots is None:
             raise ValueError(
@@ -830,7 +938,7 @@ def generate_greedy_batched(
     started_decode = time.perf_counter()
 
     admission_passes = 0
-    if reject_mode == "foldin":
+    if ar_mode or reject_mode == "foldin":
         # ================= FOLD-IN REPLAY LOOP (R3, scheme §2.2) ================
         # ONE [B,2] pass per cycle, no separate repair forward.  Per-row mode from
         # last cycle's accept mask; all row-mode selection (tokens, write_start,
@@ -939,24 +1047,40 @@ def generate_greedy_batched(
                 return next_req < len(requests) or not all(done)
 
             max_cycles_override = (max_new_tokens + 4) * max(1, len(requests))
-        cycles, forwards, all_accept_cycles, replay_rows = _run_foldin_loop(
-            rt,
-            cache=foldin_cache,
-            batch=batch,
-            n_real=n_real,
-            real_slots=real_slots,
-            logits_last=logits_last,
-            hidden_last=hidden_last,
-            use_mtp_draft=use_mtp_draft,
-            max_new_tokens=max_new_tokens,
-            done=done,
-            commit=_commit,
-            verify_shape_ok=_verify_shape_ok,
-            admit_fn=admit_fn,
-            work_remaining=work_remaining,
-            max_cycles=max_cycles_override,
-            pin_idle_offsets=(prompt_len if refill else None),
-        )
+        if ar_mode:
+            cycles, forwards, all_accept_cycles, replay_rows = _run_ar_loop(
+                rt,
+                cache=foldin_cache,
+                batch=batch,
+                logits_last=logits_last,
+                hidden_last=hidden_last,
+                max_new_tokens=max_new_tokens,
+                done=done,
+                commit=_commit,
+                admit_fn=admit_fn,
+                work_remaining=work_remaining,
+                max_cycles=max_cycles_override,
+                pin_idle_offsets=(prompt_len if refill else None),
+            )
+        else:
+            cycles, forwards, all_accept_cycles, replay_rows = _run_foldin_loop(
+                rt,
+                cache=foldin_cache,
+                batch=batch,
+                n_real=n_real,
+                real_slots=real_slots,
+                logits_last=logits_last,
+                hidden_last=hidden_last,
+                use_mtp_draft=use_mtp_draft,
+                max_new_tokens=max_new_tokens,
+                done=done,
+                commit=_commit,
+                verify_shape_ok=_verify_shape_ok,
+                admit_fn=admit_fn,
+                work_remaining=work_remaining,
+                max_cycles=max_cycles_override,
+                pin_idle_offsets=(prompt_len if refill else None),
+            )
     elif serial:
         # ================= EXACT PHASE-1 SERIAL LOOP (A/B baseline) =============
         # 4-5 blocking syncs per cycle; behaviour identical to the original driver
@@ -1120,7 +1244,11 @@ def generate_greedy_batched(
     foldin = reject_mode == "foldin"
     meta: dict[str, Any] = {}
     if collect_stats:
-        if foldin:
+        if ar_mode:
+            loop_name = "ar_batched_single_sync"
+            scheme_name = "ar_row_packed"
+            lane_name = "ragged_batch_kv+stock_attention"
+        elif foldin:
             loop_name = "foldin_replay_single_sync"
             scheme_name = "foldin_replay_ragged_kv"
             lane_name = "ragged_batch_kv+stock_attention"
@@ -1139,8 +1267,9 @@ def generate_greedy_batched(
             "real_streams": n_real,
             # fold-in and the pipelined repair loop both hold to one bundle sync
             # per cycle; the serial A/B baseline is multi-sync.
-            "syncs_per_cycle": None if (serial and not foldin) else 1,
+            "syncs_per_cycle": None if (serial and not foldin and not ar_mode) else 1,
             "replay_rows": int(replay_rows),
+            "decode_mode": decode_mode,
             "refill": bool(refill),
             "requests": len(requests),
             "admission_passes": int(admission_passes),
