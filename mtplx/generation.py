@@ -8731,30 +8731,27 @@ def generate_mtpk(
                 )
                 event["capture_repair"] = "trimmed_prefix_commit"
             else:
-                started = time.perf_counter()
-                with attention_phase("decode_verify"):
-                    if compiled_verify_bank is not None:
-                        repair_logits, repair_hidden, _repair_captures = (
-                            compiled_verify_bank.forward_ar_capture(
-                                mx.array([[int(rejection_correction)]]),
-                                cache=cache,
-                                return_hidden=True,
-                                hidden_variant=base_hidden_variant,
-                            )
-                        )
-                    else:
-                        repair_logits, repair_hidden = rt.forward_ar(
-                            mx.array([[int(rejection_correction)]]),
-                            cache=cache,
-                            return_hidden=True,
-                            hidden_variant=base_hidden_variant,
-                        )
-                _eval(repair_logits, repair_hidden)
-                elapsed_repair = time.perf_counter() - started
-                target_time += elapsed_repair
-                repair_time += elapsed_repair
-                _add_timing(event, "repair_forward", elapsed_repair)
-                event["capture_repair"] = "trimmed_prefix_correction_forward"
+                # Deferred correction repair (the 2.3.0 capture-commit fix,
+                # ported to the trim lane): the correction is emitted now and
+                # becomes the pending primary, whose KV is computed by
+                # whichever forward runs next -- no dedicated one-row
+                # correction forward.  Drafting needs the hidden of the token
+                # BEFORE the pending primary, which is exactly the retained
+                # verify row at the rejection boundary; the trim commit
+                # already restored the cache to the committed prefix, the
+                # same state the old correction forward ran on.
+                repair_logits, repair_hidden = own_live_logits_hidden(
+                    verify_logits[
+                        :, committed_prefix_len - 1 : committed_prefix_len, :
+                    ],
+                    verify_hidden[
+                        :, committed_prefix_len - 1 : committed_prefix_len, :
+                    ],
+                )
+                pending_primary = int(rejection_correction)
+                deferred_correction_repairs += 1
+                event["capture_repair"] = "trimmed_prefix_pending_correction"
+                event["pending_primary"] = int(rejection_correction)
         else:
             if before_verify is None:
                 raise RuntimeError(

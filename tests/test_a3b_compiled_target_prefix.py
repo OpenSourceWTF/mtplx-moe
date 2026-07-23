@@ -304,6 +304,25 @@ def test_takeover_lane_uses_draft_source_not_block_rounds() -> None:
     assert streak > 0
 
 
+def test_trim_lane_defers_correction_repairs() -> None:
+    # The 2.3.0 deferred-correction fix, ported to the trim (target_prefix)
+    # lane: a rejection must emit the correction as the pending primary and
+    # never pay a dedicated one-row correction forward.
+    from mtplx import generation
+
+    source = inspect.getsource(generation.generate_mtpk)
+    assert "trimmed_prefix_pending_correction" in source
+    assert "trimmed_prefix_correction_forward" not in source
+    trim_branch = source[
+        source.index("elif committed_from_trim:"):
+        source.index('event["capture_repair"] = "trimmed_prefix_pending_correction"')
+    ]
+    assert "forward_ar" not in trim_branch
+    assert "deferred_correction_repairs += 1" in source[
+        source.index("elif committed_from_trim:"):
+    ]
+
+
 def test_route_records_rejection_correction_under_greedy() -> None:
     # The compiled route commits + repair-forwards the rejection correction
     # in-cycle (fixed 2-token geometry); the greedy lane's defer-to-next-cycle
