@@ -193,6 +193,88 @@ def test_batch_invariance_under_force_unsorted_flag(monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# (c) FIXED-SHAPE per-row independence -- the property the batched-decode
+#     fixed-shape sha gate rests on.  At an IDENTICAL total row count (so the
+#     kernel picks one dispatch), a row's forward output depends ONLY on its own
+#     content and NOT on which other rows share the batch or where it sits.  That
+#     is exactly what lets "stream b batched among real prompts" be compared
+#     BITWISE to "stream b alone in a cohort of the same slot count" (the gate).
+#     Checked on the default (Metal) device with the force-unsorted pin so the
+#     MoE takes one numerical path regardless of row count.
+# --------------------------------------------------------------------------
+def test_fixed_shape_quantized_matmul_row_independence():
+    """A dense affine-quantized projection (the attn/router/lm_head shape) is,
+    at a FIXED row count, per-row independent and row-permutation invariant --
+    BITWISE.  Uses 16 rows = the B=8 cohort operating point (2 rows/stream)."""
+    mx.random.seed(0)
+    k, n, rows = 128, 64, 16  # 16 = 2 * 8-slot cohort
+    weight = mx.random.normal((n, k))
+    w_q, scales, biases = mx.quantize(weight, group_size=GROUP_SIZE, bits=BITS)
+
+    def qmm(x):
+        return mx.quantized_matmul(
+            x, w_q, scales=scales, biases=biases,
+            transpose=True, group_size=GROUP_SIZE, bits=BITS,
+        )
+
+    x = mx.random.normal((rows, k))
+    out = qmm(x)
+    # (a) change every row EXCEPT row 0 -> row 0's output is byte-identical.
+    x_other = mx.concatenate([x[:1], mx.random.normal((rows - 1, k))], axis=0)
+    out_other = qmm(x_other)
+    mx.eval(out, out_other)
+    assert mx.array_equal(out[0], out_other[0])  # BITWISE, default device
+
+    # (b) permuting the rows permutes the output identically -- byte-for-byte, so
+    #     the same content at slot 0 vs slot b yields the same row.
+    perm = mx.array(sorted(range(rows), key=lambda i: (i * 7 + 3) % rows))
+    out_perm = qmm(x[perm])
+    mx.eval(out_perm)
+    assert mx.array_equal(out_perm, out[perm])
+
+
+def test_fixed_shape_packed_switch_glu_row_independence(monkeypatch):
+    """Under the force-unsorted pin, the routed MoE (:class:`PackedSwitchGLU`) is,
+    at a FIXED row count that WOULD otherwise sort (``indices.size == 64``),
+    per-row independent and row-permutation invariant -- BITWISE.  This closes the
+    per-row-independence assumption for the one op whose sort path made B>=4
+    batch-variant in the first place (§7)."""
+    monkeypatch.setenv(FORCE_UNSORTED_ENV, "1")
+    moe_force_unsorted_enabled.cache_clear()
+
+    block = _make_block(quantized=True)  # default device (Metal)
+    switch_mlp = block.switch_mlp
+    result = _pack_pair(switch_mlp.gate_proj, switch_mlp.up_proj, axis=1)
+    assert not isinstance(result, str), result
+    packed, split_at = result
+    fused = PackedSwitchGLU(
+        packed, switch_mlp.down_proj, switch_mlp.activation, split_at
+    )
+
+    mx.random.seed(101)
+    rows, top_k = 8, 8
+    x = mx.random.normal((rows, HIDDEN))
+    indices = (
+        mx.arange(rows).reshape(rows, 1) + mx.arange(top_k).reshape(1, top_k)
+    ) % NUM_EXPERTS
+    assert int(indices.size) == 64  # crosses do_sort; the pin keeps it unsorted
+    out = fused(x, indices)
+
+    # (a) change every row EXCEPT row 0's content AND routing -> row 0 unchanged.
+    x_other = mx.concatenate([x[:1], mx.random.normal((rows - 1, HIDDEN))], axis=0)
+    idx_other = mx.concatenate([indices[:1], (indices[1:] + 1) % NUM_EXPERTS], axis=0)
+    out_other = fused(x_other, idx_other)
+    mx.eval(out, out_other)
+    assert mx.array_equal(out[0], out_other[0])  # BITWISE, default device
+
+    # (b) row-permutation invariance -- byte-for-byte.
+    perm = mx.array(sorted(range(rows), key=lambda i: (i * 5 + 2) % rows))
+    out_perm = fused(x[perm], indices[perm])
+    mx.eval(out_perm)
+    assert mx.array_equal(out_perm, out[perm])
+
+
+# --------------------------------------------------------------------------
 # Flag plumbing (truthy-set convention, matching batched_decode_enabled).
 # --------------------------------------------------------------------------
 def test_force_unsorted_flag_parsing(monkeypatch):

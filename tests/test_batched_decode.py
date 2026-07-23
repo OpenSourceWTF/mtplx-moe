@@ -16,9 +16,12 @@ from __future__ import annotations
 import mlx.core as mx
 import pytest
 
+import mtplx.batched_decode as bd
 from mtplx.batched_decode import (
     BATCHED_DECODE_ENV,
+    BATCHED_DECODE_SERIAL_ENV,
     batched_decode_enabled,
+    batched_decode_serial,
     diff_streams,
     generate_greedy_batched,
     left_pad_prompts,
@@ -278,6 +281,194 @@ def test_output_is_draft_independent() -> None:
         [s.tokens for s in without_draft.streams],
     )
     assert streams_all_match(records), records
+
+
+# --------------------------------------------------------------------------- #
+# Build-1: fixed-shape cohort padding
+# --------------------------------------------------------------------------- #
+def test_cohort_padding_matches_explicit_dummies() -> None:
+    """cohort_slots=N with M real prompts is EQUIVALENT to appending N-M explicit
+    dummy prompts and slicing the first M — the internal padding is exactly a
+    fixed pad-token prompt of the shared length, and dummy slots commit nothing.
+    (Pure driver logic on the row-isolated fake runtime.)"""
+    prompts = _distinct_prompts(3)
+    prompt_len = len(prompts[0])
+    pad_id = 0
+    res_cohort = generate_greedy_batched(
+        _FakeRuntime(), prompts, max_new_tokens=16, cohort_slots=8, pad_id=pad_id
+    )
+    dummy = [pad_id] * prompt_len
+    explicit = prompts + [list(dummy) for _ in range(5)]
+    res_explicit = generate_greedy_batched(_FakeRuntime(), explicit, max_new_tokens=16)
+
+    # Results report REAL streams only.
+    assert len(res_cohort.streams) == 3
+    assert res_cohort.batch_size == 3
+    assert [s.index for s in res_cohort.streams] == [0, 1, 2]
+    records = diff_streams(
+        [s.tokens for s in res_cohort.streams],
+        [s.tokens for s in res_explicit.streams[:3]],
+    )
+    assert streams_all_match(records), records
+    # Dummy slots contributed nothing to the reported / generated totals.
+    assert res_cohort.generated_tokens == sum(
+        len(s.tokens) for s in res_cohort.streams
+    )
+    assert res_cohort.meta["cohort_slots"] == 8
+    assert res_cohort.meta["real_streams"] == 3
+
+
+def test_cohort_slots_below_real_count_rejected() -> None:
+    with pytest.raises(ValueError, match="cohort_slots"):
+        generate_greedy_batched(
+            _FakeRuntime(), _distinct_prompts(4), max_new_tokens=4, cohort_slots=2
+        )
+
+
+def test_cohort_fixed_shape_gate_reference() -> None:
+    """The harness's fixed-shape gate, on the fake: real stream b in an N-slot
+    cohort of real prompts equals prompt b ALONE in an N-slot cohort (1 real +
+    N-1 dummies).  Only the OTHER rows' content differs — the row-isolated fake
+    proves the driver never leaks it across slots (the real per-row-independence
+    claim is the Metal test in ``test_moe_force_unsorted``)."""
+    prompts = _distinct_prompts(8)
+    slots = 8
+    res = generate_greedy_batched(
+        _FakeRuntime(), prompts, max_new_tokens=20, cohort_slots=slots
+    )
+    references: list[list[int]] = []
+    for prompt in prompts:
+        ref = generate_greedy_batched(
+            _FakeRuntime(), [prompt], max_new_tokens=20, cohort_slots=slots
+        )
+        assert len(ref.streams) == 1  # only the one real stream is reported
+        references.append(ref.streams[0].tokens)
+    records = diff_streams([s.tokens for s in res.streams], references)
+    assert streams_all_match(records), records
+
+
+# --------------------------------------------------------------------------- #
+# Build-1: pipelined single-sync loop == serial Phase-1 loop
+# --------------------------------------------------------------------------- #
+def _pattern_case(pattern: str):
+    """(prompts, rt_kwargs, decode_kwargs) for each accept/reject/stop pattern."""
+    if pattern == "all_accept":
+        return _distinct_prompts(6), {}, {"max_new_tokens": 20}
+    if pattern == "all_reject":
+        prompts = _distinct_prompts(4)
+        return prompts, {"broken_rids": {p[0] for p in prompts}}, {"max_new_tokens": 20}
+    if pattern == "mixed":
+        prompts = _distinct_prompts(6)
+        return (
+            prompts,
+            {"broken_rids": {prompts[b][0] for b in (1, 3, 5)}},
+            {"max_new_tokens": 24},
+        )
+    if pattern == "stop":
+        prompts = _distinct_prompts(4)
+        return (
+            prompts,
+            {"stop_at": {prompts[b][0]: 3 + 4 * b for b in range(4)}},
+            {"max_new_tokens": 64, "stop_token_ids": {STOP_ID}},
+        )
+    if pattern == "length_odd":
+        return _distinct_prompts(3), {}, {"max_new_tokens": 7}
+    raise AssertionError(pattern)
+
+
+@pytest.mark.parametrize(
+    "pattern", ["all_accept", "all_reject", "mixed", "stop", "length_odd"]
+)
+def test_pipelined_loop_matches_serial(pattern: str) -> None:
+    """The load-bearing regression: the pipelined (single-sync) loop and the
+    serial Phase-1 loop commit the IDENTICAL tokens and finish reasons — the
+    parallelization is a pure SCHEDULING change.  Repair/accept classification is
+    identical too; only the cycle count may grow by the bounded deferred-commit
+    lag."""
+    prompts, rt_kwargs, decode_kwargs = _pattern_case(pattern)
+    res_par = generate_greedy_batched(
+        _FakeRuntime(**rt_kwargs), prompts, serial=False, **decode_kwargs
+    )
+    res_ser = generate_greedy_batched(
+        _FakeRuntime(**rt_kwargs), prompts, serial=True, **decode_kwargs
+    )
+    assert [s.tokens for s in res_par.streams] == [s.tokens for s in res_ser.streams]
+    assert [s.finish_reason for s in res_par.streams] == [
+        s.finish_reason for s in res_ser.streams
+    ]
+    assert res_par.generated_tokens == res_ser.generated_tokens
+    # Scheduling-only: the pipeline never commits FEWER cycles than serial and
+    # over-runs by at most the bounded deferred-commit lag (<=2 garbage cycles).
+    assert res_ser.cycles <= res_par.cycles <= res_ser.cycles + 2
+    assert res_par.meta["loop"] == "pipelined_single_sync"
+    assert res_ser.meta["loop"] == "serial"
+
+
+@pytest.mark.parametrize("cohort_stop", [False, True])
+def test_pipelined_matches_serial_in_cohort_mode(cohort_stop: bool) -> None:
+    """Loops agree with dummy slots present (dummies masked from repair), for
+    both a rejecting-stream pattern and RAGGED per-stream STOP — the latter
+    exercises real streams finishing at different cycles WHILE dummies occupy the
+    rest of the fixed-shape cohort."""
+    prompts = _distinct_prompts(3)
+    kw: dict = {"cohort_slots": 8}
+    if cohort_stop:
+        rt_kwargs = {"stop_at": {prompts[b][0]: 2 + 3 * b for b in range(3)}}  # 2,5,8
+        kw.update(max_new_tokens=40, stop_token_ids={STOP_ID})
+    else:
+        rt_kwargs = {"broken_rids": {prompts[1][0]}}  # one rejecting real stream
+        kw.update(max_new_tokens=18)
+    res_par = generate_greedy_batched(_FakeRuntime(**rt_kwargs), prompts, serial=False, **kw)
+    res_ser = generate_greedy_batched(_FakeRuntime(**rt_kwargs), prompts, serial=True, **kw)
+    assert [s.tokens for s in res_par.streams] == [s.tokens for s in res_ser.streams]
+    assert [s.finish_reason for s in res_par.streams] == [
+        s.finish_reason for s in res_ser.streams
+    ]
+    if cohort_stop:
+        # Every real stream stopped at its own scheduled point (ragged), inside a
+        # fixed-shape cohort padded to 8 slots.
+        assert all(s.finish_reason == "stop" for s in res_par.streams)
+        assert len({len(s.tokens) for s in res_par.streams}) == 3
+
+
+# --------------------------------------------------------------------------- #
+# Build-1: single-sync accounting
+# --------------------------------------------------------------------------- #
+def test_pipelined_one_blocking_sync_per_cycle(monkeypatch) -> None:
+    """The pipelined loop reads the GPU exactly ONCE per cycle: it calls the
+    ``_eval_bundle`` seam once per cycle and nothing else blocks on the critical
+    path.  The serial loop never touches that seam."""
+    calls = {"n": 0}
+    real_eval_bundle = bd._eval_bundle
+
+    def _counting(bundle):
+        calls["n"] += 1
+        return real_eval_bundle(bundle)
+
+    monkeypatch.setattr(bd, "_eval_bundle", _counting)
+
+    res = generate_greedy_batched(
+        _FakeRuntime(), _distinct_prompts(4), max_new_tokens=16, serial=False
+    )
+    assert calls["n"] == res.cycles  # exactly one bundle readback per cycle
+    assert res.meta["syncs_per_cycle"] == 1
+
+    calls["n"] = 0
+    res_ser = generate_greedy_batched(
+        _FakeRuntime(), _distinct_prompts(4), max_new_tokens=16, serial=True
+    )
+    assert calls["n"] == 0  # serial loop uses _argmax_ids, never the bundle seam
+    assert res_ser.meta["syncs_per_cycle"] is None
+
+
+def test_serial_env_selects_serial_loop(monkeypatch) -> None:
+    assert batched_decode_serial({}) is False
+    assert batched_decode_serial({BATCHED_DECODE_SERIAL_ENV: "1"}) is True
+    monkeypatch.setenv(BATCHED_DECODE_SERIAL_ENV, "1")
+    res = generate_greedy_batched(
+        _FakeRuntime(), _distinct_prompts(3), max_new_tokens=8
+    )
+    assert res.meta["loop"] == "serial"  # env fallback, no explicit serial= arg
 
 
 # --------------------------------------------------------------------------- #
