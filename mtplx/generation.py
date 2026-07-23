@@ -6734,6 +6734,7 @@ def generate_mtpk(
     _cc_src_check_from = 0
     _cc_streak_drafted = 0
     _cc_streak_accepted = 0
+    _cc_streak_outstanding = 0  # substituted drafts not yet seen by the sync
     ccopy_index = None
     ccopy_k = context_copy_block_k()
     ccopy_min_ext = context_copy_min_ext()
@@ -6940,10 +6941,17 @@ def generate_mtpk(
                         prompt_ids[_cc_src_idx]
                     ):
                         _cc_src_idx += 1
-                        _cc_streak_accepted += 1
-                        ccopy_accepted += 1
+                        # Acceptance stats count only tokens WE drafted; a
+                        # bonus/primary token that happens to continue the
+                        # prompt match advances the streak but is the
+                        # verify's own win, not copy acceptance.
+                        if _cc_streak_outstanding > 0:
+                            _cc_streak_outstanding -= 1
+                            _cc_streak_accepted += 1
+                            ccopy_accepted += 1
                     else:
                         _cc_src_idx = None
+                        _cc_streak_outstanding = 0
                         break
                 if _cc_src_idx is not None and _cc_src_idx >= len(prompt_ids):
                     _cc_src_idx = None
@@ -6978,6 +6986,7 @@ def generate_mtpk(
                     _cc_src_idx = int(_cc_pos)
                     _cc_streak_drafted = 0
                     _cc_streak_accepted = 0
+                    _cc_streak_outstanding = 0
                     ccopy_rounds += 1
                     event["context_copy"] = {
                         "mode": "draft_source",
@@ -7215,6 +7224,7 @@ def generate_mtpk(
         ):
             _cc_draft_source_token = int(prompt_ids[_cc_src_idx])
             _cc_streak_drafted += 1
+            _cc_streak_outstanding += 1
             ccopy_drafted += 1
 
         used_device_d2_core = False
