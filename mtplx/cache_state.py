@@ -3476,6 +3476,46 @@ def snapshot_untrimmable_cache(cache: list[Any]) -> CacheSnapshot:
     return CacheSnapshot(states=tuple(states), meta_states=tuple(meta_states))
 
 
+def snapshot_untrimmable_cache_lazy(cache: list[Any]) -> CacheSnapshot:
+    """Zero-copy-view variant of :func:`snapshot_untrimmable_cache`.
+
+    Identical entry selection (trimmable KV -> ``None``; recurrent/non-trimmable
+    -> captured), but each recurrent leaf is retained as a lazy view
+    (:func:`_lazy_state_view`, ``value[...]``, zero kernel) instead of a
+    materialized clone (:func:`_clone_tree`, ``value + mx.zeros`` -- a full
+    device copy of the whole batch's GDN matrix state every cycle).
+
+    COW-safety basis (why the view can never be mutated behind our back on the
+    fold-in loop):
+
+    * The GDN forward REBINDS the recurrent cache slots
+      (``cache[idx] = new_state``; ``gdn_capture.py`` ->
+      ``OwnedRecurrentStateCache.__setitem__``) rather than writing in place, so
+      advancing the state leaves the retained view pointing at the pre-forward
+      array's value.
+    * The per-row REPLAY rewind (:func:`restore_untrimmable_cache_masked` ->
+      ``OwnedRecurrentStateCache.restore_masked``) also REBINDS via a fresh
+      ``mx.where`` expression, never a setitem into the snapshot's buffer.
+
+    Only the authoritative commit path (``replace_state`` / ``_own_value``'s
+    in-place ``target[:] = value``) writes a recurrent buffer in place, and that
+    path is not on the fold-in decode forward.  Meta-states are tiny string
+    tuples and are still cloned.  :func:`snapshot_untrimmable_cache` (eager) is
+    left byte-for-byte unchanged for every other caller (serial/pipelined
+    scalar-repair lanes, ``generation.py``).
+    """
+    states = []
+    meta_states = []
+    for entry in cache:
+        if _is_trimmable(entry):
+            states.append(None)
+            meta_states.append(None)
+        else:
+            states.append(_lazy_state_view(getattr(entry, "state", None)))
+            meta_states.append(_clone_tree(getattr(entry, "meta_state", None)))
+    return CacheSnapshot(states=tuple(states), meta_states=tuple(meta_states))
+
+
 def restore_cache(
     cache: list[Any],
     snapshot: CacheSnapshot,

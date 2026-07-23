@@ -81,6 +81,11 @@ BATCHED_DECODE_SERIAL_ENV = "MTPLX_A3B_BATCHED_DECODE_SERIAL"
 # separate repair forward), its recurrent state rewound per-row.  Env fallback;
 # the ``reject_mode=`` argument overrides it when passed explicitly.
 BATCHED_DECODE_REJECT_ENV = "MTPLX_A3B_BATCHED_DECODE_REJECT"
+# Fallback knob (default OFF): restore the legacy eager clone snapshot for the
+# fold-in loop's per-cycle recurrent snapshot.  The default (OFF) uses the lazy
+# zero-copy view snapshot (COW-safe: the GDN forward and the masked REPLAY
+# rewind both rebind cache slots, never mutate a snapshot buffer in place).
+FOLDIN_CLONE_SNAPSHOT_ENV = "MTPLX_A3B_FOLDIN_CLONE_SNAPSHOT"
 _TRUTHY = {"1", "true", "yes", "on"}
 _REJECT_MODES = {"repair", "foldin"}
 
@@ -120,6 +125,20 @@ def batched_decode_reject_mode(environ: dict[str, str] | None = None) -> str:
     env = os.environ if environ is None else environ
     value = str(env.get(BATCHED_DECODE_REJECT_ENV, "")).strip().lower()
     return value if value in _REJECT_MODES else "repair"
+
+
+def foldin_clone_snapshot(environ: dict[str, str] | None = None) -> bool:
+    """True iff the fold-in loop must use the legacy EAGER clone snapshot.
+
+    From ``MTPLX_A3B_FOLDIN_CLONE_SNAPSHOT``.  Default (False) selects the lazy
+    zero-copy view snapshot for the per-cycle recurrent snapshot (the new
+    default); setting the env truthy restores the ``_clone_tree`` materialization
+    as a fallback.  Fail-closed to the fast (lazy) path.  Affects ONLY the
+    fold-in loop -- the serial/pipelined scalar-repair lanes keep the eager
+    ``snapshot_untrimmable_cache`` unchanged.
+    """
+    env = os.environ if environ is None else environ
+    return str(env.get(FOLDIN_CLONE_SNAPSHOT_ENV, "")).strip().lower() in _TRUTHY
 
 
 # --------------------------------------------------------------------------- #
@@ -321,8 +340,21 @@ def _run_foldin_loop(
     from mtplx.cache_state import (
         restore_untrimmable_cache_masked,
         snapshot_untrimmable_cache,
+        snapshot_untrimmable_cache_lazy,
     )
     from mtplx.ragged_kv_cache import RaggedBatchKVCache
+
+    # FIX 2: the fold-in per-cycle recurrent snapshot uses the lazy zero-copy
+    # view by default (COW-safe -- the GDN forward and the masked REPLAY rewind
+    # both rebind cache slots, never mutate a snapshot buffer in place), which
+    # drops the whole-batch GDN-matrix clone every cycle.  The env fallback
+    # restores the eager clone.  Resolved once per decode so the per-cycle hot
+    # path is a plain call.
+    _snapshot_untrimmable = (
+        snapshot_untrimmable_cache
+        if foldin_clone_snapshot()
+        else snapshot_untrimmable_cache_lazy
+    )
 
     ragged = [e for e in cache if isinstance(e, RaggedBatchKVCache)]
     # Dummy slots (indices >= n_real) NEVER replay -- they stay inert SPEC rows.
@@ -356,10 +388,16 @@ def _run_foldin_loop(
             rc.reserve(2)
         # 3b. recurrent REPLAY rewind: revert replay rows to the pre-verify snapshot
         #     of the cycle they missed (prev cycle's snapshot).
-        if prev_snapshot is not None:
+        # FIX 1: skip the whole-batch masked restore when NO real row replays --
+        # ``replay_flags`` already comes from the single per-cycle bundle sync
+        # (dummy slots forced OFF), so this adds no new sync.  An all-False mask
+        # restore is mathematically ``mx.where(False, snap, cur) == cur``, i.e. a
+        # byte-identical no-op, so gating it out cannot change the committed
+        # sequence -- it only elides ~158 us/layer of pointless mx.where rebinds.
+        if prev_snapshot is not None and any(replay_flags):
             restore_untrimmable_cache_masked(cache, prev_snapshot, replay_flags)
         # 4. snapshot the (rewound) recurrent state for THIS cycle's potential miss.
-        snapshot = snapshot_untrimmable_cache(cache)
+        snapshot = _snapshot_untrimmable(cache)
         # 5. the one [B,2] forward.
         with attention_phase("decode_verify"):
             v_logits, v_hidden = rt.forward_ar(inp, cache=cache, return_hidden=True)

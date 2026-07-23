@@ -21,10 +21,12 @@ from mtplx.batched_decode import (
     BATCHED_DECODE_ENV,
     BATCHED_DECODE_REJECT_ENV,
     BATCHED_DECODE_SERIAL_ENV,
+    FOLDIN_CLONE_SNAPSHOT_ENV,
     batched_decode_enabled,
     batched_decode_reject_mode,
     batched_decode_serial,
     diff_streams,
+    foldin_clone_snapshot,
     generate_greedy_batched,
     left_pad_prompts,
     streams_all_match,
@@ -901,3 +903,89 @@ def test_foldin_ragged_backed_matches_repair() -> None:
         max_new_tokens=18,
     )
     assert [s.tokens for s in res_fold.streams] == [s.tokens for s in res_repair.streams]
+
+
+# --------------------------------------------------------------------------- #
+# FIX 1: conditional REPLAY restore (skip the whole-batch masked restore when no
+# real row replays -- an all-False mask restore is a byte-identical no-op).
+# --------------------------------------------------------------------------- #
+def test_foldin_conditional_restore_skipped_when_no_replay(monkeypatch) -> None:
+    import mtplx.cache_state as cs
+
+    calls = {"n": 0}
+    real = cs.restore_untrimmable_cache_masked
+
+    def _counting(cache, snap, mask):
+        calls["n"] += 1
+        return real(cache, snap, mask)
+
+    monkeypatch.setattr(cs, "restore_untrimmable_cache_masked", _counting)
+    # all-accept: no row ever replays -> the restore is elided EVERY cycle.
+    res = generate_greedy_batched(
+        _FakeRuntime(), _distinct_prompts(4), reject_mode="foldin", max_new_tokens=16
+    )
+    assert res.replay_rows == 0
+    assert calls["n"] == 0
+
+
+def test_foldin_conditional_restore_runs_only_with_a_live_mask(monkeypatch) -> None:
+    import mtplx.cache_state as cs
+
+    calls = {"n": 0}
+    real = cs.restore_untrimmable_cache_masked
+
+    def _counting(cache, snap, mask):
+        calls["n"] += 1
+        # FIX 1 invariant: the restore is NEVER invoked with an all-False mask.
+        assert any(mask), "restore called with an all-False (no-op) mask"
+        return real(cache, snap, mask)
+
+    monkeypatch.setattr(cs, "restore_untrimmable_cache_masked", _counting)
+    prompts = _distinct_prompts(4)
+    broken = {p[0] for p in prompts}  # every row misses -> genuine replays
+    res_fold = generate_greedy_batched(
+        _FakeRuntime(broken_rids=broken), prompts, reject_mode="foldin",
+        max_new_tokens=16,
+    )
+    assert res_fold.replay_rows > 0
+    assert calls["n"] > 0  # restore genuinely ran, only for live-mask cycles
+    # still byte-identical to the repair loop despite the gated restore.
+    res_repair = generate_greedy_batched(
+        _FakeRuntime(broken_rids=broken), prompts, reject_mode="repair",
+        max_new_tokens=16,
+    )
+    assert [s.tokens for s in res_fold.streams] == [s.tokens for s in res_repair.streams]
+
+
+# --------------------------------------------------------------------------- #
+# FIX 2: lazy zero-copy view recurrent snapshot (default) vs the eager clone
+# fallback -- the fold-in loop commits the identical sequence either way.
+# --------------------------------------------------------------------------- #
+def test_foldin_clone_snapshot_env() -> None:
+    assert foldin_clone_snapshot({}) is False  # default OFF -> lazy view
+    assert foldin_clone_snapshot({FOLDIN_CLONE_SNAPSHOT_ENV: "1"}) is True
+    assert foldin_clone_snapshot({FOLDIN_CLONE_SNAPSHOT_ENV: "true"}) is True
+    assert foldin_clone_snapshot({FOLDIN_CLONE_SNAPSHOT_ENV: "off"}) is False
+    assert foldin_clone_snapshot({FOLDIN_CLONE_SNAPSHOT_ENV: ""}) is False
+
+
+def test_foldin_lazy_and_clone_snapshot_agree(monkeypatch) -> None:
+    # The default lazy-view snapshot and the eager-clone fallback commit the
+    # SAME streams (ragged-backed fake -> real mx.array KV + create_attention_mask).
+    prompts = _distinct_prompts(4)
+    broken = {prompts[1][0], prompts[3][0]}
+
+    def _run():
+        return generate_greedy_batched(
+            _RaggedFakeRuntime(broken_rids=broken), prompts, reject_mode="foldin",
+            max_new_tokens=18,
+        )
+
+    monkeypatch.delenv(FOLDIN_CLONE_SNAPSHOT_ENV, raising=False)
+    res_lazy = _run()  # default: lazy zero-copy view
+    monkeypatch.setenv(FOLDIN_CLONE_SNAPSHOT_ENV, "1")
+    res_clone = _run()  # fallback: eager clone
+    assert [s.tokens for s in res_lazy.streams] == [s.tokens for s in res_clone.streams]
+    assert [s.finish_reason for s in res_lazy.streams] == [
+        s.finish_reason for s in res_clone.streams
+    ]
