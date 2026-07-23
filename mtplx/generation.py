@@ -5716,20 +5716,19 @@ def generate_mtpk(
     # correction to be dropped so the next masked primary resamples it.
     # The stock target_prefix lane below carries that contract.
     #
-    # Context-copy (prompt-lookup) drafting proposes variable-length copy blocks
-    # that the compiled K1 route -- frozen at verify-length-2 with its own
-    # request-owned state (state_slots + shadow) -- cannot verify or stay
-    # cache-consistent through.  So the compiled K1 route stays STRICTLY K1-only:
-    # when the opt-in ccopy-on-target_prefix flag takes over the lane, the route
-    # steps aside (exactly like the constraint case) and the whole request runs
-    # the non-compiled capture-commit-style target_prefix lane, where copy blocks
-    # and K1 draft cycles share one main-cache forward_ar_capture path.  The two
-    # improvement families never share a cycle: K1 compiled-route wins on pure-K1
-    # requests, prompt-lookup wins on the non-compiled lane.  Keyed on the FLAG
-    # (not on whether copy rounds fire) so ccopy-off on this lane is a clean
-    # byte-exactness baseline.  Whole-MoE (needs the compiled route) and penalties
-    # (disable ccopy) both keep the compiled route -- mirrors the ccopy_active
-    # gate below.
+    # Context-copy on this lane is a DRAFT SOURCE (a prompt match feeds the
+    # depth-1 draft; see context_copy_target_prefix_enabled), which conflicts
+    # with the compiled K1 route's device-draft (R1) contract.  So the
+    # compiled route stays STRICTLY K1/device-drafted: when the opt-in flag
+    # takes over the lane, the route steps aside (exactly like the constraint
+    # case) and the whole request runs the non-compiled target_prefix lane,
+    # whose 2-row verify cycles are byte-exact to AR for any draft source.
+    # The two improvement families never share a cycle: the compiled route
+    # wins on pure-K1 requests, prompt-lookup drafting wins on the
+    # non-compiled lane.  Keyed on the FLAG (not on whether streaks fire) so
+    # ccopy-off on this lane is a clean byte-exactness baseline.  Whole-MoE
+    # (needs the compiled route) and penalties (disable ccopy) both keep the
+    # compiled route -- mirrors the ccopy_active gate below.
     from .context_copy import (
         context_copy_target_prefix_enabled as _cc_tp_enabled_early,
     )
@@ -6694,12 +6693,11 @@ def generate_mtpk(
     # sampling distribution at any temperature (no greedy shortcut).
     #
     # Copy rounds normally require a capture-commit verify strategy.  The opt-in
-    # MTPLX_CONTEXT_COPY_TARGET_PREFIX flag also allows them under the exact
-    # target_prefix route: a copy round runs its own forward_ar_capture +
-    # commit_captured_prefix (cache-generic, __final_only__ fallback) rather than
-    # the compiled route, so it interleaves with the K1 compiled cycles.  It is
-    # mutually exclusive with installed whole-MoE (frozen at 2 rows; a copy block
-    # is T+1 rows), so the round stays gated off with a recorded reason there.
+    # MTPLX_CONTEXT_COPY_TARGET_PREFIX flag also enables the target_prefix
+    # lane-takeover, where context-copy is a DRAFT SOURCE (streaks feed the
+    # depth-1 draft; block rounds stay capture_commit-only -- their T+1-row
+    # forwards are not AR-exact).  With whole-MoE installed the compiled
+    # route is kept and the flag is inert, recorded via disabled_reason.
     _ccopy_capture_lane = verify_strategy in {"capture_commit", "graphbank_capture_commit"}
     _ccopy_tp_requested = (
         context_copy_target_prefix_enabled() and verify_strategy == "target_prefix"
@@ -6716,9 +6714,10 @@ def generate_mtpk(
     ccopy_probes = ccopy_blocks_accepted = ccopy_suspensions = 0
     ccopy_disabled_reason = None
     if _ccopy_whole_moe_conflict:
-        # Requested the target_prefix hybrid but whole-MoE is installed: the fused
-        # 2-row kernel cannot verify a T+1-row copy block.  Stay on the pure route.
-        ccopy_disabled_reason = "whole_moe_installed_2row_geometry"
+        # Requested the target_prefix takeover but whole-MoE is installed:
+        # whole-MoE requires the compiled route, whose device-draft contract
+        # excludes draft substitution.  The compiled route is kept.
+        ccopy_disabled_reason = "whole_moe_keeps_compiled_route"
     ccopy_ema, ccopy_seen, ccopy_suspend_until = 0.5, 0, 0
     ccopy_backoff = 64   # doubles on each suspension (self-repetitive novel text would
                          # otherwise re-trigger copy rounds after every backoff and pay

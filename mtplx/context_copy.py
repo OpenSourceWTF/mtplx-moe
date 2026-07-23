@@ -30,24 +30,26 @@ def context_copy_target_prefix_enabled() -> bool:
     """Opt-in: run context-copy on the target_prefix lane (default OFF, so the
     shipped/PR behaviour is byte-unchanged).
 
-    Context-copy proposes variable-length ``[primary] + block`` copy rounds (T+1
-    rows) and commits a per-position prefix.  The COMPILED K1 target_prefix route
-    is frozen at verify-length-2 with its own request-owned state (state_slots +
-    a shadow scaffold), so a copy round's main-cache ``forward_ar_capture`` cannot
-    stay cache-consistent through it (empirically corrupts state -- argmax
-    divergence).  Rather than bridge those two incompatible cache representations,
-    this flag makes the compiled K1 route STEP ASIDE (like the grammar-constraint
-    case): the whole request runs the non-compiled, capture-commit-style
-    target_prefix lane, where copy blocks and K1 draft cycles share one main-cache
-    forward_ar_capture path and context-copy is already correct.  The compiled K1
-    route stays strictly K1-only (pure-K1 requests); prompt-lookup lives on the
-    non-compiled lane.  The flag drives the lane switch REGARDLESS of whether copy
-    rounds fire, so flag-on + MTPLX_CONTEXT_COPY=0 is a clean same-lane baseline.
+    On this lane context-copy is a DRAFT SOURCE, not a block-round engine: a
+    prompt n-gram match starts a streak that feeds the copy continuation as
+    the depth-1 draft, so every forward keeps the lane's 2-row verify
+    geometry and the emitted stream is bit-exact to pure AR for any draft
+    source at any temperature (the accepted token is always the pre-sampled
+    target id).  Block rounds -- whose T+1-row forwards leave M>2 kernel-path
+    ulps in retained cache rows and break AR-exactness -- remain
+    capture_commit-only.
 
-    Precedence: whole-MoE fusion needs the compiled route (and its 2-row kernel
-    can't verify a copy block), and repetition penalties disable copy rounds; in
-    both cases the compiled route is KEPT and this flag is inert -- mirrored in the
-    exact_a3b_target_prefix_factory gate and the ccopy_active gate.
+    The COMPILED K1 route keeps its device-draft (R1) contract, so when this
+    flag takes over, the compiled route STEPS ASIDE (like the
+    grammar-constraint case) and the request runs the non-compiled
+    target_prefix lane.  The flag drives the lane switch REGARDLESS of
+    whether streaks fire, so flag-on + MTPLX_CONTEXT_COPY=0 is a clean
+    same-lane baseline.
+
+    Precedence: whole-MoE fusion needs the compiled route, and repetition
+    penalties disable context-copy; in both cases the compiled route is KEPT
+    and this flag is inert -- mirrored in the exact_a3b_target_prefix_factory
+    gate and the ccopy_active gate.
     """
     return (os.environ.get("MTPLX_CONTEXT_COPY_TARGET_PREFIX") or "").strip() in {
         "1",
