@@ -53,7 +53,9 @@ def _fixed_source(*, stage: int, rows: int, variant: str) -> str:
 
 
 def _stage1_source(*, target: bool, rows: int) -> str:
-    if target and rows == 2:
+    if target and rows in (2, 3):
+        # Verify routes (2-row K1, 3-row k=2) share the split projection +
+        # finalizer path; both sources loop over ROWS internally.
         return _target_m2_stage1_projection_source()
     projection = _target_stage1_projection() if target else _mtp_stage1_projection()
     prologue = """
@@ -219,7 +221,7 @@ def _target_m2_stage1_projection_source() -> str:
                         + k_lane / ROUTER_GROUP;
                     float scale = float(router_scales[metadata_index]);
                     float bias = float(router_biases[metadata_index]);
-                    float quantized_dot[ROWS] = {0.0f, 0.0f};
+                    float quantized_dot[ROWS] = {};
                     for (uint item = 0; item < Q8_VALUES_PER_LANE; ++item) {
                         uchar packed_weight = weights[weight_base + item];
                         for (uint row = 0; row < ROWS; ++row) {
@@ -249,12 +251,12 @@ def _target_m2_stage1_projection_source() -> str:
         {
             const device uchar* weights =
                 reinterpret_cast<const device uchar*>(shared_gate_weight);
-            float shared_partial[ROWS] = {0.0f, 0.0f};
+            float shared_partial[ROWS] = {};
             if (expert_tile == 0 && simd_gid == 0) {
                 for (uint k_block = 0; k_block < HIDDEN; k_block += Q8_BLOCK) {
                     uint k_lane = k_block + lane * Q8_VALUES_PER_LANE;
                     float input_sum[ROWS] = {};
-                    float quantized_dot[ROWS] = {0.0f, 0.0f};
+                    float quantized_dot[ROWS] = {};
                     uint metadata_index = k_lane / ROUTER_GROUP;
                     float scale = float(shared_gate_scales[metadata_index]);
                     float bias = float(shared_gate_biases[metadata_index]);
@@ -1024,6 +1026,8 @@ def _stage3_source(*, target: bool, rows: int) -> str:
     if target:
         if rows == 2:
             return _target_m2_stage3_source()
+        if rows == 3:
+            return _target_m3_stage3_source()
         return _target_stage3_source()
     return _mtp_stage3_source()
 
@@ -1238,6 +1242,207 @@ def _target_m2_stage3_source() -> str:
                 output[HIDDEN + output_column] = bfloat(
                     float(routed_accumulator1[result_index])
                     + float(gated_shared1));
+            }
+        }
+    """
+    )
+
+
+def _target_m3_stage3_source() -> str:
+    """Row-tripled M2 stage3 for the k=2 verify ``[primary, d1, d2]``.
+
+    Byte-parity extension of the row-paired 2-row kernel: rows 0 and 1 are
+    textually identical to ``_target_m2_stage3_source`` (routed rows reuse
+    ``_target_m2_routed_row_source``; the shared per-row arithmetic is
+    replicated verbatim), so a 3-row verify's first two rows bit-match the
+    shipped M2 kernel, and every row bit-matches the single-row M1 route --
+    the AR-exactness contract (install parity lane, limit 0.0).  Row 2 adds a
+    third routed accumulator and a third shared partial that consumes the
+    same single shared-down packed load already read for rows 0 and 1, so the
+    weight read is amortized across all three verify rows.
+    """
+
+    return (
+        """
+        constexpr uint ROUTED_GROUP = 64;
+        constexpr uint VALUES_PER_LANE = 16;
+        constexpr uint OUTPUT_TILES = HIDDEN / 16;
+        constexpr uint SIMD_GROUPS = 4;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint output_base = tile * 16 + simd_gid * 4;
+
+        bfloat routed_accumulator0[4] = {
+            bfloat(0.0f), bfloat(0.0f), bfloat(0.0f), bfloat(0.0f)};
+        bfloat routed_accumulator1[4] = {
+            bfloat(0.0f), bfloat(0.0f), bfloat(0.0f), bfloat(0.0f)};
+        bfloat routed_accumulator2[4] = {
+            bfloat(0.0f), bfloat(0.0f), bfloat(0.0f), bfloat(0.0f)};
+        """
+        + _target_m2_routed_row_source(0)
+        + _target_m2_routed_row_source(1)
+        + _target_m2_routed_row_source(2)
+        + """
+        threadgroup bfloat shared_inputs[ROWS * 4 * INTERMEDIATE];
+        uint shared_k_lane = lane * VALUES_PER_LANE;
+        uint shared_input_base0 =
+            (0 * SIMD_GROUPS + simd_gid) * INTERMEDIATE + shared_k_lane;
+        uint shared_input_base1 =
+            (1 * SIMD_GROUPS + simd_gid) * INTERMEDIATE + shared_k_lane;
+        uint shared_input_base2 =
+            (2 * SIMD_GROUPS + simd_gid) * INTERMEDIATE + shared_k_lane;
+        float shared_input_sum0 = 0.0f;
+        float shared_input_sum1 = 0.0f;
+        float shared_input_sum2 = 0.0f;
+        for (uint item = 0; item < VALUES_PER_LANE; item += 4) {
+            uint activation_base0 =
+                (0 * ACTIVATION_SLOTS + TOP_K) * INTERMEDIATE
+                + shared_k_lane + item;
+            uint activation_base1 =
+                (1 * ACTIVATION_SLOTS + TOP_K) * INTERMEDIATE
+                + shared_k_lane + item;
+            uint activation_base2 =
+                (2 * ACTIVATION_SLOTS + TOP_K) * INTERMEDIATE
+                + shared_k_lane + item;
+            bfloat x00 = activations[activation_base0];
+            bfloat x01 = activations[activation_base0 + 1];
+            bfloat x02 = activations[activation_base0 + 2];
+            bfloat x03 = activations[activation_base0 + 3];
+            bfloat x10 = activations[activation_base1];
+            bfloat x11 = activations[activation_base1 + 1];
+            bfloat x12 = activations[activation_base1 + 2];
+            bfloat x13 = activations[activation_base1 + 3];
+            bfloat x20 = activations[activation_base2];
+            bfloat x21 = activations[activation_base2 + 1];
+            bfloat x22 = activations[activation_base2 + 2];
+            bfloat x23 = activations[activation_base2 + 3];
+            shared_input_sum0 +=
+                float(x00) + float(x01) + float(x02) + float(x03);
+            shared_input_sum1 +=
+                float(x10) + float(x11) + float(x12) + float(x13);
+            shared_input_sum2 +=
+                float(x20) + float(x21) + float(x22) + float(x23);
+            shared_inputs[shared_input_base0 + item] = x00;
+            shared_inputs[shared_input_base0 + item + 1] = x01;
+            shared_inputs[shared_input_base0 + item + 2] = x02;
+            shared_inputs[shared_input_base0 + item + 3] = x03;
+            shared_inputs[shared_input_base1 + item] = x10;
+            shared_inputs[shared_input_base1 + item + 1] = x11;
+            shared_inputs[shared_input_base1 + item + 2] = x12;
+            shared_inputs[shared_input_base1 + item + 3] = x13;
+            shared_inputs[shared_input_base2 + item] = x20;
+            shared_inputs[shared_input_base2 + item + 1] = x21;
+            shared_inputs[shared_input_base2 + item + 2] = x22;
+            shared_inputs[shared_input_base2 + item + 3] = x23;
+        }
+
+        const device uchar* shared_down_bytes =
+            reinterpret_cast<const device uchar*>(shared_down_weight);
+        float shared_result0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float shared_result1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float shared_result2[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (uint result_index = 0; result_index < 4; ++result_index) {
+            uint output_column = output_base + result_index;
+            uint weight_offset =
+                output_column * (INTERMEDIATE / 2) + shared_k_lane / 2;
+            const device ushort* shared_down_packed =
+                reinterpret_cast<const device ushort*>(
+                    shared_down_bytes + weight_offset);
+            float shared_quantized_dot0 = 0.0f;
+            float shared_quantized_dot1 = 0.0f;
+            float shared_quantized_dot2 = 0.0f;
+            // qdot4_affine shared, one packed load for all three rows
+            for (uint piece = 0; piece < VALUES_PER_LANE / 4; ++piece) {
+                ushort packed = shared_down_packed[piece];
+                uint item = piece * 4;
+                shared_quantized_dot0 +=
+                    float(shared_inputs[shared_input_base0 + item])
+                        * float(packed & 0x000f)
+                    + float(shared_inputs[shared_input_base0 + item + 1]) / 16.0f
+                        * float(packed & 0x00f0)
+                    + float(shared_inputs[shared_input_base0 + item + 2]) / 256.0f
+                        * float(packed & 0x0f00)
+                    + float(shared_inputs[shared_input_base0 + item + 3]) / 4096.0f
+                        * float(packed & 0xf000);
+                shared_quantized_dot1 +=
+                    float(shared_inputs[shared_input_base1 + item])
+                        * float(packed & 0x000f)
+                    + float(shared_inputs[shared_input_base1 + item + 1]) / 16.0f
+                        * float(packed & 0x00f0)
+                    + float(shared_inputs[shared_input_base1 + item + 2]) / 256.0f
+                        * float(packed & 0x0f00)
+                    + float(shared_inputs[shared_input_base1 + item + 3]) / 4096.0f
+                        * float(packed & 0xf000);
+                shared_quantized_dot2 +=
+                    float(shared_inputs[shared_input_base2 + item])
+                        * float(packed & 0x000f)
+                    + float(shared_inputs[shared_input_base2 + item + 1]) / 16.0f
+                        * float(packed & 0x00f0)
+                    + float(shared_inputs[shared_input_base2 + item + 2]) / 256.0f
+                        * float(packed & 0x0f00)
+                    + float(shared_inputs[shared_input_base2 + item + 3]) / 4096.0f
+                        * float(packed & 0xf000);
+            }
+            uint metadata_index =
+                output_column * (INTERMEDIATE / ROUTED_GROUP)
+                + shared_k_lane / ROUTED_GROUP;
+            float shared_scale = float(shared_down_scales[metadata_index]);
+            float shared_bias = float(shared_down_biases[metadata_index]);
+            shared_result0[result_index] =
+                shared_scale * shared_quantized_dot0
+                + shared_input_sum0 * shared_bias;
+            shared_result1[result_index] =
+                shared_scale * shared_quantized_dot1
+                + shared_input_sum1 * shared_bias;
+            shared_result2[result_index] =
+                shared_scale * shared_quantized_dot2
+                + shared_input_sum2 * shared_bias;
+        }
+
+        for (uint result_index = 0; result_index < 4; ++result_index) {
+            float shared_sum0 = simd_sum(shared_result0[result_index]);
+            float shared_sum1 = simd_sum(shared_result1[result_index]);
+            float shared_sum2 = simd_sum(shared_result2[result_index]);
+            if (lane == 0) {
+                bfloat gate_value0 = shared_gate[0];
+                auto sigmoid_y0 = 1 / (
+                    1 + metal::exp(metal::abs(gate_value0)));
+                bfloat sigmoid_mlx_exact0 = gate_value0 < bfloat(0.0f)
+                    ? bfloat(sigmoid_y0)
+                    : bfloat(1 - sigmoid_y0);
+                bfloat shared_value0 = bfloat(shared_sum0);
+                bfloat gated_shared0 = bfloat(
+                    sigmoid_mlx_exact0 * shared_value0);
+                bfloat gate_value1 = shared_gate[1];
+                auto sigmoid_y1 = 1 / (
+                    1 + metal::exp(metal::abs(gate_value1)));
+                bfloat sigmoid_mlx_exact1 = gate_value1 < bfloat(0.0f)
+                    ? bfloat(sigmoid_y1)
+                    : bfloat(1 - sigmoid_y1);
+                bfloat shared_value1 = bfloat(shared_sum1);
+                bfloat gated_shared1 = bfloat(
+                    sigmoid_mlx_exact1 * shared_value1);
+                bfloat gate_value2 = shared_gate[2];
+                auto sigmoid_y2 = 1 / (
+                    1 + metal::exp(metal::abs(gate_value2)));
+                bfloat sigmoid_mlx_exact2 = gate_value2 < bfloat(0.0f)
+                    ? bfloat(sigmoid_y2)
+                    : bfloat(1 - sigmoid_y2);
+                bfloat shared_value2 = bfloat(shared_sum2);
+                bfloat gated_shared2 = bfloat(
+                    sigmoid_mlx_exact2 * shared_value2);
+                uint output_column = output_base + result_index;
+                output[output_column] = bfloat(
+                    float(routed_accumulator0[result_index])
+                    + float(gated_shared0));
+                output[HIDDEN + output_column] = bfloat(
+                    float(routed_accumulator1[result_index])
+                    + float(gated_shared1));
+                output[2 * HIDDEN + output_column] = bfloat(
+                    float(routed_accumulator2[result_index])
+                    + float(gated_shared2));
             }
         }
     """
@@ -1636,6 +1841,16 @@ def all_whole_moe_sources() -> dict[str, str]:
         # chains bit-match the M2 verify kernels (AR-exactness contract).
         "target_m2r1_stage2": _source_preamble(rows=1) + _target_m2_stage2_source(),
         "target_m2r1_stage3": _source_preamble(rows=1) + _target_m2r1_stage3_source(),
+        # M3 (k=2) verify route: same split stage1 + row-generic stage2 as M2,
+        # recompiled at ROWS=3, and the row-tripled paired stage3.  Rows 0/1
+        # bit-match the M2 kernels; every row bit-matches the M1 route.
+        "target_m3_stage1_projection": _fixed_source(
+            stage=1, rows=3, variant="target_q8g64"
+        ),
+        "target_m3_stage1_finalizer": _source_preamble(rows=3)
+        + _target_m2_stage1_finalizer_source(),
+        "target_m3_stage2": _fixed_source(stage=2, rows=3, variant="target_q4g64"),
+        "target_m3_stage3": _fixed_source(stage=3, rows=3, variant="target_q4g64"),
     }
 
 
@@ -1661,6 +1876,16 @@ def whole_moe_launch_table() -> dict[str, tuple[tuple[int, int, int], tuple[int,
         "mtp_m1_stage3": ((STAGE3_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
         "target_m2r1_stage2": ((STAGE2_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
         "target_m2r1_stage3": ((STAGE3_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
+        "target_m3_stage1_projection": (
+            (STAGE1_PROJECTION_THREADGROUPS * STAGE1_THREADS, 1, 1),
+            (STAGE1_THREADS, 1, 1),
+        ),
+        "target_m3_stage1_finalizer": (
+            (STAGE1_THREADS, 1, 1),
+            (STAGE1_THREADS, 1, 1),
+        ),
+        "target_m3_stage2": ((STAGE2_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
+        "target_m3_stage3": ((STAGE3_THREADGROUPS * 128, 1, 1), (128, 1, 1)),
     }
 
 
@@ -1837,6 +2062,38 @@ def _build_mtp_m1_stage3_kernel():
     )
 
 
+def _build_target_m3_stage1_projection_kernel():
+    return _build_kernel(
+        "target_m3_stage1_projection",
+        input_names=_TARGET_STAGE1_INPUT_NAMES,
+        output_names=_TARGET_M2_STAGE1_PROJECTION_OUTPUT_NAMES,
+    )
+
+
+def _build_target_m3_stage1_finalizer_kernel():
+    return _build_kernel(
+        "target_m3_stage1_finalizer",
+        input_names=_TARGET_M2_STAGE1_FINALIZER_INPUT_NAMES,
+        output_names=_TARGET_M2_STAGE1_FINALIZER_OUTPUT_NAMES,
+    )
+
+
+def _build_target_m3_stage2_kernel():
+    return _build_kernel(
+        "target_m3_stage2",
+        input_names=_TARGET_STAGE2_INPUT_NAMES,
+        output_names=_STAGE2_OUTPUT_NAMES,
+    )
+
+
+def _build_target_m3_stage3_kernel():
+    return _build_kernel(
+        "target_m3_stage3",
+        input_names=_TARGET_STAGE3_INPUT_NAMES,
+        output_names=_STAGE3_OUTPUT_NAMES,
+    )
+
+
 def _launch_target_stage1(
     kernel: Any,
     value: Any,
@@ -1882,6 +2139,8 @@ def _launch_target_m2_stage1(
     finalizer_kernel: Any,
     value: Any,
     binding: Any,
+    *,
+    rows: int = 2,
 ):
     router = binding.router
     shared_gate_projection = binding.shared_scalar_gate
@@ -1897,14 +2156,14 @@ def _launch_target_m2_stage1(
         ],
         grid=(STAGE1_PROJECTION_THREADGROUPS * STAGE1_THREADS, 1, 1),
         threadgroup=(STAGE1_THREADS, 1, 1),
-        output_shapes=[(2, EXPERTS), (2, 1)],
+        output_shapes=[(rows, EXPERTS), (rows, 1)],
         output_dtypes=[mx.bfloat16, mx.bfloat16],
     )
     expert_ids, route_scores = finalizer_kernel(
         inputs=[router_logits],
         grid=(STAGE1_THREADS, 1, 1),
         threadgroup=(STAGE1_THREADS, 1, 1),
-        output_shapes=[(2, TOP_K), (2, TOP_K)],
+        output_shapes=[(rows, TOP_K), (rows, TOP_K)],
         output_dtypes=[mx.uint32, mx.bfloat16],
     )
     return expert_ids, route_scores, shared_gate
@@ -1929,6 +2188,18 @@ def target_m2_stage1(value: Any, binding: Any):
         _build_target_m2_stage1_finalizer_kernel(),
         value,
         binding,
+    )
+
+
+def target_m3_stage1(value: Any, binding: Any):
+    """Launch the 3-row (k=2 verify) target route and shared-gate ownership."""
+
+    return _launch_target_m2_stage1(
+        _build_target_m3_stage1_projection_kernel(),
+        _build_target_m3_stage1_finalizer_kernel(),
+        value,
+        binding,
+        rows=3,
     )
 
 
@@ -2016,6 +2287,14 @@ def target_m2r1_stage2(value: Any, expert_ids: Any, binding: Any):
 
     return _launch_target_stage2(
         _build_target_m2r1_stage2_kernel(), value, expert_ids, binding, rows=1
+    )
+
+
+def target_m3_stage2(value: Any, expert_ids: Any, binding: Any):
+    """Launch fixed BF16 target M3 `[3,9,512]` activation ownership (k=2)."""
+
+    return _launch_target_stage2(
+        _build_target_m3_stage2_kernel(), value, expert_ids, binding, rows=3
     )
 
 
@@ -2140,6 +2419,26 @@ def target_m2_stage3(
     )
 
 
+def target_m3_stage3(
+    activations: Any,
+    expert_ids: Any,
+    route_scores: Any,
+    shared_gate: Any,
+    binding: Any,
+):
+    """Launch the row-tripled target M3 output ownership (k=2 verify)."""
+
+    return _launch_target_stage3(
+        _build_target_m3_stage3_kernel(),
+        activations,
+        expert_ids,
+        route_scores,
+        shared_gate,
+        binding,
+        rows=3,
+    )
+
+
 def target_m2r1_stage3(
     activations: Any,
     expert_ids: Any,
@@ -2212,6 +2511,25 @@ def bind_target_m2_stage3(binding: Any):
             shared_gate,
             binding,
             rows=2,
+        )
+
+    return call
+
+
+def bind_target_m3_stage3(binding: Any):
+    """Prebind the row-tripled target M3 fused-down kernel (k=2 verify)."""
+
+    kernel = _build_target_m3_stage3_kernel()
+
+    def call(activations, expert_ids, route_scores, shared_gate):
+        return _launch_target_stage3(
+            kernel,
+            activations,
+            expert_ids,
+            route_scores,
+            shared_gate,
+            binding,
+            rows=3,
         )
 
     return call
@@ -2291,6 +2609,39 @@ def bind_target_m2(binding: Any):
             rows=2,
         )
         return output.reshape(1, 2, 2048)
+
+    return call
+
+
+def bind_target_m3(binding: Any):
+    """Bind the four row-tripled target M3 kernels once (k=2, 3-row verify)."""
+
+    stage1_projection_kernel = _build_target_m3_stage1_projection_kernel()
+    stage1_finalizer_kernel = _build_target_m3_stage1_finalizer_kernel()
+    stage2_kernel = _build_target_m3_stage2_kernel()
+    stage3_kernel = _build_target_m3_stage3_kernel()
+
+    def call(value: Any):
+        expert_ids, route_scores, shared_gate = _launch_target_m2_stage1(
+            stage1_projection_kernel,
+            stage1_finalizer_kernel,
+            value,
+            binding,
+            rows=3,
+        )
+        activations = _launch_target_stage2(
+            stage2_kernel, value, expert_ids, binding, rows=3
+        )
+        output = _launch_target_stage3(
+            stage3_kernel,
+            activations,
+            expert_ids,
+            route_scores,
+            shared_gate,
+            binding,
+            rows=3,
+        )
+        return output.reshape(1, 3, 2048)
 
     return call
 

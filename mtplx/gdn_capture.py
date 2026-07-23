@@ -47,16 +47,22 @@ class A3BGDNPostconvInstallPlan:
 
 @dataclass(frozen=True)
 class A3BGDNPostconvFactory:
-    """Selfchecked, order-stable callables for the exact M1/M2 traces."""
+    """Selfchecked, order-stable callables for the exact M1/M2/M3 traces.
+
+    ``m3_implementations`` is the k=2 (3-row) verify recurrence; it defaults to
+    empty so K1-only construction paths are unchanged and is populated whenever
+    the postconv is installed.
+    """
 
     m1_implementations: tuple[Callable[..., Any], ...]
     m2_implementations: tuple[Callable[..., Any], ...]
+    m3_implementations: tuple[Callable[..., Any], ...] = ()
 
 
 def _a3b_gdn_postconv_contract() -> dict[str, Any]:
     return {
         "batch": 1,
-        "logical_m": [1, 2],
+        "logical_m": [1, 2, 3],
         "routes": {
             "m1_correction": {
                 "conv_shape": [1, 1, 8192],
@@ -69,6 +75,12 @@ def _a3b_gdn_postconv_contract() -> dict[str, Any]:
                 "gate_shapes": {"a": [1, 2, 32], "b": [1, 2, 32]},
                 "output_shape": [1, 2, 32, 128],
                 "captured_states_shape": [1, 2, 32, 128, 128],
+            },
+            "m3_verify": {
+                "conv_shape": [1, 3, 8192],
+                "gate_shapes": {"a": [1, 3, 32], "b": [1, 3, 32]},
+                "output_shape": [1, 3, 32, 128],
+                "captured_states_shape": [1, 3, 32, 128, 128],
             },
         },
         "state_shape": [1, 32, 128, 128],
@@ -293,10 +305,12 @@ def install_a3b_gdn_postconv(
         required_lane = "gdn_postconv_headquarter"
         m1_apply = _apply_enabled_a3b_gdn_postconv_m1_headquarter
         m2_apply = _apply_enabled_a3b_gdn_postconv_m2_headquarter
+        m3_apply = _apply_enabled_a3b_gdn_postconv_m3_headquarter
     else:
         required_lane = "gdn_postconv_inline_g"
         m1_apply = _apply_enabled_a3b_gdn_postconv_m1_tgy4
         m2_apply = _apply_enabled_a3b_gdn_postconv_m2_tgy4
+        m3_apply = _apply_enabled_a3b_gdn_postconv_m3_tgy4
     if lanes.get(required_lane) != "ok":
         _fail_a3b_gdn_postconv_configuration(
             "A3B GDN postconv selfcheck did not validate the exact M1/M2 kernels"
@@ -318,6 +332,14 @@ def install_a3b_gdn_postconv(
         m2_implementations=tuple(
             partial(
                 m2_apply,
+                A_log=gdn.A_log,
+                dt_bias=gdn.dt_bias,
+            )
+            for gdn in plan.gdns
+        ),
+        m3_implementations=tuple(
+            partial(
+                m3_apply,
                 A_log=gdn.A_log,
                 dt_bias=gdn.dt_bias,
             )
@@ -2115,6 +2137,111 @@ def _apply_enabled_a3b_gdn_postconv_m2_headquarter(
 ):
     """Execute the construction-installed exact A3B M2 headquarter route."""
     return _a3b_compiled_target_gdn_postconv_m2_headquarter(
+        conv_out,
+        a,
+        b,
+        state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+
+
+def _a3b_compiled_target_gdn_postconv_m3_tgy4(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Launch the A3B compiled-target M3 (k=2, 3-row) recurrence with TGY4.
+
+    Identical to the M2 launch except the logical sequence length is 3 -- the
+    inline_g kernel scans ``logical_m`` positions, so the k=2 verify
+    ``[primary, d1, d2]`` recurrence reuses the exact M1/M2 arithmetic per row.
+    """
+    return _linear_gated_delta_from_conv_inline_g_kernel(
+        inputs=[conv_out, a, b, A_log, dt_bias, state, 3],
+        template=[
+            ("InT", mx.bfloat16),
+            ("StT", mx.float32),
+            ("Dk", 128),
+            ("Dv", 128),
+            ("Hk", 16),
+            ("Hv", 32),
+            ("KeyDim", 2048),
+            ("ConvDim", 8192),
+        ],
+        grid=(32, 128, 32),
+        threadgroup=(32, 4, 1),
+        output_shapes=[(1, 3, 32, 128), (1, 3, 32, 128, 128)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+
+
+def _a3b_compiled_target_gdn_postconv_m3_headquarter(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Launch the A3B compiled-target M3 (k=2, 3-row) recurrence with headquarter."""
+    return _linear_gated_delta_from_conv_headquarter_kernel(
+        inputs=[conv_out, a, b, A_log, dt_bias, state, 3],
+        template=[
+            ("InT", mx.bfloat16),
+            ("StT", mx.float32),
+            ("Dk", 128),
+            ("Dv", 128),
+            ("Hk", 16),
+            ("Hv", 32),
+            ("KeyDim", 2048),
+            ("ConvDim", 8192),
+            ("Quarters", 4),
+            ("Simds", 8),
+        ],
+        grid=(256, 4, 32),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(1, 3, 32, 128), (1, 3, 32, 128, 128)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+
+
+def _apply_enabled_a3b_gdn_postconv_m3_tgy4(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Execute the construction-installed exact A3B M3/TGY4 route (k=2)."""
+    return _a3b_compiled_target_gdn_postconv_m3_tgy4(
+        conv_out,
+        a,
+        b,
+        state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+
+
+def _apply_enabled_a3b_gdn_postconv_m3_headquarter(
+    conv_out: mx.array,
+    a: mx.array,
+    b: mx.array,
+    state: mx.array,
+    *,
+    A_log: mx.array,
+    dt_bias: mx.array,
+):
+    """Execute the construction-installed exact A3B M3 headquarter route (k=2)."""
+    return _a3b_compiled_target_gdn_postconv_m3_headquarter(
         conv_out,
         a,
         b,

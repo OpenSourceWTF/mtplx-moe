@@ -78,11 +78,18 @@ class A3BWholeMoeInstallPlan:
 
 @dataclass(frozen=True)
 class _TargetA3BWholeMoeRoute:
-    """Prebound accepted execution plus the exact target M2/M1 overrides."""
+    """Prebound accepted execution plus the exact target M3/M2/M1 overrides.
+
+    ``m3_call`` is the 3-row (k=2) verify override; it is bound and
+    dispatched on 3-row decode forwards but reached only once the depth-2
+    request/route/generation path selects a 3-row verify geometry.  The
+    shipped K1 paths (m2_call at 2 rows, m1_call at 1 row) are unchanged.
+    """
 
     accepted_call: Callable[[Any, Any], Any]
     m2_call: Callable[[Any], Any]
     m1_call: Callable[[Any], Any]
+    m3_call: Callable[[Any], Any] | None = None
 
 
 _SELFCHECK_LIMITS = {
@@ -156,6 +163,19 @@ def a3b_whole_moe_enabled() -> bool:
     }
 
 
+def a3b_whole_moe_m3_selfcheck_enabled() -> bool:
+    """Whether the opt-in k=2 (m3) install-time byte-exactness gate is armed.
+
+    When on, the whole-MoE selfcheck computes the 3-row parity lanes and the
+    install requires them at limit 0.0 (fail-closed) -- the k=2 driving path
+    arms this so a byte-inexact m3 kernel can never serve.
+    """
+
+    return os.environ.get(
+        "MTPLX_A3B_WHOLE_MOE_M3_SELFCHECK", ""
+    ).strip().lower() in {"1", "true", "on", "yes"}
+
+
 def validate_a3b_whole_moe_load_options(
     *,
     mtp_adapter: Any | None,
@@ -189,9 +209,18 @@ def validate_a3b_whole_moe_request(
         raise A3BWholeMoeConfigError(
             "whole-MoE requires the exact target-prefix request route"
         )
-    if requested_speculative_depth != 1 or speculative_depth != 1:
+    # K1 (depth 1, 2-row verify) is the shipped path; depth 2 (k=2, 3-row verify
+    # via the m3 kernels) is the opt-in experiment lane.  The m3 fused route is
+    # byte-exact per row to the M1 route (install parity lane), so a greedy k=2
+    # stream stays byte-comparable to greedy generate_ar.
+    if (
+        requested_speculative_depth not in (1, 2)
+        or speculative_depth not in (1, 2)
+        or requested_speculative_depth != speculative_depth
+    ):
         raise A3BWholeMoeConfigError(
-            "whole-MoE requires exact K1 ownership with maximum verify length 2"
+            "whole-MoE requires exact K1 (verify len 2) or k=2 (verify len 3) "
+            "ownership"
         )
     if verify_core != "stock":
         raise A3BWholeMoeConfigError(
@@ -682,6 +711,19 @@ def _target_m2_route(binding: A3BWholeMoeBinding) -> Callable[[Any], Any]:
     return kernel_module.bind_target_m2(binding)
 
 
+def _target_m3_route(binding: A3BWholeMoeBinding) -> Callable[[Any], Any]:
+    """Bind the four row-tripled target-M3 stages (k=2, 3-row verify).
+
+    Rows 0/1 of the M3 stage3 are byte-identical to the shipped M2 kernel and
+    every row is byte-identical to the M1 route (parity lane, limit 0.0), so a
+    greedy k=2 stream stays byte-comparable to greedy generate_ar of the same
+    configuration -- the same AR-exactness contract the K1 stack proves at 2
+    rows, extended to the 3-row ``[primary, d1, d2]`` verify geometry.
+    """
+
+    return kernel_module.bind_target_m3(binding)
+
+
 def _mtp_m1_route(binding: A3BWholeMoeBinding) -> Callable[[Any], Any]:
     """Bind exact MTP M1 row routing, packed gate/up, and fused down."""
 
@@ -718,6 +760,76 @@ def _check_whole_moe_m1_m2_row_parity(binding: A3BWholeMoeBinding) -> float:
         _max_abs_diff(m2_out[:, 0:1, :], row0),
         _max_abs_diff(m2_out[:, 1:2, :], row1),
     )
+
+
+def _check_whole_moe_m1_m3_row_parity(binding: A3BWholeMoeBinding) -> float:
+    """Max abs diff between the 3-row M3 verify and the M1 route (limit 0.0).
+
+    The k=2 AR-exactness contract: each row of the 3-row ``[primary, d1, d2]``
+    verify must reproduce the single-row M1 decode route EXACTLY, or a greedy
+    k=2 request cannot byte-match greedy generate_ar of the same config.
+    """
+
+    fixture = mx.arange(3 * 2048, dtype=mx.float32).reshape(1, 3, 2048)
+    value = (
+        mx.sin(fixture * 0.013) * 0.25
+        + mx.cos(fixture * 0.007) * 0.0625
+    ).astype(mx.bfloat16)
+    m3_out = _target_m3_route(binding)(value)
+    m1_route = _target_m1_route(binding)
+    row0 = m1_route(value[:, 0:1, :])
+    row1 = m1_route(value[:, 1:2, :])
+    row2 = m1_route(value[:, 2:3, :])
+    mx.eval(m3_out, row0, row1, row2)
+    return max(
+        _max_abs_diff(m3_out[:, 0:1, :], row0),
+        _max_abs_diff(m3_out[:, 1:2, :], row1),
+        _max_abs_diff(m3_out[:, 2:3, :], row2),
+    )
+
+
+def _check_whole_moe_m2_m3_prefix_parity(binding: A3BWholeMoeBinding) -> float:
+    """Rows 0/1 of the 3-row M3 verify must match the shipped 2-row M2 (limit 0.0).
+
+    Guards the "rows 0/1 stay identical to the shipped paired stage-3" claim:
+    the row-tripled kernel must not perturb the first two verify rows.
+    """
+
+    fixture = mx.arange(3 * 2048, dtype=mx.float32).reshape(1, 3, 2048)
+    value = (
+        mx.sin(fixture * 0.013) * 0.25
+        + mx.cos(fixture * 0.007) * 0.0625
+    ).astype(mx.bfloat16)
+    m3_out = _target_m3_route(binding)(value)
+    m2_out = _target_m2_route(binding)(value[:, 0:2, :])
+    mx.eval(m3_out, m2_out)
+    return max(
+        _max_abs_diff(m3_out[:, 0:1, :], m2_out[:, 0:1, :]),
+        _max_abs_diff(m3_out[:, 1:2, :], m2_out[:, 1:2, :]),
+    )
+
+
+def check_a3b_whole_moe_m3_row_parity(plan: A3BWholeMoeInstallPlan) -> dict[str, float]:
+    """Aggregate the k=2 kernel parity lanes across every target binding.
+
+    Exposed for the k=2 build / GPU smoke; not part of the K1 install gate, so
+    the shipped depth-1 path never pays the extra M3 compiles.
+    """
+
+    m1_m3 = 0.0
+    m2_m3 = 0.0
+    for binding in plan.target_bindings:
+        try:
+            m1_m3 = max(m1_m3, _check_whole_moe_m1_m3_row_parity(binding))
+            m2_m3 = max(m2_m3, _check_whole_moe_m2_m3_prefix_parity(binding))
+        except Exception:
+            m1_m3 = float("inf")
+            m2_m3 = float("inf")
+            break
+    return {
+        "a3b_whole_moe_target_m1_m3_row_parity": m1_m3,
+        "a3b_whole_moe_target_m2_m3_prefix_parity": m2_m3,
+    }
 
 
 def _max_abs_diff(candidate: Any, reference: Any) -> float:
@@ -896,6 +1008,15 @@ def run_a3b_whole_moe_selfcheck(
     component_report[parity_lane] = {"row_parity": parity_dmax}
     dmax[parity_lane] = parity_dmax
     lanes[parity_lane] = "ok" if parity_dmax == 0.0 else "failed"
+    # k=2 (m3) kernel parity is opt-in: the shipped depth-1 install never pays
+    # the extra M3 compiles.  Enabled by the k=2 build / a GPU smoke to prove
+    # each 3-row verify row bit-matches the M1 route (limit 0.0).
+    if a3b_whole_moe_m3_selfcheck_enabled():
+        m3_parity = check_a3b_whole_moe_m3_row_parity(plan)
+        for m3_lane, m3_value in m3_parity.items():
+            component_report[m3_lane] = {"row_parity": m3_value}
+            dmax[m3_lane] = m3_value
+            lanes[m3_lane] = "ok" if m3_value == 0.0 else "failed"
     report["lanes"] = lanes
     report["dmax"] = dmax
     report["a3b_whole_moe_components"] = component_report
@@ -921,6 +1042,10 @@ def _target_a3b_whole_moe_call(self: Any, value: Any) -> Any:
             return route.m2_call(value)
         if rows == 1:
             return route.m1_call(value)
+        if rows == 3 and route.m3_call is not None:
+            # k=2 verify [primary, d1, d2]; dormant until the depth-2
+            # request/route/generation path emits a 3-row decode forward.
+            return route.m3_call(value)
     return route.accepted_call(self, value)
 
 
@@ -948,6 +1073,7 @@ def _route_for_binding(
         accepted_call=type(binding.block).__call__,
         m2_call=_target_m2_route(binding),
         m1_call=_target_m1_route(binding),
+        m3_call=_target_m3_route(binding),
     )
 
 
@@ -964,6 +1090,13 @@ def install_a3b_whole_moe(
         "a3b_whole_moe_target_m2",
         "a3b_whole_moe_target_m1_m2_row_parity",
     )
+    if a3b_whole_moe_m3_selfcheck_enabled():
+        # k=2 driving path armed: the 3-row kernels must be byte-exact (each
+        # verify row == M1 route, rows 0/1 == shipped M2) or install fails.
+        required_lanes = required_lanes + (
+            "a3b_whole_moe_target_m1_m3_row_parity",
+            "a3b_whole_moe_target_m2_m3_prefix_parity",
+        )
     failed = tuple(lane for lane in required_lanes if lanes.get(lane) != "ok")
     if failed:
         _STATS.update(
@@ -1023,9 +1156,19 @@ def install_a3b_whole_moe(
         )
         raise A3BWholeMoeConfigError(_STATS["installation_error"]) from exc
 
+    # Surface any opt-in k=2 (m3) parity lanes the selfcheck computed, so a
+    # build / GPU smoke can read the on-device byte-exactness result.  Never
+    # gating (not in required_lanes) -- the shipped depth-1 install is unchanged.
+    report_lanes = (selfcheck_report or {}).get("lanes", {}) or {}
+    m3_lanes = {
+        lane: status
+        for lane, status in report_lanes.items()
+        if "_m3_" in lane
+    }
     installed_lanes = {
         **{lane: lanes[lane] for lane in required_lanes},
         **{lane: full_graph_report[lane] for lane in full_graph_lanes},
+        **m3_lanes,
     }
     _STATS.update(
         {
@@ -1044,6 +1187,10 @@ def install_a3b_whole_moe(
                     for lane in required_lanes
                 },
                 **{lane: 0.0 for lane in full_graph_lanes},
+                **{
+                    lane: (selfcheck_report or {}).get("dmax", {}).get(lane)
+                    for lane in m3_lanes
+                },
             },
             "selfcheck_components": dict(
                 (selfcheck_report or {}).get("a3b_whole_moe_components") or {}

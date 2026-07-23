@@ -6063,6 +6063,12 @@ def generate_mtpk(
     device_d2_compile_time = 0.0
     device_d2_calls = 0
     device_d2_fallbacks = 0
+    # k=2 (depth-2) compiled target-prefix: a chained 2-draft producer for the
+    # [primary, d1, d2] verify, plus the two mid-window rebase states the last
+    # verify_m3 returned (post-row-0, post-row-1).  Dormant for K1.
+    compiled_k2_d2_core: dict[str, Any] | None = None
+    a3b_m3_rebase0_state = None
+    a3b_m3_rebase1_state = None
     device_core: dict[str, Any] | None = None
     device_core_compile_time = 0.0
     device_core_calls = 0
@@ -7312,6 +7318,45 @@ def generate_mtpk(
                 }
 
         used_device_core = used_device_d2_core
+        a3b_k2 = (
+            a3b_target_prefix_route is not None
+            and int(getattr(a3b_target_prefix_route, "speculative_depth", 1)) == 2
+        )
+        if a3b_k2 and not used_device_core:
+            # k=2 compiled path: produce the two chained greedy MTP drafts
+            # [d1, d2] on-device (one host sync) BEFORE the draft loop, then
+            # skip the loop (used_device_core).  d2 chains from d1's hidden --
+            # the same single-module recurrence characterized for a2~0.45; we
+            # measure the 3-row verify cost, and commits stay target-argmax so
+            # the greedy stream is byte-exact vs generate_ar regardless of a2.
+            k2_started = time.perf_counter()
+            if compiled_k2_d2_core is None:
+                compiled_k2_d2_core = _make_device_d2_draft_core(
+                    rt,
+                    draft_hidden,
+                    mx.array([[primary]]),
+                    mtp_hidden_variant=mtp_hidden_variant,
+                )
+            _k2_drafts = _run_device_d2_draft_core(
+                compiled_k2_d2_core, draft_hidden, int(primary)
+            )
+            draft_time += time.perf_counter() - k2_started
+            draft_tokens = [int(_k2_drafts[0]), int(_k2_drafts[1])]
+            draft_probs = [None, None]
+            for _k2_depth, _k2_tok in enumerate(draft_tokens):
+                drafted += 1
+                drafted_by_depth[_k2_depth] += 1
+                event["drafts"].append(
+                    {
+                        "depth": _k2_depth + 1,
+                        "token": _k2_tok,
+                        "timing_s": {"draft": 0.0},
+                        "mtp_corrector": None,
+                        "draft_core": "compiled-k2-d2",
+                    }
+                )
+            next_token = draft_tokens[-1]
+            used_device_core = True
         if _cc_draft_source_token is not None:
             # Copy streak owns this cycle's draft: one host token, no MTP
             # forward.  The accept path is draft-source-agnostic (the
@@ -7771,7 +7816,17 @@ def generate_mtpk(
         lazy_bonus_verify_min_depth = _lazy_bonus_verify_min_depth()
         lazy_bonus_verify_requested = _lazy_bonus_verify_enabled()
         omit_speculative_bonus = _omit_speculative_bonus_enabled()
-        if a3b_target_prefix_route is not None:
+        if a3b_target_prefix_route is not None and a3b_k2:
+            # 3-row verify [primary, d1, d2]; greedy needs all 3 target rows so
+            # the accept loop can commit a1/a2/a3 and pick the rebase point.
+            lazy_bonus_verify = False
+            bonus_distribution_row_needed = (
+                not omit_speculative_bonus and len(tokens) + 1 < max_tokens
+            )
+            target_distribution_rows_needed = 3
+            verified_token_count = 3
+            verify_input_array = mx.array([[int(primary), *draft_tokens]])
+        elif a3b_target_prefix_route is not None:
             lazy_bonus_verify = False
             bonus_distribution_row_needed = (
                 not omit_speculative_bonus and len(tokens) + 1 < max_tokens
@@ -7859,6 +7914,29 @@ def generate_mtpk(
                         hidden_variant=base_hidden_variant,
                         capture_backend=verify_core_backend,
                     )
+            elif a3b_target_prefix_route is not None and a3b_k2:
+                # k=2 3-row verify.  Returns the two mid-window rebase states
+                # (post-row-0, post-row-1); the accept loop picks which one the
+                # next cycle rebases from after a d1 or d2 reject.
+                if a3b_rebase_state is not None:
+                    (
+                        verify_logits,
+                        verify_hidden,
+                        a3b_m3_rebase0_state,
+                        a3b_m3_rebase1_state,
+                    ) = a3b_target_prefix_route.verify_m3_rebased(
+                        verify_input_array, a3b_rebase_state
+                    )
+                    a3b_rebase_state = None
+                else:
+                    (
+                        verify_logits,
+                        verify_hidden,
+                        a3b_m3_rebase0_state,
+                        a3b_m3_rebase1_state,
+                    ) = a3b_target_prefix_route.verify_m3(verify_input_array)
+                # a3b_primary_state (the K1 single-rebase leaf) is unused on the
+                # k=2 path: the reject rebase selects m3 rebase0/rebase1 instead.
             elif a3b_target_prefix_route is not None:
                 if a3b_rebase_state is not None:
                     # Deferred-correction fold: the pending correction is
@@ -7941,12 +8019,13 @@ def generate_mtpk(
                 target_distribution_logits,
                 sampler,
             )
-            if a3b_target_prefix_route is not None:
+            if a3b_target_prefix_route is not None and not a3b_k2:
                 _eval(sampled_target_ids, device_draft_token)
                 draft_token = int(np.asarray(device_draft_token).reshape(-1)[0])
                 draft_tokens[0] = draft_token
                 event["drafts"][0]["token"] = draft_token
             else:
+                # k=2 (and non-compiled) already hold host-int draft tokens.
                 _eval(sampled_target_ids)
             target_prefix_tokens = [
                 int(token) for token in np.asarray(sampled_target_ids).reshape(-1)
@@ -8614,7 +8693,19 @@ def generate_mtpk(
             # boundary row (the primary's verify row), the same hidden the
             # committed-history append pairs with the correction.
             pending_primary = int(rejection_correction)
-            a3b_rebase_state = a3b_primary_state
+            if a3b_k2:
+                # Rebase to the state matching the accepted prefix: 0 accepted
+                # -> post-row-0, 1 accepted -> post-row-1, 2 accepted -> the
+                # live post-row-2 state already written by verify_m3 (no
+                # rebase).  The next verify_m3 starts from here.
+                if accepted_count >= 2:
+                    a3b_rebase_state = None
+                elif accepted_count == 1:
+                    a3b_rebase_state = a3b_m3_rebase1_state
+                else:
+                    a3b_rebase_state = a3b_m3_rebase0_state
+            else:
+                a3b_rebase_state = a3b_primary_state
             deferred_correction_repairs += 1
             event["capture_repair"] = "route_pending_correction"
             event["pending_primary"] = int(rejection_correction)

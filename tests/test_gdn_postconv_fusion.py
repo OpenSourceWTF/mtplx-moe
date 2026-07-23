@@ -131,12 +131,13 @@ def test_exact_a3b_contract_installs_all_30_prebound_routes_after_selfcheck(
     assert isinstance(factory, gdn_capture.A3BGDNPostconvFactory)
     assert len(factory.m1_implementations) == 30
     assert len(factory.m2_implementations) == 30
+    assert len(factory.m3_implementations) == 30
     assert report["installed"] is True
     assert report["installation_status"] == "installed"
     assert report["gdn_layers"] == 30
     assert report["validated_contract"] == {
         "batch": 1,
-        "logical_m": [1, 2],
+        "logical_m": [1, 2, 3],
         "routes": {
             "m1_correction": {
                 "conv_shape": [1, 1, 8192],
@@ -149,6 +150,12 @@ def test_exact_a3b_contract_installs_all_30_prebound_routes_after_selfcheck(
                 "gate_shapes": {"a": [1, 2, 32], "b": [1, 2, 32]},
                 "output_shape": [1, 2, 32, 128],
                 "captured_states_shape": [1, 2, 32, 128, 128],
+            },
+            "m3_verify": {
+                "conv_shape": [1, 3, 8192],
+                "gate_shapes": {"a": [1, 3, 32], "b": [1, 3, 32]},
+                "output_shape": [1, 3, 32, 128],
+                "captured_states_shape": [1, 3, 32, 128, 128],
             },
         },
         "state_shape": [1, 32, 128, 128],
@@ -165,12 +172,13 @@ def test_exact_a3b_contract_installs_all_30_prebound_routes_after_selfcheck(
         for layer in model.language_model.model.layers
         if layer.is_linear
     )
-    for gdn, m1_impl, m2_impl in zip(
+    for gdn, m1_impl, m2_impl, m3_impl in zip(
         gdns,
         factory.m1_implementations,
         factory.m2_implementations,
+        factory.m3_implementations,
     ):
-        for implementation in (m1_impl, m2_impl):
+        for implementation in (m1_impl, m2_impl, m3_impl):
             assert implementation.keywords == {
                 "A_log": gdn.A_log,
                 "dt_bias": gdn.dt_bias,

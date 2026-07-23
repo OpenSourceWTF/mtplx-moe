@@ -45,12 +45,23 @@ _FULL_ATTENTION_INDICES = tuple(
 _PRIMARY_STATE_START = 2
 _FINAL_STATE_START = _PRIMARY_STATE_START + _STATE_LEAVES
 _M1_FINAL_STATE_START = 2
+# k=2 (m3) 3-row verify returns two mid-window rebase states -- after row 0
+# (d1 rejected -> continue from the row-0 correction) and after row 1 (d1
+# accepted, d2 rejected -> continue from the row-1 correction) -- then the
+# final post-row-2 state.
+_M3_REBASE0_STATE_START = 2
+_M3_REBASE1_STATE_START = 2 + _STATE_LEAVES
+_M3_FINAL_STATE_START = 2 + 2 * _STATE_LEAVES
 _FULL_ATTENTION_CACHE_STEP = 256
 _SHARED_M2_STEPS: dict[
     tuple[int, str],
     tuple[Callable[..., Any], dict[str, Any], weakref.ReferenceType[Any]],
 ] = {}
 _SHARED_M1_STEPS: dict[
+    tuple[int, str],
+    tuple[Callable[..., Any], dict[str, Any], weakref.ReferenceType[Any]],
+] = {}
+_SHARED_M3_STEPS: dict[
     tuple[int, str],
     tuple[Callable[..., Any], dict[str, Any], weakref.ReferenceType[Any]],
 ] = {}
@@ -289,6 +300,80 @@ def _make_a3b_k1_target_prefix_m1_step(
     return step
 
 
+def _make_a3b_k1_target_prefix_m3_step(
+    *,
+    host: dict[str, Any],
+) -> Callable[..., Any]:
+    """Build the fixed 3-row (k=2) verify trace ``[primary, d1, d2]``.
+
+    Structurally identical to the M2 step, but the postconv runs the M3 GDN
+    recurrence and the step returns TWO mid-window rebase states (post-row-0 and
+    post-row-1) so the accept loop can rebase after a d1 reject or a d2 reject
+    without a repair_m1 forward.  Python runs only while tracing.
+    """
+    spec = _STATE_SPEC
+
+    def step(input_ids, *state_in):
+        shadow = host["shadow"]
+        runtime = host["runtime_ref"]()
+        if runtime is None:
+            _fail("compiled A3B target-prefix runtime was released")
+        position = 0
+        for index, kind, leaves in spec:
+            entry = shadow[index]
+            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                entry.cache[0] = state_in[position]
+                entry.cache[1] = state_in[position + 1]
+                entry.cache[2] = state_in[position + 2]
+                entry.rollback_state[0] = None
+                entry.rollback_state[1] = None
+                entry.rollback_state[2] = None
+            else:
+                entry.cache[0] = state_in[position]
+                entry.cache[1] = state_in[position + 1]
+            position += leaves
+        with attention_phase("decode_verify"):
+            logits, hidden, captures = runtime._forward_ar_capture_a3b_postconv(
+                input_ids,
+                cache=shadow,
+                hidden_variant=host["hidden_variant"],
+                postconv_implementations=host["postconv_implementations"],
+            )
+        rebase0_state: list[Any] = []
+        rebase1_state: list[Any] = []
+        final_state: list[Any] = []
+        for index, kind, _leaves in spec:
+            entry = shadow[index]
+            if kind == VERIFY_SPEC_KIND_GDN:
+                layer_capture = captures[index]
+                rebase0_state.extend(
+                    (
+                        layer_capture["conv_states"][:, 0, :, :],
+                        layer_capture["states"][:, 0, :, :, :],
+                    )
+                )
+                rebase1_state.extend(
+                    (
+                        layer_capture["conv_states"][:, 1, :, :],
+                        layer_capture["states"][:, 1, :, :, :],
+                    )
+                )
+            else:
+                # 3 rows appended: post-row-0 offset = final - 2, post-row-1 =
+                # final - 1.  The KV buffers are shared; the next verify from a
+                # rebase overwrites the rejected speculative rows.
+                rebase0_state.extend(
+                    (entry.cache[0], entry.cache[1], entry.cache[2] - 2)
+                )
+                rebase1_state.extend(
+                    (entry.cache[0], entry.cache[1], entry.cache[2] - 1)
+                )
+            final_state.extend(entry.cache)
+        return (logits, hidden, *rebase0_state, *rebase1_state, *final_state)
+
+    return step
+
+
 def _shared_m2_step(
     runtime: Any,
     shadow: list[Any],
@@ -339,6 +424,31 @@ def _shared_m1_step(
     return compiled
 
 
+def _shared_m3_step(
+    runtime: Any,
+    shadow: list[Any],
+    hidden_variant: str | None,
+    postconv_implementations: tuple[Callable[..., Any], ...],
+) -> Callable[..., Any]:
+    key = (id(runtime), str(hidden_variant or ""))
+    entry = _SHARED_M3_STEPS.get(key)
+    if entry is not None:
+        compiled, host, runtime_ref = entry
+        if runtime_ref() is runtime:
+            host["shadow"] = shadow
+            return compiled
+        _SHARED_M3_STEPS.pop(key, None)
+    host = {
+        "shadow": shadow,
+        "runtime_ref": weakref.ref(runtime),
+        "hidden_variant": hidden_variant,
+        "postconv_implementations": postconv_implementations,
+    }
+    compiled = mx.compile(_make_a3b_k1_target_prefix_m3_step(host=host))
+    _SHARED_M3_STEPS[key] = (compiled, host, weakref.ref(runtime))
+    return compiled
+
+
 @dataclass
 class A3BK1TargetPrefixRoute:
     """Request-owned fixed M2 verifier and captured-primary M1 continuation."""
@@ -353,6 +463,10 @@ class A3BK1TargetPrefixRoute:
     prompt_tokens: int
     request_preflight_key: str | None = None
     request_preflight_status: str = "not_required"
+    # k=2 (depth-2) only: the compiled 3-row verify step; None for the shipped
+    # K1 route.  speculative_depth records which verify width the route serves.
+    compiled_m3: Callable[..., Any] | None = None
+    speculative_depth: int = 1
 
     def verify_m2(self, input_ids):
         return self._forward_m2(input_ids)
@@ -372,8 +486,46 @@ class A3BK1TargetPrefixRoute:
 
         return self._forward_m2(input_ids, state_in=list(primary_state))
 
+    def verify_m3(self, input_ids):
+        """k=2 verify of ``[primary, d1, d2]`` from the live state.
+
+        Returns ``(logits[1,3,V], hidden[1,3,H], rebase0_state, rebase1_state)``
+        -- the two mid-window states the accept loop rebases from when d1 or d2
+        is rejected.  The live state is advanced to post-row-2 (full accept);
+        the caller rewinds via a rebased verify when a draft is rejected.
+        """
+        return self._forward_m3(input_ids)
+
+    def verify_m3_rebased(self, input_ids, rebase_state):
+        """k=2 verify from a stashed mid-window rebase state (deferred fold)."""
+        return self._forward_m3(input_ids, state_in=list(rebase_state))
+
     def repair_m1(self, input_ids, primary_state):
         return self._forward_m1(input_ids, primary_state)
+
+    def _forward_m3(self, input_ids, state_in=None):
+        if self.compiled_m3 is None:
+            _fail("compiled A3B target-prefix m3 (k=2) step is not installed")
+        if state_in is None:
+            state_in = [container[slot] for container, slot in self.state_slots]
+        outputs = self.compiled_m3(input_ids, *state_in)
+        for (container, slot), value in zip(
+            self.state_slots,
+            outputs[_M3_FINAL_STATE_START:],
+        ):
+            container[slot] = value
+        for rollback in self.rollback_slots:
+            rollback[0] = None
+            rollback[1] = None
+            rollback[2] = None
+        mx.async_eval(*outputs)
+        rebase0_state = tuple(
+            outputs[_M3_REBASE0_STATE_START:_M3_REBASE1_STATE_START]
+        )
+        rebase1_state = tuple(
+            outputs[_M3_REBASE1_STATE_START:_M3_FINAL_STATE_START]
+        )
+        return outputs[0], outputs[1], rebase0_state, rebase1_state
 
     def _forward_m2(self, input_ids, state_in=None):
         if state_in is None:
@@ -430,14 +582,19 @@ class A3BK1TargetPrefixRoute:
             "fallback_reasons": {},
             "growth_demotions": 0,
             "request_max_tokens": self.request_max_tokens,
-            "max_verify_len": 2,
-            "speculative_headroom": 2,
+            "max_verify_len": 1 + int(self.speculative_depth),
+            "speculative_headroom": 1 + int(self.speculative_depth),
+            "speculative_depth": int(self.speculative_depth),
             "growth_reserve_tokens": self.growth_reserve_tokens,
             "prompt_tokens": self.prompt_tokens,
             "capture_backend": "stock",
             "device_draft_input": True,
-            "compiled_entry_count": 2,
-            "compiled_keys": ["m2:verify:b0", "m1:repair:b0"],
+            "compiled_entry_count": 3 if self.compiled_m3 is not None else 2,
+            "compiled_keys": (
+                ["m3:verify:b0", "m1:repair:b0"]
+                if self.compiled_m3 is not None
+                else ["m2:verify:b0", "m1:repair:b0"]
+            ),
             "request_preflight_key": self.request_preflight_key,
             "request_preflight_status": self.request_preflight_status,
             "permanent_eager": False,
@@ -524,16 +681,22 @@ def install_a3b_k1_target_prefix_route(
     require_request_preflight: bool = False,
 ) -> A3BK1TargetPrefixRoute:
     """Validate external request facts and construct the fixed route."""
+    # K1 (depth 1) is the shipped path; depth 2 (k=2, 3-row verify) is the
+    # opt-in experiment lane.  Both require the same stock target-prefix
+    # ownership; only the verify width differs.
     if (
         verify_strategy != "target_prefix"
-        or int(speculative_depth) != 1
-        or int(requested_speculative_depth) != 1
+        or int(speculative_depth) not in (1, 2)
+        or int(requested_speculative_depth) not in (1, 2)
+        or int(speculative_depth) != int(requested_speculative_depth)
         or str(verify_core) != "stock"
         or int(state_rebase_every) != 0
         or int(max_tokens) <= 0
         or int(prompt_tokens) <= 0
     ):
-        _fail("compiled A3B target-prefix requires exact K1 stock request ownership")
+        _fail("compiled A3B target-prefix requires exact stock request ownership")
+    if int(speculative_depth) == 2 and not factory.gdn_postconv.m3_implementations:
+        _fail("compiled A3B target-prefix depth 2 requires the installed M3 GDN postconv")
     if _owned_state_env_active("MTPLX_OWNED_ATTN_KV") or _owned_state_env_active(
         "MTPLX_OWNED_RECURRENT_STATE"
     ):
@@ -569,6 +732,17 @@ def install_a3b_k1_target_prefix_route(
             hidden_variant,
             factory.gdn_postconv.m1_implementations,
         ),
+        compiled_m3=(
+            _shared_m3_step(
+                runtime,
+                shadow,
+                hidden_variant,
+                factory.gdn_postconv.m3_implementations,
+            )
+            if int(speculative_depth) == 2
+            else None
+        ),
+        speculative_depth=int(speculative_depth),
         state_slots=tuple(state_slots),
         rollback_slots=tuple(rollback_slots),
         request_max_tokens=int(max_tokens),

@@ -429,7 +429,9 @@ def test_external_contract_mismatch_fails_before_install(
 
 def test_fixed_kernel_sources_encode_exact_geometry_without_hot_validation():
     sources = kernel_module.all_whole_moe_sources()
-    assert len(sources) == 12
+    # 12 shipped K1 kernels + 4 k=2 (m3) kernels: stage1 projection/finalizer,
+    # stage2, stage3 recompiled at ROWS=3.
+    assert len(sources) == 16
     for source in sources.values():
         assert "constexpr uint HIDDEN = 2048" in source
         assert "constexpr uint EXPERTS = 256" in source
@@ -545,6 +547,10 @@ def test_fixed_entrypoint_launch_table(monkeypatch):
         "mtp_m1_stage3": ((128 * 128, 1, 1), (128, 1, 1)),
         "target_m2r1_stage2": ((288 * 128, 1, 1), (128, 1, 1)),
         "target_m2r1_stage3": ((128 * 128, 1, 1), (128, 1, 1)),
+        "target_m3_stage1_projection": ((8 * 256, 1, 1), (256, 1, 1)),
+        "target_m3_stage1_finalizer": ((256, 1, 1), (256, 1, 1)),
+        "target_m3_stage2": ((288 * 128, 1, 1), (128, 1, 1)),
+        "target_m3_stage3": ((128 * 128, 1, 1), (128, 1, 1)),
     }
     assert kernel_module.whole_moe_launch_table() == expected
 
@@ -747,9 +753,16 @@ def test_all_fixed_entrypoints_launch_directly_without_runtime_validation(monkey
     target = plan.target_bindings[0]
     mtp = plan.mtp_bindings[0]
     for name, (grid, threadgroup) in kernel_module.whole_moe_launch_table().items():
-        if name.startswith("target_m2_stage1_"):
+        if name.startswith(("target_m2_stage1_", "target_m3_stage1_")):
+            # Split projection/finalizer stage1 kernels have no per-split
+            # entrypoint; the combined target_m2_stage1 / target_m3_stage1 are
+            # exercised separately.
             continue
-        rows = 1 if "m2r1" in name else (2 if "m2" in name else 1)
+        rows = (
+            1
+            if "m2r1" in name
+            else (3 if "m3" in name else (2 if "m2" in name else 1))
+        )
         binding = mtp if name.startswith("mtp") else target
         captured = _CapturedKernel()
         monkeypatch.setattr(
@@ -1020,6 +1033,11 @@ def _patch_whole_moe_stages(monkeypatch):
         "_target_m1_route",
         lambda binding: lambda value: _ResultSpec("target_m1", value.shape),
     )
+    monkeypatch.setattr(
+        whole_moe_module,
+        "_target_m3_route",
+        lambda binding: lambda value: _ResultSpec("target_m3", value.shape),
+    )
 
 
 def test_installed_partition_prebinds_all_four_exact_target_m2_kernels():
@@ -1167,7 +1185,10 @@ def test_installed_route_delegates_everything_except_target_m2(monkeypatch):
     phase["value"] = "decode_verify"
     assert targets[0](_ArraySpec((1, 2, 2048))).label == "target_m2"
     assert targets[0](_ArraySpec((1, 1, 2048))).label == "target_m1"
-    assert targets[0](_ArraySpec((1, 3, 2048))).label == "accepted_target"
+    # 3-row verify [primary, d1, d2] now routes to the k=2 fused M3 kernel
+    # (byte-exact per row to the M1 route) instead of delegating to stock.
+    assert targets[0](_ArraySpec((1, 3, 2048))).label == "target_m3"
+    assert targets[0](_ArraySpec((1, 4, 2048))).label == "accepted_target"
     assert len(targets[0].stock_calls) == 3
     assert len(mtp[0].stock_calls) == 2
 
