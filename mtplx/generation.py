@@ -93,8 +93,17 @@ _PREFILL_CHUNK_SIZE_OVERRIDE: ContextVar[int | None] = ContextVar(
 
 
 def reject_non_k1_a3b_whole_moe_request(rt: MTPLXRuntime, *, entrypoint: str) -> None:
-    """Reject unsupported generation modes once, before they construct a prompt."""
+    """Reject unsupported generation modes once, before they construct a prompt.
 
+    generate_ar is supported: every one of its decode forwards is a single
+    row, which the installed M1 route serves with per-row arithmetic that
+    bit-matches the M2 verify route (enforced at install by the
+    a3b_whole_moe_target_m1_m2_row_parity selfcheck lane).  Pure AR under
+    whole-MoE is the ground-truth arm of the K1 AR-exactness gate.
+    """
+
+    if entrypoint == "generate_ar":
+        return
     if bool(getattr(rt, "a3b_whole_moe_installed", False)):
         raise RuntimeError(
             f"installed A3B whole-MoE is owned by exact K1 generate_mtpk, not {entrypoint}"
@@ -5706,9 +5715,32 @@ def generate_mtpk(
     # while the #186 phase-3 grammar clamp expects a grammar-illegal
     # correction to be dropped so the next masked primary resamples it.
     # The stock target_prefix lane below carries that contract.
+    #
+    # Context-copy on this lane is a DRAFT SOURCE (a prompt match feeds the
+    # depth-1 draft; see context_copy_target_prefix_enabled), which conflicts
+    # with the compiled K1 route's device-draft (R1) contract.  So the
+    # compiled route stays STRICTLY K1/device-drafted: when the opt-in flag
+    # takes over the lane, the route steps aside (exactly like the constraint
+    # case) and the whole request runs the non-compiled target_prefix lane,
+    # whose 2-row verify cycles are byte-exact to AR for any draft source.
+    # The two improvement families never share a cycle: the compiled route
+    # wins on pure-K1 requests, prompt-lookup drafting wins on the
+    # non-compiled lane.  Keyed on the FLAG (not on whether streaks fire) so
+    # ccopy-off on this lane is a clean byte-exactness baseline.  Whole-MoE
+    # (needs the compiled route) and penalties (disable ccopy) both keep the
+    # compiled route -- mirrors the ccopy_active gate below.
+    from .context_copy import (
+        context_copy_target_prefix_enabled as _cc_tp_enabled_early,
+    )
+    _ccopy_takes_over_lane = (
+        target_prefix_verify
+        and _cc_tp_enabled_early()
+        and not (bool(sampler.presence_penalty) or bool(sampler.frequency_penalty))
+        and not bool(getattr(rt, "a3b_whole_moe_installed", False))
+    )
     exact_a3b_target_prefix_factory = (
         rt.a3b_compiled_target_prefix_factory
-        if target_prefix_verify and constraint is None
+        if target_prefix_verify and constraint is None and not _ccopy_takes_over_lane
         else None
     )
     exact_a3b_target_prefix = exact_a3b_target_prefix_factory is not None
@@ -5936,6 +5968,7 @@ def generate_mtpk(
         else None
     )
     a3b_target_prefix_route = None
+    a3b_rebase_state = None  # stashed post-primary state for a deferred correction
     snapshot_time = accept_time = rollback_time = repair_time = 0.0
     commit_time = capture_commit_time = 0.0
     bonus_time = 0.0
@@ -6652,24 +6685,56 @@ def generate_mtpk(
     # capture-commit verify strategies ----
     from .context_copy import (NgramIndex, block_for_ext, context_copy_block_k,
                                context_copy_enabled, context_copy_min_ext,
-                               context_copy_ng_max, context_copy_ng_min)
+                               context_copy_ng_max, context_copy_ng_min,
+                               context_copy_target_prefix_enabled)
     # Temperature is supported through the same probability-ratio acceptance
     # as the MTP path: the copy block is a point-mass proposal, so a copied
     # token is accepted with the target's own shaped probability and a
     # rejection samples the residual — the output law is exactly the target
     # sampling distribution at any temperature (no greedy shortcut).
+    #
+    # Copy rounds normally require a capture-commit verify strategy.  The opt-in
+    # MTPLX_CONTEXT_COPY_TARGET_PREFIX flag also enables the target_prefix
+    # lane-takeover, where context-copy is a DRAFT SOURCE (streaks feed the
+    # depth-1 draft; block rounds stay capture_commit-only -- their T+1-row
+    # forwards are not AR-exact).  With whole-MoE installed the compiled
+    # route is kept and the flag is inert, recorded via disabled_reason.
+    _ccopy_capture_lane = verify_strategy in {"capture_commit", "graphbank_capture_commit"}
+    _ccopy_tp_requested = (
+        context_copy_target_prefix_enabled() and verify_strategy == "target_prefix"
+    )
+    _ccopy_whole_moe_conflict = _ccopy_tp_requested and bool(
+        getattr(rt, "a3b_whole_moe_installed", False)
+    )
     ccopy_active = (
         context_copy_enabled()
         and not _penalties_active
-        and verify_strategy in {"capture_commit", "graphbank_capture_commit"}
+        and (_ccopy_capture_lane or (_ccopy_tp_requested and not _ccopy_whole_moe_conflict))
     )
     ccopy_rounds = ccopy_drafted = ccopy_accepted = 0
     ccopy_probes = ccopy_blocks_accepted = ccopy_suspensions = 0
     ccopy_disabled_reason = None
+    if _ccopy_whole_moe_conflict:
+        # Requested the target_prefix takeover but whole-MoE is installed:
+        # whole-MoE requires the compiled route, whose device-draft contract
+        # excludes draft substitution.  The compiled route is kept.
+        ccopy_disabled_reason = "whole_moe_keeps_compiled_route"
     ccopy_ema, ccopy_seen, ccopy_suspend_until = 0.5, 0, 0
     ccopy_backoff = 64   # doubles on each suspension (self-repetitive novel text would
                          # otherwise re-trigger copy rounds after every backoff and pay
                          # the probe cost recurrently); a paying round resets it.
+    # Draft-source streak state (target_prefix takeover lane): the copy match
+    # feeds the depth-1 DRAFT instead of a block round, so every forward stays
+    # on the lane's proven 2-row verify geometry -- bit-exact by construction.
+    # _cc_src_idx = next prompt index the streak proposes; the streak advances
+    # by diffing committed tokens against the prompt continuation and breaks on
+    # the first mismatch (covers accept, bonus, and correction paths without
+    # touching the accept machinery).
+    _cc_src_idx: int | None = None
+    _cc_src_check_from = 0
+    _cc_streak_drafted = 0
+    _cc_streak_accepted = 0
+    _cc_streak_outstanding = 0  # substituted drafts not yet seen by the sync
     ccopy_index = None
     ccopy_k = context_copy_block_k()
     ccopy_min_ext = context_copy_min_ext()
@@ -6860,8 +6925,79 @@ def generate_mtpk(
         trace_current_mtp_cache = (
             mtp_cache if mtp_cache is not None else mtp_history_cache
         )
+        # ---- context-copy as DRAFT SOURCE (target_prefix takeover lane) ----
+        # The block-round machinery is NOT AR-exact on this lane: its T+1-row
+        # block forward runs M>2 kernel paths (stock gather_qmm fallbacks)
+        # whose retained rows differ at ulp scale from the M<=2 decode path,
+        # surfacing as delayed argmax flips (windows 083910/085411).  Feeding
+        # the copy match as the depth-1 draft keeps every forward on the
+        # proven 2-row cycle: the accepted token is always the pre-sampled
+        # target id, so the emitted stream is bit-exact for ANY draft source,
+        # at any temperature.  MTP head compute is skipped during a streak.
+        if ccopy_active and _ccopy_takes_over_lane:
+            if _cc_src_idx is not None:
+                for _cc_committed in tokens[_cc_src_check_from:]:
+                    if _cc_src_idx < len(prompt_ids) and int(_cc_committed) == int(
+                        prompt_ids[_cc_src_idx]
+                    ):
+                        _cc_src_idx += 1
+                        # Acceptance stats count only tokens WE drafted; a
+                        # bonus/primary token that happens to continue the
+                        # prompt match advances the streak but is the
+                        # verify's own win, not copy acceptance.
+                        if _cc_streak_outstanding > 0:
+                            _cc_streak_outstanding -= 1
+                            _cc_streak_accepted += 1
+                            ccopy_accepted += 1
+                    else:
+                        _cc_src_idx = None
+                        _cc_streak_outstanding = 0
+                        break
+                if _cc_src_idx is not None and _cc_src_idx >= len(prompt_ids):
+                    _cc_src_idx = None
+                if _cc_src_idx is None:
+                    # Streak over: same acceptance-EMA suspend/backoff contract
+                    # as the round path, per streak.
+                    _cc_ratio = (
+                        _cc_streak_accepted / _cc_streak_drafted
+                        if _cc_streak_drafted
+                        else 0.0
+                    )
+                    ccopy_ema = 0.7 * ccopy_ema + 0.3 * min(1.0, _cc_ratio)
+                    ccopy_seen += 1
+                    if _cc_ratio >= 0.5:
+                        ccopy_backoff = 64
+                    if ccopy_seen >= 4 and ccopy_ema < 0.35:
+                        ccopy_suspend_until = len(tokens) + ccopy_backoff
+                        ccopy_backoff = min(ccopy_backoff * 2, 4096)
+                        ccopy_ema, ccopy_seen = 0.5, 0
+                        ccopy_suspensions += 1
+            _cc_src_check_from = len(tokens)
+            if _cc_src_idx is None and len(tokens) >= ccopy_suspend_until:
+                ccopy_probes += 1
+                _cc_pos, _cc_ext = ccopy_index.find(
+                    prompt_ids + tokens, max_pos=len(prompt_ids)
+                )
+                if (
+                    _cc_pos is not None
+                    and _cc_ext >= ccopy_min_ext
+                    and int(_cc_pos) < len(prompt_ids)
+                ):
+                    _cc_src_idx = int(_cc_pos)
+                    _cc_streak_drafted = 0
+                    _cc_streak_accepted = 0
+                    _cc_streak_outstanding = 0
+                    ccopy_rounds += 1
+                    event["context_copy"] = {
+                        "mode": "draft_source",
+                        "extension": int(_cc_ext),
+                        "at_tokens": len(tokens),
+                        "block": 0,
+                        "accepted": 0,
+                        "correction": None,
+                    }
         # ---- context-copy round: verbatim block from context, no MTP compute this cycle ----
-        if ccopy_active and cycle_depth >= 1 and len(tokens) >= ccopy_suspend_until:
+        if ccopy_active and _ccopy_capture_lane and cycle_depth >= 1 and len(tokens) >= ccopy_suspend_until:
             _cc_hist = prompt_ids + tokens
             ccopy_probes += 1
             # Prompt-only contract: candidates whose continuation starts at the
@@ -6996,6 +7132,7 @@ def generate_mtpk(
                     event["context_copy"] = {"disabled": "no_per_position_commit"}
                     append_event(event)
                     continue
+                _cc_round_pos = len(tokens)
                 _cc_acc = _cc_block[:_cc_nacc]
                 _cc_stop_idx = next((i for i, t in enumerate(_cc_acc)
                                      if _is_stop(int(t), stop_token_ids)), None)
@@ -7047,6 +7184,12 @@ def generate_mtpk(
                     "correction": (
                         int(_cc_correction) if _cc_correction is not None else None
                     ),
+                    # Completion-stream position of the round (tokens emitted
+                    # BEFORE this round's block landed): byte-exactness gates
+                    # correlate a divergence index with round windows to tell
+                    # an accept/continuation fault from post-commit state
+                    # corruption.
+                    "at_tokens": int(_cc_round_pos),
                 }
                 # Committed-history MTP caches pair every committed token with the
                 # hidden state of the token before it, including (previous hidden,
@@ -7070,9 +7213,24 @@ def generate_mtpk(
         next_token = primary
         device_draft_token = None
 
+        # Copy-streak draft substitution: propose the prompt continuation as
+        # this cycle's depth-1 draft and skip MTP head compute entirely.  The
+        # compiled route keeps its device-draft contract (no substitution).
+        _cc_draft_source_token: int | None = None
+        if (
+            _cc_src_idx is not None
+            and a3b_target_prefix_route is None
+            and cycle_depth == 1
+        ):
+            _cc_draft_source_token = int(prompt_ids[_cc_src_idx])
+            _cc_streak_drafted += 1
+            _cc_streak_outstanding += 1
+            ccopy_drafted += 1
+
         used_device_d2_core = False
         device_d2_eligible = (
-            draft_core == "device-d2"
+            _cc_draft_source_token is None
+            and draft_core == "device-d2"
             and cycle_depth == 2
             and speculative_depth == 2
             and mtp_cache_policy == "persistent"
@@ -7154,7 +7312,24 @@ def generate_mtpk(
                 }
 
         used_device_core = used_device_d2_core
-        if not used_device_core and draft_core == "device":
+        if _cc_draft_source_token is not None:
+            # Copy streak owns this cycle's draft: one host token, no MTP
+            # forward.  The accept path is draft-source-agnostic (the
+            # accepted token is always the pre-sampled target id).
+            draft_tokens = [int(_cc_draft_source_token)]
+            draft_probs = [None]
+            next_token = int(_cc_draft_source_token)
+            used_device_core = True  # skip the host MTP drafting loop below
+            event["drafts"].append(
+                {
+                    "depth": 1,
+                    "token": int(_cc_draft_source_token),
+                    "timing_s": {"draft": 0.0},
+                    "mtp_corrector": None,
+                    "draft_core": "context_copy",
+                }
+            )
+        elif not used_device_core and draft_core == "device":
             device_core_eligible = (
                 2 <= cycle_depth <= 5
                 and cycle_depth == speculative_depth
@@ -7685,9 +7860,21 @@ def generate_mtpk(
                         capture_backend=verify_core_backend,
                     )
             elif a3b_target_prefix_route is not None:
-                verify_logits, verify_hidden, a3b_primary_state = (
-                    a3b_target_prefix_route.verify_m2(verify_input_array)
-                )
+                if a3b_rebase_state is not None:
+                    # Deferred-correction fold: the pending correction is
+                    # this cycle's primary and the verify runs from the
+                    # stashed post-primary state of the cycle that rejected
+                    # it -- the repair_m1 forward never happens.
+                    verify_logits, verify_hidden, a3b_primary_state = (
+                        a3b_target_prefix_route.verify_m2_rebased(
+                            verify_input_array, a3b_rebase_state
+                        )
+                    )
+                    a3b_rebase_state = None
+                else:
+                    verify_logits, verify_hidden, a3b_primary_state = (
+                        a3b_target_prefix_route.verify_m2(verify_input_array)
+                    )
             elif compiled_verify_bank is not None:
                 # Replace only the target forward. target_prefix keeps its
                 # authoritative snapshot/trim, pre-sampling, and correction
@@ -8129,7 +8316,10 @@ def generate_mtpk(
                 event["drafts"][depth_index]["online_correction_cache"][
                     "stored_token"
                 ] = cached_target
-            if sampler.temperature > 0 and (
+            if (
+                sampler.temperature > 0
+                or a3b_target_prefix_route is not None
+            ) and (
                 constraint is None
                 or constraint.validate_prefix(
                     [*draft_tokens[:depth_index], int(correction)]
@@ -8138,6 +8328,12 @@ def generate_mtpk(
             ):
                 # A grammar-illegal residual correction is dropped, not
                 # committed; the masked primary resamples the position.
+                # Greedy normally defers the correction to the next cycle's
+                # argmax over the retained rejection row, but the compiled
+                # K1 route's fixed cycle geometry commits + repair-forwards
+                # the correction in-cycle, so it must be recorded at any
+                # temperature -- under greedy `correction` IS the
+                # pre-sampled argmax target id (the AR token).
                 rejection_correction = int(correction)
             break
         elapsed_accept = max(
@@ -8409,19 +8605,19 @@ def generate_mtpk(
             committed.append(rejection_correction)
             correction_tokens += 1
             tokens.extend(committed[1:])
-            started = time.perf_counter()
-            with attention_phase("decode_verify"):
-                repair_logits, repair_hidden, _repair_captures = (
-                    a3b_target_prefix_route.repair_m1(
-                        mx.array([[rejection_correction]]),
-                        a3b_primary_state,
-                    )
-                )
-            _eval(repair_logits, repair_hidden)
-            elapsed_repair = time.perf_counter() - started
-            target_time += elapsed_repair
-            repair_time += elapsed_repair
-            _add_timing(event, "repair_forward", elapsed_repair)
+            # Deferred-correction fold: no repair_m1 forward.  The correction
+            # is emitted as the pending primary; the next verify runs the M2
+            # graph FROM the stashed post-primary state and computes the
+            # correction's row itself.  Byte-neutral vs repair: M2 row-0
+            # arithmetic is install-enforced bit-identical to the fused M1
+            # route.  Drafting for the folded cycle consumes the rejection
+            # boundary row (the primary's verify row), the same hidden the
+            # committed-history append pairs with the correction.
+            pending_primary = int(rejection_correction)
+            a3b_rebase_state = a3b_primary_state
+            deferred_correction_repairs += 1
+            event["capture_repair"] = "route_pending_correction"
+            event["pending_primary"] = int(rejection_correction)
             if _mtp_history_uses_committed_cache(mtp_history_policy):
                 _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
                 draft_time += append_mtp_history(
@@ -8429,11 +8625,11 @@ def generate_mtpk(
                     verify_hidden[:, 0:1, :],
                     [rejection_correction],
                 )
-            cache_committed_token_count = len(tokens)
+            cache_committed_token_count = max(0, len(tokens) - 1)
             maybe_detach_dirty_state(cache_committed_token_count)
             logits, hidden = own_live_logits_hidden(
-                repair_logits[:, -1, :],
-                repair_hidden[:, -1:, :],
+                verify_logits[:, 0:1, :].reshape(1, -1),
+                verify_hidden[:, 0:1, :],
             )
             maybe_rebase_decode_state(cache_committed_token_count)
             maybe_eval_state_roots(event, cache_committed_token_count)
@@ -8548,30 +8744,27 @@ def generate_mtpk(
                 )
                 event["capture_repair"] = "trimmed_prefix_commit"
             else:
-                started = time.perf_counter()
-                with attention_phase("decode_verify"):
-                    if compiled_verify_bank is not None:
-                        repair_logits, repair_hidden, _repair_captures = (
-                            compiled_verify_bank.forward_ar_capture(
-                                mx.array([[int(rejection_correction)]]),
-                                cache=cache,
-                                return_hidden=True,
-                                hidden_variant=base_hidden_variant,
-                            )
-                        )
-                    else:
-                        repair_logits, repair_hidden = rt.forward_ar(
-                            mx.array([[int(rejection_correction)]]),
-                            cache=cache,
-                            return_hidden=True,
-                            hidden_variant=base_hidden_variant,
-                        )
-                _eval(repair_logits, repair_hidden)
-                elapsed_repair = time.perf_counter() - started
-                target_time += elapsed_repair
-                repair_time += elapsed_repair
-                _add_timing(event, "repair_forward", elapsed_repair)
-                event["capture_repair"] = "trimmed_prefix_correction_forward"
+                # Deferred correction repair (the 2.3.0 capture-commit fix,
+                # ported to the trim lane): the correction is emitted now and
+                # becomes the pending primary, whose KV is computed by
+                # whichever forward runs next -- no dedicated one-row
+                # correction forward.  Drafting needs the hidden of the token
+                # BEFORE the pending primary, which is exactly the retained
+                # verify row at the rejection boundary; the trim commit
+                # already restored the cache to the committed prefix, the
+                # same state the old correction forward ran on.
+                repair_logits, repair_hidden = own_live_logits_hidden(
+                    verify_logits[
+                        :, committed_prefix_len - 1 : committed_prefix_len, :
+                    ],
+                    verify_hidden[
+                        :, committed_prefix_len - 1 : committed_prefix_len, :
+                    ],
+                )
+                pending_primary = int(rejection_correction)
+                deferred_correction_repairs += 1
+                event["capture_repair"] = "trimmed_prefix_pending_correction"
+                event["pending_primary"] = int(rejection_correction)
         else:
             if before_verify is None:
                 raise RuntimeError(
@@ -8693,8 +8886,10 @@ def generate_mtpk(
     compiled_verify_report: dict[str, Any] | None = None
     if a3b_target_prefix_route is not None:
         compiled_verify_report = a3b_target_prefix_route.final_report(
+            # Corrections are deferred into rebased M2 verifies; repair_m1 is
+            # never dispatched, so m1_calls reports the truth: zero.
             verify_calls=verify_calls,
-            repair_calls=correction_tokens,
+            repair_calls=correction_tokens - deferred_correction_repairs,
         )
         a3b_target_prefix_route.demote()
     elif compiled_verify_bank is not None:

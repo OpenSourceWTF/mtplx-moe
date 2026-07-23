@@ -78,10 +78,11 @@ class A3BWholeMoeInstallPlan:
 
 @dataclass(frozen=True)
 class _TargetA3BWholeMoeRoute:
-    """Prebound accepted execution plus the exact target-M2 override."""
+    """Prebound accepted execution plus the exact target M2/M1 overrides."""
 
     accepted_call: Callable[[Any, Any], Any]
     m2_call: Callable[[Any], Any]
+    m1_call: Callable[[Any], Any]
 
 
 _SELFCHECK_LIMITS = {
@@ -125,7 +126,7 @@ def _validated_contract() -> dict[str, Any]:
             "shared_down": "affine_q4_group64_[2048,64]",
             "shared_scalar_gate": "affine_q8_group64_[1,512]",
             "routes": {
-                "M1": "accepted_row_owned_router_combine",
+                "M1": "m2_row_arithmetic_at_rows1_stage23_row_parity",
                 "M2": "fixed_tiled_stage1_stage23_one_read_row_paired",
             },
         },
@@ -642,19 +643,34 @@ def _packed_stage12_unchecked(
 
 
 def _target_m1_route(binding: A3BWholeMoeBinding) -> Callable[[Any], Any]:
-    """Bind exact target M1 row routing, packed gate/up, and fused down."""
+    """Bind the M1 decode route with M2-arithmetic stage2/stage3 at ROWS=1.
 
-    stage3 = kernel_module.bind_target_m1_stage3(binding)
+    Per-row bit-parity with the M2 verify route is the AR-exactness
+    contract: a greedy K1 request must byte-match greedy generate_ar of the
+    same serving configuration, so the single-row decode forwards must
+    compute the exact per-row arithmetic of the M2 verify kernels.  Stage1
+    (precise-softmax row-owned routing + shared scalar gate) is bit-equal
+    to the fused M2 stage1 and its ids are exact integers; stage2/stage3
+    run the M2 kernel sources compiled at ROWS=1 (the routed loop and the
+    row-0 chains are textually identical to the M2 kernels).  The install
+    selfcheck enforces row parity at limit 0.0.
+    """
 
     def call(value: Any):
-        expert_ids, route_scores, shared_gate, activations = (
-            _packed_stage12_unchecked(value, binding, rows=1)
+        expert_ids, route_scores, shared_gate = _row_owned_stage1_unchecked(
+            value,
+            binding,
+            rows=1,
         )
-        return stage3(
+        activations = kernel_module.target_m2r1_stage2(
+            value, expert_ids, binding
+        )
+        return kernel_module.target_m2r1_stage3(
             activations,
             expert_ids,
             route_scores,
             shared_gate,
+            binding,
         ).reshape(1, 1, 2048)
 
     return call
@@ -683,6 +699,25 @@ def _mtp_m1_route(binding: A3BWholeMoeBinding) -> Callable[[Any], Any]:
         ).reshape(1, 1, 2048)
 
     return call
+
+
+def _check_whole_moe_m1_m2_row_parity(binding: A3BWholeMoeBinding) -> float:
+    """Max abs diff between M2 rows and the M1 route run per row (limit 0.0)."""
+
+    fixture = mx.arange(2 * 2048, dtype=mx.float32).reshape(1, 2, 2048)
+    value = (
+        mx.sin(fixture * 0.013) * 0.25
+        + mx.cos(fixture * 0.007) * 0.0625
+    ).astype(mx.bfloat16)
+    m2_out = _target_m2_route(binding)(value)
+    m1_route = _target_m1_route(binding)
+    row0 = m1_route(value[:, 0:1, :])
+    row1 = m1_route(value[:, 1:2, :])
+    mx.eval(m2_out, row0, row1)
+    return max(
+        _max_abs_diff(m2_out[:, 0:1, :], row0),
+        _max_abs_diff(m2_out[:, 1:2, :], row1),
+    )
 
 
 def _max_abs_diff(candidate: Any, reference: Any) -> float:
@@ -845,6 +880,22 @@ def run_a3b_whole_moe_selfcheck(
             )
             else "failed"
         )
+    # M1/M2 per-row bit-parity: the AR-exactness contract.  The M1 decode
+    # route must reproduce each M2 verify row EXACTLY (limit 0.0) or a greedy
+    # K1 request cannot byte-match greedy generate_ar of the same config.
+    parity_lane = "a3b_whole_moe_target_m1_m2_row_parity"
+    parity_dmax = 0.0
+    for binding in plan.target_bindings:
+        try:
+            parity_dmax = max(
+                parity_dmax, _check_whole_moe_m1_m2_row_parity(binding)
+            )
+        except Exception:
+            parity_dmax = float("inf")
+            break
+    component_report[parity_lane] = {"row_parity": parity_dmax}
+    dmax[parity_lane] = parity_dmax
+    lanes[parity_lane] = "ok" if parity_dmax == 0.0 else "failed"
     report["lanes"] = lanes
     report["dmax"] = dmax
     report["a3b_whole_moe_components"] = component_report
@@ -852,14 +903,24 @@ def run_a3b_whole_moe_selfcheck(
 
 
 def _target_a3b_whole_moe_call(self: Any, value: Any) -> Any:
-    """Override only exact target verification M2 after construction."""
+    """Override exact target decode forwards after construction.
+
+    Verify rows (2) run the fused M2 route; single decode rows (the route's
+    repair forward and pure-AR decode) run the M1 route, whose per-row
+    arithmetic bit-matches M2 -- the whole decode-time model function is one
+    consistent arithmetic, which is what makes the greedy K1 stream
+    byte-comparable to greedy generate_ar of the same configuration.
+    Prefill keeps the stock path (identical for every entrypoint).
+    """
 
     route = type(self)._mtplx_a3b_whole_moe_route
     phase = current_attention_phase()
-    if phase == "decode_verify":
+    if phase in ("decode_verify", "ar_decode"):
         rows = math.prod(int(dimension) for dimension in value.shape[:-1])
         if rows == 2:
             return route.m2_call(value)
+        if rows == 1:
+            return route.m1_call(value)
     return route.accepted_call(self, value)
 
 
@@ -886,6 +947,7 @@ def _route_for_binding(
     return _TargetA3BWholeMoeRoute(
         accepted_call=type(binding.block).__call__,
         m2_call=_target_m2_route(binding),
+        m1_call=_target_m1_route(binding),
     )
 
 
@@ -898,7 +960,10 @@ def install_a3b_whole_moe(
     """Commit the 40 target-M2 overrides after exact compiled preflight."""
 
     lanes = {} if selfcheck_report is None else selfcheck_report.get("lanes", {})
-    required_lanes = ("a3b_whole_moe_target_m2",)
+    required_lanes = (
+        "a3b_whole_moe_target_m2",
+        "a3b_whole_moe_target_m1_m2_row_parity",
+    )
     failed = tuple(lane for lane in required_lanes if lanes.get(lane) != "ok")
     if failed:
         _STATS.update(

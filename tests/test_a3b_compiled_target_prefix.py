@@ -259,21 +259,84 @@ def test_request_construction_trusts_finalized_model_factory() -> None:
         assert forbidden not in construction_source
 
 
-@pytest.mark.parametrize(
-    "sampler",
-    (
-        SamplerConfig(temperature=0.0, top_p=1.0, top_k=20),
-        SamplerConfig(temperature=0.6, top_p=0.95, top_k=0),
-    ),
-)
-def test_exact_request_rejects_unsupported_sampler_before_prompt_construction(
-    sampler,
-) -> None:
+def test_exact_request_rejects_unsupported_sampler_before_prompt_construction() -> None:
     with pytest.raises(
         a3b_target.A3BCompiledTargetPrefixConfigError,
         match="stochastic top-k sampler",
     ):
-        a3b_target.validate_a3b_k1_target_prefix_sampler(sampler)
+        a3b_target.validate_a3b_k1_target_prefix_sampler(
+            SamplerConfig(temperature=0.6, top_p=0.95, top_k=0)
+        )
+
+
+@pytest.mark.parametrize(
+    "sampler",
+    (
+        SamplerConfig(temperature=0.0, top_p=1.0, top_k=20),
+        SamplerConfig(temperature=0.0, top_p=1.0, top_k=0),
+        SamplerConfig(temperature=-1.0, top_p=1.0, top_k=0),
+    ),
+)
+def test_exact_request_accepts_greedy_as_deterministic_argmax_contract(
+    sampler,
+) -> None:
+    # Greedy is the AR-exactness gate lane: every route sample site
+    # degenerates to argmax, so the request is deterministic end-to-end.
+    a3b_target.validate_a3b_k1_target_prefix_sampler(sampler)
+
+
+def test_takeover_lane_uses_draft_source_not_block_rounds() -> None:
+    # The block-round machinery is not AR-exact on the target_prefix lane
+    # (M>2 forwards leave ulp-perturbed retained rows).  The takeover lane
+    # must feed the copy match as the depth-1 draft (2-row proven geometry)
+    # and leave block rounds to the capture_commit lane.
+    from mtplx import generation
+
+    source = inspect.getsource(generation.generate_mtpk)
+    round_gate = source.index(
+        "if ccopy_active and _ccopy_capture_lane and cycle_depth >= 1"
+    )
+    assert round_gate > 0
+    substitution = source.index("_cc_draft_source_token: int | None = None")
+    assert "a3b_target_prefix_route is None" in source[substitution:substitution + 400]
+    # The streak proposes from the prompt and never runs its own forward.
+    streak = source.index('"mode": "draft_source"')
+    assert streak > 0
+
+
+def test_trim_lane_defers_correction_repairs() -> None:
+    # The 2.3.0 deferred-correction fix, ported to the trim (target_prefix)
+    # lane: a rejection must emit the correction as the pending primary and
+    # never pay a dedicated one-row correction forward.
+    from mtplx import generation
+
+    source = inspect.getsource(generation.generate_mtpk)
+    assert "trimmed_prefix_pending_correction" in source
+    assert "trimmed_prefix_correction_forward" not in source
+    trim_branch = source[
+        source.index("elif committed_from_trim:"):
+        source.index('event["capture_repair"] = "trimmed_prefix_pending_correction"')
+    ]
+    assert "forward_ar" not in trim_branch
+    assert "deferred_correction_repairs += 1" in source[
+        source.index("elif committed_from_trim:"):
+    ]
+
+
+def test_route_records_rejection_correction_under_greedy() -> None:
+    # The compiled route commits + repair-forwards the rejection correction
+    # in-cycle (fixed 2-token geometry); the greedy lane's defer-to-next-cycle
+    # convention would hand it a None and crash mx.array([[None]]).  The
+    # acceptance loop must record the correction for the route at ANY
+    # temperature -- under greedy it is the pre-sampled argmax target id.
+    from mtplx import generation
+
+    source = inspect.getsource(generation.generate_mtpk)
+    guard = source.index("or a3b_target_prefix_route is not None")
+    record = source.index("rejection_correction = int(correction)")
+    assert guard < record
+    repair = source.index("committed.append(rejection_correction)")
+    assert record < repair
 
 
 def test_generic_target_prefix_sampler_contract_is_proven_without_sampling() -> None:
@@ -642,12 +705,20 @@ def test_generation_exact_route_has_fixed_m2_m1_schedule_without_generic_repair(
     assert "sample_token_ids_from_mlx_logits" not in generic_proof
     assert "a3b_primary_state = None" not in source
     assert "if a3b_primary_state" not in source
-    assert "a3b_target_prefix_route.repair_m1(" in exact_repair_block
+    # Deferred-correction fold: repair_m1 is never dispatched; a rejection
+    # stashes the post-primary state and the next verify is the rebased M2.
+    assert "a3b_target_prefix_route.repair_m1(" not in source
+    assert "a3b_target_prefix_route.verify_m2_rebased(" in source
+    assert "a3b_rebase_state = a3b_primary_state" in exact_repair_block
+    assert "deferred_correction_repairs += 1" in exact_repair_block
     assert exact_repair_start < generic_optional_commit
     assert "committed.append(rejection_correction)" in exact_repair_block
-    assert "int(rejection_correction)" not in exact_repair_block
+    assert "pending_primary = int(rejection_correction)" in exact_repair_block
     assert "verify_hidden[:, 0:1, :]" in exact_repair_block
-    assert "cache_committed_token_count = len(tokens)" in exact_repair_block
+    assert (
+        "cache_committed_token_count = max(0, len(tokens) - 1)"
+        in exact_repair_block
+    )
     for forbidden in (
         "snapshot_untrimmable_cache",
         "rollback_after_verify",
@@ -655,8 +726,6 @@ def test_generation_exact_route_has_fixed_m2_m1_schedule_without_generic_repair(
         "commit_captured_prefix",
         "repair_m2",
         "rt.forward_ar",
-        "pending_primary",
-        "capture_repair",
     ):
         assert forbidden not in exact_repair_block
 

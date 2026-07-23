@@ -87,8 +87,19 @@ def _fail(message: str) -> None:
 
 
 def validate_a3b_k1_target_prefix_sampler(sampler: Any) -> None:
-    """Prove the external sampler contract once before prompt construction."""
-    if float(sampler.temperature) <= 0.0 or int(sampler.top_k or 0) <= 0:
+    """Prove the external sampler contract once before prompt construction.
+
+    Greedy (temperature<=0) is the deterministic argmax contract: every route
+    sample site (the pre-sampled target rows, the device draft, the repair
+    resample) degenerates to argmax, which the pre-sampled-target-id
+    acceptance supports unchanged.  This is the AR-exactness gate lane -- a
+    greedy request must byte-match pure autoregressive decoding.  A
+    positive-temperature request still requires top-k so the pre-sampled
+    target rows stay on the small-support device sampler.
+    """
+    if float(sampler.temperature) <= 0.0:
+        return
+    if int(sampler.top_k or 0) <= 0:
         _fail("compiled A3B target-prefix requires a stochastic top-k sampler")
 
 
@@ -347,11 +358,27 @@ class A3BK1TargetPrefixRoute:
     def verify_m2(self, input_ids):
         return self._forward_m2(input_ids)
 
+    def verify_m2_rebased(self, input_ids, primary_state):
+        """Verify [pending_correction, draft] FROM the stashed primary state.
+
+        The deferred-correction fold: a rejection no longer pays a repair_m1
+        forward -- the correction becomes the pending primary and the next
+        verify runs the SAME compiled M2 graph from the mid-window state the
+        verify that rejected it returned.  compiled_m1(input, *primary_state)
+        already proves the state pack is a valid graph input; M2 shares the
+        layout, and its writes land at the same offsets repair_m1 would have
+        used.  Byte-neutral vs repair under greedy: M2 row-0 arithmetic is
+        install-enforced bit-identical to the fused M1 route.
+        """
+
+        return self._forward_m2(input_ids, state_in=list(primary_state))
+
     def repair_m1(self, input_ids, primary_state):
         return self._forward_m1(input_ids, primary_state)
 
-    def _forward_m2(self, input_ids):
-        state_in = [container[slot] for container, slot in self.state_slots]
+    def _forward_m2(self, input_ids, state_in=None):
+        if state_in is None:
+            state_in = [container[slot] for container, slot in self.state_slots]
         outputs = self.compiled_m2(input_ids, *state_in)
         for (container, slot), value in zip(
             self.state_slots,
