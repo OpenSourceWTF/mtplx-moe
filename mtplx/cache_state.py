@@ -2698,6 +2698,43 @@ class OwnedRecurrentStateCache:
         for idx in range(len(value), len(self.cache)):
             self.cache[idx] = None
 
+    def restore_masked(
+        self,
+        snapshot_state: list[Any] | tuple[Any, ...] | None,
+        row_mask: Any,
+    ) -> None:
+        """Per-row masked restore of the recurrent leaves (fold-in REPLAY rewind).
+
+        Rows where ``row_mask`` is ``True`` revert each leaf (batch-major
+        ``[conv_tail, gdn_matrix]``, axis 0 == batch) to ``snapshot_state``; rows
+        where it is ``False`` keep their current advanced state.  This is the
+        per-row analogue of ``rollback_after_verify``'s whole-batch restore,
+        following the same snapshot-in / restore-out convention (the snapshot
+        comes from ``snapshot_untrimmable_cache``), and it covers a REPLAY row's
+        rewind: the conv tail is sliding-window / positional, so its missed-cycle
+        pollution is undone here (a test pins this bitwise).
+
+        REBINDS ``self.cache[idx]`` with a lazy ``mx.where`` expression -- it does
+        NOT route through ``replace_state``/``_own_value`` (those force an
+        ``mx.eval`` into the owned buffer), so the restore stays a device op that
+        adds no sync to the single-sync fold-in loop.  Signature is additive;
+        nothing existing changes.
+        """
+        import mlx.core as mx
+
+        if snapshot_state is None:
+            return
+        mask = row_mask if isinstance(row_mask, mx.array) else mx.array(row_mask)
+        mask = mask.astype(mx.bool_).reshape(-1)
+        for idx in range(len(self.cache)):
+            cur = self.cache[idx]
+            snap = snapshot_state[idx] if idx < len(snapshot_state) else None
+            if cur is None or snap is None:
+                continue
+            # broadcast the [B] row selector across each leaf's trailing dims.
+            m = mask.reshape((int(mask.size),) + (1,) * (int(cur.ndim) - 1))
+            self.cache[idx] = mx.where(m, snap, cur)
+
     @property
     def meta_state(self) -> tuple[str, str]:
         return ("owned_recurrent_state", self.mode)
@@ -3477,6 +3514,75 @@ def rollback_after_verify(cache: list[Any], snapshot: CacheSnapshot, verified_to
         if _is_trimmable(entry) and hasattr(entry, "trim"):
             entry.trim(verified_tokens)
     restore_cache(cache, snapshot)
+
+
+def restore_untrimmable_cache_masked(
+    cache: list[Any],
+    snapshot: CacheSnapshot,
+    row_mask: Any,
+) -> None:
+    """Per-row masked restore of every non-trimmable (recurrent) entry.
+
+    The fold-in decode loop's REPLAY rewind: rows selected by ``row_mask`` revert
+    their recurrent state to ``snapshot`` (the pre-verify snapshot of the cycle
+    they missed, from :func:`snapshot_untrimmable_cache`); every other row keeps
+    advancing.  This is the per-row companion to :func:`rollback_after_verify`'s
+    whole-batch restore.
+
+    Trimmable KV carries a ``None`` snapshot state here (see
+    :func:`snapshot_untrimmable_cache`) and is skipped -- the ragged fold-in KV
+    lane rolls a missed row back by OVERWRITING its stale draft slot on the replay
+    write, not by snapshot restore, so only the recurrent leaves need this.
+
+    Entries exposing ``restore_masked`` (``OwnedRecurrentStateCache``) take the
+    lazy device rebind path (no sync).  A plain list/array-state recurrent entry
+    (e.g. the CPU test fake) falls back to a generic per-row selection so the same
+    loop drives both.
+    """
+    for entry, state in zip(cache, snapshot.states):
+        if state is None:
+            continue
+        restore_masked = getattr(entry, "restore_masked", None)
+        if callable(restore_masked):
+            restore_masked(state, row_mask)
+        else:
+            entry.state = _select_rows_masked(getattr(entry, "state", None), state, row_mask)
+
+
+def _select_rows_masked(current: Any, snapshot: Any, row_mask: Any) -> Any:
+    """Per-row masked blend of ``current`` and ``snapshot`` recurrent state.
+
+    Fallback for entries WITHOUT ``restore_masked`` (array-state recurrent caches
+    take the class method instead).  Handles the two shapes such an entry's
+    ``state`` can take:
+
+    * a single batch-major ``mx.array`` (``[B, ...]``) -> ``mx.where`` on axis 0;
+    * a per-row Python container (``list[row]`` -- the CPU test fake's histories)
+      -> pick whole rows by the host mask, COPYING reverted rows so a later
+      in-place append can't mutate the retained snapshot.
+
+    A ``list``-of-arrays *leaves* container (``[conv_tail, gdn_matrix]``) is NOT
+    handled here on purpose -- that is ``OwnedRecurrentStateCache.restore_masked``'s
+    job, and the fold-in make-cache converts every real recurrent entry to that
+    class, so only per-row list state ever reaches this fallback.
+    """
+    import mlx.core as mx
+
+    if current is None or snapshot is None:
+        return current if current is not None else snapshot
+    if isinstance(current, mx.array) and isinstance(snapshot, mx.array):
+        mask = row_mask if isinstance(row_mask, mx.array) else mx.array(row_mask)
+        mask = mask.astype(mx.bool_).reshape((-1,) + (1,) * (int(current.ndim) - 1))
+        return mx.where(mask, snapshot, current)
+    if isinstance(current, (list, tuple)) and isinstance(snapshot, (list, tuple)):
+        flags = row_mask.tolist() if isinstance(row_mask, mx.array) else list(row_mask)
+        out = []
+        for r in range(len(current)):
+            revert = bool(flags[r]) if r < len(flags) else False
+            src = snapshot[r] if revert else current[r]
+            out.append(list(src) if isinstance(src, list) else src)
+        return type(current)(out)
+    return current
 
 
 def trim_verified_window_to_prefix(

@@ -25,6 +25,7 @@ from mtplx.cache_state import (
     owned_recurrent_state_stats,
     rollback_after_verify,
     restore_cache,
+    restore_untrimmable_cache_masked,
     snapshot_cache,
     snapshot_untrimmable_cache,
     tail_owned_attention_kv_stats,
@@ -131,6 +132,96 @@ def test_rollback_after_verify_trims_kv_and_restores_recurrent_state():
     assert recurrent.meta_state == ("meta", "3")
     assert recurrent.state[0].tolist() == [1, 2, 3]
     assert kv.trimmed == 3
+
+
+def test_owned_recurrent_state_restore_masked_bitwise():
+    # Gate d: per-row masked restore of the recurrent leaves is bitwise exact --
+    # reverted rows return to the snapshot, kept rows stay advanced (the fold-in
+    # REPLAY rewind).  Two batch-major leaves model [conv_tail, gdn_matrix].
+    mx.random.seed(70)
+    B = 4
+    conv0 = mx.random.normal((B, 2, 3))  # conv tail (sliding-window, positional)
+    gdn0 = mx.random.normal((B, 4, 4))  # gdn matrix state
+    owned = OwnedRecurrentStateCache(size=2, initial=[conv0, gdn0])
+    snap = snapshot_untrimmable_cache([owned])
+
+    pre_conv = owned.state[0] + 0.0
+    pre_gdn = owned.state[1] + 0.0
+    # advance ALL rows (speculative write path = plain __setitem__ rebind).
+    adv_conv = mx.random.normal((B, 2, 3))
+    adv_gdn = mx.random.normal((B, 4, 4))
+    owned[0] = adv_conv
+    owned[1] = adv_gdn
+
+    # revert rows 0 and 2, keep rows 1 and 3 advanced.
+    mask = mx.array([True, False, True, False])
+    updates_before = owned.owner_updates
+    owned.restore_masked(snap.states[0], mask)
+    # restore_masked REBINDS (lazy where), it must NOT touch the owned buffers.
+    assert owned.owner_updates == updates_before
+
+    for r in (0, 2):
+        assert bool(mx.all(owned.state[0][r] == pre_conv[r]).item()), f"conv row {r}"
+        assert bool(mx.all(owned.state[1][r] == pre_gdn[r]).item()), f"gdn row {r}"
+    for r in (1, 3):
+        assert bool(mx.all(owned.state[0][r] == adv_conv[r]).item()), f"conv row {r}"
+        assert bool(mx.all(owned.state[1][r] == adv_gdn[r]).item()), f"gdn row {r}"
+
+
+def test_restore_untrimmable_cache_masked_skips_trimmable_and_reverts_recurrent():
+    # The helper reverts only the masked rows of the recurrent (non-trimmable)
+    # entry and never touches the trimmable KV (its snapshot state is None -- the
+    # ragged fold-in KV lane rewinds a missed row by overwriting its draft slot).
+    mx.random.seed(71)
+    B = 3
+    owned = OwnedRecurrentStateCache(
+        size=2, initial=[mx.random.normal((B, 5)), mx.random.normal((B, 6))]
+    )
+    kv = TrimmableDummyCache()
+    cache = [owned, kv]
+    snap = snapshot_untrimmable_cache(cache)
+    pre0 = owned.state[0] + 0.0
+
+    owned[0] = mx.random.normal((B, 5))
+    owned[1] = mx.random.normal((B, 6))
+    restore_untrimmable_cache_masked(cache, snap, mx.array([True, False, True]))
+
+    assert bool(mx.all(owned.state[0][0] == pre0[0]).item())
+    assert not bool(mx.all(owned.state[0][1] == pre0[1]).item())  # row 1 kept advanced
+    assert bool(mx.all(owned.state[0][2] == pre0[2]).item())
+    assert kv.trimmed == 0  # trimmable KV untouched
+
+
+def test_restore_untrimmable_cache_masked_generic_list_state_fallback():
+    # The list-state fallback drives the CPU test fake: per-row history revert.
+    class _ListRecurrent:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def is_trimmable(self):
+            return False
+
+        @property
+        def state(self):
+            return self._rows
+
+        @state.setter
+        def state(self, value):
+            self._rows = value
+
+        @property
+        def meta_state(self):
+            return None
+
+    entry = _ListRecurrent([[1, 2], [3], [4, 5, 6]])
+    snap = snapshot_untrimmable_cache([entry])
+    # advance every row (append), then revert rows 0 and 2 only.
+    entry.state = [[1, 2, 9], [3, 9], [4, 5, 6, 9]]
+    restore_untrimmable_cache_masked([entry], snap, [True, False, True])
+    assert entry.state == [[1, 2], [3, 9], [4, 5, 6]]
+    # reverted rows are COPIES -- a later append cannot corrupt the snapshot.
+    entry.state[0].append(99)
+    assert snap.states[0][0] == [1, 2]
 
 
 def test_trim_verified_window_to_prefix_requires_all_trimmable_snapshot():
