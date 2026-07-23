@@ -8757,9 +8757,6 @@ def generate_mtpk(
                 raise RuntimeError(
                     "capture commit failed after MTPLX_SKIP_VERIFY_SNAPSHOT=1"
                 )
-            event["capture_repair"] = (
-                "standard_reforward" if verify_strategy == "capture_commit" else None
-            )
             started_rollback = time.perf_counter()
             rollback_after_verify(
                 cache, before_verify, verified_tokens=verified_token_count
@@ -8767,12 +8764,24 @@ def generate_mtpk(
             elapsed_rollback = time.perf_counter() - started_rollback
             rollback_time += elapsed_rollback
             _add_timing(event, "rollback", elapsed_rollback)
+            # Deferred correction, one-row-replay form: the recurrent-state
+            # boundary forces re-forwarding the committed window after the
+            # rollback, but the CORRECTION row is folded out of the replay --
+            # it becomes the pending primary and its KV rides the next verify
+            # forward.  The shortened replay's rows are exactly the hiddens
+            # the committed-history append needs (each committed token pairs
+            # with the hidden of the token before it), and its last row is
+            # the rejection boundary, which is what drafting against the
+            # pending primary consumes.
+            reforward_window = (
+                committed[:-1] if rejection_correction is not None else committed
+            )
             started = time.perf_counter()
             with attention_phase("decode_verify"):
                 if generic_compiled_target_prefix and compiled_verify_bank is not None:
                     repair_logits, repair_hidden, _repair_captures = (
                         compiled_verify_bank.forward_ar_capture(
-                            mx.array([committed]),
+                            mx.array([reforward_window]),
                             cache=cache,
                             return_hidden=True,
                             hidden_variant=base_hidden_variant,
@@ -8780,7 +8789,7 @@ def generate_mtpk(
                     )
                 else:
                     repair_logits, repair_hidden = rt.forward_ar(
-                        mx.array([committed]),
+                        mx.array([reforward_window]),
                         cache=cache,
                         return_hidden=True,
                         hidden_variant=base_hidden_variant,
@@ -8790,6 +8799,21 @@ def generate_mtpk(
             target_time += elapsed_repair
             repair_time += elapsed_repair
             _add_timing(event, "repair_forward", elapsed_repair)
+            if rejection_correction is not None:
+                pending_primary = int(rejection_correction)
+                deferred_correction_repairs += 1
+                event["capture_repair"] = (
+                    "standard_reforward_pending_correction"
+                    if verify_strategy == "capture_commit"
+                    else "reforward_pending_correction"
+                )
+                event["pending_primary"] = int(rejection_correction)
+            else:
+                event["capture_repair"] = (
+                    "standard_reforward"
+                    if verify_strategy == "capture_commit"
+                    else None
+                )
         if _mtp_history_uses_committed_cache(mtp_history_policy):
             assert mtp_cache is not None and cycle_mtp_offset is not None
             _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
