@@ -6714,6 +6714,17 @@ def generate_mtpk(
     ccopy_backoff = 64   # doubles on each suspension (self-repetitive novel text would
                          # otherwise re-trigger copy rounds after every backoff and pay
                          # the probe cost recurrently); a paying round resets it.
+    # Draft-source streak state (target_prefix takeover lane): the copy match
+    # feeds the depth-1 DRAFT instead of a block round, so every forward stays
+    # on the lane's proven 2-row verify geometry -- bit-exact by construction.
+    # _cc_src_idx = next prompt index the streak proposes; the streak advances
+    # by diffing committed tokens against the prompt continuation and breaks on
+    # the first mismatch (covers accept, bonus, and correction paths without
+    # touching the accept machinery).
+    _cc_src_idx: int | None = None
+    _cc_src_check_from = 0
+    _cc_streak_drafted = 0
+    _cc_streak_accepted = 0
     ccopy_index = None
     ccopy_k = context_copy_block_k()
     ccopy_min_ext = context_copy_min_ext()
@@ -6904,8 +6915,71 @@ def generate_mtpk(
         trace_current_mtp_cache = (
             mtp_cache if mtp_cache is not None else mtp_history_cache
         )
+        # ---- context-copy as DRAFT SOURCE (target_prefix takeover lane) ----
+        # The block-round machinery is NOT AR-exact on this lane: its T+1-row
+        # block forward runs M>2 kernel paths (stock gather_qmm fallbacks)
+        # whose retained rows differ at ulp scale from the M<=2 decode path,
+        # surfacing as delayed argmax flips (windows 083910/085411).  Feeding
+        # the copy match as the depth-1 draft keeps every forward on the
+        # proven 2-row cycle: the accepted token is always the pre-sampled
+        # target id, so the emitted stream is bit-exact for ANY draft source,
+        # at any temperature.  MTP head compute is skipped during a streak.
+        if ccopy_active and _ccopy_takes_over_lane:
+            if _cc_src_idx is not None:
+                for _cc_committed in tokens[_cc_src_check_from:]:
+                    if _cc_src_idx < len(prompt_ids) and int(_cc_committed) == int(
+                        prompt_ids[_cc_src_idx]
+                    ):
+                        _cc_src_idx += 1
+                        _cc_streak_accepted += 1
+                        ccopy_accepted += 1
+                    else:
+                        _cc_src_idx = None
+                        break
+                if _cc_src_idx is not None and _cc_src_idx >= len(prompt_ids):
+                    _cc_src_idx = None
+                if _cc_src_idx is None:
+                    # Streak over: same acceptance-EMA suspend/backoff contract
+                    # as the round path, per streak.
+                    _cc_ratio = (
+                        _cc_streak_accepted / _cc_streak_drafted
+                        if _cc_streak_drafted
+                        else 0.0
+                    )
+                    ccopy_ema = 0.7 * ccopy_ema + 0.3 * min(1.0, _cc_ratio)
+                    ccopy_seen += 1
+                    if _cc_ratio >= 0.5:
+                        ccopy_backoff = 64
+                    if ccopy_seen >= 4 and ccopy_ema < 0.35:
+                        ccopy_suspend_until = len(tokens) + ccopy_backoff
+                        ccopy_backoff = min(ccopy_backoff * 2, 4096)
+                        ccopy_ema, ccopy_seen = 0.5, 0
+                        ccopy_suspensions += 1
+            _cc_src_check_from = len(tokens)
+            if _cc_src_idx is None and len(tokens) >= ccopy_suspend_until:
+                ccopy_probes += 1
+                _cc_pos, _cc_ext = ccopy_index.find(
+                    prompt_ids + tokens, max_pos=len(prompt_ids)
+                )
+                if (
+                    _cc_pos is not None
+                    and _cc_ext >= ccopy_min_ext
+                    and int(_cc_pos) < len(prompt_ids)
+                ):
+                    _cc_src_idx = int(_cc_pos)
+                    _cc_streak_drafted = 0
+                    _cc_streak_accepted = 0
+                    ccopy_rounds += 1
+                    event["context_copy"] = {
+                        "mode": "draft_source",
+                        "extension": int(_cc_ext),
+                        "at_tokens": len(tokens),
+                        "block": 0,
+                        "accepted": 0,
+                        "correction": None,
+                    }
         # ---- context-copy round: verbatim block from context, no MTP compute this cycle ----
-        if ccopy_active and cycle_depth >= 1 and len(tokens) >= ccopy_suspend_until:
+        if ccopy_active and _ccopy_capture_lane and cycle_depth >= 1 and len(tokens) >= ccopy_suspend_until:
             _cc_hist = prompt_ids + tokens
             ccopy_probes += 1
             # Prompt-only contract: candidates whose continuation starts at the
@@ -7121,9 +7195,23 @@ def generate_mtpk(
         next_token = primary
         device_draft_token = None
 
+        # Copy-streak draft substitution: propose the prompt continuation as
+        # this cycle's depth-1 draft and skip MTP head compute entirely.  The
+        # compiled route keeps its device-draft contract (no substitution).
+        _cc_draft_source_token: int | None = None
+        if (
+            _cc_src_idx is not None
+            and a3b_target_prefix_route is None
+            and cycle_depth == 1
+        ):
+            _cc_draft_source_token = int(prompt_ids[_cc_src_idx])
+            _cc_streak_drafted += 1
+            ccopy_drafted += 1
+
         used_device_d2_core = False
         device_d2_eligible = (
-            draft_core == "device-d2"
+            _cc_draft_source_token is None
+            and draft_core == "device-d2"
             and cycle_depth == 2
             and speculative_depth == 2
             and mtp_cache_policy == "persistent"
@@ -7205,7 +7293,24 @@ def generate_mtpk(
                 }
 
         used_device_core = used_device_d2_core
-        if not used_device_core and draft_core == "device":
+        if _cc_draft_source_token is not None:
+            # Copy streak owns this cycle's draft: one host token, no MTP
+            # forward.  The accept path is draft-source-agnostic (the
+            # accepted token is always the pre-sampled target id).
+            draft_tokens = [int(_cc_draft_source_token)]
+            draft_probs = [None]
+            next_token = int(_cc_draft_source_token)
+            used_device_core = True  # skip the host MTP drafting loop below
+            event["drafts"].append(
+                {
+                    "depth": 1,
+                    "token": int(_cc_draft_source_token),
+                    "timing_s": {"draft": 0.0},
+                    "mtp_corrector": None,
+                    "draft_core": "context_copy",
+                }
+            )
+        elif not used_device_core and draft_core == "device":
             device_core_eligible = (
                 2 <= cycle_depth <= 5
                 and cycle_depth == speculative_depth

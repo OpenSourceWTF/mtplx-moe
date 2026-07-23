@@ -285,6 +285,25 @@ def test_exact_request_accepts_greedy_as_deterministic_argmax_contract(
     a3b_target.validate_a3b_k1_target_prefix_sampler(sampler)
 
 
+def test_takeover_lane_uses_draft_source_not_block_rounds() -> None:
+    # The block-round machinery is not AR-exact on the target_prefix lane
+    # (M>2 forwards leave ulp-perturbed retained rows).  The takeover lane
+    # must feed the copy match as the depth-1 draft (2-row proven geometry)
+    # and leave block rounds to the capture_commit lane.
+    from mtplx import generation
+
+    source = inspect.getsource(generation.generate_mtpk)
+    round_gate = source.index(
+        "if ccopy_active and _ccopy_capture_lane and cycle_depth >= 1"
+    )
+    assert round_gate > 0
+    substitution = source.index("_cc_draft_source_token: int | None = None")
+    assert "a3b_target_prefix_route is None" in source[substitution:substitution + 400]
+    # The streak proposes from the prompt and never runs its own forward.
+    streak = source.index('"mode": "draft_source"')
+    assert streak > 0
+
+
 def test_route_records_rejection_correction_under_greedy() -> None:
     # The compiled route commits + repair-forwards the rejection correction
     # in-cycle (fixed 2-token geometry); the greedy lane's defer-to-next-cycle
