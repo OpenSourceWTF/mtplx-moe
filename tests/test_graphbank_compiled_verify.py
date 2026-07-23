@@ -1170,14 +1170,18 @@ def _run_exact_a3b_k1_schedule(
         def __init__(self, cache):
             self.cache = cache
 
-        def verify_m2(self, input_ids):
+        def _verify(self, input_ids, kind, state_in=None):
             cycle = len(primary_states)
             target_token = int(target_tokens[min(cycle, len(target_tokens) - 1)])
             primary_state = object()
             primary_states.append(primary_state)
-            schedule.append(
-                ("m2", tuple(int(token) for token in np.asarray(input_ids).reshape(-1)))
+            entry = (
+                kind,
+                tuple(int(token) for token in np.asarray(input_ids).reshape(-1)),
             )
+            if state_in is not None:
+                entry = entry + (state_in,)
+            schedule.append(entry)
             logits = mx.zeros((1, 2, 4), dtype=mx.float32)
             logits = logits + mx.eye(4, dtype=mx.float32)[target_token]
             hidden = mx.stack(
@@ -1189,17 +1193,17 @@ def _run_exact_a3b_k1_schedule(
             )[None, ...]
             return logits, hidden, primary_state
 
+        def verify_m2(self, input_ids):
+            return self._verify(input_ids, "m2")
+
+        def verify_m2_rebased(self, input_ids, primary_state):
+            # Deferred-correction fold: the rejecting cycle's post-primary
+            # state is the graph input; no repair_m1 dispatch exists.
+            return self._verify(input_ids, "m2r", state_in=primary_state)
+
         def repair_m1(self, input_ids, primary_state):
-            cycle = len(primary_states) - 1
-            assert primary_state is primary_states[cycle]
-            correction = tuple(
-                int(token) for token in np.asarray(input_ids).reshape(-1)
-            )
-            schedule.append(("m1", correction, primary_state))
-            return (
-                model._logits(1),
-                mx.full((1, 1, 2), 90 + cycle, dtype=mx.float32),
-                None,
+            raise AssertionError(
+                "repair_m1 must not be dispatched under the deferred-correction fold"
             )
 
         def final_report(self, *, verify_calls, repair_calls):
@@ -1345,25 +1349,33 @@ def test_generation_exact_a3b_k1_reject_uses_primary_state_m1_schedule(
         max_tokens=4,
     )
 
-    assert out.tokens == [1, 2, 1, 2]
-    assert [call[0] for call in schedule] == ["m2", "m1", "m2", "m1"]
-    assert schedule[1][1] == (2,)
+    # Deferred-correction fold: the rejected cycle emits the correction as
+    # the pending primary; the NEXT verify is the rebased M2 running from
+    # the rejecting cycle's post-primary state.  The token after each
+    # correction comes from the rebased verify's pre-sampled row.
+    assert out.tokens == [1, 2, 2, 2]
+    assert [call[0] for call in schedule] == ["m2", "m2r", "m2r"]
+    assert schedule[1][1][0] == 2  # pending correction is the verify primary
     assert schedule[1][2] is primary_states[0]
-    assert schedule[3][1] == (2,)
-    assert schedule[3][2] is primary_states[1]
-    assert out.stats.correction_tokens == 2
-    assert all("pending_primary" not in event for event in out.stats.events)
-    assert all(not event["primary_already_emitted"] for event in out.stats.events)
+    assert schedule[2][1][0] == 2
+    assert schedule[2][2] is primary_states[1]
+    assert out.stats.correction_tokens == 3
+    assert out.stats.deferred_correction_repairs == 3
+    route_events = [event for event in out.stats.events if "drafts" in event]
+    assert any(event.get("pending_primary") == 2 for event in route_events)
+    assert route_events[0]["primary_already_emitted"] is False
+    assert all(event["primary_already_emitted"] for event in route_events[1:])
     correction_history = [
         hidden for token_ids, hidden in history_appends if token_ids == [2]
     ]
-    assert len(correction_history) == 2
+    assert len(correction_history) == 3
     np.testing.assert_array_equal(correction_history[0], np.full((1, 1, 2), 10))
     np.testing.assert_array_equal(correction_history[1], np.full((1, 1, 2), 11))
+    np.testing.assert_array_equal(correction_history[2], np.full((1, 1, 2), 12))
     assert not any(np.all(hidden == 90) for hidden in correction_history)
     report = out.stats.graphbank["compiled_verify"]
-    assert report["m2_calls"] == out.stats.verify_calls == 2
-    assert report["m1_calls"] == out.stats.correction_tokens == 2
+    assert report["m2_calls"] == out.stats.verify_calls == 3
+    assert report["m1_calls"] == 0
 
 
 def test_generation_exact_a3b_k1_mixed_schedule_keeps_accept_and_reject_ownership(
@@ -1376,13 +1388,17 @@ def test_generation_exact_a3b_k1_mixed_schedule_keeps_accept_and_reject_ownershi
     )
 
     assert out.tokens[:3] == [1, 1, 1]
-    assert [call[0] for call in schedule] == ["m2", "m2", "m1", "m2", "m1"]
+    # Accept keeps the plain M2 schedule (state continues from the slots);
+    # every rejection folds into a rebased M2 from the rejecting cycle's
+    # post-primary state -- ownership of accept vs reject stays distinct.
+    assert [call[0] for call in schedule] == ["m2", "m2", "m2r", "m2r"]
     assert schedule[2][2] is primary_states[1]
-    assert schedule[4][2] is primary_states[2]
+    assert schedule[3][2] is primary_states[2]
     assert out.stats.accepted_drafts == 1
-    assert out.stats.correction_tokens == 2
+    assert out.stats.correction_tokens == 3
+    assert out.stats.deferred_correction_repairs == 3
     assert out.stats.events[1]["primary_already_emitted"] is True
-    assert out.stats.events[2]["primary_already_emitted"] is False
+    assert out.stats.events[2]["primary_already_emitted"] is True
 
 
 def test_generation_flag_parity_double_runs_each_verify(monkeypatch):

@@ -711,12 +711,20 @@ def test_generation_exact_route_has_fixed_m2_m1_schedule_without_generic_repair(
     assert "sample_token_ids_from_mlx_logits" not in generic_proof
     assert "a3b_primary_state = None" not in source
     assert "if a3b_primary_state" not in source
-    assert "a3b_target_prefix_route.repair_m1(" in exact_repair_block
+    # Deferred-correction fold: repair_m1 is never dispatched; a rejection
+    # stashes the post-primary state and the next verify is the rebased M2.
+    assert "a3b_target_prefix_route.repair_m1(" not in source
+    assert "a3b_target_prefix_route.verify_m2_rebased(" in source
+    assert "a3b_rebase_state = a3b_primary_state" in exact_repair_block
+    assert "deferred_correction_repairs += 1" in exact_repair_block
     assert exact_repair_start < generic_optional_commit
     assert "committed.append(rejection_correction)" in exact_repair_block
-    assert "int(rejection_correction)" not in exact_repair_block
+    assert "pending_primary = int(rejection_correction)" in exact_repair_block
     assert "verify_hidden[:, 0:1, :]" in exact_repair_block
-    assert "cache_committed_token_count = len(tokens)" in exact_repair_block
+    assert (
+        "cache_committed_token_count = max(0, len(tokens) - 1)"
+        in exact_repair_block
+    )
     for forbidden in (
         "snapshot_untrimmable_cache",
         "rollback_after_verify",
@@ -724,8 +732,6 @@ def test_generation_exact_route_has_fixed_m2_m1_schedule_without_generic_repair(
         "commit_captured_prefix",
         "repair_m2",
         "rt.forward_ar",
-        "pending_primary",
-        "capture_repair",
     ):
         assert forbidden not in exact_repair_block
 

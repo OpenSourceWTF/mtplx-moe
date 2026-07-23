@@ -5968,6 +5968,7 @@ def generate_mtpk(
         else None
     )
     a3b_target_prefix_route = None
+    a3b_rebase_state = None  # stashed post-primary state for a deferred correction
     snapshot_time = accept_time = rollback_time = repair_time = 0.0
     commit_time = capture_commit_time = 0.0
     bonus_time = 0.0
@@ -7859,9 +7860,21 @@ def generate_mtpk(
                         capture_backend=verify_core_backend,
                     )
             elif a3b_target_prefix_route is not None:
-                verify_logits, verify_hidden, a3b_primary_state = (
-                    a3b_target_prefix_route.verify_m2(verify_input_array)
-                )
+                if a3b_rebase_state is not None:
+                    # Deferred-correction fold: the pending correction is
+                    # this cycle's primary and the verify runs from the
+                    # stashed post-primary state of the cycle that rejected
+                    # it -- the repair_m1 forward never happens.
+                    verify_logits, verify_hidden, a3b_primary_state = (
+                        a3b_target_prefix_route.verify_m2_rebased(
+                            verify_input_array, a3b_rebase_state
+                        )
+                    )
+                    a3b_rebase_state = None
+                else:
+                    verify_logits, verify_hidden, a3b_primary_state = (
+                        a3b_target_prefix_route.verify_m2(verify_input_array)
+                    )
             elif compiled_verify_bank is not None:
                 # Replace only the target forward. target_prefix keeps its
                 # authoritative snapshot/trim, pre-sampling, and correction
@@ -8592,19 +8605,19 @@ def generate_mtpk(
             committed.append(rejection_correction)
             correction_tokens += 1
             tokens.extend(committed[1:])
-            started = time.perf_counter()
-            with attention_phase("decode_verify"):
-                repair_logits, repair_hidden, _repair_captures = (
-                    a3b_target_prefix_route.repair_m1(
-                        mx.array([[rejection_correction]]),
-                        a3b_primary_state,
-                    )
-                )
-            _eval(repair_logits, repair_hidden)
-            elapsed_repair = time.perf_counter() - started
-            target_time += elapsed_repair
-            repair_time += elapsed_repair
-            _add_timing(event, "repair_forward", elapsed_repair)
+            # Deferred-correction fold: no repair_m1 forward.  The correction
+            # is emitted as the pending primary; the next verify runs the M2
+            # graph FROM the stashed post-primary state and computes the
+            # correction's row itself.  Byte-neutral vs repair: M2 row-0
+            # arithmetic is install-enforced bit-identical to the fused M1
+            # route.  Drafting for the folded cycle consumes the rejection
+            # boundary row (the primary's verify row), the same hidden the
+            # committed-history append pairs with the correction.
+            pending_primary = int(rejection_correction)
+            a3b_rebase_state = a3b_primary_state
+            deferred_correction_repairs += 1
+            event["capture_repair"] = "route_pending_correction"
+            event["pending_primary"] = int(rejection_correction)
             if _mtp_history_uses_committed_cache(mtp_history_policy):
                 _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
                 draft_time += append_mtp_history(
@@ -8612,11 +8625,11 @@ def generate_mtpk(
                     verify_hidden[:, 0:1, :],
                     [rejection_correction],
                 )
-            cache_committed_token_count = len(tokens)
+            cache_committed_token_count = max(0, len(tokens) - 1)
             maybe_detach_dirty_state(cache_committed_token_count)
             logits, hidden = own_live_logits_hidden(
-                repair_logits[:, -1, :],
-                repair_hidden[:, -1:, :],
+                verify_logits[:, 0:1, :].reshape(1, -1),
+                verify_hidden[:, 0:1, :],
             )
             maybe_rebase_decode_state(cache_committed_token_count)
             maybe_eval_state_roots(event, cache_committed_token_count)
@@ -8897,8 +8910,10 @@ def generate_mtpk(
     compiled_verify_report: dict[str, Any] | None = None
     if a3b_target_prefix_route is not None:
         compiled_verify_report = a3b_target_prefix_route.final_report(
+            # Corrections are deferred into rebased M2 verifies; repair_m1 is
+            # never dispatched, so m1_calls reports the truth: zero.
             verify_calls=verify_calls,
-            repair_calls=correction_tokens,
+            repair_calls=correction_tokens - deferred_correction_repairs,
         )
         a3b_target_prefix_route.demote()
     elif compiled_verify_bank is not None:
