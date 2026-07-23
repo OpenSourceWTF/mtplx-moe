@@ -6652,20 +6652,40 @@ def generate_mtpk(
     # capture-commit verify strategies ----
     from .context_copy import (NgramIndex, block_for_ext, context_copy_block_k,
                                context_copy_enabled, context_copy_min_ext,
-                               context_copy_ng_max, context_copy_ng_min)
+                               context_copy_ng_max, context_copy_ng_min,
+                               context_copy_target_prefix_enabled)
     # Temperature is supported through the same probability-ratio acceptance
     # as the MTP path: the copy block is a point-mass proposal, so a copied
     # token is accepted with the target's own shaped probability and a
     # rejection samples the residual — the output law is exactly the target
     # sampling distribution at any temperature (no greedy shortcut).
+    #
+    # Copy rounds normally require a capture-commit verify strategy.  The opt-in
+    # MTPLX_CONTEXT_COPY_TARGET_PREFIX flag also allows them under the exact
+    # target_prefix route: a copy round runs its own forward_ar_capture +
+    # commit_captured_prefix (cache-generic, __final_only__ fallback) rather than
+    # the compiled route, so it interleaves with the K1 compiled cycles.  It is
+    # mutually exclusive with installed whole-MoE (frozen at 2 rows; a copy block
+    # is T+1 rows), so the round stays gated off with a recorded reason there.
+    _ccopy_capture_lane = verify_strategy in {"capture_commit", "graphbank_capture_commit"}
+    _ccopy_tp_requested = (
+        context_copy_target_prefix_enabled() and verify_strategy == "target_prefix"
+    )
+    _ccopy_whole_moe_conflict = _ccopy_tp_requested and bool(
+        getattr(rt, "a3b_whole_moe_installed", False)
+    )
     ccopy_active = (
         context_copy_enabled()
         and not _penalties_active
-        and verify_strategy in {"capture_commit", "graphbank_capture_commit"}
+        and (_ccopy_capture_lane or (_ccopy_tp_requested and not _ccopy_whole_moe_conflict))
     )
     ccopy_rounds = ccopy_drafted = ccopy_accepted = 0
     ccopy_probes = ccopy_blocks_accepted = ccopy_suspensions = 0
     ccopy_disabled_reason = None
+    if _ccopy_whole_moe_conflict:
+        # Requested the target_prefix hybrid but whole-MoE is installed: the fused
+        # 2-row kernel cannot verify a T+1-row copy block.  Stay on the pure route.
+        ccopy_disabled_reason = "whole_moe_installed_2row_geometry"
     ccopy_ema, ccopy_seen, ccopy_suspend_until = 0.5, 0, 0
     ccopy_backoff = 64   # doubles on each suspension (self-repetitive novel text would
                          # otherwise re-trigger copy rounds after every backoff and pay

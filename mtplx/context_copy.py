@@ -26,6 +26,30 @@ def context_copy_enabled() -> bool:
     return (os.environ.get("MTPLX_CONTEXT_COPY") or "").strip() not in {"0", "false", "off"}
 
 
+def context_copy_target_prefix_enabled() -> bool:
+    """Opt-in: allow context-copy rounds to run under the exact A3B target_prefix
+    verify strategy (default OFF, so the shipped/PR behaviour is unchanged).
+
+    Context-copy is normally gated to capture_commit because a copy round verifies
+    a variable-length ``[primary] + block`` (T+1 rows) and commits a per-position
+    prefix, while the compiled target_prefix route is frozen at the K1 verify-length-2
+    contract.  A copy round does NOT use the compiled route, though -- it runs its own
+    ``forward_ar_capture`` + ``commit_captured_prefix`` (both cache-generic, with a
+    graceful ``__final_only__`` fallback), so the two can interleave: copy when a
+    prompt match exists, the compiled target_prefix K1 route otherwise.
+
+    NOTE: this is incompatible with installed whole-MoE fusion -- that fused kernel is
+    frozen at exactly 2 rows (K1 verify length), and a copy block is T+1 rows.  The
+    caller must not enable whole-MoE together with this flag; the decode loop keeps the
+    round gated off (with a recorded reason) if whole-MoE is installed.
+    """
+    return (os.environ.get("MTPLX_CONTEXT_COPY_TARGET_PREFIX") or "").strip() in {
+        "1",
+        "true",
+        "on",
+    }
+
+
 def context_copy_block_k() -> int:
     try:
         return max(4, int(os.environ.get("MTPLX_CONTEXT_COPY_K") or 24))
