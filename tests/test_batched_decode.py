@@ -19,8 +19,10 @@ import pytest
 import mtplx.batched_decode as bd
 from mtplx.batched_decode import (
     BATCHED_DECODE_ENV,
+    BATCHED_DECODE_REJECT_ENV,
     BATCHED_DECODE_SERIAL_ENV,
     batched_decode_enabled,
+    batched_decode_reject_mode,
     batched_decode_serial,
     diff_streams,
     generate_greedy_batched,
@@ -530,3 +532,372 @@ def test_batched_decode_enabled_failclosed() -> None:
     assert batched_decode_enabled({BATCHED_DECODE_ENV: "nope"}) is False
     for truthy in ("1", "true", "YES", "On"):
         assert batched_decode_enabled({BATCHED_DECODE_ENV: truthy}) is True
+
+
+# --------------------------------------------------------------------------- #
+# R3: FOLD-IN REPLAY loop
+# --------------------------------------------------------------------------- #
+class _AltFakeRuntime(_FakeRuntime):
+    """Fake whose ``alt_rids`` rows draft wrong on EVEN generated positions and
+    right on odd ones -- an accept/miss ALTERNATION per row (so a row goes
+    miss -> replay -> accept -> miss ...), exercising a mode change every cycle
+    that the static ``broken_rids`` fake cannot.  Output stays greedy => the
+    committed sequence is unchanged, only the accept pattern differs."""
+
+    def __init__(self, *, alt_rids=None, **kw) -> None:
+        super().__init__(**kw)
+        self.alt_rids = set(alt_rids or set())
+
+    def draft_mtp(self, hidden, next_token_ids, mtp_cache=None, **_kw):
+        assert self._trunk_entry is not None and self._trunk_entry.histories is not None
+        x0_rows = next_token_ids.tolist()
+        out: list[list[list[float]]] = []
+        for b in range(len(x0_rows)):
+            hist = list(self._trunk_entry.histories[b])
+            x0 = int(x0_rows[b][-1])
+            correct = self._next_token(hist + [x0], self._trunk_entry.prompt_len[b])
+            rid = hist[0]
+            wrong = correct + 1 if correct + 1 != STOP_ID else correct + 2
+            generated = len(hist) - int(self._trunk_entry.prompt_len[b])
+            if rid in self.broken_rids or (rid in self.alt_rids and generated % 2 == 0):
+                token = wrong % VOCAB
+            else:
+                token = correct
+            out.append([self._onehot(token)])
+        return mx.array(out)
+
+
+def _foldin_vs_repair(rt_factory, prompts, **decode_kwargs) -> None:
+    """THE gate (a): fold-in committed tokens + finish reasons are IDENTICAL to
+    the Build-1 repair loop on the same fake runtime.  Greedy => the sequence is a
+    pure function of the prompt, so the reject mechanism cannot change it."""
+    res_fold = generate_greedy_batched(
+        rt_factory(), prompts, reject_mode="foldin", **decode_kwargs
+    )
+    res_repair = generate_greedy_batched(
+        rt_factory(), prompts, reject_mode="repair", **decode_kwargs
+    )
+    assert [s.tokens for s in res_fold.streams] == [s.tokens for s in res_repair.streams]
+    assert [s.finish_reason for s in res_fold.streams] == [
+        s.finish_reason for s in res_repair.streams
+    ]
+    assert res_fold.generated_tokens == res_repair.generated_tokens
+    assert res_fold.meta["reject_mode"] == "foldin"
+    assert res_fold.meta["loop"] == "foldin_replay_single_sync"
+    return res_fold
+
+
+def test_foldin_equiv_all_accept() -> None:
+    prompts = _distinct_prompts(6)
+    res = _foldin_vs_repair(lambda: _FakeRuntime(), prompts, max_new_tokens=20)
+    assert res.replay_rows == 0  # perfect drafts -> never any miss/replay
+
+
+def test_foldin_equiv_all_miss() -> None:
+    # every row drafts wrong EVERY spec cycle => miss -> replay -> miss ... on the
+    # same row (the consecutive-miss case).
+    prompts = _distinct_prompts(4)
+    broken = {p[0] for p in prompts}
+    res = _foldin_vs_repair(
+        lambda: _FakeRuntime(broken_rids=broken), prompts, max_new_tokens=20
+    )
+    assert res.replay_rows > 0
+    assert res.repair_cycles == 0  # fold-in never repairs
+
+
+def test_foldin_equiv_alternating() -> None:
+    # per-row accept/miss ALTERNATION (miss -> replay -> accept -> miss ...).
+    prompts = _distinct_prompts(6)
+    alt = {prompts[b][0] for b in (0, 2, 4)}
+    _foldin_vs_repair(
+        lambda: _AltFakeRuntime(alt_rids=alt), prompts, max_new_tokens=24
+    )
+
+
+def test_foldin_equiv_heterogeneous() -> None:
+    # per-row heterogeneous: some rows always miss, some alternate, some accept.
+    prompts = _distinct_prompts(6)
+    broken = {prompts[1][0], prompts[4][0]}
+    alt = {prompts[2][0], prompts[5][0]}
+    _foldin_vs_repair(
+        lambda: _AltFakeRuntime(broken_rids=broken, alt_rids=alt),
+        prompts,
+        max_new_tokens=24,
+    )
+
+
+def test_foldin_equiv_miss_at_stop() -> None:
+    # a chronically-missing row that also STOPS: the stop can fall on a miss's x0
+    # (replay x1 dropped) or a replay's x1 -- both must match the repair loop.
+    prompts = _distinct_prompts(4)
+    broken = {p[0] for p in prompts}
+    stop_at = {prompts[b][0]: 3 + 2 * b for b in range(4)}  # 3,5,7,9
+    _foldin_vs_repair(
+        lambda: _FakeRuntime(broken_rids=broken, stop_at=stop_at),
+        prompts,
+        max_new_tokens=40,
+        stop_token_ids={STOP_ID},
+    )
+
+
+def test_foldin_equiv_length_cap_odd() -> None:
+    # odd length cap on a missing row: the final committed token may be the x0 of a
+    # miss (its deferred x1 must be dropped by the cap, exactly as in repair).
+    prompts = _distinct_prompts(3)
+    broken = {prompts[0][0]}
+    for cap in (7, 8, 9):
+        _foldin_vs_repair(
+            lambda: _FakeRuntime(broken_rids=broken), prompts, max_new_tokens=cap
+        )
+
+
+def test_foldin_equiv_in_cohort_mode() -> None:
+    # fold-in inside a fixed-shape cohort with dummy slots + ragged per-stream stop.
+    prompts = _distinct_prompts(3)
+    stop_at = {prompts[b][0]: 2 + 3 * b for b in range(3)}  # 2,5,8
+    broken = {prompts[1][0]}  # one chronically-missing real stream
+    res_fold = generate_greedy_batched(
+        _FakeRuntime(broken_rids=broken, stop_at=stop_at), prompts,
+        reject_mode="foldin", cohort_slots=8, max_new_tokens=40,
+        stop_token_ids={STOP_ID},
+    )
+    res_repair = generate_greedy_batched(
+        _FakeRuntime(broken_rids=broken, stop_at=stop_at), prompts,
+        reject_mode="repair", cohort_slots=8, max_new_tokens=40,
+        stop_token_ids={STOP_ID},
+    )
+    assert [s.tokens for s in res_fold.streams] == [s.tokens for s in res_repair.streams]
+    assert len(res_fold.streams) == 3  # dummies not reported
+    assert all(s.finish_reason == "stop" for s in res_fold.streams)
+
+
+def test_foldin_matches_single_stream_reference() -> None:
+    # fold-in batched stream b == prompt b decoded ALONE (the sha-gate contract).
+    prompts = _distinct_prompts(6)
+    broken = {prompts[b][0] for b in (1, 3, 5)}
+    res = generate_greedy_batched(
+        _FakeRuntime(broken_rids=broken), prompts, reject_mode="foldin",
+        max_new_tokens=24,
+    )
+    ref = []
+    for prompt in prompts:
+        r = generate_greedy_batched(
+            _FakeRuntime(broken_rids=broken), [prompt], reject_mode="foldin",
+            max_new_tokens=24,
+        )
+        ref.append(r.streams[0].tokens)
+    records = diff_streams([s.tokens for s in res.streams], ref)
+    assert streams_all_match(records), records
+
+
+# --------------------------------------------------------------------------- #
+# Gate b: ragged per-row bookkeeping under divergence
+# --------------------------------------------------------------------------- #
+def test_foldin_ragged_bookkeeping_divergence() -> None:
+    """A chronically-MISSING row (1 tok/cycle) beside an all-ACCEPT row (2/cycle):
+    lengths diverge cycle-to-cycle yet both land exactly on their own greedy
+    continuation with the right finish reason."""
+    prompts = _distinct_prompts(2)
+    broken = {prompts[0][0]}  # row 0 misses forever, row 1 always accepts
+    res = generate_greedy_batched(
+        _FakeRuntime(broken_rids=broken), prompts, reject_mode="foldin",
+        max_new_tokens=16,
+    )
+    ref = _reference_single_stream(prompts, max_new_tokens=16, broken_rids=broken)
+    records = diff_streams([s.tokens for s in res.streams], ref)
+    assert streams_all_match(records), records
+    for s in res.streams:
+        assert len(s.tokens) == 16
+        assert s.finish_reason == "length"
+    # the missing row genuinely deferred corrections (replay_rows counts misses).
+    assert res.replay_rows > 0
+
+
+def test_foldin_ragged_bookkeeping_ragged_stop() -> None:
+    prompts = _distinct_prompts(4)
+    # different stop points AND some rows missing -> maximally ragged commit cadence.
+    stop_at = {prompts[b][0]: 3 + 4 * b for b in range(4)}  # 3,7,11,15
+    broken = {prompts[1][0], prompts[3][0]}
+    res = generate_greedy_batched(
+        _FakeRuntime(broken_rids=broken, stop_at=stop_at), prompts,
+        reject_mode="foldin", max_new_tokens=64, stop_token_ids={STOP_ID},
+    )
+    ref = _reference_single_stream(
+        prompts, max_new_tokens=64, stop_token_ids={STOP_ID},
+        broken_rids=broken, stop_at=stop_at,
+    )
+    records = diff_streams([s.tokens for s in res.streams], ref)
+    assert streams_all_match(records), records
+    for b in range(4):
+        s = res.streams[b]
+        assert s.finish_reason == "stop"
+        assert s.tokens[-1] == STOP_ID
+        assert len(s.tokens) == stop_at[prompts[b][0]] + 1
+    assert len({len(s.tokens) for s in res.streams}) == 4  # genuinely ragged
+
+
+# --------------------------------------------------------------------------- #
+# Gate c: single-sync accounting
+# --------------------------------------------------------------------------- #
+def test_foldin_one_blocking_sync_per_cycle(monkeypatch) -> None:
+    """The fold-in loop reads the GPU exactly ONCE per cycle -- the ``_eval_bundle``
+    seam -- regardless of the miss pattern (no repair sync, no cache-induced sync;
+    the ragged offset ops are pure device where + the host capacity bound)."""
+    calls = {"n": 0}
+    real = bd._eval_bundle
+
+    def _counting(bundle):
+        calls["n"] += 1
+        return real(bundle)
+
+    monkeypatch.setattr(bd, "_eval_bundle", _counting)
+    prompts = _distinct_prompts(4)
+    broken = {prompts[1][0], prompts[3][0]}  # misses -> still one sync/cycle
+    res = generate_greedy_batched(
+        _FakeRuntime(broken_rids=broken), prompts, reject_mode="foldin",
+        max_new_tokens=16,
+    )
+    assert calls["n"] == res.cycles  # exactly one bundle readback per cycle
+    assert res.meta["syncs_per_cycle"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# reject_mode selection + default fail-closed
+# --------------------------------------------------------------------------- #
+def test_foldin_reject_mode_env_and_arg() -> None:
+    assert batched_decode_reject_mode({}) == "repair"
+    assert batched_decode_reject_mode({BATCHED_DECODE_REJECT_ENV: "foldin"}) == "foldin"
+    assert batched_decode_reject_mode({BATCHED_DECODE_REJECT_ENV: "FoldIn"}) == "foldin"
+    assert batched_decode_reject_mode({BATCHED_DECODE_REJECT_ENV: "nonsense"}) == "repair"
+    assert batched_decode_reject_mode({BATCHED_DECODE_REJECT_ENV: "repair"}) == "repair"
+
+
+def test_foldin_default_is_repair_byte_identical() -> None:
+    # DEFAULT (no arg, no env) is repair: byte-identical to Build-1, meta reflects it.
+    prompts = _distinct_prompts(4)
+    broken = {prompts[1][0]}
+    res_default = generate_greedy_batched(
+        _FakeRuntime(broken_rids=broken), prompts, max_new_tokens=16
+    )
+    res_repair = generate_greedy_batched(
+        _FakeRuntime(broken_rids=broken), prompts, reject_mode="repair",
+        max_new_tokens=16,
+    )
+    assert [s.tokens for s in res_default.streams] == [
+        s.tokens for s in res_repair.streams
+    ]
+    assert res_default.meta["reject_mode"] == "repair"
+    assert res_default.replay_rows == 0
+
+
+def test_foldin_env_selects_foldin(monkeypatch) -> None:
+    monkeypatch.setenv(BATCHED_DECODE_REJECT_ENV, "foldin")
+    res = generate_greedy_batched(
+        _FakeRuntime(), _distinct_prompts(3), max_new_tokens=8
+    )
+    assert res.meta["reject_mode"] == "foldin"
+    assert res.meta["loop"] == "foldin_replay_single_sync"
+
+
+def test_foldin_bad_reject_mode_rejected() -> None:
+    with pytest.raises(ValueError, match="reject_mode"):
+        generate_greedy_batched(
+            _FakeRuntime(), _distinct_prompts(2), max_new_tokens=4,
+            reject_mode="bogus",
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Ragged-BACKED integration: the loop actually drives a RaggedBatchKVCache (tiny
+# Metal).  Validates item 1 (KV -> ragged conversion), the write-offset /
+# offset-fix cadence (committed tokens land at the right KV positions, a REPLAY
+# overwrites the stale draft slot), and the reserve()/make_mask key_len coordination
+# -- none of which the pure recurrent fake exercises.
+# --------------------------------------------------------------------------- #
+class _RaggedFakeRuntime(_FakeRuntime):
+    """Fake with a REAL trimmable KV entry (converted to RaggedBatchKVCache by the
+    fold-in path) alongside the recurrent trunk.  The KV is written with token-
+    valued K/V so committed tokens are recoverable from the buffer; the greedy
+    logits come from the recurrent trunk exactly as the base fake, so tokens are
+    identical.  Also fires the real ``create_attention_mask`` -> ``make_mask`` seam."""
+
+    def make_cache(self):
+        from mlx_lm.models.cache import KVCache
+
+        trunk = _FakeTrunkEntry()
+        self._trunk_entry = trunk
+        cache = [KVCache(), trunk]
+        self._last_cache = cache
+        self.last_mask_shape = None
+        self.last_kv_cap = None
+        return cache
+
+    def forward_ar(self, input_ids, cache, return_hidden: bool = False, **kw):
+        from mlx_lm.models.base import create_attention_mask
+
+        kv = cache[0]
+        rows = input_ids.tolist()
+        B, L = len(rows), len(rows[0])
+        # the real seam: create_attention_mask delegates to the ragged make_mask
+        # once the KV is on the ragged lane (during prefill kv is stock -> "causal").
+        mask = create_attention_mask(mx.zeros((B, L, 1)), kv)
+        self.last_mask_shape = (
+            None if (mask is None or isinstance(mask, str)) else tuple(mask.shape)
+        )
+        self.last_kv_cap = None if getattr(kv, "keys", None) is None else int(kv.keys.shape[2])
+        kvals = mx.array(rows, dtype=mx.float32).reshape(B, 1, L, 1)
+        kv.update_and_fetch(kvals, kvals)  # advances at the loop-preset write_start
+        # logits/hidden come from the recurrent trunk (cache[1]) -- base fake logic.
+        return super().forward_ar(input_ids, [cache[1]], return_hidden=return_hidden, **kw)
+
+
+def test_foldin_ragged_backed_kv_content_and_offsets() -> None:
+    from mtplx.ragged_kv_cache import RaggedBatchKVCache
+
+    prompts = _distinct_prompts(2)  # prompt_len 3
+    prompt_len = len(prompts[0])
+    broken = {prompts[1][0]}  # row 0 always accepts (2/cyc), row 1 always misses
+    rt = _RaggedFakeRuntime(broken_rids=broken)
+    res = generate_greedy_batched(
+        rt, prompts, reject_mode="foldin", max_new_tokens=12
+    )
+    # 1. equivalence: identical committed tokens to the pure recurrent fold-in fake.
+    ref = generate_greedy_batched(
+        _FakeRuntime(broken_rids=broken), prompts, reject_mode="foldin",
+        max_new_tokens=12,
+    )
+    assert [s.tokens for s in res.streams] == [s.tokens for s in ref.streams]
+
+    # 2. item 1: the trimmable KV entry became the ragged lane.
+    rg = rt._last_cache[0]
+    assert isinstance(rg, RaggedBatchKVCache)
+
+    # 3. cadence: committed tokens sit at their committed KV positions (a REPLAY
+    #    overwrote the stale draft slot), and per-row offsets track committed length.
+    for b, s in enumerate(res.streams):
+        toks = s.tokens
+        committed = rg.keys[b, 0, prompt_len : prompt_len + len(toks), 0].tolist()
+        assert [int(round(x)) for x in committed] == toks, (b, committed, toks)
+        assert int(rg.offsets[b].item()) >= prompt_len + len(toks)
+
+    # 4. reserve()/make_mask coordination: the last decode mask's key_len equals the
+    #    KV buffer capacity (no grow slipped between make_mask and update_and_fetch).
+    assert rt.last_mask_shape is not None
+    assert rt.last_mask_shape[:3] == (2, 1, 2)  # [B, 1, q=2, cap]
+    assert rt.last_mask_shape[-1] == rt.last_kv_cap
+
+
+def test_foldin_ragged_backed_matches_repair() -> None:
+    # the ragged-backed fold-in still equals the repair loop (which runs on the
+    # stock KV lane) -- the reject mechanism + the cache lane are both transparent.
+    prompts = _distinct_prompts(4)
+    broken = {prompts[1][0], prompts[2][0]}
+    res_fold = generate_greedy_batched(
+        _RaggedFakeRuntime(broken_rids=broken), prompts, reject_mode="foldin",
+        max_new_tokens=18,
+    )
+    res_repair = generate_greedy_batched(
+        _FakeRuntime(broken_rids=broken), prompts, reject_mode="repair",
+        max_new_tokens=18,
+    )
+    assert [s.tokens for s in res_fold.streams] == [s.tokens for s in res_repair.streams]

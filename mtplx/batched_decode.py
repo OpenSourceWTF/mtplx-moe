@@ -74,7 +74,15 @@ BATCHED_DECODE_ENV = "MTPLX_A3B_BATCHED_DECODE"
 # scheduling change; both commit the identical greedy sequence).  The ``serial=``
 # argument overrides this env when passed explicitly.
 BATCHED_DECODE_SERIAL_ENV = "MTPLX_A3B_BATCHED_DECODE_SERIAL"
+# Reject-handling mode (scheme doc §2.2, Build-2 kill-check).  DEFAULT "repair"
+# is fail-closed: the exact Build-1 uniform full-B repair loop, byte-identical
+# when off.  "foldin" selects the FOLD-IN REPLAY loop on the ragged-KV lane: a
+# missed row re-enters the next cycle one position back with [x0_prev, x1] (no
+# separate repair forward), its recurrent state rewound per-row.  Env fallback;
+# the ``reject_mode=`` argument overrides it when passed explicitly.
+BATCHED_DECODE_REJECT_ENV = "MTPLX_A3B_BATCHED_DECODE_REJECT"
 _TRUTHY = {"1", "true", "yes", "on"}
+_REJECT_MODES = {"repair", "foldin"}
 
 # What a real cross-request serving build still needs beyond this module
 # (recorded so the Phase-1/Phase-2 boundary is unambiguous):
@@ -102,6 +110,18 @@ def batched_decode_serial(environ: dict[str, str] | None = None) -> bool:
     return str(env.get(BATCHED_DECODE_SERIAL_ENV, "")).strip().lower() in _TRUTHY
 
 
+def batched_decode_reject_mode(environ: dict[str, str] | None = None) -> str:
+    """Reject-handling mode from ``MTPLX_A3B_BATCHED_DECODE_REJECT``.
+
+    Returns ``"foldin"`` iff the env is set to ``foldin`` (case-insensitive);
+    otherwise ``"repair"`` (the default, fail-closed Build-1 behaviour).  Any
+    unrecognized value falls back to ``"repair"``.
+    """
+    env = os.environ if environ is None else environ
+    value = str(env.get(BATCHED_DECODE_REJECT_ENV, "")).strip().lower()
+    return value if value in _REJECT_MODES else "repair"
+
+
 # --------------------------------------------------------------------------- #
 # Results
 # --------------------------------------------------------------------------- #
@@ -125,6 +145,10 @@ class BatchedDecodeResult:
     prefill_s: float
     decode_s: float
     generated_tokens: int
+    # FOLD-IN telemetry: total REPLAY row-cycles (== total misses; each miss is
+    # deferred one cycle and replayed).  Named to line up with upstream's
+    # ``deferred_correction_repairs``.  Zero in repair mode (no fold-in).
+    replay_rows: int = 0
     meta: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -250,6 +274,228 @@ def _eval_bundle(bundle: Any) -> tuple[list[int], list[int], list[int], list[int
     )
 
 
+def _run_foldin_loop(
+    rt: Any,
+    *,
+    cache: Any,
+    batch: int,
+    n_real: int,
+    real_slots: Any,
+    logits_last: Any,
+    hidden_last: Any,
+    use_mtp_draft: bool,
+    max_new_tokens: int,
+    done: list[bool],
+    commit: Any,
+    verify_shape_ok: Any,
+) -> tuple[int, int, int, int]:
+    """The FOLD-IN REPLAY decode loop (scheme doc §2.2; R3).
+
+    Pipelined single-sync structure identical to the Build-1 loop (submit -> async
+    kick -> drain the previous cycle one behind -> ONE bundle sync), but with NO
+    repair forward: a missed row re-enters the next cycle one position back.
+
+    Per cycle, ONE ``[B,2]`` forward.  Per-row mode from last cycle's accept mask
+    (``replay_flags``, from the previous bundle sync -- dummy slots forced OFF):
+
+    * SPEC row (accepted or fresh): input ``[x0', d']`` written at ``(L, L+1)``;
+      ``x0' = argmax`` of its latest logits, ``d'`` = MTP draft on its latest
+      hidden.  Commits 2 tokens on accept, 1 (``x0'``) on a miss.
+    * REPLAY row (missed last cycle): input ``[x0_prev, x1]`` written at
+      ``(L-1, L)`` -- ``write_start = offset-1`` overwrites the stale draft slot;
+      its recurrent state is reverted per-row to the PRE-verify snapshot of the
+      cycle it missed (a 1-cycle snapshot window).  Unconditional accept (both
+      tokens known); commits ``x1``.
+
+    All row-mode selection -- input tokens, ragged write offsets / new offsets, and
+    the recurrent restore mask -- is DEVICE-SIDE ``mx.where`` on the accept mask;
+    the only host read is the single ``[4,B]`` bundle
+    ``(commit0, commit1, n_commit, next_replay)`` per cycle.  The ragged KV entries
+    carry per-row offsets and roll a missed row back by OVERWRITING its draft slot
+    on the replay write (no KV snapshot); only the recurrent state is snapshot-
+    restored.  Returns ``(cycles, forwards, all_accept_cycles, replay_rows)``.
+    """
+    import mlx.core as mx
+
+    from mtplx.attention_context import attention_phase
+    from mtplx.cache_state import (
+        restore_untrimmable_cache_masked,
+        snapshot_untrimmable_cache,
+    )
+    from mtplx.ragged_kv_cache import RaggedBatchKVCache
+
+    ragged = [e for e in cache if isinstance(e, RaggedBatchKVCache)]
+    # Dummy slots (indices >= n_real) NEVER replay -- they stay inert SPEC rows.
+    real_mask_host = [b < n_real for b in range(batch)]
+
+    def _mtp_draft(hl: Any, x0_ids: Any) -> Any:
+        if not use_mtp_draft:
+            return x0_ids
+        draft_logits = rt.draft_mtp(
+            hl, mx.expand_dims(x0_ids, axis=1), mtp_cache=rt.make_mtp_cache()
+        )
+        return mx.argmax(draft_logits[:, -1, :], axis=-1)
+
+    def _submit(
+        ll: Any, hl: Any, replay_flags: list[bool], replay_a: Any, replay_b: Any,
+        prev_snapshot: Any,
+    ) -> dict[str, Any]:
+        """Build one cycle's device graph (no host sync); returns lazy handles."""
+        replay_dev = mx.array(replay_flags)  # [batch] bool
+        # 1. SPEC candidate tokens (device).
+        x0_spec = mx.argmax(ll, axis=-1)  # [batch]
+        d_spec = _mtp_draft(hl, x0_spec)  # [batch]
+        # 2. per-row input [batch,2]: REPLAY rows use the known [x0_prev, x1].
+        a = mx.where(replay_dev, replay_a, x0_spec)
+        b = mx.where(replay_dev, replay_b, d_spec)
+        inp = mx.stack([a, b], axis=1)  # [batch,2]
+        # 3. pre-forward ragged prep: write_start = offset-1 for REPLAY rows;
+        #    reserve so the ragged mask key_len matches the post-write capacity.
+        for rc in ragged:
+            rc.offsets = mx.where(replay_dev, rc.offsets - 1, rc.offsets).astype(mx.int32)
+            rc.reserve(2)
+        # 3b. recurrent REPLAY rewind: revert replay rows to the pre-verify snapshot
+        #     of the cycle they missed (prev cycle's snapshot).
+        if prev_snapshot is not None:
+            restore_untrimmable_cache_masked(cache, prev_snapshot, replay_flags)
+        # 4. snapshot the (rewound) recurrent state for THIS cycle's potential miss.
+        snapshot = snapshot_untrimmable_cache(cache)
+        # 5. the one [B,2] forward.
+        with attention_phase("decode_verify"):
+            v_logits, v_hidden = rt.forward_ar(inp, cache=cache, return_hidden=True)
+        # 6. decision (device).  REPLAY rows accept unconditionally.
+        x1_new = mx.argmax(v_logits[:, 0, :], axis=-1)  # [batch]
+        accept = mx.where(replay_dev, mx.array(True), b == x1_new)  # [batch] bool
+        spec_miss = mx.logical_and(mx.logical_not(replay_dev), mx.logical_not(accept))
+        # offset fix: a SPEC miss commits only x0 -> drop the stale draft slot from
+        # the logical length (REPLAY already advanced by exactly 1; SPEC accept by 2).
+        for rc in ragged:
+            rc.offsets = mx.where(spec_miss, rc.offsets - 1, rc.offsets).astype(mx.int32)
+        # 7. commit + telemetry bundle [4,batch].
+        commit0 = mx.where(replay_dev, b, a)  # REPLAY commits x1(=b); SPEC commits x0(=a)
+        two = mx.logical_and(mx.logical_not(replay_dev), accept)  # SPEC accept -> 2 tokens
+        n_commit = mx.where(two, mx.array(2, mx.int32), mx.array(1, mx.int32))
+        next_replay = spec_miss.astype(mx.int32)
+        bundle = mx.stack(
+            [commit0.astype(mx.int32), x1_new.astype(mx.int32), n_commit, next_replay],
+            axis=0,
+        )  # [4,batch] = (commit0, commit1, n_commit, next_replay)
+        return {
+            "v_logits": v_logits,
+            "v_hidden": v_hidden,
+            "bundle": bundle,
+            "snapshot": snapshot,
+            "next_ll": v_logits[:, 1, :],
+            "next_hl": v_hidden[:, 1:2, :],
+            "replay_a": a,  # this cycle's x0 -> next-cycle REPLAY's x0_prev
+            "replay_b": x1_new,  # this cycle's true x1 -> next-cycle REPLAY's x1
+        }
+
+    def _read(sub: dict[str, Any]) -> tuple[tuple[list, list, list], list[bool]]:
+        nonlocal forwards, all_accept_cycles
+        verify_shape_ok(sub["v_logits"], sub["v_hidden"])
+        c0, c1, nc, nr = _eval_bundle(sub["bundle"])  # THE one blocking sync
+        forwards += 1
+        if not any(nr[b] for b in real_slots):
+            all_accept_cycles += 1  # no NEW real miss this cycle
+        next_flags = [bool(nr[b]) and real_mask_host[b] for b in range(batch)]
+        return (c0, c1, nc), next_flags
+
+    def _drain(pending: tuple[list, list, list]) -> None:
+        c0, c1, nc = pending
+        for b in range(batch):
+            commit(b, c0[b])
+            if nc[b] >= 2:
+                commit(b, c1[b])
+
+    forwards = 0
+    all_accept_cycles = 0
+    replay_rows = 0
+    # Every ACTIVE row commits >=1 token/cycle (accept 2, miss 1, replay 1), so a
+    # row reaches max_new_tokens in <= max_new_tokens cycles; +lag headroom.
+    max_cycles = max_new_tokens + 4
+
+    zeros = mx.zeros((batch,), dtype=mx.int32)
+    replay_flags = [False] * batch
+    replay_a, replay_b, prev_snapshot = zeros, zeros, None
+
+    # Prologue: submit + read cycle 0 (all SPEC), then hold one pending commit.
+    sub = _submit(logits_last, hidden_last, replay_flags, replay_a, replay_b, prev_snapshot)
+    mx.async_eval(sub["bundle"], sub["v_logits"], sub["v_hidden"])
+    pending, replay_flags = _read(sub)
+    replay_rows += sum(1 for f in replay_flags if f)
+    logits_last, hidden_last = sub["next_ll"], sub["next_hl"]
+    replay_a, replay_b, prev_snapshot = sub["replay_a"], sub["replay_b"], sub["snapshot"]
+    cycles = 1
+
+    while not all(done) and cycles < max_cycles:
+        sub = _submit(
+            logits_last, hidden_last, replay_flags, replay_a, replay_b, prev_snapshot
+        )
+        mx.async_eval(sub["bundle"], sub["v_logits"], sub["v_hidden"])
+        _drain(pending)  # commit the previous cycle (one-cycle lag)
+        pending, replay_flags = _read(sub)
+        replay_rows += sum(1 for f in replay_flags if f)
+        logits_last, hidden_last = sub["next_ll"], sub["next_hl"]
+        replay_a, replay_b, prev_snapshot = (
+            sub["replay_a"], sub["replay_b"], sub["snapshot"]
+        )
+        cycles += 1
+
+    _drain(pending)  # flush the final cycle's deferred commit
+    return cycles, forwards, all_accept_cycles, replay_rows
+
+
+def to_foldin_cache(cache: list[Any], batch_size: int) -> list[Any]:
+    """Convert a stock (prefilled) cache list to the FOLD-IN lane in place (item 1).
+
+    * Full-attention layers (trimmable KV) -> :class:`RaggedBatchKVCache`, seeded
+      from the prefilled scalar KV via ``from_scalar_cache`` (uniform per-row
+      offsets == the shared prefill length, host capacity bound seeded).  Their
+      array ``offset`` fails every custom Metal fast-path closed
+      (``_cache_offset_static_int`` -> ``None``), so only stock SDPA runs, and the
+      ragged mask reaches attention through ``create_attention_mask`` ->
+      ``make_mask`` with no model edit.
+    * GDN/conv layers (recurrent, batch-major) -> ``OwnedRecurrentStateCache`` so
+      the per-row masked restore (``restore_masked``) is available for the REPLAY
+      rewind.  A non-array recurrent entry (e.g. a CPU test fake with list state)
+      is left untouched -- the generic restore fallback drives it.
+
+    Called AFTER prefill: prefill runs on the stock lane (uniform offset, plain
+    causal mask), then this hands the decode loop a ragged cache whose buffers are
+    the prefilled K/V.
+    """
+    from mtplx.cache_state import OwnedRecurrentStateCache, _is_trimmable
+    from mtplx.ragged_kv_cache import RaggedBatchKVCache
+
+    for idx, entry in enumerate(cache):
+        if entry is None:
+            continue
+        if _is_trimmable(entry):
+            cache[idx] = RaggedBatchKVCache.from_scalar_cache(
+                entry, batch_size=int(batch_size)
+            )
+            continue
+        if isinstance(entry, OwnedRecurrentStateCache):
+            continue
+        # Convert an ARRAY-state recurrent cache to the owned class (so
+        # restore_masked exists).  Leave list/None state (test fakes) alone.
+        state = getattr(entry, "state", None)
+        if (
+            isinstance(state, list)
+            and state
+            and all(_is_array_leaf(leaf) for leaf in state)
+        ):
+            cache[idx] = OwnedRecurrentStateCache.from_cache(entry)
+    return cache
+
+
+def _is_array_leaf(leaf: Any) -> bool:
+    import mlx.core as mx
+
+    return leaf is None or isinstance(leaf, mx.array)
+
+
 def generate_greedy_batched(
     rt: Any,
     prompts: list[list[int]],
@@ -261,6 +507,7 @@ def generate_greedy_batched(
     cohort_slots: int | None = None,
     pad_id: int = 0,
     serial: bool | None = None,
+    reject_mode: str | None = None,
 ) -> BatchedDecodeResult:
     """Greedy multi-stream batched decode.
 
@@ -293,9 +540,20 @@ def generate_greedy_batched(
     commit the IDENTICAL greedy sequence — the parallelization is a pure scheduling
     change.
 
-    The committed sequence of real stream ``b`` is byte-identical across loops and
-    to running ``[prompts[b]]`` alone through this function in a cohort of the same
-    slot count (the correctness contract); assert it with :func:`diff_streams`.
+    REJECT (``reject_mode``).  Default ``"repair"`` (or the
+    ``MTPLX_A3B_BATCHED_DECODE_REJECT`` env fallback unset) is the Build-1 uniform
+    full-B repair loop above, byte-identical when off.  ``"foldin"`` selects the
+    FOLD-IN REPLAY loop on the ragged-KV lane (scheme §2.2): a missed row re-enters
+    the next cycle one position back with ``[x0_prev, x1]`` — no separate repair
+    forward — its recurrent state rewound per-row.  Same single-sync structure,
+    same committed greedy sequence; only the per-cycle token cadence (1 on a miss +
+    1 on its replay, vs 2 on accept) and the ``replay_rows`` telemetry differ.  The
+    stock KV entries are converted (post-prefill) to :class:`RaggedBatchKVCache`.
+
+    The committed sequence of real stream ``b`` is byte-identical across loops AND
+    reject modes, and to running ``[prompts[b]]`` alone through this function in a
+    cohort of the same slot count (the correctness contract); assert with
+    :func:`diff_streams`.
     """
     import mlx.core as mx
 
@@ -339,6 +597,13 @@ def generate_greedy_batched(
 
     if serial is None:
         serial = batched_decode_serial()
+    if reject_mode is None:
+        reject_mode = batched_decode_reject_mode()
+    reject_mode = str(reject_mode).strip().lower()
+    if reject_mode not in _REJECT_MODES:
+        raise ValueError(
+            f"reject_mode must be one of {sorted(_REJECT_MODES)}, got {reject_mode!r}"
+        )
     stop = {int(t) for t in (stop_token_ids or set())}
 
     started_all = time.perf_counter()
@@ -403,9 +668,31 @@ def generate_greedy_batched(
     forwards = 0
     all_accept_cycles = 0
     repair_cycles = 0
+    replay_rows = 0
     started_decode = time.perf_counter()
 
-    if serial:
+    if reject_mode == "foldin":
+        # ================= FOLD-IN REPLAY LOOP (R3, scheme §2.2) ================
+        # ONE [B,2] pass per cycle, no separate repair forward.  Per-row mode from
+        # last cycle's accept mask; all row-mode selection (tokens, write_start,
+        # new_offsets, recurrent restore) is DEVICE-SIDE mx.where, the single
+        # [4,B]-bundle sync per cycle preserved.  The stock KV entries become
+        # RaggedBatchKVCache (per-row offsets) seeded from the prefill.
+        cycles, forwards, all_accept_cycles, replay_rows = _run_foldin_loop(
+            rt,
+            cache=to_foldin_cache(cache, batch),
+            batch=batch,
+            n_real=n_real,
+            real_slots=real_slots,
+            logits_last=logits_last,
+            hidden_last=hidden_last,
+            use_mtp_draft=use_mtp_draft,
+            max_new_tokens=max_new_tokens,
+            done=done,
+            commit=_commit,
+            verify_shape_ok=_verify_shape_ok,
+        )
+    elif serial:
         # ================= EXACT PHASE-1 SERIAL LOOP (A/B baseline) =============
         # 4-5 blocking syncs per cycle; behaviour identical to the original driver
         # except dummy slots are masked out of the all-accept decision.
@@ -565,17 +852,30 @@ def generate_greedy_batched(
         for b in real_slots
     ]
     generated = sum(len(tokens[b]) for b in real_slots)
+    foldin = reject_mode == "foldin"
     meta: dict[str, Any] = {}
     if collect_stats:
+        if foldin:
+            loop_name = "foldin_replay_single_sync"
+            scheme_name = "foldin_replay_ragged_kv"
+            lane_name = "ragged_batch_kv+stock_attention"
+        else:
+            loop_name = "serial" if serial else "pipelined_single_sync"
+            scheme_name = "uniform_+2_per_cycle_full_B_repair"
+            lane_name = "batch_generic_kv+stock_attention"
         meta = {
             "elapsed_s": time.perf_counter() - started_all,
             "use_mtp_draft": bool(use_mtp_draft),
-            "shared_offset_lane": "batch_generic_kv+stock_attention",
-            "scheme": "uniform_+2_per_cycle_full_B_repair",
-            "loop": "serial" if serial else "pipelined_single_sync",
+            "shared_offset_lane": lane_name,
+            "scheme": scheme_name,
+            "reject_mode": reject_mode,
+            "loop": loop_name,
             "cohort_slots": None if cohort_slots is None else int(cohort_slots),
             "real_streams": n_real,
-            "syncs_per_cycle": None if serial else 1,
+            # fold-in and the pipelined repair loop both hold to one bundle sync
+            # per cycle; the serial A/B baseline is multi-sync.
+            "syncs_per_cycle": None if (serial and not foldin) else 1,
+            "replay_rows": int(replay_rows),
             "phase": 1,
             "phase2_remaining": PHASE2_REMAINING,
         }
@@ -589,5 +889,6 @@ def generate_greedy_batched(
         prefill_s=prefill_s,
         decode_s=decode_s,
         generated_tokens=generated,
+        replay_rows=replay_rows,
         meta=meta,
     )
