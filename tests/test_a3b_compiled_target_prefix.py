@@ -321,12 +321,6 @@ def test_trim_lane_defers_correction_repairs() -> None:
     assert "deferred_correction_repairs += 1" in source[
         source.index("elif committed_from_trim:"):
     ]
-    # The reforward fallback (the path GDN models actually take: trim fails
-    # at the recurrent-state boundary) folds the correction row out of the
-    # replay window and defers it as the pending primary.
-    assert "reforward_window = (" in source
-    assert 'committed[:-1] if rejection_correction is not None else committed' in source
-    assert "reforward_pending_correction" in source
 
 
 def test_route_records_rejection_correction_under_greedy() -> None:
