@@ -107,6 +107,14 @@ class RaggedBatchKVCache:
         # telemetry
         self.ragged_updates = 0
         self.ragged_grows = 0
+        # HOST-side monotone capacity upper bound (fable-main review, item 3).
+        # When set, ``update_and_fetch`` grows the physical buffer off this Python
+        # int and NEVER reads the device ``offsets`` for capacity -- so once
+        # ``write_start`` depends on the accept mask (a device expression) the call
+        # does not force a sync that would block the pipelined fold-in forward.
+        # ``None`` selects the legacy one-off path (a single device read), keeping
+        # every pre-existing caller byte-identical.
+        self._capacity_bound: int | None = None
 
     # -- construction helpers ------------------------------------------------
 
@@ -127,13 +135,20 @@ class RaggedBatchKVCache:
         if batch_size is None:
             raise ValueError("batch_size is required when the source cache has no keys")
         offsets = mx.full((int(batch_size),), scalar_offset, dtype=mx.int32)
-        return cls(
+        out = cls(
             batch_size=int(batch_size),
             step=int(step or getattr(entry, "step", 256)),
             keys=keys,
             values=values,
             offsets=offsets,
         )
+        # Seed the host capacity bound from the (host-known) scalar offset so the
+        # fold-in decode lane is sync-free from its first ``update_and_fetch``.
+        # from_scalar_cache makes every row uniform at ``scalar_offset``, so this
+        # is an EXACT upper bound on the max logical offset (not the step-rounded
+        # physical capacity -- seeding that would over-grow every cycle).
+        out._capacity_bound = int(scalar_offset)
+        return out
 
     # -- core contract -------------------------------------------------------
 
@@ -225,8 +240,19 @@ class RaggedBatchKVCache:
         else:
             resulting = _as_int32_vector(new_offsets, batch_size=B)
 
-        # physical positions touched by the scatter: max(write_start) + q
-        required = int(mx.max(start).item()) + int(q)
+        # Capacity: prefer the HOST-side monotone bound (item 3).  Every write
+        # advances a row's offset by at most ``q``, so ``_capacity_bound += q`` is
+        # an upper bound on ``max(offsets)`` -- and a REPLAY write at ``offset-1``
+        # touches positions ``[offset-1, offset-1+q) < _capacity_bound + q``, never
+        # exceeding it.  This reads NO device offset, so a device-valued
+        # ``write_start`` (the fold-in loop) never forces a sync here.  With no
+        # host bound seeded we fall back to the legacy single device read
+        # (byte-identical to the pre-fix behaviour for every existing caller).
+        if self._capacity_bound is not None:
+            self._capacity_bound += int(q)
+            required = self._capacity_bound
+        else:
+            required = int(mx.max(start).item()) + int(q)
         self._grow_to(required, keys, values)
 
         # per-row scatter indices along the sequence axis (axis=2):
@@ -248,16 +274,37 @@ class RaggedBatchKVCache:
         self.ragged_updates += 1
         return self.keys, self.values
 
-    def make_mask(self, q_len: int, *, key_len: int | None = None) -> mx.array:
+    def make_mask(
+        self,
+        q_len: int,
+        *,
+        return_array: bool = False,
+        window_size: int | None = None,
+        key_len: int | None = None,
+    ) -> mx.array:
         """Per-row causal mask ``[B, 1, q, key_len]`` from the current offsets.
 
-        Convenience wrapper around :func:`ragged_attention.ragged_causal_mask`
-        using this cache's *current* offsets as the per-row query-start
-        positions (append semantics).  ``key_len`` defaults to the physical
-        buffer capacity.  See ``ragged_attention`` for the mask contract.
+        This is the seam ``mlx_lm.models.base.create_attention_mask`` takes: it
+        delegates to ``cache.make_mask(N, return_array=..., window_size=...)``
+        whenever the cache entry exposes ``make_mask``, so a full-attention layer
+        gets the RAGGED mask WITHOUT any edit to the model or the custom attention
+        (``attention_split`` consumes an explicit ``mx.array`` mask on its stock
+        SDPA path).  The ``return_array``/``window_size`` kwargs match that call
+        signature: this lane is full-attention (the GDN layers carry the sliding
+        window on the recurrent side, so ``window_size`` is inapplicable) and it
+        ALWAYS returns an explicit ``[B, 1, q, key_len]`` boolean array (never the
+        ``"causal"`` sentinel), which is exactly ``return_array`` semantics.
+
+        Uses this cache's *current* offsets as the per-row query-start positions
+        -- for the fold-in loop those are the pre-write offsets it set before the
+        forward (``offset`` for SPEC rows, ``offset-1`` for REPLAY rows).
+        ``key_len`` defaults to the physical buffer capacity; the fold-in loop
+        calls :meth:`reserve` before the forward so this already equals the
+        post-``update_and_fetch`` capacity (no grow inside the forward).
         """
         from .ragged_attention import ragged_causal_mask
 
+        del return_array, window_size  # honoured implicitly (see docstring)
         if key_len is None:
             key_len = 0 if self.keys is None else int(self.keys.shape[2])
         return ragged_causal_mask(
@@ -265,6 +312,23 @@ class RaggedBatchKVCache:
             q_len=int(q_len),
             key_len=int(key_len),
         )
+
+    def reserve(self, additional_positions: int) -> None:
+        """Pre-grow the physical buffer to hold ``additional_positions`` more.
+
+        The fold-in decode loop calls this on every ragged entry BEFORE the
+        forward so the ragged mask's ``key_len`` (read from ``keys.shape[2]``
+        inside ``create_attention_mask`` -> :meth:`make_mask`) already matches the
+        capacity ``update_and_fetch`` will return -- no grow happens *inside* the
+        forward, so the mask and the K/V buffer stay shape-consistent and the
+        fixed-shape cohort discipline holds.  Grows purely off the host bound
+        (never a device read); a no-op until a host bound is seeded and the
+        buffers exist (post-prefill).
+        """
+        if self.keys is None or self.values is None or self._capacity_bound is None:
+            return
+        required = self._capacity_bound + int(additional_positions)
+        self._grow_to(required, self.keys, self.values)
 
     def size(self) -> int:
         if self.offsets is None:

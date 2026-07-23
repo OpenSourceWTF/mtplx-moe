@@ -638,3 +638,123 @@ def test_from_scalar_cache_degenerate_seed():
     rg = RaggedBatchKVCache.from_scalar_cache(sc)
     assert rg.offsets.tolist() == [5, 5, 5, 5]
     assert _bitwise_equal(rg.keys, sc.keys)
+    # host capacity bound seeded from the (host-known) scalar offset -- EXACT, not
+    # the step-rounded physical capacity (which would over-grow every cycle).
+    assert rg._capacity_bound == 5
+
+
+# ---------------------------------------------------------------------------
+# Item 3 (fable-main review): host-side monotone capacity bound -- update_and_fetch
+# performs ZERO device syncs when a host bound is seeded (a device-valued
+# write_start must not block the pipelined fold-in forward).
+# ---------------------------------------------------------------------------
+
+
+class _MaxSpy:
+    """Wrap ``mx.max`` to prove ``update_and_fetch`` never calls it for capacity."""
+
+    def __init__(self, monkeypatch):
+        self.calls = 0
+        self._real = mx.max
+        monkeypatch.setattr(mx, "max", self)
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        return self._real(*args, **kwargs)
+
+
+def test_capacity_bound_zero_device_sync_when_seeded(monkeypatch):
+    # A seeded host bound => update_and_fetch grows off the Python int only and
+    # never reads the device offsets (no mx.max(...).item()).  The device-valued
+    # write_start below is exactly the fold-in loop's blocking hazard.
+    B, H, D = 4, 2, 8
+    rg = RaggedBatchKVCache(step=64)
+    rg.keys = mx.zeros((B, H, 32, D))
+    rg.values = mx.zeros((B, H, 32, D))
+    rg.offsets = mx.array([5, 5, 5, 5], dtype=mx.int32)
+    rg._capacity_bound = 5  # seed the host bound (as the fold-in make-cache does)
+    spy = _MaxSpy(monkeypatch)
+    # SPEC append + a REPLAY write at offset-1, both device-valued write_start.
+    rg.update_and_fetch(
+        mx.random.normal((B, H, 2, D)),
+        mx.random.normal((B, H, 2, D)),
+        write_start=mx.array([5, 4, 5, 5]),  # row 1 replays at offset-1
+    )
+    assert spy.calls == 0, "seeded host bound must not read device offsets"
+    assert rg._capacity_bound == 7  # += q, monotone
+    assert rg.ragged_grows == 0  # capacity (32) sufficed => no allocation, no sync
+
+
+def test_capacity_bound_legacy_path_unchanged(monkeypatch):
+    # With NO host bound (default None), the legacy single device read runs -- the
+    # byte-identical pre-fix behaviour every existing caller relies on.
+    B, H, D = 3, 2, 8
+    rg = RaggedBatchKVCache(step=8)
+    rg.keys = mx.zeros((B, H, 8, D))
+    rg.values = mx.zeros((B, H, 8, D))
+    rg.offsets = mx.array([1, 3, 0], dtype=mx.int32)
+    assert rg._capacity_bound is None
+    spy = _MaxSpy(monkeypatch)
+    rg.update_and_fetch(mx.random.normal((B, H, 2, D)), mx.random.normal((B, H, 2, D)))
+    assert spy.calls == 1  # legacy path reads max(offsets) exactly once
+    assert rg.offsets.tolist() == [3, 5, 2]
+
+
+def test_capacity_bound_monotone_grows_off_python_int():
+    # Repeated appends grow the buffer purely off _capacity_bound; a REPLAY write
+    # at offset-1 never needs more capacity than a SPEC append already reserved.
+    B, H, D = 2, 2, 8
+    rg = RaggedBatchKVCache.from_scalar_cache(
+        TailOwnedKVCache(step=4), batch_size=B
+    )  # fresh: offsets 0, bound 0
+    assert rg._capacity_bound == 0
+    rg.keys = mx.zeros((B, H, 0, D))
+    rg.values = mx.zeros((B, H, 0, D))
+    for cycle in range(6):
+        rg.update_and_fetch(
+            mx.random.normal((B, H, 2, D)), mx.random.normal((B, H, 2, D))
+        )
+        assert rg._capacity_bound == 2 * (cycle + 1)
+        assert int(rg.keys.shape[2]) >= rg._capacity_bound
+
+
+def test_reserve_pregrows_so_no_grow_inside_update():
+    # reserve() before the forward makes keys.shape[2] final so make_mask's
+    # key_len matches update_and_fetch's output capacity (mask/keys consistency).
+    B, H, D = 4, 2, 8
+    rg = RaggedBatchKVCache(step=16)
+    rg.keys = mx.zeros((B, H, 16, D))
+    rg.values = mx.zeros((B, H, 16, D))
+    rg.offsets = mx.array([14, 14, 14, 14], dtype=mx.int32)
+    rg._capacity_bound = 14
+    rg.reserve(2)  # 14 + 2 = 16 <= cap 16 => no grow yet
+    assert int(rg.keys.shape[2]) == 16
+    cap_before = int(rg.keys.shape[2])
+    mask_key_len = int(rg.make_mask(2).shape[-1])
+    keys, _ = rg.update_and_fetch(
+        mx.random.normal((B, H, 2, D)), mx.random.normal((B, H, 2, D))
+    )
+    assert int(keys.shape[2]) == cap_before  # no grow inside update
+    assert mask_key_len == int(keys.shape[2])  # mask key_len matches K buffer
+    # next cycle crosses the step boundary: reserve grows, make_mask still matches.
+    rg.reserve(2)  # 16 + 2 = 18 > 16 => grow to 32
+    assert int(rg.keys.shape[2]) == 32
+    assert int(rg.make_mask(2).shape[-1]) == 32
+
+
+def test_make_mask_create_attention_mask_signature():
+    # create_attention_mask calls cache.make_mask(N, return_array=..., window_size=..).
+    rg = RaggedBatchKVCache(step=16)
+    rg.keys = mx.zeros((3, 2, 16, 8))
+    rg.values = mx.zeros((3, 2, 16, 8))
+    rg.offsets = mx.array([2, 5, 0], dtype=mx.int32)
+    m = rg.make_mask(2, return_array=True, window_size=None)
+    assert m.shape == (3, 1, 2, 16)
+    assert m.dtype == mx.bool_
+    from mlx_lm.models.base import create_attention_mask
+
+    # the real seam: create_attention_mask delegates to make_mask when present.
+    mixed = mx.zeros((3, 2, 8))  # [B, N=2, H]
+    delegated = create_attention_mask(mixed, rg)
+    assert delegated.shape == (3, 1, 2, 16)
+    assert _bitwise_equal(delegated.astype(mx.int32), m.astype(mx.int32))
