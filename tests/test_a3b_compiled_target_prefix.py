@@ -285,6 +285,22 @@ def test_exact_request_accepts_greedy_as_deterministic_argmax_contract(
     a3b_target.validate_a3b_k1_target_prefix_sampler(sampler)
 
 
+def test_route_records_rejection_correction_under_greedy() -> None:
+    # The compiled route commits + repair-forwards the rejection correction
+    # in-cycle (fixed 2-token geometry); the greedy lane's defer-to-next-cycle
+    # convention would hand it a None and crash mx.array([[None]]).  The
+    # acceptance loop must record the correction for the route at ANY
+    # temperature -- under greedy it is the pre-sampled argmax target id.
+    from mtplx import generation
+
+    source = inspect.getsource(generation.generate_mtpk)
+    guard = source.index("or a3b_target_prefix_route is not None")
+    record = source.index("rejection_correction = int(correction)")
+    assert guard < record
+    repair = source.index("committed.append(rejection_correction)")
+    assert record < repair
+
+
 def test_generic_target_prefix_sampler_contract_is_proven_without_sampling() -> None:
     from mtplx import generation
 

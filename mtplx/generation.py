@@ -8173,7 +8173,10 @@ def generate_mtpk(
                 event["drafts"][depth_index]["online_correction_cache"][
                     "stored_token"
                 ] = cached_target
-            if sampler.temperature > 0 and (
+            if (
+                sampler.temperature > 0
+                or a3b_target_prefix_route is not None
+            ) and (
                 constraint is None
                 or constraint.validate_prefix(
                     [*draft_tokens[:depth_index], int(correction)]
@@ -8182,6 +8185,12 @@ def generate_mtpk(
             ):
                 # A grammar-illegal residual correction is dropped, not
                 # committed; the masked primary resamples the position.
+                # Greedy normally defers the correction to the next cycle's
+                # argmax over the retained rejection row, but the compiled
+                # K1 route's fixed cycle geometry commits + repair-forwards
+                # the correction in-cycle, so it must be recorded at any
+                # temperature -- under greedy `correction` IS the
+                # pre-sampled argmax target id (the AR token).
                 rejection_correction = int(correction)
             break
         elapsed_accept = max(
