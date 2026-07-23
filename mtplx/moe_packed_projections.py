@@ -46,6 +46,7 @@ Default off.  Enable with ``MTPLX_QWEN_MOE_PACK_GATE_UP=1``.
 
 from __future__ import annotations
 
+import functools
 import os
 from typing import Any
 
@@ -54,6 +55,13 @@ import mlx.nn as nn
 
 
 PACK_GATE_UP_ENV = "MTPLX_QWEN_MOE_PACK_GATE_UP"
+
+# Batched-decode numerical-path pin.  When truthy, :class:`PackedSwitchGLU`
+# forces its token-sort switch OFF so the routed-expert gather runs the UNSORTED
+# ``gather_qmm`` kernel at every row count.  Default OFF => serving numerics are
+# unchanged; only the batched-decode lane sets it.  See
+# :func:`moe_force_unsorted_enabled`.
+FORCE_UNSORTED_ENV = "MTPLX_A3B_MOE_FORCE_UNSORTED"
 
 _STATS: dict[str, Any] = {
     "enabled": False,
@@ -72,6 +80,30 @@ def moe_pack_gate_up_enabled() -> bool:
     """Whether construction-time MoE gate/up packing is requested."""
 
     return _env_enabled(PACK_GATE_UP_ENV)
+
+
+@functools.cache
+def moe_force_unsorted_enabled() -> bool:
+    """Whether the batched-decode lane pins :class:`PackedSwitchGLU` to the
+    UNSORTED gather path (``do_sort`` forced ``False``).
+
+    Default OFF -> serving behaviour is unchanged.  When ON, a ``[B, rows]``
+    decode forward is bitwise identical to the same stream run single-stream.
+    The stock ``indices.size >= 64`` switch otherwise flips a B>=4 verify
+    (``16 * B`` routed indices at ``top_k=8``, ``rows=2``: B=2 -> 32 unsorted,
+    B=4 -> 64 SORTED) onto the sorted ``gather_qmm`` kernel, whose float
+    accumulation order differs from the unsorted kernel a B<4 / single stream
+    uses.  That is greedy batch NON-invariance -- a different numerical path,
+    NOT a row permutation (the ``_gather_sort`` / ``_scatter_unsort`` round-trip
+    is exact) -- and it breaks the per-stream sha gate at B>=4.  Pinning the
+    whole batched-decode lane to the unsorted path gives ONE numerical path for
+    every row count.
+
+    Cached: :meth:`PackedSwitchGLU.__call__` runs ~40x per forward, so the env
+    is read once.  Tests that toggle the flag call ``.cache_clear()``.
+    """
+
+    return _env_enabled(FORCE_UNSORTED_ENV)
 
 
 def moe_packed_projection_stats() -> dict[str, Any]:
@@ -169,7 +201,10 @@ class PackedSwitchGLU(nn.Module):
 
         x = mx.expand_dims(x, (-2, -3))
 
-        do_sort = indices.size >= 64
+        # ``MTPLX_A3B_MOE_FORCE_UNSORTED`` pins the batched-decode lane to the
+        # unsorted gather so a [B, rows] forward is bitwise identical to the
+        # single-stream reference (the B>=4 per-stream sha root-cause fix).
+        do_sort = indices.size >= 64 and not moe_force_unsorted_enabled()
         idx = indices
         inv_order = None
         if do_sort:
