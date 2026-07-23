@@ -115,6 +115,10 @@ class RaggedBatchKVCache:
         # ``None`` selects the legacy one-off path (a single device read), keeping
         # every pre-existing caller byte-identical.
         self._capacity_bound: int | None = None
+        # CONSTANT-capacity pin (refill/admission lane).  When set, every write
+        # and mask uses exactly this capacity: the §47 fixed-shape discipline
+        # extended to the KV axis, and no bound arithmetic / device read at all.
+        self._frozen_capacity: int | None = None
 
     # -- construction helpers ------------------------------------------------
 
@@ -248,7 +252,9 @@ class RaggedBatchKVCache:
         # ``write_start`` (the fold-in loop) never forces a sync here.  With no
         # host bound seeded we fall back to the legacy single device read
         # (byte-identical to the pre-fix behaviour for every existing caller).
-        if self._capacity_bound is not None:
+        if self._frozen_capacity is not None:
+            required = self._frozen_capacity
+        elif self._capacity_bound is not None:
             self._capacity_bound += int(q)
             required = self._capacity_bound
         else:
@@ -325,10 +331,33 @@ class RaggedBatchKVCache:
         (never a device read); a no-op until a host bound is seeded and the
         buffers exist (post-prefill).
         """
-        if self.keys is None or self.values is None or self._capacity_bound is None:
+        if self.keys is None or self.values is None:
+            return
+        if self._frozen_capacity is not None:
+            self._grow_to(self._frozen_capacity, self.keys, self.values)
+            return
+        if self._capacity_bound is None:
             return
         required = self._capacity_bound + int(additional_positions)
         self._grow_to(required, self.keys, self.values)
+
+    def freeze_capacity(self, capacity: int) -> None:
+        """Pin the physical buffer at a CONSTANT capacity (refill lane).
+
+        After this, every mask key width and every ``update_and_fetch`` growth
+        target is exactly ``capacity`` (step-rounded once by ``_grow_to``) for
+        the rest of the decode — the fixed-shape cohort discipline extended to
+        the KV axis, so admission events can never shift kernel dispatch
+        mid-run.  The CALLER contracts that no row ever writes at or beyond the
+        rounded capacity (the refill driver bounds offsets by ``prompt_len +
+        max_new + lag + one admission window``, far under the frozen cap).
+        Buffers that do not exist yet grow to the frozen capacity on their
+        first write instead.
+        """
+        cap = int(capacity)
+        if self.keys is not None and self.values is not None:
+            self._grow_to(cap, self.keys, self.values)
+        self._frozen_capacity = cap
 
     def size(self) -> int:
         if self.offsets is None:

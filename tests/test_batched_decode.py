@@ -989,3 +989,128 @@ def test_foldin_lazy_and_clone_snapshot_agree(monkeypatch) -> None:
     assert [s.finish_reason for s in res_lazy.streams] == [
         s.finish_reason for s in res_clone.streams
     ]
+
+
+# --------------------------------------------------------------------------- #
+# REFILL / continuous batching (fold-in + cohort mode only)
+# --------------------------------------------------------------------------- #
+def _refill_reference(
+    prompts, *, cohort, max_new_tokens, stop_token_ids=None, **rt_kwargs
+):
+    """Each prompt alone through the REFILL machinery (admission-path entry)."""
+    out = []
+    for prompt in prompts:
+        res = generate_greedy_batched(
+            _FakeRuntime(**rt_kwargs),
+            [prompt],
+            max_new_tokens=max_new_tokens,
+            stop_token_ids=stop_token_ids,
+            cohort_slots=cohort,
+            reject_mode="foldin",
+            refill_queue=[],
+        )
+        out.append(res.streams[0].tokens)
+    return out
+
+
+def test_refill_requires_foldin_and_cohort() -> None:
+    prompts = _distinct_prompts(2)
+    with pytest.raises(ValueError, match="foldin"):
+        generate_greedy_batched(
+            _FakeRuntime(), prompts, max_new_tokens=4, cohort_slots=4,
+            reject_mode="repair", refill_queue=[],
+        )
+    with pytest.raises(ValueError, match="cohort"):
+        generate_greedy_batched(
+            _FakeRuntime(), prompts, max_new_tokens=4,
+            reject_mode="foldin", refill_queue=[],
+        )
+    with pytest.raises(ValueError, match="length"):
+        generate_greedy_batched(
+            _FakeRuntime(), prompts, max_new_tokens=4, cohort_slots=4,
+            reject_mode="foldin", refill_queue=[[1, 2]],
+        )
+
+
+def test_refill_reference_matches_plain_foldin_reference() -> None:
+    # The admission-path entry (dummy prefill + zero-state admission) must
+    # reproduce the plain fold-in cohort decode bitwise on the row-isolated fake.
+    prompts = _distinct_prompts(4)
+    plain = [
+        generate_greedy_batched(
+            _FakeRuntime(), [p], max_new_tokens=16, cohort_slots=4,
+            reject_mode="foldin",
+        ).streams[0].tokens
+        for p in prompts
+    ]
+    via_admission = _refill_reference(prompts, cohort=4, max_new_tokens=16)
+    assert plain == via_admission
+
+
+@pytest.mark.parametrize("batch", [2, 4])
+def test_refill_serves_queue_and_matches_references(batch: int) -> None:
+    total = 3 * batch
+    all_prompts = _distinct_prompts(total)
+    cohort = max(4, batch)
+    res = generate_greedy_batched(
+        _FakeRuntime(), all_prompts[:batch], max_new_tokens=12,
+        cohort_slots=cohort, reject_mode="foldin",
+        refill_queue=all_prompts[batch:],
+    )
+    assert len(res.streams) == total
+    ref = _refill_reference(all_prompts, cohort=cohort, max_new_tokens=12)
+    records = diff_streams([s.tokens for s in res.streams], ref)
+    assert streams_all_match(records), records
+    assert res.meta["refill"] is True
+    assert res.meta["requests"] == total
+    assert res.meta["admission_passes"] >= 2  # initial + at least one refill
+    assert res.repair_cycles == 0
+    assert res.forwards == res.cycles  # admission passes are counted separately
+
+
+def test_refill_with_replays_matches_references() -> None:
+    total = 8
+    all_prompts = _distinct_prompts(total)
+    broken = {p[0] for p in all_prompts[::2]}  # alternating requests draft wrong
+    res = generate_greedy_batched(
+        _FakeRuntime(broken_rids=broken), all_prompts[:4], max_new_tokens=12,
+        cohort_slots=4, reject_mode="foldin", refill_queue=all_prompts[4:],
+    )
+    ref = _refill_reference(
+        all_prompts, cohort=4, max_new_tokens=12, broken_rids=broken
+    )
+    records = diff_streams([s.tokens for s in res.streams], ref)
+    assert streams_all_match(records), records
+    assert res.replay_rows > 0  # staggered finishes exercise partial admission
+
+
+def test_refill_with_stops_staggered_admission() -> None:
+    total = 6
+    all_prompts = _distinct_prompts(total)
+    stop_at = {all_prompts[i][0]: 3 + i for i in range(total)}
+    res = generate_greedy_batched(
+        _FakeRuntime(stop_at=stop_at), all_prompts[:2], max_new_tokens=20,
+        cohort_slots=2, reject_mode="foldin", refill_queue=all_prompts[2:],
+        stop_token_ids={STOP_ID},
+    )
+    assert len(res.streams) == total
+    assert all(s.finish_reason == "stop" for s in res.streams)
+    ref = _refill_reference(
+        all_prompts, cohort=2, max_new_tokens=20,
+        stop_token_ids={STOP_ID}, stop_at=stop_at,
+    )
+    records = diff_streams([s.tokens for s in res.streams], ref)
+    assert streams_all_match(records), records
+
+
+def test_refill_instance_invariance() -> None:
+    # The same prompt admitted multiple times commits the same sequence.
+    prompts = _distinct_prompts(2)
+    queue = [list(prompts[0]), list(prompts[1]), list(prompts[0])]
+    res = generate_greedy_batched(
+        _FakeRuntime(), prompts, max_new_tokens=10, cohort_slots=2,
+        reject_mode="foldin", refill_queue=queue,
+    )
+    seq = [s.tokens for s in res.streams]
+    assert seq[0] == seq[2] == seq[4]
+    assert seq[1] == seq[3]

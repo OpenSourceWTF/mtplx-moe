@@ -307,6 +307,10 @@ def _run_foldin_loop(
     done: list[bool],
     commit: Any,
     verify_shape_ok: Any,
+    admit_fn: Any = None,
+    work_remaining: Any = None,
+    max_cycles: int | None = None,
+    pin_idle_offsets: int | None = None,
 ) -> tuple[int, int, int, int]:
     """The FOLD-IN REPLAY decode loop (scheme doc §2.2; R3).
 
@@ -383,6 +387,19 @@ def _run_foldin_loop(
         inp = mx.stack([a, b], axis=1)  # [batch,2]
         # 3. pre-forward ragged prep: write_start = offset-1 for REPLAY rows;
         #    reserve so the ragged mask key_len matches the post-write capacity.
+        # 3a. FROZEN-capacity guard (refill lane): idle rows -- dummy slots and
+        #     done-but-not-yet-readmitted real slots -- decode discarded garbage
+        #     but their offsets would advance ~2/cycle without bound and overflow
+        #     the frozen physical capacity (out-of-bounds scatter corrupts
+        #     NEIGHBOURING rows' slabs).  Pin them to a constant in-bounds
+        #     position; their content is discarded and per-row independence keeps
+        #     live rows byte-stable.  ``done`` is at most one flush stale, so an
+        #     unpinned overrun is bounded by ~2 positions -- always in bounds.
+        if pin_idle_offsets is not None and ragged and any(done):
+            idle_dev = mx.array(list(done))
+            pin_off = mx.full((batch,), int(pin_idle_offsets), dtype=mx.int32)
+            for rc in ragged:
+                rc.offsets = mx.where(idle_dev, pin_off, rc.offsets).astype(mx.int32)
         for rc in ragged:
             rc.offsets = mx.where(replay_dev, rc.offsets - 1, rc.offsets).astype(mx.int32)
             rc.reserve(2)
@@ -451,11 +468,26 @@ def _run_foldin_loop(
     replay_rows = 0
     # Every ACTIVE row commits >=1 token/cycle (accept 2, miss 1, replay 1), so a
     # row reaches max_new_tokens in <= max_new_tokens cycles; +lag headroom.
-    max_cycles = max_new_tokens + 4
+    # A refill driver passes an override scaled by its total request count.
+    if max_cycles is None:
+        max_cycles = max_new_tokens + 4
+    _more = work_remaining if work_remaining is not None else (lambda: not all(done))
 
     zeros = mx.zeros((batch,), dtype=mx.int32)
     replay_flags = [False] * batch
     replay_a, replay_b, prev_snapshot = zeros, zeros, None
+    pending: tuple[list, list, list] | None = None
+
+    def _flush() -> None:
+        # Drain the held cycle's commits exactly once.  At the loop top there is
+        # NO cycle in flight (the previous iteration's read synced it), so an
+        # admission hook can flush here and see fully-current done flags before
+        # it reassigns a slot -- stale pending commits can never leak into a
+        # newly admitted request.
+        nonlocal pending
+        if pending is not None:
+            _drain(pending)
+            pending = None
 
     # Prologue: submit + read cycle 0 (all SPEC), then hold one pending commit.
     sub = _submit(logits_last, hidden_last, replay_flags, replay_a, replay_b, prev_snapshot)
@@ -466,12 +498,16 @@ def _run_foldin_loop(
     replay_a, replay_b, prev_snapshot = sub["replay_a"], sub["replay_b"], sub["snapshot"]
     cycles = 1
 
-    while not all(done) and cycles < max_cycles:
+    while _more() and cycles < max_cycles:
+        if admit_fn is not None:
+            logits_last, hidden_last = admit_fn(
+                logits_last, hidden_last, replay_flags, _flush
+            )
         sub = _submit(
             logits_last, hidden_last, replay_flags, replay_a, replay_b, prev_snapshot
         )
         mx.async_eval(sub["bundle"], sub["v_logits"], sub["v_hidden"])
-        _drain(pending)  # commit the previous cycle (one-cycle lag)
+        _flush()  # commit the previous cycle (one-cycle lag)
         pending, replay_flags = _read(sub)
         replay_rows += sum(1 for f in replay_flags if f)
         logits_last, hidden_last = sub["next_ll"], sub["next_hl"]
@@ -480,7 +516,7 @@ def _run_foldin_loop(
         )
         cycles += 1
 
-    _drain(pending)  # flush the final cycle's deferred commit
+    _flush()  # flush the final cycle's deferred commit
     return cycles, forwards, all_accept_cycles, replay_rows
 
 
@@ -509,6 +545,8 @@ def to_foldin_cache(cache: list[Any], batch_size: int) -> list[Any]:
     for idx, entry in enumerate(cache):
         if entry is None:
             continue
+        if isinstance(entry, RaggedBatchKVCache):
+            continue  # already on the fold-in lane (refill converts early)
         if _is_trimmable(entry):
             cache[idx] = RaggedBatchKVCache.from_scalar_cache(
                 entry, batch_size=int(batch_size)
@@ -534,6 +572,38 @@ def _is_array_leaf(leaf: Any) -> bool:
     return leaf is None or isinstance(leaf, mx.array)
 
 
+def _zero_untrimmable_rows(cache: list[Any], row_mask: list[bool]) -> None:
+    """Masked fresh-start reset of recurrent rows (refill admission).
+
+    Rows selected by ``row_mask`` get their recurrent state zeroed
+    (``OwnedRecurrentStateCache.zero_rows`` — conv tail and GDN matrix state
+    both zero-initialize, so the admission prefill over those rows reproduces a
+    from-scratch prefill); a per-row Python container (the CPU test fake's
+    histories) gets those rows emptied, the same fresh-start semantics.
+    Trimmable / ragged KV entries are skipped — their reset is the per-row
+    offset rewrite in the admission pass.
+    """
+    import mlx.core as mx
+
+    from mtplx.cache_state import _is_trimmable
+
+    for entry in cache:
+        if entry is None or _is_trimmable(entry):
+            continue
+        zero_rows = getattr(entry, "zero_rows", None)
+        if callable(zero_rows):
+            zero_rows(row_mask)
+            continue
+        state = getattr(entry, "state", None)
+        if isinstance(state, mx.array):
+            mask = mx.array(row_mask).reshape(
+                (len(row_mask),) + (1,) * (int(state.ndim) - 1)
+            )
+            entry.state = mx.where(mask, mx.zeros_like(state), state)
+        elif isinstance(state, list) and all(isinstance(r, list) for r in state):
+            entry.state = [[] if m else row for row, m in zip(state, row_mask)]
+
+
 def generate_greedy_batched(
     rt: Any,
     prompts: list[list[int]],
@@ -546,6 +616,7 @@ def generate_greedy_batched(
     pad_id: int = 0,
     serial: bool | None = None,
     reject_mode: str | None = None,
+    refill_queue: list[list[int]] | None = None,
 ) -> BatchedDecodeResult:
     """Greedy multi-stream batched decode.
 
@@ -592,6 +663,22 @@ def generate_greedy_batched(
     reject modes, and to running ``[prompts[b]]`` alone through this function in a
     cohort of the same slot count (the correctness contract); assert with
     :func:`diff_streams`.
+
+    REFILL / CONTINUOUS BATCHING (``refill_queue``, fold-in + cohort mode only).
+    When not ``None`` (an EMPTY list still selects refill mechanics — the
+    reference arm uses that), the run serves ``prompts + refill_queue`` requests
+    through the ``n_real`` slots: a finished slot is re-admitted with the next
+    queued request at the following cycle boundary.  EVERY real request —
+    initial cohort included — enters through one identical ADMISSION pass: a
+    ``[cohort, prompt_len]`` ragged-mask prefill in which the admitted rows run
+    their new prompt from per-row offset 0 over zero-reset recurrent state
+    while every other row's state is masked-restored and its offsets are put
+    back (its KV beyond the logical length is never attended).  The initial
+    scalar prefill runs DUMMY rows only (buffer materialization — identical in
+    every run), and KV capacity is FROZEN to one constant so every forward in
+    candidate and reference runs has identical shapes (the §47 discipline
+    extended to admission).  Results report one stream per REQUEST; admission
+    passes are counted in ``meta['admission_passes']`` (not ``forwards``).
     """
     import mlx.core as mx
 
@@ -644,14 +731,41 @@ def generate_greedy_batched(
         )
     stop = {int(t) for t in (stop_token_ids or set())}
 
+    refill = refill_queue is not None
+    if refill:
+        if reject_mode != "foldin":
+            raise ValueError(
+                "refill_queue requires reject_mode='foldin' (the ragged per-row "
+                "offset lane is what admission resets)"
+            )
+        if cohort_slots is None:
+            raise ValueError(
+                "refill_queue requires fixed-shape cohort mode (cohort_slots)"
+            )
+        for q in refill_queue:
+            if len(q) != prompt_len:
+                raise ValueError(
+                    "refill prompts must share the cohort prompt length "
+                    f"({prompt_len}); left_pad the whole request set together"
+                )
+    # One entry per REQUEST (non-refill: exactly the initial prompts).
+    requests: list[list[int]] = [list(p) for p in slots[:n_real]]
+    if refill:
+        requests += [[int(t) for t in q] for q in refill_queue]
+
     started_all = time.perf_counter()
     cache = rt.make_cache()
 
     # --- batched prefill: one [batch, prompt_len] forward -> per-stream last logits.
+    # Refill mode prefills DUMMY rows only (buffer/template materialization,
+    # identical in every run); the real requests enter via the admission pass.
+    prefill_rows = (
+        [[int(pad_id)] * prompt_len for _ in range(batch)] if refill else slots
+    )
     started = time.perf_counter()
     with attention_phase("prefill"):
         logits, hidden = rt.forward_ar(
-            mx.array(slots),
+            mx.array(prefill_rows),
             cache=cache,
             return_hidden=True,
         )
@@ -665,26 +779,32 @@ def generate_greedy_batched(
     hidden_last = hidden[:, -1:, :]  # [batch, 1, H]
     prefill_s = time.perf_counter() - started
 
-    tokens: list[list[int]] = [[] for _ in range(batch)]
-    finish: list[str | None] = [None] * batch
+    # Request-indexed results with slot indirection: slot ``b`` currently serves
+    # request ``slot_request[b]`` (``None`` for a dummy slot).  Without refill
+    # this is the identity map, byte-identical to the old per-slot bookkeeping.
+    tokens: list[list[int]] = [[] for _ in requests]
+    finish: list[str | None] = [None] * len(requests)
     done = [False] * batch
+    slot_request: list[int | None] = [None] * batch
+    for b in range(n_real):
+        slot_request[b] = b
     # Dummy slots occupy their row but are inert: pre-marked done so they commit
     # nothing and drop out of the ``all(done)`` termination test.
     for b in range(n_real, batch):
         done[b] = True
-        finish[b] = "dummy"
 
     def _commit(b: int, tok: int) -> None:
-        """Record one committed token for stream b, applying stop/length."""
-        if done[b]:
+        """Record one committed token for slot b's request, applying stop/length."""
+        r = slot_request[b]
+        if r is None or done[b]:
             return
-        tokens[b].append(int(tok))
+        tokens[r].append(int(tok))
         if int(tok) in stop:
             done[b] = True
-            finish[b] = "stop"
-        elif len(tokens[b]) >= max_new_tokens:
+            finish[r] = "stop"
+        elif len(tokens[r]) >= max_new_tokens:
             done[b] = True
-            finish[b] = "length"
+            finish[r] = "length"
 
     def _commit_pair(x0: list[int], x1: list[int]) -> None:
         for b in range(batch):
@@ -709,6 +829,7 @@ def generate_greedy_batched(
     replay_rows = 0
     started_decode = time.perf_counter()
 
+    admission_passes = 0
     if reject_mode == "foldin":
         # ================= FOLD-IN REPLAY LOOP (R3, scheme §2.2) ================
         # ONE [B,2] pass per cycle, no separate repair forward.  Per-row mode from
@@ -716,9 +837,111 @@ def generate_greedy_batched(
         # new_offsets, recurrent restore) is DEVICE-SIDE mx.where, the single
         # [4,B]-bundle sync per cycle preserved.  The stock KV entries become
         # RaggedBatchKVCache (per-row offsets) seeded from the prefill.
+        foldin_cache = to_foldin_cache(cache, batch)
+        admit_fn = None
+        work_remaining = None
+        max_cycles_override = None
+        if refill:
+            # ---- REFILL / CONTINUOUS BATCHING (see the docstring) -------------
+            from mtplx.cache_state import (
+                restore_untrimmable_cache_masked,
+                snapshot_untrimmable_cache_lazy,
+            )
+            from mtplx.ragged_kv_cache import RaggedBatchKVCache
+
+            _snap = (
+                snapshot_untrimmable_cache
+                if foldin_clone_snapshot()
+                else snapshot_untrimmable_cache_lazy
+            )
+            ragged_entries = [
+                e for e in foldin_cache if isinstance(e, RaggedBatchKVCache)
+            ]
+            # Constant KV capacity: prompt + generation + pipeline lag + one
+            # admission window, identical in candidate and reference runs.  A
+            # tight growth step keeps the frozen cap (= SDPA key width every
+            # cycle) near the true bound instead of the 256-step round-up.
+            frozen_cap = 2 * prompt_len + max_new_tokens + 32
+            for rc in ragged_entries:
+                rc.step = 32
+                rc.freeze_capacity(frozen_cap)
+            dummy_row = [int(pad_id)] * prompt_len
+            next_req = n_real
+
+            def _admit_rows(
+                assign: dict[int, int], ll: Any, hl: Any, flags: list[bool] | None
+            ) -> tuple[Any, Any]:
+                """Admit ``assign`` (slot -> request idx) via ONE cohort-shaped
+                ragged prefill; every other row's state/offsets are put back."""
+                nonlocal admission_passes
+                admit_host = [b in assign for b in range(batch)]
+                keep_host = [not m for m in admit_host]
+                admit_dev = mx.array(admit_host)
+                pre_state = _snap(foldin_cache)
+                _zero_untrimmable_rows(foldin_cache, admit_host)
+                saved_offsets = [rc.offsets for rc in ragged_entries]
+                if ragged_entries:
+                    zero_off = mx.zeros((batch,), dtype=mx.int32)
+                    for rc in ragged_entries:
+                        rc.offsets = mx.where(
+                            admit_dev, zero_off, rc.offsets
+                        ).astype(mx.int32)
+                inp = [
+                    requests[assign[b]] if b in assign else dummy_row
+                    for b in range(batch)
+                ]
+                with attention_phase("prefill"):
+                    p_logits, p_hidden = rt.forward_ar(
+                        mx.array(inp), cache=foldin_cache, return_hidden=True
+                    )
+                restore_untrimmable_cache_masked(foldin_cache, pre_state, keep_host)
+                if ragged_entries:
+                    admitted_off = mx.full((batch,), prompt_len, dtype=mx.int32)
+                    for rc, saved in zip(ragged_entries, saved_offsets):
+                        rc.offsets = mx.where(
+                            admit_dev, admitted_off, saved
+                        ).astype(mx.int32)
+                ll = mx.where(admit_dev[:, None], p_logits[:, -1, :], ll)
+                hl = mx.where(admit_dev[:, None, None], p_hidden[:, -1:, :], hl)
+                for b, rid in assign.items():
+                    slot_request[b] = rid
+                    done[b] = False
+                    if flags is not None:
+                        flags[b] = False
+                admission_passes += 1
+                return ll, hl
+
+            # The INITIAL cohort enters through the same admission pass as every
+            # queued request -- one prefill mechanism, one kernel schedule.
+            logits_last, hidden_last = _admit_rows(
+                {b: b for b in range(n_real)}, logits_last, hidden_last, None
+            )
+
+            def admit_fn(ll: Any, hl: Any, flags: list[bool], flush: Any):
+                nonlocal next_req
+                if next_req >= len(requests):
+                    return ll, hl
+                if not any(done[b] for b in range(n_real)):
+                    return ll, hl
+                flush()  # commits current before any slot is reassigned
+                assign: dict[int, int] = {}
+                for b in range(n_real):
+                    if next_req >= len(requests):
+                        break
+                    if done[b]:
+                        assign[b] = next_req
+                        next_req += 1
+                if not assign:
+                    return ll, hl
+                return _admit_rows(assign, ll, hl, flags)
+
+            def work_remaining() -> bool:
+                return next_req < len(requests) or not all(done)
+
+            max_cycles_override = (max_new_tokens + 4) * max(1, len(requests))
         cycles, forwards, all_accept_cycles, replay_rows = _run_foldin_loop(
             rt,
-            cache=to_foldin_cache(cache, batch),
+            cache=foldin_cache,
             batch=batch,
             n_real=n_real,
             real_slots=real_slots,
@@ -729,6 +952,10 @@ def generate_greedy_batched(
             done=done,
             commit=_commit,
             verify_shape_ok=_verify_shape_ok,
+            admit_fn=admit_fn,
+            work_remaining=work_remaining,
+            max_cycles=max_cycles_override,
+            pin_idle_offsets=(prompt_len if refill else None),
         )
     elif serial:
         # ================= EXACT PHASE-1 SERIAL LOOP (A/B baseline) =============
@@ -875,21 +1102,21 @@ def generate_greedy_batched(
 
     decode_s = time.perf_counter() - started_decode
 
-    for b in real_slots:
-        if finish[b] is None:
-            finish[b] = "length" if len(tokens[b]) >= max_new_tokens else "cycle_cap"
+    for r in range(len(requests)):
+        if finish[r] is None:
+            finish[r] = "length" if len(tokens[r]) >= max_new_tokens else "cycle_cap"
 
     streams = [
         BatchedStreamResult(
-            index=b,
+            index=r,
             prompt_len=prompt_len,
-            tokens=tokens[b],
-            finish_reason=str(finish[b]),
-            sha=token_sha(tokens[b]),
+            tokens=tokens[r],
+            finish_reason=str(finish[r]),
+            sha=token_sha(tokens[r]),
         )
-        for b in real_slots
+        for r in range(len(requests))
     ]
-    generated = sum(len(tokens[b]) for b in real_slots)
+    generated = sum(len(tokens[r]) for r in range(len(requests)))
     foldin = reject_mode == "foldin"
     meta: dict[str, Any] = {}
     if collect_stats:
@@ -914,6 +1141,9 @@ def generate_greedy_batched(
             # per cycle; the serial A/B baseline is multi-sync.
             "syncs_per_cycle": None if (serial and not foldin) else 1,
             "replay_rows": int(replay_rows),
+            "refill": bool(refill),
+            "requests": len(requests),
+            "admission_passes": int(admission_passes),
             "phase": 1,
             "phase2_remaining": PHASE2_REMAINING,
         }

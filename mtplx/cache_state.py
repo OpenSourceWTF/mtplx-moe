@@ -2735,6 +2735,26 @@ class OwnedRecurrentStateCache:
             m = mask.reshape((int(mask.size),) + (1,) * (int(cur.ndim) - 1))
             self.cache[idx] = mx.where(m, snap, cur)
 
+    def zero_rows(self, row_mask: Any) -> None:
+        """Per-row masked ZERO of the recurrent leaves (refill admission).
+
+        Rows where ``row_mask`` is ``True`` have every leaf reset to zeros —
+        the recurrent fresh-start value (the causal-conv tail and the GDN
+        matrix state both zero-initialize), so an admission prefill over those
+        rows reproduces a from-scratch prefill.  Same lazy rebind contract as
+        :meth:`restore_masked`: a device-side ``mx.where``, no sync, additive.
+        """
+        import mlx.core as mx
+
+        mask = row_mask if isinstance(row_mask, mx.array) else mx.array(row_mask)
+        mask = mask.astype(mx.bool_).reshape(-1)
+        for idx in range(len(self.cache)):
+            cur = self.cache[idx]
+            if cur is None:
+                continue
+            m = mask.reshape((int(mask.size),) + (1,) * (int(cur.ndim) - 1))
+            self.cache[idx] = mx.where(m, mx.zeros_like(cur), cur)
+
     @property
     def meta_state(self) -> tuple[str, str]:
         return ("owned_recurrent_state", self.mode)
