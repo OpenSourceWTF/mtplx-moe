@@ -87,8 +87,19 @@ def _fail(message: str) -> None:
 
 
 def validate_a3b_k1_target_prefix_sampler(sampler: Any) -> None:
-    """Prove the external sampler contract once before prompt construction."""
-    if float(sampler.temperature) <= 0.0 or int(sampler.top_k or 0) <= 0:
+    """Prove the external sampler contract once before prompt construction.
+
+    Greedy (temperature<=0) is the deterministic argmax contract: every route
+    sample site (the pre-sampled target rows, the device draft, the repair
+    resample) degenerates to argmax, which the pre-sampled-target-id
+    acceptance supports unchanged.  This is the AR-exactness gate lane -- a
+    greedy request must byte-match pure autoregressive decoding.  A
+    positive-temperature request still requires top-k so the pre-sampled
+    target rows stay on the small-support device sampler.
+    """
+    if float(sampler.temperature) <= 0.0:
+        return
+    if int(sampler.top_k or 0) <= 0:
         _fail("compiled A3B target-prefix requires a stochastic top-k sampler")
 
 

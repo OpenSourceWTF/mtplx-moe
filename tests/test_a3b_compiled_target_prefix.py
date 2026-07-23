@@ -259,21 +259,30 @@ def test_request_construction_trusts_finalized_model_factory() -> None:
         assert forbidden not in construction_source
 
 
-@pytest.mark.parametrize(
-    "sampler",
-    (
-        SamplerConfig(temperature=0.0, top_p=1.0, top_k=20),
-        SamplerConfig(temperature=0.6, top_p=0.95, top_k=0),
-    ),
-)
-def test_exact_request_rejects_unsupported_sampler_before_prompt_construction(
-    sampler,
-) -> None:
+def test_exact_request_rejects_unsupported_sampler_before_prompt_construction() -> None:
     with pytest.raises(
         a3b_target.A3BCompiledTargetPrefixConfigError,
         match="stochastic top-k sampler",
     ):
-        a3b_target.validate_a3b_k1_target_prefix_sampler(sampler)
+        a3b_target.validate_a3b_k1_target_prefix_sampler(
+            SamplerConfig(temperature=0.6, top_p=0.95, top_k=0)
+        )
+
+
+@pytest.mark.parametrize(
+    "sampler",
+    (
+        SamplerConfig(temperature=0.0, top_p=1.0, top_k=20),
+        SamplerConfig(temperature=0.0, top_p=1.0, top_k=0),
+        SamplerConfig(temperature=-1.0, top_p=1.0, top_k=0),
+    ),
+)
+def test_exact_request_accepts_greedy_as_deterministic_argmax_contract(
+    sampler,
+) -> None:
+    # Greedy is the AR-exactness gate lane: every route sample site
+    # degenerates to argmax, so the request is deterministic end-to-end.
+    a3b_target.validate_a3b_k1_target_prefix_sampler(sampler)
 
 
 def test_generic_target_prefix_sampler_contract_is_proven_without_sampling() -> None:
