@@ -91,14 +91,15 @@ def test_graft_injects_and_validates(tmp_path):
     assert validate_mtp_support(model)
 
 
-def test_return_hidden_is_pre_final_norm(tmp_path):
+def test_return_hidden_is_post_final_norm(tmp_path):
     model = _grafted(tmp_path)
     x = mx.array([[1, 2, 3, 4]])
     logits, hidden = model(x, return_hidden=True)
     assert logits.shape == (1, 4, VOCAB) and hidden.shape == (1, 4, HIDDEN)
-    # hidden must be the PRE-final-norm trunk state: re-applying the trunk's
-    # final norm + head must reproduce the returned logits exactly.
-    again = model.lm_head(model.model.norm(hidden))
+    # hidden must be the POST-final-norm trunk state (the measured draft
+    # contract — teacher-forced agreement 0.773 post vs 0.387 pre on real
+    # code): the head applied directly must reproduce the returned logits.
+    again = model.lm_head(hidden)
     assert mx.allclose(again, logits, atol=1e-5).item()
 
 

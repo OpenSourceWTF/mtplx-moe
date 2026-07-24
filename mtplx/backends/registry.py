@@ -424,9 +424,11 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
         notes=(
             "Hy3 ships one appended NextN layer with its own 192-expert MoE, "
             "eh_proj over concat[enorm(embedding), hnorm(hidden)], and shared "
-            "embeddings/head. The mlx-lm hy_v3 MTP revision exposes the head "
-            "natively (predict_next_tokens), so injection binds the existing "
-            "surface rather than grafting weights."
+            "embeddings/head. The draft consumes the POST-final-norm trunk "
+            "hidden (measured: teacher-forced agreement 0.773 post vs 0.387 "
+            "pre on real code). Injection grafts the head from the standard "
+            "appended-layer checkpoint; a native mlx-lm surface, when it "
+            "lands, is bound instead."
         ),
     ),
     "generic-mtp": ArchitectureSupport(

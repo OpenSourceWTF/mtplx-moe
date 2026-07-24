@@ -2,7 +2,7 @@
 
 Hy3 ships one appended MTP layer (num_nextn_predict_layers=1): a full MoE
 decoder layer fed concat[RMSNorm(next-token embedding), RMSNorm(trunk
-pre-final-norm hidden state)] through an eh_proj down-projection, sharing the
+post-final-norm hidden state)] through an eh_proj down-projection, sharing the
 trunk's embeddings and lm_head. The MLX reference implementation exposes it as
 ``Model.predict_next_tokens(hidden, token_ids, cache)`` with
 ``return_hidden_states=True`` on the trunk forward (see
@@ -57,8 +57,8 @@ class HyV3MTPBackend(MTPBackend):
                 "Single appended NextN layer with its own 192-expert MoE MLP, "
                 "sigmoid top-8 routing with expert bias, eh_proj over "
                 "concat[enorm(embedding), hnorm(hidden)], shared embeddings "
-                "and head. Draft layer consumes the trunk pre-final-norm "
-                "hidden state. Verification is exact rejection sampling in "
+                "and head. Draft layer consumes the trunk POST-final-norm "
+                "hidden state (measured 0.773 vs 0.387 pre-norm). Verification is exact rejection sampling in "
                 "generation.py; the MLX reference (mlx-lm hy_v3 MTP revision) "
                 "verifies greedily and is temp-0 exact."
             ),

@@ -16,7 +16,11 @@ graft is skipped and the same wrapper binds the native module unchanged.
 Architecture contract (must match the checkpoint):
 - one appended NextN layer (depth 1) with its own MoE MLP;
 - draft input is concat[enorm(next-token embedding), hnorm(trunk hidden)]
-  with the trunk hidden taken PRE-final-norm ("embedding_hidden" order);
+  with the trunk hidden taken POST-final-norm ("embedding_hidden" order).
+  Measured, not assumed: teacher-forced draft/target argmax agreement on a
+  1024-token real-code prompt is 0.773 with the post-norm hidden vs 0.387
+  pre-norm (and 0.000 with the concat order flipped) — the checkpoint's head
+  was trained on the normed trunk output;
 - shared embeddings and lm_head.
 """
 
@@ -266,12 +270,15 @@ def inject_hy_v3_mtp_support(
             if not return_hidden:
                 return super().__call__(inputs, cache=cache)
             if native_return_hidden:
-                # hy_v3's native forward already returns (logits, pre-norm h)
-                return super().__call__(
+                # A native forward returns the raw (pre-norm) trunk hidden;
+                # normalize it to match the measured draft contract.
+                logits, h = super().__call__(
                     inputs, cache=cache, return_hidden_states=True
                 )
-            # Released hy_v3 has no return_hidden_states: walk the trunk
-            # keeping the PRE-final-norm hidden the draft layer consumes.
+                return logits, self.model.norm(h)
+            # Released hy_v3 has no return_hidden_states: walk the trunk and
+            # hand back the POST-final-norm hidden the draft layer consumes
+            # (measured contract — see module docstring).
             inner = self.model
             if getattr(inner, "pipeline_size", 1) > 1:
                 raise ValueError(
@@ -283,7 +290,8 @@ def inject_hy_v3_mtp_support(
             mask = create_attention_mask(h, cache[0])
             for layer, c in zip(inner.layers, cache):
                 h = layer(h, mask, cache=c)
-            return self._head_logits(inner.norm(h)), h
+            normed = inner.norm(h)
+            return self._head_logits(normed), normed
 
         def _hy3_mtp_logits(self, h_mtp):
             native_logits = getattr(self, "_logits", None)
@@ -299,7 +307,7 @@ def inject_hy_v3_mtp_support(
             mtp_cache=None,
             concat_order=None,
             return_hidden: bool = False,
-            mtp_hidden_variant: str = "pre_norm",
+            mtp_hidden_variant: str = "post_norm",
             position_offset: int | None = None,
             mtp_depth: int | None = None,
         ):
