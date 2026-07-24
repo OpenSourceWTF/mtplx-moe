@@ -816,23 +816,35 @@ _HY_V3_MTP_MARKER_SUFFIXES = (
 
 
 def _passes_hy_v3_gate(inspection: Any) -> bool:
-    """Hy3's appended MTP block lives directly under an ``mtp.`` prefix
-    (``mtp.enorm.weight``, ``mtp.hnorm.weight``, ``mtp.eh_proj.weight``,
-    ``mtp.final_layernorm.weight``, ``mtp.layer.*``) rather than the
-    ``mtp.layers.{idx}.`` nesting DeepSeek/GLM/Step use, so it needs its own
-    gate instead of `_passes_appended_layer_gate` (verified against the
-    shipped `hy3-demolition-mlx-*-mtp` checkpoints' safetensors index)."""
+    """Hy3's appended MTP block ships in one of two layouts: repacked
+    checkpoints put it directly under an ``mtp.`` prefix (``mtp.enorm.weight``,
+    ``mtp.eh_proj.weight``, ``mtp.layer.*`` — verified against the shipped
+    `hy3-demolition-mlx-*-mtp` indexes), while tencent-native exports keep the
+    canonical appended-layer form ``model.layers.{num_hidden_layers}.*``
+    (``...enorm.weight``, ``...self_attn.*``, ``...mlp.*``). Neither uses the
+    ``mtp.layers.{idx}.`` nesting DeepSeek/GLM/Step share, so this stays a
+    dedicated gate instead of `_passes_appended_layer_gate`."""
     keys = _weight_keys(inspection)
     if not keys:
         return False
     count = int(getattr(inspection, "mtp_num_hidden_layers", 0) or 0)
     if count <= 0:
         return False
-    return _has_marker_under_prefixes(
+    if _has_marker_under_prefixes(
         keys,
         ("mtp.",),
         _HY_V3_MTP_MARKER_SUFFIXES,
         ("mtp.layer.",),
+    ):
+        return True
+    start = int(getattr(inspection, "num_hidden_layers", 0) or 0)
+    if start <= 0:
+        return False
+    return _has_marker_under_prefixes(
+        keys,
+        (f"model.layers.{start}.",),
+        _HY_V3_MTP_MARKER_SUFFIXES,
+        ("self_attn.", "mlp."),
     )
 
 
