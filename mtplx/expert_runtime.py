@@ -2066,6 +2066,19 @@ class ExpertStreamingRuntime:
             codec_verify=config.streamed_codec_verify,
             **pipeline_kwargs,
         )
+        # Expert reads are on the decode path, so make the active I/O backend
+        # visible: without the optional compiled extension the portable
+        # ``preadv`` fallback is used, which works but is slower and otherwise
+        # gives no sign that a faster path exists.
+        if reader.backend == "native":
+            _LOGGER.info("expert I/O backend: native positional reader")
+        else:
+            _LOGGER.info(
+                "expert I/O backend: %s (portable fallback). For faster expert "
+                "reads, install the native reader: "
+                "uv pip install -e native_extensions/expert_io",
+                reader.backend,
+            )
         try:
             slots = ExpertSlotPool(
                 model_spec,
