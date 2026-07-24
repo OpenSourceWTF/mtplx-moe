@@ -11,6 +11,22 @@ from mtplx.models.hy3_mlx import Model as Hy3Model
 from mtplx.models.hy3_mlx import ModelArgs as Hy3Args
 
 
+def _bind_execution_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_cadence: str | None,
+) -> None:
+    environ = (
+        {}
+        if raw_cadence is None
+        else {hy3_mlx.SUBMIT_CADENCE_ENV: raw_cadence}
+    )
+    monkeypatch.setattr(
+        hy3_mlx,
+        "_HY3_EXECUTION_POLICY",
+        hy3_mlx.bind_hy3_execution_policy(environ),
+    )
+
+
 def _tiny_args() -> Hy3Args:
     return Hy3Args(
         model_type="hy_v3",
@@ -53,12 +69,12 @@ def _decode_logits(model: Hy3Model) -> mx.array:
 
 
 def test_cadence_parses_and_defaults_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(hy3_mlx.SUBMIT_CADENCE_ENV, raising=False)
+    _bind_execution_policy(monkeypatch, None)
     assert hy3_mlx._decode_submit_cadence() == 0
-    monkeypatch.setenv(hy3_mlx.SUBMIT_CADENCE_ENV, "6")
+    _bind_execution_policy(monkeypatch, "6")
     assert hy3_mlx._decode_submit_cadence() == 6
     for bad in ("", "0", "-3", "nope"):
-        monkeypatch.setenv(hy3_mlx.SUBMIT_CADENCE_ENV, bad)
+        _bind_execution_policy(monkeypatch, bad)
         assert hy3_mlx._decode_submit_cadence() == 0
 
 
@@ -72,7 +88,7 @@ def test_cadence_submits_on_decode_not_prefill(
         calls["n"] += 1
         return original(*values)
 
-    monkeypatch.setenv(hy3_mlx.SUBMIT_CADENCE_ENV, "1")
+    _bind_execution_policy(monkeypatch, "1")
     monkeypatch.setattr(hy3_mlx.mx, "async_eval", counting)
     model = _fresh_model()
     cache = model.make_cache()
@@ -85,8 +101,18 @@ def test_cadence_submits_on_decode_not_prefill(
 
 
 def test_cadence_is_bitwise_invisible(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(hy3_mlx.SUBMIT_CADENCE_ENV, raising=False)
+    _bind_execution_policy(monkeypatch, None)
     baseline = _decode_logits(_fresh_model())
-    monkeypatch.setenv(hy3_mlx.SUBMIT_CADENCE_ENV, "1")
+
+    calls = {"n": 0}
+    original = mx.async_eval
+
+    def counting(*values):
+        calls["n"] += 1
+        return original(*values)
+
+    _bind_execution_policy(monkeypatch, "1")
+    monkeypatch.setattr(hy3_mlx.mx, "async_eval", counting)
     cadenced = _decode_logits(_fresh_model())
+    assert calls["n"] > 0
     assert mx.array_equal(baseline, cadenced).item()
