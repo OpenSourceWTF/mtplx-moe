@@ -309,8 +309,17 @@ def load(
     merge_mtp_adapter: bool = False,
     gemma4_draft_block_size: int | None = None,
     gemma4_target_distribution_mode: str | None = None,
+    proj_quant: str | None = None,
+    proj_requant: str | None = None,
 ) -> MTPLXRuntime:
-    """Load an MLX model and optionally inject native MTP support."""
+    """Load an MLX model and optionally inject native MTP support.
+
+    ``proj_quant`` / ``proj_requant`` (or the ``MTPLX_PROJ_QUANT`` /
+    ``MTPLX_PROJ_REQUANT`` environment variables) quantize the trunk
+    ``*_proj`` Linears at load time — see :mod:`mtplx.proj_quant`. Applied
+    to the trunk only, before MTP injection, so a draft head's precision is
+    never reduced.
+    """
     path = Path(model_path)
     from .gemma4_pair import resolve_gemma4_pair_paths
 
@@ -371,6 +380,25 @@ def load(
         from mlx_lm.utils import load as mlx_lm_load
 
         model, tokenizer = mlx_lm_load(str(_mtp_alias_load_path(path, config)))
+    import os as _os
+
+    proj_quant = proj_quant or _os.environ.get("MTPLX_PROJ_QUANT") or None
+    proj_requant = proj_requant or _os.environ.get("MTPLX_PROJ_REQUANT") or None
+    if proj_quant or proj_requant:
+        from .proj_quant import quantize_projections, requantize_projections
+
+        if proj_quant:
+            touched = quantize_projections(model, proj_quant)
+            logger.info(
+                "[proj-quant] quantized %d trunk *_proj modules to %s",
+                len(touched), proj_quant,
+            )
+        if proj_requant:
+            touched = requantize_projections(model, proj_requant)
+            logger.info(
+                "[proj-quant] requantized %d trunk *_proj modules to %s",
+                len(touched), proj_requant,
+            )
     runtime_metadata = _load_runtime_metadata(path)
     contract = (
         (contract or MTPContract())
