@@ -1958,7 +1958,18 @@ def _hy_v3_streaming_inspection(model_dir):
     )
 
 
-def test_baked_streaming_layout_reports_runnable_via_ar(tmp_path):
+def _install_authoritative_streaming_fixture(model_dir, monkeypatch):
+    from mtplx.expert_manifest import save_expert_manifest
+    from mtplx.expert_streaming_models import MODEL_SPECS
+    from test_expert_manifest import _make_authoritative_checkpoint
+
+    spec, manifest = _make_authoritative_checkpoint(model_dir)
+    saved = save_expert_manifest(manifest, model_dir / "expert-manifest.json")
+    monkeypatch.setitem(MODEL_SPECS, spec.key, spec)
+    return saved
+
+
+def test_baked_streaming_layout_reports_runnable_via_ar(monkeypatch, tmp_path):
     """Issue: `mtplx inspect` on a published SSD-streaming model wrongly said
     it CANNOT run, while `mtplx serve --expert-streaming` runs it fine via
     target-only AR. A valid baked streaming layout (expert-manifest.json plus
@@ -1967,23 +1978,14 @@ def test_baked_streaming_layout_reports_runnable_via_ar(tmp_path):
     from mtplx.backends.registry import compatibility_for_inspection
 
     # Preserve the upstream 2.3 family verdict as the non-streaming baseline.
-    inspection = _hy_v3_streaming_inspection(tmp_path)
+    model_dir = tmp_path / "model"
+    inspection = _hy_v3_streaming_inspection(model_dir)
     baseline = compatibility_for_inspection(inspection)
     assert baseline.can_run is False
 
     # A valid baked streaming layout is present and inspected by the real
     # construction-boundary helper.
-    (tmp_path / "expert-manifest.json").write_text(
-        json.dumps(
-            {
-                "format": "mtplx-expert-manifest-v1",
-                "model_key": "hy3-expert-oq2e",
-                "sidecar": {"file": "experts.bin", "size": 4},
-            }
-        ),
-        encoding="utf-8",
-    )
-    (tmp_path / "experts.bin").write_bytes(b"bank")
+    _install_authoritative_streaming_fixture(model_dir, monkeypatch)
 
     verdict = compatibility_for_inspection(inspection)
 
@@ -2001,7 +2003,7 @@ def test_baked_streaming_layout_reports_runnable_via_ar(tmp_path):
     assert verdict.arch_id == "hy-v3-mtp"
 
 
-def test_streaming_override_absent_keeps_pending_verdict(tmp_path):
+def test_streaming_override_absent_keeps_pending_verdict(monkeypatch, tmp_path):
     """The override only fires for a valid baked streaming layout.
 
     A truncated/missing bank (ok False) and an ordinary non-streaming model
@@ -2010,30 +2012,24 @@ def test_streaming_override_absent_keeps_pending_verdict(tmp_path):
     """
     from mtplx.backends.registry import compatibility_for_inspection
 
-    inspection = _hy_v3_streaming_inspection(tmp_path)
+    model_dir = tmp_path / "model"
+    inspection = _hy_v3_streaming_inspection(model_dir)
     baseline = compatibility_for_inspection(inspection)
     assert baseline.can_run is False
 
     # A real truncated bank -> unchanged prior verdict.
-    (tmp_path / "expert-manifest.json").write_text(
-        json.dumps(
-            {
-                "format": "mtplx-expert-manifest-v1",
-                "model_key": "hy3-expert-oq2e",
-                "sidecar": {"file": "experts.bin", "size": 8},
-            }
-        ),
-        encoding="utf-8",
-    )
-    (tmp_path / "experts.bin").write_bytes(b"short")
+    manifest = _install_authoritative_streaming_fixture(model_dir, monkeypatch)
+    assert manifest.sidecar is not None
+    bank = model_dir / manifest.sidecar.file
+    bank.write_bytes(bank.read_bytes()[:-1])
     not_ok = compatibility_for_inspection(inspection)
     assert not_ok == baseline
 
     # Ordinary non-streaming model (real status shape) -> unchanged prior
     # verdict. `ok` defaults True here, so gating on `ok` alone would wrongly
     # trigger; gating also on `streamed_experts` keeps normal models intact.
-    (tmp_path / "expert-manifest.json").unlink()
-    (tmp_path / "experts.bin").unlink()
+    (model_dir / "expert-manifest.json").unlink()
+    bank.unlink()
     non_streaming = compatibility_for_inspection(inspection)
     assert non_streaming == baseline
 

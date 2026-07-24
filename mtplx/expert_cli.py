@@ -71,7 +71,8 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group("SSD expert streaming")
     group.add_argument(
         "--expert-streaming",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help=(
             "Load only resident weights and stream routed quantized experts from SSD. "
             "This selects target-only AR for the pinned Hy3/GLM artifacts."

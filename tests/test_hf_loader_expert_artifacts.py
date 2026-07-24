@@ -1,357 +1,330 @@
-"""Expert-artifact completeness and opt-out download patterns."""
+"""Authoritative completeness checks for published streamed-expert artifacts."""
 
 from __future__ import annotations
 
-import json
-import sys
+import hashlib
+from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
+from mtplx.expert_manifest import (
+    EMPTY_SHA256,
+    ExpertManifest,
+    ShardInfo,
+    SidecarInfo,
+    SidecarPart,
+    save_expert_manifest,
+    validate_expert_manifest_spec,
+)
+from mtplx.expert_streaming_models import MODEL_SPECS, ExpertStreamingModelSpec
 from mtplx.hf_loader import (
-    EXPERT_BANK_IGNORE_PATTERNS,
-    PARTIAL_DOWNLOAD_MARKER,
-    cached_model_incompleteness_reason,
-    cached_model_is_complete,
+    MAX_RUNTIME_CONTRACT_BYTES,
     expert_artifact_status,
-    partial_download_info,
-    pull_model,
-    repo_file_is_ignored,
-    resolve_model_path,
-    validate_mtplx_model_files,
 )
 
-
-def _resident_model(root: Path) -> Path:
-    """A complete non-expert artifact: config + index + the shard it names."""
-
-    root.mkdir(parents=True, exist_ok=True)
-    (root / "config.json").write_text("{}\n", encoding="utf-8")
-    (root / "model.safetensors.index.json").write_text(
-        '{"weight_map": {"lm_head.weight": "model-00001-of-00001.safetensors"}}\n',
-        encoding="utf-8",
-    )
-    (root / "model-00001-of-00001.safetensors").write_bytes(b"weights")
-    return root
+from test_expert_manifest import _make_authoritative_checkpoint
 
 
-def _write_expert_manifest(
-    root: Path, *, sidecar_file: str | None = "experts.bin", size: int = 16
-) -> None:
-    manifest: dict[str, object] = {
-        "format": "mtplx-expert-manifest-v1",
-        "model_key": "fixture-expert-q2",
-        "source_repo": "local/fixture",
-        "source_revision": "0" * 40,
-        "quantization": {"bits": 2, "group_size": 32, "mode": "affine"},
-        "artifact": {
-            "tensor_bytes": size,
-            "resident_tensor_bytes": 0,
-            "routed_expert_bytes": size,
-            "shard_count": 0,
-            "record_count": 0,
-        },
-        "shards": [],
-        "resident_tensors": [],
-        "records": [],
-    }
-    if sidecar_file is not None:
-        manifest["sidecar"] = {
-            "file": sidecar_file,
-            "alignment": 16384,
-            "size": size,
-            "sha256": "e" * 64,
-        }
-    (root / "expert-manifest.json").write_text(
-        json.dumps(manifest), encoding="utf-8"
-    )
+def _install_authoritative_model(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[ExpertStreamingModelSpec, ExpertManifest]:
+    root.parent.mkdir(parents=True, exist_ok=True)
+    spec, manifest = _make_authoritative_checkpoint(root)
+    saved = save_expert_manifest(manifest, root / "expert-manifest.json")
+    monkeypatch.setitem(MODEL_SPECS, spec.key, spec)
+    return spec, saved
 
 
-# --- item 1: completeness is expert-aware -----------------------------------
-
-
-def test_streamed_expert_model_missing_bank_is_not_complete(tmp_path: Path):
-    model = _resident_model(tmp_path / "mtplx--experts")
-    _write_expert_manifest(model)
-
-    assert cached_model_is_complete(model) is False
-    reason = cached_model_incompleteness_reason(model)
-    assert reason is not None
-    assert "experts.bin" in reason and "missing" in reason
-
-
-def test_streamed_expert_model_truncated_bank_is_not_complete(tmp_path: Path):
-    model = _resident_model(tmp_path / "mtplx--experts")
-    _write_expert_manifest(model, size=64)
-    (model / "experts.bin").write_bytes(b"\x00" * 10)
-
-    reason = cached_model_incompleteness_reason(model)
-    assert reason is not None
-    assert "truncated" in reason
-    assert "10 of 64" in reason
-
-
-def test_streamed_expert_model_with_full_bank_is_complete(tmp_path: Path):
-    model = _resident_model(tmp_path / "mtplx--experts")
-    _write_expert_manifest(model, size=64)
-    (model / "experts.bin").write_bytes(b"\x00" * 64)
-
-    assert cached_model_is_complete(model) is True
-    assert cached_model_incompleteness_reason(model) is None
-
-
-def test_oversized_bank_is_accepted(tmp_path: Path):
-    """The manifest size is a floor, not an equality check."""
-
-    model = _resident_model(tmp_path / "mtplx--experts")
-    _write_expert_manifest(model, size=16)
-    (model / "experts.bin").write_bytes(b"\x00" * 4096)
-
-    assert cached_model_is_complete(model) is True
-
-
-def test_manifest_without_sidecar_needs_no_bank(tmp_path: Path):
-    model = _resident_model(tmp_path / "mtplx--experts")
-    _write_expert_manifest(model, sidecar_file=None)
-
-    assert cached_model_is_complete(model) is True
-
-
-def test_runtime_contract_declaring_experts_without_manifest_fails_closed(
+@pytest.fixture
+def authoritative_model(
     tmp_path: Path,
-):
-    model = _resident_model(tmp_path / "mtplx--experts")
-    (model / "mtplx_runtime.json").write_text(
-        json.dumps({"expert_manifest_file": "expert-manifest.json"}),
-        encoding="utf-8",
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, ExpertStreamingModelSpec, ExpertManifest]:
+    root = tmp_path / "model"
+    spec, manifest = _install_authoritative_model(root, monkeypatch)
+    return root, spec, manifest
+
+
+def test_authoritative_streamed_artifact_is_complete(
+    authoritative_model: tuple[Path, ExpertStreamingModelSpec, ExpertManifest],
+) -> None:
+    root, _spec, manifest = authoritative_model
+
+    status = expert_artifact_status(root)
+
+    assert manifest.sidecar is not None
+    assert status["streamed_experts"] is True
+    assert status["ok"] is True
+    assert status["sidecar_file"] == manifest.sidecar.file
+    assert status["expected_bytes"] == manifest.sidecar.size
+    assert status["actual_bytes"] == manifest.sidecar.size
+    assert status["reason"] is None
+
+
+def test_unknown_manifest_model_key_fails_closed(
+    authoritative_model: tuple[Path, ExpertStreamingModelSpec, ExpertManifest],
+) -> None:
+    root, _spec, manifest = authoritative_model
+    save_expert_manifest(
+        replace(manifest, model_key="unknown-streaming-model"),
+        root / "expert-manifest.json",
     )
 
-    reason = cached_model_incompleteness_reason(model)
-    assert reason is not None
-    assert "expert-manifest.json is missing" in reason
+    status = expert_artifact_status(root)
+
+    assert status["ok"] is False
+    assert "unknown model" in status["reason"]
 
 
-def test_unreadable_manifest_fails_closed(tmp_path: Path):
-    model = _resident_model(tmp_path / "mtplx--experts")
-    (model / "expert-manifest.json").write_text("{not json", encoding="utf-8")
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        (
+            lambda manifest: replace(manifest, source_repo="attacker/wrong-source"),
+            "source identity",
+        ),
+        (
+            lambda manifest: replace(manifest, records=manifest.records[:-1]),
+            "record",
+        ),
+        (
+            lambda manifest: replace(
+                manifest,
+                resident_tensors=(
+                    replace(
+                        manifest.resident_tensors[0],
+                        tensor="model.layers.1.mlp.experts.0.gate_proj.weight",
+                    ),
+                ),
+            ),
+            "resident",
+        ),
+        (
+            lambda manifest: replace(
+                manifest,
+                shards=tuple(
+                    shard for shard in manifest.shards if shard.kind != "sidecar"
+                ),
+            ),
+            "authoritative",
+        ),
+        (
+            lambda manifest: replace(
+                manifest,
+                records=(
+                    replace(
+                        manifest.records[0],
+                        sidecar_offset=manifest.records[0].sidecar_offset + 1,
+                    ),
+                    *manifest.records[1:],
+                ),
+            ),
+            "aligned",
+        ),
+    ),
+    ids=("identity", "records", "resident", "shards", "layout"),
+)
+def test_manifest_identity_and_layout_mismatches_fail_closed(
+    authoritative_model: tuple[Path, ExpertStreamingModelSpec, ExpertManifest],
+    mutation,
+    reason: str,
+) -> None:
+    root, _spec, manifest = authoritative_model
+    save_expert_manifest(mutation(manifest), root / "expert-manifest.json")
 
-    reason = cached_model_incompleteness_reason(model)
-    assert reason is not None
-    assert "could not be read" in reason
+    status = expert_artifact_status(root)
+
+    assert status["ok"] is False
+    assert reason in status["reason"]
 
 
-def test_manifest_naming_a_traversing_bank_is_rejected(tmp_path: Path):
-    model = _resident_model(tmp_path / "mtplx--experts")
-    _write_expert_manifest(model, sidecar_file="../../etc/passwd")
+def test_sidecar_bank_must_meet_authoritative_part_size(
+    authoritative_model: tuple[Path, ExpertStreamingModelSpec, ExpertManifest],
+) -> None:
+    root, _spec, manifest = authoritative_model
+    assert manifest.sidecar is not None
+    bank = root / manifest.sidecar.file
+    bank.write_bytes(bank.read_bytes()[:-1])
 
-    reason = cached_model_incompleteness_reason(model)
-    assert reason is not None
-    assert "unsafe" in reason
+    status = expert_artifact_status(root)
 
-
-def test_non_expert_model_is_unaffected(tmp_path: Path):
-    model = _resident_model(tmp_path / "mtplx--plain")
-
-    assert cached_model_is_complete(model) is True
-    assert expert_artifact_status(model)["streamed_experts"] is False
+    assert status["ok"] is False
+    assert "truncated" in status["reason"]
 
 
-def test_sidecar_is_read_without_a_full_manifest_parse(tmp_path: Path):
-    """Huge record lists must not have to be parsed to check the bank."""
+def _split_authoritative_sidecar(
+    root: Path,
+    manifest: ExpertManifest,
+) -> ExpertManifest:
+    assert manifest.sidecar is not None
+    blob = (root / manifest.sidecar.file).read_bytes()
+    parts: list[SidecarPart] = []
+    records = []
+    sidecar_shards: list[ShardInfo] = []
+    for index, record in enumerate(manifest.records):
+        assert record.sidecar_offset is not None
+        assert record.sidecar_length is not None
+        payload = blob[
+            record.sidecar_offset : record.sidecar_offset + record.sidecar_length
+        ]
+        name = f"experts-{index + 1:05d}-of-{len(manifest.records):05d}.bin"
+        (root / name).write_bytes(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        parts.append(SidecarPart(file=name, size=len(payload), sha256=digest))
+        sidecar_shards.append(
+            ShardInfo(
+                name=name,
+                size=len(payload),
+                header_bytes=0,
+                header_sha256=EMPTY_SHA256,
+                sha256=digest,
+                kind="sidecar",
+            )
+        )
+        cursor = 0
+        segments = []
+        for segment in record.segments:
+            segments.append(replace(segment, shard=name, offset=cursor))
+            cursor += segment.length
+        records.append(
+            replace(
+                record,
+                segments=tuple(segments),
+                sidecar_offset=0,
+                part=index,
+            )
+        )
+    (root / manifest.sidecar.file).unlink()
+    resident_shards = tuple(
+        shard for shard in manifest.shards if shard.kind == "safetensors"
+    )
+    return replace(
+        manifest,
+        sidecar=SidecarInfo(
+            alignment=manifest.sidecar.alignment,
+            parts=tuple(parts),
+        ),
+        shards=(*resident_shards, *sidecar_shards),
+        records=tuple(records),
+        manifest_sha256=None,
+    ).with_digest()
 
-    model = _resident_model(tmp_path / "mtplx--experts")
-    payload = {
-        "format": "mtplx-expert-manifest-v1",
-        "records": [{"layer": i, "expert": i} for i in range(5000)],
-        "sidecar": {
-            "file": "experts.bin",
-            "alignment": 16384,
-            "size": 32,
-            "sha256": "e" * 64,
-        },
-    }
-    (model / "expert-manifest.json").write_text(json.dumps(payload), encoding="utf-8")
-    (model / "experts.bin").write_bytes(b"\x00" * 32)
+
+def test_every_authoritative_sidecar_part_must_exist(
+    authoritative_model: tuple[Path, ExpertStreamingModelSpec, ExpertManifest],
+) -> None:
+    root, spec, manifest = authoritative_model
+    split = _split_authoritative_sidecar(root, manifest)
+    validate_expert_manifest_spec(split, spec)
+    save_expert_manifest(split, root / "expert-manifest.json")
+    assert split.sidecar is not None
+
+    complete = expert_artifact_status(root)
+    assert complete["ok"] is True
+    assert complete["expected_bytes"] == sum(
+        part.size for part in split.sidecar.parts
+    )
+
+    (root / split.sidecar.parts[-1].file).unlink()
+
+    status = expert_artifact_status(root)
+
+    assert status["ok"] is False
+    assert split.sidecar.parts[-1].file in status["reason"]
+    assert "missing" in status["reason"]
+
+
+def test_repository_local_hf_blob_symlink_is_supported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "models--owner--repo" / "snapshots" / "revision"
+    _spec, manifest = _install_authoritative_model(root, monkeypatch)
+    assert manifest.sidecar is not None
+    bank = root / manifest.sidecar.file
+    blob_root = root.parents[1] / "blobs"
+    blob_root.mkdir()
+    blob = blob_root / "bank-digest"
+    bank.replace(blob)
+    bank.symlink_to(Path("..") / ".." / "blobs" / blob.name)
+
+    status = expert_artifact_status(root)
+
+    assert status["ok"] is True
+    assert status["actual_bytes"] == manifest.sidecar.size
+
+
+def test_sidecar_symlink_outside_artifact_is_rejected(
+    authoritative_model: tuple[Path, ExpertStreamingModelSpec, ExpertManifest],
+    tmp_path: Path,
+) -> None:
+    root, _spec, manifest = authoritative_model
+    assert manifest.sidecar is not None
+    bank = root / manifest.sidecar.file
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(bank.read_bytes())
+    bank.unlink()
+    bank.symlink_to(outside)
+
+    status = expert_artifact_status(root)
+
+    assert status["ok"] is False
+    assert "escapes root" in status["reason"]
+
+
+def test_manifest_symlink_is_not_followed(
+    authoritative_model: tuple[Path, ExpertStreamingModelSpec, ExpertManifest],
+    tmp_path: Path,
+) -> None:
+    root, _spec, _manifest = authoritative_model
+    manifest_path = root / "expert-manifest.json"
+    outside = tmp_path / "outside-manifest.json"
+    manifest_path.replace(outside)
+    manifest_path.symlink_to(outside)
+
+    status = expert_artifact_status(root)
+
+    assert status["streamed_experts"] is True
+    assert status["ok"] is False
+    assert "could not read" in status["reason"]
+
+
+def test_runtime_contract_symlink_is_not_followed(tmp_path: Path) -> None:
+    model = tmp_path / "plain"
+    model.mkdir()
+    outside = tmp_path / "outside-runtime.json"
+    outside.write_text(
+        '{"expert_manifest_file":"expert-manifest.json"}',
+        encoding="utf-8",
+    )
+    (model / "mtplx_runtime.json").symlink_to(outside)
 
     status = expert_artifact_status(model)
+
+    assert status["streamed_experts"] is False
     assert status["ok"] is True
-    assert status["sidecar_file"] == "experts.bin"
-    assert status["expected_bytes"] == 32
 
 
-def test_validate_mtplx_model_files_reports_missing_bank(tmp_path: Path):
-    model = _resident_model(tmp_path / "mtplx--experts")
-    (model / "tokenizer.json").write_text("{}", encoding="utf-8")
-    (model / "mtplx_runtime.json").write_text("{}", encoding="utf-8")
-    (model / "mtp.safetensors").write_bytes(b"x")
-    _write_expert_manifest(model)
-
-    report = validate_mtplx_model_files(model)
-
-    assert report["ok"] is False
-    assert any("experts.bin" in item for item in report["missing_files"])
-    assert report["expert_artifact"]["streamed_experts"] is True
-
-
-def test_resolve_model_path_names_the_missing_bank(tmp_path: Path):
-    model = _resident_model(tmp_path / "mtplx--example")
-    _write_expert_manifest(model)
-
-    with pytest.raises(FileNotFoundError) as excinfo:
-        resolve_model_path("mtplx/example", cache_dir=tmp_path)
-
-    assert "experts.bin" in str(excinfo.value)
-
-
-# --- item 2: expert banks are fetched by default, opt-out is explicit -------
-
-
-def test_repo_file_is_ignored_matches_banks_only():
-    assert repo_file_is_ignored("experts.bin", EXPERT_BANK_IGNORE_PATTERNS) is True
-    assert repo_file_is_ignored("sub/dir/experts.bin", EXPERT_BANK_IGNORE_PATTERNS) is True
-    assert repo_file_is_ignored("model.safetensors", EXPERT_BANK_IGNORE_PATTERNS) is False
-    assert repo_file_is_ignored("expert-manifest.json", EXPERT_BANK_IGNORE_PATTERNS) is False
-    assert repo_file_is_ignored("experts.bin", ()) is False
-
-
-def _install_fake_snapshot_download(monkeypatch, recorded: dict) -> None:
-    def snapshot_download(**kwargs):
-        recorded.update(kwargs)
-        destination = Path(kwargs["local_dir"])
-        destination.mkdir(parents=True, exist_ok=True)
-        _resident_model(destination)
-        _write_expert_manifest(destination, size=32)
-        if not kwargs.get("ignore_patterns"):
-            (destination / "experts.bin").write_bytes(b"\x00" * 32)
-        return str(destination)
-
-    monkeypatch.setitem(
-        sys.modules,
-        "huggingface_hub",
-        SimpleNamespace(snapshot_download=snapshot_download),
+def test_runtime_contract_read_is_bounded(tmp_path: Path) -> None:
+    model = tmp_path / "plain"
+    model.mkdir()
+    (model / "mtplx_runtime.json").write_bytes(
+        b'{"expert_streaming":"' + b"x" * MAX_RUNTIME_CONTRACT_BYTES + b'"}'
     )
 
+    status = expert_artifact_status(model)
 
-def test_pull_fetches_expert_banks_by_default(tmp_path: Path, monkeypatch):
-    recorded: dict = {}
-    _install_fake_snapshot_download(monkeypatch, recorded)
-
-    result = pull_model("mtplx/example", cache_dir=tmp_path)
-
-    assert recorded["ignore_patterns"] is None
-    assert result["partial_download"] is False
-    assert result["excluded_patterns"] == []
-    assert (Path(result["path"]) / "experts.bin").is_file()
-    assert cached_model_is_complete(Path(result["path"])) is True
+    assert status["streamed_experts"] is False
+    assert status["ok"] is True
 
 
-def test_pull_with_no_expert_banks_excludes_and_marks(tmp_path: Path, monkeypatch):
-    recorded: dict = {}
-    _install_fake_snapshot_download(monkeypatch, recorded)
+def test_plain_model_is_unaffected(tmp_path: Path) -> None:
+    model = tmp_path / "plain"
+    model.mkdir()
 
-    result = pull_model(
-        "mtplx/example", cache_dir=tmp_path, include_expert_banks=False
-    )
-    path = Path(result["path"])
+    status = expert_artifact_status(model)
 
-    assert recorded["ignore_patterns"] == list(EXPERT_BANK_IGNORE_PATTERNS)
-    assert result["partial_download"] is True
-    assert not (path / "experts.bin").exists()
-    # The pull itself succeeds — a deliberate skip is not a download failure.
-    assert (path / PARTIAL_DOWNLOAD_MARKER).is_file()
-
-
-def test_deliberate_partial_download_is_not_reported_complete(
-    tmp_path: Path, monkeypatch
-):
-    recorded: dict = {}
-    _install_fake_snapshot_download(monkeypatch, recorded)
-    result = pull_model(
-        "mtplx/example", cache_dir=tmp_path, include_expert_banks=False
-    )
-    path = Path(result["path"])
-
-    assert cached_model_is_complete(path) is False
-    reason = cached_model_incompleteness_reason(path)
-    assert reason is not None
-    # Distinguishable from corruption: the message says it was on purpose.
-    assert "on purpose" in reason
-    assert "--no-expert-banks" in reason
-    assert "truncated" not in reason
-    assert partial_download_info(path)["excluded_patterns"] == list(
-        EXPERT_BANK_IGNORE_PATTERNS
-    )
-
-
-def test_completing_a_partial_download_clears_the_marker(tmp_path: Path, monkeypatch):
-    recorded: dict = {}
-    _install_fake_snapshot_download(monkeypatch, recorded)
-    pull_model("mtplx/example", cache_dir=tmp_path, include_expert_banks=False)
-
-    result = pull_model("mtplx/example", cache_dir=tmp_path)
-    path = Path(result["path"])
-
-    assert not (path / PARTIAL_DOWNLOAD_MARKER).exists()
-    assert result["partial_download"] is False
-    assert cached_model_is_complete(path) is True
-
-
-def test_a_partial_download_is_not_reused_as_a_cache_hit(tmp_path: Path, monkeypatch):
-    recorded: dict = {}
-    _install_fake_snapshot_download(monkeypatch, recorded)
-    pull_model("mtplx/example", cache_dir=tmp_path, include_expert_banks=False)
-
-    result = pull_model("mtplx/example", cache_dir=tmp_path)
-
-    assert result["reused_existing"] is False
-
-
-def test_structured_progress_download_skips_ignored_files(tmp_path: Path, monkeypatch):
-    from mtplx import hf_loader
-
-    calls: list[str] = []
-
-    def fake_download(repo_file, **kwargs):
-        calls.append(repo_file.path)
-        target = Path(kwargs["destination"]) / repo_file.path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(b"\x00" * (repo_file.size_bytes or 1))
-        return kwargs["last_emit_at"], kwargs["last_emit_size"]
-
-    monkeypatch.setattr(hf_loader, "_download_repo_file", fake_download)
-    monkeypatch.setattr(
-        hf_loader,
-        "_hub_runtime",
-        lambda: (
-            lambda: SimpleNamespace(
-                model_info=lambda **_kw: SimpleNamespace(
-                    siblings=[
-                        SimpleNamespace(rfilename="config.json", size=2),
-                        SimpleNamespace(rfilename="expert-manifest.json", size=4),
-                        SimpleNamespace(rfilename="experts.bin", size=4096),
-                    ]
-                )
-            ),
-            lambda **_kw: "https://example.invalid/f",
-            lambda: SimpleNamespace(),
-            lambda **_kw: {},
-            lambda _r: None,
-        ),
-    )
-
-    destination = tmp_path / "dest"
-    destination.mkdir()
-    _resolved, total, skipped = hf_loader._download_snapshot_with_structured_progress(
-        repo_id="mtplx/example",
-        revision=None,
-        destination=destination,
-        progress_callback=lambda _event: None,
-        progress_interval_s=10.0,
-        ignore_patterns=EXPERT_BANK_IGNORE_PATTERNS,
-    )
-
-    assert calls == ["config.json", "expert-manifest.json"]
-    assert skipped == ["experts.bin"]
-    # The excluded bank must not inflate the reported download total.
-    assert total == 6
+    assert status["streamed_experts"] is False
+    assert status["ok"] is True

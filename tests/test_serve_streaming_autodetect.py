@@ -7,6 +7,10 @@ import pytest
 
 from mtplx import default_models, hf_loader
 from mtplx.commands import public
+from mtplx.expert_manifest import save_expert_manifest
+from mtplx.expert_streaming_models import MODEL_SPECS
+
+from test_expert_manifest import _make_authoritative_checkpoint
 
 HY3_STREAMING_REPO_ID = "OpensourceWTF/Hy3-oQ2e-MTPLX-streaming"
 
@@ -25,17 +29,12 @@ def _args(**overrides):
     return SimpleNamespace(**base)
 
 
-def _write_streaming_manifest(model_dir, sidecar):
-    (model_dir / "expert-manifest.json").write_text(
-        json.dumps(
-            {
-                "format": "mtplx-expert-manifest-v1",
-                "model_key": "hy3-expert-oq2e",
-                "sidecar": sidecar,
-            }
-        ),
-        encoding="utf-8",
-    )
+def _install_authoritative_manifest(parent, monkeypatch):
+    model_dir = parent / "model"
+    spec, manifest = _make_authoritative_checkpoint(model_dir)
+    saved = save_expert_manifest(manifest, model_dir / "expert-manifest.json")
+    monkeypatch.setitem(MODEL_SPECS, spec.key, spec)
+    return model_dir, saved
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +93,7 @@ def test_empty_manifest_fails_closed_with_real_helper(tmp_path):
 
     assert status["streamed_experts"] is True
     assert status["ok"] is False
-    assert "sidecar" in status["reason"]
+    assert status["reason"]
     assert public._maybe_enable_expert_streaming(args, str(tmp_path)) is False
     assert args.expert_streaming is False
 
@@ -117,51 +116,68 @@ def test_truncated_manifest_with_apparent_sidecar_fails_closed(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "sidecar",
+    ("size", "missing"),
     (
-        {"file": "experts.bin", "size": "4"},
-        {"file": "experts.bin"},
-        {"file": "experts.bin", "size": 0},
-        {"file": "experts.bin", "size": -1},
-        {"file": "experts.bin", "size": True},
+        ("4", False),
+        (None, True),
+        (0, False),
+        (-1, False),
+        (True, False),
     ),
     ids=("string", "missing", "zero", "negative", "bool"),
 )
-def test_invalid_sidecar_size_fails_closed_with_real_helper(tmp_path, sidecar):
-    _write_streaming_manifest(tmp_path, sidecar)
-    (tmp_path / "experts.bin").write_bytes(b"complete-looking-bank")
+def test_invalid_sidecar_size_fails_closed_with_real_helper(
+    tmp_path,
+    monkeypatch,
+    size,
+    missing,
+):
+    model_dir, manifest = _install_authoritative_manifest(tmp_path, monkeypatch)
+    payload = manifest.to_dict()
+    if missing:
+        payload["sidecar"].pop("size")
+    else:
+        payload["sidecar"]["size"] = size
+    (model_dir / "expert-manifest.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
 
-    status = hf_loader.expert_artifact_status(tmp_path)
+    status = hf_loader.expert_artifact_status(model_dir)
     args = _args()
 
     assert status["streamed_experts"] is True
     assert status["ok"] is False
-    assert "positive integer size" in status["reason"]
-    assert public._maybe_enable_expert_streaming(args, str(tmp_path)) is False
+    assert "size" in status["reason"]
+    assert public._maybe_enable_expert_streaming(args, str(model_dir)) is False
     assert args.expert_streaming is False
 
 
 @pytest.mark.parametrize(
-    ("bank_size", "expected_ok"),
-    ((3, False), (4, True), (8, True)),
+    ("size_delta", "expected_ok"),
+    ((-1, False), (0, True), (1, True)),
     ids=("smaller", "equal", "larger"),
 )
-def test_positive_sidecar_size_controls_real_auto_enable(
+def test_authoritative_sidecar_size_controls_real_auto_enable(
     tmp_path,
-    bank_size,
+    monkeypatch,
+    size_delta,
     expected_ok,
 ):
-    _write_streaming_manifest(
-        tmp_path,
-        {"file": "experts.bin", "size": 4},
-    )
-    (tmp_path / "experts.bin").write_bytes(b"x" * bank_size)
+    model_dir, manifest = _install_authoritative_manifest(tmp_path, monkeypatch)
+    assert manifest.sidecar is not None
+    bank = model_dir / manifest.sidecar.file
+    payload = bank.read_bytes()
+    if size_delta < 0:
+        bank.write_bytes(payload[:size_delta])
+    elif size_delta > 0:
+        bank.write_bytes(payload + b"x" * size_delta)
 
-    status = hf_loader.expert_artifact_status(tmp_path)
+    status = hf_loader.expert_artifact_status(model_dir)
     args = _args()
 
     assert status["ok"] is expected_ok
-    assert public._maybe_enable_expert_streaming(args, str(tmp_path)) is expected_ok
+    assert public._maybe_enable_expert_streaming(args, str(model_dir)) is expected_ok
     assert args.expert_streaming is expected_ok
 
 
@@ -178,14 +194,26 @@ def test_explicit_streaming_flag_not_overridden(tmp_path, monkeypatch):
     assert args.expert_streaming is True
 
 
-def test_explicit_opt_out_not_overridden(tmp_path, monkeypatch):
-    """(c) An explicit opt-out recorded in _cli_flags is honored over the layout."""
+def test_parser_explicit_no_streaming_is_not_auto_overridden(tmp_path, monkeypatch):
+    """A real --no-expert-streaming parse is honored over a valid layout."""
+
+    from mtplx.cli import build_parser
 
     monkeypatch.setattr(
         "mtplx.hf_loader.expert_artifact_status",
         lambda path: {"ok": True, "streamed_experts": True, "reason": None},
     )
-    args = _args(expert_streaming=False, _cli_flags={"expert_streaming"})
+    args = build_parser().parse_args(
+        [
+            "serve",
+            "--model",
+            str(tmp_path),
+            "--no-expert-streaming",
+        ]
+    )
+
+    assert args.expert_streaming is False
+    assert "no-expert-streaming" in args._cli_flags
     flipped = public._maybe_enable_expert_streaming(args, str(tmp_path))
     assert flipped is False
     assert args.expert_streaming is False

@@ -9,9 +9,10 @@ import json
 import os
 import re
 import shutil
+import stat
 import time
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from mtplx.artifacts import _hf_repo_id_from_ref
@@ -33,7 +34,7 @@ MTP_SIDECAR_FALLBACKS = (
 )
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 EXPERT_MANIFEST_FILE = "expert-manifest.json"
-MAX_EXPERT_MANIFEST_BYTES = 512 * 1024 * 1024
+MAX_RUNTIME_CONTRACT_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -206,57 +207,26 @@ def _complete_unindexed_weights(path: Path) -> bool:
     return False
 
 
-def _safe_member_name(name: Any) -> str | None:
-    """Return ``name`` when it is a repo-relative path that cannot escape."""
-
-    if not isinstance(name, str) or not name.strip():
-        return None
-    if "\\" in name or "\x00" in name:
-        return None
-    pure = PurePosixPath(name)
-    if pure.is_absolute() or any(part in {"..", ""} for part in pure.parts):
-        return None
-    return name
-
-
-def _expert_manifest_sidecar(
-    manifest_path: Path,
-) -> tuple[dict[str, Any] | None, str | None]:
-    """Parse and return a valid manifest's sidecar object, or an error."""
-
-    try:
-        size = manifest_path.stat().st_size
-    except OSError as exc:
-        return None, str(exc)
-    if size > MAX_EXPERT_MANIFEST_BYTES:
-        return None, f"manifest exceeds the {MAX_EXPERT_MANIFEST_BYTES}-byte inspection limit"
-    try:
-        payload = manifest_path.read_bytes()
-    except OSError as exc:
-        return None, str(exc)
-    try:
-        data = json.loads(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        return None, f"invalid JSON: {exc}"
-    if not isinstance(data, dict):
-        return None, "manifest is not a JSON object"
-    sidecar = data.get("sidecar")
-    if sidecar is None:
-        return None, "manifest sidecar entry is missing"
-    if not isinstance(sidecar, dict):
-        return None, "manifest sidecar entry is not an object"
-    return sidecar, None
-
-
 def _declares_streamed_experts(path: Path) -> bool:
     """Whether the runtime contract says this artifact streams its experts."""
 
+    from mtplx.expert_manifest import ExpertManifestError, _read_file_nofollow
+
     contract_path = path / "mtplx_runtime.json"
-    if not contract_path.is_file():
+    if not contract_path.exists():
         return False
     try:
-        contract = json.loads(contract_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        payload = _read_file_nofollow(
+            contract_path,
+            max_bytes=MAX_RUNTIME_CONTRACT_BYTES,
+        )
+        contract = json.loads(payload)
+    except (
+        ExpertManifestError,
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ):
         return False
     if not isinstance(contract, dict):
         return False
@@ -269,15 +239,23 @@ def _declares_streamed_experts(path: Path) -> bool:
 
 
 def expert_artifact_status(path: Path) -> dict[str, Any]:
-    """Describe the streamed-expert sidecar state of a model directory."""
+    """Validate a complete authoritative streamed-expert artifact.
+
+    This is a construction-time trust boundary. Manifest identity and geometry
+    go through the runtime's authoritative parser/spec validator, then every
+    declared bank part is resolved inside the artifact (including supported
+    repository-local Hugging Face blob links) and checked through an opened
+    descriptor. No generation-path work is added.
+    """
 
     manifest_path = path / EXPERT_MANIFEST_FILE
-    manifest_present = manifest_path.is_file()
+    manifest_present = manifest_path.exists()
     status: dict[str, Any] = {
         "streamed_experts": manifest_present or _declares_streamed_experts(path),
         "manifest_file": EXPERT_MANIFEST_FILE,
         "manifest_present": manifest_present,
         "sidecar_file": None,
+        "sidecar_files": [],
         "expected_bytes": None,
         "actual_bytes": None,
         "ok": True,
@@ -292,47 +270,78 @@ def expert_artifact_status(path: Path) -> dict[str, Any]:
         )
         return status
 
-    sidecar, error = _expert_manifest_sidecar(manifest_path)
-    if error is not None:
-        status["ok"] = False
-        status["reason"] = f"{EXPERT_MANIFEST_FILE} is invalid ({error})"
-        return status
-    if sidecar is None:
-        status["ok"] = False
-        status["reason"] = f"{EXPERT_MANIFEST_FILE} sidecar entry could not be resolved"
-        return status
-
-    name = _safe_member_name(sidecar.get("file"))
-    if name is None:
-        status["ok"] = False
-        status["reason"] = f"{EXPERT_MANIFEST_FILE} names an unsafe expert bank path"
-        return status
-    status["sidecar_file"] = name
-    expected = sidecar.get("size")
-    if isinstance(expected, bool) or not isinstance(expected, int) or expected <= 0:
-        status["ok"] = False
-        status["reason"] = (
-            f"{EXPERT_MANIFEST_FILE} sidecar must declare a positive integer size"
-        )
-        return status
-    status["expected_bytes"] = expected
-
-    bank = path / name
     try:
-        actual = bank.stat().st_size if bank.is_file() else None
-    except OSError:
-        actual = None
-    status["actual_bytes"] = actual
-    if actual is None:
-        status["ok"] = False
-        status["reason"] = (
-            f"expert bank {name} named by {EXPERT_MANIFEST_FILE} is missing"
+        from mtplx.expert_manifest import (
+            ExpertManifestError,
+            load_expert_manifest,
+            resolve_artifact_member,
+            validate_expert_manifest_spec,
         )
-        return status
-    if expected is not None and actual < expected:
+        from mtplx.expert_streaming_models import get_model_spec
+
+        manifest = load_expert_manifest(manifest_path)
+        spec = get_model_spec(manifest.model_key)
+        validate_expert_manifest_spec(manifest, spec)
+        if manifest.sidecar is None:
+            raise ExpertManifestError(
+                "authoritative streamed manifest requires sidecar metadata"
+            )
+        sidecar_shards = tuple(
+            shard for shard in manifest.shards if shard.kind == "sidecar"
+        )
+        part_names = tuple(part.file for part in manifest.sidecar.parts)
+        if (
+            len(sidecar_shards) != len(manifest.sidecar.parts)
+            or {shard.name for shard in sidecar_shards} != set(part_names)
+        ):
+            raise ExpertManifestError(
+                "manifest is not authoritative for every sidecar part"
+            )
+
+        status["sidecar_files"] = list(part_names)
+        status["sidecar_file"] = part_names[0] if len(part_names) == 1 else None
+        status["expected_bytes"] = sum(
+            part.size for part in manifest.sidecar.parts
+        )
+        actual_bytes = 0
+        for part in manifest.sidecar.parts:
+            try:
+                resolved = resolve_artifact_member(path, part.file)
+            except ExpertManifestError as exc:
+                raise ExpertManifestError(
+                    f"expert bank part {part.file} is missing or unsafe ({exc})"
+                ) from exc
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                descriptor = os.open(resolved, flags)
+            except OSError as exc:
+                raise ExpertManifestError(
+                    f"could not open expert bank part {part.file}: {exc}"
+                ) from exc
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ExpertManifestError(
+                        f"expert bank part {part.file} is not a regular file"
+                    )
+                actual = metadata.st_size
+            finally:
+                os.close(descriptor)
+            if actual < part.size:
+                raise ExpertManifestError(
+                    f"expert bank part {part.file} is truncated "
+                    f"({actual} of {part.size} bytes)"
+                )
+            actual_bytes += actual
+        status["actual_bytes"] = actual_bytes
+    except (OSError, TypeError, ValueError) as exc:
         status["ok"] = False
         status["reason"] = (
-            f"expert bank {name} is truncated ({actual} of {expected} bytes)"
+            f"{EXPERT_MANIFEST_FILE} failed authoritative validation: {exc}"
         )
     return status
 

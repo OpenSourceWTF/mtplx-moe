@@ -43,6 +43,7 @@ from mtplx.default_models import (
     optimized_quality_model_ref,
     public_model_id_for_ref,
     select_default_model,
+    streaming_catalog_models,
 )
 from mtplx.env import collect_environment
 from mtplx.fan_mode import FAN_MODE_MAX, FAN_MODE_SMART, fan_mode_from_args
@@ -7920,9 +7921,10 @@ def _resolve_runtime_options_on_args(
 
 
 _STREAMING_FLAG_ATTRS = (
-    "expert_streaming",
-    "expert_manifest",
-    "expert_streaming_config",
+    "expert-streaming",
+    "no-expert-streaming",
+    "expert-manifest",
+    "expert-streaming-config",
 )
 
 
@@ -7952,7 +7954,8 @@ def _maybe_enable_expert_streaming(args: Any, model_path: Any) -> bool:
     # An explicit streaming request (flag / manifest / config) already wins.
     if expert_streaming_requested(args):
         return False
-    # Honor an explicit user opt-out even though ``store_true`` reads falsey.
+    # Honor explicit user intent, including BooleanOptionalAction's negative
+    # spelling. _cli_flags records canonical CLI names with hyphens.
     cli_flags = getattr(args, "_cli_flags", None) or set()
     if any(attr in cli_flags for attr in _STREAMING_FLAG_ATTRS):
         return False
@@ -9529,6 +9532,14 @@ def _quickstart_resolve_model(
         }
 
     download_ref = _quickstart_download_ref(model)
+    streaming_catalog_model = next(
+        (
+            candidate
+            for candidate in streaming_catalog_models()
+            if download_ref in {candidate.id, candidate.hf_model_id}
+        ),
+        None,
+    )
     try:
         inspection = inspect_model(download_ref).to_dict()
     except Exception as exc:
@@ -9544,7 +9555,10 @@ def _quickstart_resolve_model(
             },
         }
     compatibility = inspection.get("compatibility") or {}
-    if not bool(compatibility.get("can_run")):
+    if (
+        not bool(compatibility.get("can_run"))
+        and streaming_catalog_model is None
+    ):
         return None, {
             "model": model,
             "runtime_model": None,
@@ -9595,6 +9609,28 @@ def _quickstart_resolve_model(
             "download_result": result,
             "error": resolve_error,
         }
+    if streaming_catalog_model is not None:
+        from mtplx.hf_loader import expert_artifact_status
+
+        expert_status = expert_artifact_status(Path(runtime_model))
+        if not (
+            expert_status.get("streamed_experts")
+            and expert_status.get("ok")
+        ):
+            return None, {
+                "model": model,
+                "runtime_model": None,
+                "downloaded": True,
+                "download_ref": download_ref,
+                "download_result": result,
+                "expert_artifact": expert_status,
+                "error": {
+                    "error": "downloaded streaming artifact is invalid",
+                    "model": download_ref,
+                    "detail": expert_status.get("reason")
+                    or "artifact is not an authoritative streamed model",
+                },
+            }
     return runtime_model, {
         "model": model,
         "runtime_model": runtime_model,
