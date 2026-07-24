@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
+from mtplx import generation as generation_module
 from mtplx.generation import (
     _clear_cache_every,
     _defer_verify_hidden_eval_enabled,
@@ -26,6 +27,15 @@ from mtplx.mtp_patch import MTPContract
 from mtplx.profiles import DEFAULT_HF_MODEL_ID
 from mtplx.runtime import MTPLXRuntime
 from mtplx.sampling import SamplerConfig
+
+
+def _bind_sustained_prefill_policy(monkeypatch, *, enabled: bool) -> None:
+    environ = {"MTPLX_SUSTAINED_PREFILL": "1"} if enabled else {}
+    monkeypatch.setattr(
+        generation_module,
+        "_GENERATION_FEATURE_POLICY",
+        generation_module.bind_generation_feature_policy(environ),
+    )
 
 
 class TinyTokenizer:
@@ -249,7 +259,7 @@ def test_contiguous_dense_decode_cache_layout_does_not_repage(monkeypatch):
 
 
 def test_session_restore_uses_prefill_layout_cache_factory(monkeypatch):
-    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "contiguous_dense_decode")
     monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN", "1")
     model = TinyModel()
@@ -290,7 +300,7 @@ def test_session_restore_uses_prefill_layout_cache_factory(monkeypatch):
 
 
 def test_live_frontier_reference_restore_survives_prefill_layout_factory(monkeypatch):
-    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "contiguous_dense_decode")
     monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN", "1")
     monkeypatch.setenv("MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE", "1")
@@ -383,7 +393,7 @@ def test_auto_sustained_prefill_policy_repages_when_paged_kv_quant_is_enabled(mo
 def test_non_sustained_long_context_prefill_is_blocked_before_full_hidden_eval(
     monkeypatch,
 ):
-    monkeypatch.delenv("MTPLX_SUSTAINED_PREFILL", raising=False)
+    _bind_sustained_prefill_policy(monkeypatch, enabled=False)
     monkeypatch.delenv("MTPLX_ALLOW_UNSAFE_LONG_CONTEXT_PREFILL", raising=False)
     monkeypatch.setenv("MTPLX_UNSAFE_LONG_CONTEXT_PREFILL_GUARD_TOKENS", "8")
     model = TinyModel()
@@ -403,7 +413,7 @@ def test_non_sustained_long_context_prefill_is_blocked_before_full_hidden_eval(
 def test_non_sustained_long_context_prefill_guard_has_explicit_escape_hatch(
     monkeypatch,
 ):
-    monkeypatch.delenv("MTPLX_SUSTAINED_PREFILL", raising=False)
+    _bind_sustained_prefill_policy(monkeypatch, enabled=False)
     monkeypatch.setenv("MTPLX_ALLOW_UNSAFE_LONG_CONTEXT_PREFILL", "1")
     monkeypatch.setenv("MTPLX_UNSAFE_LONG_CONTEXT_PREFILL_GUARD_TOKENS", "8")
     model = TinyModel()
@@ -672,7 +682,7 @@ def test_trim_commit_keeps_rejected_verify_prefix_without_reforward(monkeypatch)
 
 
 def test_sustained_prefill_chunks_without_full_prompt_logits(monkeypatch):
-    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     model = TinyModel()
@@ -692,7 +702,7 @@ def test_warm_restored_suffix_prefill_is_chunked_and_typed_for_abort(monkeypatch
     # kvcache-v2: suffixes <= MTPLX_SMALL_SUFFIX_FUSED_MAX fuse into one
     # forward; this test guards the chunked lane used above that threshold.
     monkeypatch.setenv("MTPLX_SMALL_SUFFIX_FUSED_MAX", "0")
-    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     model = TinyModel()
@@ -756,7 +766,7 @@ def test_warm_restored_suffix_prefill_is_chunked_and_typed_for_abort(monkeypatch
 
 
 def test_restore_prefers_larger_near_gap_over_shorter_exact_prefix(monkeypatch):
-    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     model = TinyModel()
@@ -868,7 +878,7 @@ def test_restore_prefers_larger_near_gap_over_shorter_exact_prefix(monkeypatch):
 
 
 def test_opencode_compact_restore_prefers_block_prefix_over_short_exact(monkeypatch):
-    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     model = TinyModel()
@@ -1075,7 +1085,7 @@ def test_generic_client_escapes_stale_short_exact_prefix_via_block_restore(
     prefixes went unused, re-prefilling a growing suffix every turn. With
     boundary-true restore on (the v2 default), the block-prefix lane is safe
     and must engage for every client."""
-    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     model = TinyModel()
@@ -1108,7 +1118,7 @@ def test_generic_client_block_restore_respects_boundary_true_off_switch(
 ):
     """With MTPLX_SESSION_BOUNDARY_TRUE_RESTORE=0 the pre-v2 caution comes
     back for non-OpenCode clients: tiny-gap only, exact restore wins."""
-    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     monkeypatch.setenv("MTPLX_SESSION_BOUNDARY_TRUE_RESTORE", "0")
@@ -1139,7 +1149,7 @@ def test_generic_client_block_restore_respects_block_prefix_kill_switch(
 ):
     """MTPLX_SESSION_BLOCK_PREFIX_RESTORE=0 must still disable the block
     lane for generic clients even with boundary-true restore on."""
-    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     monkeypatch.setenv("MTPLX_SESSION_BLOCK_PREFIX_RESTORE", "0")
@@ -1167,7 +1177,7 @@ def test_generic_client_block_restore_respects_block_prefix_kill_switch(
 
 def test_ssd_near_prefix_restore_time_is_cache_time_not_decode_time(monkeypatch):
     monkeypatch.setenv("MTPLX_SESSION_BLOCK_PREFIX_RESTORE", "1")
-    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     model = TinyModel()
@@ -1252,7 +1262,7 @@ def test_ssd_near_prefix_restore_time_is_cache_time_not_decode_time(monkeypatch)
 
 def test_block_prefix_restore_matches_target_default(monkeypatch):
     monkeypatch.delenv("MTPLX_SESSION_BLOCK_PREFIX_RESTORE", raising=False)
-    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     model = TinyModel()
@@ -1289,7 +1299,7 @@ def test_block_prefix_restore_matches_target_default(monkeypatch):
 
 
 def test_sustained_prefill_chunk_cache_cleanup_is_explicit(monkeypatch):
-    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_CACHE_CLEANUP", "1")
@@ -1308,7 +1318,7 @@ def test_sustained_prefill_chunk_cache_cleanup_is_explicit(monkeypatch):
 
 
 def test_sustained_prefill_stock_cache_only_requires_unsafe_allow(monkeypatch):
-    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     monkeypatch.setenv("MTPLX_PREFILL_STOCK_CACHE_ONLY", "1")
@@ -1324,7 +1334,7 @@ def test_sustained_prefill_stock_cache_only_requires_unsafe_allow(monkeypatch):
 
 
 def test_sustained_prefill_stock_cache_only_is_explicit_unsafe(monkeypatch):
-    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     monkeypatch.setenv("MTPLX_PREFILL_STOCK_CACHE_ONLY", "1")
@@ -1342,7 +1352,7 @@ def test_sustained_prefill_stock_cache_only_is_explicit_unsafe(monkeypatch):
 
 
 def test_sustained_prefill_omlx_external_is_safe_profile_path(monkeypatch):
-    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     monkeypatch.setenv("MTPLX_PREFILL_OMLX_EXTERNAL", "1")
@@ -1362,7 +1372,7 @@ def test_sustained_prefill_omlx_external_is_safe_profile_path(monkeypatch):
 def test_sustained_prefill_forwards_logits_controls_through_patched_kwargs_wrapper(
     monkeypatch,
 ):
-    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     model = KwargsOnlyTinyModel()
@@ -1375,7 +1385,7 @@ def test_sustained_prefill_forwards_logits_controls_through_patched_kwargs_wrapp
 
 
 def test_last_window_mtp_history_skips_discarded_chunk_hidden(monkeypatch):
-    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
     monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
     model = TinyModel()
@@ -1436,7 +1446,11 @@ def test_32k_prefill_peak_memory_bounded():
         pytest.skip("QA prompt did not tokenize to 32K tokens")
 
     mx.reset_peak_memory()
-    os.environ["MTPLX_SUSTAINED_PREFILL"] = "1"
+    generation_module._GENERATION_FEATURE_POLICY = (
+        generation_module.bind_generation_feature_policy(
+            {"MTPLX_SUSTAINED_PREFILL": "1"}
+        )
+    )
     os.environ["MTPLX_PREFILL_CHUNK_SIZE"] = "2048"
     os.environ["MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS"] = "0"
     _prefill(rt, prompt_ids, return_hidden=True)

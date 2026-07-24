@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import math
 import os
 from dataclasses import dataclass
@@ -81,17 +82,29 @@ FUSE_QKV_ENV = "MTPLX_FUSE_HY3_QKV_PROJECTIONS"
 SUBMIT_CADENCE_ENV = "MTPLX_HY3_SUBMIT_CADENCE"
 
 
+@dataclass(frozen=True)
+class Hy3ExecutionPolicy:
+    submit_cadence: int
+
+
+def bind_hy3_execution_policy(environ: Mapping[str, str]) -> Hy3ExecutionPolicy:
+    raw = str(environ.get(SUBMIT_CADENCE_ENV, "")).strip()
+    try:
+        cadence = int(raw) if raw else 0
+    except ValueError:
+        cadence = 0
+    return Hy3ExecutionPolicy(submit_cadence=max(0, cadence))
+
+
+_HY3_EXECUTION_POLICY = bind_hy3_execution_policy(os.environ)
+
+
 def _decode_submit_cadence() -> int:
     """Layers between decode-lane GPU submission checkpoints (0 = off)."""
 
-    raw = os.environ.get(SUBMIT_CADENCE_ENV, "").strip()
-    if not raw:
-        return 0
-    try:
-        cadence = int(raw)
-    except ValueError:
-        return 0
-    return cadence if cadence > 0 else 0
+    return _HY3_EXECUTION_POLICY.submit_cadence
+
+
 _PACKABLE_LINEAR_SUFFIXES = ("weight", "scales", "biases", "bias")
 
 

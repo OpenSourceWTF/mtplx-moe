@@ -441,8 +441,27 @@ def _attach_runtime_diagnostics(
     )
 
 
+@dataclass(frozen=True)
+class GenerationFeaturePolicy:
+    sustained_prefill: bool
+
+
+def bind_generation_feature_policy(
+    environ: Mapping[str, str],
+) -> GenerationFeaturePolicy:
+    return GenerationFeaturePolicy(
+        sustained_prefill=str(environ.get("MTPLX_SUSTAINED_PREFILL", ""))
+        .strip()
+        .lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+
+_GENERATION_FEATURE_POLICY = bind_generation_feature_policy(os.environ)
+
+
 def _sustained_prefill_enabled() -> bool:
-    return _env_truthy("MTPLX_SUSTAINED_PREFILL")
+    return _GENERATION_FEATURE_POLICY.sustained_prefill
 
 
 def _final_logits_prefill_enabled() -> bool:
