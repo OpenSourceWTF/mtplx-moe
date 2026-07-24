@@ -1010,6 +1010,54 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
     contract_path = getattr(inspection, "runtime_contract_path", None)
     if not contract_path:
         contract_path = str(_contract_path(model_dir)) if _contract_path(model_dir).exists() else None
+
+    # A published SSD-streaming artifact (a baked expert-manifest.json plus
+    # the named experts bank it declares, present at full size) runs via the
+    # target-only autoregressive expert-streaming path — `mtplx serve
+    # --expert-streaming` — regardless of whether its family has a native MTP
+    # backend yet. Resident weights load into memory and the routed experts
+    # stream from the sidecar bank. Report that runnable reality instead of the
+    # "recognized-backend-pending" cannot-run verdict that the same family would
+    # otherwise receive. Gated on a valid baked streaming layout only
+    # (expert_artifact_status.ok is truthy AND the artifact actually declares
+    # streamed experts), so ordinary non-streaming models — which report
+    # streamed_experts=False — are untouched and keep their existing verdicts,
+    # and a genuinely incompatible non-streaming architecture is never
+    # overridden.
+    from mtplx.hf_loader import expert_artifact_status
+
+    expert_status = expert_artifact_status(model_dir)
+    if expert_status.get("ok") and expert_status.get("streamed_experts"):
+        support = architecture_support_for(detected_arch_id)
+        return CompatibilityVerdict(
+            tier=TIER_FAMILY_COMPATIBLE_UNVERIFIED,
+            arch_id=detected_arch_id,
+            supported=True,
+            recognized=support is not None,
+            can_run=True,
+            exit_code=EXIT_VERIFIED,
+            message=(
+                "Runs via SSD-streamed target-only AR (--expert-streaming): "
+                "resident weights load in memory and routed experts stream from "
+                "the baked expert-manifest.json/experts.bin. MTP drafting is "
+                "intentionally disabled on this path; decoding is target-only "
+                "autoregressive."
+            ),
+            recommended_backend=(support.backend if support else None),
+            recommended_profile=(
+                contract.recommended_profile if contract is not None else DEFAULT_PROFILE_NAME
+            ),
+            runtime_contract=contract,
+            runtime_contract_path=contract_path,
+            runtime_contract_error=contract_error,
+            unsafe_force_required=False,
+            unverified_model=True,
+            mtp_supported="disabled",
+            runtime_compatibility="streaming-ar",
+            support_level="streaming-ar-target-only",
+            support_notes=(support.notes if support else None),
+        )
+
     body_blocker = _runtime_body_layout_blocker(detected_arch_id, inspection)
     if body_blocker:
         support = architecture_support_for(detected_arch_id)

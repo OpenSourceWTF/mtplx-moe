@@ -1937,6 +1937,123 @@ def test_gemma4_target_subfolder_alone_still_refuses():
     assert verdict.runtime_compatibility == "incomplete-assistant-pair"
 
 
+def _hy_v3_streaming_inspection(model_dir):
+    """A recognized-but-backend-pending family (HY V3 MTP).
+
+    Without a streaming layout this inspection lands on the
+    "recognized-backend-pending" cannot-run verdict; with a valid baked
+    streaming layout it must instead report runnable via SSD-streamed AR.
+    """
+    from mtplx.artifacts import ModelInspection
+
+    return ModelInspection(
+        model_dir=str(model_dir),
+        config_exists=True,
+        architecture="HYV3MTPForCausalLM",
+        model_type="hy_v3_mtp",
+        mtp_num_hidden_layers=1,
+        hidden_size=4096,
+        num_hidden_layers=48,
+        vocab_size=128000,
+        source="local",
+    )
+
+
+def test_baked_streaming_layout_reports_runnable_via_ar(monkeypatch, tmp_path):
+    """Issue: `mtplx inspect` on a published SSD-streaming model wrongly said
+    it CANNOT run, while `mtplx serve --expert-streaming` runs it fine via
+    target-only AR. A valid baked streaming layout (expert-manifest.json plus
+    its named experts bank) must report runnable.
+    """
+    from mtplx import hf_loader
+    from mtplx.backends.registry import compatibility_for_inspection
+
+    # A recognized family with no native MTP backend: the baseline verdict is
+    # the cannot-run "recognized-backend-pending".
+    inspection = _hy_v3_streaming_inspection(tmp_path)
+    baseline = compatibility_for_inspection(inspection)
+    assert baseline.can_run is False
+    assert baseline.support_level == "recognized-backend-pending"
+
+    # A valid baked streaming layout is present.
+    monkeypatch.setattr(
+        hf_loader,
+        "expert_artifact_status",
+        lambda path: {
+            "ok": True,
+            "streamed_experts": True,
+            "manifest_present": True,
+            "sidecar_file": "experts.bin",
+            "expected_bytes": 1024,
+            "actual_bytes": 1024,
+            "reason": None,
+        },
+    )
+
+    verdict = compatibility_for_inspection(inspection)
+
+    assert verdict.can_run is True
+    assert verdict.exit_code == 0
+    assert verdict.runtime_compatibility == "streaming-ar"
+    assert verdict.support_level == "streaming-ar-target-only"
+    # Streaming is target-only AR: MTP is intentionally disabled, never claimed.
+    assert verdict.mtp_supported != "yes"
+    assert verdict.mtp_supported == "disabled"
+    message = verdict.message.lower()
+    assert "stream" in message and " ar" in message
+    assert "--expert-streaming" in verdict.message
+    # The family is still recognized; the arch id is preserved.
+    assert verdict.arch_id == "hy-v3-mtp"
+
+
+def test_streaming_override_absent_keeps_pending_verdict(monkeypatch, tmp_path):
+    """The override only fires for a valid baked streaming layout.
+
+    A truncated/missing bank (ok False) and an ordinary non-streaming model
+    (streamed_experts False) must both keep the prior cannot-run verdict for
+    the backend-pending family — the override never fabricates runnability.
+    """
+    from mtplx import hf_loader
+    from mtplx.backends.registry import compatibility_for_inspection
+
+    inspection = _hy_v3_streaming_inspection(tmp_path)
+
+    # ok False (e.g. truncated/missing experts bank) -> unchanged prior verdict.
+    monkeypatch.setattr(
+        hf_loader,
+        "expert_artifact_status",
+        lambda path: {
+            "ok": False,
+            "streamed_experts": True,
+            "manifest_present": True,
+            "sidecar_file": "experts.bin",
+            "reason": "expert bank experts.bin is truncated (10 of 1024 bytes)",
+        },
+    )
+    not_ok = compatibility_for_inspection(inspection)
+    assert not_ok.can_run is False
+    assert not_ok.support_level == "recognized-backend-pending"
+    assert not_ok.runtime_compatibility == "recognized-backend-pending"
+
+    # Ordinary non-streaming model (real status shape) -> unchanged prior
+    # verdict. `ok` defaults True here, so gating on `ok` alone would wrongly
+    # trigger; gating also on `streamed_experts` keeps normal models intact.
+    monkeypatch.setattr(
+        hf_loader,
+        "expert_artifact_status",
+        lambda path: {
+            "ok": True,
+            "streamed_experts": False,
+            "manifest_present": False,
+            "sidecar_file": None,
+            "reason": None,
+        },
+    )
+    non_streaming = compatibility_for_inspection(inspection)
+    assert non_streaming.can_run is False
+    assert non_streaming.support_level == "recognized-backend-pending"
+
+
 def test_user_promoted_contract_runs_as_unverified_label(monkeypatch, tmp_path):
     # The published Optimized Quality shape (#98): a human promoted the
     # artifact at publish time. Verification is a label, never a load
