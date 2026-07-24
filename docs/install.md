@@ -10,9 +10,8 @@ MTPLX is Apple-Silicon-first:
 - enough unified memory and disk for the selected model/profile, checked by `mtplx doctor`
 
 The first-run default model is `Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed`. The quantized 27B
-flagships select the Turbo product profile; other models normally select Sustained. Persist an
-explicit choice with `mtplx settings user set runtime.profile=sustained`. `stable` remains a
-conservative compatibility value, while `performance-cold` is the short-context Burst lane. See
-[Profiles](profiles.md) and the generated [settings reference](reference/settings.md).
+flagships select the Turbo product profile; other models normally select Sustained
+(`--profile sustained`). `stable` remains a conservative compatibility value, while
+`performance-cold` is the short-context Burst lane. See [Profiles](profiles.md).
 
 Do not install model weights into the source checkout. Use the MTPLX model cache or a Hugging Face cache.

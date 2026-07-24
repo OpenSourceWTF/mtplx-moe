@@ -71,7 +71,17 @@ class MTPLXRuntime:
     _forward_ar_supports_logits_keep: bool | None = field(
         default=None, init=False, repr=False
     )
-    _expert_compiled_ar_enabled: bool = field(default=False, init=False, repr=False)
+    _plain_ar_decode: Any = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # The promoted streamed lane has no construction-proven compiled
+        # profile. Install its eager target route once so decode never enters
+        # compiled eligibility or an eligible-or-eager fallback in the hot
+        # path. Fully resident runtimes retain the upstream opt-in route.
+        if self.expert_streaming is None:
+            self._plain_ar_decode = self._resident_plain_ar_decode
+        else:
+            self._plain_ar_decode = self._streamed_plain_ar_decode
 
     def _count(self, key: str, amount: int = 1) -> None:
         self.diagnostic_counters[key] = int(self.diagnostic_counters.get(key, 0)) + int(
@@ -117,6 +127,25 @@ class MTPLXRuntime:
 
         text_model = getattr(self.model, "language_model", self.model)
         return text_model.model.embed_tokens(input_ids)
+
+    def _streamed_plain_ar_decode(self, input_ids, cache, _kwargs):
+        return self.model(input_ids, cache=cache)
+
+    def _resident_plain_ar_decode(self, input_ids, cache, kwargs):
+        compiled = self._compiled_ar_forward(cache)
+        if compiled is not None:
+            # Preserve the upstream fully resident diagnostic. Streamed
+            # runtimes never install this callable.
+            self._count("compiled_forward_calls")
+            return compiled(input_ids, cache)
+        if not kwargs:
+            return self.model(input_ids, cache=cache)
+        return self.model(
+            input_ids,
+            cache=cache,
+            return_hidden=False,
+            **kwargs,
+        )
 
     def _expert_routing_context(self, input_ids: Any):
         if self.expert_streaming is None:
@@ -209,14 +238,8 @@ class MTPLXRuntime:
                 # unprimed cache: seeding the compiled graph from its None KV
                 # leaves throws, and its shape differs from a single-token
                 # decode step, forcing a retrace. Prefill stays eager.
-                compiled = (
-                    self._compiled_ar_forward(cache) if sequence_len == 1 else None
-                )
-                if compiled is not None:
-                    # Engagement proof: arm A (flag off) must report 0 here,
-                    # arm B (on) > 0 — the A/B credits nothing without it.
-                    self._count("compiled_forward_calls")
-                    return compiled(input_ids, cache)
+                if sequence_len == 1:
+                    return self._plain_ar_decode(input_ids, cache, kwargs)
                 if not kwargs:
                     return self.model(input_ids, cache=cache)
             return self.model(
@@ -239,10 +262,7 @@ class MTPLXRuntime:
         """
         from .compiled_forward import CompiledARForward, compile_forward_enabled
 
-        if self.expert_streaming is None:
-            if not compile_forward_enabled():
-                return None
-        elif not self._expert_compiled_ar_enabled:
+        if not compile_forward_enabled():
             return None
         if not cache:
             return None
@@ -265,14 +285,11 @@ class MTPLXRuntime:
             getattr(self, "_compiled_ar", None) is None
             or getattr(self, "_compiled_ar_key", None) != cache_key
         ):
-            if self.expert_streaming is not None:
-                reserve = int(self.expert_streaming.config.max_live_kv_tokens)
-            else:
-                import os as _os
+            import os as _os
 
-                reserve = int(
-                    _os.environ.get("MTPLX_COMPILE_AR_RESERVE_TOKENS", "4096")
-                )
+            reserve = int(
+                _os.environ.get("MTPLX_COMPILE_AR_RESERVE_TOKENS", "4096")
+            )
             self._compiled_ar = CompiledARForward(self.model, reserve_tokens=reserve)
             self._compiled_ar_key = cache_key
         return self._compiled_ar
@@ -1021,14 +1038,6 @@ def _load_impl(
         expert_streaming=expert_runtime,
         resident_load_report=resident_load_report,
     )
-    if expert_runtime is not None:
-        from .compiled_forward import compile_forward_enabled
-
-        routed = set(getattr(streaming_spec, "routed_layer_indices", ()))
-        islands = getattr(expert_runtime, "island_layer_set", frozenset())
-        runtime._expert_compiled_ar_enabled = bool(
-            compile_forward_enabled() and routed and routed <= islands
-        )
     return runtime
 
 

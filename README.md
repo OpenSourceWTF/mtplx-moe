@@ -51,54 +51,8 @@ anything.
 mtplx start
 ```
 
-Onboarding chooses the model, runtime mode, and chat surface. To make the
-normal long-context profile persistent and inspect why it won:
-
-```bash
-mtplx settings user set runtime.profile=sustained
-mtplx settings explain runtime.profile
-```
-
-For one run only:
-
-```bash
-mtplx start --set generation.temperature=0.7
-```
-
-See [Getting started](docs/getting-started.md) for server and client setup.
-
-## Configure with settings
-
-Reusable configuration has canonical dotted names. Persist it with `settings
-user set`, override one run with repeatable `--set`, or layer data-only TOML and
-active experiment recipes with repeatable `--settings`.
-
-```bash
-mtplx settings show
-mtplx settings list --group generation
-mtplx serve --set runtime.mtp.depth=2
-mtplx serve --settings ./run.toml
-```
-
-Resolution records the winning source and any hard model constraint. User TOML
-writes are atomic and private; raw API keys cannot be persisted, only an API
-key file reference. Read [Settings](docs/settings.md), the generated [settings
-reference](docs/reference/settings.md), and the [migration
-guide](docs/migration-settings.md).
-
-For agents and integrations, these are the configuration sources of truth:
-
-| Need | Use |
-|---|---|
-| Discover the installed canonical catalog | `mtplx settings list --json` |
-| Read every canonical name, type, default, lifecycle, visibility, and alias | Generated [settings reference](docs/reference/settings.md) |
-| Translate an older flag or reviewed environment variable | Generated [migration tables](docs/migration-settings.md) |
-| Find command operands and mechanical flags | `mtplx help flags` or the command's `--help` |
-| Classify internal experiment switches | Generated [experiment inventory](docs/experiments/inventory.md) |
-
-Do not infer a public setting from an arbitrary `MTPLX_*` name in source. Environment variables not
-listed in the generated migration tables are internal, experimental, diagnostic, or command-owned
-until explicitly cataloged.
+Onboarding chooses the model, runtime mode, and chat surface. See the
+[quickstart](docs/quickstart.md) for server and client setup.
 
 ## App
 
@@ -147,12 +101,10 @@ depth only when it wins, and says so when none does.
 ```bash
 mtplx tune --retune
 mtplx bench aime --quick
-mtplx bench run --settings lab:compiled-verify-control --dry-run
 ```
 
 On a 16 GB M4 Mac mini, tuning the 9B model lands on depth 1: 14.4 tok/s
-baseline becomes 23.0 tok/s. Experiment bundles are strict data-only controls
-with lifecycle and normalized hashes; read [Experiments](docs/experiments.md).
+baseline becomes 23.0 tok/s.
 
 ## Modes
 
@@ -183,9 +135,7 @@ Gemma 4. The app recommends among them for the detected hardware.
 `mtplx inspect` classifies models before loading: verified,
 architecture-compatible but unverified, incompatible architecture, or no MTP
 heads. There are no silent fallbacks. Existing individual flags, flat config
-keys, reviewed environment variables, and `mtplx settings get/set` remain
-compatibility aliases; new automation should use canonical settings and
-explicit `settings live` scope.
+keys, and reviewed environment variables remain compatibility controls.
 
 MTPLX also has an opt-in target-only AR path for two pinned community MoE Q4
 artifacts that streams routed experts into a bounded hot bank. It is not on by
@@ -193,8 +143,7 @@ default and has no full-checkpoint performance claim. See the [advanced
 SSD-streamed MoE guide](docs/advanced/ssd-streamed-moe.md).
 
 Use `mtplx help advanced` for QA, profiling, support bundles, and kernel tools.
-See the [CLI guide](docs/cli.md), [compatibility mappings](docs/migration-settings.md),
-and [documentation index](docs/README.md).
+See the [documentation index](docs/README.md).
 
 ## What MTPLX is not
 

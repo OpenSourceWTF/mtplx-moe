@@ -433,9 +433,6 @@ def build_benchmark_envelope(
     decode_trace_path: Path | str | None = None,
     runtime_profile: str | None = None,
     runtime_env: dict[str, str] | None = None,
-    settings: dict[str, Any] | None = None,
-    settings_provenance: dict[str, Any] | None = None,
-    settings_bundles: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     rows = _rows(result)
     summary = _summary(result)
@@ -453,7 +450,7 @@ def build_benchmark_envelope(
         trace=trace,
         fan_controlled=fan_controlled,
     )
-    envelope = {
+    return {
         "run_id": run_id,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "suite": suite,
@@ -478,35 +475,4 @@ def build_benchmark_envelope(
         },
         "strict_gates": strict_gates,
         "strict_passed": all(strict_gates.values()) if strict_gates else None,
-    }
-    if settings is not None:
-        envelope["settings"] = build_settings_envelope(
-            settings=settings,
-            settings_provenance=settings_provenance or {},
-            settings_bundles=settings_bundles or [],
-        )
-    return envelope
-
-
-def build_settings_envelope(
-    *,
-    settings: dict[str, Any],
-    settings_provenance: dict[str, Any],
-    settings_bundles: list[dict[str, Any]],
-) -> dict[str, Any]:
-    return {
-        "effective": dict(sorted(settings.items())),
-        "provenance": {
-            name: settings_provenance[name]
-            for name in sorted(settings_provenance)
-        },
-        # Bundle order is resolution order and must not be sorted.
-        "bundles": [
-            {
-                key: bundle[key]
-                for key in ("id", "sha256", "source")
-                if key in bundle and bundle[key] is not None
-            }
-            for bundle in settings_bundles
-        ],
     }

@@ -59,12 +59,8 @@ mtplx serve --rate-limit 120
 mtplx serve --stream-interval 4
 mtplx serve --warmup-tokens 16
 mtplx serve --reasoning-parser qwen3
-mtplx serve --set runtime.mtp.enabled=false
+mtplx serve --no-mtp
 ```
-
-The host, port, API-key, warmup, and stream controls above are invocation mechanics. Reusable runtime
-configuration uses canonical settings; see [Settings](settings.md) and the generated
-[settings reference](reference/settings.md).
 
 Non-localhost binds require `--api-key`. Requests may authenticate with either:
 

@@ -17,6 +17,6 @@ Expected production failures should be actionable, not tracebacks:
 | default model missing | `mtplx pull Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed` |
 | Open WebUI cannot connect | use `http://127.0.0.1:8000/v1` on the host, or `http://host.docker.internal:8000/v1` inside Docker |
 | Docker daemon stopped | start Docker Desktop |
-| low disk/RAM | change `model.cache_dir`, lower `model.context_window`, select a smaller model/profile, or free storage; use `mtplx settings explain NAME` to verify the winning source |
+| low disk/RAM | change `MTPLX_MODEL_DIR`, free storage, lower context/profile, or use a smaller model |
 
 See [TROUBLESHOOTING.md](../TROUBLESHOOTING.md) for the wider table.

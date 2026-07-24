@@ -332,6 +332,29 @@ class _StreamingStub:
         return SimpleNamespace(tokens=tokens)
 
 
+def test_streamed_plain_decode_uses_prebound_eager_route_without_engagement_counter(
+    monkeypatch,
+) -> None:
+    model = _PhaseModel()
+    runtime = MTPLXRuntime(
+        model=model,
+        tokenizer=None,
+        model_path=Path("model"),
+        mtp_enabled=False,
+        contract=MTPContract(),
+        expert_streaming=_StreamingStub(),
+    )
+
+    def reject_compiled_eligibility(_cache):
+        raise AssertionError("streamed decode re-entered compiled eligibility")
+
+    monkeypatch.setattr(runtime, "_compiled_ar_forward", reject_compiled_eligibility)
+    token = SimpleNamespace(shape=(1, 1))
+
+    assert runtime.forward_ar(token, cache=[object()]) is token
+    assert "compiled_forward_calls" not in runtime.diagnostic_counters
+
+
 def test_mtplx_runtime_marks_prefill_decode_and_closes_streaming_runtime() -> None:
     model = _PhaseModel()
     streaming = _StreamingStub()
