@@ -137,10 +137,13 @@ architecture-compatible but unverified, incompatible architecture, or no MTP
 heads. There are no silent fallbacks. Existing individual flags, flat config
 keys, and reviewed environment variables remain compatibility controls.
 
-MTPLX also has an opt-in target-only AR path for two pinned community MoE Q4
-artifacts that streams routed experts into a bounded hot bank. It is not on by
-default and has no full-checkpoint performance claim. See the [advanced
-SSD-streamed MoE guide](docs/advanced/ssd-streamed-moe.md).
+MTPLX can also serve mixture-of-experts models larger than your Mac's memory by
+streaming routed experts from SSD. Two are published ready to run —
+`OpensourceWTF/Hy3-oQ2e-MTPLX-streaming` and
+`OpensourceWTF/GLM-5.2-t158-MTPLX-streaming`: `mtplx pull` one and `mtplx serve`
+it, with no manifest to build and no memory flags. This is an opt-in,
+target-only AR path with no full-checkpoint performance claim. See the
+[SSD-streamed MoE guide](docs/advanced/ssd-streamed-moe.md).
 
 Use `mtplx help advanced` for QA, profiling, support bundles, and kernel tools.
 See the [documentation index](docs/README.md).
