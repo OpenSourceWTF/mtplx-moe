@@ -11,6 +11,8 @@ dtype the real checkpoint runs in.
 
 from __future__ import annotations
 
+import math
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
@@ -79,12 +81,15 @@ def toy_model():
     mx.eval(model.parameters())
     stock_moe = laguna.LagunaSparseMoeBlock.__call__
     stock_forward = laguna.LagunaModel.__call__
+    stock_attention = laguna.Attention.__call__
     try:
         yield model
     finally:
         laguna.LagunaSparseMoeBlock.__call__ = stock_moe
         laguna.LagunaModel.__call__ = stock_forward
+        laguna.Attention.__call__ = stock_attention
         laguna.PER_HEAD_GATE_IMPL = laguna._stock_per_head_gate
+        laguna.MOE_COMBINE_IMPL = laguna._stock_moe_combine
         mx.set_default_device(previous)
 
 
@@ -125,6 +130,8 @@ def _last_logits(model, prompts):
         (laguna_fused.install_fused_residual_norm, True),
         (laguna_fused.install_compiled_attention_gate, False),
         (laguna_fused.install_kernel_attention_gate, False),
+        (laguna_fused.install_kernel_qk_rope, True),
+        (laguna_fused.install_kernel_moe_combine, True),
     ],
 )
 def test_fused_path_preserves_greedy_output(toy_model, installer, bit_exact):
@@ -140,6 +147,92 @@ def test_fused_path_preserves_greedy_output(toy_model, installer, bit_exact):
     assert delta <= BF16_SAFE_TOLERANCE
     if bit_exact:
         assert delta == 0.0, f"expected bit-exact, got {delta:.3e}"
+
+
+def test_qk_rope_install_reads_the_layer_rope_modules(toy_model):
+    """The installer must capture each layer's own rope constants, not guess.
+
+    On the toy geometry (head_dim 8) no layer is kernel-covered, but the specs
+    still have to reflect the modules exactly: default-rope layers carry
+    log2(theta) and the full-attention layers' partial rotary width.
+    """
+
+    report = laguna_fused.install_kernel_qk_rope(toy_model)
+    assert report["layers_covered"] == 0  # head_dim 8 stays on the stock path
+    assert report["layers_skipped"] == len(LAYER_TYPES)
+
+    layers = toy_model.model.layers
+    full = layers[0].self_attn._qk_rope_spec
+    sliding = layers[1].self_attn._qk_rope_spec
+    assert full.rot_dims == 4  # head_dim 8 * partial_rotary_factor 0.5
+    assert full.base_log2 == pytest.approx(math.log2(500_000.0))
+    assert full.mscale is None and full.freqs is None
+    assert sliding.rot_dims == 8
+    assert sliding.base_log2 == pytest.approx(math.log2(10_000.0))
+
+
+def test_qk_rope_spec_for_yarn_captures_freqs_and_mscale():
+    """A YaRN rope must contribute its own freqs buffer and attention factor."""
+
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        args = _toy_args(
+            head_dim=128,
+            hidden_size=256,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            rope_parameters={
+                "full_attention": {
+                    "rope_type": "yarn",
+                    "rope_theta": 500_000.0,
+                    "factor": 128.0,
+                    "original_max_position_embeddings": 8192,
+                    "beta_fast": 32.0,
+                    "beta_slow": 1.0,
+                    "partial_rotary_factor": 0.5,
+                },
+                "sliding_attention": {
+                    "rope_type": "default",
+                    "rope_theta": 10_000.0,
+                    "partial_rotary_factor": 1.0,
+                },
+            },
+        )
+        model = Model(args)
+        spec = laguna_fused._qk_rope_spec_for(model.model.layers[0].self_attn)
+        assert spec is not None
+        assert spec.rot_dims == 64
+        assert spec.freqs is not None and int(spec.freqs.size) == 32
+        assert spec.base_log2 is None
+        # yarn_get_mscale(128, 1) — what mlx-lm computes for this config.
+        assert spec.mscale == pytest.approx(0.1 * math.log(128.0) + 1.0)
+
+        sliding_spec = laguna_fused._qk_rope_spec_for(
+            model.model.layers[1].self_attn
+        )
+        assert sliding_spec is not None
+        assert sliding_spec.rot_dims == 128
+        assert sliding_spec.freqs is None and sliding_spec.mscale is None
+    finally:
+        mx.set_default_device(previous)
+
+
+def test_moe_combine_fallback_matches_stock_expression(toy_model):
+    """The CPU fallback inside fused_moe_combine IS the stock arithmetic."""
+
+    from mtplx.kernels.laguna_decode import fused_moe_combine
+
+    mx.random.seed(11)
+    expert_out = mx.random.normal((3, 4, 16)).astype(mx.bfloat16)
+    weights = mx.random.uniform(shape=(3, 4)).astype(mx.float32)
+    shared = mx.random.normal((3, 16)).astype(mx.bfloat16)
+
+    stock = (
+        expert_out * weights.astype(mx.bfloat16)[..., None]
+    ).sum(axis=-2) + shared
+    fused = fused_moe_combine(expert_out, weights, shared)
+    assert float(mx.abs(stock - fused).astype(mx.float32).max()) == 0.0
 
 
 def test_fused_gate_up_is_bit_exact_when_quantized(toy_model):
@@ -163,6 +256,28 @@ def test_fused_gate_up_is_bit_exact_when_quantized(toy_model):
     assert _greedy(toy_model, PROMPTS, 5) == reference_tokens
     delta = float(mx.abs(_last_logits(toy_model, PROMPTS) - reference_logits).max())
     assert delta == 0.0, f"gate/up fusion was not bit-exact: {delta:.3e}"
+
+
+def test_fused_shared_gate_up_is_bit_exact_when_quantized(toy_model):
+    """Concatenating the dense-MLP gate/up rows must not perturb anything.
+
+    Covers both flavors the installer touches: the layer-0 dense block and the
+    per-layer shared experts.
+    """
+
+    nn.quantize(toy_model, group_size=32, bits=4)
+    mx.eval(toy_model.parameters())
+
+    reference_tokens = _greedy(toy_model, PROMPTS, 5)
+    reference_logits = _last_logits(toy_model, PROMPTS)
+
+    report = laguna_fused.install_fused_shared_gate_up(toy_model)
+    # layer 0 dense + three sparse layers' shared experts
+    assert report["layers_converted"] == 4
+
+    assert _greedy(toy_model, PROMPTS, 5) == reference_tokens
+    delta = float(mx.abs(_last_logits(toy_model, PROMPTS) - reference_logits).max())
+    assert delta == 0.0, f"shared gate/up fusion was not bit-exact: {delta:.3e}"
 
 
 def test_fused_gate_up_is_idempotent(toy_model):

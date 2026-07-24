@@ -32,7 +32,10 @@ measured, not assumed.
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
 from functools import lru_cache
+from typing import Optional
 
 import mlx.core as mx
 
@@ -302,3 +305,382 @@ def fused_per_head_gate(
         output_dtypes=[output.dtype],
     )
     return gated
+
+
+# ---------------------------------------------------------------------------
+# fused q/k RMSNorm + rope for the single-token decode step
+# ---------------------------------------------------------------------------
+#
+# The census put 1.21 ms/step in rope and 0.35 ms in q/k norm + transpose —
+# arithmetic on 48x128 and 8x128 elements, spread over ~200 dispatches per step
+# (two norms, two ropes, and on the YaRN layers a copy plus a sliced scalar
+# multiply per projection).  This kernel does the whole chain for q AND k in
+# ONE dispatch per layer, writing directly into the head-major layout sdpa
+# reads.
+#
+# Bit-exactness is by construction, matching each stock stage's exact math:
+#   - RMSNorm reproduces MLX's rms_single_row at axis 128: one 32-lane
+#     simdgroup, four sequential squares per lane in float, simd_sum, and
+#     precise::rsqrt(acc/axis + eps); the output expression is
+#     w[i] * static_cast<T>(x[i] * inv), the same double rounding.
+#   - The YaRN pre-scale reproduces mlx-lm's `mscale * x[..., :dims]`: the
+#     scalar is rounded to the tensor dtype first, then multiplied in that
+#     dtype, and it touches only the rotated dims.
+#   - The rotation reproduces mx.fast.rope: theta = float(offset) * inv_freq
+#     with inv_freq either exp2(-d * log2(base)) at d = p / (dims/2) or the
+#     module's own float32 freqs buffer, metal::fast::cos/sin, pairs (p,
+#     p + dims/2), float multiply-add, one cast back to T per element.
+
+_QK_HEAD_DIM = 128
+_QK_LANES = 32
+
+
+@dataclass(frozen=True)
+class QkRopeSpec:
+    """Per-layer constants for the fused q/k norm+rope kernel.
+
+    Captured from the layer's own rope module at install time so the kernel
+    can only ever see the exact frequencies and scale the stock path uses.
+    """
+
+    n_q_heads: int
+    n_kv_heads: int
+    head_dim: int
+    rot_dims: int
+    freqs: Optional[mx.array]  # float32 [rot_dims // 2], or None for base form
+    base_log2: Optional[float]  # log2(rope theta) when freqs is None
+    mscale: Optional[float]  # YaRN attention factor, None when 1.0
+
+
+def is_qk_norm_rope_eligible(
+    queries: mx.array,
+    keys: mx.array,
+    q_weight: mx.array,
+    k_weight: mx.array,
+    spec: "QkRopeSpec | None",
+) -> bool:
+    if spec is None or not _on_metal_device():
+        return False
+    if queries.dtype not in (mx.bfloat16, mx.float16):
+        return False
+    if keys.dtype != queries.dtype:
+        return False
+    if q_weight.dtype != queries.dtype or k_weight.dtype != queries.dtype:
+        return False
+    if spec.head_dim != _QK_HEAD_DIM or spec.rot_dims not in (64, 128):
+        return False
+    if spec.freqs is None and spec.base_log2 is None:
+        return False
+    if spec.freqs is not None:
+        if spec.freqs.dtype != mx.float32:
+            return False
+        if int(spec.freqs.size) != spec.rot_dims // 2:
+            return False
+    if queries.ndim != 3 or keys.ndim != 3:
+        return False
+    if int(queries.shape[1]) != 1 or int(keys.shape[1]) != 1:
+        return False
+    if int(queries.shape[-1]) != spec.n_q_heads * spec.head_dim:
+        return False
+    if int(keys.shape[-1]) != spec.n_kv_heads * spec.head_dim:
+        return False
+    if int(q_weight.size) != spec.head_dim or int(k_weight.size) != spec.head_dim:
+        return False
+    return int(queries.shape[0]) == int(keys.shape[0])
+
+
+@lru_cache(maxsize=None)
+def _qk_norm_rope_kernel(
+    n_q_heads: int,
+    n_kv_heads: int,
+    rot_dims: int,
+    use_freqs: bool,
+    base_log2: float,
+    mscale: float,
+):
+    has_mscale = mscale != 1.0
+    header = f"""
+        using namespace metal;
+        constant constexpr int HQ = {n_q_heads};
+        constant constexpr int HKV = {n_kv_heads};
+        constant constexpr int HEAD_DIM = {_QK_HEAD_DIM};
+        constant constexpr int ROT_DIMS = {rot_dims};
+        constant constexpr int HALF_ROT = ROT_DIMS / 2;
+        constant constexpr bool USE_FREQS = {"true" if use_freqs else "false"};
+        constant constexpr bool HAS_MSCALE = {"true" if has_mscale else "false"};
+        constant constexpr float MSCALE_F = {mscale!r}f;
+        constant constexpr float BASE_LOG2 = {base_log2!r}f;
+    """
+
+    source = """
+        uint tg = threadgroup_position_in_grid.x;
+        uint lane = thread_position_in_threadgroup.x;
+        constexpr int TOTAL_HEADS = HQ + HKV;
+
+        uint b = tg / uint(TOTAL_HEADS);
+        uint hg = tg - b * uint(TOTAL_HEADS);
+        bool is_q = hg < uint(HQ);
+        uint h = is_q ? hg : (hg - uint(HQ));
+
+        // [B, 1, H*D] in and [B, H, 1, D] out are the same linear layout at
+        // T == 1, so the stock transpose is free here.
+        size_t head_offset = is_q
+            ? ((size_t)b * (size_t)(HQ * HEAD_DIM) + (size_t)h * HEAD_DIM)
+            : ((size_t)b * (size_t)(HKV * HEAD_DIM) + (size_t)h * HEAD_DIM);
+        const device T* src = (is_q ? q_in : k_in) + head_offset;
+        const device T* w = is_q ? q_w : k_w;
+        device T* dst = (is_q ? q_out : k_out) + head_offset;
+
+        // RMS statistic, exactly as MLX's rms_single_row lays it out for a
+        // 128-wide axis: 32 lanes x 4 sequential float squares, one simd_sum.
+        float acc = 0.0f;
+        uint base = lane * 4;
+        for (int i = 0; i < 4; ++i) {
+            float xi = static_cast<float>(src[base + i]);
+            acc += xi * xi;
+        }
+        acc = simd_sum(acc);
+        float inv = metal::precise::rsqrt(acc / float(HEAD_DIM) + eps);
+
+        float L = float(position);
+
+        if (ROT_DIMS == HEAD_DIM) {
+            for (uint p = lane; p < uint(HALF_ROT); p += 32u) {
+                float inv_freq;
+                if (USE_FREQS) {
+                    inv_freq = 1.0 / (freqs[p]);
+                } else {
+                    float d = float(p) / float(HALF_ROT);
+                    inv_freq = metal::exp2(-d * BASE_LOG2);
+                }
+                float theta = L * inv_freq;
+                float costheta = metal::fast::cos(theta);
+                float sintheta = metal::fast::sin(theta);
+                T v1 = w[p] * static_cast<T>(src[p] * inv);
+                T v2 = w[p + uint(HALF_ROT)] *
+                    static_cast<T>(src[p + uint(HALF_ROT)] * inv);
+                if (HAS_MSCALE) {
+                    v1 = static_cast<T>(MSCALE_F) * v1;
+                    v2 = static_cast<T>(MSCALE_F) * v2;
+                }
+                float x1 = static_cast<float>(v1);
+                float x2 = static_cast<float>(v2);
+                dst[p] = static_cast<T>(x1 * costheta - x2 * sintheta);
+                dst[p + uint(HALF_ROT)] =
+                    static_cast<T>(x1 * sintheta + x2 * costheta);
+            }
+        } else {
+            // Partial rotary: rotate pairs (p, p + HALF_ROT) inside the first
+            // ROT_DIMS dims; the tail is normed output with NO mscale, which
+            // is exactly what the stock chain produces (the YaRN pre-scale
+            // slices [..., :dims]).
+            if (lane < uint(HALF_ROT)) {
+                uint p = lane;
+                float inv_freq;
+                if (USE_FREQS) {
+                    inv_freq = 1.0 / (freqs[p]);
+                } else {
+                    float d = float(p) / float(HALF_ROT);
+                    inv_freq = metal::exp2(-d * BASE_LOG2);
+                }
+                float theta = L * inv_freq;
+                float costheta = metal::fast::cos(theta);
+                float sintheta = metal::fast::sin(theta);
+                T v1 = w[p] * static_cast<T>(src[p] * inv);
+                T v2 = w[p + uint(HALF_ROT)] *
+                    static_cast<T>(src[p + uint(HALF_ROT)] * inv);
+                if (HAS_MSCALE) {
+                    v1 = static_cast<T>(MSCALE_F) * v1;
+                    v2 = static_cast<T>(MSCALE_F) * v2;
+                }
+                float x1 = static_cast<float>(v1);
+                float x2 = static_cast<float>(v2);
+                dst[p] = static_cast<T>(x1 * costheta - x2 * sintheta);
+                dst[p + uint(HALF_ROT)] =
+                    static_cast<T>(x1 * sintheta + x2 * costheta);
+            }
+            constexpr int TAIL = HEAD_DIM - ROT_DIMS;
+            constexpr int PER_LANE = TAIL / 32;
+            for (int i = 0; i < PER_LANE; ++i) {
+                uint t = uint(ROT_DIMS) + lane * uint(PER_LANE) + uint(i);
+                dst[t] = w[t] * static_cast<T>(src[t] * inv);
+            }
+        }
+    """
+
+    name = (
+        f"mtplx_laguna_qk_rope_hq{n_q_heads}_hkv{n_kv_heads}_r{rot_dims}"
+        f"_{'freqs' if use_freqs else 'base'}{'_ms' if has_mscale else ''}"
+    )
+    return mx.fast.metal_kernel(
+        name=name,
+        input_names=["q_in", "k_in", "q_w", "k_w", "freqs", "eps", "position"],
+        output_names=["q_out", "k_out"],
+        header=header,
+        source=source,
+    )
+
+
+_QK_DUMMY_FREQS = None
+
+
+def fused_qk_norm_rope(
+    queries: mx.array,
+    keys: mx.array,
+    q_weight: mx.array,
+    k_weight: mx.array,
+    eps: float,
+    position: int,
+    spec: QkRopeSpec,
+) -> tuple[mx.array, mx.array]:
+    """RMSNorm + (partial/YaRN) rope for q and k in one dispatch, at T == 1.
+
+    Returns ``(queries, keys)`` shaped ``[B, heads, 1, head_dim]`` — the
+    layout the stock transpose+rope chain hands to attention.  Callers check
+    :func:`is_qk_norm_rope_eligible` first; there is no fallback here because
+    the caller owns the stock path.
+    """
+
+    global _QK_DUMMY_FREQS
+    batch = int(queries.shape[0])
+    freqs = spec.freqs
+    if freqs is None:
+        if _QK_DUMMY_FREQS is None:
+            _QK_DUMMY_FREQS = mx.ones((1,), dtype=mx.float32)
+        freqs = _QK_DUMMY_FREQS
+
+    kernel = _qk_norm_rope_kernel(
+        spec.n_q_heads,
+        spec.n_kv_heads,
+        spec.rot_dims,
+        spec.freqs is not None,
+        float(spec.base_log2) if spec.base_log2 is not None else 0.0,
+        float(spec.mscale) if spec.mscale is not None else 1.0,
+    )
+    total_heads = spec.n_q_heads + spec.n_kv_heads
+    q_out, k_out = kernel(
+        inputs=[queries, keys, q_weight, k_weight, freqs, float(eps), int(position)],
+        template=[("T", queries.dtype)],
+        grid=(_QK_LANES * batch * total_heads, 1, 1),
+        threadgroup=(_QK_LANES, 1, 1),
+        output_shapes=[
+            (batch, spec.n_q_heads, 1, spec.head_dim),
+            (batch, spec.n_kv_heads, 1, spec.head_dim),
+        ],
+        output_dtypes=[queries.dtype, queries.dtype],
+    )
+    return q_out, k_out
+
+
+# ---------------------------------------------------------------------------
+# fused MoE weighted combine (+ shared-expert add)
+# ---------------------------------------------------------------------------
+#
+# Stock: `(expert_out * weights[..., None]).sum(axis=-2) + shared` materializes
+# a [rows, K, hidden] product (61 KB per layer per token written and re-read)
+# and costs three dispatches.  This kernel reads the expert outputs once and
+# writes the combined row directly.
+#
+# Bit-exactness means matching MLX's own strided_reduce_small order for a
+# K-deep bf16 column reduction: threadgroup_y = min(8, K) partial accumulators,
+# partial y summing rows {y, y+TY, ...} in ascending order, partials combined
+# in ascending y with `op(partial, total)`, everything in the tensor dtype.
+# The weight multiply rounds to the tensor dtype first (the stock astype), and
+# the shared-expert add happens after the reduction's final rounding, exactly
+# as the separate stock add does.
+
+
+def is_moe_combine_eligible(
+    expert_out: mx.array, weights: mx.array, shared: mx.array
+) -> bool:
+    if not _on_metal_device():
+        return False
+    if expert_out.ndim != 3 or weights.ndim != 2 or shared.ndim != 2:
+        return False
+    if expert_out.dtype not in (mx.bfloat16, mx.float16):
+        return False
+    if shared.dtype != expert_out.dtype:
+        return False
+    if weights.dtype not in (mx.float32, expert_out.dtype):
+        return False
+    rows, top_k, hidden = (int(dim) for dim in expert_out.shape)
+    if top_k <= 0 or top_k > 32:
+        return False
+    if (int(weights.shape[0]), int(weights.shape[1])) != (rows, top_k):
+        return False
+    return (int(shared.shape[0]), int(shared.shape[1])) == (rows, hidden)
+
+
+@lru_cache(maxsize=None)
+def _moe_combine_kernel(top_k: int, hidden: int):
+    ty = min(8, top_k)
+    header = f"""
+        using namespace metal;
+        constant constexpr int TOP_K = {top_k};
+        constant constexpr int HIDDEN = {hidden};
+        constant constexpr int TY = {ty};
+    """
+
+    source = """
+        uint idx = thread_position_in_grid.x;
+        uint row = idx / uint(HIDDEN);
+        uint c = idx - row * uint(HIDDEN);
+
+        const device T* base_ptr =
+            expert_out + (size_t)row * (size_t)(TOP_K * HIDDEN) + c;
+
+        // Reproduce col_reduce_small's threadgroup_y=TY accumulation exactly:
+        // partial y takes rows {y, y+TY, ...} in order, then partials combine
+        // in ascending y as op(partial, running).
+        T totals[TY];
+        for (int y = 0; y < TY; ++y) {
+            totals[y] = T(0);
+        }
+        for (int r = 0; r < TOP_K; ++r) {
+            T wv = static_cast<T>(weights[(size_t)row * TOP_K + r]);
+            T prod = base_ptr[(size_t)r * HIDDEN] * wv;
+            totals[r % TY] = prod + totals[r % TY];
+        }
+        T total = totals[0];
+        for (int y = 1; y < TY; ++y) {
+            total = totals[y] + total;
+        }
+        combined[idx] = total + shared_in[idx];
+    """
+
+    return mx.fast.metal_kernel(
+        name=f"mtplx_laguna_moe_combine_k{top_k}_h{hidden}",
+        input_names=["expert_out", "weights", "shared_in"],
+        output_names=["combined"],
+        header=header,
+        source=source,
+    )
+
+
+def fused_moe_combine(
+    expert_out: mx.array, weights: mx.array, shared: mx.array
+) -> mx.array:
+    """Weighted expert combine plus shared-expert add, one dispatch.
+
+    Falls back to the stock op chain on any shape the kernel does not cover,
+    so callers can switch it on without owning a correctness branch.
+    """
+
+    if not is_moe_combine_eligible(expert_out, weights, shared):
+        combined = (
+            expert_out * weights.astype(expert_out.dtype)[..., None]
+        ).sum(axis=-2)
+        return combined + shared
+
+    rows, top_k, hidden = (int(dim) for dim in expert_out.shape)
+    kernel = _moe_combine_kernel(top_k, hidden)
+    total = rows * hidden
+    (combined,) = kernel(
+        inputs=[expert_out, weights, shared],
+        template=[("T", expert_out.dtype)],
+        grid=(total, 1, 1),
+        threadgroup=(256 if total >= 256 else 32, 1, 1),
+        output_shapes=[(rows, hidden)],
+        output_dtypes=[expert_out.dtype],
+    )
+    return combined

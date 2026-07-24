@@ -45,6 +45,13 @@ ENV_COMPILED_ATTN_GATE = "MTPLX_LAGUNA_COMPILED_ATTN_GATE"
 ENV_KERNEL_ROUTER = "MTPLX_LAGUNA_KERNEL_ROUTER"
 ENV_KERNEL_ATTN_GATE = "MTPLX_LAGUNA_KERNEL_ATTN_GATE"
 ENV_FUSED_RESIDUAL_NORM = "MTPLX_LAGUNA_FUSED_RESIDUAL_NORM"
+ENV_KERNEL_QK_ROPE = "MTPLX_LAGUNA_KERNEL_QK_ROPE"
+ENV_KERNEL_COMBINE = "MTPLX_LAGUNA_KERNEL_COMBINE"
+ENV_FUSED_SHARED_GATE_UP = "MTPLX_LAGUNA_FUSED_SHARED_GATE_UP"
+
+# The pristine Attention.__call__, captured on first install so the fused
+# variant can delegate any shape it does not cover and benches can restore it.
+_STOCK_ATTENTION_CALL = None
 
 
 def _enabled(name: str) -> bool:
@@ -147,6 +154,103 @@ class FusedGateUpSwitchGLU(nn.Module):
         return x.squeeze(-2)
 
 
+class FusedGateUpMLP(nn.Module):
+    """A dense MLP with gate and up issued as ONE (quantized) matmul.
+
+    Same argument as the expert-bank fusion: quantization groups run along the
+    input dimension, so concatenating output rows carries each row's own scales
+    and biases untouched — the per-row arithmetic is identical and the fusion
+    is bit-exact by construction.  Applies to the 47 shared experts and the
+    lone dense layer-0 MLP, each of which currently pays two launches for one
+    weight read's worth of work.
+
+    The activation stays the stock ``nn.silu(gate) * up`` expression verbatim;
+    only the launch count changes.
+    """
+
+    def __init__(self, mlp: Any) -> None:
+        super().__init__()
+        gate_proj = mlp.gate_proj
+        up_proj = mlp.up_proj
+
+        self.quantized = "scales" in gate_proj
+        if self.quantized:
+            if (
+                int(gate_proj.group_size) != int(up_proj.group_size)
+                or int(gate_proj.bits) != int(up_proj.bits)
+                or gate_proj.mode != up_proj.mode
+            ):
+                raise ValueError(
+                    "gate/up quantization differs; concatenation would change "
+                    "the arithmetic"
+                )
+            self.hidden_dims = int(gate_proj.scales.shape[0])
+            self.gate_up_scales = mx.concatenate(
+                [gate_proj.scales, up_proj.scales], axis=0
+            )
+            gate_biases = gate_proj.get("biases")
+            if gate_biases is not None:
+                self.gate_up_biases = mx.concatenate(
+                    [gate_biases, up_proj["biases"]], axis=0
+                )
+            self.group_size = int(gate_proj.group_size)
+            self.bits = int(gate_proj.bits)
+            self.mode = gate_proj.mode
+        else:
+            self.hidden_dims = int(gate_proj.weight.shape[0])
+        self.gate_up_weight = mx.concatenate(
+            [gate_proj.weight, up_proj.weight], axis=0
+        )
+        self.down_proj = mlp.down_proj
+
+    def __call__(self, x: mx.array) -> mx.array:
+        if self.quantized:
+            fused = mx.quantized_matmul(
+                x,
+                self["gate_up_weight"],
+                self["gate_up_scales"],
+                self.get("gate_up_biases"),
+                transpose=True,
+                group_size=self.group_size,
+                bits=self.bits,
+                mode=self.mode,
+            )
+        else:
+            fused = x @ self["gate_up_weight"].swapaxes(-1, -2)
+        hidden = self.hidden_dims
+        gate = fused[..., :hidden]
+        up = fused[..., hidden:]
+        return self.down_proj(nn.silu(gate) * up)
+
+
+def install_fused_shared_gate_up(model: Any) -> dict[str, Any]:
+    """Fuse gate/up for every dense MLP: shared experts and the layer-0 block.
+
+    Destructive in the same sense as the expert-bank fusion — the originals
+    are dropped as each layer converts — but the transient cost is a few MB
+    per layer, not 38 GB.
+    """
+
+    from .laguna import MLP
+
+    inner = getattr(model, "model", model)
+    converted = 0
+    for layer in inner.layers:
+        mlp = layer.mlp
+        if isinstance(mlp, MLP):
+            layer.mlp = FusedGateUpMLP(mlp)
+            converted += 1
+            continue
+        shared = getattr(mlp, "shared_expert", None)
+        if shared is not None and isinstance(shared, MLP):
+            mlp.shared_expert = FusedGateUpMLP(shared)
+            converted += 1
+    mx.eval(inner.parameters())
+    gc.collect()
+    mx.clear_cache()
+    return {"path": "fused_shared_gate_up", "layers_converted": converted}
+
+
 def install_fused_gate_up(model: Any) -> dict[str, Any]:
     """Replace every MoE block's SwitchGLU with the fused-gate/up variant.
 
@@ -210,9 +314,12 @@ def _fused_moe_call(self, x: mx.array) -> mx.array:
     else:
         weights = (weights * self.routed_scaling_factor).astype(x.dtype)
 
+    from . import laguna
+
     output = self.switch_mlp(flattened, indices)
-    output = (output * weights[..., None]).sum(axis=-2)
-    output = output + self.shared_expert(flattened)
+    output = laguna.MOE_COMBINE_IMPL(
+        output, weights, self.shared_expert(flattened)
+    )
     return output.reshape(batch, length, hidden)
 
 
@@ -362,6 +469,7 @@ def install_fused_residual_norm(model: Any) -> dict[str, Any]:
 # hand-written Metal kernels
 # ---------------------------------------------------------------------------
 def _kernel_moe_call(self, x: mx.array) -> mx.array:
+    from . import laguna
     from ..kernels.laguna_decode import fused_router_topk
 
     batch, length, hidden = x.shape
@@ -380,8 +488,9 @@ def _kernel_moe_call(self, x: mx.array) -> mx.array:
     )
 
     output = self.switch_mlp(flattened, indices)
-    output = (output * weights.astype(x.dtype)[..., None]).sum(axis=-2)
-    output = output + self.shared_expert(flattened)
+    output = laguna.MOE_COMBINE_IMPL(
+        output, weights, self.shared_expert(flattened)
+    )
     return output.reshape(batch, length, hidden)
 
 
@@ -407,6 +516,166 @@ def install_kernel_attention_gate(model: Any) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# fused q/k norm + rope
+# ---------------------------------------------------------------------------
+def _kernel_attention_call(self, x, mask=None, cache=None, rope_memo=None):
+    """Attention forward that fuses norm+transpose+rope at the decode step.
+
+    Any shape the kernel does not cover — prefill, CPU runs, a rope module the
+    installer did not recognize — delegates wholesale to the pristine
+    implementation captured at install time.
+    """
+
+    from ..kernels.laguna_decode import (
+        fused_qk_norm_rope,
+        is_qk_norm_rope_eligible,
+    )
+    from mlx_lm.models.base import scaled_dot_product_attention
+
+    spec = getattr(self, "_qk_rope_spec", None)
+    batch, length, _ = x.shape
+    if spec is None or length != 1:
+        return _STOCK_ATTENTION_CALL(self, x, mask, cache, rope_memo)
+
+    queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+    if not is_qk_norm_rope_eligible(
+        queries, keys, self.q_norm.weight, self.k_norm.weight, spec
+    ):
+        return _STOCK_ATTENTION_CALL(self, x, mask, cache, rope_memo)
+
+    offset = cache.offset if cache is not None else 0
+    queries, keys = fused_qk_norm_rope(
+        queries,
+        keys,
+        self.q_norm.weight,
+        self.k_norm.weight,
+        float(self.q_norm.eps),
+        int(offset),
+        spec,
+    )
+    values = values.reshape(batch, 1, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+
+    if cache is not None:
+        keys, values = cache.update_and_fetch(keys, values)
+
+    output = scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        cache=cache,
+        scale=self.scale,
+        mask=mask,
+    )
+    output = output.transpose(0, 2, 1, 3).reshape(
+        batch,
+        length,
+        self.n_heads * self.head_dim,
+    )
+
+    if self.gating:
+        from . import laguna
+
+        gate_logits = self.g_proj(x)
+        if self.gate_per_head:
+            output = laguna.PER_HEAD_GATE_IMPL(
+                output, gate_logits, self.n_heads, self.head_dim
+            )
+        else:
+            gate = mx.logaddexp(
+                gate_logits.astype(mx.float32), mx.array(0.0)
+            ).astype(output.dtype)
+            output = output * gate
+
+    return self.o_proj(output)
+
+
+def _qk_rope_spec_for(attention: Any) -> "Any | None":
+    """Build the fused-kernel spec from a layer's own rope module.
+
+    Returns None for any rope this install does not recognize EXACTLY; those
+    layers keep the stock path via the per-call eligibility check.
+    """
+
+    import mlx.nn as mlx_nn
+    from mlx_lm.models.rope_utils import YarnRoPE
+
+    from ..kernels.laguna_decode import QkRopeSpec
+
+    rope = attention.rope
+    head_dim = int(attention.head_dim)
+    if isinstance(rope, YarnRoPE):
+        if rope.traditional:
+            return None
+        freqs = rope._freqs
+        if freqs.dtype != mx.float32:
+            return None
+        return QkRopeSpec(
+            n_q_heads=int(attention.n_heads),
+            n_kv_heads=int(attention.n_kv_heads),
+            head_dim=head_dim,
+            rot_dims=int(rope.dims),
+            freqs=freqs,
+            base_log2=None,
+            mscale=float(rope.mscale) if rope.mscale != 1.0 else None,
+        )
+    if isinstance(rope, mlx_nn.RoPE):
+        # nn.RoPE computes inv_freq from the base; the host passes log2(base).
+        if rope.traditional or float(rope.scale) != 1.0:
+            return None
+        import math
+
+        return QkRopeSpec(
+            n_q_heads=int(attention.n_heads),
+            n_kv_heads=int(attention.n_kv_heads),
+            head_dim=head_dim,
+            rot_dims=int(rope.dims),
+            freqs=None,
+            base_log2=float(math.log2(float(rope.base))),
+            mscale=None,
+        )
+    return None
+
+
+def install_kernel_qk_rope(model: Any) -> dict[str, Any]:
+    from .laguna import Attention
+
+    global _STOCK_ATTENTION_CALL
+    if _STOCK_ATTENTION_CALL is None:
+        _STOCK_ATTENTION_CALL = Attention.__call__
+
+    inner = getattr(model, "model", model)
+    covered = 0
+    skipped = 0
+    for layer in inner.layers:
+        attention = layer.self_attn
+        spec = _qk_rope_spec_for(attention)
+        attention._qk_rope_spec = spec
+        if spec is not None and spec.head_dim == 128 and spec.rot_dims in (64, 128):
+            covered += 1
+        else:
+            skipped += 1
+
+    Attention.__call__ = _kernel_attention_call
+    return {
+        "path": "kernel_qk_rope",
+        "layers_covered": covered,
+        "layers_skipped": skipped,
+    }
+
+
+def install_kernel_moe_combine(model: Any) -> dict[str, Any]:
+    from . import laguna
+    from ..kernels.laguna_decode import fused_moe_combine
+
+    laguna.MOE_COMBINE_IMPL = fused_moe_combine
+    inner = getattr(model, "model", model)
+    count = sum(
+        1 for layer in inner.layers if hasattr(layer.mlp, "switch_mlp")
+    )
+    return {"path": "kernel_moe_combine", "layers_affected": count}
+
+
+# ---------------------------------------------------------------------------
 def install_from_env(model: Any) -> list[dict[str, Any]]:
     """Install whichever fused paths the environment asks for."""
 
@@ -424,4 +693,10 @@ def install_from_env(model: Any) -> list[dict[str, Any]]:
         report.append(install_kernel_attention_gate(model))
     if _enabled(ENV_FUSED_RESIDUAL_NORM):
         report.append(install_fused_residual_norm(model))
+    if _enabled(ENV_KERNEL_QK_ROPE):
+        report.append(install_kernel_qk_rope(model))
+    if _enabled(ENV_KERNEL_COMBINE):
+        report.append(install_kernel_moe_combine(model))
+    if _enabled(ENV_FUSED_SHARED_GATE_UP):
+        report.append(install_fused_shared_gate_up(model))
     return report

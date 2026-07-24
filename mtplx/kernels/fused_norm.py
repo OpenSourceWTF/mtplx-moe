@@ -111,18 +111,114 @@ def _add_rmsnorm_kernel(dtype: mx.Dtype):
     )
 
 
+@lru_cache(maxsize=None)
+def _add_rmsnorm_exact_kernel(dtype: mx.Dtype, axis: int):
+    """Single-pass add+RMSNorm for rows an entire threadgroup covers at once.
+
+    The looped kernel above was tuned for a 5120-wide row; at Laguna's 3072 it
+    ran a fixed 1024-wide threadgroup (25% idle lanes) and read x and residual
+    TWICE — once for the statistic, once for the writeback — and measured 1.7%
+    SLOWER than the stock pair.  This variant sizes the threadgroup so
+    ``threads * N_READS == axis`` (768 lanes at 3072), keeps the summed values
+    in registers, and writes both outputs without re-reading.
+
+    Accumulation layout matches MLX's own rms_single_row for the same axis:
+    lane i squares its four consecutive elements in float, one simd_sum per
+    simdgroup, partials combined through shared memory by simdgroup 0, and
+    precise::rsqrt(acc / axis + eps).
+    """
+
+    header = f"""
+        using namespace metal;
+
+        constant constexpr int SIMD_SIZE = 32;
+        constant constexpr int N_READS = 4;
+        constant constexpr int AXIS = {axis};
+    """
+
+    source = """
+        uint row = threadgroup_position_in_grid.x;
+        uint lid = thread_position_in_threadgroup.x;
+        uint simd_lane_id = thread_index_in_simdgroup;
+        uint simd_group_id = simdgroup_index_in_threadgroup;
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[SIMD_SIZE];
+
+        size_t row_offset = size_t(row) * size_t(AXIS);
+        uint base = lid * N_READS;
+
+        T h_vals[N_READS];
+        float acc = 0.0f;
+        for (int i = 0; i < N_READS; ++i) {
+          T h_val = x[row_offset + base + i] + residual[row_offset + base + i];
+          h_vals[i] = h_val;
+          float f = static_cast<float>(h_val);
+          acc += f * f;
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group_id == 0) {
+          local_sums[simd_lane_id] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_lane_id == 0) {
+          local_sums[simd_group_id] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group_id == 0) {
+          acc = simd_sum(local_sums[simd_lane_id]);
+          if (simd_lane_id == 0) {
+            local_inv_mean[0] = metal::precise::rsqrt(acc / float(AXIS) + eps);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv = local_inv_mean[0];
+        for (int i = 0; i < N_READS; ++i) {
+          uint idx = base + uint(i);
+          T h_val = h_vals[i];
+          h[row_offset + idx] = h_val;
+          normed[row_offset + idx] =
+            weight[idx] * static_cast<T>(float(h_val) * inv);
+        }
+    """
+    dtype_tag = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    return mx.fast.metal_kernel(
+        name=f"mtplx_add_rmsnorm_exact_{dtype_tag}_{axis}",
+        input_names=["x", "residual", "weight", "eps"],
+        output_names=["h", "normed"],
+        header=header,
+        source=source,
+    )
+
+
+def _exact_fit_threads(axis: int) -> int | None:
+    """Threadgroup size covering the whole row in one pass, or None."""
+
+    if axis <= 0 or axis % (32 * 4) != 0:
+        return None
+    threads = axis // 4
+    return threads if threads <= 1024 else None
+
+
 def fused_add_rmsnorm(
     x: mx.array,
     residual: mx.array,
     weight: mx.array,
     eps: float,
     *,
-    threadgroup_size: int = 1024,
+    threadgroup_size: int | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Return ``(x + residual, rms_norm(x + residual, weight, eps))``.
 
     Unsupported shapes fall back to stock MLX operations so callers can use the
     helper behind an environment switch without changing correctness behavior.
+    With no explicit ``threadgroup_size``, rows that a threadgroup covers in a
+    single pass take the register-resident exact-fit kernel; everything else
+    keeps the original looped kernel at 1024 lanes.
     """
     if not is_fused_add_rmsnorm_eligible(x, residual, weight):
         h = x + residual
@@ -135,12 +231,29 @@ def fused_add_rmsnorm(
         rows *= int(dim)
     x2 = x.reshape(rows, axis)
     residual2 = residual.reshape(rows, axis)
+
+    exact_threads = (
+        _exact_fit_threads(axis) if threadgroup_size is None else None
+    )
+    if exact_threads is not None:
+        kernel = _add_rmsnorm_exact_kernel(x.dtype, axis)
+        h, normed = kernel(
+            inputs=[x2, residual2, weight, float(eps)],
+            template=[("T", x.dtype)],
+            grid=(exact_threads * rows, 1, 1),
+            threadgroup=(exact_threads, 1, 1),
+            output_shapes=[(rows, axis), (rows, axis)],
+            output_dtypes=[x.dtype, x.dtype],
+        )
+        return h.reshape(*leading, axis), normed.reshape(*leading, axis)
+
+    threads = 1024 if threadgroup_size is None else int(threadgroup_size)
     kernel = _add_rmsnorm_kernel(x.dtype)
     h, normed = kernel(
         inputs=[x2, residual2, weight, float(eps), axis],
         template=[("T", x.dtype)],
-        grid=(int(threadgroup_size) * rows, 1, 1),
-        threadgroup=(int(threadgroup_size), 1, 1),
+        grid=(threads * rows, 1, 1),
+        threadgroup=(threads, 1, 1),
         output_shapes=[(rows, axis), (rows, axis)],
         output_dtypes=[x.dtype, x.dtype],
     )

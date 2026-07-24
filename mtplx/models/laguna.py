@@ -193,6 +193,22 @@ def _stock_per_head_gate(
 PER_HEAD_GATE_IMPL = _stock_per_head_gate
 
 
+def _stock_moe_combine(
+    expert_out: mx.array, weights: mx.array, shared: mx.array
+) -> mx.array:
+    """Weighted sum of the routed expert outputs plus the shared expert."""
+
+    combined = (
+        expert_out * weights.astype(expert_out.dtype)[..., None]
+    ).sum(axis=-2)
+    return combined + shared
+
+
+# Swapped by `laguna_fused.install_kernel_moe_combine`; the stock callable is
+# the shipped behaviour and stays the default.
+MOE_COMBINE_IMPL = _stock_moe_combine
+
+
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
@@ -340,8 +356,9 @@ class LagunaSparseMoeBlock(nn.Module):
         weights = (weights * self.routed_scaling_factor).astype(x.dtype)
 
         output = self.switch_mlp(flattened, indices)
-        output = (output * weights[..., None]).sum(axis=-2)
-        output = output + self.shared_expert(flattened)
+        output = MOE_COMBINE_IMPL(
+            output, weights, self.shared_expert(flattened)
+        )
         return output.reshape(batch, length, hidden)
 
 
