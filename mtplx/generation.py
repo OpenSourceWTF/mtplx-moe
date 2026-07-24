@@ -66,6 +66,7 @@ from .sampling import (
     sample_from_distribution,
 )
 from .session_bank import _boundary_true_restore_enabled
+from .runtime_options import block_prefix_restore_enabled, env_bool
 
 Mode = Literal["ar", "mtp1", "mtpk", "mtpa"]
 VerifyStrategy = Literal[
@@ -183,6 +184,18 @@ def _env_falsey(name: str) -> bool:
         "no",
         "off",
     }
+
+
+def _skip_verify_snapshot() -> bool:
+    """The single parse of ``MTPLX_SKIP_VERIFY_SNAPSHOT`` (default OFF).
+
+    The serve fast path force-sets this to "1"; whether that is safe is
+    decided by the verify strategy, and the server now answers that from an
+    explicit list of strategies known to survive without the snapshot
+    rather than from a two-element list of the ones that need it.
+    """
+
+    return env_bool("MTPLX_SKIP_VERIFY_SNAPSHOT", default=False)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -644,12 +657,13 @@ def _sustained_prefill_layout() -> str:
     )
     if layout != "auto":
         return layout
-    kv_quant = (
-        os.environ.get("MTPLX_VLLM_METAL_PAGED_KV_QUANT")
-        or os.environ.get("MTPLX_PAGED_KV_QUANT")
-        or ""
-    ).strip().lower().replace("-", "_")
-    if kv_quant in {"q8", "q8_0", "int8", "q4", "q4_0", "int4"}:
+    # Canonicalize through the one parser: a raw membership test here missed
+    # documented spellings ("8", "8bit", "uint8") that the rest of the stack
+    # honours as q8, and silently picked the dense-decode layout for a
+    # quantized cache.
+    from .kv_quant import paged_kv_quant_mode_from_env
+
+    if paged_kv_quant_mode_from_env() != "off":
         return "contiguous_then_repage"
     context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
     dense_max = _env_int("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", 131072)
@@ -1261,7 +1275,7 @@ class _DecodeTrace:
             "lazy_mtp_history_append": _env_truthy("MTPLX_LAZY_MTP_HISTORY_APPEND"),
             "batch_target_arrays": _batch_target_arrays_enabled(),
             "drop_events": _env_truthy("MTPLX_DROP_EVENTS"),
-            "skip_verify_snapshot": _env_truthy("MTPLX_SKIP_VERIFY_SNAPSHOT"),
+            "skip_verify_snapshot": _skip_verify_snapshot(),
             "mtp_history_materialize_every": int(mtp_history_materialize_every),
             "mtp_history_materialize_events": int(mtp_history_materialize_events),
             "clear_cache_every": int(_clear_cache_every()),
@@ -2295,13 +2309,8 @@ def _restore_near_prefix_prompt_state(
         return None
     max_gap = max(0, _env_int("MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP", 8))
     min_match = max(1, _env_int("MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS", 64))
-    block_prefix_raw = os.environ.get("MTPLX_SESSION_BLOCK_PREFIX_RESTORE")
     block_prefix_enabled = (
-        (
-            True
-            if block_prefix_raw is None
-            else not _env_falsey("MTPLX_SESSION_BLOCK_PREFIX_RESTORE")
-        )
+        block_prefix_restore_enabled()
         if allow_block_prefix is None
         else bool(allow_block_prefix)
     )
@@ -7479,7 +7488,7 @@ def generate_mtpk(
                     break
 
         before_verify = None
-        if _env_truthy("MTPLX_SKIP_VERIFY_SNAPSHOT"):
+        if _skip_verify_snapshot():
             event["snapshot"] = "skipped_capture_commit_required"
         else:
             started = time.perf_counter()

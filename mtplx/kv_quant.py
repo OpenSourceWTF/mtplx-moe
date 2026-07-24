@@ -40,23 +40,30 @@ def env_enabled(name: str, *, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def config_from_env() -> PagedKVQuantConfig | None:
+def paged_kv_quant_mode_from_env() -> str:
+    """The single parse of the paged-KV-quant env pair, canonicalized.
+
+    Returns one of ``off``/``q8``/``q4``. Every reader goes through
+    :func:`~mtplx.runtime_options.normalize_paged_kv_quantization`, so
+    spellings like ``8``/``8bit``/``uint8`` cannot normalize in one reader,
+    raise in a second, and fall through to the wrong KV layout in a third.
+    """
+
+    from mtplx.runtime_options import normalize_paged_kv_quantization
+
     raw = (
         os.environ.get("MTPLX_VLLM_METAL_PAGED_KV_QUANT")
         or os.environ.get("MTPLX_PAGED_KV_QUANT")
         or ""
-    ).strip().lower().replace("-", "_")
-    if raw in {"", "0", "false", "no", "off", "none"}:
+    )
+    return str(normalize_paged_kv_quantization(raw))
+
+
+def config_from_env() -> PagedKVQuantConfig | None:
+    mode = paged_kv_quant_mode_from_env()
+    if mode == "off":
         return None
-    if raw in {"q8_0", "int8"}:
-        raw = "q8"
-    if raw in {"q4_0", "int4"}:
-        raw = "q4"
-    if raw not in {"q8", "q4"}:
-        raise ValueError(
-            f"Unsupported paged KV quantization mode {raw!r}; available=['off', 'q8', 'q4']"
-        )
-    return PagedKVQuantConfig(mode=raw)
+    return PagedKVQuantConfig(mode=mode)
 
 
 def packed_dim(head_dim: int, bits: int) -> int:

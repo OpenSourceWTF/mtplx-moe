@@ -104,6 +104,9 @@ from mtplx.profiles import (
 )
 from mtplx.runtime_options import (
     apply_paged_kv_quantization_env,
+    block_prefix_restore_enabled,
+    canonicalize_flag_tokens,
+    env_bool,
     normalize_paged_kv_quantization,
     resolve_api_key,
 )
@@ -258,7 +261,22 @@ FAST_PATH_ENV = {
     "MTPLX_DROP_EVENTS": "1",
     "MTPLX_SKIP_VERIFY_SNAPSHOT": "1",
 }
-VERIFY_SNAPSHOT_REQUIRED_STRATEGIES = {"trim_commit", "target_prefix"}
+#: Verify strategies known to be correct with ``MTPLX_SKIP_VERIFY_SNAPSHOT=1``.
+#:
+#: Stated as a safe-list rather than as the complement (which used to be the
+#: two-element ``{"trim_commit", "target_prefix"}``) so that a verify strategy
+#: added later defaults to *keeping* the snapshot — slower, but correct —
+#: instead of silently inheriting the fast path's skip.
+VERIFY_SNAPSHOT_OPTIONAL_STRATEGIES = frozenset(
+    {
+        "batched",
+        "sequential",
+        "capture",
+        "capture_commit",
+        "graphbank",
+        "graphbank_capture_commit",
+    }
+)
 STATS_FOOTER_MARKER = "\n---\n⚡ **MTPLX TPS:**"
 THINK_OPEN = "<think>"
 THINK_CLOSE = "</think>"
@@ -544,7 +562,10 @@ def _server_runtime_env_overrides(
         .lower()
         .replace("-", "_")
     )
-    if generation_mode == "mtp" and verify_strategy in VERIFY_SNAPSHOT_REQUIRED_STRATEGIES:
+    if (
+        generation_mode == "mtp"
+        and verify_strategy not in VERIFY_SNAPSHOT_OPTIONAL_STRATEGIES
+    ):
         overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
     return overrides
 
@@ -11903,10 +11924,10 @@ def _effective_ram_session_cache_settings() -> dict[str, Any]:
     entries_raw = os.environ.get("MTPLX_SESSION_BANK_MAX_ENTRIES")
     max_bytes = os.environ.get("MTPLX_SESSION_BANK_MAX_BYTES") or "8G"
     per_session_bytes = os.environ.get("MTPLX_SESSION_BANK_PER_SESSION_BYTES") or "4G"
-    block_prefix_restore = _env_bool_setting(
-        "MTPLX_SESSION_BLOCK_PREFIX_RESTORE",
-        default=True,
-    )
+    # One parse, shared with the decode loop and the cold tier: an
+    # allowlist-only read here reported "off" for spellings the runtime
+    # honours as on (e.g. "enabled").
+    block_prefix_restore = block_prefix_restore_enabled()
     try:
         entries = max(1, int(entries_raw)) if entries_raw is not None else 4
     except ValueError:
@@ -15060,9 +15081,13 @@ def _loop_guard_enabled() -> bool:
     ``MTPLX_LOOP_GUARD=1``, but the product answer to the quantized-model
     loop marathons is the artifact lane (delta-net-sensitive quantization),
     not a sampler intervention. Config knobs live in mtplx/loop_guard.py.
+
+    Parsed by loop_guard.py's own reader so this answer cannot disagree
+    with the guard the decode loop actually builds.
     """
-    raw = os.environ.get("MTPLX_LOOP_GUARD", "0").strip().lower()
-    return raw not in _UNCAPPED_RESPONSE_LEASE_DISABLED_VALUES
+    from mtplx.loop_guard import loop_guard_enabled_from_env
+
+    return loop_guard_enabled_from_env(default=False)
 
 
 def _fresh_seed() -> int:
@@ -25289,8 +25314,11 @@ def _apply_backend_server_defaults(
     if not _server_flag_present(explicit_flags, "draft-top-k"):
         args.draft_top_k = int(sampler["top_k"])
     if (
+        # `and`, not `or`: the flag's own default *is* LOCAL, so an `or` on
+        # the value fired regardless of provenance and rewrote an explicitly
+        # typed `--chat-template-profile local_qwen36` to `tokenizer`.
         not _server_flag_present(explicit_flags, "chat-template-profile")
-        or getattr(args, "chat_template_profile", None) == _CHAT_TEMPLATE_PROFILE_LOCAL
+        and getattr(args, "chat_template_profile", None) == _CHAT_TEMPLATE_PROFILE_LOCAL
     ):
         args.chat_template_profile = _CHAT_TEMPLATE_PROFILE_TOKENIZER
     if not _server_flag_present(
@@ -25466,9 +25494,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--kv-quant",
         dest="paged_kv_quantization",
         metavar="{off,q8,q4}",
-        default=os.environ.get("MTPLX_VLLM_METAL_PAGED_KV_QUANT")
-        or os.environ.get("MTPLX_PAGED_KV_QUANT")
-        or "off",
+        # Canonical, not raw: the runtime readers only understand
+        # off/q8/q4, so an env-supplied "uint8" must arrive here as "q8".
+        default=_effective_paged_kv_quantization(),
         help="Paged KV cache quantization mode: off, q8, or q4.",
     )
     parser.add_argument(
@@ -25888,7 +25916,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(raw_args)
     args._raw_args = list(raw_args)
-    args._cli_flags = _explicit_server_flags(raw_args)
+    args._cli_flags = canonicalize_flag_tokens(
+        _explicit_server_flags(raw_args), parser, args
+    )
     try:
         resolved_key = resolve_api_key(
             explicit_api_key=getattr(args, "api_key", None),

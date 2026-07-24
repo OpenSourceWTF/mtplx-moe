@@ -22,7 +22,7 @@ from .profiles import (
     list_profiles,
     resolve_profile_name,
 )
-from .runtime_options import normalize_paged_kv_quantization
+from .runtime_options import canonicalize_flag_tokens, normalize_paged_kv_quantization
 from .version import DISPLAY_VERSION, __version__
 
 # Help/usage advertises only the canonical profiles; the parser itself
@@ -1845,7 +1845,9 @@ class _FlagRecordingArgumentParser(argparse.ArgumentParser):
         raw = list(sys.argv[1:]) if args is None else list(args)
         parsed = super().parse_args(raw, namespace)
         if not hasattr(parsed, "_cli_flags"):
-            parsed._cli_flags = _explicit_cli_flags(raw)
+            parsed._cli_flags = canonicalize_flag_tokens(
+                _explicit_cli_flags(raw), self, parsed
+            )
         return parsed
 
 
@@ -3825,7 +3827,9 @@ def main(argv: list[str] | None = None) -> int:
     if raw_args[0] not in command_names and not raw_args[0].startswith("-"):
         return _print_unknown_command(raw_args[0])
     args = parser.parse_args(raw_args)
-    args._cli_flags = _explicit_cli_flags(raw_args)
+    args._cli_flags = canonicalize_flag_tokens(
+        _explicit_cli_flags(raw_args), parser, args
+    )
     from .config import apply_user_config
 
     apply_user_config(args)

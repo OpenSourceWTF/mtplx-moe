@@ -29,6 +29,7 @@ from .cache_state import (
     snapshot_cache_lazy_hybrid,
 )
 from .runtime import MTPLXRuntime
+from .runtime_options import block_prefix_restore_enabled
 
 
 def _lazy_snapshot_enabled() -> bool:
@@ -879,8 +880,7 @@ class SessionBank:
             return None
         if model_path is None or mtp_enabled is None:
             return None
-        raw_enabled = os.environ.get("MTPLX_SESSION_BLOCK_PREFIX_RESTORE")
-        if raw_enabled is None or str(raw_enabled).strip().lower() in {"0", "false", "no", "off"}:
+        if not block_prefix_restore_enabled():
             return None
         lookup = getattr(self.cold_tier, "lookup_prefix_boundary", None)
         if not callable(lookup):

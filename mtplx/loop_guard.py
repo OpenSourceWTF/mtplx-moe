@@ -55,6 +55,8 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from .runtime_options import env_bool
+
 __all__ = [
     "LoopGuard",
     "LoopGuardConfig",
@@ -154,6 +156,19 @@ def tool_call_marker_ids(tokenizer: Any) -> tuple[int, int] | None:
     return open_id, close_id
 
 
+def loop_guard_enabled_from_env(*, default: bool) -> bool:
+    """The single parse of ``MTPLX_LOOP_GUARD``.
+
+    ``default`` is the caller's product default (OFF on the serve path);
+    the env var overrides in either direction. The server used to answer
+    this question with a *lease-token* vocabulary that counted "none" and
+    "unlimited" as off, so ``MTPLX_LOOP_GUARD=unlimited`` made the server
+    report the guard disabled while this module built it enabled.
+    """
+
+    return env_bool("MTPLX_LOOP_GUARD", default=default)
+
+
 def loop_guard_config_from_env(
     enabled: bool,
     *,
@@ -166,9 +181,7 @@ def loop_guard_config_from_env(
     ``tokenizer`` (when provided) resolves the tool-call marker tokens for
     span masking; ``MTPLX_LOOP_GUARD_MASK_TOOL_CALLS=0`` turns masking off.
     """
-    raw = os.environ.get("MTPLX_LOOP_GUARD")
-    if raw is not None and raw.strip() != "":
-        enabled = raw.strip().lower() not in {"0", "false", "off", "no"}
+    enabled = loop_guard_enabled_from_env(default=enabled)
     if not enabled:
         return LoopGuardConfig(enabled=False)
     markers: tuple[int, int] | None = None
