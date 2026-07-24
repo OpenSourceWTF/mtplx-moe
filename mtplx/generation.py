@@ -1352,6 +1352,41 @@ class _DecodeTrace:
         }
 
 
+_AR_FORWARD_PROFILE: Any = None
+
+
+def _ar_forward_profiler(step: int) -> Any:
+    """Diagnostic lane: MTPLX_AR_PROFILE_TOKENS=N cProfiles decode forwards
+    for steps [8, 8+N) and dumps pstats to MTPLX_AR_PROFILE_PATH at the
+    last profiled step. Off (None) unless the env is set; throughput
+    measured with this enabled is not promotion evidence."""
+
+    global _AR_FORWARD_PROFILE
+    raw = os.environ.get("MTPLX_AR_PROFILE_TOKENS")
+    if not raw:
+        return None
+    try:
+        budget = int(raw)
+    except ValueError:
+        return None
+    first, last = 8, 8 + budget
+    if not first <= step < last:
+        if step == last and _AR_FORWARD_PROFILE is not None:
+            import pstats
+
+            path = os.environ.get(
+                "MTPLX_AR_PROFILE_PATH", "/tmp/mtplx-ar-forward.pstats"
+            )
+            pstats.Stats(_AR_FORWARD_PROFILE).dump_stats(path)
+            _AR_FORWARD_PROFILE = None
+        return None
+    if _AR_FORWARD_PROFILE is None:
+        import cProfile
+
+        _AR_FORWARD_PROFILE = cProfile.Profile()
+    return _AR_FORWARD_PROFILE
+
+
 def _batch_target_distributions_enabled() -> bool:
     return os.environ.get("MTPLX_BATCH_TARGET_DISTS", "").lower() in {
         "1",
@@ -4706,12 +4741,17 @@ def generate_ar(
             break
 
         started = time.perf_counter()
+        profiler = _ar_forward_profiler(step)
         with attention_phase("ar_decode"):
+            if profiler is not None:
+                profiler.enable()
             result_next = rt.forward_ar(
                 mx.array([[token]]),
                 cache=cache,
                 return_hidden=ar_return_hidden,
             )
+            if profiler is not None:
+                profiler.disable()
         if ar_return_hidden:
             logits_next, hidden_next = result_next
         else:
