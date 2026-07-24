@@ -1,0 +1,90 @@
+{
+  "schema": 1,
+  "profiles": [
+    {
+      "name": "hy3-oq2e-64",
+      "model_key": "hy3-expert-oq2e",
+      "process_ceiling_bytes": 76235669504,
+      "weight_envelope_bytes": 68719476736,
+      "generation_mode": "ar",
+      "evidence_commit": "14c8b57fff358bee3da2d10968a855b955b86847",
+      "evidence_receipts": [
+        "evals/tier2/t3_64x16k_armB_frequency.json",
+        "research/envelope-admission-sweep-2026-07-22.json"
+      ],
+      "config": {
+        "memory_limit_bytes": 76235669504,
+        "runtime_reserve_bytes": 7516192768,
+        "expert_cache_limit_bytes": 53678702592,
+        "max_live_kv_tokens": 4096,
+        "cache_policy": "frequency",
+        "cache_scope": "layer",
+        "slot_layout": "component-banks",
+        "hy3_router_kernel": "mpp-fp32-splitk-r1-fused-r2",
+        "proj_requant": "q4",
+        "split_route_release": "deferred",
+        "deferred_pin_release": true,
+        "verify_record_hashes": false,
+        "verify_sidecar_hash_at_open": false
+      },
+      "child_env": {
+        "MTPLX_SUSTAINED_PREFILL": "1",
+        "MTPLX_HY3_SUBMIT_CADENCE": "8"
+      }
+    },
+    {
+      "name": "hy3-oq2e-88",
+      "model_key": "hy3-expert-oq2e",
+      "process_ceiling_bytes": 102005473280,
+      "weight_envelope_bytes": 94489280512,
+      "generation_mode": "ar",
+      "evidence_commit": "191ed9aa362e645f48f1a105a6ec024ea4fd5cf4",
+      "evidence_receipts": ["evals/tier2/NOTES.md"],
+      "config": {
+        "memory_limit_bytes": 102005473280,
+        "runtime_reserve_bytes": 7516192768,
+        "expert_cache_limit_bytes": 2147483648,
+        "max_live_kv_tokens": 4096,
+        "cache_policy": "frequency",
+        "cache_scope": "layer",
+        "slot_layout": "component-banks",
+        "island_layer_count": 74,
+        "hy3_router_kernel": "mpp-fp32-splitk-r1-fused-r2",
+        "split_route_release": "deferred",
+        "deferred_pin_release": true,
+        "verify_record_hashes": false,
+        "verify_sidecar_hash_at_open": false
+      },
+      "child_env": {
+        "MTPLX_SUSTAINED_PREFILL": "1",
+        "MTPLX_HY3_SUBMIT_CADENCE": "8"
+      }
+    },
+    {
+      "name": "hy3-oq2e-96",
+      "model_key": "hy3-expert-oq2e",
+      "process_ceiling_bytes": 110595407872,
+      "weight_envelope_bytes": 103079215104,
+      "generation_mode": "ar",
+      "evidence_commit": "191ed9aa362e645f48f1a105a6ec024ea4fd5cf4",
+      "evidence_receipts": ["evals/tier2/NOTES.md"],
+      "config": {
+        "memory_limit_bytes": 110595407872,
+        "runtime_reserve_bytes": 7516192768,
+        "expert_cache_limit_bytes": 2147483648,
+        "max_live_kv_tokens": 4096,
+        "cache_policy": "frequency",
+        "cache_scope": "layer",
+        "slot_layout": "component-banks",
+        "island_layer_count": 79,
+        "hy3_router_kernel": "mpp-fp32-splitk-r1-fused-r2",
+        "verify_record_hashes": false,
+        "verify_sidecar_hash_at_open": false
+      },
+      "child_env": {
+        "MTPLX_SUSTAINED_PREFILL": "1",
+        "MTPLX_HY3_SUBMIT_CADENCE": "8"
+      }
+    }
+  ]
+}

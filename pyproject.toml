@@ -82,7 +82,7 @@ mtplx-tune = "mtplx.cli:main_tune"
 include = ["mtplx*", "vllm_metal*"]
 
 [tool.setuptools.package-data]
-mtplx = ["templates/**/*.jinja", "native/*.cpp"]
+mtplx = ["templates/**/*.jinja", "native/*.cpp", "data/*.json"]
 "mtplx.benchmarks" = ["prompts/*.jsonl"]
 "mtplx.dashboard" = ["_static/**/*"]
 "vllm_metal.metal" = [
