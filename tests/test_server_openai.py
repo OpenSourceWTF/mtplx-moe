@@ -11004,3 +11004,68 @@ def test_parallel_tool_calls_false_streaming_android_studio_shape(monkeypatch):
     assert "pwd" not in arguments
     assert final[-1]["choices"][0]["finish_reason"] == "tool_calls"
     assert final[-1]["mtplx_stats"]["tool_calls_emitted"] == 1
+
+
+def test_run_generation_passes_draft_core_from_serve_args(monkeypatch):
+    state = _fake_streaming_session_state()
+    state.draft_sampler = None
+    state.requests_completed = 0
+    state.args.draft_core = "device"
+    captured: dict[str, object] = {}
+
+    def fake_generate_mtpk(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            tokens=[],
+            text="",
+            stats=SimpleNamespace(
+                to_dict=lambda: {
+                    "prompt_eval_time_s": 0.0,
+                    "generated_tokens": 0,
+                    "elapsed_s": 0.0,
+                    "tok_s": 0.0,
+                }
+            ),
+            final_state=None,
+        )
+
+    monkeypatch.setattr(openai, "generate_mtpk", fake_generate_mtpk)
+
+    openai._run_generation(
+        state,
+        [1, 2, 3],
+        max_tokens=1,
+        temperature=None,
+        top_p=None,
+        top_k=None,
+        seed=None,
+        generation_mode="mtp",
+        depth=1,
+        session_id="sess-draft-core",
+        session_bank=state.sessions.bank,
+        session_template_hash=state.template_hash,
+        session_draft_head_identity=state.draft_head_identity,
+        session_policy_fingerprint="policy",
+    )
+    assert captured["draft_core"] == "device"
+
+    # serve args without the attribute (older callers) fall back to stock
+    del state.args.draft_core
+    captured.clear()
+    openai._run_generation(
+        state,
+        [1, 2, 3],
+        max_tokens=1,
+        temperature=None,
+        top_p=None,
+        top_k=None,
+        seed=None,
+        generation_mode="mtp",
+        depth=1,
+        session_id="sess-draft-core-2",
+        session_bank=state.sessions.bank,
+        session_template_hash=state.template_hash,
+        session_draft_head_identity=state.draft_head_identity,
+        session_policy_fingerprint="policy",
+    )
+    assert captured["draft_core"] == "stock"

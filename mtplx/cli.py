@@ -2611,6 +2611,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="linear-gdn-from-conv-tape",
         help="Server verification core.",
     )
+    serve_p.add_argument(
+        "--draft-core",
+        choices=["stock", "device-d2", "device"],
+        default="stock",
+        help=(
+            "Server DraftCore backend. 'device' keeps the whole draft chain "
+            "on device with a single sync per cycle."
+        ),
+    )
     serve_p.add_argument("--mtp-adapter", type=Path)
     serve_p.add_argument(
         "--merge-mtp-adapter",

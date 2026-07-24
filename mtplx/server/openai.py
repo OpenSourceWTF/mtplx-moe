@@ -15795,6 +15795,9 @@ def _run_generation(
                         mtp_history_policy="committed",
                         verify_strategy=state.args.verify_strategy,
                         verify_core=state.args.verify_core,
+                        draft_core=str(
+                            getattr(state.args, "draft_core", None) or "stock"
+                        ),
                         token_callback=record_tokens,
                         session_bank=session_bank,
                         session_id=session_id,

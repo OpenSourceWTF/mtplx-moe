@@ -7422,3 +7422,13 @@ def test_qwen36_35b_a3b_defaults_to_measured_best_depth():
     sustained = public.get_profile("sustained")
 
     assert public._model_contract_depth(inspection, profile=sustained, fallback=3) == 2
+
+
+def test_serve_parser_accepts_draft_core():
+    from mtplx.cli import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["serve", "--model", "m", "--draft-core", "device"])
+    assert args.draft_core == "device"
+    default = parser.parse_args(["serve", "--model", "m"])
+    assert default.draft_core == "stock"
