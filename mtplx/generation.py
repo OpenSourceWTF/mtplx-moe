@@ -982,8 +982,14 @@ class _DecodeTrace:
             self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def _delta(self, totals: dict[str, Any], key: str) -> Any:
-        value = totals[key]
-        previous = self.last_totals[key]
+        # Lanes maintain different counter sets (AR omits MTP-only keys);
+        # a counter absent on either side is a zero delta, not an error.
+        value = totals.get(key)
+        previous = self.last_totals.get(key)
+        if value is None:
+            value = previous if previous is not None else 0
+        if previous is None:
+            previous = [0.0] * len(value) if isinstance(value, list) else 0
         if isinstance(value, list):
             return [(float(item) - float(prev)) for item, prev in zip(value, previous)]
         return value - previous
