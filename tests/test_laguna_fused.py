@@ -90,6 +90,7 @@ def toy_model():
         laguna.Attention.__call__ = stock_attention
         laguna.PER_HEAD_GATE_IMPL = laguna._stock_per_head_gate
         laguna.MOE_COMBINE_IMPL = laguna._stock_moe_combine
+        laguna_fused.reset_cached_gather_indices()
         mx.set_default_device(previous)
 
 
@@ -132,6 +133,7 @@ def _last_logits(model, prompts):
         (laguna_fused.install_kernel_attention_gate, False),
         (laguna_fused.install_kernel_qk_rope, True),
         (laguna_fused.install_kernel_moe_combine, True),
+        (laguna_fused.install_cached_gather_indices, True),
     ],
 )
 def test_fused_path_preserves_greedy_output(toy_model, installer, bit_exact):
@@ -278,6 +280,35 @@ def test_fused_shared_gate_up_is_bit_exact_when_quantized(toy_model):
     assert _greedy(toy_model, PROMPTS, 5) == reference_tokens
     delta = float(mx.abs(_last_logits(toy_model, PROMPTS) - reference_logits).max())
     assert delta == 0.0, f"shared gate/up fusion was not bit-exact: {delta:.3e}"
+
+
+def test_cached_lhs_indices_is_bit_exact_when_quantized(toy_model):
+    """The cached lhs_indices must reproduce MLX's default arange exactly.
+
+    Covers the QuantizedSwitchLinear path the real checkpoint runs, on top of
+    the gate/up-fused expert bank, at both sort settings.
+    """
+
+    nn.quantize(toy_model, group_size=32, bits=4)
+    mx.eval(toy_model.parameters())
+    laguna_fused.install_fused_gate_up(toy_model)
+
+    reference_tokens = _greedy(toy_model, PROMPTS, 5)
+    reference_logits = _last_logits(toy_model, PROMPTS)
+
+    laguna_fused.install_cached_gather_indices(toy_model)
+    for sort_decision in (False, True):
+        laguna_fused.SORT_DECISION = sort_decision
+        try:
+            assert _greedy(toy_model, PROMPTS, 5) == reference_tokens
+            delta = float(
+                mx.abs(_last_logits(toy_model, PROMPTS) - reference_logits).max()
+            )
+            assert delta == 0.0, (
+                f"cached lhs (sort={sort_decision}) not bit-exact: {delta:.3e}"
+            )
+        finally:
+            laguna_fused.SORT_DECISION = None
 
 
 def test_fused_gate_up_is_idempotent(toy_model):

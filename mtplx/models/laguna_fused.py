@@ -48,6 +48,7 @@ ENV_FUSED_RESIDUAL_NORM = "MTPLX_LAGUNA_FUSED_RESIDUAL_NORM"
 ENV_KERNEL_QK_ROPE = "MTPLX_LAGUNA_KERNEL_QK_ROPE"
 ENV_KERNEL_COMBINE = "MTPLX_LAGUNA_KERNEL_COMBINE"
 ENV_FUSED_SHARED_GATE_UP = "MTPLX_LAGUNA_FUSED_SHARED_GATE_UP"
+ENV_CACHED_LHS = "MTPLX_LAGUNA_CACHED_LHS"
 
 # The pristine Attention.__call__, captured on first install so the fused
 # variant can delegate any shape it does not cover and benches can restore it.
@@ -111,12 +112,18 @@ class FusedGateUpSwitchGLU(nn.Module):
         self.activation = switch_glu.activation
 
     def _gate_up(self, x: mx.array, indices: mx.array, sorted_indices: bool):
+        lhs_indices = (
+            cached_lhs_indices(tuple(x.shape[:-2]))
+            if _CACHED_LHS_ACTIVE
+            else None
+        )
         if self.quantized:
             return mx.gather_qmm(
                 x,
                 self["gate_up_weight"],
                 self["gate_up_scales"],
                 self.get("gate_up_biases"),
+                lhs_indices=lhs_indices,
                 rhs_indices=indices,
                 transpose=True,
                 group_size=self.group_size,
@@ -127,6 +134,7 @@ class FusedGateUpSwitchGLU(nn.Module):
         return mx.gather_mm(
             x,
             self["gate_up_weight"].swapaxes(-1, -2),
+            lhs_indices=lhs_indices,
             rhs_indices=indices,
             sorted_indices=sorted_indices,
         )
@@ -152,6 +160,114 @@ class FusedGateUpSwitchGLU(nn.Module):
         if do_sort:
             x = sl._scatter_unsort(x, inv_order, indices.shape)
         return x.squeeze(-2)
+
+
+# ---------------------------------------------------------------------------
+# cached gather lhs_indices
+# ---------------------------------------------------------------------------
+#
+# When gather_qmm/gather_mm get no lhs_indices, MLX builds
+# `arange(prod(x.shape[:-2])).reshape(x.shape[:-2])` as a GRAPH OP — a real
+# kernel dispatch — on every call.  Three gathers per MoE layer put 141 arange
+# launches in every decode step.  The default is a pure function of x's shape,
+# so passing a cached copy is value-identical and drops the dispatches.
+
+_LHS_CACHE: dict[tuple[int, ...], mx.array] = {}
+
+
+def cached_lhs_indices(leading_shape: tuple[int, ...]) -> mx.array:
+    cached = _LHS_CACHE.get(leading_shape)
+    if cached is None:
+        total = 1
+        for dim in leading_shape:
+            total *= int(dim)
+        cached = mx.arange(total, dtype=mx.uint32).reshape(leading_shape)
+        mx.eval(cached)
+        _LHS_CACHE[leading_shape] = cached
+    return cached
+
+
+def _patched_quantized_switch_call(self, x, indices, sorted_indices=False):
+    x = mx.gather_qmm(
+        x,
+        self["weight"],
+        self["scales"],
+        self.get("biases"),
+        lhs_indices=cached_lhs_indices(tuple(x.shape[:-2])),
+        rhs_indices=indices,
+        transpose=True,
+        group_size=self.group_size,
+        bits=self.bits,
+        mode=self.mode,
+        sorted_indices=sorted_indices,
+    )
+    if "bias" in self:
+        x = x + mx.expand_dims(self["bias"][indices], -2)
+    return x
+
+
+def _patched_switch_call(self, x, indices, sorted_indices=False):
+    x = mx.gather_mm(
+        x,
+        self["weight"].swapaxes(-1, -2),
+        lhs_indices=cached_lhs_indices(tuple(x.shape[:-2])),
+        rhs_indices=indices,
+        sorted_indices=sorted_indices,
+    )
+    if "bias" in self:
+        x = x + mx.expand_dims(self["bias"][indices], -2)
+    return x
+
+
+_STOCK_QUANTIZED_SWITCH_CALL = None
+_STOCK_SWITCH_CALL = None
+_CACHED_LHS_ACTIVE = False
+
+
+def install_cached_gather_indices(model: Any) -> dict[str, Any]:
+    """Feed every expert gather a cached lhs_indices instead of a fresh arange.
+
+    Patches the mlx-lm SwitchLinear call sites process-wide (they are the only
+    reachable expert-gather paths) with bodies identical to stock except for
+    the explicit, value-identical lhs_indices argument.
+    """
+
+    from mlx_lm.models import switch_layers as sl
+
+    global _STOCK_QUANTIZED_SWITCH_CALL, _STOCK_SWITCH_CALL, _CACHED_LHS_ACTIVE
+    if _STOCK_QUANTIZED_SWITCH_CALL is None:
+        _STOCK_QUANTIZED_SWITCH_CALL = sl.QuantizedSwitchLinear.__call__
+        _STOCK_SWITCH_CALL = sl.SwitchLinear.__call__
+    sl.QuantizedSwitchLinear.__call__ = _patched_quantized_switch_call
+    sl.SwitchLinear.__call__ = _patched_switch_call
+    _CACHED_LHS_ACTIVE = True
+
+    inner = getattr(model, "model", model)
+    count = sum(
+        1
+        for layer in inner.layers
+        if getattr(layer.mlp, "switch_mlp", None) is not None
+    )
+    return {"path": "cached_lhs_indices", "moe_layers": count}
+
+
+def reset_cached_gather_indices() -> None:
+    from mlx_lm.models import switch_layers as sl
+
+    global _CACHED_LHS_ACTIVE
+    _CACHED_LHS_ACTIVE = False
+    if _STOCK_QUANTIZED_SWITCH_CALL is not None:
+        sl.QuantizedSwitchLinear.__call__ = _STOCK_QUANTIZED_SWITCH_CALL
+        sl.SwitchLinear.__call__ = _STOCK_SWITCH_CALL
+
+
+class _ArrayBox:
+    """Holds an mx.array where nn.Module attribute traversal cannot see it."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: mx.array) -> None:
+        self.value = value
 
 
 class FusedGateUpMLP(nn.Module):
@@ -479,9 +595,17 @@ def _kernel_moe_call(self, x: mx.array) -> mx.array:
     if self.softcap and self.softcap > 0.0:
         logits = mx.tanh(logits / self.softcap) * self.softcap
 
+    # The correction bias is a constant; the boxed float32 copy from install
+    # time saves one cast dispatch per MoE layer per step.
+    bias_box = getattr(self, "_router_bias_f32", None)
+    bias_f32 = (
+        bias_box.value
+        if bias_box is not None
+        else self.e_score_correction_bias.astype(mx.float32)
+    )
     indices, weights = fused_router_topk(
         logits,
-        self.e_score_correction_bias.astype(mx.float32),
+        bias_f32,
         self.top_k,
         normalize=bool(self.norm_topk_prob),
         scale=float(self.routed_scaling_factor),
@@ -499,9 +623,15 @@ def install_kernel_router(model: Any) -> dict[str, Any]:
 
     LagunaSparseMoeBlock.__call__ = _kernel_moe_call
     inner = getattr(model, "model", model)
-    count = sum(
-        1 for layer in inner.layers if isinstance(layer.mlp, LagunaSparseMoeBlock)
-    )
+    count = 0
+    for layer in inner.layers:
+        block = layer.mlp
+        if not isinstance(block, LagunaSparseMoeBlock):
+            continue
+        bias_f32 = block.e_score_correction_bias.astype(mx.float32)
+        mx.eval(bias_f32)
+        block._router_bias_f32 = _ArrayBox(bias_f32)
+        count += 1
     return {"path": "kernel_router", "layers_affected": count}
 
 
@@ -699,4 +829,6 @@ def install_from_env(model: Any) -> list[dict[str, Any]]:
         report.append(install_kernel_moe_combine(model))
     if _enabled(ENV_FUSED_SHARED_GATE_UP):
         report.append(install_fused_shared_gate_up(model))
+    if _enabled(ENV_CACHED_LHS):
+        report.append(install_cached_gather_indices(model))
     return report
