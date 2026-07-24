@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import mtplx.expert_cli as expert_cli
 from mtplx.expert_cli import (
     add_expert_streaming_args,
     append_expert_streaming_child_args,
@@ -27,7 +28,11 @@ from mtplx.expert_runtime import (
     ExpertStreamingConfigurationError,
     ExpertStreamingRuntime,
 )
-from mtplx.expert_streaming_models import ExpertStreamingModelSpec
+from mtplx.expert_streaming_models import (
+    ExpertStreamingModelSpec,
+    get_model_spec,
+    plan_expert_memory,
+)
 from mtplx.attention_context import attention_phase
 from mtplx.expert_streaming import RoutingPhase
 from mtplx.models.expert_mlx import current_expert_routing_phase
@@ -48,6 +53,36 @@ def _model_root(tmp_path: Path, model_type: str = "hy_v3") -> Path:
         json.dumps({"model_type": model_type}), encoding="utf-8"
     )
     (root / "expert-manifest.json").write_text("{}", encoding="utf-8")
+    return root
+
+
+def _streaming_root(
+    tmp_path: Path,
+    *,
+    model_type: str,
+    manifest_model_key: str | None = None,
+    write_manifest: bool = True,
+    name: str = "model",
+) -> Path:
+    """Minimal streaming artifact: a config.json plus a tiny manifest.
+
+    ``manifest_model_key`` writes a top-level ``model_key`` into the manifest
+    (mirroring the published streaming repos). ``None`` writes a manifest with
+    no model_key so the config.json fallback is exercised.
+    """
+
+    root = tmp_path / name
+    root.mkdir()
+    (root / "config.json").write_text(
+        json.dumps({"model_type": model_type}), encoding="utf-8"
+    )
+    if write_manifest:
+        manifest: dict[str, str] = {}
+        if manifest_model_key is not None:
+            manifest["model_key"] = manifest_model_key
+        (root / "expert-manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
     return root
 
 
@@ -298,12 +333,153 @@ def test_expert_cli_json_and_flags_are_strict_and_forwarded(tmp_path: Path) -> N
     assert "--no-expert-verify-record-hashes" in command
 
 
-def test_expert_cli_requires_memory_and_kv_limits(tmp_path: Path) -> None:
-    root = _model_root(tmp_path)
+@pytest.mark.parametrize(
+    ("model_type", "manifest_model_key"),
+    [
+        ("hy_v3", "hy3-expert-oq2e"),
+        ("glm_moe_dsa", "glm52-expert-q1t"),
+    ],
+)
+def test_manifest_model_key_wins_over_shared_config_type(
+    tmp_path: Path,
+    model_type: str,
+    manifest_model_key: str,
+) -> None:
+    # oQ2e / t158 share a config.json model_type with the production q4 bank,
+    # so the manifest's declared spec key must be authoritative when the user
+    # passes no --expert-model-key.
+    root = _streaming_root(
+        tmp_path, model_type=model_type, manifest_model_key=manifest_model_key
+    )
+    args = _parser().parse_args(
+        [
+            "--expert-streaming",
+            "--expert-memory-limit",
+            "96GiB",
+            "--expert-max-live-kv-tokens",
+            "8192",
+        ]
+    )
+
+    kwargs = expert_streaming_load_kwargs(args, root)
+
+    assert kwargs["expert_streaming_config"].model_key == manifest_model_key
+
+
+def test_manifest_without_model_key_falls_back_to_config_q4(tmp_path: Path) -> None:
+    # A manifest that declares no model_key must not upgrade the bank; the
+    # coarse config.json model_type map still picks the safe production q4 key.
+    root = _streaming_root(tmp_path, model_type="hy_v3", manifest_model_key=None)
+    args = _parser().parse_args(
+        [
+            "--expert-streaming",
+            "--expert-memory-limit",
+            "96GiB",
+            "--expert-max-live-kv-tokens",
+            "8192",
+        ]
+    )
+
+    kwargs = expert_streaming_load_kwargs(args, root)
+
+    assert kwargs["expert_streaming_config"].model_key == "hy3-q4"
+
+
+def test_explicit_model_key_overrides_manifest_model_key(tmp_path: Path) -> None:
+    root = _streaming_root(
+        tmp_path, model_type="hy_v3", manifest_model_key="hy3-expert-oq2e"
+    )
+    args = _parser().parse_args(
+        [
+            "--expert-streaming",
+            "--expert-model-key",
+            "hy3-expert-q2",
+            "--expert-memory-limit",
+            "96GiB",
+            "--expert-max-live-kv-tokens",
+            "8192",
+        ]
+    )
+
+    kwargs = expert_streaming_load_kwargs(args, root)
+
+    assert kwargs["expert_streaming_config"].model_key == "hy3-expert-q2"
+
+
+def test_memory_and_kv_limits_auto_derived_when_omitted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _streaming_root(
+        tmp_path, model_type="hy_v3", manifest_model_key="hy3-expert-oq2e"
+    )
+    monkeypatch.setattr(
+        expert_cli, "_installed_ram_bytes", lambda: 128 * 1024**3
+    )
     args = _parser().parse_args(["--expert-streaming"])
-    with pytest.raises(
-        ValueError, match="missing memory-limit-bytes, max-live-kv-tokens"
-    ):
+
+    config = expert_streaming_load_kwargs(args, root)["expert_streaming_config"]
+
+    # 75% of installed RAM, floored at 8GiB and capped at 192GiB.
+    assert config.memory_limit_bytes == 96 * 1024**3
+    # The derived KV ceiling prioritizes the expert slot bank over KV: the
+    # backward plan search is clamped to _DEFAULT_KV_TOKENS, and this fixture's
+    # config.json declares no context window (so _declared_context_window is the
+    # larger _DEFAULT_CONTEXT_CEILING). 32768 tokens still fit at a 96 GiB
+    # envelope for hy3-expert-oq2e, so the search returns _DEFAULT_KV_TOKENS.
+    assert config.max_live_kv_tokens == expert_cli._DEFAULT_KV_TOKENS
+    assert config.max_live_kv_tokens < expert_cli._DEFAULT_CONTEXT_CEILING
+    assert config.max_live_kv_tokens > 0
+
+    # Regression guard: the derived default must never starve the expert cache
+    # to a single slot per layer (the "maximize KV" failure mode). Rebuild the
+    # plan at the derived KV ceiling exactly as _derive_max_live_kv_tokens does
+    # and assert a healthy slot bank survives.
+    plan = plan_expert_memory(
+        get_model_spec(config.model_key),
+        total_limit_bytes=config.memory_limit_bytes,
+        context_tokens=config.max_live_kv_tokens,
+        runtime_reserve_bytes=config.runtime_reserve_bytes,
+        transient_slots=config.transient_slots,
+        io_staging_bytes=config.io_staging_bytes,
+        execution_workspace_bytes=config.execution_workspace_bytes,
+        kv_quant=config.kv_quant,
+        cache_scope=config.cache_scope,
+    )
+    assert plan.fits_fixed
+    assert plan.slots_per_layer > 1
+    # The README-tested streaming profile keeps well over 100 slots/layer.
+    assert plan.slots_per_layer >= 128
+
+    # Explicit flags always win over the derived defaults.
+    explicit = _parser().parse_args(
+        [
+            "--expert-streaming",
+            "--expert-memory-limit",
+            "64GiB",
+            "--expert-max-live-kv-tokens",
+            "4096",
+        ]
+    )
+    explicit_config = expert_streaming_load_kwargs(explicit, root)[
+        "expert_streaming_config"
+    ]
+    assert explicit_config.memory_limit_bytes == 64 * 1024**3
+    assert explicit_config.max_live_kv_tokens == 4096
+
+
+def test_derived_memory_limit_too_small_raises_clear_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _streaming_root(
+        tmp_path, model_type="hy_v3", manifest_model_key="hy3-expert-oq2e"
+    )
+    # 6 GiB cannot hold the ~9 GiB resident footprint, let alone slots.
+    monkeypatch.setattr(expert_cli, "_installed_ram_bytes", lambda: 6 * 1024**3)
+    args = _parser().parse_args(["--expert-streaming"])
+
+    with pytest.raises(ValueError, match="too small"):
         expert_streaming_load_kwargs(args, root)
 
 

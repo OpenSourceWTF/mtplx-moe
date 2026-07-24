@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -12,6 +13,12 @@ from .expert_runtime import (
     parse_memory_bytes,
     resolve_island_placement,
 )
+from .expert_streaming_models import (
+    ExpertMemoryPlan,
+    get_model_spec,
+    plan_expert_memory,
+)
+from .hardware import total_memory_gib
 
 
 _BYTE_FIELDS = {
@@ -23,6 +30,41 @@ _BYTE_FIELDS = {
     "max_inflight_io_bytes",
     "max_read_chunk_bytes",
 }
+
+# The manifest's top-level ``model_key`` is a small scalar that precedes the
+# large ``records`` array in every serialization order, so a bounded head scan
+# lifts it out without a full parse or the digest/record verification pass.
+_MODEL_KEY_RE = re.compile(rb'"model_key"\s*:\s*"([^"]+)"')
+_MANIFEST_MODEL_KEY_SCAN_BYTES = 1 * 1024 * 1024
+
+# RAM-derived memory-limit policy, mirrored from the non-streaming Metal caps
+# in mtplx/server/openai.py: 75% of installed RAM, floored at 8GiB and capped
+# at 192GiB. The GPU wired budget is engineered UNDER installed RAM and must
+# never exceed it, so this fraction/cap is a hard ceiling, not a suggestion.
+_DEFAULT_MEMORY_FRACTION = 0.75
+_MIN_MEMORY_LIMIT_BYTES = 8 * 1024**3
+_MAX_MEMORY_LIMIT_BYTES = 192 * 1024**3
+
+# Sane KV-admission ceiling when the artifact's config.json declares no
+# context window. Derived max_live_kv_tokens is clamped to this so a very large
+# unified-memory box does not reserve an absurd admission budget.
+_DEFAULT_CONTEXT_CEILING = 131072
+_CONTEXT_WINDOW_CONFIG_KEYS = (
+    "max_position_embeddings",
+    "max_sequence_length",
+    "seq_length",
+)
+
+# Out-of-box KV-admission target for the derived default. For an SSD-streaming
+# MoE the per-layer expert-slot count is the dominant decode-throughput lever,
+# so the default deliberately caps KV reservation here instead of maximizing it:
+# maximizing KV would spend nearly the whole envelope on KV and starve the
+# expert cache down to a single slot per layer. This value matches the
+# README-tested streaming profile (156 slots/layer at a 96 GiB envelope for
+# hy3-expert-oq2e) and trades context headroom for expert-cache residency.
+# Users who need more context can pass --expert-max-live-kv-tokens explicitly
+# (which reserves more KV and yields slower decode).
+_DEFAULT_KV_TOKENS = 32768
 
 
 def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
@@ -156,6 +198,166 @@ def _read_model_key(model_path: Path) -> str:
         ) from exc
 
 
+def _read_manifest_model_key(manifest_path: Path) -> str | None:
+    """Return the manifest's top-level ``model_key``, or ``None`` if absent.
+
+    A bounded head scan handles the published manifests cheaply; a single full
+    ``json.loads`` is the fallback for an unusual field ordering. Neither path
+    triggers the digest/record verification pass — this only lifts one field.
+    """
+
+    try:
+        with manifest_path.open("rb") as handle:
+            head = handle.read(_MANIFEST_MODEL_KEY_SCAN_BYTES)
+    except OSError:
+        return None
+    match = _MODEL_KEY_RE.search(head)
+    if match is not None:
+        return match.group(1).decode("utf-8")
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if isinstance(data, dict):
+        value = data.get("model_key")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _resolve_model_key(model_root: Path, manifest_path: Path) -> str:
+    """Resolve the streamed spec key: manifest-authoritative, config fallback.
+
+    The published streaming artifacts declare the exact registered spec key in
+    the manifest's top-level ``model_key``. It is authoritative when present —
+    it disambiguates banks (oQ2e, t158) that share a ``config.json``
+    ``model_type`` with the production q4 default. Only when no manifest
+    ``model_key`` can be read does the coarse ``model_type`` map apply, which
+    preserves the safe q4 default for bare artifacts.
+    """
+
+    if manifest_path.is_file():
+        manifest_key = _read_manifest_model_key(manifest_path)
+        if manifest_key:
+            return manifest_key
+    return _read_model_key(model_root)
+
+
+def _installed_ram_bytes() -> int:
+    """Installed unified memory in bytes; ``0`` when it cannot be determined."""
+
+    return int(total_memory_gib() * (1024**3))
+
+
+def _derive_memory_limit_bytes() -> int:
+    """Default the process memory ceiling from installed RAM."""
+
+    total = _installed_ram_bytes()
+    if total <= 0:
+        raise ValueError(
+            "could not detect installed RAM to derive an expert-streaming "
+            "memory limit; pass --expert-memory-limit explicitly"
+        )
+    return min(
+        total,
+        max(_MIN_MEMORY_LIMIT_BYTES, int(total * _DEFAULT_MEMORY_FRACTION)),
+        _MAX_MEMORY_LIMIT_BYTES,
+    )
+
+
+def _declared_context_window(model_root: Path) -> int:
+    """Artifact-declared context window, or a sane fallback ceiling."""
+
+    try:
+        data = json.loads((model_root / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return _DEFAULT_CONTEXT_CEILING
+    if isinstance(data, dict):
+        for key in _CONTEXT_WINDOW_CONFIG_KEYS:
+            value = data.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+    return _DEFAULT_CONTEXT_CEILING
+
+
+def _derive_max_live_kv_tokens(
+    values: Mapping[str, Any],
+    model_root: Path,
+) -> int:
+    """Largest KV admission ceiling that still fits under the memory limit.
+
+    Runs the authoritative memory planner backwards from the resolved memory
+    limit: the derived ceiling is the largest ``max_live_kv_tokens`` whose plan
+    still leaves resident weights, the runtime reserve, transient service, and
+    at least a minimal expert slot bank inside the limit, clamped to the smaller
+    of the artifact's declared context window and ``_DEFAULT_KV_TOKENS``. The
+    ``_DEFAULT_KV_TOKENS`` clamp keeps the out-of-box default from spending the
+    whole envelope on KV and starving the expert cache to one slot per layer;
+    on a normal machine the search therefore returns ``_DEFAULT_KV_TOKENS`` and
+    the planner instead maximizes the expert slot bank, while a memory-tight
+    machine still gets the largest viable value below it. Reuses
+    :func:`plan_expert_memory` so it can never disagree with the plan that
+    actually admits KV at serve time.
+    """
+
+    spec = get_model_spec(str(values["model_key"]))
+    memory_limit_bytes = int(values["memory_limit_bytes"])
+    runtime_reserve_bytes = int(values.get("runtime_reserve_bytes", 16 * 1024**3))
+    io_staging_bytes = int(values.get("io_staging_bytes", 0))
+    execution_workspace_bytes = int(values.get("execution_workspace_bytes", 0))
+    transient_slots = values.get("transient_slots")
+    kv_quant = values.get("kv_quant")
+    cache_scope = values.get("cache_scope", "layer")
+
+    def _plan(context_tokens: int) -> ExpertMemoryPlan:
+        return plan_expert_memory(
+            spec,
+            total_limit_bytes=memory_limit_bytes,
+            context_tokens=context_tokens,
+            runtime_reserve_bytes=runtime_reserve_bytes,
+            transient_slots=transient_slots,
+            io_staging_bytes=io_staging_bytes,
+            execution_workspace_bytes=execution_workspace_bytes,
+            kv_quant=kv_quant,
+            cache_scope=cache_scope,
+        )
+
+    def _viable(plan: ExpertMemoryPlan) -> bool:
+        # Fits the fixed footprint AND leaves room for at least one persistent
+        # expert slot per streamed layer (a minimal, usable cache bank).
+        return plan.fits_fixed and plan.slots_per_layer >= 1
+
+    floor_plan = _plan(0)
+    if not _viable(floor_plan):
+        raise ValueError(
+            f"the derived expert-streaming memory limit ({memory_limit_bytes} "
+            f"bytes) is too small for {spec.key}: resident weights "
+            f"({floor_plan.resident_bytes} bytes) + runtime reserve "
+            f"({runtime_reserve_bytes} bytes) + transient service already "
+            f"require {floor_plan.fixed_bytes} bytes with no room left for a "
+            "minimal expert slot bank. Free RAM or pass --expert-memory-limit "
+            "and --expert-max-live-kv-tokens explicitly."
+        )
+
+    ceiling = min(_declared_context_window(model_root), _DEFAULT_KV_TOKENS)
+    low, high = 0, ceiling
+    while low < high:
+        mid = (low + high + 1) // 2
+        if _viable(_plan(mid)):
+            low = mid
+        else:
+            high = mid - 1
+    if low < 1:
+        raise ValueError(
+            f"the derived expert-streaming memory limit ({memory_limit_bytes} "
+            f"bytes) leaves no KV admission budget for {spec.key} after "
+            "resident weights, runtime reserve, and a minimal expert slot "
+            "bank. This machine is too small; free RAM or pass "
+            "--expert-max-live-kv-tokens explicitly."
+        )
+    return low
+
+
 def _load_config_object(path: str | None) -> dict[str, Any]:
     if path is None:
         return {}
@@ -188,6 +390,9 @@ def expert_streaming_load_kwargs(
     if not expert_streaming_requested(args):
         return {}
     root = Path(model_path).resolve()
+    manifest = Path(
+        getattr(args, "expert_manifest", None) or root / "expert-manifest.json"
+    ).resolve()
     values = _load_config_object(getattr(args, "expert_streaming_config", None))
     overrides = {
         "model_key": getattr(args, "expert_model_key", None),
@@ -214,23 +419,23 @@ def expert_streaming_load_kwargs(
         ),
     }
     values.update({key: value for key, value in overrides.items() if value is not None})
+    # Manifest-authoritative model key: an explicit --expert-model-key (or a
+    # streaming-config model_key) always wins; otherwise the manifest's declared
+    # spec key resolves oQ2e/t158 correctly, falling back to the config.json
+    # model_type map (safe production q4) only when no manifest key is present.
     if "model_key" not in values:
-        values["model_key"] = _read_model_key(root)
+        values["model_key"] = _resolve_model_key(root, manifest)
     values.setdefault("runtime_reserve_bytes", 16 * 1024**3)
     values.setdefault("io_staging_bytes", 0)
     values.setdefault("execution_workspace_bytes", 0)
-    missing = [
-        name
-        for name in ("memory_limit_bytes", "max_live_kv_tokens")
-        if name not in values
-    ]
-    if missing:
-        flags = ", ".join(name.replace("_", "-") for name in missing)
-        raise ValueError(
-            "expert streaming requires explicit memory/KV admission limits; "
-            f"missing {flags}"
-        )
     values = _normalize_byte_fields(values)
+    # The two mandatory admission limits are optional: derive safe defaults from
+    # installed RAM (memory limit) and the authoritative memory plan (KV tokens)
+    # when omitted. Explicit flags, normalized above, are left untouched.
+    if "memory_limit_bytes" not in values:
+        values["memory_limit_bytes"] = _derive_memory_limit_bytes()
+    if "max_live_kv_tokens" not in values:
+        values["max_live_kv_tokens"] = _derive_max_live_kv_tokens(values, root)
     try:
         config = ExpertStreamingConfig(**values)
     except TypeError as exc:
@@ -240,9 +445,6 @@ def expert_streaming_load_kwargs(
     # downstream memory_plan prices the islands. Precedence: explicit
     # island_layers > spec.island_pin_order > island-placement.json > error.
     config = resolve_island_placement(config, root)
-    manifest = Path(
-        getattr(args, "expert_manifest", None) or root / "expert-manifest.json"
-    ).resolve()
     if not manifest.is_file():
         raise ValueError(f"expert manifest does not exist: {manifest}")
     return {
