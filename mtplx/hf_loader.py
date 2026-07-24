@@ -35,8 +35,6 @@ DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 EXPERT_MANIFEST_FILE = "expert-manifest.json"
 MAX_EXPERT_MANIFEST_BYTES = 512 * 1024 * 1024
 
-_SIDECAR_OBJECT_RE = re.compile(rb'"sidecar"\s*:\s*(\{[^{}]*\})')
-
 
 @dataclass(frozen=True)
 class RepoFile:
@@ -224,7 +222,7 @@ def _safe_member_name(name: Any) -> str | None:
 def _expert_manifest_sidecar(
     manifest_path: Path,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Return the manifest's sidecar object, or an error string."""
+    """Parse and return a valid manifest's sidecar object, or an error."""
 
     try:
         size = manifest_path.stat().st_size
@@ -236,14 +234,6 @@ def _expert_manifest_sidecar(
         payload = manifest_path.read_bytes()
     except OSError as exc:
         return None, str(exc)
-    match = _SIDECAR_OBJECT_RE.search(payload)
-    if match is not None:
-        try:
-            candidate = json.loads(match.group(1))
-        except json.JSONDecodeError:
-            candidate = None
-        if isinstance(candidate, dict) and "file" in candidate:
-            return candidate, None
     try:
         data = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -252,7 +242,7 @@ def _expert_manifest_sidecar(
         return None, "manifest is not a JSON object"
     sidecar = data.get("sidecar")
     if sidecar is None:
-        return None, None
+        return None, "manifest sidecar entry is missing"
     if not isinstance(sidecar, dict):
         return None, "manifest sidecar entry is not an object"
     return sidecar, None
@@ -305,9 +295,11 @@ def expert_artifact_status(path: Path) -> dict[str, Any]:
     sidecar, error = _expert_manifest_sidecar(manifest_path)
     if error is not None:
         status["ok"] = False
-        status["reason"] = f"{EXPERT_MANIFEST_FILE} could not be read ({error})"
+        status["reason"] = f"{EXPERT_MANIFEST_FILE} is invalid ({error})"
         return status
     if sidecar is None:
+        status["ok"] = False
+        status["reason"] = f"{EXPERT_MANIFEST_FILE} sidecar entry could not be resolved"
         return status
 
     name = _safe_member_name(sidecar.get("file"))
@@ -317,8 +309,12 @@ def expert_artifact_status(path: Path) -> dict[str, Any]:
         return status
     status["sidecar_file"] = name
     expected = sidecar.get("size")
-    if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
-        expected = None
+    if isinstance(expected, bool) or not isinstance(expected, int) or expected <= 0:
+        status["ok"] = False
+        status["reason"] = (
+            f"{EXPERT_MANIFEST_FILE} sidecar must declare a positive integer size"
+        )
+        return status
     status["expected_bytes"] = expected
 
     bank = path / name

@@ -1958,13 +1958,12 @@ def _hy_v3_streaming_inspection(model_dir):
     )
 
 
-def test_baked_streaming_layout_reports_runnable_via_ar(monkeypatch, tmp_path):
+def test_baked_streaming_layout_reports_runnable_via_ar(tmp_path):
     """Issue: `mtplx inspect` on a published SSD-streaming model wrongly said
     it CANNOT run, while `mtplx serve --expert-streaming` runs it fine via
     target-only AR. A valid baked streaming layout (expert-manifest.json plus
     its named experts bank) must report runnable.
     """
-    from mtplx import hf_loader
     from mtplx.backends.registry import compatibility_for_inspection
 
     # Preserve the upstream 2.3 family verdict as the non-streaming baseline.
@@ -1972,20 +1971,19 @@ def test_baked_streaming_layout_reports_runnable_via_ar(monkeypatch, tmp_path):
     baseline = compatibility_for_inspection(inspection)
     assert baseline.can_run is False
 
-    # A valid baked streaming layout is present.
-    monkeypatch.setattr(
-        hf_loader,
-        "expert_artifact_status",
-        lambda path: {
-            "ok": True,
-            "streamed_experts": True,
-            "manifest_present": True,
-            "sidecar_file": "experts.bin",
-            "expected_bytes": 1024,
-            "actual_bytes": 1024,
-            "reason": None,
-        },
+    # A valid baked streaming layout is present and inspected by the real
+    # construction-boundary helper.
+    (tmp_path / "expert-manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "mtplx-expert-manifest-v1",
+                "model_key": "hy3-expert-oq2e",
+                "sidecar": {"file": "experts.bin", "size": 4},
+            }
+        ),
+        encoding="utf-8",
     )
+    (tmp_path / "experts.bin").write_bytes(b"bank")
 
     verdict = compatibility_for_inspection(inspection)
 
@@ -2003,49 +2001,39 @@ def test_baked_streaming_layout_reports_runnable_via_ar(monkeypatch, tmp_path):
     assert verdict.arch_id == "hy-v3-mtp"
 
 
-def test_streaming_override_absent_keeps_pending_verdict(monkeypatch, tmp_path):
+def test_streaming_override_absent_keeps_pending_verdict(tmp_path):
     """The override only fires for a valid baked streaming layout.
 
     A truncated/missing bank (ok False) and an ordinary non-streaming model
     (streamed_experts False) must both keep the prior upstream verdict — the
     override never fabricates runnability.
     """
-    from mtplx import hf_loader
     from mtplx.backends.registry import compatibility_for_inspection
 
     inspection = _hy_v3_streaming_inspection(tmp_path)
     baseline = compatibility_for_inspection(inspection)
     assert baseline.can_run is False
 
-    # ok False (e.g. truncated/missing experts bank) -> unchanged prior verdict.
-    monkeypatch.setattr(
-        hf_loader,
-        "expert_artifact_status",
-        lambda path: {
-            "ok": False,
-            "streamed_experts": True,
-            "manifest_present": True,
-            "sidecar_file": "experts.bin",
-            "reason": "expert bank experts.bin is truncated (10 of 1024 bytes)",
-        },
+    # A real truncated bank -> unchanged prior verdict.
+    (tmp_path / "expert-manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "mtplx-expert-manifest-v1",
+                "model_key": "hy3-expert-oq2e",
+                "sidecar": {"file": "experts.bin", "size": 8},
+            }
+        ),
+        encoding="utf-8",
     )
+    (tmp_path / "experts.bin").write_bytes(b"short")
     not_ok = compatibility_for_inspection(inspection)
     assert not_ok == baseline
 
     # Ordinary non-streaming model (real status shape) -> unchanged prior
     # verdict. `ok` defaults True here, so gating on `ok` alone would wrongly
     # trigger; gating also on `streamed_experts` keeps normal models intact.
-    monkeypatch.setattr(
-        hf_loader,
-        "expert_artifact_status",
-        lambda path: {
-            "ok": True,
-            "streamed_experts": False,
-            "manifest_present": False,
-            "sidecar_file": None,
-            "reason": None,
-        },
-    )
+    (tmp_path / "expert-manifest.json").unlink()
+    (tmp_path / "experts.bin").unlink()
     non_streaming = compatibility_for_inspection(inspection)
     assert non_streaming == baseline
 
