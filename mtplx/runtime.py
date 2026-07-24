@@ -121,6 +121,18 @@ class MTPLXRuntime:
             else:
                 self._count("full_logits_tokens_emitted", emitted)
         if not return_hidden and hidden_variant is None and not kwargs:
+            # Decode-only (seq_len == 1). Prefill is multi-token over an
+            # unprimed cache: seeding the compiled graph from its None KV
+            # leaves throws, and its shape differs from a single-token decode
+            # step, forcing a retrace. Prefill stays eager.
+            compiled = (
+                self._compiled_ar_forward(cache) if sequence_len == 1 else None
+            )
+            if compiled is not None:
+                # Engagement proof: arm A (flag off) must report 0 here,
+                # arm B (on) > 0 — the A/B credits nothing without it.
+                self._count("compiled_forward_calls")
+                return compiled(input_ids, cache)
             return self.model(input_ids, cache=cache)
         return self.model(
             input_ids,
@@ -128,6 +140,47 @@ class MTPLXRuntime:
             return_hidden=return_hidden,
             **kwargs,
         )
+
+    def _compiled_ar_forward(self, cache):
+        """Compiled target forward (MTPLX_COMPILE_AR_FORWARD).
+
+        Kills the per-token Python graph rebuild by tracing the full trunk
+        forward once (CompiledARForward, KV state threaded). Applies to
+        fully-resident loads with a standard per-layer KV cache; a host-sync
+        buried in the model forward surfaces as an error on the first traced
+        call rather than silently degrading. Rebuilds per cache identity so a
+        new generation gets fresh threaded state. Returns None (the eager
+        path) otherwise.
+        """
+        from .compiled_forward import CompiledARForward, compile_forward_enabled
+
+        if not compile_forward_enabled() or not cache:
+            return None
+        # An unprimed cache (empty context / first token) has None KV leaves
+        # that would crash the compiled graph. Only compile once the cache
+        # holds real keys, and only for the plain growable KVCache shape the
+        # fixed-buffer conversion understands.
+        first = cache[0]
+        if getattr(first, "keys", None) is None:
+            return None
+        if any(
+            not hasattr(entry, "keys")
+            or not hasattr(entry, "values")
+            or not hasattr(entry, "offset")
+            for entry in cache
+        ):
+            return None
+        cache_key = id(first)
+        if (
+            getattr(self, "_compiled_ar", None) is None
+            or getattr(self, "_compiled_ar_key", None) != cache_key
+        ):
+            import os as _os
+
+            reserve = int(_os.environ.get("MTPLX_COMPILE_AR_RESERVE_TOKENS", "4096"))
+            self._compiled_ar = CompiledARForward(self.model, reserve_tokens=reserve)
+            self._compiled_ar_key = cache_key
+        return self._compiled_ar
 
     def forward_ar_capture(
         self,
