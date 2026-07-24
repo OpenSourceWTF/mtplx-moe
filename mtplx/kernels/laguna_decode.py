@@ -55,6 +55,27 @@ _SOFTPLUS = """
 """
 
 
+# The fused router wins where the stock chain's cost is launch overhead and
+# loses where it is not.  Measured on the pinned checkpoint (ctx 1024): +2.3% of
+# the whole step at B=1 and +2.5% at B=2, but -3.5% at B=8, because the stock
+# chain barely gets more expensive with rows (20.6 us at B=1 vs 18.8 us at B=8)
+# while this kernel's ten serial reduction rounds do.  So it is row-gated rather
+# than sold as a uniform win.
+DEFAULT_ROUTER_MAX_ROWS = 4
+
+
+def _router_max_rows() -> int:
+    import os
+
+    raw = os.environ.get("MTPLX_LAGUNA_KERNEL_ROUTER_MAX_ROWS")
+    if raw is None:
+        return DEFAULT_ROUTER_MAX_ROWS
+    try:
+        return int(raw)
+    except ValueError:
+        return DEFAULT_ROUTER_MAX_ROWS
+
+
 def is_router_eligible(logits: mx.array, bias: mx.array, top_k: int) -> bool:
     if not mx.metal.is_available():
         return False
@@ -64,6 +85,8 @@ def is_router_eligible(logits: mx.array, bias: mx.array, top_k: int) -> bool:
         return False
     experts = int(logits.shape[1])
     if experts != int(bias.shape[0]):
+        return False
+    if int(logits.shape[0]) > _router_max_rows():
         return False
     # One thread per expert, and the selection scratch is sized at compile time.
     return 0 < top_k <= 32 and 32 <= experts <= 1024 and (experts % 32) == 0
