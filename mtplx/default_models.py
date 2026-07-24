@@ -11,6 +11,12 @@ from typing import Any, Mapping
 
 from mtplx.constants import DEFAULT_RUNTIME_MODEL_DIR
 from mtplx.hardware import classify_apple_silicon_generation, detect_apple_silicon
+from mtplx.model_catalog import (
+    CatalogModel,
+    OFFICIAL_CATALOG as APP_OFFICIAL_CATALOG,
+    catalog_model_matching as _app_catalog_model_matching,
+    _normalized as _normalize_catalog_ref,
+)
 from mtplx.profiles import (
     DEFAULT_FP16_PUBLIC_MODEL_ID,
     DEFAULT_FP16_HF_MODEL_ID,
@@ -35,6 +41,131 @@ from mtplx.profiles import (
     QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
     QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
 )
+
+
+# ---------------------------------------------------------------------------
+# SSD-streamed MoE research artifacts
+# ---------------------------------------------------------------------------
+# Published, revision-pinned streaming banks served via ``--expert-streaming``
+# (see mtplx/expert_streaming_models.py). Unlike the Qwen/Gemma consumer
+# artifacts, these run with only their resident tensors held in memory while
+# the routed experts stream from SSD, so their working-set peak is a small
+# fraction of the full HF download.
+#
+# They are deliberately NOT part of the Swift SYNC PAIR catalog
+# (mtplx/model_catalog.OFFICIAL_CATALOG), whose 12-entry roster is guarded by
+# test_catalog_matches_swift_official_catalog / test_catalog_has_twelve_unique_entries.
+# Registering them here keeps the app's consumer catalog untouched while still
+# giving CLI/discovery surfaces one place to resolve and label the streaming
+# repos.
+#
+# Field notes:
+#   * ``size_bytes``      — full HF repo download (experts.bin + resident
+#     shards + manifests + tokenizer/MTP). This is what ``pull`` transfers and
+#     what disk-feasibility should budget for.
+#   * ``peak_memory_gib`` — streamed working-set peak, NOT the download. Taken
+#     from the served spec as ``resident_bytes + cold_expert_bytes_per_token``
+#     (resident tensors that stay in RAM plus one decode step's routed-expert
+#     service): Hy3 oQ2e 8.71 + 3.13 GiB, GLM-5.2 t158 9.90 + 4.94 GiB.
+#   * ``recommended_tiers`` — empty: these are opt-in streamed artifacts, never
+#     auto-offered by the RAM-tiered recommender.
+STREAMING_CATALOG: tuple[CatalogModel, ...] = (
+    CatalogModel(
+        id="OpensourceWTF/Hy3-oQ2e-MTPLX-streaming",
+        display_name="Hy3 oQ2e (SSD-streamed MoE)",
+        detail=(
+            "2-bit imatrix experts streamed from SSD; ~8.7 GiB resident. "
+            "Serves spec key hy3-expert-oq2e via --expert-streaming."
+        ),
+        hf_model_id="OpensourceWTF/Hy3-oQ2e-MTPLX-streaming",
+        # Full HF repo download (~97.6 GB): experts.bin 80.5 GB + resident
+        # shards ~9.3 GB + manifests ~0.1 GB + tokenizer/MTP.
+        size_bytes=97_600_000_000,
+        peak_memory_gib=11.84,
+        recommended_tiers=frozenset(),
+        aliases=(
+            "hy3-oq2e",
+            "hy3-expert-oq2e",
+            "Hy3 oQ2e",
+            "Hy3-oQ2e-MTPLX-streaming",
+            "OpensourceWTF--Hy3-oQ2e-MTPLX-streaming",
+        ),
+    ),
+    CatalogModel(
+        id="OpensourceWTF/GLM-5.2-t158-MTPLX-streaming",
+        display_name="GLM-5.2 t158 (SSD-streamed MoE)",
+        detail=(
+            "Ternary 1.58bpw experts streamed from SSD; ~9.9 GiB resident. "
+            "Serves spec key glm52-expert-q1t via --expert-streaming."
+        ),
+        hf_model_id="OpensourceWTF/GLM-5.2-t158-MTPLX-streaming",
+        # Full HF repo download (~187 GB): experts.bin ~158 GiB + resident
+        # shards ~10.6 GB + bf16 MTP head + tokenizer.
+        size_bytes=187_000_000_000,
+        peak_memory_gib=14.84,
+        recommended_tiers=frozenset(),
+        aliases=(
+            "glm52-t158",
+            "glm52-expert-q1t",
+            "GLM-5.2 t158",
+            "GLM-5.2-t158-MTPLX-streaming",
+            "OpensourceWTF--GLM-5.2-t158-MTPLX-streaming",
+        ),
+    ),
+)
+
+
+# Combined view: the Swift-synced consumer catalog plus the SSD-streamed
+# research artifacts. This is the single enumeration/resolution point for CLI
+# and discovery surfaces that must recognize both families. The Swift SYNC
+# PAIR source of truth stays model_catalog.OFFICIAL_CATALOG -- keep the
+# Swift-parity test pointed there, not at this superset.
+OFFICIAL_CATALOG: tuple[CatalogModel, ...] = APP_OFFICIAL_CATALOG + STREAMING_CATALOG
+
+
+def streaming_catalog_models() -> tuple[CatalogModel, ...]:
+    """The registered SSD-streamed MoE artifacts."""
+
+    return STREAMING_CATALOG
+
+
+def catalog_model_with_id(model_id: str) -> CatalogModel | None:
+    """Resolve any catalog entry (consumer or streamed) by its exact id."""
+
+    for model in OFFICIAL_CATALOG:
+        if model.id == model_id:
+            return model
+    return None
+
+
+def catalog_model_matching(ref: str | Path | None) -> CatalogModel | None:
+    """Match a reference (id, HF repo, cache dir, or alias) across both
+    the consumer catalog and the SSD-streamed registry.
+
+    The consumer catalog keeps its own tested matcher; this only extends the
+    search to the streaming entries when the base catalog does not match.
+    """
+
+    matched = _app_catalog_model_matching(ref)
+    if matched is not None:
+        return matched
+    if ref is None:
+        return None
+    text = str(ref).strip()
+    if not text:
+        return None
+    normalized = _normalize_catalog_ref(text)
+    basename = _normalize_catalog_ref(Path(text).name)
+    for model in STREAMING_CATALOG:
+        candidates = {
+            _normalize_catalog_ref(model.id),
+            _normalize_catalog_ref(model.display_name),
+            _normalize_catalog_ref(model.hf_model_id),
+            *(_normalize_catalog_ref(alias) for alias in model.aliases),
+        }
+        if normalized in candidates or basename in candidates:
+            return model
+    return None
 
 
 DEFAULT_MODEL_VARIANT_ENV = "MTPLX_DEFAULT_MODEL_VARIANT"

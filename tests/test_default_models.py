@@ -6,15 +6,21 @@ import pytest
 
 from mtplx.default_models import (
     DEFAULT_MODEL_VARIANT_ENV,
+    OFFICIAL_CATALOG,
     OPTIMIZED_SPEED_DESCRIPTION,
     QUALITY_MODEL_ENV,
     SPEED_MODEL_ENV,
+    STREAMING_CATALOG,
+    catalog_model_matching,
+    catalog_model_with_id,
     is_verified_default_model_ref,
     optimized_quality_model_ref,
     optimized_speed_model_ref,
     public_model_id_for_ref,
     select_default_model,
+    streaming_catalog_models,
 )
+from mtplx.model_catalog import OFFICIAL_CATALOG as APP_OFFICIAL_CATALOG
 from mtplx import hardware as hardware_module
 from mtplx.hardware import classify_apple_silicon_generation, detect_apple_silicon
 from mtplx.profiles import (
@@ -542,3 +548,73 @@ def test_public_model_id_for_ref_maps_unknown_local_name_to_sanitized_id():
         public_model_id_for_ref("/tmp/My Custom Local Model!")
         == "my-custom-local-model"
     )
+
+
+_HY3_STREAMING_ID = "OpensourceWTF/Hy3-oQ2e-MTPLX-streaming"
+_GLM_STREAMING_ID = "OpensourceWTF/GLM-5.2-t158-MTPLX-streaming"
+
+
+def test_streaming_catalog_registers_both_published_repos():
+    streaming_ids = {model.id for model in STREAMING_CATALOG}
+    assert streaming_ids == {_HY3_STREAMING_ID, _GLM_STREAMING_ID}
+    assert streaming_catalog_models() == STREAMING_CATALOG
+    # Every streamed entry advertises the HF repo it is pulled from and the
+    # served spec key as an alias, so discovery can bridge repo <-> spec.
+    hy3 = catalog_model_with_id(_HY3_STREAMING_ID)
+    glm = catalog_model_with_id(_GLM_STREAMING_ID)
+    assert hy3 is not None and glm is not None
+    assert hy3.hf_model_id == _HY3_STREAMING_ID
+    assert glm.hf_model_id == _GLM_STREAMING_ID
+    assert "hy3-expert-oq2e" in hy3.aliases
+    assert "glm52-expert-q1t" in glm.aliases
+    # Never auto-recommended by the RAM-tiered recommender.
+    assert hy3.recommended_tiers == frozenset()
+    assert glm.recommended_tiers == frozenset()
+
+
+def test_streaming_catalog_peak_is_far_below_download():
+    # The streaming benefit: resident working-set peak << full HF download.
+    for model in STREAMING_CATALOG:
+        assert model.peak_memory_gib > 0
+        assert model.peak_memory_gib < model.download_gib
+        # Well under a fifth of the download, since routed experts stream.
+        assert model.peak_memory_gib < model.download_gib / 5
+
+
+@pytest.mark.parametrize(
+    ("ref", "expected_id"),
+    [
+        (_HY3_STREAMING_ID, _HY3_STREAMING_ID),
+        ("hy3-oq2e", _HY3_STREAMING_ID),
+        ("hy3-expert-oq2e", _HY3_STREAMING_ID),
+        ("OpensourceWTF--Hy3-oQ2e-MTPLX-streaming", _HY3_STREAMING_ID),
+        ("~/.mtplx/models/OpensourceWTF--Hy3-oQ2e-MTPLX-streaming", _HY3_STREAMING_ID),
+        (_GLM_STREAMING_ID, _GLM_STREAMING_ID),
+        ("glm52-t158", _GLM_STREAMING_ID),
+        ("glm52-expert-q1t", _GLM_STREAMING_ID),
+        ("OpensourceWTF--GLM-5.2-t158-MTPLX-streaming", _GLM_STREAMING_ID),
+    ],
+)
+def test_streaming_catalog_resolves_by_id_repo_and_alias(ref, expected_id):
+    matched = catalog_model_matching(ref)
+    assert matched is not None
+    assert matched.id == expected_id
+
+
+def test_combined_catalog_extends_consumer_catalog_without_mutating_it():
+    # The combined view is the consumer catalog plus exactly the streamed
+    # entries, appended at the tail; the Swift-synced catalog is untouched.
+    assert OFFICIAL_CATALOG == APP_OFFICIAL_CATALOG + STREAMING_CATALOG
+    assert len(OFFICIAL_CATALOG) == len(APP_OFFICIAL_CATALOG) + 2
+    assert [model.id for model in OFFICIAL_CATALOG][-2:] == [
+        _HY3_STREAMING_ID,
+        _GLM_STREAMING_ID,
+    ]
+    ids = [model.id for model in OFFICIAL_CATALOG]
+    assert len(ids) == len(set(ids))
+    # Base entries still resolve through the extended matcher.
+    speed = catalog_model_with_id("optimized-speed")
+    assert speed is not None
+    assert catalog_model_matching("mtplx-qwen36-27b-optimized-speed") is speed
+    # An unrelated reference still misses.
+    assert catalog_model_matching("someone/custom-model") is None
