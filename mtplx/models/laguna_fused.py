@@ -44,6 +44,7 @@ ENV_COMPILED_ROUTER = "MTPLX_LAGUNA_COMPILED_ROUTER"
 ENV_COMPILED_ATTN_GATE = "MTPLX_LAGUNA_COMPILED_ATTN_GATE"
 ENV_KERNEL_ROUTER = "MTPLX_LAGUNA_KERNEL_ROUTER"
 ENV_KERNEL_ATTN_GATE = "MTPLX_LAGUNA_KERNEL_ATTN_GATE"
+ENV_FUSED_RESIDUAL_NORM = "MTPLX_LAGUNA_FUSED_RESIDUAL_NORM"
 
 
 def _enabled(name: str) -> bool:
@@ -263,6 +264,86 @@ def install_compiled_attention_gate(model: Any) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# fused residual + RMSNorm across the layer boundary
+# ---------------------------------------------------------------------------
+def _fused_residual_forward(self, inputs, cache=None, input_embeddings=None):
+    """Run the decoder stack as a residual stream with fused add+RMSNorm.
+
+    The shipped layer does ``h = x + attn(norm(x))`` then ``h + mlp(norm(h))``,
+    which is four separate kernels per layer: two adds and two norms, 192
+    dispatches across 48 layers for arithmetic that moves 3072 floats.
+
+    Rewritten as a residual stream, every add pairs with the norm that consumes
+    its result — including ACROSS the layer boundary, where the mlp residual add
+    pairs with the next layer's input norm.  All 96 pairs become 96 fused
+    kernels instead of 192 ops.
+
+    The fused kernel keeps MLX's order exactly (the residual add is rounded back
+    to the input dtype before the RMS sum), so this is a dispatch change, not a
+    numerics change.
+    """
+
+    from ..kernels.fused_norm import fused_add_rmsnorm
+    from mlx_lm.models.base import create_attention_mask
+
+    hidden = (
+        input_embeddings
+        if input_embeddings is not None
+        else self.embed_tokens(inputs)
+    )
+    if cache is None:
+        cache = [None] * len(self.layers)
+
+    full_mask = create_attention_mask(hidden, cache[self._first_full])
+    if self._has_swa:
+        sliding_mask = create_attention_mask(
+            hidden, cache[self._first_swa], window_size=self.args.sliding_window
+        )
+    else:
+        sliding_mask = full_mask
+
+    rope_memo: dict[int, mx.array] = {}
+    layers = self.layers
+    first = layers[0]
+    normed = mx.fast.rms_norm(
+        hidden, first.input_layernorm.weight, first.input_layernorm.eps
+    )
+
+    for index, (layer, layer_cache) in enumerate(zip(layers, cache)):
+        mask = sliding_mask if layer.self_attn.is_sliding else full_mask
+        attention_out = layer.self_attn(normed, mask, layer_cache, rope_memo)
+        hidden, normed = fused_add_rmsnorm(
+            attention_out,
+            hidden,
+            layer.post_attention_layernorm.weight,
+            layer.post_attention_layernorm.eps,
+        )
+        mlp_out = layer.mlp(normed)
+        if index + 1 < len(layers):
+            following = layers[index + 1]
+            hidden, normed = fused_add_rmsnorm(
+                mlp_out,
+                hidden,
+                following.input_layernorm.weight,
+                following.input_layernorm.eps,
+            )
+        else:
+            hidden, normed = fused_add_rmsnorm(
+                mlp_out, hidden, self.norm.weight, self.norm.eps
+            )
+
+    return normed
+
+
+def install_fused_residual_norm(model: Any) -> dict[str, Any]:
+    from .laguna import LagunaModel
+
+    LagunaModel.__call__ = _fused_residual_forward
+    inner = getattr(model, "model", model)
+    return {"path": "fused_residual_norm", "layers_affected": len(inner.layers)}
+
+
+# ---------------------------------------------------------------------------
 # hand-written Metal kernels
 # ---------------------------------------------------------------------------
 def _kernel_moe_call(self, x: mx.array) -> mx.array:
@@ -326,4 +407,6 @@ def install_from_env(model: Any) -> list[dict[str, Any]]:
         report.append(install_kernel_router(model))
     if _enabled(ENV_KERNEL_ATTN_GATE):
         report.append(install_kernel_attention_gate(model))
+    if _enabled(ENV_FUSED_RESIDUAL_NORM):
+        report.append(install_fused_residual_norm(model))
     return report
