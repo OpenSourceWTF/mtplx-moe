@@ -51,9 +51,23 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 Point any OpenAI or Anthropic client at that URL — Cline, Continue, Open WebUI,
-the `openai`/`anthropic` Python clients, curl. In Cline, add an
-OpenAI-compatible provider with base URL `http://127.0.0.1:8000/v1` and any
-model name.
+LiteLLM, the `openai`/`anthropic` Python clients, curl. The server answers
+whatever model name a client sends and serves the loaded model, so no name
+matching is needed, and localhost needs no API key.
+
+In Cline, add an OpenAI-compatible provider with base URL
+`http://127.0.0.1:8000/v1`, any API key, and any model id.
+
+Behind LiteLLM:
+
+```yaml
+model_list:
+  - model_name: hy3-oq2e
+    litellm_params:
+      model: openai/mtplx
+      api_base: http://127.0.0.1:8000/v1
+      api_key: dummy
+```
 
 GLM-5.2 is the same flow, just larger:
 
