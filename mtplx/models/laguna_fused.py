@@ -336,11 +336,26 @@ def _fused_residual_forward(self, inputs, cache=None, input_embeddings=None):
 
 
 def install_fused_residual_norm(model: Any) -> dict[str, Any]:
+    from ..kernels.fused_norm import is_fused_add_rmsnorm_eligible
     from .laguna import LagunaModel
 
-    LagunaModel.__call__ = _fused_residual_forward
     inner = getattr(model, "model", model)
-    return {"path": "fused_residual_norm", "layers_affected": len(inner.layers)}
+
+    # `fused_add_rmsnorm` silently falls back to stock ops on any shape it does
+    # not cover.  Without this probe an ineligible dtype would show up as "the
+    # fusion bought nothing" instead of "the fusion never ran".
+    first = inner.layers[0]
+    weight = first.post_attention_layernorm.weight
+    probe = mx.zeros((1, 1, int(weight.shape[0])), dtype=weight.dtype)
+    engaged = bool(is_fused_add_rmsnorm_eligible(probe, probe, weight))
+
+    LagunaModel.__call__ = _fused_residual_forward
+    return {
+        "path": "fused_residual_norm",
+        "layers_affected": len(inner.layers),
+        "kernel_engaged": engaged,
+        "norm_dtype": str(weight.dtype),
+    }
 
 
 # ---------------------------------------------------------------------------
