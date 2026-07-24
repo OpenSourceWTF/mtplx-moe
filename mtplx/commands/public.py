@@ -7919,6 +7919,98 @@ def _resolve_runtime_options_on_args(
     return None
 
 
+_STREAMING_FLAG_ATTRS = (
+    "expert_streaming",
+    "expert_manifest",
+    "expert_streaming_config",
+)
+
+
+def _maybe_enable_expert_streaming(args: Any, model_path: Any) -> bool:
+    """Auto-enable AR expert streaming for a baked streaming layout.
+
+    When the resolved local model directory holds a valid streamed-expert
+    artifact (manifest present AND the sidecar bank it names present at >= its
+    declared size, per ``hf_loader.expert_artifact_status``) and the user passed
+    no streaming flag, flip ``args.expert_streaming`` on so the published
+    Hy3/GLM streaming repos serve with zero extra flags.
+
+    ``expert_artifact_status`` reports ``ok`` as ``True`` for ordinary,
+    non-streaming models too (they simply declare no streamed experts), so the
+    gate also requires ``streamed_experts`` -- this is what "manifest present and
+    valid" actually means and prevents a normal load from being flipped into
+    streaming. A stray/partial ``expert-manifest.json`` (missing or truncated
+    bank) reports ``ok`` False and is left as a normal load.
+
+    Returns ``True`` when this call turned streaming on, ``False`` otherwise. An
+    explicit user choice (a streaming flag, or an explicit opt-out recorded in
+    ``args._cli_flags``) is never overridden.
+    """
+
+    from mtplx.expert_cli import expert_streaming_requested
+
+    # An explicit streaming request (flag / manifest / config) already wins.
+    if expert_streaming_requested(args):
+        return False
+    # Honor an explicit user opt-out even though ``store_true`` reads falsey.
+    cli_flags = getattr(args, "_cli_flags", None) or set()
+    if any(attr in cli_flags for attr in _STREAMING_FLAG_ATTRS):
+        return False
+    if not model_path:
+        return False
+    try:
+        from mtplx.hf_loader import expert_artifact_status
+
+        status = expert_artifact_status(Path(model_path))
+    except Exception:
+        return False
+    if not (status.get("streamed_experts") and status.get("ok")):
+        return False
+    args.expert_streaming = True
+    return True
+
+
+def _maybe_rewrite_streaming_model_ref(args: Any) -> str | None:
+    """Resolve a published streaming alias/id to its HF repo id in place.
+
+    Lets ``--model hy3-oq2e`` (a short alias) or the bare repo id resolve to the
+    pulled local snapshot: the ref is rewritten to the streaming catalog entry's
+    ``hf_model_id`` so the normal HF-repo->cache-path resolution finds it. Only
+    the SSD-streamed registry is consulted, so non-streaming model resolution is
+    untouched, and a concrete local path (something that exists on disk) is left
+    exactly as the user typed it.
+
+    Returns the rewritten ``hf_model_id`` when a rewrite happened, else ``None``.
+    """
+
+    ref = getattr(args, "model", None)
+    if not ref:
+        return None
+    text = str(ref)
+    # A concrete local path the user pointed at wins over any alias match.
+    try:
+        if Path(text).expanduser().exists():
+            return None
+    except OSError:
+        pass
+    try:
+        from mtplx.default_models import (
+            catalog_model_matching,
+            streaming_catalog_models,
+        )
+
+        matched = catalog_model_matching(text)
+        if matched is None or matched not in streaming_catalog_models():
+            return None
+    except Exception:
+        return None
+    hf_id = getattr(matched, "hf_model_id", None)
+    if not hf_id or text == str(hf_id):
+        return None
+    args.model = str(hf_id)
+    return str(hf_id)
+
+
 def cmd_serve_public(args: Any) -> int:
     from mtplx.expert_cli import expert_streaming_requested
 
@@ -7989,6 +8081,9 @@ def cmd_serve_public(args: Any) -> int:
         args.fan_mode = FAN_MODE_MAX if args.max else "default"
         args.open_browser = bool(choice.get("open_browser"))
         args._onboarded = True
+    # A published streaming alias/id (e.g. ``hy3-oq2e``) is rewritten to its HF
+    # repo id here so the pull/cache-resolve logic below finds the snapshot.
+    _maybe_rewrite_streaming_model_ref(args)
     depth_error = _validate_public_depth(args, printer=_print_serve_start_line)
     if depth_error is not None:
         return depth_error
@@ -8235,6 +8330,18 @@ def cmd_serve_public(args: Any) -> int:
                 json_output=bool(getattr(args, "json", False)),
             )
             return 1
+    # A resident manifest + experts.bin imply AR streaming: auto-enable it when
+    # the resolved local dir holds a valid baked streaming layout and no
+    # streaming flag was passed. Re-derive the streaming state and re-apply the
+    # AR forcing (the top-of-function pass only saw explicit flags) so the gate
+    # bypass below and the launch's generation mode both reflect the flip.
+    _maybe_enable_expert_streaming(args, runtime_model)
+    streaming_requested = expert_streaming_requested(args)
+    if streaming_requested:
+        args.no_mtp = True
+        args.load_mtp = False
+        args.generation_mode = GENERATION_MODE_AR
+        generation_mode = _generation_mode_from_args(args)
     inspection, gate_exit = _model_gate(
         runtime_model,
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
@@ -8861,6 +8968,9 @@ def _generate_one_shot_public(
             },
             [],
         )
+    # Mirror the serve path: resolve a published streaming alias/id to its HF
+    # repo id so the cache-path resolver finds the pulled snapshot.
+    _maybe_rewrite_streaming_model_ref(args)
     runtime_model, resolve_error = _resolve_runtime_model_path(
         args.model,
         cache_dir=getattr(args, "cache_dir", None),
@@ -8869,6 +8979,9 @@ def _generate_one_shot_public(
         return EXIT_TELEMETRY, resolve_error, []
     from mtplx.expert_cli import expert_streaming_requested
 
+    # Auto-enable AR streaming for a resident baked streaming layout (the AR
+    # forcing / gate bypass below already handle it once streaming is on).
+    _maybe_enable_expert_streaming(args, runtime_model)
     streaming_requested = expert_streaming_requested(args)
     inspection, gate_exit = _model_gate(
         runtime_model,
