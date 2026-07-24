@@ -1,0 +1,90 @@
+{
+  "schema": "mtplx-glm52-q1t-cache-geometry-benchmark-v1",
+  "date": "2026-07-18",
+  "goal": "exceed 5 decode tokens/s at 1024 input and 1024 output tokens",
+  "model_key": "glm52-expert-q1t",
+  "artifact": "/Users/davidtai/.cache/huggingface/glm52-expert-only-mlx-q1t",
+  "mtp_artifact": "/Users/davidtai/.cache/huggingface/glm52-mtp-layer78-q4",
+  "configuration": {
+    "context_tokens": 1024,
+    "output_tokens": 1024,
+    "depths": [0, 3],
+    "memory_limit": "96GiB",
+    "runtime_reserve": "12GiB",
+    "max_live_kv_tokens": 4096,
+    "cache_policy": "frequency",
+    "cache_scope": "layer",
+    "slot_layout": "component-banks",
+    "transient_slots": 48,
+    "read_chunk": "8MiB",
+    "q2_expert_kernel": "stock",
+    "bypass_page_cache": true,
+    "verify_strategy": "batched",
+    "compiled_verify_mode": "off",
+    "draft_core": "stock",
+    "expert_integrity": "headers-only",
+    "split_route_release": "deferred",
+    "prefetch_slots": 0,
+    "streamed_codec": "none",
+    "mtp_precision": "q4",
+    "seed": 0,
+    "temperature": 0.0
+  },
+  "control": {
+    "expert_cache_limit": "54GiB",
+    "slots_per_layer": 87,
+    "replicates": [
+      {
+        "ar_decode_tok_s": 4.496701123287338,
+        "d3_decode_tok_s": 4.931064684848495,
+        "hard_peak_gib": 71.05222927033901
+      },
+      {
+        "ar_decode_tok_s": 4.45713853231968,
+        "d3_decode_tok_s": 5.040042411988696,
+        "hard_peak_gib": 71.05222927033901
+      }
+    ],
+    "ar_mean_decode_tok_s": 4.47691982780351,
+    "d3_mean_decode_tok_s": 4.985553548418595,
+    "ar_decode_hit_rate": 0.6998370804822418,
+    "d3_decode_hit_rate": 0.689469696969697,
+    "ar_decode_misses": 184240,
+    "d3_decode_misses": 245940
+  },
+  "candidate": {
+    "expert_cache_limit": "72GiB",
+    "slots_per_layer": 116,
+    "planned_persistent_cache_gib": 71.686,
+    "planned_unallocated_gib": 1.651,
+    "replicates": [
+      {
+        "ar_decode_tok_s": 5.38819358882658,
+        "d3_decode_tok_s": 5.906641291925805,
+        "hard_peak_gib": 84.12454117275774
+      },
+      {
+        "ar_decode_tok_s": 5.262025955818371,
+        "d3_decode_tok_s": 5.96188497363195,
+        "hard_peak_gib": 84.12454117275774
+      }
+    ],
+    "ar_mean_decode_tok_s": 5.325109772322476,
+    "d3_mean_decode_tok_s": 5.934263132778877,
+    "ar_uplift_percent": 18.94583725291121,
+    "d3_uplift_percent": 19.029172491010748,
+    "ar_decode_hit_rate": 0.7751661779081134,
+    "d3_decode_hit_rate": 0.767114898989899,
+    "ar_decode_misses": 138003,
+    "d3_decode_misses": 184445,
+    "observed_token_sha256": "4b0c1741123cad8d59f8a01dfb2d3e9f30c28eef9f97573aa14def0f75a92f31",
+    "all_benchmark_gates_passed": true
+  },
+  "quality_scope": {
+    "cache_geometry_parity": "bit-identical AR and depth-3 output tokens within the t158 artifact",
+    "q2_parity": false,
+    "reason": "t158 is a lossy shadow codec derived from Q2 weights",
+    "synthetic_probe_combine_cosine_mean": 0.9223501298072904,
+    "synthetic_probe": "research/glm52-shadow-codec-probe-20260717.json"
+  }
+}

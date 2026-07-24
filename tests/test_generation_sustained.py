@@ -8,24 +8,29 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
+from mtplx.expert_streaming import RoutingPhase
 from mtplx.generation import (
     _clear_cache_every,
     _defer_verify_hidden_eval_enabled,
     _make_target_prefill_cache,
     _maybe_repage_target_prefill_cache,
     _prefill,
+    _prefill_cache_only_forward,
     _prefill_chunk_cache_cleanup_every,
     _prefill_chunk_size,
     _prefill_committed_mtp_history_streaming,
+    _prefill_with_hidden_sequence,
     _sustained_prefill_layout,
     generate_ar,
     generate_mtpk,
     restore_or_prefill_prompt_state,
 )
+from mtplx.models.expert_mlx import current_expert_routing_phase
 from mtplx.mtp_patch import MTPContract
 from mtplx.profiles import DEFAULT_HF_MODEL_ID
 from mtplx.runtime import MTPLXRuntime
 from mtplx.sampling import SamplerConfig
+from mtplx.vision.splice import VisionSplice
 
 
 class TinyTokenizer:
@@ -145,6 +150,23 @@ class OffsetCache:
         return n
 
 
+class CompilableOffsetCache(OffsetCache):
+    step = 64
+
+    def __init__(self):
+        super().__init__()
+        self.keys = mx.zeros((1, 1, 64, 1), dtype=mx.float32)
+        self.values = mx.zeros((1, 1, 64, 1), dtype=mx.float32)
+
+    def update_and_fetch(self, keys, values):
+        steps = int(keys.shape[2])
+        start = mx.array(self.offset, dtype=mx.int32)
+        self.keys = mx.slice_update(self.keys, keys, start, axes=(2,))
+        self.values = mx.slice_update(self.values, values, start, axes=(2,))
+        self.offset += steps
+        return self.keys, self.values
+
+
 class RejectingTinyMTPModel(AcceptingTinyMTPModel):
     def __init__(self):
         super().__init__()
@@ -174,6 +196,389 @@ class RejectingTinyMTPModel(AcceptingTinyMTPModel):
         )
 
 
+class CycleTrackingTinyMTPModel(AcceptingTinyMTPModel):
+    def __init__(
+        self,
+        *,
+        draft_token: int = 1,
+        target_verify_token: int = 1,
+        fail_on_draft: int | None = None,
+    ):
+        super().__init__()
+        self.draft_token = int(draft_token)
+        self.target_verify_token = int(target_verify_token)
+        self.fail_on_draft = fail_on_draft
+        self.cycle_active = False
+        self.draft_calls = 0
+        self.finish_calls: list[object] = []
+
+    def make_mtp_cache(self):
+        return [OffsetCache()]
+
+    def finish_mtp_cycle(self, mtp_cache):
+        self.finish_calls.append(mtp_cache)
+        self.cycle_active = False
+
+    def __call__(self, input_ids, *, cache=None, **kwargs):
+        if self.cycle_active:
+            raise AssertionError("target verification observed active MTP cycle")
+        result = super().__call__(input_ids, cache=cache, **kwargs)
+        if int(input_ids.shape[1]) <= 1:
+            return result
+        token_logits = mx.full((4,), -1.0, dtype=mx.float32)
+        token_logits[self.target_verify_token] = 1.0
+        if isinstance(result, tuple):
+            logits, hidden = result
+            return mx.zeros_like(logits) + token_logits, hidden
+        return mx.zeros_like(result) + token_logits
+
+    def mtp_forward(self, hidden_states, next_token_ids, **kwargs):
+        self.draft_calls += 1
+        self.cycle_active = True
+        if self.fail_on_draft == self.draft_calls:
+            raise RuntimeError("synthetic recurrent draft failure")
+        length = int(next_token_ids.shape[1])
+        hidden = mx.zeros((1, length, 2), dtype=mx.float32)
+        token_logits = mx.full((4,), -1.0, dtype=mx.float32)
+        token_logits[self.draft_token] = 1.0
+        logits = mx.zeros((1, length, 4), dtype=mx.float32) + token_logits
+        if kwargs.get("return_hidden", False):
+            return logits, hidden
+        return logits
+
+
+class VisionTinyMTPModel(CycleTrackingTinyMTPModel):
+    def __init__(self):
+        super().__init__()
+        self.model = SimpleNamespace(
+            embed_tokens=lambda token_ids: mx.zeros(
+                (*token_ids.shape, 2),
+                dtype=mx.float32,
+            )
+        )
+        self.input_embeddings: list[mx.array | None] = []
+
+    def __call__(self, input_ids, *, input_embeddings=None, cache=None, **kwargs):
+        self.input_embeddings.append(input_embeddings)
+        return super().__call__(input_ids, cache=cache, **kwargs)
+
+
+class CompilableCycleTrackingTinyMTPModel(CycleTrackingTinyMTPModel):
+    def make_mtp_cache(self):
+        return [CompilableOffsetCache()]
+
+    @staticmethod
+    def _append_cache(mtp_cache, next_token_ids) -> None:
+        if mtp_cache is None:
+            return
+        values = next_token_ids.astype(mx.float32).reshape(
+            1,
+            1,
+            int(next_token_ids.shape[1]),
+            1,
+        )
+        mtp_cache[0].update_and_fetch(values, values + 100.0)
+
+    def mtp_forward(self, hidden_states, next_token_ids, **kwargs):
+        result = super().mtp_forward(hidden_states, next_token_ids, **kwargs)
+        self._append_cache(kwargs.get("mtp_cache"), next_token_ids)
+        return result
+
+    def mtp_update_cache(
+        self,
+        hidden_states,
+        next_token_ids,
+        *,
+        mtp_cache=None,
+        **_kwargs,
+    ):
+        self._append_cache(mtp_cache, next_token_ids)
+        return hidden_states
+
+
+class CompilableRejectAtSecondDepthTinyMTPModel(CompilableCycleTrackingTinyMTPModel):
+    def __call__(self, input_ids, *, cache=None, **kwargs):
+        if self.cycle_active:
+            raise AssertionError("target verification observed active MTP cycle")
+        result = TinyModel.__call__(self, input_ids, cache=cache, **kwargs)
+        row_tokens = [int(token) for row in input_ids.tolist() for token in row]
+        logits = mx.full((1, len(row_tokens), 4), -100.0, dtype=mx.float32)
+        for index, token in enumerate(row_tokens):
+            logits[0, index, (token + 1) % 4] = 100.0
+        if isinstance(result, tuple):
+            _unused_logits, hidden = result
+            return logits, hidden
+        return logits
+
+    def mtp_forward(self, hidden_states, next_token_ids, **kwargs):
+        self.draft_calls += 1
+        self.cycle_active = True
+        depth = int(kwargs.get("mtp_depth", 1))
+        draft_token = (3, 2, 1)[min(depth - 1, 2)]
+        hidden = mx.zeros((1, 1, 2), dtype=mx.float32)
+        logits = mx.full((1, 1, 4), -100.0, dtype=mx.float32)
+        logits[0, 0, draft_token] = 100.0
+        self._append_cache(kwargs.get("mtp_cache"), next_token_ids)
+        if kwargs.get("return_hidden", False):
+            return logits, hidden
+        return logits
+
+
+class CompilableCaptureCommitRejectTinyMTPModel(
+    CompilableRejectAtSecondDepthTinyMTPModel
+):
+    def __init__(self):
+        super().__init__()
+        self.target_cache = [OffsetCache()]
+
+    def make_cache(self):
+        return self.target_cache
+
+    def __call__(self, input_ids, *, cache=None, **kwargs):
+        if cache:
+            for entry in cache:
+                entry.offset += int(input_ids.shape[1])
+        return super().__call__(input_ids, cache=cache, **kwargs)
+
+
+class PatternedCaptureCommitTinyMTPModel(AcceptingTinyMTPModel):
+    """Deterministic long-run fixture with mixed accept/reject prefixes."""
+
+    vocab_size = 17
+
+    def __init__(self):
+        super().__init__()
+        self.target_cache = [OffsetCache()]
+
+    def make_cache(self):
+        return self.target_cache
+
+    def make_mtp_cache(self):
+        return [CompilableOffsetCache()]
+
+    @classmethod
+    def _target_token(cls, source_token: int) -> int:
+        return (int(source_token) * 5 + 3) % cls.vocab_size
+
+    @classmethod
+    def _draft_token(cls, source_token: int, depth: int) -> int:
+        target = cls._target_token(source_token)
+        if (int(source_token) + 2 * int(depth)) % 6 in {2, 3}:
+            return (target + 2) % cls.vocab_size
+        return target
+
+    @staticmethod
+    def _append_cache(mtp_cache, next_token_ids) -> None:
+        if mtp_cache is None:
+            return
+        values = next_token_ids.astype(mx.float32).reshape(
+            1,
+            1,
+            int(next_token_ids.shape[1]),
+            1,
+        )
+        mtp_cache[0].update_and_fetch(values, values + 100.0)
+
+    def __call__(self, input_ids, *, cache=None, return_hidden=False, **_kwargs):
+        if cache:
+            for entry in cache:
+                entry.offset += int(input_ids.shape[1])
+        row_tokens = [int(token) for row in input_ids.tolist() for token in row]
+        hidden = mx.array(row_tokens, dtype=mx.float32).reshape(1, -1, 1)
+        hidden = mx.concatenate((hidden, hidden + 0.5), axis=-1)
+        logits = mx.full(
+            (1, len(row_tokens), self.vocab_size),
+            -100.0,
+            dtype=mx.float32,
+        )
+        for index, token in enumerate(row_tokens):
+            logits[0, index, self._target_token(token)] = 100.0
+        if return_hidden:
+            return logits, hidden
+        return logits
+
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        *,
+        mtp_cache=None,
+        return_hidden=False,
+        mtp_depth=None,
+        **_kwargs,
+    ):
+        source_token = int(next_token_ids.item())
+        depth = int(mtp_depth or 1)
+        draft_token = self._draft_token(source_token, depth)
+        self._append_cache(mtp_cache, next_token_ids)
+        hidden = mx.array([[[float(draft_token), float(depth)]]], dtype=mx.float32)
+        logits = mx.full((1, 1, self.vocab_size), -100.0, dtype=mx.float32)
+        logits[0, 0, draft_token] = 100.0
+        if return_hidden:
+            return logits, hidden
+        return logits
+
+    def mtp_update_cache(
+        self,
+        hidden_states,
+        next_token_ids,
+        *,
+        mtp_cache=None,
+        **_kwargs,
+    ):
+        self._append_cache(mtp_cache, next_token_ids)
+        return hidden_states
+
+
+class StopAfterFirstDraftPolicy:
+    current_depth = 3
+    wants_draft_metrics = False
+
+    def should_continue_after_draft(self, **_kwargs):
+        return {"continue": False, "reason": "synthetic_early_exit"}
+
+    def observe(self, **_kwargs):
+        return {"action": "hold", "next_depth": self.current_depth}
+
+
+class RejectAtSecondDepthTinyMTPModel(CycleTrackingTinyMTPModel):
+    def __init__(self):
+        super().__init__()
+
+    def __call__(self, input_ids, *, cache=None, **kwargs):
+        if self.cycle_active:
+            raise AssertionError("target verification observed active MTP cycle")
+        result = TinyModel.__call__(self, input_ids, cache=cache, **kwargs)
+        row_tokens = [int(token) for row in input_ids.tolist() for token in row]
+        logits = mx.full((1, len(row_tokens), 4), -100.0, dtype=mx.float32)
+        for index, token in enumerate(row_tokens):
+            logits[0, index, (token + 1) % 4] = 100.0
+        if isinstance(result, tuple):
+            _unused_logits, hidden = result
+            return logits, hidden
+        return logits
+
+    def mtp_forward(self, hidden_states, next_token_ids, **kwargs):
+        self.draft_calls += 1
+        self.cycle_active = True
+        draft_tokens = (2, 0, 1)
+        draft_token = draft_tokens[min(self.draft_calls - 1, len(draft_tokens) - 1)]
+        hidden = mx.zeros((1, 1, 2), dtype=mx.float32)
+        logits = mx.full((1, 1, 4), -100.0, dtype=mx.float32)
+        logits[0, 0, draft_token] = 100.0
+        if kwargs.get("return_hidden", False):
+            return logits, hidden
+        return logits
+
+
+class PendingBonusThenRejectTinyMTPModel(CycleTrackingTinyMTPModel):
+    def __init__(self):
+        super().__init__()
+        self.target_cache = [OffsetCache()]
+        self.committed_mtp_cache: list[OffsetCache] | None = None
+        self.cycle_base: int | None = None
+
+    @property
+    def target_cache_offset(self) -> int:
+        return self.target_cache[0].offset
+
+    @property
+    def mtp_committed_offset(self) -> int:
+        assert self.committed_mtp_cache is not None
+        return self.committed_mtp_cache[0].offset
+
+    def make_cache(self):
+        return self.target_cache
+
+    def make_mtp_cache(self):
+        self.committed_mtp_cache = [OffsetCache()]
+        return self.committed_mtp_cache
+
+    def __call__(self, input_ids, *, cache=None, **kwargs):
+        if self.cycle_active:
+            raise AssertionError("target verification observed active MTP cycle")
+        if cache:
+            for entry in cache:
+                entry.offset += int(input_ids.shape[1])
+        result = TinyModel.__call__(self, input_ids, cache=cache, **kwargs)
+        row_tokens = [int(token) for row in input_ids.tolist() for token in row]
+        logits = mx.full((1, len(row_tokens), 8), -100.0, dtype=mx.float32)
+        for index, token in enumerate(row_tokens):
+            logits[0, index, (token + 1) % 8] = 100.0
+        if isinstance(result, tuple):
+            _unused_logits, hidden = result
+            return logits, hidden
+        return logits
+
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        *,
+        mtp_cache=None,
+        **kwargs,
+    ):
+        self.draft_calls += 1
+        if not self.cycle_active:
+            self.cycle_base = mtp_cache[0].offset if mtp_cache else 0
+        self.cycle_active = True
+        source_token = int(next_token_ids.item())
+        draft_token = 0 if self.draft_calls == 4 else (source_token + 1) % 8
+        if mtp_cache:
+            for entry in mtp_cache:
+                entry.offset += 1
+        hidden = mx.zeros((1, 1, 2), dtype=mx.float32)
+        logits = mx.full((1, 1, 8), -100.0, dtype=mx.float32)
+        logits[0, 0, draft_token] = 100.0
+        if kwargs.get("return_hidden", False):
+            return logits, hidden
+        return logits
+
+    def mtp_update_cache(
+        self,
+        hidden_states,
+        next_token_ids,
+        *,
+        mtp_cache=None,
+        **_kwargs,
+    ):
+        if mtp_cache:
+            for entry in mtp_cache:
+                entry.offset += int(next_token_ids.shape[1])
+        return hidden_states
+
+    def finish_mtp_cycle(self, mtp_cache):
+        super().finish_mtp_cycle(mtp_cache)
+        if mtp_cache and self.cycle_base is not None:
+            target = self.cycle_base + 1
+            for entry in mtp_cache:
+                entry.trim(max(0, entry.offset - target))
+        self.cycle_base = None
+
+
+class BatchShapeDriftTinyMTPModel(PendingBonusThenRejectTinyMTPModel):
+    """Expose a verifier correction that differs from qlen=1 replay."""
+
+    verifier_correction = 6
+
+    def __call__(self, input_ids, *, cache=None, **kwargs):
+        result = super().__call__(input_ids, cache=cache, **kwargs)
+        if int(input_ids.shape[1]) <= 1:
+            return result
+
+        if isinstance(result, tuple):
+            logits, hidden = result
+            logits = mx.array(logits)
+            logits[:, 0, :] = -100.0
+            logits[:, 0, self.verifier_correction] = 100.0
+            return logits, hidden
+
+        logits = mx.array(result)
+        logits[:, 0, :] = -100.0
+        logits[:, 0, self.verifier_correction] = 100.0
+        return logits
+
+
 def _runtime(model: TinyModel, *, mtp_enabled: bool = True) -> MTPLXRuntime:
     return MTPLXRuntime(
         model=model,
@@ -182,6 +587,884 @@ def _runtime(model: TinyModel, *, mtp_enabled: bool = True) -> MTPLXRuntime:
         mtp_enabled=mtp_enabled,
         contract=MTPContract(),
     )
+
+
+def _run_cycle_tracking_mtpk(
+    model: CycleTrackingTinyMTPModel,
+    *,
+    max_tokens: int = 2,
+    speculative_depth: int = 1,
+    stop_token_ids: set[int] | None = None,
+    adaptive_policy=None,
+):
+    return generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=max_tokens,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=speculative_depth,
+        mtp_history_policy="cycle",
+        verify_strategy="batched",
+        stop_token_ids=set() if stop_token_ids is None else stop_token_ids,
+        adaptive_policy=adaptive_policy,
+    )
+
+
+def test_generate_mtpk_rejects_fresh_recurrent_cache_before_prefill():
+    model = AcceptingTinyMTPModel()
+    model.mtp_recurrent_requires_persistent_cache = True
+
+    with pytest.raises(ValueError, match="persistent cache"):
+        generate_mtpk(
+            _runtime(model, mtp_enabled=True),
+            [0],
+            max_tokens=3,
+            sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+            speculative_depth=2,
+            mtp_cache_policy="fresh",
+            mtp_history_policy="cycle",
+            verify_strategy="batched",
+            stop_token_ids=set(),
+        )
+
+    assert model.calls == []
+
+
+def test_generate_mtpk_configures_one_depth_gated_operator_mode_before_prefill():
+    class DepthConfiguredModel(CycleTrackingTinyMTPModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.configured_depths: list[int] = []
+
+        def configure_mtp_execution_depth(self, depth: int) -> None:
+            assert self.calls == []
+            self.configured_depths.append(depth)
+
+    model = DepthConfiguredModel()
+    generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=2,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=3,
+        mtp_history_policy="cycle",
+        verify_strategy="batched",
+        stop_token_ids=set(),
+    )
+
+    assert model.configured_depths == [3]
+
+
+@pytest.mark.parametrize(
+    ("generation_kwargs", "environment"),
+    [
+        ({"adaptive_policy": StopAfterFirstDraftPolicy()}, {}),
+        ({"draft_margin_threshold": 0.5}, {}),
+        (
+            {},
+            {
+                "MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS": "1",
+                "MTPLX_LATE_DEPTH_BEFORE": "1",
+                "MTPLX_LATE_DEPTH_AFTER": "3",
+            },
+        ),
+    ],
+    ids=("adaptive", "confidence-gated", "late-switch"),
+)
+def test_generate_mtpk_fails_closed_for_dynamic_execution_depths(
+    monkeypatch: pytest.MonkeyPatch,
+    generation_kwargs,
+    environment,
+):
+    class DepthConfiguredModel(CycleTrackingTinyMTPModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.configured_depths: list[int | None] = []
+
+        def configure_mtp_execution_depth(self, depth: int | None) -> None:
+            assert self.calls == []
+            self.configured_depths.append(depth)
+
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    model = DepthConfiguredModel()
+    generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=2,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=3,
+        mtp_history_policy="cycle",
+        verify_strategy="batched",
+        stop_token_ids=set(),
+        **generation_kwargs,
+    )
+
+    assert model.configured_depths == [None]
+
+
+def test_generate_mtpk_cycle_cleanup_precedes_rejection_verify():
+    model = CycleTrackingTinyMTPModel(draft_token=2, target_verify_token=1)
+
+    output = _run_cycle_tracking_mtpk(model)
+
+    assert output.stats.rejected_drafts == 1
+    assert len(model.finish_calls) == 1
+    assert model.cycle_active is False
+
+
+def test_generate_mtpk_cycle_cleanup_precedes_accepted_stop_verify():
+    model = CycleTrackingTinyMTPModel(draft_token=2, target_verify_token=2)
+
+    output = _run_cycle_tracking_mtpk(
+        model,
+        max_tokens=3,
+        speculative_depth=2,
+        stop_token_ids={2},
+    )
+
+    assert output.tokens == [1, 2]
+    assert len(model.finish_calls) == 1
+    assert model.cycle_active is False
+
+
+def test_generate_mtpk_cycle_cleanup_precedes_adaptive_early_exit_verify():
+    model = CycleTrackingTinyMTPModel()
+
+    output = _run_cycle_tracking_mtpk(
+        model,
+        max_tokens=3,
+        speculative_depth=3,
+        adaptive_policy=StopAfterFirstDraftPolicy(),
+    )
+
+    assert output.stats.events[0]["gated_stop_depth"] == 1
+    assert len(model.finish_calls) == 1
+    assert model.cycle_active is False
+
+
+def test_generate_mtpk_cycle_cleanup_runs_when_recurrent_draft_raises():
+    model = CycleTrackingTinyMTPModel(fail_on_draft=1)
+
+    with pytest.raises(RuntimeError, match="synthetic recurrent draft failure"):
+        _run_cycle_tracking_mtpk(model)
+
+    assert len(model.finish_calls) == 1
+    assert model.cycle_active is False
+
+
+def test_generate_mtpk_evaluated_by_depth_stops_at_first_rejection():
+    model = RejectAtSecondDepthTinyMTPModel()
+
+    output = generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=4,
+        sampler=SamplerConfig(temperature=0.6, top_p=1.0, top_k=1),
+        speculative_depth=3,
+        mtp_history_policy="cycle",
+        verify_strategy="batched",
+        stop_token_ids={3},
+    )
+
+    assert output.tokens == [1, 2, 3]
+    assert output.stats.drafted_by_depth == [1, 1, 1]
+    assert output.stats.evaluated_by_depth == [1, 1, 0]
+    assert output.stats.accepted_by_depth == [1, 0, 0]
+    assert output.stats.evaluated_drafts == 2
+    assert output.stats.fully_accepted_verify_calls == 0
+    assert output.stats.mean_accept_probability_by_depth == [1.0, 0.0, None]
+
+
+def test_generate_mtpk_counts_a_fully_accepted_verify_call():
+    model = CycleTrackingTinyMTPModel()
+
+    output = _run_cycle_tracking_mtpk(
+        model,
+        max_tokens=4,
+        speculative_depth=3,
+    )
+
+    assert output.stats.evaluated_by_depth == [1, 1, 1]
+    assert output.stats.evaluated_drafts == 3
+    assert output.stats.fully_accepted_verify_calls == 1
+
+
+@pytest.mark.parametrize("depth", range(1, 8))
+def test_device_k_draft_preserves_serial_tokens_and_verification(
+    monkeypatch,
+    depth: int,
+):
+    import mtplx.generation as generation
+
+    monkeypatch.setattr(
+        generation.mx,
+        "compile",
+        lambda fn: fn,
+    )
+    sampler = SamplerConfig(temperature=0.0, top_p=1.0, top_k=4)
+    stock_runtime = _runtime(
+        CompilableCycleTrackingTinyMTPModel(),
+        mtp_enabled=True,
+    )
+    stock = generate_mtpk(
+        stock_runtime,
+        [0, 1],
+        max_tokens=depth + 1,
+        sampler=sampler,
+        speculative_depth=depth,
+        mtp_history_policy="committed",
+        verify_strategy="batched",
+        draft_core="stock",
+        stop_token_ids=set(),
+        capture_final_state=True,
+    )
+    compiled_runtime = _runtime(
+        CompilableCycleTrackingTinyMTPModel(),
+        mtp_enabled=True,
+    )
+    compiled = generate_mtpk(
+        compiled_runtime,
+        [0, 1],
+        max_tokens=depth + 1,
+        sampler=sampler,
+        speculative_depth=depth,
+        mtp_history_policy="committed",
+        verify_strategy="batched",
+        draft_core="device-k",
+        stop_token_ids=set(),
+        capture_final_state=True,
+    )
+
+    assert compiled.tokens == stock.tokens
+    assert compiled.stats.accepted_by_depth == stock.stats.accepted_by_depth
+    assert compiled.stats.evaluated_by_depth == stock.stats.evaluated_by_depth
+    assert compiled.stats.verify_calls == stock.stats.verify_calls
+    trace_fields = ("depth", "token", "accepted", "accept_probability", "correction")
+    assert [
+        {name: draft.get(name) for name in trace_fields}
+        for draft in compiled.stats.events[0]["drafts"]
+    ] == [
+        {name: draft.get(name) for name in trace_fields}
+        for draft in stock.stats.events[0]["drafts"]
+    ]
+    assert (
+        compiled.stats.events[0]["accepted_depths"]
+        == stock.stats.events[0]["accepted_depths"]
+    )
+    assert compiled.stats.events[0].get("rejected_at_depth") == stock.stats.events[
+        0
+    ].get("rejected_at_depth")
+    assert compiled.stats.events[0]["verify_strategy"] == "batched"
+    assert compiled.stats.draft_core["selected"] == "device-k"
+    assert compiled.stats.draft_core["per_depth"][str(depth)]["calls"] == 1
+    assert compiled_runtime.diagnostic_counters["make_mtp_cache_calls"] == 1
+    assert compiled.stats.draft_core["fallbacks"] == 0
+    assert compiled.stats.draft_core["organic_compile_calls"] == 0
+    assert compiled.stats.draft_core["per_depth"][str(depth)]["live_cache_commits"] == 1
+    assert compiled.stats.draft_core["per_depth"][str(depth)]["host_syncs"] == 0
+    assert (
+        compiled.stats.draft_core["per_depth"][str(depth)]["host_token_transfers"] == 0
+    )
+    assert (
+        compiled.stats.draft_core["per_depth"][str(depth)]["device_handoff_calls"] == 1
+    )
+    assert (
+        compiled.stats.draft_core["per_depth"][str(depth)]["acceptance_host_transfers"]
+        == 1
+    )
+    assert (
+        compiled.stats.draft_core["per_depth"][str(depth)]["per_row_argmax_host_reads"]
+        == 0
+    )
+    assert compiled.stats.events[0]["draft_device_handoff"]["enabled"] is True
+    assert compiled.stats.events[0]["draft_device_handoff"]["proposal_rows"] == depth
+    assert compiled.stats.events[0]["draft_device_handoff"]["verify_rows"] == depth + 1
+    assert compiled.stats.draft_core["device_handoff"] == {
+        "schema": "compiled-mtp-device-handoff-v1",
+        "full_verify_width": True,
+        "calls": 1,
+        "fallbacks": 0,
+        "fallback_reasons": {},
+        "acceptance_host_transfers": 1,
+        "acceptance_payload_ints": depth + 3,
+        "per_row_argmax_host_reads": 0,
+        "qualification_eligible": True,
+    }
+    assert compiled.stats.events[0]["draft_core_dispatch"][
+        "primary_optimized_depth"
+    ] is (depth == 3)
+    prewarm_time = compiled.stats.draft_core["prewarm_time_s"]
+    assert prewarm_time > 0.0
+    assert compiled.stats.decode_elapsed_s == pytest.approx(
+        compiled.stats.elapsed_s - compiled.stats.prompt_eval_time_s - prewarm_time
+    )
+    assert stock.final_state is not None
+    assert compiled.final_state is not None
+    stock_cache = stock.final_state.final_committed_mtp_cache[0]
+    compiled_cache = compiled.final_state.final_committed_mtp_cache[0]
+    mx.eval(stock_cache.keys, stock_cache.values)
+    mx.eval(compiled_cache.keys, compiled_cache.values)
+    assert compiled_cache.offset == stock_cache.offset
+    assert mx.array_equal(compiled_cache.keys, stock_cache.keys).item()
+    assert mx.array_equal(compiled_cache.values, stock_cache.values).item()
+
+
+def test_device_k_prewarm_failure_falls_back_without_dispatch(monkeypatch):
+    import mtplx.generation as generation
+
+    class FailingPrewarmBank:
+        def __init__(self):
+            self.run_calls = 0
+
+        def prewarm(self, *_args, **_kwargs):
+            raise RuntimeError("synthetic compile failure")
+
+        def run(self, *_args, **_kwargs):
+            self.run_calls += 1
+            raise AssertionError("failed prewarm must never enter measured dispatch")
+
+    bank = FailingPrewarmBank()
+    monkeypatch.setattr(
+        generation,
+        "_get_compiled_mtp_draft_bank",
+        lambda *_args, **_kwargs: bank,
+    )
+
+    output = generate_mtpk(
+        _runtime(CompilableCycleTrackingTinyMTPModel(), mtp_enabled=True),
+        [0, 1],
+        max_tokens=4,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=3,
+        mtp_history_policy="committed",
+        verify_strategy="batched",
+        draft_core="device-k",
+        stop_token_ids=set(),
+    )
+
+    assert bank.run_calls == 0
+    assert output.stats.draft_core["selected"] == "stock"
+    assert output.stats.draft_core["fallback_reasons"] == {"prewarm:RuntimeError": 1}
+
+
+def test_device_k_handoff_setup_failure_falls_back_before_state_commit(monkeypatch):
+    import mtplx.generation as generation
+
+    monkeypatch.setattr(generation.mx, "compile", lambda fn: fn)
+
+    def fail_before_commit(self, *_args, **_kwargs):
+        del self
+        raise RuntimeError("synthetic device handoff setup failure")
+
+    monkeypatch.setattr(
+        generation.CompiledMTPDraftBank,
+        "run_device",
+        fail_before_commit,
+    )
+
+    output = generate_mtpk(
+        _runtime(CompilableCycleTrackingTinyMTPModel(), mtp_enabled=True),
+        [0, 1],
+        max_tokens=4,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=3,
+        mtp_history_policy="committed",
+        verify_strategy="batched",
+        draft_core="device-k",
+        stop_token_ids=set(),
+    )
+
+    assert output.tokens == [1, 1, 1, 1]
+    assert output.stats.draft_core["selected"] == "stock"
+    assert output.stats.draft_core["fallbacks"] == 1
+    assert output.stats.draft_core["fallback_reasons"] == {"dispatch:RuntimeError": 1}
+    assert output.stats.draft_core["device_handoff"]["fallbacks"] == 1
+    assert output.stats.draft_core["device_handoff"]["fallback_reasons"] == {
+        "dispatch:RuntimeError": 1
+    }
+    assert output.stats.events[0]["draft_core_fallback"]["reason"] == (
+        "dispatch:RuntimeError"
+    )
+
+
+def test_device_k_full_width_handoff_preserves_lazy_bonus_host_path(monkeypatch):
+    import mtplx.generation as generation
+
+    monkeypatch.setattr(generation.mx, "compile", lambda fn: fn)
+    monkeypatch.setenv("MTPLX_LAZY_BONUS_VERIFY", "1")
+
+    output = generate_mtpk(
+        _runtime(CompilableCycleTrackingTinyMTPModel(), mtp_enabled=True),
+        [0, 1],
+        max_tokens=4,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=3,
+        mtp_history_policy="committed",
+        verify_strategy="batched",
+        draft_core="device-k",
+        stop_token_ids=set(),
+    )
+
+    event = output.stats.events[0]
+    depth = output.stats.draft_core["per_depth"]["3"]
+    assert event["draft_device_handoff"] == {
+        "enabled": False,
+        "reason": "lazy_bonus_verify",
+        "proposal_rows": 3,
+        "verify_rows": 4,
+    }
+    assert event["lazy_bonus_verify"]["enabled"] is True
+    assert event["lazy_bonus_verify"]["verify_input_tokens"] == 3
+    assert depth["host_syncs"] == 1
+    assert depth["host_token_transfers"] == 1
+    assert depth["device_handoff_calls"] == 0
+    assert output.stats.draft_core["device_handoff"]["qualification_eligible"] is False
+    assert output.stats.draft_core["device_handoff"]["fallbacks"] == 1
+    assert output.stats.draft_core["device_handoff"]["fallback_reasons"] == {
+        "lazy_bonus_verify": 1
+    }
+
+
+def test_device_k_committed_history_reject_rolls_back_exact_live_cache(monkeypatch):
+    import mtplx.generation as generation
+
+    monkeypatch.setattr(generation.mx, "compile", lambda fn: fn)
+    sampler = SamplerConfig(temperature=0.0, top_p=1.0, top_k=4)
+
+    def run(draft_core: str):
+        return generate_mtpk(
+            _runtime(
+                CompilableRejectAtSecondDepthTinyMTPModel(),
+                mtp_enabled=True,
+            ),
+            [0, 1],
+            max_tokens=4,
+            sampler=sampler,
+            speculative_depth=3,
+            mtp_history_policy="committed",
+            verify_strategy="batched",
+            draft_core=draft_core,
+            stop_token_ids={0},
+            capture_final_state=True,
+        )
+
+    stock = run("stock")
+    compiled = run("device-k")
+
+    assert compiled.tokens == stock.tokens == [2, 3, 0]
+    assert compiled.stats.accepted_by_depth == stock.stats.accepted_by_depth
+    assert compiled.stats.accepted_by_depth == [1, 0, 0]
+    assert compiled.stats.draft_core["fallbacks"] == 0
+    assert compiled.final_state is not None
+    assert stock.final_state is not None
+    stock_cache = stock.final_state.final_committed_mtp_cache[0]
+    compiled_cache = compiled.final_state.final_committed_mtp_cache[0]
+    mx.eval(stock_cache.keys, stock_cache.values)
+    mx.eval(compiled_cache.keys, compiled_cache.values)
+    assert compiled_cache.offset == stock_cache.offset
+    assert mx.array_equal(compiled_cache.keys, stock_cache.keys).item()
+    assert mx.array_equal(compiled_cache.values, stock_cache.values).item()
+
+
+def test_device_k_capture_commit_avoids_target_rollback_and_reforward(monkeypatch):
+    import mtplx.generation as generation
+
+    monkeypatch.setattr(generation.mx, "compile", lambda fn: fn)
+    monkeypatch.setenv("MTPLX_LAZY_BONUS_VERIFY", "0")
+
+    def fail_target_rollback(*_args, **_kwargs):
+        raise AssertionError(
+            "successful capture commit must not roll target cache back"
+        )
+
+    monkeypatch.setattr(generation, "rollback_after_verify", fail_target_rollback)
+    model = CompilableCaptureCommitRejectTinyMTPModel()
+    runtime = _runtime(model, mtp_enabled=True)
+    call_kinds: list[str] = []
+    forward_widths: list[int] = []
+    capture_widths: list[int] = []
+    original_forward = runtime.forward_ar
+
+    def tracked_forward(input_ids, **kwargs):
+        call_kinds.append("forward")
+        forward_widths.append(int(input_ids.shape[1]))
+        return original_forward(input_ids, **kwargs)
+
+    def tracked_capture(input_ids, *, cache=None, return_hidden=False, **kwargs):
+        del kwargs
+        call_kinds.append("capture")
+        capture_widths.append(int(input_ids.shape[1]))
+        result = model(
+            input_ids,
+            cache=cache,
+            return_hidden=return_hidden,
+        )
+        if return_hidden:
+            logits, hidden = result
+            return logits, hidden, {}
+        return result, {}
+
+    runtime.forward_ar = tracked_forward
+    runtime.forward_ar_capture = tracked_capture
+
+    output = generate_mtpk(
+        runtime,
+        [0, 1],
+        max_tokens=4,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=3,
+        mtp_history_policy="committed",
+        verify_strategy="capture_commit",
+        draft_core="device-k",
+        stop_token_ids={0},
+    )
+
+    assert output.tokens == [2, 3, 0]
+    assert capture_widths == [4]
+    assert sum(forward_widths) == 2
+    capture_index = call_kinds.index("capture")
+    assert "forward" not in call_kinds[capture_index + 1 :]
+    assert model.target_cache[0].offset == 4
+    assert output.stats.rollback_time_s == 0.0
+    assert output.stats.repair_time_s == 0.0
+    assert output.stats.capture_commit_time_s > 0.0
+    assert output.stats.events[0]["capture_repair"] == (
+        "captured_prefix_pending_correction"
+    )
+    assert output.stats.events[0]["verify_strategy"] == "capture_commit"
+    assert output.stats.draft_core["selected"] == "device-k"
+
+
+@pytest.mark.parametrize("depth", range(1, 8))
+def test_device_k_capture_commit_matches_stock_across_patterned_cycles(
+    monkeypatch,
+    depth: int,
+):
+    import mtplx.generation as generation
+
+    monkeypatch.setattr(generation.mx, "compile", lambda fn: fn)
+    monkeypatch.setenv("MTPLX_LAZY_BONUS_VERIFY", "0")
+
+    def fail_target_rollback(*_args, **_kwargs):
+        raise AssertionError("capture_commit parity must not roll back and re-forward")
+
+    monkeypatch.setattr(generation, "rollback_after_verify", fail_target_rollback)
+
+    def run(draft_core: str):
+        model = PatternedCaptureCommitTinyMTPModel()
+        runtime = _runtime(model, mtp_enabled=True)
+        call_kinds: list[str] = []
+        capture_widths: list[int] = []
+        forward_widths: list[int] = []
+        original_forward = runtime.forward_ar
+
+        def tracked_forward(input_ids, **kwargs):
+            call_kinds.append("forward")
+            forward_widths.append(int(input_ids.shape[1]))
+            return original_forward(input_ids, **kwargs)
+
+        def tracked_capture(input_ids, *, cache=None, return_hidden=False, **kwargs):
+            del kwargs
+            call_kinds.append("capture")
+            capture_widths.append(int(input_ids.shape[1]))
+            result = model(
+                input_ids,
+                cache=cache,
+                return_hidden=return_hidden,
+            )
+            if return_hidden:
+                logits, hidden = result
+                return logits, hidden, {}
+            return result, {}
+
+        runtime.forward_ar = tracked_forward
+        runtime.forward_ar_capture = tracked_capture
+        output = generate_mtpk(
+            runtime,
+            [4, 9, 2, 11],
+            max_tokens=43,
+            sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=1),
+            speculative_depth=depth,
+            mtp_history_policy="committed",
+            verify_strategy="capture_commit",
+            draft_core=draft_core,
+            stop_token_ids=set(),
+            capture_final_state=True,
+        )
+        return (
+            model,
+            output,
+            call_kinds,
+            capture_widths,
+            forward_widths,
+        )
+
+    stock_model, stock, stock_calls, stock_captures, stock_forwards = run("stock")
+    device_model, device, device_calls, device_captures, device_forwards = run(
+        "device-k"
+    )
+
+    def event_contract(output):
+        draft_fields = (
+            "depth",
+            "token",
+            "accepted",
+            "accept_probability",
+            "correction",
+        )
+        event_fields = (
+            "primary",
+            "primary_already_emitted",
+            "depth",
+            "accepted_depths",
+            "rejected_at_depth",
+            "bonus_token",
+            "pending_primary",
+            "capture_repair",
+        )
+        return [
+            {
+                **{name: event.get(name) for name in event_fields},
+                "drafts": [
+                    {name: draft.get(name) for name in draft_fields}
+                    for draft in event["drafts"]
+                ],
+            }
+            for event in output.stats.events
+        ]
+
+    assert device.tokens == stock.tokens
+    assert event_contract(device) == event_contract(stock)
+    for name in (
+        "accepted_drafts",
+        "rejected_drafts",
+        "drafted_tokens",
+        "evaluated_drafts",
+        "fully_accepted_verify_calls",
+        "bonus_tokens",
+        "correction_tokens",
+        "verify_calls",
+        "accepted_by_depth",
+        "drafted_by_depth",
+        "evaluated_by_depth",
+        "accept_probability_sum_by_depth",
+    ):
+        assert getattr(device.stats, name) == getattr(stock.stats, name)
+    assert device.stats.rejected_drafts > 2
+    assert device.stats.accepted_drafts > 2
+    assert device.stats.fully_accepted_verify_calls > 0
+    assert device.stats.evaluated_by_depth[-1] > 0
+
+    assert device_captures == stock_captures
+    assert len(device_captures) == device.stats.verify_calls
+    assert len(stock_captures) == stock.stats.verify_calls
+    assert device_calls.count("capture") == stock_calls.count("capture")
+    assert device_forwards == stock_forwards
+
+    assert stock.final_state is not None
+    assert device.final_state is not None
+    assert (
+        device.final_state.generated_token_ids == stock.final_state.generated_token_ids
+    )
+    assert device.final_state.safe_to_commit == stock.final_state.safe_to_commit
+    assert device.final_state.finish_reason == stock.final_state.finish_reason
+    assert (
+        device.final_state.mtp_history_window_tokens
+        == stock.final_state.mtp_history_window_tokens
+    )
+    assert (
+        device.final_state.mtp_history_position_base
+        == stock.final_state.mtp_history_position_base
+    )
+    mx.eval(
+        stock.final_state.final_logits,
+        stock.final_state.final_hidden,
+        device.final_state.final_logits,
+        device.final_state.final_hidden,
+    )
+    assert mx.array_equal(
+        device.final_state.final_logits,
+        stock.final_state.final_logits,
+    ).item()
+    assert mx.array_equal(
+        device.final_state.final_hidden,
+        stock.final_state.final_hidden,
+    ).item()
+    assert device_model.target_cache[0].offset == stock_model.target_cache[0].offset
+    assert device_model.target_cache[0].trimmed == stock_model.target_cache[0].trimmed
+
+    stock_cache = stock.final_state.final_committed_mtp_cache[0]
+    device_cache = device.final_state.final_committed_mtp_cache[0]
+    mx.eval(
+        stock_cache.keys, stock_cache.values, device_cache.keys, device_cache.values
+    )
+    assert device_cache.offset == stock_cache.offset
+    assert mx.array_equal(device_cache.keys, stock_cache.keys).item()
+    assert mx.array_equal(device_cache.values, stock_cache.values).item()
+    assert device.stats.draft_core["selected"] == "device-k"
+    assert device.stats.draft_core["fallbacks"] == 0
+
+
+def test_cold_committed_history_reports_exact_rows_and_tps(monkeypatch):
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "0")
+    model = CycleTrackingTinyMTPModel()
+    appended: list[tuple[list[int], int]] = []
+
+    def append_history(
+        _rt,
+        _mtp_cache,
+        hidden_states,
+        token_ids,
+        **_kwargs,
+    ):
+        appended.append((list(token_ids), int(hidden_states.shape[1])))
+        return 2.0
+
+    monkeypatch.setattr("mtplx.generation._append_mtp_history", append_history)
+    output = generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0, 1, 2, 3],
+        max_tokens=1,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=1,
+        mtp_history_policy="committed",
+        stop_token_ids=set(),
+    )
+
+    assert appended == [([1, 2, 3], 3)]
+    assert output.stats.new_prefill_tokens == 4
+    assert output.stats.prompt_mtp_history_tokens == 3
+    assert output.stats.prompt_mtp_history_time_s == 2.0
+    assert output.stats.prompt_mtp_history_tok_s == pytest.approx(1.5)
+    assert [call["tokens"] for call in model.calls] == [3, 1]
+    assert [call["return_hidden"] for call in model.calls] == [True, True]
+
+
+@pytest.mark.parametrize("prompt_ids", [[7], [0, 7]], ids=["only", "final"])
+def test_prefill_with_hidden_sequence_splices_final_vision_token(prompt_ids):
+    model = VisionTinyMTPModel()
+    vision_row = mx.array([[9.0, 10.0]], dtype=mx.float32)
+    splice = VisionSplice(
+        image_pad_token_id=7,
+        embeddings=vision_row,
+    )
+
+    _prefill_with_hidden_sequence(
+        _runtime(model, mtp_enabled=True),
+        prompt_ids,
+        hidden_variant="post_norm",
+        vision_splice=splice,
+    )
+
+    final_embeddings = model.input_embeddings[-1]
+    assert final_embeddings is not None
+    assert mx.array_equal(final_embeddings, vision_row[None, :, :]).item()
+    assert splice.remaining() == 0
+
+
+@pytest.mark.parametrize(
+    ("stop_token_ids", "expected_finish_reason"),
+    [(set(), "length"), ({1}, "stop")],
+    ids=["length", "stop"],
+)
+def test_generate_mtpk_final_state_commits_terminal_primary_to_both_caches(
+    stop_token_ids: set[int], expected_finish_reason: str
+):
+    model = PendingBonusThenRejectTinyMTPModel()
+
+    output = generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=1,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=1,
+        mtp_history_policy="committed",
+        verify_strategy="batched",
+        stop_token_ids=stop_token_ids,
+        capture_final_state=True,
+    )
+
+    assert output.tokens == [1]
+    assert output.final_state is not None
+    assert output.final_state.safe_to_commit is True
+    assert output.final_state.finish_reason == expected_finish_reason
+    assert output.stats.final_state_capture_time_s > 0.0
+    assert model.target_cache_offset == 2
+    assert model.mtp_committed_offset == 1
+
+    cold_continuation = generate_ar(
+        _runtime(PendingBonusThenRejectTinyMTPModel(), mtp_enabled=False),
+        [0, 1],
+        max_tokens=1,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        stop_token_ids=set(),
+    )
+    resumed_token = int(mx.argmax(output.final_state.final_logits[0]).item())
+    assert resumed_token == cold_continuation.tokens[0] == 2
+
+
+def test_generate_mtpk_pending_bonus_then_rejection_matches_ar():
+    sampler = SamplerConfig(temperature=0.6, top_p=1.0, top_k=1)
+    ar_model = PendingBonusThenRejectTinyMTPModel()
+    mtpk_model = PendingBonusThenRejectTinyMTPModel()
+
+    ar = generate_ar(
+        _runtime(ar_model, mtp_enabled=False),
+        [0],
+        max_tokens=6,
+        sampler=sampler,
+        stop_token_ids=set(),
+    )
+    mtpk = generate_mtpk(
+        _runtime(mtpk_model, mtp_enabled=True),
+        [0],
+        max_tokens=6,
+        sampler=sampler,
+        speculative_depth=2,
+        mtp_history_policy="committed",
+        verify_strategy="batched",
+        stop_token_ids=set(),
+        capture_final_state=True,
+    )
+
+    assert mtpk.tokens == ar.tokens == [1, 2, 3, 4, 5, 6]
+    assert mtpk.finish_reason == ar.finish_reason == "length"
+    assert mtpk.stats.generated_tokens == ar.stats.generated_tokens
+    assert mtpk.stats.events[0]["accepted_depths"] == 2
+    assert mtpk.stats.events[0]["bonus_token"] == 4
+    assert mtpk.stats.events[1]["accepted_depths"] == 1
+    assert mtpk.stats.events[1]["rejected_at_depth"] == 2
+    assert mtpk_model.target_cache_offset == 1 + mtpk.stats.generated_tokens
+    assert mtpk_model.mtp_committed_offset == mtpk.stats.generated_tokens
+
+
+def test_generate_mtpk_greedy_rejection_commits_batched_verifier_correction():
+    model = BatchShapeDriftTinyMTPModel()
+
+    output = generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=3,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=8),
+        speculative_depth=1,
+        mtp_history_policy="committed",
+        verify_strategy="batched",
+        stop_token_ids=set(),
+        capture_final_state=True,
+    )
+
+    rejected = output.stats.events[0]
+    correction = rejected["drafts"][0]["correction"]
+    assert rejected["rejected_at_depth"] == 1
+    assert correction == model.verifier_correction
+    assert output.tokens[:2] == [1, correction]
+    assert len(output.tokens) == 3
+    assert output.final_state is not None
+    assert output.final_state.safe_to_commit is True
+    assert output.final_state.generated_token_ids == tuple(output.tokens)
+    assert model.target_cache_offset == 1 + len(output.tokens)
+    assert model.mtp_committed_offset == len(output.tokens)
 
 
 def test_contiguous_then_repage_cache_layout_restores_paged_env(monkeypatch):
@@ -365,7 +1648,9 @@ def test_auto_sustained_prefill_policy_keeps_dense_decode_through_128k(monkeypat
     assert _clear_cache_every() == 0
 
 
-def test_auto_sustained_prefill_policy_repages_when_paged_kv_quant_is_enabled(monkeypatch):
+def test_auto_sustained_prefill_policy_repages_when_paged_kv_quant_is_enabled(
+    monkeypatch,
+):
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "auto")
     monkeypatch.setenv("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", "131072")
     monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", "65536")
@@ -649,7 +1934,9 @@ def test_omit_speculative_bonus_skips_bonus_distribution_row(monkeypatch):
     assert out.stats.bonus_tokens == 0
 
 
-def test_trim_commit_keeps_rejected_verify_prefix_without_reforward(monkeypatch):
+def test_trim_commit_reuses_rejected_verify_prefix_and_forwards_correction(
+    monkeypatch,
+):
     monkeypatch.delenv("MTPLX_LAZY_BONUS_VERIFY", raising=False)
     model = RejectingTinyMTPModel()
 
@@ -665,10 +1952,10 @@ def test_trim_commit_keeps_rejected_verify_prefix_without_reforward(monkeypatch)
     )
 
     assert out.tokens == [1, 1]
-    assert [call["tokens"] for call in model.calls] == [1, 2]
+    assert [call["tokens"] for call in model.calls] == [1, 2, 1]
     assert model.target_cache[0].trimmed == [1]
-    assert out.stats.events[0]["capture_repair"] == "trimmed_prefix_commit"
-    assert "repair_forward" not in out.stats.events[0].get("timing_s", {})
+    assert out.stats.events[0]["capture_repair"] == "trimmed_prefix_correction_forward"
+    assert "repair_forward" in out.stats.events[0]["timing_s"]
 
 
 def test_sustained_prefill_chunks_without_full_prompt_logits(monkeypatch):
@@ -1357,6 +2644,46 @@ def test_sustained_prefill_omlx_external_is_safe_profile_path(monkeypatch):
     assert rt.diagnostic_counters["prefill_external_cache_only_calls"] == 2
     assert rt.diagnostic_counters["prefill_omlx_external_calls"] == 2
     assert rt.diagnostic_counters.get("prefill_stock_cache_only_calls", 0) == 0
+
+
+def test_legacy_external_prefill_routes_streamed_experts_as_prefill(monkeypatch):
+    monkeypatch.setenv("MTPLX_PREFILL_OMLX_EXTERNAL", "1")
+
+    class PhaseRecordingModel(TinyModel):
+        def __init__(self):
+            super().__init__()
+            self.phases: list[RoutingPhase] = []
+
+        def __call__(self, input_ids, *, cache=None, **kwargs):
+            # token_count=1 would classify as decode without an explicit
+            # routing context, so a PREFILL observation proves the wrap.
+            self.phases.append(current_expert_routing_phase(token_count=1))
+            kwargs.pop("input_embeddings", None)
+            return super().__call__(input_ids, cache=cache, **kwargs)
+
+    model = PhaseRecordingModel()
+    rt = MTPLXRuntime(
+        model=model,
+        tokenizer=TinyTokenizer(),
+        model_path=Path("tiny"),
+        mtp_enabled=False,
+        contract=MTPContract(),
+        expert_streaming=SimpleNamespace(),
+    )
+
+    assert _prefill_cache_only_forward(rt, mx.array([[7]]), cache=[]) is None
+    assert (
+        _prefill_cache_only_forward(
+            rt,
+            mx.array([[7]]),
+            cache=[],
+            input_embeddings=object(),
+        )
+        is None
+    )
+
+    assert rt.diagnostic_counters["prefill_omlx_external_calls"] == 2
+    assert model.phases == [RoutingPhase.PREFILL, RoutingPhase.PREFILL]
 
 
 def test_sustained_prefill_forwards_logits_controls_through_patched_kwargs_wrapper(

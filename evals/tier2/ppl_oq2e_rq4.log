@@ -1,0 +1,3 @@
+[tokenizer] AutoTokenizer parse failed (No module named 'mlx_lm.tool_parsers.hy_v3_opensource'); using tokenizer.json fallback
+[tokenizer] AutoTokenizer parse failed (No module named 'mlx_lm.tool_parsers.hy_v3_opensource'); using tokenizer.json fallback
+compare_streamed_quality: [Errno 17] File exists: 'evals/tier2/ppl_oq2e_rq4_vs_q4_wikitext2.json'

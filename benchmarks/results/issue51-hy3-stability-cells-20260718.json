@@ -1,0 +1,36 @@
+[
+  {
+    "cell": "champ-a",
+    "rc": 0,
+    "secs": 142,
+    "tok_s": 38.732960879368854,
+    "peak_gb": null,
+    "sha": null,
+    "apv": 1.5536159600997506,
+    "hit": "0.893/0.742",
+    "drafted": 801
+  },
+  {
+    "cell": "champ-b",
+    "rc": -6,
+    "secs": 22,
+    "err": "no observations"
+  },
+  {
+    "cell": "headroom",
+    "rc": 1,
+    "secs": 2,
+    "err": "no observations"
+  },
+  {
+    "cell": "k3",
+    "rc": 0,
+    "secs": 145,
+    "tok_s": 35.28973116240907,
+    "peak_gb": null,
+    "sha": null,
+    "apv": 1.8816901408450704,
+    "hit": "0.887/0.708/0.583",
+    "drafted": 1065
+  }
+]

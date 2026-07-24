@@ -1,13 +1,14 @@
 # Architectures
 
-## Supported In v0.1
+Architecture support is registry-driven and may differ by installed release. Inspect the current
+matrix without loading a model:
 
-- Qwen3-Next-MTP with an MTPLX runtime contract
+```bash
+mtplx model architectures
+mtplx model architectures --json
+```
 
-## Detected But Rejected In v0.1
-
-- DeepSeek V3 MTP
-- Llama-MTP
-- generic MTP layouts
-
-The registry should tell users why a model is rejected and which release track is expected to support it.
+`mtplx inspect MODEL --json` classifies an individual artifact as verified,
+architecture-compatible-but-unverified, incompatible, or lacking MTP heads. The registry reports the
+backend lifecycle, supported capabilities, and an actionable reason when a model cannot run; do not
+maintain a static family list in an integration.

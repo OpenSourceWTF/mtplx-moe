@@ -1,0 +1,13 @@
+[experiment]
+id = "nax-verify-control"
+title = "NAX verify disabled control"
+status = "active"
+owner = "runtime"
+tracking = "https://github.com/davidtai/MTPLX/issues/90"
+created = "2026-07-16"
+review_after = "2026-08-16"
+models = ["qwen3-next"]
+purpose = "Control recipe that disables NAX verification for attribution."
+
+[settings]
+"verify.nax.enabled" = false

@@ -1,8 +1,12 @@
 # Benchmark Results
 
-Keep large raw benchmark JSON files out of Git.
+This directory contains curated, human-readable benchmark summaries. Put all
+raw machine-generated artifacts, regardless of size or file type, under the
+ignored `benchmarks/raw/<benchmark>/<run-id>/` tree. Never force-add raw
+artifacts. The JSON files already tracked here are legacy summaries, not a
+precedent for adding new raw output.
 
-Small benchmark summaries may live here when they include:
+Each curated summary must include enough reproducibility metadata to identify:
 
 - hardware and RAM
 - macOS version
@@ -12,6 +16,10 @@ Small benchmark summaries may live here when they include:
 - token count
 - profile
 - fan mode
-- date and commit
+- UTC run date and commit SHA
+- benchmark command and relevant environment/configuration values
+- repeat count and the aggregation method used
 
-Attach large artifacts to releases or store them externally.
+Summaries must stand on their own: do not link to files under the ignored
+`benchmarks/raw/` tree. If raw evidence must be shared, publish it in a durable
+external location and link to that location instead.

@@ -1,0 +1,316 @@
+{
+  "schema": "mtplx.hy3-starvation-attribution.issue30.v1",
+  "issue": 30,
+  "base_branch": "experiment/hy3-cache-scheduling",
+  "base_commit": "b7ba5ab526a44c4abbeb11a1462794f3ea79d1a0",
+  "measured_commit": "59bc40c37efe7cd3d25149fcb87f3f33db29a7f3",
+  "decision": {
+    "status": "retain_phase1_attribution_infrastructure",
+    "runtime_optimization_promoted": false,
+    "finding": "In this concurrency-1 covered-decode lane, the potentially blocking next-miss upper-bound span is predominantly co-located with host-known current-route read activity and rarely with ledger submitted-queued or eligible-unsubmitted states; awaited-future identity and outer split-executor occupancy remain unavailable.",
+    "next_narrow_experiment": "Matched existing 1-way control versus 2/4/8-way exact-demand range striping within one required record, preserving authoritative routing and adding no synchronization barrier.",
+    "not_authorized": [
+      "scheduler change",
+      "speculative prefetch",
+      "cache-policy change",
+      "MLX execution change",
+      "kernel change"
+    ]
+  },
+  "campaign": {
+    "id": "moe-runtime-issue30-campaign-p14517-20260713T190009Z-59bc40c37efe",
+    "raw_directory": "benchmarks/raw/moe-runtime/moe-runtime-issue30-campaign-p14517-20260713T190009Z-59bc40c37efe",
+    "created_at_utc": "2026-07-13T19:00:09.813613Z",
+    "finished_at_utc": "2026-07-13T19:09:05.017294Z",
+    "status": "complete",
+    "physical_order": [
+      "off-p01",
+      "on-p01",
+      "on-p02",
+      "off-p02",
+      "off-p03",
+      "on-p03",
+      "on-p04",
+      "off-p04"
+    ],
+    "qwen": {
+      "initial": {
+        "loaded": true,
+        "models": ["mtplx-qwen36-27b-optimized-speed"]
+      },
+      "final": {
+        "loaded": true,
+        "models": ["mtplx-qwen36-27b-optimized-speed"]
+      },
+      "exact_state_restored": true
+    },
+    "exclusive_lane_released": true,
+    "exclusive_lane_release_evidence": "The runner writes status=complete only after restoration and lane release."
+  },
+  "environment": {
+    "machine": "MacBook Pro Mac17,6",
+    "chip": "Apple M5 Max",
+    "memory_bytes": 137438953472,
+    "os": "macOS 26.5.2 build 25F84 arm64",
+    "python": "3.12.13",
+    "mlx": "0.31.2",
+    "mlx_lm": "0.31.3",
+    "thermal_warning": false,
+    "fan_coverage": "unavailable"
+  },
+  "configuration": {
+    "model": "pipenetwork/Hy3-4bit",
+    "revision": "160619d3f96c8470350b6dac0ef033a8381551e3",
+    "model_key": "hy3-q4",
+    "expert_payload_sha256": "5ba698b9b2c51bca66254e5d8d35101325e37dfe40744294d4aa233c980472ae",
+    "expert_payload_bytes": 161036107776,
+    "manifest_sha256": "8263670ddb775ccfccb51cb266fe5ddc3ce706114fc9c26b40ec36df54c367b4",
+    "harness_source_sha256": "b4b600f35989c15240428745c2fc13ab835cd9754cac35ac058c308d751968eb",
+    "prompt_content_sha256": "ea526dc67d05aa7865c1ffc3e750782e55f9e464ca327030ff69be25fc80b4c1",
+    "prompt_token_sha256": "8b29a315b0b7a882698ca08d08ec1566b23b0c450c24b70ebb9e9a66ac777bdf",
+    "memory_limit_bytes": 120259084288,
+    "runtime_reserve_bytes": 8589934592,
+    "expert_cache_limit_bytes": 83034243072,
+    "max_live_kv_tokens": 18888,
+    "cache_policy": "lru",
+    "cache_scope": "global",
+    "slot_layout": "component-banks",
+    "transient_slots": 32,
+    "read_chunk_bytes": 67108864,
+    "f_nocache": true,
+    "trust_sidecar": true,
+    "mtp_enabled": false,
+    "chat": true,
+    "thinking_enabled": false,
+    "generation_profile": "deterministic",
+    "seed": 0,
+    "prompt_tokens": 313,
+    "completion_tokens": 256,
+    "concurrency": 1,
+    "max_prefills_per_step": 1,
+    "workload_shape": "static",
+    "window_telemetry": false
+  },
+  "parity": {
+    "all_selected_parity": true,
+    "successful_runs": 8,
+    "expected_runs": 8,
+    "checks": {
+      "normalized_configuration_fingerprint": true,
+      "raw_configuration_fingerprints": true,
+      "stream_signature": true,
+      "cache_signature": true,
+      "route_signature": true,
+      "manifest_sha256": true,
+      "final_health": true
+    },
+    "raw_configuration_fingerprint": {
+      "off": "427569328848c72c",
+      "on": "b1ecf851fecab0f8"
+    },
+    "normalized_runtime_config_fingerprint": "af3e3d8d7b56c688ebe1daa99e4a213ee46f4cbc6e857a6d8624e8c7ffca0695",
+    "normalized_full_configuration_fingerprint": "e581971b10015721a8bf437a578262ce7e933b39679774316276e0855c9e7e54",
+    "stream_signature": "09ed5051cbde32df01fe9b86c5ca22da2eda08b5d63413fa976bdccccfe1c47b",
+    "cache_signature": "abf83da2dcab88ef586a5861531e096099bb0bf2cd1eb19bd58343a06489d350",
+    "route_signature": "7d90db73fda0c8bf371133995c56418ac20848f2c5e746d03e5ed5afdff4e2a9"
+  },
+  "throughput": {
+    "telemetry_on_is_diagnostic_only": true,
+    "pairs": [
+      {
+        "pair": 1,
+        "order": "off_then_on",
+        "off_decode_tokens_per_second": 6.709806637468102,
+        "on_decode_tokens_per_second": 5.914750069293112,
+        "decode_delta_percent": -11.849172578764477,
+        "off_aggregate_tokens_per_second": 4.777717932920781,
+        "on_aggregate_tokens_per_second": 4.285853010907457,
+        "aggregate_delta_percent": -10.294976156380798
+      },
+      {
+        "pair": 2,
+        "order": "on_then_off",
+        "off_decode_tokens_per_second": 6.7486874795302505,
+        "on_decode_tokens_per_second": 5.9364275999944915,
+        "decode_delta_percent": -12.035820031664846,
+        "off_aggregate_tokens_per_second": 4.816146009152356,
+        "on_aggregate_tokens_per_second": 4.297337462453758,
+        "aggregate_delta_percent": -10.772276125198054
+      },
+      {
+        "pair": 3,
+        "order": "off_then_on",
+        "off_decode_tokens_per_second": 6.747068334195929,
+        "on_decode_tokens_per_second": 5.950994129319633,
+        "decode_delta_percent": -11.798816396175827,
+        "off_aggregate_tokens_per_second": 4.81708393872279,
+        "on_aggregate_tokens_per_second": 4.306218352232581,
+        "aggregate_delta_percent": -10.605287202565561
+      },
+      {
+        "pair": 4,
+        "order": "on_then_off",
+        "off_decode_tokens_per_second": 6.592185902789195,
+        "on_decode_tokens_per_second": 5.717530212488001,
+        "decode_delta_percent": -13.268067727445631,
+        "off_aggregate_tokens_per_second": 4.740770363268539,
+        "on_aggregate_tokens_per_second": 4.173744060694207,
+        "aggregate_delta_percent": -11.960636333867768
+      }
+    ],
+    "decode": {
+      "off_mean_tokens_per_second": 6.69943708849587,
+      "on_mean_tokens_per_second": 5.879925502773809,
+      "ratio_of_means_delta_percent": -12.23254394207699,
+      "median_paired_delta_percent": -11.94249630521466,
+      "paired_delta_range_percent": [-13.268067727445631, -11.798816396175827]
+    },
+    "aggregate": {
+      "off_mean_tokens_per_second": 4.787929561016116,
+      "on_mean_tokens_per_second": 4.265788221572,
+      "ratio_of_means_delta_percent": -10.90536802578409,
+      "median_paired_delta_percent": -10.688781663881809,
+      "paired_delta_range_percent": [-11.960636333867768, -10.294976156380798]
+    }
+  },
+  "attribution": {
+    "source_schema": "mtplx-expert-pipeline-attribution-v1",
+    "summary_schema": "mtplx-expert-pipeline-summary-v1",
+    "scope": "decode",
+    "diagnostic_runs": 4,
+    "decode_observation_ns_total": 133086382246,
+    "potentially_blocking_next_miss": {
+      "semantics": "measured_upper_bound",
+      "duration_ns_total": 53920576062,
+      "pooled_fraction": 0.40515472095658844,
+      "unweighted_mean_fraction": 0.40523171465854296,
+      "run_fraction_range": [0.3937272999665447, 0.4099326640050831],
+      "exact_generation_expert_input_wait": "unavailable"
+    },
+    "primary_state_pooled_fraction": {
+      "potentially_blocking_next_miss_step": 0.40515472095658844,
+      "host_runnable_work": 0.23704896844130868,
+      "logical_range_active": 0.2052874000474316,
+      "no_known_useful_work": 0.08675578441720715,
+      "eligible_unsubmitted": 0.0359252956111045,
+      "submitted_queued": 0.01983326211483469,
+      "reader_completion_active": 0.00802207809681511,
+      "route_publication_pending": 0.0019724903147097903
+    },
+    "orthogonal_overlap": {
+      "independent_non_additive": true,
+      "fraction_of_decode_observation": {
+        "next_miss_step_reader_task_active": 0.3925091091772467,
+        "next_miss_step_storage_active": 0.38580607571924,
+        "next_miss_step_runnable": 0.011534033047518174,
+        "next_miss_step_submitted_queued": 0.00047061818003458784,
+        "next_miss_step_eligible_unsubmitted": 0.00024275149308877547
+      },
+      "fraction_of_next_miss_upper_bound": {
+        "next_miss_step_reader_task_active": 0.968788190966935,
+        "next_miss_step_storage_active": 0.9522438114711698,
+        "next_miss_step_runnable": 0.028468218314933624,
+        "next_miss_step_submitted_queued": 0.0011615764439901802,
+        "next_miss_step_eligible_unsubmitted": 0.000599157508310969
+      }
+    },
+    "reader_pool": {
+      "worker_capacity": 32,
+      "mean_active_readers": 3.2914573534096334,
+      "active_capacity_fraction": 0.10285804229405104,
+      "active_reader_range": [3.2427231525215063, 3.3126758792056314],
+      "mean_queued_reads": 0.463138080517162,
+      "queued_read_range": [0.45090839481095396, 0.47776941193158273],
+      "queue_nonempty_fraction": 1.0
+    },
+    "storage": {
+      "semantics": "uncached_reader_returned_host_traffic_not_physical_device_traffic",
+      "mean_gib_per_second": 5.371028726851218,
+      "run_range_gib_per_second": [5.25513691838406, 5.421933999232772],
+      "supplied_ceiling_gib_per_second": 12.47,
+      "mean_fraction_of_supplied_ceiling": 0.43071601658790837
+    },
+    "per_run_exact_counts": {
+      "logical_record_jobs": 19164,
+      "logical_record_bytes": 203460968448,
+      "accepted_executor_submissions": 19164,
+      "reader_tasks_started": 19164,
+      "reader_tasks_completed": 19164,
+      "reader_tasks_failed": 0,
+      "decode_logical_ranges_started": 19164,
+      "sampler_window_logical_range_reader_invocations": 31684,
+      "sampler_window_python_preadv_invocations": 31684,
+      "sampler_window_preadv_bytes_returned": 346098106368,
+      "decode_expert_requests": 161160,
+      "decode_expert_hits": 141996,
+      "decode_expert_misses": 19164,
+      "decode_hit_rate": 0.8810871183916604,
+      "submission_rejections": 0,
+      "abandoned_record_jobs": 0,
+      "diagnostic_hook_failures": 0
+    },
+    "completion_fences_per_run": {
+      "synchronous_fence_calls": 39910,
+      "synchronous_fence_calls_per_token": 155.8984375,
+      "mean_active_asynchronous_fences": 0.0,
+      "interpretation": "Operation and occupancy evidence only; no fence-duration or GPU-utilization claim."
+    },
+    "mean_record_stage_ns": {
+      "eligible_unsubmitted": 137276.66045710706,
+      "accepted_unstarted": 60140.22346587351,
+      "reader_active": 1850401.4878026508,
+      "active_logical_range": 1819201.4189756836,
+      "ready_not_runnable": 36043.274329471926,
+      "runnable_miss_unclaimed": 117883.08529012732
+    },
+    "block_reasons": {
+      "pin_held": {"status": "measured", "count": 0, "duration_ns": 0},
+      "slot_loading": {"status": "measured", "count": 0, "duration_ns": 0},
+      "operation_credit": {"status": "unavailable"},
+      "byte_credit": {"status": "unavailable"},
+      "authoritative_reserve": {"status": "unavailable"},
+      "slot_unavailable": {"status": "unavailable"}
+    },
+    "latency_histograms": {
+      "bounds_ns": [1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000],
+      "logical_range_bucket_counts_total": [0, 0, 0, 96, 76560, 0, 0, 0],
+      "complete_record_bucket_counts_total": [0, 0, 0, 0, 76656, 0, 0, 0],
+      "p50_upper_bound_ns": 10000000,
+      "p95_upper_bound_ns": 10000000,
+      "overflow_count": 0,
+      "percentile_semantics": "bucket_upper_bound_not_interpolated"
+    },
+    "coverage": {
+      "attribution": "measured",
+      "decode_phase": "measured",
+      "potentially_blocking_next_miss_step": "measured_upper_bound",
+      "sampler_window_backend": "measured_all_phases",
+      "eligible_unsubmitted_cause": "unattributed",
+      "generation_expert_input_wait": "unavailable",
+      "gpu_expert_wait": "unavailable",
+      "gpu_idle_time": "unavailable",
+      "physical_device_bytes": "unavailable",
+      "physical_device_operations": "unavailable",
+      "physical_device_queue_depth": "unavailable",
+      "outer_split_executor_queue": "unavailable",
+      "future_layer_eligibility": "unavailable",
+      "speculative_record_accounting": "unavailable"
+    }
+  },
+  "verification": {
+    "full_pytest": {
+      "exit_code": 0,
+      "progress": "100%",
+      "expected_skips": 4
+    },
+    "campaign_runner_tests": {
+      "tests": 20,
+      "exit_code": 0
+    },
+    "ruff_check": "passed",
+    "ruff_format_check": "changed Python files already formatted",
+    "json_parse": "passed",
+    "raw_to_curated_crosscheck": "passed",
+    "independent_review": "no Critical or Important findings after strict retained-artifact validation"
+  }
+}

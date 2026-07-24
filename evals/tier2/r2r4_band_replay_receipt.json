@@ -1,0 +1,52 @@
+{
+  "schema": "r2r4-band-replay/1",
+  "band": {
+    "gib": 20,
+    "records": 2010,
+    "per_layer_ranks": "87-116",
+    "replay_share": 0.1929
+  },
+  "replay": {
+    "misses": 2400
+  },
+  "arms": {
+    "A1_nocache_single": {
+      "n": 200,
+      "mean_ms": 0.913,
+      "p50_ms": 0.9097,
+      "p90_ms": 0.9301,
+      "gib_s": 10.83
+    },
+    "A2_nocache_chunk8m": {
+      "n": 200,
+      "mean_ms": 1.0548,
+      "p50_ms": 1.0379,
+      "p90_ms": 1.1211,
+      "gib_s": 9.374
+    },
+    "B0_band_populate": {
+      "seconds": 2.1,
+      "gib_s": 9.596
+    },
+    "B1_band_mmap_warm": {
+      "n": 463,
+      "mean_ms": 0.6636,
+      "p50_ms": 0.6625,
+      "p90_ms": 0.6855,
+      "gib_s": 14.901
+    },
+    "B1_deep_nocache": {
+      "n": 1937,
+      "mean_ms": 0.9074,
+      "p50_ms": 0.9109,
+      "p90_ms": 0.9596,
+      "gib_s": 10.896
+    },
+    "band_residency_sampled": {
+      "method": "timing<2ms",
+      "n": 200,
+      "resident_share": 1.0
+    }
+  },
+  "status": "complete"
+}

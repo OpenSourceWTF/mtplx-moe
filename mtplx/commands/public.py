@@ -24,6 +24,7 @@ import importlib.metadata
 import importlib.util
 import re
 import webbrowser
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -60,6 +61,7 @@ from mtplx.kpi import (
     write_json,
 )
 from mtplx.kpi.runtime_kpis import (
+    build_settings_envelope,
     distribution_suite_names,
     repo_root,
 )
@@ -190,6 +192,7 @@ EXTERNAL_RUNTIME_ENV_KEYS = (
     "MTPLX_EVAL_STATE_ROOTS_INCLUDE_LIVE",
     "MTPLX_TARGET_LAYER_EVAL_MODE",
     "MTPLX_FUSE_ATTN_QKV_PROJECTIONS",
+    "MTPLX_FUSE_HY3_SHARED_GATE_UP_PROJECTIONS",
     "MTPLX_SDPA_2PASS_BLOCKS",
     "MTPLX_SDPA_DYNAMIC_OFFSET_ACTIVE_BLOCKS",
     "MTPLX_EXPORT_VERIFY_DOT_DIR",
@@ -473,6 +476,27 @@ def _model_gate(
     return inspection, exit_code
 
 
+def _record_model_gate_constraint(args: Any, inspection: dict[str, Any]) -> None:
+    """Explain an existing failed model gate in the settings snapshot."""
+
+    compatibility = inspection.get("compatibility") or {}
+    if not isinstance(compatibility, dict):
+        return
+    if compatibility.get("can_run") is not False:
+        return
+    reason = str(
+        compatibility.get("message")
+        or inspection.get("detail")
+        or "model failed the MTPLX compatibility gate"
+    )
+    from mtplx.settings.argparse import apply_args_constraints
+
+    apply_args_constraints(
+        args,
+        {"runtime.mtp.enabled": (False, reason)},
+    )
+
+
 def _compact_model_summary(inspection: dict[str, Any]) -> dict[str, Any]:
     compatibility = inspection.get("compatibility") or {}
     return {
@@ -670,6 +694,11 @@ def _generation_mode_from_args(args: Any) -> str:
     )
 
 
+def _runtime_kv_admission(runtime: Any, tokens: int):
+    admit = getattr(runtime, "admit_kv_tokens", None)
+    return admit(tokens) if callable(admit) else nullcontext()
+
+
 def _fan_mode_from_args(args: Any) -> str:
     mode = fan_mode_from_args(args)
     setattr(args, "fan_mode", mode)
@@ -864,10 +893,22 @@ def _apply_model_contract_depth_default(
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     if "depth" in cli_flags:
         return
-    args.depth = _model_contract_depth(
+    depth = _model_contract_depth(
         inspection,
         profile=profile,
         fallback=int(getattr(args, "depth", 3)),
+    )
+    args.depth = depth
+    from mtplx.settings.argparse import apply_args_constraints
+
+    apply_args_constraints(
+        args,
+        {
+            "runtime.mtp.depth": (
+                depth,
+                f"model maximum MTP depth is {depth}",
+            )
+        },
     )
 
 
@@ -2169,119 +2210,7 @@ def cmd_stop_public(args: Any) -> int:
     return 1
 
 
-def _parse_settings_pairs(pairs: list[str]) -> tuple[dict[str, Any], list[str]]:
-    """Parse ``key=value`` pairs; values decode as JSON with string fallback."""
-
-    parsed: dict[str, Any] = {}
-    errors: list[str] = []
-    for pair in pairs:
-        key, separator, raw_value = str(pair).partition("=")
-        key = key.strip()
-        if not separator or not key:
-            errors.append(pair)
-            continue
-        value_text = raw_value.strip()
-        try:
-            parsed[key] = json.loads(value_text)
-        except json.JSONDecodeError:
-            parsed[key] = value_text
-    return parsed, errors
-
-
-def cmd_settings_public(args: Any) -> int:
-    """Read or change live server settings over /v1/mtplx/settings."""
-
-    host = str(getattr(args, "host", "127.0.0.1"))
-    port = int(getattr(args, "port", 8000))
-    base = _server_url(host, port)
-    json_output = bool(getattr(args, "json", False))
-    action = str(getattr(args, "settings_action", None) or "get")
-    pairs = list(getattr(args, "pairs", None) or [])
-    if action == "get" and pairs:
-        # `mtplx settings depth=2` reads as intent to set.
-        action = "set"
-
-    def fail_unreachable() -> int:
-        print(f"No MTPLX server is responding on {base}.")
-        print("Start one with the MTPLX app or: mtplx start")
-        return 1
-
-    if action == "get":
-        payload = _http_json(base + "/v1/mtplx/settings", timeout=5.0)
-        if not payload.get("ok"):
-            return fail_unreachable()
-        if json_output:
-            _print(payload)
-            return 0
-        print(f"MTPLX server settings  ·  {base}")
-        for key in sorted(payload):
-            if key in {"ok"}:
-                continue
-            print(f"  {key} = {json.dumps(payload[key], default=str)}")
-        return 0
-
-    update, malformed = _parse_settings_pairs(pairs)
-    if malformed or not update:
-        for pair in malformed:
-            print(f"error: not a key=value pair: {pair!r}")
-        if not update:
-            print("usage: mtplx settings set key=value [key=value ...]")
-            print("example: mtplx settings set depth=2 reasoning=off")
-        return 2
-    response = _http_post_json(
-        base + "/v1/mtplx/settings", update, timeout=10.0
-    )
-    if response.get("ok"):
-        body = response.get("json") or {}
-        applied = body.get("applied") or {}
-        if json_output:
-            _print(body)
-            return 0
-        if applied:
-            for key in sorted(applied):
-                print(f"applied: {key} = {json.dumps(applied[key], default=str)}")
-        else:
-            print("nothing to apply")
-        return 0
-    error = response.get("error")
-    if isinstance(error, dict) and isinstance(error.get("error"), dict):
-        # _http_post_json stores the whole response body; the daemon
-        # wraps errors in the OpenAI envelope {"error": {...}} with the
-        # structured detail inside it (QA-105).
-        error = error["error"]
-    detail = error.get("detail") if isinstance(error, dict) else None
-    if isinstance(detail, dict):
-        kind = detail.get("error")
-        keys = detail.get("keys") or []
-        if kind == "restart_required":
-            print(
-                "error: these settings need a server restart: "
-                + ", ".join(str(key) for key in keys)
-            )
-            print(
-                "Change them in the MTPLX app's settings, or restart "
-                "`mtplx serve` with the matching flags."
-            )
-            return 2
-        if kind == "unknown_settings":
-            print(
-                "error: unknown settings: " + ", ".join(str(key) for key in keys)
-            )
-            supported = detail.get("supported") or []
-            if supported:
-                print(
-                    "supported: " + ", ".join(str(key) for key in supported)
-                )
-            return 2
-    if isinstance(detail, str) and detail:
-        print(f"error: {detail}")
-        return 2
-    if response.get("status") is None:
-        return fail_unreachable()
-    print(f"error: settings update failed ({response.get('status')})")
-    return 1
-
-
+from .settings import _parse_settings_pairs, cmd_settings_public  # noqa: E402, F401
 def _format_aime_question_line(event: dict[str, Any]) -> str:
     idx = int(event.get("idx") or 0)
     status = str(event.get("status") or "?")
@@ -3080,6 +3009,7 @@ def _cmd_tune_candidate(args: Any) -> int:
             ),
             yes=True,
         )
+    _record_model_gate_constraint(args, inspection or {})
     if gate_exit is not None or inspection is None:
         _print({"error": "model failed MTP primary gate", "model": inspection})
         return gate_exit or 1
@@ -4906,6 +4836,7 @@ def cmd_pull_public(args: Any) -> int:
             revision=args.revision,
             progress_callback=callback,
             progress_interval_s=progress_interval_s,
+            include_expert_banks=bool(getattr(args, "include_expert_banks", True)),
         )
     except KeyboardInterrupt:
         finalize()
@@ -4946,6 +4877,10 @@ def cmd_pull_public(args: Any) -> int:
         print(
             f"runtime contract: {str(bool(result.get('has_runtime_contract'))).lower()}"
         )
+        if result.get("partial_download"):
+            excluded = ", ".join(result.get("excluded_patterns") or []) or "some files"
+            print(f"partial download: yes (excluded {excluded})")
+            print("note: this copy is not runnable; re-pull without --no-expert-banks")
     return 0
 
 
@@ -4986,6 +4921,41 @@ def cmd_remove_public(args: Any) -> int:
         else:
             print("removed: false")
     return 0 if result["removed"] or args.missing_ok else 1
+
+
+def _benchmark_settings_kwargs(args: Any) -> dict[str, Any]:
+    from mtplx.settings.builtins import default_setting_catalog
+    from mtplx.settings.resolver import ResolvedSettings
+
+    resolved = getattr(args, "mtplx_settings", None)
+    if not isinstance(resolved, ResolvedSettings):
+        return {}
+    catalog = default_setting_catalog()
+    provenance: dict[str, Any] = {}
+    for name, record in resolved.provenance.items():
+        spec = catalog.require(name)
+        requested = record.requested_value
+        if spec.secret and requested:
+            requested = "[redacted]"
+        provenance[name] = {
+            "source": record.source.name,
+            "requested_value": requested,
+            "reason": record.reason,
+            "shadowed_sources": [item.source.name for item in record.shadowed],
+        }
+    bundles = [
+        {
+            "id": getattr(bundle, "id", None),
+            "sha256": getattr(bundle, "sha256", None),
+            "source": str(getattr(bundle, "source", "")),
+        }
+        for bundle in resolved.bundle_provenance
+    ]
+    return {
+        "settings": resolved.to_dict(redact=True),
+        "settings_provenance": provenance,
+        "settings_bundles": bundles,
+    }
 
 
 def _cmd_bench_run(args: Any) -> int:
@@ -5069,6 +5039,7 @@ def _cmd_bench_run(args: Any) -> int:
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=bool(getattr(args, "yes", False)),
     )
+    _record_model_gate_constraint(args, inspection)
     if gate_exit is not None:
         _print({"error": "model failed MTP primary gate", "model": inspection})
         return gate_exit
@@ -5161,6 +5132,7 @@ def _cmd_bench_run(args: Any) -> int:
             "deep_smc_trace_attached": False,
         },
         decode_trace_path=decode_trace,
+        **_benchmark_settings_kwargs(args),
     )
     envelope["artifacts"] = {
         "depth_sweep": str(output),
@@ -5467,6 +5439,9 @@ def _cmd_bench_run_direct_http(
         "direct_returncode": proc.returncode,
         "error": row_error,
     }
+    settings_kwargs = _benchmark_settings_kwargs(args)
+    if settings_kwargs:
+        envelope["settings"] = build_settings_envelope(**settings_kwargs)
     (output_dir / "direct-http-command.log").write_text(proc.stdout, encoding="utf-8")
     write_json(envelope_output, envelope)
     _print(_bench_run_console_summary(envelope))
@@ -7023,6 +6998,7 @@ def _cmd_profile_thermal(args: Any) -> int:
 
 def _cmd_profile_compile_audit(args: Any) -> int:
     inspection, gate_exit = _model_gate(args.model)
+    _record_model_gate_constraint(args, inspection)
     output = (
         Path(args.output)
         if args.output
@@ -7113,6 +7089,7 @@ def _cmd_profile_compile_audit(args: Any) -> int:
 
 def _cmd_profile_eval_attribution(args: Any) -> int:
     inspection, gate_exit = _model_gate(args.model)
+    _record_model_gate_constraint(args, inspection)
     output = (
         Path(args.output)
         if args.output
@@ -7914,6 +7891,9 @@ def _resolve_runtime_options_on_args(
 
 
 def cmd_serve_public(args: Any) -> int:
+    from mtplx.expert_cli import expert_streaming_requested
+
+    streaming_requested = expert_streaming_requested(args)
     dry_run = bool(getattr(args, "dry_run", False))
     quiet_json = dry_run and bool(getattr(args, "json", False))
     runtime_options_error = _resolve_runtime_options_on_args(
@@ -7983,6 +7963,10 @@ def cmd_serve_public(args: Any) -> int:
     depth_error = _validate_public_depth(args, printer=_print_serve_start_line)
     if depth_error is not None:
         return depth_error
+    if streaming_requested:
+        args.no_mtp = True
+        args.load_mtp = False
+        args.generation_mode = GENERATION_MODE_AR
     generation_mode = _generation_mode_from_args(args)
     fan_mode = _fan_mode_from_args(args)
     if generation_mode == GENERATION_MODE_MTP and getattr(args, "load_mtp", True) is False:
@@ -8227,6 +8211,9 @@ def cmd_serve_public(args: Any) -> int:
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=bool(getattr(args, "yes", False)),
     )
+    _record_model_gate_constraint(args, inspection)
+    if streaming_requested:
+        gate_exit = None
     if gate_exit is not None:
         _print_model_gate_error(inspection, printer=_print_serve_start_line)
         return gate_exit
@@ -8300,6 +8287,9 @@ def cmd_serve_public(args: Any) -> int:
         "--fan-mode",
         fan_mode,
     ]
+    from mtplx.expert_cli import append_expert_streaming_child_args
+
+    append_expert_streaming_child_args(cmd, args)
     for attr, flag in (
         ("max_active_requests", "--max-active-requests"),
         ("decode_batch_max", "--decode-batch-max"),
@@ -8849,17 +8839,27 @@ def _generate_one_shot_public(
     )
     if resolve_error is not None:
         return EXIT_TELEMETRY, resolve_error, []
+    from mtplx.expert_cli import expert_streaming_requested
+
+    streaming_requested = expert_streaming_requested(args)
     inspection, gate_exit = _model_gate(
         runtime_model,
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=bool(getattr(args, "yes", False)),
     )
+    _record_model_gate_constraint(args, inspection)
+    if streaming_requested:
+        gate_exit = None
     if gate_exit is not None:
         return (
             gate_exit,
             {"error": "model failed MTP primary gate", "model": inspection},
             [],
         )
+    if streaming_requested:
+        args.no_mtp = True
+        args.load_mtp = False
+        args.generation_mode = GENERATION_MODE_AR
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     apply_profile_env(profile.name)
     generation_mode = _generation_mode_from_args(args)
@@ -8900,8 +8900,12 @@ def _generate_one_shot_public(
     from mtplx.runtime import load
     from mtplx.sampling import SamplerConfig
 
+    rt = None
     try:
-        rt = load(runtime_model, mtp=True)
+        from mtplx.expert_cli import expert_streaming_load_kwargs
+
+        load_kwargs = expert_streaming_load_kwargs(args, runtime_model)
+        rt = load(runtime_model, **(load_kwargs or {"mtp": True}))
         draft_report = None
         if (
             draft_lm_head is not None
@@ -8961,33 +8965,39 @@ def _generate_one_shot_public(
             smart_request_id = f"cli-{command}-{int(time.time() * 1000)}"
             smart_fans.begin_request(smart_request_id)
         try:
-            if generation_mode == GENERATION_MODE_AR:
-                out = generate_ar(
-                    rt,
-                    prompt_ids,
-                    max_tokens=max_tokens_value,
-                    sampler=sampler,
-                    seed=args.seed,
-                )
-            else:
-                out = generate_mtpk(
-                    rt,
-                    prompt_ids,
-                    max_tokens=max_tokens_value,
-                    sampler=sampler,
-                    draft_sampler=_draft_sampler_from_spec(draft_sampler),
-                    speculative_depth=args.depth,
-                    seed=args.seed,
-                    mtp_hidden_variant="post_norm",
-                    mtp_cache_policy="persistent",
-                    mtp_history_policy="committed",
-                    verify_strategy="capture_commit",
-                    verify_core="linear-gdn-from-conv-tape",
-                )
+            with _runtime_kv_admission(
+                rt, len(prompt_ids) + max_tokens_value
+            ):
+                if generation_mode == GENERATION_MODE_AR:
+                    out = generate_ar(
+                        rt,
+                        prompt_ids,
+                        max_tokens=max_tokens_value,
+                        sampler=sampler,
+                        seed=args.seed,
+                    )
+                else:
+                    out = generate_mtpk(
+                        rt,
+                        prompt_ids,
+                        max_tokens=max_tokens_value,
+                        sampler=sampler,
+                        draft_sampler=_draft_sampler_from_spec(draft_sampler),
+                        speculative_depth=args.depth,
+                        seed=args.seed,
+                        mtp_hidden_variant="post_norm",
+                        mtp_cache_policy="persistent",
+                        mtp_history_policy="committed",
+                        verify_strategy="capture_commit",
+                        verify_core="linear-gdn-from-conv-tape",
+                    )
         finally:
             if smart_fans is not None and smart_request_id is not None:
                 smart_fans.end_request(smart_request_id, wait_for_restore=True)
     finally:
+        close_runtime = getattr(rt, "close", None)
+        if callable(close_runtime):
+            close_runtime(timeout=5.0)
         if max_session is not None:
             max_session.stop()
             thermal = max_session.thermal
@@ -9747,31 +9757,32 @@ def _quickstart_generate(
             smart_fans = SmartFanController(log=_quickstart_line)
             smart_request_id = f"terminal-{turn_index}-{int(time.time() * 1000)}"
             smart_fans.begin_request(smart_request_id)
-        if generation_mode == GENERATION_MODE_AR:
-            out = generate_ar(
-                rt,
-                prompt_ids,
-                max_tokens=max_tokens_value,
-                sampler=sampler,
-                seed=seed,
-                token_callback=record_tokens,
-            )
-        else:
-            out = generate_mtpk(
-                rt,
-                prompt_ids,
-                max_tokens=max_tokens_value,
-                sampler=sampler,
-                draft_sampler=_draft_sampler_from_spec(draft_sampler),
-                speculative_depth=int(getattr(args, "depth", 3)),
-                seed=seed,
-                mtp_hidden_variant="post_norm",
-                mtp_cache_policy="persistent",
-                mtp_history_policy="committed",
-                verify_strategy="capture_commit",
-                verify_core="linear-gdn-from-conv-tape",
-                token_callback=record_tokens,
-            )
+        with _runtime_kv_admission(rt, len(prompt_ids) + max_tokens_value):
+            if generation_mode == GENERATION_MODE_AR:
+                out = generate_ar(
+                    rt,
+                    prompt_ids,
+                    max_tokens=max_tokens_value,
+                    sampler=sampler,
+                    seed=seed,
+                    token_callback=record_tokens,
+                )
+            else:
+                out = generate_mtpk(
+                    rt,
+                    prompt_ids,
+                    max_tokens=max_tokens_value,
+                    sampler=sampler,
+                    draft_sampler=_draft_sampler_from_spec(draft_sampler),
+                    speculative_depth=int(getattr(args, "depth", 3)),
+                    seed=seed,
+                    mtp_hidden_variant="post_norm",
+                    mtp_cache_policy="persistent",
+                    mtp_history_policy="committed",
+                    verify_strategy="capture_commit",
+                    verify_core="linear-gdn-from-conv-tape",
+                    token_callback=record_tokens,
+                )
     finally:
         if smart_fans is not None and smart_request_id is not None:
             smart_fans.end_request(smart_request_id, wait_for_restore=False)
@@ -11119,6 +11130,7 @@ def _quickstart_apply_local_model_defaults(
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=bool(getattr(args, "yes", False)),
     )
+    _record_model_gate_constraint(args, inspection)
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     _apply_model_contract_depth_default(args, inspection, profile)
     _apply_backend_serve_defaults(args, inspection)
@@ -11870,7 +11882,10 @@ def _quickstart_run_terminal_chat_body(
     quiet_progress = not sys.stdout.isatty()
     with ModelLoadProgress("Loading model", quiet=quiet_progress) as progress:
         progress.set_subtitle(f"profile {profile.name}")
-        rt = load(runtime_model, mtp=True)
+        from mtplx.expert_cli import expert_streaming_load_kwargs
+
+        load_kwargs = expert_streaming_load_kwargs(args, runtime_model)
+        rt = load(runtime_model, **(load_kwargs or {"mtp": True}))
         progress.set_subtitle("ready")
     _quickstart_line(f"Model ready in {time.perf_counter() - started:.1f}s")
     _quickstart_line(f"Generation mode: {_generation_mode_label(generation_mode)}")
@@ -12539,6 +12554,7 @@ def cmd_quickstart_public(args: Any) -> int:
                 ),
                 yes=bool(getattr(args, "yes", False)),
             )
+            _record_model_gate_constraint(args, inspection)
             if gate_exit is not None:
                 _print_model_gate_error(
                     inspection,
@@ -12612,6 +12628,7 @@ def cmd_quickstart_public(args: Any) -> int:
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=bool(getattr(args, "yes", False)),
     )
+    _record_model_gate_constraint(args, inspection)
     if gate_exit is not None:
         _print_model_gate_error(
             inspection,

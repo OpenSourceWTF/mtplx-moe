@@ -318,7 +318,7 @@ def test_bench_prefill_ladder_dry_run_json(monkeypatch, capsys):
     assert payload["prompt"]["style"] == "coding-agent"
     assert payload["prompt"]["format"] == "chat"
     assert payload["prompt"]["enable_thinking"] is False
-    assert payload["prompt"]["policy"] == "coding_agent_tail_v2"
+    assert payload["prompt"]["policy"] == "realistic_programming_v1"
     assert payload["prompt"]["tail_sha256"]
     assert payload["prompt"]["release_valid"] is True
     assert payload["prefill_layout"]["requested"] == "profile"
@@ -333,6 +333,29 @@ def test_bench_prefill_ladder_dry_run_json(monkeypatch, capsys):
     assert payload["profile"]["env"]["MTPLX_LAZY_VERIFY_LOGITS"] == "1"
     assert payload["profile"]["env"]["MTPLX_BATCH_TARGET_ARRAYS"] == "1"
     assert payload["profile"]["env"]["MTPLX_LAZY_TARGET_DISTRIBUTIONS"] == "1"
+
+
+def test_bench_prefill_ladder_dry_run_uses_programming_context_defaults(
+    monkeypatch, capsys
+):
+    import mtplx.prefill_bench as prefill_bench
+
+    monkeypatch.setattr(
+        prefill_bench,
+        "inspect_hardware",
+        lambda: {
+            "chip": "Apple M5 Max",
+            "hardware_acceleration_eligible": True,
+            "hardware_acceleration_confirmed": False,
+        },
+    )
+
+    code = main(["bench", "prefill-ladder", "--dry-run", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["contexts"] == [1024, 2048, 4096, 8192, 16384]
+    assert payload["prompt"]["policy"] == "realistic_programming_v1"
     assert payload["profile"]["env"]["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP"] == "1"
     assert (
         payload["profile"]["env"]["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY"] == "auto"
@@ -4284,6 +4307,7 @@ def test_public_bench_run_dry_run_records_external_kernel_env(monkeypatch, capsy
     monkeypatch.setenv("MTPLX_EXPORT_VERIFY_DOT_DIR", "outputs/dot-probe")
     monkeypatch.setenv("MTPLX_EXPORT_VERIFY_DOT_CYCLES", "1,128")
     monkeypatch.setenv("MTPLX_EVAL_STATE_ROOTS_INCLUDE_LIVE", "0")
+    monkeypatch.setenv("MTPLX_FUSE_HY3_SHARED_GATE_UP_PROJECTIONS", "1")
 
     code = main(
         [
@@ -4309,6 +4333,9 @@ def test_public_bench_run_dry_run_records_external_kernel_env(monkeypatch, capsy
     assert payload["runtime_env"]["MTPLX_EXPORT_VERIFY_DOT_DIR"] == "outputs/dot-probe"
     assert payload["runtime_env"]["MTPLX_EXPORT_VERIFY_DOT_CYCLES"] == "1,128"
     assert payload["runtime_env"]["MTPLX_EVAL_STATE_ROOTS_INCLUDE_LIVE"] == "0"
+    assert (
+        payload["runtime_env"]["MTPLX_FUSE_HY3_SHARED_GATE_UP_PROJECTIONS"] == "1"
+    )
 
 
 def test_public_bench_cold_run_defaults_to_sustained_mode(capsys):
@@ -4408,6 +4435,21 @@ def test_public_qa_distribution_parser_dry_shape():
 
     assert args.command == "qa"
     assert args.qa_action == "distribution"
+
+
+def test_mtp_depth_sweep_accepts_compiled_device_k_core() -> None:
+    args = build_parser().parse_args(
+        [
+            "mtp-depth-sweep",
+            "--depths",
+            "1,2,3,4,5,6,7",
+            "--draft-core",
+            "device-k",
+        ]
+    )
+
+    assert args.depths == "1,2,3,4,5,6,7"
+    assert args.draft_core == "device-k"
 
 
 def test_public_profile_dispatch_without_trace_is_actionable(capsys):
@@ -7045,7 +7087,15 @@ def test_profiles_command_lists_default_without_mlx(capsys):
 def test_pull_progress_json_emits_ndjson_events(tmp_path, monkeypatch, capsys):
     import mtplx.hf_loader as hf_loader
 
-    def fake_pull_model(model, *, cache_dir, revision, progress_callback, progress_interval_s):
+    def fake_pull_model(
+        model,
+        *,
+        cache_dir,
+        revision,
+        progress_callback,
+        progress_interval_s,
+        include_expert_banks=True,
+    ):
         assert model == "mtplx/example"
         assert cache_dir == str(tmp_path)
         assert revision is None

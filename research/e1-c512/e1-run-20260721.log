@@ -1,0 +1,22 @@
+run_with_qwen_stopped: Qwen service/API/process state is ambiguous or does not expose the exact expected model list; observation=_QwenObservation(loaded=True, models=None, processes=())
+2026-07-21 01:43:23 launcher: box green (attempt 1); starting E1 window
+2026-07-21 02:43:27 launcher: wrapper refused (raced a window); backing off 120s
+2026-07-21 03:12:15 launcher: box green (attempt 2); starting E1 window
+compare_streamed_quality: [Errno 17] File exists: '/Users/davidtai/projects/OpenSourceWTF/.worktrees/51-c6-mmap-band/research/e1-c512/e1-mixofficial-vs-q4-20260721.json'
+2026-07-21 04:12:59 launcher: wrapper refused (raced a window); backing off 120s
+2026-07-21 04:42:16 launcher: box green (attempt 3); starting E1 window
+compare_streamed_quality: [Errno 17] File exists: '/Users/davidtai/projects/OpenSourceWTF/.worktrees/51-c6-mmap-band/research/e1-c512/e1-mixofficial-vs-q4-20260721.json'
+2026-07-21 05:42:52 launcher: wrapper refused (raced a window); backing off 120s
+2026-07-21 05:45:32 launcher: box green (attempt 4); starting E1 window
+compare_streamed_quality: [Errno 17] File exists: '/Users/davidtai/projects/OpenSourceWTF/.worktrees/51-c6-mmap-band/research/e1-c512/e1-mixofficial-vs-q4-20260721.json'
+2026-07-21 06:45:35 launcher: wrapper refused (raced a window); backing off 120s
+2026-07-21 06:47:46 launcher: box green (attempt 5); starting E1 window
+2026-07-21 07:48:08 launcher: wrapper refused (raced a window); backing off 120s
+2026-07-21 07:51:49 launcher: box green (attempt 6); starting E1 window
+2026-07-21 07:57:22 launcher: box green (attempt 1); starting E1 window
+preflight hy3-expert-only-mlx-q4 {'valid': True, 'model_key': 'hy3-expert-only-q4', 'checked_shards': 52, 'checked_records': 0, 'sidecar_verified': False}
+preflight hy3-expert-only-mlx-mixofficial {'valid': True, 'model_key': 'hy3-expert-mixofficial', 'checked_shards': 19, 'checked_records': 0, 'sidecar_verified': False}
+2026-07-21 08:31:34 launcher: box green (attempt 1); starting E1 window
+preflight mixofficial: {'valid': True, 'model_key': 'hy3-expert-mixofficial', 'checked_shards': 19, 'checked_records': 0, 'sidecar_verified': False}
+E1 candidate-only: ppl= 7.428573341434795 rel= 0.4912677980072213 passed= False
+2026-07-21 09:11:57 launcher: E1 window completed rc=0

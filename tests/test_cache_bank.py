@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 
 import mlx.core as mx
@@ -112,6 +113,53 @@ def test_session_bank_cold_tier_write_only_writes_but_does_not_restore(tmp_path)
         assert restored is None
         assert bank.last_miss_reason == "ssd_cache_write_only"
     finally:
+        cold.close()
+
+
+def test_session_bank_cold_tier_flush_waits_for_dequeued_write(tmp_path):
+    cold = SessionBankColdTier(
+        base_dir=tmp_path / "session-bank",
+        mode="on",
+        min_prefix_tokens=2,
+    )
+    release_write = threading.Event()
+    write_started = threading.Event()
+    original_write = cold._write_pending
+
+    def blocked_write(pending):
+        write_started.set()
+        assert release_write.wait(timeout=5.0)
+        return original_write(pending)
+
+    cold._write_pending = blocked_write
+    try:
+        bank = SessionBank(
+            max_entries=1,
+            max_bytes=1024,
+            per_session_max_bytes=1024,
+            cold_tier=cold,
+        )
+        bank.put_snapshot(
+            runtime=FakeRuntime(),
+            token_ids=[1, 2, 3],
+            cache_snapshot=CacheSnapshot(states=(), meta_states=()),
+            logits=None,
+            hidden=None,
+            template_hash="template-a",
+            policy_fingerprint="policy-a",
+            snapshot_epoch=3,
+            nbytes_override=128,
+        )
+
+        assert write_started.wait(timeout=5.0)
+        assert cold._queue.empty()
+        assert cold.flush(timeout_s=0.05) is False
+
+        release_write.set()
+        assert cold.flush(timeout_s=5.0) is True
+        assert cold.stats()["entries"] == 1
+    finally:
+        release_write.set()
         cold.close()
 
 

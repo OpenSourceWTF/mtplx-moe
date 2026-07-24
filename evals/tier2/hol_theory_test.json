@@ -1,0 +1,75 @@
+{
+  "schema": "hol-theory-test/1",
+  "predictions": {
+    "T1_quantum_hol": "qd>=2: chunked mean_ms < whole mean_ms by >5%",
+    "T2_null_io_layer": "qd>=2: all chunk arms within ~2% -> live effect is runtime-layer"
+  },
+  "caveat": "no generation-thread GIL load; verify_hash off",
+  "arms": {
+    "qd1_whole": {
+      "n": 360,
+      "wall_s": 0.34,
+      "aggregate_gib_s": 10.374,
+      "mean_ms": 0.9513,
+      "p50_ms": 0.9467,
+      "p90_ms": 0.9715
+    },
+    "qd1_chunk8m": {
+      "n": 360,
+      "wall_s": 0.4,
+      "aggregate_gib_s": 8.978,
+      "mean_ms": 1.1007,
+      "p50_ms": 1.0826,
+      "p90_ms": 1.1713
+    },
+    "qd2_whole": {
+      "n": 360,
+      "wall_s": 0.28,
+      "aggregate_gib_s": 12.692,
+      "mean_ms": 1.5479,
+      "p50_ms": 1.5449,
+      "p90_ms": 1.6986
+    },
+    "qd2_chunk8m": {
+      "n": 360,
+      "wall_s": 0.29,
+      "aggregate_gib_s": 12.17,
+      "mean_ms": 1.6201,
+      "p50_ms": 1.6161,
+      "p90_ms": 1.7545
+    },
+    "qd2_even2": {
+      "n": 360,
+      "wall_s": 0.28,
+      "aggregate_gib_s": 12.814,
+      "mean_ms": 1.5408,
+      "p50_ms": 1.5404,
+      "p90_ms": 1.6028
+    },
+    "qd2_even3": {
+      "n": 360,
+      "wall_s": 0.28,
+      "aggregate_gib_s": 12.7,
+      "mean_ms": 1.5552,
+      "p50_ms": 1.5455,
+      "p90_ms": 1.5919
+    },
+    "qd3_whole": {
+      "n": 360,
+      "wall_s": 0.28,
+      "aggregate_gib_s": 12.68,
+      "mean_ms": 2.3227,
+      "p50_ms": 2.3341,
+      "p90_ms": 2.6005
+    },
+    "qd3_even3": {
+      "n": 360,
+      "wall_s": 0.28,
+      "aggregate_gib_s": 12.817,
+      "mean_ms": 2.3019,
+      "p50_ms": 2.2973,
+      "p90_ms": 2.43
+    }
+  },
+  "status": "complete"
+}

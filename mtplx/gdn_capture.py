@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
 import os
 from typing import Any
 
@@ -956,7 +958,9 @@ def resolve_gdn_capture_backend(backend: str | None = None) -> str:
     )
 
 
-def _linear_conv1d_capture(qkv: mx.array, base_conv_state: mx.array, conv_weight: mx.array):
+def _linear_conv1d_capture(
+    qkv: mx.array, base_conv_state: mx.array, conv_weight: mx.array
+):
     if _linear_conv1d_kernel is None:
         return None
     B, T, conv_dim = qkv.shape
@@ -981,7 +985,9 @@ def _linear_conv1d_capture(qkv: mx.array, base_conv_state: mx.array, conv_weight
 
 
 def _matching_quantized_linears(left: Any, right: Any) -> bool:
-    if not isinstance(left, nn.QuantizedLinear) or not isinstance(right, nn.QuantizedLinear):
+    if not isinstance(left, nn.QuantizedLinear) or not isinstance(
+        right, nn.QuantizedLinear
+    ):
         return False
     if "bias" in left or "bias" in right:
         return False
@@ -1068,7 +1074,9 @@ def _fused_quantized_many(
     return tuple(mx.split(out, list(split_points), axis=-1))
 
 
-def _gdn_input_projections(gdn: Any, inputs: mx.array) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+def _gdn_input_projections(
+    gdn: Any, inputs: mx.array
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
     fuse_mode = os.environ.get("MTPLX_FUSE_GDN_PROJECTIONS", "").lower()
     if fuse_mode in {"all", "4to1", "one"}:
         fused = _fused_quantized_many(
@@ -1500,7 +1508,9 @@ def gdn_forward_with_capture(
 
     state = cache[1] if cache and cache[1] is not None else None
     if state is None:
-        state = mx.zeros((B, gdn.num_v_heads, gdn.head_v_dim, gdn.head_k_dim), dtype=mx.float32)
+        state = mx.zeros(
+            (B, gdn.num_v_heads, gdn.head_v_dim, gdn.head_k_dim), dtype=mx.float32
+        )
 
     final_only_capture = False
     capture_start = 0
@@ -1529,7 +1539,10 @@ def gdn_forward_with_capture(
             return gdn(inputs, mask=mask, cache=cache), None
         out, final_state, tape = delta_result
         states = final_state[:, None, :, :, :]
-    elif backend in {"linear_gdn_from_conv_stream", "linear_gdn_from_conv_stream_skip0"}:
+    elif backend in {
+        "linear_gdn_from_conv_stream",
+        "linear_gdn_from_conv_stream_skip0",
+    }:
         beta = mx.sigmoid(b)
         g = compute_g(gdn.A_log, a, gdn.dt_bias)
         capture_start = 1 if backend == "linear_gdn_from_conv_stream_skip0" else 0
@@ -1556,7 +1569,9 @@ def gdn_forward_with_capture(
         beta = mx.sigmoid(b)
         g = compute_g(gdn.A_log, a, gdn.dt_bias)
         if use_from_conv:
-            delta_result = _linear_gated_delta_from_conv_capture(conv_out, g, beta, state, gdn)
+            delta_result = _linear_gated_delta_from_conv_capture(
+                conv_out, g, beta, state, gdn
+            )
         else:
             q, k, v = [
                 t.reshape(B, S, h, d)
@@ -1689,9 +1704,26 @@ def forward_with_gdn_capture(
 ):
     text_model = getattr(model, "language_model", model)
     inner = text_model.model
+    layers = tuple(inner.layers)
+    hybrid_metadata = hasattr(inner, "fa_idx") and hasattr(inner, "ssm_idx")
+    if not hybrid_metadata:
+        if any(bool(getattr(layer, "is_linear", False)) for layer in layers):
+            raise RuntimeError(
+                "hybrid capture target is missing fa_idx/ssm_idx metadata"
+            )
+        result = text_model(
+            inputs,
+            cache=cache,
+            return_hidden=return_hidden,
+            hidden_variant=hidden_variant,
+        )
+        if return_hidden:
+            logits, hidden = result
+            return logits, hidden, {}
+        return result, {}
     hidden_states = inner.embed_tokens(inputs)
     if cache is None:
-        cache = [None] * len(inner.layers)
+        cache = [None] * len(layers)
 
     from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
@@ -1711,7 +1743,7 @@ def forward_with_gdn_capture(
         and context_len >= max(0, layer_eval_threshold)
     )
 
-    for layer_idx, (layer, layer_cache) in enumerate(zip(inner.layers, cache)):
+    for layer_idx, (layer, layer_cache) in enumerate(zip(layers, cache)):
         mask = ssm_mask if layer.is_linear else fa_mask
         normed = layer.input_layernorm(hidden_states)
         if layer.is_linear:
@@ -1766,11 +1798,182 @@ def forward_with_gdn_capture(
 
     pre_norm = hidden_states
     post_norm = inner.norm(hidden_states)
-    logits = inner.embed_tokens.as_linear(post_norm) if text_model.args.tie_word_embeddings else text_model.lm_head(post_norm)
+    logits = (
+        inner.embed_tokens.as_linear(post_norm)
+        if text_model.args.tie_word_embeddings
+        else text_model.lm_head(post_norm)
+    )
     if return_hidden:
         hidden = pre_norm if hidden_variant == "pre_norm" else post_norm
         return logits, hidden, captures
     return logits, captures
+
+
+@dataclass(frozen=True)
+class _StockCapturedLayerCommit:
+    layer_index: int
+    own_conv: Callable[[Any], Any]
+    own_gdn: Callable[[Any], Any]
+    replace_state: Callable[[Any, list[Any]], None]
+
+    def __call__(
+        self,
+        cache: list[Any],
+        captures: dict[int, dict[str, mx.array]],
+        capture_index: int,
+    ) -> None:
+        capture = captures[self.layer_index]
+        conv_state = self.own_conv(
+            capture["conv_states"][:, capture_index, :, :]
+        )
+        gdn_state = self.own_gdn(
+            capture["states"][:, capture_index, :, :, :]
+        )
+        self.replace_state(cache[self.layer_index], [conv_state, gdn_state])
+
+
+@dataclass(frozen=True)
+class CapturedPrefixCommitPlan:
+    """Construction-qualified direct commit for stock GDN captures.
+
+    Cache ownership, layer kinds, capture schema, shapes, dtypes, backend, and
+    detach policy are proven before installation.  Runtime keep/verify widths
+    genuinely vary (the final depth-3 cycle can be shorter), so commit uses
+    those two values directly without rechecking the installed invariants.
+    """
+
+    max_verified_tokens: int
+    _recurrent_commits: tuple[_StockCapturedLayerCommit, ...]
+    trimmable_layer_indices: tuple[int, ...]
+
+    @property
+    def recurrent_layer_indices(self) -> tuple[int, ...]:
+        return tuple(route.layer_index for route in self._recurrent_commits)
+
+    def commit(
+        self,
+        cache: list[Any],
+        captures: dict[int, dict[str, mx.array]],
+        *,
+        keep_tokens: int,
+        verified_tokens: int,
+    ) -> None:
+        capture_index = keep_tokens - 1
+        trim_tokens = verified_tokens - keep_tokens
+        for route in self._recurrent_commits:
+            route(cache, captures, capture_index)
+        for layer_index in self.trimmable_layer_indices:
+            cache[layer_index].trim(trim_tokens)
+
+
+def qualify_captured_prefix_commit(
+    cache: list[Any],
+    captures: dict[int, dict[str, mx.array]],
+    *,
+    max_verified_tokens: int,
+    capture_backend: str,
+    detach_components: set[str],
+) -> CapturedPrefixCommitPlan:
+    """Fail closed before measurement and return a direct stock committer."""
+
+    if capture_backend != "stock":
+        raise RuntimeError("direct commit requires the stock capture backend")
+    if detach_components:
+        raise RuntimeError("direct commit does not permit capture detach components")
+    if max_verified_tokens < 1:
+        raise RuntimeError("direct commit max_verified_tokens must be positive")
+    if captures.get("__final_only__"):
+        raise RuntimeError("direct commit cannot install from a final-only capture")
+
+    from .cache_state import replace_recurrent_cache_state
+
+    recurrent: list[_StockCapturedLayerCommit] = []
+    trimmable: list[int] = []
+    for layer_index, entry in enumerate(cache):
+        is_trimmable = getattr(entry, "is_trimmable", None)
+        if callable(is_trimmable) and bool(is_trimmable()):
+            if layer_index in captures:
+                raise RuntimeError(
+                    f"unexpected capture for trimmable layer {layer_index}"
+                )
+            if not callable(getattr(entry, "trim", None)):
+                raise RuntimeError(
+                    f"trimmable layer {layer_index} has no fixed trim operation"
+                )
+            trimmable.append(layer_index)
+            continue
+
+        state = getattr(entry, "state", None)
+        if not isinstance(state, (list, tuple)) or len(state) != 2:
+            raise RuntimeError(
+                f"cache layer {layer_index} is neither trimmable nor recurrent"
+            )
+        capture = captures.get(layer_index)
+        if capture is None:
+            raise RuntimeError(f"missing capture for recurrent layer {layer_index}")
+        if not isinstance(capture, dict) or set(capture) != {
+            "conv_states",
+            "states",
+        }:
+            raise RuntimeError(
+                f"recurrent layer {layer_index} does not use the stock capture schema"
+            )
+        if not all(isinstance(value, mx.array) for value in state):
+            raise RuntimeError(
+                f"recurrent cache layer {layer_index} has non-array state"
+            )
+        conv_states = capture["conv_states"]
+        gdn_states = capture["states"]
+        if not isinstance(conv_states, mx.array) or not isinstance(gdn_states, mx.array):
+            raise RuntimeError(
+                f"recurrent layer {layer_index} capture leaves are not arrays"
+            )
+        if len(conv_states.shape) != 4 or len(gdn_states.shape) != 5:
+            raise RuntimeError(
+                f"recurrent layer {layer_index} capture ranks are invalid"
+            )
+        if (
+            int(conv_states.shape[1]) != max_verified_tokens
+            or int(gdn_states.shape[1]) != max_verified_tokens
+        ):
+            raise RuntimeError(
+                f"recurrent layer {layer_index} capture width does not match "
+                f"{max_verified_tokens}"
+            )
+        if (
+            tuple(conv_states.shape[:1] + conv_states.shape[2:])
+            != tuple(state[0].shape)
+            or tuple(gdn_states.shape[:1] + gdn_states.shape[2:])
+            != tuple(state[1].shape)
+        ):
+            raise RuntimeError(
+                f"recurrent layer {layer_index} capture shapes do not match cache state"
+            )
+        if conv_states.dtype != state[0].dtype or gdn_states.dtype != state[1].dtype:
+            raise RuntimeError(
+                f"recurrent layer {layer_index} capture dtypes do not match cache state"
+            )
+        recurrent.append(
+            _StockCapturedLayerCommit(
+                layer_index=layer_index,
+                own_conv=mx.contiguous,
+                own_gdn=_contiguous_recurrent_leaf,
+                replace_state=replace_recurrent_cache_state,
+            )
+        )
+
+    capture_layers = {key for key in captures if isinstance(key, int)}
+    recurrent_layers = {route.layer_index for route in recurrent}
+    if capture_layers != recurrent_layers:
+        unexpected = sorted(capture_layers - recurrent_layers)
+        raise RuntimeError(f"unexpected recurrent capture layers: {unexpected}")
+    if not recurrent:
+        raise RuntimeError("direct commit requires at least one recurrent layer")
+    return CapturedPrefixCommitPlan(
+        max_verified_tokens=int(max_verified_tokens),
+        _recurrent_commits=tuple(recurrent),
+        trimmable_layer_indices=tuple(trimmable),
+    )
 
 
 def commit_captured_prefix(
@@ -1811,7 +2014,9 @@ def commit_captured_prefix(
                 conv_state = detach_array_leaf(conv_state, mode=detach_mode)
                 if detach_stats is not None:
                     detach_stats["arrays"] = int(detach_stats.get("arrays", 0)) + 1
-                    detach_stats["bytes"] = int(detach_stats.get("bytes", 0)) + int(conv_state.nbytes)
+                    detach_stats["bytes"] = int(detach_stats.get("bytes", 0)) + int(
+                        conv_state.nbytes
+                    )
             if "tape" in capture:
                 replayed_state = _linear_gated_delta_from_conv_tape_replay(
                     capture["tape"],
@@ -1834,7 +2039,9 @@ def commit_captured_prefix(
                 gdn_state = detach_array_leaf(gdn_state, mode=detach_mode)
                 if detach_stats is not None:
                     detach_stats["arrays"] = int(detach_stats.get("arrays", 0)) + 1
-                    detach_stats["bytes"] = int(detach_stats.get("bytes", 0)) + int(gdn_state.nbytes)
+                    detach_stats["bytes"] = int(detach_stats.get("bytes", 0)) + int(
+                        gdn_state.nbytes
+                    )
             from .cache_state import replace_recurrent_cache_state
 
             replace_recurrent_cache_state(entry, [conv_state, gdn_state])

@@ -1,0 +1,55 @@
+{
+  "eval": "manifest & bank completeness + effective bpw",
+  "repo_verify_tool": {
+    "command": "/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/eval-hy3-q2-2p6bit/scripts/verify_expert_manifest.py /Users/davidtai/.cache/huggingface/hy3-expert-only-mlx-q2 /Users/davidtai/.cache/huggingface/hy3-expert-only-mlx-q2/expert-manifest.json",
+    "returncode": 0,
+    "ok": true,
+    "report": {
+      "checked_records": 0,
+      "checked_shards": 19,
+      "model_key": "hy3-expert-q2",
+      "sidecar_verified": false,
+      "valid": true
+    },
+    "stderr": ""
+  },
+  "independent_check": {
+    "bank_file": "experts.bin",
+    "bank_size_on_disk": 89464504320,
+    "sidecar_declared_size": 89464504320,
+    "sidecar_size_matches_disk": true,
+    "record_count": 15168,
+    "expected_grid": "79x192=15168",
+    "missing_count": 0,
+    "missing_sample": [],
+    "extra_count": 0,
+    "duplicate_records": 0,
+    "segments_out_of_bounds": [],
+    "n_out_of_bounds": 0,
+    "total_expert_record_bytes": 89464504320,
+    "total_weight_elements": 286286413824,
+    "effective_bpw": 2.5,
+    "weight_payload_bpw": 2.0,
+    "scale_bias_overhead_bpw": 0.5,
+    "group_size": 64
+  },
+  "hf_expert_aware_completeness": {
+    "source": "commit a476015 (mtplx.hf_loader)",
+    "expert_artifact_status": {
+      "streamed_experts": true,
+      "manifest_file": "expert-manifest.json",
+      "manifest_present": true,
+      "sidecar_file": "experts.bin",
+      "expected_bytes": 89464504320,
+      "actual_bytes": 89464504320,
+      "ok": true,
+      "reason": null
+    },
+    "cached_model_incompleteness_reason": null,
+    "reads_as_complete": true
+  },
+  "effective_bpw_measured": 2.5,
+  "effective_bpw_note": "affine gs64 2-bit == exactly 2.0 payload + 0.5 (bf16 scale+bias per 64 weights) = 2.50 bpw; the '2.6-bit' label is approximate/rounded, measured is 2.50.",
+  "verdict": "PASS",
+  "seconds": 2.7
+}

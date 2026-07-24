@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import fnmatch
 import importlib
 import json
 import os
@@ -11,8 +12,8 @@ import re
 import shutil
 import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Callable, Iterator
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable, Iterator, Sequence
 
 from mtplx.artifacts import _hf_repo_id_from_ref
 from mtplx.profiles import DEFAULT_PROFILE_NAME
@@ -32,6 +33,22 @@ MTP_SIDECAR_FALLBACKS = (
     "model-mtp.safetensors",
 )
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+
+#: Sidecar manifest that declares SSD-streamed MoE experts for an artifact.
+EXPERT_MANIFEST_FILE = "expert-manifest.json"
+#: Marker written into a cache directory when the user deliberately skipped files.
+PARTIAL_DOWNLOAD_MARKER = ".mtplx_partial_download.json"
+#: Glob patterns excluded by ``--no-expert-banks``. Expert banks are the raw
+#: ``.bin`` blobs named by an expert manifest's ``sidecar`` entry; MTPLX
+#: artifacts otherwise carry their weights as ``.safetensors``.
+EXPERT_BANK_IGNORE_PATTERNS = ("*.bin",)
+#: Refuse to slurp a pathological manifest during a cheap completeness check.
+MAX_EXPERT_MANIFEST_BYTES = 512 * 1024 * 1024
+
+# The sidecar object is small and flat, so it can be lifted out of a very
+# large manifest without paying for a full JSON parse. A full parse is the
+# fallback whenever this does not match.
+_SIDECAR_OBJECT_RE = re.compile(rb'"sidecar"\s*:\s*(\{[^{}]*\})')
 
 
 @dataclass(frozen=True)
@@ -204,29 +221,209 @@ def _complete_unindexed_weights(path: Path) -> bool:
     return False
 
 
-def cached_model_is_complete(path: Path) -> bool:
-    """Return whether a Hub cache directory is ready to run.
+def _safe_member_name(name: Any) -> str | None:
+    """Return ``name`` when it is a repo-relative path that cannot escape."""
+
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if "\\" in name or "\x00" in name:
+        return None
+    pure = PurePosixPath(name)
+    if pure.is_absolute() or any(part in {"..", ""} for part in pure.parts):
+        return None
+    return name
+
+
+def _expert_manifest_sidecar(manifest_path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    """Return the manifest's ``sidecar`` object, or an error string.
+
+    ``(None, None)`` means the manifest parsed cleanly and simply declares no
+    sidecar bank — the expert bytes live in the safetensors shards instead.
+    """
+
+    try:
+        size = manifest_path.stat().st_size
+    except OSError as exc:
+        return None, str(exc)
+    if size > MAX_EXPERT_MANIFEST_BYTES:
+        return None, f"manifest exceeds the {MAX_EXPERT_MANIFEST_BYTES}-byte inspection limit"
+    try:
+        payload = manifest_path.read_bytes()
+    except OSError as exc:
+        return None, str(exc)
+    match = _SIDECAR_OBJECT_RE.search(payload)
+    if match is not None:
+        try:
+            candidate = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            candidate = None
+        if isinstance(candidate, dict) and "file" in candidate:
+            return candidate, None
+    try:
+        data = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, f"invalid JSON: {exc}"
+    if not isinstance(data, dict):
+        return None, "manifest is not a JSON object"
+    sidecar = data.get("sidecar")
+    if sidecar is None:
+        return None, None
+    if not isinstance(sidecar, dict):
+        return None, "manifest sidecar entry is not an object"
+    return sidecar, None
+
+
+def _declares_streamed_experts(path: Path) -> bool:
+    """Whether the runtime contract says this artifact streams its experts."""
+
+    contract_path = path / "mtplx_runtime.json"
+    if not contract_path.is_file():
+        return False
+    try:
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(contract, dict):
+        return False
+    if contract.get("expert_manifest_file"):
+        return True
+    streaming = contract.get("expert_streaming")
+    if isinstance(streaming, dict):
+        return bool(streaming)
+    return bool(streaming)
+
+
+def expert_artifact_status(path: Path) -> dict[str, Any]:
+    """Describe the streamed-expert sidecar state of a model directory.
+
+    A streamed-expert artifact is only loadable when the expert manifest AND
+    the expert bank it names are both present, and the bank is at least the
+    manifest's declared size. Neither file appears in the safetensors index,
+    so the ordinary shard check cannot see a missing or truncated bank.
+    """
+
+    manifest_path = path / EXPERT_MANIFEST_FILE
+    manifest_present = manifest_path.is_file()
+    status: dict[str, Any] = {
+        "streamed_experts": manifest_present or _declares_streamed_experts(path),
+        "manifest_file": EXPERT_MANIFEST_FILE,
+        "manifest_present": manifest_present,
+        "sidecar_file": None,
+        "expected_bytes": None,
+        "actual_bytes": None,
+        "ok": True,
+        "reason": None,
+    }
+    if not status["streamed_experts"]:
+        return status
+    if not manifest_present:
+        status["ok"] = False
+        status["reason"] = (
+            f"{EXPERT_MANIFEST_FILE} is missing but the artifact declares streamed experts"
+        )
+        return status
+
+    sidecar, error = _expert_manifest_sidecar(manifest_path)
+    if error is not None:
+        status["ok"] = False
+        status["reason"] = f"{EXPERT_MANIFEST_FILE} could not be read ({error})"
+        return status
+    if sidecar is None:
+        # Manifest declares no separate bank; the experts live in the shards.
+        return status
+
+    name = _safe_member_name(sidecar.get("file"))
+    if name is None:
+        status["ok"] = False
+        status["reason"] = f"{EXPERT_MANIFEST_FILE} names an unsafe expert bank path"
+        return status
+    status["sidecar_file"] = name
+    expected = sidecar.get("size")
+    if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
+        expected = None
+    status["expected_bytes"] = expected
+
+    bank = path / name
+    try:
+        actual = bank.stat().st_size if bank.is_file() else None
+    except OSError:
+        actual = None
+    status["actual_bytes"] = actual
+    if actual is None:
+        status["ok"] = False
+        status["reason"] = (
+            f"expert bank {name} named by {EXPERT_MANIFEST_FILE} is missing"
+        )
+        return status
+    if expected is not None and actual < expected:
+        status["ok"] = False
+        status["reason"] = (
+            f"expert bank {name} is truncated ({actual} of {expected} bytes)"
+        )
+    return status
+
+
+def partial_download_info(path: Path) -> dict[str, Any] | None:
+    """Return the deliberate-partial-download marker for ``path``, if any."""
+
+    marker = path / PARTIAL_DOWNLOAD_MARKER
+    if not marker.is_file():
+        return None
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {"excluded_patterns": [], "unreadable_marker": True}
+    return data if isinstance(data, dict) else {"excluded_patterns": []}
+
+
+def cached_model_incompleteness_reason(path: Path) -> str | None:
+    """Return why a cache directory is not ready to run, or ``None`` if it is.
 
     ``snapshot_download(local_dir=...)`` creates the destination early. An
     interrupted pull can therefore leave config/tokenizer files plus an index,
-    which looks cached even though the weight shards are missing.
+    which looks cached even though the weight shards are missing. A
+    streamed-expert artifact has the same failure mode one level down: its
+    expert bank is named only by ``expert-manifest.json``.
     """
 
     if not path.is_dir():
-        return False
+        return f"model directory does not exist: {path}"
     if _has_incomplete_transfers(path):
-        return False
+        return "weight download is incomplete (*.incomplete)"
+    partial = partial_download_info(path)
+    if partial is not None:
+        patterns = partial.get("excluded_patterns")
+        excluded = ", ".join(patterns) if isinstance(patterns, list) and patterns else "some files"
+        return (
+            f"model was downloaded without {excluded} on purpose "
+            f"(see {PARTIAL_DOWNLOAD_MARKER}); re-run the pull without "
+            "--no-expert-banks to fetch the rest"
+        )
     # Assistant-pair bundles (Gemma 4) have no top-level config.json — the
     # weights live under target/ and assistant/ with an mtplx_pair.json
     # marker. Require both halves to be complete (QA-112).
     if (path / "mtplx_pair.json").is_file():
-        return _pair_bundle_is_complete(path)
+        if _pair_bundle_is_complete(path):
+            return None
+        return "assistant-pair bundle is incomplete: a half is missing or has no weights"
     if not (path / "config.json").is_file():
-        return False
+        return "config.json is missing"
     index_names = ("model.safetensors.index.json", "pytorch_model.bin.index.json")
     if any((path / name).is_file() for name in index_names):
-        return any(_complete_indexed_weights(path, name) for name in index_names)
-    return _complete_unindexed_weights(path)
+        if not any(_complete_indexed_weights(path, name) for name in index_names):
+            return "weight shards named by the index are missing or still partial"
+    elif not _complete_unindexed_weights(path):
+        return "no weight files were found (*.safetensors, *.bin, *.gguf)"
+    experts = expert_artifact_status(path)
+    if not experts["ok"]:
+        return str(experts["reason"])
+    return None
+
+
+def cached_model_is_complete(path: Path) -> bool:
+    """Return whether a Hub cache directory is ready to run."""
+
+    return cached_model_incompleteness_reason(path) is None
 
 
 def _pair_bundle_is_complete(path: Path) -> bool:
@@ -273,8 +470,10 @@ def resolve_model_path(model_ref: str, *, cache_dir: str | Path | None = None) -
     cached = cached_model_path(repo_id, cache_dir=cache_dir)
     if _cached_model_ready_for_repo(cached, repo_id):
         return cached
+    reason = cached_model_incompleteness_reason(cached)
+    detail = f" ({reason})" if reason and cached.is_dir() else ""
     raise FileNotFoundError(
-        f"Model {repo_id} is not cached. Run: mtplx pull {repo_id}"
+        f"Model {repo_id} is not cached{detail}. Run: mtplx pull {repo_id}"
     )
 
 
@@ -336,10 +535,14 @@ def validate_mtplx_model_files(path: Path) -> dict[str, Any]:
     sidecar_candidates = _mtp_sidecar_candidates(path, contract)
     if not _mtp_sidecar_exists(path, contract):
         missing.append("mtp sidecar")
+    experts = expert_artifact_status(path)
+    if not experts["ok"]:
+        missing.append(str(experts["reason"]))
     return {
         "ok": not missing and contract_error is None,
         "required_files": list(REQUIRED_MTPLX_MODEL_FILES) + [sidecar_candidates[0]],
         "mtp_sidecar_candidates": sidecar_candidates,
+        "expert_artifact": experts,
         "missing_files": missing,
         "contract_present": contract_path.exists(),
         "contract_arch_id": contract.get("arch_id") if isinstance(contract, dict) else None,
@@ -591,6 +794,46 @@ def _download_repo_file(
     )
 
 
+def repo_file_is_ignored(name: str, ignore_patterns: Sequence[str]) -> bool:
+    """Whether a repo-relative file name matches any ignore glob."""
+
+    if not ignore_patterns:
+        return False
+    base = PurePosixPath(name).name
+    return any(
+        fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(base, pattern)
+        for pattern in ignore_patterns
+    )
+
+
+def _write_partial_marker(
+    destination: Path,
+    *,
+    repo_id: str,
+    ignore_patterns: Sequence[str],
+    skipped_files: Sequence[str],
+) -> None:
+    """Record that files were skipped on purpose, not lost to a failure."""
+
+    payload = {
+        "repo_id": repo_id,
+        "excluded_patterns": list(ignore_patterns),
+        "skipped_files": sorted(skipped_files)[:512],
+        "skipped_file_count": len(skipped_files),
+        "reason": "expert banks were excluded at the user's request",
+    }
+    (destination / PARTIAL_DOWNLOAD_MARKER).write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def _clear_partial_marker(destination: Path) -> None:
+    try:
+        (destination / PARTIAL_DOWNLOAD_MARKER).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _download_snapshot_with_structured_progress(
     *,
     repo_id: str,
@@ -598,7 +841,8 @@ def _download_snapshot_with_structured_progress(
     destination: Path,
     progress_callback: DownloadProgressCallback | None,
     progress_interval_s: float,
-) -> tuple[Path, int | None]:
+    ignore_patterns: Sequence[str] = (),
+) -> tuple[Path, int | None, list[str]]:
     HfApi, hf_hub_url, get_session, build_hf_headers, hf_raise_for_status = _hub_runtime()
     try:
         info = HfApi().model_info(
@@ -619,6 +863,21 @@ def _download_snapshot_with_structured_progress(
         repo_files.append(RepoFile(path=name, size_bytes=size if isinstance(size, int) else None))
     if not repo_files:
         raise RuntimeError(f"Hugging Face repo {repo_id} did not return downloadable files.")
+
+    skipped_files = [
+        repo_file.path
+        for repo_file in repo_files
+        if repo_file_is_ignored(repo_file.path, ignore_patterns)
+    ]
+    if skipped_files:
+        skipped = set(skipped_files)
+        repo_files = [
+            repo_file for repo_file in repo_files if repo_file.path not in skipped
+        ]
+        if not repo_files:
+            raise RuntimeError(
+                f"every file in {repo_id} was excluded by {list(ignore_patterns)}"
+            )
 
     total_bytes = sum(
         repo_file.size_bytes
@@ -649,7 +908,7 @@ def _download_snapshot_with_structured_progress(
             )
         except Exception as exc:
             raise RuntimeError(_classify_pull_error(exc, repo_id)) from exc
-    return destination, total_bytes
+    return destination, total_bytes, skipped_files
 
 
 @dataclass(frozen=True)
@@ -733,10 +992,22 @@ def pull_model(
     revision: str | None = None,
     progress_callback: DownloadProgressCallback | None = None,
     progress_interval_s: float = 10.0,
+    include_expert_banks: bool = True,
 ) -> dict[str, Any]:
+    """Download ``model_ref`` into the MTPLX cache.
+
+    Expert banks are fetched by default. ``include_expert_banks=False`` is an
+    explicit opt-out for users who only want the resident weights: it skips
+    the multi-hundred-gigabyte ``*.bin`` banks and stamps the destination with
+    a marker so the result is never mistaken for a complete artifact.
+    """
+
     repo_id = repo_id_from_model_ref(model_ref)
     if repo_id is None:
         raise ValueError(f"pull requires a Hugging Face repo id or URL, got: {model_ref}")
+    ignore_patterns: tuple[str, ...] = (
+        () if include_expert_banks else EXPERT_BANK_IGNORE_PATTERNS
+    )
     root = model_cache_dir(cache_dir)
     root.mkdir(parents=True, exist_ok=True)
     destination = cached_model_path(repo_id, cache_dir=root)
@@ -750,6 +1021,7 @@ def pull_model(
         resolved = destination
         reused_existing = True
         resumed_existing = False
+        skipped_files: list[str] = []
         validation = validate_mtplx_model_files(resolved)
         if repo_id.lower().startswith("youssofal/qwen3.6-27b-mtplx") and not validation["ok"]:
             raise RuntimeError(
@@ -770,6 +1042,7 @@ def pull_model(
         )
     else:
         reused_existing = False
+        skipped_files = []
         resumed_existing = destination.exists() and started_size > 0
         destination.mkdir(parents=True, exist_ok=True)
         total_bytes = (
@@ -794,12 +1067,17 @@ def pull_model(
         )
         with progress_suppression:
             if progress_callback is not None:
-                resolved, total_bytes_from_download = _download_snapshot_with_structured_progress(
+                (
+                    resolved,
+                    total_bytes_from_download,
+                    skipped_files,
+                ) = _download_snapshot_with_structured_progress(
                     repo_id=repo_id,
                     revision=revision,
                     destination=destination,
                     progress_callback=progress_callback,
                     progress_interval_s=progress_interval_s,
+                    ignore_patterns=ignore_patterns,
                 )
                 if total_bytes_from_download:
                     total_bytes = total_bytes_from_download
@@ -816,6 +1094,7 @@ def pull_model(
                     revision=revision,
                     local_dir=str(destination),
                     token=hf_token_for_download(),
+                    ignore_patterns=list(ignore_patterns) or None,
                 )
                 resolved = Path(path)
         _emit_download_progress(
@@ -828,11 +1107,20 @@ def pull_model(
                 "total_bytes": total_bytes,
             },
         )
-        validation = validate_mtplx_model_files(resolved)
-        if not cached_model_is_complete(resolved):
-            raise RuntimeError(
-                "downloaded model is incomplete: weight shards are missing or still partial"
+        if ignore_patterns:
+            # A deliberate partial pull must stay clearly distinguishable from
+            # a corrupt one: mark it, and skip the fail-closed gate below.
+            _write_partial_marker(
+                resolved,
+                repo_id=repo_id,
+                ignore_patterns=ignore_patterns,
+                skipped_files=skipped_files,
             )
+        else:
+            _clear_partial_marker(resolved)
+        validation = validate_mtplx_model_files(resolved)
+        if not ignore_patterns and (reason := cached_model_incompleteness_reason(resolved)):
+            raise RuntimeError(f"downloaded model is incomplete: {reason}")
         if repo_id.lower().startswith("youssofal/qwen3.6-27b-mtplx") and not validation["ok"]:
             raise RuntimeError(
                 "downloaded MTPLX model is incomplete: "
@@ -861,6 +1149,10 @@ def pull_model(
         "size_bytes": directory_size_bytes(resolved),
         "has_runtime_contract": (resolved / "mtplx_runtime.json").exists(),
         "has_config": (resolved / "config.json").exists(),
+        "include_expert_banks": include_expert_banks,
+        "excluded_patterns": list(ignore_patterns),
+        "skipped_files": sorted(skipped_files),
+        "partial_download": bool(ignore_patterns),
         "validation": validate_mtplx_model_files(resolved),
     }
 

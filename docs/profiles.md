@@ -12,3 +12,5 @@
 | `max-diagnostic` | Fan-control diagnostics only. Product modes are Sustained, Sustained Max, and Burst. |
 
 `--max` is separate from profiles. It is opt-in and must restore fan state on exit when supported.
+Set the profile persistently with `mtplx settings user set runtime.profile=VALUE` or for one run with
+`--set runtime.profile=VALUE`.

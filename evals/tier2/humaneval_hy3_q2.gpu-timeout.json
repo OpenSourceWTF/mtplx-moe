@@ -1,0 +1,428 @@
+{
+  "params": {
+    "allow_code_execution": true,
+    "endpoint": "chat",
+    "execution_timeout_s": 15.0,
+    "limit": 20,
+    "max_tokens": 1024,
+    "model": "hy3-q2",
+    "n": 1,
+    "retries": 2,
+    "score_workers": 4,
+    "seed": 42,
+    "temperature": 0.0,
+    "timeout_s": 600.0,
+    "top_p": null,
+    "workers": 4
+  },
+  "provenance": {
+    "base_url": "http://127.0.0.1:18183",
+    "completions": 20,
+    "dataset_path": "/Users/davidtai/Library/Caches/evalplus/HumanEvalPlus-v0.1.10.jsonl",
+    "dataset_sha256": "42526ec0e7d5f3ee0b06d6ced98f8c8bae3d76519151bfb3d36f79010645bd7f",
+    "endpoint": "chat",
+    "model": "hy3-q2",
+    "mtplx_version": "2.0.2",
+    "python": "3.12.13",
+    "samples_per_task": 1,
+    "suite": "humaneval",
+    "tasks": 20,
+    "timestamp_utc": "2026-07-21T04:41:08.990091+00:00",
+    "wall_s": 48.292621416999964
+  },
+  "request_errors": 20,
+  "rows": [
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 43.26440716700017,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/0",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 43.22959341699993,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/1",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 43.40260462499987,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/2",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 43.18696912500013,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/3",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.0208630839999842,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/4",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.0568613750001532,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/5",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.035791042000028,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/6",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.322229666999874,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/7",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.2329250829998273,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/8",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.2025899170000685,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/9",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.2510959159999402,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/10",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.2261563329998353,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/11",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 0.9337219159999677,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/12",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.1881306249999852,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/13",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.2111977090000892,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/14",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.021271041000091,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/15",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 0.8506989999998495,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/16",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.0386740000001282,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/17",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.1049620829999185,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/18",
+      "usage": null
+    },
+    {
+      "attempts": 3,
+      "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "error": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+      "finish_reason": null,
+      "passed": false,
+      "request_seconds": 1.3172178329998587,
+      "sample": 0,
+      "seconds": 0.0,
+      "status": "request_error",
+      "suite": "humaneval",
+      "task_id": "HumanEval/19",
+      "usage": null
+    }
+  ],
+  "schema": "mtplx.code_eval_gate/1",
+  "summary": {
+    "by_status": {
+      "request_error": 20
+    },
+    "failures": [
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/0"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/1"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/2"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/3"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/4"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/5"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/6"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/7"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/8"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/9"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/10"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/11"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/12"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/13"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/14"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/15"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/16"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/17"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/18"
+      },
+      {
+        "detail": "GateHTTPError(\"connection failed: ConnectionRefusedError(61, 'Connection refused')\")",
+        "status": "request_error",
+        "task_id": "HumanEval/19"
+      }
+    ],
+    "pass@1": 0.0,
+    "passed": 0,
+    "samples": 20,
+    "tasks": 20
+  }
+}

@@ -14,8 +14,6 @@ from collections import deque
 from concurrent.futures import Future
 from types import SimpleNamespace
 
-import pytest
-
 import mtplx.server.openai as server
 
 

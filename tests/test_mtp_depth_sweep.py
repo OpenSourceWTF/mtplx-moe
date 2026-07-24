@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from mtplx.benchmarks.runners import mtp_depth_sweep
 
 
@@ -24,10 +26,14 @@ def test_depth_sweep_uses_packaged_draft_lm_head_helper(monkeypatch, tmp_path) -
     )
 
     monkeypatch.setattr(mtp_depth_sweep, "load", lambda *_args, **_kwargs: fake_runtime)
-    monkeypatch.setattr(mtp_depth_sweep, "load_prompt_suite", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        mtp_depth_sweep, "load_prompt_suite", lambda *_args, **_kwargs: []
+    )
     monkeypatch.setattr(
         "mtplx.draft_lm_head._install_draft_lm_head",
-        lambda runtime, **kwargs: calls.append((runtime, kwargs)) or {"installed": True},
+        lambda runtime, **kwargs: (
+            calls.append((runtime, kwargs)) or {"installed": True}
+        ),
     )
 
     result = mtp_depth_sweep.run_mtp_depth_sweep(
@@ -73,7 +79,9 @@ def test_depth_sweep_passes_merge_mtp_adapter_to_runtime(monkeypatch, tmp_path) 
         return fake_runtime
 
     monkeypatch.setattr(mtp_depth_sweep, "load", fake_load)
-    monkeypatch.setattr(mtp_depth_sweep, "load_prompt_suite", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        mtp_depth_sweep, "load_prompt_suite", lambda *_args, **_kwargs: []
+    )
 
     result = mtp_depth_sweep.run_mtp_depth_sweep(
         tmp_path / "model",
@@ -87,4 +95,132 @@ def test_depth_sweep_passes_merge_mtp_adapter_to_runtime(monkeypatch, tmp_path) 
     assert load_kwargs[0]["merge_mtp_adapter"] is True
     assert result["mtp_adapter_kind"] == "c4_mtp_lora_adapter"
     assert result["mtp_adapter_merged"] is True
-    assert result["mtp_adapter_merge_report"] == {"merged": 1, "targets": [{"target": "fc"}]}
+    assert result["mtp_adapter_merge_report"] == {
+        "merged": 1,
+        "targets": [{"target": "fc"}],
+    }
+
+
+def test_sum_draft_core_keeps_benchmarkable_per_depth_report() -> None:
+    summary = mtp_depth_sweep._sum_draft_core(
+        [
+            {
+                "requested": "device-k",
+                "selected": "device-k",
+                "compiled_calls": 2,
+                "organic_compile_calls": 0,
+                "fallbacks": 1,
+                "qualification_eligible": False,
+                "history_policy": "committed",
+                "cache_state_mode": "explicit-live-io",
+                "fallback_reasons": {"non_fixed_depth": 1},
+                "prewarm_time_s": 0.3,
+                "graph_construct_time_s": 0.1,
+                "host_syncs": 4,
+                "host_token_transfers": 2,
+                "device_handoff": {
+                    "schema": "compiled-mtp-device-handoff-v1",
+                    "full_verify_width": True,
+                    "calls": 2,
+                    "fallbacks": 1,
+                    "fallback_reasons": {"lazy_bonus_verify": 1},
+                    "acceptance_host_transfers": 2,
+                    "acceptance_payload_ints": 12,
+                    "per_row_argmax_host_reads": 0,
+                    "qualification_eligible": False,
+                },
+                "per_depth": {
+                    "3": {
+                        "calls": 2,
+                        "dispatch_time_s": 0.4,
+                        "host_syncs": 2,
+                        "host_token_transfers": 2,
+                        "device_handoff_calls": 2,
+                        "acceptance_host_transfers": 2,
+                        "acceptance_payload_ints": 12,
+                        "per_row_argmax_host_reads": 0,
+                        "live_cache_commits": 2,
+                        "verify_width": 4,
+                    }
+                },
+            },
+            {
+                "requested": "device-k",
+                "selected": "device-k",
+                "compiled_calls": 1,
+                "organic_compile_calls": 0,
+                "fallbacks": 0,
+                "qualification_eligible": True,
+                "history_policy": "committed",
+                "cache_state_mode": "explicit-live-io",
+                "fallback_reasons": {},
+                "prewarm_time_s": 0.0,
+                "graph_construct_time_s": 0.0,
+                "host_syncs": 1,
+                "host_token_transfers": 1,
+                "device_handoff": {
+                    "schema": "compiled-mtp-device-handoff-v1",
+                    "full_verify_width": True,
+                    "calls": 1,
+                    "fallbacks": 0,
+                    "fallback_reasons": {},
+                    "acceptance_host_transfers": 1,
+                    "acceptance_payload_ints": 6,
+                    "per_row_argmax_host_reads": 0,
+                    "qualification_eligible": True,
+                },
+                "per_depth": {
+                    "3": {
+                        "calls": 1,
+                        "dispatch_time_s": 0.2,
+                        "host_syncs": 1,
+                        "host_token_transfers": 1,
+                        "device_handoff_calls": 1,
+                        "acceptance_host_transfers": 1,
+                        "acceptance_payload_ints": 6,
+                        "per_row_argmax_host_reads": 0,
+                        "live_cache_commits": 1,
+                        "verify_width": 4,
+                    }
+                },
+            },
+        ]
+    )
+
+    assert summary["schema"] == "compiled-mtp-draft-v1"
+    assert summary["primary_depth"] == 3
+    assert summary["primary_width"] == 4
+    assert summary["compiled_calls"] == 3
+    assert summary["organic_compile_calls"] == 0
+    assert summary["fallbacks"] == 1
+    assert summary["fallback_reasons"] == {"non_fixed_depth": 1}
+    assert summary["qualification_eligible"] is False
+    assert summary["history_policy"] == "committed"
+    assert summary["cache_state_mode"] == "explicit-live-io"
+    assert summary["prewarm_time_s"] == pytest.approx(0.3)
+    assert summary["graph_construct_time_s"] == pytest.approx(0.1)
+    assert summary["host_syncs"] == 5
+    assert summary["host_token_transfers"] == 3
+    assert summary["device_handoff"] == {
+        "schema": "compiled-mtp-device-handoff-v1",
+        "full_verify_width": True,
+        "calls": 3,
+        "fallbacks": 1,
+        "fallback_reasons": {"lazy_bonus_verify": 1},
+        "acceptance_host_transfers": 3,
+        "acceptance_payload_ints": 18,
+        "per_row_argmax_host_reads": 0,
+        "qualification_eligible": False,
+    }
+    assert summary["per_depth"]["3"] == {
+        "calls": 3,
+        "dispatch_time_s": pytest.approx(0.6),
+        "host_syncs": 3,
+        "host_token_transfers": 3,
+        "device_handoff_calls": 3,
+        "acceptance_host_transfers": 3,
+        "acceptance_payload_ints": 18,
+        "per_row_argmax_host_reads": 0,
+        "live_cache_commits": 3,
+        "verify_width": 4,
+    }

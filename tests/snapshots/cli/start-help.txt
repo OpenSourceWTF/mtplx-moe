@@ -1,0 +1,55 @@
+MTPLX start
+
+Interactive end-to-end setup. On first run MTPLX walks you through three
+quick choices: model, runtime mode, and where to chat (browser, terminal, Pi, OpenCode, Swival, or Hermes).
+On later runs it offers "same as last time?" so the chat is one keypress away.
+
+What gets asked:
+  1. Model — your configured model, the verified default, custom HF, or local
+  2. Mode  — Sustained, Turbo, Sustained Max, or Burst (Stable remains available via --profile safe)
+  3. Where — Web UI (default), terminal CLI, Pi, OpenCode Desktop, Swival, or Hermes
+
+Power-user shortcuts (any of these skip the onboarding wizard):
+  mtplx start --fresh                 Walk the onboarding again from scratch
+  mtplx start cli                     Skip onboarding; terminal chat directly
+  mtplx start pi                      Configure Pi, then serve MTPLX for Pi
+  mtplx start opencode --port 18083   Configure OpenCode Desktop for MTPLX-owned generation
+  mtplx start swival --port 18084     Serve MTPLX and print the Swival command
+  mtplx start hermes --port 18085     Serve MTPLX and open Hermes Agent in Terminal
+  mtplx start --max                   Sustained Max: long-context mode with ThermalForge fan boost
+  mtplx start --profile performance-cold --max
+                                      Burst: old max-fan lane, max 8K context
+  mtplx start --download              Pull the verified model from HF first
+  mtplx start --model /path/...       Use a specific local or HF model
+  mtplx start --prompt "hi"           One-shot ask and exit (non-interactive)
+  mtplx start cli --no-mtp            Use target-only AR generation
+
+Useful controls:
+  --download       Download the selected/default model if missing
+  --model PATH     Use a local model folder or HF repo id
+  --profile sustained
+                  Use the explicit long-context memory-safe native-MTP profile
+  --profile safe   Use the compatibility long-response profile
+  --mtp            Use native-MTP speculative generation (default)
+  --no-mtp         Use target-only AR generation; MTP can be turned back on
+  --prompt TEXT    (cli) Ask once and exit instead of opening chat
+  --max-tokens N   (cli) Optional response cap; default uses remaining context
+  --no-stats       Hide the TPS footer
+  --dry-run        Preview without loading MLX
+
+Inside terminal chat:
+  /mtp status      Show whether the next turn uses MTP or AR
+  /mtp off         Switch the next turn to target-only AR generation
+  /mtp on          Switch the next turn back to MTP without reloading
+  /stats           Print the last response stats again
+  /speed           Run a 192-token comparison sample
+  /exit            Quit
+
+Aliases:
+  `web` and `openwebui` -> browser chat (same as default)
+  `terminal`            -> terminal chat (same as `cli`)
+  `pi`                  -> Pi coding-agent connection
+  `opencode`, `oc`      -> OpenCode Desktop coding-agent connection
+  `swival`, `sv`        -> Swival generic-provider connection
+  `hermes`              -> Hermes Agent with terminal/file/web/browser/messaging tools
+

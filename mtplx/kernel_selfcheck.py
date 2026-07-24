@@ -201,13 +201,80 @@ def _check_fused_gdn_norm_gate(mx, dtype) -> float:
     return _max_abs_diff(mx, y, ref)
 
 
-def run_kernel_selfcheck(dtype, bits: int, group_size: int) -> dict[str, Any]:
+def _check_expert_gather(
+    mx,
+    dtype,
+    bits: int,
+    group_size: int,
+    *,
+    bank_group_size: int | None = None,
+) -> float:
+    """Synthetic ``mx.gather_qmm`` round-trip at a streamed expert bank's format.
+
+    Mirrors the routed-expert path (``models/expert_mlx._gather_component_bank``
+    / ``hy3_expert_wave_m4._tuned_qmm``): tiny quantized bank of shape
+    ``(experts, N, K)``, activations shaped ``(rows, 1, 1, K)`` with per-row
+    slot indices ``(rows, 1)``, ``transpose=True`` affine gather. The reference
+    is a per-expert ``mx.quantized_matmul`` on the selected slot — the exact
+    stock op the gather fans out over. Returns the worst per-row max-abs diff;
+    a broken (bits, group_size) gather lands at O(1) or raises.
+
+    ``bank_group_size`` lets a caller quantize the bank at one group size while
+    the gather runs at another, forcing the fail-closed mismatch path.
+    """
+    experts, rows, K, N = 4, 4, _K, 256
+    bank_gs = int(group_size if bank_group_size is None else bank_group_size)
+    mx.random.seed(19)
+    w = (mx.random.normal((experts, N, K), dtype=mx.float32) * 0.02).astype(dtype)
+    w_q, scales, biases = mx.quantize(w, group_size=bank_gs, bits=bits)
+    mx.eval(w_q, scales, biases)
+    x = (mx.random.normal((rows, 1, 1, K), dtype=mx.float32) * 0.5).astype(dtype)
+    slots = mx.array([r % experts for r in range(rows)], dtype=mx.uint32).reshape(
+        (rows, 1)
+    )
+    y = mx.gather_qmm(
+        x,
+        w_q,
+        scales,
+        biases,
+        rhs_indices=slots,
+        transpose=True,
+        group_size=group_size,
+        bits=bits,
+        mode="affine",
+    ).reshape((rows, N))
+    worst = 0.0
+    for r in range(rows):
+        expert = r % experts
+        ref = mx.quantized_matmul(
+            x[r].reshape((1, K)),
+            w_q[expert],
+            scales=scales[expert],
+            biases=biases[expert],
+            transpose=True,
+            group_size=group_size,
+            bits=bits,
+        ).reshape((N,))
+        worst = max(worst, _max_abs_diff(mx, y[r], ref))
+    return worst
+
+
+def run_kernel_selfcheck(
+    dtype, bits: int, group_size: int, *, expert_signature=None
+) -> dict[str, Any]:
     """Probe every turbo lane that can engage for this model configuration.
 
     Returns ``{"lanes": {lane: status}, "dmax": {lane: float}, ...}`` and
     updates the process-wide disable registry: lanes reported ``fallback``
     stop engaging (their call sites route the stock path) until the process
     restarts. Idempotent — each run rebuilds the registry from scratch.
+
+    ``expert_signature`` is ``(dtype, bits, group_size)`` for a streamed routed
+    expert bank whose quant format may differ from the resident trunk (e.g.
+    q8-gs64 residents serving 2-bit gs128 experts). When supplied, the
+    ``expert_gather`` lane exercises ``mx.gather_qmm`` at that format in
+    addition to the resident lanes; when ``None`` no expert lane is added and
+    the report is byte-identical to the resident-only path.
     """
     import mlx.core as mx
 
@@ -411,6 +478,20 @@ def run_kernel_selfcheck(dtype, bits: int, group_size: int) -> dict[str, Any]:
     else:
         lanes["fused_gdn_norm_gate"] = _STATUS_SKIPPED
 
+    # Routed expert bank (expert-streaming specs only): validate the actual
+    # gather_qmm op family at the bank's own (bits, group_size), which can
+    # differ from the resident trunk. Absent entirely for non-streaming loads
+    # so their report is unchanged.
+    if expert_signature is not None:
+        e_dtype, e_bits, e_group_size = expert_signature
+        _record(
+            "expert_gather",
+            _QMM_TOLERANCE,
+            lambda: _check_expert_gather(
+                mx, e_dtype, int(e_bits), int(e_group_size)
+            ),
+        )
+
     elapsed_ms = (time.perf_counter() - started) * 1000.0
 
     _LANE_STATUS.clear()
@@ -464,11 +545,41 @@ def _model_quant_signature(model: Any):
     return None
 
 
-def maybe_run_model_selfcheck(model: Any) -> dict[str, Any] | None:
+def _expert_quant_signature(spec: Any):
+    """(dtype, bits, group_size) of a streamed routed expert bank, or None.
+
+    A streamed model's routed experts carry their own affine quant format,
+    independent of the resident trunk (``ExpertStreamingModelSpec.quant_bits`` /
+    ``quant_group_size``). Scales and biases are stored as BF16 leaves
+    (``quant_parameter_bytes == 2`` across the affine specs), so the gather
+    lane runs at BF16. Shadow-codec banks (the q1 lane) do not run the affine
+    ``gather_qmm`` path and yield no signature.
+    """
+    import mlx.core as mx
+
+    if spec is None:
+        return None
+    bits = getattr(spec, "quant_bits", None)
+    group_size = getattr(spec, "quant_group_size", None)
+    if bits is None or group_size is None:
+        return None
+    if getattr(spec, "expert_codec", "affine") != "affine":
+        return None
+    scale_bytes = int(getattr(spec, "quant_parameter_bytes", 2) or 2)
+    dtype = mx.float32 if scale_bytes == 4 else mx.bfloat16
+    return dtype, int(bits), int(group_size)
+
+
+def maybe_run_model_selfcheck(
+    model: Any, *, expert_spec: Any = None
+) -> dict[str, Any] | None:
     """Run the selfcheck for a freshly loaded model if turbo lanes are active.
 
     Called once from ``runtime.load()`` before the runtime is returned; any
     failure inside the probe itself must never break model loading.
+    ``expert_spec`` is the ``ExpertStreamingModelSpec`` for expert-streaming
+    loads (``None`` for dense/non-streaming models), used to add the routed
+    expert bank's ``gather_qmm`` lane at its own quant format.
     """
     if not selfcheck_enabled():
         return None
@@ -484,7 +595,10 @@ def maybe_run_model_selfcheck(model: Any) -> dict[str, Any] | None:
             group_size = 64
         else:
             dtype, bits, group_size = signature
-        report = run_kernel_selfcheck(dtype, bits, group_size)
+        expert_signature = _expert_quant_signature(expert_spec)
+        report = run_kernel_selfcheck(
+            dtype, bits, group_size, expert_signature=expert_signature
+        )
         fallbacks = sorted(
             lane for lane, status in report["lanes"].items() if status == _STATUS_FALLBACK
         )

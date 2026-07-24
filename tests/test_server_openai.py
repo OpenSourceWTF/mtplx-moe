@@ -697,6 +697,14 @@ def test_implicit_session_live_refs_have_diagnostic_override(monkeypatch):
     )
 
 
+def test_expert_streaming_disables_unmetered_session_live_refs():
+    regular = SimpleNamespace(expert_streaming=None)
+    streamed = SimpleNamespace(expert_streaming=object())
+
+    assert openai._expert_streaming_allows_session_live_refs(regular) is True
+    assert openai._expert_streaming_allows_session_live_refs(streamed) is False
+
+
 def test_opencode_tool_history_live_frontier_is_app_opt_in(monkeypatch):
     monkeypatch.delenv("MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER", raising=False)
     assert openai._opencode_tool_history_live_frontier_enabled() is False

@@ -3464,6 +3464,14 @@ def _restore_state_preserving_container(entry: Any, state: Any, *, clone: bool =
     if hasattr(entry, "replace_state"):
         entry.replace_state(cloned)
         return
+    from mlx_lm.models.cache import CacheList
+
+    if isinstance(entry, CacheList):
+        # CacheList.state constructs a fresh list on every read. Mutating that
+        # temporary list does not reach its nested caches; its setter is the
+        # only state-restoration contract.
+        entry.state = cloned
+        return
     current = getattr(entry, "state", None)
     if isinstance(current, list) and isinstance(cloned, list) and len(current) == len(cloned):
         current[:] = cloned
@@ -3507,34 +3515,51 @@ def trim_verified_window_to_prefix(
     if not cache:
         return False
 
-    before_offsets: list[int] = []
+    before_offsets: list[tuple[int, ...]] = []
     for entry in cache:
         trim = getattr(entry, "trim", None)
-        offset = _entry_offset(entry)
-        if not _is_trimmable(entry) or not callable(trim) or offset is None:
+        offsets = _entry_offsets(entry)
+        if not _is_trimmable(entry) or not callable(trim) or offsets is None:
             return False
-        if offset < trim_tokens:
+        if any(offset < trim_tokens for offset in offsets):
             return False
-        before_offsets.append(offset)
+        before_offsets.append(offsets)
 
-    for entry, before_offset in zip(cache, before_offsets):
+    for entry, entry_before_offsets in zip(cache, before_offsets):
         trimmed = entry.trim(trim_tokens)
         if trimmed is not None and int(trimmed) != trim_tokens:
             return False
-        after_offset = _entry_offset(entry)
-        if after_offset is None or before_offset - after_offset != trim_tokens:
+        after_offsets = _entry_offsets(entry)
+        if after_offsets is None or len(after_offsets) != len(entry_before_offsets):
+            return False
+        if any(
+            before_offset - after_offset != trim_tokens
+            for before_offset, after_offset in zip(entry_before_offsets, after_offsets)
+        ):
             return False
     return True
 
 
-def _entry_offset(entry: Any) -> int | None:
+def _entry_offsets(entry: Any) -> tuple[int, ...] | None:
+    nested = getattr(entry, "caches", None)
+    if isinstance(nested, (list, tuple)):
+        if not nested:
+            return None
+        offsets: list[int] = []
+        for child in nested:
+            child_offsets = _entry_offsets(child)
+            if child_offsets is None:
+                return None
+            offsets.extend(child_offsets)
+        return tuple(offsets)
+
     offset = getattr(entry, "offset", None)
     if offset is None:
         return None
     try:
         if hasattr(offset, "item"):
-            return int(offset.item())
-        return int(offset)
+            return (int(offset.item()),)
+        return (int(offset),)
     except Exception:
         return None
 
