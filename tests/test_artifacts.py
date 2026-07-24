@@ -1938,10 +1938,9 @@ def test_gemma4_target_subfolder_alone_still_refuses():
 
 
 def _hy_v3_streaming_inspection(model_dir):
-    """A recognized-but-backend-pending family (HY V3 MTP).
+    """A recognized HY V3 MTP family without its native runtime contract.
 
-    Without a streaming layout this inspection lands on the
-    "recognized-backend-pending" cannot-run verdict; with a valid baked
+    Without a streaming layout this inspection cannot run; with a valid baked
     streaming layout it must instead report runnable via SSD-streamed AR.
     """
     from mtplx.artifacts import ModelInspection
@@ -1968,12 +1967,10 @@ def test_baked_streaming_layout_reports_runnable_via_ar(monkeypatch, tmp_path):
     from mtplx import hf_loader
     from mtplx.backends.registry import compatibility_for_inspection
 
-    # A recognized family with no native MTP backend: the baseline verdict is
-    # the cannot-run "recognized-backend-pending".
+    # Preserve the upstream 2.3 family verdict as the non-streaming baseline.
     inspection = _hy_v3_streaming_inspection(tmp_path)
     baseline = compatibility_for_inspection(inspection)
     assert baseline.can_run is False
-    assert baseline.support_level == "recognized-backend-pending"
 
     # A valid baked streaming layout is present.
     monkeypatch.setattr(
@@ -2010,13 +2007,15 @@ def test_streaming_override_absent_keeps_pending_verdict(monkeypatch, tmp_path):
     """The override only fires for a valid baked streaming layout.
 
     A truncated/missing bank (ok False) and an ordinary non-streaming model
-    (streamed_experts False) must both keep the prior cannot-run verdict for
-    the backend-pending family — the override never fabricates runnability.
+    (streamed_experts False) must both keep the prior upstream verdict — the
+    override never fabricates runnability.
     """
     from mtplx import hf_loader
     from mtplx.backends.registry import compatibility_for_inspection
 
     inspection = _hy_v3_streaming_inspection(tmp_path)
+    baseline = compatibility_for_inspection(inspection)
+    assert baseline.can_run is False
 
     # ok False (e.g. truncated/missing experts bank) -> unchanged prior verdict.
     monkeypatch.setattr(
@@ -2031,9 +2030,7 @@ def test_streaming_override_absent_keeps_pending_verdict(monkeypatch, tmp_path):
         },
     )
     not_ok = compatibility_for_inspection(inspection)
-    assert not_ok.can_run is False
-    assert not_ok.support_level == "recognized-backend-pending"
-    assert not_ok.runtime_compatibility == "recognized-backend-pending"
+    assert not_ok == baseline
 
     # Ordinary non-streaming model (real status shape) -> unchanged prior
     # verdict. `ok` defaults True here, so gating on `ok` alone would wrongly
@@ -2050,8 +2047,7 @@ def test_streaming_override_absent_keeps_pending_verdict(monkeypatch, tmp_path):
         },
     )
     non_streaming = compatibility_for_inspection(inspection)
-    assert non_streaming.can_run is False
-    assert non_streaming.support_level == "recognized-backend-pending"
+    assert non_streaming == baseline
 
 
 def test_user_promoted_contract_runs_as_unverified_label(monkeypatch, tmp_path):
