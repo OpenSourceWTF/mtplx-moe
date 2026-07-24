@@ -120,7 +120,14 @@ class MTPLXRuntime:
                 self._count("final_logits_tokens_emitted", 1)
             else:
                 self._count("full_logits_tokens_emitted", emitted)
-        if not return_hidden and hidden_variant is None and not kwargs:
+        # kwargs == {"emit_logits": True} is semantically the plain call —
+        # MTP-patched wrappers advertise emit_logits via **kwargs, so on MTP
+        # runtimes the bare-kwargs case never occurs and the compiled hook
+        # must accept the default-emit form too.
+        plain_call = not kwargs or (
+            set(kwargs) == {"emit_logits"} and kwargs["emit_logits"] is True
+        )
+        if not return_hidden and hidden_variant is None and plain_call:
             # Decode-only (seq_len == 1). Prefill is multi-token over an
             # unprimed cache: seeding the compiled graph from its None KV
             # leaves throws, and its shape differs from a single-token decode
@@ -133,7 +140,8 @@ class MTPLXRuntime:
                 # arm B (on) > 0 — the A/B credits nothing without it.
                 self._count("compiled_forward_calls")
                 return compiled(input_ids, cache)
-            return self.model(input_ids, cache=cache)
+            if not kwargs:
+                return self.model(input_ids, cache=cache)
         return self.model(
             input_ids,
             cache=cache,
