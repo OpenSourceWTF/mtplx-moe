@@ -48,6 +48,18 @@ def _enabled(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in ("1", "true", "yes", "on")
 
 
+# Pinned by the bench so a batch sweep stays on one kernel path.  ``None`` keeps
+# mlx-lm's stock heuristic, which turns gather-sorting on at indices.size >= 64
+# — at top-10 that flips between B=6 and B=7, mid-sweep.
+SORT_DECISION: bool | None = None
+
+
+def should_sort(indices: mx.array) -> bool:
+    if SORT_DECISION is None:
+        return bool(indices.size >= 64)
+    return bool(SORT_DECISION)
+
+
 # ---------------------------------------------------------------------------
 # gate/up fusion
 # ---------------------------------------------------------------------------
@@ -113,7 +125,7 @@ class FusedGateUpSwitchGLU(nn.Module):
         from mlx_lm.models import switch_layers as sl
 
         x = mx.expand_dims(x, (-2, -3))
-        do_sort = indices.size >= 64
+        do_sort = should_sort(indices)
         idx = indices
         inv_order = None
         if do_sort:
