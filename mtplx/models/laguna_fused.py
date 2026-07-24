@@ -42,6 +42,8 @@ import mlx.nn as nn
 ENV_FUSED_GATE_UP = "MTPLX_LAGUNA_FUSED_GATE_UP"
 ENV_COMPILED_ROUTER = "MTPLX_LAGUNA_COMPILED_ROUTER"
 ENV_COMPILED_ATTN_GATE = "MTPLX_LAGUNA_COMPILED_ATTN_GATE"
+ENV_KERNEL_ROUTER = "MTPLX_LAGUNA_KERNEL_ROUTER"
+ENV_KERNEL_ATTN_GATE = "MTPLX_LAGUNA_KERNEL_ATTN_GATE"
 
 
 def _enabled(name: str) -> bool:
@@ -261,6 +263,54 @@ def install_compiled_attention_gate(model: Any) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# hand-written Metal kernels
+# ---------------------------------------------------------------------------
+def _kernel_moe_call(self, x: mx.array) -> mx.array:
+    from ..kernels.laguna_decode import fused_router_topk
+
+    batch, length, hidden = x.shape
+    flattened = x.reshape(-1, hidden)
+
+    logits = self.gate(flattened).astype(mx.float32)
+    if self.softcap and self.softcap > 0.0:
+        logits = mx.tanh(logits / self.softcap) * self.softcap
+
+    indices, weights = fused_router_topk(
+        logits,
+        self.e_score_correction_bias.astype(mx.float32),
+        self.top_k,
+        normalize=bool(self.norm_topk_prob),
+        scale=float(self.routed_scaling_factor),
+    )
+
+    output = self.switch_mlp(flattened, indices)
+    output = (output * weights.astype(x.dtype)[..., None]).sum(axis=-2)
+    output = output + self.shared_expert(flattened)
+    return output.reshape(batch, length, hidden)
+
+
+def install_kernel_router(model: Any) -> dict[str, Any]:
+    from .laguna import LagunaSparseMoeBlock
+
+    LagunaSparseMoeBlock.__call__ = _kernel_moe_call
+    inner = getattr(model, "model", model)
+    count = sum(
+        1 for layer in inner.layers if isinstance(layer.mlp, LagunaSparseMoeBlock)
+    )
+    return {"path": "kernel_router", "layers_affected": count}
+
+
+def install_kernel_attention_gate(model: Any) -> dict[str, Any]:
+    from . import laguna
+    from ..kernels.laguna_decode import fused_per_head_gate
+
+    laguna.PER_HEAD_GATE_IMPL = fused_per_head_gate
+    inner = getattr(model, "model", model)
+    count = sum(1 for layer in inner.layers if layer.self_attn.gating)
+    return {"path": "kernel_attn_gate", "layers_affected": count}
+
+
+# ---------------------------------------------------------------------------
 def install_from_env(model: Any) -> list[dict[str, Any]]:
     """Install whichever fused paths the environment asks for."""
 
@@ -271,4 +321,9 @@ def install_from_env(model: Any) -> list[dict[str, Any]]:
         report.append(install_compiled_router(model))
     if _enabled(ENV_COMPILED_ATTN_GATE):
         report.append(install_compiled_attention_gate(model))
+    # The hand kernels win over the compiled variants where both are asked for.
+    if _enabled(ENV_KERNEL_ROUTER):
+        report.append(install_kernel_router(model))
+    if _enabled(ENV_KERNEL_ATTN_GATE):
+        report.append(install_kernel_attention_gate(model))
     return report
