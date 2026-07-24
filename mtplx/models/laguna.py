@@ -112,6 +112,38 @@ class ModelArgs(BaseModelArgs):
             self.swa_rope_parameters = rope_parameters.get("sliding_attention")
 
 
+def _rope_offset(offset: int, batch: int, memo: dict | None):
+    """Return a rope offset that survives a batched single-token step.
+
+    MLX 0.31.2's ``mx.fast.rope`` takes a "single" fast path whenever the input
+    is row-contiguous, the sequence length is 1, and the offset holds one value.
+    That path dispatches a TWO-dimensional grid — ``(dims/2, heads)`` — and
+    indexes with ``pos.x + pos.y * stride``.  There is no batch term anywhere in
+    it, so only batch element 0 is ever written; rows 1..B-1 come back as
+    whatever the freshly allocated output buffer happened to hold.
+
+    Every batched decode step has exactly that shape: ``[B, heads, 1, head_dim]``
+    is row-contiguous because transposing a length-1 sequence dimension leaves
+    the strides untouched.  Prefill (T > 1) is unaffected, which is why the
+    corruption only appears once generation starts.
+
+    Handing rope a length-B offset vector fails the ``offset.size() == 1``
+    condition and routes the call to the general kernel, which computes a real
+    ``batch_idx`` and reads a per-row offset.  The vector form is also what a
+    ragged batch would need, so this is the API's intended shape, not a dodge.
+    """
+
+    if batch <= 1:
+        return offset
+    if memo is None:
+        return mx.full((batch,), offset, dtype=mx.int32)
+    cached = memo.get(offset)
+    if cached is None:
+        cached = mx.full((batch,), offset, dtype=mx.int32)
+        memo[offset] = cached
+    return cached
+
+
 def _rope_for(config: dict, head_dim: int, max_position_embeddings: int) -> nn.Module:
     config = dict(config or {})
     theta = float(config.get("rope_theta", 10_000.0))
@@ -185,7 +217,7 @@ class Attention(nn.Module):
             args.max_position_embeddings,
         )
 
-    def __call__(self, x: mx.array, mask=None, cache=None) -> mx.array:
+    def __call__(self, x: mx.array, mask=None, cache=None, rope_memo=None) -> mx.array:
         batch, length, _ = x.shape
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
@@ -199,7 +231,9 @@ class Attention(nn.Module):
             0, 2, 1, 3
         )
 
-        offset = cache.offset if cache is not None else 0
+        offset = _rope_offset(
+            cache.offset if cache is not None else 0, batch, rope_memo
+        )
         queries = self.rope(queries, offset=offset)
         keys = self.rope(keys, offset=offset)
         if cache is not None:
@@ -318,8 +352,10 @@ class DecoderLayer(nn.Module):
         else:
             self.mlp = MLP(args.hidden_size, args.intermediate_size)
 
-    def __call__(self, x: mx.array, mask=None, cache=None) -> mx.array:
-        hidden = x + self.self_attn(self.input_layernorm(x), mask, cache)
+    def __call__(self, x: mx.array, mask=None, cache=None, rope_memo=None) -> mx.array:
+        hidden = x + self.self_attn(
+            self.input_layernorm(x), mask, cache, rope_memo
+        )
         return hidden + self.mlp(self.post_attention_layernorm(hidden))
 
 
@@ -372,9 +408,13 @@ class LagunaModel(nn.Module):
         else:
             sliding_mask = full_mask
 
+        # One offset vector per distinct cache offset per forward, shared by
+        # every layer, so the batched-rope fix costs one tiny array and not one
+        # per attention block.  See `_rope_offset` for why the vector is needed.
+        rope_memo: dict[int, mx.array] = {}
         for layer, layer_cache in zip(self.layers, cache):
             mask = sliding_mask if layer.self_attn.is_sliding else full_mask
-            hidden = layer(hidden, mask, layer_cache)
+            hidden = layer(hidden, mask, layer_cache, rope_memo)
 
         return self.norm(hidden)
 

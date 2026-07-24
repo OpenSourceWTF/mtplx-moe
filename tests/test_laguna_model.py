@@ -784,3 +784,109 @@ def test_ar_cycle_snapshot_prefill_returns_no_hidden_under_sustained_env(
     assert prompt_state.hidden is None
     assert prompt_state.trunk_cache is not None
     assert prompt_state.logits is not None
+
+
+def _batched_greedy_rows(model, prompts, steps: int):
+    """Greedy-decode every row of `prompts` in one batched forward per step."""
+
+    import mlx.core as mx
+
+    cache = model.make_cache()
+    logits = model(prompts, cache=cache, logits_keep=1)
+    token = mx.argmax(logits[:, -1, :], axis=-1).astype(mx.uint32)[:, None]
+    rows = [token]
+    for _ in range(steps):
+        logits = model(token, cache=cache)
+        token = mx.argmax(logits[:, -1, :], axis=-1).astype(mx.uint32)[:, None]
+        rows.append(token)
+    stacked = mx.concatenate(rows, axis=1)
+    mx.eval(stacked)
+    return stacked.tolist()
+
+
+def test_batched_decode_matches_single_stream_decode() -> None:
+    """A batched decode step must not corrupt every row but the first.
+
+    MLX 0.31.2's ``mx.fast.rope`` takes a "single" fast path when the input is
+    row-contiguous with sequence length 1 and the offset holds one value — the
+    exact shape of a batched decode step, since transposing a length-1 sequence
+    dimension leaves the strides row-contiguous.  That path dispatches a
+    two-dimensional ``(dims/2, heads)`` grid with no batch term, so rows
+    1..B-1 are never written and come back as whatever was in the freshly
+    allocated output buffer.  Prefill (T > 1) is unaffected, so the corruption
+    only appears once generation starts and only above batch 1.
+
+    Guarding it here rather than in the bench: this is a serving-correctness
+    contract, and a mocked test suite cannot see it.
+    """
+
+    import mlx.core as mx
+
+    from mtplx.models.laguna import Model, ModelArgs
+
+    mx.random.seed(0)
+    args = ModelArgs.from_dict(
+        _tiny_laguna_config(
+            head_dim=8,  # partial_rotary_factor 0.5 needs an even rotated dim
+            num_hidden_layers=4,
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            num_attention_heads_per_layer=None,
+        )
+    )
+    model = Model(args)
+    mx.eval(model.parameters())
+
+    # Prompt longer than the sliding window so the rotating cache wraps.
+    prompts = mx.array(
+        [
+            [3, 9, 14, 2, 7, 21, 5, 11, 30, 1, 18, 6],
+            [17, 4, 25, 8, 13, 0, 29, 22, 10, 16, 27, 19],
+            [1, 1, 2, 3, 5, 8, 13, 21, 2, 3, 5, 8],
+        ],
+        dtype=mx.uint32,
+    )
+    steps = 6
+
+    batched = _batched_greedy_rows(model, prompts, steps)
+    for index in range(prompts.shape[0]):
+        solo = _batched_greedy_rows(model, prompts[index : index + 1], steps)[0]
+        assert batched[index] == solo, (
+            f"row {index} of a batched decode diverged from the same prompt "
+            f"decoded alone: batched={batched[index]} solo={solo}"
+        )
+
+
+def test_batched_decode_rows_are_independent() -> None:
+    """Row 0's tokens must not depend on what row 1 contains.
+
+    Held at FIXED batch shape so the two runs use identical kernels; any
+    difference is genuine cross-row contamination rather than a batched-matmul
+    reduction-order flip.
+    """
+
+    import mlx.core as mx
+
+    from mtplx.models.laguna import Model, ModelArgs
+
+    mx.random.seed(1)
+    args = ModelArgs.from_dict(
+        _tiny_laguna_config(head_dim=8, num_attention_heads_per_layer=None)
+    )
+    model = Model(args)
+    mx.eval(model.parameters())
+
+    row_a = [3, 9, 14, 2, 7, 21, 5, 11, 30, 1]
+    row_b = [17, 4, 25, 8, 13, 0, 29, 22, 10, 16]
+    mixed = mx.array([row_a, row_b], dtype=mx.uint32)
+    duplicated = mx.array([row_a, row_a], dtype=mx.uint32)
+
+    mixed_rows = _batched_greedy_rows(model, mixed, 5)
+    duplicated_rows = _batched_greedy_rows(model, duplicated, 5)
+
+    assert mixed_rows[0] == duplicated_rows[0]
+    assert duplicated_rows[0] == duplicated_rows[1]
