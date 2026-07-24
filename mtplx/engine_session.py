@@ -31,6 +31,7 @@ from .session_bank import (
     SessionBank,
     block_aligned_prefix_len,
 )
+from .runtime_options import block_prefix_restore_enabled
 
 
 logger = logging.getLogger(__name__)
@@ -460,10 +461,14 @@ def _near_prefix_min_match_tokens() -> int:
 
 
 def _block_prefix_restore_enabled() -> bool:
-    raw = os.environ.get("MTPLX_SESSION_BLOCK_PREFIX_RESTORE")
-    if raw is None:
-        return True
-    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+    """The single parse of ``MTPLX_SESSION_BLOCK_PREFIX_RESTORE`` (default ON).
+
+    Shared by :mod:`mtplx.generation`, :mod:`mtplx.session_bank` and the
+    server so one spelling cannot mean ON in the decode loop and OFF in the
+    cold tier.
+    """
+
+    return block_prefix_restore_enabled()
 
 
 def _prefix_block_size() -> int:
