@@ -174,6 +174,25 @@ def _rope_for(config: dict, head_dim: int, max_position_embeddings: int) -> nn.M
     )
 
 
+def _stock_per_head_gate(
+    output: mx.array, gate_logits: mx.array, n_heads: int, head_dim: int
+) -> mx.array:
+    """Softplus the per-head gate logits and scale each head's slice by it."""
+
+    batch, length, _ = output.shape
+    gate = mx.logaddexp(
+        gate_logits.astype(mx.float32), mx.array(0.0)
+    ).astype(output.dtype)
+    return (
+        output.reshape(batch, length, n_heads, head_dim) * gate[..., None]
+    ).reshape(batch, length, -1)
+
+
+# Swapped by `laguna_fused.install_compiled_attention_gate`; the stock callable
+# is the shipped behaviour and stays the default.
+PER_HEAD_GATE_IMPL = _stock_per_head_gate
+
+
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
@@ -254,21 +273,15 @@ class Attention(nn.Module):
         )
 
         if self.gating:
-            gate = mx.logaddexp(
-                self.g_proj(x).astype(mx.float32),
-                mx.array(0.0),
-            ).astype(output.dtype)
+            gate_logits = self.g_proj(x)
             if self.gate_per_head:
-                output = (
-                    output.reshape(
-                        batch,
-                        length,
-                        self.n_heads,
-                        self.head_dim,
-                    )
-                    * gate[..., None]
-                ).reshape(batch, length, -1)
+                output = PER_HEAD_GATE_IMPL(
+                    output, gate_logits, self.n_heads, self.head_dim
+                )
             else:
+                gate = mx.logaddexp(
+                    gate_logits.astype(mx.float32), mx.array(0.0)
+                ).astype(output.dtype)
                 output = output * gate
 
         return self.o_proj(output)
