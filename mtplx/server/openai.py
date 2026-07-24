@@ -106,7 +106,6 @@ from mtplx.runtime_options import (
     apply_paged_kv_quantization_env,
     block_prefix_restore_enabled,
     canonicalize_flag_tokens,
-    env_bool,
     normalize_paged_kv_quantization,
     resolve_api_key,
 )
@@ -19396,6 +19395,39 @@ def _start_server_console(state: ServerState) -> None:
     thread.start()
 
 
+async def _shutdown_model_workers(state: ServerState) -> None:
+    """Stop admission and quiesce every model owner before runtime teardown."""
+
+    scheduler = getattr(state, "model_scheduler", None)
+    if scheduler is not None:
+        await asyncio.to_thread(
+            scheduler.shutdown,
+            wait=True,
+            cancel_futures=True,
+        )
+        return
+
+    executors: list[Any] = []
+    seen: set[int] = set()
+    for name in ("postcommit_executor", "generation_executor"):
+        executor = getattr(state, name, None)
+        if executor is None or id(executor) in seen:
+            continue
+        seen.add(id(executor))
+        executors.append(executor)
+    if executors:
+        await asyncio.gather(
+            *(
+                asyncio.to_thread(
+                    executor.shutdown,
+                    wait=True,
+                    cancel_futures=True,
+                )
+                for executor in executors
+            )
+        )
+
+
 def create_app(state: ServerState) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -19423,20 +19455,11 @@ def create_app(state: ServerState) -> FastAPI:
                 pass
             for task in bg_tasks:
                 task.cancel()
+            await _shutdown_model_workers(state)
             runtime = getattr(state, "runtime", None)
             close_runtime = getattr(runtime, "close", None)
             if callable(close_runtime):
-                close_runtime(timeout=5.0)
-            scheduler = getattr(state, "model_scheduler", None)
-            if scheduler is not None:
-                scheduler.shutdown(wait=False, cancel_futures=True)
-            else:
-                postcommit_executor = getattr(state, "postcommit_executor", None)
-                generation_executor = getattr(state, "generation_executor", None)
-                if postcommit_executor is not None:
-                    postcommit_executor.shutdown(wait=False, cancel_futures=True)
-                if generation_executor is not None:
-                    generation_executor.shutdown(wait=False, cancel_futures=True)
+                await asyncio.to_thread(close_runtime, timeout=5.0)
 
     app = FastAPI(title="MTPLX OpenAI-compatible server", lifespan=lifespan)
     app.state.mtplx = state

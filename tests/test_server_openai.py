@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import re
 import time
-from threading import Lock
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -1020,6 +1020,139 @@ def _fake_state(*, api_key: str | None = None, rate_limit: int = 0):
         # Dashboard primitives mirror what ServerState.__init__ allocates.
         dashboard=DashboardState(),
     )
+
+
+def test_lifespan_shutdown_quiesces_active_model_work_before_runtime_close():
+    from mtplx.model_scheduler import ModelWorkScheduler
+
+    state = _fake_state()
+    scheduler = ModelWorkScheduler(name="shutdown-order-test")
+    state.model_scheduler = scheduler
+    state.generation_executor = scheduler
+    job_started = Event()
+    allow_job_exit = Event()
+    job_exited = Event()
+    shutdown_started = Event()
+    runtime_closed = Event()
+    close_observed_job_exit: list[bool] = []
+    shutdown_errors: list[BaseException] = []
+
+    def active_job() -> None:
+        job_started.set()
+        allow_job_exit.wait()
+        job_exited.set()
+
+    active_future = scheduler.submit_foreground(active_job)
+    assert job_started.wait(timeout=1.0)
+    pending_future = scheduler.submit_idle_postcommit(lambda: None)
+
+    original_shutdown = scheduler.shutdown
+
+    def recording_shutdown(*args, **kwargs) -> None:
+        shutdown_started.set()
+        original_shutdown(*args, **kwargs)
+
+    scheduler.shutdown = recording_shutdown
+
+    def close_runtime(*, timeout=None) -> None:
+        del timeout
+        close_observed_job_exit.append(job_exited.is_set())
+        runtime_closed.set()
+
+    state.runtime.close = close_runtime
+    client = TestClient(create_app(state))
+    client.__enter__()
+
+    def stop_client() -> None:
+        try:
+            client.__exit__(None, None, None)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            shutdown_errors.append(exc)
+
+    shutdown_thread = Thread(target=stop_client, name="lifespan-shutdown-test")
+    shutdown_thread.start()
+    try:
+        assert shutdown_started.wait(timeout=1.0)
+        assert not runtime_closed.is_set()
+        assert pending_future.cancelled()
+        rejected = scheduler.submit_foreground(lambda: None)
+        with pytest.raises(RuntimeError, match="shut down"):
+            rejected.result()
+    finally:
+        allow_job_exit.set()
+        shutdown_thread.join(timeout=2.0)
+
+    assert not shutdown_thread.is_alive()
+    assert not shutdown_errors
+    active_future.result()
+    assert job_exited.is_set()
+    assert runtime_closed.is_set()
+    assert close_observed_job_exit == [True]
+
+
+def test_lifespan_shutdown_quiesces_executor_fallback_before_runtime_close():
+    state = _fake_state()
+    executor = ThreadPoolExecutor(max_workers=1)
+    state.generation_executor = executor
+    state.postcommit_executor = executor
+    job_started = Event()
+    allow_job_exit = Event()
+    job_exited = Event()
+    shutdown_started = Event()
+    runtime_closed = Event()
+    shutdown_calls: list[tuple[bool, bool]] = []
+    shutdown_errors: list[BaseException] = []
+
+    def active_job() -> None:
+        job_started.set()
+        allow_job_exit.wait()
+        job_exited.set()
+
+    active_future = executor.submit(active_job)
+    assert job_started.wait(timeout=1.0)
+    pending_future = executor.submit(lambda: None)
+    original_shutdown = executor.shutdown
+
+    def recording_shutdown(*, wait=True, cancel_futures=False) -> None:
+        shutdown_calls.append((bool(wait), bool(cancel_futures)))
+        shutdown_started.set()
+        original_shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    executor.shutdown = recording_shutdown
+
+    def close_runtime(*, timeout=None) -> None:
+        del timeout
+        assert job_exited.is_set()
+        runtime_closed.set()
+
+    state.runtime.close = close_runtime
+    client = TestClient(create_app(state))
+    client.__enter__()
+
+    def stop_client() -> None:
+        try:
+            client.__exit__(None, None, None)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            shutdown_errors.append(exc)
+
+    shutdown_thread = Thread(
+        target=stop_client,
+        name="fallback-lifespan-shutdown-test",
+    )
+    shutdown_thread.start()
+    try:
+        assert shutdown_started.wait(timeout=1.0)
+        assert not runtime_closed.is_set()
+        assert pending_future.cancelled()
+    finally:
+        allow_job_exit.set()
+        shutdown_thread.join(timeout=2.0)
+
+    assert not shutdown_thread.is_alive()
+    assert not shutdown_errors
+    active_future.result()
+    assert runtime_closed.is_set()
+    assert shutdown_calls == [(True, True)]
 
 
 def _fake_streaming_session_state():
@@ -3842,6 +3975,69 @@ def test_tool_requests_enable_prompt_prefix_bank_commit(monkeypatch):
 
     assert captured["commit_prompt_state_to_bank"] is True
     assert captured["commit_prompt_state_keep_live_ref"] is False
+
+
+@pytest.mark.parametrize("generation_fails", [False, True])
+def test_run_generation_releases_kv_lease_on_success_and_exception(
+    monkeypatch,
+    generation_fails,
+):
+    state = _fake_streaming_session_state()
+    state.draft_sampler = None
+    state.requests_completed = 0
+    requested_tokens: list[int] = []
+    released: list[bool] = []
+
+    class Lease:
+        def release(self) -> None:
+            released.append(True)
+
+    def admit_kv_tokens(tokens: int):
+        requested_tokens.append(tokens)
+        return Lease()
+
+    state.runtime.admit_kv_tokens = admit_kv_tokens
+
+    def fake_generate_mtpk(*_args, **_kwargs):
+        if generation_fails:
+            raise RuntimeError("generation failed")
+        return SimpleNamespace(
+            tokens=[ord("O")],
+            text="O",
+            stats=SimpleNamespace(
+                to_dict=lambda: {
+                    "prompt_eval_time_s": 0.0,
+                    "generated_tokens": 1,
+                    "elapsed_s": 0.1,
+                    "tok_s": 10.0,
+                }
+            ),
+            final_state=None,
+        )
+
+    monkeypatch.setattr(openai, "generate_mtpk", fake_generate_mtpk)
+
+    def call():
+        return openai._run_generation(
+            state,
+            [1, 2, 3],
+            max_tokens=4,
+            temperature=None,
+            top_p=None,
+            top_k=None,
+            seed=None,
+            generation_mode="mtp",
+            depth=1,
+        )
+
+    if generation_fails:
+        with pytest.raises(RuntimeError, match="generation failed"):
+            call()
+    else:
+        assert call()["text"] == "O"
+
+    assert requested_tokens == [7]
+    assert released == [True]
 
 
 def test_run_generation_depth1_clamps_expected_value_policy(monkeypatch):

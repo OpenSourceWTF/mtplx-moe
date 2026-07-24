@@ -9,21 +9,16 @@ import shlex
 import subprocess
 import time
 import gc
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .benchmarks.programming_prompts import (
-    PROGRAMMING_ARTIFACT_KINDS,
-    build_programming_context,
-)
 from .hardware import inspect_hardware
 from .profiles import DEFAULT_PROFILE_NAME, apply_profile_env, get_profile
 
 
-DEFAULT_CONTEXTS = (1024, 2048, 4096, 8192, 16384)
-FULL_CONTEXTS = DEFAULT_CONTEXTS + (32768, 65536, 131072)
+DEFAULT_CONTEXTS = (512, 1024, 2048, 4096, 8192, 16384, 32768)
+FULL_CONTEXTS = DEFAULT_CONTEXTS + (65536, 131072)
 DEFAULT_PROMPT_STYLE = "coding-agent"
 LEGACY_PROMPT_STYLE = "legacy-repeat"
 PROMPT_STYLE_CHOICES = (DEFAULT_PROMPT_STYLE, LEGACY_PROMPT_STYLE)
@@ -40,7 +35,7 @@ PREFILL_LAYOUT_CHOICES = (
     CONTIGUOUS_DENSE_DECODE_LAYOUT,
     PAGED_PREFILL_LAYOUT,
 )
-PROMPT_POLICY_VERSION = "realistic_programming_v1"
+PROMPT_POLICY_VERSION = "coding_agent_tail_v2"
 UNSAFE_STOCK_CACHE_ONLY_ALLOW_ENV = "MTPLX_ALLOW_UNSAFE_PREFILL_STOCK_CACHE_ONLY"
 DEFAULT_SYSTEM_PROMPT = (
     "You are MTPLX, a precise coding agent. Follow the user's instructions, "
@@ -217,19 +212,12 @@ def _coherent_tail_token_ids_for_context(
         )
 
     filler_target = int(context_tokens) - len(tail_ids)
-    minimum_characters = max(16_384, int(context_tokens) * 8)
-    filler = build_programming_context(minimum_characters=minimum_characters)
+    filler = _model_prompt_text()
     raw_filler_ids = [int(token) for token in tokenizer.encode(filler)]
     filler_ids = raw_filler_ids
     while len(filler_ids) < filler_target:
-        previous_length = len(filler_ids)
-        minimum_characters *= 2
-        filler = build_programming_context(minimum_characters=minimum_characters)
+        filler += "\n\n" + _model_prompt_text()
         filler_ids = [int(token) for token in tokenizer.encode(filler)]
-        if len(filler_ids) <= previous_length:
-            raise ValueError(
-                "tokenizer made no progress while sizing programming context"
-            )
     content = tokenizer.decode(filler_ids[:filler_target]) + tail
     token_ids = _encode_prompt_content(
         tokenizer,
@@ -238,19 +226,9 @@ def _coherent_tail_token_ids_for_context(
         enable_thinking=enable_thinking,
     )
     while len(token_ids) < context_tokens:
-        previous_prompt_length = len(token_ids)
-        filler_target += max(1, int(context_tokens) - len(token_ids))
-        while len(filler_ids) < filler_target:
-            previous_length = len(filler_ids)
-            minimum_characters *= 2
-            filler = build_programming_context(
-                minimum_characters=minimum_characters
-            )
-            filler_ids = [int(token) for token in tokenizer.encode(filler)]
-            if len(filler_ids) <= previous_length:
-                raise ValueError(
-                    "tokenizer made no progress while sizing programming context"
-                )
+        filler += "\n\n" + _model_prompt_text()
+        filler_ids = [int(token) for token in tokenizer.encode(filler)]
+        filler_target += max(1, len(raw_filler_ids) // 4)
         content = tokenizer.decode(filler_ids[:filler_target]) + tail
         token_ids = _encode_prompt_content(
             tokenizer,
@@ -258,13 +236,8 @@ def _coherent_tail_token_ids_for_context(
             prompt_format=prompt_format,
             enable_thinking=enable_thinking,
         )
-        if len(token_ids) <= previous_prompt_length:
-            raise ValueError(
-                "chat template made no progress while sizing programming context"
-            )
     head_trimmed_tokens = max(0, len(token_ids) - int(context_tokens))
     token_ids = token_ids[-context_tokens:]
-    rendered_prompt = tokenizer.decode(token_ids)
     return PromptBuild(
         token_ids=token_ids,
         metadata={
@@ -278,10 +251,6 @@ def _coherent_tail_token_ids_for_context(
             "prompt_tail_preserved": True,
             "prompt_tail_truncated": False,
             "prompt_filler_tokens": filler_target,
-            "prompt_artifact_kinds": sum(
-                f"Artifact type: {kind}." in rendered_prompt
-                for kind in PROGRAMMING_ARTIFACT_KINDS
-            ),
             "prompt_head_trimmed_tokens": head_trimmed_tokens,
             "prompt_context_tokens": int(context_tokens),
             "prompt_actual_tokens": len(token_ids),
@@ -472,18 +441,16 @@ def _encode_prompt_content(
     }
     if enable_thinking is not None:
         kwargs["enable_thinking"] = enable_thinking
-    encoded = tokenizer.apply_chat_template(
-        [
-            {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
-            {"role": "user", "content": content},
-        ],
-        **kwargs,
-    )
-    if isinstance(encoded, Mapping):
-        encoded = encoded.get("input_ids")
-        if encoded is None:
-            raise TypeError("chat template result does not contain input_ids")
-    return [int(token) for token in encoded]
+    return [
+        int(token)
+        for token in tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
+                {"role": "user", "content": content},
+            ],
+            **kwargs,
+        )
+    ]
 
 
 def _prompt_build_for_context(

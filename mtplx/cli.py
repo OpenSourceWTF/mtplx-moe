@@ -3490,7 +3490,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     depth_p.add_argument(
         "--draft-core",
-        choices=["stock", "device-d2", "device", "device-k"],
+        choices=["stock", "device-d2", "device"],
         default="stock",
         help=(
             "Experimental DraftCore backend. device-d2 compiles the greedy D2 "

@@ -191,7 +191,6 @@ EXTERNAL_RUNTIME_ENV_KEYS = (
     "MTPLX_EVAL_STATE_ROOTS_INCLUDE_LIVE",
     "MTPLX_TARGET_LAYER_EVAL_MODE",
     "MTPLX_FUSE_ATTN_QKV_PROJECTIONS",
-    "MTPLX_FUSE_HY3_SHARED_GATE_UP_PROJECTIONS",
     "MTPLX_SDPA_2PASS_BLOCKS",
     "MTPLX_SDPA_DYNAMIC_OFFSET_ACTIVE_BLOCKS",
     "MTPLX_EXPORT_VERIFY_DOT_DIR",
@@ -4913,7 +4912,6 @@ def cmd_pull_public(args: Any) -> int:
             revision=args.revision,
             progress_callback=callback,
             progress_interval_s=progress_interval_s,
-            include_expert_banks=bool(getattr(args, "include_expert_banks", True)),
         )
     except KeyboardInterrupt:
         finalize()
@@ -4954,10 +4952,6 @@ def cmd_pull_public(args: Any) -> int:
         print(
             f"runtime contract: {str(bool(result.get('has_runtime_contract'))).lower()}"
         )
-        if result.get("partial_download"):
-            excluded = ", ".join(result.get("excluded_patterns") or []) or "some files"
-            print(f"partial download: yes (excluded {excluded})")
-            print("note: this copy is not runnable; re-pull without --no-expert-banks")
     return 0
 
 
