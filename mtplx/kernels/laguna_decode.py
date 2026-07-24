@@ -76,8 +76,25 @@ def _router_max_rows() -> int:
         return DEFAULT_ROUTER_MAX_ROWS
 
 
-def is_router_eligible(logits: mx.array, bias: mx.array, top_k: int) -> bool:
+def _on_metal_device() -> bool:
+    """Metal being AVAILABLE is not the same as being the device in use.
+
+    `mx.fast.metal_kernel` raises "Only supports the GPU" when the default
+    device is the CPU, which happens on any CPU-device run (tests, fallbacks).
+    Checking availability alone let an ineligible run reach the kernel and
+    crash instead of taking the stock path.
+    """
+
     if not mx.metal.is_available():
+        return False
+    try:
+        return mx.default_device() == mx.gpu
+    except Exception:
+        return False
+
+
+def is_router_eligible(logits: mx.array, bias: mx.array, top_k: int) -> bool:
+    if not _on_metal_device():
         return False
     if logits.ndim != 2 or bias.ndim != 1:
         return False
@@ -212,7 +229,7 @@ def fused_router_topk(
 def is_per_head_gate_eligible(
     output: mx.array, gate_logits: mx.array, n_heads: int, head_dim: int
 ) -> bool:
-    if not mx.metal.is_available():
+    if not _on_metal_device():
         return False
     if output.dtype not in (mx.bfloat16, mx.float16, mx.float32):
         return False
