@@ -16,7 +16,6 @@ output and the returned shared must be UNCHANGED. These tests lock that:
 from __future__ import annotations
 
 import mlx.core as mx
-import pytest
 
 from mtplx.models.expert_mlx import HotExpertSwitchGLU
 from tests.test_streamed_models import (

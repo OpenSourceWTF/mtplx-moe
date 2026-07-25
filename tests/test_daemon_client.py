@@ -6,10 +6,8 @@ import signal
 import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from types import SimpleNamespace
 
-from mtplx import daemon_client
 from mtplx.commands import public
 from mtplx.daemon_client import (
     PORT_APP_DAEMON,

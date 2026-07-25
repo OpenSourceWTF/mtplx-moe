@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import replace
 from pathlib import Path
 
 import hashlib
@@ -23,8 +22,6 @@ import pytest
 from mtplx.expert_io import (
     ExpertIOCancelled,
     ExpertIOError,
-    ExpertIOShortRead,
-    PositionalExpertReader,
 )
 from mtplx.expert_manifest import (
     ExpertManifest,

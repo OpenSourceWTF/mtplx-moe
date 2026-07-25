@@ -46,6 +46,8 @@ from typing import TYPE_CHECKING, Callable, Iterable
 import numpy as np
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    import mlx.core as mx
+
     from mtplx.expert_manifest import ExpertManifest
     from mtplx.expert_streaming_models import ExpertMemoryPlan
 

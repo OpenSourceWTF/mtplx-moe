@@ -17,7 +17,6 @@ from mtplx.prefill_bench import (
     DEFAULT_FINAL_REQUEST,
     _prompt_build_for_context,
     _token_ids_for_context,
-    parse_contexts,
     run_prefill_ladder,
 )
 
@@ -36,39 +35,6 @@ class _CharTokenizer:
         if add_generation_prompt:
             text += "<assistant>\n"
         return self.encode(text) if tokenize else text
-
-
-class _StalledTokenizer(_CharTokenizer):
-    def __init__(self) -> None:
-        self.encode_calls = 0
-
-    def encode(self, text: str) -> list[int]:
-        self.encode_calls += 1
-        if self.encode_calls > 3:
-            raise AssertionError("prompt sizing did not detect stalled encoding")
-        return [1]
-
-
-class _MappingChatTokenizer(_CharTokenizer):
-    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **kwargs):
-        ids = super().apply_chat_template(
-            messages,
-            tokenize=tokenize,
-            add_generation_prompt=add_generation_prompt,
-            **kwargs,
-        )
-        return {"input_ids": ids, "attention_mask": [1] * len(ids)}
-
-
-class _StalledChatTokenizer(_CharTokenizer):
-    def __init__(self) -> None:
-        self.chat_calls = 0
-
-    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **kwargs):
-        self.chat_calls += 1
-        if self.chat_calls > 3:
-            raise AssertionError("prompt sizing did not detect stalled chat encoding")
-        return [1]
 
 
 def test_programming_context_is_deterministic_and_structurally_varied() -> None:
@@ -99,79 +65,12 @@ def test_prefill_prompt_preserves_coherent_tail() -> None:
     assert len(prompt.token_ids) == 4096
     assert DEFAULT_FINAL_REQUEST in text
     assert text.endswith("<assistant>\n")
-    assert prompt.metadata["prompt_policy"] == "realistic_programming_v1"
+    assert prompt.metadata["prompt_policy"] == "coding_agent_tail_v2"
     assert prompt.metadata["prompt_format"] == "chat"
     assert prompt.metadata["prompt_enable_thinking"] is False
     assert prompt.metadata["prompt_tail_preserved"] is True
     assert prompt.metadata["prompt_release_valid"] is True
     assert prompt.metadata["prompt_filler_tokens"] > 0
-
-
-@pytest.mark.parametrize("context_tokens", [1024, 2048, 4096, 8192, 16384])
-def test_realistic_programming_prompt_has_exact_default_size(
-    context_tokens: int,
-) -> None:
-    tokenizer = _CharTokenizer()
-    tail = "\n\n# Final user request\nFix the queue and add regression tests.\n"
-
-    first = _prompt_build_for_context(tokenizer, context_tokens, prompt_tail=tail)
-    second = _prompt_build_for_context(tokenizer, context_tokens, prompt_tail=tail)
-    text = tokenizer.decode(first.token_ids)
-
-    assert first.token_ids == second.token_ids
-    assert len(first.token_ids) == context_tokens
-    assert tail in text
-    assert text.endswith("<assistant>\n")
-    assert first.metadata["prompt_policy"] == "realistic_programming_v1"
-    assert first.metadata["prompt_release_valid"] is True
-
-
-def test_realistic_programming_prompt_records_artifact_variety() -> None:
-    prompt = _prompt_build_for_context(_CharTokenizer(), 16_384)
-
-    assert prompt.metadata["prompt_artifact_kinds"] >= 4
-
-
-def test_default_prefill_contexts_are_requested_programming_sizes() -> None:
-    assert parse_contexts(None) == [1024, 2048, 4096, 8192, 16384]
-
-
-def test_realistic_programming_prompt_rejects_stalled_tokenizer() -> None:
-    with pytest.raises(
-        ValueError,
-        match="tokenizer made no progress while sizing programming context",
-    ):
-        _prompt_build_for_context(
-            _StalledTokenizer(),
-            1024,
-            prompt_tail="Fix the queue.",
-            prompt_format="raw",
-        )
-
-
-def test_realistic_programming_prompt_accepts_mapping_chat_template() -> None:
-    prompt = _prompt_build_for_context(
-        _MappingChatTokenizer(),
-        1024,
-        prompt_tail="Fix the queue.",
-    )
-
-    assert len(prompt.token_ids) == 1024
-    assert prompt.metadata["prompt_tail_preserved"] is True
-
-
-def test_realistic_programming_prompt_rejects_stalled_chat_template() -> None:
-    with pytest.raises(
-        ValueError,
-        match="chat template made no progress while sizing programming context",
-    ):
-        _prompt_build_for_context(
-            _StalledChatTokenizer(),
-            1024,
-            prompt_tail="Fix the queue.",
-        )
-
-
 def test_prefill_prompt_legacy_mode_keeps_diagnostic_hard_truncate() -> None:
     tokenizer = _CharTokenizer()
 

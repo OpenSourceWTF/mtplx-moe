@@ -32,15 +32,12 @@ from mtplx.expert_streaming_models import (
     ExpertMemoryPlan,
     ExpertStreamingModelSpec,
 )
+from mtplx.mmap_mlx import mmap_u32
 
 # Mixed-official (issue #51, M2) per-tier affine bit widths: gate/up is 2-bit
 # affine when the layer's tier is "affine2"; down is always 3-bit affine.
 _MIXED_AFFINE_BITS = {"affine2": 2, "affine3": 3}
 _MIXED_DOWN_BITS = 3
-from mtplx.mmap_mlx import mmap_u32
-
-
-
 
 _ROUTING_PHASE: ContextVar[RoutingPhase | None] = ContextVar(
     "mtplx_expert_routing_phase",

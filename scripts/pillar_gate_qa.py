@@ -170,7 +170,7 @@ def gate_vision_cache(client: Client, report: dict[str, Any]) -> bool:
         {"type": "text", "text": "Look, the screen is blank "},
         {"type": "image_url", "image_url": {"url": data_url(make_png(1200, 800, (200, 40, 40)))}},
     ]}
-    r4 = client.chat(diff, max_tokens=120)
+    client.chat(diff, max_tokens=120)
     snap4 = client.snapshot()
     cached4 = int((snap4.get("latest") or {}).get("cached_tokens") or 0)
     prompt2 = int((snap2.get("latest") or {}).get("prompt_tokens") or 0)

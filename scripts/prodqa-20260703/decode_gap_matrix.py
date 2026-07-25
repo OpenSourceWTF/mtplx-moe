@@ -13,7 +13,10 @@ Shapes:
   octools         OpenCode-like: big system prompt + 11 tools + "how are you"
   octools_128     same shape, longer answer request
 """
-import json, sys, time, urllib.request
+import json
+import sys
+import time
+import urllib.request
 
 PORT = int(sys.argv[1])
 LABEL = sys.argv[2] if len(sys.argv) > 2 else "daemon"
@@ -70,7 +73,6 @@ def fire(name, messages, tools=None, max_tokens=256, thinking=True):
     comp = lat.get("completion_tokens") or 0
     dec = lat.get("decode_tok_s") or 0.0
     dec_el = lat.get("decode_elapsed_s") or 0.0
-    accepted = sum(abd)
     bonus = lat.get("bonus_tokens") or 0
     row = {
         "shape": name, "daemon": LABEL,

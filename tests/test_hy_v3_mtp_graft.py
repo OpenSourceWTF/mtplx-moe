@@ -9,18 +9,21 @@ layout, the form real exports ship in) rather than requiring a native
 """
 import json
 
+import mlx.core as mx
 import pytest
+from mlx.utils import tree_flatten
 
 hy_v3 = pytest.importorskip(
     "mlx_lm.models.hy_v3",
     reason="mlx-lm does not ship models/hy_v3 yet (unreleased upstream)",
 )
 
-import mlx.core as mx
-from mlx.utils import tree_flatten
-
-from mtplx.hy_v3_mtp_patch import inject_hy_v3_mtp_support, is_hy_v3_mtp_config
-from mtplx.mtp_patch import validate_mtp_support
+# These imports stay behind the optional hy_v3 availability gate.
+from mtplx.hy_v3_mtp_patch import (  # noqa: E402
+    inject_hy_v3_mtp_support,
+    is_hy_v3_mtp_config,
+)
+from mtplx.mtp_patch import validate_mtp_support  # noqa: E402
 
 VOCAB, HIDDEN, LAYERS = 128, 64, 2
 SPEC_IDX = LAYERS  # appended NextN layer index

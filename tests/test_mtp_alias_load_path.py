@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
 
 from mtplx.runtime import _mtp_alias_load_path
 

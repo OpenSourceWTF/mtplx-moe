@@ -13,7 +13,6 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
-import pytest
 
 from mtplx.models import lookahead_prefetch
 from mtplx.models.lookahead_prefetch import (

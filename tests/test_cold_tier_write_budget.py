@@ -12,7 +12,6 @@ from __future__ import annotations
 import time
 from types import SimpleNamespace
 
-import pytest
 
 from mtplx.cache_bank.cold_tier import SessionBankColdTier
 

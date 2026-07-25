@@ -21,7 +21,6 @@ clean-prefix. These tests pin the composed flow end to end.
 from pathlib import Path
 
 import mlx.core as mx
-import pytest
 
 from mtplx.cache_bank import SessionBankColdTier
 from mtplx.session_bank import CacheSnapshot, SessionBank

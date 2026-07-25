@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 
 from mtplx.belady_oracle import BeladyOracle, belady_fetches
 

@@ -2,7 +2,12 @@
 """Thermal-controlled cold-prefill pair: baseline vs candidate 12k, interleaved
 in one window (B,C,B,C), fresh sessions + fresh SSD dir for candidate, no SSD
 for baseline (its default). Settles the cold-prefill pillar cleanly."""
-import json, subprocess, time, urllib.request, sys, os
+import json
+import subprocess
+import time
+import urllib.request
+import sys
+import os
 
 SCRATCH = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, "/Users/youssof/Projects/MTPLX-release/mtplx-kvcache-v2-20260703/scripts")

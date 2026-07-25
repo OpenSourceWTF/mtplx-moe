@@ -51,6 +51,18 @@ ALIGNED_DIMS = {
 }
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _use_cpu_default_device():
+    import mlx.core as mx
+
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        yield
+    finally:
+        mx.set_default_device(previous)
+
+
 # --------------------------------------------------------------------------
 # fixture builders
 # --------------------------------------------------------------------------

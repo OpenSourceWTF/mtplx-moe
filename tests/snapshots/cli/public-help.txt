@@ -5,7 +5,7 @@
   ██║ ╚═╝ ██║    ██║    ██║      ███████╗ ██╔╝ ██╗
   ╚═╝     ╚═╝    ╚═╝    ╚═╝      ╚══════╝ ╚═╝  ╚═╝
 
-  v2.0.2  ·  Native MTP speculative decoding on Apple Silicon
+  v2.3.1rc1  ·  Native MTP speculative decoding on Apple Silicon
 
 Commands
   start        Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Swival)

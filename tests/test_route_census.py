@@ -149,7 +149,6 @@ def _hy3_uniform_census() -> RouteCensus:
     """Near-uniform routing over hy3's real geometry (79 layers x 192)."""
 
     spec = get_model_spec("hy3-expert-q2")
-    census = RouteCensus(spec.key)
     counts = {
         layer: {
             expert: 100 + (layer * 31 + expert * 7) % 5

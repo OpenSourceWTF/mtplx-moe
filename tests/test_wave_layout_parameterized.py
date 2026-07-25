@@ -22,14 +22,21 @@ import pytest
 
 from mlx_lm.models.activations import swiglu
 
-from mtplx import hy3_expert_wave_m4 as wave_m4
 from mtplx.hy3_expert_wave_m4 import (
     Hy3M4ExpertWaveIneligible,
     component_layout,
     hy3_q2_m4_expert_wave,
 )
 
-mx.set_default_device(mx.cpu)
+
+@pytest.fixture(autouse=True, scope="module")
+def _use_cpu_default_device():
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        yield
+    finally:
+        mx.set_default_device(previous)
 
 
 # The exact tail layout the module hardcoded before parameterization, kept here

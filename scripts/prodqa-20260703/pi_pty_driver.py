@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Drive a REAL Pi session through its production launcher over a pty."""
-import os, pty, select, signal, sys, time, re
+import os
+import pty
+import select
+import signal
+import sys
+import time
+import re
 
 LAUNCHER = os.path.expanduser("~/.mtplx/open-pi.command")
 LOG = sys.argv[1] if len(sys.argv) > 1 else "/tmp/pi_session.log"
@@ -33,19 +39,23 @@ def main():
                 return None
             if not chunk:
                 return None
-            log.write(chunk); log.flush()
+            log.write(chunk)
+            log.flush()
             buf += chunk
             return chunk
         return b""
 
     def wait_idle(min_activity_bytes, idle_s, cap_s):
-        start = time.time(); seen = 0; last_data = time.time()
+        start = time.time()
+        seen = 0
+        last_data = time.time()
         while time.time() - start < cap_s:
             chunk = pump(1.0)
             if chunk is None:
                 return False
             if chunk:
-                seen += len(chunk); last_data = time.time()
+                seen += len(chunk)
+                last_data = time.time()
             elif seen >= min_activity_bytes and time.time() - last_data >= idle_s:
                 return True
         return True
@@ -60,11 +70,14 @@ def main():
         wait_idle(min_activity_bytes=200, idle_s=15.0, cap_s=cap)
         print(f"[driver] turn {i} done in {time.time()-t0:.1f}s ({len(buf)-mark} bytes)", flush=True)
 
-    os.write(fd, b"\x03"); time.sleep(1.5)
-    os.write(fd, b"\x04"); time.sleep(1.5)
+    os.write(fd, b"\x03")
+    time.sleep(1.5)
+    os.write(fd, b"\x04")
+    time.sleep(1.5)
     pump(2.0)
     try:
-        os.kill(pid, signal.SIGTERM); time.sleep(2)
+        os.kill(pid, signal.SIGTERM)
+        time.sleep(2)
     except ProcessLookupError:
         pass
     try:

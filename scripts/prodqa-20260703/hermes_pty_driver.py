@@ -5,7 +5,13 @@ Spawns ~/.mtplx/open-hermes.command exactly as the app's Terminal lane would,
 sends real user turns, waits for the agent to finish each one (output-idle
 heuristic), then exits the client cleanly. Full raw transcript saved.
 """
-import os, pty, select, signal, sys, time, re
+import os
+import pty
+import select
+import signal
+import sys
+import time
+import re
 
 LAUNCHER = os.path.expanduser("~/.mtplx/open-hermes.command")
 LOG = sys.argv[1] if len(sys.argv) > 1 else "/tmp/hermes_session.log"
@@ -39,20 +45,24 @@ def main():
                 return None
             if not chunk:
                 return None
-            log.write(chunk); log.flush()
+            log.write(chunk)
+            log.flush()
             buf += chunk
             return chunk
         return b""
 
     def wait_idle(min_activity_bytes, idle_s, cap_s):
         """Wait until we've seen min bytes AND then idle_s of silence."""
-        start = time.time(); seen = 0; last_data = time.time()
+        start = time.time()
+        seen = 0
+        last_data = time.time()
         while time.time() - start < cap_s:
             chunk = pump(1.0)
             if chunk is None:
                 return False
             if chunk:
-                seen += len(chunk); last_data = time.time()
+                seen += len(chunk)
+                last_data = time.time()
             elif seen >= min_activity_bytes and time.time() - last_data >= idle_s:
                 return True
         return True
@@ -70,8 +80,10 @@ def main():
         print(f"[driver] turn {i} done in {time.time()-t0:.1f}s, {len(turn_out)} chars", flush=True)
 
     # exit: Ctrl+C then Ctrl+D
-    os.write(fd, b"\x03"); time.sleep(1.5)
-    os.write(fd, b"\x04"); time.sleep(1.5)
+    os.write(fd, b"\x03")
+    time.sleep(1.5)
+    os.write(fd, b"\x04")
+    time.sleep(1.5)
     pump(2.0)
     try:
         os.kill(pid, 0)

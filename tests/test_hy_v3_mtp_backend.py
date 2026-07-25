@@ -4,6 +4,9 @@ mlx-lm ships models/hy_v3.py on main but not in any release yet (latest is
 0.31.3, checked 2026-07-11); the backend is inert until it lands, so these
 tests skip rather than break collection on released mlx-lm.
 """
+from pathlib import Path
+
+import mlx.core as mx
 import pytest
 
 hy_v3 = pytest.importorskip(
@@ -11,11 +14,13 @@ hy_v3 = pytest.importorskip(
     reason="mlx-lm does not ship models/hy_v3 yet (unreleased upstream)",
 )
 
-import mlx.core as mx
-from pathlib import Path
-from mtplx.hy_v3_mtp_patch import inject_hy_v3_mtp_support, is_hy_v3_mtp_config
-from mtplx.mtp_patch import validate_mtp_support, MTPContract
-from mtplx.backends.registry import SUPPORTED_ARCH_IDS
+# These imports stay behind the optional hy_v3 availability gate.
+from mtplx.backends.registry import SUPPORTED_ARCH_IDS  # noqa: E402
+from mtplx.hy_v3_mtp_patch import (  # noqa: E402
+    inject_hy_v3_mtp_support,
+    is_hy_v3_mtp_config,
+)
+from mtplx.mtp_patch import MTPContract, validate_mtp_support  # noqa: E402
 
 
 def _tiny():

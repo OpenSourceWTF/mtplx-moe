@@ -32,7 +32,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -46,7 +46,6 @@ from mtplx.expert_mixed_official import (  # noqa: E402
     MIXED_ALIGNMENT,
     MIXED_GROUP_SIZE,
     MIXED_MANIFEST_FORMAT,
-    MixedManifestError,
     PROJECTIONS,
     TIERS,
     align_up,

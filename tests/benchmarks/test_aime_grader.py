@@ -81,7 +81,6 @@ class TestExtractBoxed:
         assert extract_boxed("") is None
 
     def test_non_string(self) -> None:
-        # noqa: type-ignore - intentional defensive check
         assert extract_boxed(None) is None  # type: ignore[arg-type]
         assert extract_boxed(123) is None  # type: ignore[arg-type]
 

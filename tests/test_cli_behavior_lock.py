@@ -39,8 +39,8 @@ def test_cli_help_snapshot(argv, snapshot, capsys):
             {"command": "model", "model_action": "architectures"},
         ),
         (
-            ["lab", "show", "compiled-verify-control"],
-            {"command": "lab", "lab_action": "show"},
+            ["config", "show"],
+            {"command": "config", "config_action": "show"},
         ),
     ],
 )
