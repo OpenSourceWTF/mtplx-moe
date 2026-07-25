@@ -1,3 +1,5 @@
+import json
+import subprocess
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
@@ -12,6 +14,19 @@ from mtplx.expert_profiles import (
 
 
 GiB = 1024**3
+
+
+def _profile_resource_document():
+    resource = expert_profiles.files("mtplx").joinpath(
+        "data/expert_profiles.json"
+    )
+    return json.loads(resource.read_text(encoding="utf-8"))
+
+
+def _parse_profile_document(document):
+    return expert_profiles._parse_expert_profiles_resource(
+        json.dumps(document)
+    )
 
 
 def test_only_promoted_oq2e_profiles_are_installed():
@@ -141,13 +156,74 @@ def test_profile_overrides_normalize_memory_values():
     config = build_expert_streaming_config(
         profile,
         overrides={
-            "memory_limit_bytes": "72GiB",
+            "memory_limit_bytes": "70GiB",
             "expert_cache_limit_bytes": "50GiB",
         },
     )
 
-    assert config.memory_limit_bytes == 72 * GiB
+    assert config.memory_limit_bytes == 70 * GiB
     assert config.expert_cache_limit_bytes == 50 * GiB
+
+
+def test_profile_override_cannot_exceed_admitted_process_ceiling():
+    profile = load_expert_profiles()["hy3-oq2e-64"]
+
+    with pytest.raises(ValueError) as excinfo:
+        build_expert_streaming_config(
+            profile,
+            overrides={"memory_limit_bytes": "192GiB"},
+        )
+
+    message = str(excinfo.value)
+    assert "memory_limit_bytes" in message
+    assert str(192 * GiB) in message
+    assert str(profile.process_ceiling_bytes) in message
+
+
+def test_profile_override_cannot_replace_model_identity():
+    profile = load_expert_profiles()["hy3-oq2e-64"]
+
+    with pytest.raises(ValueError, match="model_key"):
+        build_expert_streaming_config(
+            profile,
+            overrides={"model_key": "hy3-expert-q2"},
+        )
+
+
+def test_profile_resource_rejects_duplicate_json_keys():
+    resource = """\
+{"schema": 1, "schema": 1, "profiles": []}
+"""
+
+    with pytest.raises(ValueError, match="duplicate JSON key 'schema'"):
+        expert_profiles._parse_expert_profiles_resource(resource)
+
+
+def test_profile_resource_rejects_config_ceiling_mismatch():
+    document = _profile_resource_document()
+    row = document["profiles"][0]
+    row["config"]["memory_limit_bytes"] -= 1
+
+    with pytest.raises(ValueError, match="config.memory_limit_bytes"):
+        _parse_profile_document(document)
+
+
+def test_profile_resource_rejects_weight_and_reserve_mismatch():
+    document = _profile_resource_document()
+    row = document["profiles"][0]
+    row["config"]["runtime_reserve_bytes"] -= 1
+
+    with pytest.raises(ValueError, match="weight_envelope_bytes"):
+        _parse_profile_document(document)
+
+
+def test_profile_resource_rejects_config_identity_shadowing():
+    document = _profile_resource_document()
+    row = document["profiles"][0]
+    row["config"]["model_key"] = "hy3-expert-q2"
+
+    with pytest.raises(ValueError, match="config.*model_key"):
+        _parse_profile_document(document)
 
 
 def test_model_key_mismatch_fails_before_selection():
@@ -233,3 +309,74 @@ Pages purgeable:                             50.
             },
         )
     ]
+
+
+def test_available_memory_rejects_missing_page_size(monkeypatch):
+    output = """\
+Mach Virtual Memory Statistics:
+Pages free: 10.
+Pages inactive: 30.
+Pages speculative: 40.
+Pages purgeable: 50.
+"""
+    monkeypatch.setattr(
+        expert_profiles.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=output),
+    )
+
+    with pytest.raises(RuntimeError, match="page size"):
+        expert_profiles.available_memory_bytes()
+
+
+def test_available_memory_rejects_zero_page_size(monkeypatch):
+    output = """\
+Mach Virtual Memory Statistics: (page size of 0 bytes)
+Pages free: 10.
+Pages inactive: 30.
+Pages speculative: 40.
+Pages purgeable: 50.
+"""
+    monkeypatch.setattr(
+        expert_profiles.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=output),
+    )
+
+    with pytest.raises(RuntimeError, match="page size.*positive"):
+        expert_profiles.available_memory_bytes()
+
+
+def test_available_memory_rejects_missing_required_counter(monkeypatch):
+    output = """\
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free: 10.
+Pages inactive: 30.
+Pages speculative: 40.
+"""
+    monkeypatch.setattr(
+        expert_profiles.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=output),
+    )
+
+    with pytest.raises(RuntimeError, match="Pages purgeable"):
+        expert_profiles.available_memory_bytes()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        subprocess.TimeoutExpired(["/usr/bin/vm_stat"], timeout=2.0),
+        subprocess.CalledProcessError(1, ["/usr/bin/vm_stat"]),
+    ],
+    ids=["timeout", "nonzero-exit"],
+)
+def test_available_memory_reports_subprocess_failure(monkeypatch, failure):
+    def fail(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(expert_profiles.subprocess, "run", fail)
+
+    with pytest.raises(RuntimeError, match="vm_stat preflight failed"):
+        expert_profiles.available_memory_bytes()

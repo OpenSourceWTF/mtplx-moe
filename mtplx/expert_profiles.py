@@ -40,6 +40,19 @@ _AVAILABLE_VM_STAT_PAGES = frozenset(
         "Pages purgeable",
     }
 )
+_PROFILE_IDENTITY_FIELDS = frozenset(
+    {
+        "name",
+        "model_key",
+        "process_ceiling_bytes",
+        "weight_envelope_bytes",
+        "generation_mode",
+        "evidence_commit",
+        "evidence_receipts",
+        "config",
+        "child_env",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -88,9 +101,56 @@ def _profile_mapping(row: Mapping[str, Any], key: str) -> Mapping[str, Any]:
 def _parse_profile(row: object) -> ExpertServeProfile:
     if not isinstance(row, dict):
         raise ValueError("each expert profile must be an object")
+    name = _profile_string(row, "name")
+    process_ceiling_bytes = _profile_positive_int(
+        row, "process_ceiling_bytes"
+    )
+    weight_envelope_bytes = _profile_positive_int(
+        row, "weight_envelope_bytes"
+    )
     generation_mode = _profile_string(row, "generation_mode")
     if generation_mode != "ar":
         raise ValueError("promoted expert profiles must use generation_mode 'ar'")
+    config = _profile_mapping(row, "config")
+    shadowed_identity = _PROFILE_IDENTITY_FIELDS.intersection(config)
+    if shadowed_identity:
+        names = ", ".join(sorted(shadowed_identity))
+        raise ValueError(
+            f"expert profile {name!r} config shadows profile identity: {names}"
+        )
+    config_ceiling = config.get("memory_limit_bytes")
+    if (
+        isinstance(config_ceiling, bool)
+        or not isinstance(config_ceiling, int)
+        or config_ceiling <= 0
+    ):
+        raise ValueError(
+            f"expert profile {name!r} config.memory_limit_bytes must be "
+            "a positive integer"
+        )
+    runtime_reserve = config.get("runtime_reserve_bytes")
+    if (
+        isinstance(runtime_reserve, bool)
+        or not isinstance(runtime_reserve, int)
+        or runtime_reserve < 0
+    ):
+        raise ValueError(
+            f"expert profile {name!r} config.runtime_reserve_bytes must be "
+            "a non-negative integer"
+        )
+    if config_ceiling != process_ceiling_bytes:
+        raise ValueError(
+            f"expert profile {name!r} config.memory_limit_bytes "
+            f"{config_ceiling} does not equal process_ceiling_bytes "
+            f"{process_ceiling_bytes}"
+        )
+    if weight_envelope_bytes + runtime_reserve != process_ceiling_bytes:
+        raise ValueError(
+            f"expert profile {name!r} weight_envelope_bytes "
+            f"{weight_envelope_bytes} plus config.runtime_reserve_bytes "
+            f"{runtime_reserve} does not equal process_ceiling_bytes "
+            f"{process_ceiling_bytes}"
+        )
     child_env = _profile_mapping(row, "child_env")
     if any(
         not isinstance(key, str) or not isinstance(value, str)
@@ -98,28 +158,39 @@ def _parse_profile(row: object) -> ExpertServeProfile:
     ):
         raise ValueError("expert profile child_env must map strings to strings")
     return ExpertServeProfile(
-        name=_profile_string(row, "name"),
+        name=name,
         model_key=_profile_string(row, "model_key"),
-        process_ceiling_bytes=_profile_positive_int(
-            row, "process_ceiling_bytes"
-        ),
-        weight_envelope_bytes=_profile_positive_int(
-            row, "weight_envelope_bytes"
-        ),
+        process_ceiling_bytes=process_ceiling_bytes,
+        weight_envelope_bytes=weight_envelope_bytes,
         generation_mode=generation_mode,
         evidence_commit=_profile_string(row, "evidence_commit"),
         evidence_receipts=_profile_string_tuple(row, "evidence_receipts"),
-        config=_profile_mapping(row, "config"),
+        config=config,
         child_env=child_env,
     )
 
 
-@lru_cache(maxsize=1)
-def load_expert_profiles() -> Mapping[str, ExpertServeProfile]:
-    """Load immutable production profiles from the installed package."""
+def _reject_duplicate_json_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in parsed:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        parsed[key] = value
+    return parsed
 
-    resource = files("mtplx").joinpath("data/expert_profiles.json")
-    document = json.loads(resource.read_text(encoding="utf-8"))
+
+def _parse_expert_profiles_resource(
+    resource_text: str,
+) -> Mapping[str, ExpertServeProfile]:
+    try:
+        document = json.loads(
+            resource_text,
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid expert profiles JSON: {exc}") from exc
     if not isinstance(document, dict) or document.get("schema") != 1:
         raise ValueError("expert profiles resource must use schema 1")
     rows = document.get("profiles")
@@ -132,6 +203,16 @@ def load_expert_profiles() -> Mapping[str, ExpertServeProfile]:
             raise ValueError(f"duplicate expert profile {profile.name!r}")
         parsed[profile.name] = profile
     return MappingProxyType(parsed)
+
+
+@lru_cache(maxsize=1)
+def load_expert_profiles() -> Mapping[str, ExpertServeProfile]:
+    """Load immutable production profiles from the installed package."""
+
+    resource = files("mtplx").joinpath("data/expert_profiles.json")
+    return _parse_expert_profiles_resource(
+        resource.read_text(encoding="utf-8")
+    )
 
 
 def _installed_ram_bytes() -> int:
@@ -154,13 +235,16 @@ def _installed_ram_bytes() -> int:
 def available_memory_bytes() -> int:
     """Return launch-time reclaimable memory reported by macOS ``vm_stat``."""
 
-    result = subprocess.run(
-        ["/usr/bin/vm_stat"],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=2.0,
-    )
+    try:
+        result = subprocess.run(
+            ["/usr/bin/vm_stat"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"vm_stat preflight failed: {exc}") from exc
     lines = result.stdout.splitlines()
     if not lines:
         raise RuntimeError("vm_stat returned no output")
@@ -168,6 +252,8 @@ def available_memory_bytes() -> int:
     if size_match is None:
         raise RuntimeError("could not parse vm_stat page size")
     page_size = int(size_match.group(1))
+    if page_size <= 0:
+        raise RuntimeError("vm_stat page size must be positive")
     counts: dict[str, int] = {}
     for line in lines[1:]:
         match = _VM_STAT_PAGE_COUNT.match(line.strip())
@@ -277,12 +363,26 @@ def build_expert_streaming_config(
 ) -> ExpertStreamingConfig:
     """Construct one validated immutable streaming configuration."""
 
+    normalized_overrides = _normalize_overrides(overrides)
+    if "model_key" in normalized_overrides:
+        raise ValueError("model_key cannot override expert profile identity")
     values = {
         "model_key": profile.model_key,
         **profile.config,
-        **_normalize_overrides(overrides),
+        **normalized_overrides,
     }
     config = ExpertStreamingConfig(**values)
+    if config.model_key != profile.model_key:
+        raise ValueError(
+            f"completed config model_key {config.model_key!r} does not match "
+            f"expert profile model_key {profile.model_key!r}"
+        )
+    if config.memory_limit_bytes > profile.process_ceiling_bytes:
+        raise ValueError(
+            f"completed config memory_limit_bytes {config.memory_limit_bytes} "
+            "exceeds the admitted expert profile process ceiling "
+            f"{profile.process_ceiling_bytes}"
+        )
     if config.island_layer_count is not None:
         config = resolve_island_placement(config, Path())
     return config
