@@ -44,6 +44,7 @@ from functools import lru_cache
 from typing import Optional
 
 import mlx.core as mx
+import mlx.nn as nn
 
 # MLX's Metal LogAddExp, specialized to logaddexp(x, 0) — the shipped softplus.
 _SOFTPLUS = """
@@ -1034,3 +1035,190 @@ def fused_moe_combine(
         output_dtypes=[expert_out.dtype],
     )
     return combined
+
+
+# ---------------------------------------------------------------------------
+# fused dense-MLP GLU over the concatenated gate/up projection
+# ---------------------------------------------------------------------------
+#
+# `laguna_fused.FusedGateUpMLP` issues gate and up as ONE (quantized) matmul, so
+# what comes back is a single [rows, 2H] row with gate in the first half and up
+# in the second.  The stock activation then slices that row in two and evaluates
+# `nn.silu(gate) * up` over the halves.  Both halves are STRIDED views of the
+# same buffer, and the component census on the pinned oQ4e checkpoint prices
+# what that costs per layer: the fused-elementwise sigmoid/multiply chain, plus
+# an H-wide contiguity copy before `down_proj` will take the result.  That is
+# ~two removable serial links per layer over 47 shared experts at H=1024 and the
+# dense layer-0 block at H=12288 — 0.25-0.4 ms/step.
+#
+# This kernel reads the two halves at their strides and writes ONE contiguous
+# activation, so neither slice materializes and the copy has nothing left to do.
+#
+# WHAT IT IS WORTH, measured, because the two serving lanes disagree and the
+# number is smaller than the census implies.  `check_fused_glu` prices it on a
+# chained spine — 47 activations back to back, each depending on the last, so
+# the harness's own plumbing is amortized rather than dominating — at bf16,
+# rows=1, over four sessions on an M5 Max (ranges, not a best run):
+#
+#   eager     stock 360-370 us | kernel 368-373 us per 47 blocks
+#             -> +0.03 to +0.42 us/block, +0.002 to +0.020 ms/step.  A wash
+#             to a small LOSS, and the sign never went the other way.
+#   compiled  stock 250-257 us | kernel 213-230 us per 47 blocks
+#             -> -0.53 to -0.68 us/block, -0.027 to -0.032 ms/step.  A win,
+#             and the tightest number of the four.
+#
+# They disagree because they run different stock chains.  Eager, the stock
+# activation is a compiled `silu` kernel plus a binary multiply — two MLX
+# elementwise dispatches, ~1.3 us each — against this kernel's one; but one
+# custom-kernel dispatch costs about two stock ones at this size, because
+# `mx.fast.metal_kernel`'s own call validation is ~2.8 us of HOST time against
+# ~2.0 us for the whole stock expression.  Removing a dispatch does not pay for
+# the one that replaces it.  Under `mx.compile` the stock chain fuses to a
+# single kernel, but its two inputs are strided views and MLX materializes them
+# before the fused elementwise runs — and that copy is what this kernel removes.
+#
+# So it is the compiled lane that this is for, which is also the lane the model
+# serves from.  -0.03 ms/step is an order of magnitude under the 0.25-0.4
+# ms/step the in-model census attributes to this link, and the micro-lane cannot
+# adjudicate that gap: it prices dispatches around a synthetic dependency, and
+# the census prices them inside a decode step where each sits between two pieces
+# of real work.  The guarded window decides; nothing here is sold as the answer.
+#
+# EXACTNESS.  Bit-exact by mirroring MLX's own Metal op structs rather than
+# re-deriving the activation:
+#
+#   - `mtplx_sigmoid` is `struct Sigmoid` from
+#     mlx/backend/metal/kernels/unary_ops.h verbatim —
+#     `auto y = 1 / (1 + metal::exp(metal::abs(x))); return (x < 0) ? y : 1 - y;`
+#     Written that way for the rounding, not the algebra: at T = bfloat16_t,
+#     `metal::exp` resolves to bf16_math.h's overload, which is
+#     `static_cast<bfloat16_t>(__metal_exp(static_cast<float>(x), ...))` — so the
+#     exponential is ROUNDED TO BFLOAT16 before the reciprocal, and a version
+#     that kept it in float would be a different number, not a different last
+#     bit.  Custom kernels get the same preamble (`metal::utils()`, which
+#     includes bf16_math.h) and the same compile options as MLX's own kernels
+#     (device.cpp builds every JIT library with `setFastMathEnabled(false)`), so
+#     `__METAL_MAYBE_FAST_MATH__` resolves identically on both sides.
+#   - The two multiplies are `struct Multiply`'s `T operator()(T x, T y)` from
+#     binary_ops.h, applied in the stock order: `silu(gate)` lands in a T
+#     variable first, which is the rounding `nn.silu`'s own output carries,
+#     and only then meets `up`.
+#
+# That order is what BOTH stock lanes evaluate.  Uncompiled, `nn.silu` is itself
+# `@partial(mx.compile)` (`x * mx.sigmoid(x)`), so it writes a bfloat16 array and
+# the `* up` binary op reads it back.  Under the compiled step the whole chain
+# fuses, but MLX's compiled elementwise codegen declares every intermediate at
+# its array's own dtype (backend/metal/compiled.cpp emits
+# `{type} tmp_{name} = Op{}(...)` with `get_type_string(x.dtype())`), so the
+# intermediate is rounded to bfloat16 there too.  The two lanes agree, and this
+# kernel reproduces both.
+#
+# `mtplx_sigmoid` deliberately matches the `sigmoid_mlx_exact` helper already
+# embedded in `kernels/verify_mlp_fused.py`; the difference is only that this
+# one keeps MLX's `(x < 0)` spelling rather than `(x < T(0))`.
+
+# MLX's Metal Sigmoid and Multiply, so what this kernel writes is the same bits
+# the stock expression writes.  See the note above for why each cast is where
+# it is.
+_GLU_OPS = """
+    // mlx/backend/metal/kernels/unary_ops.h, struct Sigmoid, verbatim.
+    template <typename T>
+    inline T mtplx_sigmoid(T x) {
+        auto y = 1 / (1 + metal::exp(metal::abs(x)));
+        return (x < 0) ? y : 1 - y;
+    }
+
+    // mlx/backend/metal/kernels/binary_ops.h, struct Multiply, applied the two
+    // times the stock expression applies it.  `silu` is a T variable rather
+    // than an expression on purpose: that is the rounding `nn.silu`'s own
+    // output carries into the second multiply.
+    template <typename T>
+    inline T mtplx_silu_mul(T gate, T up) {
+        T silu = gate * mtplx_sigmoid<T>(gate);
+        return silu * up;
+    }
+"""
+
+
+def is_glu_eligible(fused: mx.array, hidden: int) -> bool:
+    """Whether the fused GLU covers this concatenated projection.
+
+    No row gate, unlike the router: this kernel reads 2H and writes H per row
+    and does the stock arithmetic once per output element, so it is strictly
+    fewer bytes and strictly fewer dispatches than the slice/activate/copy chain
+    at every row count.  There is no batch at which the stock path becomes the
+    better one, so there is nothing for a threshold to protect.
+    """
+
+    if not _on_metal_device():
+        return False
+    if fused.dtype not in (mx.bfloat16, mx.float16, mx.float32):
+        return False
+    if fused.ndim < 1:
+        return False
+    if hidden <= 0:
+        return False
+    return int(fused.shape[-1]) == 2 * hidden
+
+
+@lru_cache(maxsize=None)
+def _glu_kernel(hidden: int):
+    header = _GLU_OPS + f"""
+        using namespace metal;
+        constant constexpr int HIDDEN = {hidden};
+    """
+
+    source = """
+        uint index = thread_position_in_grid.x;
+        uint row = index / uint(HIDDEN);
+        uint col = index - row * uint(HIDDEN);
+        // The gate/up halves at their strides — read, never materialized.
+        size_t base = (size_t)row * (size_t)(2 * HIDDEN) + (size_t)col;
+        activated[index] =
+            mtplx_silu_mul<T>(gate_up[base], gate_up[base + (size_t)HIDDEN]);
+    """
+
+    return mx.fast.metal_kernel(
+        name=f"mtplx_laguna_glu_h{hidden}",
+        input_names=["gate_up"],
+        output_names=["activated"],
+        header=header,
+        source=source,
+    )
+
+
+def fused_glu(fused: mx.array, hidden: int) -> mx.array:
+    """``silu(gate) * up`` over a concatenated [..., 2H] projection.
+
+    One dispatch, one contiguous [..., H] output: the caller's ``down_proj``
+    takes it as it stands.  Falls back to the stock expression verbatim on any
+    shape or device the kernel does not cover, so callers do not own a
+    correctness branch.
+
+    No environment variable of its own.  This is the internals of the path
+    ``MTPLX_LAGUNA_FUSED_SHARED_GATE_UP`` already installs — a run that did not
+    ask for the gate/up concatenation never reaches it, and one that did gets
+    the same numbers with two fewer links in the chain.
+    """
+
+    if not is_glu_eligible(fused, hidden):
+        gate = fused[..., :hidden]
+        up = fused[..., hidden:]
+        return nn.silu(gate) * up
+
+    # Kept to the cheapest expressions that produce the right thing: this
+    # kernel replaces two dispatches worth ~1.4 us, and `mx.fast.metal_kernel`'s
+    # own call validation already spends ~2.8 us of that, so a comprehension
+    # over the shape is a measurable fraction of the margin rather than noise.
+    shape = fused.shape
+    total = fused.size // 2
+    kernel = _glu_kernel(hidden)
+    (activated,) = kernel(
+        inputs=[fused],
+        template=[("T", fused.dtype)],
+        grid=(total, 1, 1),
+        threadgroup=(256 if total >= 256 else 32, 1, 1),
+        output_shapes=[shape[:-1] + (hidden,)],
+        output_dtypes=[fused.dtype],
+    )
+    return activated

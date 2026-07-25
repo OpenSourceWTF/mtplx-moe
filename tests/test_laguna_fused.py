@@ -141,6 +141,13 @@ def _last_logits(model, prompts):
         # bench/laguna/laguna_kernel_check.py::check_router_gemv instead.
         (laguna_fused.install_kernel_router_gemv, True),
         (laguna_fused.install_cached_gather_indices, True),
+        # The dense-MLP gate/up concatenation, whose activation now runs through
+        # `fused_glu`.  On the CPU device that kernel is ineligible and every
+        # dense block evaluates the stock expression, so what this pins is the
+        # FALLBACK plus the concatenation itself; the GPU kernel's own
+        # bit-exactness is measured in
+        # bench/laguna/laguna_kernel_check.py::check_fused_glu.
+        (laguna_fused.install_fused_shared_gate_up, True),
         # UNQUANTIZED float32 here, which is the one shape the q/k/v/g fusion is
         # NOT bit-exact in, for two reasons that are both MLX kernel selection
         # rather than arithmetic: the fused `x @ W.T` is a wider gemm and CPU
@@ -638,6 +645,126 @@ def test_fused_shared_gate_up_is_bit_exact_when_quantized(toy_model):
     assert _greedy(toy_model, PROMPTS, 5) == reference_tokens
     delta = float(mx.abs(_last_logits(toy_model, PROMPTS) - reference_logits).max())
     assert delta == 0.0, f"shared gate/up fusion was not bit-exact: {delta:.3e}"
+
+
+def test_fused_glu_fallback_is_the_stock_activation():
+    """Off the GPU, ``fused_glu`` has to BE ``nn.silu(gate) * up``.
+
+    Pinned on the CPU device on purpose: the kernel's own arithmetic is checked
+    where it runs (bench/laguna/laguna_kernel_check.py::check_fused_glu), and
+    what is reachable here is the other half of the contract — the half a
+    refactor is most likely to break.  The fallback must stay the shipped
+    expression rather than drift into something merely equivalent-looking, and
+    it must produce the same shape the kernel does at every rank the dense MLPs
+    hand it.
+    """
+
+    from mtplx.kernels.laguna_decode import fused_glu
+
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        for shape, hidden in (((2 * 5,), 5), ((1, 2 * 7), 7), ((3, 1, 2 * 4), 4)):
+            mx.random.seed(sum(shape) + hidden)
+            fused = mx.random.normal(shape).astype(mx.float32)
+            mx.eval(fused)
+
+            want = nn.silu(fused[..., :hidden]) * fused[..., hidden:]
+            got = fused_glu(fused, hidden)
+            mx.eval(want, got)
+
+            assert tuple(got.shape) == tuple(shape[:-1]) + (hidden,)
+            assert float(mx.abs(want - got).max()) == 0.0, shape
+    finally:
+        mx.set_default_device(previous)
+
+
+def test_fused_glu_takes_the_gate_from_the_first_half():
+    """Which half is the gate is a silent, unrecoverable defect if it is wrong.
+
+    ``silu(a) * b`` and ``silu(b) * a`` are both plausible-looking outputs of the
+    right shape, and the concatenation order (gate rows first, then up) is a
+    convention set in ``FusedGateUpMLP.__init__`` that the kernel's ``base`` vs
+    ``base + HIDDEN`` addressing has to agree with.  So assert the halves are
+    not interchangeable AND that it is the first one that goes through the
+    sigmoid.
+
+    Left on the DEFAULT device rather than pinned to the CPU: on a Metal box
+    that makes this the one suite test that actually dispatches the kernel, and
+    the halves contract is what a GPU dispatch is best spent on.
+    """
+
+    from mtplx.kernels.laguna_decode import fused_glu
+
+    hidden = 4
+    gate = mx.array([-2.0, -0.5, 0.5, 2.0])
+    up = mx.array([1.0, 3.0, -4.0, 7.0])
+    fused = mx.concatenate([gate, up])
+
+    got = fused_glu(fused, hidden)
+    swapped = fused_glu(mx.concatenate([up, gate]), hidden)
+    mx.eval(got, swapped)
+
+    assert float(mx.abs(got - nn.silu(gate) * up).max()) == 0.0
+    assert float(mx.abs(got - swapped).max()) > 0.0
+
+
+def test_fused_glu_addressing_tiles_the_concatenated_row():
+    """Walk the kernel's flat index arithmetic and check it hits each half once.
+
+    The kernel is one thread per OUTPUT element over a [rows, 2H] input, so it
+    recovers ``(row, col)`` by division and reads ``base`` and ``base + HIDDEN``.
+    That arithmetic is unreachable off the GPU, but it is arithmetic, and an
+    off-by-a-row would read a neighbouring token's activation rather than crash.
+    So reproduce it here and pin it against the flat positions the stock slices
+    actually occupy.
+    """
+
+    for rows, hidden in ((1, 1024), (1, 12288), (4, 32), (7, 5)):
+        flat = mx.arange(rows * 2 * hidden).reshape(rows, 2 * hidden)
+        want_gate = flat[:, :hidden].reshape(-1).tolist()
+        want_up = flat[:, hidden:].reshape(-1).tolist()
+
+        got_gate, got_up = [], []
+        for index in range(rows * hidden):
+            row, col = index // hidden, index % hidden
+            base = row * (2 * hidden) + col
+            got_gate.append(base)
+            got_up.append(base + hidden)
+
+        assert got_gate == want_gate, (rows, hidden)
+        assert got_up == want_up, (rows, hidden)
+
+
+def test_glu_eligibility_refuses_what_the_kernel_cannot_do():
+    """The eligibility gate is the correctness branch; pin its shape rules.
+
+    Says the same thing on a CPU-only box and on this one: every malformed
+    shape has to be refused either way, and on a Metal box the well-formed one
+    has to be accepted or the path is silently dead.
+    """
+
+    from mtplx.kernels import laguna_decode as kernels
+
+    fused = mx.zeros((1, 2048), dtype=mx.bfloat16)
+
+    if kernels._on_metal_device():
+        assert kernels.is_glu_eligible(fused, 1024) is True
+        # No row gate: this kernel is strictly fewer bytes and strictly fewer
+        # dispatches than the stock chain at every batch, so there is nothing a
+        # threshold would protect.
+        batched = mx.zeros((64, 2048), dtype=mx.bfloat16)
+        assert kernels.is_glu_eligible(batched, 1024) is True
+
+    refused = {
+        "last axis is not 2H": (mx.zeros((1, 2047), dtype=mx.bfloat16), 1024),
+        "hidden claims the whole row": (fused, 2048),
+        "hidden is zero": (fused, 0),
+        "hidden is negative": (fused, -1024),
+        "integer projection": (mx.zeros((1, 2048), dtype=mx.int32), 1024),
+    }
+    for label, arguments in refused.items():
+        assert kernels.is_glu_eligible(*arguments) is False, label
 
 
 def test_cached_lhs_indices_is_bit_exact_when_quantized(toy_model):

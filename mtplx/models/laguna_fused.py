@@ -41,6 +41,13 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
+# Imported at module scope, unlike every other kernel here: this one is called
+# once per dense MLP per decode step (47 shared experts plus the layer-0 block),
+# and a function-local import would spend a meaningful slice of what it saves on
+# `sys.modules` lookups.  `mtplx.kernels` imports nothing from `mtplx.models`,
+# so there is no cycle to avoid.
+from ..kernels.laguna_decode import fused_glu
+
 ENV_FUSED_GATE_UP = "MTPLX_LAGUNA_FUSED_GATE_UP"
 ENV_COMPILED_ROUTER = "MTPLX_LAGUNA_COMPILED_ROUTER"
 ENV_COMPILED_ATTN_GATE = "MTPLX_LAGUNA_COMPILED_ATTN_GATE"
@@ -284,8 +291,18 @@ class FusedGateUpMLP(nn.Module):
     lone dense layer-0 MLP, each of which currently pays two launches for one
     weight read's worth of work.
 
-    The activation stays the stock ``nn.silu(gate) * up`` expression verbatim;
-    only the launch count changes.
+    The activation is the stock ``nn.silu(gate) * up``, evaluated by
+    :func:`~mtplx.kernels.laguna_decode.fused_glu`, which reads the two halves
+    at their strides and writes ONE contiguous activation.  That removes the
+    slice materialization and the contiguity copy ``down_proj`` would otherwise
+    need, and it is bit-exact: the kernel mirrors MLX's own Metal ``Sigmoid``
+    and ``Multiply`` structs, including the bfloat16 rounding of the
+    exponential and of ``silu(gate)``.  On any shape or device it does not
+    cover — the CPU device, most obviously — ``fused_glu`` evaluates the stock
+    expression verbatim instead.  It has no environment variable of its own: it
+    is the internals of the path ``MTPLX_LAGUNA_FUSED_SHARED_GATE_UP`` already
+    installs, so a run that did not ask for the gate/up concatenation never
+    reaches it.
     """
 
     def __init__(self, mlp: Any) -> None:
@@ -337,10 +354,7 @@ class FusedGateUpMLP(nn.Module):
             )
         else:
             fused = x @ self["gate_up_weight"].swapaxes(-1, -2)
-        hidden = self.hidden_dims
-        gate = fused[..., :hidden]
-        up = fused[..., hidden:]
-        return self.down_proj(nn.silu(gate) * up)
+        return self.down_proj(fused_glu(fused, self.hidden_dims))
 
 
 def install_fused_shared_gate_up(model: Any) -> dict[str, Any]:
