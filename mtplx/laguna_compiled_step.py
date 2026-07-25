@@ -23,7 +23,11 @@ and an ICB capture becomes possible on top of it.
 Packed KV
 ---------
 K and V for a layer go to the SAME slot on the same step, so they do not need
-two writes.  ``packed_kv=True`` (the default) gives each layer one leaf
+two writes.  ``packed_kv=True`` gives each layer one leaf — measured
+2026-07-24 at ~0.07 ms/step SLOWER in-model than unpacked (the Select
+pack plus the strided sdpa plane views cost more than the saved
+dispatch), so UNPACKED is the default and the packed layout stays
+available for A/B —
 ``[2, H, S, D]`` — plane 0 keys, plane 1 values — and writes both with a single
 ``mx.slice_update`` whose update is ``[2, H, 1, D]``.  The leading axis doubles
 as the batch axis on the way out: ``kv[0:1]`` is exactly the ``[1, H, S, D]``
@@ -105,7 +109,7 @@ class StepGeometry:
     cap: int
     window: int | None
     kinds: tuple[str, ...]
-    packed_kv: bool = True
+    packed_kv: bool = False
 
     @property
     def n_layers(self) -> int:
@@ -136,7 +140,7 @@ class StepGeometry:
         return tuple(leaves[width * index : width * (index + 1)])
 
 
-def geometry_for(model: Any, cap: int, *, packed_kv: bool = True) -> StepGeometry:
+def geometry_for(model: Any, cap: int, *, packed_kv: bool = False) -> StepGeometry:
     """Derive the leaf layout from the model's own layers.
 
     Uses ``self_attn.is_sliding`` — the same flag ``LagunaModel.__call__``
@@ -350,7 +354,7 @@ def ring_state_from_cache(
 
 
 def snapshot_leaves(
-    model: Any, caches: Sequence[Any], cap: int, *, packed_kv: bool = True
+    model: Any, caches: Sequence[Any], cap: int, *, packed_kv: bool = False
 ) -> tuple[mx.array, mx.array, tuple[mx.array, ...]]:
     """Turn a post-prefill eager cache list into the step's tensor state.
 
@@ -452,7 +456,7 @@ def next_ring_index(ring_idx: mx.array, window: int) -> mx.array:
 # the step
 # ---------------------------------------------------------------------------
 def build_step(
-    model: Any, cap: int, *, compiled: bool = True, packed_kv: bool = True
+    model: Any, cap: int, *, compiled: bool = True, packed_kv: bool = False
 ) -> Callable[..., tuple[mx.array, ...]]:
     """Build the pure decode step for ``model``.
 
@@ -740,7 +744,7 @@ class LagunaCompiledLane:
         cap: int,
         *,
         compiled: bool = True,
-        packed_kv: bool = True,
+        packed_kv: bool = False,
     ) -> None:
         self.model = model
         self.compiled = bool(compiled)
