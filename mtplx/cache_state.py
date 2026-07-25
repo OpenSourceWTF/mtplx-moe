@@ -3527,6 +3527,38 @@ def trim_verified_window_to_prefix(
     return True
 
 
+def trim_verified_window_without_snapshot(
+    cache: list[Any],
+    *,
+    verified_tokens: int,
+    keep_tokens: int,
+) -> bool:
+    """Snapshot-free ``trim_verified_window_to_prefix``.
+
+    The snapshot's only role in the trim path is proving that no
+    recurrent/non-trimmable state needs restoring; when every cache entry is
+    trimmable that property holds by construction, so a skipped verify
+    snapshot (MTPLX_SKIP_VERIFY_SNAPSHOT=1) must not strand the repair.
+    Returns False for any cache carrying non-trimmable entries — those
+    genuinely need the snapshot.
+    """
+
+    if not cache:
+        return False
+    if any(not _is_trimmable(entry) for entry in cache):
+        return False
+    empty = CacheSnapshot(
+        states=tuple(None for _ in cache),
+        meta_states=tuple(None for _ in cache),
+    )
+    return trim_verified_window_to_prefix(
+        cache,
+        empty,
+        verified_tokens=verified_tokens,
+        keep_tokens=keep_tokens,
+    )
+
+
 def _entry_offset(entry: Any) -> int | None:
     offset = getattr(entry, "offset", None)
     if offset is None:

@@ -31,6 +31,7 @@ from .cache_state import (
     owned_recurrent_state_stats,
     restore_cache,
     rollback_after_verify,
+    trim_verified_window_without_snapshot,
     snapshot_cache,
     snapshot_untrimmable_cache,
     tail_owned_attention_kv_stats,
@@ -8325,6 +8326,26 @@ def generate_mtpk(
             committed_from_trim = trim_verified_window_to_prefix(
                 cache,
                 before_verify,
+                verified_tokens=len(verify_input),
+                keep_tokens=committed_prefix_len,
+            )
+            elapsed_trim_commit = time.perf_counter() - started_trim_commit
+            if committed_from_trim:
+                commit_time += elapsed_trim_commit
+                _add_timing(event, "trim_commit", elapsed_trim_commit)
+        if (
+            not committed_from_capture
+            and not committed_from_trim
+            and before_verify is None
+        ):
+            # The verify snapshot was skipped (MTPLX_SKIP_VERIFY_SNAPSHOT=1,
+            # the product-profile default) and no capture/trim lane committed.
+            # All-trimmable caches can still repair exactly by trimming the
+            # uncommitted verify tail — without this, the first rejection on
+            # such a lane raised and killed the request.
+            started_trim_commit = time.perf_counter()
+            committed_from_trim = trim_verified_window_without_snapshot(
+                cache,
                 verified_tokens=len(verify_input),
                 keep_tokens=committed_prefix_len,
             )
