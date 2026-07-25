@@ -9,6 +9,7 @@ import mlx.core as mx
 import pytest
 
 from mtplx import generation as generation_module
+from mtplx.cache_state import CacheSnapshot
 from mtplx.generation import (
     _clear_cache_every,
     _defer_verify_hidden_eval_enabled,
@@ -430,6 +431,72 @@ def test_target_only_near_prefix_restore_without_suffix_keeps_hidden_none(
     assert prompt_state.committed_mtp_cache is None
     assert prompt_state.suffix_tokens == 0
     assert [call["return_hidden"] for call in model.calls] == [False]
+
+
+def test_target_only_duck_near_prefix_ignores_stale_mtp_snapshot(monkeypatch):
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+
+    class DuckFallbackModel(TinyModel):
+        def make_cache(self):
+            cache = OffsetCache()
+            cache.offset = 5
+            return [cache]
+
+    model = DuckFallbackModel()
+    rt = _runtime(model, mtp_enabled=False)
+    make_mtp_cache_calls: list[bool] = []
+    original_make_mtp_cache = rt.make_mtp_cache
+
+    def recording_make_mtp_cache():
+        make_mtp_cache_calls.append(True)
+        return original_make_mtp_cache()
+
+    rt.make_mtp_cache = recording_make_mtp_cache
+    entry = SimpleNamespace(
+        prefix_len=6,
+        token_ids=tuple(range(6)),
+        model_path=str(rt.model_path),
+        hidden_variant=None,
+        template_hash=None,
+        mtp_history_policy="none",
+        draft_head_identity=None,
+        policy_fingerprint=None,
+        snapshot_epoch=6,
+        mtp_snapshot_epoch=6,
+        cache_snapshot=CacheSnapshot(states=(), meta_states=()),
+        mtp_history_snapshot=CacheSnapshot(states=(), meta_states=()),
+        mtp_history_cache_ref=None,
+        live_ref_only=False,
+        has_recurrent=False,
+        hits=0,
+        last_access_s=0.0,
+    )
+
+    class DuckBank:
+        last_miss_reason = "prefix_divergence_at_token"
+
+        def longest_prefix(self, _prompt_ids):
+            return None
+
+        def near_prefix_candidates(self, _prompt_ids, **kwargs):
+            assert kwargs["mtp_history_policy"] == "none"
+            return [(entry, 5)]
+
+        def restore(self, *_args, **_kwargs):
+            raise AssertionError("duck near-prefix hit must bypass exact restore")
+
+    prompt_state = restore_or_prefill_prompt_state(
+        rt,
+        [0, 1, 2, 3, 4],
+        mtp_history_policy="none",
+        session_bank=DuckBank(),
+        target_only=True,
+    )
+
+    assert prompt_state.cache_hit is True
+    assert prompt_state.hidden is None
+    assert prompt_state.committed_mtp_cache is None
+    assert make_mtp_cache_calls == []
 
 
 def test_live_frontier_reference_restore_survives_prefill_layout_factory(monkeypatch):

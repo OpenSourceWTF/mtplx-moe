@@ -3,6 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+from mtplx.cache_state import CacheSnapshot
 from mtplx.session_bank import SessionBank
 
 
@@ -42,6 +45,246 @@ class RuntimeWithCaches:
 
     def make_mtp_cache(self):
         return [TrimmableLiveCache(0)]
+
+
+class AROnlyRuntime:
+    model_path = Path("models/example")
+    mtp_enabled = False
+
+    def __init__(self):
+        self.make_mtp_cache_calls = 0
+
+    def make_cache(self):
+        return []
+
+    def make_mtp_cache(self):
+        self.make_mtp_cache_calls += 1
+        raise AssertionError("AR-only SessionBank restore must not build MTP cache")
+
+
+_EMPTY_SNAPSHOT = CacheSnapshot(states=(), meta_states=())
+
+
+@pytest.mark.parametrize(
+    "auxiliary",
+    [
+        {"hidden": "stale-hidden"},
+        {"hidden_variant": "post_norm"},
+        {"mtp_history_snapshot": _EMPTY_SNAPSHOT},
+        {"mtp_history_cache_ref": []},
+        {"mtp_snapshot_epoch": 3},
+        {"gdn_boundaries": [(2, _EMPTY_SNAPSHOT, "stale-boundary-hidden")]},
+    ],
+    ids=[
+        "hidden",
+        "hidden-variant",
+        "mtp-snapshot",
+        "mtp-live-ref",
+        "mtp-epoch",
+        "boundary-hidden",
+    ],
+)
+def test_session_bank_put_rejects_explicit_none_auxiliary_state(auxiliary):
+    bank = SessionBank()
+    kwargs = {
+        "runtime": AROnlyRuntime(),
+        "token_ids": [1, 2, 3],
+        "cache": [],
+        "logits": "logits",
+        "hidden": None,
+        "mtp_history_policy": "none",
+        "snapshot_epoch": 3,
+        **auxiliary,
+    }
+
+    with pytest.raises(ValueError, match="mtp_history_policy='none'"):
+        bank.put(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "auxiliary",
+    [
+        {"hidden": "stale-hidden"},
+        {"hidden_variant": "post_norm"},
+        {"mtp_history_snapshot": _EMPTY_SNAPSHOT},
+        {"mtp_snapshot_epoch": 3},
+    ],
+    ids=["hidden", "hidden-variant", "mtp-snapshot", "mtp-epoch"],
+)
+def test_session_bank_put_snapshot_rejects_explicit_none_auxiliary_state(
+    auxiliary,
+):
+    bank = SessionBank()
+    kwargs = {
+        "runtime": AROnlyRuntime(),
+        "token_ids": [1, 2, 3],
+        "cache_snapshot": _EMPTY_SNAPSHOT,
+        "logits": "logits",
+        "hidden": None,
+        "mtp_history_policy": "none",
+        "snapshot_epoch": 3,
+        **auxiliary,
+    }
+
+    with pytest.raises(ValueError, match="mtp_history_policy='none'"):
+        bank.put_snapshot(**kwargs)
+
+
+def test_session_bank_exact_none_restore_ignores_stale_auxiliary_state():
+    bank = SessionBank()
+    runtime = AROnlyRuntime()
+    entry = bank.put(
+        runtime=runtime,
+        token_ids=[1, 2, 3],
+        cache=[],
+        logits="logits",
+        hidden=None,
+        hidden_variant=None,
+        mtp_history_policy="none",
+        snapshot_epoch=3,
+    )
+    assert entry is not None
+    # Models a pre-fix RAM entry or corrupt persisted payload.
+    entry.hidden = "stale-hidden"
+    entry.hidden_variant = "post_norm"
+    entry.mtp_history_snapshot = _EMPTY_SNAPSHOT
+    entry.mtp_history_cache_ref = [TrimmableLiveCache(offset=2)]
+    entry.mtp_snapshot_epoch = 999
+
+    restored = bank.restore(
+        runtime,
+        [1, 2, 3, 4],
+        hidden_variant=None,
+        mtp_history_policy="none",
+    )
+
+    assert restored is not None
+    assert runtime.make_mtp_cache_calls == 0
+    assert restored.hidden is None
+    assert restored.mtp_history_snapshot is None
+    assert restored.mtp_history_cache is None
+    assert restored.entry.hidden_variant is None
+    assert restored.entry.mtp_snapshot_epoch is None
+
+
+def test_session_bank_near_none_restore_ignores_stale_live_mtp_reference():
+    bank = SessionBank()
+    runtime = AROnlyRuntime()
+    entry = bank.put(
+        runtime=runtime,
+        token_ids=[1, 2, 3, 4, 5, 6],
+        cache=[],
+        logits="logits",
+        hidden=None,
+        hidden_variant=None,
+        mtp_history_policy="none",
+        snapshot_epoch=6,
+    )
+    assert entry is not None
+    entry.cache_ref = [TrimmableLiveCache(offset=5)]
+    entry.mtp_history_cache_ref = [TrimmableLiveCache(offset=5)]
+    entry.hidden = "stale-hidden"
+
+    restored = bank.restore_entry_prefix_cache(
+        runtime,
+        entry,
+        5,
+        mode="reference",
+    )
+
+    assert restored is not None
+    cache, mtp_cache, restore_mode, restore_point, boundary_hidden = restored
+    assert cache is not None
+    assert mtp_cache is None
+    assert restore_mode == "reference_lease"
+    assert restore_point == 5
+    assert boundary_hidden is None
+    assert runtime.make_mtp_cache_calls == 0
+    assert entry.hidden is None
+    assert entry.mtp_history_cache_ref is None
+
+
+def test_session_bank_cold_none_restore_ignores_stale_auxiliary_state():
+    runtime = AROnlyRuntime()
+    record = SimpleNamespace(
+        token_ids=(1, 2, 3),
+        cache_snapshot=_EMPTY_SNAPSHOT,
+        logits="logits",
+        hidden="stale-hidden",
+        mtp_history_snapshot=_EMPTY_SNAPSHOT,
+        nbytes=128,
+        restore_s=0.01,
+        metadata={
+            "model_path": str(runtime.model_path),
+            "mtp_enabled": False,
+            "hidden_variant": "post_norm",
+            "mtp_history_policy": "none",
+            "snapshot_epoch": 3,
+            "mtp_snapshot_epoch": 999,
+        },
+    )
+
+    class ColdTier:
+        def lookup(self, *_args, **_kwargs):
+            return record
+
+    bank = SessionBank(cold_tier=ColdTier())
+    restored = bank.restore(
+        runtime,
+        [1, 2, 3, 4],
+        hidden_variant=None,
+        mtp_history_policy="none",
+    )
+
+    assert restored is not None
+    assert restored.cache_source == "ssd"
+    assert runtime.make_mtp_cache_calls == 0
+    assert restored.hidden is None
+    assert restored.mtp_history_snapshot is None
+    assert restored.mtp_history_cache is None
+    assert restored.entry.hidden_variant is None
+    assert restored.entry.mtp_snapshot_epoch is None
+
+
+def test_session_bank_committed_restore_keeps_hidden_and_mtp_snapshot():
+    bank = SessionBank()
+    runtime = RuntimeWithCaches()
+    entry = bank.put(
+        runtime=runtime,
+        token_ids=[1, 2, 3],
+        cache=[],
+        logits="logits",
+        hidden="committed-hidden",
+        hidden_variant="post_norm",
+        mtp_history_policy="committed",
+        mtp_history_snapshot=_EMPTY_SNAPSHOT,
+        snapshot_epoch=3,
+        mtp_snapshot_epoch=3,
+    )
+    assert entry is not None
+
+    incompatible = bank.restore(
+        runtime,
+        [1, 2, 3, 4],
+        hidden_variant=None,
+        mtp_history_policy="none",
+    )
+
+    assert incompatible is None
+    assert entry.hidden == "committed-hidden"
+    assert entry.mtp_history_snapshot is not None
+
+    restored = bank.restore(
+        runtime,
+        [1, 2, 3, 4],
+        hidden_variant="post_norm",
+        mtp_history_policy="committed",
+    )
+
+    assert restored is not None
+    assert restored.hidden == "committed-hidden"
+    assert restored.mtp_history_snapshot is not None
+    assert restored.mtp_history_cache is not None
 
 
 def test_session_bank_skips_single_oversized_snapshot_before_insert():

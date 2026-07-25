@@ -2478,7 +2478,7 @@ def _restore_near_prefix_prompt_state(
             )
             if _trim_cache_to_offset(cache, matched - 1):
                 mtp_history_cache = None
-                if entry.mtp_history_snapshot is not None:
+                if not target_only and entry.mtp_history_snapshot is not None:
                     mtp_history_cache = rt.make_mtp_cache()
                     restore_cache(mtp_history_cache, entry.mtp_history_snapshot)
                     if not _trim_cache_to_offset(mtp_history_cache, matched - 1):

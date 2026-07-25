@@ -137,6 +137,63 @@ def _mtp_history_policy_compatible(
     )
 
 
+def _mtp_history_policy_is_none(policy: str | None) -> bool:
+    return str(policy or "").strip().lower().replace("-", "_") == "none"
+
+
+def _validate_none_policy_auxiliary_state(
+    *,
+    mtp_history_policy: str | None,
+    hidden: Any | None,
+    hidden_variant: str | None,
+    mtp_history_snapshot: Any | None,
+    mtp_history_cache_ref: list[Any] | None = None,
+    mtp_snapshot_epoch: int | None,
+    gdn_boundaries: list[tuple[int, CacheSnapshot]] | None = None,
+) -> None:
+    """Reject impossible target-only entries at the storage boundary."""
+
+    if not _mtp_history_policy_is_none(mtp_history_policy):
+        return
+    invalid = []
+    if hidden is not None:
+        invalid.append("hidden")
+    if hidden_variant is not None:
+        invalid.append("hidden_variant")
+    if mtp_history_snapshot is not None:
+        invalid.append("mtp_history_snapshot")
+    if mtp_history_cache_ref is not None:
+        invalid.append("mtp_history_cache_ref")
+    if mtp_snapshot_epoch is not None:
+        invalid.append("mtp_snapshot_epoch")
+    if any(len(record) > 2 and record[2] is not None for record in (gdn_boundaries or [])):
+        invalid.append("gdn_boundary_hidden")
+    if invalid:
+        raise ValueError(
+            "mtp_history_policy='none' cannot store auxiliary MTP state: "
+            + ", ".join(invalid)
+        )
+
+
+def _canonicalize_none_policy_entry(
+    entry: "SessionBankEntry",
+) -> bool:
+    """Defensively strip auxiliary state from old/corrupt AR-only entries."""
+
+    if not _mtp_history_policy_is_none(entry.mtp_history_policy):
+        return False
+    entry.hidden_variant = None
+    entry.hidden = None
+    entry.mtp_history_snapshot = None
+    entry.mtp_history_cache_ref = None
+    entry.mtp_snapshot_epoch = None
+    if entry.gdn_boundaries:
+        entry.gdn_boundaries = [
+            (int(record[0]), record[1], None) for record in entry.gdn_boundaries
+        ]
+    return True
+
+
 def _tree_nbytes(value: Any) -> int:
     if value is None:
         return 0
@@ -391,6 +448,15 @@ class SessionBank:
         tokens = tuple(int(token) for token in token_ids)
         if not tokens:
             raise ValueError("cannot store an empty prefix")
+        _validate_none_policy_auxiliary_state(
+            mtp_history_policy=mtp_history_policy,
+            hidden=hidden,
+            hidden_variant=hidden_variant,
+            mtp_history_snapshot=mtp_history_snapshot,
+            mtp_history_cache_ref=mtp_history_cache_ref,
+            mtp_snapshot_epoch=mtp_snapshot_epoch,
+            gdn_boundaries=gdn_boundaries,
+        )
         if mtp_snapshot_epoch is not None and int(mtp_snapshot_epoch) != int(snapshot_epoch):
             raise ValueError("trunk and MTP snapshots must share the same commit boundary")
         self.last_put_nbytes = 0
@@ -636,6 +702,13 @@ class SessionBank:
         tokens = tuple(int(token) for token in token_ids)
         if not tokens:
             raise ValueError("cannot store an empty prefix")
+        _validate_none_policy_auxiliary_state(
+            mtp_history_policy=mtp_history_policy,
+            hidden=hidden,
+            hidden_variant=hidden_variant,
+            mtp_history_snapshot=mtp_history_snapshot,
+            mtp_snapshot_epoch=mtp_snapshot_epoch,
+        )
         if mtp_snapshot_epoch is not None and int(mtp_snapshot_epoch) != int(snapshot_epoch):
             raise ValueError("trunk and MTP snapshots must share the same commit boundary")
         self.last_put_nbytes = 0
@@ -940,6 +1013,11 @@ class SessionBank:
                 )
             ),
         )
+        if mtp_history_policy is not None and not _mtp_history_policy_compatible(
+            entry.mtp_history_policy, mtp_history_policy
+        ):
+            return None
+        _canonicalize_none_policy_entry(entry)
         setattr(entry, "cache_source", "ssd")
         setattr(entry, "ssd_cache_hit", True)
         setattr(entry, "ssd_cached_tokens", matched)
@@ -1005,6 +1083,7 @@ class SessionBank:
         ):
             self.last_miss_reason = CacheMissReason.POLICY_MISMATCH.value
             return cold_fallback()
+        _canonicalize_none_policy_entry(entry)
         if draft_head_identity is not None and entry.draft_head_identity != draft_head_identity:
             self.last_miss_reason = CacheMissReason.POLICY_MISMATCH.value
             return cold_fallback()
@@ -1108,6 +1187,7 @@ class SessionBank:
         matched = int(prefix_len)
         if matched < 1 or matched > int(entry.prefix_len):
             return None
+        none_policy_entry = _canonicalize_none_policy_entry(entry)
 
         # kvcache-v2 boundary-true restore: on hybrid models a sub-prefix
         # restore must land on a token where the recurrent state is *known*,
@@ -1147,6 +1227,9 @@ class SessionBank:
                 # Legacy escape hatch (env off-switch): pre-v2 behavior.
             else:
                 restore_point, boundary_snapshot, boundary_hidden = boundary
+                if none_policy_entry:
+                    boundary_hidden = None
+                    _canonicalize_none_policy_entry(entry)
                 if restore_point < 1:
                     self.last_miss_reason = (
                         CacheMissReason.NO_SNAPSHOT_COVERAGE.value
@@ -1444,6 +1527,12 @@ class SessionBank:
                 )
             ),
         )
+        if mtp_history_policy is not None and not _mtp_history_policy_compatible(
+            entry.mtp_history_policy, mtp_history_policy
+        ):
+            self.last_miss_reason = CacheMissReason.POLICY_MISMATCH.value
+            return None
+        _canonicalize_none_policy_entry(entry)
         if (
             entry.mtp_snapshot_epoch is not None
             and int(entry.mtp_snapshot_epoch) != int(entry.snapshot_epoch)
