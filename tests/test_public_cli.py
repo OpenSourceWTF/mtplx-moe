@@ -36,6 +36,34 @@ from mtplx.profiles import (
 from mtplx.version import DISPLAY_VERSION, __version__
 
 HY3_STREAMING_REPO_ID = "OpensourceWTF/Hy3-oQ2e-MTPLX-streaming"
+GLM_STREAMING_REPO_ID = "OpensourceWTF/GLM-5.2-t158-MTPLX-streaming"
+HY3_STREAMING_REVISION = "d33ce31c0605fc571c374cdf0aa0f085ec50ff88"
+HY3_STREAMING_BANK_SIZE = 80_518_053_888
+HY3_STREAMING_BANK_SHA256 = (
+    "c72fb8c0a66020439f4a78591ab9a79d8da3d38412635a531d604ffbf0d2e7d4"
+)
+
+
+def _hy3_pull_result(path: Path, **overrides):
+    result = {
+        "ok": True,
+        "repo_id": HY3_STREAMING_REPO_ID,
+        "path": str(path),
+        "revision": HY3_STREAMING_REVISION,
+        "resolved_revision": HY3_STREAMING_REVISION,
+        "expert_admission": {
+            "revision": HY3_STREAMING_REVISION,
+            "banks": [
+                {
+                    "file": "experts.bin",
+                    "st_size": HY3_STREAMING_BANK_SIZE,
+                    "sha256": HY3_STREAMING_BANK_SHA256,
+                }
+            ],
+        },
+    }
+    result.update(overrides)
+    return result
 
 
 def _pin_big_apple_silicon(monkeypatch):
@@ -87,14 +115,15 @@ def test_quickstart_download_allows_registered_streaming_repo_after_local_valida
                 },
             }
 
-    def fake_pull(model, **_kwargs):
+    def fake_pull(model, **kwargs):
         pull_calls.append(model)
+        assert kwargs["revision"] == HY3_STREAMING_REVISION
         spec, manifest = _make_authoritative_checkpoint(runtime)
         spec = replace(spec, key="hy3-expert-oq2e")
         manifest = replace(manifest, model_key=spec.key)
         save_expert_manifest(manifest, runtime / "expert-manifest.json")
         monkeypatch.setitem(MODEL_SPECS, spec.key, spec)
-        return {"ok": True, "repo_id": model, "path": str(runtime)}
+        return _hy3_pull_result(runtime)
 
     monkeypatch.setattr(public, "_resolve_runtime_model_path", fake_resolve)
     monkeypatch.setattr(public, "inspect_model", lambda _model: RemoteInspection())
@@ -162,10 +191,11 @@ def test_quickstart_invalid_cached_streaming_bank_errors_or_repairs(
 
     pull_calls = []
 
-    def fake_pull(model, **_kwargs):
+    def fake_pull(model, **kwargs):
         pull_calls.append(model)
+        assert kwargs["revision"] == HY3_STREAMING_REVISION
         bank.write_bytes(expected)
-        return {"ok": True, "repo_id": model, "path": str(runtime)}
+        return _hy3_pull_result(runtime)
 
     monkeypatch.setattr(public, "inspect_model", lambda _model: RemoteInspection())
     monkeypatch.setattr(hf_loader, "pull_model", fake_pull)
@@ -244,12 +274,13 @@ def test_quickstart_download_rejects_invalid_local_streaming_artifact(
                 "compatibility": {"can_run": False, "exit_code": 3},
             }
 
-    def fake_pull(model, **_kwargs):
+    def fake_pull(model, **kwargs):
         nonlocal pulled
         pulled = True
+        assert kwargs["revision"] == HY3_STREAMING_REVISION
         runtime.mkdir()
         (runtime / "expert-manifest.json").write_text("{}", encoding="utf-8")
-        return {"ok": True, "repo_id": model, "path": str(runtime)}
+        return _hy3_pull_result(runtime)
 
     monkeypatch.setattr(public, "_resolve_runtime_model_path", fake_resolve)
     monkeypatch.setattr(public, "inspect_model", lambda _model: RemoteInspection())
@@ -270,6 +301,208 @@ def test_quickstart_download_rejects_invalid_local_streaming_artifact(
     assert resolved is None
     assert result["downloaded"] is True
     assert result["error"]["error"] == "downloaded streaming artifact is invalid"
+
+
+def test_quickstart_download_rechecks_cached_hy3_against_exact_release(
+    tmp_path,
+    monkeypatch,
+):
+    import mtplx.hf_loader as hf_loader
+
+    runtime = tmp_path / "cached-hy3"
+    runtime.mkdir()
+    pull_kwargs = []
+
+    monkeypatch.setattr(
+        public,
+        "_resolve_runtime_model_path",
+        lambda *_args, **_kwargs: (str(runtime), None),
+    )
+    monkeypatch.setattr(
+        public,
+        "inspect_model",
+        lambda _model: SimpleNamespace(
+            to_dict=lambda: {"compatibility": {"can_run": False}}
+        ),
+    )
+
+    def fake_pull(_model, **kwargs):
+        pull_kwargs.append(kwargs)
+        return _hy3_pull_result(runtime)
+
+    monkeypatch.setattr(hf_loader, "pull_model", fake_pull)
+    monkeypatch.setattr(
+        hf_loader,
+        "expert_artifact_status",
+        lambda _path: {"streamed_experts": True, "ok": True},
+    )
+    monkeypatch.setattr(
+        public,
+        "_rich_download_progress_callback",
+        lambda **_kwargs: (lambda _event: None, lambda: None),
+    )
+
+    resolved, result = public._quickstart_resolve_model(
+        HY3_STREAMING_REPO_ID,
+        cache_dir=str(tmp_path),
+        download=True,
+    )
+
+    assert resolved == str(runtime)
+    assert result["downloaded"] is True
+    assert pull_kwargs[0]["revision"] == HY3_STREAMING_REVISION
+
+
+@pytest.mark.parametrize(
+    "bad_result",
+    [
+        {"resolved_revision": "0" * 40},
+        {
+            "expert_admission": {
+                "revision": "0" * 40,
+                "banks": [
+                    {
+                        "file": "experts.bin",
+                        "st_size": HY3_STREAMING_BANK_SIZE,
+                        "sha256": HY3_STREAMING_BANK_SHA256,
+                    }
+                ],
+            }
+        },
+        {
+            "expert_admission": {
+                "revision": HY3_STREAMING_REVISION,
+                "banks": [
+                    {
+                        "file": "experts.bin",
+                        "st_size": HY3_STREAMING_BANK_SIZE - 1,
+                        "sha256": HY3_STREAMING_BANK_SHA256,
+                    }
+                ],
+            }
+        },
+        {
+            "expert_admission": {
+                "revision": HY3_STREAMING_REVISION,
+                "banks": [
+                    {
+                        "file": "experts.bin",
+                        "st_size": HY3_STREAMING_BANK_SIZE,
+                        "sha256": "0" * 64,
+                    }
+                ],
+            }
+        },
+    ],
+)
+def test_quickstart_rejects_hy3_pull_outside_release_identity(
+    tmp_path,
+    monkeypatch,
+    bad_result,
+):
+    import mtplx.hf_loader as hf_loader
+
+    runtime = tmp_path / "hy3"
+    runtime.mkdir()
+    resolve_calls = 0
+
+    def fake_resolve(*_args, **_kwargs):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        if resolve_calls == 1:
+            return None, {"error": "not cached"}
+        return str(runtime), None
+
+    monkeypatch.setattr(public, "_resolve_runtime_model_path", fake_resolve)
+    monkeypatch.setattr(
+        public,
+        "inspect_model",
+        lambda _model: SimpleNamespace(
+            to_dict=lambda: {"compatibility": {"can_run": False}}
+        ),
+    )
+    monkeypatch.setattr(
+        hf_loader,
+        "pull_model",
+        lambda *_args, **_kwargs: _hy3_pull_result(runtime, **bad_result),
+    )
+    monkeypatch.setattr(
+        hf_loader,
+        "expert_artifact_status",
+        lambda _path: {"streamed_experts": True, "ok": True},
+    )
+    monkeypatch.setattr(
+        public,
+        "_rich_download_progress_callback",
+        lambda **_kwargs: (lambda _event: None, lambda: None),
+    )
+
+    resolved, result = public._quickstart_resolve_model(
+        HY3_STREAMING_REPO_ID,
+        cache_dir=str(tmp_path),
+        download=True,
+    )
+
+    assert resolved is None
+    assert result["error"]["error"] == "downloaded streaming release identity mismatch"
+
+
+def test_quickstart_does_not_invent_glm_streaming_revision(
+    tmp_path,
+    monkeypatch,
+):
+    import mtplx.hf_loader as hf_loader
+
+    runtime = tmp_path / "glm"
+    runtime.mkdir()
+    resolve_calls = 0
+    pull_kwargs = []
+
+    def fake_resolve(*_args, **_kwargs):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        if resolve_calls == 1:
+            return None, {"error": "not cached"}
+        return str(runtime), None
+
+    monkeypatch.setattr(public, "_resolve_runtime_model_path", fake_resolve)
+    monkeypatch.setattr(
+        public,
+        "inspect_model",
+        lambda _model: SimpleNamespace(
+            to_dict=lambda: {"compatibility": {"can_run": False}}
+        ),
+    )
+
+    def fake_pull(model, **kwargs):
+        pull_kwargs.append(kwargs)
+        return {
+            "repo_id": model,
+            "resolved_revision": "1" * 40,
+            "expert_admission": {"revision": "1" * 40, "banks": []},
+        }
+
+    monkeypatch.setattr(hf_loader, "pull_model", fake_pull)
+    monkeypatch.setattr(
+        hf_loader,
+        "expert_artifact_status",
+        lambda _path: {"streamed_experts": True, "ok": True},
+    )
+    monkeypatch.setattr(
+        public,
+        "_rich_download_progress_callback",
+        lambda **_kwargs: (lambda _event: None, lambda: None),
+    )
+
+    resolved, result = public._quickstart_resolve_model(
+        GLM_STREAMING_REPO_ID,
+        cache_dir=str(tmp_path),
+        download=True,
+    )
+
+    assert resolved == str(runtime)
+    assert result["downloaded"] is True
+    assert "revision" not in pull_kwargs[0]
 
 
 def test_version_metadata_matches_package_metadata():

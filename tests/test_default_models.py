@@ -11,6 +11,7 @@ from mtplx.default_models import (
     QUALITY_MODEL_ENV,
     SPEED_MODEL_ENV,
     STREAMING_CATALOG,
+    HY3_STREAMING_RELEASE_IDENTITY,
     catalog_model_matching,
     catalog_model_with_id,
     is_verified_default_model_ref,
@@ -19,6 +20,7 @@ from mtplx.default_models import (
     public_model_id_for_ref,
     select_default_model,
     streaming_catalog_models,
+    streaming_release_identity_for_ref,
 )
 from mtplx.model_catalog import OFFICIAL_CATALOG as APP_OFFICIAL_CATALOG
 from mtplx import hardware as hardware_module
@@ -570,6 +572,27 @@ def test_streaming_catalog_registers_both_published_repos():
     # Never auto-recommended by the RAM-tiered recommender.
     assert hy3.recommended_tiers == frozenset()
     assert glm.recommended_tiers == frozenset()
+
+
+def test_hy3_streaming_release_identity_is_exact_and_alias_resolvable():
+    identity = HY3_STREAMING_RELEASE_IDENTITY
+
+    assert identity.repo_id == _HY3_STREAMING_ID
+    assert identity.revision == "d33ce31c0605fc571c374cdf0aa0f085ec50ff88"
+    assert identity.bank_file == "experts.bin"
+    assert identity.bank_size_bytes == 80_518_053_888
+    assert (
+        identity.bank_sha256
+        == "c72fb8c0a66020439f4a78591ab9a79d8da3d38412635a531d604ffbf0d2e7d4"
+    )
+    assert streaming_release_identity_for_ref(_HY3_STREAMING_ID) is identity
+    assert streaming_release_identity_for_ref("hy3-expert-oq2e") is identity
+
+
+def test_unapproved_streaming_and_arbitrary_models_have_no_release_identity():
+    assert streaming_release_identity_for_ref(_GLM_STREAMING_ID) is None
+    assert streaming_release_identity_for_ref("glm52-expert-q1t") is None
+    assert streaming_release_identity_for_ref("someone/custom-model") is None
 
 
 def test_streaming_catalog_peak_is_far_below_download():

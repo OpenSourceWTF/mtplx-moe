@@ -115,6 +115,31 @@ STREAMING_CATALOG: tuple[CatalogModel, ...] = (
 )
 
 
+@dataclass(frozen=True)
+class StreamingReleaseIdentity:
+    """Immutable product-approved identity for a streamed model release."""
+
+    repo_id: str
+    revision: str
+    bank_file: str
+    bank_size_bytes: int
+    bank_sha256: str
+
+
+HY3_STREAMING_RELEASE_IDENTITY = StreamingReleaseIdentity(
+    repo_id="OpensourceWTF/Hy3-oQ2e-MTPLX-streaming",
+    revision="d33ce31c0605fc571c374cdf0aa0f085ec50ff88",
+    bank_file="experts.bin",
+    bank_size_bytes=80_518_053_888,
+    bank_sha256=(
+        "c72fb8c0a66020439f4a78591ab9a79d8da3d38412635a531d604ffbf0d2e7d4"
+    ),
+)
+STREAMING_RELEASE_IDENTITIES: tuple[StreamingReleaseIdentity, ...] = (
+    HY3_STREAMING_RELEASE_IDENTITY,
+)
+
+
 # Combined view: the Swift-synced consumer catalog plus the SSD-streamed
 # research artifacts. This is the single enumeration/resolution point for CLI
 # and discovery surfaces that must recognize both families. The Swift SYNC
@@ -165,6 +190,21 @@ def catalog_model_matching(ref: str | Path | None) -> CatalogModel | None:
         }
         if normalized in candidates or basename in candidates:
             return model
+    return None
+
+
+def streaming_release_identity_for_ref(
+    ref: str | Path | None,
+) -> StreamingReleaseIdentity | None:
+    """Return an approved immutable release identity for a catalog reference."""
+
+    model = catalog_model_matching(ref)
+    if model is None:
+        return None
+    repo_id = model.hf_model_id.casefold()
+    for identity in STREAMING_RELEASE_IDENTITIES:
+        if identity.repo_id.casefold() == repo_id:
+            return identity
     return None
 
 

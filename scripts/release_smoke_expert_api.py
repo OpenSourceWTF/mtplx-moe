@@ -12,16 +12,18 @@ from typing import Any, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
+from mtplx.default_models import HY3_STREAMING_RELEASE_IDENTITY
 
-EXPECTED_REVISION = "d33ce31c0605fc571c374cdf0aa0f085ec50ff88"
-EXPECTED_BANK_SHA256 = (
-    "c72fb8c0a66020439f4a78591ab9a79d8da3d38412635a531d604ffbf0d2e7d4"
-)
+
+EXPECTED_REVISION = HY3_STREAMING_RELEASE_IDENTITY.revision
+EXPECTED_BANK_SHA256 = HY3_STREAMING_RELEASE_IDENTITY.bank_sha256
 EXPECTED_PROFILE_EVIDENCE = {
     "hy3-oq2e-64": "14c8b57fff358bee3da2d10968a855b955b86847",
     "hy3-oq2e-88": "191ed9aa362e645f48f1a105a6ec024ea4fd5cf4",
     "hy3-oq2e-96": "191ed9aa362e645f48f1a105a6ec024ea4fd5cf4",
 }
+DEFAULT_TIMEOUT_SECONDS = 600.0
+MAX_TIMEOUT_SECONDS = 3_600.0
 _T = TypeVar("_T")
 
 
@@ -53,13 +55,36 @@ def _hex_digest(value: object, length: int, name: str) -> str:
     return text
 
 
-def _redacted_error(exc: BaseException, api_key: str) -> str:
+def _redacted_error(
+    exc: Exception,
+    *,
+    api_key: str,
+    base_url: str,
+) -> str:
     message = str(exc)
-    if api_key:
-        message = message.replace(api_key, "<redacted>")
-    return re.sub(
+    if base_url:
+        message = message.replace(base_url, "<redacted-url>")
+    parsed = urlsplit(base_url)
+    secrets = [api_key, parsed.username, parsed.password]
+    for secret in sorted(
+        (value for value in secrets if value),
+        key=len,
+        reverse=True,
+    ):
+        message = message.replace(secret, "<redacted>")
+    message = re.sub(
         r"(?i)(authorization\s*[:=]\s*bearer\s+)\S+",
         r"\1<redacted>",
+        message,
+    )
+    message = re.sub(
+        r"(?i)(https?://)[^/@\s]+@",
+        r"\1<redacted>@",
+        message,
+    )
+    return re.sub(
+        r"(?i)([?&][^=\s&]+)=([^&#\s]+)",
+        r"\1=<redacted>",
         message,
     )
 
@@ -69,13 +94,25 @@ def _run_step(
     operation: Callable[[], _T],
     *,
     api_key: str,
+    base_url: str,
 ) -> _T:
     try:
         return operation()
-    except SmokeFailure:
-        raise
-    except BaseException as exc:
-        detail = _redacted_error(exc, api_key)
+    except SmokeFailure as exc:
+        detail = _redacted_error(
+            exc,
+            api_key=api_key,
+            base_url=base_url,
+        )
+        if detail == str(exc):
+            raise
+        raise SmokeFailure(detail) from None
+    except Exception as exc:
+        detail = _redacted_error(
+            exc,
+            api_key=api_key,
+            base_url=base_url,
+        )
         raise SmokeFailure(
             f"{label} failed ({type(exc).__name__}): {detail}"
         ) from None
@@ -86,6 +123,10 @@ def _health_url(base_url: str) -> str:
     _require(
         parsed.scheme in {"http", "https"} and bool(parsed.netloc),
         "--base-url must be an absolute HTTP(S) URL",
+    )
+    _require(
+        parsed.username is None and parsed.password is None,
+        "--base-url must not contain credentials",
     )
     _require(
         not parsed.query and not parsed.fragment,
@@ -103,7 +144,12 @@ def _health_url(base_url: str) -> str:
     )
 
 
-def _fetch_health(base_url: str, api_key: str) -> dict[str, Any]:
+def _fetch_health(
+    base_url: str,
+    api_key: str,
+    *,
+    timeout: float,
+) -> dict[str, Any]:
     request = Request(
         _health_url(base_url),
         headers={
@@ -111,7 +157,7 @@ def _fetch_health(base_url: str, api_key: str) -> dict[str, Any]:
             "Authorization": f"Bearer {api_key}",
         },
     )
-    with urlopen(request, timeout=30) as response:  # noqa: S310
+    with urlopen(request, timeout=timeout) as response:  # noqa: S310
         payload = json.load(response)
     _require(isinstance(payload, dict), "/health did not return a JSON object")
     return payload
@@ -130,6 +176,35 @@ def _assert_request_ar(response: object, name: str) -> None:
         stats.get("generation_mode") == "ar",
         f"{name} did not report generation_mode='ar'",
     )
+
+
+def _consume_openai_response(response: object, name: str) -> str:
+    text = _nonempty_text(
+        response.choices[0].message.content,
+        f"{name} text",
+    )
+    _assert_request_ar(response, name)
+    return text
+
+
+def _consume_openai_stream(stream: object) -> str:
+    stream_parts: list[str] = []
+    stream_final: object | None = None
+    for chunk in stream:
+        if chunk.choices:
+            content = chunk.choices[0].delta.content
+            if isinstance(content, str):
+                stream_parts.append(content)
+        payload = _model_dump(chunk)
+        if isinstance(payload.get("mtplx_stats"), Mapping):
+            stream_final = chunk
+    text = _nonempty_text(
+        "".join(stream_parts),
+        "OpenAI streaming response text",
+    )
+    _require(stream_final is not None, "stream omitted final mtplx_stats")
+    _assert_request_ar(stream_final, "OpenAI streaming response")
+    return text
 
 
 def _profile_evidence(
@@ -161,6 +236,10 @@ def _profile_evidence(
     )
     backend = _nonempty_text(
         profile.get("backend"), "expert_profile.backend"
+    )
+    _require(
+        backend in {"native", "python-preadv"},
+        f"unsupported expert backend {backend!r}",
     )
     _require(
         profile.get("generation_mode") == "ar",
@@ -253,6 +332,36 @@ def _assert_health_consistent(
         )
 
 
+def _bounded_timeout(value: str) -> float:
+    try:
+        timeout = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--timeout must be a number of seconds"
+        ) from exc
+    if not 0 < timeout <= MAX_TIMEOUT_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"--timeout must be greater than 0 and at most "
+            f"{MAX_TIMEOUT_SECONDS:g} seconds"
+        )
+    return timeout
+
+
+def _listed_model_ids(client: object, *, expected: str) -> list[str]:
+    models = client.models.list()
+    model_ids = [
+        item.id
+        for item in getattr(models, "data", [])
+        if isinstance(getattr(item, "id", None), str)
+    ]
+    _require(bool(model_ids), "/v1/models returned no models")
+    _require(
+        expected in model_ids,
+        f"--model {expected!r} is absent from /v1/models",
+    )
+    return model_ids
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Smoke-test an MTPLX expert-serving release candidate."
@@ -268,130 +377,150 @@ def _parse_args() -> argparse.Namespace:
         help="Exact served model ID returned by /v1/models.",
     )
     parser.add_argument("--api-key", required=True)
+    parser.add_argument(
+        "--timeout",
+        type=_bounded_timeout,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help=(
+            "Per-request timeout in seconds "
+            f"(default: {DEFAULT_TIMEOUT_SECONDS:g}, "
+            f"maximum: {MAX_TIMEOUT_SECONDS:g})."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = _parse_args()
     try:
-        from openai import OpenAI
         import litellm
+        from openai import OpenAI
     except ImportError as exc:
         raise SmokeFailure(
             "release smoke requires the openai and litellm packages"
         ) from exc
 
-    client = OpenAI(base_url=args.base_url, api_key=args.api_key)
-
-    models = _run_step(
-        "OpenAI model listing",
-        client.models.list,
-        api_key=args.api_key,
-    )
-    model_ids = [
-        item.id
-        for item in getattr(models, "data", [])
-        if isinstance(getattr(item, "id", None), str)
-    ]
-    _require(bool(model_ids), "/v1/models returned no models")
-    _require(
-        args.model in model_ids,
-        f"--model {args.model!r} is absent from /v1/models",
-    )
-
-    nonstream = _run_step(
-        "OpenAI non-streaming Chat Completions",
-        lambda: client.chat.completions.create(
-            model=args.model,
-            messages=[{"role": "user", "content": "Reply with exactly OK"}],
-            temperature=0,
-        ),
-        api_key=args.api_key,
-    )
-    _nonempty_text(
-        nonstream.choices[0].message.content,
-        "OpenAI non-streaming response text",
-    )
-    _assert_request_ar(nonstream, "OpenAI non-streaming response")
-
-    stream = _run_step(
-        "OpenAI streaming Chat Completions",
-        lambda: client.chat.completions.create(
-            model=args.model,
-            messages=[{"role": "user", "content": "Reply with exactly OK"}],
-            temperature=0,
-            stream=True,
-        ),
-        api_key=args.api_key,
-    )
-    stream_parts: list[str] = []
-    stream_final: object | None = None
-    for chunk in stream:
-        if chunk.choices:
-            content = chunk.choices[0].delta.content
-            if isinstance(content, str):
-                stream_parts.append(content)
-        payload = _model_dump(chunk)
-        if isinstance(payload.get("mtplx_stats"), Mapping):
-            stream_final = chunk
-    _nonempty_text("".join(stream_parts), "OpenAI streaming response text")
-    _require(stream_final is not None, "stream omitted final mtplx_stats")
-    _assert_request_ar(stream_final, "OpenAI streaming response")
-
-    litellm_response = _run_step(
-        "LiteLLM Chat Completions",
-        lambda: litellm.completion(
-            model=f"openai/{args.model}",
-            api_base=args.base_url,
+    client = _run_step(
+        "OpenAI client setup",
+        lambda: OpenAI(
+            base_url=args.base_url,
             api_key=args.api_key,
-            messages=[{"role": "user", "content": "Reply with exactly OK"}],
-            temperature=0,
+            timeout=args.timeout,
         ),
         api_key=args.api_key,
+        base_url=args.base_url,
     )
-    _nonempty_text(
-        litellm_response.choices[0].message.content,
-        "LiteLLM response text",
+
+    _run_step(
+        "OpenAI model listing",
+        lambda: _listed_model_ids(client, expected=args.model),
+        api_key=args.api_key,
+        base_url=args.base_url,
+    )
+
+    _run_step(
+        "OpenAI non-streaming Chat Completions",
+        lambda: _consume_openai_response(
+            client.chat.completions.create(
+                model=args.model,
+                messages=[
+                    {"role": "user", "content": "Reply with exactly OK"}
+                ],
+                temperature=0,
+            ),
+            "OpenAI non-streaming response",
+        ),
+        api_key=args.api_key,
+        base_url=args.base_url,
+    )
+
+    _run_step(
+        "OpenAI streaming Chat Completions",
+        lambda: _consume_openai_stream(
+            client.chat.completions.create(
+                model=args.model,
+                messages=[
+                    {"role": "user", "content": "Reply with exactly OK"}
+                ],
+                temperature=0,
+                stream=True,
+            )
+        ),
+        api_key=args.api_key,
+        base_url=args.base_url,
+    )
+
+    _run_step(
+        "LiteLLM Chat Completions",
+        lambda: _nonempty_text(
+            litellm.completion(
+                model=f"openai/{args.model}",
+                api_base=args.base_url,
+                api_key=args.api_key,
+                messages=[
+                    {"role": "user", "content": "Reply with exactly OK"}
+                ],
+                temperature=0,
+                timeout=args.timeout,
+            ).choices[0].message.content,
+            "LiteLLM response text",
+        ),
+        api_key=args.api_key,
+        base_url=args.base_url,
     )
 
     first_health = _run_step(
         "health after short requests",
         lambda: _profile_evidence(
-            _fetch_health(args.base_url, args.api_key)
+            _fetch_health(
+                args.base_url,
+                args.api_key,
+                timeout=args.timeout,
+            )
         ),
         api_key=args.api_key,
+        base_url=args.base_url,
     )
 
-    long_response = _run_step(
+    _run_step(
         "OpenAI long Chat Completions",
-        lambda: client.chat.completions.create(
-            model=args.model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": "Summarize in one sentence: "
-                    + ("MTPLX streams experts from SSD. " * 512),
-                }
-            ],
-            max_tokens=32,
-            temperature=0,
+        lambda: _consume_openai_response(
+            client.chat.completions.create(
+                model=args.model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "Summarize in one sentence: "
+                        + ("MTPLX streams experts from SSD. " * 512),
+                    }
+                ],
+                max_tokens=32,
+                temperature=0,
+            ),
+            "OpenAI long response",
         ),
         api_key=args.api_key,
+        base_url=args.base_url,
     )
-    _nonempty_text(
-        long_response.choices[0].message.content,
-        "OpenAI long response text",
-    )
-    _assert_request_ar(long_response, "OpenAI long response")
 
     final_health = _run_step(
         "health after long request",
         lambda: _profile_evidence(
-            _fetch_health(args.base_url, args.api_key)
+            _fetch_health(
+                args.base_url,
+                args.api_key,
+                timeout=args.timeout,
+            )
         ),
         api_key=args.api_key,
+        base_url=args.base_url,
     )
-    _assert_health_consistent(first_health, final_health)
+    _run_step(
+        "health consistency",
+        lambda: _assert_health_consistent(first_health, final_health),
+        api_key=args.api_key,
+        base_url=args.base_url,
+    )
 
     print(
         json.dumps(

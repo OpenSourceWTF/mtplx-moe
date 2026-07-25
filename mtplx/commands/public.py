@@ -39,11 +39,13 @@ from mtplx.benchmarks.validators.basic import (
 from mtplx.constants import DEFAULT_RUNTIME_MODEL_DIR
 from mtplx.default_models import (
     OPTIMIZED_QUALITY_DESCRIPTION,
+    StreamingReleaseIdentity,
     is_verified_default_model_ref,
     optimized_quality_model_ref,
     public_model_id_for_ref,
     select_default_model,
     streaming_catalog_models,
+    streaming_release_identity_for_ref,
 )
 from mtplx.env import collect_environment
 from mtplx.fan_mode import FAN_MODE_MAX, FAN_MODE_SMART, fan_mode_from_args
@@ -9566,10 +9568,13 @@ def _quickstart_choose_model(
 def _quickstart_resolve_model(
     model: str, *, cache_dir: str | None, download: bool
 ) -> tuple[str | None, dict[str, Any]]:
+    release_identity = streaming_release_identity_for_ref(model)
     runtime_model, resolve_error = _resolve_runtime_model_path(
         model, cache_dir=cache_dir
     )
-    if resolve_error is None:
+    if resolve_error is None and not (
+        download and release_identity is not None
+    ):
         return runtime_model, {
             "model": model,
             "runtime_model": runtime_model,
@@ -9586,6 +9591,7 @@ def _quickstart_resolve_model(
         }
 
     download_ref = _quickstart_download_ref(model)
+    release_identity = streaming_release_identity_for_ref(download_ref)
     streaming_catalog_model = next(
         (
             candidate
@@ -9631,12 +9637,14 @@ def _quickstart_resolve_model(
     callback, finalize = _rich_download_progress_callback(repo_id=download_ref)
     try:
         try:
-            result = pull_model(
-                download_ref,
-                cache_dir=cache_dir,
-                progress_callback=callback,
-                progress_interval_s=0.4,
-            )
+            pull_kwargs: dict[str, Any] = {
+                "cache_dir": cache_dir,
+                "progress_callback": callback,
+                "progress_interval_s": 0.4,
+            }
+            if release_identity is not None:
+                pull_kwargs["revision"] = release_identity.revision
+            result = pull_model(download_ref, **pull_kwargs)
         except KeyboardInterrupt:
             return None, {
                 "model": model,
@@ -9651,6 +9659,24 @@ def _quickstart_resolve_model(
             }
     finally:
         finalize()
+    if release_identity is not None:
+        identity_error = _streaming_release_identity_error(
+            result,
+            release_identity=release_identity,
+        )
+        if identity_error is not None:
+            return None, {
+                "model": model,
+                "runtime_model": None,
+                "downloaded": True,
+                "download_ref": download_ref,
+                "download_result": result,
+                "error": {
+                    "error": "downloaded streaming release identity mismatch",
+                    "model": download_ref,
+                    "detail": identity_error,
+                },
+            }
     runtime_model, resolve_error = _resolve_runtime_model_path(
         download_ref, cache_dir=cache_dir
     )
@@ -9692,6 +9718,35 @@ def _quickstart_resolve_model(
         "download_ref": download_ref,
         "download_result": result,
     }
+
+
+def _streaming_release_identity_error(
+    result: dict[str, Any],
+    *,
+    release_identity: StreamingReleaseIdentity,
+) -> str | None:
+    if result.get("repo_id") != release_identity.repo_id:
+        return "pull result repository does not match the approved release"
+    if result.get("resolved_revision") != release_identity.revision:
+        return "resolved revision does not match the approved release"
+    admission = result.get("expert_admission")
+    if not isinstance(admission, dict):
+        return "pull result has no expert admission receipt"
+    if admission.get("revision") != release_identity.revision:
+        return "admission revision does not match the approved release"
+    banks = admission.get("banks")
+    if not isinstance(banks, list) or len(banks) != 1:
+        return "admission receipt does not contain the approved expert bank"
+    bank = banks[0]
+    if not isinstance(bank, dict):
+        return "admission receipt expert bank is invalid"
+    if bank.get("file") != release_identity.bank_file:
+        return "admitted expert bank name does not match the approved release"
+    if bank.get("st_size") != release_identity.bank_size_bytes:
+        return "admitted expert bank size does not match the approved release"
+    if bank.get("sha256") != release_identity.bank_sha256:
+        return "admitted expert bank digest does not match the approved release"
+    return None
 
 
 def _quickstart_number(value: Any) -> float | None:
