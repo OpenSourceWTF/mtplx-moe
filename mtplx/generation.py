@@ -457,6 +457,17 @@ def bind_generation_feature_policy(
     )
 
 
+def install_generation_feature_policy(
+    environ: Mapping[str, str],
+) -> GenerationFeaturePolicy:
+    """Install one immutable policy after construction-time env is finalized."""
+
+    global _GENERATION_FEATURE_POLICY
+    policy = bind_generation_feature_policy(environ)
+    _GENERATION_FEATURE_POLICY = policy
+    return policy
+
+
 _GENERATION_FEATURE_POLICY = bind_generation_feature_policy(os.environ)
 
 

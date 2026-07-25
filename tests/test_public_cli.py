@@ -6159,6 +6159,58 @@ def test_serve_threads_api_key_file_and_kv_quant_to_daemon(monkeypatch, tmp_path
     assert env["MTPLX_PAGED_KV_QUANT"] == "q8"
 
 
+def test_serve_wrapper_child_selects_sustained_with_profile_env_unset(monkeypatch):
+    calls: dict[str, object] = {}
+    monkeypatch.delenv("MTPLX_SUSTAINED_PREFILL", raising=False)
+    monkeypatch.setattr(public, "_serve_should_onboard", lambda _args: False)
+    monkeypatch.setattr(public, "_print_serve_start_banner", lambda _args: None)
+    monkeypatch.setattr(public, "_port_is_busy", lambda host, port: False)
+    monkeypatch.setattr(
+        public,
+        "_resolve_runtime_model_path",
+        lambda model, cache_dir=None: (model, None),
+    )
+    monkeypatch.setattr(
+        public,
+        "_model_gate",
+        lambda model, unsafe_force_unverified=False, yes=False: (
+            {"compatibility": {"tier": "verified", "can_run": True, "exit_code": 0}},
+            None,
+        ),
+    )
+
+    def fake_execvpe(_executable, cmd, env):
+        calls["cmd"] = cmd
+        calls["env"] = env
+        raise SystemExit(0)
+
+    monkeypatch.setattr(public.os, "execvpe", fake_execvpe)
+    args = build_parser().parse_args(
+        [
+            "serve",
+            "--model",
+            "/tmp/model",
+            "--yes",
+            "--profile",
+            "sustained",
+            "--warmup-tokens",
+            "0",
+        ]
+    )
+    args._cli_flags = {"model", "yes", "profile", "warmup-tokens"}
+
+    with pytest.raises(SystemExit) as exc:
+        public.cmd_serve_public(args)
+
+    cmd = calls["cmd"]
+    env = calls["env"]
+    assert exc.value.code == 0
+    assert isinstance(cmd, list)
+    assert cmd[cmd.index("--profile") + 1] == "sustained"
+    assert isinstance(env, dict)
+    assert "MTPLX_SUSTAINED_PREFILL" not in env
+
+
 @pytest.mark.parametrize(
     ("public_model_id", "expected_model"),
     [

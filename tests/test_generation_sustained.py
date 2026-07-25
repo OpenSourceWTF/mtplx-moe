@@ -1426,7 +1426,7 @@ def test_last_window_mtp_history_skips_discarded_chunk_hidden(monkeypatch):
     assert appended == [([6], 5), ([7, 8], 6)]
 
 
-def test_32k_prefill_peak_memory_bounded():
+def test_32k_prefill_peak_memory_bounded(monkeypatch):
     """
     Regression guard for the Ivan/Benchand 32K memory balloon.
     Run only on the Apple Silicon long-context QA machine.
@@ -1437,6 +1437,10 @@ def test_32k_prefill_peak_memory_bounded():
     if not model_path:
         pytest.skip("set MTPLX_32K_QA_MODEL to a local runnable MTPLX model")
 
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2048")
+    monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
+
     from mtplx.runtime import load
 
     rt = load(model_path, mtp=True)
@@ -1446,13 +1450,6 @@ def test_32k_prefill_peak_memory_bounded():
         pytest.skip("QA prompt did not tokenize to 32K tokens")
 
     mx.reset_peak_memory()
-    generation_module._GENERATION_FEATURE_POLICY = (
-        generation_module.bind_generation_feature_policy(
-            {"MTPLX_SUSTAINED_PREFILL": "1"}
-        )
-    )
-    os.environ["MTPLX_PREFILL_CHUNK_SIZE"] = "2048"
-    os.environ["MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS"] = "0"
     _prefill(rt, prompt_ids, return_hidden=True)
     peak_gb = mx.get_peak_memory() / (1024**3)
 

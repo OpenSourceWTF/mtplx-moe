@@ -178,6 +178,7 @@ try:
         _strip_terminal_stop,
         generate_ar,
         generate_mtpk,
+        install_generation_feature_policy,
         prefill_chunk_size_override,
         restore_or_prefill_prompt_state,
     )
@@ -208,6 +209,7 @@ except Exception as exc:
 
     generate_ar = _missing_runtime
     generate_mtpk = _missing_runtime
+    install_generation_feature_policy = _missing_runtime
     think_marker_ids = _missing_runtime
     thinking_guard_config_from_env = _missing_runtime
     prefill_chunk_size_override = nullcontext
@@ -1614,6 +1616,9 @@ class ServerState:
                         + json.dumps(bad_profile_env, sort_keys=True)
                     )
             self.fast_path_env_status = _fast_path_env_status()
+        self.generation_feature_policy = install_generation_feature_policy(
+            dict(os.environ)
+        )
         _startup_line("[4/6] Checking local acceleration runtime")
         _startup_line("      This may take a few seconds.")
         self.mlx_runtime_status = _mlx_runtime_status()

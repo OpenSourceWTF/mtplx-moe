@@ -12,6 +12,7 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
+from mtplx import generation as generation_module
 from mtplx.backends.gemma4_assistant import _gemma4_draft_position
 from mtplx.profiles import DEFAULT_HF_MODEL_ID, get_profile
 from mtplx.server import openai
@@ -10347,6 +10348,48 @@ def test_server_state_emits_startup_progress(monkeypatch, capsys):
     assert "[5/6] Model loaded" in captured
     assert "[6/6] Warmup skipped" in captured
     assert state.context_window == 32768
+
+
+def test_server_state_binds_sustained_policy_before_runtime_load(monkeypatch):
+    for key in get_profile("sustained").env_dict():
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(
+        generation_module,
+        "_GENERATION_FEATURE_POLICY",
+        generation_module.bind_generation_feature_policy({}),
+    )
+    monkeypatch.setattr(openai, "_apply_metal_memory_caps", lambda: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
+    monkeypatch.setattr(
+        openai,
+        "_configure_mlx_cache_limit",
+        lambda _args: {"configured": False},
+    )
+
+    def stop_after_policy_install(*_args, **_kwargs):
+        assert generation_module._sustained_prefill_enabled() is True
+        assert generation_module._iter_prefill_chunk_spans(4097) == [
+            (0, 2048),
+            (2048, 4096),
+            (4096, 4097),
+        ]
+        raise RuntimeError("stop after generation policy install")
+
+    monkeypatch.setattr(openai, "load", stop_after_policy_install)
+    args = parse_args(
+        [
+            "--model",
+            "models/example",
+            "--profile",
+            "sustained",
+            "--warmup-tokens",
+            "0",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="stop after generation policy install"):
+        openai.ServerState(args)
 
 
 def test_server_state_applies_clear_cache_every_after_profile(monkeypatch):
