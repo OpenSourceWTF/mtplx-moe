@@ -10351,45 +10351,55 @@ def test_server_state_emits_startup_progress(monkeypatch, capsys):
 
 
 def test_server_state_binds_sustained_policy_before_runtime_load(monkeypatch):
-    for key in get_profile("sustained").env_dict():
-        monkeypatch.delenv(key, raising=False)
-    monkeypatch.setattr(
-        generation_module,
-        "_GENERATION_FEATURE_POLICY",
-        generation_module.bind_generation_feature_policy({}),
-    )
-    monkeypatch.setattr(openai, "_apply_metal_memory_caps", lambda: {})
-    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
-    monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
-    monkeypatch.setattr(
-        openai,
-        "_configure_mlx_cache_limit",
-        lambda _args: {"configured": False},
-    )
+    environment_before = dict(os.environ)
+    try:
+        for key in get_profile("sustained").env_dict():
+            os.environ.pop(key, None)
+        monkeypatch.setattr(
+            generation_module,
+            "_GENERATION_FEATURE_POLICY",
+            generation_module.bind_generation_feature_policy({}),
+        )
+        monkeypatch.setattr(openai, "_apply_metal_memory_caps", lambda: {})
+        monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+        monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
+        monkeypatch.setattr(
+            openai,
+            "_configure_mlx_cache_limit",
+            lambda _args: {"configured": False},
+        )
 
-    def stop_after_policy_install(*_args, **_kwargs):
-        assert generation_module._sustained_prefill_enabled() is True
-        assert generation_module._iter_prefill_chunk_spans(4097) == [
-            (0, 2048),
-            (2048, 4096),
-            (4096, 4097),
-        ]
-        raise RuntimeError("stop after generation policy install")
+        def stop_after_policy_install(*_args, **_kwargs):
+            assert generation_module._sustained_prefill_enabled() is True
+            assert generation_module._iter_prefill_chunk_spans(4097) == [
+                (0, 2048),
+                (2048, 4096),
+                (4096, 4097),
+            ]
+            assert (
+                generation_module._assert_safe_long_context_prefill(16_384) is None
+            )
+            raise RuntimeError("stop after generation policy install")
 
-    monkeypatch.setattr(openai, "load", stop_after_policy_install)
-    args = parse_args(
-        [
-            "--model",
-            "models/example",
-            "--profile",
-            "sustained",
-            "--warmup-tokens",
-            "0",
-        ]
-    )
+        monkeypatch.setattr(openai, "load", stop_after_policy_install)
+        args = parse_args(
+            [
+                "--model",
+                "models/example",
+                "--profile",
+                "sustained",
+                "--warmup-tokens",
+                "0",
+            ]
+        )
 
-    with pytest.raises(RuntimeError, match="stop after generation policy install"):
-        openai.ServerState(args)
+        with pytest.raises(RuntimeError, match="stop after generation policy install"):
+            openai.ServerState(args)
+    finally:
+        os.environ.clear()
+        os.environ.update(environment_before)
+
+    assert dict(os.environ) == environment_before
 
 
 def test_server_state_applies_clear_cache_every_after_profile(monkeypatch):
