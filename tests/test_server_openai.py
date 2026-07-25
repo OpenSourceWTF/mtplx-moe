@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from mtplx import generation as generation_module
 from mtplx.backends.gemma4_assistant import _gemma4_draft_position
+from mtplx.expert_runtime import ExpertStreamingConfigurationError
 from mtplx.profiles import DEFAULT_HF_MODEL_ID, get_profile
 from mtplx.server import openai
 from mtplx.server.openai import _RateLimiter, create_app, parse_args
@@ -2436,6 +2437,7 @@ def test_opencode_initial_coding_request_uses_compact_mtplx_agent_prompt(monkeyp
 def test_chat_long_context_depth_cap_resolves_runtime_depth(monkeypatch):
     captured: dict[str, object] = {}
     state = _fake_state()
+    state.context_window = 32_768
     client = TestClient(create_app(state))
 
     monkeypatch.setenv("MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY", "auto")
@@ -2487,7 +2489,9 @@ def test_chat_long_context_depth_cap_resolves_runtime_depth(monkeypatch):
 
 def test_opencode_short_context_preserves_depth3(monkeypatch):
     captured: dict[str, object] = {}
-    client = TestClient(create_app(_fake_state()))
+    state = _fake_state()
+    state.context_window = 16_384
+    client = TestClient(create_app(state))
 
     monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1] * 5000)
 
@@ -2525,7 +2529,9 @@ def test_opencode_short_context_preserves_depth3(monkeypatch):
 
 def test_opencode_short_context_depth_policy_respects_explicit_depth(monkeypatch):
     captured: dict[str, object] = {}
-    client = TestClient(create_app(_fake_state()))
+    state = _fake_state()
+    state.context_window = 16_384
+    client = TestClient(create_app(state))
 
     monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1] * 5000)
 
@@ -2564,7 +2570,9 @@ def test_opencode_short_context_depth_policy_respects_explicit_depth(monkeypatch
 
 def test_opencode_short_context_depth_policy_keeps_depth3_above_threshold(monkeypatch):
     captured: dict[str, object] = {}
-    client = TestClient(create_app(_fake_state()))
+    state = _fake_state()
+    state.context_window = 16_384
+    client = TestClient(create_app(state))
 
     monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1] * 8000)
 
@@ -3130,6 +3138,178 @@ def test_invalid_generation_mode_returns_400():
         response.json()["error"]["message"] == "generation_mode must be 'mtp' or 'ar'"
     )
     assert response.json()["error"]["type"] == "invalid_request_error"
+
+
+@pytest.mark.parametrize(
+    ("path", "encoder_name", "request_json"),
+    [
+        (
+            "/v1/chat/completions",
+            "_encode_messages",
+            {
+                "messages": [{"role": "user", "content": "fit check"}],
+                "max_tokens": 1,
+            },
+        ),
+        (
+            "/v1/completions",
+            "_encode_prompt",
+            {"prompt": "fit check", "max_tokens": 1},
+        ),
+        (
+            "/v1/messages",
+            "_encode_messages",
+            {
+                "model": "mtplx-test-model",
+                "messages": [{"role": "user", "content": "fit check"}],
+                "max_tokens": 1,
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("prompt_tokens", [4, 5])
+def test_generation_endpoints_reject_prompts_without_decode_room_before_kv_admission(
+    monkeypatch,
+    path,
+    encoder_name,
+    request_json,
+    stream,
+    prompt_tokens,
+):
+    state = _fake_state()
+    state.context_window = 4
+    requested_kv: list[int] = []
+
+    def admit_kv_tokens(tokens: int):
+        requested_kv.append(tokens)
+        if tokens > state.context_window:
+            raise ExpertStreamingConfigurationError(
+                f"requested {tokens} KV tokens exceeds {state.context_window}"
+            )
+        return SimpleNamespace(release=lambda: None)
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        response_max, _sampler, _limits = openai._generation_params(
+            _state,
+            prompt_token_count=len(prompt_ids),
+            max_tokens=kwargs["max_tokens"],
+            temperature=kwargs["temperature"],
+            top_p=kwargs["top_p"],
+            top_k=kwargs["top_k"],
+        )
+        _state.runtime.admit_kv_tokens(len(prompt_ids) + response_max)
+        return _fake_generation("ok")
+
+    state.runtime.admit_kv_tokens = admit_kv_tokens
+    monkeypatch.setattr(
+        openai,
+        encoder_name,
+        lambda *_args, **_kwargs: list(range(prompt_tokens)),
+    )
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    client = TestClient(create_app(state), raise_server_exceptions=False)
+
+    response = client.post(
+        path,
+        headers={
+            "x-mtplx-cache-mode": "bypass",
+            "x-mtplx-allow-client-controls": "1",
+        },
+        json={**request_json, "stream": stream},
+    )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert str(prompt_tokens) in error["message"]
+    assert "context window" in error["message"]
+    assert requested_kv == []
+
+
+@pytest.mark.parametrize(
+    ("path", "encoder_name", "request_json"),
+    [
+        (
+            "/v1/chat/completions",
+            "_encode_messages",
+            {
+                "messages": [{"role": "user", "content": "fit check"}],
+                "max_tokens": 1,
+            },
+        ),
+        (
+            "/v1/completions",
+            "_encode_prompt",
+            {"prompt": "fit check", "max_tokens": 1},
+        ),
+        (
+            "/v1/messages",
+            "_encode_messages",
+            {
+                "model": "mtplx-test-model",
+                "messages": [{"role": "user", "content": "fit check"}],
+                "max_tokens": 1,
+            },
+        ),
+    ],
+)
+def test_generation_endpoints_admit_prompt_with_one_decode_token_remaining(
+    monkeypatch,
+    path,
+    encoder_name,
+    request_json,
+):
+    state = _fake_state()
+    state.context_window = 4
+    requested_kv: list[int] = []
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        response_max, _sampler, _limits = openai._generation_params(
+            _state,
+            prompt_token_count=len(prompt_ids),
+            max_tokens=kwargs["max_tokens"],
+            temperature=kwargs["temperature"],
+            top_p=kwargs["top_p"],
+            top_k=kwargs["top_k"],
+        )
+        requested_kv.append(len(prompt_ids) + response_max)
+        return _fake_generation("ok")
+
+    monkeypatch.setattr(
+        openai,
+        encoder_name,
+        lambda *_args, **_kwargs: [1, 2, 3],
+    )
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    client = TestClient(create_app(state))
+
+    response = client.post(
+        path,
+        headers={
+            "x-mtplx-cache-mode": "bypass",
+            "x-mtplx-allow-client-controls": "1",
+        },
+        json=request_json,
+    )
+
+    assert response.status_code == 200
+    assert requested_kv == [state.context_window]
+
+
+@pytest.mark.parametrize("prompt_tokens", [4, 5])
+def test_shared_prompt_validation_rejects_prompt_without_decode_room(prompt_tokens):
+    state = _fake_state()
+    state.context_window = 4
+
+    with pytest.raises(openai.HTTPException) as failed:
+        openai._validate_prompt_has_decode_room(
+            state,
+            prompt_token_count=prompt_tokens,
+        )
+
+    assert failed.value.status_code == 400
+    assert str(prompt_tokens) in str(failed.value.detail)
 
 
 def test_completion_request_controls_are_server_owned_without_override(monkeypatch):
@@ -8439,6 +8619,7 @@ def test_read_only_force_answer_stream_fallback_emits_without_marker(monkeypatch
 def test_read_only_force_answer_stream_postcommit_uses_client_history(monkeypatch):
     monkeypatch.setenv("MTPLX_READ_ONLY_INSPECTION_FORCE_ANSWER_AFTER_TOOLS", "2")
     state = _fake_streaming_session_state()
+    state.context_window = 32_768
     state.args.stream_interval = 1
     captured: dict[str, object] = {}
     client = TestClient(create_app(state))

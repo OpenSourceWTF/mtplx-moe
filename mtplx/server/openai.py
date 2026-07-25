@@ -15175,6 +15175,25 @@ def _uncapped_response_lease_tokens_from_env() -> int | None:
         return None
 
 
+def _validate_prompt_has_decode_room(
+    state: ServerState,
+    *,
+    prompt_token_count: int,
+) -> None:
+    served_context_window = int(state.context_window)
+    if int(prompt_token_count) < served_context_window:
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Prompt contains {int(prompt_token_count)} tokens, but the served "
+            f"context window is {served_context_window} tokens. The prompt must "
+            "be shorter than the context window to leave room for at least one "
+            "generated token."
+        ),
+    )
+
+
 def _generation_params(
     state: ServerState,
     *,
@@ -21370,6 +21389,10 @@ def create_app(state: ServerState) -> FastAPI:
             ]
             template_observability["aime_visible_working"] = True
             template_observability["aime_visible_working_prompt_close"] = True
+        _validate_prompt_has_decode_room(
+            state,
+            prompt_token_count=len(prompt_ids),
+        )
         request_depth, short_depth_policy = _opencode_short_context_depth_policy(
             request,
             headers=headers,
@@ -24992,6 +25015,10 @@ def create_app(state: ServerState) -> FastAPI:
         metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
         client_controls_allowed = _client_controls_allowed(headers, metadata)
         prompt_ids = _encode_prompt(state.runtime.tokenizer, request.prompt)
+        _validate_prompt_has_decode_room(
+            state,
+            prompt_token_count=len(prompt_ids),
+        )
         request_generation_mode = _request_generation_mode_for_generation(
             state,
             request,
