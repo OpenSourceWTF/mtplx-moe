@@ -25,9 +25,11 @@ Three paths live here, ordered by how certain they are to help:
     Same treatment for the per-head attention gate: a softplus and a broadcast
     multiply that currently cost four kernels per attention block.
 
-Nothing here changes weights or arithmetic order that MLX would not itself
-change; each path is expected to be bit-exact against stock, and the A/B bench
-verifies that rather than assuming it.
+Most of these change no weights and no arithmetic order that MLX would not
+itself change, and the A/B bench verifies bit-exactness rather than assuming
+it.  ``MTPLX_LAGUNA_KERNEL_ROUTER_GEMV`` is the deliberate exception: folding
+the routing matmul into the router kernel reassociates its fp32 dot, so it
+belongs to the inexact configuration set and says so at its own installer.
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ ENV_FUSED_GATE_UP = "MTPLX_LAGUNA_FUSED_GATE_UP"
 ENV_COMPILED_ROUTER = "MTPLX_LAGUNA_COMPILED_ROUTER"
 ENV_COMPILED_ATTN_GATE = "MTPLX_LAGUNA_COMPILED_ATTN_GATE"
 ENV_KERNEL_ROUTER = "MTPLX_LAGUNA_KERNEL_ROUTER"
+ENV_KERNEL_ROUTER_GEMV = "MTPLX_LAGUNA_KERNEL_ROUTER_GEMV"
 ENV_KERNEL_ATTN_GATE = "MTPLX_LAGUNA_KERNEL_ATTN_GATE"
 ENV_FUSED_RESIDUAL_NORM = "MTPLX_LAGUNA_FUSED_RESIDUAL_NORM"
 ENV_KERNEL_QK_ROPE = "MTPLX_LAGUNA_KERNEL_QK_ROPE"
@@ -587,14 +590,14 @@ def install_fused_residual_norm(model: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 def _kernel_moe_call(self, x: mx.array) -> mx.array:
     from . import laguna
-    from ..kernels.laguna_decode import fused_router_topk
+    from ..kernels.laguna_decode import (
+        fused_router_gemv_topk,
+        fused_router_topk,
+        is_router_gemv_eligible,
+    )
 
     batch, length, hidden = x.shape
     flattened = x.reshape(-1, hidden)
-
-    logits = self.gate(flattened).astype(mx.float32)
-    if self.softcap and self.softcap > 0.0:
-        logits = mx.tanh(logits / self.softcap) * self.softcap
 
     # The correction bias is a constant; the boxed float32 copy from install
     # time saves one cast dispatch per MoE layer per step.
@@ -604,6 +607,40 @@ def _kernel_moe_call(self, x: mx.array) -> mx.array:
         if bias_box is not None
         else self.e_score_correction_bias.astype(mx.float32)
     )
+    softcapped = bool(self.softcap and self.softcap > 0.0)
+
+    # `install_kernel_router_gemv` leaves a `_router_gemv_pack` holding this
+    # block's router weight; its presence is the switch, and the eligibility
+    # check refuses anything the kernel does not cover exactly (CPU runs, a
+    # quantized router, a row count past the gate).  When it engages, BOTH the
+    # `self.gate` matmul and the `.astype(mx.float32)` below disappear — which
+    # is the whole point, two dispatches per MoE layer per step.  A softcapped
+    # block is excluded here as well as at install: the kernel has no softcap
+    # and must never be handed a config that needs one.
+    pack = getattr(self, "_router_gemv_pack", None)
+    if (
+        pack is not None
+        and not softcapped
+        and is_router_gemv_eligible(flattened, pack.weight, bias_f32, self.top_k)
+    ):
+        indices, weights = fused_router_gemv_topk(
+            flattened,
+            pack.weight,
+            bias_f32,
+            self.top_k,
+            normalize=bool(self.norm_topk_prob),
+            scale=float(self.routed_scaling_factor),
+        )
+        output = self.switch_mlp(flattened, indices)
+        output = laguna.MOE_COMBINE_IMPL(
+            output, weights, self.shared_expert(flattened)
+        )
+        return output.reshape(batch, length, hidden)
+
+    logits = self.gate(flattened).astype(mx.float32)
+    if softcapped:
+        logits = mx.tanh(logits / self.softcap) * self.softcap
+
     indices, weights = fused_router_topk(
         logits,
         bias_f32,
@@ -634,6 +671,121 @@ def install_kernel_router(model: Any) -> dict[str, Any]:
         block._router_bias_f32 = _ArrayBox(bias_f32)
         count += 1
     return {"path": "kernel_router", "layers_affected": count}
+
+
+class _RouterGemvPack:
+    """The router's own weight, held where module traversal cannot see it.
+
+    Same trick as :class:`_ArrayBox`: a plain slotted object under an
+    underscore-prefixed attribute, so ``Module.valid_parameter_filter`` walks
+    straight past it and the weight is not counted twice in ``parameters()``.
+    It is a REFERENCE to the router's existing weight, not a copy — nothing is
+    duplicated and ``mlp.gate`` keeps working for any layer that falls back.
+    """
+
+    __slots__ = ("weight",)
+
+    def __init__(self, weight: mx.array) -> None:
+        self.weight = weight
+
+
+def install_kernel_router_gemv(model: Any) -> dict[str, Any]:
+    """Fold the routing matmul into the router kernel.  INEXACT by design.
+
+    Implies the kernel-router path and installs it if it is not already in
+    place: the select/normalize/scale epilogue and the boxed float32 correction
+    bias both live there, and ``_kernel_moe_call`` is the only forward that
+    knows how to read a ``_router_gemv_pack``.
+
+    Per layer this removes two dispatches from the serial spine — the
+    ``[rows, 3072] x [3072, 256]`` bfloat16 gemv and the bf16 -> f32 cast of its
+    output — 47 times per decode step.  What it costs is the GUARANTEE of
+    exactness: the in-kernel dot accumulates in a different order than MLX's
+    gemv, and a near-tie between two experts can therefore resolve the other
+    way.  That is why it is env-gated and belongs to the inexact configuration
+    set.  The measured divergence is much smaller than the classification
+    suggests — the kernel rounds its dot back to bfloat16 exactly as the stock
+    gemv's own output is rounded, and at the real shape nothing has moved yet
+    (see the note in ``kernels/laguna_decode.py``) — but "not observed" is not a
+    guarantee, and the set a path lives in is decided by the guarantee.
+
+    A layer whose router is quantized, carries a bias, or is not an ``nn.Linear``
+    at all cannot be packed and is left on the two-step path and counted; so is
+    a softcapped block, because the kernel has no softcap.  The shipped oQ4e
+    checkpoint has neither — its routers carry no quantization entry (BF16) and
+    ``moe_router_logit_softcapping`` is pinned to 0.0.
+    """
+
+    from ..kernels.laguna_decode import is_router_gemv_eligible
+    from .laguna import LagunaSparseMoeBlock
+
+    # The epilogue contract lives in the kernel-router forward, so this path
+    # requires it.  Installing it again would only rebuild bias boxes that are
+    # already correct, so it is skipped when it is already the forward.
+    router_report: dict[str, Any] | None = None
+    if LagunaSparseMoeBlock.__call__ is not _kernel_moe_call:
+        router_report = install_kernel_router(model)
+
+    inner = getattr(model, "model", model)
+    packed = 0
+    skipped = 0
+    reasons: list[str] = []
+    weight_dtypes: set[str] = set()
+    probe_weight: mx.array | None = None
+    for index, layer in enumerate(inner.layers):
+        block = layer.mlp
+        if not isinstance(block, LagunaSparseMoeBlock):
+            continue
+        gate = block.gate
+        reason = None
+        if not isinstance(gate, nn.Linear):
+            reason = f"router is {type(gate).__name__}, not an unquantized nn.Linear"
+        elif "scales" in gate:
+            reason = "router is quantized; the kernel reads dense weights only"
+        elif "bias" in gate:
+            reason = "router carries a bias; the kernel has no bias term"
+        elif block.softcap and block.softcap > 0.0:
+            reason = f"router softcap {float(block.softcap)} != 0; the kernel has none"
+        if reason is not None:
+            block._router_gemv_pack = None
+            skipped += 1
+            reasons.append(f"layer {index}: {reason}")
+            continue
+        weight = gate.weight
+        weight_dtypes.add(str(weight.dtype))
+        if probe_weight is None:
+            probe_weight = weight
+        block._router_gemv_pack = _RouterGemvPack(weight)
+        packed += 1
+
+    # A silent fallback has to be visible, not read as "the fusion bought
+    # nothing": probe the real router shape at one row and report whether the
+    # kernel would actually engage.
+    engaged = False
+    if probe_weight is not None:
+        dims = int(probe_weight.shape[1])
+        probe_x = mx.zeros((1, dims), dtype=probe_weight.dtype)
+        probe_bias = mx.zeros((int(probe_weight.shape[0]),), dtype=mx.float32)
+        first = next(
+            layer.mlp
+            for layer in inner.layers
+            if isinstance(layer.mlp, LagunaSparseMoeBlock)
+        )
+        engaged = bool(
+            is_router_gemv_eligible(probe_x, probe_weight, probe_bias, first.top_k)
+        )
+
+    report: dict[str, Any] = {
+        "path": "kernel_router_gemv",
+        "layers_packed": packed,
+        "layers_skipped": skipped,
+        "skip_reasons": reasons,
+        "weight_dtypes": sorted(weight_dtypes),
+        "kernel_engaged": engaged,
+    }
+    if router_report is not None:
+        report["installed_kernel_router"] = router_report
+    return report
 
 
 def install_kernel_attention_gate(model: Any) -> dict[str, Any]:
@@ -1143,6 +1295,10 @@ def install_from_env(model: Any) -> list[dict[str, Any]]:
     # The hand kernels win over the compiled variants where both are asked for.
     if _enabled(ENV_KERNEL_ROUTER):
         report.append(install_kernel_router(model))
+    # Implies the kernel router and installs it itself, so it composes whether
+    # or not ENV_KERNEL_ROUTER was also asked for.
+    if _enabled(ENV_KERNEL_ROUTER_GEMV):
+        report.append(install_kernel_router_gemv(model))
     if _enabled(ENV_KERNEL_ATTN_GATE):
         report.append(install_kernel_attention_gate(model))
     if _enabled(ENV_FUSED_RESIDUAL_NORM):

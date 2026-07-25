@@ -133,6 +133,13 @@ def _last_logits(model, prompts):
         (laguna_fused.install_kernel_attention_gate, False),
         (laguna_fused.install_kernel_qk_rope, True),
         (laguna_fused.install_kernel_moe_combine, True),
+        (laguna_fused.install_kernel_router, True),
+        # INEXACT on the GPU by construction (the folded gemv reassociates the
+        # dot), but on the CPU device eligibility is false and every layer takes
+        # the two-step stock path, so what this pins is that the FALLBACK is the
+        # shipped arithmetic untouched.  The GPU divergence is measured in
+        # bench/laguna/laguna_kernel_check.py::check_router_gemv instead.
+        (laguna_fused.install_kernel_router_gemv, True),
         (laguna_fused.install_cached_gather_indices, True),
         # UNQUANTIZED float32 here, which is the one shape the q/k/v/g fusion is
         # NOT bit-exact in, for two reasons that are both MLX kernel selection
@@ -244,6 +251,317 @@ def test_moe_combine_fallback_matches_stock_expression(toy_model):
     ).sum(axis=-2) + shared
     fused = fused_moe_combine(expert_out, weights, shared)
     assert float(mx.abs(stock - fused).astype(mx.float32).max()) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# the router gemv folded into the router kernel
+# ---------------------------------------------------------------------------
+MOE_LAYERS = len(LAYER_TYPES) - 1  # layer 0 is dense
+
+
+class _CountingGate:
+    """Stands in for ``mlp.gate`` and records whether anything called it.
+
+    Assigning a non-array object to a module attribute stores it as a plain
+    Python attribute (``Module.__setattr__`` pops the dict entry), so the spy is
+    invisible to ``parameters()`` and delegates everything it is asked for.
+    """
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.calls = 0
+
+    def __call__(self, x):
+        self.calls += 1
+        return self.inner(x)
+
+
+def _spy_on_every_packed_router(model) -> list[_CountingGate]:
+    spies: list[_CountingGate] = []
+    for layer in model.model.layers:
+        block = layer.mlp
+        if getattr(block, "_router_gemv_pack", None) is None:
+            continue
+        spy = _CountingGate(block.gate)
+        block.gate = spy
+        spies.append(spy)
+    return spies
+
+
+def _stock_router_via_mx_ops(x, gate_weight, correction_bias, top_k, normalize, scale):
+    """The two-step stock chain, written out in mx ops.
+
+    Used as the body of a FAKE kernel so the call contract can be proved on the
+    CPU: if ``_kernel_moe_call`` hands this the right arguments, the model has to
+    generate exactly what it generated before the install.
+    """
+
+    logits = (x @ gate_weight.swapaxes(-1, -2)).astype(mx.float32)
+    scores = mx.sigmoid(logits)
+    choice = scores + correction_bias
+    indices = mx.argpartition(-choice, kth=top_k - 1, axis=-1)[..., :top_k]
+    weights = mx.take_along_axis(scores, indices, axis=-1)
+    if normalize:
+        weights = weights / weights.sum(axis=-1, keepdims=True)
+    return indices, weights * scale
+
+
+def test_kernel_router_gemv_packs_the_routers_and_implies_the_kernel_router(toy_model):
+    """The install has to bring the epilogue path with it, and pack every router.
+
+    The pack holds a REFERENCE to the router's own weight — not a copy — and
+    lives under an underscore, so it stays out of ``parameters()`` and cannot
+    double-count 3 MB of BF16 per layer on the real checkpoint.
+    """
+
+    assert laguna.LagunaSparseMoeBlock.__call__ is not laguna_fused._kernel_moe_call
+
+    report = laguna_fused.install_kernel_router_gemv(toy_model)
+
+    assert report["path"] == "kernel_router_gemv"
+    assert report["layers_packed"] == MOE_LAYERS
+    assert report["layers_skipped"] == 0
+    # The kernel-router forward owns the select/normalize/scale epilogue, so the
+    # gemv install is required to put it in place.
+    assert laguna.LagunaSparseMoeBlock.__call__ is laguna_fused._kernel_moe_call
+    assert report["installed_kernel_router"]["path"] == "kernel_router"
+    # CPU device: the kernel cannot engage, and that has to be visible.
+    assert report["kernel_engaged"] is False
+
+    for layer in toy_model.model.layers:
+        block = layer.mlp
+        if not isinstance(block, laguna.LagunaSparseMoeBlock):
+            continue
+        pack = block._router_gemv_pack
+        assert pack.weight is block.gate.weight
+        assert "_router_gemv_pack" not in block  # out of the module tree
+        assert block._router_bias_f32 is not None  # the kernel-router box, too
+
+
+def test_kernel_router_gemv_skips_a_quantized_router(toy_model):
+    """A quantized router cannot be packed, so it is left on the stock path.
+
+    The shipped oQ4e checkpoint leaves ``mlp.gate`` unquantized (it carries no
+    entry in the per-path quantization map), but the installer refuses rather
+    than assumes, and a skipped layer still routes correctly.
+    """
+
+    nn.quantize(toy_model, group_size=32, bits=4)
+    mx.eval(toy_model.parameters())
+
+    reference_tokens = _greedy(toy_model, PROMPTS, 5)
+    reference_logits = _last_logits(toy_model, PROMPTS)
+
+    report = laguna_fused.install_kernel_router_gemv(toy_model)
+    assert report["layers_packed"] == 0
+    assert report["layers_skipped"] == MOE_LAYERS
+    assert report["kernel_engaged"] is False
+    assert all("quantized" in reason for reason in report["skip_reasons"])
+
+    for layer in toy_model.model.layers:
+        block = layer.mlp
+        if isinstance(block, laguna.LagunaSparseMoeBlock):
+            assert block._router_gemv_pack is None
+
+    assert _greedy(toy_model, PROMPTS, 5) == reference_tokens
+    delta = float(mx.abs(_last_logits(toy_model, PROMPTS) - reference_logits).max())
+    assert delta == 0.0, f"a skipped router was perturbed: {delta:.3e}"
+
+
+def test_kernel_router_gemv_call_contract_holds_end_to_end(toy_model, monkeypatch):
+    """The arguments the fused entry point is handed must BE the router.
+
+    Eligibility is forced true and the kernel is replaced by the stock chain
+    written in mx ops.  If ``_kernel_moe_call`` passes the right hidden states,
+    the right weight (in ``nn.Linear``'s own ``[experts, dims]`` layout, no
+    transpose), the right float32 bias and the right normalize/scale, then the
+    model generates exactly what it did before — on the CPU, with no GPU.  It
+    also has to STOP calling ``mlp.gate``, which is half the point of the fold.
+    """
+
+    from mtplx.kernels import laguna_decode as kernels
+
+    reference_tokens = _greedy(toy_model, PROMPTS, 5)
+    reference_logits = _last_logits(toy_model, PROMPTS)
+
+    laguna_fused.install_kernel_router_gemv(toy_model)
+    spies = _spy_on_every_packed_router(toy_model)
+    assert len(spies) == MOE_LAYERS
+
+    calls: list[dict] = []
+
+    def fake_gemv(x, gate_weight, correction_bias, top_k, *, normalize, scale):
+        calls.append(
+            {
+                "rows": int(x.shape[0]),
+                "dims": int(x.shape[1]),
+                "weight_shape": tuple(int(dim) for dim in gate_weight.shape),
+                "bias_dtype": correction_bias.dtype,
+                "top_k": top_k,
+                "normalize": normalize,
+                "scale": scale,
+            }
+        )
+        return _stock_router_via_mx_ops(
+            x, gate_weight, correction_bias, top_k, normalize, scale
+        )
+
+    monkeypatch.setattr(kernels, "is_router_gemv_eligible", lambda *a, **k: True)
+    monkeypatch.setattr(kernels, "fused_router_gemv_topk", fake_gemv)
+
+    assert _greedy(toy_model, PROMPTS, 5) == reference_tokens
+    delta = float(mx.abs(_last_logits(toy_model, PROMPTS) - reference_logits).max())
+    assert delta == 0.0, f"the fused call contract changed the model: {delta:.3e}"
+
+    assert calls, "the fused router-gemv entry point was never reached"
+    assert all(spy.calls == 0 for spy in spies), "the fused path still called mlp.gate"
+
+    args = toy_model.args
+    for call in calls:
+        assert call["dims"] == int(args.hidden_size)
+        assert call["weight_shape"] == (
+            int(args.num_experts),
+            int(args.hidden_size),
+        )
+        assert call["bias_dtype"] == mx.float32
+        assert call["top_k"] == int(args.num_experts_per_tok)
+        assert call["normalize"] is bool(args.norm_topk_prob)
+        assert call["scale"] == pytest.approx(
+            float(args.moe_routed_scaling_factor)
+        )
+
+
+def test_kernel_router_gemv_leaves_mlp_gate_running_when_ineligible(toy_model):
+    """The fallback is the whole safety net, so pin that it really runs.
+
+    Same install, real eligibility (false on the CPU device): every MoE layer
+    has to go back through ``mlp.gate``.
+    """
+
+    laguna_fused.install_kernel_router_gemv(toy_model)
+    spies = _spy_on_every_packed_router(toy_model)
+
+    _greedy(toy_model, PROMPTS, 2)
+
+    assert spies and all(spy.calls > 0 for spy in spies)
+
+
+def test_kernel_router_gemv_is_idempotent(toy_model):
+    """Installing twice must repack, not double-install or double-count."""
+
+    first = laguna_fused.install_kernel_router_gemv(toy_model)
+    second = laguna_fused.install_kernel_router_gemv(toy_model)
+
+    assert first["layers_packed"] == second["layers_packed"] == MOE_LAYERS
+    assert second["layers_skipped"] == 0
+    # The kernel-router forward was already in place the second time around.
+    assert "installed_kernel_router" in first
+    assert "installed_kernel_router" not in second
+    assert laguna.LagunaSparseMoeBlock.__call__ is laguna_fused._kernel_moe_call
+
+
+def test_install_from_env_wires_the_router_gemv(toy_model):
+    """The env entry point has to reach the installer and stay token-equal."""
+
+    import os
+
+    reference_tokens = _greedy(toy_model, PROMPTS, 5)
+
+    os.environ[laguna_fused.ENV_KERNEL_ROUTER_GEMV] = "1"
+    try:
+        report = laguna_fused.install_from_env(toy_model)
+    finally:
+        del os.environ[laguna_fused.ENV_KERNEL_ROUTER_GEMV]
+
+    assert [entry["path"] for entry in report] == ["kernel_router_gemv"]
+    assert laguna.LagunaSparseMoeBlock.__call__ is laguna_fused._kernel_moe_call
+    assert _greedy(toy_model, PROMPTS, 5) == reference_tokens
+
+
+def test_router_gemv_eligibility_refuses_what_the_kernel_cannot_do():
+    """The eligibility gate is the correctness branch; pin its shape rules.
+
+    Written so it says the same thing on a CPU-only box and on this one: every
+    malformed shape has to be refused whether or not the well-formed one would
+    be accepted, and on a Metal box the well-formed one has to be accepted too,
+    or the whole path is silently dead.
+    """
+
+    from mtplx.kernels import laguna_decode as kernels
+
+    assert kernels._router_selection_shape_ok(256, 10) is True
+    assert kernels._router_selection_shape_ok(256, 0) is False
+    assert kernels._router_selection_shape_ok(256, 33) is False  # past the scratch
+    assert kernels._router_selection_shape_ok(16, 4) is False  # below the floor
+    assert kernels._router_selection_shape_ok(48, 4) is False  # not a 32-multiple
+    assert kernels.MAX_ROUTER_GEMV_DIMS % 4 == 0
+
+    weight = mx.zeros((256, 3072), dtype=mx.bfloat16)
+    bias = mx.zeros((256,), dtype=mx.float32)
+    x = mx.zeros((1, 3072), dtype=mx.bfloat16)
+
+    if kernels._on_metal_device():
+        assert kernels.is_router_gemv_eligible(x, weight, bias, 10) is True
+
+    refused = {
+        "3-D hidden states": (x[None], weight, bias, 10),
+        "float32 hidden states": (x.astype(mx.float32), weight, bias, 10),
+        "float32 weight": (x, weight.astype(mx.float32), bias, 10),
+        "bfloat16 bias": (x, weight, bias.astype(mx.bfloat16), 10),
+        "width mismatch": (mx.zeros((1, 3068), dtype=mx.bfloat16), weight, bias, 10),
+        "bias/expert mismatch": (
+            x,
+            weight,
+            mx.zeros((128,), dtype=mx.float32),
+            10,
+        ),
+        "width not a multiple of four": (
+            mx.zeros((1, 3070), dtype=mx.bfloat16),
+            mx.zeros((256, 3070), dtype=mx.bfloat16),
+            bias,
+            10,
+        ),
+        "width past the threadgroup budget": (
+            mx.zeros((1, kernels.MAX_ROUTER_GEMV_DIMS + 4), dtype=mx.bfloat16),
+            mx.zeros((256, kernels.MAX_ROUTER_GEMV_DIMS + 4), dtype=mx.bfloat16),
+            bias,
+            10,
+        ),
+        "past the row gate": (
+            mx.zeros((64, 3072), dtype=mx.bfloat16),
+            weight,
+            bias,
+            10,
+        ),
+        "top_k past the scratch": (x, weight, bias, 33),
+    }
+    for label, arguments in refused.items():
+        assert kernels.is_router_gemv_eligible(*arguments) is False, label
+
+
+def test_router_gemv_fallback_matches_the_two_step_stock_chain():
+    """The CPU fallback inside fused_router_gemv_topk IS the stock arithmetic."""
+
+    from mtplx.kernels.laguna_decode import fused_router_gemv_topk
+
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        mx.random.seed(19)
+        x = mx.random.normal((3, 64)).astype(mx.float32)
+        weight = mx.random.normal((16, 64)).astype(mx.float32)
+        bias = (mx.random.normal((16,)) * 0.05).astype(mx.float32)
+        mx.eval(x, weight, bias)
+
+        want_idx, want_w = _stock_router_via_mx_ops(x, weight, bias, 4, True, 2.5)
+        got_idx, got_w = fused_router_gemv_topk(
+            x, weight, bias, 4, normalize=True, scale=2.5
+        )
+        mx.eval(want_idx, want_w, got_idx, got_w)
+        assert got_idx.tolist() == want_idx.tolist()
+        assert float(mx.abs(want_w - got_w).max()) == 0.0
+    finally:
+        mx.set_default_device(previous)
 
 
 def test_fused_gate_up_is_bit_exact_when_quantized(toy_model):

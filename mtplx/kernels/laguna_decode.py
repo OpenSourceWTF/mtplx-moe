@@ -28,6 +28,12 @@ leaves the order of the selected indices unspecified, and the normalizing sum
 therefore accumulates in an order this kernel has no way to reproduce.  Ties
 are broken toward the lower expert index here.  Callers get the divergence
 measured, not assumed.
+
+``fused_router_gemv_topk`` is the one exception to "leave every matmul alone",
+and it is opt-in for exactly that reason: the router's own gemv is small enough
+that MLX spends more on launching it than on running it, so it folds into the
+router kernel — at the price of a different fp32 reduction order and therefore
+an INEXACT-config path.  See its own note below.
 """
 
 from __future__ import annotations
@@ -95,6 +101,17 @@ def _on_metal_device() -> bool:
         return False
 
 
+def _router_selection_shape_ok(experts: int, top_k: int) -> bool:
+    """The expert/top-k bounds the SELECTION epilogue is compiled for.
+
+    One thread per expert, the selection scratch sized at compile time, and the
+    tree reduction stepping ``experts / 2`` downward.  Shared by both router
+    entry points so the two can never disagree about what they cover.
+    """
+
+    return 0 < top_k <= 32 and 32 <= experts <= 1024 and (experts % 32) == 0
+
+
 def is_router_eligible(logits: mx.array, bias: mx.array, top_k: int) -> bool:
     if not _on_metal_device():
         return False
@@ -107,31 +124,25 @@ def is_router_eligible(logits: mx.array, bias: mx.array, top_k: int) -> bool:
         return False
     if int(logits.shape[0]) > _router_max_rows():
         return False
-    # One thread per expert, and the selection scratch is sized at compile time.
-    return 0 < top_k <= 32 and 32 <= experts <= 1024 and (experts % 32) == 0
+    return _router_selection_shape_ok(experts, top_k)
 
 
-@lru_cache(maxsize=None)
-def _router_kernel(experts: int, top_k: int):
-    header = _SOFTPLUS + f"""
-        using namespace metal;
-        constant constexpr int NUM_EXPERTS = {experts};
-        constant constexpr int TOP_K = {top_k};
-    """
-
-    source = """
-        uint row = threadgroup_position_in_grid.x;
-        uint lid = thread_position_in_threadgroup.x;
-
+# The selection scratch and the select/normalize/scale epilogue, shared by both
+# router entry points rather than copied into each.  Sharing the SOURCE is what
+# makes "the gemv variant runs the same selection" a fact instead of a claim:
+# there is one tie-break, one accumulation order for the normalizing sum, and
+# one output contract, and neither kernel can drift from the other.
+_ROUTER_SELECT_DECLS = """
         threadgroup float tg_score[NUM_EXPERTS];
         threadgroup float tg_choice[NUM_EXPERTS];
         threadgroup float red_val[NUM_EXPERTS];
         threadgroup uint  red_idx[NUM_EXPERTS];
         threadgroup uint  sel_idx[TOP_K];
         threadgroup float sel_score[TOP_K];
+"""
 
-        float logit = logits[row * NUM_EXPERTS + lid];
-        float score = 1.0f / (1.0f + metal::exp(-logit));
+# Entered with `score` (the sigmoid of this thread's logit) already in hand.
+_ROUTER_SELECT_EPILOGUE = """
         tg_score[lid] = score;
         tg_choice[lid] = score + correction_bias[lid];
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -182,7 +193,29 @@ def _router_kernel(experts: int, top_k: int):
                               : (sel_score[k] * scale);
             }
         }
+"""
+
+
+@lru_cache(maxsize=None)
+def _router_kernel(experts: int, top_k: int):
+    header = _SOFTPLUS + f"""
+        using namespace metal;
+        constant constexpr int NUM_EXPERTS = {experts};
+        constant constexpr int TOP_K = {top_k};
     """
+
+    source = (
+        """
+        uint row = threadgroup_position_in_grid.x;
+        uint lid = thread_position_in_threadgroup.x;
+"""
+        + _ROUTER_SELECT_DECLS
+        + """
+        float logit = logits[row * NUM_EXPERTS + lid];
+        float score = 1.0f / (1.0f + metal::exp(-logit));
+"""
+        + _ROUTER_SELECT_EPILOGUE
+    )
 
     return mx.fast.metal_kernel(
         name=f"mtplx_laguna_router_e{experts}_k{top_k}",
@@ -220,6 +253,201 @@ def fused_router_topk(
     kernel = _router_kernel(experts, top_k)
     indices, weights = kernel(
         inputs=[logits, correction_bias, float(scale), bool(normalize)],
+        grid=(experts * rows, 1, 1),
+        threadgroup=(experts, 1, 1),
+        output_shapes=[(rows, top_k), (rows, top_k)],
+        output_dtypes=[mx.uint32, mx.float32],
+    )
+    return indices, weights
+
+
+# ---------------------------------------------------------------------------
+# router gemv folded INTO the router kernel
+# ---------------------------------------------------------------------------
+#
+# The kernel above leaves the routing matmul on the stock path, which is the
+# right call for anything MLX can do well.  The router's gemv is not that: at
+# [rows, 3072] x [3072, 256] in unquantized bfloat16 it reads 1.5 MB and does
+# 786k MACs, and per-command ICB attribution puts it at 48.5 us against a
+# ~17-20 us floor for a kernel that does nothing at all.  Most of that number is
+# launch and occupancy, not arithmetic, and it is paid 47 times per decode step
+# on a TRUE serial link — plus a second dispatch for the bf16 -> f32 cast of the
+# logits, 47 more.  Folding the matmul into the router removes both.
+#
+# EXACTNESS.  This variant is NOT bit-exact against the stock chain and is not
+# meant to be.  The dot below is fp32 and strictly sequential in ascending k
+# (unrolled by four, which is why the input width must be a multiple of four);
+# that is deterministic run to run, but it is a different ORDER from MLX's, and
+# deliberately so — chasing gemv's blocking would give up the fusion.  Callers
+# who need bit-exactness use `fused_router_topk` and leave the matmul where it
+# is.
+#
+# What keeps the divergence to ulp scale rather than something much bigger is
+# the rounding.  The stock chain is `nn.Linear` on a bfloat16 input and a
+# bfloat16 weight, so its logits come out BFLOAT16 and only then widen to float32
+# — that widening cast is the second dispatch this fold removes.  Carrying a
+# full float32 dot straight into the sigmoid would therefore be a different
+# NUMBER, not a different last bit: bfloat16 resolves to about 4e-3 relative, and
+# through the sigmoid's <= 1/4 slope that is a ~1e-3 shift in every routing
+# score, which would move far more selections than reassociation ever could.  So
+# the dot is rounded to T before the sigmoid, reproducing the precision the
+# stock gemv would have produced.  What is left is the fp32 ordering difference
+# (~1e-6 relative over 3072 terms) surviving only where it straddles a bfloat16
+# rounding boundary — rare, and one ulp when it happens.
+#
+# Rare turned out to mean "not once yet".  At the real shape over rows 1/2/4
+# (`check_router_gemv`) every logit rounded to the same bfloat16 the stock gemv
+# produced: zero selection changes, and a per-expert weight delta of 7e-9 —
+# below the 1e-6 the SELECTION-only kernel already diverges by, since that one's
+# normalizing sum reassociates too.  So the fold is measured to be no less exact
+# than the kernel router it replaces.  It is still classified inexact, because
+# "no straddle observed" is not "no straddle possible" and one bfloat16 ulp on a
+# near-tie logit can reorder two experts; the classification is a statement
+# about the guarantee, not about the observed delta.
+#
+# MEMORY PATTERN.  One threadgroup per row, NUM_EXPERTS threads.  The row of x
+# is staged into threadgroup memory first — a coalesced strided load across all
+# NUM_EXPERTS threads, converted to float once — and then thread e streams its
+# own contiguous row of the weight, `gate_weight[e * DIMS ...]`, multiplying
+# against the shared staged copy.  So x is read from global memory ONCE per row
+# instead of once per expert, and every thread's weight reads are sequential
+# within the thread.  What this layout does NOT get is coalescing ACROSS
+# threads: at a given k the 256 threads are DIMS*sizeof(T) bytes apart, so the
+# weight stream is 256 concurrent sequential readers rather than one wide one.
+# That is the deliberate simplicity, and it is also the risk — a single
+# threadgroup pulls 1.5 MB through one GPU core, so whether this wins is a
+# bandwidth question that only the GPU can answer.  `bench/laguna/
+# laguna_kernel_check.py::check_router_gemv` times it against the stock chain.
+
+# Threadgroup memory for the staged row: DIMS floats.  4096 keeps that at 16 KB,
+# which leaves room for the 4 KB of selection scratch inside the 32 KB budget.
+MAX_ROUTER_GEMV_DIMS = 4096
+
+
+def is_router_gemv_eligible(
+    x: mx.array, gate_weight: mx.array, bias: mx.array, top_k: int
+) -> bool:
+    """Whether the fused-gemv router covers this exact shape.
+
+    Deliberately narrow: bfloat16 only (what the oQ4e routers are — ``mlp.gate``
+    carries no quantization entry), 2-D only, and the same row gate and
+    expert/top-k bounds the selection-only kernel uses.
+    """
+
+    if not _on_metal_device():
+        return False
+    if x.ndim != 2 or gate_weight.ndim != 2 or bias.ndim != 1:
+        return False
+    if x.dtype != mx.bfloat16 or gate_weight.dtype != mx.bfloat16:
+        return False
+    if bias.dtype != mx.float32:
+        return False
+    rows, dims = int(x.shape[0]), int(x.shape[1])
+    experts = int(gate_weight.shape[0])
+    if int(gate_weight.shape[1]) != dims:
+        return False
+    if experts != int(bias.shape[0]):
+        return False
+    # Unrolled by four, and the staged row has to fit in threadgroup memory.
+    if dims <= 0 or (dims % 4) != 0 or dims > MAX_ROUTER_GEMV_DIMS:
+        return False
+    if rows <= 0 or rows > _router_max_rows():
+        return False
+    return _router_selection_shape_ok(experts, top_k)
+
+
+@lru_cache(maxsize=None)
+def _router_gemv_kernel(experts: int, top_k: int, dims: int):
+    header = f"""
+        using namespace metal;
+        constant constexpr int NUM_EXPERTS = {experts};
+        constant constexpr int TOP_K = {top_k};
+        constant constexpr int DIMS = {dims};
+    """
+
+    source = (
+        """
+        uint row = threadgroup_position_in_grid.x;
+        uint lid = thread_position_in_threadgroup.x;
+
+        threadgroup float tg_x[DIMS];
+"""
+        + _ROUTER_SELECT_DECLS
+        + """
+        // Stage this row of x once, coalesced across the whole threadgroup, and
+        // convert to float here so the dot loop below never re-converts it.
+        const device T* x_row = x + (size_t)row * (size_t)DIMS;
+        for (uint i = lid; i < uint(DIMS); i += uint(NUM_EXPERTS)) {
+            tg_x[i] = static_cast<float>(x_row[i]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Thread e owns expert e's whole row.  Sequential ascending k in float,
+        // unrolled by four: one fixed order, not MLX's.
+        const device T* w_row = gate_weight + (size_t)lid * (size_t)DIMS;
+        float acc = 0.0f;
+        for (uint k = 0; k < uint(DIMS); k += 4u) {
+            acc += static_cast<float>(w_row[k]) * tg_x[k];
+            acc += static_cast<float>(w_row[k + 1u]) * tg_x[k + 1u];
+            acc += static_cast<float>(w_row[k + 2u]) * tg_x[k + 2u];
+            acc += static_cast<float>(w_row[k + 3u]) * tg_x[k + 3u];
+        }
+        // The stock gemv writes T and the stock chain then widens it to float,
+        // so round HERE — carrying the raw float dot forward would be a
+        // different number, not a different last bit.  See the note above.
+        float logit = static_cast<float>(static_cast<T>(acc));
+        float score = 1.0f / (1.0f + metal::exp(-logit));
+"""
+        + _ROUTER_SELECT_EPILOGUE
+    )
+
+    return mx.fast.metal_kernel(
+        name=f"mtplx_laguna_router_gemv_e{experts}_k{top_k}_d{dims}",
+        input_names=["x", "gate_weight", "correction_bias", "scale", "normalize"],
+        output_names=["indices", "weights"],
+        header=header,
+        source=source,
+    )
+
+
+def fused_router_gemv_topk(
+    x: mx.array,
+    gate_weight: mx.array,
+    correction_bias: mx.array,
+    top_k: int,
+    *,
+    normalize: bool,
+    scale: float,
+) -> tuple[mx.array, mx.array]:
+    """Routing matmul AND the routing decision, in one dispatch.
+
+    ``x`` is the flattened hidden state ``[rows, dims]`` and ``gate_weight`` is
+    the router's ``nn.Linear`` weight ``[experts, dims]`` — the layout mlx-lm
+    stores, so no transpose happens anywhere.  There is no softcap here: the
+    shipped checkpoint pins ``moe_router_logit_softcapping`` to 0.0 (see
+    ``models/laguna_config.py``), and the caller keeps a softcapped block on the
+    stock path rather than this kernel growing a branch it can never take.
+
+    Returns the same ``(indices, weights)`` contract as
+    :func:`fused_router_topk`: uint32 ``[rows, top_k]`` and float32
+    ``[rows, top_k]``.  Falls back to the two-step stock chain on any shape the
+    kernel does not cover, so callers can switch it on without owning a
+    correctness branch — but see the exactness note above: where the kernel DOES
+    run, it is an inexact-config path.
+    """
+
+    if not is_router_gemv_eligible(x, gate_weight, correction_bias, top_k):
+        logits = (x @ gate_weight.swapaxes(-1, -2)).astype(mx.float32)
+        return fused_router_topk(
+            logits, correction_bias, top_k, normalize=normalize, scale=scale
+        )
+
+    rows, dims = int(x.shape[0]), int(x.shape[1])
+    experts = int(gate_weight.shape[0])
+    kernel = _router_gemv_kernel(experts, top_k, dims)
+    indices, weights = kernel(
+        inputs=[x, gate_weight, correction_bias, float(scale), bool(normalize)],
+        template=[("T", x.dtype)],
         grid=(experts * rows, 1, 1),
         threadgroup=(experts, 1, 1),
         output_shapes=[(rows, top_k), (rows, top_k)],
