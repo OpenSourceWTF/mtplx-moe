@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import time
 from types import ModuleType, SimpleNamespace
 from pathlib import Path
 
+import pytest
+
 from mtplx.hf_loader import (
+    RepoFile,
+    _download_repo_file,
     cached_model_is_complete,
     cached_model_path,
     hf_token_for_download,
@@ -72,6 +77,8 @@ def _install_fake_hub(
     files: dict[str, bytes | list[bytes | tuple[bytes, float]]],
     *,
     captured: dict[str, object] | None = None,
+    resolved_revision: str = "c" * 40,
+    lfs_overrides: dict[str, str] | None = None,
 ) -> _FakeHubSession:
     captured = captured if captured is not None else {}
     session = _FakeHubSession(files)
@@ -81,16 +88,42 @@ def _install_fake_hub(
     class FakeHfApi:
         def model_info(self, **kwargs):
             captured["model_info_token"] = kwargs.get("token")
+            captured["model_info_calls"] = (
+                int(captured.get("model_info_calls", 0)) + 1
+            )
             return SimpleNamespace(
+                sha=resolved_revision,
                 siblings=[
-                    SimpleNamespace(rfilename=name, size=sum(len(item[0] if isinstance(item, tuple) else item) for item in payload) if isinstance(payload, list) else len(payload))
+                    SimpleNamespace(
+                        rfilename=name,
+                        size=sum(
+                            len(item[0] if isinstance(item, tuple) else item)
+                            for item in payload
+                        )
+                        if isinstance(payload, list)
+                        else len(payload),
+                        lfs=SimpleNamespace(
+                            sha256=(lfs_overrides or {}).get(
+                                name,
+                                hashlib.sha256(
+                                    b"".join(
+                                        item[0] if isinstance(item, tuple) else item
+                                        for item in payload
+                                    )
+                                    if isinstance(payload, list)
+                                    else payload
+                                ).hexdigest(),
+                            )
+                        ),
+                    )
                     for name, payload in files.items()
-                ]
+                ],
             )
 
     def fake_hf_hub_url(*, repo_id, filename, revision=None):
         captured["repo_id"] = repo_id
         captured["revision"] = revision
+        captured.setdefault("download_revisions", []).append(revision)
         return f"fake://{filename}"
 
     hub.HfApi = FakeHfApi
@@ -114,6 +147,251 @@ def _install_fake_hub(
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
     monkeypatch.setitem(sys.modules, "huggingface_hub.utils", utils)
     return session
+
+
+class _RangeSession:
+    def __init__(self, payload: bytes, *, status_code: int) -> None:
+        self.payload = payload
+        self.status_code = status_code
+        self.requests: list[dict[str, object]] = []
+
+    def get(self, url: str, **kwargs):
+        self.requests.append({"url": url, **kwargs})
+        return _FakeHubResponse([self.payload], status_code=self.status_code)
+
+
+def _download_one(
+    tmp_path: Path,
+    repo_file: RepoFile,
+    *,
+    payload: bytes,
+    status_code: int,
+):
+    session = _RangeSession(payload, status_code=status_code)
+    seen_revisions: list[str | None] = []
+    result = _download_repo_file(
+        repo_file,
+        repo_id="owner/model",
+        revision="d" * 40,
+        destination=tmp_path,
+        session=session,
+        hf_hub_url=lambda **kwargs: (
+            seen_revisions.append(kwargs.get("revision")) or "fake://file"
+        ),
+        build_hf_headers=lambda **_kwargs: {},
+        hf_raise_for_status=lambda response: response.raise_for_status(),
+        callback=None,
+        total_bytes=repo_file.size_bytes,
+        started_at=time.monotonic(),
+        progress_interval_s=0,
+        last_emit_at=time.monotonic(),
+        last_emit_size=0,
+    )
+    return result, session, seen_revisions
+
+
+def test_download_repo_file_hashes_resumed_prefix_and_appends_206(
+    tmp_path: Path,
+) -> None:
+    complete = b"abcdef"
+    partial = tmp_path / "experts.bin.incomplete"
+    partial.write_bytes(complete[:3])
+    repo_file = RepoFile(
+        path="experts.bin",
+        size_bytes=len(complete),
+        sha256=hashlib.sha256(complete).hexdigest(),
+    )
+
+    (_emit_at, _emit_size, digest), session, revisions = _download_one(
+        tmp_path,
+        repo_file,
+        payload=complete[3:],
+        status_code=206,
+    )
+
+    assert (tmp_path / "experts.bin").read_bytes() == complete
+    assert session.requests[0]["headers"]["Range"] == "bytes=3-"
+    assert digest.sha256 == repo_file.sha256
+    assert revisions == ["d" * 40]
+
+
+def test_download_repo_file_resets_prefix_and_hasher_on_range_200(
+    tmp_path: Path,
+) -> None:
+    complete = b"abcdef"
+    (tmp_path / "experts.bin.incomplete").write_bytes(complete[:3])
+    repo_file = RepoFile(
+        path="experts.bin",
+        size_bytes=len(complete),
+        sha256=hashlib.sha256(complete).hexdigest(),
+    )
+
+    (_emit_at, _emit_size, digest), _session, _revisions = _download_one(
+        tmp_path,
+        repo_file,
+        payload=complete,
+        status_code=200,
+    )
+
+    assert (tmp_path / "experts.bin").read_bytes() == complete
+    assert digest.sha256 == repo_file.sha256
+
+
+def test_download_repo_file_installs_exact_partial_on_range_416(
+    tmp_path: Path,
+) -> None:
+    complete = b"abcdef"
+    (tmp_path / "experts.bin.incomplete").write_bytes(complete)
+    repo_file = RepoFile(
+        path="experts.bin",
+        size_bytes=len(complete),
+        sha256=hashlib.sha256(complete).hexdigest(),
+    )
+
+    (_emit_at, _emit_size, digest), _session, _revisions = _download_one(
+        tmp_path,
+        repo_file,
+        payload=b"",
+        status_code=416,
+    )
+
+    assert (tmp_path / "experts.bin").read_bytes() == complete
+    assert digest.sha256 == repo_file.sha256
+
+
+def test_download_repo_file_rejects_lfs_digest_mismatch_before_install(
+    tmp_path: Path,
+) -> None:
+    complete = b"abcdef"
+    repo_file = RepoFile(
+        path="experts.bin",
+        size_bytes=len(complete),
+        sha256="0" * 64,
+    )
+
+    with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
+        _download_one(
+            tmp_path,
+            repo_file,
+            payload=complete,
+            status_code=200,
+        )
+
+    assert not (tmp_path / "experts.bin").exists()
+
+
+def test_download_repo_file_rejects_intermediate_symlink_escape(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "nested").symlink_to(outside, target_is_directory=True)
+    repo_file = RepoFile(path="nested/experts.bin", size_bytes=1, sha256=None)
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        _download_one(
+            tmp_path,
+            repo_file,
+            payload=b"x",
+            status_code=200,
+        )
+
+    assert not (outside / "experts.bin").exists()
+
+
+def test_pull_model_lfs_mismatch_never_emits_complete(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    files = {
+        "config.json": b"{}\n",
+        "model.safetensors": b"weights",
+    }
+    _install_fake_hub(
+        monkeypatch,
+        files,
+        lfs_overrides={"model.safetensors": "0" * 64},
+    )
+    events: list[dict] = []
+
+    with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
+        pull_model(
+            "owner/model",
+            cache_dir=tmp_path,
+            progress_callback=events.append,
+            progress_interval_s=0,
+        )
+
+    assert "complete" not in [event["event"] for event in events]
+
+
+def test_pull_model_requires_model_info_immutable_sha(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _install_fake_hub(
+        monkeypatch,
+        {
+            "config.json": b"{}\n",
+            "model.safetensors": b"weights",
+        },
+        resolved_revision="main",
+    )
+    events: list[dict] = []
+
+    with pytest.raises(RuntimeError, match="immutable commit SHA"):
+        pull_model(
+            "owner/model",
+            cache_dir=tmp_path,
+            progress_callback=events.append,
+        )
+
+    assert events == []
+
+
+def test_pull_model_plain_no_callback_keeps_snapshot_downloader_but_pins_sha(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    resolved_revision = "e" * 40
+    captured: dict[str, object] = {}
+    hub = ModuleType("huggingface_hub")
+    hub.__path__ = []
+
+    class FakeHfApi:
+        def model_info(self, **_kwargs):
+            return SimpleNamespace(
+                sha=resolved_revision,
+                siblings=[
+                    SimpleNamespace(
+                        rfilename="config.json",
+                        size=3,
+                        lfs=None,
+                    ),
+                    SimpleNamespace(
+                        rfilename="model.safetensors",
+                        size=7,
+                        lfs=None,
+                    ),
+                ],
+            )
+
+    def snapshot_download(**kwargs):
+        captured.update(kwargs)
+        destination = Path(kwargs["local_dir"])
+        (destination / "config.json").write_text("{}\n", encoding="utf-8")
+        (destination / "model.safetensors").write_bytes(b"weights")
+        return str(destination)
+
+    hub.HfApi = FakeHfApi
+    hub.snapshot_download = snapshot_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+
+    result = pull_model("owner/plain", cache_dir=tmp_path)
+
+    assert captured["revision"] == resolved_revision
+    assert result["resolved_revision"] == resolved_revision
+    assert result["expert_admission"] is None
 
 
 def test_repo_id_from_model_ref_accepts_hf_url_and_repo_id():
@@ -386,8 +664,11 @@ def test_pull_model_downloads_public_models_anonymously_by_default(
     )
 
     assert result["path"] == str(tmp_path / "mtplx--example")
+    assert result["resolved_revision"] == "c" * 40
     assert captured["model_info_token"] is False
+    assert captured["model_info_calls"] == 1
     assert captured["headers_token"] is False
+    assert set(captured["download_revisions"]) == {"c" * 40}
     assert events[0]["total_bytes"] == 81
 
 

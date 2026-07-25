@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-import sys
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -31,6 +29,7 @@ from mtplx.hf_loader import (
 )
 
 from test_expert_manifest import _make_authoritative_checkpoint
+from test_hf_loader import _install_fake_hub
 
 
 def _install_authoritative_model(
@@ -51,6 +50,14 @@ def _install_authoritative_cache(
     spec, manifest = _install_authoritative_model(root, monkeypatch)
     (root / "config.json").write_text("{}\n", encoding="utf-8")
     return spec, manifest
+
+
+def _remote_files(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
 
 
 @pytest.fixture
@@ -373,30 +380,200 @@ def test_pull_model_repairs_invalid_streaming_cache_instead_of_reusing_it(
     assert manifest.sidecar is not None
     bank = root / manifest.sidecar.file
     expected = bank.read_bytes()
+    remote_files = _remote_files(root)
     if mutation == "missing":
         bank.unlink()
     else:
         bank.write_bytes(expected[:-1])
-    snapshot_calls = []
-
-    def fake_snapshot_download(**kwargs):
-        snapshot_calls.append(kwargs)
-        bank.write_bytes(expected)
-        return kwargs["local_dir"]
-
-    monkeypatch.setitem(
-        sys.modules,
-        "huggingface_hub",
-        SimpleNamespace(snapshot_download=fake_snapshot_download),
+    session = _install_fake_hub(
+        monkeypatch,
+        remote_files,
+        resolved_revision="9" * 40,
     )
+    monkeypatch.setenv("MTPLX_RECEIPT_DIR", str(tmp_path / "receipts"))
 
     result = pull_model(repo_id, cache_dir=tmp_path)
 
-    assert snapshot_calls
+    assert session.requests
     assert result["reused_existing"] is False
     assert result["resumed_existing"] is True
     assert bank.read_bytes() == expected
     assert expert_artifact_status(root)["ok"] is True
+
+
+def test_pull_model_uses_remote_manifest_to_force_structured_download_without_callback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_id = "owner/streamed"
+    source = tmp_path / "source"
+    _spec, manifest = _install_authoritative_cache(source, monkeypatch)
+    assert manifest.sidecar is not None
+    captured: dict[str, object] = {}
+    resolved_revision = "a" * 40
+    _install_fake_hub(
+        monkeypatch,
+        _remote_files(source),
+        captured=captured,
+        resolved_revision=resolved_revision,
+    )
+    monkeypatch.setenv("MTPLX_RECEIPT_DIR", str(tmp_path / "receipts"))
+
+    result = pull_model(repo_id, cache_dir=tmp_path / "cache")
+
+    assert result["resolved_revision"] == resolved_revision
+    assert result["expert_admission"]["revision"] == resolved_revision
+    assert captured["model_info_calls"] == 1
+    assert set(captured["download_revisions"]) == {resolved_revision}
+
+
+def test_pull_model_fresh_and_receipt_reuse_event_order_and_hash_skip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_id = "owner/streamed"
+    source = tmp_path / "source"
+    _spec, _manifest = _install_authoritative_cache(source, monkeypatch)
+    captured: dict[str, object] = {}
+    resolved_revision = "b" * 40
+    session = _install_fake_hub(
+        monkeypatch,
+        _remote_files(source),
+        captured=captured,
+        resolved_revision=resolved_revision,
+    )
+    monkeypatch.setenv("MTPLX_RECEIPT_DIR", str(tmp_path / "receipts"))
+    fresh_events: list[dict] = []
+
+    fresh = pull_model(
+        repo_id,
+        cache_dir=tmp_path / "cache",
+        progress_callback=fresh_events.append,
+        progress_interval_s=0,
+    )
+
+    event_names = [event["event"] for event in fresh_events]
+    assert event_names[0] == "start"
+    assert "progress" in event_names
+    assert event_names[-2:] == ["verifying", "complete"]
+    assert fresh["reused_existing"] is False
+    request_count = len(session.requests)
+
+    def fail_hash(_descriptor: int) -> str:
+        raise AssertionError("valid reused cache must not hash its bank")
+
+    monkeypatch.setattr("mtplx.expert_admission._hash_bank_descriptor", fail_hash)
+    reused_events: list[dict] = []
+    reused = pull_model(
+        repo_id,
+        cache_dir=tmp_path / "cache",
+        progress_callback=reused_events.append,
+        progress_interval_s=0,
+    )
+
+    assert [event["event"] for event in reused_events] == [
+        "verifying",
+        "complete",
+    ]
+    assert reused["reused_existing"] is True
+    assert reused["expert_admission"] == fresh["expert_admission"]
+    assert len(session.requests) == request_count
+
+
+def test_same_size_mutation_cannot_be_bound_to_existing_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_id = "owner/streamed"
+    source = tmp_path / "source"
+    _spec, manifest = _install_authoritative_cache(source, monkeypatch)
+    assert manifest.sidecar is not None
+    remote_files = _remote_files(source)
+    resolved_revision = "c" * 40
+    _install_fake_hub(
+        monkeypatch,
+        remote_files,
+        resolved_revision=resolved_revision,
+    )
+    cache_root = tmp_path / "cache"
+    monkeypatch.setenv("MTPLX_RECEIPT_DIR", str(tmp_path / "receipts"))
+    first = pull_model(repo_id, cache_dir=cache_root)
+    bank = Path(first["path"]) / manifest.sidecar.file
+    original = bank.read_bytes()
+    bank.write_bytes(original[:-1] + bytes([original[-1] ^ 0xFF]))
+
+    repaired = pull_model(repo_id, cache_dir=cache_root)
+
+    assert repaired["reused_existing"] is False
+    assert bank.read_bytes() == original
+    assert repaired["expert_admission"]["revision"] == resolved_revision
+
+
+def test_new_remote_revision_requires_sync_before_new_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_id = "owner/streamed"
+    source = tmp_path / "source"
+    _spec, _manifest = _install_authoritative_cache(source, monkeypatch)
+    remote_files = _remote_files(source)
+    cache_root = tmp_path / "cache"
+    monkeypatch.setenv("MTPLX_RECEIPT_DIR", str(tmp_path / "receipts"))
+    _install_fake_hub(
+        monkeypatch,
+        remote_files,
+        resolved_revision="d" * 40,
+    )
+    first = pull_model(repo_id, cache_dir=cache_root)
+    assert first["expert_admission"]["revision"] == "d" * 40
+
+    _install_fake_hub(
+        monkeypatch,
+        remote_files,
+        resolved_revision="e" * 40,
+    )
+    updated = pull_model(repo_id, cache_dir=cache_root)
+
+    assert updated["reused_existing"] is False
+    assert updated["expert_admission"]["revision"] == "e" * 40
+
+
+def test_offline_expert_reuse_requires_matching_immutable_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_id = "owner/streamed"
+    source = tmp_path / "source"
+    _spec, _manifest = _install_authoritative_cache(source, monkeypatch)
+    resolved_revision = "f" * 40
+    _install_fake_hub(
+        monkeypatch,
+        _remote_files(source),
+        resolved_revision=resolved_revision,
+    )
+    cache_root = tmp_path / "cache"
+    monkeypatch.setenv("MTPLX_RECEIPT_DIR", str(tmp_path / "receipts"))
+    pull_model(repo_id, cache_dir=cache_root)
+
+    def offline(*_args, **_kwargs):
+        raise RuntimeError("offline")
+
+    def fail_hash(_descriptor: int) -> str:
+        raise AssertionError("offline receipt reuse must skip the bank hash")
+
+    monkeypatch.setattr("mtplx.hf_loader._query_repo_inventory", offline)
+    monkeypatch.setattr("mtplx.expert_admission._hash_bank_descriptor", fail_hash)
+
+    reused = pull_model(repo_id, cache_dir=cache_root)
+
+    assert reused["reused_existing"] is True
+    assert reused["resolved_revision"] == resolved_revision
+    with pytest.raises(RuntimeError, match="offline"):
+        pull_model(
+            repo_id,
+            cache_dir=cache_root,
+            revision="1" * 40,
+        )
 
 
 def test_runtime_contract_symlink_is_not_followed(tmp_path: Path) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import importlib
 import json
 import os
@@ -12,10 +13,16 @@ import shutil
 import stat
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator
 
 from mtplx.artifacts import _hf_repo_id_from_ref
+from mtplx.expert_admission import (
+    TrustedFileDigest,
+    admit_expert_artifact,
+    ensure_expert_admitted,
+    load_valid_admission_receipt,
+)
 from mtplx.profiles import DEFAULT_PROFILE_NAME
 
 
@@ -73,34 +80,90 @@ def read_bounded_artifact_member(
 class RepoFile:
     path: str
     size_bytes: int | None
+    sha256: str | None = None
 
 
-def _query_repo_files(repo_id: str, *, revision: str | None = None) -> list[RepoFile]:
-    """Return downloadable files with Hub-reported sizes when available."""
+@dataclass(frozen=True)
+class RepoInventory:
+    resolved_revision: str
+    files: tuple[RepoFile, ...]
 
+
+def _repo_file_from_sibling(sibling: Any) -> RepoFile | None:
+    name = getattr(sibling, "rfilename", None) or getattr(sibling, "path", None)
+    if not isinstance(name, str) or not name.strip():
+        return None
+    size = getattr(sibling, "size", None)
+    lfs = getattr(sibling, "lfs", None)
+    if isinstance(lfs, dict):
+        digest = lfs.get("sha256")
+    else:
+        digest = getattr(lfs, "sha256", None)
+    sha256 = (
+        digest.lower()
+        if isinstance(digest, str)
+        and re.fullmatch(r"[0-9a-fA-F]{64}", digest) is not None
+        else None
+    )
+    return RepoFile(
+        path=name,
+        size_bytes=size if isinstance(size, int) else None,
+        sha256=sha256,
+    )
+
+
+def _repo_inventory_from_info(info: Any, repo_id: str) -> RepoInventory:
+    resolved_revision = getattr(info, "sha", None)
+    if (
+        not isinstance(resolved_revision, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}", resolved_revision) is None
+    ):
+        raise RuntimeError(
+            f"Hugging Face repo {repo_id} did not resolve to an immutable commit SHA"
+        )
+    files = tuple(
+        repo_file
+        for sibling in (getattr(info, "siblings", None) or [])
+        if (repo_file := _repo_file_from_sibling(sibling)) is not None
+    )
+    if not files:
+        raise RuntimeError(
+            f"Hugging Face repo {repo_id} did not return downloadable files."
+        )
+    return RepoInventory(
+        resolved_revision=resolved_revision.lower(),
+        files=files,
+    )
+
+
+def _query_repo_inventory(
+    repo_id: str,
+    *,
+    revision: str | None = None,
+) -> RepoInventory:
     try:
         hf_hub = importlib.import_module("huggingface_hub")
         api = hf_hub.HfApi()
-    except Exception:
-        return []
-    try:
         info = api.model_info(
             repo_id=repo_id,
             revision=revision,
             files_metadata=True,
             token=hf_token_for_download(),
         )
-    except Exception:
+        return _repo_inventory_from_info(info, repo_id)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(_classify_pull_error(exc, repo_id)) from exc
+
+
+def _query_repo_files(repo_id: str, *, revision: str | None = None) -> list[RepoFile]:
+    """Return downloadable files with Hub-reported sizes when available."""
+
+    try:
+        return list(_query_repo_inventory(repo_id, revision=revision).files)
+    except RuntimeError:
         return []
-    siblings = getattr(info, "siblings", None) or []
-    files: list[RepoFile] = []
-    for sibling in siblings:
-        name = getattr(sibling, "rfilename", None) or getattr(sibling, "path", None)
-        if not isinstance(name, str) or not name.strip():
-            continue
-        size = getattr(sibling, "size", None)
-        files.append(RepoFile(path=name, size_bytes=size if isinstance(size, int) else None))
-    return files
 
 
 def _query_repo_total_bytes(repo_id: str, *, revision: str | None = None) -> int | None:
@@ -637,13 +700,208 @@ def _classify_pull_error(exc: BaseException, repo_id: str) -> str:
     return str(exc)
 
 
+def _safe_repo_relative_path(repo_file: RepoFile) -> PurePosixPath:
+    relative = PurePosixPath(repo_file.path)
+    if (
+        not repo_file.path
+        or "\\" in repo_file.path
+        or relative.is_absolute()
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise RuntimeError(
+            f"unsafe file path in Hugging Face repo: {repo_file.path}"
+        )
+    return relative
+
+
 def _safe_destination_for_repo_file(destination: Path, repo_file: RepoFile) -> Path:
-    target = destination / repo_file.path
+    relative = _safe_repo_relative_path(repo_file)
+    return destination.joinpath(*relative.parts)
+
+
+@contextlib.contextmanager
+def _open_safe_repo_parent(
+    destination: Path,
+    repo_file: RepoFile,
+) -> Iterator[tuple[int, Path, str]]:
+    """Open every parent with ``openat`` so symlink swaps cannot escape."""
+
+    relative = _safe_repo_relative_path(repo_file)
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor: int | None = None
+    parent = destination
     try:
-        target.relative_to(destination)
-    except ValueError as exc:
-        raise RuntimeError(f"unsafe file path in Hugging Face repo: {repo_file.path}") from exc
-    return target
+        try:
+            descriptor = os.open(destination, directory_flags)
+        except OSError as exc:
+            raise RuntimeError(
+                f"model download directory must be a real directory, not a symlink: "
+                f"{destination} ({exc})"
+            ) from exc
+        for component in relative.parts[:-1]:
+            try:
+                os.mkdir(component, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            try:
+                child_descriptor = os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=descriptor,
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    f"download path contains an unsafe intermediate symlink "
+                    f"or non-directory member: {parent / component} ({exc})"
+                ) from exc
+            os.close(descriptor)
+            descriptor = child_descriptor
+            parent /= component
+        yield descriptor, parent, relative.name
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _regular_file_metadata(path: Path) -> os.stat_result | None:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError(f"could not inspect download file {path}: {exc}") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise RuntimeError(f"download file must not be a symlink: {path}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(f"download file is not a regular file: {path}")
+    return metadata
+
+
+def _regular_file_metadata_at(
+    directory_descriptor: int,
+    name: str,
+    display_path: Path,
+) -> os.stat_result | None:
+    try:
+        metadata = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError(
+            f"could not inspect download file {display_path}: {exc}"
+        ) from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise RuntimeError(f"download file must not be a symlink: {display_path}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(
+            f"download file is not a regular file: {display_path}"
+        )
+    return metadata
+
+
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
+def _hash_descriptor(
+    descriptor: int,
+    digest: Any,
+    *,
+    limit: int | None = None,
+) -> int:
+    total = 0
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while limit is None or total < limit:
+        size = DOWNLOAD_CHUNK_SIZE if limit is None else min(
+            DOWNLOAD_CHUNK_SIZE, limit - total
+        )
+        try:
+            chunk = os.read(descriptor, size)
+        except InterruptedError:
+            continue
+        if not chunk:
+            break
+        digest.update(chunk)
+        total += len(chunk)
+    return total
+
+
+def _trusted_file_digest(
+    descriptor: int,
+    digest: Any,
+) -> TrustedFileDigest:
+    metadata = os.fstat(descriptor)
+    return TrustedFileDigest(
+        sha256=digest.hexdigest(),
+        st_dev=metadata.st_dev,
+        st_ino=metadata.st_ino,
+        st_size=metadata.st_size,
+        st_mtime_ns=metadata.st_mtime_ns,
+    )
+
+
+def _hash_existing_file(
+    path: Path,
+    *,
+    directory_descriptor: int | None = None,
+    name: str | None = None,
+) -> TrustedFileDigest:
+    open_kwargs: dict[str, Any] = {}
+    open_target: Path | str = path
+    if directory_descriptor is not None and name is not None:
+        open_kwargs["dir_fd"] = directory_descriptor
+        open_target = name
+    descriptor = os.open(
+        open_target,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        **open_kwargs,
+    )
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError(f"download file is not a regular file: {path}")
+        digest = hashlib.sha256()
+        read_bytes = _hash_descriptor(descriptor, digest)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if read_bytes != before.st_size or _file_identity(before) != _file_identity(after):
+        raise RuntimeError(f"download file changed while hashing: {path}")
+    return TrustedFileDigest(
+        sha256=digest.hexdigest(),
+        st_dev=after.st_dev,
+        st_ino=after.st_ino,
+        st_size=after.st_size,
+        st_mtime_ns=after.st_mtime_ns,
+    )
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        try:
+            written = os.write(descriptor, view)
+        except InterruptedError:
+            continue
+        if written <= 0:
+            raise OSError("short write while downloading model file")
+        view = view[written:]
 
 
 def _emit_current_download_size(
@@ -706,6 +964,225 @@ def _iter_response_bytes(response: Any) -> Iterator[bytes]:
     raise RuntimeError("Hugging Face response does not support byte streaming")
 
 
+def _download_repo_file_at(
+    repo_file: RepoFile,
+    *,
+    directory_descriptor: int,
+    parent: Path,
+    target_name: str,
+    repo_id: str,
+    revision: str | None,
+    destination: Path,
+    session: Any,
+    hf_hub_url: Callable[..., str],
+    build_hf_headers: Callable[..., dict[str, str]],
+    hf_raise_for_status: Callable[[Any], None],
+    callback: DownloadProgressCallback | None,
+    total_bytes: int | None,
+    started_at: float,
+    progress_interval_s: float,
+    last_emit_at: float,
+    last_emit_size: int,
+) -> tuple[float, int, TrustedFileDigest]:
+    target = parent / target_name
+    expected_size = repo_file.size_bytes
+    partial_name = target_name + ".incomplete"
+    partial = parent / partial_name
+    target_metadata = _regular_file_metadata_at(
+        directory_descriptor,
+        target_name,
+        target,
+    )
+    partial_metadata = _regular_file_metadata_at(
+        directory_descriptor,
+        partial_name,
+        partial,
+    )
+
+    if (
+        target_metadata is not None
+        and expected_size is not None
+        and target_metadata.st_size == expected_size
+        and repo_file.sha256 is not None
+    ):
+        existing_digest = _hash_existing_file(
+            target,
+            directory_descriptor=directory_descriptor,
+            name=target_name,
+        )
+        if existing_digest.sha256 == repo_file.sha256:
+            emitted_at, emitted_size = _emit_current_download_size(
+                callback,
+                repo_id=repo_id,
+                destination=destination,
+                total_bytes=total_bytes,
+                started_at=started_at,
+                last_emit_at=last_emit_at,
+                last_emit_size=last_emit_size,
+                file_path=repo_file.path,
+            )
+            return emitted_at, emitted_size, existing_digest
+        os.unlink(target_name, dir_fd=directory_descriptor)
+        target_metadata = None
+    elif (
+        target_metadata is not None
+        and expected_size is not None
+        and target_metadata.st_size == expected_size
+    ):
+        # Size alone cannot bind old bytes to new remote metadata.
+        os.unlink(target_name, dir_fd=directory_descriptor)
+        target_metadata = None
+    elif target_metadata is not None and expected_size is None:
+        # A file without an authoritative size or digest must be fetched again.
+        os.unlink(target_name, dir_fd=directory_descriptor)
+        target_metadata = None
+
+    if target_metadata is not None:
+        if partial_metadata is None:
+            os.replace(
+                target_name,
+                partial_name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+            )
+            partial_metadata = target_metadata
+        else:
+            os.unlink(target_name, dir_fd=directory_descriptor)
+    existing = partial_metadata.st_size if partial_metadata is not None else 0
+    if expected_size is not None and existing > expected_size:
+        os.unlink(partial_name, dir_fd=directory_descriptor)
+        existing = 0
+
+    descriptor = os.open(
+        partial_name,
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=directory_descriptor,
+    )
+    try:
+        prefix_before = os.fstat(descriptor)
+        if not stat.S_ISREG(prefix_before.st_mode):
+            raise RuntimeError(f"partial download is not a regular file: {partial}")
+        existing = prefix_before.st_size
+        digest = hashlib.sha256()
+        if existing:
+            hashed = _hash_descriptor(descriptor, digest, limit=existing)
+            prefix_after = os.fstat(descriptor)
+            if (
+                hashed != existing
+                or _file_identity(prefix_before) != _file_identity(prefix_after)
+            ):
+                raise RuntimeError(
+                    f"partial download changed while hashing: {repo_file.path}"
+                )
+
+        def install_verified_partial() -> TrustedFileDigest:
+            os.fsync(descriptor)
+            final_metadata = os.fstat(descriptor)
+            if (
+                expected_size is not None
+                and final_metadata.st_size != expected_size
+            ):
+                raise RuntimeError(
+                    f"incomplete download for {repo_file.path}: "
+                    f"expected {expected_size} bytes, got {final_metadata.st_size}"
+                )
+            trusted = _trusted_file_digest(descriptor, digest)
+            if (
+                repo_file.sha256 is not None
+                and trusted.sha256 != repo_file.sha256
+            ):
+                raise RuntimeError(
+                    f"SHA-256 mismatch for {repo_file.path}: "
+                    f"expected {repo_file.sha256}, got {trusted.sha256}"
+                )
+            os.replace(
+                partial_name,
+                target_name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+            )
+            os.fsync(directory_descriptor)
+            after_install = os.fstat(descriptor)
+            if _file_identity(final_metadata) != _file_identity(after_install):
+                raise RuntimeError(
+                    f"download file changed during install: {repo_file.path}"
+                )
+            return trusted
+
+        headers = build_hf_headers(token=hf_token_for_download())
+        if existing > 0:
+            headers["Range"] = f"bytes={existing}-"
+        url = hf_hub_url(
+            repo_id=repo_id,
+            filename=repo_file.path,
+            revision=revision,
+        )
+        response_stream = _open_hub_stream(session, url, headers)
+        with response_stream as response:
+            status_code = int(getattr(response, "status_code", 200))
+            if existing > 0 and status_code == 200:
+                os.ftruncate(descriptor, 0)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                digest = hashlib.sha256()
+                existing = 0
+            elif (
+                existing > 0
+                and status_code == 416
+                and expected_size is not None
+                and existing == expected_size
+            ):
+                trusted = install_verified_partial()
+                emitted_at, emitted_size = _emit_current_download_size(
+                    callback,
+                    repo_id=repo_id,
+                    destination=destination,
+                    total_bytes=total_bytes,
+                    started_at=started_at,
+                    last_emit_at=last_emit_at,
+                    last_emit_size=last_emit_size,
+                    file_path=repo_file.path,
+                )
+                return emitted_at, emitted_size, trusted
+            hf_raise_for_status(response)
+            os.lseek(descriptor, 0, os.SEEK_END)
+            for chunk in _iter_response_bytes(response):
+                if not chunk:
+                    continue
+                _write_all(descriptor, chunk)
+                digest.update(chunk)
+                now = time.monotonic()
+                if now - last_emit_at >= progress_interval_s:
+                    last_emit_at, last_emit_size = _emit_current_download_size(
+                        callback,
+                        repo_id=repo_id,
+                        destination=destination,
+                        total_bytes=total_bytes,
+                        started_at=started_at,
+                        last_emit_at=last_emit_at,
+                        last_emit_size=last_emit_size,
+                        file_path=repo_file.path,
+                    )
+        trusted = install_verified_partial()
+    finally:
+        os.close(descriptor)
+
+    emitted_at, emitted_size = _emit_current_download_size(
+        callback,
+        repo_id=repo_id,
+        destination=destination,
+        total_bytes=total_bytes,
+        started_at=started_at,
+        last_emit_at=last_emit_at,
+        last_emit_size=last_emit_size,
+        file_path=repo_file.path,
+    )
+    return emitted_at, emitted_size, trusted
+
+
 def _download_repo_file(
     repo_file: RepoFile,
     *,
@@ -722,113 +1199,48 @@ def _download_repo_file(
     progress_interval_s: float,
     last_emit_at: float,
     last_emit_size: int,
-) -> tuple[float, int]:
-    target = _safe_destination_for_repo_file(destination, repo_file)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    expected_size = repo_file.size_bytes
-    if expected_size is not None and target.exists() and target.stat().st_size == expected_size:
-        return last_emit_at, last_emit_size
-    if expected_size is None and target.exists() and target.stat().st_size > 0:
-        return last_emit_at, last_emit_size
-
-    partial = target.with_name(target.name + ".incomplete")
-    if target.exists():
-        if not partial.exists():
-            target.replace(partial)
-        else:
-            target.unlink()
-    existing = partial.stat().st_size if partial.exists() else 0
-    if expected_size is not None and existing > expected_size:
-        partial.unlink()
-        existing = 0
-
-    headers = build_hf_headers(token=hf_token_for_download())
-    if existing > 0:
-        headers["Range"] = f"bytes={existing}-"
-    url = hf_hub_url(repo_id=repo_id, filename=repo_file.path, revision=revision)
-    response_stream = _open_hub_stream(session, url, headers)
-    with response_stream as response:
-        status_code = int(getattr(response, "status_code", 200))
-        if existing > 0 and status_code == 200:
-            partial.unlink(missing_ok=True)
-            existing = 0
-        elif existing > 0 and status_code == 416 and expected_size is not None and existing == expected_size:
-            partial.replace(target)
-            return _emit_current_download_size(
-                callback,
-                repo_id=repo_id,
-                destination=destination,
-                total_bytes=total_bytes,
-                started_at=started_at,
-                last_emit_at=last_emit_at,
-                last_emit_size=last_emit_size,
-                file_path=repo_file.path,
-            )
-        hf_raise_for_status(response)
-        mode = "ab" if existing > 0 else "wb"
-        with partial.open(mode + "") as handle:
-            for chunk in _iter_response_bytes(response):
-                if not chunk:
-                    continue
-                handle.write(chunk)
-                now = time.monotonic()
-                if now - last_emit_at >= progress_interval_s:
-                    last_emit_at, last_emit_size = _emit_current_download_size(
-                        callback,
-                        repo_id=repo_id,
-                        destination=destination,
-                        total_bytes=total_bytes,
-                        started_at=started_at,
-                        last_emit_at=last_emit_at,
-                        last_emit_size=last_emit_size,
-                        file_path=repo_file.path,
-                    )
-    if expected_size is not None and partial.stat().st_size != expected_size:
-        raise RuntimeError(
-            f"incomplete download for {repo_file.path}: "
-            f"expected {expected_size} bytes, got {partial.stat().st_size}"
+) -> tuple[float, int, TrustedFileDigest]:
+    with _open_safe_repo_parent(
+        destination,
+        repo_file,
+    ) as (directory_descriptor, parent, target_name):
+        return _download_repo_file_at(
+            repo_file,
+            directory_descriptor=directory_descriptor,
+            parent=parent,
+            target_name=target_name,
+            repo_id=repo_id,
+            revision=revision,
+            destination=destination,
+            session=session,
+            hf_hub_url=hf_hub_url,
+            build_hf_headers=build_hf_headers,
+            hf_raise_for_status=hf_raise_for_status,
+            callback=callback,
+            total_bytes=total_bytes,
+            started_at=started_at,
+            progress_interval_s=progress_interval_s,
+            last_emit_at=last_emit_at,
+            last_emit_size=last_emit_size,
         )
-    partial.replace(target)
-    return _emit_current_download_size(
-        callback,
-        repo_id=repo_id,
-        destination=destination,
-        total_bytes=total_bytes,
-        started_at=started_at,
-        last_emit_at=last_emit_at,
-        last_emit_size=last_emit_size,
-        file_path=repo_file.path,
-    )
 
 
 def _download_snapshot_with_structured_progress(
     *,
     repo_id: str,
-    revision: str | None,
+    inventory: RepoInventory,
     destination: Path,
     progress_callback: DownloadProgressCallback | None,
     progress_interval_s: float,
-) -> tuple[Path, int | None]:
-    HfApi, hf_hub_url, get_session, build_hf_headers, hf_raise_for_status = _hub_runtime()
-    try:
-        info = HfApi().model_info(
-            repo_id=repo_id,
-            revision=revision,
-            files_metadata=True,
-            token=hf_token_for_download(),
-        )
-    except Exception as exc:
-        raise RuntimeError(_classify_pull_error(exc, repo_id)) from exc
-    siblings = getattr(info, "siblings", None) or []
-    repo_files: list[RepoFile] = []
-    for sibling in siblings:
-        name = getattr(sibling, "rfilename", None) or getattr(sibling, "path", None)
-        if not isinstance(name, str) or not name.strip():
-            continue
-        size = getattr(sibling, "size", None)
-        repo_files.append(RepoFile(path=name, size_bytes=size if isinstance(size, int) else None))
-    if not repo_files:
-        raise RuntimeError(f"Hugging Face repo {repo_id} did not return downloadable files.")
+) -> tuple[Path, int | None, dict[str, TrustedFileDigest]]:
+    (
+        _HfApi,
+        hf_hub_url,
+        get_session,
+        build_hf_headers,
+        hf_raise_for_status,
+    ) = _hub_runtime()
+    repo_files = inventory.files
 
     total_bytes = sum(
         repo_file.size_bytes
@@ -839,12 +1251,13 @@ def _download_snapshot_with_structured_progress(
     started_at = time.monotonic()
     last_emit_at = started_at
     last_emit_size = directory_size_bytes(destination)
+    downloaded_digests: dict[str, TrustedFileDigest] = {}
     for repo_file in repo_files:
         try:
-            last_emit_at, last_emit_size = _download_repo_file(
+            last_emit_at, last_emit_size, digest = _download_repo_file(
                 repo_file,
                 repo_id=repo_id,
-                revision=revision,
+                revision=inventory.resolved_revision,
                 destination=destination,
                 session=session,
                 hf_hub_url=hf_hub_url,
@@ -857,9 +1270,10 @@ def _download_snapshot_with_structured_progress(
                 last_emit_at=last_emit_at,
                 last_emit_size=last_emit_size,
             )
+            downloaded_digests[repo_file.path] = digest
         except Exception as exc:
             raise RuntimeError(_classify_pull_error(exc, repo_id)) from exc
-    return destination, total_bytes
+    return destination, total_bytes, downloaded_digests
 
 
 @dataclass(frozen=True)
@@ -936,6 +1350,29 @@ def _local_matches_remote_index(
         return True
 
 
+def _repo_is_exact_streaming_catalog(repo_id: str) -> bool:
+    try:
+        from mtplx.default_models import streaming_catalog_models
+
+        return repo_id.casefold() in {
+            model.hf_model_id.casefold()
+            for model in streaming_catalog_models()
+        }
+    except Exception:
+        return False
+
+
+def _inventory_declares_experts(inventory: RepoInventory) -> bool:
+    return any(repo_file.path == EXPERT_MANIFEST_FILE for repo_file in inventory.files)
+
+
+def _is_immutable_hub_revision(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"[0-9a-fA-F]{40}", value) is not None
+    )
+
+
 def pull_model(
     model_ref: str,
     *,
@@ -952,11 +1389,73 @@ def pull_model(
     destination = cached_model_path(repo_id, cache_dir=root)
 
     started_size = directory_size_bytes(destination)
-    if (
+    local_ready = (
         destination.exists()
         and _cached_model_ready_for_repo(destination, repo_id)
-        and _local_matches_remote_index(destination, repo_id, revision)
-    ):
+    )
+    local_expert_status = (
+        expert_artifact_status(destination)
+        if destination.is_dir()
+        else {"streamed_experts": False, "ok": True}
+    )
+    local_streamed = bool(local_expert_status.get("streamed_experts"))
+    exact_streaming_repo = _repo_is_exact_streaming_catalog(repo_id)
+    inventory: RepoInventory | None = None
+    inventory_error: RuntimeError | None = None
+    try:
+        inventory = _query_repo_inventory(repo_id, revision=revision)
+    except RuntimeError as exc:
+        inventory_error = exc
+
+    resolved_revision = (
+        inventory.resolved_revision if inventory is not None else revision
+    )
+    remote_streamed = (
+        _inventory_declares_experts(inventory)
+        if inventory is not None
+        else False
+    )
+    expert_repo = exact_streaming_repo or local_streamed or remote_streamed
+    admission: dict[str, Any] | None = None
+    reuse_allowed = False
+
+    if local_ready and expert_repo:
+        if inventory is not None:
+            receipt = load_valid_admission_receipt(
+                destination,
+                revision=inventory.resolved_revision,
+            )
+            reuse_allowed = (
+                receipt is not None
+                and receipt.get("repo_id") == repo_id
+            )
+        else:
+            # Offline expert reuse is allowed only when a prior admission is
+            # bound to an immutable Hub SHA. A mutable requested revision or
+            # an identity-only cache check is insufficient.
+            receipt = load_valid_admission_receipt(destination)
+            receipt_revision = (
+                receipt.get("revision") if receipt is not None else None
+            )
+            reuse_allowed = (
+                receipt is not None
+                and receipt.get("repo_id") == repo_id
+                and _is_immutable_hub_revision(receipt_revision)
+                and (
+                    not _is_immutable_hub_revision(revision)
+                    or str(receipt_revision).casefold() == str(revision).casefold()
+                )
+            )
+            if reuse_allowed:
+                resolved_revision = receipt_revision
+    elif local_ready and not expert_repo:
+        reuse_allowed = _local_matches_remote_index(
+            destination,
+            repo_id,
+            resolved_revision,
+        )
+
+    if reuse_allowed:
         resolved = destination
         reused_existing = True
         resumed_existing = False
@@ -965,6 +1464,22 @@ def pull_model(
             raise RuntimeError(
                 "cached MTPLX model is incomplete: "
                 + ", ".join(validation["missing_files"] or [str(validation.get("contract_error"))])
+            )
+        if expert_repo:
+            _emit_download_progress(
+                progress_callback,
+                {
+                    "event": "verifying",
+                    "repo_id": repo_id,
+                    "path": str(resolved),
+                    "size_bytes": directory_size_bytes(resolved),
+                    "total_bytes": directory_size_bytes(resolved),
+                },
+            )
+            admission = ensure_expert_admitted(
+                resolved,
+                repo_id=repo_id,
+                revision=resolved_revision,
             )
         _emit_download_progress(
             progress_callback,
@@ -979,14 +1494,21 @@ def pull_model(
             },
         )
     else:
+        if inventory is None:
+            if inventory_error is not None:
+                raise inventory_error
+            raise RuntimeError(
+                f"could not resolve immutable Hugging Face metadata for {repo_id}"
+            )
         reused_existing = False
         resumed_existing = destination.exists() and started_size > 0
         destination.mkdir(parents=True, exist_ok=True)
-        total_bytes = (
-            _query_repo_total_bytes(repo_id, revision=revision)
-            if progress_callback is not None
-            else None
-        )
+        total_bytes = sum(
+            repo_file.size_bytes
+            for repo_file in inventory.files
+            if isinstance(repo_file.size_bytes, int)
+            and repo_file.size_bytes > 0
+        ) or None
         _emit_download_progress(
             progress_callback,
             {
@@ -1002,11 +1524,16 @@ def pull_model(
             if progress_callback is not None
             else contextlib.nullcontext()
         )
+        downloaded_digests: dict[str, TrustedFileDigest] = {}
         with progress_suppression:
-            if progress_callback is not None:
-                resolved, total_bytes_from_download = _download_snapshot_with_structured_progress(
+            if progress_callback is not None or expert_repo:
+                (
+                    resolved,
+                    total_bytes_from_download,
+                    downloaded_digests,
+                ) = _download_snapshot_with_structured_progress(
                     repo_id=repo_id,
-                    revision=revision,
+                    inventory=inventory,
                     destination=destination,
                     progress_callback=progress_callback,
                     progress_interval_s=progress_interval_s,
@@ -1023,7 +1550,7 @@ def pull_model(
                 path = snapshot_download(
                     repo_id=repo_id,
                     repo_type="model",
-                    revision=revision,
+                    revision=inventory.resolved_revision,
                     local_dir=str(destination),
                     token=hf_token_for_download(),
                 )
@@ -1057,6 +1584,19 @@ def pull_model(
                 "downloaded MTPLX model is incomplete: "
                 + ", ".join(validation["missing_files"] or [str(validation.get("contract_error"))])
             )
+        expert_status = expert_artifact_status(resolved)
+        if expert_repo and not expert_status.get("streamed_experts"):
+            raise RuntimeError(
+                f"downloaded expert repository {repo_id} has no "
+                f"{EXPERT_MANIFEST_FILE}"
+            )
+        if expert_status.get("streamed_experts"):
+            admission = admit_expert_artifact(
+                resolved,
+                repo_id=repo_id,
+                revision=inventory.resolved_revision,
+                trusted_bank_digests=downloaded_digests,
+            )
         final_size = directory_size_bytes(resolved)
         _emit_download_progress(
             progress_callback,
@@ -1074,6 +1614,8 @@ def pull_model(
         "path": str(resolved),
         "cache_dir": str(root),
         "revision": revision,
+        "resolved_revision": resolved_revision,
+        "expert_admission": admission,
         "reused_existing": reused_existing,
         "resumed_existing": resumed_existing,
         "started_size_bytes": started_size,
