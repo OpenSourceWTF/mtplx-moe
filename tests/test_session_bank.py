@@ -287,6 +287,100 @@ def test_session_bank_committed_restore_keeps_hidden_and_mtp_snapshot():
     assert restored.mtp_history_cache is not None
 
 
+@pytest.mark.parametrize(
+    "ar_tokens",
+    [
+        [1, 2, 3],
+        [1, 2, 3, 4],
+    ],
+    ids=["same-key", "prefix-donor"],
+)
+def test_session_bank_none_put_strips_inherited_boundary_hidden(ar_tokens):
+    bank = SessionBank()
+    boundary_snapshot = CacheSnapshot(states=("trunk-boundary",), meta_states=(None,))
+    committed = bank.put(
+        runtime=RuntimeWithCaches(),
+        token_ids=[1, 2, 3],
+        cache=[],
+        logits="logits",
+        hidden="committed-hidden",
+        hidden_variant="post_norm",
+        mtp_history_policy="committed",
+        snapshot_epoch=3,
+        gdn_boundaries=[(2, boundary_snapshot, "committed-boundary-hidden")],
+    )
+    assert committed is not None
+
+    ar_entry = bank.put(
+        runtime=AROnlyRuntime(),
+        token_ids=ar_tokens,
+        cache=[],
+        logits="ar-logits",
+        hidden=None,
+        hidden_variant=None,
+        mtp_history_policy="none",
+        snapshot_epoch=len(ar_tokens),
+    )
+
+    assert ar_entry is not None
+    assert len(ar_entry.gdn_boundaries) == 1
+    boundary, restored_snapshot, boundary_hidden = ar_entry.gdn_boundaries[0]
+    assert boundary == 2
+    assert restored_snapshot.states == ("trunk-boundary",)
+    assert boundary_hidden is None
+
+
+def test_session_bank_none_put_sanitizes_loader_boundaries_before_ssd_enqueue():
+    enqueued: list[tuple[list[tuple], list[str]]] = []
+
+    class ColdTier:
+        def put_entry(self, entry, *, capabilities):
+            enqueued.append((list(entry.gdn_boundaries), list(capabilities)))
+
+    bank = SessionBank(cold_tier=ColdTier())
+    committed = bank.put(
+        runtime=RuntimeWithCaches(),
+        token_ids=[1, 2, 3],
+        cache=[],
+        logits="logits",
+        hidden="committed-hidden",
+        hidden_variant="post_norm",
+        mtp_history_policy="committed",
+        snapshot_epoch=3,
+    )
+    assert committed is not None
+    enqueued.clear()
+    committed.gdn_boundary_loader = lambda: [
+        (
+            2,
+            CacheSnapshot(states=("lazy-trunk-boundary",), meta_states=(None,)),
+            "lazy-committed-hidden",
+        )
+    ]
+
+    ar_entry = bank.put(
+        runtime=AROnlyRuntime(),
+        token_ids=[1, 2, 3, 4],
+        cache=[],
+        logits="ar-logits",
+        hidden=None,
+        hidden_variant=None,
+        mtp_history_policy="none",
+        snapshot_epoch=4,
+    )
+
+    assert ar_entry is not None
+    assert ar_entry.gdn_boundary_loader is None
+    assert len(ar_entry.gdn_boundaries) == 1
+    assert ar_entry.gdn_boundaries[0][1].states == ("lazy-trunk-boundary",)
+    assert ar_entry.gdn_boundaries[0][2] is None
+    assert len(enqueued) == 1
+    persisted_boundaries, capabilities = enqueued[0]
+    assert persisted_boundaries[0][1].states == ("lazy-trunk-boundary",)
+    assert persisted_boundaries[0][2] is None
+    assert capabilities == ["ar_insert"]
+
+
 def test_session_bank_skips_single_oversized_snapshot_before_insert():
     bank = SessionBank(max_entries=4, max_bytes=1024, per_session_max_bytes=512)
     runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)

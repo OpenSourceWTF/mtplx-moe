@@ -188,10 +188,27 @@ def _canonicalize_none_policy_entry(
     entry.mtp_history_cache_ref = None
     entry.mtp_snapshot_epoch = None
     if entry.gdn_boundaries:
-        entry.gdn_boundaries = [
-            (int(record[0]), record[1], None) for record in entry.gdn_boundaries
-        ]
+        entry.gdn_boundaries = _strip_boundary_hidden(entry.gdn_boundaries)
+    if entry.gdn_boundary_loader is not None:
+        entry.gdn_boundary_loader = _boundary_loader_without_hidden(
+            entry.gdn_boundary_loader
+        )
     return True
+
+
+def _strip_boundary_hidden(records: Any) -> list[tuple[int, CacheSnapshot, None]]:
+    return [(int(record[0]), record[1], None) for record in (records or ())]
+
+
+def _boundary_loader_without_hidden(loader: Any) -> Any:
+    if loader is None or getattr(loader, "_mtplx_none_policy", False):
+        return loader
+
+    def load_without_hidden():
+        return _strip_boundary_hidden(loader())
+
+    load_without_hidden._mtplx_none_policy = True
+    return load_without_hidden
 
 
 def _tree_nbytes(value: Any) -> int:
@@ -470,6 +487,7 @@ class SessionBank:
             ),
             key=lambda item: item[0],
         )
+        inherited_loader = None
         if os.environ.get("MTPLX_DEBUG_PREFIX_DIVERGENCE"):
             print(
                 f"[mtplx] bank-put: len={len(tokens)} "
@@ -510,6 +528,10 @@ class SessionBank:
                     inherited_loader = getattr(
                         prefix_donor, "gdn_boundary_loader", None
                     )
+        if _mtp_history_policy_is_none(mtp_history_policy):
+            normalized_boundaries = _strip_boundary_hidden(normalized_boundaries)
+            inherited_loader = _boundary_loader_without_hidden(inherited_loader)
+
         def live_ref_entry(reason: str, nbytes: int) -> SessionBankEntry | None:
             if not keep_live_ref or not cache:
                 return None
@@ -545,7 +567,11 @@ class SessionBank:
                 extra_state=_clone_tree(extra_state),
                 has_recurrent=cache_has_recurrent,
                 gdn_boundaries=list(normalized_boundaries),
+                gdn_boundary_loader=(
+                    inherited_loader if not normalized_boundaries else None
+                ),
             )
+            _canonicalize_none_policy_entry(entry)
             self.eviction_log.append(
                 {
                     "reason": reason,
@@ -672,6 +698,7 @@ class SessionBank:
                 inherited_loader if not normalized_boundaries else None
             ),
         )
+        _canonicalize_none_policy_entry(entry)
         self._enqueue_cold_entry(entry)
         self._entries[tokens] = entry
         self._supersede_contained_prefixes(tokens)
