@@ -345,7 +345,9 @@ def build_step(
     ``cache.update_and_fetch``) and the full-attention mask (an in-graph
     additive mask over the padded leaf instead of ``mask=None`` over an exactly
     sized buffer).  Gating, MoE and the norms call the shipped module code, so
-    the ``laguna_fused`` installers keep applying.
+    the ``laguna_fused`` installers keep applying — including the destructive
+    q/k/v/g concatenation, which the projection block reads off the attention
+    module rather than assuming the four separate projections still exist.
     """
 
     geometry = geometry_for(model, cap)
@@ -375,7 +377,17 @@ def build_step(
         """``Attention.__call__`` at T=1 with the cache replaced by leaves."""
 
         batch, length, _ = x.shape
-        queries, keys, values = attn.q_proj(x), attn.k_proj(x), attn.v_proj(x)
+        # `laguna_fused.install_fused_qkvg` concatenates q/k/v/g into one
+        # projection and DROPS the four originals, so a converted layer has no
+        # `q_proj` to call; reading `_qkvg` first is what keeps that install
+        # applicable to this lane, exactly as the gate hook below does for the
+        # attention gate.
+        qkvg = getattr(attn, "_qkvg", None)
+        if qkvg is not None:
+            queries, keys, values, gate_logits = qkvg(x)
+        else:
+            queries, keys, values = attn.q_proj(x), attn.k_proj(x), attn.v_proj(x)
+            gate_logits = None
 
         queries = attn.q_norm(
             queries.reshape(batch, length, attn.n_heads, -1)
@@ -415,7 +427,8 @@ def build_step(
         )
 
         if attn.gating:
-            gate_logits = attn.g_proj(x)
+            if gate_logits is None:
+                gate_logits = attn.g_proj(x)
             if attn.gate_per_head:
                 output = gate_impl(
                     output, gate_logits, attn.n_heads, attn.head_dim

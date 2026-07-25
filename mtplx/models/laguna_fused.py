@@ -49,6 +49,7 @@ ENV_KERNEL_QK_ROPE = "MTPLX_LAGUNA_KERNEL_QK_ROPE"
 ENV_KERNEL_COMBINE = "MTPLX_LAGUNA_KERNEL_COMBINE"
 ENV_FUSED_SHARED_GATE_UP = "MTPLX_LAGUNA_FUSED_SHARED_GATE_UP"
 ENV_CACHED_LHS = "MTPLX_LAGUNA_CACHED_LHS"
+ENV_FUSED_QKVG = "MTPLX_LAGUNA_FUSED_QKVG"
 
 # The pristine Attention.__call__, captured on first install so the fused
 # variant can delegate any shape it does not cover and benches can restore it.
@@ -646,14 +647,324 @@ def install_kernel_attention_gate(model: Any) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# fused q/k/v/gate projection
+# ---------------------------------------------------------------------------
+class FusedQkvgProj(nn.Module):
+    """q, k, v and the attention gate issued as ONE (quantized) matmul.
+
+    All four projections read the SAME input — the post-``input_layernorm``
+    hidden state — so their weights stack along the output dimension and apply
+    in a single pass.  The transform is bit-exact by the same argument the
+    gate/up fusions rest on: quantization groups run along the INPUT dimension,
+    so concatenating output ROWS carries each row's own scales and biases
+    untouched, and every output element is still the same products summed in
+    the same order.  Nothing about a row's arithmetic can see which other rows
+    it was issued alongside.
+
+    The motivation is the serial link rather than bandwidth.  At B=1 these are
+    four separate dispatches at the head of every attention block — 192 across
+    48 layers, each one encoded, submitted and drained in turn — and each pays a
+    launch floor that is now most of what a decode step costs.  Bytes read are
+    unchanged; the launch count drops to one and the rows per launch quadruple,
+    which is what occupancy responds to.
+
+    The four results come back as SLICES of the fused output rather than as
+    separately allocated buffers.  At the B=1/T=1 decode shape those slices are
+    row-contiguous in MLX's own sense (its contiguity check excuses dimensions
+    of size 1), so they are views and nothing is copied.  At B > 1 they are
+    genuinely strided and MLX materializes them wherever a consumer needs them
+    contiguous — the regime this path is not built for, and part of why it is
+    env-gated rather than default.
+    """
+
+    _NAMES = ("q_proj", "k_proj", "v_proj", "g_proj")
+
+    def __init__(self, attention: Any) -> None:
+        super().__init__()
+
+        self.gating = bool(getattr(attention, "gating", False))
+        names = self._NAMES if self.gating else self._NAMES[:3]
+        parts = [getattr(attention, name) for name in names]
+
+        for name, part in zip(names, parts):
+            if "bias" in part:
+                # A per-output bias would concatenate cleanly too, but the
+                # admitted checkpoint sets attention_bias=False everywhere, so
+                # an unexpected bias means this is not the module tree the
+                # fusion was reasoned about.
+                raise ValueError(f"{name} carries a bias; refusing to concatenate")
+
+        quantized = [("scales" in part) for part in parts]
+        if any(quantized) and not all(quantized):
+            raise ValueError(
+                "q/k/v/g are not uniformly quantized; concatenation would need "
+                "two different matmuls"
+            )
+        self.quantized = bool(quantized[0])
+
+        reference = parts[0]
+        if self.quantized:
+            for name, part in zip(names[1:], parts[1:]):
+                if (
+                    int(part.group_size) != int(reference.group_size)
+                    or int(part.bits) != int(reference.bits)
+                    or part.mode != reference.mode
+                ):
+                    raise ValueError(
+                        f"{name} is {int(part.bits)}-bit/gs{int(part.group_size)}"
+                        f"/{part.mode} but q_proj is {int(reference.bits)}-bit"
+                        f"/gs{int(reference.group_size)}/{reference.mode}; "
+                        "concatenating would change the arithmetic"
+                    )
+            has_biases = [(part.get("biases") is not None) for part in parts]
+            if any(has_biases) and not all(has_biases):
+                raise ValueError(
+                    "q/k/v/g disagree on whether the quantization carries "
+                    "biases; concatenation would be ill-defined"
+                )
+            self.group_size = int(reference.group_size)
+            self.bits = int(reference.bits)
+            self.mode = reference.mode
+
+        widths = {int(part.weight.shape[1]) for part in parts}
+        if len(widths) != 1:
+            raise ValueError(
+                f"q/k/v/g do not share an input width ({sorted(widths)}); they "
+                "cannot be reading the same hidden state"
+            )
+
+        # Split points, as the cumulative row counts of the concatenation.  Held
+        # as plain ints so `__call__` slices with no per-step arithmetic, and so
+        # module traversal never sees them as parameters.
+        rows = [
+            int(part.scales.shape[0]) if self.quantized else int(part.weight.shape[0])
+            for part in parts
+        ]
+        self.q_end = rows[0]
+        self.k_end = self.q_end + rows[1]
+        self.v_end = self.k_end + rows[2]
+
+        self.qkvg_weight = mx.concatenate([part.weight for part in parts], axis=0)
+        if self.quantized:
+            self.qkvg_scales = mx.concatenate([part.scales for part in parts], axis=0)
+            if reference.get("biases") is not None:
+                self.qkvg_biases = mx.concatenate(
+                    [part["biases"] for part in parts], axis=0
+                )
+
+    def __call__(self, x: mx.array):
+        """Return ``(queries, keys, values, gate_logits)`` from one matmul.
+
+        ``gate_logits`` is None for a non-gating layer, which is what lets the
+        callers keep the shipped ``if self.gating`` shape verbatim.
+        """
+
+        if self.quantized:
+            fused = mx.quantized_matmul(
+                x,
+                self["qkvg_weight"],
+                self["qkvg_scales"],
+                self.get("qkvg_biases"),
+                transpose=True,
+                group_size=self.group_size,
+                bits=self.bits,
+                mode=self.mode,
+            )
+        else:
+            fused = x @ self["qkvg_weight"].swapaxes(-1, -2)
+
+        queries = fused[..., : self.q_end]
+        keys = fused[..., self.q_end : self.k_end]
+        values = fused[..., self.k_end : self.v_end]
+        gate_logits = fused[..., self.v_end :] if self.gating else None
+        return queries, keys, values, gate_logits
+
+
+def _capture_stock_attention_call():
+    """Pin the pristine ``Attention.__call__`` before anything patches it.
+
+    Both attention installers call this before their own swap and it only ever
+    fires once, so whichever runs first records the shipped implementation and
+    the second cannot record the first's patch.  That is what makes the two
+    installs compose in either order.
+    """
+
+    from .laguna import Attention
+
+    global _STOCK_ATTENTION_CALL
+    if _STOCK_ATTENTION_CALL is None:
+        _STOCK_ATTENTION_CALL = Attention.__call__
+    return _STOCK_ATTENTION_CALL
+
+
+def _fused_qkvg_attention_call(self, x, mask=None, cache=None, rope_memo=None):
+    """``Attention.__call__`` verbatim, reading the fused projection.
+
+    Only the first line differs from the shipped forward: the four projections
+    arrive as slices of one matmul instead of four separate calls, and the gate
+    logits are already in hand by the time the gating branch needs them.  Every
+    other op — the norms, the transposes, the rope offset vector, the gate
+    expression — is the module code unchanged, so this path is bit-exact
+    against stock and stays that way if the shipped forward is edited only in
+    the ways that also have to be mirrored here.
+    """
+
+    from . import laguna
+
+    batch, length, _ = x.shape
+    queries, keys, values, gate_logits = self._qkvg(x)
+
+    queries = self.q_norm(
+        queries.reshape(batch, length, self.n_heads, -1)
+    ).transpose(0, 2, 1, 3)
+    keys = self.k_norm(keys.reshape(batch, length, self.n_kv_heads, -1)).transpose(
+        0, 2, 1, 3
+    )
+    values = values.reshape(batch, length, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+
+    offset = laguna._rope_offset(
+        cache.offset if cache is not None else 0, batch, rope_memo
+    )
+    queries = self.rope(queries, offset=offset)
+    keys = self.rope(keys, offset=offset)
+    if cache is not None:
+        keys, values = cache.update_and_fetch(keys, values)
+
+    from mlx_lm.models.base import scaled_dot_product_attention
+
+    output = scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        cache=cache,
+        scale=self.scale,
+        mask=mask,
+    )
+    output = output.transpose(0, 2, 1, 3).reshape(
+        batch,
+        length,
+        self.n_heads * self.head_dim,
+    )
+
+    if self.gating:
+        if self.gate_per_head:
+            output = laguna.PER_HEAD_GATE_IMPL(
+                output, gate_logits, self.n_heads, self.head_dim
+            )
+        else:
+            gate = mx.logaddexp(
+                gate_logits.astype(mx.float32), mx.array(0.0)
+            ).astype(output.dtype)
+            output = output * gate
+
+    return self.o_proj(output)
+
+
+def _qkvg_attention_dispatch(self, x, mask=None, cache=None, rope_memo=None):
+    """Send each layer to the forward its own modules can still support.
+
+    The install is per layer and is allowed to skip one (mixed quantization),
+    so the dispatch is per layer too: a converted layer no longer HAS q_proj
+    and must take the fused path, while a skipped layer kept its four modules
+    and runs the shipped code untouched.
+    """
+
+    if getattr(self, "_qkvg", None) is not None:
+        return _fused_qkvg_attention_call(self, x, mask, cache, rope_memo)
+    return _STOCK_ATTENTION_CALL(self, x, mask, cache, rope_memo)
+
+
+def install_fused_qkvg(model: Any) -> dict[str, Any]:
+    """Fuse q/k/v/g into one projection per attention block.  DESTRUCTIVE.
+
+    Each converted layer's ``q_proj``, ``k_proj``, ``v_proj`` and ``g_proj``
+    are DROPPED once their rows are concatenated, so the layer holds one copy
+    of the weights rather than two.  After this install the only forwards that
+    still work on a converted layer are the ones that know about ``_qkvg``:
+
+    * ``_qkvg_attention_dispatch`` / ``_fused_qkvg_attention_call`` (swapped in
+      here, unless the qk-rope kernel path is already installed);
+    * ``_kernel_attention_call``, which reads ``_qkvg`` when it is present;
+    * ``mtplx.laguna_compiled_step.build_step``, likewise.
+
+    Anything else that reaches for ``attention.q_proj`` — the pristine
+    ``Attention.__call__``, weight export, a self-check that walks the module
+    tree — will raise on a converted layer.  Like the gate/up concatenations
+    this is a one-way conversion: undoing it means reloading the model, so a
+    bench must run this arm LAST.
+
+    Composition with ``install_kernel_qk_rope`` is explicit and order-free.
+    Both installers capture the pristine forward through
+    :func:`_capture_stock_attention_call`, which fires once; the qk-rope path
+    supersedes the plain dispatcher (it handles ``_qkvg`` itself and falls back
+    THROUGH the dispatcher for shapes its kernel does not cover), so whichever
+    order they are installed in, both installed ends at
+    ``_kernel_attention_call`` and qkvg-only ends at the dispatcher.
+
+    A layer whose q/k/v/g do not share one (bits, group_size, mode) cannot be
+    concatenated without changing the arithmetic; it is left entirely stock and
+    counted in the report.  The shipped oQ4e checkpoint has no such layer — its
+    per-layer table gives q, k, v and g the same width on all 48 layers (layer
+    33 differs only in ``o_proj``, which is not part of this concatenation).
+    """
+
+    from .laguna import Attention
+
+    _capture_stock_attention_call()
+
+    inner = getattr(model, "model", model)
+    converted = 0
+    skipped = 0
+    reasons: list[str] = []
+    for index, layer in enumerate(inner.layers):
+        attention = layer.self_attn
+        if getattr(attention, "_qkvg", None) is not None:
+            continue
+        try:
+            fused = FusedQkvgProj(attention)
+        except ValueError as error:
+            skipped += 1
+            reasons.append(f"layer {index}: {error}")
+            continue
+        # Evaluated HERE rather than left to a later `mx.eval(model.parameters())`:
+        # `Module.valid_parameter_filter` drops keys that start with an
+        # underscore, so `_qkvg` is in the module tree but out of
+        # `parameters()`.  Materializing now is also what frees the originals —
+        # an unevaluated concatenation still holds them alive.
+        mx.eval(fused.parameters())
+        attention._qkvg = fused
+        for name in FusedQkvgProj._NAMES:
+            if name in attention:
+                del attention[name]
+        gc.collect()
+        converted += 1
+
+    # Never downgrade the kernel path: it already handles `_qkvg` and covers
+    # strictly more than the dispatcher does.
+    if Attention.__call__ is not _kernel_attention_call:
+        Attention.__call__ = _qkvg_attention_dispatch
+    mx.clear_cache()
+    return {
+        "path": "fused_qkvg",
+        "layers_converted": converted,
+        "layers_skipped": skipped,
+        "skip_reasons": reasons,
+    }
+
+
+# ---------------------------------------------------------------------------
 # fused q/k norm + rope
 # ---------------------------------------------------------------------------
 def _kernel_attention_call(self, x, mask=None, cache=None, rope_memo=None):
     """Attention forward that fuses norm+transpose+rope at the decode step.
 
     Any shape the kernel does not cover — prefill, CPU runs, a rope module the
-    installer did not recognize — delegates wholesale to the pristine
-    implementation captured at install time.
+    installer did not recognize — delegates wholesale to
+    :func:`_qkvg_attention_dispatch`, which is the pristine implementation
+    captured at install time unless the destructive q/k/v/g fusion has taken
+    this layer's projections away, in which case it is that fusion's mirror of
+    it.  Delegating THROUGH the dispatcher rather than straight to the pristine
+    call is what lets the two installs compose in either order.
     """
 
     from ..kernels.laguna_decode import (
@@ -665,13 +976,20 @@ def _kernel_attention_call(self, x, mask=None, cache=None, rope_memo=None):
     spec = getattr(self, "_qk_rope_spec", None)
     batch, length, _ = x.shape
     if spec is None or length != 1:
-        return _STOCK_ATTENTION_CALL(self, x, mask, cache, rope_memo)
+        return _qkvg_attention_dispatch(self, x, mask, cache, rope_memo)
 
-    queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+    # One matmul for all four projections when the fusion is installed; the
+    # gate logits then come for free instead of costing a fifth dispatch below.
+    qkvg = getattr(self, "_qkvg", None)
+    if qkvg is not None:
+        queries, keys, values, gate_logits = qkvg(x)
+    else:
+        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        gate_logits = None
     if not is_qk_norm_rope_eligible(
         queries, keys, self.q_norm.weight, self.k_norm.weight, spec
     ):
-        return _STOCK_ATTENTION_CALL(self, x, mask, cache, rope_memo)
+        return _qkvg_attention_dispatch(self, x, mask, cache, rope_memo)
 
     offset = cache.offset if cache is not None else 0
     queries, keys = fused_qk_norm_rope(
@@ -705,7 +1023,8 @@ def _kernel_attention_call(self, x, mask=None, cache=None, rope_memo=None):
     if self.gating:
         from . import laguna
 
-        gate_logits = self.g_proj(x)
+        if gate_logits is None:
+            gate_logits = self.g_proj(x)
         if self.gate_per_head:
             output = laguna.PER_HEAD_GATE_IMPL(
                 output, gate_logits, self.n_heads, self.head_dim
@@ -767,11 +1086,16 @@ def _qk_rope_spec_for(attention: Any) -> "Any | None":
 
 
 def install_kernel_qk_rope(model: Any) -> dict[str, Any]:
+    """Swap in the fused norm+rope forward.  Supersedes the q/k/v/g dispatcher.
+
+    ``_kernel_attention_call`` reads ``_qkvg`` itself and falls back through
+    ``_qkvg_attention_dispatch``, so it covers everything the dispatcher does
+    and installing it second is an upgrade, not a clobber.
+    """
+
     from .laguna import Attention
 
-    global _STOCK_ATTENTION_CALL
-    if _STOCK_ATTENTION_CALL is None:
-        _STOCK_ATTENTION_CALL = Attention.__call__
+    _capture_stock_attention_call()
 
     inner = getattr(model, "model", model)
     covered = 0
@@ -831,4 +1155,10 @@ def install_from_env(model: Any) -> list[dict[str, Any]]:
         report.append(install_fused_shared_gate_up(model))
     if _enabled(ENV_CACHED_LHS):
         report.append(install_cached_gather_indices(model))
+    # Last, and after ENV_KERNEL_QK_ROPE by construction: the q/k/v/g fusion
+    # drops the projections it concatenates, so every path that still wants to
+    # read them has to have run first.  `install_fused_qkvg` will not downgrade
+    # the qk-rope forward if that one is already in place.
+    if _enabled(ENV_FUSED_QKVG):
+        report.append(install_fused_qkvg(model))
     return report

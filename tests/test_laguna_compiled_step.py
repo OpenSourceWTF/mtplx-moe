@@ -453,6 +453,67 @@ def test_lane_runs_the_quantized_layout(toy_model):
     _assert_lane_tracks_stock(toy_model, compiled=True)
 
 
+def test_lane_runs_the_fused_qkvg_projection(toy_model):
+    """The destructive q/k/v/g fusion has to keep applying to this lane.
+
+    ``install_fused_qkvg`` DROPS q_proj/k_proj/v_proj/g_proj, so a step that
+    still reached for them would raise rather than quietly fall back — passing
+    is proof the lane took the fused projection, in both the eager twin and the
+    compiled build, and that it still tracks the stock forward token for token.
+    """
+
+    nn.quantize(toy_model, group_size=32, bits=4)
+    mx.eval(toy_model.parameters())
+    report = laguna_fused.install_fused_qkvg(toy_model)
+    assert report["layers_converted"] == len(LAYER_TYPES)
+    assert "q_proj" not in toy_model.model.layers[0].self_attn
+
+    _assert_lane_tracks_stock(toy_model, compiled=False)
+    _assert_lane_tracks_stock(toy_model, compiled=True)
+
+
+def test_compiled_twin_matches_the_eager_twin_with_fused_qkvg(toy_model):
+    """Compilation must not change the fused projection's result either.
+
+    The fused path hands the step SLICES of one matmul rather than three
+    freshly allocated outputs, and ``mx.compile`` is free to fuse around them —
+    so the eager-vs-compiled comparison is re-run on top of the install rather
+    than assumed to carry over from the unfused case.
+    """
+
+    nn.quantize(toy_model, group_size=32, bits=4)
+    mx.eval(toy_model.parameters())
+    laguna_fused.install_fused_qkvg(toy_model)
+
+    eager_caches, eager_token = _prefill(toy_model)
+    compiled_caches, compiled_token = _prefill(toy_model)
+    eager = LagunaCompiledLane(toy_model, CAP, compiled=False).seed(
+        eager_caches, eager_token
+    )
+    compiled = LagunaCompiledLane(toy_model, CAP, compiled=True).seed(
+        compiled_caches, compiled_token
+    )
+
+    for step in range(STEPS):
+        a = eager.advance()
+        b = compiled.advance()
+        mx.eval(a, b)
+        assert b.tolist() == a.tolist(), f"compiled token diverged at step {step}"
+
+    eager_offset, eager_ring, eager_leaves = eager.state()
+    offset, ring_idx, leaves = compiled.state()
+    mx.eval(offset, ring_idx, *leaves, eager_offset, eager_ring, *eager_leaves)
+
+    assert int(offset) == int(eager_offset)
+    assert int(ring_idx) == int(eager_ring)
+    for index, (leaf, want) in enumerate(zip(leaves, eager_leaves)):
+        assert leaf.shape == want.shape
+        delta = _max_delta(leaf, want)
+        assert delta <= BF16_SAFE_TOLERANCE, (
+            f"compiled leaf {index} diverged from the eager twin: {delta:.3e}"
+        )
+
+
 def test_lane_handles_the_shipped_yarn_rope(cpu_device):
     """The admitted config ropes full-attention layers with YaRN, factor 128.
 
