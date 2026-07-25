@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -40,6 +42,56 @@ def test_run_step_wraps_lazy_stream_timeout_and_redacts_url_secrets():
     assert api_key not in detail
     assert "password" not in detail
     assert "url-secret" not in detail
+
+
+def test_run_step_malformed_base_url_cannot_break_error_redaction():
+    api_key = "sk-malformed-secret"
+    base_url = "http://[invalid/v1"
+
+    with pytest.raises(smoke.SmokeFailure) as exc_info:
+        smoke._run_step(
+            "malformed URL request",
+            lambda: (_ for _ in ()).throw(
+                RuntimeError(
+                    f"request {base_url} Authorization: Bearer {api_key}"
+                )
+            ),
+            api_key=api_key,
+            base_url=base_url,
+        )
+
+    detail = str(exc_info.value)
+    assert "RuntimeError" in detail
+    assert api_key not in detail
+    assert base_url not in detail
+
+
+def test_cli_malformed_base_url_fails_cleanly_without_secrets():
+    api_key = "sk-cli-malformed-secret"
+    base_url = "http://[invalid/v1"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--base-url",
+            base_url,
+            "--model",
+            "model",
+            "--api-key",
+            api_key,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stderr.startswith("release smoke failed:")
+    assert "base URL validation failed" in completed.stderr
+    assert "Traceback" not in completed.stderr
+    assert api_key not in completed.stderr
+    assert base_url not in completed.stderr
 
 
 def test_run_step_does_not_swallow_keyboard_interrupt():

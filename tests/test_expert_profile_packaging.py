@@ -2,12 +2,46 @@ import json
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tarfile
 import zipfile
 
 
-def _build_wheel(outdir: Path, *, epoch: int) -> Path:
+def _clean_source_tree(destination: Path) -> Path:
+    repo = Path(__file__).resolve().parents[1]
+    destination.mkdir()
+    included_paths = [
+        "CHANGELOG.md",
+        "CITATION.cff",
+        "LICENSE",
+        "MANIFEST.in",
+        "NOTICE",
+        "README.md",
+        "pyproject.toml",
+        "mtplx",
+        "scripts",
+        "tests",
+        "vllm_metal",
+    ]
+    process = subprocess.Popen(
+        ["git", "archive", "--format=tar", "HEAD", "--", *included_paths],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    with tarfile.open(fileobj=process.stdout, mode="r|") as archive:
+        archive.extractall(destination, filter="data")
+    assert process.wait() == 0
+    for name in ("pyproject.toml", "MANIFEST.in", "setup.py"):
+        source = repo / name
+        if source.is_file():
+            shutil.copy2(source, destination / name)
+    return destination
+
+
+def _build_release(source: Path, outdir: Path, *, epoch: int) -> tuple[Path, Path]:
     outdir.mkdir()
     env = dict(os.environ, SOURCE_DATE_EPOCH=str(epoch))
     subprocess.run(
@@ -15,27 +49,51 @@ def _build_wheel(outdir: Path, *, epoch: int) -> Path:
             sys.executable,
             "-m",
             "build",
-            "--wheel",
             "--outdir",
             str(outdir),
         ],
         check=True,
+        cwd=source,
         env=env,
     )
-    return next(outdir.glob("mtplx-2.3.1rc1-*.whl"))
+    wheel = next(outdir.glob("mtplx-2.3.1rc1-*.whl"))
+    sdist = next(outdir.glob("mtplx-2.3.1rc1.tar.gz"))
+    return wheel, sdist
 
 
-def test_built_wheel_is_reproducible_and_contains_expert_profiles(tmp_path):
-    first = _build_wheel(tmp_path / "first", epoch=1_700_000_000)
-    second = _build_wheel(tmp_path / "second", epoch=1_700_000_000)
+def test_built_release_is_reproducible_and_contains_expert_profiles(tmp_path):
+    epoch = 1_700_000_000
+    first_source = _clean_source_tree(tmp_path / "source-first")
+    second_source = _clean_source_tree(tmp_path / "source-second")
+    first_wheel, first_sdist = _build_release(
+        first_source,
+        tmp_path / "dist-first",
+        epoch=epoch,
+    )
+    second_wheel, second_sdist = _build_release(
+        second_source,
+        tmp_path / "dist-second",
+        epoch=epoch,
+    )
 
-    assert first.read_bytes() == second.read_bytes()
-    assert hashlib.sha256(first.read_bytes()).digest() == hashlib.sha256(
-        second.read_bytes()
-    ).digest()
+    for first, second in (
+        (first_wheel, second_wheel),
+        (first_sdist, second_sdist),
+    ):
+        assert first.read_bytes() == second.read_bytes()
+        assert hashlib.sha256(first.read_bytes()).digest() == hashlib.sha256(
+            second.read_bytes()
+        ).digest()
 
-    wheel = first
-    with zipfile.ZipFile(wheel) as archive:
+    assert int.from_bytes(first_sdist.read_bytes()[4:8], "little") == epoch
+    with tarfile.open(first_sdist) as archive:
+        members = archive.getmembers()
+    assert {member.mtime for member in members} == {epoch}
+    assert "mtplx-2.3.1rc1/setup.py" in {
+        member.name for member in members
+    }
+
+    with zipfile.ZipFile(first_wheel) as archive:
         payload = json.loads(
             archive.read("mtplx/data/expert_profiles.json")
         )

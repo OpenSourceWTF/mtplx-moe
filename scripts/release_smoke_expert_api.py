@@ -64,8 +64,13 @@ def _redacted_error(
     message = str(exc)
     if base_url:
         message = message.replace(base_url, "<redacted-url>")
-    parsed = urlsplit(base_url)
-    secrets = [api_key, parsed.username, parsed.password]
+    secrets = [api_key]
+    try:
+        parsed = urlsplit(base_url)
+    except Exception:
+        parsed = None
+    if parsed is not None:
+        secrets.extend((parsed.username, parsed.password))
     for secret in sorted(
         (value for value in secrets if value),
         key=len,
@@ -145,13 +150,13 @@ def _health_url(base_url: str) -> str:
 
 
 def _fetch_health(
-    base_url: str,
+    health_url: str,
     api_key: str,
     *,
     timeout: float,
 ) -> dict[str, Any]:
     request = Request(
-        _health_url(base_url),
+        health_url,
         headers={
             "Accept": "application/json",
             "Authorization": f"Bearer {api_key}",
@@ -392,6 +397,12 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
+    health_url = _run_step(
+        "base URL validation",
+        lambda: _health_url(args.base_url),
+        api_key=args.api_key,
+        base_url=args.base_url,
+    )
     try:
         import litellm
         from openai import OpenAI
@@ -473,7 +484,7 @@ def main() -> int:
         "health after short requests",
         lambda: _profile_evidence(
             _fetch_health(
-                args.base_url,
+                health_url,
                 args.api_key,
                 timeout=args.timeout,
             )
@@ -507,7 +518,7 @@ def main() -> int:
         "health after long request",
         lambda: _profile_evidence(
             _fetch_health(
-                args.base_url,
+                health_url,
                 args.api_key,
                 timeout=args.timeout,
             )
