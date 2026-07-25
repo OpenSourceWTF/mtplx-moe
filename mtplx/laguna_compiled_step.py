@@ -12,13 +12,40 @@ to capture the stock caches (see ``mtplx/graphbank.py``).
 This module removes the blocker by making the whole decode state explicit
 tensors — "leaves" — that go in as arguments and come out as results:
 
-* the KV buffers, one pair per layer;
+* the KV buffer, one per layer (see "Packed KV" below);
 * ``offset``, an int32 scalar ``mx.array`` shared by every layer;
 * ``ring_idx``, an int32 scalar ``mx.array`` shared by every sliding layer.
 
 Everything the step reads is then either a weight (constant) or a leaf (an
 argument), so ``mx.compile`` produces one graph that is valid at every position,
 and an ICB capture becomes possible on top of it.
+
+Packed KV
+---------
+K and V for a layer go to the SAME slot on the same step, so they do not need
+two writes.  ``packed_kv=True`` (the default) gives each layer one leaf
+``[2, H, S, D]`` — plane 0 keys, plane 1 values — and writes both with a single
+``mx.slice_update`` whose update is ``[2, H, 1, D]``.  The leading axis doubles
+as the batch axis on the way out: ``kv[0:1]`` is exactly the ``[1, H, S, D]``
+keys tensor attention wants, which is only true because this lane is B=1.
+
+That trades two dynamic writes for one write plus one pack.  It is a win only
+because of how MLX implements each piece (checked against 0.31.2):
+
+* a dynamic ``mx.slice_update`` costs TWO dispatches, ``compute_dynamic_offset``
+  and a ``gg*_dynamic_copy``, so dropping one drops two;
+* the pack is :func:`pack_kv`, a ``mx.where`` — ONE ``Select`` dispatch.
+  ``mx.concatenate`` would be the obvious way to build the same array and is the
+  wrong one: ``concatenate_gpu`` has no kernel of its own and issues one copy
+  per input, so a two-input concat would cost back exactly what the merged write
+  saved;
+* the reads ``kv[0:1]`` / ``kv[1:2]`` are unit-stride slices, which MLX resolves
+  to a buffer offset (``shared_buffer_slice``) rather than a copy, and both
+  planes stay row-contiguous, so attention sees the layout it would have seen
+  from separate leaves.
+
+``packed_kv=False`` keeps the original two-leaf layout for A/B.  It is a pure
+layout change: both produce the same tokens and the same numbers.
 
 Two shared scalars, not 48
 --------------------------
@@ -78,6 +105,7 @@ class StepGeometry:
     cap: int
     window: int | None
     kinds: tuple[str, ...]
+    packed_kv: bool = True
 
     @property
     def n_layers(self) -> int:
@@ -88,13 +116,27 @@ class StepGeometry:
         return self.window is not None
 
     @property
+    def leaves_per_layer(self) -> int:
+        """One packed ``[2, H, S, D]`` leaf, or the keys/values pair."""
+
+        return 1 if self.packed_kv else 2
+
+    @property
     def n_leaves(self) -> int:
-        """Two leaves — keys and values — per layer, in layer order."""
+        """The leaves of every layer, in layer order."""
 
-        return 2 * len(self.kinds)
+        return self.leaves_per_layer * len(self.kinds)
+
+    def layer_leaves(
+        self, leaves: Sequence[mx.array], index: int
+    ) -> tuple[mx.array, ...]:
+        """The slice of a flat leaf sequence that belongs to layer ``index``."""
+
+        width = self.leaves_per_layer
+        return tuple(leaves[width * index : width * (index + 1)])
 
 
-def geometry_for(model: Any, cap: int) -> StepGeometry:
+def geometry_for(model: Any, cap: int, *, packed_kv: bool = True) -> StepGeometry:
     """Derive the leaf layout from the model's own layers.
 
     Uses ``self_attn.is_sliding`` — the same flag ``LagunaModel.__call__``
@@ -114,7 +156,68 @@ def geometry_for(model: Any, cap: int) -> StepGeometry:
         window = int(model.args.sliding_window)
         if window <= 0:
             raise ValueError(f"sliding_window must be positive, got {window}")
-    return StepGeometry(cap=cap, window=window, kinds=kinds)
+    return StepGeometry(
+        cap=cap, window=window, kinds=kinds, packed_kv=bool(packed_kv)
+    )
+
+
+# ---------------------------------------------------------------------------
+# the packed KV layout
+# ---------------------------------------------------------------------------
+def kv_plane_mask() -> mx.array:
+    """The ``[2, 1, 1, 1]`` selector that defines which plane is which.
+
+    Plane 0 is keys, plane 1 is values — everything in this module that reads or
+    writes a packed leaf goes through this constant or through the slices in
+    :func:`unpack_kv`, so the convention is stated once.
+    """
+
+    return mx.array([True, False]).reshape(2, 1, 1, 1)
+
+
+def pack_kv(
+    keys: mx.array, values: mx.array, plane: mx.array | None = None
+) -> mx.array:
+    """Fold a ``[1, H, T, D]`` k and v into one ``[2, H, T, D]`` array.
+
+    A ``mx.where`` rather than the obvious ``mx.concatenate``: both write the
+    same bytes, but MLX has a ``Select`` kernel and has no concatenate kernel —
+    ``concatenate_gpu`` allocates the output and then issues one
+    ``copy_gpu_inplace`` PER INPUT.  On the step's hot path this function stands
+    in for one of the two dynamic writes packing removes, so a two-dispatch pack
+    would hand the saving straight back; a one-dispatch pack keeps it.
+
+    ``plane`` lets a caller pass a hoisted :func:`kv_plane_mask` so the constant
+    is not rebuilt inside a traced body.
+    """
+
+    if keys.shape != values.shape:
+        raise ValueError(
+            f"k and v must have the same shape to pack, got {keys.shape} "
+            f"and {values.shape}"
+        )
+    if int(keys.shape[0]) != 1:
+        raise ValueError(
+            "the packed layout spends the leading axis on the k/v plane, so it "
+            f"is B=1 only; got batch {keys.shape[0]}"
+        )
+    return mx.where(kv_plane_mask() if plane is None else plane, keys, values)
+
+
+def unpack_kv(leaf: mx.array) -> tuple[mx.array, mx.array]:
+    """Read a packed leaf back as the ``[1, H, S, D]`` k and v tensors.
+
+    Unit-stride slices, which MLX resolves to a buffer offset instead of a copy,
+    and each plane is still row-contiguous — so attention is handed the same
+    layout the unpacked leaves would have handed it.  The ``[0:1]`` (rather than
+    ``[0]``) is what restores the batch axis attention expects.
+    """
+
+    if int(leaf.shape[0]) != 2:
+        raise ValueError(
+            f"a packed KV leaf has 2 planes, got shape {tuple(leaf.shape)}"
+        )
+    return leaf[0:1], leaf[1:2]
 
 
 # ---------------------------------------------------------------------------
@@ -247,20 +350,26 @@ def ring_state_from_cache(
 
 
 def snapshot_leaves(
-    model: Any, caches: Sequence[Any], cap: int
+    model: Any, caches: Sequence[Any], cap: int, *, packed_kv: bool = True
 ) -> tuple[mx.array, mx.array, tuple[mx.array, ...]]:
     """Turn a post-prefill eager cache list into the step's tensor state.
 
-    Returns ``(offset, ring_idx, leaves)``, where ``leaves`` is two arrays per
-    layer in layer order, and both scalars are int32 ``mx.array``s so the
-    compiled graph reads them as inputs rather than baking them in.
+    Returns ``(offset, ring_idx, leaves)``, where ``leaves`` is one packed
+    ``[2, H, S, D]`` array per layer in layer order — or, with
+    ``packed_kv=False``, the keys/values pair — and both scalars are int32
+    ``mx.array``s so the compiled graph reads them as inputs rather than baking
+    them in.
 
     The lockstep invariant that lets one ``offset`` and one ``ring_idx`` serve
     all 48 layers is checked here, not assumed: every cache must report the same
     ``offset``, and every sliding cache the same normalized slot.
+
+    The pack goes through :func:`pack_kv` like the step's own writes do, so one
+    function decides which plane is keys.  This is a once-per-seed call, so its
+    dispatch count does not matter; matching the step's layout does.
     """
 
-    geometry = geometry_for(model, cap)
+    geometry = geometry_for(model, cap, packed_kv=packed_kv)
     if len(caches) != geometry.n_layers:
         raise ValueError(
             f"expected {geometry.n_layers} caches, got {len(caches)}"
@@ -279,7 +388,10 @@ def snapshot_leaves(
         except ValueError as error:
             raise ValueError(f"layer {index} ({kind}): {error}") from error
         offsets.add(int(cache.offset))
-        leaves.extend((keys, values))
+        if geometry.packed_kv:
+            leaves.append(pack_kv(keys, values))
+        else:
+            leaves.extend((keys, values))
 
     if len(offsets) != 1:
         raise ValueError(
@@ -302,12 +414,17 @@ def snapshot_leaves(
 # ring arithmetic, exposed so it can be tested against the real cache
 # ---------------------------------------------------------------------------
 def kv_slot_write(leaf: mx.array, update: mx.array, start: mx.array) -> mx.array:
-    """Write one step's K or V into a state leaf at a DYNAMIC slot.
+    """Write one step's KV into a state leaf at a DYNAMIC slot.
 
     The eager caches do ``self.keys[..., idx : idx + 1, :] = k`` with a Python
     ``idx``.  ``mx.slice_update`` takes its start indices as an ``mx.array``,
     which is the whole point: the slot stays a graph input, so one compiled
     graph serves every position instead of one per position.
+
+    ``axes=(2,)`` pins only the slot; the update's own shape sizes every other
+    axis.  That is what lets ONE call serve the packed layout: an update of
+    ``[2, H, 1, D]`` covers both planes at the same slot, which is exactly where
+    k and v belong, while the unpacked ``[1, H, 1, D]`` update covers one.
 
     It is NOT bounds-checked: a start past the end of ``leaf`` drops the write
     silently.  Nothing in the graph can catch that, which is why
@@ -335,7 +452,7 @@ def next_ring_index(ring_idx: mx.array, window: int) -> mx.array:
 # the step
 # ---------------------------------------------------------------------------
 def build_step(
-    model: Any, cap: int, *, compiled: bool = True
+    model: Any, cap: int, *, compiled: bool = True, packed_kv: bool = True
 ) -> Callable[..., tuple[mx.array, ...]]:
     """Build the pure decode step for ``model``.
 
@@ -350,6 +467,12 @@ def build_step(
 
     ``compiled=False`` returns the traced-by-Python twin of the exact same body,
     so a divergence between the two is a compilation bug and never a rewrite.
+
+    ``packed_kv`` decides the leaf layout, and with it the arity: one
+    ``[2, H, S, D]`` leaf per layer written once, or the keys/values pair
+    written twice.  See the module docstring for why one write plus a
+    ``mx.where`` beats two writes.  Nothing else about the step changes, so the
+    two builds are expected to agree token for token and number for number.
 
     Every op below mirrors a specific line of ``mtplx/models/laguna.py``; the
     only substitutions are the cache plumbing (explicit leaves instead of
@@ -371,10 +494,11 @@ def build_step(
     norm/transpose/rope chain runs unchanged.
     """
 
-    geometry = geometry_for(model, cap)
+    geometry = geometry_for(model, cap, packed_kv=packed_kv)
     inner = getattr(model, "model", model)
     layers = list(inner.layers)
     window = geometry.window
+    packed = geometry.packed_kv
     tied = bool(model.args.tie_word_embeddings)
 
     # Loop-invariant constants live OUTSIDE the traced body so they are captured
@@ -383,18 +507,18 @@ def build_step(
     positions = mx.arange(geometry.cap, dtype=mx.int32)
     admit = mx.array(0.0, dtype=mx.float32)
     reject = mx.array(-float("inf"), dtype=mx.float32)
-    mx.eval(positions, admit, reject)
+    plane = kv_plane_mask()
+    mx.eval(positions, admit, reject, plane)
 
     def _attention(
         attn: Any,
         x: mx.array,
         offset: mx.array,
         start: mx.array,
-        k_leaf: mx.array,
-        v_leaf: mx.array,
+        kv_state: tuple[mx.array, ...],
         mask_for: Callable[[Any], mx.array] | None,
         gate_impl: Callable[..., mx.array],
-    ) -> tuple[mx.array, mx.array, mx.array]:
+    ) -> tuple[mx.array, tuple[mx.array, ...]]:
         """``Attention.__call__`` at T=1 with the cache replaced by leaves."""
 
         batch, length, _ = x.shape
@@ -455,8 +579,22 @@ def build_step(
             queries = attn.rope(queries, offset=offset)
             keys = attn.rope(keys, offset=offset)
 
-        keys = kv_slot_write(k_leaf, keys, start)
-        values = kv_slot_write(v_leaf, values, start)
+        if packed:
+            # ONE dynamic write for both planes: k and v go to the same slot, so
+            # a `[2, H, 1, D]` update at `start` lands each of them where a
+            # separate `slice_update` would have.  The planes come back out as
+            # unit-stride slices, which cost no dispatch of their own.
+            (kv_leaf,) = kv_state
+            kv_leaf = kv_slot_write(
+                kv_leaf, pack_kv(keys, values, plane), start
+            )
+            keys, values = unpack_kv(kv_leaf)
+            updated: tuple[mx.array, ...] = (kv_leaf,)
+        else:
+            k_leaf, v_leaf = kv_state
+            keys = kv_slot_write(k_leaf, keys, start)
+            values = kv_slot_write(v_leaf, values, start)
+            updated = (keys, values)
 
         # Straight to `mx.fast.scaled_dot_product_attention`: the mlx-lm wrapper
         # only branches on a quantized cache, which this lane does not have, and
@@ -487,7 +625,7 @@ def build_step(
                 ).astype(output.dtype)
                 output = output * gate
 
-        return attn.o_proj(output), keys, values
+        return attn.o_proj(output), updated
 
     def step(
         token: mx.array,
@@ -530,21 +668,20 @@ def build_step(
         for index, layer in enumerate(layers):
             attn = layer.self_attn
             sliding = geometry.kinds[index] == SLIDING
-            attention_out, keys, values = _attention(
+            attention_out, layer_updated = _attention(
                 attn,
                 layer.input_layernorm(hidden),
                 offset,
                 # Sliding layers overwrite the oldest slot; full layers append
                 # at the absolute position.
                 ring_start if sliding else full_start,
-                leaves[2 * index],
-                leaves[2 * index + 1],
+                geometry.layer_leaves(leaves, index),
                 # Steady state means every ring slot is live, so sliding needs
                 # no mask; softmax does not care that the ring is rotated.
                 None if sliding else mask_for,
                 gate_impl,
             )
-            updated.extend((keys, values))
+            updated.extend(layer_updated)
             hidden = hidden + attention_out
             hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
 
@@ -589,13 +726,29 @@ class LagunaCompiledLane:
     mirrored on the host (exact at B=1, where every step is +1) and the step is
     refused rather than allowed to corrupt state.  The mirror costs one sync at
     ``seed`` and none per step.
+
+    ``packed_kv`` (default on) is the leaf layout — one ``[2, H, S, D]`` array
+    per layer instead of a keys/values pair, halving both the arity and the
+    per-layer cache writes.  It changes what ``state()``, ``capture_inputs()``
+    and ``geometry.n_leaves`` describe, and nothing else: ``packed_kv=False``
+    rebuilds the original layout for an A/B and generates the same tokens.
     """
 
-    def __init__(self, model: Any, cap: int, *, compiled: bool = True) -> None:
+    def __init__(
+        self,
+        model: Any,
+        cap: int,
+        *,
+        compiled: bool = True,
+        packed_kv: bool = True,
+    ) -> None:
         self.model = model
         self.compiled = bool(compiled)
-        self.geometry = geometry_for(model, cap)
-        self.step = build_step(model, cap, compiled=compiled)
+        self.packed_kv = bool(packed_kv)
+        self.geometry = geometry_for(model, cap, packed_kv=packed_kv)
+        self.step = build_step(
+            model, cap, compiled=compiled, packed_kv=packed_kv
+        )
         self.token: mx.array | None = None
         self.offset: mx.array | None = None
         self.ring_idx: mx.array | None = None
@@ -610,7 +763,7 @@ class LagunaCompiledLane:
         """Adopt a post-prefill eager cache list and the token it produced."""
 
         self.offset, self.ring_idx, self.leaves = snapshot_leaves(
-            self.model, caches, self.geometry.cap
+            self.model, caches, self.geometry.cap, packed_kv=self.packed_kv
         )
         self._position = int(self.offset)
         self.token = mx.array(token, dtype=mx.uint32).reshape(1, 1)

@@ -13,7 +13,10 @@ sliding caches are past the window and in the steady state the lane supports).
 
 from __future__ import annotations
 
+import collections
+import io
 import math
+import re
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -27,8 +30,10 @@ from mtplx.laguna_compiled_step import (
     full_state_from_cache,
     kv_slot_write,
     next_ring_index,
+    pack_kv,
     ring_state_from_cache,
     snapshot_leaves,
+    unpack_kv,
 )
 from mtplx.models import laguna, laguna_fused
 from mtplx.models.laguna import Model, ModelArgs
@@ -146,6 +151,31 @@ def _identical(a, b):
     return bool(mx.all(a == b))
 
 
+def _graph_primitives(outputs):
+    """Count the primitives in the graph that produced ``outputs``.
+
+    ``mx.export_to_dot`` is the only view of the built graph MLX exposes to
+    Python, and it is device-independent — which is what makes a dispatch-shape
+    claim checkable on a CPU-only box.
+    """
+
+    buffer = io.StringIO()
+    mx.export_to_dot(buffer, *outputs)
+    return collections.Counter(re.findall(r'label ="([^"]+)"', buffer.getvalue()))
+
+
+def _layer_kv(leaves, index, packed):
+    """A layer's ``(keys, values)`` out of either leaf layout.
+
+    Tests that care about WHERE a key landed have to read the same thing from
+    both layouts, so the layout lives here rather than in every assertion.
+    """
+
+    if packed:
+        return unpack_kv(leaves[index])
+    return leaves[2 * index], leaves[2 * index + 1]
+
+
 # ---------------------------------------------------------------------------
 # write positions, against the real cache classes
 # ---------------------------------------------------------------------------
@@ -224,9 +254,12 @@ def test_full_write_matches_kv_cache(cpu_device):
 # ---------------------------------------------------------------------------
 # snapshot
 # ---------------------------------------------------------------------------
-def test_snapshot_reports_the_shared_offset_and_ring_slot(toy_model):
+@pytest.mark.parametrize("packed_kv", [True, False])
+def test_snapshot_reports_the_shared_offset_and_ring_slot(toy_model, packed_kv):
     caches, _ = _prefill(toy_model)
-    offset, ring_idx, leaves = snapshot_leaves(toy_model, caches, CAP)
+    offset, ring_idx, leaves = snapshot_leaves(
+        toy_model, caches, CAP, packed_kv=packed_kv
+    )
 
     assert offset.dtype == mx.int32 and offset.shape == ()
     assert ring_idx.dtype == mx.int32 and ring_idx.shape == ()
@@ -235,12 +268,16 @@ def test_snapshot_reports_the_shared_offset_and_ring_slot(toy_model):
     # write slot back to 0 — what `_update_in_place` would do on the next step.
     assert int(ring_idx) == 0
 
-    assert len(leaves) == 2 * len(LAYER_TYPES)
+    # Packing is what halves the arity: one leaf per layer, not two.
+    assert len(leaves) == (1 if packed_kv else 2) * len(LAYER_TYPES)
     window = toy_model.args.sliding_window
     for index, kind in enumerate(LAYER_TYPES):
-        keys = leaves[2 * index]
-        expected = CAP if kind == "full_attention" else window
-        assert keys.shape == (1, 2, expected, 8), f"layer {index} leaf shape"
+        length = CAP if kind == "full_attention" else window
+        planes = 2 if packed_kv else 1
+        leaf = leaves[index if packed_kv else 2 * index]
+        assert leaf.shape == (planes, 2, length, 8), f"layer {index} leaf shape"
+        keys, values = _layer_kv(leaves, index, packed_kv)
+        assert keys.shape == values.shape == (1, 2, length, 8)
 
 
 def test_snapshot_does_not_alias_the_eager_cache_buffers(toy_model):
@@ -304,16 +341,17 @@ def test_snapshot_refuses_sliding_caches_with_different_slots(toy_model):
 # ---------------------------------------------------------------------------
 # the eager twin against the stock python-cache path
 # ---------------------------------------------------------------------------
-def test_eager_twin_generates_what_the_stock_path_generates(toy_model):
+@pytest.mark.parametrize("packed_kv", [True, False])
+def test_eager_twin_generates_what_the_stock_path_generates(toy_model, packed_kv):
     """The lane may reduce over a padded leaf; it may not change the tokens."""
 
     stock_caches, stock_token = _prefill(toy_model)
     lane_caches, lane_token = _prefill(toy_model)
     assert stock_token.tolist() == lane_token.tolist()
 
-    lane = LagunaCompiledLane(toy_model, CAP, compiled=False).seed(
-        lane_caches, lane_token
-    )
+    lane = LagunaCompiledLane(
+        toy_model, CAP, compiled=False, packed_kv=packed_kv
+    ).seed(lane_caches, lane_token)
 
     for step in range(STEPS):
         stock_token = _stock_step(toy_model, stock_caches, stock_token)
@@ -324,7 +362,8 @@ def test_eager_twin_generates_what_the_stock_path_generates(toy_model):
         )
 
 
-def test_eager_twin_state_tracks_the_eager_caches(toy_model):
+@pytest.mark.parametrize("packed_kv", [True, False])
+def test_eager_twin_state_tracks_the_eager_caches(toy_model, packed_kv):
     """Per step, the leaves must equal what the eager caches now hold.
 
     Compared against ``snapshot_leaves`` of the stock caches, which is the same
@@ -336,9 +375,9 @@ def test_eager_twin_state_tracks_the_eager_caches(toy_model):
 
     stock_caches, stock_token = _prefill(toy_model)
     lane_caches, lane_token = _prefill(toy_model)
-    lane = LagunaCompiledLane(toy_model, CAP, compiled=False).seed(
-        lane_caches, lane_token
-    )
+    lane = LagunaCompiledLane(
+        toy_model, CAP, compiled=False, packed_kv=packed_kv
+    ).seed(lane_caches, lane_token)
 
     for step in range(STEPS):
         stock_token = _stock_step(toy_model, stock_caches, stock_token)
@@ -347,7 +386,7 @@ def test_eager_twin_state_tracks_the_eager_caches(toy_model):
         mx.eval(stock_token, offset, ring_idx, *leaves)
 
         want_offset, want_ring, want_leaves = snapshot_leaves(
-            toy_model, stock_caches, CAP
+            toy_model, stock_caches, CAP, packed_kv=packed_kv
         )
         assert int(offset) == int(want_offset), f"offset drifted at step {step}"
         assert int(ring_idx) == int(want_ring), f"ring slot drifted at step {step}"
@@ -363,16 +402,20 @@ def test_eager_twin_state_tracks_the_eager_caches(toy_model):
         for index, kind in enumerate(LAYER_TYPES):
             if kind != "full_attention":
                 continue
-            tail = leaves[2 * index][..., live:, :]
-            assert _identical(tail, mx.zeros_like(tail)), (
-                f"layer {index} wrote past the live prefix at step {step}"
-            )
+            # Both planes: a merged write that overran would corrupt the values
+            # exactly as readily as the keys.
+            for plane in _layer_kv(leaves, index, packed_kv):
+                tail = plane[..., live:, :]
+                assert _identical(tail, mx.zeros_like(tail)), (
+                    f"layer {index} wrote past the live prefix at step {step}"
+                )
 
 
 # ---------------------------------------------------------------------------
 # compiled against eager
 # ---------------------------------------------------------------------------
-def test_compiled_twin_matches_the_eager_twin(toy_model):
+@pytest.mark.parametrize("packed_kv", [True, False])
+def test_compiled_twin_matches_the_eager_twin(toy_model, packed_kv):
     """Compiling the step may not change what it generates.
 
     The bar is greedy tokens EQUAL and leaves equal to well inside bf16
@@ -388,12 +431,12 @@ def test_compiled_twin_matches_the_eager_twin(toy_model):
 
     eager_caches, eager_token = _prefill(toy_model)
     compiled_caches, compiled_token = _prefill(toy_model)
-    eager = LagunaCompiledLane(toy_model, CAP, compiled=False).seed(
-        eager_caches, eager_token
-    )
-    compiled = LagunaCompiledLane(toy_model, CAP, compiled=True).seed(
-        compiled_caches, compiled_token
-    )
+    eager = LagunaCompiledLane(
+        toy_model, CAP, compiled=False, packed_kv=packed_kv
+    ).seed(eager_caches, eager_token)
+    compiled = LagunaCompiledLane(
+        toy_model, CAP, compiled=True, packed_kv=packed_kv
+    ).seed(compiled_caches, compiled_token)
 
     for step in range(STEPS):
         a = eager.advance()
@@ -420,21 +463,265 @@ def test_compiled_twin_matches_the_eager_twin(toy_model):
     for index, kind in enumerate(LAYER_TYPES):
         if kind != "full_attention":
             continue
-        tail = leaves[2 * index][..., live:, :]
-        assert _identical(tail, mx.zeros_like(tail)), (
-            f"compiled layer {index} wrote past the live prefix"
+        for plane in _layer_kv(leaves, index, packed_kv):
+            tail = plane[..., live:, :]
+            assert _identical(tail, mx.zeros_like(tail)), (
+                f"compiled layer {index} wrote past the live prefix"
+            )
+
+
+# ---------------------------------------------------------------------------
+# the packed KV layout
+# ---------------------------------------------------------------------------
+def test_pack_kv_writes_what_a_concatenate_would(cpu_device):
+    """The pack is a stack; only the op that builds it is chosen for cost.
+
+    ``mx.concatenate([k, v], axis=0)`` is the obvious spelling and the wrong
+    one: MLX has no concatenate kernel, so ``concatenate_gpu`` issues one copy
+    dispatch PER INPUT, which would cost back the write packing removes.  The
+    ``mx.where`` in ``pack_kv`` is a single ``Select``.  Equality here is what
+    says the cheaper spelling is the same layout — plane 0 keys, plane 1 values
+    — and not a transposed or interleaved one.
+    """
+
+    mx.random.seed(29)
+    keys = mx.random.normal((1, 2, 5, 4))
+    values = mx.random.normal((1, 2, 5, 4))
+
+    packed = pack_kv(keys, values)
+    assert packed.shape == (2, 2, 5, 4)
+    assert _identical(packed, mx.concatenate([keys, values], axis=0))
+
+    read_k, read_v = unpack_kv(packed)
+    assert read_k.shape == keys.shape and read_v.shape == values.shape
+    assert _identical(read_k, keys) and _identical(read_v, values)
+
+
+def test_pack_kv_refuses_layouts_it_cannot_represent(cpu_device):
+    """``mx.where`` broadcasts, so mismatches have to be caught, not absorbed.
+
+    A k and v of different shapes, or a batch above one, would silently produce
+    a plausible array — the leading axis is spent on the k/v plane, so B=1 is
+    structural here rather than a convention.
+    """
+
+    with pytest.raises(ValueError, match="same shape"):
+        pack_kv(mx.zeros((1, 2, 5, 4)), mx.zeros((1, 2, 1, 4)))
+    with pytest.raises(ValueError, match="B=1"):
+        pack_kv(mx.zeros((2, 2, 5, 4)), mx.zeros((2, 2, 5, 4)))
+    with pytest.raises(ValueError, match="2 planes"):
+        unpack_kv(mx.zeros((1, 2, 5, 4)))
+
+
+def test_packed_ring_write_matches_rotating_kv_cache_across_two_wraps(cpu_device):
+    """One merged write must land k and v where two separate ones did.
+
+    The same slot-arithmetic contract as the unpacked ring test, run through the
+    single ``[2, H, 1, D]`` update: both planes have to advance together and
+    wrap together, because they now share one ``slice_update`` and one start.
+    """
+
+    mx.random.seed(17)
+    window = 8
+    cache = RotatingKVCache(max_size=window, keep=0)
+    cache.update_and_fetch(
+        mx.random.normal((1, 2, window + 4, 4)),
+        mx.random.normal((1, 2, window + 4, 4)),
+    )
+    ring_k, ring_v, slot = ring_state_from_cache(cache, window)
+    ring = pack_kv(ring_k, ring_v)
+    idx = mx.array(slot, dtype=mx.int32)
+
+    for step in range(2 * window + 3):  # wraps twice with room to spare
+        keys = mx.random.normal((1, 2, 1, 4))
+        values = mx.random.normal((1, 2, 1, 4))
+        cache.update_and_fetch(keys, values)
+
+        ring = kv_slot_write(ring, pack_kv(keys, values), mx.reshape(idx, (1,)))
+        idx = next_ring_index(idx, window)
+        mx.eval(ring, idx, cache.keys, cache.values)
+
+        read_k, read_v = unpack_kv(ring)
+        assert read_k.shape == cache.keys.shape
+        assert _identical(read_k, cache.keys), f"packed keys diverged at {step}"
+        assert _identical(read_v, cache.values), f"packed values diverged at {step}"
+        assert int(idx) == cache._idx % window
+
+
+def test_packed_full_write_matches_kv_cache(cpu_device):
+    """The absolute-position write, merged, still leaves the padding inert."""
+
+    mx.random.seed(23)
+    cap = 16
+    cache = KVCache()
+    cache.update_and_fetch(
+        mx.random.normal((1, 2, 5, 4)), mx.random.normal((1, 2, 5, 4))
+    )
+    leaf = pack_kv(*full_state_from_cache(cache, cap))
+    offset = mx.array(int(cache.offset), dtype=mx.int32)
+
+    for step in range(6):
+        keys = mx.random.normal((1, 2, 1, 4))
+        values = mx.random.normal((1, 2, 1, 4))
+        live_k, live_v = cache.update_and_fetch(keys, values)
+
+        leaf = kv_slot_write(
+            leaf, pack_kv(keys, values), mx.reshape(offset, (1,))
         )
+        offset = offset + 1
+        mx.eval(leaf, offset, live_k, live_v)
+
+        length = int(cache.offset)
+        read_k, read_v = unpack_kv(leaf)
+        assert _identical(live_k, read_k[..., :length, :]), f"keys differ at {step}"
+        assert _identical(live_v, read_v[..., :length, :]), f"values differ at {step}"
+        tail = leaf[..., length:, :]
+        assert _identical(tail, mx.zeros_like(tail)), f"padding written at {step}"
+
+
+def test_packed_snapshot_holds_the_same_state_as_the_unpacked_one(toy_model):
+    """Packing at seed is a re-layout of the same bytes, per layer and plane."""
+
+    caches, _ = _prefill(toy_model)
+    packed_offset, packed_ring, packed = snapshot_leaves(
+        toy_model, caches, CAP, packed_kv=True
+    )
+    plain_offset, plain_ring, plain = snapshot_leaves(
+        toy_model, caches, CAP, packed_kv=False
+    )
+    mx.eval(*packed, *plain)
+
+    assert int(packed_offset) == int(plain_offset)
+    assert int(packed_ring) == int(plain_ring)
+    assert len(packed) * 2 == len(plain) == 2 * len(LAYER_TYPES)
+    for index in range(len(LAYER_TYPES)):
+        for plane, want in zip(
+            _layer_kv(packed, index, True), _layer_kv(plain, index, False)
+        ):
+            assert _identical(plane, want), f"layer {index} re-layout changed bytes"
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_packed_and_unpacked_lanes_generate_the_same_run(toy_model, compiled):
+    """The A/B that makes the flag safe to flip: same tokens, same numbers.
+
+    Packing changes how many dispatches a step costs and nothing about its
+    arithmetic — the same k and v reach the same slots, and attention is handed
+    the same values, just out of one buffer instead of two.  So the bar is
+    BITWISE, not a tolerance, and it is held across a ring wrap (12 steps into
+    an 8-slot window) rather than only in the first pass.
+
+    On CPU the two lanes are bit-identical.  On Metal the packed lane hands
+    ``mx.fast.scaled_dot_product_attention`` a plane of a shared buffer rather
+    than a freshly allocated one; if that ever selects a different kernel
+    variant, this comparison is where it would show up as a drift.
+    """
+
+    steps = toy_model.args.sliding_window + 4
+    packed_caches, packed_token = _prefill(toy_model)
+    plain_caches, plain_token = _prefill(toy_model)
+    packed = LagunaCompiledLane(
+        toy_model, CAP, compiled=compiled, packed_kv=True
+    ).seed(packed_caches, packed_token)
+    plain = LagunaCompiledLane(
+        toy_model, CAP, compiled=compiled, packed_kv=False
+    ).seed(plain_caches, plain_token)
+
+    for step in range(steps):
+        a = packed.advance()
+        b = plain.advance()
+        mx.eval(a, b)
+        assert a.tolist() == b.tolist(), f"packed token diverged at step {step}"
+
+    packed_offset, packed_ring, packed_leaves = packed.state()
+    plain_offset, plain_ring, plain_leaves = plain.state()
+    mx.eval(*packed_leaves, *plain_leaves)
+
+    # The wrap has happened: the ring slot is behind the absolute offset.
+    assert int(packed_ring) == int(plain_ring)
+    assert int(packed_ring) < int(packed_offset)
+    for index in range(len(LAYER_TYPES)):
+        for plane, want in zip(
+            _layer_kv(packed_leaves, index, True),
+            _layer_kv(plain_leaves, index, False),
+        ):
+            assert _identical(plane, want), f"layer {index} state diverged"
+
+
+def test_packing_halves_the_dynamic_cache_writes(toy_model):
+    """The claim the layout exists for, counted rather than asserted in prose.
+
+    Per layer, the packed step must build ONE dynamic write where the unpacked
+    step builds two, and must pay for it with ONE ``Select``.  Translated to
+    Metal that is 4 dispatches a layer against 3: a ``DynamicSliceUpdate`` is
+    two (``compute_dynamic_offset`` then a ``gg*_dynamic_copy``), a ``Select``
+    is one, and the ``Slice``/``Broadcast`` nodes the pack adds are stride
+    rewrites that dispatch nothing.
+
+    ``Concatenate`` is checked as UNCHANGED because it is the trap: MLX has no
+    concatenate kernel and emits one copy per input, so building the packed
+    update with ``mx.concatenate`` would spend both saved dispatches and leave
+    the step no faster than the layout it replaced.
+    """
+
+    caches, token = _prefill(toy_model)
+    plain = LagunaCompiledLane(toy_model, CAP, compiled=False, packed_kv=False)
+    plain.seed(caches, token)
+    plain_counts = _graph_primitives(plain.step(*plain.capture_inputs()))
+
+    caches, token = _prefill(toy_model)
+    packed = LagunaCompiledLane(toy_model, CAP, compiled=False, packed_kv=True)
+    packed.seed(caches, token)
+    packed_counts = _graph_primitives(packed.step(*packed.capture_inputs()))
+
+    layers = len(LAYER_TYPES)
+    assert plain_counts["DynamicSliceUpdate"] == 2 * layers
+    assert packed_counts["DynamicSliceUpdate"] == layers
+    assert packed_counts["Select"] == plain_counts["Select"] + layers
+    assert packed_counts["Concatenate"] == plain_counts["Concatenate"]
+
+
+def test_packing_halves_the_step_arity(toy_model):
+    """What the win is made of: one leaf per layer in, one out, same fixed point.
+
+    Every leaf is one ``mx.slice_update`` in the step and one feedback pair in a
+    capture, so the leaf count IS the count of cache writes per step.  Halving
+    it is the whole point of the layout, and the fixed-point contract
+    ``capture_compiled`` depends on has to survive the halving.
+    """
+
+    caches, token = _prefill(toy_model)
+    packed = LagunaCompiledLane(toy_model, CAP, packed_kv=True).seed(caches, token)
+    assert packed.packed_kv is True
+    assert packed.geometry.leaves_per_layer == 1
+    assert packed.geometry.n_leaves == len(LAYER_TYPES)
+
+    plain_caches, plain_token = _prefill(toy_model)
+    plain = LagunaCompiledLane(toy_model, CAP, packed_kv=False).seed(
+        plain_caches, plain_token
+    )
+    assert plain.geometry.n_leaves == 2 * len(LAYER_TYPES)
+
+    for lane in (packed, plain):
+        inputs = lane.capture_inputs()
+        assert len(inputs) == 3 + lane.geometry.n_leaves
+        outputs = lane.step(*inputs)
+        mx.eval(*outputs)
+        assert len(outputs) == len(inputs)
+        for index, (before, after) in enumerate(zip(inputs, outputs)):
+            assert before.shape == after.shape, f"position {index} changed shape"
+            assert before.dtype == after.dtype, f"position {index} changed dtype"
 
 
 # ---------------------------------------------------------------------------
 # the configurations the shipped checkpoint actually runs in
 # ---------------------------------------------------------------------------
-def _assert_lane_tracks_stock(model, *, compiled, steps=STEPS):
+def _assert_lane_tracks_stock(model, *, compiled, steps=STEPS, packed_kv=True):
     stock_caches, stock_token = _prefill(model)
     lane_caches, lane_token = _prefill(model)
-    lane = LagunaCompiledLane(model, CAP, compiled=compiled).seed(
-        lane_caches, lane_token
-    )
+    lane = LagunaCompiledLane(
+        model, CAP, compiled=compiled, packed_kv=packed_kv
+    ).seed(lane_caches, lane_token)
     for step in range(steps):
         stock_token = _stock_step(model, stock_caches, stock_token)
         twin_token = lane.advance()
@@ -442,6 +729,23 @@ def _assert_lane_tracks_stock(model, *, compiled, steps=STEPS):
         assert twin_token.tolist() == stock_token.tolist(), (
             f"greedy token diverged at step {step}"
         )
+
+
+@pytest.mark.parametrize("packed_kv", [True, False])
+def test_lane_tracks_the_stock_path_across_a_ring_wrap(toy_model, packed_kv):
+    """The merged write has to keep wrapping like ``RotatingKVCache`` does.
+
+    Six steps never reach the end of an eight-slot ring, so the suite's default
+    length cannot see a wrap at model level at all.  Twelve does, against the
+    real cache classes rather than against the other layout.
+    """
+
+    _assert_lane_tracks_stock(
+        toy_model,
+        compiled=True,
+        steps=toy_model.args.sliding_window + 4,
+        packed_kv=packed_kv,
+    )
 
 
 def test_lane_runs_the_quantized_layout(toy_model):
