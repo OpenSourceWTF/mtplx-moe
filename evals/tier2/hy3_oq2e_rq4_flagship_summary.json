@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "model": "hy3-oq2e",
+  "model_key": "hy3-expert-oq2e",
+  "source_commit": "05034f43afb65a1af37eab284cc2747247d39440",
+  "source_receipts": [
+    {
+      "file": "evals/tier2/t3_88col_1024_rep1.json",
+      "sha256": "ca2a50218f27d26e492fa911fd5282caee2b101c9dbbd01bd72ac973f1d84827"
+    },
+    {
+      "file": "evals/tier2/t3_88col_1024_rep2.json",
+      "sha256": "b0d4e66e0de7ab79818ba4a6c64f49505025a646308a6c9d63914a6302568d24"
+    },
+    {
+      "file": "evals/tier2/t3_88col_1024_rep3.json",
+      "sha256": "2dd48365df15420d1eac1cf976a4fd9e4b1cb72fd67ca6cb769c2a0554906885"
+    }
+  ],
+  "hardware": {
+    "soc": "Apple M5 Max",
+    "unified_memory_gb": 128
+  },
+  "configuration": {
+    "expert_bank": "oQ2e",
+    "proj_requant": "q4",
+    "projection_group_size": 64,
+    "island_layer_count": 79,
+    "streamed_layer_count": 0,
+    "kv_quant": null,
+    "kv_precision": "bf16",
+    "memory_limit": "96GiB",
+    "runtime_reserve": "7GiB",
+    "expert_cache_limit": "0",
+    "max_live_kv_tokens": 4096,
+    "context_tokens": 1024,
+    "output_tokens": 256,
+    "sampler": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": 1,
+      "seed": 0
+    }
+  },
+  "repetitions": [
+    {
+      "rep": 1,
+      "ar_decode_tok_s": 41.370014901603504,
+      "mtp_depth_1_decode_tok_s": 47.450162710514476,
+      "accepted_per_verify": 0.8984375,
+      "token_parity": true
+    },
+    {
+      "rep": 2,
+      "ar_decode_tok_s": 41.35480967665663,
+      "mtp_depth_1_decode_tok_s": 48.641733431897634,
+      "accepted_per_verify": 0.8984375,
+      "token_parity": true
+    },
+    {
+      "rep": 3,
+      "ar_decode_tok_s": 41.36659975491645,
+      "mtp_depth_1_decode_tok_s": 48.04075320208318,
+      "accepted_per_verify": 0.8984375,
+      "token_parity": true
+    }
+  ],
+  "means": {
+    "ar_decode_tok_s": 41.36380811105886,
+    "mtp_depth_1_decode_tok_s": 48.044216448165095
+  },
+  "quality_receipts": {
+    "q4_requant": "evals/tier2/humaneval_oq2e_full164_rq4.json",
+    "q8_control": "evals/tier2/humaneval_oq2e_full164_q8.json",
+    "q4_requant_passed": 142,
+    "q8_control_passed": 143,
+    "tasks": 164,
+    "mcnemar_exact_two_sided_p": 1.0
+  }
+}

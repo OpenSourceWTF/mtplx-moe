@@ -90,11 +90,11 @@ An explicit profile runs the same preflight and fails once with required and
 available bytes if it does not fit; it never silently downgrades or routes to a
 stock loader.
 
-| Profile | Weight envelope | Process ceiling | Promoted geometry | Route |
-|---|---:|---:|---|---|
-| `hy3-oq2e-64` | 64 GiB | 71 GiB | zero islands; 49.9921875 GiB frequency cache | AR |
-| `hy3-oq2e-88` | 88 GiB | 95 GiB | 74 pinned island layers; five streamed layers | AR |
-| `hy3-oq2e-96` | 96 GiB | 103 GiB | all 79 routed layers pinned | AR |
+| Profile | Weight envelope | Process ceiling | Promoted geometry | Trunk | Route |
+|---|---:|---:|---|---|---|
+| `hy3-oq2e-64` | 64 GiB | 71 GiB | zero islands; 49.9921875 GiB frequency cache | q4 requant | AR |
+| `hy3-oq2e-88` | 88 GiB | 95 GiB | 74 pinned island layers; five streamed layers | q8 | AR |
+| `hy3-oq2e-96` | 96 GiB | 103 GiB | all 79 routed layers pinned | q8 | AR |
 
 The number in a profile name is its weight envelope, not a machine-RAM
 requirement. The process ceiling adds the exact 7 GiB runtime reserve:
@@ -115,6 +115,51 @@ All three profiles reserve at most 4,096 aggregate live KV tokens. The 64 GiB
 row is the promoted zero-island, cache-heavy execution geometry at its 4K
 product KV ceiling; its separate 16K performance A/B used a 74.75 GiB process
 ceiling and is not the installed product configuration.
+
+## Hy3 q4 resident-trunk requantization
+
+`proj_requant` is separate from the expert-bank quantization. The Hugging Face
+artifact keeps its published oQ2e `experts.bin`; at model construction,
+`"proj_requant": "q4"` converts only supported resident q8 trunk `*_proj`
+matrices to q4/gs64. Expert banks, router gates, embeddings, the LM head, norms,
+and biases retain their loaded precision. The `hy3-oq2e-64` profile already
+enables this setting.
+
+To use q4 resident projections with the full-resident 96 GiB weight envelope,
+save this as `hy3-rq4.json`:
+
+```json
+{
+  "proj_requant": "q4"
+}
+```
+
+Then overlay it on the 79-island profile:
+
+```bash
+"$MTPLX_MOE_VENV/bin/mtplx" serve \
+  --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
+  --download \
+  --expert-profile hy3-oq2e-96 \
+  --expert-streaming-config hy3-rq4.json
+```
+
+This keeps 79 pinned islands, BF16 KV, and the 4,096-token live-KV ceiling from
+the selected profile while changing the trunk to q4. Because the effective
+configuration differs from the promoted `hy3-oq2e-96` row, `/health` reports
+`"customized": true` and does not attach that row's q8 evidence commit.
+
+The flagship q4 receipt is a three-run M5 Max mean at a 1,024-token real-code
+context and 256 generated tokens: **48.04 tok/s** at MTP depth 1, versus a
+41.36 tok/s AR control, with all 79 islands pinned, BF16 KV, and
+`proj_requant=q4`. The paired full-suite HumanEvalPlus result was 142/164
+(86.6%) for q4 versus 143/164 (87.2%) for q8; McNemar's exact two-sided test
+was p=1.0. The
+[compact receipt](../../evals/tier2/hy3_oq2e_rq4_flagship_summary.json)
+retains the exact per-run values, settings, source commit, and raw-receipt
+hashes. The current streamed `mtplx serve` route is AR-only, so the command
+above applies the same requantization to serving but does not enable the MTP
+depth-1 benchmark lane.
 
 ## Islands versus paged streaming
 

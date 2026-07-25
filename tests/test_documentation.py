@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 import tomllib
@@ -161,15 +162,36 @@ def test_readme_publishes_retained_hy3_quality_and_speed_receipts():
     supported_section = readme.split("## Supported models", 1)[1].split(
         "\n## ", 1
     )[0]
+    advanced = (ROOT / "docs/advanced/ssd-streamed-moe.md").read_text(
+        encoding="utf-8"
+    )
+    flagship = json.loads(
+        (
+            ROOT
+            / "evals/tier2/hy3_oq2e_rq4_flagship_summary.json"
+        ).read_text(encoding="utf-8")
+    )
 
     assert "HumanEvalPlus pass@1" in supported_section
-    assert "`hy3-oq2e-64`: 86.6% (142/164)" in supported_section
-    assert "`hy3-oq2e-88`/`-96`: 87.2% (143/164)" in supported_section
+    assert "`q4` requant: 86.6% (142/164)" in supported_section
+    assert "`q8`: 87.2% (143/164)" in supported_section
+    assert "**48.04 tok/s**" in supported_section
+    assert "41.36 tok/s AR control" in supported_section
+    assert "MTP depth 1" in supported_section
     assert "`-64`: 9.31" in supported_section
     assert "`-88`: 22.35" in supported_section
     assert "`-96`: 30.17 tok/s" in supported_section
-    assert "single-stream AR decode" in supported_section
     assert "M5 Max with 128 GB unified memory" in supported_section
+    assert "current `mtplx serve` route is AR-only" in supported_section
+    assert '"proj_requant": "q4"' in advanced
+    assert "79 pinned islands" in advanced
+    assert "BF16 KV" in advanced
+    assert flagship["configuration"]["proj_requant"] == "q4"
+    assert flagship["quality_receipts"]["q4_requant_passed"] == 142
+    assert flagship["quality_receipts"]["q8_control_passed"] == 143
+    assert flagship["means"]["mtp_depth_1_decode_tok_s"] == 48.044216448165095
+    assert flagship["means"]["ar_decode_tok_s"] == 41.36380811105886
+    assert all(row["token_parity"] for row in flagship["repetitions"])
     assert "Not measured" in supported_section
 
 
