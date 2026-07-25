@@ -104,6 +104,53 @@ def test_server_parser_accepts_step_adapter_quant_flags():
     assert args.reasoning_parser == "step3p5"
     assert args.reasoning_effort == "medium"
 
+
+def test_server_backend_defaults_apply_laguna_response_cap_and_codec():
+    args = parse_args(
+        [
+            "--backend-id",
+            "laguna_ar",
+            "--no-load-mtp",
+            "--generation-mode",
+            "ar",
+            "--warmup-tokens",
+            "0",
+        ]
+    )
+    args.max_response_tokens = None
+    args.reasoning_parser = "qwen3"
+
+    openai._apply_backend_server_defaults(args, explicit_flags=set())
+
+    assert args.max_response_tokens == 32_768
+    assert args.reasoning_parser == "poolside_v1"
+    assert args.tool_prompt_mode == "native"
+    assert args.chat_template_profile == "tokenizer"
+
+    with pytest.raises(ValueError, match="requires.*tokenizer chat template"):
+        parse_args(
+            [
+                "--backend-id",
+                "laguna_ar",
+                "--chat-template-profile",
+                "local_qwen36",
+                "--warmup-tokens",
+                "0",
+            ]
+        )
+
+    with pytest.raises(ValueError, match="requires.*tokenizer chat template"):
+        parse_args(
+            [
+                "--backend-id",
+                "laguna_ar",
+                "--chat-template-path",
+                "/tmp/qwen.jinja",
+                "--warmup-tokens",
+                "0",
+            ]
+        )
+
     inferred = parse_args(
         [
             "--model",
@@ -7611,6 +7658,55 @@ def test_opencode_agent_tool_client_uses_compact_prompt_mode(monkeypatch):
     assert "tool_prompt_mode=compact" in seen["session_policy_fingerprint"]
 
 
+def test_laguna_opencode_keeps_poolside_native_tool_protocol(monkeypatch):
+    from mtplx.backends.descriptors import LAGUNA_AR_DESCRIPTOR
+
+    seen: dict[str, object] = {}
+    state = _fake_state()
+    foreground = ForegroundState()
+    state.lock = foreground.lock
+    state.has_foreground = foreground.has_foreground
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.backend_descriptor = LAGUNA_AR_DESCRIPTOR
+    state.args.backend_id = "laguna_ar"
+    state.args.reasoning_parser = "poolside_v1"
+    state.args.tool_prompt_mode = "native"
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+
+    def fake_run_generation(*_args, **kwargs):
+        seen["request_observability"] = dict(kwargs["request_observability"])
+        return _fake_generation("Done")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": "opencode"},
+        json={
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "user", "content": "Read package.json."},
+            ],
+            "tools": [_named_tool_schema("read")],
+            "tool_choice": "auto",
+            "max_tokens": 32,
+        },
+    )
+
+    assert response.status_code == 200
+    messages, kwargs = state.runtime.tokenizer.calls[0]
+    rendered = "\n".join(str(message.get("content") or "") for message in messages)
+    stats = seen["request_observability"]
+    assert "tools" in kwargs
+    assert "Qwen native XML" not in rendered
+    assert "<function=" not in rendered
+    assert "<parameter=" not in rendered
+    assert stats["tool_prompt_mode"] == "native"
+    assert stats["tool_prompt_mode_source"] == "backend:laguna_ar"
+    assert stats["tool_prompt_mode_client_repaired"] is False
+
+
 @pytest.mark.parametrize("client_hint", ["pi", "hermes"])
 def test_agent_tool_clients_repair_native_launch_mode_to_hybrid(monkeypatch, client_hint):
     seen: dict[str, object] = {}
@@ -9462,6 +9558,51 @@ def test_chat_tool_json_returns_openai_tool_calls_nonstream(monkeypatch):
     assert choice["message"]["tool_calls"][0]["function"]["arguments"] == "{}"
 
 
+def test_poolside_tool_call_payload_maps_arg_pairs_to_openai_call():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+
+    calls = openai._parse_generated_tool_calls(
+        "<tool_call>get_weather"
+        "<arg_key>city</arg_key>"
+        "<arg_value>Paris</arg_value>"
+        "</tool_call>",
+        tools=tools,
+    )
+
+    assert calls is not None
+    assert calls[0]["function"] == {
+        "name": "get_weather",
+        "arguments": '{"city":"Paris"}',
+    }
+
+
+def test_poolside_reasoning_parser_keeps_target_default_thinking_enabled():
+    from mtplx.backends.descriptors import LAGUNA_AR_DESCRIPTOR
+
+    state = SimpleNamespace(
+        args=SimpleNamespace(
+            reasoning_parser="poolside_v1",
+            enable_thinking=True,
+        ),
+        backend_descriptor=LAGUNA_AR_DESCRIPTOR,
+    )
+    request = SimpleNamespace(enable_thinking=None)
+
+    assert openai._thinking_enabled_for_request(state, request) is True
+
+
 def test_anthropic_messages_returns_tool_use_nonstream(monkeypatch):
     client = TestClient(create_app(_fake_state()))
     monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
@@ -10741,7 +10882,11 @@ def test_server_state_caps_expert_served_context_to_installed_kv_limit(
         "reconcile_mlx_memory_cap",
         lambda _plan: 256 * 1024**3,
     )
-    monkeypatch.setattr(openai, "_apply_metal_memory_caps", lambda: {})
+    monkeypatch.setattr(
+        openai,
+        "_apply_metal_memory_caps",
+        lambda **_kwargs: {},
+    )
     monkeypatch.setattr(openai, "apply_profile_env", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
@@ -10838,7 +10983,11 @@ def test_server_state_binds_sustained_policy_before_runtime_load(monkeypatch):
             "_GENERATION_FEATURE_POLICY",
             generation_module.bind_generation_feature_policy({}),
         )
-        monkeypatch.setattr(openai, "_apply_metal_memory_caps", lambda: {})
+        monkeypatch.setattr(
+            openai,
+            "_apply_metal_memory_caps",
+            lambda **_kwargs: {},
+        )
         monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
         monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
         monkeypatch.setattr(
@@ -10948,7 +11097,11 @@ def test_server_revalidates_profile_and_reapplies_child_env_before_policy_and_lo
         monkeypatch.setattr(openai, "apply_profile_env", generic_profile_env)
         monkeypatch.setattr(openai, "profile_env_status", lambda *_a, **_k: {})
         monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
-        monkeypatch.setattr(openai, "_apply_metal_memory_caps", lambda: {})
+        monkeypatch.setattr(
+            openai,
+            "_apply_metal_memory_caps",
+            lambda **_kwargs: {},
+        )
         monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
         monkeypatch.setattr(
             openai,
@@ -11915,3 +12068,146 @@ def test_run_generation_passes_draft_core_from_serve_args(monkeypatch):
         session_policy_fingerprint="policy",
     )
     assert captured["draft_core"] == "stock"
+
+
+def _postcommit_route_state(*, mtp_enabled: bool):
+    """A minimal ServerState stub for exercising the postcommit snapshot
+    routing decision (mtp vs ar) without real generation."""
+
+    def _boom_mtp_cache():
+        # LagunaARRuntime.make_mtp_cache raises this; reaching it means the
+        # postcommit took the MTP-only history branch on an AR-only runtime.
+        raise RuntimeError("MTP is not enabled for this runtime")
+
+    class _RouteBank:
+        per_session_max_bytes = 0
+
+        def __init__(self) -> None:
+            self.puts: list[dict] = []
+
+        def longest_prefix(self, _token_ids):
+            return None
+
+        def put(self, **kwargs):
+            self.puts.append(kwargs)
+            return SimpleNamespace(
+                prefix_len=len(kwargs["token_ids"]),
+                nbytes=1,
+                token_hash="route-hash",
+            )
+
+    foreground = ForegroundState()
+    return SimpleNamespace(
+        runtime=SimpleNamespace(
+            mtp_enabled=mtp_enabled,
+            make_mtp_cache=_boom_mtp_cache,
+            tokenizer=SimpleNamespace(),
+        ),
+        sessions=SimpleNamespace(bank=_RouteBank()),
+        lock=foreground.lock,
+        begin_foreground=foreground.begin_foreground,
+        end_foreground=foreground.end_foreground,
+        template_hash="tpl",
+        draft_head_identity="head",
+        session_mtp_history_policy="committed" if mtp_enabled else "none",
+        session_hidden_variant="post_norm" if mtp_enabled else None,
+    )
+
+
+def _make_route_restore(captured: dict):
+    from mtplx.generation import _mtp_history_uses_committed_cache
+
+    def _fake_restore(rt, prompt_ids, *, mtp_history_policy, **_kwargs):
+        captured["restore_policy"] = mtp_history_policy
+        if _mtp_history_uses_committed_cache(mtp_history_policy):
+            # The real committed-history prefill builds an MTP history cache;
+            # on an AR runtime that call is exactly what raised in production.
+            rt.make_mtp_cache()
+        return SimpleNamespace(
+            trunk_cache=["cache"],
+            logits="logits",
+            hidden="hidden",
+            committed_mtp_cache=None,
+            gdn_boundaries=[],
+            mtp_history_policy=mtp_history_policy,
+            cache_hit=False,
+            cached_tokens=0,
+            suffix_tokens=len(prompt_ids),
+            cache_source="none",
+            ssd_cache_hit=False,
+            ssd_cached_tokens=0,
+            ssd_restore_s=0.0,
+            cache_miss_reason=None,
+        )
+
+    return _fake_restore
+
+
+def test_ar_postcommit_snapshot_routes_through_ar_path(monkeypatch):
+    """A laguna_ar/AR-mode postcommit must re-prefill history through the AR
+    target-only path — never the committed MTP-history branch that calls
+    make_mtp_cache() and raises 'MTP is not enabled for this runtime'."""
+
+    state = _postcommit_route_state(mtp_enabled=False)
+    monkeypatch.setattr(
+        openai,
+        "_history_ids_for_postcommit",
+        lambda *_a, **_k: ([1, 2, 3, 4], None),
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        openai, "restore_or_prefill_prompt_state", _make_route_restore(captured)
+    )
+
+    result = openai._store_retokenized_history_snapshot(
+        state,
+        session_id="sess-1",
+        messages=[],
+        assistant_content="hello",
+        thinking_enabled=False,
+        policy_fingerprint="pf",
+    )
+
+    # Routed through the AR path (never the MTP-only committed branch).
+    assert captured["restore_policy"] == "none"
+    assert result["stored"] is True
+    # The banked entry's policy metadata matches what the next AR turn looks up.
+    assert state.sessions.bank.puts
+    assert state.sessions.bank.puts[0]["mtp_history_policy"] == "none"
+
+
+def test_mtp_postcommit_snapshot_keeps_committed_policy(monkeypatch):
+    """MTP-capable runtimes are unchanged: the postcommit still banks under the
+    committed MTP-history policy and exercises the MTP cache."""
+
+    state = _postcommit_route_state(mtp_enabled=True)
+    made = {"mtp_cache": 0}
+
+    def _ok_mtp_cache():
+        made["mtp_cache"] += 1
+        return SimpleNamespace()
+
+    state.runtime.make_mtp_cache = _ok_mtp_cache
+    monkeypatch.setattr(
+        openai,
+        "_history_ids_for_postcommit",
+        lambda *_a, **_k: ([1, 2, 3, 4], None),
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        openai, "restore_or_prefill_prompt_state", _make_route_restore(captured)
+    )
+
+    result = openai._store_retokenized_history_snapshot(
+        state,
+        session_id="sess-1",
+        messages=[],
+        assistant_content="hello",
+        thinking_enabled=False,
+        policy_fingerprint="pf",
+    )
+
+    assert captured["restore_policy"] == "committed"
+    assert made["mtp_cache"] == 1
+    assert result["stored"] is True
+    assert state.sessions.bank.puts[0]["mtp_history_policy"] == "committed"

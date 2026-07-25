@@ -25,6 +25,13 @@ from mtplx.expert_admission import (
     ensure_expert_admitted,
     load_valid_admission_receipt,
 )
+from mtplx.models.laguna_config import (
+    LAGUNA_S_2_1_REPO_ID,
+    LAGUNA_S_2_1_REPO_BYTES,
+    LAGUNA_S_2_1_REQUIRED_FILES,
+    LAGUNA_S_2_1_REVISION,
+    laguna_s_2_1_artifact_integrity_errors,
+)
 from mtplx.profiles import DEFAULT_PROFILE_NAME
 
 
@@ -44,6 +51,7 @@ MTP_SIDECAR_FALLBACKS = (
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 EXPERT_MANIFEST_FILE = "expert-manifest.json"
 MAX_RUNTIME_CONTRACT_BYTES = 1024 * 1024
+SOURCE_MARKER_FILE = ".mtplx-source.json"
 
 
 def read_bounded_artifact_member(
@@ -89,6 +97,101 @@ class RepoFile:
 class RepoInventory:
     resolved_revision: str
     files: tuple[RepoFile, ...]
+
+
+def _effective_model_revision(repo_id: str, revision: str | None) -> str | None:
+    if repo_id.casefold() == LAGUNA_S_2_1_REPO_ID.casefold():
+        if revision is not None and revision != LAGUNA_S_2_1_REVISION:
+            raise ValueError(
+                "Laguna-S-2.1 support is pinned to revision "
+                f"{LAGUNA_S_2_1_REVISION}"
+            )
+        return LAGUNA_S_2_1_REVISION
+    return revision
+
+
+def _source_marker_matches(
+    destination: Path,
+    *,
+    repo_id: str,
+    revision: str | None,
+) -> bool:
+    if repo_id.casefold() != LAGUNA_S_2_1_REPO_ID.casefold():
+        return True
+    try:
+        payload = json.loads(
+            (destination / SOURCE_MARKER_FILE).read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return payload == {"repo_id": repo_id, "revision": revision}
+
+
+def _write_source_marker(
+    destination: Path,
+    *,
+    repo_id: str,
+    revision: str | None,
+) -> None:
+    (destination / SOURCE_MARKER_FILE).write_text(
+        json.dumps(
+            {"repo_id": repo_id, "revision": revision},
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _validate_pinned_laguna_files(destination: Path, repo_id: str) -> None:
+    if repo_id.casefold() != LAGUNA_S_2_1_REPO_ID.casefold():
+        return
+    missing_or_wrong = laguna_s_2_1_artifact_integrity_errors(destination)
+    if missing_or_wrong:
+        raise RuntimeError(
+            "pinned Laguna snapshot is incomplete or differs from revision "
+            f"{LAGUNA_S_2_1_REVISION}: "
+            + ", ".join(sorted(missing_or_wrong))
+        )
+
+
+def _pull_validation(path: Path, repo_id: str) -> dict[str, Any]:
+    validation = validate_mtplx_model_files(path)
+    if repo_id.casefold() != LAGUNA_S_2_1_REPO_ID.casefold():
+        return validation
+    _validate_pinned_laguna_files(path, repo_id)
+    return {
+        **validation,
+        "ok": True,
+        "missing_files": [],
+        "contract_error": None,
+        "required_files": sorted(LAGUNA_S_2_1_REQUIRED_FILES),
+        "mtp_supported": False,
+        "runtime_compatibility": "native-ar-only",
+    }
+
+
+def _require_download_disk_headroom(
+    root: Path,
+    *,
+    total_bytes: int | None,
+    started_size_bytes: int,
+) -> None:
+    if total_bytes is None or total_bytes <= 0:
+        return
+    remaining = max(0, int(total_bytes) - max(0, int(started_size_bytes)))
+    headroom = 5 * 1024**3
+    try:
+        free = int(shutil.disk_usage(root).free)
+    except OSError:
+        return
+    required = remaining + headroom
+    if free < required:
+        raise RuntimeError(
+            "insufficient free disk space for model download: "
+            f"need {required / 1024**3:.1f} GiB including headroom, "
+            f"have {free / 1024**3:.1f} GiB"
+        )
 
 
 def _repo_file_from_sibling(sibling: Any) -> RepoFile | None:
@@ -523,6 +626,17 @@ def _repo_requires_qwen_mtplx_payload(repo_id: str) -> bool:
 def _cached_model_ready_for_repo(path: Path, repo_id: str) -> bool:
     if not cached_model_is_complete(path):
         return False
+    if repo_id.casefold() == LAGUNA_S_2_1_REPO_ID.casefold():
+        if not _source_marker_matches(
+            path,
+            repo_id=repo_id,
+            revision=LAGUNA_S_2_1_REVISION,
+        ):
+            return False
+        try:
+            _validate_pinned_laguna_files(path, repo_id)
+        except RuntimeError:
+            return False
     if _repo_requires_qwen_mtplx_payload(repo_id):
         return bool(validate_mtplx_model_files(path).get("ok"))
     return True
@@ -1683,6 +1797,7 @@ def _pull_model_unlocked(
     repo_id = repo_id_from_model_ref(model_ref)
     if repo_id is None:
         raise ValueError(f"pull requires a Hugging Face repo id or URL, got: {model_ref}")
+    revision = _effective_model_revision(repo_id, revision)
     root = model_cache_dir(cache_dir)
     root.mkdir(parents=True, exist_ok=True)
     destination = cached_model_path(repo_id, cache_dir=root)
@@ -1752,10 +1867,17 @@ def _pull_model_unlocked(
             if reuse_allowed:
                 resolved_revision = receipt_revision
     elif local_ready and not expert_repo:
-        reuse_allowed = _local_matches_remote_index(
-            destination,
-            repo_id,
-            resolved_revision,
+        reuse_allowed = (
+            _source_marker_matches(
+                destination,
+                repo_id=repo_id,
+                revision=revision,
+            )
+            and _local_matches_remote_index(
+                destination,
+                repo_id,
+                resolved_revision,
+            )
         )
 
     if reuse_allowed:
@@ -1763,6 +1885,7 @@ def _pull_model_unlocked(
         reused_existing = True
         resumed_existing = False
         validation = validate_mtplx_model_files(resolved)
+        _validate_pinned_laguna_files(resolved, repo_id)
         if repo_id.lower().startswith("youssofal/qwen3.6-27b-mtplx") and not validation["ok"]:
             raise RuntimeError(
                 "cached MTPLX model is incomplete: "
@@ -1805,13 +1928,20 @@ def _pull_model_unlocked(
             )
         reused_existing = False
         resumed_existing = destination.exists() and started_size > 0
-        destination.mkdir(parents=True, exist_ok=True)
         total_bytes = sum(
             repo_file.size_bytes
             for repo_file in inventory.files
             if isinstance(repo_file.size_bytes, int)
             and repo_file.size_bytes > 0
         ) or None
+        if repo_id.casefold() == LAGUNA_S_2_1_REPO_ID.casefold():
+            total_bytes = LAGUNA_S_2_1_REPO_BYTES
+        _require_download_disk_headroom(
+            root,
+            total_bytes=total_bytes,
+            started_size_bytes=started_size,
+        )
+        destination.mkdir(parents=True, exist_ok=True)
         _emit_download_progress(
             progress_callback,
             {
@@ -1900,6 +2030,13 @@ def _pull_model_unlocked(
                 revision=inventory.resolved_revision,
                 trusted_bank_digests=downloaded_digests,
             )
+        _validate_pinned_laguna_files(resolved, repo_id)
+        if repo_id.casefold() == LAGUNA_S_2_1_REPO_ID.casefold():
+            _write_source_marker(
+                resolved,
+                repo_id=repo_id,
+                revision=revision,
+            )
         final_size = directory_size_bytes(resolved)
         _emit_download_progress(
             progress_callback,
@@ -1925,7 +2062,7 @@ def _pull_model_unlocked(
         "size_bytes": directory_size_bytes(resolved),
         "has_runtime_contract": (resolved / "mtplx_runtime.json").exists(),
         "has_config": (resolved / "config.json").exists(),
-        "validation": validate_mtplx_model_files(resolved),
+        "validation": _pull_validation(resolved, repo_id),
     }
 
 

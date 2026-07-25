@@ -1,1 +1,1 @@
-"""Model overlays used by optional MTPLX execution paths."""
+"""MTPLX-owned model implementations and optional execution-path overlays."""

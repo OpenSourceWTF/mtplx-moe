@@ -161,7 +161,7 @@ class ContextWindowPolicy:
         if value is None:
             return self
         resolved = int(value)
-        if resolved <= 0 or resolved > 1_000_000:
+        if resolved <= 0 or resolved > 1_048_576:
             return self
         maximum = max(int(self.minimum), resolved)
         default = min(maximum, max(int(self.minimum), int(self.default)))
@@ -270,6 +270,11 @@ class BackendDescriptor:
     context_window_policy: ContextWindowPolicy = field(
         default_factory=ContextWindowPolicy
     )
+    default_max_response_tokens: int | None = None
+    default_tool_prompt_mode: str = "hybrid"
+    required_tool_prompt_mode: str | None = None
+    required_chat_template_profile: str | None = None
+    allows_chat_template_path: bool = True
     validation_status: str = "qa_verified"
     app_ui_policy: str = "descriptor_owned"
     status: str = "qa_verified"
@@ -310,6 +315,11 @@ class BackendDescriptor:
             "tune_policy": self.tune_policy.to_dict(),
             "kv_quant_policy": self.kv_quant_policy.to_dict(),
             "context_window_policy": self.context_window_policy.to_dict(),
+            "default_max_response_tokens": self.default_max_response_tokens,
+            "default_tool_prompt_mode": self.default_tool_prompt_mode,
+            "required_tool_prompt_mode": self.required_tool_prompt_mode,
+            "required_chat_template_profile": self.required_chat_template_profile,
+            "allows_chat_template_path": self.allows_chat_template_path,
             "validation_status": self.validation_status,
             "app_ui_policy": self.app_ui_policy,
             "status": self.status,
@@ -365,6 +375,57 @@ QWEN3_NEXT_DESCRIPTOR = BackendDescriptor(
         source="qwen3_next_config",
     ),
     status="qa_verified",
+)
+
+
+LAGUNA_AR_DESCRIPTOR = BackendDescriptor(
+    backend_id="laguna_ar",
+    architecture_id="laguna-s-2.1-ar",
+    model_family="laguna",
+    display_name="Laguna-S-2.1 target-only AR",
+    artifact_layout="single_mlx_folder_target_only_ar",
+    runtime_capabilities=("target_logits", "target_only_ar"),
+    sampler_defaults=SamplerDefaults(temperature=1.0, top_p=1.0, top_k=20),
+    reasoning_codec=ReasoningCodec(
+        parser="poolside_v1",
+        display_name="Poolside v1 think tags",
+        default_mode="on",
+        supported=True,
+        modes=("auto", "on", "off"),
+        history_policy="preserve_when_enabled",
+    ),
+    draft_semantics=DraftSemantics(
+        request_field="depth",
+        display_label="Draft depth",
+        default=1,
+        minimum=1,
+        maximum=1,
+        unit="depth",
+    ),
+    uses_external_assistant=False,
+    uses_draft_lm_head=False,
+    tune_policy=TunePolicy(
+        supported=False,
+        supported_families=(),
+        unsupported_reason="Laguna-S-2.1 is installed as target-only AR.",
+    ),
+    kv_quant_policy=KVQuantPolicy(supported=False),
+    context_window_policy=ContextWindowPolicy(
+        maximum=1_048_576,
+        default=32_768,
+        source="laguna_s_2_1_config",
+    ),
+    default_max_response_tokens=32_768,
+    default_tool_prompt_mode="native",
+    required_tool_prompt_mode="native",
+    required_chat_template_profile="tokenizer",
+    allows_chat_template_path=False,
+    validation_status="target_exact_ar",
+    status="target_exact_ar",
+    notes=(
+        "The checkpoint has no native MTP head.",
+        "The bundled loader and native MLX cache path are pinned to Laguna-S-2.1 4-bit geometry.",
+    ),
 )
 
 
@@ -628,6 +689,7 @@ GEMMA4_ASSISTANT_DESCRIPTOR = BackendDescriptor(
 
 DESCRIPTORS_BY_BACKEND_ID: dict[str, BackendDescriptor] = {
     QWEN3_NEXT_DESCRIPTOR.backend_id: QWEN3_NEXT_DESCRIPTOR,
+    LAGUNA_AR_DESCRIPTOR.backend_id: LAGUNA_AR_DESCRIPTOR,
     NATIVE_CONTRACT_DESCRIPTOR.backend_id: NATIVE_CONTRACT_DESCRIPTOR,
     GEMMA4_ASSISTANT_DESCRIPTOR.backend_id: GEMMA4_ASSISTANT_DESCRIPTOR,
     STEP3P5_MTP_DESCRIPTOR.backend_id: STEP3P5_MTP_DESCRIPTOR,
@@ -794,7 +856,7 @@ def _context_window_from_inspection(inspection: dict[str, Any] | None) -> int | 
             value = source.get(key)
             if isinstance(value, int):
                 candidates.append(value)
-    sane = [value for value in candidates if 0 < value <= 1_000_000]
+    sane = [value for value in candidates if 0 < value <= 1_048_576]
     return max(sane) if sane else None
 
 
@@ -845,6 +907,8 @@ def reasoning_policy_for_model(
         return GLM_MTP_DESCRIPTOR.reasoning_codec
     if family == "deepseek":
         return DEEPSEEK_MTP_DESCRIPTOR.reasoning_codec
+    if family == "laguna":
+        return LAGUNA_AR_DESCRIPTOR.reasoning_codec
     return ReasoningCodec(
         parser="none",
         display_name="No verified reasoning parser",

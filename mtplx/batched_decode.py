@@ -335,15 +335,16 @@ def _run_ar_loop(
                 rc.offsets = mx.where(idle_dev, pin_off, rc.offsets).astype(mx.int32)
         for rc in ragged:
             rc.reserve(1)
+        # No draft head runs on this lane, so the hidden state is dead weight
+        # here — and a target-only runtime (Laguna) returns logits ONLY, so
+        # asking for it is an unpack error rather than a wasted tensor.
         with attention_phase("decode_verify"):
-            v_logits, v_hidden = rt.forward_ar(
-                mx.expand_dims(x_ids, axis=1), cache=cache, return_hidden=True
-            )
+            v_logits = rt.forward_ar(mx.expand_dims(x_ids, axis=1), cache=cache)
         return {
             "x": x_ids,
             "v_logits": v_logits,
             "next_ll": v_logits[:, -1, :],
-            "next_hl": v_hidden[:, -1:, :],
+            "next_hl": None,
         }
 
     def _read(sub: dict[str, Any]) -> list[int]:
@@ -791,8 +792,20 @@ def generate_greedy_batched(
         snapshot_untrimmable_cache,
     )
 
-    if not rt.mtp_enabled:
-        raise RuntimeError("generate_greedy_batched requires an MTP-enabled runtime")
+    decode_mode = str(decode_mode).strip().lower()
+    if decode_mode not in ("spec", "ar"):
+        raise ValueError(f"decode_mode must be 'spec' or 'ar', got {decode_mode!r}")
+    ar_mode = decode_mode == "ar"
+
+    # The AR lane needs no draft head: `_run_ar_loop` runs one [B,1] forward per
+    # cycle with no draft, no verify decision and no replay.  Requiring MTP here
+    # locked out every target-only runtime (Laguna has no MTP head at all) from
+    # a lane that never touches one.  The speculative lane still requires it.
+    if not ar_mode and not rt.mtp_enabled:
+        raise RuntimeError(
+            "generate_greedy_batched(decode_mode='spec') requires an "
+            "MTP-enabled runtime; use decode_mode='ar' for target-only runtimes"
+        )
     if not prompts:
         raise ValueError("prompts must be non-empty")
     if max_new_tokens < 1:
@@ -834,10 +847,6 @@ def generate_greedy_batched(
         )
     stop = {int(t) for t in (stop_token_ids or set())}
 
-    decode_mode = str(decode_mode).strip().lower()
-    if decode_mode not in ("spec", "ar"):
-        raise ValueError(f"decode_mode must be 'spec' or 'ar', got {decode_mode!r}")
-    ar_mode = decode_mode == "ar"
 
     refill = refill_queue is not None
     if refill:
@@ -871,20 +880,31 @@ def generate_greedy_batched(
         [[int(pad_id)] * prompt_len for _ in range(batch)] if refill else slots
     )
     started = time.perf_counter()
+    # Only the speculative lane consumes hidden states (the draft head reads
+    # them).  The AR lane never does, and a target-only runtime such as Laguna
+    # returns logits ONLY — asking it for hidden states is an unpack error at
+    # the very first forward.
     with attention_phase("prefill"):
-        logits, hidden = rt.forward_ar(
-            mx.array(prefill_rows),
-            cache=cache,
-            return_hidden=True,
-        )
-    mx.eval(logits, hidden)
-    if int(logits.shape[0]) != batch or int(hidden.shape[0]) != batch:
+        if ar_mode:
+            logits = rt.forward_ar(mx.array(prefill_rows), cache=cache)
+            hidden = None
+        else:
+            logits, hidden = rt.forward_ar(
+                mx.array(prefill_rows),
+                cache=cache,
+                return_hidden=True,
+            )
+    mx.eval(logits) if hidden is None else mx.eval(logits, hidden)
+    if int(logits.shape[0]) != batch or (
+        hidden is not None and int(hidden.shape[0]) != batch
+    ):
         raise RuntimeError(
             f"prefill collapsed the batch dim: logits {tuple(logits.shape)} "
-            f"hidden {tuple(hidden.shape)} for B={batch}"
+            f"hidden {None if hidden is None else tuple(hidden.shape)} "
+            f"for B={batch}"
         )
     logits_last = logits[:, -1, :]  # [batch, V]
-    hidden_last = hidden[:, -1:, :]  # [batch, 1, H]
+    hidden_last = None if hidden is None else hidden[:, -1:, :]  # [batch, 1, H]
     prefill_s = time.perf_counter() - started
 
     # Request-indexed results with slot indirection: slot ``b`` currently serves

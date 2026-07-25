@@ -170,6 +170,27 @@ override precedence, health evidence, and LiteLLM setup.
 Use `mtplx help advanced` for QA, profiling, support bundles, and kernel tools.
 See the [documentation index](docs/README.md).
 
+### Laguna S-2.1
+
+[Laguna-S-2.1 oQ4e](https://huggingface.co/mlx-community/Laguna-S-2.1-oQ4e) is supported through its exact MLX architecture in target-only AR mode:
+
+```bash
+mtplx start cli \
+  --model mlx-community/Laguna-S-2.1-oQ4e \
+  --download \
+  --no-mtp
+```
+
+MTPLX pins that model to revision
+`8e3f5cad513746264940c1c4195de48d7ea345a5` and verifies the 13-shard layout,
+tokenizer, generation config, special tokens map, and Poolside chat template
+before admitting it. The checkpoint has no native MTP head, so an MTP launch is
+rejected before weights load instead of falling back during execution. The
+weights occupy 59.72 GiB (64.13 GB); use a Mac with at least 96 GiB unified
+memory (128 GiB is recommended). MTPLX defaults Laguna to a 32,768-token context
+and response cap, and checks larger explicit server contexts against the active
+Metal memory cap.
+
 ## What MTPLX is not
 
 - Not an external-drafter system. The drafter is the target model's own MTP heads.

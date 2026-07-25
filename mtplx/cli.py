@@ -2150,7 +2150,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_reasoning_effort_arg(quickstart_server_p)
     quickstart_server_p.add_argument(
         "--reasoning-parser",
-        choices=["qwen3", "step3p5", "gemma4", "none"],
+        choices=["qwen3", "step3p5", "gemma4", "poolside_v1", "none"],
         default="qwen3",
     )
     _add_preserve_thinking_arg(quickstart_server_p)
@@ -2642,7 +2642,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_reasoning_effort_arg(serve_p)
     serve_p.add_argument(
         "--reasoning-parser",
-        choices=["qwen3", "step3p5", "gemma4", "none"],
+        choices=["qwen3", "step3p5", "gemma4", "poolside_v1", "none"],
         default="qwen3",
     )
     _add_preserve_thinking_arg(serve_p)

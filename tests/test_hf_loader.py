@@ -688,6 +688,18 @@ def test_resolve_model_path_uses_cache_for_hf_refs(tmp_path: Path):
     assert resolve_model_path("mtplx/example", cache_dir=tmp_path) == cached
 
 
+def test_resolve_model_path_rejects_unpinned_laguna_cache(tmp_path: Path):
+    from mtplx.models.laguna_config import LAGUNA_S_2_1_REPO_ID
+
+    cached = cached_model_path(LAGUNA_S_2_1_REPO_ID, cache_dir=tmp_path)
+    cached.mkdir()
+    (cached / "config.json").write_text("{}\n", encoding="utf-8")
+    (cached / "model.safetensors").write_bytes(b"weights")
+
+    with pytest.raises(FileNotFoundError, match="not cached"):
+        resolve_model_path(LAGUNA_S_2_1_REPO_ID, cache_dir=tmp_path)
+
+
 def test_cached_model_is_complete_rejects_interrupted_indexed_download(tmp_path: Path):
     cached = tmp_path / "mtplx--example"
     cached.mkdir()
@@ -778,6 +790,151 @@ def test_pull_model_reuses_complete_destination_without_redownload(
     assert result["path"] == str(cached)
     assert result["reused_existing"] is True
     assert result["resumed_existing"] is False
+
+
+def _install_snapshot_hub(
+    monkeypatch,
+    *,
+    resolved_revision: str,
+    snapshot_download,
+) -> None:
+    hub = ModuleType("huggingface_hub")
+    hub.__path__ = []
+
+    class FakeHfApi:
+        def model_info(self, **kwargs):
+            assert kwargs["revision"] == resolved_revision
+            return SimpleNamespace(
+                sha=resolved_revision,
+                siblings=[
+                    SimpleNamespace(
+                        rfilename="config.json",
+                        size=2,
+                        lfs=None,
+                    )
+                ],
+            )
+
+    hub.HfApi = FakeHfApi
+    hub.snapshot_download = snapshot_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+
+
+def test_pull_model_pins_laguna_revision_and_records_source(
+    tmp_path: Path, monkeypatch
+):
+    from mtplx.models.laguna_config import (
+        LAGUNA_S_2_1_REPO_ID,
+        LAGUNA_S_2_1_REVISION,
+        LAGUNA_S_2_1_SHARD_SIZES,
+    )
+
+    # This test exercises revision pinning and source-marker recording, not the
+    # disk preflight (covered separately). Mock free space so it stays hermetic
+    # regardless of the host's actual free disk.
+    monkeypatch.setattr(
+        "mtplx.hf_loader.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=256 * 1024**3),
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_snapshot_download(**kwargs):
+        from mtplx.models import laguna_config
+
+        captured.update(kwargs)
+        destination = Path(kwargs["local_dir"])
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "config.json").write_text("{}", encoding="utf-8")
+        weight_map = {}
+        for index, (name, size) in enumerate(LAGUNA_S_2_1_SHARD_SIZES.items()):
+            with (destination / name).open("wb") as handle:
+                handle.truncate(size)
+            weight_map[f"model.layer.{index}"] = name
+        (destination / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map}),
+            encoding="utf-8",
+        )
+        (destination / "tokenizer.json").write_text("{}", encoding="utf-8")
+        (destination / "tokenizer_config.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        (destination / "generation_config.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        (destination / "special_tokens_map.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        (destination / "chat_template.jinja").write_text(
+            "{{ messages }}",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            laguna_config,
+            "LAGUNA_S_2_1_SIDECAR_SHA256",
+            {
+                name: hashlib.sha256((destination / name).read_bytes()).hexdigest()
+                for name in laguna_config.LAGUNA_S_2_1_SIDECAR_SHA256
+            },
+        )
+        return str(destination)
+
+    _install_snapshot_hub(
+        monkeypatch,
+        resolved_revision=LAGUNA_S_2_1_REVISION,
+        snapshot_download=fake_snapshot_download,
+    )
+
+    result = pull_model(LAGUNA_S_2_1_REPO_ID, cache_dir=tmp_path)
+
+    assert captured["revision"] == LAGUNA_S_2_1_REVISION
+    assert result["revision"] == LAGUNA_S_2_1_REVISION
+    assert result["validation"]["ok"] is True
+    assert result["validation"]["missing_files"] == []
+    assert result["validation"]["runtime_compatibility"] == "native-ar-only"
+    marker = json.loads(
+        (Path(result["path"]) / ".mtplx-source.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert marker == {
+        "repo_id": LAGUNA_S_2_1_REPO_ID,
+        "revision": LAGUNA_S_2_1_REVISION,
+    }
+
+    with pytest.raises(ValueError, match="pinned to revision"):
+        pull_model(
+            LAGUNA_S_2_1_REPO_ID,
+            cache_dir=tmp_path,
+            revision="main",
+        )
+
+
+def test_pull_model_rejects_laguna_download_without_disk_headroom(
+    tmp_path: Path, monkeypatch
+):
+    from mtplx.models.laguna_config import (
+        LAGUNA_S_2_1_REPO_ID,
+        LAGUNA_S_2_1_REVISION,
+    )
+
+    monkeypatch.setattr(
+        "mtplx.hf_loader.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=8 * 1024**3),
+    )
+    _install_snapshot_hub(
+        monkeypatch,
+        resolved_revision=LAGUNA_S_2_1_REVISION,
+        snapshot_download=lambda **_kwargs: pytest.fail(
+            "download started before disk-space preflight"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="free disk space"):
+        pull_model(LAGUNA_S_2_1_REPO_ID, cache_dir=tmp_path)
 
 
 def test_pull_model_resumes_incomplete_destination(

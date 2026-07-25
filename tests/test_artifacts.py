@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 
 import numpy as np
@@ -1647,6 +1649,316 @@ def test_llama_without_mtp_is_no_mtp(tmp_path):
 
     assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["exit_code"] == 2
+
+
+def _laguna_s_2_1_config(**updates):
+    layer_types = [
+        layer_type
+        for _ in range(12)
+        for layer_type in (
+            "full_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+        )
+    ]
+    from mtplx.models.laguna_config import LAGUNA_S_2_1_QUANTIZATION
+
+    quantization = copy.deepcopy(LAGUNA_S_2_1_QUANTIZATION)
+    config = {
+        "architectures": ["LagunaForCausalLM"],
+        "model_type": "laguna",
+        "hidden_size": 3072,
+        "num_hidden_layers": 48,
+        "intermediate_size": 12288,
+        "num_attention_heads": 48,
+        "num_attention_heads_per_layer": [
+            48 if layer_type == "full_attention" else 72
+            for layer_type in layer_types
+        ],
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "vocab_size": 100352,
+        "bos_token_id": 2,
+        "eos_token_id": [2, 24],
+        "pad_token_id": 9,
+        "rms_norm_eps": 1e-6,
+        "num_experts": 256,
+        "num_experts_per_tok": 10,
+        "moe_intermediate_size": 1024,
+        "shared_expert_intermediate_size": 1024,
+        "decoder_sparse_step": 1,
+        "norm_topk_prob": True,
+        "moe_routed_scaling_factor": 2.5,
+        "moe_router_logit_softcapping": 0.0,
+        "moe_apply_router_weight_on_input": False,
+        "router_aux_loss_coef": 0.0,
+        "mlp_only_layers": [0],
+        "gating": "per-head",
+        "gating_types": ["per_head"] * 48,
+        "sliding_window": 512,
+        "layer_types": layer_types,
+        "mlp_layer_types": ["dense", *("sparse" for _ in range(47))],
+        "rope_parameters": {
+            "full_attention": {
+                "rope_type": "yarn",
+                "rope_theta": 500_000.0,
+                "factor": 128.0,
+                "original_max_position_embeddings": 8192,
+                "beta_slow": 1.0,
+                "beta_fast": 32.0,
+                "attention_factor": 1.4852030263919618,
+                "partial_rotary_factor": 0.5,
+            },
+            "sliding_attention": {
+                "rope_type": "default",
+                "rope_theta": 10_000.0,
+                "partial_rotary_factor": 1.0,
+            },
+        },
+        "max_position_embeddings": 1_048_576,
+        "tie_word_embeddings": False,
+        "torch_dtype": "bfloat16",
+        "use_cache": True,
+        "quantization": copy.deepcopy(quantization),
+        "quantization_config": copy.deepcopy(quantization),
+    }
+    config.update(updates)
+    return config
+
+
+def _pipenetwork_laguna_config(**updates):
+    """The superseded uniform-4bit build; kept only as rejection coverage."""
+
+    quantization = {
+        "bits": 4,
+        "group_size": 64,
+        "mode": "affine",
+        **{
+            f"model.layers.{layer}.mlp.gate": {"bits": 8, "group_size": 64}
+            for layer in range(1, 48)
+        },
+    }
+    return _laguna_s_2_1_config(
+        quantization=copy.deepcopy(quantization),
+        quantization_config=copy.deepcopy(quantization),
+        **updates,
+    )
+
+
+def _write_laguna_s_2_1_artifacts(path, monkeypatch):
+    from mtplx.models import laguna_config
+    from mtplx.models.laguna_config import (
+        LAGUNA_S_2_1_REPO_ID,
+        LAGUNA_S_2_1_REVISION,
+        LAGUNA_S_2_1_SHARD_SIZES,
+    )
+
+    (path / ".mtplx-source.json").write_text(
+        json.dumps(
+            {
+                "repo_id": LAGUNA_S_2_1_REPO_ID,
+                "revision": LAGUNA_S_2_1_REVISION,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    shards = [
+        f"model-{index:05d}-of-00013.safetensors"
+        for index in range(1, 14)
+    ]
+    (path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    f"model.layer.{index}": shard
+                    for index, shard in enumerate(shards)
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    for shard in shards:
+        with (path / shard).open("wb") as handle:
+            handle.truncate(LAGUNA_S_2_1_SHARD_SIZES[shard])
+    (path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (path / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    (path / "generation_config.json").write_text("{}", encoding="utf-8")
+    (path / "special_tokens_map.json").write_text("{}", encoding="utf-8")
+    (path / "chat_template.jinja").write_text(
+        "{{ messages }}",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        laguna_config,
+        "LAGUNA_S_2_1_SIDECAR_SHA256",
+        {
+            name: hashlib.sha256((path / name).read_bytes()).hexdigest()
+            for name in laguna_config.LAGUNA_S_2_1_SIDECAR_SHA256
+        },
+    )
+
+
+def test_laguna_config_only_directory_is_not_runnable(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(_laguna_s_2_1_config()),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "no-MTP"
+    assert result.compatibility["can_run"] is False
+
+
+def test_complete_laguna_s_2_1_mlx_4bit_is_runnable_ar_only(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "config.json").write_text(
+        json.dumps(_laguna_s_2_1_config()),
+        encoding="utf-8",
+    )
+    _write_laguna_s_2_1_artifacts(tmp_path, monkeypatch)
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "AR-only"
+    assert result.compatibility["arch_id"] == "laguna-s-2.1-ar"
+    assert result.compatibility["recognized"] is True
+    assert result.compatibility["supported"] is True
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["mtp_supported"] == "no"
+    assert result.compatibility["runtime_compatibility"] == "native-ar-only"
+
+
+def test_laguna_shard_with_wrong_size_is_not_runnable(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text(
+        json.dumps(_laguna_s_2_1_config()),
+        encoding="utf-8",
+    )
+    _write_laguna_s_2_1_artifacts(tmp_path, monkeypatch)
+    (tmp_path / "model-00013-of-00013.safetensors").write_bytes(b"tampered")
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "no-MTP"
+    assert result.compatibility["can_run"] is False
+
+
+def test_laguna_without_poolside_chat_template_is_not_runnable(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "config.json").write_text(
+        json.dumps(_laguna_s_2_1_config()),
+        encoding="utf-8",
+    )
+    _write_laguna_s_2_1_artifacts(tmp_path, monkeypatch)
+    (tmp_path / "chat_template.jinja").unlink()
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "no-MTP"
+    assert result.compatibility["can_run"] is False
+
+
+@pytest.mark.parametrize(
+    ("filename", "contents"),
+    (
+        ("tokenizer.json", "not-json"),
+        ("chat_template.jinja", "{% if broken %}"),
+    ),
+)
+def test_laguna_with_mutated_pinned_sidecar_is_not_runnable(
+    tmp_path, monkeypatch, filename, contents
+):
+    (tmp_path / "config.json").write_text(
+        json.dumps(_laguna_s_2_1_config()),
+        encoding="utf-8",
+    )
+    _write_laguna_s_2_1_artifacts(tmp_path, monkeypatch)
+    (tmp_path / filename).write_text(contents, encoding="utf-8")
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "no-MTP"
+    assert result.compatibility["can_run"] is False
+
+
+def test_non_4bit_laguna_is_not_admitted_by_target_only_gate(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            _laguna_s_2_1_config(
+                quantization={"bits": 8, "group_size": 64, "mode": "affine"},
+                quantization_config={"bits": 8, "group_size": 64, "mode": "affine"},
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "no-MTP"
+    assert result.compatibility["can_run"] is False
+
+
+def test_superseded_pipenetwork_laguna_is_not_admitted(tmp_path, monkeypatch):
+    # The pin moved to mlx-community/Laguna-S-2.1-oQ4e; the older uniform-4bit
+    # pipenetwork build shares the geometry but not the quantization map, so it
+    # is now blocked like any other non-pinned variant even with a fully written
+    # (but wrong-hash) artifact set.
+    (tmp_path / "config.json").write_text(
+        json.dumps(_pipenetwork_laguna_config()),
+        encoding="utf-8",
+    )
+    _write_laguna_s_2_1_artifacts(tmp_path, monkeypatch)
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "no-MTP"
+    assert result.compatibility["can_run"] is False
+
+
+def test_laguna_config_with_remote_model_file_is_blocked(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(_laguna_s_2_1_config(model_file="evil.py")),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "no-MTP"
+    assert result.compatibility["can_run"] is False
+
+
+def test_wrong_laguna_expert_geometry_is_not_admitted_by_target_only_gate(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(_laguna_s_2_1_config(num_experts=128)),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "no-MTP"
+    assert result.compatibility["can_run"] is False
+
+
+def test_wrong_laguna_attention_geometry_is_not_admitted_by_target_only_gate(
+    tmp_path,
+):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            _laguna_s_2_1_config(num_attention_heads_per_layer=[48] * 48)
+        ),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "no-MTP"
+    assert result.compatibility["can_run"] is False
 
 
 def test_hf_qwen_mtp_without_runtime_contract_is_family_runnable(monkeypatch):

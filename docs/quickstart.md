@@ -33,6 +33,15 @@ mtplx start cli --no-mtp
 mtplx quickstart --port 8000 --no-stats-footer
 ```
 
-`--no-mtp` switches generation to target-only AR while keeping the same runtime load path. In terminal chat, use `/mtp off`, `/mtp on`, and `/mtp status` to switch the next turn without reloading the model.
+`--no-mtp` switches generation to target-only AR. For MTP-equipped models the
+MTP runtime stays loaded, so terminal chat can use `/mtp off`, `/mtp on`, and
+`/mtp status` without reloading. Native AR-only models such as
+`mlx-community/Laguna-S-2.1-oQ4e` instead install an unloaded AR route at
+construction because there is no MTP head to retain.
+
+The Laguna download is pinned automatically. It needs about 64.13 GB of disk
+space and at least 96 GiB unified memory; 128 GiB is recommended. Its default
+context and maximum response are 32,768 tokens. A larger explicit server
+context is accepted only when it fits the active Metal resident-memory cap.
 
 Use `mtplx doctor --deep --json` for exhaustive diagnostics and `mtplx doctor --bundle` to create a redacted support bundle.
