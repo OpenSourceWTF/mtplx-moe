@@ -453,6 +453,8 @@ def _fingerprint_state(policy: str, *, capable: bool):
         args=args,
         template_hash="template",
         draft_head_identity="draft",
+        session_mtp_history_policy="committed",
+        session_hidden_variant="post_norm",
         reasoning_history_scoped_capable=capable,
     )
 

@@ -1803,6 +1803,17 @@ class ServerState:
             load_heartbeat.set()
         self.load_time_s = time.perf_counter() - started
         _startup_line(f"[5/6] Model loaded in {self.load_time_s:.1f}s")
+        # SessionBank identity follows the installed runtime, not the per-request
+        # generation mode. Bind it once so an AR-only expert runtime never enters
+        # hidden-state or MTP-cache construction during postcommit maintenance.
+        self.session_mtp_history_policy = (
+            "committed" if self.runtime.mtp_enabled else "none"
+        )
+        self.session_hidden_variant = (
+            "post_norm"
+            if self.session_mtp_history_policy == "committed"
+            else None
+        )
         self.backend_descriptor = descriptor_from_runtime(self.runtime, args)
         args.backend_id = self.backend_descriptor.backend_id
         if self.backend_descriptor.uses_draft_lm_head:
@@ -13956,8 +13967,8 @@ def _policy_fingerprint(
         f"opencode_prompt_contract={opencode_prompt_contract_profile or 'none'}",
         f"generation_mode={effective_mode}",
         f"depth={effective_depth}",
-        "hidden_variant=post_norm",
-        "mtp_history_policy=committed",
+        f"hidden_variant={state.session_hidden_variant or 'none'}",
+        f"mtp_history_policy={state.session_mtp_history_policy}",
         f"draft_head={state.draft_head_identity}",
         f"adaptive={json.dumps(adaptive, sort_keys=True, separators=(',', ':'))}",
         f"proposal_cache={json.dumps(proposal_cache, sort_keys=True, separators=(',', ':'))}",
@@ -14458,14 +14469,15 @@ def _store_retokenized_history_snapshot(
                 prompt_state = restore_or_prefill_prompt_state(
                     state.runtime,
                     history_ids,
-                    mtp_hidden_variant="post_norm",
-                    mtp_history_policy="committed",
+                    mtp_hidden_variant=state.session_hidden_variant,
+                    mtp_history_policy=state.session_mtp_history_policy,
                     session_bank=state.sessions.bank,
                     template_hash=state.template_hash,
                     draft_head_identity=state.draft_head_identity,
                     policy_fingerprint=policy_fingerprint,
                     abort_check=abort_check,
                     vision_splice=history_vision_splice,
+                    target_only=state.session_mtp_history_policy == "none",
                 )
             if _abort_requested():
                 raise PostcommitAbort(_abort_reason())
@@ -14482,11 +14494,11 @@ def _store_retokenized_history_snapshot(
                 cache=prompt_state.trunk_cache,
                 logits=prompt_state.logits,
                 hidden=prompt_state.hidden,
-                hidden_variant="post_norm",
+                hidden_variant=state.session_hidden_variant,
                 keep_live_ref=bool(keep_live_ref),
                 session_id=session_id,
                 template_hash=state.template_hash,
-                mtp_history_policy="committed",
+                mtp_history_policy=state.session_mtp_history_policy,
                 draft_head_identity=state.draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
                 gdn_boundaries=list(
@@ -14855,7 +14867,8 @@ def _store_generation_final_history_snapshot(
     try:
         mtp_snapshot = (
             snapshot_cache(final_state.final_committed_mtp_cache)
-            if final_state.final_committed_mtp_cache is not None
+            if state.session_mtp_history_policy == "committed"
+            and final_state.final_committed_mtp_cache is not None
             else None
         )
         entry = state.sessions.bank.put(
@@ -14863,12 +14876,16 @@ def _store_generation_final_history_snapshot(
             token_ids=token_ids,
             cache=final_state.final_trunk_cache,
             logits=final_state.final_logits,
-            hidden=final_state.final_hidden,
-            hidden_variant="post_norm",
+            hidden=(
+                final_state.final_hidden
+                if state.session_mtp_history_policy == "committed"
+                else None
+            ),
+            hidden_variant=state.session_hidden_variant,
             keep_live_ref=bool(keep_live_ref),
             session_id=session_id,
             template_hash=state.template_hash,
-            mtp_history_policy="committed",
+            mtp_history_policy=state.session_mtp_history_policy,
             draft_head_identity=state.draft_head_identity,
             policy_fingerprint=policy_fingerprint,
             mtp_history_snapshot=mtp_snapshot,
@@ -16156,7 +16173,8 @@ def _run_generation(
             final_token_ids = list(final_commit_prompt_ids) + list(out.tokens)
             mtp_snapshot = (
                 snapshot_cache(final_state.final_committed_mtp_cache)
-                if final_state.final_committed_mtp_cache is not None
+                if state.session_mtp_history_policy == "committed"
+                and final_state.final_committed_mtp_cache is not None
                 else None
             )
             session_bank.put(
@@ -16164,12 +16182,16 @@ def _run_generation(
                 token_ids=final_token_ids,
                 cache=final_state.final_trunk_cache,
                 logits=final_state.final_logits,
-                hidden=final_state.final_hidden,
-                hidden_variant="post_norm",
+                hidden=(
+                    final_state.final_hidden
+                    if state.session_mtp_history_policy == "committed"
+                    else None
+                ),
+                hidden_variant=state.session_hidden_variant,
                 keep_live_ref=bool(session_keep_live_ref),
                 session_id=session_id,
                 template_hash=session_template_hash,
-                mtp_history_policy="committed",
+                mtp_history_policy=state.session_mtp_history_policy,
                 draft_head_identity=session_draft_head_identity,
                 policy_fingerprint=session_policy_fingerprint,
                 mtp_history_snapshot=mtp_snapshot,

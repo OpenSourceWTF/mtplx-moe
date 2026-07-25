@@ -21,10 +21,16 @@ These tests cover:
 """
 
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 import threading
 from threading import Lock
 from types import SimpleNamespace
 
+import mlx.core as mx
+
+from mtplx import generation as generation_module
+from mtplx.mtp_patch import MTPContract
+from mtplx.runtime import MTPLXRuntime
 from mtplx.server import openai
 from mtplx.server.openai import (
     ChatMessage,
@@ -197,6 +203,16 @@ class BoundarySensitiveNoThinkingTokenizer(ToolAwareTokenizer):
 class RecordingBank:
     def __init__(self) -> None:
         self.puts: list[dict] = []
+        self.restore_policies: list[str | None] = []
+        self.last_miss_reason = "new_session"
+        self.per_session_max_bytes = 0
+
+    def longest_prefix(self, _token_ids):
+        return None
+
+    def restore(self, _runtime, _token_ids, **kwargs):
+        self.restore_policies.append(kwargs.get("mtp_history_policy"))
+        return None
 
     def put(self, **kwargs):
         self.puts.append(kwargs)
@@ -217,6 +233,8 @@ def _postcommit_state(*, tokenizer=None):
             model_path="models/test",
             mtp_enabled=True,
         ),
+        session_mtp_history_policy="committed",
+        session_hidden_variant="post_norm",
         sessions=SimpleNamespace(bank=bank),
         template_hash="template",
         draft_head_identity="draft-head",
@@ -231,6 +249,199 @@ def _postcommit_state(*, tokenizer=None):
         begin_foreground=lambda: None,
         end_foreground=lambda: None,
     )
+
+
+class _PostcommitTargetModel:
+    def __init__(self) -> None:
+        self.forward_return_hidden: list[bool] = []
+
+    def make_cache(self):
+        return []
+
+    def make_mtp_cache(self):
+        return []
+
+    def mtp_update_cache(
+        self,
+        hidden_states,
+        _next_token_ids,
+        **_kwargs,
+    ):
+        return hidden_states
+
+    def __call__(
+        self,
+        input_ids,
+        *,
+        cache=None,
+        return_hidden: bool = False,
+        hidden_variant: str | None = None,
+        emit_logits: bool = True,
+        logits_keep: int | None = None,
+    ):
+        del cache, hidden_variant
+        self.forward_return_hidden.append(bool(return_hidden))
+        token_count = int(input_ids.shape[1])
+        kept_tokens = (
+            token_count
+            if logits_keep is None
+            else min(token_count, max(1, int(logits_keep)))
+        )
+        logits = mx.zeros((1, kept_tokens, 4), dtype=mx.float32)
+        if not emit_logits:
+            logits = None
+        if not return_hidden:
+            return logits
+        hidden = mx.zeros((1, token_count, 2), dtype=mx.float32)
+        return logits, hidden
+
+
+def _postcommit_runtime(*, mtp_enabled: bool):
+    model = _PostcommitTargetModel()
+    runtime = MTPLXRuntime(
+        model=model,
+        tokenizer=ToolAwareTokenizer(),
+        model_path=Path("models/postcommit-target"),
+        mtp_enabled=mtp_enabled,
+        contract=MTPContract(),
+    )
+    make_mtp_cache_calls: list[bool] = []
+    original_make_mtp_cache = runtime.make_mtp_cache
+
+    def recording_make_mtp_cache():
+        make_mtp_cache_calls.append(True)
+        return original_make_mtp_cache()
+
+    runtime.make_mtp_cache = recording_make_mtp_cache
+    return runtime, model, make_mtp_cache_calls
+
+
+def _runtime_postcommit_state(*, mtp_enabled: bool):
+    runtime, model, make_mtp_cache_calls = _postcommit_runtime(
+        mtp_enabled=mtp_enabled
+    )
+    bank = RecordingBank()
+    args = parse_args(["--warmup-tokens", "0"])
+    state = SimpleNamespace(
+        args=args,
+        runtime=runtime,
+        session_mtp_history_policy=("committed" if mtp_enabled else "none"),
+        session_hidden_variant="post_norm" if mtp_enabled else None,
+        sessions=SimpleNamespace(bank=bank),
+        template_hash="template",
+        draft_head_identity="draft-head" if mtp_enabled else None,
+        lock=Lock(),
+        begin_foreground=lambda: None,
+        end_foreground=lambda: None,
+    )
+    return state, bank, model, make_mtp_cache_calls
+
+
+def test_ar_only_retokenized_postcommit_stores_target_cache_without_mtp(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        generation_module,
+        "_GENERATION_FEATURE_POLICY",
+        generation_module.bind_generation_feature_policy(
+            {"MTPLX_SUSTAINED_PREFILL": "1"}
+        ),
+    )
+    monkeypatch.setattr(
+        openai,
+        "_history_ids_for_postcommit",
+        lambda *_args, **_kwargs: ([10, 11, 12], None),
+    )
+    snapshot_calls: list[object] = []
+    monkeypatch.setattr(
+        openai,
+        "snapshot_cache",
+        lambda cache: snapshot_calls.append(cache) or ("snapshot", cache),
+    )
+    state, bank, model, make_mtp_cache_calls = _runtime_postcommit_state(
+        mtp_enabled=False
+    )
+
+    result = _store_retokenized_history_snapshot(
+        state,
+        session_id="ar-session",
+        messages=[],
+        assistant_content="OK",
+        thinking_enabled=False,
+        policy_fingerprint="ar-policy",
+    )
+
+    assert result["stored"] is True
+    assert make_mtp_cache_calls == []
+    assert model.forward_return_hidden
+    assert set(model.forward_return_hidden) == {False}
+    assert snapshot_calls == []
+    assert bank.restore_policies == ["none"]
+    assert bank.puts[-1]["hidden"] is None
+    assert bank.puts[-1]["hidden_variant"] is None
+    assert bank.puts[-1]["mtp_history_policy"] == "none"
+    assert bank.puts[-1]["mtp_history_snapshot"] is None
+
+
+def test_mtp_retokenized_postcommit_keeps_committed_history_snapshot(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        generation_module,
+        "_GENERATION_FEATURE_POLICY",
+        generation_module.bind_generation_feature_policy(
+            {"MTPLX_SUSTAINED_PREFILL": "1"}
+        ),
+    )
+    monkeypatch.setattr(
+        openai,
+        "_history_ids_for_postcommit",
+        lambda *_args, **_kwargs: ([10, 11, 12], None),
+    )
+    snapshot_calls: list[object] = []
+    monkeypatch.setattr(
+        openai,
+        "snapshot_cache",
+        lambda cache: snapshot_calls.append(cache) or ("snapshot", cache),
+    )
+    state, bank, model, make_mtp_cache_calls = _runtime_postcommit_state(
+        mtp_enabled=True
+    )
+
+    result = _store_retokenized_history_snapshot(
+        state,
+        session_id="mtp-session",
+        messages=[],
+        assistant_content="OK",
+        thinking_enabled=False,
+        policy_fingerprint="mtp-policy",
+    )
+
+    assert result["stored"] is True
+    assert make_mtp_cache_calls
+    assert True in model.forward_return_hidden
+    assert snapshot_calls
+    assert bank.restore_policies == ["committed"]
+    assert bank.puts[-1]["hidden_variant"] == "post_norm"
+    assert bank.puts[-1]["mtp_history_policy"] == "committed"
+    assert bank.puts[-1]["mtp_history_snapshot"] is not None
+
+
+def test_policy_fingerprint_uses_bound_session_mtp_history_policy():
+    state = _postcommit_state()
+    state.session_mtp_history_policy = "none"
+    state.session_hidden_variant = None
+
+    fingerprint = openai._policy_fingerprint(
+        state,
+        thinking_enabled=False,
+        generation_mode="ar",
+        depth=0,
+    )
+
+    assert "mtp_history_policy=none" in fingerprint
+    assert "mtp_history_policy=committed" not in fingerprint
+    assert "hidden_variant=none" in fingerprint
 
 
 _TOOL_SPECS: list[dict] = [
@@ -581,6 +792,8 @@ def _async_state(*, foreground_always: bool = False, tokenizer=None):
             model_path="models/test",
             mtp_enabled=True,
         ),
+        session_mtp_history_policy="committed",
+        session_hidden_variant="post_norm",
         sessions=SimpleNamespace(bank=bank),
         template_hash="template",
         draft_head_identity="draft-head",

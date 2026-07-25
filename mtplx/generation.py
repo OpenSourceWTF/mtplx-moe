@@ -1886,9 +1886,10 @@ def _prefill_restored_prompt_suffix(
     restored: Any,
     suffix: list[int],
     *,
-    base_hidden_variant: str,
-    mtp_hidden_variant: str,
+    base_hidden_variant: str | None,
+    mtp_hidden_variant: str | None,
     mtp_history_policy: str,
+    target_only: bool = False,
     abort_check: Callable[[], bool] | None = None,
     chunk_callback: Callable[[dict[str, Any]], None] | None = None,
     tokens_total: int | None = None,
@@ -2034,16 +2035,22 @@ def _prefill_restored_prompt_suffix(
         fused_embeddings = _suffix_chunk_embeddings(fused_array)
         started = time.perf_counter()
         with attention_phase("prefill"):
-            suffix_logits, suffix_hidden = rt.forward_ar(
+            fused_result = rt.forward_ar(
                 fused_array,
                 cache=restored.cache,
-                return_hidden=True,
+                return_hidden=not target_only,
                 hidden_variant=base_hidden_variant,
                 emit_logits=True,
                 logits_keep=1 if final_logits_only else None,
                 input_embeddings=fused_embeddings,
             )
-        _eval(suffix_logits, suffix_hidden)
+        if target_only:
+            suffix_logits = fused_result
+            suffix_hidden = None
+            _eval(suffix_logits)
+        else:
+            suffix_logits, suffix_hidden = fused_result
+            _eval(suffix_logits, suffix_hidden)
         chunk_elapsed = time.perf_counter() - started
         target_forward_time += chunk_elapsed
         _runtime_count(rt, "restored_suffix_prefill_fused")
@@ -2051,7 +2058,7 @@ def _prefill_restored_prompt_suffix(
         suffix_done = suffix_total
         emit_chunk(suffix_total, chunk_elapsed, started)
         _check_postcommit_abort(abort_check)
-        if len(suffix) > 1:
+        if len(suffix) > 1 and suffix_hidden is not None:
             append_history(
                 suffix_hidden[:, :-1, :],
                 [int(token) for token in suffix[1:]],
@@ -2061,7 +2068,7 @@ def _prefill_restored_prompt_suffix(
         _check_splice_consumed()
         return (
             suffix_logits[:, -1, :],
-            suffix_hidden[:, -1:, :],
+            suffix_hidden[:, -1:, :] if suffix_hidden is not None else None,
             target_forward_time,
             mtp_history_time,
         )
@@ -2152,16 +2159,22 @@ def _prefill_restored_prompt_suffix(
     final_array = mx.array([[suffix[-1]]])
     final_embeddings = _suffix_chunk_embeddings(final_array)
     with attention_phase("prefill"):
-        suffix_logits, suffix_hidden = rt.forward_ar(
+        final_result = rt.forward_ar(
             final_array,
             cache=restored.cache,
-            return_hidden=True,
+            return_hidden=not target_only,
             hidden_variant=base_hidden_variant,
             emit_logits=True,
             logits_keep=1 if final_logits_only else None,
             input_embeddings=final_embeddings,
         )
-    _eval(suffix_logits, suffix_hidden)
+    if target_only:
+        suffix_logits = final_result
+        suffix_hidden = None
+        _eval(suffix_logits)
+    else:
+        suffix_logits, suffix_hidden = final_result
+        _eval(suffix_logits, suffix_hidden)
     chunk_elapsed = time.perf_counter() - started
     target_forward_time += chunk_elapsed
     target_forward_time += _maybe_repage_target_prefill_cache(restored.cache)
@@ -2171,7 +2184,7 @@ def _prefill_restored_prompt_suffix(
     _check_splice_consumed()
     return (
         suffix_logits[:, -1, :],
-        suffix_hidden[:, -1:, :],
+        suffix_hidden[:, -1:, :] if suffix_hidden is not None else None,
         target_forward_time,
         mtp_history_time,
     )
@@ -2318,9 +2331,10 @@ def _restore_near_prefix_prompt_state(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
     *,
-    base_hidden_variant: str,
-    mtp_hidden_variant: str,
+    base_hidden_variant: str | None,
+    mtp_hidden_variant: str | None,
     mtp_history_policy: str,
+    target_only: bool = False,
     session_bank: Any,
     template_hash: str | None,
     draft_head_identity: str | None,
@@ -2530,15 +2544,21 @@ def _restore_near_prefix_prompt_state(
         else:
             started = time.perf_counter()
             with attention_phase("prefill"):
-                logits, hidden = rt.forward_ar(
+                repair_result = rt.forward_ar(
                     mx.array([[int(prompt_ids[restore_point - 1])]]),
                     cache=cache,
-                    return_hidden=True,
+                    return_hidden=not target_only,
                     hidden_variant=base_hidden_variant,
                     emit_logits=True,
                     logits_keep=1 if _final_logits_prefill_enabled() else None,
                 )
-            _eval(logits, hidden)
+            if target_only:
+                logits = repair_result
+                hidden = None
+                _eval(logits)
+            else:
+                logits, hidden = repair_result
+                _eval(logits, hidden)
             repair_time = time.perf_counter() - started
         _check_postcommit_abort(abort_check)
         restore_kind_base = (
@@ -2598,8 +2618,8 @@ def _restore_near_prefix_prompt_state(
             return PromptState(
                 trunk_cache=cache,
                 logits=logits[:, -1, :],
-                hidden=hidden[:, -1:, :],
-                committed_mtp_cache=mtp_history_cache,
+                hidden=hidden[:, -1:, :] if hidden is not None else None,
+                committed_mtp_cache=None if target_only else mtp_history_cache,
                 token_prefix=tuple(int(token) for token in prompt_ids),
                 prompt_eval_time_s=repair_time + repage_time,
                 cache_restore_time_s=total_cache_restore_time_s,
@@ -2627,6 +2647,7 @@ def _restore_near_prefix_prompt_state(
                 base_hidden_variant=base_hidden_variant,
                 mtp_hidden_variant=mtp_hidden_variant,
                 mtp_history_policy=mtp_history_policy,
+                target_only=target_only,
                 abort_check=abort_check,
                 chunk_callback=chunk_callback,
                 tokens_total=len(prompt_ids),
@@ -2641,7 +2662,7 @@ def _restore_near_prefix_prompt_state(
             trunk_cache=cache,
             logits=suffix_logits,
             hidden=suffix_hidden,
-            committed_mtp_cache=mtp_history_cache,
+            committed_mtp_cache=None if target_only else mtp_history_cache,
             token_prefix=tuple(int(token) for token in prompt_ids),
             prompt_eval_time_s=repair_time + suffix_time + mtp_history_time,
             prompt_mtp_history_time_s=mtp_history_time,
@@ -2932,12 +2953,17 @@ def restore_or_prefill_prompt_state(
     prefill_callback: Callable[[dict[str, Any]], None] | None = None,
     vision_splice: Any | None = None,
     store_prefix_snapshot: bool | None = None,
+    target_only: bool = False,
 ) -> PromptState:
-    """Build the initial prompt state used by MTP-k decode.
+    """Build the initial prompt state used by decode.
 
     This is the first mechanical split point for the serving engine. It keeps
     today's cold path behavior intact while giving EngineSession a concrete
     target for future warm SessionBank restores.
+
+    target_only: build and restore only the target-model cache. This is a
+    construction-bound AR-only lane: it preserves the literal ``none`` history
+    identity, never captures hidden state, and never constructs MTP cache state.
 
     store_prefix_snapshot: store the completed prompt-boundary state into the
     session bank before decode starts (None = follow the
@@ -2965,13 +2991,29 @@ def restore_or_prefill_prompt_state(
                 "vision requests must not use the session bank without "
                 "content-keyed ids"
             )
-    base_hidden_variant = _resolve_runtime_base_hidden_variant(rt, base_hidden_variant)
-    mtp_hidden_variant = _resolve_runtime_mtp_hidden_variant(rt, mtp_hidden_variant)
-    mtp_position_mode = _resolve_runtime_mtp_position_mode(rt)
+    if target_only:
+        if str(mtp_history_policy or "").strip().lower().replace("-", "_") != "none":
+            raise ValueError("target_only prompt state requires mtp_history_policy='none'")
+        base_hidden_variant = None
+        mtp_hidden_variant = None
+    else:
+        base_hidden_variant = _resolve_runtime_base_hidden_variant(
+            rt, base_hidden_variant
+        )
+        mtp_hidden_variant = _resolve_runtime_mtp_hidden_variant(
+            rt, mtp_hidden_variant
+        )
+    mtp_position_mode = (
+        "cache" if target_only else _resolve_runtime_mtp_position_mode(rt)
+    )
     os.environ["MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS"] = str(len(prompt_ids))
-    mtp_history_policy = _resolve_mtp_history_policy(
-        mtp_history_policy,
-        len(prompt_ids),
+    mtp_history_policy = (
+        "none"
+        if target_only
+        else _resolve_mtp_history_policy(
+            mtp_history_policy,
+            len(prompt_ids),
+        )
     )
     mtp_history_window_tokens = (
         _mtp_history_last_window_tokens() if mtp_history_policy == "last_window" else 0
@@ -3160,6 +3202,7 @@ def restore_or_prefill_prompt_state(
                 base_hidden_variant=base_hidden_variant,
                 mtp_hidden_variant=mtp_hidden_variant,
                 mtp_history_policy=mtp_history_policy,
+                target_only=target_only,
                 session_bank=session_bank,
                 template_hash=template_hash,
                 draft_head_identity=draft_head_identity,
@@ -3210,8 +3253,10 @@ def restore_or_prefill_prompt_state(
                 return _emit_prefill_complete(PromptState(
                     trunk_cache=restored.cache,
                     logits=restored.logits,
-                    hidden=restored.hidden,
-                    committed_mtp_cache=restored.mtp_history_cache,
+                    hidden=None if target_only else restored.hidden,
+                    committed_mtp_cache=(
+                        None if target_only else restored.mtp_history_cache
+                    ),
                     token_prefix=tuple(int(token) for token in prompt_ids),
                     prompt_eval_time_s=repage_time,
                     cache_restore_time_s=restore_elapsed_s,
@@ -3268,6 +3313,7 @@ def restore_or_prefill_prompt_state(
                     base_hidden_variant=base_hidden_variant,
                     mtp_hidden_variant=mtp_hidden_variant,
                     mtp_history_policy=mtp_history_policy,
+                    target_only=target_only,
                     abort_check=abort_check,
                     chunk_callback=prefill_callback,
                     tokens_total=len(prompt_ids),
@@ -3281,7 +3327,9 @@ def restore_or_prefill_prompt_state(
                 trunk_cache=restored.cache,
                 logits=suffix_logits,
                 hidden=suffix_hidden,
-                committed_mtp_cache=restored.mtp_history_cache,
+                committed_mtp_cache=(
+                    None if target_only else restored.mtp_history_cache
+                ),
                 token_prefix=tuple(int(token) for token in prompt_ids),
                 prompt_eval_time_s=suffix_time + mtp_history_time,
                 prompt_mtp_history_time_s=mtp_history_time,
@@ -3309,6 +3357,7 @@ def restore_or_prefill_prompt_state(
             base_hidden_variant=base_hidden_variant,
             mtp_hidden_variant=mtp_hidden_variant,
             mtp_history_policy=mtp_history_policy,
+            target_only=target_only,
             session_bank=session_bank,
             template_hash=template_hash,
             draft_head_identity=draft_head_identity,
@@ -3424,7 +3473,7 @@ def restore_or_prefill_prompt_state(
         cache, logits, hidden, target_time = _prefill(
             rt,
             prompt_ids,
-            return_hidden=True,
+            return_hidden=not target_only,
             hidden_variant=base_hidden_variant,
             abort_check=abort_check,
             vision_splice=vision_splice,

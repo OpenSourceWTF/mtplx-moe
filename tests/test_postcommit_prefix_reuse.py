@@ -56,6 +56,8 @@ def _make_state(*, bank: object) -> SimpleNamespace:
     args = SimpleNamespace(strip_assistant_reasoning_history=False)
     return SimpleNamespace(
         runtime=SimpleNamespace(tokenizer=_Tokenizer()),
+        session_mtp_history_policy="committed",
+        session_hidden_variant="post_norm",
         sessions=SimpleNamespace(bank=bank),
         template_hash="tmpl-abc",
         draft_head_identity="draft-xyz",

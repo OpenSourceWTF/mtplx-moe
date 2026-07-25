@@ -1004,6 +1004,8 @@ def _fake_state(*, api_key: str | None = None, rate_limit: int = 0):
         load_time_s=0.25,
         draft_lm_head={"installed": False, "reason": "test"},
         draft_head_identity="test-head",
+        session_mtp_history_policy="committed",
+        session_hidden_variant="post_norm",
         template_hash="test-template",
         main_system_prompt_hash=None,
         fast_path_env_status={},
@@ -10781,6 +10783,8 @@ def test_server_state_caps_expert_served_context_to_installed_kv_limit(
         states.append(regular)
         assert regular.model_context_window_max == 262_144
         assert regular.context_window == 262_144
+        assert regular.session_mtp_history_policy == "committed"
+        assert regular.session_hidden_variant == "post_norm"
 
         for context_args in (
             [],
@@ -10804,6 +10808,8 @@ def test_server_state_caps_expert_served_context_to_installed_kv_limit(
             assert state.args.max_response_tokens is None
             assert state.model_context_window_max == 262_144
             assert state.context_window == 4_096
+            assert state.session_mtp_history_policy == "none"
+            assert state.session_hidden_variant is None
             response_tokens, _sampler, limits = openai._generation_params(
                 state,
                 prompt_token_count=128,

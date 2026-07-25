@@ -134,6 +134,8 @@ def _postcommit_state(*, tokenizer=None):
             model_path="models/test",
             mtp_enabled=True,
         ),
+        session_mtp_history_policy="committed",
+        session_hidden_variant="post_norm",
         sessions=SimpleNamespace(bank=bank),
         template_hash="template",
         draft_head_identity="draft-head",
@@ -1904,6 +1906,8 @@ def test_online_hidden_config_and_policy_fingerprint_track_proposal_policy():
         args=args,
         template_hash="template",
         draft_head_identity="draft",
+        session_mtp_history_policy="committed",
+        session_hidden_variant="post_norm",
     )
 
     config = _online_hidden_config(args)
@@ -1940,6 +1944,8 @@ def test_adaptive_ev_config_tracks_warmup_and_exploration_in_fingerprint():
         args=args,
         template_hash="template",
         draft_head_identity="draft",
+        session_mtp_history_policy="committed",
+        session_hidden_variant="post_norm",
     )
 
     config = _adaptive_config(args, max_depth=3)
@@ -1991,6 +1997,8 @@ def test_policy_fingerprint_separates_tool_contract_cache_identity():
         args=args,
         template_hash="template",
         draft_head_identity="draft",
+        session_mtp_history_policy="committed",
+        session_hidden_variant="post_norm",
     )
 
     plain = _policy_fingerprint(state, thinking_enabled=True, tools_active=False)
@@ -2043,6 +2051,8 @@ def test_opencode_session_cache_scope_is_launch_bound():
         args=args,
         template_hash="template",
         draft_head_identity="draft",
+        session_mtp_history_policy="committed",
+        session_hidden_variant="post_norm",
     )
 
     stable_scope = _session_cache_scope_for_request(state, headers={}, metadata={})

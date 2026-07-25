@@ -299,6 +299,139 @@ def test_session_restore_uses_prefill_layout_cache_factory(monkeypatch):
     assert prompt_state.restore_mode == "clone"
 
 
+@pytest.mark.parametrize(
+    ("prefix_len", "expected_suffix_tokens"),
+    [
+        (5, 0),
+        (3, 2),
+    ],
+)
+def test_target_only_exact_restore_keeps_none_identity_without_hidden_capture(
+    monkeypatch,
+    prefix_len,
+    expected_suffix_tokens,
+):
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    monkeypatch.setattr(
+        generation_module,
+        "_resolve_runtime_mtp_position_mode",
+        lambda _rt: (_ for _ in ()).throw(
+            AssertionError("target-only restore must not resolve MTP position mode")
+        ),
+    )
+    model = TinyModel()
+    rt = _runtime(model, mtp_enabled=False)
+    restore_kwargs: list[dict[str, object]] = []
+
+    class Bank:
+        last_miss_reason = None
+
+        def longest_prefix(self, _prompt_ids):
+            return SimpleNamespace(prefix_len=prefix_len)
+
+        def near_prefix_candidates(self, _prompt_ids, **kwargs):
+            assert kwargs["hidden_variant"] is None
+            assert kwargs["mtp_history_policy"] == "none"
+            return []
+
+        def restore(self, _rt, _prompt_ids, **kwargs):
+            restore_kwargs.append(kwargs)
+            return SimpleNamespace(
+                entry=SimpleNamespace(prefix_len=prefix_len),
+                cache=[],
+                logits=mx.zeros((1, 4), dtype=mx.float32),
+                # A target-only restore must fail closed against stale
+                # auxiliary state even if a duck-typed bank returns it.
+                hidden=mx.zeros((1, 1, 2), dtype=mx.float32),
+                mtp_history_cache=["unexpected-mtp-cache"],
+                restore_mode="clone",
+            )
+
+    prompt_state = restore_or_prefill_prompt_state(
+        rt,
+        [0, 1, 2, 3, 4],
+        mtp_history_policy="none",
+        session_bank=Bank(),
+        target_only=True,
+    )
+
+    assert restore_kwargs[-1]["hidden_variant"] is None
+    assert restore_kwargs[-1]["mtp_history_policy"] == "none"
+    assert prompt_state.mtp_history_policy == "none"
+    assert prompt_state.hidden is None
+    assert prompt_state.committed_mtp_cache is None
+    assert prompt_state.suffix_tokens == expected_suffix_tokens
+    assert all(call["return_hidden"] is False for call in model.calls)
+
+
+def test_target_only_near_prefix_restore_without_suffix_keeps_hidden_none(
+    monkeypatch,
+):
+    _bind_sustained_prefill_policy(monkeypatch, enabled=True)
+    model = TinyModel()
+    rt = _runtime(model, mtp_enabled=False)
+    entry = SimpleNamespace(
+        prefix_len=6,
+        token_ids=tuple(range(6)),
+        model_path=str(rt.model_path),
+        hidden_variant=None,
+        template_hash=None,
+        mtp_history_policy="none",
+        draft_head_identity=None,
+        policy_fingerprint=None,
+        snapshot_epoch=6,
+        mtp_snapshot_epoch=None,
+        mtp_history_snapshot=None,
+        mtp_history_cache_ref=None,
+        hits=0,
+        last_access_s=0.0,
+    )
+
+    class Bank:
+        last_miss_reason = "prefix_divergence_at_token"
+
+        def longest_prefix(self, _prompt_ids):
+            return None
+
+        def near_prefix_candidates(self, _prompt_ids, **kwargs):
+            assert kwargs["hidden_variant"] is None
+            assert kwargs["mtp_history_policy"] == "none"
+            return [(entry, 5)]
+
+        def restore_entry_prefix_cache(
+            self,
+            _rt,
+            _entry,
+            prefix_len,
+            *,
+            mode,
+            cache_factory=None,
+        ):
+            assert prefix_len == 5
+            assert mode == "clone"
+            assert cache_factory is None or callable(cache_factory)
+            return [], None, "clone"
+
+        def restore(self, *_args, **_kwargs):
+            raise AssertionError("near-prefix hit must bypass exact restore")
+
+    prompt_state = restore_or_prefill_prompt_state(
+        rt,
+        [0, 1, 2, 3, 4],
+        mtp_history_policy="none",
+        session_bank=Bank(),
+        target_only=True,
+    )
+
+    assert prompt_state.cache_hit is True
+    assert prompt_state.restore_mode == "near_prefix_clone"
+    assert prompt_state.mtp_history_policy == "none"
+    assert prompt_state.hidden is None
+    assert prompt_state.committed_mtp_cache is None
+    assert prompt_state.suffix_tokens == 0
+    assert [call["return_hidden"] for call in model.calls] == [False]
+
+
 def test_live_frontier_reference_restore_survives_prefill_layout_factory(monkeypatch):
     _bind_sustained_prefill_policy(monkeypatch, enabled=True)
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "contiguous_dense_decode")
