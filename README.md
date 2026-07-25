@@ -223,6 +223,13 @@ depth only when it wins, and says so when none does.
 On a 16 GB M4 Mac mini, tuning the 9B model lands on depth 1: 14.4 tok/s
 baseline becomes 23.0 tok/s.
 
+On a 128 GB M4 Max (Mac16,5, macOS 26.5.1, fans on auto), the same
+[`Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed`](https://huggingface.co/Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed)
+catalog model tunes to depth 3 under `performance-cold`: 56.4 tok/s AR becomes
+114.5 tok/s (2.03×). A follow-up `bench aime --quick` on that depth scored
+5/5. Receipt:
+[community M4 Max 9B tune + AIME](benchmarks/results/community-qwen35-9b-tune-aime-m4max-128gb-20260725.json).
+
 ## Modes
 
 | Mode | What it does | When |
