@@ -26,6 +26,38 @@ def context_copy_enabled() -> bool:
     return (os.environ.get("MTPLX_CONTEXT_COPY") or "").strip() not in {"0", "false", "off"}
 
 
+def context_copy_target_prefix_enabled() -> bool:
+    """Opt-in: run context-copy on the target_prefix lane (default OFF, so the
+    shipped/PR behaviour is byte-unchanged).
+
+    On this lane context-copy is a DRAFT SOURCE, not a block-round engine: a
+    prompt n-gram match starts a streak that feeds the copy continuation as
+    the depth-1 draft, so every forward keeps the lane's 2-row verify
+    geometry and the emitted stream is bit-exact to pure AR for any draft
+    source at any temperature (the accepted token is always the pre-sampled
+    target id).  Block rounds -- whose T+1-row forwards leave M>2 kernel-path
+    ulps in retained cache rows and break AR-exactness -- remain
+    capture_commit-only.
+
+    The COMPILED K1 route keeps its device-draft (R1) contract, so when this
+    flag takes over, the compiled route STEPS ASIDE (like the
+    grammar-constraint case) and the request runs the non-compiled
+    target_prefix lane.  The flag drives the lane switch REGARDLESS of
+    whether streaks fire, so flag-on + MTPLX_CONTEXT_COPY=0 is a clean
+    same-lane baseline.
+
+    Precedence: whole-MoE fusion needs the compiled route, and repetition
+    penalties disable context-copy; in both cases the compiled route is KEPT
+    and this flag is inert -- mirrored in the exact_a3b_target_prefix_factory
+    gate and the ccopy_active gate.
+    """
+    return (os.environ.get("MTPLX_CONTEXT_COPY_TARGET_PREFIX") or "").strip() in {
+        "1",
+        "true",
+        "on",
+    }
+
+
 def context_copy_block_k() -> int:
     try:
         return max(4, int(os.environ.get("MTPLX_CONTEXT_COPY_K") or 24))

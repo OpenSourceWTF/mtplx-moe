@@ -22,6 +22,13 @@ from typing import Any, Callable, Literal
 import mlx.core as mx
 import numpy as np
 
+from .a3b_compiled_target_prefix import (
+    ensure_a3b_whole_moe_request_preflight as _ensure_a3b_whole_moe_request_preflight,
+    install_a3b_k1_target_prefix_route,
+    validate_a3b_k1_device_draft_request,
+    validate_a3b_k1_target_prefix_sampler,
+)
+from .a3b_whole_moe import validate_a3b_whole_moe_request
 from .adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from .attention_context import attention_phase
 from .progress_heartbeat import tick as _owner_progress_tick
@@ -85,6 +92,49 @@ _PREFILL_CHUNK_SIZE_OVERRIDE: ContextVar[int | None] = ContextVar(
     "mtplx_prefill_chunk_size_override",
     default=None,
 )
+
+
+def reject_non_k1_a3b_whole_moe_request(rt: MTPLXRuntime, *, entrypoint: str) -> None:
+    """Reject unsupported generation modes once, before they construct a prompt.
+
+    generate_ar is supported: every one of its decode forwards is a single
+    row, which the installed M1 route serves with per-row arithmetic that
+    bit-matches the M2 verify route (enforced at install by the
+    a3b_whole_moe_target_m1_m2_row_parity selfcheck lane).  Pure AR under
+    whole-MoE is the ground-truth arm of the K1 AR-exactness gate.
+    """
+
+    if entrypoint == "generate_ar":
+        return
+    if bool(getattr(rt, "a3b_whole_moe_installed", False)):
+        raise RuntimeError(
+            f"installed A3B whole-MoE is owned by exact K1 generate_mtpk, not {entrypoint}"
+        )
+
+
+def ensure_a3b_whole_moe_request_preflight(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    max_tokens: int,
+    base_hidden_variant: str,
+    prefill_layout: str | None = None,
+) -> dict[str, Any]:
+    """Prime the installed exact request geometry before prompt generation."""
+
+    if not bool(getattr(rt, "a3b_whole_moe_installed", False)):
+        return {"status": "disabled"}
+    os.environ["MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS"] = str(len(prompt_ids))
+    layout = _sustained_prefill_layout() if prefill_layout is None else prefill_layout
+    return _ensure_a3b_whole_moe_request_preflight(
+        rt,
+        rt.a3b_compiled_target_prefix_factory,
+        prompt_tokens=len(prompt_ids),
+        max_tokens=max_tokens,
+        hidden_variant=base_hidden_variant,
+        cache_factory=lambda: _make_target_prefill_cache(rt),
+        prefill_layout=layout,
+    )
 
 
 def _resolve_runtime_mtp_hidden_variant(
@@ -2015,6 +2065,7 @@ def _prefill_restored_prompt_suffix(
             restored.mtp_history_cache,
             hidden_states,
             token_ids,
+            phase="prefill",
             mtp_hidden_variant=mtp_hidden_variant,
             force_eval=True,
             input_embeddings=_history_window_embeddings(token_ids, window_start),
@@ -3461,6 +3512,7 @@ def restore_or_prefill_prompt_state(
                     mtp_history_cache,
                     history_hidden,
                     history_token_ids,
+                    phase="prefill",
                     mtp_hidden_variant=mtp_hidden_variant,
                     position_offset=(
                         mtp_history_position_base
@@ -3578,6 +3630,18 @@ def _batched_distributions_from_mlx_logits(
     config: SamplerConfig,
 ) -> BatchedSparseDistributions | None:
     return batched_sparse_distributions_from_mlx_logits(logits, config)
+
+
+def _validate_target_prefix_sampler_request(config: SamplerConfig) -> None:
+    """Reject an unsupported external target-prefix sampler before prompt work."""
+    if (
+        config.temperature > 0
+        and int(config.top_k or 0) <= 0
+        and 0 < config.top_p < 1.0
+    ):
+        raise RuntimeError(
+            "target_prefix verification requires top-k sampling or top_p=1"
+        )
 
 
 def _sample_from_logits(
@@ -4335,6 +4399,7 @@ def _prefill_committed_mtp_history_streaming(
                     mtp_history_cache,
                     sliced_hidden,
                     sliced_token_ids,
+                    phase="prefill",
                     mtp_hidden_variant=mtp_hidden_variant,
                     position_offset=(
                         token_start_index + slice_start
@@ -4513,6 +4578,7 @@ def _append_mtp_history(
     hidden_states: mx.array,
     token_ids: list[int],
     *,
+    phase: Literal["prefill", "ar_decode"],
     mtp_hidden_variant: str,
     position_offset: int | None = None,
     force_eval: bool = False,
@@ -4526,14 +4592,15 @@ def _append_mtp_history(
         raise ValueError("input_embeddings length must match token_ids length")
     _runtime_count(rt, "mtp_history_append_calls")
     started = time.perf_counter()
-    hidden = rt.update_mtp_cache(
-        hidden_states,
-        mx.array([token_ids]),
-        mtp_cache=mtp_cache,
-        mtp_hidden_variant=mtp_hidden_variant,
-        position_offset=position_offset,
-        input_embeddings=input_embeddings,
-    )
+    with attention_phase(phase):
+        hidden = rt.update_mtp_cache(
+            hidden_states,
+            mx.array([token_ids]),
+            mtp_cache=mtp_cache,
+            mtp_hidden_variant=mtp_hidden_variant,
+            position_offset=position_offset,
+            input_embeddings=input_embeddings,
+        )
     if _env_truthy("MTPLX_LAZY_MTP_HISTORY_APPEND") and not force_eval:
         return time.perf_counter() - started
     _eval(hidden)
@@ -4557,6 +4624,7 @@ def generate_ar(
     thinking_guard: ThinkingGuardConfig | None = None,
     constraint: Any | None = None,
 ) -> GenerationOutput:
+    reject_non_k1_a3b_whole_moe_request(rt, entrypoint="generate_ar")
     if getattr(rt, "backend_id", None) == "gemma4_assistant":
         if constraint is not None:
             raise ValueError(
@@ -4959,6 +5027,7 @@ def generate_mtp1(
     draft_margin_threshold: float | None = None,
     repetition_stop: bool = False,
 ) -> GenerationOutput:
+    reject_non_k1_a3b_whole_moe_request(rt, entrypoint="generate_mtp1")
     if not rt.mtp_enabled:
         raise RuntimeError("generate_mtp1 requires an MTP-enabled runtime")
     if verify_strategy not in {
@@ -5776,6 +5845,83 @@ def generate_mtpk(
             "or 'trim_commit'"
         )
     target_prefix_verify = verify_strategy == "target_prefix"
+    # Constrained requests never engage the exact A3B route: the route
+    # pre-commits its rejection correction (no None-guard on the append),
+    # while the #186 phase-3 grammar clamp expects a grammar-illegal
+    # correction to be dropped so the next masked primary resamples it.
+    # The stock target_prefix lane below carries that contract.
+    #
+    # Context-copy on this lane is a DRAFT SOURCE (a prompt match feeds the
+    # depth-1 draft; see context_copy_target_prefix_enabled), which conflicts
+    # with the compiled K1 route's device-draft (R1) contract.  So the
+    # compiled route stays STRICTLY K1/device-drafted: when the opt-in flag
+    # takes over the lane, the route steps aside (exactly like the constraint
+    # case) and the whole request runs the non-compiled target_prefix lane,
+    # whose 2-row verify cycles are byte-exact to AR for any draft source.
+    # The two improvement families never share a cycle: the compiled route
+    # wins on pure-K1 requests, prompt-lookup drafting wins on the
+    # non-compiled lane.  Keyed on the FLAG (not on whether streaks fire) so
+    # ccopy-off on this lane is a clean byte-exactness baseline.  Whole-MoE
+    # (needs the compiled route) and penalties (disable ccopy) both keep the
+    # compiled route -- mirrors the ccopy_active gate below.
+    from .context_copy import (
+        context_copy_target_prefix_enabled as _cc_tp_enabled_early,
+    )
+    _ccopy_takes_over_lane = (
+        target_prefix_verify
+        and _cc_tp_enabled_early()
+        and not (bool(sampler.presence_penalty) or bool(sampler.frequency_penalty))
+        and not bool(getattr(rt, "a3b_whole_moe_installed", False))
+    )
+    exact_a3b_target_prefix_factory = (
+        rt.a3b_compiled_target_prefix_factory
+        if target_prefix_verify and constraint is None and not _ccopy_takes_over_lane
+        else None
+    )
+    exact_a3b_target_prefix = exact_a3b_target_prefix_factory is not None
+    draft_sampler = _env_scaled_draft_sampler(sampler, draft_sampler)
+    _loop_guard_config = loop_guard_config_from_env(
+        bool(loop_guard), tokenizer=getattr(rt, "tokenizer", None)
+    )
+    if bool(getattr(rt, "a3b_whole_moe_installed", False)):
+        os.environ["MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS"] = str(len(prompt_ids))
+        whole_moe_prefill_layout = _sustained_prefill_layout()
+        validate_a3b_whole_moe_request(
+            verify_strategy=verify_strategy,
+            requested_speculative_depth=requested_speculative_depth,
+            speculative_depth=speculative_depth,
+            verify_core=verify_core,
+            draft_core=draft_core,
+            compiled_target_prefix=exact_a3b_target_prefix,
+            session_bank_present=session_bank is not None,
+            vision_splice_present=vision_splice is not None,
+            prefill_layout=whole_moe_prefill_layout,
+        )
+        ensure_a3b_whole_moe_request_preflight(
+            rt,
+            prompt_ids,
+            max_tokens=max_tokens,
+            base_hidden_variant=base_hidden_variant,
+            prefill_layout=whole_moe_prefill_layout,
+        )
+    if target_prefix_verify:
+        if exact_a3b_target_prefix:
+            validate_a3b_k1_target_prefix_sampler(sampler)
+            validate_a3b_k1_device_draft_request(
+                draft_sampler,
+                draft_margin_threshold=draft_margin_threshold,
+                adaptive_policy=adaptive_policy,
+                draft_core=draft_core,
+                online_correction_cache=online_correction_cache,
+                prompt_correction_cache=prompt_correction_cache,
+                adapter_ensemble_q=adapter_ensemble_q,
+                mtp_topk_reranker=mtp_topk_reranker,
+                loop_guard=_loop_guard_config.enabled,
+                presence_penalty=float(sampler.presence_penalty),
+                frequency_penalty=float(sampler.frequency_penalty),
+            )
+        else:
+            _validate_target_prefix_sampler_request(sampler)
     counter_start = _runtime_counter_snapshot(rt)
     verify_core_backend = resolve_gdn_capture_backend(verify_core)
     online_hidden_enabled = online_hidden_corrector_alpha > 0.0
@@ -5786,7 +5932,6 @@ def generate_mtpk(
     )
 
     rng = np.random.default_rng(seed)
-    draft_sampler = _env_scaled_draft_sampler(sampler, draft_sampler)
     if mtp_corrector is not None:
         corrector_variant = getattr(mtp_corrector, "hidden_variant", mtp_hidden_variant)
         if corrector_variant != mtp_hidden_variant:
@@ -5937,17 +6082,28 @@ def generate_mtpk(
         else None
     )
     _compiled_verify_mode = compiled_verify_mode()
+    generic_compiled_target_prefix = (
+        target_prefix_verify
+        and not exact_a3b_target_prefix
+        and _env_truthy("MTPLX_COMPILED_TARGET_PREFIX")
+    )
     compiled_verify_bank = (
         CompiledVerifyBank(
             rt,
+            request_max_tokens=max_tokens,
             capture_backend=verify_core_backend,
             parity=_compiled_verify_mode == "parity",
             parity2=_compiled_verify_mode == "parity2",
         )
         if _compiled_verify_mode != "off"
-        and verify_strategy in {"capture_commit", "graphbank_capture_commit"}
+        and (
+            verify_strategy in {"capture_commit", "graphbank_capture_commit"}
+            or generic_compiled_target_prefix
+        )
         else None
     )
+    a3b_target_prefix_route = None
+    a3b_rebase_state = None  # stashed post-primary state for a deferred correction
     snapshot_time = accept_time = rollback_time = repair_time = 0.0
     commit_time = capture_commit_time = 0.0
     bonus_time = 0.0
@@ -5969,9 +6125,6 @@ def generate_mtpk(
     # Armed = target distributions get sparse anti-cycle penalties per position;
     # the draft proposal q stays untouched (proposal mismatch only costs
     # acceptance, never correctness).
-    _loop_guard_config = loop_guard_config_from_env(
-        bool(loop_guard), tokenizer=getattr(rt, "tokenizer", None)
-    )
     _loop_guard = LoopGuard(_loop_guard_config) if _loop_guard_config.enabled else None
     # Thinking Guard: surfaced reasoning-token budget (mtplx/thinking_guard.py).
     # Below budget = zero distribution impact; at budget the guard force-closes
@@ -6045,6 +6198,12 @@ def generate_mtpk(
     device_d2_compile_time = 0.0
     device_d2_calls = 0
     device_d2_fallbacks = 0
+    # k=2 (depth-2) compiled target-prefix: a chained 2-draft producer for the
+    # [primary, d1, d2] verify, plus the two mid-window rebase states the last
+    # verify_m3 returned (post-row-0, post-row-1).  Dormant for K1.
+    compiled_k2_d2_core: dict[str, Any] | None = None
+    a3b_m3_rebase0_state = None
+    a3b_m3_rebase1_state = None
     device_core: dict[str, Any] | None = None
     device_core_compile_time = 0.0
     device_core_calls = 0
@@ -6334,6 +6493,7 @@ def generate_mtpk(
             mtp_cache,
             hidden_states,
             token_ids,
+            phase="ar_decode",
             mtp_hidden_variant=mtp_hidden_variant,
             position_offset=mtp_position_offset_for_cache(mtp_cache),
             force_eval=force_eval,
@@ -6638,30 +6798,84 @@ def generate_mtpk(
         if new_tokens:
             token_callback(new_tokens)
 
+    if exact_a3b_target_prefix:
+        if _compiled_verify_mode != "on":
+            raise RuntimeError(
+                "exact A3B compiled target-prefix requires compiled verify mode 'on'"
+            )
+        a3b_target_prefix_route = install_a3b_k1_target_prefix_route(
+            rt,
+            cache,
+            factory=exact_a3b_target_prefix_factory,
+            max_tokens=max_tokens,
+            prompt_tokens=len(prompt_ids),
+            verify_strategy=verify_strategy,
+            speculative_depth=speculative_depth,
+            requested_speculative_depth=requested_speculative_depth,
+            verify_core=verify_core_backend,
+            hidden_variant=base_hidden_variant,
+            state_rebase_every=state_rebase_every,
+            require_request_preflight=bool(
+                getattr(rt, "a3b_whole_moe_installed", False)
+            ),
+        )
+
     step = 0
     # ---- context-copy (prompt-lookup) drafting: always on (kill switch
     # MTPLX_CONTEXT_COPY=0); any temperature, no repetition penalties, on
     # capture-commit verify strategies ----
     from .context_copy import (NgramIndex, block_for_ext, context_copy_block_k,
                                context_copy_enabled, context_copy_min_ext,
-                               context_copy_ng_max, context_copy_ng_min)
+                               context_copy_ng_max, context_copy_ng_min,
+                               context_copy_target_prefix_enabled)
     # Temperature is supported through the same probability-ratio acceptance
     # as the MTP path: the copy block is a point-mass proposal, so a copied
     # token is accepted with the target's own shaped probability and a
     # rejection samples the residual — the output law is exactly the target
     # sampling distribution at any temperature (no greedy shortcut).
+    #
+    # Copy rounds normally require a capture-commit verify strategy.  The opt-in
+    # MTPLX_CONTEXT_COPY_TARGET_PREFIX flag also enables the target_prefix
+    # lane-takeover, where context-copy is a DRAFT SOURCE (streaks feed the
+    # depth-1 draft; block rounds stay capture_commit-only -- their T+1-row
+    # forwards are not AR-exact).  With whole-MoE installed the compiled
+    # route is kept and the flag is inert, recorded via disabled_reason.
+    _ccopy_capture_lane = verify_strategy in {"capture_commit", "graphbank_capture_commit"}
+    _ccopy_tp_requested = (
+        context_copy_target_prefix_enabled() and verify_strategy == "target_prefix"
+    )
+    _ccopy_whole_moe_conflict = _ccopy_tp_requested and bool(
+        getattr(rt, "a3b_whole_moe_installed", False)
+    )
     ccopy_active = (
         context_copy_enabled()
         and not _penalties_active
-        and verify_strategy in {"capture_commit", "graphbank_capture_commit"}
+        and (_ccopy_capture_lane or (_ccopy_tp_requested and not _ccopy_whole_moe_conflict))
     )
     ccopy_rounds = ccopy_drafted = ccopy_accepted = 0
     ccopy_probes = ccopy_blocks_accepted = ccopy_suspensions = 0
     ccopy_disabled_reason = None
+    if _ccopy_whole_moe_conflict:
+        # Requested the target_prefix takeover but whole-MoE is installed:
+        # whole-MoE requires the compiled route, whose device-draft contract
+        # excludes draft substitution.  The compiled route is kept.
+        ccopy_disabled_reason = "whole_moe_keeps_compiled_route"
     ccopy_ema, ccopy_seen, ccopy_suspend_until = 0.5, 0, 0
     ccopy_backoff = 64   # doubles on each suspension (self-repetitive novel text would
                          # otherwise re-trigger copy rounds after every backoff and pay
                          # the probe cost recurrently); a paying round resets it.
+    # Draft-source streak state (target_prefix takeover lane): the copy match
+    # feeds the depth-1 DRAFT instead of a block round, so every forward stays
+    # on the lane's proven 2-row verify geometry -- bit-exact by construction.
+    # _cc_src_idx = next prompt index the streak proposes; the streak advances
+    # by diffing committed tokens against the prompt continuation and breaks on
+    # the first mismatch (covers accept, bonus, and correction paths without
+    # touching the accept machinery).
+    _cc_src_idx: int | None = None
+    _cc_src_check_from = 0
+    _cc_streak_drafted = 0
+    _cc_streak_accepted = 0
+    _cc_streak_outstanding = 0  # substituted drafts not yet seen by the sync
     ccopy_index = None
     ccopy_k = context_copy_block_k()
     ccopy_min_ext = context_copy_min_ext()
@@ -6836,7 +7050,7 @@ def generate_mtpk(
             break
 
         cycle_depth = min(planned_depth, max_tokens - len(tokens))
-        draft_tokens: list[int] = []
+        draft_tokens: list[int | None] = []
         draft_probs: list[np.ndarray | None] = []
         draft_cache_keys: list[tuple[int, ...]] = []
         draft_hidden_for_update: list[mx.array] = []
@@ -6852,8 +7066,79 @@ def generate_mtpk(
         trace_current_mtp_cache = (
             mtp_cache if mtp_cache is not None else mtp_history_cache
         )
+        # ---- context-copy as DRAFT SOURCE (target_prefix takeover lane) ----
+        # The block-round machinery is NOT AR-exact on this lane: its T+1-row
+        # block forward runs M>2 kernel paths (stock gather_qmm fallbacks)
+        # whose retained rows differ at ulp scale from the M<=2 decode path,
+        # surfacing as delayed argmax flips (windows 083910/085411).  Feeding
+        # the copy match as the depth-1 draft keeps every forward on the
+        # proven 2-row cycle: the accepted token is always the pre-sampled
+        # target id, so the emitted stream is bit-exact for ANY draft source,
+        # at any temperature.  MTP head compute is skipped during a streak.
+        if ccopy_active and _ccopy_takes_over_lane:
+            if _cc_src_idx is not None:
+                for _cc_committed in tokens[_cc_src_check_from:]:
+                    if _cc_src_idx < len(prompt_ids) and int(_cc_committed) == int(
+                        prompt_ids[_cc_src_idx]
+                    ):
+                        _cc_src_idx += 1
+                        # Acceptance stats count only tokens WE drafted; a
+                        # bonus/primary token that happens to continue the
+                        # prompt match advances the streak but is the
+                        # verify's own win, not copy acceptance.
+                        if _cc_streak_outstanding > 0:
+                            _cc_streak_outstanding -= 1
+                            _cc_streak_accepted += 1
+                            ccopy_accepted += 1
+                    else:
+                        _cc_src_idx = None
+                        _cc_streak_outstanding = 0
+                        break
+                if _cc_src_idx is not None and _cc_src_idx >= len(prompt_ids):
+                    _cc_src_idx = None
+                if _cc_src_idx is None:
+                    # Streak over: same acceptance-EMA suspend/backoff contract
+                    # as the round path, per streak.
+                    _cc_ratio = (
+                        _cc_streak_accepted / _cc_streak_drafted
+                        if _cc_streak_drafted
+                        else 0.0
+                    )
+                    ccopy_ema = 0.7 * ccopy_ema + 0.3 * min(1.0, _cc_ratio)
+                    ccopy_seen += 1
+                    if _cc_ratio >= 0.5:
+                        ccopy_backoff = 64
+                    if ccopy_seen >= 4 and ccopy_ema < 0.35:
+                        ccopy_suspend_until = len(tokens) + ccopy_backoff
+                        ccopy_backoff = min(ccopy_backoff * 2, 4096)
+                        ccopy_ema, ccopy_seen = 0.5, 0
+                        ccopy_suspensions += 1
+            _cc_src_check_from = len(tokens)
+            if _cc_src_idx is None and len(tokens) >= ccopy_suspend_until:
+                ccopy_probes += 1
+                _cc_pos, _cc_ext = ccopy_index.find(
+                    prompt_ids + tokens, max_pos=len(prompt_ids)
+                )
+                if (
+                    _cc_pos is not None
+                    and _cc_ext >= ccopy_min_ext
+                    and int(_cc_pos) < len(prompt_ids)
+                ):
+                    _cc_src_idx = int(_cc_pos)
+                    _cc_streak_drafted = 0
+                    _cc_streak_accepted = 0
+                    _cc_streak_outstanding = 0
+                    ccopy_rounds += 1
+                    event["context_copy"] = {
+                        "mode": "draft_source",
+                        "extension": int(_cc_ext),
+                        "at_tokens": len(tokens),
+                        "block": 0,
+                        "accepted": 0,
+                        "correction": None,
+                    }
         # ---- context-copy round: verbatim block from context, no MTP compute this cycle ----
-        if ccopy_active and cycle_depth >= 1 and len(tokens) >= ccopy_suspend_until:
+        if ccopy_active and _ccopy_capture_lane and cycle_depth >= 1 and len(tokens) >= ccopy_suspend_until:
             _cc_hist = prompt_ids + tokens
             ccopy_probes += 1
             # Prompt-only contract: candidates whose continuation starts at the
@@ -6988,6 +7273,7 @@ def generate_mtpk(
                     event["context_copy"] = {"disabled": "no_per_position_commit"}
                     append_event(event)
                     continue
+                _cc_round_pos = len(tokens)
                 _cc_acc = _cc_block[:_cc_nacc]
                 _cc_stop_idx = next((i for i, t in enumerate(_cc_acc)
                                      if _is_stop(int(t), stop_token_ids)), None)
@@ -7039,6 +7325,12 @@ def generate_mtpk(
                     "correction": (
                         int(_cc_correction) if _cc_correction is not None else None
                     ),
+                    # Completion-stream position of the round (tokens emitted
+                    # BEFORE this round's block landed): byte-exactness gates
+                    # correlate a divergence index with round windows to tell
+                    # an accept/continuation fault from post-commit state
+                    # corruption.
+                    "at_tokens": int(_cc_round_pos),
                 }
                 # Committed-history MTP caches pair every committed token with the
                 # hidden state of the token before it, including (previous hidden,
@@ -7060,10 +7352,26 @@ def generate_mtpk(
                 continue
         draft_hidden = hidden
         next_token = primary
+        device_draft_token = None
+
+        # Copy-streak draft substitution: propose the prompt continuation as
+        # this cycle's depth-1 draft and skip MTP head compute entirely.  The
+        # compiled route keeps its device-draft contract (no substitution).
+        _cc_draft_source_token: int | None = None
+        if (
+            _cc_src_idx is not None
+            and a3b_target_prefix_route is None
+            and cycle_depth == 1
+        ):
+            _cc_draft_source_token = int(prompt_ids[_cc_src_idx])
+            _cc_streak_drafted += 1
+            _cc_streak_outstanding += 1
+            ccopy_drafted += 1
 
         used_device_d2_core = False
         device_d2_eligible = (
-            draft_core == "device-d2"
+            _cc_draft_source_token is None
+            and draft_core == "device-d2"
             and cycle_depth == 2
             and speculative_depth == 2
             and mtp_cache_policy == "persistent"
@@ -7145,7 +7453,63 @@ def generate_mtpk(
                 }
 
         used_device_core = used_device_d2_core
-        if not used_device_core and draft_core == "device":
+        a3b_k2 = (
+            a3b_target_prefix_route is not None
+            and int(getattr(a3b_target_prefix_route, "speculative_depth", 1)) == 2
+        )
+        if a3b_k2 and not used_device_core:
+            # k=2 compiled path: produce the two chained greedy MTP drafts
+            # [d1, d2] on-device (one host sync) BEFORE the draft loop, then
+            # skip the loop (used_device_core).  d2 chains from d1's hidden --
+            # the same single-module recurrence characterized for a2~0.45; we
+            # measure the 3-row verify cost, and commits stay target-argmax so
+            # the greedy stream is byte-exact vs generate_ar regardless of a2.
+            k2_started = time.perf_counter()
+            if compiled_k2_d2_core is None:
+                compiled_k2_d2_core = _make_device_d2_draft_core(
+                    rt,
+                    draft_hidden,
+                    mx.array([[primary]]),
+                    mtp_hidden_variant=mtp_hidden_variant,
+                )
+            _k2_drafts = _run_device_d2_draft_core(
+                compiled_k2_d2_core, draft_hidden, int(primary)
+            )
+            draft_time += time.perf_counter() - k2_started
+            draft_tokens = [int(_k2_drafts[0]), int(_k2_drafts[1])]
+            draft_probs = [None, None]
+            for _k2_depth, _k2_tok in enumerate(draft_tokens):
+                drafted += 1
+                drafted_by_depth[_k2_depth] += 1
+                event["drafts"].append(
+                    {
+                        "depth": _k2_depth + 1,
+                        "token": _k2_tok,
+                        "timing_s": {"draft": 0.0},
+                        "mtp_corrector": None,
+                        "draft_core": "compiled-k2-d2",
+                    }
+                )
+            next_token = draft_tokens[-1]
+            used_device_core = True
+        if _cc_draft_source_token is not None:
+            # Copy streak owns this cycle's draft: one host token, no MTP
+            # forward.  The accept path is draft-source-agnostic (the
+            # accepted token is always the pre-sampled target id).
+            draft_tokens = [int(_cc_draft_source_token)]
+            draft_probs = [None]
+            next_token = int(_cc_draft_source_token)
+            used_device_core = True  # skip the host MTP drafting loop below
+            event["drafts"].append(
+                {
+                    "depth": 1,
+                    "token": int(_cc_draft_source_token),
+                    "timing_s": {"draft": 0.0},
+                    "mtp_corrector": None,
+                    "draft_core": "context_copy",
+                }
+            )
+        elif not used_device_core and draft_core == "device":
             device_core_eligible = (
                 2 <= cycle_depth <= 5
                 and cycle_depth == speculative_depth
@@ -7367,7 +7731,14 @@ def generate_mtpk(
             cached_token = (
                 correction_cache.get(cache_key) if cache_enabled_for_depth else None
             )
-            if cached_token is not None:
+            if a3b_target_prefix_route is not None:
+                device_draft_token = sample_token_ids_from_mlx_logits(
+                    draft_logits[:, -1, :],
+                    draft_sampler,
+                )
+                draft_token = None
+                draft_q = None
+            elif cached_token is not None:
                 draft_token = int(cached_token)
                 draft_q = (
                     SparseDistribution.one_hot(draft_token, int(draft_logits.shape[-1]))
@@ -7568,40 +7939,69 @@ def generate_mtpk(
                     break
 
         before_verify = None
-        if _skip_verify_snapshot():
-            event["snapshot"] = "skipped_capture_commit_required"
-        else:
-            started = time.perf_counter()
-            before_verify = snapshot_untrimmable_cache(cache)
-            elapsed_snapshot = time.perf_counter() - started
-            snapshot_time += elapsed_snapshot
-            _add_timing(event, "snapshot", elapsed_snapshot)
+        if a3b_target_prefix_route is None:
+            if _skip_verify_snapshot():
+                event["snapshot"] = "skipped_capture_commit_required"
+            else:
+                started = time.perf_counter()
+                before_verify = snapshot_untrimmable_cache(cache)
+                elapsed_snapshot = time.perf_counter() - started
+                snapshot_time += elapsed_snapshot
+                _add_timing(event, "snapshot", elapsed_snapshot)
         lazy_bonus_verify_min_depth = _lazy_bonus_verify_min_depth()
         lazy_bonus_verify_requested = _lazy_bonus_verify_enabled()
-        lazy_bonus_verify = (
-            lazy_bonus_verify_requested
-            and not lazy_target_distributions
-            and not target_prefix_verify
-            and len(draft_tokens) > 0
-            and len(draft_tokens) >= lazy_bonus_verify_min_depth
-            and not any(_is_stop(token, stop_token_ids) for token in draft_tokens[:-1])
-        )
         omit_speculative_bonus = _omit_speculative_bonus_enabled()
-        bonus_distribution_row_needed = (
-            not omit_speculative_bonus
-            and not lazy_bonus_verify
-            and len(draft_tokens) > 0
-            and len(tokens) + len(draft_tokens) < max_tokens
-            and not any(_is_stop(token, stop_token_ids) for token in draft_tokens)
-        )
-        target_distribution_rows_needed = len(draft_tokens) + (
-            1 if bonus_distribution_row_needed else 0
-        )
+        if a3b_target_prefix_route is not None and a3b_k2:
+            # 3-row verify [primary, d1, d2]; greedy needs all 3 target rows so
+            # the accept loop can commit a1/a2/a3 and pick the rebase point.
+            lazy_bonus_verify = False
+            bonus_distribution_row_needed = (
+                not omit_speculative_bonus and len(tokens) + 1 < max_tokens
+            )
+            target_distribution_rows_needed = 3
+            verified_token_count = 3
+            verify_input_array = mx.array([[int(primary), *draft_tokens]])
+        elif a3b_target_prefix_route is not None:
+            lazy_bonus_verify = False
+            bonus_distribution_row_needed = (
+                not omit_speculative_bonus and len(tokens) + 1 < max_tokens
+            )
+            target_distribution_rows_needed = 1 + int(
+                bonus_distribution_row_needed
+            )
+            verified_token_count = 2
+            verify_input_array = mx.concatenate(
+                (mx.array([[primary]]), device_draft_token.reshape(1, 1)),
+                axis=1,
+            )
+        else:
+            lazy_bonus_verify = (
+                lazy_bonus_verify_requested
+                and not lazy_target_distributions
+                and not target_prefix_verify
+                and len(draft_tokens) > 0
+                and len(draft_tokens) >= lazy_bonus_verify_min_depth
+                and not any(
+                    _is_stop(token, stop_token_ids) for token in draft_tokens[:-1]
+                )
+            )
+            bonus_distribution_row_needed = (
+                not omit_speculative_bonus
+                and not lazy_bonus_verify
+                and len(draft_tokens) > 0
+                and len(tokens) + len(draft_tokens) < max_tokens
+                and not any(_is_stop(token, stop_token_ids) for token in draft_tokens)
+            )
+            target_distribution_rows_needed = len(draft_tokens) + (
+                1 if bonus_distribution_row_needed else 0
+            )
+            verify_input = [primary] + (
+                draft_tokens[:-1] if lazy_bonus_verify else draft_tokens
+            )
+            verified_token_count = len(verify_input)
+            verify_input_array = mx.array([verify_input])
         if lazy_bonus_verify:
             lazy_bonus_verify_calls += 1
-        verify_input = [primary] + (
-            draft_tokens[:-1] if lazy_bonus_verify else draft_tokens
-        )
         event["lazy_bonus_verify"] = {
             "enabled": bool(lazy_bonus_verify),
             "requested": bool(lazy_bonus_verify_requested),
@@ -7611,7 +8011,7 @@ def generate_mtpk(
             and not target_prefix_verify
             else None,
             "min_depth": int(lazy_bonus_verify_min_depth),
-            "verify_input_tokens": int(len(verify_input)),
+            "verify_input_tokens": int(verified_token_count),
             "draft_tokens": int(len(draft_tokens)),
         }
         event["speculative_bonus"] = {
@@ -7626,7 +8026,7 @@ def generate_mtpk(
                 if compiled_verify_bank is not None:
                     verify_logits, verify_hidden, captures = (
                         compiled_verify_bank.forward_ar_capture(
-                            mx.array([verify_input]),
+                            verify_input_array,
                             cache=cache,
                             return_hidden=True,
                             hidden_variant=base_hidden_variant,
@@ -7635,7 +8035,7 @@ def generate_mtpk(
                 elif graphbank is not None:
                     verify_logits, verify_hidden, captures = (
                         graphbank.forward_ar_capture(
-                            mx.array([verify_input]),
+                            verify_input_array,
                             cache=cache,
                             return_hidden=True,
                             hidden_variant=base_hidden_variant,
@@ -7643,22 +8043,73 @@ def generate_mtpk(
                     )
                 else:
                     verify_logits, verify_hidden, captures = rt.forward_ar_capture(
-                        mx.array([verify_input]),
+                        verify_input_array,
                         cache=cache,
                         return_hidden=True,
                         hidden_variant=base_hidden_variant,
                         capture_backend=verify_core_backend,
                     )
+            elif a3b_target_prefix_route is not None and a3b_k2:
+                # k=2 3-row verify.  Returns the two mid-window rebase states
+                # (post-row-0, post-row-1); the accept loop picks which one the
+                # next cycle rebases from after a d1 or d2 reject.
+                if a3b_rebase_state is not None:
+                    (
+                        verify_logits,
+                        verify_hidden,
+                        a3b_m3_rebase0_state,
+                        a3b_m3_rebase1_state,
+                    ) = a3b_target_prefix_route.verify_m3_rebased(
+                        verify_input_array, a3b_rebase_state
+                    )
+                    a3b_rebase_state = None
+                else:
+                    (
+                        verify_logits,
+                        verify_hidden,
+                        a3b_m3_rebase0_state,
+                        a3b_m3_rebase1_state,
+                    ) = a3b_target_prefix_route.verify_m3(verify_input_array)
+                # a3b_primary_state (the K1 single-rebase leaf) is unused on the
+                # k=2 path: the reject rebase selects m3 rebase0/rebase1 instead.
+            elif a3b_target_prefix_route is not None:
+                if a3b_rebase_state is not None:
+                    # Deferred-correction fold: the pending correction is
+                    # this cycle's primary and the verify runs from the
+                    # stashed post-primary state of the cycle that rejected
+                    # it -- the repair_m1 forward never happens.
+                    verify_logits, verify_hidden, a3b_primary_state = (
+                        a3b_target_prefix_route.verify_m2_rebased(
+                            verify_input_array, a3b_rebase_state
+                        )
+                    )
+                    a3b_rebase_state = None
+                else:
+                    verify_logits, verify_hidden, a3b_primary_state = (
+                        a3b_target_prefix_route.verify_m2(verify_input_array)
+                    )
+            elif compiled_verify_bank is not None:
+                # Replace only the target forward. target_prefix keeps its
+                # authoritative snapshot/trim, pre-sampling, and correction
+                # forward; captures here must not change its commit semantics.
+                verify_logits, verify_hidden, _compiled_captures = (
+                    compiled_verify_bank.forward_ar_capture(
+                        verify_input_array,
+                        cache=cache,
+                        return_hidden=True,
+                        hidden_variant=base_hidden_variant,
+                    )
+                )
             elif graphbank is not None:
                 verify_logits, verify_hidden = graphbank.forward_ar(
-                    mx.array([verify_input]),
+                    verify_input_array,
                     cache=cache,
                     return_hidden=True,
                     hidden_variant=base_hidden_variant,
                 )
             else:
                 verify_logits, verify_hidden = rt.forward_ar(
-                    mx.array([verify_input]),
+                    verify_input_array,
                     cache=cache,
                     return_hidden=True,
                     hidden_variant=base_hidden_variant,
@@ -7703,11 +8154,14 @@ def generate_mtpk(
                 target_distribution_logits,
                 sampler,
             )
-            if sampled_target_ids is None:
-                raise RuntimeError(
-                    "target_prefix verification requires top-k sampling or top_p=1"
-                )
-            _eval(sampled_target_ids)
+            if a3b_target_prefix_route is not None and not a3b_k2:
+                _eval(sampled_target_ids, device_draft_token)
+                draft_token = int(np.asarray(device_draft_token).reshape(-1)[0])
+                draft_tokens[0] = draft_token
+                event["drafts"][0]["token"] = draft_token
+            else:
+                # k=2 (and non-compiled) already hold host-int draft tokens.
+                _eval(sampled_target_ids)
             target_prefix_tokens = [
                 int(token) for token in np.asarray(sampled_target_ids).reshape(-1)
             ]
@@ -7845,10 +8299,6 @@ def generate_mtpk(
             trace_accounting_time_s += time.perf_counter() - trace_accounting_started
         if graphbank is not None:
             event["graphbank"] = graphbank.to_dict()
-        if compiled_verify_bank is not None:
-            event.setdefault("graphbank", {})["compiled_verify"] = (
-                compiled_verify_bank.to_dict()
-            )
 
         accepted_count = 0
         rejection_correction: int | None = None
@@ -8080,7 +8530,10 @@ def generate_mtpk(
                 event["drafts"][depth_index]["online_correction_cache"][
                     "stored_token"
                 ] = cached_target
-            if sampler.temperature > 0 and (
+            if (
+                sampler.temperature > 0
+                or a3b_target_prefix_route is not None
+            ) and (
                 constraint is None
                 or constraint.validate_prefix(
                     [*draft_tokens[:depth_index], int(correction)]
@@ -8089,6 +8542,12 @@ def generate_mtpk(
             ):
                 # A grammar-illegal residual correction is dropped, not
                 # committed; the masked primary resamples the position.
+                # Greedy normally defers the correction to the next cycle's
+                # argmax over the retained rejection row, but the compiled
+                # K1 route's fixed cycle geometry commits + repair-forwards
+                # the correction in-cycle, so it must be recorded at any
+                # temperature -- under greedy `correction` IS the
+                # pre-sampled argmax target id (the AR token).
                 rejection_correction = int(correction)
             break
         elapsed_accept = max(
@@ -8356,6 +8815,66 @@ def generate_mtpk(
             continue
 
         committed = [primary] + draft_tokens[:accepted_count]
+        if a3b_target_prefix_route is not None:
+            committed.append(rejection_correction)
+            correction_tokens += 1
+            tokens.extend(committed[1:])
+            # Deferred-correction fold: no repair_m1 forward.  The correction
+            # is emitted as the pending primary; the next verify runs the M2
+            # graph FROM the stashed post-primary state and computes the
+            # correction's row itself.  Byte-neutral vs repair: M2 row-0
+            # arithmetic is install-enforced bit-identical to the fused M1
+            # route.  Drafting for the folded cycle consumes the rejection
+            # boundary row (the primary's verify row), the same hidden the
+            # committed-history append pairs with the correction.
+            pending_primary = int(rejection_correction)
+            if a3b_k2:
+                # Rebase to the state matching the accepted prefix: 0 accepted
+                # -> post-row-0, 1 accepted -> post-row-1, 2 accepted -> the
+                # live post-row-2 state already written by verify_m3 (no
+                # rebase).  The next verify_m3 starts from here.
+                if accepted_count >= 2:
+                    a3b_rebase_state = None
+                elif accepted_count == 1:
+                    a3b_rebase_state = a3b_m3_rebase1_state
+                else:
+                    a3b_rebase_state = a3b_m3_rebase0_state
+            else:
+                a3b_rebase_state = a3b_primary_state
+            deferred_correction_repairs += 1
+            event["capture_repair"] = "route_pending_correction"
+            event["pending_primary"] = int(rejection_correction)
+            if _mtp_history_uses_committed_cache(mtp_history_policy):
+                _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
+                draft_time += append_mtp_history(
+                    mtp_cache,
+                    verify_hidden[:, 0:1, :],
+                    [rejection_correction],
+                )
+            cache_committed_token_count = max(0, len(tokens) - 1)
+            maybe_detach_dirty_state(cache_committed_token_count)
+            logits, hidden = own_live_logits_hidden(
+                verify_logits[:, 0:1, :].reshape(1, -1),
+                verify_hidden[:, 0:1, :],
+            )
+            maybe_rebase_decode_state(cache_committed_token_count)
+            maybe_eval_state_roots(event, cache_committed_token_count)
+            append_event(event)
+
+            if any(_is_stop(token, stop_token_ids) for token in committed):
+                stop_index = next(
+                    i
+                    for i, token in enumerate(tokens)
+                    if _is_stop(token, stop_token_ids)
+                )
+                tokens = tokens[: stop_index + 1]
+                emit_new_tokens()
+                emit_trace()
+                break
+            emit_new_tokens()
+            emit_trace()
+            continue
+
         if rejection_correction is not None:
             committed.append(rejection_correction)
             correction_tokens += 1
@@ -8382,7 +8901,7 @@ def generate_mtpk(
                 cache,
                 captures,
                 keep_tokens=committed_prefix_len,
-                verified_tokens=len(verify_input),
+                verified_tokens=verified_token_count,
                 detach_components=capture_commit_detach_components,
                 detach_mode=capture_commit_detach_mode,
                 detach_stats=commit_detach_stats,
@@ -8405,7 +8924,7 @@ def generate_mtpk(
             committed_from_trim = trim_verified_window_to_prefix(
                 cache,
                 before_verify,
-                verified_tokens=len(verify_input),
+                verified_tokens=verified_token_count,
                 keep_tokens=committed_prefix_len,
             )
             elapsed_trim_commit = time.perf_counter() - started_trim_commit
@@ -8471,20 +8990,27 @@ def generate_mtpk(
                 )
                 event["capture_repair"] = "trimmed_prefix_commit"
             else:
-                started = time.perf_counter()
-                with attention_phase("decode_verify"):
-                    repair_logits, repair_hidden = rt.forward_ar(
-                        mx.array([[int(rejection_correction)]]),
-                        cache=cache,
-                        return_hidden=True,
-                        hidden_variant=base_hidden_variant,
-                    )
-                _eval(repair_logits, repair_hidden)
-                elapsed_repair = time.perf_counter() - started
-                target_time += elapsed_repair
-                repair_time += elapsed_repair
-                _add_timing(event, "repair_forward", elapsed_repair)
-                event["capture_repair"] = "trimmed_prefix_correction_forward"
+                # Deferred correction repair (the 2.3.0 capture-commit fix,
+                # ported to the trim lane): the correction is emitted now and
+                # becomes the pending primary, whose KV is computed by
+                # whichever forward runs next -- no dedicated one-row
+                # correction forward.  Drafting needs the hidden of the token
+                # BEFORE the pending primary, which is exactly the retained
+                # verify row at the rejection boundary; the trim commit
+                # already restored the cache to the committed prefix, the
+                # same state the old correction forward ran on.
+                repair_logits, repair_hidden = own_live_logits_hidden(
+                    verify_logits[
+                        :, committed_prefix_len - 1 : committed_prefix_len, :
+                    ],
+                    verify_hidden[
+                        :, committed_prefix_len - 1 : committed_prefix_len, :
+                    ],
+                )
+                pending_primary = int(rejection_correction)
+                deferred_correction_repairs += 1
+                event["capture_repair"] = "trimmed_prefix_pending_correction"
+                event["pending_primary"] = int(rejection_correction)
         else:
             if before_verify is None:
                 raise RuntimeError(
@@ -8495,19 +9021,29 @@ def generate_mtpk(
             )
             started_rollback = time.perf_counter()
             rollback_after_verify(
-                cache, before_verify, verified_tokens=len(verify_input)
+                cache, before_verify, verified_tokens=verified_token_count
             )
             elapsed_rollback = time.perf_counter() - started_rollback
             rollback_time += elapsed_rollback
             _add_timing(event, "rollback", elapsed_rollback)
             started = time.perf_counter()
             with attention_phase("decode_verify"):
-                repair_logits, repair_hidden = rt.forward_ar(
-                    mx.array([committed]),
-                    cache=cache,
-                    return_hidden=True,
-                    hidden_variant=base_hidden_variant,
-                )
+                if generic_compiled_target_prefix and compiled_verify_bank is not None:
+                    repair_logits, repair_hidden, _repair_captures = (
+                        compiled_verify_bank.forward_ar_capture(
+                            mx.array([committed]),
+                            cache=cache,
+                            return_hidden=True,
+                            hidden_variant=base_hidden_variant,
+                        )
+                    )
+                else:
+                    repair_logits, repair_hidden = rt.forward_ar(
+                        mx.array([committed]),
+                        cache=cache,
+                        return_hidden=True,
+                        hidden_variant=base_hidden_variant,
+                    )
             _eval(repair_logits, repair_hidden)
             elapsed_repair = time.perf_counter() - started
             target_time += elapsed_repair
@@ -8593,12 +9129,22 @@ def generate_mtpk(
 
     emit_trace(force=True, final=True)
     elapsed = time.perf_counter() - started_all
-    if compiled_verify_bank is not None:
+    compiled_verify_report: dict[str, Any] | None = None
+    if a3b_target_prefix_route is not None:
+        compiled_verify_report = a3b_target_prefix_route.final_report(
+            # Corrections are deferred into rebased M2 verifies; repair_m1 is
+            # never dispatched, so m1_calls reports the truth: zero.
+            verify_calls=verify_calls,
+            repair_calls=correction_tokens - deferred_correction_repairs,
+        )
+        a3b_target_prefix_route.demote()
+    elif compiled_verify_bank is not None:
+        compiled_verify_report = compiled_verify_bank.to_dict()
         if _env_truthy("MTPLX_COMPILED_VERIFY_STATS"):
             try:
                 print(
                     "[mtplx] compiled-verify stats "
-                    + json.dumps(compiled_verify_bank.to_dict()),
+                    + json.dumps(compiled_verify_report),
                     file=sys.stderr,
                     flush=True,
                 )
@@ -8786,8 +9332,8 @@ def generate_mtpk(
         graphbank={
             **(graphbank.to_dict() if graphbank is not None else {}),
             **(
-                {"compiled_verify": compiled_verify_bank.to_dict()}
-                if compiled_verify_bank is not None
+                {"compiled_verify": compiled_verify_report}
+                if compiled_verify_report is not None
                 else {}
             ),
         },

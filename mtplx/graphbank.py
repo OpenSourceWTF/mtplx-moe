@@ -1104,6 +1104,7 @@ class CompiledVerifyBank:
         runtime: Any,
         *,
         max_verify_len: int | None = None,
+        request_max_tokens: int | None = None,
         capture_backend: str | None = None,
         parity: bool = False,
         parity2: bool = False,
@@ -1113,6 +1114,17 @@ class CompiledVerifyBank:
             raw = os.environ.get("MTPLX_COMPILED_VERIFY_MAX_LEN", "").strip()
             max_verify_len = int(raw) if raw else 6
         self.max_verify_len = int(max_verify_len)
+        self.request_max_tokens = (
+            None if request_max_tokens is None else max(0, int(request_max_tokens))
+        )
+        self.speculative_headroom = (
+            self.max_verify_len if self.request_max_tokens is not None else 0
+        )
+        self.growth_reserve_tokens = (
+            self.request_max_tokens + self.speculative_headroom
+            if self.request_max_tokens is not None
+            else _compiled_verify_growth_reserve()
+        )
         self.capture_backend = resolve_gdn_capture_backend(capture_backend)
         self.parity = bool(parity)
         self.parity2 = bool(parity2)
@@ -1133,13 +1145,12 @@ class CompiledVerifyBank:
         self._gdn_meta_cache: dict[int, dict[str, int] | None] = {}
         self._exception_failures = 0
         self._held_state_refs: list = []
-        # Growth-budget demotion (2026-07-03): dense leaves that outgrow the
-        # capacity granted at first promotion would retrace the compiled graph
-        # on every 256-token step (measured: 5 retraces per 1.3k-token answer,
-        # one 9.5s first-compile stall mid-generation at 7k). Once the request
-        # exhausts its growth budget the bank stays eager for the rest of the
-        # generation: agent-length rounds (<= ~500 tokens) run fully compiled,
-        # long chat generations pay zero retraces and zero padded-mask tax.
+        # Dense leaves that outgrow the capacity granted at first promotion
+        # would retrace the compiled graph on every cache-growth step. A
+        # generation request supplies its known output budget plus one maximum
+        # speculative window; TensorOffsetKVCache.ensure_capacity rounds the
+        # final offset + reserve to each entry's own step geometry. Standalone
+        # callers without a request budget retain the legacy env reserve.
         self._growth_demoted = False
         self._dense_capacity_grant: dict[int, int] | None = None
         self.stats: dict[str, Any] = {
@@ -1156,6 +1167,7 @@ class CompiledVerifyBank:
             "parity2_calls": 0,
             "parity2_divergent_calls": 0,
             "parity2_first_divergence": None,
+            "growth_demotions": 0,
         }
 
     # -- public API ---------------------------------------------------------
@@ -1524,6 +1536,9 @@ class CompiledVerifyBank:
         else:
             data["mode"] = "parity" if self.parity else "on"
         data["max_verify_len"] = self.max_verify_len
+        data["request_max_tokens"] = self.request_max_tokens
+        data["speculative_headroom"] = self.speculative_headroom
+        data["growth_reserve_tokens"] = self.growth_reserve_tokens
         data["capture_backend"] = self.capture_backend
         data["permanent_eager"] = self.permanent_eager
         data["compiled_entry_count"] = len(self._compiled)
@@ -1566,7 +1581,7 @@ class CompiledVerifyBank:
             cache,
             reserve_tokens=length,
             preserve_paged=True,
-            initial_reserve_tokens=max(length, _compiled_verify_growth_reserve()),
+            initial_reserve_tokens=max(length, self.growth_reserve_tokens),
         )
         self.stats["promoted"] += promoted
         for entry in cache:

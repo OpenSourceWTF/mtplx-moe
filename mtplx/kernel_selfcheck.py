@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from types import SimpleNamespace
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -69,7 +70,14 @@ def selfcheck_enabled() -> bool:
         return False
     if raw in {"1", "true", "on", "yes"}:
         return True
-    return _env_on("MTPLX_NAX_VERIFY") or _env_on("MTPLX_GQA_PACKED_SDPA")
+    return (
+        _env_on("MTPLX_NAX_VERIFY")
+        or _env_on("MTPLX_GQA_PACKED_SDPA")
+        or _env_on("MTPLX_QWEN_ROW_OWNED_ROUTER")
+        or _env_on("MTPLX_QWEN_COMBINE_TAIL")
+        or _env_on("MTPLX_FUSE_GDN_POST_CONV")
+        or _env_on("MTPLX_A3B_WHOLE_MOE_FUSION")
+    )
 
 
 def lane_disabled(lane: str) -> bool:
@@ -132,6 +140,69 @@ def _check_qmm_lane(mx, fn, m: int, bits: int, group_size: int, dtype) -> float:
     if tuple(y.shape) != tuple(ref.shape):
         return float("inf")
     return _max_abs_diff(mx, y, ref)
+
+
+def _check_qwen_row_owned_router(mx, dtype) -> float:
+    """Require bitwise stock routing for every installed M1-M16 row count."""
+
+    if dtype != mx.bfloat16:
+        return float("inf")
+    from .qwen_row_owned_router import qwen_row_owned_route
+
+    fixture = mx.arange(16 * 256, dtype=mx.float32).reshape(16, 256)
+    logits = (
+        mx.sin(fixture * 0.017) * 0.5
+        + mx.cos(fixture * 0.031) * 0.125
+    ).astype(dtype)
+    probabilities = mx.softmax(logits, axis=-1, precise=True)
+    for rows in range(1, 17):
+        current = probabilities[:rows]
+        stock_ids = mx.argpartition(current, kth=-8, axis=-1)[..., -8:]
+        stock_scores = mx.take_along_axis(current, stock_ids, axis=-1)
+        stock_scores = stock_scores / stock_scores.sum(axis=-1, keepdims=True)
+        candidate_ids, candidate_scores = qwen_row_owned_route(current)
+        mx.eval(stock_ids, stock_scores, candidate_ids, candidate_scores)
+        if not bool(mx.array_equal(candidate_ids, stock_ids).item()):
+            return float("inf")
+        if not bool(mx.array_equal(candidate_scores, stock_scores).item()):
+            return float("inf")
+    return 0.0
+
+
+def _check_qwen_combine_tail_m1_m2(mx, dtype) -> float:
+    """Require bitwise stock arithmetic for the installed K1 shapes."""
+
+    if dtype != mx.bfloat16:
+        return float("inf")
+    from .qwen_row_owned_router import (
+        qwen_combine_tail_m1,
+        qwen_combine_tail_m2,
+    )
+
+    for rows, entrypoint in ((1, qwen_combine_tail_m1), (2, qwen_combine_tail_m2)):
+        routed_fixture = mx.arange(
+            rows * 8 * 2048, dtype=mx.float32
+        ).reshape(1, rows, 8, 2048)
+        routed = (
+            mx.sin(routed_fixture * 0.013) * 0.5
+            + mx.cos(routed_fixture * 0.007) * 0.125
+        ).astype(dtype)
+        score_fixture = mx.arange(rows * 8, dtype=mx.float32).reshape(
+            1, rows, 8
+        )
+        scores = mx.softmax(
+            mx.sin(score_fixture * 0.11)
+            + mx.cos(score_fixture * 0.07) * 0.25,
+            axis=-1,
+        ).astype(dtype)
+        stock = (routed * scores[..., None]).sum(axis=-2)
+        candidate = entrypoint(routed, scores)
+        mx.eval(stock, candidate)
+        if tuple(candidate.shape) != (1, rows, 2048):
+            return float("inf")
+        if not bool(mx.array_equal(candidate, stock).item()):
+            return float("inf")
+    return 0.0
 
 
 def _check_gqa_packed(mx, dtype) -> float:
@@ -257,6 +328,168 @@ def _check_expert_gather(
         ).reshape((N,))
         worst = max(worst, _max_abs_diff(mx, y[r], ref))
     return worst
+def _check_gdn_postconv_inline_g(mx, dtype) -> float:
+    """Compare the exact A3B M1/M2 stock captures with their fixed routes."""
+    if dtype != mx.bfloat16:
+        return float("inf")
+
+    from .gdn_capture import (
+        _a3b_compiled_target_gdn_postconv_m1_tgy4,
+        _a3b_compiled_target_gdn_postconv_m2_tgy4,
+        _stock_gated_delta_capture,
+    )
+
+    conv_values = mx.arange(2 * 8192, dtype=mx.float32).reshape(1, 2, 8192)
+    conv_out = (mx.sin(conv_values * 0.013) * 0.5).astype(mx.bfloat16)
+    gate_values = mx.arange(64, dtype=mx.float32).reshape(1, 2, 32)
+    a = (mx.sin(gate_values * 0.11) * 0.5).astype(mx.bfloat16)
+    b = (mx.cos(gate_values * 0.07) * 0.5).astype(mx.bfloat16)
+    state_values = mx.arange(32 * 128 * 128, dtype=mx.float32).reshape(
+        1, 32, 128, 128
+    )
+    state = mx.sin(state_values * 0.001) * 0.1
+    gdn = SimpleNamespace(
+        A_log=mx.linspace(0.0, 2.0, 32).astype(dtype),
+        dt_bias=mx.linspace(-5.0, -3.0, 32).astype(dtype),
+        conv_dim=8192,
+        key_dim=2048,
+        num_k_heads=16,
+        num_v_heads=32,
+        head_k_dim=128,
+        head_v_dim=128,
+        training=False,
+    )
+    inv_scale = 128**-0.5
+    routes = (
+        (1, _a3b_compiled_target_gdn_postconv_m1_tgy4),
+        (2, _a3b_compiled_target_gdn_postconv_m2_tgy4),
+    )
+    differences = []
+    for logical_m, route in routes:
+        route_conv = conv_out[:, :logical_m]
+        route_a = a[:, :logical_m]
+        route_b = b[:, :logical_m]
+        q, k, v = [
+            tensor.reshape(1, logical_m, heads, 128)
+            for tensor, heads in zip(
+                mx.split(route_conv, [2048, 4096], axis=-1),
+                [16, 16, 32],
+            )
+        ]
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        ref_out, ref_states = _stock_gated_delta_capture(
+            q,
+            k,
+            v,
+            route_a,
+            route_b,
+            state,
+            None,
+            gdn,
+        )
+        out, states = route(
+            route_conv,
+            route_a,
+            route_b,
+            state,
+            A_log=gdn.A_log,
+            dt_bias=gdn.dt_bias,
+        )
+        mx.eval(ref_out, ref_states, out, states)
+        if tuple(out.shape) != tuple(ref_out.shape) or tuple(states.shape) != tuple(
+            ref_states.shape
+        ):
+            return float("inf")
+        differences.extend(
+            (
+                _max_abs_diff(mx, out, ref_out),
+                _max_abs_diff(mx, states, ref_states),
+            )
+        )
+    return max(differences)
+
+
+def _check_gdn_postconv_headquarter(mx, dtype) -> float:
+    """Compare the exact A3B M1/M2 stock captures with the C1 headquarter routes."""
+    if dtype != mx.bfloat16:
+        return float("inf")
+
+    from .gdn_capture import (
+        _a3b_compiled_target_gdn_postconv_m1_headquarter,
+        _a3b_compiled_target_gdn_postconv_m2_headquarter,
+        _stock_gated_delta_capture,
+    )
+
+    conv_values = mx.arange(2 * 8192, dtype=mx.float32).reshape(1, 2, 8192)
+    conv_out = (mx.sin(conv_values * 0.013) * 0.5).astype(mx.bfloat16)
+    gate_values = mx.arange(64, dtype=mx.float32).reshape(1, 2, 32)
+    a = (mx.sin(gate_values * 0.11) * 0.5).astype(mx.bfloat16)
+    b = (mx.cos(gate_values * 0.07) * 0.5).astype(mx.bfloat16)
+    state_values = mx.arange(32 * 128 * 128, dtype=mx.float32).reshape(
+        1, 32, 128, 128
+    )
+    state = mx.sin(state_values * 0.001) * 0.1
+    gdn = SimpleNamespace(
+        A_log=mx.linspace(0.0, 2.0, 32).astype(dtype),
+        dt_bias=mx.linspace(-5.0, -3.0, 32).astype(dtype),
+        conv_dim=8192,
+        key_dim=2048,
+        num_k_heads=16,
+        num_v_heads=32,
+        head_k_dim=128,
+        head_v_dim=128,
+        training=False,
+    )
+    inv_scale = 128**-0.5
+    routes = (
+        (1, _a3b_compiled_target_gdn_postconv_m1_headquarter),
+        (2, _a3b_compiled_target_gdn_postconv_m2_headquarter),
+    )
+    differences = []
+    for logical_m, route in routes:
+        route_conv = conv_out[:, :logical_m]
+        route_a = a[:, :logical_m]
+        route_b = b[:, :logical_m]
+        q, k, v = [
+            tensor.reshape(1, logical_m, heads, 128)
+            for tensor, heads in zip(
+                mx.split(route_conv, [2048, 4096], axis=-1),
+                [16, 16, 32],
+            )
+        ]
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        ref_out, ref_states = _stock_gated_delta_capture(
+            q,
+            k,
+            v,
+            route_a,
+            route_b,
+            state,
+            None,
+            gdn,
+        )
+        out, states = route(
+            route_conv,
+            route_a,
+            route_b,
+            state,
+            A_log=gdn.A_log,
+            dt_bias=gdn.dt_bias,
+        )
+        mx.eval(ref_out, ref_states, out, states)
+        if tuple(out.shape) != tuple(ref_out.shape) or tuple(states.shape) != tuple(
+            ref_states.shape
+        ):
+            return float("inf")
+        differences.extend(
+            (
+                _max_abs_diff(mx, out, ref_out),
+                _max_abs_diff(mx, states, ref_states),
+            )
+        )
+    return max(differences)
 
 
 def run_kernel_selfcheck(
@@ -455,6 +688,24 @@ def run_kernel_selfcheck(
     # lm_head_topk kernels exist but are not routed on the serve path.
     lanes["lm_head_topk"] = _STATUS_SKIPPED
 
+    if _env_on("MTPLX_QWEN_ROW_OWNED_ROUTER"):
+        _record(
+            "qwen_row_owned_router",
+            0.002,
+            lambda: _check_qwen_row_owned_router(mx, dtype),
+        )
+    else:
+        lanes["qwen_row_owned_router"] = _STATUS_SKIPPED
+
+    if _env_on("MTPLX_QWEN_COMBINE_TAIL"):
+        _record(
+            "qwen_combine_tail_m1_m2",
+            0.0,
+            lambda: _check_qwen_combine_tail_m1_m2(mx, dtype),
+        )
+    else:
+        lanes["qwen_combine_tail_m1_m2"] = _STATUS_SKIPPED
+
     if _env_on("MTPLX_GQA_PACKED_SDPA"):
         _record("gqa_packed_sdpa", _SDPA_TOLERANCE, lambda: _check_gqa_packed(mx, dtype))
     else:
@@ -491,6 +742,27 @@ def run_kernel_selfcheck(
                 mx, e_dtype, int(e_bits), int(e_group_size)
             ),
         )
+
+    if _env_on("MTPLX_FUSE_GDN_POST_CONV"):
+        from .gdn_capture import _a3b_gdn_postconv_headquarter_requested
+
+        if _a3b_gdn_postconv_headquarter_requested():
+            lanes["gdn_postconv_inline_g"] = _STATUS_SKIPPED
+            _record(
+                "gdn_postconv_headquarter",
+                0.03125,
+                lambda: _check_gdn_postconv_headquarter(mx, dtype),
+            )
+        else:
+            _record(
+                "gdn_postconv_inline_g",
+                0.03125,
+                lambda: _check_gdn_postconv_inline_g(mx, dtype),
+            )
+            lanes["gdn_postconv_headquarter"] = _STATUS_SKIPPED
+    else:
+        lanes["gdn_postconv_inline_g"] = _STATUS_SKIPPED
+        lanes["gdn_postconv_headquarter"] = _STATUS_SKIPPED
 
     elapsed_ms = (time.perf_counter() - started) * 1000.0
 

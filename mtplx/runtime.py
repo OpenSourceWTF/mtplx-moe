@@ -6,10 +6,11 @@ import hashlib
 import inspect as py_inspect
 import json
 import logging
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 from .artifacts import inspect_model, load_config
 from .mtp_adapters import (
@@ -20,6 +21,9 @@ from .mtp_adapters import (
 from .mtp_patch import MTPContract, inject_mtp_support, validate_mtp_support
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .a3b_compiled_target_prefix import A3BCompiledTargetPrefixFactory
 
 
 def _streamed_mtp_backend(model_key: str, precision: str) -> str:
@@ -64,6 +68,16 @@ class MTPLXRuntime:
     mtp_adapter_merge_report: dict[str, Any] | None = None
     expert_streaming: Any | None = None
     resident_load_report: dict[str, Any] | None = None
+    a3b_compiled_target_prefix_factory: A3BCompiledTargetPrefixFactory | None = None
+    a3b_whole_moe_installed: bool = False
+    _a3b_whole_moe_request_preflights: dict[str, dict[str, Any]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _a3b_whole_moe_request_geometry_keys: dict[
+        tuple[int, str, str], str
+    ] = field(default_factory=dict, init=False, repr=False)
     diagnostic_counters: dict[str, int] = field(default_factory=dict)
     _forward_ar_supports_emit_logits: bool | None = field(
         default=None, init=False, repr=False
@@ -335,6 +349,24 @@ class MTPLXRuntime:
                 hidden_variant=hidden_variant,
                 capture_backend=capture_backend,
             )
+
+    def _forward_ar_capture_a3b_postconv(
+        self,
+        input_ids,
+        *,
+        cache,
+        hidden_variant: str | None,
+        postconv_implementations: tuple[Callable[..., Any], ...],
+    ):
+        from .gdn_capture import forward_with_a3b_gdn_postconv_capture
+
+        return forward_with_a3b_gdn_postconv_capture(
+            self.model,
+            input_ids,
+            cache=cache,
+            hidden_variant=hidden_variant,
+            postconv_implementations=postconv_implementations,
+        )
 
     def draft_mtp(
         self,
@@ -617,6 +649,12 @@ def _load_impl(
         (contract or MTPContract())
         .with_runtime_metadata(runtime_metadata, preserve_explicit=True)
         .with_config_defaults(config)
+    )
+    from .a3b_whole_moe import validate_a3b_whole_moe_load_options
+
+    validate_a3b_whole_moe_load_options(
+        mtp_adapter=mtp_adapter,
+        merge_mtp_adapter=merge_mtp_adapter,
     )
     from .step3p5_mtp_patch import is_step3p5_mtp_config
     from .qwen3_5_mtp_patch import (
@@ -1001,15 +1039,49 @@ def _load_impl(
         if not mtp_enabled or not validate_mtp_support(model):
             raise RuntimeError(f"MTP injection failed for {path}")
     from .attention_split import configure_split_full_attention
+    from .moe_packed_projections import (
+        configure_moe_packed_projections,
+        moe_pack_gate_up_enabled,
+    )
     from .native_mlp import configure_native_mlp
 
     configure_split_full_attention(model)
     configure_native_mlp(model)
+    # Construction-time only: replaces the MoE gate/up projections with one
+    # packed matmul each. Must run after MTP injection so the draft block's
+    # MoE layer is packed too, and after load-coverage validation so the
+    # packed parameter tree is never compared against checkpoint keys.
+    if moe_pack_gate_up_enabled():
+        pack_report = configure_moe_packed_projections(model)
+        logger.info("[moe-pack] %s", pack_report)
     from .nax_verify import install_nax_qlinear_patch, nax_env_enabled
 
     if nax_env_enabled():
         nax_report = install_nax_qlinear_patch()
         logger.info("[nax-verify] %s", nax_report)
+    from .qwen_row_owned_router import (
+        install_qwen_row_owned_routers,
+        prepare_qwen_row_owned_routers,
+    )
+    from .a3b_whole_moe import (
+        install_a3b_whole_moe,
+        prepare_a3b_whole_moe,
+        run_a3b_whole_moe_selfcheck,
+    )
+
+    from .gdn_capture import (
+        install_a3b_gdn_postconv,
+        prepare_a3b_gdn_postconv,
+    )
+    from .a3b_compiled_target_prefix import (
+        preflight_a3b_k1_target_prefix_load_graph,
+        prepare_a3b_compiled_target_prefix,
+    )
+
+    whole_moe_plan = prepare_a3b_whole_moe(model, config=config)
+    router_plan = prepare_qwen_row_owned_routers(model, config=config)
+    postconv_plan = prepare_a3b_gdn_postconv(model, config=config)
+    postconv_factory = None
     from .kernel_selfcheck import maybe_run_model_selfcheck
 
     # Turbo lanes validate themselves once per load on the model's actual
@@ -1017,9 +1089,35 @@ def _load_impl(
     # continues on the stock path (surfaced in /health kernel_selfcheck).
     # Expert-streaming loads also pass their spec so the routed expert bank's
     # gather_qmm lane is validated at its own (possibly different) quant format.
-    maybe_run_model_selfcheck(
+    selfcheck_report = maybe_run_model_selfcheck(
         model,
         expert_spec=getattr(expert_runtime, "spec", None),
+    )
+    if whole_moe_plan is not None and router_plan is None:
+        from .a3b_whole_moe import A3BWholeMoeConfigError
+
+        raise A3BWholeMoeConfigError(
+            "whole-MoE target M2 requires the accepted row-owned router/combine route"
+        )
+    if router_plan is not None:
+        router_report = install_qwen_row_owned_routers(router_plan, selfcheck_report)
+        logger.info("[qwen-row-owned-router] %s", router_report)
+    if whole_moe_plan is not None:
+        selfcheck_report = run_a3b_whole_moe_selfcheck(
+            whole_moe_plan,
+            selfcheck_report,
+        )
+    if postconv_plan is not None:
+        postconv_factory = install_a3b_gdn_postconv(
+            postconv_plan, selfcheck_report
+        )
+        from .gdn_capture import gdn_postconv_stats
+
+        logger.info("[a3b-gdn-postconv] %s", gdn_postconv_stats())
+    compiled_target_factory = prepare_a3b_compiled_target_prefix(
+        model,
+        config=config,
+        gdn_postconv_factory=postconv_factory,
     )
     adapter_path = Path(mtp_adapter) if mtp_adapter is not None else None
     adapter_metadata = None
@@ -1043,7 +1141,25 @@ def _load_impl(
         mtp_adapter_merge_report=adapter_merge_report,
         expert_streaming=expert_runtime,
         resident_load_report=resident_load_report,
+        a3b_compiled_target_prefix_factory=compiled_target_factory,
+        a3b_whole_moe_installed=False,
     )
+    if whole_moe_plan is not None:
+        if compiled_target_factory is None:
+            from .a3b_whole_moe import A3BWholeMoeConfigError
+
+            raise A3BWholeMoeConfigError(
+                "whole-MoE requires exact compiled target-prefix construction"
+            )
+        whole_moe_report = install_a3b_whole_moe(
+            whole_moe_plan,
+            selfcheck_report,
+            compiled_preflight=lambda: preflight_a3b_k1_target_prefix_load_graph(
+                runtime, compiled_target_factory
+            ),
+        )
+        runtime.a3b_whole_moe_installed = True
+        logger.info("[a3b-whole-moe] %s", whole_moe_report)
     return runtime
 
 

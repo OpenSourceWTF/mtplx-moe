@@ -571,6 +571,57 @@ def test_to_dict_exposes_stats_and_buckets():
     assert isinstance(data["buckets"], dict)
 
 
+def test_request_reserve_keeps_1024_outputs_compiled_and_parity_exact(monkeypatch):
+    """A known 1024-token request must not hit the legacy 512-token cliff."""
+
+    class ExactKVRuntime:
+        V = 5
+
+        def forward_ar_capture(
+            self,
+            input_ids,
+            cache=None,
+            return_hidden=False,
+            hidden_variant=None,
+            capture_backend=None,
+        ):
+            del hidden_variant, capture_backend
+            hidden = input_ids.astype(mx.float32)[..., None]
+            kv = hidden[:, None, :, :]
+            cache[0].update_and_fetch(kv, kv)
+            logits = mx.concatenate((hidden, hidden + 1.0), axis=-1)
+            if return_hidden:
+                return logits, hidden, {}
+            return logits, {}
+
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_PREWARM", "0")
+    rt = ExactKVRuntime()
+    cache = [KVCache()]
+    rt.forward_ar_capture(mx.array([[0, 1, 2]]), cache=cache)
+    bank = CompiledVerifyBank(rt, request_max_tokens=1024, parity=True)
+
+    for token_index in range(1024):
+        bank.forward_ar_capture(
+            mx.array([[token_index % rt.V]]),
+            cache=cache,
+            return_hidden=True,
+        )
+
+    stats = bank.to_dict()
+    assert stats["request_max_tokens"] == 1024
+    assert stats["speculative_headroom"] == bank.max_verify_len == 6
+    assert stats["compiled_calls"] == 1024
+    assert stats["fallback_calls"] == 0
+    assert stats["fallback_reasons"] == {}
+    assert stats["growth_demotions"] == 0
+    assert stats["parity_checks"] == 1024
+    assert stats["parity_failures"] == 0
+    assert isinstance(cache[0], TensorOffsetKVCache)
+    assert cache[0].size() == 1027
+    assert int(cache[0].keys.shape[2]) == 1280
+    assert int(cache[0].keys.shape[2]) % int(cache[0].step) == 0
+
+
 def test_parity_mode_passes_on_toy_model_and_commits_eager_state():
     rt = ToyHybridRuntime()
     bank = CompiledVerifyBank(rt, parity=True)
@@ -934,7 +985,7 @@ def test_capture_commit_supports_pure_attention_hy3_cache() -> None:
 # -- generation wiring (step 3) ------------------------------------------------
 
 
-def _tiny_mtpk_runtime():
+def _tiny_mtpk_runtime(*, mtp_token: int = 1):
     """Stub runtime in the style of tests/test_generation_sustained.py."""
     from pathlib import Path
     from types import SimpleNamespace
@@ -950,6 +1001,7 @@ def _tiny_mtpk_runtime():
         def __init__(self):
             self.mtp = SimpleNamespace(_mtplx_lora_targets=[])
             self.capture_calls: list[int] = []
+            self.mtp_token = int(mtp_token)
 
         def make_cache(self):
             return []
@@ -989,9 +1041,11 @@ def _tiny_mtpk_runtime():
         ):
             length = int(next_token_ids.shape[1])
             hidden = mx.zeros((1, length, 2), dtype=mx.float32)
+            logits = mx.zeros((1, length, 4), dtype=mx.float32)
+            logits = logits + mx.eye(4, dtype=mx.float32)[self.mtp_token]
             if return_hidden:
-                return self._logits(length), hidden
-            return self._logits(length)
+                return logits, hidden
+            return logits
 
         def mtp_update_cache(self, hidden_states, next_token_ids, **_kwargs):
             return hidden_states
@@ -1023,11 +1077,16 @@ def _tiny_mtpk_runtime():
     return rt, model
 
 
-def _run_tiny_mtpk(max_tokens: int = 5):
+def _run_tiny_mtpk(
+    max_tokens: int = 5,
+    *,
+    verify_strategy: str = "capture_commit",
+    mtp_token: int = 1,
+):
     from mtplx.generation import generate_mtpk
     from mtplx.sampling import SamplerConfig
 
-    rt, model = _tiny_mtpk_runtime()
+    rt, model = _tiny_mtpk_runtime(mtp_token=mtp_token)
     out = generate_mtpk(
         rt,
         [0],
@@ -1035,7 +1094,7 @@ def _run_tiny_mtpk(max_tokens: int = 5):
         sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=20),
         speculative_depth=3,
         mtp_history_policy="committed",
-        verify_strategy="capture_commit",
+        verify_strategy=verify_strategy,
         stop_token_ids=set(),
     )
     return out, model
@@ -1068,9 +1127,353 @@ def test_generation_flag_on_attaches_stats_and_matches_flag_off(monkeypatch):
     assert bank_stats["compiled_calls"] >= 1
     assert bank_stats["fallback_calls"] == 0
     assert bank_stats["permanent_eager"] is False
-    assert out.stats.events[0]["graphbank"]["compiled_verify"]["calls"] >= 1
+    assert all(
+        "compiled_verify" not in event.get("graphbank", {})
+        for event in out.stats.events
+    )
     # No adapters existed in the empty stub cache, so nothing to demote.
     assert bank_stats["demotions"] == 0
+
+
+def test_generation_target_prefix_compile_is_separately_default_off(monkeypatch):
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "1")
+    monkeypatch.delenv("MTPLX_COMPILED_TARGET_PREFIX", raising=False)
+
+    out, _ = _run_tiny_mtpk(verify_strategy="target_prefix")
+
+    assert out.stats.graphbank == {}
+
+
+def test_generation_flag_on_compiles_target_prefix_without_changing_tokens(monkeypatch):
+    monkeypatch.delenv("MTPLX_COMPILED_VERIFY", raising=False)
+    monkeypatch.delenv("MTPLX_COMPILED_TARGET_PREFIX", raising=False)
+    baseline, _ = _run_tiny_mtpk(verify_strategy="target_prefix")
+
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "1")
+    monkeypatch.setenv("MTPLX_COMPILED_TARGET_PREFIX", "1")
+    out, _ = _run_tiny_mtpk(verify_strategy="target_prefix")
+
+    assert out.tokens == baseline.tokens
+    assert out.stats.generated_tokens == baseline.stats.generated_tokens
+    bank_stats = out.stats.graphbank["compiled_verify"]
+    assert bank_stats["mode"] == "on"
+    assert bank_stats["calls"] == out.stats.verify_calls
+    assert bank_stats["compiled_calls"] >= 1
+    assert bank_stats["fallback_calls"] == 0
+
+
+def test_generation_passes_known_output_budget_to_compiled_bank(monkeypatch):
+    import mtplx.generation as generation
+
+    real_bank = generation.CompiledVerifyBank
+    seen: list[dict] = []
+
+    def recording_bank(*args, **kwargs):
+        seen.append(dict(kwargs))
+        return real_bank(*args, **kwargs)
+
+    monkeypatch.setattr(generation, "CompiledVerifyBank", recording_bank)
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "1")
+    monkeypatch.setenv("MTPLX_COMPILED_TARGET_PREFIX", "1")
+
+    out, _ = _run_tiny_mtpk(
+        max_tokens=17,
+        verify_strategy="target_prefix",
+    )
+
+    assert len(out.tokens) == 17
+    assert seen and seen[0]["request_max_tokens"] == 17
+
+
+def test_generation_target_prefix_compiles_rejection_correction_forward(monkeypatch):
+    monkeypatch.delenv("MTPLX_COMPILED_VERIFY", raising=False)
+    monkeypatch.delenv("MTPLX_COMPILED_TARGET_PREFIX", raising=False)
+    baseline, _ = _run_tiny_mtpk(
+        verify_strategy="target_prefix",
+        mtp_token=2,
+    )
+
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "1")
+    monkeypatch.setenv("MTPLX_COMPILED_TARGET_PREFIX", "1")
+    out, _ = _run_tiny_mtpk(
+        verify_strategy="target_prefix",
+        mtp_token=2,
+    )
+
+    assert out.tokens == baseline.tokens
+    bank_stats = out.stats.graphbank["compiled_verify"]
+    assert bank_stats["calls"] > out.stats.verify_calls
+    assert bank_stats["compiled_calls"] == bank_stats["calls"]
+    assert bank_stats["fallback_calls"] == 0
+
+
+def _run_exact_a3b_k1_schedule(
+    monkeypatch,
+    *,
+    target_tokens: list[int],
+    max_tokens: int,
+    **generation_kwargs,
+):
+    import mtplx.generation as generation
+    from mtplx.a3b_compiled_target_prefix import A3BCompiledTargetPrefixFactory
+    from mtplx.gdn_capture import A3BGDNPostconvFactory
+    from mtplx.sampling import SamplerConfig
+
+    rt, model = _tiny_mtpk_runtime(mtp_token=1)
+    rt.a3b_compiled_target_prefix_factory = (
+        A3BCompiledTargetPrefixFactory(
+            layer_types=tuple(
+                "linear_attention" if index % 4 != 3 else "full_attention"
+                for index in range(40)
+            ),
+            gdn_layers=30,
+            full_attention_layers=10,
+            hidden_size=2048,
+            quantization="affine_q4_group64",
+            gdn_postconv=A3BGDNPostconvFactory(
+                m1_implementations=tuple(lambda *args: args for _ in range(30)),
+                m2_implementations=tuple(lambda *args: args for _ in range(30)),
+            ),
+        )
+    )
+    schedule: list[tuple] = []
+    primary_states: list[object] = []
+    history_appends: list[tuple[list[int], np.ndarray]] = []
+    exact_installed = False
+
+    class SpyRoute:
+        def __init__(self, cache):
+            self.cache = cache
+
+        def _verify(self, input_ids, kind, state_in=None):
+            cycle = len(primary_states)
+            target_token = int(target_tokens[min(cycle, len(target_tokens) - 1)])
+            primary_state = object()
+            primary_states.append(primary_state)
+            entry = (
+                kind,
+                tuple(int(token) for token in np.asarray(input_ids).reshape(-1)),
+            )
+            if state_in is not None:
+                entry = entry + (state_in,)
+            schedule.append(entry)
+            logits = mx.zeros((1, 2, 4), dtype=mx.float32)
+            logits = logits + mx.eye(4, dtype=mx.float32)[target_token]
+            hidden = mx.stack(
+                (
+                    mx.full((2,), 10 + cycle, dtype=mx.float32),
+                    mx.full((2,), 20 + cycle, dtype=mx.float32),
+                ),
+                axis=0,
+            )[None, ...]
+            return logits, hidden, primary_state
+
+        def verify_m2(self, input_ids):
+            return self._verify(input_ids, "m2")
+
+        def verify_m2_rebased(self, input_ids, primary_state):
+            # Deferred-correction fold: the rejecting cycle's post-primary
+            # state is the graph input; no repair_m1 dispatch exists.
+            return self._verify(input_ids, "m2r", state_in=primary_state)
+
+        def repair_m1(self, input_ids, primary_state):
+            raise AssertionError(
+                "repair_m1 must not be dispatched under the deferred-correction fold"
+            )
+
+        def final_report(self, *, verify_calls, repair_calls):
+            total = int(verify_calls) + int(repair_calls)
+            return {
+                "calls": total,
+                "compiled_calls": total,
+                "m2_calls": int(verify_calls),
+                "m1_calls": int(repair_calls),
+                "fallback_calls": 0,
+                "growth_demotions": 0,
+            }
+
+        def demote(self):
+            return 0
+
+    def install_spy_route(_rt, cache, **_kwargs):
+        nonlocal exact_installed
+        exact_installed = True
+        return SpyRoute(cache)
+
+    monkeypatch.setattr(
+        generation,
+        "install_a3b_k1_target_prefix_route",
+        install_spy_route,
+    )
+
+    def forbidden(name):
+        def fail(*_args, **_kwargs):
+            raise AssertionError(f"exact A3B route must not call {name}")
+
+        return fail
+
+    monkeypatch.setattr(generation, "snapshot_untrimmable_cache", forbidden("snapshot"))
+    monkeypatch.setattr(generation, "rollback_after_verify", forbidden("rollback"))
+    monkeypatch.setattr(
+        generation,
+        "_sample_draft_from_logits",
+        forbidden("host draft sampler"),
+    )
+    monkeypatch.setattr(
+        generation,
+        "trim_verified_window_to_prefix",
+        forbidden("trim"),
+    )
+    real_forward_ar = rt.forward_ar
+
+    def forward_ar_only_before_install(*args, **kwargs):
+        if exact_installed:
+            raise AssertionError("exact A3B route must not call generic target forward")
+        return real_forward_ar(*args, **kwargs)
+
+    monkeypatch.setattr(rt, "forward_ar", forward_ar_only_before_install)
+
+    import mtplx.gdn_capture as gdn_capture
+
+    monkeypatch.setattr(
+        gdn_capture,
+        "commit_captured_prefix",
+        forbidden("capture commit"),
+    )
+
+    def record_history(
+        _rt,
+        _mtp_cache,
+        hidden_states,
+        token_ids,
+        **_kwargs,
+    ):
+        mx.eval(hidden_states)
+        history_appends.append(
+            (list(token_ids), np.asarray(hidden_states, dtype=np.float32).copy())
+        )
+        return 0.0
+
+    monkeypatch.setattr(generation, "_append_mtp_history", record_history)
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "1")
+    monkeypatch.setenv("MTPLX_COMPILED_TARGET_PREFIX", "1")
+    monkeypatch.delenv("MTPLX_STATE_REBASE_EVERY", raising=False)
+
+    out = generation.generate_mtpk(
+        rt,
+        [0],
+        max_tokens=max_tokens,
+        sampler=SamplerConfig(temperature=0.5, top_p=1.0, top_k=1),
+        speculative_depth=1,
+        min_speculative_depth=1,
+        mtp_history_policy="committed",
+        verify_strategy="target_prefix",
+        stop_token_ids=set(),
+        **generation_kwargs,
+    )
+    return out, schedule, primary_states, history_appends
+
+
+def test_generation_exact_a3b_k1_rejects_host_only_draft_modifiers_before_prompt(
+    monkeypatch,
+):
+    with pytest.raises(RuntimeError, match="device draft"):
+        _run_exact_a3b_k1_schedule(
+            monkeypatch,
+            target_tokens=[1],
+            max_tokens=2,
+            online_correction_cache=True,
+        )
+
+
+def test_generation_exact_a3b_k1_rejects_env_forced_loop_guard_before_prompt(
+    monkeypatch,
+):
+    monkeypatch.setenv("MTPLX_LOOP_GUARD", "1")
+    with pytest.raises(RuntimeError, match="device draft"):
+        _run_exact_a3b_k1_schedule(
+            monkeypatch,
+            target_tokens=[1],
+            max_tokens=2,
+        )
+
+
+def test_generation_exact_a3b_k1_accept_keeps_m2_state_without_generic_commit(
+    monkeypatch,
+):
+    out, schedule, _primary_states, _history_appends = _run_exact_a3b_k1_schedule(
+        monkeypatch,
+        target_tokens=[1],
+        max_tokens=5,
+    )
+
+    assert out.tokens == [1, 1, 1, 1, 1]
+    assert all(call[0] == "m2" for call in schedule)
+    assert out.stats.correction_tokens == 0
+    report = out.stats.graphbank["compiled_verify"]
+    assert report["m2_calls"] == out.stats.verify_calls
+    assert report["m1_calls"] == 0
+
+
+def test_generation_exact_a3b_k1_reject_uses_primary_state_m1_schedule(
+    monkeypatch,
+):
+    out, schedule, primary_states, history_appends = _run_exact_a3b_k1_schedule(
+        monkeypatch,
+        target_tokens=[2],
+        max_tokens=4,
+    )
+
+    # Deferred-correction fold: the rejected cycle emits the correction as
+    # the pending primary; the NEXT verify is the rebased M2 running from
+    # the rejecting cycle's post-primary state.  The token after each
+    # correction comes from the rebased verify's pre-sampled row.
+    assert out.tokens == [1, 2, 2, 2]
+    assert [call[0] for call in schedule] == ["m2", "m2r", "m2r"]
+    assert schedule[1][1][0] == 2  # pending correction is the verify primary
+    assert schedule[1][2] is primary_states[0]
+    assert schedule[2][1][0] == 2
+    assert schedule[2][2] is primary_states[1]
+    assert out.stats.correction_tokens == 3
+    assert out.stats.deferred_correction_repairs == 3
+    route_events = [event for event in out.stats.events if "drafts" in event]
+    assert any(event.get("pending_primary") == 2 for event in route_events)
+    assert route_events[0]["primary_already_emitted"] is False
+    assert all(event["primary_already_emitted"] for event in route_events[1:])
+    correction_history = [
+        hidden for token_ids, hidden in history_appends if token_ids == [2]
+    ]
+    assert len(correction_history) == 3
+    np.testing.assert_array_equal(correction_history[0], np.full((1, 1, 2), 10))
+    np.testing.assert_array_equal(correction_history[1], np.full((1, 1, 2), 11))
+    np.testing.assert_array_equal(correction_history[2], np.full((1, 1, 2), 12))
+    assert not any(np.all(hidden == 90) for hidden in correction_history)
+    report = out.stats.graphbank["compiled_verify"]
+    assert report["m2_calls"] == out.stats.verify_calls == 3
+    assert report["m1_calls"] == 0
+
+
+def test_generation_exact_a3b_k1_mixed_schedule_keeps_accept_and_reject_ownership(
+    monkeypatch,
+):
+    out, schedule, primary_states, _history_appends = _run_exact_a3b_k1_schedule(
+        monkeypatch,
+        target_tokens=[1, 2],
+        max_tokens=6,
+    )
+
+    assert out.tokens[:3] == [1, 1, 1]
+    # Accept keeps the plain M2 schedule (state continues from the slots);
+    # every rejection folds into a rebased M2 from the rejecting cycle's
+    # post-primary state -- ownership of accept vs reject stays distinct.
+    assert [call[0] for call in schedule] == ["m2", "m2", "m2r", "m2r"]
+    assert schedule[2][2] is primary_states[1]
+    assert schedule[3][2] is primary_states[2]
+    assert out.stats.accepted_drafts == 1
+    assert out.stats.correction_tokens == 3
+    assert out.stats.deferred_correction_repairs == 3
+    assert out.stats.events[1]["primary_already_emitted"] is True
+    assert out.stats.events[2]["primary_already_emitted"] is True
 
 
 def test_generation_flag_parity_double_runs_each_verify(monkeypatch):
@@ -1132,12 +1535,18 @@ def test_profiles_accept_compiled_verify_env_keys():
 
     assert "MTPLX_COMPILED_VERIFY" in MODEL_RUNTIME_ENV_OVERRIDE_KEYS
     assert "MTPLX_COMPILED_VERIFY_MAX_LEN" in MODEL_RUNTIME_ENV_OVERRIDE_KEYS
+    assert "MTPLX_COMPILED_TARGET_PREFIX" in MODEL_RUNTIME_ENV_OVERRIDE_KEYS
     normalized = normalize_runtime_env_overrides(
-        {"MTPLX_COMPILED_VERIFY": "parity", "MTPLX_COMPILED_VERIFY_MAX_LEN": 6}
+        {
+            "MTPLX_COMPILED_VERIFY": "parity",
+            "MTPLX_COMPILED_VERIFY_MAX_LEN": 6,
+            "MTPLX_COMPILED_TARGET_PREFIX": True,
+        }
     )
     assert normalized == {
         "MTPLX_COMPILED_VERIFY": "parity",
         "MTPLX_COMPILED_VERIFY_MAX_LEN": "6",
+        "MTPLX_COMPILED_TARGET_PREFIX": "1",
     }
     # parity2 is a VALUE of the exact-match MTPLX_COMPILED_VERIFY key, so the
     # existing key list already carries it through contract overrides.
