@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-from .expert_io import PositionalExpertReader
+from .expert_io import ExpertIOError, PositionalExpertReader
 from .expert_manifest import (
     ExpertManifest,
     ExpertManifestError,
@@ -1896,6 +1896,7 @@ class ExpertStreamingRuntime:
         mx_module: Any | None = None,
         env: dict[str, str] | None = None,
         additional_resident_bytes: int = 0,
+        expert_admission_receipt: Mapping[str, Any] | None = None,
     ) -> ExpertStreamingRuntime:
         artifact_root = Path(root).resolve()
         model_spec = get_model_spec(config.model_key) if spec is None else spec
@@ -2057,15 +2058,46 @@ class ExpertStreamingRuntime:
         pipeline_kwargs = (
             {} if pipeline_ledger is None else {"pipeline_ledger": pipeline_ledger}
         )
-        reader = PositionalExpertReader(
-            artifact_root,
-            max_open_files=config.max_open_files,
-            max_read_chunk_bytes=config.max_read_chunk_bytes,
-            bypass_page_cache=config.bypass_page_cache,
-            codec_sidecar=codec_sidecar,
-            codec_verify=config.streamed_codec_verify,
-            **pipeline_kwargs,
-        )
+        admission_kwargs: dict[str, Any] = {}
+        if expert_admission_receipt is not None:
+            admitted_banks = expert_admission_receipt.get("banks")
+            admitted_identities = (
+                [(bank.get("file"), bank.get("sha256")) for bank in admitted_banks]
+                if isinstance(admitted_banks, list)
+                and all(isinstance(bank, Mapping) for bank in admitted_banks)
+                else None
+            )
+            expected_identities = (
+                [(part.file, part.sha256) for part in manifest.sidecar.parts]
+                if manifest.sidecar is not None
+                else []
+            )
+            if (
+                expert_admission_receipt.get("manifest_sha256")
+                != manifest.manifest_sha256
+                or admitted_identities != expected_identities
+            ):
+                raise ExpertStreamingConfigurationError(
+                    "expert admission receipt banks do not match the manifest"
+                )
+            admission_kwargs["expert_admission_receipt"] = (
+                expert_admission_receipt
+            )
+        try:
+            reader = PositionalExpertReader(
+                artifact_root,
+                max_open_files=config.max_open_files,
+                max_read_chunk_bytes=config.max_read_chunk_bytes,
+                bypass_page_cache=config.bypass_page_cache,
+                codec_sidecar=codec_sidecar,
+                codec_verify=config.streamed_codec_verify,
+                **pipeline_kwargs,
+                **admission_kwargs,
+            )
+        except ExpertIOError as exc:
+            raise ExpertStreamingConfigurationError(
+                f"expert admission receipt is unusable: {exc}"
+            ) from exc
         # Expert reads are on the decode path, so make the active I/O backend
         # visible: without the optional compiled extension the portable
         # ``preadv`` fallback is used, which works but is slower and otherwise

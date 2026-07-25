@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import fcntl
 import hashlib
 import importlib
 import json
@@ -11,6 +12,7 @@ import os
 import re
 import shutil
 import stat
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -808,12 +810,13 @@ def _regular_file_metadata_at(
     return metadata
 
 
-def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
     return (
         metadata.st_dev,
         metadata.st_ino,
         metadata.st_size,
         metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
     )
 
 
@@ -851,6 +854,7 @@ def _trusted_file_digest(
         st_ino=metadata.st_ino,
         st_size=metadata.st_size,
         st_mtime_ns=metadata.st_mtime_ns,
+        st_ctime_ns=metadata.st_ctime_ns,
     )
 
 
@@ -889,6 +893,7 @@ def _hash_existing_file(
         st_ino=after.st_ino,
         st_size=after.st_size,
         st_mtime_ns=after.st_mtime_ns,
+        st_ctime_ns=after.st_ctime_ns,
     )
 
 
@@ -902,6 +907,157 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         if written <= 0:
             raise OSError("short write while downloading model file")
         view = view[written:]
+
+
+def _partial_metadata_payload(
+    repo_file: RepoFile,
+    *,
+    repo_id: str,
+    revision: str | None,
+) -> dict[str, Any] | None:
+    if repo_file.sha256 is None:
+        return None
+    return {
+        "schema": 1,
+        "repo_id": repo_id,
+        "revision": revision,
+        "path": repo_file.path,
+        "size_bytes": repo_file.size_bytes,
+        "validator": f"sha256:{repo_file.sha256}",
+    }
+
+
+def _read_partial_metadata_at(
+    directory_descriptor: int,
+    metadata_name: str,
+) -> dict[str, Any] | None:
+    try:
+        descriptor = os.open(
+            metadata_name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_descriptor,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 64 * 1024:
+            return None
+        payload = bytearray()
+        while len(payload) <= 64 * 1024:
+            chunk = os.read(descriptor, min(8192, 64 * 1024 + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) > 64 * 1024:
+            return None
+        decoded = json.loads(payload.decode("utf-8"))
+        return decoded if isinstance(decoded, dict) else None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    finally:
+        os.close(descriptor)
+
+
+def _write_partial_metadata_at(
+    directory_descriptor: int,
+    metadata_name: str,
+    payload: dict[str, Any],
+) -> None:
+    temporary_name = metadata_name + ".tmp"
+    try:
+        os.unlink(temporary_name, dir_fd=directory_descriptor)
+    except FileNotFoundError:
+        pass
+    descriptor = os.open(
+        temporary_name,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=directory_descriptor,
+    )
+    try:
+        _write_all(
+            descriptor,
+            (
+                json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                + "\n"
+            ).encode("utf-8"),
+        )
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(
+        temporary_name,
+        metadata_name,
+        src_dir_fd=directory_descriptor,
+        dst_dir_fd=directory_descriptor,
+    )
+    os.fsync(directory_descriptor)
+
+
+def _remove_partial_state_at(
+    directory_descriptor: int,
+    partial_name: str,
+    metadata_name: str,
+) -> None:
+    removed = False
+    for name in (partial_name, metadata_name, metadata_name + ".tmp"):
+        try:
+            os.unlink(name, dir_fd=directory_descriptor)
+            removed = True
+        except FileNotFoundError:
+            continue
+    if removed:
+        os.fsync(directory_descriptor)
+
+
+def _response_header(response: Any, name: str) -> str | None:
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    value = headers.get(name)
+    if value is None:
+        value = headers.get(name.lower())
+    return value if isinstance(value, str) else None
+
+
+def _validate_content_range(
+    response: Any,
+    *,
+    expected_start: int,
+    expected_size: int | None,
+) -> None:
+    value = _response_header(response, "Content-Range")
+    match = (
+        re.fullmatch(r"bytes ([0-9]+)-([0-9]+)/([0-9]+|\*)", value)
+        if value is not None
+        else None
+    )
+    if match is None:
+        raise RuntimeError("invalid or missing Content-Range for resumed download")
+    start, end = int(match.group(1)), int(match.group(2))
+    if start != expected_start or end < start:
+        raise RuntimeError(
+            f"Content-Range does not match requested offset {expected_start}: {value}"
+        )
+    if (
+        expected_size is not None
+        and (
+            match.group(3) == "*"
+            or int(match.group(3)) != expected_size
+        )
+    ):
+        raise RuntimeError(
+            f"Content-Range does not match expected size {expected_size}: {value}"
+        )
 
 
 def _emit_current_download_size(
@@ -988,6 +1144,12 @@ def _download_repo_file_at(
     expected_size = repo_file.size_bytes
     partial_name = target_name + ".incomplete"
     partial = parent / partial_name
+    partial_metadata_name = partial_name + ".meta.json"
+    expected_partial_metadata = _partial_metadata_payload(
+        repo_file,
+        repo_id=repo_id,
+        revision=revision,
+    )
     target_metadata = _regular_file_metadata_at(
         directory_descriptor,
         target_name,
@@ -999,6 +1161,9 @@ def _download_repo_file_at(
         partial,
     )
 
+    # Installed paths are immutable once admission can retain their inode.
+    # A refresh never opens ``target`` for writing: it stages a separate
+    # partial and atomically replaces the pathname after verification.
     if (
         target_metadata is not None
         and expected_size is not None
@@ -1011,6 +1176,11 @@ def _download_repo_file_at(
             name=target_name,
         )
         if existing_digest.sha256 == repo_file.sha256:
+            _remove_partial_state_at(
+                directory_descriptor,
+                partial_name,
+                partial_metadata_name,
+            )
             emitted_at, emitted_size = _emit_current_download_size(
                 callback,
                 repo_id=repo_id,
@@ -1023,6 +1193,7 @@ def _download_repo_file_at(
             )
             return emitted_at, emitted_size, existing_digest
         os.unlink(target_name, dir_fd=directory_descriptor)
+        os.fsync(directory_descriptor)
         target_metadata = None
     elif (
         target_metadata is not None
@@ -1031,27 +1202,55 @@ def _download_repo_file_at(
     ):
         # Size alone cannot bind old bytes to new remote metadata.
         os.unlink(target_name, dir_fd=directory_descriptor)
+        os.fsync(directory_descriptor)
         target_metadata = None
     elif target_metadata is not None and expected_size is None:
         # A file without an authoritative size or digest must be fetched again.
         os.unlink(target_name, dir_fd=directory_descriptor)
+        os.fsync(directory_descriptor)
         target_metadata = None
 
     if target_metadata is not None:
-        if partial_metadata is None:
-            os.replace(
-                target_name,
-                partial_name,
-                src_dir_fd=directory_descriptor,
-                dst_dir_fd=directory_descriptor,
-            )
-            partial_metadata = target_metadata
-        else:
-            os.unlink(target_name, dir_fd=directory_descriptor)
+        os.unlink(target_name, dir_fd=directory_descriptor)
+        os.fsync(directory_descriptor)
+    recorded_partial_metadata = _read_partial_metadata_at(
+        directory_descriptor,
+        partial_metadata_name,
+    )
+    resumable = (
+        expected_partial_metadata is not None
+        and recorded_partial_metadata == expected_partial_metadata
+    )
+    if partial_metadata is not None and not resumable:
+        _remove_partial_state_at(
+            directory_descriptor,
+            partial_name,
+            partial_metadata_name,
+        )
+        partial_metadata = None
+    elif partial_metadata is None and recorded_partial_metadata is not None:
+        _remove_partial_state_at(
+            directory_descriptor,
+            partial_name,
+            partial_metadata_name,
+        )
     existing = partial_metadata.st_size if partial_metadata is not None else 0
     if expected_size is not None and existing > expected_size:
-        os.unlink(partial_name, dir_fd=directory_descriptor)
+        _remove_partial_state_at(
+            directory_descriptor,
+            partial_name,
+            partial_metadata_name,
+        )
         existing = 0
+    if expected_partial_metadata is not None:
+        _write_partial_metadata_at(
+            directory_descriptor,
+            partial_metadata_name,
+            expected_partial_metadata,
+        )
+        resumable = True
+    else:
+        resumable = False
 
     descriptor = os.open(
         partial_name,
@@ -1095,6 +1294,11 @@ def _download_repo_file_at(
                 repo_file.sha256 is not None
                 and trusted.sha256 != repo_file.sha256
             ):
+                _remove_partial_state_at(
+                    directory_descriptor,
+                    partial_name,
+                    partial_metadata_name,
+                )
                 raise RuntimeError(
                     f"SHA-256 mismatch for {repo_file.path}: "
                     f"expected {repo_file.sha256}, got {trusted.sha256}"
@@ -1106,12 +1310,34 @@ def _download_repo_file_at(
                 dst_dir_fd=directory_descriptor,
             )
             os.fsync(directory_descriptor)
+            _remove_partial_state_at(
+                directory_descriptor,
+                partial_name,
+                partial_metadata_name,
+            )
             after_install = os.fstat(descriptor)
-            if _file_identity(final_metadata) != _file_identity(after_install):
+            if (
+                final_metadata.st_dev,
+                final_metadata.st_ino,
+                final_metadata.st_size,
+                final_metadata.st_mtime_ns,
+            ) != (
+                after_install.st_dev,
+                after_install.st_ino,
+                after_install.st_size,
+                after_install.st_mtime_ns,
+            ):
                 raise RuntimeError(
                     f"download file changed during install: {repo_file.path}"
                 )
-            return trusted
+            return TrustedFileDigest(
+                sha256=trusted.sha256,
+                st_dev=after_install.st_dev,
+                st_ino=after_install.st_ino,
+                st_size=after_install.st_size,
+                st_mtime_ns=after_install.st_mtime_ns,
+                st_ctime_ns=after_install.st_ctime_ns,
+            )
 
         headers = build_hf_headers(token=hf_token_for_download())
         if existing > 0:
@@ -1124,6 +1350,17 @@ def _download_repo_file_at(
         response_stream = _open_hub_stream(session, url, headers)
         with response_stream as response:
             status_code = int(getattr(response, "status_code", 200))
+            if status_code == 206:
+                if not resumable or repo_file.sha256 is None:
+                    raise RuntimeError(
+                        "unexpected Content-Range without a strongly validated "
+                        "resumable partial"
+                    )
+                _validate_content_range(
+                    response,
+                    expected_start=existing,
+                    expected_size=expected_size,
+                )
             if existing > 0 and status_code == 200:
                 os.ftruncate(descriptor, 0)
                 os.lseek(descriptor, 0, os.SEEK_SET)
@@ -1132,6 +1369,8 @@ def _download_repo_file_at(
             elif (
                 existing > 0
                 and status_code == 416
+                and resumable
+                and repo_file.sha256 is not None
                 and expected_size is not None
                 and existing == expected_size
             ):
@@ -1373,7 +1612,60 @@ def _is_immutable_hub_revision(value: Any) -> bool:
     )
 
 
+_DESTINATION_LOCKS_GUARD = threading.Lock()
+_DESTINATION_LOCKS: dict[str, threading.Lock] = {}
+
+
+@contextlib.contextmanager
+def _destination_pull_lock(destination: Path) -> Iterator[None]:
+    key = str(destination.resolve())
+    with _DESTINATION_LOCKS_GUARD:
+        thread_lock = _DESTINATION_LOCKS.setdefault(key, threading.Lock())
+    lock_root = destination.parent / ".locks"
+    lock_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path = lock_root / f"{destination.name}.lock"
+    with thread_lock:
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+
 def pull_model(
+    model_ref: str,
+    *,
+    cache_dir: str | Path | None = None,
+    revision: str | None = None,
+    progress_callback: DownloadProgressCallback | None = None,
+    progress_interval_s: float = 10.0,
+) -> dict[str, Any]:
+    repo_id = repo_id_from_model_ref(model_ref)
+    if repo_id is None:
+        raise ValueError(
+            f"pull requires a Hugging Face repo id or URL, got: {model_ref}"
+        )
+    destination = cached_model_path(repo_id, cache_dir=cache_dir)
+    with _destination_pull_lock(destination):
+        return _pull_model_unlocked(
+            model_ref,
+            cache_dir=cache_dir,
+            revision=revision,
+            progress_callback=progress_callback,
+            progress_interval_s=progress_interval_s,
+        )
+
+
+def _pull_model_unlocked(
     model_ref: str,
     *,
     cache_dir: str | Path | None = None,
@@ -1442,8 +1734,12 @@ def pull_model(
                 and receipt.get("repo_id") == repo_id
                 and _is_immutable_hub_revision(receipt_revision)
                 and (
-                    not _is_immutable_hub_revision(revision)
-                    or str(receipt_revision).casefold() == str(revision).casefold()
+                    revision is None
+                    or (
+                        _is_immutable_hub_revision(revision)
+                        and str(receipt_revision).casefold()
+                        == str(revision).casefold()
+                    )
                 )
             )
             if reuse_allowed:

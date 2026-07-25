@@ -9,7 +9,7 @@ import logging
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .artifacts import inspect_model, load_config
 from .mtp_adapters import (
@@ -528,6 +528,7 @@ def _load_impl(
     expert_manifest: Path | str | None = None,
     mtp_artifacts: Path | str | None = None,
     mtp_precision: str = "bf16",
+    expert_admission_receipt: Mapping[str, Any] | None = None,
     _expert_runtime_owner: list[Any],
 ) -> MTPLXRuntime:
     """Load an MLX model and optionally inject native MTP support.
@@ -556,6 +557,10 @@ def _load_impl(
     if (expert_streaming_config is None) != (expert_manifest is None):
         raise ValueError(
             "expert_streaming_config and expert_manifest must be supplied together"
+        )
+    if expert_admission_receipt is not None and not streaming_requested:
+        raise ValueError(
+            "expert_admission_receipt applies to streamed checkpoints only"
         )
     if streaming_requested and (proj_quant is not None or proj_requant is not None):
         raise ValueError(
@@ -845,6 +850,7 @@ def _load_impl(
                 device_synchronize=mx.synchronize,
                 apply_memory_cap=True,
                 mx_module=mx,
+                expert_admission_receipt=expert_admission_receipt,
                 **plan_kwargs,
             )
             _expert_runtime_owner[:] = [expert_runtime]
@@ -1056,6 +1062,7 @@ def load(
     expert_manifest: Path | str | None = None,
     mtp_artifacts: Path | str | None = None,
     mtp_precision: str = "bf16",
+    expert_admission_receipt: Mapping[str, Any] | None = None,
 ) -> MTPLXRuntime:
     """Load a model and transfer streamed-runtime ownership only on success."""
 
@@ -1075,6 +1082,7 @@ def load(
             expert_manifest=expert_manifest,
             mtp_artifacts=mtp_artifacts,
             mtp_precision=mtp_precision,
+            expert_admission_receipt=expert_admission_receipt,
             _expert_runtime_owner=expert_runtime_owner,
         )
     except BaseException:

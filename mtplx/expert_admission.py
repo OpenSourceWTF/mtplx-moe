@@ -38,6 +38,7 @@ class TrustedFileDigest:
     st_ino: int
     st_size: int
     st_mtime_ns: int
+    st_ctime_ns: int
 
 
 def _resolve_receipt_root(receipt_root: Path | str | None) -> Path:
@@ -102,12 +103,13 @@ def _authoritative_manifest(root: Path) -> ExpertManifest:
     return manifest
 
 
-def _identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+def _identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
     return (
         metadata.st_dev,
         metadata.st_ino,
         metadata.st_size,
         metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
     )
 
 
@@ -120,6 +122,7 @@ def _trusted_matches(
         trusted.st_ino,
         trusted.st_size,
         trusted.st_mtime_ns,
+        trusted.st_ctime_ns,
     ) == _identity(metadata)
 
 
@@ -194,6 +197,7 @@ def _inspect_bank(
         "st_ino": after.st_ino,
         "st_size": after.st_size,
         "st_mtime_ns": after.st_mtime_ns,
+        "st_ctime_ns": after.st_ctime_ns,
     }
 
 
@@ -291,7 +295,13 @@ def _receipt_bank_matches(
     }
     if any(bank.get(key) != value for key, value in expected.items()):
         return False
-    identity_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    identity_fields = (
+        "st_dev",
+        "st_ino",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
     if any(
         isinstance(bank.get(field), bool)
         or not isinstance(bank.get(field), int)

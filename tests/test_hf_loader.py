@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from types import ModuleType, SimpleNamespace
 from pathlib import Path
 
@@ -11,6 +14,7 @@ import pytest
 
 from mtplx.hf_loader import (
     RepoFile,
+    RepoInventory,
     _download_repo_file,
     cached_model_is_complete,
     cached_model_path,
@@ -28,9 +32,16 @@ from mtplx.profiles import DEFAULT_HF_MODEL_ID, LEGACY_OPTIMIZED_HF_MODEL_ID, QU
 
 
 class _FakeHubResponse:
-    def __init__(self, chunks: list[bytes | tuple[bytes, float]], status_code: int = 200):
+    def __init__(
+        self,
+        chunks: list[bytes | tuple[bytes, float]],
+        status_code: int = 200,
+        *,
+        headers: dict[str, str] | None = None,
+    ):
         self._chunks = chunks
         self.status_code = status_code
+        self.headers = headers or {}
 
     def __enter__(self):
         return self
@@ -150,14 +161,30 @@ def _install_fake_hub(
 
 
 class _RangeSession:
-    def __init__(self, payload: bytes, *, status_code: int) -> None:
+    def __init__(
+        self,
+        payload: bytes,
+        *,
+        status_code: int,
+        content_range: str | None = None,
+    ) -> None:
         self.payload = payload
         self.status_code = status_code
+        self.content_range = content_range
         self.requests: list[dict[str, object]] = []
 
     def get(self, url: str, **kwargs):
         self.requests.append({"url": url, **kwargs})
-        return _FakeHubResponse([self.payload], status_code=self.status_code)
+        headers = (
+            {"Content-Range": self.content_range}
+            if self.content_range is not None
+            else None
+        )
+        return _FakeHubResponse(
+            [self.payload],
+            status_code=self.status_code,
+            headers=headers,
+        )
 
 
 def _download_one(
@@ -166,8 +193,13 @@ def _download_one(
     *,
     payload: bytes,
     status_code: int,
+    content_range: str | None = None,
 ):
-    session = _RangeSession(payload, status_code=status_code)
+    session = _RangeSession(
+        payload,
+        status_code=status_code,
+        content_range=content_range,
+    )
     seen_revisions: list[str | None] = []
     result = _download_repo_file(
         repo_file,
@@ -190,6 +222,28 @@ def _download_one(
     return result, session, seen_revisions
 
 
+def _write_partial_metadata(
+    root: Path,
+    repo_file: RepoFile,
+    *,
+    revision: str = "d" * 40,
+) -> None:
+    assert repo_file.sha256 is not None
+    (root / f"{repo_file.path}.incomplete.meta.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "repo_id": "owner/model",
+                "revision": revision,
+                "path": repo_file.path,
+                "size_bytes": repo_file.size_bytes,
+                "validator": f"sha256:{repo_file.sha256}",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_download_repo_file_hashes_resumed_prefix_and_appends_206(
     tmp_path: Path,
 ) -> None:
@@ -201,12 +255,14 @@ def test_download_repo_file_hashes_resumed_prefix_and_appends_206(
         size_bytes=len(complete),
         sha256=hashlib.sha256(complete).hexdigest(),
     )
+    _write_partial_metadata(tmp_path, repo_file)
 
     (_emit_at, _emit_size, digest), session, revisions = _download_one(
         tmp_path,
         repo_file,
         payload=complete[3:],
         status_code=206,
+        content_range="bytes 3-5/6",
     )
 
     assert (tmp_path / "experts.bin").read_bytes() == complete
@@ -225,6 +281,7 @@ def test_download_repo_file_resets_prefix_and_hasher_on_range_200(
         size_bytes=len(complete),
         sha256=hashlib.sha256(complete).hexdigest(),
     )
+    _write_partial_metadata(tmp_path, repo_file)
 
     (_emit_at, _emit_size, digest), _session, _revisions = _download_one(
         tmp_path,
@@ -247,6 +304,7 @@ def test_download_repo_file_installs_exact_partial_on_range_416(
         size_bytes=len(complete),
         sha256=hashlib.sha256(complete).hexdigest(),
     )
+    _write_partial_metadata(tmp_path, repo_file)
 
     (_emit_at, _emit_size, digest), _session, _revisions = _download_one(
         tmp_path,
@@ -297,6 +355,205 @@ def test_download_repo_file_rejects_intermediate_symlink_escape(
         )
 
     assert not (outside / "experts.bin").exists()
+
+
+def test_download_repo_file_rejects_mismatched_content_range(
+    tmp_path: Path,
+) -> None:
+    complete = b"abcdef"
+    (tmp_path / "experts.bin.incomplete").write_bytes(complete[:3])
+    (tmp_path / "experts.bin.incomplete.meta.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "repo_id": "owner/model",
+                "revision": "d" * 40,
+                "path": "experts.bin",
+                "size_bytes": len(complete),
+                "validator": f"sha256:{hashlib.sha256(complete).hexdigest()}",
+            }
+        ),
+        encoding="utf-8",
+    )
+    repo_file = RepoFile(
+        path="experts.bin",
+        size_bytes=len(complete),
+        sha256=hashlib.sha256(complete).hexdigest(),
+    )
+
+    with pytest.raises(RuntimeError, match="Content-Range"):
+        _download_one(
+            tmp_path,
+            repo_file,
+            payload=complete[3:],
+            status_code=206,
+            content_range="bytes 0-2/6",
+        )
+
+    assert not (tmp_path / "experts.bin").exists()
+
+
+def test_download_repo_file_never_resumes_digestless_partial_or_accepts_416(
+    tmp_path: Path,
+) -> None:
+    partial = tmp_path / "config.json.incomplete"
+    partial.write_bytes(b"old")
+    repo_file = RepoFile(path="config.json", size_bytes=3, sha256=None)
+
+    with pytest.raises(RuntimeError, match="HTTP 416"):
+        _download_one(
+            tmp_path,
+            repo_file,
+            payload=b"",
+            status_code=416,
+        )
+
+    assert not (tmp_path / "config.json").exists()
+
+
+def test_download_repo_file_discards_cross_revision_partial_metadata(
+    tmp_path: Path,
+) -> None:
+    complete = b"NEWNEW"
+    (tmp_path / "experts.bin.incomplete").write_bytes(b"old")
+    (tmp_path / "experts.bin.incomplete.meta.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "repo_id": "owner/model",
+                "revision": "a" * 40,
+                "path": "experts.bin",
+                "size_bytes": len(complete),
+                "validator": f"sha256:{hashlib.sha256(complete).hexdigest()}",
+            }
+        ),
+        encoding="utf-8",
+    )
+    repo_file = RepoFile(
+        path="experts.bin",
+        size_bytes=len(complete),
+        sha256=hashlib.sha256(complete).hexdigest(),
+    )
+
+    (_emit_at, _emit_size, _digest), session, _revisions = _download_one(
+        tmp_path,
+        repo_file,
+        payload=complete,
+        status_code=200,
+    )
+
+    assert "Range" not in session.requests[0]["headers"]
+    assert (tmp_path / "experts.bin").read_bytes() == complete
+
+
+def test_verified_final_removes_stale_partial_and_metadata(
+    tmp_path: Path,
+) -> None:
+    complete = b"abcdef"
+    (tmp_path / "experts.bin").write_bytes(complete)
+    (tmp_path / "experts.bin.incomplete").write_bytes(b"stale")
+    (tmp_path / "experts.bin.incomplete.meta.json").write_text(
+        "{}",
+        encoding="utf-8",
+    )
+    repo_file = RepoFile(
+        path="experts.bin",
+        size_bytes=len(complete),
+        sha256=hashlib.sha256(complete).hexdigest(),
+    )
+
+    _download_one(
+        tmp_path,
+        repo_file,
+        payload=b"",
+        status_code=200,
+    )
+
+    assert not (tmp_path / "experts.bin.incomplete").exists()
+    assert not (tmp_path / "experts.bin.incomplete.meta.json").exists()
+
+
+def test_downloader_replaces_final_without_mutating_retained_inode(
+    tmp_path: Path,
+) -> None:
+    old = b"OLDOLD"
+    complete = b"NEWNEW"
+    target = tmp_path / "experts.bin"
+    target.write_bytes(old)
+    retained = os.open(target, os.O_RDONLY)
+    repo_file = RepoFile(
+        path="experts.bin",
+        size_bytes=len(complete),
+        sha256=hashlib.sha256(complete).hexdigest(),
+    )
+    try:
+        _download_one(
+            tmp_path,
+            repo_file,
+            payload=complete,
+            status_code=200,
+        )
+
+        assert os.pread(retained, len(old), 0) == old
+        assert target.read_bytes() == complete
+    finally:
+        os.close(retained)
+
+
+def test_pull_model_serializes_same_destination(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    active = 0
+    peak_active = 0
+    active_lock = threading.Lock()
+
+    def inventory(_repo_id: str, *, revision: str | None = None):
+        assert revision is not None
+        return RepoInventory(
+            resolved_revision=revision,
+            files=(
+                RepoFile(path="config.json", size_bytes=3),
+                RepoFile(path="model.safetensors", size_bytes=7),
+            ),
+        )
+
+    def snapshot_download(**kwargs):
+        nonlocal active, peak_active
+        with active_lock:
+            active += 1
+            peak_active = max(peak_active, active)
+        try:
+            time.sleep(0.05)
+            destination = Path(kwargs["local_dir"])
+            (destination / "config.json").write_text("{}\n", encoding="utf-8")
+            (destination / "model.safetensors").write_bytes(b"weights")
+            return str(destination)
+        finally:
+            with active_lock:
+                active -= 1
+
+    monkeypatch.setattr("mtplx.hf_loader._query_repo_inventory", inventory)
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(snapshot_download=snapshot_download),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                pull_model,
+                "owner/model",
+                cache_dir=tmp_path,
+                revision=revision,
+            )
+            for revision in ("a" * 40, "b" * 40)
+        ]
+        for future in futures:
+            future.result()
+
+    assert peak_active == 1
 
 
 def test_pull_model_lfs_mismatch_never_emits_complete(

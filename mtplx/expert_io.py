@@ -5,13 +5,14 @@ from __future__ import annotations
 import hashlib
 import fcntl
 import os
+import stat
 import threading
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 from .expert_manifest import (
     ExpertManifest,
@@ -46,6 +47,16 @@ class ExpertIOShortRead(ExpertIOError):
 
 class ExpertIOIntegrityError(ExpertIOError):
     pass
+
+
+ADMITTED_DESCRIPTOR_SECURITY_BOUNDARY = (
+    "Pinned descriptors prevent pathname replacement after admission. "
+    "MTPLX-controlled installs must stage a separate file and atomically "
+    "replace the pathname; they must never mutate an admitted inode. "
+    "Uncooperative same-user writes to that retained inode after construction "
+    "are outside the local artifact threat model; per-record hash verification, "
+    "when enabled, detects that residual risk."
+)
 
 
 def _record_part_index(record: Any) -> int:
@@ -207,6 +218,10 @@ class PositionalExpertReader:
     Reads go directly into a caller-owned fixed slot buffer.  No record-sized
     temporary allocation is made by this class.  The optional native backend
     has the same contract and is loaded lazily when available.
+
+    Admitted banks are retained by descriptor for the reader lifetime. See
+    ``ADMITTED_DESCRIPTOR_SECURITY_BOUNDARY`` for the remaining same-inode
+    mutation boundary.
     """
 
     def __init__(
@@ -220,6 +235,7 @@ class PositionalExpertReader:
         pipeline_ledger: Any | None = None,
         codec_sidecar: Any | None = None,
         codec_verify: bool = True,
+        expert_admission_receipt: Mapping[str, Any] | None = None,
     ) -> None:
         if isinstance(max_open_files, bool) or not isinstance(max_open_files, int):
             raise TypeError("max_open_files must be an integer")
@@ -259,8 +275,110 @@ class PositionalExpertReader:
         self.metrics = ExpertIOMetrics()
         self._condition = threading.Condition()
         self._entries: OrderedDict[str, _FDEntry] = OrderedDict()
+        self._pinned_entries: dict[str, _FDEntry] = {}
         self._closed = False
+        if expert_admission_receipt is not None:
+            self._pin_admitted_sidecars(expert_admission_receipt)
         self._native_read_into = self._load_native_reader() if use_native else None
+
+    @staticmethod
+    def _receipt_identity(bank: Mapping[str, Any]) -> tuple[int, int, int, int, int]:
+        fields = (
+            "st_dev",
+            "st_ino",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        values = tuple(bank.get(field) for field in fields)
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+            raise ExpertIOError(
+                "expert admission receipt identity fields are invalid"
+            )
+        return values  # type: ignore[return-value]
+
+    @staticmethod
+    def _descriptor_identity(
+        metadata: os.stat_result,
+    ) -> tuple[int, int, int, int, int]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+
+    def _pin_admitted_sidecars(
+        self,
+        receipt: Mapping[str, Any],
+    ) -> None:
+        if (
+            type(receipt.get("schema")) is not int
+            or receipt.get("schema") != 1
+            or receipt.get("artifact_root") != str(self.root)
+        ):
+            raise ExpertIOError(
+                "expert admission receipt does not match the artifact root"
+            )
+        banks = receipt.get("banks")
+        if not isinstance(banks, list) or not banks:
+            raise ExpertIOError("expert admission receipt has no admitted banks")
+        opened: dict[str, _FDEntry] = {}
+        try:
+            for bank in banks:
+                if not isinstance(bank, Mapping):
+                    raise ExpertIOError(
+                        "expert admission receipt bank entry is invalid"
+                    )
+                relative_name = bank.get("file")
+                if not isinstance(relative_name, str) or not relative_name:
+                    raise ExpertIOError(
+                        "expert admission receipt bank file is invalid"
+                    )
+                if relative_name in opened:
+                    raise ExpertIOError(
+                        "expert admission receipt contains duplicate bank files"
+                    )
+                expected_identity = self._receipt_identity(bank)
+                try:
+                    resolved = resolve_artifact_member(self.root, relative_name)
+                    descriptor = os.open(
+                        resolved,
+                        os.O_RDONLY
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                    )
+                except (OSError, ExpertManifestError) as exc:
+                    raise ExpertIOError(
+                        f"could not pin admitted expert bank {relative_name}: {exc}"
+                    ) from exc
+                try:
+                    metadata = os.fstat(descriptor)
+                    if (
+                        not stat.S_ISREG(metadata.st_mode)
+                        or self._descriptor_identity(metadata)
+                        != expected_identity
+                    ):
+                        raise ExpertIOError(
+                            "expert admission receipt identity does not match "
+                            f"the retained descriptor for {relative_name}"
+                        )
+                    if self.bypass_page_cache:
+                        fcntl.fcntl(descriptor, fcntl.F_NOCACHE, 1)
+                except BaseException:
+                    os.close(descriptor)
+                    raise
+                opened[relative_name] = _FDEntry(fd=descriptor)
+        except BaseException:
+            for entry in opened.values():
+                try:
+                    os.close(entry.fd)
+                except OSError:
+                    pass
+            raise
+        self._pinned_entries = opened
+        self.metrics.observe_open_count(len(opened))
 
     @staticmethod
     def _load_native_reader() -> Any | None:
@@ -293,6 +411,21 @@ class PositionalExpertReader:
 
     @contextmanager
     def _lease(self, relative_name: str) -> Iterator[int]:
+        with self._condition:
+            if self._closed:
+                raise ExpertIOError("expert reader is closed")
+            pinned_entry = self._pinned_entries.get(relative_name)
+            if pinned_entry is not None:
+                pinned_entry.users += 1
+        if pinned_entry is not None:
+            try:
+                yield pinned_entry.fd
+            finally:
+                with self._condition:
+                    pinned_entry.users -= 1
+                    self._condition.notify_all()
+            return
+
         resolved = resolve_artifact_member(self.root, relative_name)
         key = str(resolved)
         with self._condition:
@@ -325,7 +458,9 @@ class PositionalExpertReader:
                         ) from exc
                     entry = _FDEntry(fd=fd, users=1)
                     self._entries[key] = entry
-                    self.metrics.observe_open_count(len(self._entries))
+                    self.metrics.observe_open_count(
+                        len(self._pinned_entries) + len(self._entries)
+                    )
                     break
                 self._condition.wait()
         try:
@@ -1057,9 +1192,19 @@ class PositionalExpertReader:
     def close(self) -> None:
         with self._condition:
             self._closed = True
-            while any(entry.users for entry in self._entries.values()):
+            while any(
+                entry.users
+                for entry in (
+                    *self._pinned_entries.values(),
+                    *self._entries.values(),
+                )
+            ):
                 self._condition.wait()
-            entries = tuple(self._entries.values())
+            entries = (
+                *self._pinned_entries.values(),
+                *self._entries.values(),
+            )
+            self._pinned_entries.clear()
             self._entries.clear()
             self._condition.notify_all()
         for entry in entries:

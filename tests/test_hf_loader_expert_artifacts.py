@@ -568,6 +568,13 @@ def test_offline_expert_reuse_requires_matching_immutable_receipt(
 
     assert reused["reused_existing"] is True
     assert reused["resolved_revision"] == resolved_revision
+    for mutable_revision in ("main", "release-tag", "feature/branch"):
+        with pytest.raises(RuntimeError, match="offline"):
+            pull_model(
+                repo_id,
+                cache_dir=cache_root,
+                revision=mutable_revision,
+            )
     with pytest.raises(RuntimeError, match="offline"):
         pull_model(
             repo_id,
