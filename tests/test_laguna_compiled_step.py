@@ -601,3 +601,69 @@ def test_lane_refuses_to_step_past_the_end_of_its_leaves(toy_model):
     assert lane.remaining_steps() == 0
     with pytest.raises(ValueError, match="leaves are full"):
         lane.advance()
+
+
+# ---------------------------------------------------------------------------
+# the capture surface
+# ---------------------------------------------------------------------------
+def test_capture_inputs_are_the_arguments_the_lane_would_step_with(toy_model):
+    """``capture_inputs()`` must BE the next call's arguments, not a copy of them.
+
+    An ICB capture records the stream produced by evaluating the step on the
+    arrays it is handed, and the fork pins exactly those buffers.  If the
+    accessor handed back clones, the capture would pin buffers the lane does not
+    own and the first replay would read stale state, so identity is the contract
+    — and calling the step with them has to land where ``advance`` lands.
+    """
+
+    caches, token = _prefill(toy_model)
+    lane = LagunaCompiledLane(toy_model, CAP, compiled=False).seed(caches, token)
+
+    inputs = lane.capture_inputs()
+    assert inputs[0] is lane.token
+    assert inputs[1] is lane.offset
+    assert inputs[2] is lane.ring_idx
+    assert tuple(inputs[3:]) == lane.leaves
+
+    manual = lane.step(*inputs)
+    advanced = lane.advance()
+    mx.eval(*manual, advanced)
+
+    assert _identical(manual[0], advanced), "step(*capture_inputs) != advance()"
+    offset, ring_idx, leaves = lane.state()
+    assert _identical(manual[1], offset)
+    assert _identical(manual[2], ring_idx)
+    for index, (got, want) in enumerate(zip(manual[3:], leaves)):
+        assert _identical(got, want), f"leaf {index} diverged"
+
+
+def test_capture_inputs_and_the_step_result_are_a_fixed_point(toy_model):
+    """Position ``i`` in must match position ``i`` out, in arity, shape and dtype.
+
+    This is what makes an identity feedback plan legal: the fork's
+    ``make_feedback_plan`` validates each ``(output i -> input i)`` pair by byte
+    size, so a step whose result reordered, resized or re-dtyped any position
+    could not advance its own state on-device.  The token pair is the one worth
+    naming — it is what removes the last per-cycle host write.
+    """
+
+    caches, token = _prefill(toy_model)
+    lane = LagunaCompiledLane(toy_model, CAP, compiled=False).seed(caches, token)
+
+    inputs = lane.capture_inputs()
+    outputs = lane.step(*inputs)
+    mx.eval(*outputs)
+
+    assert len(outputs) == len(inputs) == 3 + lane.geometry.n_leaves
+    for index, (before, after) in enumerate(zip(inputs, outputs)):
+        assert before.shape == after.shape, f"position {index} changed shape"
+        assert before.dtype == after.dtype, f"position {index} changed dtype"
+        assert before.nbytes == after.nbytes, f"position {index} changed size"
+
+
+def test_capture_inputs_refuses_an_unseeded_lane(toy_model):
+    """No state means no capture; the accessor says so instead of returning None."""
+
+    lane = LagunaCompiledLane(toy_model, CAP, compiled=False)
+    with pytest.raises(ValueError, match="no state"):
+        lane.capture_inputs()

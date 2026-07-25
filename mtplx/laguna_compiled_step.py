@@ -588,3 +588,24 @@ class LagunaCompiledLane:
         """The ``(offset, ring_idx, leaves)`` triple, for comparison in tests."""
 
         return self.offset, self.ring_idx, self.leaves
+
+    def capture_inputs(self) -> tuple[mx.array, ...]:
+        """The flat argument tuple :attr:`step` would be called with right now.
+
+        ``state()`` deliberately omits the token, and ``advance`` builds the
+        argument list inline — neither is what an ICB capture needs.  Capture
+        wants the arguments as ONE flat sequence, in the step's own order, so
+        that ``capture_compiled(lane.step, *lane.capture_inputs())`` records the
+        stream this lane would actually run next.
+
+        The ordering is the contract, not a convenience: the step is a fixed
+        point — its result tuple has the same arity, order, shape and dtype as
+        this one — so position ``i`` of the result is the successor of position
+        ``i`` here, and a replay feedback plan can blit output ``i`` straight
+        into input ``i`` for every leaf, token included.  Anything that reorders
+        one side has to reorder the other.
+        """
+
+        if self.token is None:
+            raise ValueError("lane has no state; call seed() after a prefill")
+        return (self.token, self.offset, self.ring_idx, *self.leaves)
