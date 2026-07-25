@@ -527,6 +527,16 @@ def load(
             adapter_merge_report = merge_installed_mtp_lora_adapters(model)
     elif merge_mtp_adapter:
         raise RuntimeError("merge_mtp_adapter requires mtp_adapter")
+    if _is_laguna_s_2_1_mlx_4bit_config(config):
+        # Env-gated fused decode paths (MTPLX_LAGUNA_*): with no switches set
+        # this returns an empty report and changes nothing, so default serving
+        # behavior is untouched; a serving wrapper that exports the measured
+        # stack gets it engaged at load, visible in this log line.
+        from .models.laguna_fused import install_from_env as _laguna_install_fused
+
+        fused_report = _laguna_install_fused(model)
+        if fused_report:
+            logger.info("[laguna-fused] %s", fused_report)
     runtime_class = (
         LagunaARRuntime
         if _is_laguna_s_2_1_mlx_4bit_config(config)
