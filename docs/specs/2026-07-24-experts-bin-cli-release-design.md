@@ -1,4 +1,4 @@
-# MTPLX 2.3 experts.bin CLI release design
+# OpenSourceWTF MTPLX-MOE experts.bin CLI fork design
 
 Date: 2026-07-24
 Status: approved for implementation
@@ -7,10 +7,10 @@ Base: `ship/upstream-230-hy3-mtp` at `e560cb2`
 
 ## Goal
 
-Make the normal MTPLX 2.3 installation support a complete first-run path:
+Make the source-installed OpenSourceWTF fork support a complete first-run path:
 
 ```bash
-python3 -m pip install mtplx==2.3.1rc1
+python3 -m pip install "mtplx @ git+https://github.com/OpenSourceWTF/mtplx-moe.git@main"
 mtplx serve \
   --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
   --download
@@ -24,7 +24,7 @@ OpenAI and LiteLLM Chat Completions without expert-specific flags.
 ## Scope
 
 - Integrate the exact SSD-streaming implementation from `davidtai/MTPLX`
-  into the upstream 2.3 release candidate without changing its expert
+  into the OpenSourceWTF fork based on upstream 2.3.0 without changing its expert
   arithmetic, ownership, tiling, record layout, or compiled execution paths.
 - Reuse the completed `feat/moe-streaming-oob` work for manifest-authoritative
   model identity, alias resolution, automatic streaming activation, artifact
@@ -54,10 +54,11 @@ OpenAI and LiteLLM Chat Completions without expert-specific flags.
 
 ## Integration strategy
 
-The fork and the 2.3 release candidate share merge base `510ac8c`. The fork is
-hundreds of commits ahead and the release candidate contains newer public CLI
-and server work. Copying expert modules by filename would risk separating the
-runtime from the exact model patches and ownership rules it depends on.
+The expert fork and the upstream 2.3.0 line share merge base `510ac8c`. The
+expert fork is hundreds of commits ahead and the upstream line contains newer
+public CLI and server work. Copying expert modules by filename would risk
+separating the runtime from the exact model patches and ownership rules it
+depends on.
 
 Implementation will therefore merge the fork history into the release branch
 and resolve shared-file conflicts semantically:
@@ -72,8 +73,8 @@ and resolve shared-file conflicts semantically:
 - The `feat/moe-streaming-oob` commits are applied after the merge so their
   zero-flag behavior is evaluated against the final 2.3 surfaces.
 
-The release candidate version becomes `2.3.1rc1`. Final `2.3.1` publication is
-separate and requires all gates below.
+The source-only fork build is identified as `2.3.0+opensourcewtf.moe`. It is
+not an official MTPLX release and is not published to PyPI or Homebrew.
 
 ## Artifact admission
 
@@ -225,7 +226,7 @@ OpenAI-compatible Chat Completions rather than the full OpenAI API.
 
 ### Release smoke
 
-Run from an empty cache and a clean `2.3.1rc1` wheel:
+Run from an empty cache and a clean `2.3.0+opensourcewtf.moe` fork wheel:
 
 1. Pull the pinned public Hugging Face revision including `experts.bin`.
 2. Confirm the bank size/digest and installed receipt.

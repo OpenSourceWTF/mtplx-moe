@@ -98,8 +98,9 @@ series + Recharts for richer charts + motion/react + canvas-confetti)
 subscribes via `GET /v1/mtplx/metrics/stream` (SSE, 200 ms snapshot
 cadence interleaved with bus events) and polls `/metrics`,
 `/admin/sessions`, and `/v1/mtplx/prefill_history` for tabular state.
-Same origin, same port, same process. Built bundle ships inside the
-wheel via `package_data` so `pip install mtplx` is enough.
+Same origin, same port, same process. The built bundle ships inside this
+fork's wheel via `package_data`, including when the fork is installed directly
+from GitHub.
 
 ## New HTTP endpoints
 

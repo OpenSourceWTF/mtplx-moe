@@ -5,7 +5,7 @@
   ██║ ╚═╝ ██║    ██║    ██║      ███████╗ ██╔╝ ██╗
   ╚═╝     ╚═╝    ╚═╝    ╚═╝      ╚══════╝ ╚═╝  ╚═╝
 
-  v2.3.1rc1  ·  Native MTP speculative decoding on Apple Silicon
+  v2.3.0+opensourcewtf.moe  ·  Native MTP speculative decoding on Apple Silicon
 
 Commands
   start        Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Swival)
@@ -34,4 +34,3 @@ Examples
   mtplx quickstart --profile sustained --port 8000  API server only, no chat
 
   more: `mtplx help <command>` · `mtplx help advanced` · `mtplx --help` · `mtplx --version`
-

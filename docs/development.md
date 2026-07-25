@@ -7,40 +7,25 @@ python -m build
 scripts/fresh_venv_smoke.sh
 ```
 
-Keep generated artifacts, model weights, and local credentials out of Git. The release repository is a product export, not a research workspace dump.
+Keep generated artifacts, model weights, and local credentials out of Git.
 
-## Release
+## Fork artifacts
 
-Release artifacts are published from a clean tag:
-
-```bash
-VERSION=vX.Y.Z  # replace with the release tag
-git tag -a "$VERSION" -m "MTPLX $VERSION"
-git push origin "$VERSION"
-gh release create "$VERSION" dist/* scripts/install_macos.sh --title "MTPLX $VERSION"
-```
-
-Use GitHub CLI authentication for artifact smoke tests:
+The OpenSourceWTF fork is not published to PyPI or the upstream Homebrew tap.
+Build a local wheel and source archive with:
 
 ```bash
-gh release download "$VERSION" --repo youssofal/mtplx --pattern 'mtplx-*-py3-none-any.whl'
-python3 -m pip install ./mtplx-*-py3-none-any.whl
-mtplx help
+python -m build
+python -m twine check dist/*
 ```
 
-PyPI publishing is wired through Trusted Publishing, not local long-lived tokens. Before enabling the upload job, configure a pending publisher on PyPI:
+Install the built fork wheel into a clean environment for smoke testing:
 
-```text
-project: mtplx
-owner: youssofal
-repository: MTPLX
-workflow: release.yml
-environment: pypi
+```bash
+python3 -m venv /tmp/mtplx-moe-fork-verify
+/tmp/mtplx-moe-fork-verify/bin/python -m pip install dist/mtplx-*.whl
+/tmp/mtplx-moe-fork-verify/bin/mtplx --version
 ```
 
-The `release.yml` workflow always builds and checks artifacts for tags. PyPI
-publishing is manual only:
-
-- tag pushes build and check artifacts but do not publish
-- a maintainer must run the workflow with `publish_to_pypi=true` after the tag
-  exists and the local build/twine gates pass
+The `build fork artifacts` workflow performs the same build and smoke checks
+for tags or a manually selected ref. It cannot publish to PyPI.

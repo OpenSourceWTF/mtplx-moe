@@ -1,4 +1,4 @@
-name: release
+name: build fork artifacts
 
 on:
   push:
@@ -7,14 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Git ref to build, such as v0.3.5"
+        description: "Git ref to build"
         required: true
-        default: "v0.3.5"
-      publish_to_pypi:
-        description: "Publish the built artifacts to PyPI through Trusted Publishing"
-        type: boolean
-        required: true
-        default: false
+        default: "main"
 
 permissions:
   contents: read
@@ -26,18 +21,6 @@ jobs:
       - uses: actions/checkout@v7.0.0
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
-      - name: Validate PyPI publish ref
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_to_pypi }}
-        env:
-          PUBLISH_REF: ${{ inputs.ref }}
-        run: |
-          case "$PUBLISH_REF" in
-            v*) ;;
-            *)
-              echo "PyPI publishing requires an explicit version tag ref, not '$PUBLISH_REF'." >&2
-              exit 1
-              ;;
-          esac
       - uses: actions/setup-python@v6.3.0
         with:
           python-version: "3.11"
@@ -51,22 +34,3 @@ jobs:
         with:
           name: dist
           path: dist/*
-
-  publish-pypi:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_to_pypi }}
-    needs: build-artifacts
-    runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/mtplx
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v8.0.1
-        with:
-          name: dist
-          path: dist
-      - uses: pypa/gh-action-pypi-publish@v1.14.0
-        with:
-          packages-dir: dist/

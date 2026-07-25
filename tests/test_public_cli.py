@@ -1682,7 +1682,10 @@ def test_one_shot_rejects_explicit_mtp_before_profile_or_runtime_load(
 
     assert code == 2
     assert payload == {
-        "error": "promoted streamed profiles are AR-only in MTPLX 2.3.1rc1"
+        "error": (
+            "promoted streamed profiles are AR-only in the OpenSourceWTF "
+            "MTPLX-MOE fork"
+        )
     }
     assert validations == []
 

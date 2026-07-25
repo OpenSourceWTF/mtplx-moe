@@ -715,7 +715,8 @@ def expert_streaming_load_kwargs(
         )
     ):
         raise ValueError(
-            "promoted streamed profiles are AR-only in MTPLX 2.3.1rc1"
+            "promoted streamed profiles are AR-only in the OpenSourceWTF "
+            "MTPLX-MOE fork"
         )
     root = Path(model_path).resolve()
     receipt = ensure_expert_admitted(root)

@@ -1,13 +1,14 @@
-# MTPLX 2.3 experts.bin CLI Release Implementation Plan
+# OpenSourceWTF MTPLX-MOE experts.bin CLI Fork Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers-optimized:subagent-driven-development (recommended) or
 > superpowers-optimized:executing-plans to implement this plan task-by-task.
 > Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship an MTPLX 2.3 release candidate whose normal CLI can download,
-admit, configure, and serve the public Hy3 oQ2e `experts.bin` model to OpenAI
-and LiteLLM clients without expert-specific flags.
+**Goal:** Ship a source-installed OpenSourceWTF fork, based on upstream 2.3.0,
+whose normal CLI can download, admit, configure, and serve the public Hy3 oQ2e
+`experts.bin` model to OpenAI and LiteLLM clients without expert-specific
+flags.
 
 **Architecture:** Preserve the upstream 2.3 CLI, server, generation, and
 standard-model implementation, merge the fork's exact expert runtime modules,
@@ -993,7 +994,8 @@ def test_explicit_mtp_is_rejected_for_streamed_profile():
         _cli_flags={"generation-mode"},
     )
     assert public._streamed_generation_mode_error(args) == (
-        "promoted streamed profiles are AR-only in MTPLX 2.3.1rc1"
+        "promoted streamed profiles are AR-only in the OpenSourceWTF "
+        "MTPLX-MOE fork"
     )
 ```
 
@@ -1082,7 +1084,10 @@ def _streamed_generation_mode_error(args: Any) -> str | None:
         "generation-mode" in cli_flags
         and _generation_mode_from_args(args) == GENERATION_MODE_MTP
     ):
-        return "promoted streamed profiles are AR-only in MTPLX 2.3.1rc1"
+        return (
+            "promoted streamed profiles are AR-only in the OpenSourceWTF "
+            "MTPLX-MOE fork"
+        )
     return None
 ```
 
@@ -1233,7 +1238,7 @@ def test_built_wheel_contains_expert_profiles(tmp_path):
         [sys.executable, "-m", "build", "--wheel", "--outdir", str(tmp_path)],
         check=True,
     )
-    wheel = next(tmp_path.glob("mtplx-2.3.1rc1-*.whl"))
+    wheel = next(tmp_path.glob("mtplx-2.3.0+opensourcewtf.moe-*.whl"))
     with zipfile.ZipFile(wheel) as archive:
         payload = json.loads(
             archive.read("mtplx/data/expert_profiles.json")
@@ -1245,17 +1250,17 @@ def test_built_wheel_contains_expert_profiles(tmp_path):
     ]
 ```
 
-- [x] **Step 2: Set the release-candidate version**
+- [x] **Step 2: Set the source-fork version**
 
 Set both package sources to:
 
 ```toml
-version = "2.3.1rc1"
+version = "2.3.0+opensourcewtf.moe"
 ```
 
 ```python
-__version__ = "2.3.1rc1"
-DISPLAY_VERSION = "2.3.1rc1"
+__version__ = "2.3.0+opensourcewtf.moe"
+DISPLAY_VERSION = "2.3.0+opensourcewtf.moe"
 ```
 
 - [x] **Step 3: Document the exact user flow and configurations**
@@ -1263,7 +1268,7 @@ DISPLAY_VERSION = "2.3.1rc1"
 Document:
 
 ```bash
-python3 -m pip install mtplx==2.3.1rc1
+python3 -m pip install "mtplx @ git+https://github.com/OpenSourceWTF/mtplx-moe.git@main"
 mtplx serve \
   --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
   --download
@@ -1356,7 +1361,7 @@ git add \
   docs/plans/2026-07-24-experts-bin-cli-release.md \
   tests/test_expert_profile_packaging.py \
   scripts/release_smoke_expert_api.py
-git commit -m "release: prepare MTPLX 2.3.1rc1 expert serving"
+git commit -m "docs: identify OpenSourceWTF expert-serving fork"
 ```
 
 ## Task 8: Run full regression and real empty-cache release smoke
@@ -1364,7 +1369,7 @@ git commit -m "release: prepare MTPLX 2.3.1rc1 expert serving"
 **Files:**
 
 - Verify: entire worktree
-- Runtime cache: `/Users/davidtai/projects/OpenSourceWTF/.release-smoke/mtplx-2.3.1rc1`
+- Runtime cache: `/Users/davidtai/projects/OpenSourceWTF/.release-smoke/mtplx-moe-fork`
 
 **Security flag:** `security`
 
@@ -1387,7 +1392,7 @@ failure must be rerun on the Metal-capable host before classification.
 - [ ] **Step 2: Install only the built wheel into a clean environment**
 
 ```bash
-SMOKE_ROOT=/Users/davidtai/projects/OpenSourceWTF/.release-smoke/mtplx-2.3.1rc1
+SMOKE_ROOT=/Users/davidtai/projects/OpenSourceWTF/.release-smoke/mtplx-moe-fork
 test ! -e "$SMOKE_ROOT" || {
   echo "release smoke root already exists; archive it before this empty-cache gate"
   exit 1
@@ -1397,18 +1402,18 @@ export MTPLX_RECEIPT_DIR="$SMOKE_ROOT/receipts"
 python3 -m venv "$SMOKE_ROOT/venv"
 "$SMOKE_ROOT/venv/bin/python" -m pip install --upgrade pip
 "$SMOKE_ROOT/venv/bin/python" -m pip install \
-  dist/mtplx-2.3.1rc1-*.whl \
+  dist/mtplx-2.3.0+opensourcewtf.moe-*.whl \
   openai \
   litellm
 "$SMOKE_ROOT/venv/bin/mtplx" --version
 ```
 
-Expected: `mtplx 2.3.1rc1 (2.3.1rc1)`.
+Expected: `mtplx 2.3.0+opensourcewtf.moe (2.3.0+opensourcewtf.moe)`.
 
 - [ ] **Step 3: Confirm disk and download the pinned public revision**
 
 ```bash
-SMOKE_ROOT=/Users/davidtai/projects/OpenSourceWTF/.release-smoke/mtplx-2.3.1rc1
+SMOKE_ROOT=/Users/davidtai/projects/OpenSourceWTF/.release-smoke/mtplx-moe-fork
 export MTPLX_RECEIPT_DIR="$SMOKE_ROOT/receipts"
 df -Pk "$SMOKE_ROOT"
 "$SMOKE_ROOT/venv/bin/mtplx" pull \
@@ -1425,7 +1430,7 @@ pinned revision, an admitted receipt, bank size `80518053888`, and bank digest
 - [ ] **Step 4: Start the zero-flag server from the installed wheel**
 
 ```bash
-SMOKE_ROOT=/Users/davidtai/projects/OpenSourceWTF/.release-smoke/mtplx-2.3.1rc1
+SMOKE_ROOT=/Users/davidtai/projects/OpenSourceWTF/.release-smoke/mtplx-moe-fork
 export MTPLX_RECEIPT_DIR="$SMOKE_ROOT/receipts"
 "$SMOKE_ROOT/venv/bin/mtplx" serve \
   --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
@@ -1453,7 +1458,7 @@ availability claim for the streamed profile.
 - [ ] **Step 5: Run OpenAI and LiteLLM client smoke**
 
 ```bash
-SMOKE_ROOT=/Users/davidtai/projects/OpenSourceWTF/.release-smoke/mtplx-2.3.1rc1
+SMOKE_ROOT=/Users/davidtai/projects/OpenSourceWTF/.release-smoke/mtplx-moe-fork
 MODEL_ID=$(
   curl -fsS -H 'Authorization: Bearer mtplx-local' \
     http://127.0.0.1:18081/v1/models |
@@ -1476,7 +1481,7 @@ Record the receipt modification time, stop the server by its recorded PID,
 restart the identical installed-wheel command, and compare:
 
 ```bash
-SMOKE_ROOT=/Users/davidtai/projects/OpenSourceWTF/.release-smoke/mtplx-2.3.1rc1
+SMOKE_ROOT=/Users/davidtai/projects/OpenSourceWTF/.release-smoke/mtplx-moe-fork
 export MTPLX_RECEIPT_DIR="$SMOKE_ROOT/receipts"
 find "$SMOKE_ROOT/receipts" -type f -name '*.json' \
   -exec stat -f '%m %N' {} \; | sort \

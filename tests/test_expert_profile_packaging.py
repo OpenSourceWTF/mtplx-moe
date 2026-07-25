@@ -56,8 +56,8 @@ def _build_release(source: Path, outdir: Path, *, epoch: int) -> tuple[Path, Pat
         cwd=source,
         env=env,
     )
-    wheel = next(outdir.glob("mtplx-2.3.1rc1-*.whl"))
-    sdist = next(outdir.glob("mtplx-2.3.1rc1.tar.gz"))
+    wheel = next(outdir.glob("mtplx-2.3.0+opensourcewtf.moe-*.whl"))
+    sdist = next(outdir.glob("mtplx-2.3.0+opensourcewtf.moe.tar.gz"))
     return wheel, sdist
 
 
@@ -89,7 +89,7 @@ def test_built_release_is_reproducible_and_contains_expert_profiles(tmp_path):
     with tarfile.open(first_sdist) as archive:
         members = archive.getmembers()
     assert {member.mtime for member in members} == {epoch}
-    assert "mtplx-2.3.1rc1/setup.py" in {
+    assert "mtplx-2.3.0+opensourcewtf.moe/setup.py" in {
         member.name for member in members
     }
 

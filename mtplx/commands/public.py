@@ -692,7 +692,10 @@ def _streamed_generation_mode_error(args: Any) -> str | None:
             and getattr(args, "load_mtp", True) is True
         )
     ):
-        return "promoted streamed profiles are AR-only in MTPLX 2.3.1rc1"
+        return (
+            "promoted streamed profiles are AR-only in the OpenSourceWTF "
+            "MTPLX-MOE fork"
+        )
     return None
 
 

@@ -64,7 +64,10 @@ def test_streamed_generation_mode_error_preserves_explicit_intent(
 
     assert (error is not None) is expected
     if expected:
-        assert error == "promoted streamed profiles are AR-only in MTPLX 2.3.1rc1"
+        assert error == (
+            "promoted streamed profiles are AR-only in the OpenSourceWTF "
+            "MTPLX-MOE fork"
+        )
 
 
 # ---------------------------------------------------------------------------

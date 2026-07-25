@@ -43,12 +43,13 @@ mtplx openwebui docker-command
 That helper disables Open WebUI's Ollama probe and background task generations
 so MTPLX only serves visible chat turns by default.
 
-## Hy3 experts.bin release candidate
+## Hy3 experts.bin fork
 
-Install and start the package-owned, AR-only Hy3 expert-serving path:
+This fork is not published to PyPI. Install it from GitHub, then start the
+package-owned, AR-only Hy3 expert-serving path:
 
 ```bash
-python3 -m pip install mtplx==2.3.1rc1
+python3 -m pip install "mtplx @ git+https://github.com/OpenSourceWTF/mtplx-moe.git@main"
 mtplx serve \
   --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
   --download

@@ -1,6 +1,8 @@
-# Install MTPLX
+# Install the OpenSourceWTF MTPLX-MOE fork
 
-MTPLX is early production software for Apple Silicon Macs.
+This repository is a source-installed fork of
+[youssofal/MTPLX](https://github.com/youssofal/MTPLX). It is not an official
+MTPLX release and is not published to PyPI or the upstream Homebrew tap.
 
 ## Requirements
 
@@ -11,25 +13,15 @@ MTPLX is early production software for Apple Silicon Macs.
 
 ## Install
 
-Recommended macOS install:
+Install this fork directly from GitHub:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/youssofal/MTPLX/main/scripts/install_macos.sh | bash
+python3 -m pip install "mtplx @ git+https://github.com/OpenSourceWTF/mtplx-moe.git@main"
 mtplx help
 ```
 
-The installer checks Homebrew Python paths directly, so it works even if a fresh
-Terminal tab has not put `/opt/homebrew/bin` on PATH yet. It installs MTPLX from
-PyPI into `~/.mtplx/venv` and writes a durable launcher at `~/.local/bin/mtplx`.
-On Apple Silicon Homebrew installs, it also writes `/opt/homebrew/bin/mtplx` when
-that directory is writable.
-
-Python-only install:
-
-```bash
-python3 -m pip install -U mtplx
-mtplx help
-```
+The upstream installer, PyPI package, Homebrew formula, Mac app, and official
+version numbers belong to the upstream project. They do not install this fork.
 
 For local development:
 

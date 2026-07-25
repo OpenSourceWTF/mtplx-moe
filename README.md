@@ -4,13 +4,17 @@
 
 # Run local LLMs on Apple Silicon, around twice as fast.
 
-[![PyPI](https://img.shields.io/pypi/v/mtplx?label=PyPI)](https://pypi.org/project/mtplx/)
 [![CI](https://github.com/OpenSourceWTF/mtplx-moe/actions/workflows/ci.yml/badge.svg)](https://github.com/OpenSourceWTF/mtplx-moe/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![macOS Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-black?logo=apple)](https://developer.apple.com/metal/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 
 </div>
+
+> [!IMPORTANT]
+> This repository is the OpenSourceWTF `mtplx-moe` fork of
+> [youssofal/MTPLX](https://github.com/youssofal/MTPLX). It is not an official
+> MTPLX release and is not published to PyPI or the upstream Homebrew tap.
 
 MTPLX is a native Mac app and command line for running local language models
 with multi-token prediction. Modern Qwen 3.5/3.6 models ship with built-in MTP
@@ -24,28 +28,21 @@ what the model would have said at real sampling settings. The acceptance math
 is the Leviathan and Chen rejection sampling theorem with residual correction,
 so `temperature=0.6, top_p=0.95` behaves like normal decoding, just faster.
 
-## Get it
+## Install this fork
 
-**The Mac app** is the easiest route. Download the DMG at
-[mtplx.com](https://mtplx.com/download), drag it to Applications, and the app
-checks hardware, recommends and downloads a model that fits, installs its own
-Python engine, configures fan control, puts `mtplx` on `PATH`, and tunes draft
-depth on the Mac.
-
-**The CLI**:
+Install the OpenSourceWTF fork directly from GitHub:
 
 ```bash
-brew install youssofal/mtplx/mtplx
+python3 -m pip install "mtplx @ git+https://github.com/OpenSourceWTF/mtplx-moe.git@main"
 ```
 
-Pip also works: `python3 -m pip install mtplx`. Releases are listed at
-[mtplx.com/releases](https://mtplx.com/releases/).
+The upstream Mac app, PyPI package, Homebrew tap, and official release numbers
+belong to [youssofal/MTPLX](https://github.com/youssofal/MTPLX). They do not
+install this fork.
 
-The 2.3.1 release candidate adds the package-owned Hy3 `experts.bin` serving
-path:
+This fork adds the package-owned Hy3 `experts.bin` serving path:
 
 ```bash
-python3 -m pip install mtplx==2.3.1rc1
 mtplx serve \
   --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
   --download
@@ -151,10 +148,10 @@ keys, and reviewed environment variables remain compatibility controls.
 
 MTPLX can also serve mixture-of-experts models larger than a selected memory
 envelope by streaming routed experts from prepacked Hugging Face banks. The
-promoted 2.3.1rc1 profiles are specifically for
+promoted OpenSourceWTF fork profiles are specifically for
 `OpensourceWTF/Hy3-oQ2e-MTPLX-streaming`; the published
 `OpensourceWTF/GLM-5.2-t158-MTPLX-streaming` artifact uses a manual,
-experimental paging configuration. This release does not promote GLM profiles
+experimental paging configuration. This fork does not promote GLM profiles
 or streamed MTP. The primary command above admits the artifact once, selects
 `hy3-oq2e-64`, `hy3-oq2e-88`, or `hy3-oq2e-96`, and constructs the AR route
 directly.
@@ -211,6 +208,8 @@ If MTPLX powers a public project, benchmark, or paper, please credit it:
 > Powered by MTPLX by Youssof Altoukhi
 > https://github.com/youssofal/MTPLX
 
-Built by [Youssof Altoukhi](https://github.com/youssofal). Bug reports and
-benchmark replications are welcome via
-[Issues](https://github.com/youssofal/MTPLX/issues).
+Upstream MTPLX is built by
+[Youssof Altoukhi](https://github.com/youssofal). This fork is maintained by
+[OpenSourceWTF](https://github.com/OpenSourceWTF); report fork-specific bugs
+and benchmark replications in
+[OpenSourceWTF/mtplx-moe Issues](https://github.com/OpenSourceWTF/mtplx-moe/issues).

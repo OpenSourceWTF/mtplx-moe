@@ -701,7 +701,7 @@ wheels = [
 
 [[package]]
 name = "mtplx"
-version = "2.3.1rc1"
+version = "2.3.0+opensourcewtf.moe"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },

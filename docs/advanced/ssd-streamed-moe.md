@@ -2,7 +2,7 @@
 
 MTPLX recognizes two prepacked SSD-streamed models on Hugging Face:
 
-| Model | Routed-expert bank | Model key | 2.3.1rc1 status |
+| Model | Routed-expert bank | Model key | OpenSourceWTF fork status |
 |---|---|---|---|
 | `OpensourceWTF/Hy3-oQ2e-MTPLX-streaming` | `experts.bin` | `hy3-expert-oq2e` | Promoted profiles |
 | `OpensourceWTF/GLM-5.2-t158-MTPLX-streaming` | `experts-q1-t158.bin` | `glm52-expert-q1t` | Manual, experimental configuration |
@@ -11,16 +11,18 @@ MTPLX keeps resident tensors and a bounded expert bank in unified memory and
 reads the remaining routed experts from the serialized Hugging Face bank. Users
 do not need the original expert safetensors or a local repack step.
 
-This first release is autoregressive-only. The serve path installs the AR
+This fork's streamed path is autoregressive-only. The serve path installs the AR
 callable directly, reports `generation_mode=ar`, and rejects an explicit MTP
 request before generation. There is no try-MTP-then-AR fallback. Only the Hy3
-profiles are promoted; the GLM artifact has no promoted release profile or
+profiles are promoted; the GLM artifact has no promoted fork profile or
 quality receipt.
 
 ## Install and serve
 
+This fork is not published to PyPI. Install it directly from GitHub:
+
 ```bash
-python3 -m pip install mtplx==2.3.1rc1
+python3 -m pip install "mtplx @ git+https://github.com/OpenSourceWTF/mtplx-moe.git@main"
 mtplx serve \
   --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
   --download
@@ -210,11 +212,11 @@ An explicit `--no-expert-streaming` prevents automatic activation. Combining
 that opt-out with a positive expert selector, including `--expert-streaming`, a
 named profile, an expert config, a manifest, or an individual expert flag, is a
 configuration error. Likewise, `--generation-mode mtp`, `--mtp`, or
-`--load-mtp` is rejected for a streamed profile in 2.3.1rc1.
+`--load-mtp` is rejected for a streamed profile in this fork.
 
 ## OpenAI and LiteLLM clients
 
-The OpenAI-compatible surface for this release is:
+The OpenAI-compatible surface for this fork is:
 
 - `GET /v1/models`
 - `POST /v1/chat/completions`, including streaming

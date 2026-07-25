@@ -2,5 +2,5 @@
 
 from __future__ import annotations
 
-__version__ = "2.3.1rc1"
-DISPLAY_VERSION = "2.3.1rc1"
+__version__ = "2.3.0+opensourcewtf.moe"
+DISPLAY_VERSION = "2.3.0+opensourcewtf.moe"

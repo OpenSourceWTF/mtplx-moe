@@ -369,7 +369,7 @@ def _listed_model_ids(client: object, *, expected: str) -> list[str]:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Smoke-test an MTPLX expert-serving release candidate."
+        description="Smoke-test the OpenSourceWTF MTPLX-MOE fork."
     )
     parser.add_argument(
         "--base-url",

@@ -1,7 +1,10 @@
 # Quickstart
 
+Install the OpenSourceWTF fork directly from GitHub. It is not published to
+PyPI or the upstream Homebrew tap.
+
 ```bash
-brew install youssofal/mtplx/mtplx
+python3 -m pip install "mtplx @ git+https://github.com/OpenSourceWTF/mtplx-moe.git@main"
 
 mtplx help
 mtplx doctor --summary
@@ -9,18 +12,8 @@ mtplx pull Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed
 mtplx inspect Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed --json
 ```
 
-Homebrew is the recommended macOS path. Python-only installs can use PyPI:
-
-```bash
-python3 -m pip install -U mtplx
-```
-
-The GitHub release wheel remains available for reproducible installs:
-
-```bash
-gh release download v0.3.0 --repo youssofal/mtplx --pattern 'mtplx-0.3.0-py3-none-any.whl'
-python3 -m pip install ./mtplx-0.3.0-py3-none-any.whl
-```
+The upstream Homebrew formula, PyPI package, Mac app, and official release
+artifacts do not install this fork.
 
 The commands above are no-MLX-safe except generation and serving. A missing MLX runtime should appear in `doctor` as an actionable dependency issue, not a traceback.
 
