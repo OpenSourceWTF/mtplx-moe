@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -25,12 +26,14 @@ from mtplx.expert_io import (
     ExpertIOIntegrityError,
     PositionalExpertReader,
 )
+from mtplx.hf_loader import RepoFile
 from mtplx.expert_streaming_models import MODEL_SPECS
 
 import mtplx.runtime as runtime_module
 
 from test_expert_manifest import _make_authoritative_checkpoint
 from test_hf_loader_expert_artifacts import _split_authoritative_sidecar
+from test_hf_loader import _download_one
 
 
 @pytest.fixture
@@ -319,6 +322,109 @@ def test_downloader_digest_with_exact_identity_skips_bank_hash(
     )
 
     assert receipt["banks"][0]["sha256"] == manifest.sidecar.sha256
+
+
+def test_post_install_same_inode_mutation_cannot_reuse_preinstall_digest(
+    authoritative_expert_artifact,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, manifest, bank = authoritative_expert_artifact
+    assert manifest.sidecar is not None
+    original = bank.read_bytes()
+    bank.write_bytes(original[:-1] + bytes([original[-1] ^ 0xFF]))
+    repo_file = RepoFile(
+        path=manifest.sidecar.file,
+        size_bytes=len(original),
+        sha256=manifest.sidecar.sha256,
+    )
+    real_replace = os.replace
+    mutated = False
+
+    def replace_then_mutate(source, destination, *args, **kwargs):
+        nonlocal mutated
+        result = real_replace(source, destination, *args, **kwargs)
+        if destination == bank.name and not mutated:
+            mutated = True
+            installed = bank.stat()
+            with bank.open("r+b") as handle:
+                handle.seek(-1, os.SEEK_END)
+                byte = handle.read(1)
+                handle.seek(-1, os.SEEK_END)
+                handle.write(bytes([byte[0] ^ 0xFF]))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.utime(
+                bank,
+                ns=(installed.st_atime_ns, installed.st_mtime_ns),
+            )
+        return result
+
+    monkeypatch.setattr("mtplx.hf_loader.os.replace", replace_then_mutate)
+
+    with pytest.raises(
+        (RuntimeError, ExpertManifestError),
+        match="SHA-256 mismatch",
+    ):
+        (_emit_at, _emit_size, trusted), _session, _revisions = _download_one(
+            root,
+            repo_file,
+            payload=original,
+            status_code=200,
+        )
+        admit_expert_artifact(
+            root,
+            revision="7" * 40,
+            receipt_root=tmp_path / "receipts",
+            trusted_bank_digests={manifest.sidecar.file: trusted},
+        )
+
+    assert mutated is True
+    assert load_valid_admission_receipt(
+        root,
+        receipt_root=tmp_path / "receipts",
+    ) is None
+
+
+def test_failed_refresh_preserves_old_admitted_target_and_receipt(
+    authoritative_expert_artifact,
+    tmp_path: Path,
+) -> None:
+    root, manifest, bank = authoritative_expert_artifact
+    assert manifest.sidecar is not None
+    receipt_root = tmp_path / "receipts"
+    receipt = admit_expert_artifact(
+        root,
+        revision="8" * 40,
+        receipt_root=receipt_root,
+    )
+    old = bank.read_bytes()
+    replacement = old[:-1] + bytes([old[-1] ^ 0xFF])
+    repo_file = RepoFile(
+        path=manifest.sidecar.file,
+        size_bytes=len(replacement),
+        sha256=hashlib.sha256(replacement).hexdigest(),
+    )
+    receipt_bytes = Path(receipt["receipt_path"]).read_bytes()
+
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        _download_one(
+            root,
+            repo_file,
+            payload=b"",
+            status_code=500,
+        )
+
+    assert bank.read_bytes() == old
+    assert Path(receipt["receipt_path"]).read_bytes() == receipt_bytes
+    assert (
+        load_valid_admission_receipt(
+            root,
+            revision="8" * 40,
+            receipt_root=receipt_root,
+        )
+        == receipt
+    )
 
 
 def test_admission_covers_every_sidecar_part(

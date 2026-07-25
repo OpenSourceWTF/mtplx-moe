@@ -858,6 +858,32 @@ def _trusted_file_digest(
     )
 
 
+def _rehash_trusted_descriptor(
+    descriptor: int,
+    *,
+    display_path: str,
+) -> TrustedFileDigest:
+    before = os.fstat(descriptor)
+    digest = hashlib.sha256()
+    read_bytes = _hash_descriptor(descriptor, digest)
+    after = os.fstat(descriptor)
+    if (
+        read_bytes != before.st_size
+        or _file_identity(before) != _file_identity(after)
+    ):
+        raise RuntimeError(
+            f"download file changed while hashing installed bytes: {display_path}"
+        )
+    return TrustedFileDigest(
+        sha256=digest.hexdigest(),
+        st_dev=after.st_dev,
+        st_ino=after.st_ino,
+        st_size=after.st_size,
+        st_mtime_ns=after.st_mtime_ns,
+        st_ctime_ns=after.st_ctime_ns,
+    )
+
+
 def _hash_existing_file(
     path: Path,
     *,
@@ -1192,27 +1218,10 @@ def _download_repo_file_at(
                 file_path=repo_file.path,
             )
             return emitted_at, emitted_size, existing_digest
-        os.unlink(target_name, dir_fd=directory_descriptor)
-        os.fsync(directory_descriptor)
-        target_metadata = None
-    elif (
-        target_metadata is not None
-        and expected_size is not None
-        and target_metadata.st_size == expected_size
-    ):
-        # Size alone cannot bind old bytes to new remote metadata.
-        os.unlink(target_name, dir_fd=directory_descriptor)
-        os.fsync(directory_descriptor)
-        target_metadata = None
-    elif target_metadata is not None and expected_size is None:
-        # A file without an authoritative size or digest must be fetched again.
-        os.unlink(target_name, dir_fd=directory_descriptor)
-        os.fsync(directory_descriptor)
-        target_metadata = None
-
-    if target_metadata is not None:
-        os.unlink(target_name, dir_fd=directory_descriptor)
-        os.fsync(directory_descriptor)
+    # A nonmatching target stays linked and available to its existing receipt
+    # and any retained readers until the new partial has been fully downloaded,
+    # verified, and fsynced. ``install_verified_partial`` is the only refresh
+    # path that replaces it.
     recorded_partial_metadata = _read_partial_metadata_at(
         directory_descriptor,
         partial_metadata_name,
@@ -1317,27 +1326,25 @@ def _download_repo_file_at(
             )
             after_install = os.fstat(descriptor)
             if (
-                final_metadata.st_dev,
-                final_metadata.st_ino,
-                final_metadata.st_size,
-                final_metadata.st_mtime_ns,
-            ) != (
-                after_install.st_dev,
-                after_install.st_ino,
-                after_install.st_size,
-                after_install.st_mtime_ns,
-            ):
-                raise RuntimeError(
-                    f"download file changed during install: {repo_file.path}"
+                trusted.st_dev,
+                trusted.st_ino,
+                trusted.st_size,
+                trusted.st_mtime_ns,
+                trusted.st_ctime_ns,
+            ) != _file_identity(after_install):
+                trusted = _rehash_trusted_descriptor(
+                    descriptor,
+                    display_path=repo_file.path,
                 )
-            return TrustedFileDigest(
-                sha256=trusted.sha256,
-                st_dev=after_install.st_dev,
-                st_ino=after_install.st_ino,
-                st_size=after_install.st_size,
-                st_mtime_ns=after_install.st_mtime_ns,
-                st_ctime_ns=after_install.st_ctime_ns,
-            )
+                if (
+                    repo_file.sha256 is not None
+                    and trusted.sha256 != repo_file.sha256
+                ):
+                    raise RuntimeError(
+                        f"SHA-256 mismatch for installed {repo_file.path}: "
+                        f"expected {repo_file.sha256}, got {trusted.sha256}"
+                    )
+            return trusted
 
         headers = build_hf_headers(token=hf_token_for_download())
         if existing > 0:
