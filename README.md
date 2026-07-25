@@ -5,7 +5,7 @@
 # Run local LLMs on Apple Silicon, around twice as fast.
 
 [![PyPI](https://img.shields.io/pypi/v/mtplx?label=PyPI)](https://pypi.org/project/mtplx/)
-[![CI](https://github.com/youssofal/MTPLX/actions/workflows/ci.yml/badge.svg)](https://github.com/youssofal/MTPLX/actions/workflows/ci.yml)
+[![CI](https://github.com/OpenSourceWTF/mtplx-moe/actions/workflows/ci.yml/badge.svg)](https://github.com/OpenSourceWTF/mtplx-moe/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![macOS Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-black?logo=apple)](https://developer.apple.com/metal/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)

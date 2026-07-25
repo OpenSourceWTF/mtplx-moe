@@ -53,9 +53,10 @@ classifiers = [
 keywords = ["mlx", "apple-silicon", "speculative-decoding", "qwen", "mtp", "local-ai"]
 
 [project.urls]
-Homepage = "https://github.com/youssofal/mtplx"
-Documentation = "https://github.com/youssofal/mtplx/tree/main/docs"
-Issues = "https://github.com/youssofal/mtplx/issues"
+Homepage = "https://github.com/OpenSourceWTF/mtplx-moe"
+Documentation = "https://github.com/OpenSourceWTF/mtplx-moe/tree/main/docs"
+Issues = "https://github.com/OpenSourceWTF/mtplx-moe/issues"
+Upstream = "https://github.com/youssofal/mtplx"
 Citation = "https://github.com/youssofal/mtplx/blob/main/CITATION.cff"
 
 [project.optional-dependencies]
