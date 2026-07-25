@@ -17,18 +17,62 @@ def test_streamed_moe_release_flow_lives_in_advanced_guide():
     )
     assert "scripts/build_expert_manifest.py" not in root_readme
     assert "scripts/build_expert_manifest.py" not in advanced
-    source_install = (
-        'python3 -m pip install "mtplx @ '
-        'git+https://github.com/OpenSourceWTF/mtplx-moe.git@main"'
-    )
     install_guides = [
         root_readme,
         advanced,
         (ROOT / "INSTALL.md").read_text(encoding="utf-8"),
         (ROOT / "docs/quickstart.md").read_text(encoding="utf-8"),
     ]
-    assert all(source_install in guide for guide in install_guides)
+    assert all(
+        'MTPLX_MOE_VENV="$HOME/.venvs/mtplx-moe"' in guide
+        for guide in install_guides
+    )
+    assert all(
+        '"$MTPLX_MOE_VENV/bin/python" -m pip install' in guide
+        for guide in install_guides
+    )
+    assert all(
+        "git+https://github.com/OpenSourceWTF/mtplx-moe.git@main" in guide
+        for guide in install_guides
+    )
     assert "--expert-profile hy3-oq2e-64" in advanced
+
+
+def test_fork_docs_cover_upstream_and_litellm_collisions():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    install = (ROOT / "INSTALL.md").read_text(encoding="utf-8")
+    server = (ROOT / "docs/server.md").read_text(encoding="utf-8")
+    advanced = (ROOT / "docs/advanced/ssd-streamed-moe.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "same Python distribution" in readme
+    assert "type -a mtplx" in install
+    assert "port 8000" in install
+    assert "shared `~/.mtplx`" in install
+    assert 'MTPLX_CLIENT_VENV="$HOME/.venvs/mtplx-clients"' in install
+    assert "1.93.0 requires `rich<14`" in install
+    assert "hy3-oq2e-mtplx-streaming" in server
+    assert "hy3-oq2e-mtplx-streaming" in advanced
+    assert "openai/hy3-oq2e-mtplx-streaming" in advanced
+    assert "`validation.ok: false`" in advanced
+    assert "“Sustained MTP”" in advanced
+    assert "http://127.0.0.1:4000/v1" in advanced
+    assert "For the primary command\nit is `OpensourceWTF/" not in advanced
+
+
+def test_docs_index_surfaces_fork_guides_after_introduction():
+    index = (ROOT / "docs/README.md").read_text(encoding="utf-8")
+
+    introduction = index.index("This index separates")
+    fork_section = index.index("## OpenSourceWTF fork")
+    start_section = index.index("## Start")
+    assert introduction < fork_section < start_section
+    assert "(../INSTALL.md)" in index
+    assert "(advanced/ssd-streamed-moe.md)" in index
+    assert "(server.md#hy3-expertsbin-fork)" in index
+    assert "(PUBLISH_AND_REPARENT.md)" in index
+    assert "(PYPI_RELEASE.md)" in index
 
 
 def test_mtplx_moe_identifies_as_a_source_installed_fork():

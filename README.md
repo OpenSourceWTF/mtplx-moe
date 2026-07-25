@@ -30,20 +30,37 @@ so `temperature=0.6, top_p=0.95` behaves like normal decoding, just faster.
 
 ## Install this fork
 
-Install the OpenSourceWTF fork directly from GitHub:
+The fork and upstream MTPLX intentionally have the same Python distribution
+name (`mtplx`), import package (`mtplx`), and CLI command (`mtplx`). They cannot
+coexist in one Python environment. Installing either one into an environment
+that already contains the other replaces that environment's MTPLX install.
+
+Use a dedicated virtual environment for this fork:
 
 ```bash
-python3 -m pip install "mtplx @ git+https://github.com/OpenSourceWTF/mtplx-moe.git@main"
+MTPLX_MOE_VENV="$HOME/.venvs/mtplx-moe"
+python3 -m venv "$MTPLX_MOE_VENV"
+"$MTPLX_MOE_VENV/bin/python" -m pip install --upgrade pip
+"$MTPLX_MOE_VENV/bin/python" -m pip install \
+  "mtplx @ git+https://github.com/OpenSourceWTF/mtplx-moe.git@main"
+"$MTPLX_MOE_VENV/bin/python" -m pip check
+"$MTPLX_MOE_VENV/bin/mtplx" --version
 ```
+
+The version must contain `+opensourcewtf.moe`. Use the venv's absolute
+`mtplx` path when the upstream CLI, Homebrew formula, or Mac app is also
+installed; `type -a mtplx` shows every PATH-visible command.
 
 The upstream Mac app, PyPI package, Homebrew tap, and official release numbers
 belong to [youssofal/MTPLX](https://github.com/youssofal/MTPLX). They do not
-install this fork.
+install this fork. In particular, `pip install mtplx` installs the upstream
+PyPI package, not this repository. See [INSTALL.md](INSTALL.md) for coexistence,
+upgrade, port-collision, and separate LiteLLM environment guidance.
 
 This fork adds the package-owned Hy3 `experts.bin` serving path:
 
 ```bash
-mtplx serve \
+"$MTPLX_MOE_VENV/bin/mtplx" serve \
   --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
   --download
 ```
@@ -83,7 +100,7 @@ the catalog's preferred hardware lane, not a hard architecture restriction.
 Launch any catalog model by exact ID:
 
 ```bash
-mtplx start cli \
+"$MTPLX_MOE_VENV/bin/mtplx" start cli \
   --model Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed \
   --download
 ```
@@ -105,7 +122,7 @@ models and rejects MTP before loading.
 ## Start in 60 seconds
 
 ```bash
-mtplx start
+"$MTPLX_MOE_VENV/bin/mtplx" start
 ```
 
 Onboarding chooses the model, runtime mode, and chat surface. See the
@@ -130,9 +147,9 @@ an AIME runner with disclosed, coaching-free prompts.
 Start the API server and print client configuration:
 
 ```bash
-mtplx quickstart --port 8000
-mtplx connect openwebui
-mtplx start opencode --port 18083
+"$MTPLX_MOE_VENV/bin/mtplx" quickstart --port 8000
+"$MTPLX_MOE_VENV/bin/mtplx" connect openwebui
+"$MTPLX_MOE_VENV/bin/mtplx" start opencode --port 18083
 ```
 
 The server exposes OpenAI-compatible `/v1/chat/completions`,
@@ -142,10 +159,19 @@ server, so attaching a client does not load a second model. `/v1/responses` is
 not implemented; OpenAI compatibility here names the supported endpoints, not
 the full OpenAI API.
 
+The fork and upstream servers also default to port 8000. A virtual environment
+isolates Python packages, not TCP ports or unified memory. If another MTPLX
+server is already running, stop it or run this fork on a different port, such
+as `--port 18080`, and use the matching client base URL. For the streamed Hy3
+quickstart, `/v1/models` returns `hy3-oq2e-mtplx-streaming`; the Hugging Face
+repository ID used for download is not the served API model ID. The
+[SSD-streamed MoE guide](docs/advanced/ssd-streamed-moe.md#openai-and-litellm-clients)
+shows isolated OpenAI and LiteLLM client setup.
+
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"mtplx","messages":[{"role":"user","content":"hi"}],"stream":true}'
+  -d '{"model":"hy3-oq2e-mtplx-streaming","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
 Warm-prefix session state keeps multi-turn chats fast, and an optional SSD
@@ -158,8 +184,8 @@ real model at each depth with autoregressive decoding as the baseline, saves a
 depth only when it wins, and says so when none does.
 
 ```bash
-mtplx tune --retune
-mtplx bench aime --quick
+"$MTPLX_MOE_VENV/bin/mtplx" tune --retune
+"$MTPLX_MOE_VENV/bin/mtplx" bench aime --quick
 ```
 
 On a 16 GB M4 Mac mini, tuning the 9B model lands on depth 1: 14.4 tok/s

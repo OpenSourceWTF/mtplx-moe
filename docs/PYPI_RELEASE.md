@@ -1,10 +1,14 @@
 # Fork distribution policy
 
 The OpenSourceWTF `mtplx-moe` fork is not published to PyPI or the upstream
-Homebrew tap. Install it directly from GitHub:
+Homebrew tap. It shares upstream MTPLX's `mtplx` distribution, import, and CLI
+names, so install it directly from GitHub in the dedicated environment
+described in [INSTALL.md](../INSTALL.md):
 
 ```bash
-python3 -m pip install "mtplx @ git+https://github.com/OpenSourceWTF/mtplx-moe.git@main"
+MTPLX_MOE_VENV="$HOME/.venvs/mtplx-moe"
+"$MTPLX_MOE_VENV/bin/python" -m pip install \
+  "mtplx @ git+https://github.com/OpenSourceWTF/mtplx-moe.git@main"
 ```
 
 The `build fork artifacts` GitHub Actions workflow builds and checks wheels and

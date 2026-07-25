@@ -1,8 +1,19 @@
 # MTPLX Docs
 
+This index separates OpenSourceWTF fork guidance from the inherited MTPLX
+runtime and development reference.
+
+## OpenSourceWTF fork
+
+- [Install, coexist with upstream MTPLX, and avoid CLI/port collisions](../INSTALL.md)
+- [Complete supported-model roster](../README.md#supported-models)
+- [SSD-streamed Hy3 and GLM guide](advanced/ssd-streamed-moe.md)
+- [Hy3 server, OpenAI, and LiteLLM setup](server.md#hy3-expertsbin-fork)
+- [Fork topology and upstream sync](PUBLISH_AND_REPARENT.md)
+- [Fork distribution policy](PYPI_RELEASE.md)
+
 ## Start
 
-- [Install details](install.md)
 - [Quickstart reference](quickstart.md)
 
 ## Operate
@@ -12,7 +23,6 @@
 - [Server](server.md)
 - [API](api.md)
 - [Troubleshooting](troubleshooting.md)
-- [Experimental SSD-streamed MoE](advanced/ssd-streamed-moe.md)
 
 ## Develop and reference
 

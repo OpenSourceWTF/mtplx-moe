@@ -4,8 +4,26 @@ The server provides OpenAI-compatible local serving and Anthropic Messages compa
 clients and harnesses.
 
 ```bash
-mtplx serve --host 127.0.0.1 --port 8000 --no-stats-footer
+MTPLX_MOE_VENV="$HOME/.venvs/mtplx-moe"
+"$MTPLX_MOE_VENV/bin/mtplx" serve \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --no-stats-footer
 ```
+
+Both upstream MTPLX and this fork default to port 8000. If they are installed
+side by side, first verify which command and process you are using:
+
+```bash
+MTPLX_MOE_VENV="$HOME/.venvs/mtplx-moe"
+type -a mtplx
+"$MTPLX_MOE_VENV/bin/mtplx" --version
+lsof -nP -iTCP:8000 -sTCP:LISTEN
+```
+
+The OpenSourceWTF fork version contains `+opensourcewtf.moe`. If another server
+owns 8000, stop it normally or choose a different port and update every client
+base URL. Separate Python environments do not isolate ports or unified memory.
 
 Endpoints:
 
@@ -25,7 +43,10 @@ full OpenAI API compatibility.
 Binding to a non-localhost host requires an API key:
 
 ```bash
-mtplx serve --host 0.0.0.0 --port 8000 --api-key "$MTPLX_API_KEY"
+"$MTPLX_MOE_VENV/bin/mtplx" serve \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --api-key "$MTPLX_API_KEY"
 ```
 
 For Open WebUI, set the OpenAI-compatible base URL to:
@@ -37,7 +58,7 @@ http://127.0.0.1:8000/v1
 For Dockerized Open WebUI, the container must use the host gateway URL, not the host's loopback URL:
 
 ```bash
-mtplx openwebui docker-command
+"$MTPLX_MOE_VENV/bin/mtplx" openwebui docker-command
 ```
 
 That helper disables Open WebUI's Ollama probe and background task generations
@@ -45,12 +66,14 @@ so MTPLX only serves visible chat turns by default.
 
 ## Hy3 experts.bin fork
 
-This fork is not published to PyPI. Install it from GitHub, then start the
-package-owned, AR-only Hy3 expert-serving path:
+This fork is not published to PyPI and collides with upstream MTPLX's Python
+distribution/import/CLI names. Follow [INSTALL.md](../INSTALL.md) to create a
+dedicated fork environment, then start the package-owned, AR-only Hy3
+expert-serving path:
 
 ```bash
-python3 -m pip install "mtplx @ git+https://github.com/OpenSourceWTF/mtplx-moe.git@main"
-mtplx serve \
+MTPLX_MOE_VENV="$HOME/.venvs/mtplx-moe"
+"$MTPLX_MOE_VENV/bin/mtplx" serve \
   --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
   --download
 ```
@@ -68,9 +91,10 @@ backend, and effective evidence state. A customized profile reports
 `customized: true`, clears `evidence_commit`, and exposes its safe effective
 configuration instead of claiming promoted evidence.
 
-Use the exact ID returned by `GET /v1/models`. For the primary flow it is
-`OpensourceWTF/Hy3-oQ2e-MTPLX-streaming`; responses carry the loaded server
-model ID even if a client submits a stale request model name.
+Use the exact ID returned by `GET /v1/models`. For the tested primary flow it
+is `hy3-oq2e-mtplx-streaming`, not the Hugging Face repository ID. Responses
+carry the loaded server model ID even if a client submits a stale request
+model name.
 
 LiteLLM:
 
@@ -78,10 +102,14 @@ LiteLLM:
 model_list:
   - model_name: hy3-local
     litellm_params:
-      model: openai/OpensourceWTF/Hy3-oQ2e-MTPLX-streaming
+      model: openai/hy3-oq2e-mtplx-streaming
       api_base: http://127.0.0.1:8000/v1
       api_key: mtplx-local
 ```
+
+Install OpenAI and LiteLLM in a separate client venv, not the fork server venv:
+LiteLLM 1.93.0 requires `rich<14`, while the fork requires `rich>=14`. See the
+[complete client setup](advanced/ssd-streamed-moe.md#openai-and-litellm-clients).
 
 On loopback, `mtplx-local` satisfies clients that require a nonempty API key
 even when server-side authentication is disabled. If the server was started
@@ -114,7 +142,7 @@ proprietary behavior is outside that compatibility contract. To verify a local
 setup, run:
 
 ```bash
-mtplx doctor android-studio --port 8008
+"$MTPLX_MOE_VENV/bin/mtplx" doctor android-studio --port 8008
 ```
 
 Use `--no-stats-footer` for Open WebUI, Claude Code, OpenCode, and other

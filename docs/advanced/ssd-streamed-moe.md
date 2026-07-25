@@ -19,27 +19,68 @@ quality receipt.
 
 ## Install and serve
 
-This fork is not published to PyPI. Install it directly from GitHub:
+This fork is not published to PyPI. It uses the same `mtplx` Python
+distribution, import package, and CLI name as upstream MTPLX, so install it in
+its own virtual environment:
 
 ```bash
-python3 -m pip install "mtplx @ git+https://github.com/OpenSourceWTF/mtplx-moe.git@main"
-mtplx serve \
+MTPLX_MOE_VENV="$HOME/.venvs/mtplx-moe"
+python3 -m venv "$MTPLX_MOE_VENV"
+"$MTPLX_MOE_VENV/bin/python" -m pip install --upgrade pip
+"$MTPLX_MOE_VENV/bin/python" -m pip install \
+  "mtplx @ git+https://github.com/OpenSourceWTF/mtplx-moe.git@main"
+"$MTPLX_MOE_VENV/bin/python" -m pip check
+"$MTPLX_MOE_VENV/bin/mtplx" --version
+
+"$MTPLX_MOE_VENV/bin/mtplx" serve \
   --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
   --download
 ```
 
+The version must contain `+opensourcewtf.moe`. If upstream MTPLX is also
+installed, use the venv's absolute command as shown; see
+[INSTALL.md](../../INSTALL.md) for package, PATH, port, and unified-memory
+collision handling.
+
 `--download` fetches the resident shards, tokenizer/config files,
 `expert-manifest.json`, and the expert bank named by that manifest: literal
 `experts.bin` for Hy3 or `experts-q1-t158.bin` for GLM. Before model
-construction, MTPLX validates the complete artifact and writes a revision- and
-digest-bound admission receipt outside the immutable model snapshot. A
-subsequent launch reuses a matching receipt rather than hashing the bank again.
+construction, the streamed path validates its manifest and expert bank and
+writes a revision- and digest-bound admission receipt outside the immutable
+model snapshot. A subsequent launch reuses a matching receipt rather than
+hashing the bank again.
+
+To download before occupying the server port, run:
+
+```bash
+"$MTPLX_MOE_VENV/bin/mtplx" pull \
+  OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
+  --progress-json
+```
+
+The pull is resumable. The tested Hy3 snapshot contains 97,608,670,094 logical
+bytes, including the 80,518,053,888-byte `experts.bin`.
 
 The promoted Hy3 release is pinned to revision
 `d33ce31c0605fc571c374cdf0aa0f085ec50ff88`. Its `experts.bin` is
 80,518,053,888 bytes with SHA-256
 `c72fb8c0a66020439f4a78591ab9a79d8da3d38412635a531d604ffbf0d2e7d4`.
 A mismatch fails before construction.
+
+The generic `pull --json` validator also checks upstream MTP release metadata.
+For this AR-only streamed artifact it can report `validation.ok: false` with
+missing `mtplx_runtime.json` or MTP-sidecar entries even when
+`expert_admission` succeeds. That generic result does not invalidate the
+streamed expert bank. For this path, require all of the following:
+
+- `pull` exits successfully;
+- `expert_admission` records the pinned revision and bank/manifest digests;
+- `serve` prints `Runtime contract verified` and reaches `MTPLX is ready`; and
+- `/health` reports the same admission evidence and AR-only route.
+
+The related “family-compatible model without a recorded
+`mtplx_runtime.json` exactness baseline” warning means generic MTP statistics
+are unverified. It is not a missing-`experts.bin` warning.
 
 ## Promoted profiles
 
@@ -64,7 +105,7 @@ requires at least 110 GiB of free disk before download.
 Choose an envelope explicitly when reproducibility matters:
 
 ```bash
-mtplx serve \
+"$MTPLX_MOE_VENV/bin/mtplx" serve \
   --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
   --download \
   --expert-profile hy3-oq2e-64
@@ -109,7 +150,7 @@ retaining the 64 GiB profile's other settings:
 ```
 
 ```bash
-mtplx serve \
+"$MTPLX_MOE_VENV/bin/mtplx" serve \
   --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
   --download \
   --expert-profile hy3-oq2e-64 \
@@ -154,7 +195,7 @@ slots per each of the 75 streamed layers.
 ```
 
 ```bash
-mtplx serve \
+"$MTPLX_MOE_VENV/bin/mtplx" serve \
   --model OpensourceWTF/GLM-5.2-t158-MTPLX-streaming \
   --download \
   --expert-streaming-config glm52-t158-96g.json
@@ -190,7 +231,7 @@ For example, this keeps the selected profile identity but changes its effective
 configuration:
 
 ```bash
-mtplx serve \
+"$MTPLX_MOE_VENV/bin/mtplx" serve \
   --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
   --expert-profile hy3-oq2e-64 \
   --expert-streaming-config expert-overrides.json \
@@ -226,10 +267,33 @@ The OpenAI-compatible surface for this fork is:
 documented endpoints above, not the full OpenAI API. The separate
 Anthropic-compatible endpoint remains `POST /v1/messages`.
 
-Use the exact served model ID returned by `/v1/models`. For the primary command
-it is `OpensourceWTF/Hy3-oQ2e-MTPLX-streaming`. The loaded model determines the
-response model ID; a request's `model` field does not select a different loaded
-model.
+The Hugging Face repository ID selects the download. It is not necessarily the
+API model ID. Discover the loaded server's ID after startup:
+
+```bash
+curl -fsS http://127.0.0.1:8000/v1/models | python3 -m json.tool
+```
+
+For the tested Hy3 command, `/v1/models` returns
+`hy3-oq2e-mtplx-streaming`. Use that value in clients. The loaded model
+determines the response model ID; a request's `model` field does not load or
+select a different model.
+
+Keep client and proxy dependencies outside the fork's server venv. In
+particular, LiteLLM 1.93.0 requires `rich<14`, while this fork requires
+`rich>=14`.
+
+```bash
+MTPLX_CLIENT_VENV="$HOME/.venvs/mtplx-clients"
+python3 -m venv "$MTPLX_CLIENT_VENV"
+"$MTPLX_CLIENT_VENV/bin/python" -m pip install --upgrade pip
+"$MTPLX_CLIENT_VENV/bin/python" -m pip install \
+  "openai>=1" "litellm[proxy]"
+"$MTPLX_CLIENT_VENV/bin/python" -m pip check
+```
+
+This split was verified with OpenAI 2.48.0 and LiteLLM 1.93.0. Do not install
+`mtplx` into the client venv or `litellm[proxy]` into the server venv.
 
 OpenAI Python:
 
@@ -241,26 +305,54 @@ client = OpenAI(
     api_key="mtplx-local",
 )
 response = client.chat.completions.create(
-    model="OpensourceWTF/Hy3-oQ2e-MTPLX-streaming",
+    model="hy3-oq2e-mtplx-streaming",
     messages=[{"role": "user", "content": "Reply with exactly OK"}],
 )
+print(response.choices[0].message.content)
 ```
 
-LiteLLM proxy configuration:
+Run that script with `$MTPLX_CLIENT_VENV/bin/python`.
+
+LiteLLM proxy configuration (`litellm.yaml`):
 
 ```yaml
 model_list:
   - model_name: hy3-local
     litellm_params:
-      model: openai/OpensourceWTF/Hy3-oQ2e-MTPLX-streaming
+      model: openai/hy3-oq2e-mtplx-streaming
       api_base: http://127.0.0.1:8000/v1
       api_key: mtplx-local
 ```
+
+Start the proxy in the client environment:
+
+```bash
+"$MTPLX_CLIENT_VENV/bin/litellm" \
+  --config litellm.yaml \
+  --port 4000
+```
+
+OpenAI-compatible clients of the proxy use `http://127.0.0.1:4000/v1` and
+model `hy3-local`.
+LiteLLM forwards that alias to the one model already loaded by MTPLX; it does
+not load another copy.
 
 Loopback serving does not require server-side authentication, but the OpenAI
 client requires a nonempty key value. If MTPLX was started with
 `--api-key mtplx-local`, the client value must match. Binding to a non-loopback
 host always requires an API key.
+
+The fork and upstream MTPLX both default to port 8000, while LiteLLM commonly
+uses 4000. Check for listeners before starting either process:
+
+```bash
+lsof -nP -iTCP:8000 -sTCP:LISTEN
+lsof -nP -iTCP:4000 -sTCP:LISTEN
+```
+
+If another MTPLX server owns 8000, use a different fork port such as 18080 and
+change LiteLLM's `api_base` and the direct OpenAI `base_url` to match. Separate
+venvs do not isolate TCP ports or unified memory.
 
 ## Health evidence
 
@@ -278,6 +370,12 @@ the profile file. Filesystem paths, inode/device values, and receipt paths are
 not exposed. The release smoke checks that admission, profile, customization,
 evidence, actual backend, and AR route remain consistent after short,
 streaming, LiteLLM, and long requests.
+
+The early generic startup card can currently label the selected sustained
+profile as “Sustained MTP” before the streamed route is constructed. That text
+is not route evidence for these artifacts. After `MTPLX is ready`, the
+authoritative checks are `/health` and `expert_profile.generation_mode`; both
+must report `ar`, and `available_generation_modes` must contain only `ar`.
 
 For the lower-level artifact layout and parity gates, see the
 [SSD-streamed MoE plan](../MOE_SSD_STREAMING_PLAN.md).
