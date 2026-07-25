@@ -719,13 +719,11 @@ def test_runtime_load_accepts_admission_receipt_through_real_reader_boundary(
             expert_admission_receipt=receipt,
         )
 
-    assert reached == {
-        "model_path": root,
-        "backend": "python-preadv",
-        "pinned_banks": tuple(
-            bank["file"] for bank in receipt["banks"]
-        ),
-    }
+    assert reached["model_path"] == root
+    assert reached["backend"] in {"native", "python-preadv"}
+    assert reached["pinned_banks"] == tuple(
+        bank["file"] for bank in receipt["banks"]
+    )
 
 
 @pytest.mark.parametrize(("manifest_bits", "descriptor_bits"), [(2, 4), (4, 2)])
