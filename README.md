@@ -41,6 +41,16 @@ brew install youssofal/mtplx/mtplx
 Pip also works: `python3 -m pip install mtplx`. Releases are listed at
 [mtplx.com/releases](https://mtplx.com/releases/).
 
+The 2.3.1 release candidate adds the package-owned Hy3 `experts.bin` serving
+path:
+
+```bash
+python3 -m pip install mtplx==2.3.1rc1
+mtplx serve \
+  --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
+  --download
+```
+
 Requirements: Apple Silicon (M1 or newer), macOS 14+. 16 GB runs the 4B and 9B
 models comfortably; 27B wants 32 GB and up. The app checks before recommending
 anything.
@@ -81,7 +91,9 @@ mtplx start opencode --port 18083
 The server exposes OpenAI-compatible `/v1/chat/completions`,
 `/v1/completions`, and `/v1/models`, plus Anthropic-compatible `/v1/messages`,
 streaming, tool calls, `/health`, and `/metrics`. The app and CLI share one
-server, so attaching a client does not load a second model.
+server, so attaching a client does not load a second model. `/v1/responses` is
+not implemented; OpenAI compatibility here names the supported endpoints, not
+the full OpenAI API.
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -137,13 +149,19 @@ architecture-compatible but unverified, incompatible architecture, or no MTP
 heads. There are no silent fallbacks. Existing individual flags, flat config
 keys, and reviewed environment variables remain compatibility controls.
 
-MTPLX can also serve mixture-of-experts models larger than your Mac's memory by
-streaming routed experts from SSD. Two are published ready to run —
-`OpensourceWTF/Hy3-oQ2e-MTPLX-streaming` and
-`OpensourceWTF/GLM-5.2-t158-MTPLX-streaming`: `mtplx pull` one and `mtplx serve`
-it, with no manifest to build and no memory flags. This is an opt-in,
-target-only AR path with no full-checkpoint performance claim. See the
-[SSD-streamed MoE guide](docs/advanced/ssd-streamed-moe.md).
+MTPLX can also serve mixture-of-experts models larger than a selected memory
+envelope by streaming routed experts from SSD. The promoted 2.3.1rc1 profiles
+are specifically for `OpensourceWTF/Hy3-oQ2e-MTPLX-streaming`; this release
+does not promote GLM profiles or streamed MTP. The primary command above admits
+the artifact once, selects `hy3-oq2e-64`, `hy3-oq2e-88`, or `hy3-oq2e-96`, and
+constructs the AR route directly.
+
+The numbers in those names are weight envelopes, not required machine RAM.
+Their exact process ceilings, including the 7 GiB runtime reserve, are 71 GiB,
+95 GiB, and 103 GiB. `auto` chooses the largest promoted profile whose process
+ceiling fits both installed RAM and launch-time available memory. See the
+[SSD-streamed MoE guide](docs/advanced/ssd-streamed-moe.md) for explicit
+profiles, advanced override precedence, health evidence, and LiteLLM setup.
 
 Use `mtplx help advanced` for QA, profiling, support bundles, and kernel tools.
 See the [documentation index](docs/README.md).
