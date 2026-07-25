@@ -79,6 +79,78 @@ EXPERT_PROFILE_CHOICES = (
     "hy3-oq2e-88",
     "hy3-oq2e-96",
 )
+_PROFILE_EFFECTIVE_FIELDS = (
+    "memory_limit_bytes",
+    "max_live_kv_tokens",
+    "runtime_reserve_bytes",
+    "expert_cache_limit_bytes",
+    "transient_slots",
+    "io_staging_bytes",
+    "execution_workspace_bytes",
+    "max_inflight_io_bytes",
+    "max_open_files",
+    "max_read_chunk_bytes",
+    "frequency_decay",
+    "prefer_sidecar",
+    "verify_record_hashes",
+    "verify_artifact_headers",
+    "verify_sidecar_hash_at_open",
+    "prefill_admission",
+    "slot_layout",
+    "trace_routes",
+    "cache_policy",
+    "cache_scope",
+    "bypass_page_cache",
+    "resource_telemetry",
+    "q2_expert_kernel",
+    "hy3_router_kernel",
+    "hy3_router_sigmoid",
+    "hy3_mtp_shared_kernel",
+    "hy3_mtp_shared_kernel_depth",
+    "proj_quant",
+    "proj_requant",
+    "kv_quant",
+    "split_route_release",
+    "deferred_pin_release",
+    "island_layers",
+    "island_layer_count",
+    "mmap_island_layers",
+    "banked_codec",
+    "streamed_codec",
+    "streamed_codec_verify",
+    "mmap_island_wired",
+    "overlap_miss_reads",
+    "prefetch_slots",
+    "speculative_io_fraction",
+    "route_census",
+    "miss_shadow",
+    "miss_shadow_layers",
+)
+_EXPERT_STREAMING_POSITIVE_FLAGS = (
+    "expert-streaming",
+    "expert-streaming-config",
+    "expert-manifest",
+    "expert-model-key",
+    "expert-memory-limit",
+    "expert-max-live-kv-tokens",
+    "expert-runtime-reserve",
+    "expert-cache-limit",
+    "expert-cache-policy",
+    "expert-cache-scope",
+    "expert-transient-slots",
+    "expert-io-staging",
+    "expert-execution-workspace",
+    "expert-max-inflight-io",
+    "expert-max-open-files",
+    "expert-read-chunk",
+    "expert-f-nocache",
+    "expert-slot-layout",
+    "expert-frequency-decay",
+    "expert-prefer-sidecar",
+    "expert-verify-record-hashes",
+    "expert-verify-headers",
+    "expert-verify-sidecar-at-open",
+)
 
 
 def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
@@ -197,10 +269,41 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
 def expert_streaming_requested(args: Any) -> bool:
     profile = str(getattr(args, "expert_profile", "auto") or "auto")
     cli_flags = set(getattr(args, "_cli_flags", set()) or set())
-    if profile != "auto" and "no-expert-streaming" in cli_flags:
-        raise ValueError(
-            "--expert-profile cannot be combined with --no-expert-streaming"
-        )
+    if "no-expert-streaming" in cli_flags:
+        positive_selector = None
+        if (
+            "expert-streaming" in cli_flags
+            or getattr(args, "expert_streaming", False)
+        ):
+            positive_selector = "--expert-streaming"
+        elif profile != "auto":
+            positive_selector = "--expert-profile"
+        elif (
+            "expert-streaming-config" in cli_flags
+            or getattr(args, "expert_streaming_config", None)
+        ):
+            positive_selector = "--expert-streaming-config"
+        elif (
+            "expert-manifest" in cli_flags
+            or getattr(args, "expert_manifest", None)
+        ):
+            positive_selector = "--expert-manifest"
+        if positive_selector is None:
+            positive_flag = next(
+                (
+                    flag
+                    for flag in _EXPERT_STREAMING_POSITIVE_FLAGS
+                    if flag in cli_flags
+                ),
+                None,
+            )
+            if positive_flag is not None:
+                positive_selector = f"--{positive_flag}"
+        if positive_selector is not None:
+            raise ValueError(
+                f"{positive_selector} cannot be combined with "
+                "--no-expert-streaming"
+            )
     return bool(
         getattr(args, "expert_streaming", False)
         or getattr(args, "expert_streaming_config", None)
@@ -539,6 +642,32 @@ def _apply_diagnostic_hash_policy(
     return dataclasses.replace(config, **changes)
 
 
+def _profile_customization(
+    profile: ExpertServeProfile,
+    config: ExpertStreamingConfig,
+) -> tuple[tuple[str, ...], dict[str, Any]]:
+    baseline = build_expert_streaming_config(profile)
+    baseline_changes: dict[str, Any] = {
+        "verify_record_hashes": False,
+        "verify_sidecar_hash_at_open": False,
+    }
+    if baseline.island_layers:
+        baseline_changes["island_layer_count"] = None
+    baseline = dataclasses.replace(baseline, **baseline_changes)
+    changed = tuple(
+        field.name
+        for field in dataclasses.fields(config)
+        if getattr(config, field.name) != getattr(baseline, field.name)
+    )
+    if not changed:
+        return (), {}
+    effective: dict[str, Any] = {}
+    for name in _PROFILE_EFFECTIVE_FIELDS:
+        value = getattr(config, name)
+        effective[name] = list(value) if isinstance(value, tuple) else value
+    return changed, effective
+
+
 def expert_streaming_load_kwargs(
     args: Any,
     model_path: Path | str,
@@ -555,6 +684,10 @@ def expert_streaming_load_kwargs(
             == "mtp"
         )
         or "mtp" in cli_flags
+        or (
+            "load-mtp" in cli_flags
+            and getattr(args, "load_mtp", True) is True
+        )
     ):
         raise ValueError(
             "promoted streamed profiles are AR-only in MTPLX 2.3.1rc1"
@@ -580,13 +713,20 @@ def expert_streaming_load_kwargs(
             f"admitted manifest model key {model_key!r}"
         )
     profile = _profile_for_model_key(args, model_key=model_key)
+    customized_fields: tuple[str, ...] = ()
+    effective_config: dict[str, Any] = {}
     if profile is not None:
         profile_overrides = dict(values)
         profile_overrides.update(overrides)
-        config = build_expert_streaming_config(
-            profile,
-            overrides=profile_overrides,
-        )
+        try:
+            config = build_expert_streaming_config(
+                profile,
+                overrides=profile_overrides,
+            )
+        except TypeError as exc:
+            raise ValueError(
+                f"invalid expert profile overrides: {exc}"
+            ) from exc
         setattr(args, "expert_profile", profile.name)
     else:
         values["model_key"] = model_key
@@ -605,9 +745,25 @@ def expert_streaming_load_kwargs(
             raise ValueError(f"invalid expert streaming config: {exc}") from exc
         config = resolve_island_placement(config, root)
     config = _apply_diagnostic_hash_policy(args, config)
+    if profile is not None:
+        customized_fields, effective_config = _profile_customization(
+            profile,
+            config,
+        )
     if not manifest.is_file():
         raise ValueError(f"expert manifest does not exist: {manifest}")
     setattr(args, "_resolved_expert_profile", profile)
+    setattr(
+        args,
+        "_resolved_expert_profile_customized",
+        bool(customized_fields),
+    )
+    setattr(
+        args,
+        "_resolved_expert_profile_customized_fields",
+        customized_fields,
+    )
+    setattr(args, "_resolved_expert_effective_config", effective_config)
     setattr(args, "_expert_admission_receipt", receipt)
     return {
         "mtp": False,

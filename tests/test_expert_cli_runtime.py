@@ -172,6 +172,48 @@ def test_concrete_profile_rejects_explicit_streaming_opt_out() -> None:
         expert_streaming_requested(args)
 
 
+@pytest.mark.parametrize(
+    ("argv", "cli_flags", "selector"),
+    [
+        (
+            ["--expert-streaming", "--no-expert-streaming"],
+            {"expert-streaming", "no-expert-streaming"},
+            "--expert-streaming",
+        ),
+        (
+            ["--expert-profile", "hy3-oq2e-64", "--no-expert-streaming"],
+            {"expert-profile", "no-expert-streaming"},
+            "--expert-profile",
+        ),
+        (
+            ["--expert-streaming-config", "stream.json", "--no-expert-streaming"],
+            {"expert-streaming-config", "no-expert-streaming"},
+            "--expert-streaming-config",
+        ),
+        (
+            ["--expert-manifest", "manifest.json", "--no-expert-streaming"],
+            {"expert-manifest", "no-expert-streaming"},
+            "--expert-manifest",
+        ),
+        (
+            ["--expert-cache-policy", "lru", "--no-expert-streaming"],
+            {"expert-cache-policy", "no-expert-streaming"},
+            "--expert-cache-policy",
+        ),
+    ],
+)
+def test_explicit_streaming_opt_out_rejects_every_positive_selector(
+    argv: list[str],
+    cli_flags: set[str],
+    selector: str,
+) -> None:
+    args = _parser().parse_args(argv)
+    args._cli_flags = cli_flags
+
+    with pytest.raises(ValueError, match=selector):
+        expert_streaming_requested(args)
+
+
 def test_promoted_profile_admits_then_freezes_auto_and_attaches_receipt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -213,6 +255,109 @@ def test_promoted_profile_admits_then_freezes_auto_and_attaches_receipt(
     assert kwargs["expert_admission_receipt"] is receipt
     assert kwargs["expert_streaming_config"].model_key == "hy3-expert-oq2e"
     assert kwargs["mtp"] is False
+
+
+def test_promoted_profile_geometry_override_is_customized_in_parent_and_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _streaming_root(
+        tmp_path,
+        model_type="hy_v3",
+        manifest_model_key="hy3-expert-oq2e",
+    )
+    profile = expert_cli.load_expert_profiles()["hy3-oq2e-96"]
+    monkeypatch.setattr(
+        expert_cli,
+        "select_expert_profile",
+        lambda requested, *, model_key: profile,
+    )
+    args = _parser().parse_args(
+        [
+            "--expert-profile",
+            profile.name,
+            "--expert-cache-policy",
+            "lru",
+        ]
+    )
+    args._cli_flags = {"expert-profile", "expert-cache-policy"}
+
+    kwargs = expert_streaming_load_kwargs(args, root)
+
+    assert kwargs["expert_streaming_config"].cache_policy == "lru"
+    assert args._resolved_expert_profile is profile
+    assert args._resolved_expert_profile_customized is True
+    assert "cache_policy" in args._resolved_expert_profile_customized_fields
+    assert args._resolved_expert_effective_config["cache_policy"] == "lru"
+
+    child_command: list[str] = []
+    append_expert_streaming_child_args(child_command, args)
+    child = _parser().parse_args(child_command)
+    child._cli_flags = {
+        token[2:] for token in child_command if token.startswith("--")
+    }
+
+    child_kwargs = expert_streaming_load_kwargs(child, root)
+
+    assert child_kwargs["expert_streaming_config"].cache_policy == "lru"
+    assert child._resolved_expert_profile_customized is True
+    assert child._resolved_expert_profile_customized_fields == (
+        "cache_policy",
+    )
+    assert child._resolved_expert_effective_config["cache_policy"] == "lru"
+
+
+def test_promoted_profile_unknown_override_is_a_controlled_value_error(
+    tmp_path: Path,
+) -> None:
+    root = _streaming_root(
+        tmp_path,
+        model_type="hy_v3",
+        manifest_model_key="hy3-expert-oq2e",
+    )
+    config_path = tmp_path / "unknown-key.json"
+    config_path.write_text(
+        json.dumps({"not_a_profile_field": 1}),
+        encoding="utf-8",
+    )
+    args = _parser().parse_args(
+        [
+            "--expert-profile",
+            "hy3-oq2e-96",
+            "--expert-streaming-config",
+            str(config_path),
+        ]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="invalid expert profile overrides.*not_a_profile_field",
+    ):
+        expert_streaming_load_kwargs(args, root)
+
+
+def test_explicit_load_mtp_is_rejected_before_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _streaming_root(
+        tmp_path,
+        model_type="hy_v3",
+        manifest_model_key="hy3-expert-oq2e",
+    )
+    args = _parser().parse_args(["--expert-profile", "hy3-oq2e-96"])
+    args.load_mtp = True
+    args._cli_flags = {"expert-profile", "load-mtp"}
+    monkeypatch.setattr(
+        expert_cli,
+        "ensure_expert_admitted",
+        lambda _root: (_ for _ in ()).throw(
+            AssertionError("MTP contradiction must fail before admission")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="AR-only"):
+        expert_streaming_load_kwargs(args, root)
 
 
 def test_legacy_config_for_unpromoted_glm_is_admitted_without_hy3_profile(
@@ -495,6 +640,92 @@ def _write_tiny_affine_manifest(
     path = root / "expert-manifest.json"
     save_expert_manifest(manifest, path)
     return path
+
+
+def test_runtime_load_accepts_admission_receipt_through_real_reader_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mtplx.expert_runtime as expert_runtime_module
+    import mtplx.models.expert_mlx as expert_mlx_module
+    import mtplx.resident_loader as resident_loader_module
+    import mtplx.runtime as runtime_module
+    from mtplx.expert_admission import admit_expert_artifact
+    from mtplx.expert_streaming_models import MODEL_SPECS
+    from test_expert_manifest import _make_authoritative_checkpoint
+
+    root = tmp_path / "admitted"
+    spec, manifest = _make_authoritative_checkpoint(root)
+    save_expert_manifest(
+        manifest,
+        root / "expert-manifest.json",
+    )
+    manifest_path = root / "expert-manifest.json"
+    (root / "config.json").write_text(
+        json.dumps({"model_type": "hy_v3"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(MODEL_SPECS, spec.key, spec)
+    receipt = admit_expert_artifact(
+        root,
+        revision="a" * 40,
+        receipt_root=tmp_path / "receipts",
+    )
+    config = ExpertStreamingConfig(
+        model_key=spec.key,
+        memory_limit_bytes=1 << 20,
+        max_live_kv_tokens=0,
+        runtime_reserve_bytes=0,
+        expert_cache_limit_bytes=spec.expert_record_bytes,
+        transient_slots=1,
+        verify_artifact_headers=False,
+        hy3_router_kernel="stock",
+    )
+    reached: dict[str, object] = {}
+
+    class LaterResidentBoundary(RuntimeError):
+        pass
+
+    def stop_after_reader_open(model_path, expert_runtime, *, config):
+        reached["model_path"] = model_path
+        reached["backend"] = expert_runtime.reader.backend
+        reached["pinned_banks"] = tuple(
+            expert_runtime.reader._pinned_entries
+        )
+        raise LaterResidentBoundary("reader construction reached")
+
+    monkeypatch.setattr(
+        expert_runtime_module,
+        "apply_mlx_memory_cap",
+        lambda *_args, **_kwargs: {"applied": False},
+    )
+    monkeypatch.setattr(
+        expert_mlx_module,
+        "make_mlx_slot_buffer_allocator",
+        lambda _plan, _spec: lambda size, _label: bytearray(size),
+    )
+    monkeypatch.setattr(
+        resident_loader_module,
+        "construct_resident_model",
+        stop_after_reader_open,
+    )
+
+    with pytest.raises(LaterResidentBoundary, match="reader construction reached"):
+        runtime_module.load(
+            root,
+            mtp=False,
+            expert_streaming_config=config,
+            expert_manifest=manifest_path,
+            expert_admission_receipt=receipt,
+        )
+
+    assert reached == {
+        "model_path": root,
+        "backend": "python-preadv",
+        "pinned_banks": tuple(
+            bank["file"] for bank in receipt["banks"]
+        ),
+    }
 
 
 @pytest.mark.parametrize(("manifest_bits", "descriptor_bits"), [(2, 4), (4, 2)])

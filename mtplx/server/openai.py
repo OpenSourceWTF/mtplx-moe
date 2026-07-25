@@ -1525,24 +1525,101 @@ def _health_string(value: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
+_EXPERT_EFFECTIVE_HEALTH_FIELDS = (
+    "memory_limit_bytes",
+    "max_live_kv_tokens",
+    "runtime_reserve_bytes",
+    "expert_cache_limit_bytes",
+    "transient_slots",
+    "io_staging_bytes",
+    "execution_workspace_bytes",
+    "max_inflight_io_bytes",
+    "max_open_files",
+    "max_read_chunk_bytes",
+    "frequency_decay",
+    "prefer_sidecar",
+    "verify_record_hashes",
+    "verify_artifact_headers",
+    "verify_sidecar_hash_at_open",
+    "prefill_admission",
+    "slot_layout",
+    "trace_routes",
+    "cache_policy",
+    "cache_scope",
+    "bypass_page_cache",
+    "resource_telemetry",
+    "q2_expert_kernel",
+    "hy3_router_kernel",
+    "hy3_router_sigmoid",
+    "hy3_mtp_shared_kernel",
+    "hy3_mtp_shared_kernel_depth",
+    "proj_quant",
+    "proj_requant",
+    "kv_quant",
+    "split_route_release",
+    "deferred_pin_release",
+    "island_layers",
+    "island_layer_count",
+    "mmap_island_layers",
+    "banked_codec",
+    "streamed_codec",
+    "streamed_codec_verify",
+    "mmap_island_wired",
+    "overlap_miss_reads",
+    "prefetch_slots",
+    "speculative_io_fraction",
+    "route_census",
+    "miss_shadow",
+    "miss_shadow_layers",
+)
+
+
+def _expert_effective_health_payload(
+    effective: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(effective, Mapping):
+        return {}
+    payload: dict[str, Any] = {}
+    for name in _EXPERT_EFFECTIVE_HEALTH_FIELDS:
+        if name not in effective:
+            continue
+        value = effective[name]
+        if value is None or isinstance(value, (bool, int, float, str)):
+            payload[name] = value
+        elif isinstance(value, (list, tuple)) and all(
+            item is None or isinstance(item, (bool, int, float, str))
+            for item in value
+        ):
+            payload[name] = list(value)
+    return payload
+
+
 def expert_profile_health_payload(
     profile: Any | None,
     *,
     backend: str | None = None,
+    customized: bool = False,
+    effective: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if profile is None:
         return None
-    return {
+    payload = {
         "name": _health_string(getattr(profile, "name", None)),
         "model_key": _health_string(getattr(profile, "model_key", None)),
-        "evidence_commit": _health_string(
-            getattr(profile, "evidence_commit", None)
+        "evidence_commit": (
+            None
+            if customized
+            else _health_string(getattr(profile, "evidence_commit", None))
         ),
         "backend": _health_string(backend),
         "generation_mode": _health_string(
             getattr(profile, "generation_mode", None)
         ),
     }
+    if customized:
+        payload["customized"] = True
+        payload["effective"] = _expert_effective_health_payload(effective)
+    return payload
 
 
 def expert_admission_health_payload(
@@ -19777,6 +19854,18 @@ def create_app(state: ServerState) -> FastAPI:
             "expert_profile": expert_profile_health_payload(
                 resolved_expert_profile,
                 backend=_expert_runtime_io_backend(runtime),
+                customized=bool(
+                    getattr(
+                        state.args,
+                        "_resolved_expert_profile_customized",
+                        False,
+                    )
+                ),
+                effective=getattr(
+                    state.args,
+                    "_resolved_expert_effective_config",
+                    None,
+                ),
             ),
             "expert_admission": expert_admission_health_payload(
                 expert_admission_receipt

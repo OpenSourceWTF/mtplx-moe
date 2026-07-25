@@ -1744,6 +1744,27 @@ def test_expert_health_serializers_whitelist_and_reject_malformed_banks():
         "backend": "native",
         "generation_mode": "ar",
     }
+    assert openai.expert_profile_health_payload(
+        profile,
+        backend="preadv",
+        customized=True,
+        effective={
+            "cache_policy": "lru",
+            "memory_limit_bytes": 64 * 1024**3,
+            "secret_path": "/private/model",
+        },
+    ) == {
+        "name": "hy3-oq2e-64",
+        "model_key": "hy3-expert-oq2e",
+        "evidence_commit": None,
+        "backend": "preadv",
+        "generation_mode": "ar",
+        "customized": True,
+        "effective": {
+            "cache_policy": "lru",
+            "memory_limit_bytes": 64 * 1024**3,
+        },
+    }
     assert openai.expert_admission_health_payload(receipt) == {
         "revision": "d" * 40,
         "manifest_sha256": "a" * 64,
@@ -1804,6 +1825,38 @@ def test_streaming_health_reports_actual_backend_and_ar_only_modes():
     assert "st_dev" not in serialized
     assert "st_ino" not in serialized
     assert "receipt_path" not in serialized
+
+
+def test_streaming_health_does_not_claim_promoted_evidence_for_custom_geometry():
+    state = _fake_state()
+    state.args.generation_mode = "ar"
+    state.args.load_mtp = False
+    state.args._resolved_expert_profile = SimpleNamespace(
+        name="hy3-oq2e-64",
+        model_key="hy3-expert-oq2e",
+        evidence_commit="14c8b57fff358bee3da2d10968a855b955b86847",
+        generation_mode="ar",
+    )
+    state.args._resolved_expert_profile_customized = True
+    state.args._resolved_expert_effective_config = {
+        "cache_policy": "lru",
+        "memory_limit_bytes": 64 * 1024**3,
+    }
+    state.expert_streaming_load_kwargs = {"expert_streaming_config": object()}
+    state.runtime.expert_streaming = SimpleNamespace(
+        reader=SimpleNamespace(backend="preadv")
+    )
+    state.runtime.expert_streaming_snapshot = lambda: {"ok": True}
+    client = TestClient(create_app(state))
+
+    profile = client.get("/health").json()["expert_profile"]
+
+    assert profile["customized"] is True
+    assert profile["evidence_commit"] is None
+    assert profile["effective"] == {
+        "cache_policy": "lru",
+        "memory_limit_bytes": 64 * 1024**3,
+    }
 
 
 def test_ordinary_health_keeps_both_generation_modes_and_no_expert_metadata():

@@ -680,6 +680,10 @@ def _streamed_generation_mode_error(args: Any) -> str | None:
     if (
         ("generation-mode" in cli_flags and explicit_generation_mode == "mtp")
         or "mtp" in cli_flags
+        or (
+            "load-mtp" in cli_flags
+            and getattr(args, "load_mtp", True) is True
+        )
     ):
         return "promoted streamed profiles are AR-only in MTPLX 2.3.1rc1"
     return None

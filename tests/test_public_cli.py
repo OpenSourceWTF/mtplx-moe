@@ -1299,8 +1299,9 @@ def test_public_serve_expert_profile_defaults_to_auto() -> None:
     [
         (("--generation-mode", "mtp"), {"generation-mode", "expert-profile"}),
         (("--mtp",), {"mtp", "expert-profile"}),
+        (("--load-mtp",), {"load-mtp", "expert-profile"}),
     ],
-    ids=("generation-mode", "mtp-toggle"),
+    ids=("generation-mode", "mtp-toggle", "load-mtp"),
 )
 def test_full_serve_rejects_explicit_mtp_before_profile_or_exec(
     monkeypatch,
@@ -1349,6 +1350,69 @@ def test_full_serve_rejects_explicit_mtp_before_profile_or_exec(
     assert public.cmd_serve_public(args) == 2
     expected_mode = "mtp" if "generation-mode" in canonical_flags else None
     assert args.generation_mode == expected_mode
+
+
+@pytest.mark.parametrize("command", ["run", "chat"])
+@pytest.mark.parametrize(
+    ("generation_mode", "cli_flags"),
+    [
+        ("mtp", {"generation-mode", "expert-profile"}),
+        (None, {"mtp", "expert-profile"}),
+        (None, {"load-mtp", "expert-profile"}),
+    ],
+    ids=("generation-mode", "mtp-toggle", "load-mtp"),
+)
+def test_one_shot_rejects_explicit_mtp_before_profile_or_runtime_load(
+    monkeypatch,
+    tmp_path,
+    command,
+    generation_mode,
+    cli_flags,
+) -> None:
+    import mtplx.expert_cli as expert_cli
+
+    model_dir = tmp_path / "streamed"
+    model_dir.mkdir()
+    monkeypatch.setattr(
+        public,
+        "_resolve_runtime_model_path",
+        lambda _model, cache_dir=None: (str(model_dir), None),
+    )
+    monkeypatch.setattr(
+        expert_cli,
+        "expert_streaming_load_kwargs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("MTP contradiction must fail before admission/profile")
+        ),
+    )
+    args = SimpleNamespace(
+        prompt="hello",
+        prompt_arg=None,
+        model=str(model_dir),
+        cache_dir=None,
+        expert_profile="hy3-oq2e-64",
+        expert_streaming=False,
+        expert_streaming_config=None,
+        expert_manifest=None,
+        generation_mode=generation_mode,
+        load_mtp=True,
+        no_mtp=False,
+        fan_mode="default",
+        max=False,
+        depth=3,
+        _cli_flags=cli_flags,
+    )
+
+    code, payload, validations = public._generate_one_shot_public(
+        args,
+        command=command,
+    )
+
+    assert code == 2
+    assert payload == {
+        "error": "promoted streamed profiles are AR-only in MTPLX 2.3.1rc1"
+    }
+    assert validations == []
 
 
 def test_full_serve_freezes_profile_for_child_and_applies_child_env_last(

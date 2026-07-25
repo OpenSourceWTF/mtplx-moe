@@ -42,6 +42,7 @@ def _install_authoritative_manifest(parent, monkeypatch):
     [
         ("mtp", {"generation-mode"}, True),
         (None, {"mtp"}, True),
+        (None, {"load-mtp"}, True),
         ("auto", {"generation-mode"}, False),
         ("ar", {"generation-mode"}, False),
         (None, set(), False),
@@ -54,6 +55,7 @@ def test_streamed_generation_mode_error_preserves_explicit_intent(
 ):
     args = _args(
         generation_mode=generation_mode,
+        load_mtp=True,
         no_mtp=False,
         _cli_flags=cli_flags,
     )
