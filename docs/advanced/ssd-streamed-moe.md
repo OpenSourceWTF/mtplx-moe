@@ -1,14 +1,21 @@
 # SSD-streamed MoE
 
-MTPLX 2.3.1rc1 promotes one SSD-streamed model:
-`OpensourceWTF/Hy3-oQ2e-MTPLX-streaming`. Its routed expert weights live in
-`experts.bin`; MTPLX keeps the resident tensors and a bounded expert bank in
-unified memory and reads the remaining routed experts from SSD.
+MTPLX recognizes two prepacked SSD-streamed models on Hugging Face:
 
-This first release is autoregressive-only. The promoted profiles install the AR
-callable directly, report `generation_mode=ar`, and reject an explicit MTP
-request before generation. There is no try-MTP-then-AR fallback. This release
-does not promote a GLM streamed profile.
+| Model | Routed-expert bank | Model key | 2.3.1rc1 status |
+|---|---|---|---|
+| `OpensourceWTF/Hy3-oQ2e-MTPLX-streaming` | `experts.bin` | `hy3-expert-oq2e` | Promoted profiles |
+| `OpensourceWTF/GLM-5.2-t158-MTPLX-streaming` | `experts-q1-t158.bin` | `glm52-expert-q1t` | Manual, experimental configuration |
+
+MTPLX keeps resident tensors and a bounded expert bank in unified memory and
+reads the remaining routed experts from the serialized Hugging Face bank. Users
+do not need the original expert safetensors or a local repack step.
+
+This first release is autoregressive-only. The serve path installs the AR
+callable directly, reports `generation_mode=ar`, and rejects an explicit MTP
+request before generation. There is no try-MTP-then-AR fallback. Only the Hy3
+profiles are promoted; the GLM artifact has no promoted release profile or
+quality receipt.
 
 ## Install and serve
 
@@ -20,12 +27,13 @@ mtplx serve \
 ```
 
 `--download` fetches the resident shards, tokenizer/config files,
-`expert-manifest.json`, and literal `experts.bin`. Before model construction,
-MTPLX validates the complete artifact and writes a revision- and digest-bound
-admission receipt outside the immutable model snapshot. A subsequent launch
-reuses a matching receipt rather than hashing the 75 GiB bank again.
+`expert-manifest.json`, and the expert bank named by that manifest: literal
+`experts.bin` for Hy3 or `experts-q1-t158.bin` for GLM. Before model
+construction, MTPLX validates the complete artifact and writes a revision- and
+digest-bound admission receipt outside the immutable model snapshot. A
+subsequent launch reuses a matching receipt rather than hashing the bank again.
 
-The release is pinned to revision
+The promoted Hy3 release is pinned to revision
 `d33ce31c0605fc571c374cdf0aa0f085ec50ff88`. Its `experts.bin` is
 80,518,053,888 bytes with SHA-256
 `c72fb8c0a66020439f4a78591ab9a79d8da3d38412635a531d604ffbf0d2e7d4`.
@@ -65,17 +73,111 @@ row is the promoted zero-island, cache-heavy execution geometry at its 4K
 product KV ceiling; its separate 16K performance A/B used a 74.75 GiB process
 ceiling and is not the installed product configuration.
 
+## Islands versus paged streaming
+
+An island keeps every routed expert for one transformer layer resident. A
+streamed layer keeps only a fixed number of expert records in slots and reads a
+missing record from the prepacked Hugging Face bank. The configured memory plan
+is fixed before model construction:
+
+| Configuration | Dense islands | Streamed layers | Fixed expert slots |
+|---|---:|---:|---:|
+| Hy3 `hy3-oq2e-64` | 0 | 79 | 49.9921875 GiB total cache |
+| Hy3 `hy3-oq2e-88` | 74 | 5 | 2 GiB total cache |
+| Hy3 `hy3-oq2e-96` | 79 | 0 | none required |
+| GLM t158 measured 96 GiB config | 0 | 75 | 72 GiB cap; 116 slots/layer |
+
+Here “streamed” or “paged” means checked record reads from `experts.bin` or
+`experts-q1-t158.bin` into bounded component-bank slots. It does **not** mean
+`mmap_island_layers`. That separate zero-copy mode requires a component-major
+`experts-banked-manifest.json`, which neither published Hugging Face repository
+ships. Do not set `mmap_island_layers` or `banked_manifest` for these downloads.
+
+Hy3's affine expert records support dense islands. The named profiles are the
+recommended way to select them. An advanced JSON overlay may set
+`island_layer_count`; MTPLX resolves the count through the admitted model's
+measured placement and validates the resulting memory plan before installing
+the route. For example, this makes four measured Hy3 layers resident while
+retaining the 64 GiB profile's other settings:
+
+```json
+{
+  "island_layer_count": 4
+}
+```
+
+```bash
+mtplx serve \
+  --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
+  --download \
+  --expert-profile hy3-oq2e-64 \
+  --expert-streaming-config hy3-four-islands.json
+```
+
+Custom geometry clears the named profile's promoted benchmark evidence and
+appears as `"customized": true` in `/health`. `island_layer_count` and an
+explicit `island_layers` list are mutually exclusive. Island layers must use
+`cache_scope: "layer"`, `slot_layout: "component-banks"`, and
+`trace_routes: false`; invalid combinations fail during construction.
+
+The published GLM-5.2 bank uses the t158 codec rather than affine expert
+records. The affine dense-island and mmap-island kernels cannot interpret that
+layout, so `island_layers`, `island_layer_count`, and `mmap_island_layers` are
+unsupported for this artifact and fail before loading. Configure its bounded
+streaming slots instead.
+
+This GLM configuration reproduces the measured 96 GiB memory plan: a 12 GiB
+runtime reserve, 72 GiB expert-cache cap, 48 transient slots, and 116 persistent
+slots per each of the 75 streamed layers.
+
+```json
+{
+  "model_key": "glm52-expert-q1t",
+  "memory_limit_bytes": "96GiB",
+  "max_live_kv_tokens": 4096,
+  "runtime_reserve_bytes": "12GiB",
+  "expert_cache_limit_bytes": "72GiB",
+  "transient_slots": 48,
+  "cache_policy": "frequency",
+  "cache_scope": "layer",
+  "slot_layout": "component-banks",
+  "max_read_chunk_bytes": "8MiB",
+  "bypass_page_cache": true,
+  "q2_expert_kernel": "stock",
+  "split_route_release": "deferred",
+  "prefetch_slots": 0,
+  "streamed_codec": "none",
+  "trace_routes": false
+}
+```
+
+```bash
+mtplx serve \
+  --model OpensourceWTF/GLM-5.2-t158-MTPLX-streaming \
+  --download \
+  --expert-streaming-config glm52-t158-96g.json
+```
+
+The 96 GiB value is a process ceiling, not the model's download size. The GLM
+repository is about 187 GiB on disk. Its t158 weights are lossy and have
+construction-time numeric evidence but no task-quality validation, so this is
+an experimental serving configuration rather than a quality recommendation.
+Changing the memory limit, reserve, cache cap, context budget, or workload
+creates a new unmeasured configuration; startup will still validate that its
+fixed footprint fits.
+
 ## Configuration precedence
 
-For a complete admitted Hy3 artifact, the normal serve command automatically
+For either complete admitted artifact, the normal serve command automatically
 enables streaming. Configuration is resolved once, before the runtime is
 constructed:
 
-1. `auto` selects the largest fitting promoted profile. A concrete
+1. For Hy3, `auto` selects the largest fitting promoted profile. A concrete
    `--expert-profile hy3-oq2e-64`, `hy3-oq2e-88`, or `hy3-oq2e-96` selects that
-   profile and still runs preflight.
+   profile and still runs preflight. GLM has no promoted profile, so `auto`
+   leaves its configuration to the JSON/default construction path.
 2. `--expert-streaming-config FILE.json` overlays that profile with one JSON
-   object.
+   object. For GLM it supplies the manual configuration directly.
 3. Individual expert flags, such as `--expert-cache-policy` or
    `--expert-max-live-kv-tokens`, override the corresponding JSON values.
 4. The completed immutable configuration is validated before the lane is

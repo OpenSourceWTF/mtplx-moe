@@ -150,18 +150,22 @@ heads. There are no silent fallbacks. Existing individual flags, flat config
 keys, and reviewed environment variables remain compatibility controls.
 
 MTPLX can also serve mixture-of-experts models larger than a selected memory
-envelope by streaming routed experts from SSD. The promoted 2.3.1rc1 profiles
-are specifically for `OpensourceWTF/Hy3-oQ2e-MTPLX-streaming`; this release
-does not promote GLM profiles or streamed MTP. The primary command above admits
-the artifact once, selects `hy3-oq2e-64`, `hy3-oq2e-88`, or `hy3-oq2e-96`, and
-constructs the AR route directly.
+envelope by streaming routed experts from prepacked Hugging Face banks. The
+promoted 2.3.1rc1 profiles are specifically for
+`OpensourceWTF/Hy3-oQ2e-MTPLX-streaming`; the published
+`OpensourceWTF/GLM-5.2-t158-MTPLX-streaming` artifact uses a manual,
+experimental paging configuration. This release does not promote GLM profiles
+or streamed MTP. The primary command above admits the artifact once, selects
+`hy3-oq2e-64`, `hy3-oq2e-88`, or `hy3-oq2e-96`, and constructs the AR route
+directly.
 
 The numbers in those names are weight envelopes, not required machine RAM.
 Their exact process ceilings, including the 7 GiB runtime reserve, are 71 GiB,
 95 GiB, and 103 GiB. `auto` chooses the largest promoted profile whose process
 ceiling fits both installed RAM and launch-time available memory. See the
 [SSD-streamed MoE guide](docs/advanced/ssd-streamed-moe.md) for explicit
-profiles, advanced override precedence, health evidence, and LiteLLM setup.
+Hy3 island profiles, the measured GLM t158 paging configuration, advanced
+override precedence, health evidence, and LiteLLM setup.
 
 Use `mtplx help advanced` for QA, profiling, support bundles, and kernel tools.
 See the [documentation index](docs/README.md).
