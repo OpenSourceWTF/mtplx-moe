@@ -242,14 +242,12 @@ def _complete_unindexed_weights(path: Path) -> bool:
 def _declares_streamed_experts(path: Path) -> bool:
     """Whether the runtime contract says this artifact streams its experts."""
 
-    from mtplx.expert_manifest import ExpertManifestError, _read_file_nofollow
+    from mtplx.expert_manifest import ExpertManifestError
 
-    contract_path = path / "mtplx_runtime.json"
-    if not contract_path.exists():
-        return False
     try:
-        payload = _read_file_nofollow(
-            contract_path,
+        payload = read_bounded_artifact_member(
+            path,
+            "mtplx_runtime.json",
             max_bytes=MAX_RUNTIME_CONTRACT_BYTES,
         )
         contract = json.loads(payload)

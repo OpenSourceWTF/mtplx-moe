@@ -415,6 +415,33 @@ def test_runtime_contract_symlink_is_not_followed(tmp_path: Path) -> None:
     assert status["ok"] is True
 
 
+def test_repository_local_hf_runtime_contract_symlink_declares_streaming(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "models--owner--repo" / "snapshots" / "revision"
+    root.mkdir(parents=True)
+    (root / "config.json").write_text("{}\n", encoding="utf-8")
+    (root / "model.safetensors").write_bytes(b"weights")
+    blob_root = root.parents[1] / "blobs"
+    blob_root.mkdir()
+    blob = blob_root / "runtime-contract-digest"
+    blob.write_text(
+        '{"expert_manifest_file":"expert-manifest.json"}',
+        encoding="utf-8",
+    )
+    (root / "mtplx_runtime.json").symlink_to(
+        Path("..") / ".." / "blobs" / blob.name
+    )
+
+    status = expert_artifact_status(root)
+
+    assert status["streamed_experts"] is True
+    assert status["manifest_present"] is False
+    assert status["ok"] is False
+    assert "manifest.json is missing" in status["reason"]
+    assert cached_model_is_complete(root) is False
+
+
 def test_runtime_contract_read_is_bounded(tmp_path: Path) -> None:
     model = tmp_path / "plain"
     model.mkdir()

@@ -393,6 +393,71 @@ def test_manifest_model_key_supports_repository_local_hf_blob_symlink(
     assert expert_cli._read_manifest_model_key(manifest_path) == "hy3-expert-oq2e"
 
 
+def test_default_manifest_rejects_external_model_root_symlink(
+    tmp_path: Path,
+) -> None:
+    root = _streaming_root(
+        tmp_path,
+        model_type="hy_v3",
+        manifest_model_key="hy3-expert-oq2e",
+    )
+    manifest_path = root / "expert-manifest.json"
+    outside = tmp_path / "external-manifest.json"
+    manifest_path.replace(outside)
+    manifest_path.symlink_to(outside)
+    args = _parser().parse_args(
+        [
+            "--expert-streaming",
+            "--expert-memory-limit",
+            "96GiB",
+            "--expert-max-live-kv-tokens",
+            "8192",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="escapes root"):
+        expert_streaming_load_kwargs(args, root)
+
+
+def test_default_manifest_accepts_repository_local_hf_blob_symlink(
+    tmp_path: Path,
+) -> None:
+    root = (
+        tmp_path
+        / "models--owner--streamed"
+        / "snapshots"
+        / "revision"
+    )
+    root.mkdir(parents=True)
+    (root / "config.json").write_text(
+        json.dumps({"model_type": "hy_v3"}),
+        encoding="utf-8",
+    )
+    blob_root = root.parents[1] / "blobs"
+    blob_root.mkdir()
+    blob = blob_root / "manifest-digest"
+    blob.write_text(
+        json.dumps({"model_key": "hy3-expert-oq2e"}),
+        encoding="utf-8",
+    )
+    manifest_path = root / "expert-manifest.json"
+    manifest_path.symlink_to(Path("..") / ".." / "blobs" / blob.name)
+    args = _parser().parse_args(
+        [
+            "--expert-streaming",
+            "--expert-memory-limit",
+            "96GiB",
+            "--expert-max-live-kv-tokens",
+            "8192",
+        ]
+    )
+
+    kwargs = expert_streaming_load_kwargs(args, root)
+
+    assert kwargs["expert_manifest"] == blob.resolve()
+    assert kwargs["expert_streaming_config"].model_key == "hy3-expert-oq2e"
+
+
 @pytest.mark.parametrize("oversized", [False, True])
 def test_manifest_model_key_rejects_unsafe_symlink_targets(
     tmp_path: Path,

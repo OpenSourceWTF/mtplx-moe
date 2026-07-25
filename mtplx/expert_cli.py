@@ -399,9 +399,17 @@ def expert_streaming_load_kwargs(
     if not expert_streaming_requested(args):
         return {}
     root = Path(model_path).resolve()
-    manifest = Path(
-        getattr(args, "expert_manifest", None) or root / "expert-manifest.json"
-    ).resolve()
+    explicit_manifest = getattr(args, "expert_manifest", None)
+    if explicit_manifest:
+        # An explicit manifest is a user-selected independent artifact path.
+        manifest = Path(explicit_manifest).resolve()
+    else:
+        # Preserve the model root as the trust boundary for the default. This
+        # accepts standard HF snapshot links into the repository-local blobs
+        # directory while rejecting every arbitrary external symlink.
+        from .expert_manifest import resolve_artifact_member
+
+        manifest = resolve_artifact_member(root, "expert-manifest.json")
     values = _load_config_object(getattr(args, "expert_streaming_config", None))
     overrides = {
         "model_key": getattr(args, "expert_model_key", None),
