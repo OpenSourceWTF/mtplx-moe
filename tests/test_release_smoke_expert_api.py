@@ -67,7 +67,7 @@ def test_run_step_malformed_base_url_cannot_break_error_redaction():
 
 
 def test_cli_malformed_base_url_fails_cleanly_without_secrets():
-    api_key = "sk-cli-malformed-secret"
+    api_key = "sk-cli-secret"
     base_url = "http://[invalid/v1"
 
     completed = subprocess.run(
