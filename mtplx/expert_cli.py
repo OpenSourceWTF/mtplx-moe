@@ -7,26 +7,12 @@ import dataclasses
 import json
 import re
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
-from .expert_admission import ensure_expert_admitted
-from .expert_profiles import (
-    ExpertServeProfile,
-    build_expert_streaming_config,
-    load_expert_profiles,
-    select_expert_profile,
-)
-from .expert_runtime import (
-    ExpertStreamingConfig,
-    parse_memory_bytes,
-    resolve_island_placement,
-)
-from .expert_streaming_models import (
-    ExpertMemoryPlan,
-    get_model_spec,
-    plan_expert_memory,
-)
-from .hardware import total_memory_gib
+if TYPE_CHECKING:
+    from .expert_profiles import ExpertServeProfile
+    from .expert_runtime import ExpertStreamingConfig
+    from .expert_streaming_models import ExpertMemoryPlan
 
 
 _BYTE_FIELDS = {
@@ -151,6 +137,34 @@ _EXPERT_STREAMING_POSITIVE_FLAGS = (
     "expert-verify-headers",
     "expert-verify-sidecar-at-open",
 )
+
+
+def ensure_expert_admitted(root: Path) -> dict[str, Any]:
+    """Load the heavy artifact verifier only for an enabled streaming route."""
+
+    from .expert_admission import ensure_expert_admitted as admit
+
+    return admit(root)
+
+
+def load_expert_profiles() -> dict[str, ExpertServeProfile]:
+    """Load profile/runtime modules only when profile resolution is requested."""
+
+    from .expert_profiles import load_expert_profiles as load
+
+    return load()
+
+
+def select_expert_profile(
+    requested: str,
+    *,
+    model_key: str,
+) -> ExpertServeProfile:
+    """Resolve a profile without loading runtime modules during parser setup."""
+
+    from .expert_profiles import select_expert_profile as select
+
+    return select(requested, model_key=model_key)
 
 
 def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
@@ -385,6 +399,8 @@ def _resolve_model_key(model_root: Path, manifest_path: Path) -> str:
 def _installed_ram_bytes() -> int:
     """Installed unified memory in bytes; ``0`` when it cannot be determined."""
 
+    from .hardware import total_memory_gib
+
     return int(total_memory_gib() * (1024**3))
 
 
@@ -438,6 +454,8 @@ def _derive_max_live_kv_tokens(
     :func:`plan_expert_memory` so it can never disagree with the plan that
     actually admits KV at serve time.
     """
+
+    from .expert_streaming_models import get_model_spec, plan_expert_memory
 
     spec = get_model_spec(str(values["model_key"]))
     memory_limit_bytes = int(values["memory_limit_bytes"])
@@ -512,6 +530,8 @@ def _load_config_object(path: str | None) -> dict[str, Any]:
 
 
 def _normalize_byte_fields(values: Mapping[str, Any]) -> dict[str, Any]:
+    from .expert_runtime import parse_memory_bytes
+
     normalized = dict(values)
     for field in _BYTE_FIELDS:
         value = normalized.get(field)
@@ -646,6 +666,8 @@ def _profile_customization(
     profile: ExpertServeProfile,
     config: ExpertStreamingConfig,
 ) -> tuple[tuple[str, ...], dict[str, Any]]:
+    from .expert_profiles import build_expert_streaming_config
+
     baseline = build_expert_streaming_config(profile)
     baseline_changes: dict[str, Any] = {
         "verify_record_hashes": False,
@@ -676,6 +698,9 @@ def expert_streaming_load_kwargs(
 
     if not expert_streaming_requested(args):
         return {}
+    from .expert_profiles import build_expert_streaming_config
+    from .expert_runtime import ExpertStreamingConfig, resolve_island_placement
+
     cli_flags = set(getattr(args, "_cli_flags", set()) or set())
     if (
         (

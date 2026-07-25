@@ -16,15 +16,9 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from mtplx.artifacts import _hf_repo_id_from_ref
-from mtplx.expert_admission import (
-    TrustedFileDigest,
-    admit_expert_artifact,
-    ensure_expert_admitted,
-    load_valid_admission_receipt,
-)
 from mtplx.models.laguna_config import (
     LAGUNA_S_2_1_REPO_ID,
     LAGUNA_S_2_1_REPO_BYTES,
@@ -33,6 +27,9 @@ from mtplx.models.laguna_config import (
     laguna_s_2_1_artifact_integrity_errors,
 )
 from mtplx.profiles import DEFAULT_PROFILE_NAME
+
+if TYPE_CHECKING:
+    from mtplx.expert_admission import TrustedFileDigest
 
 
 DEFAULT_MODEL_CACHE = Path("~/.mtplx/models").expanduser()
@@ -52,6 +49,12 @@ DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 EXPERT_MANIFEST_FILE = "expert-manifest.json"
 MAX_RUNTIME_CONTRACT_BYTES = 1024 * 1024
 SOURCE_MARKER_FILE = ".mtplx-source.json"
+
+
+def _new_trusted_file_digest(**kwargs: Any) -> TrustedFileDigest:
+    from mtplx.expert_admission import TrustedFileDigest
+
+    return TrustedFileDigest(**kwargs)
 
 
 def read_bounded_artifact_member(
@@ -409,6 +412,13 @@ def _complete_unindexed_weights(path: Path) -> bool:
 
 def _declares_streamed_experts(path: Path) -> bool:
     """Whether the runtime contract says this artifact streams its experts."""
+
+    contract_path = path / "mtplx_runtime.json"
+    try:
+        if not contract_path.is_file():
+            return False
+    except OSError:
+        return False
 
     from mtplx.expert_manifest import ExpertManifestError
 
@@ -962,7 +972,7 @@ def _trusted_file_digest(
     digest: Any,
 ) -> TrustedFileDigest:
     metadata = os.fstat(descriptor)
-    return TrustedFileDigest(
+    return _new_trusted_file_digest(
         sha256=digest.hexdigest(),
         st_dev=metadata.st_dev,
         st_ino=metadata.st_ino,
@@ -988,7 +998,7 @@ def _rehash_trusted_descriptor(
         raise RuntimeError(
             f"download file changed while hashing installed bytes: {display_path}"
         )
-    return TrustedFileDigest(
+    return _new_trusted_file_digest(
         sha256=digest.hexdigest(),
         st_dev=after.st_dev,
         st_ino=after.st_ino,
@@ -1027,7 +1037,7 @@ def _hash_existing_file(
         os.close(descriptor)
     if read_bytes != before.st_size or _file_identity(before) != _file_identity(after):
         raise RuntimeError(f"download file changed while hashing: {path}")
-    return TrustedFileDigest(
+    return _new_trusted_file_digest(
         sha256=digest.hexdigest(),
         st_dev=after.st_dev,
         st_ino=after.st_ino,
@@ -1794,6 +1804,12 @@ def _pull_model_unlocked(
     progress_callback: DownloadProgressCallback | None = None,
     progress_interval_s: float = 10.0,
 ) -> dict[str, Any]:
+    from mtplx.expert_admission import (
+        admit_expert_artifact,
+        ensure_expert_admitted,
+        load_valid_admission_receipt,
+    )
+
     repo_id = repo_id_from_model_ref(model_ref)
     if repo_id is None:
         raise ValueError(f"pull requires a Hugging Face repo id or URL, got: {model_ref}")

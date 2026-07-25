@@ -123,6 +123,37 @@ def test_cli_help_without_mlx(tmp_path: Path) -> None:
     assert "mtplx help advanced" in proc.stdout
 
 
+def test_doctor_without_any_site_packages(tmp_path: Path) -> None:
+    proc = _run_no_mlx(
+        tmp_path,
+        ["-S", "-m", "mtplx.cli", "doctor", "--json"],
+        block_modules=(),
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "Traceback" not in proc.stderr
+    assert "environment" in json.loads(proc.stdout)
+
+
+def test_inspect_without_any_site_packages(tmp_path: Path) -> None:
+    model = tmp_path / "non-mtp-model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        '{"model_type": "llama"}\n',
+        encoding="utf-8",
+    )
+
+    proc = _run_no_mlx(
+        tmp_path,
+        ["-S", "-m", "mtplx.cli", "inspect", str(model), "--json"],
+        block_modules=(),
+    )
+
+    assert proc.returncode == 2, proc.stderr
+    assert "Traceback" not in proc.stderr
+    assert json.loads(proc.stdout)["model_type"] == "llama"
+
+
 def test_doctor_json_reports_missing_mlx_without_traceback(tmp_path: Path) -> None:
     proc = _run_no_mlx(tmp_path, ["-m", "mtplx.cli", "doctor", "--json"])
 
