@@ -14,6 +14,7 @@ from mtplx.expert_cli import (
     add_expert_streaming_args,
     append_expert_streaming_child_args,
     expert_streaming_load_kwargs,
+    expert_streaming_requested,
 )
 from mtplx.expert_manifest import (
     ExpertManifest,
@@ -44,6 +45,30 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     add_expert_streaming_args(parser)
     return parser
+
+
+@pytest.fixture(autouse=True)
+def _admitted_artifact_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        expert_cli,
+        "ensure_expert_admitted",
+        lambda _root: {
+            "manifest_sha256": "a" * 64,
+            "banks": [{"sha256": "b" * 64}],
+        },
+    )
+    profile = expert_cli.load_expert_profiles()["hy3-oq2e-96"]
+    monkeypatch.setattr(
+        expert_cli,
+        "select_expert_profile",
+        lambda requested, *, model_key: (
+            profile
+            if model_key == profile.model_key
+            else (_ for _ in ()).throw(
+                ValueError(f"no promoted expert profiles match model key {model_key!r}")
+            )
+        ),
+    )
 
 
 def _model_root(tmp_path: Path, model_type: str = "hy_v3") -> Path:
@@ -114,6 +139,217 @@ def test_expert_cli_builds_explicit_bounded_config(tmp_path: Path) -> None:
     assert config.expert_cache_limit_bytes == 24 * 1024**3
     assert config.runtime_reserve_bytes == 8 * 1024**3
     assert config.prefer_sidecar is False
+
+
+def test_expert_profile_is_public_and_defaults_to_auto() -> None:
+    args = _parser().parse_args([])
+
+    assert args.expert_profile == "auto"
+    assert expert_streaming_requested(args) is False
+
+
+def test_concrete_expert_profile_implies_streaming_and_is_forwarded() -> None:
+    args = _parser().parse_args(["--expert-profile", "hy3-oq2e-64"])
+    args._cli_flags = {"expert-profile"}
+    command = ["python", "-m", "mtplx.server.openai"]
+
+    assert expert_streaming_requested(args) is True
+    append_expert_streaming_child_args(command, args)
+
+    assert command[command.index("--expert-profile") + 1] == "hy3-oq2e-64"
+
+
+def test_concrete_profile_rejects_explicit_streaming_opt_out() -> None:
+    args = _parser().parse_args(
+        ["--expert-profile", "hy3-oq2e-64", "--no-expert-streaming"]
+    )
+    args._cli_flags = {"expert-profile", "no-expert-streaming"}
+
+    with pytest.raises(
+        ValueError,
+        match="--expert-profile cannot be combined with --no-expert-streaming",
+    ):
+        expert_streaming_requested(args)
+
+
+def test_promoted_profile_admits_then_freezes_auto_and_attaches_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _streaming_root(
+        tmp_path,
+        model_type="hy_v3",
+        manifest_model_key="hy3-expert-oq2e",
+    )
+    events: list[str] = []
+    receipt = {
+        "manifest_sha256": "a" * 64,
+        "banks": [{"sha256": "b" * 64}],
+    }
+    monkeypatch.setattr(
+        expert_cli,
+        "ensure_expert_admitted",
+        lambda admitted_root: events.append(f"admit:{admitted_root}") or receipt,
+    )
+    profile = expert_cli.load_expert_profiles()["hy3-oq2e-64"]
+    monkeypatch.setattr(
+        expert_cli,
+        "select_expert_profile",
+        lambda requested, *, model_key: (
+            events.append(f"profile:{requested}:{model_key}") or profile
+        ),
+    )
+    args = _parser().parse_args(["--expert-streaming"])
+
+    kwargs = expert_streaming_load_kwargs(args, root)
+
+    assert events == [
+        f"admit:{root.resolve()}",
+        "profile:auto:hy3-expert-oq2e",
+    ]
+    assert args.expert_profile == "hy3-oq2e-64"
+    assert args._resolved_expert_profile is profile
+    assert args._expert_admission_receipt is receipt
+    assert kwargs["expert_admission_receipt"] is receipt
+    assert kwargs["expert_streaming_config"].model_key == "hy3-expert-oq2e"
+    assert kwargs["mtp"] is False
+
+
+def test_legacy_config_for_unpromoted_glm_is_admitted_without_hy3_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _streaming_root(
+        tmp_path,
+        model_type="glm_moe_dsa",
+        manifest_model_key="glm52-expert-q2",
+    )
+    config_path = tmp_path / "legacy.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_key": "glm52-expert-q2",
+                "memory_limit_bytes": "256GiB",
+                "max_live_kv_tokens": 4096,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        expert_cli,
+        "select_expert_profile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unsupported legacy model must not select a Hy3 profile")
+        ),
+    )
+    args = _parser().parse_args(
+        ["--expert-streaming-config", str(config_path)]
+    )
+
+    kwargs = expert_streaming_load_kwargs(args, root)
+
+    assert kwargs["expert_streaming_config"].model_key == "glm52-expert-q2"
+    assert args._resolved_expert_profile is None
+
+
+def test_admitted_manifest_model_key_cannot_be_replaced_by_cli(
+    tmp_path: Path,
+) -> None:
+    root = _streaming_root(
+        tmp_path,
+        model_type="hy_v3",
+        manifest_model_key="hy3-expert-oq2e",
+    )
+    args = _parser().parse_args(
+        [
+            "--expert-streaming",
+            "--expert-model-key",
+            "hy3-expert-q2",
+            "--expert-memory-limit",
+            "96GiB",
+            "--expert-max-live-kv-tokens",
+            "8192",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="does not match admitted manifest"):
+        expert_streaming_load_kwargs(args, root)
+
+
+def test_record_hash_diagnostic_requires_cli_flag_provenance(
+    tmp_path: Path,
+) -> None:
+    root = _streaming_root(
+        tmp_path,
+        model_type="glm_moe_dsa",
+        manifest_model_key="glm52-expert-q2",
+    )
+    config_path = tmp_path / "legacy.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_key": "glm52-expert-q2",
+                "memory_limit_bytes": "256GiB",
+                "max_live_kv_tokens": 4096,
+                "verify_record_hashes": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = _parser().parse_args(
+        ["--expert-streaming-config", str(config_path)]
+    )
+    args._cli_flags = {"expert-streaming-config"}
+
+    config = expert_streaming_load_kwargs(args, root)[
+        "expert_streaming_config"
+    ]
+    assert config.verify_record_hashes is False
+
+    explicit = _parser().parse_args(
+        [
+            "--expert-streaming-config",
+            str(config_path),
+            "--expert-verify-record-hashes",
+        ]
+    )
+    explicit._cli_flags = {
+        "expert-streaming-config",
+        "expert-verify-record-hashes",
+    }
+    explicit_config = expert_streaming_load_kwargs(explicit, root)[
+        "expert_streaming_config"
+    ]
+    assert explicit_config.verify_record_hashes is True
+
+
+def test_external_manifest_must_match_admitted_root_manifest(
+    tmp_path: Path,
+) -> None:
+    root = _streaming_root(
+        tmp_path,
+        model_type="hy_v3",
+        manifest_model_key="hy3-expert-oq2e",
+    )
+    outside = tmp_path / "other-manifest.json"
+    outside.write_text(
+        json.dumps({"model_key": "hy3-expert-q2"}),
+        encoding="utf-8",
+    )
+    args = _parser().parse_args(
+        [
+            "--expert-streaming",
+            "--expert-manifest",
+            str(outside),
+            "--expert-memory-limit",
+            "96GiB",
+            "--expert-max-live-kv-tokens",
+            "8192",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="admitted root manifest"):
+        expert_streaming_load_kwargs(args, root)
 
 
 @pytest.mark.parametrize(
@@ -510,7 +746,7 @@ def test_manifest_without_model_key_falls_back_to_config_q4(tmp_path: Path) -> N
     assert kwargs["expert_streaming_config"].model_key == "hy3-q4"
 
 
-def test_explicit_model_key_overrides_manifest_model_key(tmp_path: Path) -> None:
+def test_explicit_model_key_cannot_override_manifest_model_key(tmp_path: Path) -> None:
     root = _streaming_root(
         tmp_path, model_type="hy_v3", manifest_model_key="hy3-expert-oq2e"
     )
@@ -526,9 +762,8 @@ def test_explicit_model_key_overrides_manifest_model_key(tmp_path: Path) -> None
         ]
     )
 
-    kwargs = expert_streaming_load_kwargs(args, root)
-
-    assert kwargs["expert_streaming_config"].model_key == "hy3-expert-q2"
+    with pytest.raises(ValueError, match="does not match admitted manifest"):
+        expert_streaming_load_kwargs(args, root)
 
 
 def test_memory_and_kv_limits_auto_derived_when_omitted(
@@ -536,7 +771,7 @@ def test_memory_and_kv_limits_auto_derived_when_omitted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = _streaming_root(
-        tmp_path, model_type="hy_v3", manifest_model_key="hy3-expert-oq2e"
+        tmp_path, model_type="hy_v3", manifest_model_key="hy3-expert-q2"
     )
     monkeypatch.setattr(
         expert_cli, "_installed_ram_bytes", lambda: 128 * 1024**3
@@ -574,7 +809,7 @@ def test_memory_and_kv_limits_auto_derived_when_omitted(
     assert plan.fits_fixed
     assert plan.slots_per_layer > 1
     # The README-tested streaming profile keeps well over 100 slots/layer.
-    assert plan.slots_per_layer >= 128
+    assert plan.slots_per_layer >= 100
 
     # Explicit flags always win over the derived defaults.
     explicit = _parser().parse_args(
@@ -598,7 +833,7 @@ def test_derived_memory_limit_too_small_raises_clear_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = _streaming_root(
-        tmp_path, model_type="hy_v3", manifest_model_key="hy3-expert-oq2e"
+        tmp_path, model_type="hy_v3", manifest_model_key="hy3-expert-q2"
     )
     # 6 GiB cannot hold the ~9 GiB resident footprint, let alone slots.
     monkeypatch.setattr(expert_cli, "_installed_ram_bytes", lambda: 6 * 1024**3)

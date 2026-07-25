@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import re
 from pathlib import Path
 from typing import Any, Mapping
 
+from .expert_admission import ensure_expert_admitted
+from .expert_profiles import (
+    ExpertServeProfile,
+    build_expert_streaming_config,
+    load_expert_profiles,
+    select_expert_profile,
+)
 from .expert_runtime import (
     ExpertStreamingConfig,
     parse_memory_bytes,
@@ -65,10 +73,22 @@ _CONTEXT_WINDOW_CONFIG_KEYS = (
 # Users who need more context can pass --expert-max-live-kv-tokens explicitly
 # (which reserves more KV and yields slower decode).
 _DEFAULT_KV_TOKENS = 32768
+EXPERT_PROFILE_CHOICES = (
+    "auto",
+    "hy3-oq2e-64",
+    "hy3-oq2e-88",
+    "hy3-oq2e-96",
+)
 
 
 def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group("SSD expert streaming")
+    group.add_argument(
+        "--expert-profile",
+        choices=EXPERT_PROFILE_CHOICES,
+        default="auto",
+        help="Promoted SSD expert memory profile (default: auto).",
+    )
     group.add_argument(
         "--expert-streaming",
         action=argparse.BooleanOptionalAction,
@@ -175,10 +195,17 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
 
 
 def expert_streaming_requested(args: Any) -> bool:
+    profile = str(getattr(args, "expert_profile", "auto") or "auto")
+    cli_flags = set(getattr(args, "_cli_flags", set()) or set())
+    if profile != "auto" and "no-expert-streaming" in cli_flags:
+        raise ValueError(
+            "--expert-profile cannot be combined with --no-expert-streaming"
+        )
     return bool(
         getattr(args, "expert_streaming", False)
         or getattr(args, "expert_streaming_config", None)
         or getattr(args, "expert_manifest", None)
+        or profile != "auto"
     )
 
 
@@ -390,27 +417,36 @@ def _normalize_byte_fields(values: Mapping[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def expert_streaming_load_kwargs(
-    args: Any,
-    model_path: Path | str,
-) -> dict[str, Any]:
-    """Build validated ``runtime.load`` kwargs or return an empty mapping."""
+def _authoritative_manifest_path(root: Path) -> Path:
+    from .expert_manifest import resolve_artifact_member
 
-    if not expert_streaming_requested(args):
-        return {}
-    root = Path(model_path).resolve()
-    explicit_manifest = getattr(args, "expert_manifest", None)
-    if explicit_manifest:
-        # An explicit manifest is a user-selected independent artifact path.
-        manifest = Path(explicit_manifest).resolve()
-    else:
-        # Preserve the model root as the trust boundary for the default. This
-        # accepts standard HF snapshot links into the repository-local blobs
-        # directory while rejecting every arbitrary external symlink.
-        from .expert_manifest import resolve_artifact_member
+    return resolve_artifact_member(root, "expert-manifest.json")
 
-        manifest = resolve_artifact_member(root, "expert-manifest.json")
-    values = _load_config_object(getattr(args, "expert_streaming_config", None))
+
+def _validate_explicit_manifest(
+    root_manifest: Path,
+    explicit_manifest: Path,
+) -> None:
+    from .expert_manifest import load_expert_manifest
+
+    if explicit_manifest == root_manifest:
+        return
+    try:
+        root_digest = load_expert_manifest(root_manifest).manifest_sha256
+        explicit_digest = load_expert_manifest(explicit_manifest).manifest_sha256
+    except Exception as exc:
+        raise ValueError(
+            "--expert-manifest must be exactly or digest-equivalent to the "
+            "admitted root manifest"
+        ) from exc
+    if not root_digest or explicit_digest != root_digest:
+        raise ValueError(
+            "--expert-manifest must be exactly or digest-equivalent to the "
+            "admitted root manifest"
+        )
+
+
+def _explicit_overrides(args: Any) -> dict[str, Any]:
     overrides = {
         "model_key": getattr(args, "expert_model_key", None),
         "memory_limit_bytes": getattr(args, "expert_memory_limit", None),
@@ -421,7 +457,9 @@ def expert_streaming_load_kwargs(
         "cache_scope": getattr(args, "expert_cache_scope", None),
         "transient_slots": getattr(args, "expert_transient_slots", None),
         "io_staging_bytes": getattr(args, "expert_io_staging", None),
-        "execution_workspace_bytes": getattr(args, "expert_execution_workspace", None),
+        "execution_workspace_bytes": getattr(
+            args, "expert_execution_workspace", None
+        ),
         "max_inflight_io_bytes": getattr(args, "expert_max_inflight_io", None),
         "max_open_files": getattr(args, "expert_max_open_files", None),
         "max_read_chunk_bytes": getattr(args, "expert_read_chunk", None),
@@ -435,39 +473,147 @@ def expert_streaming_load_kwargs(
             args, "expert_verify_sidecar_at_open", None
         ),
     }
-    values.update({key: value for key, value in overrides.items() if value is not None})
-    # Manifest-authoritative model key: an explicit --expert-model-key (or a
-    # streaming-config model_key) always wins; otherwise the manifest's declared
-    # spec key resolves oQ2e/t158 correctly, falling back to the config.json
-    # model_type map (safe production q4) only when no manifest key is present.
-    if "model_key" not in values:
-        values["model_key"] = _resolve_model_key(root, manifest)
-    values.setdefault("runtime_reserve_bytes", 16 * 1024**3)
-    values.setdefault("io_staging_bytes", 0)
-    values.setdefault("execution_workspace_bytes", 0)
-    values = _normalize_byte_fields(values)
-    # The two mandatory admission limits are optional: derive safe defaults from
-    # installed RAM (memory limit) and the authoritative memory plan (KV tokens)
-    # when omitted. Explicit flags, normalized above, are left untouched.
-    if "memory_limit_bytes" not in values:
-        values["memory_limit_bytes"] = _derive_memory_limit_bytes()
-    if "max_live_kv_tokens" not in values:
-        values["max_live_kv_tokens"] = _derive_max_live_kv_tokens(values, root)
-    try:
-        config = ExpertStreamingConfig(**values)
-    except TypeError as exc:
-        raise ValueError(f"invalid expert streaming config: {exc}") from exc
-    # A pending island_layer_count (spec without a measured pin order)
-    # resolves here, where the config first meets the model root, so every
-    # downstream memory_plan prices the islands. Precedence: explicit
-    # island_layers > spec.island_pin_order > island-placement.json > error.
-    config = resolve_island_placement(config, root)
+    return {key: value for key, value in overrides.items() if value is not None}
+
+
+def _profile_for_model_key(
+    args: Any,
+    *,
+    model_key: str,
+) -> ExpertServeProfile | None:
+    requested = str(getattr(args, "expert_profile", "auto") or "auto")
+    promoted_model_keys = {
+        profile.model_key for profile in load_expert_profiles().values()
+    }
+    if requested == "auto" and model_key not in promoted_model_keys:
+        return None
+    return select_expert_profile(requested, model_key=model_key)
+
+
+def resolve_expert_profile_for_args(
+    args: Any,
+    model_path: Path | str,
+    *,
+    model_key: str | None = None,
+) -> ExpertServeProfile:
+    root = Path(model_path).resolve()
+    resolved_model_key = model_key
+    if resolved_model_key is None:
+        resolved_model_key = _resolve_model_key(
+            root, _authoritative_manifest_path(root)
+        )
+    return select_expert_profile(
+        str(getattr(args, "expert_profile", "auto") or "auto"),
+        model_key=resolved_model_key,
+    )
+
+
+def apply_expert_profile_child_env(
+    args: Any,
+    environ: dict[str, str],
+) -> None:
+    profile = getattr(args, "_resolved_expert_profile", None)
+    if profile is not None:
+        environ.update(dict(profile.child_env))
+
+
+def _apply_diagnostic_hash_policy(
+    args: Any,
+    config: ExpertStreamingConfig,
+) -> ExpertStreamingConfig:
+    cli_flags = set(getattr(args, "_cli_flags", set()) or set())
+    record_hashes = (
+        "expert-verify-record-hashes" in cli_flags
+        and getattr(args, "expert_verify_record_hashes", None) is True
+    )
+    sidecar_hash = (
+        "expert-verify-sidecar-at-open" in cli_flags
+        and getattr(args, "expert_verify_sidecar_at_open", None) is True
+    )
+    changes: dict[str, Any] = {
+        "verify_record_hashes": record_hashes,
+        "verify_sidecar_hash_at_open": sidecar_hash,
+    }
+    if config.island_layers:
+        changes["island_layer_count"] = None
+    return dataclasses.replace(config, **changes)
+
+
+def expert_streaming_load_kwargs(
+    args: Any,
+    model_path: Path | str,
+) -> dict[str, Any]:
+    """Build validated ``runtime.load`` kwargs or return an empty mapping."""
+
+    if not expert_streaming_requested(args):
+        return {}
+    cli_flags = set(getattr(args, "_cli_flags", set()) or set())
+    if (
+        (
+            "generation-mode" in cli_flags
+            and str(getattr(args, "generation_mode", "") or "").strip().lower()
+            == "mtp"
+        )
+        or "mtp" in cli_flags
+    ):
+        raise ValueError(
+            "promoted streamed profiles are AR-only in MTPLX 2.3.1rc1"
+        )
+    root = Path(model_path).resolve()
+    receipt = ensure_expert_admitted(root)
+    manifest = _authoritative_manifest_path(root)
+    explicit_manifest = getattr(args, "expert_manifest", None)
+    if explicit_manifest:
+        _validate_explicit_manifest(
+            manifest,
+            Path(explicit_manifest).expanduser().resolve(),
+        )
+    model_key = _resolve_model_key(root, manifest)
+    values = _load_config_object(getattr(args, "expert_streaming_config", None))
+    overrides = _explicit_overrides(args)
+    configured_model_key = overrides.pop(
+        "model_key", values.pop("model_key", None)
+    )
+    if configured_model_key is not None and configured_model_key != model_key:
+        raise ValueError(
+            f"expert model key {configured_model_key!r} does not match "
+            f"admitted manifest model key {model_key!r}"
+        )
+    profile = _profile_for_model_key(args, model_key=model_key)
+    if profile is not None:
+        profile_overrides = dict(values)
+        profile_overrides.update(overrides)
+        config = build_expert_streaming_config(
+            profile,
+            overrides=profile_overrides,
+        )
+        setattr(args, "expert_profile", profile.name)
+    else:
+        values["model_key"] = model_key
+        values.update(overrides)
+        values.setdefault("runtime_reserve_bytes", 16 * 1024**3)
+        values.setdefault("io_staging_bytes", 0)
+        values.setdefault("execution_workspace_bytes", 0)
+        values = _normalize_byte_fields(values)
+        if "memory_limit_bytes" not in values:
+            values["memory_limit_bytes"] = _derive_memory_limit_bytes()
+        if "max_live_kv_tokens" not in values:
+            values["max_live_kv_tokens"] = _derive_max_live_kv_tokens(values, root)
+        try:
+            config = ExpertStreamingConfig(**values)
+        except TypeError as exc:
+            raise ValueError(f"invalid expert streaming config: {exc}") from exc
+        config = resolve_island_placement(config, root)
+    config = _apply_diagnostic_hash_policy(args, config)
     if not manifest.is_file():
         raise ValueError(f"expert manifest does not exist: {manifest}")
+    setattr(args, "_resolved_expert_profile", profile)
+    setattr(args, "_expert_admission_receipt", receipt)
     return {
         "mtp": False,
         "expert_streaming_config": config,
         "expert_manifest": manifest,
+        "expert_admission_receipt": receipt,
     }
 
 
@@ -478,6 +624,7 @@ def append_expert_streaming_child_args(command: list[str], args: Any) -> None:
         return
     command.append("--expert-streaming")
     mappings = (
+        ("expert_profile", "--expert-profile"),
         ("expert_streaming_config", "--expert-streaming-config"),
         ("expert_manifest", "--expert-manifest"),
         ("expert_model_key", "--expert-model-key"),
@@ -498,7 +645,9 @@ def append_expert_streaming_child_args(command: list[str], args: Any) -> None:
     )
     for attribute, flag in mappings:
         value = getattr(args, attribute, None)
-        if value is not None:
+        if value is not None and not (
+            attribute == "expert_profile" and value == "auto"
+        ):
             if attribute in {"expert_streaming_config", "expert_manifest"}:
                 value = Path(value).expanduser().resolve()
             command.extend([flag, str(value)])

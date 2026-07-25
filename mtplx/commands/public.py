@@ -672,6 +672,19 @@ def _generation_mode_from_args(args: Any) -> str:
     )
 
 
+def _streamed_generation_mode_error(args: Any) -> str | None:
+    cli_flags = set(getattr(args, "_cli_flags", set()) or set())
+    explicit_generation_mode = str(
+        getattr(args, "generation_mode", "") or ""
+    ).strip().lower()
+    if (
+        ("generation-mode" in cli_flags and explicit_generation_mode == "mtp")
+        or "mtp" in cli_flags
+    ):
+        return "promoted streamed profiles are AR-only in MTPLX 2.3.1rc1"
+    return None
+
+
 def _runtime_kv_admission(runtime: Any, tokens: int):
     admit = getattr(runtime, "admit_kv_tokens", None)
     return admit(tokens) if callable(admit) else nullcontext()
@@ -8017,7 +8030,11 @@ def _maybe_rewrite_streaming_model_ref(args: Any) -> str | None:
 def cmd_serve_public(args: Any) -> int:
     from mtplx.expert_cli import expert_streaming_requested
 
-    streaming_requested = expert_streaming_requested(args)
+    try:
+        streaming_requested = expert_streaming_requested(args)
+    except ValueError as exc:
+        _print_serve_start_line(f"error: {exc}")
+        return 2
     dry_run = bool(getattr(args, "dry_run", False))
     quiet_json = dry_run and bool(getattr(args, "json", False))
     runtime_options_error = _resolve_runtime_options_on_args(
@@ -8090,10 +8107,6 @@ def cmd_serve_public(args: Any) -> int:
     depth_error = _validate_public_depth(args, printer=_print_serve_start_line)
     if depth_error is not None:
         return depth_error
-    if streaming_requested:
-        args.no_mtp = True
-        args.load_mtp = False
-        args.generation_mode = GENERATION_MODE_AR
     generation_mode = _generation_mode_from_args(args)
     fan_mode = _fan_mode_from_args(args)
     if generation_mode == GENERATION_MODE_MTP and getattr(args, "load_mtp", True) is False:
@@ -8339,8 +8352,23 @@ def cmd_serve_public(args: Any) -> int:
     # AR forcing (the top-of-function pass only saw explicit flags) so the gate
     # bypass below and the launch's generation mode both reflect the flip.
     _maybe_enable_expert_streaming(args, runtime_model)
-    streaming_requested = expert_streaming_requested(args)
+    try:
+        streaming_requested = expert_streaming_requested(args)
+    except ValueError as exc:
+        _print_serve_start_line(f"error: {exc}")
+        return 2
     if streaming_requested:
+        generation_error = _streamed_generation_mode_error(args)
+        if generation_error is not None:
+            _print_serve_start_line(f"error: {generation_error}")
+            return 2
+        from mtplx.expert_cli import expert_streaming_load_kwargs
+
+        try:
+            expert_streaming_load_kwargs(args, runtime_model)
+        except (OSError, RuntimeError, ValueError) as exc:
+            _print_serve_start_line(f"error: {exc}")
+            return 2
         args.no_mtp = True
         args.load_mtp = False
         args.generation_mode = GENERATION_MODE_AR
@@ -8620,6 +8648,9 @@ def cmd_serve_public(args: Any) -> int:
         child_env_base["MTPLX_FAN_MODE"] = fan_mode
     if fan_mode == FAN_MODE_MAX:
         child_env_base["MTPLX_MAX_REQUESTED"] = "1"
+    from mtplx.expert_cli import apply_expert_profile_child_env
+
+    apply_expert_profile_child_env(args, child_env_base)
     if dry_run:
         payload = _serve_dry_run_payload(
             args,
@@ -8985,7 +9016,22 @@ def _generate_one_shot_public(
     # Auto-enable AR streaming for a resident baked streaming layout (the AR
     # forcing / gate bypass below already handle it once streaming is on).
     _maybe_enable_expert_streaming(args, runtime_model)
-    streaming_requested = expert_streaming_requested(args)
+    try:
+        streaming_requested = expert_streaming_requested(args)
+    except ValueError as exc:
+        return 2, {"error": str(exc)}, []
+    if streaming_requested:
+        generation_error = _streamed_generation_mode_error(args)
+        if generation_error is not None:
+            return 2, {"error": generation_error}, []
+        from mtplx.expert_cli import expert_streaming_load_kwargs
+
+        try:
+            load_kwargs = expert_streaming_load_kwargs(args, runtime_model)
+        except (OSError, RuntimeError, ValueError) as exc:
+            return 2, {"error": str(exc)}, []
+    else:
+        load_kwargs = {}
     inspection, gate_exit = _model_gate(
         runtime_model,
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
@@ -9005,6 +9051,9 @@ def _generate_one_shot_public(
         args.generation_mode = GENERATION_MODE_AR
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     apply_profile_env(profile.name)
+    from mtplx.expert_cli import apply_expert_profile_child_env
+
+    apply_expert_profile_child_env(args, os.environ)
     generation_mode = _generation_mode_from_args(args)
     draft_lm_head = (
         _model_draft_lm_head_spec(inspection, profile)
@@ -9042,12 +9091,13 @@ def _generate_one_shot_public(
     from mtplx.generation import generate_ar, generate_mtpk
     from mtplx.runtime import load
     from mtplx.sampling import SamplerConfig
+    if getattr(args, "_resolved_expert_profile", None) is not None:
+        from mtplx.generation import install_generation_feature_policy
+
+        install_generation_feature_policy(dict(os.environ))
 
     rt = None
     try:
-        from mtplx.expert_cli import expert_streaming_load_kwargs
-
-        load_kwargs = expert_streaming_load_kwargs(args, runtime_model)
         rt = load(runtime_model, **(load_kwargs or {"mtp": True}))
         draft_report = None
         if (

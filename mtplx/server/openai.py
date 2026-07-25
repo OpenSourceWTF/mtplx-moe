@@ -1521,6 +1521,60 @@ def _apply_metal_memory_caps(
     return applied
 
 
+def _health_string(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def expert_profile_health_payload(
+    profile: Any | None,
+    *,
+    backend: str | None = None,
+) -> dict[str, Any] | None:
+    if profile is None:
+        return None
+    return {
+        "name": _health_string(getattr(profile, "name", None)),
+        "model_key": _health_string(getattr(profile, "model_key", None)),
+        "evidence_commit": _health_string(
+            getattr(profile, "evidence_commit", None)
+        ),
+        "backend": _health_string(backend),
+        "generation_mode": _health_string(
+            getattr(profile, "generation_mode", None)
+        ),
+    }
+
+
+def expert_admission_health_payload(
+    receipt: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(receipt, Mapping):
+        return None
+    banks = receipt.get("banks")
+    first_bank = (
+        banks[0]
+        if isinstance(banks, list)
+        and banks
+        and isinstance(banks[0], Mapping)
+        else None
+    )
+    return {
+        "revision": _health_string(receipt.get("revision")),
+        "manifest_sha256": _health_string(receipt.get("manifest_sha256")),
+        "bank_sha256": (
+            _health_string(first_bank.get("sha256"))
+            if first_bank is not None
+            else None
+        ),
+    }
+
+
+def _expert_runtime_io_backend(runtime: Any) -> str | None:
+    expert_runtime = getattr(runtime, "expert_streaming", None)
+    reader = getattr(expert_runtime, "reader", None)
+    return _health_string(getattr(reader, "backend", None))
+
+
 class ServerState:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -1616,6 +1670,9 @@ class ServerState:
                         + json.dumps(bad_profile_env, sort_keys=True)
                     )
             self.fast_path_env_status = _fast_path_env_status()
+        from mtplx.expert_cli import apply_expert_profile_child_env
+
+        apply_expert_profile_child_env(args, os.environ)
         self.generation_feature_policy = install_generation_feature_policy(
             dict(os.environ)
         )
@@ -19599,6 +19656,17 @@ def create_app(state: ServerState) -> FastAPI:
     @app.get("/health")
     def health() -> dict[str, Any]:
         runtime = getattr(state, "runtime", None)
+        resolved_expert_profile = getattr(
+            state.args, "_resolved_expert_profile", None
+        )
+        expert_admission_receipt = getattr(
+            state.args, "_expert_admission_receipt", None
+        )
+        streaming_active = bool(
+            resolved_expert_profile is not None
+            or getattr(runtime, "expert_streaming", None) is not None
+            or getattr(state, "expert_streaming_load_kwargs", None)
+        )
         if hasattr(state, "foreground_count"):
             foreground_active = int(state.foreground_count())
         else:
@@ -19667,7 +19735,9 @@ def create_app(state: ServerState) -> FastAPI:
                 fan_mode=fan_mode,
                 smart_status=smart_status,
             ),
-            "available_generation_modes": ["mtp", "ar"],
+            "available_generation_modes": (
+                ["ar"] if streaming_active else ["mtp", "ar"]
+            ),
             "load_mtp": bool(state.args.load_mtp),
             "mtp_enabled": bool(
                 getattr(runtime, "mtp_enabled", False)
@@ -19703,6 +19773,13 @@ def create_app(state: ServerState) -> FastAPI:
                 if runtime is not None
                 and getattr(runtime, "expert_streaming", None) is not None
                 else None
+            ),
+            "expert_profile": expert_profile_health_payload(
+                resolved_expert_profile,
+                backend=_expert_runtime_io_backend(runtime),
+            ),
+            "expert_admission": expert_admission_health_payload(
+                expert_admission_receipt
             ),
             "rate_limit_per_minute": int(state.args.rate_limit),
             "stream_interval": int(state.args.stream_interval),

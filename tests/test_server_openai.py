@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import time
 from threading import Event, Lock, Thread
 from types import SimpleNamespace
@@ -1707,6 +1708,110 @@ def test_openai_server_health_profile_sampler_reports_active_override():
         "top_p": 0.95,
         "top_k": 20,
     }
+
+
+def test_expert_health_serializers_whitelist_and_reject_malformed_banks():
+    profile = SimpleNamespace(
+        name="hy3-oq2e-64",
+        model_key="hy3-expert-oq2e",
+        evidence_commit="14c8b57fff358bee3da2d10968a855b955b86847",
+        generation_mode="ar",
+        config={"io_backend": "profile-placeholder"},
+        child_env={"SECRET_PATH": "/private/model"},
+    )
+    receipt = {
+        "revision": "d" * 40,
+        "manifest_sha256": "a" * 64,
+        "banks": [
+            {
+                "sha256": "b" * 64,
+                "file": "/private/experts.bin",
+                "st_dev": 1,
+                "st_ino": 2,
+                "st_mtime_ns": 3,
+            }
+        ],
+        "artifact_root": "/private/model",
+        "receipt_path": "/private/receipt.json",
+    }
+
+    assert openai.expert_profile_health_payload(
+        profile, backend="native"
+    ) == {
+        "name": "hy3-oq2e-64",
+        "model_key": "hy3-expert-oq2e",
+        "evidence_commit": "14c8b57fff358bee3da2d10968a855b955b86847",
+        "backend": "native",
+        "generation_mode": "ar",
+    }
+    assert openai.expert_admission_health_payload(receipt) == {
+        "revision": "d" * 40,
+        "manifest_sha256": "a" * 64,
+        "bank_sha256": "b" * 64,
+    }
+    assert openai.expert_admission_health_payload(
+        {**receipt, "banks": "not-a-list"}
+    ) == {
+        "revision": "d" * 40,
+        "manifest_sha256": "a" * 64,
+        "bank_sha256": None,
+    }
+    assert openai.expert_admission_health_payload(
+        {**receipt, "banks": ["not-a-bank"]}
+    )["bank_sha256"] is None
+
+
+def test_streaming_health_reports_actual_backend_and_ar_only_modes():
+    state = _fake_state()
+    state.args.generation_mode = "ar"
+    state.args.load_mtp = False
+    state.args._resolved_expert_profile = SimpleNamespace(
+        name="hy3-oq2e-64",
+        model_key="hy3-expert-oq2e",
+        evidence_commit="14c8b57fff358bee3da2d10968a855b955b86847",
+        generation_mode="ar",
+        config={},
+    )
+    state.args._expert_admission_receipt = {
+        "revision": "d" * 40,
+        "manifest_sha256": "a" * 64,
+        "banks": [{"sha256": "b" * 64}],
+    }
+    state.expert_streaming_load_kwargs = {"expert_streaming_config": object()}
+    state.runtime.expert_streaming = SimpleNamespace(
+        reader=SimpleNamespace(backend="preadv")
+    )
+    state.runtime.expert_streaming_snapshot = lambda: {"ok": True}
+    client = TestClient(create_app(state))
+
+    health = client.get("/health").json()
+
+    assert health["generation_mode"] == "ar"
+    assert health["available_generation_modes"] == ["ar"]
+    assert health["expert_profile"] == {
+        "name": "hy3-oq2e-64",
+        "model_key": "hy3-expert-oq2e",
+        "evidence_commit": "14c8b57fff358bee3da2d10968a855b955b86847",
+        "backend": "preadv",
+        "generation_mode": "ar",
+    }
+    assert health["expert_admission"] == {
+        "revision": "d" * 40,
+        "manifest_sha256": "a" * 64,
+        "bank_sha256": "b" * 64,
+    }
+    serialized = json.dumps(health)
+    assert "st_dev" not in serialized
+    assert "st_ino" not in serialized
+    assert "receipt_path" not in serialized
+
+
+def test_ordinary_health_keeps_both_generation_modes_and_no_expert_metadata():
+    health = TestClient(create_app(_fake_state())).get("/health").json()
+
+    assert health["available_generation_modes"] == ["mtp", "ar"]
+    assert health["expert_profile"] is None
+    assert health["expert_admission"] is None
 
 
 def test_chat_completion_response_reports_served_model_when_request_model_is_stale(
@@ -10400,6 +10505,117 @@ def test_server_state_binds_sustained_policy_before_runtime_load(monkeypatch):
         os.environ.update(environment_before)
 
     assert dict(os.environ) == environment_before
+
+
+def test_server_revalidates_profile_and_reapplies_child_env_before_policy_and_load(
+    monkeypatch,
+) -> None:
+    import mtplx.expert_cli as expert_cli
+    import mtplx.expert_runtime as expert_runtime
+
+    environment_before = dict(os.environ)
+    events: list[str] = []
+    selected = SimpleNamespace(
+        name="hy3-oq2e-64",
+        model_key="hy3-expert-oq2e",
+        child_env={
+            "MTPLX_SUSTAINED_PREFILL": "1",
+            "MTPLX_HY3_SUBMIT_CADENCE": "8",
+        },
+    )
+    stream_config = SimpleNamespace(
+        model_key="hy3-expert-oq2e",
+        memory_plan=lambda _spec: object(),
+    )
+
+    def repeated_validation(args, model):
+        events.append(f"validated:{model}")
+        args._resolved_expert_profile = selected
+        args._expert_admission_receipt = {
+            "manifest_sha256": "a" * 64,
+            "banks": [{"sha256": "b" * 64}],
+        }
+        args.expert_profile = selected.name
+        return {
+            "mtp": False,
+            "expert_streaming_config": stream_config,
+            "expert_manifest": Path(model) / "expert-manifest.json",
+            "expert_admission_receipt": args._expert_admission_receipt,
+        }
+
+    def generic_profile_env(_profile, **_kwargs):
+        events.append("generic-profile")
+        os.environ["MTPLX_HY3_SUBMIT_CADENCE"] = "2"
+
+    def install_policy(environ):
+        events.append("generation-policy")
+        assert environ["MTPLX_SUSTAINED_PREFILL"] == "1"
+        assert environ["MTPLX_HY3_SUBMIT_CADENCE"] == "8"
+        return object()
+
+    def stop_at_load(*_args, **_kwargs):
+        events.append("load")
+        assert os.environ["MTPLX_HY3_SUBMIT_CADENCE"] == "8"
+        assert "mtplx.models.hy3_mlx" not in sys.modules
+        assert _kwargs["expert_admission_receipt"]["manifest_sha256"] == "a" * 64
+        raise RuntimeError("stop after expert construction policy")
+
+    try:
+        sys.modules.pop("mtplx.models.hy3_mlx", None)
+        monkeypatch.setattr(
+            expert_cli,
+            "expert_streaming_load_kwargs",
+            repeated_validation,
+        )
+        monkeypatch.setattr(
+            expert_runtime,
+            "reconcile_mlx_memory_cap",
+            lambda _plan: 70 * 1024**3,
+        )
+        monkeypatch.setattr(openai, "apply_profile_env", generic_profile_env)
+        monkeypatch.setattr(openai, "profile_env_status", lambda *_a, **_k: {})
+        monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+        monkeypatch.setattr(openai, "_apply_metal_memory_caps", lambda: {})
+        monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
+        monkeypatch.setattr(
+            openai,
+            "_configure_mlx_cache_limit",
+            lambda _args: {"configured": False},
+        )
+        monkeypatch.setattr(
+            openai,
+            "install_generation_feature_policy",
+            install_policy,
+        )
+        monkeypatch.setattr(openai, "load", stop_at_load)
+        args = parse_args(
+            [
+                "--model",
+                "models/streamed",
+                "--expert-streaming",
+                "--expert-profile",
+                "hy3-oq2e-64",
+                "--generation-mode",
+                "ar",
+                "--warmup-tokens",
+                "0",
+            ]
+        )
+
+        with pytest.raises(
+            RuntimeError, match="stop after expert construction policy"
+        ):
+            openai.ServerState(args)
+    finally:
+        os.environ.clear()
+        os.environ.update(environment_before)
+
+    assert events == [
+        "validated:models/streamed",
+        "generic-profile",
+        "generation-policy",
+        "load",
+    ]
 
 
 def test_server_state_applies_clear_cache_every_after_profile(monkeypatch):

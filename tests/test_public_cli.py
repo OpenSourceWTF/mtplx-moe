@@ -1281,6 +1281,299 @@ def _serve_dry_run_payload_for_model(monkeypatch, capsys, model_dir, extra_args=
     return json.loads(capsys.readouterr().out)
 
 
+def test_public_serve_expert_profile_defaults_to_auto() -> None:
+    args = build_parser().parse_args(
+        [
+            "serve",
+            "--model",
+            HY3_STREAMING_REPO_ID,
+            "--download",
+        ]
+    )
+
+    assert args.expert_profile == "auto"
+
+
+@pytest.mark.parametrize(
+    ("flag_args", "canonical_flags"),
+    [
+        (("--generation-mode", "mtp"), {"generation-mode", "expert-profile"}),
+        (("--mtp",), {"mtp", "expert-profile"}),
+    ],
+    ids=("generation-mode", "mtp-toggle"),
+)
+def test_full_serve_rejects_explicit_mtp_before_profile_or_exec(
+    monkeypatch,
+    tmp_path,
+    flag_args,
+    canonical_flags,
+) -> None:
+    import mtplx.expert_cli as expert_cli
+
+    model_dir = tmp_path / "streamed"
+    model_dir.mkdir()
+    monkeypatch.setattr(public, "_serve_should_onboard", lambda _args: False)
+    monkeypatch.setattr(public, "_port_is_busy", lambda *_args: False)
+    monkeypatch.setattr(
+        public,
+        "_resolve_runtime_model_path",
+        lambda _model, cache_dir=None: (str(model_dir), None),
+    )
+    monkeypatch.setattr(
+        expert_cli,
+        "expert_streaming_load_kwargs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("MTP contradiction must fail before admission/profile")
+        ),
+    )
+    monkeypatch.setattr(
+        public.os,
+        "execvpe",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("rejected serve must not exec")
+        ),
+    )
+    args = build_parser().parse_args(
+        [
+            "serve",
+            "--model",
+            str(model_dir),
+            "--expert-profile",
+            "hy3-oq2e-64",
+            "--yes",
+            *flag_args,
+        ]
+    )
+    args._cli_flags = canonical_flags | {"model", "yes"}
+
+    assert public.cmd_serve_public(args) == 2
+    expected_mode = "mtp" if "generation-mode" in canonical_flags else None
+    assert args.generation_mode == expected_mode
+
+
+def test_full_serve_freezes_profile_for_child_and_applies_child_env_last(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    import mtplx.expert_cli as expert_cli
+
+    model_dir = tmp_path / "streamed"
+    model_dir.mkdir()
+    selected = SimpleNamespace(
+        name="hy3-oq2e-64",
+        child_env={
+            "MTPLX_SUSTAINED_PREFILL": "1",
+            "MTPLX_HY3_SUBMIT_CADENCE": "8",
+        },
+    )
+    calls: list[str] = []
+
+    def fake_load_kwargs(args, model):
+        calls.append(str(model))
+        args.expert_profile = selected.name
+        args._resolved_expert_profile = selected
+        args._expert_admission_receipt = {"banks": [{"sha256": "a" * 64}]}
+        return {"mtp": False, "expert_streaming_config": object()}
+
+    monkeypatch.setenv("MTPLX_HY3_SUBMIT_CADENCE", "2")
+    monkeypatch.setattr(public, "_serve_should_onboard", lambda _args: False)
+    monkeypatch.setattr(public, "_port_is_busy", lambda *_args: False)
+    monkeypatch.setattr(
+        public,
+        "_resolve_runtime_model_path",
+        lambda _model, cache_dir=None: (str(model_dir), None),
+    )
+    monkeypatch.setattr(
+        public,
+        "_model_gate",
+        lambda *_args, **_kwargs: (
+            {
+                "recommended_backend": "qwen3_next",
+                "compatibility": {"can_run": True, "exit_code": 0},
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(expert_cli, "expert_streaming_load_kwargs", fake_load_kwargs)
+    args = build_parser().parse_args(
+        [
+            "serve",
+            "--model",
+            str(model_dir),
+            "--expert-profile",
+            "hy3-oq2e-64",
+            "--generation-mode",
+            "ar",
+            "--yes",
+        ]
+    )
+    args._cli_flags = {
+        "model",
+        "expert-profile",
+        "generation-mode",
+        "yes",
+    }
+    args.dry_run = True
+    args.json = True
+
+    assert public.cmd_serve_public(args) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert calls == [str(model_dir)]
+    assert payload["generation_mode"] == "ar"
+    assert "--expert-profile hy3-oq2e-64" in payload["server_command"]
+    assert payload["env"]["MTPLX_HY3_SUBMIT_CADENCE"] == "8"
+    assert payload["env"]["MTPLX_SUSTAINED_PREFILL"] == "1"
+
+
+def test_full_serve_profile_failure_never_execs(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import mtplx.expert_cli as expert_cli
+
+    model_dir = tmp_path / "streamed"
+    model_dir.mkdir()
+    monkeypatch.setattr(public, "_serve_should_onboard", lambda _args: False)
+    monkeypatch.setattr(public, "_port_is_busy", lambda *_args: False)
+    monkeypatch.setattr(
+        public,
+        "_resolve_runtime_model_path",
+        lambda _model, cache_dir=None: (str(model_dir), None),
+    )
+    monkeypatch.setattr(
+        expert_cli,
+        "expert_streaming_load_kwargs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("no promoted expert profile fits")
+        ),
+    )
+    monkeypatch.setattr(
+        public.os,
+        "execvpe",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("failed profile preflight must not exec")
+        ),
+    )
+    args = build_parser().parse_args(
+        [
+            "serve",
+            "--model",
+            str(model_dir),
+            "--expert-profile",
+            "hy3-oq2e-64",
+            "--yes",
+        ]
+    )
+    args._cli_flags = {"model", "expert-profile", "yes"}
+
+    assert public.cmd_serve_public(args) == 2
+
+
+@pytest.mark.parametrize("command", ["run", "chat"])
+def test_one_shot_named_profile_installs_policy_before_runtime_load(
+    monkeypatch,
+    tmp_path,
+    command,
+) -> None:
+    import mtplx.expert_cli as expert_cli
+
+    model_dir = tmp_path / "streamed"
+    model_dir.mkdir()
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "0")
+    monkeypatch.setenv("MTPLX_HY3_SUBMIT_CADENCE", "0")
+    events: list[str] = []
+    selected = SimpleNamespace(
+        name="hy3-oq2e-64",
+        child_env={
+            "MTPLX_SUSTAINED_PREFILL": "1",
+            "MTPLX_HY3_SUBMIT_CADENCE": "8",
+        },
+    )
+
+    def resolve_profile(args, model):
+        events.append(f"profile:{model}")
+        args.expert_profile = selected.name
+        args._resolved_expert_profile = selected
+        args._expert_admission_receipt = {"banks": [{"sha256": "a" * 64}]}
+        return {
+            "mtp": False,
+            "expert_streaming_config": object(),
+            "expert_admission_receipt": args._expert_admission_receipt,
+        }
+
+    fake_generation = ModuleType("mtplx.generation")
+    fake_generation.generate_ar = lambda *_a, **_k: None
+    fake_generation.generate_mtpk = fake_generation.generate_ar
+
+    def install_policy(environ):
+        events.append("policy")
+        assert environ["MTPLX_HY3_SUBMIT_CADENCE"] == "8"
+
+    fake_generation.install_generation_feature_policy = install_policy
+    fake_runtime = ModuleType("mtplx.runtime")
+
+    def stop_at_load(*_args, **kwargs):
+        events.append("load")
+        assert kwargs["expert_admission_receipt"]["banks"][0]["sha256"] == "a" * 64
+        assert os.environ["MTPLX_HY3_SUBMIT_CADENCE"] == "8"
+        raise RuntimeError("stop after one-shot construction policy")
+
+    fake_runtime.load = stop_at_load
+    monkeypatch.setitem(sys.modules, "mtplx.generation", fake_generation)
+    monkeypatch.setitem(sys.modules, "mtplx.runtime", fake_runtime)
+    monkeypatch.setattr(
+        public,
+        "_resolve_runtime_model_path",
+        lambda _model, cache_dir=None: (str(model_dir), None),
+    )
+    monkeypatch.setattr(
+        public,
+        "_model_gate",
+        lambda *_args, **_kwargs: ({}, None),
+    )
+    monkeypatch.setattr(expert_cli, "expert_streaming_load_kwargs", resolve_profile)
+    monkeypatch.setattr(
+        public,
+        "apply_profile_env",
+        lambda _profile: monkeypatch.setenv(
+            "MTPLX_HY3_SUBMIT_CADENCE", "2"
+        ),
+    )
+    args = SimpleNamespace(
+        prompt="hello",
+        prompt_arg=None,
+        model=str(model_dir),
+        cache_dir=None,
+        expert_profile="hy3-oq2e-64",
+        expert_streaming=False,
+        expert_streaming_config=None,
+        expert_manifest=None,
+        unsafe_force_unverified=False,
+        yes=True,
+        profile="sustained",
+        max=False,
+        fan_mode="default",
+        system=None,
+        max_tokens=8,
+        temperature=0.6,
+        top_p=0.95,
+        top_k=20,
+        depth=3,
+        seed=0,
+        expect_python=False,
+        _cli_flags={"expert-profile"},
+    )
+
+    with pytest.raises(
+        RuntimeError, match="stop after one-shot construction policy"
+    ):
+        public._generate_one_shot_public(args, command=command)
+
+    assert events == [f"profile:{model_dir}", "policy", "load"]
+
+
 def test_serve_defaults_quantized_27b_flagships_to_turbo(
     monkeypatch, tmp_path, capsys
 ):

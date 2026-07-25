@@ -37,6 +37,34 @@ def _install_authoritative_manifest(parent, monkeypatch):
     return model_dir, saved
 
 
+@pytest.mark.parametrize(
+    ("generation_mode", "cli_flags", "expected"),
+    [
+        ("mtp", {"generation-mode"}, True),
+        (None, {"mtp"}, True),
+        ("auto", {"generation-mode"}, False),
+        ("ar", {"generation-mode"}, False),
+        (None, set(), False),
+    ],
+)
+def test_streamed_generation_mode_error_preserves_explicit_intent(
+    generation_mode,
+    cli_flags,
+    expected,
+):
+    args = _args(
+        generation_mode=generation_mode,
+        no_mtp=False,
+        _cli_flags=cli_flags,
+    )
+
+    error = public._streamed_generation_mode_error(args)
+
+    assert (error is not None) is expected
+    if expected:
+        assert error == "promoted streamed profiles are AR-only in MTPLX 2.3.1rc1"
+
+
 # ---------------------------------------------------------------------------
 # CHANGE 1 -- auto-detect streaming from a resident baked layout
 # ---------------------------------------------------------------------------
