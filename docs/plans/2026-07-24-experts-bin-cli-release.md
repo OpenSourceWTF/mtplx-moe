@@ -1219,7 +1219,7 @@ git commit -m "feat(serve): make admitted Hy3 experts zero-flag"
 **Does NOT cover:** Publishing to PyPI/Homebrew/Hugging Face or claiming
 `/v1/responses`.
 
-- [ ] **Step 1: Write the wheel-resource test**
+- [x] **Step 1: Write the wheel-resource test**
 
 ```python
 import json
@@ -1245,7 +1245,7 @@ def test_built_wheel_contains_expert_profiles(tmp_path):
     ]
 ```
 
-- [ ] **Step 2: Set the release-candidate version**
+- [x] **Step 2: Set the release-candidate version**
 
 Set both package sources to:
 
@@ -1258,7 +1258,7 @@ __version__ = "2.3.1rc1"
 DISPLAY_VERSION = "2.3.1rc1"
 ```
 
-- [ ] **Step 3: Document the exact user flow and configurations**
+- [x] **Step 3: Document the exact user flow and configurations**
 
 Document:
 
@@ -1285,7 +1285,7 @@ model_list:
       api_key: mtplx-local
 ```
 
-- [ ] **Step 4: Add the API smoke script**
+- [x] **Step 4: Add the API smoke script**
 
 The script accepts `--base-url`, `--model`, and `--api-key`; it must:
 
@@ -1330,7 +1330,7 @@ from `args.base_url`; assert `generation_mode == "ar"` and that
 `expert_streaming` reports the same active backend and route installed at
 request admission.
 
-- [ ] **Step 5: Build and inspect the wheel**
+- [x] **Step 5: Build and inspect the wheel**
 
 ```bash
 /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.venv/bin/python \
@@ -1343,7 +1343,7 @@ request admission.
 
 Expected: packaging test passes, build succeeds, and `twine check` passes.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add \
