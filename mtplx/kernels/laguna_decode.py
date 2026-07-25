@@ -32,7 +32,6 @@ measured, not assumed.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional
@@ -330,6 +329,13 @@ def fused_per_head_gate(
 #     with inv_freq either exp2(-d * log2(base)) at d = p / (dims/2) or the
 #     module's own float32 freqs buffer, metal::fast::cos/sin, pairs (p,
 #     p + dims/2), float multiply-add, one cast back to T per element.
+#
+# Two callers, one switch.  `laguna_fused.install_kernel_qk_rope` (env
+# MTPLX_LAGUNA_KERNEL_QK_ROPE) attaches a `_qk_rope_spec` to every attention
+# module; the eager forward and `mtplx.laguna_compiled_step` both read that
+# spec and call this kernel when `is_qk_norm_rope_eligible` passes.  Neither
+# has an env var of its own — the presence of the spec IS the switch, so a run
+# that did not install the path keeps the stock chain in both lanes.
 
 _QK_HEAD_DIM = 128
 _QK_LANES = 32
@@ -530,7 +536,7 @@ def fused_qk_norm_rope(
     q_weight: mx.array,
     k_weight: mx.array,
     eps: float,
-    position: int,
+    position: int | mx.array,
     spec: QkRopeSpec,
 ) -> tuple[mx.array, mx.array]:
     """RMSNorm + (partial/YaRN) rope for q and k in one dispatch, at T == 1.
@@ -539,6 +545,16 @@ def fused_qk_norm_rope(
     layout the stock transpose+rope chain hands to attention.  Callers check
     :func:`is_qk_norm_rope_eligible` first; there is no fallback here because
     the caller owns the stock path.
+
+    ``position`` is the rope offset and may be either a Python ``int`` or an
+    int32 scalar ``mx.array``.  The distinction matters under ``mx.compile``:
+    the kernel's ``position`` input is a scalar buffer, so an ARRAY stays a
+    traced graph input and one compiled graph serves every position, while a
+    Python int would be captured as a trace constant and freeze the rotation
+    at whatever offset the graph was first built at.  An array is therefore
+    forwarded untouched — no ``int()``, which would sync the stream and bake
+    the value in.  ``mtplx.laguna_compiled_step`` passes its ``offset`` leaf;
+    the eager forward in ``mtplx.models.laguna_fused`` passes an int.
     """
 
     global _QK_DUMMY_FREQS
@@ -558,8 +574,12 @@ def fused_qk_norm_rope(
         float(spec.mscale) if spec.mscale is not None else 1.0,
     )
     total_heads = spec.n_q_heads + spec.n_kv_heads
+    # A traced offset goes in as-is; a host int is normalized to one.  Both
+    # reach the kernel as a scalar int32 buffer, so the JIT source is the same
+    # either way and the two callers share one compiled variant.
+    offset = position if isinstance(position, mx.array) else int(position)
     q_out, k_out = kernel(
-        inputs=[queries, keys, q_weight, k_weight, freqs, float(eps), int(position)],
+        inputs=[queries, keys, q_weight, k_weight, freqs, float(eps), offset],
         template=[("T", queries.dtype)],
         grid=(_QK_LANES * batch * total_heads, 1, 1),
         threadgroup=(_QK_LANES, 1, 1),

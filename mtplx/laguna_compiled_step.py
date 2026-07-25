@@ -36,6 +36,16 @@ against prompts that are far longer).  In that regime every ring slot holds a
 live key, so sliding attention needs no mask at all, and softmax's
 permutation-invariance makes the ring's rotated order irrelevant.
 
+Fused kernels
+-------------
+The step calls the shipped module code for gating, MoE and the norms, so every
+``laguna_fused`` installer keeps applying to it.  The fused q/k norm+rope Metal
+kernel is wired the same way and needs no env var here: when
+``install_kernel_qk_rope`` (``MTPLX_LAGUNA_KERNEL_QK_ROPE``) has left a
+``_qk_rope_spec`` on an attention module, and the projected q/k shapes are ones
+the kernel covers, the step replaces that layer's norm -> transpose -> rope
+chain with one dispatch; otherwise it runs the stock chain.
+
 Scope: T=1, B=1, greedy.  Prefill still runs through the stock python-cache
 path; this lane takes over afterwards via :func:`snapshot_leaves`.
 """
@@ -47,6 +57,7 @@ from typing import Any, Callable, Sequence
 
 import mlx.core as mx
 
+from .kernels.laguna_decode import fused_qk_norm_rope, is_qk_norm_rope_eligible
 from .models import laguna
 
 FULL = "full"
@@ -342,12 +353,22 @@ def build_step(
 
     Every op below mirrors a specific line of ``mtplx/models/laguna.py``; the
     only substitutions are the cache plumbing (explicit leaves instead of
-    ``cache.update_and_fetch``) and the full-attention mask (an in-graph
-    additive mask over the padded leaf instead of ``mask=None`` over an exactly
-    sized buffer).  Gating, MoE and the norms call the shipped module code, so
-    the ``laguna_fused`` installers keep applying — including the destructive
-    q/k/v/g concatenation, which the projection block reads off the attention
-    module rather than assuming the four separate projections still exist.
+    ``cache.update_and_fetch``), the full-attention mask (an in-graph additive
+    mask over the padded leaf instead of ``mask=None`` over an exactly sized
+    buffer), and the fused q/k norm+rope kernel below.  Gating, MoE and the
+    norms call the shipped module code, so the ``laguna_fused`` installers keep
+    applying — including the destructive q/k/v/g concatenation, which the
+    projection block reads off the attention module rather than assuming the
+    four separate projections still exist.
+
+    The q/k kernel is likewise switched on by an installer rather than by a
+    knob of this lane's own: ``laguna_fused.install_kernel_qk_rope`` (env
+    ``MTPLX_LAGUNA_KERNEL_QK_ROPE``) leaves a ``_qk_rope_spec`` on every
+    attention module, and the step calls
+    :func:`~mtplx.kernels.laguna_decode.fused_qk_norm_rope` for every layer
+    whose projected shapes that spec covers.  Without the install — or on CPU,
+    or at any geometry the kernel does not implement — the stock
+    norm/transpose/rope chain runs unchanged.
     """
 
     geometry = geometry_for(model, cap)
@@ -389,23 +410,50 @@ def build_step(
             queries, keys, values = attn.q_proj(x), attn.k_proj(x), attn.v_proj(x)
             gate_logits = None
 
-        queries = attn.q_norm(
-            queries.reshape(batch, length, attn.n_heads, -1)
-        ).transpose(0, 2, 1, 3)
-        keys = attn.k_norm(
-            keys.reshape(batch, length, attn.n_kv_heads, -1)
-        ).transpose(0, 2, 1, 3)
         values = values.reshape(batch, length, attn.n_kv_heads, -1).transpose(
             0, 2, 1, 3
         )
 
-        # The offset goes in as the int32 ARRAY, not `int(offset)`: both
-        # `nn.RoPE` and `YarnRoPE` hand it straight to `mx.fast.rope`, which
-        # accepts an array, and that is what keeps the position a graph input.
-        # Sliding layers rope at the ABSOLUTE position too — the window bounds
-        # what is attended to, never how a key is rotated.
-        queries = attn.rope(queries, offset=offset)
-        keys = attn.rope(keys, offset=offset)
+        # `install_kernel_qk_rope` (env MTPLX_LAGUNA_KERNEL_QK_ROPE) attaches a
+        # `_qk_rope_spec` to every attention module; its presence is the whole
+        # switch, so this lane needs no env var of its own.  The eligibility
+        # check wants the PRE-transpose [B, 1, H*D] projections, which is what
+        # the block above just produced, and it refuses anything the kernel
+        # does not cover exactly — CPU runs and the toy head_dim the tests
+        # build both land in the stock chain below.
+        spec = getattr(attn, "_qk_rope_spec", None)
+        if is_qk_norm_rope_eligible(
+            queries, keys, attn.q_norm.weight, attn.k_norm.weight, spec
+        ):
+            # One dispatch for norm + transpose + rope, on q and k together,
+            # instead of the five-plus the chain below costs per layer.  The
+            # offset goes in as the ARRAY for the same reason the stock rope
+            # takes it that way: a Python int would be a trace constant.
+            queries, keys = fused_qk_norm_rope(
+                queries,
+                keys,
+                attn.q_norm.weight,
+                attn.k_norm.weight,
+                float(attn.q_norm.eps),
+                offset,
+                spec,
+            )
+        else:
+            queries = attn.q_norm(
+                queries.reshape(batch, length, attn.n_heads, -1)
+            ).transpose(0, 2, 1, 3)
+            keys = attn.k_norm(
+                keys.reshape(batch, length, attn.n_kv_heads, -1)
+            ).transpose(0, 2, 1, 3)
+
+            # The offset goes in as the int32 ARRAY, not `int(offset)`: both
+            # `nn.RoPE` and `YarnRoPE` hand it straight to `mx.fast.rope`,
+            # which accepts an array, and that is what keeps the position a
+            # graph input.  Sliding layers rope at the ABSOLUTE position too —
+            # the window bounds what is attended to, never how a key is
+            # rotated.
+            queries = attn.rope(queries, offset=offset)
+            keys = attn.rope(keys, offset=offset)
 
         keys = kv_slot_write(k_leaf, keys, start)
         values = kv_slot_write(v_leaf, values, start)

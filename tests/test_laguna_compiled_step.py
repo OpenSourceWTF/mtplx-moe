@@ -13,11 +13,15 @@ sliding caches are past the window and in the steady state the lane supports).
 
 from __future__ import annotations
 
+import math
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 
+from mtplx import laguna_compiled_step
+from mtplx.kernels import laguna_decode
 from mtplx.laguna_compiled_step import (
     LagunaCompiledLane,
     full_state_from_cache,
@@ -512,6 +516,157 @@ def test_compiled_twin_matches_the_eager_twin_with_fused_qkvg(toy_model):
         assert delta <= BF16_SAFE_TOLERANCE, (
             f"compiled leaf {index} diverged from the eager twin: {delta:.3e}"
         )
+
+
+# ---------------------------------------------------------------------------
+# the fused q/k norm+rope kernel
+# ---------------------------------------------------------------------------
+def test_lane_falls_back_when_the_qk_rope_kernel_cannot_run(toy_model, monkeypatch):
+    """Specs attached but no kernel: the step must take the stock chain.
+
+    ``install_kernel_qk_rope`` attaches a ``_qk_rope_spec`` to EVERY attention
+    module, covered or not — head_dim 8 here, and a CPU device besides, so no
+    layer is eligible.  The step therefore has to keep roping through the
+    module, which is asserted the only way that cannot be faked: the kernel
+    entry point is replaced with a raiser, so reaching it fails the test rather
+    than crashing somewhere inside Metal on a machine that has no GPU.
+    """
+
+    report = laguna_fused.install_kernel_qk_rope(toy_model)
+    assert report["layers_covered"] == 0
+    assert report["layers_skipped"] == len(LAYER_TYPES)
+    assert all(
+        layer.self_attn._qk_rope_spec is not None for layer in toy_model.model.layers
+    )
+
+    def _refuse(*args, **kwargs):  # pragma: no cover - the point is not calling it
+        raise AssertionError("the step called the kernel on an ineligible layer")
+
+    monkeypatch.setattr(laguna_compiled_step, "fused_qk_norm_rope", _refuse)
+
+    _assert_lane_tracks_stock(toy_model, compiled=False)
+    _assert_lane_tracks_stock(toy_model, compiled=True)
+
+
+@pytest.mark.parametrize("with_qkvg", [False, True])
+def test_lane_calls_the_fused_qk_kernel_with_the_current_offset(
+    toy_model, monkeypatch, with_qkvg
+):
+    """Where the fused call sits, and what it is handed.
+
+    The kernel needs head_dim 128 and a Metal device, so the eligible path
+    cannot execute on CPU.  What CAN be pinned here is the call site: force
+    eligibility, stand in for the kernel with the layer's OWN norm and rope
+    modules — the same objects the stock chain uses, so the tokens stay
+    bit-identical to the stock forward — and check every argument that crosses
+    the boundary.  The position is the one that would rot silently: the stock
+    chain ropes at the PRE-write ``offset``, and a step that handed the kernel
+    ``offset + 1`` or the ring slot instead would still produce plausible
+    tokens.  It has to arrive as the traced int32 array, or ``mx.compile``
+    would freeze the rotation at the offset the graph was built at.
+
+    Run with and without the q/k/v/g concatenation, because that install is
+    what decides WHAT the call site hands over: with it, q and k are slices of
+    one fused matmul rather than separately allocated buffers.
+    """
+
+    laguna_fused.install_kernel_qk_rope(toy_model)
+    if with_qkvg:
+        nn.quantize(toy_model, group_size=32, bits=4)
+        mx.eval(toy_model.parameters())
+        assert laguna_fused.install_fused_qkvg(toy_model)["layers_converted"] == len(
+            LAYER_TYPES
+        )
+    attentions = [layer.self_attn for layer in toy_model.model.layers]
+    seen: list[mx.array] = []
+
+    def _stand_in(queries, keys, q_weight, k_weight, eps, position, spec):
+        attn = attentions[len(seen) % len(attentions)]
+        assert q_weight is attn.q_norm.weight
+        assert k_weight is attn.k_norm.weight
+        assert eps == attn.q_norm.eps
+        assert spec is attn._qk_rope_spec
+        # Pre-transpose [B, 1, H*D], which is what the eligibility check reads.
+        assert queries.shape == (1, 1, attn.n_heads * attn.head_dim)
+        assert keys.shape == (1, 1, attn.n_kv_heads * attn.head_dim)
+        assert isinstance(position, mx.array) and position.dtype == mx.int32
+        seen.append(position)
+
+        batch = int(queries.shape[0])
+        normed_q = attn.q_norm(
+            queries.reshape(batch, 1, attn.n_heads, -1)
+        ).transpose(0, 2, 1, 3)
+        normed_k = attn.k_norm(
+            keys.reshape(batch, 1, attn.n_kv_heads, -1)
+        ).transpose(0, 2, 1, 3)
+        return (
+            attn.rope(normed_q, offset=position),
+            attn.rope(normed_k, offset=position),
+        )
+
+    monkeypatch.setattr(
+        laguna_compiled_step, "is_qk_norm_rope_eligible", lambda *a: True
+    )
+    monkeypatch.setattr(laguna_compiled_step, "fused_qk_norm_rope", _stand_in)
+
+    _assert_lane_tracks_stock(toy_model, compiled=False)
+
+    # Two lanes are built inside the helper, but only one of them steps.
+    assert len(seen) == STEPS * len(LAYER_TYPES)
+    for step in range(STEPS):
+        for index in range(len(LAYER_TYPES)):
+            position = seen[step * len(LAYER_TYPES) + index]
+            assert int(position) == PROMPT.shape[1] + step, (
+                f"layer {index} roped at the wrong position on step {step}"
+            )
+
+
+def test_fused_qk_kernel_forwards_a_traced_position_untouched(cpu_device, monkeypatch):
+    """An array position must reach the kernel as the SAME array.
+
+    ``int(position)`` at this boundary would do two things the compiled lane
+    cannot afford: sync the stream, and turn the offset into a trace constant
+    that pins the graph to one position.  The kernel itself cannot run on CPU,
+    so the binding is checked by standing in for the compiled kernel object and
+    reading what it was handed.
+    """
+
+    recorded: dict[str, object] = {}
+
+    def _record(**kwargs):
+        recorded.update(kwargs)
+        return tuple(
+            mx.zeros(shape, dtype=dtype)
+            for shape, dtype in zip(kwargs["output_shapes"], kwargs["output_dtypes"])
+        )
+
+    monkeypatch.setattr(
+        laguna_decode, "_qk_norm_rope_kernel", lambda *a, **k: _record
+    )
+
+    spec = laguna_decode.QkRopeSpec(
+        n_q_heads=2,
+        n_kv_heads=1,
+        head_dim=128,
+        rot_dims=128,
+        freqs=None,
+        base_log2=math.log2(10_000.0),
+        mscale=None,
+    )
+    queries = mx.zeros((1, 1, 2 * 128), dtype=mx.bfloat16)
+    keys = mx.zeros((1, 1, 128), dtype=mx.bfloat16)
+    weight = mx.ones((128,), dtype=mx.bfloat16)
+
+    position = mx.array(37, dtype=mx.int32)
+    laguna_decode.fused_qk_norm_rope(
+        queries, keys, weight, weight, 1e-6, position, spec
+    )
+    # Position is input 6; identity, not equality, is the contract.
+    assert recorded["inputs"][6] is position
+
+    laguna_decode.fused_qk_norm_rope(queries, keys, weight, weight, 1e-6, 37, spec)
+    host_side = recorded["inputs"][6]
+    assert isinstance(host_side, int) and host_side == 37
 
 
 def test_lane_handles_the_shipped_yarn_rope(cpu_device):
