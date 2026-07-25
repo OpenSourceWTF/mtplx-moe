@@ -52,6 +52,56 @@ Requirements: Apple Silicon (M1 or newer), macOS 14+. 16 GB runs the 4B and 9B
 models comfortably; 27B wants 32 GB and up. The app checks before recommending
 anything.
 
+## Supported models
+
+This is the complete list of preconfigured or revision-pinned Hugging Face
+repositories recognized by this fork. Other compatible or locally forged
+models may pass `mtplx inspect`, but they are not part of this verified roster.
+
+The catalog's peak-memory figures are planning estimates before the CLI applies
+its safety margin and request-specific KV budget. “M1–M2” and “M3–M5” identify
+the catalog's preferred hardware lane, not a hard architecture restriction.
+
+### MTP catalog
+
+| Exact model ID | Runtime | Approx. peak RAM | Preferred lane |
+|---|---|---:|---|
+| [`Youssofal/Qwen3.5-4B-MTPLX-Optimized-Speed`](https://huggingface.co/Youssofal/Qwen3.5-4B-MTPLX-Optimized-Speed) | MTP or AR | 2.86 GiB | M3–M5 |
+| [`Youssofal/Qwen3.5-4B-MTPLX-Optimized-Quality`](https://huggingface.co/Youssofal/Qwen3.5-4B-MTPLX-Optimized-Quality) | MTP or AR | 4.75 GiB | M3–M5 |
+| [`Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed`](https://huggingface.co/Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed) | MTP or AR | 10.0 GiB | M3–M5 |
+| [`Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed-FP16`](https://huggingface.co/Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed-FP16) | MTP or AR | 10.5 GiB | M1–M2 |
+| [`Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed`](https://huggingface.co/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed) | MTP or AR | 17.0 GiB | M3–M5 |
+| [`Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-FP16`](https://huggingface.co/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-FP16) | MTP or AR | 17.5 GiB | M1–M2 |
+| [`Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality`](https://huggingface.co/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality) | MTP or AR | 27.62 GiB | M3–M5 |
+| [`Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality-FP16`](https://huggingface.co/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality-FP16) | MTP or AR | 28.12 GiB | M1–M2 |
+| [`Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed`](https://huggingface.co/Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed) | MTP or AR | 28.0 GiB | M3–M5 |
+| [`Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16`](https://huggingface.co/Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16) | MTP or AR | 28.5 GiB | M1–M2 |
+| [`Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance`](https://huggingface.co/Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance) | MTP or AR | 32.0 GiB | M3–M5 |
+| [`Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance-FP16`](https://huggingface.co/Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance-FP16) | MTP or AR | 32.5 GiB | M1–M2 |
+| [`Youssofal/Gemma4-MTPLX-Optimized-Speed`](https://huggingface.co/Youssofal/Gemma4-MTPLX-Optimized-Speed) | MTP or AR | 18.0 GiB | M3–M5 |
+
+Launch any catalog model by exact ID:
+
+```bash
+mtplx start cli \
+  --model Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed \
+  --download
+```
+
+### Fork-specific models
+
+| Exact model ID | Runtime | Capacity requirement | Support status |
+|---|---|---|---|
+| [`OpensourceWTF/Hy3-oQ2e-MTPLX-streaming`](https://huggingface.co/OpensourceWTF/Hy3-oQ2e-MTPLX-streaming) | SSD-streamed AR | 71, 95, or 103 GiB process ceiling; about 97.6 GB download | Promoted `hy3-oq2e-64`, `-88`, and `-96` profiles |
+| [`OpensourceWTF/GLM-5.2-t158-MTPLX-streaming`](https://huggingface.co/OpensourceWTF/GLM-5.2-t158-MTPLX-streaming) | SSD-streamed AR | Measured 96 GiB configuration; about 187 GB download | Manual and experimental; no task-quality receipt |
+| [`mlx-community/Laguna-S-2.1-oQ4e`](https://huggingface.co/mlx-community/Laguna-S-2.1-oQ4e) | Native AR only | At least 96 GiB unified memory; 128 GiB recommended; 64.13 GB download | Exact revision pinned and artifact-verified |
+
+Hy3 starts with the zero-config `mtplx serve` command above. GLM requires the
+manual paging configuration in the
+[SSD-streamed MoE guide](docs/advanced/ssd-streamed-moe.md). Laguna launches
+with the same `mtplx start cli --model MODEL_ID --download` form as the catalog
+models and rejects MTP before loading.
+
 ## Start in 60 seconds
 
 ```bash
@@ -135,9 +185,8 @@ that it is exact and actually faster, and can publish it back to the Hub. It
 reports measured verdicts rather than assuming training helped (for example,
 "Depth 1 is fastest: 227.1 to 296.1, 1.30x"). Use the app or `mtplx forge`.
 
-The official [Youssofal catalog](https://huggingface.co/Youssofal) includes
-Qwen 3.5 (4B, 9B), Qwen 3.6 (27B, 35B MoE) speed/balance/quality builds, and
-Gemma 4. The app recommends among them for the detected hardware.
+The app recommends among the preconfigured models in the
+[supported-model table](#supported-models) for the detected hardware.
 
 ## Advanced and compatibility
 
@@ -166,27 +215,6 @@ override precedence, health evidence, and LiteLLM setup.
 
 Use `mtplx help advanced` for QA, profiling, support bundles, and kernel tools.
 See the [documentation index](docs/README.md).
-
-### Laguna S-2.1
-
-[Laguna-S-2.1 oQ4e](https://huggingface.co/mlx-community/Laguna-S-2.1-oQ4e) is supported through its exact MLX architecture in target-only AR mode:
-
-```bash
-mtplx start cli \
-  --model mlx-community/Laguna-S-2.1-oQ4e \
-  --download \
-  --no-mtp
-```
-
-MTPLX pins that model to revision
-`8e3f5cad513746264940c1c4195de48d7ea345a5` and verifies the 13-shard layout,
-tokenizer, generation config, special tokens map, and Poolside chat template
-before admitting it. The checkpoint has no native MTP head, so an MTP launch is
-rejected before weights load instead of falling back during execution. The
-weights occupy 59.72 GiB (64.13 GB); use a Mac with at least 96 GiB unified
-memory (128 GiB is recommended). MTPLX defaults Laguna to a 32,768-token context
-and response cap, and checks larger explicit server contexts against the active
-Metal memory cap.
 
 ## What MTPLX is not
 

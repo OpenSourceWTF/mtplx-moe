@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import tomllib
 
 from scripts.check_documentation import check_documentation
@@ -70,6 +71,45 @@ def test_fork_release_workflow_cannot_publish_the_upstream_pypi_package():
     assert "id-token: write" not in workflow
     assert "publish_to_pypi" not in distribution_docs
     assert "not published to PyPI" in distribution_docs
+
+
+def test_readme_lists_every_preconfigured_model_in_one_section():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    catalog_source = (ROOT / "mtplx/model_catalog.py").read_text(
+        encoding="utf-8"
+    )
+    streaming_source = (ROOT / "mtplx/default_models.py").read_text(
+        encoding="utf-8"
+    )
+    laguna_source = (ROOT / "mtplx/models/laguna_config.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "## Supported models" in readme
+    supported_section = readme.split("## Supported models", 1)[1].split(
+        "\n## ", 1
+    )[0]
+    expected_ids = set(
+        re.findall(
+            r'hf_model_id="([^"]+)"',
+            catalog_source + streaming_source,
+        )
+    )
+    laguna_match = re.search(
+        r'LAGUNA_S_2_1_REPO_ID = "([^"]+)"',
+        laguna_source,
+    )
+    assert laguna_match is not None
+    expected_ids.add(laguna_match.group(1))
+
+    documented_ids = set(
+        re.findall(
+            r"https://huggingface\.co/([^)\s]+)",
+            supported_section,
+        )
+    )
+    assert documented_ids == expected_ids
+    assert len(documented_ids) == 16
 
 
 def test_documentation_checker_skips_plan_pseudocode_but_checks_user_guides(
