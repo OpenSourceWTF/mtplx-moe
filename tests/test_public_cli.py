@@ -117,6 +117,76 @@ def test_quickstart_download_allows_registered_streaming_repo_after_local_valida
     assert pull_calls == [HY3_STREAMING_REPO_ID]
 
 
+def test_quickstart_invalid_cached_streaming_bank_errors_or_repairs(
+    tmp_path,
+    monkeypatch,
+):
+    import mtplx.hf_loader as hf_loader
+    from mtplx.expert_manifest import save_expert_manifest
+    from mtplx.expert_streaming_models import MODEL_SPECS
+    from test_expert_manifest import _make_authoritative_checkpoint
+
+    runtime = hf_loader.cached_model_path(
+        HY3_STREAMING_REPO_ID,
+        cache_dir=tmp_path,
+    )
+    spec, manifest = _make_authoritative_checkpoint(runtime)
+    manifest = save_expert_manifest(
+        manifest,
+        runtime / "expert-manifest.json",
+    )
+    monkeypatch.setitem(MODEL_SPECS, spec.key, spec)
+    (runtime / "config.json").write_text("{}\n", encoding="utf-8")
+    assert manifest.sidecar is not None
+    bank = runtime / manifest.sidecar.file
+    expected = bank.read_bytes()
+    bank.unlink()
+
+    unresolved, no_download = public._quickstart_resolve_model(
+        HY3_STREAMING_REPO_ID,
+        cache_dir=str(tmp_path),
+        download=False,
+    )
+
+    assert unresolved is None
+    assert no_download["downloaded"] is False
+    assert manifest.sidecar.file in no_download["error"]["detail"]
+    assert "missing" in no_download["error"]["detail"]
+
+    class RemoteInspection:
+        def to_dict(self):
+            return {
+                "model_dir": HY3_STREAMING_REPO_ID,
+                "compatibility": {"can_run": False, "exit_code": 3},
+            }
+
+    pull_calls = []
+
+    def fake_pull(model, **_kwargs):
+        pull_calls.append(model)
+        bank.write_bytes(expected)
+        return {"ok": True, "repo_id": model, "path": str(runtime)}
+
+    monkeypatch.setattr(public, "inspect_model", lambda _model: RemoteInspection())
+    monkeypatch.setattr(hf_loader, "pull_model", fake_pull)
+    monkeypatch.setattr(
+        public,
+        "_rich_download_progress_callback",
+        lambda **_kwargs: (lambda _event: None, lambda: None),
+    )
+
+    resolved, downloaded = public._quickstart_resolve_model(
+        HY3_STREAMING_REPO_ID,
+        cache_dir=str(tmp_path),
+        download=True,
+    )
+
+    assert pull_calls == [HY3_STREAMING_REPO_ID]
+    assert resolved == str(runtime)
+    assert downloaded["downloaded"] is True
+    assert bank.read_bytes() == expected
+
+
 def test_quickstart_download_keeps_remote_gate_for_arbitrary_repo(
     tmp_path,
     monkeypatch,

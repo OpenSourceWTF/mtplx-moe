@@ -202,22 +202,31 @@ def _read_model_key(model_path: Path) -> str:
 def _read_manifest_model_key(manifest_path: Path) -> str | None:
     """Return the manifest's top-level ``model_key``, or ``None`` if absent.
 
-    A bounded head scan handles the published manifests cheaply; a single full
-    ``json.loads`` is the fallback for an unusual field ordering. Neither path
-    triggers the digest/record verification pass — this only lifts one field.
+    The manifest is read once through the shared bounded artifact descriptor
+    path. A head scan handles published ordering cheaply; ``json.loads`` over
+    those already-bounded bytes is the fallback for unusual field ordering.
+    Neither path triggers digest/record verification — this only lifts one
+    field.
     """
 
+    from .expert_manifest import MAX_MANIFEST_BYTES
+    from .hf_loader import read_bounded_artifact_member
+
     try:
-        with manifest_path.open("rb") as handle:
-            head = handle.read(_MANIFEST_MODEL_KEY_SCAN_BYTES)
-    except OSError:
+        payload = read_bounded_artifact_member(
+            manifest_path.parent,
+            manifest_path.name,
+            max_bytes=MAX_MANIFEST_BYTES,
+        )
+    except (OSError, ValueError):
         return None
+    head = payload[:_MANIFEST_MODEL_KEY_SCAN_BYTES]
     match = _MODEL_KEY_RE.search(head)
     if match is not None:
         return match.group(1).decode("utf-8")
     try:
-        data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        data = json.loads(payload)
+    except (UnicodeDecodeError, ValueError):
         return None
     if isinstance(data, dict):
         value = data.get("model_key")
@@ -237,10 +246,9 @@ def _resolve_model_key(model_root: Path, manifest_path: Path) -> str:
     preserves the safe q4 default for bare artifacts.
     """
 
-    if manifest_path.is_file():
-        manifest_key = _read_manifest_model_key(manifest_path)
-        if manifest_key:
-            return manifest_key
+    manifest_key = _read_manifest_model_key(manifest_path)
+    if manifest_key:
+        return manifest_key
     return _read_model_key(model_root)
 
 

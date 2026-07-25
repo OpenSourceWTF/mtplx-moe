@@ -366,6 +366,66 @@ def test_manifest_model_key_wins_over_shared_config_type(
     assert kwargs["expert_streaming_config"].model_key == manifest_model_key
 
 
+def test_manifest_model_key_supports_repository_local_hf_blob_symlink(
+    tmp_path: Path,
+) -> None:
+    root = (
+        tmp_path
+        / "models--owner--streamed"
+        / "snapshots"
+        / "revision"
+    )
+    root.mkdir(parents=True)
+    (root / "config.json").write_text(
+        json.dumps({"model_type": "hy_v3"}),
+        encoding="utf-8",
+    )
+    blob_root = root.parents[1] / "blobs"
+    blob_root.mkdir()
+    blob = blob_root / "manifest-digest"
+    blob.write_text(
+        json.dumps({"model_key": "hy3-expert-oq2e"}),
+        encoding="utf-8",
+    )
+    manifest_path = root / "expert-manifest.json"
+    manifest_path.symlink_to(Path("..") / ".." / "blobs" / blob.name)
+
+    assert expert_cli._read_manifest_model_key(manifest_path) == "hy3-expert-oq2e"
+
+
+@pytest.mark.parametrize("oversized", [False, True])
+def test_manifest_model_key_rejects_unsafe_symlink_targets(
+    tmp_path: Path,
+    oversized: bool,
+) -> None:
+    root = (
+        tmp_path
+        / "models--owner--streamed"
+        / "snapshots"
+        / "revision"
+    )
+    root.mkdir(parents=True)
+    if oversized:
+        from mtplx.expert_manifest import MAX_MANIFEST_BYTES
+
+        blob_root = root.parents[1] / "blobs"
+        blob_root.mkdir()
+        target = blob_root / "oversized-manifest"
+        with target.open("wb") as handle:
+            handle.write(b'{"model_key":"hy3-expert-oq2e","padding":"')
+            handle.truncate(MAX_MANIFEST_BYTES + 1)
+    else:
+        target = tmp_path / "external-manifest.json"
+        target.write_text(
+            json.dumps({"model_key": "hy3-expert-oq2e"}),
+            encoding="utf-8",
+        )
+    manifest_path = root / "expert-manifest.json"
+    manifest_path.symlink_to(target)
+
+    assert expert_cli._read_manifest_model_key(manifest_path) is None
+
+
 def test_manifest_without_model_key_falls_back_to_config_q4(tmp_path: Path) -> None:
     # A manifest that declares no model_key must not upgrade the bank; the
     # coarse config.json model_type map still picks the safe production q4 key.

@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from mtplx.expert_manifest import (
     EMPTY_SHA256,
+    MAX_MANIFEST_BYTES,
     ExpertManifest,
     ShardInfo,
     SidecarInfo,
@@ -20,7 +23,11 @@ from mtplx.expert_manifest import (
 from mtplx.expert_streaming_models import MODEL_SPECS, ExpertStreamingModelSpec
 from mtplx.hf_loader import (
     MAX_RUNTIME_CONTRACT_BYTES,
+    cached_model_is_complete,
+    cached_model_path,
     expert_artifact_status,
+    pull_model,
+    resolve_model_path,
 )
 
 from test_expert_manifest import _make_authoritative_checkpoint
@@ -35,6 +42,15 @@ def _install_authoritative_model(
     saved = save_expert_manifest(manifest, root / "expert-manifest.json")
     monkeypatch.setitem(MODEL_SPECS, spec.key, spec)
     return spec, saved
+
+
+def _install_authoritative_cache(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[ExpertStreamingModelSpec, ExpertManifest]:
+    spec, manifest = _install_authoritative_model(root, monkeypatch)
+    (root / "config.json").write_text("{}\n", encoding="utf-8")
+    return spec, manifest
 
 
 @pytest.fixture
@@ -236,24 +252,36 @@ def test_every_authoritative_sidecar_part_must_exist(
     assert "missing" in status["reason"]
 
 
-def test_repository_local_hf_blob_symlink_is_supported(
+def test_repository_local_hf_manifest_and_multipart_bank_symlinks_are_supported(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "models--owner--repo" / "snapshots" / "revision"
     _spec, manifest = _install_authoritative_model(root, monkeypatch)
+    manifest = _split_authoritative_sidecar(root, manifest)
+    manifest = save_expert_manifest(manifest, root / "expert-manifest.json")
     assert manifest.sidecar is not None
-    bank = root / manifest.sidecar.file
     blob_root = root.parents[1] / "blobs"
     blob_root.mkdir()
-    blob = blob_root / "bank-digest"
-    bank.replace(blob)
-    bank.symlink_to(Path("..") / ".." / "blobs" / blob.name)
+    artifact_names = (
+        "expert-manifest.json",
+        *(part.file for part in manifest.sidecar.parts),
+    )
+    for index, name in enumerate(artifact_names):
+        artifact = root / name
+        blob = blob_root / f"blob-{index}"
+        artifact.replace(blob)
+        artifact.symlink_to(Path("..") / ".." / "blobs" / blob.name)
 
     status = expert_artifact_status(root)
 
     assert status["ok"] is True
-    assert status["actual_bytes"] == manifest.sidecar.size
+    assert status["sidecar_files"] == [
+        part.file for part in manifest.sidecar.parts
+    ]
+    assert status["actual_bytes"] == sum(
+        part.size for part in manifest.sidecar.parts
+    )
 
 
 def test_sidecar_symlink_outside_artifact_is_rejected(
@@ -288,7 +316,87 @@ def test_manifest_symlink_is_not_followed(
 
     assert status["streamed_experts"] is True
     assert status["ok"] is False
-    assert "could not read" in status["reason"]
+    assert "escapes root" in status["reason"]
+
+
+def test_repository_local_hf_manifest_symlink_read_is_bounded(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "models--owner--repo" / "snapshots" / "revision"
+    root.mkdir(parents=True)
+    blob_root = root.parents[1] / "blobs"
+    blob_root.mkdir()
+    blob = blob_root / "oversized-manifest"
+    with blob.open("wb") as handle:
+        handle.truncate(MAX_MANIFEST_BYTES + 1)
+    (root / "expert-manifest.json").symlink_to(
+        Path("..") / ".." / "blobs" / blob.name
+    )
+
+    status = expert_artifact_status(root)
+
+    assert status["streamed_experts"] is True
+    assert status["ok"] is False
+    assert "exceeds" in status["reason"]
+
+
+@pytest.mark.parametrize("mutation", ["missing", "truncated"])
+def test_cached_streaming_model_requires_authoritative_bank(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    repo_id = "owner/streamed"
+    root = cached_model_path(repo_id, cache_dir=tmp_path)
+    _spec, manifest = _install_authoritative_cache(root, monkeypatch)
+    assert manifest.sidecar is not None
+    bank = root / manifest.sidecar.file
+    if mutation == "missing":
+        bank.unlink()
+    else:
+        bank.write_bytes(bank.read_bytes()[:-1])
+
+    assert cached_model_is_complete(root) is False
+    with pytest.raises(FileNotFoundError, match=f"{manifest.sidecar.file}.*{mutation}"):
+        resolve_model_path(repo_id, cache_dir=tmp_path)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "truncated"])
+def test_pull_model_repairs_invalid_streaming_cache_instead_of_reusing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    repo_id = "owner/streamed"
+    root = cached_model_path(repo_id, cache_dir=tmp_path)
+    _spec, manifest = _install_authoritative_cache(root, monkeypatch)
+    assert manifest.sidecar is not None
+    bank = root / manifest.sidecar.file
+    expected = bank.read_bytes()
+    if mutation == "missing":
+        bank.unlink()
+    else:
+        bank.write_bytes(expected[:-1])
+    snapshot_calls = []
+
+    def fake_snapshot_download(**kwargs):
+        snapshot_calls.append(kwargs)
+        bank.write_bytes(expected)
+        return kwargs["local_dir"]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(snapshot_download=fake_snapshot_download),
+    )
+
+    result = pull_model(repo_id, cache_dir=tmp_path)
+
+    assert snapshot_calls
+    assert result["reused_existing"] is False
+    assert result["resumed_existing"] is True
+    assert bank.read_bytes() == expected
+    assert expert_artifact_status(root)["ok"] is True
 
 
 def test_runtime_contract_symlink_is_not_followed(tmp_path: Path) -> None:

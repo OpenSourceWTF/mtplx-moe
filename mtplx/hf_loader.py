@@ -37,6 +37,38 @@ EXPERT_MANIFEST_FILE = "expert-manifest.json"
 MAX_RUNTIME_CONTRACT_BYTES = 1024 * 1024
 
 
+def read_bounded_artifact_member(
+    root: Path | str,
+    name: str,
+    *,
+    max_bytes: int,
+) -> bytes:
+    """Read a bounded artifact member through the trusted descriptor path.
+
+    Members may be regular files inside ``root`` or standard Hugging Face
+    ``snapshots/<revision> -> ../../blobs/<digest>`` links. The resolver
+    rejects every other escape, then the resolved target is opened with
+    ``O_NOFOLLOW`` and checked through its descriptor before any bytes are
+    consumed.
+    """
+
+    from mtplx.expert_manifest import (
+        ExpertManifestError,
+        _read_file_nofollow,
+        resolve_artifact_member,
+    )
+
+    try:
+        resolved = resolve_artifact_member(Path(root), name)
+        return _read_file_nofollow(resolved, max_bytes=max_bytes)
+    except ExpertManifestError:
+        raise
+    except OSError as exc:
+        raise ExpertManifestError(
+            f"could not read artifact member {name}: {exc}"
+        ) from exc
+
+
 @dataclass(frozen=True)
 class RepoFile:
     path: str
@@ -249,7 +281,16 @@ def expert_artifact_status(path: Path) -> dict[str, Any]:
     """
 
     manifest_path = path / EXPERT_MANIFEST_FILE
-    manifest_present = manifest_path.exists()
+    try:
+        os.lstat(manifest_path)
+        manifest_present = True
+    except FileNotFoundError:
+        manifest_present = False
+    except OSError:
+        # An unreadable directory entry is present for trust-boundary
+        # purposes: validation below must fail closed rather than silently
+        # treating the cache as an ordinary non-streamed model.
+        manifest_present = True
     status: dict[str, Any] = {
         "streamed_experts": manifest_present or _declares_streamed_experts(path),
         "manifest_file": EXPERT_MANIFEST_FILE,
@@ -272,14 +313,23 @@ def expert_artifact_status(path: Path) -> dict[str, Any]:
 
     try:
         from mtplx.expert_manifest import (
+            MAX_MANIFEST_BYTES,
+            ExpertManifest,
             ExpertManifestError,
-            load_expert_manifest,
+            _load_json_bytes,
             resolve_artifact_member,
             validate_expert_manifest_spec,
         )
         from mtplx.expert_streaming_models import get_model_spec
 
-        manifest = load_expert_manifest(manifest_path)
+        payload = read_bounded_artifact_member(
+            path,
+            EXPERT_MANIFEST_FILE,
+            max_bytes=MAX_MANIFEST_BYTES,
+        )
+        manifest = ExpertManifest.from_dict(
+            _load_json_bytes(payload, source=str(manifest_path))
+        )
         spec = get_model_spec(manifest.model_key)
         validate_expert_manifest_spec(manifest, spec)
         if manifest.sidecar is None:
@@ -367,8 +417,18 @@ def cached_model_is_complete(path: Path) -> bool:
         return False
     index_names = ("model.safetensors.index.json", "pytorch_model.bin.index.json")
     if any((path / name).is_file() for name in index_names):
-        return any(_complete_indexed_weights(path, name) for name in index_names)
-    return _complete_unindexed_weights(path)
+        weights_complete = any(
+            _complete_indexed_weights(path, name) for name in index_names
+        )
+    else:
+        weights_complete = _complete_unindexed_weights(path)
+    if not weights_complete:
+        return False
+    expert_status = expert_artifact_status(path)
+    return not (
+        expert_status["streamed_experts"]
+        and not expert_status["ok"]
+    )
 
 
 def _pair_bundle_is_complete(path: Path) -> bool:
@@ -413,6 +473,16 @@ def resolve_model_path(model_ref: str, *, cache_dir: str | Path | None = None) -
     if repo_id is None:
         raise FileNotFoundError(f"Model path is not available locally: {local}")
     cached = cached_model_path(repo_id, cache_dir=cache_dir)
+    if cached.is_dir():
+        expert_status = expert_artifact_status(cached)
+        if (
+            expert_status["streamed_experts"]
+            and not expert_status["ok"]
+        ):
+            raise FileNotFoundError(
+                f"Cached streamed model {repo_id} has invalid expert artifacts: "
+                f"{expert_status['reason']}. Run: mtplx pull {repo_id}"
+            )
     if _cached_model_ready_for_repo(cached, repo_id):
         return cached
     raise FileNotFoundError(
@@ -972,6 +1042,15 @@ def pull_model(
         )
         validation = validate_mtplx_model_files(resolved)
         if not cached_model_is_complete(resolved):
+            expert_status = expert_artifact_status(resolved)
+            if (
+                expert_status["streamed_experts"]
+                and not expert_status["ok"]
+            ):
+                raise RuntimeError(
+                    "downloaded streamed model has invalid expert artifacts: "
+                    + str(expert_status["reason"])
+                )
             raise RuntimeError(
                 "downloaded model is incomplete: weight shards are missing or still partial"
             )
