@@ -612,9 +612,10 @@ def _kernel_moe_call(self, x: mx.array) -> mx.array:
     # `install_kernel_router_gemv` leaves a `_router_gemv_pack` holding this
     # block's router weight; its presence is the switch, and the eligibility
     # check refuses anything the kernel does not cover exactly (CPU runs, a
-    # quantized router, a row count past the gate).  When it engages, BOTH the
-    # `self.gate` matmul and the `.astype(mx.float32)` below disappear — which
-    # is the whole point, two dispatches per MoE layer per step.  A softcapped
+    # quantized router, a row count past the gate).  When it engages, the
+    # `self.gate` matmul is taken over by a kernel that writes float32 directly
+    # and the `.astype(mx.float32)` below disappears outright — three dispatches
+    # per MoE layer per step become two.  A softcapped
     # block is excluded here as well as at install: the kernel has no softcap
     # and must never be handed a config that needs one.
     pack = getattr(self, "_router_gemv_pack", None)
@@ -697,9 +698,10 @@ def install_kernel_router_gemv(model: Any) -> dict[str, Any]:
     bias both live there, and ``_kernel_moe_call`` is the only forward that
     knows how to read a ``_router_gemv_pack``.
 
-    Per layer this removes two dispatches from the serial spine — the
-    ``[rows, 3072] x [3072, 256]`` bfloat16 gemv and the bf16 -> f32 cast of its
-    output — 47 times per decode step.  What it costs is the GUARANTEE of
+    Per layer this turns three dispatches on the serial spine into two, 47 times
+    per decode step: the ``[rows, 3072] x [3072, 256]`` bfloat16 gemv is taken
+    over by a kernel that writes float32 logits, so the bf16 -> f32 cast of its
+    output stops existing.  What it costs is the GUARANTEE of
     exactness: the in-kernel dot accumulates in a different order than MLX's
     gemv, and a near-tie between two experts can therefore resolve the other
     way.  That is why it is env-gated and belongs to the inexact configuration

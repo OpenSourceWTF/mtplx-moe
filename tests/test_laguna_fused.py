@@ -539,6 +539,37 @@ def test_router_gemv_eligibility_refuses_what_the_kernel_cannot_do():
         assert kernels.is_router_gemv_eligible(*arguments) is False, label
 
 
+def test_router_gemv_logits_k_partition_covers_every_admissible_width():
+    """The K split has to cover the row exactly once, at every width.
+
+    A threadgroup's eight simdgroups share one expert's row, each taking a
+    ceil-sized slice of the blocks of four.  Ceil is what makes a width that is
+    a multiple of four but not of 32 safe — the last slice comes up short and a
+    surplus one is empty — but ceil is also how a partition ends up covering an
+    element twice or not at all, so walk the arithmetic the kernel uses and
+    check the slices tile the row.  Off the GPU this is the only reachable proof
+    of it.
+    """
+
+    from mtplx.kernels import laguna_decode as kernels
+
+    simd = kernels._ROUTER_GEMV_SIMD
+    split = kernels._ROUTER_GEMV_SPLIT
+    assert kernels._ROUTER_GEMV_THREADS == simd * split
+
+    widths = [4, 8, 28, 32, 3068, 3072, 3076, kernels.MAX_ROUTER_GEMV_DIMS]
+    for dims in widths:
+        assert dims % 4 == 0 and dims <= kernels.MAX_ROUTER_GEMV_DIMS
+        blocks = dims // 4
+        per_part = -(-blocks // split)  # the kernel's (BLOCKS + SPLIT - 1) / SPLIT
+        covered: list[int] = []
+        for part in range(split):
+            begin, end = part * per_part, min((part + 1) * per_part, blocks)
+            for lane in range(simd):
+                covered.extend(range(begin + lane, end, simd))
+        assert sorted(covered) == list(range(blocks)), dims
+
+
 def test_router_gemv_fallback_matches_the_two_step_stock_chain():
     """The CPU fallback inside fused_router_gemv_topk IS the stock arithmetic."""
 

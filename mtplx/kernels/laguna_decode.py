@@ -31,9 +31,10 @@ measured, not assumed.
 
 ``fused_router_gemv_topk`` is the one exception to "leave every matmul alone",
 and it is opt-in for exactly that reason: the router's own gemv is small enough
-that MLX spends more on launching it than on running it, so it folds into the
-router kernel — at the price of a different fp32 reduction order and therefore
-an INEXACT-config path.  See its own note below.
+that MLX spends more on launching it than on running it, so it is taken over by
+a kernel of ours that also absorbs the bf16 -> f32 cast of the logits — at the
+price of a different fp32 reduction order and therefore an INEXACT-config path.
+See its own note below.
 """
 
 from __future__ import annotations
@@ -262,7 +263,7 @@ def fused_router_topk(
 
 
 # ---------------------------------------------------------------------------
-# router gemv folded INTO the router kernel
+# the router gemv taken over from MLX, in two phases
 # ---------------------------------------------------------------------------
 #
 # The kernel above leaves the routing matmul on the stock path, which is the
@@ -272,56 +273,111 @@ def fused_router_topk(
 # ~17-20 us floor for a kernel that does nothing at all.  Most of that number is
 # launch and occupancy, not arithmetic, and it is paid 47 times per decode step
 # on a TRUE serial link — plus a second dispatch for the bf16 -> f32 cast of the
-# logits, 47 more.  Folding the matmul into the router removes both.
+# logits, 47 more.  A kernel that writes float32 logits directly removes the
+# cast outright and gets to choose its own decomposition for the matmul.
 #
-# EXACTNESS.  This variant is NOT bit-exact against the stock chain and is not
-# meant to be.  The dot below is fp32 and strictly sequential in ascending k
-# (unrolled by four, which is why the input width must be a multiple of four);
-# that is deterministic run to run, but it is a different ORDER from MLX's, and
-# deliberately so — chasing gemv's blocking would give up the fusion.  Callers
-# who need bit-exactness use `fused_router_topk` and leave the matmul where it
-# is.
+# WHAT THE FIRST ATTEMPT MEASURED, because it decided this layout.  The first
+# version did the whole thing in ONE dispatch: one threadgroup per row, one
+# THREAD per expert, each thread streaming its own contiguous 6 KB weight row
+# against a staged copy of x.  It was correct — see the digest note below — and
+# at model scale it cost +2.0 ms/step on the compiled lane (17.25/17.41 ms
+# against 15.28/15.53 ms stock anchors).  A threadgroup runs on ONE GPU core, so
+# that layout pulled all 1.5 MB of routing weight through one core while the
+# rest of the GPU had nothing to do, and the layer's next kernel had to wait for
+# it — 47 times per step.
+#
+# WHICH LANE SAYS SO.  The micro-benchmark had missed that, and the reason is
+# worth more than the fix.  It was not cache residency: cycling 47 distinct
+# weights (74 MB, past the SLC) still prices v1 at 0.4 us/layer FASTER than the
+# reference.  The queued lane runs 200 INDEPENDENT iterations, so the GPU
+# overlaps them and hides the fact that any one dispatch occupies a single core.
+# A decode step cannot overlap them — every router dispatch sits between two
+# pieces of dependent work — so the lane that predicts is one where each
+# iteration depends on the previous: no host sync, one command buffer, a true
+# chain.  That lane puts v1 at +41.5 us/layer, i.e. +1.95 ms/step against a
+# window that measured +2.0.  `check_router_gemv_distinct` runs both lanes and
+# prints them side by side for exactly that reason.
+#
+# MEMORY PATTERN.  So the matmul is its own kernel, decomposed for latency
+# rather than for the fusion: ONE threadgroup per (row, expert) — 256 of them
+# per row instead of 1 — with the expert's row split across the threadgroup's 8
+# simdgroups, and each simdgroup's 32 lanes walking its slice in blocks of four.
+# So a lane takes k = 4l .. 4l+3 and strides 128 within its slice, the simdgroup
+# asks for 128 CONSECUTIVE weights (256 bytes) per step, `simd_sum` collapses
+# each simdgroup's partial dot in registers, and the 8 partials meet in 32 bytes
+# of threadgroup memory.  The unroll by four is v1's dot loop unchanged; all that
+# moved is which lane owns which group of four, and it is still why the width
+# must be a multiple of four.  The slices are ceil-partitioned, so a width that
+# is a multiple of four but not of 32 still works: the last simdgroup gets a
+# short slice, and an empty one contributes a deterministic zero.
+#
+# Measured on the chained lane at rows=1, against the three-dispatch reference:
+# this layout is -2.6 to -3.7 us/layer across sessions (-0.12 to -0.17 ms/step
+# over 47 layers), and every configuration from 2 to 16 simdgroups per expert
+# lands within 0.4 us of it, while NOT splitting the row at all (one simdgroup
+# per expert, 16 experts per threadgroup) is only break even.  Staging x in
+# threadgroup memory first was also measured and dropped: x is 6 KB and stays in
+# cache, so the barrier costs more than the re-reads it saves.  At rows=4 the
+# same kernel is -38 us/layer, because MLX's matmul leaves its gemv path above
+# one row and the reference arm quadruples.
+#
+# The second phase is `fused_router_topk`, unchanged — it already takes float32
+# logits and does sigmoid, correction bias, top-k, normalize and scale in one
+# dispatch.  Two dispatches replace the stock three (gemv, astype, selection),
+# and the selection half of the contract is the SAME SOURCE the selection-only
+# kernel runs, not a copy of it.
+#
+# EXACTNESS.  This path is NOT bit-exact against the stock chain and is not
+# meant to be.  The dot is fp32, lane-strided inside each of the eight slices,
+# each slice finished by a simd_sum tree and the eight partials added in
+# ascending slice order: deterministic run to run, but a different ORDER from
+# MLX's, and deliberately so — chasing gemv's blocking would give up the point.
+# Callers who need bit-exactness use `fused_router_topk` and leave the matmul
+# where it is.
 #
 # What keeps the divergence to ulp scale rather than something much bigger is
 # the rounding.  The stock chain is `nn.Linear` on a bfloat16 input and a
 # bfloat16 weight, so its logits come out BFLOAT16 and only then widen to float32
-# — that widening cast is the second dispatch this fold removes.  Carrying a
-# full float32 dot straight into the sigmoid would therefore be a different
-# NUMBER, not a different last bit: bfloat16 resolves to about 4e-3 relative, and
-# through the sigmoid's <= 1/4 slope that is a ~1e-3 shift in every routing
-# score, which would move far more selections than reassociation ever could.  So
-# the dot is rounded to T before the sigmoid, reproducing the precision the
-# stock gemv would have produced.  What is left is the fp32 ordering difference
-# (~1e-6 relative over 3072 terms) surviving only where it straddles a bfloat16
-# rounding boundary — rare, and one ulp when it happens.
+# — that widening cast is the dispatch this path absorbs.  Carrying a full
+# float32 dot straight into the sigmoid would therefore be a different NUMBER,
+# not a different last bit: bfloat16 resolves to about 4e-3 relative, and through
+# the sigmoid's <= 1/4 slope that is a ~1e-3 shift in every routing score, which
+# would move far more selections than reassociation ever could.  So the dot is
+# rounded to T before it leaves the kernel, reproducing the precision the stock
+# gemv would have produced.  What is left is the fp32 ordering difference (~1e-6
+# relative over 3072 terms) surviving only where it straddles a bfloat16 rounding
+# boundary — rare, and one ulp when it happens.
 #
-# Rare turned out to mean "not once yet".  At the real shape over rows 1/2/4
-# (`check_router_gemv`) every logit rounded to the same bfloat16 the stock gemv
-# produced: zero selection changes, and a per-expert weight delta of 7e-9 —
-# below the 1e-6 the SELECTION-only kernel already diverges by, since that one's
-# normalizing sum reassociates too.  So the fold is measured to be no less exact
-# than the kernel router it replaces.  It is still classified inexact, because
-# "no straddle observed" is not "no straddle possible" and one bfloat16 ulp on a
-# near-tie logit can reorder two experts; the classification is a statement
-# about the guarantee, not about the observed delta.
-#
-# MEMORY PATTERN.  One threadgroup per row, NUM_EXPERTS threads.  The row of x
-# is staged into threadgroup memory first — a coalesced strided load across all
-# NUM_EXPERTS threads, converted to float once — and then thread e streams its
-# own contiguous row of the weight, `gate_weight[e * DIMS ...]`, multiplying
-# against the shared staged copy.  So x is read from global memory ONCE per row
-# instead of once per expert, and every thread's weight reads are sequential
-# within the thread.  What this layout does NOT get is coalescing ACROSS
-# threads: at a given k the 256 threads are DIMS*sizeof(T) bytes apart, so the
-# weight stream is 256 concurrent sequential readers rather than one wide one.
-# That is the deliberate simplicity, and it is also the risk — a single
-# threadgroup pulls 1.5 MB through one GPU core, so whether this wins is a
-# bandwidth question that only the GPU can answer.  `bench/laguna/
-# laguna_kernel_check.py::check_router_gemv` times it against the stock chain.
+# Rare has now been counted rather than hoped at: comparing this kernel's logits
+# against the stock gemv's over 47 distinct weights, ONE logit in 12032 lands a
+# bfloat16 ulp away at rows=1, and 8 to 13 in 48128 at rows=4.  None of them
+# moved a selection — `check_router_gemv` and `check_router_gemv_distinct` see
+# zero flips over 50 draws at the real shape, with a per-expert weight delta of
+# 7e-9, below the 1e-6 the SELECTION-only kernel already diverges by since its
+# normalizing sum reassociates too.  The guarded window said the same thing where
+# it counts: with this rounding contract in place the end-to-end token digest
+# MATCHED the stock lane's, so nothing the model emitted moved.  It stays
+# classified inexact — a straddled logit demonstrably happens, and on a near-tie
+# one of them can reorder two experts.  The classification is a statement about
+# the guarantee, not about the observed delta.
 
-# Threadgroup memory for the staged row: DIMS floats.  4096 keeps that at 16 KB,
-# which leaves room for the 4 KB of selection scratch inside the 32 KB budget.
+# The widest router row this decomposition is characterized at.  Nothing in the
+# kernel breaks above it — the slices are strides, not unrolls — but at 4096 each
+# of the eight slices is already 128 blocks of four for one float of output, and
+# a wider router would want more simdgroups on the row rather than this shape
+# stretched.  The gate keeps an uncharacterized width on the stock chain instead
+# of guessing that the same split still holds there.
 MAX_ROUTER_GEMV_DIMS = 4096
+
+# One threadgroup per (row, expert), 8 simdgroups of 32 lanes sharing that
+# expert's row.  Nothing here has to divide the expert count, so the geometry
+# cannot disagree with the selection gate.  The simdgroup/lane split is
+# arithmetic rather than `thread_index_in_simdgroup` because a 1-D threadgroup
+# assigns simdgroup s the thread indices [32s, 32s + 32) by definition, and this
+# way the kernel needs one attribute instead of three.
+_ROUTER_GEMV_SIMD = 32
+_ROUTER_GEMV_SPLIT = 8
+_ROUTER_GEMV_THREADS = _ROUTER_GEMV_SIMD * _ROUTER_GEMV_SPLIT
 
 
 def is_router_gemv_eligible(
@@ -348,7 +404,8 @@ def is_router_gemv_eligible(
         return False
     if experts != int(bias.shape[0]):
         return False
-    # Unrolled by four, and the staged row has to fit in threadgroup memory.
+    # The dot walks the row in blocks of four, and eight simdgroups share it, so
+    # the width also has to stay inside the one this split is characterized at.
     if dims <= 0 or (dims % 4) != 0 or dims > MAX_ROUTER_GEMV_DIMS:
         return False
     if rows <= 0 or rows > _router_max_rows():
@@ -357,57 +414,110 @@ def is_router_gemv_eligible(
 
 
 @lru_cache(maxsize=None)
-def _router_gemv_kernel(experts: int, top_k: int, dims: int):
+def _router_gemv_logits_kernel(experts: int, dims: int):
     header = f"""
         using namespace metal;
         constant constexpr int NUM_EXPERTS = {experts};
-        constant constexpr int TOP_K = {top_k};
         constant constexpr int DIMS = {dims};
+        constant constexpr int SIMD = {_ROUTER_GEMV_SIMD};
+        constant constexpr int SPLIT = {_ROUTER_GEMV_SPLIT};
+        constant constexpr int BLOCKS = DIMS / 4;
+        constant constexpr int PER_PART = (BLOCKS + SPLIT - 1) / SPLIT;
     """
 
-    source = (
-        """
-        uint row = threadgroup_position_in_grid.x;
+    source = """
+        uint tg = threadgroup_position_in_grid.x;
         uint lid = thread_position_in_threadgroup.x;
+        uint part = lid / uint(SIMD);
+        uint lane = lid - part * uint(SIMD);
 
-        threadgroup float tg_x[DIMS];
-"""
-        + _ROUTER_SELECT_DECLS
-        + """
-        // Stage this row of x once, coalesced across the whole threadgroup, and
-        // convert to float here so the dot loop below never re-converts it.
-        const device T* x_row = x + (size_t)row * (size_t)DIMS;
-        for (uint i = lid; i < uint(DIMS); i += uint(NUM_EXPERTS)) {
-            tg_x[i] = static_cast<float>(x_row[i]);
+        uint row = tg / uint(NUM_EXPERTS);
+        uint expert = tg - row * uint(NUM_EXPERTS);
+
+        threadgroup float partials[SPLIT];
+
+        // x is one short row and every threadgroup wants all of it, so it is
+        // read straight from global memory: it was written by the kernel just
+        // before this one and is in cache, and staging it in threadgroup memory
+        // measured slower than the re-reads it saves.
+        //
+        // `auto`, not `const device T*`: MLX hands a small enough input to the
+        // kernel in the CONSTANT address space instead of device, and a pointer
+        // declared with an address space it did not pick fails to compile.  At
+        // the real shape both are device; at the smallest shape the gate admits,
+        // x is constant.  Inferring costs nothing and covers both.
+        auto x_row = x + (size_t)row * (size_t)DIMS;
+        auto w_row = gate_weight + (size_t)expert * (size_t)DIMS;
+
+        // This simdgroup's slice of the expert's row, walked in blocks of four:
+        // at every step its 32 lanes want 128 CONSECUTIVE weights, which is a
+        // handful of wide reads rather than 32 scattered ones.  The slice is
+        // ceil-sized, so the last one may be short and a surplus one empty.
+        uint kbeg = part * uint(PER_PART) + lane;
+        uint kend = metal::min((part + 1u) * uint(PER_PART), uint(BLOCKS));
+        float acc = 0.0f;
+        for (uint b = kbeg; b < kend; b += uint(SIMD)) {
+            uint k = b * 4u;
+            acc += static_cast<float>(w_row[k]) * static_cast<float>(x_row[k]);
+            acc += static_cast<float>(w_row[k + 1u]) *
+                   static_cast<float>(x_row[k + 1u]);
+            acc += static_cast<float>(w_row[k + 2u]) *
+                   static_cast<float>(x_row[k + 2u]);
+            acc += static_cast<float>(w_row[k + 3u]) *
+                   static_cast<float>(x_row[k + 3u]);
+        }
+        acc = simd_sum(acc);
+        if (lane == 0) {
+            partials[part] = acc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Thread e owns expert e's whole row.  Sequential ascending k in float,
-        // unrolled by four: one fixed order, not MLX's.
-        const device T* w_row = gate_weight + (size_t)lid * (size_t)DIMS;
-        float acc = 0.0f;
-        for (uint k = 0; k < uint(DIMS); k += 4u) {
-            acc += static_cast<float>(w_row[k]) * tg_x[k];
-            acc += static_cast<float>(w_row[k + 1u]) * tg_x[k + 1u];
-            acc += static_cast<float>(w_row[k + 2u]) * tg_x[k + 2u];
-            acc += static_cast<float>(w_row[k + 3u]) * tg_x[k + 3u];
+        if (lid == 0) {
+            // Ascending slice order, so the sum is one fixed order run to run.
+            float total = 0.0f;
+            for (uint p = 0; p < uint(SPLIT); ++p) {
+                total += partials[p];
+            }
+            // The stock gemv writes T and the stock chain then widens it to
+            // float, so round HERE — carrying the raw float dot forward would be
+            // a different number, not a different last bit.  See the note above.
+            float logit = static_cast<float>(static_cast<T>(total));
+            logits[(size_t)row * (size_t)NUM_EXPERTS + (size_t)expert] = logit;
         }
-        // The stock gemv writes T and the stock chain then widens it to float,
-        // so round HERE — carrying the raw float dot forward would be a
-        // different number, not a different last bit.  See the note above.
-        float logit = static_cast<float>(static_cast<T>(acc));
-        float score = 1.0f / (1.0f + metal::exp(-logit));
-"""
-        + _ROUTER_SELECT_EPILOGUE
-    )
+    """
 
     return mx.fast.metal_kernel(
-        name=f"mtplx_laguna_router_gemv_e{experts}_k{top_k}_d{dims}",
-        input_names=["x", "gate_weight", "correction_bias", "scale", "normalize"],
-        output_names=["indices", "weights"],
+        name=f"mtplx_laguna_router_gemv_logits_e{experts}_d{dims}",
+        input_names=["x", "gate_weight"],
+        output_names=["logits"],
         header=header,
         source=source,
     )
+
+
+def router_gemv_logits(x: mx.array, gate_weight: mx.array) -> mx.array:
+    """The routing matmul alone: float32 logits at bfloat16 precision.
+
+    Callers check :func:`is_router_gemv_eligible` first — there is no fallback
+    here, because the only caller that needs one is
+    :func:`fused_router_gemv_topk` and it owns the stock path.  The float32
+    output is what makes the stock chain's separate widening cast unnecessary;
+    the VALUE is still a bfloat16 one, rounded exactly where the stock gemv
+    rounds.
+    """
+
+    rows, dims = int(x.shape[0]), int(x.shape[1])
+    experts = int(gate_weight.shape[0])
+    kernel = _router_gemv_logits_kernel(experts, dims)
+    (logits,) = kernel(
+        inputs=[x, gate_weight],
+        template=[("T", x.dtype)],
+        grid=(_ROUTER_GEMV_THREADS * experts * rows, 1, 1),
+        threadgroup=(_ROUTER_GEMV_THREADS, 1, 1),
+        output_shapes=[(rows, experts)],
+        output_dtypes=[mx.float32],
+    )
+    return logits
 
 
 def fused_router_gemv_topk(
@@ -419,7 +529,7 @@ def fused_router_gemv_topk(
     normalize: bool,
     scale: float,
 ) -> tuple[mx.array, mx.array]:
-    """Routing matmul AND the routing decision, in one dispatch.
+    """Routing matmul AND the routing decision, in two dispatches.
 
     ``x`` is the flattened hidden state ``[rows, dims]`` and ``gate_weight`` is
     the router's ``nn.Linear`` weight ``[experts, dims]`` — the layout mlx-lm
@@ -434,26 +544,18 @@ def fused_router_gemv_topk(
     kernel does not cover, so callers can switch it on without owning a
     correctness branch — but see the exactness note above: where the kernel DOES
     run, it is an inexact-config path.
+
+    Eligible or not, the tail is the same call, so the two branches can only
+    differ in where the logits came from.
     """
 
     if not is_router_gemv_eligible(x, gate_weight, correction_bias, top_k):
         logits = (x @ gate_weight.swapaxes(-1, -2)).astype(mx.float32)
-        return fused_router_topk(
-            logits, correction_bias, top_k, normalize=normalize, scale=scale
-        )
-
-    rows, dims = int(x.shape[0]), int(x.shape[1])
-    experts = int(gate_weight.shape[0])
-    kernel = _router_gemv_kernel(experts, top_k, dims)
-    indices, weights = kernel(
-        inputs=[x, gate_weight, correction_bias, float(scale), bool(normalize)],
-        template=[("T", x.dtype)],
-        grid=(experts * rows, 1, 1),
-        threadgroup=(experts, 1, 1),
-        output_shapes=[(rows, top_k), (rows, top_k)],
-        output_dtypes=[mx.uint32, mx.float32],
+    else:
+        logits = router_gemv_logits(x, gate_weight)
+    return fused_router_topk(
+        logits, correction_bias, top_k, normalize=normalize, scale=scale
     )
-    return indices, weights
 
 
 def is_per_head_gate_eligible(
