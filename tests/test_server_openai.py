@@ -10508,6 +10508,139 @@ def test_server_state_emits_startup_progress(monkeypatch, capsys):
     assert state.context_window == 32768
 
 
+def test_server_state_caps_expert_served_context_to_installed_kv_limit(
+    monkeypatch,
+):
+    import mtplx.expert_cli as expert_cli
+    import mtplx.expert_runtime as expert_runtime
+
+    environment_before = dict(os.environ)
+    stream_config = expert_runtime.ExpertStreamingConfig(
+        model_key="hy3-expert-oq2e",
+        memory_limit_bytes=256 * 1024**3,
+        max_live_kv_tokens=4_096,
+    )
+
+    def streaming_load_kwargs(_args, model):
+        if model == "models/streamed":
+            return {
+                "mtp": False,
+                "expert_streaming_config": stream_config,
+            }
+        return {}
+
+    def fake_load(model, mtp, contract, **kwargs):
+        del contract
+        selected_config = kwargs.get("expert_streaming_config")
+        return SimpleNamespace(
+            model_path=Path(model),
+            mtp_enabled=mtp,
+            tokenizer=SimpleNamespace(),
+            expert_streaming=(
+                SimpleNamespace(config=selected_config)
+                if selected_config is not None
+                else None
+            ),
+        )
+
+    monkeypatch.setattr(
+        expert_cli,
+        "expert_streaming_load_kwargs",
+        streaming_load_kwargs,
+    )
+    monkeypatch.setattr(
+        expert_cli,
+        "apply_expert_profile_child_env",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        expert_runtime,
+        "reconcile_mlx_memory_cap",
+        lambda _plan: 256 * 1024**3,
+    )
+    monkeypatch.setattr(openai, "_apply_metal_memory_caps", lambda: {})
+    monkeypatch.setattr(openai, "apply_profile_env", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(openai, "profile_env_status", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
+    monkeypatch.setattr(
+        openai,
+        "_configure_mlx_cache_limit",
+        lambda _args: {"configured": False},
+    )
+    monkeypatch.setattr(openai, "load", fake_load)
+    monkeypatch.setattr(
+        openai,
+        "_install_draft_lm_head",
+        lambda *_args, **_kwargs: {"installed": True},
+    )
+    monkeypatch.setattr(
+        openai,
+        "_draft_head_identity",
+        lambda _runtime: "draft-head",
+    )
+    monkeypatch.setattr(openai, "_template_hash", lambda _tokenizer: "template")
+    monkeypatch.setattr(
+        openai,
+        "_resolve_context_window",
+        lambda _tokenizer, _model: 262_144,
+    )
+    monkeypatch.setattr(
+        openai,
+        "EngineSessionManager",
+        lambda **_kwargs: SimpleNamespace(),
+    )
+
+    states = []
+    try:
+        regular_args = parse_args(
+            ["--model", "models/regular", "--warmup-tokens", "0"]
+        )
+        regular = openai.ServerState(regular_args)
+        states.append(regular)
+        assert regular.model_context_window_max == 262_144
+        assert regular.context_window == 262_144
+
+        for context_args in (
+            [],
+            ["--context-window", "131072"],
+        ):
+            args = parse_args(
+                [
+                    "--model",
+                    "models/streamed",
+                    "--expert-streaming",
+                    "--generation-mode",
+                    "ar",
+                    "--warmup-tokens",
+                    "0",
+                    *context_args,
+                ]
+            )
+            state = openai.ServerState(args)
+            states.append(state)
+
+            assert state.args.max_response_tokens is None
+            assert state.model_context_window_max == 262_144
+            assert state.context_window == 4_096
+            response_tokens, _sampler, limits = openai._generation_params(
+                state,
+                prompt_token_count=128,
+                max_tokens=None,
+                temperature=None,
+                top_p=None,
+                top_k=None,
+            )
+            assert response_tokens == 4_096 - 128
+            assert limits["remaining_context_tokens"] == 4_096 - 128
+            assert 128 + response_tokens <= stream_config.max_live_kv_tokens
+    finally:
+        for state in states:
+            state.model_scheduler.shutdown(wait=True, cancel_futures=True)
+        os.environ.clear()
+        os.environ.update(environment_before)
+
+
 def test_server_state_binds_sustained_policy_before_runtime_load(monkeypatch):
     environment_before = dict(os.environ)
     try:

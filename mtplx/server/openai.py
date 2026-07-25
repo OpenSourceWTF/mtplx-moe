@@ -1891,10 +1891,12 @@ class ServerState:
             args.model,
         )
         requested_context_window = int(getattr(args, "context_window", None) or 0)
-        self.context_window = (
-            max(4_096, min(int(self.model_context_window_max), requested_context_window))
-            if requested_context_window > 0
-            else int(self.model_context_window_max)
+        # Preserve the model capability separately for metadata, but install
+        # only a served window that the selected runtime can actually admit.
+        self.context_window = _effective_served_context_window(
+            model_context_window_max=self.model_context_window_max,
+            requested_context_window=requested_context_window,
+            runtime=self.runtime,
         )
         _startup_line(f"[5/6] Context window: {self.context_window} tokens")
         # The paged KV pool clamps geometric growth to this window (#150);
@@ -3011,6 +3013,37 @@ def _resolve_context_window(tokenizer: Any, model_path: str) -> int:
 
     sane = [value for value in candidates if 0 < value <= 1_000_000]
     return max(sane) if sane else 262_144
+
+
+def _effective_served_context_window(
+    *,
+    model_context_window_max: int,
+    requested_context_window: int,
+    runtime: Any,
+) -> int:
+    served_context_window = (
+        max(
+            4_096,
+            min(int(model_context_window_max), int(requested_context_window)),
+        )
+        if requested_context_window > 0
+        else int(model_context_window_max)
+    )
+    expert_streaming = getattr(runtime, "expert_streaming", None)
+    if expert_streaming is None:
+        return served_context_window
+    stream_config = getattr(expert_streaming, "config", None)
+    max_live_kv_tokens = getattr(stream_config, "max_live_kv_tokens", None)
+    if (
+        isinstance(max_live_kv_tokens, bool)
+        or not isinstance(max_live_kv_tokens, int)
+        or max_live_kv_tokens <= 0
+    ):
+        raise ValueError(
+            "installed expert streaming config requires positive "
+            "max_live_kv_tokens"
+        )
+    return min(served_context_window, max_live_kv_tokens)
 
 
 def _content_to_text(content: Any) -> str:
