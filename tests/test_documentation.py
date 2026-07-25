@@ -156,6 +156,23 @@ def test_readme_lists_every_preconfigured_model_in_one_section():
     assert len(documented_ids) == 16
 
 
+def test_readme_publishes_retained_hy3_quality_and_speed_receipts():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    supported_section = readme.split("## Supported models", 1)[1].split(
+        "\n## ", 1
+    )[0]
+
+    assert "HumanEvalPlus pass@1" in supported_section
+    assert "`hy3-oq2e-64`: 86.6% (142/164)" in supported_section
+    assert "`hy3-oq2e-88`/`-96`: 87.2% (143/164)" in supported_section
+    assert "`-64`: 9.31" in supported_section
+    assert "`-88`: 22.35" in supported_section
+    assert "`-96`: 30.17 tok/s" in supported_section
+    assert "single-stream AR decode" in supported_section
+    assert "M5 Max with 128 GB unified memory" in supported_section
+    assert "Not measured" in supported_section
+
+
 def test_documentation_checker_skips_plan_pseudocode_but_checks_user_guides(
     tmp_path,
 ):

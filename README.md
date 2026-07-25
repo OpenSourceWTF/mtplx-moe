@@ -107,11 +107,29 @@ Launch any catalog model by exact ID:
 
 ### Fork-specific models
 
-| Exact model ID | Runtime | Capacity requirement | Support status |
-|---|---|---|---|
-| [`OpensourceWTF/Hy3-oQ2e-MTPLX-streaming`](https://huggingface.co/OpensourceWTF/Hy3-oQ2e-MTPLX-streaming) | SSD-streamed AR | 71, 95, or 103 GiB process ceiling; about 97.6 GB download | Promoted `hy3-oq2e-64`, `-88`, and `-96` profiles |
-| [`OpensourceWTF/GLM-5.2-t158-MTPLX-streaming`](https://huggingface.co/OpensourceWTF/GLM-5.2-t158-MTPLX-streaming) | SSD-streamed AR | Measured 96 GiB configuration; about 187 GB download | Manual and experimental; no task-quality receipt |
-| [`mlx-community/Laguna-S-2.1-oQ4e`](https://huggingface.co/mlx-community/Laguna-S-2.1-oQ4e) | Native AR only | At least 96 GiB unified memory; 128 GiB recommended; 64.13 GB download | Exact revision pinned and artifact-verified |
+Quality and speed appear only where this fork retains a receipt for the exact
+artifact and quantization. “Not measured” means there is no comparable retained
+run, not that the result is zero.
+
+| Exact model ID | Runtime | Capacity requirement | HumanEvalPlus pass@1 | Measured AR decode | Support status |
+|---|---|---|---|---|---|
+| [`OpensourceWTF/Hy3-oQ2e-MTPLX-streaming`](https://huggingface.co/OpensourceWTF/Hy3-oQ2e-MTPLX-streaming) | SSD-streamed AR | 71, 95, or 103 GiB process ceiling; about 97.6 GB download | `hy3-oq2e-64`: 86.6% (142/164); `hy3-oq2e-88`/`-96`: 87.2% (143/164) | `-64`: 9.31; `-88`: 22.35; `-96`: 30.17 tok/s | Promoted `hy3-oq2e-64`, `-88`, and `-96` profiles |
+| [`OpensourceWTF/GLM-5.2-t158-MTPLX-streaming`](https://huggingface.co/OpensourceWTF/GLM-5.2-t158-MTPLX-streaming) | SSD-streamed AR | Measured 96 GiB configuration; about 187 GB download | Not measured | Not measured | Manual and experimental; no task-quality receipt |
+| [`mlx-community/Laguna-S-2.1-oQ4e`](https://huggingface.co/mlx-community/Laguna-S-2.1-oQ4e) | Native AR only | At least 96 GiB unified memory; 128 GiB recommended; 64.13 GB download | Not measured | Not measured | Exact revision pinned and artifact-verified |
+
+The HumanEvalPlus v0.1.10 receipts use all 164 tasks, one sample per task,
+greedy decoding, temperature 0, seed 42, and the chat endpoint. They were
+collected through the MTP depth-2 evaluation lane, so they establish retained
+quality evidence for the q4 resident trunk used by `hy3-oq2e-64` and the q8
+resident trunk used by `-88`/`-96`; they are not an AR-server pass@1 claim.
+
+TPS is single-stream AR decode on an M5 Max with 128 GB unified memory, using a
+1,024-token prompt and 1,024 generated tokens. The `-64` figure is the
+three-repetition mean for the same zero-island, cache-heavy geometry at its
+separate 16K-KV performance envelope; the installed `-64` profile uses a 4K
+KV ceiling. The `-88` and `-96` figures are retained 4K-ceiling measurements.
+Different hardware, context, cache warmth, or concurrent work will change
+absolute throughput.
 
 Hy3 starts with the zero-config `mtplx serve` command above. GLM requires the
 manual paging configuration in the
