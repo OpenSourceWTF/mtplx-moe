@@ -1817,6 +1817,18 @@ def _linear_gated_delta_from_conv_tape_capture(
     state: mx.array,
     gdn: Any,
 ):
+    # Alternative execution layout for the same contract (A3B C1 lineage).
+    # Fail-closed: any ineligibility returns None from the wrapper and we
+    # fall through to the incumbent TGY kernel below.
+    if os.environ.get("MTPLX_LINEAR_GDN_TAPE_IMPL", "").strip().lower() == "headquarter":
+        try:
+            from .kernels.gdn_tape_headquarter import headquarter_tape_capture
+        except Exception:
+            headquarter_tape_capture = None
+        if headquarter_tape_capture is not None:
+            result = headquarter_tape_capture(conv_out, g, beta, state, gdn)
+            if result is not None:
+                return result
     if _linear_gated_delta_from_conv_tape_kernel is None:
         return None
     B, T, conv_dim = conv_out.shape
