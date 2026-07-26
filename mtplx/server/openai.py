@@ -307,8 +307,15 @@ STREAM_SILENCE_WARN_INTERVAL_S = 60.0
 STREAM_STALL_DEADLINE_S = float(
     os.environ.get("MTPLX_STREAM_STALL_DEADLINE_S") or 300.0
 )
-STREAM_HIDDEN_TOOL_GUARD_TOKENS = 2048
-STREAM_HIDDEN_TOOL_GUARD_S = 30.0
+# Runaway-hidden-generation backstop. Native-tool agent workloads stream
+# multi-thousand-token arguments (whole files) as legitimate hidden text, so
+# the ceilings are env-tunable; the defaults keep the original chat-UX guard.
+STREAM_HIDDEN_TOOL_GUARD_TOKENS = int(
+    os.environ.get("MTPLX_STREAM_HIDDEN_TOOL_GUARD_TOKENS", "2048")
+)
+STREAM_HIDDEN_TOOL_GUARD_S = float(
+    os.environ.get("MTPLX_STREAM_HIDDEN_TOOL_GUARD_S", "30")
+)
 STREAM_TOOL_CALL_FINISH_GRACE_S = 0.05
 TOOL_PROTOCOL_BOUNDARY_GRACE_S = 0.05
 _REASONING_DETAILS_RE = re.compile(
