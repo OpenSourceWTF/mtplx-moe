@@ -361,7 +361,11 @@ def test_leading_whitespace_before_marker_still_dropped():
     assert any("tool_calls" in d for d in (out + finish_deltas))
 
 
-def test_unknown_tool_name_suppresses_raw_tool_markup():
+def test_unknown_tool_name_passes_through_as_tool_call():
+    # OpenAI-compatible contract: an unknown-named call is surfaced to the
+    # client, which owns the rejection (and answers the model so it can
+    # self-correct). Suppressing it degraded the whole turn to prose and cost
+    # agent clients (Cline) a consecutive-mistake strike per occurrence.
     t = _make()
     text = (
         "<tool_call>\n<function=Agent>\n"
@@ -369,9 +373,17 @@ def test_unknown_tool_name_suppresses_raw_tool_markup():
         "</function>\n</tool_call>"
     )
     out = t.feed("content", text)
-    assert t.finish() == []
-    assert t.has_tool_calls is False
-    assert t.fallback_reason == "unknown tool 'Agent'"
+    finish_deltas = t.finish()
+    assert t.has_tool_calls is True
+    assert t.fallback_reason is None
+    named = [
+        d for d in (out + finish_deltas)
+        if any(
+            (c.get("function") or {}).get("name") == "Agent"
+            for c in (d.get("tool_calls") or [])
+        )
+    ]
+    assert named, "unknown-named call should stream as a tool_call delta"
     assert _content_text(out) == ""
 
 

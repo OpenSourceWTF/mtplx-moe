@@ -474,8 +474,10 @@ def parse_tool_calls(
         cleaned, calls, malformed = _parse_xml_tool_calls(cleaned_text)
         filtered_calls = _filter_known_tools(calls, tools)
         if calls and not filtered_calls and tools:
-            first_name = calls[0].get("function", {}).get("name", "unknown")
-            malformed = f"unknown tool '{first_name}'"
+            # OpenAI passes unknown-named calls through; the client owns the
+            # rejection (and answers the model, letting it self-correct).
+            # Degrading the whole turn to prose costs the agent a strike.
+            filtered_calls = calls
         if filtered_calls:
             return ToolCallExtraction(
                 cleaned_text=cleaned,

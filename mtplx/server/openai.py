@@ -6726,23 +6726,28 @@ def _parse_generated_tool_calls(
             raise _tool_protocol_error("unsupported tool_call payload format")
         name, arguments = parsed
         canonical_name = _canonical_tool_name_for_model_output(name, tools)
-        if canonical_name is None:
-            raise _tool_protocol_error(f"unknown tool '{name}'")
         arguments_value = _json_object_value(
             arguments,
             context=f"tool_call[{index}]",
         )
-        arguments_value = _normalize_tool_arguments_for_schema(
-            tool_name=canonical_name,
-            arguments=arguments_value,
-            tools=tools,
-        )
-        _validate_tool_arguments_for_schema(
-            tool_name=canonical_name,
-            arguments=arguments_value,
-            tools=tools,
-            context=f"tool_call[{index}]",
-        )
+        if canonical_name is None:
+            # OpenAI-compatible pass-through: surface the call under its raw
+            # name and let the client own the unknown-tool rejection (the
+            # client answers the model, which self-corrects). There is no
+            # schema to normalize or validate against.
+            canonical_name = str(name)
+        else:
+            arguments_value = _normalize_tool_arguments_for_schema(
+                tool_name=canonical_name,
+                arguments=arguments_value,
+                tools=tools,
+            )
+            _validate_tool_arguments_for_schema(
+                tool_name=canonical_name,
+                arguments=arguments_value,
+                tools=tools,
+                context=f"tool_call[{index}]",
+            )
         calls.append(
             {
                 "id": f"call_{uuid.uuid4().hex[:24]}",
@@ -7052,8 +7057,8 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                     self._tools,
                 )
                 if canonical_name is None:
-                    self._fallback_reason = f"unknown tool '{name}'"
-                    return deltas
+                    # Pass-through: the client owns unknown-tool rejection.
+                    canonical_name = name
                 self._name = canonical_name
                 self._started = True
                 self._buf = self._buf[function_end + 1 :]

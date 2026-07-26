@@ -320,3 +320,15 @@ def test_omlx_tool_parser_poolside_residue_stays_content():
 
     assert extraction.status == "malformed_as_content"
     assert extraction.tool_calls is None
+
+
+def test_omlx_tool_parser_passes_unknown_tool_name_through():
+    extraction = parse_tool_calls(
+        "<tool_call>task_progress<arg_key>steps</arg_key>"
+        "<arg_value>plan</arg_value></tool_call>",
+        tokenizer=None,
+        tools=[{"type": "function", "function": {"name": "list_files"}}],
+    )
+
+    assert extraction.status == "parsed"
+    assert extraction.tool_calls[0]["function"]["name"] == "task_progress"
