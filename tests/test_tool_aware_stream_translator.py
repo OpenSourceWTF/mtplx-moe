@@ -863,3 +863,60 @@ def test_schema_type_mismatch_suppresses_raw_tool_markup():
     assert t.has_tool_calls is False
     assert "timeout must be number" in (t.fallback_reason or "")
     assert _content_text(out) == ""
+
+
+def test_bracket_call_streams_as_tool_call_not_content():
+    # Live shape 2026-07-25: prose, then a complete [Calling tool: ...] block
+    # whose arguments contain `]` (task_progress checklist) and `})]` inside
+    # strings. The old start detector skipped the prefix on the early `]`,
+    # so the block streamed as content AND the finish-time rescue emitted the
+    # same call — a double delivery.
+    payload = {
+        "input": "*** Begin Patch\n+const f = (x) => ({y: x});\ncall(f(1))]\n*** End Patch",
+        "task_progress": "- [x] one\n- [ ] two",
+    }
+    text = (
+        "Let me start with the math utilities: [Calling tool: apply_patch("
+        + json.dumps(payload)
+        + ")]"
+    )
+    t = _make(
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "apply_patch",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"input": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+    )
+    out = []
+    for i in range(0, len(text), 7):  # simulate streaming in small chunks
+        out += t.feed("content", text[i : i + 7])
+    out += t.finish()
+    assert t.has_tool_calls is True, t.fallback_reason
+    contents = _content_text(out)
+    assert "[Calling tool:" not in contents
+    assert "Begin Patch" not in contents
+    args = _argument_text(out)
+    assert json.loads(args) == payload
+
+
+def test_unterminated_bracket_call_suppresses_like_unclosed_markup():
+    # Same contract as test_unclosed_tool_call_suppresses_raw_tool_markup:
+    # a never-completing block is suppressed with a recorded reason, keeping
+    # the drift dialect out of the visible transcript (and the model's
+    # conversation history).
+    text = 'And now: [Calling tool: apply_patch({"input": "never closed'
+    t = _make()
+    out = []
+    for i in range(0, len(text), 9):
+        out += t.feed("content", text[i : i + 9])
+    out += t.finish()
+    assert t.has_tool_calls is False
+    assert t.fallback_reason
+    assert _content_text(out) == "And now: "

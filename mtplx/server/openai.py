@@ -6634,6 +6634,74 @@ def _scan_bracket_tool_call(
     return close.end(), name, arguments
 
 
+def _classify_bracket_tool_call(text: str, start: int) -> str:
+    """Classify the bracket block starting at `start` (which sits on a full
+    `[Calling tool:`/`[Tool call:` prefix).
+
+    'complete'   — a well-formed call the scanner can extract now.
+    'incomplete' — the available text ends inside a structurally consistent
+                   block; more chunks may complete it (streaming: buffer).
+    'invalid'    — the structure is already broken with text to spare (e.g. a
+                   dangling prefix in prose); never a call, leave it to the
+                   content path and its prefix sanitizer.
+    """
+    if _scan_bracket_tool_call(text, start) is not None:
+        return "complete"
+    tail = text[start:]
+    head = re.match(
+        r"\[(?:Calling tool|Tool call):\s*[A-Za-z_][\w.-]*\s*\(",
+        tail,
+        re.IGNORECASE,
+    )
+    if head is None:
+        after_prefix = re.sub(
+            r"^\[(?:Calling tool|Tool call):",
+            "",
+            tail,
+            flags=re.IGNORECASE,
+        )
+        if re.fullmatch(r"\s*(?:[A-Za-z_][\w.-]*)?\s*\(?", after_prefix):
+            return "incomplete"
+        return "invalid"
+    i = start + head.end()
+    if i >= len(text):
+        return "incomplete"
+    if text[i] != "{":
+        return (
+            "incomplete"
+            if re.fullmatch(r"\s*\)?\s*\]?", text[i:])
+            else "invalid"
+        )
+    depth = 0
+    in_string = False
+    escaped = False
+    j = i
+    while j < len(text):
+        ch = text[j]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                j += 1
+                break
+        j += 1
+    if depth != 0:
+        return "incomplete"
+    # Object closed but the scanner rejected it: either the `)]` close is
+    # still arriving, or the payload is truly malformed.
+    return "incomplete" if re.fullmatch(r"\s*\)?\s*", text[j:]) else "invalid"
+
+
 def _tool_marker_pairs_from_tokenizer(tokenizer: Any | None) -> list[tuple[str, str]]:
     if tokenizer is None:
         return []
@@ -7571,12 +7639,16 @@ class _ToolAwareContentStreamTranslator:
         for prefix in _BRACKET_TOOL_PREFIXES:
             bracket_idx = lowered.find(prefix.lower())
             while bracket_idx >= 0:
-                candidate = text[bracket_idx:]
-                if _BRACKET_TOOL_CALL_RE.match(candidate):
+                # The old gate demanded a complete regex match mid-stream and
+                # skipped ahead on any early `]` (present in every
+                # task_progress checklist), so bracket-call text streamed to
+                # the client as content AND the finish-time rescue emitted the
+                # same call — a double delivery that also taught the model its
+                # drift dialect was accepted. Buffer on complete AND
+                # still-completing blocks; only structurally-dead prefixes
+                # stay on the content path for the prefix sanitizer.
+                if _classify_bracket_tool_call(text, bracket_idx) != "invalid":
                     candidates.append(bracket_idx)
-                    break
-                close_idx = candidate.find("]")
-                if close_idx < 0:
                     break
                 bracket_idx = lowered.find(prefix.lower(), bracket_idx + 1)
         for start_marker, _end_marker in self._marker_pairs:
