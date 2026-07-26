@@ -6571,6 +6571,69 @@ def _parse_poolside_tool_call(block: str) -> tuple[str, Any] | None:
     return name, arguments
 
 
+def _scan_bracket_tool_call(
+    text: str,
+    start: int,
+) -> tuple[int, str, Any] | None:
+    """Balanced-scan one `[Calling tool: name({...})]` block at `start`.
+
+    The JSON object is walked with string/escape awareness, so `}` or `)]`
+    sequences inside argument strings (a JS file body, a task_progress
+    checklist) cannot end the block early — the failure mode of the
+    non-greedy regex this replaces. Returns (end_exclusive, name, arguments)
+    for a complete block, or None when no complete well-formed block starts
+    at `start`.
+    """
+    match = re.compile(
+        r"\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)\s*\(",
+        re.IGNORECASE,
+    ).match(text, start)
+    if match is None:
+        return None
+    name = match.group(1)
+    i = match.end()
+    tail = re.compile(r"\s*\)\s*\]").match(text, i)
+    if tail is not None:
+        return tail.end(), name, {}
+    if i >= len(text) or text[i] != "{":
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    j = i
+    while j < len(text):
+        ch = text[j]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                j += 1
+                break
+        j += 1
+    if depth != 0:
+        return None
+    close = re.compile(r"\s*\)\s*\]").match(text, j)
+    if close is None:
+        return None
+    try:
+        arguments = json.loads(text[i:j])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    return close.end(), name, arguments
+
+
 def _tool_marker_pairs_from_tokenizer(tokenizer: Any | None) -> list[tuple[str, str]]:
     if tokenizer is None:
         return []
@@ -6602,19 +6665,33 @@ def _iter_generated_tool_call_envelopes(
         )
         for match in pattern.finditer(text):
             envelopes.append((match.start(), match.end(), match.group(1).strip(), None))
-    for match in _BRACKET_TOOL_CALL_RE.finditer(text):
-        name = match.group(1).strip()
-        raw_args = (match.group(2) or "").strip()
-        if raw_args:
-            try:
-                arguments: Any = json.loads(raw_args)
-            except json.JSONDecodeError as exc:
-                raise _tool_protocol_error(
-                    f"bracket tool_call '{name}' arguments are not valid JSON"
-                ) from exc
-        else:
-            arguments = {}
-        envelopes.append((match.start(), match.end(), "", (name, arguments)))
+    # Bracket dialect (`[Calling tool: name({...})]`) via the balanced scanner:
+    # the old non-greedy regex ended the block at the first `})]`, which any
+    # code-file argument contains inside a string, so large bracket calls
+    # always failed JSON decode and fell back to prose.
+    search_from = 0
+    lowered_text = text.lower()
+    while True:
+        candidates = [
+            idx
+            for idx in (
+                lowered_text.find(prefix.lower(), search_from)
+                for prefix in _BRACKET_TOOL_PREFIXES
+            )
+            if idx >= 0
+        ]
+        if not candidates:
+            break
+        found = min(candidates)
+        scanned = _scan_bracket_tool_call(text, found)
+        if scanned is None:
+            # Unterminated or malformed: not an envelope — the text stays
+            # visible content, same terminal state as the old decode error.
+            search_from = found + 1
+            continue
+        end, name, arguments = scanned
+        envelopes.append((found, end, "", (name, arguments)))
+        search_from = end
     envelopes.sort(key=lambda item: item[0])
     for previous, current in zip(envelopes, envelopes[1:]):
         if current[0] < previous[1]:
