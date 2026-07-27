@@ -531,6 +531,29 @@ _ROUTER_GEMV_M2_DIMS = 3072
 _ROUTER_GEMV_M2_EXPERTS = 256
 
 
+def _router_gemv_logits_m1_direct(
+    x: mx.array,
+    gate_weight: mx.array,
+    *,
+    _kernel,
+) -> mx.array:
+    """Launch the construction-prevalidated fixed Laguna M1 projection."""
+
+    (logits,) = _kernel(
+        inputs=[x, gate_weight],
+        template=[("T", mx.bfloat16)],
+        grid=(
+            _ROUTER_GEMV_THREADS * _ROUTER_GEMV_M2_EXPERTS,
+            1,
+            1,
+        ),
+        threadgroup=(_ROUTER_GEMV_THREADS, 1, 1),
+        output_shapes=[(1, _ROUTER_GEMV_M2_EXPERTS)],
+        output_dtypes=[mx.float32],
+    )
+    return logits
+
+
 def _router_gemv_m2_source(*, experts: int, dims: int) -> str:
     """Return the fixed-M2 Metal source for source-contract tests.
 
@@ -621,14 +644,15 @@ def _router_gemv_logits_m2_kernel():
     )
 
 
-def _router_gemv_logits_m2_direct(
+def _router_gemv_logits_m2_prebound(
     x: mx.array,
     gate_weight: mx.array,
+    *,
+    _kernel,
 ) -> mx.array:
-    """Launch the already-validated fixed-M2 kernel without routing checks."""
+    """Launch the construction-prevalidated fixed Laguna M2 projection."""
 
-    kernel = _router_gemv_logits_m2_kernel()
-    (logits,) = kernel(
+    (logits,) = _kernel(
         inputs=[x, gate_weight],
         template=[("T", mx.bfloat16)],
         grid=(
@@ -641,6 +665,19 @@ def _router_gemv_logits_m2_direct(
         output_dtypes=[mx.float32],
     )
     return logits
+
+
+def _router_gemv_logits_m2_direct(
+    x: mx.array,
+    gate_weight: mx.array,
+) -> mx.array:
+    """Launch the fixed-M2 kernel at its checked construction boundary."""
+
+    return _router_gemv_logits_m2_prebound(
+        x,
+        gate_weight,
+        _kernel=_router_gemv_logits_m2_kernel(),
+    )
 
 
 def router_gemv_logits_m2(

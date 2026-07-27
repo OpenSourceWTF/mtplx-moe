@@ -653,12 +653,18 @@ class _FixedM2FakeGate(nn.Module):
         self.weight = weight
 
 
+class _FixedM2TensorSpec:
+    def __init__(self, shape, dtype):
+        self.shape = shape
+        self.dtype = dtype
+
+
 class _FixedM2QuantizedProjection(nn.Module):
-    def __init__(self, *, bits: int):
+    def __init__(self, *, bits: int, weight_shape, metadata_shape):
         super().__init__()
-        self.weight = mx.zeros((1,), dtype=mx.uint32)
-        self.scales = mx.zeros((1,), dtype=mx.bfloat16)
-        self.biases = mx.zeros((1,), dtype=mx.bfloat16)
+        self.weight = _FixedM2TensorSpec(weight_shape, mx.uint32)
+        self.scales = _FixedM2TensorSpec(metadata_shape, mx.bfloat16)
+        self.biases = _FixedM2TensorSpec(metadata_shape, mx.bfloat16)
         self.group_size = 128
         self.bits = bits
         self.mode = "affine"
@@ -667,9 +673,21 @@ class _FixedM2QuantizedProjection(nn.Module):
 class _FixedM2FakeSwitch(nn.Module):
     def __init__(self):
         super().__init__()
-        self.gate_proj = _FixedM2QuantizedProjection(bits=4)
-        self.up_proj = _FixedM2QuantizedProjection(bits=4)
-        self.down_proj = _FixedM2QuantizedProjection(bits=4)
+        self.gate_proj = _FixedM2QuantizedProjection(
+            bits=4,
+            weight_shape=(256, 1024, 384),
+            metadata_shape=(256, 1024, 24),
+        )
+        self.up_proj = _FixedM2QuantizedProjection(
+            bits=4,
+            weight_shape=(256, 1024, 384),
+            metadata_shape=(256, 1024, 24),
+        )
+        self.down_proj = _FixedM2QuantizedProjection(
+            bits=4,
+            weight_shape=(256, 3072, 128),
+            metadata_shape=(256, 3072, 8),
+        )
         self.calls = 0
 
     def __call__(self, x, indices):
@@ -683,9 +701,21 @@ class _FixedM2FakeSwitch(nn.Module):
 class _FixedM2FakeShared(nn.Module):
     def __init__(self):
         super().__init__()
-        self.gate_proj = _FixedM2QuantizedProjection(bits=8)
-        self.up_proj = _FixedM2QuantizedProjection(bits=8)
-        self.down_proj = _FixedM2QuantizedProjection(bits=8)
+        self.gate_proj = _FixedM2QuantizedProjection(
+            bits=8,
+            weight_shape=(1024, 768),
+            metadata_shape=(1024, 24),
+        )
+        self.up_proj = _FixedM2QuantizedProjection(
+            bits=8,
+            weight_shape=(1024, 768),
+            metadata_shape=(1024, 24),
+        )
+        self.down_proj = _FixedM2QuantizedProjection(
+            bits=8,
+            weight_shape=(3072, 256),
+            metadata_shape=(3072, 8),
+        )
 
     def __call__(self, x):
         return mx.zeros_like(x)
@@ -706,7 +736,7 @@ def _fixed_m2_fake_block(index: int):
     block.routed_scaling_factor = 2.5
     block.softcap = 0.0
     block.gate = _FixedM2FakeGate(weight)
-    block.e_score_correction_bias = mx.zeros((256,), dtype=mx.float32)
+    block.e_score_correction_bias = mx.zeros((256,), dtype=mx.bfloat16)
     block.switch_mlp = _FixedM2FakeSwitch()
     block.shared_expert = _FixedM2FakeShared()
     return block
@@ -720,6 +750,8 @@ def _fixed_m2_fake_model():
         hidden_size=3072,
         num_experts=256,
         num_experts_per_tok=10,
+        moe_intermediate_size=1024,
+        shared_expert_intermediate_size=1024,
         norm_topk_prob=True,
         moe_routed_scaling_factor=2.5,
         moe_router_logit_softcapping=0.0,
@@ -728,6 +760,51 @@ def _fixed_m2_fake_model():
         model=SimpleNamespace(layers=layers, args=args),
         args=args,
     )
+
+
+def _fixed_m2_fuse_fake_experts(model):
+    for layer in model.model.layers[1:]:
+        block = layer.mlp
+        routed = laguna_fused.FusedGateUpSwitchGLU.__new__(
+            laguna_fused.FusedGateUpSwitchGLU
+        )
+        nn.Module.__init__(routed)
+        routed.quantized = True
+        routed.hidden_dims = 1024
+        routed.gate_up_weight = _FixedM2TensorSpec(
+            (256, 2048, 384),
+            mx.uint32,
+        )
+        routed.gate_up_scales = _FixedM2TensorSpec(
+            (256, 2048, 24),
+            mx.bfloat16,
+        )
+        routed.gate_up_biases = _FixedM2TensorSpec(
+            (256, 2048, 24),
+            mx.bfloat16,
+        )
+        routed.group_size = 128
+        routed.bits = 4
+        routed.mode = "affine"
+        routed.down_proj = block.switch_mlp.down_proj
+        routed.calls = 0
+        block.switch_mlp = routed
+
+        shared = laguna_fused.FusedGateUpMLP.__new__(
+            laguna_fused.FusedGateUpMLP
+        )
+        nn.Module.__init__(shared)
+        shared.quantized = True
+        shared.hidden_dims = 1024
+        shared.gate_up_weight = _FixedM2TensorSpec((2048, 768), mx.uint32)
+        shared.gate_up_scales = _FixedM2TensorSpec((2048, 24), mx.bfloat16)
+        shared.gate_up_biases = _FixedM2TensorSpec((2048, 24), mx.bfloat16)
+        shared.group_size = 128
+        shared.bits = 8
+        shared.mode = "affine"
+        shared.down_proj = block.shared_expert.down_proj
+        block.shared_expert = shared
+    return model
 
 
 @pytest.fixture
@@ -744,11 +821,11 @@ def fixed_m2_fake_runtime(monkeypatch):
         "control": {"m2_error": None},
     }
 
-    def fake_m1(x, gate_weight):
+    def fake_m1(x, gate_weight, *, _kernel):
         calls["m1"].append((x, gate_weight))
         return x[:, :256].astype(mx.float32)
 
-    def fake_m2(x, gate_weight):
+    def fake_m2(x, gate_weight, *, _kernel):
         calls["m2"].append((x, gate_weight))
         if calls["control"]["m2_error"] is not None:
             raise calls["control"]["m2_error"]
@@ -773,8 +850,8 @@ def fixed_m2_fake_runtime(monkeypatch):
         laguna.LagunaSparseMoeBlock.__call__,
     )
     monkeypatch.setattr(kernels, "_on_metal_device", lambda: True)
-    monkeypatch.setattr(kernels, "router_gemv_logits", fake_m1)
-    monkeypatch.setattr(kernels, "_router_gemv_logits_m2_direct", fake_m2)
+    monkeypatch.setattr(kernels, "_router_gemv_logits_m1_direct", fake_m1)
+    monkeypatch.setattr(kernels, "_router_gemv_logits_m2_prebound", fake_m2)
     monkeypatch.setattr(laguna_fused, "_fixed_router_topk_direct", fake_topk)
     monkeypatch.setattr(laguna_fused, "_STOCK_LAGUNA_MOE_CALL", fake_stock)
     return calls
@@ -859,6 +936,276 @@ def test_fixed_m2_install_rejects_contract_mismatch(
         laguna_fused.install_fixed_m2_router(model)
 
 
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda projection: setattr(
+                projection,
+                "weight",
+                _FixedM2TensorSpec((256, 1024, 383), mx.uint32),
+            ),
+            "routed expert gate_proj weight shape",
+        ),
+        (
+            lambda projection: setattr(
+                projection,
+                "weight",
+                _FixedM2TensorSpec((256, 1024, 384), mx.int32),
+            ),
+            "routed expert gate_proj weight dtype",
+        ),
+        (
+            lambda projection: setattr(
+                projection,
+                "scales",
+                _FixedM2TensorSpec((256, 1024, 23), mx.bfloat16),
+            ),
+            "routed expert gate_proj scales shape",
+        ),
+        (
+            lambda projection: setattr(
+                projection,
+                "scales",
+                _FixedM2TensorSpec((256, 1024, 24), mx.float16),
+            ),
+            "routed expert gate_proj scales dtype",
+        ),
+        (
+            lambda projection: setattr(projection, "biases", None),
+            "routed expert gate_proj biases",
+        ),
+        (
+            lambda projection: setattr(
+                projection,
+                "biases",
+                _FixedM2TensorSpec((256, 1024, 24), mx.float32),
+            ),
+            "routed expert gate_proj biases dtype",
+        ),
+        (
+            lambda projection: setattr(
+                projection,
+                "bias",
+                _FixedM2TensorSpec((256, 1024), mx.bfloat16),
+            ),
+            "routed expert gate_proj output bias",
+        ),
+    ],
+)
+def test_fixed_m2_install_rejects_exact_routed_storage_mismatch(
+    fixed_m2_fake_runtime,
+    mutate,
+    message,
+):
+    model = _fixed_m2_fake_model()
+    projection = model.model.layers[1].mlp.switch_mlp.gate_proj
+    mutate(projection)
+
+    with pytest.raises(laguna_fused.LagunaFixedM2ConfigError, match=message):
+        laguna_fused.install_fixed_m2_router(model)
+
+
+@pytest.mark.parametrize(
+    ("projection_name", "tensor_name", "shape", "dtype", "message"),
+    [
+        (
+            "gate_proj",
+            "weight",
+            (1024, 767),
+            mx.uint32,
+            "shared expert gate_proj weight shape",
+        ),
+        (
+            "up_proj",
+            "scales",
+            (1024, 24),
+            mx.float32,
+            "shared expert up_proj scales dtype",
+        ),
+        (
+            "down_proj",
+            "biases",
+            (3072, 7),
+            mx.bfloat16,
+            "shared expert down_proj biases shape",
+        ),
+    ],
+)
+def test_fixed_m2_install_rejects_exact_shared_storage_mismatch(
+    fixed_m2_fake_runtime,
+    projection_name,
+    tensor_name,
+    shape,
+    dtype,
+    message,
+):
+    model = _fixed_m2_fake_model()
+    projection = getattr(
+        model.model.layers[1].mlp.shared_expert,
+        projection_name,
+    )
+    setattr(projection, tensor_name, _FixedM2TensorSpec(shape, dtype))
+
+    with pytest.raises(laguna_fused.LagunaFixedM2ConfigError, match=message):
+        laguna_fused.install_fixed_m2_router(model)
+
+
+def test_fixed_m2_install_accepts_exact_final_fused_expert_storage(
+    fixed_m2_fake_runtime,
+):
+    model = _fixed_m2_fuse_fake_experts(_fixed_m2_fake_model())
+
+    report = laguna_fused.install_fixed_m2_router(model)
+
+    assert report["layers_validated"] == 47
+    assert report["layers_selfchecked"] == 47
+
+
+@pytest.mark.parametrize(
+    ("target", "tensor_name", "shape", "dtype", "message"),
+    [
+        (
+            "switch_mlp",
+            "gate_up_weight",
+            (256, 2048, 383),
+            mx.uint32,
+            "routed expert gate_up weight shape",
+        ),
+        (
+            "switch_mlp",
+            "gate_up_scales",
+            (256, 2048, 24),
+            mx.float32,
+            "routed expert gate_up scales dtype",
+        ),
+        (
+            "shared_expert",
+            "gate_up_biases",
+            (2048, 23),
+            mx.bfloat16,
+            "shared expert gate_up biases shape",
+        ),
+    ],
+)
+def test_fixed_m2_install_rejects_final_fused_storage_mismatch(
+    fixed_m2_fake_runtime,
+    target,
+    tensor_name,
+    shape,
+    dtype,
+    message,
+):
+    model = _fixed_m2_fuse_fake_experts(_fixed_m2_fake_model())
+    module = getattr(model.model.layers[1].mlp, target)
+    setattr(module, tensor_name, _FixedM2TensorSpec(shape, dtype))
+
+    with pytest.raises(laguna_fused.LagunaFixedM2ConfigError, match=message):
+        laguna_fused.install_fixed_m2_router(model)
+
+
+def test_fixed_m2_install_rejects_non_bf16_correction_bias(
+    fixed_m2_fake_runtime,
+):
+    model = _fixed_m2_fake_model()
+    model.model.layers[1].mlp.e_score_correction_bias = mx.zeros(
+        (256,),
+        dtype=mx.float32,
+    )
+
+    with pytest.raises(
+        laguna_fused.LagunaFixedM2ConfigError,
+        match="correction bias dtype.*float32.*bfloat16",
+    ):
+        laguna_fused.install_fixed_m2_router(model)
+
+
+@pytest.mark.parametrize(
+    ("property_name", "value", "message"),
+    [
+        ("hidden_size", 4096, "hidden size.*4096.*3072"),
+        ("num_experts", 255, "expert count.*255.*256"),
+        ("num_experts_per_tok", 9, "top-k.*9.*10"),
+        (
+            "moe_intermediate_size",
+            2048,
+            "routed intermediate size.*2048.*1024",
+        ),
+        (
+            "shared_expert_intermediate_size",
+            2048,
+            "shared intermediate size.*2048.*1024",
+        ),
+        ("norm_topk_prob", False, "normalization.*False.*True"),
+        ("moe_routed_scaling_factor", 1.0, "scaling.*1.0.*2.5"),
+        ("moe_router_logit_softcapping", 1.0, "softcap.*1.0.*0.0"),
+    ],
+)
+def test_fixed_m2_install_reports_exact_model_property(
+    fixed_m2_fake_runtime,
+    property_name,
+    value,
+    message,
+):
+    model = _fixed_m2_fake_model()
+    setattr(model.args, property_name, value)
+
+    with pytest.raises(laguna_fused.LagunaFixedM2ConfigError, match=message):
+        laguna_fused.install_fixed_m2_router(model)
+
+
+def test_fixed_m2_bitwise_equality_rejects_signed_zero_mismatch():
+    positive_zero = mx.array([0.0], dtype=mx.float32)
+    negative_zero = mx.array([-0.0], dtype=mx.float32)
+
+    assert bool(mx.array_equal(positive_zero, negative_zero)) is True
+    assert (
+        laguna_fused._fixed_m2_bitwise_array_equal(
+            positive_zero,
+            negative_zero,
+        )
+        is False
+    )
+
+
+def test_fixed_m2_installer_has_prevalidated_m1_launcher():
+    from mtplx.kernels import laguna_decode as kernels
+
+    assert callable(kernels._router_gemv_logits_m1_direct)
+
+
+def test_fixed_m2_prevalidated_m1_launcher_uses_only_fixed_geometry():
+    from mtplx.kernels import laguna_decode as kernels
+
+    x = object()
+    weight = object()
+    sentinel = object()
+    calls = []
+
+    def fake_kernel(**kwargs):
+        calls.append(kwargs)
+        return (sentinel,)
+
+    assert (
+        kernels._router_gemv_logits_m1_direct(
+            x,
+            weight,
+            _kernel=fake_kernel,
+        )
+        is sentinel
+    )
+    assert calls == [
+        {
+            "inputs": [x, weight],
+            "template": [("T", mx.bfloat16)],
+            "grid": (kernels._ROUTER_GEMV_THREADS * 256, 1, 1),
+            "threadgroup": (kernels._ROUTER_GEMV_THREADS, 1, 1),
+            "output_shapes": [(1, 256)],
+            "output_dtypes": [mx.float32],
+        }
+    ]
+
+
 def test_fixed_m2_install_rejects_reused_router_array(fixed_m2_fake_runtime):
     model = _fixed_m2_fake_model()
     model.model.layers[2].mlp.gate.weight = model.model.layers[1].mlp.gate.weight
@@ -899,7 +1246,7 @@ def test_fixed_m2_install_selfcheck_failure_is_atomic(
     model = _fixed_m2_fake_model()
     calls = 0
 
-    def wrong_m2(x, gate_weight):
+    def wrong_m2(x, gate_weight, *, _kernel):
         nonlocal calls
         calls += 1
         logits = x[:, :256].astype(mx.float32)
@@ -907,7 +1254,7 @@ def test_fixed_m2_install_selfcheck_failure_is_atomic(
             logits = logits + 1.0
         return logits
 
-    monkeypatch.setattr(kernels, "_router_gemv_logits_m2_direct", wrong_m2)
+    monkeypatch.setattr(kernels, "_router_gemv_logits_m2_prebound", wrong_m2)
 
     with pytest.raises(
         laguna_fused.LagunaFixedM2ConfigError,
@@ -1015,6 +1362,8 @@ def test_fixed_m2_installed_route_never_calls_eligibility_helpers(
 
     monkeypatch.setattr(kernels, "is_router_gemv_eligible", forbidden)
     monkeypatch.setattr(kernels, "is_router_eligible", forbidden)
+    monkeypatch.setattr(kernels, "router_gemv_logits", forbidden)
+    monkeypatch.setattr(kernels, "_router_gemv_logits_m2_direct", forbidden)
     block = model.model.layers[1].mlp
 
     block(mx.zeros((1, 1, 3072), dtype=mx.bfloat16))

@@ -825,6 +825,31 @@ _FIXED_M2_HIDDEN = 3072
 _FIXED_M2_EXPERTS = 256
 _FIXED_M2_TOP_K = 10
 _FIXED_M2_SCALE = 2.5
+_FIXED_M2_INTERMEDIATE = 1024
+
+# Exact safetensors header contract at the pinned oQ4e revision
+# 8e3f5cad513746264940c1c4195de48d7ea345a5.  Quantized MLX weights are packed
+# U32; affine scales and zero-point ``biases`` are BF16.  These are storage
+# shapes, not inferred logical shapes.
+_FIXED_M2_ROUTED_LAYOUT = {
+    "gate_proj": (
+        (256, 1024, 384),
+        (256, 1024, 24),
+    ),
+    "up_proj": (
+        (256, 1024, 384),
+        (256, 1024, 24),
+    ),
+    "down_proj": (
+        (256, 3072, 128),
+        (256, 3072, 8),
+    ),
+}
+_FIXED_M2_SHARED_LAYOUT = {
+    "gate_proj": ((1024, 768), (1024, 24)),
+    "up_proj": ((1024, 768), (1024, 24)),
+    "down_proj": ((3072, 256), (3072, 8)),
+}
 
 
 def _fixed_router_topk_direct(
@@ -920,98 +945,209 @@ def _fixed_m2_contract_error(
     )
 
 
+def _fixed_m2_tensor_shape(value: Any) -> tuple[int, ...] | None:
+    if value is None or not hasattr(value, "shape"):
+        return None
+    return tuple(int(dim) for dim in value.shape)
+
+
+def _validate_fixed_tensor(
+    owner: Any,
+    tensor_name: str,
+    *,
+    layer_number: int,
+    label: str,
+    shape: tuple[int, ...],
+    dtype: Any,
+) -> None:
+    value = getattr(owner, tensor_name, None)
+    property_name = (
+        tensor_name.removeprefix("gate_up_")
+        if label.endswith("gate_up")
+        else tensor_name
+    )
+    if value is None:
+        raise _fixed_m2_contract_error(
+            layer_number,
+            f"{label} {property_name}",
+            None,
+            f"non-None {dtype} tensor {shape}",
+        )
+    actual_shape = _fixed_m2_tensor_shape(value)
+    if actual_shape != shape:
+        raise _fixed_m2_contract_error(
+            layer_number,
+            f"{label} {property_name} shape",
+            actual_shape,
+            shape,
+        )
+    actual_dtype = getattr(value, "dtype", None)
+    if actual_dtype != dtype:
+        raise _fixed_m2_contract_error(
+            layer_number,
+            f"{label} {property_name} dtype",
+            actual_dtype,
+            dtype,
+        )
+
+
 def _validate_fixed_quantized_projection(
     projection: Any,
     *,
     layer_number: int,
     label: str,
     bits: int,
+    weight_shape: tuple[int, ...],
+    metadata_shape: tuple[int, ...],
 ) -> None:
-    actual = (
-        getattr(projection, "bits", None),
-        getattr(projection, "group_size", None),
-        getattr(projection, "mode", None),
-        hasattr(projection, "weight"),
-        hasattr(projection, "scales"),
-        hasattr(projection, "biases"),
-    )
-    expected = (bits, 128, "affine", True, True, True)
-    if actual != expected:
+    for property_name, expected in (
+        ("bits", bits),
+        ("group_size", 128),
+        ("mode", "affine"),
+    ):
+        actual = getattr(projection, property_name, None)
+        if actual != expected:
+            raise _fixed_m2_contract_error(
+                layer_number,
+                f"{label} layout {property_name}",
+                actual,
+                expected,
+            )
+    if hasattr(projection, "bias"):
         raise _fixed_m2_contract_error(
             layer_number,
-            f"{label} layout",
-            actual,
-            f"Q{bits} affine group_size 128 with weight/scales/biases",
+            f"{label} output bias",
+            "present",
+            "absent",
+        )
+    _validate_fixed_tensor(
+        projection,
+        "weight",
+        layer_number=layer_number,
+        label=label,
+        shape=weight_shape,
+        dtype=mx.uint32,
+    )
+    for tensor_name in ("scales", "biases"):
+        _validate_fixed_tensor(
+            projection,
+            tensor_name,
+            layer_number=layer_number,
+            label=label,
+            shape=metadata_shape,
+            dtype=mx.bfloat16,
+        )
+
+
+def _validate_fixed_fused_projection(
+    projection: Any,
+    *,
+    layer_number: int,
+    label: str,
+    bits: int,
+    weight_shape: tuple[int, ...],
+    metadata_shape: tuple[int, ...],
+) -> None:
+    for property_name, expected in (
+        ("quantized", True),
+        ("hidden_dims", _FIXED_M2_INTERMEDIATE),
+        ("bits", bits),
+        ("group_size", 128),
+        ("mode", "affine"),
+    ):
+        actual = getattr(projection, property_name, None)
+        if actual != expected:
+            raise _fixed_m2_contract_error(
+                layer_number,
+                f"{label} layout {property_name}",
+                actual,
+                expected,
+            )
+    if hasattr(projection, "bias"):
+        raise _fixed_m2_contract_error(
+            layer_number,
+            f"{label} output bias",
+            "present",
+            "absent",
+        )
+    _validate_fixed_tensor(
+        projection,
+        "gate_up_weight",
+        layer_number=layer_number,
+        label=label,
+        shape=weight_shape,
+        dtype=mx.uint32,
+    )
+    for tensor_name in ("gate_up_scales", "gate_up_biases"):
+        _validate_fixed_tensor(
+            projection,
+            tensor_name,
+            layer_number=layer_number,
+            label=label,
+            shape=metadata_shape,
+            dtype=mx.bfloat16,
         )
 
 
 def _validate_fixed_routed_layout(block: Any, layer_number: int) -> None:
     routed = block.switch_mlp
     if isinstance(routed, FusedGateUpSwitchGLU):
-        actual = (
-            bool(routed.quantized),
-            getattr(routed, "bits", None),
-            getattr(routed, "group_size", None),
-            getattr(routed, "mode", None),
-            hasattr(routed, "gate_up_weight"),
-            hasattr(routed, "gate_up_scales"),
-            hasattr(routed, "gate_up_biases"),
+        _validate_fixed_fused_projection(
+            routed,
+            layer_number=layer_number,
+            label="routed expert gate_up",
+            bits=4,
+            weight_shape=(256, 2048, 384),
+            metadata_shape=(256, 2048, 24),
         )
-        expected = (True, 4, 128, "affine", True, True, True)
-        if actual != expected:
-            raise _fixed_m2_contract_error(
-                layer_number,
-                "routed expert gate_up layout",
-                actual,
-                "Q4 affine group_size 128 fused gate/up",
-            )
         _validate_fixed_quantized_projection(
             routed.down_proj,
             layer_number=layer_number,
             label="routed expert down_proj",
             bits=4,
+            weight_shape=_FIXED_M2_ROUTED_LAYOUT["down_proj"][0],
+            metadata_shape=_FIXED_M2_ROUTED_LAYOUT["down_proj"][1],
         )
     else:
         for name in ("gate_proj", "up_proj", "down_proj"):
+            weight_shape, metadata_shape = _FIXED_M2_ROUTED_LAYOUT[name]
             _validate_fixed_quantized_projection(
                 getattr(routed, name, None),
                 layer_number=layer_number,
                 label=f"routed expert {name}",
                 bits=4,
+                weight_shape=weight_shape,
+                metadata_shape=metadata_shape,
             )
 
     shared = block.shared_expert
     if isinstance(shared, FusedGateUpMLP):
-        actual = (
-            bool(shared.quantized),
-            getattr(shared, "bits", None),
-            getattr(shared, "group_size", None),
-            getattr(shared, "mode", None),
-            hasattr(shared, "gate_up_weight"),
-            hasattr(shared, "gate_up_scales"),
-            hasattr(shared, "gate_up_biases"),
+        _validate_fixed_fused_projection(
+            shared,
+            layer_number=layer_number,
+            label="shared expert gate_up",
+            bits=8,
+            weight_shape=(2048, 768),
+            metadata_shape=(2048, 24),
         )
-        expected = (True, 8, 128, "affine", True, True, True)
-        if actual != expected:
-            raise _fixed_m2_contract_error(
-                layer_number,
-                "shared expert gate_up layout",
-                actual,
-                "Q8 affine group_size 128 fused gate/up",
-            )
         _validate_fixed_quantized_projection(
             shared.down_proj,
             layer_number=layer_number,
             label="shared expert down_proj",
             bits=8,
+            weight_shape=_FIXED_M2_SHARED_LAYOUT["down_proj"][0],
+            metadata_shape=_FIXED_M2_SHARED_LAYOUT["down_proj"][1],
         )
     else:
         for name in ("gate_proj", "up_proj", "down_proj"):
+            weight_shape, metadata_shape = _FIXED_M2_SHARED_LAYOUT[name]
             _validate_fixed_quantized_projection(
                 getattr(shared, name, None),
                 layer_number=layer_number,
                 label=f"shared expert {name}",
                 bits=8,
+                weight_shape=weight_shape,
+                metadata_shape=metadata_shape,
             )
 
 
@@ -1023,6 +1159,14 @@ def _fixed_m2_selfcheck_inputs() -> mx.array:
     inputs = values.reshape(2, _FIXED_M2_HIDDEN).astype(mx.bfloat16)
     mx.eval(inputs)
     return inputs
+
+
+def _fixed_m2_bitwise_array_equal(left: mx.array, right: mx.array) -> bool:
+    """Compare tensor representation, including signed zero and NaN payloads."""
+
+    if left.dtype != right.dtype or tuple(left.shape) != tuple(right.shape):
+        return False
+    return bool(mx.array_equal(left.view(mx.uint8), right.view(mx.uint8)))
 
 
 def _selfcheck_fixed_m2_block(
@@ -1048,7 +1192,7 @@ def _selfcheck_fixed_m2_block(
         raise LagunaFixedM2ConfigError(
             f"layer {layer_number} fixed-M2 logits self-check failed: {error}"
         ) from error
-    if not bool(mx.array_equal(m1_logits, m2_logits)):
+    if not _fixed_m2_bitwise_array_equal(m1_logits, m2_logits):
         raise LagunaFixedM2ConfigError(
             f"layer {layer_number} fixed-M2 logits self-check mismatch"
         )
@@ -1068,7 +1212,7 @@ def _selfcheck_fixed_m2_block(
         raise LagunaFixedM2ConfigError(
             f"layer {layer_number} fixed-M2 expert IDs self-check mismatch"
         )
-    if not bool(mx.array_equal(m1_weights, m2_weights)):
+    if not _fixed_m2_bitwise_array_equal(m1_weights, m2_weights):
         raise LagunaFixedM2ConfigError(
             f"layer {layer_number} fixed-M2 route weights self-check mismatch"
         )
@@ -1097,30 +1241,32 @@ def install_fixed_m2_router(model: Any) -> dict[str, Any]:
         )
 
     args = getattr(inner, "args", getattr(model, "args", None))
-    model_contract = (
-        getattr(args, "hidden_size", None),
-        getattr(args, "num_experts", None),
-        getattr(args, "num_experts_per_tok", None),
-        getattr(args, "norm_topk_prob", None),
-        getattr(args, "moe_routed_scaling_factor", None),
-        getattr(args, "moe_router_logit_softcapping", None),
-    )
-    expected_model_contract = (
-        _FIXED_M2_HIDDEN,
-        _FIXED_M2_EXPERTS,
-        _FIXED_M2_TOP_K,
-        True,
-        _FIXED_M2_SCALE,
-        0.0,
-    )
-    if model_contract != expected_model_contract:
-        raise _fixed_m2_contract_error(
-            None,
-            "model router contract "
-            "(hidden, experts, top-k, normalization, scaling, softcap)",
-            model_contract,
-            expected_model_contract,
-        )
+    for property_name, attribute, expected in (
+        ("hidden size", "hidden_size", _FIXED_M2_HIDDEN),
+        ("expert count", "num_experts", _FIXED_M2_EXPERTS),
+        ("top-k", "num_experts_per_tok", _FIXED_M2_TOP_K),
+        (
+            "routed intermediate size",
+            "moe_intermediate_size",
+            _FIXED_M2_INTERMEDIATE,
+        ),
+        (
+            "shared intermediate size",
+            "shared_expert_intermediate_size",
+            _FIXED_M2_INTERMEDIATE,
+        ),
+        ("normalization", "norm_topk_prob", True),
+        ("scaling", "moe_routed_scaling_factor", _FIXED_M2_SCALE),
+        ("softcap", "moe_router_logit_softcapping", 0.0),
+    ):
+        actual = getattr(args, attribute, None)
+        if actual != expected:
+            raise _fixed_m2_contract_error(
+                None,
+                property_name,
+                actual,
+                expected,
+            )
 
     validated: list[tuple[int, Any, mx.array, mx.array]] = []
     router_weight_ids: set[int] = set()
@@ -1212,6 +1358,13 @@ def install_fixed_m2_router(model: Any) -> dict[str, Any]:
                 bias_shape,
                 (_FIXED_M2_EXPERTS,),
             )
+        if bias.dtype != mx.bfloat16:
+            raise _fixed_m2_contract_error(
+                layer_number,
+                "correction bias dtype",
+                bias.dtype,
+                mx.bfloat16,
+            )
         _validate_fixed_routed_layout(block, layer_number)
         bias_f32 = bias.astype(mx.float32)
         mx.eval(bias_f32)
@@ -1223,6 +1376,11 @@ def install_fixed_m2_router(model: Any) -> dict[str, Any]:
         )
 
     try:
+        m1_kernel = kernels._router_gemv_logits_kernel(
+            _FIXED_M2_EXPERTS,
+            _FIXED_M2_HIDDEN,
+        )
+        m2_kernel = kernels._router_gemv_logits_m2_kernel()
         topk_kernel = kernels._router_kernel(
             _FIXED_M2_EXPERTS,
             _FIXED_M2_TOP_K,
@@ -1243,10 +1401,15 @@ def install_fixed_m2_router(model: Any) -> dict[str, Any]:
         ]
     ] = []
     for layer_number, _block, weight, bias_f32 in validated:
-        project_m1 = partial(kernels.router_gemv_logits, gate_weight=weight)
-        project_m2 = partial(
-            kernels._router_gemv_logits_m2_direct,
+        project_m1 = partial(
+            kernels._router_gemv_logits_m1_direct,
             gate_weight=weight,
+            _kernel=m1_kernel,
+        )
+        project_m2 = partial(
+            kernels._router_gemv_logits_m2_prebound,
+            gate_weight=weight,
+            _kernel=m2_kernel,
         )
         select_m1 = partial(
             _fixed_router_topk_direct,
