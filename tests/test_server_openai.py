@@ -653,6 +653,7 @@ class _RecordingBatchGenerator:
     def __init__(self):
         self.next_uid = 1
         self.inserted_request_ids = []
+        self.removed_uids = []
 
     def insert(self, _prompts, **kwargs):
         request_ids = list(kwargs["samplers"])
@@ -660,6 +661,20 @@ class _RecordingBatchGenerator:
         uids = list(range(self.next_uid, self.next_uid + len(request_ids)))
         self.next_uid += len(request_ids)
         return uids
+
+    def remove(self, uids):
+        self.removed_uids.extend(uids)
+
+
+class _WaitForbiddenCondition:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        return False
+
+    def wait(self, *, timeout):
+        raise AssertionError(f"unexpected cohort wait: {timeout}")
 
 
 def test_ar_batch_traffic_class_recognizes_only_explicit_cline():
@@ -772,6 +787,97 @@ def test_ar_batch_completion_releases_only_its_class_slot():
     assert generator.inserted_request_ids == ["cline-4"]
     assert list(service._active.values()) == [active_background, pending_cline]
     assert service._pending == [pending_background]
+
+
+def test_ar_batch_active_uid_owns_class_even_if_future_is_done():
+    service = _make_ar_batch_admission_service()
+    generator = _RecordingBatchGenerator()
+    active_background = _make_ar_batch_admission_job("background-1", "background")
+    active_background.future.set_result({})
+    pending_background = _make_ar_batch_admission_job("background-2", "background")
+    pending_cline = _make_ar_batch_admission_job("cline-3", "cline")
+    service._active = {10: active_background}
+    service._pending = [pending_background, pending_cline]
+
+    service._admit_pending(generator, {"max_active_requests": 2})
+
+    assert generator.inserted_request_ids == ["cline-3"]
+    assert list(service._active.values()) == [active_background, pending_cline]
+    assert service._pending == [pending_background]
+
+
+def test_ar_batch_initial_cohort_caps_effective_target_at_two():
+    service = _make_ar_batch_admission_service()
+    service._pending = [
+        _make_ar_batch_admission_job("background-1", "background"),
+        _make_ar_batch_admission_job("cline-2", "cline"),
+    ]
+    service._condition = _WaitForbiddenCondition()
+    service._initial_cohort_wait_s = lambda _config: 1.0
+
+    service._wait_for_initial_cohort(
+        {
+            "decode_batch_max": 4,
+            "max_active_requests": 4,
+        }
+    )
+
+
+def test_ar_batch_active_cancellation_releases_only_cancelled_class():
+    service = _make_ar_batch_admission_service()
+    generator = _RecordingBatchGenerator()
+    cancelled_background = _make_ar_batch_admission_job(
+        "background-1", "background", cancelled=True
+    )
+    active_cline = _make_ar_batch_admission_job("cline-2", "cline")
+    pending_background = _make_ar_batch_admission_job("background-3", "background")
+    pending_cline = _make_ar_batch_admission_job("cline-4", "cline")
+    service._active = {10: cancelled_background, 11: active_cline}
+    service._pending = [pending_background, pending_cline]
+
+    service._remove_cancelled_active(generator)
+    service._admit_pending(generator, {"max_active_requests": 2})
+
+    assert generator.removed_uids == [10]
+    assert isinstance(cancelled_background.future.exception(), openai._StreamCancelled)
+    assert generator.inserted_request_ids == ["background-3"]
+    assert list(service._active.values()) == [active_cline, pending_background]
+    assert service._pending == [pending_cline]
+
+
+def test_ar_batch_max_active_one_admits_only_oldest_job():
+    service = _make_ar_batch_admission_service()
+    generator = _RecordingBatchGenerator()
+    cline = _make_ar_batch_admission_job("cline-1", "cline")
+    background = _make_ar_batch_admission_job("background-2", "background")
+    service._pending = [cline, background]
+
+    service._admit_pending(generator, {"max_active_requests": 1})
+
+    assert generator.inserted_request_ids == ["cline-1"]
+    assert list(service._active.values()) == [cline]
+    assert service._pending == [background]
+
+
+def test_ar_batch_max_active_above_two_still_owns_one_slot_per_class():
+    service = _make_ar_batch_admission_service()
+    generator = _RecordingBatchGenerator()
+    background_oldest = _make_ar_batch_admission_job("background-1", "background")
+    background_newer = _make_ar_batch_admission_job("background-2", "background")
+    cline_oldest = _make_ar_batch_admission_job("cline-3", "cline")
+    cline_newer = _make_ar_batch_admission_job("cline-4", "cline")
+    service._pending = [
+        background_oldest,
+        background_newer,
+        cline_oldest,
+        cline_newer,
+    ]
+
+    service._admit_pending(generator, {"max_active_requests": 4})
+
+    assert generator.inserted_request_ids == ["background-1", "cline-3"]
+    assert list(service._active.values()) == [background_oldest, cline_oldest]
+    assert service._pending == [background_newer, cline_newer]
 
 
 def test_ar_batch_snapshot_reports_aggregate_and_per_class_counts():

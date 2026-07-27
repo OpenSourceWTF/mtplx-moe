@@ -2166,6 +2166,7 @@ def _session_bank_cold_tier_from_args(args: argparse.Namespace) -> Any | None:
 
 
 TrafficClass = Literal["cline", "background"]
+_AR_BATCH_CLASS_CAPACITY = 2
 
 
 def _ar_batch_traffic_class(
@@ -2389,7 +2390,10 @@ class _BatchedARGenerationService:
         if max_batch <= 1:
             return
         max_active = max(1, int(config_dict["max_active_requests"]))
-        target_batch = max(1, min(max_batch, max_active))
+        target_batch = max(
+            1,
+            min(_AR_BATCH_CLASS_CAPACITY, max_batch, max_active),
+        )
         wait_s = self._initial_cohort_wait_s(config_dict)
         if wait_s <= 0.0:
             return
@@ -2684,10 +2688,11 @@ class _BatchedARGenerationService:
     def _admit_pending(self, generator: Any, config_dict: dict[str, Any]) -> None:
         with self._condition:
             max_active = max(1, int(config_dict["max_active_requests"]))
-            active_jobs = [
-                job for job in self._active.values() if not job.future.done()
-            ]
-            capacity = max(0, min(2, max_active) - len(active_jobs))
+            active_jobs = list(self._active.values())
+            capacity = max(
+                0,
+                min(_AR_BATCH_CLASS_CAPACITY, max_active) - len(active_jobs),
+            )
             occupied_classes = {job.traffic_class for job in active_jobs}
             selected_classes: set[TrafficClass] = set()
             pending: list[_BatchedARJob] = []
