@@ -102,10 +102,11 @@ requirement. The process ceiling adds the exact 7 GiB runtime reserve:
 respectively. The real release smoke uses a 128 GiB Apple Silicon Mac and
 requires at least 110 GiB of free disk before download.
 
-Admission compares that process ceiling, never the realized footprint, so the
-smallest promoted Hy3 profile needs 71 GiB installed and 71 GiB available. A
-64 GiB machine is refused by every row above, and no cache-sizing flag changes
-that; see the cache-tier section for the footprint each tier actually reaches.
+The process ceiling is a budget, not a requirement: each profile's own cache cap
+leaves part of it unallocated. Admission compares the footprint the plan
+actually reaches -- 66.992 GiB, 89.216 GiB, and 91.992 GiB respectively -- and
+applies any cache-sizing override first, so a machine smaller than the ceiling
+can still run the profile. See the cache-tier section for the arithmetic.
 
 Choose an envelope explicitly when reproducibility matters:
 
@@ -331,13 +332,11 @@ The fixed floor under every row is 17.0 GiB: 8.71 GiB resident, 1.25 GiB KV at
 are upper bounds, because `proj_requant=q4` removes a further
 manifest-dependent amount from the resident side.
 
-Admission does not use the realized total. It compares the profile's declared
-71 GiB process ceiling against installed and available memory, so a machine
-under 71 GiB is refused even when the realized plan would have fit. No profile
-below `hy3-oq2e-64` is promoted and `auto` cannot synthesize one, so a 64 GiB
-machine currently has no admitted configuration even though the 32 GiB tier
-needs only 48.636 GiB. Sizing the cache down does not change that outcome; only
-a promoted profile with a lower ceiling would.
+Admission compares the realized total against installed and available memory,
+not the declared ceiling, and it resolves `--expert-cache-limit` before that
+comparison. Sizing the cache down therefore lowers the requirement: the 32 GiB
+tier admits on a 64 GiB machine because it needs 48.636 GiB. The 48 GiB tier
+needs 64.649 GiB and does not fit one.
 
 ### GLM-5.2 t158
 

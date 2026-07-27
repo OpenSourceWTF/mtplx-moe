@@ -272,12 +272,52 @@ def _memory_measurement(name: str, value: int) -> int:
     return value
 
 
+def profile_required_bytes(
+    profile: ExpertServeProfile,
+    *,
+    overrides: Mapping[str, Any] | None = None,
+) -> int:
+    """Bytes the profile's resolved plan actually reaches.
+
+    ``process_ceiling_bytes`` is a budget, not a requirement. A cache cap --
+    whether the profile's own ``expert_cache_limit_bytes`` or a
+    ``--expert-cache-limit`` override -- leaves the difference unallocated
+    rather than touching it, so the declared ceiling overstates what the
+    process needs. Admission compares this value instead.
+
+    The plan comes from the same ``config.memory_plan`` the runtime uses at
+    construction, so admission and construction cannot drift apart. The one
+    input admission cannot supply is ``resident_discount_bytes``, which needs
+    the on-disk manifest (``proj_requant``/``proj_quant``). Omitting it only
+    overstates the requirement, so the gate stays conservative.
+
+    Returns the ceiling unchanged when the plan cannot be resolved, so an
+    unsizable configuration is never admitted on an optimistic estimate.
+    """
+
+    from .expert_streaming_models import get_model_spec
+
+    try:
+        config = build_expert_streaming_config(profile, overrides=overrides)
+        plan = config.memory_plan(get_model_spec(profile.model_key))
+    except Exception:
+        return profile.process_ceiling_bytes
+    # Match the runtime's own viability predicate exactly (ExpertStreamingRuntime
+    # rejects on `not plan.fits_fixed` and nothing else). A fully pinned profile
+    # such as hy3-oq2e-96 streams nothing and legitimately plans zero cache
+    # slots, so slot count must not gate admission.
+    if not plan.fits_fixed:
+        return profile.process_ceiling_bytes
+    return plan.total_limit_bytes - plan.unallocated_bytes
+
+
 def select_expert_profile(
     requested: str,
     *,
     model_key: str,
     installed_ram_bytes: int | None = None,
     available_bytes: int | None = None,
+    overrides: Mapping[str, Any] | None = None,
 ) -> ExpertServeProfile:
     """Select a promoted profile once, before runtime construction."""
 
@@ -306,14 +346,12 @@ def select_expert_profile(
                 f"expert profile {selected.name!r} requires model key "
                 f"{selected.model_key!r}, not {model_key!r}"
             )
-        if (
-            selected.process_ceiling_bytes > installed
-            or selected.process_ceiling_bytes > available
-        ):
+        required = profile_required_bytes(selected, overrides=overrides)
+        if required > installed or required > available:
             raise ValueError(
                 f"expert profile {selected.name!r}: required "
-                f"{selected.process_ceiling_bytes} installed bytes and "
-                f"{selected.process_ceiling_bytes} available bytes; detected "
+                f"{required} installed bytes and "
+                f"{required} available bytes; detected "
                 f"{installed} installed bytes and {available} available bytes"
             )
         return selected
@@ -326,20 +364,23 @@ def select_expert_profile(
         ),
         reverse=True,
     )
-    for profile in candidates:
-        if (
-            profile.process_ceiling_bytes <= installed
-            and profile.process_ceiling_bytes <= available
-        ):
-            return profile
     if not candidates:
         raise ValueError(f"no promoted expert profiles match model key {model_key!r}")
-    smallest = candidates[-1]
+    requirements = {
+        profile.name: profile_required_bytes(profile, overrides=overrides)
+        for profile in candidates
+    }
+    for profile in candidates:
+        required = requirements[profile.name]
+        if required <= installed and required <= available:
+            return profile
+    smallest = min(candidates, key=lambda profile: requirements[profile.name])
+    least = requirements[smallest.name]
     names = ", ".join(profile.name for profile in reversed(candidates))
     raise ValueError(
         "no promoted expert profile fits: minimum profile "
-        f"{smallest.name!r} requires {smallest.process_ceiling_bytes} installed "
-        f"bytes and {smallest.process_ceiling_bytes} available bytes; detected "
+        f"{smallest.name!r} requires {least} installed "
+        f"bytes and {least} available bytes; detected "
         f"{installed} installed bytes and {available} available bytes; "
         f"promoted profiles: {names}"
     )

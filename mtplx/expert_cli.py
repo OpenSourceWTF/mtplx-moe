@@ -603,6 +603,7 @@ def _profile_for_model_key(
     args: Any,
     *,
     model_key: str,
+    overrides: Mapping[str, Any] | None = None,
 ) -> ExpertServeProfile | None:
     requested = str(getattr(args, "expert_profile", "auto") or "auto")
     promoted_model_keys = {
@@ -610,7 +611,11 @@ def _profile_for_model_key(
     }
     if requested == "auto" and model_key not in promoted_model_keys:
         return None
-    return select_expert_profile(requested, model_key=model_key)
+    return select_expert_profile(
+        requested,
+        model_key=model_key,
+        overrides=overrides,
+    )
 
 
 def resolve_expert_profile_for_args(
@@ -738,7 +743,11 @@ def expert_streaming_load_kwargs(
             f"expert model key {configured_model_key!r} does not match "
             f"admitted manifest model key {model_key!r}"
         )
-    profile = _profile_for_model_key(args, model_key=model_key)
+    profile = _profile_for_model_key(
+        args,
+        model_key=model_key,
+        overrides={**values, **overrides},
+    )
     customized_fields: tuple[str, ...] = ()
     effective_config: dict[str, Any] = {}
     if profile is not None:
