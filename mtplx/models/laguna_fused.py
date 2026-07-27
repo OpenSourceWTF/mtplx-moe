@@ -1966,6 +1966,14 @@ def _kernel_attention_call(self, x, mask=None, cache=None, rope_memo=None):
     batch, length, _ = x.shape
     if spec is None or length != 1:
         return _qkvg_attention_dispatch(self, x, mask, cache, rope_memo)
+    offset = cache.offset if cache is not None else 0
+    if isinstance(offset, mx.array) and offset.size != 1:
+        # Ragged serving owns one logical offset per batch row.  The fixed
+        # qk+rope kernel accepts one scalar position, while the installed qkvg
+        # dispatcher preserves the vector and uses MLX's general per-row rope
+        # path.  Route before projection so this explicit runtime phase choice
+        # never computes qkvg twice.
+        return _qkvg_attention_dispatch(self, x, mask, cache, rope_memo)
 
     # One matmul for all four projections when the fusion is installed; the
     # gate logits then come for free instead of costing a fifth dispatch below.
@@ -1980,7 +1988,6 @@ def _kernel_attention_call(self, x, mask=None, cache=None, rope_memo=None):
     ):
         return _qkvg_attention_dispatch(self, x, mask, cache, rope_memo)
 
-    offset = cache.offset if cache is not None else 0
     queries, keys = fused_qk_norm_rope(
         queries,
         keys,

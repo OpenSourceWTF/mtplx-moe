@@ -245,6 +245,31 @@ def test_qk_rope_spec_for_yarn_captures_freqs_and_mscale():
         mx.set_default_device(previous)
 
 
+def test_qk_rope_kernel_routes_ragged_offsets_before_projection(monkeypatch):
+    sentinel = object()
+    projected = False
+
+    def forbidden_projection(_x):
+        nonlocal projected
+        projected = True
+        raise AssertionError("ragged route projected before dispatch")
+
+    monkeypatch.setattr(
+        laguna_fused,
+        "_qkvg_attention_dispatch",
+        lambda self, x, mask, cache, rope_memo: sentinel,
+    )
+    attention = SimpleNamespace(
+        _qk_rope_spec=object(),
+        _qkvg=forbidden_projection,
+    )
+    x = SimpleNamespace(shape=(2, 1, 64))
+    cache = SimpleNamespace(offset=mx.array([12, 19], dtype=mx.int32))
+
+    assert laguna_fused._kernel_attention_call(attention, x, cache=cache) is sentinel
+    assert projected is False
+
+
 def test_moe_combine_fallback_matches_stock_expression(toy_model):
     """The CPU fallback inside fused_moe_combine IS the stock arithmetic."""
 
