@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import gc
 import os
-from typing import Any
+from dataclasses import dataclass
+from functools import partial
+from typing import Any, Callable
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -47,6 +49,7 @@ import mlx.nn as nn
 # `sys.modules` lookups.  `mtplx.kernels` imports nothing from `mtplx.models`,
 # so there is no cycle to avoid.
 from ..kernels.laguna_decode import fused_glu
+from .laguna import LagunaSparseMoeBlock as _LagunaSparseMoeBlock
 
 ENV_FUSED_GATE_UP = "MTPLX_LAGUNA_FUSED_GATE_UP"
 ENV_COMPILED_ROUTER = "MTPLX_LAGUNA_COMPILED_ROUTER"
@@ -60,10 +63,20 @@ ENV_KERNEL_COMBINE = "MTPLX_LAGUNA_KERNEL_COMBINE"
 ENV_FUSED_SHARED_GATE_UP = "MTPLX_LAGUNA_FUSED_SHARED_GATE_UP"
 ENV_CACHED_LHS = "MTPLX_LAGUNA_CACHED_LHS"
 ENV_FUSED_QKVG = "MTPLX_LAGUNA_FUSED_QKVG"
+ENV_FIXED_M2_ROUTER = "MTPLX_LAGUNA_FIXED_M2_ROUTER"
+
+
+class LagunaFixedM2ConfigError(RuntimeError):
+    """The requested fixed Laguna router route failed construction checks."""
+
 
 # The pristine Attention.__call__, captured on first install so the fused
 # variant can delegate any shape it does not cover and benches can restore it.
 _STOCK_ATTENTION_CALL = None
+# Unlike the older optional router patches, the fixed-M2 route owns an explicit
+# stock prefill route.  Capture the shipped implementation at module import so
+# installer order cannot accidentally bind another experimental forward.
+_STOCK_LAGUNA_MOE_CALL = _LagunaSparseMoeBlock.__call__
 
 
 def _enabled(name: str) -> bool:
@@ -804,6 +817,500 @@ def install_kernel_router_gemv(model: Any) -> dict[str, Any]:
     return report
 
 
+# ---------------------------------------------------------------------------
+# validated direct M1/M2 router route
+# ---------------------------------------------------------------------------
+_FIXED_M2_LAYERS = 47
+_FIXED_M2_HIDDEN = 3072
+_FIXED_M2_EXPERTS = 256
+_FIXED_M2_TOP_K = 10
+_FIXED_M2_SCALE = 2.5
+
+
+def _fixed_router_topk_direct(
+    logits: mx.array,
+    correction_bias: mx.array,
+    *,
+    rows: int,
+    _kernel: Any,
+) -> tuple[mx.array, mx.array]:
+    """Launch the proven Laguna top-k kernel with no runtime eligibility gate."""
+
+    indices, weights = _kernel(
+        inputs=[logits, correction_bias, _FIXED_M2_SCALE, True],
+        grid=(_FIXED_M2_EXPERTS * rows, 1, 1),
+        threadgroup=(_FIXED_M2_EXPERTS, 1, 1),
+        output_shapes=[
+            (rows, _FIXED_M2_TOP_K),
+            (rows, _FIXED_M2_TOP_K),
+        ],
+        output_dtypes=[mx.uint32, mx.float32],
+    )
+    return indices, weights
+
+
+def _fixed_m2_route_direct(
+    x: mx.array,
+    *,
+    project_logits: Callable[[mx.array], mx.array],
+    select_topk: Callable[[mx.array], tuple[mx.array, mx.array]],
+) -> tuple[mx.array, mx.array]:
+    return select_topk(project_logits(x))
+
+
+def _fixed_m2_apply_routed(
+    x: mx.array,
+    routing: tuple[mx.array, mx.array],
+    *,
+    switch_mlp: Callable[[mx.array, mx.array], mx.array],
+    shared_expert: Callable[[mx.array], mx.array],
+    combine: Callable[[mx.array, mx.array, mx.array], mx.array],
+) -> mx.array:
+    batch, length, hidden = x.shape
+    flattened = x.reshape(-1, hidden)
+    indices, weights = routing
+    output = switch_mlp(flattened, indices)
+    output = combine(
+        output,
+        weights,
+        shared_expert(flattened),
+    )
+    return output.reshape(batch, length, hidden)
+
+
+@dataclass(frozen=True, slots=True)
+class _FixedM2RouterPack:
+    """Construction-validated arrays and exact bound route entrypoints."""
+
+    weight: mx.array
+    correction_bias: mx.array
+    route_m1: Callable[[mx.array], tuple[mx.array, mx.array]]
+    route_m2: Callable[[mx.array], tuple[mx.array, mx.array]]
+    prefill_stock: Callable[[mx.array], mx.array]
+    apply_routed_and_shared_experts: Callable[
+        [mx.array, tuple[mx.array, mx.array]],
+        mx.array,
+    ]
+
+
+def _fixed_m2_moe_call(self, x: mx.array) -> mx.array:
+    """Direct installed route; logical M is its only execution-time decision."""
+
+    pack = self._fixed_m2_router_pack
+    x2d = x.reshape(-1, int(x.shape[-1]))
+    logical_m = int(x2d.shape[0])
+    if logical_m == 1:
+        routing = pack.route_m1(x2d)
+    elif logical_m == 2:
+        routing = pack.route_m2(x2d)
+    else:
+        return pack.prefill_stock(x)
+    return pack.apply_routed_and_shared_experts(x, routing)
+
+
+def _fixed_m2_contract_error(
+    layer_number: int | None,
+    property_name: str,
+    actual: Any,
+    expected: Any,
+) -> LagunaFixedM2ConfigError:
+    prefix = "" if layer_number is None else f"layer {layer_number} "
+    return LagunaFixedM2ConfigError(
+        f"{prefix}{property_name} is {actual}; expected {expected}"
+    )
+
+
+def _validate_fixed_quantized_projection(
+    projection: Any,
+    *,
+    layer_number: int,
+    label: str,
+    bits: int,
+) -> None:
+    actual = (
+        getattr(projection, "bits", None),
+        getattr(projection, "group_size", None),
+        getattr(projection, "mode", None),
+        hasattr(projection, "weight"),
+        hasattr(projection, "scales"),
+        hasattr(projection, "biases"),
+    )
+    expected = (bits, 128, "affine", True, True, True)
+    if actual != expected:
+        raise _fixed_m2_contract_error(
+            layer_number,
+            f"{label} layout",
+            actual,
+            f"Q{bits} affine group_size 128 with weight/scales/biases",
+        )
+
+
+def _validate_fixed_routed_layout(block: Any, layer_number: int) -> None:
+    routed = block.switch_mlp
+    if isinstance(routed, FusedGateUpSwitchGLU):
+        actual = (
+            bool(routed.quantized),
+            getattr(routed, "bits", None),
+            getattr(routed, "group_size", None),
+            getattr(routed, "mode", None),
+            hasattr(routed, "gate_up_weight"),
+            hasattr(routed, "gate_up_scales"),
+            hasattr(routed, "gate_up_biases"),
+        )
+        expected = (True, 4, 128, "affine", True, True, True)
+        if actual != expected:
+            raise _fixed_m2_contract_error(
+                layer_number,
+                "routed expert gate_up layout",
+                actual,
+                "Q4 affine group_size 128 fused gate/up",
+            )
+        _validate_fixed_quantized_projection(
+            routed.down_proj,
+            layer_number=layer_number,
+            label="routed expert down_proj",
+            bits=4,
+        )
+    else:
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            _validate_fixed_quantized_projection(
+                getattr(routed, name, None),
+                layer_number=layer_number,
+                label=f"routed expert {name}",
+                bits=4,
+            )
+
+    shared = block.shared_expert
+    if isinstance(shared, FusedGateUpMLP):
+        actual = (
+            bool(shared.quantized),
+            getattr(shared, "bits", None),
+            getattr(shared, "group_size", None),
+            getattr(shared, "mode", None),
+            hasattr(shared, "gate_up_weight"),
+            hasattr(shared, "gate_up_scales"),
+            hasattr(shared, "gate_up_biases"),
+        )
+        expected = (True, 8, 128, "affine", True, True, True)
+        if actual != expected:
+            raise _fixed_m2_contract_error(
+                layer_number,
+                "shared expert gate_up layout",
+                actual,
+                "Q8 affine group_size 128 fused gate/up",
+            )
+        _validate_fixed_quantized_projection(
+            shared.down_proj,
+            layer_number=layer_number,
+            label="shared expert down_proj",
+            bits=8,
+        )
+    else:
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            _validate_fixed_quantized_projection(
+                getattr(shared, name, None),
+                layer_number=layer_number,
+                label=f"shared expert {name}",
+                bits=8,
+            )
+
+
+def _fixed_m2_selfcheck_inputs() -> mx.array:
+    """Two deterministic BF16 rows shared by all 47 construction checks."""
+
+    values = mx.arange(2 * _FIXED_M2_HIDDEN, dtype=mx.float32)
+    values = ((values % 251) - 125.0) / 128.0
+    inputs = values.reshape(2, _FIXED_M2_HIDDEN).astype(mx.bfloat16)
+    mx.eval(inputs)
+    return inputs
+
+
+def _selfcheck_fixed_m2_block(
+    *,
+    layer_number: int,
+    inputs: mx.array,
+    project_m1: Callable[[mx.array], mx.array],
+    project_m2: Callable[[mx.array], mx.array],
+    select_m1: Callable[[mx.array], tuple[mx.array, mx.array]],
+    select_m2: Callable[[mx.array], tuple[mx.array, mx.array]],
+) -> None:
+    try:
+        m1_logits = mx.concatenate(
+            [
+                project_m1(inputs[0:1]),
+                project_m1(inputs[1:2]),
+            ],
+            axis=0,
+        )
+        m2_logits = project_m2(inputs)
+        mx.eval(m1_logits, m2_logits)
+    except Exception as error:
+        raise LagunaFixedM2ConfigError(
+            f"layer {layer_number} fixed-M2 logits self-check failed: {error}"
+        ) from error
+    if not bool(mx.array_equal(m1_logits, m2_logits)):
+        raise LagunaFixedM2ConfigError(
+            f"layer {layer_number} fixed-M2 logits self-check mismatch"
+        )
+
+    try:
+        m1_indices_0, m1_weights_0 = select_m1(m1_logits[0:1])
+        m1_indices_1, m1_weights_1 = select_m1(m1_logits[1:2])
+        m1_indices = mx.concatenate([m1_indices_0, m1_indices_1], axis=0)
+        m1_weights = mx.concatenate([m1_weights_0, m1_weights_1], axis=0)
+        m2_indices, m2_weights = select_m2(m2_logits)
+        mx.eval(m1_indices, m1_weights, m2_indices, m2_weights)
+    except Exception as error:
+        raise LagunaFixedM2ConfigError(
+            f"layer {layer_number} fixed-M2 route self-check failed: {error}"
+        ) from error
+    if not bool(mx.array_equal(m1_indices, m2_indices)):
+        raise LagunaFixedM2ConfigError(
+            f"layer {layer_number} fixed-M2 expert IDs self-check mismatch"
+        )
+    if not bool(mx.array_equal(m1_weights, m2_weights)):
+        raise LagunaFixedM2ConfigError(
+            f"layer {layer_number} fixed-M2 route weights self-check mismatch"
+        )
+
+
+def install_fixed_m2_router(model: Any) -> dict[str, Any]:
+    """Validate and atomically install the direct Laguna M1/M2 router routes."""
+
+    from ..kernels import laguna_decode as kernels
+    from . import laguna
+
+    LagunaSparseMoeBlock = laguna.LagunaSparseMoeBlock
+
+    inner = getattr(model, "model", model)
+    blocks = [
+        (index, layer.mlp)
+        for index, layer in enumerate(inner.layers)
+        if isinstance(layer.mlp, LagunaSparseMoeBlock)
+    ]
+    if len(blocks) != _FIXED_M2_LAYERS:
+        raise _fixed_m2_contract_error(
+            None,
+            "MoE block count",
+            len(blocks),
+            _FIXED_M2_LAYERS,
+        )
+
+    args = getattr(inner, "args", getattr(model, "args", None))
+    model_contract = (
+        getattr(args, "hidden_size", None),
+        getattr(args, "num_experts", None),
+        getattr(args, "num_experts_per_tok", None),
+        getattr(args, "norm_topk_prob", None),
+        getattr(args, "moe_routed_scaling_factor", None),
+        getattr(args, "moe_router_logit_softcapping", None),
+    )
+    expected_model_contract = (
+        _FIXED_M2_HIDDEN,
+        _FIXED_M2_EXPERTS,
+        _FIXED_M2_TOP_K,
+        True,
+        _FIXED_M2_SCALE,
+        0.0,
+    )
+    if model_contract != expected_model_contract:
+        raise _fixed_m2_contract_error(
+            None,
+            "model router contract "
+            "(hidden, experts, top-k, normalization, scaling, softcap)",
+            model_contract,
+            expected_model_contract,
+        )
+
+    validated: list[tuple[int, Any, mx.array, mx.array]] = []
+    router_weight_ids: set[int] = set()
+    for layer_index, block in blocks:
+        layer_number = layer_index
+        if int(block.num_experts) != _FIXED_M2_EXPERTS:
+            raise _fixed_m2_contract_error(
+                layer_number,
+                "expert count",
+                block.num_experts,
+                _FIXED_M2_EXPERTS,
+            )
+        if int(block.top_k) != _FIXED_M2_TOP_K:
+            raise _fixed_m2_contract_error(
+                layer_number,
+                "top-k",
+                block.top_k,
+                _FIXED_M2_TOP_K,
+            )
+        if block.norm_topk_prob is not True:
+            raise _fixed_m2_contract_error(
+                layer_number,
+                "normalization",
+                block.norm_topk_prob,
+                True,
+            )
+        if float(block.routed_scaling_factor) != _FIXED_M2_SCALE:
+            raise _fixed_m2_contract_error(
+                layer_number,
+                "scaling",
+                block.routed_scaling_factor,
+                _FIXED_M2_SCALE,
+            )
+        if float(block.softcap) != 0.0:
+            raise _fixed_m2_contract_error(
+                layer_number,
+                "softcap",
+                block.softcap,
+                0.0,
+            )
+
+        gate = block.gate
+        if hasattr(gate, "scales"):
+            raise _fixed_m2_contract_error(
+                layer_number,
+                "router layout",
+                "quantized",
+                "dense BF16",
+            )
+        if hasattr(gate, "bias"):
+            raise _fixed_m2_contract_error(
+                layer_number,
+                "router bias",
+                "present",
+                "absent",
+            )
+        weight = getattr(gate, "weight", None)
+        weight_shape = (
+            tuple(int(dim) for dim in weight.shape)
+            if weight is not None
+            else None
+        )
+        if weight_shape != (_FIXED_M2_EXPERTS, _FIXED_M2_HIDDEN):
+            raise _fixed_m2_contract_error(
+                layer_number,
+                "router weight shape",
+                weight_shape,
+                (_FIXED_M2_EXPERTS, _FIXED_M2_HIDDEN),
+            )
+        if weight.dtype != mx.bfloat16:
+            raise _fixed_m2_contract_error(
+                layer_number,
+                "router weight dtype",
+                weight.dtype,
+                mx.bfloat16,
+            )
+        if id(weight) in router_weight_ids:
+            raise LagunaFixedM2ConfigError(
+                f"layer {layer_number} violates 47 distinct router weights"
+            )
+        router_weight_ids.add(id(weight))
+
+        bias = block.e_score_correction_bias
+        bias_shape = tuple(int(dim) for dim in bias.shape)
+        if bias_shape != (_FIXED_M2_EXPERTS,):
+            raise _fixed_m2_contract_error(
+                layer_number,
+                "correction bias shape",
+                bias_shape,
+                (_FIXED_M2_EXPERTS,),
+            )
+        _validate_fixed_routed_layout(block, layer_number)
+        bias_f32 = bias.astype(mx.float32)
+        mx.eval(bias_f32)
+        validated.append((layer_number, block, weight, bias_f32))
+
+    if not kernels._on_metal_device():
+        raise LagunaFixedM2ConfigError(
+            "Metal/custom kernel availability is false; expected active Metal device"
+        )
+
+    try:
+        topk_kernel = kernels._router_kernel(
+            _FIXED_M2_EXPERTS,
+            _FIXED_M2_TOP_K,
+        )
+    except Exception as error:
+        raise LagunaFixedM2ConfigError(
+            f"Metal/custom top-k kernel construction failed: {error}"
+        ) from error
+
+    inputs = _fixed_m2_selfcheck_inputs()
+    staged: list[
+        tuple[
+            Any,
+            mx.array,
+            mx.array,
+            Callable[[mx.array], tuple[mx.array, mx.array]],
+            Callable[[mx.array], tuple[mx.array, mx.array]],
+        ]
+    ] = []
+    for layer_number, _block, weight, bias_f32 in validated:
+        project_m1 = partial(kernels.router_gemv_logits, gate_weight=weight)
+        project_m2 = partial(
+            kernels._router_gemv_logits_m2_direct,
+            gate_weight=weight,
+        )
+        select_m1 = partial(
+            _fixed_router_topk_direct,
+            correction_bias=bias_f32,
+            rows=1,
+            _kernel=topk_kernel,
+        )
+        select_m2 = partial(
+            _fixed_router_topk_direct,
+            correction_bias=bias_f32,
+            rows=2,
+            _kernel=topk_kernel,
+        )
+        _selfcheck_fixed_m2_block(
+            layer_number=layer_number,
+            inputs=inputs,
+            project_m1=project_m1,
+            project_m2=project_m2,
+            select_m1=select_m1,
+            select_m2=select_m2,
+        )
+        route_m1 = partial(
+            _fixed_m2_route_direct,
+            project_logits=project_m1,
+            select_topk=select_m1,
+        )
+        route_m2 = partial(
+            _fixed_m2_route_direct,
+            project_logits=project_m2,
+            select_topk=select_m2,
+        )
+        staged.append((_block, weight, bias_f32, route_m1, route_m2))
+
+    packs: list[tuple[Any, _FixedM2RouterPack]] = []
+    for block, weight, bias_f32, route_m1, route_m2 in staged:
+        packs.append(
+            (
+                block,
+                _FixedM2RouterPack(
+                    weight=weight,
+                    correction_bias=bias_f32,
+                    route_m1=route_m1,
+                    route_m2=route_m2,
+                    prefill_stock=partial(_STOCK_LAGUNA_MOE_CALL, block),
+                    apply_routed_and_shared_experts=partial(
+                        _fixed_m2_apply_routed,
+                        switch_mlp=block.switch_mlp,
+                        shared_expert=block.shared_expert,
+                        combine=laguna.MOE_COMBINE_IMPL,
+                    ),
+                ),
+            )
+        )
+
+    for block, pack in packs:
+        block._fixed_m2_router_pack = pack
+    LagunaSparseMoeBlock.__call__ = _fixed_m2_moe_call
+    return {
+        "path": "fixed_m2_router",
+        "layers_validated": _FIXED_M2_LAYERS,
+        "layers_selfchecked": _FIXED_M2_LAYERS,
+    }
+
+
 def install_kernel_attention_gate(model: Any) -> dict[str, Any]:
     from . import laguna
     from ..kernels.laguna_decode import fused_per_head_gate
@@ -1302,6 +1809,7 @@ def install_from_env(model: Any) -> list[dict[str, Any]]:
     """Install whichever fused paths the environment asks for."""
 
     report: list[dict[str, Any]] = []
+    fixed_m2_requested = _enabled(ENV_FIXED_M2_ROUTER)
     if _enabled(ENV_FUSED_GATE_UP):
         report.append(install_fused_gate_up(model))
     if _enabled(ENV_COMPILED_ROUTER):
@@ -1333,4 +1841,9 @@ def install_from_env(model: Any) -> list[dict[str, Any]]:
     # the qk-rope forward if that one is already in place.
     if _enabled(ENV_FUSED_QKVG):
         report.append(install_fused_qkvg(model))
+    # Last: this route validates the final installed expert layout and must own
+    # the MoE call after any older router experiment asked for in the same env.
+    # A requested failure raises; it never becomes a skip report.
+    if fixed_m2_requested:
+        report.append(install_fixed_m2_router(model))
     return report

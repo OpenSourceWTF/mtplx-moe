@@ -924,3 +924,38 @@ def test_laguna_load_attaches_the_fused_install_report(
 
     assert isinstance(loaded, _StubLagunaRuntime)
     assert loaded.laguna_fused_report == fused_report
+
+
+def test_laguna_load_propagates_requested_fixed_m2_install_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """A requested invalid direct route must abort before serving."""
+
+    from mtplx import runtime
+    from mtplx.models import laguna_fused
+
+    target_config = _target_laguna_config()
+    failure = laguna_fused.LagunaFixedM2ConfigError(
+        "layer 12 router weight dtype is float32; expected bfloat16"
+    )
+
+    monkeypatch.setenv(laguna_fused.ENV_FIXED_M2_ROUTER, "1")
+    monkeypatch.setattr(runtime, "load_config", lambda path: target_config)
+    monkeypatch.setattr(
+        runtime, "_preflight_laguna_system_memory", lambda config: None
+    )
+    monkeypatch.setattr(
+        runtime, "_load_base_model", lambda path, config: (object(), object())
+    )
+    monkeypatch.setattr(runtime, "_load_runtime_metadata", lambda path: None)
+    monkeypatch.setattr(
+        laguna_fused,
+        "install_from_env",
+        lambda model: (_ for _ in ()).throw(failure),
+    )
+
+    with pytest.raises(laguna_fused.LagunaFixedM2ConfigError) as raised:
+        runtime.load(tmp_path, mtp=False)
+
+    assert raised.value is failure

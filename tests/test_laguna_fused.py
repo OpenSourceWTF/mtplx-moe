@@ -12,6 +12,7 @@ dtype the real checkpoint runs in.
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -641,6 +642,429 @@ def test_router_gemv_m2_shape_contract_precedes_direct_dispatch(monkeypatch):
             assert len(calls) == 1, label
     finally:
         mx.set_default_device(previous)
+
+
+# ---------------------------------------------------------------------------
+# the validated fixed-M2 installed route
+# ---------------------------------------------------------------------------
+class _FixedM2FakeGate(nn.Module):
+    def __init__(self, weight):
+        super().__init__()
+        self.weight = weight
+
+
+class _FixedM2QuantizedProjection(nn.Module):
+    def __init__(self, *, bits: int):
+        super().__init__()
+        self.weight = mx.zeros((1,), dtype=mx.uint32)
+        self.scales = mx.zeros((1,), dtype=mx.bfloat16)
+        self.biases = mx.zeros((1,), dtype=mx.bfloat16)
+        self.group_size = 128
+        self.bits = bits
+        self.mode = "affine"
+
+
+class _FixedM2FakeSwitch(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate_proj = _FixedM2QuantizedProjection(bits=4)
+        self.up_proj = _FixedM2QuantizedProjection(bits=4)
+        self.down_proj = _FixedM2QuantizedProjection(bits=4)
+        self.calls = 0
+
+    def __call__(self, x, indices):
+        self.calls += 1
+        return mx.zeros(
+            (int(x.shape[0]), int(indices.shape[1]), int(x.shape[1])),
+            dtype=x.dtype,
+        )
+
+
+class _FixedM2FakeShared(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate_proj = _FixedM2QuantizedProjection(bits=8)
+        self.up_proj = _FixedM2QuantizedProjection(bits=8)
+        self.down_proj = _FixedM2QuantizedProjection(bits=8)
+
+    def __call__(self, x):
+        return mx.zeros_like(x)
+
+
+def _fixed_m2_fake_block(index: int):
+    block = laguna.LagunaSparseMoeBlock.__new__(laguna.LagunaSparseMoeBlock)
+    nn.Module.__init__(block)
+    # Broadcasted constants keep the CPU-only fixture cheap while preserving
+    # 47 distinct installed array objects with the real router geometry.
+    weight = mx.broadcast_to(
+        mx.array(index + 1, dtype=mx.bfloat16),
+        (256, 3072),
+    )
+    block.num_experts = 256
+    block.top_k = 10
+    block.norm_topk_prob = True
+    block.routed_scaling_factor = 2.5
+    block.softcap = 0.0
+    block.gate = _FixedM2FakeGate(weight)
+    block.e_score_correction_bias = mx.zeros((256,), dtype=mx.float32)
+    block.switch_mlp = _FixedM2FakeSwitch()
+    block.shared_expert = _FixedM2FakeShared()
+    return block
+
+
+def _fixed_m2_fake_model():
+    blocks = [_fixed_m2_fake_block(index) for index in range(47)]
+    layers = [SimpleNamespace(mlp=object())]
+    layers.extend(SimpleNamespace(mlp=block) for block in blocks)
+    args = SimpleNamespace(
+        hidden_size=3072,
+        num_experts=256,
+        num_experts_per_tok=10,
+        norm_topk_prob=True,
+        moe_routed_scaling_factor=2.5,
+        moe_router_logit_softcapping=0.0,
+    )
+    return SimpleNamespace(
+        model=SimpleNamespace(layers=layers, args=args),
+        args=args,
+    )
+
+
+@pytest.fixture
+def fixed_m2_fake_runtime(monkeypatch):
+    """CPU call-recording substitutes for the three direct Metal launches."""
+
+    from mtplx.kernels import laguna_decode as kernels
+
+    calls = {
+        "m1": [],
+        "m2": [],
+        "topk": [],
+        "stock": [],
+        "control": {"m2_error": None},
+    }
+
+    def fake_m1(x, gate_weight):
+        calls["m1"].append((x, gate_weight))
+        return x[:, :256].astype(mx.float32)
+
+    def fake_m2(x, gate_weight):
+        calls["m2"].append((x, gate_weight))
+        if calls["control"]["m2_error"] is not None:
+            raise calls["control"]["m2_error"]
+        return x[:, :256].astype(mx.float32)
+
+    def fake_topk(logits, correction_bias, *, rows, _kernel=None):
+        calls["topk"].append((logits, correction_bias, rows))
+        indices = mx.broadcast_to(
+            mx.arange(10, dtype=mx.uint32)[None],
+            (rows, 10),
+        )
+        weights = logits[:, :10]
+        return indices, weights
+
+    def fake_stock(block, x):
+        calls["stock"].append((block, x))
+        return x
+
+    monkeypatch.setattr(
+        laguna.LagunaSparseMoeBlock,
+        "__call__",
+        laguna.LagunaSparseMoeBlock.__call__,
+    )
+    monkeypatch.setattr(kernels, "_on_metal_device", lambda: True)
+    monkeypatch.setattr(kernels, "router_gemv_logits", fake_m1)
+    monkeypatch.setattr(kernels, "_router_gemv_logits_m2_direct", fake_m2)
+    monkeypatch.setattr(laguna_fused, "_fixed_router_topk_direct", fake_topk)
+    monkeypatch.setattr(laguna_fused, "_STOCK_LAGUNA_MOE_CALL", fake_stock)
+    return calls
+
+
+def test_fixed_m2_install_rejects_wrong_layer_count(fixed_m2_fake_runtime):
+    model = _fixed_m2_fake_model()
+    model.model.layers.pop()
+
+    with pytest.raises(
+        laguna_fused.LagunaFixedM2ConfigError,
+        match="MoE block count.*46.*47",
+    ):
+        laguna_fused.install_fixed_m2_router(model)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda block: setattr(
+                block.gate,
+                "weight",
+                mx.zeros((255, 3072), dtype=mx.bfloat16),
+            ),
+            "router weight shape",
+        ),
+        (
+            lambda block: setattr(
+                block.gate,
+                "weight",
+                mx.zeros((256, 3072), dtype=mx.float32),
+            ),
+            "router weight dtype",
+        ),
+        (
+            lambda block: setattr(
+                block.gate,
+                "bias",
+                mx.zeros((256,), dtype=mx.bfloat16),
+            ),
+            "router bias",
+        ),
+        (lambda block: setattr(block, "num_experts", 255), "expert count"),
+        (lambda block: setattr(block, "top_k", 9), "top-k"),
+        (
+            lambda block: setattr(block, "norm_topk_prob", False),
+            "normalization",
+        ),
+        (
+            lambda block: setattr(block, "routed_scaling_factor", 1.0),
+            "scaling",
+        ),
+        (lambda block: setattr(block, "softcap", 1.0), "softcap"),
+        (
+            lambda block: setattr(
+                block,
+                "e_score_correction_bias",
+                mx.zeros((255,), dtype=mx.float32),
+            ),
+            "correction bias shape",
+        ),
+        (
+            lambda block: setattr(block.switch_mlp.gate_proj, "bits", 5),
+            "routed expert gate_proj layout",
+        ),
+        (
+            lambda block: setattr(block.shared_expert.down_proj, "group_size", 64),
+            "shared expert down_proj layout",
+        ),
+    ],
+)
+def test_fixed_m2_install_rejects_contract_mismatch(
+    fixed_m2_fake_runtime,
+    mutate,
+    message,
+):
+    model = _fixed_m2_fake_model()
+    mutate(model.model.layers[1].mlp)
+
+    with pytest.raises(laguna_fused.LagunaFixedM2ConfigError, match=message):
+        laguna_fused.install_fixed_m2_router(model)
+
+
+def test_fixed_m2_install_rejects_reused_router_array(fixed_m2_fake_runtime):
+    model = _fixed_m2_fake_model()
+    model.model.layers[2].mlp.gate.weight = model.model.layers[1].mlp.gate.weight
+
+    with pytest.raises(
+        laguna_fused.LagunaFixedM2ConfigError,
+        match="distinct router weights",
+    ):
+        laguna_fused.install_fixed_m2_router(model)
+
+
+def test_fixed_m2_install_selfchecks_all_47_distinct_router_weights(
+    fixed_m2_fake_runtime,
+):
+    model = _fixed_m2_fake_model()
+
+    report = laguna_fused.install_fixed_m2_router(model)
+
+    assert report == {
+        "path": "fixed_m2_router",
+        "layers_validated": 47,
+        "layers_selfchecked": 47,
+    }
+    m2_weights = [weight for _x, weight in fixed_m2_fake_runtime["m2"]]
+    assert len(m2_weights) == 47
+    assert len({id(weight) for weight in m2_weights}) == 47
+    assert len(fixed_m2_fake_runtime["m1"]) == 94
+    for layer in model.model.layers[1:]:
+        assert layer.mlp._fixed_m2_router_pack.weight is layer.mlp.gate.weight
+
+
+def test_fixed_m2_install_selfcheck_failure_is_atomic(
+    fixed_m2_fake_runtime,
+    monkeypatch,
+):
+    from mtplx.kernels import laguna_decode as kernels
+
+    model = _fixed_m2_fake_model()
+    calls = 0
+
+    def wrong_m2(x, gate_weight):
+        nonlocal calls
+        calls += 1
+        logits = x[:, :256].astype(mx.float32)
+        if calls == 47:
+            logits = logits + 1.0
+        return logits
+
+    monkeypatch.setattr(kernels, "_router_gemv_logits_m2_direct", wrong_m2)
+
+    with pytest.raises(
+        laguna_fused.LagunaFixedM2ConfigError,
+        match="layer 47.*logits self-check",
+    ):
+        laguna_fused.install_fixed_m2_router(model)
+
+    assert all(
+        not hasattr(layer.mlp, "_fixed_m2_router_pack")
+        for layer in model.model.layers[1:]
+    )
+
+
+def _clear_fixed_m2_calls(calls):
+    for entries in calls.values():
+        if isinstance(entries, list):
+            entries.clear()
+
+
+def test_fixed_m2_route_calls_bound_m1_entrypoint_for_one_row(
+    fixed_m2_fake_runtime,
+):
+    model = _fixed_m2_fake_model()
+    laguna_fused.install_fixed_m2_router(model)
+    _clear_fixed_m2_calls(fixed_m2_fake_runtime)
+    block = model.model.layers[1].mlp
+    x = mx.zeros((1, 1, 3072), dtype=mx.bfloat16)
+
+    block(x)
+
+    assert len(fixed_m2_fake_runtime["m1"]) == 1
+    assert len(fixed_m2_fake_runtime["m2"]) == 0
+    assert len(fixed_m2_fake_runtime["topk"]) == 1
+    assert fixed_m2_fake_runtime["topk"][0][2] == 1
+    assert len(fixed_m2_fake_runtime["stock"]) == 0
+    assert block.switch_mlp.calls == 1
+
+
+def test_fixed_m2_route_calls_bound_m2_entrypoint_for_two_rows(
+    fixed_m2_fake_runtime,
+):
+    model = _fixed_m2_fake_model()
+    laguna_fused.install_fixed_m2_router(model)
+    _clear_fixed_m2_calls(fixed_m2_fake_runtime)
+    block = model.model.layers[1].mlp
+    x = mx.zeros((2, 1, 3072), dtype=mx.bfloat16)
+
+    block(x)
+
+    assert len(fixed_m2_fake_runtime["m1"]) == 0
+    assert len(fixed_m2_fake_runtime["m2"]) == 1
+    assert len(fixed_m2_fake_runtime["topk"]) == 1
+    assert fixed_m2_fake_runtime["topk"][0][2] == 2
+    assert len(fixed_m2_fake_runtime["stock"]) == 0
+    assert block.switch_mlp.calls == 1
+
+
+def test_fixed_m2_route_uses_explicit_stock_route_for_larger_prefill_m(
+    fixed_m2_fake_runtime,
+):
+    model = _fixed_m2_fake_model()
+    laguna_fused.install_fixed_m2_router(model)
+    _clear_fixed_m2_calls(fixed_m2_fake_runtime)
+    block = model.model.layers[1].mlp
+    x = mx.zeros((1, 3, 3072), dtype=mx.bfloat16)
+
+    assert block(x) is x
+
+    assert len(fixed_m2_fake_runtime["m1"]) == 0
+    assert len(fixed_m2_fake_runtime["m2"]) == 0
+    assert len(fixed_m2_fake_runtime["topk"]) == 0
+    assert fixed_m2_fake_runtime["stock"] == [(block, x)]
+
+
+def test_fixed_m2_route_has_no_exception_fallback(
+    fixed_m2_fake_runtime,
+):
+    model = _fixed_m2_fake_model()
+    laguna_fused.install_fixed_m2_router(model)
+    _clear_fixed_m2_calls(fixed_m2_fake_runtime)
+    sentinel = RuntimeError("sentinel fixed-M2 failure")
+    fixed_m2_fake_runtime["control"]["m2_error"] = sentinel
+    block = model.model.layers[1].mlp
+    x = mx.zeros((2, 1, 3072), dtype=mx.bfloat16)
+
+    with pytest.raises(RuntimeError) as raised:
+        block(x)
+
+    assert raised.value is sentinel
+    assert fixed_m2_fake_runtime["stock"] == []
+
+
+def test_fixed_m2_installed_route_never_calls_eligibility_helpers(
+    fixed_m2_fake_runtime,
+    monkeypatch,
+):
+    from mtplx.kernels import laguna_decode as kernels
+
+    model = _fixed_m2_fake_model()
+    laguna_fused.install_fixed_m2_router(model)
+    _clear_fixed_m2_calls(fixed_m2_fake_runtime)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("eligibility helper reached installed route")
+
+    monkeypatch.setattr(kernels, "is_router_gemv_eligible", forbidden)
+    monkeypatch.setattr(kernels, "is_router_eligible", forbidden)
+    block = model.model.layers[1].mlp
+
+    block(mx.zeros((1, 1, 3072), dtype=mx.bfloat16))
+    block(mx.zeros((2, 1, 3072), dtype=mx.bfloat16))
+
+
+def test_fixed_m2_requested_install_failure_is_fatal(monkeypatch):
+    model = _fixed_m2_fake_model()
+    model.model.layers.pop()
+    monkeypatch.setenv(laguna_fused.ENV_FIXED_M2_ROUTER, "1")
+
+    with pytest.raises(
+        laguna_fused.LagunaFixedM2ConfigError,
+        match="MoE block count",
+    ):
+        laguna_fused.install_from_env(model)
+
+
+def test_fixed_m2_install_from_env_reads_dedicated_flag_once(monkeypatch):
+    reads = []
+
+    def fake_enabled(name):
+        reads.append(name)
+        return False
+
+    monkeypatch.setattr(laguna_fused, "_enabled", fake_enabled)
+
+    assert laguna_fused.install_from_env(object()) == []
+    assert reads.count(laguna_fused.ENV_FIXED_M2_ROUTER) == 1
+
+
+def test_fixed_m2_install_requires_active_metal(
+    fixed_m2_fake_runtime,
+    monkeypatch,
+):
+    from mtplx.kernels import laguna_decode as kernels
+
+    model = _fixed_m2_fake_model()
+    monkeypatch.setattr(kernels, "_on_metal_device", lambda: False)
+
+    with pytest.raises(
+        laguna_fused.LagunaFixedM2ConfigError,
+        match="Metal/custom kernel availability",
+    ):
+        laguna_fused.install_fixed_m2_router(model)
+
+    assert all(
+        not hasattr(layer.mlp, "_fixed_m2_router_pack")
+        for layer in model.model.layers[1:]
+    )
 
 
 def test_router_gemv_fallback_matches_the_two_step_stock_chain():
