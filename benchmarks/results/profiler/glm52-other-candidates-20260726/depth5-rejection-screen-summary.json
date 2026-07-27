@@ -1,0 +1,232 @@
+{
+  "schema": "mtplx-glm52-q1t-depth5-rejection-screen-v1",
+  "workload": {
+    "model": "glm52-q1t",
+    "context_tokens": 1024,
+    "output_tokens": 64,
+    "sampler": "greedy",
+    "mtp_precision": "q4",
+    "verify_strategy": "capture_commit",
+    "context_copy": false,
+    "memory_limit_bytes": 103079215104,
+    "runtime_reserve": "12GiB",
+    "expert_cache_limit": "72GiB",
+    "slots_per_layer": 109,
+    "transient_slots": 48,
+    "token_sha256": "e2abfa810932ce1e59c8ff0796e14b2983ac777ed5c397acfe9ec3ac1807fc3d",
+    "target_offset": 1088,
+    "mtp_offset": 1087,
+    "peak_mlx_bytes": 90470328522
+  },
+  "depth5_vs_depth4_abba": {
+    "order": [
+      "depth4",
+      "depth5",
+      "depth5",
+      "depth4"
+    ],
+    "depth4": {
+      "decode_tok_s": [
+        7.041807307034773,
+        7.077865654994575
+      ],
+      "median_decode_tok_s": 7.059836481014674,
+      "verify_calls": 14,
+      "drafted_tokens": 54,
+      "accepted_drafts": 50,
+      "rejected_drafts": 2,
+      "bonus_tokens": 11,
+      "bytes_read": 239860776960,
+      "evictions": 3201
+    },
+    "depth5": {
+      "decode_tok_s": [
+        7.124527355276496,
+        7.104767408770747
+      ],
+      "median_decode_tok_s": 7.114647382023622,
+      "verify_calls": 12,
+      "drafted_tokens": 58,
+      "accepted_drafts": 52,
+      "rejected_drafts": 2,
+      "bonus_tokens": 9,
+      "bytes_read": 240064266240,
+      "evictions": 3253
+    },
+    "depth5_speedup_ratio": 1.0077637635313998,
+    "all_rows_passed": true,
+    "all_tokens_identical": true
+  },
+  "depth5_route_trace": {
+    "timing_eligible": false,
+    "measured_decode_entries": 900,
+    "routed_layers_per_verify": 75,
+    "verify_input_rows": {
+      "6": 11,
+      "4": 1
+    },
+    "rejections": [
+      {
+        "step": 0,
+        "accepted_depths": 2,
+        "rejected_at_depth": 3,
+        "unevaluated_depths": [
+          4,
+          5
+        ],
+        "verify_input_rows": 6
+      },
+      {
+        "step": 1,
+        "accepted_depths": 2,
+        "rejected_at_depth": 3,
+        "unevaluated_depths": [
+          4,
+          5
+        ],
+        "verify_input_rows": 6
+      }
+    ],
+    "accepted_depth_histogram": {
+      "2": 2,
+      "3": 1,
+      "5": 9
+    }
+  },
+  "depth2_then5_abba": {
+    "order": [
+      "fixed_depth5",
+      "depth2_then5",
+      "depth2_then5",
+      "fixed_depth5"
+    ],
+    "fixed_depth5": {
+      "decode_tok_s": [
+        7.120052908671875,
+        7.128862903317669
+      ],
+      "median_decode_tok_s": 7.124457905994772,
+      "verify_time_s": [
+        8.730071919038892,
+        8.719772207929054
+      ],
+      "verify_calls": 12,
+      "drafted_tokens": 58,
+      "accepted_drafts": 52,
+      "rejected_drafts": 2,
+      "bonus_tokens": 9,
+      "expert_requests": 656400,
+      "bytes_read": 240064266240,
+      "evictions": 3253
+    },
+    "depth2_then5": {
+      "switch_after_generated_tokens": 9,
+      "observed_cycle_depths": [
+        2,
+        2,
+        2,
+        5,
+        5,
+        5,
+        5,
+        5,
+        5,
+        5,
+        5,
+        5
+      ],
+      "decode_tok_s": [
+        7.4036961333484825,
+        7.376040064560975
+      ],
+      "median_decode_tok_s": 7.389868098954729,
+      "verify_time_s": [
+        8.172621831909055,
+        8.1991189160035
+      ],
+      "verify_calls": 12,
+      "drafted_tokens": 51,
+      "accepted_drafts": 51,
+      "rejected_drafts": 0,
+      "bonus_tokens": 12,
+      "expert_requests": 652800,
+      "bytes_read": 236436848640,
+      "evictions": 2967
+    },
+    "candidate_speedup_ratio": 1.0372533877611418,
+    "candidate_verify_time_reduction_ratio": 0.06178298047884745,
+    "candidate_bytes_read_reduction_ratio": 0.015110193852730935,
+    "candidate_eviction_reduction_ratio": 0.08791884414386718,
+    "all_rows_passed": true,
+    "all_tokens_identical": true,
+    "decision": "qualify_across_prompts_and_output_lengths_before_installation"
+  },
+  "bf16_accuracy_screen": {
+    "q4": {
+      "artifact_bytes": 6014594720,
+      "slots_per_layer": 109,
+      "accepted_drafts": 52,
+      "drafted_tokens": 58,
+      "rejected_drafts": 2,
+      "rejection_depths": [
+        3,
+        3
+      ]
+    },
+    "bf16": {
+      "artifact_bytes": 19905942064,
+      "slots_per_layer": 88,
+      "accepted_drafts": 52,
+      "drafted_tokens": 58,
+      "rejected_drafts": 2,
+      "rejection_depths": [
+        4,
+        2
+      ]
+    },
+    "all_tokens_identical": true,
+    "decision": "reject_no_acceptance_gain"
+  },
+  "source_receipts": [
+    {
+      "path": "depth4-control-k5-abba-r1.json",
+      "sha256": "b4fe783d783dbaaf6c8e7cd1993357ec3bba4423903bdd8fa18c504ce6a06a78"
+    },
+    {
+      "path": "depth5-candidate-fresh-r1.json",
+      "sha256": "554f9ebe514fa1d9a555d2c62a4227b839b6c1c99a993092fa9a672757bbc0e6"
+    },
+    {
+      "path": "depth5-candidate-fresh-r2.json",
+      "sha256": "028d42db5f0ceaca14891ccc242d481df1fe3e2734b4bb217eca82e70d09c82d"
+    },
+    {
+      "path": "depth4-control-k5-abba-r2.json",
+      "sha256": "108401f6af356ab90d0d49f0ec97682ab148358e3fc045accf28ab665b8a3358"
+    },
+    {
+      "path": "depth5-fixed-control-schedule-abba-r1.json",
+      "sha256": "47bf9ab18f55427fee72fad92ebda5e7d0817b9b4194e9b6868ecda1244aece0"
+    },
+    {
+      "path": "depth2-then5-candidate-fresh-r1.json",
+      "sha256": "37322c468221d7201762fa4eff63dbe98b298cb131632c2feab2a878c810f559"
+    },
+    {
+      "path": "depth2-then5-candidate-fresh-r2.json",
+      "sha256": "9488b01d50f136818844d7da2da1447cd26a6f446596b8880e04ab9df9431b3f"
+    },
+    {
+      "path": "depth5-fixed-control-schedule-abba-r2.json",
+      "sha256": "864b7028ebccf0cc419373005f95ae01158a91b8cd985e1c8945929fccfa5b44"
+    },
+    {
+      "path": "depth5-rejection-route-trace-64t.json",
+      "sha256": "593e71b9e56d6f42e65f99c99b7d41fc919e21bc735d77febd4bcb43163ed117"
+    },
+    {
+      "path": "depth5-bf16-mtp-accuracy-64t.json",
+      "sha256": "bfb34703f659940e72bc16582f80de5c80cbf1176b0fbaff3317b0db2818b67b"
+    }
+  ]
+}

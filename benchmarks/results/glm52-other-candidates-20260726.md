@@ -4,12 +4,18 @@
 
 Do not move GLM tensor work from Metal to the CPU.
 
-For the exact 1,024-input / 64-output Q1-t158 + Q4-MTP lane, use speculative
-depth 4 rather than depth 3 when reproducing the measured throughput result.
-Two fresh-process depth-4 rows reached 7.022466 and 7.015873 token/s. Their
-7.019169 token/s median is 2.218% above the fresh same-harness depth-3 control
-at 6.866858 token/s. This is a workload-scoped result, not evidence for changing
-the default depth of every GLM request.
+For the exact 1,024-input / 64-output Q1-t158 + Q4-MTP lane, fixed speculative
+depth 5 is the best qualified fixed depth. Its fresh-process ABBA median is
+7.114647 token/s, 0.776% above the matched depth-4 median at 7.059836 token/s.
+
+A rejection-aware K2-for-three-cycles then K5 schedule is the highest-value
+new candidate. Its fresh-process ABBA median is 7.389868 token/s, 3.725% above
+the matched fixed-K5 median at 7.124458 token/s. It removes both cold
+rejections, reduces verify time 6.178%, and preserves exact output and final
+cache offsets. Do not install it yet: the retained proof is one prompt and one
+64-token phase alignment, so it still needs multi-prompt and 256-1,024-output
+qualification. The result is evidence for rejection-aware depth selection,
+not for changing every GLM request to the same token threshold.
 
 ## Verified 7 token/s result
 
@@ -39,6 +45,59 @@ Evidence:
 - `profiler/glm52-other-candidates-20260726/depth3-control-fresh-r3.json`
 - `profiler/glm52-other-candidates-20260726/depth4-candidate-fresh-r1.json`
 - `profiler/glm52-other-candidates-20260726/depth4-candidate-fresh-r2.json`
+
+## Depth 5 and rejection-aware depth
+
+The fixed-depth ABBA order was K4 / K5 / K5 / K4 with a fresh model process
+per row:
+
+| Fixed depth | Decode token/s rows | Median | Verify calls | Drafted / accepted | Rejects |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| K4 | 7.041807, 7.077866 | 7.059836 | 14 | 54 / 50 | 2 |
+| K5 | 7.124527, 7.104767 | 7.114647 | 12 | 58 / 52 | 2 |
+
+K5 wins by 0.776%. It removes two more target verify calls than K4 while
+retaining the same token hash, exact target offset 1,088, exact MTP offset
+1,087, and the same 90,470,328,522-byte MLX peak. It is a clean but small
+workload-local win: reads rise by 203,489,280 bytes and evictions rise from
+3,201 to 3,253.
+
+The discovery-only K5 route trace proves where the remaining waste occurs.
+The first two verify calls each route all 75 target MoE layers at six input
+rows. Both accept drafts one and two, reject draft three, and never evaluate
+drafts four and five. The later nine complete K5 calls accept all five drafts.
+Capture-commit repair takes about 43 microseconds on each miss; the useful
+target is therefore avoiding the wasted target rows, not moving host repair
+work.
+
+The existing late-depth construction parameters were then screened with a
+generated-token threshold of nine. Because an accepted bonus is already
+emitted as the next cycle primary, the observed route was K2 for three cycles
+then K5, not two K2 cycles. The ABBA order was fixed K5 / K2-then-K5 /
+K2-then-K5 / fixed K5:
+
+| Route | Decode token/s rows | Median | Verify time median | Drafted / accepted | Rejects | Read bytes | Evictions |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Fixed K5 | 7.120053, 7.128863 | 7.124458 | 8.724922 s | 58 / 52 | 2 | 240,064,266,240 | 3,253 |
+| K2 x3 then K5 | 7.403696, 7.376040 | 7.389868 | 8.185870 s | 51 / 51 | 0 | 236,436,848,640 | 2,967 |
+
+The candidate improves decode throughput 3.725%, reduces verify time 6.178%,
+reads 1.511% fewer bytes, and causes 8.792% fewer evictions. All four rows pass
+the same exactness gates and emit the same SHA-256. This is the first candidate
+in the campaign whose full-lane gain comes primarily from rejection
+performance rather than deeper speculation or a sub-percent kernel change.
+
+The BF16 MTP artifact does not improve prediction accuracy enough to justify
+its size. Against the same target output, Q4 and BF16 both accept 52 of 58
+drafts and reject twice. BF16 moves the rejection depths from 3/3 to 4/2:
+it fixes one Q4 draft but creates different misses. Its 19,905,942,064-byte
+artifact forces the target cache from 109 to 88 slots/layer under the same
+96 GiB cap, compared with the 6,014,594,720-byte Q4 artifact. Reject BF16 for
+this lane.
+
+Compact machine-readable proof:
+
+- `profiler/glm52-other-candidates-20260726/depth5-rejection-screen-summary.json`
 
 ## Additional candidate outcomes
 
@@ -167,10 +226,10 @@ Cheap GLM history predictors failed the offline gate:
 
 The ranked follow-ups are therefore:
 
-1. run an exact fixed-depth-5 A/B against depth 4, then qualify the winning
-   depth across multiple prompts and 256-1,024 output tokens;
-2. capture draft-route, target-verify-row, acceptance-depth, and cache-miss
-   alignment in one diagnostic run, then score draft-route prefetch offline;
+1. qualify K2-for-three-cycles then K5 across multiple prompts and 256-1,024
+   output tokens, comparing against unchanged fixed K5;
+2. capture pre-verification draft confidence and reject it unless the wrong
+   drafts are separable without false stops on accepted drafts;
 3. screen a raw-t158 gate/up/SwiGLU kernel on the exact observed shapes before
    considering full-model integration.
 
@@ -179,12 +238,12 @@ hint on the current q1t artifact costs 8.4375 MiB.
 
 ## Remaining candidates
 
-Depth 5 is the highest-priority next experiment. Depth 4 accepted 50 of 54
-drafts and reduced target verify calls from 17 to 14. A depth-5 verify wave uses
-six rows times top-k 8, exactly matching the current 48 transient slots. That
-makes it a measurable boundary rather than a reason to change the global
-default: it must beat the matched depth-4 median in fresh processes without
-increasing memory pressure or changing tokens.
+Depth 5 has cleared its fresh-process fixed-depth gate, and K2-for-three-cycles
+then K5 has cleared the exact current-prompt rejection gate. The remaining
+promotion boundary is generalization: a token-count threshold can benefit from
+64-token phase alignment without being the best policy for longer generation.
+Qualification must preserve the target path's output, cache offsets, 96 GiB
+plan, and unchanged fixed-K5 control on every prompt/output stratum.
 
 The I/O candidates tested in this campaign are closed. `overlap_miss_reads`
 regressed throughput 5.390%; commitment-only cache credit increased reads; and
@@ -207,3 +266,4 @@ real-shape microbenchmark washes.
 - `benchmarks/results/profiler/glm52-other-candidates-20260726/t158-prebound-paired.json`
 - `benchmarks/results/profiler/glm52-other-candidates-20260726/t158-geometry-sweep-r2.json`
 - `benchmarks/results/profiler/glm52-other-candidates-20260726/t158-installed-path-ab.json`
+- `benchmarks/results/profiler/glm52-other-candidates-20260726/depth5-rejection-screen-summary.json`
