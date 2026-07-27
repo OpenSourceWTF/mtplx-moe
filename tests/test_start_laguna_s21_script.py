@@ -32,8 +32,28 @@ def test_laguna_launcher_derives_repository_root_from_script() -> None:
     text = _script_text()
 
     assert "SCRIPT_DIR=${0:A:h}" in text
-    assert "REPO_ROOT=${SCRIPT_DIR:h}" in text
+    assert "REPO_ROOT=${MTPLX_REPO_ROOT:-${SCRIPT_DIR:h}}" in text
     assert 'PYTHONPATH="$REPO_ROOT' in text
+
+
+def test_laguna_launcher_allows_wrapper_safe_repository_root_override() -> None:
+    environment = {
+        **os.environ,
+        "MTPLX_REPO_ROOT": str(ROOT),
+        "MTPLX_PYTHON": "/definitely/not/an/executable/python",
+    }
+    completed = subprocess.run(
+        ["/bin/zsh", str(SCRIPT), "--print-config"],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert f"repository_root={ROOT}" in completed.stdout
 
 
 def test_laguna_launcher_defaults_to_loopback_and_exact_checkpoint() -> None:

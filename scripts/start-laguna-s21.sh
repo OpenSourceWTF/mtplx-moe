@@ -7,7 +7,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=${0:A:h}
-REPO_ROOT=${SCRIPT_DIR:h}
+REPO_ROOT=${MTPLX_REPO_ROOT:-${SCRIPT_DIR:h}}
 
 PYTHON=${MTPLX_PYTHON:-python3}
 MODEL=${MTPLX_LAGUNA_MODEL:-mlx-community/Laguna-S-2.1-oQ4e}

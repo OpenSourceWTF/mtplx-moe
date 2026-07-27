@@ -284,7 +284,8 @@ non-borrowing background slot, use:
 The launcher defaults to `127.0.0.1:8080` and the exact
 `mlx-community/Laguna-S-2.1-oQ4e` checkpoint. Use `--print-config` to inspect the
 resolved command without importing MLX or starting the server. Deployments can
-override `MTPLX_PYTHON`, `MTPLX_LAGUNA_MODEL`, `MTPLX_LAGUNA_HOST`,
+override `MTPLX_REPO_ROOT`, `MTPLX_PYTHON`, `MTPLX_LAGUNA_MODEL`,
+`MTPLX_LAGUNA_HOST`,
 `MTPLX_LAGUNA_PORT`, and `MTPLX_LAGUNA_MIN_AVAIL_GIB`; non-loopback exposure is
 therefore an explicit operator choice.
 
