@@ -1,0 +1,2249 @@
+{
+  "finished_unix_s": 1785150553.6528971,
+  "limitation": "Isolated ownership-safe service-time gate; it does not model runtime cache locks, completion leases, or sibling miss readers.",
+  "manifest": "/Users/davidtai/.cache/huggingface/glm52-expert-only-mlx-q1t/expert-manifest.json",
+  "passed": true,
+  "pid": 32558,
+  "reader_metrics": {
+    "bytes_read_saved": 0,
+    "cancellations": 0,
+    "deadline_errors": 0,
+    "decode_ns": 0,
+    "decoded_raw_bytes": 0,
+    "decoded_records": 0,
+    "integrity_errors": 0,
+    "io_errors": 0,
+    "native_bytes_returned": 0,
+    "native_positional_calls": 0,
+    "open_files_peak": 1,
+    "preadv_bytes_returned": 1981808640,
+    "python_preadv_invocations": 336,
+    "read_bytes": 1981808640,
+    "read_mib_per_second": 8583.135228290075,
+    "read_ns": 220199257,
+    "read_operations": 336,
+    "record_requests": 0,
+    "requested_bytes": 1981808640,
+    "short_reads": 0,
+    "sidecar_record_requests": 0,
+    "source_record_requests": 0
+  },
+  "record_geometry": {
+    "components": [
+      "gate_proj.packed",
+      "gate_proj.scales",
+      "up_proj.packed",
+      "up_proj.scales",
+      "down_proj.packed",
+      "down_proj.scales"
+    ],
+    "down_bytes": 2949120,
+    "gate_up_bytes": 5898240,
+    "record_bytes": 8847360
+  },
+  "schedule": {
+    "candidate": "gate/up preadv, async gate/up/SwiGLU, concurrent down preadv, then down",
+    "control": "one full-record preadv, then gate/up/SwiGLU/down",
+    "page_cache": "F_NOCACHE",
+    "production_installed": false
+  },
+  "schema": "mtplx-glm52-t158-projection-overlap-v1",
+  "shapes": [
+    {
+      "pairs": [
+        {
+          "candidate_ns": 1395084,
+          "candidate_phases": {
+            "down_and_wait_ns": 252792,
+            "down_read_ns": 408875,
+            "gate_up_read_ns": 685834,
+            "gate_up_submit_ns": 47583
+          },
+          "control_ns": 1737791,
+          "control_phases": {
+            "compute_ns": 777958,
+            "read_ns": 959833
+          },
+          "order": "control-first",
+          "record": [
+            7,
+            204
+          ]
+        },
+        {
+          "candidate_ns": 1392125,
+          "candidate_phases": {
+            "down_and_wait_ns": 269042,
+            "down_read_ns": 398375,
+            "gate_up_read_ns": 676000,
+            "gate_up_submit_ns": 48708
+          },
+          "control_ns": 1367208,
+          "control_phases": {
+            "compute_ns": 441917,
+            "read_ns": 925291
+          },
+          "order": "candidate-first",
+          "record": [
+            8,
+            255
+          ]
+        },
+        {
+          "candidate_ns": 1390625,
+          "candidate_phases": {
+            "down_and_wait_ns": 303959,
+            "down_read_ns": 382041,
+            "gate_up_read_ns": 669416,
+            "gate_up_submit_ns": 35209
+          },
+          "control_ns": 1384750,
+          "control_phases": {
+            "compute_ns": 503666,
+            "read_ns": 881084
+          },
+          "order": "control-first",
+          "record": [
+            10,
+            50
+          ]
+        },
+        {
+          "candidate_ns": 1370833,
+          "candidate_phases": {
+            "down_and_wait_ns": 259333,
+            "down_read_ns": 397958,
+            "gate_up_read_ns": 666042,
+            "gate_up_submit_ns": 47500
+          },
+          "control_ns": 1327917,
+          "control_phases": {
+            "compute_ns": 449209,
+            "read_ns": 878708
+          },
+          "order": "candidate-first",
+          "record": [
+            11,
+            101
+          ]
+        },
+        {
+          "candidate_ns": 1410000,
+          "candidate_phases": {
+            "down_and_wait_ns": 295959,
+            "down_read_ns": 409916,
+            "gate_up_read_ns": 662541,
+            "gate_up_submit_ns": 41584
+          },
+          "control_ns": 1417292,
+          "control_phases": {
+            "compute_ns": 506084,
+            "read_ns": 911208
+          },
+          "order": "control-first",
+          "record": [
+            12,
+            152
+          ]
+        },
+        {
+          "candidate_ns": 1427834,
+          "candidate_phases": {
+            "down_and_wait_ns": 329375,
+            "down_read_ns": 370042,
+            "gate_up_read_ns": 684000,
+            "gate_up_submit_ns": 44417
+          },
+          "control_ns": 1680000,
+          "control_phases": {
+            "compute_ns": 789083,
+            "read_ns": 890917
+          },
+          "order": "candidate-first",
+          "record": [
+            13,
+            203
+          ]
+        },
+        {
+          "candidate_ns": 1546625,
+          "candidate_phases": {
+            "down_and_wait_ns": 285375,
+            "down_read_ns": 459250,
+            "gate_up_read_ns": 700708,
+            "gate_up_submit_ns": 101292
+          },
+          "control_ns": 1348792,
+          "control_phases": {
+            "compute_ns": 471708,
+            "read_ns": 877084
+          },
+          "order": "control-first",
+          "record": [
+            14,
+            254
+          ]
+        },
+        {
+          "candidate_ns": 1391167,
+          "candidate_phases": {
+            "down_and_wait_ns": 268209,
+            "down_read_ns": 400833,
+            "gate_up_read_ns": 682875,
+            "gate_up_submit_ns": 39250
+          },
+          "control_ns": 1344958,
+          "control_phases": {
+            "compute_ns": 448125,
+            "read_ns": 896833
+          },
+          "order": "candidate-first",
+          "record": [
+            16,
+            49
+          ]
+        },
+        {
+          "candidate_ns": 1390208,
+          "candidate_phases": {
+            "down_and_wait_ns": 214708,
+            "down_read_ns": 405709,
+            "gate_up_read_ns": 712666,
+            "gate_up_submit_ns": 57125
+          },
+          "control_ns": 1347750,
+          "control_phases": {
+            "compute_ns": 464125,
+            "read_ns": 883625
+          },
+          "order": "control-first",
+          "record": [
+            17,
+            100
+          ]
+        },
+        {
+          "candidate_ns": 1302791,
+          "candidate_phases": {
+            "down_and_wait_ns": 207041,
+            "down_read_ns": 404417,
+            "gate_up_read_ns": 653250,
+            "gate_up_submit_ns": 38083
+          },
+          "control_ns": 1318209,
+          "control_phases": {
+            "compute_ns": 396459,
+            "read_ns": 921750
+          },
+          "order": "candidate-first",
+          "record": [
+            18,
+            151
+          ]
+        },
+        {
+          "candidate_ns": 1376416,
+          "candidate_phases": {
+            "down_and_wait_ns": 208958,
+            "down_read_ns": 426250,
+            "gate_up_read_ns": 680958,
+            "gate_up_submit_ns": 60250
+          },
+          "control_ns": 1274792,
+          "control_phases": {
+            "compute_ns": 344708,
+            "read_ns": 930084
+          },
+          "order": "control-first",
+          "record": [
+            19,
+            202
+          ]
+        },
+        {
+          "candidate_ns": 1466875,
+          "candidate_phases": {
+            "down_and_wait_ns": 382208,
+            "down_read_ns": 398292,
+            "gate_up_read_ns": 649792,
+            "gate_up_submit_ns": 36583
+          },
+          "control_ns": 1217375,
+          "control_phases": {
+            "compute_ns": 336292,
+            "read_ns": 881083
+          },
+          "order": "candidate-first",
+          "record": [
+            20,
+            253
+          ]
+        },
+        {
+          "candidate_ns": 1352750,
+          "candidate_phases": {
+            "down_and_wait_ns": 199541,
+            "down_read_ns": 416042,
+            "gate_up_read_ns": 680084,
+            "gate_up_submit_ns": 57083
+          },
+          "control_ns": 1304792,
+          "control_phases": {
+            "compute_ns": 404917,
+            "read_ns": 899875
+          },
+          "order": "control-first",
+          "record": [
+            22,
+            48
+          ]
+        },
+        {
+          "candidate_ns": 1343542,
+          "candidate_phases": {
+            "down_and_wait_ns": 212208,
+            "down_read_ns": 410625,
+            "gate_up_read_ns": 676500,
+            "gate_up_submit_ns": 44209
+          },
+          "control_ns": 1180875,
+          "control_phases": {
+            "compute_ns": 300625,
+            "read_ns": 880250
+          },
+          "order": "candidate-first",
+          "record": [
+            23,
+            99
+          ]
+        },
+        {
+          "candidate_ns": 1301959,
+          "candidate_phases": {
+            "down_and_wait_ns": 205834,
+            "down_read_ns": 399250,
+            "gate_up_read_ns": 662334,
+            "gate_up_submit_ns": 34541
+          },
+          "control_ns": 1215125,
+          "control_phases": {
+            "compute_ns": 321709,
+            "read_ns": 893416
+          },
+          "order": "control-first",
+          "record": [
+            24,
+            150
+          ]
+        },
+        {
+          "candidate_ns": 1380500,
+          "candidate_phases": {
+            "down_and_wait_ns": 287417,
+            "down_read_ns": 397541,
+            "gate_up_read_ns": 653875,
+            "gate_up_submit_ns": 41667
+          },
+          "control_ns": 1262000,
+          "control_phases": {
+            "compute_ns": 357542,
+            "read_ns": 904458
+          },
+          "order": "candidate-first",
+          "record": [
+            25,
+            201
+          ]
+        },
+        {
+          "candidate_ns": 1315917,
+          "candidate_phases": {
+            "down_and_wait_ns": 187167,
+            "down_read_ns": 425250,
+            "gate_up_read_ns": 667875,
+            "gate_up_submit_ns": 35625
+          },
+          "control_ns": 1291000,
+          "control_phases": {
+            "compute_ns": 375042,
+            "read_ns": 915958
+          },
+          "order": "control-first",
+          "record": [
+            26,
+            252
+          ]
+        },
+        {
+          "candidate_ns": 1282292,
+          "candidate_phases": {
+            "down_and_wait_ns": 210209,
+            "down_read_ns": 383958,
+            "gate_up_read_ns": 655625,
+            "gate_up_submit_ns": 32500
+          },
+          "control_ns": 1210083,
+          "control_phases": {
+            "compute_ns": 356291,
+            "read_ns": 853792
+          },
+          "order": "candidate-first",
+          "record": [
+            28,
+            47
+          ]
+        },
+        {
+          "candidate_ns": 1430041,
+          "candidate_phases": {
+            "down_and_wait_ns": 219666,
+            "down_read_ns": 396625,
+            "gate_up_read_ns": 741125,
+            "gate_up_submit_ns": 72625
+          },
+          "control_ns": 1200875,
+          "control_phases": {
+            "compute_ns": 351541,
+            "read_ns": 849334
+          },
+          "order": "control-first",
+          "record": [
+            29,
+            98
+          ]
+        },
+        {
+          "candidate_ns": 1312000,
+          "candidate_phases": {
+            "down_and_wait_ns": 216333,
+            "down_read_ns": 381417,
+            "gate_up_read_ns": 667333,
+            "gate_up_submit_ns": 46917
+          },
+          "control_ns": 1222500,
+          "control_phases": {
+            "compute_ns": 344459,
+            "read_ns": 878041
+          },
+          "order": "candidate-first",
+          "record": [
+            30,
+            149
+          ]
+        },
+        {
+          "candidate_ns": 1313375,
+          "candidate_phases": {
+            "down_and_wait_ns": 228708,
+            "down_read_ns": 382834,
+            "gate_up_read_ns": 663125,
+            "gate_up_submit_ns": 38708
+          },
+          "control_ns": 1252458,
+          "control_phases": {
+            "compute_ns": 329166,
+            "read_ns": 923292
+          },
+          "order": "control-first",
+          "record": [
+            31,
+            200
+          ]
+        },
+        {
+          "candidate_ns": 1258125,
+          "candidate_phases": {
+            "down_and_wait_ns": 194417,
+            "down_read_ns": 373042,
+            "gate_up_read_ns": 656625,
+            "gate_up_submit_ns": 34041
+          },
+          "control_ns": 1336417,
+          "control_phases": {
+            "compute_ns": 357750,
+            "read_ns": 978667
+          },
+          "order": "candidate-first",
+          "record": [
+            32,
+            251
+          ]
+        },
+        {
+          "candidate_ns": 1281000,
+          "candidate_phases": {
+            "down_and_wait_ns": 208042,
+            "down_read_ns": 400250,
+            "gate_up_read_ns": 639375,
+            "gate_up_submit_ns": 33333
+          },
+          "control_ns": 1372500,
+          "control_phases": {
+            "compute_ns": 348500,
+            "read_ns": 1024000
+          },
+          "order": "control-first",
+          "record": [
+            34,
+            46
+          ]
+        },
+        {
+          "candidate_ns": 1374125,
+          "candidate_phases": {
+            "down_and_wait_ns": 197791,
+            "down_read_ns": 384292,
+            "gate_up_read_ns": 761125,
+            "gate_up_submit_ns": 30917
+          },
+          "control_ns": 1464791,
+          "control_phases": {
+            "compute_ns": 587958,
+            "read_ns": 876833
+          },
+          "order": "candidate-first",
+          "record": [
+            35,
+            97
+          ]
+        }
+      ],
+      "parity": "bit-exact",
+      "phase_summary": {
+        "candidate": {
+          "down_and_wait_ns": {
+            "count": 24,
+            "max_ns": 382208,
+            "mean_ns": 243512.16666666666,
+            "median_ns": 217999.5,
+            "min_ns": 187167
+          },
+          "down_read_ns": {
+            "count": 24,
+            "max_ns": 459250,
+            "mean_ns": 400545.1666666667,
+            "median_ns": 398812.5,
+            "min_ns": 370042
+          },
+          "gate_up_read_ns": {
+            "count": 24,
+            "max_ns": 761125,
+            "mean_ns": 677045.125,
+            "median_ns": 668645.5,
+            "min_ns": 639375
+          },
+          "gate_up_submit_ns": {
+            "count": 24,
+            "max_ns": 101292,
+            "mean_ns": 45822.916666666664,
+            "median_ns": 41625.5,
+            "min_ns": 30917
+          }
+        },
+        "control": {
+          "compute_ns": {
+            "count": 24,
+            "max_ns": 789083,
+            "mean_ns": 431868.0833333333,
+            "median_ns": 385750.5,
+            "min_ns": 300625
+          },
+          "read_ns": {
+            "count": 24,
+            "max_ns": 1024000,
+            "mean_ns": 904809.0,
+            "median_ns": 895124.5,
+            "min_ns": 849334
+          }
+        }
+      },
+      "repeats": 24,
+      "rows": 1,
+      "summary": {
+        "by_order": {
+          "candidate-first": {
+            "candidate_median_ns": 1372479.0,
+            "control_median_ns": 1323063.0,
+            "count": 12,
+            "pair_gain": -0.03734969536598021
+          },
+          "control-first": {
+            "candidate_median_ns": 1383312.0,
+            "control_median_ns": 1326271.0,
+            "count": 12,
+            "pair_gain": -0.043008555566697915
+          }
+        },
+        "candidate": {
+          "count": 24,
+          "max_ns": 1546625,
+          "mean_ns": 1366925.375,
+          "median_ns": 1375270.5,
+          "min_ns": 1258125
+        },
+        "candidate_gain": -0.039459572219916916,
+        "candidate_speedup": 0.9620383771774352,
+        "control": {
+          "count": 24,
+          "max_ns": 1737791,
+          "mean_ns": 1336677.0833333333,
+          "median_ns": 1323063.0,
+          "min_ns": 1180875
+        }
+      },
+      "warmups": 4
+    },
+    {
+      "pairs": [
+        {
+          "candidate_ns": 1344541,
+          "candidate_phases": {
+            "down_and_wait_ns": 253541,
+            "down_read_ns": 398584,
+            "gate_up_read_ns": 659208,
+            "gate_up_submit_ns": 33208
+          },
+          "control_ns": 1473625,
+          "control_phases": {
+            "compute_ns": 591375,
+            "read_ns": 882250
+          },
+          "order": "control-first",
+          "record": [
+            7,
+            204
+          ]
+        },
+        {
+          "candidate_ns": 1421917,
+          "candidate_phases": {
+            "down_and_wait_ns": 262542,
+            "down_read_ns": 432667,
+            "gate_up_read_ns": 652125,
+            "gate_up_submit_ns": 74583
+          },
+          "control_ns": 1384458,
+          "control_phases": {
+            "compute_ns": 481250,
+            "read_ns": 903208
+          },
+          "order": "candidate-first",
+          "record": [
+            8,
+            255
+          ]
+        },
+        {
+          "candidate_ns": 1383958,
+          "candidate_phases": {
+            "down_and_wait_ns": 267708,
+            "down_read_ns": 403208,
+            "gate_up_read_ns": 675750,
+            "gate_up_submit_ns": 37292
+          },
+          "control_ns": 1399417,
+          "control_phases": {
+            "compute_ns": 541834,
+            "read_ns": 857583
+          },
+          "order": "control-first",
+          "record": [
+            10,
+            50
+          ]
+        },
+        {
+          "candidate_ns": 1443958,
+          "candidate_phases": {
+            "down_and_wait_ns": 355708,
+            "down_read_ns": 387208,
+            "gate_up_read_ns": 661500,
+            "gate_up_submit_ns": 39542
+          },
+          "control_ns": 1392875,
+          "control_phases": {
+            "compute_ns": 499416,
+            "read_ns": 893459
+          },
+          "order": "candidate-first",
+          "record": [
+            11,
+            101
+          ]
+        },
+        {
+          "candidate_ns": 1458125,
+          "candidate_phases": {
+            "down_and_wait_ns": 264625,
+            "down_read_ns": 419125,
+            "gate_up_read_ns": 700500,
+            "gate_up_submit_ns": 73875
+          },
+          "control_ns": 1452292,
+          "control_phases": {
+            "compute_ns": 529959,
+            "read_ns": 922333
+          },
+          "order": "control-first",
+          "record": [
+            12,
+            152
+          ]
+        },
+        {
+          "candidate_ns": 1323917,
+          "candidate_phases": {
+            "down_and_wait_ns": 250583,
+            "down_read_ns": 385334,
+            "gate_up_read_ns": 652750,
+            "gate_up_submit_ns": 35250
+          },
+          "control_ns": 1575750,
+          "control_phases": {
+            "compute_ns": 687791,
+            "read_ns": 887959
+          },
+          "order": "candidate-first",
+          "record": [
+            13,
+            203
+          ]
+        },
+        {
+          "candidate_ns": 1520500,
+          "candidate_phases": {
+            "down_and_wait_ns": 259541,
+            "down_read_ns": 438125,
+            "gate_up_read_ns": 748709,
+            "gate_up_submit_ns": 74125
+          },
+          "control_ns": 1520792,
+          "control_phases": {
+            "compute_ns": 644583,
+            "read_ns": 876209
+          },
+          "order": "control-first",
+          "record": [
+            14,
+            254
+          ]
+        },
+        {
+          "candidate_ns": 1404875,
+          "candidate_phases": {
+            "down_and_wait_ns": 268292,
+            "down_read_ns": 396833,
+            "gate_up_read_ns": 699042,
+            "gate_up_submit_ns": 40708
+          },
+          "control_ns": 1369708,
+          "control_phases": {
+            "compute_ns": 481167,
+            "read_ns": 888541
+          },
+          "order": "candidate-first",
+          "record": [
+            16,
+            49
+          ]
+        },
+        {
+          "candidate_ns": 1356916,
+          "candidate_phases": {
+            "down_and_wait_ns": 284250,
+            "down_read_ns": 391541,
+            "gate_up_read_ns": 649166,
+            "gate_up_submit_ns": 31959
+          },
+          "control_ns": 1349916,
+          "control_phases": {
+            "compute_ns": 470958,
+            "read_ns": 878958
+          },
+          "order": "control-first",
+          "record": [
+            17,
+            100
+          ]
+        },
+        {
+          "candidate_ns": 1511416,
+          "candidate_phases": {
+            "down_and_wait_ns": 334083,
+            "down_read_ns": 448375,
+            "gate_up_read_ns": 658458,
+            "gate_up_submit_ns": 70500
+          },
+          "control_ns": 1384750,
+          "control_phases": {
+            "compute_ns": 471666,
+            "read_ns": 913084
+          },
+          "order": "candidate-first",
+          "record": [
+            18,
+            151
+          ]
+        },
+        {
+          "candidate_ns": 1372125,
+          "candidate_phases": {
+            "down_and_wait_ns": 261917,
+            "down_read_ns": 405458,
+            "gate_up_read_ns": 669083,
+            "gate_up_submit_ns": 35667
+          },
+          "control_ns": 1390292,
+          "control_phases": {
+            "compute_ns": 486083,
+            "read_ns": 904209
+          },
+          "order": "control-first",
+          "record": [
+            19,
+            202
+          ]
+        },
+        {
+          "candidate_ns": 1493000,
+          "candidate_phases": {
+            "down_and_wait_ns": 364125,
+            "down_read_ns": 415250,
+            "gate_up_read_ns": 661041,
+            "gate_up_submit_ns": 52584
+          },
+          "control_ns": 1511417,
+          "control_phases": {
+            "compute_ns": 627292,
+            "read_ns": 884125
+          },
+          "order": "candidate-first",
+          "record": [
+            20,
+            253
+          ]
+        },
+        {
+          "candidate_ns": 1448875,
+          "candidate_phases": {
+            "down_and_wait_ns": 260541,
+            "down_read_ns": 440042,
+            "gate_up_read_ns": 690125,
+            "gate_up_submit_ns": 58167
+          },
+          "control_ns": 1548209,
+          "control_phases": {
+            "compute_ns": 648500,
+            "read_ns": 899709
+          },
+          "order": "control-first",
+          "record": [
+            22,
+            48
+          ]
+        },
+        {
+          "candidate_ns": 1361708,
+          "candidate_phases": {
+            "down_and_wait_ns": 258791,
+            "down_read_ns": 412292,
+            "gate_up_read_ns": 652542,
+            "gate_up_submit_ns": 38083
+          },
+          "control_ns": 1387584,
+          "control_phases": {
+            "compute_ns": 490709,
+            "read_ns": 896875
+          },
+          "order": "candidate-first",
+          "record": [
+            23,
+            99
+          ]
+        },
+        {
+          "candidate_ns": 1542042,
+          "candidate_phases": {
+            "down_and_wait_ns": 299000,
+            "down_read_ns": 417458,
+            "gate_up_read_ns": 725875,
+            "gate_up_submit_ns": 99709
+          },
+          "control_ns": 1498833,
+          "control_phases": {
+            "compute_ns": 613250,
+            "read_ns": 885583
+          },
+          "order": "control-first",
+          "record": [
+            24,
+            150
+          ]
+        },
+        {
+          "candidate_ns": 1374916,
+          "candidate_phases": {
+            "down_and_wait_ns": 267958,
+            "down_read_ns": 402125,
+            "gate_up_read_ns": 661208,
+            "gate_up_submit_ns": 43625
+          },
+          "control_ns": 1379000,
+          "control_phases": {
+            "compute_ns": 483083,
+            "read_ns": 895917
+          },
+          "order": "candidate-first",
+          "record": [
+            25,
+            201
+          ]
+        },
+        {
+          "candidate_ns": 1469125,
+          "candidate_phases": {
+            "down_and_wait_ns": 318917,
+            "down_read_ns": 444625,
+            "gate_up_read_ns": 666333,
+            "gate_up_submit_ns": 39250
+          },
+          "control_ns": 1446000,
+          "control_phases": {
+            "compute_ns": 535417,
+            "read_ns": 910583
+          },
+          "order": "control-first",
+          "record": [
+            26,
+            252
+          ]
+        },
+        {
+          "candidate_ns": 1377584,
+          "candidate_phases": {
+            "down_and_wait_ns": 298417,
+            "down_read_ns": 390000,
+            "gate_up_read_ns": 653959,
+            "gate_up_submit_ns": 35208
+          },
+          "control_ns": 1552208,
+          "control_phases": {
+            "compute_ns": 669916,
+            "read_ns": 882292
+          },
+          "order": "candidate-first",
+          "record": [
+            28,
+            47
+          ]
+        },
+        {
+          "candidate_ns": 1371583,
+          "candidate_phases": {
+            "down_and_wait_ns": 264583,
+            "down_read_ns": 391834,
+            "gate_up_read_ns": 675166,
+            "gate_up_submit_ns": 40000
+          },
+          "control_ns": 1440458,
+          "control_phases": {
+            "compute_ns": 554083,
+            "read_ns": 886375
+          },
+          "order": "control-first",
+          "record": [
+            29,
+            98
+          ]
+        },
+        {
+          "candidate_ns": 1406833,
+          "candidate_phases": {
+            "down_and_wait_ns": 323166,
+            "down_read_ns": 381917,
+            "gate_up_read_ns": 659958,
+            "gate_up_submit_ns": 41792
+          },
+          "control_ns": 1491833,
+          "control_phases": {
+            "compute_ns": 604125,
+            "read_ns": 887708
+          },
+          "order": "candidate-first",
+          "record": [
+            30,
+            149
+          ]
+        },
+        {
+          "candidate_ns": 1420917,
+          "candidate_phases": {
+            "down_and_wait_ns": 334042,
+            "down_read_ns": 389541,
+            "gate_up_read_ns": 663250,
+            "gate_up_submit_ns": 34084
+          },
+          "control_ns": 1507292,
+          "control_phases": {
+            "compute_ns": 607583,
+            "read_ns": 899709
+          },
+          "order": "control-first",
+          "record": [
+            31,
+            200
+          ]
+        },
+        {
+          "candidate_ns": 1418084,
+          "candidate_phases": {
+            "down_and_wait_ns": 263084,
+            "down_read_ns": 418166,
+            "gate_up_read_ns": 681417,
+            "gate_up_submit_ns": 55417
+          },
+          "control_ns": 1381209,
+          "control_phases": {
+            "compute_ns": 487959,
+            "read_ns": 893250
+          },
+          "order": "candidate-first",
+          "record": [
+            32,
+            251
+          ]
+        },
+        {
+          "candidate_ns": 1440291,
+          "candidate_phases": {
+            "down_and_wait_ns": 313541,
+            "down_read_ns": 410459,
+            "gate_up_read_ns": 667833,
+            "gate_up_submit_ns": 48458
+          },
+          "control_ns": 1510750,
+          "control_phases": {
+            "compute_ns": 627250,
+            "read_ns": 883500
+          },
+          "order": "control-first",
+          "record": [
+            34,
+            46
+          ]
+        },
+        {
+          "candidate_ns": 1481833,
+          "candidate_phases": {
+            "down_and_wait_ns": 292291,
+            "down_read_ns": 407167,
+            "gate_up_read_ns": 740542,
+            "gate_up_submit_ns": 41833
+          },
+          "control_ns": 1505667,
+          "control_phases": {
+            "compute_ns": 599917,
+            "read_ns": 905750
+          },
+          "order": "candidate-first",
+          "record": [
+            35,
+            97
+          ]
+        }
+      ],
+      "parity": "bit-exact",
+      "phase_summary": {
+        "candidate": {
+          "down_and_wait_ns": {
+            "count": 24,
+            "max_ns": 364125,
+            "mean_ns": 288385.25,
+            "median_ns": 268125.0,
+            "min_ns": 250583
+          },
+          "down_read_ns": {
+            "count": 24,
+            "max_ns": 448375,
+            "mean_ns": 409472.25,
+            "median_ns": 406312.5,
+            "min_ns": 381917
+          },
+          "gate_up_read_ns": {
+            "count": 24,
+            "max_ns": 748709,
+            "mean_ns": 676064.1666666666,
+            "median_ns": 664791.5,
+            "min_ns": 649166
+          },
+          "gate_up_submit_ns": {
+            "count": 24,
+            "max_ns": 99709,
+            "mean_ns": 48954.958333333336,
+            "median_ns": 41250.0,
+            "min_ns": 31959
+          }
+        },
+        "control": {
+          "compute_ns": {
+            "count": 24,
+            "max_ns": 687791,
+            "mean_ns": 559798.5833333334,
+            "median_ns": 547958.5,
+            "min_ns": 470958
+          },
+          "read_ns": {
+            "count": 24,
+            "max_ns": 922333,
+            "mean_ns": 892465.375,
+            "median_ns": 890895.5,
+            "min_ns": 857583
+          }
+        }
+      },
+      "repeats": 24,
+      "rows": 2,
+      "summary": {
+        "by_order": {
+          "candidate-first": {
+            "candidate_median_ns": 1412458.5,
+            "control_median_ns": 1390229.5,
+            "count": 12,
+            "pair_gain": -0.01598944634680821
+          },
+          "control-first": {
+            "candidate_median_ns": 1430604.0,
+            "control_median_ns": 1462958.5,
+            "count": 12,
+            "pair_gain": 0.022115801644407518
+          }
+        },
+        "candidate": {
+          "count": 24,
+          "max_ns": 1542042,
+          "mean_ns": 1422876.625,
+          "median_ns": 1419500.5,
+          "min_ns": 1323917
+        },
+        "candidate_gain": 0.020457221011547455,
+        "candidate_speedup": 1.0208844590051218,
+        "control": {
+          "count": 24,
+          "max_ns": 1575750,
+          "mean_ns": 1452263.9583333333,
+          "median_ns": 1449146.0,
+          "min_ns": 1349916
+        }
+      },
+      "warmups": 4
+    },
+    {
+      "pairs": [
+        {
+          "candidate_ns": 1474167,
+          "candidate_phases": {
+            "down_and_wait_ns": 352167,
+            "down_read_ns": 399833,
+            "gate_up_read_ns": 682125,
+            "gate_up_submit_ns": 40042
+          },
+          "control_ns": 1699208,
+          "control_phases": {
+            "compute_ns": 792416,
+            "read_ns": 906792
+          },
+          "order": "control-first",
+          "record": [
+            7,
+            204
+          ]
+        },
+        {
+          "candidate_ns": 1457959,
+          "candidate_phases": {
+            "down_and_wait_ns": 285292,
+            "down_read_ns": 429000,
+            "gate_up_read_ns": 663792,
+            "gate_up_submit_ns": 79875
+          },
+          "control_ns": 1647417,
+          "control_phases": {
+            "compute_ns": 747084,
+            "read_ns": 900333
+          },
+          "order": "candidate-first",
+          "record": [
+            8,
+            255
+          ]
+        },
+        {
+          "candidate_ns": 1417625,
+          "candidate_phases": {
+            "down_and_wait_ns": 340083,
+            "down_read_ns": 378375,
+            "gate_up_read_ns": 663792,
+            "gate_up_submit_ns": 35375
+          },
+          "control_ns": 1686083,
+          "control_phases": {
+            "compute_ns": 820583,
+            "read_ns": 865500
+          },
+          "order": "control-first",
+          "record": [
+            10,
+            50
+          ]
+        },
+        {
+          "candidate_ns": 1448875,
+          "candidate_phases": {
+            "down_and_wait_ns": 363875,
+            "down_read_ns": 395708,
+            "gate_up_read_ns": 655000,
+            "gate_up_submit_ns": 34292
+          },
+          "control_ns": 1652666,
+          "control_phases": {
+            "compute_ns": 768000,
+            "read_ns": 884666
+          },
+          "order": "candidate-first",
+          "record": [
+            11,
+            101
+          ]
+        },
+        {
+          "candidate_ns": 1394542,
+          "candidate_phases": {
+            "down_and_wait_ns": 277792,
+            "down_read_ns": 413875,
+            "gate_up_read_ns": 668250,
+            "gate_up_submit_ns": 34625
+          },
+          "control_ns": 1641083,
+          "control_phases": {
+            "compute_ns": 755833,
+            "read_ns": 885250
+          },
+          "order": "control-first",
+          "record": [
+            12,
+            152
+          ]
+        },
+        {
+          "candidate_ns": 1349625,
+          "candidate_phases": {
+            "down_and_wait_ns": 280709,
+            "down_read_ns": 372583,
+            "gate_up_read_ns": 661625,
+            "gate_up_submit_ns": 34708
+          },
+          "control_ns": 1683584,
+          "control_phases": {
+            "compute_ns": 751417,
+            "read_ns": 932167
+          },
+          "order": "candidate-first",
+          "record": [
+            13,
+            203
+          ]
+        },
+        {
+          "candidate_ns": 1389042,
+          "candidate_phases": {
+            "down_and_wait_ns": 299792,
+            "down_read_ns": 392958,
+            "gate_up_read_ns": 661125,
+            "gate_up_submit_ns": 35167
+          },
+          "control_ns": 1638791,
+          "control_phases": {
+            "compute_ns": 751500,
+            "read_ns": 887291
+          },
+          "order": "control-first",
+          "record": [
+            14,
+            254
+          ]
+        },
+        {
+          "candidate_ns": 1380458,
+          "candidate_phases": {
+            "down_and_wait_ns": 283708,
+            "down_read_ns": 396208,
+            "gate_up_read_ns": 669708,
+            "gate_up_submit_ns": 30834
+          },
+          "control_ns": 1585250,
+          "control_phases": {
+            "compute_ns": 706417,
+            "read_ns": 878833
+          },
+          "order": "candidate-first",
+          "record": [
+            16,
+            49
+          ]
+        },
+        {
+          "candidate_ns": 1384834,
+          "candidate_phases": {
+            "down_and_wait_ns": 307375,
+            "down_read_ns": 383167,
+            "gate_up_read_ns": 660417,
+            "gate_up_submit_ns": 33875
+          },
+          "control_ns": 1667833,
+          "control_phases": {
+            "compute_ns": 766708,
+            "read_ns": 901125
+          },
+          "order": "control-first",
+          "record": [
+            17,
+            100
+          ]
+        },
+        {
+          "candidate_ns": 1386375,
+          "candidate_phases": {
+            "down_and_wait_ns": 308000,
+            "down_read_ns": 396042,
+            "gate_up_read_ns": 649958,
+            "gate_up_submit_ns": 32375
+          },
+          "control_ns": 1703167,
+          "control_phases": {
+            "compute_ns": 792958,
+            "read_ns": 910209
+          },
+          "order": "candidate-first",
+          "record": [
+            18,
+            151
+          ]
+        },
+        {
+          "candidate_ns": 1435000,
+          "candidate_phases": {
+            "down_and_wait_ns": 327292,
+            "down_read_ns": 390042,
+            "gate_up_read_ns": 676041,
+            "gate_up_submit_ns": 41625
+          },
+          "control_ns": 1666084,
+          "control_phases": {
+            "compute_ns": 777334,
+            "read_ns": 888750
+          },
+          "order": "control-first",
+          "record": [
+            19,
+            202
+          ]
+        },
+        {
+          "candidate_ns": 1388583,
+          "candidate_phases": {
+            "down_and_wait_ns": 315333,
+            "down_read_ns": 384542,
+            "gate_up_read_ns": 655333,
+            "gate_up_submit_ns": 33375
+          },
+          "control_ns": 1702000,
+          "control_phases": {
+            "compute_ns": 796791,
+            "read_ns": 905209
+          },
+          "order": "candidate-first",
+          "record": [
+            20,
+            253
+          ]
+        },
+        {
+          "candidate_ns": 1502666,
+          "candidate_phases": {
+            "down_and_wait_ns": 388375,
+            "down_read_ns": 396666,
+            "gate_up_read_ns": 678750,
+            "gate_up_submit_ns": 38875
+          },
+          "control_ns": 1673292,
+          "control_phases": {
+            "compute_ns": 754375,
+            "read_ns": 918917
+          },
+          "order": "control-first",
+          "record": [
+            22,
+            48
+          ]
+        },
+        {
+          "candidate_ns": 1426833,
+          "candidate_phases": {
+            "down_and_wait_ns": 305625,
+            "down_read_ns": 409583,
+            "gate_up_read_ns": 656667,
+            "gate_up_submit_ns": 54958
+          },
+          "control_ns": 1642375,
+          "control_phases": {
+            "compute_ns": 750875,
+            "read_ns": 891500
+          },
+          "order": "candidate-first",
+          "record": [
+            23,
+            99
+          ]
+        },
+        {
+          "candidate_ns": 1364667,
+          "candidate_phases": {
+            "down_and_wait_ns": 287958,
+            "down_read_ns": 387792,
+            "gate_up_read_ns": 643500,
+            "gate_up_submit_ns": 45417
+          },
+          "control_ns": 1700500,
+          "control_phases": {
+            "compute_ns": 797708,
+            "read_ns": 902792
+          },
+          "order": "control-first",
+          "record": [
+            24,
+            150
+          ]
+        },
+        {
+          "candidate_ns": 1413375,
+          "candidate_phases": {
+            "down_and_wait_ns": 292834,
+            "down_read_ns": 403708,
+            "gate_up_read_ns": 662250,
+            "gate_up_submit_ns": 54583
+          },
+          "control_ns": 1693125,
+          "control_phases": {
+            "compute_ns": 799334,
+            "read_ns": 893791
+          },
+          "order": "candidate-first",
+          "record": [
+            25,
+            201
+          ]
+        },
+        {
+          "candidate_ns": 1439875,
+          "candidate_phases": {
+            "down_and_wait_ns": 279917,
+            "down_read_ns": 427125,
+            "gate_up_read_ns": 678250,
+            "gate_up_submit_ns": 54583
+          },
+          "control_ns": 1710792,
+          "control_phases": {
+            "compute_ns": 777667,
+            "read_ns": 933125
+          },
+          "order": "control-first",
+          "record": [
+            26,
+            252
+          ]
+        },
+        {
+          "candidate_ns": 1388458,
+          "candidate_phases": {
+            "down_and_wait_ns": 289625,
+            "down_read_ns": 403958,
+            "gate_up_read_ns": 656458,
+            "gate_up_submit_ns": 38417
+          },
+          "control_ns": 1577875,
+          "control_phases": {
+            "compute_ns": 715333,
+            "read_ns": 862542
+          },
+          "order": "candidate-first",
+          "record": [
+            28,
+            47
+          ]
+        },
+        {
+          "candidate_ns": 1507500,
+          "candidate_phases": {
+            "down_and_wait_ns": 318958,
+            "down_read_ns": 410500,
+            "gate_up_read_ns": 736334,
+            "gate_up_submit_ns": 41708
+          },
+          "control_ns": 1859583,
+          "control_phases": {
+            "compute_ns": 921125,
+            "read_ns": 938458
+          },
+          "order": "control-first",
+          "record": [
+            29,
+            98
+          ]
+        },
+        {
+          "candidate_ns": 1443125,
+          "candidate_phases": {
+            "down_and_wait_ns": 297791,
+            "down_read_ns": 409334,
+            "gate_up_read_ns": 687709,
+            "gate_up_submit_ns": 48291
+          },
+          "control_ns": 1661542,
+          "control_phases": {
+            "compute_ns": 765125,
+            "read_ns": 896417
+          },
+          "order": "candidate-first",
+          "record": [
+            30,
+            149
+          ]
+        },
+        {
+          "candidate_ns": 1432583,
+          "candidate_phases": {
+            "down_and_wait_ns": 322083,
+            "down_read_ns": 393833,
+            "gate_up_read_ns": 683292,
+            "gate_up_submit_ns": 33375
+          },
+          "control_ns": 1664583,
+          "control_phases": {
+            "compute_ns": 762750,
+            "read_ns": 901833
+          },
+          "order": "control-first",
+          "record": [
+            31,
+            200
+          ]
+        },
+        {
+          "candidate_ns": 1382500,
+          "candidate_phases": {
+            "down_and_wait_ns": 293458,
+            "down_read_ns": 391583,
+            "gate_up_read_ns": 659875,
+            "gate_up_submit_ns": 37584
+          },
+          "control_ns": 1603417,
+          "control_phases": {
+            "compute_ns": 731375,
+            "read_ns": 872042
+          },
+          "order": "candidate-first",
+          "record": [
+            32,
+            251
+          ]
+        },
+        {
+          "candidate_ns": 1391875,
+          "candidate_phases": {
+            "down_and_wait_ns": 288458,
+            "down_read_ns": 390459,
+            "gate_up_read_ns": 678500,
+            "gate_up_submit_ns": 34458
+          },
+          "control_ns": 1666708,
+          "control_phases": {
+            "compute_ns": 778333,
+            "read_ns": 888375
+          },
+          "order": "control-first",
+          "record": [
+            34,
+            46
+          ]
+        },
+        {
+          "candidate_ns": 1407083,
+          "candidate_phases": {
+            "down_and_wait_ns": 312750,
+            "down_read_ns": 396583,
+            "gate_up_read_ns": 661458,
+            "gate_up_submit_ns": 36292
+          },
+          "control_ns": 1654834,
+          "control_phases": {
+            "compute_ns": 772292,
+            "read_ns": 882542
+          },
+          "order": "candidate-first",
+          "record": [
+            35,
+            97
+          ]
+        }
+      ],
+      "parity": "bit-exact",
+      "phase_summary": {
+        "candidate": {
+          "down_and_wait_ns": {
+            "count": 24,
+            "max_ns": 388375,
+            "mean_ns": 309135.4166666667,
+            "median_ns": 302708.5,
+            "min_ns": 277792
+          },
+          "down_read_ns": {
+            "count": 24,
+            "max_ns": 429000,
+            "mean_ns": 398060.7083333333,
+            "median_ns": 396125.0,
+            "min_ns": 372583
+          },
+          "gate_up_read_ns": {
+            "count": 24,
+            "max_ns": 736334,
+            "mean_ns": 668758.7083333334,
+            "median_ns": 663021.0,
+            "min_ns": 643500
+          },
+          "gate_up_submit_ns": {
+            "count": 24,
+            "max_ns": 79875,
+            "mean_ns": 41029.541666666664,
+            "median_ns": 36938.0,
+            "min_ns": 30834
+          }
+        },
+        "control": {
+          "compute_ns": {
+            "count": 24,
+            "max_ns": 921125,
+            "mean_ns": 773055.5416666666,
+            "median_ns": 767354.0,
+            "min_ns": 706417
+          },
+          "read_ns": {
+            "count": 24,
+            "max_ns": 938458,
+            "mean_ns": 897019.125,
+            "median_ns": 895104.0,
+            "min_ns": 862542
+          }
+        }
+      },
+      "repeats": 24,
+      "rows": 3,
+      "summary": {
+        "by_order": {
+          "candidate-first": {
+            "candidate_median_ns": 1397833.0,
+            "control_median_ns": 1653750.0,
+            "count": 12,
+            "pair_gain": 0.1547495086923658
+          },
+          "control-first": {
+            "candidate_median_ns": 1425104.0,
+            "control_median_ns": 1670562.5,
+            "count": 12,
+            "pair_gain": 0.1469316472744958
+          }
+        },
+        "candidate": {
+          "count": 24,
+          "max_ns": 1507500,
+          "mean_ns": 1416984.375,
+          "median_ns": 1410229.0,
+          "min_ns": 1349625
+        },
+        "candidate_gain": 0.15372516496679056,
+        "candidate_speedup": 1.1816492215094145,
+        "control": {
+          "count": 24,
+          "max_ns": 1859583,
+          "mean_ns": 1670074.6666666667,
+          "median_ns": 1666396.0,
+          "min_ns": 1577875
+        }
+      },
+      "warmups": 4
+    },
+    {
+      "pairs": [
+        {
+          "candidate_ns": 1550125,
+          "candidate_phases": {
+            "down_and_wait_ns": 466750,
+            "down_read_ns": 377875,
+            "gate_up_read_ns": 673334,
+            "gate_up_submit_ns": 32166
+          },
+          "control_ns": 1785459,
+          "control_phases": {
+            "compute_ns": 900709,
+            "read_ns": 884750
+          },
+          "order": "control-first",
+          "record": [
+            7,
+            204
+          ]
+        },
+        {
+          "candidate_ns": 1515042,
+          "candidate_phases": {
+            "down_and_wait_ns": 443042,
+            "down_read_ns": 391417,
+            "gate_up_read_ns": 644000,
+            "gate_up_submit_ns": 36583
+          },
+          "control_ns": 1818416,
+          "control_phases": {
+            "compute_ns": 940875,
+            "read_ns": 877541
+          },
+          "order": "candidate-first",
+          "record": [
+            8,
+            255
+          ]
+        },
+        {
+          "candidate_ns": 1589834,
+          "candidate_phases": {
+            "down_and_wait_ns": 471584,
+            "down_read_ns": 384041,
+            "gate_up_read_ns": 698459,
+            "gate_up_submit_ns": 35750
+          },
+          "control_ns": 1870000,
+          "control_phases": {
+            "compute_ns": 997459,
+            "read_ns": 872541
+          },
+          "order": "control-first",
+          "record": [
+            10,
+            50
+          ]
+        },
+        {
+          "candidate_ns": 1557167,
+          "candidate_phases": {
+            "down_and_wait_ns": 458708,
+            "down_read_ns": 405834,
+            "gate_up_read_ns": 659459,
+            "gate_up_submit_ns": 33166
+          },
+          "control_ns": 1828542,
+          "control_phases": {
+            "compute_ns": 943709,
+            "read_ns": 884833
+          },
+          "order": "candidate-first",
+          "record": [
+            11,
+            101
+          ]
+        },
+        {
+          "candidate_ns": 1498750,
+          "candidate_phases": {
+            "down_and_wait_ns": 429459,
+            "down_read_ns": 379000,
+            "gate_up_read_ns": 647250,
+            "gate_up_submit_ns": 43041
+          },
+          "control_ns": 1839000,
+          "control_phases": {
+            "compute_ns": 958583,
+            "read_ns": 880417
+          },
+          "order": "control-first",
+          "record": [
+            12,
+            152
+          ]
+        },
+        {
+          "candidate_ns": 1537542,
+          "candidate_phases": {
+            "down_and_wait_ns": 481959,
+            "down_read_ns": 378291,
+            "gate_up_read_ns": 646083,
+            "gate_up_submit_ns": 31209
+          },
+          "control_ns": 1884000,
+          "control_phases": {
+            "compute_ns": 990084,
+            "read_ns": 893916
+          },
+          "order": "candidate-first",
+          "record": [
+            13,
+            203
+          ]
+        },
+        {
+          "candidate_ns": 1623833,
+          "candidate_phases": {
+            "down_and_wait_ns": 500125,
+            "down_read_ns": 381666,
+            "gate_up_read_ns": 705708,
+            "gate_up_submit_ns": 36334
+          },
+          "control_ns": 1840250,
+          "control_phases": {
+            "compute_ns": 959750,
+            "read_ns": 880500
+          },
+          "order": "control-first",
+          "record": [
+            14,
+            254
+          ]
+        },
+        {
+          "candidate_ns": 1583166,
+          "candidate_phases": {
+            "down_and_wait_ns": 458000,
+            "down_read_ns": 400666,
+            "gate_up_read_ns": 688375,
+            "gate_up_submit_ns": 36125
+          },
+          "control_ns": 1809584,
+          "control_phases": {
+            "compute_ns": 919000,
+            "read_ns": 890584
+          },
+          "order": "candidate-first",
+          "record": [
+            16,
+            49
+          ]
+        },
+        {
+          "candidate_ns": 1740334,
+          "candidate_phases": {
+            "down_and_wait_ns": 443000,
+            "down_read_ns": 448000,
+            "gate_up_read_ns": 815042,
+            "gate_up_submit_ns": 34292
+          },
+          "control_ns": 1838667,
+          "control_phases": {
+            "compute_ns": 942584,
+            "read_ns": 896083
+          },
+          "order": "control-first",
+          "record": [
+            17,
+            100
+          ]
+        },
+        {
+          "candidate_ns": 1542458,
+          "candidate_phases": {
+            "down_and_wait_ns": 440833,
+            "down_read_ns": 406417,
+            "gate_up_read_ns": 649750,
+            "gate_up_submit_ns": 45458
+          },
+          "control_ns": 1770625,
+          "control_phases": {
+            "compute_ns": 887625,
+            "read_ns": 883000
+          },
+          "order": "candidate-first",
+          "record": [
+            18,
+            151
+          ]
+        },
+        {
+          "candidate_ns": 1576625,
+          "candidate_phases": {
+            "down_and_wait_ns": 496208,
+            "down_read_ns": 380250,
+            "gate_up_read_ns": 660125,
+            "gate_up_submit_ns": 40042
+          },
+          "control_ns": 1859708,
+          "control_phases": {
+            "compute_ns": 956208,
+            "read_ns": 903500
+          },
+          "order": "control-first",
+          "record": [
+            19,
+            202
+          ]
+        },
+        {
+          "candidate_ns": 1574083,
+          "candidate_phases": {
+            "down_and_wait_ns": 478333,
+            "down_read_ns": 406875,
+            "gate_up_read_ns": 647791,
+            "gate_up_submit_ns": 41084
+          },
+          "control_ns": 1756125,
+          "control_phases": {
+            "compute_ns": 856292,
+            "read_ns": 899833
+          },
+          "order": "candidate-first",
+          "record": [
+            20,
+            253
+          ]
+        },
+        {
+          "candidate_ns": 1566166,
+          "candidate_phases": {
+            "down_and_wait_ns": 463166,
+            "down_read_ns": 391834,
+            "gate_up_read_ns": 672375,
+            "gate_up_submit_ns": 38791
+          },
+          "control_ns": 1810958,
+          "control_phases": {
+            "compute_ns": 920583,
+            "read_ns": 890375
+          },
+          "order": "control-first",
+          "record": [
+            22,
+            48
+          ]
+        },
+        {
+          "candidate_ns": 1529375,
+          "candidate_phases": {
+            "down_and_wait_ns": 452416,
+            "down_read_ns": 408625,
+            "gate_up_read_ns": 636209,
+            "gate_up_submit_ns": 32125
+          },
+          "control_ns": 1743959,
+          "control_phases": {
+            "compute_ns": 862209,
+            "read_ns": 881750
+          },
+          "order": "candidate-first",
+          "record": [
+            23,
+            99
+          ]
+        },
+        {
+          "candidate_ns": 1563500,
+          "candidate_phases": {
+            "down_and_wait_ns": 458209,
+            "down_read_ns": 396958,
+            "gate_up_read_ns": 672416,
+            "gate_up_submit_ns": 35917
+          },
+          "control_ns": 1824791,
+          "control_phases": {
+            "compute_ns": 907208,
+            "read_ns": 917583
+          },
+          "order": "control-first",
+          "record": [
+            24,
+            150
+          ]
+        },
+        {
+          "candidate_ns": 1532083,
+          "candidate_phases": {
+            "down_and_wait_ns": 477958,
+            "down_read_ns": 380292,
+            "gate_up_read_ns": 641708,
+            "gate_up_submit_ns": 32125
+          },
+          "control_ns": 1784292,
+          "control_phases": {
+            "compute_ns": 905292,
+            "read_ns": 879000
+          },
+          "order": "candidate-first",
+          "record": [
+            25,
+            201
+          ]
+        },
+        {
+          "candidate_ns": 1534417,
+          "candidate_phases": {
+            "down_and_wait_ns": 434667,
+            "down_read_ns": 415708,
+            "gate_up_read_ns": 651583,
+            "gate_up_submit_ns": 32459
+          },
+          "control_ns": 1790375,
+          "control_phases": {
+            "compute_ns": 886416,
+            "read_ns": 903959
+          },
+          "order": "control-first",
+          "record": [
+            26,
+            252
+          ]
+        },
+        {
+          "candidate_ns": 1549584,
+          "candidate_phases": {
+            "down_and_wait_ns": 440500,
+            "down_read_ns": 389667,
+            "gate_up_read_ns": 677750,
+            "gate_up_submit_ns": 41667
+          },
+          "control_ns": 1788208,
+          "control_phases": {
+            "compute_ns": 925458,
+            "read_ns": 862750
+          },
+          "order": "candidate-first",
+          "record": [
+            28,
+            47
+          ]
+        },
+        {
+          "candidate_ns": 1535791,
+          "candidate_phases": {
+            "down_and_wait_ns": 456125,
+            "down_read_ns": 392125,
+            "gate_up_read_ns": 651583,
+            "gate_up_submit_ns": 35958
+          },
+          "control_ns": 1789542,
+          "control_phases": {
+            "compute_ns": 926958,
+            "read_ns": 862584
+          },
+          "order": "control-first",
+          "record": [
+            29,
+            98
+          ]
+        },
+        {
+          "candidate_ns": 1541875,
+          "candidate_phases": {
+            "down_and_wait_ns": 471584,
+            "down_read_ns": 375416,
+            "gate_up_read_ns": 659875,
+            "gate_up_submit_ns": 35000
+          },
+          "control_ns": 1730750,
+          "control_phases": {
+            "compute_ns": 847709,
+            "read_ns": 883041
+          },
+          "order": "candidate-first",
+          "record": [
+            30,
+            149
+          ]
+        },
+        {
+          "candidate_ns": 1537083,
+          "candidate_phases": {
+            "down_and_wait_ns": 449708,
+            "down_read_ns": 381375,
+            "gate_up_read_ns": 669375,
+            "gate_up_submit_ns": 36625
+          },
+          "control_ns": 1813625,
+          "control_phases": {
+            "compute_ns": 922375,
+            "read_ns": 891250
+          },
+          "order": "control-first",
+          "record": [
+            31,
+            200
+          ]
+        },
+        {
+          "candidate_ns": 1637958,
+          "candidate_phases": {
+            "down_and_wait_ns": 548500,
+            "down_read_ns": 396333,
+            "gate_up_read_ns": 650125,
+            "gate_up_submit_ns": 43000
+          },
+          "control_ns": 1819500,
+          "control_phases": {
+            "compute_ns": 940125,
+            "read_ns": 879375
+          },
+          "order": "candidate-first",
+          "record": [
+            32,
+            251
+          ]
+        },
+        {
+          "candidate_ns": 1583458,
+          "candidate_phases": {
+            "down_and_wait_ns": 442333,
+            "down_read_ns": 404500,
+            "gate_up_read_ns": 686000,
+            "gate_up_submit_ns": 50625
+          },
+          "control_ns": 1831167,
+          "control_phases": {
+            "compute_ns": 946833,
+            "read_ns": 884334
+          },
+          "order": "control-first",
+          "record": [
+            34,
+            46
+          ]
+        },
+        {
+          "candidate_ns": 1538667,
+          "candidate_phases": {
+            "down_and_wait_ns": 453834,
+            "down_read_ns": 394791,
+            "gate_up_read_ns": 655667,
+            "gate_up_submit_ns": 34375
+          },
+          "control_ns": 1806333,
+          "control_phases": {
+            "compute_ns": 913917,
+            "read_ns": 892416
+          },
+          "order": "candidate-first",
+          "record": [
+            35,
+            97
+          ]
+        }
+      ],
+      "parity": "bit-exact",
+      "phase_summary": {
+        "candidate": {
+          "down_and_wait_ns": {
+            "count": 24,
+            "max_ns": 548500,
+            "mean_ns": 463208.375,
+            "median_ns": 458104.5,
+            "min_ns": 429459
+          },
+          "down_read_ns": {
+            "count": 24,
+            "max_ns": 448000,
+            "mean_ns": 394498.1666666667,
+            "median_ns": 391979.5,
+            "min_ns": 375416
+          },
+          "gate_up_read_ns": {
+            "count": 24,
+            "max_ns": 815042,
+            "mean_ns": 669168.4166666666,
+            "median_ns": 659667.0,
+            "min_ns": 636209
+          },
+          "gate_up_submit_ns": {
+            "count": 24,
+            "max_ns": 50625,
+            "mean_ns": 37246.541666666664,
+            "median_ns": 36041.5,
+            "min_ns": 31209
+          }
+        },
+        "control": {
+          "compute_ns": {
+            "count": 24,
+            "max_ns": 997459,
+            "mean_ns": 923248.375,
+            "median_ns": 923916.5,
+            "min_ns": 847709
+          },
+          "read_ns": {
+            "count": 24,
+            "max_ns": 917583,
+            "mean_ns": 886496.4583333334,
+            "median_ns": 884542.0,
+            "min_ns": 862584
+          }
+        }
+      },
+      "repeats": 24,
+      "rows": 4,
+      "summary": {
+        "by_order": {
+          "candidate-first": {
+            "candidate_median_ns": 1542166.5,
+            "control_median_ns": 1797270.5,
+            "count": 12,
+            "pair_gain": 0.14193968019838976
+          },
+          "control-first": {
+            "candidate_median_ns": 1564833.0,
+            "control_median_ns": 1827979.0,
+            "count": 12,
+            "pair_gain": 0.14395460779363434
+          }
+        },
+        "candidate": {
+          "count": 24,
+          "max_ns": 1740334,
+          "mean_ns": 1564121.5,
+          "median_ns": 1549854.5,
+          "min_ns": 1498750
+        },
+        "candidate_gain": 0.14480948567048957,
+        "candidate_speedup": 1.1693300887276838,
+        "control": {
+          "count": 24,
+          "max_ns": 1884000,
+          "mean_ns": 1809744.8333333333,
+          "median_ns": 1812291.5,
+          "min_ns": 1730750
+        }
+      },
+      "warmups": 4
+    }
+  ],
+  "started_unix_s": 1785150552.9930198,
+  "trace": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/moe-glm52-k3-t158-owner-fusion/benchmarks/results/profiler/glm52-other-candidates-20260726/k3-route-memory-trace-64t-no-context-copy.json",
+  "trace_shape_proxy": {
+    "assignments": 45600,
+    "decode_layer_calls": 1500,
+    "limitation": "Route multiplicity includes hits and misses; it is a shape proxy, not a miss-only cache replay.",
+    "multiplicity_fraction": {
+      "1": 0.7694081032793499,
+      "2": 0.16506253241888075,
+      "3": 0.04760532534147888,
+      "4": 0.017924038960290472
+    },
+    "multiplicity_histogram": {
+      "1": 26700,
+      "2": 5728,
+      "3": 1652,
+      "4": 622
+    },
+    "unique_expert_occurrences": 34702
+  }
+}

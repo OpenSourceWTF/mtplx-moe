@@ -1,0 +1,70 @@
+{
+  "dispatch_census": null,
+  "mlx_core_file": "/Users/davidtai/projects/OpenSourceWTF/mlx-profiler/python/mlx/core.cpython-312-darwin.so",
+  "mlx_version": "0.32.1.dev20260723+56b7a3ea",
+  "projection_mix": {
+    "prebound_median_ms": 1.5777505,
+    "prebound_over_wrapper": 1.0007135492861177,
+    "saved_ms": -0.0011250000000000426,
+    "wrapper_median_ms": 1.5766255
+  },
+  "projections": {
+    "down": {
+      "in_dim": 2048,
+      "order": "alternating-wrapper-prebound",
+      "out_dim": 6144,
+      "parity": true,
+      "repeats": 200,
+      "rows": 28,
+      "timings": {
+        "prebound": {
+          "max_ms": 0.6245,
+          "mean_ms": 0.497487895,
+          "median_ms": 0.4942085,
+          "min_ms": 0.436916
+        },
+        "prebound_over_wrapper": 0.999915022847726,
+        "saved_ms": 4.199999999998649e-05,
+        "wrapper": {
+          "max_ms": 0.628459,
+          "mean_ms": 0.49652647499999997,
+          "median_ms": 0.4942505,
+          "min_ms": 0.434375
+        }
+      },
+      "unique_slots": 17,
+      "warmups": 20
+    },
+    "gate_up": {
+      "in_dim": 6144,
+      "order": "alternating-wrapper-prebound",
+      "out_dim": 2048,
+      "parity": true,
+      "repeats": 200,
+      "rows": 28,
+      "timings": {
+        "prebound": {
+          "max_ms": 0.948292,
+          "mean_ms": 0.5923369,
+          "median_ms": 0.541771,
+          "min_ms": 0.482458
+        },
+        "prebound_over_wrapper": 1.0010781845478691,
+        "saved_ms": -0.000583499999999959,
+        "wrapper": {
+          "max_ms": 0.955916,
+          "mean_ms": 0.594559975,
+          "median_ms": 0.5411875,
+          "min_ms": 0.4775
+        }
+      },
+      "unique_slots": 17,
+      "warmups": 20
+    }
+  },
+  "route": {
+    "rows": 28,
+    "unique_slots": 17
+  },
+  "schema": "glm52-t158-prebound-profile-paired-v1"
+}
