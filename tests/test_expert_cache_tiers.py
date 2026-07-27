@@ -271,6 +271,36 @@ def test_the_rejected_footprint_would_have_fit():
     assert load_expert_profiles()["hy3-oq2e-64"].process_ceiling_bytes > 64 * GIB
 
 
+def test_expert_cli_select_wrapper_forwards_overrides(monkeypatch):
+    """`expert_cli` wraps `select_expert_profile` to defer runtime imports.
+
+    Tests that call `mtplx.expert_profiles` directly skip that indirection, so a
+    stale signature here surfaces only when a server actually starts. Pin the
+    forwarding instead of the outcome, which would depend on live memory.
+    """
+
+    import mtplx.expert_profiles as profiles_module
+    from mtplx import expert_cli
+
+    seen: dict[str, object] = {}
+
+    def fake_select(requested, *, model_key, overrides=None, **kwargs):
+        seen.update(requested=requested, model_key=model_key, overrides=overrides)
+        return "sentinel-profile"
+
+    monkeypatch.setattr(profiles_module, "select_expert_profile", fake_select)
+
+    result = expert_cli.select_expert_profile(
+        "hy3-oq2e-64",
+        model_key="hy3-expert-oq2e",
+        overrides={"expert_cache_limit_bytes": "32GiB"},
+    )
+
+    assert result == "sentinel-profile"
+    assert seen["overrides"] == {"expert_cache_limit_bytes": "32GiB"}
+    assert seen["requested"] == "hy3-oq2e-64"
+
+
 def test_streaming_plan_floor_is_far_below_the_promoted_ceiling():
     """Bound the real floor so nobody reads 71 GiB as an architectural minimum."""
 

@@ -159,12 +159,13 @@ def select_expert_profile(
     requested: str,
     *,
     model_key: str,
+    overrides: Mapping[str, Any] | None = None,
 ) -> ExpertServeProfile:
     """Resolve a profile without loading runtime modules during parser setup."""
 
     from .expert_profiles import select_expert_profile as select
 
-    return select(requested, model_key=model_key)
+    return select(requested, model_key=model_key, overrides=overrides)
 
 
 def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
