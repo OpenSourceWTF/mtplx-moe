@@ -941,14 +941,30 @@ def _fixed_m2_contract_error(
 ) -> LagunaFixedM2ConfigError:
     prefix = "" if layer_number is None else f"layer {layer_number} "
     return LagunaFixedM2ConfigError(
-        f"{prefix}{property_name} is {actual}; expected {expected}"
+        f"{prefix}{property_name} is {actual!r}; expected {expected!r}"
     )
 
 
-def _fixed_m2_tensor_shape(value: Any) -> tuple[int, ...] | None:
-    if value is None or not hasattr(value, "shape"):
+def _fixed_m2_tensor_shape(value: Any) -> Any:
+    if value is None:
         return None
-    return tuple(int(dim) for dim in value.shape)
+    try:
+        shape = value.shape
+    except Exception:
+        return None
+    if shape is None:
+        return None
+    try:
+        return tuple(shape)
+    except Exception:
+        return shape
+
+
+def _fixed_m2_property_matches(actual: Any, expected: Any) -> bool:
+    try:
+        return bool(actual == expected)
+    except Exception:
+        return False
 
 
 def _validate_fixed_tensor(
@@ -1272,41 +1288,21 @@ def install_fixed_m2_router(model: Any) -> dict[str, Any]:
     router_weight_ids: set[int] = set()
     for layer_index, block in blocks:
         layer_number = layer_index
-        if int(block.num_experts) != _FIXED_M2_EXPERTS:
-            raise _fixed_m2_contract_error(
-                layer_number,
-                "expert count",
-                block.num_experts,
-                _FIXED_M2_EXPERTS,
-            )
-        if int(block.top_k) != _FIXED_M2_TOP_K:
-            raise _fixed_m2_contract_error(
-                layer_number,
-                "top-k",
-                block.top_k,
-                _FIXED_M2_TOP_K,
-            )
-        if block.norm_topk_prob is not True:
-            raise _fixed_m2_contract_error(
-                layer_number,
-                "normalization",
-                block.norm_topk_prob,
-                True,
-            )
-        if float(block.routed_scaling_factor) != _FIXED_M2_SCALE:
-            raise _fixed_m2_contract_error(
-                layer_number,
-                "scaling",
-                block.routed_scaling_factor,
-                _FIXED_M2_SCALE,
-            )
-        if float(block.softcap) != 0.0:
-            raise _fixed_m2_contract_error(
-                layer_number,
-                "softcap",
-                block.softcap,
-                0.0,
-            )
+        for property_name, attribute, expected in (
+            ("expert count", "num_experts", _FIXED_M2_EXPERTS),
+            ("top-k", "top_k", _FIXED_M2_TOP_K),
+            ("normalization", "norm_topk_prob", True),
+            ("scaling", "routed_scaling_factor", _FIXED_M2_SCALE),
+            ("softcap", "softcap", 0.0),
+        ):
+            actual = getattr(block, attribute, None)
+            if not _fixed_m2_property_matches(actual, expected):
+                raise _fixed_m2_contract_error(
+                    layer_number,
+                    property_name,
+                    actual,
+                    expected,
+                )
 
         gate = block.gate
         if hasattr(gate, "scales"):
@@ -1324,11 +1320,7 @@ def install_fixed_m2_router(model: Any) -> dict[str, Any]:
                 "absent",
             )
         weight = getattr(gate, "weight", None)
-        weight_shape = (
-            tuple(int(dim) for dim in weight.shape)
-            if weight is not None
-            else None
-        )
+        weight_shape = _fixed_m2_tensor_shape(weight)
         if weight_shape != (_FIXED_M2_EXPERTS, _FIXED_M2_HIDDEN):
             raise _fixed_m2_contract_error(
                 layer_number,
@@ -1336,11 +1328,12 @@ def install_fixed_m2_router(model: Any) -> dict[str, Any]:
                 weight_shape,
                 (_FIXED_M2_EXPERTS, _FIXED_M2_HIDDEN),
             )
-        if weight.dtype != mx.bfloat16:
+        weight_dtype = getattr(weight, "dtype", None)
+        if weight_dtype != mx.bfloat16:
             raise _fixed_m2_contract_error(
                 layer_number,
                 "router weight dtype",
-                weight.dtype,
+                weight_dtype,
                 mx.bfloat16,
             )
         if id(weight) in router_weight_ids:
@@ -1349,8 +1342,8 @@ def install_fixed_m2_router(model: Any) -> dict[str, Any]:
             )
         router_weight_ids.add(id(weight))
 
-        bias = block.e_score_correction_bias
-        bias_shape = tuple(int(dim) for dim in bias.shape)
+        bias = getattr(block, "e_score_correction_bias", None)
+        bias_shape = _fixed_m2_tensor_shape(bias)
         if bias_shape != (_FIXED_M2_EXPERTS,):
             raise _fixed_m2_contract_error(
                 layer_number,
@@ -1358,12 +1351,20 @@ def install_fixed_m2_router(model: Any) -> dict[str, Any]:
                 bias_shape,
                 (_FIXED_M2_EXPERTS,),
             )
-        if bias.dtype != mx.bfloat16:
+        bias_dtype = getattr(bias, "dtype", None)
+        if bias_dtype != mx.bfloat16:
             raise _fixed_m2_contract_error(
                 layer_number,
                 "correction bias dtype",
-                bias.dtype,
+                bias_dtype,
                 mx.bfloat16,
+            )
+        if not isinstance(bias, mx.array):
+            raise _fixed_m2_contract_error(
+                layer_number,
+                "correction bias type",
+                type(bias).__name__,
+                "mlx.core.array",
             )
         _validate_fixed_routed_layout(block, layer_number)
         bias_f32 = bias.astype(mx.float32)
@@ -1380,7 +1381,17 @@ def install_fixed_m2_router(model: Any) -> dict[str, Any]:
             _FIXED_M2_EXPERTS,
             _FIXED_M2_HIDDEN,
         )
+    except Exception as error:
+        raise LagunaFixedM2ConfigError(
+            f"Metal/custom M1 projection kernel construction failed: {error}"
+        ) from error
+    try:
         m2_kernel = kernels._router_gemv_logits_m2_kernel()
+    except Exception as error:
+        raise LagunaFixedM2ConfigError(
+            f"Metal/custom M2 projection kernel construction failed: {error}"
+        ) from error
+    try:
         topk_kernel = kernels._router_kernel(
             _FIXED_M2_EXPERTS,
             _FIXED_M2_TOP_K,

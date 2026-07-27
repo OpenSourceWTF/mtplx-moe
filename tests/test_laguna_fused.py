@@ -937,6 +937,120 @@ def test_fixed_m2_install_rejects_contract_mismatch(
 
 
 @pytest.mark.parametrize(
+    ("property_name", "value", "message"),
+    [
+        ("num_experts", None, "expert count.*None.*256"),
+        ("num_experts", "256", "expert count.*'256'.*256"),
+        ("num_experts", object(), "expert count.*object.*256"),
+        ("top_k", None, "top-k.*None.*10"),
+        ("top_k", "10", "top-k.*'10'.*10"),
+        ("top_k", object(), "top-k.*object.*10"),
+        ("routed_scaling_factor", None, "scaling.*None.*2.5"),
+        ("routed_scaling_factor", "2.5", "scaling.*'2.5'.*2.5"),
+        ("routed_scaling_factor", object(), "scaling.*object.*2.5"),
+        ("softcap", None, "softcap.*None.*0.0"),
+        ("softcap", "0.0", "softcap.*'0.0'.*0.0"),
+        ("softcap", object(), "softcap.*object.*0.0"),
+    ],
+)
+def test_fixed_m2_install_rejects_malformed_block_property(
+    fixed_m2_fake_runtime,
+    property_name,
+    value,
+    message,
+):
+    model = _fixed_m2_fake_model()
+    setattr(model.model.layers[1].mlp, property_name, value)
+
+    with pytest.raises(laguna_fused.LagunaFixedM2ConfigError, match=message):
+        laguna_fused.install_fixed_m2_router(model)
+
+
+@pytest.mark.parametrize(
+    ("replacement", "message"),
+    [
+        (None, "correction bias shape.*None.*256"),
+        (object(), "correction bias shape.*None.*256"),
+        (
+            SimpleNamespace(shape=object(), dtype=mx.bfloat16),
+            "correction bias shape.*object.*256",
+        ),
+        (
+            SimpleNamespace(shape="256", dtype=mx.bfloat16),
+            "correction bias shape.*'2'.*256",
+        ),
+    ],
+)
+def test_fixed_m2_install_rejects_malformed_correction_bias(
+    fixed_m2_fake_runtime,
+    replacement,
+    message,
+):
+    model = _fixed_m2_fake_model()
+    model.model.layers[1].mlp.e_score_correction_bias = replacement
+
+    with pytest.raises(laguna_fused.LagunaFixedM2ConfigError, match=message):
+        laguna_fused.install_fixed_m2_router(model)
+
+
+def test_fixed_m2_install_rejects_missing_correction_bias(
+    fixed_m2_fake_runtime,
+):
+    model = _fixed_m2_fake_model()
+    del model.model.layers[1].mlp.e_score_correction_bias
+
+    with pytest.raises(
+        laguna_fused.LagunaFixedM2ConfigError,
+        match="correction bias shape.*None.*256",
+    ):
+        laguna_fused.install_fixed_m2_router(model)
+
+
+@pytest.mark.parametrize(
+    ("constructor_name", "property_name"),
+    [
+        ("_router_gemv_logits_kernel", "M1 projection kernel"),
+        ("_router_gemv_logits_m2_kernel", "M2 projection kernel"),
+        ("_router_kernel", "top-k kernel"),
+    ],
+)
+def test_fixed_m2_install_names_exact_kernel_construction_failure(
+    fixed_m2_fake_runtime,
+    monkeypatch,
+    constructor_name,
+    property_name,
+):
+    from mtplx.kernels import laguna_decode as kernels
+
+    model = _fixed_m2_fake_model()
+    monkeypatch.setattr(
+        kernels,
+        "_router_gemv_logits_kernel",
+        lambda *args: object(),
+    )
+    monkeypatch.setattr(
+        kernels,
+        "_router_gemv_logits_m2_kernel",
+        lambda: object(),
+    )
+    monkeypatch.setattr(kernels, "_router_kernel", lambda *args: object())
+    sentinel = RuntimeError(f"sentinel {property_name}")
+
+    def fail(*args):
+        raise sentinel
+
+    monkeypatch.setattr(kernels, constructor_name, fail)
+
+    with pytest.raises(
+        laguna_fused.LagunaFixedM2ConfigError,
+        match=f"{property_name} construction.*sentinel {property_name}",
+    ) as raised:
+        laguna_fused.install_fixed_m2_router(model)
+
+    assert raised.value.__cause__ is sentinel
+
+
+@pytest.mark.parametrize(
     ("mutate", "message"),
     [
         (
