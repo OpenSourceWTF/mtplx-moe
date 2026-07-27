@@ -274,6 +274,39 @@ override precedence, health evidence, and LiteLLM setup.
 Use `mtplx help advanced` for QA, profiling, support bundles, and kernel tools.
 See the [documentation index](docs/README.md).
 
+For the supported loopback server with one non-borrowing Cline slot and one
+non-borrowing background slot, use:
+
+```bash
+./scripts/start-laguna-s21.sh
+```
+
+The launcher defaults to `127.0.0.1:8080` and the exact
+`mlx-community/Laguna-S-2.1-oQ4e` checkpoint. Use `--print-config` to inspect the
+resolved command without importing MLX or starting the server. Deployments can
+override `MTPLX_PYTHON`, `MTPLX_LAGUNA_MODEL`, `MTPLX_LAGUNA_HOST`,
+`MTPLX_LAGUNA_PORT`, and `MTPLX_LAGUNA_MIN_AVAIL_GIB`; non-loopback exposure is
+therefore an explicit operator choice.
+
+The two clients identify their scheduling class with:
+
+```text
+X-MTPLX-Client: cline
+X-MTPLX-Client: opensource-leaderboard
+```
+
+Only the exact `cline` value owns the Cline slot; the leaderboard value and
+unlabelled requests use the background slot. Each class owns at most one active
+request, and an idle slot is never borrowed by the other class.
+
+The supported launcher enables the promoted
+`MTPLX_LAGUNA_FIXED_M2_ROUTER=1` construction-time route. To roll back that
+promotion, disable that export and restore `--scheduler-mode serial` with the
+prior serial batching arguments. Blackwellboy's operational changes were
+applied to make the Laguna serving path work correctly. That attribution covers
+the real-server startup and serving guards, not the fixed-M2 kernel or its
+benchmark result.
+
 ## What MTPLX is not
 
 - Not an external-drafter system. The drafter is the target model's own MTP heads.
