@@ -102,6 +102,11 @@ requirement. The process ceiling adds the exact 7 GiB runtime reserve:
 respectively. The real release smoke uses a 128 GiB Apple Silicon Mac and
 requires at least 110 GiB of free disk before download.
 
+Admission compares that process ceiling, never the realized footprint, so the
+smallest promoted Hy3 profile needs 71 GiB installed and 71 GiB available. A
+64 GiB machine is refused by every row above, and no cache-sizing flag changes
+that; see the cache-tier section for the footprint each tier actually reaches.
+
 Choose an envelope explicitly when reproducibility matters:
 
 ```bash
@@ -310,6 +315,30 @@ and 4,096-token aggregate live-KV ceiling. The default optimized cache
 allowance for this profile is 49.9921875 GiB, so the same optimization stack
 can be sized to any persistent cache through that value.
 
+Lowering the cap does not lower the ceiling. The reclaimed bytes stay
+unallocated inside the same 71 GiB budget, so the footprint the process
+actually reaches is well under what the profile declares:
+
+| Cache cap | Slots/layer | Realized cache | Unallocated | Realized total |
+|---:|---:|---:|---:|---:|
+| 49.9921875 GiB (default) | 128 | 49.992 GiB | 4.008 GiB | 66.992 GiB |
+| 48 GiB | 122 | 47.649 GiB | 6.351 GiB | 64.649 GiB |
+| 32 GiB | 81 | 31.636 GiB | 22.364 GiB | 48.636 GiB |
+
+Realized total is resident weights + KV + transient service + cache + reserve.
+The fixed floor under every row is 17.0 GiB: 8.71 GiB resident, 1.25 GiB KV at
+4,096 tokens, 0.04 GiB transient service, and the 7 GiB reserve. These totals
+are upper bounds, because `proj_requant=q4` removes a further
+manifest-dependent amount from the resident side.
+
+Admission does not use the realized total. It compares the profile's declared
+71 GiB process ceiling against installed and available memory, so a machine
+under 71 GiB is refused even when the realized plan would have fit. No profile
+below `hy3-oq2e-64` is promoted and `auto` cannot synthesize one, so a 64 GiB
+machine currently has no admitted configuration even though the 32 GiB tier
+needs only 48.636 GiB. Sizing the cache down does not change that outcome; only
+a promoted profile with a lower ceiling would.
+
 ### GLM-5.2 t158
 
 Save the complete optimized GLM configuration above as
@@ -343,8 +372,12 @@ realized allocations round down slightly:
 
 | Requested cap | Hy3 oQ2e | GLM-5.2 t158 |
 |---:|---:|---:|
-| 32 GiB | 81 slots/layer; 31.636 GiB | 51 slots/layer; 31.517 GiB |
-| 48 GiB | 122 slots/layer; 47.649 GiB | 77 slots/layer; 47.585 GiB |
+| 32 GiB | 81 slots/layer; 31.636 GiB cache; 48.636 GiB total | 51 slots/layer; 31.517 GiB cache; 54.180 GiB total |
+| 48 GiB | 122 slots/layer; 47.649 GiB cache; 64.649 GiB total | 77 slots/layer; 47.585 GiB cache; 70.248 GiB total |
+
+Total is the realized process footprint. It is not the declared process ceiling,
+which stays at 71 GiB for `hy3-oq2e-64` and 96 GiB for the measured GLM plan,
+and it is the ceiling that admission checks.
 
 These four cases were operationally smoke-tested on a 128 GiB M5 Max with a
 clean `mtplx 2.3.0+opensourcewtf.moe` install. Each constructed its real model,
