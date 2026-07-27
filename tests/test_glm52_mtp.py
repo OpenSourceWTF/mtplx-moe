@@ -727,6 +727,41 @@ def test_glm52_finished_cycle_retains_rollback_ownership() -> None:
     assert cache.cycle.finished is False
 
 
+def test_glm52_exact_boundary_rollback_commits_k1_cycle_ownership() -> None:
+    """A K1 rollback must close the cycle even when there are no rows to trim."""
+
+    from mlx_lm.models.cache import KVCache
+
+    from mtplx.generation import _rollback_mtp_cache
+    from mtplx.glm52_mtp_patch import GLM52MTPCache
+
+    cache = GLM52MTPCache(KVCache(), KVCache(), index_topk=4)
+    _append(cache.main_kv, 2)
+    _append(cache.indexer_kv, 2)
+    cache.begin_cycle()
+    _append(cache.main_kv, 1)
+    _append(cache.indexer_kv, 1)
+    cache.finish_d1(topk_indices=mx.array([[[[0]]]], dtype=mx.uint32))
+
+    _rollback_mtp_cache([cache], 3)
+    cache.finish_cycle()
+
+    assert cache.main_kv.offset == 3
+    assert cache.indexer_kv.offset == 3
+    assert cache.cycle is None
+
+    # The committed-history append follows accepted-boundary rollback. The
+    # next K1 cycle must start from that committed row rather than treating
+    # the old D1 cycle as incomplete and rolling back to its prior base.
+    _append(cache.main_kv, 1)
+    _append(cache.indexer_kv, 1)
+    cache.begin_cycle()
+    assert cache.main_kv.offset == 4
+    assert cache.indexer_kv.offset == 4
+    assert cache.cycle is not None
+    assert cache.cycle.base_offset == 4
+
+
 @pytest.mark.parametrize(
     ("indexed_length", "should_reject"), [(2048, False), (2049, True)]
 )

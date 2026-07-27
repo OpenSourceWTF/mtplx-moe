@@ -234,6 +234,12 @@ class GLM52MTPCache:
         state = self.cycle
         if state is not None:
             state.finished = True
+            # Equal offsets mean verification already placed both children at
+            # the accepted boundary.  K1 has no recurrent row for trim() to
+            # remove, so finish_cycle() must release that cycle explicitly.
+            # Divergent D2+ offsets retain ownership until rollback_to().
+            if self.offset == int(self.indexer_kv.offset):
+                self.cycle = None
 
     def abort_cycle(self) -> None:
         """Discard every append from an incomplete or failed draft cycle."""

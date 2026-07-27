@@ -207,6 +207,42 @@ class CommittedHistoryRejectingTinyMTPModel(RejectingTinyMTPModel):
         return hidden_states
 
 
+class CycleOwningCommittedHistoryRejectingTinyMTPModel(
+    CommittedHistoryRejectingTinyMTPModel
+):
+    """Model the GLM K1 rule that an unfinished cycle rolls back its D1 row."""
+
+    def __init__(self):
+        super().__init__()
+        self.cycle_base: int | None = None
+        self.finish_calls = 0
+
+    def mtp_forward(self, *args, **kwargs):
+        mtp_cache = kwargs.get("mtp_cache")
+        assert mtp_cache
+        if self.cycle_base is not None:
+            for entry in mtp_cache:
+                entry.trim(max(0, entry.offset - self.cycle_base))
+        self.cycle_base = mtp_cache[0].offset
+        result = super().mtp_forward(*args, **kwargs)
+        for entry in mtp_cache:
+            entry.offset += 1
+        return result
+
+    def finish_mtp_cycle(self, _mtp_cache):
+        self.finish_calls += 1
+        self.cycle_base = None
+
+    def mtp_update_cache(self, hidden_states, next_token_ids, *, mtp_cache=None, **kwargs):
+        self.finish_mtp_cycle(mtp_cache)
+        return super().mtp_update_cache(
+            hidden_states,
+            next_token_ids,
+            mtp_cache=mtp_cache,
+            **kwargs,
+        )
+
+
 def _runtime(model: TinyModel, *, mtp_enabled: bool = True) -> MTPLXRuntime:
     return MTPLXRuntime(
         model=model,
@@ -717,6 +753,26 @@ def test_mtpk_final_state_commits_fresh_terminal_primary(
     assert out.final_state.finish_reason == finish_reason
     assert out.final_state.final_trunk_cache[0].offset == 2
     assert out.final_state.final_committed_mtp_cache[0].offset == 1
+
+
+def test_mtpk_k1_rejection_finishes_cycle_before_next_draft() -> None:
+    model = CycleOwningCommittedHistoryRejectingTinyMTPModel()
+
+    out = generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=4,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=1,
+        stop_token_ids=set(),
+        mtp_history_policy="committed",
+        capture_final_state=True,
+    )
+
+    assert out.stats.rejected_drafts == 3
+    assert out.final_state is not None
+    assert out.final_state.final_committed_mtp_cache[0].offset == 4
+    assert model.finish_calls >= out.stats.verify_calls
 
 
 def test_default_qwen27b_ar_decode_trace_does_not_crash(tmp_path, monkeypatch):

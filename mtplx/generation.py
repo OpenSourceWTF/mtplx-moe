@@ -7967,6 +7967,9 @@ def generate_mtpk(
                     event["policy_stop"] = policy_continue
                     break
 
+        if not used_device_core:
+            rt.finish_mtp_cycle(step_mtp_cache)
+
         before_verify = None
         if a3b_target_prefix_route is None:
             if _skip_verify_snapshot():

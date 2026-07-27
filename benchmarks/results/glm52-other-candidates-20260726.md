@@ -4,18 +4,78 @@
 
 Do not move GLM tensor work from Metal to the CPU.
 
+None of the speculative or weight-residency candidates produced a durable
+speedup on the naturalistic 130-token chat / 1,024-output qualification lane.
+Q4 K1, fixed K2, and adaptive K1/K2 all remained near 5.8 diagnostic token/s.
+The timings are not headline-eligible because the host was contended, but the
+structural result is clear: K2 removed 132 verify calls while increasing expert
+traffic from 1.107 TB to 1.248 TB, and therefore did not improve throughput.
+K5 cut verify calls further to 405 but read 1.951 TB and fell to 4.044
+diagnostic token/s.
+
 For the exact 1,024-input / 64-output Q1-t158 + Q4-MTP lane, fixed speculative
 depth 5 is the best qualified fixed depth. Its fresh-process ABBA median is
 7.114647 token/s, 0.776% above the matched depth-4 median at 7.059836 token/s.
 
-A rejection-aware K2-for-three-cycles then K5 schedule is the highest-value
-new candidate. Its fresh-process ABBA median is 7.389868 token/s, 3.725% above
-the matched fixed-K5 median at 7.124458 token/s. It removes both cold
-rejections, reduces verify time 6.178%, and preserves exact output and final
-cache offsets. Do not install it yet: the retained proof is one prompt and one
-64-token phase alignment, so it still needs multi-prompt and 256-1,024-output
-qualification. The result is evidence for rejection-aware depth selection,
-not for changing every GLM request to the same token threshold.
+A rejection-aware K2-for-three-cycles then K5 schedule won its fresh-process
+64-token screen, but it is not durable enough to promote. On a naturalistic
+130-token chat prompt capped at 1,024 output tokens, fixed K5 accepted only
+618 of 999 evaluated drafts and needed 405 verify calls. The schedule changes
+only its first three cycles, or 0.741% of that long run. Even linear dilution
+of the original 3.725% O64 gain is only about 0.233% at O1024.
+
+Do not extend this route to K6 or K7. Conditional acceptance fell to 50.0% at
+depths 3 and 4 and 53.3% at depth 5. The current optimization target should
+move away from depth scheduling. Adaptive K1/K2 engaged for 275 second-position
+drafts but still produced only 5.799560 diagnostic token/s, between fixed K1
+and K2. The remaining credible target is either materially better draft/target
+agreement at K2 or a verifier that can reuse one expert-weight read across
+multiple owned rows. The existing K3 owner-fusion attempt does not provide
+that verifier: it was 5.47x slower.
+
+The natural long-output run is acceptance-only evidence. Host CPU/GPU
+contention made its 4.044338 token/s timing ineligible. It nevertheless passed
+the exact final-state gates: 1,024 generated tokens, target offset 1,154,
+committed-MTP offset 1,153, matching token history and finish reason, and
+`safe_to_commit=true`.
+
+Evidence:
+
+- `profiler/glm52-other-candidates-20260726/natural-k5-130in-1024out-acceptance-only.json`
+- `profiler/glm52-other-candidates-20260726/natural-130in-1024out-durability-screen.json`
+
+## Natural 1,024-output durability matrix
+
+Every row below emitted the same 1,024-token SHA-256
+`5fb5e598a12bc4cca3712f1db7791113d76e237f8efa143fa357d7b4d90f1660`,
+finished by length, and passed exact target offset 1,154 and committed-MTP
+offset 1,153 gates.
+
+| Candidate | Verify calls | Accepted / evaluated | Expert reads | Diagnostic token/s | Decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Q4 fixed K1 | 595 | 428 / 595 | 1.107 TB | 5.829087 | Correct baseline |
+| Q4 fixed K2 | 463 | 560 / 799 | 1.248 TB | 5.779109 | Wash |
+| Q4 adaptive K1/K2 | 517 | 506 / 724 | 1.182 TB | 5.799560 | Wash |
+| Q4 fixed K5 | 405 | 618 / 999 | 1.951 TB | 4.044338 | Reject |
+| BF16 fixed K2 | 461 | 562 / not retained | 1.669 TB | 4.829500 | Reject |
+
+The BF16 head accepted only two more drafts than Q4 K2. Its 19.906 GB artifact
+reduced target residency, lowered the hit rate from 81.031% to 74.251%, and
+increased reads 33.7%. This rules out draft-weight precision as the main
+accuracy problem.
+
+Prompt-context copying also failed the natural lane. It ran 596 probes and
+drafted one eight-token block, but accepted zero blocks and zero copied tokens.
+Its 5.8445 diagnostic token/s is therefore the K1 control plus unused
+speculation, not a copy win.
+
+The K1 run also exposed and now covers a real lifecycle error. A rejected K1
+cycle can land exactly on the accepted cache boundary, leaving no rows for
+rollback to trim. The GLM cache now releases ownership at that exact boundary,
+and host-drafted cycles are finalized before verification. The corrected
+1,024-output rerun moved the committed-MTP offset from the broken 132 to the
+required 1,153 without changing the output SHA. This is a durable correctness
+fix, not a throughput claim.
 
 ## Verified 7 token/s result
 
@@ -248,24 +308,32 @@ Cheap GLM history predictors failed the offline gate:
 
 The ranked follow-ups are therefore:
 
-1. replace the fixed cold-prefix threshold with a rejection-history controller
-   and qualify it across prompts with both high and collapsed K5 acceptance;
-2. qualify 256-1,024 output lengths against unchanged fixed K5 after every
-   terminal final-state gate passes;
+1. improve K2 draft/target agreement through head training or distillation,
+   not greater draft-weight precision;
+2. design a verifier only if one fixed expert-weight read can provably serve
+   multiple owned speculative rows at the real Q1-t158 shapes;
 3. screen a raw-t158 gate/up/SwiGLU kernel on the exact observed shapes before
    considering full-model integration.
 
 None should be installed before the trace/replay gate. Every wrong full-record
 hint on the current q1t artifact costs 8.4375 MiB.
 
+Sharing the same 8,175 persistent records globally is also rejected. A replay
+of the current Q1-t158 route trace with reset boundaries honored reduced
+physical reads from 10,022 to 9,954, only 0.68%, while global frequency victim
+selection searches a much larger resident set. This does not justify a full
+model benchmark.
+
+Evidence:
+
+- `profiler/glm52-other-candidates-20260726/equal-memory-cache-scope-replay-64t.json`
+
 ## Remaining candidates
 
-Depth 5 has cleared its fresh-process fixed-depth gate, and K2-for-three-cycles
-then K5 has cleared the exact current-prompt rejection gate. The remaining
-promotion boundary is generalization: a token-count threshold can benefit from
-64-token phase alignment without being the best policy for longer generation.
-Qualification must preserve the target path's output, cache offsets, 96 GiB
-plan, and unchanged fixed-K5 control on every prompt/output stratum.
+Depth scheduling is closed. Depth 5 and K2-for-three-cycles then K5 won short
+screens but failed the natural 1,024-output durability premise. Adaptive K1/K2
+also washed, so a more elaborate request-local controller is not justified by
+the current evidence.
 
 The I/O candidates tested in this campaign are closed. `overlap_miss_reads`
 regressed throughput 5.390%; commitment-only cache credit increased reads; and
@@ -289,3 +357,5 @@ real-shape microbenchmark washes.
 - `benchmarks/results/profiler/glm52-other-candidates-20260726/t158-geometry-sweep-r2.json`
 - `benchmarks/results/profiler/glm52-other-candidates-20260726/t158-installed-path-ab.json`
 - `benchmarks/results/profiler/glm52-other-candidates-20260726/depth5-rejection-screen-summary.json`
+- `benchmarks/results/profiler/glm52-other-candidates-20260726/natural-130in-1024out-durability-screen.json`
+- `benchmarks/results/profiler/glm52-other-candidates-20260726/equal-memory-cache-scope-replay-64t.json`
