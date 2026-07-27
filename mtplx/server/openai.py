@@ -1084,6 +1084,15 @@ def _startup_line(text: str = "") -> None:
     _safe_stdout_print(text)
 
 
+def _laguna_fused_startup_line(runtime: Any) -> str | None:
+    """Engagement receipt for the env-gated fused stack (grep: [laguna-fused])."""
+
+    report = getattr(runtime, "laguna_fused_report", None)
+    if not report:
+        return None
+    return "[5/6] [laguna-fused] " + json.dumps(report, ensure_ascii=False)
+
+
 def _startup_server_url(args: argparse.Namespace) -> str:
     return local_url_for_bind(
         str(getattr(args, "host", "127.0.0.1")),
@@ -1938,6 +1947,9 @@ class ServerState:
             _startup_line(
                 f"[5/6] {self.backend_descriptor.display_name} drafter is active"
             )
+        fused_line = _laguna_fused_startup_line(self.runtime)
+        if fused_line:
+            _startup_line(fused_line)
         if self.backend_descriptor.uses_draft_lm_head and self.runtime.mtp_enabled:
             self.draft_lm_head = self.model_scheduler.submit_foreground(
                 _install_draft_lm_head,

@@ -351,6 +351,26 @@ def test_startup_urls_distinguish_wildcard_bind_from_local_url():
     assert openai._startup_openai_base_url(args) == "http://127.0.0.1:8000/v1"
 
 
+def test_laguna_fused_startup_line_carries_the_engagement_receipt():
+    runtime = SimpleNamespace(
+        laguna_fused_report=[{"path": "fused_gate_up", "layers_converted": 47}]
+    )
+
+    line = openai._laguna_fused_startup_line(runtime)
+
+    assert line is not None
+    assert "[laguna-fused]" in line
+    assert json.loads(line.split("[laguna-fused] ", 1)[1]) == runtime.laguna_fused_report
+
+
+def test_laguna_fused_startup_line_stays_silent_without_a_report():
+    assert openai._laguna_fused_startup_line(SimpleNamespace()) is None
+    assert (
+        openai._laguna_fused_startup_line(SimpleNamespace(laguna_fused_report=[]))
+        is None
+    )
+
+
 def test_chat_request_accepts_ai_sdk_camel_sampler_aliases():
     request = openai.ChatCompletionRequest.model_validate(
         {
