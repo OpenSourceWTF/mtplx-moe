@@ -804,14 +804,16 @@ def _batched_greedy_rows(model, prompts, steps: int):
     return stacked.tolist()
 
 
-def test_rope_offset_preserves_ragged_per_row_positions() -> None:
+def test_rope_offset_materializes_ragged_per_row_positions() -> None:
     import mlx.core as mx
 
     from mtplx.models.laguna import _rope_offset
 
     offsets = mx.array([12, 19], dtype=mx.int32)
+    materialized = _rope_offset(offsets, 2, memo={})
 
-    assert _rope_offset(offsets, 2, memo={}) is offsets
+    assert materialized is not offsets
+    assert materialized.tolist() == [12, 19]
 
 
 def test_batched_decode_matches_single_stream_decode() -> None:
