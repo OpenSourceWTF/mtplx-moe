@@ -933,6 +933,31 @@ def _fixed_m2_moe_call(self, x: mx.array) -> mx.array:
     return pack.apply_routed_and_shared_experts(x, routing)
 
 
+def _new_fixed_m2_installed_block_type(block_type: type) -> type:
+    """Create the layout-compatible direct-call type for one model install."""
+
+    return type(
+        f"_FixedM2Installed{block_type.__name__}",
+        (block_type,),
+        {
+            "__module__": __name__,
+            "__slots__": (),
+            "__call__": _fixed_m2_moe_call,
+        },
+    )
+
+
+def _install_fixed_m2_block_route(
+    block: Any,
+    pack: _FixedM2RouterPack,
+    installed_type: type,
+) -> None:
+    """Mutate one fully validated block; the caller owns transaction rollback."""
+
+    block._fixed_m2_router_pack = pack
+    block.__class__ = installed_type
+
+
 def _fixed_m2_contract_error(
     layer_number: int | None,
     property_name: str,
@@ -965,6 +990,22 @@ def _fixed_m2_property_matches(actual: Any, expected: Any) -> bool:
         return bool(actual == expected)
     except Exception:
         return False
+
+
+def _fixed_m2_required_component(
+    block: Any,
+    component_name: str,
+    layer_number: int,
+) -> Any:
+    component = getattr(block, component_name, None)
+    if component is None:
+        raise _fixed_m2_contract_error(
+            layer_number,
+            component_name,
+            None,
+            "present component",
+        )
+    return component
 
 
 def _validate_fixed_tensor(
@@ -1105,8 +1146,11 @@ def _validate_fixed_fused_projection(
         )
 
 
-def _validate_fixed_routed_layout(block: Any, layer_number: int) -> None:
-    routed = block.switch_mlp
+def _validate_fixed_routed_layout(
+    routed: Any,
+    shared: Any,
+    layer_number: int,
+) -> None:
     if isinstance(routed, FusedGateUpSwitchGLU):
         _validate_fixed_fused_projection(
             routed,
@@ -1136,7 +1180,6 @@ def _validate_fixed_routed_layout(block: Any, layer_number: int) -> None:
                 metadata_shape=metadata_shape,
             )
 
-    shared = block.shared_expert
     if isinstance(shared, FusedGateUpMLP):
         _validate_fixed_fused_projection(
             shared,
@@ -1284,7 +1327,9 @@ def install_fixed_m2_router(model: Any) -> dict[str, Any]:
                 expected,
             )
 
-    validated: list[tuple[int, Any, mx.array, mx.array]] = []
+    validated: list[
+        tuple[int, Any, mx.array, mx.array, Callable, Callable]
+    ] = []
     router_weight_ids: set[int] = set()
     for layer_index, block in blocks:
         layer_number = layer_index
@@ -1304,7 +1349,17 @@ def install_fixed_m2_router(model: Any) -> dict[str, Any]:
                     expected,
                 )
 
-        gate = block.gate
+        gate = _fixed_m2_required_component(block, "gate", layer_number)
+        switch_mlp = _fixed_m2_required_component(
+            block,
+            "switch_mlp",
+            layer_number,
+        )
+        shared_expert = _fixed_m2_required_component(
+            block,
+            "shared_expert",
+            layer_number,
+        )
         if hasattr(gate, "scales"):
             raise _fixed_m2_contract_error(
                 layer_number,
@@ -1366,10 +1421,23 @@ def install_fixed_m2_router(model: Any) -> dict[str, Any]:
                 type(bias).__name__,
                 "mlx.core.array",
             )
-        _validate_fixed_routed_layout(block, layer_number)
+        _validate_fixed_routed_layout(
+            switch_mlp,
+            shared_expert,
+            layer_number,
+        )
         bias_f32 = bias.astype(mx.float32)
         mx.eval(bias_f32)
-        validated.append((layer_number, block, weight, bias_f32))
+        validated.append(
+            (
+                layer_number,
+                block,
+                weight,
+                bias_f32,
+                switch_mlp,
+                shared_expert,
+            )
+        )
 
     if not kernels._on_metal_device():
         raise LagunaFixedM2ConfigError(
@@ -1404,14 +1472,24 @@ def install_fixed_m2_router(model: Any) -> dict[str, Any]:
     inputs = _fixed_m2_selfcheck_inputs()
     staged: list[
         tuple[
+            int,
             Any,
             mx.array,
             mx.array,
+            Callable,
+            Callable,
             Callable[[mx.array], tuple[mx.array, mx.array]],
             Callable[[mx.array], tuple[mx.array, mx.array]],
         ]
     ] = []
-    for layer_number, _block, weight, bias_f32 in validated:
+    for (
+        layer_number,
+        _block,
+        weight,
+        bias_f32,
+        switch_mlp,
+        shared_expert,
+    ) in validated:
         project_m1 = partial(
             kernels._router_gemv_logits_m1_direct,
             gate_weight=weight,
@@ -1452,12 +1530,33 @@ def install_fixed_m2_router(model: Any) -> dict[str, Any]:
             project_logits=project_m2,
             select_topk=select_m2,
         )
-        staged.append((_block, weight, bias_f32, route_m1, route_m2))
+        staged.append(
+            (
+                layer_number,
+                _block,
+                weight,
+                bias_f32,
+                switch_mlp,
+                shared_expert,
+                route_m1,
+                route_m2,
+            )
+        )
 
-    packs: list[tuple[Any, _FixedM2RouterPack]] = []
-    for block, weight, bias_f32, route_m1, route_m2 in staged:
+    packs: list[tuple[int, Any, _FixedM2RouterPack]] = []
+    for (
+        layer_number,
+        block,
+        weight,
+        bias_f32,
+        switch_mlp,
+        shared_expert,
+        route_m1,
+        route_m2,
+    ) in staged:
         packs.append(
             (
+                layer_number,
                 block,
                 _FixedM2RouterPack(
                     weight=weight,
@@ -1467,17 +1566,58 @@ def install_fixed_m2_router(model: Any) -> dict[str, Any]:
                     prefill_stock=partial(_STOCK_LAGUNA_MOE_CALL, block),
                     apply_routed_and_shared_experts=partial(
                         _fixed_m2_apply_routed,
-                        switch_mlp=block.switch_mlp,
-                        shared_expert=block.shared_expert,
+                        switch_mlp=switch_mlp,
+                        shared_expert=shared_expert,
                         combine=laguna.MOE_COMBINE_IMPL,
                     ),
                 ),
             )
         )
 
-    for block, pack in packs:
-        block._fixed_m2_router_pack = pack
-    LagunaSparseMoeBlock.__call__ = _fixed_m2_moe_call
+    block_types = {
+        type(block) for _layer_number, block, _pack in packs
+    }
+    installed_types = {
+        block_type: _new_fixed_m2_installed_block_type(block_type)
+        for block_type in block_types
+    }
+    missing_pack = object()
+    changed: list[tuple[Any, type, Any]] = []
+    for layer_number, block, pack in packs:
+        previous_pack = getattr(
+            block,
+            "_fixed_m2_router_pack",
+            missing_pack,
+        )
+        changed.append((block, type(block), previous_pack))
+        try:
+            _install_fixed_m2_block_route(
+                block,
+                pack,
+                installed_types[type(block)],
+            )
+        except Exception as error:
+            rollback_errors = []
+            for changed_block, previous_type, old_pack in reversed(changed):
+                try:
+                    changed_block.__class__ = previous_type
+                except Exception as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+                try:
+                    if old_pack is missing_pack:
+                        if hasattr(changed_block, "_fixed_m2_router_pack"):
+                            delattr(changed_block, "_fixed_m2_router_pack")
+                    else:
+                        changed_block._fixed_m2_router_pack = old_pack
+                except Exception as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+            detail = ""
+            if rollback_errors:
+                detail = f"; rollback failed: {rollback_errors!r}"
+            raise LagunaFixedM2ConfigError(
+                f"layer {layer_number} fixed-M2 route installation failed: "
+                f"{error}{detail}"
+            ) from error
     return {
         "path": "fixed_m2_router",
         "layers_validated": _FIXED_M2_LAYERS,

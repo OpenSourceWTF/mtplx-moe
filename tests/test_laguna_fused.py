@@ -11,6 +11,7 @@ dtype the real checkpoint runs in.
 
 from __future__ import annotations
 
+import inspect
 import math
 from types import SimpleNamespace
 
@@ -652,6 +653,9 @@ class _FixedM2FakeGate(nn.Module):
         super().__init__()
         self.weight = weight
 
+    def __call__(self, x):
+        return mx.zeros((int(x.shape[0]), 256), dtype=mx.bfloat16)
+
 
 class _FixedM2TensorSpec:
     def __init__(self, shape, dtype):
@@ -866,6 +870,22 @@ def test_fixed_m2_install_rejects_wrong_layer_count(fixed_m2_fake_runtime):
         match="MoE block count.*46.*47",
     ):
         laguna_fused.install_fixed_m2_router(model)
+
+
+@pytest.mark.parametrize("component", ["gate", "switch_mlp", "shared_expert"])
+def test_fixed_m2_install_names_missing_core_component(
+    fixed_m2_fake_runtime,
+    component,
+):
+    model = _fixed_m2_fake_model()
+    delattr(model.model.layers[1].mlp, component)
+
+    with pytest.raises(laguna_fused.LagunaFixedM2ConfigError) as raised:
+        laguna_fused.install_fixed_m2_router(model)
+
+    assert str(raised.value) == (
+        f"layer 1 {component} is None; expected 'present component'"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1351,6 +1371,60 @@ def test_fixed_m2_install_selfchecks_all_47_distinct_router_weights(
         assert layer.mlp._fixed_m2_router_pack.weight is layer.mlp.gate.weight
 
 
+def test_fixed_m2_install_scopes_direct_call_to_only_validated_blocks(
+    fixed_m2_fake_runtime,
+):
+    installed_model = _fixed_m2_fake_model()
+    untouched_model = _fixed_m2_fake_model()
+    base_call = laguna.LagunaSparseMoeBlock.__call__
+
+    laguna_fused.install_fixed_m2_router(installed_model)
+
+    installed_blocks = [
+        layer.mlp for layer in installed_model.model.layers[1:]
+    ]
+    untouched_blocks = [
+        layer.mlp for layer in untouched_model.model.layers[1:]
+    ]
+    installed_types = {type(block) for block in installed_blocks}
+    assert len(installed_types) == 1
+    installed_type = installed_types.pop()
+    assert installed_type is not laguna.LagunaSparseMoeBlock
+    assert installed_type.__bases__ == (laguna.LagunaSparseMoeBlock,)
+    assert installed_type.__slots__ == ()
+    assert installed_type.__call__ is laguna_fused._fixed_m2_moe_call
+    assert laguna.LagunaSparseMoeBlock.__call__ is base_call
+    assert all(type(block) is installed_type for block in installed_blocks)
+    assert all(
+        type(block) is laguna.LagunaSparseMoeBlock
+        for block in untouched_blocks
+    )
+    assert all(
+        not hasattr(block, "_fixed_m2_router_pack")
+        for block in untouched_blocks
+    )
+
+
+def test_fixed_m2_install_leaves_flag_off_reloaded_model_on_stock_call(
+    fixed_m2_fake_runtime,
+    monkeypatch,
+):
+    installed_model = _fixed_m2_fake_model()
+    laguna_fused.install_fixed_m2_router(installed_model)
+    reloaded_model = _fixed_m2_fake_model()
+    block = reloaded_model.model.layers[1].mlp
+    base_call = laguna.LagunaSparseMoeBlock.__call__
+    monkeypatch.setattr(laguna_fused, "_enabled", lambda _name: False)
+
+    assert laguna_fused.install_from_env(reloaded_model) == []
+    assert type(block) is laguna.LagunaSparseMoeBlock
+    assert type(block).__call__ is base_call
+    assert not hasattr(block, "_fixed_m2_router_pack")
+    output = block(mx.zeros((1, 1, 3072), dtype=mx.bfloat16))
+    mx.eval(output)
+    assert tuple(output.shape) == (1, 1, 3072)
+
+
 def test_fixed_m2_install_selfcheck_failure_is_atomic(
     fixed_m2_fake_runtime,
     monkeypatch,
@@ -1379,6 +1453,45 @@ def test_fixed_m2_install_selfcheck_failure_is_atomic(
     assert all(
         not hasattr(layer.mlp, "_fixed_m2_router_pack")
         for layer in model.model.layers[1:]
+    )
+
+
+def test_fixed_m2_install_mutation_failure_rolls_back_types_and_packs(
+    fixed_m2_fake_runtime,
+    monkeypatch,
+):
+    model = _fixed_m2_fake_model()
+    blocks = [layer.mlp for layer in model.model.layers[1:]]
+    original_types = [type(block) for block in blocks]
+    original_install = laguna_fused._install_fixed_m2_block_route
+    calls = 0
+    failure_call = 13
+    sentinel = RuntimeError("sentinel route mutation failure")
+
+    def fail_during_install(block, pack, installed_type):
+        nonlocal calls
+        calls += 1
+        if calls == failure_call:
+            block._fixed_m2_router_pack = pack
+            raise sentinel
+        original_install(block, pack, installed_type)
+
+    monkeypatch.setattr(
+        laguna_fused,
+        "_install_fixed_m2_block_route",
+        fail_during_install,
+    )
+
+    with pytest.raises(
+        laguna_fused.LagunaFixedM2ConfigError,
+        match="layer 13 fixed-M2 route installation failed",
+    ) as raised:
+        laguna_fused.install_fixed_m2_router(model)
+
+    assert raised.value.__cause__ is sentinel
+    assert [type(block) for block in blocks] == original_types
+    assert all(
+        not hasattr(block, "_fixed_m2_router_pack") for block in blocks
     )
 
 
@@ -1482,6 +1595,20 @@ def test_fixed_m2_installed_route_never_calls_eligibility_helpers(
 
     block(mx.zeros((1, 1, 3072), dtype=mx.bfloat16))
     block(mx.zeros((2, 1, 3072), dtype=mx.bfloat16))
+
+
+def test_fixed_m2_hot_call_has_no_dynamic_lookup_or_fallback():
+    source = inspect.getsource(laguna_fused._fixed_m2_moe_call)
+
+    for forbidden in (
+        "getattr(",
+        "hasattr(",
+        "eligible",
+        "try:",
+        "except",
+        "fallback",
+    ):
+        assert forbidden not in source
 
 
 def test_fixed_m2_requested_install_failure_is_fatal(monkeypatch):
