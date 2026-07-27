@@ -216,7 +216,9 @@ streaming slots instead.
 
 This GLM configuration reproduces the measured 96 GiB memory plan: a 12 GiB
 runtime reserve, 72 GiB expert-cache cap, 48 transient slots, and 116 persistent
-slots per each of the 75 streamed layers.
+slots per each of the 75 streamed layers. It also retains the measured
+component-bank, frequency-cache, `F_NOCACHE`, deferred-release, no-prefetch,
+and headers-only integrity settings.
 
 ```json
 {
@@ -233,14 +235,18 @@ slots per each of the 75 streamed layers.
   "bypass_page_cache": true,
   "q2_expert_kernel": "stock",
   "split_route_release": "deferred",
+  "deferred_pin_release": true,
   "prefetch_slots": 0,
   "streamed_codec": "none",
+  "verify_record_hashes": false,
+  "verify_artifact_headers": true,
+  "verify_sidecar_hash_at_open": false,
   "trace_routes": false
 }
 ```
 
 ```bash
-"$MTPLX_MOE_VENV/bin/mtplx" serve \
+MTPLX_SUSTAINED_PREFILL=1 "$MTPLX_MOE_VENV/bin/mtplx" serve \
   --model OpensourceWTF/GLM-5.2-t158-MTPLX-streaming \
   --download \
   --expert-streaming-config glm52-t158-96g.json
@@ -253,6 +259,136 @@ an experimental serving configuration rather than a quality recommendation.
 Changing the memory limit, reserve, cache cap, context budget, or workload
 creates a new unmeasured configuration; startup will still validate that its
 fixed footprint fits.
+
+## Optimized 32 GiB and 48 GiB cache tiers
+
+“32 GiB configuration” and “48 GiB configuration” are tuning-tier labels. The
+same optimized execution stack applies at that persistent expert-cache size or
+any smaller size; the label is not a total-RAM limit and does not exclude a
+machine with more memory.
+
+The command-line field has a narrower, literal meaning:
+`--expert-cache-limit 48GiB` installs a construction-time 48 GiB safety sub-cap
+for the persistent expert cache. It does not cap the whole MTPLX process.
+Resident weights, KV cache, runtime workspace, and the OS reserve are budgeted
+separately by the selected base plan. These examples retain that complete
+optimized base configuration and change only its expert-cache sub-cap. Both
+are custom, unmeasured cache geometries; startup still resolves and validates
+the complete immutable memory plan before construction.
+
+### Hy3 oQ2e
+
+Use `hy3-oq2e-64` as the base for a cache-sized streaming configuration. The
+named profile carries the q4 resident-trunk requantization, measured FP32
+split-K router kernel, frequency policy, component banks, deferred split and
+pin release, trusted admission-integrity settings, sustained prefill, and the
+measured submit cadence. Do not reconstruct those settings manually in a
+cache-only override.
+
+For a 32 GiB cache:
+
+```bash
+"$MTPLX_MOE_VENV/bin/mtplx" serve \
+  --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
+  --download \
+  --expert-profile hy3-oq2e-64 \
+  --expert-cache-limit 32GiB
+```
+
+For a 48 GiB cache:
+
+```bash
+"$MTPLX_MOE_VENV/bin/mtplx" serve \
+  --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
+  --download \
+  --expert-profile hy3-oq2e-64 \
+  --expert-cache-limit 48GiB
+```
+
+Both commands keep the profile's 71 GiB process ceiling, 7 GiB runtime reserve,
+and 4,096-token aggregate live-KV ceiling. The default optimized cache
+allowance for this profile is 49.9921875 GiB, so the same optimization stack
+can be sized to any persistent cache through that value.
+
+### GLM-5.2 t158
+
+Save the complete optimized GLM configuration above as
+`glm52-t158-96g.json`. Keep its 96 GiB process ceiling, 12 GiB reserve, 48
+transient slots, frequency policy, component banks, `F_NOCACHE`, deferred
+release, no-prefetch control, and headers-only integrity settings. The explicit
+cache flag below overrides only `expert_cache_limit_bytes` in that JSON.
+
+For a 32 GiB cache:
+
+```bash
+MTPLX_SUSTAINED_PREFILL=1 "$MTPLX_MOE_VENV/bin/mtplx" serve \
+  --model OpensourceWTF/GLM-5.2-t158-MTPLX-streaming \
+  --download \
+  --expert-streaming-config glm52-t158-96g.json \
+  --expert-cache-limit 32GiB
+```
+
+For a 48 GiB cache:
+
+```bash
+MTPLX_SUSTAINED_PREFILL=1 "$MTPLX_MOE_VENV/bin/mtplx" serve \
+  --model OpensourceWTF/GLM-5.2-t158-MTPLX-streaming \
+  --download \
+  --expert-streaming-config glm52-t158-96g.json \
+  --expert-cache-limit 48GiB
+```
+
+Layer-scoped caches allocate whole expert slots per streamed layer, so the
+realized allocations round down slightly:
+
+| Requested cap | Hy3 oQ2e | GLM-5.2 t158 |
+|---:|---:|---:|
+| 32 GiB | 81 slots/layer; 31.636 GiB | 51 slots/layer; 31.517 GiB |
+| 48 GiB | 122 slots/layer; 47.649 GiB | 77 slots/layer; 47.585 GiB |
+
+These four cases were operationally smoke-tested on a 128 GiB M5 Max with a
+clean `mtplx 2.3.0+opensourcewtf.moe` install. Each constructed its real model,
+reached `MTPLX is ready`, reported the slot count above through `/health`,
+listed its model through `/v1/models`, and returned a nonempty AR chat
+completion. This proves that the serving configurations execute; it is not a
+throughput receipt or a GLM t158 task-quality validation.
+
+For another cache size, replace the `--expert-cache-limit` value with the
+desired `GiB` amount. A 48 GiB tuning tier therefore covers 48 GiB and every
+smaller positive cache setting without dropping the model-specific
+optimizations. Cache-only overrides are bounded by the selected base plan:
+49.9921875 GiB for `hy3-oq2e-64` and 72 GiB for the measured GLM plan. A larger
+cache requires a new total-memory plan and benchmark rather than only raising
+this sub-cap.
+
+### Verify the running server
+
+Wait for `MTPLX is ready`, then verify the route rather than relying on the
+early startup card:
+
+```bash
+curl -fsS http://127.0.0.1:8000/health | python3 -m json.tool
+curl -fsS http://127.0.0.1:8000/v1/models | python3 -m json.tool
+```
+
+`/health` must report `generation_mode: "ar"`,
+`available_generation_modes: ["ar"]`, the expected expert model key, and a
+memory plan whose persistent allocation is no larger than the requested cache
+sub-cap. A cache-only override customizes the promoted Hy3 profile, so
+`expert_profile.customized` must be `true` and `evidence_commit` must be
+`null`.
+
+Copy the ID returned by `/v1/models` into this request:
+
+```bash
+curl -fsS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"MODEL_ID_FROM_V1_MODELS","messages":[{"role":"user","content":"Reply with exactly OK"}],"temperature":0,"max_tokens":8}' \
+  | python3 -m json.tool
+```
+
+Stop the foreground server with `Ctrl-C`. To test both tiers, restart it with
+the other cache value; do not run two large unified-memory servers at once.
 
 ## Configuration precedence
 
