@@ -126,7 +126,7 @@ def test_no_budget_line_is_negative():
 
 @pytest.mark.parametrize(
     ("cache_cap_gib", "expected_slots", "expected_cache_gib"),
-    [(32, 81, 31.636), (48, 122, 47.649)],
+    [(32, 81, 31.636), (40, 102, 39.838), (47, 120, 46.868)],
 )
 def test_hy3_documented_tier_geometry(cache_cap_gib, expected_slots, expected_cache_gib):
     plan = _hy3(cache_cap_gib * GIB)
@@ -154,11 +154,29 @@ def test_glm_documented_tier_geometry(cache_cap_gib, expected_slots, expected_ca
 
 @pytest.mark.parametrize(
     ("cache_cap_bytes", "expected_used_gib"),
-    [(HY3_DEFAULT_CACHE, 66.992), (48 * GIB, 64.649), (32 * GIB, 48.636)],
+    [
+        (HY3_DEFAULT_CACHE, 66.992),
+        (47 * GIB, 63.868),
+        (40 * GIB, 56.838),
+        (32 * GIB, 48.636),
+    ],
 )
 def test_hy3_tier_total_footprint(cache_cap_bytes, expected_used_gib):
     plan = _hy3(cache_cap_bytes)
     assert _used(plan) / GIB == pytest.approx(expected_used_gib, abs=5e-4)
+
+
+def test_documented_hy3_tiers_clear_the_installed_ram_check_on_a_64_gib_mac():
+    """Both published sub-default tiers sit under 64 GiB of installed RAM.
+
+    The 47 GiB row clears it by only 132 MiB, so it is the installed check it
+    passes, not the available-memory gate a real 64 GiB machine applies.
+    """
+
+    for cap_gib, margin_gib in ((47, 0.13), (40, 7.16), (32, 15.36)):
+        used = _used(_hy3(cap_gib * GIB))
+        assert used < 64 * GIB
+        assert (64 * GIB - used) / GIB == pytest.approx(margin_gib, abs=5e-3)
 
 
 @pytest.mark.parametrize(
