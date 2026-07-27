@@ -804,6 +804,16 @@ def _batched_greedy_rows(model, prompts, steps: int):
     return stacked.tolist()
 
 
+def test_rope_offset_preserves_ragged_per_row_positions() -> None:
+    import mlx.core as mx
+
+    from mtplx.models.laguna import _rope_offset
+
+    offsets = mx.array([12, 19], dtype=mx.int32)
+
+    assert _rope_offset(offsets, 2, memo={}) is offsets
+
+
 def test_batched_decode_matches_single_stream_decode() -> None:
     """A batched decode step must not corrupt every row but the first.
 

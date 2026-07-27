@@ -133,6 +133,11 @@ def _rope_offset(offset: int, batch: int, memo: dict | None):
     ragged batch would need, so this is the API's intended shape, not a dodge.
     """
 
+    if isinstance(offset, mx.array) and offset.size != 1:
+        # Batch-aware caches already own the exact logical position of every
+        # row. Forward that vector unchanged; rebuilding it as a scalar fill
+        # severs the cache's per-row position contract.
+        return offset
     if batch <= 1:
         return offset
     if memo is None:
