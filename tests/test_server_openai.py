@@ -617,6 +617,183 @@ def test_ar_batch_admits_generic_openai_clients():
     )
 
 
+def _make_ar_batch_admission_job(
+    request_id: str,
+    traffic_class: str,
+    *,
+    cancelled: bool = False,
+):
+    cancel_event = Event()
+    if cancelled:
+        cancel_event.set()
+    return openai._BatchedARJob(
+        request_id=request_id,
+        prompt_ids=[int(request_id.rsplit("-", 1)[-1])],
+        max_tokens=4,
+        sampler=openai.SamplerConfig(temperature=0.0),
+        seed=0,
+        stop_token_ids=set(),
+        token_callback=None,
+        prefill_callback=None,
+        request_observability={"request_client_hint": traffic_class},
+        mtp_disabled_reason=None,
+        generation_limits={},
+        cancel_event=cancel_event,
+    )
+
+
+def _make_ar_batch_admission_service():
+    service = openai._BatchedARGenerationService(SimpleNamespace())
+    service._prepare_prompt_inputs = lambda _jobs: None
+    service._make_sampler = lambda job: job.request_id
+    return service
+
+
+class _RecordingBatchGenerator:
+    def __init__(self):
+        self.next_uid = 1
+        self.inserted_request_ids = []
+
+    def insert(self, _prompts, **kwargs):
+        request_ids = list(kwargs["samplers"])
+        self.inserted_request_ids.extend(request_ids)
+        uids = list(range(self.next_uid, self.next_uid + len(request_ids)))
+        self.next_uid += len(request_ids)
+        return uids
+
+
+def test_ar_batch_traffic_class_recognizes_only_explicit_cline():
+    assert (
+        openai._ar_batch_traffic_class({"request_client_hint": "cline"}) == "cline"
+    )
+    assert (
+        openai._ar_batch_traffic_class({"request_client_hint": " CLINE "})
+        == "cline"
+    )
+    assert (
+        openai._ar_batch_traffic_class(
+            {"request_client_hint": "opensource-leaderboard"}
+        )
+        == "background"
+    )
+    assert (
+        openai._ar_batch_traffic_class({"request_client_hint": ["cline"]})
+        == "background"
+    )
+    assert openai._ar_batch_traffic_class({}) == "background"
+    assert openai._ar_batch_traffic_class(None) == "background"
+
+    job = _make_ar_batch_admission_job("job-1", "cline")
+    job.request_observability["request_client_hint"] = "background"
+    assert job.traffic_class == "cline"
+
+
+def test_ar_batch_admits_one_job_from_each_class_at_capacity_two():
+    service = _make_ar_batch_admission_service()
+    generator = _RecordingBatchGenerator()
+    background_oldest = _make_ar_batch_admission_job("background-1", "background")
+    background_newer = _make_ar_batch_admission_job("background-2", "background")
+    cline_oldest = _make_ar_batch_admission_job("cline-3", "cline")
+    cline_newer = _make_ar_batch_admission_job("cline-4", "cline")
+    service._pending = [
+        background_oldest,
+        background_newer,
+        cline_oldest,
+        cline_newer,
+    ]
+
+    service._admit_pending(generator, {"max_active_requests": 2})
+
+    assert generator.inserted_request_ids == ["background-1", "cline-3"]
+    assert list(service._active.values()) == [background_oldest, cline_oldest]
+    assert service._pending == [background_newer, cline_newer]
+
+
+def test_ar_batch_does_not_borrow_idle_cline_slot_for_background():
+    service = _make_ar_batch_admission_service()
+    generator = _RecordingBatchGenerator()
+    background_oldest = _make_ar_batch_admission_job("background-1", "background")
+    background_newer = _make_ar_batch_admission_job("background-2", "background")
+    service._pending = [background_oldest, background_newer]
+
+    service._admit_pending(generator, {"max_active_requests": 2})
+
+    assert generator.inserted_request_ids == ["background-1"]
+    assert list(service._active.values()) == [background_oldest]
+    assert service._pending == [background_newer]
+
+
+def test_ar_batch_does_not_borrow_idle_background_slot_for_cline():
+    service = _make_ar_batch_admission_service()
+    generator = _RecordingBatchGenerator()
+    cline_oldest = _make_ar_batch_admission_job("cline-1", "cline")
+    cline_newer = _make_ar_batch_admission_job("cline-2", "cline")
+    service._pending = [cline_oldest, cline_newer]
+
+    service._admit_pending(generator, {"max_active_requests": 2})
+
+    assert generator.inserted_request_ids == ["cline-1"]
+    assert list(service._active.values()) == [cline_oldest]
+    assert service._pending == [cline_newer]
+
+
+def test_ar_batch_cancelled_pending_job_does_not_occupy_class_slot():
+    service = _make_ar_batch_admission_service()
+    generator = _RecordingBatchGenerator()
+    cancelled_background = _make_ar_batch_admission_job(
+        "background-1", "background", cancelled=True
+    )
+    live_background = _make_ar_batch_admission_job("background-2", "background")
+    live_cline = _make_ar_batch_admission_job("cline-3", "cline")
+    service._pending = [cancelled_background, live_background, live_cline]
+
+    service._admit_pending(generator, {"max_active_requests": 2})
+
+    assert generator.inserted_request_ids == ["background-2", "cline-3"]
+    assert list(service._active.values()) == [live_background, live_cline]
+    assert service._pending == []
+    assert isinstance(cancelled_background.future.exception(), openai._StreamCancelled)
+
+
+def test_ar_batch_completion_releases_only_its_class_slot():
+    service = _make_ar_batch_admission_service()
+    generator = _RecordingBatchGenerator()
+    active_background = _make_ar_batch_admission_job("background-1", "background")
+    completed_cline = _make_ar_batch_admission_job("cline-2", "cline")
+    pending_background = _make_ar_batch_admission_job("background-3", "background")
+    pending_cline = _make_ar_batch_admission_job("cline-4", "cline")
+    service._active = {10: active_background, 11: completed_cline}
+    completed_cline.future.set_result({})
+    service._active.pop(11)
+    service._pending = [pending_background, pending_cline]
+
+    service._admit_pending(generator, {"max_active_requests": 2})
+
+    assert generator.inserted_request_ids == ["cline-4"]
+    assert list(service._active.values()) == [active_background, pending_cline]
+    assert service._pending == [pending_background]
+
+
+def test_ar_batch_snapshot_reports_aggregate_and_per_class_counts():
+    service = _make_ar_batch_admission_service()
+    service._pending = [
+        _make_ar_batch_admission_job("background-1", "background"),
+        _make_ar_batch_admission_job("cline-2", "cline"),
+        _make_ar_batch_admission_job("background-3", "background"),
+    ]
+    service._active = {
+        10: _make_ar_batch_admission_job("cline-4", "cline"),
+        11: _make_ar_batch_admission_job("background-5", "background"),
+    }
+
+    snapshot = service.snapshot()
+
+    assert snapshot["pending"] == 3
+    assert snapshot["active"] == 2
+    assert snapshot["pending_by_class"] == {"cline": 1, "background": 2}
+    assert snapshot["active_by_class"] == {"cline": 1, "background": 1}
+
+
 def test_ar_batch_strips_nonmergeable_history_caches():
     service = object.__new__(openai._BatchedARGenerationService)
     cached = SimpleNamespace(

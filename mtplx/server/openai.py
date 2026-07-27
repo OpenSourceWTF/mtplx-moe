@@ -41,7 +41,7 @@ from enum import Enum
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Condition, Event, Lock, Thread, Timer
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Literal, Mapping
 
 import numpy as np
 
@@ -2165,6 +2165,20 @@ def _session_bank_cold_tier_from_args(args: argparse.Namespace) -> Any | None:
     )
 
 
+TrafficClass = Literal["cline", "background"]
+
+
+def _ar_batch_traffic_class(
+    request_observability: Mapping[str, Any] | None,
+) -> TrafficClass:
+    if not isinstance(request_observability, Mapping):
+        return "background"
+    hint = request_observability.get("request_client_hint")
+    if not isinstance(hint, str):
+        return "background"
+    return "cline" if hint.strip().lower() == "cline" else "background"
+
+
 class _BatchedARJob:
     """One OpenAI request admitted into the live AR batch lane."""
 
@@ -2201,6 +2215,7 @@ class _BatchedARJob:
         self.token_callback = token_callback
         self.prefill_callback = prefill_callback
         self.request_observability = dict(request_observability or {})
+        self._traffic_class = _ar_batch_traffic_class(self.request_observability)
         self.mtp_disabled_reason = mtp_disabled_reason
         self.generation_limits = dict(generation_limits)
         self.cancel_event = cancel_event
@@ -2244,6 +2259,10 @@ class _BatchedARJob:
         self.shared_prefix_snapshot_s = 0.0
         self.prompt_prepare_s = 0.0
 
+    @property
+    def traffic_class(self) -> TrafficClass:
+        return self._traffic_class
+
     def cancel_requested(self) -> bool:
         return bool(self.cancel_event is not None and self.cancel_event.is_set())
 
@@ -2284,9 +2303,24 @@ class _BatchedARGenerationService:
 
     def snapshot(self) -> dict[str, Any]:
         with self._condition:
+            pending_by_class = {
+                traffic_class: sum(
+                    job.traffic_class == traffic_class for job in self._pending
+                )
+                for traffic_class in ("cline", "background")
+            }
+            active_by_class = {
+                traffic_class: sum(
+                    job.traffic_class == traffic_class
+                    for job in self._active.values()
+                )
+                for traffic_class in ("cline", "background")
+            }
             return {
                 "pending": len(self._pending),
                 "active": len(self._active),
+                "pending_by_class": pending_by_class,
+                "active_by_class": active_by_class,
                 "pump_scheduled": bool(self._pump_scheduled),
                 "last_batch_size": int(self._last_batch_size),
                 "last_error": self._last_error,
@@ -2650,12 +2684,35 @@ class _BatchedARGenerationService:
     def _admit_pending(self, generator: Any, config_dict: dict[str, Any]) -> None:
         with self._condition:
             max_active = max(1, int(config_dict["max_active_requests"]))
-            capacity = max(0, max_active - len(self._active))
-            if capacity <= 0:
-                pending = []
-            else:
-                pending = self._pending[:capacity]
-                del self._pending[:capacity]
+            active_jobs = [
+                job for job in self._active.values() if not job.future.done()
+            ]
+            capacity = max(0, min(2, max_active) - len(active_jobs))
+            occupied_classes = {job.traffic_class for job in active_jobs}
+            selected_classes: set[TrafficClass] = set()
+            pending: list[_BatchedARJob] = []
+            cancelled: list[_BatchedARJob] = []
+            remaining: list[_BatchedARJob] = []
+            for job in self._pending:
+                if job.cancel_requested():
+                    cancelled.append(job)
+                    continue
+                if job.future.done():
+                    continue
+                if (
+                    len(pending) < capacity
+                    and job.traffic_class not in occupied_classes
+                    and job.traffic_class not in selected_classes
+                ):
+                    pending.append(job)
+                    selected_classes.add(job.traffic_class)
+                    continue
+                remaining.append(job)
+            self._pending = remaining
+            self._condition.notify_all()
+        for job in cancelled:
+            if not job.future.done():
+                job.future.set_exception(self._cancelled_error(job))
         if not pending:
             return
         now = time.perf_counter()
