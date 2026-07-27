@@ -521,6 +521,157 @@ def router_gemv_logits(x: mx.array, gate_weight: mx.array) -> mx.array:
     return logits
 
 
+# The installed M2 path is deliberately a different entrypoint, not a dynamic
+# extension of the M1 kernel.  Its geometry is the construction-time Laguna
+# checkpoint contract: two BF16 hidden rows, 3072 columns, and 256 experts.
+# One threadgroup owns one expert and streams that expert's weight row once,
+# updating both input-row accumulators from each weight read.
+_ROUTER_GEMV_M2_ROWS = 2
+_ROUTER_GEMV_M2_DIMS = 3072
+_ROUTER_GEMV_M2_EXPERTS = 256
+
+
+def _router_gemv_m2_source(*, experts: int, dims: int) -> str:
+    """Return the fixed-M2 Metal source for source-contract tests.
+
+    The arguments make the checkpoint geometry visible to tests, but are not a
+    general source-generation API.  Only the Laguna geometry is accepted, so
+    dimensions never arrive in Metal source from runtime input.
+    """
+
+    if experts != _ROUTER_GEMV_M2_EXPERTS or dims != _ROUTER_GEMV_M2_DIMS:
+        raise ValueError(
+            "Laguna fixed M2 source requires experts=256 and dims=3072"
+        )
+
+    return """
+        uint expert = threadgroup_position_in_grid.x;
+        uint lid = thread_position_in_threadgroup.x;
+        uint part = lid / uint(SIMD);
+        uint lane = lid - part * uint(SIMD);
+
+        threadgroup float partials_row0[SPLIT];
+        threadgroup float partials_row1[SPLIT];
+
+        uint kbeg = part * uint(PER_PART) + lane;
+        uint kend = metal::min((part + 1u) * uint(PER_PART), uint(BLOCKS));
+        float acc_row0 = 0.0f;
+        float acc_row1 = 0.0f;
+        for (uint b = kbeg; b < kend; b += uint(SIMD)) {
+            // Keep the M1 lane arithmetic: four ascending K terms per block.
+            // The physical M2 gain is that each BF16 weight load feeds both
+            // row accumulators before the traversal advances.
+            for (uint j = 0; j < 4u; ++j) {
+                uint k = b * 4u + j;
+                T w = gate_weight[
+                    (size_t)expert * (size_t)DIMS + (size_t)k
+                ];
+                acc_row0 += static_cast<float>(w) *
+                            static_cast<float>(x[k]);
+                acc_row1 += static_cast<float>(w) *
+                            static_cast<float>(x[DIMS + k]);
+            }
+        }
+
+        acc_row0 = simd_sum(acc_row0);
+        acc_row1 = simd_sum(acc_row1);
+        if (lane == 0) {
+            partials_row0[part] = acc_row0;
+            partials_row1[part] = acc_row1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (lid == 0) {
+            float total_row0 = 0.0f;
+            float total_row1 = 0.0f;
+            // The same owner combines both rows in M1's ascending slice order.
+            for (uint p = 0; p < uint(SPLIT); ++p) {
+                total_row0 += partials_row0[p];
+                total_row1 += partials_row1[p];
+            }
+            // Match M1's precision boundary: BF16 first, then widened FP32.
+            logits[expert] =
+                static_cast<float>(static_cast<T>(total_row0));
+            logits[NUM_EXPERTS + expert] =
+                static_cast<float>(static_cast<T>(total_row1));
+        }
+    """
+
+
+@lru_cache(maxsize=1)
+def _router_gemv_logits_m2_kernel():
+    header = f"""
+        using namespace metal;
+        constant constexpr int NUM_EXPERTS = {_ROUTER_GEMV_M2_EXPERTS};
+        constant constexpr int DIMS = {_ROUTER_GEMV_M2_DIMS};
+        constant constexpr int SIMD = {_ROUTER_GEMV_SIMD};
+        constant constexpr int SPLIT = {_ROUTER_GEMV_SPLIT};
+        constant constexpr int BLOCKS = DIMS / 4;
+        constant constexpr int PER_PART = (BLOCKS + SPLIT - 1) / SPLIT;
+    """
+    return mx.fast.metal_kernel(
+        name="mtplx_laguna_router_gemv_logits_m2_e256_d3072",
+        input_names=["x", "gate_weight"],
+        output_names=["logits"],
+        header=header,
+        source=_router_gemv_m2_source(
+            experts=_ROUTER_GEMV_M2_EXPERTS,
+            dims=_ROUTER_GEMV_M2_DIMS,
+        ),
+    )
+
+
+def _router_gemv_logits_m2_direct(
+    x: mx.array,
+    gate_weight: mx.array,
+) -> mx.array:
+    """Launch the already-validated fixed-M2 kernel without routing checks."""
+
+    kernel = _router_gemv_logits_m2_kernel()
+    (logits,) = kernel(
+        inputs=[x, gate_weight],
+        template=[("T", mx.bfloat16)],
+        grid=(
+            _ROUTER_GEMV_THREADS * _ROUTER_GEMV_M2_EXPERTS,
+            1,
+            1,
+        ),
+        threadgroup=(_ROUTER_GEMV_THREADS, 1, 1),
+        output_shapes=[(_ROUTER_GEMV_M2_ROWS, _ROUTER_GEMV_M2_EXPERTS)],
+        output_dtypes=[mx.float32],
+    )
+    return logits
+
+
+def router_gemv_logits_m2(
+    x: mx.array,
+    gate_weight: mx.array,
+) -> mx.array:
+    """Fixed [2, 3072] x [256, 3072] BF16 Laguna router projection.
+
+    This public construction/testing boundary checks the fixed checkpoint
+    contract before dispatch.  Installed decode code binds the private direct
+    launcher after proving the same invariants once, so its hot path has no
+    eligibility decision and no fallback.
+    """
+
+    if (
+        x.ndim != 2
+        or tuple(int(dim) for dim in x.shape)
+        != (_ROUTER_GEMV_M2_ROWS, _ROUTER_GEMV_M2_DIMS)
+        or x.dtype != mx.bfloat16
+        or gate_weight.ndim != 2
+        or tuple(int(dim) for dim in gate_weight.shape)
+        != (_ROUTER_GEMV_M2_EXPERTS, _ROUTER_GEMV_M2_DIMS)
+        or gate_weight.dtype != mx.bfloat16
+    ):
+        raise ValueError(
+            "Laguna fixed M2 router projection requires BF16 x [2, 3072] "
+            "and gate_weight [256, 3072]"
+        )
+    return _router_gemv_logits_m2_direct(x, gate_weight)
+
+
 def fused_router_gemv_topk(
     x: mx.array,
     gate_weight: mx.array,

@@ -577,6 +577,72 @@ def test_router_gemv_logits_k_partition_covers_every_admissible_width():
         assert sorted(covered) == list(range(blocks)), dims
 
 
+def test_router_gemv_m2_source_owns_one_expert_and_two_rows():
+    """One expert owner must reuse each weight read across both fixed rows."""
+
+    from mtplx.kernels import laguna_decode as kernels
+
+    source = kernels._router_gemv_m2_source(experts=256, dims=3072)
+
+    assert "uint expert = threadgroup_position_in_grid.x;" in source
+    assert "uint row" not in source
+    assert "float acc_row0" in source
+    assert "float acc_row1" in source
+    assert source.count("T w = gate_weight[") == 1
+    assert "acc_row0 += static_cast<float>(w) *" in source
+    assert "static_cast<float>(x[k])" in source
+    assert "acc_row1 += static_cast<float>(w) *" in source
+    assert "static_cast<float>(x[DIMS + k])" in source
+    assert "for (uint p = 0; p < uint(SPLIT); ++p)" in source
+    assert "static_cast<float>(static_cast<T>(total_row0))" in source
+    assert "static_cast<float>(static_cast<T>(total_row1))" in source
+
+
+def test_router_gemv_m2_shape_contract_precedes_direct_dispatch(monkeypatch):
+    """The checked host entrypoint accepts only the fixed BF16 Laguna geometry."""
+
+    from mtplx.kernels import laguna_decode as kernels
+
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        x = mx.zeros((2, 3072), dtype=mx.bfloat16)
+        weight = mx.zeros((256, 3072), dtype=mx.bfloat16)
+        sentinel = mx.zeros((2, 256), dtype=mx.float32)
+        calls = []
+
+        def fake_direct(got_x, got_weight):
+            calls.append((got_x, got_weight))
+            return sentinel
+
+        monkeypatch.setattr(kernels, "_router_gemv_logits_m2_direct", fake_direct)
+
+        assert kernels.router_gemv_logits_m2(x, weight) is sentinel
+        assert calls == [(x, weight)]
+
+        bad_inputs = {
+            "one input row": (mx.zeros((1, 3072), dtype=mx.bfloat16), weight),
+            "three input rows": (mx.zeros((3, 3072), dtype=mx.bfloat16), weight),
+            "input width": (mx.zeros((2, 3068), dtype=mx.bfloat16), weight),
+            "expert count": (
+                x,
+                mx.zeros((255, 3072), dtype=mx.bfloat16),
+            ),
+            "weight width": (
+                x,
+                mx.zeros((256, 3068), dtype=mx.bfloat16),
+            ),
+            "input dtype": (x.astype(mx.float32), weight),
+            "weight dtype": (x, weight.astype(mx.float32)),
+        }
+        for label, arguments in bad_inputs.items():
+            with pytest.raises(ValueError, match="fixed M2"):
+                kernels.router_gemv_logits_m2(*arguments)
+            assert len(calls) == 1, label
+    finally:
+        mx.set_default_device(previous)
+
+
 def test_router_gemv_fallback_matches_the_two_step_stock_chain():
     """The CPU fallback inside fused_router_gemv_topk IS the stock arithmetic."""
 
