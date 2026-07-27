@@ -187,6 +187,53 @@
     "all_tokens_identical": true,
     "decision": "reject_no_acceptance_gain"
   },
+  "confidence_screen": {
+    "metric_collection_timing_eligible": false,
+    "standard_prompt": {
+      "prompt_sha256": "77586ec5611f280487a4050866c3be272e4f1eade7febae65b83b9a15fee43f3",
+      "accepted_drafts": 52,
+      "rejected_drafts": 2,
+      "accepted_entropy_max": 1.3672424860650816,
+      "rejected_entropy_min": 1.4809049482880736,
+      "entropy_threshold_1_4": {
+        "accepted_false_stops": 0,
+        "rejections_caught": 2,
+        "rejections_missed": 0
+      }
+    },
+    "alternate_python_jsonl_prompt": {
+      "prompt_sha256": "c4ec5b8a47ecd3915556f4cede85797f5736e45c977ff2daaa3b2d2285c6a0cc",
+      "accepted_drafts": 34,
+      "rejected_drafts": 29,
+      "accepted_entropy_max": 1.8654693276480723,
+      "rejected_entropy_min": 0.7011554483344347,
+      "entropy_threshold_1_4": {
+        "accepted_false_stops": 6,
+        "rejections_caught": 16,
+        "rejections_missed": 13
+      }
+    },
+    "decision": "reject_confidence_distributions_overlap_across_prompts"
+  },
+  "terminal_primary_final_state_regression": {
+    "prompt_sha256": "c4ec5b8a47ecd3915556f4cede85797f5736e45c977ff2daaa3b2d2285c6a0cc",
+    "token_sha256": "8a181747cd1dbc5c76ed22009236b6f29b824031fd0348b57bb6faa62d20175b",
+    "before": {
+      "passed": false,
+      "target_offset": 1087,
+      "mtp_offset": 1086,
+      "reported_safe_to_commit": true
+    },
+    "after": {
+      "passed": true,
+      "target_offset": 1088,
+      "mtp_offset": 1087,
+      "reported_safe_to_commit": true,
+      "terminal_commit_time_s": 0.18506433299626224
+    },
+    "tokens_identical": true,
+    "root_cause": "fresh terminal primary emitted without target or MTP cache commit"
+  },
   "source_receipts": [
     {
       "path": "depth4-control-k5-abba-r1.json",
@@ -227,6 +274,18 @@
     {
       "path": "depth5-bf16-mtp-accuracy-64t.json",
       "sha256": "bfb34703f659940e72bc16582f80de5c80cbf1176b0fbaff3317b0db2818b67b"
+    },
+    {
+      "path": "depth5-q4-confidence-discovery-64t.json",
+      "sha256": "8d4c9ea9d712174e52907c26398923976a5437526d8eb964d157d5425592dc0a"
+    },
+    {
+      "path": "depth5-q4-confidence-python-jsonl-64t.json",
+      "sha256": "6d4b1beabebee34080145b1bede968af67939e87366c2385d9db21683764ed5d"
+    },
+    {
+      "path": "depth5-q4-confidence-python-jsonl-64t-fixed.json",
+      "sha256": "7c6288a6ea9e0da45d676daadbec03c5647bdbfdd409ba5e50483673ac56cccf"
     }
   ]
 }

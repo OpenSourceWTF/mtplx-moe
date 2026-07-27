@@ -95,6 +95,28 @@ artifact forces the target cache from 109 to 88 slots/layer under the same
 96 GiB cap, compared with the 6,014,594,720-byte Q4 artifact. Reject BF16 for
 this lane.
 
+Pre-verification confidence also fails the cross-prompt gate. On the original
+prompt, top-8 entropy appeared to separate the two rejected drafts cleanly:
+accepted drafts had entropy at most 1.367242 while rejected drafts were at
+least 1.480905. A 1.4 threshold would have caught both without a false stop.
+That separation disappears on an alternate Python JSONL task. K5 accepts only
+34 drafts and rejects 29; accepted entropy reaches 1.865469 while rejected
+entropy falls to 0.701155. The same 1.4 threshold falsely stops six accepted
+drafts, catches 16 rejections, and misses 13. Reject per-draft confidence
+gating rather than adding its top-k/host-synchronization cost to the hot path.
+
+The alternate prompt also exposed a final-state correctness bug at the
+performance boundary. When `max_tokens` was reached by a freshly sampled
+primary, `generate_mtpk` emitted the token and exited before forwarding it
+into the target and committed-MTP caches. The final state then reported
+`safe_to_commit=true` with both offsets one token short. The terminal branch
+now marks that fresh primary pending and reuses the existing final commit path.
+The real GLM rerun preserves the exact 64-token SHA-256 while correcting target
+offset 1,087 to 1,088 and MTP offset 1,086 to 1,087. The missing terminal
+commit measured 0.185064 seconds on this rejection-heavy row, so the old
+3.973250 token/s diagnostic was also slightly overstated; the corrected row is
+3.934064 token/s.
+
 Compact machine-readable proof:
 
 - `profiler/glm52-other-candidates-20260726/depth5-rejection-screen-summary.json`
@@ -226,10 +248,10 @@ Cheap GLM history predictors failed the offline gate:
 
 The ranked follow-ups are therefore:
 
-1. qualify K2-for-three-cycles then K5 across multiple prompts and 256-1,024
-   output tokens, comparing against unchanged fixed K5;
-2. capture pre-verification draft confidence and reject it unless the wrong
-   drafts are separable without false stops on accepted drafts;
+1. replace the fixed cold-prefix threshold with a rejection-history controller
+   and qualify it across prompts with both high and collapsed K5 acceptance;
+2. qualify 256-1,024 output lengths against unchanged fixed K5 after every
+   terminal final-state gate passes;
 3. screen a raw-t158 gate/up/SwiGLU kernel on the exact observed shapes before
    considering full-model integration.
 

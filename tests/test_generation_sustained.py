@@ -185,6 +185,28 @@ class RejectingTinyMTPModel(AcceptingTinyMTPModel):
         )
 
 
+class CommittedHistoryRejectingTinyMTPModel(RejectingTinyMTPModel):
+    def __init__(self):
+        super().__init__()
+        self.mtp_cache = [OffsetCache()]
+
+    def make_mtp_cache(self):
+        return self.mtp_cache
+
+    def mtp_update_cache(
+        self,
+        hidden_states,
+        next_token_ids,
+        *,
+        mtp_cache=None,
+        **_kwargs,
+    ):
+        if mtp_cache:
+            for entry in mtp_cache:
+                entry.offset += int(next_token_ids.shape[1])
+        return hidden_states
+
+
 def _runtime(model: TinyModel, *, mtp_enabled: bool = True) -> MTPLXRuntime:
     return MTPLXRuntime(
         model=model,
@@ -662,6 +684,39 @@ def test_generate_ar_does_not_request_hidden_by_default(monkeypatch):
     )
     assert out.stats.end_to_end_tok_s <= out.stats.decode_tok_s
     assert all(call["return_hidden"] is False for call in model.calls)
+
+
+@pytest.mark.parametrize(
+    ("max_tokens", "stop_token_ids", "finish_reason"),
+    [
+        pytest.param(1, set(), "length", id="length"),
+        pytest.param(5, {1}, "stop", id="stop"),
+    ],
+)
+def test_mtpk_final_state_commits_fresh_terminal_primary(
+    max_tokens: int,
+    stop_token_ids: set[int],
+    finish_reason: str,
+) -> None:
+    model = CommittedHistoryRejectingTinyMTPModel()
+
+    out = generate_mtpk(
+        _runtime(model, mtp_enabled=True),
+        [0],
+        max_tokens=max_tokens,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        speculative_depth=5,
+        stop_token_ids=stop_token_ids,
+        mtp_history_policy="committed",
+        capture_final_state=True,
+    )
+
+    assert out.tokens == [1]
+    assert out.final_state is not None
+    assert out.final_state.safe_to_commit is True
+    assert out.final_state.finish_reason == finish_reason
+    assert out.final_state.final_trunk_cache[0].offset == 2
+    assert out.final_state.final_committed_mtp_cache[0].offset == 1
 
 
 def test_default_qwen27b_ar_decode_trace_does_not_crash(tmp_path, monkeypatch):
