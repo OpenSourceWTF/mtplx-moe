@@ -1,0 +1,104 @@
+{
+  "schema": "glm52-natural-k5-acceptance-v1",
+  "captured_at_utc": "2026-07-27T14:38:58Z",
+  "configuration": {
+    "model": "glm52-q1t",
+    "mtp_precision": "q4",
+    "speculative_depth": 5,
+    "verify_strategy": "capture_commit",
+    "prompt_tokens": 130,
+    "prompt_sha256": "a3ed3adceb4d265642d5422032a5d92ff5d176bdceb009e520d94203dfd08a75",
+    "max_tokens": 1024,
+    "natural_stop_tokens": true,
+    "repetition_stop": false,
+    "context_copy": false,
+    "memory_limit": "96GiB",
+    "runtime_reserve": "12GiB",
+    "expert_cache_limit": "72GiB",
+    "cache_policy": "frequency",
+    "cache_scope": "layer",
+    "slot_layout": "component-banks",
+    "transient_slots": 48
+  },
+  "timing": {
+    "eligible": false,
+    "reason": "Host CPU/GPU contention was present before the guarded run.",
+    "decode_tok_s_diagnostic_only": 4.04433806702818,
+    "verify_time_s_diagnostic_only": 245.67531709073228
+  },
+  "output": {
+    "generated_tokens": 1024,
+    "finish_reason": "length",
+    "sha256": "5fb5e598a12bc4cca3712f1db7791113d76e237f8efa143fa357d7b4d90f1660"
+  },
+  "acceptance": {
+    "verify_calls": 405,
+    "drafted_tokens": 2025,
+    "evaluated_drafts": 999,
+    "accepted_drafts": 618,
+    "rejected_drafts": 381,
+    "accepted_per_verify": 1.525925925925926,
+    "outputs_per_verify": 2.528395061728395,
+    "cumulative_accepted_over_evaluated": 0.6186186186186187,
+    "accepted_by_depth": [
+      279,
+      180,
+      90,
+      45,
+      24
+    ],
+    "evaluated_by_depth": [
+      405,
+      279,
+      180,
+      90,
+      45
+    ],
+    "drafted_by_depth": [
+      405,
+      405,
+      405,
+      405,
+      405
+    ],
+    "conditional_acceptance_by_depth": [
+      0.6888888888888889,
+      0.6451612903225806,
+      0.5,
+      0.5,
+      0.5333333333333333
+    ]
+  },
+  "expert_decode": {
+    "bytes_read": 1951285248000,
+    "evictions": 27827,
+    "expert_hits": 1192465,
+    "expert_misses": 266135,
+    "expert_requests": 1458600,
+    "hit_rate": 0.8175407925407926,
+    "persistent_loads": 27827,
+    "prefetch_committed": 0,
+    "prefetch_issued": 0,
+    "route_calls": 30450,
+    "shared_expert_assignments": 495732,
+    "transient_loads": 192723,
+    "unique_expert_requests": 962868
+  },
+  "final_state": {
+    "safe_to_commit": true,
+    "generated_tokens_match": true,
+    "finish_reason_matches": true,
+    "target_cache_count": 78,
+    "target_cache_offset": 1154,
+    "target_cache_offsets_exact": true,
+    "committed_mtp_cache_count": 1,
+    "committed_mtp_cache_offset": 1153,
+    "committed_mtp_cache_offsets_exact": true
+  },
+  "decision": {
+    "fixed_k5_durable": false,
+    "cold_prefix_k2_then_k5_durable": false,
+    "test_k6_or_k7": false,
+    "reason": "K5 accepted only 1.526 drafts per verify over the long naturalistic response. The K2-for-three-cycles schedule changes only 0.741 percent of this run's 405 verification cycles, while depth-5 conditional acceptance was only 53.3 percent."
+  }
+}

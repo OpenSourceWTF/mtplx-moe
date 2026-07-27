@@ -1,0 +1,32 @@
+{
+  "schema": "glm52-t158-installed-path-ab-v1",
+  "measured_at_utc": "2026-07-27T02:55:55Z",
+  "source_head": "ff9d1683532adab7e13a8a89e3250ae3ecbf5450",
+  "source_branch": "experiment/moe-glm52-k3-t158-owner-fusion",
+  "source_state": "working tree with GLM-specific construction-time dispatch",
+  "mlx_core_file": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/moe-glm52-k3-t158-owner-fusion/.venv/lib/python3.12/site-packages/mlx/core.cpython-312-darwin.so",
+  "exclusive_window": {
+    "lock_path": "/tmp/mtplx-gpu-exclusive.lock",
+    "qwen_stopped": true,
+    "qwen_restored": true,
+    "restored_model": "mtplx-qwen36-27b-optimized-speed"
+  },
+  "route": {
+    "rows": 28,
+    "unique_slots": 17
+  },
+  "warmups": 20,
+  "repeats_per_arm": 400,
+  "interleaved": true,
+  "parity": "bit-exact",
+  "arms": {
+    "unchanged_default_128_128_128": {
+      "median_ms": 1.1405625
+    },
+    "glm_q1t_32_32_64": {
+      "median_ms": 1.133208
+    }
+  },
+  "candidate_over_default": 0.9935518658556634,
+  "speedup": 1.0064899824215854
+}

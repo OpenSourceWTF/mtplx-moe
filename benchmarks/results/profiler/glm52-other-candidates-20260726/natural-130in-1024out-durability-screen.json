@@ -1,0 +1,164 @@
+{
+  "schema": "mtplx-glm52-natural-durability-screen-v1",
+  "captured_at_utc": "2026-07-27",
+  "configuration": {
+    "model": "glm52-q1t",
+    "prompt_tokens": 130,
+    "prompt_sha256": "a3ed3adceb4d265642d5422032a5d92ff5d176bdceb009e520d94203dfd08a75",
+    "max_output_tokens": 1024,
+    "output_sha256": "5fb5e598a12bc4cca3712f1db7791113d76e237f8efa143fa357d7b4d90f1660",
+    "mtp_history_policy": "committed",
+    "verify_strategy": "capture_commit",
+    "memory_limit": "96GiB",
+    "runtime_reserve": "12GiB",
+    "expert_cache_limit": "72GiB",
+    "cache_policy": "frequency",
+    "cache_scope": "layer",
+    "slot_layout": "component-banks",
+    "transient_slots": 48,
+    "timing_eligible": false,
+    "timing_ineligibility_reason": "Host CPU/GPU contention was present before the guarded runs."
+  },
+  "observations": {
+    "q4_fixed_k1_after_cycle_fix": {
+      "generated_tokens": 1024,
+      "finish_reason": "length",
+      "verify_calls": 595,
+      "drafted_tokens": 595,
+      "evaluated_drafts": 595,
+      "accepted_drafts": 428,
+      "rejected_drafts": 167,
+      "accepted_by_depth": [
+        428
+      ],
+      "diagnostic_decode_tokens_per_second": 5.8290865,
+      "diagnostic_verify_seconds": 172.592,
+      "diagnostic_draft_seconds": 2.5594,
+      "expert_bytes_read": 1107388661760,
+      "expert_hit_rate": 0.812011,
+      "expert_evictions": 29486,
+      "target_cache_offset": 1154,
+      "committed_mtp_cache_offset": 1153,
+      "exact_final_state": true
+    },
+    "q4_fixed_k2": {
+      "generated_tokens": 1024,
+      "finish_reason": "length",
+      "verify_calls": 463,
+      "drafted_tokens": 926,
+      "evaluated_drafts": 799,
+      "accepted_drafts": 560,
+      "rejected_drafts": 239,
+      "accepted_by_depth": [
+        336,
+        224
+      ],
+      "diagnostic_decode_tokens_per_second": 5.779109,
+      "diagnostic_verify_seconds": 172.747,
+      "diagnostic_draft_seconds": 3.93,
+      "expert_bytes_read_decimal_tb_rounded_6dp": 1.248212,
+      "expert_hit_rate": 0.81031,
+      "expert_evictions": 27645,
+      "target_cache_offset": 1154,
+      "committed_mtp_cache_offset": 1153,
+      "exact_final_state": true
+    },
+    "q4_adaptive_k1_k2": {
+      "policy": {
+        "min_depth": 1,
+        "max_depth": 2,
+        "start_depth": 1,
+        "increase_after": 2,
+        "decrease_after": 1
+      },
+      "generated_tokens": 1024,
+      "finish_reason": "length",
+      "verify_calls": 517,
+      "drafted_tokens": 792,
+      "evaluated_drafts": 724,
+      "accepted_drafts": 506,
+      "rejected_drafts": 218,
+      "accepted_by_depth": [
+        375,
+        131
+      ],
+      "diagnostic_decode_tokens_per_second": 5.79956,
+      "diagnostic_verify_seconds": 172.678,
+      "diagnostic_draft_seconds": 3.374,
+      "expert_bytes_read_decimal_tb_rounded_6dp": 1.182104,
+      "expert_hit_rate": 0.812447,
+      "expert_evictions": 28207,
+      "target_cache_offset": 1154,
+      "committed_mtp_cache_offset": 1153,
+      "exact_final_state": true
+    },
+    "q4_fixed_k5": {
+      "receipt": "natural-k5-130in-1024out-acceptance-only.json",
+      "generated_tokens": 1024,
+      "finish_reason": "length",
+      "verify_calls": 405,
+      "drafted_tokens": 2025,
+      "evaluated_drafts": 999,
+      "accepted_drafts": 618,
+      "rejected_drafts": 381,
+      "accepted_by_depth": [
+        279,
+        180,
+        90,
+        45,
+        24
+      ],
+      "diagnostic_decode_tokens_per_second": 4.04433806702818,
+      "diagnostic_verify_seconds": 245.67531709073228,
+      "expert_bytes_read": 1951285248000,
+      "expert_hit_rate": 0.8175407925407926,
+      "expert_evictions": 27827,
+      "target_cache_offset": 1154,
+      "committed_mtp_cache_offset": 1153,
+      "exact_final_state": true
+    },
+    "q4_fixed_k1_with_prompt_context_copy": {
+      "generated_tokens": 1024,
+      "finish_reason": "length",
+      "verify_calls": 596,
+      "context_copy_active": true,
+      "context_copy_probes": 596,
+      "context_copy_drafted_tokens": 8,
+      "context_copy_accepted_blocks": 0,
+      "context_copy_accepted_tokens": 0,
+      "diagnostic_decode_tokens_per_second": 5.8445,
+      "diagnostic_verify_seconds": 172.143,
+      "expert_bytes_read_decimal_tb_rounded_6dp": 1.115157,
+      "expert_hit_rate": 0.81194,
+      "target_cache_offset": 1154,
+      "committed_mtp_cache_offset": 1153,
+      "exact_final_state": true
+    },
+    "bf16_fixed_k2": {
+      "generated_tokens": 1024,
+      "finish_reason": "length",
+      "verify_calls": 461,
+      "accepted_drafts": 562,
+      "accepted_by_depth": [
+        339,
+        223
+      ],
+      "diagnostic_decode_tokens_per_second": 4.8295,
+      "diagnostic_verify_seconds": 206.351,
+      "expert_bytes_read_decimal_tb_rounded_6dp": 1.669054,
+      "expert_hit_rate": 0.74251,
+      "mtp_artifact_bytes": 19905942064,
+      "target_cache_offset": 1154,
+      "committed_mtp_cache_offset": 1153,
+      "exact_final_state": true
+    }
+  },
+  "decision": {
+    "durable_speculative_speedup_found": false,
+    "fixed_k5": "reject",
+    "adaptive_k1_k2": "reject",
+    "prompt_context_copy": "reject",
+    "bf16_mtp": "reject",
+    "reason": "K1, K2, and adaptive K1/K2 all remained near 5.8 diagnostic token/s. K5 reduced verify-call count but increased verifier rows and expert traffic enough to regress. Prompt copying accepted no blocks, and BF16 changed only two accepted drafts while increasing expert reads and reducing target cache capacity."
+  }
+}

@@ -1497,6 +1497,64 @@ def _shadow_gather_component_bank(
     return projection(swiglu(gate, up), "down_proj")
 
 
+def _glm52_q1t_t158_component_bank(
+    x: mx.array,
+    bank: MlxComponentBank,
+    slot_rows: mx.array,
+) -> mx.array:
+    """Run the measured GLM-5.2 q1t projection launch geometry.
+
+    The generic t158 defaults were measured on Hy3's 4096x1536 experts.
+    GLM-5.2 uses 6144x2048 experts, where the exact-route sweep measured
+    32 threads for gate/up and 64 for down. Keep this model-specific entrypoint
+    branch-free after construction; other t158 models retain their defaults.
+    """
+
+    from mtplx.kernels.shadow_gather import shadow_gather_mm
+
+    gate = shadow_gather_mm(
+        x,
+        slot_rows,
+        bank.arrays["gate_proj.packed"],
+        bank.arrays["gate_proj.scales"],
+        codec="t158",
+        threads_per_tg=32,
+        stage=False,
+    )
+    up = shadow_gather_mm(
+        x,
+        slot_rows,
+        bank.arrays["up_proj.packed"],
+        bank.arrays["up_proj.scales"],
+        codec="t158",
+        threads_per_tg=32,
+        stage=False,
+    )
+    return shadow_gather_mm(
+        swiglu(gate, up),
+        slot_rows,
+        bank.arrays["down_proj.packed"],
+        bank.arrays["down_proj.scales"],
+        codec="t158",
+        threads_per_tg=64,
+        stage=False,
+    )
+
+
+def _run_glm52_q1t_t158_component_bank(
+    x: mx.array,
+    bindings: tuple[ExpertSlotBinding, ...],
+) -> mx.array:
+    """Execute one installed GLM-5.2 q1t component-bank wave."""
+
+    bank = bindings[0].buffer.bank
+    slot_rows = mx.array(
+        [int(binding.buffer.bank_index) for binding in bindings],
+        dtype=mx.int32,
+    )
+    return _glm52_q1t_t158_component_bank(x, bank, slot_rows)
+
+
 def _run_component_bank_mixed(
     x: mx.array,
     bindings: tuple[ExpertSlotBinding, ...],
@@ -1734,29 +1792,58 @@ class HotExpertSwitchGLU(nn.Module):
         self._shadow_bank = (
             shadow_lookup(self.layer_index) if callable(shadow_lookup) else None
         )
+        # Codec/model identity is immutable for the installed switch. Resolve
+        # it once here so the measured route has no eligibility or fallback
+        # branch in the per-wave execution path.
+        if self.codec == "affine":
+            self._dispatch_component_bank = self._dispatch_affine_component_bank
+        elif self.codec == MIXED_OFFICIAL_CODEC:
+            self._dispatch_component_bank = self._dispatch_mixed_component_bank
+        elif (
+            self.codec == "t158"
+            and getattr(runtime.spec, "key", None) == "glm52-expert-q1t"
+        ):
+            self._dispatch_component_bank = self._dispatch_glm52_q1t_component_bank
+        else:
+            self._dispatch_component_bank = self._dispatch_shadow_component_bank
 
-    def _dispatch_component_bank(
+    def _dispatch_affine_component_bank(
         self,
         selected: mx.array,
         bindings: tuple[ExpertSlotBinding, ...],
     ) -> mx.array:
-        """Execute one component-bank wave under this layer's record codec."""
+        return _run_component_bank_q4(
+            selected,
+            bindings,
+            group_size=self.group_size,
+            bits=self.bits,
+        )
 
-        if self.codec == "affine":
-            return _run_component_bank_q4(
-                selected,
-                bindings,
-                group_size=self.group_size,
-                bits=self.bits,
-            )
-        if self.codec == MIXED_OFFICIAL_CODEC:
-            assert self._gate_up_tier is not None
-            return _run_component_bank_mixed(
-                selected,
-                bindings,
-                gate_up_tier=self._gate_up_tier,
-                group_size=self.group_size,
-            )
+    def _dispatch_mixed_component_bank(
+        self,
+        selected: mx.array,
+        bindings: tuple[ExpertSlotBinding, ...],
+    ) -> mx.array:
+        assert self._gate_up_tier is not None
+        return _run_component_bank_mixed(
+            selected,
+            bindings,
+            gate_up_tier=self._gate_up_tier,
+            group_size=self.group_size,
+        )
+
+    def _dispatch_glm52_q1t_component_bank(
+        self,
+        selected: mx.array,
+        bindings: tuple[ExpertSlotBinding, ...],
+    ) -> mx.array:
+        return _run_glm52_q1t_t158_component_bank(selected, bindings)
+
+    def _dispatch_shadow_component_bank(
+        self,
+        selected: mx.array,
+        bindings: tuple[ExpertSlotBinding, ...],
+    ) -> mx.array:
         return _run_component_bank_shadow(selected, bindings, codec=self.codec)
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:

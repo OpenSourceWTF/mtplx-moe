@@ -1,0 +1,254 @@
+{
+  "dispatch_census": null,
+  "independently_best_projection_mix": {
+    "best_ms": 1.529562,
+    "best_over_default": 0.9835361626990302,
+    "default_ms": 1.555166,
+    "speedup": 1.0167394325957366
+  },
+  "mlx_core_file": "/Users/davidtai/projects/OpenSourceWTF/mlx-profiler/python/mlx/core.cpython-312-darwin.so",
+  "mlx_version": "0.32.1.dev20260723+56b7a3ea",
+  "projections": {
+    "down": {
+      "best": {
+        "max_ms": 0.6405,
+        "mean_ms": 0.49985198999999997,
+        "median_ms": 0.496021,
+        "min_ms": 0.42625,
+        "over_default": 0.9975284062342885,
+        "stage": false,
+        "threads": 64
+      },
+      "default": {
+        "max_ms": 0.634084,
+        "mean_ms": 0.5005484675,
+        "median_ms": 0.49725,
+        "min_ms": 0.429042,
+        "over_default": 1.0,
+        "stage": false,
+        "threads": 128
+      },
+      "in_dim": 2048,
+      "out_dim": 6144,
+      "parity": true,
+      "ranked": [
+        {
+          "max_ms": 0.6405,
+          "mean_ms": 0.49985198999999997,
+          "median_ms": 0.496021,
+          "min_ms": 0.42625,
+          "over_default": 0.9975284062342885,
+          "stage": false,
+          "threads": 64
+        },
+        {
+          "max_ms": 0.634084,
+          "mean_ms": 0.5005484675,
+          "median_ms": 0.49725,
+          "min_ms": 0.429042,
+          "over_default": 1.0,
+          "stage": false,
+          "threads": 128
+        },
+        {
+          "max_ms": 0.615292,
+          "mean_ms": 0.5022642525,
+          "median_ms": 0.4985835,
+          "min_ms": 0.439375,
+          "over_default": 1.002681749622926,
+          "stage": false,
+          "threads": 256
+        },
+        {
+          "max_ms": 0.62525,
+          "mean_ms": 0.50004143,
+          "median_ms": 0.4989785,
+          "min_ms": 0.4295,
+          "over_default": 1.0034761186525891,
+          "stage": false,
+          "threads": 32
+        },
+        {
+          "max_ms": 0.685792,
+          "mean_ms": 0.520958735,
+          "median_ms": 0.515646,
+          "min_ms": 0.4535,
+          "over_default": 1.0369954751131223,
+          "stage": false,
+          "threads": 512
+        },
+        {
+          "max_ms": 0.699959,
+          "mean_ms": 0.5353323950000001,
+          "median_ms": 0.532292,
+          "min_ms": 0.4665,
+          "over_default": 1.0704715937657114,
+          "stage": true,
+          "threads": 256
+        },
+        {
+          "max_ms": 0.661083,
+          "mean_ms": 0.5400213625000001,
+          "median_ms": 0.535459,
+          "min_ms": 0.459375,
+          "over_default": 1.0768406234288588,
+          "stage": true,
+          "threads": 64
+        },
+        {
+          "max_ms": 0.705375,
+          "mean_ms": 0.5416095775,
+          "median_ms": 0.536125,
+          "min_ms": 0.485584,
+          "over_default": 1.0781799899446958,
+          "stage": true,
+          "threads": 512
+        },
+        {
+          "max_ms": 0.714125,
+          "mean_ms": 0.5431777175,
+          "median_ms": 0.5394165,
+          "min_ms": 0.469666,
+          "over_default": 1.0847993966817495,
+          "stage": true,
+          "threads": 128
+        },
+        {
+          "max_ms": 0.698917,
+          "mean_ms": 0.5592896925,
+          "median_ms": 0.557104,
+          "min_ms": 0.478125,
+          "over_default": 1.1203700351935646,
+          "stage": true,
+          "threads": 32
+        }
+      ],
+      "repeats": 400,
+      "rows": 28,
+      "warmups": 20
+    },
+    "gate_up": {
+      "best": {
+        "max_ms": 0.682375,
+        "mean_ms": 0.5190656375,
+        "median_ms": 0.5167705,
+        "min_ms": 0.436667,
+        "over_default": 0.9769594183281092,
+        "stage": false,
+        "threads": 32
+      },
+      "default": {
+        "max_ms": 0.689917,
+        "mean_ms": 0.532770115,
+        "median_ms": 0.528958,
+        "min_ms": 0.448333,
+        "over_default": 1.0,
+        "stage": false,
+        "threads": 128
+      },
+      "in_dim": 6144,
+      "out_dim": 2048,
+      "parity": true,
+      "ranked": [
+        {
+          "max_ms": 0.682375,
+          "mean_ms": 0.5190656375,
+          "median_ms": 0.5167705,
+          "min_ms": 0.436667,
+          "over_default": 0.9769594183281092,
+          "stage": false,
+          "threads": 32
+        },
+        {
+          "max_ms": 0.666709,
+          "mean_ms": 0.52308729,
+          "median_ms": 0.5174795,
+          "min_ms": 0.454208,
+          "over_default": 0.9782997893972677,
+          "stage": false,
+          "threads": 256
+        },
+        {
+          "max_ms": 0.685375,
+          "mean_ms": 0.523277615,
+          "median_ms": 0.519875,
+          "min_ms": 0.440208,
+          "over_default": 0.9828285043424997,
+          "stage": false,
+          "threads": 64
+        },
+        {
+          "max_ms": 0.692084,
+          "mean_ms": 0.531915535,
+          "median_ms": 0.527292,
+          "min_ms": 0.466375,
+          "over_default": 0.996850411563867,
+          "stage": false,
+          "threads": 512
+        },
+        {
+          "max_ms": 0.689917,
+          "mean_ms": 0.532770115,
+          "median_ms": 0.528958,
+          "min_ms": 0.448333,
+          "over_default": 1.0,
+          "stage": false,
+          "threads": 128
+        },
+        {
+          "max_ms": 0.712375,
+          "mean_ms": 0.5501356574999999,
+          "median_ms": 0.5427915,
+          "min_ms": 0.484792,
+          "over_default": 1.0261523599227158,
+          "stage": true,
+          "threads": 256
+        },
+        {
+          "max_ms": 0.723166,
+          "mean_ms": 0.56237697,
+          "median_ms": 0.5540415,
+          "min_ms": 0.497916,
+          "over_default": 1.0474205891583073,
+          "stage": true,
+          "threads": 512
+        },
+        {
+          "max_ms": 0.710125,
+          "mean_ms": 0.5627498925,
+          "median_ms": 0.556625,
+          "min_ms": 0.503625,
+          "over_default": 1.052304719845432,
+          "stage": true,
+          "threads": 128
+        },
+        {
+          "max_ms": 0.760292,
+          "mean_ms": 0.63648614,
+          "median_ms": 0.6283335,
+          "min_ms": 0.575,
+          "over_default": 1.1878703035023574,
+          "stage": true,
+          "threads": 64
+        },
+        {
+          "max_ms": 1.120459,
+          "mean_ms": 0.97977093,
+          "median_ms": 0.9732085,
+          "min_ms": 0.902958,
+          "over_default": 1.839859686402323,
+          "stage": true,
+          "threads": 32
+        }
+      ],
+      "repeats": 400,
+      "rows": 28,
+      "warmups": 20
+    }
+  },
+  "route": {
+    "rows": 28,
+    "unique_slots": 17
+  },
+  "schema": "glm52-t158-geometry-sweep-v1"
+}

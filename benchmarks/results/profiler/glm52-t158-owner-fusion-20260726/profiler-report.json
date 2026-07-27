@@ -1,0 +1,434 @@
+{
+  "capture_order": [
+    "control-a",
+    "candidate-a",
+    "candidate-b",
+    "control-b"
+  ],
+  "comparisons": {
+    "down": {
+      "candidate_minus_control_gpu_median_ms": 1.0651249999999997,
+      "candidate_over_control_gpu_median": 3.421657765561019
+    },
+    "gate_up": {
+      "candidate_minus_control_gpu_median_ms": 1.4419374999999999,
+      "candidate_over_control_gpu_median": 3.7138113010108533
+    }
+  },
+  "evidence_gate": {
+    "all_measured_target_cbs_single_operation": true,
+    "all_projection_parity": true,
+    "all_traces_source_complete": true,
+    "all_traces_zero_dropped_rows": true,
+    "measured_launches_per_arm_per_projection_cross_process": 60,
+    "measured_launches_per_arm_per_projection_same_process": 60
+  },
+  "persistent_projection_mix": {
+    "candidate_median_gpu_ms": 5.451499,
+    "candidate_over_control": 3.628287938960358,
+    "control_median_gpu_ms": 1.5024990000000003,
+    "pair_ratios": {
+      "control-a:candidate-a": 2.7772424282273116,
+      "control-b:candidate-b": 5.47709365883625
+    }
+  },
+  "pooled_gpu": {
+    "candidate": {
+      "down": {
+        "count": 60,
+        "max_ms": 1.57,
+        "mean_ms": 1.5055277999999999,
+        "median_ms": 1.5049579999999998,
+        "min_ms": 1.436625,
+        "total_ms": 90.331668
+      },
+      "gate_up": {
+        "count": 60,
+        "max_ms": 2.000709,
+        "mean_ms": 1.9710880833333335,
+        "median_ms": 1.9732705,
+        "min_ms": 1.927084,
+        "total_ms": 118.265285
+      }
+    },
+    "control": {
+      "down": {
+        "count": 60,
+        "max_ms": 0.598375,
+        "mean_ms": 0.4479083,
+        "median_ms": 0.43983300000000003,
+        "min_ms": 0.313375,
+        "total_ms": 26.874498
+      },
+      "gate_up": {
+        "count": 60,
+        "max_ms": 0.7205,
+        "mean_ms": 0.5203403333333333,
+        "median_ms": 0.531333,
+        "min_ms": 0.339334,
+        "total_ms": 31.22042
+      }
+    }
+  },
+  "route": {
+    "reusable_assignments": 11,
+    "reuse_fraction": 0.39285714285714285,
+    "rows": 28,
+    "unique_slots": 17
+  },
+  "runs": {
+    "candidate-a": {
+      "arm": "candidate",
+      "command_buffers_total": 77,
+      "dropped_rows": 0,
+      "mlx_core_file": "/Users/davidtai/projects/OpenSourceWTF/mlx-profiler/python/mlx/core.cpython-312-darwin.so",
+      "mlx_version": "0.32.1.dev20260723+56b7a3ea",
+      "ops_total": 148,
+      "persistent_projection_mix_median_gpu_ms": 5.4488330000000005,
+      "projections": {
+        "down": {
+          "all_target_command_buffers_single_operation": true,
+          "gpu": {
+            "count": 30,
+            "max_ms": 1.57,
+            "mean_ms": 1.4993638,
+            "median_ms": 1.498208,
+            "min_ms": 1.436625,
+            "total_ms": 44.980914
+          },
+          "grid": [
+            172032,
+            1,
+            1
+          ],
+          "kernel_name": "custom_kernel_mtplx_diag_t158_owner_fused_bf16_t128_k2048__bfloat16_t_bfloat16_t_int32_t_uint8_t_uint16_t_int32_ts_int32_ts_int32_ts_bfloat16_t",
+          "parity": true,
+          "threadgroup": [
+            128,
+            1,
+            1
+          ],
+          "wall_median_ms": 1.7045835
+        },
+        "gate_up": {
+          "all_target_command_buffers_single_operation": true,
+          "gpu": {
+            "count": 30,
+            "max_ms": 2.000709,
+            "mean_ms": 1.9754179666666665,
+            "median_ms": 1.9753125,
+            "min_ms": 1.954625,
+            "total_ms": 59.262539
+          },
+          "grid": [
+            57344,
+            1,
+            1
+          ],
+          "kernel_name": "custom_kernel_mtplx_diag_t158_owner_fused_bf16_t128_k6144__bfloat16_t_bfloat16_t_int32_t_uint8_t_uint16_t_int32_ts_int32_ts_int32_ts_bfloat16_t",
+          "parity": true,
+          "threadgroup": [
+            128,
+            1,
+            1
+          ],
+          "wall_median_ms": 2.176521
+        }
+      },
+      "source_complete": true,
+      "source_sha256": "bcea4c82ee7e6599b202f7b9ff337e8ac305d7963fee4f67a4cff0060d6dfd0f"
+    },
+    "candidate-b": {
+      "arm": "candidate",
+      "command_buffers_total": 77,
+      "dropped_rows": 0,
+      "mlx_core_file": "/Users/davidtai/projects/OpenSourceWTF/mlx-profiler/python/mlx/core.cpython-312-darwin.so",
+      "mlx_version": "0.32.1.dev20260723+56b7a3ea",
+      "ops_total": 148,
+      "persistent_projection_mix_median_gpu_ms": 5.447542,
+      "projections": {
+        "down": {
+          "all_target_command_buffers_single_operation": true,
+          "gpu": {
+            "count": 30,
+            "max_ms": 1.566334,
+            "mean_ms": 1.5116918000000001,
+            "median_ms": 1.513292,
+            "min_ms": 1.437584,
+            "total_ms": 45.350754
+          },
+          "grid": [
+            172032,
+            1,
+            1
+          ],
+          "kernel_name": "custom_kernel_mtplx_diag_t158_owner_fused_bf16_t128_k2048__bfloat16_t_bfloat16_t_int32_t_uint8_t_uint16_t_int32_ts_int32_ts_int32_ts_bfloat16_t",
+          "parity": true,
+          "threadgroup": [
+            128,
+            1,
+            1
+          ],
+          "wall_median_ms": 1.7042295
+        },
+        "gate_up": {
+          "all_target_command_buffers_single_operation": true,
+          "gpu": {
+            "count": 30,
+            "max_ms": 2.000625,
+            "mean_ms": 1.9667582000000001,
+            "median_ms": 1.967125,
+            "min_ms": 1.927084,
+            "total_ms": 59.002746
+          },
+          "grid": [
+            57344,
+            1,
+            1
+          ],
+          "kernel_name": "custom_kernel_mtplx_diag_t158_owner_fused_bf16_t128_k6144__bfloat16_t_bfloat16_t_int32_t_uint8_t_uint16_t_int32_ts_int32_ts_int32_ts_bfloat16_t",
+          "parity": true,
+          "threadgroup": [
+            128,
+            1,
+            1
+          ],
+          "wall_median_ms": 2.1773125
+        }
+      },
+      "source_complete": true,
+      "source_sha256": "5b6b93bf682d64b063017beae333fa7c3d05b9208b7569eea5cf792cda729b2d"
+    },
+    "control-a": {
+      "arm": "control",
+      "command_buffers_total": 75,
+      "dropped_rows": 0,
+      "mlx_core_file": "/Users/davidtai/projects/OpenSourceWTF/mlx-profiler/python/mlx/core.cpython-312-darwin.so",
+      "mlx_version": "0.32.1.dev20260723+56b7a3ea",
+      "ops_total": 140,
+      "persistent_projection_mix_median_gpu_ms": 1.961958,
+      "projections": {
+        "down": {
+          "all_target_command_buffers_single_operation": true,
+          "gpu": {
+            "count": 30,
+            "max_ms": 0.598375,
+            "mean_ms": 0.5798112,
+            "median_ms": 0.578792,
+            "min_ms": 0.539416,
+            "total_ms": 17.394336
+          },
+          "grid": [
+            172032,
+            1,
+            1
+          ],
+          "kernel_name": "custom_kernel_mtplx_shadow_gather_t158_bf16_t128_k2048_s0__bfloat16_t_bfloat16_t_int32_t_uint8_t_uint16_t_int32_ts_int32_ts_int32_ts_bfloat16_t",
+          "parity": true,
+          "threadgroup": [
+            128,
+            1,
+            1
+          ],
+          "wall_median_ms": 0.788917
+        },
+        "gate_up": {
+          "all_target_command_buffers_single_operation": true,
+          "gpu": {
+            "count": 30,
+            "max_ms": 0.7205,
+            "mean_ms": 0.6957819666666667,
+            "median_ms": 0.6915830000000001,
+            "min_ms": 0.689791,
+            "total_ms": 20.873459
+          },
+          "grid": [
+            57344,
+            1,
+            1
+          ],
+          "kernel_name": "custom_kernel_mtplx_shadow_gather_t158_bf16_t128_k6144_s0__bfloat16_t_bfloat16_t_int32_t_uint8_t_uint16_t_int32_ts_int32_ts_int32_ts_bfloat16_t",
+          "parity": true,
+          "threadgroup": [
+            128,
+            1,
+            1
+          ],
+          "wall_median_ms": 0.901979
+        }
+      },
+      "source_complete": true,
+      "source_sha256": "513ca2a0175653cd1b7b10256d38feb48cd217ed991157156bcdf7b254af02a1"
+    },
+    "control-b": {
+      "arm": "control",
+      "command_buffers_total": 75,
+      "dropped_rows": 0,
+      "mlx_core_file": "/Users/davidtai/projects/OpenSourceWTF/mlx-profiler/python/mlx/core.cpython-312-darwin.so",
+      "mlx_version": "0.32.1.dev20260723+56b7a3ea",
+      "ops_total": 140,
+      "persistent_projection_mix_median_gpu_ms": 0.9946045000000001,
+      "projections": {
+        "down": {
+          "all_target_command_buffers_single_operation": true,
+          "gpu": {
+            "count": 30,
+            "max_ms": 0.34025,
+            "mean_ms": 0.3160054,
+            "median_ms": 0.31402050000000004,
+            "min_ms": 0.313375,
+            "total_ms": 9.480162
+          },
+          "grid": [
+            172032,
+            1,
+            1
+          ],
+          "kernel_name": "custom_kernel_mtplx_shadow_gather_t158_bf16_t128_k2048_s0__bfloat16_t_bfloat16_t_int32_t_uint8_t_uint16_t_int32_ts_int32_ts_int32_ts_bfloat16_t",
+          "parity": true,
+          "threadgroup": [
+            128,
+            1,
+            1
+          ],
+          "wall_median_ms": 0.5028125
+        },
+        "gate_up": {
+          "all_target_command_buffers_single_operation": true,
+          "gpu": {
+            "count": 30,
+            "max_ms": 0.372875,
+            "mean_ms": 0.3448987,
+            "median_ms": 0.34029200000000004,
+            "min_ms": 0.339334,
+            "total_ms": 10.346961
+          },
+          "grid": [
+            57344,
+            1,
+            1
+          ],
+          "kernel_name": "custom_kernel_mtplx_shadow_gather_t158_bf16_t128_k6144_s0__bfloat16_t_bfloat16_t_int32_t_uint8_t_uint16_t_int32_ts_int32_ts_int32_ts_bfloat16_t",
+          "parity": true,
+          "threadgroup": [
+            128,
+            1,
+            1
+          ],
+          "wall_median_ms": 0.532
+        }
+      },
+      "source_complete": true,
+      "source_sha256": "54885dcaca24e3a193b1c2fb832e7f9b9af2c7d8c409ba24d6313fc0e04fe65b"
+    }
+  },
+  "same_process_alternating": {
+    "command_buffers_total": 289,
+    "comparisons": {
+      "down": {
+        "candidate_minus_control_gpu_median_ms": 1.1855625,
+        "candidate_over_control_gpu_median": 4.776933724758718
+      },
+      "gate_up": {
+        "candidate_minus_control_gpu_median_ms": 1.631376,
+        "candidate_over_control_gpu_median": 5.787027826439078
+      }
+    },
+    "dropped_rows": 0,
+    "gpu": {
+      "candidate": {
+        "down": {
+          "all_target_command_buffers_single_operation": true,
+          "gpu": {
+            "count": 60,
+            "max_ms": 1.638041,
+            "mean_ms": 1.5025957,
+            "median_ms": 1.499458,
+            "min_ms": 1.41275,
+            "total_ms": 90.155742
+          },
+          "kernel_name": "custom_kernel_mtplx_diag_t158_owner_fused_bf16_t128_k2048__bfloat16_t_bfloat16_t_int32_t_uint8_t_uint16_t_int32_ts_int32_ts_int32_ts_bfloat16_t",
+          "parity": true,
+          "wall": {
+            "max_ms": 1.835792,
+            "mean_ms": 1.7046076833333335,
+            "median_ms": 1.7026045,
+            "min_ms": 1.581166
+          }
+        },
+        "gate_up": {
+          "all_target_command_buffers_single_operation": true,
+          "gpu": {
+            "count": 60,
+            "max_ms": 2.183625,
+            "mean_ms": 1.97924375,
+            "median_ms": 1.972167,
+            "min_ms": 1.863959,
+            "total_ms": 118.754625
+          },
+          "kernel_name": "custom_kernel_mtplx_diag_t158_owner_fused_bf16_t128_k6144__bfloat16_t_bfloat16_t_int32_t_uint8_t_uint16_t_int32_ts_int32_ts_int32_ts_bfloat16_t",
+          "parity": true,
+          "wall": {
+            "max_ms": 2.411042,
+            "mean_ms": 2.1940771333333333,
+            "median_ms": 2.1835625,
+            "min_ms": 2.075
+          }
+        }
+      },
+      "control": {
+        "down": {
+          "all_target_command_buffers_single_operation": true,
+          "gpu": {
+            "count": 60,
+            "max_ms": 0.327834,
+            "mean_ms": 0.31477425,
+            "median_ms": 0.3138955,
+            "min_ms": 0.313291,
+            "total_ms": 18.886454999999998
+          },
+          "kernel_name": "custom_kernel_mtplx_shadow_gather_t158_bf16_t128_k2048_s0__bfloat16_t_bfloat16_t_int32_t_uint8_t_uint16_t_int32_ts_int32_ts_int32_ts_bfloat16_t",
+          "parity": true,
+          "wall": {
+            "max_ms": 0.598583,
+            "mean_ms": 0.5145951,
+            "median_ms": 0.5127085,
+            "min_ms": 0.442292
+          }
+        },
+        "gate_up": {
+          "all_target_command_buffers_single_operation": true,
+          "gpu": {
+            "count": 60,
+            "max_ms": 0.375709,
+            "mean_ms": 0.34346041666666666,
+            "median_ms": 0.340791,
+            "min_ms": 0.339875,
+            "total_ms": 20.607625
+          },
+          "kernel_name": "custom_kernel_mtplx_shadow_gather_t158_bf16_t128_k6144_s0__bfloat16_t_bfloat16_t_int32_t_uint8_t_uint16_t_int32_ts_int32_ts_int32_ts_bfloat16_t",
+          "parity": true,
+          "wall": {
+            "max_ms": 0.624208,
+            "mean_ms": 0.5508597166666667,
+            "median_ms": 0.5478125,
+            "min_ms": 0.468458
+          }
+        }
+      }
+    },
+    "mlx_core_file": "/Users/davidtai/projects/OpenSourceWTF/mlx-profiler/python/mlx/core.cpython-312-darwin.so",
+    "mlx_version": "0.32.1.dev20260723+56b7a3ea",
+    "ops_total": 360,
+    "order": "alternating-control-candidate",
+    "persistent_projection_mix": {
+      "candidate_median_gpu_ms": 5.443792,
+      "candidate_over_control": 5.468523397063218,
+      "control_median_gpu_ms": 0.9954775
+    },
+    "source_complete": true,
+    "source_sha256": "f1fd536c2d397bf7b1ae0bb84f7765c0a8a6d2f46c67f95cc26c4b214cb1d152"
+  },
+  "schema": "glm52-t158-owner-fusion-profiler-report-v1",
+  "verdict": "rejected"
+}

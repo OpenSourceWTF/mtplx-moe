@@ -7068,6 +7068,12 @@ def generate_mtpk(
             event["mtp_topk_reranker"] = mtp_topk_reranker.to_dict()
         step += 1
         if len(tokens) >= max_tokens or _is_stop(primary, stop_token_ids):
+            if capture_final_state and not primary_already_emitted:
+                # This primary was sampled from the previous target row and
+                # emitted above, but no verify forward has committed its KV.
+                # Reuse the existing final pending-token commit path so the
+                # captured caches and logits represent every emitted token.
+                pending_primary = int(primary)
             append_event(event)
             emit_trace()
             break
@@ -7960,6 +7966,9 @@ def generate_mtpk(
                     event["gated_stop_depth"] = depth_index + 1
                     event["policy_stop"] = policy_continue
                     break
+
+        if not used_device_core:
+            rt.finish_mtp_cycle(step_mtp_cache)
 
         before_verify = None
         if a3b_target_prefix_route is None:

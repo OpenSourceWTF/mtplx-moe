@@ -1,0 +1,52 @@
+{
+  "schema": "mtplx-glm52-equal-memory-cache-scope-replay-v1",
+  "source": "k3-route-memory-trace-64t-no-context-copy.json",
+  "configuration": {
+    "model": "glm52-q1t",
+    "cache_policy": "frequency",
+    "frequency_decay": 0.995,
+    "layers": 75,
+    "persistent_slots_per_layer": 109,
+    "total_persistent_slots": 8175,
+    "transient_slots": 48,
+    "record_bytes": 8847360,
+    "includes_warmup_epoch": true,
+    "honors_trace_reset_boundaries": true,
+    "timing_eligible": false
+  },
+  "layer_scope": {
+    "hits": 34129,
+    "misses": 11471,
+    "requests": 45600,
+    "hit_rate": 0.7484429824561404,
+    "physical_records_read": 10022,
+    "bytes_read": 88668241920,
+    "persistent_loads": 3610,
+    "transient_loads": 6412,
+    "evictions": 3610,
+    "final_occupancy_per_layer": 109
+  },
+  "global_scope": {
+    "hits": 34270,
+    "misses": 11330,
+    "requests": 45600,
+    "hit_rate": 0.7515350877192982,
+    "physical_records_read": 9954,
+    "bytes_read": 88066621440,
+    "persistent_loads": 3549,
+    "transient_loads": 6405,
+    "evictions": 3549,
+    "final_occupancy_min": 80,
+    "final_occupancy_max": 143
+  },
+  "global_vs_layer": {
+    "records_saved": 68,
+    "bytes_saved": 601620480,
+    "read_reduction": 0.006785072839752493,
+    "hit_rate_delta": 0.0030921052631578405
+  },
+  "decision": {
+    "benchmark_full_model": false,
+    "reason": "Sharing the same 8175 persistent records globally reduces physical reads by only 0.68 percent on the current Q1-t158 trace while global frequency victim selection scans the much larger shared resident set."
+  }
+}
