@@ -293,17 +293,13 @@ def test_promoted_profile_geometry_override_is_customized_in_parent_and_child(
     child_command: list[str] = []
     append_expert_streaming_child_args(child_command, args)
     child = _parser().parse_args(child_command)
-    child._cli_flags = {
-        token[2:] for token in child_command if token.startswith("--")
-    }
+    child._cli_flags = {token[2:] for token in child_command if token.startswith("--")}
 
     child_kwargs = expert_streaming_load_kwargs(child, root)
 
     assert child_kwargs["expert_streaming_config"].cache_policy == "lru"
     assert child._resolved_expert_profile_customized is True
-    assert child._resolved_expert_profile_customized_fields == (
-        "cache_policy",
-    )
+    assert child._resolved_expert_profile_customized_fields == ("cache_policy",)
     assert child._resolved_expert_effective_config["cache_policy"] == "lru"
 
 
@@ -387,9 +383,7 @@ def test_legacy_config_for_unpromoted_glm_is_admitted_without_hy3_profile(
             AssertionError("unsupported legacy model must not select a Hy3 profile")
         ),
     )
-    args = _parser().parse_args(
-        ["--expert-streaming-config", str(config_path)]
-    )
+    args = _parser().parse_args(["--expert-streaming-config", str(config_path)])
 
     kwargs = expert_streaming_load_kwargs(args, root)
 
@@ -441,14 +435,10 @@ def test_record_hash_diagnostic_requires_cli_flag_provenance(
         ),
         encoding="utf-8",
     )
-    args = _parser().parse_args(
-        ["--expert-streaming-config", str(config_path)]
-    )
+    args = _parser().parse_args(["--expert-streaming-config", str(config_path)])
     args._cli_flags = {"expert-streaming-config"}
 
-    config = expert_streaming_load_kwargs(args, root)[
-        "expert_streaming_config"
-    ]
+    config = expert_streaming_load_kwargs(args, root)["expert_streaming_config"]
     assert config.verify_record_hashes is False
 
     explicit = _parser().parse_args(
@@ -524,7 +514,12 @@ def test_hy3_default_and_glm_default_stay_on_production_q4(
 
 @pytest.mark.parametrize(
     "model_key",
-    ["hy3-expert-only-q4", "hy3-expert-q2", "glm52-expert-q2"],
+    [
+        "hy3-expert-only-q4",
+        "hy3-expert-q2",
+        "glm52-expert-q2",
+        "kimi-k3-q1t",
+    ],
 )
 def test_expert_cli_accepts_explicit_expert_only_model_keys(
     model_key: str,
@@ -689,9 +684,7 @@ def test_runtime_load_accepts_admission_receipt_through_real_reader_boundary(
     def stop_after_reader_open(model_path, expert_runtime, *, config):
         reached["model_path"] = model_path
         reached["backend"] = expert_runtime.reader.backend
-        reached["pinned_banks"] = tuple(
-            expert_runtime.reader._pinned_entries
-        )
+        reached["pinned_banks"] = tuple(expert_runtime.reader._pinned_entries)
         raise LaterResidentBoundary("reader construction reached")
 
     monkeypatch.setattr(
@@ -721,9 +714,7 @@ def test_runtime_load_accepts_admission_receipt_through_real_reader_boundary(
 
     assert reached["model_path"] == root
     assert reached["backend"] in {"native", "python-preadv"}
-    assert reached["pinned_banks"] == tuple(
-        bank["file"] for bank in receipt["banks"]
-    )
+    assert reached["pinned_banks"] == tuple(bank["file"] for bank in receipt["banks"])
 
 
 @pytest.mark.parametrize(("manifest_bits", "descriptor_bits"), [(2, 4), (4, 2)])
@@ -834,12 +825,7 @@ def test_manifest_model_key_wins_over_shared_config_type(
 def test_manifest_model_key_supports_repository_local_hf_blob_symlink(
     tmp_path: Path,
 ) -> None:
-    root = (
-        tmp_path
-        / "models--owner--streamed"
-        / "snapshots"
-        / "revision"
-    )
+    root = tmp_path / "models--owner--streamed" / "snapshots" / "revision"
     root.mkdir(parents=True)
     (root / "config.json").write_text(
         json.dumps({"model_type": "hy_v3"}),
@@ -887,12 +873,7 @@ def test_default_manifest_rejects_external_model_root_symlink(
 def test_default_manifest_accepts_repository_local_hf_blob_symlink(
     tmp_path: Path,
 ) -> None:
-    root = (
-        tmp_path
-        / "models--owner--streamed"
-        / "snapshots"
-        / "revision"
-    )
+    root = tmp_path / "models--owner--streamed" / "snapshots" / "revision"
     root.mkdir(parents=True)
     (root / "config.json").write_text(
         json.dumps({"model_type": "hy_v3"}),
@@ -928,12 +909,7 @@ def test_manifest_model_key_rejects_unsafe_symlink_targets(
     tmp_path: Path,
     oversized: bool,
 ) -> None:
-    root = (
-        tmp_path
-        / "models--owner--streamed"
-        / "snapshots"
-        / "revision"
-    )
+    root = tmp_path / "models--owner--streamed" / "snapshots" / "revision"
     root.mkdir(parents=True)
     if oversized:
         from mtplx.expert_manifest import MAX_MANIFEST_BYTES
@@ -1002,9 +978,7 @@ def test_memory_and_kv_limits_auto_derived_when_omitted(
     root = _streaming_root(
         tmp_path, model_type="hy_v3", manifest_model_key="hy3-expert-q2"
     )
-    monkeypatch.setattr(
-        expert_cli, "_installed_ram_bytes", lambda: 128 * 1024**3
-    )
+    monkeypatch.setattr(expert_cli, "_installed_ram_bytes", lambda: 128 * 1024**3)
     args = _parser().parse_args(["--expert-streaming"])
 
     config = expert_streaming_load_kwargs(args, root)["expert_streaming_config"]

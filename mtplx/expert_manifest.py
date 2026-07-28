@@ -22,7 +22,7 @@ import stat
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Mapping
 
 from .expert_shadow import (
     SHADOW_CODECS,
@@ -54,22 +54,23 @@ EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 _LEAVES = ("weight", "scales", "biases")
 _SHADOW_LEAVES = ("packed", "scales")
-_SHARD_KINDS = ("safetensors", "sidecar")
+_SHARD_KINDS = ("safetensors", "preserved-safetensors", "sidecar")
 _COMPONENTS = tuple(
     f"{projection}.{leaf}" for projection in _PROJECTIONS for leaf in _LEAVES
 )
 # Shadow-codec (q1 lane, issue #51) records store six components per expert:
 # per projection one packed sign/trit tensor plus one bf16-bit scale row.
 _SHADOW_COMPONENTS = tuple(
-    f"{projection}.{leaf}"
-    for projection in _PROJECTIONS
-    for leaf in _SHADOW_LEAVES
+    f"{projection}.{leaf}" for projection in _PROJECTIONS for leaf in _SHADOW_LEAVES
 )
 _KNOWN_COMPONENTS = frozenset(_COMPONENTS) | frozenset(_SHADOW_COMPONENTS)
 # Nominal quantization bits carried by shadow-codec manifests; the byte
 # math lives in the codec (10 or 15 bytes per g64 group), the nominal bits
 # keep spec/manifest/pool guards single-valued.
 _SHADOW_NOMINAL_BITS = {"b1": 1, "t158": 2}
+_KIMI_K3_TEXT_MODEL_KEY = "kimi-k3-q1t"
+_KIMI_K3_TEXT_PREFIX = "language_model."
+_KIMI_K3_PRESERVED_NON_TEXT_PREFIXES = ("vision_tower.", "mm_projector.")
 
 # Mixed-official (issue #51, M2): a per-layer tier schedule instead of one
 # uniform record. down is always 3-bit affine; the gate/up pair is t158 (shadow
@@ -108,6 +109,8 @@ def expert_components_for_mode(quant_mode: str) -> tuple[str, ...]:
         f"unsupported manifest quantization mode {quant_mode!r}; expected "
         f"'affine' or one of {', '.join(SHADOW_CODECS)}"
     )
+
+
 _LAYER_RE = re.compile(
     r"(?:^|\.)layers\.(?P<layer>\d+)\.mlp\."
     r"(?P<container>switch_mlp|experts)\.(?P<tail>.+)$"
@@ -1333,7 +1336,12 @@ class ExpertManifest:
                 raise ExpertManifestError(
                     "authoritative manifest contains unreferenced safetensors shards"
                 )
-            for name in resident_shard_names:
+            preserved_shards = {
+                shard.name
+                for shard in self.shards
+                if shard.kind == "preserved-safetensors"
+            }
+            for name in resident_shard_names | preserved_shards:
                 if shard_by_name[name].sha256 is None:
                     raise ExpertManifestError(
                         f"authoritative resident shard {name} requires a hash"
@@ -1916,12 +1924,12 @@ def build_mixed_official_manifest(
             f"mixed-official record bin is not in the artifact: {bin_path}"
         )
     layer_tier_map = _parse_mixed_layer_tier_map(quant["layer_tier_map"])
-    group_size = _integer(quant["group_size"], label="quantization group_size", minimum=1)
+    group_size = _integer(
+        quant["group_size"], label="quantization group_size", minimum=1
+    )
 
     shards, tensors = _checkpoint_inventory(root, hash_shards=True)
-    routed = [
-        name for name in tensors if _classify_expert_name(name, spec) is not None
-    ]
+    routed = [name for name in tensors if _classify_expert_name(name, spec) is not None]
     if routed:
         raise ExpertManifestError(
             "mixed-official artifact safetensors must hold only resident tensors; "
@@ -1965,7 +1973,9 @@ def build_mixed_official_manifest(
             )
             for segment in raw["segments"]
         )
-        logical = _integer(raw["logical_bytes"], label="record logical_bytes", minimum=1)
+        logical = _integer(
+            raw["logical_bytes"], label="record logical_bytes", minimum=1
+        )
         records.append(
             ExpertRecord(
                 layer=_integer(raw["layer"], label="record layer"),
@@ -2150,6 +2160,19 @@ def validate_expert_manifest_spec(
     if not isinstance(spec, ExpertStreamingModelSpec):
         raise TypeError("spec must be an ExpertStreamingModelSpec")
     manifest.validate_structure()
+    preserved_safetensors = tuple(
+        shard for shard in manifest.shards if shard.kind == "preserved-safetensors"
+    )
+    if preserved_safetensors:
+        trusted_kimi_spec = get_model_spec(_KIMI_K3_TEXT_MODEL_KEY)
+        if spec != trusted_kimi_spec:
+            raise ExpertManifestError(
+                "preserved safetensors shards require the trusted Kimi K3 descriptor"
+            )
+        if not any(shard.kind == "sidecar" for shard in manifest.shards):
+            raise ExpertManifestError(
+                "preserved safetensors shards require an authoritative manifest"
+            )
     if spec.is_mixed_official:
         _validate_mixed_manifest_spec(
             manifest, spec, require_pinned_tensor_bytes=require_pinned_tensor_bytes
@@ -2164,9 +2187,7 @@ def validate_expert_manifest_spec(
         raise ExpertManifestError(
             "manifest quantization group size does not match the descriptor"
         )
-    expected_mode = (
-        "affine" if spec.expert_codec == "affine" else spec.expert_codec
-    )
+    expected_mode = "affine" if spec.expert_codec == "affine" else spec.expert_codec
     if manifest.quant_mode != expected_mode:
         raise ExpertManifestError(
             f"manifest quantization mode {manifest.quant_mode!r} does not "
@@ -2326,6 +2347,60 @@ def make_sidecar_authoritative(
     return authoritative
 
 
+def _validate_authoritative_resident_inventory(
+    expected_residents: Mapping[str, ResidentTensor],
+    inventory_tensors: Mapping[str, ResidentTensor],
+    *,
+    trusted_spec: ExpertStreamingModelSpec | None = None,
+) -> None:
+    """Bind an authoritative index to the runtime's resident allowlist.
+
+    K3 preserves its pinned multimodal tensors in the checkpoint inventory,
+    but the dedicated streamed runtime is text-only.  Its allowlist therefore
+    contains every ``language_model.*`` tensor and no vision/projector tensor.
+    The two exact upstream non-text namespaces may remain indexed so their
+    byte-preserved payload is not discarded.  Every other model retains the
+    original exact-inventory contract.
+    """
+
+    expected_names = set(expected_residents)
+    inventory_names = set(inventory_tensors)
+    if trusted_spec is not None and trusted_spec.key == _KIMI_K3_TEXT_MODEL_KEY:
+        if any(not name.startswith(_KIMI_K3_TEXT_PREFIX) for name in expected_names):
+            raise ExpertManifestError("Kimi K3 resident allowlist must be text-only")
+        indexed_text = {
+            name for name in inventory_names if name.startswith(_KIMI_K3_TEXT_PREFIX)
+        }
+        extras = inventory_names - indexed_text
+        if indexed_text != expected_names or any(
+            not name.startswith(_KIMI_K3_PRESERVED_NON_TEXT_PREFIXES) for name in extras
+        ):
+            raise ExpertManifestError(
+                "authoritative resident index/header inventory mismatch"
+            )
+    elif inventory_names != expected_names:
+        raise ExpertManifestError(
+            "authoritative resident index/header inventory mismatch"
+        )
+
+    for name, expected in expected_residents.items():
+        tensor = inventory_tensors.get(name)
+        if tensor is None:
+            raise ExpertManifestError(
+                "authoritative resident index/header inventory mismatch"
+            )
+        if (
+            tensor.shard != expected.shard
+            or tensor.offset != expected.offset
+            or tensor.length != expected.length
+            or tensor.dtype != expected.dtype
+            or tensor.shape != expected.shape
+        ):
+            raise ExpertManifestError(
+                f"authoritative resident metadata mismatch: {name}"
+            )
+
+
 def verify_expert_manifest(
     manifest: ExpertManifest,
     root: Path | str,
@@ -2342,12 +2417,27 @@ def verify_expert_manifest(
         raise ExpertManifestError("manifest digest mismatch")
     authoritative = any(shard.kind == "sidecar" for shard in manifest.shards)
     if authoritative:
+        trusted_subset_spec = None
+        if manifest.model_key == _KIMI_K3_TEXT_MODEL_KEY:
+            trusted_subset_spec = get_model_spec(_KIMI_K3_TEXT_MODEL_KEY)
+            validate_expert_manifest_spec(manifest, trusted_subset_spec)
+        preserved_safetensors = {
+            shard.name
+            for shard in manifest.shards
+            if shard.kind == "preserved-safetensors"
+        }
+        if preserved_safetensors and trusted_subset_spec is None:
+            raise ExpertManifestError(
+                "preserved safetensors shards require the trusted Kimi K3 descriptor"
+            )
         if not (artifact_root / "model.safetensors.index.json").is_file():
             raise ExpertManifestError(
                 "authoritative artifact requires a complete resident index"
             )
         expected_safetensors = {
-            shard.name for shard in manifest.shards if shard.kind == "safetensors"
+            shard.name
+            for shard in manifest.shards
+            if shard.kind in {"safetensors", "preserved-safetensors"}
         }
         actual_safetensors = {path.name for path in artifact_root.glob("*.safetensors")}
         if actual_safetensors != expected_safetensors:
@@ -2366,22 +2456,11 @@ def verify_expert_manifest(
         expected_residents = {
             tensor.tensor: tensor for tensor in manifest.resident_tensors
         }
-        if set(inventory_tensors) != set(expected_residents):
-            raise ExpertManifestError(
-                "authoritative resident index/header inventory mismatch"
-            )
-        for name, tensor in inventory_tensors.items():
-            expected = expected_residents[name]
-            if (
-                tensor.shard != expected.shard
-                or tensor.offset != expected.offset
-                or tensor.length != expected.length
-                or tensor.dtype != expected.dtype
-                or tensor.shape != expected.shape
-            ):
-                raise ExpertManifestError(
-                    f"authoritative resident metadata mismatch: {name}"
-                )
+        _validate_authoritative_resident_inventory(
+            expected_residents,
+            inventory_tensors,
+            trusted_spec=trusted_subset_spec,
+        )
     checked_shards = 0
     for shard in manifest.shards:
         path = _resolve_member(artifact_root, shard.name)

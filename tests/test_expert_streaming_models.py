@@ -59,6 +59,21 @@ def test_hy3_q4_exact_expert_layout() -> None:
     assert spec.full_indexer_layers == ()
 
 
+def test_shadow_codec_descriptors_use_their_exact_nominal_bits() -> None:
+    assert get_model_spec("glm52-expert-q1t").quant_bits == 2
+    assert get_model_spec("glm52-expert-q1b1").quant_bits == 1
+    assert get_model_spec("kimi-k3-q1t").quant_bits == 2
+
+
+@pytest.mark.parametrize(("codec", "bits"), (("t158", 1), ("b1", 2)))
+def test_shadow_codec_descriptor_rejects_wrong_nominal_bits(
+    codec: str,
+    bits: int,
+) -> None:
+    with pytest.raises(ValueError, match="requires nominal quant_bits"):
+        replace(HY3_EXPERT_Q2, expert_codec=codec, quant_bits=bits)
+
+
 def test_hy3_expert_only_q4_control_exact_layout() -> None:
     q4 = get_model_spec("hy3-expert-only-q4")
 
@@ -124,6 +139,9 @@ def test_hy3_q4_is_unchanged_by_hy3_expert_q2_registry_expansion() -> None:
         "full_indexer_layers": (),
         "island_pin_order": (),
         "expert_codec": "affine",
+        "expert_activation": "swiglu",
+        "model_hidden_size": None,
+        "fixed_cache_bytes_per_batch": 0,
     }
     before = asdict(HY3_Q4)
 
@@ -215,11 +233,11 @@ def test_existing_descriptors_are_unchanged_by_glm52_expert_q2_registry_expansio
         # (auto-census #98) and expert_codec (q1 lane, issue #51) are
         # spec fields now; a digest change without a matching field-set
         # change is the drift this test exists to catch.
-        "hy3-q4": "bc121154d4d6286e9499995e06632e10007ef5c9b343254018a60bff59ef344c",
+        "hy3-q4": "8d94358654e92c4d56c1d1cf828cc9e2915a255b39b68b01e56dd34feece5ba8",
         # hy3-expert-only-q4 keeps its ORIGINAL digest: pin order stays empty (census-driven)
-        "hy3-expert-only-q4": "d6ac448f353a988d77c27b5e81d6cb7b9de2eba3c93b67bfd0efa35729473140",
-        "hy3-expert-q2": "286bc48306801005db9b32d96362ac2553bbe4ce5e53112503b1a12c9a6a78ea",
-        "glm52-q4": "6372e17bf28658526de0b2150cda8fad486f077849b5d0c5be23ff19e6b770b1",
+        "hy3-expert-only-q4": "f3fad27e1ab95cfb5f775d6af875c0e21434c7f95330a114b94148fc75f83022",
+        "hy3-expert-q2": "eb7fc1ad7b44c6b54f5dd452154c19de998679a6da7f9b43d372699437e364fa",
+        "glm52-q4": "5238b5c92243bc6584d651c33c606fe24c0668be1837144b00b8a1f4f06655e4",
     }
     existing = (HY3_Q4, HY3_EXPERT_ONLY_Q4, HY3_EXPERT_Q2, GLM52_Q4)
 

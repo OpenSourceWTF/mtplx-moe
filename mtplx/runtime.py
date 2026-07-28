@@ -352,9 +352,7 @@ class MTPLXRuntime:
         ):
             import os as _os
 
-            reserve = int(
-                _os.environ.get("MTPLX_COMPILE_AR_RESERVE_TOKENS", "4096")
-            )
+            reserve = int(_os.environ.get("MTPLX_COMPILE_AR_RESERVE_TOKENS", "4096"))
             self._compiled_ar = CompiledARForward(self.model, reserve_tokens=reserve)
             self._compiled_ar_key = cache_key
         return self._compiled_ar
@@ -635,6 +633,27 @@ class LagunaARRuntime(MTPLXRuntime):
         return False
 
 
+def _streaming_preflight_resident_discount(
+    manifest: Any,
+    config: Any,
+) -> int:
+    """Price the exact resident quantization scope used by runtime open."""
+
+    from .expert_runtime import (
+        proj_quant_plan_discount,
+        proj_requant_plan_discount,
+    )
+
+    return proj_quant_plan_discount(
+        manifest,
+        config.proj_quant,
+        model_key=config.model_key,
+    ) + proj_requant_plan_discount(
+        manifest,
+        getattr(config, "proj_requant", None),
+    )
+
+
 def _load_impl(
     model_path: Path | str,
     *,
@@ -893,20 +912,12 @@ def _load_impl(
                 expert_streaming_config, "proj_requant", None
             ):
                 from .expert_manifest import load_expert_manifest
-                from .expert_runtime import (
-                    proj_quant_plan_discount,
-                    proj_requant_plan_discount,
-                )
 
                 _preflight_manifest = load_expert_manifest(expert_manifest)
                 preflight_plan_kwargs["resident_discount_bytes"] = (
-                    proj_quant_plan_discount(
+                    _streaming_preflight_resident_discount(
                         _preflight_manifest,
-                        expert_streaming_config.proj_quant,
-                    )
-                    + proj_requant_plan_discount(
-                        _preflight_manifest,
-                        getattr(expert_streaming_config, "proj_requant", None),
+                        expert_streaming_config,
                     )
                 )
             if bool(getattr(streaming_spec, "is_mixed_official", False)):
@@ -1092,13 +1103,15 @@ def _load_impl(
             touched = quantize_projections(model, proj_quant)
             logger.info(
                 "[proj-quant] quantized %d trunk *_proj modules to %s",
-                len(touched), proj_quant,
+                len(touched),
+                proj_quant,
             )
         if proj_requant:
             touched = requantize_projections(model, proj_requant)
             logger.info(
                 "[proj-quant] requantized %d trunk *_proj modules to %s",
-                len(touched), proj_requant,
+                len(touched),
+                proj_requant,
             )
     if mtp and expert_runtime is None:
         from .deepseek_mtp_patch import (
@@ -1430,8 +1443,123 @@ def _repair_included_chat_template(tokenizer: Any, model_path: Path) -> None:
     tokenizer.chat_template = replacement
 
 
+_KIMI_K3_EOS_TOKEN_ID = 163586
+_KIMI_K3_CHAT_UNSET = object()
+
+
+def _is_kimi_k3_tokenizer_config(config: Mapping[str, Any]) -> bool:
+    """Identify the pinned K3 text topology before tokenizer construction."""
+
+    nested = config.get("text_config")
+    text = nested if isinstance(nested, Mapping) else config
+    root_model_type = str(config.get("model_type") or "")
+    return (
+        root_model_type == "kimi_k3"
+        or str(text.get("model_type") or "") == "kimi_linear"
+    ) and all(
+        (
+            str(text.get("hidden_act") or "") == "situ",
+            int(text.get("num_hidden_layers") or 0) == 93,
+            int(text.get("num_experts") or 0) == 896,
+            int(text.get("eos_token_id") or 0) == _KIMI_K3_EOS_TOKEN_ID,
+        )
+    )
+
+
+class _KimiK3TokenizerAdapter:
+    """Bind MTPLX chat controls to K3's audited tokenizer API once."""
+
+    def __init__(self, wrapped: Any) -> None:
+        inner = getattr(wrapped, "_tokenizer", None)
+        if inner is None or not callable(getattr(inner, "apply_chat_template", None)):
+            raise RuntimeError(
+                "Kimi K3 requires MLX-LM's tokenizer wrapper around TikTokenTokenizer"
+            )
+        if getattr(wrapped, "_chat_template", None) is not None:
+            raise RuntimeError(
+                "Kimi K3 must use its audited native chat renderer, not an "
+                "injected template"
+            )
+        object.__setattr__(self, "_wrapped", wrapped)
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "_eos_token_ids", {_KIMI_K3_EOS_TOKEN_ID})
+
+    @property
+    def eos_token_ids(self) -> set[int]:
+        return self._eos_token_ids
+
+    @eos_token_ids.setter
+    def eos_token_ids(self, value: Any) -> None:
+        object.__setattr__(self, "_eos_token_ids", set(value or ()))
+
+    def apply_chat_template(
+        self,
+        conversation: Any,
+        *,
+        tokenize: bool = True,
+        **kwargs: Any,
+    ) -> Any:
+        enable_thinking = kwargs.pop("enable_thinking", _KIMI_K3_CHAT_UNSET)
+        reasoning_effort = kwargs.pop("reasoning_effort", _KIMI_K3_CHAT_UNSET)
+        # K3's native XTML renderer reconstructs its own thinking segments; it
+        # has no preserve_thinking control.
+        kwargs.pop("preserve_thinking", None)
+
+        if enable_thinking is not _KIMI_K3_CHAT_UNSET and enable_thinking is not None:
+            thinking = bool(enable_thinking)
+            native_thinking = kwargs.get("thinking", _KIMI_K3_CHAT_UNSET)
+            if (
+                native_thinking is not _KIMI_K3_CHAT_UNSET
+                and bool(native_thinking) != thinking
+            ):
+                raise ValueError(
+                    "conflicting Kimi K3 thinking and enable_thinking controls"
+                )
+            kwargs["thinking"] = thinking
+
+        if reasoning_effort is not _KIMI_K3_CHAT_UNSET and reasoning_effort is not None:
+            native_effort = kwargs.get("thinking_effort", _KIMI_K3_CHAT_UNSET)
+            if (
+                native_effort is not _KIMI_K3_CHAT_UNSET
+                and native_effort != reasoning_effort
+            ):
+                raise ValueError(
+                    "conflicting Kimi K3 thinking_effort and reasoning_effort controls"
+                )
+            kwargs["thinking_effort"] = reasoning_effort
+
+        kwargs["return_dict"] = False
+        return self._inner.apply_chat_template(
+            conversation,
+            tokenize=tokenize,
+            **kwargs,
+        )
+
+    def __getattr__(self, attr: str) -> Any:
+        return getattr(self._wrapped, attr)
+
+    def __setattr__(self, attr: str, value: Any) -> None:
+        if attr.startswith("_") or attr == "eos_token_ids":
+            object.__setattr__(self, attr, value)
+        else:
+            setattr(self._wrapped, attr, value)
+
+
 def _load_tokenizer_resilient(model_path: Path, config: dict[str, Any]) -> Any:
     from mlx_lm.utils import load_tokenizer
+
+    if _is_kimi_k3_tokenizer_config(config):
+        try:
+            tokenizer = load_tokenizer(
+                model_path,
+                tokenizer_config_extra={"trust_remote_code": True},
+                eos_token_ids=[_KIMI_K3_EOS_TOKEN_ID],
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve the tokenizer cause
+            raise RuntimeError(
+                "failed to construct Kimi K3's pinned TikTokenTokenizer"
+            ) from exc
+        return _KimiK3TokenizerAdapter(tokenizer)
 
     try:
         tokenizer = load_tokenizer(model_path)
@@ -1514,10 +1642,7 @@ def _mtp_alias_load_path(path: Path, config: dict[str, Any] | None) -> Path:
     import importlib.util
 
     def _mlx_lm_has(model_type_name: str) -> bool:
-        return (
-            importlib.util.find_spec(f"mlx_lm.models.{model_type_name}")
-            is not None
-        )
+        return importlib.util.find_spec(f"mlx_lm.models.{model_type_name}") is not None
 
     if _mlx_lm_has(model_type) or not _mlx_lm_has(base_type):
         return path

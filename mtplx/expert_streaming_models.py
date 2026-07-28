@@ -38,7 +38,7 @@ _ATTENTION_PROJ_SUFFIXES = (".q_proj", ".k_proj", ".v_proj", ".o_proj", ".qkv_pr
 _MLP_PROJ_SUFFIXES = (".gate_proj", ".up_proj", ".down_proj", ".gate_up_proj")
 
 
-def proj_quant_covers(path: str) -> bool:
+def proj_quant_covers(path: str, *, model_key: str | None = None) -> bool:
     """Module/tensor paths quantized by the load-time proj-quant pass.
 
     Covers exactly the ``*_proj`` weights of the trunk: attention
@@ -50,8 +50,28 @@ def proj_quant_covers(path: str) -> bool:
     This is deliberately NARROWER than "everything resident"; the loader's
     module predicate and the memory plan's byte discount must agree, so
     both read scope from this single source.
+
+    Kimi K3 has a separate construction contract: every compatible resident
+    Linear or Embedding is dynamically q8, while its t158 switch banks, router,
+    directly-read residual score projections, MTP namespace, norms,
+    convolutions, recurrent vectors, and biases retain their source
+    representation.
     """
 
+    if model_key == "kimi-k3-q1t":
+        normalized = path
+        if normalized.startswith("language_model."):
+            normalized = normalized[len("language_model.") :]
+        normalized = normalized.replace(".block_sparse_moe.", ".mlp.")
+        if normalized in {"model.embed_tokens", "lm_head"}:
+            return True
+        if normalized == "mtp" or normalized.startswith("mtp."):
+            return False
+        if normalized.endswith("_res_proj") or normalized.endswith(
+            ".self_attn.kv_b_proj"
+        ):
+            return False
+        return normalized.endswith("_proj")
     if ".self_attn." in path and path.endswith(_ATTENTION_PROJ_SUFFIXES):
         return True
     if path.endswith(_MLP_PROJ_SUFFIXES):
@@ -122,6 +142,14 @@ class ExpertStreamingModelSpec:
     # until the affine assumptions catalogued in
     # research/streamed-q1-codec-gap-analysis.md are closed.
     expert_codec: str = "affine"
+    # Expert activation is resolved once when the streamed switch is
+    # constructed. Enabled calls invoke the bound arithmetic directly.
+    expert_activation: str = "swiglu"
+    # K3 routes in the model width but projects routed experts into a narrower
+    # latent width before this streamed bank.
+    model_hidden_size: int | None = None
+    # Recurrent cache state that is independent of live token count, at B=1.
+    fixed_cache_bytes_per_batch: int = 0
 
     def __post_init__(self) -> None:
         integer_fields = {
@@ -138,12 +166,21 @@ class ExpertStreamingModelSpec:
             "quant_parameter_bytes": 1,
             "router_bytes": 0,
             "kv_bytes_per_token": 0,
+            "fixed_cache_bytes_per_batch": 0,
         }
         for name, minimum in integer_fields.items():
             normalized = _integer(name, getattr(self, name), minimum=minimum)
             object.__setattr__(self, name, normalized)
         if not isinstance(self.mtp_included, bool):
             raise TypeError("mtp_included must be bool")
+        if self.model_hidden_size is not None:
+            object.__setattr__(
+                self,
+                "model_hidden_size",
+                _integer("model_hidden_size", self.model_hidden_size, minimum=1),
+            )
+        if self.expert_activation not in {"swiglu", "situ"}:
+            raise ValueError("expert_activation must be 'swiglu' or 'situ'")
         if self.mtp_layer_index is not None:
             object.__setattr__(
                 self,
@@ -185,6 +222,12 @@ class ExpertStreamingModelSpec:
             choices = ", ".join(repr(codec) for codec in SHADOW_CODECS)
             raise ValueError(
                 f"expert_codec must be 'affine', {MIXED_OFFICIAL_CODEC!r}, {choices}"
+            )
+        shadow_nominal_bits = {"b1": 1, "t158": 2}
+        expected_bits = shadow_nominal_bits.get(self.expert_codec)
+        if expected_bits is not None and self.quant_bits != expected_bits:
+            raise ValueError(
+                f"{self.expert_codec} requires nominal quant_bits={expected_bits}"
             )
         if self.expert_codec == MIXED_OFFICIAL_CODEC:
             # Mixed-official specs have no uniform record size, so the routed /
@@ -255,9 +298,7 @@ class ExpertStreamingModelSpec:
                 "the manifest-derived per-layer record sizes (issue #51 D7)"
             )
         if self.expert_codec != "affine":
-            return shadow_record_bytes(
-                self.expert_codec, self.expert_source_parameters
-            )
+            return shadow_record_bytes(self.expert_codec, self.expert_source_parameters)
         return self.packed_weight_bytes + self.scale_bias_bytes
 
     @property
@@ -301,6 +342,7 @@ class ExpertMemoryPlan:
     context_tokens: int
     resident_bytes: int
     kv_bytes: int
+    fixed_cache_bytes: int
     transient_slots: int
     transient_bytes: int
     expert_cache_limit_bytes: int | None
@@ -332,6 +374,7 @@ class ExpertMemoryPlan:
         return (
             self.resident_bytes
             + self.kv_bytes
+            + self.fixed_cache_bytes
             + self.transient_bytes
             + self.prefetch_bytes
             + self.io_staging_bytes
@@ -352,7 +395,85 @@ class ExpertMemoryPlan:
 # shared bf16 router weights (tencent/Hy3@716aa724), not the expert codec, so
 # every hy3 bank derived from that revision shares this order.
 _HY3_ROUTED_PIN_ORDER = (
-    1, 4, 5, 13, 2, 3, 12, 18, 14, 15, 11, 10, 16, 17, 22, 28, 24, 26, 6, 25, 66, 29, 71, 27, 31, 19, 7, 69, 67, 23, 33, 32, 74, 9, 8, 50, 73, 79, 65, 72, 75, 70, 20, 30, 57, 21, 60, 64, 35, 51, 49, 68, 48, 59, 61, 77, 54, 38, 47, 52, 78, 53, 45, 62, 34, 58, 76, 63, 46, 55, 56, 44, 36, 37, 41, 43, 39, 40, 42,
+    1,
+    4,
+    5,
+    13,
+    2,
+    3,
+    12,
+    18,
+    14,
+    15,
+    11,
+    10,
+    16,
+    17,
+    22,
+    28,
+    24,
+    26,
+    6,
+    25,
+    66,
+    29,
+    71,
+    27,
+    31,
+    19,
+    7,
+    69,
+    67,
+    23,
+    33,
+    32,
+    74,
+    9,
+    8,
+    50,
+    73,
+    79,
+    65,
+    72,
+    75,
+    70,
+    20,
+    30,
+    57,
+    21,
+    60,
+    64,
+    35,
+    51,
+    49,
+    68,
+    48,
+    59,
+    61,
+    77,
+    54,
+    38,
+    47,
+    52,
+    78,
+    53,
+    45,
+    62,
+    34,
+    58,
+    76,
+    63,
+    46,
+    55,
+    56,
+    44,
+    36,
+    37,
+    41,
+    43,
+    39,
+    40,
+    42,
 )
 
 
@@ -600,11 +721,81 @@ GLM52_EXPERT_Q2 = ExpertStreamingModelSpec(
     mtp_included=False,
     full_indexer_layers=(0, 1, 2, *range(6, 75, 4)),
     island_pin_order=(
-        5, 3, 4, 9, 7, 11, 8, 10, 6, 16, 13, 26, 14, 25, 24,
-        49, 65, 70, 23, 54, 67, 66, 12, 52, 59, 15, 47, 71, 69, 62,
-        17, 48, 61, 68, 74, 53, 57, 76, 75, 73, 60, 55, 77, 30, 29,
-        72, 56, 27, 46, 63, 51, 28, 50, 64, 22, 58, 44, 38, 45, 39,
-        43, 31, 42, 21, 35, 41, 40, 34, 37, 19, 36, 32, 33, 18, 20,
+        5,
+        3,
+        4,
+        9,
+        7,
+        11,
+        8,
+        10,
+        6,
+        16,
+        13,
+        26,
+        14,
+        25,
+        24,
+        49,
+        65,
+        70,
+        23,
+        54,
+        67,
+        66,
+        12,
+        52,
+        59,
+        15,
+        47,
+        71,
+        69,
+        62,
+        17,
+        48,
+        61,
+        68,
+        74,
+        53,
+        57,
+        76,
+        75,
+        73,
+        60,
+        55,
+        77,
+        30,
+        29,
+        72,
+        56,
+        27,
+        46,
+        63,
+        51,
+        28,
+        50,
+        64,
+        22,
+        58,
+        44,
+        38,
+        45,
+        39,
+        43,
+        31,
+        42,
+        21,
+        35,
+        41,
+        40,
+        34,
+        37,
+        19,
+        36,
+        32,
+        33,
+        18,
+        20,
     ),
 )
 
@@ -644,6 +835,45 @@ GLM52_EXPERT_Q1B1 = replace(
 )
 
 
+KIMI_K3_EXPERT_Q1T = ExpertStreamingModelSpec(
+    key="kimi-k3-q1t",
+    display_name="Kimi K3 routed-expert ternary t158",
+    source_model="moonshotai/Kimi-K3",
+    source_revision="9f62e4e9fffbd0a83ddd60e1c209d828994b3569",
+    quant_model="GrEarl/Kimi-K3-GGUF",
+    quant_revision="0169245d3ea1473a3f9f03bca821d855df5fb2a3",
+    total_tensor_bytes=751_651_922_944,
+    total_layers=93,
+    routed_layer_start=1,
+    routed_layer_count=92,
+    expert_count=896,
+    top_k=16,
+    hidden_size=3584,
+    model_hidden_size=7168,
+    expert_hidden_size=3072,
+    # t158 uses the manifest schema's nominal 2-bit value while physically
+    # storing 15 bytes per group of 64 values.
+    quant_bits=2,
+    quant_group_size=64,
+    quant_parameter_bytes=2,
+    router_storage="bfloat16 with fp32 correction bias",
+    router_matmul_dtype="float32",
+    router_bytes=1_182_074_880,
+    # Each of 24 MLA layers stores 576 BF16 values per token (27,648
+    # logical bytes/model token). The measured geometric cache satisfies
+    # capacity < 2 * logical length above its minimum allocation, so admission
+    # conservatively prices the full 2x capacity bound.
+    kv_bytes_per_token=2 * 24 * (512 + 64) * 2,
+    # Preserve the exact 69-layer KDA recurrent/conv cost and separately price
+    # the 24 MLA layers' minimum 256-token geometric allocation.
+    fixed_cache_bytes_per_batch=449_372_160 + 24 * 256 * (512 + 64) * 2,
+    mtp_layer_index=None,
+    mtp_included=False,
+    expert_codec="t158",
+    expert_activation="situ",
+)
+
+
 MODEL_SPECS: dict[str, ExpertStreamingModelSpec] = {
     spec.key: spec
     for spec in (
@@ -657,6 +887,7 @@ MODEL_SPECS: dict[str, ExpertStreamingModelSpec] = {
         GLM52_EXPERT_Q2,
         GLM52_EXPERT_Q1T,
         GLM52_EXPERT_Q1B1,
+        KIMI_K3_EXPERT_Q1T,
     )
 }
 
@@ -748,9 +979,7 @@ def plan_expert_memory(
         )
     if cache_scope not in {"layer", "global"}:
         raise ValueError("cache_scope must be 'layer' or 'global'")
-    island_layer_count = _integer(
-        "island_layer_count", island_layer_count, minimum=0
-    )
+    island_layer_count = _integer("island_layer_count", island_layer_count, minimum=0)
     if island_layer_count > spec.routed_layer_count:
         raise ValueError(
             f"island_layer_count {island_layer_count} exceeds routed layer "
@@ -802,9 +1031,7 @@ def plan_expert_memory(
                 "mixed-official MVP forbids dense/mmap islands and miss-shadow"
             )
         if prefetch_slots_per_layer:
-            raise ValueError(
-                "mixed-official MVP forbids the prefetch ring (perf lane)"
-            )
+            raise ValueError("mixed-official MVP forbids the prefetch ring (perf lane)")
         if cache_scope != "layer":
             raise ValueError("mixed-official banks require cache_scope 'layer'")
         all_routed_bytes = sum(resolved_layer_bytes[layer] for layer in routed)
@@ -818,9 +1045,7 @@ def plan_expert_memory(
         )
     else:
         if layer_record_bytes is not None:
-            raise ValueError(
-                "layer_record_bytes only applies to mixed-official specs"
-            )
+            raise ValueError("layer_record_bytes only applies to mixed-official specs")
         transient_record_total = spec.expert_record_bytes
         spec_resident_bytes = spec.resident_bytes
 
@@ -830,6 +1055,7 @@ def plan_expert_memory(
         raise ValueError(f"transient_slots must be at least top_k ({spec.top_k})")
 
     kv_bytes = context_tokens * spec.kv_bytes_per_token
+    fixed_cache_bytes = spec.fixed_cache_bytes_per_batch
     if kv_quant is not None:
         if kv_quant not in AFFINE_QUANT_KEEP_NUMERATOR:
             raise ValueError("kv_quant must be None, 'q8', or 'q4'")
@@ -859,9 +1085,7 @@ def plan_expert_memory(
         mmap_island_bytes = 0
         streamed_bytes_sum = all_routed_bytes
     else:
-        island_bytes = (
-            island_layer_count * spec.expert_count * spec.expert_record_bytes
-        )
+        island_bytes = island_layer_count * spec.expert_count * spec.expert_record_bytes
         mmap_island_bytes = (
             mmap_island_layer_count * spec.expert_count * spec.expert_record_bytes
         )
@@ -894,6 +1118,7 @@ def plan_expert_memory(
     fixed_bytes = (
         resident_bytes
         + kv_bytes
+        + fixed_cache_bytes
         + runtime_reserve_bytes
         + transient_bytes
         + prefetch_bytes
@@ -945,6 +1170,7 @@ def plan_expert_memory(
         context_tokens=context_tokens,
         resident_bytes=resident_bytes,
         kv_bytes=kv_bytes,
+        fixed_cache_bytes=fixed_cache_bytes,
         transient_slots=service_slots,
         transient_bytes=transient_bytes,
         expert_cache_limit_bytes=expert_cache_limit_bytes,

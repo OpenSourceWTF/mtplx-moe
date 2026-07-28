@@ -55,12 +55,22 @@ _HY3_AR_DEFAULTS = {
     "enable_thinking": False,
     "reasoning_effort": None,
 }
+_KIMI_K3_AR_DEFAULTS = {
+    "max_tokens": 65_536,
+    "max_output_tokens": 262_144,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "enable_thinking": True,
+    "reasoning_effort": "max",
+}
 _MODEL_DEFAULTS = {
     "glm52-q4": _GLM52_AR_DEFAULTS,
     "glm52-expert-q2": _GLM52_AR_DEFAULTS,
     "hy3-q4": _HY3_AR_DEFAULTS,
     "hy3-expert-only-q4": _HY3_AR_DEFAULTS,
     "hy3-expert-q2": _HY3_AR_DEFAULTS,
+    "kimi-k3-q1t": _KIMI_K3_AR_DEFAULTS,
 }
 
 
@@ -383,29 +393,78 @@ def build_model_artifact_identity(
             )
 
     if manifest.sidecar is not None:
-        sidecar_path = resolve_artifact_member(root, manifest.sidecar.file)
-        expert_payload = _verified_file_digest(
-            sidecar_path,
-            require_nocache=require_nocache,
-            receipt_path=(
-                _receipt_path(receipt_dir, sidecar_path)
-                if receipt_dir is not None
-                else None
-            ),
+        declared_parts = getattr(manifest.sidecar, "parts", None)
+        parts = (
+            tuple(declared_parts) if declared_parts is not None else (manifest.sidecar,)
         )
-        if expert_payload["size"] != manifest.sidecar.size:
-            raise ExpertManifestError("sidecar size differs from validated manifest")
-        if expert_payload["sha256"] != manifest.sidecar.sha256:
-            raise ExpertManifestError("sidecar digest differs from validated manifest")
-        expert_payload.update(
-            {
-                "method": "verified_sidecar_sha256",
-                "verification_level": "actual_full_file_digest_matches_manifest",
+        verified_parts: list[dict[str, object]] = []
+        for index, part in enumerate(parts):
+            sidecar_path = resolve_artifact_member(root, part.file)
+            verified = _verified_file_digest(
+                sidecar_path,
+                require_nocache=require_nocache,
+                receipt_path=(
+                    _receipt_path(receipt_dir, sidecar_path)
+                    if receipt_dir is not None
+                    else None
+                ),
+            )
+            if verified["size"] != part.size:
+                label = "sidecar" if len(parts) == 1 else f"sidecar part {index}"
+                raise ExpertManifestError(
+                    f"{label} size differs from validated manifest"
+                )
+            if verified["sha256"] != part.sha256:
+                label = "sidecar" if len(parts) == 1 else f"sidecar part {index}"
+                raise ExpertManifestError(
+                    f"{label} digest differs from validated manifest"
+                )
+            verified_parts.append(
+                {
+                    "index": index,
+                    "file": part.file,
+                    **_verification_identity_fields(
+                        verified,
+                        report_timing=report_timing,
+                    ),
+                }
+            )
+        if len(verified_parts) == 1:
+            expert_payload = {
+                key: value
+                for key, value in verified_parts[0].items()
+                if key not in {"index", "file"}
             }
-        )
-        expert_payload = _verification_identity_fields(
-            expert_payload, report_timing=report_timing
-        )
+            expert_payload.update(
+                {
+                    "method": "verified_sidecar_sha256",
+                    "verification_level": ("actual_full_file_digest_matches_manifest"),
+                }
+            )
+        else:
+            canonical_parts = [
+                {
+                    "file": part["file"],
+                    "size": part["size"],
+                    "sha256": part["sha256"],
+                }
+                for part in verified_parts
+            ]
+            expert_payload = {
+                "method": "verified_multipart_sidecar_sha256",
+                "verification_level": (
+                    "every_actual_full_file_digest_matches_manifest"
+                ),
+                "parts_identity_sha256": _sha256_bytes(
+                    json.dumps(
+                        canonical_parts,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ),
+                "size": sum(int(part["size"]) for part in verified_parts),
+                "parts": verified_parts,
+            }
     else:
         expert_payload = {
             "method": "manifest_record_sha256_inventory",
@@ -1080,11 +1139,20 @@ def build_parser() -> argparse.ArgumentParser:
             "hy3-expert-only-q4",
             "hy3-expert-q2",
             "glm52-expert-q2",
+            "kimi-k3-q1t",
         ],
-        required=True,
     )
-    parser.add_argument("--memory-limit", required=True)
-    parser.add_argument("--max-live-kv-tokens", type=_positive_int, required=True)
+    parser.add_argument("--memory-limit")
+    parser.add_argument("--max-live-kv-tokens", type=_positive_int)
+    parser.add_argument(
+        "--expert-streaming-config",
+        type=Path,
+        help=(
+            "Use the exact JSON ExpertStreamingConfig supplied to the service; "
+            "cannot be combined with --model-key, --memory-limit, or "
+            "--max-live-kv-tokens."
+        ),
+    )
     parser.add_argument("--runtime-reserve", default="16GiB")
     parser.add_argument("--expert-cache-limit")
     parser.add_argument(
@@ -1845,10 +1913,74 @@ def _run_concurrent_repeats(
 _active_evidence_reservations: JsonEvidenceReservations | None = None
 
 
+def resolve_streaming_config(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> ExpertStreamingConfig | None:
+    """Resolve an exact service config or validate the legacy benchmark flags."""
+
+    config_path = args.expert_streaming_config
+    if config_path is None:
+        missing = [
+            flag
+            for flag, value in (
+                ("--model-key", args.model_key),
+                ("--memory-limit", args.memory_limit),
+                ("--max-live-kv-tokens", args.max_live_kv_tokens),
+            )
+            if value is None
+        ]
+        if missing:
+            parser.error(
+                f"{', '.join(missing)} required without --expert-streaming-config"
+            )
+        return None
+
+    if any(
+        value is not None
+        for value in (
+            args.model_key,
+            args.memory_limit,
+            args.max_live_kv_tokens,
+        )
+    ):
+        parser.error(
+            "--expert-streaming-config cannot be combined with --model-key, "
+            "--memory-limit, or --max-live-kv-tokens"
+        )
+    path = config_path.expanduser().resolve()
+    try:
+        if path.stat().st_size > 1024**2:
+            raise ValueError("config exceeds 1 MiB")
+
+        def strict_pairs(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(f"duplicate config key {key!r}")
+                result[key] = value
+            return result
+
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=strict_pairs,
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("config root must be an object")
+        config = ExpertStreamingConfig(**payload)
+    except (OSError, TypeError, ValueError) as exc:
+        parser.error(f"invalid --expert-streaming-config: {exc}")
+    args.model_key = config.model_key
+    args.memory_limit = str(config.memory_limit_bytes)
+    args.max_live_kv_tokens = config.max_live_kv_tokens
+    return config
+
+
 def _main() -> int:
     global _active_evidence_reservations
     parser = build_parser()
     args = parser.parse_args()
+    service_streaming_config = resolve_streaming_config(parser, args)
     validate_resource_flags(parser, args)
     root = args.model_root.expanduser().resolve()
     model_defaults = model_defaults_for_key(args.model_key)
@@ -1923,7 +2055,7 @@ def _main() -> int:
     )
     if validated_manifest is not None:
         validate_sidecar_flags(parser, args, validated_manifest)
-    config = ExpertStreamingConfig(
+    config = service_streaming_config or ExpertStreamingConfig(
         model_key=args.model_key,
         memory_limit_bytes=parse_memory_bytes(args.memory_limit),
         max_live_kv_tokens=args.max_live_kv_tokens,

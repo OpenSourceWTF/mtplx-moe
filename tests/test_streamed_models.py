@@ -2763,8 +2763,13 @@ def test_global_component_bank_all_hit_decode_binds_without_reads(
         def unexpected_split(*_args, **_kwargs):
             raise AssertionError("global all-hit decode used the split route")
 
-        monkeypatch.setattr(
-            expert_mlx, "_run_component_bank_q4", observe_component_bindings
+        switch._component_bank_executor = lambda selected, bindings: (
+            observe_component_bindings(
+                selected,
+                bindings,
+                group_size=spec.quant_group_size,
+                bits=spec.quant_bits,
+            )
         )
         monkeypatch.setattr(runtime, "begin_split_route", unexpected_split)
 
@@ -2965,10 +2970,13 @@ def test_component_bank_all_hit_decode_releases_pins_on_q4_error(
                 raise q4_error
             return selected
 
-        monkeypatch.setattr(
-            expert_mlx,
-            "_run_component_bank_q4",
-            fail_second_wave_with_identity,
+        switch._component_bank_executor = lambda selected, bindings: (
+            fail_second_wave_with_identity(
+                selected,
+                bindings,
+                group_size=spec.quant_group_size,
+                bits=spec.quant_bits,
+            )
         )
 
         with pytest.raises(RuntimeError, match="injected Q4 failure") as failed:
@@ -3025,11 +3033,7 @@ def test_slot_fence_all_hit_synchronous_eval_failure_blocks_replacement(
     eval_error = RuntimeError("injected all-hit synchronous eval failure")
     replacement_ready = None
     original_eval = expert_mlx.mx.eval
-    monkeypatch.setattr(
-        expert_mlx,
-        "_run_component_bank_q4",
-        lambda selected, *_a, **_k: selected,
-    )
+    switch._component_bank_executor = lambda selected, _bindings: selected
 
     try:
         warm = switch(tokens, indices)
@@ -3340,9 +3344,7 @@ def test_speculative_io_admission_caps_prefetch_read_concurrency(
         stream_config = ExpertStreamingConfig(
             model_key=spec.key,
             memory_limit_bytes=(
-                fixed
-                + spec.persistent_cache_bytes(1)
-                + prefetch_slots * record
+                fixed + spec.persistent_cache_bytes(1) + prefetch_slots * record
             ),
             max_live_kv_tokens=0,
             runtime_reserve_bytes=0,
@@ -3413,9 +3415,7 @@ def test_prefetch_skips_experts_the_route_is_already_loading(
     root, config, spec, manifest_path = _integrated_hy3_artifact(
         tmp_path, expert_count=4, top_k=1
     )
-    runtime = _open_prefetch_runtime(
-        root, manifest_path, spec, prefetch_slots=2
-    )
+    runtime = _open_prefetch_runtime(root, manifest_path, spec, prefetch_slots=2)
     layer = 1
     bank = runtime._banks[layer]
     lock = runtime._layer_locks[layer]
@@ -3443,9 +3443,7 @@ def test_prefetch_skips_experts_the_route_is_already_loading(
     finally:
         runtime.close()
 
-    disabled = _open_prefetch_runtime(
-        root, manifest_path, spec, prefetch_slots=0
-    )
+    disabled = _open_prefetch_runtime(root, manifest_path, spec, prefetch_slots=0)
     try:
         assert disabled.speculation_saturated is True
     finally:
@@ -3468,9 +3466,7 @@ def test_prefetch_workers_never_block_on_layer_locks(
     record = spec.expert_record_bytes
     stream_config = ExpertStreamingConfig(
         model_key=spec.key,
-        memory_limit_bytes=(
-            fixed + spec.persistent_cache_bytes(1) + 2 * record
-        ),
+        memory_limit_bytes=(fixed + spec.persistent_cache_bytes(1) + 2 * record),
         max_live_kv_tokens=0,
         runtime_reserve_bytes=0,
         prefetch_slots=2,
@@ -3571,9 +3567,7 @@ def test_prefetch_ring_load_resolves_as_route_hit_bitwise(
                 # release keeps it across evals) must skip speculation
                 # without planning anything, never block the caller.
                 with runtime._layer_locks[streamed_layer]:
-                    assert (
-                        runtime.prefetch_experts(streamed_layer, [0, 1]) == 0
-                    )
+                    assert runtime.prefetch_experts(streamed_layer, [0, 1]) == 0
                 # Both experts are uncached; each must get a ring load.
                 issued = runtime.prefetch_experts(streamed_layer, [0, 1])
                 assert issued == 2
@@ -3708,9 +3702,7 @@ def test_stale_prefetch_commit_never_publishes_a_reassigned_ring_slot(
     root, config, spec, manifest_path = _integrated_hy3_artifact(
         tmp_path, expert_count=4, top_k=1
     )
-    runtime = _open_prefetch_runtime(
-        root, manifest_path, spec, prefetch_slots=2
-    )
+    runtime = _open_prefetch_runtime(root, manifest_path, spec, prefetch_slots=2)
     layer = 1
     bank = runtime._banks[layer]
     lock = runtime._layer_locks[layer]
@@ -3766,9 +3758,7 @@ def test_stale_prefetch_commit_never_publishes_a_reassigned_ring_slot(
         for expert in (0, 2):
             ready = runtime.ensure_route(layer, [expert], phase="decode")
             try:
-                assert [
-                    binding.expert for binding in ready.bindings
-                ] == [expert]
+                assert [binding.expert for binding in ready.bindings] == [expert]
             finally:
                 ready.release()
     finally:
@@ -3795,9 +3785,7 @@ def test_recycled_ring_assignment_load_never_claims_a_published_slot(
     root, config, spec, manifest_path = _integrated_hy3_artifact(
         tmp_path, expert_count=4, top_k=1
     )
-    runtime = _open_prefetch_runtime(
-        root, manifest_path, spec, prefetch_slots=2
-    )
+    runtime = _open_prefetch_runtime(root, manifest_path, spec, prefetch_slots=2)
     layer = 1
     bank = runtime._banks[layer]
     lock = runtime._layer_locks[layer]
@@ -3842,9 +3830,7 @@ def test_recycled_ring_assignment_load_never_claims_a_published_slot(
         for expert in published:
             ready = runtime.ensure_route(layer, [expert], phase="decode")
             try:
-                assert [
-                    binding.expert for binding in ready.bindings
-                ] == [expert]
+                assert [binding.expert for binding in ready.bindings] == [expert]
             finally:
                 ready.release()
     finally:
@@ -3897,9 +3883,7 @@ def test_prefetch_stress_concurrent_recycling_keeps_routes_healthy(
             resident = construct_resident_model(root, runtime, config=config)
             outputs = []
             for step in range(steps):
-                logits = resident.model(
-                    mx.array([[1 + (step % 7)]], dtype=mx.int32)
-                )
+                logits = resident.model(mx.array([[1 + (step % 7)]], dtype=mx.int32))
                 mx.eval(logits)
                 outputs.append(logits)
             snapshot = runtime.snapshot(mx_module=mx)
