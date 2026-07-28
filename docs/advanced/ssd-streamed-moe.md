@@ -395,17 +395,29 @@ admission asks for.
 
 ### What has been verified
 
-Smoke-tested on a 128 GiB M5 Max with a clean
-`mtplx 2.3.0+opensourcewtf.moe` install: Hy3 at 32 GiB, GLM at 32 GiB, and GLM
-at 48 GiB. Each constructed its real model, reached `MTPLX is ready`, reported
-the slot count above through `/health`, listed its model through `/v1/models`,
-and returned a nonempty AR chat completion. That shows those configurations
-execute. It is not a throughput receipt, and it is not a GLM t158 task-quality
-validation.
+Every Hy3 row above was constructed against the real model on a 128 GiB M5 Max.
+Each reached `MTPLX is ready`, reported through `/health` the exact slot count
+its plan predicted, and returned a nonempty AR chat completion:
 
-The Hy3 40 GiB and 47 GiB rows come from the same memory plan the runtime
-builds at construction and are covered by `tests/test_expert_cache_tiers.py`,
-but neither has been constructed on hardware.
+| Cache cap | Slots/layer predicted | Reported | Planned total | Measured RSS |
+|---:|---:|---:|---:|---:|
+| 32 GiB | 81 | 81 | 48.636 GiB | 33.609 GiB |
+| 40 GiB | 102 | 102 | 56.838 GiB | 41.849 GiB |
+| 47 GiB | 120 | 120 | 63.868 GiB | 48.855 GiB |
+
+`/health` also confirmed the resolved configuration each time: profile
+`hy3-oq2e-64`, model key `hy3-expert-oq2e`, the 71 GiB declared ceiling intact,
+and `expert_cache_limit_bytes` equal to the requested cap exactly.
+
+Measured RSS runs about 15 GiB under the planned total at every size. The plan
+counts the 7 GiB runtime reserve, which is budget rather than an allocation, and
+does not subtract the `proj_requant=q4` resident discount. Read the planned
+total as the number admission compares and as a ceiling on real residency, not
+as an expected RSS.
+
+The two GLM rows were smoke-tested separately under the same conditions. None
+of this is a throughput receipt, and it is not a GLM t158 task-quality
+validation.
 
 One sizing caveat worth stating directly: a 47 GiB Hy3 cache clears a 64 GiB
 machine's installed-RAM check by only 132 MiB, and will still be refused by the
