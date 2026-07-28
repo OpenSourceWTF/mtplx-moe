@@ -1,0 +1,122 @@
+{
+  "title": "Community replication: Qwen3.5-9B Speed tune + AIME quick on M4 Max 128 GB",
+  "contributor": "odilitime",
+  "utc_date": "2026-07-25",
+  "source_commit": "d5adda1",
+  "package_version": "2.3.0+opensourcewtf.moe",
+  "aggregation": "single run (tune once; AIME quick once)",
+  "repeat_count": 1,
+  "hardware": {
+    "chip": "Apple M4 Max",
+    "hw_model": "Mac16,5",
+    "memory_gib": 128.0,
+    "perf_cores": 12,
+    "efficiency_cores": 4,
+    "logical_cpu": 16
+  },
+  "software": {
+    "macos_version": "26.5.1",
+    "macos_build": "25F80",
+    "python": "3.11.15",
+    "mlx_version": "0.32.0",
+    "mlx_lm_version": "0.31.3"
+  },
+  "model": {
+    "hf_model_id": "Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed",
+    "served_model_id": "mtplx-qwen35-9b-optimized-speed"
+  },
+  "fan_mode": "auto",
+  "fans_pinned": false,
+  "tune": {
+    "command": "mtplx tune --model Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed --retune --json --verbose",
+    "profile": "performance-cold",
+    "sampler": {
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "top_k": 20,
+      "seed": 0
+    },
+    "max_tokens": 512,
+    "limit": 1,
+    "depths": [1, 2, 3],
+    "winner": {
+      "mode": "D3",
+      "depth": 3,
+      "tok_s": 114.48671452688899,
+      "multiplier_vs_ar": 2.0302801994660418
+    },
+    "results": [
+      {
+        "mode": "AR",
+        "depth": null,
+        "tok_s": 56.38961290022859,
+        "multiplier_vs_ar": 1.0
+      },
+      {
+        "mode": "D1",
+        "depth": 1,
+        "tok_s": 84.97890343693958,
+        "multiplier_vs_ar": 1.5069956870832693,
+        "acceptance_by_depth": [0.8807692307692307]
+      },
+      {
+        "mode": "D2",
+        "depth": 2,
+        "tok_s": 105.02369402871444,
+        "multiplier_vs_ar": 1.8624652418617453,
+        "acceptance_by_depth": [0.9441340782122905, 0.7877094972067039]
+      },
+      {
+        "mode": "D3",
+        "depth": 3,
+        "tok_s": 114.48671452688899,
+        "multiplier_vs_ar": 2.0302801994660418,
+        "acceptance_by_depth": [
+          0.9440559440559441,
+          0.8111888111888111,
+          0.6901408450704225
+        ]
+      }
+    ],
+    "notes": [
+      "Pinned-fan timing was unavailable; fans stayed on the Apple auto curve.",
+      "Not a product headline claim; community replication of the published 9B tune recipe."
+    ]
+  },
+  "aime_quick": {
+    "command": "mtplx bench aime --quick --url http://127.0.0.1:18080 --port 18080 --model Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed --max-tokens 2048 --json --verbose",
+    "run_id": "aime-2026-20260725T191018Z-8b550f",
+    "profile": "performance-cold",
+    "depth": 3,
+    "mtp_enabled": true,
+    "enable_thinking": true,
+    "score": 5,
+    "total": 5,
+    "accuracy": 1.0,
+    "duration_ms": 1461159,
+    "questions": [
+      {"id": "2026-I-1", "status": "correct", "duration_ms": 231440},
+      {"id": "2026-I-2", "status": "correct", "duration_ms": 365545},
+      {"id": "2026-I-3", "status": "correct", "duration_ms": 285915},
+      {"id": "2026-I-4", "status": "correct", "duration_ms": 391196},
+      {"id": "2026-I-5", "status": "correct", "duration_ms": 187057}
+    ],
+    "notes": [
+      "AIME quick used the live OpenAI-compatible server on port 18080.",
+      "Reported question tok/s in the CLI banner mixes long CoT with verify overhead; use the tune table for decode throughput."
+    ]
+  },
+  "live_decode_sample": {
+    "description": "Single short /v1/chat/completions request after warmup",
+    "profile": "performance-cold",
+    "depth": 3,
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "max_tokens": 128,
+    "completion_tokens": 128,
+    "decode_tok_s": 109.66849920677792,
+    "ttft_s": 0.18319766700733453,
+    "accepted_by_depth": [34, 30, 25],
+    "drafted_by_depth": [38, 38, 38]
+  }
+}
