@@ -205,6 +205,7 @@ def add_expert_streaming_args(parser: argparse.ArgumentParser) -> None:
             "glm52-expert-q2",
             "glm52-expert-q1t",
             "glm52-expert-q1b1",
+            "kimi-k3-q1t",
         ],
         help="Pinned streamed model descriptor; inferred from config.json by default.",
     )
@@ -286,22 +287,15 @@ def expert_streaming_requested(args: Any) -> bool:
     cli_flags = set(getattr(args, "_cli_flags", set()) or set())
     if "no-expert-streaming" in cli_flags:
         positive_selector = None
-        if (
-            "expert-streaming" in cli_flags
-            or getattr(args, "expert_streaming", False)
-        ):
+        if "expert-streaming" in cli_flags or getattr(args, "expert_streaming", False):
             positive_selector = "--expert-streaming"
         elif profile != "auto":
             positive_selector = "--expert-profile"
-        elif (
-            "expert-streaming-config" in cli_flags
-            or getattr(args, "expert_streaming_config", None)
+        elif "expert-streaming-config" in cli_flags or getattr(
+            args, "expert_streaming_config", None
         ):
             positive_selector = "--expert-streaming-config"
-        elif (
-            "expert-manifest" in cli_flags
-            or getattr(args, "expert_manifest", None)
-        ):
+        elif "expert-manifest" in cli_flags or getattr(args, "expert_manifest", None):
             positive_selector = "--expert-manifest"
         if positive_selector is None:
             positive_flag = next(
@@ -316,8 +310,7 @@ def expert_streaming_requested(args: Any) -> bool:
                 positive_selector = f"--{positive_flag}"
         if positive_selector is not None:
             raise ValueError(
-                f"{positive_selector} cannot be combined with "
-                "--no-expert-streaming"
+                f"{positive_selector} cannot be combined with --no-expert-streaming"
             )
     return bool(
         getattr(args, "expert_streaming", False)
@@ -581,9 +574,7 @@ def _explicit_overrides(args: Any) -> dict[str, Any]:
         "cache_scope": getattr(args, "expert_cache_scope", None),
         "transient_slots": getattr(args, "expert_transient_slots", None),
         "io_staging_bytes": getattr(args, "expert_io_staging", None),
-        "execution_workspace_bytes": getattr(
-            args, "expert_execution_workspace", None
-        ),
+        "execution_workspace_bytes": getattr(args, "expert_execution_workspace", None),
         "max_inflight_io_bytes": getattr(args, "expert_max_inflight_io", None),
         "max_open_files": getattr(args, "expert_max_open_files", None),
         "max_read_chunk_bytes": getattr(args, "expert_read_chunk", None),
@@ -711,14 +702,10 @@ def expert_streaming_load_kwargs(
     if (
         (
             "generation-mode" in cli_flags
-            and str(getattr(args, "generation_mode", "") or "").strip().lower()
-            == "mtp"
+            and str(getattr(args, "generation_mode", "") or "").strip().lower() == "mtp"
         )
         or "mtp" in cli_flags
-        or (
-            "load-mtp" in cli_flags
-            and getattr(args, "load_mtp", True) is True
-        )
+        or ("load-mtp" in cli_flags and getattr(args, "load_mtp", True) is True)
     ):
         raise ValueError(
             "promoted streamed profiles are AR-only in the OpenSourceWTF "
@@ -736,9 +723,7 @@ def expert_streaming_load_kwargs(
     model_key = _resolve_model_key(root, manifest)
     values = _load_config_object(getattr(args, "expert_streaming_config", None))
     overrides = _explicit_overrides(args)
-    configured_model_key = overrides.pop(
-        "model_key", values.pop("model_key", None)
-    )
+    configured_model_key = overrides.pop("model_key", values.pop("model_key", None))
     if configured_model_key is not None and configured_model_key != model_key:
         raise ValueError(
             f"expert model key {configured_model_key!r} does not match "
@@ -760,9 +745,7 @@ def expert_streaming_load_kwargs(
                 overrides=profile_overrides,
             )
         except TypeError as exc:
-            raise ValueError(
-                f"invalid expert profile overrides: {exc}"
-            ) from exc
+            raise ValueError(f"invalid expert profile overrides: {exc}") from exc
         setattr(args, "expert_profile", profile.name)
     else:
         values["model_key"] = model_key

@@ -471,6 +471,91 @@ def test_model_identity_covers_small_resident_bytes_and_reuses_sidecar_digest(
         )
 
 
+def test_model_identity_hashes_every_multipart_sidecar_without_scalar_file(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    part_payloads = (b"first expert part", b"second expert part")
+    parts = tuple(
+        SimpleNamespace(
+            file=f"experts-{index}.bin",
+            size=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+        )
+        for index, payload in enumerate(part_payloads)
+    )
+
+    def validated_manifest(_path, *, verify_digest):
+        assert verify_digest is True
+        return SimpleNamespace(
+            sidecar=SimpleNamespace(parts=parts),
+            resident_tensors=(),
+        )
+
+    monkeypatch.setattr(module, "load_expert_manifest", validated_manifest)
+    root = tmp_path / "model"
+    root.mkdir()
+    manifest = root / "expert-manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "model_key": "kimi-k3-q1t",
+                "source_revision": "rev",
+                "manifest_sha256": "manifest",
+            }
+        ),
+        encoding="utf-8",
+    )
+    for part, payload in zip(parts, part_payloads, strict=True):
+        (root / part.file).write_bytes(payload)
+
+    identity = module.build_model_artifact_identity(root, manifest)
+
+    assert identity["expert_payload"]["method"] == ("verified_multipart_sidecar_sha256")
+    assert [part["file"] for part in identity["expert_payload"]["parts"]] == [
+        "experts-0.bin",
+        "experts-1.bin",
+    ]
+    assert identity["expert_payload"]["size"] == sum(map(len, part_payloads))
+
+
+def test_benchmark_accepts_service_streaming_config_for_kimi_k3(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    config_path = tmp_path / "kimi-streaming.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_key": "kimi-k3-q1t",
+                "memory_limit_bytes": 128 * 1024**3,
+                "max_live_kv_tokens": 1024,
+                "runtime_reserve_bytes": 0,
+                "slot_layout": "component-banks",
+            }
+        ),
+        encoding="utf-8",
+    )
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [
+            "/model",
+            "/manifest",
+            "--expert-streaming-config",
+            str(config_path),
+        ]
+    )
+
+    config = module.resolve_streaming_config(parser, args)
+
+    assert config.model_key == "kimi-k3-q1t"
+    assert config.memory_limit_bytes == 128 * 1024**3
+    assert config.slot_layout == "component-banks"
+    assert args.model_key == "kimi-k3-q1t"
+    assert args.max_live_kv_tokens == 1024
+
+
 def test_harness_source_identity_detects_uncommitted_source_change(
     tmp_path: Path,
 ) -> None:

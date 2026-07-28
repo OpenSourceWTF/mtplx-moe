@@ -37,6 +37,10 @@ def test_streamed_moe_release_flow_lives_in_advanced_guide():
         for guide in install_guides
     )
     assert "--expert-profile hy3-oq2e-64" in advanced
+    assert "OpensourceWTF/Kimi-K3-Q2_K-t158-MTPLX-streaming" in advanced
+    assert "configs/kimi-k3-t158-110g-host.json" in advanced
+    assert "configs/kimi-k3-t158-128g-host.json" in advanced
+    assert "Kimi K3 t158" in advanced
 
 
 def test_fork_docs_cover_upstream_and_litellm_collisions():

@@ -1,0 +1,20 @@
+{
+  "model_key": "kimi-k3-q1t",
+  "memory_limit_bytes": 118111600640,
+  "max_live_kv_tokens": 131072,
+  "runtime_reserve_bytes": 17179869184,
+  "transient_slots": 16,
+  "max_open_files": 16,
+  "max_read_chunk_bytes": 8388608,
+  "prefer_sidecar": true,
+  "verify_record_hashes": false,
+  "verify_artifact_headers": true,
+  "verify_sidecar_hash_at_open": false,
+  "slot_layout": "component-banks",
+  "cache_policy": "frequency",
+  "cache_scope": "layer",
+  "trace_routes": false,
+  "resource_telemetry": false,
+  "route_census": false,
+  "proj_quant": "q8"
+}

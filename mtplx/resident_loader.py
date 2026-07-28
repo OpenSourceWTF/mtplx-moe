@@ -152,6 +152,10 @@ def get_streaming_model_classes(config: dict[str, Any]) -> tuple[type, type]:
         from .models.glm52_mlx import Model, ModelArgs
 
         return Model, ModelArgs
+    if model_type == "kimi_linear":
+        from .models.kimi_k3_mlx import Model, ModelArgs
+
+        return Model, ModelArgs
     raise ResidentLoadError(f"no streamed model overlay for model_type={model_type!r}")
 
 
@@ -202,7 +206,12 @@ def _quantize_resident_model(
 _PROJ_QUANT_BITS = {"q8": 8, "q4": 4}
 
 
-def _runtime_quantize_projections(model: Any, mode: str) -> list[str]:
+def _runtime_quantize_projections(
+    model: Any,
+    mode: str,
+    *,
+    model_key: str | None = None,
+) -> list[str]:
     """Quantize the bandwidth-dominant trunk ``*_proj`` Linears after a BF16 load.
 
     Scope comes from ``proj_quant_covers`` — the memory plan discounts the
@@ -220,11 +229,16 @@ def _runtime_quantize_projections(model: Any, mode: str) -> list[str]:
     quantized: list[str] = []
 
     def predicate(path: str, module: Any) -> bool:
-        if not isinstance(module, nn.Linear) or isinstance(
-            module, nn.QuantizedLinear
+        quantizable_types: tuple[type, ...] = (nn.Linear,)
+        quantized_types: tuple[type, ...] = (nn.QuantizedLinear,)
+        if model_key == "kimi-k3-q1t":
+            quantizable_types += (nn.Embedding,)
+            quantized_types += (nn.QuantizedEmbedding,)
+        if not isinstance(module, quantizable_types) or isinstance(
+            module, quantized_types
         ):
             return False
-        if proj_quant_covers(path):
+        if proj_quant_covers(path, model_key=model_key):
             quantized.append(path)
             return True
         return False
@@ -327,9 +341,7 @@ def _verify_kv_quant_honored(model: Any, kv_quant: str) -> None:
 
         probe_cache = model.make_cache()
     except Exception as exc:
-        raise ResidentLoadError(
-            f"kv_quant={kv_quant!r} probe failed: {exc}"
-        ) from exc
+        raise ResidentLoadError(f"kv_quant={kv_quant!r} probe failed: {exc}") from exc
     if not any(isinstance(entry, QuantizedKVCache) for entry in probe_cache):
         raise ResidentLoadError(
             f"kv_quant={kv_quant!r} requested but "
@@ -358,9 +370,13 @@ def construct_resident_model(
         except Exception as exc:
             raise ResidentLoadError(f"could not load model config: {exc}") from exc
     config = dict(config)
-    if str(config.get("model_type") or "") not in {"hy_v3", "glm_moe_dsa"}:
+    if str(config.get("model_type") or "") not in {
+        "hy_v3",
+        "glm_moe_dsa",
+        "kimi_linear",
+    }:
         raise ResidentLoadError(
-            "resident streaming supports only hy_v3 and glm_moe_dsa"
+            "resident streaming supports only hy_v3, glm_moe_dsa, and kimi_linear"
         )
     resolver = model_class_resolver or get_streaming_model_classes
     model_class, args_class = resolver(config)
@@ -396,7 +412,11 @@ def construct_resident_model(
         # Drop the loader's references first so each replaced BF16 weight
         # frees as its quantized module lands, instead of at function exit.
         weights.clear()
-        quantized_paths = _runtime_quantize_projections(model, proj_quant)
+        quantized_paths = _runtime_quantize_projections(
+            model,
+            proj_quant,
+            model_key=runtime.spec.key,
+        )
     proj_requant = getattr(runtime.config, "proj_requant", None)
     requantized_paths: list[str] = []
     if proj_requant:

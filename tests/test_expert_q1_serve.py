@@ -183,9 +183,14 @@ def test_q1_forward_executes_through_shadow_kernel(tmp_path: Path) -> None:
     seen_codecs: list[str] = []
     original = expert_mlx._run_component_bank_shadow
 
-    def spy(selected, bindings, *, codec):
+    def spy(selected, bindings, *, codec, activation):
         seen_codecs.append(codec)
-        return original(selected, bindings, codec=codec)
+        return original(
+            selected,
+            bindings,
+            codec=codec,
+            activation=activation,
+        )
 
     expert_mlx._run_component_bank_shadow = spy
     try:
