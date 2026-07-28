@@ -1,11 +1,12 @@
 # SSD-streamed MoE
 
-MTPLX recognizes two prepacked SSD-streamed models on Hugging Face:
+MTPLX recognizes three prepacked SSD-streamed models on Hugging Face:
 
 | Model | Routed-expert bank | Model key | OpenSourceWTF fork status |
 |---|---|---|---|
 | `OpensourceWTF/Hy3-oQ2e-MTPLX-streaming` | `experts.bin` | `hy3-expert-oq2e` | Promoted profiles |
 | `OpensourceWTF/GLM-5.2-t158-MTPLX-streaming` | `experts-q1-t158.bin` | `glm52-expert-q1t` | Manual, experimental configuration |
+| `OpensourceWTF/Kimi-K3-Q2_K-t158-MTPLX-streaming` | 92 layer-local t158 parts | `kimi-k3-q1t` | Manual, experimental configuration |
 
 MTPLX keeps resident tensors and a bounded expert bank in unified memory and
 reads the remaining routed experts from the serialized Hugging Face bank. Users
@@ -43,12 +44,13 @@ installed, use the venv's absolute command as shown; see
 collision handling.
 
 `--download` fetches the resident shards, tokenizer/config files,
-`expert-manifest.json`, and the expert bank named by that manifest: literal
-`experts.bin` for Hy3 or `experts-q1-t158.bin` for GLM. Before model
-construction, the streamed path validates its manifest and expert bank and
+`expert-manifest.json`, and the expert payloads named by that manifest: literal
+`experts.bin` for Hy3, `experts-q1-t158.bin` for GLM, or the 92
+`experts-t158-layer-NNN-of-092.bin` parts for Kimi K3. Before model
+construction, the streamed path validates its manifest and expert payloads and
 writes a revision- and digest-bound admission receipt outside the immutable
 model snapshot. A subsequent launch reuses a matching receipt rather than
-hashing the bank again.
+hashing the payloads again.
 
 To download before occupying the server port, run:
 
@@ -265,6 +267,68 @@ an experimental serving configuration rather than a quality recommendation.
 Changing the memory limit, reserve, cache cap, context budget, or workload
 creates a new unmeasured configuration; startup will still validate that its
 fixed footprint fits.
+
+## Kimi K3 t158
+
+Kimi K3 uses the same bounded component-bank runtime as GLM, but not GLM's
+model arithmetic or cache geometry. The artifact requantizes only the 92
+routed-MoE layers from the pinned Q2_K source to MTPLX t158. Resident BF16/F32
+weights are copied unchanged into the artifact. At construction,
+`"proj_quant": "q8"` dynamically quantizes compatible resident linear and
+embedding modules; it does not rewrite the checkpoint. Router gates, residual
+score projections, norms, convolutions, recurrent vectors, and biases retain
+their source precision.
+
+The text route is experimental and AR-only. This checkpoint has no MTP weights,
+and Kimi K3 KV quantization and reasoning parsing are not enabled. Startup
+validates the exact K3 topology, SITU activation, resident allowlist, 92-part
+manifest, and q8 resident scope once before installing the direct streamed
+route.
+
+Two measured configurations are tracked:
+
+- [`configs/kimi-k3-t158-110g-host.json`](../../configs/kimi-k3-t158-110g-host.json)
+  declares the 110 GiB candidate envelope.
+- [`configs/kimi-k3-t158-128g-host.json`](../../configs/kimi-k3-t158-128g-host.json)
+  declares the 96 GiB control envelope used on the same 128 GB host.
+
+From a repository checkout, launch the 110 GiB plan with:
+
+```bash
+"$MTPLX_MOE_VENV/bin/mtplx" serve \
+  --model OpensourceWTF/Kimi-K3-Q2_K-t158-MTPLX-streaming \
+  --download \
+  --expert-streaming-config configs/kimi-k3-t158-110g-host.json
+```
+
+Launch the lower-memory 96 GiB plan with:
+
+```bash
+"$MTPLX_MOE_VENV/bin/mtplx" serve \
+  --model OpensourceWTF/Kimi-K3-Q2_K-t158-MTPLX-streaming \
+  --download \
+  --expert-streaming-config configs/kimi-k3-t158-128g-host.json
+```
+
+Both configurations keep a 16 GiB runtime reserve, permit 131,072 live KV
+tokens, use a layer-scoped frequency cache with 16 transient slots, and
+dynamically quantize eligible resident weights to q8. They are sized for a
+128 GB unified-memory host and are not promoted profiles.
+
+The retained M5 Max benchmark used exactly 1,024 prompt and 1,024 output tokens
+while an unpaused four-worker Hugging Face upload was active:
+
+| Memory plan | Prefill | AR decode | Peak physical footprint |
+|---|---:|---:|---:|
+| 96 GiB control | 7.39 tok/s | 1.18 tok/s | 83.8 GiB |
+| 110 GiB candidate | 6.43 tok/s | 1.11 tok/s | 97.9 GiB |
+
+Both lanes produced the same output with zero I/O or integrity errors. The
+110 GiB plan raised the decode cache hit rate by 9.25 percentage points and
+reduced decode reads by 13.73%, but it was slower in this concurrent-load run.
+The result supports the memory-safety claim, not a throughput win. The
+[benchmark receipt](../../benchmarks/results/kimi-k3-t158-1024x1024-memory-ab-20260727.json)
+contains the exact prompt identity, settings, counters, and caveat.
 
 ## Cache tiers
 
