@@ -1242,6 +1242,39 @@ def _open_browser_later(url: str, *, delay_s: float = 1.0) -> None:
     timer.start()
 
 
+DEFAULT_SERVED_MODEL_ID = "mtplx-qwen36-27b-native-mtp"
+
+
+def _derive_served_model_id(model_ref: str | None) -> str:
+    """Name the served model after what was actually loaded.
+
+    ``--model-id`` sets the identity returned by ``/v1/models``, ``/health``,
+    and every completion. It used to default to one specific model's name, so
+    serving anything else advertised the wrong identity -- which matters,
+    because clients select prompt formats and tool modes by matching on this
+    string.
+
+    The stock model keeps its established id so existing clients are unaffected.
+    Anything else is named after its repo or directory: both
+    ``OpensourceWTF/Hy3-oQ2e-MTPLX-streaming`` and a local
+    ``.../OpensourceWTF--Hy3-oQ2e-MTPLX-streaming`` become
+    ``hy3-oq2e-mtplx-streaming``.
+    """
+
+    from mtplx.profiles import DEFAULT_HF_MODEL_ID
+
+    reference = str(model_ref or "").strip()
+    if not reference or reference == DEFAULT_HF_MODEL_ID:
+        return DEFAULT_SERVED_MODEL_ID
+
+    tail = reference.rstrip("/").split("/")[-1]
+    # Local snapshot directories encode the org as "Org--Repo".
+    if "--" in tail:
+        tail = tail.split("--")[-1]
+    slug = re.sub(r"[^0-9A-Za-z]+", "-", tail).strip("-").lower()
+    return slug or DEFAULT_SERVED_MODEL_ID
+
+
 def _open_pi_later(command: str, *, model_id: str, delay_s: float = 1.0) -> None:
     def open_pi() -> None:
         try:
@@ -26134,7 +26167,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     from mtplx.expert_cli import add_expert_streaming_args
 
     add_expert_streaming_args(parser)
-    parser.add_argument("--model-id", default="mtplx-qwen36-27b-native-mtp")
+    # Left unset so it can be derived from --model after parsing. A fixed
+    # default advertised one specific model's name through /v1/models no matter
+    # what was actually loaded. See _derive_served_model_id.
+    parser.add_argument("--model-id", default=None)
     parser.add_argument("--backend-id", default="qwen3_next", help=argparse.SUPPRESS)
     parser.add_argument(
         "--assistant-model",
@@ -26664,6 +26700,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Hermes command to open when --launch-hermes is set.",
     )
     args = parser.parse_args(raw_args)
+    if getattr(args, "model_id", None) is None:
+        args.model_id = _derive_served_model_id(getattr(args, "model", None))
     args._raw_args = list(raw_args)
     args._cli_flags = canonicalize_flag_tokens(
         _explicit_server_flags(raw_args), parser, args
