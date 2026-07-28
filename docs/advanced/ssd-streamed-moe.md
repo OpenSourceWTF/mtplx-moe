@@ -6,7 +6,7 @@ MTPLX recognizes three prepacked SSD-streamed models on Hugging Face:
 |---|---|---|---|
 | `OpensourceWTF/Hy3-oQ2e-MTPLX-streaming` | `experts.bin` | `hy3-expert-oq2e` | Promoted profiles |
 | `OpensourceWTF/GLM-5.2-t158-MTPLX-streaming` | `experts-q1-t158.bin` | `glm52-expert-q1t` | Manual, experimental configuration |
-| `OpensourceWTF/Kimi-K3-Q2_K-t158-MTPLX-streaming` | 92 layer-local t158 parts | `kimi-k3-q1t` | Manual, experimental configuration |
+| [`OpensourceWTF/Kimi-K3-Q2_K-t158-MTPLX-streaming`](https://huggingface.co/OpensourceWTF/Kimi-K3-Q2_K-t158-MTPLX-streaming) | 92 layer-local t158 parts | `kimi-k3-q1t` | Manual, experimental configuration |
 
 MTPLX keeps resident tensors and a bounded expert bank in unified memory and
 reads the remaining routed experts from the serialized Hugging Face bank. Users
