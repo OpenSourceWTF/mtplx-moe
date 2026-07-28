@@ -50,3 +50,9 @@ benchmark_outputs/
 
 # AI assistant artifacts
 context-snapshot.json
+session-log.md
+project-map.md
+/docs/plans/
+
+# Raw harness stdout. Keep the JSON receipts beside it, not the transcript.
+evals/**/*.log
