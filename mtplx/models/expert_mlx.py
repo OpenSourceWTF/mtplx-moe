@@ -11,6 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
@@ -38,6 +39,30 @@ from mtplx.mmap_mlx import mmap_u32
 # affine when the layer's tier is "affine2"; down is always 3-bit affine.
 _MIXED_AFFINE_BITS = {"affine2": 2, "affine3": 3}
 _MIXED_DOWN_BITS = 3
+
+
+def _situ_expert_activation(gate: mx.array, up: mx.array) -> mx.array:
+    """K3 SITU in FP32, cast once to the incoming expert activation dtype."""
+
+    output_dtype = gate.dtype
+    gate32 = gate.astype(mx.float32)
+    up32 = up.astype(mx.float32)
+    return (
+        4.0 * mx.tanh(gate32 / 4.0) * mx.sigmoid(gate32) * 25.0 * mx.tanh(up32 / 25.0)
+    ).astype(output_dtype)
+
+
+def _resolve_expert_activation(
+    activation: str,
+) -> Callable[[mx.array, mx.array], mx.array]:
+    """Resolve invariant expert arithmetic at streamed-switch construction."""
+
+    if activation == "swiglu":
+        return swiglu
+    if activation == "situ":
+        return _situ_expert_activation
+    raise ValueError(f"unsupported streamed expert activation {activation!r}")
+
 
 _ROUTING_PHASE: ContextVar[RoutingPhase | None] = ContextVar(
     "mtplx_expert_routing_phase",
@@ -537,9 +562,7 @@ class DenseIslandStore:
         self.expert_count = int(expert_count)
         if not self.layers:
             raise ValueError("dense island store requires at least one layer")
-        records = {
-            (record.layer, record.expert): record for record in manifest.records
-        }
+        records = {(record.layer, record.expert): record for record in manifest.records}
         self._records: dict[int, tuple[ExpertRecord, ...]] = {}
         self._banks: dict[int, MlxComponentBank] = {}
         self._fill_seconds = 0.0
@@ -568,9 +591,7 @@ class DenseIslandStore:
 
     @property
     def island_bytes(self) -> int:
-        return sum(
-            bank.capacity * bank.record_bytes for bank in self._banks.values()
-        )
+        return sum(bank.capacity * bank.record_bytes for bank in self._banks.values())
 
     def fill(
         self,
@@ -910,8 +931,7 @@ class BankedMmapIslandStore:
                     )
                 if component.offset % item_size:
                     raise BankedManifestError(
-                        f"banked component {component.component} is not "
-                        "dtype-aligned"
+                        f"banked component {component.component} is not dtype-aligned"
                     )
                 arrays[component.component] = mx.as_strided(
                     typed,
@@ -938,9 +958,7 @@ class BankedMmapIslandStore:
             handle.seek(entry.offset)
             region = handle.read(entry.length)
         if len(region) != entry.length:
-            raise BankedManifestError(
-                f"banked layer {entry.layer} region is truncated"
-            )
+            raise BankedManifestError(f"banked layer {entry.layer} region is truncated")
         arrays: dict[str, mx.array] = {}
         for component in entry.components:
             blob = region[component.offset : component.offset + component.length]
@@ -950,9 +968,7 @@ class BankedMmapIslandStore:
             elif component.dtype == "BF16":
                 typed = mx.view(decoded, mx.bfloat16)
             else:
-                raise TypeError(
-                    f"unsupported banked component dtype {component.dtype}"
-                )
+                raise TypeError(f"unsupported banked component dtype {component.dtype}")
             bank = typed.reshape(self.expert_count, *component.shape)
             mx.eval(bank)  # materialize; releases the compressed payload graph
             arrays[component.component] = bank
@@ -1446,6 +1462,7 @@ def _run_component_bank_shadow(
     bindings: tuple[ExpertSlotBinding, ...],
     *,
     codec: str,
+    activation: Callable[[mx.array, mx.array], mx.array],
 ) -> mx.array:
     """Execute assignment-aligned rows of a shadow-codec (q1) slot bank.
 
@@ -1469,7 +1486,13 @@ def _run_component_bank_shadow(
         [int(binding.buffer.bank_index) for binding in bindings],
         dtype=mx.int32,
     )
-    return _shadow_gather_component_bank(x, bank, slot_rows, codec=codec)
+    return _shadow_gather_component_bank(
+        x,
+        bank,
+        slot_rows,
+        codec=codec,
+        activation=activation,
+    )
 
 
 def _shadow_gather_component_bank(
@@ -1478,6 +1501,7 @@ def _shadow_gather_component_bank(
     slot_rows: mx.array,
     *,
     codec: str,
+    activation: Callable[[mx.array, mx.array], mx.array],
 ) -> mx.array:
     """Row-gathered three-projection shadow MLP against one component bank."""
 
@@ -1494,7 +1518,7 @@ def _shadow_gather_component_bank(
 
     gate = projection(x, "gate_proj")
     up = projection(x, "up_proj")
-    return projection(swiglu(gate, up), "down_proj")
+    return projection(activation(gate, up), "down_proj")
 
 
 def _run_component_bank_mixed(
@@ -1591,6 +1615,8 @@ def _run_shadow_bank(
     x: mx.array,
     expert_rows: mx.array,
     bank: Any,
+    *,
+    activation: Callable[[mx.array, mx.array], mx.array],
 ) -> mx.array:
     """Three-projection expert MLP against a low-precision shadow bank.
 
@@ -1613,7 +1639,7 @@ def _run_shadow_bank(
 
     gate = projection(x, "gate_proj")
     up = projection(x, "up_proj")
-    return projection(swiglu(gate, up), "down_proj")
+    return projection(activation(gate, up), "down_proj")
 
 
 def _run_mapped_q4(
@@ -1712,20 +1738,49 @@ class HotExpertSwitchGLU(nn.Module):
         self.layer_index = int(layer_index)
         self.group_size = runtime.spec.quant_group_size
         self.bits = runtime.spec.quant_bits
+        activation_name = getattr(runtime.spec, "expert_activation", "swiglu")
+        self._expert_activation = _resolve_expert_activation(activation_name)
         # Streamed record codec (issue #51 q1 lane): "affine" executes
         # slot-resident records through gather_qmm; a shadow codec ("b1",
         # "t158") executes them through shadow_gather_mm instead.  The read
         # path is identical either way — only the component-bank dispatch
         # differs (gate 4 of the gap analysis).
         self.codec = getattr(runtime.spec, "expert_codec", "affine")
+        if activation_name == "situ" and (
+            self.codec != "t158"
+            or getattr(runtime.config, "slot_layout", None) != "component-banks"
+        ):
+            raise ValueError(
+                "SITU streamed experts require t158 component-bank execution"
+            )
         # Mixed-official (issue #51, M2): resolve this layer's (gate_up, down)
         # tier from the loaded manifest's layer_tier_map — never the spec (D1).
         # Fail closed if the layer has no tier entry.
         self._gate_up_tier: str | None = None
         self._down_tier: str | None = None
         if self.codec == MIXED_OFFICIAL_CODEC:
-            self._gate_up_tier, self._down_tier = (
-                runtime.manifest.mixed_tier_for_layer(self.layer_index)
+            self._gate_up_tier, self._down_tier = runtime.manifest.mixed_tier_for_layer(
+                self.layer_index
+            )
+        if self.codec == "affine":
+            self._component_bank_executor = partial(
+                _run_component_bank_q4,
+                group_size=self.group_size,
+                bits=self.bits,
+            )
+        elif self.codec == MIXED_OFFICIAL_CODEC:
+            if self._gate_up_tier is None:
+                raise ValueError("mixed-official layer has no gate/up tier")
+            self._component_bank_executor = partial(
+                _run_component_bank_mixed,
+                gate_up_tier=self._gate_up_tier,
+                group_size=self.group_size,
+            )
+        else:
+            self._component_bank_executor = partial(
+                _run_component_bank_shadow,
+                codec=self.codec,
+                activation=self._expert_activation,
             )
         # Shadow miss fallback (issue #51): when the runtime opened with
         # miss_shadow, decode misses on this streamed layer are served from
@@ -1742,22 +1797,7 @@ class HotExpertSwitchGLU(nn.Module):
     ) -> mx.array:
         """Execute one component-bank wave under this layer's record codec."""
 
-        if self.codec == "affine":
-            return _run_component_bank_q4(
-                selected,
-                bindings,
-                group_size=self.group_size,
-                bits=self.bits,
-            )
-        if self.codec == MIXED_OFFICIAL_CODEC:
-            assert self._gate_up_tier is not None
-            return _run_component_bank_mixed(
-                selected,
-                bindings,
-                gate_up_tier=self._gate_up_tier,
-                group_size=self.group_size,
-            )
-        return _run_component_bank_shadow(selected, bindings, codec=self.codec)
+        return self._component_bank_executor(selected, bindings)
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         output, _overlap_result = self._run(
@@ -2162,6 +2202,7 @@ class HotExpertSwitchGLU(nn.Module):
                                 selected,
                                 mx.array(shadow_experts, dtype=mx.int32),
                                 shadow_bank,
+                                activation=self._expert_activation,
                             )
                         )
                         output_positions.extend(shadow_positions)
@@ -2172,9 +2213,7 @@ class HotExpertSwitchGLU(nn.Module):
                         assignments=len(shadow_positions),
                         experts=len(unique_shadowed),
                     )
-                    self.runtime.prefetch_experts(
-                        self.layer_index, unique_shadowed
-                    )
+                    self.runtime.prefetch_experts(self.layer_index, unique_shadowed)
                     continue
                 # Keep the all-hit optimization inside the authoritative bounded
                 # route-wave loop.  A successful probe avoids split-route futures
@@ -2287,9 +2326,7 @@ class HotExpertSwitchGLU(nn.Module):
                 deferred_split = (
                     wave_index == final_wave
                     and phase is RoutingPhase.DECODE
-                    and getattr(
-                        self.runtime.config, "split_route_release", "fenced"
-                    )
+                    and getattr(self.runtime.config, "split_route_release", "fenced")
                     == "deferred"
                     and getattr(self.runtime.config, "deferred_pin_release", False)
                 )
@@ -2396,14 +2433,11 @@ class HotExpertSwitchGLU(nn.Module):
                             # coverage, so the blocking barrier serves no
                             # release obligation there; strict mode keeps it.
                             async_eval = getattr(mx, "async_eval", None)
-                            if (
-                                getattr(
-                                    self.runtime.config,
-                                    "deferred_pin_release",
-                                    False,
-                                )
-                                and callable(async_eval)
-                            ):
+                            if getattr(
+                                self.runtime.config,
+                                "deferred_pin_release",
+                                False,
+                            ) and callable(async_eval):
                                 async_eval(shared)
                             else:
                                 mx.eval(shared)
@@ -2483,9 +2517,7 @@ class HotExpertSwitchGLU(nn.Module):
                 finally:
                     if deferred_split and split_completed:
                         self.runtime.defer_slot_release(
-                            _DeferredSplitClose(
-                                pending, tuple(deferred_parts)
-                            ),
+                            _DeferredSplitClose(pending, tuple(deferred_parts)),
                             tuple(outputs[wave_output_start:]),
                         )
                     else:

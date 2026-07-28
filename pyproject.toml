@@ -36,6 +36,9 @@ dependencies = [
   "pydantic>=2",
   "rich>=14",
   "safetensors>=0.6",
+  # Kimi K3 ships a tiktoken.model and a custom TikTokenTokenizer rather than
+  # tokenizer.json. Keep the runtime API range narrow and lock the exact wheel.
+  "tiktoken>=0.13,<0.14",
   "uvicorn>=0.46",
 ]
 classifiers = [
