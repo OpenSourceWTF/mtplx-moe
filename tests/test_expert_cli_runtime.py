@@ -61,7 +61,7 @@ def _admitted_artifact_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         expert_cli,
         "select_expert_profile",
-        lambda requested, *, model_key: (
+        lambda requested, *, model_key, overrides=None: (
             profile
             if model_key == profile.model_key
             else (_ for _ in ()).throw(
@@ -237,7 +237,7 @@ def test_promoted_profile_admits_then_freezes_auto_and_attaches_receipt(
     monkeypatch.setattr(
         expert_cli,
         "select_expert_profile",
-        lambda requested, *, model_key: (
+        lambda requested, *, model_key, overrides=None: (
             events.append(f"profile:{requested}:{model_key}") or profile
         ),
     )
@@ -270,7 +270,7 @@ def test_promoted_profile_geometry_override_is_customized_in_parent_and_child(
     monkeypatch.setattr(
         expert_cli,
         "select_expert_profile",
-        lambda requested, *, model_key: profile,
+        lambda requested, *, model_key, overrides=None: profile,
     )
     args = _parser().parse_args(
         [

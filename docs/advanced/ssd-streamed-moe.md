@@ -102,6 +102,12 @@ requirement. The process ceiling adds the exact 7 GiB runtime reserve:
 respectively. The real release smoke uses a 128 GiB Apple Silicon Mac and
 requires at least 110 GiB of free disk before download.
 
+The process ceiling is a budget, not a requirement: each profile's own cache cap
+leaves part of it unallocated. Admission compares the footprint the plan
+actually reaches -- 66.992 GiB, 89.216 GiB, and 91.992 GiB respectively -- and
+applies any cache-sizing override first, so a machine smaller than the ceiling
+can still run the profile. See the cache-tier section for the arithmetic.
+
 Choose an envelope explicitly when reproducibility matters:
 
 ```bash
@@ -260,55 +266,102 @@ Changing the memory limit, reserve, cache cap, context budget, or workload
 creates a new unmeasured configuration; startup will still validate that its
 fixed footprint fits.
 
-## Optimized 32 GiB and 48 GiB cache tiers
+## Cache tiers
 
-“32 GiB configuration” and “48 GiB configuration” are tuning-tier labels. The
-same optimized execution stack applies at that persistent expert-cache size or
-any smaller size; the label is not a total-RAM limit and does not exclude a
-machine with more memory.
+`--expert-cache-limit` sets a construction-time ceiling on the persistent
+expert cache. It does not cap the whole MTPLX process: resident weights, KV
+cache, transient service slots, and the runtime reserve are budgeted separately
+by the base plan you select. A tier label such as “32 GiB” names that cache
+size, not a machine's total RAM, and the same optimized execution stack applies
+at that size or any smaller one.
 
-The command-line field has a narrower, literal meaning:
-`--expert-cache-limit 48GiB` installs a construction-time 48 GiB safety sub-cap
-for the persistent expert cache. It does not cap the whole MTPLX process.
-Resident weights, KV cache, runtime workspace, and the OS reserve are budgeted
-separately by the selected base plan. These examples retain that complete
-optimized base configuration and change only its expert-cache sub-cap. Both
-are custom, unmeasured cache geometries; startup still resolves and validates
-the complete immutable memory plan before construction.
+### How a cache size becomes a memory footprint
+
+The footprint follows one rule:
+
+```
+realized total  =  fixed floor  +  cache cap rounded down to whole slots
+```
+
+The fixed floor is everything the cache does not cover:
+
+| Base plan | Resident | KV @ 4,096 tok | Transient | Reserve | Fixed floor |
+|---|---:|---:|---:|---:|---:|
+| `hy3-oq2e-64` | 8.710 GiB | 1.250 GiB | 0.040 GiB | 7 GiB | 17.000 GiB |
+| GLM t158 96 GiB plan | 9.904 GiB | 0.363 GiB | 0.396 GiB | 12 GiB | 22.663 GiB |
+
+A layer-scoped cache allocates whole expert slots per streamed layer, so the
+realized cache rounds down from the requested cap by up to one slot: about
+0.39 GiB for Hy3, 0.62 GiB for GLM.
+
+Admission compares that realized total against two machine measurements, and
+resolves `--expert-cache-limit` before comparing, so a smaller cache lowers the
+requirement:
+
+- **Installed RAM**, from `hw.memsize`.
+- **Available memory**, counting free, inactive, speculative, and purgeable
+  pages. This is usually the binding gate, and it sits well below installed RAM
+  on a machine that has been running for a while.
+
+Both checks run before anything is downloaded or constructed. A base plan's
+declared process ceiling (71 GiB for `hy3-oq2e-64`, 96 GiB for the GLM plan) is
+a budget rather than a requirement: whatever the cache cap leaves unspent stays
+unallocated, and admission does not ask for it.
+
+### Choosing a size for your machine
+
+1. Read this machine's admission inputs:
+
+   ```bash
+   "$MTPLX_MOE_VENV/bin/python" -c "from mtplx.expert_profiles import \
+     available_memory_bytes, _installed_ram_bytes; g=1024**3; \
+     print(f'installed {_installed_ram_bytes()/g:.1f} GiB, \
+     available {available_memory_bytes()/g:.1f} GiB')"
+   ```
+
+2. Subtract the fixed floor from the smaller of the two, keep a margin for
+   everything else you run, and use the remainder as the cap. With 40 GiB
+   available on Hy3: `40 - 17.0 = 23`, so pass `--expert-cache-limit 22GiB`.
+
+3. Start the server. If admission refuses, the error reports the exact bytes
+   required and detected; lower the cap by the shortfall and retry.
+
+A larger cache holds more experts resident and streams less from SSD. A smaller
+one always runs, down to a single slot per layer. Any size other than a base
+plan's own default is an unmeasured geometry: startup validates it, but it
+carries no throughput or quality receipt.
 
 ### Hy3 oQ2e
 
-Use `hy3-oq2e-64` as the base for a cache-sized streaming configuration. The
-named profile carries the q4 resident-trunk requantization, measured FP32
-split-K router kernel, frequency policy, component banks, deferred split and
-pin release, trusted admission-integrity settings, sustained prefill, and the
-measured submit cadence. Do not reconstruct those settings manually in a
-cache-only override.
-
-For a 32 GiB cache:
+Use `hy3-oq2e-64` as the base. The named profile carries the q4 resident-trunk
+requantization, measured FP32 split-K router kernel, frequency policy,
+component banks, deferred split and pin release, trusted admission-integrity
+settings, sustained prefill, and the measured submit cadence. Do not
+reconstruct those settings manually in a cache-only override.
 
 ```bash
 "$MTPLX_MOE_VENV/bin/mtplx" serve \
   --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
   --download \
   --expert-profile hy3-oq2e-64 \
-  --expert-cache-limit 32GiB
+  --expert-cache-limit 40GiB
 ```
 
-For a 48 GiB cache:
+Replace `40GiB` with any size up to the profile's own 49.9921875 GiB allowance.
+Every size keeps the 7 GiB runtime reserve and the 4,096-token aggregate
+live-KV ceiling:
 
-```bash
-"$MTPLX_MOE_VENV/bin/mtplx" serve \
-  --model OpensourceWTF/Hy3-oQ2e-MTPLX-streaming \
-  --download \
-  --expert-profile hy3-oq2e-64 \
-  --expert-cache-limit 48GiB
-```
+| Cache cap | Slots/layer | Realized cache | Unallocated | Realized total |
+|---:|---:|---:|---:|---:|
+| 49.9921875 GiB (default) | 128 | 49.992 GiB | 4.008 GiB | 66.992 GiB |
+| 47 GiB | 120 | 46.868 GiB | 7.132 GiB | 63.868 GiB |
+| 40 GiB | 102 | 39.838 GiB | 14.162 GiB | 56.838 GiB |
+| 32 GiB | 81 | 31.636 GiB | 22.364 GiB | 48.636 GiB |
 
-Both commands keep the profile's 71 GiB process ceiling, 7 GiB runtime reserve,
-and 4,096-token aggregate live-KV ceiling. The default optimized cache
-allowance for this profile is 49.9921875 GiB, so the same optimization stack
-can be sized to any persistent cache through that value.
+These totals are upper bounds: `proj_requant=q4` removes a further
+manifest-dependent amount from the resident side. A cache larger than the
+49.9921875 GiB allowance needs a new total-memory plan and benchmark, not a
+raised sub-cap.
 
 ### GLM-5.2 t158
 
@@ -318,8 +371,6 @@ transient slots, frequency policy, component banks, `F_NOCACHE`, deferred
 release, no-prefetch control, and headers-only integrity settings. The explicit
 cache flag below overrides only `expert_cache_limit_bytes` in that JSON.
 
-For a 32 GiB cache:
-
 ```bash
 MTPLX_SUSTAINED_PREFILL=1 "$MTPLX_MOE_VENV/bin/mtplx" serve \
   --model OpensourceWTF/GLM-5.2-t158-MTPLX-streaming \
@@ -328,38 +379,50 @@ MTPLX_SUSTAINED_PREFILL=1 "$MTPLX_MOE_VENV/bin/mtplx" serve \
   --expert-cache-limit 32GiB
 ```
 
-For a 48 GiB cache:
+Replace `32GiB` with any size up to the plan's 72 GiB allowance. Every size
+keeps the 12 GiB runtime reserve and the plan's 48 transient slots:
 
-```bash
-MTPLX_SUSTAINED_PREFILL=1 "$MTPLX_MOE_VENV/bin/mtplx" serve \
-  --model OpensourceWTF/GLM-5.2-t158-MTPLX-streaming \
-  --download \
-  --expert-streaming-config glm52-t158-96g.json \
-  --expert-cache-limit 48GiB
-```
+| Cache cap | Slots/layer | Realized cache | Unallocated | Realized total |
+|---:|---:|---:|---:|---:|
+| 72 GiB (plan allowance) | 116 | 71.686 GiB | 1.651 GiB | 94.349 GiB |
+| 48 GiB | 77 | 47.585 GiB | 25.752 GiB | 70.248 GiB |
+| 32 GiB | 51 | 31.517 GiB | 41.820 GiB | 54.180 GiB |
 
-Layer-scoped caches allocate whole expert slots per streamed layer, so the
-realized allocations round down slightly:
+The unallocated column is the part of the declared 96 GiB ceiling that the cap
+leaves unspent. It is not reserve and not headroom the runtime draws on; it is
+simply budget the plan never claims, which is why a smaller cache lowers what
+admission asks for.
 
-| Requested cap | Hy3 oQ2e | GLM-5.2 t158 |
-|---:|---:|---:|
-| 32 GiB | 81 slots/layer; 31.636 GiB | 51 slots/layer; 31.517 GiB |
-| 48 GiB | 122 slots/layer; 47.649 GiB | 77 slots/layer; 47.585 GiB |
+### What has been verified
 
-These four cases were operationally smoke-tested on a 128 GiB M5 Max with a
-clean `mtplx 2.3.0+opensourcewtf.moe` install. Each constructed its real model,
-reached `MTPLX is ready`, reported the slot count above through `/health`,
-listed its model through `/v1/models`, and returned a nonempty AR chat
-completion. This proves that the serving configurations execute; it is not a
-throughput receipt or a GLM t158 task-quality validation.
+Every Hy3 row above was constructed against the real model on a 128 GiB M5 Max.
+Each reached `MTPLX is ready`, reported through `/health` the exact slot count
+its plan predicted, and returned a nonempty AR chat completion:
 
-For another cache size, replace the `--expert-cache-limit` value with the
-desired `GiB` amount. A 48 GiB tuning tier therefore covers 48 GiB and every
-smaller positive cache setting without dropping the model-specific
-optimizations. Cache-only overrides are bounded by the selected base plan:
-49.9921875 GiB for `hy3-oq2e-64` and 72 GiB for the measured GLM plan. A larger
-cache requires a new total-memory plan and benchmark rather than only raising
-this sub-cap.
+| Cache cap | Slots/layer predicted | Reported | Planned total | Measured RSS |
+|---:|---:|---:|---:|---:|
+| 32 GiB | 81 | 81 | 48.636 GiB | 33.609 GiB |
+| 40 GiB | 102 | 102 | 56.838 GiB | 41.849 GiB |
+| 47 GiB | 120 | 120 | 63.868 GiB | 48.855 GiB |
+
+`/health` also confirmed the resolved configuration each time: profile
+`hy3-oq2e-64`, model key `hy3-expert-oq2e`, the 71 GiB declared ceiling intact,
+and `expert_cache_limit_bytes` equal to the requested cap exactly.
+
+Measured RSS runs about 15 GiB under the planned total at every size. The plan
+counts the 7 GiB runtime reserve, which is budget rather than an allocation, and
+does not subtract the `proj_requant=q4` resident discount. Read the planned
+total as the number admission compares and as a ceiling on real residency, not
+as an expected RSS.
+
+The two GLM rows were smoke-tested separately under the same conditions. None
+of this is a throughput receipt, and it is not a GLM t158 task-quality
+validation.
+
+One sizing caveat worth stating directly: a 47 GiB Hy3 cache clears a 64 GiB
+machine's installed-RAM check by only 132 MiB, and will still be refused by the
+available-memory gate there. On a 64 GiB machine, 32 GiB is the size that
+admits with margin.
 
 ### Verify the running server
 

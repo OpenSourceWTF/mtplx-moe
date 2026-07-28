@@ -9,6 +9,7 @@ import mtplx.expert_profiles as expert_profiles
 from mtplx.expert_profiles import (
     build_expert_streaming_config,
     load_expert_profiles,
+    profile_required_bytes,
     select_expert_profile,
 )
 
@@ -52,11 +53,24 @@ def test_loaded_profiles_are_immutable():
 
 
 def test_auto_selects_largest_profile_that_passes_both_memory_gates():
+    # 97 GiB is under hy3-oq2e-96's 103 GiB declared ceiling but over the
+    # 91.99 GiB its plan reaches, and admission compares the latter.
     selected = select_expert_profile(
         "auto",
         model_key="hy3-expert-oq2e",
         installed_ram_bytes=128 * GiB,
         available_bytes=97 * GiB,
+    )
+    assert selected.name == "hy3-oq2e-96"
+
+
+def test_auto_falls_to_the_next_profile_below_the_largest_realized_footprint():
+    largest = load_expert_profiles()["hy3-oq2e-96"]
+    selected = select_expert_profile(
+        "auto",
+        model_key="hy3-expert-oq2e",
+        installed_ram_bytes=128 * GiB,
+        available_bytes=profile_required_bytes(largest) - GiB,
     )
     assert selected.name == "hy3-oq2e-88"
 
@@ -94,7 +108,7 @@ def test_auto_selection_measures_memory_once_at_construction(monkeypatch):
         model_key="hy3-expert-oq2e",
     )
 
-    assert selected.name == "hy3-oq2e-88"
+    assert selected.name == "hy3-oq2e-96"
     assert calls == {"installed": 1, "available": 1}
 
 
@@ -243,6 +257,8 @@ def test_model_key_mismatch_fails_before_selection():
 
 def test_explicit_profile_fails_instead_of_downgrading():
     available = 70 * GiB
+    profile = load_expert_profiles()["hy3-oq2e-88"]
+    required = profile_required_bytes(profile)
 
     with pytest.raises(ValueError) as excinfo:
         select_expert_profile(
@@ -253,14 +269,19 @@ def test_explicit_profile_fails_instead_of_downgrading():
         )
 
     message = str(excinfo.value)
-    assert str(95 * GiB) in message
+    assert str(required) in message
     assert str(available) in message
     assert "required" in message
     assert "available" in message
+    # The reported requirement is what the plan reaches, not the declared
+    # ceiling, which the profile's own cache cap leaves partly unallocated.
+    assert required < profile.process_ceiling_bytes
 
 
 def test_auto_fails_when_no_promoted_profile_fits():
-    available = 70 * GiB
+    smallest = load_expert_profiles()["hy3-oq2e-64"]
+    required = profile_required_bytes(smallest)
+    available = required - GiB
 
     with pytest.raises(ValueError) as excinfo:
         select_expert_profile(
@@ -271,11 +292,54 @@ def test_auto_fails_when_no_promoted_profile_fits():
         )
 
     message = str(excinfo.value)
-    assert str(71 * GiB) in message
+    assert str(required) in message
     assert str(available) in message
     assert "hy3-oq2e-64" in message
     assert "hy3-oq2e-88" in message
     assert "hy3-oq2e-96" in message
+
+
+def test_auto_admits_between_the_realized_footprint_and_the_ceiling():
+    """A machine too small for the declared ceiling still runs the profile."""
+
+    profile = load_expert_profiles()["hy3-oq2e-64"]
+    required = profile_required_bytes(profile)
+    assert required < profile.process_ceiling_bytes
+
+    selected = select_expert_profile(
+        "auto",
+        model_key="hy3-expert-oq2e",
+        installed_ram_bytes=profile.process_ceiling_bytes - GiB,
+        available_bytes=required,
+    )
+    assert selected.name == "hy3-oq2e-64"
+
+
+def test_cache_cap_override_lowers_the_admission_requirement():
+    """`--expert-cache-limit` reaches admission, not just construction."""
+
+    profile = load_expert_profiles()["hy3-oq2e-64"]
+    capped = profile_required_bytes(
+        profile, overrides={"expert_cache_limit_bytes": "32GiB"}
+    )
+    assert capped < profile_required_bytes(profile)
+
+    selected = select_expert_profile(
+        "hy3-oq2e-64",
+        model_key="hy3-expert-oq2e",
+        installed_ram_bytes=64 * GiB,
+        available_bytes=capped,
+        overrides={"expert_cache_limit_bytes": "32GiB"},
+    )
+    assert selected.name == "hy3-oq2e-64"
+
+    with pytest.raises(ValueError, match="required"):
+        select_expert_profile(
+            "hy3-oq2e-64",
+            model_key="hy3-expert-oq2e",
+            installed_ram_bytes=64 * GiB,
+            available_bytes=64 * GiB,
+        )
 
 
 def test_available_memory_counts_reclaimable_vm_stat_pages(monkeypatch):
