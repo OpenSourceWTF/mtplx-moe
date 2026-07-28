@@ -188,6 +188,59 @@ def test_glm_tier_total_footprint(cache_cap_bytes, expected_used_gib):
     assert _used(plan) / GIB == pytest.approx(expected_used_gib, abs=5e-4)
 
 
+@pytest.mark.parametrize(
+    ("cache_cap_bytes", "expected_unallocated_gib"),
+    [(GLM_DEFAULT_CACHE, 1.651), (48 * GIB, 25.752), (32 * GIB, 41.820)],
+)
+def test_glm_documented_unallocated_tail(cache_cap_bytes, expected_unallocated_gib):
+    """The published GLM stranded-budget column."""
+
+    plan = _glm(cache_cap_bytes)
+    assert plan.unallocated_bytes / GIB == pytest.approx(
+        expected_unallocated_gib, abs=5e-4
+    )
+
+
+@pytest.mark.parametrize(
+    ("cache_cap_bytes", "expected_unallocated_gib"),
+    [
+        (HY3_DEFAULT_CACHE, 4.008),
+        (47 * GIB, 7.132),
+        (40 * GIB, 14.162),
+        (32 * GIB, 22.364),
+    ],
+)
+def test_hy3_documented_unallocated_tail(cache_cap_bytes, expected_unallocated_gib):
+    """The published Hy3 stranded-budget column."""
+
+    plan = _hy3(cache_cap_bytes)
+    assert plan.unallocated_bytes / GIB == pytest.approx(
+        expected_unallocated_gib, abs=5e-4
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "plan_fn", "cap", "expected_floor_gib"),
+    [
+        ("hy3-oq2e-64", _hy3, 32 * GIB, 17.000),
+        ("glm t158 96 GiB plan", _glm, 32 * GIB, 22.663),
+    ],
+)
+def test_documented_fixed_floor(label, plan_fn, cap, expected_floor_gib):
+    """Fixed floor = everything the cache does not cover, per the guide."""
+
+    plan = plan_fn(cap)
+    floor = (
+        plan.resident_bytes
+        + plan.kv_bytes
+        + plan.transient_bytes
+        + plan.runtime_reserve_bytes
+    )
+    assert floor / GIB == pytest.approx(expected_floor_gib, abs=5e-4)
+    # The stated rule: realized total is that floor plus the realized cache.
+    assert floor + plan.persistent_cache_bytes == _used(plan)
+
+
 def test_hy3_profile_default_cache_matches_the_documented_allowance():
     """The 49.9921875 GiB figure the guide quotes is the profile's own cap."""
 

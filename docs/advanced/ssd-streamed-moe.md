@@ -379,12 +379,19 @@ MTPLX_SUSTAINED_PREFILL=1 "$MTPLX_MOE_VENV/bin/mtplx" serve \
   --expert-cache-limit 32GiB
 ```
 
-Replace `32GiB` with any size up to the plan's 72 GiB allowance:
+Replace `32GiB` with any size up to the plan's 72 GiB allowance. Every size
+keeps the 12 GiB runtime reserve and the plan's 48 transient slots:
 
-| Cache cap | Slots/layer | Realized cache | Realized total |
-|---:|---:|---:|---:|
-| 48 GiB | 77 | 47.585 GiB | 70.248 GiB |
-| 32 GiB | 51 | 31.517 GiB | 54.180 GiB |
+| Cache cap | Slots/layer | Realized cache | Unallocated | Realized total |
+|---:|---:|---:|---:|---:|
+| 72 GiB (plan allowance) | 116 | 71.686 GiB | 1.651 GiB | 94.349 GiB |
+| 48 GiB | 77 | 47.585 GiB | 25.752 GiB | 70.248 GiB |
+| 32 GiB | 51 | 31.517 GiB | 41.820 GiB | 54.180 GiB |
+
+The unallocated column is the part of the declared 96 GiB ceiling that the cap
+leaves unspent. It is not reserve and not headroom the runtime draws on; it is
+simply budget the plan never claims, which is why a smaller cache lowers what
+admission asks for.
 
 ### What has been verified
 
