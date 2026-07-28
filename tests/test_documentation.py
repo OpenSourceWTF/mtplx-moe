@@ -133,6 +133,7 @@ def test_readme_lists_every_preconfigured_model_in_one_section():
     laguna_source = (ROOT / "mtplx/models/laguna_config.py").read_text(
         encoding="utf-8"
     )
+    kimi_streaming_id = "OpensourceWTF/Kimi-K3-Q2_K-t158-MTPLX-streaming"
 
     assert "## Supported models" in readme
     supported_section = readme.split("## Supported models", 1)[1].split(
@@ -150,6 +151,7 @@ def test_readme_lists_every_preconfigured_model_in_one_section():
     )
     assert laguna_match is not None
     expected_ids.add(laguna_match.group(1))
+    expected_ids.add(kimi_streaming_id)
 
     documented_ids = set(
         re.findall(
@@ -158,7 +160,25 @@ def test_readme_lists_every_preconfigured_model_in_one_section():
         )
     )
     assert documented_ids == expected_ids
-    assert len(documented_ids) == 16
+    assert len(documented_ids) == 17
+
+
+def test_readme_publishes_kimi_streaming_contract_and_receipt():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    supported_section = readme.split("## Supported models", 1)[1].split(
+        "\n## ", 1
+    )[0]
+
+    assert "OpensourceWTF/Kimi-K3-Q2_K-t158-MTPLX-streaming" in supported_section
+    assert "96 GiB: **1.18 tok/s**" in supported_section
+    assert "110 GiB: **1.11 tok/s**" in supported_section
+    assert "Eligible resident linear and embedding weights are dynamically" in (
+        supported_section
+    )
+    assert "four-worker Hugging Face upload" in supported_section
+    assert "memory-safety receipt" in supported_section
+    assert "rather than a speed" in supported_section
+    assert "separate 96 GiB and 110 GiB launch examples" in supported_section
 
 
 def test_readme_publishes_retained_hy3_quality_and_speed_receipts():
