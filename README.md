@@ -57,7 +57,8 @@ install this fork. In particular, `pip install mtplx` installs the upstream
 PyPI package, not this repository. See [INSTALL.md](INSTALL.md) for coexistence,
 upgrade, port-collision, and separate LiteLLM environment guidance.
 
-This fork adds the package-owned Hy3 `experts.bin` serving path:
+This fork adds package-owned SSD-streamed MoE serving for Hy3, GLM-5.2, and
+Kimi K3. Hy3 is the zero-configuration entrypoint:
 
 ```bash
 "$MTPLX_MOE_VENV/bin/mtplx" serve \
@@ -115,6 +116,7 @@ run, not that the result is zero.
 |---|---|---|---|---|---|
 | [`OpensourceWTF/Hy3-oQ2e-MTPLX-streaming`](https://huggingface.co/OpensourceWTF/Hy3-oQ2e-MTPLX-streaming) | SSD-streamed AR; retained MTP benchmark | 71, 95, or 103 GiB process ceiling; about 97.6 GB download | `q4` requant: 86.6% (142/164); `q8`: 87.2% (143/164) | Flagship: **48.04 tok/s** with q4 requant at MTP depth 1; 41.36 tok/s AR control. Promoted AR profiles: `-64`: 9.31; `-88`: 22.35; `-96`: 30.17 tok/s | Promoted `hy3-oq2e-64`, `-88`, and `-96` profiles |
 | [`OpensourceWTF/GLM-5.2-t158-MTPLX-streaming`](https://huggingface.co/OpensourceWTF/GLM-5.2-t158-MTPLX-streaming) | SSD-streamed AR | Measured 96 GiB configuration; about 187 GB download | Not measured | Not measured | Manual and experimental; no task-quality receipt |
+| [`OpensourceWTF/Kimi-K3-Q2_K-t158-MTPLX-streaming`](https://huggingface.co/OpensourceWTF/Kimi-K3-Q2_K-t158-MTPLX-streaming) | SSD-streamed AR | Measured 96 or 110 GiB configuration; about 752 GB download | Not measured | 96 GiB: **1.18 tok/s**; 110 GiB: **1.11 tok/s**, both at 1,024/1,024 | Manual and experimental; text-only, no MTP |
 | [`mlx-community/Laguna-S-2.1-oQ4e`](https://huggingface.co/mlx-community/Laguna-S-2.1-oQ4e) | Native AR only | At least 96 GiB unified memory; 128 GiB recommended; 64.13 GB download | Not measured | Not measured | Exact revision pinned and artifact-verified |
 
 The HumanEvalPlus v0.1.10 receipts use all 164 tasks, one sample per task,
@@ -145,11 +147,25 @@ hardware, context, cache warmth, or concurrent work will change absolute
 throughput. The [SSD-streamed MoE guide](docs/advanced/ssd-streamed-moe.md#hy3-q4-resident-trunk-requantization)
 shows the requant setting.
 
-Hy3 starts with the zero-config `mtplx serve` command above. GLM requires the
-manual paging configuration in the
-[SSD-streamed MoE guide](docs/advanced/ssd-streamed-moe.md). Laguna launches
-with the same `mtplx start cli --model MODEL_ID --download` form as the catalog
-models and rejects MTP before loading.
+Kimi K3 requantizes only its 92 routed-MoE layers from the pinned Q2_K source
+to t158. Eligible resident linear and embedding weights are dynamically
+quantized to q8 during construction; the checkpoint is not rewritten, and
+routers, residual score projections, norms, convolutions, recurrent vectors,
+and biases retain source precision. The retained M5 Max run used exactly 1,024
+prompt and 1,024 output tokens while a four-worker Hugging Face upload remained
+active. The 96 GiB plan measured 7.39 tok/s prefill, 1.18 tok/s decode, and
+83.8 GiB peak physical footprint; the 110 GiB plan measured 6.43 tok/s,
+1.11 tok/s, and 97.9 GiB. Outputs were identical with zero I/O or integrity
+errors. The larger cache reduced reads but did not improve throughput in that
+concurrent-load run, so this is a memory-safety receipt rather than a speed
+claim.
+
+Hy3 starts with the zero-config `mtplx serve` command above. GLM and Kimi
+require their manual paging configurations in the
+[SSD-streamed MoE guide](docs/advanced/ssd-streamed-moe.md); Kimi includes
+separate 96 GiB and 110 GiB launch examples. Laguna launches with the same
+`mtplx start cli --model MODEL_ID --download` form as the catalog models and
+rejects MTP before loading.
 
 ## Start in 60 seconds
 
@@ -264,19 +280,21 @@ MTPLX can also serve mixture-of-experts models larger than a selected memory
 envelope by streaming routed experts from prepacked Hugging Face banks. The
 promoted OpenSourceWTF fork profiles are specifically for
 `OpensourceWTF/Hy3-oQ2e-MTPLX-streaming`; the published
-`OpensourceWTF/GLM-5.2-t158-MTPLX-streaming` artifact uses a manual,
-experimental paging configuration. This fork does not promote GLM profiles
-or streamed MTP. The primary command above admits the artifact once, selects
-`hy3-oq2e-64`, `hy3-oq2e-88`, or `hy3-oq2e-96`, and constructs the AR route
-directly.
+`OpensourceWTF/GLM-5.2-t158-MTPLX-streaming` and
+`OpensourceWTF/Kimi-K3-Q2_K-t158-MTPLX-streaming` artifacts use manual,
+experimental paging configurations. This fork does not promote GLM or Kimi
+profiles or streamed MTP. The primary command above admits the Hy3 artifact
+once, selects `hy3-oq2e-64`, `hy3-oq2e-88`, or `hy3-oq2e-96`, and constructs
+the AR route directly.
 
 The numbers in those names are weight envelopes, not required machine RAM.
 Their exact process ceilings, including the 7 GiB runtime reserve, are 71 GiB,
 95 GiB, and 103 GiB. `auto` chooses the largest promoted profile whose process
 ceiling fits both installed RAM and launch-time available memory. See the
 [SSD-streamed MoE guide](docs/advanced/ssd-streamed-moe.md) for explicit
-Hy3 island profiles, the measured GLM t158 paging configuration, advanced
-override precedence, health evidence, and LiteLLM setup.
+Hy3 island profiles, the measured GLM t158 paging configuration, both measured
+Kimi K3 memory plans, advanced override precedence, health evidence, and
+LiteLLM setup.
 
 Use `mtplx help advanced` for QA, profiling, support bundles, and kernel tools.
 See the [documentation index](docs/README.md).
