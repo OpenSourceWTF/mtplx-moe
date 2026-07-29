@@ -283,6 +283,49 @@ def test_dashboard_snapshot_returns_expected_shape():
     assert payload["scheduler"]["scheduler_policy"] == "solo_mtp_oracle"
 
 
+@pytest.mark.parametrize(
+    ("active_width", "expected_lane"),
+    [
+        (0, "mtp_cohort_idle"),
+        (1, "mtp_cohort_width_1"),
+        (2, "mtp_cohort_width_2"),
+    ],
+)
+def test_dashboard_reports_native_mtp_cohort_width_without_ar_fallback(
+    active_width, expected_lane
+):
+    state = _fake_state()
+    state.args.scheduler_mode = "mtp_cohort_experimental"
+    state.args.experimental_mtp_cohorts = True
+    state.args.max_active_requests = 2
+    state.args.decode_batch_max = 2
+    state.args.batch_wait_ms = 0
+    state.args.prefill_chunk_tokens = 1024
+    state.args.generation_mode = "mtp"
+    state.args.load_mtp = True
+    state.args.depth = 2
+    state.mtp_cohort_service = SimpleNamespace(
+        snapshot=lambda: {
+            "pending": 0,
+            "active": active_width,
+            "pending_request_ids": [],
+            "active_request_ids": [f"r{index}" for index in range(active_width)],
+            "active_width": active_width,
+            "pump_scheduled": bool(active_width),
+            "last_error": None,
+        }
+    )
+
+    scheduler = openai._mtplx_scheduler_state(state)
+
+    assert scheduler["active_lane"] == expected_lane
+    assert scheduler["active_requests"] == active_width
+    assert scheduler["mtp_disabled_reason"] is None
+    assert scheduler["path"] == "path_b"
+    assert scheduler["path_b"]["concurrent_strategy"] == "native_mtp_k2_cohort"
+    assert scheduler["mtp_cohort"]["active_width"] == active_width
+
+
 # ---- /v1/mtplx/benchmarks/aime/start --------------------------------------
 
 

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 import math
 import os
+from collections.abc import Mapping
 from statistics import NormalDist
 
 
@@ -83,11 +84,25 @@ def env_enabled(name: str, *, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def config_from_env() -> TurboQuantConfig | None:
-    if not env_enabled("MTPLX_VLLM_METAL_PAGED_TURBOQUANT"):
+def config_from_environment(
+    environment: Mapping[str, str],
+) -> TurboQuantConfig | None:
+    enabled_raw = environment.get("MTPLX_VLLM_METAL_PAGED_TURBOQUANT")
+    if enabled_raw is None or enabled_raw.strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
         return None
-    key_quant = (os.environ.get("MTPLX_VLLM_METAL_PAGED_TURBOQUANT_K_QUANT") or "q8_0").strip().lower()
-    value_quant = (os.environ.get("MTPLX_VLLM_METAL_PAGED_TURBOQUANT_V_QUANT") or "q3_0").strip().lower()
+    key_quant = (
+        environment.get("MTPLX_VLLM_METAL_PAGED_TURBOQUANT_K_QUANT")
+        or "q8_0"
+    ).strip().lower()
+    value_quant = (
+        environment.get("MTPLX_VLLM_METAL_PAGED_TURBOQUANT_V_QUANT")
+        or "q3_0"
+    ).strip().lower()
     if key_quant not in KEY_QUANTS:
         raise ValueError(
             f"Unsupported TurboQuant key quant {key_quant!r}; "
@@ -99,6 +114,10 @@ def config_from_env() -> TurboQuantConfig | None:
             f"available={sorted(VALUE_QUANTS)}"
         )
     return TurboQuantConfig(key_quant=key_quant, value_quant=value_quant)
+
+
+def config_from_env() -> TurboQuantConfig | None:
+    return config_from_environment(os.environ)
 
 
 def packed_dim(head_dim: int, bits: int) -> int:

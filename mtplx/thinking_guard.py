@@ -45,6 +45,7 @@ Interface mirrors mtplx/loop_guard.py: one instance per generation call,
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -93,8 +94,14 @@ class ThinkingGuardConfig:
     novelty_scan_interval: int = 64
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
+def _env_int(
+    name: str,
+    default: int,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> int:
+    source = os.environ if environment is None else environment
+    raw = source.get(name)
     if raw is None or raw.strip() == "":
         return default
     try:
@@ -142,6 +149,7 @@ def thinking_guard_config_from_env(
     starts_in_think: bool = False,
     bridge_text: str | None = None,
     novelty_close: bool = False,
+    environment: Mapping[str, str] | None = None,
 ) -> ThinkingGuardConfig:
     """Build the guard config; ``enabled``/``budget_tokens`` are the caller's
     resolved product policy (lane + effort mapping live server-side).
@@ -151,7 +159,8 @@ def thinking_guard_config_from_env(
     lane in. A tokenizer without single-token think markers disables the
     guard outright (no approximate matching).
     """
-    raw = os.environ.get("MTPLX_THINKING_BUDGET")
+    source = os.environ if environment is None else environment
+    raw = source.get("MTPLX_THINKING_BUDGET")
     if raw is not None and raw.strip() != "":
         lowered = raw.strip().lower()
         if lowered in _DISABLED_VALUES:
@@ -162,7 +171,7 @@ def thinking_guard_config_from_env(
                 enabled = budget_tokens > 0
             except ValueError:
                 pass
-    nov_raw = os.environ.get("MTPLX_THINKING_NOVELTY_CLOSE", "").strip().lower()
+    nov_raw = source.get("MTPLX_THINKING_NOVELTY_CLOSE", "").strip().lower()
     if nov_raw != "":
         novelty_close = nov_raw not in _DISABLED_VALUES
     if not enabled or budget_tokens <= 0:
@@ -174,7 +183,7 @@ def thinking_guard_config_from_env(
     bridge = (
         bridge_text
         if bridge_text is not None
-        else os.environ.get(
+        else source.get(
             "MTPLX_THINKING_BRIDGE",
             "\n\nI have enough analysis — deciding now and acting.\n",
         )
@@ -202,20 +211,56 @@ def thinking_guard_config_from_env(
         budget_tokens=int(budget_tokens),
         forced_close_ids=tuple(forced),
         starts_in_think=bool(starts_in_think),
-        reentry_ban_tokens=max(0, _env_int("MTPLX_THINKING_REENTRY_BAN", 64)),
+        reentry_ban_tokens=max(
+            0,
+            _env_int(
+                "MTPLX_THINKING_REENTRY_BAN",
+                64,
+                environment=source,
+            ),
+        ),
         mask_open_token=tool_markers[0] if tool_markers else None,
         mask_close_token=tool_markers[1] if tool_markers else None,
         novelty_close=bool(novelty_close),
-        novelty_ngram=max(8, _env_int("MTPLX_THINKING_NOVELTY_NGRAM", 24)),
-        novelty_occurrences=max(
-            2, _env_int("MTPLX_THINKING_NOVELTY_OCCURRENCES", 3)
+        novelty_ngram=max(
+            8,
+            _env_int(
+                "MTPLX_THINKING_NOVELTY_NGRAM",
+                24,
+                environment=source,
+            ),
         ),
-        novelty_window=max(512, _env_int("MTPLX_THINKING_NOVELTY_WINDOW", 4096)),
+        novelty_occurrences=max(
+            2,
+            _env_int(
+                "MTPLX_THINKING_NOVELTY_OCCURRENCES",
+                3,
+                environment=source,
+            ),
+        ),
+        novelty_window=max(
+            512,
+            _env_int(
+                "MTPLX_THINKING_NOVELTY_WINDOW",
+                4096,
+                environment=source,
+            ),
+        ),
         novelty_min_tokens=max(
-            256, _env_int("MTPLX_THINKING_NOVELTY_MIN_TOKENS", 1024)
+            256,
+            _env_int(
+                "MTPLX_THINKING_NOVELTY_MIN_TOKENS",
+                1024,
+                environment=source,
+            ),
         ),
         novelty_scan_interval=max(
-            16, _env_int("MTPLX_THINKING_NOVELTY_SCAN_INTERVAL", 64)
+            16,
+            _env_int(
+                "MTPLX_THINKING_NOVELTY_SCAN_INTERVAL",
+                64,
+                environment=source,
+            ),
         ),
     )
 

@@ -1,4 +1,5 @@
 from concurrent.futures import Future, ThreadPoolExecutor
+import inspect
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,913 @@ from mtplx.expert_runtime import ExpertStreamingConfigurationError
 from mtplx.profiles import DEFAULT_HF_MODEL_ID, get_profile
 from mtplx.server import openai
 from mtplx.server.openai import _RateLimiter, create_app, parse_args
+
+
+class _ImmediateModelScheduler:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def submit_foreground(self, fn, *args, batch_key=None, **kwargs):
+        self.calls.append({"fn": fn, "batch_key": batch_key})
+        future = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+
+def _mtp_cohort_startup_state():
+    args = parse_args(
+        [
+            "--warmup-tokens", "0",
+            "--scheduler-mode", "mtp_cohort_experimental",
+            "--experimental-mtp-cohorts",
+            "--max-active-requests", "2",
+            "--decode-batch-max", "2",
+            "--batch-wait-ms", "0",
+            "--prefill-chunk-tokens", "1024",
+            "--generation-mode", "mtp",
+            "--load-mtp",
+            "--depth", "2",
+        ]
+    )
+    return SimpleNamespace(
+        args=args,
+        runtime=SimpleNamespace(mtp_enabled=True),
+        backend_descriptor=SimpleNamespace(backend_id="qwen3_next"),
+        model_scheduler=_ImmediateModelScheduler(),
+    )
+
+
+def test_mtp_cohort_startup_installs_lane_then_service_on_model_owner(monkeypatch):
+    state = _mtp_cohort_startup_state()
+    lane = object()
+    service = object()
+    events: list[tuple] = []
+    monkeypatch.setenv("MTPLX_COHORT_FROZEN_TEST", "before-install")
+
+    def install(runtime, **kwargs):
+        events.append(("install", runtime, kwargs))
+        return lane
+
+    def make_service(server_state, installed_lane):
+        events.append(("service", server_state, installed_lane))
+        return service
+
+    openai._install_mtp_cohort_runtime(
+        state,
+        lane_installer=install,
+        service_factory=make_service,
+    )
+
+    assert state.mtp_cohort_lane is lane
+    assert state.mtp_cohort_service is service
+    assert state.mtp_cohort_environment["MTPLX_COHORT_FROZEN_TEST"] == (
+        "before-install"
+    )
+    monkeypatch.setenv("MTPLX_COHORT_FROZEN_TEST", "after-install")
+    assert state.mtp_cohort_environment["MTPLX_COHORT_FROZEN_TEST"] == (
+        "before-install"
+    )
+    with pytest.raises(TypeError):
+        state.mtp_cohort_environment["MTPLX_COHORT_FROZEN_TEST"] = "mutated"
+    assert [event[0] for event in events] == ["install", "service"]
+    assert events[0][2] == {
+        "backend_id": "qwen3_next",
+        "depth": 2,
+        "verify_strategy": "capture_commit",
+        "verify_core": "linear-gdn-from-conv-tape",
+    }
+    assert state.model_scheduler.calls[0]["batch_key"] == "startup.mtp_cohort_lane"
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "message"),
+    [
+        ("experimental_mtp_cohorts", False, "--experimental-mtp-cohorts"),
+        ("max_active_requests", 1, "max_active_requests=2"),
+        ("decode_batch_max", 1, "decode_batch_max=2"),
+        ("batch_wait_ms", 1.0, "batch_wait_ms=0"),
+        ("prefill_chunk_tokens", 2048, "prefill_chunk_tokens=1024"),
+        ("generation_mode", "ar", "generation_mode=mtp"),
+        ("load_mtp", False, "load_mtp=true"),
+        ("depth", 3, "depth=2"),
+        ("adaptive_policy", "expected_value", "adaptive_policy=none"),
+    ],
+)
+def test_mtp_cohort_startup_rejects_nonfixed_configuration(
+    attribute, value, message
+):
+    state = _mtp_cohort_startup_state()
+    setattr(state.args, attribute, value)
+
+    with pytest.raises(ValueError, match=message):
+        openai._install_mtp_cohort_runtime(
+            state,
+            lane_installer=lambda *_args, **_kwargs: object(),
+            service_factory=lambda *_args: object(),
+        )
+
+    assert state.mtp_cohort_lane is None
+    assert state.mtp_cohort_service is None
+    assert state.mtp_cohort_environment is None
+    assert state.model_scheduler.calls == []
+
+
+def test_noncohort_startup_leaves_experimental_lane_uninstalled():
+    state = _mtp_cohort_startup_state()
+    state.args.scheduler_mode = "serial"
+    state.mtp_cohort_lane = object()
+    state.mtp_cohort_service = object()
+
+    openai._install_mtp_cohort_runtime(
+        state,
+        lane_installer=lambda *_args, **_kwargs: pytest.fail("unexpected install"),
+        service_factory=lambda *_args: pytest.fail("unexpected service"),
+    )
+
+    assert state.mtp_cohort_lane is None
+    assert state.mtp_cohort_service is None
+    assert state.model_scheduler.calls == []
+
+
+def test_mtp_cohort_startup_propagates_lane_installation_failure():
+    state = _mtp_cohort_startup_state()
+
+    def fail_install(*_args, **_kwargs):
+        raise RuntimeError("lane self-check failed")
+
+    with pytest.raises(RuntimeError, match="lane self-check failed"):
+        openai._install_mtp_cohort_runtime(
+            state,
+            lane_installer=fail_install,
+            service_factory=lambda *_args: pytest.fail("unexpected service"),
+        )
+
+    assert state.mtp_cohort_lane is None
+    assert state.mtp_cohort_service is None
+
+
+def test_server_installs_mtp_cohort_runtime_before_warmup():
+    source = inspect.getsource(openai.ServerState.__init__)
+
+    assert source.index("_install_mtp_cohort_runtime(self)") < source.index(
+        "_run_startup_warmup(self)"
+    )
+
+
+def test_mtp_cohort_mode_is_never_an_ar_batch_fallback():
+    state = _mtp_cohort_startup_state()
+
+    assert openai._ar_batch_mtp_fallback_reason(state) is None
+    assert openai._use_live_ar_batch(state, effective_mode="mtp") == (False, None)
+    assert openai._use_live_ar_batch(state, effective_mode="ar") == (False, None)
+
+
+def test_mtp_cohort_long_context_policy_preserves_fixed_depth(monkeypatch):
+    state = _mtp_cohort_startup_state()
+    monkeypatch.setattr(
+        openai,
+        "resolve_long_context_mtp_depth",
+        lambda **_kwargs: pytest.fail(
+            "fixed cohort depth consulted the ambient long-context policy"
+        ),
+    )
+
+    effective_depth, policy = openai._long_context_mtp_depth_policy_for_request(
+        state,
+        generation_mode="mtp",
+        request_depth=2,
+        prompt_tokens=200_000,
+    )
+
+    assert effective_depth == 2
+    assert policy == {
+        "active": False,
+        "effective_depth": 2,
+        "reason": "fixed_mtp_cohort_depth",
+        "requested_depth": 2,
+    }
+
+
+def test_mtp_cohort_dispatch_runs_generation_on_request_thread(monkeypatch):
+    state = _mtp_cohort_startup_state()
+    state.mtp_cohort_lane = object()
+    state.mtp_cohort_service = object()
+    state.mtp_cohort_environment = {}
+    state.ar_batch_service = SimpleNamespace(
+        submit=lambda _job: pytest.fail("cohort request touched AR batch service")
+    )
+    captured = {}
+
+    def run_generation(server_state, prompt_ids, **kwargs):
+        captured.update(
+            {
+                "state": server_state,
+                "prompt_ids": prompt_ids,
+                "kwargs": kwargs,
+            }
+        )
+        return {"lane": "mtp_cohort"}
+
+    monkeypatch.setattr(openai, "_run_generation_cohort", run_generation)
+    monkeypatch.setattr(
+        openai,
+        "_submit_foreground_model_work",
+        lambda *_args, **_kwargs: pytest.fail(
+            "cohort dispatch submitted a waiter to the model owner"
+        ),
+    )
+
+    result = openai._run_generation_dispatched(
+        state,
+        [1, 2, 3],
+        batch_key="test.cohort",
+        response_id="cohort-request",
+        generation_mode="mtp",
+        constraint_spec="constraint",
+    )
+
+    assert result == {"lane": "mtp_cohort"}
+    assert captured["state"] is state
+    assert captured["prompt_ids"] == [1, 2, 3]
+    assert captured["kwargs"]["constraint_spec"] == "constraint"
+    assert captured["kwargs"]["request_observability"] == {
+        "request_id": "cohort-request",
+        "scheduler_lane": "mtp_cohort",
+    }
+
+
+@pytest.mark.parametrize(
+    "missing_attribute",
+    [
+        "mtp_cohort_lane",
+        "mtp_cohort_service",
+        "mtp_cohort_environment",
+    ],
+)
+def test_mtp_cohort_dispatch_fails_before_work_when_not_installed(
+    monkeypatch, missing_attribute
+):
+    state = _mtp_cohort_startup_state()
+    state.mtp_cohort_lane = object()
+    state.mtp_cohort_service = object()
+    state.mtp_cohort_environment = {}
+    setattr(state, missing_attribute, None)
+    monkeypatch.setattr(
+        openai,
+        "_run_generation_cohort",
+        lambda *_args, **_kwargs: pytest.fail("generation started before lane check"),
+    )
+    monkeypatch.setattr(
+        openai,
+        "_submit_foreground_model_work",
+        lambda *_args, **_kwargs: pytest.fail("owner work started before lane check"),
+    )
+
+    with pytest.raises(RuntimeError, match="cohort runtime is not installed"):
+        openai._run_generation_dispatched(
+            state,
+            [1, 2, 3],
+            batch_key="test.missing",
+            generation_mode="mtp",
+        )
+
+
+def test_mtp_cohort_per_request_ar_preserves_serial_owner_dispatch(monkeypatch):
+    state = _mtp_cohort_startup_state()
+    state.mtp_cohort_lane = object()
+    state.mtp_cohort_service = object()
+    state.mtp_cohort_environment = {}
+    state.ar_batch_service = SimpleNamespace(
+        submit=lambda _job: pytest.fail("per-request AR touched AR batch service")
+    )
+    captured = {}
+
+    def run_generation(_state, _prompt_ids, **kwargs):
+        captured.update(kwargs)
+        return {"lane": "serial_ar"}
+
+    monkeypatch.setattr(openai, "_run_generation", run_generation)
+
+    result = openai._run_generation_dispatched(
+        state,
+        [1, 2, 3],
+        batch_key="test.serial-ar",
+        generation_mode="ar",
+    )
+
+    assert result == {"lane": "serial_ar"}
+    assert captured["generation_mode"] == "ar"
+    assert len(state.model_scheduler.calls) == 1
+    assert state.model_scheduler.calls[0]["batch_key"] == "test.serial-ar"
+
+
+def test_use_mtp_cohort_selects_only_installed_explicit_mtp_lane():
+    state = _mtp_cohort_startup_state()
+    state.mtp_cohort_lane = object()
+    state.mtp_cohort_service = object()
+    state.mtp_cohort_environment = {}
+
+    assert openai._use_mtp_cohort(state, effective_mode="mtp") is True
+    assert openai._use_mtp_cohort(state, effective_mode="ar") is False
+
+    state.args.scheduler_mode = "serial"
+    assert openai._use_mtp_cohort(state, effective_mode="mtp") is False
+
+
+@pytest.mark.parametrize("missing", ["lane", "service", "environment"])
+def test_use_mtp_cohort_rejects_missing_construction_artifact(missing):
+    state = _mtp_cohort_startup_state()
+    state.mtp_cohort_lane = object()
+    state.mtp_cohort_service = object()
+    state.mtp_cohort_environment = {}
+    setattr(state, f"mtp_cohort_{missing}", None)
+
+    with pytest.raises(RuntimeError, match="cohort runtime is not installed"):
+        openai._use_mtp_cohort(state, effective_mode="mtp")
+
+
+def test_frozen_mtp_cohort_environment_overlays_without_ambient_read(monkeypatch):
+    state = _mtp_cohort_startup_state()
+    base = {"BASE": "frozen", "OVERLAY": "old"}
+    state.mtp_cohort_environment = base
+    dynamic = {"OVERLAY": "new", "DYNAMIC": "yes"}
+
+    class AmbientBomb:
+        @property
+        def environ(self):
+            pytest.fail("cohort environment re-read ambient os.environ")
+
+    monkeypatch.setattr(openai, "os", AmbientBomb())
+    frozen = openai._frozen_mtp_cohort_environment(state, dynamic)
+    base["BASE"] = "mutated"
+    dynamic["DYNAMIC"] = "mutated"
+
+    assert dict(frozen) == {
+        "BASE": "frozen",
+        "OVERLAY": "new",
+        "DYNAMIC": "yes",
+    }
+    with pytest.raises(TypeError):
+        frozen["DYNAMIC"] = "mutated"
+
+
+def test_mtp_cohort_request_policy_reads_only_frozen_environment(monkeypatch):
+    state = _fake_streaming_session_state()
+    state.args.max_response_tokens = None
+    frozen = {
+        "MTPLX_UNCAPPED_RESPONSE_LEASE_TOKENS": "7",
+        "MTPLX_UNCAPPED_REPETITION_STOP": "0",
+        "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "3",
+        "MTPLX_LOOP_GUARD": "1",
+        "MTPLX_CLEAR_CACHE_AFTER_REQUEST": "always",
+    }
+    captured = {}
+
+    class AmbientBomb:
+        @property
+        def environ(self):
+            pytest.fail("cohort request policy read ambient os.environ")
+
+    monkeypatch.setattr(openai, "os", AmbientBomb())
+    monkeypatch.setattr(openai, "think_marker_ids", lambda _tokenizer: (1, 2))
+
+    def thinking_config(*_args, **kwargs):
+        captured["thinking_environment"] = kwargs["environment"]
+        return SimpleNamespace(enabled=True)
+
+    def clear_cache(*_args, **kwargs):
+        captured["cleanup_environment"] = kwargs["environment"]
+        return {"cleared": True}
+
+    monkeypatch.setattr(
+        openai,
+        "thinking_guard_config_from_env",
+        thinking_config,
+    )
+    monkeypatch.setattr(
+        openai,
+        "_clear_mlx_cache_after_request",
+        clear_cache,
+    )
+
+    response_max, _sampler, limits = openai._generation_params(
+        state,
+        prompt_token_count=10,
+        max_tokens=None,
+        temperature=None,
+        top_p=None,
+        top_k=None,
+        environment=frozen,
+    )
+    repetition_stop = openai._uncapped_repetition_stop_enabled(
+        limits,
+        environment=frozen,
+    )
+    reservation = openai._dynamic_paged_kv_reservation(
+        prompt_tokens=10,
+        max_new_tokens=9,
+        mtp_depth=2,
+        environment=frozen,
+    )
+    loop_guard = openai._loop_guard_enabled(frozen)
+    thinking_guard = openai._thinking_guard_config_for_request(
+        state,
+        prompt_ids=[1, 2, 3],
+        request_observability={
+            "request_enable_thinking": True,
+            "request_tool_count": 1,
+        },
+        environment=frozen,
+    )
+    cleanup = openai._auto_clear_mlx_cache_after_completed_request(
+        state,
+        session_id=None,
+        request_observability={},
+        environment=frozen,
+    )
+
+    assert response_max == 7
+    assert repetition_stop is False
+    assert reservation["reserved_new_tokens"] == 3
+    assert reservation["reserved_total_tokens"] == 15
+    assert loop_guard is True
+    assert thinking_guard.enabled is True
+    assert cleanup == {"cleared": True}
+    assert captured == {
+        "thinking_environment": frozen,
+        "cleanup_environment": frozen,
+    }
+
+
+def test_build_mtp_cohort_job_preserves_prepared_request_contract():
+    state = _mtp_cohort_startup_state()
+    state.mtp_cohort_environment = {
+        "MTPLX_SUSTAINED_PREFILL": "1",
+        "MTPLX_DYNAMIC": "base",
+    }
+    cancel_event = Event()
+    sampler = SimpleNamespace(
+        temperature=0.6,
+        top_p=0.95,
+        top_k=20,
+        presence_penalty=1.25,
+        frequency_penalty=0.5,
+    )
+    constraint = object()
+    token_callback = object()
+    prefill_callback = object()
+    session_bank = object()
+
+    def owner_finalize(output):
+        return output
+
+    trace_metadata = {"session_id": "session-a", "request_id": "request-a"}
+    prepared = {
+        "constraint": constraint,
+        "vision_splice": None,
+        "max_tokens": 99,
+        "sampler": sampler,
+        "draft_sampler": "draft-sampler",
+        "seed": 17,
+        "verify_strategy": "capture_commit",
+        "verify_core": "linear-gdn-from-conv-tape",
+        "token_callback": token_callback,
+        "session_bank": session_bank,
+        "session_id": "session-a",
+        "session_restore_mode": "clone",
+        "session_template_hash": "template-a",
+        "session_draft_head_identity": "draft-a",
+        "session_policy_fingerprint": "policy-a",
+        "capture_final_state": True,
+        "commit_prompt_state_to_bank": True,
+        "commit_prompt_state_keep_live_ref": False,
+        "trace_label": "trace-a",
+        "trace_metadata": trace_metadata,
+        "prefill_callback": prefill_callback,
+        "repetition_stop": True,
+        "loop_guard": False,
+        "thinking_guard": "thinking-a",
+    }
+
+    job = openai._build_mtp_cohort_job(
+        state,
+        [1, 2, 3],
+        request_id="request-a",
+        dynamic_environment={"MTPLX_DYNAMIC": "request"},
+        prepared_state_kwargs=prepared,
+        cancel_event=cancel_event,
+        owner_finalize=owner_finalize,
+    )
+
+    assert job.request_id == "request-a"
+    assert job.prompt_ids == [1, 2, 3]
+    assert job.owner_finalize is owner_finalize
+    assert job.environment["MTPLX_SUSTAINED_PREFILL"] == "1"
+    assert job.environment["MTPLX_DYNAMIC"] == "request"
+    assert job.state_kwargs["constraint"] is constraint
+    assert job.state_kwargs["sampler"] is sampler
+    assert job.state_kwargs["sampler"].presence_penalty == 1.25
+    assert job.state_kwargs["sampler"].frequency_penalty == 0.5
+    assert job.state_kwargs["seed"] == 17
+    assert job.state_kwargs["token_callback"] is token_callback
+    assert job.state_kwargs["prefill_callback"] is prefill_callback
+    assert job.state_kwargs["session_bank"] is session_bank
+    assert job.state_kwargs["session_id"] == "session-a"
+    assert job.state_kwargs["trace_metadata"] == trace_metadata
+    assert job.state_kwargs["speculative_depth"] == 2
+    assert job.state_kwargs["adaptive_policy"] is None
+    assert job.state_kwargs["abort_check"]() is False
+    cancel_event.set()
+    assert job.state_kwargs["abort_check"]() is True
+    with pytest.raises(TypeError):
+        job.state_kwargs["seed"] = 18
+
+
+def test_mtp_cohort_owner_finalize_commits_and_collects_owner_metadata(monkeypatch):
+    state = _fake_streaming_session_state()
+    owner_events: list[str] = []
+    output_tokens = [ord("O"), ord("K")]
+    final_state = _fake_final_state(output_tokens)
+    final_state.final_committed_mtp_cache = "mtp-cache"
+    output = SimpleNamespace(
+        tokens=output_tokens,
+        text="OK",
+        stats=SimpleNamespace(
+            to_dict=lambda: {
+                "prompt_eval_time_s": 0.01,
+                "generated_tokens": 2,
+                "elapsed_s": 0.1,
+                "tok_s": 20.0,
+                "speculative_depth": 2,
+            }
+        ),
+        final_state=final_state,
+        finish_reason="stop",
+    )
+
+    class OwnerService:
+        def __init__(self):
+            self.in_owner = False
+            self.job = None
+
+        def submit(self, job):
+            self.job = job
+            self.in_owner = True
+            try:
+                result = job.owner_finalize(output)
+            finally:
+                self.in_owner = False
+            assert not job.future.done()
+            job.future.set_result(result)
+            return job.future
+
+    service = OwnerService()
+    state.mtp_cohort_service = service
+
+    class OwnerBank(RecordingBank):
+        last_put_nbytes = 789
+        last_put_skipped_oversized_snapshot = True
+
+        def put(self, **kwargs):
+            assert service.in_owner
+            owner_events.append("session-put")
+            return super().put(**kwargs)
+
+    bank = OwnerBank()
+
+    def owner_snapshot(cache):
+        assert service.in_owner
+        owner_events.append("snapshot-cache")
+        return {"snapshot": cache}
+
+    def owner_cleanup(*_args, **_kwargs):
+        assert service.in_owner
+        owner_events.append("cleanup")
+        return {"cleared": True, "reason": "test"}
+
+    def owner_allocator():
+        assert service.in_owner
+        owner_events.append("allocator")
+        return {"active_memory_bytes": 123}
+
+    monkeypatch.setattr(openai, "snapshot_cache", owner_snapshot)
+    monkeypatch.setattr(
+        openai,
+        "_auto_clear_mlx_cache_after_completed_request",
+        owner_cleanup,
+    )
+    monkeypatch.setattr(openai, "_mlx_allocator_public_stats", owner_allocator)
+
+    from mtplx.server.mtp_cohort import MTPK2CohortJob
+
+    def owner_finalize(owner_output):
+        return openai._finalize_mtp_cohort_output_on_owner(
+            state,
+            owner_output,
+            prompt_ids=[1, 2, 3],
+            session_id="session-a",
+            session_bank=bank,
+            session_template_hash="template-a",
+            session_draft_head_identity="draft-a",
+            session_policy_fingerprint="policy-a",
+            session_keep_live_ref=False,
+            commit_final_state_to_bank=True,
+            request_observability={"request_id": "request-a"},
+            vision_splice=None,
+        )
+
+    job = MTPK2CohortJob(
+        request_id="request-a",
+        prompt_ids=[1, 2, 3],
+        state_kwargs={},
+        owner_finalize=owner_finalize,
+    )
+    result = service.submit(job).result()
+
+    assert result.output is output
+    assert result.session_commit_stats == {
+        "sessionbank_snapshot_bytes": 789,
+        "sessionbank_skipped_oversized_snapshot": True,
+    }
+    assert result.cleanup == {
+        "cleared": True,
+        "reason": "test",
+    }
+    assert result.allocator_stats == {"active_memory_bytes": 123}
+    assert owner_events == [
+        "snapshot-cache",
+        "session-put",
+        "cleanup",
+        "allocator",
+    ]
+    assert len(bank.puts) == 1
+    assert bank.puts[0] == {
+        "runtime": state.runtime,
+        "token_ids": [1, 2, 3, *output_tokens],
+        "cache": ["cache"],
+        "logits": "logits",
+        "hidden": "hidden",
+        "hidden_variant": "post_norm",
+        "keep_live_ref": False,
+        "session_id": "session-a",
+        "template_hash": "template-a",
+        "mtp_history_policy": "committed",
+        "draft_head_identity": "draft-a",
+        "policy_fingerprint": "policy-a",
+        "mtp_history_snapshot": {"snapshot": "mtp-cache"},
+        "snapshot_epoch": 5,
+        "mtp_snapshot_epoch": 5,
+        "extra_state": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("commit_enabled", "safe_to_commit", "with_session_bank"),
+    [
+        (False, True, True),
+        (True, False, True),
+        (True, True, False),
+    ],
+)
+def test_mtp_cohort_owner_finalize_skips_ineligible_session_commit(
+    monkeypatch,
+    commit_enabled,
+    safe_to_commit,
+    with_session_bank,
+):
+    state = _fake_streaming_session_state()
+    final_state = _fake_final_state([7])
+    final_state.safe_to_commit = safe_to_commit
+    output = SimpleNamespace(tokens=[7], final_state=final_state)
+
+    class Bank:
+        def put(self, **_kwargs):
+            pytest.fail("ineligible cohort output reached SessionBank.put")
+
+    monkeypatch.setattr(
+        openai,
+        "snapshot_cache",
+        lambda _cache: pytest.fail(
+            "ineligible cohort output reached snapshot_cache"
+        ),
+    )
+    cleanup_calls = []
+    allocator_calls = []
+    monkeypatch.setattr(
+        openai,
+        "_auto_clear_mlx_cache_after_completed_request",
+        lambda *_args, **_kwargs: (
+            cleanup_calls.append("cleanup") or {"cleared": True}
+        ),
+    )
+    monkeypatch.setattr(
+        openai,
+        "_mlx_allocator_public_stats",
+        lambda: (
+            allocator_calls.append("allocator")
+            or {"cache_memory_bytes": 456}
+        ),
+    )
+
+    result = openai._finalize_mtp_cohort_output_on_owner(
+        state,
+        output,
+        prompt_ids=[1, 2, 3],
+        session_id="session-a",
+        session_bank=Bank() if with_session_bank else None,
+        session_template_hash="template-a",
+        session_draft_head_identity="draft-a",
+        session_policy_fingerprint="policy-a",
+        session_keep_live_ref=True,
+        commit_final_state_to_bank=commit_enabled,
+        request_observability={"request_id": "request-a"},
+        vision_splice=None,
+    )
+
+    assert result.output is output
+    assert result.session_commit_stats == {}
+    assert result.cleanup == {"cleared": True}
+    assert result.allocator_stats == {"cache_memory_bytes": 456}
+    assert cleanup_calls == ["cleanup"]
+    assert allocator_calls == ["allocator"]
+
+
+@pytest.mark.parametrize("background_request", [False, True])
+def test_run_generation_cohort_keeps_model_postprocess_on_owner(
+    monkeypatch,
+    background_request,
+):
+    state = _fake_streaming_session_state()
+    state.args = _mtp_cohort_startup_state().args
+    state.draft_sampler = None
+    state.requests_completed = 0
+    state.mtp_cohort_lane = object()
+    state.mtp_cohort_environment = {
+        "MTPLX_SUSTAINED_PREFILL": "1",
+        "MTPLX_LOOP_GUARD": "0",
+    }
+    owner_events: list[str] = []
+    streamed_tokens: list[int] = []
+    final_state = _fake_final_state([ord("O"), ord("K")])
+    output = SimpleNamespace(
+        tokens=[ord("O"), ord("K")],
+        text="OK",
+        stats=SimpleNamespace(
+            to_dict=lambda: {
+                "prompt_eval_time_s": 0.01,
+                "generated_tokens": 2,
+                "elapsed_s": 0.1,
+                "tok_s": 20.0,
+                "decode_tok_s": 20.0,
+                "speculative_depth": 2,
+            }
+        ),
+        final_state=final_state,
+        finish_reason="stop",
+    )
+
+    class BombLock:
+        def __getattr__(self, name):
+            pytest.fail(f"cohort request touched the serial model lock: {name}")
+
+    state.lock = BombLock()
+
+    class OwnerService:
+        def __init__(self):
+            self.in_owner = False
+            self.job = None
+
+        def submit(self, job):
+            self.job = job
+            self.in_owner = True
+            try:
+                job.state_kwargs["token_callback"](output.tokens)
+                result = job.owner_finalize(output)
+            finally:
+                self.in_owner = False
+            job.future.set_result(result)
+            return job.future
+
+        def snapshot(self):
+            return {
+                "pending": 0,
+                "active": 0,
+                "pump_scheduled": False,
+            }
+
+    service = OwnerService()
+    state.mtp_cohort_service = service
+
+    class OwnerBank(RecordingBank):
+        last_put_nbytes = 321
+        last_put_skipped_oversized_snapshot = False
+
+        def put(self, **kwargs):
+            assert service.in_owner
+            owner_events.append("session-put")
+            return super().put(**kwargs)
+
+    bank = OwnerBank()
+
+    def owner_cleanup(*_args, **_kwargs):
+        assert service.in_owner
+        owner_events.append("cleanup")
+        return {"cleared": True}
+
+    def owner_allocator():
+        assert service.in_owner
+        owner_events.append("allocator")
+        return {"active_memory_bytes": 123}
+
+    monkeypatch.setattr(
+        openai,
+        "_dynamic_paged_kv_reservation",
+        lambda **_kwargs: {
+            "env": {"MTPLX_DYNAMIC_PAGED_KV_TOKENS": "4101"},
+            "reserved_total_tokens": 4101,
+        },
+    )
+    monkeypatch.setattr(openai, "snapshot_cache", lambda _cache: None)
+    monkeypatch.setattr(
+        openai,
+        "_auto_clear_mlx_cache_after_completed_request",
+        owner_cleanup,
+    )
+    monkeypatch.setattr(openai, "_mlx_allocator_public_stats", owner_allocator)
+    monkeypatch.setattr(
+        openai,
+        "_temporary_env",
+        lambda *_args, **_kwargs: pytest.fail(
+            "cohort request mutated ambient environment"
+        ),
+    )
+    monkeypatch.setattr(
+        openai,
+        "prefill_chunk_size_override",
+        lambda *_args, **_kwargs: pytest.fail(
+            "cohort request overrode the frozen 1024-token prefill chunk"
+        ),
+    )
+    monkeypatch.setattr(
+        openai,
+        "generate_mtpk",
+        lambda *_args, **_kwargs: pytest.fail(
+            "cohort request called the monolithic MTP generator"
+        ),
+    )
+    constraint = object()
+
+    generated = openai._run_generation_cohort(
+        state,
+        [1, 2, 3],
+        max_tokens=2,
+        temperature=0.6,
+        top_p=0.95,
+        top_k=20,
+        presence_penalty=1.25,
+        frequency_penalty=0.5,
+        seed=17,
+        generation_mode="mtp",
+        depth=2,
+        background_request=background_request,
+        token_callback=streamed_tokens.extend,
+        session_id="session-a",
+        session_bank=bank,
+        session_template_hash="template-a",
+        session_draft_head_identity="draft-a",
+        session_policy_fingerprint="policy-a",
+        session_keep_live_ref=False,
+        request_observability={"request_id": "request-a"},
+        constraint_spec=SimpleNamespace(
+            build=lambda _tokenizer, *, prompt_ids: (
+                constraint
+                if prompt_ids == [1, 2, 3]
+                else pytest.fail("constraint received the wrong prompt")
+            )
+        ),
+    )
+
+    assert generated["text"] == "OK"
+    assert generated["tokens"] == [ord("O"), ord("K")]
+    assert generated["stats"]["sessionbank_snapshot_bytes"] == 321
+    assert generated["stats"]["mlx_cache_cleanup"] == {"cleared": True}
+    assert generated["stats"]["active_memory_bytes"] == 123
+    assert streamed_tokens == [ord("O"), ord("K")]
+    assert owner_events == ["session-put", "cleanup", "allocator"]
+    assert len(bank.puts) == 1
+    assert service.job.request_id == "request-a"
+    assert service.job.prompt_ids == [1, 2, 3]
+    assert service.job.environment["MTPLX_DYNAMIC_PAGED_KV_TOKENS"] == "4101"
+    assert service.job.state_kwargs["constraint"] is constraint
+    assert service.job.state_kwargs["speculative_depth"] == 2
+    assert service.job.state_kwargs["adaptive_policy"] is None
+    assert service.job.state_kwargs["session_bank"] is bank
+    assert service.job.state_kwargs["session_id"] == "session-a"
+    assert service.job.state_kwargs["commit_prompt_state_keep_live_ref"] is False
+    assert state.foreground_count() == 0
 
 
 def test_server_parser_default_model_is_public_hf_default():

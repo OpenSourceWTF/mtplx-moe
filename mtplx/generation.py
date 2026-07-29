@@ -16,7 +16,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Callable, Literal
 
 import mlx.core as mx
@@ -61,10 +61,26 @@ from .graphbank import (
     promote_kv_cache_offsets,
 )
 from .native_mlp import set_native_mlp_context
-from .loop_guard import LoopGuard, loop_guard_config_from_env
+from .loop_guard import (
+    LoopGuard,
+    loop_guard_config_from_env,
+    loop_guard_config_from_environment,
+)
 from .thinking_guard import ThinkingGuard, ThinkingGuardConfig
 from .profiles import resolve_long_context_mtp_depth
 from .runtime import MTPLXRuntime
+from .mtp_k2_stepper import (
+    MTPK2AcceptanceContext,
+    MTPK2ContextCopyResult,
+    MTPK2ContextCopyTicket,
+    MTPK2PrefillResult,
+    MTPK2PrefillTicket,
+    MTPK2RequestConfig,
+    MTPK2RequestState,
+    MTPK2VerifyResult,
+    MTPK2VerifyTicket,
+    current_mtpk2_request_config,
+)
 from .sampling import (
     SamplerConfig,
     SparseDistribution,
@@ -156,7 +172,7 @@ def _resolve_runtime_base_hidden_variant(
 
 
 def _resolve_runtime_mtp_position_mode(rt: MTPLXRuntime) -> str:
-    raw = os.environ.get("MTPLX_MTP_POSITION_MODE")
+    raw = _generation_env_get("MTPLX_MTP_POSITION_MODE")
     if raw is None:
         raw = getattr(rt.contract, "mtp_position_mode", "cache")
     normalized = str(raw or "cache").strip().lower().replace("-", "_")
@@ -189,7 +205,7 @@ def _eval_value_summary(value: Any) -> dict[str, Any]:
 
 
 def _eval(*values: Any, _caller_depth: int = 1) -> None:
-    audit_path = os.environ.get("MTPLX_EVAL_AUDIT")
+    audit_path = _generation_env_get("MTPLX_EVAL_AUDIT")
     if not audit_path:
         mx.eval(*values)
         # Every settled engine forward (prefill chunk, verify, AR step) proves
@@ -215,12 +231,31 @@ def _eval(*values: Any, _caller_depth: int = 1) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, sort_keys=True) + "\n")
-    if os.environ.get("MTPLX_EVAL_AUDIT_STDERR"):
+    if _generation_env_get("MTPLX_EVAL_AUDIT_STDERR"):
         print(json.dumps(entry, sort_keys=True), file=sys.stderr)
 
 
+_GENERATION_ENV_SNAPSHOT: ContextVar[Mapping[str, str] | None] = ContextVar(
+    "mtplx_generation_env_snapshot",
+    default=None,
+)
+
+
+def _generation_env_get(
+    name: str,
+    default: str | None = None,
+) -> str | None:
+    request_config = current_mtpk2_request_config()
+    if request_config is not None:
+        return request_config.environment.get(name, default)
+    construction_snapshot = _GENERATION_ENV_SNAPSHOT.get()
+    if construction_snapshot is not None:
+        return construction_snapshot.get(name, default)
+    return os.environ.get(name, default)
+
+
 def _env_truthy(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {
+    return (_generation_env_get(name, "") or "").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -229,7 +264,7 @@ def _env_truthy(name: str) -> bool:
 
 
 def _env_falsey(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {
+    return (_generation_env_get(name, "") or "").strip().lower() in {
         "0",
         "false",
         "no",
@@ -251,7 +286,7 @@ def _skip_verify_snapshot() -> bool:
 
 def _env_int(name: str, default: int) -> int:
     try:
-        return int(os.environ.get(name, str(default)))
+        return int(_generation_env_get(name, str(default)) or default)
     except (TypeError, ValueError):
         return int(default)
 
@@ -308,7 +343,7 @@ def _mtp_history_last_window_tokens() -> int:
 
 def _resolve_mtp_history_policy(requested_policy: str, prompt_tokens: int) -> str:
     requested = _normalize_mtp_history_policy(requested_policy)
-    env_policy = os.environ.get("MTPLX_MTP_HISTORY_POLICY")
+    env_policy = _generation_env_get("MTPLX_MTP_HISTORY_POLICY")
     # Honor the env-var override whenever the caller requested either the
     # product default "committed" or the auto-resolution path. This keeps
     # diagnostic history-policy overrides reachable from the server hot path.
@@ -523,6 +558,14 @@ _GENERATION_FEATURE_POLICY = bind_generation_feature_policy(os.environ)
 
 
 def _sustained_prefill_enabled() -> bool:
+    request_config = current_mtpk2_request_config()
+    if request_config is not None:
+        return request_config.sustained_prefill_enabled
+    construction_snapshot = _GENERATION_ENV_SNAPSHOT.get()
+    if construction_snapshot is not None:
+        return str(
+            construction_snapshot.get("MTPLX_SUSTAINED_PREFILL", "")
+        ).strip().lower() in {"1", "true", "yes", "on"}
     return _GENERATION_FEATURE_POLICY.sustained_prefill
 
 
@@ -537,7 +580,7 @@ def _prefill_chunk_cache_cleanup_enabled() -> bool:
 
 
 def _prefill_chunk_cache_cleanup_every() -> int:
-    raw = os.environ.get("MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY")
+    raw = _generation_env_get("MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY")
     if raw is None or not str(raw).strip():
         return 1
     raw_text = str(raw).strip().lower()
@@ -585,7 +628,7 @@ def _prefill_stock_cache_only_enabled() -> bool:
 
 
 def _unsafe_long_context_prefill_guard_tokens() -> int:
-    raw = os.environ.get("MTPLX_UNSAFE_LONG_CONTEXT_PREFILL_GUARD_TOKENS")
+    raw = _generation_env_get("MTPLX_UNSAFE_LONG_CONTEXT_PREFILL_GUARD_TOKENS")
     if raw is None or not str(raw).strip():
         return 16384
     try:
@@ -672,10 +715,15 @@ def _prefill_cache_only_forward(
 
 
 def _prefill_chunk_size() -> int:
+    request_config = current_mtpk2_request_config()
+    if request_config is not None:
+        return request_config.prefill_chunk_tokens
     override = _PREFILL_CHUNK_SIZE_OVERRIDE.get()
     if override is not None:
         return max(1, int(override))
-    raw = (os.environ.get("MTPLX_PREFILL_CHUNK_SIZE") or "2048").strip().lower()
+    raw = (
+        _generation_env_get("MTPLX_PREFILL_CHUNK_SIZE") or "2048"
+    ).strip().lower()
     if raw == "auto":
         layout = _sustained_prefill_layout()
         if layout == "contiguous_dense_decode":
@@ -729,9 +777,12 @@ def _iter_prefill_chunk_spans(token_count: int) -> list[tuple[int, int]]:
     ]
 
 
-def _sustained_prefill_layout() -> str:
+def _sustained_prefill_layout(*, context_tokens: int | None = None) -> str:
+    request_config = current_mtpk2_request_config()
+    if context_tokens is None and request_config is not None:
+        return request_config.sustained_prefill_layout
     layout = (
-        os.environ.get("MTPLX_SUSTAINED_PREFILL_LAYOUT", "")
+        (_generation_env_get("MTPLX_SUSTAINED_PREFILL_LAYOUT", "") or "")
         .strip()
         .lower()
         .replace("-", "_")
@@ -742,29 +793,53 @@ def _sustained_prefill_layout() -> str:
     # documented spellings ("8", "8bit", "uint8") that the rest of the stack
     # honours as q8, and silently picked the dense-decode layout for a
     # quantized cache.
-    from .kv_quant import paged_kv_quant_mode_from_env
+    from .kv_quant import paged_kv_quant_mode_from_environment
 
-    if paged_kv_quant_mode_from_env() != "off":
+    quant_environment = (
+        request_config.environment
+        if request_config is not None
+        else (_GENERATION_ENV_SNAPSHOT.get() or os.environ)
+    )
+    if paged_kv_quant_mode_from_environment(quant_environment) != "off":
         return "contiguous_then_repage"
-    context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
+    resolved_context_tokens = (
+        _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
+        if context_tokens is None
+        else max(0, int(context_tokens))
+    )
     dense_max = _env_int("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", 131072)
-    if context_tokens > 0 and context_tokens <= dense_max:
+    if resolved_context_tokens > 0 and resolved_context_tokens <= dense_max:
         return "contiguous_dense_decode"
     return "contiguous_then_repage"
 
 
-def _defer_verify_hidden_eval_enabled() -> bool:
-    raw = (os.environ.get("MTPLX_DEFER_VERIFY_HIDDEN_EVAL") or "").strip().lower()
+def _defer_verify_hidden_eval_enabled(
+    *,
+    context_tokens: int | None = None,
+) -> bool:
+    request_config = current_mtpk2_request_config()
+    if context_tokens is None and request_config is not None:
+        return request_config.defer_verify_hidden_eval
+    raw = (
+        _generation_env_get("MTPLX_DEFER_VERIFY_HIDDEN_EVAL") or ""
+    ).strip().lower()
     if raw == "auto":
-        context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
+        resolved_context_tokens = (
+            _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
+            if context_tokens is None
+            else max(0, int(context_tokens))
+        )
         dense_max = _env_int("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", 131072)
-        return context_tokens > 0 and context_tokens <= dense_max
+        return (
+            resolved_context_tokens > 0
+            and resolved_context_tokens <= dense_max
+        )
     return _env_truthy("MTPLX_DEFER_VERIFY_HIDDEN_EVAL")
 
 
 def _verify_hidden_mode() -> str:
     raw = (
-        (os.environ.get("MTPLX_VERIFY_HIDDEN_MODE") or "default")
+        (_generation_env_get("MTPLX_VERIFY_HIDDEN_MODE") or "default")
         .strip()
         .lower()
         .replace("-", "_")
@@ -772,16 +847,31 @@ def _verify_hidden_mode() -> str:
     return raw or "default"
 
 
-def _clear_cache_every() -> int:
-    raw = (os.environ.get("MTPLX_CLEAR_CACHE_EVERY") or "auto").strip().lower()
+def _clear_cache_every(*, context_tokens: int | None = None) -> int:
+    request_config = current_mtpk2_request_config()
+    if context_tokens is None and request_config is not None:
+        return request_config.clear_cache_every
+    raw = (
+        _generation_env_get("MTPLX_CLEAR_CACHE_EVERY") or "auto"
+    ).strip().lower()
     if raw == "auto":
-        context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
+        resolved_context_tokens = (
+            _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
+            if context_tokens is None
+            else max(0, int(context_tokens))
+        )
         # Lowered default 98304 -> 16384 so clear_cache fires for the typical
         # opencode subagent context regime (16-40K) where wired-memory pressure
         # has been observed in practice. The previous threshold only kicked in
         # past 96K, well above the crash zone.
         threshold = _env_int("MTPLX_CLEAR_CACHE_EVERY_CONTEXT_THRESHOLD", 16384)
-        if context_tokens >= threshold and _contiguous_dense_decode_prefill_enabled():
+        if (
+            resolved_context_tokens >= threshold
+            and _sustained_prefill_layout(
+                context_tokens=resolved_context_tokens
+            )
+            == "contiguous_dense_decode"
+        ):
             # Default 16 tokens was per-step aggressive (sync barrier every
             # tick). 256 amortized it; 1024 (2026-07-16) removes the remaining
             # -3.8% decode tax on 512-token generations at 33k ctx while
@@ -819,7 +909,7 @@ def _target_prefill_cache_layout_scope():
         "MTPLX_OWNED_ATTN_KV",
         "MTPLX_BLOCK_OWNED_ATTN_KV",
     )
-    saved = {key: os.environ.get(key) for key in keys}
+    saved = {key: _generation_env_get(key) for key in keys}
     os.environ["MTPLX_VLLM_METAL_PAGED_ATTN"] = "0"
     os.environ["MTPLX_OWNED_ATTN_KV"] = "0"
     os.environ["MTPLX_BLOCK_OWNED_ATTN_KV"] = "0"
@@ -834,8 +924,18 @@ def _target_prefill_cache_layout_scope():
 
 
 def _make_target_prefill_cache(rt: MTPLXRuntime):
+    request_config = current_mtpk2_request_config()
+    if request_config is not None:
+        return request_config.target_prefill_cache_factory()
     with _target_prefill_cache_layout_scope():
         return rt.make_cache()
+
+
+def _make_generation_mtp_cache(rt: MTPLXRuntime):
+    request_config = current_mtpk2_request_config()
+    if request_config is not None:
+        return request_config.mtp_cache_factory()
+    return rt.make_mtp_cache()
 
 
 def _maybe_repage_target_prefill_cache(rt: MTPLXRuntime, cache: Any) -> float:
@@ -843,23 +943,37 @@ def _maybe_repage_target_prefill_cache(rt: MTPLXRuntime, cache: Any) -> float:
         return 0.0
 
     started = time.perf_counter()
-    if not rt.repage_target_prefill_cache(cache):
-        return 0.0
+    request_config = current_mtpk2_request_config()
+    if request_config is not None:
+        request_config.target_prefill_repage_route(cache)
+    else:
+        if not rt.repage_target_prefill_cache(cache):
+            return 0.0
     _eval_cache_roots(cache)
     return time.perf_counter() - started
 
 
 def _session_restore_cache_factory(rt: MTPLXRuntime) -> Callable[[], Any] | None:
+    request_config = current_mtpk2_request_config()
+    if request_config is not None:
+        return request_config.target_prefill_cache_factory
     if not _contiguous_prefill_cache_layout_enabled():
         return None
     return lambda: _make_target_prefill_cache(rt)
 
 
+def _session_restore_mtp_cache_factory() -> Callable[[], Any] | None:
+    request_config = current_mtpk2_request_config()
+    if request_config is None:
+        return None
+    return request_config.mtp_cache_factory
+
+
 def _session_live_frontier_reference_restore_enabled() -> bool:
     name = "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE"
-    if name not in os.environ:
+    if _generation_env_get(name) is None:
         name = "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER"
-    if name not in os.environ:
+    if _generation_env_get(name) is None:
         return False
     return _env_truthy(name)
 
@@ -1000,15 +1114,19 @@ class _DecodeTrace:
         trace_label: str | None,
         trace_metadata: dict[str, Any] | None,
     ) -> None:
-        trace_path = os.environ.get("MTPLX_DECODE_TRACE_JSONL")
+        trace_path = _generation_env_get("MTPLX_DECODE_TRACE_JSONL")
         self.enabled = bool(trace_path)
         self.path = Path(trace_path).expanduser() if trace_path else None
         self.interval_s = max(
             0.1,
-            float(os.environ.get("MTPLX_DECODE_TRACE_INTERVAL_S") or 1.0),
+            float(_generation_env_get("MTPLX_DECODE_TRACE_INTERVAL_S") or 1.0),
         )
         self.run_id = f"{int(time.time() * 1000)}-{os.getpid()}-{id(self):x}"
-        self.label = trace_label or os.environ.get("MTPLX_DECODE_TRACE_LABEL") or None
+        self.label = (
+            trace_label
+            or _generation_env_get("MTPLX_DECODE_TRACE_LABEL")
+            or None
+        )
         self.metadata = dict(trace_metadata or {})
         self.prompt_tokens = int(prompt_tokens)
         self.max_tokens = int(max_tokens)
@@ -1356,7 +1474,7 @@ class _DecodeTrace:
             "lazy_mtp_history_append": _env_truthy("MTPLX_LAZY_MTP_HISTORY_APPEND"),
             "batch_target_arrays": _batch_target_arrays_enabled(),
             "drop_events": _env_truthy("MTPLX_DROP_EVENTS"),
-            "skip_verify_snapshot": _skip_verify_snapshot(),
+            "skip_verify_snapshot": _skip_verify_snapshot_enabled(),
             "mtp_history_materialize_every": int(mtp_history_materialize_every),
             "mtp_history_materialize_events": int(mtp_history_materialize_events),
             "clear_cache_every": int(_clear_cache_every()),
@@ -1365,7 +1483,7 @@ class _DecodeTrace:
             "clear_cache_time_s_total": float(totals["clear_cache_time_s"]),
             "clear_cache_time_s_delta": clear_cache_time_delta,
             "trunk_cache_materialize_every": int(
-                os.environ.get("MTPLX_TRUNK_CACHE_MATERIALIZE_EVERY") or 0
+                _generation_env_get("MTPLX_TRUNK_CACHE_MATERIALIZE_EVERY") or 0
             ),
             "trunk_cache_materialize_events_total": int(
                 totals["trunk_cache_materialize_events"]
@@ -1375,16 +1493,18 @@ class _DecodeTrace:
                 totals["trunk_cache_materialize_time_s"]
             ),
             "trunk_cache_materialize_time_s_delta": trunk_cache_materialize_time_delta,
-            "dirty_detach_components": os.environ.get("MTPLX_DETACH_COMPONENTS"),
-            "dirty_detach_mode": os.environ.get("MTPLX_DETACH_MODE"),
+            "dirty_detach_components": _generation_env_get(
+                "MTPLX_DETACH_COMPONENTS"
+            ),
+            "dirty_detach_mode": _generation_env_get("MTPLX_DETACH_MODE"),
             "dirty_detach_gdn_every": int(
-                os.environ.get("MTPLX_DETACH_GDN_EVERY") or 0
+                _generation_env_get("MTPLX_DETACH_GDN_EVERY") or 0
             ),
             "dirty_detach_conv_every": int(
-                os.environ.get("MTPLX_DETACH_CONV_EVERY") or 0
+                _generation_env_get("MTPLX_DETACH_CONV_EVERY") or 0
             ),
             "dirty_detach_attn_every": int(
-                os.environ.get("MTPLX_DETACH_ATTN_EVERY") or 0
+                _generation_env_get("MTPLX_DETACH_ATTN_EVERY") or 0
             ),
             "dirty_detach_events_total": int(totals["dirty_detach_events"]),
             "dirty_detach_events_delta": dirty_detach_events_delta,
@@ -1395,9 +1515,11 @@ class _DecodeTrace:
             "dirty_detach_bytes_total": int(totals["dirty_detach_bytes"]),
             "dirty_detach_bytes_delta": dirty_detach_bytes_delta,
             "live_output_detach_enabled": bool(
-                os.environ.get("MTPLX_DETACH_LIVE_OUTPUTS")
+                _generation_env_get("MTPLX_DETACH_LIVE_OUTPUTS")
             ),
-            "live_output_detach_mode": os.environ.get("MTPLX_DETACH_LIVE_OUTPUTS_MODE"),
+            "live_output_detach_mode": _generation_env_get(
+                "MTPLX_DETACH_LIVE_OUTPUTS_MODE"
+            ),
             "live_output_detach_events_total": int(totals["live_output_detach_events"]),
             "live_output_detach_events_delta": live_output_detach_events_delta,
             "live_output_detach_time_s_total": float(
@@ -1408,16 +1530,18 @@ class _DecodeTrace:
             "live_output_detach_arrays_delta": live_output_detach_arrays_delta,
             "live_output_detach_bytes_total": int(totals["live_output_detach_bytes"]),
             "live_output_detach_bytes_delta": live_output_detach_bytes_delta,
-            "state_rebase_every": int(os.environ.get("MTPLX_STATE_REBASE_EVERY") or 0),
+            "state_rebase_every": int(
+                _generation_env_get("MTPLX_STATE_REBASE_EVERY") or 0
+            ),
             "state_rebase_events_total": int(totals["state_rebase_events"]),
             "state_rebase_events_delta": state_rebase_events_delta,
             "state_rebase_time_s_total": float(totals["state_rebase_time_s"]),
             "state_rebase_time_s_delta": state_rebase_time_delta,
             "state_root_eval_enabled": bool(
-                os.environ.get("MTPLX_EVAL_STATE_ROOTS_ON_COMMIT")
+                _generation_env_get("MTPLX_EVAL_STATE_ROOTS_ON_COMMIT")
             ),
             "state_root_eval_include_mtp": bool(
-                os.environ.get("MTPLX_EVAL_STATE_ROOTS_INCLUDE_MTP", "1")
+                _generation_env_get("MTPLX_EVAL_STATE_ROOTS_INCLUDE_MTP", "1")
                 .strip()
                 .lower()
                 not in {"0", "false", "no", "off"}
@@ -1489,7 +1613,12 @@ def _ar_forward_profiler(step: int) -> Any:
 
 
 def _batch_target_distributions_enabled() -> bool:
-    return os.environ.get("MTPLX_BATCH_TARGET_DISTS", "").lower() in {
+    request_config = current_mtpk2_request_config()
+    if request_config is not None:
+        return request_config.batch_target_distributions
+    return (
+        _generation_env_get("MTPLX_BATCH_TARGET_DISTS", "") or ""
+    ).lower() in {
         "1",
         "true",
         "yes",
@@ -1498,7 +1627,12 @@ def _batch_target_distributions_enabled() -> bool:
 
 
 def _batch_target_arrays_enabled() -> bool:
-    return os.environ.get("MTPLX_BATCH_TARGET_ARRAYS", "").lower() in {
+    request_config = current_mtpk2_request_config()
+    if request_config is not None:
+        return request_config.batch_target_arrays
+    return (
+        _generation_env_get("MTPLX_BATCH_TARGET_ARRAYS", "") or ""
+    ).lower() in {
         "1",
         "true",
         "yes",
@@ -1515,7 +1649,7 @@ def _lazy_bonus_verify_enabled() -> bool:
 
 
 def _lazy_bonus_verify_min_depth() -> int:
-    raw = os.environ.get("MTPLX_LAZY_BONUS_VERIFY_MIN_DEPTH")
+    raw = _generation_env_get("MTPLX_LAZY_BONUS_VERIFY_MIN_DEPTH")
     if raw is None or raw.strip() == "":
         return 2
     try:
@@ -1525,7 +1659,24 @@ def _lazy_bonus_verify_min_depth() -> int:
 
 
 def _omit_speculative_bonus_enabled() -> bool:
+    request_config = current_mtpk2_request_config()
+    if request_config is not None:
+        return request_config.omit_speculative_bonus
     return _env_truthy("MTPLX_OMIT_SPECULATIVE_BONUS")
+
+
+def _skip_verify_snapshot_enabled() -> bool:
+    request_config = current_mtpk2_request_config()
+    if request_config is not None:
+        return request_config.skip_verify_snapshot
+    return _skip_verify_snapshot()
+
+
+def _compiled_verify_stats_enabled() -> bool:
+    request_config = current_mtpk2_request_config()
+    if request_config is not None:
+        return request_config.compiled_verify_stats
+    return _env_truthy("MTPLX_COMPILED_VERIFY_STATS")
 
 
 @dataclass
@@ -1932,11 +2083,13 @@ def _trim_repeated_suffix(
     return result
 
 
-def _prefill_restored_prompt_suffix(
+def _prefill_restored_prompt_suffix_machine(
     rt: MTPLXRuntime,
     restored: Any,
     suffix: list[int],
     *,
+    request_id: str,
+    enforce_ticket_chunk_limit: bool = False,
     base_hidden_variant: str | None,
     mtp_hidden_variant: str | None,
     mtp_history_policy: str,
@@ -2082,28 +2235,39 @@ def _prefill_restored_prompt_suffix(
     # logits does the same work with two eval barriers total. Large suffixes
     # keep the chunked path for abort responsiveness.
     fused_max = _small_suffix_fused_max()
-    if 0 < len(suffix) <= fused_max:
+    fused_limit = (
+        min(fused_max, _prefill_chunk_size())
+        if enforce_ticket_chunk_limit
+        else fused_max
+    )
+    if 0 < len(suffix) <= fused_limit:
         fused_array = mx.array([suffix])
         fused_embeddings = _suffix_chunk_embeddings(fused_array)
         started = time.perf_counter()
-        with attention_phase("prefill"):
-            fused_result = rt.forward_ar(
-                fused_array,
-                cache=restored.cache,
-                return_hidden=not target_only,
-                hidden_variant=base_hidden_variant,
-                emit_logits=True,
-                logits_keep=1 if final_logits_only else None,
-                input_embeddings=fused_embeddings,
-            )
+        result = yield _make_mtpk2_prefill_ticket(
+            request_id=request_id,
+            input_ids=fused_array,
+            cache=restored.cache,
+            prompt_start=cached_tokens,
+            prompt_stop=cached_tokens + suffix_total,
+            route="forward_ar",
+            return_hidden=not target_only,
+            hidden_variant=base_hidden_variant,
+            emit_logits=True,
+            logits_keep=1 if final_logits_only else None,
+            input_embeddings=fused_embeddings,
+        )
+        restored.cache = result.request_cache
+        started_eval = time.perf_counter()
+        suffix_logits, suffix_hidden = result.logits, result.hidden
         if target_only:
-            suffix_logits = fused_result
             suffix_hidden = None
             _eval(suffix_logits)
         else:
-            suffix_logits, suffix_hidden = fused_result
             _eval(suffix_logits, suffix_hidden)
-        chunk_elapsed = time.perf_counter() - started
+        chunk_elapsed = float(result.elapsed_s) + (
+            time.perf_counter() - started_eval
+        )
         target_forward_time += chunk_elapsed
         _runtime_count(rt, "restored_suffix_prefill_fused")
         _runtime_count(rt, "prefill_chunks")
@@ -2116,9 +2280,7 @@ def _prefill_restored_prompt_suffix(
                 [int(token) for token in suffix[1:]],
                 window_start=1,
             )
-        target_forward_time += _maybe_repage_target_prefill_cache(
-            rt, restored.cache
-        )
+        target_forward_time += _maybe_repage_target_prefill_cache(rt, restored.cache)
         _check_splice_consumed()
         return (
             suffix_logits[:, -1, :],
@@ -2146,24 +2308,34 @@ def _prefill_restored_prompt_suffix(
             chunk_array = body_array[:, start:end]
             chunk_embeddings = _suffix_chunk_embeddings(chunk_array)
             started = time.perf_counter()
-            with attention_phase("prefill"):
-                if use_committed_mtp:
-                    logits_chunk, hidden_chunk = rt.forward_ar(
-                        chunk_array,
-                        cache=restored.cache,
-                        return_hidden=True,
-                        hidden_variant=base_hidden_variant,
-                        emit_logits=False,
-                        input_embeddings=chunk_embeddings,
-                    )
-                else:
-                    hidden_chunk = None
-                    logits_chunk = _prefill_cache_only_forward(
-                        rt,
-                        chunk_array,
-                        restored.cache,
-                        input_embeddings=chunk_embeddings,
-                    )
+            if use_committed_mtp:
+                result = yield _make_mtpk2_prefill_ticket(
+                    request_id=request_id,
+                    input_ids=chunk_array,
+                    cache=restored.cache,
+                    prompt_start=cached_tokens + start,
+                    prompt_stop=cached_tokens + end,
+                    route="forward_ar",
+                    return_hidden=True,
+                    hidden_variant=base_hidden_variant,
+                    emit_logits=False,
+                    input_embeddings=chunk_embeddings,
+                )
+                logits_chunk, hidden_chunk = result.logits, result.hidden
+            else:
+                result = yield _make_mtpk2_prefill_ticket(
+                    request_id=request_id,
+                    input_ids=chunk_array,
+                    cache=restored.cache,
+                    prompt_start=cached_tokens + start,
+                    prompt_stop=cached_tokens + end,
+                    route="prefill_cache_only",
+                    input_embeddings=chunk_embeddings,
+                )
+                hidden_chunk = None
+                logits_chunk = result.logits
+            restored.cache = result.request_cache
+            started_eval = time.perf_counter()
             if hidden_chunk is None:
                 if logits_chunk is None:
                     _eval_cache_roots(restored.cache)
@@ -2173,7 +2345,9 @@ def _prefill_restored_prompt_suffix(
                 _eval(hidden_chunk)
             else:
                 _eval(logits_chunk, hidden_chunk)
-            chunk_elapsed = time.perf_counter() - started
+            chunk_elapsed = float(result.elapsed_s) + (
+                time.perf_counter() - started_eval
+            )
             target_forward_time += chunk_elapsed
             _runtime_count(rt, "restored_suffix_prefill_chunks")
             _runtime_count(rt, "prefill_chunks")
@@ -2212,24 +2386,30 @@ def _prefill_restored_prompt_suffix(
     _check_postcommit_abort(abort_check)
     final_array = mx.array([[suffix[-1]]])
     final_embeddings = _suffix_chunk_embeddings(final_array)
-    with attention_phase("prefill"):
-        final_result = rt.forward_ar(
-            final_array,
-            cache=restored.cache,
-            return_hidden=not target_only,
-            hidden_variant=base_hidden_variant,
-            emit_logits=True,
-            logits_keep=1 if final_logits_only else None,
-            input_embeddings=final_embeddings,
-        )
+    result = yield _make_mtpk2_prefill_ticket(
+        request_id=request_id,
+        input_ids=final_array,
+        cache=restored.cache,
+        prompt_start=cached_tokens + suffix_total - 1,
+        prompt_stop=cached_tokens + suffix_total,
+        route="forward_ar",
+        return_hidden=not target_only,
+        hidden_variant=base_hidden_variant,
+        emit_logits=True,
+        logits_keep=1 if final_logits_only else None,
+        input_embeddings=final_embeddings,
+    )
+    restored.cache = result.request_cache
+    started_eval = time.perf_counter()
+    suffix_logits, suffix_hidden = result.logits, result.hidden
     if target_only:
-        suffix_logits = final_result
         suffix_hidden = None
         _eval(suffix_logits)
     else:
-        suffix_logits, suffix_hidden = final_result
         _eval(suffix_logits, suffix_hidden)
-    chunk_elapsed = time.perf_counter() - started
+    chunk_elapsed = float(result.elapsed_s) + (
+        time.perf_counter() - started_eval
+    )
     target_forward_time += chunk_elapsed
     target_forward_time += _maybe_repage_target_prefill_cache(rt, restored.cache)
     suffix_done = suffix_total
@@ -2241,6 +2421,44 @@ def _prefill_restored_prompt_suffix(
         suffix_hidden[:, -1:, :] if suffix_hidden is not None else None,
         target_forward_time,
         mtp_history_time,
+    )
+
+
+def _prefill_restored_prompt_suffix(
+    rt: MTPLXRuntime,
+    restored: Any,
+    suffix: list[int],
+    *,
+    base_hidden_variant: str,
+    mtp_hidden_variant: str,
+    mtp_history_policy: str,
+    abort_check: Callable[[], bool] | None = None,
+    chunk_callback: Callable[[dict[str, Any]], None] | None = None,
+    tokens_total: int | None = None,
+    cached_tokens: int = 0,
+    chunk_started_s: float | None = None,
+    gdn_boundary_sink: list[tuple[int, Any, Any]] | None = None,
+    vision_splice: Any | None = None,
+) -> tuple[Any, Any, float, float]:
+    return _drive_mtpk2_prefill_machine(
+        rt,
+        _prefill_restored_prompt_suffix_machine(
+            rt,
+            restored,
+            suffix,
+            request_id="solo-restored-prefill",
+            enforce_ticket_chunk_limit=False,
+            base_hidden_variant=base_hidden_variant,
+            mtp_hidden_variant=mtp_hidden_variant,
+            mtp_history_policy=mtp_history_policy,
+            abort_check=abort_check,
+            chunk_callback=chunk_callback,
+            tokens_total=tokens_total,
+            cached_tokens=cached_tokens,
+            chunk_started_s=chunk_started_s,
+            gdn_boundary_sink=gdn_boundary_sink,
+            vision_splice=vision_splice,
+        ),
     )
 
 
@@ -2381,10 +2599,12 @@ def _opencode_compact_tool_history_policy(policy_fingerprint: str | None) -> boo
     )
 
 
-def _restore_near_prefix_prompt_state(
+def _restore_near_prefix_prompt_state_machine(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
     *,
+    request_id: str,
+    enforce_ticket_chunk_limit: bool = False,
     base_hidden_variant: str | None,
     mtp_hidden_variant: str | None,
     mtp_history_policy: str,
@@ -2399,9 +2619,11 @@ def _restore_near_prefix_prompt_state(
     chunk_callback: Callable[[dict[str, Any]], None] | None = None,
     chunk_started_s: float | None = None,
     cache_factory: Callable[[], Any] | None = None,
+    mtp_cache_factory: Callable[[], Any] | None = None,
 ) -> PromptState | None:
     if not _near_prefix_restore_enabled() or len(prompt_ids) < 2:
         return None
+    prefill_phase_started = time.perf_counter()
     candidates = getattr(session_bank, "near_prefix_candidates", None)
     if not callable(candidates):
         return None
@@ -2436,7 +2658,7 @@ def _restore_near_prefix_prompt_state(
         matched = int(matched)
 
         def _near_debug(reason: str) -> None:
-            if os.environ.get("MTPLX_DEBUG_PREFIX_DIVERGENCE"):
+            if _generation_env_get("MTPLX_DEBUG_PREFIX_DIVERGENCE"):
                 print(
                     f"[mtplx] near-prefix reject: entry_len="
                     f"{int(getattr(entry, 'prefix_len', 0) or 0)} "
@@ -2504,7 +2726,9 @@ def _restore_near_prefix_prompt_state(
             # consumed leases and snapshot-only entries. (Pre-v2 this was
             # clone-first, paying O(bytes) even when a free lease existed.)
             restore_modes = (
-                ["reference"]
+                ["clone"]
+                if mtp_cache_factory is not None
+                else ["reference"]
                 if getattr(entry, "live_ref_only", False)
                 else ["reference", "clone"]
                 if getattr(entry, "cache_ref", None) is not None
@@ -2512,12 +2736,17 @@ def _restore_near_prefix_prompt_state(
             )
             for restore_mode in restore_modes:
                 restore_started = time.perf_counter()
+                restore_kwargs = {
+                    "mode": restore_mode,
+                    "cache_factory": cache_factory,
+                }
+                if mtp_cache_factory is not None:
+                    restore_kwargs["mtp_cache_factory"] = mtp_cache_factory
                 prefix_restore = restore_entry_prefix_cache(
                     rt,
                     entry,
                     matched,
-                    mode=restore_mode,
-                    cache_factory=cache_factory,
+                    **restore_kwargs,
                 )
                 cache_restore_time_s += time.perf_counter() - restore_started
                 if prefix_restore is not None:
@@ -2533,7 +2762,11 @@ def _restore_near_prefix_prompt_state(
             if _trim_cache_to_offset(cache, matched - 1):
                 mtp_history_cache = None
                 if not target_only and entry.mtp_history_snapshot is not None:
-                    mtp_history_cache = rt.make_mtp_cache()
+                    mtp_history_cache = (
+                        mtp_cache_factory()
+                        if mtp_cache_factory is not None
+                        else _make_generation_mtp_cache(rt)
+                    )
                     restore_cache(mtp_history_cache, entry.mtp_history_snapshot)
                     if not _trim_cache_to_offset(mtp_history_cache, matched - 1):
                         mtp_history_cache = None
@@ -2596,24 +2829,28 @@ def _restore_near_prefix_prompt_state(
             hidden = boundary_hidden
             repair_time = 0.0
         else:
-            started = time.perf_counter()
-            with attention_phase("prefill"):
-                repair_result = rt.forward_ar(
-                    mx.array([[int(prompt_ids[restore_point - 1])]]),
-                    cache=cache,
-                    return_hidden=not target_only,
-                    hidden_variant=base_hidden_variant,
-                    emit_logits=True,
-                    logits_keep=1 if _final_logits_prefill_enabled() else None,
-                )
+            repair_result = yield _make_mtpk2_prefill_ticket(
+                request_id=request_id,
+                input_ids=mx.array([[int(prompt_ids[restore_point - 1])]]),
+                cache=cache,
+                prompt_start=restore_point - 1,
+                prompt_stop=restore_point,
+                route="forward_ar",
+                return_hidden=not target_only,
+                hidden_variant=base_hidden_variant,
+                emit_logits=True,
+                logits_keep=1 if _final_logits_prefill_enabled() else None,
+            )
+            cache = repair_result.request_cache
+            started_eval = time.perf_counter()
+            logits, hidden = repair_result.logits, repair_result.hidden
             if target_only:
-                logits = repair_result
                 hidden = None
                 _eval(logits)
             else:
-                logits, hidden = repair_result
                 _eval(logits, hidden)
-            repair_time = time.perf_counter() - started
+            repair_time = float(repair_result.elapsed_s)
+            repair_time += time.perf_counter() - started_eval
         _check_postcommit_abort(abort_check)
         restore_kind_base = (
             "block_prefix" if int(entry.prefix_len) - matched > max_gap else "near_prefix"
@@ -2658,7 +2895,11 @@ def _restore_near_prefix_prompt_state(
             tokens_total=len(prompt_ids),
             cached_tokens=restore_point,
             new_prefill_tokens=len(suffix),
-            started_s=chunk_started_s if chunk_started_s is not None else started,
+            started_s=(
+                chunk_started_s
+                if chunk_started_s is not None
+                else prefill_phase_started
+            ),
             cache_source=cache_source,
             ssd_cache_hit=ssd_cache_hit,
             ssd_cached_tokens=ssd_cached_tokens,
@@ -2694,10 +2935,12 @@ def _restore_near_prefix_prompt_state(
             else None
         )
         suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
-            _prefill_restored_prompt_suffix(
+            yield from _prefill_restored_prompt_suffix_machine(
                 rt,
                 restored,
                 suffix,
+                request_id=request_id,
+                enforce_ticket_chunk_limit=enforce_ticket_chunk_limit,
                 base_hidden_variant=base_hidden_variant,
                 mtp_hidden_variant=mtp_hidden_variant,
                 mtp_history_policy=mtp_history_policy,
@@ -2710,6 +2953,7 @@ def _restore_near_prefix_prompt_state(
                 gdn_boundary_sink=suffix_boundary_sink,
             )
         )
+        cache = restored.cache
         entry.hits += 1
         entry.last_access_s = time.time()
         return PromptState(
@@ -2739,10 +2983,54 @@ def _restore_near_prefix_prompt_state(
     return None
 
 
+def _restore_near_prefix_prompt_state(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    base_hidden_variant: str,
+    mtp_hidden_variant: str,
+    mtp_history_policy: str,
+    session_bank: Any,
+    template_hash: str | None,
+    draft_head_identity: str | None,
+    policy_fingerprint: str | None,
+    min_restore_tokens: int = 0,
+    allow_block_prefix: bool | None = None,
+    abort_check: Callable[[], bool] | None = None,
+    chunk_callback: Callable[[dict[str, Any]], None] | None = None,
+    chunk_started_s: float | None = None,
+    cache_factory: Callable[[], Any] | None = None,
+    mtp_cache_factory: Callable[[], Any] | None = None,
+) -> PromptState | None:
+    return _drive_mtpk2_prefill_machine(
+        rt,
+        _restore_near_prefix_prompt_state_machine(
+            rt,
+            prompt_ids,
+            request_id="solo-near-prefix",
+            enforce_ticket_chunk_limit=False,
+            base_hidden_variant=base_hidden_variant,
+            mtp_hidden_variant=mtp_hidden_variant,
+            mtp_history_policy=mtp_history_policy,
+            session_bank=session_bank,
+            template_hash=template_hash,
+            draft_head_identity=draft_head_identity,
+            policy_fingerprint=policy_fingerprint,
+            min_restore_tokens=min_restore_tokens,
+            allow_block_prefix=allow_block_prefix,
+            abort_check=abort_check,
+            chunk_callback=chunk_callback,
+            chunk_started_s=chunk_started_s,
+            cache_factory=cache_factory,
+            mtp_cache_factory=mtp_cache_factory,
+        ),
+    )
+
+
 def _small_suffix_fused_max() -> int:
     """Suffix length at or below which restored-prefix prefill fuses into one
     forward (kvcache-v2). 0 disables the fast path."""
-    raw = os.environ.get("MTPLX_SMALL_SUFFIX_FUSED_MAX", "512")
+    raw = _generation_env_get("MTPLX_SMALL_SUFFIX_FUSED_MAX", "512")
     try:
         return max(0, int(raw))
     except (TypeError, ValueError):
@@ -2751,12 +3039,14 @@ def _small_suffix_fused_max() -> int:
 
 def _gdn_boundary_capture_enabled() -> bool:
     """Interior recurrent boundary capture during cold prefill (kvcache-v2)."""
-    raw = str(os.environ.get("MTPLX_GDN_BOUNDARY_CAPTURE", "1")).strip().lower()
+    raw = str(
+        _generation_env_get("MTPLX_GDN_BOUNDARY_CAPTURE", "1")
+    ).strip().lower()
     return raw not in {"0", "false", "off", "no"}
 
 
 def _gdn_boundary_max_count() -> int:
-    raw = os.environ.get("MTPLX_GDN_BOUNDARY_MAX", "8")
+    raw = _generation_env_get("MTPLX_GDN_BOUNDARY_MAX", "8")
     try:
         return max(2, int(raw))
     except (TypeError, ValueError):
@@ -2770,7 +3060,7 @@ def _gdn_boundary_tail_interval() -> int:
     gets a finer boundary grid than the chunk-edge default; 256 keeps the
     worst-case boundary→match re-prefill to a few hundred ms.
     """
-    raw = os.environ.get("MTPLX_GDN_BOUNDARY_TAIL_INTERVAL", "256")
+    raw = _generation_env_get("MTPLX_GDN_BOUNDARY_TAIL_INTERVAL", "256")
     try:
         return max(0, int(raw))
     except (TypeError, ValueError):
@@ -2928,12 +3218,17 @@ def _store_on_prefill_env_enabled() -> bool:
     """Default ON (2026-07-02 A/B: agent turn-2 TTFT 40s -> 1.3s, e2e 1.7 ->
     33.6 tok/s at 25k ctx; cost is one bank snapshot copy on large cold
     prefills). MTPLX_SESSION_STORE_ON_PREFILL=0 is the kill switch."""
-    raw = str(os.environ.get("MTPLX_SESSION_STORE_ON_PREFILL", "1")).strip().lower()
+    raw = str(
+        _generation_env_get("MTPLX_SESSION_STORE_ON_PREFILL", "1")
+    ).strip().lower()
     return raw not in {"0", "false", "off", "no"}
 
 
 def _store_on_prefill_min_suffix() -> int:
-    raw = os.environ.get("MTPLX_SESSION_STORE_ON_PREFILL_MIN_SUFFIX", "1024")
+    raw = _generation_env_get(
+        "MTPLX_SESSION_STORE_ON_PREFILL_MIN_SUFFIX",
+        "1024",
+    )
     try:
         return max(1, int(raw))
     except (TypeError, ValueError):
@@ -2990,10 +3285,12 @@ def _debug_prefix_divergence(rt: MTPLXRuntime, prompt_ids: list[int], session_ba
         print(f"[mtplx] prefix-diverge diagnostic failed: {exc}", file=sys.stderr)
 
 
-def restore_or_prefill_prompt_state(
+def _restore_or_prefill_prompt_state_machine(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
     *,
+    request_id: str,
+    enforce_ticket_chunk_limit: bool = False,
     base_hidden_variant: str | None = None,
     mtp_hidden_variant: str | None = None,
     mtp_history_policy: str = "cycle",
@@ -3060,7 +3357,8 @@ def restore_or_prefill_prompt_state(
     mtp_position_mode = (
         "cache" if target_only else _resolve_runtime_mtp_position_mode(rt)
     )
-    os.environ["MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS"] = str(len(prompt_ids))
+    if current_mtpk2_request_config() is None:
+        os.environ["MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS"] = str(len(prompt_ids))
     mtp_history_policy = (
         "none"
         if target_only
@@ -3118,7 +3416,7 @@ def restore_or_prefill_prompt_state(
             # Warm restore or trivial extension: the existing postcommit
             # machinery owns those; storing again would just churn the bank.
             return
-        if os.environ.get("MTPLX_DEBUG_PREFIX_DIVERGENCE"):
+        if _generation_env_get("MTPLX_DEBUG_PREFIX_DIVERGENCE"):
             print(
                 f"[mtplx] store-on-prefill: len={len(prompt_ids)} "
                 f"boundaries={len(list(getattr(state, 'gdn_boundaries', None) or []))} "
@@ -3194,18 +3492,22 @@ def restore_or_prefill_prompt_state(
         _debug_prefix_divergence(rt, prompt_ids, session_bank)
     if session_bank is not None:
         restore_cache_factory = _session_restore_cache_factory(rt)
+        restore_mtp_cache_factory = _session_restore_mtp_cache_factory()
         normalized_restore_mode = str(restore_mode).replace("-", "_")
-        allow_live_frontier_reference = (
-            normalized_restore_mode in {"reference", "reference_lease"}
-            and _session_live_frontier_reference_restore_enabled()
-        )
-        effective_restore_mode = (
-            "clone"
-            if restore_cache_factory is not None
-            and normalized_restore_mode in {"reference", "reference_lease"}
-            and not allow_live_frontier_reference
-            else restore_mode
-        )
+        if restore_mtp_cache_factory is not None:
+            effective_restore_mode = "clone"
+        else:
+            allow_live_frontier_reference = (
+                normalized_restore_mode in {"reference", "reference_lease"}
+                and _session_live_frontier_reference_restore_enabled()
+            )
+            effective_restore_mode = (
+                "clone"
+                if restore_cache_factory is not None
+                and normalized_restore_mode in {"reference", "reference_lease"}
+                and not allow_live_frontier_reference
+                else restore_mode
+            )
         # The bank only ever sees the content-keyed view of a vision prompt;
         # for text prompts the two views are the same list.
         bank_match_ids = bank_key_ids if bank_key_ids is not None else prompt_ids
@@ -3259,9 +3561,11 @@ def restore_or_prefill_prompt_state(
             else:
                 allow_block_prefix = False
             tried_larger_near_prefix = True
-            near_prompt_state = _restore_near_prefix_prompt_state(
+            near_prompt_state = yield from _restore_near_prefix_prompt_state_machine(
                 rt,
                 prompt_ids,
+                request_id=request_id,
+                enforce_ticket_chunk_limit=enforce_ticket_chunk_limit,
                 base_hidden_variant=base_hidden_variant,
                 mtp_hidden_variant=mtp_hidden_variant,
                 mtp_history_policy=mtp_history_policy,
@@ -3276,22 +3580,28 @@ def restore_or_prefill_prompt_state(
                 chunk_callback=prefill_callback,
                 chunk_started_s=prefill_started_s,
                 cache_factory=restore_cache_factory,
+                mtp_cache_factory=restore_mtp_cache_factory,
             )
             if near_prompt_state is not None:
                 return _emit_prefill_complete(near_prompt_state)
 
         restore_started = time.perf_counter()
+        restore_kwargs = {
+            "mode": effective_restore_mode,
+            "session_id": session_id,
+            "hidden_variant": base_hidden_variant,
+            "template_hash": template_hash,
+            "mtp_history_policy": mtp_history_policy,
+            "draft_head_identity": draft_head_identity,
+            "policy_fingerprint": policy_fingerprint,
+            "cache_factory": restore_cache_factory,
+        }
+        if restore_mtp_cache_factory is not None:
+            restore_kwargs["mtp_cache_factory"] = restore_mtp_cache_factory
         restored = session_bank.restore(
             rt,
             bank_match_ids,
-            mode=effective_restore_mode,
-            session_id=session_id,
-            hidden_variant=base_hidden_variant,
-            template_hash=template_hash,
-            mtp_history_policy=mtp_history_policy,
-            draft_head_identity=draft_head_identity,
-            policy_fingerprint=policy_fingerprint,
-            cache_factory=restore_cache_factory,
+            **restore_kwargs,
         )
         restore_elapsed_s = time.perf_counter() - restore_started
         if restored is not None and (
@@ -3303,7 +3613,7 @@ def restore_or_prefill_prompt_state(
             inherited_boundaries = _inherited_gdn_boundaries(
                 restored.entry, restored.entry.prefix_len
             )
-            if os.environ.get("MTPLX_DEBUG_PREFIX_DIVERGENCE"):
+            if _generation_env_get("MTPLX_DEBUG_PREFIX_DIVERGENCE"):
                 print(
                     f"[mtplx] exact-restore: entry_len={restored.entry.prefix_len} "
                     f"entry_boundaries={len(list(getattr(restored.entry, 'gdn_boundaries', None) or []))} "
@@ -3371,10 +3681,12 @@ def restore_or_prefill_prompt_state(
                     if token == pad_id
                 )
             suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
-                _prefill_restored_prompt_suffix(
+                yield from _prefill_restored_prompt_suffix_machine(
                     rt,
                     restored,
                     suffix,
+                    request_id=request_id,
+                    enforce_ticket_chunk_limit=enforce_ticket_chunk_limit,
                     base_hidden_variant=base_hidden_variant,
                     mtp_hidden_variant=mtp_hidden_variant,
                     mtp_history_policy=mtp_history_policy,
@@ -3416,9 +3728,11 @@ def restore_or_prefill_prompt_state(
                 ),
             ))
 
-        near_prompt_state = _restore_near_prefix_prompt_state(
+        near_prompt_state = yield from _restore_near_prefix_prompt_state_machine(
             rt,
             prompt_ids,
+            request_id=request_id,
+            enforce_ticket_chunk_limit=enforce_ticket_chunk_limit,
             base_hidden_variant=base_hidden_variant,
             mtp_hidden_variant=mtp_hidden_variant,
             mtp_history_policy=mtp_history_policy,
@@ -3432,6 +3746,7 @@ def restore_or_prefill_prompt_state(
             chunk_callback=prefill_callback,
             chunk_started_s=prefill_started_s,
             cache_factory=restore_cache_factory,
+            mtp_cache_factory=restore_mtp_cache_factory,
         )
         if near_prompt_state is not None:
             return _emit_prefill_complete(near_prompt_state)
@@ -3459,9 +3774,10 @@ def restore_or_prefill_prompt_state(
                 target_time,
                 prompt_history_time,
                 mtp_history_position_base,
-            ) = _prefill_committed_mtp_history_streaming(
+            ) = yield from _prefill_committed_mtp_history_streaming_machine(
                 rt,
                 prompt_ids,
+                request_id=request_id,
                 base_hidden_variant=base_hidden_variant,
                 mtp_hidden_variant=mtp_hidden_variant,
                 mtp_position_mode=mtp_position_mode,
@@ -3482,16 +3798,17 @@ def restore_or_prefill_prompt_state(
             _assert_safe_long_context_prefill(len(prompt_ids))
             _check_postcommit_abort(abort_check)
             cache, logits, hidden, prompt_hidden, target_time = (
-                _prefill_with_hidden_sequence(
+                yield from _prefill_with_hidden_sequence_machine(
                     rt,
                     prompt_ids,
+                    request_id=request_id,
                     hidden_variant=base_hidden_variant,
                     vision_splice=vision_splice,
                 )
             )
             _check_postcommit_abort(abort_check)
             prompt_eval_time = target_time
-            mtp_history_cache = rt.make_mtp_cache()
+            mtp_history_cache = _make_generation_mtp_cache(rt)
             if len(prompt_ids) > 1:
                 history_token_ids = prompt_ids[1:]
                 history_hidden = prompt_hidden[:, :-1, :]
@@ -3546,9 +3863,10 @@ def restore_or_prefill_prompt_state(
         # and this mirrors generate_ar, which gates return_hidden on
         # rt.mtp_enabled. hidden stays None for AR; nothing downstream in the
         # AR path consumes it (the bank stores trunk cache only).
-        cache, logits, hidden, target_time = _prefill(
+        cache, logits, hidden, target_time = yield from _prefill_machine(
             rt,
             prompt_ids,
+            request_id=request_id,
             return_hidden=not target_only,
             hidden_variant=base_hidden_variant,
             abort_check=abort_check,
@@ -3573,6 +3891,50 @@ def restore_or_prefill_prompt_state(
         else None,
         gdn_boundaries=list(gdn_boundary_sink or []),
     ))
+
+
+def restore_or_prefill_prompt_state(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    base_hidden_variant: str | None = None,
+    mtp_hidden_variant: str | None = None,
+    mtp_history_policy: str = "cycle",
+    session_bank: Any | None = None,
+    restore_mode: str = "clone",
+    session_id: str | None = None,
+    template_hash: str | None = None,
+    draft_head_identity: str | None = None,
+    policy_fingerprint: str | None = None,
+    abort_check: Callable[[], bool] | None = None,
+    prefill_callback: Callable[[dict[str, Any]], None] | None = None,
+    vision_splice: Any | None = None,
+    store_prefix_snapshot: bool | None = None,
+    target_only: bool = False,
+) -> PromptState:
+    return _drive_mtpk2_prefill_machine(
+        rt,
+        _restore_or_prefill_prompt_state_machine(
+            rt,
+            prompt_ids,
+            request_id="solo-prompt-state",
+            enforce_ticket_chunk_limit=False,
+            base_hidden_variant=base_hidden_variant,
+            mtp_hidden_variant=mtp_hidden_variant,
+            mtp_history_policy=mtp_history_policy,
+            session_bank=session_bank,
+            restore_mode=restore_mode,
+            session_id=session_id,
+            template_hash=template_hash,
+            draft_head_identity=draft_head_identity,
+            policy_fingerprint=policy_fingerprint,
+            abort_check=abort_check,
+            prefill_callback=prefill_callback,
+            vision_splice=vision_splice,
+            store_prefix_snapshot=store_prefix_snapshot,
+            target_only=target_only,
+        ),
+    )
 
 
 def _decode(tokenizer, tokens: list[int]) -> str:
@@ -3715,7 +4077,7 @@ def _env_scaled_draft_sampler(
     draft_sampler: SamplerConfig | None,
 ) -> SamplerConfig:
     base = draft_sampler or sampler
-    raw = os.environ.get("MTPLX_DRAFT_TEMPERATURE_SCALE")
+    raw = _generation_env_get("MTPLX_DRAFT_TEMPERATURE_SCALE")
     if raw is None or raw.strip() == "":
         return base
     try:
@@ -3851,7 +4213,7 @@ def _make_device_d2_draft_core(
     *,
     mtp_hidden_variant: str,
 ) -> dict[str, Any]:
-    mtp_cache = rt.make_mtp_cache()
+    mtp_cache = _make_generation_mtp_cache(rt)
     logits, draft_hidden = rt.draft_mtp(
         hidden,
         token_ids,
@@ -4160,10 +4522,12 @@ def _top2_margin(logits: mx.array) -> float:
     return _draft_confidence_metrics(logits, topk=2)["top2_margin"]
 
 
-def _prefill(
+def _prefill_machine(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
     *,
+    request_id: str,
+    prompt_offset: int = 0,
     return_hidden: bool,
     hidden_variant: str | None = None,
     abort_check: Callable[[], bool] | None = None,
@@ -4201,17 +4565,25 @@ def _prefill(
                 chunk_embeddings = spliced_chunk_embeddings(
                     rt.embed_tokens, chunk_array, vision_splice
                 )
-            started = time.perf_counter()
-            with attention_phase("prefill"):
-                prefill = _prefill_cache_only_forward(
-                    rt, chunk_array, cache, input_embeddings=chunk_embeddings
-                )
+            result = yield _make_mtpk2_prefill_ticket(
+                request_id=request_id,
+                input_ids=chunk_array,
+                cache=cache,
+                prompt_start=prompt_offset + start,
+                prompt_stop=prompt_offset + end,
+                route="prefill_cache_only",
+                input_embeddings=chunk_embeddings,
+            )
+            cache = result.request_cache
+            started_eval = time.perf_counter()
+            prefill = result.logits
             if prefill is None:
                 _eval_cache_roots(cache)
             else:
                 _eval(prefill)
             _runtime_count(rt, "prefill_chunks")
-            target_forward_time += time.perf_counter() - started
+            target_forward_time += float(result.elapsed_s)
+            target_forward_time += time.perf_counter() - started_eval
             target_forward_time += _prefill_chunk_cache_cleanup(rt)
             if capture_boundaries:
                 _capture_gdn_boundary(gdn_boundary_sink, end, cache)
@@ -4222,35 +4594,67 @@ def _prefill(
                 f"({vision_splice.total_rows}) than image pad tokens in the prompt"
             )
 
-    started = time.perf_counter()
     _check_postcommit_abort(abort_check)
-    with attention_phase("prefill"):
-        result = rt.forward_ar(
-            mx.array([[prompt_ids[-1]]]),
-            cache=cache,
-            return_hidden=return_hidden,
-            hidden_variant=hidden_variant if return_hidden else None,
-            emit_logits=True,
-            logits_keep=1 if final_logits_only else None,
-        )
+    final_result = yield _make_mtpk2_prefill_ticket(
+        request_id=request_id,
+        input_ids=mx.array([[prompt_ids[-1]]]),
+        cache=cache,
+        prompt_start=prompt_offset + len(prompt_ids) - 1,
+        prompt_stop=prompt_offset + len(prompt_ids),
+        route="forward_ar",
+        return_hidden=return_hidden,
+        hidden_variant=hidden_variant if return_hidden else None,
+        emit_logits=True,
+        logits_keep=1 if final_logits_only else None,
+    )
+    cache = final_result.request_cache
+    started_eval = time.perf_counter()
     if return_hidden:
-        logits, hidden = result
+        logits, hidden = final_result.logits, final_result.hidden
         _eval(logits, hidden)
         hidden = hidden[:, -1:, :]
     else:
-        logits = result
+        logits = final_result.logits
         hidden = None
         _eval(logits)
-    target_forward_time += time.perf_counter() - started
+    target_forward_time += float(final_result.elapsed_s)
+    target_forward_time += time.perf_counter() - started_eval
     target_forward_time += _maybe_repage_target_prefill_cache(rt, cache)
     _check_postcommit_abort(abort_check)
     return cache, logits[:, -1, :], hidden, target_forward_time
 
 
-def _prefill_committed_mtp_history_streaming(
+def _prefill(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
     *,
+    return_hidden: bool,
+    hidden_variant: str | None = None,
+    abort_check: Callable[[], bool] | None = None,
+    vision_splice: Any | None = None,
+    gdn_boundary_sink: list[tuple[int, Any]] | None = None,
+):
+    return _drive_mtpk2_prefill_machine(
+        rt,
+        _prefill_machine(
+            rt,
+            prompt_ids,
+            request_id="solo-prefill",
+            return_hidden=return_hidden,
+            hidden_variant=hidden_variant,
+            abort_check=abort_check,
+            vision_splice=vision_splice,
+            gdn_boundary_sink=gdn_boundary_sink,
+        ),
+    )
+
+
+def _prefill_committed_mtp_history_streaming_machine(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    request_id: str,
+    prompt_offset: int = 0,
     base_hidden_variant: str = "post_norm",
     mtp_hidden_variant: str = "post_norm",
     mtp_position_mode: str = "cache",
@@ -4267,7 +4671,7 @@ def _prefill_committed_mtp_history_streaming(
 
     _check_postcommit_abort(abort_check)
     cache = _make_target_prefill_cache(rt)
-    mtp_history_cache = rt.make_mtp_cache()
+    mtp_history_cache = _make_generation_mtp_cache(rt)
     target_forward_time = 0.0
     prompt_history_time = 0.0
     final_logits_only = _final_logits_prefill_enabled()
@@ -4324,21 +4728,34 @@ def _prefill_committed_mtp_history_streaming(
                 rt.embed_tokens, chunk_array, vision_splice
             )
         started = time.perf_counter()
-        with attention_phase("prefill"):
-            if needs_history_hidden:
-                logits_chunk, hidden_chunk = rt.forward_ar(
-                    chunk_array,
-                    cache=cache,
-                    return_hidden=True,
-                    hidden_variant=base_hidden_variant,
-                    emit_logits=not final_logits_only,
-                    input_embeddings=chunk_embeddings,
-                )
-            else:
-                hidden_chunk = None
-                logits_chunk = _prefill_cache_only_forward(
-                    rt, chunk_array, cache, input_embeddings=chunk_embeddings
-                )
+        if needs_history_hidden:
+            result = yield _make_mtpk2_prefill_ticket(
+                request_id=request_id,
+                input_ids=chunk_array,
+                cache=cache,
+                prompt_start=prompt_offset + start,
+                prompt_stop=prompt_offset + end,
+                route="forward_ar",
+                return_hidden=True,
+                hidden_variant=base_hidden_variant,
+                emit_logits=not final_logits_only,
+                input_embeddings=chunk_embeddings,
+            )
+            logits_chunk, hidden_chunk = result.logits, result.hidden
+        else:
+            result = yield _make_mtpk2_prefill_ticket(
+                request_id=request_id,
+                input_ids=chunk_array,
+                cache=cache,
+                prompt_start=prompt_offset + start,
+                prompt_stop=prompt_offset + end,
+                route="prefill_cache_only",
+                input_embeddings=chunk_embeddings,
+            )
+            hidden_chunk = None
+            logits_chunk = result.logits
+        cache = result.request_cache
+        started_eval = time.perf_counter()
         if hidden_chunk is None:
             if logits_chunk is None:
                 _eval_cache_roots(cache)
@@ -4348,13 +4765,15 @@ def _prefill_committed_mtp_history_streaming(
             _eval(hidden_chunk)
         else:
             _eval(logits_chunk, hidden_chunk)
-        target_forward_time += time.perf_counter() - started
+        chunk_elapsed = float(result.elapsed_s) + (
+            time.perf_counter() - started_eval
+        )
+        target_forward_time += chunk_elapsed
         _runtime_count(rt, "prefill_chunks")
         if chunk_callback is not None:
             try:
                 now = time.perf_counter()
                 phase_start = chunk_started_s if chunk_started_s is not None else started
-                chunk_elapsed = max(0.0, now - started)
                 elapsed = max(0.0, now - phase_start)
                 tokens_done = int(cursor + chunk_len)
                 chunk_tok_s = (
@@ -4449,19 +4868,25 @@ def _prefill_committed_mtp_history_streaming(
         del boundary_hidden
         _check_postcommit_abort(abort_check)
 
-    started = time.perf_counter()
     _check_postcommit_abort(abort_check)
-    with attention_phase("prefill"):
-        logits, hidden = rt.forward_ar(
-            mx.array([[prompt_ids[-1]]]),
-            cache=cache,
-            return_hidden=True,
-            hidden_variant=base_hidden_variant,
-            emit_logits=True,
-            logits_keep=1 if final_logits_only else None,
-        )
+    result = yield _make_mtpk2_prefill_ticket(
+        request_id=request_id,
+        input_ids=mx.array([[prompt_ids[-1]]]),
+        cache=cache,
+        prompt_start=prompt_offset + len(prompt_ids) - 1,
+        prompt_stop=prompt_offset + len(prompt_ids),
+        route="forward_ar",
+        return_hidden=True,
+        hidden_variant=base_hidden_variant,
+        emit_logits=True,
+        logits_keep=1 if final_logits_only else None,
+    )
+    cache = result.request_cache
+    started_eval = time.perf_counter()
+    logits, hidden = result.logits, result.hidden
     _eval(logits, hidden)
-    target_forward_time += time.perf_counter() - started
+    target_forward_time += float(result.elapsed_s)
+    target_forward_time += time.perf_counter() - started_eval
     target_forward_time += _maybe_repage_target_prefill_cache(rt, cache)
     _check_postcommit_abort(abort_check)
     return (
@@ -4475,10 +4900,47 @@ def _prefill_committed_mtp_history_streaming(
     )
 
 
-def _prefill_with_hidden_sequence(
+def _prefill_committed_mtp_history_streaming(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
     *,
+    base_hidden_variant: str = "post_norm",
+    mtp_hidden_variant: str = "post_norm",
+    mtp_position_mode: str = "cache",
+    history_window_tokens: int | None = None,
+    abort_check: Callable[[], bool] | None = None,
+    chunk_callback: Callable[[dict[str, Any]], None] | None = None,
+    cached_tokens: int = 0,
+    chunk_started_s: float | None = None,
+    vision_splice: Any | None = None,
+    gdn_boundary_sink: list[tuple[int, Any]] | None = None,
+):
+    return _drive_mtpk2_prefill_machine(
+        rt,
+        _prefill_committed_mtp_history_streaming_machine(
+            rt,
+            prompt_ids,
+            request_id="solo-prefill-history",
+            base_hidden_variant=base_hidden_variant,
+            mtp_hidden_variant=mtp_hidden_variant,
+            mtp_position_mode=mtp_position_mode,
+            history_window_tokens=history_window_tokens,
+            abort_check=abort_check,
+            chunk_callback=chunk_callback,
+            cached_tokens=cached_tokens,
+            chunk_started_s=chunk_started_s,
+            vision_splice=vision_splice,
+            gdn_boundary_sink=gdn_boundary_sink,
+        ),
+    )
+
+
+def _prefill_with_hidden_sequence_machine(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    request_id: str,
+    prompt_offset: int = 0,
     hidden_variant: str,
     vision_splice: Any | None = None,
 ):
@@ -4494,21 +4956,46 @@ def _prefill_with_hidden_sequence(
         prompt_embeddings = spliced_chunk_embeddings(
             rt.embed_tokens, prompt_array, vision_splice
         )
-    started = time.perf_counter()
-    with attention_phase("prefill"):
-        logits, hidden = rt.forward_ar(
-            prompt_array,
-            cache=cache,
-            return_hidden=True,
-            hidden_variant=hidden_variant,
-            emit_logits=True,
-            logits_keep=1 if _final_logits_prefill_enabled() else None,
-            input_embeddings=prompt_embeddings,
-        )
+    result = yield _make_mtpk2_prefill_ticket(
+        request_id=request_id,
+        input_ids=prompt_array,
+        cache=cache,
+        prompt_start=prompt_offset,
+        prompt_stop=prompt_offset + len(prompt_ids),
+        route="forward_ar",
+        return_hidden=True,
+        hidden_variant=hidden_variant,
+        emit_logits=True,
+        logits_keep=1 if _final_logits_prefill_enabled() else None,
+        input_embeddings=prompt_embeddings,
+    )
+    cache = result.request_cache
+    started_eval = time.perf_counter()
+    logits, hidden = result.logits, result.hidden
     _eval(logits, hidden)
-    target_forward_time = time.perf_counter() - started
+    target_forward_time = float(result.elapsed_s)
+    target_forward_time += time.perf_counter() - started_eval
     target_forward_time += _maybe_repage_target_prefill_cache(rt, cache)
     return cache, logits[:, -1, :], hidden[:, -1:, :], hidden, target_forward_time
+
+
+def _prefill_with_hidden_sequence(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    hidden_variant: str,
+    vision_splice: Any | None = None,
+):
+    return _drive_mtpk2_prefill_machine(
+        rt,
+        _prefill_with_hidden_sequence_machine(
+            rt,
+            prompt_ids,
+            request_id="solo-prefill-hidden",
+            hidden_variant=hidden_variant,
+            vision_splice=vision_splice,
+        ),
+    )
 
 
 def _mtp_cache_offset(mtp_cache) -> int:
@@ -5137,7 +5624,7 @@ def generate_mtp1(
         draft_logits = rt.draft_mtp(
             hidden,
             mx.array([[primary]]),
-            mtp_cache=rt.make_mtp_cache(),
+            mtp_cache=_make_generation_mtp_cache(rt),
         )
         draft_timed = False
         elapsed_draft = 0.0
@@ -5708,7 +6195,237 @@ def generate_mtp1(
     )
 
 
-def generate_mtpk(
+@dataclass(frozen=True)
+class _MTPK2ForwardExecution:
+    route: str
+    kwargs: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class _MTPK2VerifyExecution:
+    route: str
+    target: Any
+    hidden_variant: str
+    capture_backend: str
+    commit_route: Callable[..., list[Any]]
+
+
+def _make_mtpk2_prefill_ticket(
+    *,
+    request_id: str,
+    input_ids: Any,
+    cache: list[Any],
+    prompt_start: int,
+    prompt_stop: int,
+    route: str,
+    **kwargs: Any,
+) -> MTPK2PrefillTicket:
+    return MTPK2PrefillTicket(
+        request_id=request_id,
+        input_ids=input_ids,
+        request_cache=cache,
+        prompt_start=int(prompt_start),
+        prompt_stop=int(prompt_stop),
+        execution=_MTPK2ForwardExecution(
+            route=route,
+            kwargs=MappingProxyType(dict(kwargs)),
+        ),
+    )
+
+
+def execute_solo_mtpk2_prefill_ticket(
+    rt: MTPLXRuntime,
+    ticket: MTPK2PrefillTicket,
+) -> MTPK2PrefillResult:
+    execution = ticket.execution
+    started = time.perf_counter()
+    with attention_phase("prefill"):
+        if execution.route == "prefill_cache_only":
+            logits = _prefill_cache_only_forward(
+                rt,
+                ticket.input_ids,
+                ticket.request_cache,
+                input_embeddings=execution.kwargs.get("input_embeddings"),
+            )
+            hidden = None
+        elif execution.route == "forward_ar":
+            result = rt.forward_ar(
+                ticket.input_ids,
+                cache=ticket.request_cache,
+                **execution.kwargs,
+            )
+            if bool(execution.kwargs.get("return_hidden")):
+                logits, hidden = result
+            else:
+                logits, hidden = result, None
+        else:
+            raise RuntimeError(f"unknown K2 prefill route {execution.route!r}")
+    return MTPK2PrefillResult(
+        logits=logits,
+        hidden=hidden,
+        request_cache=ticket.request_cache,
+        elapsed_s=time.perf_counter() - started,
+    )
+
+
+def execute_solo_mtpk2_context_copy_ticket(
+    rt: MTPLXRuntime,
+    ticket: MTPK2ContextCopyTicket,
+) -> MTPK2ContextCopyResult:
+    """Execute one request-local prompt-lookup phase outside the fixed K2 lane."""
+    started = time.perf_counter()
+    with attention_phase("decode_verify"):
+        logits, hidden, captures = rt.forward_ar_capture(
+            ticket.input_ids,
+            cache=ticket.request_cache,
+            return_hidden=True,
+            hidden_variant=ticket.hidden_variant,
+            capture_backend=ticket.capture_backend,
+        )
+    return MTPK2ContextCopyResult(
+        logits=logits,
+        hidden=hidden,
+        captures=captures,
+        request_cache=ticket.request_cache,
+        forward_elapsed_s=time.perf_counter() - started,
+    )
+
+
+def execute_solo_mtpk2_verify_ticket(
+    rt: MTPLXRuntime,
+    ticket: MTPK2VerifyTicket,
+) -> MTPK2VerifyResult:
+    execution = ticket.acceptance_context.execution
+    started = time.perf_counter()
+    with attention_phase("decode_verify"):
+        if execution.route == "capture":
+            logits, hidden, captures = rt.forward_ar_capture(
+                ticket.input_ids,
+                cache=ticket.request_cache,
+                return_hidden=True,
+                hidden_variant=execution.hidden_variant,
+                capture_backend=execution.capture_backend,
+            )
+        elif execution.route == "capture_bank":
+            logits, hidden, captures = execution.target.forward_ar_capture(
+                ticket.input_ids,
+                cache=ticket.request_cache,
+                return_hidden=True,
+                hidden_variant=execution.hidden_variant,
+            )
+        elif execution.route == "plain_bank":
+            logits, hidden = execution.target.forward_ar(
+                ticket.input_ids,
+                cache=ticket.request_cache,
+                return_hidden=True,
+                hidden_variant=execution.hidden_variant,
+            )
+            captures = None
+        elif execution.route == "plain":
+            logits, hidden = rt.forward_ar(
+                ticket.input_ids,
+                cache=ticket.request_cache,
+                return_hidden=True,
+                hidden_variant=execution.hidden_variant,
+            )
+            captures = None
+        else:
+            raise RuntimeError(f"unknown K2 verify route {execution.route!r}")
+
+    def commit_prefix(steps: int) -> list[Any]:
+        return execution.commit_route(
+            ticket.request_cache,
+            captures,
+            steps=int(steps),
+        )
+
+    return MTPK2VerifyResult(
+        logits=logits,
+        hidden=hidden,
+        captures=captures,
+        request_cache=ticket.request_cache,
+        commit_prefix=commit_prefix,
+        forward_elapsed_s=time.perf_counter() - started,
+    )
+
+
+def _drive_mtpk2_prefill_machine(rt: MTPLXRuntime, machine: Any) -> Any:
+    try:
+        ticket = next(machine)
+        while True:
+            result = execute_solo_mtpk2_prefill_ticket(rt, ticket)
+            ticket = machine.send(result)
+    except StopIteration as finished:
+        return finished.value
+
+
+def _yield_from_with_prefill_chunk_override(
+    machine: Any,
+    chunk_tokens: int,
+):
+    """Advance a prefill coroutine under its frozen request-local chunk size.
+
+    The ContextVar is reset before every scheduler yield, so two suspended
+    requests cannot leak chunk geometry into one another or into unrelated
+    synchronous generation on the same owner thread.
+    """
+
+    try:
+        with prefill_chunk_size_override(chunk_tokens):
+            ticket = next(machine)
+        while True:
+            result = yield ticket
+            with prefill_chunk_size_override(chunk_tokens):
+                ticket = machine.send(result)
+    except StopIteration as finished:
+        return finished.value
+    except BaseException:
+        machine.close()
+        raise
+
+
+@dataclass(frozen=True)
+class _ResolvedMTPDepth:
+    """Construction-time MTP depth decision shared by serial and K2 routes."""
+
+    requested_depth: int
+    effective_depth: int
+    min_depth: int
+    prompt_tokens: int
+    policy: Mapping[str, object]
+
+
+def _resolve_mtpk_depth(
+    prompt_ids: list[int],
+    *,
+    speculative_depth: int,
+    min_speculative_depth: int,
+) -> _ResolvedMTPDepth:
+    requested_depth = int(speculative_depth)
+    min_depth = int(min_speculative_depth)
+    if requested_depth < 1:
+        raise ValueError("speculative_depth must be >= 1")
+    if min_depth < 0:
+        raise ValueError("min_speculative_depth must be >= 0")
+    if min_depth > requested_depth:
+        raise ValueError("min_speculative_depth cannot exceed speculative_depth")
+    effective_depth, policy = resolve_long_context_mtp_depth(
+        prompt_tokens=len(prompt_ids),
+        requested_depth=requested_depth,
+        min_depth=min_depth,
+    )
+    if min_depth > effective_depth:
+        raise ValueError("min_speculative_depth cannot exceed speculative_depth")
+    return _ResolvedMTPDepth(
+        requested_depth=requested_depth,
+        effective_depth=int(effective_depth),
+        min_depth=min_depth,
+        prompt_tokens=len(prompt_ids),
+        policy=MappingProxyType(dict(policy)),
+    )
+
+
+def _generate_mtpk_machine(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
     *,
@@ -5762,6 +6479,13 @@ def generate_mtpk(
     thinking_guard: ThinkingGuardConfig | None = None,
     vision_splice: Any | None = None,
     constraint: Any | None = None,
+    _request_id: str = "solo-k2",
+    _prefill_chunk_tokens: int | None = None,
+    _request_state: MTPK2RequestState | None = None,
+    _resolved_depth: _ResolvedMTPDepth | None = None,
+    _context_copy_requested: bool | None = None,
+    _lazy_bonus_verify_requested: bool | None = None,
+    _resolved_lazy_bonus_verify_min_depth: int | None = None,
 ) -> GenerationOutput:
     """Generate with a fixed native-MTP depth.
 
@@ -5805,20 +6529,32 @@ def generate_mtpk(
         raise RuntimeError("generate_mtpk requires an MTP-enabled runtime")
     base_hidden_variant = _resolve_runtime_base_hidden_variant(rt, base_hidden_variant)
     mtp_hidden_variant = _resolve_runtime_mtp_hidden_variant(rt, mtp_hidden_variant)
-    requested_speculative_depth = int(speculative_depth)
-    if requested_speculative_depth < 1:
-        raise ValueError("speculative_depth must be >= 1")
-    if min_speculative_depth < 0:
-        raise ValueError("min_speculative_depth must be >= 0")
-    if min_speculative_depth > requested_speculative_depth:
-        raise ValueError("min_speculative_depth cannot exceed speculative_depth")
-    speculative_depth, long_context_depth_policy = resolve_long_context_mtp_depth(
-        prompt_tokens=len(prompt_ids),
-        requested_depth=requested_speculative_depth,
-        min_depth=min_speculative_depth,
+    resolved_depth = _resolved_depth or _resolve_mtpk_depth(
+        prompt_ids,
+        speculative_depth=speculative_depth,
+        min_speculative_depth=min_speculative_depth,
     )
-    if min_speculative_depth > speculative_depth:
-        raise ValueError("min_speculative_depth cannot exceed speculative_depth")
+    requested_speculative_depth = int(resolved_depth.requested_depth)
+    speculative_depth = int(resolved_depth.effective_depth)
+    long_context_depth_policy = dict(resolved_depth.policy)
+    resolved_lazy_bonus_verify_requested = (
+        False
+        if _request_state is not None
+        else (
+            _lazy_bonus_verify_enabled()
+            if _lazy_bonus_verify_requested is None
+            else bool(_lazy_bonus_verify_requested)
+        )
+    )
+    resolved_lazy_bonus_verify_min_depth = (
+        2
+        if _request_state is not None
+        else (
+            _lazy_bonus_verify_min_depth()
+            if _resolved_lazy_bonus_verify_min_depth is None
+            else max(1, int(_resolved_lazy_bonus_verify_min_depth))
+        )
+    )
     if mtp_cache_policy not in {"persistent", "fresh"}:
         raise ValueError("mtp_cache_policy must be 'persistent' or 'fresh'")
     mtp_history_policy = _normalize_mtp_history_policy(mtp_history_policy)
@@ -5902,9 +6638,18 @@ def generate_mtpk(
         else None
     )
     exact_a3b_target_prefix = exact_a3b_target_prefix_factory is not None
-    draft_sampler = _env_scaled_draft_sampler(sampler, draft_sampler)
-    _loop_guard_config = loop_guard_config_from_env(
-        bool(loop_guard), tokenizer=getattr(rt, "tokenizer", None)
+    draft_sampler = (
+        _request_state.draft_sampler
+        if _request_state is not None
+        else _env_scaled_draft_sampler(sampler, draft_sampler)
+    )
+    _loop_guard_config = (
+        _request_state.config.loop_guard_config
+        if _request_state is not None
+        else loop_guard_config_from_env(
+            bool(loop_guard),
+            tokenizer=getattr(rt, "tokenizer", None),
+        )
     )
     if bool(getattr(rt, "a3b_whole_moe_installed", False)):
         os.environ["MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS"] = str(len(prompt_ids))
@@ -5954,7 +6699,11 @@ def generate_mtpk(
         else int(online_hidden_corrector_max_feed_depth)
     )
 
-    rng = np.random.default_rng(seed)
+    rng = (
+        _request_state.rng
+        if _request_state is not None
+        else np.random.default_rng(seed)
+    )
     if mtp_corrector is not None:
         corrector_variant = getattr(mtp_corrector, "hidden_variant", mtp_hidden_variant)
         if corrector_variant != mtp_hidden_variant:
@@ -5984,27 +6733,40 @@ def generate_mtpk(
     lazy_bonus_verify_calls = 0
     lazy_bonus_commit_time = 0.0
     verify_eval_unattributed_time = 0.0
-    prompt_state = restore_or_prefill_prompt_state(
-        rt,
-        prompt_ids,
-        vision_splice=vision_splice,
-        base_hidden_variant=base_hidden_variant,
-        mtp_hidden_variant=mtp_hidden_variant,
-        mtp_history_policy=mtp_history_policy,
-        session_bank=session_bank,
-        restore_mode=session_restore_mode,
-        session_id=session_id,
-        template_hash=session_template_hash,
-        draft_head_identity=session_draft_head_identity,
-        policy_fingerprint=session_policy_fingerprint,
-        prefill_callback=prefill_callback,
+    prompt_state_kwargs = {
+        "vision_splice": vision_splice,
+        "base_hidden_variant": base_hidden_variant,
+        "mtp_hidden_variant": mtp_hidden_variant,
+        "mtp_history_policy": mtp_history_policy,
+        "session_bank": session_bank,
+        "restore_mode": session_restore_mode,
+        "session_id": session_id,
+        "template_hash": session_template_hash,
+        "draft_head_identity": session_draft_head_identity,
+        "policy_fingerprint": session_policy_fingerprint,
+        "prefill_callback": prefill_callback,
         # kvcache-v2: client disconnect aborts the prefill through the same
         # chunk-granular check the postcommit path uses — an abandoned agent
-        # request must not pin the GPU for a full long-context prefill
-        # (measured: an orphaned ~200k prefill blocked all sessions for
-        # 10+ minutes, 2026-07-03).
-        abort_check=abort_check,
-    )
+        # request must not pin the GPU for a full long-context prefill.
+        "abort_check": abort_check,
+    }
+    if _request_state is not None:
+        prompt_state = yield from _yield_from_with_prefill_chunk_override(
+            _restore_or_prefill_prompt_state_machine(
+                rt,
+                prompt_ids,
+                request_id=_request_id,
+                enforce_ticket_chunk_limit=True,
+                **prompt_state_kwargs,
+            ),
+            int(_prefill_chunk_tokens or _prefill_chunk_size()),
+        )
+    else:
+        prompt_state = restore_or_prefill_prompt_state(
+            rt,
+            prompt_ids,
+            **prompt_state_kwargs,
+        )
     prompt_prefix_bank_commit: dict[str, object] = {}
     bank_commit_ids = prompt_ids
     if vision_splice is not None and session_bank is not None:
@@ -6104,7 +6866,11 @@ def generate_mtpk(
         if verify_strategy in {"graphbank", "graphbank_capture_commit"}
         else None
     )
-    _compiled_verify_mode = compiled_verify_mode()
+    _compiled_verify_mode = (
+        _request_state.config.compiled_verify_mode
+        if _request_state is not None
+        else compiled_verify_mode()
+    )
     generic_compiled_target_prefix = (
         target_prefix_verify
         and not exact_a3b_target_prefix
@@ -6114,9 +6880,19 @@ def generate_mtpk(
         CompiledVerifyBank(
             rt,
             request_max_tokens=max_tokens,
+            max_verify_len=(
+                _request_state.config.compiled_verify_max_len
+                if _request_state is not None
+                else None
+            ),
             capture_backend=verify_core_backend,
             parity=_compiled_verify_mode == "parity",
             parity2=_compiled_verify_mode == "parity2",
+            environment=(
+                _request_state.config.environment
+                if _request_state is not None
+                else None
+            ),
         )
         if _compiled_verify_mode != "off"
         and (
@@ -6131,7 +6907,10 @@ def generate_mtpk(
     commit_time = capture_commit_time = 0.0
     bonus_time = 0.0
     online_hidden_corrector_time = 0.0
-    tokens: list[int] = []
+    if _request_state is not None:
+        _request_state.target_cache = cache
+        _request_state.mtp_cache = mtp_history_cache
+    tokens = _request_state.tokens if _request_state is not None else []
     # Grammar-constrained decoding (#186 phase 3): the matcher advances only
     # through committed tokens (synced once per cycle after the primary);
     # speculative windows are clamped to the matcher's legal prefix before
@@ -6234,28 +7013,28 @@ def generate_mtpk(
     streamed_token_count = 0
     mtp_history_materialize_every = max(
         0,
-        int(os.environ.get("MTPLX_MTP_HISTORY_MATERIALIZE_EVERY") or 0),
+        int(_generation_env_get("MTPLX_MTP_HISTORY_MATERIALIZE_EVERY") or 0),
     )
     late_depth_switch_after = max(
         0,
-        int(os.environ.get("MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS") or 0),
+        int(_generation_env_get("MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS") or 0),
     )
     late_depth_before = int(
-        os.environ.get("MTPLX_LATE_DEPTH_BEFORE") or speculative_depth
+        _generation_env_get("MTPLX_LATE_DEPTH_BEFORE") or speculative_depth
     )
     late_depth_after = int(
-        os.environ.get("MTPLX_LATE_DEPTH_AFTER") or speculative_depth
+        _generation_env_get("MTPLX_LATE_DEPTH_AFTER") or speculative_depth
     )
     mtp_position_mode = _resolve_runtime_mtp_position_mode(rt)
     mtp_position_cap = max(
         0,
-        int(os.environ.get("MTPLX_MTP_POSITION_CAP") or 4096),
+        int(_generation_env_get("MTPLX_MTP_POSITION_CAP") or 4096),
     )
     mtp_position_period = max(
         0,
-        int(os.environ.get("MTPLX_MTP_POSITION_PERIOD") or 4096),
+        int(_generation_env_get("MTPLX_MTP_POSITION_PERIOD") or 4096),
     )
-    position_base_env = os.environ.get("MTPLX_MTP_POSITION_BASE")
+    position_base_env = _generation_env_get("MTPLX_MTP_POSITION_BASE")
     mtp_position_base = max(
         0,
         int(
@@ -6294,25 +7073,29 @@ def generate_mtpk(
     clear_cache_time_s = 0.0
     trunk_cache_materialize_every = max(
         0,
-        int(os.environ.get("MTPLX_TRUNK_CACHE_MATERIALIZE_EVERY") or 0),
+        int(_generation_env_get("MTPLX_TRUNK_CACHE_MATERIALIZE_EVERY") or 0),
     )
     trunk_cache_materialize_tokens_since = 0
     trunk_cache_materialize_observed_tokens = 0
     trunk_cache_materialize_events = 0
     trunk_cache_materialize_time_s = 0.0
-    state_rebase_every = max(
-        0,
-        int(os.environ.get("MTPLX_STATE_REBASE_EVERY") or 0),
+    state_rebase_every = (
+        _request_state.config.state_rebase_every
+        if _request_state is not None
+        else max(
+            0,
+            int(_generation_env_get("MTPLX_STATE_REBASE_EVERY") or 0),
+        )
     )
     state_rebase_tokens_since = 0
     state_rebase_observed_tokens = 0
     state_rebase_events = 0
     state_rebase_time_s = 0.0
     state_root_eval_enabled = _env_truthy("MTPLX_EVAL_STATE_ROOTS_ON_COMMIT")
-    state_root_eval_include_mtp = os.environ.get(
+    state_root_eval_include_mtp = _generation_env_get(
         "MTPLX_EVAL_STATE_ROOTS_INCLUDE_MTP", "1"
     ).strip().lower() not in {"0", "false", "no", "off"}
-    state_root_eval_include_live = os.environ.get(
+    state_root_eval_include_live = _generation_env_get(
         "MTPLX_EVAL_STATE_ROOTS_INCLUDE_LIVE", "1"
     ).strip().lower() not in {"0", "false", "no", "off"}
     defer_verify_hidden_eval = _defer_verify_hidden_eval_enabled()
@@ -6322,12 +7105,17 @@ def generate_mtpk(
     state_root_eval_time_s = 0.0
     state_root_eval_arrays = 0
     dirty_detach_mode = (
-        (os.environ.get("MTPLX_DETACH_MODE") or "selected_slice_contiguous_eval")
+        (
+            _generation_env_get("MTPLX_DETACH_MODE")
+            or "selected_slice_contiguous_eval"
+        )
         .strip()
         .lower()
         .replace("-", "_")
     )
-    dirty_detach_components_env = os.environ.get("MTPLX_DETACH_COMPONENTS") or ""
+    dirty_detach_components_env = (
+        _generation_env_get("MTPLX_DETACH_COMPONENTS") or ""
+    )
     dirty_detach_component_filter = {
         item.strip().lower().replace("-", "_")
         for item in dirty_detach_components_env.split(",")
@@ -6336,20 +7124,29 @@ def generate_mtpk(
     dirty_detach_supported_components = {"gdn", "conv", "attn"}
     dirty_detach_global_every = max(
         0,
-        int(os.environ.get("MTPLX_DETACH_EVERY") or 0),
+        int(_generation_env_get("MTPLX_DETACH_EVERY") or 0),
     )
     dirty_detach_cadences = {
         "gdn": max(
             0,
-            int(os.environ.get("MTPLX_DETACH_GDN_EVERY") or dirty_detach_global_every),
+            int(
+                _generation_env_get("MTPLX_DETACH_GDN_EVERY")
+                or dirty_detach_global_every
+            ),
         ),
         "conv": max(
             0,
-            int(os.environ.get("MTPLX_DETACH_CONV_EVERY") or dirty_detach_global_every),
+            int(
+                _generation_env_get("MTPLX_DETACH_CONV_EVERY")
+                or dirty_detach_global_every
+            ),
         ),
         "attn": max(
             0,
-            int(os.environ.get("MTPLX_DETACH_ATTN_EVERY") or dirty_detach_global_every),
+            int(
+                _generation_env_get("MTPLX_DETACH_ATTN_EVERY")
+                or dirty_detach_global_every
+            ),
         ),
     }
     if dirty_detach_component_filter:
@@ -6373,8 +7170,8 @@ def generate_mtpk(
     live_output_detach_enabled = _env_truthy("MTPLX_DETACH_LIVE_OUTPUTS")
     live_output_detach_mode = (
         (
-            os.environ.get("MTPLX_DETACH_LIVE_OUTPUTS_MODE")
-            or os.environ.get("MTPLX_DETACH_MODE")
+            _generation_env_get("MTPLX_DETACH_LIVE_OUTPUTS_MODE")
+            or _generation_env_get("MTPLX_DETACH_MODE")
             or "contiguous_eval"
         )
         .strip()
@@ -6386,13 +7183,16 @@ def generate_mtpk(
     live_output_detach_arrays = 0
     live_output_detach_bytes = 0
     capture_commit_detach_mode = (
-        (os.environ.get("MTPLX_CAPTURE_COMMIT_DETACH_MODE") or dirty_detach_mode)
+        (
+            _generation_env_get("MTPLX_CAPTURE_COMMIT_DETACH_MODE")
+            or dirty_detach_mode
+        )
         .strip()
         .lower()
         .replace("-", "_")
     )
     capture_commit_detach_components_env = (
-        os.environ.get("MTPLX_CAPTURE_COMMIT_DETACH_COMPONENTS") or ""
+        _generation_env_get("MTPLX_CAPTURE_COMMIT_DETACH_COMPONENTS") or ""
     )
     capture_commit_detach_component_filter = {
         item.strip().lower().replace("-", "_")
@@ -6401,20 +7201,20 @@ def generate_mtpk(
     }
     capture_commit_detach_global_every = max(
         0,
-        int(os.environ.get("MTPLX_CAPTURE_COMMIT_DETACH_EVERY") or 0),
+        int(_generation_env_get("MTPLX_CAPTURE_COMMIT_DETACH_EVERY") or 0),
     )
     capture_commit_detach_cadences = {
         "gdn": max(
             0,
             int(
-                os.environ.get("MTPLX_CAPTURE_COMMIT_DETACH_GDN_EVERY")
+                _generation_env_get("MTPLX_CAPTURE_COMMIT_DETACH_GDN_EVERY")
                 or capture_commit_detach_global_every
             ),
         ),
         "conv": max(
             0,
             int(
-                os.environ.get("MTPLX_CAPTURE_COMMIT_DETACH_CONV_EVERY")
+                _generation_env_get("MTPLX_CAPTURE_COMMIT_DETACH_CONV_EVERY")
                 or capture_commit_detach_global_every
             ),
         ),
@@ -6870,8 +7670,13 @@ def generate_mtpk(
     _ccopy_whole_moe_conflict = _ccopy_tp_requested and bool(
         getattr(rt, "a3b_whole_moe_installed", False)
     )
-    ccopy_active = (
+    resolved_context_copy_requested = (
         context_copy_enabled()
+        if _context_copy_requested is None
+        else bool(_context_copy_requested)
+    )
+    ccopy_active = (
+        resolved_context_copy_requested
         and not _penalties_active
         and (_ccopy_capture_lane or (_ccopy_tp_requested and not _ccopy_whole_moe_conflict))
     )
@@ -6900,9 +7705,11 @@ def generate_mtpk(
     _cc_streak_accepted = 0
     _cc_streak_outstanding = 0  # substituted drafts not yet seen by the sync
     ccopy_index = None
-    ccopy_k = context_copy_block_k()
-    ccopy_min_ext = context_copy_min_ext()
+    ccopy_k = 1
+    ccopy_min_ext = 1
     if ccopy_active:
+        ccopy_k = context_copy_block_k()
+        ccopy_min_ext = context_copy_min_ext()
         ccopy_index = NgramIndex(context_copy_ng_min(), context_copy_ng_max())
         # Prompt-lookup semantics: the index covers the PROMPT only. Matches into
         # the model's own generated text (self-repetition) tend to have weak
@@ -7072,8 +7879,12 @@ def generate_mtpk(
             emit_trace()
             break
 
-        cycle_depth = min(planned_depth, max_tokens - len(tokens))
-        draft_tokens: list[int | None] = []
+        logical_cycle_depth = min(planned_depth, max_tokens - len(tokens))
+        # An installed K2 request owns the fixed T=3 verify geometry.  The
+        # second draft is still computed at a short output tail, then the
+        # commit path below limits the visible prefix to the logical cap.
+        cycle_depth = 2 if _request_state is not None else logical_cycle_depth
+        draft_tokens: list[int] = []
         draft_probs: list[np.ndarray | None] = []
         draft_cache_keys: list[tuple[int, ...]] = []
         draft_hidden_for_update: list[mx.array] = []
@@ -7083,12 +7894,17 @@ def generate_mtpk(
             cycle_mtp_offset = _mtp_cache_offset(mtp_cache)
         else:
             mtp_cache = (
-                rt.make_mtp_cache() if mtp_cache_policy == "persistent" else None
+                _make_generation_mtp_cache(rt)
+                if mtp_cache_policy == "persistent"
+                else None
             )
             cycle_mtp_offset = None
         trace_current_mtp_cache = (
             mtp_cache if mtp_cache is not None else mtp_history_cache
         )
+        if _request_state is not None:
+            _request_state.mtp_cache = trace_current_mtp_cache
+
         # ---- context-copy as DRAFT SOURCE (target_prefix takeover lane) ----
         # The block-round machinery is NOT AR-exact on this lane: its T+1-row
         # block forward runs M>2 kernel paths (stock gather_qmm fallbacks)
@@ -7183,24 +7999,41 @@ def generate_mtpk(
             if _cc_block:
                 _cc_T = 1 + len(_cc_block)
                 _cc_before = None
-                if not _env_truthy("MTPLX_SKIP_VERIFY_SNAPSHOT"):
+                if not _skip_verify_snapshot_enabled():
                     started = time.perf_counter()
                     _cc_before = snapshot_untrimmable_cache(cache)
                     snapshot_time += time.perf_counter() - started
-                started_forward = time.perf_counter()
-                with attention_phase("decode_verify"):
-                    _cc_logits, _cc_hidden, _cc_captures = rt.forward_ar_capture(
-                        mx.array([[primary] + _cc_block]),
-                        cache=cache,
-                        return_hidden=True,
+                if _request_state is None:
+                    started_forward = time.perf_counter()
+                    with attention_phase("decode_verify"):
+                        _cc_logits, _cc_hidden, _cc_captures = (
+                            rt.forward_ar_capture(
+                                mx.array([[primary] + _cc_block]),
+                                cache=cache,
+                                return_hidden=True,
+                                hidden_variant=base_hidden_variant,
+                                capture_backend=verify_core_backend,
+                            )
+                        )
+                    elapsed_verify = time.perf_counter() - started_forward
+                else:
+                    _cc_result = yield MTPK2ContextCopyTicket(
+                        request_id=_request_id,
+                        input_ids=mx.array([[primary] + _cc_block]),
+                        request_cache=cache,
                         hidden_variant=base_hidden_variant,
                         capture_backend=verify_core_backend,
                     )
+                    _cc_logits = _cc_result.logits
+                    _cc_hidden = _cc_result.hidden
+                    _cc_captures = _cc_result.captures
+                    cache = _cc_result.request_cache
+                    _request_state.target_cache = cache
+                    elapsed_verify = float(_cc_result.forward_elapsed_s or 0.0)
                 if sampler.temperature <= 0:
                     _cc_g = [int(x) for x in mx.argmax(_cc_logits[0], axis=-1).tolist()]
                 else:
                     mx.eval(_cc_logits)
-                elapsed_verify = time.perf_counter() - started_forward
                 verify_forward_time += elapsed_verify
                 verify_time += elapsed_verify
                 target_time += elapsed_verify
@@ -7562,7 +8395,7 @@ def generate_mtpk(
                     if (
                         not core_current
                         and device_core is not None
-                        and os.environ.get("MTPLX_DEVICE_CORE_DEBUG")
+                        and _generation_env_get("MTPLX_DEVICE_CORE_DEBUG")
                     ):
                         stored = device_core["state_signature"]
                         diffs = [
@@ -7649,7 +8482,9 @@ def generate_mtpk(
         for depth_index in range(0 if used_device_core else cycle_depth):
             source_token = int(next_token)
             step_mtp_cache = (
-                mtp_cache if mtp_cache_policy == "persistent" else rt.make_mtp_cache()
+                mtp_cache
+                if mtp_cache_policy == "persistent"
+                else _make_generation_mtp_cache(rt)
             )
             draft_position_offset = mtp_position_offset_for_cache(step_mtp_cache)
             started = time.perf_counter()
@@ -7963,7 +8798,7 @@ def generate_mtpk(
 
         before_verify = None
         if a3b_target_prefix_route is None:
-            if _skip_verify_snapshot():
+            if _skip_verify_snapshot_enabled():
                 event["snapshot"] = "skipped_capture_commit_required"
             else:
                 started = time.perf_counter()
@@ -7971,8 +8806,8 @@ def generate_mtpk(
                 elapsed_snapshot = time.perf_counter() - started
                 snapshot_time += elapsed_snapshot
                 _add_timing(event, "snapshot", elapsed_snapshot)
-        lazy_bonus_verify_min_depth = _lazy_bonus_verify_min_depth()
-        lazy_bonus_verify_requested = _lazy_bonus_verify_enabled()
+        lazy_bonus_verify_min_depth = resolved_lazy_bonus_verify_min_depth
+        lazy_bonus_verify_requested = resolved_lazy_bonus_verify_requested
         omit_speculative_bonus = _omit_speculative_bonus_enabled()
         if a3b_target_prefix_route is not None and a3b_k2:
             # 3-row verify [primary, d1, d2]; greedy needs all 3 target rows so
@@ -8027,9 +8862,9 @@ def generate_mtpk(
             lazy_bonus_verify_calls += 1
         event["lazy_bonus_verify"] = {
             "enabled": bool(lazy_bonus_verify),
-            "requested": bool(lazy_bonus_verify_requested),
+            "requested": bool(resolved_lazy_bonus_verify_requested),
             "disabled_by": "lazy_target_distributions"
-            if lazy_bonus_verify_requested
+            if resolved_lazy_bonus_verify_requested
             and lazy_target_distributions
             and not target_prefix_verify
             else None,
@@ -8041,13 +8876,146 @@ def generate_mtpk(
             "omitted": bool(omit_speculative_bonus),
             "distribution_row_needed": bool(bonus_distribution_row_needed),
         }
-        set_native_mlp_context(len(tokens))
-        started_forward = time.perf_counter()
+        if _request_state is None:
+            set_native_mlp_context(len(tokens))
         captures = None
-        with attention_phase("decode_verify"):
+        if _request_state is not None:
             if verify_strategy in {"capture_commit", "graphbank_capture_commit"}:
                 if compiled_verify_bank is not None:
-                    verify_logits, verify_hidden, captures = (
+                    verify_execution = _MTPK2VerifyExecution(
+                        route="capture_bank",
+                        target=compiled_verify_bank,
+                        hidden_variant=base_hidden_variant,
+                        capture_backend=verify_core_backend,
+                        commit_route=_request_state.width1_commit_route,
+                    )
+                elif graphbank is not None:
+                    verify_execution = _MTPK2VerifyExecution(
+                        route="capture_bank",
+                        target=graphbank,
+                        hidden_variant=base_hidden_variant,
+                        capture_backend=verify_core_backend,
+                        commit_route=_request_state.width1_commit_route,
+                    )
+                else:
+                    verify_execution = _MTPK2VerifyExecution(
+                        route="capture",
+                        target=None,
+                        hidden_variant=base_hidden_variant,
+                        capture_backend=verify_core_backend,
+                        commit_route=_request_state.width1_commit_route,
+                    )
+            elif graphbank is not None:
+                verify_execution = _MTPK2VerifyExecution(
+                    route="plain_bank",
+                    target=graphbank,
+                    hidden_variant=base_hidden_variant,
+                    capture_backend=verify_core_backend,
+                    commit_route=_request_state.width1_commit_route,
+                )
+            else:
+                verify_execution = _MTPK2VerifyExecution(
+                    route="plain",
+                    target=None,
+                    hidden_variant=base_hidden_variant,
+                    capture_backend=verify_core_backend,
+                    commit_route=_request_state.width1_commit_route,
+                )
+            ticket_distributions = tuple(draft_probs)
+            if len(ticket_distributions) < 2:
+                ticket_distributions = (
+                    *ticket_distributions,
+                    *(None for _ in range(2 - len(ticket_distributions))),
+                )
+            verify_result = yield MTPK2VerifyTicket(
+                request_id=_request_id,
+                input_ids=mx.array([verify_input]),
+                request_cache=cache,
+                draft_distributions=(
+                    ticket_distributions[0],
+                    ticket_distributions[1],
+                ),
+                acceptance_context=MTPK2AcceptanceContext(
+                    verify_strategy=verify_strategy,
+                    verify_core=verify_core_backend,
+                    hidden_variant=base_hidden_variant,
+                    before_verify=before_verify,
+                    event=MappingProxyType(dict(event)),
+                    execution=verify_execution,
+                ),
+            )
+            verify_logits = verify_result.logits
+            verify_hidden = verify_result.hidden
+            captures = verify_result.captures
+            cache = verify_result.request_cache
+            if _request_state is not None:
+                _request_state.target_cache = cache
+            elapsed_verify_forward = float(verify_result.forward_elapsed_s or 0.0)
+        else:
+            started_forward = time.perf_counter()
+            with attention_phase("decode_verify"):
+                if verify_strategy in {"capture_commit", "graphbank_capture_commit"}:
+                    if compiled_verify_bank is not None:
+                        verify_logits, verify_hidden, captures = (
+                            compiled_verify_bank.forward_ar_capture(
+                                mx.array([verify_input]),
+                                cache=cache,
+                                return_hidden=True,
+                                hidden_variant=base_hidden_variant,
+                            )
+                        )
+                    elif graphbank is not None:
+                        verify_logits, verify_hidden, captures = (
+                            graphbank.forward_ar_capture(
+                                mx.array([verify_input]),
+                                cache=cache,
+                                return_hidden=True,
+                                hidden_variant=base_hidden_variant,
+                            )
+                        )
+                    else:
+                        verify_logits, verify_hidden, captures = rt.forward_ar_capture(
+                            mx.array([verify_input]),
+                            cache=cache,
+                            return_hidden=True,
+                            hidden_variant=base_hidden_variant,
+                            capture_backend=verify_core_backend,
+                        )
+                elif a3b_target_prefix_route is not None and a3b_k2:
+                    # k=2 3-row verify. Returns both mid-window rebase states.
+                    if a3b_rebase_state is not None:
+                        (
+                            verify_logits,
+                            verify_hidden,
+                            a3b_m3_rebase0_state,
+                            a3b_m3_rebase1_state,
+                        ) = a3b_target_prefix_route.verify_m3_rebased(
+                            verify_input_array,
+                            a3b_rebase_state,
+                        )
+                        a3b_rebase_state = None
+                    else:
+                        (
+                            verify_logits,
+                            verify_hidden,
+                            a3b_m3_rebase0_state,
+                            a3b_m3_rebase1_state,
+                        ) = a3b_target_prefix_route.verify_m3(verify_input_array)
+                elif a3b_target_prefix_route is not None:
+                    if a3b_rebase_state is not None:
+                        verify_logits, verify_hidden, a3b_primary_state = (
+                            a3b_target_prefix_route.verify_m2_rebased(
+                                verify_input_array,
+                                a3b_rebase_state,
+                            )
+                        )
+                        a3b_rebase_state = None
+                    else:
+                        verify_logits, verify_hidden, a3b_primary_state = (
+                            a3b_target_prefix_route.verify_m2(verify_input_array)
+                        )
+                elif compiled_verify_bank is not None:
+                    verify_logits, verify_hidden, _compiled_captures = (
                         compiled_verify_bank.forward_ar_capture(
                             verify_input_array,
                             cache=cache,
@@ -8056,88 +9024,20 @@ def generate_mtpk(
                         )
                     )
                 elif graphbank is not None:
-                    verify_logits, verify_hidden, captures = (
-                        graphbank.forward_ar_capture(
-                            verify_input_array,
-                            cache=cache,
-                            return_hidden=True,
-                            hidden_variant=base_hidden_variant,
-                        )
-                    )
-                else:
-                    verify_logits, verify_hidden, captures = rt.forward_ar_capture(
-                        verify_input_array,
-                        cache=cache,
-                        return_hidden=True,
-                        hidden_variant=base_hidden_variant,
-                        capture_backend=verify_core_backend,
-                    )
-            elif a3b_target_prefix_route is not None and a3b_k2:
-                # k=2 3-row verify.  Returns the two mid-window rebase states
-                # (post-row-0, post-row-1); the accept loop picks which one the
-                # next cycle rebases from after a d1 or d2 reject.
-                if a3b_rebase_state is not None:
-                    (
-                        verify_logits,
-                        verify_hidden,
-                        a3b_m3_rebase0_state,
-                        a3b_m3_rebase1_state,
-                    ) = a3b_target_prefix_route.verify_m3_rebased(
-                        verify_input_array, a3b_rebase_state
-                    )
-                    a3b_rebase_state = None
-                else:
-                    (
-                        verify_logits,
-                        verify_hidden,
-                        a3b_m3_rebase0_state,
-                        a3b_m3_rebase1_state,
-                    ) = a3b_target_prefix_route.verify_m3(verify_input_array)
-                # a3b_primary_state (the K1 single-rebase leaf) is unused on the
-                # k=2 path: the reject rebase selects m3 rebase0/rebase1 instead.
-            elif a3b_target_prefix_route is not None:
-                if a3b_rebase_state is not None:
-                    # Deferred-correction fold: the pending correction is
-                    # this cycle's primary and the verify runs from the
-                    # stashed post-primary state of the cycle that rejected
-                    # it -- the repair_m1 forward never happens.
-                    verify_logits, verify_hidden, a3b_primary_state = (
-                        a3b_target_prefix_route.verify_m2_rebased(
-                            verify_input_array, a3b_rebase_state
-                        )
-                    )
-                    a3b_rebase_state = None
-                else:
-                    verify_logits, verify_hidden, a3b_primary_state = (
-                        a3b_target_prefix_route.verify_m2(verify_input_array)
-                    )
-            elif compiled_verify_bank is not None:
-                # Replace only the target forward. target_prefix keeps its
-                # authoritative snapshot/trim, pre-sampling, and correction
-                # forward; captures here must not change its commit semantics.
-                verify_logits, verify_hidden, _compiled_captures = (
-                    compiled_verify_bank.forward_ar_capture(
-                        verify_input_array,
+                    verify_logits, verify_hidden = graphbank.forward_ar(
+                        mx.array([verify_input]),
                         cache=cache,
                         return_hidden=True,
                         hidden_variant=base_hidden_variant,
                     )
-                )
-            elif graphbank is not None:
-                verify_logits, verify_hidden = graphbank.forward_ar(
-                    verify_input_array,
-                    cache=cache,
-                    return_hidden=True,
-                    hidden_variant=base_hidden_variant,
-                )
-            else:
-                verify_logits, verify_hidden = rt.forward_ar(
-                    verify_input_array,
-                    cache=cache,
-                    return_hidden=True,
-                    hidden_variant=base_hidden_variant,
-                )
-        elapsed_verify_forward = time.perf_counter() - started_forward
+                else:
+                    verify_logits, verify_hidden = rt.forward_ar(
+                        mx.array([verify_input]),
+                        cache=cache,
+                        return_hidden=True,
+                        hidden_variant=base_hidden_variant,
+                    )
+            elapsed_verify_forward = time.perf_counter() - started_forward
         verify_forward_time += elapsed_verify_forward
         _add_timing(event, "verify_forward", elapsed_verify_forward)
         target_distribution_batch = None
@@ -8378,12 +9278,18 @@ def generate_mtpk(
         # committed window must stop at the grammar's legal prefix. One
         # stateless validate call per cycle; the matcher itself only advances
         # through committed tokens at the top-of-cycle sync.
+        committable_draft_count = min(
+            len(draft_tokens),
+            max(0, max_tokens - len(tokens)),
+        )
         constraint_legal_prefix = (
             constraint.validate_prefix(list(draft_tokens))
             if constraint is not None
             else None
         )
-        for depth_index, draft_token in enumerate(draft_tokens):
+        for depth_index, draft_token in enumerate(
+            draft_tokens[:committable_draft_count]
+        ):
             target_logits_for_draft = verify_logits[:, depth_index, :]
             if _steer_active:
                 _row_guard_overlay = _steer_overlay(
@@ -8650,7 +9556,10 @@ def generate_mtpk(
                 event["online_hidden_corrector_updates"] = update_events
                 _add_timing(event, "online_hidden_corrector_update", elapsed_online)
 
-        if accepted_count == len(draft_tokens):
+        if (
+            accepted_count == len(draft_tokens)
+            and committable_draft_count == len(draft_tokens)
+        ):
             committed = [primary] + draft_tokens
             tokens.extend(draft_tokens)
             if _mtp_history_uses_committed_cache(mtp_history_policy):
@@ -8912,7 +9821,15 @@ def generate_mtpk(
         capture_commit_detach_components = capture_commit_detach_due(
             cache_committed_token_count
         )
-        if (
+        if _request_state is not None:
+            started_commit = time.perf_counter()
+            cache = verify_result.commit_prefix(committed_prefix_len)
+            _request_state.target_cache = cache
+            elapsed_commit = time.perf_counter() - started_commit
+            capture_commit_time += elapsed_commit
+            _add_timing(event, "capture_commit", elapsed_commit)
+            committed_from_capture = True
+        elif (
             verify_strategy in {"capture_commit", "graphbank_capture_commit"}
             and captures is not None
         ):
@@ -9128,20 +10045,75 @@ def generate_mtpk(
                 [pending_token],
             )
             commit_time += time.perf_counter() - commit_started
-        commit_started = time.perf_counter()
-        with attention_phase("decode_verify"):
-            commit_logits, commit_hidden = rt.forward_ar(
-                mx.array([[pending_token]]),
-                cache=cache,
-                return_hidden=True,
-                hidden_variant=base_hidden_variant,
+        if _request_state is not None:
+            if compiled_verify_bank is not None:
+                final_execution = _MTPK2VerifyExecution(
+                    route="capture_bank",
+                    target=compiled_verify_bank,
+                    hidden_variant=base_hidden_variant,
+                    capture_backend=verify_core_backend,
+                    commit_route=_request_state.width1_commit_route,
+                )
+            elif graphbank is not None:
+                final_execution = _MTPK2VerifyExecution(
+                    route="capture_bank",
+                    target=graphbank,
+                    hidden_variant=base_hidden_variant,
+                    capture_backend=verify_core_backend,
+                    commit_route=_request_state.width1_commit_route,
+                )
+            else:
+                final_execution = _MTPK2VerifyExecution(
+                    route="capture",
+                    target=None,
+                    hidden_variant=base_hidden_variant,
+                    capture_backend=verify_core_backend,
+                    commit_route=_request_state.width1_commit_route,
+                )
+            final_result = yield MTPK2VerifyTicket(
+                request_id=_request_id,
+                input_ids=mx.array(
+                    [[pending_token, pending_token, pending_token]]
+                ),
+                request_cache=cache,
+                draft_distributions=(None, None),
+                acceptance_context=MTPK2AcceptanceContext(
+                    verify_strategy=verify_strategy,
+                    verify_core=verify_core_backend,
+                    hidden_variant=base_hidden_variant,
+                    purpose="final_commit",
+                    event=MappingProxyType({"purpose": "final_commit"}),
+                    execution=final_execution,
+                ),
             )
+            commit_started = time.perf_counter()
+            cache = final_result.commit_prefix(1)
+            elapsed_commit_install = time.perf_counter() - commit_started
+            _request_state.target_cache = cache
+            commit_logits = final_result.logits[:, 0, :]
+            commit_hidden = final_result.hidden[:, 0:1, :]
+            elapsed_commit_forward = float(final_result.forward_elapsed_s or 0.0)
+            elapsed_final_commit = (
+                elapsed_commit_forward + elapsed_commit_install
+            )
+        else:
+            commit_started = time.perf_counter()
+            with attention_phase("decode_verify"):
+                commit_logits, commit_hidden = rt.forward_ar(
+                    mx.array([[pending_token]]),
+                    cache=cache,
+                    return_hidden=True,
+                    hidden_variant=base_hidden_variant,
+                )
+            elapsed_commit_forward = time.perf_counter() - commit_started
+            elapsed_final_commit = elapsed_commit_forward
+        commit_eval_started = time.perf_counter()
         _eval(commit_logits, commit_hidden)
-        elapsed_commit_forward = time.perf_counter() - commit_started
-        target_time += elapsed_commit_forward
-        commit_time += elapsed_commit_forward
+        elapsed_commit_eval = time.perf_counter() - commit_eval_started
+        target_time += elapsed_commit_forward + elapsed_commit_eval
+        commit_time += elapsed_final_commit + elapsed_commit_eval
         logits, hidden = own_live_logits_hidden(
-            commit_logits[:, -1, :],
+            commit_logits[:, -1, :] if commit_logits.ndim == 3 else commit_logits,
             commit_hidden[:, -1:, :],
         )
         pending_primary = None
@@ -9163,7 +10135,7 @@ def generate_mtpk(
         a3b_target_prefix_route.demote()
     elif compiled_verify_bank is not None:
         compiled_verify_report = compiled_verify_bank.to_dict()
-        if _env_truthy("MTPLX_COMPILED_VERIFY_STATS"):
+        if _compiled_verify_stats_enabled():
             try:
                 print(
                     "[mtplx] compiled-verify stats "
@@ -9436,6 +10408,10 @@ def generate_mtpk(
         events=events,
     )
     _attach_runtime_diagnostics(stats, rt, counter_start)
+    if _request_state is not None:
+        _request_state.target_cache = cache
+        _request_state.mtp_cache = mtp_history_cache
+        _request_state.stats = stats
     return GenerationOutput(
         tokens=tokens,
         text=_decode(rt.tokenizer, _strip_terminal_stop(tokens, stop_token_ids)),
@@ -9443,6 +10419,559 @@ def generate_mtpk(
         final_state=final_state,
         finish_reason=finish_reason,
     )
+
+
+def _validate_mtpk2_request_contract(
+    rt: MTPLXRuntime,
+    kwargs: Mapping[str, Any],
+    *,
+    construction_lane: Any | None = None,
+) -> Any:
+    if not rt.mtp_enabled:
+        raise RuntimeError("resumable K2 construction requires MTP enabled")
+    lane = (
+        construction_lane
+        if construction_lane is not None
+        else getattr(rt, "qwen27b_k2_dual_lane", None)
+    )
+    if lane is None:
+        raise RuntimeError(
+            "resumable K2 construction requires installed "
+            "rt.qwen27b_k2_dual_lane"
+        )
+    exact_values = (
+        ("lane.backend_id", getattr(lane, "backend_id", None), "qwen3_next"),
+        ("lane.depth", getattr(lane, "depth", None), 2),
+        ("lane.hidden_variant", getattr(lane, "hidden_variant", None), "post_norm"),
+        (
+            "lane.verify_strategy",
+            getattr(lane, "verify_strategy", None),
+            "capture_commit",
+        ),
+        (
+            "lane.verify_core",
+            getattr(lane, "verify_core", None),
+            "linear-gdn-from-conv-tape",
+        ),
+        ("lane.max_width", getattr(lane, "max_width", None), 2),
+        ("speculative_depth", int(kwargs.get("speculative_depth") or 0), 2),
+        (
+            "base_hidden_variant",
+            _resolve_runtime_base_hidden_variant(
+                rt,
+                kwargs.get("base_hidden_variant"),
+            ),
+            "post_norm",
+        ),
+        (
+            "mtp_hidden_variant",
+            _resolve_runtime_mtp_hidden_variant(
+                rt,
+                kwargs.get("mtp_hidden_variant"),
+            ),
+            "post_norm",
+        ),
+        ("verify_strategy", kwargs.get("verify_strategy", "batched"), "capture_commit"),
+        (
+            "verify_core",
+            kwargs.get("verify_core", "stock"),
+            "linear-gdn-from-conv-tape",
+        ),
+        ("draft_core", kwargs.get("draft_core", "stock"), "stock"),
+        (
+            "mtp_cache_policy",
+            kwargs.get("mtp_cache_policy", "persistent"),
+            "persistent",
+        ),
+        (
+            "mtp_history_policy",
+            kwargs.get("mtp_history_policy", "cycle"),
+            "committed",
+        ),
+    )
+    for name, observed, expected in exact_values:
+        if observed != expected:
+            raise RuntimeError(
+                "resumable K2 construction requires "
+                f"{name}={expected!r}, got {observed!r}"
+            )
+    if not callable(getattr(lane, "capture_commit_for", None)):
+        raise RuntimeError(
+            "resumable K2 construction requires lane.capture_commit_for"
+        )
+    return lane
+
+
+def _snapshot_truthy(environment: Mapping[str, str], name: str) -> bool:
+    return (environment.get(name, "") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _bind_mtpk2_target_prefill_cache_factory(
+    rt: MTPLXRuntime,
+    *,
+    environment: Mapping[str, str],
+    sustained_prefill_layout: str,
+) -> Callable[[], list[Any]]:
+    """Install the fixed request's cache route without process-global env edits."""
+
+    contiguous_prefill = sustained_prefill_layout in {
+        "contiguous_dense_decode",
+        "contiguous_then_repage",
+    }
+    paged_attention_requested = _snapshot_truthy(
+        environment,
+        "MTPLX_VLLM_METAL_PAGED_ATTN",
+    )
+    if (
+        sustained_prefill_layout == "contiguous_then_repage"
+        and paged_attention_requested
+    ):
+        raise RuntimeError(
+            "resumable K2 construction with contiguous_then_repage requires "
+            "MTPLX_VLLM_METAL_PAGED_ATTN=0; paged target attention reads "
+            "ambient routing options during decode execution"
+        )
+    owned_attention_raw = (
+        environment.get("MTPLX_OWNED_ATTN_KV", "") or ""
+    ).strip().lower().replace("-", "_")
+    attention_cache_requested = (
+        paged_attention_requested
+        or owned_attention_raw
+        in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "tail",
+            "tail_owned",
+            "block",
+            "block_owned",
+        }
+        or _snapshot_truthy(environment, "MTPLX_BLOCK_OWNED_ATTN_KV")
+    )
+    if attention_cache_requested and not contiguous_prefill:
+        raise RuntimeError(
+            "resumable K2 construction requires a contiguous sustained-prefill "
+            "layout when an optimized attention cache is enabled"
+        )
+
+    inner = getattr(rt.model, "language_model", rt.model)
+    make_cache = inner.make_cache
+    recurrent_raw = (
+        environment.get("MTPLX_OWNED_RECURRENT_STATE", "") or ""
+    ).strip().lower().replace("-", "_")
+    owned_recurrent = recurrent_raw in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "persistent",
+        "persistent_eval",
+    }
+    recurrent_mode = (
+        environment.get("MTPLX_OWNED_RECURRENT_STATE_MODE")
+        or "persistent_eval"
+    )
+    if not owned_recurrent:
+        return make_cache
+
+    from .cache_state import install_owned_recurrent_state_cache
+
+    def make_owned_recurrent_cache() -> list[Any]:
+        cache = make_cache()
+        install_owned_recurrent_state_cache(cache, mode=recurrent_mode)
+        return cache
+
+    return make_owned_recurrent_cache
+
+
+def _bind_mtpk2_mtp_cache_factory(
+    rt: MTPLXRuntime,
+    *,
+    environment: Mapping[str, str],
+) -> Callable[[], Any]:
+    if _snapshot_truthy(environment, "MTPLX_VLLM_METAL_PAGED_MTP_ATTN"):
+        raise RuntimeError(
+            "resumable K2 construction requires "
+            "MTPLX_VLLM_METAL_PAGED_MTP_ATTN=0; paged MTP attention reads "
+            "ambient routing options during draft execution"
+        )
+    make_cache = rt.model.make_mtp_cache
+    count = rt._count
+
+    def make_mtp_cache() -> Any:
+        count("make_mtp_cache_calls")
+        return make_cache()
+
+    return make_mtp_cache
+
+
+def _make_mtpk2_request_config(
+    rt: MTPLXRuntime,
+    prompt_tokens: int,
+    *,
+    environment: Mapping[str, str],
+    loop_guard_config: Any,
+) -> MTPK2RequestConfig:
+    compiled_raw = (
+        _generation_env_get("MTPLX_COMPILED_VERIFY") or ""
+    ).strip().lower()
+    if compiled_raw in {"", "0", "false", "no", "off"}:
+        frozen_compiled_verify_mode = "off"
+    elif compiled_raw in {"parity", "parity2"}:
+        frozen_compiled_verify_mode = compiled_raw
+    else:
+        frozen_compiled_verify_mode = "on"
+    state_rebase_every = max(
+        0,
+        _env_int("MTPLX_STATE_REBASE_EVERY", 0),
+    )
+    sustained_prefill_layout = _sustained_prefill_layout(
+        context_tokens=prompt_tokens
+    )
+    target_prefill_cache_factory = _bind_mtpk2_target_prefill_cache_factory(
+        rt,
+        environment=environment,
+        sustained_prefill_layout=sustained_prefill_layout,
+    )
+    if sustained_prefill_layout == "contiguous_then_repage":
+        from .cache_state import bind_tail_owned_attention_kv_cache_route
+
+        target_prefill_repage_route = (
+            bind_tail_owned_attention_kv_cache_route(environment)
+        )
+    else:
+        def target_prefill_repage_route(_cache: list[Any]) -> None:
+            return None
+    return MTPK2RequestConfig(
+        prompt_tokens=int(prompt_tokens),
+        prefill_chunk_tokens=1024,
+        environment=environment,
+        compiled_verify_mode=frozen_compiled_verify_mode,
+        compiled_verify_max_len=max(
+            1,
+            _env_int("MTPLX_COMPILED_VERIFY_MAX_LEN", 6),
+        ),
+        loop_guard_config=loop_guard_config,
+        target_prefill_cache_factory=target_prefill_cache_factory,
+        target_prefill_repage_route=target_prefill_repage_route,
+        mtp_cache_factory=_bind_mtpk2_mtp_cache_factory(
+            rt,
+            environment=environment,
+        ),
+        sustained_prefill_enabled=_sustained_prefill_enabled(),
+        state_rebase_every=state_rebase_every,
+        sustained_prefill_layout=sustained_prefill_layout,
+        defer_verify_hidden_eval=_defer_verify_hidden_eval_enabled(
+            context_tokens=prompt_tokens
+        ),
+        clear_cache_every=_clear_cache_every(context_tokens=prompt_tokens),
+        skip_verify_snapshot=_env_truthy("MTPLX_SKIP_VERIFY_SNAPSHOT"),
+        omit_speculative_bonus=_env_truthy("MTPLX_OMIT_SPECULATIVE_BONUS"),
+        batch_target_arrays=_batch_target_arrays_enabled(),
+        batch_target_distributions=_batch_target_distributions_enabled(),
+        compiled_verify_stats=_env_truthy("MTPLX_COMPILED_VERIFY_STATS"),
+    )
+
+
+def make_mtpk2_request_state(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    request_id: str | None = None,
+    _resolved_depth: _ResolvedMTPDepth | None = None,
+    _context_copy_requested: bool | None = None,
+    **kwargs: Any,
+) -> MTPK2RequestState:
+    """Freeze one depth-two request's chunk geometry and mutable state."""
+
+    return make_mtpk2_request_state_from_environment(
+        rt,
+        prompt_ids,
+        request_id=request_id,
+        environment=os.environ,
+        _resolved_depth=_resolved_depth,
+        _context_copy_requested=_context_copy_requested,
+        **kwargs,
+    )
+
+
+def make_mtpk2_request_state_from_environment(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    environment: Mapping[str, str],
+    request_id: str | None = None,
+    _resolved_depth: _ResolvedMTPDepth | None = None,
+    _context_copy_requested: bool | None = None,
+    _construction_lane: Any | None = None,
+    **kwargs: Any,
+) -> MTPK2RequestState:
+    """Construct one K2 request from an immutable caller-owned environment."""
+
+    frozen_environment = MappingProxyType(
+        {
+            str(name): str(value)
+            for name, value in environment.items()
+        }
+    )
+    token = _GENERATION_ENV_SNAPSHOT.set(frozen_environment)
+    try:
+        return _make_mtpk2_request_state_from_snapshot(
+            rt,
+            prompt_ids,
+            request_id=request_id,
+            _resolved_depth=_resolved_depth,
+            _context_copy_requested=_context_copy_requested,
+            _construction_lane=_construction_lane,
+            _environment=frozen_environment,
+            **kwargs,
+        )
+    finally:
+        _GENERATION_ENV_SNAPSHOT.reset(token)
+
+
+def _make_mtpk2_request_state_from_snapshot(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    request_id: str | None,
+    _resolved_depth: _ResolvedMTPDepth | None,
+    _context_copy_requested: bool | None,
+    _construction_lane: Any | None,
+    _environment: Mapping[str, str],
+    **kwargs: Any,
+) -> MTPK2RequestState:
+    frozen_prompt_ids = list(prompt_ids)
+    lane = _validate_mtpk2_request_contract(
+        rt,
+        kwargs,
+        construction_lane=_construction_lane,
+    )
+    speculative_depth = int(kwargs.get("speculative_depth") or 0)
+    resolved_depth = _resolved_depth or _resolve_mtpk_depth(
+        frozen_prompt_ids,
+        speculative_depth=speculative_depth,
+        min_speculative_depth=int(
+            kwargs.get("min_speculative_depth")
+            if kwargs.get("min_speculative_depth") is not None
+            else 1
+        ),
+    )
+    if resolved_depth.effective_depth != 2:
+        raise RuntimeError(
+            "resumable K2 construction requires effective speculative depth 2; "
+            f"resolved depth {resolved_depth.effective_depth} before publication"
+        )
+    if kwargs.get("adaptive_policy") is not None:
+        raise RuntimeError(
+            "resumable K2 construction requires adaptive_policy=None"
+        )
+    if kwargs.get("draft_margin_threshold") is not None:
+        raise RuntimeError(
+            "resumable K2 construction requires draft_margin_threshold=None"
+        )
+    frozen_context_copy_requested = (
+        str(_environment.get("MTPLX_CONTEXT_COPY") or "").strip().lower()
+        not in {"0", "false", "off"}
+        if _context_copy_requested is None
+        else bool(_context_copy_requested)
+    )
+    state_rebase_every = max(0, _env_int("MTPLX_STATE_REBASE_EVERY", 0))
+    if state_rebase_every:
+        raise RuntimeError(
+            "resumable K2 construction requires MTPLX_STATE_REBASE_EVERY=0; "
+            "nested decode-state prefill is not a schedulable request boundary"
+        )
+    frozen_chunk_tokens = 1024
+    if (
+        not _sustained_prefill_enabled()
+        and len(frozen_prompt_ids) > frozen_chunk_tokens
+    ):
+        raise RuntimeError(
+            "resumable K2 construction requires sustained prefill when the "
+            "prompt exceeds the frozen prefill chunk size"
+        )
+    resolved_request_id = str(
+        request_id
+        or kwargs.get("session_id")
+        or f"solo-k2-{id(prompt_ids)}"
+    )
+    sampler = kwargs["sampler"]
+    draft_sampler = _env_scaled_draft_sampler(
+        sampler,
+        kwargs.get("draft_sampler"),
+    )
+    stop_token_ids = (
+        _default_stop_tokens(rt.tokenizer)
+        if kwargs.get("stop_token_ids") is None
+        else set(kwargs["stop_token_ids"])
+    )
+    kwargs["stop_token_ids"] = stop_token_ids
+    frozen_loop_guard_config = loop_guard_config_from_environment(
+        bool(kwargs.get("loop_guard")),
+        environment=_environment,
+        tokenizer=getattr(rt, "tokenizer", None),
+    )
+    request_config = _make_mtpk2_request_config(
+        rt,
+        len(frozen_prompt_ids),
+        environment=_environment,
+        loop_guard_config=frozen_loop_guard_config,
+    )
+    width1_commit_route = lane.capture_commit_for(1, 0)
+    state = MTPK2RequestState(
+        request_id=resolved_request_id,
+        _machine=None,
+        config=request_config,
+        lane=lane,
+        width1_commit_route=width1_commit_route,
+        target_cache=[],
+        mtp_cache=None,
+        tokens=[],
+        rng=np.random.default_rng(int(kwargs.get("seed") or 0)),
+        sampler=sampler,
+        draft_sampler=draft_sampler,
+        constraint=kwargs.get("constraint"),
+        stop_token_ids=stop_token_ids,
+        token_callback=kwargs.get("token_callback"),
+        prefill_callback=kwargs.get("prefill_callback"),
+        cancel_event=kwargs.get("abort_check"),
+        session_id=kwargs.get("session_id"),
+        stats=SimpleNamespace(
+            mode="mtpk",
+            prefill_chunk_size=frozen_chunk_tokens,
+        ),
+        prefill_chunk_tokens=frozen_chunk_tokens,
+        context_copy_enabled=frozen_context_copy_requested,
+        lazy_bonus_verify_requested=False,
+        lazy_bonus_verify_min_depth=2,
+    )
+    state._machine = _generate_mtpk_machine(
+        rt,
+        frozen_prompt_ids,
+        _request_id=resolved_request_id,
+        _prefill_chunk_tokens=frozen_chunk_tokens,
+        _request_state=state,
+        _resolved_depth=resolved_depth,
+        _context_copy_requested=frozen_context_copy_requested,
+        _lazy_bonus_verify_requested=False,
+        _resolved_lazy_bonus_verify_min_depth=2,
+        **kwargs,
+    )
+    return state
+
+
+def _drive_mtpk_machine_solo(rt: MTPLXRuntime, machine: Any) -> GenerationOutput:
+    try:
+        ticket = next(machine)
+        while True:
+            if isinstance(ticket, MTPK2PrefillTicket):
+                result = execute_solo_mtpk2_prefill_ticket(rt, ticket)
+            elif isinstance(ticket, MTPK2ContextCopyTicket):
+                result = execute_solo_mtpk2_context_copy_ticket(rt, ticket)
+            elif isinstance(ticket, MTPK2VerifyTicket):
+                result = execute_solo_mtpk2_verify_ticket(rt, ticket)
+            else:
+                raise TypeError(f"unknown MTPLX request ticket {type(ticket).__name__}")
+            ticket = machine.send(result)
+    except StopIteration as finished:
+        return finished.value
+
+
+def _generate_mtpk_serial_dispatch(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    kwargs: dict[str, Any],
+) -> GenerationOutput:
+    """Run the historical public API through its ordinary serial machine."""
+
+    from .context_copy import context_copy_enabled
+
+    frozen_context_copy_requested = bool(context_copy_enabled())
+    frozen_lazy_bonus_verify_requested = bool(_lazy_bonus_verify_enabled())
+    frozen_lazy_bonus_verify_min_depth = int(_lazy_bonus_verify_min_depth())
+    return _drive_mtpk_machine_solo(
+        rt,
+        _generate_mtpk_machine(
+            rt,
+            prompt_ids,
+            _context_copy_requested=frozen_context_copy_requested,
+            _lazy_bonus_verify_requested=frozen_lazy_bonus_verify_requested,
+            _resolved_lazy_bonus_verify_min_depth=(
+                frozen_lazy_bonus_verify_min_depth
+            ),
+            **kwargs,
+        ),
+    )
+
+
+def generate_mtpk(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    abort_check: Callable[[], bool] | None = None,
+    max_tokens: int,
+    sampler: SamplerConfig,
+    speculative_depth: int,
+    seed: int = 0,
+    stop_token_ids: set[int] | None = None,
+    base_hidden_variant: str | None = None,
+    mtp_hidden_variant: str | None = None,
+    mtp_cache_policy: str = "persistent",
+    mtp_history_policy: str = "cycle",
+    draft_sampler: SamplerConfig | None = None,
+    draft_margin_threshold: float | None = None,
+    min_speculative_depth: int = 1,
+    verify_strategy: VerifyStrategy = "batched",
+    verify_core: str = "stock",
+    draft_core: str = "stock",
+    mtp_corrector: Any | None = None,
+    adaptive_policy: AdaptiveDepthPolicy | ExpectedValueDepthPolicy | None = None,
+    online_hidden_corrector_alpha: float = 0.0,
+    online_hidden_corrector_decay: float = 0.8,
+    online_hidden_corrector_warmup: int = 1,
+    online_hidden_corrector_max_feed_depth: int | None = None,
+    online_hidden_corrector_key: str = "global",
+    online_correction_cache: bool = False,
+    online_correction_cache_min_depth: int = 1,
+    online_correction_cache_key: str = "local_prefix",
+    prompt_correction_cache: bool = False,
+    prompt_correction_cache_min_depth: int = 2,
+    adapter_ensemble_q: bool = False,
+    adapter_ensemble_epsilon: float = 0.5,
+    adapter_ensemble_min_depth: int = 2,
+    mtp_topk_reranker: Any | None = None,
+    token_callback: Callable[[list[int]], None] | None = None,
+    session_bank: Any | None = None,
+    session_id: str | None = None,
+    session_restore_mode: str = "clone",
+    session_template_hash: str | None = None,
+    session_draft_head_identity: str | None = None,
+    session_policy_fingerprint: str | None = None,
+    capture_final_state: bool = False,
+    commit_prompt_state_to_bank: bool = False,
+    commit_prompt_state_keep_live_ref: bool = False,
+    trace_label: str | None = None,
+    trace_metadata: dict[str, Any] | None = None,
+    prefill_callback: Callable[[dict[str, Any]], None] | None = None,
+    repetition_stop: bool = False,
+    loop_guard: bool = False,
+    thinking_guard: ThinkingGuardConfig | None = None,
+    vision_splice: Any | None = None,
+    constraint: Any | None = None,
+) -> GenerationOutput:
+    """Generate with the historical explicit API and a construction-time route."""
+
+    arguments = dict(locals())
+    arguments.pop("rt")
+    arguments.pop("prompt_ids")
+    return _generate_mtpk_serial_dispatch(rt, prompt_ids, arguments)
 
 
 def generate_mtpa(
@@ -9517,13 +11046,19 @@ def generate_mtpa(
         cycle_depth = min(planned_depth, max_tokens - len(tokens))
         draft_tokens: list[int] = []
         draft_probs: list[np.ndarray | SparseDistribution | None] = []
-        mtp_cache = rt.make_mtp_cache() if mtp_cache_policy == "persistent" else None
+        mtp_cache = (
+            _make_generation_mtp_cache(rt)
+            if mtp_cache_policy == "persistent"
+            else None
+        )
         draft_hidden = hidden
         next_token = primary
 
         for depth_index in range(cycle_depth):
             step_mtp_cache = (
-                mtp_cache if mtp_cache_policy == "persistent" else rt.make_mtp_cache()
+                mtp_cache
+                if mtp_cache_policy == "persistent"
+                else _make_generation_mtp_cache(rt)
             )
             started = time.perf_counter()
             draft_logits, draft_hidden_next = rt.draft_mtp(

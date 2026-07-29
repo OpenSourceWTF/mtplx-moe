@@ -493,6 +493,25 @@ def test_owned_recurrent_state_cache_reuses_fixed_buffers():
     assert owned.owner_updates == 2
 
 
+def test_owned_recurrent_state_cache_merge_extract_owns_each_row():
+    first = OwnedRecurrentStateCache(
+        initial=[mx.ones((1, 2, 3)), mx.ones((1, 2, 3, 4))]
+    )
+    second = OwnedRecurrentStateCache(
+        initial=[mx.full((1, 2, 3), 2), mx.full((1, 2, 3, 4), 2)]
+    )
+
+    cohort = OwnedRecurrentStateCache.merge((first, second))
+    row0 = cohort.extract(0)
+    row1 = cohort.extract(1)
+    row0.state[0][:] = 9
+    mx.eval(row0.state[0], row1.state[0], cohort.state[0])
+
+    assert cohort.batch_size == 2
+    assert row1.state[0].tolist() == second.state[0].tolist()
+    assert cohort.state[0][1:2].tolist() == second.state[0].tolist()
+
+
 def test_owned_recurrent_state_cache_keeps_speculative_writes_out_of_owner_buffer():
     owned = OwnedRecurrentStateCache(size=2)
     owned.replace_state([None, mx.array([[1.0]])])

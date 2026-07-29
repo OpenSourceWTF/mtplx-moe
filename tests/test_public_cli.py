@@ -66,6 +66,39 @@ def _hy3_pull_result(path: Path, **overrides):
     return result
 
 
+def test_mtp_cohort_cli_flags_are_explicit_opt_in():
+    parser = build_parser()
+
+    normal = parser.parse_args(["start", "cli", "--dry-run"])
+    cohort = parser.parse_args(
+        [
+            "start",
+            "cli",
+            "--dry-run",
+            "--scheduler-mode",
+            "mtp_cohort_experimental",
+            "--experimental-mtp-cohorts",
+            "--max-active-requests",
+            "2",
+            "--decode-batch-max",
+            "2",
+            "--batch-wait-ms",
+            "0",
+            "--prefill-chunk-tokens",
+            "1024",
+        ]
+    )
+
+    assert normal.scheduler_mode == "serial"
+    assert normal.experimental_mtp_cohorts is False
+    assert cohort.scheduler_mode == "mtp_cohort_experimental"
+    assert cohort.experimental_mtp_cohorts is True
+    assert cohort.max_active_requests == 2
+    assert cohort.decode_batch_max == 2
+    assert cohort.batch_wait_ms == 0
+    assert cohort.prefill_chunk_tokens == 1024
+
+
 def _pin_big_apple_silicon(monkeypatch):
     """Pin the hardware probe to a big newer-generation machine.
 

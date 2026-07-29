@@ -50,6 +50,7 @@ live outside these spans and stay fully guarded.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -60,7 +61,9 @@ from .runtime_options import env_bool
 __all__ = [
     "LoopGuard",
     "LoopGuardConfig",
+    "loop_guard_enabled_from_env",
     "loop_guard_config_from_env",
+    "loop_guard_config_from_environment",
     "tool_call_marker_ids",
 ]
 
@@ -103,26 +106,6 @@ class LoopGuardConfig:
     mask_close_token: int | None = None
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
-
-
 def tool_call_marker_ids(tokenizer: Any) -> tuple[int, int] | None:
     """Resolve single-token ``<tool_call>``/``</tool_call>`` ids, else None.
 
@@ -156,7 +139,11 @@ def tool_call_marker_ids(tokenizer: Any) -> tuple[int, int] | None:
     return open_id, close_id
 
 
-def loop_guard_enabled_from_env(*, default: bool) -> bool:
+def loop_guard_enabled_from_env(
+    *,
+    default: bool,
+    environment: Mapping[str, str] | None = None,
+) -> bool:
     """The single parse of ``MTPLX_LOOP_GUARD``.
 
     ``default`` is the caller's product default (OFF on the serve path);
@@ -166,7 +153,77 @@ def loop_guard_enabled_from_env(*, default: bool) -> bool:
     report the guard disabled while this module built it enabled.
     """
 
-    return env_bool("MTPLX_LOOP_GUARD", default=default)
+    return env_bool("MTPLX_LOOP_GUARD", default=default, env=environment)
+
+
+def _loop_guard_config(
+    enabled: bool,
+    *,
+    environment: Mapping[str, str],
+    tokenizer: Any = None,
+) -> LoopGuardConfig:
+    def env_int(name: str, default: int) -> int:
+        raw_value = environment.get(name)
+        if raw_value is None or raw_value.strip() == "":
+            return default
+        try:
+            return int(raw_value)
+        except ValueError:
+            return default
+
+    def env_float(name: str, default: float) -> float:
+        raw_value = environment.get(name)
+        if raw_value is None or raw_value.strip() == "":
+            return default
+        try:
+            return float(raw_value)
+        except ValueError:
+            return default
+
+    enabled = loop_guard_enabled_from_env(
+        default=enabled,
+        environment=environment,
+    )
+    if not enabled:
+        return LoopGuardConfig(enabled=False)
+    markers: tuple[int, int] | None = None
+    mask_raw = environment.get(
+        "MTPLX_LOOP_GUARD_MASK_TOOL_CALLS", ""
+    ).strip().lower()
+    if mask_raw not in {"0", "false", "off", "no"}:
+        markers = tool_call_marker_ids(tokenizer)
+    return LoopGuardConfig(
+        enabled=True,
+        scan_interval=max(1, env_int("MTPLX_LOOP_GUARD_SCAN_INTERVAL", 16)),
+        window=max(64, env_int("MTPLX_LOOP_GUARD_WINDOW", 2048)),
+        ngram=max(4, env_int("MTPLX_LOOP_GUARD_NGRAM", 12)),
+        arm_occurrences=max(2, env_int("MTPLX_LOOP_GUARD_ARM_OCCURRENCES", 4)),
+        min_tokens=max(0, env_int("MTPLX_LOOP_GUARD_MIN_TOKENS", 256)),
+        allowed_length=max(4, env_int("MTPLX_LOOP_GUARD_ALLOWED_LENGTH", 12)),
+        min_distinct=max(1, env_int("MTPLX_LOOP_GUARD_MIN_DISTINCT", 4)),
+        penalty=max(0.0, env_float("MTPLX_LOOP_GUARD_PENALTY", 3.0)),
+        growth=max(1.0, env_float("MTPLX_LOOP_GUARD_GROWTH", 1.3)),
+        penalty_cap=max(0.0, env_float("MTPLX_LOOP_GUARD_PENALTY_CAP", 16.0)),
+        max_candidates=max(1, env_int("MTPLX_LOOP_GUARD_MAX_CANDIDATES", 32)),
+        disarm_after=max(16, env_int("MTPLX_LOOP_GUARD_DISARM_AFTER", 256)),
+        mask_open_token=markers[0] if markers else None,
+        mask_close_token=markers[1] if markers else None,
+    )
+
+
+def loop_guard_config_from_environment(
+    enabled: bool,
+    *,
+    environment: Mapping[str, str],
+    tokenizer: Any = None,
+) -> LoopGuardConfig:
+    """Build one guard config exclusively from the provided environment."""
+
+    return _loop_guard_config(
+        enabled,
+        environment=environment,
+        tokenizer=tokenizer,
+    )
 
 
 def loop_guard_config_from_env(
@@ -174,36 +231,12 @@ def loop_guard_config_from_env(
     *,
     tokenizer: Any = None,
 ) -> LoopGuardConfig:
-    """Build the guard config; ``enabled`` is the caller's product default.
+    """Build the guard config from the current process environment."""
 
-    ``MTPLX_LOOP_GUARD`` overrides in either direction ("0" kills the guard,
-    "1" forces it on); the remaining knobs tune the detector/steering.
-    ``tokenizer`` (when provided) resolves the tool-call marker tokens for
-    span masking; ``MTPLX_LOOP_GUARD_MASK_TOOL_CALLS=0`` turns masking off.
-    """
-    enabled = loop_guard_enabled_from_env(default=enabled)
-    if not enabled:
-        return LoopGuardConfig(enabled=False)
-    markers: tuple[int, int] | None = None
-    mask_raw = os.environ.get("MTPLX_LOOP_GUARD_MASK_TOOL_CALLS", "").strip().lower()
-    if mask_raw not in {"0", "false", "off", "no"}:
-        markers = tool_call_marker_ids(tokenizer)
-    return LoopGuardConfig(
-        enabled=True,
-        scan_interval=max(1, _env_int("MTPLX_LOOP_GUARD_SCAN_INTERVAL", 16)),
-        window=max(64, _env_int("MTPLX_LOOP_GUARD_WINDOW", 2048)),
-        ngram=max(4, _env_int("MTPLX_LOOP_GUARD_NGRAM", 12)),
-        arm_occurrences=max(2, _env_int("MTPLX_LOOP_GUARD_ARM_OCCURRENCES", 4)),
-        min_tokens=max(0, _env_int("MTPLX_LOOP_GUARD_MIN_TOKENS", 256)),
-        allowed_length=max(4, _env_int("MTPLX_LOOP_GUARD_ALLOWED_LENGTH", 12)),
-        min_distinct=max(1, _env_int("MTPLX_LOOP_GUARD_MIN_DISTINCT", 4)),
-        penalty=max(0.0, _env_float("MTPLX_LOOP_GUARD_PENALTY", 3.0)),
-        growth=max(1.0, _env_float("MTPLX_LOOP_GUARD_GROWTH", 1.3)),
-        penalty_cap=max(0.0, _env_float("MTPLX_LOOP_GUARD_PENALTY_CAP", 16.0)),
-        max_candidates=max(1, _env_int("MTPLX_LOOP_GUARD_MAX_CANDIDATES", 32)),
-        disarm_after=max(16, _env_int("MTPLX_LOOP_GUARD_DISARM_AFTER", 256)),
-        mask_open_token=markers[0] if markers else None,
-        mask_close_token=markers[1] if markers else None,
+    return _loop_guard_config(
+        enabled,
+        environment=os.environ,
+        tokenizer=tokenizer,
     )
 
 

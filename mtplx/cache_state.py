@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 import time
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from .attention_context import current_attention_phase
@@ -432,8 +433,14 @@ class BlockOwnedKVCache(TailOwnedKVCache):
         return total
 
 
-def _vllm_metal_reference_path() -> Path:
-    override = os.environ.get("MTPLX_VLLM_METAL_REPO")
+def _vllm_metal_reference_path(
+    environment: Mapping[str, str] | None = None,
+) -> Path:
+    override = (
+        environment.get("MTPLX_VLLM_METAL_REPO")
+        if environment is not None
+        else os.environ.get("MTPLX_VLLM_METAL_REPO")
+    )
     if override:
         return Path(override).expanduser()
     return Path(__file__).resolve().parents[1] / "REFERENCES:TOOLS" / "vllm-metal"
@@ -681,24 +688,40 @@ def _paged_attention_requires_external_ops(
     *,
     turboquant_config: Any | None = None,
     kv_quant_config: Any | None = None,
+    attention_impl: str | None = None,
+    partitioned_attention_enabled: bool | None = None,
 ) -> bool:
     if turboquant_config is not None:
         return True
     if kv_quant_config is not None:
         return False
-    impl = _paged_attention_impl_from_env()
+    impl = (
+        _paged_attention_impl_from_env()
+        if attention_impl is None
+        else str(attention_impl).strip().lower().replace("-", "_")
+    )
     if impl in {"fast_sdpa_gather", "sdpa_gather", "exact_gather"}:
         return False
     if impl == "sdpa_2pass_paged":
         return False
     if impl == "mlx_vector_paged":
-        return _env_truthy("MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN")
+        return (
+            _env_truthy("MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN")
+            if partitioned_attention_enabled is None
+            else bool(partitioned_attention_enabled)
+        )
     return True
 
 
-def _load_vllm_metal_ops():
+def _load_vllm_metal_ops(
+    environment: Mapping[str, str] | None = None,
+):
     errors: list[str] = []
-    override = os.environ.get("MTPLX_VLLM_METAL_REPO", "").strip()
+    override = (
+        environment.get("MTPLX_VLLM_METAL_REPO", "")
+        if environment is not None
+        else os.environ.get("MTPLX_VLLM_METAL_REPO", "")
+    ).strip()
     if override:
         repo = Path(override).expanduser()
         if not repo.exists():
@@ -724,7 +747,7 @@ def _load_vllm_metal_ops():
     except Exception as exc:
         errors.append(f"vendored vllm_metal.metal: {exc}")
 
-    repo = _vllm_metal_reference_path()
+    repo = _vllm_metal_reference_path(environment)
     if repo.exists():
         repo_text = str(repo)
         if repo_text not in sys.path:
@@ -810,6 +833,7 @@ class VllmMetalPagedKVCache:
         offset: int = 0,
         turboquant_config: Any | None = None,
         kv_quant_config: Any | None = None,
+        external_ops_validated: bool = False,
     ) -> None:
         self.block_size = int(block_size)
         self.num_blocks = int(num_blocks)
@@ -823,6 +847,7 @@ class VllmMetalPagedKVCache:
         self.turboquant = turboquant_config is not None
         self.kv_quant_config = kv_quant_config
         self.kv_quant = kv_quant_config is not None
+        self.external_ops_validated = bool(external_ops_validated)
         self._shape: tuple[int, int, int] | None = None
         self._dtypes: tuple[Any, Any] | None = None
         self.update_calls = 0
@@ -865,6 +890,7 @@ class VllmMetalPagedKVCache:
         num_blocks: int = 1024,
         turboquant_config: Any | None = None,
         kv_quant_config: Any | None = None,
+        external_ops_validated: bool = False,
     ) -> "VllmMetalPagedKVCache":
         return cls(
             block_size=block_size,
@@ -874,6 +900,7 @@ class VllmMetalPagedKVCache:
             offset=int(getattr(entry, "offset", 0)),
             turboquant_config=turboquant_config,
             kv_quant_config=kv_quant_config,
+            external_ops_validated=external_ops_validated,
         )
 
     @property
@@ -969,9 +996,14 @@ class VllmMetalPagedKVCache:
         # install-time path already drops turboquant_config when ops are
         # missing, but downstream callers (e.g. snapshot restore) may still
         # construct a TurboQuant cache without going through that gate.
-        if self.turboquant and _load_vllm_metal_ops_optional(
-            context="TurboQuant cache allocation"
-        ) is None:
+        if (
+            self.turboquant
+            and not self.external_ops_validated
+            and _load_vllm_metal_ops_optional(
+                context="TurboQuant cache allocation"
+            )
+            is None
+        ):
             self.turboquant = False
             self.turboquant_config = None
         if self.turboquant:
@@ -2754,6 +2786,18 @@ class OwnedRecurrentStateCache:
                 continue
             m = mask.reshape((int(mask.size),) + (1,) * (int(cur.ndim) - 1))
             self.cache[idx] = mx.where(m, mx.zeros_like(cur), cur)
+    def replace_state_lazy_owned(
+        self,
+        value: list[Any] | tuple[Any, ...],
+    ) -> None:
+        """Install independent lazy copies for aggregate commit materialization."""
+        for idx, item in enumerate(value):
+            owned = self._lazy_owned_copy(item)
+            self.cache[idx] = owned
+            self._owned_buffers[idx] = owned
+        for idx in range(len(value), len(self.cache)):
+            self.cache[idx] = None
+            self._owned_buffers[idx] = None
 
     @property
     def meta_state(self) -> tuple[str, str]:
@@ -2848,6 +2892,108 @@ class OwnedRecurrentStateCache:
         self.replace_state([cat(c, o) for c, o in zip(self.cache, other.cache)])
         self.left_padding = cat(self.left_padding, getattr(other, "left_padding", None))
         self.lengths = cat(self.lengths, getattr(other, "lengths", None))
+
+    @staticmethod
+    def _lazy_owned_copy(value: Any) -> Any:
+        if value is None:
+            return None
+        import mlx.core as mx
+
+        owned = mx.zeros(value.shape, dtype=value.dtype)
+        owned[tuple(slice(None) for _ in value.shape)] = value
+        return owned
+
+    @classmethod
+    def _from_lazy_owned_state(
+        cls,
+        state: list[Any],
+        *,
+        mode: str,
+        left_padding: Any | None,
+        lengths: Any | None,
+    ) -> "OwnedRecurrentStateCache":
+        cache = cls(
+            len(state),
+            mode=mode,
+            left_padding=left_padding,
+            lengths=lengths,
+        )
+        cache.cache = state
+        cache._owned_buffers = list(state)
+        return cache
+
+    @classmethod
+    def merge_lazy(
+        cls,
+        caches: tuple["OwnedRecurrentStateCache", ...],
+    ) -> "OwnedRecurrentStateCache":
+        """Build an owned cohort graph without inserting an evaluation barrier."""
+        if not caches:
+            raise ValueError("cannot merge an empty recurrent cache cohort")
+        import mlx.core as mx
+
+        batch_sizes = tuple(cache.batch_size for cache in caches)
+
+        def merge_values(values: tuple[Any, ...]) -> Any:
+            template = next((value for value in values if value is not None), None)
+            if template is None:
+                return None
+            owned = mx.zeros(
+                (sum(batch_sizes),) + tuple(template.shape[1:]),
+                dtype=template.dtype,
+            )
+            start = 0
+            for batch_size, value in zip(batch_sizes, values, strict=True):
+                if value is not None:
+                    owned[start : start + batch_size] = value
+                start += batch_size
+            return owned
+
+        state = [
+            merge_values(tuple(cache.cache[index] for cache in caches))
+            for index in range(len(caches[0].cache))
+        ]
+        return cls._from_lazy_owned_state(
+            state,
+            mode=caches[0].mode,
+            left_padding=merge_values(
+                tuple(cache.left_padding for cache in caches)
+            ),
+            lengths=merge_values(tuple(cache.lengths for cache in caches)),
+        )
+
+    def extract_lazy(self, idx: int) -> "OwnedRecurrentStateCache":
+        """Own one batch row lazily for one aggregate caller-side evaluation."""
+        def own_row(value: Any) -> Any:
+            if value is None:
+                return None
+            return self._lazy_owned_copy(value[idx : idx + 1])
+
+        return self._from_lazy_owned_state(
+            [own_row(value) for value in self.cache],
+            mode=self.mode,
+            left_padding=own_row(self.left_padding),
+            lengths=own_row(self.lengths),
+        )
+
+    @classmethod
+    def merge(
+        cls,
+        caches: tuple["OwnedRecurrentStateCache", ...],
+    ) -> "OwnedRecurrentStateCache":
+        """Create a batch-owned recurrent cache without borrowing request leaves."""
+        if not caches:
+            raise ValueError("cannot merge an empty recurrent cache cohort")
+        merged = cls(
+            len(caches[0].cache),
+            mode=caches[0].mode,
+            initial=list(caches[0].cache),
+            left_padding=caches[0].left_padding,
+            lengths=caches[0].lengths,
+        )
+        for cache in caches[1:]:
+            merged.extend(cache)
+        return merged
 
     def extract(self, idx: int) -> "OwnedRecurrentStateCache":
         return OwnedRecurrentStateCache(
@@ -3091,6 +3237,10 @@ def install_vllm_metal_paged_attention_kv_cache(
     num_blocks: int = 1024,
     turboquant_config: Any | None = None,
     kv_quant_config: Any | None = None,
+    attention_impl: str | None = None,
+    external_ops_required: bool | None = None,
+    external_ops_validated: bool = False,
+    turboquant_disabled_reason: str | None = None,
 ) -> dict[str, int | str]:
     """Replace stock full-attention KV caches with vLLM-Metal paged caches."""
     fallback_kv_quant_config = kv_quant_config
@@ -3110,13 +3260,21 @@ def install_vllm_metal_paged_attention_kv_cache(
         "num_blocks": int(num_blocks),
         "turboquant": int(bool(turboquant_config)),
         "kv_quant": int(bool(kv_quant_config)),
-        "attention_impl": _paged_attention_impl_from_env() or "vllm_metal",
+        "attention_impl": (
+            attention_impl
+            if attention_impl is not None
+            else _paged_attention_impl_from_env()
+        )
+        or "vllm_metal",
     }
-    external_ops_required = _paged_attention_requires_external_ops(
-        turboquant_config=turboquant_config,
-        kv_quant_config=kv_quant_config,
-    )
+    if external_ops_required is None:
+        external_ops_required = _paged_attention_requires_external_ops(
+            turboquant_config=turboquant_config,
+            kv_quant_config=kv_quant_config,
+        )
     stats["external_ops_required"] = int(external_ops_required)
+    if turboquant_disabled_reason is not None:
+        stats["turboquant_disabled_reason"] = turboquant_disabled_reason
     if turboquant_config is not None:
         stats["turboquant_k_quant"] = str(turboquant_config.key_quant)
         stats["turboquant_v_quant"] = str(turboquant_config.value_quant)
@@ -3133,7 +3291,7 @@ def install_vllm_metal_paged_attention_kv_cache(
     # the install. Instead, downgrade gracefully to the plain paged-cache
     # layout. The cache stays functional via the in-tree mlx_vector_paged /
     # sdpa_2pass_paged kernels, just without the TurboQuant compression.
-    if external_ops_required:
+    if external_ops_required and not external_ops_validated:
         try:
             _load_vllm_metal_ops()
         except RuntimeError as exc:
@@ -3174,6 +3332,7 @@ def install_vllm_metal_paged_attention_kv_cache(
             entry.turboquant = turboquant_config is not None
             entry.kv_quant_config = kv_quant_config
             entry.kv_quant = kv_quant_config is not None
+            entry.external_ops_validated = bool(external_ops_validated)
             stats["entries"] = int(stats["entries"]) + 1
             continue
         if isinstance(entry, TailOwnedKVCache):
@@ -3194,9 +3353,242 @@ def install_vllm_metal_paged_attention_kv_cache(
             num_blocks=num_blocks,
             turboquant_config=turboquant_config,
             kv_quant_config=kv_quant_config,
+            external_ops_validated=external_ops_validated,
         )
         stats["entries"] = int(stats["entries"]) + 1
     return stats
+
+
+def _mapping_truthy(environment: Mapping[str, str], name: str) -> bool:
+    return (environment.get(name, "") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _mapping_int(
+    environment: Mapping[str, str],
+    name: str,
+    default: int,
+) -> int:
+    try:
+        return int(environment.get(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _dynamic_paged_num_blocks_from_environment(
+    environment: Mapping[str, str],
+    *,
+    block_size: int,
+    configured_blocks: int,
+) -> int:
+    if not _mapping_truthy(environment, "MTPLX_DYNAMIC_PAGED_KV"):
+        return int(configured_blocks)
+    min_blocks = max(
+        int(configured_blocks),
+        _mapping_int(
+            environment,
+            "MTPLX_DYNAMIC_PAGED_KV_MIN_BLOCKS",
+            int(configured_blocks),
+        ),
+    )
+    request_tokens = max(
+        0,
+        _mapping_int(environment, "MTPLX_DYNAMIC_PAGED_KV_TOKENS", 0),
+    )
+    previous_high_water = max(
+        0,
+        _mapping_int(
+            environment,
+            "MTPLX_DYNAMIC_PAGED_KV_PREVIOUS_HIGH_WATER",
+            0,
+        ),
+    )
+    session_tokens = int((previous_high_water * 3 + 1) // 2)
+    margin = max(
+        0,
+        _mapping_int(environment, "MTPLX_DYNAMIC_PAGED_KV_MARGIN", 128),
+    )
+    needed = max(request_tokens, session_tokens) + margin
+    if needed <= margin:
+        return min_blocks
+    required_blocks = (needed + int(block_size) - 1) // int(block_size)
+    return max(min_blocks, required_blocks)
+
+
+def _bind_vllm_metal_paged_attention_kv_cache_route(
+    environment: Mapping[str, str],
+    *,
+    block_size: int,
+    configured_blocks: int,
+    turboquant_config: Any | None,
+    kv_quant_config: Any | None,
+    mode: str | None,
+) -> Callable[[list[Any]], dict[str, int | str]]:
+    num_blocks = _dynamic_paged_num_blocks_from_environment(
+        environment,
+        block_size=block_size,
+        configured_blocks=configured_blocks,
+    )
+    attention_impl = (
+        environment.get("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "") or ""
+    ).strip().lower().replace("-", "_")
+    partitioned_attention_enabled = _mapping_truthy(
+        environment,
+        "MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN",
+    )
+    fallback_kv_quant_config = kv_quant_config
+    effective_turboquant_config = turboquant_config
+    effective_kv_quant_config = (
+        None if turboquant_config is not None else kv_quant_config
+    )
+    external_ops_required = _paged_attention_requires_external_ops(
+        turboquant_config=effective_turboquant_config,
+        kv_quant_config=effective_kv_quant_config,
+        attention_impl=attention_impl,
+        partitioned_attention_enabled=partitioned_attention_enabled,
+    )
+    turboquant_disabled_reason = None
+    if external_ops_required:
+        try:
+            _load_vllm_metal_ops(environment)
+        except RuntimeError as exc:
+            if effective_turboquant_config is None:
+                raise
+            _warn_vllm_metal_ops_unavailable(
+                exc,
+                context="TurboQuant install",
+            )
+            effective_turboquant_config = None
+            effective_kv_quant_config = fallback_kv_quant_config
+            turboquant_disabled_reason = "vllm_metal_ops_unavailable"
+            external_ops_required = _paged_attention_requires_external_ops(
+                turboquant_config=None,
+                kv_quant_config=effective_kv_quant_config,
+                attention_impl=attention_impl,
+                partitioned_attention_enabled=partitioned_attention_enabled,
+            )
+
+    def install(cache: list[Any]) -> dict[str, int | str]:
+        stats = install_vllm_metal_paged_attention_kv_cache(
+            cache,
+            block_size=block_size,
+            num_blocks=num_blocks,
+            turboquant_config=effective_turboquant_config,
+            kv_quant_config=effective_kv_quant_config,
+            attention_impl=attention_impl,
+            external_ops_required=external_ops_required,
+            external_ops_validated=True,
+            turboquant_disabled_reason=turboquant_disabled_reason,
+        )
+        if mode is not None:
+            stats["mode"] = mode
+        return stats
+
+    return install
+
+
+def bind_tail_owned_attention_kv_cache_route(
+    environment: Mapping[str, str],
+) -> Callable[[list[Any]], dict[str, int | str]]:
+    """Freeze the post-prefill attention-cache installer for one request."""
+
+    if _mapping_truthy(environment, "MTPLX_VLLM_METAL_PAGED_ATTN"):
+        from .kv_quant import config_from_environment as kv_quant_config
+        from .turboquant import config_from_environment as turboquant_config
+
+        block_size = int(
+            environment.get("MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE") or "16"
+        )
+        configured_blocks = int(
+            environment.get("MTPLX_VLLM_METAL_PAGED_NUM_BLOCKS") or "1024"
+        )
+        return _bind_vllm_metal_paged_attention_kv_cache_route(
+            environment,
+            block_size=block_size,
+            configured_blocks=configured_blocks,
+            turboquant_config=turboquant_config(environment),
+            kv_quant_config=kv_quant_config(environment),
+            mode=None,
+        )
+
+    raw = environment.get("MTPLX_OWNED_ATTN_KV") or ""
+    normalized = raw.strip().lower().replace("-", "_")
+    if normalized in {"block", "block_owned"}:
+        mode = (
+            environment.get("MTPLX_OWNED_ATTN_KV_MODE")
+            or "contiguous_eval"
+        )
+        block_size = int(
+            environment.get("MTPLX_OWNED_ATTN_KV_BLOCK_SIZE")
+            or environment.get("MTPLX_OWNED_ATTN_KV_STEP")
+            or "1024"
+        )
+        return lambda cache: install_block_owned_attention_kv_cache(
+            cache,
+            mode=mode,
+            block_size=block_size,
+        )
+    if normalized in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "tail",
+        "tail_owned",
+    }:
+        mode = (
+            environment.get("MTPLX_OWNED_ATTN_KV_MODE")
+            or "contiguous_eval"
+        )
+        step_raw = environment.get("MTPLX_OWNED_ATTN_KV_STEP")
+        step = int(step_raw) if step_raw else None
+        return lambda cache: install_tail_owned_attention_kv_cache(
+            cache,
+            mode=mode,
+            step=step,
+        )
+    return lambda _cache: {
+        "enabled": 0,
+        "entries": 0,
+        "skipped": 0,
+        "mode": "disabled",
+    }
+
+
+def bind_mtp_attention_kv_cache_route(
+    environment: Mapping[str, str],
+) -> Callable[[list[Any]], dict[str, int | str]]:
+    """Freeze the native MTP attention-cache installer for one request."""
+
+    if not _mapping_truthy(environment, "MTPLX_VLLM_METAL_PAGED_MTP_ATTN"):
+        return lambda _cache: {
+            "enabled": 0,
+            "entries": 0,
+            "skipped": 0,
+            "mode": "disabled",
+        }
+    block_size = int(
+        environment.get("MTPLX_VLLM_METAL_PAGED_MTP_BLOCK_SIZE")
+        or environment.get("MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE")
+        or "16"
+    )
+    configured_blocks = int(
+        environment.get("MTPLX_VLLM_METAL_PAGED_MTP_NUM_BLOCKS")
+        or environment.get("MTPLX_VLLM_METAL_PAGED_NUM_BLOCKS")
+        or "1024"
+    )
+    return _bind_vllm_metal_paged_attention_kv_cache_route(
+        environment,
+        block_size=block_size,
+        configured_blocks=configured_blocks,
+        turboquant_config=None,
+        kv_quant_config=None,
+        mode="vllm_metal_paged_mtp",
+    )
 
 
 def configure_tail_owned_attention_kv_cache(cache: list[Any]) -> dict[str, int | str]:

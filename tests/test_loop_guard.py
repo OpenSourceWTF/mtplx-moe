@@ -1,5 +1,6 @@
 """Loop Guard: detector, DRY steering, exactness-when-disarmed, env plumbing."""
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +12,12 @@ from mtplx.fast_sampling import (
     sparse_distribution_from_mlx_logits,
 )
 from mtplx.generation import generate_ar, generate_mtpk
-from mtplx.loop_guard import LoopGuard, LoopGuardConfig, loop_guard_config_from_env
+from mtplx.loop_guard import (
+    LoopGuard,
+    LoopGuardConfig,
+    loop_guard_config_from_env,
+    loop_guard_config_from_environment,
+)
 from mtplx.mtp_patch import MTPContract
 from mtplx.runtime import MTPLXRuntime
 from mtplx.sampling import SamplerConfig, apply_penalties, distribution_from_logits
@@ -389,6 +395,27 @@ def test_env_knobs_override(monkeypatch):
     assert config.allowed_length == 32
     assert config.penalty == 3.5
     assert config.window == 4096
+
+
+def test_explicit_environment_constructor_matches_legacy_env(monkeypatch):
+    values = {
+        "MTPLX_LOOP_GUARD": "1",
+        "MTPLX_LOOP_GUARD_ALLOWED_LENGTH": "23",
+        "MTPLX_LOOP_GUARD_GROWTH": "1.7",
+        "MTPLX_LOOP_GUARD_MAX_CANDIDATES": "19",
+        "MTPLX_LOOP_GUARD_PENALTY": "4.25",
+        "MTPLX_LOOP_GUARD_SCAN_INTERVAL": "7",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+    legacy = loop_guard_config_from_env(False)
+    explicit = loop_guard_config_from_environment(
+        False,
+        environment=dict(os.environ),
+    )
+
+    assert explicit == legacy
 
 
 def test_summary_shape_is_json_primitive_only():

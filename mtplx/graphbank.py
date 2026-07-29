@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import time
 import weakref
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -671,8 +672,23 @@ def promote_kv_cache_offsets(
     return promoted, failures
 
 
-def _env_enabled(name: str, *, default: bool = False) -> bool:
-    raw = os.environ.get(name)
+def _environment_get(
+    environment: Mapping[str, str] | None,
+    name: str,
+    default: str | None = None,
+) -> str | None:
+    if environment is not None:
+        return environment.get(name, default)
+    return os.environ.get(name, default)
+
+
+def _env_enabled(
+    name: str,
+    *,
+    default: bool = False,
+    environment: Mapping[str, str] | None = None,
+) -> bool:
+    raw = _environment_get(environment, name)
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
@@ -741,8 +757,16 @@ _PREWARM_DONE = False
 _SHARED_VERIFY_STEPS: dict[tuple, tuple[Any, dict[str, Any]]] = {}
 
 
-def _prewarm_enabled() -> bool:
-    raw = str(os.environ.get("MTPLX_COMPILED_VERIFY_PREWARM", "1")).strip().lower()
+def _prewarm_enabled(
+    environment: Mapping[str, str] | None = None,
+) -> bool:
+    raw = str(
+        _environment_get(
+            environment,
+            "MTPLX_COMPILED_VERIFY_PREWARM",
+            "1",
+        )
+    ).strip().lower()
     return raw not in {"0", "false", "off", ""}
 
 
@@ -768,13 +792,16 @@ def _next_pow2(value: int) -> int:
     return 1 << (value - 1).bit_length()
 
 
-def _owned_state_env_active(name: str) -> bool:
+def _owned_state_env_active(
+    name: str,
+    environment: Mapping[str, str] | None = None,
+) -> bool:
     """True when an owned-state wrapper env is set to any enabling value.
 
     These envs carry mode names (e.g. ``persistent_eval``) rather than plain
     booleans, so anything other than empty/off counts as active.
     """
-    raw = (os.environ.get(name) or "").strip().lower()
+    raw = (_environment_get(environment, name) or "").strip().lower()
     return raw not in {"", "0", "false", "no", "off"}
 
 
@@ -814,7 +841,13 @@ def build_verify_state_spec(cache: Any) -> tuple[list[tuple[int, str, int]] | No
     return spec, None
 
 
-def _paged_kernel_bucket_eligible(entry: Any, length: int, bucket: int) -> bool:
+def _paged_kernel_bucket_eligible(
+    entry: Any,
+    length: int,
+    bucket: int,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> bool:
     """Best-effort eager mirror of sdpa_2pass_paged_tail_dynamic_offset gates.
 
     A miss here is a performance decision, not a correctness one: inside the
@@ -836,7 +869,14 @@ def _paged_kernel_bucket_eligible(entry: Any, length: int, bucket: int) -> bool:
     head_dim = int(key_cache.shape[3])
     if head_dim != int(value_cache.shape[3]) or head_dim not in {64, 96, 128, 256}:
         return False
-    max_q = int(os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q", "16") or "16")
+    max_q = int(
+        _environment_get(
+            environment,
+            "MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q",
+            "16",
+        )
+        or "16"
+    )
     if length > max_q:
         return False
     from .kernels.sdpa_2pass import _compute_blocks
@@ -911,16 +951,22 @@ def _leaf_max_abs_diff(reference: Any, candidate: Any) -> float | None:
         return float(np.nanmax(np.abs(diff)))
 
 
-def _compiled_verify_max_context() -> int:
+def _compiled_verify_max_context(
+    environment: Mapping[str, str] | None = None,
+) -> int:
     """Context ceiling for the compiled verify step (tokens). Beyond it the
     bank falls back to eager for that call. Default 6144 = the highest
     context Gate A has proven bit-exact AND the ABBA showed +4.8%; past it
     the 2026-07-02 long-form pair measured -28% with a seed-0 trajectory
     fork (boundary materialization scales with context; bucket-crossing
     numerics untested). 0 disables the ceiling (experiments only)."""
-    import os
-
-    raw = str(os.environ.get("MTPLX_COMPILED_VERIFY_MAX_CONTEXT", "6144")).strip()
+    raw = str(
+        _environment_get(
+            environment,
+            "MTPLX_COMPILED_VERIFY_MAX_CONTEXT",
+            "6144",
+        )
+    ).strip()
     try:
         value = int(raw)
     except (TypeError, ValueError):
@@ -928,14 +974,22 @@ def _compiled_verify_max_context() -> int:
     return max(0, value)
 
 
-def _compiled_verify_boundary() -> str:
-    import os
-
-    raw = str(os.environ.get("MTPLX_COMPILED_VERIFY_BOUNDARY", "both")).strip().lower()
+def _compiled_verify_boundary(
+    environment: Mapping[str, str] | None = None,
+) -> str:
+    raw = str(
+        _environment_get(
+            environment,
+            "MTPLX_COMPILED_VERIFY_BOUNDARY",
+            "both",
+        )
+    ).strip().lower()
     return raw if raw in ("both", "pre", "post", "none") else "both"
 
 
-def _compiled_verify_donation_enabled() -> bool:
+def _compiled_verify_donation_enabled(
+    environment: Mapping[str, str] | None = None,
+) -> bool:
     """A2.1 commit-first ownership handoff (speed-war Lane A2, 2026-07-06).
 
     Donation of a KV buffer into its in-graph ``slice_update`` requires the
@@ -951,13 +1005,19 @@ def _compiled_verify_donation_enabled() -> bool:
     compiled_copy_tax_correctness.py).  Default ON; env kill-switch for
     A/B and emergency revert.
     """
-    import os
-
-    raw = str(os.environ.get("MTPLX_COMPILED_VERIFY_DONATION", "1")).strip().lower()
+    raw = str(
+        _environment_get(
+            environment,
+            "MTPLX_COMPILED_VERIFY_DONATION",
+            "1",
+        )
+    ).strip().lower()
     return raw not in ("0", "false", "no", "off")
 
 
-def _compiled_verify_growth_reserve() -> int:
+def _compiled_verify_growth_reserve(
+    environment: Mapping[str, str] | None = None,
+) -> int:
     """Dense-leaf growth headroom granted at first promotion (tokens).
 
     Sized so a typical agent tool round (40-500 generated tokens) completes
@@ -966,7 +1026,13 @@ def _compiled_verify_growth_reserve() -> int:
     eager for the request remainder, which measured flat vs eager-only.
     """
 
-    raw = str(os.environ.get("MTPLX_COMPILED_VERIFY_GROWTH_RESERVE", "512")).strip()
+    raw = str(
+        _environment_get(
+            environment,
+            "MTPLX_COMPILED_VERIFY_GROWTH_RESERVE",
+            "512",
+        )
+    ).strip()
     try:
         return max(0, int(raw))
     except (TypeError, ValueError):
@@ -1007,8 +1073,14 @@ def _runtime_trunk_quant_bits(runtime: Any) -> int | None:
         return None
 
 
-def _compiled_verify_bits_gate_ok(runtime: Any) -> bool:
-    if _env_enabled("MTPLX_COMPILED_VERIFY_FORCE"):
+def _compiled_verify_bits_gate_ok(
+    runtime: Any,
+    environment: Mapping[str, str] | None = None,
+) -> bool:
+    if _env_enabled(
+        "MTPLX_COMPILED_VERIFY_FORCE",
+        environment=environment,
+    ):
         return True
     bits = _runtime_trunk_quant_bits(runtime)
     # Measured-win allowlist: 4-bit and 8-bit affine trunks engage;
@@ -1108,10 +1180,19 @@ class CompiledVerifyBank:
         capture_backend: str | None = None,
         parity: bool = False,
         parity2: bool = False,
+        environment: Mapping[str, str] | None = None,
     ) -> None:
         self.runtime = runtime
+        self.environment = environment
         if max_verify_len is None:
-            raw = os.environ.get("MTPLX_COMPILED_VERIFY_MAX_LEN", "").strip()
+            raw = (
+                _environment_get(
+                    self.environment,
+                    "MTPLX_COMPILED_VERIFY_MAX_LEN",
+                    "",
+                )
+                or ""
+            ).strip()
             max_verify_len = int(raw) if raw else 6
         self.max_verify_len = int(max_verify_len)
         self.request_max_tokens = (
@@ -1123,7 +1204,7 @@ class CompiledVerifyBank:
         self.growth_reserve_tokens = (
             self.request_max_tokens + self.speculative_headroom
             if self.request_max_tokens is not None
-            else _compiled_verify_growth_reserve()
+            else _compiled_verify_growth_reserve(self.environment)
         )
         self.capture_backend = resolve_gdn_capture_backend(capture_backend)
         self.parity = bool(parity)
@@ -1133,7 +1214,14 @@ class CompiledVerifyBank:
                 "CompiledVerifyBank: parity and parity2 are mutually exclusive"
             )
         self.permanent_eager = False
-        if not parity and not parity2 and not _compiled_verify_bits_gate_ok(runtime):
+        if (
+            not parity
+            and not parity2
+            and not _compiled_verify_bits_gate_ok(
+                runtime,
+                self.environment,
+            )
+        ):
             # Per-model promotion gate: only 4-bit affine trunks measured a
             # win; q8 (Optimized-Quality) measured -15/-18% and stays eager.
             self.permanent_eager = True
@@ -1185,7 +1273,7 @@ class CompiledVerifyBank:
             not _PREWARM_DONE
             and not self.parity
             and not self.parity2
-            and _prewarm_enabled()
+            and _prewarm_enabled(self.environment)
         ):
             # First compiled dispatch of the process (normally the startup
             # warmup generation): walk the PAGED bucket ladder once so those
@@ -1232,7 +1320,7 @@ class CompiledVerifyBank:
                     hidden_variant=hidden_variant,
                     reason="capacity_overflow",
                 )
-            max_ctx = _compiled_verify_max_context()
+            max_ctx = _compiled_verify_max_context(self.environment)
             if max_ctx and getattr(self, "_last_context_estimate", 0) > max_ctx:
                 # Context-scaled router: compiled verify is proven bit-exact
                 # and +4.8% only up to ~6k ctx; beyond, eager wins and the
@@ -1270,9 +1358,9 @@ class CompiledVerifyBank:
             # none. When 'post' is dropped, buffer safety is preserved by
             # holding the input references until the NEXT dispatch instead
             # (self._held_state_refs) — no numerics cost, no forced batch.
-            boundary = _compiled_verify_boundary()
+            boundary = _compiled_verify_boundary(self.environment)
             donate = (
-                _compiled_verify_donation_enabled()
+                _compiled_verify_donation_enabled(self.environment)
                 and not self.parity
                 and not self.parity2
                 and boundary in ("both", "post")
@@ -1427,7 +1515,7 @@ class CompiledVerifyBank:
         boundary = (
             int(max_context)
             if max_context is not None
-            else _compiled_verify_max_context()
+            else _compiled_verify_max_context(self.environment)
         )
         if boundary <= 0:
             # Router disabled: only the natural bucket is reachable cheaply;
@@ -1567,9 +1655,15 @@ class CompiledVerifyBank:
             return "length_outside_bank"
         if self.capture_backend in _UNSUPPORTED_CAPTURE_BACKENDS:
             return "unsupported_capture_backend"
-        if _owned_state_env_active("MTPLX_OWNED_ATTN_KV"):
+        if _owned_state_env_active(
+            "MTPLX_OWNED_ATTN_KV",
+            self.environment,
+        ):
             return "owned_attn_kv_env"
-        if _owned_state_env_active("MTPLX_OWNED_RECURRENT_STATE"):
+        if _owned_state_env_active(
+            "MTPLX_OWNED_RECURRENT_STATE",
+            self.environment,
+        ):
             return "owned_recurrent_state_env"
         if cache is None:
             return "no_cache"
@@ -1646,7 +1740,12 @@ class CompiledVerifyBank:
             entry = cache[idx]
             if not hasattr(entry, "capacity"):
                 continue
-            if not _paged_kernel_bucket_eligible(entry, length, bucket):
+            if not _paged_kernel_bucket_eligible(
+                entry,
+                length,
+                bucket,
+                environment=self.environment,
+            ):
                 return "paged_kernel_ineligible"
         return None
 
@@ -1740,7 +1839,11 @@ class CompiledVerifyBank:
         request's containers.
         """
 
-        if not _env_enabled("MTPLX_COMPILED_VERIFY_SHARED_TRACES", default=True):
+        if not _env_enabled(
+            "MTPLX_COMPILED_VERIFY_SHARED_TRACES",
+            default=True,
+            environment=self.environment,
+        ):
             return mx.compile(self._make_verify_step(length, hidden_variant))
         spec_sig = tuple(self._spec or [])
         global_key = (

@@ -41,6 +41,7 @@ from enum import Enum
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Condition, Event, Lock, Thread, Timer
+from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
@@ -2126,6 +2127,7 @@ class ServerState:
         # surface as user requests.
         self.dashboard = DashboardState()
         self.ar_batch_service = _BatchedARGenerationService(self)
+        _install_mtp_cohort_runtime(self)
         self.warmup_status = _run_startup_warmup(self)
 
     def begin_foreground(self) -> None:
@@ -2160,6 +2162,76 @@ def _submit_foreground_model_work(
     if executor is None:
         raise RuntimeError("state has no model work executor")
     return executor.submit(fn, *args, **kwargs)
+
+
+def _install_mtp_cohort_runtime(
+    state: Any,
+    *,
+    lane_installer: Callable[..., Any] | None = None,
+    service_factory: Callable[[Any, Any], Any] | None = None,
+) -> None:
+    """Install the exact Qwen K2 cohort route once, before measured work."""
+
+    state.mtp_cohort_lane = None
+    state.mtp_cohort_service = None
+    state.mtp_cohort_environment = None
+    config = _scheduler_config_from_args(state.args)
+    if config.mode != SchedulerMode.MTP_COHORT_EXPERIMENTAL:
+        return
+
+    effective = config.to_dict()
+    required = {
+        "max_active_requests": 2,
+        "decode_batch_max": 2,
+        "batch_wait_ms": 0.0,
+        "prefill_chunk_tokens": 1024,
+    }
+    errors: list[str] = []
+    if not bool(config.experimental_mtp_cohorts):
+        errors.append("--experimental-mtp-cohorts is required")
+    for name, expected in required.items():
+        if effective[name] != expected:
+            errors.append(f"{name}={expected:g} is required")
+    if str(getattr(state.args, "generation_mode", "mtp")) != "mtp":
+        errors.append("generation_mode=mtp is required")
+    if not bool(getattr(state.args, "load_mtp", True)):
+        errors.append("load_mtp=true is required")
+    if int(getattr(state.args, "depth", 0) or 0) != 2:
+        errors.append("depth=2 is required")
+    if str(getattr(state.args, "adaptive_policy", "none") or "none") != "none":
+        errors.append("adaptive_policy=none is required")
+    if not bool(getattr(state.runtime, "mtp_enabled", False)):
+        errors.append("the loaded runtime must have MTP enabled")
+    if errors:
+        raise ValueError(
+            "mtp_cohort_experimental has a fixed construction contract: "
+            + "; ".join(errors)
+        )
+
+    if lane_installer is None:
+        from mtplx.qwen27b_mtp_cohort import install_qwen27b_k2_dual_lane
+
+        lane_installer = install_qwen27b_k2_dual_lane
+    if service_factory is None:
+        from mtplx.server.mtp_cohort import MTPK2CohortGenerationService
+
+        service_factory = MTPK2CohortGenerationService
+
+    lane = _submit_foreground_model_work(
+        state,
+        lane_installer,
+        state.runtime,
+        backend_id=str(state.backend_descriptor.backend_id),
+        depth=2,
+        verify_strategy=str(getattr(state.args, "verify_strategy", "")),
+        verify_core=str(getattr(state.args, "verify_core", "")),
+        batch_key="startup.mtp_cohort_lane",
+    ).result()
+    service = service_factory(state, lane)
+    environment = MappingProxyType(dict(os.environ))
+    state.mtp_cohort_lane = lane
+    state.mtp_cohort_service = service
+    state.mtp_cohort_environment = environment
 
 
 def _session_bank_cold_tier_from_args(args: argparse.Namespace) -> Any | None:
@@ -11262,6 +11334,16 @@ def _long_context_mtp_depth_policy_for_request(
 ) -> tuple[int, dict[str, Any]]:
     if generation_mode == "ar" or request_depth <= 0:
         return 0, {}
+    if (
+        _scheduler_config_from_args(state.args).mode
+        == SchedulerMode.MTP_COHORT_EXPERIMENTAL
+    ):
+        return request_depth, {
+            "active": False,
+            "effective_depth": int(request_depth),
+            "reason": "fixed_mtp_cohort_depth",
+            "requested_depth": int(request_depth),
+        }
     descriptor = _backend_descriptor(state)
     if not descriptor.supports("native_adaptive_depth_policy"):
         return request_depth, {
@@ -12689,6 +12771,13 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
             ar_batch_stats = dict(ar_batch_service.snapshot())
         except Exception as exc:
             ar_batch_stats = {"error": str(exc)}
+    mtp_cohort_stats: dict[str, Any] = {}
+    mtp_cohort_service = getattr(state, "mtp_cohort_service", None)
+    if mtp_cohort_service is not None and hasattr(mtp_cohort_service, "snapshot"):
+        try:
+            mtp_cohort_stats = dict(mtp_cohort_service.snapshot())
+        except Exception as exc:
+            mtp_cohort_stats = {"error": str(exc)}
     try:
         active_requests = int(state.dashboard.in_flight.count())
     except Exception:
@@ -12702,7 +12791,18 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
         getattr(getattr(state, "runtime", None), "mtp_enabled", False)
         and str(getattr(state.args, "generation_mode", "mtp")) == "mtp"
     )
-    if active_requests <= 1 and mtp_available:
+    if config.mode == SchedulerMode.MTP_COHORT_EXPERIMENTAL:
+        cohort_active = int(mtp_cohort_stats.get("active") or 0)
+        cohort_pending = int(mtp_cohort_stats.get("pending") or 0)
+        active_requests = max(active_requests, cohort_active + cohort_pending)
+        active_width = int(mtp_cohort_stats.get("active_width") or 0)
+        active_lane = (
+            f"mtp_cohort_width_{active_width}"
+            if active_width in {1, 2}
+            else "mtp_cohort_idle"
+        )
+        mtp_disabled_reason = None
+    elif active_requests <= 1 and mtp_available:
         active_lane = "solo_mtp"
         mtp_disabled_reason = None
     elif active_requests > 1 and mtp_available:
@@ -12719,6 +12819,11 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
     else:
         active_lane = "serial_ar" if not mtp_available else "serial_mtp"
         mtp_disabled_reason = None if mtp_available else "generation_mode_ar"
+    path = (
+        "path_b"
+        if config.mode == SchedulerMode.MTP_COHORT_EXPERIMENTAL
+        else "path_a"
+    )
     return {
         "config": config.to_dict(),
         "mode": config.mode.value,
@@ -12728,7 +12833,7 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
         "active_requests": active_requests,
         "mtp_available": mtp_available,
         "mtp_disabled_reason": mtp_disabled_reason,
-        "path": "path_a",
+        "path": path,
         "path_a": {
             "solo_mtp_protected": True,
             "concurrent_strategy": "cooperative_ar_batch",
@@ -12737,9 +12842,12 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
         "path_b": {
             "experimental_mtp_cohorts": bool(config.experimental_mtp_cohorts),
             "default_enabled": False,
+            "installed": mtp_cohort_service is not None,
+            "concurrent_strategy": "native_mtp_k2_cohort",
         },
         "telemetry": scheduler_stats,
         "ar_batch": ar_batch_stats,
+        "mtp_cohort": mtp_cohort_stats,
     }
 
 
@@ -13133,9 +13241,15 @@ def _temporary_env(updates: dict[str, str | None]):
 
 def _dynamic_paged_kv_initial_new_token_budget(
     max_new_tokens: int,
+    *,
+    environment: Mapping[str, str] | None = None,
 ) -> tuple[int, int | None]:
+    source = os.environ if environment is None else environment
     raw = (
-        (os.environ.get("MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS") or "16384")
+        (
+            source.get("MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS")
+            or "16384"
+        )
         .strip()
         .lower()
     )
@@ -13154,9 +13268,13 @@ def _dynamic_paged_kv_reservation(
     prompt_tokens: int,
     max_new_tokens: int,
     mtp_depth: int,
+    environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     requested_new = max(0, int(max_new_tokens))
-    reserved_new, cap = _dynamic_paged_kv_initial_new_token_budget(requested_new)
+    reserved_new, cap = _dynamic_paged_kv_initial_new_token_budget(
+        requested_new,
+        environment=environment,
+    )
     reserved_tokens = (
         max(0, int(prompt_tokens)) + max(0, int(reserved_new)) + max(0, int(mtp_depth))
     )
@@ -13412,8 +13530,12 @@ def _clear_mlx_cache_after_request(
     *,
     reason: str,
     lock_wait_s: float = 0.0,
+    environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    raw = (os.environ.get("MTPLX_CLEAR_CACHE_AFTER_REQUEST") or "auto").strip().lower()
+    source = os.environ if environment is None else environment
+    raw = (
+        source.get("MTPLX_CLEAR_CACHE_AFTER_REQUEST") or "auto"
+    ).strip().lower()
     if raw in {"0", "false", "no", "off", "never"}:
         return {"cleared": False, "reason": "disabled"}
     lock = getattr(state, "lock", None)
@@ -13467,8 +13589,12 @@ def _auto_clear_mlx_cache_after_completed_request(
     *,
     session_id: str | None,
     request_observability: dict[str, Any] | None,
+    environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any] | None:
-    raw = (os.environ.get("MTPLX_CLEAR_CACHE_AFTER_REQUEST") or "auto").strip().lower()
+    source = os.environ if environment is None else environment
+    raw = (
+        source.get("MTPLX_CLEAR_CACHE_AFTER_REQUEST") or "auto"
+    ).strip().lower()
     if raw in {"0", "false", "no", "off", "never"}:
         return None
     request_observability = request_observability or {}
@@ -13489,7 +13615,11 @@ def _auto_clear_mlx_cache_after_completed_request(
         reason = "aime_configured"
     else:
         return None
-    return _clear_mlx_cache_after_request(state, reason=reason)
+    return _clear_mlx_cache_after_request(
+        state,
+        reason=reason,
+        environment=environment,
+    )
 
 
 def _attach_skipped_postcommit_cleanup(
@@ -15557,8 +15687,11 @@ _UNCAPPED_RESPONSE_LEASE_DISABLED_VALUES = {
 }
 
 
-def _uncapped_response_lease_tokens_from_env() -> int | None:
-    raw_value = os.environ.get("MTPLX_UNCAPPED_RESPONSE_LEASE_TOKENS")
+def _uncapped_response_lease_tokens_from_env(
+    environment: Mapping[str, str] | None = None,
+) -> int | None:
+    source = os.environ if environment is None else environment
+    raw_value = source.get("MTPLX_UNCAPPED_RESPONSE_LEASE_TOKENS")
     if raw_value is None:
         return None
     raw = raw_value.strip().lower()
@@ -15599,6 +15732,7 @@ def _generation_params(
     top_k: int | None,
     presence_penalty: float | None = None,
     frequency_penalty: float | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> tuple[int, SamplerConfig, dict[str, Any]]:
     remaining_context = max(1, int(state.context_window) - int(prompt_token_count))
     request_max_tokens = None if max_tokens is None else int(max_tokens)
@@ -15618,7 +15752,9 @@ def _generation_params(
     uncapped_response_lease_tokens: int | None = None
     uncapped_response_lease_applied = False
     if uncapped_response_requested and server_max_response_tokens is None:
-        uncapped_response_lease_tokens = _uncapped_response_lease_tokens_from_env()
+        uncapped_response_lease_tokens = _uncapped_response_lease_tokens_from_env(
+            environment
+        )
         if uncapped_response_lease_tokens is not None:
             decode_lease_tokens = max(
                 1, min(semantic_effective_max, uncapped_response_lease_tokens)
@@ -15683,16 +15819,23 @@ def _generation_params(
     )
 
 
-def _uncapped_repetition_stop_enabled(generation_limits: dict[str, Any]) -> bool:
+def _uncapped_repetition_stop_enabled(
+    generation_limits: dict[str, Any],
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> bool:
     if not bool(generation_limits.get("uncapped_response_requested")):
         return False
     if generation_limits.get("server_max_response_tokens") is not None:
         return False
-    raw = os.environ.get("MTPLX_UNCAPPED_REPETITION_STOP", "1").strip().lower()
+    source = os.environ if environment is None else environment
+    raw = source.get("MTPLX_UNCAPPED_REPETITION_STOP", "1").strip().lower()
     return raw not in _UNCAPPED_RESPONSE_LEASE_DISABLED_VALUES
 
 
-def _loop_guard_enabled() -> bool:
+def _loop_guard_enabled(
+    environment: Mapping[str, str] | None = None,
+) -> bool:
     """Loop Guard product default for the serve path: OFF (opt-in).
 
     Founder ruling 2026-07-08: no synthetic steering touches sampling by
@@ -15707,7 +15850,11 @@ def _loop_guard_enabled() -> bool:
     """
     from mtplx.loop_guard import loop_guard_enabled_from_env
 
-    return loop_guard_enabled_from_env(default=False)
+    source = os.environ if environment is None else environment
+    return loop_guard_enabled_from_env(
+        default=False,
+        environment=source,
+    )
 
 
 def _fresh_seed() -> int:
@@ -15741,7 +15888,7 @@ def _dashboard_in_flight_count(state: ServerState) -> int:
 
 def _ar_batch_mtp_fallback_reason(state: ServerState) -> str | None:
     config = _scheduler_config_from_args(state.args)
-    if config.mode not in {SchedulerMode.AR_BATCH, SchedulerMode.MTP_COHORT_EXPERIMENTAL}:
+    if config.mode != SchedulerMode.AR_BATCH:
         return None
     burst_reason = (
         "open_code_fair_burst"
@@ -15775,7 +15922,7 @@ def _use_live_ar_batch(
     effective_mode: str,
 ) -> tuple[bool, str | None]:
     config = _scheduler_config_from_args(state.args)
-    if config.mode not in {SchedulerMode.AR_BATCH, SchedulerMode.MTP_COHORT_EXPERIMENTAL}:
+    if config.mode != SchedulerMode.AR_BATCH:
         return False, None
     if effective_mode == "ar":
         return True, "generation_mode_ar"
@@ -16007,6 +16154,205 @@ def _end_smart_fan_request(
         LOGGER.warning("Smart fan restore failed: %s", exc)
 
 
+def _use_mtp_cohort(state: Any, *, effective_mode: str) -> bool:
+    config = _scheduler_config_from_args(state.args)
+    if (
+        config.mode != SchedulerMode.MTP_COHORT_EXPERIMENTAL
+        or effective_mode != "mtp"
+    ):
+        return False
+    if (
+        getattr(state, "mtp_cohort_lane", None) is None
+        or getattr(state, "mtp_cohort_service", None) is None
+        or getattr(state, "mtp_cohort_environment", None) is None
+    ):
+        raise RuntimeError(
+            "MTP K2 cohort runtime is not installed for the explicit cohort mode"
+        )
+    return True
+
+
+def _frozen_mtp_cohort_environment(
+    state: Any,
+    dynamic_environment: Mapping[str, str],
+) -> Mapping[str, str]:
+    base = getattr(state, "mtp_cohort_environment", None)
+    if base is None:
+        raise RuntimeError(
+            "MTP K2 cohort runtime is not installed for the explicit cohort mode"
+        )
+    environment = {
+        str(name): str(value)
+        for name, value in base.items()
+    }
+    environment.update(
+        {
+            str(name): str(value)
+            for name, value in dynamic_environment.items()
+        }
+    )
+    return MappingProxyType(environment)
+
+
+def _build_mtp_cohort_job(
+    state: Any,
+    prompt_ids: list[int],
+    *,
+    request_id: str,
+    dynamic_environment: Mapping[str, str],
+    prepared_state_kwargs: Mapping[str, Any],
+    cancel_event: Event | None,
+    owner_finalize: Callable[[Any], Any],
+) -> Any:
+    from mtplx.server.mtp_cohort import MTPK2CohortJob
+
+    state_kwargs = dict(prepared_state_kwargs)
+    state_kwargs.update(
+        {
+            "speculative_depth": 2,
+            "mtp_hidden_variant": "post_norm",
+            "mtp_cache_policy": "persistent",
+            "mtp_history_policy": "committed",
+            "adaptive_policy": None,
+            "abort_check": (
+                (lambda: bool(cancel_event.is_set()))
+                if cancel_event is not None
+                else None
+            ),
+        }
+    )
+    state_kwargs.setdefault(
+        "verify_strategy",
+        str(getattr(state.args, "verify_strategy", "")),
+    )
+    state_kwargs.setdefault(
+        "verify_core",
+        str(getattr(state.args, "verify_core", "")),
+    )
+    return MTPK2CohortJob(
+        request_id=request_id,
+        prompt_ids=prompt_ids,
+        state_kwargs=state_kwargs,
+        environment=_frozen_mtp_cohort_environment(
+            state,
+            dynamic_environment,
+        ),
+        owner_finalize=owner_finalize,
+    )
+
+
+@dataclass(frozen=True)
+class _MTPK2CohortOwnerResult:
+    output: Any
+    session_commit_stats: Mapping[str, Any]
+    cleanup: Mapping[str, Any] | None
+    allocator_stats: Mapping[str, int]
+
+
+def _finalize_mtp_cohort_output_on_owner(
+    state: Any,
+    output: Any,
+    *,
+    prompt_ids: list[int],
+    session_id: str | None,
+    session_bank: Any | None,
+    session_template_hash: str | None,
+    session_draft_head_identity: str | None,
+    session_policy_fingerprint: str | None,
+    session_keep_live_ref: bool,
+    commit_final_state_to_bank: bool,
+    request_observability: dict[str, Any] | None,
+    vision_splice: Any | None,
+    environment: Mapping[str, str] | None = None,
+) -> _MTPK2CohortOwnerResult:
+    session_stats: dict[str, Any] = {}
+    final_state = output.final_state
+    final_commit_prompt_ids: list[int] | None = list(prompt_ids)
+    if vision_splice is not None:
+        from mtplx.vision.splice import vision_bank_key_ids
+
+        final_commit_prompt_ids = vision_bank_key_ids(
+            list(prompt_ids),
+            vision_splice,
+        )
+    if (
+        commit_final_state_to_bank
+        and session_bank is not None
+        and session_id is not None
+        and final_state is not None
+        and final_state.safe_to_commit
+        and final_commit_prompt_ids is not None
+    ):
+        final_token_ids = list(final_commit_prompt_ids) + list(output.tokens)
+        mtp_snapshot = (
+            snapshot_cache(final_state.final_committed_mtp_cache)
+            if final_state.final_committed_mtp_cache is not None
+            else None
+        )
+        session_bank.put(
+            runtime=state.runtime,
+            token_ids=final_token_ids,
+            cache=final_state.final_trunk_cache,
+            logits=final_state.final_logits,
+            hidden=final_state.final_hidden,
+            hidden_variant="post_norm",
+            keep_live_ref=bool(session_keep_live_ref),
+            session_id=session_id,
+            template_hash=session_template_hash,
+            mtp_history_policy="committed",
+            draft_head_identity=session_draft_head_identity,
+            policy_fingerprint=session_policy_fingerprint,
+            mtp_history_snapshot=mtp_snapshot,
+            snapshot_epoch=len(final_token_ids),
+            mtp_snapshot_epoch=(
+                len(final_token_ids)
+                if mtp_snapshot is not None
+                else None
+            ),
+            extra_state=getattr(final_state, "extra_state", None),
+        )
+        session_stats["sessionbank_snapshot_bytes"] = int(
+            getattr(session_bank, "last_put_nbytes", 0) or 0
+        )
+        session_stats["sessionbank_skipped_oversized_snapshot"] = bool(
+            getattr(
+                session_bank,
+                "last_put_skipped_oversized_snapshot",
+                False,
+            )
+        )
+    cleanup = _auto_clear_mlx_cache_after_completed_request(
+        state,
+        session_id=session_id,
+        request_observability=request_observability,
+        environment=environment,
+    )
+    allocator = _mlx_allocator_public_stats()
+    return _MTPK2CohortOwnerResult(
+        output=output,
+        session_commit_stats=MappingProxyType(session_stats),
+        cleanup=(
+            None
+            if cleanup is None
+            else MappingProxyType(dict(cleanup))
+        ),
+        allocator_stats=MappingProxyType(dict(allocator)),
+    )
+
+
+def _run_generation_cohort(
+    state: Any,
+    prompt_ids: list[int],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    return _run_generation(
+        state,
+        prompt_ids,
+        _mtp_cohort_request=True,
+        **kwargs,
+    )
+
+
 _SMART_FAN_ARRIVAL_PATHS = {
     "/v1/chat/completions",
     "/v1/completions",
@@ -16078,6 +16424,9 @@ def _run_generation_dispatched(
     if response_id:
         request_observability_for_lane.setdefault("request_id", response_id)
     kwargs["request_observability"] = request_observability_for_lane
+    if _use_mtp_cohort(state, effective_mode=effective_mode):
+        request_observability_for_lane["scheduler_lane"] = "mtp_cohort"
+        return _run_generation_cohort(state, prompt_ids, **kwargs)
     history_bypass_reason = _ar_batch_history_bypass_reason(
         request_observability_for_lane
     )
@@ -16255,7 +16604,19 @@ def _run_generation(
     streaming_response: bool | None = None,
     vision_splice: Any | None = None,
     constraint_spec: Any | None = None,
+    _mtp_cohort_request: bool = False,
 ) -> dict[str, Any]:
+    request_environment: Mapping[str, str] | None = None
+    if _mtp_cohort_request:
+        request_environment = getattr(
+            state,
+            "mtp_cohort_environment",
+            None,
+        )
+        if request_environment is None:
+            raise RuntimeError(
+                "MTP K2 cohort runtime is not installed for request construction"
+            )
     response_max, sampler, generation_limits = _generation_params(
         state,
         prompt_token_count=len(prompt_ids),
@@ -16265,8 +16626,12 @@ def _run_generation(
         top_k=top_k,
         presence_penalty=presence_penalty,
         frequency_penalty=frequency_penalty,
+        environment=request_environment,
     )
-    uncapped_repetition_stop = _uncapped_repetition_stop_enabled(generation_limits)
+    uncapped_repetition_stop = _uncapped_repetition_stop_enabled(
+        generation_limits,
+        environment=request_environment,
+    )
     generation_limits["uncapped_repetition_stop_enabled"] = bool(
         uncapped_repetition_stop
     )
@@ -16274,6 +16639,7 @@ def _run_generation(
         state,
         prompt_ids=prompt_ids,
         request_observability=request_observability,
+        environment=request_environment,
     )
     effective_draft_sampler = draft_sampler if draft_sampler is not None else state.draft_sampler
     effective_mode = _normalize_generation_mode(
@@ -16292,6 +16658,15 @@ def _run_generation(
         and requested_depth > 0
     ):
         effective_depth = max(1, min(int(resolved_mtp_depth), int(requested_depth)))
+    if _mtp_cohort_request and (
+        effective_mode != "mtp"
+        or requested_depth != 2
+        or effective_depth != 2
+    ):
+        raise RuntimeError(
+            "MTP K2 cohort requests require fixed generation_mode=mtp and "
+            "effective depth=2"
+        )
     started = time.perf_counter()
     token_times: list[float] = []
     lock_wait_time_s = 0.0
@@ -16330,9 +16705,39 @@ def _run_generation(
     }
     for attempt in range(max_attempts):
         generation_seed, seed_is_explicit = _resolve_seed(state, seed)
+        cohort_owner_result: _MTPK2CohortOwnerResult | None = None
         lock_started = time.perf_counter()
         smart_fan_lease: str | None = None
-        if background_request:
+        if _mtp_cohort_request and background_request:
+            cohort_snapshot = state.mtp_cohort_service.snapshot()
+            if (
+                state.has_foreground()
+                or int(cohort_snapshot.get("pending") or 0) > 0
+                or int(cohort_snapshot.get("active") or 0) > 0
+                or bool(cohort_snapshot.get("pump_scheduled"))
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "background request bypassed while MTP K2 cohort "
+                        "generation is busy"
+                    ),
+                    headers={"Retry-After": "1"},
+                )
+        elif _mtp_cohort_request:
+            smart_request_id = str(
+                (request_observability or {}).get("request_id") or ""
+            )
+            smart_fan_lease = _begin_smart_fan_request(
+                state,
+                request_id=_smart_fan_request_id(
+                    smart_request_id or session_id,
+                    "mtp-cohort",
+                ),
+                request_observability=request_observability,
+            )
+            state.begin_foreground()
+        elif background_request:
             if state.has_foreground() or state.lock.locked():
                 raise HTTPException(
                     status_code=503,
@@ -16358,7 +16763,8 @@ def _run_generation(
             )
             state.begin_foreground()
             state.lock.acquire()
-        lock_wait_time_s += time.perf_counter() - lock_started
+        if not _mtp_cohort_request:
+            lock_wait_time_s += time.perf_counter() - lock_started
         kv_admission = None
         try:
             if cancel_event is not None and cancel_event.is_set():
@@ -16371,11 +16777,20 @@ def _run_generation(
                 prompt_tokens=len(prompt_ids),
                 max_new_tokens=response_max,
                 mtp_depth=effective_depth,
+                environment=request_environment,
             )
             prefill_chunk_tokens = getattr(state.args, "prefill_chunk_tokens", None)
-            with _temporary_env(
-                dynamic_kv_reservation["env"]
-            ), prefill_chunk_size_override(prefill_chunk_tokens):
+            environment_context = (
+                nullcontext()
+                if _mtp_cohort_request
+                else _temporary_env(dynamic_kv_reservation["env"])
+            )
+            prefill_context = (
+                nullcontext()
+                if _mtp_cohort_request
+                else prefill_chunk_size_override(prefill_chunk_tokens)
+            )
+            with environment_context, prefill_context:
                 constraint = (
                     constraint_spec.build(
                         state.runtime.tokenizer, prompt_ids=prompt_ids
@@ -16383,7 +16798,136 @@ def _run_generation(
                     if constraint_spec is not None
                     else None
                 )
-                if effective_mode == "ar":
+                if _mtp_cohort_request:
+                    if vision_splice is not None and vision_splice.cursor:
+                        vision_splice.reset()
+                    prepared_state_kwargs = {
+                        "constraint": constraint,
+                        "vision_splice": vision_splice,
+                        "max_tokens": response_max,
+                        "sampler": sampler,
+                        "draft_sampler": effective_draft_sampler,
+                        "seed": generation_seed,
+                        "verify_strategy": state.args.verify_strategy,
+                        "verify_core": state.args.verify_core,
+                        "token_callback": record_tokens,
+                        "session_bank": session_bank,
+                        "session_id": session_id,
+                        "session_restore_mode": _session_bank_restore_mode(
+                            session_restore_mode
+                        ),
+                        "session_template_hash": session_template_hash,
+                        "session_draft_head_identity": (
+                            session_draft_head_identity
+                        ),
+                        "session_policy_fingerprint": (
+                            session_policy_fingerprint
+                        ),
+                        "capture_final_state": session_bank is not None,
+                        "commit_prompt_state_to_bank": (
+                            commit_prompt_prefix_to_bank
+                            and session_bank is not None
+                            and session_id is not None
+                        ),
+                        "commit_prompt_state_keep_live_ref": False,
+                        "trace_label": trace_label,
+                        "trace_metadata": trace_metadata,
+                        "prefill_callback": prefill_callback,
+                        "repetition_stop": uncapped_repetition_stop,
+                        "loop_guard": _loop_guard_enabled(request_environment),
+                        "thinking_guard": thinking_guard_config,
+                        "online_correction_cache": bool(
+                            state.args.online_correction_cache
+                        ),
+                        "online_correction_cache_min_depth": int(
+                            state.args.online_correction_cache_min_depth
+                        ),
+                        "online_correction_cache_key": str(
+                            state.args.online_correction_cache_key
+                        ),
+                        "prompt_correction_cache": bool(
+                            state.args.prompt_correction_cache
+                        ),
+                        "prompt_correction_cache_min_depth": int(
+                            state.args.prompt_correction_cache_min_depth
+                        ),
+                        "online_hidden_corrector_alpha": float(
+                            state.args.online_hidden_corrector_alpha
+                        ),
+                        "online_hidden_corrector_decay": float(
+                            state.args.online_hidden_corrector_decay
+                        ),
+                        "online_hidden_corrector_warmup": int(
+                            state.args.online_hidden_corrector_warmup
+                        ),
+                        "online_hidden_corrector_max_feed_depth": (
+                            state.args.online_hidden_corrector_max_feed_depth
+                        ),
+                        "online_hidden_corrector_key": str(
+                            state.args.online_hidden_corrector_key
+                        ),
+                    }
+
+                    def owner_finalize(
+                        owner_output: Any,
+                    ) -> _MTPK2CohortOwnerResult:
+                        return _finalize_mtp_cohort_output_on_owner(
+                            state,
+                            owner_output,
+                            prompt_ids=prompt_ids,
+                            session_id=session_id,
+                            session_bank=session_bank,
+                            session_template_hash=session_template_hash,
+                            session_draft_head_identity=(
+                                session_draft_head_identity
+                            ),
+                            session_policy_fingerprint=(
+                                session_policy_fingerprint
+                            ),
+                            session_keep_live_ref=session_keep_live_ref,
+                            commit_final_state_to_bank=(
+                                commit_final_state_to_bank
+                            ),
+                            request_observability=request_observability,
+                            vision_splice=vision_splice,
+                            environment=request_environment,
+                        )
+
+                    request_id = str(
+                        (request_observability or {}).get("request_id")
+                        or session_id
+                        or f"mtpcohort-{uuid.uuid4().hex}"
+                    )
+                    job = _build_mtp_cohort_job(
+                        state,
+                        prompt_ids,
+                        request_id=request_id,
+                        dynamic_environment=dynamic_kv_reservation["env"],
+                        prepared_state_kwargs=prepared_state_kwargs,
+                        cancel_event=cancel_event,
+                        owner_finalize=owner_finalize,
+                    )
+                    try:
+                        cohort_owner_result = (
+                            state.mtp_cohort_service.submit(job).result()
+                        )
+                    except BaseException as exc:
+                        from mtplx.server.mtp_cohort import (
+                            MTPK2CohortCancelled,
+                        )
+
+                        if isinstance(exc, MTPK2CohortCancelled):
+                            raise _StreamCancelled(str(exc)) from exc
+                        raise
+                    if not isinstance(
+                        cohort_owner_result,
+                        _MTPK2CohortOwnerResult,
+                    ):
+                        raise RuntimeError(
+                            "MTP K2 cohort owner returned an invalid result"
+                        )
+                    out = cohort_owner_result.output
+                elif effective_mode == "ar":
                     out = generate_ar(
                         state.runtime,
                         prompt_ids,
@@ -16504,7 +17048,8 @@ def _run_generation(
                 release_kv = getattr(kv_admission, "release", None)
                 if callable(release_kv):
                     release_kv()
-            state.lock.release()
+            if not _mtp_cohort_request:
+                state.lock.release()
             if not background_request:
                 state.end_foreground()
                 _end_smart_fan_request(state, smart_fan_lease)
@@ -16541,7 +17086,8 @@ def _run_generation(
                 list(prompt_ids), vision_splice
             )
         if (
-            commit_final_state_to_bank
+            cohort_owner_result is None
+            and commit_final_state_to_bank
             and session_bank is not None
             and session_id is not None
             and final_state is not None
@@ -16585,6 +17131,8 @@ def _run_generation(
             stats["sessionbank_skipped_oversized_snapshot"] = bool(
                 getattr(session_bank, "last_put_skipped_oversized_snapshot", False)
             )
+        elif cohort_owner_result is not None:
+            stats.update(dict(cohort_owner_result.session_commit_stats))
         actual_mtp_depth = int(
             stats.get("speculative_depth")
             or (effective_depth if effective_mode == "mtp" else 0)
@@ -16695,14 +17243,26 @@ def _run_generation(
                     session_keep_live_ref=session_keep_live_ref,
                 )
             )
-        cleanup = _auto_clear_mlx_cache_after_completed_request(
-            state,
-            session_id=session_id,
-            request_observability=request_observability,
+        cleanup = (
+            (
+                None
+                if cohort_owner_result.cleanup is None
+                else dict(cohort_owner_result.cleanup)
+            )
+            if cohort_owner_result is not None
+            else _auto_clear_mlx_cache_after_completed_request(
+                state,
+                session_id=session_id,
+                request_observability=request_observability,
+            )
         )
         if cleanup is not None:
             envelope["mlx_cache_cleanup"] = cleanup
-        envelope.update(_mlx_allocator_public_stats())
+        envelope.update(
+            dict(cohort_owner_result.allocator_stats)
+            if cohort_owner_result is not None
+            else _mlx_allocator_public_stats()
+        )
         stats["generation_mode"] = effective_mode
         stats.update(envelope)
         stats.update(_generation_truth_stats(state, effective_mode))
@@ -19695,6 +20255,7 @@ def _thinking_guard_config_for_request(
     *,
     prompt_ids: list[int],
     request_observability: Mapping[str, Any] | None,
+    environment: Mapping[str, str] | None = None,
 ) -> Any | None:
     """Resolve the agent-lane reasoning budget for this request, or None.
 
@@ -19748,6 +20309,7 @@ def _thinking_guard_config_for_request(
         budget_tokens=budget,
         tokenizer=tokenizer,
         starts_in_think=starts_in_think,
+        environment=environment,
     )
     return config if getattr(config, "enabled", False) else None
 

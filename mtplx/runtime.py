@@ -129,6 +129,7 @@ class MTPLXRuntime:
     _a3b_whole_moe_request_geometry_keys: dict[
         tuple[int, str, str], str
     ] = field(default_factory=dict, init=False, repr=False)
+    qwen27b_k2_dual_lane: Any | None = None
     diagnostic_counters: dict[str, int] = field(default_factory=dict)
     _forward_ar_supports_emit_logits: bool | None = field(
         default=None, init=False, repr=False
@@ -416,6 +417,16 @@ class MTPLXRuntime:
             hidden_variant=hidden_variant,
             postconv_implementations=postconv_implementations,
         )
+
+    def forward_qwen27b_k2_target(
+        self,
+        lane: Any,
+        width: int,
+        input_ids: Any,
+        cache: list[Any],
+    ) -> Any:
+        target = lane.target_for_width(width)
+        return target(input_ids=input_ids, cache=cache)
 
     def draft_mtp(
         self,

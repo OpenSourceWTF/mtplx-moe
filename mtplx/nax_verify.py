@@ -19,11 +19,76 @@ from __future__ import annotations
 
 import os
 import platform
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from functools import lru_cache
+from threading import RLock
+from typing import Any, Callable
 
 import mlx.core as mx
 
 _VERIFY_KERNEL_CACHE: dict[tuple, object] = {}
+
+
+@dataclass(frozen=True)
+class FixedQMMExecution:
+    """One prevalidated fixed-width QuantizedLinear execution scope."""
+
+    routes: Mapping[int, Any]
+    width: int
+
+
+@dataclass(frozen=True)
+class QLinearPatchSnapshot:
+    """Read-only process patch state and its true stock callable."""
+
+    installed: bool
+    stock_call: Callable[..., Any]
+
+
+class FixedQLinearPatchLease:
+    """Ownership of fixed-scope dispatch without changing outside behavior."""
+
+    def __init__(self, snapshot: QLinearPatchSnapshot):
+        self._snapshot = snapshot
+        self._active = False
+
+    @property
+    def stock_call(self) -> Callable[..., Any]:
+        return self._snapshot.stock_call
+
+    @property
+    def initially_dynamic(self) -> bool:
+        return bool(self._snapshot.installed)
+
+    @property
+    def active(self) -> bool:
+        return bool(self._active)
+
+    def acquire(self) -> None:
+        _acquire_fixed_qlinear_patch(self)
+
+    def release(self) -> None:
+        _release_fixed_qlinear_patch(self)
+
+
+_FIXED_QMM_ROUTE: ContextVar[FixedQMMExecution | None] = ContextVar(
+    "mtplx_fixed_qmm_route",
+    default=None,
+)
+
+
+@contextmanager
+def fixed_qmm_execution_scope(
+    execution: FixedQMMExecution,
+) -> Iterator[None]:
+    token = _FIXED_QMM_ROUTE.set(execution)
+    try:
+        yield
+    finally:
+        _FIXED_QMM_ROUTE.reset(token)
 
 
 def nax_env_enabled() -> bool:
@@ -622,7 +687,13 @@ def _build_kernel_m8_ksplit_np(group_size: int, dtype: mx.Dtype, *, k_parts: int
     return kernel
 
 
-def _build_kernel_m6_ksplit_np(group_size: int, dtype: mx.Dtype, *, k_parts: int = 2):
+def _build_kernel_m6_ksplit_np(
+    group_size: int,
+    dtype: mx.Dtype,
+    *,
+    k_parts: int = 2,
+    bn: int = 4,
+):
     """6-row K-split variant (24 accumulators/thread, scalar row registers).
 
     Beats both stock qmm (1.14-1.80x) and the m16 NAX tile (1.03-1.15x) on all
@@ -631,14 +702,32 @@ def _build_kernel_m6_ksplit_np(group_size: int, dtype: mx.Dtype, *, k_parts: int
     Note: an earlier un-unrolled probe measured 0.08-0.16x — explicit unrolls
     and scalar v0..v5 registers are load-bearing, not style.
     """
-    key = ("m6_ksplit_np", group_size, dtype, int(k_parts))
+    key = (
+        "m6_ksplit_np",
+        group_size,
+        dtype,
+        int(k_parts),
+        int(bn),
+    )
     if key in _VERIFY_KERNEL_CACHE:
         return _VERIFY_KERNEL_CACHE[key]
+
+    pack_setup = """
+        int packs_per_part = K_by_8 / K_PARTS;
+        int pack_start = int(part) * packs_per_part;
+        int pack_end = (int(part) == K_PARTS - 1)
+            ? K_by_8
+            : pack_start + packs_per_part;
+    """
+    pack_loop = (
+        "for (int pack = pack_start + int(lane); "
+        "pack < pack_end; pack += 32) {"
+    )
 
     source = f"""
         using namespace metal;
         constexpr int M = 6;
-        constexpr int BN = 4;
+        constexpr int BN = {int(bn)};
         constexpr int K_PARTS = {int(k_parts)};
         constexpr int GS = {group_size};
 
@@ -651,9 +740,7 @@ def _build_kernel_m6_ksplit_np(group_size: int, dtype: mx.Dtype, *, k_parts: int
         int K_by_8 = K / 8;
         int K_by_gs = K / GS;
         int n0 = int(tg_n) * BN;
-        int packs_per_part = K_by_8 / K_PARTS;
-        int pack_start = int(part) * packs_per_part;
-        int pack_end = (int(part) == K_PARTS - 1) ? K_by_8 : pack_start + packs_per_part;
+        {pack_setup}
 
         float acc[BN * M];
         _Pragma("unroll")
@@ -664,7 +751,7 @@ def _build_kernel_m6_ksplit_np(group_size: int, dtype: mx.Dtype, *, k_parts: int
         using Vec8 = vec<T, 8>;
         const device Vec8 *xv = (const device Vec8*)x;
 
-        for (int pack = pack_start + int(lane); pack < pack_end; pack += 32) {{
+        {pack_loop}
             int k_base = pack * 8;
             Vec8 v0 = xv[(0 * K + k_base) / 8];
             Vec8 v1 = xv[(1 * K + k_base) / 8];
@@ -721,8 +808,143 @@ def _build_kernel_m6_ksplit_np(group_size: int, dtype: mx.Dtype, *, k_parts: int
 
     dtype_tag = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     kernel = mx.fast.metal_kernel(
-        name=f"mtplx_verify_m6_ksplit_kp{int(k_parts)}_gs{group_size}_{dtype_tag}",
+        name=(
+            f"mtplx_verify_m6_ksplit_kp{int(k_parts)}"
+            f"_bn{int(bn)}_gs{group_size}_{dtype_tag}"
+        ),
         input_names=["x", "w_q", "scales", "biases", "K_size", "N_size"],
+        output_names=["y"],
+        source=source,
+    )
+    _VERIFY_KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def _m6_qmv_wide_simdgroups(k: int, n: int) -> int:
+    """Select the measured Qwen row geometry from the committed route shape."""
+    return 4 if (k, n) == (5120, 248320) else 2
+
+
+def _build_kernel_m6_qmv_wide_vec6(
+    group_size: int,
+    dtype: mx.Dtype,
+    k: int,
+    n: int,
+):
+    """Six-row q4 QMV with MLX 0.32 ``qmv_wide`` arithmetic.
+
+    Stock M=6 uses two three-vector tiles, so each output weight row is read
+    twice. This fixed-shape lane preserves the stock affine decode, eight-lane
+    K ownership, per-vector accumulation order, and shuffle reduction while
+    streaming all six vectors through one threadgroup. The dependency-chained
+    Qwen target uses the sustained two-SIMD-group geometry for layer
+    projections and four SIMD groups only for the unique 248,320-wide LM head.
+    K and N are committed by the validated route table, so compiling them into
+    the kernel removes runtime shape arithmetic and impossible tail rows.
+    """
+    num_simdgroups = _m6_qmv_wide_simdgroups(k, n)
+    rows_per_tg = 4 * num_simdgroups
+    if k % group_size != 0 or n % rows_per_tg != 0:
+        raise ValueError(
+            "fixed M6 qmv-wide geometry requires K divisible by group size "
+            f"and N divisible by {rows_per_tg}, got K={k}, N={n}, "
+            f"group_size={group_size}"
+        )
+    key = (
+        f"m6_qmv_wide_vec6_sg{num_simdgroups}",
+        group_size,
+        dtype,
+        k,
+        n,
+    )
+    if key in _VERIFY_KERNEL_CACHE:
+        return _VERIFY_KERNEL_CACHE[key]
+
+    source = f"""
+        using namespace metal;
+        constexpr int M = 6;
+        constexpr int GS = {group_size};
+        constexpr int K = {k};
+        constexpr int N = {n};
+        constexpr int K_LANES = 8;
+        constexpr int RESULTS_PER_SIMDGROUP = 32 / K_LANES;
+        constexpr int NUM_SIMDGROUPS = {num_simdgroups};
+        constexpr int ROWS_PER_TG =
+            RESULTS_PER_SIMDGROUP * NUM_SIMDGROUPS;
+        constexpr int SUB = 8;
+
+        uint lane = thread_index_in_simdgroup;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+        uint tg_n = threadgroup_position_in_grid.y;
+
+        int K_by_gs = K / GS;
+        short k_lane = short(lane % K_LANES);
+        short sg_row = short(lane / K_LANES);
+        int out_row =
+            int(tg_n) * ROWS_PER_TG
+            + RESULTS_PER_SIMDGROUP * int(simd_gid)
+            + int(sg_row);
+
+        int K_bytes = K * 4 / 8;
+        const device uint8_t* wrow =
+            (const device uint8_t*)w_q + out_row * K_bytes;
+        const device T* srow = scales + out_row * K_by_gs;
+        const device T* brow = biases + out_row * K_by_gs;
+
+        float result[M] = {{0.0f}};
+        for (int g = int(k_lane); g < K_by_gs; g += K_LANES) {{
+            float scale = srow[g];
+            float bias = brow[g];
+            _Pragma("unroll")
+            for (int sc = 0; sc < GS / SUB; ++sc) {{
+                int k0 = g * GS + sc * SUB;
+                const device uint8_t* wc = wrow + k0 * 4 / 8;
+                float scaled_hi = scale / 16.0f;
+                float w_dq[SUB];
+                w_dq[0] = scale * (wc[0] & 0x0f) + bias;
+                w_dq[1] = scaled_hi * (wc[0] & 0xf0) + bias;
+                w_dq[2] = scale * (wc[1] & 0x0f) + bias;
+                w_dq[3] = scaled_hi * (wc[1] & 0xf0) + bias;
+                w_dq[4] = scale * (wc[2] & 0x0f) + bias;
+                w_dq[5] = scaled_hi * (wc[2] & 0xf0) + bias;
+                w_dq[6] = scale * (wc[3] & 0x0f) + bias;
+                w_dq[7] = scaled_hi * (wc[3] & 0xf0) + bias;
+
+                _Pragma("unroll")
+                for (int v = 0; v < M; ++v) {{
+                    const device T* xc = x + v * K + k0;
+                    float acc = 0.0f;
+                    _Pragma("unroll")
+                    for (int i = 0; i < SUB; ++i) {{
+                        acc += float(xc[i]) * w_dq[i];
+                    }}
+                    result[v] += acc;
+                }}
+            }}
+        }}
+
+        _Pragma("unroll")
+        for (int v = 0; v < M; ++v) {{
+            result[v] += simd_shuffle_down(result[v], 4);
+            result[v] += simd_shuffle_down(result[v], 2);
+            result[v] += simd_shuffle_down(result[v], 1);
+        }}
+
+        if (k_lane == 0) {{
+            _Pragma("unroll")
+            for (int v = 0; v < M; ++v) {{
+                y[v * N + out_row] = T(result[v]);
+            }}
+        }}
+    """
+
+    dtype_tag = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    kernel = mx.fast.metal_kernel(
+        name=(
+            f"mtplx_verify_m6_qmv_wide_vec6_sg{num_simdgroups}"
+            f"_gs{group_size}_k{k}_n{n}_{dtype_tag}"
+        ),
+        input_names=["x", "w_q", "scales", "biases"],
         output_names=["y"],
         source=source,
     )
@@ -769,6 +991,66 @@ def nax_qmm_m6(
     )
     if M < 6:
         return y[:M, :]
+    return y
+
+
+def nax_qmm_m6_kp1_bn2(
+    x6: mx.array,
+    w_q: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    *,
+    group_size: int = 64,
+) -> mx.array:
+    """Run the fixed six-row, single-K-partition, two-column verify kernel."""
+    K = int(x6.shape[1])
+    N = int(w_q.shape[0])
+    x6 = mx.contiguous(x6)
+    kernel = _build_kernel_m6_ksplit_np(
+        group_size,
+        x6.dtype,
+        k_parts=1,
+        bn=2,
+    )
+    (y,) = kernel(
+        inputs=[x6, w_q, scales, biases, K, N],
+        template=[("T", x6.dtype)],
+        grid=(32, N // 2, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(6, N)],
+        output_dtypes=[x6.dtype],
+    )
+    return y
+
+
+def nax_qmm_m6_qmv_wide_vec6(
+    x6: mx.array,
+    w_q: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    *,
+    group_size: int = 64,
+) -> mx.array:
+    """Run the fixed M=6 Qwen kernel with MLX qmv_wide arithmetic."""
+    K = int(x6.shape[1])
+    N = int(w_q.shape[0])
+    x6 = mx.contiguous(x6)
+    num_simdgroups = _m6_qmv_wide_simdgroups(K, N)
+    rows_per_tg = 4 * num_simdgroups
+    kernel = _build_kernel_m6_qmv_wide_vec6(
+        group_size,
+        x6.dtype,
+        K,
+        N,
+    )
+    (y,) = kernel(
+        inputs=[x6, w_q, scales, biases],
+        template=[("T", x6.dtype)],
+        grid=(32, num_simdgroups * (N // rows_per_tg), 1),
+        threadgroup=(32, num_simdgroups, 1),
+        output_shapes=[(6, N)],
+        output_dtypes=[x6.dtype],
+    )
     return y
 
 
@@ -870,9 +1152,113 @@ def nax_qmm_m16(
 
 
 _QLINEAR_PATCH: dict[str, object] = {"installed": False, "original": None}
+_FIXED_ONLY_QLINEAR_PATCH: dict[str, object] = {
+    "installed": False,
+    "original": None,
+    "wrapper": None,
+}
+_FIXED_QMM_OWNER_COUNT = 0
+_QLINEAR_PATCH_LOCK = RLock()
+
+
+def qlinear_patch_snapshot() -> QLinearPatchSnapshot:
+    """Capture stock dispatch without mutating the process-wide patch."""
+
+    import mlx.nn as nn
+
+    with _QLINEAR_PATCH_LOCK:
+        original = _QLINEAR_PATCH["original"]
+        if _QLINEAR_PATCH["installed"] and original is not None:
+            return QLinearPatchSnapshot(installed=True, stock_call=original)
+        fixed_original = _FIXED_ONLY_QLINEAR_PATCH["original"]
+        if _FIXED_ONLY_QLINEAR_PATCH["installed"] and fixed_original is not None:
+            return QLinearPatchSnapshot(
+                installed=False,
+                stock_call=fixed_original,
+            )
+        return QLinearPatchSnapshot(
+            installed=False,
+            stock_call=nn.QuantizedLinear.__call__,
+        )
+
+
+def prepare_fixed_qlinear_patch_lease() -> FixedQLinearPatchLease:
+    """Prepare a fixed-route owner without mutating QuantizedLinear dispatch."""
+
+    with _QLINEAR_PATCH_LOCK:
+        return FixedQLinearPatchLease(qlinear_patch_snapshot())
+
+
+def _acquire_fixed_qlinear_patch(lease: FixedQLinearPatchLease) -> None:
+    import mlx.nn as nn
+
+    global _FIXED_QMM_OWNER_COUNT
+    with _QLINEAR_PATCH_LOCK:
+        if lease._active:
+            raise RuntimeError("fixed QMM patch lease is already active")
+        current = qlinear_patch_snapshot()
+        if (
+            current.installed != lease.initially_dynamic
+            or current.stock_call is not lease.stock_call
+        ):
+            raise RuntimeError(
+                "QuantizedLinear patch state changed during fixed route construction"
+            )
+        if not current.installed and not _FIXED_ONLY_QLINEAR_PATCH["installed"]:
+            original = lease.stock_call
+
+            def fixed_only(self, x):  # type: ignore[no-untyped-def]
+                fixed = _FIXED_QMM_ROUTE.get()
+                if fixed is not None:
+                    return fixed.routes[id(self)].execute(x, width=fixed.width)
+                return original(self, x)
+
+            nn.QuantizedLinear.__call__ = fixed_only
+            _FIXED_ONLY_QLINEAR_PATCH["installed"] = True
+            _FIXED_ONLY_QLINEAR_PATCH["original"] = original
+            _FIXED_ONLY_QLINEAR_PATCH["wrapper"] = fixed_only
+        _FIXED_QMM_OWNER_COUNT += 1
+        lease._active = True
+
+
+def _release_fixed_qlinear_patch(lease: FixedQLinearPatchLease) -> None:
+    import mlx.nn as nn
+
+    global _FIXED_QMM_OWNER_COUNT
+    with _QLINEAR_PATCH_LOCK:
+        if not lease._active:
+            raise RuntimeError("fixed QMM patch lease is not active")
+        _FIXED_QMM_OWNER_COUNT -= 1
+        lease._active = False
+        if _FIXED_QMM_OWNER_COUNT == 0 and _FIXED_ONLY_QLINEAR_PATCH["installed"]:
+            wrapper = _FIXED_ONLY_QLINEAR_PATCH["wrapper"]
+            if nn.QuantizedLinear.__call__ is not wrapper:
+                raise RuntimeError(
+                    "fixed-only QuantizedLinear wrapper ownership was replaced"
+                )
+            nn.QuantizedLinear.__call__ = _FIXED_ONLY_QLINEAR_PATCH["original"]
+            _FIXED_ONLY_QLINEAR_PATCH["installed"] = False
+            _FIXED_ONLY_QLINEAR_PATCH["original"] = None
+            _FIXED_ONLY_QLINEAR_PATCH["wrapper"] = None
+
+
+def captured_qlinear_call():
+    """Return the stock call captured when the process-wide patch was installed."""
+
+    original = _QLINEAR_PATCH["original"]
+    if not _QLINEAR_PATCH["installed"] or original is None:
+        raise RuntimeError("NAX QuantizedLinear patch is not installed")
+    return original
 
 
 def install_nax_qlinear_patch() -> dict[str, object]:
+    """Atomically install dynamic verify dispatch for QuantizedLinear."""
+
+    with _QLINEAR_PATCH_LOCK:
+        return _install_nax_qlinear_patch_locked()
+
+
+def _install_nax_qlinear_patch_locked() -> dict[str, object]:
     """Route verify-shaped (M in 4..16) 4-bit QuantizedLinear calls through the
     NAX/m4 verify kernels. Decode (M=1..3) and prefill (M>16) stay stock.
 
@@ -883,12 +1269,18 @@ def install_nax_qlinear_patch() -> dict[str, object]:
     if _QLINEAR_PATCH["installed"]:
         return {"installed": True, "already": True, "nax_available": nax_available()}
 
-    original = nn.QuantizedLinear.__call__
+    if _FIXED_ONLY_QLINEAR_PATCH["installed"]:
+        original = _FIXED_ONLY_QLINEAR_PATCH["original"]
+    else:
+        original = nn.QuantizedLinear.__call__
 
     from .attention_context import current_attention_phase
     from .kernel_selfcheck import lane_disabled
 
     def patched(self, x: mx.array) -> mx.array:  # type: ignore[no-untyped-def]
+        fixed = _FIXED_QMM_ROUTE.get()
+        if fixed is not None:
+            return fixed.routes[id(self)].execute(x, width=fixed.width)
         bits = int(getattr(self, "bits", 0) or 0)
         group_size = int(getattr(self, "group_size", 0) or 0)
         if bits == 8 and x.ndim >= 2 and current_attention_phase() != "prefill":
@@ -1051,12 +1443,26 @@ def install_nax_qlinear_patch() -> dict[str, object]:
     nn.QuantizedLinear.__call__ = patched
     _QLINEAR_PATCH["installed"] = True
     _QLINEAR_PATCH["original"] = original
+    _FIXED_ONLY_QLINEAR_PATCH["installed"] = False
+    _FIXED_ONLY_QLINEAR_PATCH["original"] = None
+    _FIXED_ONLY_QLINEAR_PATCH["wrapper"] = None
     return {"installed": True, "already": False, "nax_available": True}
 
 
 def uninstall_nax_qlinear_patch() -> None:
+    """Atomically remove dynamic dispatch when no fixed owner is published."""
+
+    with _QLINEAR_PATCH_LOCK:
+        _uninstall_nax_qlinear_patch_locked()
+
+
+def _uninstall_nax_qlinear_patch_locked() -> None:
     import mlx.nn as nn
 
+    if _FIXED_QMM_OWNER_COUNT:
+        raise RuntimeError(
+            "cannot uninstall QuantizedLinear patch while a fixed QMM owner is active"
+        )
     if _QLINEAR_PATCH["installed"] and _QLINEAR_PATCH["original"] is not None:
         nn.QuantizedLinear.__call__ = _QLINEAR_PATCH["original"]
         _QLINEAR_PATCH["installed"] = False

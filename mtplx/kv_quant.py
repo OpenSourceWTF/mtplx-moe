@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+from collections.abc import Mapping
 from typing import Any
 
 
@@ -40,7 +41,9 @@ def env_enabled(name: str, *, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def paged_kv_quant_mode_from_env() -> str:
+def paged_kv_quant_mode_from_environment(
+    environment: Mapping[str, str],
+) -> str:
     """The single parse of the paged-KV-quant env pair, canonicalized.
 
     Returns one of ``off``/``q8``/``q4``. Every reader goes through
@@ -52,18 +55,28 @@ def paged_kv_quant_mode_from_env() -> str:
     from mtplx.runtime_options import normalize_paged_kv_quantization
 
     raw = (
-        os.environ.get("MTPLX_VLLM_METAL_PAGED_KV_QUANT")
-        or os.environ.get("MTPLX_PAGED_KV_QUANT")
+        environment.get("MTPLX_VLLM_METAL_PAGED_KV_QUANT")
+        or environment.get("MTPLX_PAGED_KV_QUANT")
         or ""
     )
     return str(normalize_paged_kv_quantization(raw))
 
 
-def config_from_env() -> PagedKVQuantConfig | None:
-    mode = paged_kv_quant_mode_from_env()
+def paged_kv_quant_mode_from_env() -> str:
+    return paged_kv_quant_mode_from_environment(os.environ)
+
+
+def config_from_environment(
+    environment: Mapping[str, str],
+) -> PagedKVQuantConfig | None:
+    mode = paged_kv_quant_mode_from_environment(environment)
     if mode == "off":
         return None
     return PagedKVQuantConfig(mode=mode)
+
+
+def config_from_env() -> PagedKVQuantConfig | None:
+    return config_from_environment(os.environ)
 
 
 def packed_dim(head_dim: int, bits: int) -> int:

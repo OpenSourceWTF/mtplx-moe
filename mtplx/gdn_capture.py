@@ -2,14 +2,149 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass
-import os
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
 from functools import partial
+import os
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+
+
+@dataclass(frozen=True)
+class QwenGDNVerifyConfig:
+    """Construction-resolved operations for the fixed Qwen verify lane."""
+
+    capture_backend: str
+    projection_path: str
+    linear_conv_path: str
+    gdn_tail_path: str
+    residual_path: str
+    hidden_variant: str
+    target_width: int
+    attention_cache_type: str
+    layer_eval_every: int
+    layer_eval_schedule: tuple[tuple[int, int], ...]
+    layer_eval_context_threshold: int
+    layer_eval_max_q: int
+    tape_replay_tgy: int
+    project_inputs: Callable[[Any, Any], tuple[Any, Any, Any, Any]]
+    capture_conv: Callable[[Any, Any, Any], tuple[Any, Any]]
+    capture_delta: Callable[[Any, Any, Any, Any, Any], tuple[Any, Any, Any]]
+    compute_g: Callable[[Any, Any, Any], Any]
+    authoritative_state_path: str
+    own_authoritative_state: Callable[[Any], Any]
+    apply_gdn_tail: Callable[[Any, Any, Any], Any]
+    apply_post_norm_residual: Callable[[Any, Any, Any], tuple[Any, Any]]
+    embed_inputs: Callable[[Any], Any]
+    create_fa_mask: Callable[[Any, Any], Any]
+    create_ssm_mask: Callable[[Any, Any], Any]
+    cache_context_length: Callable[[list[Any]], int]
+    final_norm: Callable[[Any], Any]
+    project_logits: Callable[[Any], Any]
+    layer_routes: tuple[Callable[..., tuple[Any, dict[str, Any] | None]], ...] = ()
+
+    @classmethod
+    def stock(
+        cls,
+        *,
+        capture_backend: str,
+        hidden_variant: str,
+    ) -> "QwenGDNVerifyConfig":
+        from mlx_lm.models.gated_delta import compute_g
+
+        return cls(
+            capture_backend=capture_backend,
+            projection_path="stock",
+            linear_conv_path="stock",
+            gdn_tail_path="stock",
+            residual_path="stock",
+            hidden_variant=hidden_variant,
+            target_width=1,
+            attention_cache_type="KVCache",
+            layer_eval_every=0,
+            layer_eval_schedule=(),
+            layer_eval_context_threshold=0,
+            layer_eval_max_q=8,
+            tape_replay_tgy=8,
+            project_inputs=_stock_gdn_input_projections,
+            capture_conv=_stock_conv1d_capture_configured,
+            capture_delta=partial(_kernel_tape_capture_configured, tgy=8),
+            compute_g=compute_g,
+            authoritative_state_path="identity",
+            own_authoritative_state=_identity,
+            apply_gdn_tail=_stock_gdn_tail,
+            apply_post_norm_residual=_stock_post_norm_residual,
+            embed_inputs=_identity,
+            create_fa_mask=_return_none_mask,
+            create_ssm_mask=_return_none_mask,
+            cache_context_length=_zero_cache_context_length,
+            final_norm=_identity,
+            project_logits=_identity,
+        )
+
+    def eval_every(self, context_len: int) -> int:
+        selected = self.layer_eval_every
+        for threshold, every in self.layer_eval_schedule:
+            if int(context_len) >= threshold:
+                selected = every
+        return selected
+
+
+def _identity(value: Any) -> Any:
+    return value
+
+
+def _return_none_mask(_hidden_states: Any, _cache: Any) -> None:
+    return None
+
+
+def _zero_cache_context_length(_cache: list[Any]) -> int:
+    return 0
+
+
+def _configured_cache_context_length(
+    cache: list[Any],
+    *,
+    layer_index: int,
+    size: Callable[[Any], int],
+) -> int:
+    return int(size(cache[layer_index]))
+
+
+def bind_qwen_cache_context_length(
+    *,
+    layer_index: int,
+    target_width: int,
+) -> tuple[str, Callable[[list[Any]], int]]:
+    """Bind width-specific cache context lookup outside the target cycle."""
+    from mlx_lm.models.cache import BatchKVCache, KVCache
+
+    if target_width == 1:
+        cache_type = KVCache
+    elif target_width == 2:
+        cache_type = BatchKVCache
+    else:
+        raise ValueError(f"configured Qwen target width must be 1 or 2, got {target_width}")
+    return (
+        cache_type.__name__,
+        partial(
+            _configured_cache_context_length,
+            layer_index=layer_index,
+            size=cache_type.size,
+        ),
+    )
+
+
+def _configured_mask(
+    hidden_states: Any,
+    cache: list[Any],
+    *,
+    create: Callable[[Any, Any], Any],
+    layer_index: int,
+) -> Any:
+    return create(hidden_states, cache[layer_index])
 
 
 def _env_enabled(name: str, *, default: bool = False) -> bool:
@@ -1397,6 +1532,13 @@ def _maybe_contiguous_authoritative_gdn_leaf(value: mx.array) -> mx.array:
     return _contiguous_recurrent_leaf(value)
 
 
+def bind_qwen_authoritative_state_operation() -> tuple[str, Callable[[Any], Any]]:
+    """Resolve the fixed Qwen authoritative-state operation at construction."""
+    if _env_enabled("MTPLX_CAPTURE_CONTIGUOUS_GDN_STATE"):
+        return "contiguous", _contiguous_recurrent_leaf
+    return "identity", _identity
+
+
 def _gdn_tape_meta(gdn: Any) -> dict[str, int]:
     return {
         "conv_dim": int(gdn.conv_dim),
@@ -1409,6 +1551,8 @@ def _gdn_tape_meta(gdn: Any) -> dict[str, int]:
 
 
 def _gdn_meta_int(meta: Any, name: str) -> int:
+    if hasattr(meta, name):
+        return int(getattr(meta, name))
     if isinstance(meta, dict):
         return int(meta[name])
     return int(getattr(meta, name))
@@ -1632,6 +1776,51 @@ def _gdn_input_projections(
     )
 
 
+def _stock_gdn_input_projections(
+    gdn: Any,
+    inputs: mx.array,
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    return (
+        gdn.in_proj_qkv(inputs),
+        gdn.in_proj_z(inputs),
+        gdn.in_proj_b(inputs),
+        gdn.in_proj_a(inputs),
+    )
+
+
+def _fused_pair_gdn_input_projections(
+    gdn: Any,
+    inputs: mx.array,
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    qkv, z = _fused_quantized_pair(
+        gdn,
+        "_mtplx_fused_qkvz",
+        inputs,
+        gdn.in_proj_qkv,
+        gdn.in_proj_z,
+    )
+    b, a = _fused_quantized_pair(
+        gdn,
+        "_mtplx_fused_ba",
+        inputs,
+        gdn.in_proj_b,
+        gdn.in_proj_a,
+    )
+    return qkv, z, b, a
+
+
+def _fused_all_gdn_input_projections(
+    gdn: Any,
+    inputs: mx.array,
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    return _fused_quantized_many(
+        gdn,
+        "_mtplx_fused_qkvzba",
+        inputs,
+        (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a),
+    )
+
+
 def _stock_conv1d_capture(qkv: mx.array, base_conv_state: mx.array, gdn: Any):
     """Run the exact MLX Conv1d path and capture each linear-prefix state."""
     B, T, _ = qkv.shape
@@ -1643,6 +1832,33 @@ def _stock_conv1d_capture(qkv: mx.array, base_conv_state: mx.array, gdn: Any):
         axis=1,
     )
     return conv_out, conv_states
+
+
+def _stock_conv1d_capture_configured(
+    qkv: mx.array,
+    base_conv_state: mx.array,
+    gdn: Any,
+) -> tuple[mx.array, mx.array]:
+    return _stock_conv1d_capture(qkv, base_conv_state, gdn)
+
+
+def _linear_conv1d_capture_configured(
+    qkv: mx.array,
+    base_conv_state: mx.array,
+    gdn: Any,
+) -> tuple[mx.array, mx.array]:
+    B, T, conv_dim = qkv.shape
+    keep = int(base_conv_state.shape[1])
+    input_type = qkv.dtype
+    raw_conv, conv_states = _linear_conv1d_kernel(
+        inputs=[qkv, base_conv_state, gdn.conv1d.weight, T],
+        template=[("InT", input_type), ("Keep", keep), ("ConvDim", conv_dim)],
+        grid=(conv_dim, B, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(B, T, conv_dim), (B, T, keep, conv_dim)],
+        output_dtypes=[input_type, input_type],
+    )
+    return nn.silu(raw_conv), conv_states
 
 
 def _linear_gated_delta_capture(
@@ -1867,6 +2083,105 @@ def _linear_gated_delta_from_conv_tape_capture(
     )
 
 
+def _kernel_tape_capture_configured(
+    conv_out: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    state: mx.array,
+    gdn: Any,
+    *,
+    tgy: int,
+):
+    B, T, _ = conv_out.shape
+    Dk = int(gdn.head_k_dim)
+    Dv = int(gdn.head_v_dim)
+    Hk = int(gdn.num_k_heads)
+    Hv = int(gdn.num_v_heads)
+    input_type = conv_out.dtype
+    state_type = state.dtype
+    return _linear_gated_delta_from_conv_tape_kernel(
+        inputs=[conv_out, g, beta, state, T],
+        template=[
+            ("InT", input_type),
+            ("StT", state_type),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
+            ("KeyDim", int(gdn.key_dim)),
+            ("ConvDim", int(gdn.conv_dim)),
+        ],
+        grid=(32, Dv, B * Hv),
+        threadgroup=(32, int(tgy), 1),
+        output_shapes=[(B, T, Hv, Dv), (B, Hv, Dv, Dk), (B, T, Hv, Dv)],
+        output_dtypes=[input_type, state_type, mx.float32],
+    )
+
+
+def _headquarter_tape_capture_configured(
+    conv_out: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    state: mx.array,
+    gdn: Any,
+    *,
+    kernel: Callable[..., Any],
+    simds: int,
+    quarters: int,
+):
+    B, T, _ = conv_out.shape
+    Dk = int(gdn.head_k_dim)
+    Dv = int(gdn.head_v_dim)
+    Hk = int(gdn.num_k_heads)
+    Hv = int(gdn.num_v_heads)
+    input_type = conv_out.dtype
+    state_type = state.dtype
+    return kernel(
+        inputs=[conv_out, g, beta, state, T],
+        template=[
+            ("InT", input_type),
+            ("StT", state_type),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
+            ("KeyDim", int(gdn.key_dim)),
+            ("ConvDim", int(gdn.conv_dim)),
+            ("Quarters", int(quarters)),
+            ("Simds", int(simds)),
+        ],
+        grid=(int(simds) * 32, int(quarters), B * Hv),
+        threadgroup=(int(simds) * 32, 1, 1),
+        output_shapes=[(B, T, Hv, Dv), (B, Hv, Dv, Dk), (B, T, Hv, Dv)],
+        output_dtypes=[input_type, state_type, mx.float32],
+    )
+
+
+def _linear_gated_delta_from_conv_tape_capture_configured(
+    conv_out: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    state: mx.array,
+    gdn: Any,
+    *,
+    implementation: str,
+    tgy: int,
+):
+    """Construction helper; installed configs bind one direct backend callable."""
+    if implementation == "headquarter":
+        from .kernels.gdn_tape_headquarter import headquarter_tape_capture
+
+        return headquarter_tape_capture(conv_out, g, beta, state, gdn)
+    return _kernel_tape_capture_configured(
+        conv_out,
+        g,
+        beta,
+        state,
+        gdn,
+        tgy=tgy,
+    )
+
+
 def _linear_gated_delta_from_conv_tape_replay(
     tape: mx.array,
     conv_out: mx.array,
@@ -1875,6 +2190,7 @@ def _linear_gated_delta_from_conv_tape_replay(
     gdn_meta: Any,
     *,
     steps: int,
+    tgy: int | None = None,
 ):
     if _linear_gated_delta_from_conv_tape_replay_kernel is None:
         return None
@@ -1890,10 +2206,11 @@ def _linear_gated_delta_from_conv_tape_replay(
     Hv = _gdn_meta_int(gdn_meta, "num_v_heads")
     if Dk % 32 != 0:
         return None
-    try:
-        tgy = int(os.environ.get("MTPLX_LINEAR_GDN_FROM_CONV_TGY", "8"))
-    except ValueError:
-        tgy = 8
+    if tgy is None:
+        try:
+            tgy = int(os.environ.get("MTPLX_LINEAR_GDN_FROM_CONV_TGY", "8"))
+        except ValueError:
+            tgy = 8
     if tgy not in {4, 8, 16, 32} or Dv % tgy != 0:
         tgy = 8 if Dv % 8 == 0 else 4
     input_type = conv_out.dtype
@@ -1917,6 +2234,285 @@ def _linear_gated_delta_from_conv_tape_replay(
         output_dtypes=[state_type],
     )
     return state_out
+
+
+def _linear_gated_delta_from_conv_tape_replay_configured(
+    capture: Mapping[str, mx.array],
+    *,
+    steps: int,
+    kernel: Callable[..., Any],
+    target_width: int,
+    verified_tokens: int,
+    tgy: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    key_dim: int,
+    conv_dim: int,
+) -> mx.array:
+    """Replay one installed fixed-shape tape route without eligibility work."""
+    conv_out = capture["conv_out"]
+    state = capture["state_in"]
+    (state_out,) = kernel(
+        inputs=[
+            capture["tape"],
+            conv_out,
+            capture["g"],
+            state,
+            verified_tokens,
+        ],
+        template=[
+            ("InT", conv_out.dtype),
+            ("StT", state.dtype),
+            ("Dk", head_k_dim),
+            ("Dv", head_v_dim),
+            ("Hk", num_k_heads),
+            ("Hv", num_v_heads),
+            ("KeyDim", key_dim),
+            ("ConvDim", conv_dim),
+            ("Steps", int(steps)),
+        ],
+        grid=(32, head_v_dim, target_width * num_v_heads),
+        threadgroup=(32, tgy, 1),
+        output_shapes=[state.shape],
+        output_dtypes=[state.dtype],
+    )
+    return state_out
+
+
+def bind_qwen_tape_replay(
+    *,
+    gdn_layers: tuple[Any, ...],
+    target_width: int,
+    verified_tokens: int,
+    tgy: int,
+) -> Callable[..., mx.array]:
+    """Validate once and bind the direct configured rejection replay."""
+    if _linear_gated_delta_from_conv_tape_replay_kernel is None:
+        raise RuntimeError("configured tape replay kernel is unavailable")
+    geometries = {
+        (
+            _gdn_meta_int(gdn, "head_k_dim"),
+            _gdn_meta_int(gdn, "head_v_dim"),
+            _gdn_meta_int(gdn, "num_k_heads"),
+            _gdn_meta_int(gdn, "num_v_heads"),
+            _gdn_meta_int(gdn, "key_dim"),
+            _gdn_meta_int(gdn, "conv_dim"),
+        )
+        for gdn in gdn_layers
+    }
+    if len(geometries) != 1:
+        raise ValueError(
+            "configured tape replay requires one exact GDN geometry"
+        )
+    head_k_dim, head_v_dim, num_k_heads, num_v_heads, key_dim, conv_dim = (
+        geometries.pop()
+    )
+    if (
+        int(target_width) not in {1, 2}
+        or int(verified_tokens) != 3
+        or head_k_dim % 32 != 0
+        or int(tgy) not in {4, 8, 16, 32}
+        or head_v_dim % int(tgy) != 0
+    ):
+        raise ValueError("configured tape replay geometry is invalid")
+    return partial(
+        _linear_gated_delta_from_conv_tape_replay_configured,
+        kernel=_linear_gated_delta_from_conv_tape_replay_kernel,
+        target_width=int(target_width),
+        verified_tokens=int(verified_tokens),
+        tgy=int(tgy),
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        key_dim=key_dim,
+        conv_dim=conv_dim,
+    )
+
+
+def _commit_configured_recurrent_capture(
+    entry: Any,
+    capture: Mapping[str, mx.array],
+    *,
+    steps: int,
+    row: int,
+    replay: Callable[..., mx.array],
+    own_authoritative_state: Callable[[Any], Any],
+    install_state: Callable[[Any, list[mx.array]], None],
+) -> None:
+    conv_state = mx.contiguous(
+        capture["conv_states"][row : row + 1, int(steps) - 1, :, :]
+    )
+    replayed = replay(capture, steps=steps)
+    gdn_state = own_authoritative_state(
+        replayed[row : row + 1, :, :, :]
+    )
+    install_state(entry, [conv_state, gdn_state])
+
+
+def _commit_configured_recurrent_capture_memoized(
+    entry: Any,
+    capture: Mapping[str, mx.array],
+    *,
+    steps: int,
+    row: int,
+    layer_index: int,
+    replay: Callable[..., mx.array],
+    replay_memo: dict[tuple[int, int], mx.array],
+    own_authoritative_state: Callable[[Any], Any],
+    install_state: Callable[[Any, list[mx.array]], None],
+) -> None:
+    conv_state = mx.contiguous(
+        capture["conv_states"][row : row + 1, int(steps) - 1, :, :]
+    )
+    replay_key = (int(layer_index), int(steps))
+    try:
+        replayed = replay_memo[replay_key]
+    except KeyError:
+        replayed = replay(capture, steps=steps)
+        replay_memo[replay_key] = replayed
+    gdn_state = own_authoritative_state(
+        replayed[row : row + 1, :, :, :]
+    )
+    install_state(entry, [conv_state, gdn_state])
+
+
+def _install_request_recurrent_state(
+    entry: Any,
+    state: list[mx.array],
+) -> None:
+    entry[0] = state[0]
+    entry[1] = state[1]
+
+
+def _install_owned_recurrent_state(
+    entry: Any,
+    state: list[mx.array],
+) -> None:
+    entry.replace_state(state)
+
+
+def _install_owned_recurrent_state_lazy(
+    entry: Any,
+    state: list[mx.array],
+) -> None:
+    entry.replace_state_lazy_owned(state)
+
+
+def _trim_configured_attention_capture(
+    entry: Any,
+    _capture: Any,
+    *,
+    steps: int,
+    verified_tokens: int,
+) -> None:
+    entry.trim(verified_tokens - int(steps))
+
+
+def _trim_configured_attention_capture_memoized(
+    entry: Any,
+    capture: Any,
+    *,
+    steps: int,
+    verified_tokens: int,
+    replay_memo: dict[tuple[int, int], mx.array],
+) -> None:
+    del replay_memo
+    _trim_configured_attention_capture(
+        entry,
+        capture,
+        steps=steps,
+        verified_tokens=verified_tokens,
+    )
+
+
+def bind_qwen_capture_commit_route(
+    *,
+    config: QwenGDNVerifyConfig,
+    cache_routes: tuple[Any, ...],
+    layers: tuple[Any, ...],
+    target_width: int,
+    row: int,
+    verified_tokens: int,
+) -> Callable[..., list[Any]]:
+    """Bind one fixed cohort-row rejection commit route."""
+    del cache_routes
+    gdn_layers = tuple(
+        layer.linear_attn
+        for layer in layers
+        if bool(getattr(layer, "is_linear", False))
+    )
+    replay = bind_qwen_tape_replay(
+        gdn_layers=gdn_layers,
+        target_width=target_width,
+        verified_tokens=verified_tokens,
+        tgy=config.tape_replay_tgy,
+    )
+    install_recurrent_state = (
+        _install_request_recurrent_state
+        if target_width == 1
+        else _install_owned_recurrent_state_lazy
+    )
+    layer_commits = tuple(
+        partial(
+            (
+                _commit_configured_recurrent_capture
+                if target_width == 1
+                else _commit_configured_recurrent_capture_memoized
+            ),
+            row=row,
+            replay=replay,
+            own_authoritative_state=config.own_authoritative_state,
+            install_state=install_recurrent_state,
+            **(
+                {}
+                if target_width == 1
+                else {"layer_index": layer_index}
+            ),
+        )
+        if bool(getattr(layer, "is_linear", False))
+        else partial(
+            (
+                _trim_configured_attention_capture
+                if target_width == 1
+                else _trim_configured_attention_capture_memoized
+            ),
+            verified_tokens=verified_tokens,
+        )
+        for layer_index, layer in enumerate(layers)
+    )
+    if target_width == 1:
+        def commit_width1(
+            cache: list[Any],
+            captures: Mapping[int, Mapping[str, mx.array]],
+            *,
+            steps: int,
+        ) -> list[Any]:
+            for index, commit_layer in enumerate(layer_commits):
+                commit_layer(cache[index], captures.get(index), steps=steps)
+            return cache
+
+        return commit_width1
+
+    def commit_width2_request(
+        request_cache: list[Any],
+        captures: Mapping[int, Mapping[str, mx.array]],
+        *,
+        steps: int,
+        replay_memo: dict[tuple[int, int], mx.array],
+    ) -> list[Any]:
+        for index, commit_layer in enumerate(layer_commits):
+            commit_layer(
+                request_cache[index],
+                captures.get(index),
+                steps=steps,
+                replay_memo=replay_memo,
+            )
+        return request_cache
+
+    return commit_width2_request
 
 
 def _linear_gated_delta_from_conv_inline_g_capture(
@@ -2305,6 +2901,453 @@ def _stock_gated_delta_capture(
         outs.append(out)
         states.append(current)
     return mx.concatenate(outs, axis=1), mx.stack(states, axis=1)
+
+
+def _stock_gdn_tail(gdn: Any, out: mx.array, z: mx.array) -> mx.array:
+    B, S = out.shape[:2]
+    return gdn.out_proj(gdn.norm(out, z).reshape(B, S, -1))
+
+
+def _stock_qmv_gdn_tail(gdn: Any, out: mx.array, z: mx.array) -> mx.array:
+    B, S = out.shape[:2]
+    return _configured_qmv8_matmul(
+        gdn.norm(out, z).reshape(B, S, -1),
+        gdn.out_proj,
+    )
+
+
+def _fused_gdn_tail(gdn: Any, out: mx.array, z: mx.array) -> mx.array:
+    from .kernels.fused_norm import fused_gdn_norm_gate
+
+    B, S = out.shape[:2]
+    normalized = fused_gdn_norm_gate(out, z, gdn.norm.weight, gdn.norm.eps)
+    return gdn.out_proj(normalized.reshape(B, S, -1))
+
+
+def _fused_qmv_gdn_tail(gdn: Any, out: mx.array, z: mx.array) -> mx.array:
+    from .kernels.fused_norm import fused_gdn_norm_gate
+
+    B, S = out.shape[:2]
+    normalized = fused_gdn_norm_gate(out, z, gdn.norm.weight, gdn.norm.eps)
+    return _configured_qmv8_matmul(
+        normalized.reshape(B, S, -1),
+        gdn.out_proj,
+    )
+
+
+def _configured_qmv8_matmul(x: mx.array, module: Any) -> mx.array:
+    from .verify_qmv import _stocklike_qmv8_kernel
+
+    leading = x.shape[:-1]
+    m = 1
+    for dim in leading:
+        m *= int(dim)
+    k = int(x.shape[-1])
+    n = int(module.weight.shape[0])
+    x2 = mx.contiguous(x.reshape(m, k))
+    kernel = _stocklike_qmv8_kernel(int(module.group_size), x.dtype)
+    (y,) = kernel(
+        inputs=[x2, module.weight, module.scales, module.biases, k, n],
+        template=[("T", x.dtype), ("GS", int(module.group_size))],
+        grid=(32 * m, 2 * (n // 8), 1),
+        threadgroup=(32, 2, 1),
+        output_shapes=[(m, n)],
+        output_dtypes=[x.dtype],
+    )
+    return y.reshape(*leading, n)
+
+
+def _native_gdn_tail(
+    gdn: Any,
+    out: mx.array,
+    z: mx.array,
+    *,
+    native: Any,
+    num_simdgroups: int,
+) -> mx.array:
+    leading = out.shape[:-2]
+    m = 1
+    for dim in leading:
+        m *= int(dim)
+    hv = int(out.shape[-2])
+    dv = int(out.shape[-1])
+    out2 = mx.contiguous(out.reshape(m * hv, dv))
+    z2 = mx.contiguous(z.reshape(m * hv, dv))
+    projected = native.gdn_norm_gate_out_qmv8(
+        out2,
+        z2,
+        gdn.norm.weight,
+        gdn.out_proj.weight,
+        gdn.out_proj.scales,
+        gdn.out_proj.biases,
+        hv,
+        float(gdn.norm.eps),
+        int(gdn.out_proj.group_size),
+        int(num_simdgroups),
+    )
+    return projected.reshape(*leading, int(gdn.out_proj.weight.shape[0]))
+
+
+def _stock_post_norm_residual(
+    layer: Any,
+    hidden_states: mx.array,
+    residual: mx.array,
+) -> tuple[mx.array, mx.array]:
+    hidden = hidden_states + residual
+    return hidden, layer.post_attention_layernorm(hidden)
+
+
+def _fused_post_norm_residual(
+    layer: Any,
+    hidden_states: mx.array,
+    residual: mx.array,
+) -> tuple[mx.array, mx.array]:
+    from .kernels.fused_norm import fused_add_rmsnorm
+
+    return fused_add_rmsnorm(
+        hidden_states,
+        residual,
+        layer.post_attention_layernorm.weight,
+        layer.post_attention_layernorm.eps,
+        threadgroup_size=512,
+    )
+
+
+def _configured_recurrent_layer_step(
+    hidden_states: mx.array,
+    fa_mask: Any,
+    ssm_mask: Any,
+    layer_cache: Any,
+    *,
+    layer: Any,
+    config: QwenGDNVerifyConfig,
+) -> tuple[mx.array, dict[str, Any]]:
+    del fa_mask
+    normed = layer.input_layernorm(hidden_states)
+    residual, capture = gdn_forward_with_capture_configured(
+        layer.linear_attn,
+        normed,
+        ssm_mask,
+        layer_cache,
+        config=config,
+    )
+    hidden, mlp_input = config.apply_post_norm_residual(
+        layer,
+        hidden_states,
+        residual,
+    )
+    return hidden + layer.mlp(mlp_input), capture
+
+
+def _configured_attention_layer_step(
+    hidden_states: mx.array,
+    fa_mask: Any,
+    ssm_mask: Any,
+    layer_cache: Any,
+    *,
+    layer: Any,
+    config: QwenGDNVerifyConfig,
+) -> tuple[mx.array, None]:
+    del ssm_mask
+    normed = layer.input_layernorm(hidden_states)
+    residual = layer.self_attn(normed, mask=fa_mask, cache=layer_cache)
+    hidden, mlp_input = config.apply_post_norm_residual(
+        layer,
+        hidden_states,
+        residual,
+    )
+    return hidden + layer.mlp(mlp_input), None
+
+
+def _bind_configured_layer_routes(
+    config: QwenGDNVerifyConfig,
+    layers: tuple[Any, ...],
+) -> tuple[Callable[..., tuple[Any, dict[str, Any] | None]], ...]:
+    routes = []
+    for layer in layers:
+        operation = (
+            _configured_recurrent_layer_step
+            if bool(getattr(layer, "is_linear", False))
+            else _configured_attention_layer_step
+        )
+        routes.append(partial(operation, layer=layer, config=config))
+    return tuple(routes)
+
+
+def _parse_layer_eval_schedule(raw: str) -> tuple[tuple[int, int], ...]:
+    schedule: list[tuple[int, int]] = []
+    for part in raw.replace(";", ",").split(","):
+        item = part.strip()
+        if not item:
+            continue
+        threshold_text, every_text = item.split(":", 1)
+        schedule.append((int(threshold_text), max(0, int(every_text))))
+    return tuple(schedule)
+
+
+def resolve_qwen_gdn_verify_config(
+    *,
+    capture_backend: str,
+    hidden_variant: str,
+    model: Any,
+    target_width: int,
+    layers: tuple[Any, ...] = (),
+) -> QwenGDNVerifyConfig:
+    """Resolve every Qwen verify choice once at lane construction."""
+    backend = resolve_gdn_capture_backend(capture_backend)
+    if backend != "linear_gdn_from_conv_tape":
+        raise ValueError(
+            "fixed Qwen GDN verify requires linear_gdn_from_conv_tape"
+        )
+    gdn_layers = tuple(
+        layer.linear_attn
+        for layer in layers
+        if bool(getattr(layer, "is_linear", False))
+    )
+    text_model = getattr(model, "language_model", model)
+    inner = text_model.model
+    from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+    from mlx_lm.models.gated_delta import compute_g
+    attention_cache_index = int(inner.fa_idx)
+    attention_cache_type, cache_context_length = bind_qwen_cache_context_length(
+        layer_index=attention_cache_index,
+        target_width=target_width,
+    )
+    project_logits = (
+        inner.embed_tokens.as_linear
+        if bool(text_model.args.tie_word_embeddings)
+        else text_model.lm_head
+    )
+
+    projection_raw = os.environ.get("MTPLX_FUSE_GDN_PROJECTIONS", "").lower()
+    if projection_raw in {"all", "4to1", "one", "1", "true", "yes", "on"}:
+        raise ValueError(
+            "fixed Qwen GDN verify does not install dynamically validated "
+            "projection fusion"
+        )
+    projection_path = "stock"
+    project_inputs = _stock_gdn_input_projections
+    (
+        authoritative_state_path,
+        own_authoritative_state,
+    ) = bind_qwen_authoritative_state_operation()
+
+    if _env_enabled("MTPLX_LINEAR_CONV1D_CAPTURE"):
+        if _linear_conv1d_kernel is None:
+            raise RuntimeError("configured linear Conv1d capture kernel is unavailable")
+        for gdn in gdn_layers:
+            weight = gdn.conv1d.weight
+            if (
+                len(weight.shape) != 3
+                or int(weight.shape[0]) != int(gdn.conv_dim)
+                or int(weight.shape[1]) != int(gdn.conv_kernel_size)
+                or int(weight.shape[2]) != 1
+            ):
+                raise ValueError("configured linear Conv1d geometry is invalid")
+        linear_conv_path = "linear"
+        capture_conv = _linear_conv1d_capture_configured
+    else:
+        linear_conv_path = "stock"
+        capture_conv = _stock_conv1d_capture_configured
+
+    tape_implementation = (
+        os.environ.get("MTPLX_LINEAR_GDN_TAPE_IMPL", "").strip().lower()
+        or "kernel"
+    )
+    tape_tgy = int(os.environ.get("MTPLX_LINEAR_GDN_FROM_CONV_TGY", "8") or "8")
+    if tape_implementation == "headquarter":
+        from .kernels import gdn_tape_headquarter
+
+        if gdn_tape_headquarter._KERNEL is None:
+            raise RuntimeError("configured headquarter tape kernel is unavailable")
+        simds = int(gdn_tape_headquarter._SIMDS)
+        quarters = int(gdn_tape_headquarter._QUARTERS)
+        for gdn in gdn_layers:
+            qsize = int(gdn.head_v_dim) // quarters
+            if (
+                int(gdn.head_k_dim) % 32 != 0
+                or int(gdn.head_v_dim) % quarters != 0
+                or qsize % simds != 0
+                or int(gdn.num_v_heads) % int(gdn.num_k_heads) != 0
+            ):
+                raise ValueError("configured headquarter tape geometry is invalid")
+        capture_delta = partial(
+            _headquarter_tape_capture_configured,
+            kernel=gdn_tape_headquarter._KERNEL,
+            simds=simds,
+            quarters=quarters,
+        )
+    elif tape_implementation == "kernel":
+        if _linear_gated_delta_from_conv_tape_kernel is None:
+            raise RuntimeError("configured tape capture kernel is unavailable")
+        for gdn in gdn_layers:
+            if (
+                int(gdn.head_k_dim) % 32 != 0
+                or tape_tgy not in {4, 8, 16, 32}
+                or int(gdn.head_v_dim) % tape_tgy != 0
+            ):
+                raise ValueError("configured tape capture geometry is invalid")
+        capture_delta = partial(_kernel_tape_capture_configured, tgy=tape_tgy)
+    else:
+        raise ValueError(
+            f"unsupported configured Qwen tape implementation: {tape_implementation}"
+        )
+
+    from .kernel_selfcheck import lane_disabled
+
+    qmv_enabled = _env_enabled("MTPLX_GDN_OUT_QMV8")
+    if qmv_enabled:
+        from .verify_qmv import is_stocklike_qmv8_eligible
+
+        for gdn in gdn_layers:
+            if (
+                not is_stocklike_qmv8_eligible(gdn.out_proj)
+                or "bias" in gdn.out_proj
+                or gdn.out_proj.scales.dtype != gdn.norm.weight.dtype
+                or gdn.out_proj.biases.dtype != gdn.norm.weight.dtype
+            ):
+                raise ValueError("configured QMV8 GDN output geometry is invalid")
+    if _env_enabled("MTPLX_NATIVE_GDN_TAIL"):
+        from .kernels import native_gdn_tail
+
+        native = native_gdn_tail._native_module()
+        if native is None:
+            raise RuntimeError("configured native GDN tail is unavailable")
+        for gdn in gdn_layers:
+            out_proj = gdn.out_proj
+            if (
+                int(getattr(out_proj, "bits", 0) or 0) != 8
+                or int(getattr(out_proj, "group_size", 0) or 0)
+                not in {32, 64, 128}
+                or str(getattr(out_proj, "mode", "affine")) != "affine"
+                or "bias" in out_proj
+                or int(out_proj.weight.shape[1]) * 4
+                != int(gdn.num_v_heads) * int(gdn.head_v_dim)
+                or out_proj.scales.dtype != gdn.norm.weight.dtype
+                or out_proj.biases.dtype != gdn.norm.weight.dtype
+            ):
+                raise ValueError("configured native GDN tail geometry is invalid")
+        simdgroups = int(os.environ.get("MTPLX_NATIVE_GDN_TAIL_SIMDGROUPS") or 2)
+        gdn_tail_path = f"native_sg{simdgroups}"
+        apply_gdn_tail = partial(
+            _native_gdn_tail,
+            native=native,
+            num_simdgroups=simdgroups,
+        )
+    elif (
+        _env_enabled("MTPLX_FUSE_GDN_NORM_GATE")
+        and not lane_disabled("fused_gdn_norm_gate")
+    ):
+        gdn_tail_path = "fused_norm_qmv" if qmv_enabled else "fused_norm"
+        apply_gdn_tail = _fused_qmv_gdn_tail if qmv_enabled else _fused_gdn_tail
+    else:
+        gdn_tail_path = "stock_qmv" if qmv_enabled else "stock"
+        apply_gdn_tail = _stock_qmv_gdn_tail if qmv_enabled else _stock_gdn_tail
+
+    if (
+        _env_enabled("MTPLX_FUSE_POST_NORM_RESIDUAL")
+        and not lane_disabled("fused_add_rmsnorm")
+    ):
+        residual_path = "fused"
+        apply_post_norm_residual = _fused_post_norm_residual
+    else:
+        residual_path = "stock"
+        apply_post_norm_residual = _stock_post_norm_residual
+
+    config = QwenGDNVerifyConfig(
+        capture_backend=backend,
+        projection_path=projection_path,
+        linear_conv_path=linear_conv_path,
+        gdn_tail_path=gdn_tail_path,
+        residual_path=residual_path,
+        hidden_variant=hidden_variant,
+        target_width=target_width,
+        attention_cache_type=attention_cache_type,
+        layer_eval_every=int(
+            os.environ.get("MTPLX_TARGET_LAYER_EVAL_EVERY", "0") or "0"
+        ),
+        layer_eval_schedule=_parse_layer_eval_schedule(
+            os.environ.get("MTPLX_TARGET_LAYER_EVAL_SCHEDULE", "")
+        ),
+        layer_eval_context_threshold=int(
+            os.environ.get("MTPLX_TARGET_LAYER_EVAL_CONTEXT_THRESHOLD", "0")
+            or "0"
+        ),
+        layer_eval_max_q=int(
+            os.environ.get("MTPLX_TARGET_LAYER_EVAL_MAX_Q", "8") or "8"
+        ),
+        tape_replay_tgy=tape_tgy,
+        project_inputs=project_inputs,
+        capture_conv=capture_conv,
+        capture_delta=capture_delta,
+        compute_g=compute_g,
+        authoritative_state_path=authoritative_state_path,
+        own_authoritative_state=own_authoritative_state,
+        apply_gdn_tail=apply_gdn_tail,
+        apply_post_norm_residual=apply_post_norm_residual,
+        embed_inputs=inner.embed_tokens,
+        create_fa_mask=partial(
+            _configured_mask,
+            create=create_attention_mask,
+            layer_index=attention_cache_index,
+        ),
+        create_ssm_mask=partial(
+            _configured_mask,
+            create=create_ssm_mask,
+            layer_index=int(inner.ssm_idx),
+        ),
+        cache_context_length=cache_context_length,
+        final_norm=inner.norm,
+        project_logits=project_logits,
+    )
+    return replace(
+        config,
+        layer_routes=_bind_configured_layer_routes(config, layers),
+    )
+
+
+def gdn_forward_with_capture_configured(
+    gdn: Any,
+    inputs: mx.array,
+    mask: Any,
+    cache: Any,
+    *,
+    config: QwenGDNVerifyConfig,
+) -> tuple[mx.array, dict[str, Any]]:
+    """Run the installed tape capture route without dynamic eligibility checks."""
+    del mask
+
+    B, S, _ = inputs.shape
+    qkv, z, b, a = config.project_inputs(gdn, inputs)
+    z = z.reshape(B, S, gdn.num_v_heads, gdn.head_v_dim)
+    conv_state = cache[0]
+    conv_out, conv_states = config.capture_conv(qkv, conv_state, gdn)
+    state = cache[1]
+    beta = mx.sigmoid(b)
+    g = config.compute_g(gdn.A_log, a, gdn.dt_bias)
+    out, final_state, tape = config.capture_delta(
+        conv_out,
+        g,
+        beta,
+        state,
+        gdn,
+    )
+    states = final_state[:, None, :, :, :]
+    cache[0] = mx.contiguous(conv_states[:, -1, :, :])
+    cache[1] = config.own_authoritative_state(
+        states[:, -1, :, :, :]
+    )
+    cache.advance(S)
+    out = config.apply_gdn_tail(gdn, out, z)
+    return out, {
+        "conv_states": conv_states,
+        "conv_out": conv_out,
+        "g": g,
+        "state_in": state,
+        "tape": tape,
+        "gdn_meta": _gdn_tape_meta(gdn),
+        "tape_replay_tgy": config.tape_replay_tgy,
+    }
 
 
 def gdn_forward_with_capture(
@@ -2879,6 +3922,145 @@ def qualify_captured_prefix_commit(
     )
 
 
+def _forward_with_gdn_capture_impl(
+    model: Any,
+    inputs: mx.array,
+    cache: list[Any],
+    *,
+    config: QwenGDNVerifyConfig,
+) -> tuple[mx.array, mx.array, dict[int, dict[str, mx.array]]]:
+    del model
+    hidden_states = config.embed_inputs(inputs)
+    fa_mask = config.create_fa_mask(hidden_states, cache)
+    ssm_mask = config.create_ssm_mask(hidden_states, cache)
+    captures: dict[int, dict[str, mx.array]] = {}
+    context_len = config.cache_context_length(cache)
+    layer_eval_every = config.eval_every(context_len)
+    layer_eval_enabled = (
+        layer_eval_every > 0
+        and int(inputs.shape[1]) <= max(1, config.layer_eval_max_q)
+        and context_len >= max(0, config.layer_eval_context_threshold)
+    )
+
+    for layer_idx, (route, layer_cache) in enumerate(
+        zip(config.layer_routes, cache)
+    ):
+        hidden_states, capture = route(
+            hidden_states,
+            fa_mask,
+            ssm_mask,
+            layer_cache,
+        )
+        if capture is not None:
+            captures[layer_idx] = capture
+        if layer_eval_enabled and (layer_idx + 1) % layer_eval_every == 0:
+            mx.eval(hidden_states)
+
+    pre_norm = hidden_states
+    post_norm = config.final_norm(hidden_states)
+    logits = config.project_logits(post_norm)
+    hidden = pre_norm if config.hidden_variant == "pre_norm" else post_norm
+    return logits, hidden, captures
+
+
+def forward_with_gdn_capture_configured(
+    model: Any,
+    inputs: mx.array,
+    cache: list[Any],
+    *,
+    config: QwenGDNVerifyConfig,
+) -> tuple[mx.array, mx.array, dict[int, dict[str, mx.array]]]:
+    return _forward_with_gdn_capture_impl(
+        model,
+        inputs,
+        cache,
+        config=config,
+    )
+
+
+def _contains_captured_array(value: Any) -> bool:
+    if isinstance(value, mx.array):
+        return True
+    if isinstance(value, Mapping):
+        return any(_contains_captured_array(item) for item in value.values())
+    if isinstance(value, list | tuple):
+        return any(_contains_captured_array(item) for item in value)
+    return False
+
+
+def _extract_captured_value(value: Any, row: int) -> Any:
+    if isinstance(value, mx.array):
+        if value.ndim == 0:
+            return value
+        owned = mx.contiguous(value[row : row + 1])
+        mx.eval(owned)
+        return owned
+    if isinstance(value, Mapping):
+        if not _contains_captured_array(value):
+            return value
+        return {
+            key: _extract_captured_value(item, row)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        if not _contains_captured_array(value):
+            return value
+        return tuple(_extract_captured_value(item, row) for item in value)
+    if isinstance(value, list):
+        if not _contains_captured_array(value):
+            return value
+        return [_extract_captured_value(item, row) for item in value]
+    return value
+
+
+def extract_captured_row(
+    captures: Mapping[Any, Any],
+    row: int,
+) -> dict[Any, Any]:
+    """Own every batch-array leaf before a request-local capture commit."""
+    return {
+        key: _extract_captured_value(value, row)
+        for key, value in captures.items()
+    }
+
+
+def _extract_captured_value_lazy(value: Any, row: int) -> Any:
+    if isinstance(value, mx.array):
+        if value.ndim == 0:
+            return value
+        source = value[row : row + 1]
+        owned = mx.zeros(source.shape, dtype=source.dtype)
+        owned[tuple(slice(None) for _ in source.shape)] = source
+        return owned
+    if isinstance(value, Mapping):
+        if not _contains_captured_array(value):
+            return value
+        return {
+            key: _extract_captured_value_lazy(item, row)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        if not _contains_captured_array(value):
+            return value
+        return tuple(_extract_captured_value_lazy(item, row) for item in value)
+    if isinstance(value, list):
+        if not _contains_captured_array(value):
+            return value
+        return [_extract_captured_value_lazy(item, row) for item in value]
+    return value
+
+
+def extract_captured_row_lazy(
+    captures: Mapping[Any, Any],
+    row: int,
+) -> dict[Any, Any]:
+    """Own one capture row without evaluating its lazy copy graph."""
+    return {
+        key: _extract_captured_value_lazy(value, row)
+        for key, value in captures.items()
+    }
+
+
 def commit_captured_prefix(
     cache: list[Any],
     captures: dict[int, dict[str, mx.array]],
@@ -2928,6 +4110,7 @@ def commit_captured_prefix(
                     capture["state_in"],
                     capture.get("gdn_meta", capture.get("gdn")),
                     steps=capture_index + 1,
+                    tgy=capture.get("tape_replay_tgy"),
                 )
                 if replayed_state is None:
                     return False

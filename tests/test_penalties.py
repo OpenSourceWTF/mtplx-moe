@@ -13,11 +13,20 @@ from __future__ import annotations
 
 import mlx.core as mx
 import numpy as np
+import pytest
 
 from mtplx.fast_sampling import apply_penalties_mlx, sparse_distribution_from_mlx_logits
 from mtplx.generation import generate_ar, generate_mtpk
 from mtplx.sampling import SamplerConfig, apply_penalties, distribution_from_logits
 from tests.test_generation_sustained import AcceptingTinyMTPModel, TinyModel, _runtime
+
+
+@pytest.fixture(autouse=True)
+def _generation_diagnostics_enabled(monkeypatch):
+    """Keep this module independent of a serving profile in the parent shell."""
+
+    monkeypatch.setenv("MTPLX_DROP_EVENTS", "0")
+    monkeypatch.setenv("MTPLX_SKIP_VERIFY_SNAPSHOT", "0")
 
 
 def _mtpk(model, **kw):

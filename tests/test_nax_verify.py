@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+from importlib.metadata import version
+from threading import Event, Thread
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
 from mtplx.nax_verify import (
+    FixedQMMExecution,
+    fixed_qmm_execution_scope,
     install_nax_qlinear_patch,
     m4_ksplit_eligible,
     m16_nax_eligible,
     nax_available,
     nax_qmm_m4,
     nax_qmm_m16,
+    qlinear_patch_snapshot,
     uninstall_nax_qlinear_patch,
 )
 
@@ -80,6 +86,272 @@ def test_qlinear_patch_routes_only_verify_shapes() -> None:
             y = layer(x)
             mx.eval(y)
             assert y.shape == (m, 256)
+    finally:
+        uninstall_nax_qlinear_patch()
+
+
+def test_qlinear_patch_snapshot_captures_stock_without_mutation() -> None:
+    before = qlinear_patch_snapshot()
+
+    assert before.installed is False
+    assert before.stock_call is nn.QuantizedLinear.__call__
+    report = install_nax_qlinear_patch()
+    try:
+        assert report["installed"] is True
+        after = qlinear_patch_snapshot()
+        assert after.installed is True
+        assert after.stock_call is before.stock_call
+    finally:
+        uninstall_nax_qlinear_patch()
+
+
+def test_fixed_patch_lease_preserves_initial_stock_and_blocks_uninstall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mtplx.nax_verify import prepare_fixed_qlinear_patch_lease
+
+    original = nn.QuantizedLinear.__call__
+    lease = prepare_fixed_qlinear_patch_lease()
+    assert lease.stock_call is original
+    assert lease.initially_dynamic is False
+    lease.acquire()
+    layer = nn.QuantizedLinear(512, 256, bias=False, group_size=64, bits=4)
+    route_calls: list[int] = []
+    sentinel = object()
+
+    class Route:
+        def execute(self, _x, *, width):
+            route_calls.append(width)
+            return sentinel
+
+    execution = FixedQMMExecution(routes={id(layer): Route()}, width=2)
+    x = mx.zeros((4, 512), dtype=mx.bfloat16)
+    try:
+        outside = layer(x)
+        mx.eval(outside)
+        assert outside.shape == (4, 256)
+        assert route_calls == []
+        with fixed_qmm_execution_scope(execution):
+            assert layer(object()) is sentinel
+        assert route_calls == [2]
+        with pytest.raises(RuntimeError, match="fixed QMM owner"):
+            uninstall_nax_qlinear_patch()
+        with fixed_qmm_execution_scope(execution):
+            assert layer(object()) is sentinel
+    finally:
+        lease.release()
+    assert nn.QuantizedLinear.__call__ is original
+
+
+def test_fixed_patch_lease_preserves_initial_dynamic_outside_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mtplx import nax_verify
+    from mtplx.attention_context import attention_phase
+    from mtplx.nax_verify import prepare_fixed_qlinear_patch_lease
+
+    original = nn.QuantizedLinear.__call__
+    install_nax_qlinear_patch()
+    dynamic = nn.QuantizedLinear.__call__
+    lease = prepare_fixed_qlinear_patch_lease()
+    assert lease.stock_call is original
+    assert lease.initially_dynamic is True
+    lease.acquire()
+    layer = nn.QuantizedLinear(512, 256, bias=False, group_size=64, bits=4)
+    dynamic_calls: list[tuple[int, int]] = []
+
+    def fake_m4(x, weight, scales, biases, *, group_size):
+        del scales, biases, group_size
+        dynamic_calls.append((int(x.shape[0]), int(weight.shape[0])))
+        return mx.zeros((int(x.shape[0]), int(weight.shape[0])), dtype=x.dtype)
+
+    monkeypatch.setattr(nax_verify, "nax_qmm_m4", fake_m4)
+    x = mx.zeros((4, 512), dtype=mx.bfloat16)
+    try:
+        with attention_phase("decode_verify"):
+            outside = layer(x)
+            mx.eval(outside)
+        assert outside.shape == (4, 256)
+        assert dynamic_calls == [(4, 256)]
+        with pytest.raises(RuntimeError, match="fixed QMM owner"):
+            uninstall_nax_qlinear_patch()
+        assert nn.QuantizedLinear.__call__ is dynamic
+    finally:
+        lease.release()
+        uninstall_nax_qlinear_patch()
+    assert nn.QuantizedLinear.__call__ is original
+
+
+def test_acquire_and_uninstall_share_one_serialized_state_transition() -> None:
+    from mtplx import nax_verify
+    from mtplx.nax_verify import prepare_fixed_qlinear_patch_lease
+
+    original = nn.QuantizedLinear.__call__
+    install_nax_qlinear_patch()
+    dynamic = nn.QuantizedLinear.__call__
+    lease = prepare_fixed_qlinear_patch_lease()
+    acquire_started = Event()
+    acquire_done = Event()
+    uninstall_started = Event()
+    uninstall_done = Event()
+    acquire_errors: list[Exception] = []
+    uninstall_errors: list[Exception] = []
+
+    def acquire() -> None:
+        acquire_started.set()
+        try:
+            lease.acquire()
+        except Exception as exc:
+            acquire_errors.append(exc)
+        finally:
+            acquire_done.set()
+
+    def uninstall() -> None:
+        uninstall_started.set()
+        try:
+            uninstall_nax_qlinear_patch()
+        except Exception as exc:
+            uninstall_errors.append(exc)
+        finally:
+            uninstall_done.set()
+
+    nax_verify._QLINEAR_PATCH_LOCK.acquire()
+    acquire_thread = Thread(target=acquire)
+    uninstall_thread = Thread(target=uninstall)
+    acquire_was_blocked = False
+    uninstall_was_blocked = False
+    try:
+        acquire_thread.start()
+        assert acquire_started.wait(timeout=1.0)
+        uninstall_thread.start()
+        assert uninstall_started.wait(timeout=1.0)
+        acquire_was_blocked = not acquire_done.wait(timeout=0.05)
+        uninstall_was_blocked = not uninstall_done.wait(timeout=0.05)
+    finally:
+        nax_verify._QLINEAR_PATCH_LOCK.release()
+    acquire_thread.join(timeout=1.0)
+    uninstall_thread.join(timeout=1.0)
+
+    try:
+        assert acquire_was_blocked
+        assert uninstall_was_blocked
+        assert acquire_done.is_set()
+        assert uninstall_done.is_set()
+        assert not (lease.active and nn.QuantizedLinear.__call__ is original)
+        if lease.active:
+            assert nn.QuantizedLinear.__call__ is dynamic
+            assert not acquire_errors
+            assert len(uninstall_errors) == 1
+        else:
+            assert nn.QuantizedLinear.__call__ is original
+            assert len(acquire_errors) == 1
+            assert not uninstall_errors
+    finally:
+        if lease.active:
+            lease.release()
+        if nax_verify._QLINEAR_PATCH["installed"]:
+            uninstall_nax_qlinear_patch()
+    assert nn.QuantizedLinear.__call__ is original
+
+
+def test_concurrent_dynamic_install_cannot_capture_fixed_wrapper_as_stock() -> None:
+    from mtplx import nax_verify
+    from mtplx.nax_verify import prepare_fixed_qlinear_patch_lease
+
+    original = nn.QuantizedLinear.__call__
+    lease = prepare_fixed_qlinear_patch_lease()
+    acquire_started = Event()
+    acquire_done = Event()
+    install_started = Event()
+    install_done = Event()
+    acquire_errors: list[Exception] = []
+    install_errors: list[Exception] = []
+
+    def acquire() -> None:
+        acquire_started.set()
+        try:
+            lease.acquire()
+        except Exception as exc:
+            acquire_errors.append(exc)
+        finally:
+            acquire_done.set()
+
+    def install() -> None:
+        install_started.set()
+        try:
+            install_nax_qlinear_patch()
+        except Exception as exc:
+            install_errors.append(exc)
+        finally:
+            install_done.set()
+
+    nax_verify._QLINEAR_PATCH_LOCK.acquire()
+    acquire_thread = Thread(target=acquire)
+    install_thread = Thread(target=install)
+    acquire_was_blocked = False
+    install_was_blocked = False
+    try:
+        acquire_thread.start()
+        assert acquire_started.wait(timeout=1.0)
+        install_thread.start()
+        assert install_started.wait(timeout=1.0)
+        acquire_was_blocked = not acquire_done.wait(timeout=0.05)
+        install_was_blocked = not install_done.wait(timeout=0.05)
+    finally:
+        nax_verify._QLINEAR_PATCH_LOCK.release()
+    acquire_thread.join(timeout=1.0)
+    install_thread.join(timeout=1.0)
+
+    try:
+        assert acquire_was_blocked
+        assert install_was_blocked
+        assert acquire_done.is_set()
+        assert install_done.is_set()
+        assert not install_errors
+        assert nax_verify.qlinear_patch_snapshot().stock_call is original
+        if nax_verify._QLINEAR_PATCH["installed"]:
+            assert nax_verify._QLINEAR_PATCH["original"] is original
+        if lease.active:
+            assert not acquire_errors
+        else:
+            assert len(acquire_errors) == 1
+    finally:
+        if lease.active:
+            lease.release()
+        if nax_verify._QLINEAR_PATCH["installed"]:
+            uninstall_nax_qlinear_patch()
+    assert nn.QuantizedLinear.__call__ is original
+
+
+def test_qlinear_patch_fixed_scope_executes_prebuilt_route_before_dynamic_gates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mtplx import nax_verify
+    from mtplx import kernel_selfcheck
+
+    report = install_nax_qlinear_patch()
+    assert report["installed"] is True
+    layer = nn.QuantizedLinear(512, 256, bias=False, group_size=64, bits=4)
+    sentinel = object()
+    calls: list[tuple[object, int]] = []
+
+    class Route:
+        def execute(self, x, *, width):
+            calls.append((x, width))
+            return sentinel
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("dynamic gate reached from fixed qlinear scope")
+
+    monkeypatch.setattr(nax_verify, "m6_ksplit_eligible", forbidden)
+    monkeypatch.setattr(kernel_selfcheck, "lane_disabled", forbidden)
+    monkeypatch.setattr(nax_verify.os.environ, "get", forbidden)
+    x = object()
+    execution = FixedQMMExecution(routes={id(layer): Route()}, width=2)
+    try:
+        with fixed_qmm_execution_scope(execution):
+            assert layer(x) is sentinel
+        assert calls == [(x, 2)]
     finally:
         uninstall_nax_qlinear_patch()
 
@@ -154,6 +426,114 @@ def test_m6_kernel_matches_stock_within_tolerance() -> None:
         assert diff < 0.25, f"m6 kernel drift too large at M={m}: {diff}"
     assert not m6_ksplit_eligible(4, K, N, 4, 64, mx.bfloat16)
     assert not m6_ksplit_eligible(7, K, N, 4, 64, mx.bfloat16)
+
+
+def test_m6_kp1_bn2_kernel_matches_stock_within_tolerance() -> None:
+    from mtplx.nax_verify import nax_qmm_m6_kp1_bn2
+
+    K, N = 5120, 6144
+    w_q, scales, biases = _quantized_fixture(K, N)
+    x = (mx.random.normal((6, K), dtype=mx.float32) * 0.5).astype(mx.bfloat16)
+
+    y = nax_qmm_m6_kp1_bn2(x, w_q, scales, biases, group_size=64)
+    ref = _stock(x, w_q, scales, biases)
+    diff = float(mx.abs(y.astype(mx.float32) - ref.astype(mx.float32)).max())
+
+    assert y.shape == (6, N)
+    assert diff < 0.25, f"m6 Kp1/BN2 kernel drift too large: {diff}"
+
+
+@pytest.mark.skipif(
+    tuple(int(part) for part in version("mlx").split(".")[:2]) < (0, 32),
+    reason="MLX before 0.32 routes M=6 through qmv_fast instead of qmv_wide",
+)
+@pytest.mark.parametrize(("K", "N"), [(5120, 48), (6144, 1024)])
+def test_m6_qmv_wide_vec6_kernel_is_bit_exact_to_stock(K: int, N: int) -> None:
+    from mtplx.nax_verify import nax_qmm_m6_qmv_wide_vec6
+
+    w_q, scales, biases = _quantized_fixture(K, N)
+    x = (mx.random.normal((6, K), dtype=mx.float32) * 0.5).astype(mx.bfloat16)
+
+    y = nax_qmm_m6_qmv_wide_vec6(
+        x,
+        w_q,
+        scales,
+        biases,
+        group_size=64,
+    )
+    ref = _stock(x, w_q, scales, biases)
+    mx.eval(y, ref)
+
+    assert y.shape == (6, N)
+    assert mx.array_equal(y, ref).item()
+
+
+def test_m6_qmv_wide_vec6_uses_sustained_two_simdgroup_layer_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mtplx.nax_verify as nax_verify
+
+    observed: dict[str, object] = {}
+
+    def fake_kernel(**kwargs):
+        observed.update(kwargs)
+        return (mx.zeros((6, 48), dtype=mx.bfloat16),)
+
+    monkeypatch.setattr(
+        nax_verify,
+        "_build_kernel_m6_qmv_wide_vec6",
+        lambda _group_size, _dtype, _k, _n: fake_kernel,
+    )
+    nax_verify.nax_qmm_m6_qmv_wide_vec6(
+        mx.zeros((6, 5120), dtype=mx.bfloat16),
+        mx.zeros((48, 640), dtype=mx.uint32),
+        mx.zeros((48, 80), dtype=mx.bfloat16),
+        mx.zeros((48, 80), dtype=mx.bfloat16),
+    )
+
+    assert observed["grid"] == (32, 12, 1)
+    assert observed["threadgroup"] == (32, 2, 1)
+
+
+def test_m6_qmv_wide_vec6_compiles_the_committed_shape_without_tail_guards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mtplx.nax_verify as nax_verify
+
+    observed: dict[str, object] = {}
+
+    def fake_metal_kernel(**kwargs):
+        observed.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(nax_verify.mx.fast, "metal_kernel", fake_metal_kernel)
+    nax_verify._VERIFY_KERNEL_CACHE.pop(
+        ("m6_qmv_wide_vec6_sg2", 64, mx.bfloat16, 5120, 48),
+        None,
+    )
+
+    nax_verify._build_kernel_m6_qmv_wide_vec6(
+        64,
+        mx.bfloat16,
+        5120,
+        48,
+    )
+
+    source = str(observed["source"])
+    assert "constexpr int K = 5120;" in source
+    assert "constexpr int N = 48;" in source
+    assert "min(out_row, N - 1)" not in source
+    assert "out_row < N" not in source
+    assert observed["input_names"] == ["x", "w_q", "scales", "biases"]
+
+
+def test_m6_qmv_wide_vec6_uses_sg4_only_for_the_unique_lm_head_shape(
+) -> None:
+    import mtplx.nax_verify as nax_verify
+
+    assert nax_verify._m6_qmv_wide_simdgroups(5120, 248320) == 4
+    assert nax_verify._m6_qmv_wide_simdgroups(5120, 17408) == 2
+    assert nax_verify._m6_qmv_wide_simdgroups(17408, 5120) == 2
 
 
 def test_vk_6bit_hexpack_ksplit_matches_stock() -> None:
