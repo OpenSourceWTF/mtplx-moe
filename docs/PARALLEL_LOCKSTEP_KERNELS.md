@@ -39,10 +39,17 @@ enters only as values-per-uint32 (8 nibbles vs 4 bytes) in the K-split, and as
 the nibble-vs-byte decode block in the qmv_wide (the q4 path masks the high
 nibble in place and folds the ×16 into the scale because stock does; at q8
 each byte is the value). Both verified `dmax == 0.0` against stock at both
-widths on the real shapes. **6-bit is not supported**: 5.33 values per uint32
-straddle word boundaries, so the per-word decode does not exist; a clean
-adaptation is possible (LCM(6,32) = 96 bits → 16 values per 3 words,
-compile-time repeating pattern) but has no consumer — see the A3B section.
+widths on the real shapes. **6-bit is supported on the K-split kernel**
+(2026-07-31): values straddle word boundaries at 5.33/uint32, so the decode
+works on 3-word/16-value blocks of the continuous little-endian bitstream
+(LCM(6,32) = 96 bits, straddles at fields 5 and 10, all shifts compile-time).
+Dequant verified bit-identical to `mx.dequantize` via one-hot probe (dmax 0.0
+at gs 32/64/128, both callers); full matmul sits in the family's
+reduction-order tolerance band (worst rel 1.3e-3) with argmax parity. The
+rendered 4-bit source is test-asserted byte-identical to the pre-change
+original. Consumer: the 35B-A3B Balance build's 6-bit dense projections
+(routing them onto the lane is a separate dispatcher decision, deliberately
+not changed here).
 Cache keys and kernel names carry the bit width so variants cannot collide.
 
 ## Per-build contracts: `CohortProfile`
