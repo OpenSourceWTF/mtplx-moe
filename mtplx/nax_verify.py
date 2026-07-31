@@ -687,44 +687,139 @@ def _build_kernel_m8_ksplit_np(group_size: int, dtype: mx.Dtype, *, k_parts: int
     return kernel
 
 
-def _build_kernel_m6_ksplit_np(
-    group_size: int,
-    dtype: mx.Dtype,
-    *,
-    k_parts: int = 2,
-    bn: int = 4,
-):
-    """6-row K-split variant (24 accumulators/thread, scalar row registers).
+# Per-width pieces of the m6 K-split source. 4-bit walks one uint32 of 8
+# nibble-aligned values; 6-bit walks a 3-word block of 16 values from MLX's
+# continuous little-endian bitstream. Everything outside these three slots is
+# width-independent, which is what keeps the 4-bit rendering byte-identical.
+_M6_UNIT_SETUP_BY_BITS = {
+    4: """int K_by_8 = K / 8;""",
+    6: """int K_by_16 = K / 16;
+        int W_row = 3 * K_by_16;""",
+}
 
-    Beats both stock qmm (1.14-1.80x) and the m16 NAX tile (1.03-1.15x) on all
-    live shapes at M=5..6 (2026-06-12 microbench), and unlike the NAX tile it
-    is plain SIMD — no G17/macOS-26.2 gate. Covers the D4/D5 verify shapes.
-    Note: an earlier un-unrolled probe measured 0.08-0.16x — explicit unrolls
-    and scalar v0..v5 registers are load-bearing, not style.
-    """
-    key = (
-        "m6_ksplit_np",
-        group_size,
-        dtype,
-        int(k_parts),
-        int(bn),
-    )
-    if key in _VERIFY_KERNEL_CACHE:
-        return _VERIFY_KERNEL_CACHE[key]
-
-    pack_setup = """
+_M6_PACK_RANGE_BY_BITS = {
+    4: """
         int packs_per_part = K_by_8 / K_PARTS;
         int pack_start = int(part) * packs_per_part;
         int pack_end = (int(part) == K_PARTS - 1)
             ? K_by_8
             : pack_start + packs_per_part;
-    """
-    pack_loop = (
-        "for (int pack = pack_start + int(lane); "
-        "pack < pack_end; pack += 32) {"
-    )
+    """,
+    6: """
+        int packs_per_part = K_by_16 / K_PARTS;
+        int pack_start = int(part) * packs_per_part;
+        int pack_end = (int(part) == K_PARTS - 1)
+            ? K_by_16
+            : pack_start + packs_per_part;
+    """,
+}
 
-    source = f"""
+_M6_INNER_BY_BITS = {
+    4: """for (int pack = pack_start + int(lane); pack < pack_end; pack += 32) {
+            int k_base = pack * 8;
+            Vec8 v0 = xv[(0 * K + k_base) / 8];
+            Vec8 v1 = xv[(1 * K + k_base) / 8];
+            Vec8 v2 = xv[(2 * K + k_base) / 8];
+            Vec8 v3 = xv[(3 * K + k_base) / 8];
+            Vec8 v4 = xv[(4 * K + k_base) / 8];
+            Vec8 v5 = xv[(5 * K + k_base) / 8];
+            _Pragma("unroll")
+            for (int j = 0; j < BN; ++j) {
+                uint32_t packed = w_q[(n0 + j) * K_by_8 + pack];
+                float s = float(scales[(n0 + j) * K_by_gs + (k_base / GS)]);
+                float b = float(biases[(n0 + j) * K_by_gs + (k_base / GS)]);
+                _Pragma("unroll")
+                for (int ki = 0; ki < 8; ++ki) {
+                    float wv = float((packed >> (ki * 4)) & 0xFu) * s + b;
+                    acc[j * M + 0] += float(v0[ki]) * wv;
+                    acc[j * M + 1] += float(v1[ki]) * wv;
+                    acc[j * M + 2] += float(v2[ki]) * wv;
+                    acc[j * M + 3] += float(v3[ki]) * wv;
+                    acc[j * M + 4] += float(v4[ki]) * wv;
+                    acc[j * M + 5] += float(v5[ki]) * wv;
+                }
+            }
+        }""",
+    6: """for (int pack = pack_start + int(lane); pack < pack_end; pack += 32) {
+            int k_base = pack * 16;
+            Vec8 v0a = xv[(0 * K + k_base) / 8]; Vec8 v0b = xv[(0 * K + k_base) / 8 + 1];
+            Vec8 v1a = xv[(1 * K + k_base) / 8]; Vec8 v1b = xv[(1 * K + k_base) / 8 + 1];
+            Vec8 v2a = xv[(2 * K + k_base) / 8]; Vec8 v2b = xv[(2 * K + k_base) / 8 + 1];
+            Vec8 v3a = xv[(3 * K + k_base) / 8]; Vec8 v3b = xv[(3 * K + k_base) / 8 + 1];
+            Vec8 v4a = xv[(4 * K + k_base) / 8]; Vec8 v4b = xv[(4 * K + k_base) / 8 + 1];
+            Vec8 v5a = xv[(5 * K + k_base) / 8]; Vec8 v5b = xv[(5 * K + k_base) / 8 + 1];
+            _Pragma("unroll")
+            for (int j = 0; j < BN; ++j) {
+                int wbase = (n0 + j) * W_row + pack * 3;
+                uint32_t w0 = w_q[wbase];
+                uint32_t w1 = w_q[wbase + 1];
+                uint32_t w2 = w_q[wbase + 2];
+                float s = float(scales[(n0 + j) * K_by_gs + (k_base / GS)]);
+                float b = float(biases[(n0 + j) * K_by_gs + (k_base / GS)]);
+                float wd[16];
+                wd[0]  = float( w0        & 0x3Fu) * s + b;
+                wd[1]  = float((w0 >>  6) & 0x3Fu) * s + b;
+                wd[2]  = float((w0 >> 12) & 0x3Fu) * s + b;
+                wd[3]  = float((w0 >> 18) & 0x3Fu) * s + b;
+                wd[4]  = float((w0 >> 24) & 0x3Fu) * s + b;
+                wd[5]  = float(((w0 >> 30) | (w1 << 2)) & 0x3Fu) * s + b;
+                wd[6]  = float((w1 >>  4) & 0x3Fu) * s + b;
+                wd[7]  = float((w1 >> 10) & 0x3Fu) * s + b;
+                wd[8]  = float((w1 >> 16) & 0x3Fu) * s + b;
+                wd[9]  = float((w1 >> 22) & 0x3Fu) * s + b;
+                wd[10] = float(((w1 >> 28) | (w2 << 4)) & 0x3Fu) * s + b;
+                wd[11] = float((w2 >>  2) & 0x3Fu) * s + b;
+                wd[12] = float((w2 >>  8) & 0x3Fu) * s + b;
+                wd[13] = float((w2 >> 14) & 0x3Fu) * s + b;
+                wd[14] = float((w2 >> 20) & 0x3Fu) * s + b;
+                wd[15] = float((w2 >> 26) & 0x3Fu) * s + b;
+                _Pragma("unroll")
+                for (int ki = 0; ki < 8; ++ki) {
+                    acc[j * M + 0] += float(v0a[ki]) * wd[ki] + float(v0b[ki]) * wd[8 + ki];
+                    acc[j * M + 1] += float(v1a[ki]) * wd[ki] + float(v1b[ki]) * wd[8 + ki];
+                    acc[j * M + 2] += float(v2a[ki]) * wd[ki] + float(v2b[ki]) * wd[8 + ki];
+                    acc[j * M + 3] += float(v3a[ki]) * wd[ki] + float(v3b[ki]) * wd[8 + ki];
+                    acc[j * M + 4] += float(v4a[ki]) * wd[ki] + float(v4b[ki]) * wd[8 + ki];
+                    acc[j * M + 5] += float(v5a[ki]) * wd[ki] + float(v5b[ki]) * wd[8 + ki];
+                }
+            }
+        }""",
+}
+
+
+def _packed_bits_from_shape(k: int, packed_cols: int) -> int:
+    """Recover the weight bit width from the packed uint32 column count.
+
+    Exact for every width MLX packs (4-bit: K/8 columns, 6-bit: 3K/16,
+    8-bit: K/4): bits = 32 * packed_cols / K, required to divide evenly.
+    """
+    if packed_cols <= 0 or (32 * packed_cols) % int(k) != 0:
+        raise ValueError(
+            f"cannot infer bit width from K={k} packed_cols={packed_cols}"
+        )
+    return (32 * packed_cols) // int(k)
+
+
+def _m6_ksplit_source(
+    group_size: int,
+    *,
+    k_parts: int = 2,
+    bn: int = 4,
+    bits: int = 4,
+) -> str:
+    """Render the m6 K-split Metal source.
+
+    Split out of the builder so the generated text itself is assertable: the
+    bits=4 rendering must stay byte-identical to the 4-bit-only original at
+    every (group_size, k_parts, bn) the lane builds.
+    """
+    if int(bits) not in _M6_INNER_BY_BITS:
+        raise ValueError(f"m6 ksplit supports 4- or 6-bit weights, got {bits}")
+    unit_setup = _M6_UNIT_SETUP_BY_BITS[int(bits)]
+    pack_setup = _M6_PACK_RANGE_BY_BITS[int(bits)]
+    pack_body = _M6_INNER_BY_BITS[int(bits)]
+
+    return f"""
         using namespace metal;
         constexpr int M = 6;
         constexpr int BN = {int(bn)};
@@ -737,7 +832,7 @@ def _build_kernel_m6_ksplit_np(
 
         int K = int(K_size);
         int N = int(N_size);
-        int K_by_8 = K / 8;
+        {unit_setup}
         int K_by_gs = K / GS;
         int n0 = int(tg_n) * BN;
         {pack_setup}
@@ -751,31 +846,7 @@ def _build_kernel_m6_ksplit_np(
         using Vec8 = vec<T, 8>;
         const device Vec8 *xv = (const device Vec8*)x;
 
-        {pack_loop}
-            int k_base = pack * 8;
-            Vec8 v0 = xv[(0 * K + k_base) / 8];
-            Vec8 v1 = xv[(1 * K + k_base) / 8];
-            Vec8 v2 = xv[(2 * K + k_base) / 8];
-            Vec8 v3 = xv[(3 * K + k_base) / 8];
-            Vec8 v4 = xv[(4 * K + k_base) / 8];
-            Vec8 v5 = xv[(5 * K + k_base) / 8];
-            _Pragma("unroll")
-            for (int j = 0; j < BN; ++j) {{
-                uint32_t packed = w_q[(n0 + j) * K_by_8 + pack];
-                float s = float(scales[(n0 + j) * K_by_gs + (k_base / GS)]);
-                float b = float(biases[(n0 + j) * K_by_gs + (k_base / GS)]);
-                _Pragma("unroll")
-                for (int ki = 0; ki < 8; ++ki) {{
-                    float wv = float((packed >> (ki * 4)) & 0xFu) * s + b;
-                    acc[j * M + 0] += float(v0[ki]) * wv;
-                    acc[j * M + 1] += float(v1[ki]) * wv;
-                    acc[j * M + 2] += float(v2[ki]) * wv;
-                    acc[j * M + 3] += float(v3[ki]) * wv;
-                    acc[j * M + 4] += float(v4[ki]) * wv;
-                    acc[j * M + 5] += float(v5[ki]) * wv;
-                }}
-            }}
-        }}
+        {pack_body}
 
         _Pragma("unroll")
         for (int i = 0; i < BN * M; ++i) {{
@@ -806,11 +877,46 @@ def _build_kernel_m6_ksplit_np(
         }}
     """
 
+
+def _build_kernel_m6_ksplit_np(
+    group_size: int,
+    dtype: mx.Dtype,
+    *,
+    k_parts: int = 2,
+    bn: int = 4,
+    bits: int = 4,
+):
+    """6-row K-split variant (24 accumulators/thread, scalar row registers).
+
+    Beats both stock qmm (1.14-1.80x) and the m16 NAX tile (1.03-1.15x) on all
+    live shapes at M=5..6 (2026-06-12 microbench), and unlike the NAX tile it
+    is plain SIMD — no G17/macOS-26.2 gate. Covers the D4/D5 verify shapes.
+    Note: an earlier un-unrolled probe measured 0.08-0.16x — explicit unrolls
+    and scalar v0..v5 registers are load-bearing, not style.
+    """
+    key = (
+        "m6_ksplit_np",
+        group_size,
+        dtype,
+        int(k_parts),
+        int(bn),
+        int(bits),
+    )
+    if key in _VERIFY_KERNEL_CACHE:
+        return _VERIFY_KERNEL_CACHE[key]
+
+    source = _m6_ksplit_source(
+        group_size,
+        k_parts=k_parts,
+        bn=bn,
+        bits=bits,
+    )
+
     dtype_tag = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     kernel = mx.fast.metal_kernel(
         name=(
             f"mtplx_verify_m6_ksplit_kp{int(k_parts)}"
-            f"_bn{int(bn)}_gs{group_size}_{dtype_tag}"
+            f"_bn{int(bn)}_b{int(bits)}_gs{group_size}_{dtype_tag}"
         ),
         input_names=["x", "w_q", "scales", "biases", "K_size", "N_size"],
         output_names=["y"],
@@ -954,7 +1060,7 @@ def _build_kernel_m6_qmv_wide_vec6(
 
 def m6_ksplit_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bool:
     return (
-        int(bits) == 4
+        int(bits) in (4, 6)
         and int(group_size) in (32, 64, 128)
         and dtype in (mx.bfloat16, mx.float16)
         and 5 <= int(M) <= 6
@@ -980,7 +1086,12 @@ def nax_qmm_m6(
         x6 = mx.contiguous(mx.concatenate([x2, pad], axis=0))
     else:
         x6 = mx.contiguous(x2)
-    kernel = _build_kernel_m6_ksplit_np(group_size, x2.dtype, k_parts=2)
+    kernel = _build_kernel_m6_ksplit_np(
+        group_size,
+        x2.dtype,
+        k_parts=2,
+        bits=_packed_bits_from_shape(K, int(w_q.shape[1])),
+    )
     (y,) = kernel(
         inputs=[x6, w_q, scales, biases, K, N],
         template=[("T", x2.dtype)],
@@ -1011,6 +1122,7 @@ def nax_qmm_m6_kp1_bn2(
         x6.dtype,
         k_parts=1,
         bn=2,
+        bits=_packed_bits_from_shape(K, int(w_q.shape[1])),
     )
     (y,) = kernel(
         inputs=[x6, w_q, scales, biases, K, N],
