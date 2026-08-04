@@ -1020,9 +1020,16 @@ def generate_greedy_batched(
                     for b in range(batch)
                 ]
                 with attention_phase("prefill"):
-                    p_logits, p_hidden = rt.forward_ar(
-                        mx.array(inp), cache=foldin_cache, return_hidden=True
-                    )
+                    # AR lane: no draft head consumes hidden states, and a
+                    # target-only runtime (Laguna) returns logits ONLY — same
+                    # conditioning as the initial-cohort prefill above.
+                    if ar_mode:
+                        p_logits = rt.forward_ar(mx.array(inp), cache=foldin_cache)
+                        p_hidden = None
+                    else:
+                        p_logits, p_hidden = rt.forward_ar(
+                            mx.array(inp), cache=foldin_cache, return_hidden=True
+                        )
                 restore_untrimmable_cache_masked(foldin_cache, pre_state, keep_host)
                 if ragged_entries:
                     admitted_off = mx.full((batch,), prompt_len, dtype=mx.int32)
@@ -1031,7 +1038,10 @@ def generate_greedy_batched(
                             admit_dev, admitted_off, saved
                         ).astype(mx.int32)
                 ll = mx.where(admit_dev[:, None], p_logits[:, -1, :], ll)
-                hl = mx.where(admit_dev[:, None, None], p_hidden[:, -1:, :], hl)
+                if hl is not None and p_hidden is not None:
+                    hl = mx.where(admit_dev[:, None, None], p_hidden[:, -1:, :], hl)
+                else:
+                    hl = None
                 for b, rid in assign.items():
                     slot_request[b] = rid
                     done[b] = False

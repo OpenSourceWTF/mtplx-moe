@@ -111,6 +111,7 @@ from mtplx.runtime_options import (
     resolve_api_key,
 )
 from mtplx.draft_lm_head import _install_draft_lm_head
+from mtplx import request_capture
 from mtplx.fan_mode import (
     FAN_MODE_CHOICES,
     FAN_MODE_DEFAULT,
@@ -137,6 +138,7 @@ from mtplx.server.omlx_bridge import (
     extract_thinking as omlx_extract_thinking,
     extract_tool_calls_with_thinking as omlx_extract_tool_calls_with_thinking,
     normalize_messages_for_template as omlx_normalize_messages_for_template,
+    parse_tool_calls as omlx_parse_tool_calls,
 )
 from mtplx.server_urls import bind_label, is_wildcard_bind, local_url_for_bind
 
@@ -2119,7 +2121,8 @@ class ServerState:
         from mtplx.thermal import SmartFanController
 
         self.smart_fans = SmartFanController(
-            log=lambda line: LOGGER.info("%s", line)
+            log=lambda line: LOGGER.info("%s", line),
+            activity_probe=self._smart_fan_activity_probe,
         )
         # Dashboard primitives: pub/sub bus, in-flight registry, 5-min rolling
         # TPS window, lifetime counters, prefill history. Created before
@@ -2129,6 +2132,29 @@ class ServerState:
         self.ar_batch_service = _BatchedARGenerationService(self)
         _install_mtp_cohort_runtime(self)
         self.warmup_status = _run_startup_warmup(self)
+
+    def _smart_fan_activity_probe(self) -> bool:
+        """True while any model work is executing, queued, or recently active.
+
+        Feeds the SmartFanController stale-lease reconciler (#201). Covers
+        every legitimate work state: foreground generation (begin/end_foreground
+        wraps dispatch on all paths including the AR batch service), scheduler
+        queues and the executing item of either lane (foreground + idle
+        postcommit), and a short recency window so back-to-back agent turns
+        never look idle between requests.
+        """
+        if self.has_foreground():
+            return True
+        scheduler = getattr(self, "model_scheduler", None)
+        if scheduler is not None and hasattr(scheduler, "any_pending_or_active"):
+            try:
+                if scheduler.any_pending_or_active():
+                    return True
+            except BaseException:
+                return True
+        last_started = float(getattr(self, "last_request_started_at", 0.0) or 0.0)
+        last_finished = float(getattr(self, "last_request_at", 0.0) or 0.0)
+        return (time.time() - max(last_started, last_finished)) < 30.0
 
     def begin_foreground(self) -> None:
         with self.foreground_lock:
@@ -5441,7 +5467,11 @@ def _mtplx_pi_convergence_user_instruction_text() -> str:
         "context now. Use the evidence already gathered to edit, verify, or "
         "finish. The next response must not be another broad read/grep/find/ls "
         "or inspection-only shell command; only one narrow line-range refresh "
-        "is allowed when it is necessary to make the edit apply."
+        "is allowed when it is necessary to make the edit apply. Editing and "
+        "verification tools (edit/write/patch, or shell commands that run "
+        "tests or the build) remain fully allowed and are the expected next "
+        "step — this restriction covers broad inspection only, and it applies "
+        "to this reply only, not to the rest of the session."
     )
 
 
@@ -6496,12 +6526,91 @@ def _decode_tool_parameter_value(value: str, schema: Any | None = None) -> Any:
         return text
 
 
+def _repair_tool_argument_keys_for_schema(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    tools: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Repair unambiguous near-miss argument keys against the tool schema.
+
+    Qwen3.6 intermittently corrupts an argument key (#197): ``offsets`` for
+    ``offset``, or ``offset `` / ``offset >`` with whitespace/template-close
+    bytes bled into the key. Such keys previously passed straight through
+    (schema validation only rejects unknown keys under
+    ``additionalProperties: false``), and the client silently dropped the
+    argument — every paginated ``read`` returned the top-of-file window.
+
+    A key is renamed only when the mapping is unambiguous:
+    - the raw key is not itself a schema property,
+    - the target resolves via trimming (whitespace / trailing ``>``), letter
+      case, or a single trailing ``s`` to exactly one schema property,
+    - the target is not already supplied, and no other raw key resolves to
+      the same target.
+    Anything else passes through verbatim (pass-through stays the client's
+    contract).
+    """
+    if not arguments:
+        return arguments
+    schema = _tool_schema_for_name(tools, tool_name=tool_name)
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(properties, dict) or not properties:
+        return arguments
+    by_casefold: dict[str, list[str]] = {}
+    for name in properties:
+        by_casefold.setdefault(str(name).casefold(), []).append(str(name))
+
+    def _unique(casefolded: str) -> str | None:
+        matches = by_casefold.get(casefolded)
+        return matches[0] if matches and len(matches) == 1 else None
+
+    def _resolve(key: str) -> str | None:
+        if key in properties:
+            return None
+        trimmed = key.strip().rstrip(">").strip()
+        if trimmed in properties:
+            return trimmed
+        target = _unique(trimmed.casefold())
+        if target is not None:
+            return target
+        if trimmed.casefold().endswith("s"):
+            target = _unique(trimmed.casefold()[:-1])
+            if target is not None:
+                return target
+        return _unique(trimmed.casefold() + "s")
+
+    renames: dict[str, str] = {}
+    for key in arguments:
+        target = _resolve(str(key))
+        if target is None or target in arguments:
+            continue
+        renames[str(key)] = target
+    # Two corrupted keys collapsing onto one property is ambiguous — repair
+    # neither rather than clobber one value with the other.
+    target_counts: dict[str, int] = {}
+    for target in renames.values():
+        target_counts[target] = target_counts.get(target, 0) + 1
+    renames = {
+        key: target
+        for key, target in renames.items()
+        if target_counts[target] == 1
+    }
+    if not renames:
+        return arguments
+    return {renames.get(str(key), key): value for key, value in arguments.items()}
+
+
 def _normalize_tool_arguments_for_schema(
     *,
     tool_name: str,
     arguments: dict[str, Any],
     tools: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    arguments = _repair_tool_argument_keys_for_schema(
+        tool_name=tool_name,
+        arguments=arguments,
+        tools=tools,
+    )
     normalized: dict[str, Any] = {}
     for key, value in arguments.items():
         if isinstance(value, str):
@@ -7155,6 +7264,174 @@ class _ToolCallStreamParser:
         raise NotImplementedError
 
 
+class _SuffixedNativeToolCallStreamParser(_ToolCallStreamParser):
+    """Buffer and translate Hy3's native suffix-token tool protocol."""
+
+    dialect = "suffixed_native"
+    _OPEN_RE = re.compile(r"^<tool_calls?:[A-Za-z_][\w.-]*>", re.IGNORECASE)
+    _WRAPPER_RE = re.compile(
+        r"^<tool_calls(?P<suffix>:[A-Za-z_][\w.-]*)>",
+        re.IGNORECASE,
+    )
+
+    def __init__(
+        self,
+        *,
+        tools: list[dict[str, Any]],
+        tokenizer: Any | None,
+        argument_chunk_chars: int,
+    ) -> None:
+        self._tools = tools
+        self._tokenizer = tokenizer
+        self._argument_chunk_chars = max(1, int(argument_chunk_chars))
+        self._raw = ""
+        self._done = False
+        self._tool_calls: list[dict[str, Any]] | None = None
+        self._fallback_reason: str | None = None
+        self._remaining_text = ""
+
+    @property
+    def tool_calls(self) -> list[dict[str, Any]] | None:
+        return self._tool_calls
+
+    @property
+    def fallback_reason(self) -> str | None:
+        return self._fallback_reason
+
+    @property
+    def raw_text(self) -> str:
+        return self._raw
+
+    @property
+    def started(self) -> bool:
+        return bool(self._OPEN_RE.match(self._raw.lstrip()))
+
+    @property
+    def remaining_text(self) -> str:
+        return self._remaining_text
+
+    def _complete_span(self, *, final: bool) -> tuple[str, str] | None:
+        stripped = self._raw.lstrip()
+        wrapper = self._WRAPPER_RE.match(stripped)
+        if wrapper is not None:
+            suffix = wrapper.group("suffix")
+            close = f"</tool_calls{suffix}>"
+            end = _find_casefold(stripped, close, wrapper.end())
+            if end < 0:
+                if final:
+                    self._fallback_reason = "unclosed suffixed tool_calls block"
+                return None
+            end += len(close)
+            return stripped[:end], stripped[end:]
+
+        call = re.match(
+            r"^<tool_call(?P<suffix>:[A-Za-z_][\w.-]*)>",
+            stripped,
+            re.IGNORECASE,
+        )
+        if call is None:
+            if final:
+                self._fallback_reason = "invalid suffixed tool_call opener"
+            return None
+        close = f"</tool_call{call.group('suffix')}>"
+        end = _find_casefold(stripped, close, call.end())
+        if end < 0:
+            if final:
+                self._fallback_reason = "unclosed suffixed tool_call block"
+            return None
+        end += len(close)
+        return stripped[:end], stripped[end:]
+
+    def _finish_complete(self, complete: str, remaining: str) -> list[dict[str, Any]]:
+        extraction = omlx_parse_tool_calls(
+            complete,
+            self._tokenizer,
+            self._tools,
+        )
+        if not extraction.tool_calls:
+            self._fallback_reason = (
+                extraction.malformed_reason
+                or "unrecognized suffixed native tool call"
+            )
+            return []
+
+        normalized_calls: list[dict[str, Any]] = []
+        try:
+            for index, call in enumerate(extraction.tool_calls):
+                function = call.get("function") if isinstance(call, dict) else None
+                if not isinstance(function, dict):
+                    raise _tool_protocol_error(
+                        f"suffixed tool_call[{index}] has no function"
+                    )
+                canonical_name = _canonical_tool_name_for_model_output(
+                    str(function.get("name") or ""),
+                    self._tools,
+                )
+                if canonical_name is None:
+                    raise _tool_protocol_error(
+                        f"unknown tool '{function.get('name') or ''}'"
+                    )
+                arguments = _json_object_value(
+                    function.get("arguments"),
+                    context=f"tool_call[{index}]",
+                )
+                arguments = _normalize_tool_arguments_for_schema(
+                    tool_name=canonical_name,
+                    arguments=arguments,
+                    tools=self._tools,
+                )
+                _validate_tool_arguments_for_schema(
+                    tool_name=canonical_name,
+                    arguments=arguments,
+                    tools=self._tools,
+                    context=f"tool_call[{index}]",
+                )
+                normalized_calls.append(
+                    {
+                        "id": str(call.get("id") or f"call_{uuid.uuid4().hex[:24]}"),
+                        "type": "function",
+                        "function": {
+                            "name": canonical_name,
+                            "arguments": _json_object_string(
+                                arguments,
+                                context=f"tool_call[{index}]",
+                            ),
+                        },
+                    }
+                )
+        except HTTPException as exc:
+            self._fallback_reason = _tool_protocol_reason(exc)
+            return []
+
+        self._tool_calls = normalized_calls
+        self._remaining_text = remaining
+        self._done = True
+        return list(
+            _stream_tool_call_deltas(
+                normalized_calls,
+                argument_chunk_chars=self._argument_chunk_chars,
+            )
+        )
+
+    def feed(self, text: str) -> list[dict[str, Any]]:
+        if self._done or self._fallback_reason:
+            self._raw += text
+            return []
+        self._raw += text
+        span = self._complete_span(final=False)
+        if span is None:
+            return []
+        return self._finish_complete(*span)
+
+    def finish(self) -> list[dict[str, Any]]:
+        if self._done or self._fallback_reason:
+            return []
+        span = self._complete_span(final=True)
+        if span is None:
+            return []
+        return self._finish_complete(*span)
+
+
 class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
     """Incrementally translate Qwen XML tool calls into OpenAI deltas.
 
@@ -7250,11 +7527,21 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
 
     @property
     def in_known_tool_parameter(self) -> bool:
+        if not (self._started and self._name and self._name in self._known):
+            return False
+        if self._stage == "in_parameter":
+            return True
+        # A JSON-dialect function body (#170) is argument payload too. While
+        # the object streams, the parser waits in "find_parameter" for its
+        # closing </function>, so the hidden-tool guard must stand down here
+        # exactly as it does inside <parameter=> values — otherwise a large
+        # write body crosses the guard's token/time budget and generation is
+        # cancelled mid-call as "malformed tool_call: unterminated stream"
+        # (#196).
         return (
-            bool(self._started)
-            and bool(self._name)
-            and self._name in self._known
-            and self._stage == "in_parameter"
+            self._stage == "find_parameter"
+            and not self._params
+            and self._buf.lstrip().startswith("{")
         )
 
     def _finish_call(self, deltas: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -7917,11 +8204,24 @@ class _ToolAwareContentStreamTranslator:
 
     def _tool_deltas_if_complete(self, *, final: bool) -> list[dict[str, Any]]:
         if self._tool_parser is None:
-            self._tool_parser = _QwenXMLToolCallStreamParser(
-                tools=self._tools,
-                call_index=len(self.tool_calls or []),
-                repair_unclosed_complete=self._repair_unclosed_complete,
-            )
+            stripped_pending = self._pending.lstrip()
+            lowered_pending = stripped_pending.lower()
+            if lowered_pending in {"<tool_call", "<tool_calls"} and not final:
+                return []
+            if lowered_pending.startswith(
+                "<tool_call:"
+            ) or lowered_pending.startswith("<tool_calls:"):
+                self._tool_parser = _SuffixedNativeToolCallStreamParser(
+                    tools=self._tools,
+                    tokenizer=self._tokenizer,
+                    argument_chunk_chars=self._argument_chunk_chars,
+                )
+            else:
+                self._tool_parser = _QwenXMLToolCallStreamParser(
+                    tools=self._tools,
+                    call_index=len(self.tool_calls or []),
+                    repair_unclosed_complete=self._repair_unclosed_complete,
+                )
             self.tool_parser_dialect = self._tool_parser.dialect
         chunk = self._pending
         self._pending = ""
@@ -10827,12 +11127,49 @@ def _count_text_tokens(tokenizer: Any, text: str) -> int:
 _REQUEST_LOG_LOCK = threading.Lock()
 
 
+_REQUEST_LOG_MAX_BYTES = 64 * 1024 * 1024
+_REQUEST_LOG_KEEP_GENERATIONS = 4
+
+
 def _request_log_path(state: "ServerState") -> str | None:
     raw = getattr(state.args, "request_log_jsonl", None) or os.environ.get(
         "MTPLX_REQUEST_LOG_JSONL"
     )
     raw = str(raw or "").strip()
-    return raw or None
+    if raw.lower() in {"0", "off", "false", "no", "none", "disabled"}:
+        return None
+    if raw:
+        return raw
+    # Default ON: agent-session incidents cannot be diagnosed after the fact
+    # without a durable per-request trail. Records are numeric/hash telemetry
+    # only — no prompt or completion content — size-capped by rotation below,
+    # and disabled with MTPLX_REQUEST_LOG_JSONL=off. Per-port files so
+    # parallel serves never interleave. Live forensics repeatedly stalled on
+    # the 15-entry RAM ring; this keeps the durable trail by default.
+    try:
+        port = int(getattr(state.args, "port", 0) or 0)
+        log_dir = os.path.join(os.path.expanduser("~"), ".mtplx", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        return os.path.join(log_dir, f"request-log-{port}.jsonl")
+    except Exception:
+        return None
+
+
+def _rotate_request_log_if_needed(path: str) -> None:
+    """Cascade path -> .1 -> .2 ... keeping a bounded on-disk history."""
+    try:
+        if os.path.getsize(path) < _REQUEST_LOG_MAX_BYTES:
+            return
+    except OSError:
+        return
+    try:
+        for gen in range(_REQUEST_LOG_KEEP_GENERATIONS - 1, 0, -1):
+            older = f"{path}.{gen}"
+            if os.path.exists(older):
+                os.replace(older, f"{path}.{gen + 1}")
+        os.replace(path, f"{path}.1")
+    except OSError:
+        pass
 
 
 def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> None:
@@ -10858,6 +11195,7 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
             default=str,
         )
         with _REQUEST_LOG_LOCK:
+            _rotate_request_log_if_needed(path)
             with open(path, "a", encoding="utf-8") as sink:
                 sink.write(line + "\n")
     except Exception:
@@ -14742,6 +15080,10 @@ def _adaptive_config(
                 "decrease_after": int(args.adaptive_decrease_after),
             }
         )
+    elif policy == "cost":
+        config["marginal_ms_prior"] = float(
+            getattr(args, "adaptive_cost_marginal_ms", 7.0) or 7.0
+        )
     elif policy == "expected_value":
         configured_base_depth = max(1, int(args.adaptive_ev_base_depth))
         effective_base_depth = max(
@@ -14796,6 +15138,17 @@ def _make_adaptive_policy(
             start_depth=int(args.adaptive_start_depth),
             increase_after=int(args.adaptive_increase_after),
             decrease_after=int(args.adaptive_decrease_after),
+        )
+    if policy == "cost":
+        from mtplx.adaptive import CostModelDepthPolicy
+
+        return CostModelDepthPolicy(
+            max_depth=effective_max_depth,
+            min_depth=effective_min_depth,
+            marginal_ms=float(
+                getattr(args, "adaptive_cost_marginal_ms", 0.0) or 0.0
+            )
+            or None,
         )
     if policy == "expected_value":
         effective_base_depth = max(
@@ -15426,6 +15779,30 @@ _IDLE_POSTCOMMIT_MAX_WAIT_S = 30.0
 _IDLE_POSTCOMMIT_POLL_INTERVAL_S = 0.25
 
 
+def _idle_postcommit_foreground_grace_s() -> float:
+    """Bounded window during which a running postcommit finishes despite a
+    queued foreground request.
+
+    2026-08-01 live gauntlet receipts: in a real OpenCode tool loop the next
+    request arrives within ~0.5s of the previous response, so EVERY
+    tool_call_history_rewrite postcommit was preempted
+    (foreground_preempted_postcommit x6 in one 8-turn run) and every
+    tool-turn paid a 2-4k-token block-salvage re-prefill instead (3-7s of
+    TTFT). The commit itself starts from the live cache and typically
+    finishes well under this grace, so letting it win delays the queued
+    request by at most the grace while removing the far larger salvage.
+    0 restores strict immediate-yield (the 2026-07-02 starvation semantics,
+    still guarded as bounded by this cap in the yield test).
+    """
+    raw = os.environ.get("MTPLX_POSTCOMMIT_FOREGROUND_GRACE_S")
+    if raw is None or not str(raw).strip():
+        return 2.0
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 2.0
+
+
 def _schedule_idle_postcommit_snapshot(
     state: ServerState,
     *,
@@ -15456,6 +15833,23 @@ def _schedule_idle_postcommit_snapshot(
     rechecks that no newer foreground is queued and that the session did not
     advance before it builds a new cache.
     """
+    if unsafe_reason == "tool_call_history_rewrite" and str(
+        os.environ.get("MTPLX_IDLE_POSTCOMMIT_TOOL_REWRITE", "1")
+    ).strip().lower() in {"0", "false", "off", "no"}:
+        # 2026-08-01 gauntlet: on the OpenCode hybrid tool lane this commit's
+        # canonical retokenization matched NEITHER the generation stream NOR
+        # the next request's bytes (its own bank lookup found ~no prefix), so
+        # it re-forwarded the full 27-29k history in the gap, never stored
+        # (aborted on the next request, one after 26.8s of GPU), and the
+        # foreground grace then delayed the queued request for doomed work.
+        # This is the "postcommit ghost re-prefill" pathology. Kill switch until
+        # the hybrid-lane canonical rendering is byte-proven against real
+        # next-turn prompts; store-on-prefill + block salvage remain.
+        return {
+            "stored": False,
+            "mode": "disabled",
+            "reason": "tool_rewrite_postcommit_disabled",
+        }
     pending = {
         "stored": False,
         "mode": "async_pending",
@@ -15516,10 +15910,24 @@ def _schedule_idle_postcommit_snapshot(
             and int(observed) != int(expected_session_revision)
         )
 
+    # Foreground pressure only aborts the commit after the bounded grace
+    # (anchored when the job actually starts); explicit aborts and stale
+    # session revisions stay immediate.
+    grace_s = _idle_postcommit_foreground_grace_s()
+    job_started_holder: dict[str, float] = {}
+
+    def _foreground_pressure_past_grace() -> bool:
+        if not _foreground_model_work_pending(state):
+            return False
+        started_at = job_started_holder.get("t")
+        if started_at is None:
+            return True
+        return (time.monotonic() - started_at) > grace_s
+
     def _postcommit_abort_reason() -> str:
         if _stale_session_revision():
             return "stale_session_revision"
-        if abort_event.is_set() or _foreground_model_work_pending(state):
+        if abort_event.is_set() or _foreground_pressure_past_grace():
             return "foreground_preempted_postcommit"
         return "postcommit_abort_requested"
 
@@ -15527,7 +15935,7 @@ def _schedule_idle_postcommit_snapshot(
         return bool(
             abort_event.is_set()
             or _stale_session_revision()
-            or _foreground_model_work_pending(state)
+            or _foreground_pressure_past_grace()
         )
 
     # The postcommit re-prefills the conversation at full GPU load after the
@@ -15543,6 +15951,7 @@ def _schedule_idle_postcommit_snapshot(
 
     def async_postcommit() -> None:
         deadline = time.monotonic() + _IDLE_POSTCOMMIT_MAX_WAIT_S
+        job_started_holder["t"] = time.monotonic()
         record = pending_record_holder.get("record")
         if record is not None and hasattr(record, "mark_started"):
             try:
@@ -15563,13 +15972,16 @@ def _schedule_idle_postcommit_snapshot(
                         }
                     )
                     return
-                if abort_event.is_set() or _foreground_model_work_pending(state):
-                    # Yield to queued foreground: return to free the single
-                    # model worker (a sleep+retry here would starve the
-                    # foreground request behind us — regression caught by
+                if abort_event.is_set() or _foreground_pressure_past_grace():
+                    # Yield to queued foreground once the bounded grace is
+                    # spent: return to free the single model worker (an
+                    # unbounded sleep+retry here would starve the foreground
+                    # request behind us — regression caught by
                     # test_running_idle_postcommit_yields_to_queued_foreground,
-                    # 2026-07-02). Warming the next agent turn is handled by
-                    # store-on-prefill instead, which needs no idle gap.
+                    # 2026-07-02; the grace keeps the delay bounded while
+                    # letting agent-loop tool-turn commits actually land —
+                    # 2026-08-01 gauntlet receipts). Store-on-prefill remains
+                    # the fallback warmer when the commit loses.
                     _log(
                         {
                             "stored": False,
@@ -16102,6 +16514,18 @@ def _finalize_batched_ar_generation(
                 ensure_ascii=False,
             )
         )
+    if request_capture.capture_dir():
+        request_capture.capture_outcome(
+            (request_observability or {}).get("request_id"),
+            {
+                "scheduler_lane": "ar_batch",
+                "completion_tokens": completion_tokens,
+                "finish_reason": generated.get("finish_reason"),
+                "resolved_seed": stats.get("server_seed"),
+                "tok_s": round(float(generated.get("tok_s") or 0.0), 3),
+                **request_capture.clip_text_head_tail(generated.get("text") or ""),
+            },
+        )
     return generated
 
 
@@ -16424,6 +16848,43 @@ def _run_generation_dispatched(
     if response_id:
         request_observability_for_lane.setdefault("request_id", response_id)
     kwargs["request_observability"] = request_observability_for_lane
+    if request_capture.capture_dir() and not bool(
+        request_observability_for_lane.get("warmup")
+    ):
+        # Persist the replay envelope before dispatch, so a hung or
+        # early-stopped turn still leaves a reproducible request receipt.
+        request_capture.capture_request(
+            request_observability_for_lane.get("request_id") or response_id,
+            {
+                "model_id": str(
+                    getattr(state.args, "model_id", None)
+                    or getattr(state, "model_id", None)
+                    or ""
+                ),
+                "prompt_len": len(prompt_ids),
+                "prompt_token_ids": [int(token) for token in prompt_ids],
+                "max_tokens": kwargs.get("max_tokens"),
+                "temperature": kwargs.get("temperature"),
+                "top_p": kwargs.get("top_p"),
+                "top_k": kwargs.get("top_k"),
+                "presence_penalty": kwargs.get("presence_penalty"),
+                "frequency_penalty": kwargs.get("frequency_penalty"),
+                "requested_seed": kwargs.get("seed"),
+                "generation_mode": str(effective_mode),
+                "depth": kwargs.get("depth"),
+                "session_id": kwargs.get("session_id"),
+                "session_restore_mode": kwargs.get("session_restore_mode"),
+                "has_constraint": kwargs.get("constraint_spec") is not None,
+                "tokenizer_template_hash": str(
+                    getattr(state, "main_system_prompt_hash", None) or ""
+                ),
+                "observability": {
+                    key: value
+                    for key, value in request_observability_for_lane.items()
+                    if isinstance(value, (str, int, float, bool))
+                },
+            },
+        )
     if _use_mtp_cohort(state, effective_mode=effective_mode):
         request_observability_for_lane["scheduler_lane"] = "mtp_cohort"
         return _run_generation_cohort(state, prompt_ids, **kwargs)
@@ -16605,6 +17066,7 @@ def _run_generation(
     vision_splice: Any | None = None,
     constraint_spec: Any | None = None,
     _mtp_cohort_request: bool = False,
+    prefill_chunk_tokens: int | None = None,
 ) -> dict[str, Any]:
     request_environment: Mapping[str, str] | None = None
     if _mtp_cohort_request:
@@ -16779,7 +17241,10 @@ def _run_generation(
                 mtp_depth=effective_depth,
                 environment=request_environment,
             )
-            prefill_chunk_tokens = getattr(state.args, "prefill_chunk_tokens", None)
+            if prefill_chunk_tokens is None:
+                prefill_chunk_tokens = getattr(
+                    state.args, "prefill_chunk_tokens", None
+                )
             environment_context = (
                 nullcontext()
                 if _mtp_cohort_request
@@ -17343,6 +17808,20 @@ def _run_generation(
                 ensure_ascii=False,
             )
         )
+    if request_capture.capture_dir():
+        request_capture.capture_outcome(
+            (request_observability or {}).get("request_id"),
+            {
+                "scheduler_lane": "serial",
+                "completion_tokens": last["completion_tokens"],
+                "finish_reason": last.get("finish_reason"),
+                "resolved_seed": last["stats"].get("server_seed"),
+                "attempts": last["stats"].get("server_attempts"),
+                "blank_retries": last["stats"].get("server_blank_retries"),
+                "tok_s": round(float(last["tok_s"]), 3),
+                **request_capture.clip_text_head_tail(last.get("text") or ""),
+            },
+        )
     return last
 
 
@@ -17573,6 +18052,18 @@ class _BackgroundWarmup:
         else:
             self._finish()
 
+    # Warming prefills must yield to real traffic quickly: the
+    # foreground-yield abort only fires once per prefill chunk, and the
+    # serve-wide 2048-token chunk holds the model lock ~3s per chunk on
+    # the 27B — a request arriving mid-warmup stalled exactly that long
+    # (measured 3.1-3.3s mid-turn freezes on the first turns of a fresh
+    # serve, 2026-07-31). A 256-token warming chunk bounds the wait to
+    # ~0.4s and lets preempted steps resume instead of burning the
+    # resubmit budget and abandoning. Passed as a _run_generation kwarg:
+    # the generation applies its own prefill_chunk_size_override
+    # internally, so an outer ContextVar wrapper would be clobbered.
+    WARMUP_PREFILL_CHUNK_TOKENS = 256
+
     def _ladder_generation(self, context_tokens: int) -> dict[str, Any]:
         repeats = context_tokens // max(1, len(self.prompt_ids)) + 1
         prompt_ids = (list(self.prompt_ids) * repeats)[:context_tokens]
@@ -17586,6 +18077,7 @@ class _BackgroundWarmup:
             seed=0,
             request_observability={"warmup": True, "warmup_background": True},
             cancel_event=_ForegroundYield(self.state),
+            prefill_chunk_tokens=self.WARMUP_PREFILL_CHUNK_TOKENS,
         )
 
     def _finish(self, abandoned: bool = False) -> None:
@@ -18057,6 +18549,12 @@ class _NonDuplicatingTokenDecoder(_IncrementalTokenDecoder):
 class _ThinkingContentStreamSplitter:
     _TOOL_CALL_MARKER = "<tool_call"
     _TOOL_CALL_CLOSE_MARKER = "</tool_call>"
+    # Angle-bracketed protocol forms only. The former bare "function=" /
+    # "parameter=" entries flipped the think/content split on ordinary
+    # reasoning prose that merely *mentions* those substrings (any code
+    # discussion), leaking the rest of the think block into content
+    # (#196/#197 leak variant). Chunk-split "<function=" openers are already
+    # covered by the partial-prefix hold, so the bare forms bought nothing.
     _TOOL_CONTROL_MARKERS = (
         "<tool_call",
         "<function=",
@@ -18064,8 +18562,6 @@ class _ThinkingContentStreamSplitter:
         "</parameter>",
         "</function>",
         "</tool_call>",
-        "parameter=",
-        "function=",
     )
 
     def __init__(
@@ -25216,7 +25712,17 @@ def create_app(state: ServerState) -> FastAPI:
                                 )
                                 stats["tool_parse_success"] = True
                                 stats["tool_call_count"] = len(assistant_tool_calls)
-                                generated["finish_reason"] = "tool_calls"
+                                # Honest finish on budget cuts (#196/#197): a
+                                # length-truncated turn that still yielded
+                                # complete tool calls must NOT report
+                                # "tool_calls" — the client would treat the
+                                # batch as complete while a trailing call was
+                                # cut and swallowed. "length" tells agent
+                                # clients (OpenCode et al.) to continue.
+                                if str(generated.get("finish_reason") or "") == "length":
+                                    stats["tool_calls_truncated_by_length"] = True
+                                else:
+                                    generated["finish_reason"] = "tool_calls"
                             elif (
                                 extraction is not None
                                 and extraction.status == "malformed_as_content"
@@ -25795,7 +26301,12 @@ def create_app(state: ServerState) -> FastAPI:
                 "content": assistant_content or None,
                 "tool_calls": tool_calls,
             }
-            finish_reason = "tool_calls"
+            # Honest finish on budget cuts (#196/#197): see the streaming twin.
+            if str(generated.get("finish_reason") or "") == "length":
+                generated["stats"]["tool_calls_truncated_by_length"] = True
+                finish_reason = "length"
+            else:
+                finish_reason = "tool_calls"
         else:
             reasoning_text = ""
             if (
@@ -26573,6 +27084,39 @@ def _gemma4_bundle_defaults(model_ref: str | None) -> tuple[dict[str, Any] | Non
     return sampler, draft_block_size
 
 
+def _model_declared_sampler_defaults(model_ref: str | None) -> dict[str, Any] | None:
+    """Official sampler defaults declared by the model artifact itself.
+
+    Reads ``generation_config.json`` next to the checkpoint. Scoped to hy_v3
+    (Tencent ships temperature=0.9 / top_p=1.0 / top_k off, which differs from
+    the project-wide 0.6/0.95/20 coding defaults) — existing Qwen/Gemma serving
+    defaults are deliberately left untouched (no-regression rule; widening this
+    to every family needs its own A/B).
+    """
+    if not model_ref:
+        return None
+    try:
+        from mtplx.hf_loader import resolve_model_path
+
+        path = resolve_model_path(str(model_ref))
+        config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+        if str(config.get("model_type", "")).lower() != "hy_v3":
+            return None
+        gen = json.loads((path / "generation_config.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    out: dict[str, Any] = {}
+    if isinstance(gen.get("temperature"), (int, float)):
+        out["temperature"] = float(gen["temperature"])
+    if isinstance(gen.get("top_p"), (int, float)):
+        out["top_p"] = float(gen["top_p"])
+    top_k = gen.get("top_k")
+    if isinstance(top_k, int):
+        # HF convention: top_k -1/0 = disabled; project sampler treats <=0 as off.
+        out["top_k"] = max(0, top_k)
+    return out or None
+
+
 def _apply_backend_server_defaults(
     args: argparse.Namespace,
     *,
@@ -26583,6 +27127,22 @@ def _apply_backend_server_defaults(
         and _model_ref_is_gemma4_pair(getattr(args, "model", None))
     ):
         args.backend_id = GEMMA4_BACKEND
+
+    declared = _model_declared_sampler_defaults(getattr(args, "model", None))
+    if declared:
+        if "temperature" in declared and not _server_flag_present(
+            explicit_flags, "temperature", "default-temperature"
+        ):
+            args.temperature = declared["temperature"]
+        if "top_p" in declared and not _server_flag_present(
+            explicit_flags, "top-p", "default-top-p"
+        ):
+            args.top_p = declared["top_p"]
+        if "top_k" in declared and not _server_flag_present(explicit_flags, "top-k"):
+            args.top_k = declared["top_k"]
+        LOGGER.info(
+            "[serve-defaults] model-declared sampler defaults applied: %s", declared
+        )
 
     sync_backend_arg_aliases(args)
     backend = descriptor_for_backend_id(getattr(args, "backend_id", None))
@@ -26919,7 +27479,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--adaptive-policy",
-        choices=["none", "streak", "expected_value"],
+        choices=["none", "streak", "expected_value", "cost"],
         default="none",
         help="Optional per-request native-MTP depth policy. Exact sampler semantics remain unchanged.",
     )
@@ -27041,9 +27601,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Append every per-request telemetry record (the dashboard "
-            "'recent' schema) as one JSON line to this path. The durable "
+            "'recent' schema; numeric/hash fields only, no prompt or "
+            "completion content) as one JSON line to this path. The durable "
             "twin of the 100-entry RAM ring; scripts/session_forensics.py "
-            "reads it. Env: MTPLX_REQUEST_LOG_JSONL."
+            "reads it. Default: ON at ~/.mtplx/logs/request-log-<port>.jsonl "
+            "with 64MB x4 rotation; pass 'off' (or set "
+            "MTPLX_REQUEST_LOG_JSONL=off) to disable. Env: "
+            "MTPLX_REQUEST_LOG_JSONL."
         ),
     )
     parser.add_argument(
@@ -27204,8 +27768,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--open-dashboard",
         action="store_true",
         help=(
-            "Open the live MTPLX dashboard (/dashboard) after startup "
-            "instead of the chat UI."
+            "Open the live MTPLX dashboard (/dashboard) after startup, "
+            "alongside any client UI selected by --open-browser."
         ),
     )
     parser.add_argument(

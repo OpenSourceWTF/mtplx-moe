@@ -786,6 +786,202 @@ def test_ar_cycle_snapshot_prefill_returns_no_hidden_under_sustained_env(
     assert prompt_state.logits is not None
 
 
+def _target_only_ar_runtime():
+    """A real LagunaARRuntime over a tiny CPU model — forward_ar returns logits
+    alone, exactly like the served oQ4e target."""
+
+    from mtplx.models.laguna import Model, ModelArgs
+    from mtplx.mtp_patch import MTPContract
+    from mtplx.runtime import LagunaARRuntime
+
+    config = _tiny_laguna_config(architectures=["LagunaForCausalLM"], head_dim=4)
+    runtime = LagunaARRuntime(
+        Model(ModelArgs.from_dict(config)),
+        object(),  # tokenizer: unused by the prefill path
+        Path("tiny-laguna-ar"),
+        False,  # mtp_enabled: target-only AR runtime, no draft head
+        MTPContract(),
+    )
+    assert runtime.mtp_enabled is False
+    return runtime
+
+
+def _warm_prefix_cache(runtime, prefix_ids):
+    """Really prefill `prefix_ids` so a restore hands back a live, warm cache."""
+
+    import mlx.core as mx
+
+    cache = runtime.make_cache()
+    logits = runtime.forward_ar(mx.array([list(prefix_ids)]), cache=cache)
+    mx.eval(logits)
+    return cache, logits
+
+
+def _exact_restore_bank(runtime, prefix_ids):
+    """A session bank whose exact restore serves the warm prefix cache."""
+
+    from types import SimpleNamespace
+
+    cache, logits = _warm_prefix_cache(runtime, prefix_ids)
+
+    class Bank:
+        last_miss_reason = None
+
+        def restore(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                entry=SimpleNamespace(prefix_len=len(prefix_ids)),
+                cache=cache,
+                logits=logits[:, -1, :],
+                # An AR turn banks the trunk cache only: no hidden was stored.
+                hidden=None,
+                mtp_history_cache=None,
+                restore_mode="clone",
+            )
+
+    return Bank()
+
+
+@pytest.mark.parametrize(
+    ("lane", "fused_max", "suffix_len"),
+    [("fused", 64, 3), ("chunked", 0, 5)],
+)
+def test_warm_restore_suffix_prefill_needs_no_hidden_from_target_only_runtime(
+    monkeypatch, lane, fused_max, suffix_len
+) -> None:
+    """Regression for the live oQ4e serving crash.
+
+    `_prefill_restored_prompt_suffix` asked every runtime for hidden states
+    (``rt.forward_ar(..., return_hidden=True)``) on both of its lanes — the
+    fused small-suffix forward and the final single-token forward after the
+    chunked body. A LagunaARRuntime returns logits alone, so the two-name
+    unpack raised ``ValueError: not enough values to unpack (expected 2, got
+    1)`` and crash-looped the server on every warm session restore. The cold
+    prefill path was already gated on rt.mtp_enabled; the warm one must be too.
+    """
+
+    pytest.importorskip("mlx.core")
+    from mtplx import generation
+
+    monkeypatch.setattr(os, "environ", os.environ.copy())
+    os.environ["MTPLX_SMALL_SUFFIX_FUSED_MAX"] = str(fused_max)
+    os.environ["MTPLX_PREFILL_CHUNK_SIZE"] = "2"
+
+    runtime = _target_only_ar_runtime()
+    prefix = [1, 2, 3, 4, 5, 6]
+    prompt = prefix + list(range(7, 7 + suffix_len))
+
+    prompt_state = generation.restore_or_prefill_prompt_state(
+        runtime,
+        prompt,
+        mtp_history_policy="cycle",
+        session_bank=_exact_restore_bank(runtime, prefix),
+    )
+
+    assert prompt_state.cache_hit is True
+    assert prompt_state.cached_tokens == len(prefix)
+    assert prompt_state.suffix_tokens == suffix_len
+    # hidden stays None for AR; the trunk cache is all the bank stores.
+    assert prompt_state.hidden is None
+    assert prompt_state.logits is not None
+    # The lane under test really ran.
+    counters = runtime.diagnostic_counters
+    if lane == "fused":
+        assert counters.get("restored_suffix_prefill_fused", 0) == 1
+    else:
+        assert counters.get("restored_suffix_prefill_chunks", 0) >= 1
+
+
+def _near_prefix_bank(runtime, prefix_ids, *, entry_len):
+    """A bank offering a near-prefix candidate whose warm cache stops at
+    `prefix_ids` — the lane that runs the single-token repair forward."""
+
+    from types import SimpleNamespace
+
+    cache, _logits = _warm_prefix_cache(runtime, prefix_ids)
+    entry = SimpleNamespace(
+        prefix_len=entry_len,
+        token_ids=tuple(range(entry_len)),
+        session_id="session-1",
+        model_path=str(runtime.model_path),
+        hidden_variant="post_norm",
+        template_hash=None,
+        mtp_history_policy="cycle",
+        draft_head_identity=None,
+        policy_fingerprint=None,
+        snapshot_epoch=entry_len,
+        mtp_snapshot_epoch=None,
+        mtp_history_snapshot=None,
+        mtp_history_cache_ref=None,
+        gdn_boundaries=(),
+        has_recurrent=False,
+        live_ref_only=False,
+        cache_ref=None,
+        hits=0,
+        last_access_s=0.0,
+    )
+
+    class Bank:
+        last_miss_reason = None
+
+        def longest_prefix(self, _prompt_ids):
+            return None
+
+        def near_prefix_candidates(self, _prompt_ids, **_kwargs):
+            return [(entry, len(prefix_ids))]
+
+        def restore_entry_prefix_cache(
+            self, _rt, _entry, prefix_len, *, mode, cache_factory=None
+        ):
+            return (cache, None, "clone", int(prefix_len))
+
+        def restore(self, *_args, **_kwargs):
+            return None
+
+    return Bank(), entry
+
+
+@pytest.mark.parametrize("suffix_len", [2, 0])
+def test_near_prefix_restore_needs_no_hidden_from_target_only_runtime(
+    monkeypatch, suffix_len
+) -> None:
+    """The near/block-prefix lane's repair forward had the same ungated
+    ``return_hidden=True``.
+
+    Nothing about that lane is MTP-gated — it fires for any runtime with a
+    session bank — so an AR turn that diverged from the banked transcript hit
+    the identical unpack ValueError before reaching the suffix prefill. Both
+    the with-suffix and the empty-suffix return must tolerate hidden=None.
+    """
+
+    pytest.importorskip("mlx.core")
+    from mtplx import generation
+
+    monkeypatch.setattr(os, "environ", os.environ.copy())
+    os.environ["MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS"] = "2"
+    os.environ["MTPLX_SESSION_PREFIX_BLOCK_SIZE"] = "2"
+    os.environ["MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS"] = "2"
+
+    runtime = _target_only_ar_runtime()
+    prefix = [1, 2, 3, 4, 5, 6]
+    prompt = prefix + list(range(7, 7 + suffix_len))
+    bank, entry = _near_prefix_bank(runtime, prefix, entry_len=len(prefix) + 2)
+
+    prompt_state = generation.restore_or_prefill_prompt_state(
+        runtime,
+        prompt,
+        mtp_history_policy="cycle",
+        session_bank=bank,
+    )
+
+    assert prompt_state.restore_mode.startswith("near_prefix")
+    assert prompt_state.cache_hit is True
+    assert prompt_state.cached_tokens == len(prefix)
+    assert prompt_state.suffix_tokens == suffix_len
+    assert prompt_state.hidden is None
+    assert prompt_state.logits is not None
+    assert entry.hits == 1
+
+
 def _batched_greedy_rows(model, prompts, steps: int):
     """Greedy-decode every row of `prompts` in one batched forward per step."""
 

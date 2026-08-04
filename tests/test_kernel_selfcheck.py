@@ -177,7 +177,12 @@ def test_gdn_postconv_selfcheck_invokes_m1_and_m2(monkeypatch) -> None:
     monkeypatch.setattr(gdn_capture, "_a3b_compiled_target_gdn_postconv_m1_tgy4", m1)
     monkeypatch.setattr(gdn_capture, "_a3b_compiled_target_gdn_postconv_m2_tgy4", m2)
 
-    assert kernel_selfcheck._check_gdn_postconv_inline_g(mx, mx.bfloat16) == 0.0
+    # Bit-exact (0.0) on mlx 0.31.2; mlx 0.32.0 shifted accumulation order
+    # somewhere in the stock capture vs route pair by ~1.1e-8. The production
+    # gate for this lane tolerates 0.03125; keep the test far tighter so a
+    # genuinely broken kernel still fails, without pinning MLX's internal
+    # reduction order.
+    assert kernel_selfcheck._check_gdn_postconv_inline_g(mx, mx.bfloat16) <= 1e-6
     assert calls == [1, 2]
 
 

@@ -1948,6 +1948,34 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(command.environment["MTPLX_CHAT_TEMPLATE_PROFILE"], "tokenizer")
     }
 
+    func testCommandBuilderOpenCodePresetUsesHy3NativeDefaults() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: [
+            "PATH": fake.deletingLastPathComponent().path,
+            "MTPLX_APP_TEST_PHYSICAL_MEMORY_BYTES": "137438953472",
+        ])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/models/Hy3-295B-A21B-MTPLX-Optimized-Speed",
+                profile: "turbo"
+            ),
+            target: .openCode,
+            launchID: "opencode-hy3-launch"
+        )
+
+        XCTAssertTrue(command.arguments.containsInOrder(["--depth", "1"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--temperature", "0.9"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--top-p", "1.0"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--top-k", "0"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--draft-temperature", "0.9"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--draft-top-p", "1.0"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--draft-top-k", "0"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--chat-template-profile", "tokenizer"]))
+        XCTAssertFalse(command.arguments.containsInOrder(["--chat-template-profile", "local_qwen36"]))
+        XCTAssertEqual(command.environment["MTPLX_CHAT_TEMPLATE_PROFILE"], "tokenizer")
+    }
+
     func testCommandBuilderOpenCodePresetUsesStepLaunchDefaultsForStepfun() throws {
         let fake = try makeExecutable(named: "mtplx")
         let adapter = "/tmp/step37-134243.npz"
@@ -3131,7 +3159,7 @@ final class MTPLXAppCoreTests: XCTestCase {
     func testDefaultAppModelIsPortableHuggingFaceReference() throws {
         let model = MTPLXAppConfiguration.defaultLocalModelPath()
 
-        XCTAssertEqual(model, "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed")
+        XCTAssertEqual(model, "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2")
         XCTAssertFalse(model.contains("/Users/"))
         XCTAssertFalse(model.contains("Documents/MTPLX"))
     }
@@ -3384,8 +3412,9 @@ final class MTPLXAppCoreTests: XCTestCase {
         ).map(\.id)
 
         XCTAssertEqual(ids, [
-            "qwen35-9b-optimized-speed",
+            "optimized-speed-v2",
             "optimized-speed",
+            "qwen35-9b-optimized-speed",
             "gemma4-optimized-speed",
             "qwen36-35b-a3b-optimized-speed",
             "optimized-quality",
@@ -3394,6 +3423,21 @@ final class MTPLXAppCoreTests: XCTestCase {
         ])
         XCTAssertFalse(ids.contains { $0.hasSuffix("-fp16") })
         XCTAssertFalse(ids.contains { $0.contains("step") })
+    }
+
+    func testFreshModern36GiBCatalogLeadsWithOptimizedSpeedV2() throws {
+        let m5 = DetectedHardware(
+            chipName: "Apple M5 Pro",
+            appleSiliconGeneration: "m5",
+            unifiedMemoryBytes: 36 * 1_073_741_824
+        )
+
+        let ids = MTPLXModelOption.hardwareAwareOfficialCatalog(
+            hardware: m5,
+            includeInstalledOverrides: false
+        ).map(\.id)
+
+        XCTAssertEqual(Array(ids.prefix(2)), ["optimized-speed-v2", "optimized-speed"])
     }
 
     func testFreshModernLargeMemoryCatalogUnlocksBalanceWithoutFP16Siblings() throws {
@@ -3409,6 +3453,7 @@ final class MTPLXAppCoreTests: XCTestCase {
         ).map(\.id)
 
         XCTAssertEqual(ids, [
+            "optimized-speed-v2",
             "optimized-speed",
             "optimized-quality",
             "qwen36-35b-a3b-optimized-speed",

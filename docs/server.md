@@ -119,11 +119,14 @@ configuration precedence, contradictions, and admission behavior. This release
 does not promote streamed MTP or a GLM expert profile.
 
 For Anthropic Messages-compatible clients, point the client base URL at the
-same local server root:
+bare server root — no `/v1` suffix:
 
 ```text
-http://127.0.0.1:8000/v1
+http://127.0.0.1:8000
 ```
+
+The Anthropic SDK appends `/v1/messages` itself; a `/v1` base would request
+`/v1/v1/messages`, which is not a registered route.
 
 ## Android Studio
 

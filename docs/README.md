@@ -27,6 +27,10 @@ runtime and development reference.
 ## Develop and reference
 
 - [Architecture](architecture.md)
+- [Architectures](architectures.md)
+- [Turbo verify kernels](turbo-verify.md)
 - [Runtime contract](runtime-contract.md)
 - [Development](development.md)
+- [PyPI release runbook](PYPI_RELEASE.md)
+- [Release notes](releases/)
 - [Research note](research/native-mtp-on-mlx.md)

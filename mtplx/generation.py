@@ -30,7 +30,10 @@ from .a3b_compiled_target_prefix import (
 )
 from .a3b_whole_moe import validate_a3b_whole_moe_request
 from .adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
-from .attention_context import attention_phase
+from .attention_context import attention_phase, model_forward_kind
+from .deepseek_v4_adaptive_width import (
+    validate_installed_deepseek_v4_adaptive_width_policy,
+)
 from .progress_heartbeat import tick as _owner_progress_tick
 from .cache_state import (
     detach_array_leaf,
@@ -712,6 +715,50 @@ def _prefill_cache_only_forward(
         unused_logits = rt.model(token_array, cache=cache)
     del unused_logits
     return None
+
+
+def _forward_ar_optional_hidden(
+    rt: MTPLXRuntime,
+    token_array: Any,
+    *,
+    cache: Any,
+    hidden_variant: str | None,
+    emit_logits: bool = True,
+    logits_keep: int | None = None,
+    input_embeddings: Any | None = None,
+) -> tuple[Any, Any]:
+    """`forward_ar` as (logits, hidden), with hidden None on target-only runtimes.
+
+    Only request hidden states from a runtime that can produce them. Target-only
+    AR runtimes (laguna_ar) have no draft head: their forward_ar returns logits
+    alone, so an ungated ``return_hidden=True`` unpacks a lone logits array as
+    ``(logits, hidden)`` and raises "not enough values to unpack (expected 2,
+    got 1)" — the live serving crash in the warm session-restore suffix prefill.
+    `hidden_variant` travels only on the hidden branch for the same reason: the
+    generic runtime forwards it to the model as a kwarg a stock target does not
+    accept. This mirrors the cold prefill path and generate_ar, which both gate
+    return_hidden on rt.mtp_enabled. Callers must treat hidden as optional.
+    """
+
+    if not rt.mtp_enabled:
+        logits = rt.forward_ar(
+            token_array,
+            cache=cache,
+            return_hidden=False,
+            emit_logits=emit_logits,
+            logits_keep=logits_keep,
+            input_embeddings=input_embeddings,
+        )
+        return logits, None
+    return rt.forward_ar(
+        token_array,
+        cache=cache,
+        return_hidden=True,
+        hidden_variant=hidden_variant,
+        emit_logits=emit_logits,
+        logits_keep=logits_keep,
+        input_embeddings=input_embeddings,
+    )
 
 
 def _prefill_chunk_size() -> int:
@@ -2122,8 +2169,15 @@ def _prefill_restored_prompt_suffix_machine(
     cached_tokens = max(0, int(cached_tokens))
     suffix_total = int(len(suffix))
     suffix_done = 0
+    # A committed history needs a draft head to append to. Requiring
+    # rt.mtp_enabled here is the chokepoint that keeps the hidden-only chunk
+    # branch (and every append_history call) off target-only AR runtimes, whose
+    # forward_ar returns logits alone — restore_or_prefill_prompt_state already
+    # downgrades those to the cycle policy, and _append_mtp_history could not
+    # run against them regardless.
     use_committed_mtp = (
-        _mtp_history_uses_committed_cache(mtp_history_policy)
+        rt.mtp_enabled
+        and _mtp_history_uses_committed_cache(mtp_history_policy)
         and restored.mtp_history_cache is not None
     )
     # Vision suffixes: the caller pre-advanced the cursor past pads inside
@@ -2525,16 +2579,22 @@ def _trim_cache_to_offset(cache: Any, offset: int) -> bool:
     target = max(0, int(offset))
     if not cache:
         return target == 0
+    trims: list[tuple[Callable[[int], Any], int]] = []
     for entry in cache:
         current = int(getattr(entry, "offset", target) or 0)
         if current < target:
             return False
         delta = current - target
-        if delta <= 0:
-            continue
         trim = getattr(entry, "trim", None)
         if not callable(trim):
             return False
+        if delta <= 0:
+            continue
+        max_rollback = getattr(entry, "max_rollback", None)
+        if max_rollback is not None and delta > int(max_rollback):
+            return False
+        trims.append((trim, delta))
+    for trim, delta in trims:
         trimmed = int(trim(delta))
         if trimmed != delta:
             return False
@@ -4056,6 +4116,22 @@ def _sample_from_logits(
     return sample_from_distribution(probs, rng), probs
 
 
+def _greedy_draft_token_and_top2(logits: mx.array) -> tuple[int, float, float]:
+    """Materialize one greedy token and its FP32 top-two values together."""
+
+    row = (
+        logits[:, -1, :][0]
+        if logits.ndim == 3
+        else logits.reshape(-1)
+    ).astype(mx.float32)
+    token_id = mx.argmax(row, axis=-1)
+    top2_values = mx.topk(row, k=2)
+    _eval(token_id, top2_values)
+    token = int(np.asarray(token_id).reshape(-1)[0])
+    top2 = np.asarray(top2_values, dtype=np.float32).reshape(-1)
+    return token, float(top2[-1]), float(top2[-2])
+
+
 def _sample_draft_from_logits(
     logits: mx.array,
     config: SamplerConfig,
@@ -4070,6 +4146,83 @@ def _sample_draft_from_logits(
     if not need_distribution:
         return token, None
     return token, SparseDistribution.one_hot(token, int(logits.shape[-1]))
+
+
+def _fixed_width_draft_reader(
+    draft_logits: mx.array,
+    config: SamplerConfig,
+    rng: np.random.Generator,
+    *,
+    need_distribution: bool,
+) -> tuple[int, np.ndarray | SparseDistribution | None, bool]:
+    token, distribution = _sample_draft_from_logits(
+        draft_logits[:, -1, :][0],
+        config,
+        rng,
+        need_distribution=need_distribution,
+    )
+    return token, distribution, False
+
+
+def _adaptive_tail_k1_draft_reader(
+    draft_logits: mx.array,
+    config: SamplerConfig,
+    rng: np.random.Generator,
+    *,
+    need_distribution: bool,
+) -> tuple[int, np.ndarray | SparseDistribution | None, bool]:
+    token, distribution = _sample_draft_from_logits(
+        draft_logits[:, -1, :][0],
+        config,
+        rng,
+        need_distribution=need_distribution,
+    )
+    return token, distribution, False
+
+
+def _adaptive_tail_k2_draft_reader(
+    draft_logits: mx.array,
+    config: SamplerConfig,
+    rng: np.random.Generator,
+    *,
+    need_distribution: bool,
+) -> tuple[int, np.ndarray | SparseDistribution | None, bool]:
+    token, distribution = _sample_draft_from_logits(
+        draft_logits[:, -1, :][0],
+        config,
+        rng,
+        need_distribution=need_distribution,
+    )
+    return token, distribution, False
+
+
+def _adaptive_full_k3_draft_reader(
+    draft_logits: mx.array,
+    config: SamplerConfig,
+    rng: np.random.Generator,
+    *,
+    depth_index: int,
+    need_distribution: bool,
+    decision_margins: list[float],
+    margin_stops: tuple[Callable[[float], bool], Callable[[float], bool]],
+) -> tuple[int, np.ndarray | SparseDistribution | None, bool]:
+    if depth_index < 2:
+        token, top1, top2 = _greedy_draft_token_and_top2(draft_logits)
+        margin = float(top1 - top2)
+        decision_margins.append(margin)
+        distribution = (
+            SparseDistribution.one_hot(token, int(draft_logits.shape[-1]))
+            if need_distribution
+            else None
+        )
+        return token, distribution, margin_stops[depth_index](margin)
+    token, distribution = _sample_draft_from_logits(
+        draft_logits[:, -1, :][0],
+        config,
+        rng,
+        need_distribution=need_distribution,
+    )
+    return token, distribution, False
 
 
 def _env_scaled_draft_sampler(
@@ -4536,6 +4689,7 @@ def _prefill_machine(
 ):
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty")
+    return_hidden = bool(return_hidden and rt.mtp_enabled)
 
     _check_postcommit_abort(abort_check)
     cache = _make_target_prefill_cache(rt)
@@ -5974,7 +6128,10 @@ def generate_mtp1(
             continue
 
         started = time.perf_counter()
-        with attention_phase("decode_verify"):
+        with (
+            attention_phase("decode_verify"),
+            model_forward_kind("target_verify"),
+        ):
             if graphbank is not None:
                 verify_logits, verify_hidden = graphbank.forward_ar(
                     mx.array([[primary, draft_token]]),
@@ -6065,7 +6222,10 @@ def generate_mtp1(
             rollback_time += elapsed_rollback
             _add_timing(event, "rollback", elapsed_rollback)
             started = time.perf_counter()
-            with attention_phase("decode_verify"):
+            with (
+                attention_phase("decode_verify"),
+                model_forward_kind("repair"),
+            ):
                 logits_next, hidden_next = rt.forward_ar(
                     mx.array([[primary]]),
                     cache=cache,
@@ -6249,14 +6409,24 @@ def execute_solo_mtpk2_prefill_ticket(
             )
             hidden = None
         elif execution.route == "forward_ar":
-            result = rt.forward_ar(
-                ticket.input_ids,
-                cache=ticket.request_cache,
-                **execution.kwargs,
-            )
-            if bool(execution.kwargs.get("return_hidden")):
+            forward_kwargs = dict(execution.kwargs)
+            return_hidden = bool(forward_kwargs.pop("return_hidden", False))
+            if return_hidden:
+                result = _forward_ar_optional_hidden(
+                    rt,
+                    ticket.input_ids,
+                    cache=ticket.request_cache,
+                    hidden_variant=forward_kwargs.pop("hidden_variant", None),
+                    **forward_kwargs,
+                )
                 logits, hidden = result
             else:
+                result = rt.forward_ar(
+                    ticket.input_ids,
+                    cache=ticket.request_cache,
+                    return_hidden=False,
+                    **forward_kwargs,
+                )
                 logits, hidden = result, None
         else:
             raise RuntimeError(f"unknown K2 prefill route {execution.route!r}")
@@ -6479,6 +6649,7 @@ def _generate_mtpk_machine(
     thinking_guard: ThinkingGuardConfig | None = None,
     vision_splice: Any | None = None,
     constraint: Any | None = None,
+    adaptive_width_policy: Any | None = None,
     _request_id: str = "solo-k2",
     _prefill_chunk_tokens: int | None = None,
     _request_state: MTPK2RequestState | None = None,
@@ -6643,6 +6814,17 @@ def _generate_mtpk_machine(
         if _request_state is not None
         else _env_scaled_draft_sampler(sampler, draft_sampler)
     )
+    if adaptive_width_policy is not None:
+        validate_installed_deepseek_v4_adaptive_width_policy(
+            adaptive_width_policy,
+            rt,
+            sampler=sampler,
+            draft_sampler=draft_sampler,
+            speculative_depth=speculative_depth,
+            verify_strategy=verify_strategy,
+            verify_core=verify_core,
+            mtp_history_policy=mtp_history_policy,
+        )
     _loop_guard_config = (
         _request_state.config.loop_guard_config
         if _request_state is not None
@@ -6704,6 +6886,120 @@ def _generate_mtpk_machine(
         if _request_state is not None
         else np.random.default_rng(seed)
     )
+    def _default_cycle_draft_reader(
+        draft_logits: mx.array,
+        *,
+        depth_index: int,
+        need_distribution: bool,
+        decision_margins: list[float],
+    ) -> tuple[int, np.ndarray | SparseDistribution | None, bool]:
+        del depth_index, decision_margins
+        return _fixed_width_draft_reader(
+            draft_logits,
+            draft_sampler,
+            rng,
+            need_distribution=need_distribution,
+        )
+
+    if adaptive_width_policy is None:
+        adaptive_width_cycle_readers = (_default_cycle_draft_reader,) * max(
+            1, int(speculative_depth)
+        )
+        capture_forward_routes = (rt.forward_ar_capture,) * max(
+            1, int(speculative_depth)
+        )
+
+        def record_adaptive_width_event(
+            event: dict[str, Any],
+            *,
+            cycle_depth: int,
+            decision_margins: list[float],
+            selected_draft_depth: int,
+        ) -> None:
+            del event, cycle_depth, decision_margins, selected_draft_depth
+    else:
+        adaptive_width_margin_stops = (
+            adaptive_width_policy.stop_after_d1,
+            adaptive_width_policy.stop_after_d2,
+        )
+        adaptive_width_d1_threshold = float(
+            adaptive_width_policy.d1_margin_threshold
+        )
+        adaptive_width_d2_threshold = float(
+            adaptive_width_policy.d2_margin_threshold
+        )
+        adaptive_width_max_depth = int(adaptive_width_policy.max_speculative_depth)
+        capture_forward_routes = adaptive_width_policy.target_routes
+
+        def adaptive_tail_k1_reader(
+            draft_logits: mx.array,
+            *,
+            depth_index: int,
+            need_distribution: bool,
+            decision_margins: list[float],
+        ) -> tuple[int, np.ndarray | SparseDistribution | None, bool]:
+            del depth_index, decision_margins
+            return _adaptive_tail_k1_draft_reader(
+                draft_logits,
+                draft_sampler,
+                rng,
+                need_distribution=need_distribution,
+            )
+
+        def adaptive_tail_k2_reader(
+            draft_logits: mx.array,
+            *,
+            depth_index: int,
+            need_distribution: bool,
+            decision_margins: list[float],
+        ) -> tuple[int, np.ndarray | SparseDistribution | None, bool]:
+            del depth_index, decision_margins
+            return _adaptive_tail_k2_draft_reader(
+                draft_logits,
+                draft_sampler,
+                rng,
+                need_distribution=need_distribution,
+            )
+
+        def adaptive_full_k3_reader(
+            draft_logits: mx.array,
+            *,
+            depth_index: int,
+            need_distribution: bool,
+            decision_margins: list[float],
+        ) -> tuple[int, np.ndarray | SparseDistribution | None, bool]:
+            return _adaptive_full_k3_draft_reader(
+                draft_logits,
+                draft_sampler,
+                rng,
+                depth_index=depth_index,
+                need_distribution=need_distribution,
+                decision_margins=decision_margins,
+                margin_stops=adaptive_width_margin_stops,
+            )
+
+        adaptive_width_cycle_readers = (
+            adaptive_tail_k1_reader,
+            adaptive_tail_k2_reader,
+            adaptive_full_k3_reader,
+        )
+
+        def record_adaptive_width_event(
+            event: dict[str, Any],
+            *,
+            cycle_depth: int,
+            decision_margins: list[float],
+            selected_draft_depth: int,
+        ) -> None:
+            event["adaptive_width_policy"] = {
+                "kind": "deepseek_v4_preregistered_max_k3",
+                "eligible_full_k3": cycle_depth == adaptive_width_max_depth,
+                "d1_margin_threshold": adaptive_width_d1_threshold,
+                "d2_margin_threshold": adaptive_width_d2_threshold,
+                "decision_margins": list(decision_margins),
+                "selected_draft_depth": selected_draft_depth,
+                "target_rows": selected_draft_depth + 1,
+            }
     if mtp_corrector is not None:
         corrector_variant = getattr(mtp_corrector, "hidden_variant", mtp_hidden_variant)
         if corrector_variant != mtp_hidden_variant:
@@ -7716,6 +8012,10 @@ def _generate_mtpk_machine(
         # continuation predictiveness and can cost more to verify than they commit,
         # while grounded re-emission matches into the prompt (see the PR benchmarks).
         ccopy_index.sync(prompt_ids)
+    # Cost-model depth policy: cycle wall-time measured by the loop itself
+    # (first observe gets the span since loop entry, later ones the span
+    # since the previous observe) — real cycle cost, not inter-request gaps.
+    _policy_cycle_started = time.perf_counter()
     while len(tokens) < max_tokens:
         repetition_result = _trim_repeated_suffix(tokens, repetition_config)
         if repetition_result is not None:
@@ -7884,7 +8184,11 @@ def _generate_mtpk_machine(
         # second draft is still computed at a short output tail, then the
         # commit path below limits the visible prefix to the logical cap.
         cycle_depth = 2 if _request_state is not None else logical_cycle_depth
-        draft_tokens: list[int] = []
+        cycle_draft_reader = adaptive_width_cycle_readers[
+            min(cycle_depth - 1, len(adaptive_width_cycle_readers) - 1)
+        ]
+        adaptive_width_decision_margins: list[float] = []
+        draft_tokens: list[int | None] = []
         draft_probs: list[np.ndarray | None] = []
         draft_cache_keys: list[tuple[int, ...]] = []
         draft_hidden_for_update: list[mx.array] = []
@@ -8586,6 +8890,7 @@ def _generate_mtpk_machine(
                 )
             )
             reranker_info = None
+            adaptive_width_stop = False
             cached_token = (
                 correction_cache.get(cache_key) if cache_enabled_for_depth else None
             )
@@ -8666,13 +8971,16 @@ def _generate_mtpk_machine(
                             ),
                         )
                 else:
-                    draft_token, draft_q = _sample_draft_from_logits(
-                        draft_logits[:, -1, :][0],
-                        draft_sampler,
-                        rng,
-                        need_distribution=(
-                            sampler.temperature > 0 and not target_prefix_verify
-                        ),
+                    need_draft_distribution = (
+                        sampler.temperature > 0 and not target_prefix_verify
+                    )
+                    draft_token, draft_q, adaptive_width_stop = (
+                        cycle_draft_reader(
+                            draft_logits,
+                            depth_index=depth_index,
+                            need_distribution=need_draft_distribution,
+                            decision_margins=adaptive_width_decision_margins,
+                        )
                     )
             elapsed_draft = time.perf_counter() - started
             draft_time += elapsed_draft
@@ -8782,6 +9090,9 @@ def _generate_mtpk_machine(
             if online_draft_event is not None:
                 draft_event["online_hidden_corrector"] = online_draft_event
             event["drafts"].append(draft_event)
+            if adaptive_width_stop:
+                event["gated_stop_depth"] = depth_index + 1
+                break
             if adaptive_policy is not None and hasattr(
                 adaptive_policy, "should_continue_after_draft"
             ):
@@ -8795,6 +9106,13 @@ def _generate_mtpk_machine(
                     event["gated_stop_depth"] = depth_index + 1
                     event["policy_stop"] = policy_continue
                     break
+
+        record_adaptive_width_event(
+            event,
+            cycle_depth=cycle_depth,
+            decision_margins=adaptive_width_decision_margins,
+            selected_draft_depth=len(draft_tokens),
+        )
 
         before_verify = None
         if a3b_target_prefix_route is None:
@@ -8953,7 +9271,10 @@ def _generate_mtpk_machine(
             elapsed_verify_forward = float(verify_result.forward_elapsed_s or 0.0)
         else:
             started_forward = time.perf_counter()
-            with attention_phase("decode_verify"):
+            with (
+                attention_phase("decode_verify"),
+                model_forward_kind("target_verify"),
+            ):
                 if verify_strategy in {"capture_commit", "graphbank_capture_commit"}:
                     if compiled_verify_bank is not None:
                         verify_logits, verify_hidden, captures = (
@@ -8974,8 +9295,14 @@ def _generate_mtpk_machine(
                             )
                         )
                     else:
-                        verify_logits, verify_hidden, captures = rt.forward_ar_capture(
-                            mx.array([verify_input]),
+                        capture_forward = capture_forward_routes[
+                            min(
+                                len(draft_tokens) - 1,
+                                len(capture_forward_routes) - 1,
+                            )
+                        ]
+                        verify_logits, verify_hidden, captures = capture_forward(
+                            verify_input_array,
                             cache=cache,
                             return_hidden=True,
                             hidden_variant=base_hidden_variant,
@@ -9025,14 +9352,14 @@ def _generate_mtpk_machine(
                     )
                 elif graphbank is not None:
                     verify_logits, verify_hidden = graphbank.forward_ar(
-                        mx.array([verify_input]),
+                        verify_input_array,
                         cache=cache,
                         return_hidden=True,
                         hidden_variant=base_hidden_variant,
                     )
                 else:
                     verify_logits, verify_hidden = rt.forward_ar(
-                        mx.array([verify_input]),
+                        verify_input_array,
                         cache=cache,
                         return_hidden=True,
                         hidden_variant=base_hidden_variant,
@@ -9501,9 +9828,17 @@ def _generate_mtpk_machine(
 
         event["accepted_depths"] = accepted_count
         if adaptive_policy is not None:
+            _policy_now = time.perf_counter()
+            _policy_kwargs: dict[str, float] = {}
+            if getattr(adaptive_policy, "accepts_cycle_ms", False):
+                _policy_kwargs["cycle_ms"] = (
+                    _policy_now - _policy_cycle_started
+                ) * 1000.0
+            _policy_cycle_started = _policy_now
             event["policy"] = adaptive_policy.observe(
                 attempted_depth=max(1, len(draft_tokens)),
                 accepted_depths=accepted_count,
+                **_policy_kwargs,
             )
 
         if online_hidden_enabled and draft_hidden_for_update:
@@ -10965,6 +11300,7 @@ def generate_mtpk(
     thinking_guard: ThinkingGuardConfig | None = None,
     vision_splice: Any | None = None,
     constraint: Any | None = None,
+    adaptive_width_policy: Any | None = None,
 ) -> GenerationOutput:
     """Generate with the historical explicit API and a construction-time route."""
 

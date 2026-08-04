@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from functools import partial
-import os
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+
+logger = logging.getLogger(__name__)
+
+# One-time warning latch for an explicitly requested but unavailable
+# headquarter tape kernel (PR #209 review edit).
+_HEADQUARTER_IMPORT_WARNED = False
 
 
 @dataclass(frozen=True)
@@ -2039,8 +2046,19 @@ def _linear_gated_delta_from_conv_tape_capture(
     if os.environ.get("MTPLX_LINEAR_GDN_TAPE_IMPL", "").strip().lower() == "headquarter":
         try:
             from .kernels.gdn_tape_headquarter import headquarter_tape_capture
-        except Exception:
+        except ImportError as exc:
+            # The user explicitly opted in; falling back must be loud, not
+            # silent, or the incumbent masquerades as the requested kernel.
             headquarter_tape_capture = None
+            global _HEADQUARTER_IMPORT_WARNED
+            if not _HEADQUARTER_IMPORT_WARNED:
+                _HEADQUARTER_IMPORT_WARNED = True
+                logger.warning(
+                    "MTPLX_LINEAR_GDN_TAPE_IMPL=headquarter requested but the "
+                    "kernel module is unavailable (%s); using the incumbent "
+                    "tape kernel",
+                    exc,
+                )
         if headquarter_tape_capture is not None:
             result = headquarter_tape_capture(conv_out, g, beta, state, gdn)
             if result is not None:

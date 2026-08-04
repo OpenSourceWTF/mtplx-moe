@@ -574,6 +574,44 @@ GLM_MTP_DESCRIPTOR = BackendDescriptor(
 )
 
 
+HY_V3_MTP_DESCRIPTOR = BackendDescriptor(
+    backend_id="hy_v3_mtp",
+    architecture_id="hy-v3-mtp",
+    model_family="hy",
+    display_name="Hy3 native MTP",
+    artifact_layout="single_mlx_folder_native_mtp",
+    runtime_capabilities=NATIVE_CONTRACT_DESCRIPTOR.runtime_capabilities,
+    # Official Tencent inference settings. Do not inherit the colder Qwen
+    # coding sampler for Hy3's chain-of-thought path.
+    sampler_defaults=SamplerDefaults(temperature=0.9, top_p=1.0, top_k=0),
+    reasoning_codec=ReasoningCodec(
+        parser="qwen3",
+        display_name="Hy3 think tags",
+        default_mode="auto",
+    ),
+    draft_semantics=NATIVE_CONTRACT_DESCRIPTOR.draft_semantics,
+    uses_external_assistant=False,
+    uses_draft_lm_head=True,
+    hidden_variant="pre_norm",
+    tune_policy=TunePolicy(
+        supported=False,
+        unsupported_reason="Tune is supported for Qwen 3.5, Qwen 3.6, and Gemma 4 MTPLX models only.",
+    ),
+    kv_quant_policy=KVQuantPolicy(
+        supported=False,
+        disabled_reason="KV quantization is not supported for Hy3.",
+    ),
+    validation_status="experimental_contract_gated",
+    status="experimental_contract_gated",
+    notes=(
+        "Single appended NextN MoE layer (depth 1); 192-expert sigmoid top-8 "
+        "routing with expert bias; draft input eh_proj(concat[enorm(embedding), "
+        "hnorm(pre-final-norm hidden)]).",
+        "Official sampler: temperature 0.9, top_p 1.0, top_k off.",
+    ),
+)
+
+
 KIMI_K3_AR_DESCRIPTOR = BackendDescriptor(
     backend_id="kimi_k3_ar",
     architecture_id="kimi-k3-streaming-ar",
@@ -753,6 +791,7 @@ DESCRIPTORS_BY_BACKEND_ID: dict[str, BackendDescriptor] = {
     STEP3P5_MTP_DESCRIPTOR.backend_id: STEP3P5_MTP_DESCRIPTOR,
     DEEPSEEK_MTP_DESCRIPTOR.backend_id: DEEPSEEK_MTP_DESCRIPTOR,
     GLM_MTP_DESCRIPTOR.backend_id: GLM_MTP_DESCRIPTOR,
+    HY_V3_MTP_DESCRIPTOR.backend_id: HY_V3_MTP_DESCRIPTOR,
     KIMI_K3_AR_DESCRIPTOR.backend_id: KIMI_K3_AR_DESCRIPTOR,
     "mimo_mtp": NATIVE_CONTRACT_DESCRIPTOR,
     "nemotron_h_mtp": NATIVE_CONTRACT_DESCRIPTOR,

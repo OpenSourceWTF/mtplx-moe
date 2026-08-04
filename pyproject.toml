@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mtplx"
-version = "2.3.0+opensourcewtf.moe"
+version = "2.5.2+opensourcewtf.moe"
 description = "Native MTP speculative decoding for Qwen3-Next on Apple Silicon."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,7 +21,12 @@ dependencies = [
   # 0.32.0 exactness-gated 2026-07-11: byte-identical greedy 128-tok output
   # vs 0.31.3 on Optimized-Speed q4 turbo D3 (same 34 verify calls), and 103
   # kernel/paged-verifier/graphbank/sustained tests green under 0.32.0.
-  "mlx>=0.31,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  # Floor raised to 0.32 in 2.5.2: fresh installs already resolve 0.32.0,
+  # but existing venvs sat on 0.31.2 forever because the app bootstrapper's
+  # -U uses pip's only-if-needed strategy. Raising the floor converges every
+  # install to the stack new installs already run (and the 2026-08-04
+  # long-generation runs consistently read faster on 0.32.0).
+  "mlx>=0.32,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "mlx-lm>=0.31,<0.32; sys_platform == 'darwin' and platform_machine == 'arm64'",
   # transformers 5.13.0 changed AutoTokenizer.register to require a config
   # class as the key; mlx-lm 0.31.x still registers by name
@@ -29,8 +34,11 @@ dependencies = [
   # at model load (#136, #135; PR #137 by @davidtai). 5.13.1 restored
   # compatibility (verified 2026-07-11: mlx-lm 0.31.3 import + real Speed-q4
   # tokenizer load + chat template green on 5.13.1; 5.13.0 still crashes),
-  # so only the poisoned release stays excluded.
-  "transformers<5.14,!=5.13.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  # so only the poisoned release stays excluded. 5.14 verified 2026-08-02:
+  # mlx-lm 0.31.3 import + real Optimized-Speed tokenizer round-trip + tool
+  # chat template fingerprint-identical to 5.8.0 under transformers 5.14.1
+  # (PR #175).
+  "transformers!=5.13.0,<5.15; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "nanobind>=2; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "numpy>=2",
   "pydantic>=2",
