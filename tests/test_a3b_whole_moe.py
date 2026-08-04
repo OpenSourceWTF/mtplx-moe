@@ -1267,6 +1267,9 @@ def test_runtime_constructs_one_whole_block_owner_after_packing() -> None:
     whole_selfcheck = source.index("run_a3b_whole_moe_selfcheck(")
     compiled_factory = source.index("prepare_a3b_compiled_target_prefix(")
     runtime_construction = source.index("runtime = MTPLXRuntime(")
+    # PR #195 made construction class-indirect (LagunaARRuntime | MTPLXRuntime);
+    # the ordering invariant this test guards is unchanged.
+    runtime_construction = source.index("runtime = runtime_class(")
     install_whole = source.index("install_a3b_whole_moe(")
     compiled_preflight = source.index("preflight_a3b_k1_target_prefix_load_graph(")
     install_router = source.index("install_qwen_row_owned_routers(")

@@ -41,9 +41,11 @@ from mtplx.server import openai
 def _make_state(*, bank: object) -> SimpleNamespace:
     """Minimum stub of `ServerState` for `_store_retokenized_history_snapshot`.
 
-    The function only reaches `state.runtime.tokenizer`, `state.sessions.bank`,
-    `state.template_hash`, `state.draft_head_identity`, `state.lock`,
-    `state.begin_foreground`, `state.end_foreground`, and
+    The function only reaches `state.runtime.tokenizer`,
+    `state.runtime.mtp_enabled` (which picks the MTP-history policy the
+    snapshot banks under), `state.sessions.bank`, `state.template_hash`,
+    `state.draft_head_identity`, `state.lock`, `state.begin_foreground`,
+    `state.end_foreground`, and
     `state.args.strip_assistant_reasoning_history`. Everything else is
     bypassed by the monkeypatched `restore_or_prefill_prompt_state` and
     `_encode_messages`.
@@ -55,9 +57,9 @@ def _make_state(*, bank: object) -> SimpleNamespace:
 
     args = SimpleNamespace(strip_assistant_reasoning_history=False)
     return SimpleNamespace(
-        runtime=SimpleNamespace(tokenizer=_Tokenizer()),
         session_mtp_history_policy="committed",
         session_hidden_variant="post_norm",
+        runtime=SimpleNamespace(tokenizer=_Tokenizer(), mtp_enabled=True),
         sessions=SimpleNamespace(bank=bank),
         template_hash="tmpl-abc",
         draft_head_identity="draft-xyz",

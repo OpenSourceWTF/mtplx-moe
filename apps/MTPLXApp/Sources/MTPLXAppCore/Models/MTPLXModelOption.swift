@@ -29,6 +29,10 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
     /// "Recommended for your Mac" badge on the model-pick step. M1/M2
     /// Speed → FP16 routing happens in `ModelPickStep`, not here.
     public var recommendedFor: [ChipTier]
+    /// Target-only AR model (no native MTP head). The engine hard-rejects
+    /// MTP loads for these (Laguna), so launches must carry `--no-mtp` and
+    /// the depth/auto-tune lane must stay out of the serve command.
+    public var arOnly: Bool
     public init(
         id: String,
         displayName: String,
@@ -39,7 +43,8 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         aliases: [String] = [],
         sizeBytes: Int64 = 0,
         peakMemoryGiB: Double = 0,
-        recommendedFor: [ChipTier] = []
+        recommendedFor: [ChipTier] = [],
+        arOnly: Bool = false
     ) {
         self.id = id
         self.displayName = displayName
@@ -51,6 +56,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         self.sizeBytes = sizeBytes
         self.peakMemoryGiB = peakMemoryGiB
         self.recommendedFor = recommendedFor
+        self.arOnly = arOnly
     }
 
     enum CodingKeys: String, CodingKey {
@@ -64,6 +70,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         case sizeBytes
         case peakMemoryGiB
         case recommendedFor
+        case arOnly
     }
 
     public init(from decoder: Decoder) throws {
@@ -78,6 +85,33 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         sizeBytes = try container.decodeIfPresent(Int64.self, forKey: .sizeBytes) ?? 0
         peakMemoryGiB = try container.decodeIfPresent(Double.self, forKey: .peakMemoryGiB) ?? 0
         recommendedFor = try container.decodeIfPresent([ChipTier].self, forKey: .recommendedFor) ?? []
+        arOnly = try container.decodeIfPresent(Bool.self, forKey: .arOnly) ?? false
+    }
+
+    /// True when `reference` (a model string from configuration: catalog id,
+    /// alias, HF id, or a local path) resolves to a target-only AR model.
+    /// Used by the command builder so every app launch path carries the
+    /// correct `--no-mtp` shape without each caller re-deriving it.
+    public static func isAROnlyReference(_ reference: String) -> Bool {
+        let trimmed = reference.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let lower = trimmed.lowercased()
+        for option in MTPLXModelOption.officialCatalog where option.arOnly {
+            if option.id.lowercased() == lower { return true }
+            if option.hfModelID.lowercased() == lower { return true }
+            if option.aliases.contains(where: { $0.lowercased() == lower }) { return true }
+            let tail = (trimmed as NSString).lastPathComponent.lowercased()
+            let hfTail = (option.hfModelID as NSString).lastPathComponent.lowercased()
+            if !tail.isEmpty, tail == hfTail || tail == hfTail.replacingOccurrences(of: "/", with: "--") {
+                return true
+            }
+            if option.localCandidates.contains(where: {
+                Self.expand($0).lowercased() == Self.expand(trimmed).lowercased()
+            }) {
+                return true
+            }
+        }
+        return false
     }
 
     public var resolvedReference: String {
@@ -370,10 +404,30 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             recommendedFor: [.legacyApple]
         ),
         MTPLXModelOption(
+            id: "optimized-speed-v2",
+            displayName: "Qwen 3.6 27B Optimized Speed V2",
+            shortName: "Qwen 3.6 27B Optimized Speed V2",
+            detail: "Much higher quality for coding. Dynamic 4-bit hybrid quantization keeps hand-tuned sensitive parts at up to 16-bit. Faster on long agent tasks, slightly larger, and a little slower for short chats.",
+            hfModelID: "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
+            localCandidates: [
+                "~/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
+                "~/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
+                "~/Documents/MTPLX/hf-staging/Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
+            ],
+            aliases: [
+                "mtplx-qwen36-27b-optimized-speed-v2",
+                "Qwen3.6 27B Optimized Speed V2",
+                "Optimized Speed V2",
+            ],
+            sizeBytes: 19_887_448_095,
+            peakMemoryGiB: 21.5,
+            recommendedFor: [.modernApple]
+        ),
+        MTPLXModelOption(
             id: "optimized-speed",
             displayName: "Qwen 3.6 27B Optimized Speed",
             shortName: "Qwen 3.6 27B Optimized Speed",
-            detail: "4-bit quantization. Fast and smart.",
+            detail: "Smaller 4-bit model. A little faster for short chats.",
             hfModelID: "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed",
             localCandidates: [
                 "~/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed",
@@ -552,6 +606,25 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             peakMemoryGiB: 28.12,
             recommendedFor: [.legacyApple]
         ),
+        MTPLXModelOption(
+            id: "laguna-s21-oq4e",
+            displayName: "Laguna S-2.1 (community oQ4e)",
+            shortName: "Laguna S-2.1",
+            detail: "Poolside coding model, mixed-precision 4-bit. AR-only (no MTP head yet).",
+            hfModelID: "mlx-community/Laguna-S-2.1-oQ4e",
+            localCandidates: [
+                "~/.mtplx/models/mlx-community--Laguna-S-2.1-oQ4e",
+            ],
+            aliases: [
+                "mtplx-laguna-s21",
+                "Laguna S-2.1",
+                "Laguna-S-2.1-oQ4e",
+            ],
+            sizeBytes: 64_129_728_868,
+            peakMemoryGiB: 74.0,
+            recommendedFor: [.modernApple],
+            arOnly: true
+        ),
     ]
 
     public static func option(matching model: String) -> MTPLXModelOption? {
@@ -624,6 +697,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 memoryGiB: hardware.unifiedMemoryGiB,
                 small: "qwen35-9b-optimized-speed-fp16",
                 speed27: "optimized-speed-fp16",
+                speed27V2: nil,
                 speed35: "qwen36-35b-a3b-optimized-speed-fp16",
                 balance35: "qwen36-35b-a3b-optimized-balance-fp16",
                 quality27: "optimized-quality-fp16"
@@ -637,6 +711,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 memoryGiB: hardware.unifiedMemoryGiB,
                 small: "qwen35-9b-optimized-speed",
                 speed27: "optimized-speed",
+                speed27V2: "optimized-speed-v2",
                 speed35: "qwen36-35b-a3b-optimized-speed",
                 balance35: "qwen36-35b-a3b-optimized-balance",
                 quality27: "optimized-quality"
@@ -655,6 +730,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
     }
 
     private static let modernTopRecommendationIDs = [
+        "optimized-speed-v2",
         "optimized-speed",
         "optimized-quality",
         "qwen36-35b-a3b-optimized-speed",
@@ -667,6 +743,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         memoryGiB: Double,
         small: String,
         speed27: String,
+        speed27V2: String?,
         speed35: String,
         balance35: String,
         quality27: String
@@ -675,9 +752,13 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             return [small]
         }
         if memoryGiB < 48 {
-            return [small, speed27, "gemma4-optimized-speed", speed35, quality27]
+            guard let speed27V2 else {
+                return [small, speed27, "gemma4-optimized-speed", speed35, quality27]
+            }
+            return [speed27V2, speed27, small, "gemma4-optimized-speed", speed35, quality27]
         }
-        return [speed27, quality27, speed35, balance35, "gemma4-optimized-speed", small]
+        return (speed27V2.map { [$0] } ?? [])
+            + [speed27, quality27, speed35, balance35, "gemma4-optimized-speed", small]
     }
 
     private static func optionWithID(_ id: String) -> MTPLXModelOption? {
@@ -813,6 +894,9 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         }
         if normalized.contains("deepseek") {
             return "deepseek"
+        }
+        if normalized.contains("laguna") {
+            return "laguna"
         }
         if normalized.contains("glm") {
             return "glm"

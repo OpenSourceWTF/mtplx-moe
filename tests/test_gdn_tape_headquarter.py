@@ -65,9 +65,13 @@ def test_tape_replay_reads_geometry_attributes_from_dict_backed_module():
 
 @pytest.mark.parametrize("T", [1, 4])
 @pytest.mark.parametrize("seed", [0, 1])
-def test_headquarter_matches_incumbent_bitwise(T, seed):
+def test_headquarter_matches_incumbent_bitwise(T, seed, monkeypatch):
     from mlx_lm.models.gated_delta import compute_g
 
+    # The reference arm routes through the env-gated wrapper: a stray
+    # MTPLX_LINEAR_GDN_TAPE_IMPL=headquarter in the invoking shell would turn
+    # this into headquarter-vs-headquarter and pass vacuously.
+    monkeypatch.delenv("MTPLX_LINEAR_GDN_TAPE_IMPL", raising=False)
     mx.random.seed(0)
     gdn = _gdn()
     key = mx.random.key(1000 * T + seed)

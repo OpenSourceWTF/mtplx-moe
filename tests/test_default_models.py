@@ -29,8 +29,10 @@ from mtplx.profiles import (
     DEFAULT_FP16_HF_MODEL_ID,
     DEFAULT_FP16_PUBLIC_MODEL_ID,
     DEFAULT_HF_MODEL_ID,
-    DEFAULT_PUBLIC_MODEL_ID,
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
+    OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+    OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID,
+    OPTIMIZED_SPEED_V2_PUBLIC_MODEL_ID,
     QUALITY_PUBLIC_MODEL_ID,
     QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
     QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
@@ -154,8 +156,8 @@ def test_default_model_variant_env_override_legacy_bf16_alias_forces_speed(monke
     )
 
     assert selection.variant == "speed"
-    assert selection.precision == OPTIMIZED_SPEED_DESCRIPTION
-    assert selection.model == DEFAULT_HF_MODEL_ID
+    assert "Smaller 4-bit model" in selection.precision
+    assert selection.model == OPTIMIZED_SPEED_V1_HF_MODEL_ID
     assert "legacy alias" in selection.reason
     assert selection.auto_selected is False
 
@@ -182,6 +184,9 @@ def test_verified_default_refs_include_speed_and_fp16():
         "/Users/example/.mtplx/hf-upload/Qwen3.6-27B-MTPLX-Optimized"
     )
     assert is_verified_default_model_ref(
+        "/Users/example/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed-V2"
+    )
+    assert not is_verified_default_model_ref(
         "/Users/example/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed"
     )
     assert is_verified_default_model_ref(
@@ -192,7 +197,7 @@ def test_verified_default_refs_include_speed_and_fp16():
 
 
 def test_optimized_speed_prefers_complete_local_env_model(tmp_path, monkeypatch):
-    local_speed = _make_complete_model(tmp_path / "Qwen3.6-27B-MTPLX-Optimized-Speed")
+    local_speed = _make_complete_model(tmp_path / "Qwen3.6-27B-MTPLX-Optimized-Speed-V2")
     monkeypatch.setenv(SPEED_MODEL_ENV, str(local_speed))
 
     selection = select_default_model(
@@ -239,7 +244,7 @@ def test_optimized_quality_routes_fp16_sibling_on_legacy_silicon(monkeypatch):
     [
         (
             "/Users/example/models/Qwen3.6-27B-MTPLX-Optimized-Speed",
-            DEFAULT_PUBLIC_MODEL_ID,
+            OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID,
         ),
         (
             "/Users/example/models/Qwen3.6-27B-MTPLX-Optimized-Speed-FP16",
@@ -257,9 +262,50 @@ def test_optimized_quality_routes_fp16_sibling_on_legacy_silicon(monkeypatch):
             "/Users/example/models/Qwen3.6-27B-MTPLX-Optimized",
             LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
         ),
+        # HF repo id given directly, and the HF cache-dir path shape the
+        # resolver historically needed substring matching for — both must
+        # keep mapping to the first-party id under component equality.
+        (
+            "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed",
+            OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID,
+        ),
+        (
+            "/Users/example/.cache/huggingface/hub/"
+            "models--Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed/"
+            "snapshots/abc1234def",
+            OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID,
+        ),
     ],
 )
 def test_public_model_id_for_ref_maps_known_local_names(model_ref, expected):
+    assert public_model_id_for_ref(model_ref) == expected
+
+
+@pytest.mark.parametrize(
+    ("model_ref", "expected"),
+    [
+        # A derivative artifact whose folder name EXTENDS a first-party
+        # name must serve under its own identity, not the flagship's:
+        # substring matching made a V3-RC build report itself as
+        # mtplx-qwen36-27b-optimized-speed (health payload + app model
+        # chip both lied, reported live 2026-07-31).
+        (
+            "/Users/example/models/Qwen3.6-27B-MTPLX-Optimized-Speed-V3-RC",
+            "qwen3.6-27b-mtplx-optimized-speed-v3-rc",
+        ),
+        (
+            "/Users/example/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Quality-V2",
+            "youssofal-qwen3.6-27b-mtplx-optimized-quality-v2",
+        ),
+        (
+            "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V3-RC",
+            "qwen3.6-27b-mtplx-optimized-speed-v3-rc",
+        ),
+    ],
+)
+def test_public_model_id_for_ref_refuses_derivative_name_collisions(
+    model_ref, expected
+):
     assert public_model_id_for_ref(model_ref) == expected
 
 
@@ -520,7 +566,14 @@ def test_public_model_id_for_ref_keeps_third_party_identity(ref, expected):
 @pytest.mark.parametrize(
     ("ref", "expected"),
     [
-        ("Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed", DEFAULT_PUBLIC_MODEL_ID),
+        (
+            "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
+            OPTIMIZED_SPEED_V2_PUBLIC_MODEL_ID,
+        ),
+        (
+            "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed",
+            OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID,
+        ),
         (
             "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-FP16",
             DEFAULT_FP16_PUBLIC_MODEL_ID,
@@ -537,7 +590,7 @@ def test_public_model_id_for_ref_keeps_third_party_identity(ref, expected):
         ),
         (
             "~/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
-            DEFAULT_PUBLIC_MODEL_ID,
+            OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID,
         ),
     ],
 )

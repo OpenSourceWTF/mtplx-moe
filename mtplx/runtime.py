@@ -16,7 +16,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
-from .artifacts import inspect_model, load_config
+from .artifacts import (
+    inspect_model,
+    load_config,
+    mtp_weights_present_on_disk,
+    text_config,
+)
 from .mtp_adapters import (
     install_saved_mtp_lora_adapter,
     merge_installed_mtp_lora_adapters,
@@ -119,6 +124,9 @@ class MTPLXRuntime:
     mtp_adapter_merge_report: dict[str, Any] | None = None
     expert_streaming: Any | None = None
     resident_load_report: dict[str, Any] | None = None
+    deepseek_v4_o_lora_report: dict[str, Any] | None = None
+    deepseek_v4_attn_proj_wide_m3_report: dict[str, Any] | None = None
+    deepseek_v4_attention_island_report: dict[str, Any] | None = None
     a3b_compiled_target_prefix_factory: A3BCompiledTargetPrefixFactory | None = None
     a3b_whole_moe_installed: bool = False
     _a3b_whole_moe_request_preflights: dict[str, dict[str, Any]] = field(
@@ -331,6 +339,47 @@ class MTPLXRuntime:
         if not compile_forward_enabled():
             return None
         if not cache:
+            return None
+        # An unprimed cache (empty context / first token) has None KV leaves
+        # that would crash the compiled graph. Only compile once the cache
+        # holds real keys, and only for the plain growable KVCache shape the
+        # fixed-buffer conversion understands.
+        first = cache[0]
+        if getattr(first, "keys", None) is None:
+            return None
+        if any(
+            not hasattr(entry, "keys")
+            or not hasattr(entry, "values")
+            or not hasattr(entry, "offset")
+            for entry in cache
+        ):
+            return None
+        cache_key = id(first)
+        if (
+            getattr(self, "_compiled_ar", None) is None
+            or getattr(self, "_compiled_ar_key", None) != cache_key
+        ):
+            import os as _os
+
+            reserve = int(_os.environ.get("MTPLX_COMPILE_AR_RESERVE_TOKENS", "4096"))
+            self._compiled_ar = CompiledARForward(self.model, reserve_tokens=reserve)
+            self._compiled_ar_key = cache_key
+        return self._compiled_ar
+
+    def _compiled_ar_forward(self, cache):
+        """Compiled target forward (MTPLX_COMPILE_AR_FORWARD).
+
+        Kills the per-token Python graph rebuild by tracing the full trunk
+        forward once (CompiledARForward, KV state threaded). Applies to
+        fully-resident loads with a standard per-layer KV cache; a host-sync
+        buried in the model forward surfaces as an error on the first traced
+        call rather than silently degrading. Rebuilds per cache identity so a
+        new generation gets fresh threaded state. Returns None (the eager
+        path) otherwise.
+        """
+        from .compiled_forward import CompiledARForward, compile_forward_enabled
+
+        if not compile_forward_enabled() or not cache:
             return None
         # An unprimed cache (empty context / first token) has None KV leaves
         # that would crash the compiled graph. Only compile once the cache
@@ -665,6 +714,61 @@ def _streaming_preflight_resident_discount(
     )
 
 
+# HF class name (as declared in config ``architectures``) -> mlx-lm module
+# implementing it. Keep this allowlist schema-specific and fail loudly for
+# unverified declarations.
+_ARCHITECTURE_DECLARED_MODULES = {
+    "Qwen3_5ForConditionalGeneration": "qwen3_5",
+    "Qwen3_5ForCausalLM": "qwen3_5",
+    "Qwen3_5TextForCausalLM": "qwen3_5",
+    "Qwen3_5MoeForConditionalGeneration": "qwen3_5_moe",
+    "Qwen3_5MoeForCausalLM": "qwen3_5_moe",
+    "Qwen3_5MoeTextForCausalLM": "qwen3_5_moe",
+}
+
+
+def _install_architectures_declared_module_alias(config: dict[str, Any]) -> bool:
+    """Install a verified mlx-lm alias declared by a checkpoint architecture."""
+    import importlib
+    import importlib.util
+
+    tcfg = text_config(config)
+    model_type = str(config.get("model_type") or tcfg.get("model_type") or "").strip()
+    if not model_type:
+        return False
+    alias_name = f"mlx_lm.models.{model_type}"
+    if alias_name in sys.modules:
+        return False
+    try:
+        if importlib.util.find_spec(alias_name) is not None:
+            return False
+    except (ImportError, ValueError):
+        return False
+    architectures: list[str] = []
+    for source in (config, tcfg):
+        raw = source.get("architectures")
+        if isinstance(raw, list):
+            architectures.extend(str(item) for item in raw)
+    for architecture in architectures:
+        target = _ARCHITECTURE_DECLARED_MODULES.get(architecture)
+        if target is None:
+            continue
+        try:
+            module = importlib.import_module(f"mlx_lm.models.{target}")
+        except ImportError:
+            continue
+        sys.modules[alias_name] = module
+        logger.warning(
+            "[model-alias] model_type %r has no mlx-lm module; loading via "
+            "the checkpoint's declared architecture %s (mlx_lm.models.%s)",
+            model_type,
+            architecture,
+            target,
+        )
+        return True
+    return False
+
+
 def _load_impl(
     model_path: Path | str,
     *,
@@ -793,6 +897,15 @@ def _load_impl(
     # the trunk is a vanilla ``qwen3_5_moe``. Alias it so the trunk loads.
     if is_qwen3_5_mtp_config(config):
         install_qwen3_5_mtp_trunk_shim()
+
+    # Register the vendored Hy3 model before any resident load resolves the
+    # model type, and honor only the construction-time architecture aliases
+    # proven schema-compatible above.
+    from .hy_v3_mtp_patch import install_hy_v3_model_shim, is_hy_v3_config
+
+    if is_hy_v3_config(config):
+        install_hy_v3_model_shim()
+    _install_architectures_declared_module_alias(config)
 
     expert_runtime = None
     resident_load_report = None
@@ -1124,6 +1237,30 @@ def _load_impl(
                 len(touched),
                 proj_requant,
             )
+    deepseek_v4_attn_proj_wide_m3_report = None
+    if (
+        expert_runtime is None
+        and str((config or {}).get("model_type") or "").lower() == "deepseek_v4"
+    ):
+        from .models.deepseek_v4 import configure_deepseek_v4_moe_tail
+
+        configure_deepseek_v4_moe_tail(model, config)
+        from .deepseek_v4_attn_proj_wide_m3 import (
+            deepseek_v4_attn_proj_wide_m3_enabled,
+        )
+
+        if deepseek_v4_attn_proj_wide_m3_enabled():
+            from .deepseek_v4_attn_proj_wide_m3 import (
+                install_deepseek_v4_attn_proj_wide_m3,
+            )
+
+            deepseek_v4_attn_proj_wide_m3_report = (
+                install_deepseek_v4_attn_proj_wide_m3(model, config)
+            )
+            logger.info(
+                "[deepseek-v4-attn-proj-wide-m3] %s",
+                deepseek_v4_attn_proj_wide_m3_report,
+            )
     if mtp and expert_runtime is None:
         from .deepseek_mtp_patch import (
             inject_deepseek_mtp_support,
@@ -1137,9 +1274,21 @@ def _load_impl(
         )
         from .step3p5_mtp_patch import inject_step3p5_mtp_support
         from .hy_v3_mtp_patch import inject_hy_v3_mtp_support, is_hy_v3_mtp_config
+        from .models.deepseek_v4 import (
+            inject_deepseek_v4_mtp_support,
+            is_deepseek_v4_mtp_config,
+        )
         from .qwen3_5_mtp_patch import inject_qwen3_5_mtp_support
 
-        if is_nemotron_h_mtp_config(config):
+        if is_deepseek_v4_mtp_config(config):
+            # Native draft head: the block binds through the ordinary load path
+            # and the model already carries the runtime surface, so this only
+            # publishes it. Placed ahead of is_deepseek_mtp_config defensively --
+            # that predicate keys on model_type in {deepseek_v3, deepseek_v32,
+            # glm_moe_dsa}, so it cannot match a deepseek_v4 config today, but it
+            # is the arm that would build a V3 head if the sets ever overlap.
+            mtp_enabled = inject_deepseek_v4_mtp_support(model, path, config, contract)
+        elif is_nemotron_h_mtp_config(config):
             mtp_enabled = inject_nemotron_h_mtp_support(model, path, config, contract)
         elif is_mimo_mtp_config(config):
             mtp_enabled = inject_mimo_mtp_support(model, path, config, contract)
@@ -1155,8 +1304,21 @@ def _load_impl(
             mtp_enabled = inject_deepseek_mtp_support(model, path, config, contract)
         else:
             mtp_enabled = inject_mtp_support(model, path, config, contract)
-        if not mtp_enabled or not validate_mtp_support(model):
+        if mtp_enabled:
+            if not validate_mtp_support(model):
+                raise RuntimeError(f"MTP injection failed for {path}")
+        elif mtp_weights_present_on_disk(path, config):
+            # MTP weights ship with the model but injection could not use
+            # them: a genuine failure the operator should see.
             raise RuntimeError(f"MTP injection failed for {path}")
+        else:
+            # A conversion may preserve the MTP declaration while dropping
+            # the draft tensors. Bind the target-only route at construction.
+            logger.warning(
+                "[MTP] %s declares MTP layer(s) but ships no MTP weights; "
+                "serving autoregressive (no speculative draft head).",
+                path,
+            )
     whole_moe_plan = None
     compiled_target_factory = None
     selfcheck_report = None
@@ -1181,6 +1343,14 @@ def _load_impl(
         if nax_env_enabled():
             nax_report = install_nax_qlinear_patch()
             logger.info("[nax-verify] %s", nax_report)
+        from .kernels.gdn_blocked_prefill import (
+            blocked_prefill_env_enabled,
+            install_gdn_blocked_prefill_patch,
+        )
+
+        if blocked_prefill_env_enabled():
+            gdn_prefill_report = install_gdn_blocked_prefill_patch()
+            logger.info("[gdn-blocked-prefill] %s", gdn_prefill_report)
         from .qwen_row_owned_router import (
             install_qwen_row_owned_routers,
             prepare_qwen_row_owned_routers,
@@ -1250,6 +1420,42 @@ def _load_impl(
             adapter_merge_report = merge_installed_mtp_lora_adapters(model)
     elif merge_mtp_adapter:
         raise RuntimeError("merge_mtp_adapter requires mtp_adapter")
+    deepseek_v4_o_lora_report = None
+    deepseek_v4_attention_island_report = None
+    if (
+        expert_runtime is None
+        and str(config.get("model_type") or "").lower() == "deepseek_v4"
+    ):
+        from .models.deepseek_v4 import (
+            _o_lora_mode_from_env,
+            install_deepseek_v4_o_lora_routes,
+        )
+
+        selected_o_lora_mode = _o_lora_mode_from_env()
+        canonical_mixed_route = bool(
+            mtp_enabled and selected_o_lora_mode == "gather_qmm"
+        )
+        if not mtp_enabled:
+            selected_o_lora_mode = "cached"
+        deepseek_v4_o_lora_report = install_deepseek_v4_o_lora_routes(
+            model,
+            mode=selected_o_lora_mode,
+            canonical_mixed_route=canonical_mixed_route,
+        )
+        logger.info("[deepseek-v4-o-lora] %s", deepseek_v4_o_lora_report)
+        from .deepseek_v4_attention_island import (
+            deepseek_v4_attention_island_enabled,
+            install_deepseek_v4_attention_island,
+        )
+
+        if deepseek_v4_attention_island_enabled():
+            deepseek_v4_attention_island_report = (
+                install_deepseek_v4_attention_island(model, config)
+            )
+            logger.info(
+                "[deepseek-v4-attention-island] %s",
+                deepseek_v4_attention_island_report,
+            )
     fused_report: list[dict[str, Any]] = []
     if laguna_ar:
         # Env-gated fused decode paths (MTPLX_LAGUNA_*): with no switches set
@@ -1273,6 +1479,9 @@ def _load_impl(
         mtp_adapter_merge_report=adapter_merge_report,
         expert_streaming=expert_runtime,
         resident_load_report=resident_load_report,
+        deepseek_v4_o_lora_report=deepseek_v4_o_lora_report,
+        deepseek_v4_attn_proj_wide_m3_report=deepseek_v4_attn_proj_wide_m3_report,
+        deepseek_v4_attention_island_report=deepseek_v4_attention_island_report,
         a3b_compiled_target_prefix_factory=compiled_target_factory,
         a3b_whole_moe_installed=False,
     )
@@ -1357,6 +1566,10 @@ def _is_laguna_s_2_1_mlx_4bit_config(config: dict[str, Any]) -> bool:
 def _model_classes_for_config(config: dict[str, Any]) -> tuple[type, type] | None:
     """Return MTPLX-owned model classes for architectures missing in mlx-lm."""
 
+    if str(config.get("model_type") or "").lower() == "deepseek_v4":
+        from .models.deepseek_v4 import Model, ModelArgs
+
+        return Model, ModelArgs
     if not _is_laguna_s_2_1_mlx_4bit_config(config):
         return None
     from .models.laguna import Model, ModelArgs

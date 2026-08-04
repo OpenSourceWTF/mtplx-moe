@@ -1959,6 +1959,7 @@ def test_serve_defaults_quantized_27b_flagships_to_turbo(
 
     monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
     for dir_name in (
+        "Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
         "Qwen3.6-27B-MTPLX-Optimized-Speed",
         "Qwen3.6-27B-MTPLX-Optimized-Quality",
         "Qwen3.6-27B-MTPLX-Optimized",
@@ -3178,7 +3179,7 @@ def test_tune_default_dry_run_is_not_legacy_models_path(monkeypatch, tmp_path, c
 
     payload = json.loads(capsys.readouterr().out)
     assert code == 0
-    assert payload["model"].endswith("Qwen3.6-27B-MTPLX-Optimized-Speed")
+    assert payload["model"].endswith("Qwen3.6-27B-MTPLX-Optimized-Speed-V2")
     first_command = payload["candidates"][0]["command"]
     assert "--model" in first_command
     assert first_command[first_command.index("--model") + 1] == payload["model"]
@@ -5521,7 +5522,14 @@ def test_public_profile_dispatch_without_trace_is_actionable(capsys):
     captured = capsys.readouterr().out
     assert code == 0
     assert '"implemented_capture": false' in captured
-    assert "--trace PATH" in captured
+    # The next-step hint must stay honest about the trace analyzer: point at
+    # --trace when the research-workspace script is present, and say plainly
+    # that it is not included when it is absent (the shipped package never
+    # carries it).
+    assert (
+        "--trace PATH" in captured
+        or "not included in this installation" in captured
+    )
 
 
 def test_reference_vllm_dry_run_includes_ssh_capture_command(capsys):
@@ -5969,11 +5977,11 @@ def test_product_helper_commands_parse():
     assert start_openwebui.strict_fast_path is False
     assert start_openwebui_strict.strict_fast_path is True
     assert quickstart.command == "quickstart"
-    assert quickstart.model == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
+    assert quickstart.model == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2"
     assert quickstart.port == 18012
     assert quickstart.profile == "sustained"
     assert quickstart_alias.command == "quick-start"
-    assert quickstart_alias.model == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
+    assert quickstart_alias.model == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2"
     assert quickstart_alias.port == 18013
     assert quickstart_alias.profile == "sustained"
     assert quickstart_dry_run.command == "quickstart"
@@ -5983,7 +5991,7 @@ def test_product_helper_commands_parse():
     assert setup.command == "setup"
     assert setup.dry_run is True
     assert pull_default.command == "pull"
-    assert pull_default.model == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
+    assert pull_default.model == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2"
     assert ask.command == "ask"
     assert ask.prompt_arg == "hello"
     assert ask.quiet is True
@@ -5992,7 +6000,7 @@ def test_product_helper_commands_parse():
     assert serve_start.port == 18012
     assert serve_start.stats_footer is True
     assert tune.command == "tune"
-    assert tune.model == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
+    assert tune.model == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2"
     assert tune.depths is None
     assert status.command == "status"
     assert status.deep is True
@@ -6014,8 +6022,8 @@ def test_product_helper_commands_parse():
     assert nightly.bench_action == "nightly"
     assert suite.bench_action == "suite"
     assert bench_tune.bench_action == "tune"
-    assert bench_tune.model == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
-    assert bench_tune.champion == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
+    assert bench_tune.model == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2"
+    assert bench_tune.champion == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2"
     assert nightly.output == "out.json"
     assert suite.output == "suite.json"
     assert nightly_json.json is True
@@ -6774,7 +6782,7 @@ def test_serve_uses_quality_public_model_id_for_quality_local_path(monkeypatch):
     monkeypatch.setattr(public.os, "execvpe", fake_execvpe)
     args = SimpleNamespace(
         model=quality_path,
-        model_id="mtplx-qwen36-27b-optimized-speed",
+        model_id=DEFAULT_PUBLIC_MODEL_ID,
         cache_dir=None,
         profile="sustained",
         unsafe_force_unverified=False,
@@ -7576,7 +7584,7 @@ def test_quickstart_pi_passes_launch_command_to_server(monkeypatch):
     args = SimpleNamespace(
         command="serve",
         model="models/example",
-        model_id="mtplx-qwen36-27b-optimized-speed",
+        model_id=DEFAULT_PUBLIC_MODEL_ID,
         cache_dir=None,
         profile="sustained",
         unsafe_force_unverified=False,
@@ -8195,7 +8203,10 @@ def test_start_gate_failure_is_human_readable_for_config_only_qwen(tmp_path, cap
     assert "error: model cannot run with MTPLX" in captured
     assert "runtime: missing-mtp-weights" in captured
     assert "mtplx_runtime.json is optional metadata" in captured
-    assert "fix: choose a model with real MTP weights" in captured
+    assert "fix: use a complete model with matching MTP weights" in captured
+    assert "original source with mtplx forge" in captured
+    assert "does not attach arbitrary sidecars" in captured
+    assert "graft an MTP sidecar" not in captured
     assert '"model_files"' not in captured
 
 
@@ -8221,7 +8232,10 @@ def test_start_gate_failure_is_human_readable_for_config_only_glm(tmp_path, caps
     assert "error: model cannot run with MTPLX" in captured
     assert "runtime: missing-mtp-weights" in captured
     assert "mtplx_runtime.json is optional metadata" in captured
-    assert "fix: choose a model with real MTP weights" in captured
+    assert "fix: use a complete model with matching MTP weights" in captured
+    assert "original source with mtplx forge" in captured
+    assert "does not attach arbitrary sidecars" in captured
+    assert "graft an MTP sidecar" not in captured
     assert "MTP MTP markers" not in captured
     assert '"model_files"' not in captured
 
@@ -8397,12 +8411,23 @@ def test_eval_attribution_dry_run_is_real_command(capsys):
     )
 
     payload = json.loads(capsys.readouterr().out)
-    assert code == 0
     assert payload["action"] == "profile eval-attribution"
-    assert "probe_eval_attribution.py" in " ".join(payload["command"])
-    assert "--prefix-tokens" in payload["command"]
-    assert "outputs,recurrent;recurrent,outputs" in payload["command"]
-    assert "larger owned kernel boundary" in payload["purpose"]
+    from mtplx.commands.public import _research_script
+
+    if _research_script("probe_eval_attribution.py") is None:
+        # This repo does not ship the research-workspace probe script; the
+        # command must say so honestly instead of printing a command whose
+        # script path does not exist (dry-run included).
+        assert code == 2
+        assert payload["available"] is False
+        assert "probe_eval_attribution.py" in payload["reason"]
+        assert payload["hint"]
+    else:
+        assert code == 0
+        assert "probe_eval_attribution.py" in " ".join(payload["command"])
+        assert "--prefix-tokens" in payload["command"]
+        assert "outputs,recurrent;recurrent,outputs" in payload["command"]
+        assert "larger owned kernel boundary" in payload["purpose"]
 
 
 @pytest.mark.parametrize("action", ["compile-audit", "eval-attribution"])

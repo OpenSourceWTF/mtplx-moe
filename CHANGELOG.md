@@ -4,6 +4,336 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [2.5.2] - 2026-08-04
+
+Hotfix for a long-response slowdown that shipped in 2.5.1 with Optimized
+Speed V2 as the recommended coding model.
+
+### Fixed
+
+- Long single responses no longer slow down and stutter partway through. The
+  compiled verifier hands generation to the eager path after its growth
+  reserve is exhausted, and that handoff carried unfinished GPU work into the
+  rest of the response. Every later token paid for the old work, so decode
+  throughput fell steadily on responses past a few thousand tokens. The
+  reported 12,000-token response opened at 59 tokens per second and
+  ended near 30. With the fix, the same seeded generation no longer
+  decays: the closing windows now run as fast as or faster than the
+  early ones.
+- The handoff now settles all cache and recurrent state exactly once at the
+  ownership boundary and releases the compiled references before eager
+  decoding continues. Handoff telemetry is exposed in the compiled verifier
+  stats.
+
+### Changed
+
+- The minimum MLX version is now 0.32. Fresh installs already resolved MLX
+  0.32.0; existing runtime environments could stay on 0.31.2 indefinitely
+  because dependency upgrades only run when the declared floor requires
+  them. Long-generation runs consistently read faster on the 0.32 stack,
+  and existing installs now converge to what new installs already run.
+
+### Compatibility
+
+- Model catalogs, defaults, sampler settings, memory policy, and the 2.5.1
+  V2 recommendation are unchanged.
+
+## [2.5.1] - 2026-08-03
+
+Optimized Speed V2 is now the recommended Qwen 3.6 27B model for coding on
+modern Macs with enough unified memory. It gives users a much higher-quality
+coding model while keeping the original, smaller Optimized Speed model one row
+below it.
+
+### Added
+
+- Optimized Speed V2 is a first-class model in onboarding, the app catalog,
+  CLI defaults, quickstart, downloads, served model identity, and OpenCode
+  setup.
+- The model is published as a dynamic 4-bit hybrid quant with hand-tuned
+  sensitive parts kept at up to 16-bit. It is faster on longer agent tasks,
+  slightly larger, and a little slower for short chats.
+- RAM-aware defaults recommend V2 first on modern Macs with at least 32 GiB of
+  detected memory. Smaller Macs keep the existing 9B and 4B recommendations.
+
+### Compatibility
+
+- The original Optimized Speed model remains fully supported and appears
+  directly below V2 wherever the machine can run both.
+- Runtime kernels, sampler defaults, cache behavior, and speculative depth are
+  unchanged from 2.5.0.
+
+## [2.5.0] - 2026-08-03
+
+The next-model release: MTPLX can load new architecture aliases without a
+hard-coded model-type wait, multi-layer MTP drafts are supported for the
+upcoming Qwen generation, HY3 becomes a first-class serving target, and the
+coding-agent bridge is materially more reliable. Experimental DeepSeek V4,
+Laguna, and GDN speed lanes from David Tai land behind explicit opt-ins; the
+shipping defaults remain unchanged.
+
+### Added
+
+- Upcoming-Qwen architecture readiness: the native draft path now supports
+  `mtp_num_hidden_layers = N`, and unknown `model_type` values can resolve
+  through their declared architecture class. A synthetic `qwen3_8` alias
+  drill exercised load, generate, CLI, and app discovery before public weights
+  existed; this is compatibility preparation, not a claim that unreleased
+  weights were benchmarked.
+- HY3 first-class serving: a vendored MTP-capable model class, official
+  defaults, suffixed think-tag handling, model discovery, and native OpenCode
+  tool calls. AR-only exports fail safely to the AR path rather than touching
+  an uninitialized draft head.
+- Experimental DeepSeek-V4 shape-specialized verification lanes: prebound
+  output-LoRA routes, adaptive speculative width, exact M3 attention
+  projection, sinkhorn and attention-island kernels, and compiled
+  post-attention verifier islands. On the 128 GB M5 Max release machine, the
+  exact 2-bit DQ model plus official MTP shard measured about 31 AR tok/s and
+  36 MTP tok/s versus about 4/6 tok/s on the conservative path. These routes
+  remain opt-in while broader model-quality validation continues. Contributed
+  by David Tai (@davidtai, #223).
+- Experimental Laguna S-2.1 `mlx.fast` ports covering decode and prefill
+  kernels, including size-gated prefill MoE combine; fail-loud guards and
+  portable scratch space keep unsupported shapes on the safe route.
+  Contributed by David Tai (@davidtai, #222).
+- Experimental GDN headquarter execution layout for verify tape capture,
+  env-gated with bit-exact coverage and loud fallback. Contributed by David
+  Tai (@davidtai, #209).
+
+### Fixed
+
+- Coding-agent JSON tool calls can carry large write bodies without the hidden
+  tool guard aborting them, and common near-miss argument keys are repaired at
+  the protocol boundary. This was verified through real OpenCode CLI and
+  Desktop sessions, including a multi-file edit with all generated tests
+  passing.
+- App and CLI launches now share the same coding-agent engine environment, so
+  a workflow does not silently change behavior depending on which Start button
+  launched it.
+- `start` and `quickstart --dry-run` report the resolved profile instead of the
+  parser's placeholder default.
+- Smart-fan mode holds through the post-generation heat-soak window before
+  restoring automatic control, avoiding the early restore that could distort
+  back-to-back performance runs (#227).
+
+### Compatibility
+
+- `transformers` 5.14 is allowed after tokenizer and tool-template parity were
+  verified; the incompatible 5.13.0 release remains excluded (#175).
+- No speculative-depth, cache, sampler, or model-speed default changed in this
+  release. The opt-in model kernels fail closed to established implementations.
+
+## [2.4.2] - 2026-08-02
+
+The agentic-cache release: the session cache stops losing warm state
+mid-run, tool-turn commits stop being ghosts, every serve keeps a durable
+per-request trail by default, an experimental DeepSeek-V4-Flash backend
+lands, and the documentation now matches the code everywhere it was
+audited.
+
+### Added
+
+- DeepSeek-V4-Flash: experimental native AR backend
+  (`model_type: deepseek_v4`) — Hyper-Connections, compressed sparse
+  attention, hash-routed MoE, grouped output-LoRA — loading the
+  mlx-community checkpoints directly, with an optional single-block MTP
+  speculative lane when the checkpoint carries `mtp.0.*` weights
+  (spec == AR gated; K=1-3 measured up to 2.28x on the 2bit-DQ build).
+  MTP-declaring checkpoints that ship no draft weights degrade to AR
+  with a clear message instead of failing at bind. Thanks @davidtai
+  (#216).
+- Request log, default on: every serve writes numeric/hash per-request
+  telemetry to `~/.mtplx/logs/request-log-<port>.jsonl` (64 MB x 4
+  rotation; no prompt or completion content; disable with
+  `MTPLX_REQUEST_LOG_JSONL=off`). Pairs with 2.4.1's opt-in bit-exact
+  request capture to make agent-session incidents diagnosable after the
+  fact (#196/#197). New helpers: `scripts/gauntlet_scoreboard.py`
+  per-session summarizer, `scripts/oc_tap.py` recording proxy and
+  `scripts/oc_tap_diff.py` request-mutation analyzer for content-level
+  wire truth.
+- Session bank, active-session eviction protection: sessions that
+  touched the bank within `MTPLX_SESSION_BANK_ACTIVE_PIN_TTL_S`
+  (default 600 s) are eviction-last, so cross-session pressure evicts
+  idle victims instead of the session that is mid-run.
+- Session bank, newest-K per-session snapshot retention
+  (`MTPLX_SESSION_BANK_PER_SESSION_MAX_ENTRIES`, default 3): divergent
+  per-turn sibling snapshots no longer accumulate unreclaimed.
+  `/health` now reports active sessions, the pin TTL, and recent
+  evictions.
+- Postcommit foreground grace (`MTPLX_POSTCOMMIT_FOREGROUND_GRACE_S`,
+  default 2 s): a nearly-finished background cache commit lands instead
+  of being preempted by the next fast agent-loop request.
+- Session identity honors `x-session-affinity` / `x-session-id` request
+  headers (OpenCode sends these per request), ending cross-request
+  identity churn on that client.
+
+### Fixed
+
+- Tool-turn "ghost re-prefills": the tool-rewrite async commit rendered
+  a canonical history that matched neither the generation nor the next
+  prompt, burning full-history re-forwards (26.8 s observed) without
+  ever storing. It is disabled pending a byte-proven canonical render
+  (`MTPLX_IDLE_POSTCOMMIT_TOOL_REWRITE` re-enables);
+  store-on-prefill and block salvage cover the lane.
+- The bridge's convergence guard now states explicitly that editing and
+  verification tools remain allowed and that its restriction covers
+  only the current reply — a model read the old wording as a
+  session-wide tool ban and stalled an entire session.
+- `mtplx profile thermal`, `profile eval-attribution`,
+  `profile dispatch --trace`, and `thermal fanmax-run` invoked
+  research-workspace scripts that are not part of the distribution, and
+  `--dry-run` printed those phantom paths as runnable commands. They
+  now report availability honestly (exit 2, machine-readable
+  `available: false`) and run the real script when present.
+- `mtplx doctor`: Python floor corrected to 3.11 (matching
+  `requires-python`); remediation texts no longer tell end users to
+  edit source constants or to move a healthy server off its port;
+  `--port` is documented and, when passed explicitly, aims the server
+  connectivity checks.
+- Session-bank near-prefix restores on backends with bounded rollback
+  (DeepSeek-V4) pre-check `max_rollback` and fall back to a cold
+  prefill instead of raising (#216).
+- Help surfaces match their own parsers: the onboarding help no longer
+  promises a Turbo wizard choice that does not exist (Turbo
+  auto-selects for the quantized flagships), `--strict-cold` names the
+  enforced 59 tok/s gate, `--open-dashboard` opens alongside the chosen
+  client (as it always did), and the command reference teaches
+  `mtplx <command> --help`, which also works for multi-word commands.
+
+### Documentation
+
+- Full truth sweep: ~450 documentation claims reconciled against the
+  code across 27 files. Highlights: INSTALL.md no longer references an
+  MLX fork removed in 2.0.0; turbo-verify.md no longer calls the
+  shipped default "experimental, off by default" nor excludes the
+  6-bit lane that ships; the Anthropic base-URL instruction (docs and
+  the canonical example) no longer 404s; `/metrics` no longer claims a
+  Prometheus mode that never existed; the README modes table shows
+  Turbo as the default for the quantized 27B/9B flagships; the Laguna
+  memory requirement states the real ~85.3 GiB preflight gate;
+  version-era staleness ("v0.1", "preview", v0.3.x runbook pins) is
+  cleared; historical release notes gain bracketed corrections where
+  they documented commands that never worked. Thanks
+  @PhilipJohnBasile for #218 (removed the unsupported MTP-sidecar
+  graft guidance; seeded by #215).
+- Dependency-record correction: the transformers pin has been
+  `<5.14,!=5.13.0` since shortly after 2.0.0; the changelog never
+  recorded the relaxation from `<5.13`.
+
+### Dependencies
+
+- pypa/gh-action-pypi-publish 1.14.1 -> 1.14.2 (#217).
+
+## [2.4.1] - 2026-08-01
+
+The smooth-streaming release: the app's chat render path is overhauled
+(no more freeze-then-catch-up stutter, scroll bounce, or plain-text code
+blocks — real syntax coloring, live code cards, tables, and actual math
+notation), and the 2.4.0 short-turn regression is fixed.
+
+### Added
+
+- Live syntax coloring for code blocks (12 languages + generic) from a
+  freeze-time lexer that colors each line exactly once; streaming cost
+  is O(new text), never O(document).
+- Streaming code card: an open fence renders as a live card with
+  colored lines and flips once to its settled form at close.
+- Pipe tables render as real tables; math renders as real notation
+  (Unicode super/subscripts, stacked matrices and fractions, inline
+  conversion instead of dollar-sign leaks).
+- Typewriter pacing for streamed text with geometric catch-up and a
+  hard drain bound (`MTPLX_STREAM_TYPEWRITER=0` to disable), and a live
+  tok/s chip computed over a sliding ~5 s window.
+- Performance mode is a true kill switch: plain text only, through both
+  the streaming and settled render paths.
+- Opt-in per-request capture for bit-exact failure replay:
+  `MTPLX_REQUEST_CAPTURE_DIR=<dir>` persists each request's
+  reproduction envelope at dispatch time (#196/#197, third layer).
+- Opt-in frontend stream-performance probe (`MTPLX_UI_PERF=1`, HUD via
+  `MTPLX_UI_PERF_HUD=1`) with a per-turn JSONL trace joinable to engine
+  stats by request id.
+- Experimental: cost-model speculative-depth policy
+  (`--adaptive-policy cost`) and blocked-sequential GDN prefill
+  (`MTPLX_GDN_BLOCKED_PREFILL=1`). Defaults unchanged.
+
+### Fixed
+
+- 2.4.0 short-turn regression: the compiled-verify path could reserve
+  KV budget above the configured ceiling, taxing short requests with
+  setup work they never used; the reserve is now clamped.
+- Warming prefills yield to real traffic within one small chunk instead
+  of delaying a freshly arrived request.
+- Derivative model artifacts whose names extend a first-party model
+  name are served under their own id, not the flagship's — the health
+  payload, OpenAI `model` field, and app model chip now report the
+  artifact actually loaded.
+- Streaming render: line-segment coalescing keeps realized view count
+  bounded on long answers; the bottom-pin scroll correction runs in the
+  same display cycle as layout so the streaming bubble can no longer
+  visibly bounce; a per-display-cycle window-sizing walk that floored
+  every update at ~50 ms is removed (`MTPLX_APP_SIZING_TUNER=0`
+  restores it).
+
+## [2.4.0] - 2026-07-31
+
+The 35B speed release: the 35B-A3B MoE gets a compiled decode stack and
+continuous batched serving, the 2.3.0 fan regression is root-caused and
+fixed, tool calling gets another round of contract hardening, and
+structured output can no longer be eaten by an unbounded reasoning
+prelude. Four community contributors landed code in this release.
+
+### Added
+
+- 35B-A3B compiled decode stack: target-prefix compiled route, whole-MoE
+  fusion, GDN post-conv fusion, and a row-owned router (David Tai, #174).
+- Continuous batched serving for the A3B lane: fixed-shape cohorts,
+  ragged KV, fold-in repair, and AR row-packing (David Tai, #200).
+- Laguna S-2.1 support (exact-pin oQ4e, AR-only) with an app catalog
+  entry, plus a Poolside `arg_key`/`arg_value` tool-call dialect parser
+  (David Tai, #195).
+- Hy3 295B full-residency lane and generic MTP draft-contract hardening
+  whose loud recurrent-cache failure also caught a real bug on the Qwen
+  lane (David Tai, #208).
+- `/health` now reports smart-fan restore state (`restore_verified`,
+  `restore_failures`, `stale_leases_reconciled`) so stuck-fan reports
+  are diagnosable from the field (#201).
+
+### Fixed
+
+- Fans no longer stay pinned at max after a request ends (#201). A
+  failed fan restore was logged once and then treated as restored, so
+  the hardware stayed ramped while the server believed it was clean;
+  restores now verify the fan rows are back on the Apple auto curve and
+  retry with backoff until they are. The ThermalForge daemon-socket
+  restore path no longer trusts the daemon's "ok" reply without
+  verifying, and falls back to the CLI in the same call. A stale-lease
+  watchdog drops any fan lease held while the engine has been
+  continuously idle (default 120s, `MTPLX_SMART_FAN_STALE_LEASE_S`).
+- A generation cut by `max_tokens` mid-tool-call now reports
+  `finish_reason: "length"` instead of `"tool_calls"`, so agent clients
+  continue the turn instead of executing a truncated call (#196, #197
+  layers one and two).
+- The think-splitter no longer leaks reasoning into visible content when
+  the text contains bare `function=` or `parameter=` strings (#196/#197
+  companion fix).
+- Streaming tool-call parsing handles bracket-style dialects with a
+  balanced string/escape-aware scanner, buffers incomplete calls instead
+  of double-delivering them, and passes through calls to undeclared
+  tools per the OpenAI contract instead of dropping them (David Tai,
+  #195).
+- Constrained generation bounds the `<think>` prelude at 4000 characters
+  (`MTPLX_THINK_PRELUDE_MAX_CHARS`, 0 restores unbounded), so an
+  unclosed think block can no longer consume the entire token budget and
+  return no document (Jozef Kristek, #213).
+- Forge model probes recover from slow Hugging Face config responses:
+  30s timeout, pinned-SHA retry, positive-MTP-only indexed acceptance,
+  and revision-string validation (Philip John Basile, #210).
+
+### Changed
+
+- Dependency bumps: pillow 12.3.0, actions/checkout 7.0.1,
+  actions/setup-python 7.0.0, pypa/gh-action-pypi-publish 1.14.1.
+
 ## [2.3.0] - 2026-07-21
 
 The agent reliability release: the #170 tool-argument collapse is
@@ -616,4 +946,19 @@ working as one product. Full notes:
   completions, and Anthropic `stop_sequences`) and `/v1/completions`
   streams tokens as they are generated with real finish reasons.
 
-[1.0.0]: https://github.com/youssofal/mtplx/releases/tag/v1.0.0
+[2.5.1]: https://github.com/youssofal/MTPLX/releases/tag/v2.5.1
+[2.5.0]: https://github.com/youssofal/MTPLX/releases/tag/v2.5.0
+[2.4.2]: https://github.com/youssofal/MTPLX/releases/tag/v2.4.2
+[2.4.1]: https://github.com/youssofal/MTPLX/releases/tag/v2.4.1
+[2.4.0]: https://github.com/youssofal/MTPLX/releases/tag/v2.4.0
+[2.3.0]: https://github.com/youssofal/MTPLX/releases/tag/v2.3.0
+[2.2.0]: https://github.com/youssofal/MTPLX/releases/tag/v2.2.0
+[2.1.0]: https://github.com/youssofal/MTPLX/releases/tag/v2.1.0
+[2.0.2]: https://github.com/youssofal/MTPLX/releases/tag/v2.0.2
+[2.0.1]: https://github.com/youssofal/MTPLX/releases/tag/v2.0.1
+[2.0.0]: https://github.com/youssofal/MTPLX/releases/tag/v2.0.0
+[1.0.4]: https://github.com/youssofal/MTPLX/releases/tag/v1.0.4
+[1.0.3]: https://github.com/youssofal/MTPLX/releases/tag/v1.0.3
+[1.0.2]: https://github.com/youssofal/MTPLX/releases/tag/v1.0.2
+[1.0.1]: https://github.com/youssofal/MTPLX/releases/tag/v1.0.1
+[1.0.0]: https://github.com/youssofal/MTPLX/releases/tag/v1.0.0

@@ -88,6 +88,10 @@ from mtplx.profiles import (
     DEFAULT_PUBLIC_MODEL_ID,
     LEGACY_OPTIMIZED_HF_MODEL_ID,
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
+    OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+    OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID,
+    OPTIMIZED_SPEED_V2_HF_MODEL_ID,
+    OPTIMIZED_SPEED_V2_PUBLIC_MODEL_ID,
     QUALITY_FP16_HF_MODEL_ID,
     QUALITY_FP16_PUBLIC_MODEL_ID,
     QUALITY_HF_MODEL_ID,
@@ -311,6 +315,14 @@ def _opencode_memory_env_defaults() -> dict[str, str]:
         else _OPENCODE_DEFAULT_MAX_ENTRIES
     )
     return {
+        # Long-context decode route (>=32k): same keys the app's
+        # codingAgentRuntimeEnvironment and the CLI hermes lane already set —
+        # the OpenCode CLI lane missing them was surface drift (2026-08-03
+        # parity audit), not intent.
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_CONTEXT": "32768",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_Q": "3",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MAX_Q": "5",
         "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
         "MTPLX_SESSION_BANK_MAX_ENTRIES": max_entries,
         # "auto" = the engine budgets half the RAM surplus left after the
@@ -554,8 +566,10 @@ def _model_gate_error_lines(inspection: dict[str, Any]) -> list[str]:
         )
     if runtime_compatibility == "missing-mtp-weights":
         lines.append(
-            "fix: choose a model with real MTP weights, or graft an MTP sidecar "
-            "into this base model."
+            "fix: use a complete model with matching MTP weights, or build and "
+            "verify one from its original source with mtplx forge. MTPLX does not "
+            "attach arbitrary sidecars because config/tensor checks cannot prove "
+            "their trunk lineage."
         )
     elif compatibility.get("tier") == TIER_ARCH_COMPATIBLE_UNVERIFIED:
         lines.append(
@@ -710,11 +724,16 @@ def _apply_runtime_compatibility_mode(
     *,
     printer=print,
 ) -> int | None:
-    compatibility = inspection.get("compatibility") or {}
-    runtime_compatibility = (
-        compatibility.get("runtime_compatibility")
-        or inspection.get("runtime_compatibility")
-    )
+    compatibility = inspection.get("compatibility")
+    if isinstance(compatibility, dict):
+        runtime_compatibility = (
+            compatibility.get("runtime_compatibility")
+            or inspection.get("runtime_compatibility")
+        )
+    else:
+        # The four-tier inspection contract may expose compatibility as a
+        # string; the runtime-lane marker then lives at the top level.
+        runtime_compatibility = inspection.get("runtime_compatibility")
     if runtime_compatibility != "native-ar-only":
         return None
     if _generation_mode_from_args(args) != GENERATION_MODE_AR:
@@ -940,7 +959,8 @@ def _apply_model_contract_depth_default(
 # Gemma, and third-party artifacts keep the sustained default.
 _TURBO_DEFAULT_PUBLIC_MODEL_IDS = frozenset(
     {
-        DEFAULT_PUBLIC_MODEL_ID,  # 27B Optimized-Speed (flat 4-bit)
+        DEFAULT_PUBLIC_MODEL_ID,  # 27B Optimized Speed V2 (hybrid 4-bit)
+        OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID,  # original 27B Optimized Speed
         QUALITY_PUBLIC_MODEL_ID,  # 27B Optimized-Quality (8-bit)
         LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,  # 27B Optimized (gdn8 hybrid, 8/4-bit)
         # 27B Speed-FP16 (INT4/g64 weights, fp16 activations — the M1/M2
@@ -1019,7 +1039,13 @@ def _resolved_default_profile_name(args: Any, model: str | None = None) -> str:
 
 
 def _apply_qwen36_35b_optimized_speed_defaults(args: Any, model_id: str) -> None:
-    if model_id != QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID:
+    # The -FP16 sibling shares the byte-identical INT packs and the measured
+    # launch defaults; the app's substring detection already applied them to
+    # it while this exact-id gate skipped it (2026-08-03 parity audit).
+    if model_id not in {
+        QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
+    }:
         return
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     injected = set(getattr(args, "_injected_default_flags", set()) or set())
@@ -1381,12 +1407,19 @@ def _pi_preserve_thinking_policy(args: Any) -> str:
 
 
 def _apply_pi_history_budget_env_defaults(env: dict[str, str]) -> None:
+    """Pi lane = the shared coding-agent engine block + Pi history budgets.
+
+    Mirrors the app's composition exactly (codingAgentRuntimeEnvironment then
+    the Pi-specific overrides in MTPLXCommandBuilder.swift). Before the
+    2026-08-03 parity audit the CLI Pi lane carried only the history keys —
+    no session bank, SDPA route, postcommit wait, or frontier flags — and
+    three of its values (96/16/150) diverged from the app-lane numbers
+    (72/8/120) every app Pi user already runs; unified to the app values.
+    """
+    _apply_opencode_memory_env_defaults(env)
     env.setdefault("MTPLX_TOOL_RESULT_COMPACT_THRESHOLD_CHARS", "1200")
     env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_COMPACT_MAX_LINES", "32")
     env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_LINE_MAX_CHARS", "180")
-    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_TOTAL_MAX_LINES", "96")
-    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_MIN_LINES_PER_FILE", "16")
-    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_MULTI_FILE_LINE_MAX_CHARS", "150")
     env.setdefault("MTPLX_ACTIVE_TOOL_RESULT_COMPACT_MAX_LINES", "32")
     env.setdefault("MTPLX_ACTIVE_TOOL_RESULT_LINE_MAX_CHARS", "220")
 
@@ -1995,6 +2028,12 @@ def _build_doctor_report(args: Any) -> dict[str, Any]:
         model_cache=getattr(args, "model_cache", None),
         include_startup_default_model="model-cache" not in cli_flags,
         deep=bool(getattr(args, "deep", False)),
+        # An explicit --port aims the server checks; the bare default (8008)
+        # exists for the topic bridges and must not move the server probe off
+        # the shipped :8000 default.
+        server_port=(
+            int(getattr(args, "port", 8000)) if "port" in cli_flags else 8000
+        ),
         mlx_info=env.get("mlx") if isinstance(env.get("mlx"), dict) else None,
         thermal_control=thermal_control,
         server_dependencies=server_deps if getattr(args, "deep", False) else None,
@@ -7020,7 +7059,10 @@ def _cmd_qa_exactness(args: Any) -> int:
                 print(f"detail: {stripped[:240]}")
                 break
     print(f"output: {output}")
-    print("try: mtplx qa exactness --exactness-attention-impl mlx_vector_paged")
+    print(
+        "try: a different --exactness-attention-impl "
+        "(run `mtplx qa exactness --help` for the choices)"
+    )
     return EXIT_EXACTNESS
 
 
@@ -7094,15 +7136,48 @@ def cmd_profile_public(args: Any) -> int:
     raise SystemExit(f"unknown profile action: {args.profile_action}")
 
 
+def _research_script(name: str) -> Path | None:
+    """Resolve a research-workspace helper script, or None when not shipped.
+
+    Several diagnostic subcommands drive scripts that live in the MTPLX
+    research workspace and are not part of the distributed package (a wheel
+    install has no scripts/ tree at all). Resolving through this check keeps
+    those commands honest: run the real script, or say exactly why not —
+    never hand python3 a phantom path.
+    """
+    candidate = repo_root() / "scripts" / name
+    return candidate if candidate.is_file() else None
+
+
+def _research_script_unavailable(action: str, script: str) -> int:
+    _print(
+        {
+            "action": action,
+            "available": False,
+            "reason": (
+                f"scripts/{script} is a research-workspace tool and is not "
+                "included in this installation"
+            ),
+            "hint": "Run from an MTPLX source checkout that provides this script.",
+        }
+    )
+    return 2
+
+
 def _cmd_profile_dispatch(args: Any) -> int:
+    trace_script = _research_script("analyze_metal_command_trace.py")
     if args.trace:
+        if trace_script is None:
+            return _research_script_unavailable(
+                "profile dispatch --trace", "analyze_metal_command_trace.py"
+            )
         out_dir = Path(args.output_dir or "outputs/cli/dispatch") / time.strftime(
             "%Y%m%d-%H%M%S"
         )
         proc = subprocess.run(
             [
                 sys.executable,
-                str(repo_root() / "scripts" / "analyze_metal_command_trace.py"),
+                str(trace_script),
                 args.trace,
                 "--out-dir",
                 str(out_dir),
@@ -7119,16 +7194,27 @@ def _cmd_profile_dispatch(args: Any) -> int:
             "suite": args.suite,
             "max_tokens": args.max_tokens,
             "implemented_capture": False,
-            "next": "Run with --trace PATH to analyze an existing MLX Metal command trace.",
+            "next": (
+                "Run with --trace PATH to analyze an existing MLX Metal command trace."
+                if trace_script is not None
+                else "Trace analysis needs the research-workspace script "
+                "scripts/analyze_metal_command_trace.py, which is not included "
+                "in this installation."
+            ),
         }
     )
     return 0
 
 
 def _cmd_profile_thermal(args: Any) -> int:
+    script = _research_script("run_flappy_smc_thermal_diagnostics.py")
+    if script is None:
+        return _research_script_unavailable(
+            "profile thermal", "run_flappy_smc_thermal_diagnostics.py"
+        )
     cmd = [
         sys.executable,
-        str(repo_root() / "scripts" / "run_flappy_smc_thermal_diagnostics.py"),
+        str(script),
         "--model",
         args.model,
         "--run-id",
@@ -7273,9 +7359,14 @@ def _cmd_profile_eval_attribution(args: Any) -> int:
             / f"eval-attribution-{time.strftime('%Y%m%d-%H%M%S')}.json"
         )
     )
+    script = _research_script("probe_eval_attribution.py")
+    if script is None:
+        return _research_script_unavailable(
+            "profile eval-attribution", "probe_eval_attribution.py"
+        )
     cmd = [
         sys.executable,
-        str(repo_root() / "scripts" / "probe_eval_attribution.py"),
+        str(script),
         "--model",
         args.model,
         "--prefix-tokens",
@@ -7357,9 +7448,14 @@ def cmd_thermal_public(args: Any) -> int:
         run_id,
         "--fanmax",
     ]
+    script = _research_script("run_fanmax_command.py")
+    if script is None:
+        return _research_script_unavailable(
+            "thermal fanmax-run", "run_fanmax_command.py"
+        )
     cmd = [
         sys.executable,
-        str(repo_root() / "scripts" / "run_fanmax_command.py"),
+        str(script),
         "--output-dir",
         args.output_dir or "outputs/cli/fanmax",
         "--",
@@ -7984,6 +8080,12 @@ def _model_ref_from_public_model_id(model_id: str | None) -> str | None:
         DEFAULT_HF_MODEL_ID.lower(): DEFAULT_HF_MODEL_ID,
         DEFAULT_MODEL_ID.lower(): DEFAULT_HF_MODEL_ID,
         Path(DEFAULT_HF_MODEL_ID).name.lower(): DEFAULT_HF_MODEL_ID,
+        OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID.lower(): OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+        OPTIMIZED_SPEED_V1_HF_MODEL_ID.lower(): OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+        Path(OPTIMIZED_SPEED_V1_HF_MODEL_ID).name.lower(): OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+        OPTIMIZED_SPEED_V2_PUBLIC_MODEL_ID.lower(): OPTIMIZED_SPEED_V2_HF_MODEL_ID,
+        OPTIMIZED_SPEED_V2_HF_MODEL_ID.lower(): OPTIMIZED_SPEED_V2_HF_MODEL_ID,
+        Path(OPTIMIZED_SPEED_V2_HF_MODEL_ID).name.lower(): OPTIMIZED_SPEED_V2_HF_MODEL_ID,
         DEFAULT_FP16_PUBLIC_MODEL_ID.lower(): DEFAULT_FP16_HF_MODEL_ID,
         DEFAULT_FP16_HF_MODEL_ID.lower(): DEFAULT_FP16_HF_MODEL_ID,
         Path(DEFAULT_FP16_HF_MODEL_ID).name.lower(): DEFAULT_FP16_HF_MODEL_ID,
@@ -12828,7 +12930,11 @@ def cmd_quickstart_public(args: Any) -> int:
             "target": target,
             "model": model,
             "cache_dir": cache_dir,
-            "profile": getattr(args, "profile", DEFAULT_PROFILE_NAME),
+            # Display the profile the launch will actually resolve (per-model
+            # turbo rewrite included) — the raw parser default here made the
+            # dry-run advertise "sustained" for the turbo-default flagships
+            # (the 2026-07-16 stale-display bug class, on one more surface).
+            "profile": _resolved_default_profile_name(args, model),
             "generation_mode": _generation_mode_from_args(args),
             "max": bool(getattr(args, "max", False)),
             "download_if_missing": download,
