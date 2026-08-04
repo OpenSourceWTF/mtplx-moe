@@ -1257,16 +1257,15 @@ def test_installed_hot_call_only_routes_on_phase_and_logical_m():
 
 
 def test_runtime_constructs_one_whole_block_owner_after_packing() -> None:
-    source = inspect.getsource(runtime_module.load)
+    source = inspect.getsource(runtime_module._load_impl)
 
     adapter_guard = source.index("validate_a3b_whole_moe_load_options(")
     packing = source.index("configure_moe_packed_projections(model)")
     prepare_whole = source.index("prepare_a3b_whole_moe(model, config=config)")
     prepare_router = source.index("prepare_qwen_row_owned_routers(")
-    selfcheck = source.index("maybe_run_model_selfcheck(model)")
+    selfcheck = source.index("maybe_run_model_selfcheck(")
     whole_selfcheck = source.index("run_a3b_whole_moe_selfcheck(")
     compiled_factory = source.index("prepare_a3b_compiled_target_prefix(")
-    runtime_construction = source.index("runtime = MTPLXRuntime(")
     # PR #195 made construction class-indirect (LagunaARRuntime | MTPLXRuntime);
     # the ordering invariant this test guards is unchanged.
     runtime_construction = source.index("runtime = runtime_class(")
@@ -1525,7 +1524,7 @@ def test_whole_moe_rejects_mtp_adapter_configuration_at_load_boundary(
 
 
 def test_generation_validates_whole_moe_request_before_prefill():
-    source = inspect.getsource(generation_module.generate_mtpk)
+    source = inspect.getsource(generation_module._generate_mtpk_machine)
 
     validation = source.index("validate_a3b_whole_moe_request(")
     request_preflight = source.index("ensure_a3b_whole_moe_request_preflight(")
@@ -1539,7 +1538,7 @@ def test_actual_request_route_requires_the_preflighted_leaf_signature_before_dec
     install_source = inspect.getsource(
         compiled_target_module.install_a3b_k1_target_prefix_route
     )
-    generation_source = inspect.getsource(generation_module.generate_mtpk)
+    generation_source = inspect.getsource(generation_module._generate_mtpk_machine)
 
     assert "_route_compile_specialization_key(" in install_source
     assert "runtime._a3b_whole_moe_request_preflights" in install_source
@@ -1559,9 +1558,9 @@ def test_mtp_history_phase_is_constructed_by_prompt_and_decode_callers():
     assert 'attention_phase("prefill")' not in helper
 
     for prompt_owner in (
-        generation_module._prefill_restored_prompt_suffix,
-        generation_module.restore_or_prefill_prompt_state,
-        generation_module._prefill_committed_mtp_history_streaming,
+        generation_module._prefill_restored_prompt_suffix_machine,
+        generation_module._restore_or_prefill_prompt_state_machine,
+        generation_module._prefill_committed_mtp_history_streaming_machine,
     ):
         source = inspect.getsource(prompt_owner)
         call = source.index("_append_mtp_history(")
@@ -1569,7 +1568,7 @@ def test_mtp_history_phase_is_constructed_by_prompt_and_decode_callers():
         owned = source[call : None if next_call < 0 else next_call]
         assert 'phase="prefill"' in owned
 
-    generation = inspect.getsource(generation_module.generate_mtpk)
+    generation = inspect.getsource(generation_module._generate_mtpk_machine)
     nested_start = generation.index("def append_mtp_history(")
     nested_end = generation.index("def maybe_eval_state_roots(", nested_start)
     nested = generation[nested_start:nested_end]
