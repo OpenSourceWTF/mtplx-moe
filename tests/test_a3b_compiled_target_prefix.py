@@ -292,7 +292,7 @@ def test_takeover_lane_uses_draft_source_not_block_rounds() -> None:
     # and leave block rounds to the capture_commit lane.
     from mtplx import generation
 
-    source = inspect.getsource(generation.generate_mtpk)
+    source = inspect.getsource(generation._generate_mtpk_machine)
     round_gate = source.index(
         "if ccopy_active and _ccopy_capture_lane and cycle_depth >= 1"
     )
@@ -310,7 +310,7 @@ def test_trim_lane_defers_correction_repairs() -> None:
     # never pay a dedicated one-row correction forward.
     from mtplx import generation
 
-    source = inspect.getsource(generation.generate_mtpk)
+    source = inspect.getsource(generation._generate_mtpk_machine)
     assert "trimmed_prefix_pending_correction" in source
     assert "trimmed_prefix_correction_forward" not in source
     trim_branch = source[
@@ -331,7 +331,7 @@ def test_route_records_rejection_correction_under_greedy() -> None:
     # temperature -- under greedy it is the pre-sampled argmax target id.
     from mtplx import generation
 
-    source = inspect.getsource(generation.generate_mtpk)
+    source = inspect.getsource(generation._generate_mtpk_machine)
     guard = source.index("or a3b_target_prefix_route is not None")
     record = source.index("rejection_correction = int(correction)")
     assert guard < record
@@ -364,7 +364,7 @@ def test_generic_target_prefix_sampler_contract_is_proven_without_sampling() -> 
 def test_generation_routes_on_direct_runtime_factory_ownership() -> None:
     from mtplx import generation
 
-    source = inspect.getsource(generation.generate_mtpk)
+    source = inspect.getsource(generation._generate_mtpk_machine)
     assert "rt.a3b_compiled_target_prefix_factory" in source
     assert "factory=exact_a3b_target_prefix_factory" in source
     request_sampler_proof = source.index("validate_a3b_k1_target_prefix_sampler(")
@@ -660,14 +660,13 @@ def test_tensor_offset_primary_then_m1_matches_reference_prefix() -> None:
 def test_generation_exact_route_has_fixed_m2_m1_schedule_without_generic_repair() -> None:
     from mtplx import generation
 
-    source = inspect.getsource(generation.generate_mtpk)
+    source = inspect.getsource(generation._generate_mtpk_machine)
     event_block = source[source.index("if graphbank is not None:") : source.index(
         "accepted_count = 0"
     )]
+    snapshot_start = source.index("before_verify = None")
     snapshot_block = source[
-        source.index("before_verify = None") : source.index(
-            "lazy_bonus_verify_min_depth"
-        )
+        snapshot_start : source.index("lazy_bonus_verify_min_depth", snapshot_start)
     ]
     rejection_start = source.index("committed = [primary] + draft_tokens[:accepted_count]")
     exact_verify_start = source.index("elif a3b_target_prefix_route is not None:")
@@ -687,11 +686,11 @@ def test_generation_exact_route_has_fixed_m2_m1_schedule_without_generic_repair(
     assert "compiled_verify_bank.to_dict()" not in event_block
     assert "a3b_target_prefix_route.final_report" in source
     assert "if a3b_target_prefix_route is None:" in snapshot_block
-    # The env gate lives behind PR #208's _skip_verify_snapshot() helper now
+    # The env gate lives behind PR #208's _skip_verify_snapshot_enabled() helper now
     # (same env, plus the recurrent-cache loud-failure guard); the invariant —
     # snapshot handling only on the non-compiled route — is unchanged.
     assert snapshot_block.index("if a3b_target_prefix_route is None:") < (
-        snapshot_block.index("if _skip_verify_snapshot():")
+        snapshot_block.index("if _skip_verify_snapshot_enabled():")
     )
     assert "verify_logits, verify_hidden, a3b_primary_state = (" in source
     assert draft_sample_start < exact_verify_start < target_sample_start
@@ -750,7 +749,7 @@ def test_generation_exact_route_never_engages_under_grammar_constraint() -> None
     request must therefore fall back to the stock target_prefix lane."""
     from mtplx import generation
 
-    source = inspect.getsource(generation.generate_mtpk)
+    source = inspect.getsource(generation._generate_mtpk_machine)
     factory_block = source[
         source.index("exact_a3b_target_prefix_factory = (") : source.index(
             "exact_a3b_target_prefix = "

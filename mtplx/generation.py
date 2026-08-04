@@ -4689,6 +4689,7 @@ def _prefill_machine(
 ):
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty")
+    return_hidden = bool(return_hidden and rt.mtp_enabled)
 
     _check_postcommit_abort(abort_check)
     cache = _make_target_prefill_cache(rt)
