@@ -258,6 +258,83 @@ def test_mtp_cohort_dispatch_runs_generation_on_request_thread(monkeypatch):
     }
 
 
+def test_request_capture_uses_flat_resolved_envelope_before_cohort_dispatch(
+    monkeypatch,
+):
+    state = _mtp_cohort_startup_state()
+    state.mtp_cohort_lane = object()
+    state.mtp_cohort_service = object()
+    state.mtp_cohort_environment = {}
+    state.args.model_id = ""
+    state.model_id = "state-model"
+    state.main_system_prompt_hash = "template-hash"
+    events = []
+
+    monkeypatch.setattr(openai.request_capture, "capture_dir", lambda: "/captures")
+    monkeypatch.setattr(
+        openai.request_capture,
+        "capture_request",
+        lambda request_id, payload: events.append(("capture", request_id, payload)),
+    )
+    monkeypatch.setattr(
+        openai,
+        "_run_generation_cohort",
+        lambda *_args, **_kwargs: events.append(("cohort",)) or {"lane": "cohort"},
+    )
+
+    result = openai._run_generation_dispatched(
+        state,
+        [11, 12, 13],
+        batch_key="test.capture",
+        response_id="capture-request",
+        max_tokens=17,
+        temperature=0.25,
+        top_p=0.8,
+        top_k=23,
+        presence_penalty=0.4,
+        frequency_penalty=0.6,
+        seed=41,
+        depth=2,
+        session_id="session-7",
+        session_restore_mode="reference_lease",
+        constraint_spec={"kind": "json"},
+        request_observability={
+            "client": "test",
+            "attempt": 3,
+            "sampled": True,
+            "nested": {"excluded": True},
+        },
+    )
+
+    assert result == {"lane": "cohort"}
+    assert [event[0] for event in events] == ["capture", "cohort"]
+    assert events[0][1] == "capture-request"
+    assert events[0][2] == {
+        "model_id": "state-model",
+        "prompt_len": 3,
+        "prompt_token_ids": [11, 12, 13],
+        "max_tokens": 17,
+        "temperature": 0.25,
+        "top_p": 0.8,
+        "top_k": 23,
+        "presence_penalty": 0.4,
+        "frequency_penalty": 0.6,
+        "requested_seed": 41,
+        "generation_mode": "mtp",
+        "depth": 2,
+        "session_id": "session-7",
+        "session_restore_mode": "reference_lease",
+        "has_constraint": True,
+        "tokenizer_template_hash": "template-hash",
+        "observability": {
+            "client": "test",
+            "attempt": 3,
+            "sampled": True,
+            "request_id": "capture-request",
+        },
+    }
+
+
 @pytest.mark.parametrize(
     "missing_attribute",
     [

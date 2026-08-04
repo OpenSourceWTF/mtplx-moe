@@ -16857,27 +16857,24 @@ def _run_generation_dispatched(
             request_observability_for_lane.get("request_id") or response_id,
             {
                 "model_id": str(
-                    request_observability_for_lane.get("model_id")
-                    or state.model_id
+                    getattr(state.args, "model_id", None)
+                    or getattr(state, "model_id", None)
+                    or ""
                 ),
-                "prompt_ids": [int(token) for token in prompt_ids],
-                "generation": {
-                    key: value
-                    for key, value in kwargs.items()
-                    if key
-                    in {
-                        "max_tokens",
-                        "temperature",
-                        "top_p",
-                        "top_k",
-                        "presence_penalty",
-                        "frequency_penalty",
-                        "seed",
-                        "generation_mode",
-                        "depth",
-                    }
-                    and isinstance(value, (str, int, float, bool, type(None)))
-                },
+                "prompt_len": len(prompt_ids),
+                "prompt_token_ids": [int(token) for token in prompt_ids],
+                "max_tokens": kwargs.get("max_tokens"),
+                "temperature": kwargs.get("temperature"),
+                "top_p": kwargs.get("top_p"),
+                "top_k": kwargs.get("top_k"),
+                "presence_penalty": kwargs.get("presence_penalty"),
+                "frequency_penalty": kwargs.get("frequency_penalty"),
+                "requested_seed": kwargs.get("seed"),
+                "generation_mode": str(effective_mode),
+                "depth": kwargs.get("depth"),
+                "session_id": kwargs.get("session_id"),
+                "session_restore_mode": kwargs.get("session_restore_mode"),
+                "has_constraint": kwargs.get("constraint_spec") is not None,
                 "tokenizer_template_hash": str(
                     getattr(state, "main_system_prompt_hash", None) or ""
                 ),
