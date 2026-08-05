@@ -289,6 +289,70 @@ def _fused_moe_kernel(IN: int, OUT: int, K: int):
     return kern
 
 
+def _fused_moe_gemv_kernel(IN: int, OUT: int, K: int):
+    """No-pad variant: one 16-row tile per slot, all rows read slot's single row directly from
+    xh [S, IN] (no padding array, no scatter/gather). Warp-assembly decode. For decode/spec-verify."""
+    key = ("gemv", IN, OUT, K)
+    if key in _FUSED:
+        return _FUSED[key]
+    src = f"""
+        uint n = thread_position_in_threadgroup.x;
+        uint m = thread_position_in_threadgroup.y;
+        uint tid = m * 16u + n;
+        uint tj = threadgroup_position_in_grid.x;
+        uint s = threadgroup_position_in_grid.y;             // slot (one tile per slot)
+        uint e = (uint) eids[s];
+        uint out_col = tj * 16u + n;
+        threadgroup ulong vsh[32];
+        threadgroup half Wt[16][16];
+        threadgroup half Xt[16];
+        float acc = 0.0f;
+        for (uint ti = 0; ti < {IN // 16}u; ++ti) {{
+            uint tilebase = ((e * {IN // 16}u + ti) * {OUT // 16}u + tj) * {16 * K}u;
+            if (tid < 32u) {{
+                uint L = tid;
+                uint wa = (uint)(lane_a[L] >> 1); uint wb = (uint)(lane_b[L] >> 1);
+                uint rd8 = (uint)(ushort)code[tilebase + wa] | ((uint)(ushort)code[tilebase + wa + 1u] << 16);
+                uint rd9 = (uint)(ushort)code[tilebase + wb] | ((uint)(ushort)code[tilebase + wb + 1u] << 16);
+                ulong v;
+                if ({K}u == 2u) {{ v = (lane_p[L] != 0) ? (ulong)((rd8 >> 16) | ((rd9 & 0xffffu) << 16)) : (ulong)rd8; }}
+                else {{ ulong rd11 = ((ulong)rd9 << 32) | (ulong)rd8; v = rd11 >> (uint)lane_p[L]; }}
+                vsh[L] = v;
+            }}
+            if (tid < 16u) Xt[tid] = xh[s * {IN}u + ti * 16u + tid];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint slot = m * 16u + n;
+            ushort window = (ushort)((vsh[(uint)perm_lane[slot]] >> ({K}u * (uint)perm_m[slot])) & 0xffffUL);
+            uint rr = (uint)window * 3417055213u;
+            ushort lo = ((ushort)(rr) & (ushort)0x8fff) ^ (ushort)0x3b60;
+            ushort hi = ((ushort)(rr >> 16) & (ushort)0x8fff) ^ (ushort)0x3b60;
+            Wt[m][n] = as_type<half>(lo) + as_type<half>(hi);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint k = 0; k < 16u; ++k) acc += (float)Xt[k] * (float)Wt[k][n];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+        if (m == 0u) out[s * {OUT}u + out_col] = (half) acc;
+    """
+    kern = mx.fast.metal_kernel(
+        name=f"eschagemv_{IN}_{OUT}_{K}",
+        input_names=["xh", "code", "eids", "perm_lane", "perm_m", "lane_a", "lane_b", "lane_p"],
+        output_names=["out"], source=src)
+    _FUSED[key] = kern
+    return kern
+
+
+def fused_moe_gemv(xh: mx.array, eids: mx.array, code: mx.array, K: int, OUT: int) -> mx.array:
+    """xh [S, IN] fp16, eids [S] -> y [S, OUT] fp16.  No padding; one tile per slot."""
+    perm_lane, perm_m, lane_a, lane_b, lane_p = _warp(K)
+    S, IN = xh.shape
+    kern = _fused_moe_gemv_kernel(IN, OUT, K)
+    (out,) = kern(
+        inputs=[xh, code, eids.astype(mx.int32), perm_lane, perm_m, lane_a, lane_b, lane_p],
+        output_shapes=[(S, OUT)], output_dtypes=[mx.float16],
+        grid=(OUT, S * 16, 1), threadgroup=(16, 16, 1))
+    return out
+
+
 def fused_moe_matmul(xh: mx.array, tile_expert: mx.array, code: mx.array, K: int, OUT: int) -> mx.array:
     """xh [Mpad, IN] fp16 (rows grouped by expert, 16-aligned per expert), tile_expert [Mpad/16] int32,
     code [E, IN/16, OUT/16, 16K] -> y [Mpad, OUT] fp16.  One launch, warp-assembly decode, no dense W."""

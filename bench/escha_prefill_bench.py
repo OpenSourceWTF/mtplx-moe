@@ -15,7 +15,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from mtplx.eschamoe import fused_moe_matmul, t128  # noqa
+from mtplx.eschamoe import fused_moe_matmul, fused_moe_gemv, t128  # noqa
 
 MODEL_DIR = os.environ.get("ESCHA_DIR") or glob.glob(os.path.expanduser(
     "~/.cache/huggingface/hub/models--EschaLabs--Qwen3.6-35B-A3B-Escha-W2/snapshots/*/"))[0]
@@ -88,23 +88,14 @@ class EschaSwitchGLU(nn.Module):
         Fully on-device, NO host sync — the decode-tps lever."""
         H, I = self.H, self.I
         flat_e = ind2.reshape(-1)                                  # [S] expert per slot
-        S = flat_e.size
         flat_tok = mx.repeat(mx.arange(Tt), top_k)                 # [S] slot -> token
-        rows = mx.arange(S) * 16
-        Mpad = S * 16
-
-        def pad(v, D):
-            p = mx.zeros((Mpad, D), mx.float16)
-            p[rows] = v
-            return p
-
-        xh = t128(x2[flat_tok] * self.gu_rin[flat_e]).astype(mx.float16)     # [S, H]
-        y_gu = fused_moe_matmul(pad(xh, H), flat_e, self.gu_code, 2, 2 * I)[rows]  # [S, 2I]
-        y_gu = t128(y_gu) * self.gu_rout[flat_e]
-        gated = (nn.silu(y_gu[:, :I]) * y_gu[:, I:]).astype(mx.float16)      # [S, I]
-        xhd = t128(gated * self.dn_rin[flat_e]).astype(mx.float16)
-        y = fused_moe_matmul(pad(xhd, I), flat_e, self.dn_code, 3, H)[rows]  # [S, H]
-        y = (t128(y) * self.dn_rout[flat_e]).astype(mx.bfloat16)
+        xh = t128(x2[flat_tok], pre=self.gu_rin[flat_e]).astype(mx.float16)   # [S, H]  (rin folded)
+        y_gu = fused_moe_gemv(xh, flat_e, self.gu_code, 2, 2 * I)             # [S, 2I]  no-pad
+        y_gu = t128(y_gu, post=self.gu_rout[flat_e])                          # rout folded
+        gated = (nn.silu(y_gu[:, :I]) * y_gu[:, I:]).astype(mx.float16)       # [S, I]
+        xhd = t128(gated, pre=self.dn_rin[flat_e]).astype(mx.float16)
+        y = fused_moe_gemv(xhd, flat_e, self.dn_code, 3, H)                   # [S, H]  no-pad
+        y = t128(y, post=self.dn_rout[flat_e]).astype(mx.bfloat16)
         return y.reshape(*lead, top_k, H)
 
 

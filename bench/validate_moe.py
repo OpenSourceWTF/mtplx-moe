@@ -33,7 +33,7 @@ mx.random.seed(0)
 x = (mx.random.normal((T, H)) * 0.1)
 idx = mx.array([[0, 1], [2, 3], [1, 0], [3, 2], [0, 3], [2, 1]], dtype=mx.uint32)
 
-out = np.array(mod(x, idx)).astype(np.float32)   # [T, top_k, H]
+out = np.array(mod(x, idx).astype(mx.float32)).astype(np.float32)   # [T, top_k, H]
 
 ref = np.zeros((T, top_k, H), np.float32)
 for t in range(T):
