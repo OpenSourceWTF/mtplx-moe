@@ -16,6 +16,7 @@ import mlx.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from mtplx.eschamoe import fused_moe_matmul, escha_qmv, t128, COMPUTE_DTYPE  # noqa
+from mtplx.int8_linear import Int8Linear  # noqa
 
 MODEL_DIR = os.environ.get("ESCHA_DIR") or glob.glob(os.path.expanduser(
     "~/.cache/huggingface/hub/models--EschaLabs--Qwen3.6-35B-A3B-Escha-W2/snapshots/*/"))[0]
@@ -112,8 +113,11 @@ def load_model():
     tcfg = cfg["text_config"]
     H, I, E = tcfg["hidden_size"], tcfg["moe_intermediate_size"], tcfg["num_experts"]
 
-    # gather raw tensors, dequant int8, collect eschamoe per (layer,proj)
-    weights, escha = {}, {}
+    # gather raw tensors, collect eschamoe per (layer,proj). Non-expert int8 weights are either
+    # dequanted to bf16 (default) or kept int8 for a fused int8 matvec (ESCHA_INT8=1 — no dequant,
+    # half the resident bytes + half the decode gemv bandwidth). embed/conv1d always dequant.
+    INT8 = bool(os.environ.get("ESCHA_INT8"))
+    weights, escha, int8_raw = {}, {}, {}
     from safetensors import safe_open
     for shard in sorted(glob.glob(os.path.join(MODEL_DIR, "*.safetensors"))):
         with safe_open(shard, "numpy") as f:
@@ -126,7 +130,10 @@ def load_model():
                     base = k[: -len(".weight_int8")]
                     w = mx.array(f.get_tensor(k))                              # [out,in] int8
                     s = mx.array(f.get_tensor(base + ".weight_scale"))          # [out]
-                    weights[base + ".weight"] = (w.astype(mx.bfloat16) * s[:, None].astype(mx.bfloat16))
+                    if INT8 and "embed_tokens" not in base and "conv1d" not in base:
+                        int8_raw[base] = (w, s)                                 # wired as Int8Linear
+                    else:
+                        weights[base + ".weight"] = (w.astype(mx.bfloat16) * s[:, None].astype(mx.bfloat16))
                 elif ".experts." in k and (".escha_" in k):
                     escha[k] = mx.array(f.get_tensor(k))
                 else:
@@ -166,6 +173,33 @@ def load_model():
             model.language_model.model.layers[l].mlp.switch_mlp = EschaSwitchGLU(
                 g(l, "gate_up_proj", "code"), g(l, "gate_up_proj", "rin"), g(l, "gate_up_proj", "rout"),
                 g(l, "down_proj", "code"), g(l, "down_proj", "rin"), g(l, "down_proj", "rout"), H, I)
+
+    if INT8:  # swap non-expert Linears for the native int8 matvec (no bf16 weight materialized)
+        lm = model.language_model
+        wired, fell_back = 0, []
+        for base, (w, s) in int8_raw.items():
+            # normalize: keys are either "model.language_model.layers.N.<...>.<proj>" or a bare
+            # "lm_head" (the checkpoint stores lm_head WITHOUT the language_model prefix).
+            key = base
+            for pre in ("model.language_model.", "language_model.model.", "language_model."):
+                if key.startswith(pre):
+                    key = key[len(pre):]; break
+            parts = key.split(".")
+            parent = attr = None
+            if parts[0] == "lm_head":
+                parent, attr = lm, "lm_head"
+            elif parts[0] == "layers":
+                parent = lm.model.layers[int(parts[1])]
+                for p in parts[2:-1]:
+                    parent = getattr(parent, p)
+                attr = parts[-1]
+            if parent is not None and isinstance(getattr(parent, attr, None), nn.Linear):
+                setattr(parent, attr, Int8Linear(w, s)); wired += 1
+            else:  # unexpected: cannot map this int8 weight to a Linear -> it would be left random
+                fell_back.append(base)
+        assert not fell_back, f"ESCHA_INT8 unwired int8 weights (would be random): {fell_back}"
+        print(f"ESCHA_INT8: wired {wired} non-expert Int8Linear (incl lm_head)")
+
     mx.eval(model.parameters())
     return model, args
 
