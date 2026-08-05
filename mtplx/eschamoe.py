@@ -341,6 +341,66 @@ def _fused_moe_gemv_kernel(IN: int, OUT: int, K: int):
     return kern
 
 
+_CB = mx.array([3417055213, 0, 0x8FFF8FFF, 0x3B603B60], dtype=mx.uint32)
+
+
+def _escha_qmv_kernel(K: int, TK: int, TN: int):
+    """Ported from dusterbloom/higgs ESCHA_QMV_KERNEL: one simdgroup per output element, rows on
+    grid.y (no M padding), lanes stride the contraction + decode 2 codes each + simd_sum reduce."""
+    key = ("qmv", K, TK, TN)
+    if key in _FUSED:
+        return _FUSED[key]
+    src = f"""
+        threadgroup float x_sh[{TK * 16}];
+        uint row = threadgroup_position_in_grid.y;
+        uint tid = thread_position_in_threadgroup.x;
+        uint sg = tid >> 5; uint lane = tid & 31u;
+        for (uint i = tid; i < {TK * 16}u; i += 128u) x_sh[i] = xh[row * {TK * 16}u + i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint o = threadgroup_position_in_grid.x * 4u + sg;
+        if (o >= {TN * 16}u) return;
+        uint tn = o >> 4; uint c = o & 15u; uint cb2 = (c >> 3) & 1u; uint c7 = c & 7u;
+        const device short* base = code + ulong(eids[row]) * {TK * TN * 16 * K}ul;
+        uint q = lane & 3u; uint rh = (lane >> 2) & 1u;
+        uint t = 4u * (4u * c7 + q) + 2u * cb2 + rh; uint r0 = 8u * rh + 2u * q;
+        uint b0 = 2u * t * {K}u + {K + 256 * K}u - 16u; uint b2 = b0 + {K + 16}u;
+        uint i0 = (b0 / 32u) % {8 * K}u; uint i1w = (b2 - 1u) / 32u; uint s1 = (i1w + 1u) * 32u - b2; uint i1 = i1w % {8 * K}u;
+        float acc = 0.0f;
+        for (uint tk = lane >> 3; tk < {TK}u; tk += 4u) {{
+            const device short* tile = base + (tk * {TN}u + tn) * {16 * K}u;
+            uint w0 = uint(ushort(tile[2u * i0])) | (uint(ushort(tile[2u * i0 + 1u])) << 16);
+            uint wb = uint(ushort(tile[2u * i1])) | (uint(ushort(tile[2u * i1 + 1u])) << 16);
+            ulong pair = (ulong(w0) << 32) | ulong(wb);
+            uint w1 = uint(pair >> s1);
+            uint x0 = ((w1 >> {K}u) & 0xFFFFu) * cb[0] + cb[1]; x0 = (x0 & cb[2]) ^ cb[3];
+            uint x1 = (w1 & 0xFFFFu) * cb[0] + cb[1]; x1 = (x1 & cb[2]) ^ cb[3];
+            half2 h0 = as_type<half2>(x0); half2 h1 = as_type<half2>(x1);
+            float v0 = float(half(float(h0.x) + float(h0.y)));
+            float v1 = float(half(float(h1.x) + float(h1.y)));
+            acc = fma(x_sh[tk * 16u + r0], v0, acc);
+            acc = fma(x_sh[tk * 16u + r0 + 1u], v1, acc);
+        }}
+        acc = simd_sum(acc);
+        if (lane == 0u) dst[row * {TN * 16}u + o] = acc;
+    """
+    kern = mx.fast.metal_kernel(name=f"escha_qmv_{K}_{TK}_{TN}",
+                                input_names=["xh", "code", "eids", "cb"], output_names=["dst"], source=src)
+    _FUSED[key] = kern
+    return kern
+
+
+def escha_qmv(xh: mx.array, eids: mx.array, code: mx.array, K: int, OUT: int) -> mx.array:
+    """Fast decode+matvec (rows<=32). xh [S, IN] f32, eids [S] u32, code [E, IN/16, OUT/16, 16K]
+    -> dst [S, OUT] f32.  One simdgroup per output element; no M padding."""
+    S, IN = xh.shape
+    TK, TN = IN // 16, OUT // 16
+    kern = _escha_qmv_kernel(K, TK, TN)
+    (dst,) = kern(inputs=[xh.astype(mx.float32), code, eids.astype(mx.uint32), _CB],
+                  output_shapes=[(S, OUT)], output_dtypes=[mx.float32],
+                  grid=(((OUT + 3) // 4) * 128, S, 1), threadgroup=(128, 1, 1))
+    return dst
+
+
 def fused_moe_gemv(xh: mx.array, eids: mx.array, code: mx.array, K: int, OUT: int) -> mx.array:
     """xh [S, IN] fp16, eids [S] -> y [S, OUT] fp16.  No padding; one tile per slot."""
     perm_lane, perm_m, lane_a, lane_b, lane_p = _warp(K)
@@ -381,12 +441,13 @@ def _hadamard128() -> mx.array:
 
 
 def t128(x: mx.array, pre=None, post=None) -> mx.array:
-    """y = post * T128((x * pre))  — normalized 128-block Walsh-Hadamard over the last dim."""
+    """y = post * T128((x * pre))  — normalized 128-block Walsh-Hadamard over the last dim,
+    via MLX's native fused hadamard_transform (O(n log n), single kernel)."""
     x = x.astype(mx.float32)
     if pre is not None:
         x = x * pre.astype(mx.float32)
     lead = tuple(x.shape[:-1]); IC = x.shape[-1]
-    x = (x.reshape(*lead, IC // 128, 128) @ _hadamard128()).reshape(*lead, IC)
+    x = mx.hadamard_transform(x.reshape(*lead, IC // 128, 128), scale=128.0 ** -0.5).reshape(*lead, IC)
     if post is not None:
         x = x * post.astype(mx.float32)
     return x

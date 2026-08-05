@@ -15,7 +15,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from mtplx.eschamoe import fused_moe_matmul, fused_moe_gemv, t128  # noqa
+from mtplx.eschamoe import fused_moe_matmul, escha_qmv, t128  # noqa
 
 MODEL_DIR = os.environ.get("ESCHA_DIR") or glob.glob(os.path.expanduser(
     "~/.cache/huggingface/hub/models--EschaLabs--Qwen3.6-35B-A3B-Escha-W2/snapshots/*/"))[0]
@@ -65,9 +65,7 @@ class EschaSwitchGLU(nn.Module):
         x2 = x.reshape(Tt, H)
         S = Tt * top_k
         if S <= 256:
-            if getattr(self, "_cstep", None) is None:
-                self._cstep = mx.compile(self._forward_ondevice)
-            return self._cstep(x2, ind2, Tt, top_k, lead)
+            return self._forward_ondevice(x2, ind2, Tt, top_k, lead)
         ind_np = np.array(ind2)
         tile_expert, padded_tok, erow, dst_slot, valid_prow, S = _group_layout(ind_np, top_k, self.gu_code.shape[0])
         te = mx.array(tile_expert); tok = mx.array(padded_tok); er = mx.array(erow)
@@ -89,12 +87,12 @@ class EschaSwitchGLU(nn.Module):
         H, I = self.H, self.I
         flat_e = ind2.reshape(-1)                                  # [S] expert per slot
         flat_tok = mx.repeat(mx.arange(Tt), top_k)                 # [S] slot -> token
-        xh = t128(x2[flat_tok], pre=self.gu_rin[flat_e]).astype(mx.float16)   # [S, H]  (rin folded)
-        y_gu = fused_moe_gemv(xh, flat_e, self.gu_code, 2, 2 * I)             # [S, 2I]  no-pad
-        y_gu = t128(y_gu, post=self.gu_rout[flat_e])                          # rout folded
-        gated = (nn.silu(y_gu[:, :I]) * y_gu[:, I:]).astype(mx.float16)       # [S, I]
-        xhd = t128(gated, pre=self.dn_rin[flat_e]).astype(mx.float16)
-        y = fused_moe_gemv(xhd, flat_e, self.dn_code, 3, H)                   # [S, H]  no-pad
+        xh = t128(x2[flat_tok], pre=self.gu_rin[flat_e])                     # f32 [S, H]  (rin folded)
+        y_gu = escha_qmv(xh, flat_e, self.gu_code, 2, 2 * I)                 # f32 [S, 2I]  QMV
+        y_gu = t128(y_gu, post=self.gu_rout[flat_e])                         # rout folded
+        gated = nn.silu(y_gu[:, :I]) * y_gu[:, I:]                           # f32 [S, I]
+        xhd = t128(gated, pre=self.dn_rin[flat_e])
+        y = escha_qmv(xhd, flat_e, self.dn_code, 3, H)                       # f32 [S, H]  QMV
         y = t128(y, post=self.dn_rout[flat_e]).astype(mx.bfloat16)
         return y.reshape(*lead, top_k, H)
 
@@ -233,11 +231,14 @@ def main():
     from mlx_lm.generate import generate_step
     prompt = mx.array(tok.encode("def fibonacci(n):\n    "))
     NG = int(os.environ.get("ESCHA_DECODE_TOK", "32"))
-    it = generate_step(prompt, model, max_tokens=NG + 1)
-    tok0, _ = next(it)                      # prefill + first token
-    mx.eval(tok0)
+    WARM = 16
+    it = generate_step(prompt, model, max_tokens=NG + WARM + 1)
+    last, _ = next(it)                      # prefill + first token
+    for _ in range(WARM):                   # warm up (report: warm-up matters)
+        last, _ = next(it)
+    mx.eval(last)
     mx.reset_peak_memory()
-    t0 = time.time(); last = tok0; n = 0
+    t0 = time.time(); n = 0
     for t_, _ in it:
         last = t_; n += 1
         if n >= NG:
