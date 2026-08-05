@@ -56,3 +56,7 @@ project-map.md
 
 # Raw harness stdout. Keep the JSON receipts beside it, not the transcript.
 evals/**/*.log
+
+# eschamoe native 2-bit decode: gather tables + tiny vendor-golden test fixture
+!mtplx/eschamoe_gather.npz
+!tests/fixtures/eschamoe_mini.npz
