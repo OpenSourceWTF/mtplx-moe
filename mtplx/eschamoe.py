@@ -31,6 +31,12 @@ _MASK = np.uint16(0x8fff)
 _XOR = np.uint16(0x3b60)
 _GATHER_PATH = os.path.join(os.path.dirname(__file__), "eschamoe_gather.npz")
 
+# Compute dtype for the Hadamard rotation + QMV matvec of the expert forward.
+# Default float32 (the numerically-safe QuaRot round-trip). ESCHA_BF16=1 keeps the
+# rotation in bf16 to drop the fp16<->fp32 cast storm (~30% of decode dispatches);
+# gated on an accuracy A/B — see bench/validate_qmv.py / the decode quality peek.
+COMPUTE_DTYPE = mx.bfloat16 if os.environ.get("ESCHA_BF16") else mx.float32
+
 _DEC: mx.array | None = None
 _GATHER: dict | None = None
 _POW16 = mx.array((np.uint32(1) << np.arange(16, dtype=np.uint32)))
@@ -342,13 +348,16 @@ def _fused_moe_gemv_kernel(IN: int, OUT: int, K: int):
 
 
 _CB = mx.array([3417055213, 0, 0x8FFF8FFF, 0x3B603B60], dtype=mx.uint32)
+# Metal element type for the QMV output buffer (must match COMPUTE_DTYPE; Metal does not
+# implicitly narrow float->bfloat, so the output write is cast explicitly).
+_MTL_ODT = "bfloat" if COMPUTE_DTYPE == mx.bfloat16 else "float"
 
 
 def _escha_qmv_kernel(K: int, TK: int, TN: int):
     """Ported from dusterbloom/higgs ESCHA_QMV_KERNEL, courtesy of dusterbloom
     (https://dusterbloom.github.io/): one simdgroup per output element, rows on grid.y (no M
     padding), lanes stride the contraction + decode 2 codes each + simd_sum reduce."""
-    key = ("qmv", K, TK, TN)
+    key = ("qmv", K, TK, TN, _MTL_ODT)
     if key in _FUSED:
         return _FUSED[key]
     src = f"""
@@ -382,22 +391,24 @@ def _escha_qmv_kernel(K: int, TK: int, TN: int):
             acc = fma(x_sh[tk * 16u + r0 + 1u], v1, acc);
         }}
         acc = simd_sum(acc);
-        if (lane == 0u) dst[row * {TN * 16}u + o] = acc;
+        if (lane == 0u) dst[row * {TN * 16}u + o] = ({_MTL_ODT})acc;
     """
-    kern = mx.fast.metal_kernel(name=f"escha_qmv_{K}_{TK}_{TN}",
+    kern = mx.fast.metal_kernel(name=f"escha_qmv_{K}_{TK}_{TN}_{_MTL_ODT}",
                                 input_names=["xh", "code", "eids", "cb"], output_names=["dst"], source=src)
     _FUSED[key] = kern
     return kern
 
 
 def escha_qmv(xh: mx.array, eids: mx.array, code: mx.array, K: int, OUT: int) -> mx.array:
-    """Fast decode+matvec (rows<=32). xh [S, IN] f32, eids [S] u32, code [E, IN/16, OUT/16, 16K]
-    -> dst [S, OUT] f32.  One simdgroup per output element; no M padding."""
+    """Fast decode+matvec (rows<=32). xh [S, IN] COMPUTE_DTYPE, eids [S] u32,
+    code [E, IN/16, OUT/16, 16K] -> dst [S, OUT] COMPUTE_DTYPE.  One simdgroup per output
+    element; no M padding.  x_sh + acc stay float in-kernel (accuracy); only the buffer dtype
+    follows COMPUTE_DTYPE, so ESCHA_BF16 drops the f32 cast on xh without changing the math."""
     S, IN = xh.shape
     TK, TN = IN // 16, OUT // 16
     kern = _escha_qmv_kernel(K, TK, TN)
-    (dst,) = kern(inputs=[xh.astype(mx.float32), code, eids.astype(mx.uint32), _CB],
-                  output_shapes=[(S, OUT)], output_dtypes=[mx.float32],
+    (dst,) = kern(inputs=[xh.astype(COMPUTE_DTYPE), code, eids.astype(mx.uint32), _CB],
+                  output_shapes=[(S, OUT)], output_dtypes=[COMPUTE_DTYPE],
                   grid=(((OUT + 3) // 4) * 128, S, 1), threadgroup=(128, 1, 1))
     return dst
 
@@ -443,12 +454,14 @@ def _hadamard128() -> mx.array:
 
 def t128(x: mx.array, pre=None, post=None) -> mx.array:
     """y = post * T128((x * pre))  — normalized 128-block Walsh-Hadamard over the last dim,
-    via MLX's native fused hadamard_transform (O(n log n), single kernel)."""
-    x = x.astype(mx.float32)
+    via MLX's native fused hadamard_transform (O(n log n), single kernel).  Runs in
+    COMPUTE_DTYPE; when callers store pre/post already in COMPUTE_DTYPE the .astype calls
+    are no-ops (the per-call scale cast is hoisted to load time)."""
+    x = x.astype(COMPUTE_DTYPE)
     if pre is not None:
-        x = x * pre.astype(mx.float32)
+        x = x * pre.astype(COMPUTE_DTYPE)
     lead = tuple(x.shape[:-1]); IC = x.shape[-1]
     x = mx.hadamard_transform(x.reshape(*lead, IC // 128, 128), scale=128.0 ** -0.5).reshape(*lead, IC)
     if post is not None:
-        x = x * post.astype(mx.float32)
+        x = x * post.astype(COMPUTE_DTYPE)
     return x

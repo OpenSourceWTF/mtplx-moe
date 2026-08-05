@@ -15,7 +15,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from mtplx.eschamoe import fused_moe_matmul, escha_qmv, t128  # noqa
+from mtplx.eschamoe import fused_moe_matmul, escha_qmv, t128, COMPUTE_DTYPE  # noqa
 
 MODEL_DIR = os.environ.get("ESCHA_DIR") or glob.glob(os.path.expanduser(
     "~/.cache/huggingface/hub/models--EschaLabs--Qwen3.6-35B-A3B-Escha-W2/snapshots/*/"))[0]
@@ -51,8 +51,13 @@ class EschaSwitchGLU(nn.Module):
     (dense W never formed). Hadamard T128 + rin/rout applied to activations."""
     def __init__(self, gu_code, gu_rin, gu_rout, dn_code, dn_rin, dn_rout, H, I):
         super().__init__()
-        self.gu_code, self.gu_rin, self.gu_rout = gu_code, gu_rin, gu_rout
-        self.dn_code, self.dn_rin, self.dn_rout = dn_code, dn_rin, dn_rout
+        # tier-1 cast hoist: store the rin/rout scale vectors in the compute dtype ONCE at
+        # load, so t128's per-call `pre/post.astype(COMPUTE_DTYPE)` becomes a no-op (drops
+        # ~hundreds of tiny fp16->f32 copy dispatches/token; loop-invariant, no math change).
+        self.gu_code, self.dn_code = gu_code, dn_code
+        cast = (lambda a: a) if os.environ.get("ESCHA_NO_HOIST") else (lambda a: a.astype(COMPUTE_DTYPE))
+        self.gu_rin, self.gu_rout = cast(gu_rin), cast(gu_rout)
+        self.dn_rin, self.dn_rout = cast(dn_rin), cast(dn_rout)
         self.H, self.I = H, I
 
     def __call__(self, x, indices):
