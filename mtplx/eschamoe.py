@@ -345,8 +345,9 @@ _CB = mx.array([3417055213, 0, 0x8FFF8FFF, 0x3B603B60], dtype=mx.uint32)
 
 
 def _escha_qmv_kernel(K: int, TK: int, TN: int):
-    """Ported from dusterbloom/higgs ESCHA_QMV_KERNEL: one simdgroup per output element, rows on
-    grid.y (no M padding), lanes stride the contraction + decode 2 codes each + simd_sum reduce."""
+    """Ported from dusterbloom/higgs ESCHA_QMV_KERNEL, courtesy of dusterbloom
+    (https://dusterbloom.github.io/): one simdgroup per output element, rows on grid.y (no M
+    padding), lanes stride the contraction + decode 2 codes each + simd_sum reduce."""
     key = ("qmv", K, TK, TN)
     if key in _FUSED:
         return _FUSED[key]
