@@ -85,6 +85,8 @@ class EschaSwitchGLU(nn.Module):
         """Small S (decode / spec-verify): each routed slot -> its own 16-row tile (row s*16 valid).
         Fully on-device, NO host sync — the decode-tps lever."""
         H, I = self.H, self.I
+        if os.environ.get("ESCHA_MOE_NOOP"):   # DIAGNOSTIC: skip expert compute, keep attn+router
+            return mx.zeros((*lead, top_k, H), mx.bfloat16)
         flat_e = ind2.reshape(-1)                                  # [S] expert per slot
         flat_tok = mx.repeat(mx.arange(Tt), top_k)                 # [S] slot -> token
         xh = t128(x2[flat_tok], pre=self.gu_rin[flat_e])                     # f32 [S, H]  (rin folded)
