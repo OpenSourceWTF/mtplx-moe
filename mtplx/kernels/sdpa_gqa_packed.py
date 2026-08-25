@@ -402,3 +402,293 @@ def sdpa_gqa_packed_tail(
         output_dtypes=[queries.dtype],
     )
     return out
+
+
+@lru_cache(maxsize=None)
+def _grouped_partials_kernel():
+    """Query-group variant: each workgroup owns <=4 rows of a wide QL window.
+
+    The 2026-08-25 QL sweep measured the second float4 bank as the depth
+    cliff (QL4->5 = 2.3x, QL8 = 4-8x vs QL4 at 40-71k): activating bank 2
+    doubles per-thread register state and collapses occupancy. This variant
+    keeps the PROVEN one-bank topology and widens by threadgroup grid
+    instead: grid.y = GQA_F * QGROUPS, each workgroup handling query rows
+    [qgroup*4, qgroup*4 + nq). KV rows are re-streamed per group (K1/K3:
+    redundant GQA loads are cache-served; register fan-out is what kills).
+    """
+    if not mx.metal.is_available():
+        return None
+
+    source = """
+        constexpr int BD = 32;
+        constexpr int qk_per_thread = D / BD;
+        constexpr int v_per_thread = V / BD;
+
+        typedef float U;
+
+        const int kv_head_idx = threadgroup_position_in_grid.x;
+        const int qgroup = threadgroup_position_in_grid.y;
+        const int block_idx = threadgroup_position_in_grid.z;
+        const int gqa_idx = thread_position_in_threadgroup.y;
+        const int simd_lid = thread_index_in_simdgroup;
+        const int n_kv = static_cast<int>(offset[0]);
+
+        const int q_head_idx = kv_head_idx * GQA_F + gqa_idx;
+        const int q0 = qgroup * 4;
+        const int nq = metal::min(4, QL - q0);
+
+        thread U q[4][qk_per_thread];
+        thread U o[4][v_per_thread];
+        float4 max_score = Limits<U>::finite_min;
+        float4 sum_exp = 0.0f;
+
+        for (int j = 0; j < 4; ++j) {
+            const bool live = j < nq;
+            const device InT* q_ptr = queries
+                + ((size_t)q_head_idx * QL + q0 + (live ? j : 0)) * D
+                + simd_lid * qk_per_thread;
+            for (int i = 0; i < qk_per_thread; ++i) {
+                q[j][i] = live ? static_cast<U>(scale) * static_cast<U>(q_ptr[i]) : U(0);
+            }
+            for (int i = 0; i < v_per_thread; ++i) {
+                o[j][i] = 0.0f;
+            }
+        }
+
+        const device InT* k_ptr = keys
+            + (size_t)kv_head_idx * k_head_seq * D
+            + (size_t)block_idx * D
+            + simd_lid * qk_per_thread;
+        const device InT* v_ptr = values
+            + (size_t)kv_head_idx * v_head_seq * D
+            + (size_t)block_idx * D
+            + simd_lid * v_per_thread;
+
+        // Rows visible to every live row of this group run branch-free;
+        // the per-row causal predicate only matters in the last QL rows.
+        const int n_full = n_kv - QL + q0;
+
+        for (int n = block_idx; n <= n_full; n += blocks) {
+            U k_vec[qk_per_thread];
+            for (int i = 0; i < qk_per_thread; ++i) {
+                k_vec[i] = static_cast<U>(k_ptr[i]);
+            }
+            float4 score = 0.0f;
+            for (int i = 0; i < qk_per_thread; ++i) {
+                score.x += q[0][i] * k_vec[i];
+                score.y += q[1][i] * k_vec[i];
+                score.z += q[2][i] * k_vec[i];
+                score.w += q[3][i] * k_vec[i];
+            }
+            for (int off = 16; off > 0; off >>= 1) {
+                score += simd_shuffle_xor(score, off);
+            }
+            float4 vis;
+            vis.x = (0 < nq) ? 1.0f : 0.0f;
+            vis.y = (1 < nq) ? 1.0f : 0.0f;
+            vis.z = (2 < nq) ? 1.0f : 0.0f;
+            vis.w = (3 < nq) ? 1.0f : 0.0f;
+            score = score * vis + (1.0f - vis) * Limits<U>::finite_min;
+            float4 new_max = metal::max(max_score, score);
+            float4 factor = fast::exp(max_score - new_max);
+            float4 exp_score = fast::exp(score - new_max) * vis;
+            max_score = new_max;
+            sum_exp = sum_exp * factor + exp_score;
+            for (int i = 0; i < v_per_thread; ++i) {
+                const U v = static_cast<U>(v_ptr[i]);
+                o[0][i] = o[0][i] * factor.x + exp_score.x * v;
+                o[1][i] = o[1][i] * factor.y + exp_score.y * v;
+                o[2][i] = o[2][i] * factor.z + exp_score.z * v;
+                o[3][i] = o[3][i] * factor.w + exp_score.w * v;
+            }
+            k_ptr += (size_t)blocks * D;
+            v_ptr += (size_t)blocks * D;
+        }
+
+        {
+            const int first = n_full + 1;
+            int n0 = block_idx;
+            if (n0 < first) {
+                const int steps = (first - n0 + blocks - 1) / blocks;
+                n0 += steps * blocks;
+            }
+            const device InT* k_tail = keys
+                + (size_t)kv_head_idx * k_head_seq * D
+                + (size_t)n0 * D + simd_lid * qk_per_thread;
+            const device InT* v_tail = values
+                + (size_t)kv_head_idx * v_head_seq * D
+                + (size_t)n0 * D + simd_lid * v_per_thread;
+            for (int n = n0; n < n_kv; n += blocks) {
+                U k_vec[qk_per_thread];
+                for (int i = 0; i < qk_per_thread; ++i) {
+                    k_vec[i] = static_cast<U>(k_tail[i]);
+                }
+                float4 score = 0.0f;
+                for (int i = 0; i < qk_per_thread; ++i) {
+                    score.x += q[0][i] * k_vec[i];
+                    score.y += q[1][i] * k_vec[i];
+                    score.z += q[2][i] * k_vec[i];
+                    score.w += q[3][i] * k_vec[i];
+                }
+                for (int off = 16; off > 0; off >>= 1) {
+                    score += simd_shuffle_xor(score, off);
+                }
+                // Row j of this group is global row q0+j: visible iff
+                // n <= n_kv - QL + q0 + j (and the row exists).
+                float4 vis;
+                vis.x = (0 < nq && n <= n_full + 0) ? 1.0f : 0.0f;
+                vis.y = (1 < nq && n <= n_full + 1) ? 1.0f : 0.0f;
+                vis.z = (2 < nq && n <= n_full + 2) ? 1.0f : 0.0f;
+                vis.w = (3 < nq && n <= n_full + 3) ? 1.0f : 0.0f;
+                score = score * vis + (1.0f - vis) * Limits<U>::finite_min;
+                float4 new_max = metal::max(max_score, score);
+                float4 factor = fast::exp(max_score - new_max);
+                float4 exp_score = fast::exp(score - new_max) * vis;
+                max_score = new_max;
+                sum_exp = sum_exp * factor + exp_score;
+                for (int i = 0; i < v_per_thread; ++i) {
+                    const U v = static_cast<U>(v_tail[i]);
+                    o[0][i] = o[0][i] * factor.x + exp_score.x * v;
+                    o[1][i] = o[1][i] * factor.y + exp_score.y * v;
+                    o[2][i] = o[2][i] * factor.z + exp_score.z * v;
+                    o[3][i] = o[3][i] * factor.w + exp_score.w * v;
+                }
+                k_tail += (size_t)blocks * D;
+                v_tail += (size_t)blocks * D;
+            }
+        }
+
+        for (int j = 0; j < nq; ++j) {
+            const int o_offset = q_head_idx * QL + q0 + j;
+            device InT* p = partials
+                + ((size_t)o_offset * blocks + block_idx) * V
+                + simd_lid * v_per_thread;
+            for (int i = 0; i < v_per_thread; ++i) {
+                p[i] = static_cast<InT>(o[j][i]);
+            }
+            if (simd_lid == 0) {
+                sums[o_offset * blocks + block_idx] = sum_exp[j];
+                maxs[o_offset * blocks + block_idx] = max_score[j];
+            }
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="mtplx_sdpa_gqa_packed_grouped_partials",
+        input_names=[
+            "queries",
+            "keys",
+            "values",
+            "offset",
+            "k_head_seq",
+            "v_head_seq",
+            "scale",
+            "blocks",
+        ],
+        output_names=["partials", "sums", "maxs"],
+        source=source,
+    )
+
+
+def sdpa_gqa_packed_tail_grouped(
+    *,
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    offset: int | mx.array,
+    scale: float,
+    max_q_len: int = 16,
+) -> mx.array | None:
+    """Wide-QL tail-causal SDPA: query groups of <=4 rows per workgroup.
+
+    Same contract as :func:`sdpa_gqa_packed_tail` but for ``2 <= q_len <= 16``.
+    Returns ``None`` on any contract miss (callers fall back to stock).
+    """
+
+    if not mx.metal.is_available():
+        return _bail("metal_unavailable")
+    if queries.ndim != 4 or keys.ndim != 4 or values.ndim != 4:
+        return _bail("ndim")
+    bsz, hq, q_len, d = (int(x) for x in queries.shape)
+    if bsz != 1:
+        return _bail("batch_size")
+    if q_len < 2 or q_len > min(16, int(max_q_len)):
+        return _bail("q_len")
+    hk = int(keys.shape[1])
+    capacity = int(keys.shape[2])
+    vdim = int(values.shape[3])
+    if int(values.shape[1]) != hk or int(values.shape[2]) != capacity:
+        return _bail("kv_shape_mismatch")
+    if int(keys.shape[3]) != d:
+        return _bail("head_dim_mismatch")
+    if d not in (64, 96, 128, 256):
+        return _bail("head_dim_unsupported")
+    if hk <= 0 or hq % hk:
+        return _bail("gqa_heads")
+    gqa_factor = hq // hk
+    if 32 * gqa_factor > 1024:
+        return _bail("threadgroup_width")
+    if queries.dtype not in (mx.bfloat16, mx.float16):
+        return _bail("query_dtype")
+    if keys.dtype != queries.dtype or values.dtype != queries.dtype:
+        return _bail("kv_dtype_mismatch")
+
+    if isinstance(offset, mx.array):
+        if offset.size != 1:
+            return _bail("offset_shape")
+        offset_arr = offset.astype(mx.int32).reshape(1)
+    else:
+        offset_int = int(offset)
+        if offset_int <= 0 or offset_int > capacity:
+            return _bail("offset_range")
+        offset_arr = mx.array([offset_int], dtype=mx.int32)
+
+    qgroups = (q_len + 3) // 4
+    base_blocks = _blocks_for_capacity(capacity)
+    blocks = max(256, base_blocks // qgroups)
+    blocks -= blocks % 32
+    if blocks <= 0 or blocks % 32:
+        return _bail("blocks_geometry")
+
+    kernel = _grouped_partials_kernel()
+    reduce_kernel = _paged_reduce_kernel()
+    if kernel is None or reduce_kernel is None:
+        return _bail("kernel_unavailable")
+
+    partial_shape = (bsz, hq, q_len, blocks, vdim)
+    stats_shape = (bsz, hq, q_len, blocks)
+    partials, sums, maxs = kernel(
+        inputs=[
+            queries,
+            keys,
+            values,
+            offset_arr,
+            capacity,
+            capacity,
+            float(scale),
+            int(blocks),
+        ],
+        template=[
+            ("InT", queries.dtype),
+            ("D", d),
+            ("V", vdim),
+            ("GQA_F", gqa_factor),
+            ("QL", q_len),
+        ],
+        grid=(hk * 32, gqa_factor * qgroups, blocks),
+        threadgroup=(32, gqa_factor, 1),
+        output_shapes=[partial_shape, stats_shape, stats_shape],
+        output_dtypes=[queries.dtype, mx.float32, mx.float32],
+    )
+
+    (out,) = reduce_kernel(
+        inputs=[partials, sums, maxs, int(blocks)],
+        template=[
+            ("InT", queries.dtype),
+            ("V", vdim),
+        ],
+        grid=(bsz * hq * 1024, q_len, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[queries.shape],
+        output_dtypes=[queries.dtype],
+    )
+    return out

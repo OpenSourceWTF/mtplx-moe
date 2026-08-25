@@ -258,6 +258,10 @@ def _install_split_attention_hook(attn: Any) -> bool:
             from .kernel_selfcheck import lane_disabled
 
             gqa_packed_enabled = not lane_disabled("gqa_packed_sdpa")
+        # MTPLX_GQA_PACKED_WIDE (2026-08-25 flat-decode): route q_len 5-16
+        # to the query-group kernel instead of the second-bank path the QL
+        # sweep measured as the depth cliff. Off = shipping behavior.
+        gqa_packed_wide = _env_enabled("MTPLX_GQA_PACKED_WIDE")
         should_use_gqa_packed = (
             gqa_packed_enabled
             and cache is not None
@@ -265,7 +269,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
             and not vllm_metal_paged_enabled
             # 8 rows since 2026-07-21 (second float4 bank): depth 4's
             # verify window is q_len 5; QL <= 4 compiles identically.
-            and 2 <= int(queries.shape[2]) <= 8
+            and 2 <= int(queries.shape[2]) <= (16 if gqa_packed_wide else 8)
             and can_slice_mask
             and getattr(cache, "keys", None) is not None
             and getattr(cache, "values", None) is not None
@@ -350,15 +354,27 @@ def _install_split_attention_hook(attn: Any) -> bool:
                     mask=mask,
                 )
         elif should_use_gqa_packed:
-            from .kernels.sdpa_gqa_packed import sdpa_gqa_packed_tail
-
-            output = sdpa_gqa_packed_tail(
-                queries=queries,
-                keys=cache.keys,
-                values=cache.values,
-                offset=cache.offset,
-                scale=self.scale,
+            from .kernels.sdpa_gqa_packed import (
+                sdpa_gqa_packed_tail,
+                sdpa_gqa_packed_tail_grouped,
             )
+
+            if gqa_packed_wide and int(queries.shape[2]) >= 5:
+                output = sdpa_gqa_packed_tail_grouped(
+                    queries=queries,
+                    keys=cache.keys,
+                    values=cache.values,
+                    offset=cache.offset,
+                    scale=self.scale,
+                )
+            else:
+                output = sdpa_gqa_packed_tail(
+                    queries=queries,
+                    keys=cache.keys,
+                    values=cache.values,
+                    offset=cache.offset,
+                    scale=self.scale,
+                )
             if output is not None:
                 self._mtplx_gqa_packed_sdpa_calls = (
                     int(getattr(self, "_mtplx_gqa_packed_sdpa_calls", 0)) + 1

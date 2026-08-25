@@ -250,3 +250,54 @@ def test_configure_defaults_gqa_packed_off(monkeypatch):
     stats = configure_split_full_attention(model)
     assert stats["gqa_packed_sdpa_enabled"] is False
     assert stats["gqa_packed_sdpa_threshold"] == 8192
+
+
+@pytest.mark.skipif(not METAL, reason="requires Metal")
+@pytest.mark.parametrize("q_len", [2, 4, 5, 6, 8, 9, 12, 15, 16])
+@pytest.mark.parametrize("offset", [515, 2051])
+def test_grouped_matches_fp32_reference(q_len, offset):
+    from mtplx.kernels.sdpa_gqa_packed import sdpa_gqa_packed_tail_grouped
+
+    mx.random.seed(offset * 100 + q_len)
+    capacity = offset + 173  # grow-slack: live rows < allocated rows
+    q = mx.random.normal((1, HQ, q_len, D)).astype(mx.bfloat16)
+    k = mx.random.normal((1, HK, capacity, D)).astype(mx.bfloat16)
+    v = mx.random.normal((1, HK, capacity, D)).astype(mx.bfloat16)
+    mx.eval(q, k, v)
+
+    out = sdpa_gqa_packed_tail_grouped(
+        queries=q, keys=k, values=v, offset=offset, scale=SCALE
+    )
+    assert out is not None, "grouped kernel bailed on a contract-clean call"
+
+    k_live = k[:, :, :offset, :]
+    v_live = v[:, :, :offset, :]
+    ref = _ref_tail_causal(q, k_live, v_live, SCALE)
+    err = float(mx.max(mx.abs(out.astype(mx.float32) - ref)).item())
+    tol = 2.5 * max(
+        _fused_reference_tolerance(q, k_live, v_live, ref), 1e-3
+    )
+    assert err <= tol, f"grouped q_len={q_len} err={err} tol={tol}"
+
+
+@pytest.mark.skipif(not METAL, reason="requires Metal")
+def test_grouped_matches_single_bank_at_ql4():
+    """QL<=4 must agree between the grouped and proven single-bank kernels."""
+    from mtplx.kernels.sdpa_gqa_packed import (
+        sdpa_gqa_packed_tail,
+        sdpa_gqa_packed_tail_grouped,
+    )
+
+    mx.random.seed(7)
+    offset, capacity = 1031, 1200
+    q = mx.random.normal((1, HQ, 4, D)).astype(mx.bfloat16)
+    k = mx.random.normal((1, HK, capacity, D)).astype(mx.bfloat16)
+    v = mx.random.normal((1, HK, capacity, D)).astype(mx.bfloat16)
+    mx.eval(q, k, v)
+    a = sdpa_gqa_packed_tail(queries=q, keys=k, values=v, offset=offset, scale=SCALE)
+    b = sdpa_gqa_packed_tail_grouped(
+        queries=q, keys=k, values=v, offset=offset, scale=SCALE
+    )
+    assert a is not None and b is not None
+    err = float(mx.max(mx.abs(a.astype(mx.float32) - b.astype(mx.float32))).item())
+    assert err <= 2e-3, f"grouped vs single-bank ql4 err={err}"
