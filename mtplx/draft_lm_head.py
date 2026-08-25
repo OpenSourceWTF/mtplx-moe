@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 import time
 from typing import Any
 
@@ -351,4 +353,12 @@ def _install_draft_lm_head(rt: Any, *, bits: int, group_size: int, mode: str) ->
     if frspec_enabled():
         report = dict(report)
         report["frspec"] = install_frspec_draft_head(text)
+        print(f"[frspec] install report: {report['frspec']}", file=sys.stderr, flush=True)
+    else:
+        print(
+            "[frspec] disabled (MTPLX_FRSPEC_DRAFT="
+            f"{os.environ.get('MTPLX_FRSPEC_DRAFT')!r})",
+            file=sys.stderr,
+            flush=True,
+        )
     return report

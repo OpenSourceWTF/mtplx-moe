@@ -4787,6 +4787,13 @@ def _make_device_draft_core(
     frspec_text = getattr(rt.model, "language_model", rt.model)
     frspec_head = getattr(frspec_text, "_mtplx_frspec_draft_head", None)
     if frspec_head is None:
+        if os.environ.get("MTPLX_FRSPEC_DRAFT"):
+            print(
+                "[frspec] core swap NOT engaged: no _mtplx_frspec_draft_head "
+                f"stamp on {type(frspec_text).__name__}",
+                file=sys.stderr,
+                flush=True,
+            )
         return _make_device_draft_core_inner(
             rt,
             hidden,
@@ -4799,6 +4806,7 @@ def _make_device_draft_core(
             frspec_ids=None,
             frspec_full_vocab=0,
         )
+    print("[frspec] core swap ENGAGED (pruned draft head active)", file=sys.stderr, flush=True)
     saved_head = getattr(frspec_text, "_mtplx_draft_lm_head", None)
     frspec_text._mtplx_draft_lm_head = frspec_head
     try:
