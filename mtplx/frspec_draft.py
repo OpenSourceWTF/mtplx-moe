@@ -117,13 +117,21 @@ def install_frspec_draft_head(text: Any) -> dict[str, Any]:
         pruned.bias = mx.take(head.bias, ids_arr, axis=0)
     mx.eval(pruned.parameters())
 
-    # Side-stamped only: the device draft core swaps this head in around its
-    # own trace window. The global _mtplx_draft_lm_head stays full-vocab so
-    # legacy draft paths (dense draft_q consumers index by real token id)
-    # keep their contract untouched.
+    # Side-stamped only by default: the device draft core swaps this head in
+    # around its own trace window. The global _mtplx_draft_lm_head stays
+    # full-vocab so legacy draft paths (dense draft_q consumers index by real
+    # token id) keep their contract untouched.
     text._mtplx_frspec_draft_head = pruned
     text._mtplx_frspec_full_vocab = vocab_rows
     text._mtplx_frspec_ids = ids_arr
+    legacy = frspec_legacy_enabled()
+    if legacy:
+        # Legacy per-step lane (2026-08-25): the mtp forward projects through
+        # _mtplx_draft_lm_head directly, so the swap is global here and
+        # generate_mtpk remaps sampled local ids -> full ids at its single
+        # draft convergence point (width-guarded).
+        text._mtplx_frspec_saved_head = head
+        text._mtplx_draft_lm_head = pruned
     report = {
         "installed": True,
         "n": n,
@@ -131,7 +139,13 @@ def install_frspec_draft_head(text: Any) -> dict[str, Any]:
         "bits": bits,
         "group_size": group_size,
         "bytes_ratio": round(n / vocab_rows, 4),
+        "legacy_swap": bool(legacy),
         "elapsed_s": round(time.perf_counter() - started, 3),
     }
     logger.info("[frspec] pruned draft lm_head installed: %s", report)
     return report
+
+
+def frspec_legacy_enabled() -> bool:
+    return (os.environ.get("MTPLX_FRSPEC_LEGACY", "").strip().lower()
+            in {"1", "true", "yes", "on"})

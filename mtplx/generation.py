@@ -6870,6 +6870,24 @@ def generate_mtpk(
     target cache snapshot and re-forwards only the committed prefix. This keeps
     the hybrid GDN/attention cache contract exact while we measure depth.
     """
+    # FR-Spec legacy lane (2026-08-25): when the pruned draft head is swapped
+    # in globally (MTPLX_FRSPEC_LEGACY), sampled draft ids are LOCAL rows of
+    # the shortlist. They are remapped to full-vocab ids at the single draft
+    # convergence point below, width-guarded on the logits row so an
+    # unswapped graph degrades to exact full-vocab drafting, never a mismap.
+    _frspec_legacy_ids: np.ndarray | None = None
+    _frspec_legacy_full = 0
+    if os.environ.get("MTPLX_FRSPEC_LEGACY", "").strip().lower() in {"1", "true", "yes", "on"}:
+        _frspec_text_model = getattr(rt.model, "language_model", rt.model)
+        _frspec_stamp = getattr(_frspec_text_model, "_mtplx_frspec_ids", None)
+        _frspec_head_live = getattr(_frspec_text_model, "_mtplx_draft_lm_head", None) is getattr(
+            _frspec_text_model, "_mtplx_frspec_draft_head", object()
+        )
+        if _frspec_stamp is not None and _frspec_head_live:
+            _frspec_legacy_ids = np.asarray(_frspec_stamp)
+            _frspec_legacy_full = int(
+                getattr(_frspec_text_model, "_mtplx_frspec_full_vocab", 0)
+            )
     if getattr(rt, "backend_id", None) == "gemma4_assistant":
         from .backends.gemma4_assistant import generate_gemma4_assistant
 
@@ -9456,6 +9474,24 @@ def generate_mtpk(
                 else:
                     draft_confidences.append(None)
                 trace_accounting_time_s += time.perf_counter() - conf_started
+            if (
+                _frspec_legacy_ids is not None
+                and draft_token is not None
+                and int(draft_logits.shape[-1]) == int(_frspec_legacy_ids.shape[0])
+            ):
+                draft_token = int(_frspec_legacy_ids[int(draft_token)])
+                if isinstance(draft_q, SparseDistribution):
+                    draft_q = SparseDistribution(
+                        token_ids=_frspec_legacy_ids[draft_q.token_ids],
+                        probs=draft_q.probs,
+                        vocab_size=_frspec_legacy_full,
+                    )
+                elif draft_q is not None:
+                    draft_q = SparseDistribution(
+                        token_ids=_frspec_legacy_ids,
+                        probs=np.asarray(draft_q, dtype=np.float64),
+                        vocab_size=_frspec_legacy_full,
+                    )
             draft_tokens.append(draft_token)
             draft_probs.append(draft_q)
             draft_cache_keys.append(cache_key)
