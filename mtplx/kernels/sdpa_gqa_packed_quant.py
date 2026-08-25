@@ -50,8 +50,6 @@ def _quant_partials_kernel():
         constexpr int QH = (QL > 4) ? (QL - 4) : 0;
         constexpr int k_bytes_per_thread =
             (KBITS == 8) ? qk_per_thread : (qk_per_thread / 2);
-        constexpr int v_bytes_per_thread =
-            (KBITS == 8) ? v_per_thread : (v_per_thread / 2);
         constexpr int KROW = (KBITS == 8) ? D : (D / 2);
 
         typedef float U;
@@ -64,23 +62,38 @@ def _quant_partials_kernel():
 
         const int q_head_idx = kv_head_idx * GQA_F + gqa_idx;
 
-        thread U q[QL][qk_per_thread];
-        thread U o[QL][v_per_thread];
+        // Pro-consult #3 register layout (2026-08-25): the query bank is
+        // TRANSPOSED — qbank[d] holds element d across query rows 0..3 as a
+        // float4, so each K element costs ONE float4 fma covering four rows
+        // (the row-scalar layout paid up to 8 scalar FMAs per element).
+        // Output accumulators are transposed the same way. No dequantized
+        // float arrays are ever materialized: uchar4 components are consumed
+        // inline. Rows 4..7 ride second banks that compile out at QL <= 4.
+        float4 qbank[qk_per_thread];
+        float4 qbank2[qk_per_thread];
+        float4 obank[v_per_thread];
+        float4 obank2[v_per_thread];
+        for (int d = 0; d < qk_per_thread; ++d) {
+            const int col = simd_lid * qk_per_thread + d;
+            float4 qv = 0.0f;
+            float4 qv2 = 0.0f;
+            qv.x = static_cast<U>(queries[(q_head_idx * QL + 0) * D + col]);
+            if (QL > 1) qv.y = static_cast<U>(queries[(q_head_idx * QL + 1) * D + col]);
+            if (QL > 2) qv.z = static_cast<U>(queries[(q_head_idx * QL + 2) * D + col]);
+            if (QL > 3) qv.w = static_cast<U>(queries[(q_head_idx * QL + 3) * D + col]);
+            if (QH > 0) qv2.x = static_cast<U>(queries[(q_head_idx * QL + 4) * D + col]);
+            if (QH > 1) qv2.y = static_cast<U>(queries[(q_head_idx * QL + 5) * D + col]);
+            if (QH > 2) qv2.z = static_cast<U>(queries[(q_head_idx * QL + 6) * D + col]);
+            if (QH > 3) qv2.w = static_cast<U>(queries[(q_head_idx * QL + 7) * D + col]);
+            qbank[d] = static_cast<U>(scale) * qv;
+            qbank2[d] = static_cast<U>(scale) * qv2;
+            obank[d] = 0.0f;
+            obank2[d] = 0.0f;
+        }
         float4 max_score = Limits<float>::finite_min;
         float4 sum_exp = 0.0f;
         float4 max_score2 = Limits<float>::finite_min;
         float4 sum_exp2 = 0.0f;
-
-        for (int j = 0; j < QL; ++j) {
-            const device InT* q_ptr = queries
-                + (q_head_idx * QL + j) * D + simd_lid * qk_per_thread;
-            for (int i = 0; i < qk_per_thread; ++i) {
-                q[j][i] = static_cast<U>(scale) * static_cast<U>(q_ptr[i]);
-            }
-            for (int i = 0; i < v_per_thread; ++i) {
-                o[j][i] = 0.0f;
-            }
-        }
 
         const device uint8_t* k_ptr = k_q
             + (size_t)kv_head_idx * k_head_seq * KROW
@@ -89,7 +102,7 @@ def _quant_partials_kernel():
         const device uint8_t* v_ptr = v_q
             + (size_t)kv_head_idx * v_head_seq * KROW
             + (size_t)block_idx * KROW
-            + simd_lid * v_bytes_per_thread;
+            + simd_lid * k_bytes_per_thread;
         const device float* ks_ptr = k_scale
             + (size_t)kv_head_idx * k_head_seq + block_idx;
         const device float* vs_ptr = v_scale
@@ -97,49 +110,121 @@ def _quant_partials_kernel():
 
         const int n_full = n_kv - QL;
 
-        #define MTPLX_LOAD_KVEC(dst, src) \\
-            if (KBITS == 8) { \\
-                const device uchar4* s4 = \\
-                    reinterpret_cast<const device uchar4*>(src); \\
-                for (int i = 0; i < qk_per_thread / 4; ++i) { \\
-                    const char4 c = as_type<char4>(s4[i]); \\
-                    dst[4 * i + 0] = static_cast<U>(c.x); \\
-                    dst[4 * i + 1] = static_cast<U>(c.y); \\
-                    dst[4 * i + 2] = static_cast<U>(c.z); \\
-                    dst[4 * i + 3] = static_cast<U>(c.w); \\
-                } \\
-            } else { \\
-                const device uchar4* s4 = \\
-                    reinterpret_cast<const device uchar4*>(src); \\
-                const uchar4 b = s4[0]; \\
-                dst[0] = static_cast<U>(static_cast<int>(b.x & 0x0F) - 8); \\
-                dst[1] = static_cast<U>(static_cast<int>(b.x >> 4) - 8); \\
-                dst[2] = static_cast<U>(static_cast<int>(b.y & 0x0F) - 8); \\
-                dst[3] = static_cast<U>(static_cast<int>(b.y >> 4) - 8); \\
-                dst[4] = static_cast<U>(static_cast<int>(b.z & 0x0F) - 8); \\
-                dst[5] = static_cast<U>(static_cast<int>(b.z >> 4) - 8); \\
-                dst[6] = static_cast<U>(static_cast<int>(b.w & 0x0F) - 8); \\
-                dst[7] = static_cast<U>(static_cast<int>(b.w >> 4) - 8); \\
+        #define MTPLX_QDOT(SRC, D1, D2) \
+            { \
+                const device uchar4* p4 = \
+                    reinterpret_cast<const device uchar4*>(SRC); \
+                if (KBITS == 8) { \
+                    uchar4 a = p4[0]; \
+                    char4 c = as_type<char4>(a); \
+                    D1 = fma(qbank[0], (U)c.x, D1); \
+                    D1 = fma(qbank[1], (U)c.y, D1); \
+                    D1 = fma(qbank[2], (U)c.z, D1); \
+                    D1 = fma(qbank[3], (U)c.w, D1); \
+                    if (QH > 0) { \
+                        D2 = fma(qbank2[0], (U)c.x, D2); \
+                        D2 = fma(qbank2[1], (U)c.y, D2); \
+                        D2 = fma(qbank2[2], (U)c.z, D2); \
+                        D2 = fma(qbank2[3], (U)c.w, D2); \
+                    } \
+                    a = p4[1]; \
+                    c = as_type<char4>(a); \
+                    D1 = fma(qbank[4], (U)c.x, D1); \
+                    D1 = fma(qbank[5], (U)c.y, D1); \
+                    D1 = fma(qbank[6], (U)c.z, D1); \
+                    D1 = fma(qbank[7], (U)c.w, D1); \
+                    if (QH > 0) { \
+                        D2 = fma(qbank2[4], (U)c.x, D2); \
+                        D2 = fma(qbank2[5], (U)c.y, D2); \
+                        D2 = fma(qbank2[6], (U)c.z, D2); \
+                        D2 = fma(qbank2[7], (U)c.w, D2); \
+                    } \
+                } else { \
+                    const uchar4 a = p4[0]; \
+                    D1 = fma(qbank[0], (U)((int)(a.x & 0x0F) - 8), D1); \
+                    D1 = fma(qbank[1], (U)((int)(a.x >> 4) - 8), D1); \
+                    D1 = fma(qbank[2], (U)((int)(a.y & 0x0F) - 8), D1); \
+                    D1 = fma(qbank[3], (U)((int)(a.y >> 4) - 8), D1); \
+                    D1 = fma(qbank[4], (U)((int)(a.z & 0x0F) - 8), D1); \
+                    D1 = fma(qbank[5], (U)((int)(a.z >> 4) - 8), D1); \
+                    D1 = fma(qbank[6], (U)((int)(a.w & 0x0F) - 8), D1); \
+                    D1 = fma(qbank[7], (U)((int)(a.w >> 4) - 8), D1); \
+                    if (QH > 0) { \
+                        D2 = fma(qbank2[0], (U)((int)(a.x & 0x0F) - 8), D2); \
+                        D2 = fma(qbank2[1], (U)((int)(a.x >> 4) - 8), D2); \
+                        D2 = fma(qbank2[2], (U)((int)(a.y & 0x0F) - 8), D2); \
+                        D2 = fma(qbank2[3], (U)((int)(a.y >> 4) - 8), D2); \
+                        D2 = fma(qbank2[4], (U)((int)(a.z & 0x0F) - 8), D2); \
+                        D2 = fma(qbank2[5], (U)((int)(a.z >> 4) - 8), D2); \
+                        D2 = fma(qbank2[6], (U)((int)(a.w & 0x0F) - 8), D2); \
+                        D2 = fma(qbank2[7], (U)((int)(a.w >> 4) - 8), D2); \
+                    } \
+                } \
+            }
+
+        #define MTPLX_VUPD(SRC, ES1, ES2, F1, F2) \
+            { \
+                for (int d = 0; d < v_per_thread; ++d) { \
+                    obank[d] = obank[d] * F1; \
+                    if (QH > 0) obank2[d] = obank2[d] * F2; \
+                } \
+                const device uchar4* p4 = \
+                    reinterpret_cast<const device uchar4*>(SRC); \
+                if (KBITS == 8) { \
+                    uchar4 a = p4[0]; \
+                    char4 c = as_type<char4>(a); \
+                    obank[0] = fma(ES1, (U)c.x, obank[0]); \
+                    obank[1] = fma(ES1, (U)c.y, obank[1]); \
+                    obank[2] = fma(ES1, (U)c.z, obank[2]); \
+                    obank[3] = fma(ES1, (U)c.w, obank[3]); \
+                    if (QH > 0) { \
+                        obank2[0] = fma(ES2, (U)c.x, obank2[0]); \
+                        obank2[1] = fma(ES2, (U)c.y, obank2[1]); \
+                        obank2[2] = fma(ES2, (U)c.z, obank2[2]); \
+                        obank2[3] = fma(ES2, (U)c.w, obank2[3]); \
+                    } \
+                    a = p4[1]; \
+                    c = as_type<char4>(a); \
+                    obank[4] = fma(ES1, (U)c.x, obank[4]); \
+                    obank[5] = fma(ES1, (U)c.y, obank[5]); \
+                    obank[6] = fma(ES1, (U)c.z, obank[6]); \
+                    obank[7] = fma(ES1, (U)c.w, obank[7]); \
+                    if (QH > 0) { \
+                        obank2[4] = fma(ES2, (U)c.x, obank2[4]); \
+                        obank2[5] = fma(ES2, (U)c.y, obank2[5]); \
+                        obank2[6] = fma(ES2, (U)c.z, obank2[6]); \
+                        obank2[7] = fma(ES2, (U)c.w, obank2[7]); \
+                    } \
+                } else { \
+                    const uchar4 a = p4[0]; \
+                    obank[0] = fma(ES1, (U)((int)(a.x & 0x0F) - 8), obank[0]); \
+                    obank[1] = fma(ES1, (U)((int)(a.x >> 4) - 8), obank[1]); \
+                    obank[2] = fma(ES1, (U)((int)(a.y & 0x0F) - 8), obank[2]); \
+                    obank[3] = fma(ES1, (U)((int)(a.y >> 4) - 8), obank[3]); \
+                    obank[4] = fma(ES1, (U)((int)(a.z & 0x0F) - 8), obank[4]); \
+                    obank[5] = fma(ES1, (U)((int)(a.z >> 4) - 8), obank[5]); \
+                    obank[6] = fma(ES1, (U)((int)(a.w & 0x0F) - 8), obank[6]); \
+                    obank[7] = fma(ES1, (U)((int)(a.w >> 4) - 8), obank[7]); \
+                    if (QH > 0) { \
+                        obank2[0] = fma(ES2, (U)((int)(a.x & 0x0F) - 8), obank2[0]); \
+                        obank2[1] = fma(ES2, (U)((int)(a.x >> 4) - 8), obank2[1]); \
+                        obank2[2] = fma(ES2, (U)((int)(a.y & 0x0F) - 8), obank2[2]); \
+                        obank2[3] = fma(ES2, (U)((int)(a.y >> 4) - 8), obank2[3]); \
+                        obank2[4] = fma(ES2, (U)((int)(a.z & 0x0F) - 8), obank2[4]); \
+                        obank2[5] = fma(ES2, (U)((int)(a.z >> 4) - 8), obank2[5]); \
+                        obank2[6] = fma(ES2, (U)((int)(a.w & 0x0F) - 8), obank2[6]); \
+                        obank2[7] = fma(ES2, (U)((int)(a.w >> 4) - 8), obank2[7]); \
+                    } \
+                } \
             }
 
         for (int n = block_idx; n <= n_full; n += blocks) {
-            U k_vec[qk_per_thread];
-            MTPLX_LOAD_KVEC(k_vec, k_ptr)
             const U ks = static_cast<U>(*ks_ptr);
-            float4 score = 0.0f;
-            float4 score2 = 0.0f;
-            for (int i = 0; i < qk_per_thread; ++i) {
-                score.x += q[0][i] * k_vec[i];
-                if (QL > 1) score.y += q[1][i] * k_vec[i];
-                if (QL > 2) score.z += q[2][i] * k_vec[i];
-                if (QL > 3) score.w += q[3][i] * k_vec[i];
-                if (QH > 0) score2.x += q[4][i] * k_vec[i];
-                if (QH > 1) score2.y += q[5][i] * k_vec[i];
-                if (QH > 2) score2.z += q[6][i] * k_vec[i];
-                if (QH > 3) score2.w += q[7][i] * k_vec[i];
-            }
-            score *= ks;
-            if (QH > 0) score2 *= ks;
+            float4 dot1 = 0.0f;
+            float4 dot2 = 0.0f;
+            MTPLX_QDOT(k_ptr, dot1, dot2)
+            float4 score = dot1 * ks;
+            float4 score2 = dot2 * ks;
             for (int off = 16; off > 0; off >>= 1) {
                 score += simd_shuffle_xor(score, off);
                 if (QH > 0) score2 += simd_shuffle_xor(score2, off);
@@ -159,23 +244,9 @@ def _quant_partials_kernel():
                 sum_exp2 = sum_exp2 * factor2 + exp_score2;
             }
             const U vs = static_cast<U>(*vs_ptr);
-            {
-                const float4 es = exp_score * vs;
-                const float4 es2 = exp_score2 * vs;
-                U v_vec[v_per_thread];
-                MTPLX_LOAD_KVEC(v_vec, v_ptr)
-                for (int i = 0; i < v_per_thread; ++i) {
-                    const U v = v_vec[i];
-                    o[0][i] = o[0][i] * factor.x + es.x * v;
-                    if (QL > 1) o[1][i] = o[1][i] * factor.y + es.y * v;
-                    if (QL > 2) o[2][i] = o[2][i] * factor.z + es.z * v;
-                    if (QL > 3) o[3][i] = o[3][i] * factor.w + es.w * v;
-                    if (QH > 0) o[4][i] = o[4][i] * factor2.x + es2.x * v;
-                    if (QH > 1) o[5][i] = o[5][i] * factor2.y + es2.y * v;
-                    if (QH > 2) o[6][i] = o[6][i] * factor2.z + es2.z * v;
-                    if (QH > 3) o[7][i] = o[7][i] * factor2.w + es2.w * v;
-                }
-            }
+            const float4 es1 = exp_score * vs;
+            const float4 es2v = exp_score2 * vs;
+            MTPLX_VUPD(v_ptr, es1, es2v, factor, factor2)
             k_ptr += (size_t)blocks * KROW;
             v_ptr += (size_t)blocks * KROW;
             ks_ptr += blocks;
@@ -194,29 +265,18 @@ def _quant_partials_kernel():
                 + (size_t)n0 * KROW + simd_lid * k_bytes_per_thread;
             const device uint8_t* v_tail = v_q
                 + (size_t)kv_head_idx * v_head_seq * KROW
-                + (size_t)n0 * KROW + simd_lid * v_bytes_per_thread;
+                + (size_t)n0 * KROW + simd_lid * k_bytes_per_thread;
             const device float* ks_tail = k_scale
                 + (size_t)kv_head_idx * k_head_seq + n0;
             const device float* vs_tail = v_scale
                 + (size_t)kv_head_idx * v_head_seq + n0;
             for (int n = n0; n < n_kv; n += blocks) {
-                U k_vec[qk_per_thread];
-                MTPLX_LOAD_KVEC(k_vec, k_tail)
                 const U ks = static_cast<U>(*ks_tail);
-                float4 score = 0.0f;
-                float4 score2 = 0.0f;
-                for (int i = 0; i < qk_per_thread; ++i) {
-                    score.x += q[0][i] * k_vec[i];
-                    if (QL > 1) score.y += q[1][i] * k_vec[i];
-                    if (QL > 2) score.z += q[2][i] * k_vec[i];
-                    if (QL > 3) score.w += q[3][i] * k_vec[i];
-                    if (QH > 0) score2.x += q[4][i] * k_vec[i];
-                    if (QH > 1) score2.y += q[5][i] * k_vec[i];
-                    if (QH > 2) score2.z += q[6][i] * k_vec[i];
-                    if (QH > 3) score2.w += q[7][i] * k_vec[i];
-                }
-                score *= ks;
-                if (QH > 0) score2 *= ks;
+                float4 dot1 = 0.0f;
+                float4 dot2 = 0.0f;
+                MTPLX_QDOT(k_tail, dot1, dot2)
+                float4 score = dot1 * ks;
+                float4 score2 = dot2 * ks;
                 for (int off = 16; off > 0; off >>= 1) {
                     score += simd_shuffle_xor(score, off);
                     if (QH > 0) score2 += simd_shuffle_xor(score2, off);
@@ -249,23 +309,9 @@ def _quant_partials_kernel():
                     sum_exp2 = sum_exp2 * factor2 + exp_score2;
                 }
                 const U vs = static_cast<U>(*vs_tail);
-                {
-                    const float4 es = exp_score * vs;
-                    const float4 es2 = exp_score2 * vs;
-                    U v_vec[v_per_thread];
-                    MTPLX_LOAD_KVEC(v_vec, v_tail)
-                    for (int i = 0; i < v_per_thread; ++i) {
-                        const U v = v_vec[i];
-                        o[0][i] = o[0][i] * factor.x + es.x * v;
-                        if (QL > 1) o[1][i] = o[1][i] * factor.y + es.y * v;
-                        if (QL > 2) o[2][i] = o[2][i] * factor.z + es.z * v;
-                        if (QL > 3) o[3][i] = o[3][i] * factor.w + es.w * v;
-                        if (QH > 0) o[4][i] = o[4][i] * factor2.x + es2.x * v;
-                        if (QH > 1) o[5][i] = o[5][i] * factor2.y + es2.y * v;
-                        if (QH > 2) o[6][i] = o[6][i] * factor2.z + es2.z * v;
-                        if (QH > 3) o[7][i] = o[7][i] * factor2.w + es2.w * v;
-                    }
-                }
+                const float4 es1 = exp_score * vs;
+                const float4 es2v = exp_score2 * vs;
+                MTPLX_VUPD(v_tail, es1, es2v, factor, factor2)
                 k_tail += (size_t)blocks * KROW;
                 v_tail += (size_t)blocks * KROW;
                 ks_tail += blocks;
@@ -279,7 +325,10 @@ def _quant_partials_kernel():
                 + ((size_t)o_offset * blocks + block_idx) * V
                 + simd_lid * v_per_thread;
             for (int i = 0; i < v_per_thread; ++i) {
-                p[i] = static_cast<InT>(o[j][i]);
+                const float4 ob = (j < 4) ? obank[i] : obank2[i];
+                const float val = (j % 4 == 0) ? ob.x
+                    : (j % 4 == 1) ? ob.y : (j % 4 == 2) ? ob.z : ob.w;
+                p[i] = static_cast<InT>(val);
             }
             if (simd_lid == 0) {
                 const float se = (j < 4) ? sum_exp[j] : sum_exp2[j - 4];
@@ -288,6 +337,7 @@ def _quant_partials_kernel():
                 maxs[o_offset * blocks + block_idx] = ms;
             }
         }
+    
     """
     return mx.fast.metal_kernel(
         name="mtplx_sdpa_gqa_packed_quant_partials",
