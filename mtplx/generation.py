@@ -8670,6 +8670,18 @@ def generate_mtpk(
                     # systematic; an empty result falls through to the normal
                     # MTP round (#186 phase 3).
                     _cc_block = _cc_block[: constraint.validate_prefix(_cc_block)]
+            _cc_bank_route = (
+                _cc_block
+                and compiled_verify_bank is not None
+                and _env_truthy("MTPLX_CCOPY_BANK_ROUTE")
+            )
+            if _cc_bank_route:
+                # Bank-routed copy blocks (2026-08-25 flat-decode): the compiled
+                # verify bank only traces windows up to max_verify_len rows, so
+                # the block is capped to fit. Receipts: eager block verify costs
+                # ~380ms FLAT in T at 88k vs ~137ms through the bank — a short
+                # banked block beats any eager block for nacc <= ~14.
+                _cc_block = _cc_block[: max(1, int(compiled_verify_bank.max_verify_len) - 1)]
             if _cc_block:
                 _cc_T = 1 + len(_cc_block)
                 _cc_before = None
@@ -8679,13 +8691,23 @@ def generate_mtpk(
                     snapshot_time += time.perf_counter() - started
                 started_forward = time.perf_counter()
                 with attention_phase("decode_verify"):
-                    _cc_logits, _cc_hidden, _cc_captures = rt.forward_ar_capture(
-                        mx.array([[primary] + _cc_block]),
-                        cache=cache,
-                        return_hidden=True,
-                        hidden_variant=base_hidden_variant,
-                        capture_backend=verify_core_backend,
-                    )
+                    if _cc_bank_route:
+                        _cc_logits, _cc_hidden, _cc_captures = (
+                            compiled_verify_bank.forward_ar_capture(
+                                mx.array([[primary] + _cc_block]),
+                                cache=cache,
+                                return_hidden=True,
+                                hidden_variant=base_hidden_variant,
+                            )
+                        )
+                    else:
+                        _cc_logits, _cc_hidden, _cc_captures = rt.forward_ar_capture(
+                            mx.array([[primary] + _cc_block]),
+                            cache=cache,
+                            return_hidden=True,
+                            hidden_variant=base_hidden_variant,
+                            capture_backend=verify_core_backend,
+                        )
                 _cc_t_build = time.perf_counter()
                 if sampler.temperature <= 0:
                     _cc_g = [int(x) for x in mx.argmax(_cc_logits[0], axis=-1).tolist()]
