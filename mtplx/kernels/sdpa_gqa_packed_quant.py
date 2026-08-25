@@ -97,50 +97,6 @@ def _quant_partials_kernel():
 
         const int n_full = n_kv - QL;
 
-        // V update with inline dequant: one element of v is produced at a
-        // time from held uchar4 registers (uints, not floats), matching the
-        // bf16 kernel's per-element V loads — the float v_vec + folded-weight
-        // float4s of v1/v2 cost ~16 registers/thread and collapsed occupancy.
-        #define MTPLX_V_FMA(v) \\
-            o[0][i_o] = o[0][i_o] * factor.x + exp_score.x * vs * (v); \\
-            if (QL > 1) o[1][i_o] = o[1][i_o] * factor.y + exp_score.y * vs * (v); \\
-            if (QL > 2) o[2][i_o] = o[2][i_o] * factor.z + exp_score.z * vs * (v); \\
-            if (QL > 3) o[3][i_o] = o[3][i_o] * factor.w + exp_score.w * vs * (v); \\
-            if (QH > 0) o[4][i_o] = o[4][i_o] * factor2.x + exp_score2.x * vs * (v); \\
-            if (QH > 1) o[5][i_o] = o[5][i_o] * factor2.y + exp_score2.y * vs * (v); \\
-            if (QH > 2) o[6][i_o] = o[6][i_o] * factor2.z + exp_score2.z * vs * (v); \\
-            if (QH > 3) o[7][i_o] = o[7][i_o] * factor2.w + exp_score2.w * vs * (v); \\
-            ++i_o;
-
-        #define MTPLX_V_UPDATE(src) \\
-            { \\
-                int i_o = 0; \\
-                const device uchar4* s4 = \\
-                    reinterpret_cast<const device uchar4*>(src); \\
-                if (KBITS == 8) { \\
-                    for (int c = 0; c < v_per_thread / 4; ++c) { \\
-                        const char4 cv = as_type<char4>(s4[c]); \\
-                        MTPLX_V_FMA(static_cast<U>(cv.x)) \\
-                        MTPLX_V_FMA(static_cast<U>(cv.y)) \\
-                        MTPLX_V_FMA(static_cast<U>(cv.z)) \\
-                        MTPLX_V_FMA(static_cast<U>(cv.w)) \\
-                    } \\
-                } else { \\
-                    const uchar4 b = s4[0]; \\
-                    MTPLX_V_FMA(static_cast<U>(static_cast<int>(b.x & 0x0F) - 8)) \\
-                    MTPLX_V_FMA(static_cast<U>(static_cast<int>(b.x >> 4) - 8)) \\
-                    MTPLX_V_FMA(static_cast<U>(static_cast<int>(b.y & 0x0F) - 8)) \\
-                    MTPLX_V_FMA(static_cast<U>(static_cast<int>(b.y >> 4) - 8)) \\
-                    MTPLX_V_FMA(static_cast<U>(static_cast<int>(b.z & 0x0F) - 8)) \\
-                    MTPLX_V_FMA(static_cast<U>(static_cast<int>(b.z >> 4) - 8)) \\
-                    MTPLX_V_FMA(static_cast<U>(static_cast<int>(b.w & 0x0F) - 8)) \\
-                    MTPLX_V_FMA(static_cast<U>(static_cast<int>(b.w >> 4) - 8)) \\
-                } \\
-            }
-
-        // Vectorized loads: byte-granular reads left the walk issue-limited
-        // (v1 receipt: 68-83GB/s effective vs bf16's 221). uchar4 packs 4
-        // transactions into 1; thread spans are 8B (q8) / 4B (q4) aligned.
         #define MTPLX_LOAD_KVEC(dst, src) \\
             if (KBITS == 8) { \\
                 const device uchar4* s4 = \\
@@ -203,9 +159,23 @@ def _quant_partials_kernel():
                 sum_exp2 = sum_exp2 * factor2 + exp_score2;
             }
             const U vs = static_cast<U>(*vs_ptr);
-            // Inline V dequant (bf16-kernel register shape): 2x uchar4 held
-            // as ints, converted per element in the FMA — no float v_vec.
-            MTPLX_V_UPDATE(v_ptr)
+            {
+                const float4 es = exp_score * vs;
+                const float4 es2 = exp_score2 * vs;
+                U v_vec[v_per_thread];
+                MTPLX_LOAD_KVEC(v_vec, v_ptr)
+                for (int i = 0; i < v_per_thread; ++i) {
+                    const U v = v_vec[i];
+                    o[0][i] = o[0][i] * factor.x + es.x * v;
+                    if (QL > 1) o[1][i] = o[1][i] * factor.y + es.y * v;
+                    if (QL > 2) o[2][i] = o[2][i] * factor.z + es.z * v;
+                    if (QL > 3) o[3][i] = o[3][i] * factor.w + es.w * v;
+                    if (QH > 0) o[4][i] = o[4][i] * factor2.x + es2.x * v;
+                    if (QH > 1) o[5][i] = o[5][i] * factor2.y + es2.y * v;
+                    if (QH > 2) o[6][i] = o[6][i] * factor2.z + es2.z * v;
+                    if (QH > 3) o[7][i] = o[7][i] * factor2.w + es2.w * v;
+                }
+            }
             k_ptr += (size_t)blocks * KROW;
             v_ptr += (size_t)blocks * KROW;
             ks_ptr += blocks;
@@ -279,7 +249,23 @@ def _quant_partials_kernel():
                     sum_exp2 = sum_exp2 * factor2 + exp_score2;
                 }
                 const U vs = static_cast<U>(*vs_tail);
-                MTPLX_V_UPDATE(v_tail)
+                {
+                    const float4 es = exp_score * vs;
+                    const float4 es2 = exp_score2 * vs;
+                    U v_vec[v_per_thread];
+                    MTPLX_LOAD_KVEC(v_vec, v_tail)
+                    for (int i = 0; i < v_per_thread; ++i) {
+                        const U v = v_vec[i];
+                        o[0][i] = o[0][i] * factor.x + es.x * v;
+                        if (QL > 1) o[1][i] = o[1][i] * factor.y + es.y * v;
+                        if (QL > 2) o[2][i] = o[2][i] * factor.z + es.z * v;
+                        if (QL > 3) o[3][i] = o[3][i] * factor.w + es.w * v;
+                        if (QH > 0) o[4][i] = o[4][i] * factor2.x + es2.x * v;
+                        if (QH > 1) o[5][i] = o[5][i] * factor2.y + es2.y * v;
+                        if (QH > 2) o[6][i] = o[6][i] * factor2.z + es2.z * v;
+                        if (QH > 3) o[7][i] = o[7][i] * factor2.w + es2.w * v;
+                    }
+                }
                 k_tail += (size_t)blocks * KROW;
                 v_tail += (size_t)blocks * KROW;
                 ks_tail += blocks;
