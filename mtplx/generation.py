@@ -8686,10 +8686,12 @@ def generate_mtpk(
                         hidden_variant=base_hidden_variant,
                         capture_backend=verify_core_backend,
                     )
+                _cc_t_build = time.perf_counter()
                 if sampler.temperature <= 0:
                     _cc_g = [int(x) for x in mx.argmax(_cc_logits[0], axis=-1).tolist()]
                 else:
                     mx.eval(_cc_logits)
+                _cc_t_eval = time.perf_counter()
                 elapsed_verify = time.perf_counter() - started_forward
                 verify_forward_time += elapsed_verify
                 verify_time += elapsed_verify
@@ -8748,6 +8750,7 @@ def generate_mtpk(
                         _cc_nacc = _cc_i + 1
                         _cc_correction = None
                         break
+                _cc_t_accept = time.perf_counter()
                 _cc_m = _cc_nacc + 1
                 _cc_ok = True
                 if _cc_nacc < len(_cc_block):
@@ -8757,6 +8760,15 @@ def generate_mtpk(
                         cache, _cc_captures, keep_tokens=_cc_m, verified_tokens=_cc_T,
                     )
                     capture_commit_time += time.perf_counter() - started_commit
+                if _env_truthy("MTPLX_CCOPY_PROF"):
+                    print(
+                        f"[ccopy-prof] T={_cc_T} nacc={_cc_nacc} "
+                        f"build={1000*(_cc_t_build-started_forward):.1f} "
+                        f"eval={1000*(_cc_t_eval-_cc_t_build):.1f} "
+                        f"accept={1000*(_cc_t_accept-_cc_t_eval):.1f} "
+                        f"commit={1000*(time.perf_counter()-_cc_t_accept):.1f}",
+                        file=sys.stderr, flush=True,
+                    )
                 if not _cc_ok:
                     # This capture core cannot commit a per-position prefix (for
                     # example final-state-only cores). Roll the whole block back,
