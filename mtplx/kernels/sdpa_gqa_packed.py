@@ -435,7 +435,10 @@ def _grouped_partials_kernel():
 
         const int q_head_idx = kv_head_idx * GQA_F + gqa_idx;
         const int q0 = qgroup * 4;
-        const int nq = metal::min(4, QL - q0);
+        // NQ_LAST/QGROUPS are template constants: full groups fold nq to a
+        // literal 4 and the tail group folds to NQ_LAST, so the dead-lane
+        // predicates compile out exactly like the single-bank kernel's QL.
+        const int nq = (qgroup == QGROUPS - 1) ? NQ_LAST : 4;
 
         thread U q[4][qk_per_thread];
         thread U o[4][v_per_thread];
@@ -673,6 +676,8 @@ def sdpa_gqa_packed_tail_grouped(
             ("V", vdim),
             ("GQA_F", gqa_factor),
             ("QL", q_len),
+            ("QGROUPS", qgroups),
+            ("NQ_LAST", q_len - 4 * (qgroups - 1)),
         ],
         grid=(hk * 32, gqa_factor * qgroups, blocks),
         threadgroup=(32, gqa_factor, 1),
