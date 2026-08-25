@@ -438,12 +438,22 @@ def _grouped_partials_kernel():
         // NQ_LAST/QGROUPS are template constants: full groups fold nq to a
         // literal 4 and the tail group folds to NQ_LAST, so the dead-lane
         // predicates compile out exactly like the single-bank kernel's QL.
-        const int nq = (qgroup == QGROUPS - 1) ? NQ_LAST : 4;
+        // NQ_LAST may exceed 4 (mixed grouping, 2026-08-25 v3): the tail
+        // group then carries QH2 = NQ_LAST - 4 rows in a small second bank.
+        // QH2 <= 2 keeps register state far from the QL8 spill cliff.
+        const bool is_tail = qgroup == QGROUPS - 1;
+        const int nq = is_tail ? metal::min(NQ_LAST, 4) : 4;
+        constexpr int QH2 = (NQ_LAST > 4) ? (NQ_LAST - 4) : 0;
+        const int nq2 = is_tail ? QH2 : 0;
 
         thread U q[4][qk_per_thread];
         thread U o[4][v_per_thread];
         float4 max_score = Limits<U>::finite_min;
         float4 sum_exp = 0.0f;
+        thread U q2[QH2 > 0 ? QH2 : 1][qk_per_thread];
+        thread U o2[QH2 > 0 ? QH2 : 1][v_per_thread];
+        float2 max_score2 = Limits<U>::finite_min;
+        float2 sum_exp2 = 0.0f;
 
         for (int j = 0; j < 4; ++j) {
             const bool live = j < nq;
@@ -455,6 +465,20 @@ def _grouped_partials_kernel():
             }
             for (int i = 0; i < v_per_thread; ++i) {
                 o[j][i] = 0.0f;
+            }
+        }
+        if (QH2 > 0) {
+            for (int j = 0; j < QH2; ++j) {
+                const bool live = j < nq2;
+                const device InT* q_ptr = queries
+                    + ((size_t)q_head_idx * QL + q0 + 4 + (live ? j : 0)) * D
+                    + simd_lid * qk_per_thread;
+                for (int i = 0; i < qk_per_thread; ++i) {
+                    q2[j][i] = live ? static_cast<U>(scale) * static_cast<U>(q_ptr[i]) : U(0);
+                }
+                for (int i = 0; i < v_per_thread; ++i) {
+                    o2[j][i] = 0.0f;
+                }
             }
         }
 
@@ -477,14 +501,18 @@ def _grouped_partials_kernel():
                 k_vec[i] = static_cast<U>(k_ptr[i]);
             }
             float4 score = 0.0f;
+            float2 score2 = 0.0f;
             for (int i = 0; i < qk_per_thread; ++i) {
                 score.x += q[0][i] * k_vec[i];
                 score.y += q[1][i] * k_vec[i];
                 score.z += q[2][i] * k_vec[i];
                 score.w += q[3][i] * k_vec[i];
+                if (QH2 > 0) score2.x += q2[0][i] * k_vec[i];
+                if (QH2 > 1) score2.y += q2[QH2 > 1 ? 1 : 0][i] * k_vec[i];
             }
             for (int off = 16; off > 0; off >>= 1) {
                 score += simd_shuffle_xor(score, off);
+                if (QH2 > 0) score2 += simd_shuffle_xor(score2, off);
             }
             float4 vis;
             vis.x = (0 < nq) ? 1.0f : 0.0f;
@@ -497,12 +525,28 @@ def _grouped_partials_kernel():
             float4 exp_score = fast::exp(score - new_max) * vis;
             max_score = new_max;
             sum_exp = sum_exp * factor + exp_score;
+            float2 factor2 = 1.0f;
+            float2 exp_score2 = 0.0f;
+            if (QH2 > 0) {
+                float2 vis2;
+                vis2.x = (0 < nq2) ? 1.0f : 0.0f;
+                vis2.y = (1 < nq2) ? 1.0f : 0.0f;
+                score2 = score2 * vis2 + (1.0f - vis2) * Limits<U>::finite_min;
+                float2 new_max2 = metal::max(max_score2, score2);
+                factor2 = fast::exp(max_score2 - new_max2);
+                exp_score2 = fast::exp(score2 - new_max2) * vis2;
+                max_score2 = new_max2;
+                sum_exp2 = sum_exp2 * factor2 + exp_score2;
+            }
             for (int i = 0; i < v_per_thread; ++i) {
                 const U v = static_cast<U>(v_ptr[i]);
                 o[0][i] = o[0][i] * factor.x + exp_score.x * v;
                 o[1][i] = o[1][i] * factor.y + exp_score.y * v;
                 o[2][i] = o[2][i] * factor.z + exp_score.z * v;
                 o[3][i] = o[3][i] * factor.w + exp_score.w * v;
+                if (QH2 > 0) o2[0][i] = o2[0][i] * factor2.x + exp_score2.x * v;
+                if (QH2 > 1) o2[QH2 > 1 ? 1 : 0][i]
+                    = o2[QH2 > 1 ? 1 : 0][i] * factor2.y + exp_score2.y * v;
             }
             k_ptr += (size_t)blocks * D;
             v_ptr += (size_t)blocks * D;
@@ -527,14 +571,18 @@ def _grouped_partials_kernel():
                     k_vec[i] = static_cast<U>(k_tail[i]);
                 }
                 float4 score = 0.0f;
+                float2 score2 = 0.0f;
                 for (int i = 0; i < qk_per_thread; ++i) {
                     score.x += q[0][i] * k_vec[i];
                     score.y += q[1][i] * k_vec[i];
                     score.z += q[2][i] * k_vec[i];
                     score.w += q[3][i] * k_vec[i];
+                    if (QH2 > 0) score2.x += q2[0][i] * k_vec[i];
+                    if (QH2 > 1) score2.y += q2[QH2 > 1 ? 1 : 0][i] * k_vec[i];
                 }
                 for (int off = 16; off > 0; off >>= 1) {
                     score += simd_shuffle_xor(score, off);
+                    if (QH2 > 0) score2 += simd_shuffle_xor(score2, off);
                 }
                 // Row j of this group is global row q0+j: visible iff
                 // n <= n_kv - QL + q0 + j (and the row exists).
@@ -549,12 +597,29 @@ def _grouped_partials_kernel():
                 float4 exp_score = fast::exp(score - new_max) * vis;
                 max_score = new_max;
                 sum_exp = sum_exp * factor + exp_score;
+                float2 factor2 = 1.0f;
+                float2 exp_score2 = 0.0f;
+                if (QH2 > 0) {
+                    // Bank-2 row j is global row q0+4+j.
+                    float2 vis2;
+                    vis2.x = (0 < nq2 && n <= n_full + 4) ? 1.0f : 0.0f;
+                    vis2.y = (1 < nq2 && n <= n_full + 5) ? 1.0f : 0.0f;
+                    score2 = score2 * vis2 + (1.0f - vis2) * Limits<U>::finite_min;
+                    float2 new_max2 = metal::max(max_score2, score2);
+                    factor2 = fast::exp(max_score2 - new_max2);
+                    exp_score2 = fast::exp(score2 - new_max2) * vis2;
+                    max_score2 = new_max2;
+                    sum_exp2 = sum_exp2 * factor2 + exp_score2;
+                }
                 for (int i = 0; i < v_per_thread; ++i) {
                     const U v = static_cast<U>(v_tail[i]);
                     o[0][i] = o[0][i] * factor.x + exp_score.x * v;
                     o[1][i] = o[1][i] * factor.y + exp_score.y * v;
                     o[2][i] = o[2][i] * factor.z + exp_score.z * v;
                     o[3][i] = o[3][i] * factor.w + exp_score.w * v;
+                    if (QH2 > 0) o2[0][i] = o2[0][i] * factor2.x + exp_score2.x * v;
+                    if (QH2 > 1) o2[QH2 > 1 ? 1 : 0][i]
+                        = o2[QH2 > 1 ? 1 : 0][i] * factor2.y + exp_score2.y * v;
                 }
                 k_tail += (size_t)blocks * D;
                 v_tail += (size_t)blocks * D;
@@ -572,6 +637,19 @@ def _grouped_partials_kernel():
             if (simd_lid == 0) {
                 sums[o_offset * blocks + block_idx] = sum_exp[j];
                 maxs[o_offset * blocks + block_idx] = max_score[j];
+            }
+        }
+        for (int j = 0; j < nq2; ++j) {
+            const int o_offset = q_head_idx * QL + q0 + 4 + j;
+            device InT* p = partials
+                + ((size_t)o_offset * blocks + block_idx) * V
+                + simd_lid * v_per_thread;
+            for (int i = 0; i < v_per_thread; ++i) {
+                p[i] = static_cast<InT>(o2[j][i]);
+            }
+            if (simd_lid == 0) {
+                sums[o_offset * blocks + block_idx] = sum_exp2[j];
+                maxs[o_offset * blocks + block_idx] = max_score2[j];
             }
         }
     """
@@ -645,7 +723,14 @@ def sdpa_gqa_packed_tail_grouped(
             return _bail("offset_range")
         offset_arr = mx.array([offset_int], dtype=mx.int32)
 
-    qgroups = (q_len + 3) // 4
+    # Mixed grouping (v3, 2026-08-25): at QL9/10 a 5-6 row tail group saves
+    # a whole extra KV walk (4+5 / 4+6 vs 4+4+1 / 4+4+2). The sweep priced
+    # per-walk costs 4-row 1.65ms/layer-16th, 5-row 2.62, 6-row 3.03 at 71k
+    # -- two mixed walks beat three narrow ones only at QL9-10.
+    if q_len in (9, 10):
+        qgroups = 2
+    else:
+        qgroups = (q_len + 3) // 4
     base_blocks = _blocks_for_capacity(capacity)
     blocks = max(256, base_blocks // qgroups)
     blocks -= blocks % 32

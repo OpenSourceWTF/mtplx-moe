@@ -253,7 +253,7 @@ def test_configure_defaults_gqa_packed_off(monkeypatch):
 
 
 @pytest.mark.skipif(not METAL, reason="requires Metal")
-@pytest.mark.parametrize("q_len", [2, 4, 5, 6, 8, 9, 12, 15, 16])
+@pytest.mark.parametrize("q_len", [2, 4, 5, 6, 8, 9, 10, 12, 15, 16])
 @pytest.mark.parametrize("offset", [515, 2051])
 def test_grouped_matches_fp32_reference(q_len, offset):
     from mtplx.kernels.sdpa_gqa_packed import sdpa_gqa_packed_tail_grouped
