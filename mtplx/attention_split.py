@@ -360,9 +360,13 @@ def _install_split_attention_hook(attn: Any) -> bool:
             )
 
             # Grouped wins only past the second-bank register cliff: the
-            # 2026-08-25 sweep put bank2 ahead at QL5-6 (one extra register
-            # row < a redundant KV re-walk) and grouped 2.4x ahead at QL8.
-            if gqa_packed_wide and int(queries.shape[2]) >= 7:
+            # 2026-08-25 three-way sweep at 71k put bank2 ahead at QL5-6,
+            # grouped ahead at QL7-8 (68.6 vs stock 83.7), stock ahead at
+            # QL9 (83.6 vs 97.6 — the 4+4+1 tail group walks the whole KV
+            # for one row; mixed 4+5 grouping is the designed v3 fix), and
+            # grouped~stock at QL10-12.
+            _wide_ql = int(queries.shape[2])
+            if gqa_packed_wide and (_wide_ql in (7, 8) or 10 <= _wide_ql <= 16):
                 output = sdpa_gqa_packed_tail_grouped(
                     queries=queries,
                     keys=cache.keys,
