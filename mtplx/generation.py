@@ -10208,6 +10208,28 @@ def generate_mtpk(
                         residual_distribution(target_p, draft_q), rng
                     )
                 )
+                if not accepted_now and _env_truthy("MTPLX_DELTA_TELEMETRY"):
+                    # Tree Stage-0 pricing (2026-08-25): would a sibling branch
+                    # have caught this rejection? Record the rank of the
+                    # committed correction inside the DRAFT's own candidate
+                    # list — Δ_r = P(correction == draft rank-2/3) is the
+                    # entire economic case for a B2/B3 fork at depth r.
+                    try:
+                        _dt_rank = -1
+                        if isinstance(draft_q, SparseDistribution):
+                            _dt_order = np.argsort(-draft_q.probs)
+                            _dt_ids = draft_q.token_ids[_dt_order][:4]
+                            _dt_hits = np.nonzero(
+                                _dt_ids == int(correction))[0]
+                            if _dt_hits.size:
+                                _dt_rank = int(_dt_hits[0])
+                        print(
+                            f"[delta-telemetry] depth={depth_index + 1} "
+                            f"correction_rank={_dt_rank}",
+                            file=sys.stderr, flush=True,
+                        )
+                    except Exception:  # noqa: BLE001 — telemetry never breaks decode
+                        pass
 
             if (
                 constraint_legal_prefix is not None
