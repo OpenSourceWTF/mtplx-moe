@@ -346,4 +346,9 @@ def _install_draft_lm_head(rt: Any, *, bits: int, group_size: int, mode: str) ->
     else:
         raise AttributeError("model has no lm_head and does not tie output projection to embeddings")
     text._mtplx_draft_lm_head = draft_head
+    from .frspec_draft import frspec_enabled, install_frspec_draft_head
+
+    if frspec_enabled():
+        report = dict(report)
+        report["frspec"] = install_frspec_draft_head(text)
     return report

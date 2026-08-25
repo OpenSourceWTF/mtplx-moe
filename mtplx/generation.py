@@ -4775,6 +4775,64 @@ def _make_device_draft_core(
     draft_sampler: SamplerConfig,
     seed: int,
 ) -> dict[str, Any]:
+    # FR-Spec pruned draft head: swapped in only around the inner maker's
+    # warm+trace window and restored unconditionally, so legacy draft paths
+    # (dense draft_q consumers index by real token id) always see the
+    # full-vocab head. Inside the traced chain every sampled index is mapped
+    # through the ranked id table back to a real token id; q_probs stay
+    # as-is — they are the actual proposal distribution, which is what exact
+    # acceptance needs. Mapping sites are width-guarded at trace time so an
+    # mx.compile retrace that resolves the restored full-vocab head degrades
+    # to exact full-vocab drafting, never a mismap.
+    frspec_text = getattr(rt.model, "language_model", rt.model)
+    frspec_head = getattr(frspec_text, "_mtplx_frspec_draft_head", None)
+    if frspec_head is None:
+        return _make_device_draft_core_inner(
+            rt,
+            hidden,
+            token_ids,
+            mtp_hidden_variant=mtp_hidden_variant,
+            depth=depth,
+            mtp_cache=mtp_cache,
+            draft_sampler=draft_sampler,
+            seed=seed,
+            frspec_ids=None,
+            frspec_full_vocab=0,
+        )
+    saved_head = getattr(frspec_text, "_mtplx_draft_lm_head", None)
+    frspec_text._mtplx_draft_lm_head = frspec_head
+    try:
+        return _make_device_draft_core_inner(
+            rt,
+            hidden,
+            token_ids,
+            mtp_hidden_variant=mtp_hidden_variant,
+            depth=depth,
+            mtp_cache=mtp_cache,
+            draft_sampler=draft_sampler,
+            seed=seed,
+            frspec_ids=getattr(frspec_text, "_mtplx_frspec_ids", None),
+            frspec_full_vocab=int(
+                getattr(frspec_text, "_mtplx_frspec_full_vocab", 0)
+            ),
+        )
+    finally:
+        frspec_text._mtplx_draft_lm_head = saved_head
+
+
+def _make_device_draft_core_inner(
+    rt: MTPLXRuntime,
+    hidden: mx.array,
+    token_ids: mx.array,
+    *,
+    mtp_hidden_variant: str,
+    depth: int,
+    mtp_cache: Any,
+    draft_sampler: SamplerConfig,
+    seed: int,
+    frspec_ids: mx.array | None,
+    frspec_full_vocab: int,
+) -> dict[str, Any]:
     temperature = float(draft_sampler.temperature)
     top_k = int(draft_sampler.top_k)
     top_p = float(draft_sampler.top_p)
@@ -4798,7 +4856,12 @@ def _make_device_draft_core(
             mtp_hidden_variant=mtp_hidden_variant,
             mtp_depth=level,
         )
-        warm_tok = mx.argmax(warm_logits[:, -1, :], axis=-1).reshape(1, 1)
+        warm_tok = mx.argmax(warm_logits[:, -1, :], axis=-1)
+        if frspec_ids is not None and int(warm_logits.shape[-1]) == int(
+            frspec_ids.shape[0]
+        ):
+            warm_tok = mx.take(frspec_ids, warm_tok)
+        warm_tok = warm_tok.reshape(1, 1)
         warm_hidden = warm_h[:, -1:, :]
     _eval(warm_tok, warm_hidden)
     vocab_size = int(warm_logits.shape[-1])
@@ -4819,8 +4882,14 @@ def _make_device_draft_core(
                 mtp_depth=level,
             )
             row = logits_level[:, -1, :].reshape(-1)
+            frspec_mapped = frspec_ids is not None and int(row.shape[0]) == int(
+                frspec_ids.shape[0]
+            )
             if greedy:
-                next_tok = mx.argmax(row, axis=-1).reshape(1, 1)
+                next_tok = mx.argmax(row, axis=-1)
+                if frspec_mapped:
+                    next_tok = mx.take(frspec_ids, next_tok)
+                next_tok = next_tok.reshape(1, 1)
             else:
                 top_idx, q_norm = _device_draft_q_arrays(
                     row,
@@ -4828,6 +4897,8 @@ def _make_device_draft_core(
                     top_k=min(top_k, vocab_size),
                     top_p=top_p,
                 )
+                if frspec_mapped:
+                    top_idx = mx.take(frspec_ids, top_idx)
                 cdf = mx.cumsum(q_norm, axis=-1)
                 u = mx.random.uniform(key=level_keys[level - 1])
                 pick = mx.minimum(
@@ -4854,7 +4925,15 @@ def _make_device_draft_core(
         "fn": compiled,
         "depth": depth,
         "greedy": greedy,
-        "vocab_size": vocab_size,
+        # Distribution DOMAIN, not logits width: with the FR-Spec pruned head
+        # the chain emits REAL token ids (mapped through the ranked table),
+        # so SparseDistribution/one_hot/to_dense must span the full vocab.
+        "vocab_size": (
+            frspec_full_vocab
+            if frspec_ids is not None and frspec_full_vocab > 0
+            else vocab_size
+        ),
+        "frspec": bool(frspec_ids is not None),
         "promoted": promoted,
         "promotion_failures": failures,
         "state_signature": _device_core_state_signature(mtp_cache),
