@@ -24,11 +24,13 @@ from mtplx.qwen4_ngram import (
     NGramManifest,
     NGramManifestError,
     NGramRowCache,
+    NGramRuntimeBudget,
     NGramShard,
     SlotTicket,
     VerifiedNGramArtifact,
     VerifiedNGramShard,
     plan_ngram_cache,
+    plan_production_ngram_cache,
 )
 
 ROW_BYTES = 8
@@ -724,6 +726,174 @@ def test_two_gib_plans_use_complete_rows_without_large_allocations(
         plan.total_reserved_bytes,
     ) == expected
     assert plan.requested_payload_bytes == 2 * 1024**3
+
+
+def test_twenty_gib_bf16_plan_accounts_for_every_backing_allocation() -> None:
+    gib = 1024**3
+    config = NGramCacheConfig(
+        cache_limit_bytes=20 * gib,
+        transient_limit_bytes=1024**2,
+        max_inflight_io_bytes=1024**2,
+        max_open_files=129,
+        bypass_page_cache=True,
+        eviction="lru",
+        allocation_alignment_bytes=16 * 1024,
+    )
+    plan = plan_ngram_cache(planning_manifest("bf16"), config)
+
+    assert plan.slot_count == 67_108_864
+    assert plan.payload_bytes == 20 * gib
+    assert plan.slot_metadata_bytes == 1_946_157_056
+    assert plan.route_capacity == 134_217_728
+    assert plan.route_table_bytes == 1_073_741_824
+    assert plan.transient_bytes == 1_048_320
+    assert plan.transient_metadata_bytes == 3_276
+    assert plan.alignment_bytes == 13_364
+    assert plan.total_reserved_bytes == 24_495_800_320
+
+
+def test_production_budget_uses_full_twenty_gib_when_total_reservation_fits() -> None:
+    gib = 1024**3
+    runtime = plan_production_ngram_cache(
+        planning_manifest("bf16"),
+        NGramRuntimeBudget(
+            measured_base_residency_bytes=64 * gib,
+            kv_mtp_reserve_bytes=2 * gib,
+            metal_working_reserve_bytes=2 * gib,
+            safety_margin_bytes=2 * gib,
+            minimum_payload_bytes=1 * gib,
+            allocation_alignment_bytes=16 * 1024,
+        ),
+        transient_limit_bytes=1024**2,
+        max_inflight_io_bytes=1024**2,
+        max_open_files=129,
+        bypass_page_cache=True,
+        eviction="lru",
+    )
+
+    assert runtime.target_residency_bytes == 95 * gib
+    assert runtime.fixed_runtime_bytes == 70 * gib
+    assert runtime.available_cache_bytes == 25 * gib
+    assert runtime.payload_formula_ceiling_bytes == 20 * gib
+    assert runtime.cache.payload_bytes == 20 * gib
+    assert runtime.cache.total_reserved_bytes == 24_495_800_320
+    assert runtime.projected_residency_bytes <= runtime.target_residency_bytes
+    assert runtime.config.cache_limit_bytes == runtime.cache.payload_bytes
+
+
+def test_production_budget_reduces_payload_for_exact_overhead() -> None:
+    gib = 1024**3
+    manifest = planning_manifest("bf16")
+    runtime = plan_production_ngram_cache(
+        manifest,
+        NGramRuntimeBudget(
+            measured_base_residency_bytes=80 * gib,
+            kv_mtp_reserve_bytes=2 * gib,
+            metal_working_reserve_bytes=1 * gib,
+            safety_margin_bytes=2 * gib,
+            minimum_payload_bytes=1 * gib,
+            allocation_alignment_bytes=16 * 1024,
+        ),
+        transient_limit_bytes=1024**2,
+        max_inflight_io_bytes=1024**2,
+        max_open_files=129,
+        bypass_page_cache=True,
+        eviction="lru",
+    )
+
+    assert runtime.available_cache_bytes == 10 * gib
+    assert runtime.payload_formula_ceiling_bytes == 10 * gib
+    assert 1 * gib <= runtime.cache.payload_bytes < 10 * gib
+    assert runtime.cache.total_reserved_bytes <= runtime.available_cache_bytes
+    next_config = replace(
+        runtime.config,
+        cache_limit_bytes=runtime.cache.payload_bytes + manifest.row_bytes,
+    )
+    assert plan_ngram_cache(manifest, next_config).total_reserved_bytes > (
+        runtime.available_cache_bytes
+    )
+
+
+def test_production_budget_rejects_runtime_below_measured_minimum() -> None:
+    gib = 1024**3
+    with pytest.raises(ValueError, match="minimum viable"):
+        plan_production_ngram_cache(
+            planning_manifest("bf16"),
+            NGramRuntimeBudget(
+                measured_base_residency_bytes=93 * gib,
+                kv_mtp_reserve_bytes=1 * gib,
+                metal_working_reserve_bytes=512 * 1024**2,
+                safety_margin_bytes=256 * 1024**2,
+                minimum_payload_bytes=1 * gib,
+                allocation_alignment_bytes=16 * 1024,
+            ),
+            transient_limit_bytes=1024**2,
+            max_inflight_io_bytes=1024**2,
+            max_open_files=129,
+            bypass_page_cache=True,
+            eviction="lru",
+        )
+
+
+def test_production_budget_rejects_checked_integer_overflow() -> None:
+    with pytest.raises(OverflowError, match="signed 64-bit"):
+        plan_production_ngram_cache(
+            planning_manifest("bf16"),
+            NGramRuntimeBudget(
+                measured_base_residency_bytes=(1 << 63) - 1,
+                kv_mtp_reserve_bytes=1,
+                metal_working_reserve_bytes=1,
+                safety_margin_bytes=1,
+                minimum_payload_bytes=320,
+                allocation_alignment_bytes=16 * 1024,
+            ),
+            transient_limit_bytes=320,
+            max_inflight_io_bytes=320,
+            max_open_files=129,
+            bypass_page_cache=True,
+            eviction="lru",
+        )
+
+
+def test_production_budget_rejects_minimum_payload_rounding_overflow() -> None:
+    with pytest.raises(OverflowError, match="minimum payload rounding"):
+        plan_production_ngram_cache(
+            planning_manifest("bf16"),
+            NGramRuntimeBudget(
+                measured_base_residency_bytes=1,
+                kv_mtp_reserve_bytes=1,
+                metal_working_reserve_bytes=1,
+                safety_margin_bytes=1,
+                minimum_payload_bytes=(1 << 63) - 1,
+                allocation_alignment_bytes=16 * 1024,
+            ),
+            transient_limit_bytes=320,
+            max_inflight_io_bytes=320,
+            max_open_files=129,
+            bypass_page_cache=True,
+            eviction="lru",
+        )
+
+
+def test_production_budget_rejects_quantized_ngram_storage() -> None:
+    gib = 1024**3
+    with pytest.raises(ValueError, match="exact BF16"):
+        plan_production_ngram_cache(
+            planning_manifest("affine-q4-g32"),
+            NGramRuntimeBudget(
+                measured_base_residency_bytes=64 * gib,
+                kv_mtp_reserve_bytes=2 * gib,
+                metal_working_reserve_bytes=2 * gib,
+                safety_margin_bytes=2 * gib,
+                minimum_payload_bytes=1 * gib,
+                allocation_alignment_bytes=16 * 1024,
+            ),
+            transient_limit_bytes=1024**2,
+            max_inflight_io_bytes=1024**2,
+            max_open_files=129,
+            bypass_page_cache=True,
+            eviction="lru",
+        )
 
 
 def test_planner_rejects_packed_index_overflow() -> None:

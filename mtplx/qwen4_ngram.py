@@ -63,6 +63,9 @@ _PLE_SEED_PRIME = 10_007
 _MAX_SIGNED_INT64 = (1 << 63) - 1
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _STORAGES = frozenset(("bf16", "affine-q4-g32"))
+_GIB = 1024**3
+PRODUCTION_RUNTIME_TARGET_BYTES = 95 * _GIB
+PRODUCTION_NGRAM_PAYLOAD_CEILING_BYTES = 20 * _GIB
 
 
 class NGramManifestError(ValueError):
@@ -1298,6 +1301,7 @@ class NGramCacheConfig:
     max_open_files: int
     bypass_page_cache: bool
     eviction: Literal["lru", "frequency"]
+    allocation_alignment_bytes: int = 1
 
     def __post_init__(self) -> None:
         for name in (
@@ -1305,6 +1309,7 @@ class NGramCacheConfig:
             "transient_limit_bytes",
             "max_inflight_io_bytes",
             "max_open_files",
+            "allocation_alignment_bytes",
         ):
             value = getattr(self, name)
             if type(value) is not int:
@@ -1318,6 +1323,8 @@ class NGramCacheConfig:
             "frequency",
         }:
             raise ValueError("eviction must be 'lru' or 'frequency'")
+        if self.allocation_alignment_bytes & (self.allocation_alignment_bytes - 1):
+            raise ValueError("allocation_alignment_bytes must be a power of two")
 
 
 _EMPTY_ROW = (1 << 32) - 1
@@ -1338,7 +1345,85 @@ class NGramCachePlan:
     route_table_bytes: int
     transient_bytes: int
     transient_metadata_bytes: int
+    alignment_bytes: int
     total_reserved_bytes: int
+
+
+@dataclass(frozen=True)
+class NGramRuntimeBudget:
+    """Measured construction-time inputs for the pinned production cache."""
+
+    measured_base_residency_bytes: int
+    kv_mtp_reserve_bytes: int
+    metal_working_reserve_bytes: int
+    safety_margin_bytes: int
+    minimum_payload_bytes: int
+    allocation_alignment_bytes: int
+    target_residency_bytes: int = PRODUCTION_RUNTIME_TARGET_BYTES
+    payload_ceiling_bytes: int = PRODUCTION_NGRAM_PAYLOAD_CEILING_BYTES
+
+    def __post_init__(self) -> None:
+        for name in (
+            "measured_base_residency_bytes",
+            "kv_mtp_reserve_bytes",
+            "metal_working_reserve_bytes",
+            "safety_margin_bytes",
+            "minimum_payload_bytes",
+            "allocation_alignment_bytes",
+            "target_residency_bytes",
+            "payload_ceiling_bytes",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int:
+                raise TypeError(f"{name} must be an exact integer")
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if self.minimum_payload_bytes == 0:
+            raise ValueError("minimum_payload_bytes must be positive")
+        if self.allocation_alignment_bytes == 0 or self.allocation_alignment_bytes & (
+            self.allocation_alignment_bytes - 1
+        ):
+            raise ValueError("allocation_alignment_bytes must be a positive power of two")
+        if not 0 < self.target_residency_bytes <= PRODUCTION_RUNTIME_TARGET_BYTES:
+            raise ValueError("target_residency_bytes exceeds the pinned 95 GiB target")
+        if not 0 < self.payload_ceiling_bytes <= (
+            PRODUCTION_NGRAM_PAYLOAD_CEILING_BYTES
+        ):
+            raise ValueError("payload_ceiling_bytes exceeds the pinned 20 GiB maximum")
+
+
+@dataclass(frozen=True)
+class NGramProductionCachePlan:
+    """Pinned production capacity plus its complete residency accounting."""
+
+    target_residency_bytes: int
+    fixed_runtime_bytes: int
+    available_cache_bytes: int
+    payload_formula_ceiling_bytes: int
+    projected_residency_bytes: int
+    config: NGramCacheConfig
+    cache: NGramCachePlan
+
+
+def _checked_add_bytes(*values: int, label: str) -> int:
+    total = 0
+    for value in values:
+        total += value
+        if total > _MAX_SIGNED_INT64:
+            raise OverflowError(f"{label} exceeds signed 64-bit byte accounting")
+    return total
+
+
+def _checked_mul_bytes(left: int, right: int, *, label: str) -> int:
+    value = left * right
+    if value > _MAX_SIGNED_INT64:
+        raise OverflowError(f"{label} exceeds signed 64-bit byte accounting")
+    return value
+
+
+def _aligned_bytes(value: int, alignment: int, *, label: str) -> int:
+    padded = _checked_add_bytes(value, alignment - 1, label=label)
+    return padded & -alignment
 
 
 def plan_ngram_cache(
@@ -1361,18 +1446,47 @@ def plan_ngram_cache(
     if transient_slots >= _EMPTY_SLOT:
         raise ValueError("transient storage exceeds the packed slot-index domain")
     route_capacity = 1 << max(1, (slot_count * 2 - 1).bit_length())
-    payload_bytes = slot_count * manifest.row_bytes
-    slot_metadata_bytes = slot_count * _SLOT_METADATA_BYTES
-    route_table_bytes = route_capacity * _ROUTE_ENTRY_BYTES
-    transient_bytes = transient_slots * manifest.row_bytes
-    transient_metadata_bytes = transient_slots
-    total = (
-        payload_bytes
-        + slot_metadata_bytes
-        + route_table_bytes
-        + transient_bytes
-        + transient_metadata_bytes
+    payload_bytes = _checked_mul_bytes(
+        slot_count, manifest.row_bytes, label="cache payload"
     )
+    slot_metadata_bytes = _checked_mul_bytes(
+        slot_count, _SLOT_METADATA_BYTES, label="slot metadata"
+    )
+    route_table_bytes = _checked_mul_bytes(
+        route_capacity, _ROUTE_ENTRY_BYTES, label="route table"
+    )
+    transient_bytes = _checked_mul_bytes(
+        transient_slots, manifest.row_bytes, label="transient buffer"
+    )
+    transient_metadata_bytes = transient_slots
+    slot_backings = tuple(
+        _checked_mul_bytes(slot_count, item_bytes, label="slot metadata backing")
+        for item_bytes in (8, 4, 4, 1, 4, 8)
+    )
+    route_backings = (
+        _checked_mul_bytes(route_capacity, 4, label="route-key backing"),
+        _checked_mul_bytes(route_capacity, 4, label="route-slot backing"),
+    )
+    backing_bytes = (
+        payload_bytes,
+        *slot_backings,
+        *route_backings,
+        transient_bytes,
+        transient_metadata_bytes,
+    )
+    logical_total = _checked_add_bytes(*backing_bytes, label="cache reservation")
+    aligned_total = _checked_add_bytes(
+        *(
+            _aligned_bytes(
+                value,
+                config.allocation_alignment_bytes,
+                label="aligned cache backing",
+            )
+            for value in backing_bytes
+        ),
+        label="aligned cache reservation",
+    )
+    alignment_bytes = aligned_total - logical_total
     return NGramCachePlan(
         requested_payload_bytes=config.cache_limit_bytes,
         payload_bytes=payload_bytes,
@@ -1382,7 +1496,98 @@ def plan_ngram_cache(
         route_table_bytes=route_table_bytes,
         transient_bytes=transient_bytes,
         transient_metadata_bytes=transient_metadata_bytes,
-        total_reserved_bytes=total,
+        alignment_bytes=alignment_bytes,
+        total_reserved_bytes=aligned_total,
+    )
+
+
+def plan_production_ngram_cache(
+    manifest: NGramManifest,
+    budget: NGramRuntimeBudget,
+    *,
+    transient_limit_bytes: int,
+    max_inflight_io_bytes: int,
+    max_open_files: int,
+    bypass_page_cache: bool,
+    eviction: Literal["lru", "frequency"],
+) -> NGramProductionCachePlan:
+    """Solve the largest exact BF16 row cache under the measured runtime budget."""
+
+    if type(manifest) is not NGramManifest:
+        raise TypeError("manifest must be an exact NGramManifest")
+    if manifest.storage != "bf16":
+        raise ValueError("the pinned production n-gram table must remain exact BF16")
+    if type(budget) is not NGramRuntimeBudget:
+        raise TypeError("budget must be an exact NGramRuntimeBudget")
+    fixed_runtime_bytes = _checked_add_bytes(
+        budget.measured_base_residency_bytes,
+        budget.kv_mtp_reserve_bytes,
+        budget.metal_working_reserve_bytes,
+        budget.safety_margin_bytes,
+        label="fixed runtime reservation",
+    )
+    if fixed_runtime_bytes >= budget.target_residency_bytes:
+        raise ValueError("minimum viable n-gram cache and runtime cannot fit")
+    available_cache_bytes = budget.target_residency_bytes - fixed_runtime_bytes
+    payload_formula_ceiling_bytes = min(
+        budget.payload_ceiling_bytes,
+        available_cache_bytes,
+    )
+    rounded_minimum_payload = _checked_add_bytes(
+        budget.minimum_payload_bytes,
+        manifest.row_bytes - 1,
+        label="minimum payload rounding",
+    )
+    minimum_slots = rounded_minimum_payload // manifest.row_bytes
+    maximum_slots = payload_formula_ceiling_bytes // manifest.row_bytes
+    if maximum_slots < minimum_slots:
+        raise ValueError("minimum viable n-gram cache and runtime cannot fit")
+
+    def candidate(slot_count: int) -> tuple[NGramCacheConfig, NGramCachePlan]:
+        config = NGramCacheConfig(
+            cache_limit_bytes=_checked_mul_bytes(
+                slot_count, manifest.row_bytes, label="candidate cache payload"
+            ),
+            transient_limit_bytes=transient_limit_bytes,
+            max_inflight_io_bytes=max_inflight_io_bytes,
+            max_open_files=max_open_files,
+            bypass_page_cache=bypass_page_cache,
+            eviction=eviction,
+            allocation_alignment_bytes=budget.allocation_alignment_bytes,
+        )
+        return config, plan_ngram_cache(manifest, config)
+
+    minimum_config, minimum_plan = candidate(minimum_slots)
+    if minimum_plan.total_reserved_bytes > available_cache_bytes:
+        raise ValueError("minimum viable n-gram cache and runtime cannot fit")
+
+    low = minimum_slots
+    high = maximum_slots
+    selected_config = minimum_config
+    selected_plan = minimum_plan
+    while low <= high:
+        middle = (low + high) // 2
+        config, plan = candidate(middle)
+        if plan.total_reserved_bytes <= available_cache_bytes:
+            selected_config = config
+            selected_plan = plan
+            low = middle + 1
+        else:
+            high = middle - 1
+
+    projected_residency_bytes = _checked_add_bytes(
+        fixed_runtime_bytes,
+        selected_plan.total_reserved_bytes,
+        label="projected runtime residency",
+    )
+    return NGramProductionCachePlan(
+        target_residency_bytes=budget.target_residency_bytes,
+        fixed_runtime_bytes=fixed_runtime_bytes,
+        available_cache_bytes=available_cache_bytes,
+        payload_formula_ceiling_bytes=payload_formula_ceiling_bytes,
+        projected_residency_bytes=projected_residency_bytes,
+        config=selected_config,
+        cache=selected_plan,
     )
 
 
@@ -2733,13 +2938,16 @@ __all__ = [
     "NGramLease",
     "NGramManifest",
     "NGramManifestError",
+    "NGramProductionCachePlan",
     "NGramRowCache",
+    "NGramRuntimeBudget",
     "NGramShard",
     "SlotTicket",
     "VerifiedNGramArtifact",
     "VerifiedNGramShard",
     "load_ngram_manifest",
     "plan_ngram_cache",
+    "plan_production_ngram_cache",
     "qwen38_ngram_manifest",
     "save_ngram_manifest",
     "verify_ngram_manifest",
