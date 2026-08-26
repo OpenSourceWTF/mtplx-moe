@@ -21302,7 +21302,16 @@ def _run_generation(
         request_capture.capture_outcome(
             (request_observability or {}).get("request_id"),
             {
-                "scheduler_lane": "serial",
+                # The solo path serves serial AND hyper-singleton traffic;
+                # mirror the hyper lane stamp instead of mislabeling hyper
+                # capture envelopes as serial. Every other lane keeps the
+                # historical "serial" label byte-for-byte.
+                "scheduler_lane": (
+                    "hyper_singleton"
+                    if (request_observability or {}).get("scheduler_lane")
+                    == "hyper_singleton"
+                    else "serial"
+                ),
                 **request_capture.completion_token_ids(last.get("tokens")),
                 "completion_tokens": last["completion_tokens"],
                 "finish_reason": last.get("finish_reason"),
