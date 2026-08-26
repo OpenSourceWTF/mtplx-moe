@@ -28,23 +28,58 @@ def test_qwen4_production_hot_paths_have_no_validation_walks() -> None:
         if isinstance(node, ast.FunctionDef)
     }
     cache_methods = set(cache_method_nodes)
+    residual_methods = {
+        node.name: node
+        for node in classes["Qwen4GatedResidual"].body
+        if isinstance(node, ast.FunctionDef)
+    }
 
-    assert "_direct_call" in gdn_methods
+    assert "_direct_cached_call" in gdn_methods
     assert "return self._execute(" in ast.unparse(gdn_methods["__call__"])
-    direct_source = ast.unparse(gdn_methods["_direct_call"])
+    direct_source = ast.unparse(gdn_methods["_direct_cached_call"])
     for forbidden in ("_validate", "cache_state.layout"):
         assert forbidden not in direct_source
+    assert "mx.zeros" not in direct_source
+    assert "cache is None" not in direct_source
     assert not any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id in {"isinstance", "type"}
-        for node in ast.walk(gdn_methods["_direct_call"])
+        for node in ast.walk(gdn_methods["_direct_cached_call"])
+    )
+    commit_source = ast.unparse(cache_method_nodes["_commit_gdn_direct"])
+    assert "generation" not in commit_source
+    assert "return self._execute(" in ast.unparse(residual_methods["__call__"])
+    assert not any(
+        isinstance(node, ast.If) for node in ast.walk(residual_methods["__call__"])
     )
     assert "restore" not in cache_methods
     assert "trim" not in cache_methods
     assert not any(
         isinstance(node, (ast.For, ast.While))
         for node in ast.walk(cache_method_nodes["_restore_prebound"])
+    )
+
+
+def test_qwen4_segmented_ngram_reader_is_prebound_before_lookup() -> None:
+    cache_path = ROOT / "mtplx" / "qwen4_ngram.py"
+    tree = ast.parse(cache_path.read_text(encoding="utf-8"))
+    classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+    methods = {
+        node.name: node
+        for node in classes["NGramRowCache"].body
+        if isinstance(node, ast.FunctionDef)
+    }
+
+    constructor = ast.unparse(methods["__init__"])
+    read_publish = ast.unparse(methods["_read_publish"])
+    assert "self._read_group =" in constructor
+    assert "self._read_group(route, offset, length, target)" in read_publish
+    assert "components" not in read_publish
+    assert not any(
+        isinstance(node, ast.If)
+        and "components" in ast.unparse(node.test)
+        for node in ast.walk(methods["_read_publish"])
     )
 
 

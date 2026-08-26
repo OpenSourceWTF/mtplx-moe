@@ -140,7 +140,9 @@ class Qwen4GatedResidual(nn.Module):
         self.input_mix_weight_up = nn.Linear(lowrank, hyper_width, bias=False)
         if use_combine:
             self.block_inject_weight = nn.Linear(hyper_width, self.hc_count, bias=False)
-        self._use_combine = use_combine
+            self._execute = self.read
+        else:
+            self._execute = self._combine
 
     def _mixed_input(self, hyper_input: mx.array) -> tuple[mx.array, mx.array]:
         normalized = self.hc_norm(hyper_input)
@@ -173,8 +175,9 @@ class Qwen4GatedResidual(nn.Module):
         return updated.reshape(*residual.shape)
 
     def __call__(self, x: mx.array):
-        if self._use_combine:
-            return self.read(x)
+        return self._execute(x)
+
+    def _combine(self, x: mx.array) -> mx.array:
         mixed_input, _ = self._mixed_input(x)
         return mixed_input
 
@@ -206,7 +209,6 @@ _CACHE_CONSTRUCTOR = object()
 class _Qwen4CacheSnapshot:
     _owner: object
     _schema: str
-    _generation: int
     _gdn: Mapping[int, _Qwen4GDNCacheState]
     _qsa_layers: tuple[int, ...]
     _restore_bound: Callable[[], None]
@@ -247,7 +249,6 @@ class _Qwen4CacheSnapshot:
 
         digest = hashlib.sha256()
         digest.update(_CACHE_SCHEMA.encode("ascii") + b"\0")
-        digest.update(struct.pack("<q", self._generation))
         digest.update(struct.pack("<q", len(self._qsa_layers)))
         if self._qsa_layers:
             digest.update(struct.pack(f"<{len(self._qsa_layers)}q", *self._qsa_layers))
@@ -304,8 +305,6 @@ class Qwen4Cache:
         if set(gdn_layers).intersection(qsa_layers):
             raise ValueError("gdn_layers and qsa_layers must be disjoint")
         self._owner = object()
-        self._generation = 0
-        self._max_generation = 0
         self._model_args = model_args
         self._request_installed = False
         self._gdn = {layer: _Qwen4GDNCacheState() for layer in gdn_layers}
@@ -457,21 +456,16 @@ class Qwen4Cache:
             offset=current.offset + length,
             layout=current.layout,
         )
-        self._max_generation += 1
-        self._generation = self._max_generation
 
     def _restore_prebound(
         self,
         saved: Mapping[int, _Qwen4GDNCacheState],
-        generation: int,
     ) -> None:
         self._gdn = dict(saved)
-        self._generation = generation
 
     def _trim_prebound(
         self,
         saved: Mapping[int, _Qwen4GDNCacheState],
-        generation: int,
         count: int,
     ) -> None:
         if type(count) is not int or count < 0:
@@ -482,19 +476,17 @@ class Qwen4Cache:
                 raise ValueError(
                     "snapshot does not identify the requested cache suffix"
                 )
-        self._restore_prebound(saved, generation)
+        self._restore_prebound(saved)
 
     def snapshot(self) -> _Qwen4CacheSnapshot:
         saved = MappingProxyType(self._gdn.copy())
-        generation = self._generation
         return _Qwen4CacheSnapshot(
             _owner=self._owner,
             _schema=_CACHE_SCHEMA,
-            _generation=generation,
             _gdn=saved,
             _qsa_layers=tuple(self._qsa),
-            _restore_bound=lambda: self._restore_prebound(saved, generation),
-            _trim_bound=lambda count: self._trim_prebound(saved, generation, count),
+            _restore_bound=lambda: self._restore_prebound(saved),
+            _trim_bound=lambda count: self._trim_prebound(saved, count),
         )
 
 
@@ -593,7 +585,9 @@ class Qwen4GatedDeltaNet(nn.Module):
             self._recurrent = self._ops_recurrence
         else:
             raise ValueError("recurrent_lane must be 'metal' or 'ops'")
-        self._execute = self._validated_call if validate_inputs else self._direct_call
+        self._execute = (
+            self._validated_call if validate_inputs else self._direct_cached_call
+        )
 
         self.in_proj_qkv = nn.Linear(self.hidden_size, self.conv_dim, bias=False)
         self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
@@ -707,35 +701,88 @@ class Qwen4GatedDeltaNet(nn.Module):
         attention_mask: mx.array | None = None,
     ) -> mx.array:
         batch_size, _ = self._validate_inputs(hidden_states, attention_mask)
-        if cache is not None:
-            if type(cache) is not Qwen4Cache:
-                raise TypeError("cache must have exact type Qwen4Cache")
-            cache._install_tiny_layer(
-                self.layer_idx,
-                layout=_Qwen4GDNLayout(
-                    batch_size=batch_size,
-                    conv_tokens=self.conv_kernel_size - 1,
-                    conv_width=self.conv_dim,
-                    conv_dtype=str(hidden_states.dtype),
-                    num_v_heads=self.num_v_heads,
-                    head_v_dim=self.head_v_dim,
-                    head_k_dim=self.head_k_dim,
-                ),
-                conv_dtype=hidden_states.dtype,
+        if cache is None:
+            return self._stateless_call(
+                hidden_states,
+                attention_mask=attention_mask,
             )
-        return self._direct_call(
+        if type(cache) is not Qwen4Cache:
+            raise TypeError("cache must have exact type Qwen4Cache")
+        cache._install_tiny_layer(
+            self.layer_idx,
+            layout=_Qwen4GDNLayout(
+                batch_size=batch_size,
+                conv_tokens=self.conv_kernel_size - 1,
+                conv_width=self.conv_dim,
+                conv_dtype=str(hidden_states.dtype),
+                num_v_heads=self.num_v_heads,
+                head_v_dim=self.head_v_dim,
+                head_k_dim=self.head_k_dim,
+            ),
+            conv_dtype=hidden_states.dtype,
+        )
+        return self._direct_cached_call(
             hidden_states,
             cache=cache,
             attention_mask=attention_mask,
         )
 
-    def _direct_call(
+    def _stateless_call(
         self,
         hidden_states: mx.array,
         *,
-        cache: Qwen4Cache | None = None,
+        attention_mask: mx.array | None,
+    ) -> mx.array:
+        batch_size = hidden_states.shape[0]
+        output, _, _ = self._run_with_states(
+            hidden_states,
+            attention_mask=attention_mask,
+            conv_state=mx.zeros(
+                (batch_size, self.conv_kernel_size - 1, self.conv_dim),
+                dtype=hidden_states.dtype,
+            ),
+            recurrent_state=mx.zeros(
+                (
+                    batch_size,
+                    self.num_v_heads,
+                    self.head_v_dim,
+                    self.head_k_dim,
+                ),
+                dtype=mx.float32,
+            ),
+        )
+        return output
+
+    def _direct_cached_call(
+        self,
+        hidden_states: mx.array,
+        *,
+        cache: Qwen4Cache,
         attention_mask: mx.array | None = None,
     ) -> mx.array:
+        cache_state = cache._gdn[self.layer_idx]
+        output, conv_state, recurrent_state = self._run_with_states(
+            hidden_states,
+            attention_mask=attention_mask,
+            conv_state=cache_state.conv_state,
+            recurrent_state=cache_state.recurrent_state,
+        )
+        cache._commit_gdn_direct(
+            self.layer_idx,
+            conv_state=conv_state,
+            recurrent_state=recurrent_state,
+            length=hidden_states.shape[1],
+        )
+        return output
+
+    def _run_with_states(
+        self,
+        hidden_states: mx.array,
+        *,
+        attention_mask: mx.array | None,
+        conv_state: mx.array,
+        recurrent_state: mx.array,
+    ) -> tuple[mx.array, mx.array, mx.array]:
         batch_size, sequence_length, _ = hidden_states.shape
         if attention_mask is None:
             projection_input = hidden_states
@@ -751,26 +798,6 @@ class Qwen4GatedDeltaNet(nn.Module):
         )
         beta = mx.sigmoid(self.in_proj_b(projection_input))
         a = self.in_proj_a(projection_input).astype(mx.float32)
-
-        if cache is None:
-            cache_state = None
-            conv_state = mx.zeros(
-                (batch_size, self.conv_kernel_size - 1, self.conv_dim),
-                dtype=mixed_qkv.dtype,
-            )
-            recurrent_state = mx.zeros(
-                (
-                    batch_size,
-                    self.num_v_heads,
-                    self.head_v_dim,
-                    self.head_k_dim,
-                ),
-                dtype=mx.float32,
-            )
-        else:
-            cache_state = cache._gdn[self.layer_idx]
-            conv_state = cache_state.conv_state
-            recurrent_state = cache_state.recurrent_state
 
         conv_input = mx.concatenate((conv_state, mixed_qkv), axis=1)
         conv_out = nn.silu(self.conv1d(conv_input))
@@ -817,14 +844,7 @@ class Qwen4GatedDeltaNet(nn.Module):
         )
         recurrent_out = self.norm(recurrent_out.astype(hidden_states.dtype), z)
 
-        if cache_state is not None:
-            cache._commit_gdn_direct(
-                self.layer_idx,
-                conv_state=next_conv_state,
-                recurrent_state=recurrent_state,
-                length=sequence_length,
-            )
-
-        return self.out_proj(
+        output = self.out_proj(
             recurrent_out.reshape(batch_size, sequence_length, self.value_dim)
         )
+        return output, next_conv_state, recurrent_state

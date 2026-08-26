@@ -655,10 +655,12 @@ def test_production_request_install_proves_state_before_direct_execution(
         cache.install_request(batch_size=1, activation_dtype=mx.bfloat16)
 
     call_source = inspect.getsource(Qwen4GatedDeltaNet.__call__)
-    direct_source = inspect.getsource(Qwen4GatedDeltaNet._direct_call)
+    direct_source = inspect.getsource(Qwen4GatedDeltaNet._direct_cached_call)
     assert "return self._execute(" in call_source
     for forbidden in ("_validate", "cache_state.layout"):
         assert forbidden not in direct_source
+    assert "mx.zeros" not in direct_source
+    assert "cache is None" not in direct_source
 
 
 def test_tiny_lane_is_explicit_and_runtime_shapes_are_rejected(mlx_cpu) -> None:
