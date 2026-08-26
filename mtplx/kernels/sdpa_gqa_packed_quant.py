@@ -36,6 +36,24 @@ from .sdpa_gqa_packed import (  # shared, proven pieces
 )
 
 
+def _static_blocks(capacity: int, max_offset: int | None) -> int:
+    """Block-lane count from the STATIC attention ceiling.
+
+    ``capacity`` is the whole allocated seq axis; ``max_offset`` (a compiled
+    verify bucket) tightens the ceiling so small-context buckets keep small
+    partial/reduce shapes and a stable compiled graph. Blocks only set the
+    walk stride, grid size, and reduce width — the walk itself always reads
+    exactly ``offset`` rows, so the math is invariant to this value.
+    """
+    capacity = int(capacity)
+    ceiling = (
+        capacity
+        if max_offset is None
+        else max(1, min(int(max_offset), capacity))
+    )
+    return _blocks_for_capacity(ceiling)
+
+
 @lru_cache(maxsize=None)
 def _quant_partials_kernel():
     if not mx.metal.is_available():
@@ -369,6 +387,7 @@ def sdpa_gqa_packed_tail_quant(
     scale,
     bits: int,
     max_q_len: int = 8,
+    max_offset: int | None = None,
 ):
     """Packed-quant GQA tail attention. Returns None (bail) on contract miss.
 
@@ -376,6 +395,11 @@ def sdpa_gqa_packed_tail_quant(
     q8 or (1, HKV, capacity, D//2) uint8 for q4 (kv_quant even|odd<<4 packing).
     k_scale/v_scale: (1, HKV, capacity, 1) fp32 rowwise. Same whole-buffer
     contract as the bf16 kernel: pass allocated buffers, never sliced views.
+
+    ``offset`` may be an ``mx.array`` scalar (compiled cache state) and
+    ``max_offset`` a static attention ceiling (compiled verify bucket): with
+    both, every host-side value feeding shapes/geometry is static per bucket,
+    so the call is safe inside an ``mx.compile`` graph.
     """
     bits = int(bits)
     if bits not in (8, 4):
@@ -420,7 +444,7 @@ def sdpa_gqa_packed_tail_quant(
             return _bail("offset_range")
         offset_arr = mx.array([offset_int], dtype=mx.int32)
 
-    blocks = _blocks_for_capacity(capacity)
+    blocks = _static_blocks(capacity, max_offset)
     if blocks <= 0 or blocks % 32:
         return _bail("blocks_geometry")
 
