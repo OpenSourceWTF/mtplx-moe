@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -10,6 +11,41 @@ from pathlib import Path
 from mtplx.version import DISPLAY_VERSION, __version__
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_qwen4_production_hot_paths_have_no_validation_walks() -> None:
+    runtime_path = ROOT / "mtplx" / "models" / "qwen4_exp_runtime.py"
+    tree = ast.parse(runtime_path.read_text(encoding="utf-8"))
+    classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+    gdn_methods = {
+        node.name: node
+        for node in classes["Qwen4GatedDeltaNet"].body
+        if isinstance(node, ast.FunctionDef)
+    }
+    cache_method_nodes = {
+        node.name: node
+        for node in classes["Qwen4Cache"].body
+        if isinstance(node, ast.FunctionDef)
+    }
+    cache_methods = set(cache_method_nodes)
+
+    assert "_direct_call" in gdn_methods
+    assert "return self._execute(" in ast.unparse(gdn_methods["__call__"])
+    direct_source = ast.unparse(gdn_methods["_direct_call"])
+    for forbidden in ("_validate", "cache_state.layout"):
+        assert forbidden not in direct_source
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"isinstance", "type"}
+        for node in ast.walk(gdn_methods["_direct_call"])
+    )
+    assert "restore" not in cache_methods
+    assert "trim" not in cache_methods
+    assert not any(
+        isinstance(node, (ast.For, ast.While))
+        for node in ast.walk(cache_method_nodes["_restore_prebound"])
+    )
 
 
 def _block_modules_sitecustomize(modules: tuple[str, ...]) -> str:

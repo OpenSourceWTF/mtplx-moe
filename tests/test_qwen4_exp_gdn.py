@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import hashlib
-from copy import copy
+import inspect
 from dataclasses import dataclass, replace
-from types import MappingProxyType
 
 import mlx.core as mx
 import numpy as np
@@ -363,11 +362,11 @@ def test_gdn_chunk_then_decode_matches_single_pass_and_rolls_back(mlx_cpu) -> No
     advanced = cache.snapshot().digest()
     assert advanced != digest
 
-    cache.restore(snapshot)
+    snapshot.restore()
     assert cache.snapshot().digest() == digest
 
     module(mx.array(hidden_np[:, 7:8]), cache=cache)
-    cache.trim(1, snapshot=snapshot)
+    snapshot.trim(1)
     assert cache.snapshot().digest() == digest
 
 
@@ -562,20 +561,13 @@ def test_bf16_snapshot_digest_uses_raw_bits_and_restores_exactly(mlx_cpu) -> Non
 
     module(hidden[:, 2:], cache=cache)
     assert cache.snapshot().digest() != digest
-    cache.restore(snapshot)
+    snapshot.restore()
 
     assert cache.snapshot().digest() == digest
     assert snapshot.gdn[0].conv_state.dtype == mx.bfloat16
 
 
-def _corrupt_snapshot(snapshot, **changes):
-    corrupted = copy(snapshot)
-    for name, value in changes.items():
-        object.__setattr__(corrupted, name, value)
-    return corrupted
-
-
-def test_snapshot_rejects_foreign_partial_extra_and_malformed_atomically(
+def test_snapshot_restore_is_owner_bound_and_has_no_target_cache_argument(
     mlx_cpu,
 ) -> None:
     config = _TinyConfig()
@@ -586,41 +578,19 @@ def test_snapshot_rejects_foreign_partial_extra_and_malformed_atomically(
     before = snapshot.digest()
 
     foreign = Qwen4Cache.tiny(gdn_layers=(0,), qsa_layers=(3,))
-    with pytest.raises(ValueError, match="owner"):
-        foreign.restore(snapshot)
-    assert foreign.snapshot().digest() != before
+    foreign_before = foreign.snapshot().digest()
+    assert not hasattr(cache, "restore")
+    assert not hasattr(cache, "trim")
+    assert tuple(inspect.signature(snapshot.restore).parameters) == ()
+    assert tuple(inspect.signature(snapshot.trim).parameters) == ("count",)
+    with pytest.raises(TypeError):
+        snapshot.restore(foreign)
+    assert foreign.snapshot().digest() == foreign_before
 
-    malformed = [
-        object(),
-        _corrupt_snapshot(snapshot, _schema="wrong"),
-        _corrupt_snapshot(snapshot, _generation=-1),
-        _corrupt_snapshot(snapshot, _gdn=MappingProxyType({})),
-        _corrupt_snapshot(
-            snapshot,
-            _gdn=MappingProxyType({**snapshot.gdn, 2: snapshot.gdn[0]}),
-        ),
-        _corrupt_snapshot(snapshot, _qsa_layers=()),
-    ]
-    bad_state = copy(snapshot.gdn[0])
-    object.__setattr__(bad_state, "offset", -1)
-    malformed.append(_corrupt_snapshot(snapshot, _gdn=MappingProxyType({0: bad_state})))
-    wrong_dtype = copy(snapshot.gdn[0])
-    object.__setattr__(
-        wrong_dtype,
-        "recurrent_state",
-        snapshot.gdn[0].recurrent_state.astype(mx.float16),
-    )
-    malformed.append(
-        _corrupt_snapshot(snapshot, _gdn=MappingProxyType({0: wrong_dtype}))
-    )
-
-    for candidate in malformed:
-        with pytest.raises((TypeError, ValueError)):
-            cache.restore(candidate)
-        assert cache.snapshot().digest() == before
-        with pytest.raises((TypeError, ValueError)):
-            cache.trim(0, snapshot=candidate)
-        assert cache.snapshot().digest() == before
+    module(mx.ones((1, 1, config.hidden_size)), cache=cache)
+    assert cache.snapshot().digest() != before
+    snapshot.restore()
+    assert cache.snapshot().digest() == before
 
 
 def _model_args() -> ModelArgs:
@@ -662,6 +632,33 @@ def test_production_factory_derives_layer_ownership_and_rejects_qsa_layers() -> 
         Qwen4GatedDeltaNet(args, layer_idx=3)
     with pytest.raises(ValueError, match="range"):
         Qwen4GatedDeltaNet(args, layer_idx=48)
+
+
+def test_production_request_install_proves_state_before_direct_execution(
+    mlx_cpu,
+) -> None:
+    cache = Qwen4Cache.from_model_args(_model_args())
+    with pytest.raises(ValueError, match="batch"):
+        cache.install_request(batch_size=0, activation_dtype=mx.bfloat16)
+    with pytest.raises(ValueError, match="bfloat16"):
+        cache.install_request(batch_size=1, activation_dtype=mx.float16)
+
+    cache.install_request(batch_size=1, activation_dtype=mx.bfloat16)
+    snapshot = cache.snapshot()
+    assert all(state.conv_state is not None for state in snapshot.gdn.values())
+    assert all(state.recurrent_state is not None for state in snapshot.gdn.values())
+    assert all(
+        state.recurrent_state.shape == (1, 48, 128, 128)
+        for state in snapshot.gdn.values()
+    )
+    with pytest.raises(RuntimeError, match="installed"):
+        cache.install_request(batch_size=1, activation_dtype=mx.bfloat16)
+
+    call_source = inspect.getsource(Qwen4GatedDeltaNet.__call__)
+    direct_source = inspect.getsource(Qwen4GatedDeltaNet._direct_call)
+    assert "return self._execute(" in call_source
+    for forbidden in ("_validate", "cache_state.layout"):
+        assert forbidden not in direct_source
 
 
 def test_tiny_lane_is_explicit_and_runtime_shapes_are_rejected(mlx_cpu) -> None:

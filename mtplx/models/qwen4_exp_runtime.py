@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import struct
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -190,20 +190,12 @@ class _Qwen4GDNLayout:
     head_k_dim: int
 
 
-@dataclass
+@dataclass(frozen=True)
 class _Qwen4GDNCacheState:
     conv_state: mx.array | None = None
     recurrent_state: mx.array | None = None
     offset: int = 0
     layout: _Qwen4GDNLayout | None = None
-
-
-@dataclass(frozen=True)
-class _Qwen4GDNCacheSnapshot:
-    conv_state: mx.array | None
-    recurrent_state: mx.array | None
-    offset: int
-    layout: _Qwen4GDNLayout | None
 
 
 _CACHE_SCHEMA = "mtplx-qwen4-cache-v2"
@@ -215,11 +207,13 @@ class _Qwen4CacheSnapshot:
     _owner: object
     _schema: str
     _generation: int
-    _gdn: Mapping[int, _Qwen4GDNCacheSnapshot]
+    _gdn: Mapping[int, _Qwen4GDNCacheState]
     _qsa_layers: tuple[int, ...]
+    _restore_bound: Callable[[], None]
+    _trim_bound: Callable[[int], None]
 
     @property
-    def gdn(self) -> Mapping[int, _Qwen4GDNCacheSnapshot]:
+    def gdn(self) -> Mapping[int, _Qwen4GDNCacheState]:
         return self._gdn
 
     def arrays(self) -> tuple[mx.array, ...]:
@@ -231,6 +225,16 @@ class _Qwen4CacheSnapshot:
             if state.recurrent_state is not None:
                 arrays.append(state.recurrent_state)
         return tuple(arrays)
+
+    def restore(self) -> None:
+        """Apply this snapshot only to the cache owner bound at capture."""
+
+        self._restore_bound()
+
+    def trim(self, count: int) -> None:
+        """Restore an owner-bound suffix after its runtime length is checked."""
+
+        self._trim_bound(count)
 
     def digest(self) -> str:
         """Hash complete raw cache bits for offline diagnostics only.
@@ -283,13 +287,14 @@ def _layer_tuple(name: str, values: object) -> tuple[int, ...]:
 
 
 class Qwen4Cache:
-    """Owner-checked Qwen4 recurrent state and future QSA state."""
+    """Construction-proven Qwen4 request state with owner-bound rollback."""
 
     def __init__(
         self,
         *,
         gdn_layers: tuple[int, ...],
         qsa_layers: tuple[int, ...],
+        model_args: ModelArgs | None,
         _constructor: object,
     ):
         if _constructor is not _CACHE_CONSTRUCTOR:
@@ -301,6 +306,8 @@ class Qwen4Cache:
         self._owner = object()
         self._generation = 0
         self._max_generation = 0
+        self._model_args = model_args
+        self._request_installed = False
         self._gdn = {layer: _Qwen4GDNCacheState() for layer in gdn_layers}
         self._qsa: dict[int, object | None] = {layer: None for layer in qsa_layers}
 
@@ -323,6 +330,7 @@ class Qwen4Cache:
         return cls(
             gdn_layers=gdn_layers,
             qsa_layers=qsa_layers,
+            model_args=args,
             _constructor=_CACHE_CONSTRUCTOR,
         )
 
@@ -336,6 +344,7 @@ class Qwen4Cache:
         return cls(
             gdn_layers=gdn_layers,
             qsa_layers=qsa_layers,
+            model_args=None,
             _constructor=_CACHE_CONSTRUCTOR,
         )
 
@@ -347,162 +356,146 @@ class Qwen4Cache:
     def qsa(self) -> Mapping[int, None]:
         return MappingProxyType(dict.fromkeys(self._qsa))
 
+    def install_request(self, *, batch_size: int, activation_dtype: object) -> None:
+        """Validate and allocate all production GDN state before execution."""
+
+        if self._model_args is None:
+            raise TypeError("tiny caches do not install production requests")
+        if self._request_installed:
+            raise RuntimeError("Qwen4 request state is already installed")
+        if type(batch_size) is not int or batch_size <= 0:
+            raise ValueError("batch size must be a positive exact int")
+        if activation_dtype != mx.bfloat16:
+            raise ValueError("pinned Qwen4 request activation dtype must be bfloat16")
+
+        args = self._model_args
+        key_dim = args.linear_num_key_heads * args.linear_key_head_dim
+        value_dim = args.linear_num_value_heads * args.linear_value_head_dim
+        conv_width = 2 * key_dim + value_dim
+        layout = _Qwen4GDNLayout(
+            batch_size=batch_size,
+            conv_tokens=args.linear_conv_kernel_dim - 1,
+            conv_width=conv_width,
+            conv_dtype=str(activation_dtype),
+            num_v_heads=args.linear_num_value_heads,
+            head_v_dim=args.linear_value_head_dim,
+            head_k_dim=args.linear_key_head_dim,
+        )
+        for layer in self._gdn:
+            self._gdn[layer] = _Qwen4GDNCacheState(
+                conv_state=mx.zeros(
+                    (batch_size, layout.conv_tokens, conv_width),
+                    dtype=activation_dtype,
+                ),
+                recurrent_state=mx.zeros(
+                    (
+                        batch_size,
+                        layout.num_v_heads,
+                        layout.head_v_dim,
+                        layout.head_k_dim,
+                    ),
+                    dtype=mx.float32,
+                ),
+                offset=0,
+                layout=layout,
+            )
+        self._request_installed = True
+
     def _gdn_state(self, layer: int) -> _Qwen4GDNCacheState:
         try:
             return self._gdn[layer]
         except KeyError as exc:
             raise ValueError(f"cache does not own GDN layer {layer}") from exc
 
-    def _commit_gdn(
+    def _install_tiny_layer(
+        self,
+        layer: int,
+        *,
+        layout: _Qwen4GDNLayout,
+        conv_dtype: object,
+    ) -> None:
+        if self._model_args is not None:
+            raise TypeError("production caches must use install_request")
+        current = self._gdn_state(layer)
+        if current.layout is None:
+            if current.conv_state is not None or current.recurrent_state is not None:
+                raise ValueError("cache GDN state is only partially initialized")
+            self._gdn[layer] = _Qwen4GDNCacheState(
+                conv_state=mx.zeros(
+                    (layout.batch_size, layout.conv_tokens, layout.conv_width),
+                    dtype=conv_dtype,
+                ),
+                recurrent_state=mx.zeros(
+                    (
+                        layout.batch_size,
+                        layout.num_v_heads,
+                        layout.head_v_dim,
+                        layout.head_k_dim,
+                    ),
+                    dtype=mx.float32,
+                ),
+                offset=0,
+                layout=layout,
+            )
+        elif current.layout != layout:
+            raise ValueError(
+                "cache batch, dtype, or GDN state layout does not match input"
+            )
+
+    def _commit_gdn_direct(
         self,
         layer: int,
         *,
         conv_state: mx.array,
         recurrent_state: mx.array,
         length: int,
-        layout: _Qwen4GDNLayout,
     ) -> None:
-        current = self._gdn_state(layer)
-        if current.layout is None:
-            current.layout = layout
-        current.conv_state = conv_state
-        current.recurrent_state = recurrent_state
-        current.offset += length
+        current = self._gdn[layer]
+        self._gdn[layer] = _Qwen4GDNCacheState(
+            conv_state=conv_state,
+            recurrent_state=recurrent_state,
+            offset=current.offset + length,
+            layout=current.layout,
+        )
         self._max_generation += 1
         self._generation = self._max_generation
 
-    def snapshot(self) -> _Qwen4CacheSnapshot:
-        return _Qwen4CacheSnapshot(
-            _owner=self._owner,
-            _schema=_CACHE_SCHEMA,
-            _generation=self._generation,
-            _gdn=MappingProxyType(
-                {
-                    layer: _Qwen4GDNCacheSnapshot(
-                        conv_state=state.conv_state,
-                        recurrent_state=state.recurrent_state,
-                        offset=state.offset,
-                        layout=state.layout,
-                    )
-                    for layer, state in self._gdn.items()
-                }
-            ),
-            _qsa_layers=tuple(self._qsa),
-        )
-
-    @staticmethod
-    def _validate_layout(layout: object) -> _Qwen4GDNLayout:
-        if type(layout) is not _Qwen4GDNLayout:
-            raise TypeError("snapshot GDN layout has invalid exact type")
-        integer_fields = (
-            layout.batch_size,
-            layout.conv_tokens,
-            layout.conv_width,
-            layout.num_v_heads,
-            layout.head_v_dim,
-            layout.head_k_dim,
-        )
-        if any(type(value) is not int or value <= 0 for value in integer_fields):
-            raise ValueError(
-                "snapshot GDN layout dimensions must be positive exact ints"
-            )
-        if type(layout.conv_dtype) is not str:
-            raise TypeError("snapshot convolution dtype metadata must be an exact str")
-        return layout
-
-    def _validate_snapshot(
-        self, snapshot: object
-    ) -> Mapping[int, _Qwen4GDNCacheSnapshot]:
-        if type(snapshot) is not _Qwen4CacheSnapshot:
-            raise TypeError("snapshot must have the private exact Qwen4 snapshot type")
-        if snapshot._owner is not self._owner:
-            raise ValueError("snapshot owner does not match this cache")
-        if snapshot._schema != _CACHE_SCHEMA:
-            raise ValueError("snapshot schema does not match this cache")
-        if (
-            type(snapshot._generation) is not int
-            or snapshot._generation < 0
-            or snapshot._generation > self._max_generation
-        ):
-            raise ValueError("snapshot generation is invalid for this cache")
-        if type(snapshot._gdn) is not MappingProxyType:
-            raise TypeError("snapshot GDN mapping must have its private exact type")
-        if set(snapshot._gdn) != set(self._gdn):
-            raise ValueError("snapshot GDN layer keys do not match this cache")
-        if type(snapshot._qsa_layers) is not tuple or snapshot._qsa_layers != tuple(
-            self._qsa
-        ):
-            raise ValueError("snapshot QSA layer keys do not match this cache")
-
-        validated: dict[int, _Qwen4GDNCacheSnapshot] = {}
-        for layer in self._gdn:
-            saved = snapshot._gdn[layer]
-            if type(saved) is not _Qwen4GDNCacheSnapshot:
-                raise TypeError("snapshot GDN state has invalid exact type")
-            if type(saved.offset) is not int or saved.offset < 0:
-                raise ValueError("snapshot GDN offset must be a non-negative exact int")
-            if saved.conv_state is None or saved.recurrent_state is None:
-                if not (
-                    saved.conv_state is None
-                    and saved.recurrent_state is None
-                    and saved.offset == 0
-                    and saved.layout is None
-                ):
-                    raise ValueError("snapshot GDN state is only partially initialized")
-                validated[layer] = saved
-                continue
-            layout = self._validate_layout(saved.layout)
-            if not isinstance(saved.conv_state, mx.array) or not isinstance(
-                saved.recurrent_state, mx.array
-            ):
-                raise TypeError("snapshot GDN arrays must be MLX arrays")
-            if saved.conv_state.shape != (
-                layout.batch_size,
-                layout.conv_tokens,
-                layout.conv_width,
-            ):
-                raise ValueError("snapshot convolution shape does not match metadata")
-            if str(saved.conv_state.dtype) != layout.conv_dtype:
-                raise ValueError("snapshot convolution dtype does not match metadata")
-            if saved.recurrent_state.shape != (
-                layout.batch_size,
-                layout.num_v_heads,
-                layout.head_v_dim,
-                layout.head_k_dim,
-            ):
-                raise ValueError("snapshot recurrent shape does not match metadata")
-            if saved.recurrent_state.dtype != mx.float32:
-                raise ValueError("snapshot recurrent dtype must be float32")
-            validated[layer] = saved
-        return MappingProxyType(validated)
-
-    def _apply_snapshot(
+    def _restore_prebound(
         self,
-        snapshot: _Qwen4CacheSnapshot,
-        validated: Mapping[int, _Qwen4GDNCacheSnapshot],
+        saved: Mapping[int, _Qwen4GDNCacheState],
+        generation: int,
     ) -> None:
-        for layer, saved in validated.items():
-            current = self._gdn[layer]
-            current.conv_state = saved.conv_state
-            current.recurrent_state = saved.recurrent_state
-            current.offset = saved.offset
-            current.layout = saved.layout
-        self._generation = snapshot._generation
+        self._gdn = dict(saved)
+        self._generation = generation
 
-    def restore(self, snapshot: object) -> None:
-        validated = self._validate_snapshot(snapshot)
-        self._apply_snapshot(snapshot, validated)
-
-    def trim(self, count: int, *, snapshot: object) -> None:
+    def _trim_prebound(
+        self,
+        saved: Mapping[int, _Qwen4GDNCacheState],
+        generation: int,
+        count: int,
+    ) -> None:
         if type(count) is not int or count < 0:
             raise ValueError("trim count must be a non-negative exact int")
-        validated = self._validate_snapshot(snapshot)
-        for layer, current in self._gdn.items():
-            if current.offset - validated[layer].offset != count:
+        if saved:
+            reference = next(iter(saved))
+            if self._gdn[reference].offset - saved[reference].offset != count:
                 raise ValueError(
                     "snapshot does not identify the requested cache suffix"
                 )
-        self._apply_snapshot(snapshot, validated)
+        self._restore_prebound(saved, generation)
+
+    def snapshot(self) -> _Qwen4CacheSnapshot:
+        saved = MappingProxyType(self._gdn.copy())
+        generation = self._generation
+        return _Qwen4CacheSnapshot(
+            _owner=self._owner,
+            _schema=_CACHE_SCHEMA,
+            _generation=generation,
+            _gdn=saved,
+            _qsa_layers=tuple(self._qsa),
+            _restore_bound=lambda: self._restore_prebound(saved, generation),
+            _trim_bound=lambda count: self._trim_prebound(saved, generation, count),
+        )
 
 
 class Qwen4GatedDeltaNet(nn.Module):
@@ -528,7 +521,12 @@ class Qwen4GatedDeltaNet(nn.Module):
         )
         if topology != (16, 48, 128, 128, 4):
             raise ValueError("production GDN topology does not match pinned ModelArgs")
-        self._install(config, layer_idx=layer_idx, recurrent_lane="metal")
+        self._install(
+            config,
+            layer_idx=layer_idx,
+            recurrent_lane="metal",
+            validate_inputs=False,
+        )
 
     @classmethod
     def tiny(
@@ -544,7 +542,12 @@ class Qwen4GatedDeltaNet(nn.Module):
             raise TypeError("recurrent_lane must have exact type str")
         module = cls.__new__(cls)
         nn.Module.__init__(module)
-        module._install(config, layer_idx=layer_idx, recurrent_lane=recurrent_lane)
+        module._install(
+            config,
+            layer_idx=layer_idx,
+            recurrent_lane=recurrent_lane,
+            validate_inputs=True,
+        )
         return module
 
     def _install(
@@ -553,6 +556,7 @@ class Qwen4GatedDeltaNet(nn.Module):
         *,
         layer_idx: int,
         recurrent_lane: str,
+        validate_inputs: bool,
     ) -> None:
         if type(layer_idx) is not int or layer_idx < 0:
             raise ValueError("layer_idx must be a non-negative exact int")
@@ -589,6 +593,7 @@ class Qwen4GatedDeltaNet(nn.Module):
             self._recurrent = self._ops_recurrence
         else:
             raise ValueError("recurrent_lane must be 'metal' or 'ops'")
+        self._execute = self._validated_call if validate_inputs else self._direct_call
 
         self.in_proj_qkv = nn.Linear(self.hidden_size, self.conv_dim, bias=False)
         self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
@@ -688,9 +693,50 @@ class Qwen4GatedDeltaNet(nn.Module):
         cache: Qwen4Cache | None = None,
         attention_mask: mx.array | None = None,
     ) -> mx.array:
-        batch_size, sequence_length = self._validate_inputs(
-            hidden_states, attention_mask
+        return self._execute(
+            hidden_states,
+            cache=cache,
+            attention_mask=attention_mask,
         )
+
+    def _validated_call(
+        self,
+        hidden_states: mx.array,
+        *,
+        cache: Qwen4Cache | None = None,
+        attention_mask: mx.array | None = None,
+    ) -> mx.array:
+        batch_size, _ = self._validate_inputs(hidden_states, attention_mask)
+        if cache is not None:
+            if type(cache) is not Qwen4Cache:
+                raise TypeError("cache must have exact type Qwen4Cache")
+            cache._install_tiny_layer(
+                self.layer_idx,
+                layout=_Qwen4GDNLayout(
+                    batch_size=batch_size,
+                    conv_tokens=self.conv_kernel_size - 1,
+                    conv_width=self.conv_dim,
+                    conv_dtype=str(hidden_states.dtype),
+                    num_v_heads=self.num_v_heads,
+                    head_v_dim=self.head_v_dim,
+                    head_k_dim=self.head_k_dim,
+                ),
+                conv_dtype=hidden_states.dtype,
+            )
+        return self._direct_call(
+            hidden_states,
+            cache=cache,
+            attention_mask=attention_mask,
+        )
+
+    def _direct_call(
+        self,
+        hidden_states: mx.array,
+        *,
+        cache: Qwen4Cache | None = None,
+        attention_mask: mx.array | None = None,
+    ) -> mx.array:
+        batch_size, sequence_length, _ = hidden_states.shape
         if attention_mask is None:
             projection_input = hidden_states
         else:
@@ -706,15 +752,6 @@ class Qwen4GatedDeltaNet(nn.Module):
         beta = mx.sigmoid(self.in_proj_b(projection_input))
         a = self.in_proj_a(projection_input).astype(mx.float32)
 
-        expected_layout = _Qwen4GDNLayout(
-            batch_size=batch_size,
-            conv_tokens=self.conv_kernel_size - 1,
-            conv_width=self.conv_dim,
-            conv_dtype=str(mixed_qkv.dtype),
-            num_v_heads=self.num_v_heads,
-            head_v_dim=self.head_v_dim,
-            head_k_dim=self.head_k_dim,
-        )
         if cache is None:
             cache_state = None
             conv_state = mx.zeros(
@@ -731,38 +768,9 @@ class Qwen4GatedDeltaNet(nn.Module):
                 dtype=mx.float32,
             )
         else:
-            if type(cache) is not Qwen4Cache:
-                raise TypeError("cache must have exact type Qwen4Cache")
-            cache_state = cache._gdn_state(self.layer_idx)
-            if cache_state.conv_state is None:
-                if (
-                    cache_state.recurrent_state is not None
-                    or cache_state.layout is not None
-                ):
-                    raise ValueError("cache GDN state is only partially initialized")
-                conv_state = mx.zeros(
-                    (batch_size, self.conv_kernel_size - 1, self.conv_dim),
-                    dtype=mixed_qkv.dtype,
-                )
-                recurrent_state = mx.zeros(
-                    (
-                        batch_size,
-                        self.num_v_heads,
-                        self.head_v_dim,
-                        self.head_k_dim,
-                    ),
-                    dtype=mx.float32,
-                )
-            else:
-                if (
-                    cache_state.recurrent_state is None
-                    or cache_state.layout != expected_layout
-                ):
-                    raise ValueError(
-                        "cache batch, dtype, or GDN state layout does not match input"
-                    )
-                conv_state = cache_state.conv_state
-                recurrent_state = cache_state.recurrent_state
+            cache_state = cache._gdn[self.layer_idx]
+            conv_state = cache_state.conv_state
+            recurrent_state = cache_state.recurrent_state
 
         conv_input = mx.concatenate((conv_state, mixed_qkv), axis=1)
         conv_out = nn.silu(self.conv1d(conv_input))
@@ -810,12 +818,11 @@ class Qwen4GatedDeltaNet(nn.Module):
         recurrent_out = self.norm(recurrent_out.astype(hidden_states.dtype), z)
 
         if cache_state is not None:
-            cache._commit_gdn(
+            cache._commit_gdn_direct(
                 self.layer_idx,
                 conv_state=next_conv_state,
                 recurrent_state=recurrent_state,
                 length=sequence_length,
-                layout=expected_layout,
             )
 
         return self.out_proj(
