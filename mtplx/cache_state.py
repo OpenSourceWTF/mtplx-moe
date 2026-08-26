@@ -2980,6 +2980,8 @@ class TensorOffsetVllmMetalPagedKVCache:
         impl_override: str | None = None,
     ):
         del impl_override
+        import mlx.core as mx
+
         if int(sliding_window) > 0:
             return None
         if int(queries.shape[0]) != 1:
