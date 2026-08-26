@@ -152,6 +152,10 @@ def test_hit_resolves_with_next_round_run_capped_at_window() -> None:
     assert snap["bins"]["hits"]["d2"][1] == 1
     assert snap["bins"]["saved_lo"]["d2"][1] == 2
     assert snap["bins"]["saved_hi"]["d2"][1] == 3
+    # Extended-window estimator: 1 + a' = 4, uncapped by h.
+    assert snap["bins"]["saved_ext"]["d2"][1] == 4
+    assert by_t[0.2]["first_saved_tokens_ext"] == 4
+    assert by_t[0.2]["at_rejection_ev_tokens_per_round_ext"] == pytest.approx(2.0)
 
 
 def test_short_next_run_bounds_saved() -> None:
@@ -191,6 +195,9 @@ def test_deepest_position_hit_saves_nothing() -> None:
     assert by_t[0.2]["first_saved_tokens_lo"] == 0
     assert by_t[0.2]["first_saved_tokens_hi"] == 0
     assert snap["bins"]["saved_lo"]["d3"][1] == 0
+    # The extended-window tree still prices the deepest fork: 1 + a' = 4.
+    assert by_t[0.2]["first_saved_tokens_ext"] == 4
+    assert snap["bins"]["saved_ext"]["d3"][1] == 4
 
 
 def test_zero_draft_round_resolves_pending_with_zero_run() -> None:
@@ -350,7 +357,36 @@ def test_finalize_resolves_dangling_pending_to_zero() -> None:
     # The stream ended: nothing followed to save. Hit stays counted.
     assert by_t[0.2]["first_hits"] == 1
     assert by_t[0.2]["first_saved_tokens_lo"] == 0
+    assert by_t[0.2]["first_saved_tokens_ext"] == 0
     assert snap["bins"]["saved_lo"]["d2"][1] == 0
+    assert snap["bins"]["saved_ext"]["d2"][1] == 0
+
+
+def test_unconditioned_anchor_reproduces_delta_baseline_shape() -> None:
+    rec = ForkEVRecorder()
+    # Two margined rejections: depth-2 hit (h=2, a'=3) and depth-1 miss.
+    hit_round(rec, attempted=4, rejection_index=1, margin=0.15)
+    quiet_round(rec, attempted=4, accepted=3)  # resolves lo=2 hi=3 ext=4
+    probs = [dist_with_margin(0.9, top1=1, top2=2)]
+    rec.observe_round(
+        draft_probs=probs,
+        attempted=1,
+        accepted=0,
+        rejection_index=0,
+        correction=999,  # miss
+    )
+    snap = rec.snapshot()
+    anchor = snap["unconditioned"]
+    assert anchor["rejections_with_margin"] == 2
+    assert anchor["hits"] == 1
+    assert anchor["hit_rate"] == pytest.approx(0.5)
+    assert anchor["hit_rate_by_depth"] == {
+        "d1": pytest.approx(0.0),
+        "d2": pytest.approx(1.0),
+    }
+    assert anchor["saved_tokens_lo"] == 2
+    assert anchor["saved_tokens_ext"] == 4
+    assert anchor["ev_tokens_per_round_lo"] == pytest.approx(2 / 3)
 
 
 def test_finalize_is_idempotent() -> None:

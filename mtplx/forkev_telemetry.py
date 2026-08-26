@@ -52,10 +52,10 @@ residual-sampled correction c, round ends.
   that exact state. Known bias: a' is measured at shallow MTP depths (1..K')
   while branch2's continuation sits at deeper recursive depths (r+1..K)
   where acceptance decays, so a' over-estimates j.
-* Estimators (both streamed):
+* Estimators (all streamed):
     - ``saved_hi = 0 if h == 0 else 1 + min(a', h)``
-      the true tree shape (run proxy + terminal token, <= h+1). Upper
-      bracket.
+      the true same-depth tree shape (run proxy + terminal token, <= h+1).
+      Upper bracket of the same-depth pair.
     - ``saved_lo = 0 if h == 0 else 1 + min(a', h - 1)``   [PRIMARY]
       keeps the structural +1 — the row after c2 is in the forward and is
       exactly the row the linear lane's next-round primary samples, so
@@ -63,8 +63,18 @@ residual-sampled correction c, round ends.
       burns one continuation slot: forgoes the leaf bonus and tightens the
       depth-mismatched run proxy by one. Bound: ``saved_lo <= h = K - r``
       ("a fork can never save more than the slots it had").
+    - ``saved_ext = 1 + a'``  (EXTENDED-window tree)
+      report 6 §14 prices branch2 with its OWN continuation budget beyond
+      the linear chain (NAX flattens M so wider/deeper verify is near-free:
+      "branch-2 budget-4", QL9/D8). Under budget >= a'+1 the branch chain
+      commits its proxied run plus one terminal token, uncapped by h. This
+      is the estimator the deepest-fork economics need — under the
+      same-depth cap a depth-K rejection (the HIGHEST hit-rate cell, Δ3
+      = .429) prices at zero by construction. Assumes the branch budget
+      covers the observed run; the same-depth pair brackets from below.
 * h == 0 (rejection at the deepest draft position): a same-depth tree has no
-  continuation slots there — saved = 0 even on a hit.
+  continuation slots there — saved_lo = saved_hi = 0 even on a hit;
+  saved_ext still prices it.
 * Resolution timing: saved needs a', so a hit parks a pending record resolved
   by the next observed round. A pending still open at generation end
   resolves to saved = 0 (the stream ended; nothing followed to save) and is
@@ -137,10 +147,12 @@ class _PolicyCell:
         "first_hits",
         "first_saved_lo",
         "first_saved_hi",
+        "first_saved_ext",
         "at_rejection_forks",
         "at_rejection_hits",
         "at_rejection_saved_lo",
         "at_rejection_saved_hi",
+        "at_rejection_saved_ext",
     )
 
     def __init__(self, threshold: float) -> None:
@@ -150,10 +162,12 @@ class _PolicyCell:
         self.first_hits = 0
         self.first_saved_lo = 0
         self.first_saved_hi = 0
+        self.first_saved_ext = 0
         self.at_rejection_forks = 0
         self.at_rejection_hits = 0
         self.at_rejection_saved_lo = 0
         self.at_rejection_saved_hi = 0
+        self.at_rejection_saved_ext = 0
 
 
 class _Pending:
@@ -210,6 +224,7 @@ class ForkEVRecorder:
         self._bin_hits: dict[int, list[int]] = {}
         self._bin_saved_lo: dict[int, list[int]] = {}
         self._bin_saved_hi: dict[int, list[int]] = {}
+        self._bin_saved_ext: dict[int, list[int]] = {}
 
     # ------------------------------------------------------------------ setup
     @classmethod
@@ -370,14 +385,18 @@ class ForkEVRecorder:
         else:
             saved_lo = 1 + min(a_next, h - 1)
             saved_hi = 1 + min(a_next, h)
+        saved_ext = 1 + a_next
         self._bin_row(self._bin_saved_lo, pending.depth)[pending.decile] += saved_lo
         self._bin_row(self._bin_saved_hi, pending.depth)[pending.decile] += saved_hi
+        self._bin_row(self._bin_saved_ext, pending.depth)[pending.decile] += saved_ext
         for t_index in pending.first_matched:
             self.policy[t_index].first_saved_lo += saved_lo
             self.policy[t_index].first_saved_hi += saved_hi
+            self.policy[t_index].first_saved_ext += saved_ext
         for t_index in pending.any_matched:
             self.policy[t_index].at_rejection_saved_lo += saved_lo
             self.policy[t_index].at_rejection_saved_hi += saved_hi
+            self.policy[t_index].at_rejection_saved_ext += saved_ext
 
     # --------------------------------------------------------------- finalize
     def finalize(self) -> None:
@@ -393,6 +412,7 @@ class ForkEVRecorder:
             # itself stays counted in hits / *_hits.
             self._bin_row(self._bin_saved_lo, pending.depth)[pending.decile] += 0
             self._bin_row(self._bin_saved_hi, pending.depth)[pending.decile] += 0
+            self._bin_row(self._bin_saved_ext, pending.depth)[pending.decile] += 0
 
     # --------------------------------------------------------------- snapshot
     @staticmethod
@@ -420,11 +440,15 @@ class ForkEVRecorder:
                     ),
                     "first_saved_tokens_lo": cell.first_saved_lo,
                     "first_saved_tokens_hi": cell.first_saved_hi,
+                    "first_saved_tokens_ext": cell.first_saved_ext,
                     "first_ev_tokens_per_round_lo": self._rate(
                         cell.first_saved_lo, rounds
                     ),
                     "first_ev_tokens_per_round_hi": self._rate(
                         cell.first_saved_hi, rounds
+                    ),
+                    "first_ev_tokens_per_round_ext": self._rate(
+                        cell.first_saved_ext, rounds
                     ),
                     "at_rejection_forks": cell.at_rejection_forks,
                     "at_rejection_hits": cell.at_rejection_hits,
@@ -433,17 +457,57 @@ class ForkEVRecorder:
                     ),
                     "at_rejection_saved_tokens_lo": cell.at_rejection_saved_lo,
                     "at_rejection_saved_tokens_hi": cell.at_rejection_saved_hi,
+                    "at_rejection_saved_tokens_ext": cell.at_rejection_saved_ext,
                     "at_rejection_ev_tokens_per_round_lo": self._rate(
                         cell.at_rejection_saved_lo, rounds
                     ),
                     "at_rejection_ev_tokens_per_round_hi": self._rate(
                         cell.at_rejection_saved_hi, rounds
                     ),
+                    "at_rejection_ev_tokens_per_round_ext": self._rate(
+                        cell.at_rejection_saved_ext, rounds
+                    ),
                 }
             )
 
         def _bins(table: dict[int, list[int]]) -> dict[str, list[int]]:
             return {f"d{depth}": list(row) for depth, row in sorted(table.items())}
+
+        # Unconditioned anchor: the SAME accounting summed over every binned
+        # rejection regardless of margin — must reproduce the Δ-telemetry
+        # baseline (report 6 §3's +6.8% input) from the same run before the
+        # conditioned rows are trusted.
+        binned_rejections = sum(sum(row) for row in self._bin_rejections.values())
+        unconditioned = {
+            "rejections_with_margin": binned_rejections,
+            "hits": self.hits,
+            "hit_rate": self._rate(self.hits, binned_rejections),
+            "hit_rate_by_depth": {
+                f"d{depth}": self._rate(
+                    sum(self._bin_hits.get(depth, [0])),
+                    sum(row),
+                )
+                for depth, row in sorted(self._bin_rejections.items())
+            },
+            "saved_tokens_lo": sum(
+                sum(row) for row in self._bin_saved_lo.values()
+            ),
+            "saved_tokens_hi": sum(
+                sum(row) for row in self._bin_saved_hi.values()
+            ),
+            "saved_tokens_ext": sum(
+                sum(row) for row in self._bin_saved_ext.values()
+            ),
+        }
+        unconditioned["ev_tokens_per_round_lo"] = self._rate(
+            unconditioned["saved_tokens_lo"], rounds
+        )
+        unconditioned["ev_tokens_per_round_hi"] = self._rate(
+            unconditioned["saved_tokens_hi"], rounds
+        )
+        unconditioned["ev_tokens_per_round_ext"] = self._rate(
+            unconditioned["saved_tokens_ext"], rounds
+        )
 
         return {
             "enabled": True,
@@ -455,6 +519,7 @@ class ForkEVRecorder:
             "pending_unresolved": self.pending_unresolved,
             "errors": self.errors,
             "thresholds": list(self.thresholds),
+            "unconditioned": unconditioned,
             "policy": policy_rows,
             "bins": {
                 "positions": _bins(self._positions),
@@ -462,6 +527,7 @@ class ForkEVRecorder:
                 "hits": _bins(self._bin_hits),
                 "saved_lo": _bins(self._bin_saved_lo),
                 "saved_hi": _bins(self._bin_saved_hi),
+                "saved_ext": _bins(self._bin_saved_ext),
             },
         }
 
@@ -477,10 +543,12 @@ class ForkEVRecorder:
         for cell in self.policy:
             fire = self._rate(cell.fired_rounds, self.rounds)
             hit = self._rate(cell.at_rejection_hits, cell.at_rejection_forks)
-            ev = self._rate(cell.at_rejection_saved_lo, self.rounds)
+            ev_lo = self._rate(cell.at_rejection_saved_lo, self.rounds)
+            ev_ext = self._rate(cell.at_rejection_saved_ext, self.rounds)
             parts.append(
                 f"T={cell.threshold:g}:fire={fire if fire is None else round(fire, 4)}"
                 f",hit={hit if hit is None else round(hit, 4)}"
-                f",ev_lo={ev if ev is None else round(ev, 4)}"
+                f",ev_lo={ev_lo if ev_lo is None else round(ev_lo, 4)}"
+                f",ev_ext={ev_ext if ev_ext is None else round(ev_ext, 4)}"
             )
         return " ".join(parts)
