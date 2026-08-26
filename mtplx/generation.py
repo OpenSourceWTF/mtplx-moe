@@ -8320,8 +8320,13 @@ def generate_mtpk(
     ccopy_index = None
     ccopy_k = context_copy_block_k()
     ccopy_min_ext = context_copy_min_ext()
+    ccopy_ng_min = context_copy_ng_min()
+    ccopy_ng_max = context_copy_ng_max()
+    # Bank-route v2: one-time (per generation) opt-in extended-window prewarm
+    # trigger; see the block-round dispatch site.
+    _cc_bank_prewarmed = False
     if ccopy_active:
-        ccopy_index = NgramIndex(context_copy_ng_min(), context_copy_ng_max())
+        ccopy_index = NgramIndex(ccopy_ng_min, ccopy_ng_max)
         # Prompt-lookup semantics: the index covers the PROMPT only. Matches into
         # the model's own generated text (self-repetition) tend to have weak
         # continuation predictiveness and can cost more to verify than they commit,
@@ -8675,13 +8680,36 @@ def generate_mtpk(
                 and compiled_verify_bank is not None
                 and _env_truthy("MTPLX_CCOPY_BANK_ROUTE")
             )
-            if _cc_bank_route:
-                # Bank-routed copy blocks (2026-08-25 flat-decode): the compiled
-                # verify bank only traces windows up to max_verify_len rows, so
-                # the block is capped to fit. Receipts: eager block verify costs
-                # ~380ms FLAT in T at 88k vs ~137ms through the bank — a short
-                # banked block beats any eager block for nacc <= ~14.
-                _cc_block = _cc_block[: max(1, int(compiled_verify_bank.max_verify_len) - 1)]
+            # Bank-routed copy blocks v2 (2026-08-26, HYPER-PLAN 0.2): dispatch
+            # the block at its NATIVE ladder length through the compiled bank's
+            # extended window — routing only, the proposal is byte-unchanged.
+            # v1 capped the block to the bank's MTP window (<=5 tokens), which
+            # changed the trajectory (different acceptance stream) and made
+            # short blocks re-probe more; it was falsified as a net win
+            # (MEASUREMENTS 2026-08-25 12:05, 13.97 vs 16.08 tps). The eager
+            # block forward costs ~380 ms FLAT in T at 88k (eager-graph
+            # pathology; MEASUREMENTS 2026-08-25 11:26) vs ~137 ms through the
+            # compiled path; the bank refuses ineligible calls internally and
+            # its fallback is the identical runtime forward with the same
+            # capture backend, so the route is pure dispatch cost either way.
+            if _cc_bank_route and not _cc_bank_prewarmed:
+                _cc_bank_prewarmed = True
+                if _env_truthy("MTPLX_CCOPY_BANK_PREWARM"):
+                    # Opt-in: pay each ladder length's one-time mx.compile
+                    # trace here (once per process — shared traces) so A/B
+                    # cells measure steady-state block rounds, not first-trace
+                    # spikes. Ext domain mirrors NgramIndex.find.
+                    _cc_ladder = sorted(
+                        {
+                            1 + block_for_ext(_cc_e, ccopy_k)
+                            for _cc_e in range(
+                                0, max(0, ccopy_ng_max - ccopy_ng_min) + 1
+                            )
+                        }
+                    )
+                    compiled_verify_bank.prewarm_extended_lengths(
+                        cache, _cc_ladder, hidden_variant=base_hidden_variant
+                    )
             if _cc_block:
                 _cc_T = 1 + len(_cc_block)
                 _cc_before = None
@@ -8689,15 +8717,29 @@ def generate_mtpk(
                     started = time.perf_counter()
                     _cc_before = snapshot_untrimmable_cache(cache)
                     snapshot_time += time.perf_counter() - started
+                _cc_prof = _env_truthy("MTPLX_CCOPY_PROF")
+                _cc_stats_before = None
+                if _cc_prof and _cc_bank_route:
+                    _cc_stats_before = (
+                        int(compiled_verify_bank.stats["traces"]),
+                        int(compiled_verify_bank.stats["fallback_calls"]),
+                        dict(compiled_verify_bank.stats["fallback_reasons"]),
+                    )
                 started_forward = time.perf_counter()
                 with attention_phase("decode_verify"):
                     if _cc_bank_route:
+                        # Native-length dispatch; the bank's extended window
+                        # accepts T up to MTPLX_CCOPY_BANK_MAX_LEN and falls
+                        # back internally (same runtime forward, same capture
+                        # backend — byte-identical to the eager branch) when
+                        # a gate refuses.
                         _cc_logits, _cc_hidden, _cc_captures = (
                             compiled_verify_bank.forward_ar_capture(
                                 mx.array([[primary] + _cc_block]),
                                 cache=cache,
                                 return_hidden=True,
                                 hidden_variant=base_hidden_variant,
+                                extended_window=True,
                             )
                         )
                     else:
@@ -8782,13 +8824,47 @@ def generate_mtpk(
                         cache, _cc_captures, keep_tokens=_cc_m, verified_tokens=_cc_T,
                     )
                     capture_commit_time += time.perf_counter() - started_commit
-                if _env_truthy("MTPLX_CCOPY_PROF"):
+                if _cc_prof:
+                    # Route attribution (v2): which dispatch served the round,
+                    # whether this call paid a fresh mx.compile trace (the
+                    # first-call-per-length cost that looked like a recurring
+                    # "~240ms/call dispatch tax" in the v1 cell), and the
+                    # bank's refusal reason when it fell back eager.
+                    if _cc_stats_before is not None:
+                        _cc_dtraces = (
+                            int(compiled_verify_bank.stats["traces"])
+                            - _cc_stats_before[0]
+                        )
+                        _cc_fell_back = (
+                            int(compiled_verify_bank.stats["fallback_calls"])
+                            - _cc_stats_before[1]
+                        ) > 0
+                        _cc_fb_reason = "-"
+                        if _cc_fell_back:
+                            _cc_after = compiled_verify_bank.stats[
+                                "fallback_reasons"
+                            ]
+                            _cc_fb_reason = ",".join(
+                                sorted(
+                                    reason
+                                    for reason, count in _cc_after.items()
+                                    if count > _cc_stats_before[2].get(reason, 0)
+                                )
+                            ) or "-"
+                        _cc_route = (
+                            f"bank_eager:{_cc_fb_reason}"
+                            if _cc_fell_back
+                            else f"bank dtrace={_cc_dtraces}"
+                        )
+                    else:
+                        _cc_route = "eager"
                     print(
                         f"[ccopy-prof] T={_cc_T} nacc={_cc_nacc} "
                         f"build={1000*(_cc_t_build-started_forward):.1f} "
                         f"eval={1000*(_cc_t_eval-_cc_t_build):.1f} "
                         f"accept={1000*(_cc_t_accept-_cc_t_eval):.1f} "
-                        f"commit={1000*(time.perf_counter()-_cc_t_accept):.1f}",
+                        f"commit={1000*(time.perf_counter()-_cc_t_accept):.1f} "
+                        f"route={_cc_route}",
                         file=sys.stderr, flush=True,
                     )
                 if not _cc_ok:
