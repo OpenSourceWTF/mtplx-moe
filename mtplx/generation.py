@@ -877,17 +877,59 @@ def _sustained_prefill_layout() -> str:
     if paged_kv_quant_mode_from_env() != "off":
         return "contiguous_then_repage"
     context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
-    dense_max = _env_int("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", 131072)
+    dense_max = _dense_decode_max_context()
     if context_tokens > 0 and context_tokens <= dense_max:
         return "contiguous_dense_decode"
     return "contiguous_then_repage"
+
+
+def _dense_decode_max_context() -> int:
+    """Context ceiling for the contiguous-dense-decode layout (tokens).
+
+    Past it the auto layout repages decode to the paged cache class, whose
+    verify path cannot use the packed fast lane — the 147.4k decode cliff
+    (MEASUREMENTS 2026-08-26 07:58: 12.0 -> 16.3/18.4 tok/s once decode
+    stays dense). The 131072 literal is NOT a kernel envelope; it is a
+    memory-budget guess from the v0.2 QA pass. "auto" replaces the guess
+    with the actual budget: the dense KV slab for one request must fit in a
+    bounded slice of machine RAM. Adoption of "auto" as the shipped default
+    is a profile decision, not this helper's.
+    """
+    raw = (
+        os.environ.get("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT") or ""
+    ).strip().lower()
+    if raw == "auto":
+        # Dense KV bytes per token of context. 65536 = Qwen3.8-27B truth
+        # (16 full-attn layers x K+V x 4 kv heads x D256 x bf16); model
+        # repos with other geometry set the env alongside their config.
+        bytes_per_token = max(
+            1, _env_int("MTPLX_DENSE_KV_BYTES_PER_TOKEN", 65536)
+        )
+        ram_fraction = max(
+            1, min(50, _env_int("MTPLX_DENSE_DECODE_RAM_PERCENT", 15))
+        )
+        try:
+            total_ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        except (ValueError, OSError, AttributeError):
+            return 131072
+        budget_tokens = int(total_ram * ram_fraction / 100) // bytes_per_token
+        window = _env_int("MTPLX_CONTEXT_WINDOW_TOKENS", 0)
+        if window > 0:
+            budget_tokens = min(budget_tokens, window)
+        return max(131072, budget_tokens)
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            return 131072
+    return 131072
 
 
 def _defer_verify_hidden_eval_enabled() -> bool:
     raw = (os.environ.get("MTPLX_DEFER_VERIFY_HIDDEN_EVAL") or "").strip().lower()
     if raw == "auto":
         context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
-        dense_max = _env_int("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", 131072)
+        dense_max = _dense_decode_max_context()
         return context_tokens > 0 and context_tokens <= dense_max
     return _env_truthy("MTPLX_DEFER_VERIFY_HIDDEN_EVAL")
 
