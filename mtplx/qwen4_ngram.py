@@ -1606,8 +1606,16 @@ class _PageCachePolicyError(NGramCacheIOError):
         self.rollback_failed = rollback_failed
 
 
+@dataclass(slots=True)
+class _PageCacheInstallState:
+    rollback_failed: bool = False
+    rollback_detail: str = ""
+
+
 def _install_page_cache_policy(
-    routes: tuple[_InstalledNGramShard, ...], bypass_page_cache: bool
+    routes: tuple[_InstalledNGramShard, ...],
+    bypass_page_cache: bool,
+    state: _PageCacheInstallState,
 ) -> bool:
     if not bypass_page_cache:
         return False
@@ -1622,20 +1630,25 @@ def _install_page_cache_policy(
     try:
         for route in routes:
             descriptor = route.retained.fileno()
-            fcntl.fcntl(descriptor, command, 1)
             installed.append(descriptor)
-    except (NGramManifestError, OSError, TypeError, ValueError) as exc:
-        rollback_error: Exception | None = None
+            fcntl.fcntl(descriptor, command, 1)
+    except BaseException as exc:
+        rollback_error: BaseException | None = None
         for descriptor in reversed(installed):
             try:
                 fcntl.fcntl(descriptor, command, 0)
-            except (OSError, TypeError, ValueError) as rollback_exc:
-                rollback_error = rollback_exc
+            except BaseException as rollback_exc:  # noqa: BLE001 - try every FD
+                if rollback_error is None:
+                    rollback_error = rollback_exc
         suffix = "" if rollback_error is None else f"; rollback failed: {rollback_error}"
-        raise _PageCachePolicyError(
-            f"could not install F_NOCACHE on retained n-gram shards: {exc}{suffix}",
-            rollback_failed=rollback_error is not None,
-        ) from exc
+        state.rollback_failed = rollback_error is not None
+        state.rollback_detail = suffix
+        if isinstance(exc, Exception):
+            raise _PageCachePolicyError(
+                f"could not install F_NOCACHE on retained n-gram shards: {exc}{suffix}",
+                rollback_failed=rollback_error is not None,
+            ) from exc
+        raise
     return True
 
 
@@ -1646,16 +1659,21 @@ def _restore_page_cache_policy(
         return
     assert fcntl is not None
     command = fcntl.F_NOCACHE
-    first_error: str | None = None
+    first_error: BaseException | None = None
+    first_traceback: Any | None = None
     for route in routes:
         try:
             fcntl.fcntl(route.retained.fileno(), command, 0)
-        except (NGramManifestError, OSError, TypeError, ValueError) as exc:
+        except BaseException as exc:  # noqa: BLE001 - restore every descriptor
             if first_error is None:
-                first_error = f"{type(exc).__name__}: {str(exc)[:256]}"
+                first_error = exc
+                first_traceback = exc.__traceback__
     if first_error is not None:
+        if not isinstance(first_error, Exception):
+            raise first_error.with_traceback(first_traceback)
+        detail = f"{type(first_error).__name__}: {str(first_error)[:256]}"
         raise NGramCacheIOError(
-            f"could not restore retained n-gram page-cache policy: {first_error}"
+            f"could not restore retained n-gram page-cache policy: {detail}"
         )
 
 
@@ -1955,13 +1973,16 @@ class NGramRowCache:
             artifact._cache_owner = token
         installed_routes: tuple[_InstalledNGramShard, ...] = ()
         page_cache_installed = False
+        page_cache_install_state = _PageCacheInstallState()
         arena: memoryview | None = None
         packed: _PackedCacheIndex | None = None
         transient_pool: _TransientPool | None = None
         try:
             installed_routes = _install_ngram_shard_routes(artifact)
             page_cache_installed = _install_page_cache_policy(
-                installed_routes, config.bypass_page_cache
+                installed_routes,
+                config.bypass_page_cache,
+                page_cache_install_state,
             )
             selected_reader = reader if reader is not None else _DescriptorReader()
             if not callable(getattr(selected_reader, "read_into", None)):
@@ -1999,7 +2020,7 @@ class NGramRowCache:
             cleanup_safe = not (
                 isinstance(construction_error, _PageCachePolicyError)
                 and construction_error.rollback_failed
-            )
+            ) and not page_cache_install_state.rollback_failed
             try:
                 if cleanup_safe:
                     _restore_page_cache_policy(
@@ -2050,6 +2071,7 @@ class NGramRowCache:
         self._fatal_cause: BaseException | None = None
         self._page_cache_installed = page_cache_installed
         self._close_error: str | None = None
+        self._close_failure: BaseException | None = None
 
     @property
     def arena_bytes(self) -> int:
@@ -2591,6 +2613,8 @@ class NGramRowCache:
     def close(self) -> None:
         with self._condition:
             if self._state == "CLOSED":
+                if self._close_failure is not None:
+                    raise self._close_failure
                 if self._fatal_cause is not None:
                     raise self._fatal_cause
                 if self._close_error is not None:
@@ -2599,6 +2623,8 @@ class NGramRowCache:
             if self._state == "CLOSING":
                 while self._state != "CLOSED":
                     self._condition.wait()
+                if self._close_failure is not None:
+                    raise self._close_failure
                 if self._fatal_cause is not None:
                     raise self._fatal_cause
                 if self._close_error is not None:
@@ -2612,34 +2638,66 @@ class NGramRowCache:
         fatal = self._drain(futures)
         if fatal is None:
             fatal = self._fatal_cause
-        self._executor.shutdown(wait=True, cancel_futures=False)
-        restore_error: NGramCacheIOError | None = None
+        first_failure: BaseException | None = fatal
+        cleanup_uncertain = False
         try:
-            _restore_page_cache_policy(
-                self._physical_routes, self._page_cache_installed
-            )
-        except NGramCacheIOError as exc:
-            restore_error = exc
-        with self._condition:
-            self._arena.release()
-            self._arena = None
-            self._arena_object = None
-            self._packed.release()
-            self._transient_pool.close()
+            try:
+                self._executor.shutdown(wait=True, cancel_futures=False)
+            except BaseException as exc:  # noqa: BLE001 - finalization must continue
+                cleanup_uncertain = True
+                if first_failure is None:
+                    first_failure = exc
+            try:
+                _restore_page_cache_policy(
+                    self._physical_routes, self._page_cache_installed
+                )
+            except BaseException as exc:  # noqa: BLE001 - finalization must continue
+                cleanup_uncertain = True
+                if first_failure is None:
+                    first_failure = exc
+            try:
+                self._arena.release()
+            except BaseException as exc:  # noqa: BLE001 - drop every fixed owner
+                cleanup_uncertain = True
+                if first_failure is None:
+                    first_failure = exc
+            finally:
+                self._arena = None
+                self._arena_object = None
+            try:
+                self._packed.release()
+            except BaseException as exc:  # noqa: BLE001 - drop every fixed owner
+                cleanup_uncertain = True
+                if first_failure is None:
+                    first_failure = exc
+            try:
+                self._transient_pool.close()
+            except BaseException as exc:  # noqa: BLE001 - drop every fixed owner
+                cleanup_uncertain = True
+                if first_failure is None:
+                    first_failure = exc
             self._physical_routes = ()
             self._physical_starts = ()
-            with self.artifact._lock:
-                if restore_error is not None:
-                    self._close_error = str(restore_error)[:512]
-                    self.artifact._cache_reuse_error = self._close_error
-                if self.artifact._cache_owner is self._token:
-                    self.artifact._cache_owner = None
-            self._state = "CLOSED"
-            self._condition.notify_all()
-        if fatal is not None:
-            raise fatal
-        if restore_error is not None:
-            raise restore_error
+        finally:
+            with self._condition:
+                with self.artifact._lock:
+                    if cleanup_uncertain:
+                        detail_source = first_failure or RuntimeError(
+                            "unknown cache close failure"
+                        )
+                        detail = (
+                            f"{type(detail_source).__name__}: "
+                            f"{str(detail_source)[:448]}"
+                        )
+                        self._close_error = detail
+                        self.artifact._cache_reuse_error = detail
+                    if self.artifact._cache_owner is self._token:
+                        self.artifact._cache_owner = None
+                self._close_failure = first_failure
+                self._state = "CLOSED"
+                self._condition.notify_all()
+        if first_failure is not None:
+            raise first_failure
 
     def __copy__(self) -> None:
         raise TypeError("copy is forbidden for n-gram row caches")

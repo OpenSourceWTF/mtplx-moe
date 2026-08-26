@@ -1029,10 +1029,63 @@ def test_f_nocache_second_shard_failure_rolls_back_first(
                 reader=RecordingReader(),
                 allocator=bytearray,
             )
-        assert calls == [(descriptors[0], 1), (descriptors[1], 1), (descriptors[0], 0)]
+        assert calls == [
+            (descriptors[0], 1),
+            (descriptors[1], 1),
+            (descriptors[1], 0),
+            (descriptors[0], 0),
+        ]
         assert fixture.artifact._cache_owner is None
     finally:
         fixture.artifact.close()
+
+
+def test_fatal_second_shard_install_rolls_back_every_recorded_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = fixture_cache(tmp_path)
+    fixture.cache.close()
+    assert qwen4_ngram.fcntl is not None
+    monkeypatch.setattr(qwen4_ngram.fcntl, "F_NOCACHE", 48, raising=False)
+    descriptors = [shard.fileno() for shard in fixture.artifact.shards]
+    calls: list[tuple[int, int]] = []
+
+    def fatal_second(descriptor: int, _command: int, value: int) -> None:
+        calls.append((descriptor, value))
+        if descriptor == descriptors[1] and value == 1:
+            raise KeyboardInterrupt("fatal second-shard install")
+
+    monkeypatch.setattr(qwen4_ngram.fcntl, "fcntl", fatal_second)
+    config = NGramCacheConfig(
+        cache_limit_bytes=ROW_BYTES,
+        transient_limit_bytes=ROW_BYTES,
+        max_inflight_io_bytes=ROW_BYTES,
+        max_open_files=3,
+        bypass_page_cache=True,
+        eviction="lru",
+    )
+    with pytest.raises(KeyboardInterrupt, match="fatal second-shard install"):
+        NGramRowCache(
+            fixture.artifact,
+            config,
+            reader=RecordingReader(),
+            allocator=bytearray,
+        )
+    assert calls == [
+        (descriptors[0], 1),
+        (descriptors[1], 1),
+        (descriptors[1], 0),
+        (descriptors[0], 0),
+    ]
+    assert fixture.artifact._cache_owner is None
+    false_cache = NGramRowCache(
+        fixture.artifact,
+        replace(config, bypass_page_cache=False),
+        reader=RecordingReader(),
+        allocator=bytearray,
+    )
+    false_cache.close()
+    fixture.artifact.close()
 
 
 def test_page_cache_policy_is_restored_before_false_reuse(
@@ -1153,6 +1206,67 @@ def test_restore_failure_is_persistent_but_artifact_can_close(
             allocator=bytearray,
         )
     fixture.artifact.close()
+
+
+def test_fatal_restore_finalizes_and_wakes_two_close_callers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = fixture_cache(tmp_path)
+    fixture.cache.close()
+    assert qwen4_ngram.fcntl is not None
+    monkeypatch.setattr(qwen4_ngram.fcntl, "F_NOCACHE", 48, raising=False)
+    descriptors = [shard.fileno() for shard in fixture.artifact.shards]
+    calls: list[tuple[int, int]] = []
+
+    def fatal_restore(descriptor: int, _command: int, value: int) -> None:
+        calls.append((descriptor, value))
+        if descriptor == descriptors[0] and value == 0:
+            raise KeyboardInterrupt("fatal restore failure")
+
+    monkeypatch.setattr(qwen4_ngram.fcntl, "fcntl", fatal_restore)
+    cache = NGramRowCache(
+        fixture.artifact,
+        NGramCacheConfig(
+            cache_limit_bytes=ROW_BYTES,
+            transient_limit_bytes=ROW_BYTES,
+            max_inflight_io_bytes=ROW_BYTES,
+            max_open_files=3,
+            bypass_page_cache=True,
+            eviction="lru",
+        ),
+        reader=RecordingReader(),
+        allocator=bytearray,
+    )
+    errors: list[BaseException] = []
+
+    def close_cache() -> None:
+        try:
+            cache.close()
+        except BaseException as exc:  # noqa: BLE001 - assert fatal propagation
+            errors.append(exc)
+
+    closers = [threading.Thread(target=close_cache) for _ in range(2)]
+    for closer in closers:
+        closer.start()
+    for closer in closers:
+        closer.join(timeout=5)
+        assert not closer.is_alive()
+    assert len(errors) == 2
+    assert all(isinstance(error, KeyboardInterrupt) for error in errors)
+    assert all("fatal restore failure" in str(error) for error in errors)
+    assert errors[0] is errors[1]
+    assert [(descriptor, 0) for descriptor in descriptors] == [
+        call for call in calls if call[1] == 0
+    ]
+    assert cache.closed
+    assert cache.arena_bytes == 0
+    assert cache.metadata_bytes == 0
+    assert cache.route_table_bytes == 0
+    assert cache.transient_storage_bytes == 0
+    assert fixture.artifact._cache_owner is None
+    assert fixture.artifact._cache_reuse_error is not None
+    fixture.artifact.close()
+    assert all(shard.closed for shard in fixture.artifact.shards)
 
 
 def test_poison_revokes_preexisting_materialized_lease_and_future(
