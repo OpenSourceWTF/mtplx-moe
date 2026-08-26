@@ -20,6 +20,7 @@ from mtplx.expert_manifest import (
     ExpertManifestError,
     ResidentTensor,
     ShardInfo,
+    _classify_expert_name,
     build_expert_manifest,
     build_expert_sidecar,
     load_expert_manifest,
@@ -31,7 +32,6 @@ from mtplx.expert_manifest import (
     verify_expert_manifest,
 )
 from mtplx.expert_streaming_models import ExpertStreamingModelSpec, get_model_spec
-
 
 COMPONENTS = (
     "gate_proj.weight",
@@ -87,6 +87,38 @@ def _tiny_spec(
         kv_bytes_per_token=0,
         mtp_layer_index=80 if key and key.startswith("hy3-") else 2,
         mtp_included=False,
+    )
+
+
+def test_qwen4_native_mtp_experts_map_to_synthetic_streaming_layer() -> None:
+    tiny = _tiny_spec(key="qwen38-flash-next-q4")
+    spec = replace(
+        tiny,
+        total_tensor_bytes=49 * 2 * tiny.expert_record_bytes + 8,
+        total_layers=49,
+        routed_layer_start=0,
+        routed_layer_count=49,
+        mtp_layer_index=None,
+        mtp_included=True,
+    )
+
+    assert _classify_expert_name(
+        "language_model.mtp.layers.0.mlp.switch_mlp.gate_proj.weight",
+        spec,
+    ) == (48, None, "gate_proj.weight")
+    assert (
+        _classify_expert_name(
+            "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight",
+            spec,
+        )
+        == (0, None, "gate_proj.weight")
+    )
+    assert (
+        _classify_expert_name(
+            "language_model.model.layers.48.mlp.switch_mlp.gate_proj.weight",
+            spec,
+        )
+        is None
     )
 
 

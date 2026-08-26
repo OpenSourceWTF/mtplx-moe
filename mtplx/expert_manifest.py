@@ -115,6 +115,11 @@ _LAYER_RE = re.compile(
     r"(?:^|\.)layers\.(?P<layer>\d+)\.mlp\."
     r"(?P<container>switch_mlp|experts)\.(?P<tail>.+)$"
 )
+_QWEN4_NATIVE_MTP_EXPERT_RE = re.compile(
+    r"^language_model\.mtp\.layers\.(?P<layer>\d+)\.mlp\."
+    r"(?P<container>switch_mlp|experts)\.(?P<tail>.+)$"
+)
+_QWEN4_STREAMING_MODEL_KEY = "qwen38-flash-next-q4"
 _DTYPE_BYTES = {
     "BOOL": 1,
     "I8": 1,
@@ -1639,10 +1644,24 @@ def _classify_expert_name(
     name: str,
     spec: ExpertStreamingModelSpec,
 ) -> tuple[int, int | None, str] | None:
-    match = _LAYER_RE.search(name)
+    native_mtp = None
+    if spec.key == _QWEN4_STREAMING_MODEL_KEY:
+        native_mtp = _QWEN4_NATIVE_MTP_EXPERT_RE.fullmatch(name)
+    match = native_mtp or _LAYER_RE.search(name)
     if match is None:
         return None
-    layer = int(match.group("layer"))
+    source_layer = int(match.group("layer"))
+    if native_mtp is not None:
+        if source_layer != 0:
+            return None
+        layer = spec.routed_layer_indices[-1]
+    else:
+        layer = source_layer
+        if (
+            spec.key == _QWEN4_STREAMING_MODEL_KEY
+            and layer == spec.routed_layer_indices[-1]
+        ):
+            return None
     if layer not in spec.routed_layer_indices:
         return None
     parts = match.group("tail").split(".")
