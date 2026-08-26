@@ -948,7 +948,7 @@ def _paged_kernel_bucket_eligible(entry: Any, length: int, bucket: int) -> bool:
         # per-call kernel gate inside the graph.
         if length > 8:
             return False
-        bits = int(entry.bits)
+        bits = int(entry.kv_bits)
         expect_kv = mx.int8 if bits == 8 else mx.uint8
         if key_cache.dtype != expect_kv or value_cache.dtype != expect_kv:
             return False

@@ -3212,7 +3212,7 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
         self.head_dims = (int(head_dims[0]), int(head_dims[1]))
 
     @property
-    def bits(self) -> int:
+    def kv_bits(self) -> int:
         return int(self.kv_quant_config.bits)
 
     @property
@@ -3298,7 +3298,7 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
 
         steps = int(keys.shape[2])
         started = time.perf_counter()
-        bits = self.bits
+        bits = self.kv_bits
         # Head-major incoming (1, H, steps, D): quantizing here yields the
         # same integers/scales the eager pages would hold for these rows
         # (rowwise quantizer, transpose-commutative) — one math for the
@@ -3351,7 +3351,7 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
             v_scale=self.cache[4],
             offset=self.cache[2],
             scale=float(scale),
-            bits=self.bits,
+            bits=self.kv_bits,
             max_q_len=8,
             max_offset=static_max_offset,
         )
@@ -3367,13 +3367,13 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
         keys = dequantize_symmetric(
             self.cache[0],
             self.cache[3],
-            bits=self.bits,
+            bits=self.kv_bits,
             head_dim=self.head_dims[0],
         ).astype(self.source_dtypes[0])
         values = dequantize_symmetric(
             self.cache[1],
             self.cache[4],
-            bits=self.bits,
+            bits=self.kv_bits,
             head_dim=self.head_dims[1],
         ).astype(self.source_dtypes[1])
         return keys, values
@@ -3474,7 +3474,7 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
     def paged_stats(self) -> dict[str, int | float | str]:
         stats = super().paged_stats()
         stats["mode"] = "tensor_offset_quantized_paged"
-        stats["kv_quant_bits"] = int(self.bits)
+        stats["kv_quant_bits"] = int(self.kv_bits)
         return stats
 
 
