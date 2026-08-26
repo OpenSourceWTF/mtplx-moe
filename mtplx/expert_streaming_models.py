@@ -60,16 +60,13 @@ def proj_quant_covers(path: str, *, model_key: str | None = None) -> bool:
 
     if model_key == "kimi-k3-q1t":
         normalized = path
-        if normalized.startswith("language_model."):
-            normalized = normalized[len("language_model.") :]
+        normalized = normalized.removeprefix("language_model.")
         normalized = normalized.replace(".block_sparse_moe.", ".mlp.")
         if normalized in {"model.embed_tokens", "lm_head"}:
             return True
         if normalized == "mtp" or normalized.startswith("mtp."):
             return False
-        if normalized.endswith("_res_proj") or normalized.endswith(
-            ".self_attn.kv_b_proj"
-        ):
+        if normalized.endswith(("_res_proj", ".self_attn.kv_b_proj")):
             return False
         return normalized.endswith("_proj")
     if ".self_attn." in path and path.endswith(_ATTENTION_PROJ_SUFFIXES):
@@ -874,6 +871,43 @@ KIMI_K3_EXPERT_Q1T = ExpertStreamingModelSpec(
 )
 
 
+QWEN38_FLASH_NEXT_Q4 = ExpertStreamingModelSpec(
+    key="qwen38-flash-next-q4",
+    display_name="Qwen3.8 Flash-Next routed-expert affine Q4",
+    source_model="Qwen/Qwen3.8-Flash-Next",
+    source_revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
+    quant_model="OpensourceWTF/Qwen3.8-Flash-Next-MTPLX-Q4",
+    # This artifact is constructed locally rather than fetched from an HF
+    # commit. Its deterministic identifier is SHA-256 over the pinned source,
+    # target artifact name, and affine-q4/group64/BF16-parameter contract.
+    quant_revision="09dbf9fa47543c707eb50e6d27f929c989be54eb14cd386f0d0bb3c98564f2c6",
+    # Source tensor payload minus its BF16 routed bank plus the affine-Q4 bank.
+    total_tensor_bytes=182_738_190_328,
+    # Layers 0..47 plus the synthetic MTP layer 48 share one authoritative bank.
+    total_layers=49,
+    routed_layer_start=0,
+    routed_layer_count=49,
+    expert_count=512,
+    top_k=10,
+    hidden_size=2560,
+    expert_hidden_size=640,
+    quant_bits=4,
+    quant_group_size=64,
+    quant_parameter_bytes=2,
+    router_storage="bfloat16",
+    router_matmul_dtype="float32",
+    router_bytes=128_450_560,
+    # Task 8 must price the exact QSA/indexer target and synthetic-MTP cache at
+    # construction time. Zero is intentionally conservative schema state here,
+    # not a measured or inferred topology claim.
+    kv_bytes_per_token=0,
+    fixed_cache_bytes_per_batch=0,
+    mtp_layer_index=None,
+    mtp_included=True,
+    expert_activation="swiglu",
+)
+
+
 MODEL_SPECS: dict[str, ExpertStreamingModelSpec] = {
     spec.key: spec
     for spec in (
@@ -888,6 +922,7 @@ MODEL_SPECS: dict[str, ExpertStreamingModelSpec] = {
         GLM52_EXPERT_Q1T,
         GLM52_EXPERT_Q1B1,
         KIMI_K3_EXPERT_Q1T,
+        QWEN38_FLASH_NEXT_Q4,
     )
 }
 
