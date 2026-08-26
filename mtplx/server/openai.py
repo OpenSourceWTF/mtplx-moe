@@ -13806,7 +13806,7 @@ def _metrics_envelope(
         if prompt_eval_time_s > 0
         else None
     )
-    return {
+    envelope = {
         "prompt_tokens": int(prompt_tokens),
         "cached_tokens": cached_tokens,
         "new_prefill_tokens": max(0, new_prefill_tokens),
@@ -13936,6 +13936,16 @@ def _metrics_envelope(
         "session_id": session_id,
         **generation_limits,
     }
+    # Adaptive draft-temperature trajectory (MTPLX_ADAPTIVE_DTEMP): stamped
+    # only when the engine produced a summary, so quiet request-log rows stay
+    # byte-stable (same idiom as the draft_sampler truth keys). This is the
+    # harvest surface: draft_sampler_resolved_temperature stays the request-
+    # resolved base, and this block carries current_temperature, the EMA, the
+    # transition count, and the transition log (the per-round trajectory).
+    adaptive_dtemp = stats.get("draft_sampler_adaptive_dtemp")
+    if adaptive_dtemp:
+        envelope["draft_sampler_adaptive_dtemp"] = adaptive_dtemp
+    return envelope
 
 
 def _effective_completion_tokens(
@@ -16829,6 +16839,15 @@ def _public_mtplx_stats(generated: dict[str, Any]) -> dict[str, Any]:
     draft_ownership = stats.get("draft_sampler_ownership")
     if draft_ownership is not None:
         public["draft_sampler_ownership"] = str(draft_ownership)
+    # Adaptive draft-temperature summary (MTPLX_ADAPTIVE_DTEMP): non-empty
+    # only when the gate is on, so disabled runs keep byte-stable envelopes.
+    # With the controller active, draft_sampler_resolved_temperature remains
+    # the request-resolved BASE set-point and this block explains any drift
+    # from it (current_temperature + EMA + transition log) — an adaptive
+    # trajectory is provable telemetry, not a desync.
+    adaptive_dtemp = stats.get("draft_sampler_adaptive_dtemp")
+    if adaptive_dtemp:
+        public["draft_sampler_adaptive_dtemp"] = adaptive_dtemp
     postcommit = stats.get("session_postcommit_snapshot")
     if isinstance(postcommit, dict):
         public["session_postcommit_snapshot"] = {
@@ -21203,6 +21222,11 @@ def _run_generation(
         # Desync receipts (dynamic draft temperature): the resolved draft
         # sampler is visible per response, so a drifted draft is provable
         # from mtplx_stats alone. AR responses carry no draft keys at all.
+        # With MTPLX_ADAPTIVE_DTEMP on, this stamp stays the request-resolved
+        # BASE; the engine's per-round moves ride the accompanying
+        # draft_sampler_adaptive_dtemp block (current temp + EMA + transition
+        # log), which is what distinguishes an adaptive trajectory from a
+        # genuine desync.
         if effective_mode != "ar" and effective_draft_sampler is not None:
             stats["draft_sampler_resolved_temperature"] = float(
                 getattr(effective_draft_sampler, "temperature", 0.0)
