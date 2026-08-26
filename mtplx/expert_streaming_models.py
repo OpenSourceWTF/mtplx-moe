@@ -129,6 +129,9 @@ class ExpertStreamingModelSpec:
     kv_bytes_per_token: int
     mtp_layer_index: int | None
     mtp_included: bool
+    # Tensor payload used by model execution but streamed from external
+    # backing rather than charged as resident model/expert-bank bytes.
+    external_backing_bytes: int = 0
     full_indexer_layers: tuple[int, ...] = ()
     # Pin-first ordering for count-based island selection: layers ranked by
     # ascending top-147 routing coverage (worst streamed-cache layers first).
@@ -167,6 +170,7 @@ class ExpertStreamingModelSpec:
             "router_bytes": 0,
             "kv_bytes_per_token": 0,
             "fixed_cache_bytes_per_batch": 0,
+            "external_backing_bytes": 0,
         }
         for name, minimum in integer_fields.items():
             normalized = _integer(name, getattr(self, name), minimum=minimum)
@@ -310,6 +314,12 @@ class ExpertStreamingModelSpec:
         """All target tensors except routed experts, before runtime/KV reserve."""
 
         return self.total_tensor_bytes - self.routed_expert_bytes
+
+    @property
+    def disk_tensor_bytes(self) -> int:
+        """Complete derivative tensor payload, including external backing."""
+
+        return self.total_tensor_bytes + self.external_backing_bytes
 
     @property
     def cold_expert_bytes_per_token(self) -> int:
@@ -876,17 +886,19 @@ KIMI_K3_EXPERT_Q1T = ExpertStreamingModelSpec(
 
 QWEN38_FLASH_NEXT_Q4 = ExpertStreamingModelSpec(
     key="qwen38-flash-next-q4",
-    display_name="Qwen3.8 Flash-Next routed-expert affine Q4",
-    source_model="Qwen/Qwen3.8-Flash-Next",
-    source_revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
-    quant_model="OpensourceWTF/Qwen3.8-Flash-Next-MTPLX-Q4",
+    display_name="Qwen3.8 Flash-Next oQ4 with native MTP",
+    source_model="Vontra/Qwen3.8-Flash-Next-MLX-oQ4-MTP",
+    source_revision="43a82b3f0ff64fa417fd09ca046580f08d19b0d6",
+    quant_model="OpensourceWTF/Qwen3.8-Flash-Next-MTPLX-oQ4-MTP",
     # UNPUBLISHED CANDIDATE: this deterministic construction digest is SHA-256
-    # over the pinned source, target artifact name, and affine-q4/group64/BF16
+    # over the pinned source, target artifact name, and published oQ4/group-32
     # parameter contract. Task 12 MUST replace it with the derivative's actual
     # immutable HF commit before adding this candidate to MODEL_SPECS.
-    quant_revision="09dbf9fa47543c707eb50e6d27f929c989be54eb14cd386f0d0bb3c98564f2c6",
-    # Source tensor payload minus its BF16 routed bank plus the affine-Q4 bank.
-    total_tensor_bytes=182_738_190_328,
+    quant_revision="d873778fec4d66ad4cc5bf9785f5f2199f7b72c037abb5823d8bf1da689916f2",
+    # Resident mixed-precision tensors plus the published affine-Q4 routed
+    # bank. The published affine-Q4 n-gram table is external SSD backing.
+    total_tensor_bytes=81_325_121_012,
+    external_backing_bytes=32_000_153_600,
     # Layers 0..47 plus the synthetic MTP layer 48 share one authoritative bank.
     total_layers=49,
     routed_layer_start=0,
@@ -896,11 +908,11 @@ QWEN38_FLASH_NEXT_Q4 = ExpertStreamingModelSpec(
     hidden_size=2560,
     expert_hidden_size=640,
     quant_bits=4,
-    quant_group_size=64,
+    quant_group_size=32,
     quant_parameter_bytes=2,
-    router_storage="bfloat16",
-    router_matmul_dtype="float32",
-    router_bytes=128_450_560,
+    router_storage="affine-q4-g32",
+    router_matmul_dtype="activation_dtype",
+    router_bytes=40_140_800,
     # Task 8 must price the exact QSA/indexer target and synthetic-MTP cache at
     # construction time. Zero is intentionally conservative schema state here,
     # not a measured or inferred topology claim.

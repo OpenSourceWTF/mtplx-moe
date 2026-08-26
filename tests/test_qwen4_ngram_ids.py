@@ -323,7 +323,7 @@ def test_qwen38_manifest_constructor_pins_provenance_and_layout() -> None:
 
     manifest = qwen38_ngram_manifest("affine-q4-g32", (shard,))
 
-    assert manifest.source_repo == "Qwen/Qwen3.8-Flash-Next"
+    assert manifest.source_repo == "Vontra/Qwen3.8-Flash-Next-MLX-oQ4-MTP"
     assert manifest.source_revision == QWEN38_FLASH_NEXT_REVISION
     assert manifest.row_width == 160
     assert manifest.row_bytes == 100

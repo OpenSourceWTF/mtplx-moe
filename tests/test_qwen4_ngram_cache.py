@@ -752,7 +752,7 @@ def test_twenty_gib_bf16_plan_accounts_for_every_backing_allocation() -> None:
     assert plan.total_reserved_bytes == 24_495_800_320
 
 
-def test_production_budget_uses_full_twenty_gib_when_total_reservation_fits() -> None:
+def test_production_budget_uses_full_ten_gib_when_total_reservation_fits() -> None:
     gib = 1024**3
     runtime = plan_production_ngram_cache(
         planning_manifest("bf16"),
@@ -774,9 +774,9 @@ def test_production_budget_uses_full_twenty_gib_when_total_reservation_fits() ->
     assert runtime.target_residency_bytes == 95 * gib
     assert runtime.fixed_runtime_bytes == 70 * gib
     assert runtime.available_cache_bytes == 25 * gib
-    assert runtime.payload_formula_ceiling_bytes == 20 * gib
-    assert runtime.cache.payload_bytes == 20 * gib
-    assert runtime.cache.total_reserved_bytes == 24_495_800_320
+    assert runtime.payload_formula_ceiling_bytes == 10 * gib
+    assert runtime.cache.payload_bytes == 10 * gib
+    assert runtime.cache.total_reserved_bytes == 12_248_432_640
     assert runtime.projected_residency_bytes <= runtime.target_residency_bytes
     assert runtime.config.cache_limit_bytes == runtime.cache.payload_bytes
 
@@ -875,25 +875,29 @@ def test_production_budget_rejects_minimum_payload_rounding_overflow() -> None:
         )
 
 
-def test_production_budget_rejects_quantized_ngram_storage() -> None:
+def test_production_budget_accepts_published_oq4_ngram_storage() -> None:
     gib = 1024**3
-    with pytest.raises(ValueError, match="exact BF16"):
-        plan_production_ngram_cache(
-            planning_manifest("affine-q4-g32"),
-            NGramRuntimeBudget(
-                measured_base_residency_bytes=64 * gib,
-                kv_mtp_reserve_bytes=2 * gib,
-                metal_working_reserve_bytes=2 * gib,
-                safety_margin_bytes=2 * gib,
-                minimum_payload_bytes=1 * gib,
-                allocation_alignment_bytes=16 * 1024,
-            ),
-            transient_limit_bytes=1024**2,
-            max_inflight_io_bytes=1024**2,
-            max_open_files=129,
-            bypass_page_cache=True,
-            eviction="lru",
-        )
+    runtime = plan_production_ngram_cache(
+        planning_manifest("affine-q4-g32"),
+        NGramRuntimeBudget(
+            measured_base_residency_bytes=64 * gib,
+            kv_mtp_reserve_bytes=2 * gib,
+            metal_working_reserve_bytes=2 * gib,
+            safety_margin_bytes=2 * gib,
+            minimum_payload_bytes=1 * gib,
+            allocation_alignment_bytes=16 * 1024,
+        ),
+        transient_limit_bytes=1024**2,
+        max_inflight_io_bytes=1024**2,
+        max_open_files=129,
+        bypass_page_cache=True,
+        eviction="lru",
+    )
+
+    assert runtime.payload_formula_ceiling_bytes == 10 * gib
+    assert runtime.cache.payload_bytes == 10_737_418_200
+    assert runtime.cache.slot_count == 107_374_182
+    assert runtime.cache.total_reserved_bytes == 15_999_860_736
 
 
 def test_production_budget_rejects_unapproved_eviction_policy() -> None:

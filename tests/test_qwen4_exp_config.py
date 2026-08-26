@@ -14,10 +14,10 @@ from mtplx.expert_streaming_models import (
 )
 from mtplx.models.qwen4_exp import ModelArgs
 
-PINNED_REVISION = "f5d08274bafd880402bd16f5e3e6c514136ec06c"
+PINNED_REVISION = "43a82b3f0ff64fa417fd09ca046580f08d19b0d6"
 CACHED_CONFIG = Path(
     "/Users/davidtai/.cache/huggingface/hub/"
-    "models--Qwen--Qwen3.8-Flash-Next/snapshots/"
+    "models--Vontra--Qwen3.8-Flash-Next-MLX-oQ4-MTP/snapshots/"
     f"{PINNED_REVISION}/config.json"
 )
 
@@ -246,6 +246,17 @@ def test_cached_pinned_config_matches_repository_fixture_when_available() -> Non
     _assert_pinned_args(ModelArgs.from_dict(cached))
 
 
+def test_missing_rope_type_uses_transformers_default() -> None:
+    config = _text_config()
+    rope_parameters = config["rope_parameters"]
+    assert isinstance(rope_parameters, dict)
+    del rope_parameters["rope_type"]
+
+    args = ModelArgs.from_dict(config)
+
+    assert args.rope_parameters.rope_type == "default"
+
+
 def test_model_args_are_frozen_and_reject_geometry_drift() -> None:
     args = ModelArgs.from_dict(_root_config())
     with pytest.raises(FrozenInstanceError):
@@ -317,7 +328,9 @@ def test_qwen38_flash_next_q4_streaming_geometry_is_exact() -> None:
     assert spec.key not in MODEL_SPECS
     with pytest.raises(ValueError, match="unknown model"):
         get_model_spec(spec.key)
-    assert spec.total_tensor_bytes == 182_738_190_328
+    assert spec.total_tensor_bytes == 81_325_121_012
+    assert spec.external_backing_bytes == 32_000_153_600
+    assert spec.disk_tensor_bytes == 113_325_274_612
     assert spec.total_layers == 49
     assert spec.routed_layer_indices == tuple(range(49))
     assert spec.expert_count == 512
@@ -325,22 +338,22 @@ def test_qwen38_flash_next_q4_streaming_geometry_is_exact() -> None:
     assert spec.hidden_size == 2560
     assert spec.expert_hidden_size == 640
     assert spec.quant_bits == 4
-    assert spec.quant_group_size == 64
+    assert spec.quant_group_size == 32
     assert spec.quant_parameter_bytes == 2
     assert spec.expert_codec == "affine"
     assert spec.expert_activation == "swiglu"
-    assert spec.expert_record_bytes == 2_764_800
-    assert spec.routed_expert_bytes == 69_363_302_400
-    assert spec.router_storage == "bfloat16"
-    assert spec.router_matmul_dtype == "float32"
-    assert spec.router_bytes == 128_450_560
+    assert spec.expert_record_bytes == 3_072_000
+    assert spec.routed_expert_bytes == 77_070_336_000
+    assert spec.router_storage == "affine-q4-g32"
+    assert spec.router_matmul_dtype == "activation_dtype"
+    assert spec.router_bytes == 40_140_800
     assert spec.kv_bytes_per_token == 0
     assert spec.fixed_cache_bytes_per_batch == 0
     assert spec.mtp_layer_index is None
     assert spec.mtp_included is True
-    assert spec.source_model == "Qwen/Qwen3.8-Flash-Next"
+    assert spec.source_model == "Vontra/Qwen3.8-Flash-Next-MLX-oQ4-MTP"
     assert spec.source_revision == PINNED_REVISION
-    assert spec.quant_model == "OpensourceWTF/Qwen3.8-Flash-Next-MTPLX-Q4"
+    assert spec.quant_model == "OpensourceWTF/Qwen3.8-Flash-Next-MTPLX-oQ4-MTP"
     assert spec.quant_revision == (
-        "09dbf9fa47543c707eb50e6d27f929c989be54eb14cd386f0d0bb3c98564f2c6"
+        "d873778fec4d66ad4cc5bf9785f5f2199f7b72c037abb5823d8bf1da689916f2"
     )

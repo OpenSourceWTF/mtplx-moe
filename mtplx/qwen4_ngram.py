@@ -41,8 +41,8 @@ except ImportError:  # pragma: no cover - unavailable on non-POSIX hosts
 
 import numpy as np
 
-QWEN38_FLASH_NEXT_REPO = "Qwen/Qwen3.8-Flash-Next"
-QWEN38_FLASH_NEXT_REVISION = "f5d08274bafd880402bd16f5e3e6c514136ec06c"
+QWEN38_FLASH_NEXT_REPO = "Vontra/Qwen3.8-Flash-Next-MLX-oQ4-MTP"
+QWEN38_FLASH_NEXT_REVISION = "43a82b3f0ff64fa417fd09ca046580f08d19b0d6"
 NGRAM_MANIFEST_FORMAT = "mtplx-qwen4-ngram-manifest-v1"
 # The production artifact has exactly 128 n-gram shards.  At under 8 KiB of
 # metadata per shard, 1 MiB leaves generous headroom without accepting an
@@ -65,7 +65,7 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _STORAGES = frozenset(("bf16", "affine-q4-g32"))
 _GIB = 1024**3
 PRODUCTION_RUNTIME_TARGET_BYTES = 95 * _GIB
-PRODUCTION_NGRAM_PAYLOAD_CEILING_BYTES = 20 * _GIB
+PRODUCTION_NGRAM_PAYLOAD_CEILING_BYTES = 10 * _GIB
 
 
 class NGramManifestError(ValueError):
@@ -1389,7 +1389,7 @@ class NGramRuntimeBudget:
         if not 0 < self.payload_ceiling_bytes <= (
             PRODUCTION_NGRAM_PAYLOAD_CEILING_BYTES
         ):
-            raise ValueError("payload_ceiling_bytes exceeds the pinned 20 GiB maximum")
+            raise ValueError("payload_ceiling_bytes exceeds the pinned 10 GiB maximum")
 
 
 @dataclass(frozen=True)
@@ -1511,12 +1511,10 @@ def plan_production_ngram_cache(
     bypass_page_cache: bool,
     eviction: Literal["lru", "frequency"],
 ) -> NGramProductionCachePlan:
-    """Solve the largest exact BF16 row cache under the measured runtime budget."""
+    """Solve the largest exact stored-row cache under the measured runtime budget."""
 
     if type(manifest) is not NGramManifest:
         raise TypeError("manifest must be an exact NGramManifest")
-    if manifest.storage != "bf16":
-        raise ValueError("the pinned production n-gram table must remain exact BF16")
     if type(budget) is not NGramRuntimeBudget:
         raise TypeError("budget must be an exact NGramRuntimeBudget")
     if eviction != "lru":

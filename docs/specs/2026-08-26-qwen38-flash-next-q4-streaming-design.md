@@ -4,15 +4,16 @@ Status: approved for implementation
 Date: 2026-08-26
 Code target: `OpenSourceWTF/mtplx-moe`
 Branch: `port/qwen38-flash-next-q4`
-Source artifact: `Qwen/Qwen3.8-Flash-Next@f5d08274bafd880402bd16f5e3e6c514136ec06c`
-Planned derivative: `OpensourceWTF/Qwen3.8-Flash-Next-MTPLX-Q4`
+Source artifact: `Vontra/Qwen3.8-Flash-Next-MLX-oQ4-MTP@43a82b3f0ff64fa417fd09ca046580f08d19b0d6`
+Planned derivative: `OpensourceWTF/Qwen3.8-Flash-Next-MTPLX-oQ4-MTP`
 
 ## Objective
 
-Run the official Qwen3.8-Flash-Next text model on the 128 GiB Apple Silicon
+Run the published Qwen3.8-Flash-Next oQ4-MTP text model on the 128 GiB Apple Silicon
 machine with:
 
-- every routed MoE expert in MLX affine 4-bit, group size 64;
+- the published mixed-precision oQ4 weights unchanged: affine Q4/group-32 base
+  with the artifact's protected 5/8-bit modules;
 - fixed-budget SSD streaming for routed experts and n-gram embeddings;
 - native autoregressive generation;
 - the checkpoint's one-layer MTP module driving MTPLX speculative decoding;
@@ -24,9 +25,8 @@ machine with:
 
 ## Evidence and geometry
 
-The source checkpoint contains approximately 180B parameters in 131
-safetensors shards (179,999,981,459 weight elements plus 35 integer metadata
-elements in the pinned index). The text configuration has 48 target layers,
+The source artifact contains 3,747 indexed tensors in 22 safetensors shards
+with 113,325,274,612 tensor bytes. The text configuration has 48 target layers,
 hidden size 2560, 512 routed experts per layer, top-10 routing, one shared
 expert, expert intermediate size 640, and one MTP layer.
 
@@ -36,24 +36,21 @@ layers plus the MTP layer:
 - `gate_up_proj`: `[512, 1280, 2560]` per layer;
 - `down_proj`: `[512, 2560, 640]` per layer.
 
-MLX affine Q4/group-64 stores packed weights plus BF16 scales and biases. One
-expert record is exactly 2,764,800 bytes, and all 49 x 512 records occupy
-69,363,302,400 bytes, or 64.60 GiB. This is the fixed expert-Q4 artifact
+The published affine Q4/group-32 expert leaves store packed weights plus BF16
+scales and biases. One expert record is exactly 3,072,000 bytes, and all
+49 x 512 target-plus-MTP records occupy 77,070,336,000 bytes, or 71.78 GiB.
+This is the fixed expert-oQ4 artifact
 contract.
 
 The n-gram memory consists of 128 tensors of shape `[2,500,012, 160]`, totaling
-51,200,245,760 BF16 parameters (95.37 GiB). With `ngram_size=3` and
+320,001,536 rows. The oQ4 artifact stores each row as 80 packed-weight bytes,
+10 BF16 scale bytes, and 10 BF16 bias bytes: 32,000,153,600 bytes total
+(29.80 GiB). With `ngram_size=3` and
 `heads_per_ngram=8`, each token deterministically selects eight bigram and
-eight trigram rows. The useful BF16 payload is 16 x 160 x 2 = 5,120 bytes per
-token.
-
-The 64.60 GiB figure therefore describes the affine-Q4 routed-expert bank, not
-the complete derivative. Keeping the n-gram table in BF16 produces an
-approximately 170.2 GiB on-disk derivative: 64.60 GiB of Q4 routed experts,
-95.37 GiB of immutable BF16 n-gram backing data, and approximately 10.2 GiB of
-the remaining model tensors. Exact file lengths and header overhead are
-recorded by the converter manifest rather than inferred from these rounded
-totals. The n-gram table is never quantized or approximated.
+eight trigram rows. The useful stored payload is 16 x 100 = 1,600 bytes per
+token. The remaining resident tensor payload is 4,254,785,012 bytes. Repacking
+for MTPLX changes storage topology only; it never requantizes or numerically
+rewrites a published tensor.
 
 ## Scope
 
@@ -66,9 +63,10 @@ totals. The n-gram table is never quantized or approximated.
    - the layer-2 PLE/n-gram injection path;
    - top-10-of-512 routed MoE plus the shared expert;
    - the model's RMSNorm, rotary embedding, and output-head semantics.
-2. Q4/group-64 routed expert conversion and SSD streaming for all target and
-   MTP experts.
-3. Exact BF16 n-gram streaming through an independently sized fixed cache.
+2. Byte-preserving extraction and SSD streaming of published Q4/group-32
+   routed experts for all target and MTP blocks.
+3. Exact published affine-Q4/group-32 n-gram row streaming through an
+   independently sized fixed cache.
 4. Native AR and MTP speculative generation, including proposal, target
    verification, rejection repair, cache rollback, and commit.
 6. Real-model correctness, quality, performance, memory, and artifact receipts.
@@ -81,9 +79,7 @@ totals. The n-gram table is never quantized or approximated.
   claim.
 - Custom performance kernels before a correct stock-MLX baseline identifies a
   measured bottleneck.
-- Quantizing routers, shared experts, GDN/QSA projections, residual mixers,
-  token embeddings, or the output head.
-- Quantizing or approximating the n-gram table.
+- Any local quantization, requantization, or use of the official BF16 payload.
 - Supporting arbitrary Qwen4-family geometries in this first port.
 
 ## Architecture
@@ -117,7 +113,7 @@ reference. The MTPLX implementation must preserve:
 - the exact GDN recurrence orientation, convolution state, FP32 recurrence
   state where specified, sigmoid output gate, and zero-centered RMSNorm;
 - QSA micro-block compression, index scores, block budget, tail inclusion,
-  RoPE layout, and selected-token ordering;
+  RoPE layout, selected-mask membership, and chronological K/V order;
 - four-branch residual ownership and elementwise read gating;
 - n-gram hashing, EOS-aware shifts, head-specific prime moduli and offsets,
   PLE convolution, projections, and injection point;
@@ -131,12 +127,10 @@ parity evidence for this checkpoint.
 
 ### Routed-expert storage
 
-The converter reads one pinned source shard at a time. Qwen stores gate and up
-rows fused as `[512, 1280, 2560]`; the converter splits the first and second
-640-row halves before quantization. Affine groups run along the unchanged
-2560-element input dimension, so splitting does not alter any group's values
-or quantization geometry. For each expert it then applies MLX affine
-Q4/group-64 independently and writes a record-major `experts.bin` bank:
+The repacker reads one pinned oQ4-MTP shard at a time. The published checkpoint
+already stores gate, up, and down leaves in MLX affine form under
+`switch_mlp`. It slices whole expert records without dequantizing or
+requantizing them and writes record-major expert sidecars:
 
 ```text
 record(layer, expert):
@@ -151,8 +145,8 @@ these 49 sparse blocks to the binder without adding the MTP block to the
 target model's 48-layer forward loop.
 
 `expert-manifest.json` records exact shapes, offsets, lengths, source tensor
-names, per-record hashes, source revision, and whole-bank hash. Resident BF16
-tensors are re-sharded without numerical conversion. Existing expert-streaming
+names, per-record hashes, source revision, and whole-bank hashes. Resident
+tensors retain their published mixed-precision representation. Existing expert-streaming
 memory planning, slot generations, I/O admission, pinning, deferred release,
 and component execution are reused only after a Qwen4-specific construction
 self-check proves the Q4 record layout and top-10 execution path.
@@ -165,7 +159,7 @@ generation.
 ### Fixed-budget n-gram cache
 
 N-gram storage and cache ownership are separate from routed-expert storage.
-The complete 95.37 GiB BF16 table remains immutable on SSD and is never mapped
+The complete 29.80 GiB published affine-Q4/group-32 table remains immutable on SSD and is never mapped
 or copied into unified memory as a whole. Only exact rows required by active
 tokens occupy the fixed cache. Its ownership resembles a second KV cache, but
 unlike KV state its values are static, addressable from token history, and
@@ -174,7 +168,7 @@ The cache configuration is fixed at construction:
 
 ```text
 NGramCacheConfig(
-    storage = bf16,
+    storage = affine-q4-g32,
     calculated_cache_payload_bytes,
     transient_limit_bytes,
     max_inflight_io_bytes,
@@ -210,7 +204,7 @@ re-traverses verified pathnames. Symlinks and multi-link shard files are
 rejected, and every failure path closes all descriptors already acquired.
 
 The pinned production configuration is calculated once at model/request
-construction. Its row payload is at most 20 GiB and the complete cache
+construction. Its row payload is at most 10 GiB and the complete cache
 reservation includes every arena, slot-metadata array, open-addressed route
 table, per-allocation alignment pad, and transient buffer. Given measured base
 residency and explicit KV/MTP, Metal-working, and safety reserves, construction
@@ -219,7 +213,8 @@ row count whose complete reservation fits. It fails before generation if the
 configured minimum viable row cache and runtime do not fit. Small explicit
 payload overrides remain test-only.
 
-The hot path receives a prebound `acquire_rows` callable for exact BF16. It
+The hot path receives a prebound `acquire_rows` callable for exact published
+packed-weight, scale, and bias row bytes. It
 does not read environment variables, revalidate the manifest, choose a storage
 representation, instrument each lookup, or fall back to uncached reads.
 
@@ -252,12 +247,12 @@ acceptance and end-to-end wall time on the exact artifact.
 Planned public controls:
 
 - `--ngram-cache-limit SIZE`: test/diagnostic override; pinned production uses
-  the measured construction-time calculation with a 20 GiB payload ceiling.
+  the measured construction-time calculation with a 10 GiB payload ceiling.
 - `--expert-cache-limit SIZE`: existing fixed routed-expert cache budget.
 - existing MTPLX `--depth`, profile, context, sampling, and receipt controls.
 
 `mtplx inspect --json` will expose source revision, artifact hashes, expert and
-n-gram BF16 storage descriptors, planned payload/metadata/route/alignment/
+  n-gram affine-Q4/group-32 storage descriptors, planned payload/metadata/route/alignment/
 transient bytes, supported
 MTP depths, and `can_run`. It must fail before allocation when the requested
 cache budgets cannot cover the configured prefill chunk or verification width.
@@ -286,14 +281,14 @@ Production changes follow test-driven development.
 
 ### CPU and small-model tests
 
-1. Parse and pin the real config and 1,658-tensor index without weight data.
+1. Parse and pin the real config and 3,747-tensor index without weight data.
 2. Match official n-gram multipliers, prime moduli, EOS-aware shifts, head
    offsets, and selected row IDs.
 3. Prove exact fixed-byte cache planning and fail-before-allocation behavior.
 4. Cover hit, miss, duplicate, eviction, pinned-victim refusal, stale ticket,
    short read, reset, and close races.
 5. Prove adjacent-run coalescing and fixed maximum in-flight bytes.
-6. Prove exact BF16 row byte identity through eviction and reload.
+6. Prove exact packed-weight/scale/bias row byte identity through eviction and reload.
 7. Cross-check Gated Residual, GDN, QSA, PLE, MoE, and full decoder-layer
    outputs against official Transformers on tiny deterministic configurations.
 8. Cover AR and MTP cache growth, proposal, rejection, rollback, and commit.
@@ -305,8 +300,8 @@ Production changes follow test-driven development.
 All real MLX work acquires `/tmp/mtplx-gpu-exclusive.lock` and restores the
 pre-existing Qwen service afterward.
 
-1. Convert sampled real expert rows and extract exact BF16 n-gram rows; record
-   reconstruction error and hash provenance respectively.
+1. Repack sampled real expert and n-gram rows byte-for-byte; record source and
+   destination hash provenance.
 2. Load the complete derivative under the 128 GiB memory plan.
 3. Run deterministic AR prompts at short, 1K, and 16K contexts.
 4. Run fixed-depth MTP and prove nonzero accepted drafts, correct physical row
@@ -323,8 +318,8 @@ uses paired task pass sets and McNemar statistics. Wall-time deltas are labeled
 
 The task is complete only when all of the following are current and evidenced:
 
-1. The expert bank is 69,363,302,400 logical bytes (64.60 GiB), affine Q4,
-   group size 64, with all 25,088 target-plus-MTP expert records present.
+1. The expert bank is 77,070,336,000 logical bytes (71.78 GiB), affine Q4,
+   group size 32, with all 25,088 target-plus-MTP expert records present.
 2. Fixed-size expert and n-gram caches stay within their configured byte plans;
    no hidden page-cache or dynamic-slot growth invalidates the process budget.
 3. `mtplx inspect` reports the derivative runnable on this 128 GiB machine.
@@ -333,14 +328,14 @@ The task is complete only when all of the following are current and evidenced:
 5. Real MTP generation accepts drafted tokens, survives rejection and rollback,
    and is faster in end-to-end wall time than matched AR on at least one
    realistic 1K-input coding workload.
-6. The shipped n-gram representation is the exact BF16 table streamed from SSD
-   through the construction-sized eviction cache.
+6. The shipped n-gram representation is the exact published oQ4 table streamed
+   from SSD through the construction-sized eviction cache.
 7. Focused tests, the documented repository baseline, build, hygiene, and fresh
    environment smoke checks pass, with unrelated pre-existing failures clearly
    separated.
 8. A focused PR is open against `OpenSourceWTF/mtplx-moe`, with raw receipts and
    artifact provenance linked.
-9. `OpensourceWTF/Qwen3.8-Flash-Next-MTPLX-Q4` contains the verified derivative,
+9. `OpensourceWTF/Qwen3.8-Flash-Next-MTPLX-oQ4-MTP` contains the verified derivative,
    Qwen Community License and attribution, manifests, checksums, model card,
    and exact MTPLX usage; a clean remote download reproduces inspection and a
    generation smoke test.
@@ -352,7 +347,7 @@ The task is complete only when all of the following are current and evidenced:
 Random rows may cause page amplification or first-layer compute may be too
 short to hide storage latency. Guarded lookup traces outside the production hot
 path select LRU or CLOCK eviction from measured reuse behavior.
-The BF16 lane measures cache hit rate, coalesced bytes, I/O wait at the layer-2
+The oQ4 lane measures cache hit rate, coalesced bytes, I/O wait at the layer-2
 boundary, and end-to-end wall time outside the measured hot path. Eviction can
 only cause an exact SSD reload; it cannot change numerical results. The port is
 not called performant from theoretical payload size alone.
@@ -366,7 +361,7 @@ enabled on the real model until fixed-depth cache and logit gates pass.
 
 ### Critical: artifact peak disk or memory exceeds the machine
 
-Conversion is shard-streamed and writes directly into final banks. Before
+Repacking is shard-streamed and writes directly into final banks. Before
 download, preflight reserves source, output, temporary, and safety bytes. If
 space is still insufficient, only the verified re-downloadable 91 GiB Hy3
 artifact may be removed under the user's authorization; unique receipts and
@@ -382,10 +377,10 @@ up; the model card and CLI must state the limitation plainly.
 ## Rollout
 
 1. Land tiny-model arithmetic and cache tests.
-2. Land converter and real-header manifest tests.
-3. Produce sampled conversion receipts.
-4. Convert the pinned full artifact.
-5. Verify AR, then fixed-depth MTP, then measured BF16 n-gram streaming.
+2. Land byte-preserving repacker and real-header manifest tests.
+3. Produce sampled repacking receipts.
+4. Repack the pinned oQ4-MTP artifact.
+5. Verify AR, then fixed-depth MTP, then measured oQ4 n-gram streaming.
 6. Run matched quality/performance gates under exclusive GPU ownership.
 7. Final review, push, and open the code PR.
 8. Upload only the verified shipping representation, verify remote hashes and a

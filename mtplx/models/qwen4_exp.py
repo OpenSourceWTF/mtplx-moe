@@ -167,7 +167,9 @@ class RopeParameters:
                     "rope_parameters.rope_theta", config["rope_theta"], int
                 ),
                 rope_type=_exact_type(
-                    "rope_parameters.rope_type", config["rope_type"], str
+                    "rope_parameters.rope_type",
+                    config.get("rope_type", "default"),
+                    str,
                 ),
             )
         except KeyError as exc:
