@@ -109,22 +109,27 @@ _SOURCE = r"""
         for (int i = 0; i < kElemsPerFrag; i++) o_frag[g][h][i] = 0.0f;
 
     for (int t0 = kv_start; t0 < kv_end; t0 += TK) {
-      // ── stage V^T tile (all 64 threads, vectorized coalesced read;
-      //     transpose scatter lands in threadgroup memory, which is cheap) ──
-      for (int idx4 = int(lid64); idx4 < TK * (D / 4); idx4 += NTHREADS) {
-        const int p = idx4 / (D / 4);    // key row in tile
-        const int d4 = idx4 % (D / 4);
-        const int gp = t0 + p;
-        vec<InT, 4> v4 = vec<InT, 4>(InT(0));
-        if (gp < kv_end) {
-          const device vec<InT, 4>* src = reinterpret_cast<const device vec<InT, 4>*>(
-              v_head + (size_t)gp * D + d4 * 4);
-          v4 = src[0];
+      // ── stage V^T tile (all threads, vectorized coalesced read;
+      //     transpose scatter lands in threadgroup memory, which is cheap).
+      //     DIRECTV=1 skips staging: PV loads V straight from device via the
+      //     transposed coordinate map (scattered 2B loads, L1-served across
+      //     the g-groups) and drops one barrier per tile. ──
+      if (!DIRECTV) {
+        for (int idx4 = int(lid64); idx4 < TK * (D / 4); idx4 += NTHREADS) {
+          const int p = idx4 / (D / 4);    // key row in tile
+          const int d4 = idx4 % (D / 4);
+          const int gp = t0 + p;
+          vec<InT, 4> v4 = vec<InT, 4>(InT(0));
+          if (gp < kv_end) {
+            const device vec<InT, 4>* src = reinterpret_cast<const device vec<InT, 4>*>(
+                v_head + (size_t)gp * D + d4 * 4);
+            v4 = src[0];
+          }
+          for (short e = 0; e < 4; e++)
+            tg_vT[(d4 * 4 + e) * TK + p] = v4[e];
         }
-        for (short e = 0; e < 4; e++)
-          tg_vT[(d4 * 4 + e) * TK + p] = v4[e];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
       }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
 
       // ── QK: S[16,32] += Q[16,256] x Ktile[32,256]^T ──
       // ct_c accumulates in place across all DFRAGS runs (single S tile).
@@ -233,11 +238,19 @@ _SOURCE = r"""
           for (short hh = 0; hh < 2; hh++) {
             for (short i = 0; i < 2; i++) {
               const int dcol = g * 32 + hh * 16 + sc.y + i * kElemRowsJump;
-              const threadgroup vec<InT, 4>* vv = reinterpret_cast<const threadgroup vec<InT, 4>*>(
-                  tg_vT + dcol * TK + kk * 16 + sc.x);
-              const vec<InT, 4> v4 = vv[0];
-              for (short j = 0; j < kElemCols; j++)
-                ct_b[hh * kElemsPerFrag + i * kElemCols + j] = v4[j];
+              if (DIRECTV) {
+                for (short j = 0; j < kElemCols; j++) {
+                  const int kr = t0 + kk * 16 + sc.x + j;
+                  ct_b[hh * kElemsPerFrag + i * kElemCols + j] = (kr < kv_end)
+                      ? v_head[(size_t)kr * D + dcol] : InT(0);
+                }
+              } else {
+                const threadgroup vec<InT, 4>* vv = reinterpret_cast<const threadgroup vec<InT, 4>*>(
+                    tg_vT + dcol * TK + kk * 16 + sc.x);
+                const vec<InT, 4> v4 = vv[0];
+                for (short j = 0; j < kElemCols; j++)
+                  ct_b[hh * kElemsPerFrag + i * kElemCols + j] = v4[j];
+              }
             }
           }
           mm.run(ct_a, ct_b, ct_c);
@@ -247,7 +260,9 @@ _SOURCE = r"""
           o_frag[g][1][i] = ct_c[kElemsPerFrag + i];
         }
       }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (!DIRECTV) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
     }
 
     // ── store partials [1, HQ, QL, blocks, D] + stats [1, HQ, QL, blocks] ──
@@ -343,6 +358,13 @@ def sdpa_nax_tile(
         offset_arr = mx.array([offset_int], dtype=mx.int32)
 
     blocks = _blocks_for_capacity(capacity)
+    # Partial-traffic cap (2026-08-26 Pulse receipt: 210 GB/s of partial
+    # writes at the scalar kernel's block count = 3x read amplification).
+    # The tile kernel fills the GPU with (hk x NSGS-simdgroup) threadgroups;
+    # far fewer, fatter blocks cut partials linearly. Env-tunable for cells.
+    cap_blocks = int(os.environ.get("MTPLX_NAX_TILE_BLOCKS", "0") or 0)
+    if cap_blocks > 0:
+        blocks = min(blocks, max(32, (cap_blocks // 32) * 32))
     if blocks <= 0 or blocks % 32:
         return _bail("blocks_geometry")
     blocks_arr = mx.array([blocks], dtype=mx.int32)
@@ -363,6 +385,7 @@ def sdpa_nax_tile(
                 ("D", d),
                 ("QL", q_len),
                 ("GQA_F", gqa_factor),
+                ("DIRECTV", 1 if os.environ.get("MTPLX_NAX_TILE_DIRECTV") == "1" else 0),
             ],
             grid=(hk * 32 * ((gqa_factor * q_len + 15) // 16), 1, blocks),
             threadgroup=(32 * ((gqa_factor * q_len + 15) // 16), 1, 1),
