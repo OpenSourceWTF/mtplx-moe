@@ -4164,7 +4164,13 @@ def tail_owned_attention_kv_stats(cache: list[Any] | None) -> dict[str, Any]:
         "mode": "disabled",
     }
     for entry in cache or []:
-        if isinstance(entry, VllmMetalPagedKVCache):
+        # TensorOffset adapters are paged caches too (2026-08-26): the
+        # 147.4k investigation ran blind for hours because adapter entries
+        # were invisible here — rows said paged_attention never engaged
+        # while the adapter was serving (and declining) every verify round.
+        if isinstance(
+            entry, (VllmMetalPagedKVCache, TensorOffsetVllmMetalPagedKVCache)
+        ):
             stats = entry.paged_stats()
             aggregate["enabled"] = 1
             aggregate["entries"] = int(aggregate["entries"]) + 1
