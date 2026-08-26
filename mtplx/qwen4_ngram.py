@@ -1072,6 +1072,46 @@ def _hash_descriptor_payload(descriptor: int, shard: NGramShard) -> str:
     return digest.hexdigest()
 
 
+def _require_verification_capabilities() -> None:
+    """Fail closed before artifact access if immutable-FD primitives are absent."""
+
+    missing: list[str] = []
+    if fcntl is None:
+        missing.append("fcntl")
+    else:
+        if not callable(getattr(fcntl, "flock", None)):
+            missing.append("fcntl.flock")
+        for name in ("LOCK_SH", "LOCK_NB", "LOCK_UN"):
+            value = getattr(fcntl, name, None)
+            if type(value) is not int:
+                missing.append(f"fcntl.{name}")
+    for name in ("O_NOFOLLOW", "O_DIRECTORY", "O_CLOEXEC"):
+        value = getattr(os, name, None)
+        if type(value) is not int or value == 0:
+            missing.append(f"os.{name}")
+    if type(getattr(os, "O_RDONLY", None)) is not int:
+        missing.append("os.O_RDONLY")
+    open_function = getattr(os, "open", None)
+    supports_dir_fd = getattr(os, "supports_dir_fd", ())
+    try:
+        supports_descriptor_open = open_function in supports_dir_fd
+    except TypeError:
+        supports_descriptor_open = False
+    if not callable(open_function) or not supports_descriptor_open:
+        missing.append("descriptor-relative os.open")
+    if not callable(getattr(os, "pread", None)):
+        missing.append("os.pread")
+    if not callable(getattr(os, "close", None)):
+        missing.append("os.close")
+    if not callable(getattr(os, "fstat", None)):
+        missing.append("os.fstat")
+    if missing:
+        raise NGramManifestError(
+            "n-gram verification lacks required platform capabilities: "
+            + ", ".join(missing)
+        )
+
+
 def verify_ngram_manifest(
     root: Path | str, manifest: NGramManifest
 ) -> VerifiedNGramArtifact:
@@ -1084,6 +1124,7 @@ def verify_ngram_manifest(
     serving performs no repeated metadata checks.
     """
 
+    _require_verification_capabilities()
     if type(manifest) is not NGramManifest:
         raise TypeError("manifest must be an exact NGramManifest")
     manifest.validate_structure()

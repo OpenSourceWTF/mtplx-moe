@@ -471,6 +471,11 @@ def test_verify_is_anchored_when_root_path_is_replaced_by_symlink(
         return original_open(path, flags, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
 
     monkeypatch.setattr(qwen4_ngram.os, "open", racing_open)
+    monkeypatch.setattr(
+        qwen4_ngram.os,
+        "supports_dir_fd",
+        frozenset((*qwen4_ngram.os.supports_dir_fd, racing_open)),
+    )
     try:
         with verify_ngram_manifest(root, manifest) as artifact:
             assert replaced
@@ -506,6 +511,11 @@ def test_verify_is_anchored_when_ancestor_is_replaced_by_symlink(
         return original_open(path, flags, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
 
     monkeypatch.setattr(qwen4_ngram.os, "open", racing_open)
+    monkeypatch.setattr(
+        qwen4_ngram.os,
+        "supports_dir_fd",
+        frozenset((*qwen4_ngram.os.supports_dir_fd, racing_open)),
+    )
     try:
         with verify_ngram_manifest(root, manifest) as artifact:
             assert replaced
@@ -728,6 +738,11 @@ def test_verify_closes_every_fd_after_mid_verification_failure(
         return fd
 
     monkeypatch.setattr(qwen4_ngram.os, "open", tracking_open)
+    monkeypatch.setattr(
+        qwen4_ngram.os,
+        "supports_dir_fd",
+        frozenset((*qwen4_ngram.os.supports_dir_fd, tracking_open)),
+    )
     with pytest.raises(NGramManifestError):
         verify_ngram_manifest(tmp_path, manifest)
 
@@ -742,6 +757,65 @@ def test_verify_missing_root_is_domain_error(tmp_path: Path) -> None:
 
     with pytest.raises(NGramManifestError):
         verify_ngram_manifest(tmp_path / "missing", manifest)
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "fcntl",
+        "flock",
+        "lock_sh",
+        "lock_nb",
+        "lock_un",
+        "o_nofollow",
+        "o_directory",
+        "o_cloexec",
+        "dir_fd_open",
+        "pread",
+        "close",
+    ],
+)
+def test_verify_fails_before_path_open_when_capability_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    manifest = _tiny_manifest(tmp_path)
+    if missing == "fcntl":
+        monkeypatch.setattr(qwen4_ngram, "fcntl", None)
+    elif missing == "flock":
+        monkeypatch.delattr(qwen4_ngram.fcntl, "flock")
+    elif missing == "lock_sh":
+        monkeypatch.delattr(qwen4_ngram.fcntl, "LOCK_SH")
+    elif missing == "lock_nb":
+        monkeypatch.delattr(qwen4_ngram.fcntl, "LOCK_NB")
+    elif missing == "lock_un":
+        monkeypatch.delattr(qwen4_ngram.fcntl, "LOCK_UN")
+    elif missing == "o_nofollow":
+        monkeypatch.delattr(qwen4_ngram.os, "O_NOFOLLOW")
+    elif missing == "o_directory":
+        monkeypatch.delattr(qwen4_ngram.os, "O_DIRECTORY")
+    elif missing == "o_cloexec":
+        monkeypatch.delattr(qwen4_ngram.os, "O_CLOEXEC")
+    elif missing == "dir_fd_open":
+        monkeypatch.setattr(
+            qwen4_ngram.os,
+            "supports_dir_fd",
+            frozenset(
+                function
+                for function in qwen4_ngram.os.supports_dir_fd
+                if function is not qwen4_ngram.os.open
+            ),
+        )
+    elif missing == "pread":
+        monkeypatch.setattr(qwen4_ngram.os, "pread", None)
+    else:
+        monkeypatch.setattr(qwen4_ngram.os, "close", None)
+
+    def unexpected_root_open(root: object) -> int:
+        raise AssertionError(f"artifact root was opened: {root}")
+
+    monkeypatch.setattr(qwen4_ngram, "_open_root_nofollow", unexpected_root_open)
+    with pytest.raises(NGramManifestError, match="capabilit|required primitive"):
+        verify_ngram_manifest(tmp_path, manifest)
 
 
 @pytest.mark.parametrize("corruption", ["short", "payload"])
