@@ -217,7 +217,8 @@ def decode_tree(spec: Any, read_tensor: Callable[[str], bytes]) -> Any:
     raise ValueError(f"unsupported SessionBank payload spec kind: {kind!r}")
 
 
-def encode_payload(
+def build_payload_spec(
+    codec: TreeCodec,
     *,
     cache_snapshot: CacheSnapshot,
     logits: Any,
@@ -225,11 +226,11 @@ def encode_payload(
     mtp_history_snapshot: CacheSnapshot | None,
     gdn_boundaries: tuple | list | None = None,
     has_recurrent: bool | None = None,
-    block_size: int = 256,
-    should_abort: Callable[[], bool] | None = None,
-) -> EncodedPayload:
-    codec = TreeCodec(block_size=block_size, should_abort=should_abort)
-    spec = {
+) -> dict[str, Any]:
+    """The payload spec structure, shared by the staged and streaming
+    encoders (cold_tier.put_entry vs cold_tier.spill_entry) so the two can
+    never drift into incompatible on-disk formats."""
+    return {
         "cache_snapshot": {
             "states": codec.encode(cache_snapshot.states),
             "meta_states": codec.encode(cache_snapshot.meta_states),
@@ -263,6 +264,29 @@ def encode_payload(
             else bool(gdn_boundaries)
         ),
     }
+
+
+def encode_payload(
+    *,
+    cache_snapshot: CacheSnapshot,
+    logits: Any,
+    hidden: Any | None,
+    mtp_history_snapshot: CacheSnapshot | None,
+    gdn_boundaries: tuple | list | None = None,
+    has_recurrent: bool | None = None,
+    block_size: int = 256,
+    should_abort: Callable[[], bool] | None = None,
+) -> EncodedPayload:
+    codec = TreeCodec(block_size=block_size, should_abort=should_abort)
+    spec = build_payload_spec(
+        codec,
+        cache_snapshot=cache_snapshot,
+        logits=logits,
+        hidden=hidden,
+        mtp_history_snapshot=mtp_history_snapshot,
+        gdn_boundaries=gdn_boundaries,
+        has_recurrent=has_recurrent,
+    )
     return EncodedPayload(
         spec=spec,
         tensors=dict(codec.tensors),
