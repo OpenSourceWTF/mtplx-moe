@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+from copy import copy
 from dataclasses import dataclass, replace
+from types import MappingProxyType
 
 import mlx.core as mx
 import numpy as np
 import pytest
 
 from mtplx.models.qwen4_exp import (
+    ModelArgs,
     Qwen4Cache,
     Qwen4GatedDeltaNet,
     Qwen4GatedResidual,
+    sanitize_qwen4_weights,
 )
 
 
@@ -22,8 +26,8 @@ class _TinyConfig:
     rms_norm_eps: float = 1e-6
     linear_num_key_heads: int = 2
     linear_num_value_heads: int = 6
-    linear_key_head_dim: int = 4
-    linear_value_head_dim: int = 4
+    linear_key_head_dim: int = 3
+    linear_value_head_dim: int = 5
     linear_conv_kernel_dim: int = 4
     hidden_act: str = "silu"
     output_gate_type: str = "sigmoid"
@@ -174,7 +178,7 @@ def _gdn_weights(config: _TinyConfig) -> dict[str, np.ndarray]:
         "conv1d.weight": rng.uniform(
             -0.3,
             0.3,
-            (conv_dim, config.linear_conv_kernel_dim, 1),
+            (conv_dim, 1, config.linear_conv_kernel_dim),
         ).astype(np.float32),
         "A_log": np.log(
             np.linspace(0.35, 1.4, config.linear_num_value_heads, dtype=np.float32)
@@ -202,7 +206,7 @@ def _depthwise_causal_conv(
         (np.zeros((batch, kernel_size - 1, channels), dtype=x.dtype), x), axis=1
     )
     out = np.empty_like(x)
-    per_channel = weight[..., 0]
+    per_channel = weight[:, 0, :]
     for token in range(length):
         window = padded[:, token : token + kernel_size, :]
         out[:, token, :] = np.sum(window * per_channel.T[None, :, :], axis=1)
@@ -213,16 +217,31 @@ def _gdn_reference(
     hidden: np.ndarray,
     weights: dict[str, np.ndarray],
     config: _TinyConfig,
-) -> np.ndarray:
+    *,
+    attention_mask: np.ndarray | None = None,
+    conv_state: np.ndarray | None = None,
+    recurrent_state: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     batch, length, _ = hidden.shape
     key_dim = config.linear_num_key_heads * config.linear_key_head_dim
     value_dim = config.linear_num_value_heads * config.linear_value_head_dim
-    mixed = _linear(hidden, weights["in_proj_qkv.weight"])
+    if attention_mask is None:
+        masked_hidden = hidden
+    else:
+        masked_hidden = np.where(attention_mask[..., None], hidden, 0.0)
+    mixed = _linear(masked_hidden, weights["in_proj_qkv.weight"])
+    if conv_state is None:
+        conv_state = np.zeros(
+            (batch, config.linear_conv_kernel_dim - 1, mixed.shape[-1]),
+            dtype=mixed.dtype,
+        )
+    conv_input = np.concatenate((conv_state, mixed), axis=1)
     mixed = _silu(
         _depthwise_causal_conv(
-            mixed, weights["conv1d.weight"], config.linear_conv_kernel_dim
+            conv_input, weights["conv1d.weight"], config.linear_conv_kernel_dim
         )
-    )
+    )[:, -length:]
+    next_conv_state = conv_input[:, -(config.linear_conv_kernel_dim - 1) :]
     query, key, value = np.split(mixed, (key_dim, 2 * key_dim), axis=-1)
     query = query.reshape(
         batch,
@@ -244,58 +263,71 @@ def _gdn_reference(
     query *= config.linear_key_head_dim**-0.5
     key *= 1.0 / np.sqrt(np.sum(key * key, axis=-1, keepdims=True) + 1e-6)
 
-    b = _linear(hidden, weights["in_proj_b.weight"]).astype(np.float32)
-    a = _linear(hidden, weights["in_proj_a.weight"]).astype(np.float32)
+    b = _linear(masked_hidden, weights["in_proj_b.weight"]).astype(np.float32)
+    a = _linear(masked_hidden, weights["in_proj_a.weight"]).astype(np.float32)
     beta = _sigmoid(b)
     decay = -np.exp(weights["A_log"].astype(np.float32)) * _softplus(
         a + weights["dt_bias"].astype(np.float32)
     )
-    state = np.zeros(
-        (
-            batch,
-            config.linear_num_value_heads,
-            config.linear_key_head_dim,
-            config.linear_value_head_dim,
-        ),
-        dtype=np.float32,
-    )
+    if recurrent_state is None:
+        recurrent_state = np.zeros(
+            (
+                batch,
+                config.linear_num_value_heads,
+                config.linear_value_head_dim,
+                config.linear_key_head_dim,
+            ),
+            dtype=np.float32,
+        )
+    state = recurrent_state.copy()
     recurrent_out = np.empty_like(value, dtype=np.float32)
     for token in range(length):
         q_t = query[:, token]
         k_t = key[:, token]
         v_t = value[:, token].astype(np.float32)
         state *= np.exp(decay[:, token])[..., None, None]
-        prediction = np.sum(state * k_t[..., None], axis=-2)
+        prediction = np.sum(state * k_t[..., None, :], axis=-1)
         state += (
             beta[:, token, :, None, None]
-            * k_t[..., None]
-            * (v_t - prediction)[..., None, :]
+            * (v_t - prediction)[..., :, None]
+            * k_t[..., None, :]
         )
-        recurrent_out[:, token] = np.sum(state * q_t[..., None], axis=-2)
+        recurrent_out[:, token] = np.sum(state * q_t[..., None, :], axis=-1)
 
     variance = np.mean(recurrent_out**2, axis=-1, keepdims=True)
     normalized = recurrent_out / np.sqrt(variance + config.rms_norm_eps)
     normalized *= weights["norm.weight"]
-    z = _linear(hidden, weights["in_proj_z.weight"]).reshape(value.shape)
+    z = _linear(masked_hidden, weights["in_proj_z.weight"]).reshape(value.shape)
     normalized *= _sigmoid(z.astype(np.float32))
-    return _linear(
-        normalized.reshape(batch, length, value_dim), weights["out_proj.weight"]
+    output = _linear(
+        normalized.reshape(batch, length, value_dim),
+        weights["out_proj.weight"],
     )
+    return output, next_conv_state, state
 
 
 def _make_gdn(
     config: _TinyConfig,
     *,
-    recurrent_lane: str | None = None,
+    recurrent_lane: str = "ops",
+    weight_dtype=None,
 ) -> tuple[Qwen4GatedDeltaNet, dict[str, np.ndarray]]:
-    module = Qwen4GatedDeltaNet(
+    module = Qwen4GatedDeltaNet.tiny(
         config,
         layer_idx=0,
         recurrent_lane=recurrent_lane,
     )
     weights = _gdn_weights(config)
+    source_weights = {}
+    for name, value in weights.items():
+        array = mx.array(value)
+        if weight_dtype is not None:
+            array = array.astype(weight_dtype)
+        source_weights[name] = array
+    sanitized = sanitize_qwen4_weights(source_weights)
     module.load_weights(
-        [(name, mx.array(value)) for name, value in weights.items()], strict=True
+        list(sanitized.items()),
+        strict=True,
     )
     return module, weights
 
@@ -304,7 +336,7 @@ def test_gdn_fixed_array_matches_independent_official_numpy_equations(mlx_cpu) -
     config = _TinyConfig()
     module, weights = _make_gdn(config)
     hidden_np = np.linspace(-0.9, 1.2, 2 * 7 * 5, dtype=np.float32).reshape(2, 7, 5)
-    expected = _gdn_reference(hidden_np, weights, config)
+    expected, _, _ = _gdn_reference(hidden_np, weights, config)
     actual = module(mx.array(hidden_np), cache=None)
     mx.eval(actual)
     np.testing.assert_allclose(np.asarray(actual), expected, rtol=3e-4, atol=3e-4)
@@ -358,6 +390,12 @@ def test_cache_snapshot_digest_covers_conv_recurrence_dtype_shape_and_offset(
         + config.linear_num_value_heads * config.linear_value_head_dim,
     )
     assert snapshot.gdn[0].recurrent_state.dtype == mx.float32
+    assert snapshot.gdn[0].recurrent_state.shape == (
+        1,
+        config.linear_num_value_heads,
+        config.linear_value_head_dim,
+        config.linear_key_head_dim,
+    )
     assert snapshot.gdn[0].offset == 2
 
 
@@ -368,11 +406,12 @@ def test_cache_snapshot_digest_covers_conv_recurrence_dtype_shape_and_offset(
         (128, 16, 48, 128),
     ],
 )
-def test_metal_recurrence_matches_logical_kv_ops_lane(
+def test_metal_recurrence_matches_physical_kv_ops_without_hot_transpose(
     head_k_dim: int,
     num_k_heads: int,
     num_v_heads: int,
     head_v_dim: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = replace(
         _TinyConfig(),
@@ -381,8 +420,8 @@ def test_metal_recurrence_matches_logical_kv_ops_lane(
         linear_num_value_heads=num_v_heads,
         linear_value_head_dim=head_v_dim,
     )
-    ops = Qwen4GatedDeltaNet(config, layer_idx=0, recurrent_lane="ops")
-    metal = Qwen4GatedDeltaNet(config, layer_idx=0, recurrent_lane="metal")
+    ops = Qwen4GatedDeltaNet.tiny(config, layer_idx=0, recurrent_lane="ops")
+    metal = Qwen4GatedDeltaNet.tiny(config, layer_idx=0, recurrent_lane="metal")
     rng = np.random.default_rng(20260827 + head_k_dim)
     shape_k = (1, 3, num_k_heads, head_k_dim)
     query = rng.normal(0.0, 0.05, shape_k).astype(np.float32)
@@ -400,13 +439,18 @@ def test_metal_recurrence_matches_logical_kv_ops_lane(
     state = rng.normal(
         0.0,
         0.03,
-        (1, num_v_heads, head_k_dim, head_v_dim),
+        (1, num_v_heads, head_v_dim, head_k_dim),
     ).astype(np.float32)
-    mask = mx.array([[True, False, True]])
     inputs = tuple(mx.array(item) for item in (query, key, value, decay, beta, state))
 
-    expected_output, expected_state = ops._recurrent(*inputs, mask)
-    actual_output, actual_state = metal._recurrent(*inputs, mask)
+    expected_output, expected_state = ops._recurrent(*inputs)
+    import mtplx.models.qwen4_exp_runtime as runtime
+
+    def reject_contiguous(*args, **kwargs):
+        raise AssertionError("physical recurrent state must not transpose or copy")
+
+    monkeypatch.setattr(runtime.mx, "contiguous", reject_contiguous)
+    actual_output, actual_state = metal._recurrent(*inputs)
     mx.eval(expected_output, expected_state, actual_output, actual_state)
 
     np.testing.assert_allclose(
@@ -421,6 +465,234 @@ def test_metal_recurrence_matches_logical_kv_ops_lane(
         rtol=2e-5,
         atol=2e-5,
     )
+
+
+def test_masked_full_and_chunk_decode_match_official_numpy_semantics(mlx_cpu) -> None:
+    config = _TinyConfig()
+    module, weights = _make_gdn(config)
+    hidden = np.linspace(-1.4, 1.6, 6 * config.hidden_size, dtype=np.float32).reshape(
+        1, 6, config.hidden_size
+    )
+    mask = np.array([[True, False, True, True, False, False]])
+    expected, expected_conv, expected_recurrent = _gdn_reference(
+        hidden,
+        weights,
+        config,
+        attention_mask=mask,
+    )
+
+    actual_full = module(
+        mx.array(hidden),
+        cache=None,
+        attention_mask=mx.array(mask),
+    )
+    cache = Qwen4Cache.tiny(gdn_layers=(0,), qsa_layers=())
+    prefix = module(
+        mx.array(hidden[:, :4]),
+        cache=cache,
+        attention_mask=mx.array(mask[:, :4]),
+    )
+    decode = module(
+        mx.array(hidden[:, 4:]),
+        cache=cache,
+        attention_mask=mx.array(mask[:, 4:]),
+    )
+    actual_chunked = mx.concatenate((prefix, decode), axis=1)
+    snapshot = cache.snapshot()
+    mx.eval(actual_full, actual_chunked, *snapshot.arrays())
+
+    np.testing.assert_allclose(np.asarray(actual_full), expected, rtol=3e-4, atol=3e-4)
+    np.testing.assert_allclose(
+        np.asarray(actual_chunked), expected, rtol=3e-4, atol=3e-4
+    )
+    np.testing.assert_allclose(
+        np.asarray(snapshot.gdn[0].conv_state),
+        expected_conv,
+        rtol=2e-5,
+        atol=2e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(snapshot.gdn[0].recurrent_state),
+        expected_recurrent,
+        rtol=3e-4,
+        atol=3e-4,
+    )
+
+
+def test_source_conv_layout_is_sanitized_once_and_matches_causal_orientation(
+    mlx_cpu,
+) -> None:
+    config = _TinyConfig()
+    module, weights = _make_gdn(config)
+    source = mx.array(weights["conv1d.weight"])
+    sanitized = sanitize_qwen4_weights({"conv1d.weight": source})
+    expected = np.transpose(weights["conv1d.weight"], (0, 2, 1))
+
+    assert sanitized["conv1d.weight"].shape == expected.shape
+    np.testing.assert_array_equal(np.asarray(sanitized["conv1d.weight"]), expected)
+    with pytest.raises(ValueError, match="source.*converter"):
+        sanitize_qwen4_weights(sanitized)
+
+    hidden = np.linspace(-0.7, 0.9, 4 * config.hidden_size, dtype=np.float32).reshape(
+        1, 4, config.hidden_size
+    )
+    expected_output, _, _ = _gdn_reference(hidden, weights, config)
+    actual = module(mx.array(hidden), cache=None)
+    mx.eval(actual)
+    np.testing.assert_allclose(
+        np.asarray(actual), expected_output, rtol=3e-4, atol=3e-4
+    )
+
+
+def test_bf16_snapshot_digest_uses_raw_bits_and_restores_exactly(mlx_cpu) -> None:
+    config = _TinyConfig()
+    module, _ = _make_gdn(config, weight_dtype=mx.bfloat16)
+    cache = Qwen4Cache.tiny(gdn_layers=(0,), qsa_layers=())
+    hidden = mx.array(
+        np.linspace(-1.0, 1.0, 3 * config.hidden_size, dtype=np.float32).reshape(
+            1, 3, config.hidden_size
+        ),
+        dtype=mx.bfloat16,
+    )
+    module(hidden[:, :2], cache=cache)
+    snapshot = cache.snapshot()
+    mx.eval(*snapshot.arrays())
+    assert snapshot.gdn[0].conv_state.dtype == mx.bfloat16
+    digest = snapshot.digest()
+
+    module(hidden[:, 2:], cache=cache)
+    assert cache.snapshot().digest() != digest
+    cache.restore(snapshot)
+
+    assert cache.snapshot().digest() == digest
+    assert snapshot.gdn[0].conv_state.dtype == mx.bfloat16
+
+
+def _corrupt_snapshot(snapshot, **changes):
+    corrupted = copy(snapshot)
+    for name, value in changes.items():
+        object.__setattr__(corrupted, name, value)
+    return corrupted
+
+
+def test_snapshot_rejects_foreign_partial_extra_and_malformed_atomically(
+    mlx_cpu,
+) -> None:
+    config = _TinyConfig()
+    module, _ = _make_gdn(config)
+    cache = Qwen4Cache.tiny(gdn_layers=(0,), qsa_layers=(3,))
+    module(mx.ones((1, 2, config.hidden_size)), cache=cache)
+    snapshot = cache.snapshot()
+    before = snapshot.digest()
+
+    foreign = Qwen4Cache.tiny(gdn_layers=(0,), qsa_layers=(3,))
+    with pytest.raises(ValueError, match="owner"):
+        foreign.restore(snapshot)
+    assert foreign.snapshot().digest() != before
+
+    malformed = [
+        object(),
+        _corrupt_snapshot(snapshot, _schema="wrong"),
+        _corrupt_snapshot(snapshot, _generation=-1),
+        _corrupt_snapshot(snapshot, _gdn=MappingProxyType({})),
+        _corrupt_snapshot(
+            snapshot,
+            _gdn=MappingProxyType({**snapshot.gdn, 2: snapshot.gdn[0]}),
+        ),
+        _corrupt_snapshot(snapshot, _qsa_layers=()),
+    ]
+    bad_state = copy(snapshot.gdn[0])
+    object.__setattr__(bad_state, "offset", -1)
+    malformed.append(_corrupt_snapshot(snapshot, _gdn=MappingProxyType({0: bad_state})))
+    wrong_dtype = copy(snapshot.gdn[0])
+    object.__setattr__(
+        wrong_dtype,
+        "recurrent_state",
+        snapshot.gdn[0].recurrent_state.astype(mx.float16),
+    )
+    malformed.append(
+        _corrupt_snapshot(snapshot, _gdn=MappingProxyType({0: wrong_dtype}))
+    )
+
+    for candidate in malformed:
+        with pytest.raises((TypeError, ValueError)):
+            cache.restore(candidate)
+        assert cache.snapshot().digest() == before
+        with pytest.raises((TypeError, ValueError)):
+            cache.trim(0, snapshot=candidate)
+        assert cache.snapshot().digest() == before
+
+
+def _model_args() -> ModelArgs:
+    import mtplx.models.qwen4_exp as qwen4
+
+    payload = dict(qwen4._PINNED_MODEL_SCALARS)
+    payload.update(
+        layer_types=list(qwen4._PINNED_LAYER_TYPES),
+        ple_layer_ids=[2],
+        mtp={
+            "hybrid": True,
+            "layer_types": ["qwen_sparse_attention"],
+            "mtp_use_hidden_state_from_layer": None,
+            "num_hidden_layers": 1,
+            "rope_theta": 10_000_000,
+        },
+        rope_parameters={
+            "mrope_interleaved": True,
+            "mrope_section": [11, 11, 10],
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 10_000_000,
+            "rope_type": "default",
+        },
+    )
+    return ModelArgs.from_dict(payload)
+
+
+def test_production_factory_derives_layer_ownership_and_rejects_qsa_layers() -> None:
+    args = _model_args()
+    cache = Qwen4Cache.from_model_args(args)
+    expected_gdn = tuple(layer for layer in range(48) if layer % 4 != 3)
+    expected_qsa = tuple(layer for layer in range(48) if layer % 4 == 3)
+
+    assert tuple(cache.gdn) == expected_gdn
+    assert tuple(cache.qsa) == expected_qsa
+    with pytest.raises(TypeError):
+        cache.gdn[0] = object()
+    with pytest.raises(ValueError, match="QSA"):
+        Qwen4GatedDeltaNet(args, layer_idx=3)
+    with pytest.raises(ValueError, match="range"):
+        Qwen4GatedDeltaNet(args, layer_idx=48)
+
+
+def test_tiny_lane_is_explicit_and_runtime_shapes_are_rejected(mlx_cpu) -> None:
+    config = _TinyConfig()
+    with pytest.raises(TypeError, match="ModelArgs"):
+        Qwen4GatedDeltaNet(config, layer_idx=0)
+    with pytest.raises(TypeError, match="recurrent_lane"):
+        Qwen4GatedDeltaNet.tiny(config, layer_idx=0, recurrent_lane=None)
+
+    module, _ = _make_gdn(config)
+    with pytest.raises(ValueError, match="rank"):
+        module(mx.ones((2, config.hidden_size)))
+    with pytest.raises(ValueError, match="hidden"):
+        module(mx.ones((1, 2, config.hidden_size + 1)))
+    with pytest.raises(ValueError, match="zero"):
+        module(mx.ones((1, 0, config.hidden_size)))
+    with pytest.raises(ValueError, match="mask"):
+        module(
+            mx.ones((1, 2, config.hidden_size)),
+            attention_mask=mx.ones((1, 2)),
+        )
+    with pytest.raises(ValueError, match="mask"):
+        module(
+            mx.ones((1, 2, config.hidden_size)),
+            attention_mask=mx.array([[True]]),
+        )
+
+    cache = Qwen4Cache.tiny(gdn_layers=(0,), qsa_layers=())
+    module(mx.ones((1, 1, config.hidden_size)), cache=cache)
+    with pytest.raises(ValueError, match="batch"):
+        module(mx.ones((2, 1, config.hidden_size)), cache=cache)
 
 
 @pytest.mark.parametrize(
@@ -439,7 +711,11 @@ def test_gdn_rejects_invalid_topology_at_construction(
     values = dict(_TinyConfig().__dict__)
     values.update(changes)
     with pytest.raises(ValueError, match=match):
-        Qwen4GatedDeltaNet(_TinyConfig(**values), layer_idx=0)
+        Qwen4GatedDeltaNet.tiny(
+            _TinyConfig(**values),
+            layer_idx=0,
+            recurrent_lane="ops",
+        )
 
 
 def test_cache_rejects_ambiguous_or_duplicate_layer_ownership() -> None:

@@ -9,7 +9,6 @@ from pathlib import Path
 
 from mtplx.version import DISPLAY_VERSION, __version__
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -90,8 +89,7 @@ def _run_no_mlx(
         cwd=cwd or ROOT,
         env=env,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         check=False,
     )
 
@@ -101,6 +99,52 @@ def test_import_mtplx_without_mlx(tmp_path: Path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == "ok"
+
+
+def test_qwen4_model_args_parse_without_mlx_numpy_or_runtime_imports(
+    tmp_path: Path,
+) -> None:
+    script = textwrap.dedent(
+        """
+        import sys
+        import mtplx.models.qwen4_exp as qwen4
+
+        payload = dict(qwen4._PINNED_MODEL_SCALARS)
+        payload.update(
+            layer_types=list(qwen4._PINNED_LAYER_TYPES),
+            ple_layer_ids=[2],
+            mtp={
+                "hybrid": True,
+                "layer_types": ["qwen_sparse_attention"],
+                "mtp_use_hidden_state_from_layer": None,
+                "num_hidden_layers": 1,
+                "rope_theta": 10_000_000,
+            },
+            rope_parameters={
+                "mrope_interleaved": True,
+                "mrope_section": [11, 11, 10],
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 10_000_000,
+                "rope_type": "default",
+            },
+        )
+        args = qwen4.ModelArgs.from_dict(payload)
+        assert args.hidden_size == 2560
+        assert "mtplx.models.qwen4_exp_runtime" not in sys.modules
+        assert "mlx" not in sys.modules
+        assert "mlx_lm" not in sys.modules
+        assert "numpy" not in sys.modules
+        print("qwen4-config-ok")
+        """
+    )
+    proc = _run_no_mlx(
+        tmp_path,
+        ["-c", script],
+        block_modules=("mlx", "mlx_lm", "numpy"),
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "qwen4-config-ok"
 
 
 def test_version_without_mlx(tmp_path: Path) -> None:
@@ -292,9 +336,7 @@ def test_run_uses_config_model_without_importing_mlx(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     cache = tmp_path / "cache"
     config.write_text(
-        'model = "mtplx/example"\n'
-        f'model_dir = "{cache}"\n'
-        'profile = "exact"\n',
+        f'model = "mtplx/example"\nmodel_dir = "{cache}"\nprofile = "exact"\n',
         encoding="utf-8",
     )
 
