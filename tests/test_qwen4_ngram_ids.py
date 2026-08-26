@@ -765,6 +765,7 @@ def test_verify_missing_root_is_domain_error(tmp_path: Path) -> None:
         "fcntl",
         "flock",
         "lock_sh",
+        "lock_ex",
         "lock_nb",
         "lock_un",
         "o_nofollow",
@@ -785,6 +786,8 @@ def test_verify_fails_before_path_open_when_capability_is_missing(
         monkeypatch.delattr(qwen4_ngram.fcntl, "flock")
     elif missing == "lock_sh":
         monkeypatch.delattr(qwen4_ngram.fcntl, "LOCK_SH")
+    elif missing == "lock_ex":
+        monkeypatch.delattr(qwen4_ngram.fcntl, "LOCK_EX")
     elif missing == "lock_nb":
         monkeypatch.delattr(qwen4_ngram.fcntl, "LOCK_NB")
     elif missing == "lock_un":
@@ -809,6 +812,33 @@ def test_verify_fails_before_path_open_when_capability_is_missing(
         monkeypatch.setattr(qwen4_ngram.os, "pread", None)
     else:
         monkeypatch.setattr(qwen4_ngram.os, "close", None)
+
+    def unexpected_root_open(root: object) -> int:
+        raise AssertionError(f"artifact root was opened: {root}")
+
+    monkeypatch.setattr(qwen4_ngram, "_open_root_nofollow", unexpected_root_open)
+    with pytest.raises(NGramManifestError, match="capabilit|required primitive"):
+        verify_ngram_manifest(tmp_path, manifest)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("LOCK_SH", 0),
+        ("LOCK_NB", False),
+        ("LOCK_UN", "8"),
+        ("LOCK_EX", fcntl.LOCK_SH),
+        ("LOCK_NB", fcntl.LOCK_SH | fcntl.LOCK_NB),
+    ],
+)
+def test_verify_rejects_invalid_or_overlapping_lock_capabilities_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: object,
+) -> None:
+    manifest = _tiny_manifest(tmp_path)
+    monkeypatch.setattr(qwen4_ngram.fcntl, name, value)
 
     def unexpected_root_open(root: object) -> int:
         raise AssertionError(f"artifact root was opened: {root}")

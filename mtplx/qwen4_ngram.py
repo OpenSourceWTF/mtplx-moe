@@ -1081,10 +1081,21 @@ def _require_verification_capabilities() -> None:
     else:
         if not callable(getattr(fcntl, "flock", None)):
             missing.append("fcntl.flock")
-        for name in ("LOCK_SH", "LOCK_NB", "LOCK_UN"):
+        lock_values: list[tuple[str, int]] = []
+        for name in ("LOCK_SH", "LOCK_EX", "LOCK_NB", "LOCK_UN"):
             value = getattr(fcntl, name, None)
-            if type(value) is not int:
+            if type(value) is not int or value <= 0:
                 missing.append(f"fcntl.{name}")
+            else:
+                lock_values.append((name, value))
+        if len(lock_values) == 4:
+            overlaps = any(
+                left_value & right_value
+                for index, (_left_name, left_value) in enumerate(lock_values)
+                for _right_name, right_value in lock_values[index + 1 :]
+            )
+            if overlaps:
+                missing.append("distinct non-overlapping fcntl lock flags")
     for name in ("O_NOFOLLOW", "O_DIRECTORY", "O_CLOEXEC"):
         value = getattr(os, name, None)
         if type(value) is not int or value == 0:
