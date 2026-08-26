@@ -5993,6 +5993,81 @@ def test_streaming_tool_call_finishes_without_waiting_for_model_eos(monkeypatch)
     assert final[-1]["mtplx_stats"]["tool_parser_source"] == "streaming_translator"
 
 
+def test_early_tool_cancel_survives_a_producer_gap_longer_than_the_queue_poll(
+    monkeypatch,
+):
+    """#343: the loop's own early tool-call cancel must not be read back as a
+    foreign POST /v1/mtplx/cancel. The worker only observes the cancel once
+    per committed token batch, so when that gap outlives the 0.25s queue poll
+    the Empty branch used to see its own cancel_event and kill a healthy
+    tool-calling turn with an error frame."""
+    state = _fake_state()
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+
+    text = (
+        "<tool_call>\n"
+        "<function=session_status>\n"
+        "</function>\n"
+        "</tool_call>"
+        " trailing text that should not stream"
+    )
+    tokens = [ord(char) for char in text]
+
+    def slow_ack_generation(_state, _prompt_ids, **kwargs):
+        token_callback = kwargs.get("token_callback")
+        if token_callback is not None:
+            for token in tokens:
+                token_callback([token])
+        # The reported failure shape (#343): after the complete tool call,
+        # the next committed batch is further away than the grace (0.05s)
+        # plus the stream loop's queue poll (0.25s), so the loop hits Empty
+        # with its own cancel_event already set.
+        time.sleep(1.2)
+        return {
+            "text": text,
+            "tokens": tokens,
+            "stats": {
+                "generation_mode": kwargs["generation_mode"],
+                "mtp_depth": kwargs["depth"],
+                "completion_tokens": len(tokens),
+            },
+            "prompt_tokens": 3,
+            "completion_tokens": len(tokens),
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(openai, "_run_generation", slow_ack_generation)
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Check status."}],
+            "tools": [_tool_schema()],
+            "tool_choice": "auto",
+            "stream": True,
+            "max_tokens": 256,
+        },
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "request cancelled via POST /v1/mtplx/cancel" not in body
+    payloads = _stream_payloads(body)
+    deltas = [
+        choice.get("delta", {})
+        for payload in payloads
+        for choice in payload.get("choices", [])
+    ]
+    assert any(delta.get("tool_calls") for delta in deltas)
+    final = [payload for payload in payloads if payload["choices"][0]["finish_reason"]]
+    assert final[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    assert final[-1]["mtplx_stats"]["early_tool_cancel_used"] is True
+
+
 def test_streaming_tool_call_canonicalizes_shell_alias_to_bash(monkeypatch):
     state = _fake_state()
     state.runtime.tokenizer = CaptureTokenizer()
