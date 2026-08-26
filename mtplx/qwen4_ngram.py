@@ -1328,32 +1328,114 @@ class _CacheRoute:
     future: Future[None] | None = None
 
 
+@dataclass(frozen=True)
+class _InstalledNGramShard:
+    """Construction-proven physical route to one retained shard descriptor."""
+
+    index: int
+    start_row: int
+    stop_row: int
+    data_offset: int
+    data_bytes: int
+    retained: VerifiedNGramShard
+
+
+def _install_ngram_shard_routes(
+    artifact: VerifiedNGramArtifact,
+) -> tuple[_InstalledNGramShard, ...]:
+    """Seal manifest order, physical ranges, and live descriptor identities."""
+
+    manifest_shards = artifact.manifest.shards
+    retained_shards = artifact.shards
+    if type(retained_shards) is not tuple:
+        raise ValueError("verified n-gram shards must be an exact tuple")
+    if len(retained_shards) != len(manifest_shards):
+        raise ValueError("verified n-gram shard count does not match the manifest")
+    routes: list[_InstalledNGramShard] = []
+    descriptors: set[int] = set()
+    identities: set[tuple[int, int]] = set()
+    for index, (expected, retained) in enumerate(
+        zip(manifest_shards, retained_shards, strict=True)
+    ):
+        if type(retained) is not VerifiedNGramShard:
+            raise TypeError("verified shard owner has the wrong exact type")
+        if type(retained.shard) is not NGramShard or retained.shard != expected:
+            raise ValueError(
+                f"verified shard {index} metadata/order does not match the manifest"
+            )
+        if type(retained.identity) is not NGramFileIdentity:
+            raise TypeError("verified shard identity has the wrong exact type")
+        if retained.closed:
+            raise NGramCacheClosed(f"verified shard {expected.name} is closed")
+        try:
+            descriptor = retained.fileno()
+            metadata = os.fstat(descriptor)
+        except (NGramManifestError, OSError) as exc:
+            raise NGramCacheIOError(
+                f"could not prove retained shard {expected.name}: {exc}"
+            ) from exc
+        current_identity = NGramFileIdentity(
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            size=metadata.st_size,
+            mtime_ns=metadata.st_mtime_ns,
+            ctime_ns=metadata.st_ctime_ns,
+        )
+        if retained.identity != current_identity:
+            raise NGramCacheIOError(
+                f"retained shard {expected.name} identity changed after verification"
+            )
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise NGramCacheIOError(
+                f"retained shard {expected.name} is not a singly-linked regular file"
+            )
+        if expected.file_size != current_identity.size:
+            raise NGramCacheIOError(
+                f"retained shard {expected.name} size does not match the manifest"
+            )
+        file_identity = (current_identity.device, current_identity.inode)
+        if descriptor in descriptors or file_identity in identities:
+            raise NGramCacheIOError("retained n-gram descriptors are not unique")
+        descriptors.add(descriptor)
+        identities.add(file_identity)
+        routes.append(
+            _InstalledNGramShard(
+                index=index,
+                start_row=expected.start_row,
+                stop_row=expected.start_row + expected.row_count,
+                data_offset=expected.data_offset,
+                data_bytes=expected.data_bytes,
+                retained=retained,
+            )
+        )
+    return tuple(routes)
+
+
+def _install_page_cache_policy(
+    routes: tuple[_InstalledNGramShard, ...], bypass_page_cache: bool
+) -> None:
+    if not bypass_page_cache:
+        return
+    if (
+        fcntl is None
+        or type(getattr(fcntl, "F_NOCACHE", None)) is not int
+        or not callable(getattr(fcntl, "fcntl", None))
+    ):
+        raise ValueError("bypass_page_cache requires Darwin fcntl.F_NOCACHE support")
+    command = fcntl.F_NOCACHE
+    try:
+        for route in routes:
+            fcntl.fcntl(route.retained.fileno(), command, 1)
+    except (NGramManifestError, OSError, TypeError, ValueError) as exc:
+        raise NGramCacheIOError(
+            f"could not install F_NOCACHE on retained n-gram shards: {exc}"
+        ) from exc
+
+
 class _DescriptorReader:
-    """The production descriptor reader selected once during construction."""
+    """Production descriptor reader with no runtime policy selection."""
 
-    __slots__ = ("_read_impl",)
-
-    def __init__(self, bypass_page_cache: bool) -> None:
-        if bypass_page_cache:
-            if fcntl is None or type(getattr(fcntl, "F_NOCACHE", None)) is not int:
-                raise ValueError(
-                    "bypass_page_cache requires Darwin fcntl.F_NOCACHE support"
-                )
-            command = fcntl.F_NOCACHE
-
-            # Capture the descriptor lookup in the selected lane, not the
-            # common dispatch below.
-            def selected(
-                shard: VerifiedNGramShard, offset: int, length: int
-            ) -> bytes:
-                descriptor = shard.fileno()
-                payload = shard.pread(offset, length)
-                fcntl.fcntl(descriptor, command, 1)
-                return payload
-
-            self._read_impl = selected
-        else:
-            self._read_impl = VerifiedNGramShard.pread
+    __slots__ = ()
 
     def read(
         self,
@@ -1364,7 +1446,7 @@ class _DescriptorReader:
         bypass_page_cache: bool,
     ) -> bytes:
         del bypass_page_cache
-        return self._read_impl(shard, offset, length)
+        return shard.pread(offset, length)
 
 
 class NGramLease:
@@ -1497,6 +1579,15 @@ class NGramRowCache:
             raise ValueError(
                 "max_open_files is smaller than the retained verified shard set"
             )
+        installed_routes = _install_ngram_shard_routes(artifact)
+        _install_page_cache_policy(installed_routes, config.bypass_page_cache)
+        selected_reader = (
+            reader
+            if reader is not None
+            else _DescriptorReader()
+        )
+        if not callable(getattr(selected_reader, "read", None)):
+            raise TypeError("reader must provide a callable read method")
         selected_allocator = bytearray if allocator is None else allocator
         arena_object = selected_allocator(config.cache_limit_bytes)
         try:
@@ -1518,17 +1609,9 @@ class NGramRowCache:
             _CacheSlot() for _ in range(config.cache_limit_bytes // row_bytes)
         ]
         self._routes: dict[int, _CacheRoute] = {}
-        self._shard_indexes = {
-            verified.shard.name: index
-            for index, verified in enumerate(artifact.shards)
-        }
-        if len(self._shard_indexes) != len(artifact.shards):
-            raise ValueError("verified artifact contains duplicate shard names")
-        self._reader = reader if reader is not None else _DescriptorReader(
-            config.bypass_page_cache
-        )
-        if not callable(getattr(self._reader, "read", None)):
-            raise TypeError("reader must provide a callable read method")
+        self._physical_routes = installed_routes
+        self._physical_starts = tuple(route.start_row for route in installed_routes)
+        self._reader = selected_reader
         self._select_victims = (
             self._lru_victims
             if config.eviction == "lru"
@@ -1536,7 +1619,7 @@ class NGramRowCache:
         )
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(
-            max_workers=max(1, min(config.max_open_files, len(artifact.shards))),
+            max_workers=max(1, min(config.max_open_files, len(installed_routes))),
             thread_name_prefix="qwen4-ngram",
         )
         self._worker_futures: set[Future[None]] = set()
@@ -1614,7 +1697,7 @@ class NGramRowCache:
         length: int,
         rows: tuple[tuple[int, SlotTicket], ...],
     ) -> None:
-        shard = self.artifact.shards[shard_index]
+        shard = self._physical_routes[shard_index].retained
         try:
             payload = self._reader.read(
                 shard,
@@ -1670,14 +1753,10 @@ class NGramRowCache:
     ) -> tuple[tuple[int, int, int, tuple[tuple[int, SlotTicket], ...]], ...]:
         located: list[tuple[int, int, int, SlotTicket]] = []
         for row, ticket in misses:
-            shard, offset = self.manifest.locate_row(row)
-            try:
-                shard_index = self._shard_indexes[shard.name]
-            except KeyError as exc:  # construction should make this unreachable
-                raise NGramCacheIOError(
-                    f"verified descriptor missing for shard {shard.name}"
-                ) from exc
-            located.append((shard_index, offset, row, ticket))
+            route_index = bisect_right(self._physical_starts, row) - 1
+            route = self._physical_routes[route_index]
+            offset = route.data_offset + (row - route.start_row) * self._row_bytes
+            located.append((route.index, offset, row, ticket))
         located.sort(key=lambda item: (item[0], item[1]))
         groups: list[tuple[int, int, int, tuple[tuple[int, SlotTicket], ...]]] = []
         for shard_index, offset, row, ticket in located:

@@ -4,7 +4,7 @@ import hashlib
 import os
 import threading
 from concurrent.futures import CancelledError
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -178,7 +178,7 @@ def test_cache_deduplicates_pins_and_never_grows(tmp_path: Path) -> None:
 
 
 def test_adjacent_rows_coalesce_only_within_one_shard(tmp_path: Path) -> None:
-    fixture = fixture_cache(tmp_path, slots=5, bypass_page_cache=True)
+    fixture = fixture_cache(tmp_path, slots=5)
     try:
         lease = fixture.cache.acquire_rows((4, 5, 6, 7, 9))
         lease.release()
@@ -191,7 +191,7 @@ def test_adjacent_rows_coalesce_only_within_one_shard(tmp_path: Path) -> None:
                 (second_fd, 3 * ROW_BYTES, ROW_BYTES),
             ]
         )
-        assert sorted(fixture.reader.nocache_ranges) == sorted(fixture.reader.reads)
+        assert fixture.reader.nocache_ranges == []
     finally:
         fixture.close()
 
@@ -224,12 +224,118 @@ def test_default_reader_applies_selected_f_nocache_after_read(
         allocator=bytearray,
     )
     try:
+        expected = sorted(
+            (shard.fileno(), 48, 1) for shard in fixture.artifact.shards
+        )
+        assert sorted(calls) == expected
         lease = cache.acquire_rows((1,))
         assert lease.row_bytes(0) == fixture_row(1)
         lease.release()
-        assert calls == [(fixture.artifact.shards[0].fileno(), 48, 1)]
+        cache.acquire_rows((7,)).release()
+        assert sorted(calls) == expected
     finally:
         cache.close()
+        fixture.artifact.close()
+
+
+def test_f_nocache_failure_rejects_construction_before_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = fixture_cache(tmp_path)
+    fixture.cache.close()
+    allocations: list[int] = []
+    assert qwen4_ngram.fcntl is not None
+    monkeypatch.setattr(qwen4_ngram.fcntl, "F_NOCACHE", 48, raising=False)
+
+    def fail_f_nocache(descriptor: int, command: int, value: int) -> None:
+        del descriptor, command, value
+        raise OSError("synthetic F_NOCACHE failure")
+
+    monkeypatch.setattr(qwen4_ngram.fcntl, "fcntl", fail_f_nocache)
+    try:
+        with pytest.raises(NGramCacheIOError, match="F_NOCACHE"):
+            NGramRowCache(
+                fixture.artifact,
+                NGramCacheConfig(
+                    cache_limit_bytes=ROW_BYTES,
+                    transient_limit_bytes=ROW_BYTES,
+                    max_inflight_io_bytes=ROW_BYTES,
+                    max_open_files=2,
+                    bypass_page_cache=True,
+                    eviction="lru",
+                ),
+                allocator=lambda size: (allocations.append(size), bytearray(size))[1],
+            )
+        assert allocations == []
+    finally:
+        fixture.artifact.close()
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "missing",
+        "extra",
+        "reordered",
+        "name",
+        "range",
+        "offset",
+        "bytes",
+        "identity",
+        "closed",
+    ],
+)
+def test_malformed_retained_routes_fail_before_arena_or_reader_work(
+    tmp_path: Path, corruption: str
+) -> None:
+    fixture = fixture_cache(tmp_path)
+    fixture.cache.close()
+    original_shards = fixture.artifact.shards
+    first = original_shards[0]
+    original_metadata = first.shard
+    original_identity = first.identity
+    if corruption == "missing":
+        fixture.artifact.shards = original_shards[:1]
+    elif corruption == "extra":
+        fixture.artifact.shards = original_shards + (original_shards[0],)
+    elif corruption == "reordered":
+        fixture.artifact.shards = tuple(reversed(original_shards))
+    elif corruption == "name":
+        first.shard = replace(first.shard, name="wrong.bin")
+    elif corruption == "range":
+        first.shard = replace(first.shard, row_count=5, data_bytes=5 * ROW_BYTES)
+    elif corruption == "offset":
+        first.shard = replace(first.shard, data_offset=1, file_size=6 * ROW_BYTES + 1)
+    elif corruption == "bytes":
+        first.shard = replace(first.shard, data_bytes=5 * ROW_BYTES)
+    elif corruption == "identity":
+        first.identity = replace(first.identity, inode=first.identity.inode + 1)
+    else:
+        first.close()
+
+    allocations: list[int] = []
+    reader = RecordingReader()
+    try:
+        with pytest.raises((NGramCacheClosed, NGramCacheIOError, ValueError)):
+            NGramRowCache(
+                fixture.artifact,
+                NGramCacheConfig(
+                    cache_limit_bytes=ROW_BYTES,
+                    transient_limit_bytes=ROW_BYTES,
+                    max_inflight_io_bytes=ROW_BYTES,
+                    max_open_files=3,
+                    bypass_page_cache=False,
+                    eviction="lru",
+                ),
+                reader=reader,
+                allocator=lambda size: (allocations.append(size), bytearray(size))[1],
+            )
+        assert allocations == []
+        assert reader.reads == []
+    finally:
+        fixture.artifact.shards = original_shards
+        first.shard = original_metadata
+        first.identity = original_identity
         fixture.artifact.close()
 
 
