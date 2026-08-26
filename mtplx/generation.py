@@ -15,7 +15,7 @@ import json
 import os
 import sys
 import time
-from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Literal
@@ -31,6 +31,7 @@ from .a3b_compiled_target_prefix import (
 )
 from .a3b_whole_moe import validate_a3b_whole_moe_request
 from .adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
+from .adaptive_dtemp import build_adaptive_dtemp_controller
 from .attention_context import attention_phase, model_forward_kind
 from .deepseek_v4_adaptive_width import (
     validate_installed_deepseek_v4_adaptive_width_policy,
@@ -1991,6 +1992,12 @@ class GenerationStats:
     drafted_by_depth: list[int] = field(default_factory=list)
     accept_probability_sum_by_depth: list[float] = field(default_factory=list)
     mean_accept_probability_by_depth: list[float | None] = field(default_factory=list)
+    # Acceptance-EMA adaptive draft temperature (MTPLX_ADAPTIVE_DTEMP).
+    # {} when the gate is off (quiet envelopes stay byte-stable — the server
+    # stamps this into mtplx_stats and the request-log envelope only when
+    # non-empty); an active/inactive summary dict otherwise. See
+    # mtplx/adaptive_dtemp.py for the schedule and its 08-25 receipts.
+    draft_sampler_adaptive_dtemp: dict[str, object] = field(default_factory=dict)
     skipped_drafts: int = 0
     bonus_tokens: int = 0
     correction_tokens: int = 0
@@ -8381,6 +8388,42 @@ def generate_mtpk(
         and _mtp_history_uses_committed_cache(mtp_history_policy)
         and _env_enabled_default_on("MTPLX_GREEDY_DRAFT_CHAIN")
     )
+    # Acceptance-EMA adaptive draft temperature (MTPLX_ADAPTIVE_DTEMP,
+    # default off) — HYPER-PLAN §15 ship shape for the register-dependent
+    # dtemp-0.85 lever. PRE-BOUND like the greedy chain above: activation is
+    # decided once per request from request-invariant terms; only the
+    # temperature VALUE moves per round (exact for any q — the probability-
+    # ratio acceptance derives p and q independently). The blocker list is
+    # the plain product draft lane: every excluded lane either bakes the
+    # draft temperature into a compiled core (device/device-d2 — rebuild
+    # signature does not cover the sampler), drafts greedily (chain,
+    # coupling, margin threshold, adaptive-width d1/d2), replaces the
+    # sampled proposal (ensemble, reranker), or clamps acceptance so the
+    # pos-1 observable is invalid (constraints, target-prefix verify).
+    # Receipts + schedule: mtplx/adaptive_dtemp.py docstring.
+    _dtemp_blockers: list[str] = []
+    if draft_sampler.temperature <= 0:
+        _dtemp_blockers.append("greedy_draft")
+    if sampler.temperature <= 0:
+        _dtemp_blockers.append("greedy_target")
+    if draft_core != "stock":
+        _dtemp_blockers.append(f"draft_core:{draft_core}")
+    if adaptive_width_policy is not None:
+        _dtemp_blockers.append("adaptive_width_policy")
+    if draft_margin_threshold is not None:
+        _dtemp_blockers.append("draft_margin_threshold")
+    if target_prefix_verify or a3b_target_prefix_route is not None:
+        _dtemp_blockers.append("target_prefix_verify")
+    if constraint is not None:
+        _dtemp_blockers.append("constraint")
+    if adapter_ensemble_q:
+        _dtemp_blockers.append("adapter_ensemble")
+    if mtp_topk_reranker is not None:
+        _dtemp_blockers.append("topk_reranker")
+    _dtemp_controller, _dtemp_telemetry = build_adaptive_dtemp_controller(
+        base_temperature=float(draft_sampler.temperature),
+        blockers=_dtemp_blockers,
+    )
     while len(tokens) < max_tokens:
         if first_round_snapshot is None and step >= 1:
             # Top of iteration 2: the cumulative timers now hold exactly
@@ -10443,6 +10486,37 @@ def generate_mtpk(
                 **_policy_kwargs,
             )
 
+        if _dtemp_controller is not None and _cc_draft_source_token is None:
+            # Observe only rounds whose pos-1 draft was SAMPLED from the
+            # draft sampler (the copy-streak substitution proposes the prompt
+            # continuation as a point mass — not a dtemp observation; copy-
+            # BLOCK rounds `continue` before drafting and never reach here).
+            # The observable is the pos-1 accept probability min(1, p/q) —
+            # same expectation as the receipt ladders' pos-1 rate, far lower
+            # variance than the accept coin. On a transition, rebinding the
+            # loop-local draft_sampler is sufficient: the cycle draft readers
+            # close over this variable and shape q from the SAME config they
+            # sample with, so acceptance stays exact by construction.
+            _dtemp_drafts = event.get("drafts")
+            if _dtemp_drafts:
+                _dtemp_pos1 = _dtemp_drafts[0].get("accept_probability")
+                if _dtemp_pos1 is not None:
+                    _dtemp_new = _dtemp_controller.observe_round(
+                        float(_dtemp_pos1)
+                    )
+                    if _dtemp_new is not None:
+                        draft_sampler = replace(
+                            draft_sampler, temperature=float(_dtemp_new)
+                        )
+                        event["adaptive_dtemp_transition"] = {
+                            "temperature": float(_dtemp_new),
+                            "state": _dtemp_controller.state,
+                            "ema": round(float(_dtemp_controller.ema), 4),
+                            "observed_rounds": int(
+                                _dtemp_controller.observed_rounds
+                            ),
+                        }
+
         if online_hidden_enabled and draft_hidden_for_update:
             started_online = time.perf_counter()
             update_events = []
@@ -11130,6 +11204,11 @@ def generate_mtpk(
         lazy_bonus_commit_time_s=lazy_bonus_commit_time,
         verify_eval_unattributed_time_s=verify_eval_unattributed_time,
         verify_hidden_mode=verify_hidden_mode,
+        draft_sampler_adaptive_dtemp=(
+            _dtemp_controller.summary()
+            if _dtemp_controller is not None
+            else _dtemp_telemetry
+        ),
         draft_time_s=draft_time,
         target_forward_time_s=target_time,
         prompt_eval_time_s=prompt_eval_time,
