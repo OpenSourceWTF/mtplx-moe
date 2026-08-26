@@ -467,3 +467,107 @@ def test_generation_stats_carries_forkev_field() -> None:
         mode="mtpk", generated_tokens=0, elapsed_s=0.0, tok_s=0.0
     )
     assert stats.to_dict()["forkev"] == {}
+
+
+# --------------------------------------- live glue through generate_mtpk
+
+
+def _fork_model():
+    """Scripted CPU model whose DRAFT head disagrees with the target head.
+
+    Target rows put 0.7/0.3 on tokens (2, 3); the MTP head emits the flipped
+    0.3/0.7, so the draft's top-1 is usually 3 while the target prefers 2:
+    probability-ratio acceptance rejects often, and the residual correction
+    is almost always token 2 — the draft's #2 candidate — i.e. real hits with
+    margin 0.4 flowing through the real accept loop.
+    """
+    import math
+
+    import mlx.core as mx
+
+    from tests.test_context_copy_stats import _ScriptedModel
+
+    class _ForkModel(_ScriptedModel):
+        def __init__(self):
+            super().__init__(4, lambda t: 2)
+
+        def _logits_for(self, last_tokens):
+            rows = [
+                [-1e9, -1e9, math.log(0.7), math.log(0.3)]
+                for _ in last_tokens
+            ]
+            return mx.array([rows], dtype=mx.float32)
+
+        def mtp_forward(self, hidden_states, next_token_ids, **kwargs):
+            import numpy as np
+
+            tokens = [int(t) for t in np.asarray(next_token_ids).reshape(-1)]
+            rows = [
+                [-1e9, -1e9, math.log(0.3), math.log(0.7)] for _ in tokens
+            ]
+            logits = mx.array([rows], dtype=mx.float32)
+            hidden = mx.zeros((1, len(tokens), 2), dtype=mx.float32)
+            if kwargs.get("return_hidden"):
+                return logits, hidden
+            return logits
+
+    return _ForkModel()
+
+
+def _run_fork_model(seed: int):
+    from mtplx.generation import generate_mtpk
+    from mtplx.sampling import SamplerConfig
+    from tests.test_context_copy_stats import _runtime
+
+    return generate_mtpk(
+        _runtime(_fork_model()),
+        [2, 3, 2, 3, 2],
+        max_tokens=64,
+        sampler=SamplerConfig(temperature=1.0, top_p=1.0, top_k=2),
+        speculative_depth=2,
+        seed=seed,
+        stop_token_ids=set(),
+        verify_strategy="capture_commit",
+    )
+
+
+def test_generate_mtpk_hook_records_and_stays_trajectory_neutral(monkeypatch):
+    monkeypatch.setenv("MTPLX_CONTEXT_COPY", "0")
+    monkeypatch.delenv("MTPLX_FORKEV_TELEMETRY", raising=False)
+    off = _run_fork_model(seed=11)
+    assert off.stats.forkev == {}
+
+    monkeypatch.setenv("MTPLX_FORKEV_TELEMETRY", "1")
+    on = _run_fork_model(seed=11)
+
+    # Trajectory neutrality: identical seed => byte-identical token stream.
+    assert list(on.tokens) == list(off.tokens)
+
+    snap = on.stats.forkev
+    assert snap["enabled"] is True
+    assert snap["errors"] == 0
+    assert snap["rounds"] > 0
+    assert snap["rejections"] > 0
+    assert snap["margin_unavailable_rejections"] == 0
+    # The flipped draft head makes residual corrections land on the draft's
+    # #2 candidate: real hits must flow through the real accept loop.
+    assert snap["hits"] > 0
+    # Margin 0.4 at every drafted position -> decile 4, depths 1..2 only.
+    for depth_key, row in snap["bins"]["rejections"].items():
+        assert depth_key in {"d1", "d2"}
+        assert sum(row) == row[4]
+    # Threshold 0.5 (> 0.4) fires every round; thresholds below 0.4 never.
+    by_t = {r["threshold"]: r for r in snap["policy"]}
+    assert by_t[0.5]["fired_rounds"] == snap["rounds"]
+    assert by_t[0.3]["fired_rounds"] == 0
+    assert by_t[0.5]["at_rejection_forks"] > 0
+    # Saved accounting resolved against real next rounds stays within caps:
+    # ext >= hi >= lo, and unconditioned EV/round is finite and non-negative.
+    anchor = snap["unconditioned"]
+    assert (
+        anchor["saved_tokens_ext"]
+        >= anchor["saved_tokens_hi"]
+        >= anchor["saved_tokens_lo"]
+        >= 0
+    )
+    assert anchor["ev_tokens_per_round_ext"] is not None
