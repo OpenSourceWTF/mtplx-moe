@@ -202,6 +202,13 @@ from mtplx.server_urls import (
 LOGGER = logging.getLogger("mtplx.server.openai")
 
 SCHEDULER_MODE_CHOICES = tuple(mode.value for mode in SchedulerMode)
+# What /v1/mtplx/app-capabilities advertises to the app UI. "hyper" is the
+# H0 experimental chassis (2.9.3): launchable via --scheduler-mode for
+# operators, but at width 1 it is by construction identical-output with no
+# user benefit yet, so the app does not surface it as a mode choice.
+ADVERTISED_SCHEDULER_MODES = tuple(
+    mode for mode in SCHEDULER_MODE_CHOICES if mode != "hyper"
+)
 BATCHING_PRESET_CHOICES = tuple(preset.value for preset in SchedulerPreset)
 _STDOUT_LOGGING_BROKEN = False
 
@@ -14630,7 +14637,7 @@ def _mtplx_app_capabilities() -> dict[str, Any]:
             "legacy_bridge_default": False,
         },
         "scheduler": {
-            "modes": list(SCHEDULER_MODE_CHOICES),
+            "modes": list(ADVERTISED_SCHEDULER_MODES),
             "presets": list(BATCHING_PRESET_CHOICES),
             "v1_done_path": "path_a_solo_mtp_plus_cooperative_ar",
             "default_ux": "coding_agents",

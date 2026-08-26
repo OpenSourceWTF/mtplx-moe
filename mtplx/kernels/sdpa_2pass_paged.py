@@ -465,6 +465,12 @@ def sdpa_2pass_paged_tail_dynamic_offset(
     if partials_kernel is None or reduce_kernel is None:
         return None
 
+    # A 0-d size-1 array passes the gate above but binds BY VALUE in
+    # mx.fast.metal_kernel, so the source's ``offset[0]`` fails to compile
+    # (the TensorOffset adapter hands a 0-d offset; serve hands shape [1]).
+    # Reshape to [1] so the offset always binds as a device pointer.
+    offset_input = offset.astype(mx.int32).reshape(1)
+
     partial_shape = (int(bsz), int(hq), int(q_len), int(blocks), int(vdim))
     stats_shape = (int(bsz), int(hq), int(q_len), int(blocks))
     partials, sums, maxs = partials_kernel(
@@ -472,7 +478,7 @@ def sdpa_2pass_paged_tail_dynamic_offset(
             queries,
             key_cache,
             value_cache,
-            offset.astype(mx.int32),
+            offset_input,
             float(scale),
             int(blocks),
         ],

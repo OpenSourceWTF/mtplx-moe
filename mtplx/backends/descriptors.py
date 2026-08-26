@@ -442,11 +442,15 @@ QWEN3_8_DRAFT_SEMANTICS = DraftSemantics(
     # report — memory-kill signature; receipt: scratchpad serve-d4-t0.6.log,
     # warmup healthy at 88-92 tok/s then nothing). Cap at 3 until the deep
     # lane is root-caused; reopen with the QL5-7 packed-verify extension.
-    # 2026-08-25 flat-decode branch: the QL<=8 packed-verify bank is on this
-    # branch (3344ac25) — the stated reopen condition — so the experimental
-    # worktree raises the gate to 8 for the depth ladder. NOT for release
-    # until the D4-8 cells pass and the drop-day memory-kill is explained.
-    maximum=8,
+    # 2026-08-25 flat-decode branch temporarily raised this to 8 for the
+    # depth-ladder cells, gated on "NOT for release until the D4-8 cells
+    # pass". The cells ran 2026-08-26 and FALSIFIED deep depth: verify is
+    # flat to D8 but acceptance cannot fill the window — D6 measured -27%
+    # vs D3 at 88.4k and flat-to-down at 16k (MEASUREMENTS 2026-08-26; the
+    # head is the binder, distillation is the reopen condition now). The
+    # drop-day memory-kill also remains unexplained, so the release cap
+    # stays 3.
+    maximum=3,
     unit="depth",
 )
 
