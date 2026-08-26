@@ -4,6 +4,7 @@ import hashlib
 import os
 import threading
 from concurrent.futures import CancelledError
+from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -11,16 +12,21 @@ import pytest
 
 from mtplx import qwen4_ngram
 from mtplx.qwen4_ngram import (
+    NGramAcquireFuture,
     NGramCacheClosed,
     NGramCacheConfig,
+    NGramCacheError,
     NGramCacheFull,
     NGramCacheIOError,
     NGramFileIdentity,
+    NGramLease,
     NGramManifest,
     NGramRowCache,
     NGramShard,
+    SlotTicket,
     VerifiedNGramArtifact,
     VerifiedNGramShard,
+    plan_ngram_cache,
 )
 
 ROW_BYTES = 8
@@ -36,29 +42,25 @@ class RecordingReader:
         self.reads: list[tuple[int, int, int]] = []
         self.nocache_ranges: list[tuple[int, int, int]] = []
 
-    def read(
+    def read_into(
         self,
         shard: VerifiedNGramShard,
         offset: int,
-        length: int,
-        *,
-        bypass_page_cache: bool,
-    ) -> bytes:
+        target: memoryview,
+    ) -> int:
+        length = target.nbytes
         item = (shard.fileno(), offset, length)
         self.reads.append(item)
-        payload = shard.pread(offset, length)
-        if bypass_page_cache:
-            self.nocache_ranges.append(item)
-        return payload
+        return os.preadv(shard.fileno(), [target], offset)
 
 
 class ShortReader(RecordingReader):
-    def read(self, *args: object, **kwargs: object) -> bytes:
-        return super().read(*args, **kwargs)[:-1]  # type: ignore[arg-type]
+    def read_into(self, *args: object, **kwargs: object) -> int:
+        return super().read_into(*args, **kwargs) - 1  # type: ignore[arg-type]
 
 
 class BrokenReader(RecordingReader):
-    def read(self, *args: object, **kwargs: object) -> bytes:
+    def read_into(self, *args: object, **kwargs: object) -> int:
         del args, kwargs
         raise OSError("synthetic read failure")
 
@@ -69,10 +71,10 @@ class ControlledReader(RecordingReader):
         self.started = threading.Event()
         self.release = threading.Event()
 
-    def read(self, *args: object, **kwargs: object) -> bytes:
+    def read_into(self, *args: object, **kwargs: object) -> int:
         self.started.set()
         assert self.release.wait(timeout=5)
-        return super().read(*args, **kwargs)  # type: ignore[arg-type]
+        return super().read_into(*args, **kwargs)  # type: ignore[arg-type]
 
 
 @dataclass
@@ -92,11 +94,12 @@ def fixture_cache(
     slots: int = 4,
     transient_rows: int = 12,
     inflight_rows: int = 12,
-    max_open_files: int = 2,
+    max_open_files: int = 3,
     eviction: str = "lru",
     bypass_page_cache: bool = False,
     reader: RecordingReader | None = None,
 ) -> CacheFixture:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     split = 6
     shards: list[NGramShard] = []
     verified: list[VerifiedNGramShard] = []
@@ -217,7 +220,7 @@ def test_default_reader_applies_selected_f_nocache_after_read(
             cache_limit_bytes=ROW_BYTES,
             transient_limit_bytes=ROW_BYTES,
             max_inflight_io_bytes=ROW_BYTES,
-            max_open_files=2,
+            max_open_files=3,
             bypass_page_cache=True,
             eviction="lru",
         ),
@@ -260,7 +263,7 @@ def test_f_nocache_failure_rejects_construction_before_allocation(
                     cache_limit_bytes=ROW_BYTES,
                     transient_limit_bytes=ROW_BYTES,
                     max_inflight_io_bytes=ROW_BYTES,
-                    max_open_files=2,
+                    max_open_files=3,
                     bypass_page_cache=True,
                     eviction="lru",
                 ),
@@ -323,7 +326,7 @@ def test_malformed_retained_routes_fail_before_arena_or_reader_work(
                     cache_limit_bytes=ROW_BYTES,
                     transient_limit_bytes=ROW_BYTES,
                     max_inflight_io_bytes=ROW_BYTES,
-                    max_open_files=3,
+                    max_open_files=4,
                     bypass_page_cache=False,
                     eviction="lru",
                 ),
@@ -581,7 +584,7 @@ def test_cache_uses_retained_descriptor_after_path_replacement(tmp_path: Path) -
 
 
 def test_open_descriptor_bound_is_enforced_at_construction(tmp_path: Path) -> None:
-    artifact_fixture = fixture_cache(tmp_path, max_open_files=2)
+    artifact_fixture = fixture_cache(tmp_path, max_open_files=3)
     artifact_fixture.cache.close()
     try:
         with pytest.raises(ValueError, match="max_open_files"):
@@ -591,7 +594,7 @@ def test_open_descriptor_bound_is_enforced_at_construction(tmp_path: Path) -> No
                     cache_limit_bytes=ROW_BYTES,
                     transient_limit_bytes=ROW_BYTES,
                     max_inflight_io_bytes=ROW_BYTES,
-                    max_open_files=1,
+                    max_open_files=2,
                     bypass_page_cache=False,
                     eviction="lru",
                 ),
@@ -606,7 +609,6 @@ def test_open_descriptor_bound_is_enforced_at_construction(tmp_path: Path) -> No
     "overrides",
     [
         {"cache_limit_bytes": 0},
-        {"cache_limit_bytes": ROW_BYTES + 1},
         {"transient_limit_bytes": 0},
         {"max_inflight_io_bytes": 0},
         {"max_open_files": 0},
@@ -624,7 +626,7 @@ def test_invalid_config_fails_at_construction(
         "cache_limit_bytes": ROW_BYTES,
         "transient_limit_bytes": ROW_BYTES,
         "max_inflight_io_bytes": ROW_BYTES,
-        "max_open_files": 2,
+        "max_open_files": 3,
         "bypass_page_cache": False,
         "eviction": "lru",
     }
@@ -652,3 +654,415 @@ def test_only_exact_verified_artifact_is_accepted() -> None:
     )
     with pytest.raises(TypeError, match="VerifiedNGramArtifact"):
         NGramRowCache(object(), config, reader=RecordingReader(), allocator=bytearray)
+
+
+def planning_manifest(storage: str) -> NGramManifest:
+    row_width = 160
+    row_bytes = 320 if storage == "bf16" else 100
+    return NGramManifest(
+        source_repo="fixture/repo",
+        source_revision="fixture-revision",
+        storage=storage,  # type: ignore[arg-type]
+        row_width=row_width,
+        row_bytes=row_bytes,
+        padded_rows=1,
+        shards=(
+            NGramShard(
+                name="plan.bin",
+                tensor="plan.weight",
+                start_row=0,
+                row_count=1,
+                data_offset=0,
+                data_bytes=row_bytes,
+                file_size=row_bytes,
+                sha256="0" * 64,
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("storage", "expected"),
+    [
+        (
+            "bf16",
+            (6_710_886, 2_147_483_520, 194_615_694, 16_777_216, 134_217_728, 2_477_368_538),
+        ),
+        (
+            "affine-q4-g32",
+            (21_474_836, 2_147_483_600, 622_770_244, 67_108_864, 536_870_912, 3_308_183_741),
+        ),
+    ],
+)
+def test_two_gib_plans_use_complete_rows_without_large_allocations(
+    storage: str, expected: tuple[int, ...]
+) -> None:
+    config = NGramCacheConfig(
+        cache_limit_bytes=2 * 1024**3,
+        transient_limit_bytes=1024**2,
+        max_inflight_io_bytes=1024**2,
+        max_open_files=2,
+        bypass_page_cache=False,
+        eviction="lru",
+    )
+    plan = plan_ngram_cache(planning_manifest(storage), config)
+    assert (
+        plan.slot_count,
+        plan.payload_bytes,
+        plan.slot_metadata_bytes,
+        plan.route_capacity,
+        plan.route_table_bytes,
+        plan.total_reserved_bytes,
+    ) == expected
+    assert plan.requested_payload_bytes == 2 * 1024**3
+
+
+def test_planner_rejects_packed_index_overflow() -> None:
+    manifest = planning_manifest("bf16")
+    config = NGramCacheConfig(
+        cache_limit_bytes=((1 << 32) - 1) * manifest.row_bytes,
+        transient_limit_bytes=manifest.row_bytes,
+        max_inflight_io_bytes=manifest.row_bytes,
+        max_open_files=2,
+        bypass_page_cache=False,
+        eviction="lru",
+    )
+    with pytest.raises(ValueError, match="slot-index domain"):
+        plan_ngram_cache(manifest, config)
+
+
+def test_non_multiple_payload_budget_allocates_only_complete_rows(tmp_path: Path) -> None:
+    fixture = fixture_cache(tmp_path, slots=1)
+    fixture.cache.close()
+    sizes: list[int] = []
+    cache = NGramRowCache(
+        fixture.artifact,
+        NGramCacheConfig(
+            cache_limit_bytes=ROW_BYTES + 1,
+            transient_limit_bytes=ROW_BYTES,
+            max_inflight_io_bytes=ROW_BYTES,
+            max_open_files=3,
+            bypass_page_cache=False,
+            eviction="lru",
+        ),
+        reader=RecordingReader(),
+        allocator=lambda size: (sizes.append(size), bytearray(size))[1],
+    )
+    try:
+        assert sizes == [ROW_BYTES]
+        assert cache.arena_bytes == ROW_BYTES
+    finally:
+        cache.close()
+        fixture.artifact.close()
+
+
+@pytest.mark.parametrize("eviction", ["lru", "frequency"])
+def test_full_cache_mixed_hit_miss_never_evicts_requested_hit(
+    tmp_path: Path, eviction: str
+) -> None:
+    fixture = fixture_cache(tmp_path, slots=2, eviction=eviction)
+    try:
+        fixture.cache.acquire_rows((1, 2)).release()
+        lease = fixture.cache.acquire_rows((1, 3))
+        assert lease.row_bytes(0) == fixture_row(1)
+        assert lease.row_bytes(1) == fixture_row(3)
+        lease.release()
+    finally:
+        fixture.close()
+
+
+def test_copy_forgery_and_cross_cache_tickets_cannot_mutate_pins(
+    tmp_path: Path,
+) -> None:
+    left = fixture_cache(tmp_path / "left", slots=1)
+    right = fixture_cache(tmp_path / "right", slots=1)
+    try:
+        future = left.cache.acquire_rows_async((1,))
+        lease = future.result(timeout=5)
+        with pytest.raises(TypeError):
+            copy(left.cache)
+        with pytest.raises(TypeError):
+            deepcopy(left.cache)
+        with pytest.raises(TypeError):
+            copy(future)
+        with pytest.raises(TypeError):
+            deepcopy(future)
+        with pytest.raises(TypeError):
+            copy(lease)
+        with pytest.raises(TypeError):
+            deepcopy(lease)
+        with pytest.raises(TypeError, match="private"):
+            NGramLease(left.cache, (), object(), object())
+        with pytest.raises(TypeError, match="private"):
+            NGramAcquireFuture(left.cache, (), (), object(), object())
+        right_lease = right.cache.acquire_rows((2,))
+        cross_ticket = right_lease._tickets[0]
+        left.cache._release_ticket_pin(cross_ticket, cancel_loading=False)
+        with pytest.raises(NGramCacheFull):
+            left.cache.acquire_rows((3,))
+        forged = SlotTicket(lease.slot_ids[0], lease._tickets[0].generation)
+        left.cache._release_ticket_pin(forged, cancel_loading=False)
+        with pytest.raises(NGramCacheFull):
+            left.cache.acquire_rows((3,))
+        right_lease.release()
+        lease.release()
+    finally:
+        left.close()
+        right.close()
+
+
+def test_worker_failure_poisons_lane_and_drains_storage(tmp_path: Path) -> None:
+    fixture = fixture_cache(tmp_path, slots=6, reader=BrokenReader())
+    try:
+        with pytest.raises(NGramCacheIOError, match="synthetic read failure") as caught:
+            fixture.cache.acquire_rows((0, 2, 4, 6, 8, 10))
+        assert caught.value.__context__ is None
+        assert fixture.cache.inflight_bytes == 0
+        message = "synthetic read failure"
+        for row in (2, 3):
+            with pytest.raises(NGramCacheIOError, match=message):
+                fixture.cache.acquire_rows((row,))
+        assert fixture.cache.transient_storage_bytes == fixture.cache.plan.transient_bytes
+    finally:
+        fixture.close()
+
+
+def test_default_allocator_is_imported_lazily_without_mlx_evaluation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = fixture_cache(tmp_path)
+    fixture.cache.close()
+    calls: list[int] = []
+    from mtplx import mmap_mlx
+
+    monkeypatch.setattr(
+        mmap_mlx,
+        "allocate_metal_u8",
+        lambda size: (calls.append(size), bytearray(size))[1],
+    )
+    cache = NGramRowCache(
+        fixture.artifact,
+        NGramCacheConfig(
+            cache_limit_bytes=ROW_BYTES,
+            transient_limit_bytes=ROW_BYTES,
+            max_inflight_io_bytes=ROW_BYTES,
+            max_open_files=3,
+            bypass_page_cache=False,
+            eviction="lru",
+        ),
+        reader=RecordingReader(),
+    )
+    try:
+        assert calls == [ROW_BYTES]
+    finally:
+        cache.close()
+        fixture.artifact.close()
+
+
+def test_route_table_collisions_and_tombstones_do_not_grow(tmp_path: Path) -> None:
+    fixture = fixture_cache(tmp_path, slots=2)
+    try:
+        route_bytes = fixture.cache.route_table_bytes
+        fixture.cache.acquire_rows((1, 5)).release()  # same low bits in capacity four
+        for row in (9, 1, 5, 9, 1):
+            lease = fixture.cache.acquire_rows((row,))
+            assert lease.row_bytes(0) == fixture_row(row)
+            lease.release()
+        assert fixture.cache.route_table_bytes == route_bytes
+        assert len(fixture.cache._packed.route_keys) == fixture.cache.plan.route_capacity
+    finally:
+        fixture.close()
+
+
+def test_two_close_callers_wait_and_release_all_fixed_storage(tmp_path: Path) -> None:
+    reader = ControlledReader()
+    fixture = fixture_cache(tmp_path, slots=1, reader=reader)
+    first_done = threading.Event()
+    second_done = threading.Event()
+    pending = fixture.cache.acquire_rows_async((1,))
+    assert reader.started.wait(timeout=5)
+    first = threading.Thread(target=lambda: (fixture.cache.close(), first_done.set()))
+    second = threading.Thread(target=lambda: (fixture.cache.close(), second_done.set()))
+    first.start()
+    second.start()
+    assert not first_done.wait(timeout=0.05)
+    assert not second_done.wait(timeout=0.05)
+    reader.release.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+    assert first_done.is_set() and second_done.is_set()
+    assert fixture.cache.arena_bytes == 0
+    assert fixture.cache.transient_storage_bytes == 0
+    assert fixture.cache.total_reserved_bytes == 0
+    assert fixture.cache._packed.slot_count == 0
+    with pytest.raises(CancelledError):
+        pending.result(timeout=5)
+    fixture.artifact.close()
+
+
+def test_f_nocache_second_shard_failure_rolls_back_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = fixture_cache(tmp_path)
+    fixture.cache.close()
+    calls: list[tuple[int, int]] = []
+    assert qwen4_ngram.fcntl is not None
+    monkeypatch.setattr(qwen4_ngram.fcntl, "F_NOCACHE", 48, raising=False)
+    descriptors = [shard.fileno() for shard in fixture.artifact.shards]
+
+    def transactional(descriptor: int, command: int, value: int) -> None:
+        assert command == 48
+        calls.append((descriptor, value))
+        if descriptor == descriptors[1] and value == 1:
+            raise OSError("second shard failure")
+
+    monkeypatch.setattr(qwen4_ngram.fcntl, "fcntl", transactional)
+    try:
+        with pytest.raises(NGramCacheIOError, match="second shard failure"):
+            NGramRowCache(
+                fixture.artifact,
+                NGramCacheConfig(
+                    cache_limit_bytes=ROW_BYTES,
+                    transient_limit_bytes=ROW_BYTES,
+                    max_inflight_io_bytes=ROW_BYTES,
+                    max_open_files=3,
+                    bypass_page_cache=True,
+                    eviction="lru",
+                ),
+                reader=RecordingReader(),
+                allocator=bytearray,
+            )
+        assert calls == [(descriptors[0], 1), (descriptors[1], 1), (descriptors[0], 0)]
+        assert fixture.artifact._cache_owner is None
+    finally:
+        fixture.artifact.close()
+
+
+def test_page_cache_policy_is_restored_before_false_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = fixture_cache(tmp_path)
+    fixture.cache.close()
+    calls: list[tuple[int, int]] = []
+    assert qwen4_ngram.fcntl is not None
+    monkeypatch.setattr(qwen4_ngram.fcntl, "F_NOCACHE", 48, raising=False)
+    monkeypatch.setattr(
+        qwen4_ngram.fcntl,
+        "fcntl",
+        lambda descriptor, command, value: calls.append((descriptor, value)),
+    )
+    config = NGramCacheConfig(
+        cache_limit_bytes=ROW_BYTES,
+        transient_limit_bytes=ROW_BYTES,
+        max_inflight_io_bytes=ROW_BYTES,
+        max_open_files=3,
+        bypass_page_cache=True,
+        eviction="lru",
+    )
+    cache = NGramRowCache(
+        fixture.artifact, config, reader=RecordingReader(), allocator=bytearray
+    )
+    descriptors = [shard.fileno() for shard in fixture.artifact.shards]
+    cache.close()
+    assert calls == [(descriptor, 1) for descriptor in descriptors] + [
+        (descriptor, 0) for descriptor in descriptors
+    ]
+    false_cache = NGramRowCache(
+        fixture.artifact,
+        replace(config, bypass_page_cache=False),
+        reader=RecordingReader(),
+        allocator=bytearray,
+    )
+    false_cache.close()
+    assert len(calls) == 2 * len(descriptors)
+    fixture.artifact.close()
+
+
+def test_page_cache_policy_rolls_back_when_later_allocation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = fixture_cache(tmp_path)
+    fixture.cache.close()
+    calls: list[tuple[int, int]] = []
+    assert qwen4_ngram.fcntl is not None
+    monkeypatch.setattr(qwen4_ngram.fcntl, "F_NOCACHE", 48, raising=False)
+    monkeypatch.setattr(
+        qwen4_ngram.fcntl,
+        "fcntl",
+        lambda descriptor, command, value: calls.append((descriptor, value)),
+    )
+    descriptors = [shard.fileno() for shard in fixture.artifact.shards]
+    try:
+        with pytest.raises(MemoryError, match="synthetic allocation"):
+            NGramRowCache(
+                fixture.artifact,
+                NGramCacheConfig(
+                    cache_limit_bytes=ROW_BYTES,
+                    transient_limit_bytes=ROW_BYTES,
+                    max_inflight_io_bytes=ROW_BYTES,
+                    max_open_files=3,
+                    bypass_page_cache=True,
+                    eviction="lru",
+                ),
+                reader=RecordingReader(),
+                allocator=lambda _size: (_ for _ in ()).throw(
+                    MemoryError("synthetic allocation")
+                ),
+            )
+        assert calls == [(descriptor, 1) for descriptor in descriptors] + [
+            (descriptor, 0) for descriptor in descriptors
+        ]
+        assert fixture.artifact._cache_owner is None
+    finally:
+        fixture.artifact.close()
+
+
+def test_empty_and_overflowing_acquisitions_are_rejected(tmp_path: Path) -> None:
+    fixture = fixture_cache(tmp_path)
+    try:
+        with pytest.raises(ValueError, match="empty"):
+            fixture.cache.acquire_rows(())
+        with pytest.raises(TypeError, match="exact integers"):
+            fixture.cache.acquire_rows((True,))
+        with pytest.raises(IndexError, match="out of range"):
+            fixture.cache.acquire_rows((1 << 200,))
+    finally:
+        fixture.close()
+
+
+def test_default_reader_capability_and_exclusive_owner_fail_before_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = fixture_cache(tmp_path)
+    sizes: list[int] = []
+    config = NGramCacheConfig(
+        cache_limit_bytes=ROW_BYTES,
+        transient_limit_bytes=ROW_BYTES,
+        max_inflight_io_bytes=ROW_BYTES,
+        max_open_files=3,
+        bypass_page_cache=False,
+        eviction="lru",
+    )
+    try:
+        with pytest.raises(NGramCacheError, match="already has a cache owner"):
+            NGramRowCache(
+                fixture.artifact,
+                config,
+                reader=RecordingReader(),
+                allocator=lambda size: (sizes.append(size), bytearray(size))[1],
+            )
+        with pytest.raises(Exception, match="cache owns"):
+            fixture.artifact.close()
+        assert sizes == []
+        fixture.cache.close()
+        monkeypatch.setattr(qwen4_ngram.os, "preadv", None)
+        with pytest.raises(TypeError, match="preadv"):
+            NGramRowCache(
+                fixture.artifact,
+                config,
+                allocator=lambda size: (sizes.append(size), bytearray(size))[1],
+            )
+        assert sizes == []
+    finally:
+        fixture.cache.close()
+        fixture.artifact.close()
